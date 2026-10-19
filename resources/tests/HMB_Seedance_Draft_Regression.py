@@ -7,6 +7,7 @@ import importlib.util
 from pathlib import Path
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -67,6 +68,22 @@ class FakeBridge:
         self.capability_response = capability()
         self.capability_error = None
         self.format_resolution_calls = []
+        self.draft_state_calls = []
+
+    def _load_access_token(self):
+        return "synthetic-offline-account"
+
+    def get_draft_final_state(self, source, *, timeout=5):
+        self.draft_state_calls.append(source["draft_job_id"])
+        return t._seedance_draft_final_state_value({
+            "schema": "hmb-review-draft-final-v1", "state_schema": "hmb-draft-final-state-v1",
+            "source_task_id": source["draft_job_id"], "state": "available", "is_draft": True,
+            "eligible": True, "consumed": False, "checked_at": int(time.time()),
+            "expires_at": int(time.time()) + 604800, "owner_user_id": 7,
+            "project_id": source["project_id"], "project_name": source["project_name"],
+            "child_task_id": None, "child_status": None,
+            "idempotency_key": t._seedance_draft_final_request_id(source["draft_job_id"]),
+        }, source)
 
     def _authenticated_capability_bridge(self):
         bridge = t._HMBAIBrokerBridge(server_url=self.server_url)
@@ -128,6 +145,20 @@ class Node(t.HMBSeedanceGeneration):
 
     def _runtime_node_is_live(self, *, require_registered=False):
         return True
+
+    def _get_broker_bridge(self, *, server_url=None):
+        return self.bridge
+
+    def _store_draft_source(self, value):
+        super()._store_draft_source(value)
+        # Existing billing/authoring tests start after the synthetic GET watch
+        # has returned. The dedicated state-sync regression exercises the real
+        # pending watch, account changes, transport failures and late replies.
+        source = self._draft_source_record()
+        if source and hasattr(self, "bridge"):
+            identity = self._draft_final_status_identity(source)
+            self._hmb_draft_final_status_cache = {"identity": identity,
+                "value": self.bridge.get_draft_final_state(source), "received_at": time.monotonic()}
 
     @staticmethod
     def _output_destination_policy(destination):
@@ -500,6 +531,7 @@ class DraftTests(unittest.TestCase):
         # The explicit Final selection now resolves its completed source before
         # exposing a runnable parameter snapshot. Keep the legacy Only source.
         node.parameter_values[t.DRAFT_SOURCE_PARAMETER] = deepcopy(SOURCE)
+        node._hmb_generation_project = mock.Mock(side_effect=t._ProjectSelectionRequired("legacy Only has no project selection"))
         for action, expected in ((t.DRAFT_ACTION_PREVIEW, "480p"), (t.DRAFT_ACTION_FINAL, "1080p")):
             node.parameter_values.update(draft_action=action, resolution="720p", output_format="mov", return_last_frame=True)
             value = t.HMBSeedanceGeneration._get_parameters(node)
@@ -650,6 +682,7 @@ class DraftTests(unittest.TestCase):
         values = params(t.DRAFT_ACTION_FINAL)
         values.update(resolution="1080p", output_format="mov")
         node = Node(values)
+        node._store_draft_source(values["_hmb_draft_source"])
         node._prepare_video_references_for_run = mock.Mock(side_effect=AssertionError("media upload"))
         node._resolve_exact_shot_generation_inputs = mock.Mock(side_effect=AssertionError("new inputs"))
         with mock.patch.object(t, "_resolve_mp4_decode_verifier", return_value=SimpleNamespace(executable="fixture", backend="test")), \

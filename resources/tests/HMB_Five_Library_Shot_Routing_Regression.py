@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import json
@@ -1003,8 +1004,34 @@ for name in shot_widget_names:
 
 agent_widget = widget_paths["HMBAgentLibraryWidget"].read_text(encoding="utf-8")
 assert "hmbAgentShotOptions" in agent_widget
-assert 'class="agent-shot-select' in agent_widget
 assert "shot_catalog" in agent_widget
+# The manager keeps one SDK-owned native editor beneath the selected row.
+# Five small row widgets replace the old header dropdown/Only control; actual
+# element identity, order, collapse and no-op layout are covered by the SDK
+# HMB_Multishot_Manager_Host_Regression suite as well.
+agent_tree = ast.parse(agent_source)
+agent_class = next(node for node in agent_tree.body
+    if isinstance(node, ast.ClassDef) and node.name == "HMBAgentLibrary")
+agent_methods = {node.name: node for node in agent_class.body
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+row_creation = agent_methods["_ensure_agent_shot_rows"]
+assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    and node.func.id == "range" and [ast.literal_eval(arg) for arg in node.args] == [1, 6]
+    for node in ast.walk(row_creation))
+row_source = ast.get_source_segment(agent_source, row_creation)
+layout_source = ast.get_source_segment(agent_source, agent_methods["_hmb_layout_shot_editor"])
+assert '_AGENT_SHOT_ROW_PREFIX = "HMB_AGENT_SHOT_ROW_"' in agent_source
+assert '"traits"] = {Widget(name=_AGENT_WIDGET_NAME' in row_source
+assert 'self.add_parameter(Parameter(**kwargs))' in row_source
+assert '"schema": "hmb-agent-shot-row"' in layout_source
+assert 'ordered.extend(body)' in layout_source and 'reorder([item.name for item in ordered])' in layout_source
+assert 'rawValue?.schema === "hmb-agent-shot-row"' in agent_widget
+assert 'hmb-agent-shot-accordion' in agent_widget and 'class="agent-shot-tab nodrag"' in agent_widget
+assert 'aria-expanded=' in agent_widget and 'class="agent-shot-run nodrag"' in agent_widget
+assert 'const selectClick=()=>send("select")' in agent_widget
+assert '?"cancel_selected":"run_selected"' in agent_widget
+assert 'class="agent-shot-select' not in agent_widget
+assert 'class="agent-only-toggle' not in agent_widget
 
 seedance_widget = widget_paths["HMBSeedanceGenerationWidget"].read_text(
     encoding="utf-8"
@@ -1044,6 +1071,6 @@ for path in widget_paths.values():
 
 print(
     "HMB six-library Shot routing regression: PASS "
-    "(catalog fan-out, exact managed edges, Prompt-filtered Agent UI, "
+    "(catalog fan-out, exact managed edges, five native Agent accordion rows, "
     "direct-source Seedance UI, release widget coverage)"
 )

@@ -88,6 +88,9 @@ def _run_regression():
             "Manual Only prompt",
         )
     node._hmb_node_deleted = False
+    # This test targets the retained native execution surface (also reused by
+    # _HMBAgentShotExecution), not manager readiness or its Prompt-owner lookup.
+    node._hmb_shot_manager_mode = False
     node._hmb_rules_active = False
     node._hmb_capture_publications = False
     node._hmb_native_prompt_read_active = False

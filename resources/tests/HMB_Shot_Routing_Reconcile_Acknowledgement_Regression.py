@@ -234,6 +234,54 @@ try:
     })
     assert node._hmb_last_reconciled_shot_catalog_identity == identity_3
 
+    # Prompt/Agent hydration has no ImageAsset reservation token. Replaying
+    # an identical saved slot many times must queue one callback, which reads
+    # the latest authored values rather than retaining a stale projection.
+    node._hmb_reserved_shot_catalog_identity = ""
+    node.authored = "initial"
+    observed = []
+    def record_latest(current):
+        observed.append(current.authored)
+        return {"ok": True, "code": "ready", "changed": 0}
+    routing.reconcile_shot_routing = record_latest
+    for index in range(100):
+        node.authored = f"latest-{index}"
+        assert routing.schedule_post_hydration_reconcile(node)
+    assert len(loop.pending) == 1, "identical hydration echoes flooded the loop"
+    loop.drain()
+    assert observed == ["latest-99"]
+
+    # A load coordinator owns the graph until consolidation completes. Its
+    # pending marker suppresses discovery/retries and releases the callback;
+    # a single explicit completion signal then routes the retained survivor.
+    original_migration_pending = routing._flow_migration_is_pending
+    try:
+        routing._flow_migration_is_pending = lambda _flow: True
+        assert routing.schedule_post_hydration_reconcile(node)
+        loop.drain()
+        assert not loop.pending and observed == ["latest-99"]
+        assert node not in routing._POST_REGISTRATION_PENDING
+        routing._flow_migration_is_pending = lambda _flow: False
+        assert routing.schedule_post_hydration_reconcile(node)
+        loop.drain()
+        assert observed == ["latest-99", "latest-99"]
+    finally:
+        routing._flow_migration_is_pending = original_migration_pending
+
+    original_blockage = routing._flow_migration_blockage
+    try:
+        routing._flow_migration_blockage = lambda _flow: {
+            "code": "workflow_migration_failed", "reason": "Original graph restored", "backup_path": "fixture.json"}
+        assert routing.schedule_post_hydration_reconcile(node)
+        loop.drain()
+        assert observed == ["latest-99", "latest-99"] and not loop.pending
+        suspended = original_reconcile(node)
+        assert suspended["ok"] is False and suspended["changed"] == 0
+        assert suspended["code"] == "workflow_migration_failed"
+        assert routing.reconcile_completed_video_routes(node) == suspended
+    finally:
+        routing._flow_migration_blockage = original_blockage
+
     print("HMB Shot routing reconcile acknowledgement regression passed")
 finally:
     routing.reconcile_shot_routing = original_reconcile

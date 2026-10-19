@@ -132,6 +132,7 @@ class SelectedRoleArtifactRegression(unittest.TestCase):
         node._encode_playblast_sequence.side_effect=encode
         with mock.patch.multiple(picker,
             _validate_full_smooth_confirmation=mock.Mock(),_validate_world_pattern_runner_confirmation=mock.Mock(),
+            _validate_mask_material_pass_confirmation=mock.Mock(),
             _validate_depth_companion_inputs=mock.Mock(return_value={'validated':True}),
             _validate_motion_guide_inputs=mock.Mock(return_value={'validated':True}),
             _validate_encoded_playblast=lambda *a,**k:{'ok':True},

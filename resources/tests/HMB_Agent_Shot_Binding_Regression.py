@@ -174,6 +174,9 @@ class ExecutionBindingHarness(agent.HMBAgentLibrary):
         self._hmb_execution_phase_syncing = False
         self._hmb_initial_shot_autoclaim_pending = False
         self._hmb_initial_shot_preferred_uuid = ""
+        self._hmb_shot_manager_mode = True
+        self._hmb_shot_editor_expanded = True
+        self._model_access = SimpleNamespace(on_value_set=lambda *_args: None)
         self._widget_parameter = SimpleNamespace(
             name=agent._AGENT_WIDGET_PARAMETER,
             default_value=agent._agent_widget_value(
@@ -213,6 +216,12 @@ class ExecutionBindingHarness(agent.HMBAgentLibrary):
 
     def _refresh_routed_prompt_preview(self) -> None:
         return None
+
+    def _native_parameter_value(self, name, default=None):
+        return self._widget_parameter.default_value if name == agent._AGENT_WIDGET_PARAMETER else default
+
+    def _hmb_persist_shot_store(self):
+        return None  # This identity harness has no retained native settings.
 
 
 agents = []
@@ -271,9 +280,8 @@ only_gate_probe._hmb_execution_shot_binding.update(
 assert only_gate_probe._adopt_verified_execution_shot_binding({}) == {}
 assert only_gate_probe._hmb_execution_shot_binding == {}
 
-# The binding is execution-scoped. Once released, Only and later Shot choices
-# immediately become the routing identity. There is no retained Agent result
-# snapshot/publication for selector changes to invalidate.
+# The binding is execution-scoped. Once released, an empty editor echo chooses
+# the first canonical row; independent Only mode is no longer part of HMB Agent.
 selector_probe = agents[0]
 selector_probe._clear_execution_shot_binding()
 selector_probe.set_parameter_value(
@@ -282,7 +290,8 @@ selector_probe.set_parameter_value(
 )
 only_subscription = selector_probe._hmb_shot_channel_subscription()
 assert only_subscription.get("participant_kind") == "agent"
-assert only_subscription.get("enabled") is False
+assert only_subscription.get("enabled") is True
+assert only_subscription.get("shot_uuid") == concurrent_shots[0]["shot_uuid"]
 
 selector_probe._widget_parameter.default_value = agent._agent_widget_value(
     {

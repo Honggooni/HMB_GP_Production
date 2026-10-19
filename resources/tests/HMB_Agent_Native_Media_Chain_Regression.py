@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import asyncio
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import json
@@ -50,6 +51,14 @@ assert agent._BuiltinAgent is not None, "Point HMB_GRIPTAPE_STANDARD_LIBRARY_PAT
 native_module = sys.modules[agent._BuiltinAgent.__module__]
 install_bundled_policy_session(agent._hmb)
 LITERAL = '{{SIGN}} {{KEEP_ME}} {% include "unavailable" %} {% endraw %} {# literal #} 한글😀\r\n\tC:\\asset\\hero'
+_socket_connect = socket.socket.connect
+
+
+def local_socket_connect(sock, address, *args, **kwargs):
+    # Windows asyncio creates a loopback self-pipe. It is not provider I/O.
+    if not isinstance(address, tuple) or str(address[0]).casefold() not in {"localhost", "127.0.0.1", "::1"}:
+        raise AssertionError("external network forbidden")
+    return _socket_connect(sock, address, *args, **kwargs)
 
 
 def subscription(number):
@@ -90,6 +99,9 @@ def source_fixture(number, image_path):
 
 
 def run_native(source, renders, machine, structured=False, expected_pixels=1, custom_input=None):
+    if hasattr(native_module, "AgentState"):
+        return run_current_native(source, renders, machine, structured=structured,
+            expected_pixels=expected_pixels, custom_input=custom_input)
     node = object.__new__(agent.HMBAgentLibrary)
     node._hmb_rules_active = True
     node._hmb_native_prompt_read_active = True
@@ -167,10 +179,60 @@ def run_native(source, renders, machine, structured=False, expected_pixels=1, cu
     return final_text, user, images[0] if images else None
 
 
+def run_current_native(source, renders, machine, structured=False, expected_pixels=1, custom_input=None):
+    """Use current native process/runner/serialization, never obsolete symbols."""
+    from HMB_Agent_Current_Standard_Transport_Regression import NativeTransport
+    fixture = NativeTransport(methodName="test_current_native_text_model_bound_bytes_rules_and_literals")
+    fixture.setUp()
+    try:
+        fixture.node._hmb_runtime_prompt = machine
+        setattr(fixture.node, agent._VERIFIED_PROMPT_SOURCE_ATTRIBUTE, source)
+        fixture.values["additional_context"] = {"zero": 0, "disabled": False, "unset": "", "literal": LITERAL}
+        fixture.final_text = "Use @image1 for the approved hero; preserve {{SIGN}}; retain the assigned motion."
+        fixture.structured_field = "prompt"
+        if structured:
+            fixture.values["output_schema"] = {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}
+        with patch.object(routing, "_same_flow_nodes", return_value=("fixture-flow", renders)):
+            result = fixture.run_native()
+        assert len(fixture.captured) == 1
+        body = fixture.captured[0]
+        assert body["model"] == VISION_MODEL_CHOICES[0]
+        messages = [message for message in body["messages"] if message["role"] == "user"]
+        content = messages[-1]["content"]
+        user = content if isinstance(content, str) else "\n".join(item["text"] for item in content if item["type"] == "text")
+        system = json.dumps([m for m in body["messages"] if m["role"] in {"system", "developer"}], ensure_ascii=False)
+        assert "Keep caller-owned rule." in system
+        for rule in fixture.node._hmb_policy_rules + fixture.node._hmb_binding_rules:
+            assert json.dumps(rule, ensure_ascii=False)[1:-1] in system
+        assert machine in user and "{{KEEP_ME}}" in user
+        assert '"zero":0' in user and '"disabled":false' in user and '"unset":""' in user
+        assert "HMB CURRENT GENERATOR SETTINGS" in user
+        images = [] if isinstance(content, str) else [item for item in content if item["type"] == "image_url"]
+        assert len(images) == expected_pixels
+        assert str(source._hmb_current_shot_images[0]) not in user
+        if structured:
+            assert result.output == {"prompt": fixture.final_text}
+            assert json.loads(fixture.node.parameter_output_values["output"]) == result.output
+        else:
+            assert result.output == fixture.final_text
+        if custom_input is not None:
+            # Current Standard has no PromptTask.input template. Exercise the
+            # genuine legacy Task contract explicitly rather than pretending
+            # the current PydanticAI state exposes a legacy task.
+            legacy = GtAgent(input=custom_input, prompt_driver=GriptapeCloudPromptDriver(model=VISION_MODEL_CHOICES[0], api_key="offline"))
+            def legacy_template(structure, value):
+                structure._execution_args = (value,)
+                return structure.tasks[0].input.value
+            user = agent._run_native_with_literal_hmb_input(legacy_template, legacy, user)
+        return fixture.final_text, user, images[0] if images else None
+    finally:
+        fixture.tearDown()
+
+
 class NativeChainTests(unittest.TestCase):
     def test_text_fallback_and_custom_native_template_preserve_literals(self):
         source, render, machine = source_fixture(1, Path("C:/unavailable-fixture/hero.png"))
-        with patch.object(socket.socket, "connect", side_effect=AssertionError("network forbidden")):
+        with patch.object(socket.socket, "connect", new=local_socket_connect):
             for template in (None, "PREFIX {{ args[0] }} SUFFIX"):
                 _final, user, pixels = run_native(source, [render], machine, expected_pixels=0, custom_input=template)
                 self.assertIsNone(pixels)
@@ -230,14 +292,7 @@ class NativeChainTests(unittest.TestCase):
             self.assertEqual(set(pool.map(execute, (1, 2))), {LITERAL + "1", LITERAL + "2"})
 
     def test_cancelled_native_worker_keeps_literal_until_finish_then_restores(self):
-        node = object.__new__(agent.HMBAgentLibrary)
-        node._hmb_rules_active = True
-        node._hmb_runtime_prompt = LITERAL
-        node._hmb_lifecycle_generation = 1
-        node._hmb_lifecycle_is_live = lambda generation: True
-        node.append_value_to_parameter = lambda *args, **kwargs: None
-        node.get_parameter_value = lambda name: False
-        native = GtAgent(prompt_driver=GriptapeCloudPromptDriver(model=VISION_MODEL_CHOICES[0], api_key="offline"))
+        native = GtAgent(prompt_driver=GriptapeCloudPromptDriver(model=VISION_MODEL_CHOICES[0], api_key="offline", stream=True))
         cancelled = [False]
         release = threading.Event()
         finished = threading.Event()
@@ -250,16 +305,24 @@ class NativeChainTests(unittest.TestCase):
             if event.structure_id == native.id:
                 finished.set()
             return event
-        with patch.object(socket.socket, "connect", side_effect=AssertionError("network forbidden")), \
+        workers = ThreadPoolExecutor(max_workers=1)
+        def cancelled_ui_processor(structure, value):
+            workers.submit(contextvars.copy_context().run, structure.run, value)
+            deadline = __import__("time").monotonic() + 2
+            while not cancelled[0] and __import__("time").monotonic() < deadline:
+                __import__("time").sleep(.005)
+            self.assertTrue(cancelled[0])
+            return structure
+        with patch.object(socket.socket, "connect", new=local_socket_connect), \
              patch.object(GriptapeCloudPromptDriver, "try_stream", stream), \
-             patch.object(agent.HMBAgentLibrary, "is_cancellation_requested", property(lambda self: cancelled[0])), \
              EventListener(on_event, event_types=[FinishStructureRunEvent]):
-            self.assertIs(node._process(native, LITERAL), native)
+            self.assertIs(agent._run_native_with_literal_hmb_input(cancelled_ui_processor, native, LITERAL), native)
             self.assertTrue(cancelled[0])
             # The UI returned while the real native worker still owns input.
             self.assertIn("_process_task_input", native.tasks[0].__dict__)
             release.set()
             self.assertTrue(finished.wait(timeout=3))
+        workers.shutdown(wait=True)
         self.assertNotIn("_process_task_input", native.tasks[0].__dict__)
         self.assertIn(LITERAL, native.conversation_memory.runs[-1].input.to_text())
 
@@ -297,7 +360,7 @@ class NativeChainTests(unittest.TestCase):
             Image.new("RGB", (32, 16), "blue").save(blue)
             source_a, render_a, machine_a = source_fixture(1, red)
             source_b, render_b, machine_b = source_fixture(2, blue)
-            with patch.object(socket.socket, "connect", side_effect=AssertionError("network forbidden")):
+            with patch.object(socket.socket, "connect", new=local_socket_connect):
                 final_a, user_a, pixels_a = run_native(source_a, [render_a, render_b], machine_a)
                 final_b, user_b, pixels_b = run_native(source_b, [render_a, render_b], machine_b, structured=True)
                 self.assertIn('"duration_seconds":8', user_a)

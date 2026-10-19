@@ -186,6 +186,8 @@ assert.match(
   "Agent remount replaces stale gesture blockers with its nodrag-only background.",
 );
 assert.doesNotMatch(agentGestureContainer.innerHTML, /\bnopan\b|\bnowheel\b/);
+assert.doesNotMatch(agentGestureContainer.innerHTML, /<(?:select|button)\b/i,
+  "The native Agent header must not render retired Only or Shot controls.");
 for (const element of [agentGestureContainer, agentGestureRoot]) {
   assert.ok(element.classList.contains("nodrag"), "Agent gesture surfaces prevent whole-node dragging.");
   assert.equal(element.classList.contains("nopan"), false, "Agent gesture surfaces pass canvas panning through.");
@@ -204,8 +206,102 @@ assert.equal(
   "Agent interior pointerdown must stay local so only the native title bar selects the node.",
 );
 assert.equal(agentGestureRoot.handler("pointerdown"), undefined);
+let agentPointerStops = 0;
+agentGestureContainer.handler("pointerdown")({ button: 1, stopPropagation() { agentPointerStops += 1; } });
+assert.equal(agentPointerStops, 0, "The Agent header must pass middle-button pan to the native canvas.");
+agentGestureContainer.handler("pointerdown")({ button: 0, stopPropagation() { agentPointerStops += 1; } });
+assert.equal(agentPointerStops, 1, "Left interaction stays local without selecting the native node.");
 agentController.cleanup();
 assert.equal(agentGestureContainer.innerHTML, "");
+assert.equal(agentGestureContainer.handler("pointerdown"), undefined, "Agent cleanup removes its local pointer guard.");
+assert.equal(agentGestureContainer.handler("keydown"), undefined, "Agent cleanup removes its keyboard guard.");
+
+// Shot rows are separate SDK hosts, so native Agent fields can remain direct
+// siblings immediately after the selected row without moving React-owned DOM.
+const agentRowContainer = fakeElement();
+const agentRowRoot = fakeElement(agentRowContainer, "hmb-agent-dashboard");
+const agentRow = fakeElement(agentRowRoot, "agent-shot-row");
+const agentRowSelect = fakeElement(agentRow, "agent-shot-tab");
+const agentRowRun = fakeElement(agentRow, "agent-shot-run");
+const agentRowNumber = fakeElement(agentRowSelect, "agent-row-number");
+const agentRowLabel = fakeElement(agentRowSelect, "");
+const agentRowStatus = fakeElement(agentRowSelect, "agent-row-status");
+const agentRowChevron = fakeElement(agentRowSelect, "agent-row-chevron");
+const rowElements = new Map([
+  [".hmb-agent-dashboard", agentRowRoot], [".agent-shot-row", agentRow],
+  [".agent-shot-tab", agentRowSelect], [".agent-shot-run", agentRowRun],
+]);
+agentRowContainer.querySelector = (selector) => rowElements.get(selector) || null;
+const rowLabels = new Map([
+  [".agent-row-number", agentRowNumber], ["b", agentRowLabel],
+  [".agent-row-status", agentRowStatus], [".agent-row-chevron", agentRowChevron],
+]);
+agentRowSelect.querySelector = (selector) => rowLabels.get(selector) || null;
+const rowActions = [];
+const rowState = {
+  schema: "hmb-agent-shot-row", version: 1,
+  shot: { channel_uuid: "channel-agent-row", shot_uuid: "shot-agent-row", number: 3,
+    name: "Renamed asset Shot", revision: 7 },
+  selected: true, expanded: true, status: "",
+};
+const rowProps = { value: rowState, onChange(value) { rowActions.push(value); } };
+const agentRowController = agentWidget.default(agentRowContainer, rowProps);
+const originalRowRAF = globalThis.requestAnimationFrame;
+const originalRowCancelRAF = globalThis.cancelAnimationFrame;
+let rowFrameSequence = 0;
+const rowFrames = new Map();
+globalThis.requestAnimationFrame = (callback) => {
+  const id = ++rowFrameSequence; rowFrames.set(id, callback); return id;
+};
+globalThis.cancelAnimationFrame = (id) => rowFrames.delete(id);
+const paintAgentRowFrame = () => {
+  const callbacks = [...rowFrames.values()]; rowFrames.clear();
+  callbacks.forEach((callback) => callback(0));
+};
+assert.match(agentRowContainer.innerHTML, /class="agent-shot-tab nodrag"/);
+assert.doesNotMatch(agentRowContainer.innerHTML, /<(?:select|input|textarea)\b/i,
+  "Shot row controls must not duplicate the native Agent editor.");
+assert.equal(agentRowNumber.textContent, "03");
+assert.equal(agentRowLabel.textContent, "Renamed asset Shot", "Rows use the ImageAsset Shot name.");
+assert.equal(agentRowSelect.getAttribute("aria-expanded"), "true");
+assert.equal(agentRowContainer.style.height, "42px", "Each native Shot row reserves its own height.");
+assert.equal(agentRowContainer.handler("click"), undefined, "Background row clicks remain native canvas gestures.");
+for (const eventName of ["mousedown", "dblclick", "wheel"]) {
+  assert.equal(agentRowContainer.handler(eventName), undefined);
+}
+agentRowSelect.handler("click")();
+agentRowSelect.handler("click")();
+assert.equal(rowActions.length, 0, "Selection feedback must precede dispatch and yield a paint.");
+assert.equal(agentRowSelect.getAttribute("aria-expanded"), "false", "Collapse feedback is immediate.");
+paintAgentRowFrame();
+assert.equal(rowActions.length, 0, "The first frame paints the optimistic row before native work.");
+paintAgentRowFrame();
+assert.equal(rowActions.length, 1, "Pending same-row clicks must not publish duplicate actions.");
+assert.equal(rowActions[0].action.kind, "select");
+assert.deepEqual(rowActions[0].shot, rowState.shot);
+assert.match(rowActions[0].action.request_id, /^[a-f0-9]{32}$/);
+await Promise.resolve();
+await Promise.resolve();
+agentRowController.update(rowProps);
+assert.equal(agentRowRun.disabled, true, "An old state echo cannot release the pending native switch.");
+agentRowController.update({ ...rowProps, value: { ...rowState, expanded: false, status: "running", request_id: rowActions[0].action.request_id } });
+assert.equal(agentRowSelect.getAttribute("aria-expanded"), "false");
+assert.equal(agentRowStatus.textContent, "Agent 실행 중…");
+assert.equal(agentRowRun.getAttribute("aria-label"), "Cancel Shot Agent");
+agentRowRun.handler("click")();
+assert.equal(rowActions.length, 1, "Run/Cancel also paints its pending state before dispatch.");
+paintAgentRowFrame(); paintAgentRowFrame();
+assert.equal(rowActions[1].action.kind, "cancel_selected", "Run controls cancel only their exact running Shot.");
+assert.deepEqual(rowActions[1].shot, rowState.shot);
+agentRowController.cleanup();
+assert.equal(rowFrames.size, 0, "Retired row owners must leave no frame callbacks.");
+globalThis.requestAnimationFrame = originalRowRAF;
+globalThis.cancelAnimationFrame = originalRowCancelRAF;
+assert.equal(agentRowContainer.innerHTML, "");
+assert.equal(agentRowSelect.handler("click"), undefined);
+assert.equal(agentRowRun.handler("click"), undefined);
+assert.equal(agentRowContainer.handler("pointerdown"), undefined);
+assert.equal(agentRowContainer.handler("keydown"), undefined);
 
 const shell = fakeElement(null, "react-flow__node");
 const outerHost = fakeElement(shell, "parameter-host");

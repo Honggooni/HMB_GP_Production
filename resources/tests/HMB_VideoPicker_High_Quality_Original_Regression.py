@@ -240,7 +240,8 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
     assert cache_fields[ORIGINAL_MATERIAL_PROFILE_FIELD] == (
         picker.ORIGINAL_MATERIAL_OVERRIDE_PROFILE
     )
-    assert cache_fields["original_material_pass_source"] == "AIPicker_SET"
+    assert cache_fields["original_material_pass_source"] == "AIPicker_SET|AIPickerM_SET"
+    assert cache_fields["original_material_pass_sources"] == ["AIPicker_SET", "AIPickerM_SET"]
 
     video_path, sidecar_path = picker._original_preview_paths(scene_path)
     video_path.parent.mkdir(parents=True, exist_ok=True)
@@ -258,7 +259,8 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
         "assignment_mode": picker.ORIGINAL_LAMBERT_ASSIGNMENT_MODE,
         "original_material_override_report": {
             "profile": picker.ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
-            "material_pass_source": "AIPicker_SET",
+            "material_pass_source": "AIPicker_SET|AIPickerM_SET",
+            "material_pass_sources": ["AIPicker_SET", "AIPickerM_SET"],
             "material_pass_shape_count": 0,
             "requested": True,
             "status": "restored",
@@ -323,20 +325,31 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
     # Older group-name caches cannot substitute for the newly authored set.
     # Reject them without deleting existing media or changing cache profiles.
     media_before_pass_check = video_path.read_bytes()
-    for missing_field in ("original_material_pass_source", "material_pass_source"):
+    for missing_field in ("original_material_pass_source", "original_material_pass_sources", "material_pass_source", "material_pass_sources"):
         legacy = copy.deepcopy(current_sidecar)
-        if missing_field == "material_pass_source":
+        if missing_field in ("material_pass_source", "material_pass_sources"):
             legacy["original_material_override_report"].pop(missing_field)
         else:
             legacy.pop(missing_field)
         sidecar_path.write_text(json.dumps(legacy), encoding="utf-8")
         assert not picker._original_preview_cache_is_valid(scene_path, state, video_path, sidecar_path)
         assert video_path.read_bytes() == media_before_pass_check
-    for incorrect_source in ("eye_GEO_GRP", "eye_GRP", "aipicker_set"):
+    for incorrect_source in ("AIPicker_SET", "eye_GEO_GRP", "eye_GRP", "aipicker_set"):
         invalid_source = copy.deepcopy(current_sidecar)
         invalid_source["original_material_pass_source"] = incorrect_source
         sidecar_path.write_text(json.dumps(invalid_source), encoding="utf-8")
         assert not picker._original_preview_cache_is_valid(scene_path, state, video_path, sidecar_path)
+    sidecar_path.write_text(json.dumps(current_sidecar), encoding="utf-8")
+
+    # The old one-set report remains readable, but cannot masquerade as a new
+    # two-set cache even when its surrounding metadata was upgraded.
+    historical = copy.deepcopy(current_sidecar)
+    historical["original_material_override_report"]["material_pass_source"] = "AIPicker_SET"
+    historical["original_material_override_report"].pop("material_pass_sources")
+    assert picker._original_material_report_is_valid(historical["original_material_override_report"])
+    sidecar_path.write_text(json.dumps(historical), encoding="utf-8")
+    assert not picker._original_preview_cache_is_valid(scene_path, state, video_path, sidecar_path)
+    assert video_path.read_bytes() == media_before_pass_check
     sidecar_path.write_text(json.dumps(current_sidecar), encoding="utf-8")
 
     # A fully restored shared head-eye/body capture can use textured VP2.

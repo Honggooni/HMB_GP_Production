@@ -24,7 +24,8 @@ function hasConsumers(entry) {
     typeof entry?.consumer === "function"
     || typeof entry?.catalogConsumer === "function"
     || (entry?.consumers instanceof Map && entry.consumers.size)
-    || (entry?.catalogConsumers instanceof Map && entry.catalogConsumers.size),
+    || (entry?.catalogConsumers instanceof Map && entry.catalogConsumers.size)
+    || (entry?.pageConsumers instanceof Map && entry.pageConsumers.size),
   );
 }
 
@@ -59,6 +60,9 @@ function wakeCatalogConsumers(entry) {
     for (const item of entry.catalogConsumers.values()) {
       if (typeof item.wake === "function") wakes.add(item.wake);
     }
+  }
+  if (entry?.pageConsumers instanceof Map) {
+    for (const item of entry.pageConsumers.values()) if (typeof item.wake === "function") wakes.add(item.wake);
   }
   for (const wake of wakes) {
     try { wake(); } catch (_error) {}
@@ -162,9 +166,8 @@ export default function HMBImageAssetThumbnailPatchBridgeWidget(container, props
       throw new Error("HMB image thumbnail bridge did not receive props.onChange.");
     }
     const source = rawRequest && typeof rawRequest === "object" ? rawRequest : {};
-    const operation = clean(source.operation) === "catalog_probe"
-      ? "catalog_probe"
-      : "hydrate";
+    const operation = ["catalog_probe", "catalog_page"].includes(clean(source.operation))
+      ? clean(source.operation) : "hydrate";
     const request = {
       schema: "hmb-image-asset-thumbnail-bridge",
       version: 1,
@@ -178,7 +181,14 @@ export default function HMBImageAssetThumbnailPatchBridgeWidget(container, props
     };
     const projectCacheUid = clean(source.project_cache_uid);
     if (projectCacheUid) request.project_cache_uid = projectCacheUid;
-    if (operation === "catalog_probe") {
+    if (operation === "catalog_page") {
+      Object.assign(request,{session_id:clean(source.session_id),sequence:Math.max(0,Math.floor(Number(source.sequence)||0)),
+        query:String(source.query||"").slice(0,256),folder:clean(source.folder).replaceAll("\\","/"),
+        folder_signature:clean(source.folder_signature),source_view:source.source_view==="user"?"user":"project",
+        offset:Math.max(0,Math.floor(Number(source.offset)||0)),limit:Math.min(80,Math.max(1,Math.floor(Number(source.limit)||80)))});
+      if(!request.session_id || !request.request_id || request.runtime_instance_id!==runtimeId || !request.project_uid)
+        throw new Error("Invalid HMB image catalog page request.");
+    } else if (operation === "catalog_probe") {
       request.project_root = clean(source.project_root).replaceAll("\\", "/");
       request.probe_kind = clean(source.probe_kind);
       if (
@@ -214,10 +224,16 @@ export default function HMBImageAssetThumbnailPatchBridgeWidget(container, props
       || clean(value?.runtime_instance_id) !== runtimeId
     ) return false;
     const operation = clean(value?.operation);
-    if (operation !== "hydrate" && operation !== "catalog_probe") return false;
+    if (operation !== "hydrate" && operation !== "catalog_probe" && operation !== "catalog_page") return false;
     const resultKey = `${operation}:${clean(value.request_id)}:${Math.max(0, Math.floor(Number(value.thumbnail_revision) || 0))}:${clean(value.outcome)}`;
     if (!resultKey || resultKey === deliveredResultKey) return false;
     const current = registry?.get(runtimeId) || {};
+    if(operation==="catalog_page") {
+      for(const item of current.pageConsumers?.values?.() || []) {
+        try {item.consumer?.(value);} catch(_error) { /* Other mounted clients retain their own result. */ }
+      }
+      deliveredResultKey=resultKey;return true;
+    }
     if (operation === "hydrate") rememberThumbnailResult(value);
     if (!deliverToConsumers(current, operation === "catalog_probe", value)) {
       // A result can race the main widget mount/remount. Retain one bounded
@@ -265,8 +281,9 @@ export default function HMBImageAssetThumbnailPatchBridgeWidget(container, props
     runtimeId = nextRuntimeId;
     if (runtimeId && registry) {
       const prior = registry.get(runtimeId) || {};
-      registry.set(runtimeId, { ...prior, bridgeToken: token, dispatch });
-      wakeCatalogConsumers(prior);
+      const entry={ ...prior, bridgeToken: token, dispatch, catalogPageVersion:Number(value?.catalog_page_version)||0 };
+      registry.set(runtimeId, entry);
+      wakeCatalogConsumers(entry);
     }
     deliverResult(value);
   };

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -159,6 +160,60 @@ with tempfile.TemporaryDirectory(prefix="hmb-picker-multi-snapshot-") as tempora
     assert written[-1]["pending_action"] == written[-1]["pending_action_id"] == ""
     assert "Current settings were preserved" in written[-1]["message"]
 
+    # Mask object count and repeated palette colors are independent from the
+    # five Shot workspaces. Preserve every target through saved-state cloning,
+    # widget merging, marker normalization and the final job-binding builder.
+    many_bindings = [binding(f"MaskTarget{index}", picker.MARKER_ORDER[index % len(picker.MARKER_ORDER)], index + 1)
+                     for index in range(128)]
+    many_roots = [{"name": item["group_name"], "full_path": item["full_dag_path"], "maya_uuid": item["maya_uuid"]}
+                  for item in many_bindings]
+    many_state = picker._parse_state(dict(base, outliner_nodes=many_roots,
+        slot_assignments=[{"video_slot": 1, "bindings": many_bindings}],
+        original_enabled=False, mask_enabled=True, depth_enabled=False, motion_guide_enabled=False))
+    many_state = picker._parse_state(dict(many_state,
+        selected_outliner_paths=[item["full_path"] for item in many_roots],
+        selected_outliner_path=many_roots[-1]["full_path"], selected_outliner_uuid=many_roots[-1]["maya_uuid"],
+        outliner_selection_scope=many_state["outliner_selection_scope"]))
+    assert len(many_state["selected_outliner_paths"]) == 128
+    cloned_many = picker._parse_state(json.loads(json.dumps(many_state)))
+    assert cloned_many["slot_assignments"] == many_state["slot_assignments"]
+    many_job = node._selected_slot_job_bindings(cloned_many, 1)
+    assert len(many_job) == 128 and len({item["color"] for item in many_job}) == 16
+    assert len(picker._normalize_markers(many_job + copy.deepcopy(many_job), 1)) == 128
+    repeated_many = copy.deepcopy(cloned_many)
+    for item in repeated_many["slot_assignments"][0]["bindings"]:
+        item["color"] = "Red"
+    repeated_job = node._selected_slot_job_bindings(repeated_many, 1)
+    assert len(repeated_job) == 128 and {item["color"] for item in repeated_job} == {"Red"}
+    assert len({item["maya_uuid"] for item in repeated_job}) == 128
+    older_many = copy.deepcopy(cloned_many)
+    older_many.update(state_revision=99)
+    older_many["slot_assignments"][0]["bindings"] = older_many["slot_assignments"][0]["bindings"][:5]
+    latest_many = dict(cloned_many, state_revision=100)
+    assert node._merge_widget_state(latest_many, older_many)["slot_assignments"] == latest_many["slot_assignments"]
+    changed_tail = copy.deepcopy(latest_many)
+    changed_tail["slot_assignments"][0]["bindings"][-1]["color"] = "Red"
+    for kind in ("run_video", "render_snapshot"):
+        assert picker._operation_input_digest(kind, str(scene), latest_many, 1) != picker._operation_input_digest(kind, str(scene), changed_tail, 1), \
+            "A target after the fifth assignment must still invalidate stale capture work."
+
+    many_node = picker.HMBVideoPickerLibrary(name="Many Mask Targets Transport Regression")
+    many_node._picker_state = lambda: copy.deepcopy(latest_many)
+    received_many = []
+    many_node._start_ui_operation = lambda action, state: received_many.append((action, copy.deepcopy(state)))
+    for action in ("render_snapshot", "run_video"):
+        many_node._hmb_pending_operation_id = ""
+        many_node._handle_picker_command({
+            "schema": picker.COMMAND_SCHEMA, "version": picker.COMMAND_VERSION,
+            "runtime_instance_id": many_node._hmb_runtime_instance_id,
+            "action": action, "action_id": "many-target-" + action,
+            "payload": {"scene_path": str(scene), "snapshot_frame": 112.0,
+                        "authoring_state": {"slot_assignments": cloned_many["slot_assignments"]}},
+        })
+        assert received_many[-1][0] == action
+        transported_job = many_node._selected_slot_job_bindings(received_many[-1][1], 1)
+        assert transported_job == many_job, "Snapshot/Playblast command must retain every target and marker."
+
     class ReachedMayaDetection(Exception):
         pass
 
@@ -188,4 +243,4 @@ with tempfile.TemporaryDirectory(prefix="hmb-picker-multi-snapshot-") as tempora
     finally:
         picker._find_mayabatch = original_find_maya
 
-print("VideoPicker multi-object same-color, scoped selection, atomic Snapshot authoring and retry: PASS")
+print("VideoPicker 128-object/16-marker same-color reuse, clone/stale preservation, exact Snapshot/Playblast job bindings and retry: PASS")

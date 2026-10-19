@@ -201,12 +201,28 @@ if agent_module._BuiltinAgent is None:
     raise SystemExit(0)
 
 native = inspect.getmodule(base)
-native_schema = native.create_model(schema)
-assert native_schema.model_validate(json.loads(valid)).instruction == instruction
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError
+from pydantic import TypeAdapter
+
+# Current Standard publishes JSON Schema through PydanticAI StructuredDict.
+# Its native TypeAdapter preserves dictionaries; it is not the removed
+# JSONSchema-to-Pydantic field validator. Check the actual schema supplied to
+# the provider and retain HMB's mandatory post-inference rejection boundary.
+native_output_type = native.output_type_from_schema(deepcopy(schema))
+native_adapter = TypeAdapter(native_output_type)
+native_schema = native_adapter.json_schema()
+assert {key: value for key, value in native_schema.items() if key != "title"} == schema
+assert native_adapter.validate_python(json.loads(valid))["instruction"] == instruction
+native_validator = Draft202012Validator(native_schema)
+native_validator.validate(json.loads(valid))
 for value in (envelope(source_sha256="0" * 64), envelope(""), envelope("한" * 50001)):
+    preserved = native_adapter.validate_python(json.loads(value))
+    assert preserved == json.loads(value)
+    rejected(json.dumps(preserved, ensure_ascii=False))
     try:
-        native_schema.model_validate(json.loads(value))
+        native_validator.validate(preserved)
         raise AssertionError("Installed SDK schema accepted invalid contract")
-    except Exception as exc:
-        assert type(exc).__name__ == "ValidationError", type(exc).__name__
-print("HMB_WEB_OUTPUT_NATIVE=PASS (installed JSONSchema-to-Pydantic required fields, enum, min/max length)")
+    except ValidationError:
+        pass
+print("HMB_WEB_OUTPUT_NATIVE=PASS (installed StructuredDict schema exact; enum/min/max provider constraints and HMB post-inference rejection)")

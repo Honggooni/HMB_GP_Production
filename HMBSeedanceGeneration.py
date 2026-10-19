@@ -26,7 +26,7 @@ import webbrowser
 import weakref
 from collections.abc import Iterator
 from contextlib import asynccontextmanager, suppress
-from copy import deepcopy
+from copy import copy, deepcopy
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -120,7 +120,7 @@ from _hmb_mp4_verify import (
 import _hmb_shot_routing as _shot_routing
 import _hmb_review as _review
 from _hmb_image_limits import inspect_seedance_image_payload
-from _hmb_project import project_from_asset_payload, resolve_project
+from _hmb_project import PROJECTS, project_from_asset_payload, resolve_project
 from _hmb_build_diagnostics import get_build_diagnostics as _get_build_diagnostics
 from _hmb_common import (
     _broker_load_bearer_token_readonly,
@@ -348,6 +348,9 @@ TASK_OMNI_REFERENCE_TYPES = {
 BROKER_SEEDANCE_CAPABILITIES_PATH = "/api/v1/generate/video/capabilities"
 BROKER_SEEDANCE_CAPABILITIES_SCHEMA = "hmb-seedance-generation-capabilities"
 BROKER_SEEDANCE_CAPABILITIES_VERSION = 2
+GENERATION_MODE_METADATA_SCHEMA = "hmb-generation-mode-v1"
+GENERATION_MODE_METADATA_FIELD = "hmb_generation_mode"
+GENERATION_TASK_METADATA_FIELD = "hmb_generation_task"
 BROKER_SEEDANCE_DRAFT_CAPABILITIES_VERSION = 3
 DRAFT_ACTION_OFF = "Off"
 DRAFT_ACTION_PREVIEW = "Draft 480p"
@@ -356,10 +359,17 @@ DRAFT_ACTION_CHOICES = (DRAFT_ACTION_OFF, DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FIN
 DRAFT_SOURCE_PARAMETER = "HMB_SEEDANCE_DRAFT_SOURCE"
 DRAFT_SOURCES_PARAMETER = "HMB_SEEDANCE_DRAFT_SOURCES"
 PROJECT_SELECTION_SCHEMA = "hmb-imageasset-project-selection-v1"
+ONLY_PROJECT_SELECTION_SCHEMA = "hmb-only-project-selection-v1"
+ONLY_PROJECT_PARAMETER = "only_project"
+ONLY_PROJECT_UNSELECTED = "Select Project"
 
 
 class _ProjectSelectionChanged(ValueError):
     """The captured local selection lost authority before a create request."""
+
+
+class _ProjectSelectionRequired(ValueError):
+    """No explicit or connected project; only legacy Final may use its source."""
 
 
 DRAFT_OWNER_PARAMETER = "HMB_SEEDANCE_DRAFT_OWNER"
@@ -574,6 +584,8 @@ SEEDANCE_SHOT_WIDGET_NAME = "HMBSeedanceGenerationWidget"
 SEEDANCE_SHOT_WIDGET_LIBRARY_NAME = "HMB_GP_Production"
 SEEDANCE_SHOT_WIDGET_HEIGHT = 64
 SEEDANCE_REFRESH_COMMAND_PARAMETER = "HMB_SEEDANCE_REFRESH_COMMAND"
+SEEDANCE_PREFLIGHT_PARAMETER = "HMB_SEEDANCE_PREFLIGHT"
+SEEDANCE_PREFLIGHT_SCHEMA = "hmb-seedance-render-preflight"
 BROKER_SERVER_URL_PARAMETER = "broker_server_url"
 SEEDANCE_REFRESH_COMMAND_SCHEMA = "hmb-seedance-refresh-command"
 SEEDANCE_REFRESH_COMMAND_VERSION = 1
@@ -660,12 +672,39 @@ GENERATION_PREVIEW_GUIDANCE = {
 }
 
 
+def _seedance_local_preview_value(value: Any = None) -> dict[str, str]:
+    """Accept only the bounded original-source/loopback read-only preview pair."""
+    if not isinstance(value, dict) or set(value) != {"source", "url"}:
+        return {}
+    source, url = value.get("source"), value.get("url")
+    if (not isinstance(source, str) or not source.strip() or len(source) > 4096
+            or not isinstance(url, str) or not url or len(url) > 8192
+            or re.search(r"[\x00-\x1f\x7f]", source + url)
+            or "\\" in url):
+        return {}
+    try:
+        # A drive letter is a local path, not a URL scheme. File/HTTP/data/asset
+        # URLs are never resolved or proxied through this optional local path.
+        if urlparse(source).scheme and not re.match(r"^[A-Za-z]:[\\/]", source):
+            return {}
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        loopback = host.casefold() == "localhost" or ipaddress.ip_address(host).is_loopback
+        if (parsed.scheme not in {"http", "https"} or not loopback
+                or parsed.username is not None or parsed.password is not None
+                or parsed.fragment or parsed.port == 0
+                or not parsed.path.startswith(("/workspace/", "/external/"))):
+            return {}
+    except (ValueError, TypeError):
+        return {}
+    return {"source": source, "url": url}
+
+
 def _seedance_generation_preview_value(value: Any = None) -> dict[str, Any]:
     """Return the bounded, browser-safe runtime preview contract.
 
-    This value deliberately contains no media path, signed URL, provider body,
-    or browser-supplied identifier.  The custom widget receives only enough
-    state to explain an empty preview and request a same-job refresh.
+    The optional original local preview is an engine-minted loopback read URL.
+    Provider URLs/bodies and browser-supplied task authority remain excluded.
     """
 
     source = value if isinstance(value, dict) else {}
@@ -702,7 +741,7 @@ def _seedance_generation_preview_value(value: Any = None) -> dict[str, Any]:
         and phase in GENERATION_PREVIEW_REFRESH_PHASES
         else "none"
     )
-    return {
+    result = {
         "schema": GENERATION_PREVIEW_SCHEMA,
         "version": GENERATION_PREVIEW_VERSION,
         "phase": phase,
@@ -714,6 +753,10 @@ def _seedance_generation_preview_value(value: Any = None) -> dict[str, Any]:
         "has_existing_video": source.get("has_existing_video") is True,
         "media_revision": media_revision,
     }
+    local_preview = _seedance_local_preview_value(source.get("local_preview"))
+    if local_preview:
+        result["local_preview"] = local_preview
+    return result
 
 
 def _seedance_refresh_command_value(value: Any = None) -> dict[str, Any]:
@@ -834,6 +877,53 @@ def _seedance_draft_final_request_id(draft_job_id: str) -> str:
     if not isinstance(draft_job_id, str) or re.fullmatch(r"job-[0-9a-f]{32}", draft_job_id) is None:
         raise ValueError("Finalization requires a canonical Broker Draft task ID.")
     return "hmb-draft-final-v1-" + draft_job_id
+
+
+_DRAFT_FINAL_SERVER_STATES = frozenset({"available", "source_pending", "reserved", "running",
+    "completed", "consumed", "expired", "unknown", "not_draft"})
+_DRAFT_FINAL_HIDDEN_STATES = frozenset({"completed", "consumed", "expired", "not_draft"})
+_DRAFT_FINAL_SYNC_SECONDS = 10.0
+
+
+def _seedance_draft_final_state_value(value: Any, source: dict[str, Any]) -> dict[str, Any]:
+    """Keep only the authenticated, exact-source advisory projection."""
+    required = {"schema", "state_schema", "state", "is_draft", "eligible", "consumed", "source_task_id",
+                "checked_at", "expires_at", "owner_user_id", "project_id", "project_name",
+                "child_task_id", "child_status", "idempotency_key"}
+    if (not isinstance(value, dict) or not required.issubset(value)
+            or value.get("schema") != "hmb-review-draft-final-v1"
+            or value.get("state_schema") != "hmb-draft-final-state-v1"
+            or value.get("source_task_id") != source["draft_job_id"]
+            or not isinstance(value.get("state"), str) or value["state"] not in _DRAFT_FINAL_SERVER_STATES
+            or type(value.get("is_draft")) is not bool
+            or type(value.get("eligible")) is not bool
+            or value.get("consumed") is not None and type(value["consumed"]) is not bool
+            or type(value.get("checked_at")) is not int or value["checked_at"] <= 0
+            or abs(time.time() - value["checked_at"]) > 300
+            or type(value.get("owner_user_id")) is not int or value["owner_user_id"] <= 0
+            or value.get("idempotency_key") != _seedance_draft_final_request_id(source["draft_job_id"])
+            or any(value.get(key) != source[key] for key in ("project_id", "project_name"))):
+        raise _BrokerProtocolError("Broker returned an invalid Draft Final state.")
+    child = value.get("child_task_id")
+    child_status = value.get("child_status")
+    expires = value.get("expires_at")
+    if (child is not None and (not isinstance(child, str) or re.fullmatch(r"job-[0-9a-f]{32}", child) is None)
+            or child_status is not None and (not isinstance(child_status, str) or len(child_status) > 64
+                or re.fullmatch(r"[A-Za-z0-9_-]+", child_status) is None)
+            or expires is not None and (type(expires) is not int or expires <= 0)
+            or child is None and child_status is not None
+            or value["eligible"] != (value["state"] == "available")
+            or value["eligible"] and (value.get("is_draft") is not True
+                or value.get("consumed") is not False or child is not None
+                or expires is None or expires <= max(value["checked_at"], time.time() - 300))
+            or value["state"] in {"reserved", "running", "completed", "consumed"}
+                and (value.get("is_draft") is not True or value.get("consumed") is not True
+                     or child is None or child_status is None)
+            or value["state"] == "unknown" and value.get("consumed") is not None):
+        raise _BrokerProtocolError("Broker returned an inconsistent Draft Final state.")
+    return {key: value.get(key) for key in ("state", "eligible", "consumed", "source_task_id",
+        "checked_at", "expires_at", "owner_user_id", "project_id", "project_name",
+        "child_task_id", "child_status", "idempotency_key")}
 
 
 class _SeedanceDraftOutputDestination:
@@ -1143,7 +1233,11 @@ def _seedance_draft_ui_value(value: Any = None) -> dict[str, Any]:
             "active_action": source.get("active_action") if source.get("active_action") in DRAFT_ACTION_CHOICES else DRAFT_ACTION_OFF,
             "cancel_available": source.get("cancel_available") is True,
             "active_job_id": str(source.get("active_job_id") or "")[:128],
-            "reason": str(source.get("reason") or "")[:400]}
+            "reason": str(source.get("reason") or "")[:400],
+            **({"final_state": str(source.get("final_state") or "")[:32],
+                "final_visible": source.get("final_visible") is True,
+                "final_task_id": str(source.get("final_task_id") or "")[:128]}
+               if "final_state" in source else {})}
 
 
 def _seedance_remote_prompt_route_value(value: Any = None) -> dict[str, Any]:
@@ -2079,6 +2173,8 @@ class _HMBAIBrokerBridge:
             "project_selection_schema",
             "draft",
             "draft_job_id",
+            GENERATION_MODE_METADATA_FIELD,
+            GENERATION_TASK_METADATA_FIELD,
         }
     )
     _COMMON_SEEDANCE_FIELDS = frozenset(
@@ -2101,6 +2197,8 @@ class _HMBAIBrokerBridge:
             "project_id",
             "project_name",
             "project_selection_schema",
+            GENERATION_MODE_METADATA_FIELD,
+            GENERATION_TASK_METADATA_FIELD,
         }
     )
     _REFERENCE_MODE_FIELDS = frozenset(
@@ -2131,6 +2229,8 @@ class _HMBAIBrokerBridge:
         self._opener = opener if opener is not None else _broker_build_opener()
         self._server_url = _broker_validated_server_url(server_url)
         self._seedance_capabilities: dict[str, Any] | None = None
+        self._generation_mode_metadata_capability: dict[str, frozenset[str]] = {}
+        self._generation_mode_metadata_checked_at: float | None = None
 
     @property
     def server_url(self) -> str:
@@ -2150,6 +2250,33 @@ class _HMBAIBrokerBridge:
                 or result.get("retention_days") != 30):
             raise _BrokerProtocolError("Broker review portal capabilities are unsupported.")
         return result
+
+    def require_generation_project_selection(self, schema: str, *, timeout: float = 5) -> None:
+        if schema == PROJECT_SELECTION_SCHEMA:
+            return
+        if schema != ONLY_PROJECT_SELECTION_SCHEMA:
+            raise _BrokerProtocolError("The generation project selection schema is unsupported.")
+        capabilities = self.review_capabilities()
+        routing = capabilities.get("project_routing")
+        supported = routing.get("generation_project_selection_schemas") if isinstance(routing, dict) else None
+        if (not isinstance(supported, list) or not supported
+                or any(not isinstance(item, str) for item in supported)
+                or ONLY_PROJECT_SELECTION_SCHEMA not in supported):
+            raise _BrokerProtocolError(
+                "This Broker does not support manual Only project selection yet. No media was uploaded or render submitted."
+            )
+
+    def get_draft_final_state(self, source: dict[str, Any], *, timeout: float = 5) -> dict[str, Any]:
+        record = _seedance_draft_source_value(source)
+        if not record or record["broker_server_url"] != self.server_url:
+            raise _BrokerProtocolError("Draft status has no exact Broker source binding.")
+        # This advisory request must not clear a saved credential on a 401.
+        # It never performs refresh, reservation, submission, or media download.
+        readonly = copy(self)
+        readonly._clear_access_token = lambda: None
+        result = readonly._request_json("GET", self._review_task_path(record["draft_job_id"]) + "/draft-final",
+                                        payload=None, timeout=timeout)
+        return _seedance_draft_final_state_value(result, record)
 
     def put_task_casecard(self, task_id: str, evidence: dict[str, Any]) -> dict[str, Any]:
         if evidence.get("schema") != _review.SCHEMA or evidence.get("version") != 1:
@@ -2600,6 +2727,70 @@ class _HMBAIBrokerBridge:
             return "mp4"
         raise _BrokerProtocolError("FN AI Broker has not enabled the selected Seedance output format.")
 
+    def _remember_generation_mode_capability(self, response: Any) -> None:
+        """Cache optional display provenance, independently of model features."""
+        self._generation_mode_metadata_checked_at = time.monotonic()
+        self._generation_mode_metadata_capability = {}
+        if (not isinstance(response, dict)
+                or response.get("schema") != BROKER_SEEDANCE_CAPABILITIES_SCHEMA
+                or type(response.get("version")) is not int
+                or response["version"] not in {BROKER_SEEDANCE_CAPABILITIES_VERSION,
+                                               BROKER_SEEDANCE_DRAFT_CAPABILITIES_VERSION}
+                or not isinstance(response.get("models"), dict)):
+            return
+        capability = response.get("generation_mode_metadata")
+        if (not isinstance(capability, dict)
+                or capability.get("schema") != GENERATION_MODE_METADATA_SCHEMA
+                or capability.get("field") != GENERATION_MODE_METADATA_FIELD
+                or capability.get("task_field") != GENERATION_TASK_METADATA_FIELD):
+            return
+        modes, tasks = capability.get("choices"), capability.get("tasks")
+        if (not isinstance(modes, list) or not isinstance(tasks, list)
+                or any(type(value) is not str for value in modes + tasks)):
+            return
+        self._generation_mode_metadata_capability = {
+            "modes": frozenset(modes).intersection({"only", "shot"}),
+            "tasks": frozenset(tasks).intersection(TASK_STORAGE_CHOICES),
+        }
+
+    def _apply_generation_mode_metadata(self, payload: dict[str, Any], *,
+                                        task: str, timeout: float) -> None:
+        """Send captured provenance only when this Broker advertises support.
+
+        Absence or failure of this optional feature must preserve legacy render
+        semantics. Neither Task nor Only is inferred from the project's schema,
+        Draft state, prompt or current widget controls.
+        """
+        mode = payload.pop(GENERATION_MODE_METADATA_FIELD, None)
+        captured_task = payload.pop(GENERATION_TASK_METADATA_FIELD, None)
+        if type(mode) is not str or mode not in {"only", "shot"}:
+            mode = None
+        if (type(captured_task) is not str or captured_task not in TASK_STORAGE_CHOICES
+                or captured_task != task
+                or payload.get("input_mode") not in (None, TASK_INPUT_MODES[captured_task])
+                or payload.get("omni_reference_task_type") not in
+                   (None, TASK_OMNI_REFERENCE_TYPES.get(captured_task))):
+            captured_task = None
+        if mode is None and captured_task is None:
+            return
+        checked = self._generation_mode_metadata_checked_at
+        if checked is None or time.monotonic() - checked >= 30.0:
+            try:
+                readonly = copy(self)
+                readonly._clear_access_token = lambda: None
+                response = readonly._request_json("GET", BROKER_SEEDANCE_CAPABILITIES_PATH,
+                    payload=None, timeout=max(1.0, min(float(timeout), 5.0)))
+            except Exception:
+                # A pre-V27 Broker, a failed discovery, or a rolling upgrade
+                # must not turn optional display metadata into a render gate.
+                response = None
+            self._remember_generation_mode_capability(response)
+        capability = self._generation_mode_metadata_capability
+        if mode in capability.get("modes", ()):
+            payload[GENERATION_MODE_METADATA_FIELD] = mode
+        if captured_task in capability.get("tasks", ()):
+            payload[GENERATION_TASK_METADATA_FIELD] = captured_task
+
     def require_seedance_features(
         self,
         *,
@@ -2664,6 +2855,7 @@ class _HMBAIBrokerBridge:
                 raise _BrokerProtocolError(
                     "FN AI Broker returned an invalid Seedance capability contract."
                 )
+            self._remember_generation_mode_capability(response)
             models = response["models"]
             profile = models.get(SEEDANCE_2_5_MODEL_ID)
             if not isinstance(profile, dict):
@@ -2741,6 +2933,7 @@ class _HMBAIBrokerBridge:
             raise _BrokerProtocolError(
                 "FN AI Broker has not enabled Seedance 2.5 Draft. No render was submitted."
             )
+        self._remember_generation_mode_capability(response)
         # A missing legacy list proves no MOV limitation. Keep old MP4 callers,
         # but stop fresh MOV requests until the server declares its actual formats.
         draft_formats = profile.get("draft_output_formats")
@@ -2780,10 +2973,12 @@ class _HMBAIBrokerBridge:
             if any(request_payload.get(key) != project[key] for key in ("project_id", "project_name")):
                 raise _BrokerProtocolError("Seedance Broker project metadata is not canonical.")
         if "project_selection_schema" in request_payload and (
-            request_payload["project_selection_schema"] != PROJECT_SELECTION_SCHEMA
+            request_payload["project_selection_schema"] not in (PROJECT_SELECTION_SCHEMA, ONLY_PROJECT_SELECTION_SCHEMA)
             or not all(key in request_payload for key in ("project_id", "project_name"))
         ):
             raise _BrokerProtocolError("Seedance Broker selected-project provenance is invalid.")
+        if request_payload.get("project_selection_schema") == ONLY_PROJECT_SELECTION_SCHEMA:
+            self.require_generation_project_selection(ONLY_PROJECT_SELECTION_SCHEMA, timeout=min(timeout, 5))
         request_payload["provider"] = "volcengine_ark"
         model = str(request_payload.get("model") or "").strip()
         if not model:
@@ -2890,6 +3085,7 @@ class _HMBAIBrokerBridge:
             request_payload.pop("omni_reference_task_type", None)
             request_payload.pop("output_format", None)
             request_payload.pop("return_last_frame", None)
+        self._apply_generation_mode_metadata(request_payload, task=task, timeout=timeout)
         priority = request_payload.get("priority")
         if model != SEEDANCE_2_0_MODEL_ID and priority not in (None, 0):
             raise _BrokerProtocolError(
@@ -3054,6 +3250,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._hmb_draft_final_context = None
         self._hmb_draft_controls_syncing = False
         self._hmb_draft_pending_source = {}
+        self._hmb_draft_final_status_cache: dict[str, Any] = {}
+        self._hmb_draft_final_status_future = None
+        self._hmb_draft_final_status_scope: tuple[str, ...] = ()
         self._hmb_generation_preview_state = _seedance_generation_preview_value()
         self._hmb_generation_recovery_restore_fingerprint: (
             tuple[Any, ...] | None
@@ -3087,6 +3286,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._hmb_pending_gallery_origin = ""
         self._hmb_processed_generation_command_ids: set[str] = set()
         self._hmb_node_deleted = False
+        self._hmb_preflight_epoch = 0
+        self._hmb_preflight_task = None
+        self._hmb_preflight_command_ids: set[str] = set()
+        self._hmb_preflight_active_request_id = ""
+        self._hmb_preflight_client_sequences = {}
+        self._hmb_preflight_active_client_session = ""
+        self._hmb_preflight_publishing = False
         self._hmb_delete_parent_called = False
         self._hmb_model_migration_active = False
         self._hmb_retired_model_migration_pending = False
@@ -3365,6 +3571,23 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     )
         self.add_parameter(shot_widget_parameter)
 
+        # A separate, non-serializable property isolates inspection from Shot
+        # selection, Draft/Resume commands and all generation inputs.
+        preflight_kwargs = {
+            "name": SEEDANCE_PREFLIGHT_PARAMETER, "type": "dict",
+            "default_value": {"schema": SEEDANCE_PREFLIGHT_SCHEMA, "version": 1,
+                "phase": "idle", "request_id": "", "rows": [], "issues": []},
+            "allowed_modes": {ParameterMode.PROPERTY}, "serializable": False,
+            "tooltip": "Read-only same-flow Shot readiness; never runs or submits a render.",
+            "ui_options": {"display_name": "", "is_full_width": True, "hide_label": True,
+                "hide_handles": True, "height": 38, "min_height": 38, "max_height": 38,
+                "widget_height": 38, "resizable": False, "expandable": False},
+        }
+        if Widget is not None:
+            preflight_kwargs["traits"] = {Widget(name=SEEDANCE_SHOT_WIDGET_NAME,
+                library=SEEDANCE_SHOT_WIDGET_LIBRARY_NAME)}
+        self.add_parameter(Parameter(**preflight_kwargs))
+
         # A separate, zero-height custom-widget parameter carries one-shot
         # refresh commands. Reusing HMB_SEEDANCE_SHOT_UI would make Griptape
         # reconcile the durable Shot/catalog value; programmatically clicking
@@ -3508,6 +3731,24 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         MODEL_TASK_CHOICES[SEEDANCE_2_5_MODEL_ID]
                     ),
                 },
+            )
+        )
+        self.add_parameter(
+            ParameterString(
+                name=ONLY_PROJECT_PARAMETER,
+                default_value=ONLY_PROJECT_UNSELECTED,
+                tooltip=(
+                    "Project for manual Only-mode renders. Select explicitly when no "
+                    "ImageAsset project is connected. A connected ImageAsset remains "
+                    "authoritative; a different manual selection is rejected."
+                ),
+                allowed_modes={ParameterMode.PROPERTY},
+                traits={Options(choices=[ONLY_PROJECT_UNSELECTED, *(
+                    project["project_name"] for project in PROJECTS.values()
+                )])},
+                ui_options={"display_name": "Project (Only)", "simple_dropdown": [
+                    ONLY_PROJECT_UNSELECTED, *(project["project_name"] for project in PROJECTS.values())
+                ]},
             )
         )
         self.add_parameter(
@@ -4332,6 +4573,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 subscription = getter()
             except Exception:
                 continue
+            if (isinstance(subscription, dict)
+                    and subscription.get("participant_kind") == "seedance"
+                    and not subscription.get("enabled")):
+                suspended = getattr(candidate, "_hmb_suspended_shot_identity", None)
+                if isinstance(suspended, dict):
+                    subscription = {**subscription, **suspended, "enabled": True}
             if (
                 isinstance(subscription, dict)
                 and subscription.get("participant_kind") == "seedance"
@@ -5147,7 +5394,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         try:
             source = None if self._draft_final_requested() else self._manual_agent_prompt_source()
             getter = getattr(source, "_hmb_agent_reference_observation_snapshot", None)
-            observation = getter() if callable(getter) else {"status": "not_available"}
+            managed = getattr(self, "_hmb_managed_agent_request", None)
+            observation = (deepcopy(managed["record"].get("observation") or {})
+                           if isinstance(managed, dict)
+                           else getter() if callable(getter) else {"status": "not_available"})
             self._hmb_review_case_id = _review.start_case(
                 client_request_id, getattr(self, "_hmb_review_inputs", {}), submitted_prompt,
                 _get_build_diagnostics(), observation if isinstance(observation, dict) else {},
@@ -5390,6 +5640,40 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             pass
         threading.Thread(target=launch, name=f"{self.name}-gallery-open", daemon=True).start()
 
+    def _restore_saved_generation_media_revision(
+        self, generation_id: str, artifact: Any,
+    ) -> None:
+        """Resume the counter from matching completed-file provenance, never UI."""
+        if not generation_id or getattr(self, "_hmb_node_deleted", False):
+            return
+        source = _generated_video_source_value(
+            self.get_parameter_value(GENERATED_VIDEO_SOURCE_PARAMETER)
+        )
+        if not source or source.get("task_id") != generation_id:
+            return
+        output_id = str(self.parameter_output_values.get("generation_id") or "").strip()
+        if output_id and output_id != generation_id:
+            return
+        location = getattr(artifact, "value", None)
+        if not isinstance(location, str) or not location:
+            return
+        if urlparse(location).scheme and not re.match(r"^[A-Za-z]:[\\/]", location):
+            return
+        try:
+            resolved = File(location).resolve()
+            path = Path(str(getattr(resolved, "location", resolved))).resolve()
+            if not path.is_file() or path != Path(source["path"]).resolve():
+                return
+        except Exception:
+            return
+        previous = int(getattr(self, "_hmb_generation_media_revision", 0))
+        restored = max(previous, source["result_revision"])
+        if restored != previous:
+            self._hmb_generation_media_revision = restored
+            # A later provenance replay must not be hidden by an earlier
+            # recovery fingerprint made before that property was available.
+            self._hmb_generation_recovery_restore_fingerprint = None
+
     def _restore_generation_recovery_preview(self) -> None:
         """Recreate only the same-task UI action after workflow hydration."""
 
@@ -5403,6 +5687,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         video_present = self._generation_artifact_is_locally_available(
             current_video
         )
+        if video_present:
+            self._restore_saved_generation_media_revision(generation_id, current_video)
         if not generation_id:
             fingerprint = ("idle", "", video_present)
             if self._hmb_generation_recovery_restore_fingerprint == fingerprint:
@@ -5809,6 +6095,67 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             source.pop("final_request_id", None)
             self._store_draft_source(source)
 
+    def _local_original_generation_preview(self) -> dict[str, str]:
+        """Mint a read URL for the existing original; never publish or convert it."""
+        if getattr(self, "_hmb_node_deleted", False):
+            return {}
+        artifact = (self.parameter_output_values.get("video_url")
+                    or self.parameter_output_values.get("VIDEO_OUT")
+                    or getattr(self, "_hmb_last_success_video", None))
+        source = getattr(artifact, "value", None)
+        if (not isinstance(source, str) or not source.strip()
+                or len(source) > 4096 or re.search(r"[\x00-\x1f\x7f]", source)):
+            return {}
+        try:
+            if urlparse(source).scheme and not re.match(r"^[A-Za-z]:[\\/]", source):
+                return {}
+            from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
+            from griptape_nodes.files.path_utils import canonicalize_to_posix, strip_windows_long_path_prefix
+
+            driver = self.engine.static_files_manager.storage_driver
+            if not isinstance(driver, LocalStorageDriver):
+                return {}  # A cloud/custom driver must never receive this file.
+            resolved = File(source).resolve()
+            path = Path(str(getattr(resolved, "location", resolved))).resolve()
+            if not path.is_file():
+                return {}
+            url = driver.create_signed_download_url(path)
+            preview = _seedance_local_preview_value({"source": source, "url": url})
+            if not preview:
+                return {}
+            # Prove the URL's path as well as its host: a driver returning an
+            # unrelated local resource cannot bind it to this original source.
+            absolute = Path(strip_windows_long_path_prefix(path))
+            workspace = Path(strip_windows_long_path_prefix(driver.workspace_directory)).resolve()
+            try:
+                relative = absolute.relative_to(workspace)
+                expected = f"{driver.base_url}/{relative.as_posix()}"
+            except ValueError:
+                external = canonicalize_to_posix(str(absolute)).removeprefix("/")
+                expected = f"{driver.base_url.rsplit('/workspace', 1)[0]}/external/{external}"
+            if urlparse(url)._replace(query="").geturl() != expected:
+                return {}
+            current = (self.parameter_output_values.get("video_url")
+                       or self.parameter_output_values.get("VIDEO_OUT")
+                       or getattr(self, "_hmb_last_success_video", None))
+            if (getattr(self, "_hmb_node_deleted", False) or current is not artifact
+                    or getattr(current, "value", None) != source):
+                return {}
+            return preview
+        except Exception:
+            # Preview is optional; an absent/incompatible local server must not
+            # change the completed Task, existing artifact, or generation path.
+            return {}
+
+    def _generation_preview_for_widget(self) -> dict[str, Any]:
+        """Build trusted display state for both stored values and UI events."""
+        generation = dict(self._hmb_generation_preview_state)
+        generation.pop("local_preview", None)
+        local_preview = self._local_original_generation_preview()
+        if local_preview:
+            generation["local_preview"] = local_preview
+        return generation
+
     def _sync_seedance_shot_widget(self, *, emit_change: bool = False) -> None:
         parameter = self.get_parameter_by_name(SEEDANCE_SHOT_WIDGET_PARAMETER)
         if parameter is None:
@@ -5823,7 +6170,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "shot_uuid": identity["shot_uuid"],
             },
             available_catalog,
-            self._hmb_generation_preview_state,
+            self._generation_preview_for_widget(),
             getattr(self, "_hmb_remote_prompt_route", None),
             self._draft_ui_state(),
         )
@@ -6011,6 +6358,29 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self._hmb_remote_prompt_route = discovered_route
             self._sync_seedance_shot_widget(emit_change=True)
 
+    @staticmethod
+    def _agent_route_subscription(source_node: Any, identity: dict[str, Any]) -> Any:
+        """Describe this Generator's Shot independently of the open Agent row.
+
+        This is UI decoration only. The physical edge and immutable per-run
+        result continue to establish execution authority.
+        """
+        try:
+            manager = getattr(source_node, "_hmb_shot_manager_enabled", None)
+            if callable(manager) and manager():
+                declared = source_node._hmb_agent_shot_subscriptions()
+                if not isinstance(declared, (list, tuple)) or len(declared) > 5:
+                    return None
+                fields = ("channel_uuid", "shot_uuid", "shot_number", "shot_name")
+                exact = [item for item in declared if isinstance(item, dict)
+                         and item.get("participant_kind") == "agent" and item.get("enabled") is True
+                         and all(item.get(key) == identity.get(key) for key in fields)]
+                return exact[0] if len(exact) == 1 else None
+            getter = getattr(source_node, "_hmb_shot_channel_subscription", None)
+            return getter() if callable(getter) else None
+        except Exception:
+            return None
+
     def _hmb_prepare_remote_prompt_route(self, source_node: Any) -> bool:
         """Pre-arm exact old/new edge hiding before retained-mode mutation.
 
@@ -6020,19 +6390,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         """
 
         identity = self._shot_identity()
-        subscription_getter = getattr(
-            source_node,
-            "_hmb_shot_channel_subscription",
-            None,
-        )
-        try:
-            subscription = (
-                subscription_getter()
-                if callable(subscription_getter)
-                else None
-            )
-        except Exception:
-            return False
+        subscription = self._agent_route_subscription(source_node, identity)
         if (
             not identity["channel_uuid"]
             or not identity["shot_uuid"]
@@ -6081,19 +6439,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return disconnected
         if source_node is None:
             return disconnected
-        subscription_getter = getattr(
-            source_node,
-            "_hmb_shot_channel_subscription",
-            None,
-        )
-        try:
-            subscription = (
-                subscription_getter()
-                if callable(subscription_getter)
-                else None
-            )
-        except Exception:
-            return disconnected
+        subscription = self._agent_route_subscription(source_node, identity)
         if (
             not isinstance(subscription, dict)
             or subscription.get("participant_kind") != "agent"
@@ -6117,6 +6463,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     def _hmb_reconcile_shot_routing(self, routing_snapshot: Any) -> None:
         snapshot = self._validate_shot_catalog_snapshot(routing_snapshot)
         identity = self._shot_identity()
+        suspended = getattr(self, "_hmb_suspended_shot_identity", None)
+        if (not identity["shot_uuid"] and isinstance(suspended, dict)
+                and suspended.get("channel_uuid") == snapshot["channel_uuid"]):
+            identity = suspended
         if identity["channel_uuid"] and identity["channel_uuid"] != snapshot["channel_uuid"]:
             raise RuntimeError("Seedance Shot channel does not match the ImageAsset publisher.")
         previous = self._hmb_shot_catalog_snapshot
@@ -6158,12 +6508,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # may adopt the first available UUID.
         fallback_to_available = bool(
             not identity.get("shot_uuid")
+            and not isinstance(suspended, dict)
             and self.get_parameter_value(SHOT_AUTOCLAIM_ENABLED_PARAMETER)
         )
         self._apply_seedance_shot_selection(
             selected["shot_uuid"] if isinstance(selected, dict) else "",
             fallback_to_available=fallback_to_available,
         )
+        if self._shot_identity().get("shot_uuid"):
+            self._hmb_suspended_shot_identity = None
         self._hmb_shot_route_status = {
             "schema": "hmb-shot-routing-status",
             "version": 1,
@@ -6190,6 +6543,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
         snapshot = self._validate_shot_catalog_snapshot(routing_snapshot)
         identity = self._shot_identity()
+        if not identity["shot_uuid"]:
+            suspended = getattr(self, "_hmb_suspended_shot_identity", None)
+            if isinstance(suspended, dict):
+                identity = suspended
         if (
             not identity["channel_uuid"]
             or identity["channel_uuid"] == snapshot["channel_uuid"]
@@ -6208,6 +6565,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     ) -> dict[str, Any]:
         """Clear remote authority without touching standalone generation inputs."""
 
+        identity = self._shot_identity()
+        if str(reason) == "publisher_unavailable":
+            if identity["channel_uuid"] and identity["shot_uuid"]:
+                # A temporary missing publisher must not reassign this node by
+                # display number or borrow a standalone Picker's new channel.
+                self._hmb_suspended_shot_identity = {
+                    "channel_uuid": identity["channel_uuid"],
+                    "shot_uuid": identity["shot_uuid"],
+                }
+        else:
+            self._hmb_suspended_shot_identity = None
         self._hmb_shot_catalog_snapshot = None
         self._hmb_shot_catalog_generation = 0
         self._hmb_shot_selector_map = {}
@@ -6230,6 +6598,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return self._hmb_shot_channel_subscription()
+        self._hmb_suspended_shot_identity = None
         self._set_hidden_control_value(
             SHOT_AUTOCLAIM_ENABLED_PARAMETER,
             False,
@@ -6435,12 +6804,27 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 # assigning the container directly otherwise stores a hidden
                 # top-level cache that its getter intentionally ignores.
                 values = list(value)
-                container.clear_list()
+                # Native saved workflows restore exact dynamic child names
+                # before replaying the parent aggregate and child values.
+                # Reuse those children during equal-length hydration so a
+                # later saved child write/connection still addresses the same
+                # parameter. Explicit edits and count changes retain the
+                # existing rebuild behavior.
+                saved_children = (
+                    list(container.get_child_parameters()) if initial_setup else []
+                )
+                reuse_saved_children = bool(initial_setup) and len(saved_children) == len(values)
+                if not reuse_saved_children:
+                    container.clear_list()
                 parent_setter = super().set_parameter_value
                 self._hmb_list_parent_syncing = True
                 try:
-                    for item in values:
-                        child = container.append_child_parameter()
+                    for index, item in enumerate(values):
+                        child = (
+                            saved_children[index]
+                            if reuse_saved_children
+                            else container.append_child_parameter()
+                        )
                         parent_setter(
                             child.name,
                             item,
@@ -6593,6 +6977,22 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     def before_value_set(self, parameter: Parameter, value: Any) -> Any:
         """Reject browser-supplied catalogs and canonicalize widget Shot requests."""
 
+        if parameter.name == SEEDANCE_PREFLIGHT_PARAMETER:
+            current = self.get_parameter_value(SEEDANCE_PREFLIGHT_PARAMETER)
+            if not isinstance(value, dict) or value.get("schema") != SEEDANCE_PREFLIGHT_SCHEMA or value.get("version") != 1:
+                return current
+            action = value.get("action")
+            request_id = value.get("request_id")
+            if action not in {"inspect", "cancel"} or not isinstance(request_id, str) or re.fullmatch(r"[0-9a-f]{32}", request_id) is None:
+                return current
+            command = {"schema": SEEDANCE_PREFLIGHT_SCHEMA, "version": 1,
+                "action": action, "request_id": request_id}
+            if "client_session" in value or "sequence" in value:
+                session, sequence = value.get("client_session"), value.get("sequence")
+                if not isinstance(session, str) or re.fullmatch(r"[0-9a-f]{32}", session) is None or type(sequence) is not int or not 0 < sequence <= 9007199254740991:
+                    return current
+                command.update(client_session=session, sequence=sequence)
+            return command
         normalized = value
         if parameter.name == SEEDANCE_RECOVERY_PARAMETER:
             normalized = _seedance_recovery_value(value)
@@ -6742,7 +7142,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             normalized = _seedance_widget_value(
                 requested_shot,
                 authoritative_catalog,
-                self._hmb_generation_preview_state,
+                self._generation_preview_for_widget(),
                 getattr(self, "_hmb_remote_prompt_route", None),
             )
         parent = getattr(super(), "before_value_set", None)
@@ -6754,6 +7154,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     def after_value_set(self, parameter: Parameter, value: Any) -> None:
         """Mirror Standard Seedance media visibility for the selected mode."""
+        if parameter.name == SEEDANCE_PREFLIGHT_PARAMETER:
+            if not getattr(self, "_hmb_preflight_publishing", False):
+                self._hmb_handle_preflight_command(value)
+            return None
         authored_draft = self.get_parameter_value("draft_action")
         expected_resolution = "480p" if authored_draft == DRAFT_ACTION_PREVIEW else "1080p"
         if (parameter.name == "resolution" and str(value) != expected_resolution
@@ -6833,6 +7237,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             and parameter.name == SEEDANCE_SHOT_WIDGET_PARAMETER
         ):
             if not self._hmb_autoclaim_in_progress:
+                self._hmb_suspended_shot_identity = None
                 self._set_hidden_control_value(
                     SHOT_AUTOCLAIM_ENABLED_PARAMETER,
                     False,
@@ -6850,6 +7255,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self._update_parameter_visibility()
         elif not self._hmb_shot_syncing and parameter.name == SHOT_SELECTOR_PARAMETER:
             if not self._hmb_autoclaim_in_progress:
+                self._hmb_suspended_shot_identity = None
                 self._set_hidden_control_value(
                     SHOT_AUTOCLAIM_ENABLED_PARAMETER,
                     False,
@@ -6921,7 +7327,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self._schedule_existing_generation_refresh()
         if not self._hmb_shot_syncing and parameter.name in {"draft_action", "resolution", "draft_job_id", DRAFT_SOURCE_PARAMETER,
                                DRAFT_SOURCES_PARAMETER, "model_id", SHOT_SELECTOR_PARAMETER,
-                               SHOT_UUID_PARAMETER, SHOT_CHANNEL_UUID_PARAMETER, BROKER_SERVER_URL_PARAMETER}:
+                               SHOT_UUID_PARAMETER, SHOT_CHANNEL_UUID_PARAMETER, BROKER_SERVER_URL_PARAMETER,
+                               ONLY_PROJECT_PARAMETER}:
             with suppress(Exception):
                 self._sync_seedance_shot_widget(emit_change=True)
         return result
@@ -7427,6 +7834,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
         )
         manual_output_controls = seedance_25_active and not draft_output_fixed
+        if self._draft_only_mode():
+            self.show_parameter_by_name(ONLY_PROJECT_PARAMETER)
+        else:
+            self.hide_parameter_by_name(ONLY_PROJECT_PARAMETER)
         if manual_output_controls:
             self.show_parameter_by_name(["output_format", "return_last_frame"])
         else:
@@ -8103,6 +8514,50 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         return subscription
 
     @staticmethod
+    def _finish_look_source_subscription(
+        source_node: Any, expected_subscription: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Resolve a manager's exact Shot without selecting its visible editor."""
+
+        try:
+            manager = getattr(source_node, "_hmb_shot_manager_enabled", None)
+            manager_flag = manager() if callable(manager) else False
+            if type(manager_flag) is not bool:
+                raise ValueError("Finish Look manager state is unavailable")
+            if manager_flag is False:
+                return HMBSeedanceGeneration._direct_source_subscription(source_node, "finish_look")
+            getter = getattr(source_node, "_hmb_finish_look_shot_subscriptions", None)
+            if not callable(getter):
+                getter = getattr(source_node, "_hmb_shot_manager_subscriptions", None)
+            declared = getter() if callable(getter) else None
+            if not isinstance(declared, (list, tuple)) or not 1 <= len(declared) <= 5:
+                raise ValueError("Invalid Finish Look manager catalog")
+            fields = ("channel_uuid", "shot_uuid", "shot_number", "shot_name")
+            identities, numbers, channels = set(), set(), set()
+            for row in declared:
+                if (not isinstance(row, dict)
+                        or row.get("schema") != "hmb-shot-channel-subscription"
+                        or type(row.get("version")) is not int or row["version"] != 1
+                        or row.get("participant_kind") != "finish_look" or row.get("enabled") is not True
+                        or type(row.get("shot_number")) is not int or not 1 <= row["shot_number"] <= 5
+                        or any(not isinstance(row.get(key), str) or not row[key].strip()
+                               or row[key] != row[key].strip() for key in ("channel_uuid", "shot_uuid", "shot_name"))):
+                    raise ValueError("Invalid Finish Look manager subscription")
+                key = (row["channel_uuid"], row["shot_uuid"])
+                if key in identities or row["shot_number"] in numbers:
+                    raise ValueError("Ambiguous Finish Look manager subscription")
+                identities.add(key)
+                numbers.add(row["shot_number"])
+                channels.add(row["channel_uuid"])
+            exact = [row for row in declared
+                     if all(row.get(key) == expected_subscription.get(key) for key in fields)]
+            if len(channels) != 1 or len(exact) != 1:
+                raise ValueError("Finish Look manager has no exact selected Shot")
+            return dict(exact[0])
+        except Exception as exc:
+            raise RuntimeError("Seedance Finish Look source does not match the selected Shot identity.") from exc
+
+    @staticmethod
     def _validate_finish_look_shot_snapshot(
         value: Any,
         *,
@@ -8337,6 +8792,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         selection = self._capture_imageasset_project_selection()
         params = {**params, **selection["project"], "_hmb_imageasset_project_selection": selection}
         subscription = self._hmb_shot_channel_subscription()
+        # Capture the actual resolved execution branch, not the pre-reconcile
+        # selector or the ImageAsset/manual project's provenance schema.
+        params["_hmb_generation_mode"] = "shot" if subscription["enabled"] else "only"
         if not subscription["enabled"]:
             resolved = dict(params)
             resolved["prompt"] = str(params.get("prompt") or "")
@@ -8477,10 +8935,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             required=False,
         )
         if finish_node is not None:
-            finish_subscription = self._direct_source_subscription(
-                finish_node,
-                "finish_look",
-            )
+            finish_subscription = self._finish_look_source_subscription(finish_node, subscription)
             if (
                 finish_subscription.get("channel_uuid") != subscription["channel_uuid"]
                 or finish_subscription.get("shot_uuid") != subscription["shot_uuid"]
@@ -8490,24 +8945,24 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 raise RuntimeError(
                     "Seedance Finish Look source does not match the selected Shot identity."
                 )
-            snapshot_api = getattr(
-                finish_node,
-                "_hmb_finish_look_shot_snapshot",
-                None,
-            )
-            if not callable(snapshot_api):
-                raise RuntimeError(
-                    "Seedance Finish Look source does not expose its atomic snapshot API."
-                )
-            routed_snapshot = self.get_parameter_value(
-                SHOT_FINISH_LOOK_INPUT_PARAMETER
-            )
-            try:
-                finish_snapshot = snapshot_api(
-                    routed_snapshot if routed_snapshot else None
-                )
-            except TypeError:
-                finish_snapshot = snapshot_api()
+            manager = getattr(finish_node, "_hmb_shot_manager_enabled", None)
+            if callable(manager) and manager() is True:
+                snapshot_api = getattr(finish_node, "_hmb_finish_look_shot_snapshot_for", None)
+                if not callable(snapshot_api):
+                    raise RuntimeError("Seedance Finish Look manager does not expose its per-Shot snapshot API.")
+                # The shared physical output may display another open row.
+                # Its value is not authority for this Generator's execution.
+                finish_snapshot = snapshot_api(channel_uuid=subscription["channel_uuid"],
+                                               shot_uuid=subscription["shot_uuid"])
+            else:
+                snapshot_api = getattr(finish_node, "_hmb_finish_look_shot_snapshot", None)
+                if not callable(snapshot_api):
+                    raise RuntimeError("Seedance Finish Look source does not expose its atomic snapshot API.")
+                routed_snapshot = self.get_parameter_value(SHOT_FINISH_LOOK_INPUT_PARAMETER)
+                try:
+                    finish_snapshot = snapshot_api(routed_snapshot if routed_snapshot else None)
+                except TypeError:
+                    finish_snapshot = snapshot_api()
             finish_snapshot = self._validate_finish_look_shot_snapshot(
                 finish_snapshot,
                 expected_subscription=subscription,
@@ -8662,14 +9117,33 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             visited.add(id(node))
 
         walk(self, "generator")
+        explicit_project = self._selected_only_project() if self._draft_only_mode() else {}
         if not sources:
-            raise ValueError("Select and connect an ImageAsset library project before rendering.")
+            if explicit_project:
+                return {"schema": ONLY_PROJECT_SELECTION_SCHEMA, "project": explicit_project,
+                        "flow": flow_name, "owner": id(self), "sources": [], "edges": [],
+                        "selection_source": "only_explicit"}
+            if self._draft_only_mode():
+                raise _ProjectSelectionRequired(
+                    "Select Project (Only), or connect an ImageAsset library project, before rendering.")
+            raise _ProjectSelectionRequired("Select and connect an ImageAsset library project before rendering.")
         identities = list(sources.values())
         if any(identity != identities[0] for identity in identities[1:]):
             raise ValueError("Connected ImageAsset sources belong to different projects.")
+        if explicit_project and explicit_project != identities[0]:
+            raise ValueError("The Only project selection does not match the connected ImageAsset project.")
         return {"schema": PROJECT_SELECTION_SCHEMA, "project": dict(identities[0]),
                 "flow": flow_name, "owner": id(self),
                 "sources": sorted(sources), "edges": sorted(edges)}
+
+    def _selected_only_project(self) -> dict[str, str]:
+        value = self.get_parameter_value(ONLY_PROJECT_PARAMETER)
+        if value in (None, "", ONLY_PROJECT_UNSELECTED):
+            return {}
+        if not isinstance(value, str):
+            raise ValueError("Select a valid Project (Only) before rendering.")
+        project = resolve_project(value, default_legacy=False)
+        return {key: project[key] for key in ("project_id", "project_name")}
 
     def _hmb_generation_project(self) -> dict[str, str]:
         return dict(self._capture_imageasset_project_selection()["project"])
@@ -8702,6 +9176,393 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         finally:
             if not pending.done():
                 pending.cancel()
+
+    @staticmethod
+    def _hmb_preflight_issue(code: str, message: str, severity: str = "error") -> dict[str, str]:
+        return {"code": code, "message": message[:300], "severity": severity}
+
+    @staticmethod
+    def _hmb_preflight_kind(node: Any) -> str:
+        """Only actual registered HMB classes can describe a readiness route."""
+        metadata = getattr(node, "metadata", {})
+        metadata = metadata if isinstance(metadata, dict) else {}
+        kind = metadata.get("node_type") if isinstance(metadata, dict) else None
+        if metadata.get("library") != "HMB_GP_Production" or kind not in {
+            "HMBImageAssetLibrary", "HMBVideoPickerLibrary", "HMBPromptLibrary",
+            "HMBAgentLibrary", "HMBFinishLookLibrary", "HMBSeedanceGeneration",
+        } or getattr(node, "_hmb_node_deleted", False):
+            return ""
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+        return kind if type(node) is LibraryRegistry.get_library("HMB_GP_Production").get_node_class(kind) else ""
+
+    @staticmethod
+    def _hmb_preflight_declares(node: Any, kind: str, expected: dict[str, Any]) -> bool:
+        hook = {"agent": "_hmb_agent_shot_subscriptions", "prompt": "_hmb_prompt_shot_subscriptions",
+            "finish_look": "_hmb_finish_look_shot_subscriptions"}[kind]
+        manager = getattr(node, "_hmb_shot_manager_enabled", None)
+        manager_flag = manager() if callable(manager) else False
+        if type(manager_flag) is not bool:
+            return False
+        rows = getattr(node, hook)() if manager_flag else [node._hmb_shot_channel_subscription()]
+        if not isinstance(rows, (list, tuple)) or len(rows) > SHOT_ROUTING_MAX_SHOTS:
+            return False
+        fields = ("channel_uuid", "shot_uuid", "shot_number", "shot_name")
+        return sum(isinstance(row, dict) and row.get("enabled") is True
+            and row.get("participant_kind") == kind and all(row.get(key) == expected[key] for key in fields)
+            for row in rows) == 1
+
+    def _hmb_preflight_parameters(self, *, bound: bool) -> dict[str, Any]:
+        """Read execution copies; deliberately never call mutating _get_parameters."""
+        def read(name: str, default: Any = None) -> Any:
+            value = self.get_parameter_value(name)
+            return default if value is None else value
+        model = str(read("model_id", MODEL_NAME_SEEDANCE_2_5)).strip()
+        model = MODEL_ID_ALIASES.get(model, model)
+        task = TASK_REFERENCE_TO_VIDEO if bound else str(read(TASK_PARAMETER, TASK_REFERENCE_TO_VIDEO))
+        if not bound and model != SEEDANCE_2_5_MODEL_ID:
+            task = INPUT_MODE_TASKS.get(str(read("input_mode", INPUT_MODE_MULTIMODAL_REFERENCES)), task)
+        videos = self._get_list_input(VIDEO_REFERENCES_PARAMETER)
+        if not videos and not self._list_input_is_authoritative(VIDEO_REFERENCES_PARAMETER):
+            videos = [read(f"reference_video_{n}") for n in range(1, LEGACY_VIDEO_REFERENCE_SLOTS + 1)
+                if self._has_reference_value(read(f"reference_video_{n}"))]
+        params = {name: read(name, default) for name, default in {
+            "duration": 4, "resolution": MODEL_DEFAULT_RESOLUTIONS.get(model, "720p"),
+            "ratio": "adaptive", "poll_interval_seconds": 30, "generation_timeout_seconds": 3600,
+            "execution_expires_after": 172800, "priority": 0, "return_last_frame": False,
+            "first_frame": None, "last_frame": None, "tos_url_validity_seconds": 172800,
+            "local_video_upload_service": LOCAL_VIDEO_UPLOAD_GRIPTAPE,
+            "tos_region": DEFAULT_TOS_REGION, "tos_endpoint": DEFAULT_TOS_ENDPOINT,
+            "resume_generation_id": "", "draft_action": DRAFT_ACTION_OFF, "draft_job_id": "",
+        }.items()}
+        params.update(model_id=model, task=task, prompt=str(read("prompt", "")),
+            output_format=str(read("output_format", NEW_NODE_OUTPUT_FORMAT if model == SEEDANCE_2_5_MODEL_ID else DEFAULT_OUTPUT_FORMAT)).lower(),
+            reference_images=self._get_list_input("reference_images"), video_references=videos,
+            reference_audio=self._get_list_input("reference_audio"), _hmb_draft_supported=True)
+        if model != SEEDANCE_2_5_MODEL_ID:
+            params.update(draft_action=DRAFT_ACTION_OFF, priority=params["priority"] if model == SEEDANCE_2_0_MODEL_ID else 0)
+        if params["draft_action"] in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}:
+            params.update(resolution="480p" if params["draft_action"] == DRAFT_ACTION_PREVIEW else "1080p", return_last_frame=False)
+            if not params["resume_generation_id"]:
+                params["output_format"] = "mov"
+            raw_source = read(DRAFT_SOURCE_PARAMETER, {})
+            if not params["draft_job_id"] and isinstance(raw_source, dict):
+                params["draft_job_id"] = raw_source.get("draft_job_id", "")
+        if task == TASK_TEXT_ONLY:
+            params.update(first_frame=None, last_frame=None, reference_images=[], video_references=[], reference_audio=[])
+        elif task == TASK_FIRST_LAST_FRAME:
+            params.update(reference_images=[], video_references=[], reference_audio=[])
+        else:
+            params.update(first_frame=None, last_frame=None)
+        return params
+
+    def _hmb_preflight_row(self, expected: dict[str, Any], *, nodes: dict[str, Any], source: Any = None,
+            source_snapshot: Any = None, source_issue: str = "") -> dict[str, Any]:
+        bound = bool(expected.get("shot_uuid"))
+        row = {"channel_uuid": expected.get("channel_uuid", ""), "shot_uuid": expected.get("shot_uuid", ""),
+            "number": expected.get("shot_number", 1), "name": expected.get("shot_name", SHOT_ONLY_LABEL),
+            "generator": str(self.name)[:128], "model": "", "task": "", "resolution": "", "output": "",
+            "media": {"images": 0, "videos": 0, "audio": 0}, "connections": {}, "issues": []}
+        issue = lambda code, message, severity="error": row["issues"].append(self._hmb_preflight_issue(code, message, severity))
+        params = self._hmb_preflight_parameters(bound=bound)
+        sparse = bool(params["resume_generation_id"] or params["draft_action"] == DRAFT_ACTION_FINAL)
+        row.update(model=MODEL_DISPLAY_NAME_BY_ID.get(params["model_id"], "알 수 없는 모델"),
+            task="기존 Task 조회" if params["resume_generation_id"] else "Draft Final" if sparse else params["task"] if params["task"] in TASK_STORAGE_CHOICES else "알 수 없는 작업",
+            resolution=params["resolution"] if params["resolution"] in {item for values in MODEL_RESOLUTIONS.values() for item in values} else "확인 필요")
+        edges = self._project_incoming_connections(self)
+        def edge_source(target: str, port: str, kind: str) -> Any:
+            matches = [edge for edge in edges if str(getattr(edge, "target_parameter_name", "")) == target]
+            if not matches:
+                row["connections"][kind] = "선택 사항 / 미연결"
+                return None
+            if len(matches) != 1:
+                raise ValueError("ambiguous")
+            edge = matches[0]
+            node = nodes.get(str(getattr(edge, "source_node_name", "")))
+            if node is None or self._hmb_preflight_kind(node) != kind or getattr(edge, "source_parameter_name", "") != port:
+                raise ValueError("foreign_source")
+            row["connections"][kind] = "연결됨"
+            return node
+        try:
+            project = self._capture_imageasset_project_selection()["project"]
+            row["project"] = str(project["project_name"])
+            if bound and source is not None:
+                canonical_project = resolve_project(source._hmb_project_identity(), default_legacy=False)
+                if project["project_id"] != canonical_project["project_id"]:
+                    issue("project_mixed", "ImageAsset와 Generator의 프로젝트가 다릅니다.")
+        except Exception:
+            issue("project_unverified", "프로젝트 연결 또는 Project (Only) 선택을 확인하세요.", "warning" if sparse else "error")
+        if bound and not sparse:
+            identity = self._hmb_shot_channel_subscription()
+            if any(identity.get(key) != expected.get(key) for key in ("channel_uuid", "shot_uuid", "shot_number", "shot_name")):
+                issue("shot_identity", "ImageAsset의 UUID·순서·변경 이름과 Generator 연결이 일치하지 않습니다.")
+            params.update(reference_images=[], video_references=[], reference_audio=[])
+            try:
+                image = edge_source(SHOT_ASSET_INPUT_PARAMETER, "SHOT_ASSET_OUT", "HMBImageAssetLibrary")
+                if image is not None and image is not source:
+                    raise ValueError("foreign_image_source")
+                if source_issue:
+                    issue("image_snapshot_unverified", "ImageAsset 선택 미디어 캐시가 준비되지 않았습니다. 준비 후 다시 점검하세요.", "warning")
+                elif isinstance(source_snapshot, dict):
+                    shot = next(item for item in source_snapshot["shots"] if item["shot_uuid"] == expected["shot_uuid"])
+                    if (shot["number"], shot["name"]) != (expected["shot_number"], expected["shot_name"]):
+                        raise ValueError("image_identity")
+                    selected = [source_snapshot["media_by_source_uid"][uid] for uid in shot["selected_source_uids"]]
+                    if selected and image is None:
+                        issue("image_edge_missing", "선택한 이미지가 있지만 Generator의 ImageAsset 입력선이 없습니다.")
+                    if image is not None:
+                        params["reference_images"] = selected
+                picker = edge_source(SHOT_PICKER_INPUT_PARAMETER, "SHOT_PICKER_OUT", "HMBVideoPickerLibrary")
+                if picker is not None:
+                    if self._direct_source_subscription(picker, "video_picker").get("channel_uuid") != expected["channel_uuid"]:
+                        raise ValueError("picker_channel")
+                    snap = self._validate_direct_media_snapshot(picker._hmb_shot_routing_snapshot(expected["channel_uuid"], validate_media=False),
+                        source_kind="video_picker", expected_channel_uuid=expected["channel_uuid"])
+                    selected = next(item for item in snap["shots"] if item["shot_uuid"] == expected["shot_uuid"])
+                    if (selected["number"], selected["name"]) != (expected["shot_number"], expected["shot_name"]):
+                        raise ValueError("picker_identity")
+                    params["video_references"] = [snap["media_by_source_uid"][uid] for uid in selected["selected_source_uids"]]
+                else:
+                    available = [candidate for candidate in nodes.values()
+                        if self._hmb_preflight_kind(candidate) == "HMBVideoPickerLibrary"
+                        and candidate._hmb_shot_channel_subscription().get("channel_uuid") == expected["channel_uuid"]]
+                    if len(available) > 1:
+                        issue("picker_duplicate", "이 채널의 VideoPicker 소스가 중복되었습니다.")
+                    elif available:
+                        try:
+                            snap = self._validate_direct_media_snapshot(available[0]._hmb_shot_routing_snapshot(expected["channel_uuid"], validate_media=False),
+                                source_kind="video_picker", expected_channel_uuid=expected["channel_uuid"])
+                            selected = next(item for item in snap["shots"] if item["shot_uuid"] == expected["shot_uuid"])
+                            if selected["selected_source_uids"]:
+                                issue("picker_edge_missing", "Picker에 선택한 영상이 있지만 Generator의 Picker 입력선이 없습니다.")
+                        except Exception:
+                            issue("picker_unverified", "미연결 Picker의 선택 상태를 확인하지 못했습니다.", "warning")
+                finish = edge_source(SHOT_FINISH_LOOK_INPUT_PARAMETER, "SHOT_FINISH_LOOK_OUT", "HMBFinishLookLibrary")
+                if finish is not None and not self._hmb_preflight_declares(finish, "finish_look", expected):
+                    raise ValueError("finish_identity")
+                agent_edges = [edge for edge in edges if getattr(edge, "target_parameter_name", "") == "prompt"]
+                if len(agent_edges) > 1:
+                    raise ValueError("ambiguous_prompt")
+                if agent_edges:
+                    edge = agent_edges[0]; agent = nodes.get(str(getattr(edge, "source_node_name", "")))
+                    if agent is not None and self._hmb_preflight_kind(agent) == "HMBAgentLibrary":
+                        if getattr(edge, "source_parameter_name", "") != "output" or not self._hmb_preflight_declares(agent, "agent", expected):
+                            raise ValueError("agent_identity")
+                        upstream = [item for item in self._project_incoming_connections(agent)
+                            if getattr(item, "target_parameter_name", "") == "SHOT_PROMPT_IN"]
+                        if len(upstream) != 1:
+                            raise ValueError("prompt_missing")
+                        prompt = nodes.get(str(getattr(upstream[0], "source_node_name", "")))
+                        if (prompt is None or self._hmb_preflight_kind(prompt) != "HMBPromptLibrary"
+                                or getattr(upstream[0], "source_parameter_name", "") != "PROMPT_OUT"
+                                or not self._hmb_preflight_declares(prompt, "prompt", expected)):
+                            raise ValueError("prompt_identity")
+                        row["connections"]["Prompt → Agent"] = "UUID 일치"
+                        # StartFlow also validates a placeholder before Agent output
+                        # exists. This sentinel is private to the copied validator.
+                        if not params["prompt"].strip():
+                            params["prompt"] = "HMB connected prompt pending execution"
+                    else:
+                        issue("manual_prompt", "일반 Prompt 입력 경로를 사용합니다. Agent 실행 여부는 점검하지 않습니다.", "warning")
+                        if not params["prompt"].strip():
+                            params["prompt"] = "HMB connected prompt pending execution"
+            except Exception:
+                issue("source_route", "Prompt·Agent·Finish·ImageAsset·Picker 중 연결선 또는 정확한 Shot UUID를 확인하세요.")
+        elif sparse:
+            issue("sparse_existing_task", "기존 Task 조회/Final은 새 Prompt·미디어·Agent를 요구하지 않습니다.", "info")
+            if params["draft_action"] == DRAFT_ACTION_FINAL:
+                issue("final_server_unverified", "Final 사용 가능 여부는 서버의 같은 Draft Task 상태 확인이 필요합니다.", "warning")
+        row["media"] = {"images": len(params["reference_images"]), "videos": len(params["video_references"]), "audio": len(params["reference_audio"])}
+        if source_issue and bound and not sparse:
+            row["media"]["images"] = None
+        try:
+            validation = dict(params)
+            if source_issue and bound and not sparse and not any(validation[key] for key in ("reference_images", "video_references", "reference_audio")):
+                validation["reference_images"] = ["HMB unverified cached media placeholder"]
+            self._validate_parameters(validation)
+            if not params["resume_generation_id"]:
+                self._validate_broker_model(params["model_id"])
+        except Exception as exc:
+            # Native validation never includes prompt/media contents. Remove
+            # authored repr strings before reporting its bounded diagnostic.
+            diagnostic = re.sub(r"(['\"]).*?\1", "[값]", str(exc))[:260]
+            if "Unsupported" in diagnostic or "does not support" in diagnostic:
+                diagnostic = "선택한 모델·작업·해상도·출력 형식의 지원 여부를 확인하세요."
+            issue("settings_invalid", diagnostic or "모델·작업·미디어 수량·설정을 확인하세요.")
+        raw_output = self.get_parameter_value("output_file")
+        output = str(getattr(raw_output, "location", getattr(raw_output, "value", raw_output)) or "").strip()
+        row["output"] = output.replace("\\", "/").split("?", 1)[0].split("#", 1)[0].rsplit("/", 1)[-1][:128]
+        if not output:
+            issue("output_missing", "출력 파일 경로가 비어 있습니다.", "warning" if sparse else "error")
+        elif "\x00" in output or any(part == ".." for part in output.replace("\\", "/").split("/")):
+            issue("output_invalid", "출력 경로에 허용되지 않은 구성 요소가 있습니다.")
+        if output and Path(output).suffix.lower() not in {".mp4", ".mov"}:
+            issue("output_extension", "출력 파일 확장자를 MP4/MOV로 확인하세요.", "warning")
+        issue("offline_scope", "파일 접근·서버 권한·실제 미디어 디코딩은 실행하지 않았습니다.", "info")
+        row["status"] = "error" if any(item["severity"] == "error" for item in row["issues"]) else "warning" if any(item["severity"] == "warning" for item in row["issues"]) else "ready"
+        return row
+
+    def _hmb_render_preflight_report(self) -> dict[str, Any]:
+        """Inspect registered same-flow state only; no reconcile/prepare/execute."""
+        flow_name, candidates = _shot_routing._same_flow_nodes(self)
+        result = {"schema": SEEDANCE_PREFLIGHT_SCHEMA, "version": 1, "phase": "complete", "request_id": "",
+            "checked_at_ms": int(time.time() * 1000), "flow": flow_name, "rows": [], "issues": [],
+            "scope": "only", "channel_uuid": "", "ok": False,
+            "notice": "점검 시점의 로컬 연결·설정 검사입니다. 서버 지원·계정·실제 파일 접근·디코딩은 미확인입니다. 업로드·Agent·렌더·연결 변경 없음. 정책은 Agent에서 적용하며 정책 없음은 렌더를 차단하지 않습니다."}
+        if not flow_name or self not in candidates:
+            result["issues"].append(self._hmb_preflight_issue("unregistered", "현재 Flow의 등록된 Generator를 다시 여세요."))
+            return result
+        nodes = {str(node.name): node for node in candidates if not getattr(node, "_hmb_node_deleted", False)}
+        identity = self._hmb_shot_channel_subscription()
+        if self.get_parameter_value("resume_generation_id") or self.get_parameter_value("draft_action") == DRAFT_ACTION_FINAL:
+            result["scope"] = "existing_task"
+            result["rows"] = [self._hmb_preflight_row(identity, nodes=nodes)]
+        elif not identity.get("enabled"):
+            result["rows"] = [self._hmb_preflight_row(identity, nodes=nodes)]
+        else:
+            channel = identity["channel_uuid"]; result.update(scope="shots", channel_uuid=channel)
+            sources = [node for node in nodes.values() if self._hmb_preflight_kind(node) == "HMBImageAssetLibrary"
+                and node._hmb_shot_channel_subscription().get("channel_uuid") == channel]
+            if len(sources) != 1:
+                result["issues"].append(self._hmb_preflight_issue("catalog_source", "이 채널의 정확한 ImageAsset 소스가 없거나 중복되었습니다."))
+                return result
+            source = sources[0]
+            catalog = self._validate_shot_catalog_snapshot(source._hmb_shot_routing_catalog())
+            snapshot, source_issue = None, ""
+            try:
+                snapshot = self._validate_direct_media_snapshot(source._hmb_shot_routing_snapshot(channel, cached_only=True),
+                    source_kind="image_asset", expected_channel_uuid=channel)
+            except Exception:
+                source_issue = "cache_unavailable"
+            generators = [node for node in nodes.values() if self._hmb_preflight_kind(node) == "HMBSeedanceGeneration"]
+            output_keys: dict[str, list[dict[str, Any]]] = {}
+            for shot in sorted(catalog["shots"], key=lambda item: item["number"]):
+                expected = {"channel_uuid": channel, "shot_uuid": shot["shot_uuid"], "shot_number": shot["number"], "shot_name": shot["name"]}
+                matches = [node for node in generators if all(node._hmb_shot_channel_subscription().get(key) == expected[key] for key in ("channel_uuid", "shot_uuid"))]
+                if len(matches) != 1:
+                    result["rows"].append({"number": shot["number"], "name": shot["name"], "channel_uuid": channel,
+                        "shot_uuid": shot["shot_uuid"], "generator": " / ".join(str(node.name)[:128] for node in matches),
+                        "status": "error", "media": {}, "connections": {}, "issues": [self._hmb_preflight_issue(
+                            "generator_missing" if not matches else "generator_duplicate", "이 Shot UUID의 Generator가 없습니다." if not matches else "동일 Shot UUID를 사용하는 Generator가 중복되었습니다.")]})
+                    continue
+                node = matches[0]
+                try:
+                    row = node._hmb_preflight_row(expected, nodes=nodes, source=source, source_snapshot=snapshot, source_issue=source_issue)
+                except Exception:
+                    row = {"number": shot["number"], "name": shot["name"], "generator": str(node.name)[:128], "status": "error",
+                        "media": {}, "connections": {}, "issues": [self._hmb_preflight_issue("row_unavailable", "이 Shot의 현재 입력을 읽지 못했습니다. 다른 Shot은 계속 점검했습니다.")]}
+                result["rows"].append(row)
+                raw = node.get_parameter_value("output_file")
+                output = str(getattr(raw, "location", getattr(raw, "value", raw)) or "").replace("\\", "/").casefold()
+                if output:
+                    output_keys.setdefault(output, []).append(row)
+            for duplicate_rows in output_keys.values():
+                if len(duplicate_rows) > 1:
+                    for row in duplicate_rows:
+                        row["issues"].append(self._hmb_preflight_issue("output_duplicate", "여러 Generator가 같은 출력 파일 경로를 사용합니다.")); row["status"] = "error"
+            if any(node._hmb_shot_channel_subscription().get("enabled") and node._hmb_shot_channel_subscription().get("channel_uuid") != channel for node in generators):
+                result["issues"].append(self._hmb_preflight_issue("other_project_channel", "같은 Flow에 다른 프로젝트/채널의 Generator도 있습니다. 이 표는 선택한 채널만 점검합니다.", "warning"))
+            known = {shot["shot_uuid"] for shot in catalog["shots"]}
+            if any(node._hmb_shot_channel_subscription().get("channel_uuid") == channel
+                    and node._hmb_shot_channel_subscription().get("shot_uuid") not in known for node in generators):
+                result["issues"].append(self._hmb_preflight_issue("orphan_generator", "같은 채널에 ImageAsset에서 삭제되었거나 존재하지 않는 Shot UUID의 Generator가 있습니다.", "warning"))
+        result["ok"] = bool(result["rows"]) and all(row["status"] != "error" for row in result["rows"]) and not any(item["severity"] == "error" for item in result["issues"])
+        return result
+
+    def _hmb_publish_preflight(self, value: dict[str, Any]) -> None:
+        if getattr(self, "_hmb_node_deleted", False):
+            return
+        self._hmb_preflight_publishing = True
+        try:
+            super().set_parameter_value(SEEDANCE_PREFLIGHT_PARAMETER, value, initial_setup=True, emit_change=False)
+            publisher = getattr(self, "publish_update_to_parameter", None)
+            if callable(publisher):
+                publisher(SEEDANCE_PREFLIGHT_PARAMETER, deepcopy(value))
+        finally:
+            self._hmb_preflight_publishing = False
+
+    def _hmb_handle_preflight_command(self, value: Any) -> None:
+        if not isinstance(value, dict) or value.get("action") not in {"inspect", "cancel"}:
+            return
+        request_id = value.get("request_id", "")
+        if not isinstance(request_id, str) or re.fullmatch(r"[0-9a-f]{32}", request_id) is None:
+            return
+        if value["action"] == "cancel" and request_id != self._hmb_preflight_active_request_id:
+            return  # A late cancel may never retire a newer inspection.
+        session, sequence = value.get("client_session"), value.get("sequence")
+        if session is not None or sequence is not None:
+            if not isinstance(session, str) or re.fullmatch(r"[0-9a-f]{32}", session) is None or type(sequence) is not int or not 0 < sequence <= 9007199254740991:
+                return
+            sequences = self._hmb_preflight_client_sequences
+            if value["action"] == "inspect":
+                if self._hmb_preflight_active_request_id and session != self._hmb_preflight_active_client_session:
+                    self._hmb_publish_preflight({"schema": SEEDANCE_PREFLIGHT_SCHEMA, "version": 1, "phase": "stale", "request_id": request_id,
+                        "rows": [], "ok": False, "issues": [self._hmb_preflight_issue("inspection_busy", "다른 점검 요청이 진행 중입니다. 완료 후 다시 점검하세요.", "warning")]})
+                    return
+                if sequence <= sequences.get(session, 0):
+                    return  # Reordered or replayed commands cannot cancel the latest request.
+                if session not in sequences and len(sequences) >= 64:
+                    sequences.pop(next(iter(sequences)))  # No other session can evict the in-flight owner.
+                sequences.pop(session, None)
+                sequences[session] = sequence
+        elif value["action"] == "inspect" and self._hmb_preflight_active_request_id and request_id != self._hmb_preflight_active_request_id:
+            return  # Legacy nonce-only callers cannot supersede an in-flight request.
+        seen = self._hmb_preflight_command_ids
+        key = value["action"] + ":" + request_id
+        if key in seen:
+            return
+        seen.add(key)
+        if len(seen) > 256:
+            seen.clear(); seen.add(key)
+        self._hmb_preflight_epoch += 1
+        epoch = self._hmb_preflight_epoch
+        self._hmb_preflight_active_request_id = request_id if value["action"] == "inspect" else ""
+        self._hmb_preflight_active_client_session = (session or "") if value["action"] == "inspect" else ""
+        previous = self._hmb_preflight_task
+        if previous is not None and not previous.done():
+            previous.cancel()
+        if value["action"] == "cancel":
+            self._hmb_publish_preflight({"schema": SEEDANCE_PREFLIGHT_SCHEMA, "version": 1,
+                "phase": "cancelled", "request_id": request_id, "rows": [], "issues": []})
+            return
+        def release_owner() -> None:
+            if epoch == self._hmb_preflight_epoch and self._hmb_preflight_active_request_id == request_id:
+                self._hmb_preflight_active_request_id = ""
+                self._hmb_preflight_active_client_session = ""
+        try:
+            requested_identity = self._hmb_shot_channel_subscription()
+        except Exception:
+            release_owner()
+            return
+        async def inspect_state():
+            try:
+                await asyncio.sleep(0)
+                try:
+                    report = self._hmb_render_preflight_report()
+                except Exception:
+                    report = {"schema": SEEDANCE_PREFLIGHT_SCHEMA, "version": 1, "phase": "complete", "rows": [], "ok": False,
+                        "issues": [self._hmb_preflight_issue("inspection_unavailable", "점검 중 연결 상태가 변경되었거나 아직 준비되지 않았습니다. 다시 점검하세요.")]}
+                if epoch == self._hmb_preflight_epoch and not self._hmb_node_deleted:
+                    if self._hmb_shot_channel_subscription() != requested_identity:
+                        report.update(phase="stale", rows=[], ok=False, issues=[self._hmb_preflight_issue(
+                            "selection_changed", "점검 중 Shot 선택이 변경되었습니다. 다시 점검하세요.", "warning")])
+                    report["request_id"] = request_id
+                    self._hmb_publish_preflight(report)
+            except Exception:
+                pass  # A disconnected display can retry; never lease it indefinitely.
+            finally:
+                release_owner()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Direct native callers can use the pure report API. UI inspection
+            # runs only on the host loop, never a filesystem/network thread.
+            try:
+                self._hmb_publish_preflight({"schema": SEEDANCE_PREFLIGHT_SCHEMA, "version": 1, "phase": "complete", "request_id": request_id,
+                    "rows": [], "ok": False, "issues": [self._hmb_preflight_issue("event_loop_unavailable", "엔진이 준비된 후 다시 점검하세요.", "warning")]})
+            finally:
+                release_owner()
+        else:
+            self._hmb_preflight_task = loop.create_task(inspect_state())
 
     def _get_parameters(self) -> dict[str, Any]:
         final_context = self._active_draft_final_context()
@@ -8745,7 +9606,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             ),
             "input_mode": self.get_parameter_value("input_mode")
             or INPUT_MODE_MULTIMODAL_REFERENCES,
-            "prompt": str(self.get_parameter_value("prompt") or ""),
+            "prompt": str(
+                self._hmb_managed_agent_request["record"]["text"]
+                if isinstance(getattr(self, "_hmb_managed_agent_request", None), dict)
+                else self.get_parameter_value("prompt") or ""
+            ),
             "first_frame": self.get_parameter_value("first_frame"),
             "last_frame": self.get_parameter_value("last_frame"),
             "reference_images": self._get_list_input("reference_images"),
@@ -8887,6 +9752,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if recovered and (not recovered.get("generation_origin") and self._draft_only_mode()
                           or recovered.get("generation_origin") and self._draft_source_key(recovered) == self._draft_source_key()):
             if not source or (source["draft_job_id"] == recovered["draft_job_id"] and recovered.get("final_request_id")):
+                if source.get("draft_job_id") == recovered["draft_job_id"] and source.get("final_job_id"):
+                    recovered["final_job_id"] = source["final_job_id"]
                 source = recovered
         return source
 
@@ -8932,6 +9799,117 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if any(project.get(key) != source.get(key) for key in ("project_id", "project_name")):
             raise ValueError("The selected project does not match the completed Draft.")
 
+    def _draft_final_status_identity(self, source: dict[str, Any]) -> tuple[str, ...]:
+        bridge = self._get_broker_bridge(server_url=source["broker_server_url"])
+        if bridge.server_url != source["broker_server_url"]:
+            raise _BrokerProtocolError("The Draft status Broker origin changed.")
+        credential = bridge._load_access_token()
+        if not credential:
+            raise _BrokerAuthenticationError("Connect to the original Broker to check this Draft.")
+        return (source["broker_server_url"], source["project_id"], source["project_name"],
+                source["draft_job_id"], hashlib.sha256(credential.encode("utf-8")).hexdigest())
+
+    def _apply_draft_final_server_state(self, source: dict[str, Any], identity: tuple[str, ...],
+                                      state: dict[str, Any]) -> bool:
+        current = self._draft_source_record()
+        if (not self._runtime_node_is_live(require_registered=True)
+                or any(current.get(key) != source.get(key) for key in
+                       ("draft_job_id", "broker_server_url", "project_id", "project_name"))
+                or self._draft_final_status_identity(source) != identity):
+            return False
+        previous = getattr(self, "_hmb_draft_final_status_cache", {})
+        owner_user_id = None
+        if previous.get("identity") == identity:
+            old_state = previous.get("value", {})
+            owner_user_id = previous.get("owner_user_id") or old_state.get("owner_user_id")
+            if owner_user_id and state.get("owner_user_id") not in (None, owner_user_id):
+                raise _BrokerProtocolError("The authenticated Draft owner changed during status reconciliation.")
+            # Never turn a known child or consumed Final into a new intent on
+            # a delayed available/expired projection or transient GET error.
+            if old_state.get("consumed") is True and state.get("consumed") is not True:
+                state = {**old_state, "state": "unknown" if old_state.get("state") not in
+                         _DRAFT_FINAL_HIDDEN_STATES else old_state["state"], "eligible": False}
+            elif old_state.get("child_task_id") and not state.get("child_task_id"):
+                state = {**state, "state": "unknown", "consumed": None, "child_task_id": old_state["child_task_id"],
+                         "child_status": old_state.get("child_status"), "eligible": False}
+        self._hmb_draft_final_status_cache = {"identity": identity, "value": deepcopy(state),
+            "owner_user_id": owner_user_id or state.get("owner_user_id"), "received_at": time.monotonic()}
+        child = state.get("child_task_id")
+        if child:
+            record = self._draft_source_record()
+            if record.get("draft_job_id") == source["draft_job_id"] and not record.get("final_job_id"):
+                self._store_draft_source({**record, "final_job_id": child})
+        return True
+
+    async def _query_draft_final_server_state(self, source: dict[str, Any], *, bridge: Any = None) -> dict[str, Any]:
+        identity = self._draft_final_status_identity(source)
+        if bridge is None:
+            bridge = self._get_broker_bridge(server_url=source["broker_server_url"])
+        try:
+            state = await asyncio.to_thread(bridge.get_draft_final_state, source, timeout=5.0)
+            if not self._apply_draft_final_server_state(source, identity, state):
+                raise _BrokerProtocolError("The Draft or Broker account changed while checking Final status.")
+        except Exception:
+            with suppress(Exception):
+                self._apply_draft_final_server_state(source, identity, {"state": "unknown", "eligible": False,
+                    "consumed": None, "source_task_id": source["draft_job_id"], "child_task_id": None})
+            raise
+        return deepcopy(self._hmb_draft_final_status_cache["value"])
+
+    def _schedule_draft_final_status_sync(self, source: dict[str, Any], identity: tuple[str, ...]) -> None:
+        if getattr(self, "_web_owner", None) is not None or not self._runtime_node_is_live(require_registered=True):
+            return
+        future = getattr(self, "_hmb_draft_final_status_future", None)
+        if future is not None and not future.done():
+            if getattr(self, "_hmb_draft_final_status_scope", ()) == identity:
+                return
+            future.cancel()
+        try:
+            loop = getattr(GriptapeNodes.EventManager(), "event_loop", None)
+            if loop is None or not loop.is_running():
+                return
+            self._hmb_draft_final_status_scope = identity
+            self._hmb_draft_final_status_future = asyncio.run_coroutine_threadsafe(
+                self._poll_draft_final_server_state(deepcopy(source), identity), loop)
+        except (RuntimeError, AttributeError):
+            return
+
+    async def _poll_draft_final_server_state(self, source: dict[str, Any], identity: tuple[str, ...]) -> None:
+        while self._runtime_node_is_live(require_registered=True):
+            try:
+                if (self._draft_source_record().get("draft_job_id") != source["draft_job_id"]
+                        or self._draft_final_status_identity(source) != identity):
+                    return
+                state = await self._query_draft_final_server_state(source)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                state = {"state": "unknown", "eligible": False, "consumed": None,
+                         "source_task_id": source["draft_job_id"], "child_task_id": None}
+                with suppress(Exception):
+                    if not self._apply_draft_final_server_state(source, identity, state):
+                        return
+            with suppress(Exception):
+                self._sync_seedance_shot_widget(emit_change=True)
+            if state.get("state") in _DRAFT_FINAL_HIDDEN_STATES:
+                return
+            await asyncio.sleep(_DRAFT_FINAL_SYNC_SECONDS)
+
+    def _draft_final_server_snapshot(self, source: dict[str, Any]) -> dict[str, Any]:
+        try:
+            identity = self._draft_final_status_identity(source)
+        except Exception:
+            return {"state": "unavailable", "eligible": False, "child_task_id": None}
+        cached = getattr(self, "_hmb_draft_final_status_cache", {})
+        if cached.get("identity") == identity and cached.get("value", {}).get("state") in _DRAFT_FINAL_HIDDEN_STATES:
+            return deepcopy(cached["value"])
+        self._schedule_draft_final_status_sync(source, identity)
+        if cached.get("identity") == identity:
+            value = cached.get("value", {})
+            if time.monotonic() - cached.get("received_at", 0) <= _DRAFT_FINAL_SYNC_SECONDS + 5:
+                return deepcopy(value)
+        return {"state": "checking", "eligible": False, "child_task_id": None}
+
     def _validated_draft_final_source(self, source: dict[str, Any] | None = None, *, allow_reserved: bool = False) -> dict[str, Any]:
         model = str(self.get_parameter_value("model_id") or "")
         if MODEL_ID_ALIASES.get(model, model) != SEEDANCE_2_5_MODEL_ID:
@@ -8945,6 +9923,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self._validate_draft_shot_binding(record)
         elif not self._draft_only_mode():
             raise ValueError("This Draft has no verified Shot identity.")
+        else:
+            try:
+                project = self._hmb_generation_project()
+            except _ProjectSelectionRequired:
+                project = {}  # A legacy Only Final retains its original project.
+            if project and any(project.get(key) != record[key] for key in ("project_id", "project_name")):
+                raise ValueError("The selected Only project does not match the completed Draft.")
         created = record.get("created_at_ms")
         if created is not None and (created > int(time.time() * 1000) or int(time.time() * 1000) >= created + DRAFT_SOURCE_TTL_MS):
             raise ValueError("This Draft has expired. Create a new 480p Draft.")
@@ -8970,12 +9955,30 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         final_busy = bool(busy and supported and active_action == DRAFT_ACTION_FINAL)
         final_available = False
         reason = ""
+        final_state = "unavailable"
+        final_task_id = ""
         if supported and source:
+            server = self._draft_final_server_snapshot(source)
+            final_state = str(server.get("state") or "unknown")
+            final_task_id = str(server.get("child_task_id") or source.get("final_job_id") or "")
             try:
                 self._validated_draft_final_source(source)
-                final_available = not busy
+                final_available = not busy and final_state == "available" and server.get("eligible") is True
             except (ValueError, RuntimeError) as exc:
                 reason = str(exc)
+                if source.get("final_job_id") and final_state in {"available", "checking", "unavailable"}:
+                    final_state = "consumed"
+                elif source.get("final_request_id") and final_state in {"available", "checking", "unavailable"}:
+                    final_state = "unknown"
+                elif "expired" in reason.lower() and not final_task_id:
+                    final_state = "expired"
+            if not final_available and not reason:
+                reason = {"checking": "Final 상태를 확인하고 있습니다.",
+                    "reserved": "이 Draft의 Final 요청이 접수되었습니다. 웹에서 같은 Task를 확인하세요.",
+                    "running": "이 Draft의 Final이 처리 중입니다. 웹에서 같은 Task를 확인하세요.",
+                    "unknown": "Final 상태를 확인할 수 없습니다. 새 렌더 대신 기존 Task를 조회하세요.",
+                    "source_pending": "Draft가 완료된 뒤 Final을 사용할 수 있습니다.",
+                    "unavailable": "원래 Broker에 연결해 Final 상태를 확인하세요."}.get(final_state, "")
         elif supported:
             reason = "Complete a 480p Draft to enable Finalize 1080p."
         return _seedance_draft_ui_value({"visible": supported and (resolution == "480p" or bool(source)),
@@ -8985,7 +9988,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "effective_resolution": "1080p" if action == DRAFT_ACTION_FINAL else "480p" if action == DRAFT_ACTION_PREVIEW and supported else resolution,
             "busy": busy, "final_busy": final_busy, "active_action": active_action,
             "cancel_available": bool(self._hmb_draft_finalize_pending and self._active_draft_job_id()),
-            "active_job_id": self._active_draft_job_id(), "reason": "Generator is busy." if busy else reason})
+            "active_job_id": self._active_draft_job_id(), "reason": "Generator is busy." if busy else reason,
+            "final_state": final_state, "final_visible": bool(source) and final_state not in _DRAFT_FINAL_HIDDEN_STATES
+                and (not busy or final_busy),
+            "final_task_id": final_task_id})
 
     def _draft_final_requested(self) -> bool:
         if isinstance(getattr(self, "_hmb_draft_final_context", None), dict):
@@ -10317,14 +11323,19 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "content_filter": True,
             "execution_expires_after": params["execution_expires_after"],
         }
+        if not isinstance(self, _HMBWebRerenderExecution):
+            captured_mode = params.get("_hmb_generation_mode")
+            if type(captured_mode) is str and captured_mode in {"only", "shot"}:
+                payload[GENERATION_MODE_METADATA_FIELD] = captured_mode
+                payload[GENERATION_TASK_METADATA_FIELD] = task
         project = resolve_project(params)
         payload.update({key: project[key] for key in ("project_id", "project_name")})
         selection = params.get("_hmb_imageasset_project_selection")
         if not isinstance(self, _HMBWebRerenderExecution) and isinstance(selection, dict):
-            if (selection.get("schema") != PROJECT_SELECTION_SCHEMA
+            if (selection.get("schema") not in (PROJECT_SELECTION_SCHEMA, ONLY_PROJECT_SELECTION_SCHEMA)
                     or selection.get("project") != {key: project[key] for key in ("project_id", "project_name")}):
                 raise ValueError("The captured ImageAsset project does not match the generation request.")
-            payload["project_selection_schema"] = PROJECT_SELECTION_SCHEMA
+            payload["project_selection_schema"] = selection["schema"]
         if params.get("draft_action") == DRAFT_ACTION_PREVIEW:
             payload["draft"] = True
             params["_hmb_draft_project"] = {key: project[key] for key in ("project_id", "project_name")}
@@ -11812,6 +12823,133 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             ),
         )
 
+    async def _reuse_saved_generation_result(
+        self, generation_id: str, checkpoint: dict[str, Any] | None = None,
+    ) -> bool:
+        """Restore an exact completed task without publishing its file again.
+
+        A True result also consumes a callback made stale during validation;
+        that callback must not fall through to downloading the old task.
+        """
+        checkpoint = deepcopy(checkpoint if checkpoint is not None else self._generation_recovery_state())
+        if (checkpoint.get("stage") != "local_succeeded"
+                or checkpoint.get("task_id") != generation_id):
+            return False
+        if (not self._runtime_node_is_live(require_registered=True)
+                or bool(getattr(self, "is_cancellation_requested", False))):
+            return True
+        output_id = str(self.parameter_output_values.get("generation_id") or "").strip()
+        if output_id and output_id != generation_id:
+            raise RuntimeError("The saved video belongs to a different current task.")
+
+        def saved_source() -> tuple[dict[str, Any], dict[str, Any]]:
+            # Do not call the legacy source snapshot: it may adopt an artifact
+            # using today's Shot selection instead of its completed-task owner.
+            return (deepcopy(getattr(self, "_hmb_generated_video_source", {}) or {}),
+                    deepcopy(self.get_parameter_value(GENERATED_VIDEO_SOURCE_PARAMETER) or {}))
+
+        raw_sources = saved_source()
+        def artifact_values() -> tuple[str, str]:
+            return tuple(str(getattr(value, "value", value) or "") for value in (
+                self.parameter_output_values.get("video_url"),
+                self.parameter_output_values.get("VIDEO_OUT")))
+        original_artifacts = artifact_values()
+        sources = []
+        for raw in raw_sources:
+            if not raw:
+                continue
+            source = _generated_video_source_value(raw)
+            if not source:
+                raise RuntimeError("The saved video source is invalid.")
+            sources.append(source)
+        if sources and any(source != sources[0] for source in sources[1:]):
+            raise RuntimeError("The saved video source records disagree.")
+        if sources and sources[0].get("task_id") != generation_id:
+            if _generated_video_origin(checkpoint.get("generation_origin")):
+                raise RuntimeError("The saved video source does not match this completed task.")
+            # Only intentionally keeps a previous Shot's routable source. It
+            # is not evidence for this new result; verify Only's own persisted
+            # destination + artifact below without changing that older source.
+            sources = []
+
+        def artifact_path(artifact: Any) -> Path | None:
+            text = str(getattr(artifact, "value", artifact) or "").strip()
+            if not text or urlparse(text).scheme in {"http", "https"}:
+                return None
+            resolved = File(text).resolve()
+            return Path(str(getattr(resolved, "location", resolved))).resolve()
+
+        if sources:
+            path = Path(sources[0]["path"]).resolve()
+        else:
+            # Older/Only exports have no Shot provenance. Their persisted save
+            # target and actual artifact must agree; the current output field
+            # is editable and is never evidence for this older task.
+            saved_target = str(checkpoint.get("output_file") or "").strip()
+            current = self.parameter_output_values.get("video_url") or self.parameter_output_values.get("VIDEO_OUT")
+            path = artifact_path(current)
+            if (not saved_target or path is None
+                    or path != artifact_path(saved_target)):
+                raise RuntimeError("This completed task has no matching saved-video provenance.")
+
+        def validate_saved_file() -> tuple[int, ...] | None:
+            try:
+                before = path.stat()
+            except FileNotFoundError:
+                return None  # Recover the same task's missing file normally.
+            if not path.is_file() or before.st_size <= 0:
+                raise RuntimeError("The saved video is empty or is not a regular file.")
+            identity = lambda stat: (stat.st_dev, stat.st_ino, stat.st_size,
+                                     stat.st_mtime_ns, stat.st_ctime_ns)
+            _validate_decodable_mp4_file(path)
+            verified = path.stat()
+            if identity(before) != identity(verified):
+                raise RuntimeError("The saved video changed while it was being verified.")
+            return identity(verified)
+
+        validation_error = None
+        file_identity = None
+        try:
+            file_identity = await asyncio.to_thread(validate_saved_file)
+        except Exception as exc:
+            validation_error = exc
+        if (not self._runtime_node_is_live(require_registered=True)
+                or bool(getattr(self, "is_cancellation_requested", False))
+                or self._generation_recovery_state() != checkpoint
+                or str(self.parameter_output_values.get("generation_id") or "").strip() != output_id
+                or saved_source() != raw_sources
+                or artifact_values() != original_artifacts):
+            return True
+        if validation_error is not None:
+            raise validation_error
+        if file_identity is None:
+            return False
+
+        artifact = self.parameter_output_values.get("video_url")
+        if artifact_path(artifact) != path:
+            artifact = self.parameter_output_values.get("VIDEO_OUT")
+        if artifact_path(artifact) != path:
+            artifact = VideoUrlArtifact(value=str(path), name=path.name)
+        self.parameter_output_values["video_url"] = artifact
+        self.parameter_output_values["VIDEO_OUT"] = artifact
+        self._hmb_last_success_video = artifact
+        self.parameter_output_values["generation_id"] = generation_id
+        self.parameter_output_values["generation_status"] = "succeeded"
+        previous = self.parameter_output_values.get("provider_response")
+        response = {"transport": "fn_ai_broker", "id": generation_id, "status": "succeeded"}
+        if isinstance(previous, dict) and previous.get("id") == generation_id:
+            if type(previous.get("provider_task_registered")) is bool:
+                response["provider_task_registered"] = previous["provider_task_registered"]
+        self.parameter_output_values["provider_response"] = response
+        self._submission_outcome_unknown = False
+        self._publish_generation_preview("succeeded", generation_id=generation_id, action="none")
+        self._set_status_results(
+            was_successful=True,
+            result_details=(f"SUCCESS: FN AI Broker task {generation_id} succeeded.\n"
+                            f"Verified existing saved video: {path}"),
+        )
+        return True
+
     async def _refresh_async(self) -> None:
         """Refresh one Broker job without ever creating a replacement task."""
         if not self._runtime_node_is_live(require_registered=True):
@@ -11822,6 +12960,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if self._generation_run_active.is_set():
             return
         generation_id = ""
+        operation_phase = "broker_lookup"
         try:
             generation_id = self._authoritative_existing_generation_id()
             if not generation_id:
@@ -11853,6 +12992,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 )
             if not self._runtime_node_is_live(require_registered=True):
                 return
+            if self._authoritative_existing_generation_id() != generation_id:
+                return
             # Refresh retrieves status for this authoritative job only.  In
             # particular, an uncertain submission never replays
             # generate_seedance (the create-task request) here.
@@ -11862,6 +13003,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 timeout=60,
             )
             if not self._runtime_node_is_live(require_registered=True):
+                return
+            if self._authoritative_existing_generation_id() != generation_id:
                 return
             task = self._normalize_broker_task(
                 response,
@@ -11914,6 +13057,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             # authoritative task identity and must replace the provisional
             # recovery identity.
             generation_id = resolved_generation_id
+            if preserve_local_success:
+                operation_phase = "local_validation"
+                if await self._reuse_saved_generation_result(generation_id, recovery_contract):
+                    return
+            if status == "succeeded":
+                operation_phase = "local_result"
             recovery_destination = (
                 self._build_recovery_output_destination(recovery_contract)
                 if status == "succeeded"
@@ -12015,7 +13164,35 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         except Exception as exc:
             if not self._runtime_node_is_live(require_registered=True):
                 return
+            if bool(getattr(self, "is_cancellation_requested", False)):
+                return
+            if generation_id and self._authoritative_existing_generation_id() != generation_id:
+                return
+            if operation_phase != "local_validation" and generation_id:
+                # A failed GET cannot undo an independently verified local
+                # success. This path never creates a replacement server task.
+                try:
+                    if await self._reuse_saved_generation_result(generation_id):
+                        return
+                except Exception as local_exc:
+                    exc = local_exc
+                    operation_phase = "local_result"
             recovery_checkpoint = self._generation_recovery_state()
+            if operation_phase in {"local_result", "local_validation"}:
+                self._publish_generation_preview(
+                    "failed", generation_id=generation_id, action="refresh_existing",
+                )
+                self._set_status_results(
+                    was_successful=False,
+                    result_details=(
+                        f"Task result retrieval / local save failed ({type(exc).__name__}). "
+                        f"Existing task ID: {generation_id or 'ID'}. "
+                        "Check the saved video, destination permissions and available disk space. "
+                        "Existing files were preserved; no new render was submitted. "
+                        "Refresh / Retrieve Result checks this same task."
+                    ),
+                )
+                return
             missing_client_request = bool(
                 isinstance(exc, _BrokerError)
                 and exc.status_code in {404, 410}
@@ -12192,6 +13369,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._discard_dangling_owned_list_connections_before_delete()
         if not bool(getattr(self, "_hmb_node_deleted", False)):
             self._hmb_node_deleted = True
+            draft_status_future = getattr(self, "_hmb_draft_final_status_future", None)
+            if draft_status_future is not None:
+                draft_status_future.cancel()
             final_future = getattr(self, "_hmb_draft_finalize_future", None)
             if final_future is not None:
                 final_future.cancel()
@@ -12252,6 +13432,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self.get_parameter_value("resume_generation_id") or ""
         ).strip()
         recovery_before_run = self._generation_recovery_state()
+        if (requested_resume_id
+                and await self._reuse_saved_generation_result(requested_resume_id, recovery_before_run)):
+            return
         if (
             requested_resume_id
             and requested_resume_id == recovery_before_run.get("task_id")
@@ -12369,6 +13552,19 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         params["_hmb_broker_server_url"] = broker_origin
         if not self._runtime_node_is_live(require_registered=True):
             return
+        if draft_final and not resume_generation_id and not isinstance(self, _HMBWebRerenderExecution):
+            state = await self._query_draft_final_server_state(draft_source, bridge=bridge)
+            if state.get("state") != "available" or state.get("eligible") is not True:
+                raise _BrokerProtocolError(
+                    "This Draft Final is already reserved, unavailable, or awaiting confirmation. "
+                    "Review the existing Draft/Final task on the web; no new render was submitted."
+                )
+        selection = params.get("_hmb_imageasset_project_selection")
+        if (not resume_generation_id and not draft_final and isinstance(selection, dict)
+                and selection.get("schema") == ONLY_PROJECT_SELECTION_SCHEMA):
+            await asyncio.to_thread(bridge.require_generation_project_selection,
+                                    ONLY_PROJECT_SELECTION_SCHEMA, timeout=5.0)
+            self._assert_operation_project_selection()
         authored_output_format = str(params.get("output_format") or DEFAULT_OUTPUT_FORMAT)
         if not resume_generation_id and draft_action != DRAFT_ACTION_OFF:
             params["output_format"] = await asyncio.to_thread(
@@ -13197,7 +14393,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._clear_execution_status()
         self._hmb_expected_agent_result = None
         self._hmb_agent_submission_prompt = None
+        self._hmb_managed_agent_request = None
         try:
+            await self._prepare_managed_agent_shot()
             self._assert_agent_result_available()
             await self._process_generation()
         except _AgentResultUnavailable as exc:
@@ -13338,13 +14536,93 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             # exception. Other shots (including their active polling) continue.
             logger.error("%s failed; independent shots continue: %s", self.name, safe_message)
 
+        finally:
+            # The frozen request belongs to this explicit Generator run only.
+            # Never leave another Shot's result in the author's prompt control.
+            managed = getattr(self, "_hmb_managed_agent_request", None)
+            if isinstance(managed, dict):
+                release = getattr(managed["source"], "_hmb_release_agent_shot_result", None)
+                if callable(release):
+                    with suppress(Exception):
+                        release(channel_uuid=managed["channel_uuid"], shot_uuid=managed["shot_uuid"],
+                                run_id=managed.get("record", {}).get("result", {}).get("run_id", ""),
+                                generator=self)
+            self._hmb_managed_agent_request = None
+
+    async def _prepare_managed_agent_shot(self) -> None:
+        """Pull one exact Shot from a manager without executing sibling Agents.
+
+        A shared SDK dependency runs once per node, so a manager dependency
+        prepares its catalog only. Each Generator owns its own immutable model
+        result and cancellation scope. Legacy single-shot and Only paths keep
+        their normal upstream execution contract.
+        """
+        if str(self.get_parameter_value("resume_generation_id") or "").strip() or self._draft_final_requested():
+            return
+        source = self._manual_agent_prompt_source()
+        enabled = getattr(source, "_hmb_shot_manager_enabled", None)
+        if not callable(enabled) or not enabled():
+            return
+        self._reconcile_shared_shot_routing(strict=True)
+        subscription = self._hmb_shot_channel_subscription()
+        if not subscription.get("enabled"):
+            raise _AgentResultUnavailable("Select a Shot before using an Agent manager. No render was submitted.")
+        channel, shot = subscription["channel_uuid"], subscription["shot_uuid"]
+        owner_api = getattr(source, "_hmb_manager_prompt_owner", None)
+        run_api = getattr(source, "_hmb_run_agent_shot", None)
+        if not callable(owner_api) or not callable(run_api):
+            raise _AgentResultUnavailable("The connected Agent manager needs a compatible Prompt manager.")
+        prompt_owner = owner_api(channel_uuid=channel, shot_uuid=shot)
+        # Validate project and direct source identity before any model call.
+        # This validation copy is never persisted or submitted as a prompt.
+        validation = self._resolve_exact_shot_generation_inputs(self._get_parameters())
+        selection = validation.get("_hmb_imageasset_project_selection")
+        if not isinstance(selection, dict):
+            raise _AgentResultUnavailable("The selected Shot project is unavailable. No render was submitted.")
+        origin = self._capture_generated_video_origin()
+        record = await run_api(channel_uuid=channel, shot_uuid=shot,
+                               prompt_owner=prompt_owner, generator=self)
+        if isinstance(record, dict):
+            # Retain the ticket immediately so every later validation/cancel
+            # path can release it, including an input edit during inference.
+            self._hmb_managed_agent_request = {
+                "source": source, "channel_uuid": channel, "shot_uuid": shot,
+                "record": deepcopy(record),
+            }
+        if not self._runtime_node_is_live(require_registered=True) or self.is_cancellation_requested:
+            raise asyncio.CancelledError()
+        self._assert_imageasset_project_selection(selection)
+        current = self._hmb_shot_channel_subscription()
+        if (self._manual_agent_prompt_source() is not source
+                or current.get("channel_uuid") != channel or current.get("shot_uuid") != shot
+                or self._capture_generated_video_origin() != origin):
+            raise _AgentResultUnavailable("The selected Shot changed during Agent execution. No render was submitted.")
+        if not isinstance(record, dict) or not isinstance(record.get("result"), dict):
+            raise _AgentResultUnavailable("The Shot Agent returned no completed result. No render was submitted.")
+        identity_fields = ("channel_uuid", "shot_uuid", "shot_number", "shot_name")
+        result_shot = record.get("shot")
+        if (not isinstance(result_shot, dict)
+                or any(result_shot.get(key) != subscription.get(key) for key in identity_fields)):
+            raise _AgentResultUnavailable("The Agent result belongs to a different Shot. No render was submitted.")
+        text, result = record.get("text"), record["result"]
+        if (not isinstance(text, str) or not text.strip() or result.get("status") != "succeeded"
+                or not result.get("run_id")
+                or hashlib.sha256(text.strip().encode("utf-8")).hexdigest() != result.get("output_sha256")):
+            raise _AgentResultUnavailable("The Shot Agent has no completed final text. No render was submitted.")
+        self._hmb_managed_agent_request = {
+            "source": source, "channel_uuid": channel, "shot_uuid": shot,
+            "record": deepcopy(record),
+        }
+
     def _assert_agent_result_available(self, prompt: str | None = None, *, allow_resume: bool = True) -> None:
         """Gate only failed/pending Agent results, never prompt meaning or roles."""
         if allow_resume and str(self.get_parameter_value("resume_generation_id") or "").strip():
             return  # Retrieving an already submitted task does not need an Agent.
         if self._draft_final_requested():
             return  # Explicit Draft finalization inherits the Broker's immutable source inputs.
-        text = str((self.get_parameter_value("prompt") if prompt is None else prompt) or "").strip()
+        managed = getattr(self, "_hmb_managed_agent_request", None)
+        text = str((managed["record"]["text"] if prompt is None and isinstance(managed, dict)
+                    else self.get_parameter_value("prompt") if prompt is None else prompt) or "").strip()
         reserved_errors = (
             "[HMB EXECUTION FAILED]", "[HMB EXECUTION CANCELLED]",
             "[HMB OUTPUT BLOCKED]", "[HMB LOCAL POLICY REQUIRED]",
@@ -13357,7 +14635,25 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise _AgentResultUnavailable(
                 "Agent prompt connection is unavailable. No new render was submitted."
             ) from None
-        getter = getattr(source, "_hmb_execution_result_snapshot", None)
+        if isinstance(managed, dict):
+            if source is not managed["source"]:
+                raise _AgentResultUnavailable("Agent manager connection changed before submission.")
+            getter = getattr(source, "_hmb_agent_shot_result", None)
+            if not callable(getter):
+                raise _AgentResultUnavailable("The Shot Agent result is unavailable.")
+            record = getter(channel_uuid=managed["channel_uuid"], shot_uuid=managed["shot_uuid"],
+                            run_id=managed["record"]["result"]["run_id"], generator=self)
+            snapshot = record.get("result") if isinstance(record, dict) else None
+            if (not isinstance(snapshot, dict) or snapshot != managed["record"]["result"]
+                    or record.get("shot") != managed["record"]["shot"]
+                    or record.get("text") != managed["record"]["text"]):
+                raise _AgentResultUnavailable("The selected Shot Agent result changed before submission.")
+            getter = lambda: snapshot
+        else:
+            manager_api = getattr(source, "_hmb_shot_manager_enabled", None)
+            if callable(manager_api) and manager_api():
+                raise _AgentResultUnavailable("The selected Shot Agent has not been prepared for this Generator run.")
+            getter = getattr(source, "_hmb_execution_result_snapshot", None)
         if not callable(getter):
             if text.startswith(reserved_errors):
                 raise _AgentResultUnavailable("Upstream Agent failed. No new render was submitted; independent shots continue.")

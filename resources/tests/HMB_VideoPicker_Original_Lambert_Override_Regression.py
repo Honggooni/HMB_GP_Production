@@ -784,7 +784,7 @@ def add_surface(fake, path, kind="mesh"):
     return path
 
 
-# Original material preservation is governed solely by exact AIPicker_SET
+# Original material preservation is governed solely by the two exact pass SETs.
 # objectSet membership. Legacy names never implicitly preserve a surface.
 with tempfile.TemporaryDirectory(prefix="hmb-authored-eye-") as texture_root:
     texture_directory = Path(texture_root)
@@ -804,6 +804,25 @@ with tempfile.TemporaryDirectory(prefix="hmb-authored-eye-") as texture_root:
     no_pass.node_types["|ROOT|AIPicker_SET"] = "transform"
     add_surface(no_pass, "|ROOT|AIPicker_SET|geometry|surfaceShape")
     assert runner._original_pass_set_shapes() == set(), "A same-name DAG group is not an objectSet."
+
+    # The new M set contributes to Original independently, and both exact
+    # names union their memberships. The M-only Mask policy is separate.
+    for prefix in ("", "studio:hero:"):
+        pair = EyeMidgrayCmds(texture_directory)
+        configure_pass_sets(pair, {
+            prefix + "AIPicker_SET": [pair.EYE_LEFT_OWNER],
+            prefix + "AIPickerM_SET": [pair.EYE_RIGHT_OWNER + ".f[0:2]"],
+            prefix + "AIPickerM_SET_extra": [pair.BODY_OWNER],
+        })
+        runner.cmds = pair
+        assert runner._original_pass_set_shapes() == {pair.EYE_LEFT, pair.EYE_RIGHT}
+        assert runner._mask_pass_set_shapes() == {pair.EYE_RIGHT}
+        pair_before = pair.snapshot()
+        pair_controller = controller_for(pair, [pair.EYE_LEFT, pair.EYE_RIGHT])
+        pair_report = pair_controller.apply()
+        assert pair_report["material_pass_sources"] == ["AIPicker_SET", "AIPickerM_SET"]
+        assert pair_report["material_pass_shape_count"] == pair_report["preserved_eye_shape_count"] == 2
+        assert pair_controller.finish()["restore_ok"] and pair.snapshot() == pair_before
 
     # Recursively nested sets, including a cycle, preserve exactly their members.
     # An unreferenced set must not expand the pass merely because it exists.
@@ -892,7 +911,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-authored-eye-") as texture_root:
         try:
             runner._original_pass_set_shapes()
         except RuntimeError as exc:
-            assert "could not read AIPicker_SET membership" in str(exc)
+            assert "could not read AIPicker_SET|AIPickerM_SET membership" in str(exc)
         else:
             raise AssertionError("Unreadable pass-set membership must fail before material edits.")
 
@@ -908,7 +927,8 @@ with tempfile.TemporaryDirectory(prefix="hmb-authored-eye-") as texture_root:
     eyes.set_query_count = 0
     eye_applied = eye_controller.apply()
     assert eyes.set_query_count == 1, "Resolve each pass set once per controller capture, not once per SG member."
-    assert eye_applied["material_pass_source"] == "AIPicker_SET"
+    assert eye_applied["material_pass_source"] == "AIPicker_SET|AIPickerM_SET"
+    assert eye_applied["material_pass_sources"] == ["AIPicker_SET", "AIPickerM_SET"]
     assert eye_applied["material_pass_shape_count"] == 2
     assert eye_applied["preserved_eye_shape_count"] == 2
     assert eye_applied["preserved_eye_component_count"] == 8
@@ -1566,7 +1586,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-aipicker-cache-") as cache_dir:
                                    "scene_path": str(cache_scene), "paths": [str(cache_scene)]}), encoding="utf-8")
     cache_state["native_metadata"]["dependency_manifest_path"] = str(manifest)
     cache_fields = picker._original_preview_cache_fields(cache_scene, cache_state)
-    assert cache_fields["original_material_pass_source"] == "AIPicker_SET"
+    assert cache_fields["original_material_pass_source"] == "AIPicker_SET|AIPickerM_SET"
     cache_video, cache_sidecar = picker._original_preview_paths(cache_scene)
     cache_video.parent.mkdir(parents=True, exist_ok=True)
     def cache_box(kind, payload):

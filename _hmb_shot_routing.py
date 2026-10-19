@@ -17,7 +17,7 @@ from contextlib import contextmanager
 import logging
 import json
 import threading
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Mapping
 import weakref
 
 
@@ -213,6 +213,20 @@ def _subscription_for(node: Any) -> ShotSubscription | None:
         raw = getter()
     except Exception:
         return None
+    normalized = _normalize_subscription(node, raw)
+    if (normalized is not None
+            and normalized.kind in {KIND_PROMPT, KIND_AGENT, KIND_FINISH_LOOK}
+            and _is_shot_manager(node)):
+        rows = _manager_shot_subscriptions(node, normalized.kind)
+        if rows:
+            # A cosmetic tab switch must not invalidate same-flow hydration
+            # authority. Actual targets resolve their own declared row below.
+            return min(rows, key=lambda item: item.shot_uuid)
+    return normalized
+
+
+def _normalize_subscription(node: Any, raw: Any) -> ShotSubscription | None:
+    """Validate a declared subscription without changing the node's selection."""
     if not isinstance(raw, dict):
         return None
     if set(raw) != {
@@ -249,6 +263,82 @@ def _subscription_for(node: Any) -> ShotSubscription | None:
         shot_number=_bounded_int(raw.get("shot_number"), 1, MAX_SHOTS, 1),
         shot_name=_clean(raw.get("shot_name"), 128) or "Shot 1",
     )
+
+
+def _is_shot_manager(node: Any) -> bool:
+    """Only the explicit local opt-in enables multi-Shot ownership."""
+    getter = getattr(node, "_hmb_shot_manager_enabled", None)
+    try:
+        return callable(getter) and getter() is True
+    except Exception:
+        return False
+
+
+def _manager_shot_subscriptions(node: Any, kind: str) -> tuple[ShotSubscription, ...]:
+    if kind not in {KIND_PROMPT, KIND_AGENT, KIND_FINISH_LOOK} or not _is_shot_manager(node):
+        return ()
+    if bool(getattr(node, "_hmb_node_deleted", False)):
+        return ()
+    method = {KIND_PROMPT: "_hmb_prompt_shot_subscriptions",
+              KIND_AGENT: "_hmb_agent_shot_subscriptions",
+              KIND_FINISH_LOOK: "_hmb_finish_look_shot_subscriptions"}[kind]
+    getter = getattr(node, method, None)
+    if not callable(getter) and kind == KIND_FINISH_LOOK:
+        getter = getattr(node, "_hmb_shot_manager_subscriptions", None)
+    try:
+        raw = getter() if callable(getter) else None
+    except Exception:
+        return ()
+    if not isinstance(raw, (list, tuple)) or not 1 <= len(raw) <= MAX_SHOTS:
+        return ()
+    result: list[ShotSubscription] = []
+    identities: set[tuple[str, str]] = set()
+    channels: set[str] = set()
+    numbers: set[int] = set()
+    for row in raw:
+        subscription = _normalize_subscription(node, row)
+        if (subscription is None or subscription.kind != kind or not subscription.enabled
+                or row.get("enabled") is not True or type(row.get("version")) is not int
+                or type(row.get("shot_number")) is not int
+                or not 1 <= row["shot_number"] <= MAX_SHOTS
+                or not isinstance(row.get("shot_name"), str) or not row["shot_name"].strip()
+                or (subscription.channel_uuid, subscription.shot_uuid) in identities
+                or subscription.shot_number in numbers):
+            return ()
+        identities.add((subscription.channel_uuid, subscription.shot_uuid))
+        channels.add(subscription.channel_uuid)
+        numbers.add(subscription.shot_number)
+        result.append(subscription)
+    return tuple(result) if len(channels) == 1 else ()
+
+
+def resolve_shot_prompt_owner(node: Any, channel_uuid: str, shot_uuid: str) -> Any | None:
+    """Resolve one same-flow Prompt owner; legacy exact ownership wins.
+
+    The return value is a registered local object, never a payload-provided
+    node name. Ambiguity fails closed and does not mutate authoring state.
+    """
+    return _resolve_shot_owner(node, KIND_PROMPT, channel_uuid, shot_uuid)
+
+
+def resolve_shot_agent_owner(node: Any, channel_uuid: str, shot_uuid: str) -> Any | None:
+    return _resolve_shot_owner(node, KIND_AGENT, channel_uuid, shot_uuid)
+
+
+def _resolve_shot_owner(node: Any, kind: str, channel_uuid: str, shot_uuid: str) -> Any | None:
+    flow_name, nodes = _same_flow_nodes(node)
+    if not flow_name or not channel_uuid or not shot_uuid:
+        return None
+    subscriptions = [item for candidate in nodes
+                     if (item := _subscription_for(candidate)) is not None]
+    target = _subscription_for(node)
+    if (kind == KIND_AGENT and target is not None and target.kind == KIND_SEEDANCE
+            and target.enabled and target.channel_uuid == channel_uuid and target.shot_uuid == shot_uuid):
+        selected, duplicate = _agent_for_target(target, subscriptions)
+    else:
+        selected, duplicate = _single(subscriptions, kind=kind,
+                                      channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+    return selected.node if selected is not None and not duplicate else None
 
 
 def _same_flow_nodes(node: Any) -> tuple[str, list[Any]]:
@@ -582,6 +672,38 @@ def _mark_authoritative(node: Any) -> tuple[str, bool, str, str] | None:
     return fingerprint
 
 
+def _flow_migration_is_pending(flow_name: str) -> bool:
+    """Do not route a partially hydrated legacy graph during consolidation."""
+    try:
+        from griptape_nodes.retained_mode.engine import current_engine  # type: ignore
+        from _hmb_workflow_migration import flow_migration_pending
+
+        engine = current_engine()
+        return bool(engine is not None and flow_migration_pending(engine, flow_name))
+    except (ImportError, AttributeError):
+        # Older SDKs and pure contract fixtures have no workflow coordinator.
+        return False
+
+
+def _flow_migration_blockage(flow_name: str) -> dict[str, Any] | None:
+    """A failed consolidation suspends automatic cleanup, without a busy loop."""
+    try:
+        from griptape_nodes.retained_mode.engine import current_engine  # type: ignore
+        from _hmb_workflow_migration import flow_migration_blocked
+
+        engine = current_engine()
+        value = flow_migration_blocked(engine, flow_name) if engine is not None else None
+        return value if isinstance(value, dict) else None
+    except (ImportError, AttributeError):
+        return None
+
+
+def _migration_blocked_result(value: dict[str, Any]) -> dict[str, Any]:
+    return {"ok": False, "code": str(value.get("code") or "workflow_migration_failed"),
+            "changed": 0, "details": str(value.get("reason") or "Original editors were retained."),
+            "backup_path": value.get("backup_path")}
+
+
 def _schedule_post_reconcile(node: Any, *, phase: str) -> bool:
     """Queue one identity-bound registration or hydration generation.
 
@@ -632,14 +754,12 @@ def _schedule_post_reconcile(node: Any, *, phase: str) -> bool:
                 if phase == "hydrated"
                 else ""
             )
-            # ImageAsset state setters can publish several presentation-only
-            # echoes before the retained event loop runs.  One identical
-            # catalog/fingerprint reservation is enough, while a changed
-            # subscription fingerprint must supersede the older callback so
-            # an active-Shot switch cannot be lost.
+            # Read the newest node state when the callback runs. Identical
+            # hydration echoes need one queued owner, including Prompt/Agent
+            # nodes without an ImageAsset catalog reservation token. A changed
+            # token or subscription still supersedes the older callback.
             if (
-                owner_token
-                and previous is not None
+                previous is not None
                 and previous.phase == "hydrated"
                 and previous.fingerprint == fingerprint
                 and previous.owner_token == owner_token
@@ -764,6 +884,17 @@ def _schedule_post_reconcile(node: Any, *, phase: str) -> bool:
                 queue_delayed_attempt(attempt + 1)
             else:
                 clear_pending(current)
+            return
+
+        current_flow_name, _current_nodes = _same_flow_nodes(current)
+        blockage = _flow_migration_blockage(current_flow_name) if current_flow_name else None
+        if blockage is not None:
+            clear_pending(current, code=str(blockage.get("code") or "workflow_migration_failed"))
+            return
+        if current_flow_name and _flow_migration_is_pending(current_flow_name):
+            # The load coordinator schedules surviving nodes after migration.
+            # Do not spin retries or discover temporary legacy owners here.
+            clear_pending(current, code="workflow_migration_pending")
             return
 
         # Hydration can supersede the constructor's queued registration phase
@@ -1274,6 +1405,12 @@ def reconcile_completed_video_routes(node: Any) -> dict[str, Any]:
     flow_name, nodes = _same_flow_nodes(node)
     if not flow_name:
         return {"ok": True, "code": "not_registered", "changed": 0}
+
+    blockage = _flow_migration_blockage(flow_name)
+    if blockage is not None:
+        return _migration_blocked_result(blockage)
+    if _flow_migration_is_pending(flow_name):
+        return {"ok": True, "code": "hydration_pending", "changed": 0}
     with _claim_routing_flow(flow_name) as claimed:
         if not claimed:
             return {"ok": True, "code": "reentrant", "changed": 0}
@@ -1297,7 +1434,108 @@ def reconcile_completed_video_routes(node: Any) -> dict[str, Any]:
         return {"ok": True, "code": "ready", "changed": changed}
 
 
-def _clear_remote_catalog(node: Any, reason: str) -> None:
+def _catalog_is_empty(value: Any) -> bool:
+    if value is None:
+        return True
+    return isinstance(value, Mapping) and (not value or (
+        value.get("schema") == "hmb-shot-routing-catalog" and value.get("version") == 1
+        and not value.get("channel_uuid") and value.get("shots") == []
+    ))
+
+
+def _already_local_catalog(subscription: ShotSubscription) -> bool:
+    """Prove a known native dashboard has already discarded remote authority.
+
+    This is a current-state check, not a cross-pass cache. Deletion can trigger
+    another native connection-removal pass after the first pass has cleared the
+    same dashboard. Replaying that clear needlessly rebuilds Prompt documents
+    and republishes native editors. Stored Shot histories remain deliberately
+    outside this check: only the active remote projection must be empty.
+    Unknown/legacy dashboards retain the original callback path.
+    """
+
+    node = subscription.node
+    if subscription.enabled or subscription.channel_uuid or subscription.shot_uuid:
+        return False
+    if bool(getattr(node, "_hmb_node_deleted", False)):
+        return False
+    with _ROUTING_LOCK:
+        try:
+            pending = node in _POST_REGISTRATION_PENDING
+        except TypeError:
+            return False
+        if pending:
+            return False
+    # A same-name replacement cannot borrow the retired instance's proof.
+    flow_name, _nodes = _same_flow_nodes(node)
+    if not flow_name:
+        return False
+    parameter_name = {
+        KIND_VIDEO_PICKER: "HMB_PICKER_STATE",
+        KIND_PROMPT: "HMB_UI_STATE",
+        KIND_AGENT: "HMB_AGENT_UI",
+        KIND_FINISH_LOOK: "HMB_FINISH_LOOK_UI_STATE",
+        KIND_SEEDANCE: "HMB_SEEDANCE_SHOT_UI",
+        KIND_COLOR_LUT: "HMB_COLOR_LUT_UI_STATE",
+    }.get(subscription.kind)
+    reader = getattr(node, "get_parameter_value", None)
+    if not parameter_name or not callable(reader):
+        return False
+    # Retain the native reader, including default/computed values, macros and
+    # held-object handling. Raw parameter_values is not a readable-value API.
+    try:
+        state = reader(parameter_name)
+    except Exception:
+        return False
+    if isinstance(state, str):
+        try:
+            state = json.loads(state)
+        except (ValueError, TypeError):
+            return False
+    if not isinstance(state, Mapping):
+        return False
+    if subscription.kind == KIND_VIDEO_PICKER:
+        return bool(
+            "shot_selections" in state
+            and not state.get("channel_uuid") and not state.get("shot_uuid")
+            and not state.get("shot_publisher_instance_uuid") and not state.get("shot_selections")
+            and _catalog_is_empty(getattr(node, "_hmb_shot_catalog_snapshot", None))
+        )
+    shot = state.get("shot")
+    if not isinstance(shot, Mapping) or shot.get("channel_uuid") or shot.get("shot_uuid"):
+        return False
+    if subscription.kind == KIND_PROMPT:
+        for name in ("image_asset", "picker"):
+            projection = state.get(name)
+            if (not isinstance(projection, Mapping) or projection.get("enabled") is not False
+                    or projection.get("shot_catalog") or projection.get("shot_routing")
+                    or projection.get("shot_catalog_routing")):
+                return False
+        return bool(
+            getattr(node, "_hmb_last_prompt_output", None) is not None
+            and getattr(node, "_hmb_last_machine_prompt_output", None) is not None
+            and not getattr(node, "_hmb_current_shot_images", None)
+            and not getattr(node, "_hmb_current_shot_videos", None)
+            and not getattr(node, "_hmb_last_shot_context", None)
+            and not getattr(node, "_hmb_last_agent_context_pair", None)
+        )
+    if "shot_catalog" not in state or not _catalog_is_empty(state["shot_catalog"]):
+        return False
+    if subscription.kind == KIND_COLOR_LUT:
+        private = getattr(node, "_hmb_color_lut_state", None)
+        return isinstance(private, Mapping) and _catalog_is_empty(private.get("shot_catalog"))
+    if not _catalog_is_empty(getattr(node, "_hmb_shot_catalog_snapshot", None)):
+        return False
+    if subscription.kind == KIND_AGENT:
+        return not getattr(node, "_hmb_shot_context", None) and not getattr(node, "_hmb_execution_shot_binding", None)
+    if subscription.kind == KIND_SEEDANCE:
+        return not getattr(node, "_hmb_shot_selector_map", None) and not getattr(node, "_hmb_shot_catalog_generation", 0)
+    return bool(subscription.kind == KIND_FINISH_LOOK
+        and not getattr(node, "_hmb_finish_route_ready", False)
+        and getattr(node, "_hmb_finish_active_key", None) == "__standalone__")
+
+
+def _clear_remote_catalog(node: Any, reason: str, *, subscription: ShotSubscription | None = None) -> None:
     """Return one participant to its local-only selector state.
 
     The callback is deliberately optional so older nodes remain compatible.
@@ -1307,6 +1545,13 @@ def _clear_remote_catalog(node: Any, reason: str) -> None:
 
     callback = getattr(node, "_hmb_clear_shot_routing_catalog", None)
     if not callable(callback):
+        return
+    # A channel replacement still has work to do even for an Only selector
+    # (notably Seedance's suspended UUID), so only an absent publisher admits
+    # this no-op. Immediate orphan/edge invalidation above remains unchanged.
+    if (reason == "publisher_unavailable" and subscription is not None
+            and _already_local_catalog(subscription)):
+        _mark_authoritative(node)
         return
     try:
         callback(_clean(reason, 64) or "publisher_unavailable")
@@ -1450,6 +1695,7 @@ def _single(
     channel_uuid: str,
     shot_uuid: str = "",
 ) -> tuple[ShotSubscription | None, bool]:
+    subscriptions = tuple(subscriptions)
     matches = [
         item
         for item in subscriptions
@@ -1457,8 +1703,131 @@ def _single(
         and item.kind == kind
         and item.channel_uuid == channel_uuid
         and (not shot_uuid or item.shot_uuid == shot_uuid)
+        and (kind not in {KIND_PROMPT, KIND_AGENT, KIND_FINISH_LOOK} or not _is_shot_manager(item.node))
     ]
+    if matches or kind not in {KIND_PROMPT, KIND_AGENT, KIND_FINISH_LOOK} or not shot_uuid:
+        return (matches[0] if len(matches) == 1 else None), len(matches) > 1
+    # A manager is an explicit multi-Shot participant, not its UI's selected
+    # legacy subscription. Never let a manager steal an established legacy
+    # owner, or choose between two managers by name/registration order.
+    seen: set[int] = set()
+    for item in subscriptions:
+        if item.kind != kind or id(item.node) in seen:
+            continue
+        seen.add(id(item.node))
+        declared_rows = _manager_shot_subscriptions(item.node, kind)
+        if (kind == KIND_FINISH_LOOK and _is_shot_manager(item.node)
+                and item.enabled and item.channel_uuid == channel_uuid and not declared_rows):
+            # An invalid connected manager is not an absent optional look.
+            # Keep a visible routing error instead of silently rendering bare.
+            return None, True
+        for declared in declared_rows:
+            if declared.channel_uuid == channel_uuid and declared.shot_uuid == shot_uuid:
+                matches.append(declared)
+    if kind == KIND_AGENT and matches:
+        prompt, duplicate = _single(subscriptions, kind=KIND_PROMPT,
+                                    channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+        # A single manager edge cannot aggregate several independent legacy
+        # Prompts. Those existing chains remain entirely legacy-owned.
+        if duplicate or prompt is None or not _is_shot_manager(prompt.node):
+            return None, duplicate
     return (matches[0] if len(matches) == 1 else None), len(matches) > 1
+
+
+def _manager_prompt_for_agent(
+    agent: ShotSubscription, subscriptions: Iterable[ShotSubscription],
+) -> tuple[ShotSubscription | None, bool]:
+    """Find one canonical Prompt manager for the manager's shared dependency."""
+    rows = _manager_shot_subscriptions(agent.node, KIND_AGENT)
+    if not rows:
+        return None, False
+    candidates: dict[int, ShotSubscription] = {}
+    subscriptions = tuple(subscriptions)
+    for row in rows:
+        prompt, duplicate = _single(subscriptions, kind=KIND_PROMPT,
+                                    channel_uuid=row.channel_uuid, shot_uuid=row.shot_uuid)
+        if duplicate:
+            return None, True
+        if prompt is None or not _is_shot_manager(prompt.node):
+            continue
+        if (prompt.shot_number, prompt.shot_name) != (row.shot_number, row.shot_name):
+            return None, False
+        candidates[id(prompt.node)] = prompt
+    return (next(iter(candidates.values())) if len(candidates) == 1 else None), len(candidates) > 1
+
+
+def _agent_for_target(
+    target: ShotSubscription, subscriptions: Iterable[ShotSubscription],
+) -> tuple[ShotSubscription | None, bool]:
+    """Honor a Generator's exact established manager edge when several exist.
+
+    Multiple Agent instances may be loaded and may manage the same catalog.
+    A single proven output edge selects the established owner for this target;
+    a new unbound target still requires an unambiguous owner. Legacy exact
+    ownership and foreign/manual prompt connections retain their old rules.
+    """
+    subscriptions = tuple(subscriptions)
+    selected, duplicate = _single(subscriptions, kind=KIND_AGENT,
+                                  channel_uuid=target.channel_uuid, shot_uuid=target.shot_uuid)
+    if not duplicate:
+        return selected, False
+    if any(item.kind == KIND_AGENT and item.enabled and not _is_shot_manager(item.node)
+           and item.channel_uuid == target.channel_uuid and item.shot_uuid == target.shot_uuid
+           for item in subscriptions):
+        return None, True
+    prompt, prompt_duplicate = _single(subscriptions, kind=KIND_PROMPT,
+        channel_uuid=target.channel_uuid, shot_uuid=target.shot_uuid)
+    if prompt_duplicate or prompt is None or not _is_shot_manager(prompt.node):
+        return None, True
+    incoming = [edge for edge in _incoming_connections(target.node)
+                if str(getattr(edge, "target_parameter_name", "")) == "prompt"]
+    if len(incoming) != 1 or str(getattr(incoming[0], "source_parameter_name", "")) != "output":
+        return None, True
+    name = str(getattr(incoming[0], "source_node_name", ""))
+    for item in subscriptions:
+        if item.kind != KIND_AGENT or item.node_name != name:
+            continue
+        for declared in _manager_shot_subscriptions(item.node, KIND_AGENT):
+            if (declared.channel_uuid == target.channel_uuid and declared.shot_uuid == target.shot_uuid
+                    and (declared.shot_number, declared.shot_name) == (target.shot_number, target.shot_name)):
+                return declared, False
+    return None, True
+
+
+def _finish_route_has_invalid_owner(
+    target: ShotSubscription, selected: ShotSubscription | None,
+    subscriptions: Mapping[str, ShotSubscription], nodes: Iterable[Any], rejected: set[int],
+) -> bool:
+    """A connected Finish manager cannot become an absent optional look.
+
+    Retain the exact edge on failure so a second Run cannot bypass the same
+    error. Legacy explicit Only transitions keep their existing behavior.
+    """
+    incoming = [edge for edge in _incoming_connections(target.node)
+                if str(getattr(edge, "target_parameter_name", "")) == "SHOT_FINISH_LOOK_IN"
+                and str(getattr(edge, "source_parameter_name", "")) == "SHOT_FINISH_LOOK_OUT"]
+    raw_by_name = {str(getattr(node, "name", "")): node for node in nodes}
+    for edge in incoming:
+        name = str(getattr(edge, "source_node_name", ""))
+        source = raw_by_name.get(name)
+        known = subscriptions.get(name)
+        metadata = getattr(source, "metadata", {})
+        unknown_manager = False
+        try:
+            manager_api = getattr(source, "_hmb_shot_manager_enabled", None)
+            manager_flag = manager_api() if callable(manager_api) else False
+            unknown_manager = type(manager_flag) is not bool
+        except Exception:
+            manager_flag, unknown_manager = False, True
+        is_finish = (known is not None and known.kind == KIND_FINISH_LOOK
+                     or isinstance(metadata, dict) and metadata.get("library") == "HMB_GP_Production"
+                     and metadata.get("node_type") == "HMBFinishLookLibrary")
+        protected = (source is not None and (manager_flag is True or unknown_manager
+                     or id(source) in rejected or is_finish and known is None))
+        if protected and (unknown_manager or len(incoming) != 1 or selected is None or selected.node is not source
+                          or id(source) in rejected):
+            return True
+    return False
 
 
 def _subscription_is_authoritative(subscription: ShotSubscription) -> bool:
@@ -1500,6 +1869,12 @@ def reconcile_shot_routing(
     flow_name, nodes = _same_flow_nodes(node)
     if not flow_name:
         return {"ok": True, "code": "not_registered", "changed": 0}
+
+    blockage = _flow_migration_blockage(flow_name)
+    if blockage is not None:
+        return _migration_blocked_result(blockage)
+    if _flow_migration_is_pending(flow_name):
+        return {"ok": True, "code": "hydration_pending", "changed": 0}
 
     # Constructor-side helpers can call the reconciler before NodeManager owns
     # the object.  Only a registered caller may publish authoritative state.
@@ -1694,6 +2069,7 @@ def reconcile_shot_routing(
                     _clear_remote_catalog(
                         recipient.node,
                         "publisher_unavailable" if not image_sources else "channel_replaced",
+                        subscription=recipient,
                     )
                     _notify_status(
                         recipient.node,
@@ -1722,6 +2098,7 @@ def reconcile_shot_routing(
                 _clear_remote_catalog(
                     recipient.node,
                     "publisher_unavailable" if not image_sources else "channel_replaced",
+                    subscription=recipient,
                 )
                 _notify_status(
                     recipient.node,
@@ -1790,6 +2167,12 @@ def reconcile_shot_routing(
                     if recipient.node is source.node:
                         continue
                     orphan_replacement = False
+                    suspended = getattr(recipient.node, "_hmb_suspended_shot_identity", None)
+                    if (recipient.kind == KIND_SEEDANCE and not recipient.enabled
+                            and isinstance(suspended, dict)
+                            and suspended.get("channel_uuid") != source.channel_uuid
+                            and len(image_sources) == 1):
+                        orphan_replacement = True
                     if recipient.channel_uuid and recipient.channel_uuid != source.channel_uuid:
                         orphan_replacement = bool(
                             recipient.kind in {KIND_VIDEO_PICKER, KIND_SEEDANCE, KIND_COLOR_LUT}
@@ -1907,7 +2290,8 @@ def reconcile_shot_routing(
                                 )
                             except Exception:
                                 pass
-                    if recipient.kind == KIND_AGENT and not recipient.channel_uuid:
+                    if (recipient.kind == KIND_AGENT and not recipient.channel_uuid
+                            and not callable(getattr(recipient.node, "_hmb_shot_manager_enabled", None))):
                         # A newly added Agent follows one already-selected,
                         # unclaimed Prompt Shot immediately. Multiple possible
                         # Prompt targets remain explicit/ambiguous and keep the
@@ -1985,6 +2369,10 @@ def reconcile_shot_routing(
                 source, snapshot = standalone_picker_catalogs[0]
                 for recipient in catalog_recipients:
                     if recipient.kind not in {KIND_SEEDANCE, KIND_COLOR_LUT}:
+                        continue
+                    suspended = getattr(recipient.node, "_hmb_suspended_shot_identity", None)
+                    if (recipient.kind == KIND_SEEDANCE and isinstance(suspended, dict)
+                            and suspended.get("channel_uuid") != source.channel_uuid):
                         continue
                     replacement = bool(
                         recipient.channel_uuid
@@ -2101,6 +2489,7 @@ def reconcile_shot_routing(
                 if (
                     prompt.kind == KIND_PROMPT
                     and prompt.enabled
+                    and not _is_shot_manager(prompt.node)
                     and id(prompt.node) not in catalog_rejected_node_ids
                 ):
                     prompt_groups.setdefault(
@@ -2191,7 +2580,8 @@ def reconcile_shot_routing(
                 tuple[str, str], list[ShotSubscription]
             ] = {}
             for prompt in routable_values:
-                if prompt.kind == KIND_PROMPT and prompt.enabled:
+                if (prompt.kind == KIND_PROMPT and prompt.enabled
+                        and not _is_shot_manager(prompt.node)):
                     remaining_prompt_groups.setdefault(
                         (prompt.channel_uuid, prompt.shot_uuid), []
                     ).append(prompt)
@@ -2231,7 +2621,8 @@ def reconcile_shot_routing(
             # to Only.  With no exact edge, every duplicate stays fail-closed.
             agent_groups: dict[tuple[str, str], list[ShotSubscription]] = {}
             for agent in routable_values:
-                if agent.kind == KIND_AGENT and agent.enabled:
+                if (agent.kind == KIND_AGENT and agent.enabled
+                        and not _is_shot_manager(agent.node)):
                     agent_groups.setdefault(
                         (agent.channel_uuid, agent.shot_uuid), []
                     ).append(agent)
@@ -2302,7 +2693,8 @@ def reconcile_shot_routing(
                 tuple[str, str], list[ShotSubscription]
             ] = {}
             for agent in routable_values:
-                if agent.kind == KIND_AGENT and agent.enabled:
+                if (agent.kind == KIND_AGENT and agent.enabled
+                        and not _is_shot_manager(agent.node)):
                     remaining_agent_groups.setdefault(
                         (agent.channel_uuid, agent.shot_uuid), []
                     ).append(agent)
@@ -2446,12 +2838,15 @@ def reconcile_shot_routing(
                 and id(item.node) not in unresolved_agent_ids
             ]
             for agent in agents:
-                prompt, duplicate = _single(
-                    routable_values,
-                    kind=KIND_PROMPT,
-                    channel_uuid=agent.channel_uuid,
-                    shot_uuid=agent.shot_uuid,
-                )
+                if _is_shot_manager(agent.node):
+                    prompt, duplicate = _manager_prompt_for_agent(agent, routable_values)
+                else:
+                    prompt, duplicate = _single(
+                        routable_values,
+                        kind=KIND_PROMPT,
+                        channel_uuid=agent.channel_uuid,
+                        shot_uuid=agent.shot_uuid,
+                    )
                 if duplicate or prompt is None:
                     code = "duplicate_prompt" if duplicate else "prompt_unavailable"
                     failures.append(f"{agent.node_name}: {code}")
@@ -2465,6 +2860,17 @@ def reconcile_shot_routing(
                     if detail.startswith("unable"):
                         failures.append(f"{agent.node_name}: {detail}")
                     _notify_status(agent.node, ok=False, code=code)
+                    continue
+                if _is_shot_manager(agent.node) and any(
+                    str(getattr(edge, "target_parameter_name", "")) == "SHOT_PROMPT_IN"
+                    and str(getattr(edge, "source_parameter_name", "")) == "PROMPT_OUT"
+                    and str(getattr(edge, "source_node_name", "")) != prompt.node_name
+                    for edge in _incoming_connections(agent.node)
+                ):
+                    # Opting into a manager never merges/steals an existing
+                    # legacy Prompt chain. The user must resolve that edge.
+                    failures.append(f"{agent.node_name}: manager_prompt_conflict")
+                    _notify_status(agent.node, ok=False, code="manager_prompt_conflict")
                     continue
                 ok, detail = _ensure_edge(
                     ShotEdge(
@@ -2489,7 +2895,7 @@ def reconcile_shot_routing(
                         "_hmb_hydrate_shot_prompt_from_source",
                         None,
                     )
-                    if callable(hydrate):
+                    if callable(hydrate) and not _is_shot_manager(agent.node):
                         try:
                             if hydrate(prompt.node, "PROMPT_OUT") is not True:
                                 ok = False
@@ -2507,7 +2913,8 @@ def reconcile_shot_routing(
             # contracts into one billable generation request.
             finish_groups: dict[tuple[str, str], list[ShotSubscription]] = {}
             for finish in routable_values:
-                if finish.kind == KIND_FINISH_LOOK and finish.enabled:
+                if (finish.kind == KIND_FINISH_LOOK and finish.enabled
+                        and not _is_shot_manager(finish.node)):
                     finish_groups.setdefault(
                         (finish.channel_uuid, finish.shot_uuid), []
                     ).append(finish)
@@ -2740,15 +3147,34 @@ def reconcile_shot_routing(
                 and id(item.node) not in unresolved_seedance_ids
             ]
             for target in seedance_nodes:
-                agent, agent_duplicate = _single(
+                # Only is a real independent mode. A previously assigned
+                # manager's exact physical edge remains its durable ownership
+                # while paused; another available manager must not silently
+                # acquire that Generator. Explicit rewiring still chooses a
+                # different owner and ordinary never-managed Only stays native.
+                prompt_edges = [edge for edge in _incoming_connections(target.node)
+                                if str(getattr(edge, "target_parameter_name", "")) == "prompt"]
+                paused_owner = False
+                if len(prompt_edges) == 1 and str(getattr(prompt_edges[0], "source_parameter_name", "")) == "output":
+                    previous = by_name.get(str(getattr(prompt_edges[0], "source_node_name", "")))
+                    paused = getattr(previous.node, "_hmb_shot_manager_paused_for", None) if previous is not None and previous.kind == KIND_AGENT else None
+                    if callable(paused):
+                        try:
+                            paused_owner = paused(channel_uuid=target.channel_uuid, shot_uuid=target.shot_uuid) is True
+                        except Exception:
+                            paused_owner = True  # Unknown ownership is never permission to transfer it.
+                if paused_owner:
+                    failures.append(f"{target.node_name}: agent_manager_paused")
+                    _notify_status(target.node, ok=False, code="agent_manager_paused",
+                                   details="The assigned Agent is in Only mode. Switch it back or explicitly connect another Agent.")
+                    continue
+                agent, agent_duplicate = _agent_for_target(
+                    target,
                     (
                         item
                         for item in routable_values
                         if id(item.node) not in unresolved_agent_ids
                     ),
-                    kind=KIND_AGENT,
-                    channel_uuid=target.channel_uuid,
-                    shot_uuid=target.shot_uuid,
                 )
                 image, image_duplicate = _single(
                     routable_values,
@@ -2770,6 +3196,8 @@ def reconcile_shot_routing(
                     channel_uuid=target.channel_uuid,
                     shot_uuid=target.shot_uuid,
                 )
+                invalid_finish_owner = _finish_route_has_invalid_owner(
+                    target, finish, by_name, nodes, catalog_rejected_node_ids)
                 source_rejected = bool(
                     image is not None and id(image.node) in catalog_rejected_node_ids
                     or picker is not None and id(picker.node) in catalog_rejected_node_ids
@@ -2805,6 +3233,7 @@ def reconcile_shot_routing(
                     or finish_duplicate
                     or finish_identity_mismatch
                     or unresolved_finish
+                    or invalid_finish_owner
                     or (image is None and picker is None)
                     or source_rejected
                 ):
@@ -2817,6 +3246,8 @@ def reconcile_shot_routing(
                         if (finish_duplicate or unresolved_finish)
                         else "finish_look_identity_mismatch"
                         if finish_identity_mismatch
+                        else "finish_look_source_unavailable"
+                        if invalid_finish_owner
                         else "duplicate_shot_source"
                         if (image_duplicate or picker_duplicate)
                         else "shot_source_unavailable"
@@ -2833,6 +3264,8 @@ def reconcile_shot_routing(
                         ("SHOT_VIDEO_IN", "SHOT_VIDEO_OUT"),
                         ("SHOT_FINISH_LOOK_IN", "SHOT_FINISH_LOOK_OUT"),
                     ):
+                        if target_parameter == "SHOT_FINISH_LOOK_IN" and invalid_finish_owner:
+                            continue
                         removed, detail = _clear_hmb_route(
                             target.node,
                             target_parameter,
@@ -2987,6 +3420,8 @@ __all__ = [
     "prepare_node_deletion",
     "release_node_lifecycle",
     "reconcile_shot_routing",
+    "resolve_shot_prompt_owner",
+    "resolve_shot_agent_owner",
     "schedule_post_deletion_reconcile",
     "schedule_post_hydration_reconcile",
     "schedule_post_registration_reconcile",

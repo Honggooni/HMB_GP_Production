@@ -63,7 +63,27 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
         with event_lock:
             events.append((kind, number, time.monotonic()))
 
-    def native_model_fixture(self, agent, _prompt):
+    native_context = threading.local()
+    native_states = []
+
+    def process_owner(self, state, prompt, output_type):
+        # Preserve actual Standard _process/build/run and its current typed
+        # AgentState -> AgentRunResult contract. Only the model is in-memory.
+        assert isinstance(state, standard_module.AgentState)
+        native_states.append(state)
+        native_context.owner = self
+        try:
+            return original_native_process(self, state, prompt, output_type)
+        finally:
+            native_context.owner = None
+
+    def test_model(_config):
+        from pydantic_ai.models.test import TestModel
+        number = native_context.owner._regression_shot_number
+        return TestModel(custom_output_text=f"Valid generator instruction for shot {number}.")
+
+    def native_model_fixture(agent, prompt, **kwargs):
+        self = native_context.owner
         number = self._regression_shot_number
         record("agent_started", number)
         if number == 1:
@@ -74,11 +94,12 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
             record("agent_failed", number)
             raise TimeoutError("Read timed out: PRIVATE_PROVIDER_PAYLOAD")
         time.sleep(0.06)
-        result = f"Valid generator instruction for shot {number}."
-        agent.tasks[0].output = standard_module.TextArtifact(value=result)
-        self._last_raw_output = result
+        result = original_run_agent(agent, prompt, **kwargs)
+        assert isinstance(result, standard_module.AgentRunResult)
+        assert result.output == f"Valid generator instruction for shot {number}."
+        assert result.new_messages()
         record("agent_finished", number)
-        return agent
+        return result
 
     async def generation_fixture(self):
         number = self._regression_shot_number
@@ -106,6 +127,9 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
     native_base = agent_module.HMBAgentLibrary.__mro__[1]
     standard_module = inspect.getmodule(native_base)
     assert standard_module is not None
+    from griptape_nodes_library.llm import runner as native_runner
+    original_native_process = native_base._process
+    original_run_agent = standard_module.run_agent
 
     with ExitStack() as stack:
         # Hold the five supplied edges fixed; selector ownership/reconciliation
@@ -118,10 +142,11 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
         # Keep the installed Standard process, callable-yield contract and real
         # HMB _process inference marker. Replace only billable model work and
         # its account prerequisites, never protected execution-result flags.
-        stack.enter_context(mock.patch.object(native_base, "_process", native_model_fixture))
+        stack.enter_context(mock.patch.object(native_base, "_process", process_owner))
+        stack.enter_context(mock.patch.object(native_runner, "build_model", test_model))
+        stack.enter_context(mock.patch.object(standard_module, "run_agent", native_model_fixture))
         stack.enter_context(mock.patch.object(standard_module, "resolve_cloud_api_key", lambda: "offline-fixture-key"))
         stack.enter_context(mock.patch.object(standard_module, "require_model_invocation_sync", lambda *_a, **_k: None))
-        stack.enter_context(mock.patch.object(standard_module, "try_throw_error", lambda *_a, **_k: None))
         stack.enter_context(mock.patch.object(
             seedance_module.HMBSeedanceGeneration, "_process_generation", generation_fixture,
         ))
@@ -136,6 +161,14 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
         ))
         for number in range(1, 6):
             agent = agent_module.HMBAgentLibrary(name=f"offline_shot_{number}_agent")
+            # Retained pre-manager native execution fixture: exercise the full
+            # protected native pipeline and host failure scheduling here. The
+            # singleton manager/requested-Shot DAG has its own host regression.
+            agent._hmb_shot_manager_mode = False
+            # Native workers keep phase UI on their manager, not a second
+            # retained editor. Avoid normalizing this deliberately legacy
+            # fixture's header back into a manager during protected execution.
+            agent._set_agent_execution_phase = lambda _phase: None
             stack.enter_context(mock.patch.object(agent._model_access, "raise_if_selection_denied", lambda: None))
             generator = seedance_module.HMBSeedanceGeneration(name=f"offline_shot_{number}_generator")
             for node in (agent, generator):
@@ -188,6 +221,9 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
         assert all(g.parameter_output_values.get("was_successful") is True for g in generators[1:])
         assert all(a._hmb_execution_result_snapshot()["status"] == "succeeded" for a in agents[1:])
         assert all(a._hmb_execution_result_snapshot()["inference_started"] is True for a in agents)
+        assert len(native_states) == 5
+        assert all(state.to_wire()["format"] == "pydantic_ai_agent" for state in native_states)
+        assert sum(bool(state.messages) for state in native_states) == 4
 
         # Single-node resolution ignores control branching in this host. The
         # actual runtime prompt guard must still reject the known failed source.

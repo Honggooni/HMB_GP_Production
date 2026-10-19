@@ -395,12 +395,27 @@ export function hmbNormalizeFinishLookWidgetValue(input = {}) {
       schema_version: HMB_FINISH_LOOK_SCHEMA_VERSION,
       beauty,
     },
+    shot_manager: source.shot_manager !== false,
+    shot_editor_expanded: source.shot_editor_expanded !== false,
+    shot_documents: Object.fromEntries(Object.entries(hmbRecord(source.shot_documents)).slice(0,5).map(([key,value])=>[key,hmbNormalizeFinishLookWidgetValue({finish_look:value}).finish_look])),
   };
   return normalized;
 }
 
 export function hmbFinishLookPublication(input) {
   return hmbNormalizeFinishLookWidgetValue(input);
+}
+
+export function hmbFinishLookUITransport(input) {
+  const value=hmbRecord(hmbRawWidgetValue(input).ui_transport);
+  const statuses=new Set(["state","accepted","refreshed","duplicate","conflict","stale_session","stale_client","stale_sequence","target_unavailable","remote_locked","invalid_command"]);
+  if(value.schema!=="hmb-finish-ui-transport" || value.version!==1 || typeof value.session_id!=="string" || !value.session_id || value.session_id.length>128
+    || !Number.isSafeInteger(value.revision) || value.revision<1 || !statuses.has(value.status)
+    || !Number.isSafeInteger(value.sequence) || value.sequence<0
+    || ["client_id","client_epoch","request_id"].some(key=>typeof value[key]!=="string" || value[key].length>128))return null;
+  const targets=hmbRecord(value.target_revisions);
+  if(Object.keys(targets).length>6 || Object.entries(targets).some(([key,revision])=>!key || key.length>257 || !Number.isSafeInteger(revision) || revision<0 || revision>value.revision))return null;
+  return {...value,target_revisions:{...targets}};
 }
 
 export function hmbFinishLookLabels(language) {
@@ -560,8 +575,31 @@ export function hmbFinishLookFieldEnabled(state, path) {
 
 export function hmbApplyFinishLookControlAvailability(container, state) {
   for (const input of container.querySelectorAll?.("[data-finish-step]") || []) {
-    input.disabled = !hmbFinishLookFieldEnabled(state, input.getAttribute("data-finish-step"));
+    const disabled = !hmbFinishLookFieldEnabled(state, input.getAttribute("data-finish-step"));
+    if (input.disabled !== disabled) input.disabled = disabled;
   }
+}
+
+function hmbApplyFinishLookActiveEditor(container, state) {
+  const root=container.querySelector?.(".hmb-finish-look");
+  if(!root)return false;
+  const attribute=(element,name,value)=>{if(element?.getAttribute(name)!==String(value))element?.setAttribute(name,String(value));};
+  attribute(root,"data-shot-number",hmbFinishLookPaletteShotNumber(state));
+  attribute(root,"data-shot-bound",Boolean(state.shot.shot_uuid));
+  for(const button of container.querySelectorAll?.("[data-finish-shot]") || []){
+    const selected=button.getAttribute("data-finish-shot")===state.shot.shot_uuid;
+    attribute(button,"aria-pressed",selected);attribute(button,"aria-expanded",selected);
+  }
+  const toggle=container.querySelector?.('[data-enable="beauty"]');
+  if(toggle){if(toggle.checked!==state.finish_look.beauty.enabled)toggle.checked=state.finish_look.beauty.enabled;if(toggle.disabled!==state.remote_connected)toggle.disabled=state.remote_connected;}
+  for(const input of container.querySelectorAll?.("[data-finish-step]") || []){
+    const path=input.getAttribute("data-finish-step"),value=hmbGetPath(state.finish_look,path);
+    const index=String(hmbFinishLookStepIndex(path,value));if(input.value!==index)input.value=index;
+    const text=hmbFinishLookStepLabel(path,value,state.language);attribute(input,"aria-valuetext",text);
+    const output=container.querySelector?.(`[data-step-label="${path}"]`);if(output && output.textContent!==text)output.textContent=text;
+  }
+  hmbApplyFinishLookControlAvailability(container,state);
+  return true;
 }
 
 function hmbStepField(path, label, value, disabled, language) {
@@ -579,6 +617,8 @@ function hmbRenderFinishLook(state) {
   const paletteShotNumber = hmbFinishLookPaletteShotNumber(state);
   const shotBound = paletteShotNumber > 0;
   const shotOptions = hmbFinishLookShotOptions(state);
+  const managed = state.shot_manager && Boolean(state.shot_catalog.channel_uuid);
+  const tabs = managed ? (state.shot_catalog.shots || []).map(shot=>`<div class="hmb-finish-look__shot-tab" data-finish-shot-row="${hmbEscape(shot.shot_uuid)}" data-shot-number="${shot.number}"><button type="button" data-finish-shot="${hmbEscape(shot.shot_uuid)}" aria-pressed="${state.shot.shot_uuid===shot.shot_uuid}" aria-expanded="${state.shot.shot_uuid===shot.shot_uuid}" title="${hmbEscape(shot.name)}"><span>${String(shot.number).padStart(2,"0")}</span><b>${hmbEscape(shot.name)}</b></button></div>`).join("") : "";
   const beautyDisabled = !beauty.enabled || remoteLocked;
   const hmbNumericField = (path, label, value, disabled) => hmbStepField(
     path, label, value, disabled || !hmbFinishLookFieldEnabled(state, path), state.language,
@@ -598,12 +638,17 @@ function hmbRenderFinishLook(state) {
       .hmb-finish-look{--hmb-shot-accent:#64748B;--hmb-shot-rgb:100,116,139;--hmb-shot-deep:#334155;--hmb-shot-soft:#CBD5E1;--hmb-shot-line:rgba(100,116,139,.4);--hmb-shot-glow:rgba(100,116,139,.08);--hmb-accent:var(--hmb-shot-accent);--hmb-soft:var(--hmb-shot-soft);border-color:var(--hmb-shot-line);background:radial-gradient(circle at 8% -24%,var(--hmb-shot-glow),transparent 42%),linear-gradient(180deg,#0b1020,var(--hmb-bg));box-shadow:inset 0 1px 0 rgba(255,255,255,.035),0 8px 24px rgba(0,0,0,.24),0 0 18px var(--hmb-shot-glow)}.hmb-finish-look[data-shot-number="1"]{--hmb-shot-accent:#F472B6;--hmb-shot-rgb:244,114,182;--hmb-shot-deep:#BE185D;--hmb-shot-soft:#FBCFE8;--hmb-shot-line:rgba(244,114,182,.5);--hmb-shot-glow:rgba(244,114,182,.2)}.hmb-finish-look[data-shot-number="2"]{--hmb-shot-accent:#3B82F6;--hmb-shot-rgb:59,130,246;--hmb-shot-deep:#1D4ED8;--hmb-shot-soft:#DBEAFE;--hmb-shot-line:rgba(59,130,246,.5);--hmb-shot-glow:rgba(59,130,246,.2)}.hmb-finish-look[data-shot-number="3"]{--hmb-shot-accent:#10B981;--hmb-shot-rgb:16,185,129;--hmb-shot-deep:#047857;--hmb-shot-soft:#D1FAE5;--hmb-shot-line:rgba(16,185,129,.5);--hmb-shot-glow:rgba(16,185,129,.2)}.hmb-finish-look[data-shot-number="4"]{--hmb-shot-accent:#8B5CF6;--hmb-shot-rgb:139,92,246;--hmb-shot-deep:#6D28D9;--hmb-shot-soft:#EDE9FE;--hmb-shot-line:rgba(139,92,246,.5);--hmb-shot-glow:rgba(139,92,246,.2)}.hmb-finish-look[data-shot-number="5"]{--hmb-shot-accent:#EAB308;--hmb-shot-rgb:234,179,8;--hmb-shot-deep:#A16207;--hmb-shot-soft:#FEF3C7;--hmb-shot-line:rgba(234,179,8,.5);--hmb-shot-glow:rgba(234,179,8,.2)}
       .hmb-finish-look__topbar{border-bottom-color:var(--hmb-shot-line);background:linear-gradient(90deg,rgba(var(--hmb-shot-rgb),.2),rgba(9,12,22,.98))}.hmb-finish-look__mark{border-color:var(--hmb-shot-line);background:rgba(var(--hmb-shot-rgb),.13);color:var(--hmb-shot-soft);box-shadow:0 0 12px var(--hmb-shot-glow)}.hmb-finish-look__section{border-color:rgba(var(--hmb-shot-rgb),.28)}.hmb-finish-look__section-header{background:linear-gradient(90deg,rgba(var(--hmb-shot-rgb),.13),transparent)}.hmb-finish-look__section-header h2,.hmb-finish-look__subhead{color:var(--hmb-shot-soft)}.hmb-finish-look input:focus,.hmb-finish-look select:focus,.hmb-finish-look button:focus-visible{border-color:var(--hmb-shot-accent);box-shadow:0 0 0 1px var(--hmb-shot-line)}.hmb-finish-look__tab.is-active{border-color:var(--hmb-shot-accent);background:rgba(var(--hmb-shot-rgb),.2);color:var(--hmb-shot-soft)}.hmb-finish-look__actions .is-primary{border-color:var(--hmb-shot-accent);background:rgba(var(--hmb-shot-rgb),.22)}
       .hmb-finish-look__shot-shell{flex:0 1 210px;width:210px;min-width:120px;max-width:210px;display:flex;align-items:center;gap:7px}.hmb-finish-look__shot-shell>span{flex:0 0 auto;color:var(--hmb-muted);font-size:8px;font-weight:900;letter-spacing:.12em}.hmb-finish-look__shot-select{width:100%;height:44px;padding:0 10px;border:1px solid var(--hmb-shot-line);border-radius:7px;outline:none;background:linear-gradient(180deg,rgba(var(--hmb-shot-rgb),.14),rgba(8,15,27,.96));color:var(--hmb-shot-soft);box-shadow:0 0 10px var(--hmb-shot-glow);font-size:13px;font-weight:800;line-height:normal}.hmb-finish-look__shot-select option{background:#0b1020;color:#e8eef7}.hmb-finish-look__shot-select:disabled{border-color:rgba(100,116,139,.28);background:#0b111c;color:#7c8a9d;box-shadow:none;opacity:.78}.hmb-finish-look__bound-badge,.hmb-finish-look__remote-badge{padding:4px 7px;border-radius:999px;font-size:8px;font-weight:950;letter-spacing:.12em;white-space:nowrap}.hmb-finish-look__bound-badge{border:1px solid var(--hmb-shot-line);background:rgba(var(--hmb-shot-rgb),.2);color:var(--hmb-shot-soft);box-shadow:0 0 10px var(--hmb-shot-glow)}.hmb-finish-look__language{border-color:var(--hmb-shot-line);color:var(--hmb-shot-soft)}
-      .hmb-finish-look{--hmb-mode-rgb:244,114,182;--hmb-mode-soft:#FBCFE8;border-color:rgba(var(--hmb-mode-rgb),.5)}.hmb-finish-look__topbar{border-bottom-color:rgba(var(--hmb-mode-rgb),.48);background:linear-gradient(90deg,rgba(var(--hmb-mode-rgb),.24),rgba(9,12,22,.98));cursor:default}.hmb-finish-look__mark{border-color:rgba(var(--hmb-mode-rgb),.62);background:rgba(var(--hmb-mode-rgb),.15);color:var(--hmb-mode-soft)}.hmb-finish-look__heading b{font-weight:800}.hmb-finish-look__heading em{margin-top:1px;color:rgba(var(--hmb-mode-rgb),.82);font-size:8px;font-style:normal;font-weight:750}
+      .hmb-finish-look{--hmb-mode-rgb:var(--hmb-shot-rgb);--hmb-mode-soft:var(--hmb-shot-soft);border-color:rgba(var(--hmb-mode-rgb),.5)}.hmb-finish-look__topbar{border-bottom-color:rgba(var(--hmb-mode-rgb),.48);background:linear-gradient(90deg,rgba(var(--hmb-mode-rgb),.24),rgba(9,12,22,.98));cursor:default}.hmb-finish-look__mark{border-color:rgba(var(--hmb-mode-rgb),.62);background:rgba(var(--hmb-mode-rgb),.15);color:var(--hmb-mode-soft)}.hmb-finish-look__heading b{font-weight:800}.hmb-finish-look__heading em{margin-top:1px;color:rgba(var(--hmb-mode-rgb),.82);font-size:8px;font-style:normal;font-weight:750}
       @container(max-width:780px){.hmb-finish-look__heading span{display:none}.hmb-finish-look__shot-shell{flex-basis:210px;width:210px}.hmb-finish-look__bound-badge,.hmb-finish-look__remote-badge{padding-inline:5px;font-size:7px}}@container(max-width:680px){.hmb-finish-look__content{grid-template-columns:1fr}.hmb-finish-look__topbar{gap:9px;padding-inline:10px}.hmb-finish-look__shot-shell{flex:1 1 auto;width:auto;max-width:none}.hmb-finish-look__shot-shell>span,.hmb-finish-look__bound-badge{display:none}}@container(max-width:500px){.hmb-finish-look__heading{display:flex}.hmb-finish-look__heading span,.hmb-finish-look__heading em,.hmb-finish-look__shot-shell>span,.hmb-finish-look__bound-badge{display:none}.hmb-finish-look__mark{display:none}.hmb-finish-look__shot-shell{min-width:0}.hmb-finish-look__language{min-width:46px;padding-inline:6px}}@container(max-width:400px){.hmb-finish-look__grid{grid-template-columns:repeat(3,minmax(0,1fr))}.hmb-finish-look__remote-badge{display:none}}
+      .hmb-finish-look{display:flex;flex-direction:column;min-width:0;min-height:0;max-height:100%}.hmb-finish-look__topbar{position:relative;top:auto;flex:0 0 68px}.hmb-finish-look__scroll{flex:1 1 0;min-width:0;min-height:0;height:auto;max-height:none;overflow:auto}.hmb-finish-look__content{min-width:0;min-height:0}
+      .hmb-finish-look__shot-tabs{flex:0 0 auto;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px;padding:9px 10px 0;min-width:0}.hmb-finish-look__shot-tab{min-width:0;--tab:#F472B6}.hmb-finish-look__shot-tab[data-shot-number="2"]{--tab:#3B82F6}.hmb-finish-look__shot-tab[data-shot-number="3"]{--tab:#10B981}.hmb-finish-look__shot-tab[data-shot-number="4"]{--tab:#8B5CF6}.hmb-finish-look__shot-tab[data-shot-number="5"]{--tab:#EAB308}
+      .hmb-finish-look__shot-tab button{display:flex;align-items:center;gap:7px;min-width:0;width:100%;height:42px;padding:6px 8px;border:1px solid color-mix(in srgb,var(--tab) 34%,transparent);border-radius:7px;background:color-mix(in srgb,var(--tab) 6%,#080f1b);color:#aebed0;font-size:10px;font-weight:750;text-align:left}.hmb-finish-look__shot-tab button[aria-pressed="true"]{border-color:var(--tab);background:color-mix(in srgb,var(--tab) 23%,#080f1b);color:var(--hmb-text);box-shadow:inset 3px 0 var(--tab),0 0 10px color-mix(in srgb,var(--tab) 18%,transparent)}.hmb-finish-look__shot-tab span{flex:0 0 auto;color:var(--tab);font-size:10px}.hmb-finish-look__shot-tab b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+      @container(max-width:460px){.hmb-finish-look__shot-tabs{grid-template-columns:repeat(3,minmax(0,1fr))}.hmb-finish-look__shot-tab button{padding:5px;gap:4px}}
     </style>
     <div class="hmb-finish-look nodrag nowheel" data-language="${state.language}" data-remote-connected="${remoteLocked ? "true" : "false"}" data-shot-number="${paletteShotNumber}" data-shot-bound="${shotBound ? "true" : "false"}" data-workspace-mode="finish" tabindex="0">
+        <header class="hmb-finish-look__topbar"><div class="hmb-finish-look__mark" aria-hidden="true">${headerMark}</div><div class="hmb-finish-look__heading"><b>${hmbEscape(headerTitle)}</b><span>${hmbEscape(headerSubtitle)}</span></div><label class="hmb-finish-look__shot-shell nodrag" data-no-finish-toggle${managed ? " hidden" : ""}><span>${hmbEscape(t.shot)}</span><select class="hmb-finish-look__shot-select nodrag" data-shot-selector aria-label="Shot"${shotOptions.length > 1 ? "" : " disabled"}>${hmbFinishLookShotOptionsMarkup(state)}</select></label><span class="hmb-finish-look__bound-badge" data-shot-bound-badge${shotBound ? "" : " hidden"}>${hmbEscape(t.bound)}</span><span class="hmb-finish-look__remote-badge"${remoteLocked ? "" : " hidden"}>REMOTE</span><button type="button" class="hmb-finish-look__language nodrag" data-no-finish-toggle data-language-toggle aria-label="${hmbEscape(t.language)}">${state.language === "ko" ? "한국어" : "EN"}</button></header>
+        <nav class="hmb-finish-look__shot-tabs" aria-label="Shots"${managed ? "" : " hidden"}>${tabs}</nav>
       <div class="hmb-finish-look__scroll">
-        <header class="hmb-finish-look__topbar"><div class="hmb-finish-look__mark" aria-hidden="true">${headerMark}</div><div class="hmb-finish-look__heading"><b>${hmbEscape(headerTitle)}</b><span>${hmbEscape(headerSubtitle)}</span></div><label class="hmb-finish-look__shot-shell nodrag" data-no-finish-toggle><span>${hmbEscape(t.shot)}</span><select class="hmb-finish-look__shot-select nodrag" data-shot-selector aria-label="Shot"${shotOptions.length > 1 ? "" : " disabled"}>${hmbFinishLookShotOptionsMarkup(state)}</select></label><span class="hmb-finish-look__bound-badge" data-shot-bound-badge${shotBound ? "" : " hidden"}>${hmbEscape(t.bound)}</span><span class="hmb-finish-look__remote-badge"${remoteLocked ? "" : " hidden"}>REMOTE</span><button type="button" class="hmb-finish-look__language nodrag" data-no-finish-toggle data-language-toggle aria-label="${hmbEscape(t.language)}">${state.language === "ko" ? "한국어" : "EN"}</button></header>
         <main class="hmb-finish-look__content">
           <section class="hmb-finish-look__section" data-finish-section="beauty"><header class="hmb-finish-look__section-header"><h2>${hmbEscape(t.beauty)}</h2><label class="hmb-finish-look__enable"><input type="checkbox" data-enable="beauty"${beauty.enabled ? " checked" : ""}${remoteLocked ? " disabled" : ""}><span>${hmbEscape(t.enable)}</span></label></header><div class="hmb-finish-look__section-body"><div class="hmb-finish-look__subhead">${hmbEscape(t.primary)}</div><div class="hmb-finish-look__grid">${hmbNumericField("beauty.soften_shadows", t.softenShadows, beauty.soften_shadows, beautyDisabled)}${hmbNumericField("beauty.shadow_threshold", t.shadowThreshold, beauty.shadow_threshold, beautyDisabled)}${hmbNumericField("beauty.saturation", t.saturation, beauty.saturation, beautyDisabled)}${hmbNumericField("beauty.brightness", t.brightness, beauty.brightness, beautyDisabled)}</div><div class="hmb-finish-look__subhead">${hmbEscape(t.advanced)}</div><div class="hmb-finish-look__grid">${hmbNumericField("beauty.glow_brightness", t.glowBrightness, beauty.glow_brightness, beautyDisabled)}${hmbNumericField("beauty.glow_threshold", t.glowThreshold, beauty.glow_threshold, beautyDisabled)}${hmbNumericField("beauty.glow_width", t.glowWidth, beauty.glow_width, beautyDisabled)}${hmbNumericField("beauty.soft_focus", t.softFocus, beauty.soft_focus, beautyDisabled)}${hmbNumericField("beauty.blur_amount", t.blurAmount, beauty.blur_amount, beautyDisabled)}${hmbNumericField("beauty.pore_size", t.poreSize, beauty.pore_size, beautyDisabled)}${hmbNumericField("beauty.reduce_shine", t.reduceShine, beauty.reduce_shine, beautyDisabled)}</div></div></section>
         </main>
@@ -714,6 +759,31 @@ function hmbFinishLookShotKey(state) {
     ? `${state.shot.channel_uuid}\u001f${state.shot.shot_uuid}` : HMB_FINISH_LOOK_ONLY_SHOT_VALUE;
 }
 
+function hmbFinishLookTransportTargetKey(state) {
+  return state?.shot?.shot_uuid ? hmbFinishLookShotKey(state) : "__standalone__";
+}
+
+function hmbMorphFinishLook(current, desired) {
+  if (!current || !desired) return;
+  if (current.nodeType !== desired.nodeType || current.nodeName !== desired.nodeName) {
+    current.replaceWith(desired.cloneNode(true));return;
+  }
+  if (current.nodeType === 3) {if(current.nodeValue!==desired.nodeValue)current.nodeValue=desired.nodeValue;return;}
+  if (current.nodeType !== 1) return;
+  for(const attribute of Array.from(current.attributes))if(!desired.hasAttribute(attribute.name))current.removeAttribute(attribute.name);
+  for(const attribute of Array.from(desired.attributes))if(current.getAttribute(attribute.name)!==attribute.value)current.setAttribute(attribute.name,attribute.value);
+  if (current.tagName === "INPUT") {
+    if(current.type === "checkbox" && current.checked!==desired.checked)current.checked=desired.checked;
+    if(current.type !== "checkbox" && current.value!==desired.value)current.value=desired.value;
+  }
+  const wanted=Array.from(desired.childNodes);
+  for(let index=0;index<wanted.length;index++){
+    if(current.childNodes[index])hmbMorphFinishLook(current.childNodes[index],wanted[index]);
+    else current.appendChild(wanted[index].cloneNode(true));
+  }
+  while(current.childNodes.length>wanted.length)current.lastChild.remove();
+}
+
 export default function HMBFinishLookLibraryWidget(container, props) {
   if (!container) return { cleanup() {}, update() {} };
   const incoming = props || container.__hmbFinishLookLatestProps || {};
@@ -733,6 +803,16 @@ export default function HMBFinishLookLibraryWidget(container, props) {
   let listenerCleanups = [];
   let publicationOwner = 0;
   let pendingShot = null;
+  let resizeObserver = null;
+  let resizeFrame = 0;
+  let queuedTab = null;
+  let tabFrame = 0;
+  let uiClock=hmbFinishLookUITransport(incoming);
+  let transportEnabled=Boolean(uiClock),transportEpoch="",transportSequence=0,transportFlight=null;
+  let transportQueue=[],transportFrames=[],transportTimer=0,transportFallback=0;
+  const retiredSessions=new Set();
+  const transportId=()=>globalThis.crypto?.randomUUID?.() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  const transportClient=transportId();
   container.__hmbFinishLookLatestProps = incoming;
 
   const clearListeners = () => {
@@ -746,37 +826,175 @@ export default function HMBFinishLookLibraryWidget(container, props) {
     listenerCleanups.push(() => target.removeEventListener?.(eventName, handler, options));
   };
   const cloneState = () => hmbNormalizeFinishLookWidgetValue(hmbFinishLookPublication(state));
+  let confirmedState=cloneState();
+  const tabWindow=container.ownerDocument?.defaultView;
+  const cancelQueuedTab=()=>{queuedTab=null;if(tabFrame){tabWindow?.cancelAnimationFrame?.(tabFrame);tabFrame=0;}};
+  const flushQueuedTab=()=>{
+    const queued=queuedTab;cancelQueuedTab();return queued && !disposed ? queued.send() : true;
+  };
+  const clearTransportSchedule=()=>{
+    for(const frame of transportFrames)tabWindow?.cancelAnimationFrame?.(frame);transportFrames=[];
+    clearTimeout(transportFallback);transportFallback=0;
+  };
+  const retainTransportProps=(nextProps)=>{
+    const value={...hmbFinishLookPublication(state),...(uiClock?{ui_transport:uiClock}:{})};
+    container.__hmbFinishLookLatestProps={...nextProps,value,parameterValue:value,defaultValue:value};
+  };
+  const rejectTransportDraft=(message)=>{
+    if(transportQueue.some(command=>command.operation==="edit"))container.__hmbFinishLookUnappliedDraft=transportQueue.filter(command=>command.operation==="edit").map(command=>structuredClone(command.payload));
+    transportQueue=[];clearTransportSchedule();pendingShot=null;state=hmbNormalizeFinishLookWidgetValue(confirmedState);
+    retainTransportProps(container.__hmbFinishLookLatestProps || {});remount();
+    if(message)hmbSetStatus(container,message,"error");
+  };
+  const queueTransportRefresh=()=>{
+    if(disposed || transportFlight?.operation==="refresh" || transportQueue.some(command=>command.operation==="refresh"))return;
+    transportQueue.unshift({operation:"refresh",payload:cloneState(),request_id:transportId()});
+    scheduleTransport(false);
+  };
+  const dispatchTransport=()=>{
+    clearTransportSchedule();if(disposed || transportFlight || !transportQueue.length)return;
+    if(!transportEpoch && transportQueue[0].operation!=="refresh")transportQueue.unshift({operation:"refresh",payload:cloneState(),request_id:transportId()});
+    const command=transportQueue.shift(),key=hmbFinishLookTransportTargetKey(command.payload);
+    if(command.operation!=="refresh" && (!uiClock || !Object.hasOwn(uiClock.target_revisions,key))){rejectTransportDraft("선택한 샷이 삭제되었거나 사용할 수 없습니다.");queueTransportRefresh();return;}
+    command.sequence=++transportSequence;
+    const envelope={schema:"hmb-finish-ui-transport",version:1,operation:command.operation,session_id:uiClock?.session_id || "",base_revision:uiClock?.revision || 0,
+      base_target_revision:command.baseTarget ?? uiClock?.target_revisions[key] ?? 0,client_id:transportClient,client_epoch:transportEpoch,request_id:command.request_id,sequence:command.sequence};
+    command.envelope=envelope;transportFlight=command;
+    const failed=error=>{
+      if(disposed || transportFlight!==command)return;
+      if(command.operation==="edit")container.__hmbFinishLookUnappliedDraft=[structuredClone(command.payload)];
+      clearTimeout(transportTimer);transportFlight=null;rejectTransportDraft(String(error?.message || "Finish Look 상태 확인에 실패했습니다."));
+      if(command.operation!=="refresh")queueTransportRefresh();
+    };
+    transportTimer=setTimeout(()=>failed(new Error("Finish Look 응답을 확인하지 못했습니다. 현재 상태를 다시 조회합니다.")),15000);
+    try{
+      const onChange=container.__hmbFinishLookLatestProps?.onChange;
+      if(typeof onChange!=="function")throw new Error("Finish Look state transport is unavailable.");
+      const result=onChange({...hmbFinishLookPublication(command.payload),ui_transport:envelope});
+      if(result && typeof result.then==="function")Promise.resolve(result).catch(failed);
+    }catch(error){failed(error);}
+  };
+  function scheduleTransport(deferred){
+    if(disposed || transportFlight)return;
+    if(!deferred){dispatchTransport();return;}
+    clearTransportSchedule();
+    if(tabWindow?.requestAnimationFrame)transportFrames.push(tabWindow.requestAnimationFrame(()=>{
+      transportFrames.push(tabWindow.requestAnimationFrame(dispatchTransport));
+    }));
+    transportFallback=setTimeout(dispatchTransport,120);
+  }
+  const enqueueTransport=(payload,tabOnly)=>{
+    const command={operation:tabOnly?"select":"edit",payload:hmbFinishLookPublication(payload),request_id:transportId(),baseTarget:uiClock?.target_revisions[hmbFinishLookTransportTargetKey(payload)] ?? 0};
+    if(tabOnly && transportQueue.at(-1)?.operation==="select")transportQueue.pop();
+    transportQueue.push(command);scheduleTransport(tabOnly);return true;
+  };
+  const receiveTransport=(nextProps,nextState)=>{
+    const meta=hmbFinishLookUITransport(nextProps),raw=hmbRecord(hmbRawWidgetValue(nextProps).ui_transport);
+    if(!transportEnabled && !meta)return false;
+    transportEnabled=true;
+    const matches=Boolean(meta && transportFlight && meta.client_id===transportClient && meta.request_id===transportFlight.request_id && meta.sequence===transportFlight.sequence);
+    if(!meta){
+      retainTransportProps(nextProps);
+      // The host may briefly echo its outgoing command before Python publishes
+      // the authoritative reply. Delivery alone never acknowledges the editor.
+      if(raw.client_id===transportClient && raw.request_id===transportFlight?.request_id)return true;
+      queueTransportRefresh();return true;
+    }
+    if(uiClock && meta.session_id!==uiClock.session_id){
+      if(retiredSessions.has(meta.session_id)){retainTransportProps(nextProps);return true;}
+      if(!(matches && transportFlight.operation==="refresh" && ["refreshed","duplicate"].includes(meta.status))){
+        retainTransportProps(nextProps);
+        if(matches){clearTimeout(transportTimer);transportFlight=null;transportEpoch="";rejectTransportDraft("Finish Look 세션이 변경되어 현재 상태를 확인합니다.");}
+        queueTransportRefresh();return true;
+      }
+      retiredSessions.add(uiClock.session_id);transportEpoch="";
+    }
+    if(uiClock && meta.session_id===uiClock.session_id && meta.revision<uiClock.revision){
+      retainTransportProps(nextProps);
+      if(matches){clearTimeout(transportTimer);transportFlight=null;rejectTransportDraft();queueTransportRefresh();}
+      return true;
+    }
+    const sameRevision=uiClock && meta.session_id===uiClock.session_id && meta.revision===uiClock.revision;
+    if(sameRevision && JSON.stringify(nextState)!==JSON.stringify(confirmedState)
+      && !(matches && transportFlight.operation==="refresh" && ["refreshed","duplicate"].includes(meta.status))){
+      retainTransportProps(nextProps);queueTransportRefresh();return true;
+    }
+    if(sameRevision && !matches && JSON.stringify(nextState)===JSON.stringify(confirmedState)){
+      uiClock=meta;retainTransportProps(nextProps);return true;
+    }
+    const completed=matches?transportFlight:null;
+    if(completed){clearTimeout(transportTimer);transportFlight=null;transportEpoch=meta.client_epoch || transportEpoch;}
+    uiClock=meta;confirmedState=hmbNormalizeFinishLookWidgetValue(nextState);
+    const failed=completed && !["accepted","refreshed","duplicate"].includes(meta.status);
+    if(failed){
+      if(completed.operation==="edit")container.__hmbFinishLookUnappliedDraft=[structuredClone(completed.payload)];
+      if(["stale_client","stale_session"].includes(meta.status))transportEpoch="";
+      rejectTransportDraft("최신 상태와 변경이 충돌해 적용하지 않았습니다. 현재 값을 확인해 주세요.");
+      retainTransportProps(nextProps);
+      if(["stale_client","stale_session"].includes(meta.status))queueTransportRefresh();
+      return true;
+    }
+    if(completed && completed.operation==="edit"){
+      const key=hmbFinishLookTransportTargetKey(completed.payload);
+      for(const queued of transportQueue)if(queued.operation==="edit" && hmbFinishLookTransportTargetKey(queued.payload)===key && queued.baseTarget===completed.envelope.base_target_revision)queued.baseTarget=meta.target_revisions[key];
+    }
+    if(transportQueue.some(command=>command.operation!=="refresh" && !Object.hasOwn(meta.target_revisions,hmbFinishLookTransportTargetKey(command.payload)))){
+      rejectTransportDraft("선택한 샷이 삭제되었거나 사용할 수 없습니다.");
+    }
+    const draft=transportQueue.filter(command=>command.operation!=="refresh").at(-1)
+      || (transportFlight?.operation!=="refresh" ? transportFlight : null);
+    state=draft?hmbNormalizeFinishLookWidgetValue(draft.payload):hmbNormalizeFinishLookWidgetValue(nextState);
+    state.remote_connected=nextState.remote_connected;
+    if(nextState.remote_connected && transportQueue.some(command=>command.operation==="edit"
+      && JSON.stringify(command.payload.finish_look)!==JSON.stringify(
+        hmbFinishLookTransportTargetKey(command.payload)===hmbFinishLookTransportTargetKey(nextState)
+          ? nextState.finish_look : nextState.shot_documents[hmbFinishLookTransportTargetKey(command.payload)] || hmbDefaultFinishLook())))rejectTransportDraft("REMOTE 연결 중에는 Finish Look 값을 수정할 수 없습니다.");
+    pendingShot=null;cancelQueuedTab();publicationOwner+=1;retainTransportProps(nextProps);remount();
+    if(!transportFlight)scheduleTransport(false);
+    return true;
+  };
 
   const remount = () => {
     if (disposed) return;
     const view = hmbCaptureFinishLookView(container);
-    clearListeners();
-    container.innerHTML = hmbRenderFinishLookWidget(state);
-    container.classList?.add("nodrag");
-    container.setAttribute?.("data-hmb-node-delete-protected", "true");
-    installInteractions();
+    const markup=hmbRenderFinishLookWidget(state);
+    const root=container.querySelector?.(".hmb-finish-look");
+    const document=container.ownerDocument;
+    if(root && document?.createElement && root.childNodes){
+      const template=document.createElement("template");template.innerHTML=markup;
+      hmbMorphFinishLook(root,template.content.querySelector(".hmb-finish-look"));
+    }else{
+      clearListeners();container.innerHTML=markup;
+      container.classList?.add("nodrag");container.setAttribute?.("data-hmb-node-delete-protected","true");installInteractions();
+    }
     hmbRestoreFinishLookView(container, view);
   };
 
   const rollback = (previous, owner, error) => {
     if (disposed || owner !== publicationOwner) return;
+    cancelQueuedTab();
     pendingShot = null;
     state = previous;
+    const retained = hmbFinishLookPublication(state);
+    container.__hmbFinishLookLatestProps = {
+      ...container.__hmbFinishLookLatestProps,
+      value: retained, parameterValue: retained, defaultValue: retained,
+    };
     remount();
     hmbSetStatus(container, String(error?.message || error || "Publication failed."), "error");
   };
 
-  const publish = (previous = cloneState(), repaint = true) => {
+  const publish = (previous = cloneState(), repaint = true, tabOnly = false) => {
     const liveProps = container.__hmbFinishLookLatestProps || {};
     if (typeof liveProps.onChange !== "function") {
-      rollback(previous, publicationOwner, new Error("Finish Look state transport is unavailable."));
+      rollback(hmbNormalizeFinishLookWidgetValue(confirmedState), publicationOwner, new Error("Finish Look state transport is unavailable."));
       return false;
     }
     const owner = ++publicationOwner;
     const payload = hmbFinishLookPublication(state);
-    let result;
-    try { result = liveProps.onChange(payload); } catch (error) { rollback(previous, owner, error); return false; }
-    if (owner !== publicationOwner) return true;
+    // A queued selection or earlier edit is not authoritative until echoed by
+    // the host. If several publications fail, never restore an unconfirmed view.
+    const rollbackState=hmbNormalizeFinishLookWidgetValue(confirmedState);
     const persisted = hmbFinishLookPublication(state);
     container.__hmbFinishLookLatestProps = {
       ...liveProps,
@@ -784,12 +1002,32 @@ export default function HMBFinishLookLibraryWidget(container, props) {
       parameterValue: persisted,
       defaultValue: persisted,
     };
-    if (repaint) remount();
-    if (result && typeof result.then === "function") Promise.resolve(result).catch((error) => rollback(previous, owner, error));
+    // Paint the local selection before the host bridge can serialize or wake
+    // the graph. Ordinary authoring transport remains unchanged.
+    if (repaint) {if(!tabOnly || !hmbApplyFinishLookActiveEditor(container,state))remount();}
+    if(transportEnabled)return enqueueTransport(payload,tabOnly);
+    const send=()=>{
+      if(disposed || owner !== publicationOwner)return false;
+      const onChange=container.__hmbFinishLookLatestProps?.onChange;
+      if(typeof onChange!=="function"){
+        rollback(rollbackState,owner,new Error("Finish Look state transport is unavailable."));return false;
+      }
+      let result;
+      try{result=onChange(payload);}catch(error){rollback(rollbackState,owner,error);return false;}
+      if(result && typeof result.then==="function")Promise.resolve(result).catch(error=>rollback(rollbackState,owner,error));
+      return true;
+    };
+    if(tabOnly && tabWindow?.requestAnimationFrame){
+      cancelQueuedTab();queuedTab={previous:rollbackState,send};
+      tabFrame=tabWindow.requestAnimationFrame(()=>{
+        tabFrame=tabWindow.requestAnimationFrame(()=>{tabFrame=0;const queued=queuedTab;queuedTab=null;if(!disposed)queued?.send();});
+      });
+    }else send();
     return true;
   };
 
   const mutate = (mutator, repaint = true) => {
+    if(!flushQueuedTab())return false;
     const previous = cloneState();
     mutator(state);
     return publish(previous, repaint);
@@ -799,6 +1037,19 @@ export default function HMBFinishLookLibraryWidget(container, props) {
     const root = container.querySelector?.(".hmb-finish-look");
     if (!root) return;
     const ownerDocument = container.ownerDocument || (typeof document !== "undefined" ? document : null);
+    bind(container,"click",event=>{
+      const button=event.target?.closest?.("[data-finish-shot]");
+      if(!button || !state.shot_manager)return;
+      const shot=state.shot_catalog.shots.find(row=>row.shot_uuid===button.getAttribute("data-finish-shot"));
+      if(!shot || state.shot.shot_uuid===shot.shot_uuid)return;
+      const previous=cloneState(),previousKey=hmbFinishLookShotKey(state);
+      state.shot_documents[previousKey]=JSON.parse(JSON.stringify(state.finish_look));
+      state.shot={channel_uuid:state.shot_catalog.channel_uuid,...shot};
+      state.finish_look=JSON.parse(JSON.stringify(state.shot_documents[hmbFinishLookShotKey(state)] || hmbDefaultFinishLook()));
+      state.shot_editor_expanded=true;
+      const blockedKeys=new Set(pendingShot?.blockedKeys||[]);blockedKeys.add(previousKey);
+      pendingShot={targetKey:hmbFinishLookShotKey(state),blockedKeys};publish(previous,true,true);
+    });
     // No workspace double-click handler: Finish Look remains the finish editor.
     const shotSelect = container.querySelector?.("[data-shot-selector]");
     bind(shotSelect, "change", () => {
@@ -829,7 +1080,8 @@ export default function HMBFinishLookLibraryWidget(container, props) {
         if (state.remote_connected) return;
         const group = toggle.getAttribute("data-enable");
         if (group !== "beauty") return;
-        mutate((next) => { next.finish_look[group].enabled = Boolean(toggle.checked); }, true);
+        const enabled = Boolean(toggle.checked);
+        mutate((next) => { next.finish_look[group].enabled = enabled; }, true);
       });
     }
     for (const input of container.querySelectorAll?.("[data-finish-step]") || []) {
@@ -848,6 +1100,9 @@ export default function HMBFinishLookLibraryWidget(container, props) {
       // Dragging is local-only. Commit once on release/keyboard change, without remounting.
       bind(input, "input", preview);
       bind(input, "change", () => {
+        const requestedValue = input.value;
+        if(!flushQueuedTab())return;
+        input.value = requestedValue;
         const value = preview();
         if (value === null || hmbGetPath(state.finish_look, path) === value) return;
         const previous = cloneState();
@@ -872,6 +1127,11 @@ export default function HMBFinishLookLibraryWidget(container, props) {
   container.__hmbFinishLookApplyProps = (nextProps = {}) => {
     if (disposed) return;
     const nextState = hmbNormalizeFinishLookWidgetValue(nextProps);
+    if(receiveTransport(nextProps,nextState))return;
+    if(JSON.stringify(nextState)===JSON.stringify(state)){
+      pendingShot=null;publicationOwner+=1;cancelQueuedTab();confirmedState=hmbNormalizeFinishLookWidgetValue(nextState);
+      container.__hmbFinishLookLatestProps=nextProps;return;
+    }
     if (pendingShot && nextProps !== container.__hmbFinishLookLatestProps) {
       const incomingKey = hmbFinishLookShotKey(nextState);
       if (incomingKey === pendingShot.targetKey) pendingShot = null;
@@ -894,24 +1154,32 @@ export default function HMBFinishLookLibraryWidget(container, props) {
           }
           return;
         }
-        pendingShot = null;
+        pendingShot = null;cancelQueuedTab();
       }
     }
+    cancelQueuedTab();
     publicationOwner += 1;
     const previousFingerprint = hmbFinishLookNonShotStateFingerprint(state);
     container.__hmbFinishLookLatestProps = nextProps;
     state = nextState;
+    confirmedState=hmbNormalizeFinishLookWidgetValue(nextState);
     const authoredUnchanged = previousFingerprint === hmbFinishLookNonShotStateFingerprint(nextState);
-    if (authoredUnchanged && hmbApplyFinishLookShotFeedback(container, nextState)) {
+    if (!state.shot_manager && authoredUnchanged && hmbApplyFinishLookShotFeedback(container, nextState)) {
       return;
     }
     remount();
   };
   const cleanup = () => {
     disposed = true;
+    clearTransportSchedule();clearTimeout(transportTimer);transportQueue=[];transportFlight=null;
+    cancelQueuedTab();
     publicationOwner += 1;
     pendingShot = null;
     clearListeners();
+    resizeObserver?.disconnect();
+    const ownerWindow=container.ownerDocument?.defaultView;
+    if(resizeFrame)ownerWindow?.cancelAnimationFrame?.(resizeFrame);
+    container.style?.removeProperty?.("max-height");
     container.removeAttribute?.("data-hmb-node-delete-protected");
     container.classList?.remove("nodrag");
     container.innerHTML = "";
@@ -921,6 +1189,21 @@ export default function HMBFinishLookLibraryWidget(container, props) {
   };
   container.__hmbFinishLookCleanup = cleanup;
   remount();
+  const ownerWindow=container.ownerDocument?.defaultView;
+  const NodeResizeObserver=ownerWindow?.ResizeObserver;
+  if(typeof NodeResizeObserver==="function"){
+    const node=hmbNodeRoot(container);
+    const fit=()=>{
+      resizeFrame=0;if(disposed || !node)return;
+      const nodeRect=node.getBoundingClientRect(),rect=container.getBoundingClientRect();
+      const scale=node.offsetHeight>0?nodeRect.height/node.offsetHeight:1;
+      const available=Math.max(120,Math.floor((nodeRect.bottom-rect.top)/Math.max(scale,0.01)-16));
+      const next=available+"px";
+      if(container.style.getPropertyValue("max-height")!==next)container.style.setProperty("max-height",next);
+    };
+    resizeObserver=new NodeResizeObserver(()=>{if(!resizeFrame)resizeFrame=ownerWindow.requestAnimationFrame(fit);});
+    resizeObserver.observe(container);if(node)resizeObserver.observe(node);
+  }
   return {
     cleanup: container.__hmbFinishLookCleanupProxy,
     update(nextProps) { container.__hmbFinishLookApplyProps?.(nextProps || {}); },

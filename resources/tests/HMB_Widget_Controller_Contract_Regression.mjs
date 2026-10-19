@@ -153,7 +153,7 @@ assert.match(promptSource, /class="title-mark" aria-hidden="true">PL<\/span>/, "
 assert.match(
   promptSource,
   /imageSources: 514,[\s\S]*?const HMB_START_LAYOUT_CHROME_HEIGHT = 129;[\s\S]*?const HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT = 0;[\s\S]*?HMB_START_LAYOUT_CHROME_HEIGHT \+[\s\S]*?HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT;/,
-  "Prompt must preserve the established 1193px startup size while reserving the current header and Shot selector chrome.",
+  "Prompt must retain editor group heights and resize minimums within the approved 1350px startup size.",
 );
 assert.match(promptSource, /\.topbar\{height:58px;flex:0 0 58px;padding:8px 13px/);
 assert.match(promptSource, /\.title-mark\{flex:0 0 35px;width:35px;height:35px/);
@@ -837,7 +837,8 @@ assert.doesNotMatch(
 );
 assert.match(agentSource, /<b>HMBAgentLibrary<\/b>/, "Agent must use the HMBAgentLibrary title.");
 assert.doesNotMatch(agentSource, /DISPLAY → FINAL TEXT/, "Agent header must omit the retired subtitle.");
-assert.match(agentSource, /class="agent-shot-select nodrag"/, "Agent header must expose the shared Shot selector.");
+assert.match(agentSource, /class="hmb-agent-dashboard hmb-agent-shot-accordion nodrag"/,
+  "Agent Shot selection must use independent native accordion row widgets.");
 assert.match(
   agentSource,
   /const catalog = hmbAgentCatalog\(state\.shot_catalog\)/,
@@ -870,13 +871,13 @@ assert.match(
 );
 assert.match(
   agentSource,
-  /container\.classList\?\.remove\("nopan", "nowheel"\);\s*container\.classList\?\.add\("nodrag"\);/,
-  "Agent's persistent host must clear stale pan/wheel blockers while retaining node-drag protection.",
+  /for \(const name of \["nopan","nowheel"\]\) if \(container\.classList\?\.contains\(name\)\) container\.classList\.remove\(name\);\s*if \(!container\.classList\?\.contains\("nodrag"\)\) container\.classList\?\.add\("nodrag"\);/,
+  "Agent's persistent host must clear stale blockers without rewriting unchanged gesture classes.",
 );
 assert.match(
   agentSource,
-  /root\?\.classList\?\.remove\("nopan", "nowheel"\);\s*root\?\.classList\?\.add\("nodrag"\);/,
-  "Agent's rendered dashboard must also clear stale pan/wheel blockers.",
+  /for \(const name of \["nopan","nowheel"\]\) if \(root\?\.classList\?\.contains\(name\)\) root\.classList\.remove\(name\);\s*if \(root && !root\.classList\?\.contains\("nodrag"\)\) root\.classList\?\.add\("nodrag"\);/,
+  "Agent's rendered dashboard must also clear stale blockers without repeated class mutations.",
 );
 assert.match(
   agentSource,
@@ -888,7 +889,7 @@ assert.equal(
   1,
   "Agent updates must retain the existing static dashboard DOM.",
 );
-assert.match(agentSource, /hmbRefreshAgentDashboard\(container, props\)/, "Agent updates must refresh Shot color, selector, and gestures in place.");
+assert.match(agentSource, /hmbRefreshAgentDashboard\(container, props\)/, "Agent updates must refresh Shot color, status, and gestures in place.");
 assert.doesNotMatch(
   agentSource,
   /class="[^"]*\b(?:nopan|nowheel)\b[^"]*"/,
@@ -905,12 +906,21 @@ assert.doesNotMatch(
   /(?:^|[;{])\s*cursor\s*:|pointer-events\s*:/m,
   "Agent must inherit Griptape's native grab/grabbing cursor and pointer hit testing.",
 );
-assert.match(
-  agentSource,
-  /<select class="agent-shot-select nodrag"/i,
-  "Agent's only custom control must be the shared Shot selector.",
-);
-assert.doesNotMatch(agentSource, /<(?:button|input|textarea)\b/i);
+assert.doesNotMatch(agentSource, /<select\b[^>]*class="agent-shot-select\b/i,
+  "The singleton Agent must not render the retired header Shot selector.");
+assert.doesNotMatch(agentSource, /<button\b[^>]*class="agent-only-toggle\b/i,
+  "The singleton Agent must not render an independent Only mode control.");
+assert.match(agentSource, /data-agent-shot="\$\{hmbAgentEscape\(state\.shot\.shot_uuid \|\| ""\)\}" aria-expanded="false"/,
+  "Each native row must expose its exact Shot identity and accordion state.");
+assert.match(agentSource, /rawValue\?\.schema === "hmb-agent-shot-row"\) return hmbAgentShotRowWidget\(container, props\)/,
+  "Native row props must dispatch to the independent retained row controller.");
+assert.doesNotMatch(agentSource, /<(?:input|textarea)\b/i,
+  "Agent model, prompt, tools and result fields must remain the native editor.");
+const agentCustomButtons = [...agentSource.matchAll(/<button\b[^>]*class="([^"]+)"/g)]
+  .map((match) => match[1].split(/\s+/)[0]);
+assert.deepEqual([...new Set(agentCustomButtons)].sort(),
+  ["agent-shot-run", "agent-shot-tab"],
+  "Custom Agent buttons are limited to per-Shot selection and execution.");
 
 for (const [name, source] of [
   ["PromptLibrary", promptSource],
@@ -1759,8 +1769,15 @@ assert.match(
 );
 assert.match(videoSource, /scheduleNativeNodeResizeRepair\(true\)/);
 assert.doesNotMatch(videoSource, /initialFitTimers|\[80,\s*250,\s*750\]/);
-assert.match(agentSource, /compactAgentWidgetHost\(container\)/);
-assert.match(agentSource, /setProperty\("height",\s*"64px",\s*"important"\)/);
+assert.match(agentSource, /compactAgentWidgetHost\(container, state\)/);
+assert.match(agentSource, /const values = \{height:`\$\{height\}px`[\s\S]*?if \(container\.style\.getPropertyValue\?\.\(name\) !== value\) container\.style\.setProperty\(name,value,"important"\)/,
+  "Agent header geometry must skip redundant host style writes on unchanged props.");
+assert.equal(agentModule.hmbAgentWidgetHeight({ shot_manager: false }), 64,
+  "The native Agent title header stays compact for saved state.");
+assert.equal(agentModule.hmbAgentWidgetHeight({ shot_manager: true, shot_catalog: { shots: [{}, {}, {}, {}, {}] } }), 64,
+  "Shot rows have separate SDK widget hosts and must not inflate the title header.");
+assert.match(agentSource, /\["height","42px"\],\["min-height","42px"\],\["max-height","42px"\],\["flex","0 0 42px"\]/,
+  "Each independent accordion row must reserve its real 42px height.");
 
 assert.doesNotMatch(videoSource, /data-resize-panel|panel-resize-handle/);
 assert.match(videoSource, /right_section_heights:\s*heights/);

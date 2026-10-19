@@ -15,7 +15,7 @@ import threading
 import time
 from copy import deepcopy
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest import mock
 
 
@@ -261,6 +261,12 @@ sync_node = SimpleNamespace(
     get_parameter_value=lambda name: sync_values.get(name),
     _set_shot_value=sync_setter,
     publish_update_to_parameter=sync_publisher,
+)
+# This publication-only fixture has no output artifact or local preview. Bind
+# the real display helper so the production sync path retains its full seam.
+sync_node._local_original_generation_preview = lambda: {}
+sync_node._generation_preview_for_widget = MethodType(
+    target.HMBSeedanceGeneration._generation_preview_for_widget, sync_node
 )
 target.HMBSeedanceGeneration._sync_seedance_shot_widget(
     sync_node,

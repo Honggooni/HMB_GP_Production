@@ -63,6 +63,7 @@ class FinalParityTests(unittest.TestCase):
         values = base.params(t.DRAFT_ACTION_FINAL)
         values.update(resolution='1080p', output_format='mov')
         node = base.Node(values)
+        node._store_draft_source(values['_hmb_draft_source'])
         node._prepare_video_references_for_run = mock.Mock(side_effect=AssertionError('media upload'))
         node._resolve_exact_shot_generation_inputs = mock.Mock(side_effect=AssertionError('new inputs'))
         with mock.patch.object(t, '_resolve_mp4_decode_verifier', return_value=SimpleNamespace(executable='fixture', backend='test')):
@@ -76,6 +77,7 @@ class FinalParityTests(unittest.TestCase):
         values = base.params(t.DRAFT_ACTION_FINAL)
         values.update(resolution='1080p', output_format='mov')
         node = base.Node(values)
+        node._store_draft_source(values['_hmb_draft_source'])
         profile = node.bridge.capability_response['models'][t.SEEDANCE_2_5_MODEL_ID]
         profile['output_formats'] = ['mp4']
         profile['draft_output_formats'] = ['mp4']

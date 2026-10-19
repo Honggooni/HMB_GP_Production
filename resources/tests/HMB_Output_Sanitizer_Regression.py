@@ -62,7 +62,14 @@ class Agent:
     def get_parameter_value(self, name):
         return self.parameters[name].default_value
 
-    def set_parameter_value(self, name, value):
+    def set_parameter_value(
+        self, name, value, *, initial_setup=False, emit_change=True,
+        skip_before_value_set=False,
+    ):
+        # Match the current BaseNode public setter, including HMB's intentional
+        # emit_change=False publication for the shared hidden Prompt input.
+        assert isinstance(initial_setup, bool) and isinstance(emit_change, bool)
+        assert isinstance(skip_before_value_set, bool)
         if name in self.parameters:
             self.parameters[name].default_value = value
         self.parameter_output_values[name] = value

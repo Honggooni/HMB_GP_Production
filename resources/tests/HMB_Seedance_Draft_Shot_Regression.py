@@ -293,6 +293,9 @@ class DraftShotTests(unittest.TestCase):
         node.parameter_values[t.DRAFT_SOURCE_PARAMETER] = deepcopy(base.SOURCE)
         node.parameter_values[t.BROKER_SERVER_URL_PARAMETER] = 'https://synthetic-broker.invalid'
         self.assertEqual(node._validated_draft_final_source(), base.SOURCE)
+        # Deserialized legacy identity is retained, but availability now waits
+        # for an advisory GET against that original authenticated Broker.
+        asyncio.run(node._query_draft_final_server_state(node._draft_source_record()))
         self.assertTrue(node._draft_ui_state()['final_available'])
 
     def test_seedance20_cannot_expose_or_submit_draft(self):

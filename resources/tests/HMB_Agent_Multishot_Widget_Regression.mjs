@@ -1,0 +1,72 @@
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {createRequire} from "node:module";
+import {fileURLToPath} from "node:url";
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),"../..");
+const source=fs.readFileSync(path.join(root,"widgets/HMBAgentLibraryWidget.js"),"utf8");
+const require=createRequire(import.meta.url);let playwright;
+try{playwright=require("playwright");}catch{playwright=require(path.join(os.homedir(),".cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright"));}
+const out=path.join(root,"reports/prompt-agent-shot-manager-20261015");fs.mkdirSync(out,{recursive:true});
+const browser=await playwright.chromium.launch({headless:true,executablePath:process.env.HMB_WIDGET_TEST_BROWSER||"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"});
+const receipt={schema:"hmb-agent-multishot-widget-regression",source_sha256:crypto.createHash("sha256").update(source).digest("hex"),external_requests:0,paid_calls:0,graph_calls:0,cases:[]};
+try{
+ const page=await browser.newPage({viewport:{width:780,height:700}});const errors=[];
+ page.on("pageerror",e=>errors.push(e.message));await page.route("**/*",route=>{receipt.external_requests++;return route.abort();});
+ await page.setContent('<!doctype html><meta charset="utf-8"><style>body{background:#080c14;margin:20px;color:white;font-family:system-ui}.mount{width:720px;margin:6px 0}#native{padding:14px 16px;background:#202020;border:1px solid #444;border-radius:6px;font-size:12px;color:#bbb}#native div{padding:8px;background:#303030;margin:4px 0}</style><section id="sdk"><div id="header" class="mount"></div><div id="row1" class="mount"></div><div id="row2" class="mount"></div><div id="row3" class="mount"></div><div id="row4" class="mount"></div><div id="row5" class="mount"></div><div id="native" class="mount">SDK native body position fixture<div>provider / prompt model</div><div>prompt / additional_context</div><div>TOOLS · BEHAVIORS · output_schema</div><div>FINAL TEXT · GENERATOR</div></div></section>');
+ await page.evaluate(async code=>{
+  window.widget=await import(`data:text/javascript;base64,${btoa(unescape(encodeURIComponent(code)))}`);
+  const catalog={schema:"hmb-shot-routing-catalog",version:1,publisher_instance_uuid:"publisher",channel_uuid:"channel",generation:1,metadata_sha256:"a".repeat(64),shots:[1,2,3,4,5].map(n=>({shot_uuid:`shot-${n}`,number:n,name:`draft_test_${String.fromCharCode(64+n)}`,revision:0}))};
+  window.selected=1;window.expanded=true;window.statuses={};window.acks={};window.calls=[];
+  window.makeState=()=>({schema:"hmb-agent-ui",schema_version:2,shot_manager:true,shot_editor_expanded:expanded,shot_catalog:catalog,shot:{channel_uuid:"channel",...catalog.shots[selected-1]},shot_states:statuses});
+  window.rowState=n=>({schema:"hmb-agent-shot-row",version:1,shot:{channel_uuid:"channel",...catalog.shots[n-1]},selected:n===selected,expanded:n===selected&&expanded,status:statuses[`shot-${n}`]||"",request_id:acks[n]||""});
+  window.header=document.querySelector("#header");window.body=document.querySelector("#native");window.rows=[1,2,3,4,5].map(n=>document.querySelector(`#row${n}`));
+  window.headerHandle=widget.default(header,{value:makeState(),onChange:value=>calls.push(value)});
+  window.onRow=value=>{calls.push(structuredClone(value));const n=value.shot.number;if(value.action.kind==="select"){expanded=selected===n?!expanded:true;selected=n;}acks[n]=value.action.request_id;sync();};
+  window.handles=rows.map((row,i)=>widget.default(row,{value:rowState(i+1),onChange:onRow}));
+  window.sync=()=>{headerHandle.update({value:makeState(),onChange:value=>calls.push(value)});handles.forEach((handle,i)=>handle.update({value:rowState(i+1),onChange:onRow}));body.hidden=!expanded;rows[selected-1].after(body);};
+  sync();window.originalHeader=header.querySelector(".hmb-agent-dashboard");window.originalRows=rows.map(row=>row.querySelector(".agent-shot-row"));
+ },source);
+ assert.equal(await page.locator('.agent-only-toggle').count(),0);assert.equal(await page.locator('.agent-shot-select').count(),0);
+ assert.equal(await page.locator('#header .agent-shot-row').count(),0);assert.equal(await page.locator('.agent-shot-row').count(),5);
+ assert.equal(await page.evaluate(()=>widget.hmbAgentWidgetHeight(widget.hmbAgentState({value:makeState()}))),64);
+ receipt.cases.push("one compact header and five separate SDK row widgets; no independent/Only controls");
+ await page.locator('#row4 [data-agent-shot="shot-4"]').click();await page.waitForFunction(()=>selected===4 && !rows[3].querySelector('.agent-shot-tab').disabled);
+ assert.equal(await page.locator('#row4 [data-agent-shot]').getAttribute('aria-expanded'),'true');
+ assert.equal(await page.evaluate(()=>body.previousElementSibling.id),'row4');
+ assert.equal(await page.evaluate(()=>calls.at(-1).action.kind),'select');
+ assert.match(await page.evaluate(()=>calls.at(-1).action.request_id),/^[0-9a-f]{32}$/);
+ receipt.cases.push("canonical renamed Shot selection opens its row and preserves native body position contract");
+ await page.locator('#row4 [data-agent-shot]').click();await page.waitForFunction(()=>selected===4 && !expanded && !rows[3].querySelector('.agent-shot-tab').disabled);assert.equal(await page.locator('#row4 [data-agent-shot]').getAttribute('aria-expanded'),'false');
+ assert.equal(await page.locator('#native').isVisible(),false);
+ await page.locator('#row2 [data-agent-shot]').click();await page.waitForFunction(()=>selected===2 && expanded && !rows[1].querySelector('.agent-shot-tab').disabled);assert.equal(await page.locator('#row2 [data-agent-shot]').getAttribute('aria-expanded'),'true');
+ assert.equal(await page.locator('#native').isVisible(),true);
+ receipt.cases.push("same row collapses and a different row expands without rebuilding the native editor fixture");
+ const palette=await page.evaluate(()=>Object.values(widget.HMB_JEWEL_NIGHT_SHOT_PALETTE));
+ assert.deepEqual(palette,['#F472B6','#3B82F6','#10B981','#8B5CF6','#EAB308']);
+ const displayed=await page.evaluate(()=>rows.map(row=>getComputedStyle(row.querySelector('.agent-shot-row')).getPropertyValue('--hmb-shot-accent').trim()));
+ assert.deepEqual(displayed,palette);receipt.cases.push("all five production palette values preserved exactly");
+ await page.locator('#row2 .agent-shot-run').click();await page.waitForFunction(()=>calls.at(-1)?.action?.kind==='run_selected' && !rows[1].querySelector('.agent-shot-run').disabled);
+ assert.equal(await page.evaluate(()=>calls.at(-1).action.kind),'run_selected');assert.equal(await page.evaluate(()=>calls.at(-1).shot.shot_uuid),'shot-2');
+ await page.evaluate(()=>{statuses['shot-2']='running';sync();});await page.locator('#row2 .agent-shot-run').click();await page.waitForFunction(()=>calls.at(-1)?.action?.kind==='cancel_selected' && !rows[1].querySelector('.agent-shot-run').disabled);
+ assert.equal(await page.evaluate(()=>calls.at(-1).action.kind),'cancel_selected');
+ receipt.cases.push("one explicit Play command and running Cancel remain scoped to the requested Shot");
+ const unchanged=await page.evaluate(async()=>{
+  statuses={};sync();await Promise.resolve();window.mutations=[];const observer=new MutationObserver(records=>mutations.push(...records));observer.observe(document.querySelector('#sdk'),{subtree:true,attributes:true,childList:true,characterData:true});const callCount=calls.length;
+  for(let n=0;n<300;n++){headerHandle.update({value:structuredClone(makeState()),onChange:value=>calls.push(value)});handles.forEach((handle,i)=>handle.update({value:structuredClone(rowState(i+1)),onChange:onRow}));}
+  await Promise.resolve();observer.disconnect();return {mutations:mutations.length,calls:calls.length-callCount,header:header.querySelector('.hmb-agent-dashboard')===originalHeader,rows:rows.every((row,i)=>row.querySelector('.agent-shot-row')===originalRows[i])};
+ });
+ assert.deepEqual(unchanged,{mutations:0,calls:0,header:true,rows:true});
+ receipt.cases.push("300 identical state refreshes cause zero DOM mutations, zero commands and no field remount");
+ await page.evaluate(()=>{window.gestureEvents=[];document.querySelector('#sdk').addEventListener('pointerdown',event=>gestureEvents.push(event.button));rows[0].dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0}));rows[0].dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:1}));});
+ assert.deepEqual(await page.evaluate(()=>gestureEvents),[1]);
+ receipt.cases.push("interior primary selection remains isolated while native middle-button canvas pan propagates");
+ await page.locator('#sdk').screenshot({path:path.join(out,'agent-accordion.png')});
+ await page.locator('#row2 [data-agent-shot]').click();await page.locator('#sdk').screenshot({path:path.join(out,'agent-accordion-collapsed.png')});
+ const cleaned=await page.evaluate(()=>{const before=calls.length;headerHandle.cleanup();handles.forEach(handle=>handle.cleanup());rows[1].dispatchEvent(new MouseEvent('click',{bubbles:true}));return {calls:calls.length-before,rows:document.querySelectorAll('.agent-shot-row').length};});
+ assert.deepEqual(cleaned,{calls:0,rows:0});assert.deepEqual(errors,[]);assert.equal(receipt.external_requests,0);
+ receipt.cases.push("cleanup detaches row callbacks and leaves no retired event owner");
+ receipt.passed=true;console.log(`HMB Agent multishot widget regression: PASS (${receipt.cases.length} cases; actual Chromium; SDK sibling fixture)`);
+}finally{await browser.close();fs.writeFileSync(path.join(out,'agent-widget-regression.json'),JSON.stringify(receipt,null,2)+'\n');}

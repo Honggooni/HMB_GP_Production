@@ -124,12 +124,15 @@ export function hmbAgentState(props) {
     schema: "hmb-agent-ui", schema_version: 2, native_agent: true,
     policy_vault: "sealed", policy_injection: "runtime_only", output_sanitizer: true,
     execution_phase: executionPhase,
+    shot_manager: true,
+    shot_editor_expanded: state.shot_editor_expanded !== false,
+    shot_states: Object.fromEntries(Object.entries(state.shot_states || {}).filter(([, value]) => ["running", "succeeded", "failed", "cancelled"].includes(value))),
     shot_catalog: catalogMatchesChannel ? catalog : {},
     shot: {
       channel_uuid: selected ? channelUuid : "",
       shot_uuid: selected ? selected.shot_uuid : "",
       number: selected ? selected.number : 1,
-      name: selected ? selected.name : "Only",
+      name: selected ? selected.name : "샷 선택",
     },
   };
 }
@@ -137,10 +140,7 @@ export function hmbAgentState(props) {
 export function hmbAgentShotOptions(state) {
   const catalog = state?.shot_catalog && typeof state.shot_catalog === "object"
     ? state.shot_catalog : {};
-  const options = [{
-    key: "__hmb_only__", channel_uuid: "", shot_uuid: "", number: 0,
-    name: "Only", revision: 0, only: true,
-  }];
+  const options = [];
   // This bounded catalog arrived in widget props only after Python reconciled
   // the exact same-flow publisher. Process-global browser events are never an
   // option source and can therefore not cross-adopt a cloned Flow.
@@ -216,11 +216,16 @@ export function hmbSyncAgentShotSelect(select, state) {
   return changed;
 }
 
+function hmbAgentSetAttribute(element, name, value) {
+  if (element?.getAttribute?.(name) !== String(value)) element?.setAttribute?.(name, String(value));
+}
+
 function hmbSetAgentStatus(container, message = "", detail = "") {
   const status = container?.querySelector?.(".agent-publication-status");
   if (!status) return false;
-  status.textContent = String(message || "");
-  status.setAttribute?.("title", message ? String(detail?.message || detail || message) : "");
+  const nextText = String(message || "");
+  if (status.textContent !== nextText) status.textContent = nextText;
+  hmbAgentSetAttribute(status, "title", message ? String(detail?.message || detail || message) : "");
   return true;
 }
 
@@ -232,9 +237,27 @@ function hmbAgentExecutionStatus(phase) {
   })[String(phase || "")] || "";
 }
 
+export function hmbAgentWidgetHeight(state) { return 64; }
+
+function hmbAgentRows(state) {
+  if (!state.shot_manager) return "";
+  const shots = state.shot_catalog.shots || [];
+  if (!shots.length) return '<div class="agent-shot-empty">ImageAsset에서 샷을 추가하세요.</div>';
+  return shots.map((shot) => {
+    const selected = shot.shot_uuid === state.shot.shot_uuid;
+    const status = state.shot_states[shot.shot_uuid] || "";
+    const running = status === "running";
+    return `<div class="agent-shot-row" data-shot-number="${shot.number}" data-active="${selected}" data-agent-row="${hmbAgentEscape(shot.shot_uuid)}">
+      <button type="button" class="agent-shot-tab nodrag" data-agent-select="${hmbAgentEscape(shot.shot_uuid)}" aria-pressed="${selected}"><span class="agent-row-number">${String(shot.number).padStart(2, "0")}</span><b>${hmbAgentEscape(shot.name)}</b><span class="agent-row-status">${({running:"Agent 실행 중…",succeeded:"완료",failed:"실패",cancelled:"취소"})[status] || ""}</span></button>
+      <button type="button" class="agent-shot-run nodrag" data-agent-run="${hmbAgentEscape(shot.shot_uuid)}" title="${running ? "이 샷 Agent만 취소" : "이 샷 Agent만 실행"}" aria-label="${running ? "Cancel Shot Agent" : "Run Shot Agent"}">${running ? "■" : "▷"}</button>
+    </div>`;
+  }).join("");
+}
+
 function renderAgentDashboard(state, container) {
   const paletteShotNumber = hmbAgentPaletteShotNumber(state);
   const executionStatus = hmbAgentExecutionStatus(state.execution_phase);
+  const height = hmbAgentWidgetHeight(state);
   return `
     <style>
       .hmb-agent-dashboard :is(button,input,select,textarea){font-family:inherit}
@@ -248,40 +271,57 @@ function renderAgentDashboard(state, container) {
       /* Match the Prompt header while preserving the existing selector position and responsive width. */
       .hmb-agent-dashboard .agent-heading b{font-size:15px;font-weight:800;letter-spacing:.01em;line-height:normal}
       .hmb-agent-dashboard .agent-shot-select{height:44px;font-size:13px;font-weight:800;line-height:normal}
+      .hmb-agent-dashboard .agent-topbar{height:64px}
+      .hmb-agent-dashboard .agent-only-toggle{flex:0 0 auto;height:29px;padding:0 10px;border:1px solid var(--hmb-chip-line);border-radius:7px;background:var(--hmb-chip-bg);color:var(--hmb-chip-text);font:inherit;font-size:10px;font-weight:850}
+      .hmb-agent-dashboard .agent-only-toggle[aria-pressed="true"]{box-shadow:0 0 10px var(--hmb-chip-glow);border-color:var(--hmb-shot-accent)}
+      .hmb-agent-dashboard .agent-shot-list{padding:0 8px 8px;display:flex;flex-direction:column;gap:0}
+      .hmb-agent-dashboard .agent-shot-row{--hmb-shot-accent:#F472B6;--row-rgb:244,114,182;display:flex;align-items:center;gap:6px;height:42px;border-top:1px solid rgba(var(--row-rgb),.35);background:linear-gradient(90deg,rgba(var(--row-rgb),.12),transparent);border-radius:5px}
+      .hmb-agent-dashboard .agent-shot-row[data-shot-number="2"]{--hmb-shot-accent:#3B82F6;--row-rgb:59,130,246}.hmb-agent-dashboard .agent-shot-row[data-shot-number="3"]{--hmb-shot-accent:#10B981;--row-rgb:16,185,129}.hmb-agent-dashboard .agent-shot-row[data-shot-number="4"]{--hmb-shot-accent:#8B5CF6;--row-rgb:139,92,246}.hmb-agent-dashboard .agent-shot-row[data-shot-number="5"]{--hmb-shot-accent:#EAB308;--row-rgb:234,179,8}
+      .hmb-agent-dashboard .agent-shot-row[data-active="true"]{box-shadow:inset 3px 0 var(--hmb-shot-accent);background:linear-gradient(90deg,rgba(var(--row-rgb),.23),rgba(var(--row-rgb),.04))}
+      .hmb-agent-dashboard .agent-shot-tab{flex:1;display:flex;align-items:center;gap:10px;height:100%;padding:4px 8px;border:0;background:transparent;color:var(--hmb-text);text-align:left;font:inherit;font-size:11px}
+      .hmb-agent-dashboard .agent-row-number{width:29px;height:29px;display:grid;place-items:center;border:1px solid var(--hmb-shot-accent);border-radius:7px;color:var(--hmb-shot-accent);font-weight:850}
+      .hmb-agent-dashboard .agent-shot-tab b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hmb-agent-dashboard .agent-row-status{margin-left:auto;color:var(--hmb-muted);font-size:9px}
+      .hmb-agent-dashboard .agent-shot-run{flex:0 0 29px;height:29px;margin-right:6px;border:1px solid rgba(var(--row-rgb),.5);border-radius:7px;background:rgba(var(--row-rgb),.12);color:var(--hmb-shot-accent);font-size:16px}
+      .hmb-agent-dashboard .agent-shot-empty{height:42px;display:flex;align-items:center;justify-content:center;color:var(--hmb-muted);font-size:10px}
     </style>
-    <div class="hmb-agent-dashboard nodrag" data-shot-number="${paletteShotNumber}" data-execution-phase="${hmbAgentEscape(state.execution_phase)}" tabindex="0">
+    <div class="hmb-agent-dashboard nodrag" data-shot-number="${paletteShotNumber}" data-execution-phase="${hmbAgentEscape(state.execution_phase)}" style="height:${height}px" tabindex="0">
       <header class="agent-topbar">
         <div class="agent-mark" aria-hidden="true"><span>AG</span></div>
         <div class="agent-heading"><b>HMBAgentLibrary</b></div>
         <span class="agent-publication-status" role="status" aria-live="polite" aria-atomic="true">${hmbAgentEscape(executionStatus)}</span>
-        <select class="agent-shot-select nodrag" aria-label="Shot"${state.execution_phase ? " disabled" : ""}>${hmbAgentShotOptionsMarkup(state)}</select>
       </header>
     </div>`;
 }
 
-function compactAgentWidgetHost(container) {
+function compactAgentWidgetHost(container, state = null) {
   if (!container?.style) return;
-  try {
-    container.style.setProperty("height", "64px", "important");
-    container.style.setProperty("min-height", "64px", "important");
-    container.style.setProperty("max-height", "64px", "important");
-    container.style.setProperty("flex", "0 0 64px", "important");
-    container.style.setProperty("flex-basis", "64px", "important");
-    container.style.setProperty("overflow", "hidden", "important");
-    container.style.setProperty("box-sizing", "border-box", "important");
-  } catch (_error) {}
+  const height = hmbAgentWidgetHeight(state);
+  const values = {height:`${height}px`,"min-height":`${height}px`,"max-height":`${height}px`,flex:`0 0 ${height}px`,"flex-basis":`${height}px`,overflow:"hidden","box-sizing":"border-box"};
+  for (const [name,value] of Object.entries(values)) {
+    if (container.style.getPropertyValue?.(name) !== value) container.style.setProperty(name,value,"important");
+  }
 }
 
 function hmbRefreshAgentDashboard(container, props) {
   const root = container?.querySelector?.(".hmb-agent-dashboard");
   if (!root) return false;
-  compactAgentWidgetHost(container);
   const state = hmbAgentState(props);
-  root.setAttribute("data-shot-number", String(hmbAgentPaletteShotNumber(state)));
-  root.setAttribute("data-execution-phase", state.execution_phase || "");
+  compactAgentWidgetHost(container, state);
+  if (root.style.height !== `${hmbAgentWidgetHeight(state)}px`) root.style.height = `${hmbAgentWidgetHeight(state)}px`;
+  const toggle = root.querySelector?.(".agent-only-toggle");
+  if (toggle) { toggle.setAttribute("aria-pressed", String(state.only_mode)); toggle.disabled = Boolean(state.execution_phase); }
+  const rows = root.querySelector?.(".agent-shot-list");
+  if (rows) {
+    rows.style.display = state.shot_manager ? "flex" : "none";
+    const html = hmbAgentRows(state);
+    if (rows.__hmbRowsMarkup !== html) { rows.innerHTML = html; rows.__hmbRowsMarkup = html; }
+  }
+  hmbAgentSetAttribute(root,"data-shot-number",String(hmbAgentPaletteShotNumber(state)));
+  hmbAgentSetAttribute(root,"data-execution-phase",state.execution_phase || "");
   const select = root.querySelector?.(".agent-shot-select");
   if (select) {
     hmbSyncAgentShotSelect(select, state);
+    select.style.display = state.shot_manager || state.only_mode ? "none" : "";
   }
   const error = container.__hmbAgentShotChangeError || "";
   const executionStatus = hmbAgentExecutionStatus(state.execution_phase);
@@ -309,18 +349,19 @@ function hmbAgentResolveShotEcho(container, incomingProps) {
     && Number(incoming.shot_catalog.generation || 0) < Number(selected.shot_catalog.generation || 0);
   const catalog = catalogOlder ? selected.shot_catalog : incoming.shot_catalog;
   const incomingKey = hmbAgentShotKey(incoming);
-  if (incomingKey === pending.targetKey) {
+  if (incomingKey === pending.targetKey && incoming.shot_manager === pending.targetMode) {
     delete container.__hmbAgentPendingShot;
     return { props: incomingProps, stale: false };
   }
   const targetAvailable = pending.targetKey === "__hmb_only__" || (catalog.shots || []).some(
     (shot) => `${catalog.channel_uuid}\u001f${shot.shot_uuid}` === pending.targetKey,
   );
-  if (!targetAvailable || !pending.blockedKeys.has(incomingKey)) {
+  const previousModeEcho = incomingKey === pending.targetKey && incoming.shot_manager !== pending.targetMode;
+  if (!targetAvailable || (!pending.blockedKeys.has(incomingKey) && !previousModeEcho)) {
     delete container.__hmbAgentPendingShot;
     return { props: incomingProps, stale: false };
   }
-  const retained = { ...incoming, shot_catalog: catalog, shot: selected.shot };
+  const retained = { ...incoming, shot_catalog: catalog, shot: selected.shot, shot_manager:selected.shot_manager, only_mode:selected.only_mode };
   return {
     props: { ...incomingProps, value: retained, parameterValue: retained, defaultValue: retained },
     stale: true,
@@ -333,11 +374,11 @@ export function hmbPrepareAgentCanvasGestures(container) {
   // broad pan/zoom guards from an older mount. With no local pointer or wheel
   // handlers, Griptape owns left/middle-button pan, wheel zoom, and its native
   // grab -> grabbing cursor transition.
-  container.classList?.remove("nopan", "nowheel");
-  container.classList?.add("nodrag");
+  for (const name of ["nopan","nowheel"]) if (container.classList?.contains(name)) container.classList.remove(name);
+  if (!container.classList?.contains("nodrag")) container.classList?.add("nodrag");
   const root = container.querySelector?.(".hmb-agent-dashboard");
-  root?.classList?.remove("nopan", "nowheel");
-  root?.classList?.add("nodrag");
+  for (const name of ["nopan","nowheel"]) if (root?.classList?.contains(name)) root.classList.remove(name);
+  if (root && !root.classList?.contains("nodrag")) root.classList?.add("nodrag");
 }
 
 function hmbAgentNodeRoot(container) {
@@ -379,6 +420,8 @@ export function hmbGuardSelectedNodeKeyboardDelete(container, event) {
 }
 
 export default function HMBAgentLibraryWidget(container, props) {
+  const rawValue = props?.value ?? props?.parameterValue ?? props?.defaultValue;
+  if (rawValue?.schema === "hmb-agent-shot-row") return hmbAgentShotRowWidget(container, props);
   if (!container) return { cleanup() {}, update() {} };
   // The host can call the factory again without replacing the mounted DOM.
   // Keep callbacks/state pointed at the newest props instead of the first
@@ -434,7 +477,7 @@ export default function HMBAgentLibraryWidget(container, props) {
     !disposed && container.__hmbAgentLifecycleEpoch === lifecycleEpoch
   );
 
-  compactAgentWidgetHost(container);
+  compactAgentWidgetHost(container, hmbAgentState(props));
   container.setAttribute?.("data-hmb-node-delete-protected", "true");
   container.innerHTML = hmbScopeWidgetStyleMarkup(
     renderAgentDashboard(hmbAgentState(props), container),
@@ -447,16 +490,16 @@ export default function HMBAgentLibraryWidget(container, props) {
     try { window.dispatchEvent(new CustomEvent("hmb-shot-routing-discover-v1")); } catch (_error) {}
   }
   const shotSelect = container.querySelector?.(".agent-shot-select");
-  const shotChangeHandler = () => {
+  const shotChangeHandler = (requestedState = null) => {
     const liveProps = container.__hmbAgentLatestProps || props || {};
     const option = hmbAgentShotOptions(hmbAgentState(liveProps)).find((item) => item.key === shotSelect?.value);
-    if (!option || typeof liveProps?.onChange !== "function") {
+    if ((!requestedState && !option) || typeof liveProps?.onChange !== "function") {
       hmbRefreshAgentDashboard(container, liveProps);
       return;
     }
     const previousProps = liveProps;
-    const next = hmbAgentState(liveProps);
-    next.shot = option.only ? {
+    const next = requestedState || hmbAgentState(liveProps);
+    if (!requestedState) next.shot = option.only ? {
       channel_uuid: "", shot_uuid: "", number: 1, name: "Only",
     } : {
       channel_uuid: option.channel_uuid,
@@ -469,8 +512,9 @@ export default function HMBAgentLibraryWidget(container, props) {
     const previousKey = hmbAgentShotKey(hmbAgentState(liveProps));
     const blockedKeys = new Set(container.__hmbAgentPendingShot?.blockedKeys || []);
     blockedKeys.add(previousKey);
-    container.__hmbAgentPendingShot = { targetKey: hmbAgentShotKey(next), blockedKeys };
-    const optimisticProps = { ...liveProps, value: next, parameterValue: next, defaultValue: next };
+    container.__hmbAgentPendingShot = { targetKey: hmbAgentShotKey(next), targetMode:next.shot_manager, blockedKeys };
+    const optimisticState = hmbAgentState({ value: next });
+    const optimisticProps = { ...liveProps, value: optimisticState, parameterValue: optimisticState, defaultValue: optimisticState };
     const accept = () => {
       if (!ownsLifecycle() || container.__hmbAgentShotChangeOwner !== owner) return false;
       props = optimisticProps;
@@ -500,7 +544,8 @@ export default function HMBAgentLibraryWidget(container, props) {
       Promise.resolve(result).catch(rollback);
     }
   };
-  shotSelect?.addEventListener?.("change", shotChangeHandler);
+  const legacyShotChangeHandler = () => shotChangeHandler();
+  shotSelect?.addEventListener?.("change", legacyShotChangeHandler);
   const stopSelectedNodeDeleteShortcut = (event) => hmbGuardSelectedNodeKeyboardDelete(container, event);
   if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
     window.addEventListener("keydown", stopSelectedNodeDeleteShortcut, true);
@@ -524,7 +569,7 @@ export default function HMBAgentLibraryWidget(container, props) {
     }
     container.removeEventListener?.("keydown", stopNodeDeleteShortcut);
     container.removeEventListener?.("pointerdown", stopInteriorNodeSelection);
-    shotSelect?.removeEventListener?.("change", shotChangeHandler);
+    shotSelect?.removeEventListener?.("change", legacyShotChangeHandler);
     container.removeAttribute?.("data-hmb-node-delete-protected");
     try {
       container.style.removeProperty("height");
@@ -564,4 +609,142 @@ export default function HMBAgentLibraryWidget(container, props) {
       }
     },
   };
+}
+
+
+export function hmbAgentShotRowState(props) {
+  const raw = props?.value ?? props?.parameterValue ?? props?.defaultValue;
+  const shot = raw?.shot && typeof raw.shot === "object" ? raw.shot : {};
+  const number = Number(shot.number);
+  const valid = raw?.schema === "hmb-agent-shot-row" && raw.version === 1
+    && typeof shot.channel_uuid === "string" && shot.channel_uuid.trim()
+    && typeof shot.shot_uuid === "string" && shot.shot_uuid.trim()
+    && Number.isInteger(number) && number >= 1 && number <= 5;
+  return {schema:"hmb-agent-shot-row",version:1,
+    shot:valid ? {channel_uuid:shot.channel_uuid,shot_uuid:shot.shot_uuid,number,name:String(shot.name || `Shot ${number}`).slice(0,128),revision:Number(shot.revision)||0} : {},
+    selected:valid && raw.selected === true,expanded:valid && raw.expanded === true,
+    request_id:/^[0-9a-f]{32}$/.test(String(raw?.request_id || "")) ? raw.request_id : "",
+    status:["running","succeeded","failed","cancelled"].includes(raw?.status) ? raw.status : ""};
+}
+
+// One Agent manager owns one channel. All five row widgets share this short
+// command lease, so a second Shot/Run cannot overtake a pending native switch.
+const hmbAgentRowChannels = new Map();
+
+function hmbGuardPendingAgentEditor(container,ticket) {
+  const host=hmbAgentNodeRoot(container);
+  if(!host?.addEventListener)return ()=>{};
+  // The SDK owns the native editor and its element IDs. Guard its events
+  // during the short switch lease instead of moving/disabling React's DOM.
+  const guard=event=>{
+    if(Number(event.button)===1 || event.target?.closest?.(".react-flow__resize-control,.react-flow__node-resizer,[class*='node-resizer']"))return;
+    if(ticket.recovering && event.target?.closest?.(".agent-shot-run")===container.querySelector?.(".agent-shot-run"))return;
+    event.preventDefault?.();event.stopImmediatePropagation?.();event.stopPropagation?.();
+  };
+  const events=["pointerdown","mousedown","click","dblclick","keydown","beforeinput","input","change","paste","drop"];
+  for(const name of events)host.addEventListener(name,guard,true);
+  return ()=>{for(const name of events)host.removeEventListener(name,guard,true);};
+}
+
+function hmbAgentShotRowWidget(container, initialProps) {
+  if (!container) return {cleanup(){},update(){}};
+  if (container.__hmbAgentRowHandle) {
+    container.__hmbAgentRowHandle.update(initialProps);
+    return container.__hmbAgentRowHandle;
+  }
+  let props=initialProps || {};let disposed=false;let channel="";let acceptedAck="";let lastError="";
+  const retiredAcks=new Set();
+  const channelEntry=()=>hmbAgentRowChannels.get(channel);
+  const refreshChannel=()=>{for(const owner of channelEntry()?.owners || [])owner.refresh();};
+  const unregister=()=>{const entry=channelEntry();if(!entry)return;if(entry.pending?.owner===container)finish(entry.pending);entry.owners.delete(owner);if(!entry.owners.size)hmbAgentRowChannels.delete(channel);};
+  const register=()=>{const next=hmbAgentShotRowState(props).shot.channel_uuid || "";if(next===channel)return;unregister();channel=next;acceptedAck="";retiredAcks.clear();if(channel){if(!hmbAgentRowChannels.has(channel))hmbAgentRowChannels.set(channel,{owners:new Set(),pending:null});channelEntry().owners.add(owner);}};
+  const finish=(ticket,error)=>{const entry=channelEntry();if(entry?.pending!==ticket)return;for(const id of ticket.frames)cancelAnimationFrame(id);clearTimeout(ticket.fallback);clearTimeout(ticket.expiry);ticket.guardCleanup?.();entry.pending=null;if(error && !disposed)lastError=String(error?.message||error);refreshChannel();};
+  const recover=(ticket,error)=>{if(disposed || channelEntry()?.pending!==ticket)return;ticket.recovering=true;lastError=String(error?.message||error);clearTimeout(ticket.expiry);refreshChannel();};
+  container.classList?.add("nodrag");container.classList?.remove("nopan","nowheel");
+  container.setAttribute?.("data-hmb-node-delete-protected","true");
+  const state=hmbAgentShotRowState(props);
+  const header=hmbScopeWidgetStyleMarkup(renderAgentDashboard(hmbAgentState({value:{}}),container),".hmb-agent-dashboard");
+  const style=header.match(/<style>[\s\S]*?<\/style>/)?.[0] || "";
+  container.innerHTML=style+`<div class="hmb-agent-dashboard hmb-agent-shot-accordion nodrag" style="height:42px;border-radius:7px;box-shadow:none" data-shot-number="${state.shot.number || 1}"><div class="agent-shot-row" style="height:40px" data-shot-number="${state.shot.number || 1}"><button type="button" class="agent-shot-tab nodrag" data-agent-shot="${hmbAgentEscape(state.shot.shot_uuid || "")}" aria-expanded="false"><span class="agent-row-number"></span><b></b><span class="agent-row-status"></span><span class="agent-row-chevron" aria-hidden="true"></span></button><button type="button" class="agent-shot-run nodrag" aria-label="Run Shot Agent"></button></div></div>`;
+  const root=container.querySelector(".hmb-agent-dashboard"),row=container.querySelector(".agent-shot-row"),select=container.querySelector(".agent-shot-tab"),run=container.querySelector(".agent-shot-run");
+  const refresh=()=>{
+    const canonical=hmbAgentShotRowState(props);const shot=canonical.shot;
+    const ticket=channelEntry()?.pending;const switching=ticket?.kind==="select" && !ticket.recovering;
+    const own=ticket?.owner===container;
+    const current=switching ? {...canonical,selected:own,expanded:own && ticket.expanded} : canonical;
+    hmbAgentSetAttribute(root,"data-shot-number",String(shot.number || 1));hmbAgentSetAttribute(row,"data-shot-number",String(shot.number || 1));
+    hmbAgentSetAttribute(row,"data-active",String(current.selected));hmbAgentSetAttribute(row,"data-shot-uuid",shot.shot_uuid || "");
+    hmbAgentSetAttribute(select,"data-agent-shot",shot.shot_uuid || "");hmbAgentSetAttribute(select,"aria-expanded",String(current.expanded));hmbAgentSetAttribute(select,"aria-pressed",String(current.selected));
+    const number=select.querySelector(".agent-row-number"),label=select.querySelector("b"),status=select.querySelector(".agent-row-status"),chevron=select.querySelector(".agent-row-chevron");
+    if(number.textContent!==String(shot.number||0).padStart(2,"0"))number.textContent=String(shot.number||0).padStart(2,"0");
+    if(label.textContent!==(shot.name||""))label.textContent=shot.name||"";
+    const recovering=own && ticket?.recovering;
+    const text=own ? (recovering ? "응답 확인 필요" : switching ? "전환 중…" : "전달 중…") : lastError ? "응답 확인 필요" : ({running:"Agent 실행 중…",succeeded:"완료",failed:"실패",cancelled:"취소"})[current.status] || "";
+    if(status.textContent!==text)status.textContent=text;
+    const arrow=current.expanded ? "▾" : "▸";if(chevron.textContent!==arrow)chevron.textContent=arrow;
+    const running=current.status==="running";const runText=recovering ? "↻" : running ? "■" : "▷";if(run.textContent!==runText)run.textContent=runText;
+    hmbAgentSetAttribute(run,"aria-label",recovering?"Refresh Agent Shot":running?"Cancel Shot Agent":"Run Shot Agent");hmbAgentSetAttribute(run,"title",recovering?"현재 상태만 확인합니다. Agent/Run은 다시 실행하지 않습니다.":lastError || (running?"이 샷 Agent만 취소":"이 샷 Agent만 실행"));
+    hmbAgentSetAttribute(row,"aria-busy",String(Boolean(ticket)));
+    const disabled=Boolean(ticket) || !shot.shot_uuid;if(select.disabled!==disabled)select.disabled=disabled;
+    const runDisabled=disabled && !recovering;if(run.disabled!==runDisabled)run.disabled=runDisabled;
+    for(const [key,value] of [["height","42px"],["min-height","42px"],["max-height","42px"],["flex","0 0 42px"],["overflow","hidden"]])if(container.style?.getPropertyValue?.(key)!==value)container.style?.setProperty?.(key,value,"important");
+  };
+  const send=(kind)=>{
+    const previous=channelEntry()?.pending;
+    if(disposed || (previous && !(kind==="refresh" && previous.recovering && previous.owner===container)) || typeof props.onChange!=="function")return;
+    const current=hmbAgentShotRowState(props);if(!current.shot.shot_uuid)return;
+    const bytes=new Uint8Array(16);crypto.getRandomValues(bytes);
+    const requestId=Array.from(bytes,byte=>byte.toString(16).padStart(2,"0")).join("");
+    const acceptedIds=new Set([...(previous?.acceptedIds || []),requestId]);
+    while(acceptedIds.size>256)acceptedIds.delete(acceptedIds.values().next().value);
+    const ticket={owner:container,kind,requestId,acceptedIds,expanded:current.selected ? !current.expanded : true,frames:[],dispatched:false};
+    const next={...current,action:{kind,request_id:requestId,...(kind==="select" ? {expanded:ticket.expanded} : {})}};
+    lastError="";
+    if(previous)finish(previous);
+    channelEntry().pending=ticket;ticket.guardCleanup=hmbGuardPendingAgentEditor(container,ticket);refreshChannel();
+    const dispatch=()=>{
+      if(disposed || channelEntry()?.pending!==ticket || ticket.dispatched)return;
+      ticket.dispatched=true;clearTimeout(ticket.fallback);
+      let result;try{result=props.onChange(next);}catch(error){recover(ticket,error);return;}
+      // Resolution alone only confirms delivery. Keep the row/Run lease until
+      // its canonical request ID acknowledges the actual native editor change.
+      Promise.resolve(result).catch(error=>recover(ticket,error));
+    };
+    ticket.frames.push(requestAnimationFrame(()=>{if(!disposed && channelEntry()?.pending===ticket)ticket.frames.push(requestAnimationFrame(dispatch));}));
+    // Background tabs can throttle rAF. This fallback still yields to painting;
+    // the guarded dispatcher makes rAF/timer/duplicates exactly one command.
+    ticket.fallback=setTimeout(dispatch,120);
+    ticket.expiry=setTimeout(()=>recover(ticket,new Error("Agent 응답을 확인하지 못했습니다. ↻로 현재 상태를 확인하세요. Agent/Run은 자동 재전송하지 않습니다.")),15000);
+  };
+  const selectClick=()=>send("select"),runClick=()=>send(channelEntry()?.pending?.recovering ? "refresh" : hmbAgentShotRowState(props).status==="running"?"cancel_selected":"run_selected");
+  const keydown=event=>{if(["Backspace","Delete"].includes(event.key))event.stopPropagation?.();};
+  const pointerdown=event=>{if(Number(event.button)!==1)event.stopPropagation?.();};
+  select.addEventListener("click",selectClick);run.addEventListener("click",runClick);container.addEventListener?.("keydown",keydown);container.addEventListener?.("pointerdown",pointerdown);
+  const owner={refresh};
+  const handle={update(next){
+    if(disposed)return;
+    const incoming=hmbAgentShotRowState(next || props),previous=hmbAgentShotRowState(props);
+    const same=incoming.shot.channel_uuid===previous.shot.channel_uuid && incoming.shot.shot_uuid===previous.shot.shot_uuid;
+    // A late unacknowledged echo must not move the editor highlight backwards.
+    if(same && acceptedAck && (!incoming.request_id || retiredAcks.has(incoming.request_id)))return;
+    // The SDK keeps five row parameter IDs while catalog numbering can move a
+    // different UUID into a row. An acknowledgement belongs to that UUID,
+    // never to the row's previous occupant or its replacement after deletion.
+    if(!same){acceptedAck="";retiredAcks.clear();lastError="";}
+    props=next || props;register();
+    const ticket=channelEntry()?.pending;
+    if(ticket?.owner===container && (!same || ticket.acceptedIds.has(incoming.request_id))){
+      if(ticket.acceptedIds.has(incoming.request_id)){
+        for(const id of ticket.acceptedIds)if(id!==incoming.request_id)retiredAcks.add(id);
+        if(acceptedAck)retiredAcks.add(acceptedAck);acceptedAck=incoming.request_id;lastError="";
+      }
+      finish(ticket);
+    }else if(incoming.request_id){if(acceptedAck && acceptedAck!==incoming.request_id)retiredAcks.add(acceptedAck);acceptedAck=incoming.request_id;}
+    while(retiredAcks.size>256)retiredAcks.delete(retiredAcks.values().next().value);
+    refresh();
+  },cleanup(){
+    if(disposed)return;disposed=true;unregister();
+    select.removeEventListener("click",selectClick);run.removeEventListener("click",runClick);container.removeEventListener?.("keydown",keydown);container.removeEventListener?.("pointerdown",pointerdown);container.removeAttribute?.("data-hmb-node-delete-protected");delete container.__hmbAgentRowHandle;container.innerHTML="";
+  }};
+  container.__hmbAgentRowHandle=handle;register();refresh();return handle;
 }

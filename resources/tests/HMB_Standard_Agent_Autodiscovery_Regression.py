@@ -98,6 +98,15 @@ try:
                 raise KeyError("Standard is discovered but intentionally not loaded yet")
 
         clear_test_modules()
+        # This fixture models a host whose only discovered Standard package is
+        # the synthetic, renamed registration above. The installed-SDK audit
+        # may have appended a real Standard root before entering this fixture;
+        # keep that other host's same-named package out of this synthetic host.
+        # Product discovery must still append the exact registered root itself.
+        sys.path[:] = [
+            value for value in sys.path
+            if not (Path(value) / "griptape_nodes_library" / "agents" / "agent.py").is_file()
+        ]
         for package_name in (
             "griptape_nodes",
             "griptape_nodes.retained_mode",

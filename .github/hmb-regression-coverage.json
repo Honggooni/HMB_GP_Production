@@ -3,6 +3,395 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_Agent_Native_Adapter_Arity_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_VideoPicker_Compact_Playback_Error_Browser_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Only_Project_Native_Surface_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_VideoPicker_Snapshot_Polling_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Actual SDK polling during delayed media preparation must complete without token starvation, preserve real edits, and stop on deletion."
+    },
+    {
+      "name": "HMB_Shot_Routing_Partial_Hydration_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Native Finish Look partial hydration must clear private active shot authority while preserving all five archived documents."
+    },
+    {
+      "name": "HMB_Shot_Routing_Empty_Catalog_No_Op_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Batched_Paint_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Compile_Cache_Hydration_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Saved_Task_Refresh_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Local_Original_Preview_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Workflow_Migration_Execution_Guard_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Workflow_Migration_Context_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires the actual installed Griptape SDK and isolated Standard Agent environment for migration context restoration and rollback checks."
+    },
+    {
+      "name": "HMB_Manager_Presentation_Authority_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Asset_Selection_Ready_Publication_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Suspended_Shot_Identity_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Agent_Saved_Preview_Hydration_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Deleted_Source_Epoch_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Agent_Catalog_Presentation_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Agent_Catalog_Presentation_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Asset_Selection_Lifecycle_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Library_Lifecycle_Order_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed SDK and tiny temporary local image catalog; verifies six-library creation order, deletion and replacement, exact shot selection and durable Prompt and Agent state with provider execution denied."
+    },
+    {
+      "name": "HMB_Prompt_Start_Size_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires the installed SDK in an isolated engine; checks saved Prompt startup geometry, later user resizing and five-shot document and connection preservation without user workflow or provider execution."
+    },
+    {
+      "name": "HMB_VideoPicker_Material_Pass_Host_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_VideoPicker_Mask_Material_Pass_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Standard_Agent_Edit_Environment_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Standard_Agent_Edit_Environment_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires a cold installed SDK without external Standard dependency path injection; validates native Agent discovery, constructor and five-slot restore with external work denied."
+    },
+    {
+      "name": "HMB_Standard_Agent_Cross_Library_Import_Host_Regression.py",
+      "coverage": "installed_sdk",
+      "mode": "manual",
+      "required": false,
+      "reason": "Requires fresh installed SDK, registered Standard and Advanced Media edit environments; run canonical, Advanced-front and cached-Advanced cases separately through the SDK offline guard."
+    },
+    {
+      "name": "HMB_Prompt_Connection_Preparing_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_List_Hydration_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed SDK to verify saved parent/child ParameterList identities, typed values, connected rows and native serialization with external and paid execution denied."
+    },
+    {
+      "name": "HMB_Agent_Shot_Store_Hydration_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Agent_Shot_Store_Hydration_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires isolated installed SDK initial setup and post-restore callbacks; verifies durable Agent slots and native cache stay in sync without provider calls."
+    },
+    {
+      "name": "HMB_Windows_Transport_Close_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Save_Roundtrip_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires the installed SDK for isolated native serialization, reference-node construction, code generation, temporary atomic save and workflow roundtrip; run with external transport and paid execution denied."
+    },
+    {
+      "name": "HMB_Prompt_Same_Catalog_Idempotence_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Generation_Mode_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Generation_Mode_Web_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Render_Preflight_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Render_Preflight_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Render_Preflight_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires the installed SDK to inspect a real registered five-shot DAG and native property command path while asserting no parameter, edge, Agent, upload or render mutations; run isolated with external transport blocked."
+    },
+    {
+      "name": "HMB_Image_Asset_Search_Page_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Asset_Search_Page_Widget_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Asset_Search_Page_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires the installed SDK for actual asynchronous page completion and bounded widget publication while preserving the full authoritative catalog and selected-source outputs; run isolated with external transport blocked."
+    },
+    {
+      "name": "HMB_Finish_UI_Transport_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Finish_UI_Transport_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Agent_UI_Responsiveness_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Hydration_Rebase_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires the installed SDK to validate each migrated Shot document against pinned real same-flow source objects after hydration, reject replacement and hash changes, and bound duplicate deferred failures without rendering."
+    },
+    {
+      "name": "HMB_Finish_Multishot_Consolidation_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires the installed SDK for actual five-to-one Finish consolidation, UUID settings and Generator context preservation, reload, singleton guard, and injected rollback/cancellation; run explicitly with external transport blocked."
+    },
+    {
+      "name": "HMB_Finish_Look_Multishot_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Finish_Look_Multishot_Widget_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Workflow_Consolidation_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires the installed SDK for actual legacy Prompt/Agent consolidation, source/connection preservation, saved-workflow loading and injected delete-failure rollback; run explicitly in an isolated engine with external transport blocked."
+    },
+    {
+      "name": "HMB_Prompt_Single_Load_Guard_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires the installed SDK for real Create/Paste/duplicate dispatch, concurrent pre-create claims and legacy workflow hydration; run explicitly with the isolated transport guard."
+    },
+    {
+      "name": "HMB_Seedance_Managed_Agent_Shot_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Agent_Multishot_Widget_Regression.mjs",
+      "mode": "ci",
+      "coverage": "javascript_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Agent_Multishot_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Agent_Prompt_Manager_Bridge_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Multishot_Manager_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires the actual installed Griptape SDK and isolated offline engine; run separately with the SDK transport guard."
+    },
+    {
+      "name": "HMB_Prompt_Multi_Shot_Manager_Regression.mjs",
+      "mode": "ci",
+      "coverage": "javascript_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Multi_Shot_Manager_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Multishot_Manager_Routing_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Only_Project_Selection_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Draft_Final_State_Sync_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Widget_Draft_State_Sync_Regression.mjs",
+      "mode": "ci",
+      "coverage": "javascript_contract",
+      "required": true
+    },
+    {
       "name": "HMB_Agent_V7_Execution_Context_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
@@ -241,6 +630,13 @@
       "coverage": "installed_sdk",
       "required": false,
       "reason": "Requires installed SDK/project scope; run explicitly in an isolated local host audit."
+    },
+    {
+      "name": "HMB_Color_LUT_Hydration_Lifecycle_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires the actual retained SDK initial_setup setter and isolated saved-state ownership lifecycle; execute offline with disposable node and project state."
     },
     {
       "name": "HMB_Color_LUT_Native_State_Regression.py",
@@ -1978,6 +2374,34 @@
       "coverage": "python_contract",
       "mode": "ci",
       "required": true
+    },
+    {
+      "name": "HMB_Library_Random_Lifecycle_Host_Regression.py",
+      "coverage": "installed_sdk",
+      "mode": "manual",
+      "required": false,
+      "reason": "Seeded random real SDK lifecycle and event-loop latency diagnostic in an isolated process; no provider calls."
+    },
+    {
+      "name": "HMB_Agent_Current_Standard_Transport_Regression.py",
+      "coverage": "installed_sdk",
+      "mode": "manual",
+      "required": false,
+      "reason": "Current installed Standard Agent and PydanticAI native wire serialization, mocked outbound transport and blocked external sockets."
+    },
+    {
+      "name": "HMB_Team801_Local804_Compatibility_Host_Regression.py",
+      "coverage": "installed_sdk",
+      "mode": "manual",
+      "required": false,
+      "reason": "Requires exact published Team v0.8.01 ZIP and two isolated SDK processes for genuine legacy save/current migration roundtrip."
+    },
+    {
+      "name": "HMB_Prompt_Random_Widget_Browser_Regression.mjs",
+      "coverage": "host_browser",
+      "mode": "manual",
+      "required": false,
+      "reason": "Seeded real Chromium 4/50 image profiles, remount/stale echo checkpoints and CPU sampling; timings are diagnostic, not CI machine-independent gates."
     }
   ]
 }

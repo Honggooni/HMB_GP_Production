@@ -917,6 +917,7 @@ def assert_draft_hides_inapplicable_output_controls_without_losing_authorship() 
     check_visibility(True)
     source = {"draft_job_id": "job-" + "a" * 32}
     with mock.patch.object(node, "_draft_source_record", return_value=source), \
+         mock.patch.object(node, "_draft_final_server_snapshot", return_value={"state": "available", "eligible": True}), \
          mock.patch.object(node, "_validated_draft_final_source", return_value=source):
         for action in (target.DRAFT_ACTION_PREVIEW, target.DRAFT_ACTION_FINAL):
             node.set_parameter_value("draft_action", action)

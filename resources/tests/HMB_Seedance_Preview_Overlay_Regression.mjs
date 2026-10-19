@@ -85,15 +85,21 @@ const awaitingCanPlay = widget.hmbSeedancePreviewPresentation(generation("succee
   playableVideo: false,
   visibleVideo: true,
 });
-assert.equal(awaitingCanPlay.visible, true);
-assert.equal(awaitingCanPlay.title, "완료 영상을 준비 중…");
+assert.equal(awaitingCanPlay.visible, false, "An existing native original player owns its loading state.");
+assert.equal(
+  widget.hmbSeedancePreviewPresentation(generation("succeeded"), {
+    visibleVideo: false, playableVideo: false,
+  }).title,
+  "완료 영상을 준비 중…",
+  "A completed result without any native player may still show preparation status.",
+);
 assert.equal(
   widget.hmbSeedancePreviewPresentation(generation("succeeded"), {
     playableVideo: true,
     visibleVideo: true,
   }).visible,
   false,
-  "The completed overlay may disappear only after the video is actually playable.",
+  "A playable original must retain its native playback controls.",
 );
 const unsupportedMovPreview = widget.hmbSeedancePreviewPresentation(
   generation("succeeded"),
@@ -104,14 +110,10 @@ const unsupportedMovPreview = widget.hmbSeedancePreviewPresentation(
     mediaFormat: "mov",
   },
 );
-assert.equal(unsupportedMovPreview.visible, true);
+assert.equal(unsupportedMovPreview.visible, false, "A native MOV error must remain owned by Griptape's default player.");
 assert.equal(unsupportedMovPreview.busy, false);
-assert.equal(unsupportedMovPreview.tone, "warning");
-assert.equal(unsupportedMovPreview.title, "MOV 저장 완료 · 내장 미리보기 불가");
-assert.equal(
-  unsupportedMovPreview.detail,
-  "파일은 정상 저장되었습니다. 외부 플레이어에서 MOV 파일을 여세요.",
-);
+assert.equal(unsupportedMovPreview.action, "none");
+assert.doesNotMatch(unsupportedMovPreview.title, /MOV|미리보기 불가|재생 다시 시도/);
 
 for (const phase of ["cancelled_locally", "timed_out", "submission_unknown"]) {
   const presentation = widget.hmbSeedancePreviewPresentation(generation(phase, {
@@ -217,6 +219,7 @@ class FakeElement {
   }
   setAttribute(name, value) {
     this.attributes.set(String(name), String(value));
+    if (name === "src") this.src = String(value);
     if (name === "class") this.className = String(value);
     if (String(name).startsWith("data-")) {
       this.dataset[attributeDatasetKey(name)] = String(value);
@@ -445,9 +448,9 @@ const completedGeneration = generation("succeeded", {
 widget.hmbSeedanceSyncPreviewOverlay(fixture.container, {
   generation: completedGeneration,
 });
-assert.ok(
-  fixture.region.querySelector(".hmb-seedance-preview-overlay"),
-  "The previous playable video cannot clear a newly completed media revision.",
+assert.equal(
+  fixture.region.querySelector(".hmb-seedance-preview-overlay"), null,
+  "A completed result must leave its native original player visible during source replacement.",
 );
 
 retainedVideo.src = "http://127.0.0.1:8124/external/new-success.mp4";
@@ -465,9 +468,9 @@ fixture.container.__hmbSeedanceLatestProps = {
 widget.hmbSeedanceSyncPreviewOverlay(fixture.container, {
   generation: completedGeneration,
 });
-assert.ok(
-  fixture.region.querySelector(".hmb-seedance-preview-overlay"),
-  "A new source must retain the completion overlay until canplay.",
+assert.equal(
+  fixture.region.querySelector(".hmb-seedance-preview-overlay"), null,
+  "The default video loader owns the new original source before canplay.",
 );
 retainedVideo.readyState = 3;
 retainedVideo.fire("canplay");
@@ -511,7 +514,7 @@ widget.hmbSeedanceSyncPreviewOverlay(sameSourceFixture.container, {
   generation: sameSourceCompleted,
 });
 assert.equal(sameSourceVideo.loadCount, 1, "A same-URL new revision must reload exactly once.");
-assert.ok(sameSourceFixture.region.querySelector(".hmb-seedance-preview-overlay"));
+assert.equal(sameSourceFixture.region.querySelector(".hmb-seedance-preview-overlay"), null);
 widget.hmbSeedanceSyncPreviewOverlay(sameSourceFixture.container, {
   generation: sameSourceCompleted,
 });
@@ -527,10 +530,9 @@ assert.equal(
 );
 widget.hmbSeedanceCleanupPreviewOverlay(sameSourceFixture.container);
 
-// ParameterVideo is type-compatible with MOV, but the embedded Chromium codec
-// set may reject a real provider MOV/10-bit HEVC stream on some team PCs. The
-// saved result must not look like an endless render in that case, and no local
-// or signed URL may be copied into visible overlay text.
+// The default Griptape player owns the original MOV, its loading/error state
+// and controls. HMB must never hide an existing native player or replace its
+// source, including a transient error followed by a remount or a new task.
 const movFallbackFixture = previewFixture();
 const movFallbackVideo = element("video");
 movFallbackVideo.src = (
@@ -539,6 +541,7 @@ movFallbackVideo.src = (
 );
 movFallbackVideo.currentSrc = movFallbackVideo.src;
 movFallbackVideo.readyState = 0;
+movFallbackVideo.controls = true;
 movFallbackFixture.region.append(movFallbackVideo);
 const movCompleted = generation("succeeded", {
   has_existing_video: true,
@@ -556,39 +559,270 @@ movFallbackFixture.container.__hmbSeedanceLatestProps = {
 widget.hmbSeedanceSyncPreviewOverlay(movFallbackFixture.container, {
   generation: movCompleted,
 });
-assert.ok(movFallbackFixture.region.querySelector(".hmb-seedance-preview-overlay"));
+assert.equal(movFallbackFixture.region.querySelector(".hmb-seedance-preview-overlay"), null);
 movFallbackVideo.error = { code: 4 };
 movFallbackVideo.fire("error");
 await Promise.resolve();
 await Promise.resolve();
-const movFallbackOverlay = movFallbackFixture.region.querySelector(
-  ".hmb-seedance-preview-overlay",
-);
-assert.ok(movFallbackOverlay, "A native MOV codec error must retain an actionable overlay.");
-assert.equal(movFallbackOverlay.dataset.tone, "warning");
-assert.equal(movFallbackOverlay.dataset.busy, "false");
-assert.equal(
-  movFallbackOverlay.querySelector(".hmb-seedance-preview-overlay__title").textContent,
-  "MOV 저장 완료 · 내장 미리보기 불가",
-);
-const movFallbackVisibleText = [
-  movFallbackOverlay.querySelector(".hmb-seedance-preview-overlay__title").textContent,
-  movFallbackOverlay.querySelector(".hmb-seedance-preview-overlay__detail").textContent,
-].join(" ");
-assert.doesNotMatch(movFallbackVisibleText, /127\.0\.0\.1|token=|seedance-result/i);
+const originalMovSource = movFallbackVideo.src;
+for (const phase of ["succeeded", "preparing", "submitting", "queued", "running", "retrieving", "downloading", "verifying", "timed_out", "failed", "cancelled_locally"]) {
+  const next = generation(phase, { has_existing_video: true, media_revision: 8 });
+  for (let index = 0; index < 100; index += 1) {
+    widget.hmbSeedanceSyncPreviewOverlay(movFallbackFixture.container, { generation: next });
+    const nativeStatus = movFallbackFixture.region.querySelector(".hmb-seedance-preview-overlay");
+    if (phase === "succeeded") assert.equal(nativeStatus, null);
+    else assert.equal(nativeStatus.dataset.mode, "badge");
+    assert.equal(movFallbackFixture.region.getAttribute("data-hmb-seedance-preview-static"), "");
+  }
+}
+assert.equal(movFallbackVideo.loadCount, 0, "Native errors and state echoes must never reload the original.");
+assert.equal(movFallbackVideo.src, originalMovSource);
+assert.equal(movFallbackVideo.controls, true, "The native loader's own playback controls must be preserved.");
+assert.equal(movFallbackFixture.region.querySelector("video"), movFallbackVideo);
 
-// A late codec installation/source replacement can still make the same MOV
-// playable. Its own canplay event should then clear the fallback normally.
+// Actual ready media also recovers when canplay preceded listener attachment
+// or the same native element missed a ready event after its transient error.
 movFallbackVideo.error = null;
 movFallbackVideo.readyState = 3;
-movFallbackVideo.fire("canplay");
+widget.hmbSeedanceSyncPreviewOverlay(movFallbackFixture.container, { generation: movCompleted });
+assert.equal(movFallbackFixture.container.__hmbSeedancePreviewFailure, undefined);
+assert.equal(movFallbackFixture.region.querySelector(".hmb-seedance-preview-overlay"), null);
+movFallbackVideo.error = { code: 3 };
+movFallbackVideo.fire("error");
 await Promise.resolve();
 await Promise.resolve();
+movFallbackVideo.remove();
+const undecodedRemount = element("video");
+undecodedRemount.src = originalMovSource;
+undecodedRemount.currentSrc = originalMovSource;
+movFallbackFixture.region.append(undecodedRemount);
+widget.hmbSeedanceSyncPreviewOverlay(movFallbackFixture.container, { generation: movCompleted });
+assert.ok(movFallbackFixture.container.__hmbSeedancePreviewFailure);
+assert.equal(movFallbackFixture.region.querySelector(".hmb-seedance-preview-overlay"), null);
+assert.equal(undecodedRemount.loadCount, 0);
+undecodedRemount.remove();
+const readyRemount = element("video");
+readyRemount.src = originalMovSource;
+readyRemount.currentSrc = originalMovSource;
+readyRemount.readyState = 3;
+movFallbackFixture.region.append(readyRemount);
+widget.hmbSeedanceSyncPreviewOverlay(movFallbackFixture.container, { generation: movCompleted });
+assert.equal(movFallbackFixture.container.__hmbSeedancePreviewFailure, undefined);
 assert.equal(
   movFallbackFixture.region.querySelector(".hmb-seedance-preview-overlay"),
   null,
 );
+assert.equal(readyRemount.loadCount, 0);
+assert.equal(movFallbackVideo.listeners.get("error").length, 0);
 widget.hmbSeedanceCleanupPreviewOverlay(movFallbackFixture.container);
+readyRemount.fire("canplay");
+movFallbackVideo.fire("error");
+await Promise.resolve();
+await Promise.resolve();
+assert.equal(movFallbackFixture.region.querySelector(".hmb-seedance-preview-overlay"), null);
+assert.equal(typeof widget.hmbSeedanceRetryPreviewPlayback, "undefined");
+assert.equal(typeof widget.HMB_SEEDANCE_PLAYBACK_RETRY_WATCHDOG_MS, "undefined");
+
+// A restored native player can receive the canonical Windows path before its
+// asynchronous host URL conversion. Bridge only that exact saved original via
+// Griptape's local HTTP file route, without changing the media artifact.
+const localSource = "C:\\shots\\two  spaces\\original.mov";
+const localUrl = "http://localhost:8124/workspace/outputs/videos/original.mov?v=123";
+const localDescriptor = { source: localSource, url: localUrl };
+assert.deepEqual(
+  widget.hmbSeedanceGenerationPreview(generation("succeeded", {
+    local_preview: localDescriptor,
+  })).local_preview,
+  localDescriptor,
+  "Canonical filename whitespace must be preserved exactly.",
+);
+for (const invalidUrl of [
+  "https://broker.example/original.mov", "http://localhost.evil.test/original.mov",
+  "file:///C:/shots/original.mov", "http://user:pass@localhost:8124/file.mov",
+  "http://localhost:8124/file.mov#fragment", "data:video/quicktime,AAAA",
+  "http://localhost:8124/api/original.mov", "http://localhost:8124/workspace/other.mov",
+]) {
+  assert.equal("local_preview" in widget.hmbSeedanceGenerationPreview(generation("succeeded", {
+    local_preview: { source: localSource, url: invalidUrl },
+  })), false);
+}
+for (let shot = 1; shot <= 5; shot += 1) {
+  const current = previewFixture();
+  const native = element("video", "", {
+    src: localSource, "data-raw-video-value": localSource,
+  });
+  native.controls = true;
+  native.error = { code: 4, message: "Media load rejected by URL safety check" };
+  native.play = () => assert.fail("Local preview must not autoplay.");
+  current.region.append(native);
+  const state = generation("succeeded", {
+    job_id: `existing-task-${shot}`, has_existing_video: true,
+    media_revision: shot, local_preview: localDescriptor,
+  });
+  current.container.__hmbSeedanceLatestProps = { value: {
+    schema: "hmb-seedance-shot-ui", schema_version: 2, generation: state,
+  } };
+  widget.hmbSeedanceSyncPreviewOverlay(current.container, { generation: state });
+  assert.equal(current.region.querySelector("video"), native);
+  assert.equal(native.getAttribute("src"), localUrl);
+  assert.equal(native.getAttribute("data-raw-video-value"), localSource);
+  assert.equal(native.loadCount, 1);
+  native.error = null;
+  native.readyState = 4;
+  native.fire("canplay");
+  await Promise.resolve();
+  for (const phase of ["succeeded", "running", "queued", "failed", "retrieving"]) {
+    for (let echo = 0; echo < 100; echo += 1) {
+      widget.hmbSeedanceSyncPreviewOverlay(current.container, {
+        generation: { ...state, phase, elapsed_seconds: echo },
+      });
+    }
+  }
+  assert.equal(native.loadCount, 1, "Progress echoes must retain original playback.");
+  assert.equal(native.controls, true);
+  assert.equal(state.job_id, `existing-task-${shot}`);
+  assert.equal(current.container.__hmbSeedancePreviewFailure, undefined);
+  // An already converted native HTTP source must remain untouched.
+  assert.equal(widget.hmbSeedanceConnectLocalPreview(current.container, state, native), false);
+  // A real remount gets one connection; another shot's retained player gets none.
+  const remount = element("video", "", { src: localSource, "data-raw-video-value": localSource });
+  assert.equal(widget.hmbSeedanceConnectLocalPreview(current.container, state, remount), true);
+  assert.equal(remount.loadCount, 1);
+  const stale = element("video", "", { src: "C:\\shots\\other.mov", "data-raw-video-value": "C:\\shots\\other.mov" });
+  assert.equal(widget.hmbSeedanceConnectLocalPreview(current.container, state, stale), false);
+  assert.equal(stale.loadCount, 0);
+  widget.hmbSeedanceCleanupPreviewOverlay(current.container);
+  assert.equal(widget.hmbSeedanceConnectLocalPreview(current.container, state, stale), false);
+}
+// A local route connection for a newly completed overwrite must also satisfy
+// the existing revision reload guard, rather than loading the file twice.
+const overwriteLocal = previewFixture();
+const overwriteNative = element("video", "", { src: localSource, "data-raw-video-value": localSource });
+overwriteLocal.region.append(overwriteNative);
+overwriteLocal.container.__hmbSeedanceConfirmedPreviewMedia = { identity: localSource, media_revision: 1 };
+const overwriteState = generation("succeeded", { media_revision: 2, local_preview: localDescriptor });
+widget.hmbSeedanceSyncPreviewOverlay(overwriteLocal.container, { generation: overwriteState });
+widget.hmbSeedanceSyncPreviewOverlay(overwriteLocal.container, { generation: overwriteState });
+assert.equal(overwriteNative.loadCount, 1, "Local repair and revision reload must coalesce.");
+widget.hmbSeedanceCleanupPreviewOverlay(overwriteLocal.container);
+// React's converter retains a prior HTTP URL while the next raw artifact is
+// already rendered. Exercise both publication orders and overwrite revisions.
+for (const order of ["descriptor-first", "raw-first", "overwrite"]) {
+  const retained = previewFixture();
+  const oldSource = "C:\\shots\\old.mov";
+  const nextSource = order === "overwrite" ? oldSource : "C:\\shots\\new.mov";
+  const oldUrl = "http://localhost:8124/workspace/old.mov?v=old";
+  const nextUrl = `http://localhost:8124/workspace/${order === "overwrite" ? "old" : "new"}.mov?v=new`;
+  const native = element("video", "", { src: oldUrl, "data-raw-video-value": oldSource });
+  native.currentSrc = oldUrl;
+  native.readyState = 4;
+  retained.region.append(native);
+  const oldState = generation("succeeded", { media_revision: 1, local_preview: { source: oldSource, url: oldUrl } });
+  const nextState = generation("succeeded", { job_id: "job-new-result", media_revision: 2,
+    local_preview: { source: nextSource, url: nextUrl } });
+  widget.hmbSeedanceSyncPreviewOverlay(retained.container, { generation: oldState });
+  if (order === "descriptor-first") {
+    widget.hmbSeedanceSyncPreviewOverlay(retained.container, { generation: nextState });
+    assert.equal(native.loadCount, 0, "A future descriptor must not reload the retained old source.");
+  }
+  native.setAttribute("data-raw-video-value", nextSource);
+  if (order === "raw-first") {
+    widget.hmbSeedanceSyncPreviewOverlay(retained.container, { generation: oldState });
+    assert.equal(native.loadCount, 0, "A new raw artifact must wait for its own descriptor.");
+  }
+  widget.hmbSeedanceSyncPreviewOverlay(retained.container, { generation: nextState });
+  assert.equal(native.getAttribute("src"), nextUrl, "The new result must replace its proved retained HTTP original immediately.");
+  assert.equal(native.loadCount, 1);
+  // A queued canplay from the prior decoder must not confirm this new result.
+  native.fire("canplay");
+  assert.equal(retained.container.__hmbSeedancePreviewVideoBinding.confirmedRevision, null);
+  native.currentSrc = nextUrl;
+  native.readyState = 4;
+  native.fire("canplay");
+  for (let echo = 0; echo < 100; echo += 1) {
+    widget.hmbSeedanceSyncPreviewOverlay(retained.container, { generation: nextState });
+  }
+  assert.equal(native.loadCount, 1, "State echoes must not restart the completed replacement.");
+  const stale = { ...oldState, local_preview: { source: nextSource, url: nextUrl.replace("v=new", "v=stale") } };
+  widget.hmbSeedanceSyncPreviewOverlay(retained.container, { generation: stale });
+  assert.equal(native.loadCount, 1, "A lower revision must not revert the local source.");
+  const rotated = { ...nextState, local_preview: { source: nextSource, url: nextUrl.replace("v=new", "v=rotated") } };
+  widget.hmbSeedanceSyncPreviewOverlay(retained.container, { generation: rotated });
+  assert.equal(native.loadCount, 1, "URL rotation without a new result must not restart playback.");
+  native.setAttribute("src", "http://localhost:8124/workspace/native-fallback.mp4?v=preview");
+  widget.hmbSeedanceSyncPreviewOverlay(retained.container, { generation: { ...nextState, media_revision: 3 } });
+  assert.equal(native.loadCount, 1, "A native converted fallback must retain its source and loading state.");
+  assert.match(native.getAttribute("src"), /native-fallback/);
+  widget.hmbSeedanceCleanupPreviewOverlay(retained.container);
+  assert.equal(retained.container.__hmbSeedanceLocalOriginalPreview, undefined);
+}
+const nativeConverted = previewFixture();
+const convertedOld = "http://localhost:8124/workspace/old.mov?v=old";
+const convertedNew = "http://localhost:8124/workspace/old.mov?v=new";
+const convertedRaw = "C:\\shots\\old.mov";
+const convertedVideo = element("video", "", { src: convertedOld, "data-raw-video-value": convertedRaw });
+convertedVideo.currentSrc = convertedOld;
+convertedVideo.readyState = 4;
+nativeConverted.region.append(convertedVideo);
+widget.hmbSeedanceSyncPreviewOverlay(nativeConverted.container, { generation: generation("succeeded", {
+  media_revision: 1, local_preview: { source: convertedRaw, url: convertedOld },
+}) });
+convertedVideo.setAttribute("src", convertedNew); // Native host has already switched.
+widget.hmbSeedanceSyncPreviewOverlay(nativeConverted.container, { generation: generation("succeeded", {
+  media_revision: 2, local_preview: { source: convertedRaw, url: convertedNew },
+}) });
+assert.equal(convertedVideo.loadCount, 0, "An already switched native URL must not be loaded twice.");
+assert.equal(nativeConverted.container.__hmbSeedancePreviewVideoBinding.confirmedRevision, null);
+convertedVideo.currentSrc = convertedNew;
+convertedVideo.readyState = 3;
+convertedVideo.fire("canplay");
+assert.equal(convertedVideo.loadCount, 0);
+widget.hmbSeedanceCleanupPreviewOverlay(nativeConverted.container);
+
+// A real saved workflow can expose its persisted counter before automatic
+// hydration publishes a fresh session's counter. Identical original bytes
+// must keep playing, and the next new result must remain eligible to switch.
+const restoredCounter = previewFixture();
+const restoredSource = "C:\\shots\\restored.mov";
+const restoredUrl = "http://localhost:8124/workspace/restored.mov?v=unchanged";
+const restoredNative = element("video", "", { src: restoredSource, "data-raw-video-value": restoredSource });
+restoredCounter.region.append(restoredNative);
+const persistedGeneration = generation("succeeded", {
+  media_revision: 3, local_preview: { source: restoredSource, url: restoredUrl },
+});
+widget.hmbSeedanceSyncPreviewOverlay(restoredCounter.container, { generation: persistedGeneration });
+restoredNative.currentSrc = restoredUrl;
+restoredNative.readyState = 4;
+restoredNative.fire("canplay");
+const automaticGeneration = { ...persistedGeneration, media_revision: 0 };
+for (let echo = 0; echo < 100; echo += 1) {
+  widget.hmbSeedanceSyncPreviewOverlay(restoredCounter.container, { generation: automaticGeneration });
+}
+assert.equal(restoredNative.loadCount, 1, "Automatic restoration must not reload identical local bytes.");
+assert.equal(restoredCounter.container.__hmbSeedanceLocalOriginalPreview.media_revision, 0);
+const nextRestoredSource = "C:\\shots\\after-reopen.mov";
+const nextRestoredUrl = "http://localhost:8124/workspace/after-reopen.mov?v=new";
+restoredNative.setAttribute("data-raw-video-value", nextRestoredSource);
+widget.hmbSeedanceSyncPreviewOverlay(restoredCounter.container, { generation: generation("succeeded", {
+  job_id: "job-after-reopen", media_revision: 1,
+  local_preview: { source: nextRestoredSource, url: nextRestoredUrl },
+}) });
+assert.equal(restoredNative.getAttribute("src"), nextRestoredUrl);
+assert.equal(restoredNative.loadCount, 2, "The next completed result after restoration must switch exactly once.");
+widget.hmbSeedanceCleanupPreviewOverlay(restoredCounter.container);
+
+const exceptionalContainer = {};
+const exceptionalVideo = element("video", "", { src: localSource });
+const exceptionalBinding = { canPlay: false, previewError: true, awaitingRevision: null, confirmedRevision: null, mediaKey: "matching-failure" };
+const exceptionalFailure = { key: "matching-failure" };
+exceptionalContainer.__hmbSeedancePreviewFailure = exceptionalFailure;
+exceptionalVideo.setAttribute = () => { throw new Error("Native host refused source assignment"); };
+assert.equal(widget.hmbSeedanceConnectLocalPreview(exceptionalContainer, overwriteState, exceptionalVideo, exceptionalBinding), false);
+assert.equal(exceptionalBinding.previewError, true);
+assert.equal(exceptionalBinding.awaitingRevision, null);
+assert.equal(exceptionalContainer.__hmbSeedancePreviewFailure, exceptionalFailure);
+assert.equal(widget.hmbSeedanceConnectLocalPreview(exceptionalContainer, overwriteState, exceptionalVideo, exceptionalBinding), false);
+assert.equal(exceptionalVideo.loadCount, 0, "Exceptional host failures must not loop on progress echoes.");
 
 const refreshRequests = [];
 let insideRefreshClickStack = true;
@@ -903,5 +1137,5 @@ try {
 
 console.log(
   "HMB Seedance native preview status-overlay regression: PASS "
-  + "(centre/badge phases, retained video, elapsed status, refresh-only presentation, canplay gate)",
+  + "(centre/badge phases, original native controls, decoded media recovery, refresh-only presentation)",
 );

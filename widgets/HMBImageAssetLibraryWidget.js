@@ -242,7 +242,8 @@ function hmbImageAssetBridgeHasConsumers(entry) {
     typeof entry?.consumer === "function"
     || typeof entry?.catalogConsumer === "function"
     || (entry?.consumers instanceof Map && entry.consumers.size)
-    || (entry?.catalogConsumers instanceof Map && entry.catalogConsumers.size),
+    || (entry?.catalogConsumers instanceof Map && entry.catalogConsumers.size)
+    || (entry?.pageConsumers instanceof Map && entry.pageConsumers.size),
   );
 }
 
@@ -1130,6 +1131,7 @@ function normalizeState(value) {
     taxonomy,
     folders,
     assets,
+    ...(hmbCatalogPage(input.catalog_page) ? {catalog_page:hmbCatalogPage(input.catalog_page)} : {}),
     shot_routing: normalizeImageAssetShotRouting(input.shot_routing, assets),
     root_edit_enabled: Boolean(input.root_edit_enabled),
     selected_folder_path: folders.includes(selectedFolderPath) ? selectedFolderPath : "",
@@ -1164,7 +1166,7 @@ function normalizeState(value) {
       : "",
     warnings: uniqueStrings(input.warnings).slice(0, 100),
     error: clean(input.error),
-    status: {
+    status: hmbCatalogPage(input.catalog_page) ? {...input.status,selected_count:assets.filter(asset=>asset.selected).length} : {
       asset_count: assets.length,
       selected_count: assets.filter((asset) => asset.selected).length,
       project_asset_count: assets.filter((asset) => asset.source_kind === "project").length,
@@ -2290,18 +2292,19 @@ function buildFolderTree(state) {
     }));
     node.assetCount = (directCounts.get(node.path) || 0)
       + node.children.reduce((total, child) => total + finalize(child), 0);
+    if(state.catalog_page?.folder_counts && Number.isFinite(state.catalog_page.folder_counts[node.path]))node.assetCount=state.catalog_page.folder_counts[node.path];
     return node.assetCount;
   };
   finalize(root);
   const importedAssets = state.assets.filter((asset) => asset.source_kind === "user");
-  if (importedAssets.length) {
+  if (importedAssets.length || Number(state.catalog_page && state.status?.user_asset_count)>0) {
     root.children.push({
       key: "$imports",
       path: "",
       label: imageAssetText(state, "import_in"),
       sourceView: "user",
       children: [],
-      assetCount: importedAssets.length,
+      assetCount: state.catalog_page ? Number(state.status?.user_asset_count)||0 : importedAssets.length,
     });
   }
   return root;
@@ -2339,6 +2342,109 @@ function folderAssets(state) {
     if (folder && !(relative === folder || relative.startsWith(`${folder}/`))) return false;
     return true;
   });
+}
+
+function hmbCatalogPage(value) {
+  if(!value || value.version!==1 || !Array.isArray(value.asset_library_ids)
+    || value.asset_library_ids.length>80 || !Number.isSafeInteger(value.total) || value.total<0
+    || !Number.isSafeInteger(value.offset) || value.offset<0 || !Number.isSafeInteger(value.limit)
+    || value.limit<1 || value.limit>80 || !Number.isSafeInteger(value.sequence) || value.sequence<1
+    || !clean(value.session_id))return null;
+  return {...value,asset_library_ids:uniqueStrings(value.asset_library_ids).slice(0,80)};
+}
+
+function hmbImageAssetCatalogFingerprint(assets) {
+  const fields=["asset_id","image_name","relative_path","image_main_type","image_sub_type","source_kind","asset_library_id","source_uid"];
+  return JSON.stringify((Array.isArray(assets)?assets:[]).map(asset=>fields.map(key=>clean(asset?.[key]))));
+}
+
+function hmbCatalogPageContext(state) {
+  return {runtime_instance_id:clean(state?.shot_routing?.publisher_instance_uuid),
+    project_uid:clean(state?.project_uid),project_cache_uid:clean(state?.project_cache_uid),
+    manifest_signature:clean(state?.manifest_signature),folder_signature:clean(state?.folder_signature),
+    scan_revision:hmbNormalizeImageAssetRevision(state?.scan_revision)};
+}
+
+function hmbCatalogPageContextKey(state) {return JSON.stringify(hmbCatalogPageContext(state));}
+
+function hmbImageAssetLocalPageProjection(value,current,container) {
+  const control=container?.__hmbImageAssetPageControl;
+  if(control && Array.isArray(value?.assets) && hmbImageAssetRevisionDisposition(container,value)!=="stale") {
+    control.fullState=value;
+    const fingerprint=hmbImageAssetCatalogFingerprint(value.assets);
+    if(fingerprint!==control.fingerprint) {
+      control.fingerprint=fingerprint;
+      clearTimeout(control.timer);control.pending=null;control.key="";control.acceptedContext="";control.disabledContext="";
+      return value;
+    }
+  }
+  const page=hmbCatalogPage(current?.catalog_page);
+  if(!page || !Array.isArray(value?.assets) || hmbCatalogPageContextKey(value)!==hmbCatalogPageContextKey(current))return value;
+  const wanted=new Set(page.asset_library_ids);
+  return {...value,catalog_page:page,assets:value.assets.filter(asset=>asset.selected || wanted.has(asset.asset_library_id))};
+}
+
+export function hmbRequestImageAssetCatalogPage(container,state,offset=0) {
+  const control=container?.__hmbImageAssetPageControl;
+  const context=hmbCatalogPageContext(state),entry=imageAssetThumbnailBridgeRegistry()?.get(context.runtime_instance_id);
+  if(!control || control.disabledContext===hmbCatalogPageContextKey(state)
+    || entry?.catalogPageVersion!==1 || !context.project_uid || !entry.dispatch)return false;
+  const request={schema:"hmb-image-asset-thumbnail-bridge",version:1,operation:"catalog_page",phase:"request",...context,
+    session_id:control.session,query:String(state.search||"").slice(0,256),folder:normalizeRelativeFolder(state.selected_folder_path),
+    source_view:state.selected_source_view==="user"?"user":"project",offset:Math.max(0,Number(offset)||0),limit:80};
+  const key=JSON.stringify(request);
+  if(control.key===key && control.pending)return true;
+  const page=hmbCatalogPage(state.catalog_page);
+  if(!control.pending && page && page.session_id===control.session && page.query===request.query && page.folder===request.folder
+    && page.source_view===request.source_view && page.offset===request.offset && control.acceptedContext===hmbCatalogPageContextKey(state))return false;
+  control.sequence+=1;request.sequence=control.sequence;request.request_id=`page-${control.session}-${control.sequence}`;
+  control.key=key;control.pending=request;
+  clearTimeout(control.timer);
+  control.timer=setTimeout(()=>{if(control.pending===request)control.fallback();},15000);
+  try{const result=entry.dispatch(request);if(result?.catch)result.catch(()=>{if(control.pending===request)control.fallback();});}
+  catch(_error){control.fallback();return true;}
+  return true;
+}
+
+function hmbInstallImageAssetCatalogPages(container,getState,accept,acceptFallback) {
+  const control={session:`${Date.now().toString(36)}-${Math.random().toString(36).slice(2,10)}`,sequence:0,pending:null,key:"",runtime:"",timer:0,
+    fingerprint:hmbImageAssetCatalogFingerprint(getState()?.assets),fullState:{...getState()}};
+  container.__hmbImageAssetPageControl=control;
+  control.fallback=()=>{
+    if(container.__hmbImageAssetPageControl!==control)return;
+    clearTimeout(control.timer);control.pending=null;control.key="";
+    const current=getState();control.disabledContext=hmbCatalogPageContextKey(current);
+    if(hmbCatalogPageContextKey(control.fullState)!==hmbCatalogPageContextKey(current))return;
+    acceptFallback(control.fullState);
+  };
+  const wake=()=>{
+    const state=getState(),runtime=hmbCatalogPageContext(state).runtime_instance_id;
+    if(runtime!==control.runtime){
+      const old=imageAssetThumbnailBridgeRegistry()?.get(control.runtime);old?.pageConsumers?.delete(control.session);
+      control.runtime=runtime;control.pending=null;control.key="";
+    }
+    if(!runtime)return;
+    const registry=imageAssetThumbnailBridgeRegistry();const entry=registry?.get(runtime)||{};
+    if(!(entry.pageConsumers instanceof Map))entry.pageConsumers=new Map();
+    entry.pageConsumers.set(control.session,{consumer:receive,wake});registry?.set(runtime,entry);
+    if(container.__hmbImageAssetSearchTimer!=null)return;
+    hmbRequestImageAssetCatalogPage(container,state,container.__hmbImageAssetRenderOffset||0);
+  };
+  const receive=result=>{
+    const request=control.pending,state=getState();
+    if(!request || result?.operation!=="catalog_page" || result.phase!=="result"
+      || result.session_id!==control.session || result.request_id!==request.request_id || result.sequence!==request.sequence)return false;
+    if(result.outcome!=="ready"){control.fallback();return false;}
+    if(JSON.stringify(hmbCatalogPageContext(result.state))!==JSON.stringify(hmbCatalogPageContext(state)))return false;
+    const page=hmbCatalogPage(result.state?.catalog_page);if(!page || page.session_id!==control.session || page.sequence!==request.sequence)return false;
+    if(page.query!==request.query || page.folder!==request.folder || page.source_view!==request.source_view)return false;
+    if(String(state.search||"")!==request.query || normalizeRelativeFolder(state.selected_folder_path)!==request.folder
+      || state.selected_source_view!==request.source_view)return false;
+    clearTimeout(control.timer);control.pending=null;control.key="";control.acceptedContext=hmbCatalogPageContextKey(state);
+    accept(result.state);return true;
+  };
+  return {wake,cleanup(){clearTimeout(control.timer);control.pending=null;const entry=imageAssetThumbnailBridgeRegistry()?.get(control.runtime);
+    entry?.pageConsumers?.delete(control.session);delete container.__hmbImageAssetPageControl;}};
 }
 
 function isUserImportFolder(value) {
@@ -2777,6 +2883,10 @@ export function hmbImageAssetCatalogWindow(
   limit = IMAGE_ASSET_RENDER_WINDOW,
   offset = 0,
 ) {
+  const page=hmbCatalogPage(state?.catalog_page);
+  if(page){const byId=new Map(state.assets.map(asset=>[asset.asset_library_id,asset]));return {
+    matches:{length:page.total},rendered:page.asset_library_ids.map(id=>byId.get(id)).filter(Boolean),
+    offset:page.offset,limit:page.limit};}
   const matches = folderAssets(state).filter((asset) => assetMatchesSearch(asset, state.search));
   const boundedLimit = Math.min(
     IMAGE_ASSET_RENDER_WINDOW,
@@ -3725,7 +3835,7 @@ export function hmbRenderImageAssetGrid(
   const shot = activeImageAssetShot(state);
   const selectedCount = imageAssetShotAssets(state, shot).length;
   const cards = windowed.rendered
-    .map((asset) => renderAssetCard(asset, selectedCount, state.search, state, shot))
+    .map((asset) => renderAssetCard(asset, selectedCount, state.catalog_page?.query ?? state.search, state, shot))
     .join("");
   const empty = windowed.matches.length
     ? ""
@@ -3745,6 +3855,7 @@ export function hmbRenderImageAssetGrid(
 }
 
 export function hmbReconcileImageAssetCatalog(container, state, options = {}) {
+  if(hmbRequestImageAssetCatalogPage(container,state,options.offset ?? container?.__hmbImageAssetRenderOffset ?? 0))return {pending:true};
   const grid = container?.querySelector?.(".asset-grid");
   const ownerDocument = grid?.ownerDocument || container?.ownerDocument
     || (typeof document !== "undefined" ? document : null);
@@ -6707,6 +6818,8 @@ function installEvents(container, state, props, remount, listeners) {
       });
     });
     const toggle = () => {
+      const asset = container.__hmbImageAssetByLibraryId?.get(key) || assetsByLibraryId.get(key);
+      if (!asset) return;
       if (!hmbImageAssetCanSelect(asset)) return;
       const activeShot = activeImageAssetShot(state);
       if (!activeShot) return;
@@ -6885,7 +6998,8 @@ function installEvents(container, state, props, remount, listeners) {
     if (event.__hmbImageAssetCardHandled) return;
     const card = event.target?.closest?.("[data-asset-key]");
     if (!card || !container.contains?.(card)) return;
-    const asset = assetsByLibraryId.get(clean(card.getAttribute("data-asset-key")));
+    const key = clean(card.getAttribute("data-asset-key"));
+    const asset = container.__hmbImageAssetByLibraryId?.get(key) || assetsByLibraryId.get(key);
     if (!asset) return;
     const add = event.target?.closest?.("[data-asset-add]");
     if (add) {
@@ -6910,7 +7024,8 @@ function installEvents(container, state, props, remount, listeners) {
     if (event.__hmbImageAssetCardHandled || !["Enter", " "].includes(event.key)) return;
     const card = event.target?.closest?.("[data-asset-key]");
     if (!card || event.target !== card || !container.contains?.(card)) return;
-    const asset = assetsByLibraryId.get(clean(card.getAttribute("data-asset-key")));
+    const key = clean(card.getAttribute("data-asset-key"));
+    const asset = container.__hmbImageAssetByLibraryId?.get(key) || assetsByLibraryId.get(key);
     if (!asset) return;
     event.preventDefault();
     toggleDelegatedAsset(card, asset);
@@ -7167,6 +7282,36 @@ export default function HMBImageAssetLibraryWidget(container, props) {
   hmbRememberImageAssetRevisionState(container, state, false);
   let listeners = [];
   let renderRevision = 0;
+  const catalogPages=hmbInstallImageAssetCatalogPages(container,()=>state,(dto)=>{
+    const page=normalizeState(dto),selected=selectedAssets(state),selectedIds=new Set(selected.map(asset=>asset.source_uid));
+    const byId=new Map(selected.map(asset=>[asset.asset_library_id,asset]));
+    const visible=new Map(state.assets.map(asset=>[asset.asset_library_id,asset]));
+    for(const asset of page.assets)if(!byId.has(asset.asset_library_id)){
+      const prior=visible.get(asset.asset_library_id);
+      const thumbnail=prior?.thumbnail_url && prior.media_signature===asset.media_signature
+        && state.thumbnail_revision>=page.thumbnail_revision ? prior.thumbnail_url : asset.thumbnail_url;
+      const retained=prior || {};
+      Object.assign(retained,asset,{thumbnail_url:thumbnail,
+        selected:selectedIds.has(asset.source_uid),selection_order:0});
+      byId.set(asset.asset_library_id,retained);
+    }
+    state.assets=[...byId.values()];state.catalog_page=page.catalog_page;
+    state.status={...page.status,selected_count:selected.length};
+    container.__hmbImageAssetLatestState=state;
+    container.__hmbImageAssetRenderOffset=page.catalog_page.offset;
+    hmbReconcileImageAssetCatalog(container,state);
+    hmbScheduleImageAssetThumbnailRequest(container,state,props,{includeWindow:!container.__hmbImageAssetCompact});
+  },(full)=>{
+    const canonical=normalizeState(full),selected=selectedAssets(state),order=new Map(selected.map((asset,index)=>[asset.source_uid,index+1]));
+    const visible=new Map(state.assets.map(asset=>[asset.asset_library_id,asset]));
+    state.assets=canonical.assets.map(asset=>Object.assign(visible.get(asset.asset_library_id)||{},asset,
+      {selected:order.has(asset.source_uid),selection_order:order.get(asset.source_uid)||0}));
+    state.status={...canonical.status,selected_count:selected.length};
+    delete state.catalog_page;
+    container.__hmbImageAssetLatestState=state;
+    hmbReconcileImageAssetCatalog(container,state);
+    hmbScheduleImageAssetThumbnailRequest(container,state,props,{includeWindow:!container.__hmbImageAssetCompact});
+  });
 
   const consumeCatalogProbeResult = (result) => hmbAcceptImageAssetCatalogProbeResult(
     container,
@@ -7241,6 +7386,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
         state.search = container.__hmbImageAssetSearchDraft.slice(0, 256);
       }
       container.__hmbImageAssetLatestState = state;
+      catalogPages.wake();
       hmbRegisterImageAssetThumbnailConsumer(
         container,
         state,
@@ -7276,6 +7422,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
       state.search = container.__hmbImageAssetSearchDraft.slice(0, 256);
     }
     container.__hmbImageAssetLatestState = state;
+    catalogPages.wake();
     hmbRegisterImageAssetThumbnailConsumer(
       container,
       state,
@@ -7384,7 +7531,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
       if (commandEcho.current) props = hmbUpdateImageAssetPropsReference(props, nextProps);
       return;
     }
-    const incomingState = normalizeState(rawIncoming);
+    const incomingState = normalizeState(hmbImageAssetLocalPageProjection(rawIncoming,state,container));
     const queuedOwnerAction = container.__hmbImageAssetPendingSlowAction;
     if (
       queuedOwnerAction
@@ -7568,6 +7715,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
   container.__hmbImageAssetApplyProps = applyProps;
 
   const cleanup = () => {
+    catalogPages.cleanup();
     cleanupImportHandles();
     hmbCancelImageAssetCompactGeometrySettle(container);
     if (container.__hmbImageAssetExpandedGeometry) {
@@ -7655,6 +7803,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
   };
   container.__hmbImageAssetCleanup = cleanup;
   remount(state);
+  catalogPages.wake();
   return {
     cleanup: container.__hmbImageAssetCleanupProxy,
     update(nextProps) {

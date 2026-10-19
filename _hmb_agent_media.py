@@ -60,11 +60,28 @@ with Image.open(io.BytesIO(blob)) as original:
 """
 
 
+def _uses_native_user_content(agent: Any) -> bool:
+    """Recognize the installed Standard Agent's current native state type."""
+    try:
+        from griptape_nodes_library.llm.agent_state import AgentState
+
+        return type(agent) is AgentState
+    except (ImportError, AttributeError):
+        return False
+
+
 def driver_accepts_images(agent: Any) -> bool:
     """Use installed metadata, never a separate model-name allowlist."""
     try:
-        from griptape.drivers.prompt.griptape_cloud_prompt_driver import GriptapeCloudPromptDriver
         from griptape_nodes.drivers.cloud_models import VISION_MODEL_CHOICES
+
+        if _uses_native_user_content(agent):
+            from griptape_nodes_library.llm.model_config import ModelProvider
+
+            config = agent.model
+            return (config is not None and config.provider == ModelProvider.GRIPTAPE_CLOUD
+                    and not config.base_url and config.model in VISION_MODEL_CHOICES)
+        from griptape.drivers.prompt.griptape_cloud_prompt_driver import GriptapeCloudPromptDriver
 
         driver = agent.tasks[0].prompt_driver
         # An OpenAI-compatible/custom endpoint can share a model name without
@@ -431,7 +448,11 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
                 skip(record, kind, reason)
             report["status"] = reason
             return prompt
-        from griptape.artifacts import ImageArtifact, ListArtifact, TextArtifact
+        native_user_content = _uses_native_user_content(agent)
+        if native_user_content:
+            from pydantic_ai.messages import BinaryContent
+        else:
+            from griptape.artifacts import ImageArtifact, ListArtifact, TextArtifact
         deadline = started + PREPARATION_SECONDS
         ffmpeg, probe = _binaries()
 
@@ -494,9 +515,13 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
                     label["alignment_retry"] = retried
                     if group_id:
                         label["sample_group_id"] = group_id
-                attachments.extend([TextArtifact("HMB REFERENCE PIXELS (SOURCE DATA): " +
-                    json.dumps(label, ensure_ascii=False, separators=(",", ":"))),
-                    ImageArtifact(blob, format="png", width=width, height=height)])
+                label_text = ("HMB REFERENCE PIXELS (SOURCE DATA): " +
+                    json.dumps(label, ensure_ascii=False, separators=(",", ":")))
+                if native_user_content:
+                    attachments.extend([label_text, BinaryContent(data=blob, media_type="image/png")])
+                else:
+                    attachments.extend([TextArtifact(label_text),
+                        ImageArtifact(blob, format="png", width=width, height=height)])
                 observed = _observation_row(record, kind)
                 observed.update({key: label[key] for key in ("image_size", "requested_seek_seconds", "decoded_pts_seconds",
                     "pts_status", "sample_reason", "requested_source_frame", "normalized_pts_seconds",
@@ -638,6 +663,8 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
             "Complete the prompt from all available sources with LOCAL CONTINUATION. "
             "Sources without attached pixels: " + json.dumps(unobserved, ensure_ascii=False) + "."
         )
+        if native_user_content:
+            return [prompt + guidance, *attachments]
         return ListArtifact([TextArtifact(prompt + guidance), *attachments])
     except Exception:
         report["status"] = "optional_preparation_failed"

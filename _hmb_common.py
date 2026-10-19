@@ -11,6 +11,7 @@ import os
 import re
 import stat
 import sys
+import sysconfig
 import unicodedata
 import zlib
 from ctypes import wintypes
@@ -1423,6 +1424,51 @@ def get_internal_policy_identity(project_id: Any = None) -> Dict[str, str]:
     }
 
 
+_STANDARD_AGENT_IMPORT_WARNINGS: set[tuple[str, str, str]] = set()
+
+
+def _standard_agent_import_warning(stage: str, error: Exception) -> None:
+    """Bounded import diagnostics; exception text may contain private values."""
+    error_type = type(error).__name__
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]{0,79}", error_type):
+        error_type = "ImportFailure"
+    missing = getattr(error, "name", None) if isinstance(error, ModuleNotFoundError) else None
+    if not isinstance(missing, str) or len(missing) > 160 or not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", missing):
+        missing = ""
+    identity = (stage, error_type, missing)
+    if identity in _STANDARD_AGENT_IMPORT_WARNINGS or len(_STANDARD_AGENT_IMPORT_WARNINGS) >= 64:
+        return
+    _STANDARD_AGENT_IMPORT_WARNINGS.add(identity)
+    try:
+        print(f"{WARN_LOG_PREFIX} Standard Agent import unavailable: stage={stage} type={error_type} missing_module={missing or '-'}")
+    except Exception:
+        pass
+
+
+def _append_standard_agent_edit_dependencies(root: Path) -> None:
+    """Use only this validated package's edit environment, after host paths.
+
+    Append a directory directly: site.addsitedir would execute arbitrary .pth
+    files. Never infer a sibling, scan home, or change loaded SDK modules.
+    An absent environment is optional when the native Agent is already usable.
+    """
+    try:
+        root = root.resolve(strict=True)
+        venv = (root / ".venv").resolve(strict=True)
+        venv.relative_to(root)
+        configuration = (venv / "pyvenv.cfg").resolve(strict=True)
+        configuration.relative_to(venv)
+        if not configuration.is_file() or configuration.stat().st_size > 16 * 1024:
+            return
+        site_packages = Path(sysconfig.get_path("purelib", vars={"base": str(venv), "platbase": str(venv)})).resolve(strict=True)
+        site_packages.relative_to(venv)
+        if site_packages.is_dir() and str(site_packages) not in sys.path:
+            sys.path.append(str(site_packages))
+            importlib.invalidate_caches()
+    except (OSError, ValueError, TypeError):
+        return
+
+
 def _configured_standard_library_root() -> Optional[Path]:
     """Return only the explicitly configured Standard Library package root."""
     explicit = os.environ.get("HMB_GRIPTAPE_STANDARD_LIBRARY_PATH", "").strip()
@@ -1444,10 +1490,7 @@ def _configured_standard_library_root() -> Optional[Path]:
         return configured
     except Exception as exc:
         try:
-            print(
-                f"{WARN_LOG_PREFIX} Ignoring invalid "
-                f"HMB_GRIPTAPE_STANDARD_LIBRARY_PATH: {exc}"
-            )
+            _standard_agent_import_warning("explicit_root", exc)
         except Exception:
             pass
         return None
@@ -1488,7 +1531,7 @@ def _validated_registered_standard_library_root(candidate: Path) -> Optional[Pat
         return None
 
 
-def _registered_standard_library_root_from_host() -> Optional[Path]:
+def _registered_standard_library_root_from_host(*, status: Optional[dict] = None) -> Optional[Path]:
     """Resolve the Standard Library through Griptape's discovery metadata."""
     try:
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes  # type: ignore
@@ -1499,22 +1542,30 @@ def _registered_standard_library_root_from_host() -> Optional[Path]:
             "Griptape Nodes Library"
         )
         if library_info is None or not getattr(library_info, "library_path", None):
+            if status is not None:
+                status["rejected"] = True
             return None
         if getattr(library_info, "enabled", True) is False:
+            if status is not None:
+                status["rejected"] = True
             raise ValueError("host Standard Library registration is disabled")
         lifecycle = getattr(library_info, "lifecycle_state", None)
         lifecycle_name = str(getattr(lifecycle, "name", lifecycle) or "").upper()
         if lifecycle_name == "FAILURE":
+            if status is not None:
+                status["rejected"] = True
             raise ValueError("host Standard Library registration failed")
         root = _validated_registered_standard_library_root(
             Path(str(library_info.library_path))
         )
         if root is None:
+            if status is not None:
+                status["rejected"] = True
             raise ValueError("host-reported Standard Library failed validation")
         return root
     except Exception as exc:
         try:
-            print(f"{WARN_LOG_PREFIX} Ignoring invalid host Standard Library path: {exc}")
+            _standard_agent_import_warning("registered_root", exc)
         except Exception:
             pass
         return None
@@ -1552,6 +1603,10 @@ def find_builtin_agent_class() -> Optional[Type[Any]]:
     explicit_root = _configured_standard_library_root()
     if explicit_requested and explicit_root is None:
         return None
+    failures: list[tuple[str, Exception]] = []
+    def report_failures() -> None:
+        for stage, error in failures:
+            _standard_agent_import_warning(stage, error)
     def is_node_agent_class(candidate: Any) -> bool:
         try:
             if not isinstance(candidate, type) or candidate.__name__ != "Agent":
@@ -1574,8 +1629,8 @@ def find_builtin_agent_class() -> Optional[Type[Any]]:
             candidate = getattr(module, "Agent", None)
             if _is_canonical_agent_module(module, expected_root) and is_node_agent_class(candidate):
                 return candidate
-        except Exception:
-            pass
+        except Exception as error:
+            failures.append(("canonical_source", error))
         return None
 
     def load_from_registry(expected_root: Optional[Path]) -> Optional[Type[Any]]:
@@ -1587,8 +1642,8 @@ def find_builtin_agent_class() -> Optional[Type[Any]]:
             module = importlib.import_module(str(candidate.__module__))
             if _is_canonical_agent_module(module, expected_root) and is_node_agent_class(candidate):
                 return candidate
-        except Exception:
-            pass
+        except Exception as error:
+            failures.append(("registered_class", error))
         return None
 
     if explicit_root is not None:
@@ -1597,10 +1652,12 @@ def find_builtin_agent_class() -> Optional[Type[Any]]:
             # Explicit configuration is an administrator/user decision. Append it
             # so it cannot shadow already configured host packages at sys.path[0].
             sys.path.append(text_path)
+        _append_standard_agent_edit_dependencies(explicit_root)
         importlib.invalidate_caches()
         candidate = load_from(explicit_root)
         if candidate is not None:
             return candidate
+        report_failures()
         try:
             print(
                 f"{WARN_LOG_PREFIX} The explicitly configured Standard Agent "
@@ -1610,7 +1667,14 @@ def find_builtin_agent_class() -> Optional[Type[Any]]:
             pass
         return None
 
-    registered_root = _registered_standard_library_root_from_host()
+    discovery_status: dict[str, bool] = {}
+    registered_root = _registered_standard_library_root_from_host(status=discovery_status)
+    if discovery_status.get("rejected"):
+        return None
+    if registered_root is not None:
+        # Registry entries may resolve a lazy Agent on the first call. Its
+        # provider dependencies must be visible before that first import.
+        _append_standard_agent_edit_dependencies(registered_root)
 
     # First honor the exact Agent class already registered by the host.
     candidate = load_from_registry(registered_root)
@@ -1637,6 +1701,7 @@ def find_builtin_agent_class() -> Optional[Type[Any]]:
             return candidate
 
     try:
+        report_failures()
         print(
             f"{WARN_LOG_PREFIX} Built-in Griptape Agent node class was not found "
             "at the registered host path. Check the Standard Library or set "

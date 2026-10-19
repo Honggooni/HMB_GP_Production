@@ -188,6 +188,9 @@ else:
 
 state = target.default_finish_look_state()
 node = target.HMBFinishLookLibrary(name="Finish Look Regression")
+# Retained individual-node compatibility retains the compiler and remote
+# contracts below. New UUID-separated manager behavior has its own regression.
+node._hmb_finish_legacy_mode = True
 
 
 def parameter_map(test_node):
@@ -213,15 +216,15 @@ assert not any("VIDEO_TOOL" in name or name in {"SHOT_PICKER_IN", "CROP_VIDEO_IN
 assert not any(key.startswith("video_") or key in {"picker_source", "command"} for key in node._widget_state)
 assert parameters[target.REMOTE_INPUT_PARAMETER_NAME].input_types == ["dict"]
 assert node.ui_options["width"] == target.FINISH_LOOK_NODE_WIDTH == 980
-assert node.ui_options["height"] == target.FINISH_LOOK_NODE_HEIGHT == 1040
-assert node.ui_options["node_size"] == {"width": 980, "height": 1040}
+assert node.ui_options["height"] == target.FINISH_LOOK_NODE_HEIGHT == 1091
+assert node.ui_options["node_size"] == {"width": 980, "height": 1091}
 widget_parameter = parameters[target.WIDGET_PARAMETER_NAME]
 widget_ui = widget_parameter.ui_options
-assert widget_ui["height"] == target.FINISH_LOOK_WIDGET_HEIGHT == 940
-assert widget_ui["min_height"] == target.FINISH_LOOK_WIDGET_MIN_HEIGHT == 720
+assert widget_ui["height"] == target.FINISH_LOOK_WIDGET_HEIGHT == 991
+assert widget_ui["min_height"] == target.FINISH_LOOK_WIDGET_MIN_HEIGHT == 180
 assert widget_ui["width"] == target.FINISH_LOOK_NODE_WIDTH
 assert widget_ui["preferred_height"] == target.FINISH_LOOK_WIDGET_HEIGHT
-assert widget_ui["node_size"] == {"width": 980, "height": 1040}
+assert widget_ui["node_size"] == {"width": 980, "height": 1091}
 assert widget_ui["expandable"] is True
 assert widget_ui["compact"] is False
 assert getattr(widget_parameter, "hide", False) is False

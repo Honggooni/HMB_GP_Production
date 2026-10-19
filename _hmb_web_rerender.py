@@ -358,7 +358,8 @@ class OperationJournal:
 
 def request_fingerprint(payload: dict[str, Any]) -> str:
     """Exact v1 Broker canonical request; never hash credentials into evidence."""
-    ignored = {"client_request_id", "idempotency_key", "api_key", "access_token", "authorization"}
+    ignored = {"client_request_id", "idempotency_key", "api_key", "access_token", "authorization",
+               "hmb_generation_mode", "hmb_generation_task"}
     canonical = {key: value for key, value in payload.items() if str(key).lower() not in ignored}
     canonical["model"] = str(payload.get("model") or "")
     canonical["provider"] = "volcengine_ark"
@@ -740,7 +741,11 @@ class EngineWorker:
             return None
         readiness = node._hmb_web_rerender_readiness()
         own_busy = target_id in self.active
-        busy = own_busy or bool(agent._hmb_web_rerender_busy()) or not readiness.get("ready")
+        manager_api = getattr(agent, "_hmb_shot_manager_enabled", None)
+        agent_busy = (agent._hmb_web_rerender_busy(generator=node)
+                      if callable(manager_api) and manager_api()
+                      else agent._hmb_web_rerender_busy())
+        busy = own_busy or bool(agent_busy) or not readiness.get("ready")
         parent = await self._parent_task_id(node, origin)
         if parent:
             recorded_project = await asyncio.to_thread(_review.task_project, parent)

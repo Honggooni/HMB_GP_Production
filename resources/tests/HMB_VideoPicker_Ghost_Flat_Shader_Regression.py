@@ -53,6 +53,10 @@ class ShaderCommands:
         self.values = {}
         self.connections = {}
 
+    def ls(self, *args, **kwargs):
+        assert not args and kwargs == {"type": "objectSet", "long": True}
+        return [name for name, kind in self.nodes.items() if kind == "objectSet"]
+
     def objExists(self, name):
         return name.split(".", 1)[0] in self.nodes
 

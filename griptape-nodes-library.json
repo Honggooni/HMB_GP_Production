@@ -279,10 +279,10 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.8.2",
+    "library_version": "0.8.7",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
-      "archive_source_count": 43,
+      "archive_source_count": 44,
       "mode": "bundled_signed_dat",
       "runtime_path": "resources/agent/superwings12/hmb_agent_core.dat",
       "policy_version": "2026-10-15.agent-shot-quality.v7.0",
@@ -593,13 +593,13 @@
         "icon": "SlidersHorizontal",
         "group": "edit",
         "width": 980,
-        "height": 1040,
+        "height": 1091,
         "default_width": 980,
-        "default_height": 1040,
+        "default_height": 1091,
         "preferred_width": 980,
-        "preferred_height": 1040,
+        "preferred_height": 1091,
         "initial_width": 980,
-        "initial_height": 1040,
+        "initial_height": 1091,
         "min_width": 700,
         "min_height": 620,
         "resizable": true,
@@ -612,24 +612,24 @@
         ],
         "ui_options": {
           "width": 980,
-          "height": 1040,
+          "height": 1091,
           "default_width": 980,
-          "default_height": 1040,
+          "default_height": 1091,
           "preferred_width": 980,
-          "preferred_height": 1040,
+          "preferred_height": 1091,
           "initial_width": 980,
-          "initial_height": 1040,
+          "initial_height": 1091,
           "node_size": {
             "width": 980,
-            "height": 1040
+            "height": 1091
           },
           "default_size": {
             "width": 980,
-            "height": 1040
+            "height": 1091
           },
           "initial_size": {
             "width": 980,
-            "height": 1040
+            "height": 1091
           },
           "min_width": 700,
           "min_height": 620,
@@ -723,23 +723,23 @@
         "description": "Builds prompts from manual text and media settings.\nWorks alone or with optional Asset and Picker.",
         "display_name": "HMBPromptLibrary",
         "width": 1800,
-        "height": 1193,
+        "height": 1350,
         "default_width": 1800,
-        "default_height": 1193,
+        "default_height": 1350,
         "initial_width": 1800,
-        "initial_height": 1193,
+        "initial_height": 1350,
         "min_width": 760,
         "min_height": 1193,
         "resizable": true,
         "ui_options": {
           "width": 1800,
-          "height": 1193,
+          "height": 1350,
           "default_width": 1800,
-          "default_height": 1193,
+          "default_height": 1350,
           "initial_width": 1800,
-          "initial_height": 1193,
+          "initial_height": 1350,
           "preferred_width": 1800,
-          "preferred_height": 1193,
+          "preferred_height": 1350,
           "min_width": 760,
           "min_height": 1193,
           "resizable": true
@@ -789,7 +789,7 @@
     {
       "name": "HMBAgentLibraryWidget",
       "path": "widgets/HMBAgentLibraryWidget.js",
-      "description": "Compact HMBAgentLibrary header with an explicit standalone Only mode and a backend-verified selector containing only same-flow Prompt-owned Shots; native Agent controls and output behavior remain unchanged."
+      "description": "One Shot manager with up to five independently colored Agent panels for same-flow Prompt-owned Shots. Existing native Agent controls and per-Shot inputs, output behavior and connections are retained during workflow consolidation."
     },
     {
       "name": "HMBFinishLookLibraryWidget",

@@ -64,12 +64,18 @@ _AGENT_WIDGET_NAME = "HMBAgentLibraryWidget"
 _AGENT_WIDGET_LIBRARY_NAME = "HMB_GP_Production"
 _AGENT_WIDGET_PARAMETER = "HMB_AGENT_UI"
 _AGENT_WIDGET_HEIGHT = 64
+_AGENT_INITIAL_NODE_WIDTH = 720
+_AGENT_INITIAL_NODE_HEIGHT = 1100
 _AGENT_SHOT_CONTEXT_SCHEMA = "hmb-agent-shot-context"
 _AGENT_SHOT_CONTEXT_VERSION = 1
 _AGENT_STATE_WARNING_NAME = "HMB_AGENT_STATE_DISPLAY_WARNING"
 _HMB_POLICY_WARNING_NAME = "HMB_AGENT_POLICY_REQUIRED_WARNING"
 _HMB_TOPOLOGY_WARNING_NAME = "HMB_AGENT_CONNECTION_CHECK_WARNING"
 _AGENT_EXECUTION_RESULT_PARAMETER = "HMB_AGENT_EXECUTION_RESULT"
+_AGENT_SHOT_STORE_PARAMETER = "HMB_AGENT_SHOT_STATES"
+_AGENT_SHOT_STORE_SCHEMA = "hmb-agent-shot-states"
+_AGENT_SHOT_ROW_PREFIX = "HMB_AGENT_SHOT_ROW_"
+_AGENT_NATIVE_SETTING_KEYS = ("model_provider", "model", "agent", "include_details", "output_schema", "additional_context", "agent_memory", "prompt")
 _AGENT_EXECUTION_FAILED_WARNING = "HMB_AGENT_EXECUTION_FAILED_WARNING"
 _AGENT_CREATED_WARNING = "HMB_AGENT_CREATED_WARNING"
 _AGENT_PROJECT_POLICY_ABSENT_WARNING = "HMB_AGENT_PROJECT_POLICY_ABSENT_WARNING"
@@ -119,6 +125,8 @@ _PAIRED_PROMPT_SNAPSHOT_KEYS = frozenset({
     "machine_prompt",
 })
 _VERIFIED_PROMPT_SOURCE_ATTRIBUTE = "_hmb_verified_prompt_source_node"
+_REGISTERED_PROMPT_OWNER_ATTRIBUTE = "_hmb_registered_prompt_source_node"
+_FROZEN_PROMPT_SHOT_ATTRIBUTE = "_hmb_frozen_prompt_shot_source"
 
 _WEB_AUTHORITY_SEAL = object()
 _EXECUTION_GATE_GUARD = threading.Lock()
@@ -679,6 +687,7 @@ def _agent_widget_value(
     shot: dict[str, Any] | None = None,
     shot_catalog: Any = None,
     execution_phase: Any = "",
+    shot_manager: bool = True,
 ) -> dict[str, Any]:
     """Return display-only state. Internal policy text must never enter widget data."""
     shot_value = shot if isinstance(shot, dict) else {}
@@ -707,6 +716,8 @@ def _agent_widget_value(
         "policy_injection": "runtime_only",
         "output_sanitizer": True,
         "execution_phase": phase,
+        "shot_manager": bool(shot_manager),
+        "shot_editor_expanded": True,
         # Selector options are supplied only by the backend same-flow
         # reconciler. Browser-global discovery events never become authority.
         "shot_catalog": catalog,
@@ -722,7 +733,7 @@ def _agent_widget_value(
                 )[:128]
                 or f"Shot {shot_number}"
                 if bound
-                else "Only"
+                else "샷 선택"
             ),
         },
     }
@@ -731,6 +742,7 @@ def _agent_widget_value(
 def _configure_agent_widget_parameter(parameter: Any) -> None:
     if parameter is None:
         return
+    height = _AGENT_WIDGET_HEIGHT
     try:
         current = None
         try:
@@ -743,7 +755,7 @@ def _configure_agent_widget_parameter(parameter: Any) -> None:
         current_catalog = (
             current.get("shot_catalog") if isinstance(current, dict) else None
         )
-        parameter.default_value = _agent_widget_value(current_shot, current_catalog)
+        parameter.default_value = _agent_widget_value(current_shot, current_catalog, shot_manager=bool(current.get("shot_manager")) if isinstance(current, dict) else False)
     except Exception:
         pass
     try:
@@ -752,13 +764,13 @@ def _configure_agent_widget_parameter(parameter: Any) -> None:
             {
                 "display_name": "HMBAgentLibrary",
                 "is_full_width": True,
-                "height": _AGENT_WIDGET_HEIGHT,
-                "min_height": _AGENT_WIDGET_HEIGHT,
-                "max_height": _AGENT_WIDGET_HEIGHT,
-                "widget_height": _AGENT_WIDGET_HEIGHT,
-                "default_height": _AGENT_WIDGET_HEIGHT,
-                "preferred_height": _AGENT_WIDGET_HEIGHT,
-                "initial_height": _AGENT_WIDGET_HEIGHT,
+                "height": height,
+                "min_height": height,
+                "max_height": height,
+                "widget_height": height,
+                "default_height": height,
+                "preferred_height": height,
+                "initial_height": height,
                 # Griptape classifies every custom widget as an expandable row
                 # unless this is explicitly false. An expandable row consumes
                 # the node's remaining height even when the widget itself is
@@ -1002,6 +1014,52 @@ def _is_direct_hmb_prompt_library_connection(
         ) from exc
 
 
+class _FrozenHMBPromptShotSource:
+    """Read-only paired data from one verified registered Prompt manager."""
+    def __init__(self, owner, document, agent_subscription):
+        if not isinstance(document, dict) or document.get("schema") != "hmb-prompt-shot-document" or document.get("version") != 1:
+            raise RuntimeError("HMB Prompt Shot document is invalid.")
+        self._owner = owner
+        self._document = copy.deepcopy(document)
+        self._subscription = {**agent_subscription, "participant_kind": "prompt"}
+        supplied = self._document.get("subscription")
+        if not isinstance(supplied, dict) or any(supplied.get(key) != self._subscription.get(key) for key in ("schema", "version", "participant_kind", "enabled", "channel_uuid", "shot_uuid", "shot_number", "shot_name")):
+            raise RuntimeError("HMB Prompt Shot document identity is invalid.")
+        self.visible_prompt = self._document.get("visible_prompt")
+        self.machine_prompt = self._document.get("machine_prompt")
+        if not isinstance(self.visible_prompt, str) or not self.visible_prompt or not isinstance(self.machine_prompt, str) or not self.machine_prompt:
+            raise RuntimeError("HMB Prompt Shot document is empty.")
+        self._hmb_shot_route_status = {"ok": True, "code": "ready"}
+    def _hmb_shot_channel_subscription(self):
+        return copy.deepcopy(self._subscription)
+    def _hmb_agent_prompt_snapshot(self, visible_prompt):
+        if visible_prompt != self.visible_prompt:
+            raise RuntimeError("HMB Prompt visible snapshot changed.")
+        paired = copy.deepcopy(self._document.get("paired_snapshot"))
+        if not isinstance(paired, dict) or paired.get("machine_prompt") != self.machine_prompt:
+            raise RuntimeError("HMB Prompt paired snapshot is invalid.")
+        return paired
+    def _hmb_agent_shot_context(self, visible_prompt):
+        if visible_prompt != self.visible_prompt:
+            raise RuntimeError("HMB Prompt Shot context changed.")
+        return copy.deepcopy(self._document.get("shot_context") or self._document.get("context") or {})
+    def _hmb_agent_reference_media(self, machine_prompt):
+        if machine_prompt != self.machine_prompt:
+            raise RuntimeError("HMB Prompt media snapshot changed.")
+        return copy.deepcopy(self._document.get("reference_media") or {})
+    def _hmb_agent_generation_context(self, machine_prompt):
+        if machine_prompt != self.machine_prompt:
+            raise RuntimeError("HMB Prompt generation snapshot changed.")
+        return copy.deepcopy(self._document.get("generation_context") or {})
+    def _hmb_project_identity(self):
+        return resolve_project(self._document.get("project_identity"), default_legacy=False)
+
+
+def _is_prompt_shot_manager(source):
+    enabled = getattr(source, "_hmb_shot_manager_enabled", None)
+    return callable(enabled) and enabled() is True
+
+
 def _prompt_transport_text(prompt_value: Any) -> str:
     value = getattr(prompt_value, "value", prompt_value)
     return str(value or "")
@@ -1020,7 +1078,7 @@ def _with_english_agent_output_contract(final_prompt: Any) -> str:
     return _AGENT_ENGLISH_OUTPUT_CONTRACT
 
 
-def _run_native_with_literal_hmb_input(native_processor: Any, agent: Any, prompt: Any) -> Any:
+def _run_native_with_literal_hmb_input(native_processor: Any, agent: Any, prompt: Any, *native_args: Any) -> Any:
     """Keep the exact verified request literal at the native Task boundary.
 
     Standard PromptTask renders every TextArtifact as Jinja, including text
@@ -1053,7 +1111,7 @@ def _run_native_with_literal_hmb_input(native_processor: Any, agent: Any, prompt
     except (ImportError, AttributeError, IndexError, TypeError):
         pass
     if task is None:
-        return native_processor(agent, prompt)
+        return native_processor(agent, prompt, *native_args)
     run_started = False
     run_finished = False
 
@@ -1081,7 +1139,7 @@ def _run_native_with_literal_hmb_input(native_processor: Any, agent: Any, prompt
     listener = EventListener(observe_run, event_types=[StartStructureRunEvent, FinishStructureRunEvent])
     listener.__enter__()
     try:
-        return native_processor(agent, prompt)
+        return native_processor(agent, prompt, *native_args)
     finally:
         # EventBus uses context-local listener lists. Removing this listener
         # from the UI context leaves the native worker's copied context intact
@@ -1456,6 +1514,8 @@ class HMBAgentLibrary(_BaseAgent):
         # while the native Agent generator is synchronously consuming inputs.
         self._hmb_native_prompt_read_active = False
         self._hmb_verified_prompt_source_node = None
+        self._hmb_registered_prompt_source_node = None
+        self._hmb_frozen_prompt_shot_source = None
         self._hmb_native_calls_this_process = 0
         self._hmb_native_inference_started = False
         self._hmb_native_run_completed = False
@@ -1477,6 +1537,26 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_execution_result: dict[str, Any] = {}
         self._hmb_reference_observation: dict[str, Any] = {}
         self._hmb_reference_observation_run_id = ""
+        self._hmb_shot_manager_mode = True
+        self._hmb_shot_editor_expanded = True
+        self._hmb_native_editor_elements = []
+        self._hmb_native_editor_visibility = {}
+        self._hmb_native_editor_collapsed = False
+        self._hmb_row_syncing = False
+        self._hmb_layout_syncing = False
+        self._hmb_agent_migration_archives = {}
+        self._hmb_shot_slots: dict[str, Any] = {}
+        self._hmb_active_slot_key = "__hmb_only__"
+        self._hmb_slot_switching = False
+        self._hmb_shot_store_syncing = False
+        self._hmb_shot_execution_locks: dict[str, Any] = {}
+        self._hmb_shot_results: dict[str, Any] = {}
+        self._hmb_shot_request_records: dict[str, Any] = {}
+        self._hmb_shot_result_lock = threading.RLock()
+        self._hmb_shot_run_status = {}
+        self._hmb_shot_workers = {}
+        self._hmb_shot_action_ids = set()
+        self._hmb_shot_local_tasks = set()
         self._hmb_shot_context: dict[str, Any] = {}
         self._hmb_shot_catalog_snapshot: dict[str, Any] = {}
         # Instance-local execution authority.  Display widget writes and
@@ -1486,7 +1566,7 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_shot_route_status: dict[str, Any] = {}
         self._hmb_shot_clear_syncing = False
         self._hmb_shot_catalog_syncing = False
-        self._hmb_initial_shot_autoclaim_pending = True
+        self._hmb_initial_shot_autoclaim_pending = False
         self._hmb_initial_shot_preferred_uuid = ""
         # The router-owned SHOT_PROMPT_IN remains the only authoritative HMB
         # execution input.  These fields only mirror its public, user-readable
@@ -1496,6 +1576,12 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_prompt_preview_value = ""
         self._hmb_prompt_before_preview = ""
         super().__init__(**kwargs)
+        # Give newly created nodes room for the compact header, five Shot rows
+        # and the stock editor. The official SDK setter preserves saved sizes;
+        # this is a creation default, never a resize/hydration correction.
+        initial_size_setter = getattr(self, "set_initial_node_size", None)
+        if callable(initial_size_setter):
+            initial_size_setter(width=_AGENT_INITIAL_NODE_WIDTH, height=_AGENT_INITIAL_NODE_HEIGHT)
         self.category = "HMB_GP_Production"
         self.description = "HMBAgentLibrary"
         self._prepare_hmb_node_surface()
@@ -1521,6 +1607,802 @@ class HMBAgentLibrary(_BaseAgent):
         _ensure_hmb_topology_warning(self)
         _ensure_agent_widget(self)
         self._ensure_hmb_execution_result()
+        self._ensure_hmb_shot_store()
+        self._ensure_agent_shot_rows()
+
+    def _hmb_widget_value(self, shot=None, shot_catalog=None, execution_phase="", shot_manager=None):
+        value = _agent_widget_value(shot, shot_catalog, execution_phase,
+                                   getattr(self, "_hmb_shot_manager_mode", False) if shot_manager is None else shot_manager)
+        value["shot_editor_expanded"] = bool(getattr(self, "_hmb_shot_editor_expanded", True))
+        value["shot_states"] = {
+            key.split("\x1f", 1)[-1]: str(status)
+            for key, status in getattr(self, "_hmb_shot_run_status", {}).items()
+            if status in {"running", "succeeded", "failed", "cancelled"}
+        }
+        return value
+
+    @staticmethod
+    def _hmb_slot_key(channel_uuid="", shot_uuid=""):
+        return f"{channel_uuid}\x1f{shot_uuid}" if channel_uuid and shot_uuid else "__hmb_only__"
+
+    def _ensure_hmb_shot_store(self):
+        if not _parameter_exists(self, _AGENT_SHOT_STORE_PARAMETER):
+            self.add_parameter(Parameter(
+                name=_AGENT_SHOT_STORE_PARAMETER, type="dict", default_value={},
+                allowed_modes={ParameterMode.PROPERTY}, hide=True, hide_property=True,
+                hide_label=True, ui_options={"hide": True, "hide_property": True, "hide_handles": True},
+            ))
+        self._hmb_restore_shot_store()
+
+    def _hmb_restore_shot_store(self):
+        if getattr(self, "_hmb_shot_store_syncing", False):
+            return
+        raw = self._native_parameter_value(_AGENT_SHOT_STORE_PARAMETER, {})
+        if not isinstance(raw, dict) or raw.get("schema") != _AGENT_SHOT_STORE_SCHEMA or raw.get("version") != 1:
+            return
+        slots = raw.get("slots")
+        if not isinstance(slots, dict):
+            return
+        self._hmb_shot_slots = copy.deepcopy(slots)
+        self._hmb_shot_manager_mode = True
+        self._hmb_shot_editor_expanded = raw.get("editor_expanded", True) is not False
+        self._hmb_agent_migration_archives = copy.deepcopy(raw.get("migration_archives") or {})
+        self._hmb_active_slot_key = str(raw.get("active") or "__hmb_only__")
+        self._hmb_shot_results = copy.deepcopy(raw.get("results") or {})
+
+    def _hmb_persist_shot_store(self):
+        if getattr(self, "_hmb_shot_store_syncing", False) or getattr(self, "_hmb_node_deleted", False):
+            return
+        self._hmb_shot_store_syncing = True
+        try:
+            value = {"schema": _AGENT_SHOT_STORE_SCHEMA, "version": 1,
+                     "manager": True,
+                     "editor_expanded": bool(getattr(self, "_hmb_shot_editor_expanded", True)),
+                     "migration_archives": copy.deepcopy(getattr(self, "_hmb_agent_migration_archives", {})),
+                     "active": self._hmb_active_slot_key,
+                     "slots": copy.deepcopy(self._hmb_shot_slots),
+                     "results": copy.deepcopy(self._hmb_shot_results)}
+            current = self._native_parameter_value(_AGENT_SHOT_STORE_PARAMETER, {})
+            if current != value:
+                super().set_parameter_value(_AGENT_SHOT_STORE_PARAMETER, value)
+        finally:
+            self._hmb_shot_store_syncing = False
+
+    def _hmb_slot_list_children(self, name):
+        parameter = _parameter_by_name(self, name)
+        children = list(getattr(parameter, "children", []) or [])
+        slots = getattr(self, "_hmb_shot_slots", {})
+        known = set().union(*(set(slot.get("children", {})) for slot in slots.values() if isinstance(slot, dict))) if slots else set()
+        active = slots.get(getattr(self, "_hmb_active_slot_key", "__hmb_only__"), {})
+        active_names = set(active.get("children", {}))
+        return [child for child in children if str(getattr(child, "name", "")) in active_names or str(getattr(child, "name", "")) not in known]
+
+    def _hmb_slot_native_list_value(self, name):
+        parameter = _parameter_by_name(self, name)
+        connected = getattr(self, "_has_connected_whole_list_value", None)
+        if parameter is not None and callable(connected) and connected(parameter):
+            getter = getattr(super(), "get_parameter_list_value", None)
+            return getter(name) if callable(getter) else []
+        children = self._hmb_slot_list_children(name)
+        all_children = list(getattr(parameter, "children", []) or [])
+        if all_children:
+            values = []
+            for child in children:
+                value = self._native_parameter_value(str(child.name), None)
+                values.extend(value if isinstance(value, (list, tuple)) else [] if value is None else [value])
+            return values
+        getter = getattr(super(), "get_parameter_list_value", None)
+        return getter(name) if callable(getter) else []
+
+    def _hmb_native_slot_snapshot(self):
+        values = {}
+        for key in _AGENT_NATIVE_SETTING_KEYS:
+            values[key] = copy.deepcopy(self._native_parameter_value(key, None))
+        for key in ("tools", "rulesets"):
+            values[key] = copy.deepcopy(self._hmb_slot_native_list_value(key))
+        children = {}
+        for key in ("tools", "rulesets"):
+            parameter = _parameter_by_name(self, key)
+            for child in self._hmb_slot_list_children(key):
+                name = str(getattr(child, "name", "") or "")
+                if name:
+                    children[name] = copy.deepcopy(self._native_parameter_value(name, None))
+        outputs = copy.deepcopy({key: getattr(self, "parameter_output_values", {}).get(key,
+                    self._native_parameter_value(key, "")) for key in ("output", "logs", "agent")})
+        return {"values": values, "children": children, "outputs": outputs,
+                "result": copy.deepcopy(self._hmb_execution_result_snapshot())}
+
+    def _hmb_capture_active_slot(self):
+        if (getattr(self, "_hmb_slot_switching", False) or getattr(self, "_hmb_node_deleted", False)
+                or not _parameter_exists(self, _AGENT_SHOT_STORE_PARAMETER)):
+            return
+        self._hmb_shot_slots[self._hmb_active_slot_key] = self._hmb_native_slot_snapshot()
+        self._hmb_persist_shot_store()
+
+    def _hmb_switch_native_slot(self, channel_uuid="", shot_uuid=""):
+        target = self._hmb_slot_key(channel_uuid, shot_uuid)
+        if not _parameter_exists(self, _AGENT_SHOT_STORE_PARAMETER):
+            self._hmb_active_slot_key = target
+            return
+        if target == getattr(self, "_hmb_active_slot_key", "__hmb_only__") or getattr(self, "_hmb_slot_switching", False):
+            return
+        self._hmb_capture_active_slot()
+        template = self._hmb_shot_slots.get("__hmb_default_settings__")
+        if not isinstance(template, dict):
+            template = self._hmb_native_slot_snapshot()
+            template["values"]["prompt"] = ""
+            template["values"]["agent"] = None
+            template["values"]["agent_memory"] = {}
+            template["values"]["tools"] = []
+            template["values"]["rulesets"] = []
+            template["children"] = {}
+            template["outputs"] = {"output": "", "logs": "", "agent": None}
+            template["result"] = {}
+            self._hmb_shot_slots["__hmb_default_settings__"] = copy.deepcopy(template)
+        slot = copy.deepcopy(self._hmb_shot_slots.get(target, template))
+        self._hmb_slot_switching = True
+        try:
+            for key in _AGENT_NATIVE_SETTING_KEYS:
+                if key in slot.get("values", {}):
+                    super().set_parameter_value(key, copy.deepcopy(slot["values"][key]))
+            for key in ("tools", "rulesets"):
+                parameter = _parameter_by_name(self, key)
+                desired = slot.get("values", {}).get(key, [])
+                if parameter is not None:
+                    setter = getattr(self, "set_parameter_list_value", None)
+                    if callable(setter):
+                        setter(key, copy.deepcopy(desired))
+                    else:
+                        super().set_parameter_value(key, copy.deepcopy(desired))
+            for parent_name in ("tools", "rulesets"):
+                parameter = _parameter_by_name(self, parent_name)
+                for child in list(getattr(parameter, "children", []) or []):
+                    active_child = str(getattr(child, "name", "")) in slot.get("children", {})
+                    try:
+                        child.hide = not active_child
+                        child.hide_property = not active_child
+                    except Exception:
+                        pass
+            for key, value in slot.get("children", {}).items():
+                if _parameter_exists(self, key):
+                    super().set_parameter_value(key, copy.deepcopy(value))
+            for key, value in slot.get("outputs", {}).items():
+                if key != "agent":
+                    super().set_parameter_value(key, copy.deepcopy(value))
+                self.parameter_output_values[key] = copy.deepcopy(value)
+            self._hmb_execution_result = copy.deepcopy(slot.get("result") or {})
+            self.parameter_values[_AGENT_EXECUTION_RESULT_PARAMETER] = copy.deepcopy(self._hmb_execution_result)
+            self.parameter_output_values[_AGENT_EXECUTION_RESULT_PARAMETER] = copy.deepcopy(self._hmb_execution_result)
+            self._hmb_active_slot_key = target
+            self._hmb_prompt_preview_active = False
+            self._hmb_prompt_preview_value = ""
+            self._hmb_prompt_before_preview = str(slot.get("values", {}).get("prompt") or "")
+            self._refresh_hmb_execution_result_messages()
+        finally:
+            self._hmb_slot_switching = False
+        self._hmb_persist_shot_store()
+
+    def _hmb_shot_manager_enabled(self):
+        return bool(getattr(self, "_hmb_shot_manager_mode", False))
+
+    def _hmb_shot_manager_paused_for(self, *, channel_uuid, shot_uuid):
+        return False
+
+    def _hmb_agent_shot_subscriptions(self):
+        if not self._hmb_shot_manager_enabled():
+            value = self._hmb_shot_channel_subscription()
+            return [value] if value.get("enabled") else []
+        catalog = getattr(self, "_hmb_shot_catalog_snapshot", {})
+        channel = str(catalog.get("channel_uuid") or "")
+        return [{"schema": "hmb-shot-channel-subscription", "version": 1,
+                 "participant_kind": "agent", "enabled": True,
+                 "channel_uuid": channel, "shot_uuid": item["shot_uuid"],
+                 "shot_number": item["number"], "shot_name": item["name"]}
+                for item in catalog.get("shots", [])] if channel else []
+
+    def _hmb_manager_prompt_owner(self, *, channel_uuid, shot_uuid):
+        from _hmb_shot_routing import resolve_shot_prompt_owner
+        candidate = resolve_shot_prompt_owner(self, channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+        if not _is_direct_hmb_prompt_library_connection(self):
+            raise RuntimeError("Connect the registered HMB Prompt manager before running this Shot.")
+        if getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None) is not candidate:
+            raise RuntimeError("The exact Shot Prompt owner does not match the managed input.")
+        return candidate
+
+    def _hmb_agent_shot_result(self, *, channel_uuid, shot_uuid, run_id=None, generator=None):
+        key = self._hmb_slot_key(channel_uuid, shot_uuid)
+        with self._hmb_shot_result_lock:
+            if run_id is not None:
+                ticket = getattr(self, "_hmb_shot_request_records", {}).get(str(run_id))
+                if (not isinstance(ticket, dict) or generator is None or ticket.get("generator") is not generator
+                        or ticket.get("key") != key):
+                    return {}
+                return copy.deepcopy(ticket["record"])
+            return copy.deepcopy(self._hmb_shot_results.get(key) or {})
+
+    def _hmb_release_agent_shot_result(self, *, channel_uuid, shot_uuid, run_id, generator):
+        key = self._hmb_slot_key(channel_uuid, shot_uuid)
+        with self._hmb_shot_result_lock:
+            tickets = getattr(self, "_hmb_shot_request_records", {})
+            ticket = tickets.get(str(run_id))
+            if isinstance(ticket, dict) and ticket.get("generator") is generator and ticket.get("key") == key:
+                tickets.pop(str(run_id), None)
+                return True
+            return False
+
+    def _hmb_publish_shot_status(self):
+        if getattr(self, "_hmb_node_deleted", False):
+            return
+        raw = self._native_parameter_value(_AGENT_WIDGET_PARAMETER, {})
+        if not isinstance(raw, dict):
+            return
+        value = self._hmb_widget_value(raw.get("shot"), raw.get("shot_catalog"), raw.get("execution_phase", ""))
+        if value != raw:
+            self._hmb_execution_phase_syncing = True
+            try:
+                self.set_parameter_value(_AGENT_WIDGET_PARAMETER, value)
+            finally:
+                self._hmb_execution_phase_syncing = False
+
+    def _hmb_publish_shot_failure(self, key, execution, *, cancelled=False):
+        getter = getattr(execution, "_hmb_execution_result_snapshot", None)
+        previous = getter() if callable(getter) else {}
+        if not isinstance(previous, dict):
+            previous = {}
+        code = "CANCELLED" if cancelled else str(previous.get("code") or "SOURCE_UNAVAILABLE")
+        message = ("[HMB EXECUTION CANCELLED] This Shot Agent was cancelled. No new render was submitted."
+                   if cancelled else str(previous.get("message") or _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE))
+        result = {**previous, "status": "failed", "code": code, "message": message,
+                  "run_id": str(previous.get("run_id") or secrets.token_hex(16)),
+                  "output_sha256": _prompt_text_sha256(message)}
+        slot = self._hmb_shot_slots.get(key)
+        if not isinstance(slot, dict):
+            slot = {"values": {}, "children": {}}
+        slot["result"] = copy.deepcopy(result)
+        slot["outputs"] = {"output": message, "logs": "", "agent": {}}
+        self._hmb_shot_slots[key] = slot
+        if self._hmb_active_slot_key == key and not self._hmb_node_deleted:
+            self._hmb_slot_switching = True
+            try:
+                super().set_parameter_value("output", message)
+                self.parameter_output_values["output"] = message
+                self._hmb_execution_result = copy.deepcopy(result)
+                self.parameter_values[_AGENT_EXECUTION_RESULT_PARAMETER] = copy.deepcopy(result)
+                self.parameter_output_values[_AGENT_EXECUTION_RESULT_PARAMETER] = copy.deepcopy(result)
+                self._refresh_hmb_execution_result_messages()
+            finally:
+                self._hmb_slot_switching = False
+        self._hmb_persist_shot_store()
+
+    async def _hmb_run_agent_shot(self, *, channel_uuid, shot_uuid, prompt_owner, generator=None):
+        lifecycle_generation = int(getattr(self, "_hmb_lifecycle_generation", 0) or 0)
+        if not self._hmb_lifecycle_is_live(lifecycle_generation):
+            raise asyncio.CancelledError()
+        if not self._hmb_shot_manager_enabled():
+            raise RuntimeError("Agent Shot manager is not enabled.")
+        if self._hmb_manager_prompt_owner(channel_uuid=channel_uuid, shot_uuid=shot_uuid) is not prompt_owner:
+            raise RuntimeError("Agent Shot Prompt owner changed.")
+        subscriptions = self._hmb_agent_shot_subscriptions()
+        matches = [item for item in subscriptions if item["channel_uuid"] == channel_uuid and item["shot_uuid"] == shot_uuid]
+        if len(matches) != 1:
+            raise RuntimeError("Agent Shot identity is unavailable.")
+        subscription = copy.deepcopy(matches[0])
+        key = self._hmb_slot_key(channel_uuid, shot_uuid)
+        lock = self._hmb_shot_execution_locks.setdefault(key, threading.Lock())
+        while not lock.acquire(blocking=False):
+            if (not self._hmb_lifecycle_is_live(lifecycle_generation)
+                    or (generator is not None and bool(getattr(generator, "is_cancellation_requested", False)))):
+                raise asyncio.CancelledError()
+            await asyncio.sleep(0.05)
+        execution = None
+        try:
+            if not self._hmb_lifecycle_is_live(lifecycle_generation):
+                raise asyncio.CancelledError()
+            if self._hmb_active_slot_key == key:
+                self._hmb_capture_active_slot()
+            slot = copy.deepcopy(self._hmb_shot_slots.get(key) or self._hmb_shot_slots.get("__hmb_default_settings__") or self._hmb_native_slot_snapshot())
+            document = prompt_owner._hmb_prompt_shot_document(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+            execution = _HMBAgentShotExecution._from_owner(self, prompt_owner, document, subscription, slot, generator)
+            self._hmb_shot_run_status[key] = "running"
+            self._hmb_shot_workers[key] = execution
+            self._hmb_publish_shot_status()
+            # Reuse the complete canonical policy, model, media and sanitization
+            # pipeline; only frozen native input getters differ from the editor.
+            await execution._hmb_aprocess_locked()
+            if not self._hmb_lifecycle_is_live(lifecycle_generation):
+                # A replacement node can reuse the same visible name. A late
+                # worker belongs to its old instance and must not publish a
+                # result/ticket or a cancellation banner into that lifecycle.
+                raise asyncio.CancelledError()
+            result = execution._hmb_execution_result_snapshot()
+            text = execution.parameter_output_values.get("output")
+            record = {"text": str(text or ""), "result": copy.deepcopy(result),
+                      "observation": execution._hmb_agent_reference_observation_snapshot(),
+                      "policy_identity": copy.deepcopy(execution._hmb_shot_policy_identity),
+                      "shot": copy.deepcopy(subscription)}
+            if result.get("status") != "succeeded":
+                raise RuntimeError(str(result.get("message") or "Agent Shot execution failed."))
+            if result.get("output_sha256") != _prompt_text_sha256(record["text"]):
+                raise RuntimeError("Agent Shot result identity is invalid.")
+            with self._hmb_shot_result_lock:
+                self._hmb_shot_results[key] = copy.deepcopy(record)
+            # Editing another Shot or changing this Shot's future settings
+            # must not be overwritten by the completed input snapshot.
+            slot = copy.deepcopy(self._hmb_shot_slots.get(key) or slot)
+            slot["outputs"] = {name: copy.deepcopy(execution.parameter_output_values.get(name)) for name in ("output", "logs", "agent")}
+            slot["result"] = copy.deepcopy(result)
+            self._hmb_shot_slots[key] = slot
+            self._hmb_shot_run_status[key] = "succeeded"
+            if self._hmb_active_slot_key == key and not self._hmb_node_deleted:
+                self._hmb_slot_switching = True
+                try:
+                    for name, value in slot["outputs"].items():
+                        if name != "agent":
+                            super().set_parameter_value(name, copy.deepcopy(value))
+                        self.parameter_output_values[name] = copy.deepcopy(value)
+                    self._hmb_execution_result = copy.deepcopy(result)
+                    self.parameter_values[_AGENT_EXECUTION_RESULT_PARAMETER] = copy.deepcopy(result)
+                    self.parameter_output_values[_AGENT_EXECUTION_RESULT_PARAMETER] = copy.deepcopy(result)
+                    self._refresh_hmb_execution_result_messages()
+                finally:
+                    self._hmb_slot_switching = False
+            self._hmb_persist_shot_store()
+            if generator is not None:
+                with self._hmb_shot_result_lock:
+                    tickets = getattr(self, "_hmb_shot_request_records", None)
+                    if tickets is None:
+                        tickets = self._hmb_shot_request_records = {}
+                    tickets[str(result["run_id"])] = {"key": key, "generator": generator, "record": copy.deepcopy(record)}
+            return copy.deepcopy(record)
+        except asyncio.CancelledError:
+            if self._hmb_lifecycle_is_live(lifecycle_generation):
+                self._hmb_shot_run_status[key] = "cancelled"
+                with self._hmb_shot_result_lock:
+                    self._hmb_shot_results.pop(key, None)
+                self._hmb_publish_shot_failure(key, execution, cancelled=True)
+            raise
+        except Exception:
+            if not self._hmb_lifecycle_is_live(lifecycle_generation):
+                raise asyncio.CancelledError() from None
+            self._hmb_shot_run_status[key] = "failed"
+            # A failed new run must not leave the previous successful text as
+            # an admissible result for this new Generator execution.
+            with self._hmb_shot_result_lock:
+                self._hmb_shot_results.pop(key, None)
+            self._hmb_publish_shot_failure(key, execution)
+            raise
+        finally:
+            if execution is not None:
+                execution._hmb_shot_cancelled = True
+                execution._clear_hmb_runtime_policy()
+                execution.parameter_values.clear()
+                execution.parameter_output_values.clear()
+            self._hmb_shot_workers.pop(key, None)
+            self._hmb_publish_shot_status()
+            lock.release()
+
+    def _hmb_handle_shot_action(self, action):
+        if not isinstance(action, dict) or not self._hmb_shot_manager_enabled():
+            return
+        request_id = str(action.get("request_id") or "")
+        if not re.fullmatch(r"[0-9a-f]{32}", request_id) or request_id in self._hmb_shot_action_ids:
+            return
+        self._hmb_shot_action_ids.add(request_id)
+        if len(self._hmb_shot_action_ids) > 256:
+            self._hmb_shot_action_ids = {request_id}
+        selected = self._hmb_shot_channel_subscription()
+        channel, shot = selected.get("channel_uuid"), selected.get("shot_uuid")
+        if not channel or not shot:
+            return
+        key = self._hmb_slot_key(channel, shot)
+        if action.get("kind") == "cancel_selected":
+            worker = self._hmb_shot_workers.get(key)
+            if worker is not None:
+                worker._hmb_shot_cancelled = True
+            return
+        if action.get("kind") != "run_selected" or key in self._hmb_shot_workers:
+            return
+        owner = self._hmb_manager_prompt_owner(channel_uuid=channel, shot_uuid=shot)
+        try:
+            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+            from griptape_nodes.retained_mode.engine import engine_scope
+            engine = GriptapeNodes.get_instance()
+            loop = engine.event_manager.event_loop
+            if loop is None or loop.is_closed() or not loop.is_running():
+                raise RuntimeError("engine_loop_unavailable")
+        except Exception:
+            self._hmb_shot_run_status[key] = "failed"
+            self._set_hmb_execution_result("failed", code="ENGINE_LOOP_UNAVAILABLE",
+                message="The Griptape execution loop is unavailable. Reopen this node in the running engine before Run Shot.")
+            self._hmb_publish_shot_status()
+            return
+        async def run():
+            with engine_scope(engine):
+                try:
+                    if engine.node_manager.get_node_by_name(self.name) is not self:
+                        return
+                    await self._hmb_run_agent_shot(channel_uuid=channel, shot_uuid=shot, prompt_owner=owner)
+                except (Exception, asyncio.CancelledError):
+                    pass  # Bounded per-Shot failure state is already published.
+        future = asyncio.run_coroutine_threadsafe(run(), loop)
+        self._hmb_shot_local_tasks.add(future)
+        future.add_done_callback(self._hmb_shot_local_tasks.discard)
+
+    def _ensure_agent_shot_rows(self):
+        root = getattr(self, "root_ui_element", None)
+        children = list(getattr(root, "children", []) or [])
+        if not getattr(self, "_hmb_native_editor_elements", None):
+            header_index = next((index for index, item in enumerate(children) if getattr(item, "name", "") == _AGENT_WIDGET_PARAMETER), len(children))
+            self._hmb_native_editor_elements = [item for item in children[header_index + 1:]
+                if (not str(getattr(item, "name", "")).startswith(("HMB_", "SHOT_"))
+                    or getattr(item, "name", "") in {_AGENT_EXECUTION_FAILED_WARNING, _AGENT_CREATED_WARNING,
+                        _AGENT_PROJECT_POLICY_ABSENT_WARNING, _HMB_POLICY_WARNING_NAME, _HMB_TOPOLOGY_WARNING_NAME})]
+        for number in range(1, 6):
+            name = _AGENT_SHOT_ROW_PREFIX + str(number)
+            if _parameter_exists(self, name):
+                continue
+            options = {"is_full_width": True, "height": 42, "min_height": 42, "max_height": 42,
+                "widget_height": 42, "default_height": 42, "preferred_height": 42, "initial_height": 42,
+                "expandable": False, "resizable": False, "compact": True, "hide_handles": True}
+            kwargs = {"name": name, "type": "dict", "default_value": {}, "allowed_modes": {ParameterMode.PROPERTY},
+                "hide": True, "hide_property": True, "hide_label": True, "ui_options": options}
+            if Widget is not None:
+                kwargs["traits"] = {Widget(name=_AGENT_WIDGET_NAME, library=_AGENT_WIDGET_LIBRARY_NAME)}
+            self.add_parameter(Parameter(**kwargs))
+        self._hmb_layout_shot_editor()
+
+    def _hmb_layout_shot_editor(self, *, restored_catalog=None):
+        if getattr(self, "_hmb_layout_syncing", False) or getattr(self, "_hmb_node_deleted", False):
+            return
+        root = getattr(self, "root_ui_element", None)
+        if root is None or not getattr(self, "_hmb_native_editor_elements", None):
+            return
+        self._hmb_layout_syncing = True
+        try:
+            raw = self._native_parameter_value(_AGENT_WIDGET_PARAMETER, {})
+            selected = raw.get("shot", {}) if isinstance(raw, dict) else {}
+            catalog = getattr(self, "_hmb_shot_catalog_snapshot", {})
+            if not catalog and restored_catalog is not None:
+                # Initial-setup values can arrive after the registered hydration
+                # callback, before live Source discovery. Saved rows may place
+                # the one SDK-owned body, but never become routing authority.
+                saved = _agent_widget_shot_catalog(restored_catalog)
+                if (saved and saved.get("channel_uuid") == selected.get("channel_uuid")
+                        and any(item["shot_uuid"] == selected.get("shot_uuid")
+                                for item in saved["shots"])):
+                    catalog = saved
+            rows = {int(item["number"]): item for item in catalog.get("shots", []) if isinstance(item, dict)}
+            selected_uuid = str(selected.get("shot_uuid") or "")
+            expanded = bool(selected_uuid and getattr(self, "_hmb_shot_editor_expanded", True))
+            body = list(self._hmb_native_editor_elements)
+            if not expanded and not self._hmb_native_editor_collapsed:
+                self._hmb_native_editor_visibility = {str(item.name): bool((getattr(item, "ui_options", {}) or {}).get("hide", getattr(item, "hide", False))) for item in body}
+            for item in body:
+                options = dict(getattr(item, "ui_options", {}) or {})
+                hidden = True if not expanded else self._hmb_native_editor_visibility.get(str(item.name), options.get("hide", False))
+                if bool(options.get("hide", False)) != bool(hidden):
+                    updater = getattr(item, "update_ui_options_key", None)
+                    if callable(updater):
+                        updater("hide", bool(hidden))
+                    else:
+                        item.ui_options = {**options, "hide": bool(hidden)}
+            self._hmb_native_editor_collapsed = not expanded
+            # Each row is a tiny SDK widget. Native controls stay one SDK-owned
+            # set, immediately after the expanded row, with their original IDs.
+            current = list(getattr(root, "children", []) or [])
+            row_elements = []
+            for number in range(1, 6):
+                parameter = _parameter_by_name(self, _AGENT_SHOT_ROW_PREFIX + str(number))
+                if parameter is None:
+                    continue
+                shot = rows.get(number)
+                visible = shot is not None
+                if bool((getattr(parameter, "ui_options", {}) or {}).get("hide", False)) == visible:
+                    parameter.update_ui_options_key("hide", not visible)
+                if getattr(parameter, "hide_property", False) == visible:
+                    parameter.hide_property = not visible
+                value = ({"schema": "hmb-agent-shot-row", "version": 1,
+                    "shot": {"channel_uuid": catalog.get("channel_uuid", ""), **shot},
+                    "selected": selected_uuid == shot["shot_uuid"],
+                    "expanded": bool(expanded and selected_uuid == shot["shot_uuid"]),
+                    "request_id": getattr(self, "_hmb_row_action_ack", {}).get(self._hmb_slot_key(catalog.get("channel_uuid"), shot["shot_uuid"]), ""),
+                    "status": self._hmb_shot_run_status.get(self._hmb_slot_key(catalog.get("channel_uuid"), shot["shot_uuid"]), "")}
+                    if shot else {"schema": "hmb-agent-shot-row", "version": 1, "shot": {}, "selected": False, "expanded": False, "status": ""})
+                if self._native_parameter_value(parameter.name, {}) != value:
+                    self._hmb_row_syncing = True
+                    try:
+                        self.set_parameter_value(parameter.name, value)
+                    finally:
+                        self._hmb_row_syncing = False
+                row_elements.append(parameter)
+            header = _parameter_by_name(self, _AGENT_WIDGET_PARAMETER)
+            excluded = {id(item) for item in body + row_elements + ([header] if header else [])}
+            before_header = current[:current.index(header)] if header in current else []
+            prefix = [item for item in before_header if id(item) not in excluded]
+            trailing = [item for item in current if id(item) not in excluded and item not in prefix]
+            ordered = prefix + ([header] if header else [])
+            inserted = False
+            for row in row_elements:
+                ordered.append(row)
+                row_value = self._native_parameter_value(row.name, {})
+                if row_value.get("selected"):
+                    ordered.extend(body)
+                    inserted = True
+            if not inserted:
+                ordered.extend(body)
+            ordered.extend(trailing)
+            if [id(item) for item in ordered] != [id(item) for item in current]:
+                reorder = getattr(self, "reorder_elements", None)
+                if callable(reorder):
+                    reorder([item.name for item in ordered])
+                elif isinstance(getattr(root, "children", None), list):
+                    root.children[:] = ordered
+        finally:
+            self._hmb_layout_syncing = False
+
+    def _set_parameter_visibility(self, names, *, visible):
+        collapsed = bool(getattr(self, "_hmb_native_editor_collapsed", False))
+        values = [names] if isinstance(names, str) else list(names)
+        body_names = {str(item.name) for item in getattr(self, "_hmb_native_editor_elements", [])}
+        parent = getattr(super(), "_set_parameter_visibility", None)
+        for name in values:
+            if collapsed and name in body_names:
+                self._hmb_native_editor_visibility[name] = not visible
+                if callable(parent):
+                    parent(name, visible=False)
+            elif callable(parent):
+                parent(name, visible=visible)
+
+    def _set_message_visibility(self, names, *, visible):
+        collapsed = bool(getattr(self, "_hmb_native_editor_collapsed", False))
+        values = [names] if isinstance(names, str) else list(names)
+        body_names = {str(item.name) for item in getattr(self, "_hmb_native_editor_elements", [])}
+        parent = getattr(super(), "_set_message_visibility", None)
+        for name in values:
+            if collapsed and name in body_names:
+                self._hmb_native_editor_visibility[name] = not visible
+                if callable(parent):
+                    parent(name, visible=False)
+            elif callable(parent):
+                parent(name, visible=visible)
+
+    def _hmb_handle_row_action(self, parameter, value):
+        if getattr(self, "_hmb_row_syncing", False) or not isinstance(value, dict):
+            return
+        action = value.get("action")
+        if not isinstance(action, dict) or action.get("kind") not in {"select", "run_selected", "cancel_selected", "refresh"}:
+            return
+        request_id = str(action.get("request_id") or "")
+        if not re.fullmatch(r"[0-9a-f]{32}", request_id):
+            return
+        if action["kind"] == "select" and request_id in self._hmb_shot_action_ids:
+            self._hmb_layout_shot_editor()
+            return
+        catalog = getattr(self, "_hmb_shot_catalog_snapshot", {})
+        requested = value.get("shot", {})
+        exact = [item for item in catalog.get("shots", []) if item.get("shot_uuid") == requested.get("shot_uuid")
+            and _AGENT_SHOT_ROW_PREFIX + str(item.get("number")) == parameter.name]
+        if len(exact) != 1 or requested.get("channel_uuid") != catalog.get("channel_uuid"):
+            raise RuntimeError("Agent Shot row identity is unavailable.")
+        if action["kind"] == "refresh":
+            # Read the current editor, even if the missing action never applied.
+            # No slot selection, input mutation, model or Run is replayed.
+            if not hasattr(self, "_hmb_row_action_ack"):
+                self._hmb_row_action_ack = {}
+            self._hmb_row_action_ack[self._hmb_slot_key(catalog["channel_uuid"], exact[0]["shot_uuid"])] = request_id
+            self._hmb_layout_shot_editor()
+            return
+        if action["kind"] == "select":
+            self._hmb_shot_action_ids.add(request_id)
+            if len(self._hmb_shot_action_ids) > 256:
+                self._hmb_shot_action_ids = {request_id}
+            self._hmb_legacy_saved_widget_value = None
+        raw = self._native_parameter_value(_AGENT_WIDGET_PARAMETER, {})
+        current = raw.get("shot", {}) if isinstance(raw, dict) else {}
+        shot = exact[0]
+        same = current.get("shot_uuid") == shot["shot_uuid"] and current.get("channel_uuid") == catalog["channel_uuid"]
+        next_value = self._hmb_widget_value({"channel_uuid": catalog["channel_uuid"], **shot}, catalog)
+        next_value["shot_editor_expanded"] = (
+            action["expanded"] if action["kind"] == "select" and type(action.get("expanded")) is bool
+            else not self._hmb_shot_editor_expanded if same and action["kind"] == "select" else True)
+        if action["kind"] != "select":
+            next_value["action"] = {"kind": action["kind"], "request_id": request_id}
+        self.set_parameter_value(_AGENT_WIDGET_PARAMETER, next_value)
+        # A transport promise is not proof that the native editor switched.
+        # Publish this acknowledgement only after its exact Shot action applied.
+        if not hasattr(self, "_hmb_row_action_ack"):
+            self._hmb_row_action_ack = {}
+        self._hmb_row_action_ack[self._hmb_slot_key(catalog["channel_uuid"], shot["shot_uuid"])] = request_id
+        self._hmb_layout_shot_editor()
+
+    @staticmethod
+    def _hmb_authoring_digest(value):
+        try:
+            encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Agent migration contains unsupported live values; the original node must be kept.") from exc
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _hmb_capture_saved_parameter_value(self, name, value, *, is_output=False):
+        """Record raw saved identity before SDK value normalization; no UI work."""
+        if is_output:
+            return
+        normalized_name = self._publication_parameter_name(name)
+        if normalized_name == _AGENT_SHOT_PROMPT_INPUT_PARAMETER.casefold():
+            if isinstance(getattr(value, "value", value), str) and str(getattr(value, "value", value) or "").strip():
+                # Serialized Prompt edges can hydrate before the unique Prompt
+                # manager exists. Unready projection is not a user disconnect.
+                self._hmb_prompt_preview_hydration_pending = True
+            return
+        if not isinstance(value, dict):
+            return
+        if normalized_name == _AGENT_SHOT_STORE_PARAMETER.casefold() and value.get("schema") == _AGENT_SHOT_STORE_SCHEMA and value.get("version") == 1 and isinstance(value.get("slots"), dict):
+            self._hmb_loaded_durable_shot_store = True
+        elif normalized_name == _AGENT_WIDGET_PARAMETER.casefold() and value.get("shot_manager") is not True:
+            self._hmb_legacy_saved_widget_value = copy.deepcopy(value)
+
+    def _hmb_export_agent_authoring_state(self):
+        slot = self._hmb_native_slot_snapshot()
+        slots = copy.deepcopy(getattr(self, "_hmb_shot_slots", {}))
+        subscription = copy.deepcopy(self._hmb_shot_channel_subscription())
+        legacy_widget = getattr(self, "_hmb_legacy_saved_widget_value", None)
+        if isinstance(legacy_widget, dict):
+            legacy_shot = legacy_widget.get("shot") or {}
+            channel = str(legacy_shot.get("channel_uuid") or "")
+            shot_uuid = str(legacy_shot.get("shot_uuid") or "")
+            subscription.update(enabled=bool(channel and shot_uuid), channel_uuid=channel,
+                shot_uuid=shot_uuid, shot_number=int(legacy_shot.get("number") or 1),
+                shot_name=str(legacy_shot.get("name") or ""))
+            if not getattr(self, "_hmb_loaded_durable_shot_store", False):
+                # Pre-manager files had one native authoring body. Any slots
+                # created while loading their new editor are presentation
+                # defaults, not additional authored Shots.
+                slots = {}
+        active = self._hmb_slot_key(subscription.get("channel_uuid"), subscription.get("shot_uuid"))
+        slots[active] = copy.deepcopy(slot)
+        children = {}
+        for parent_name in ("tools", "rulesets"):
+            parent = _parameter_by_name(self, parent_name)
+            children[parent_name] = [{"name": str(child.name),
+                "ui_options": copy.deepcopy(getattr(child, "ui_options", {}) or {}),
+                "input_types": list(getattr(child, "input_types", []) or []),
+                "type": getattr(child, "type", None),
+                "allowed_modes": [str(getattr(mode, "value", mode)) for mode in (getattr(child, "allowed_modes", []) or [])],
+                "default_value": copy.deepcopy(getattr(child, "default_value", None))}
+                for child in list(getattr(parent, "children", []) or [])]
+        data = {"schema": "hmb-agent-authoring-export", "version": 1, "source_node": str(self.name),
+            "active_subscription": subscription, "active_slot_key": active, "native_slot": copy.deepcopy(slot),
+            "slots": slots, "results": ({} if isinstance(legacy_widget, dict) and not getattr(self, "_hmb_loaded_durable_shot_store", False)
+                else copy.deepcopy(getattr(self, "_hmb_shot_results", {}))),
+            "child_parameters": children,
+            "archives": copy.deepcopy(getattr(self, "_hmb_agent_migration_archives", {})),
+            "legacy_widget": copy.deepcopy(legacy_widget),
+            "loaded_durable_shot_store": bool(getattr(self, "_hmb_loaded_durable_shot_store", False)),
+            "private_cache": {
+                "slots": copy.deepcopy(getattr(self, "_hmb_shot_slots", {})),
+                "results": copy.deepcopy(getattr(self, "_hmb_shot_results", {})),
+                "archives": copy.deepcopy(getattr(self, "_hmb_agent_migration_archives", {})),
+                "active_slot_key": str(getattr(self, "_hmb_active_slot_key", "__hmb_only__")),
+                "legacy_widget": copy.deepcopy(legacy_widget),
+                "loaded_durable_shot_store": bool(getattr(self, "_hmb_loaded_durable_shot_store", False))},
+            "request_records": [copy.deepcopy(ticket["record"]) for ticket in getattr(self, "_hmb_shot_request_records", {}).values()]}
+        data["digest"] = self._hmb_authoring_digest(data)
+        return data
+
+    def _hmb_restore_agent_authoring_state(self, exported):
+        """Restore migration rollback caches after SDK restores native state."""
+        if not isinstance(exported, dict) or exported.get("schema") != "hmb-agent-authoring-export" or exported.get("version") != 1:
+            raise RuntimeError("Agent rollback document is invalid.")
+        document = copy.deepcopy(exported)
+        digest = str(document.pop("digest", ""))
+        if not hmac.compare_digest(digest, self._hmb_authoring_digest(document)):
+            raise RuntimeError("Agent rollback document digest does not match.")
+        cache = document.get("private_cache")
+        if not isinstance(cache, dict) or any(not isinstance(cache.get(key), dict) for key in ("slots", "results", "archives")):
+            raise RuntimeError("Agent rollback private state is invalid.")
+        self._hmb_shot_slots = cache["slots"]
+        self._hmb_shot_results = cache["results"]
+        self._hmb_agent_migration_archives = cache["archives"]
+        self._hmb_active_slot_key = str(cache.get("active_slot_key") or "__hmb_only__")
+        self._hmb_legacy_saved_widget_value = cache.get("legacy_widget")
+        self._hmb_loaded_durable_shot_store = cache.get("loaded_durable_shot_store") is True
+        return True
+
+    def _hmb_import_agent_authoring_state(self, exported, *, source_alias=None):
+        if not isinstance(exported, dict) or exported.get("schema") != "hmb-agent-authoring-export" or exported.get("version") != 1:
+            raise RuntimeError("Agent migration document is invalid.")
+        document = copy.deepcopy(exported)
+        digest = str(document.pop("digest", ""))
+        if not hmac.compare_digest(digest, self._hmb_authoring_digest(document)):
+            raise RuntimeError("Agent migration document digest does not match.")
+        source = str(source_alias or document.get("source_node") or "").strip()
+        if not source or not isinstance(document.get("slots"), dict) or not isinstance(document.get("results"), dict):
+            raise RuntimeError("Agent migration source identity is invalid.")
+        slots = copy.deepcopy(getattr(self, "_hmb_shot_slots", {}))
+        results = copy.deepcopy(getattr(self, "_hmb_shot_results", {}))
+        archives = copy.deepcopy(getattr(self, "_hmb_agent_migration_archives", {}))
+        aliases = {}
+        planned_children = []
+        for parent_name, specifications in document.get("child_parameters", {}).items():
+            if parent_name not in {"tools", "rulesets"} or not isinstance(specifications, list):
+                raise RuntimeError("Agent migration native child definition is invalid.")
+            parent = _parameter_by_name(self, parent_name)
+            if parent is None:
+                raise RuntimeError("Agent migration native list is unavailable.")
+            for specification in specifications:
+                name = str(specification.get("name") or "")
+                if not name or any(char.isspace() for char in name):
+                    raise RuntimeError("Agent migration native child name is invalid.")
+                existing = _parameter_by_name(self, name)
+                target = name
+                if existing is not None:
+                    if str(getattr(existing, "parent_container_name", "")) == parent_name and source == self.name:
+                        aliases[name] = name
+                        continue
+                    target = parent_name + "_HMBMigration_" + hashlib.sha256((source + "\x1f" + name).encode("utf-8")).hexdigest()[:20]
+                    existing = _parameter_by_name(self, target)
+                    if existing is not None:
+                        if str(getattr(existing, "parent_container_name", "")) != parent_name:
+                            raise RuntimeError("Agent migration native child identity conflicts.")
+                        aliases[name] = target
+                        continue
+                aliases[name] = target
+                planned_children.append((parent, target, specification))
+        def remap_slot(slot):
+            if not isinstance(slot, dict):
+                raise RuntimeError("Agent migration Shot settings are invalid.")
+            result = copy.deepcopy(slot)
+            result["children"] = {aliases.get(name, name): value for name, value in (result.get("children") or {}).items()}
+            return result
+        for key, value in document["slots"].items():
+            if "\x1f" not in str(key):
+                continue
+            incoming = remap_slot(value)
+            if key in slots and slots[key] != incoming:
+                raise RuntimeError("Two Agents contain different settings for the same Shot; both originals must be kept.")
+            slots[key] = incoming
+        for key, value in document["results"].items():
+            if key in results and results[key] != value:
+                raise RuntimeError("Two Agents contain different results for the same Shot; both originals must be kept.")
+            results[key] = copy.deepcopy(value)
+        # Unbound/old independent content is preserved without executing it.
+        archive = {"native_slot": remap_slot(document["native_slot"]),
+            "unbound_slots": {key: remap_slot(value) for key, value in document["slots"].items() if "\x1f" not in str(key)},
+            "source_archives": copy.deepcopy(document.get("archives") or {}),
+            "request_records": copy.deepcopy(document.get("request_records") or []),
+            "legacy_widget": copy.deepcopy(document.get("legacy_widget")), "source_digest": digest}
+        if source in archives and archives[source] != archive:
+            raise RuntimeError("Agent migration archive already contains different original data.")
+        archives[source] = archive
+        before = (self._hmb_shot_slots, self._hmb_shot_results, self._hmb_agent_migration_archives,
+            copy.deepcopy(dict(self.parameter_values)), copy.deepcopy(dict(self.parameter_output_values)))
+        added = []
+        self._hmb_slot_switching = True
+        try:
+            for parent, name, specification in planned_children:
+                child = parent.add_child_parameter()
+                added.append((parent, child))
+                child.name = name
+                child.default_value = copy.deepcopy(specification.get("default_value"))
+                child.ui_options = {**dict(specification.get("ui_options") or {}), "hide": True}
+            self._hmb_shot_slots = slots
+            self._hmb_shot_results = results
+            self._hmb_agent_migration_archives = archives
+            self._hmb_persist_shot_store()
+            if self._hmb_shot_slots != slots or self._hmb_shot_results != results or self._hmb_agent_migration_archives.get(source) != archive:
+                raise RuntimeError("Agent migration verification failed.")
+        except Exception:
+            for parent, child in reversed(added):
+                parent.remove_child(child)
+            self._hmb_shot_slots, self._hmb_shot_results, self._hmb_agent_migration_archives = before[:3]
+            self.parameter_values.clear(); self.parameter_values.update(before[3])
+            self.parameter_output_values.clear(); self.parameter_output_values.update(before[4])
+            raise
+        finally:
+            self._hmb_slot_switching = False
+        return {"schema": "hmb-agent-authoring-import", "version": 1, "source_node": source,
+            "source_digest": digest, "parameter_aliases": aliases, "slot_keys": sorted(slots),
+            "state_digest": self._hmb_authoring_digest({"slots": slots, "results": results, "archives": archives})}
 
     def _ensure_hmb_execution_result(self) -> None:
         """Persist handled failure separately from text and private Agent state."""
@@ -1661,7 +2543,17 @@ class HMBAgentLibrary(_BaseAgent):
             self, request_id=request_id, generator=generator, owner_key=owner_key
         )
 
-    def _hmb_web_rerender_busy(self) -> bool:
+    def _hmb_web_rerender_busy(self, *, generator=None) -> bool:
+        if self._hmb_shot_manager_enabled():
+            if generator is None:
+                return any(lock.locked() for lock in self._hmb_shot_execution_locks.values())
+            getter = getattr(generator, "_hmb_shot_channel_subscription", None)
+            subscription = getter() if callable(getter) else {}
+            if not isinstance(subscription, dict) or not subscription.get("enabled"):
+                return True
+            key = self._hmb_slot_key(subscription.get("channel_uuid"), subscription.get("shot_uuid"))
+            lock = self._hmb_shot_execution_locks.get(key)
+            return bool(lock is not None and lock.locked())
         return _agent_execution_gate(self).locked()
 
     def _hmb_selected_project(self) -> dict[str, str]:
@@ -1768,14 +2660,40 @@ class HMBAgentLibrary(_BaseAgent):
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 54000:
             raise ValueError("Web rerender prompt must contain 1 to 54000 characters.")
         media, settings = _web_rerender_snapshots(media_snapshot, generation_settings, prompt)
-        gate = await _acquire_agent_execution_gate(self)
+        native_settings = None
+        gate = None
+        gate_owned = False
         execution = None
         try:
-            if not self._hmb_lifecycle_is_live() or bool(getattr(self, "is_cancellation_requested", False)):
+            if self._hmb_shot_manager_enabled():
+                getter = getattr(request_identity.generator, "_hmb_shot_channel_subscription", None)
+                subscription = getter() if callable(getter) else {}
+                matches = [item for item in self._hmb_agent_shot_subscriptions() if isinstance(subscription, dict)
+                           and all(item.get(key) == subscription.get(key) for key in ("channel_uuid", "shot_uuid", "shot_number", "shot_name"))]
+                if len(matches) != 1:
+                    raise RuntimeError("Web rerender Agent Shot identity is unavailable.")
+                key = self._hmb_slot_key(subscription["channel_uuid"], subscription["shot_uuid"])
+                gate = self._hmb_shot_execution_locks.setdefault(key, threading.Lock())
+                while not gate.acquire(blocking=False):
+                    await asyncio.sleep(0.05)
+                gate_owned = True
+                if self._hmb_active_slot_key == key:
+                    self._hmb_capture_active_slot()
+                slot = self._hmb_shot_slots.get(key) or self._hmb_shot_slots.get("__hmb_default_settings__") or self._hmb_native_slot_snapshot()
+                native_settings = copy.deepcopy(slot.get("values") or {})
+            else:
+                gate = await _acquire_agent_execution_gate(self)
+                gate_owned = True
+            cancel_source = self if native_settings is None else request_identity.generator
+            if not self._hmb_lifecycle_is_live() or bool(getattr(cancel_source, "is_cancellation_requested", False)):
                 raise RuntimeError("Web rerender Agent is unavailable.")
             if bool(getattr(request_identity.generator, "_hmb_node_deleted", False)):
                 raise RuntimeError("Web rerender Generator is unavailable.")
-            execution = _HMBWebRerenderExecution._from_owner(self, prompt, media, settings)
+            execution = (_HMBWebRerenderExecution._from_owner(self, prompt, media, settings)
+                         if native_settings is None else
+                         _HMBWebRerenderExecution._from_owner(self, prompt, media, settings, native_settings=native_settings))
+            if native_settings is not None:
+                execution._hmb_web_cancel_source = request_identity.generator
             policy_identity = {"mode": "preserved_parent", "reinjected": False}
             run_id = secrets.token_hex(16)
             execution._hmb_execution_result = {"status": "running", "run_id": run_id}
@@ -1823,12 +2741,18 @@ class HMBAgentLibrary(_BaseAgent):
                 execution.parameter_values.clear()
                 execution.parameter_output_values.clear()
                 execution._hmb_verified_prompt_source_node = None
-            gate.release()
+            if gate_owned:
+                gate.release()
 
     async def aprocess(self) -> None:
+        if self._hmb_shot_manager_enabled():
+            self._hmb_capture_active_slot()
+            self._refresh_agent_shot_route(strict=True)
+            return
         gate = await _acquire_agent_execution_gate(self)
         try:
             await self._hmb_aprocess_locked()
+            self._hmb_capture_active_slot()
         finally:
             gate.release()
 
@@ -2202,7 +3126,7 @@ class HMBAgentLibrary(_BaseAgent):
                 )
             except Exception:
                 current_ui = getattr(parameter, "default_value", None)
-            next_ui = _agent_widget_value()
+            next_ui = self._hmb_widget_value()
             if current_ui != next_ui:
                 self._hmb_shot_clear_syncing = True
                 try:
@@ -2218,15 +3142,29 @@ class HMBAgentLibrary(_BaseAgent):
     def _hmb_post_registration_shot_discovery(self) -> None:
         """Discover an already-running Prompt Shot for a newly added Agent."""
 
+        # Unified managers discover the existing same-flow catalog even when
+        # legacy independent-Agent autoclaim is intentionally disabled.
         if (
             bool(getattr(self, "_hmb_node_deleted", False))
-            or not bool(
+            or (not self._hmb_shot_manager_enabled() and not bool(
                 getattr(self, "_hmb_initial_shot_autoclaim_pending", False)
-            )
+            ))
         ):
             return
         self._refresh_agent_shot_route()
         self._refresh_routed_prompt_preview()
+        self._hmb_post_hydration_state_restore()
+
+    def _hmb_post_hydration_state_restore(self) -> None:
+        """Normalize saved root order on the existing registered next-turn seam.
+
+        SDK initial_setup restores native values and root element order without
+        calling after_value_set. A byte-identical catalog ACK need not rewrite
+        the header, but the selected row must already own the one native body.
+        """
+        if (not bool(getattr(self, "_hmb_node_deleted", False))
+                and bool(getattr(self, "_hmb_shot_catalog_snapshot", {}).get("shots"))):
+            self._hmb_layout_shot_editor()
 
     def _hmb_prepare_initial_shot_selection(self, shot_uuid: Any = "") -> None:
         """Capture one unambiguous existing Prompt UUID before catalog adoption."""
@@ -2259,6 +3197,8 @@ class HMBAgentLibrary(_BaseAgent):
 
         if not isinstance(snapshot, dict) or not isinstance(snapshot.get("shots"), list):
             return {}
+        if self._hmb_shot_manager_enabled():
+            return _agent_widget_shot_catalog(snapshot)
         channel_uuid = str(snapshot.get("channel_uuid") or "")
         current = (
             current_shot
@@ -2298,6 +3238,19 @@ class HMBAgentLibrary(_BaseAgent):
                     prompt_owned.add(subscription_uuid)
                 elif participant_kind == "agent":
                     claimed.add(subscription_uuid)
+        # One real Prompt manager owns a document for each declared Shot, even
+        # while its single visible editor is displaying a different UUID. The
+        # resolver retains registered same-flow identity and ambiguity checks;
+        # ordinary individual Prompt/Agent ownership remains unchanged.
+        try:
+            from _hmb_shot_routing import resolve_shot_prompt_owner
+            for item in snapshot["shots"]:
+                shot_uuid = str(item.get("shot_uuid") or "")
+                owner = resolve_shot_prompt_owner(self, channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+                if _is_prompt_shot_manager(owner):
+                    prompt_owned.add(shot_uuid)
+        except Exception:
+            pass
         current_uuid = (
             str(current.get("shot_uuid") or "")
             if current.get("channel_uuid") == channel_uuid
@@ -2338,7 +3291,7 @@ class HMBAgentLibrary(_BaseAgent):
                 self._hmb_shot_catalog_snapshot,
                 {},
             )
-            next_ui = _agent_widget_value({}, catalog)
+            next_ui = self._hmb_widget_value({}, catalog)
             self._hmb_shot_clear_syncing = True
             try:
                 self.set_parameter_value(_AGENT_WIDGET_PARAMETER, next_ui)
@@ -2476,6 +3429,8 @@ class HMBAgentLibrary(_BaseAgent):
                 ),
                 None,
             )
+        if self._hmb_shot_manager_enabled() and selected is None and shots:
+            selected = shots[0]
         if isinstance(selected, dict):
             try:
                 number = max(1, min(5, int(selected.get("number") or 1)))
@@ -2512,7 +3467,7 @@ class HMBAgentLibrary(_BaseAgent):
                 current_ui = super().get_parameter_value(_AGENT_WIDGET_PARAMETER)
             except Exception:
                 current_ui = getattr(parameter, "default_value", None)
-            next_ui = _agent_widget_value(
+            next_ui = self._hmb_widget_value(
                 shot,
                 self._hmb_available_agent_shot_catalog(
                     self._hmb_shot_catalog_snapshot
@@ -2521,10 +3476,24 @@ class HMBAgentLibrary(_BaseAgent):
             if current_ui != next_ui:
                 self._hmb_shot_catalog_syncing = True
                 try:
-                    self.set_parameter_value(_AGENT_WIDGET_PARAMETER, next_ui)
+                    # Separate the five-row catalog from the native editor's
+                    # active identity. A sibling rename/renumber or watermark
+                    # ACK must not republish the whole header/native form.
+                    # Keep the saved backend catalog current; the layout below
+                    # emits only the row parameters whose values changed.
+                    header_changed = not isinstance(current_ui, dict) or any(
+                        current_ui.get(key) != next_ui.get(key)
+                        for key in ("shot", "execution_phase", "shot_editor_expanded", "shot_manager")
+                    )
+                    self.set_parameter_value(_AGENT_WIDGET_PARAMETER, next_ui, emit_change=header_changed)
                     parameter.default_value = next_ui
                 finally:
                     self._hmb_shot_catalog_syncing = False
+            else:
+                # The SDK may restore the header before a live catalog exists.
+                # Its first identical canonical ACK still completes layout;
+                # later ACKs retain every native element in the same place.
+                self._hmb_layout_shot_editor()
         except Exception:
             self._hmb_shot_catalog_syncing = False
             pass
@@ -2570,11 +3539,65 @@ class HMBAgentLibrary(_BaseAgent):
             "changed": 0,
         }
 
+    def _hmb_prompt_manager_document(self, source, *, subscription=None):
+        if not _is_prompt_shot_manager(source):
+            raise RuntimeError("HMB Prompt manager is unavailable.")
+        selected = self._normalize_execution_shot_binding(subscription or self._hmb_shot_channel_subscription())
+        if not selected:
+            raise RuntimeError("HMB Agent Shot identity is unavailable.")
+        previous_source = getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
+        try:
+            if not _is_direct_hmb_prompt_library_connection(self) or getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None) is not source:
+                raise RuntimeError("HMB Prompt manager connection is invalid.")
+            from _hmb_shot_routing import resolve_shot_prompt_owner
+            if resolve_shot_prompt_owner(self, channel_uuid=selected["channel_uuid"], shot_uuid=selected["shot_uuid"]) is not source:
+                raise RuntimeError("HMB Prompt manager Shot owner is invalid.")
+            document = source._hmb_prompt_shot_document(channel_uuid=selected["channel_uuid"], shot_uuid=selected["shot_uuid"])
+            view = _FrozenHMBPromptShotSource(source, document, selected)
+            setattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, view)
+            _paired_machine_prompt(self, view.visible_prompt)
+            view._hmb_project_identity()
+            return view
+        finally:
+            setattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, previous_source)
+
+
+    def _hmb_revalidate_prompt_manager_owner(self):
+        view = getattr(self, _FROZEN_PROMPT_SHOT_ATTRIBUTE, None)
+        if view is None:
+            return
+        owner = getattr(self, _REGISTERED_PROMPT_OWNER_ATTRIBUTE, None)
+        try:
+            if owner is None or bool(getattr(owner, "_hmb_node_deleted", False)):
+                raise RuntimeError("HMB Prompt manager was removed.")
+            if not _is_direct_hmb_prompt_library_connection(self) or getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None) is not owner:
+                raise RuntimeError("HMB Prompt manager connection changed.")
+            from _hmb_shot_routing import resolve_shot_prompt_owner
+            shot = view._hmb_shot_channel_subscription()
+            if resolve_shot_prompt_owner(self, channel_uuid=shot["channel_uuid"], shot_uuid=shot["shot_uuid"]) is not owner:
+                raise RuntimeError("HMB Prompt manager Shot owner changed.")
+        finally:
+            setattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, view)
+
+
     def _assert_exact_prompt_shot_route(self) -> dict[str, Any]:
         """Return the Agent identity only after its exact Prompt route is verified."""
 
         subscription = self._hmb_shot_channel_subscription()
         source_node = getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
+        if _is_prompt_shot_manager(source_node):
+            verified = self._normalize_execution_shot_binding(subscription)
+            if not verified:
+                raise RuntimeError("HMB Agent Shot identity is invalid.")
+            for participant in (self, source_node):
+                status = getattr(participant, "_hmb_shot_route_status", None)
+                if not isinstance(status, dict) or status.get("ok") is not True or status.get("code") != "ready":
+                    raise RuntimeError("HMB Prompt manager Shot routing is not ready.")
+            view = self._hmb_prompt_manager_document(source_node, subscription=verified)
+            setattr(self, _REGISTERED_PROMPT_OWNER_ATTRIBUTE, source_node)
+            setattr(self, _FROZEN_PROMPT_SHOT_ATTRIBUTE, view)
+            setattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, view)
+            return verified
         getter = getattr(source_node, "_hmb_shot_channel_subscription", None)
         try:
             source_subscription = getter() if callable(getter) else None
@@ -2741,9 +3764,54 @@ class HMBAgentLibrary(_BaseAgent):
             )
         except Exception:
             enabled = False
+        if self._hmb_shot_manager_enabled():
+            value = ""
+            projection_ready = False
+            if enabled:
+                try:
+                    selected = self._hmb_shot_channel_subscription()
+                    owner = self._hmb_manager_prompt_owner(channel_uuid=selected["channel_uuid"], shot_uuid=selected["shot_uuid"])
+                    document = owner._hmb_prompt_shot_document(channel_uuid=selected["channel_uuid"], shot_uuid=selected["shot_uuid"])
+                    value = str(document.get("visible_prompt") or "")
+                    projection_ready = bool(value)
+                except Exception:
+                    value = ""
+            if not projection_ready and bool(getattr(self, "_hmb_prompt_preview_hydration_pending", False)):
+                return
+            if projection_ready:
+                self._hmb_prompt_preview_hydration_pending = False
+            if (value and bool(getattr(self, "_hmb_prompt_preview_active", False))
+                    and value == str(getattr(self, "_hmb_prompt_preview_value", "") or "")
+                    and not self._matches_active_private_runtime_prompt(
+                        self._native_parameter_value(_AGENT_PROMPT_INPUT_PARAMETER, ""))):
+                # Repeated source/catalog ACKs must not overwrite an in-progress
+                # native text edit. Real selected-document text changes still
+                # pass through the normal reversible preview projection.
+                return
+            self._set_native_prompt_preview(value, enabled=enabled)
+            if not value and self._native_parameter_value(_AGENT_PROMPT_INPUT_PARAMETER, ""):
+                self._hmb_prompt_preview_syncing = True
+                try:
+                    self.set_parameter_value(_AGENT_PROMPT_INPUT_PARAMETER, "")
+                finally:
+                    self._hmb_prompt_preview_syncing = False
+            return
         value = self._native_parameter_value(
             _AGENT_SHOT_PROMPT_INPUT_PARAMETER, ""
         )
+        view = getattr(self, _FROZEN_PROMPT_SHOT_ATTRIBUTE, None)
+        if view is not None:
+            value = view.visible_prompt
+        elif enabled:
+            try:
+                from _hmb_shot_routing import resolve_shot_prompt_owner
+                selected = self._hmb_shot_channel_subscription()
+                owner = resolve_shot_prompt_owner(self, channel_uuid=selected["channel_uuid"], shot_uuid=selected["shot_uuid"])
+                if _is_prompt_shot_manager(owner):
+                    value = self._hmb_prompt_manager_document(owner).visible_prompt
+            except Exception:
+                if getattr(self, "_hmb_prompt_manager_source_hint", None) is not None:
+                    value = ""
         self._set_native_prompt_preview(value, enabled=enabled)
 
     def _hmb_hydrate_shot_prompt_from_source(
@@ -2766,8 +3834,14 @@ class HMBAgentLibrary(_BaseAgent):
             return False
         sentinel = object()
         value: Any = sentinel
+        if _is_prompt_shot_manager(source_node):
+            try:
+                value = self._hmb_prompt_manager_document(source_node).visible_prompt
+                self._hmb_prompt_manager_source_hint = source_node
+            except Exception:
+                return False
         outputs = getattr(source_node, "parameter_output_values", {})
-        if isinstance(outputs, dict) and source_name in outputs:
+        if value is sentinel and isinstance(outputs, dict) and source_name in outputs:
             value = outputs[source_name]
         if value is sentinel:
             values = getattr(source_node, "parameter_values", {})
@@ -2799,9 +3873,7 @@ class HMBAgentLibrary(_BaseAgent):
             authoritative_catalog = getattr(self, "_hmb_shot_catalog_snapshot", None)
             if not authoritative_catalog and isinstance(value, dict):
                 authoritative_catalog = value.get("shot_catalog")
-            available_catalog = self._hmb_available_agent_shot_catalog(
-                authoritative_catalog
-            )
+            available_catalog = _agent_widget_shot_catalog(authoritative_catalog)
             requested_shot = (
                 value.get("shot") if isinstance(value, dict) else None
             )
@@ -2835,13 +3907,32 @@ class HMBAgentLibrary(_BaseAgent):
                     "number": current.get("shot_number", 1),
                     "name": current.get("shot_name", "Only"),
                 }
-            normalized = _agent_widget_value(
-                requested_shot,
-                available_catalog,
-                value.get("execution_phase", "")
-                if isinstance(value, dict)
-                else "",
+            requested_manager = True
+            if requested_manager:
+                available_catalog = _agent_widget_shot_catalog(authoritative_catalog)
+                if not str((requested_shot or {}).get("shot_uuid") or "") and available_catalog.get("shots"):
+                    first = available_catalog["shots"][0]
+                    requested_shot = {"channel_uuid": available_catalog["channel_uuid"],
+                                      "shot_uuid": first["shot_uuid"], "number": first["number"], "name": first["name"]}
+            normalized = self._hmb_widget_value(
+                requested_shot, available_catalog,
+                value.get("execution_phase", "") if isinstance(value, dict) else "",
+                shot_manager=requested_manager,
             )
+        if parameter_name == _AGENT_WIDGET_PARAMETER and isinstance(value, dict):
+            current_ui = self._native_parameter_value(_AGENT_WIDGET_PARAMETER, {})
+            old_shot = current_ui.get("shot", {}) if isinstance(current_ui, dict) else {}
+            new_shot = normalized.get("shot", {})
+            # A catalog watermark covers every Shot. It does not establish a
+            # change to this editor's Prompt document. The exact Prompt edge
+            # separately notifies real content/media changes.
+            self._hmb_ui_preview_required = any(
+                old_shot.get(key) != new_shot.get(key)
+                for key in ("channel_uuid", "shot_uuid")
+            )
+            normalized["shot_editor_expanded"] = value.get("shot_editor_expanded", getattr(self, "_hmb_shot_editor_expanded", True)) is not False
+        if parameter_name == _AGENT_WIDGET_PARAMETER and isinstance(value, dict) and isinstance(value.get("action"), dict):
+            self._hmb_pending_shot_action = copy.deepcopy(value["action"])
         parent = getattr(super(), "before_value_set", None)
         if callable(parent):
             parent_value = parent(parameter, normalized)
@@ -2854,13 +3945,15 @@ class HMBAgentLibrary(_BaseAgent):
             return None
         parent = getattr(super(), "after_value_set", None)
         result = parent(parameter, value) if callable(parent) else None
+        if str(getattr(parameter, "name", "") or "").startswith(_AGENT_SHOT_ROW_PREFIX):
+            self._hmb_handle_row_action(parameter, value)
+            return result
         if str(getattr(parameter, "name", "") or "") == _AGENT_WIDGET_PARAMETER:
+            self._hmb_shot_editor_expanded = value.get("shot_editor_expanded", True) is not False if isinstance(value, dict) else True
             authoritative_catalog = getattr(self, "_hmb_shot_catalog_snapshot", None)
             if not authoritative_catalog and isinstance(value, dict):
                 authoritative_catalog = value.get("shot_catalog")
-            available_catalog = self._hmb_available_agent_shot_catalog(
-                authoritative_catalog
-            )
+            available_catalog = _agent_widget_shot_catalog(authoritative_catalog)
             requested_shot = (
                 value.get("shot") if isinstance(value, dict) else None
             )
@@ -2881,15 +3974,32 @@ class HMBAgentLibrary(_BaseAgent):
                     "number": current.get("shot_number", 1),
                     "name": current.get("shot_name", "Only"),
                 }
-            normalized = _agent_widget_value(
-                requested_shot,
-                available_catalog,
-                value.get("execution_phase", "")
-                if isinstance(value, dict)
-                else "",
+            requested_manager = True
+            if requested_manager:
+                available_catalog = _agent_widget_shot_catalog(authoritative_catalog)
+                if not str((requested_shot or {}).get("shot_uuid") or "") and available_catalog.get("shots"):
+                    first = available_catalog["shots"][0]
+                    requested_shot = {"channel_uuid": available_catalog["channel_uuid"],
+                                      "shot_uuid": first["shot_uuid"], "number": first["number"], "name": first["name"]}
+            normalized = self._hmb_widget_value(
+                requested_shot, available_catalog,
+                value.get("execution_phase", "") if isinstance(value, dict) else "",
+                shot_manager=requested_manager,
             )
+            self._hmb_shot_manager_mode = bool(normalized.get("shot_manager"))
+            selected_slot = normalized.get("shot", {})
+            if getattr(self, "_hmb_restore_widget_write", False):
+                self._hmb_active_slot_key = self._hmb_slot_key(selected_slot.get("channel_uuid", ""), selected_slot.get("shot_uuid", ""))
+            elif not getattr(self, "_hmb_slot_switching", False):
+                self._hmb_switch_native_slot(selected_slot.get("channel_uuid", ""), selected_slot.get("shot_uuid", ""))
             try:
-                parameter.default_value = normalized
+                if getattr(parameter, "default_value", None) != normalized:
+                    parameter.default_value = normalized
+                height = _AGENT_WIDGET_HEIGHT
+                for option in ("height", "min_height", "max_height", "widget_height", "default_height", "preferred_height", "initial_height"):
+                    updater = getattr(parameter, "update_ui_options_key", None)
+                    if callable(updater) and (getattr(parameter, "ui_options", {}) or {}).get(option) != height:
+                        updater(option, height)
             except Exception:
                 pass
             execution_binding = self._normalize_execution_shot_binding(
@@ -2922,10 +4032,24 @@ class HMBAgentLibrary(_BaseAgent):
                 if not getattr(self, "_hmb_shot_catalog_syncing", False):
                     self._hmb_initial_shot_autoclaim_pending = False
                     self._hmb_initial_shot_preferred_uuid = ""
-                self._refresh_agent_shot_route()
-            self._refresh_routed_prompt_preview()
+                if not self._hmb_shot_manager_enabled():
+                    self._refresh_agent_shot_route()
+            if getattr(self, "_hmb_ui_preview_required", True):
+                self._refresh_routed_prompt_preview()
+            action = getattr(self, "_hmb_pending_shot_action", None)
+            self._hmb_pending_shot_action = None
+            if action is not None:
+                self._hmb_handle_shot_action(action)
+            self._hmb_layout_shot_editor()
+            self._hmb_persist_shot_store()
         elif str(getattr(parameter, "name", "") or "") == _AGENT_SHOT_PROMPT_INPUT_PARAMETER:
             self._refresh_routed_prompt_preview()
+        elif str(getattr(parameter, "name", "") or "") == _AGENT_SHOT_STORE_PARAMETER:
+            self._hmb_restore_shot_store()
+        elif not getattr(self, "_hmb_slot_switching", False) and not getattr(self, "_hmb_shot_store_syncing", False):
+            name = str(getattr(parameter, "name", "") or "")
+            if name in _AGENT_NATIVE_SETTING_KEYS or name in {"tools", "rulesets"} or name.startswith(("Behavior", "tools_", "rulesets_")):
+                self._hmb_capture_active_slot()
         return result
 
     @staticmethod
@@ -2938,6 +4062,22 @@ class HMBAgentLibrary(_BaseAgent):
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return None
         normalized_name = self._publication_parameter_name(name)
+        if kwargs.get("initial_setup"):
+            self._hmb_capture_saved_parameter_value(name, value)
+        if (normalized_name == _AGENT_SHOT_PROMPT_INPUT_PARAMETER.casefold()
+                and self._hmb_shot_manager_enabled() and not kwargs.get("initial_setup")):
+            # This shared dependency can publish another visible Prompt Shot.
+            # Only the exact selected document may update the native editor;
+            # the hidden shared string itself needs no whole-node UI event.
+            if self._native_parameter_value(str(name), None) == value:
+                if not getattr(self, "_hmb_prompt_preview_syncing", False):
+                    self._refresh_routed_prompt_preview()
+                return None
+            kwargs["emit_change"] = False
+        if (normalized_name == _AGENT_WIDGET_PARAMETER.casefold() or normalized_name.startswith(_AGENT_SHOT_ROW_PREFIX.casefold())) and not kwargs.get("initial_setup") and isinstance(value, dict) and "action" not in value:
+            current = self._native_parameter_value(str(name), None)
+            if current == value:
+                return None
         if normalized_name == _AGENT_PROMPT_INPUT_PARAMETER.casefold():
             value = self._public_prompt_value_after_private_echo(value)
         if getattr(self, "_hmb_capture_publications", False) and normalized_name in {
@@ -2946,10 +4086,35 @@ class HMBAgentLibrary(_BaseAgent):
         }:
             self._hmb_publication_buffer[normalized_name] = str(value or "")
             return None
-        result = super().set_parameter_value(name, value, *args, **kwargs)
+        self._hmb_restore_widget_write = bool(kwargs.get("initial_setup", False)) if normalized_name == _AGENT_WIDGET_PARAMETER.casefold() else getattr(self, "_hmb_restore_widget_write", False)
+        try:
+            result = super().set_parameter_value(name, value, *args, **kwargs)
+        finally:
+            if normalized_name == _AGENT_WIDGET_PARAMETER.casefold():
+                self._hmb_restore_widget_write = False
+        if (
+            normalized_name == _AGENT_SHOT_STORE_PARAMETER.casefold()
+            and bool(kwargs.get("initial_setup", False))
+        ):
+            # The SDK initial-setup setter deliberately skips after_value_set.
+            # Restore the durable store now, before a later live source/native
+            # callback can persist the constructor's empty/Only slot cache over
+            # the saved multi-Shot document. This is a pure cache restore.
+            self._hmb_restore_shot_store()
+        if (bool(kwargs.get("initial_setup", False)) and normalized_name in {
+                _AGENT_WIDGET_PARAMETER.casefold(), _AGENT_SHOT_STORE_PARAMETER.casefold()}):
+            # SDK command replay restores these values after root element order
+            # and skips after_value_set. Normalize only presentation here; a
+            # later identical catalog ACK must not be the first body reattach.
+            restored_ui = self._native_parameter_value(_AGENT_WIDGET_PARAMETER, {})
+            if normalized_name == _AGENT_WIDGET_PARAMETER.casefold() and isinstance(restored_ui, dict):
+                self._hmb_shot_editor_expanded = restored_ui.get("shot_editor_expanded", True) is not False
+            self._hmb_layout_shot_editor(restored_catalog=(
+                restored_ui.get("shot_catalog") if isinstance(restored_ui, dict) else None))
         if (
             normalized_name == _AGENT_SHOT_PROMPT_INPUT_PARAMETER.casefold()
             and not bool(getattr(self, "_hmb_prompt_preview_syncing", False))
+            and (bool(kwargs.get("initial_setup", False)) or not self._hmb_shot_manager_enabled())
         ):
             self._refresh_routed_prompt_preview()
         if (
@@ -3100,8 +4265,24 @@ class HMBAgentLibrary(_BaseAgent):
         if str(getattr(target_parameter, "name", "") or "") == (
             _AGENT_SHOT_PROMPT_INPUT_PARAMETER
         ):
+            # SDK removal callbacks are reentrant: the old source's outgoing
+            # callback can already have connected a replacement Prompt before
+            # this old incoming-removal callback runs. Read the canonical live
+            # edge rather than letting the old callback erase its replacement.
+            try:
+                replacement = (getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
+                    if _is_direct_hmb_prompt_library_connection(self) else None)
+            except Exception:
+                replacement = None
+            if replacement is not None and not bool(getattr(replacement, "_hmb_node_deleted", False)):
+                try:
+                    self._hmb_hydrate_shot_prompt_from_source(replacement, _HMB_PROMPT_OUTPUT_PARAMETER)
+                except Exception:
+                    pass
+                return result
             self._hmb_shot_context = {}
             setattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
+            self._hmb_prompt_preview_hydration_pending = False
             try:
                 self.set_parameter_value(_AGENT_SHOT_PROMPT_INPUT_PARAMETER, "")
             except Exception:
@@ -3184,6 +4365,8 @@ class HMBAgentLibrary(_BaseAgent):
             # prompt text and already-published native outputs are intentionally
             # left untouched while a late scheduler callback loses ownership.
             self._clear_hmb_runtime_policy()
+            if hasattr(self, "_hmb_shot_request_records"):
+                self._hmb_shot_request_records.clear()
             self._hmb_shot_catalog_snapshot = {}
             self._hmb_shot_context = {}
             self._clear_execution_shot_binding()
@@ -3209,6 +4392,8 @@ class HMBAgentLibrary(_BaseAgent):
         """Add sealed policy rules without changing Standard Agent inputs."""
         normalized_name = str(name or "").strip().casefold()
         parent_getter = getattr(super(), "get_parameter_list_value", None)
+        if normalized_name in {"tools", "rulesets"} and len(getattr(self, "_hmb_shot_slots", {})) > 1:
+            parent_getter = lambda key: self._hmb_slot_native_list_value(key)
         if (normalized_name != "rulesets" or not self._hmb_rules_active
                 or bool(getattr(self, "_hmb_policy_omitted", False))):
             return parent_getter(name) if callable(parent_getter) else []
@@ -3232,6 +4417,9 @@ class HMBAgentLibrary(_BaseAgent):
         """Swap only the authenticated prompt; preserve Standard Agent values."""
 
         normalized_name = str(name or "").strip().casefold()
+        view = getattr(self, _FROZEN_PROMPT_SHOT_ATTRIBUTE, None)
+        if normalized_name == _AGENT_SHOT_PROMPT_INPUT_PARAMETER.casefold() and view is not None:
+            return view.visible_prompt
         if self._hmb_rules_active:
             if normalized_name == _AGENT_PROMPT_INPUT_PARAMETER.casefold():
                 runtime_prompt = str(
@@ -3291,6 +4479,8 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_runtime_prompt = ""
         self._hmb_native_prompt_read_active = False
         self._hmb_verified_prompt_source_node = None
+        self._hmb_registered_prompt_source_node = None
+        self._hmb_frozen_prompt_shot_source = None
         self._hmb_publication_buffer = {"output": "", "logs": ""}
         self._hmb_scheduler_step_failed = False
         self._hmb_last_sanitizer_status = "clean"
@@ -3392,7 +4582,7 @@ class HMBAgentLibrary(_BaseAgent):
                     "number": execution_binding["shot_number"],
                     "name": execution_binding["shot_name"],
                 }
-            next_ui = _agent_widget_value(
+            next_ui = self._hmb_widget_value(
                 shot,
                 current.get("shot_catalog"),
                 normalized_phase,
@@ -3467,7 +4657,7 @@ class HMBAgentLibrary(_BaseAgent):
             )
         return super()._handle_additional_context(prompt, additional_context)
 
-    def _process(self, agent: Any, prompt: Any) -> Any:
+    def _process(self, agent: Any, prompt: Any, *native_args: Any) -> Any:
         """Use the Standard processor; constrain only canonical HMB output prose."""
 
         web_revision = isinstance(self, _HMBWebRerenderExecution)
@@ -3478,6 +4668,8 @@ class HMBAgentLibrary(_BaseAgent):
             # native processor; never emulate a second, HMB-specific model path.
             return agent
         if hmb_request:
+            if not web_revision:
+                self._hmb_revalidate_prompt_manager_owner()
             # Standard Agent has already merged any typed additional_context at
             # this point. Canonical HMB dictionaries are delimited literal data;
             # numeric/string context and non-HMB templates retain native behavior.
@@ -3545,9 +4737,9 @@ class HMBAgentLibrary(_BaseAgent):
                 marker(observation_run, True)
             self._hmb_native_inference_started = True
             self._hmb_run_policy_applied = bool(self._hmb_rules_active) and not bool(getattr(self, "_hmb_policy_omitted", False))
-            return _run_native_with_literal_hmb_input(native_processor, agent, prompt)
+            return _run_native_with_literal_hmb_input(native_processor, agent, prompt, *native_args)
         self._hmb_native_inference_started = True
-        return native_processor(agent, prompt)
+        return native_processor(agent, prompt, *native_args)
 
     def _run_native_agent_once(self, lifecycle_generation: int | None = None):
         if lifecycle_generation is None:
@@ -3795,6 +4987,8 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_native_failure_stage = ""
         self._hmb_native_failure_code = ""
         self._clear_execution_shot_binding()
+        setattr(self, _FROZEN_PROMPT_SHOT_ATTRIBUTE, None)
+        setattr(self, _REGISTERED_PROMPT_OWNER_ATTRIBUTE, None)
         # The selector is cable-free in the editor, but the router establishes
         # the same-flow hidden Prompt edge before topology validation so the
         # native scheduler still observes the real dependency.
@@ -4210,7 +5404,7 @@ class _HMBWebRerenderExecution(HMBAgentLibrary):
     """Unregistered execution facade; native setters never reach the editor."""
 
     @classmethod
-    def _from_owner(cls, owner, prompt, media, settings):
+    def _from_owner(cls, owner, prompt, media, settings, native_settings=None):
         node = object.__new__(cls)
         node.__dict__.update(owner.__dict__)
         for name in (
@@ -4222,6 +5416,7 @@ class _HMBWebRerenderExecution(HMBAgentLibrary):
         node._hmb_web_owner = owner
         node._hmb_web_owner_generation = int(getattr(owner, "_hmb_lifecycle_generation", 0) or 0)
         node._hmb_web_cancelled = False
+        node._hmb_web_cancel_source = None
         node.parameter_values = {}
         node.parameter_output_values = {}
         node.metadata = copy.deepcopy(getattr(owner, "metadata", {}))
@@ -4231,9 +5426,9 @@ class _HMBWebRerenderExecution(HMBAgentLibrary):
             "model", "model_provider", "agent", "include_details", "output_schema",
             "additional_context", "agent_memory",
         ):
-            node.parameter_values[key] = copy.deepcopy(owner.get_parameter_value(key))
+            node.parameter_values[key] = copy.deepcopy(native_settings.get(key) if isinstance(native_settings, dict) else owner.get_parameter_value(key))
         for key in ("tools", "rulesets"):
-            node.parameter_values[key] = copy.deepcopy(owner.get_parameter_list_value(key))
+            node.parameter_values[key] = copy.deepcopy(native_settings.get(key) or [] if isinstance(native_settings, dict) else owner.get_parameter_list_value(key))
         # A stale owner execution may still expose its ephemeral HMB rule
         # scopes through the getter. Preserve caller rules, never carry these
         # runtime additions into revision of an already processed prompt.
@@ -4280,7 +5475,8 @@ class _HMBWebRerenderExecution(HMBAgentLibrary):
 
     @property
     def is_cancellation_requested(self):
-        return self._hmb_web_cancelled or bool(getattr(self._hmb_web_owner, "is_cancellation_requested", False))
+        source = getattr(self, "_hmb_web_cancel_source", None) or self._hmb_web_owner
+        return self._hmb_web_cancelled or bool(getattr(source, "is_cancellation_requested", False))
 
     def _hmb_lifecycle_is_live(self, generation=None):
         return (
@@ -4317,6 +5513,189 @@ class _HMBWebRerenderExecution(HMBAgentLibrary):
 
     def _set_visible_output(self, value):
         self.parameter_output_values["output"] = value
+
+    def show_message_by_name(self, *args, **kwargs):
+        return None
+
+    def hide_message_by_name(self, *args, **kwargs):
+        return None
+
+
+class _HMBAgentShotSource:
+    """Frozen paired-data view whose registered owner was verified at creation."""
+
+    def __init__(self, owner, document, subscription):
+        if not isinstance(document, dict) or document.get("schema") != "hmb-prompt-shot-document" or document.get("version") != 1:
+            raise RuntimeError("Prompt Shot document is invalid.")
+        self.owner = owner
+        self.document = copy.deepcopy(document)
+        self.subscription = {**subscription, "participant_kind": "prompt"}
+        supplied = self.document.get("subscription")
+        for key in ("channel_uuid", "shot_uuid", "shot_number", "shot_name"):
+            if not isinstance(supplied, dict) or supplied.get(key) != self.subscription.get(key):
+                raise RuntimeError("Prompt Shot document identity does not match its registered owner.")
+        self.visible = self.document.get("visible_prompt")
+        self.machine = self.document.get("machine_prompt")
+        self._hmb_shot_route_status = {"ok": True, "code": "ready"}
+        self._hmb_agent_prompt_snapshot(self.visible)
+
+    def _hmb_shot_channel_subscription(self):
+        return copy.deepcopy(self.subscription)
+
+    def _hmb_agent_prompt_snapshot(self, visible):
+        if visible != self.visible:
+            raise RuntimeError("Prompt Shot visible snapshot changed.")
+        paired = copy.deepcopy(self.document.get("paired_snapshot"))
+        if not isinstance(paired, dict) or paired.get("machine_prompt") != self.machine:
+            raise RuntimeError("Prompt Shot paired snapshot is invalid.")
+        return paired
+
+    def _hmb_agent_reference_media(self, machine):
+        if machine != self.machine:
+            raise RuntimeError("Prompt Shot machine snapshot changed.")
+        return copy.deepcopy(self.document.get("reference_media") or {})
+
+    def _hmb_agent_generation_context(self, machine):
+        if machine != self.machine:
+            raise RuntimeError("Prompt Shot settings snapshot changed.")
+        return copy.deepcopy(self.document.get("generation_context") or {})
+
+    def _hmb_agent_shot_context(self, visible):
+        if visible != self.visible:
+            raise RuntimeError("Prompt Shot context snapshot changed.")
+        return copy.deepcopy(self.document.get("shot_context") or self.document.get("context") or {})
+
+    def _hmb_project_identity(self):
+        return resolve_project(self.document.get("project_identity"), default_legacy=False)
+
+
+class _HMBAgentShotExecution(HMBAgentLibrary):
+    """Unregistered per-Shot native execution with the normal policy boundary.
+
+    The constructor is used only after the retained Agent verified the exact
+    registered same-flow Prompt owner.  This is separate from web revision,
+    which intentionally preserves already-applied parent policy.
+    """
+
+    @classmethod
+    def _from_owner(cls, owner, prompt_owner, document, subscription, slot, generator):
+        node = object.__new__(cls)
+        node.__dict__.update(owner.__dict__)
+        for name in ("get_parameter_value", "get_parameter_list_value", "set_parameter_value",
+                     "append_value_to_parameter", "_set_visible_output", "show_message_by_name",
+                     "hide_message_by_name", "_hmb_lifecycle_is_live"):
+            node.__dict__.pop(name, None)
+        node._hmb_shot_owner = owner
+        node._hmb_shot_prompt_owner = prompt_owner
+        node._hmb_shot_owner_generation = int(owner._hmb_lifecycle_generation)
+        node._hmb_shot_generator = generator
+        node._hmb_shot_cancelled = False
+        node._hmb_shot_manager_mode = False
+        node._hmb_shot_source = _HMBAgentShotSource(prompt_owner, document, subscription)
+        node._hmb_shot_subscription = copy.deepcopy(subscription)
+        node._hmb_shot_route_status = {"ok": True, "code": "ready"}
+        node.parameter_values = copy.deepcopy(slot.get("values") or {})
+        node.parameter_output_values = {}
+        node.parameter_values[_AGENT_SHOT_PROMPT_INPUT_PARAMETER] = document["visible_prompt"]
+        node.parameter_values["prompt"] = document["visible_prompt"]
+        node._hmb_execution_result = {}
+        node._hmb_reference_observation = {}
+        node._hmb_reference_observation_run_id = ""
+        node._hmb_execution_shot_binding = {}
+        node._hmb_shot_context = {}
+        node._hmb_shot_policy_identity = {}
+        node._hmb_native_failure_stage = ""
+        node._hmb_native_failure_code = ""
+        node._hmb_native_calls_this_process = 0
+        node._last_raw_output = None
+        node._hmb_execution_gate = threading.Lock()
+        node.metadata = copy.deepcopy(getattr(owner, "metadata", {}))
+        for key in ("_model_access", "_provider"):
+            component = getattr(owner, key, None)
+            if component is not None:
+                component = copy.copy(component)
+                if hasattr(component, "_node"):
+                    component._node = node
+                setattr(node, key, component)
+        if getattr(node, "_provider", None) is not None and hasattr(node._provider, "_model_access"):
+            node._provider._model_access = node._model_access
+        node._clear_hmb_runtime_policy()
+        return node
+
+    @property
+    def is_cancellation_requested(self):
+        generator = self._hmb_shot_generator
+        return (self._hmb_shot_cancelled or bool(getattr(self._hmb_shot_owner, "_hmb_node_deleted", False))
+                or (generator is not None and (bool(getattr(generator, "_hmb_node_deleted", False))
+                    or bool(getattr(generator, "is_cancellation_requested", False)))))
+
+    def _hmb_lifecycle_is_live(self, generation=None):
+        return (not self.is_cancellation_requested
+                and self._hmb_shot_owner._hmb_lifecycle_is_live(self._hmb_shot_owner_generation)
+                and not bool(getattr(self._hmb_shot_prompt_owner, "_hmb_node_deleted", False))
+                and (generation is None or generation == self._hmb_lifecycle_generation))
+
+    def _refresh_agent_shot_route(self, *, strict=False):
+        return {"ok": True, "code": "ready"}
+
+    def _has_canonical_hmb_prompt_connection(self):
+        self._hmb_verified_prompt_source_node = self._hmb_shot_source
+        return True
+
+    def _hmb_shot_channel_subscription(self):
+        return copy.deepcopy(self._hmb_shot_subscription)
+
+    def _assert_exact_prompt_shot_route(self):
+        _paired_machine_prompt(self, self.parameter_values[_AGENT_SHOT_PROMPT_INPUT_PARAMETER])
+        return copy.deepcopy(self._hmb_shot_subscription)
+
+    def _native_parameter_value(self, name, default=""):
+        return self.parameter_values.get(name, default)
+
+    def get_parameter_value(self, name):
+        if str(name).casefold() == "prompt" and self._hmb_rules_active and self._hmb_native_prompt_read_active:
+            return self._hmb_runtime_prompt
+        return self.parameter_values.get(name)
+
+    def get_parameter_list_value(self, name):
+        values = copy.deepcopy(self.parameter_values.get(name) or [])
+        if str(name).casefold() == "rulesets" and self._hmb_rules_active and not self._hmb_policy_omitted:
+            project, shot = self._hmb_ruleset_names
+            if not project or not shot or project == shot:
+                raise RuntimeError("HMBAgentLibrary sealed rule scope is unavailable.")
+            values.extend([{"name": project, "rules": list(self._hmb_policy_rules)},
+                           {"name": shot, "rules": list(self._hmb_binding_rules)}])
+        return values
+
+    def _load_hmb_rules(self):
+        value = super()._load_hmb_rules()
+        self._hmb_shot_policy_identity = copy.deepcopy(self._hmb_policy_identity)
+        return value
+
+    def set_parameter_value(self, name, value, *args, **kwargs):
+        key = self._publication_parameter_name(name)
+        if self._hmb_capture_publications and key in {"output", "logs"}:
+            self._hmb_publication_buffer[key] = str(value or "")
+        else:
+            self.parameter_values[str(name)] = value
+            self.parameter_output_values[str(name)] = value
+
+    def append_value_to_parameter(self, name, value=None, *args, **kwargs):
+        key = self._publication_parameter_name(name)
+        if self._hmb_capture_publications and key in {"output", "logs"}:
+            self._hmb_publication_buffer[key] += str(value or "")
+        else:
+            self.set_parameter_value(name, str(self.parameter_output_values.get(str(name), "")) + str(value or ""))
+
+    def _set_visible_output(self, value):
+        self.parameter_output_values["output"] = value
+        self.parameter_values["output"] = value
+
+    def _set_agent_execution_phase(self, phase):
+        return None
+
+    def publish_update_to_parameter(self, *args, **kwargs):
+        return None
 
     def show_message_by_name(self, *args, **kwargs):
         return None

@@ -131,16 +131,19 @@ from _hmb_bundled_policy_session import install_bundled_policy_session  # noqa: 
 install_bundled_policy_session(agent_module._hmb)
 native_module = inspect.getmodule(base_agent)
 assert native_module is not None
-original_step = base_agent._process
+from griptape_nodes_library.llm import runner as native_runner  # noqa: E402
+from pydantic_ai.models.test import TestModel  # noqa: E402
+
+original_build_model = native_runner.build_model
+original_run_agent = native_module.run_agent
 original_key = native_module.resolve_cloud_api_key
 original_invocation = native_module.require_model_invocation_sync
-original_throw = native_module.try_throw_error
 live = agent_module.HMBAgentLibrary(name="hmb_literal_context_native")
 assert live._hmb_rules_active is False
 live._hmb_verified_prompt_source_node = source
 live._refresh_agent_shot_route = lambda **_kwargs: {"ok": True, "code": "ready", "changed": 0}
 live._has_canonical_hmb_prompt_connection = lambda: True
-live._model_access.raise_if_denied = lambda *args, **kwargs: None
+live._model_access.raise_if_selection_denied = lambda *args, **kwargs: None
 live.set_parameter_value(agent_module._AGENT_SHOT_PROMPT_INPUT_PARAMETER, visible_prompt)
 # The native text editor serializes a dict when entered through its setter.
 # Seed the typed input value directly to exercise the dictionary branch that
@@ -150,23 +153,27 @@ assert isinstance(live.get_parameter_value("additional_context"), dict)
 captured = []
 
 
-def no_model_call(self, agent, prompt):
+def no_model_call(agent, prompt, **kwargs):
     value = str(getattr(prompt, "value", prompt))
-    assert self._hmb_rules_active is True
-    assert self._hmb_runtime_prompt == machine_prompt
+    assert live._hmb_rules_active is True
+    assert live._hmb_runtime_prompt == machine_prompt
     assert value == merged + "\n\n" + agent_module._AGENT_ENGLISH_OUTPUT_CONTRACT
     assert digest(value[: len(machine_prompt)]) == snapshot["machine_sha256"]
     captured.append(value)
-    agent.tasks[0].output = native_module.TextArtifact(value="Literal context boundary passed.")
-    self._last_raw_output = "Literal context boundary passed."
-    return agent
+    # Keep the installed Standard _process/build/runner and its actual
+    # AgentRunResult lifecycle. Only the provider model is an in-memory test.
+    result = original_run_agent(agent, prompt, **kwargs)
+    assert isinstance(result, native_module.AgentRunResult)
+    assert result.output == "Literal context boundary passed."
+    assert result.new_messages()
+    return result
 
 
 try:
     native_module.resolve_cloud_api_key = lambda: "offline-non-billable-test"
     native_module.require_model_invocation_sync = lambda *args, **kwargs: None
-    native_module.try_throw_error = lambda *args, **kwargs: None
-    base_agent._process = no_model_call
+    native_runner.build_model = lambda _config: TestModel(custom_output_text="Literal context boundary passed.")
+    native_module.run_agent = no_model_call
     iterator = live.process()
     pending = next(iterator)
     assert callable(pending)
@@ -178,16 +185,25 @@ try:
     else:
         raise AssertionError("a second native/model step was requested")
 finally:
-    base_agent._process = original_step
+    native_runner.build_model = original_build_model
+    native_module.run_agent = original_run_agent
     native_module.resolve_cloud_api_key = original_key
     native_module.require_model_invocation_sync = original_invocation
-    native_module.try_throw_error = original_throw
 
 assert len(captured) == 1
 assert live._hmb_rules_active is False
 assert live._hmb_runtime_prompt == ""
 assert snapshot == original_snapshot and context == original_context
-assert "{{SIGN}}" not in str(live.parameter_output_values)
+assert live.parameter_output_values["output"] == "Literal context boundary passed."
+assert "{{SIGN}}" not in live.parameter_output_values["output"]
+# Current Standard persists real conversation history in the Agent state.
+# The exact approved input must remain literal in that history, while the
+# generated text output above must contain only the model result.
+saved_state = native_module.AgentState.from_wire(live.parameter_output_values["agent"])
+assert saved_state.runs() == [{
+    "input": merged + "\n\n" + agent_module._AGENT_ENGLISH_OUTPUT_CONTRACT,
+    "output": "Literal context boundary passed.",
+}]
 
 # Ordinary Agent workflows still use the installed Standard Agent's actual
 # Jinja semantics, including after the protected HMB execution was cleared.

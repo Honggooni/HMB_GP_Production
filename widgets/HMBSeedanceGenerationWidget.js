@@ -6,6 +6,7 @@ const HMB_SEEDANCE_COMMAND_VERSION = 1;
 const HMB_SEEDANCE_COMMAND_REGISTRY_KEY = "__HMB_SEEDANCE_REFRESH_BRIDGES_V1__";
 const HMB_SEEDANCE_BROKER_PARAMETER = "broker_server_url";
 const HMB_SEEDANCE_BROKER_DIALOGS = new WeakMap();
+const HMB_SEEDANCE_LOCAL_PREVIEW_LOADS = new WeakMap();
 const HMB_SEEDANCE_PROMPT_EDGE_REGISTRY_KEY = "__HMB_SEEDANCE_PROMPT_EDGE_REGISTRY_V1__";
 const HMB_SEEDANCE_PROMPT_EDGE_ATTRIBUTE = "data-hmb-seedance-prompt-edge";
 export const HMB_SEEDANCE_PREVIEW_ACTION_WATCHDOG_MS = 10_000;
@@ -76,6 +77,31 @@ function canonicalPreviewPhase(value) {
   return PREVIEW_PHASES.has(phase) ? phase : "idle";
 }
 
+function localOriginalPreview(value) {
+  if (!value || typeof value !== "object") return null;
+  const source = value.source;
+  const url = value.url;
+  if (
+    typeof source !== "string" || !source || source.length > 8192
+    || typeof url !== "string" || !url || url.length > 16384
+    || /[\u0000-\u001f\u007f]/.test(source + url)
+    || /^(?:https?:|data:|blob:)/i.test(source)
+  ) return null;
+  try {
+    const parsed = new URL(url);
+    const filename = source.replace(/\\/g, "/").split("/").pop();
+    const path = decodeURIComponent(parsed.pathname);
+    if (
+      !["http:", "https:"].includes(parsed.protocol)
+      || !["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)
+      || parsed.username || parsed.password || parsed.hash
+      || !/(?:^|\/)(?:workspace|external)\//.test(path)
+      || !filename || !path.endsWith(`/${filename}`)
+    ) return null;
+  } catch { return null; }
+  return { source, url };
+}
+
 export function hmbSeedanceGenerationPreview(value) {
   const candidate = value && typeof value === "object" && !Array.isArray(value)
     ? (value.generation && typeof value.generation === "object" ? value.generation : value)
@@ -99,7 +125,7 @@ export function hmbSeedanceGenerationPreview(value) {
   }
   const action = text(candidate.action, 32).toLowerCase() === "refresh_existing"
     ? "refresh_existing" : "none";
-  return {
+  const normalized = {
     schema: HMB_SEEDANCE_PREVIEW_SCHEMA,
     version: HMB_SEEDANCE_PREVIEW_VERSION,
     phase: canonicalPreviewPhase(candidate.phase),
@@ -111,6 +137,9 @@ export function hmbSeedanceGenerationPreview(value) {
     has_existing_video: candidate.has_existing_video === true,
     media_revision: boundedInteger(candidate.media_revision),
   };
+  const localPreview = localOriginalPreview(candidate.local_preview);
+  if (localPreview) normalized.local_preview = localPreview;
+  return normalized;
 }
 
 function elapsedLabel(seconds) {
@@ -128,12 +157,11 @@ export function hmbSeedancePreviewPresentation(value, options = {}) {
   const playableVideo = options.playableVideo === true;
   const visibleVideo = options.visibleVideo === true;
   const previewError = options.previewError === true;
-  const mediaFormat = text(options.mediaFormat, 16).toLowerCase();
   const elapsed = elapsedLabel(generation.elapsed_seconds);
   const base = {
     visible: true,
     phase: generation.phase,
-    mode: generation.has_existing_video && visibleVideo && playableVideo ? "badge" : "center",
+    mode: visibleVideo ? "badge" : "center",
     title: "",
     detail: generation.guidance,
     elapsed: "",
@@ -185,12 +213,15 @@ export function hmbSeedancePreviewPresentation(value, options = {}) {
         tone: "error",
       };
     case "succeeded":
-      if (playableVideo) return { ...base, visible: false, action: "none" };
+      // The native Griptape video loader owns loading, errors and playback.
+      // A completed original must retain its own controls even before canplay
+      // or after a transient media error; our status cannot hide that player.
+      if (visibleVideo || playableVideo) return { ...base, visible: false, action: "none" };
       if (previewError) {
         return {
           ...base,
-          title: `${mediaFormat === "mov" ? "MOV" : "영상"} 저장 완료 · 내장 미리보기 불가`,
-          detail: `파일은 정상 저장되었습니다. 외부 플레이어에서 ${mediaFormat === "mov" ? "MOV 파일" : "영상 파일"}을 여세요.`,
+          title: "영상 재생 오류",
+          detail: "파일은 저장되었습니다. 기본 비디오 로더에서 원본 영상을 확인하세요.",
           busy: false,
           tone: "warning",
           action: "none",
@@ -393,6 +424,9 @@ export function hmbSeedanceDraftState(value) {
     effective_resolution: text(source.effective_resolution, 16),
     busy: source.busy === true,
     final_busy: source.final_busy === true,
+    final_state: text(source.final_state, 32),
+    final_visible: Object.prototype.hasOwnProperty.call(source, "final_visible") ? source.final_visible === true : undefined,
+    final_task_id: text(source.final_task_id, 128),
     active_action: text(source.active_action, 80),
     cancel_available: source.cancel_available === true,
     active_job_id: text(source.active_job_id, 160),
@@ -1248,6 +1282,86 @@ function videoIdentity(video) {
   );
 }
 
+function sameLocalPreviewUrl(left, right) {
+  try { return new URL(left).href === new URL(right).href; }
+  catch { return false; }
+}
+
+export function hmbSeedanceConnectLocalPreview(container, generation, video, binding = null) {
+  if (!container || container.__hmbSeedancePreviewDisposed || !video) return false;
+  const local = localOriginalPreview(generation?.local_preview);
+  if (!local) return false;
+  const raw = video.getAttribute?.("data-raw-video-value") || "";
+  const src = video.getAttribute?.("src") || "";
+  const revision = boundedInteger(generation?.media_revision);
+  const previousOriginal = container.__hmbSeedanceLocalOriginalPreview;
+  if (raw === local.source && sameLocalPreviewUrl(src, local.url)) {
+    // An unchanged, versioned local URL still denotes the same saved bytes
+    // when a restored session rebases its private media counter. Adopt that
+    // counter without reloading; the actual decoder owns source readiness.
+    const decoded = !video.error && Number(video.readyState) >= 3
+      && sameLocalPreviewUrl(video.currentSrc, local.url);
+    if (binding) {
+      binding.awaitingRevision = revision;
+      binding.confirmedRevision = decoded ? revision : null;
+      binding.canPlay = decoded;
+      binding.previewError = Boolean(video.error) || (!decoded && binding.previewError);
+    }
+    container.__hmbSeedancePreviewReloadKey = `${revision}\u001f${videoIdentity(video)}`;
+    if (decoded && container.__hmbSeedanceConfirmedPreviewMedia?.identity === videoIdentity(video)) {
+      container.__hmbSeedanceConfirmedPreviewMedia.media_revision = revision;
+    }
+    container.__hmbSeedanceLocalOriginalPreview = { ...local, media_revision: revision };
+    return false;
+  }
+  // The native converter retains its last HTTP URL while resolving a new
+  // artifact. Replace only that previously proved original on a newer result;
+  // unrelated native HTTP sources and converted fallbacks remain untouched.
+  const replacingPreviousOriginal = raw === local.source
+    && canonicalPreviewPhase(generation?.phase) === "succeeded"
+    && previousOriginal && revision > previousOriginal.media_revision
+    && sameLocalPreviewUrl(src, previousOriginal.url);
+  if ((raw && raw !== local.source) || (src !== local.source && !(raw === local.source && !src))) {
+    if (!replacingPreviousOriginal) return false;
+  }
+  const key = `${revision}\u001f${local.source}\u001f${local.url}`;
+  if (HMB_SEEDANCE_LOCAL_PREVIEW_LOADS.get(video) === key) return false;
+  HMB_SEEDANCE_LOCAL_PREVIEW_LOADS.set(video, key);
+  // Try once for this element/revision, including exceptional host failures.
+  // A native remount may try again; progress echoes must never form a loop.
+  const previousBinding = binding && {
+    canPlay: binding.canPlay,
+    previewError: binding.previewError,
+    awaitingRevision: binding.awaitingRevision,
+    confirmedRevision: binding.confirmedRevision,
+  };
+  const previousReloadKey = container.__hmbSeedancePreviewReloadKey;
+  const previousFailure = container.__hmbSeedancePreviewFailure;
+  if (binding) {
+    binding.canPlay = false;
+    binding.previewError = false;
+    binding.awaitingRevision = generation.media_revision;
+    binding.confirmedRevision = null;
+  }
+  container.__hmbSeedancePreviewReloadKey = `${generation.media_revision}\u001f${videoIdentity(video)}`;
+  if (container.__hmbSeedancePreviewFailure?.key === binding?.mediaKey) {
+    delete container.__hmbSeedancePreviewFailure;
+  }
+  // This is Griptape's local file route to the original bytes. Keep the native
+  // element, controls, canonical artifact and authoring settings unchanged.
+  try {
+    video.setAttribute("src", local.url);
+    video.load?.();
+  } catch {
+    if (binding) Object.assign(binding, previousBinding);
+    container.__hmbSeedancePreviewReloadKey = previousReloadKey;
+    container.__hmbSeedancePreviewFailure = previousFailure;
+    return false;
+  }
+  container.__hmbSeedanceLocalOriginalPreview = { ...local, media_revision: revision };
+  return true;
+}
+
 function videoMediaFormat(identity) {
   const path = text(identity, 2048).toLowerCase().split(/[?#]/, 1)[0];
   const extension = path.match(/\.([a-z0-9]{2,8})$/)?.[1] || "";
@@ -1355,6 +1469,9 @@ function bindPreviewVideo(container, video) {
     onError: null,
   };
   binding.onCanPlay = () => {
+    const nativeSrc = video.getAttribute?.("src") || "";
+    if (binding.awaitingRevision !== null && nativeSrc && video.currentSrc
+        && !sameLocalPreviewUrl(video.currentSrc, nativeSrc)) return;
     binding.canPlay = true;
     binding.previewError = false;
     if (container.__hmbSeedancePreviewFailure?.key === binding.mediaKey) {
@@ -1501,14 +1618,20 @@ export function hmbSeedanceSyncDraftAction(container, state) {
   const button = container.querySelector?.("[data-hmb-seedance-finalize-draft]");
   if (!button) return false;
   const waiting = Boolean(container.__hmbSeedanceDraftPending);
-  button.hidden = !cancelling && (!state.draft.visible || !state.draft.job_id || Boolean(container.__hmbSeedancePendingShot));
-  button.disabled = button.hidden || waiting || (!cancelling && (!state.draft.final_available || state.draft.busy));
+  const hiddenFinal = state.draft.final_visible === false
+    || ["completed", "consumed", "expired", "not_draft"].includes(state.draft.final_state);
+  const verifiedAvailable = !state.draft.final_state || state.draft.final_state === "available";
+  button.hidden = !cancelling && (hiddenFinal || !state.draft.visible || !state.draft.job_id || Boolean(container.__hmbSeedancePendingShot));
+  button.disabled = button.hidden || waiting || (!cancelling && (!verifiedAvailable || !state.draft.final_available || state.draft.busy));
   button.setAttribute?.("aria-busy", waiting || (!cancelling && state.draft.final_busy) ? "true" : "false");
   button.title = container.__hmbSeedanceDraftError?.message || (cancelling
     ? "로컬 Final 조회를 중지합니다. 접수된 서버 렌더는 계속될 수 있습니다."
     : state.draft.reason || "완료된 Draft로 현재 Generator만 1회 실행해 1080p로 받습니다. 현재 프롬프트·소스·설정은 다시 전송하지 않으며 Agent도 재실행하지 않습니다. MOV 기본 · MOV 미지원 시 MP4.");
+  const statusLabel = state.draft.final_state === "checking" ? "Final 상태 확인 중…"
+    : ["reserved", "running"].includes(state.draft.final_state) ? "Final 처리 중…"
+    : ["unknown", "unavailable"].includes(state.draft.final_state) ? "Final 확인 필요" : "Draft final";
   setElementText(button, cancelling ? (waiting ? "중지 요청 중…" : "Final 중지")
-    : waiting || state.draft.final_busy ? "Final 처리 중…" : "Draft final");
+    : waiting || state.draft.final_busy ? "Final 처리 중…" : statusLabel);
   return !button.hidden;
 }
 
@@ -1527,6 +1650,7 @@ function requestDraftAction(container, action) {
   const available = (live) => cancelling
     ? live.draft.cancel_available && Boolean(live.draft.active_job_id)
     : !container.__hmbSeedancePendingShot && live.draft.visible && Boolean(live.draft.job_id)
+      && live.draft.final_visible !== false && (!live.draft.final_state || live.draft.final_state === "available")
       && live.draft.final_available && !live.draft.busy && !live.draft.cancel_available;
   if (
     !container || container.__hmbSeedancePreviewDisposed || container.isConnected === false
@@ -1745,12 +1869,35 @@ export function hmbSeedanceSyncPreviewOverlay(container, state, onRetrieve = nul
     binding.mediaKey = `${generation.media_revision}\u001f${identity}`;
     binding.mediaRevision = generation.media_revision;
     if (container.__hmbSeedancePreviewFailure?.key === binding.mediaKey) {
-      binding.previewError = true;
+      // The native player may already have recovered or been remounted before
+      // our ready listener runs. Actual decoded media is stronger evidence
+      // than an old element's cached error.
+      // Undecoded remounts keep the failure, without starting a reload loop.
+      if (!video?.error && Number(video.readyState) >= 3) {
+        binding.canPlay = true;
+        binding.previewError = false;
+        delete container.__hmbSeedancePreviewFailure;
+      } else {
+        binding.previewError = true;
+      }
     } else {
       delete container.__hmbSeedancePreviewFailure;
     }
   }
-  const waitingForSameSourceReload = armSameSourceRevisionReload(
+  const connectedLocalPreview = hmbSeedanceConnectLocalPreview(
+    container, generation, video, binding,
+  );
+  const localOriginal = localOriginalPreview(generation.local_preview);
+  const nativeRaw = video?.getAttribute?.("data-raw-video-value") || "";
+  // A new descriptor can precede React's raw artifact update. Never reload the
+  // retained old HTTP source while waiting for that exact original to arrive.
+  const awaitingLocalOriginal = Boolean(localOriginal && (
+    (nativeRaw && nativeRaw !== localOriginal.source)
+    || !sameLocalPreviewUrl(video?.getAttribute?.("src"), localOriginal.url)
+  ));
+  const awaitingDecodedRevision = binding?.awaitingRevision === generation.media_revision
+    && binding?.confirmedRevision !== generation.media_revision;
+  const waitingForSameSourceReload = connectedLocalPreview || awaitingLocalOriginal || awaitingDecodedRevision || armSameSourceRevisionReload(
     container,
     generation,
     identity,
@@ -1792,7 +1939,8 @@ export function hmbSeedanceSyncPreviewOverlay(container, state, onRetrieve = nul
   if (!overlay) return false;
   const pending = previewActionPending(container, generation);
   const visiblyBusy = presentation.busy || pending;
-  const staticPreview = !playableVideo && (!presentation.busy || binding?.previewError === true);
+  const staticPreview = !visibleVideo && !playableVideo
+    && (!presentation.busy || binding?.previewError === true);
   if (staticPreview) {
     if (region.getAttribute?.("data-hmb-seedance-preview-static") !== "true") {
       region.setAttribute?.("data-hmb-seedance-preview-static", "true");
@@ -1944,6 +2092,7 @@ export function hmbSeedanceCleanupPreviewOverlay(container) {
   delete container.__hmbSeedancePreviewActionError;
   delete container.__hmbSeedanceConfirmedPreviewMedia;
   delete container.__hmbSeedancePreviewReloadKey;
+  delete container.__hmbSeedanceLocalOriginalPreview;
   delete container.__hmbSeedancePreviewFailure;
   delete container.__hmbSeedancePreviewSyncScheduled;
   return true;
@@ -2036,8 +2185,84 @@ function hmbSeedanceResolveShotEcho(container, incomingProps) {
   };
 }
 
+const HMB_SEEDANCE_PREFLIGHT_SCHEMA = "hmb-seedance-render-preflight";
+
+export function hmbSeedancePreflightReport(props) {
+  const raw=props?.value ?? props?.parameterValue ?? props?.defaultValue ?? {};
+  const issue=value=>({message:String(value?.message || "").slice(0,300),severity:["error","warning","info"].includes(value?.severity)?value.severity:"info"});
+  return {schema:HMB_SEEDANCE_PREFLIGHT_SCHEMA,version:1,
+    phase:["idle","complete","stale","cancelled"].includes(raw.phase)?raw.phase:"idle",
+    request_id:/^[0-9a-f]{32}$/.test(String(raw.request_id || ""))?raw.request_id:"",
+    ok:raw.ok===true,notice:String(raw.notice || "점검 시점의 로컬 상태입니다. 업로드·Agent·렌더·연결 변경 없음.").slice(0,400),
+    checked_at_ms:boundedInteger(raw.checked_at_ms),
+    issues:Array.isArray(raw.issues)?raw.issues.slice(0,20).map(issue):[],
+    rows:Array.isArray(raw.rows)?raw.rows.slice(0,5).map(row=>({
+      number:boundedInteger(row.number,{min:1,max:5}),name:String(row.name || "Only").slice(0,128),
+      generator:String(row.generator || "").slice(0,256),model:String(row.model || "").slice(0,80),
+      task:String(row.task || "").slice(0,80),resolution:String(row.resolution || "").slice(0,32),
+      output:String(row.output || "").slice(0,128),status:["error","warning","ready"].includes(row.status)?row.status:"error",
+      media:row.media && typeof row.media==="object"?row.media:{},
+      connections:row.connections && typeof row.connections==="object"?Object.entries(row.connections).slice(0,12).map(([key,value])=>`${String(key).slice(0,64)}: ${String(value).slice(0,128)}`).join(" · "):"",
+      issues:Array.isArray(row.issues)?row.issues.slice(0,20).map(issue):[],
+    })):[]};
+}
+
+function hmbSeedancePreflightContainer(container,props) {
+  if((props?.value ?? props?.parameterValue ?? props?.defaultValue)?.schema===HMB_SEEDANCE_PREFLIGHT_SCHEMA)return true;
+  let current=container;
+  for(let n=0;current && n<8;n++,current=current.parentElement)if(current.getAttribute?.("data-parameter-name")==="HMB_SEEDANCE_PREFLIGHT")return true;
+  return false;
+}
+
+function hmbSeedancePreflightWidget(container,initialProps) {
+  if(container.__hmbSeedancePreflightHandle){container.__hmbSeedancePreflightHandle.update(initialProps);return container.__hmbSeedancePreflightHandle;}
+  let props=initialProps || {},disposed=false,report=hmbSeedancePreflightReport(props),pending=null,dialog=null;
+  const retired=new Set();const doc=container.ownerDocument || globalThis.document,win=doc?.defaultView || globalThis;
+  const nonce=()=>{const bytes=new Uint8Array(16);crypto.getRandomValues(bytes);return Array.from(bytes,x=>x.toString(16).padStart(2,"0")).join("");};
+  const clientSession=nonce();let sequence=0;
+  container.classList?.add("nodrag");
+  container.innerHTML=`<style>
+    .hmb-seedance-preflight{height:38px;display:flex;align-items:center;gap:9px;font:11px Inter,"Noto Sans KR",system-ui,sans-serif;color:#aeb9c9}
+    .hmb-seedance-preflight button{height:28px;padding:0 10px;border:1px solid #64748b;border-radius:7px;background:#151c2b;color:#dbeafe;font:inherit;font-weight:750;cursor:pointer;white-space:nowrap}
+    .hmb-seedance-preflight button:hover{border-color:#f472b6;color:#fff}.hmb-seedance-preflight [data-preflight-summary]{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    </style><div class="hmb-seedance-preflight nodrag"><button type="button" data-preflight-open aria-label="5샷 렌더 전 점검">✓ 5샷 점검</button><span data-preflight-summary>생성 없이 연결·입력 확인</span></div>`;
+  const openButton=container.querySelector("[data-preflight-open]"),summary=container.querySelector("[data-preflight-summary]");
+  const summaryText=()=>pending?"로컬 상태 점검 중…":report.phase==="complete"?(report.ok?(report.rows.some(row=>row.status==="warning") || report.issues.some(item=>item.severity==="warning")?"로컬 오류 없음 · 경고 확인":"로컬 오류 없음 · 결과 보기"):"확인할 항목 있음 · 결과 보기"):report.phase==="stale"?"선택 변경 · 다시 점검":"생성 없이 연결·입력 확인";
+  const syncSummary=()=>{const text=summaryText();if(summary.textContent!==text)summary.textContent=text;};
+  const stop=()=>{if(!pending)return;for(const id of pending.frames)win.cancelAnimationFrame(id);win.clearTimeout(pending.fallback);win.clearTimeout(pending.timeout);retired.add(pending.id);while(retired.size>256)retired.delete(retired.values().next().value);pending=null;};
+  const close=()=>{if(!dialog)return;dialog.remove();dialog=null;stop();syncSummary();};
+  const renderDialog=()=>{
+    if(!dialog)return;
+    const rows=report.rows.map(row=>`<tr data-preflight-row="${row.number}" style="--preflight-accent:${HMB_SEEDANCE_JEWEL_NIGHT_PALETTE[row.number]}"><th scope="row"><b>${escapeHtml(String(row.number).padStart(2,"0"))} · ${escapeHtml(row.name)}</b><small>${escapeHtml(row.generator)}</small></th><td>${escapeHtml(row.model)}<small>${escapeHtml(row.task)} · ${escapeHtml(row.resolution)}</small></td><td>이미지 ${Number.isInteger(row.media.images)?row.media.images:"미확인"} · 영상 ${Number.isInteger(row.media.videos)?row.media.videos:"미확인"} · 오디오 ${Number.isInteger(row.media.audio)?row.media.audio:"미확인"}<small>${escapeHtml(row.connections)}</small></td><td>${escapeHtml(row.output || "—")}</td><td data-preflight-status="${row.status}"><b>${({ready:"로컬 확인",warning:"주의",error:"확인 필요"})[row.status]}</b>${row.issues.filter(item=>item.severity!=="info").map(item=>`<small>${escapeHtml(item.message)}</small>`).join("")}</td></tr>`).join("");
+    dialog.innerHTML=`<style>
+      .hmb-preflight-backdrop{position:fixed;inset:0;z-index:2147483001;display:grid;place-items:center;padding:20px;background:rgba(1,5,14,.78);font-family:Inter,"Noto Sans KR",system-ui,sans-serif;color:#e7edf7}
+      .hmb-preflight-dialog{box-sizing:border-box;width:min(1160px,100%);min-width:0;max-height:88vh;display:flex;flex-direction:column;padding:20px;border:1px solid #9b4d7d;border-radius:13px;background:#0b1120;box-shadow:0 20px 50px rgba(0,0,0,.55)}
+      .hmb-preflight-dialog h2{margin:0 0 10px;font-size:18px}.hmb-preflight-dialog p{margin:0 0 12px;color:#b5c2d5;font-size:12px;line-height:1.5}.hmb-preflight-scroll{overflow:auto;min-height:0}.hmb-preflight-dialog table{width:100%;border-collapse:collapse;font-size:11px;text-align:left}.hmb-preflight-dialog th,.hmb-preflight-dialog td{padding:10px;border-bottom:1px solid #27324a;vertical-align:top;max-width:290px;overflow-wrap:anywhere}.hmb-preflight-dialog tbody th{border-left:3px solid var(--preflight-accent);color:var(--preflight-accent);min-width:140px}.hmb-preflight-dialog small{display:block;margin-top:5px;font-weight:400;color:#aeb9c9;font-size:10px}.hmb-preflight-dialog [data-preflight-status="error"]>b{color:#fb7185}.hmb-preflight-dialog [data-preflight-status="warning"]>b{color:#eab308}.hmb-preflight-dialog [data-preflight-status="ready"]>b{color:#10b981}.hmb-preflight-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:15px}.hmb-preflight-actions button{padding:8px 12px;border:1px solid #52617a;border-radius:7px;background:#182338;color:#e7edf7;font:12px system-ui;cursor:pointer}.hmb-preflight-actions button[data-preflight-recheck]{border-color:#f472b6;background:#9d326d;color:#fff}.hmb-preflight-busy{padding:25px;color:#dbeafe}
+    </style><section class="hmb-preflight-dialog" role="dialog" aria-modal="true" aria-labelledby="hmb-preflight-title"><h2 id="hmb-preflight-title">렌더 전 일괄 점검</h2><p>${escapeHtml(report.notice)}</p><div class="hmb-preflight-scroll">${pending?'<div class="hmb-preflight-busy" role="status">연결·미디어 수량·모델·설정·출력 경로를 확인 중입니다…</div>':`${report.issues.map(item=>`<p role="status">${escapeHtml(item.message)}</p>`).join("")}<table><thead><tr><th>ImageAsset Shot</th><th>모델 / 작업</th><th>입력 / 연결</th><th>출력 파일</th><th>점검 결과</th></tr></thead><tbody>${rows}</tbody></table>${report.checked_at_ms?`<p style="margin-top:12px">점검 시각 ${escapeHtml(new Date(report.checked_at_ms).toLocaleTimeString())} · 설정을 바꾼 후에는 다시 점검하세요.</p>`:""}`}</div><div class="hmb-preflight-actions">${pending?'<button type="button" data-preflight-cancel>점검 취소</button>':'<button type="button" data-preflight-recheck>다시 점검</button>'}<button type="button" data-preflight-close>닫기</button></div></section>`;
+    dialog.querySelector("[data-preflight-close]")?.addEventListener("click",close);
+    dialog.querySelector("[data-preflight-recheck]")?.addEventListener("click",inspect);
+    dialog.querySelector("[data-preflight-cancel]")?.addEventListener("click",()=>{
+      const previous=pending;stop();report={...report,phase:"cancelled",rows:[],issues:[{severity:"info",message:"점검을 취소했습니다. 생성 작업에는 영향이 없습니다."}]};renderDialog();syncSummary();
+      if(previous?.dispatched && typeof props.onChange==="function")try{Promise.resolve(props.onChange({schema:HMB_SEEDANCE_PREFLIGHT_SCHEMA,version:1,action:"cancel",request_id:previous.id,client_session:clientSession,sequence:previous.sequence})).catch(()=>{});}catch{}
+    });
+  };
+  const inspect=()=>{
+    if(disposed || pending)return;
+    const id=nonce();const ticket={id,sequence:++sequence,frames:[],dispatched:false};pending=ticket;renderDialog();syncSummary();
+    const fail=()=>{if(disposed || pending!==ticket)return;stop();report={...report,phase:"stale",rows:[],issues:[{severity:"warning",message:"점검 응답을 확인하지 못했습니다. 다시 점검하세요. 생성은 시작되지 않았습니다."}]};renderDialog();syncSummary();};
+    const dispatch=()=>{if(disposed || pending!==ticket || ticket.dispatched)return;ticket.dispatched=true;win.clearTimeout(ticket.fallback);try{if(typeof props.onChange!=="function")throw Error("No transport");Promise.resolve(props.onChange({schema:HMB_SEEDANCE_PREFLIGHT_SCHEMA,version:1,action:"inspect",request_id:id,client_session:clientSession,sequence:ticket.sequence})).catch(fail);}catch{fail();}};
+    ticket.frames.push(win.requestAnimationFrame(()=>{if(!disposed && pending===ticket)ticket.frames.push(win.requestAnimationFrame(dispatch));}));ticket.fallback=win.setTimeout(dispatch,120);ticket.timeout=win.setTimeout(fail,10000);
+  };
+  const open=()=>{if(disposed)return;if(!dialog){dialog=doc.createElement("div");dialog.className="hmb-preflight-backdrop nodrag";doc.body.appendChild(dialog);dialog.addEventListener("click",event=>{if(event.target===dialog)close();});dialog.addEventListener("keydown",event=>{event.stopPropagation?.();if(event.key==="Escape")close();});}renderDialog();if(!report.rows.length)inspect();};
+  const isolate=event=>{if(Number(event.button)!==1)event.stopPropagation?.();};
+  openButton.addEventListener("click",open);container.addEventListener?.("pointerdown",isolate);
+  const handle={update(next){if(disposed)return;props=next || props;const incoming=hmbSeedancePreflightReport(props);if(!pending || !["complete","stale","cancelled"].includes(incoming.phase) || retired.has(incoming.request_id) || incoming.request_id!==pending.id)return;stop();report=incoming;renderDialog();syncSummary();},cleanup(){if(disposed)return;disposed=true;close();stop();openButton.removeEventListener("click",open);container.removeEventListener?.("pointerdown",isolate);delete container.__hmbSeedancePreflightHandle;container.innerHTML="";}};
+  container.__hmbSeedancePreflightHandle=handle;syncSummary();return handle;
+}
+
 export default function HMBSeedanceGenerationWidget(container, props) {
   if (!container) return { cleanup() {}, update() {} };
+  if(hmbSeedancePreflightContainer(container,props))return hmbSeedancePreflightWidget(container,props);
   if (hmbSeedanceCommandProps(props) || hmbSeedanceCommandContainer(container)) {
     return hmbSeedanceCommandBridgeWidget(container, props);
   }

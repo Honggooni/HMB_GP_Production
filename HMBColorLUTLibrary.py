@@ -237,15 +237,17 @@ class HMBColorLUTLibrary(DataNode):
         if not shot.get("shot_uuid") and saved.get("source", {}).get("path"):
             self._queue_source(saved["source"])
 
-    def _apply_ui(self, value: Any) -> None:
+    def _apply_ui(self, value: Any, *, initial_setup: bool = False) -> None:
         if not isinstance(value, Mapping):
             return
-        command = value.get("__hmb_color_lut_command__")
+        command = None if initial_setup else value.get("__hmb_color_lut_command__")
         with self._lock:
+            if self._hmb_node_deleted:
+                return
             # A serialized backend state contains shot_states; a live widget
             # edit deliberately does not. Never hydrate read-only source data
             # back from that first compact edit after automatic routing.
-            initial = not self._hydrated and isinstance(value.get("shot_states"), Mapping)
+            initial = initial_setup or (not self._hydrated and isinstance(value.get("shot_states"), Mapping))
             self._hydrated = True
             supplied_project = str(value.get("project_id") or "")
             current_project = self._hmb_color_lut_state["project_id"]
@@ -254,8 +256,16 @@ class HMBColorLUTLibrary(DataNode):
                 # A debounced edit/command can arrive after ImageAsset has
                 # changed the project. Never reinterpret its settings as an
                 # edit of the newly selected project, even at a higher UI rev.
-                self._publish()
+                if not initial_setup:
+                    self._publish()
                 return
+            if initial_setup:
+                # Registration may already have queued an older Shot probe.
+                # Its late result must not replace the restored Shot's source.
+                self._source_token += 1
+                self._source_pending = None
+                self._pending_source_key = None
+                self._restoring_source = {}
             if initial:
                 self._hydrated = True
                 histories = value.get("shot_states")
@@ -291,11 +301,18 @@ class HMBColorLUTLibrary(DataNode):
                         self._hmb_color_lut_state["source"], self._hmb_color_lut_state["result"] = {}, {}
             self._hmb_initial_shot_autoclaim_pending = False
             self._hmb_color_lut_state["language"] = "en" if value.get("language") == "en" else "ko"
-            self._hmb_color_lut_state["preset_name"] = str(value.get("preset_name") or "")[:80]
-            self._hmb_color_lut_state["revision"] = max(revision, self._hmb_color_lut_state["revision"]) + 1
+            if initial or not changed:
+                self._hmb_color_lut_state["preset_name"] = str(value.get("preset_name") or "")[:80]
+            self._hmb_color_lut_state["revision"] = revision if initial_setup else max(revision, self._hmb_color_lut_state["revision"]) + 1
             self._remember_selection()
-            if initial and not shot.get("shot_uuid") and self._hmb_color_lut_state["source"].get("path"):
+            if initial and not initial_setup and not shot.get("shot_uuid") and self._hmb_color_lut_state["source"].get("path"):
                 self._queue_source(self._hmb_color_lut_state["source"])
+        if initial_setup:
+            # Native DeserializeFlow suppresses after_value_set. Restore only
+            # private authoring here, before deferred routing can publish a
+            # default state over the saved value. Never replay saved commands,
+            # probe media, publish or reconcile during partial hydration.
+            return
         self._publish()
         if changed:
             self._reconcile()
@@ -628,6 +645,43 @@ class HMBColorLUTLibrary(DataNode):
     def _hmb_post_registration_shot_discovery(self) -> None:
         if not self._hmb_node_deleted:
             self._reconcile()
+            self._hmb_post_hydration_state_restore()
+
+    def _hmb_post_hydration_state_restore(self) -> None:
+        with self._lock:
+            state = self._hmb_color_lut_state
+            if not self._hmb_node_deleted and self._hydrated and not state["shot"].get("shot_uuid") and state["source"].get("path"):
+                self._queue_source(state["source"])
+
+    def set_parameter_value(self, name: str, value: Any, *args: Any, **kwargs: Any) -> Any:
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return super().set_parameter_value(name, value, *args, **kwargs)
+        # Publication owns this same lock. A concurrent saved value must wait
+        # until _syncing clears; only same-thread publication echoes may skip it.
+        with lock:
+            saved = (kwargs.get("initial_setup") is True and name == UI
+                     and not self._syncing and not self._hmb_node_deleted and isinstance(value, Mapping))
+            if saved:
+                value = copy.deepcopy(value)
+                value.pop("__hmb_color_lut_command__", None)
+                supplied_project = str(value.get("project_id") or "")
+                current_project = str(self._hmb_color_lut_state.get("project_id") or "")
+                if self._project_authoritative and supplied_project != current_project:
+                    value = copy.deepcopy(self._hmb_color_lut_state)
+            result = super().set_parameter_value(name, value, *args, **kwargs)
+            if saved:
+                self._apply_ui(value, initial_setup=True)
+                # Mirror only the normalized private state. Foreign source or
+                # stale project fields must not remain visible in native UI.
+                super().set_parameter_value(name, copy.deepcopy(self._hmb_color_lut_state), *args, **kwargs)
+        if saved and not self._hmb_node_deleted:
+            try:
+                from _hmb_shot_routing import schedule_post_hydration_reconcile
+                schedule_post_hydration_reconcile(self)
+            except Exception:
+                LOGGER.debug("Color LUT hydration discovery deferred", exc_info=True)
+        return result
 
     def after_value_set(self, parameter: Any, value: Any) -> Any:
         # Wait for another thread\'s publication; only same-thread echoes may be skipped.
@@ -654,11 +708,12 @@ class HMBColorLUTLibrary(DataNode):
         self._queue_source(_raw_parameter(self, SOURCE))
 
     def after_node_deleted(self, *args: Any, **kwargs: Any) -> Any:
-        if self._hmb_node_deleted:
-            return None
-        self._hmb_node_deleted = True
-        self._source_token += 1
-        self._cancel.set()
+        with self._lock:
+            if self._hmb_node_deleted:
+                return None
+            self._hmb_node_deleted = True
+            self._source_token += 1
+            self._cancel.set()
         try:
             from _hmb_shot_routing import prepare_node_deletion, release_node_lifecycle, schedule_post_deletion_reconcile
             prepare_node_deletion(self)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from array import array
 from contextlib import contextmanager
 from pathlib import Path
 import asyncio
@@ -365,6 +366,57 @@ def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+class _ImageCatalogSearchIndex:
+    """Immutable, background-built substring index; no files or SDK access."""
+
+    def __init__(self, assets: Sequence[Dict[str, Any]], cancelled: Callable[[], bool] = lambda: False):
+        fields = ("asset_id", "image_name", "relative_path", "image_main_type", "image_sub_type", "source_kind", "asset_library_id")
+        self.assets = tuple({key: _clean(asset.get(key)) for key in fields} for asset in assets)
+        self.texts: List[str] = []
+        self.postings: Dict[str, Any] = {}
+        self.folder_counts: Dict[str, int] = {}
+        self.stats = {"records": len(assets), "queries": 0, "candidate_checks": 0}
+        for number, asset in enumerate(self.assets):
+            if number % 256 == 0 and cancelled():
+                raise InterruptedError("Catalog index retired")
+            text = "\n".join(_clean(asset.get(key)).lower() for key in
+                ("asset_id", "image_name", "relative_path", "image_main_type", "image_sub_type"))
+            self.texts.append(text)
+            for gram in set(text[pos:pos + 3] for pos in range(max(0, len(text) - 2))):
+                self.postings.setdefault(gram, array("I")).append(number)
+            if asset.get("source_kind") == "project":
+                parts = _clean(asset.get("relative_path")).replace("\\", "/").split("/")[:-1]
+                for depth in range(len(parts) + 1):
+                    folder = "/".join(parts[:depth])
+                    self.folder_counts[folder] = self.folder_counts.get(folder, 0) + 1
+
+    def query(self, request: Dict[str, Any], cancelled: Callable[[], bool] = lambda: False) -> Dict[str, Any]:
+        needle = str(request.get("query") or "").strip().lower()
+        folder = _clean(request.get("folder")).replace("\\", "/").strip("/").lower()
+        source = "user" if request.get("source_view") == "user" else "project"
+        candidates: Any = range(len(self.assets))
+        if len(needle) >= 3:
+            grams = {needle[pos:pos + 3] for pos in range(len(needle) - 2)}
+            candidates = min((self.postings.get(gram, ()) for gram in grams), key=len)
+        matches = []
+        for position, number in enumerate(candidates):
+            if position % 256 == 0 and cancelled():
+                raise InterruptedError("Catalog query retired")
+            asset = self.assets[number]
+            relative = _clean(asset.get("relative_path")).replace("\\", "/").lower()
+            if asset.get("source_kind") != source or (source == "project" and folder
+                    and not (relative == folder or relative.startswith(folder + "/"))):
+                continue
+            self.stats["candidate_checks"] += 1
+            if not needle or needle in self.texts[number]:
+                matches.append(number)
+        self.stats["queries"] += 1
+        limit = min(80, max(1, _non_negative_int(request.get("limit")) or 80))
+        offset = min(_non_negative_int(request.get("offset")), ((len(matches) - 1) // limit) * limit if matches else 0)
+        return {"total": len(matches), "offset": offset, "limit": limit,
+            "asset_library_ids": [_clean(self.assets[number].get("asset_library_id")) for number in matches[offset:offset + limit]]}
+
+
 def _default_thumbnail_bridge(runtime_instance_id: Any = "") -> Dict[str, Any]:
     return {
         "schema": THUMBNAIL_BRIDGE_SCHEMA,
@@ -373,6 +425,7 @@ def _default_thumbnail_bridge(runtime_instance_id: Any = "") -> Dict[str, Any]:
         "operation": "idle",
         "phase": "idle",
         "request_id": "",
+        "catalog_page_version": 1,
     }
 
 
@@ -381,6 +434,21 @@ def _normalize_thumbnail_bridge(value: Any) -> Dict[str, Any]:
     bridge = _default_thumbnail_bridge(raw.get("runtime_instance_id"))
     operation = _clean(raw.get("operation")).casefold()
     phase = _clean(raw.get("phase")).casefold()
+    if operation == "catalog_page" and phase in {"request", "result"}:
+        for field in ("request_id", "session_id", "project_uid", "project_cache_uid", "manifest_signature", "folder_signature"):
+            bridge[field] = _clean(raw.get(field))[:256]
+        bridge.update(operation=operation, phase=phase,
+            scan_revision=_non_negative_int(raw.get("scan_revision")),
+            import_revision=_non_negative_int(raw.get("import_revision")),
+            sequence=_non_negative_int(raw.get("sequence")),
+            query=str(raw.get("query") or "")[:256],
+            folder=_clean(raw.get("folder")).replace("\\", "/").strip("/")[:4096],
+            source_view="user" if raw.get("source_view") == "user" else "project",
+            offset=_non_negative_int(raw.get("offset")), limit=min(80, max(1, _non_negative_int(raw.get("limit")) or 80)))
+        if phase == "result":
+            bridge["state"] = raw.get("state") if isinstance(raw.get("state"), dict) else {}
+            bridge["outcome"] = _clean(raw.get("outcome"))[:32]
+        return bridge
     if operation == CATALOG_PROBE_OPERATION and phase in {"request", "result"}:
         bridge.update(
             {
@@ -7848,6 +7916,7 @@ def _stage_and_notify_image_output_pair(
     *,
     stage_outputs: bool = True,
     replace_pending: bool = True,
+    notify_unchanged_shot: bool = False,
 ) -> None:
     """Stage both sibling caches, then independently notify live connections."""
     output_values = getattr(node, "parameter_output_values", None)
@@ -7860,9 +7929,11 @@ def _stage_and_notify_image_output_pair(
         if isinstance(output_values, dict)
         else getattr(node, SHOT_ASSET_OUTPUT_PARAMETER, None)
     )
+    # Exact media readiness can change while a restored Shot token stays equal.
+    # Only its validated completion callback requests this one extra wake.
     shot_output_changed = bool(
         shot_asset_output is not None
-        and current_shot_output != shot_asset_output
+        and (current_shot_output != shot_asset_output or notify_unchanged_shot)
     )
     if shot_output_changed:
         synchronized_outputs += ((SHOT_ASSET_OUTPUT_PARAMETER, shot_asset_output),)
@@ -8873,6 +8944,14 @@ class HMBImageAssetLibrary(DataNode):
         Legacy full snapshots keep their existing hydration/scan contract.
         """
         raw = dict(_parse_mapping(value))
+        if raw.get("schema") == STATE_SCHEMA and isinstance(raw.get("catalog_page"), dict):
+            # Display pages never replace the full canonical persisted catalog.
+            base = _parse_mapping(getattr(self, "_hmb_last_accepted_widget_state", ""))
+            if not base or base.get("schema") != STATE_SCHEMA:
+                raise ValueError("A display page requires an accepted ImageAsset catalog.")
+            raw.pop("catalog_page", None)
+            raw["assets"] = base.get("assets", [])
+            raw["folders"] = base.get("folders", [])
         if raw.get("schema") != IMAGE_ASSET_EDIT_SCHEMA:
             return raw
         revision = raw.get(UI_EDIT_REVISION_KEY)
@@ -8959,6 +9038,22 @@ class HMBImageAssetLibrary(DataNode):
         normalized_state: Dict[str, Any],
         serialized: str = "",
     ) -> None:
+        # A detached scalar search projection owns index invalidation. Selection
+        # and thumbnail edits do not rebuild it; same-count metadata edits do.
+        fields = ("asset_id", "image_name", "relative_path", "image_main_type",
+                  "image_sub_type", "source_kind", "asset_library_id", "source_uid")
+        projection = tuple(tuple(_clean(asset.get(key)) for key in fields)
+                           for asset in normalized_state.get("assets", []))
+        if projection != getattr(self, "_hmb_catalog_search_projection", None):
+            self._hmb_catalog_search_projection = projection
+            self._hmb_catalog_search_catalog_revision = (
+                getattr(self, "_hmb_catalog_search_catalog_revision", 0) + 1)
+        # Owner-local accepted read view; never authority supplied by a page.
+        self._hmb_catalog_search_authority = normalized_state
+        self._hmb_catalog_search_assets = {
+            _clean(asset.get("asset_library_id")): asset for asset in normalized_state.get("assets", [])}
+        self._hmb_catalog_search_selected = tuple(
+            asset for asset in normalized_state.get("assets", []) if asset.get("selected"))
         self._hmb_last_accepted_widget_state = serialized or _json_text(normalized_state)
         self._hmb_last_accepted_widget_revisions = (
             _non_negative_int(normalized_state.get("scan_revision")),
@@ -9158,7 +9253,11 @@ class HMBImageAssetLibrary(DataNode):
             return False
         with work["lock"]:
             ready = work.get("ready")
-            work["ready"] = None
+            # A snapshot reader may warm the cache before the queued host
+            # callback runs. Only that publishing callback may consume its
+            # notification; otherwise the ready Prompt/Agent wake is lost.
+            if publish:
+                work["ready"] = None
         if ready is None or not self._scan_owner_is_current():
             return False
         identity, epoch, entries = ready
@@ -9172,7 +9271,7 @@ class HMBImageAssetLibrary(DataNode):
         if publish and not live.get("scan_busy"):
             # Only the current selection owns publication. A late completion
             # can warm its exact project cache, never restore a previous click.
-            self._sync_output(live, normalized=True)
+            self._sync_output(live, normalized=True, selection_ready=True)
             self._reconcile_hmb_shot_routing(
                 _shot_routing_catalog_identity(live, normalized=True)
             )
@@ -9294,6 +9393,7 @@ class HMBImageAssetLibrary(DataNode):
         *,
         force: bool = False,
         normalized: bool = False,
+        selection_ready: bool = False,
     ) -> Dict[str, Any]:
         normalized_state = state if normalized else _normalize_state(state)
         normalized = normalized_state
@@ -9352,7 +9452,8 @@ class HMBImageAssetLibrary(DataNode):
                 else None
             )
             if (
-                current_asset_output != cached_asset_output
+                selection_ready
+                or current_asset_output != cached_asset_output
                 or current_media_output != cached_media_output
                 or current_shot_output != shot_token
             ):
@@ -9368,6 +9469,7 @@ class HMBImageAssetLibrary(DataNode):
                         else cached_media_output
                     ),
                     shot_token,
+                    notify_unchanged_shot=selection_ready,
                 )
             elif getattr(self, "_hmb_pending_output_notifications", None):
                 _stage_and_notify_image_output_pair(
@@ -9423,6 +9525,7 @@ class HMBImageAssetLibrary(DataNode):
             asset_output_value,
             media_output_value,
             self._shot_asset_dependency_token(shot_snapshot),
+            notify_unchanged_shot=selection_ready,
         )
         return normalized
 
@@ -9433,6 +9536,172 @@ class HMBImageAssetLibrary(DataNode):
             if isinstance(state.get("shot_routing"), dict)
             else ""
         )
+
+    def _catalog_search_epoch(self, state: Dict[str, Any]) -> tuple:
+        return tuple(_clean(state.get(key)) for key in
+            ("project_uid", "project_cache_uid", "project_root", "manifest_signature", "folder_signature")) + (
+            self._thumbnail_runtime_id(state), _non_negative_int(state.get("scan_revision")),
+            _non_negative_int(getattr(self, "_hmb_import_revision", 0)),
+            _non_negative_int(getattr(self, "_hmb_catalog_search_catalog_revision", 0)),
+            len(state.get("assets", [])))
+
+    def _catalog_page_projection(self, state: Dict[str, Any], page: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        """Presentation only. The raw property and routing outputs stay full."""
+        page = dict(page or getattr(self, "_hmb_catalog_search_page", {}) or {})
+        epoch = self._catalog_search_epoch(state)
+        if page.get("epoch") != epoch:
+            ids = [_clean(asset.get("asset_library_id")) for asset in state.get("assets", [])
+                   if asset.get("source_kind") == "project"][:80]
+            page = {"query": "", "folder": "", "source_view": "project", "offset": 0,
+                "limit": 80, "total": state.get("status", {}).get("project_asset_count", len(state.get("assets", []))),
+                "asset_library_ids": ids, "epoch": epoch}
+        wanted = set(page.get("asset_library_ids", []))
+        if state is getattr(self, "_hmb_catalog_search_authority", None):
+            by_id = self._hmb_catalog_search_assets
+            assets = list(self._hmb_catalog_search_selected)
+            selected = {_clean(asset.get("asset_library_id")) for asset in assets}
+            assets.extend(by_id[key] for key in page.get("asset_library_ids", [])
+                          if key in by_id and key not in selected)
+        else:
+            assets = [asset for asset in state.get("assets", [])
+                      if asset.get("selected") or _clean(asset.get("asset_library_id")) in wanted]
+        # The retained tree repeats every asset ID. The widget derives its
+        # folder tree from folders/counts, so never copy that full export here.
+        dto = {key: value for key, value in state.items() if key not in {"assets", "catalog_page", "tree"}}
+        dto["assets"] = assets
+        dto["catalog_page"] = {key: value for key, value in page.items() if key != "epoch"}
+        dto["catalog_page"].update(version=1,
+            import_revision=_non_negative_int(getattr(self, "_hmb_import_revision", 0)),
+            catalog_revision=_non_negative_int(getattr(self, "_hmb_catalog_search_catalog_revision", 0)),
+            runtime_instance_id=self._thumbnail_runtime_id(state),
+            project_uid=state.get("project_uid", ""), project_cache_uid=state.get("project_cache_uid", ""),
+            manifest_signature=state.get("manifest_signature", ""), scan_revision=state.get("scan_revision", 0))
+        return dto
+
+    def _consume_catalog_search_result(self) -> bool:
+        lock = getattr(self, "_hmb_catalog_search_lock", None)
+        if lock is None:
+            return False
+        with lock:
+            ready = list(getattr(self, "_hmb_catalog_search_results", {}).values())
+            self._hmb_catalog_search_results = OrderedDict()
+        if not ready or not self._scan_owner_is_current():
+            return False
+        for generation, request, page in ready:
+            state = getattr(self, "_hmb_catalog_search_authority", None)
+            if (not isinstance(state, dict) or generation != self._hmb_catalog_search_generations.get(request["session_id"])
+                    or page["epoch"] != self._catalog_search_epoch(state)):
+                continue
+            self._hmb_catalog_search_page = page
+            self._set_thumbnail_bridge_value({**request, "phase": "result", "outcome": "ready",
+                "state": self._catalog_page_projection(state, page)})
+        return True
+
+    def _request_catalog_search(self, request: Dict[str, Any]) -> None:
+        state = getattr(self, "_hmb_catalog_search_authority", None)
+        if not isinstance(state, dict):
+            state = self._current_state()
+        if (request.get("runtime_instance_id") != self._thumbnail_runtime_id(state)
+                or not request.get("session_id") or not request.get("request_id")
+                or any(_clean(request.get(key)) != _clean(state.get(key)) for key in
+                    ("project_uid", "project_cache_uid", "manifest_signature", "folder_signature"))
+                or _non_negative_int(request.get("scan_revision")) != _non_negative_int(state.get("scan_revision"))):
+            return
+        if not hasattr(self, "_hmb_catalog_search_lock"):
+            self._hmb_catalog_search_lock = threading.RLock()
+            self._hmb_catalog_search_generation = 0
+            self._hmb_catalog_search_generations = {}
+            self._hmb_catalog_search_sequences = OrderedDict()
+            self._hmb_catalog_search_pending = OrderedDict()
+            self._hmb_catalog_search_results = OrderedDict()
+            self._hmb_catalog_search_index = None
+            self._hmb_catalog_search_index_epoch = None
+            self._hmb_catalog_search_thread = None
+            self._hmb_catalog_search_builds = 0
+        epoch = self._catalog_search_epoch(state)
+        with self._hmb_catalog_search_lock:
+            session = request["session_id"]
+            previous_sequence = self._hmb_catalog_search_sequences.get(session, -1)
+            if request["sequence"] <= previous_sequence:
+                return
+            self._hmb_catalog_search_sequences[session] = request["sequence"]
+            self._hmb_catalog_search_sequences.move_to_end(session)
+            while len(self._hmb_catalog_search_sequences) > 16:
+                retired, _ = self._hmb_catalog_search_sequences.popitem(last=False)
+                self._hmb_catalog_search_generations.pop(retired, None)
+                self._hmb_catalog_search_pending.pop(retired, None)
+                self._hmb_catalog_search_results.pop(retired, None)
+            self._hmb_catalog_search_generation += 1
+            generation = self._hmb_catalog_search_generation
+            self._hmb_catalog_search_generations[session] = generation
+            self._hmb_catalog_search_pending[session] = (
+                generation, dict(request), epoch,
+                getattr(self, "_hmb_catalog_search_projection", ()))
+            if self._hmb_catalog_search_thread is not None:
+                return
+            host_context = contextvars.copy_context()
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is None:
+                try:
+                    from griptape_nodes.retained_mode.engine import has_current_engine
+                    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+                    if has_current_engine():
+                        loop = GriptapeNodes.EventManager().event_loop
+                except (ImportError, AttributeError):
+                    pass
+            node_ref = weakref.ref(self)
+
+            def worker() -> None:
+                owner = node_ref()
+                if owner is None:
+                    return
+                while True:
+                    with owner._hmb_catalog_search_lock:
+                        if not owner._hmb_catalog_search_pending:
+                            owner._hmb_catalog_search_thread = None
+                            return
+                        _, job = owner._hmb_catalog_search_pending.popitem(last=False)
+                    current_generation, intent, identity, projection = job
+                    def epoch_retired() -> bool:
+                        live = getattr(owner, "_hmb_catalog_search_authority", {})
+                        return bool(getattr(owner, "_hmb_node_deleted", False)) or identity != owner._catalog_search_epoch(live)
+                    try:
+                        if owner._hmb_catalog_search_index_epoch != identity:
+                            fields = ("asset_id", "image_name", "relative_path", "image_main_type",
+                                      "image_sub_type", "source_kind", "asset_library_id", "source_uid")
+                            index = _ImageCatalogSearchIndex(
+                                [dict(zip(fields, row)) for row in projection], epoch_retired)
+                            if epoch_retired():
+                                continue
+                            owner._hmb_catalog_search_index = index
+                            owner._hmb_catalog_search_index_epoch = identity
+                            owner._hmb_catalog_search_builds += 1
+                        index = owner._hmb_catalog_search_index
+                        if index is None or epoch_retired():
+                            continue
+                        page = index.query(intent, lambda: epoch_retired() or current_generation != owner._hmb_catalog_search_generations.get(intent["session_id"]))
+                        if epoch_retired():
+                            continue
+                        page.update({key: intent[key] for key in ("query", "folder", "source_view", "session_id", "sequence")})
+                        page.update(epoch=identity, folder_counts=index.folder_counts,
+                            index_builds=owner._hmb_catalog_search_builds)
+                        with owner._hmb_catalog_search_lock:
+                            if current_generation != owner._hmb_catalog_search_generations.get(intent["session_id"]):
+                                continue
+                            owner._hmb_catalog_search_results[intent["session_id"]] = (current_generation, intent, page)
+                        if loop is not None and loop.is_running():
+                            loop.call_soon_threadsafe(host_context.copy().run, owner._consume_catalog_search_result)
+                    except InterruptedError:
+                        continue
+                    except Exception as exc:
+                        _diagnostic_exception("ImageAsset catalog page preparation failed", exc)
+
+            thread = threading.Thread(target=worker, name="HMB-image-catalog-search", daemon=True)
+            self._hmb_catalog_search_thread = thread
+            thread.start()
 
     def _set_thumbnail_bridge_value(self, value: Dict[str, Any]) -> None:
         normalized = _normalize_thumbnail_bridge(value)
@@ -11535,8 +11804,12 @@ class HMBImageAssetLibrary(DataNode):
         return normalized
 
     def _apply_thumbnail_bridge_request(self, value: Any) -> None:
+        self._consume_catalog_search_result()
         self._consume_pending_catalog_probe_result()
         bridge = _normalize_thumbnail_bridge(value)
+        if bridge.get("operation") == "catalog_page" and bridge.get("phase") == "request":
+            self._request_catalog_search(bridge)
+            return
         if (
             bridge.get("operation") == CATALOG_PROBE_OPERATION
             and bridge.get("phase") == "request"
@@ -12030,6 +12303,14 @@ class HMBImageAssetLibrary(DataNode):
         first_delete = not bool(getattr(self, "_hmb_node_deleted", False))
         if first_delete:
             self._hmb_node_deleted = True
+            search_lock = getattr(self, "_hmb_catalog_search_lock", None)
+            if search_lock is not None:
+                with search_lock:
+                    self._hmb_catalog_search_pending.clear()
+                    self._hmb_catalog_search_results.clear()
+                    self._hmb_catalog_search_generations.clear()
+                    self._hmb_catalog_search_index = None
+                    self._hmb_catalog_search_index_epoch = None
             _release_import_child_removal_observers(self)
             self._hmb_reserved_shot_catalog_identity = ""
             self._hmb_fresh_registration_scan_key = ""

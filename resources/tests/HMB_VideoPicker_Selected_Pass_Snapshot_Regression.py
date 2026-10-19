@@ -116,13 +116,17 @@ with tempfile.TemporaryDirectory(prefix="hmb-selected-snapshot-") as temporary:
                 assert "depth_range_bindings" not in job
             if role == "mask":
                 assert job["apply_marker_shaders"] is True and job["capture_pass"] == "color"
+                assert job["mask_material_pass_sources"] == ["AIPickerM_SET"]
+                assert job["mask_material_pass_profile"] == picker.MASK_MATERIAL_PASS_PROFILE
                 assert len(job["bindings"]) == 6
                 assert [item["full_dag_path"] for item in job["bindings"]] == [item["full_dag_path"] for item in bindings]
             elif role == "original":
                 assert job["apply_marker_shaders"] is False
                 assert job["original_material_override_profile"] == picker.ORIGINAL_MATERIAL_OVERRIDE_PROFILE
+                assert job["original_material_pass_sources"] == ["AIPicker_SET", "AIPickerM_SET"]
                 assert job["bindings"] == job["hidden_paths"] == []
             else:
+                assert "mask_material_pass_profile" not in job and "original_material_pass_sources" not in job
                 assert job["bindings"] == []
                 assert job["generate_depth_playblast"] is True
                 assert job["depth_profile"] == picker.DEPTH_PLAYBLAST_PROFILE
@@ -183,7 +187,8 @@ with tempfile.TemporaryDirectory(prefix="hmb-selected-snapshot-") as temporary:
          mock.patch.object(picker.subprocess, "Popen", FakeProcess), \
          mock.patch.object(picker, "_validate_full_smooth_confirmation") as quality, \
          mock.patch.object(picker, "_validate_world_pattern_runner_confirmation") as mask_check, \
-         mock.patch.object(picker, "_original_material_report_is_valid", side_effect=lambda report: report.get("test_role") == "original") as eye_check, \
+         mock.patch.object(picker, "_validate_mask_material_pass_confirmation"), \
+         mock.patch.object(picker, "_original_material_report_is_valid", side_effect=lambda report, **_options: report.get("test_role") == "original") as eye_check, \
          mock.patch.object(picker, "_validate_depth_companion_inputs") as depth_check:
         for flags in itertools.product((False, True), repeat=3):
             if not any(flags):

@@ -17,6 +17,7 @@ import io
 import json
 from pathlib import Path
 import sys
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -34,12 +35,19 @@ spec.loader.exec_module(shot)
 base = shot.base
 t = base.t
 
-# Exact pure function from C:\API SERVER\app.py, inspected 2026-10-15.
+# Exact pure function from C:\API SERVER\app.py, inspected 2026-10-16 (V27).
 # Hash covers semantic AST fields, excluding locations and Python 3.12's empty
 # type_params addition. Nonempty generic parameters remain part of the hash.
-# No server globals are imported: its only dependency is the documented TTL.
-SERVER_FIXTURE_AST_SHA256 = "b4cd726730211071916b4228f12764bc8f0afca9d285eda36b50ecfa7eebd05e"
+# No server globals are imported: the documented TTL and additive provenance
+# literals are supplied below; the live server's isolated contract suite checks
+# the actual global literals as well as first-accept record immutability.
+SERVER_FIXTURE_AST_SHA256 = "63413b947e7e5f19d075c2c1fc6d1b1f5cc8bfef3b0565f9931291b7edc64525"
 SEEDANCE_DRAFT_SOURCE_TTL_SECONDS = 7 * 24 * 60 * 60
+GENERATION_MODE_METADATA_SCHEMA = "hmb-generation-mode-v1"
+GENERATION_MODE_METADATA_FIELD = "hmb_generation_mode"
+GENERATION_MODE_METADATA_CHOICES = ("only", "shot")
+GENERATION_TASK_METADATA_FIELD = "hmb_generation_task"
+GENERATION_TASK_METADATA_CHOICES = ("Text Only", "First/Last Frame", "Reference to Video", "Video Editing", "Video Extension")
 
 
 def seedance_generation_capabilities(*, draft=False):
@@ -64,6 +72,11 @@ def seedance_generation_capabilities(*, draft=False):
     return {
         "schema":"hmb-seedance-generation-capabilities",
         "version":3 if draft else 2,
+        "generation_mode_metadata":{"schema":GENERATION_MODE_METADATA_SCHEMA,
+                                    "field":GENERATION_MODE_METADATA_FIELD,
+                                    "choices":list(GENERATION_MODE_METADATA_CHOICES),
+                                    "task_field":GENERATION_TASK_METADATA_FIELD,
+                                    "tasks":list(GENERATION_TASK_METADATA_CHOICES)},
         "models":{"doubao-seedance-2-5-260628":profile},
     }
 
@@ -107,7 +120,15 @@ class RouteOpener:
 
     @property
     def capability_paths(self):
-        return [call["path"] for call in self.calls if call["method"] == "GET"]
+        return [call["path"] for call in self.calls
+                if call["method"] == "GET" and call["path"] in (CAP_PATH, DRAFT_PATH)]
+
+    @property
+    def state_paths(self):
+        return [call["path"] for call in self.calls
+                if call["method"] == "GET"
+                and call["path"].startswith("/api/v1/reviews/tasks/")
+                and call["path"].endswith("/draft-final")]
 
     def open(self, request, timeout):
         assert request.get_header("Authorization") == "Bearer " + SYNTHETIC_TOKEN
@@ -119,7 +140,20 @@ class RouteOpener:
         self.calls.append({"method": method, "path": path, "body": deepcopy(body),
                            "idempotency_key": request.get_header("Idempotency-key", "")})
         METRICS["synthetic_authenticated_requests"] += 1
-        if method == "GET":
+        if (method == "GET" and parsed.path.startswith("/api/v1/reviews/tasks/")
+                and parsed.path.endswith("/draft-final")):
+            assert not parsed.query
+            assert request.data is None
+            source_id = parsed.path.split("/")[-2]
+            assert source_id == base.JOB
+            now = int(time.time())
+            result = {"schema": "hmb-review-draft-final-v1", "state_schema": "hmb-draft-final-state-v1",
+                "source_task_id": source_id, "state": "available", "is_draft": True,
+                "eligible": True, "consumed": False, "checked_at": now, "expires_at": now + 604800,
+                "owner_user_id": 1, "idempotency_key": t._seedance_draft_final_request_id(source_id),
+                "child_task_id": None, "child_status": None, **base.PROJECT}
+            METRICS["synthetic_draft_final_state_gets"] += 1
+        elif method == "GET":
             assert path in (CAP_PATH, DRAFT_PATH), path
             assert request.data is None
             draft = path == DRAFT_PATH
@@ -175,6 +209,10 @@ class RoutingNode(base.Node):
                                             _default_filename=Path(authored_path).name)
         self.selection = {"schema": t.PROJECT_SELECTION_SCHEMA, "project": deepcopy(base.PROJECT)}
         self._capture_imageasset_project_selection = mock.Mock(return_value=self.selection)
+        if action == t.DRAFT_ACTION_FINAL:
+            # Final now validates a fresh authenticated state against the
+            # locally retained source, not merely an execution-copy parameter.
+            self._store_draft_source(deepcopy(values["_hmb_draft_source"]))
 
     def _resolve_exact_shot_generation_inputs(self, values):
         return {**values, "_hmb_imageasset_project_selection": deepcopy(self.selection)}
@@ -203,9 +241,23 @@ class CapabilityRoutingTests(unittest.TestCase):
         self.review.start()
         self.diagnostics = mock.patch.object(t, "_broker_log_transport_error")
         self.diagnostics.start()
+        self.token_fence = mock.patch.object(t, "_broker_load_token",
+            side_effect=AssertionError("Offline regression attempted to load a real credential"))
+        self.token_fence.start()
+        self.network_fence = mock.patch.object(t.urllib.request.OpenerDirector, "open",
+            side_effect=AssertionError("Offline regression attempted an external request"))
+        self.network_fence.start()
+        self.origin_fence = mock.patch.object(t._review, "bind_task_origin")
+        self.origin_fence.start()
+        self.project_fence = mock.patch.object(t._review, "bind_task_project")
+        self.project_fence.start()
         self.addCleanup(self.boundaries.stop)
         self.addCleanup(self.review.stop)
         self.addCleanup(self.diagnostics.stop)
+        self.addCleanup(self.token_fence.stop)
+        self.addCleanup(self.network_fence.stop)
+        self.addCleanup(self.origin_fence.stop)
+        self.addCleanup(self.project_fence.stop)
 
     def tearDown(self):
         while base.TEMPORARIES:
@@ -246,7 +298,10 @@ class CapabilityRoutingTests(unittest.TestCase):
         if local_server.is_file():
             actual = function_node(local_server.read_text(encoding="utf-8-sig"))
             self.assertEqual(function_hash(actual), SERVER_FIXTURE_AST_SHA256)
-            namespace = {"SEEDANCE_DRAFT_SOURCE_TTL_SECONDS": 604800}
+            namespace = {name: globals()[name] for name in (
+                "SEEDANCE_DRAFT_SOURCE_TTL_SECONDS", "GENERATION_MODE_METADATA_SCHEMA",
+                "GENERATION_MODE_METADATA_FIELD", "GENERATION_MODE_METADATA_CHOICES",
+                "GENERATION_TASK_METADATA_FIELD", "GENERATION_TASK_METADATA_CHOICES")}
             exec(compile(ast.Module(body=[actual], type_ignores=[]), "<pure-server-fixture>", "exec"), namespace)
             for selected in (False, True):
                 self.assertEqual(namespace[actual.name](draft=selected),
@@ -256,6 +311,7 @@ class CapabilityRoutingTests(unittest.TestCase):
         node = RoutingNode()
         asyncio.run(node._process_generation_impl())
         self.assertEqual(node.transport.capability_paths, [CAP_PATH, CAP_PATH])
+        self.assertEqual(node.transport.state_paths, [])
         self.assertEqual(len(node.transport.posts), 1)
         for _, document in node.transport.responses:
             self.assertEqual(document["version"], 2)
@@ -289,6 +345,7 @@ class CapabilityRoutingTests(unittest.TestCase):
             self.assertNotIn("draft_job_id", body)
             self.assertGreaterEqual(len(node.transport.capability_paths), 2)
             self.assertEqual(set(node.transport.capability_paths), {DRAFT_PATH})
+            self.assertEqual(node.transport.state_paths, [])
             self.assertEqual(node.upload_calls, 1)
             self.assertEqual(len(node.saved), 1)
             self.assertTrue(node.saved[0][1].endswith(".mov"))
@@ -305,6 +362,7 @@ class CapabilityRoutingTests(unittest.TestCase):
             node.bridge = bridge_for(opener)
             source = shot.completed_source(node)
             node._store_draft_source(source)
+            state_gets_before_click = len(opener.state_paths)
             node.parameter_values.update(prompt="preserve authored prompt {{SIGN}}", duration=29,
                                          output_format="mov", ratio="9:16")
             shot.forbid_upstream_work(node)
@@ -327,6 +385,9 @@ class CapabilityRoutingTests(unittest.TestCase):
                 self.assertFalse(later.success)
             self.assertEqual(len(opener.posts), 1, node._set_status_results.call_args_list)
             self.assertEqual(set(opener.capability_paths), {DRAFT_PATH})
+            self.assertGreater(len(opener.state_paths), state_gets_before_click)
+            self.assertEqual(set(opener.state_paths), {
+                "/api/v1/reviews/tasks/" + base.JOB + "/draft-final"})
             self.assertEqual(opener.posts[0]["body"], {"provider": "volcengine_ark",
                 "model": t.SEEDANCE_2_5_MODEL_ID, "draft_job_id": base.JOB,
                 "resolution": "1080p", "output_format": "mov", **base.PROJECT,

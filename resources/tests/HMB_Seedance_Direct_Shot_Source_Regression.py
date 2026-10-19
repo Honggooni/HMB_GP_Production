@@ -437,6 +437,7 @@ resolved = node._resolve_exact_shot_generation_inputs(
 )
 assert resolved["prompt"] == "manual Agent text"
 assert resolved["task"] == TASK_REFERENCE_TO_VIDEO
+assert resolved["_hmb_generation_mode"] == "shot"
 assert resolved["duration"] == 5
 assert resolved["first_frame"] is None
 assert resolved["last_frame"] is None
@@ -502,6 +503,8 @@ finish_payload_params["video_references"] = [
     "https://media.example/motion.mp4",
 ]
 finish_payload = finish_node._build_broker_payload(finish_payload_params)
+assert finish_payload["hmb_generation_mode"] == "shot"
+assert finish_payload["hmb_generation_task"] == TASK_REFERENCE_TO_VIDEO
 submitted_prompt = finish_payload["prompt"]
 assert submitted_prompt.count(finish_instruction) == 1
 assert submitted_prompt.index(authored_prompt) < submitted_prompt.index(
@@ -630,6 +633,87 @@ else:
     raise AssertionError("A cross-Shot Finish Look sidecar reached Seedance")
 
 
+# One Finish manager may display a different Shot while this Generator reads
+# its own immutable Beauty. The shared hidden transport is deliberately wrong
+# for this target; neither that transport nor the visible row is authority.
+class ManagedFinishSource(FinishSource):
+    def __init__(self):
+        super().__init__(finish_snapshot())
+        self.value.update(shot_uuid="visible-other-shot", shot_number=5, shot_name="Visible fifth")
+        self.exact_value = finish_snapshot()
+        self.calls = []
+        self.rows = [dict(schema="hmb-shot-channel-subscription", version=1,
+            participant_kind="finish_look", enabled=True, channel_uuid=CHANNEL,
+            shot_uuid=SHOT if number == 2 else f"managed-{number}", shot_number=number,
+            shot_name="Second Shot" if number == 2 else f"Asset {number}") for number in range(1, 6)]
+
+    def _hmb_shot_manager_enabled(self):
+        return True
+
+    def _hmb_finish_look_shot_subscriptions(self):
+        return deepcopy(self.rows)
+
+    def _hmb_shot_channel_subscription(self):
+        return deepcopy(self.rows[4])
+
+    def _hmb_finish_look_shot_snapshot(self, *_args, **_kwargs):
+        raise AssertionError("Manager resolution used the selected-row legacy snapshot")
+
+    def _hmb_finish_look_shot_snapshot_for(self, *, channel_uuid, shot_uuid, expected_output=None):
+        assert (channel_uuid, shot_uuid) == (CHANNEL, SHOT) and expected_output is None
+        self.calls.append((channel_uuid, shot_uuid))
+        return deepcopy(self.exact_value)
+
+
+managed_finish = ManagedFinishSource()
+managed_generator = generator(image, picker, finish=managed_finish)
+old_read = managed_generator.get_parameter_value
+def read_without_shared_finish(name):
+    assert name != target.SHOT_FINISH_LOOK_INPUT_PARAMETER, "Execution read another row's shared transport"
+    return old_read(name)
+managed_generator.get_parameter_value = read_without_shared_finish
+visible_before = deepcopy(managed_finish.value)
+managed_resolved = managed_generator._resolve_exact_shot_generation_inputs(valid_params(prompt=authored_prompt))
+assert managed_resolved["prompt"] == authored_prompt
+assert managed_resolved["_hmb_finish_look_out"] == finish_instruction
+assert managed_finish.value == visible_before and managed_finish.calls == [(CHANNEL, SHOT)]
+managed_finish.exact_value = finish_snapshot(state=disabled_finish_state)
+assert managed_generator._resolve_exact_shot_generation_inputs(valid_params(prompt=authored_prompt))["_hmb_finish_look_out"] == ""
+valid_manager_rows = deepcopy(managed_finish.rows)
+for broken_rows in (
+    valid_manager_rows + [deepcopy(valid_manager_rows[1])],
+    [dict(row, shot_number=2) for row in valid_manager_rows],
+    [dict(row, participant_kind="agent") for row in valid_manager_rows],
+    [dict(row, channel_uuid="another-channel") for row in valid_manager_rows],
+    [dict(row, shot_name="Stale renamed asset") for row in valid_manager_rows],
+):
+    managed_finish.rows = broken_rows
+    try:
+        managed_generator._resolve_exact_shot_generation_inputs(valid_params(prompt=authored_prompt))
+    except RuntimeError as exc:
+        assert "selected Shot" in str(exc)
+    else:
+        raise AssertionError("Invalid manager subscription reached Seedance")
+managed_finish.rows = valid_manager_rows
+for invalid_mode in (None, 1, "true"):
+    managed_finish._hmb_shot_manager_enabled = lambda invalid_mode=invalid_mode: invalid_mode
+    try:
+        managed_generator._resolve_exact_shot_generation_inputs(valid_params(prompt=authored_prompt))
+    except RuntimeError as exc:
+        assert "selected Shot" in str(exc)
+    else:
+        raise AssertionError("Unknown manager mode was treated as a legacy source")
+managed_finish._hmb_shot_manager_enabled = lambda: True
+managed_finish.exact_value = finish_snapshot()
+managed_finish.exact_value["finish_look_state"]["beauty"]["brightness"] = 8
+try:
+    managed_generator._resolve_exact_shot_generation_inputs(valid_params(prompt=authored_prompt))
+except RuntimeError as exc:
+    assert "integrity" in str(exc)
+else:
+    raise AssertionError("Manager API bypassed canonical Beauty integrity checks")
+
+
 # Exercise real Finish Look hydration/publication and the real atomic API, not
 # merely FinishSource's transport fixture. Only host storage/edge publication
 # are local adapters; no flow registry, user state, or model is accessed.
@@ -676,6 +760,8 @@ hydrated_finish._widget_state = finish_target.default_widget_state()
 hydrated_finish._remote_revision = 0
 hydrated_finish._remote_connected = False
 hydrated_finish._remote_status = deepcopy(finish_target.DEFAULT_REMOTE_STATUS)
+hydrated_finish._seen_remote_requests = []
+hydrated_finish._seen_widget_actions = []
 hydrated_finish._hmb_node_deleted = False
 hydrated_finish._node_deleted = False
 hydrated_finish._hmb_shot_catalog_snapshot = {}
@@ -1880,6 +1966,23 @@ assert target._seedance_remote_prompt_route_value(
 agent_route_identity["shot_number"] = 4
 assert route_probe._current_remote_prompt_route()["connected"] is False
 agent_route_identity["shot_number"] = 3
+
+# A consolidated Agent manages five Shots while its editor displays one. The
+# other four Generators must retain their own proven cable descriptor, without
+# changing the manager's visible selection or trusting a duplicate claim.
+route_agent._hmb_shot_manager_enabled = lambda: True
+managed_declaration = {"participant_kind": "agent", "enabled": True, **route_identity}
+route_agent._hmb_agent_shot_subscriptions = lambda: [dict(managed_declaration)]
+agent_route_identity["shot_uuid"] = "40000000-0000-4000-8000-000000000004"
+assert route_probe._current_remote_prompt_route()["connected"] is True
+assert agent_route_identity["shot_uuid"] != route_identity["shot_uuid"]
+route_agent._hmb_agent_shot_subscriptions = lambda: [dict(managed_declaration), dict(managed_declaration)]
+assert route_probe._current_remote_prompt_route()["connected"] is False
+route_agent._hmb_agent_shot_subscriptions = lambda: [{**managed_declaration, "shot_name": "Stale name"}]
+assert route_probe._current_remote_prompt_route()["connected"] is False
+del route_agent._hmb_shot_manager_enabled
+del route_agent._hmb_agent_shot_subscriptions
+agent_route_identity["shot_uuid"] = route_identity["shot_uuid"]
 
 route_probe._hmb_remote_prompt_route = target._seedance_remote_prompt_route_value(
     {

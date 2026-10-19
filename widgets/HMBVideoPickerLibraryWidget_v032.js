@@ -6643,6 +6643,7 @@ export function hmbCancelVideoPickerPlaybackIntent(container, media = null) {
 export function hmbPauseVideoPickerMedia(container) {
   hmbCancelVideoPickerPendingPreviewStart(container);
   hmbCancelVideoPickerPlaybackIntent(container);
+  hmbClearVideoPickerCompactPlaybackFailure(container);
   let paused = 0;
   for (const media of container?.querySelectorAll?.("video") || []) {
     if (!media.paused && !media.ended) paused += 1;
@@ -9273,6 +9274,7 @@ export function hmbVideoPickerCompactSharedPlayer(container, state, uidValue, ca
   const ownerDocument = thumb?.ownerDocument || container?.ownerDocument
     || (typeof document !== "undefined" ? document : null);
   if (!uid || !thumb || !source || !ownerDocument?.createElement) return null;
+  hmbClearVideoPickerCompactPlaybackFailure(container);
   let player = container.__hmbCompactSharedVideoPlayer || null;
   if (!player) {
     player = ownerDocument.createElement("video");
@@ -9297,6 +9299,7 @@ export function hmbVideoPickerCompactSharedPlayer(container, state, uidValue, ca
 }
 
 export function hmbReleaseVideoPickerCompactSharedPlayer(container) {
+  hmbClearVideoPickerCompactPlaybackFailure(container);
   const player = container?.__hmbCompactSharedVideoPlayer || null;
   if (!player) return false;
   hmbCancelVideoPickerPlaybackIntent(container, player);
@@ -11102,6 +11105,57 @@ export function hmbApplySnapshotNavigationFeedback(container, snapshot, tr, fram
   return hmbStageVideoPickerSnapshotImage(container, snapshotUrl);
 }
 
+export function hmbClearVideoPickerCompactPlaybackFailure(container) {
+  const failure = container?.__hmbCompactPlaybackFailure;
+  if (!failure) return false;
+  failure.status?.remove?.();
+  delete container.__hmbCompactPlaybackFailure;
+  return true;
+}
+
+export function hmbShowVideoPickerCompactPlaybackFailure(container, media, expected, messageText, tr = TEXT.en) {
+  const uid = clean(expected?.uid);
+  const source = clean(expected?.url);
+  const card = media?.closest?.(".compact-shot-asset[data-video-uid]");
+  const thumb = card?.querySelector?.(".compact-shot-thumb");
+  const doc = thumb?.ownerDocument || container?.ownerDocument;
+  const resolvedSource = clean(media?.currentSrc);
+  let canonicalSource = source;
+  try { canonicalSource = new URL(source, doc?.baseURI).href; } catch (_error) {}
+  if (
+    container?.__hmbVideoPickerDeleted === true
+    || container?.__hmbVideoPickerExpanded !== false
+    || media !== container?.__hmbCompactSharedVideoPlayer
+    || !uid || !source || !thumb || !doc?.createElement
+    || clean(media.getAttribute?.("data-video-uid")) !== uid
+    || clean(card?.getAttribute?.("data-video-uid")) !== uid
+    || clean(media.getAttribute?.("src") || media.src) !== source
+    || (!!resolvedSource && resolvedSource !== source && resolvedSource !== canonicalSource)
+    || (typeof container.contains === "function" && !container.contains(media))
+  ) return false;
+  const previous = container.__hmbCompactPlaybackFailure;
+  if (previous?.media === media && previous.uid === uid && previous.source === source
+      && previous.status?.parentElement === thumb) return true;
+  hmbClearVideoPickerCompactPlaybackFailure(container);
+  const status = doc.createElement("div");
+  status.className = "preview-load-status compact-preview-load-status";
+  status.setAttribute("data-compact-preview-load-status", uid);
+  status.setAttribute("role", "alert");
+  status.setAttribute("aria-live", "assertive");
+  const message = doc.createElement("span");
+  message.textContent = clean(messageText) || tr.previewPlayFailed || TEXT.en.previewPlayFailed;
+  message.title = message.textContent;
+  const retry = doc.createElement("button");
+  retry.type = "button";
+  retry.setAttribute("data-retry-compact-video-uid", uid);
+  retry.textContent = tr.retryPreview || TEXT.en.retryPreview;
+  status.appendChild(message);
+  status.appendChild(retry);
+  thumb.appendChild(status);
+  container.__hmbCompactPlaybackFailure = { media, uid, source, status };
+  return true;
+}
+
 export function hmbClearPickerPreviewLoadFailure(container) {
   const status = container?.querySelector?.("#picker-preview-load-status");
   if (!status) return false;
@@ -12478,6 +12532,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       .hmbvp .video-assets-toolbar{height:42px;flex:0 0 42px;display:flex;align-items:center;gap:8px;padding:6px 8px;border-bottom:1px solid var(--hmb-line-soft,#2c3740);background:linear-gradient(180deg,rgba(255,255,255,.025),rgba(255,255,255,.004)),var(--hmb-field,#18232b)}.hmbvp .video-assets-active-shot{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--selection-text);font-size:10px}.hmbvp .video-assets-toolbar .video-selected-count{margin-left:auto}.hmbvp .video-assets-toolbar .import-video-button{height:30px;margin:0;padding:0 12px}
       ${hmbPickerToolsStyleMarkup()}
       ${hmbPickerToolsResizeStyleMarkup()}
+      .hmbvp .compact-shot-thumb .compact-preview-load-status{inset:4px;gap:3px;padding:4px;flex-direction:column;align-items:stretch;font-size:8px;line-height:1.2}.hmbvp .compact-preview-load-status span{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden}.hmbvp .compact-preview-load-status button{height:21px;padding:0 6px;font-size:8px}
       .hmbvp #picker-video[hidden],.hmbvp #picker-snapshot-image[hidden],.hmbvp .viewport-empty[hidden]{display:none!important}
       </style>
     <div class="hmbvp-clip nodrag"><div class="hmbvp" data-picker-view="expanded" data-theme="${uiTheme}" data-shot-number="${shotPalette.number}" data-state-revision="${Number(state.state_revision || 0)}" data-canvas-motion="false" style="${shotPaletteStyle}">
@@ -12645,7 +12700,12 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       }
       return failureKind;
     }
-    hmbShowPickerPreviewLoadFailure(container, tr.previewLoadFailed || tr.previewPlayFailed);
+    if (container.__hmbVideoPickerExpanded === false) {
+      const compactTr = TEXT[currentWidgetState().language] || TEXT.ko;
+      hmbShowVideoPickerCompactPlaybackFailure(
+        container, media, expected, compactTr.previewPlayFailed, compactTr,
+      );
+    } else hmbShowPickerPreviewLoadFailure(container, tr.previewLoadFailed || tr.previewPlayFailed);
     const details = clean(error?.message || error);
     hmbAppendImmediateActivityLogRow(
       container.querySelector("#activity-log-view"),
@@ -14102,6 +14162,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     };
   const selectCompactVideo = (event, selectionSurface) => {
       if (container.__hmbVideoPickerExpanded === true) return;
+      hmbClearVideoPickerCompactPlaybackFailure(container);
       toggleSharedLoaderVideoSelection(event, selectionSurface);
     };
   const deleteCompactVideo = (event, button) => {
@@ -14137,6 +14198,24 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     );
     activeCleanup.push(() => hmbReleaseVideoPickerCompactSharedPlayer(container));
     activeCleanup.push(() => hmbDisposeVideoPickerCompactThumbnailController(container));
+    on(container, "click", (event) => {
+      const retry = event.target?.closest?.("[data-retry-compact-video-uid]");
+      const failure = container.__hmbCompactPlaybackFailure;
+      if (!retry || !failure || container.__hmbVideoPickerExpanded !== false
+          || clean(retry.getAttribute?.("data-retry-compact-video-uid")) !== failure.uid
+          || failure.media !== container.__hmbCompactSharedVideoPlayer
+          || clean(failure.media.getAttribute?.("src")) !== failure.source) return;
+      const playButton = failure.status.closest?.("[data-video-uid]")
+        ?.querySelector?.("[data-play-video-uid]");
+      if (!playButton) return;
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      hmbClearVideoPickerCompactPlaybackFailure(container);
+      // A failed decoder will reject play() again unless the same source is
+      // explicitly reloaded. Retry owns exactly this current Loader card.
+      failure.media.load?.();
+      playCompactVideo(event, playButton);
+    });
     on(container, "load", (event) => {
       if (container.__hmbVideoPickerExpanded === true) return;
       const poster = event?.target;
@@ -14179,6 +14258,22 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       ) return;
       const uid = clean(media.getAttribute?.("data-video-uid"));
       const liveTr = compactPlaybackTranslation();
+      if (event.type === "error") {
+        if (!(Number(media.error?.code || 0) > 0)) return;
+        hmbCancelVideoPickerPlaybackIntent(container, media);
+        hmbSyncVideoPickerPlayButtonState(container, "", false, liveTr);
+        reportPlaybackFailure(media.error, "Video-card media loading", media, {
+          uid, url: clean(media.getAttribute?.("src") || media.src), mediaError: true,
+        });
+        return;
+      }
+      if (event.type === "loadeddata" || event.type === "canplay") {
+        if (media.readyState >= 2 && !media.error
+            && clean(media.currentSrc) === clean(media.getAttribute?.("src") || media.src)) {
+          hmbClearVideoPickerCompactPlaybackFailure(container);
+        }
+        return;
+      }
       if (event.type === "pause" && hmbConsumeVideoPickerPauseDebt(media)) {
         if (hmbVideoPickerPlaybackIntentMatches(container, media, uid)) {
           hmbSyncVideoPickerPlayButtonState(container, uid, true, liveTr);
@@ -14215,6 +14310,9 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     on(container, "play", syncCompactPlaybackState, true);
     on(container, "pause", syncCompactPlaybackState, true);
     on(container, "ended", syncCompactPlaybackState, true);
+    on(container, "error", syncCompactPlaybackState, true);
+    on(container, "loadeddata", syncCompactPlaybackState, true);
+    on(container, "canplay", syncCompactPlaybackState, true);
     activeCleanup.push(hmbInstallVideoAssetDragReorder(container, {
       enabled: () => container.__hmbVideoPickerExpanded !== true,
       locked: () => pickerLocalInteractionLocked(),

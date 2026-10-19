@@ -1,0 +1,380 @@
+{
+  "schema": "hmb-draft-final-synthetic-cross-contract-v1",
+  "source_fixture_sha256": "76e051b1d8705730b812e82b7639276eb70450c47510640393ccfe235f5294b1",
+  "fixture_checked_at": 2000000000,
+  "fixture_identity": {
+    "owner_user_id": 1,
+    "source_task_id": "job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "project_id": "superwings12",
+    "project_name": "슈퍼윙즈12"
+  },
+  "cases": [
+    {
+      "name": "available",
+      "projection": {
+        "schema": "hmb-review-draft-final-v1",
+        "state_schema": "hmb-draft-final-state-v1",
+        "state": "available",
+        "consumed": false,
+        "checked_at": 2000000000,
+        "is_draft": true,
+        "eligible": true,
+        "reason": "ready",
+        "source_task_id": "job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_user_id": 1,
+        "project_id": "superwings12",
+        "project_name": "슈퍼윙즈12",
+        "expires_at": 2000604555,
+        "child_task_id": null,
+        "child_status": null,
+        "idempotency_key": "hmb-draft-final-v1-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "submit_url": "/api/v1/generate/video",
+        "submit_payload": {
+          "provider": "volcengine_ark",
+          "model": "doubao-seedance-2-5-260628",
+          "quality": "1080p",
+          "draft_job_id": "job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "output_format": "mov",
+          "project_id": "superwings12",
+          "project_name": "슈퍼윙즈12"
+        },
+        "output_formats": [
+          "mp4",
+          "mov"
+        ]
+      }
+    },
+    {
+      "name": "source_pending",
+      "projection": {
+        "schema": "hmb-review-draft-final-v1",
+        "state_schema": "hmb-draft-final-state-v1",
+        "state": "source_pending",
+        "consumed": false,
+        "checked_at": 2000000000,
+        "is_draft": true,
+        "eligible": false,
+        "reason": "not_completed",
+        "source_task_id": "job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_user_id": 1,
+        "project_id": "superwings12",
+        "project_name": "슈퍼윙즈12",
+        "expires_at": 2000604555,
+        "child_task_id": null,
+        "child_status": null,
+        "idempotency_key": "hmb-draft-final-v1-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "submit_url": "/api/v1/generate/video",
+        "submit_payload": null,
+        "output_formats": [
+          "mp4",
+          "mov"
+        ]
+      }
+    },
+    {
+      "name": "reserved",
+      "projection": {
+        "schema": "hmb-review-draft-final-v1",
+        "state_schema": "hmb-draft-final-state-v1",
+        "state": "reserved",
+        "consumed": true,
+        "checked_at": 2000000000,
+        "is_draft": true,
+        "eligible": false,
+        "reason": "child_active",
+        "source_task_id": "job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_user_id": 1,
+        "project_id": "superwings12",
+        "project_name": "슈퍼윙즈12",
+        "expires_at": 2000604555,
+        "child_task_id": "job-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "child_status": "submitting",
+        "idempotency_key": "hmb-draft-final-v1-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "submit_url": "/api/v1/generate/video",
+        "submit_payload": null,
+        "output_formats": [
+          "mp4",
+          "mov"
+        ]
+      }
+    },
+    {
+      "name": "running",
+      "projection": {
+        "schema": "hmb-review-draft-final-v1",
+        "state_schema": "hmb-draft-final-state-v1",
+        "state": "running",
+        "consumed": true,
+        "checked_at": 2000000000,
+        "is_draft": true,
+        "eligible": false,
+        "reason": "child_active",
+        "source_task_id": "job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_user_id": 1,
+        "project_id": "superwings12",
+        "project_name": "슈퍼윙즈12",
+        "expires_at": 2000604555,
+        "child_task_id": "job-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "child_status": "pending",
+        "idempotency_key": "hmb-draft-final-v1-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "submit_url": "/api/v1/generate/video",
+        "submit_payload": null,
+        "output_formats": [
+          "mp4",
+          "mov"
+        ]
+      }
+    },
+    {
+      "name": "completed",
+      "projection": {
+        "schema": "hmb-review-draft-final-v1",
+        "state_schema": "hmb-draft-final-state-v1",
+        "state": "completed",
+        "consumed": true,
+        "checked_at": 2000000000,
+        "is_draft": true,
+        "eligible": false,
+        "reason": "child_exists",
+        "source_task_id": "job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_user_id": 1,
+        "project_id": "superwings12",
+        "project_name": "슈퍼윙즈12",
+        "expires_at": 2000604555,
+        "child_task_id": "job-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "child_status": "completed",
+        "idempotency_key": "hmb-draft-final-v1-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "submit_url": "/api/v1/generate/video",
+        "submit_payload": null,
+        "output_formats": [
+          "mp4",
+          "mov"
+        ]
+      }
+    },
+    {
+      "name": "consumed",
+      "projection": {
+        "schema": "hmb-review-draft-final-v1",
+        "state_schema": "hmb-draft-final-state-v1",
+        "state": "consumed",
+        "consumed": true,
+        "checked_at": 2000000000,
+        "is_draft": true,
+        "eligible": false,
+        "reason": "child_exists",
+        "source_task_id": "job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_user_id": 1,
+        "project_id": "superwings12",
+        "project_name": "슈퍼윙즈12",
+        "expires_at": 2000604555,
+        "child_task_id": "job-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "child_status": "failed",
+        "idempotency_key": "hmb-draft-final-v1-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "submit_url": "/api/v1/generate/video",
+        "submit_payload": null,
+        "output_formats": [
+          "mp4",
+          "mov"
+        ]
+      }
+    },
+    {
+      "name": "expired",
+      "projection": {
+        "schema": "hmb-review-draft-final-v1",
+        "state_schema": "hmb-draft-final-state-v1",
+        "state": "expired",
+        "consumed": false,
+        "checked_at": 2000000000,
+        "is_draft": true,
+        "eligible": false,
+        "reason": "source_expired",
+        "source_task_id": "job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_user_id": 1,
+        "project_id": "superwings12",
+        "project_name": "슈퍼윙즈12",
+        "expires_at": 1999913600,
+        "child_task_id": null,
+        "child_status": null,
+        "idempotency_key": "hmb-draft-final-v1-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "submit_url": "/api/v1/generate/video",
+        "submit_payload": null,
+        "output_formats": [
+          "mp4",
+          "mov"
+        ]
+      }
+    },
+    {
+      "name": "unknown_no_verified_child",
+      "projection": {
+        "schema": "hmb-review-draft-final-v1",
+        "state_schema": "hmb-draft-final-state-v1",
+        "state": "unknown",
+        "consumed": null,
+        "checked_at": 2000000000,
+        "is_draft": true,
+        "eligible": false,
+        "reason": "source_unavailable",
+        "source_task_id": "job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_user_id": 1,
+        "project_id": "superwings12",
+        "project_name": "슈퍼윙즈12",
+        "expires_at": 2000604555,
+        "child_task_id": null,
+        "child_status": null,
+        "idempotency_key": "hmb-draft-final-v1-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "submit_url": "/api/v1/generate/video",
+        "submit_payload": null,
+        "output_formats": [
+          "mp4",
+          "mov"
+        ]
+      }
+    },
+    {
+      "name": "unknown_known_child_null_status",
+      "projection": {
+        "schema": "hmb-review-draft-final-v1",
+        "state_schema": "hmb-draft-final-state-v1",
+        "state": "unknown",
+        "consumed": null,
+        "checked_at": 2000000000,
+        "is_draft": true,
+        "eligible": false,
+        "reason": "child_active",
+        "source_task_id": "job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_user_id": 1,
+        "project_id": "superwings12",
+        "project_name": "슈퍼윙즈12",
+        "expires_at": 2000604555,
+        "child_task_id": "job-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "child_status": null,
+        "idempotency_key": "hmb-draft-final-v1-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "submit_url": "/api/v1/generate/video",
+        "submit_payload": null,
+        "output_formats": [
+          "mp4",
+          "mov"
+        ]
+      }
+    },
+    {
+      "name": "unknown_known_hold",
+      "projection": {
+        "schema": "hmb-review-draft-final-v1",
+        "state_schema": "hmb-draft-final-state-v1",
+        "state": "unknown",
+        "consumed": null,
+        "checked_at": 2000000000,
+        "is_draft": true,
+        "eligible": false,
+        "reason": "child_active",
+        "source_task_id": "job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_user_id": 1,
+        "project_id": "superwings12",
+        "project_name": "슈퍼윙즈12",
+        "expires_at": 2000604555,
+        "child_task_id": "job-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "child_status": "provider_hold",
+        "idempotency_key": "hmb-draft-final-v1-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "submit_url": "/api/v1/generate/video",
+        "submit_payload": null,
+        "output_formats": [
+          "mp4",
+          "mov"
+        ]
+      }
+    },
+    {
+      "name": "not_draft",
+      "projection": {
+        "schema": "hmb-review-draft-final-v1",
+        "state_schema": "hmb-draft-final-state-v1",
+        "state": "not_draft",
+        "consumed": false,
+        "checked_at": 2000000000,
+        "is_draft": false,
+        "eligible": false,
+        "reason": "not_draft",
+        "source_task_id": null,
+        "owner_user_id": null,
+        "project_id": null,
+        "project_name": null,
+        "expires_at": null,
+        "child_task_id": null,
+        "child_status": null,
+        "idempotency_key": null,
+        "submit_url": "/api/v1/generate/video",
+        "submit_payload": null,
+        "output_formats": [
+          "mp4",
+          "mov"
+        ]
+      }
+    },
+    {
+      "name": "completed_after_source_expiry",
+      "projection": {
+        "schema": "hmb-review-draft-final-v1",
+        "state_schema": "hmb-draft-final-state-v1",
+        "state": "completed",
+        "consumed": true,
+        "checked_at": 2000000000,
+        "is_draft": true,
+        "eligible": false,
+        "reason": "child_exists",
+        "source_task_id": "job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_user_id": 1,
+        "project_id": "superwings12",
+        "project_name": "슈퍼윙즈12",
+        "expires_at": 1999913600,
+        "child_task_id": "job-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "child_status": "completed",
+        "idempotency_key": "hmb-draft-final-v1-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "submit_url": "/api/v1/generate/video",
+        "submit_payload": null,
+        "output_formats": [
+          "mp4",
+          "mov"
+        ]
+      }
+    },
+    {
+      "name": "available_other_draft_and_ordinary_rerender",
+      "projection": {
+        "schema": "hmb-review-draft-final-v1",
+        "state_schema": "hmb-draft-final-state-v1",
+        "state": "available",
+        "consumed": false,
+        "checked_at": 2000000000,
+        "is_draft": true,
+        "eligible": true,
+        "reason": "ready",
+        "source_task_id": "job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_user_id": 1,
+        "project_id": "superwings12",
+        "project_name": "슈퍼윙즈12",
+        "expires_at": 2000604555,
+        "child_task_id": null,
+        "child_status": null,
+        "idempotency_key": "hmb-draft-final-v1-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "submit_url": "/api/v1/generate/video",
+        "submit_payload": {
+          "provider": "volcengine_ark",
+          "model": "doubao-seedance-2-5-260628",
+          "quality": "1080p",
+          "draft_job_id": "job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "output_format": "mov",
+          "project_id": "superwings12",
+          "project_name": "슈퍼윙즈12"
+        },
+        "output_formats": [
+          "mp4",
+          "mov"
+        ]
+      }
+    }
+  ]
+}

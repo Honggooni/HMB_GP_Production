@@ -186,7 +186,7 @@ class ProjectSourceTests(unittest.TestCase):
             _hmb_project_identity=lambda: resolve_project('katuri8')))
         graph.edge(foreign, 'IMAGE_OUT', node, 'reference_images')
         node.values['prompt'] = 'project katuri8 //server/Katuri8/some.png'
-        with graph.context(), self.assertRaisesRegex(ValueError, 'Select and connect'):
+        with graph.context(), self.assertRaisesRegex(ValueError, r'Select Project \(Only\), or connect'):
             node._capture_imageasset_project_selection()
 
     def test_lookup_failure_is_not_default_project(self):
@@ -227,7 +227,7 @@ class ProjectSourceTests(unittest.TestCase):
     def test_no_source_process_blocks_before_broker_upload_or_post(self):
         node = Node(); graph = Graph(node)
         node._ensure_broker_connected = mock.AsyncMock(side_effect=AssertionError('Broker accessed'))
-        with graph.context(), self.assertRaisesRegex(ValueError, 'Select and connect'):
+        with graph.context(), self.assertRaisesRegex(ValueError, r'Select Project \(Only\), or connect'):
             asyncio.run(node._process_generation_impl())
         self.assertEqual(node.upload_calls, 0)
         self.assertEqual(node.bridge.posts, [])

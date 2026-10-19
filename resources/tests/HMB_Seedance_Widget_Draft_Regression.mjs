@@ -325,7 +325,7 @@ try {
     });
     assert.deepEqual(counts, [0, 0]);
   });
-  await check("five-Generator-MOV-errors-remain-static-through-empty-events-and-identical-polls", async () => {
+  await check("five-Generator-native-MOV-errors-remain-visible-through-empty-events-and-identical-polls", async () => {
     const result = await page.evaluate(async () => {
       const all = await Promise.all(Array.from({ length: 5 }, (_, index) => {
         const state = makeState(0, { visible: false, final_available: false });
@@ -352,14 +352,16 @@ try {
     });
     receipt.five_generator_media_error_replay = result;
     for (const item of [...result.before, ...result.after]) {
-      assert.equal(item.mode, "center"); assert.equal(item.busy, "false");
-      assert.equal(item.static, "true"); assert.equal(item.nativeVisibility, "hidden");
+      assert.equal(item.static, null); assert.equal(item.nativeVisibility, "visible");
       assert.equal(item.loads, 0); assert.equal(item.commands, 0);
-      assert.doesNotMatch(item.title, /fixture|token=/);
+      assert.doesNotMatch(String(item.title || ""), /fixture|token=|내장 미리보기 불가/);
     }
     assert.ok(result.retained.every(Boolean));
-    result.after.slice(0, 3).forEach((item) => assert.match(item.title, /MOV 저장 완료/));
-    result.after.slice(3).forEach((item) => assert.match(item.title, /생성에 실패/));
+    result.after.slice(0, 3).forEach((item) => assert.equal(item.title, undefined));
+    result.after.slice(3).forEach((item) => {
+      assert.equal(item.mode, "badge"); assert.equal(item.busy, "false");
+      assert.match(item.title, /생성에 실패/);
+    });
   });
   await check("playable-result-survives-rerender-progress-and-429-without-native-reload", async () => {
     const result = await page.evaluate(async () => {
@@ -397,7 +399,7 @@ try {
     assert.equal(result.loads, 1); assert.ok(result.sourceRetained && result.videoRetained);
     assert.equal(result.overlay, false); assert.equal(result.commands, 0);
   });
-  await check("new-playable-source-clears-static-failure-and-cleanup-restores-native-host", async () => {
+  await check("new-playable-source-preserves-native-host-without-a-static-failure", async () => {
     const result = await page.evaluate(async () => {
       const state = makeState(0, { visible: false }); Object.assign(state.generation, { has_existing_video: true, media_revision: 8 });
       const f = await addUnsupportedPreview(createFixture(state));
@@ -409,7 +411,8 @@ try {
       f.controller.cleanup(); URL.revokeObjectURL(video.src);
       return { failed, recovered, cleaned: f.region.hasAttribute("data-hmb-seedance-preview-static") };
     });
-    assert.equal(result.failed.static, "true"); assert.equal(result.recovered.overlay, false);
+    assert.equal(result.failed.static, null); assert.equal(result.failed.nativeVisibility, "visible");
+    assert.equal(result.recovered.overlay, false);
     assert.equal(result.recovered.static, null); assert.equal(result.recovered.nativeVisibility, "visible");
     assert.equal(result.cleaned, false);
   });

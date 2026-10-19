@@ -174,8 +174,8 @@ UI_RESIZE_MODE = "stacked_outer_1000"
 UI_HEADER_LAYOUT_VERSION = 2
 LEGACY_IMAGE_SOURCES_DEFAULT_HEIGHT = 542
 GROUP_START_HEIGHTS = {
-    # Match VideoPicker's 68px header without changing the established
-    # 1800x1193 outer size. Only the fresh/default image editor absorbs the
+    # Match VideoPicker's 68px header while preserving the editor groups.
+    # Only the fresh/default image editor absorbs the
     # 10px delta; persisted user group heights remain authoritative.
     "imageSources": 514,
     "imageText": 200,
@@ -194,8 +194,13 @@ PROMPT_DASHBOARD_FIXED_HEIGHT = 129
 # Native compatibility/dependency ports are retained on the graph but rendered
 # as hidden rows. The custom dashboard therefore owns the full node.
 PROMPT_NATIVE_ASSET_INPUT_ROW_HEIGHT = 0
-PROMPT_START_HEIGHT = GROUP_START_TOTAL_HEIGHT + PROMPT_DASHBOARD_FIXED_HEIGHT
-PROMPT_MIN_HEIGHT = PROMPT_START_HEIGHT
+# Use the approved startup size on every workflow open. User resizing after
+# construction and authored inner group heights remain independent of it.
+PROMPT_START_WIDTH = 1800
+PROMPT_MANAGER_HEADER_TABS_HEIGHT = 68 + 44 + 24
+PROMPT_START_BOTTOM_PADDING = 21
+PROMPT_START_HEIGHT = GROUP_START_TOTAL_HEIGHT + PROMPT_DASHBOARD_FIXED_HEIGHT + PROMPT_MANAGER_HEADER_TABS_HEIGHT + PROMPT_START_BOTTOM_PADDING
+PROMPT_MIN_HEIGHT = GROUP_START_TOTAL_HEIGHT + PROMPT_DASHBOARD_FIXED_HEIGHT
 GROUP_MAX_HEIGHT = 6000
 KEEP_OUT_TEXTAREA_MIN_HEIGHT = 34
 KEEP_OUT_TEXTAREA_MAX_HEIGHT = 1200
@@ -2421,6 +2426,7 @@ def _normalize_ui(state: Dict[str, Any]) -> Dict[str, Any]:
         "resize_mode": UI_RESIZE_MODE,
         "header_layout_version": UI_HEADER_LAYOUT_VERSION,
         "language": language,
+        "shot_editor_expanded": ui.get("shot_editor_expanded") is not False,
     }
 
 
@@ -4347,6 +4353,10 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "schema": STATE_SCHEMA,
         "mode": MODE_NAME,
+        "multi_shot_enabled": state.get("multi_shot_enabled") is True,
+        # Dormant editors remain encoded data. Normalizing one visible editor
+        # must not parse and rebuild another four source dashboards.
+        "shot_documents": _normalize_prompt_shot_documents(state.get("shot_documents")),
         SOURCE_SYNC_REVISION_KEY: source_sync_revision,
         UI_EDIT_REVISION_KEY: ui_edit_revision,
         "image_taxonomy": _image_taxonomy_payload(),
@@ -4367,6 +4377,85 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
             "max_videos": MAX_VIDEOS,
         },
     }
+
+
+def _prompt_document_key(shot: Any) -> str:
+    selected = _normalize_shot_selection(shot)
+    if selected["channel_uuid"] and selected["shot_uuid"]:
+        return selected["channel_uuid"] + "/" + selected["shot_uuid"]
+    return "__unbound__"
+
+
+def _normalize_prompt_shot_documents(value: Any) -> Dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    result: Dict[str, str] = {}
+    for key, document in value.items():
+        if not isinstance(key, str) or len(key) > 300 or "\x00" in key:
+            continue
+        if key != "__unbound__" and len(key.split("/")) != 2:
+            continue
+        if isinstance(document, dict):
+            document = _json_dumps({k: v for k, v in document.items() if k != "shot_documents"})
+        if isinstance(document, str) and document:
+            result[key] = document
+    return result
+
+
+def _store_prompt_shot_document(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("multi_shot_enabled") is not True:
+        return state
+    documents = _normalize_prompt_shot_documents(state.get("shot_documents"))
+    payload = {key: value for key, value in state.items() if key not in {"shot_documents", "disabled"}}
+    documents[_prompt_document_key(state.get("shot"))] = _json_dumps(payload)
+    state["shot_documents"] = documents
+    return state
+
+
+def _prompt_authoring_sync_fingerprint(value: Any) -> str:
+    state = _normalize_state(value if isinstance(value, dict) else _parse_state(value))
+    return _canonical_sha256({key: item for key, item in state.items()
+        if key not in {"ui", "shot_documents", SOURCE_SYNC_REVISION_KEY, UI_EDIT_REVISION_KEY}})
+
+
+def _prompt_document_intent_fingerprint(value: Any) -> str:
+    state = _normalize_state(value if isinstance(value, dict) else _parse_state(value))
+    return _canonical_sha256({"document": _prompt_document_key(state.get("shot")),
+        **{key: state.get(key) for key in ("images", "videos", "text", _SOURCE_INTENT_FALLBACKS_KEY)}})
+
+
+def _select_prompt_shot_document(state: Dict[str, Any], selected: Any) -> Dict[str, Any]:
+    """Switch only the editing projection; every UUID retains its own inputs."""
+    selected = _normalize_shot_selection(selected)
+    if state.get("multi_shot_enabled") is not True:
+        state["shot"] = selected
+        return state
+    state = _normalize_state(state)
+    key = _prompt_document_key(selected)
+    current_key = _prompt_document_key(state.get("shot"))
+    if key == current_key:
+        # The visible body already durably owns this active Shot. A catalog
+        # acknowledgement must not copy the outer source/UI clocks into its
+        # saved document: that document-only difference would advance the
+        # outer source clock on every identical catalog callback forever.
+        state["shot"] = selected
+        return state
+    state = _store_prompt_shot_document(state)
+    documents = state["shot_documents"]
+    saved = _parse_state(documents.get(key, ""))
+    if not saved and current_key == "__unbound__" and len(documents) == 1:
+        # The first chosen Shot adopts work authored before a publisher exists.
+        saved = {k: v for k, v in state.items() if k != "shot_documents"}
+    target = _normalize_state(saved or _default_widget_state())
+    target["multi_shot_enabled"] = True
+    target["shot_documents"] = documents
+    target["shot"] = selected
+    for revision in (SOURCE_SYNC_REVISION_KEY, UI_EDIT_REVISION_KEY):
+        target[revision] = state[revision]
+    for owner, fields in (("image_asset", ("shot_catalog", "shot_catalog_routing")), ("picker", ("shot_catalog",))):
+        for field in fields:
+            target[owner][field] = copy.deepcopy(state.get(owner, {}).get(field, [] if field == "shot_catalog" else {}))
+    return target
 
 
 _PROMPT_IMAGE_UI_FIELDS = (
@@ -4545,6 +4634,34 @@ def _prompt_only_intent_matches_source_authority(
     )
 
 
+def _merge_prompt_shot_document_revisions(source: Dict[str, str], ui: Dict[str, str]) -> Dict[str, str]:
+    """Merge dormant authoring by each document's clocks, not outer ownership.
+
+    The active editor is newer than its saved JSON until a switch. Source
+    deletion materializes that editor before clearing authority; an accepted UI
+    echo may still carry the preceding dormant JSON for that same UUID.
+    """
+    merged = dict(source)
+    for key, incoming in ui.items():
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = incoming
+            continue
+        if existing == incoming:
+            continue
+        source_document, ui_document = _parse_state(existing), _parse_state(incoming)
+        def revisions(document: Dict[str, Any]) -> tuple[int, int]:
+            def revision(field: str) -> int:
+                try:
+                    return max(0, min(MAX_SOURCE_SYNC_REVISION, int(document.get(field) or 0)))
+                except (TypeError, ValueError, OverflowError):
+                    return 0
+            return revision(UI_EDIT_REVISION_KEY), revision(SOURCE_SYNC_REVISION_KEY)
+        if ui_document and (not source_document or revisions(ui_document) > revisions(source_document)):
+            merged[key] = incoming
+    return merged
+
+
 def _merge_prompt_revision_axes(
     source_state: Dict[str, Any],
     ui_state: Dict[str, Any],
@@ -4562,8 +4679,23 @@ def _merge_prompt_revision_axes(
 
     source = _normalize_state(copy.deepcopy(source_state))
     ui = _normalize_state(copy.deepcopy(ui_state))
+    if source.get("multi_shot_enabled") and ui.get("multi_shot_enabled"):
+        documents = _merge_prompt_shot_document_revisions(source["shot_documents"], ui["shot_documents"])
+        source["shot_documents"] = documents
+        ui_selection = _normalize_shot_selection(ui.get("shot"))
+        if any(item["shot_uuid"] == ui_selection["shot_uuid"] and item["channel_uuid"] == ui_selection["channel_uuid"] for item in _verified_prompt_shot_catalog(source)):
+            source = _select_prompt_shot_document(source, ui_selection)
+            source["shot_documents"] = documents
+    # UI intent belongs to its channel/UUID document, not the displayed slot
+    # number. A source-only restore can select an archived UUID while the last
+    # accepted UI is unbound or belongs to a deleted/foreign channel. Keep the
+    # selected document's authoring until a valid UI document owns that UUID.
+    authored_ui = ui
+    if (source.get("multi_shot_enabled") and ui.get("multi_shot_enabled")
+            and _prompt_document_key(source.get("shot")) != _prompt_document_key(ui.get("shot"))):
+        authored_ui = source
     ui_images: Dict[str, Dict[str, Any]] = {}
-    for index, item in enumerate(ui.get("images", [])):
+    for index, item in enumerate(authored_ui.get("images", [])):
         if not isinstance(item, dict):
             continue
         identity = _prompt_revision_image_identity(item, index)
@@ -4590,7 +4722,7 @@ def _merge_prompt_revision_axes(
             )
 
     ui_videos: Dict[str, Dict[str, Any]] = {}
-    for index, item in enumerate(ui.get("videos", [])):
+    for index, item in enumerate(authored_ui.get("videos", [])):
         if not isinstance(item, dict):
             continue
         identity = _prompt_revision_video_identity(item, index)
@@ -4608,13 +4740,13 @@ def _merge_prompt_revision_axes(
 
     # Connected source inputs do not author Prompt prose. A crossed source/UI
     # callback therefore keeps the latest accepted text generation.
-    source["text"] = copy.deepcopy(ui.get("text"))
+    source["text"] = copy.deepcopy(authored_ui.get("text"))
     # These fields are also authored only by the Prompt dashboard. In
     # particular, carrying the selected Shot from the newer UI axis prevents a
     # fast Shot 1 -> Shot 2 choice from being repainted by an overlapping Shot
     # 1 source callback. The selected row is re-read from the source-proven
     # catalog so UI data can never mint or alter Shot authority.
-    source["ui"] = copy.deepcopy(ui.get("ui"))
+    source["ui"] = copy.deepcopy(authored_ui.get("ui"))
     # Source-intent fallbacks are generated while parsing the newest connected
     # ImageAsset/Picker payload. They are source-owned diagnostics, not Prompt
     # dashboard edits, so an older UI snapshot must never replace them.
@@ -4622,7 +4754,7 @@ def _merge_prompt_revision_axes(
     source_picker = (
         source.get("picker") if isinstance(source.get("picker"), dict) else {}
     )
-    ui_picker = ui.get("picker") if isinstance(ui.get("picker"), dict) else {}
+    ui_picker = authored_ui.get("picker") if isinstance(authored_ui.get("picker"), dict) else {}
     source_picker["slot_suppressions"] = copy.deepcopy(
         ui_picker.get("slot_suppressions")
     )
@@ -4638,6 +4770,7 @@ def _merge_prompt_revision_axes(
                 item
                 for item in _verified_prompt_shot_catalog(source)
                 if item["shot_uuid"] == ui_shot["shot_uuid"]
+                and item["channel_uuid"] == ui_shot["channel_uuid"]
             ),
             None,
         )
@@ -6489,6 +6622,11 @@ def _prepare_uid_managed_video_rows(
             slot_map[old_slot] = new_slot_by_old_row_id.get(id(item), old_slot)
         else:
             slot_map[old_slot] = 0
+    if generated_empty_placeholder and picker_row_slot_map:
+        # The restored empty row is not a real source that was deselected.
+        # Only an exact dormant UID can carry its former address forward;
+        # missing/foreign UIDs still map to zero and clear invalid bindings.
+        slot_map.update(picker_row_slot_map)
     if any(old != new for old, new in slot_map.items()):
         context_before_sync = _manual_video_context_snapshot(state)
         _remap_video_source_references_in_state(state, slot_map)
@@ -8786,7 +8924,7 @@ def _add_widget_state_parameter(node: Any) -> None:
     kwargs: Dict[str, Any] = {
         "name": WIDGET_PARAMETER_NAME,
         "tooltip": "HMB_GP_Production additive source-binding dashboard. Supplied Image Target, Sub Type, video role, Color Pick, and optional local bindings add authority without making another source or slot mandatory. Missing semantic fields remain unspecified. Explicit Picker companion provenance alone activates cross-file bundle integrity checks.",
-        "default_value": _json_dumps(_default_widget_state()),
+        "default_value": _json_dumps({**_default_widget_state(), "multi_shot_enabled": True}),
         "type": "str",
         "input_types": [],
         "allow_input": False,
@@ -8796,7 +8934,7 @@ def _add_widget_state_parameter(node: Any) -> None:
             "display_name": "HMB_GP_Production",
             "is_full_width": True,
             "height": PROMPT_START_HEIGHT,
-            "min_height": PROMPT_MIN_HEIGHT,
+            "min_height": 0,
             "widget_height": PROMPT_START_HEIGHT,
             "width": 1800,
             "min_width": 760,
@@ -9625,6 +9763,16 @@ def _stage_and_notify_prompt_output(
         node._hmb_pending_prompt_notification = None
 
 
+def _prompt_start_metadata(value: Any) -> Dict[str, Any]:
+    """Normalize only startup geometry, without mutating saved workflow data."""
+    metadata = dict(value) if isinstance(value, dict) else {}
+    saved_size = metadata.get("size")
+    size = dict(saved_size) if isinstance(saved_size, dict) else {}
+    size.update(width=PROMPT_START_WIDTH, height=PROMPT_START_HEIGHT)
+    metadata["size"] = size
+    return metadata
+
+
 class HMBPromptLibrary(DataNode):
     """HMBPromptLibrary.
 
@@ -9648,6 +9796,9 @@ class HMBPromptLibrary(DataNode):
     """
 
     def __init__(self, **kwargs: Any):
+        prepared_kwargs = dict(kwargs)
+        prepared_metadata = _prompt_start_metadata(kwargs.get("metadata"))
+        prepared_kwargs["metadata"] = prepared_metadata
         self._hmb_node_deleted = False
         self._hmb_delete_parent_called = False
         self._hmb_deletion_reconcile_called = False
@@ -9681,7 +9832,13 @@ class HMBPromptLibrary(DataNode):
         self._hmb_initial_shot_autoclaim_pending = True
         self._hmb_initial_shot_preferred_uuid = ""
         self._hmb_initial_shot_exact_refresh_pending = False
-        super().__init__(**kwargs)
+        # Normalize saved geometry before the SDK can publish the node, so an
+        # old large/small shell does not flash before the dashboard is mounted.
+        super().__init__(**prepared_kwargs)
+        current_metadata = dict(prepared_metadata)
+        current_metadata.update(getattr(self, "metadata", {}) or {})
+        current_metadata["size"] = dict(prepared_metadata["size"])
+        self.metadata = current_metadata
         self.category = "HMB_GP_Production"
         self.description = (
             "Independent HMB prompt authoring with four valid modes: Prompt "
@@ -9709,6 +9866,9 @@ class HMBPromptLibrary(DataNode):
         self._hmb_last_prompt_semantic_fingerprint = ""
         self._hmb_last_prompt_output = None
         self._hmb_last_machine_prompt_output = None
+        self._hmb_compiled_prompt_pairs: Dict[str, Any] = {}
+        self._hmb_compile_cache_epoch = 0
+        self._hmb_initial_source_hydration_pending = False
         self._hmb_prompt_snapshot_generation = 0
         self._hmb_prompt_notification_generation = 0
         self._hmb_pending_prompt_notification = None
@@ -9774,9 +9934,278 @@ class HMBPromptLibrary(DataNode):
         if bool(getattr(self, "_hmb_routing_hydration_epoch_started", False)):
             return
         if not self._state_has_persisted_shot_routing(value):
-            return
+            state = value if isinstance(value, dict) else _parse_state(value)
+            saved = state.get("shot_documents") if isinstance(state, dict) else None
+            if not isinstance(saved, dict) or not any(self._state_has_persisted_shot_routing(document)
+                    for document in saved.values()):
+                return
         self._hmb_routing_hydration_epoch_started = True
         self._hmb_routing_hydration_rebase_pending = True
+        self._register_hydrated_document_routes(value)
+
+    def _register_hydrated_document_routes(self, value: Any) -> None:
+        """Grant a saved document one source rebase in this hydration epoch.
+
+        This seam is used only by initial hydration and verified migration,
+        never by ordinary browser edits. Consumed entries retain their current
+        watermarks so reading a dormant saved JSON copy cannot revive old proof.
+        """
+        state = value if isinstance(value, dict) else _parse_state(value)
+        if not isinstance(state, dict):
+            return
+        ledger = getattr(self, "_hmb_hydrated_document_routes", None)
+        if not isinstance(ledger, dict):
+            ledger = {}
+            self._hmb_hydrated_document_routes = ledger
+        documents = [state]
+        saved = state.get("shot_documents")
+        for serialized in saved.values() if isinstance(saved, dict) else ():
+            document = serialized if isinstance(serialized, dict) else _parse_state(serialized)
+            if isinstance(document, dict):
+                documents.append(document)
+        for document in documents:
+            key = _prompt_document_key(document.get("shot"))
+            if key == "__unbound__":
+                continue
+            for kind, field in (("image_asset", "image_asset"), ("video_picker", "picker")):
+                payload = document.get(field)
+                if isinstance(payload, dict) and _normalize_shot_routing(payload.get("shot_routing")):
+                    ledger.setdefault((key, kind), None)
+
+    def _mark_deleted_document_source(self, source: Any, target_name: str) -> None:
+        """Remember only an official deletion's exact previously connected owner."""
+        kinds = {SHOT_ASSET_INPUT_PARAMETER_NAME: "image_asset", IMAGE_ASSET_INPUT_PARAMETER_NAME: "image_asset",
+                 SHOT_PICKER_INPUT_PARAMETER_NAME: "video_picker"}
+        kind = kinds.get(target_name)
+        if not kind or getattr(source, "_hmb_node_deleted", False) is not True:
+            return
+        metadata = getattr(source, "metadata", {})
+        expected = "HMBImageAssetLibrary" if kind == "image_asset" else "HMBVideoPickerLibrary"
+        if not isinstance(metadata, dict) or metadata.get("library") != "HMB_GP_Production" or metadata.get("node_type") != expected:
+            return
+        owner = getattr(self, "_hmb_execution_registered_owner", self)
+        pinned = getattr(owner, "_hmb_hydrated_document_sources", {}).get(kind)
+        if pinned is not None and pinned is not source:
+            return
+        pending = getattr(owner, "_hmb_deleted_document_sources", None)
+        if not isinstance(pending, dict):
+            pending = {}
+            owner._hmb_deleted_document_sources = pending
+        pending[kind] = source
+        if kind == "video_picker" and getattr(owner, "_hmb_connected_source_nodes", {}).get(target_name) is source:
+            state = owner._current_state()
+            picker = state.get("picker") if isinstance(state.get("picker"), dict) else {}
+            uids = tuple(_clean_string(uid) for uid in picker.get("ordered_video_uids", []))
+            key = _prompt_document_key(state.get("shot"))
+            if key != "__unbound__" and uids and all(uids) and len(set(uids)) == len(uids):
+                records = getattr(owner, "_hmb_deleted_picker_authoring", None)
+                if not isinstance(records, dict):
+                    records = {}
+                    owner._hmb_deleted_picker_authoring = records
+                existing = records.get(key)
+                if not isinstance(existing, dict) or existing.get("source") is not source:
+                    records[key] = {"source": source, "video_uids": uids,
+                        "before": self._deleted_picker_authoring_snapshot(state), "after": None}
+
+    @staticmethod
+    def _deleted_picker_authoring_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
+        snapshot = _manual_video_context_snapshot(state)
+        for record in snapshot["images"]:
+            index = record["index"]
+            for field in _PROMPT_IMAGE_UI_FIELDS:
+                record["fields"][field] = copy.deepcopy(state["images"][index].get(field))
+        return snapshot
+
+    def _remember_deleted_picker_projection(self, state: Dict[str, Any]) -> None:
+        """Retain the first unavailable projection, never a later user edit."""
+        owner = getattr(self, "_hmb_execution_registered_owner", self)
+        if owner is not self:
+            return
+        sources = getattr(owner, "_hmb_connected_source_nodes", {})
+        if sources.get(SHOT_PICKER_INPUT_PARAMETER_NAME) is not None or sources.get(PICKER_INPUT_PARAMETER_NAME) is not None:
+            return
+        records = getattr(owner, "_hmb_deleted_picker_authoring", {})
+        record = records.get(_prompt_document_key(state.get("shot")))
+        if isinstance(record, dict) and record.get("after") is None:
+            record["after"] = self._deleted_picker_authoring_snapshot(state)
+
+    def _restore_deleted_picker_authoring(self, state: Dict[str, Any], selected_uids: List[str],
+        *, authored_snapshot: Dict[str, Any] | None = None) -> None:
+        """Restore only exact UID bindings unchanged since an official deletion.
+
+        The unavailable projection still clears media and dangling Color Picks.
+        A live deselection creates no record, and foreign/new UID membership can
+        never revive a saved address merely because its slot/name is reused.
+        """
+        owner = getattr(self, "_hmb_execution_registered_owner", self)
+        records = getattr(owner, "_hmb_deleted_picker_authoring", {})
+        key = _prompt_document_key(state.get("shot"))
+        record = records.get(key)
+        if not isinstance(record, dict):
+            return
+        expected = record.get("video_uids")
+        if tuple(selected_uids) != expected:
+            records.pop(key, None)
+            return
+        if isinstance(record.get("after"), dict):
+            original, automatic = record["before"], record["after"]
+            restored_change = False
+            current = authored_snapshot or self._deleted_picker_authoring_snapshot(state)
+            original_images = _manual_video_context_image_records(original)
+            automatic_images = _manual_video_context_image_records(automatic)
+            current_images = _manual_video_context_image_records(current)
+            projected_images = _manual_video_context_image_records(self._deleted_picker_authoring_snapshot(state))
+            for identity, automatic_row in automatic_images.items():
+                # Recreated ImageAsset rows may not borrow an old image's input
+                # through the same display name or row number.
+                if identity[0] != "identity" or not str(identity[1]).startswith("uid:"):
+                    continue
+                original_row, current_row, projected_row = original_images.get(identity), current_images.get(identity), projected_images.get(identity)
+                if not original_row or not current_row or not projected_row:
+                    continue
+                original_fields, automatic_fields, current_fields = original_row["fields"], automatic_row["fields"], current_row["fields"]
+                target = state["images"][projected_row["index"]]
+                for field in _PROMPT_IMAGE_UI_FIELDS:
+                    if _mapping_entry_matches(original_fields, automatic_fields, field) and _mapping_entry_matches(current_fields, automatic_fields, field):
+                        continue
+                    chosen = original_fields if _mapping_entry_matches(current_fields, automatic_fields, field) else current_fields
+                    restored_change = restored_change or not _mapping_entry_matches(target, chosen, field)
+                    _replace_mapping_entry(target, chosen, field)
+            for field in TEXT_FIELD_DEFAULTS:
+                if field == "PRESERVED_TEXT":
+                    continue
+                original_text, automatic_text, current_text = original["text"], automatic["text"], current["text"]
+                if _mapping_entry_matches(original_text, automatic_text, field) and _mapping_entry_matches(current_text, automatic_text, field):
+                    continue
+                chosen = original_text if _mapping_entry_matches(current_text, automatic_text, field) else current_text
+                restored_change = restored_change or not _mapping_entry_matches(state["text"], chosen, field)
+                _replace_mapping_entry(state["text"], chosen, field)
+            if restored_change:
+                # This is an authored-intent restoration, not a source-only
+                # metadata echo. Advance its UI axis once so neither Python
+                # nor a retained browser merges the former unavailable values
+                # over this validated three-way result.
+                state[UI_EDIT_REVISION_KEY] = min(MAX_SOURCE_SYNC_REVISION,
+                    int(state.get(UI_EDIT_REVISION_KEY) or 0) + 1)
+        # Execution snapshots are read-only views of this authored archive.
+        # Only the canonical editor commit can finish its restoration.
+        if owner is self:
+            records.pop(key, None)
+
+    def _retire_deleted_document_sources(self) -> None:
+        """Release stale proof only after the deleted object is unregistered.
+
+        Connection removal happens before SDK node deregistration. An ordinary
+        edge swap to a second live publisher never grants a new source epoch.
+        The next owner must still pass the same-flow physical-edge checks below.
+        """
+        owner = getattr(self, "_hmb_execution_registered_owner", self)
+        pending = getattr(owner, "_hmb_deleted_document_sources", None)
+        if not isinstance(pending, dict) or not pending:
+            return
+        try:
+            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+            manager = GriptapeNodes.NodeManager()
+        except Exception:
+            return
+        for kind, source in tuple(pending.items()):
+            if getattr(source, "_hmb_node_deleted", False) is not True:
+                continue
+            try:
+                if manager.get_node_by_name(source.name) is source:
+                    continue
+            except ValueError:
+                # The SDK raises ValueError for a missing node name. Confirm
+                # absence through its independent public object registry too.
+                try:
+                    if GriptapeNodes.ObjectManager().attempt_get_object_by_name(source.name) is not None:
+                        continue
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            pinned = getattr(owner, "_hmb_hydrated_document_sources", {})
+            if pinned.get(kind) is not None and pinned[kind] is not source:
+                pending.pop(kind, None)
+                continue
+            ledger = getattr(owner, "_hmb_hydrated_document_routes", None)
+            if not isinstance(ledger, dict):
+                ledger = {}
+                owner._hmb_hydrated_document_routes = ledger
+            state = owner._current_state()
+            documents = [state]
+            saved = state.get("shot_documents")
+            for raw in saved.values() if isinstance(saved, dict) else ():
+                document = raw if isinstance(raw, dict) else _parse_state(raw)
+                if isinstance(document, dict):
+                    documents.append(document)
+            for document in documents:
+                key = _prompt_document_key(document.get("shot"))
+                field = "image_asset" if kind == "image_asset" else "picker"
+                payload = document.get(field)
+                if key != "__unbound__" and isinstance(payload, dict) and _normalize_shot_routing(payload.get("shot_routing")):
+                    ledger[(key, kind)] = None
+            for key in tuple(ledger):
+                if isinstance(key, tuple) and len(key) == 2 and key[1] == kind:
+                    ledger[key] = None
+            pinned.pop(kind, None)
+            pending.pop(kind, None)
+            owner._hmb_document_source_epoch = int(getattr(owner, "_hmb_document_source_epoch", 0)) + 1
+
+    def _validate_document_route_watermark(self, state: Dict[str, Any], *, kind: str,
+        source: Any, snapshot: Dict[str, Any], previous: Any, label: str) -> None:
+        self._retire_deleted_document_sources()
+        owner = getattr(self, "_hmb_execution_registered_owner", self)
+        ledger = getattr(owner, "_hmb_hydrated_document_routes", {})
+        key = (_prompt_document_key(state.get("shot")), kind)
+        pinned_sources = getattr(owner, "_hmb_hydrated_document_sources", {})
+        if kind in pinned_sources and pinned_sources[kind] is not source:
+            raise _ShotRoutingContractError(f"{label} duplicate/replaced publisher was rejected.")
+        if key not in ledger:
+            _assert_monotonic_shot_route(self._routing_watermark_for_validation(previous), snapshot, label=label)
+            return
+        # A fresh process may replace persisted publisher UUIDs, but only the
+        # exact registered source on this Prompt's same-flow physical port can
+        # establish the new epoch. It is then pinned for every dormant document.
+        from _hmb_shot_routing import _same_flow_nodes
+        flow_name, nodes = _same_flow_nodes(owner)
+        if not flow_name:
+            # Preserve the existing non-retained compatibility path. No new
+            # per-document authority is consumed without real graph evidence.
+            _assert_monotonic_shot_route(self._routing_watermark_for_validation(previous), snapshot, label=label)
+            return
+        from griptape_nodes.retained_mode.events.connection_events import ListConnectionsForNodeRequest, ListConnectionsForNodeResultSuccess
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        expected_type = "HMBImageAssetLibrary" if kind == "image_asset" else "HMBVideoPickerLibrary"
+        metadata = getattr(source, "metadata", {})
+        if (not any(node is source for node in nodes)
+                or metadata.get("library") != "HMB_GP_Production" or metadata.get("node_type") != expected_type
+                or GriptapeNodes.NodeManager().get_node_by_name(source.name) is not source):
+            raise _ShotRoutingContractError(f"{label} hydration source is not the registered same-flow publisher.")
+        result = GriptapeNodes.handle_request(ListConnectionsForNodeRequest(node_name=owner.name, broadcast_result=False))
+        ports = ({SHOT_ASSET_INPUT_PARAMETER_NAME: "SHOT_ASSET_OUT", IMAGE_ASSET_INPUT_PARAMETER_NAME: "IMAGE_ASSET_OUT"}
+            if kind == "image_asset" else {SHOT_PICKER_INPUT_PARAMETER_NAME: "SHOT_PICKER_OUT"})
+        matching = [edge for edge in getattr(result, "incoming_connections", ())
+            if getattr(edge, "target_parameter_name", "") in ports]
+        if (not isinstance(result, ListConnectionsForNodeResultSuccess) or len(matching) != 1
+                or matching[0].source_node_name != source.name
+                or matching[0].source_parameter_name != ports[matching[0].target_parameter_name]):
+            raise _ShotRoutingContractError(f"{label} hydration source has no unique physical connection.")
+        shot = _normalize_shot_selection(state.get("shot"))
+        target = next((row for row in snapshot["shots"] if row["shot_uuid"] == shot["shot_uuid"]), None)
+        if (snapshot["channel_uuid"] != shot["channel_uuid"] or target is None
+                or target["number"] != shot["number"] or target["name"] != shot["name"]):
+            raise _ShotRoutingContractError(f"{label} hydration source does not own the exact Shot.")
+        pinned = getattr(owner, "_hmb_hydrated_document_sources", None)
+        if not isinstance(pinned, dict):
+            pinned = {}
+            owner._hmb_hydrated_document_sources = pinned
+        if kind in pinned and pinned[kind] is not source:
+            raise _ShotRoutingContractError(f"{label} duplicate/replaced publisher was rejected.")
+        baseline = ledger[key]
+        _assert_monotonic_shot_route(baseline or {}, snapshot, label=label)
+        pinned[kind] = source
+        ledger[key] = _routing_projection(snapshot, target["selected_source_uids"])
 
     def _routing_watermark_for_validation(self, value: Any) -> Any:
         if bool(getattr(self, "_hmb_routing_hydration_rebase_pending", False)):
@@ -10035,13 +10464,10 @@ class HMBPromptLibrary(DataNode):
                 expected_channel_uuid=expected_channel,
                 max_selected_sources=MAX_SHOT_IMAGES,
             )
-            _assert_monotonic_shot_route(
-                self._routing_watermark_for_validation(
-                    normalized.get("image_asset", {}).get("shot_routing")
-                    if isinstance(normalized.get("image_asset"), dict)
-                    else {}
-                ),
-                image_snapshot,
+            self._validate_document_route_watermark(normalized,
+                kind="image_asset", source=image_source_node, snapshot=image_snapshot,
+                previous=normalized.get("image_asset", {}).get("shot_routing")
+                    if isinstance(normalized.get("image_asset"), dict) else {},
                 label="ImageAsset shot routing",
             )
             compact_catalog = _compact_catalog_from_snapshot(image_snapshot)
@@ -10049,6 +10475,11 @@ class HMBPromptLibrary(DataNode):
                 item["shot_uuid"] == current_shot["shot_uuid"]
                 for item in image_snapshot["shots"]
             )
+            if normalized.get("multi_shot_enabled") and not selected_uuid_exists and image_snapshot["shots"]:
+                first = {**image_snapshot["shots"][0], "channel_uuid": image_snapshot["channel_uuid"]}
+                normalized = _select_prompt_shot_document(normalized, first)
+                current_shot = _normalize_shot_selection(normalized.get("shot"))
+                selected_uuid_exists = True
             if not (
                 current_shot["channel_uuid"]
                 and current_shot["shot_uuid"]
@@ -10229,13 +10660,10 @@ class HMBPromptLibrary(DataNode):
                 raw_picker_snapshot,
                 expected_channel_uuid=expected_channel,
             )
-            _assert_monotonic_shot_route(
-                self._routing_watermark_for_validation(
-                    normalized.get("picker", {}).get("shot_routing")
-                    if isinstance(normalized.get("picker"), dict)
-                    else {}
-                ),
-                picker_snapshot,
+            self._validate_document_route_watermark(normalized,
+                kind="video_picker", source=picker_source_node, snapshot=picker_snapshot,
+                previous=normalized.get("picker", {}).get("shot_routing")
+                    if isinstance(normalized.get("picker"), dict) else {},
                 label="VideoPicker shot routing",
             )
             picker_shot = next(
@@ -10257,6 +10685,10 @@ class HMBPromptLibrary(DataNode):
                 raise _ShotRoutingContractError(
                     "Picker and ImageAsset shot metadata do not match."
                 )
+            owner = getattr(self, "_hmb_execution_registered_owner", self)
+            retired_authoring = getattr(owner, "_hmb_deleted_picker_authoring", {})
+            authored_snapshot = (self._deleted_picker_authoring_snapshot(normalized)
+                if _prompt_document_key(normalized.get("shot")) in retired_authoring else None)
             normalized = _apply_picker_payload(
                 normalized,
                 copy.deepcopy(picker_shot["picker_payload"]),
@@ -10274,6 +10706,9 @@ class HMBPromptLibrary(DataNode):
                 raise _ShotRoutingContractError(
                     "Prompt video rows do not match the active Shot media order."
                 )
+            self._restore_deleted_picker_authoring(
+                normalized, picker_shot["selected_source_uids"], authored_snapshot=authored_snapshot
+            )
             normalized["shot"] = current_shot
             picker_state = (
                 normalized.get("picker")
@@ -10316,6 +10751,141 @@ class HMBPromptLibrary(DataNode):
             "shot_name": shot["name"],
         }
 
+    def _hmb_shot_manager_enabled(self) -> bool:
+        return self._current_state().get("multi_shot_enabled") is True
+
+    def _hmb_prompt_merge_snapshot(self) -> Dict[str, Any]:
+        """Capture migration input without compiling or touching the graph."""
+        with self._hmb_sync_lock:
+            raw = _get_parameter_raw(self, WIDGET_PARAMETER_NAME)
+            state = _normalize_state(_parse_state(raw) or _default_widget_state())
+            materialized = copy.deepcopy(state)
+            materialized["multi_shot_enabled"] = True
+            _store_prompt_shot_document(materialized)
+            return copy.deepcopy({"schema": "hmb-prompt-merge-snapshot", "version": 1,
+                "node_name": self.name, "raw_widget": raw, "state": state,
+                "state_sha256": _canonical_sha256(state),
+                "materialized_documents": materialized["shot_documents"],
+                "outputs": dict(getattr(self, "parameter_output_values", {}))})
+
+    def _hmb_write_merged_prompt_state(self, raw: Any) -> None:
+        previous = self._hmb_ui_syncing
+        self._hmb_ui_syncing = True
+        try:
+            setter = getattr(super(), "set_parameter_value")
+            if ParameterMode is None:
+                setter(WIDGET_PARAMETER_NAME, raw)
+            else:
+                setter(WIDGET_PARAMETER_NAME, raw, initial_setup=True, emit_change=False, skip_before_value_set=True)
+            self._accept_widget_state_baseline(raw)
+        finally:
+            self._hmb_ui_syncing = previous
+
+    def _hmb_import_prompt_documents(self, documents: Any, *, expected_state_sha256: str) -> Dict[str, Any]:
+        """CAS-import authored documents; the caller owns graph migration."""
+        with self._hmb_sync_lock:
+            snapshot = self._hmb_prompt_merge_snapshot()
+            if snapshot["state_sha256"] != expected_state_sha256:
+                raise RuntimeError("Prompt changed during migration; original nodes are retained.")
+            normalized = _normalize_prompt_shot_documents(documents)
+            if not isinstance(documents, dict) or set(normalized) != set(documents):
+                raise ValueError("Prompt migration documents are invalid.")
+            merged = dict(snapshot["materialized_documents"])
+            for key, serialized in normalized.items():
+                document = _parse_state(serialized)
+                if not document or _prompt_document_key(document.get("shot")) != key:
+                    raise ValueError("Prompt migration document identity is invalid.")
+                if key in merged and _prompt_document_intent_fingerprint(merged[key]) != _prompt_document_intent_fingerprint(document):
+                    raise ValueError("Conflicting Prompt documents require an explicit authoring choice.")
+                merged[key] = serialized
+            state = copy.deepcopy(snapshot["state"])
+            state["multi_shot_enabled"] = True
+            state["shot_documents"] = merged
+            self._hmb_write_merged_prompt_state(_json_dumps(state))
+            self._arm_routing_hydration_rebase(state)
+            if bool(getattr(self, "_hmb_routing_hydration_epoch_started", False)):
+                self._register_hydrated_document_routes(state)
+            return self._hmb_prompt_merge_snapshot()
+
+    def _hmb_restore_prompt_merge_snapshot(self, snapshot: Any, *, expected_state_sha256: str) -> Dict[str, Any]:
+        with self._hmb_sync_lock:
+            if (not isinstance(snapshot, dict) or snapshot.get("schema") != "hmb-prompt-merge-snapshot"
+                    or snapshot.get("version") != 1 or snapshot.get("node_name") != self.name
+                    or snapshot.get("state_sha256") != _canonical_sha256(_normalize_state(_parse_state(snapshot.get("raw_widget")) or _default_widget_state()))):
+                raise ValueError("Prompt migration rollback snapshot is invalid.")
+            current = self._hmb_prompt_merge_snapshot()
+            if current["state_sha256"] != expected_state_sha256:
+                raise RuntimeError("Prompt changed after migration; rollback cannot overwrite that edit.")
+            self._hmb_write_merged_prompt_state(snapshot["raw_widget"])
+            return self._hmb_prompt_merge_snapshot()
+
+    def _hmb_prompt_shot_subscriptions(self) -> List[Dict[str, Any]]:
+        state = self._current_state()
+        if state.get("multi_shot_enabled") is not True:
+            return [self._hmb_shot_channel_subscription()]
+        return [{
+            "schema": "hmb-shot-channel-subscription", "version": 1,
+            "participant_kind": "prompt", "enabled": True,
+            "channel_uuid": shot["channel_uuid"], "shot_uuid": shot["shot_uuid"],
+            "shot_number": shot["number"], "shot_name": shot["name"],
+        } for shot in _verified_prompt_shot_catalog(state)]
+
+    def _hmb_prompt_shot_document(self, *, channel_uuid: Any, shot_uuid: Any) -> Dict[str, Any]:
+        """Read one exact execution document without changing the visible Shot.
+
+        Stored JSON carries authored controls only. Every source/media/project
+        assertion is rebuilt from the registered publisher before it is used.
+        """
+        with self._hmb_sync_lock:
+            if self._hmb_node_deleted:
+                raise RuntimeError("HMB Prompt owner was deleted.")
+            current = _normalize_state(self._current_state())
+            selected = next((item for item in _verified_prompt_shot_catalog(current)
+                if item["channel_uuid"] == _clean_string(channel_uuid)
+                and item["shot_uuid"] == _clean_string(shot_uuid)), None)
+            if selected is None:
+                raise RuntimeError("Requested Prompt Shot is not in the current ImageAsset catalog.")
+            if not current.get("multi_shot_enabled") and _prompt_document_key(current.get("shot")) != _prompt_document_key(selected):
+                raise RuntimeError("Legacy Prompt owns a different Shot.")
+            state = _select_prompt_shot_document(copy.deepcopy(current), selected)
+            view = copy.copy(self)
+            view._hmb_sync_lock = threading.RLock()
+            view._hmb_agent_pair_local = threading.local()
+            view._hmb_execution_registered_owner = self
+            state, images, videos, image_exact, _picker_exact = view._apply_exact_shot_routes(state)
+            if not image_exact or _prompt_document_key(state.get("shot")) != _prompt_document_key(selected):
+                raise RuntimeError("Requested Prompt Shot has no exact ImageAsset publisher.")
+            view._current_state = lambda: copy.deepcopy(state)
+            view._hmb_current_shot_images = list(images)
+            view._hmb_current_shot_videos = list(videos)
+            visible, machine, fingerprint = self._compiled_prompt_pair_for_state(state)
+            generation = max(1, int(state.get(UI_EDIT_REVISION_KEY) or 0) + int(state.get(SOURCE_SYNC_REVISION_KEY) or 0) + 1)
+            context = _agent_shot_context(state, prompt_generation=generation, visible_prompt=visible, image_media=images, video_media=videos)
+            paired = {"schema": "hmb-prompt-paired-snapshot", "version": 1,
+                "generation": generation, "visible_sha256": hashlib.sha256(visible.encode("utf-8")).hexdigest(),
+                "machine_sha256": hashlib.sha256(machine.encode("utf-8")).hexdigest(), "machine_prompt": machine}
+            asset = state.get("image_asset", {})
+            from _hmb_project import resolve_project
+            source_nodes = getattr(self, "_hmb_connected_source_nodes", {})
+            asset_owner = source_nodes.get(SHOT_ASSET_INPUT_PARAMETER_NAME) or source_nodes.get(IMAGE_ASSET_INPUT_PARAMETER_NAME)
+            identity_getter = getattr(asset_owner, "_hmb_project_identity", None)
+            project = resolve_project(identity_getter() if callable(identity_getter) else asset.get("project_id"), default_legacy=False)
+            projected_project = resolve_project(asset.get("project_id"), default_legacy=False)
+            if projected_project["project_id"] != project["project_id"]:
+                raise RuntimeError("ImageAsset project changed during the Prompt snapshot.")
+            subscription = {"schema": "hmb-shot-channel-subscription", "version": 1,
+                "participant_kind": "prompt", "enabled": True,
+                "channel_uuid": selected["channel_uuid"], "shot_uuid": selected["shot_uuid"],
+                "shot_number": selected["number"], "shot_name": selected["name"]}
+            return copy.deepcopy({"schema": "hmb-prompt-shot-document", "version": 1,
+                "shot": state["shot"], "subscription": subscription, "visible_prompt": visible,
+                "machine_prompt": machine, "paired_snapshot": paired, "generation": generation,
+                "fingerprint": fingerprint, "context": context, "shot_context": context,
+                "image_media": images, "video_media": videos,
+                "reference_media": view._hmb_agent_reference_media(machine),
+                "generation_context": view._hmb_agent_generation_context(machine),
+                "project_identity": {key: project[key] for key in ("project_id", "project_name")}})
+
     def _hmb_available_prompt_shot_catalog(
         self,
         catalog: Any,
@@ -10326,6 +10896,8 @@ class HMBPromptLibrary(DataNode):
         normalized_catalog = _normalize_shot_catalog(catalog)
         if not normalized_catalog:
             return []
+        if self._hmb_shot_manager_enabled():
+            return copy.deepcopy(normalized_catalog)
         current = _normalize_shot_selection(
             current_shot
             if isinstance(current_shot, dict)
@@ -10378,6 +10950,8 @@ class HMBPromptLibrary(DataNode):
         if not isinstance(incoming, dict) or not incoming:
             return value
         state = _normalize_state(copy.deepcopy(incoming))
+        if state.get("multi_shot_enabled"):
+            state["shot_documents"] = {**_normalize_prompt_shot_documents(self._current_state().get("shot_documents")), **state["shot_documents"]}
         current = _normalize_shot_selection(self._current_state().get("shot"))
         image_asset = (
             state.get("image_asset")
@@ -10546,7 +11120,12 @@ class HMBPromptLibrary(DataNode):
 
         with self._hmb_sync_lock:
             current = self._current_state()
-            state = _apply_image_asset_payload(current, {}, connected=False)
+            # Archive the live body before removing its channel projection; the
+            # last local edit may be newer than the dormant UUID document.
+            state = _normalize_state(copy.deepcopy(current))
+            if _prompt_document_key(state.get("shot")) != "__unbound__":
+                state = _store_prompt_shot_document(state)
+            state = _apply_image_asset_payload(state, {}, connected=False)
             state = _apply_picker_payload(state, {}, connected=False)
             state["shot"] = _normalize_shot_selection({})
             image_asset = (
@@ -10693,13 +11272,16 @@ class HMBPromptLibrary(DataNode):
                         ),
                         compact_shots[0],
                     )
+                if selected is None and state.get("multi_shot_enabled") and compact_shots:
+                    selected = compact_shots[0]
                 if selected is None:
                     # Blank recipients remain independently usable. The same
                     # fallback also handles deletion of the active UUID; the
                     # renumbered catalog stays available for a new explicit pick.
-                    state["shot"] = _normalize_shot_selection({})
+                    state = _select_prompt_shot_document(state, {})
                 else:
-                    state["shot"] = selected
+                    state = _select_prompt_shot_document(state, selected)
+                    image_asset = state["image_asset"]
                 if initial_autoclaim:
                     self._hmb_initial_shot_autoclaim_pending = False
                     self._hmb_initial_shot_preferred_uuid = ""
@@ -10819,9 +11401,9 @@ class HMBPromptLibrary(DataNode):
 
         try:
             from _hmb_shot_routing import schedule_post_hydration_reconcile
+            return bool(schedule_post_hydration_reconcile(self))
         except Exception:
             return False
-        return bool(schedule_post_hydration_reconcile(self))
 
     def set_parameter_value(
         self,
@@ -10852,6 +11434,8 @@ class HMBPromptLibrary(DataNode):
             # same-looking visible document can never reuse an older private
             # USER DESCRIPTION/video envelope.
             if hasattr(self, "_hmb_sync_lock"):
+                self._hmb_compile_cache_epoch = int(getattr(self, "_hmb_compile_cache_epoch", 0)) + 1
+                self._hmb_compiled_prompt_pairs = {}
                 self._hmb_last_prompt_semantic_fingerprint = ""
                 self._hmb_last_prompt_output = None
                 self._hmb_last_machine_prompt_output = None
@@ -10884,6 +11468,9 @@ class HMBPromptLibrary(DataNode):
         previous_widget_revisions = getattr(
             self, "_hmb_last_accepted_widget_revisions", (0, 0)
         )
+        previous_ui_only_write = getattr(self, "_hmb_ui_only_widget_write", False)
+        self._hmb_ui_only_widget_write = bool(guarded_widget_write and previous_widget_state
+            and _prompt_authoring_sync_fingerprint(previous_widget_state) == _prompt_authoring_sync_fingerprint(value))
         if is_widget_write:
             self._accept_widget_state_baseline(value)
             self._hmb_widget_write_in_progress = True
@@ -10908,6 +11495,7 @@ class HMBPromptLibrary(DataNode):
         finally:
             if is_widget_write:
                 self._hmb_widget_write_in_progress = False
+            self._hmb_ui_only_widget_write = previous_ui_only_write
         if (
             not initial_setup
             or param_name
@@ -10923,19 +11511,70 @@ class HMBPromptLibrary(DataNode):
         ):
             return
         try:
+            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes  # type: ignore
+            loop = GriptapeNodes.EventManager().event_loop
+            defer = loop is not None and loop.is_running()
+        except Exception:
+            defer = False
+        if defer:
+            # Every raw parameter and authoring baseline is already durable.
+            # The identity-bound native hydration callback observes the newest
+            # combined values once, after this synchronous replay has finished.
+            self._hmb_initial_source_hydration_pending = True
+            if self._schedule_post_hydration_shot_reconcile():
+                return
+            # A running loop alone does not guarantee that a callback was
+            # accepted. Keep unscheduled hydration on the synchronous path.
+            self._hmb_initial_source_hydration_pending = False
+        self._reconcile_initial_prompt_hydration(schedule_after=not defer)
+
+    def _reconcile_initial_prompt_hydration(self, *, schedule_after: bool = True) -> bool:
+        if self._hmb_node_deleted or getattr(self, "_hmb_hydration_reconciling", False):
+            return False
+        self._hmb_initial_source_hydration_pending = False
+        pending_media_publication = False
+        committed = False
+        try:
             self._hmb_hydration_reconciling = True
             if self._reconcile_connected_source_inputs_from_graph():
+                pending_media_publication = bool(
+                    getattr(self, "_hmb_sync_publish_shot_media_pending", False)
+                )
                 self._sync_prompt_output_now(
                     allow_picker_hydration_pending=True
                 )
+                committed = True
         except Exception as exc:
-            _diagnostic_exception(
-                "Initial connected source hydration reconciliation failed",
-                exc,
-            )
+            if (isinstance(exc, ValueError) and (
+                getattr(exc, "hmb_image_asset_selection_preparing", False) is True
+                or getattr(exc, "hmb_picker_media_preparing", False) is True
+            )):
+                try:
+                    self._schedule_prompt_sync(
+                        source_burst=True,
+                        publish_shot_media=pending_media_publication,
+                    )
+                except Exception as retry_exc:
+                    _diagnostic_exception("Initial source preparation retry scheduling failed", retry_exc)
+            else:
+                _diagnostic_exception(
+                    "Initial connected source hydration reconciliation failed",
+                    exc,
+                )
         finally:
             self._hmb_hydration_reconciling = False
-            self._schedule_post_hydration_shot_reconcile()
+            if schedule_after:
+                self._schedule_post_hydration_shot_reconcile()
+        return committed
+
+    def _hmb_post_hydration_state_restore(self) -> None:
+        self._flush_initial_prompt_hydration()
+
+    def _flush_initial_prompt_hydration(self) -> bool:
+        with self._hmb_sync_lock:
+            if not self._hmb_node_deleted and getattr(self, "_hmb_initial_source_hydration_pending", False):
+                return self._reconcile_initial_prompt_hydration()
+        return False
 
     def _current_state(self) -> Dict[str, Any]:
         self._ensure_prompt_output()
@@ -11263,6 +11902,14 @@ class HMBPromptLibrary(DataNode):
                     picker_payload,
                     connected=picker_connected,
                 )
+            if not picker_exact and not picker_connected:
+                self._remember_deleted_picker_projection(state)
+            # The visible body is already the durable active document. Source
+            # enrichment must not rewrite its dormant JSON copy on every
+            # compile: a local select echo would otherwise acquire unrelated
+            # backend-only fields/revisions. Switches and explicit UI writes
+            # retain document snapshots; execution reads capture the current
+            # visible body before reading another UUID.
             serialized_state = _json_dumps(state)
             source_application_changed_state = (
                 serialized_state != state_before_source_sync
@@ -11429,14 +12076,45 @@ class HMBPromptLibrary(DataNode):
                 state = self._write_dashboard_state()
         else:
             state = _normalize_state(self._current_state())
-        prompt = _build_prompt_package(state)
-        machine_prompt = _build_data_only_prompt_package(state)
-        fingerprint = _prompt_semantic_fingerprint(
-            state,
-            public_prompt=prompt,
-            machine_prompt=machine_prompt,
-        )
+        prompt, machine_prompt, fingerprint = self._compiled_prompt_pair_for_state(state)
         return state, prompt, machine_prompt, fingerprint
+
+    def _compiled_prompt_pair_for_state(self, state: Dict[str, Any]) -> tuple[str, str, str]:
+        """Memoize only pure compilation, after current source verification.
+
+        Dormant documents never feed either builder: the selected document is
+        already fully materialized in ``state``. Keep every other normalized
+        input (including private intent, clocks, media order and route proof)
+        in the key. Source/ownership checks and contexts are never cached.
+        """
+        owner = getattr(self, "_hmb_execution_registered_owner", self)
+        with owner._hmb_sync_lock:
+            document = _prompt_document_key(state.get("shot"))
+            sources = getattr(owner, "_hmb_connected_source_nodes", {})
+            identity = _canonical_sha256({
+                "instance": id(owner),
+                "epoch": int(getattr(owner, "_hmb_compile_cache_epoch", 0)),
+                "source_epoch": int(getattr(owner, "_hmb_document_source_epoch", 0)),
+                "source_instances": {name: [id(source), bool(getattr(source, "_hmb_node_deleted", False))]
+                    for name, source in sources.items()},
+                "active_state": {key: value for key, value in state.items() if key != "shot_documents"},
+            })
+            cache = getattr(owner, "_hmb_compiled_prompt_pairs", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                owner._hmb_compiled_prompt_pairs = cache
+            cached = cache.get(document)
+            if not bool(getattr(owner, "_hmb_node_deleted", False)) and cached and cached[0] == identity:
+                return cached[1]
+            visible = _build_prompt_package(state)
+            machine = _build_data_only_prompt_package(state)
+            fingerprint = _prompt_semantic_fingerprint(state, public_prompt=visible, machine_prompt=machine)
+            result = (visible, machine, fingerprint)
+            if not bool(getattr(owner, "_hmb_node_deleted", False)):
+                cache[document] = (identity, result)
+                while len(cache) > MAX_SHOTS + 1:
+                    del cache[next(iter(cache))]
+            return result
 
     def _cache_prompt_pair(
         self,
@@ -11470,6 +12148,7 @@ class HMBPromptLibrary(DataNode):
         incoming = getattr(expected_visible, "value", expected_visible)
         incoming_text = str(incoming or "")
         with self._hmb_sync_lock:
+            self._flush_initial_prompt_hydration()
             (
                 current_state,
                 current_visible,
@@ -11574,6 +12253,7 @@ class HMBPromptLibrary(DataNode):
         )
         incoming_text = str(incoming or "")
         with self._hmb_sync_lock:
+            self._flush_initial_prompt_hydration()
             paired = getattr(self._hmb_agent_pair_local, "pair", None)
             if (
                 isinstance(paired, dict)
@@ -11707,7 +12387,8 @@ class HMBPromptLibrary(DataNode):
                 return {}
             from _hmb_shot_routing import _same_flow_nodes, _subscription_for
 
-            flow_name, nodes = _same_flow_nodes(self)
+            registered_owner = getattr(self, "_hmb_execution_registered_owner", self)
+            flow_name, nodes = _same_flow_nodes(registered_owner)
             if not flow_name:
                 return {}
             fields = ("model_id", "task", "duration_seconds", "duration_mode", "aspect_ratio", "resolution")
@@ -11779,7 +12460,7 @@ class HMBPromptLibrary(DataNode):
                     if valid:
                         snapshot[key] = value
                 observed.append((subscription, snapshot))
-            current_flow_name, current_nodes = _same_flow_nodes(self)
+            current_flow_name, current_nodes = _same_flow_nodes(registered_owner)
             if current_flow_name != flow_name:
                 return {}
             sources = [
@@ -11839,6 +12520,7 @@ class HMBPromptLibrary(DataNode):
         if any(not isinstance(value, str) for value in raw_images + raw_videos):
             raise RuntimeError("HMB Prompt shot media inputs are invalid.")
         with self._hmb_sync_lock:
+            self._flush_initial_prompt_hydration()
             state, visible, machine, fingerprint = (
                 self._compile_current_prompt_pair(refresh_sources=False)
             )
@@ -11875,6 +12557,11 @@ class HMBPromptLibrary(DataNode):
         with self._hmb_sync_lock:
             if bool(getattr(self, "_hmb_node_deleted", False)):
                 return {}
+            if self._flush_initial_prompt_hydration():
+                return self._current_state()
+            # An explicit Run/refresh or changed physical connection is allowed
+            # one fresh attempt. Repeated background echoes use the gate below.
+            self._hmb_prompt_sync_failure = None
             self._hmb_sync_generation += 1
             # A synchronous authority commit supersedes any deferred request.
             # Its callback retains the old token and therefore becomes a no-op.
@@ -11884,16 +12571,36 @@ class HMBPromptLibrary(DataNode):
             self._hmb_sync_queued_token = None
             self._hmb_sync_queued_source_burst = False
             self._hmb_sync_publish_shot_media_pending = False
-            if allow_picker_hydration_pending:
-                return self._sync_prompt_output_from_state(
-                    publish_shot_media=publish_shot_media,
-                    allow_picker_hydration_pending=True,
-                )
-            if publish_shot_media:
-                return self._sync_prompt_output_from_state(
-                    publish_shot_media=True,
-                )
-            return self._sync_prompt_output_from_state()
+            try:
+                if allow_picker_hydration_pending:
+                    return self._sync_prompt_output_from_state(
+                        publish_shot_media=publish_shot_media,
+                        allow_picker_hydration_pending=True,
+                    )
+                if publish_shot_media:
+                    return self._sync_prompt_output_from_state(
+                        publish_shot_media=True,
+                    )
+                return self._sync_prompt_output_from_state()
+            except Exception as exc:
+                if isinstance(exc, _ShotRoutingContractError):
+                    self._hmb_prompt_sync_failure = {"identity": self._prompt_sync_retry_identity(),
+                        "code": type(exc).__name__}
+                raise
+
+    def _prompt_sync_retry_identity(self) -> str:
+        raw = _get_parameter_raw(self, WIDGET_PARAMETER_NAME)
+        state = raw if isinstance(raw, dict) else _parse_state(raw)
+        state = state if isinstance(state, dict) else {}
+        return _canonical_sha256({
+            "shot": _normalize_shot_selection(state.get("shot")),
+            "source_revision": state.get(SOURCE_SYNC_REVISION_KEY, 0),
+            "source_epoch": int(getattr(self, "_hmb_document_source_epoch", 0)),
+            "authored": _prompt_authoring_sync_fingerprint(state),
+            "inputs": {name: _connected_source_fingerprint({"value": _get_parameter_raw(self, name)}, True)
+                for name in (SHOT_ASSET_INPUT_PARAMETER_NAME, SHOT_PICKER_INPUT_PARAMETER_NAME,
+                    IMAGE_ASSET_INPUT_PARAMETER_NAME, PICKER_INPUT_PARAMETER_NAME)},
+        })
 
     def _schedule_prompt_sync(
         self,
@@ -11911,6 +12618,11 @@ class HMBPromptLibrary(DataNode):
         """
         with self._hmb_sync_lock:
             if bool(getattr(self, "_hmb_node_deleted", False)):
+                return
+            self._retire_deleted_document_sources()
+            retry_identity = self._prompt_sync_retry_identity()
+            failure = getattr(self, "_hmb_prompt_sync_failure", None)
+            if isinstance(failure, dict) and failure.get("identity") == retry_identity:
                 return
             self._hmb_sync_generation += 1
             self._hmb_sync_publish_shot_media_pending = bool(
@@ -11957,6 +12669,7 @@ class HMBPromptLibrary(DataNode):
                         )
                     else:
                         self._sync_prompt_output_from_state()
+                    self._hmb_prompt_sync_failure = None
             except Exception as exc:
                 if (
                     isinstance(exc, ValueError)
@@ -11976,7 +12689,18 @@ class HMBPromptLibrary(DataNode):
                                 self._hmb_sync_publish_shot_media_pending or publish_media
                             )
                     return
-                _diagnostic_exception("Deferred PROMPT_OUT synchronization failed", exc)
+                # A corrupt/replaced source must remain an explicit error, but
+                # an unchanged five-second refresh cannot recompile/log forever.
+                # New source revision/input transport or explicit Run retries.
+                if isinstance(exc, _ShotRoutingContractError):
+                    identity = self._prompt_sync_retry_identity()
+                    previous = getattr(self, "_hmb_prompt_sync_failure", None)
+                    self._hmb_prompt_sync_failure = {"identity": identity, "code": type(exc).__name__}
+                    if not isinstance(previous, dict) or previous.get("identity") != identity:
+                        _diagnostic_exception("Deferred PROMPT_OUT synchronization failed", exc)
+                else:
+                    self._hmb_prompt_sync_failure = None
+                    _diagnostic_exception("Deferred PROMPT_OUT synchronization failed", exc)
 
         try:
             from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes  # type: ignore
@@ -12016,6 +12740,10 @@ class HMBPromptLibrary(DataNode):
                 _diagnostic_exception("Parent after_value_set failed", exc)
             try:
                 name = getattr(parameter, "name", "") or ""
+                ui_only_widget_write = bool(getattr(self, "_hmb_ui_only_widget_write", False))
+                if (name == WIDGET_PARAMETER_NAME and not getattr(self, "_hmb_widget_write_in_progress", False)
+                        and getattr(self, "_hmb_last_accepted_widget_state", None)):
+                    ui_only_widget_write = _prompt_authoring_sync_fingerprint(self._hmb_last_accepted_widget_state) == _prompt_authoring_sync_fingerprint(value)
                 if (
                     name == WIDGET_PARAMETER_NAME
                     and not getattr(self, "_hmb_ui_syncing", False)
@@ -12049,7 +12777,7 @@ class HMBPromptLibrary(DataNode):
                     SHOT_PICKER_INPUT_PARAMETER_NAME,
                 } and not getattr(self, "_hmb_ui_syncing", False) and not getattr(
                     self, "_hmb_compact_route_syncing", False
-                ):
+                ) and not (name == WIDGET_PARAMETER_NAME and ui_only_widget_write):
                     self._schedule_prompt_sync(
                         source_burst=name in {
                             PICKER_INPUT_PARAMETER_NAME,
@@ -12072,6 +12800,7 @@ class HMBPromptLibrary(DataNode):
     ) -> Any:
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return None
+        pending_media_publication = False
         try:
             target_name = getattr(target_parameter, "name", "")
             if target_name in {
@@ -12105,9 +12834,24 @@ class HMBPromptLibrary(DataNode):
                             value = sentinel
                 if value is not sentinel:
                     _set_parameter_value(self, target_name, value)
+                pending_media_publication = bool(
+                    getattr(self, "_hmb_sync_publish_shot_media_pending", False)
+                )
                 self._sync_prompt_output_now()
         except Exception as exc:
-            _diagnostic_exception("Incoming source connection synchronization failed", exc)
+            if (isinstance(exc, ValueError) and (
+                getattr(exc, "hmb_image_asset_selection_preparing", False) is True
+                or getattr(exc, "hmb_picker_media_preparing", False) is True
+            )):
+                try:
+                    self._schedule_prompt_sync(
+                        source_burst=True,
+                        publish_shot_media=pending_media_publication,
+                    )
+                except Exception as retry_exc:
+                    _diagnostic_exception("Incoming source preparation retry scheduling failed", retry_exc)
+            else:
+                _diagnostic_exception("Incoming source connection synchronization failed", exc)
         try:
             return super().after_incoming_connection(source_node, source_parameter, target_parameter)
         except Exception as exc:
@@ -12130,6 +12874,12 @@ class HMBPromptLibrary(DataNode):
                 SHOT_ASSET_INPUT_PARAMETER_NAME,
                 SHOT_PICKER_INPUT_PARAMETER_NAME,
             }:
+                self._mark_deleted_document_source(source_node, target_name)
+                current_source = self._hmb_connected_source_nodes.get(target_name)
+                if current_source is not None and current_source is not source_node:
+                    # A delayed removal for the deleted owner cannot clear a
+                    # newer connection's input/cache on the same physical port.
+                    return None
                 if target_name == PICKER_INPUT_PARAMETER_NAME:
                     self._hmb_picker_connected = False
                 elif target_name in {
@@ -12160,6 +12910,9 @@ class HMBPromptLibrary(DataNode):
 
         def invalidate() -> None:
             self._hmb_node_deleted = True
+            self._hmb_initial_source_hydration_pending = False
+            self._hmb_compiled_prompt_pairs = {}
+            self._hmb_compile_cache_epoch = int(getattr(self, "_hmb_compile_cache_epoch", 0)) + 1
             self._hmb_sync_generation = (
                 int(getattr(self, "_hmb_sync_generation", 0) or 0) + 1
             )

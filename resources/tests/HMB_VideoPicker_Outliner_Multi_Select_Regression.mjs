@@ -89,6 +89,43 @@ assert.deepEqual(paths(otherScene), ["|Other"]);
 const many = { ...initial, outliner_nodes: Array.from({ length: 300 }, (_, index) => root(`N${index}`)) };
 const head = picker.hmbPickerSelectOutlinerPath(many, "|N2");
 assert.equal(paths(picker.hmbPickerSelectOutlinerPath(head, "|N250", { shiftKey: true })).length, 249);
+
+// The five Shot rows do not impose a five-target or five-color Mask limit.
+// Exercise manual per-object edits with every established palette entry, then
+// apply one repeated color to all targets through the real range selection.
+const palette = picker.hmbNormalizePickerMarkerCatalog(null);
+assert.equal(palette.options.length, 16);
+const manyTargets = { ...initial, runtime_instance_id: "many-target-runtime",
+  outliner_nodes: Array.from({ length: 128 }, (_, index) => root(`MaskTarget${index}`)),
+  slot_assignments: [{ video_slot: 1, bindings: [] }], marker_catalog: palette };
+const untouchedMany = structuredClone(manyTargets);
+let allPaletteAssignments = manyTargets;
+for (let index = 0; index < manyTargets.outliner_nodes.length; index += 1) {
+  allPaletteAssignments = picker.hmbPickerSelectOutlinerPath(allPaletteAssignments, `|MaskTarget${index}`);
+  allPaletteAssignments = picker.hmbPickerApplyColorToSelection(allPaletteAssignments, palette.options[index % palette.options.length]);
+}
+assert.equal(allPaletteAssignments.slot_assignments[0].bindings.length, 128);
+assert.deepEqual(new Set(allPaletteAssignments.slot_assignments[0].bindings.map(item => item.color)), new Set(palette.options));
+assert.deepEqual(manyTargets, untouchedMany, "Assigning many targets must not mutate the earlier authoring snapshot.");
+let allSelected = picker.hmbPickerSelectOutlinerPath(allPaletteAssignments, "|MaskTarget0");
+allSelected = picker.hmbPickerSelectOutlinerPath(allSelected, "|MaskTarget127", { shiftKey: true });
+assert.equal(paths(allSelected).length, 128);
+const sameColorMany = picker.hmbPickerApplyColorToSelection(allSelected, "Red");
+assert.equal(colorPaths(sameColorMany, "Red").length, 128, "Reusing a palette color never consumes or steals another target.");
+assert.deepEqual(sameColorMany.slot_assignments[0].bindings.map(item => item.picker_order), Array.from({ length: 128 }, (_, index) => index + 1));
+const clonedMany = picker.hmbEnsurePickerOutlinerSelection(JSON.parse(JSON.stringify(allPaletteAssignments)));
+assert.deepEqual(clonedMany.slot_assignments, allPaletteAssignments.slot_assignments);
+const manyDraftContainer = {};
+const manyOwner = { ...clonedMany, state_revision: 30, state_published_at_ms: 300 };
+picker.hmbRememberPickerOutlinerDraft(manyDraftContainer, manyOwner, true);
+picker.hmbStampPickerOutlinerDraft(manyDraftContainer, manyOwner);
+const staleMany = { ...manyOwner, state_revision: 29, state_published_at_ms: 290,
+  slot_assignments: [{ video_slot: 1, bindings: manyOwner.slot_assignments[0].bindings.slice(0, 5) }] };
+assert.deepEqual(picker.hmbProtectPickerOutlinerDraft(manyDraftContainer, staleMany).state.slot_assignments, manyOwner.slot_assignments);
+const manyAck = { ...manyOwner, state_writer: "python", frontend_seen_revision: 30 };
+assert.equal(picker.hmbProtectPickerOutlinerDraft(manyDraftContainer, manyAck).protected, false);
+assert.deepEqual(picker.hmbProtectPickerOutlinerDraft(manyDraftContainer, staleMany).state.slot_assignments, manyOwner.slot_assignments,
+  "A crossed stale echo after acknowledgement must retain all 128 assignments.");
 assert.match(source, /aria-multiselectable="true"/);
 assert.match(source, /selectOutlinerPath\(clean\(row\.getAttribute\?\.\("data-group-path"\)\), event\)/);
 
@@ -201,4 +238,11 @@ click({ preventDefault() {}, stopPropagation() {} });
 assert.equal(commands.length, 1, "A running capture must remain guarded.");
 assert.equal(pauses, 1);
 
-console.log("HMB VideoPicker multi-selection, repeat color, snapshot retry regression: PASS");
+liveState = { ...ready, ...clonedMany, selected_camera: "|latestCamera" };
+click({ preventDefault() {}, stopPropagation() {} });
+assert.equal(commands.length, 2);
+assert.equal(commands[1].action, "render_snapshot");
+assert.deepEqual(commands[1].payload.authoring_state.slot_assignments, allPaletteAssignments.slot_assignments,
+  "The actual Snapshot click transports all target/color assignments, including the tail after five.");
+
+console.log("HMB VideoPicker multi-selection, 128 targets/16 palette markers, repeated color, stale echo and snapshot retry regression: PASS");

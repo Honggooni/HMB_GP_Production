@@ -107,7 +107,8 @@ standard_module = inspect.getmodule(base_agent)
 assert standard_module is not None
 original_resolve_cloud_api_key = standard_module.resolve_cloud_api_key
 original_require_model_invocation_sync = standard_module.require_model_invocation_sync
-original_try_throw_error = standard_module.try_throw_error
+current_native = hasattr(standard_module, "AgentState")
+original_try_throw_error = getattr(standard_module, "try_throw_error", None)
 original_native_process_step = base_agent._process
 
 canonical_state = prompt_module._default_widget_state()
@@ -152,6 +153,8 @@ real_node._has_canonical_hmb_prompt_connection = types.MethodType(
     real_node,
 )
 real_node._model_access.raise_if_denied = lambda *args, **kwargs: None
+if current_native:
+    real_node._model_access.raise_if_selection_denied = lambda: None
 # Production Shot routing executes from the hidden, router-owned Prompt input.
 # Keep the private machine envelope out of the native public Prompt editor and
 # seed only that authoritative input so this fixture matches current topology.
@@ -195,7 +198,28 @@ real_node.set_parameter_value(
 captured = {}
 
 
-def non_billable_model_step(self, agent, prompt):
+def non_billable_model_step(self, agent, prompt, *native_args):
+    if current_native:
+        from pydantic_ai.models.test import TestModel
+        from griptape_nodes_library.llm.models import override_model
+        rulesets = list(agent.rulesets or [])
+        runtime_prompt = str(prompt)
+        captured["prompt_exact"] = runtime_prompt == (
+            self._hmb_runtime_prompt + "\nCALLER_CONTEXT_MUST_RUN\n\n" + module._AGENT_ENGLISH_OUTPUT_CONTRACT)
+        captured["paired_snapshot_exact"] = self._hmb_runtime_prompt == machine_prompt
+        captured["caller_context_present"] = "CALLER_CONTEXT_MUST_RUN" in runtime_prompt
+        captured["english_output_contract_count"] = runtime_prompt.count(module._AGENT_ENGLISH_OUTPUT_CONTRACT)
+        captured["rule_counts"] = [len(ruleset["rules"]) for ruleset in rulesets]
+        captured["ruleset_names"] = [ruleset["name"] for ruleset in rulesets]
+        captured["caller_rule_present_during_native_call"] = "CALLER_RULE_MUST_RUN" in rulesets[0]["rules"]
+        captured["tool_count"] = len(agent.tools)
+        captured["output_schema"] = native_args[0]
+        captured["memory_runs"] = len(agent.runs())
+        captured["sealed_rule"] = rulesets[-2]["rules"][0]
+        self.append_value_to_parameter("output", "PRIVATE_REAL_STREAM_FRAGMENT")
+        self.append_value_to_parameter("logs", captured["sealed_rule"])
+        with override_model(TestModel(custom_output_args={"answer": "FINAL_SAFE_OUTPUT"})):
+            return original_native_process_step(self, agent, prompt, *native_args)
     rulesets = list(agent.rulesets or [])
     task = agent.tasks[0]
     prompt_value = getattr(prompt, "value", prompt)
@@ -233,7 +257,8 @@ def non_billable_model_step(self, agent, prompt):
 try:
     standard_module.resolve_cloud_api_key = lambda: "non-billable-test-key"
     standard_module.require_model_invocation_sync = lambda *args, **kwargs: None
-    standard_module.try_throw_error = lambda *args, **kwargs: None
+    if original_try_throw_error is not None:
+        standard_module.try_throw_error = lambda *args, **kwargs: None
     # Patch only the Standard Agent's billable processor so the HMB override
     # still appends its private English-output contract before delegating the call.
     base_agent._process = non_billable_model_step
@@ -255,7 +280,8 @@ finally:
     standard_module.require_model_invocation_sync = (
         original_require_model_invocation_sync
     )
-    standard_module.try_throw_error = original_try_throw_error
+    if original_try_throw_error is not None:
+        standard_module.try_throw_error = original_try_throw_error
     base_agent._process = original_native_process_step
 
 assert captured["prompt_exact"] is True
@@ -274,7 +300,11 @@ assert all(
 assert captured["tool_count"] == 0
 assert captured["output_schema"] is not None
 assert captured["memory_runs"] == 1
-assert real_node.parameter_output_values["output"] == "FINAL_SAFE_OUTPUT"
+if current_native:
+    import json
+    assert json.loads(real_node.parameter_output_values["output"]) == {"answer": "FINAL_SAFE_OUTPUT"}
+else:
+    assert real_node.parameter_output_values["output"] == "FINAL_SAFE_OUTPUT"
 assert captured["sealed_rule"] not in str(real_node.parameter_output_values)
 # The caller rule reaches the native invocation above, but runtime rule state is
 # intentionally absent from the public Agent wrapper after final sanitization.

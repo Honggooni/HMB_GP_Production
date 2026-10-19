@@ -287,27 +287,46 @@ if module._BuiltinAgent is None:
 # Use the installed native model/schema/tools lifecycle; replace only the
 # billable processor. Model/credential access is mocked in this process only.
 native = inspect.getmodule(base)
+from griptape_nodes_library.llm import runner as native_runner
+from pydantic import TypeAdapter
+from pydantic_ai.models.test import TestModel
+
 live = module.HMBAgentLibrary(name="offline_web_native")
 live.parameter_values["additional_context"] = {"SIGN": "NO SUBSTITUTION"}
-live._model_access.raise_if_denied = lambda *args, **kwargs: None
-prior = copy.deepcopy((live.parameter_values, dict(live.parameter_output_values)))
+live._model_access.raise_if_selection_denied = lambda *args, **kwargs: None
+live._hmb_shot_catalog_snapshot = {"channel_uuid": "offline-native-channel", "shots": [
+    {"shot_uuid": "offline-native-shot", "number": 1, "name": "Native web revision", "revision": 0}]}
+generator._hmb_shot_channel_subscription = lambda: {
+    "channel_uuid": "offline-native-channel", "shot_uuid": "offline-native-shot",
+    "shot_number": 1, "shot_name": "Native web revision"}
+live._hmb_shot_slots["offline-native-channel\x1foffline-native-shot"] = live._hmb_native_slot_snapshot()
+prior = copy.deepcopy((dict(live.parameter_values), dict(live.parameter_output_values)))
 observed = []
+original_native_process = base._process
 
 
-def native_model(self, agent, prompt):
-    literal = agent.tasks[0]._process_task_input(prompt)
-    value = str(getattr(literal, "value", literal))
+def native_model(self, state, prompt, output_type):
+    assert isinstance(state, native.AgentState)
+    value = str(getattr(prompt, "value", prompt))
     assert value.startswith(web_prompt) and "{{SIGN}}" in value and "{% include" in value
-    assert [rule.name for rule in agent.rulesets] == [module._WEB_RERENDER_OUTPUT_RULESET] and not self._hmb_rules_active
-    schema = agent.tasks[0].output_schema.model_json_schema()
+    assert [rule["name"] for rule in state.rulesets] == [module._WEB_RERENDER_OUTPUT_RULESET] and not self._hmb_rules_active
+    schema = TypeAdapter(output_type).json_schema()
     assert set(schema["properties"]) == {"contract", "source_sha256", "instruction"}
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["source_sha256"]["enum"] == [hashlib.sha256(web_prompt.encode()).hexdigest()]
+    assert '"seed":0' in value and '"generate_audio":false' in value and "NEVER_MODEL_CONTEXT" not in value
     observed.append((self, value))
-    agent.tasks[0].output = native.TextArtifact(value=reply("Native web instruction."))
-    self._last_raw_output = reply("Native web instruction.")
-    return agent
+    # Exercise the real installed Standard build/run/output handling; replace
+    # only provider inference with PydanticAI's in-memory structured TestModel.
+    result = original_native_process(self, state, prompt, output_type)
+    assert isinstance(result, native.AgentRunResult)
+    assert result.output == json.loads(reply("Native web instruction."))
+    assert result.new_messages()
+    return result
 
 
-with patch.object(base, "_process", native_model), patch.object(native, "resolve_cloud_api_key", lambda: "offline-non-billable"), patch.object(native, "require_model_invocation_sync", lambda *args, **kwargs: None), patch.object(native, "try_throw_error", lambda *args, **kwargs: None):
+with patch.object(base, "_process", native_model), patch.object(native, "resolve_cloud_api_key", lambda: "offline-non-billable"), patch.object(native, "require_model_invocation_sync", lambda *args, **kwargs: None), \
+        patch.object(native_runner, "build_model", lambda _config: TestModel(custom_output_args=json.loads(reply("Native web instruction.")))):
     import _hmb_agent_media
     with patch.object(_hmb_agent_media, "augment_prompt", fake_augment), \
             patch.object(module._hmb, "_bootstrap_agent_policy_session", side_effect=AssertionError("native web bootstrapped policy")), \

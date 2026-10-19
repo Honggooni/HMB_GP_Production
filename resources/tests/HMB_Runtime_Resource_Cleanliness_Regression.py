@@ -49,13 +49,13 @@ diagnostics = importlib.util.module_from_spec(diagnostics_spec)
 diagnostics_spec.loader.exec_module(diagnostics)
 # The diagnostic receipt reader must recognize the same independently packaged
 # members. A valid installer receipt must not be rejected as an extra-file list.
-assert len(diagnostics.RUNTIME_FILE_PATHS) == len(set(diagnostics.RUNTIME_FILE_PATHS)) == 39
+assert len(diagnostics.RUNTIME_FILE_PATHS) == len(set(diagnostics.RUNTIME_FILE_PATHS)) == 40
 assert set(diagnostics.RUNTIME_FILE_PATHS) == set(runtime_install_files)
 distribution_only_files = tuple(packager.DISTRIBUTION_ONLY_FILES)
-assert len(runtime_install_files) == 39
+assert len(runtime_install_files) == 40
 assert distribution_only_files == DISTRIBUTION_ONLY_FILES
 assert source_files == (*runtime_install_files, *distribution_only_files)
-assert len(source_files) == 43
+assert len(source_files) == 44
 assert not EXCLUDED_PACKAGE_FILES.intersection(source_files)
 assert not set(runtime_install_files).intersection(distribution_only_files)
 assert {
@@ -93,11 +93,12 @@ assert "LocalApplicationData" in installer
 assert "Rollback data must be stored outside the Griptape libraries folder" in installer
 assert "MyInvocation.MyCommand.Path" in installer
 assert "Could not resolve the extracted HMB package directory" in installer
-assert "[int]$manifest.install_file_count -ne 39" in installer
-assert "$records.Count -ne 43" in installer
+assert "[int]$manifest.install_file_count -ne 40" in installer
+assert "$records.Count -ne 44" in installer
 assert "_hmb_agent_media.py" in runtime_install_files
 assert "_hmb_build_diagnostics.py" in runtime_install_files
 assert "_hmb_library_bootstrap.py" in runtime_install_files
+assert "_hmb_workflow_migration.py" in runtime_install_files
 assert "_hmb_image_limits.py" in runtime_install_files
 assert "_hmb_review.py" in runtime_install_files
 assert "_hmb_web_rerender.py" in runtime_install_files

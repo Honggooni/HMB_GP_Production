@@ -39,6 +39,7 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "_hmb_agent_session.py",
     "_hmb_build_diagnostics.py",
     "_hmb_library_bootstrap.py",
+    "_hmb_workflow_migration.py",
     "_hmb_image_limits.py",
     "_hmb_project.py",
     "_hmb_review.py",

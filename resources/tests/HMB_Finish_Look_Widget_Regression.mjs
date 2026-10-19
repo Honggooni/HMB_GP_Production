@@ -20,6 +20,9 @@ assert.deepEqual(Object.keys(defaultState), [
   "shot_catalog",
   "shot",
   "finish_look",
+  "shot_manager",
+  "shot_editor_expanded",
+  "shot_documents",
 ]);
 assert.equal(defaultState.schema_version, 1);
 assert.equal(defaultState.language, "ko");
@@ -85,6 +88,9 @@ const catalogState = widget.hmbNormalizeFinishLookWidgetValue({
   catalog: backendCatalog,
   shot_catalog: sparseShotCatalog,
   value: {
+    // Retained single-Shot compatibility surface. Consolidated named tabs are
+    // exercised by HMB_Finish_Look_Multishot_Widget_Regression in real Chromium.
+    shot_manager: false,
     language: "en",
     shot: {
       channel_uuid: "shared-shot-channel",

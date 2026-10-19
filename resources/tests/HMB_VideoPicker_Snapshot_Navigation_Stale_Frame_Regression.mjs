@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
+import { randomInt } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
@@ -101,8 +102,31 @@ const server = http.createServer(async (req, res) => {
   }
   res.setHeader("Content-Type", "text/html; charset=utf-8"); res.end(html);
 });
-await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
-const origin = `http://127.0.0.1:${server.address().port}`;
+// OS-assigned ports can land on Chromium's blocked low-port list (e.g. 3659).
+// Keep the browser security defaults and retry only recoverable bind failures.
+async function listenBrowserSafeLoopback(server, maxAttempts = 16) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const port = randomInt(20001, 60000);
+    try {
+      await new Promise((resolve, reject) => {
+        const cleanup = () => { server.off("error", onError); server.off("listening", onListening); };
+        const onError = error => { cleanup(); reject(error); };
+        const onListening = () => { cleanup(); resolve(); };
+        server.once("error", onError);
+        server.once("listening", onListening);
+        try { server.listen(port, "127.0.0.1"); }
+        catch (error) { cleanup(); reject(error); }
+      });
+      return { port: server.address().port, attempts: attempt };
+    } catch (error) {
+      if (!["EADDRINUSE", "EACCES", "EPERM"].includes(error.code) || attempt === maxAttempts) throw error;
+    }
+  }
+  throw new Error("No safe loopback port available for Snapshot navigation verification.");
+}
+const loopback = await listenBrowserSafeLoopback(server);
+assert.ok(loopback.port > 20000 && loopback.port < 60000);
+const origin = `http://127.0.0.1:${loopback.port}`;
 function state(active, revision = 1, aliases = active) {
   const snapshots = ["original", "mask", "depth", "slow", "fast"].map((name, i) => ({
     snapshot_uid: name, artifact_type: i === 0 ? "original" : i === 1 ? "mask" : i === 2 ? "depth" : "original",
@@ -189,7 +213,7 @@ try {
 } finally {
   if (evidence && page) await page.screenshot({ path: path.join(evidence, "navigation-last-presented.png") }).catch(()=>{});
   const trace = page ? await page.evaluate(()=>window.trace).catch(()=>[]) : [];
-  if (evidence) fs.writeFileSync(path.join(evidence, "report.json"), JSON.stringify({ widgetPath, checks, failures, errors, trace }, null, 2));
+  if (evidence) fs.writeFileSync(path.join(evidence, "report.json"), JSON.stringify({ widgetPath, loopback, checks, failures, errors, trace }, null, 2));
   for (const release of releases) release();
   await browser?.close();
   await new Promise(resolve=>server.close(resolve));

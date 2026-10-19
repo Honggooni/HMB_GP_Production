@@ -83,6 +83,9 @@ except Exception:
 MAYA_RUNNER = _THIS_DIR / "resources" / "maya" / "HMB_Maya_Background_Preview.py"
 BLENDER_RUNNER = _THIS_DIR / "resources" / "blender" / "HMB_Blender_Background_Preview.py"
 MARKER_CATALOG_PATH = _THIS_DIR / "resources" / "picker" / "HMB_Marker_Catalog.json"
+ORIGINAL_MATERIAL_PASS_SOURCES = ("AIPicker_SET", "AIPickerM_SET")
+MASK_MATERIAL_PASS_SOURCES = ("AIPickerM_SET",)
+MASK_MATERIAL_PASS_PROFILE = "mask_authored_set_material_pass_v1"
 WIDGET_NAME = "HMBVideoPickerLibraryWidget"
 WIDGET_LIBRARY_NAME = "HMB_GP_Production"
 
@@ -12978,7 +12981,8 @@ def _original_preview_cache_fields(scene_path: Path, state: Dict[str, Any]) -> D
         "encoding_profile": PROXY_ENCODING_PROFILE,
         "viewport_quality_profile": ORIGINAL_VIEWPORT_QUALITY_PROFILE,
         "original_material_override_profile": ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
-        "original_material_pass_source": "AIPicker_SET",
+        "original_material_pass_source": "|".join(ORIGINAL_MATERIAL_PASS_SOURCES),
+        "original_material_pass_sources": list(ORIGINAL_MATERIAL_PASS_SOURCES),
         "mouth_card_inner_patch_policy": MOUTH_CARD_INNER_PATCH_POLICY,
         "dependency_manifest_version": ORIGINAL_DEPENDENCY_MANIFEST_VERSION,
         "scene_dependency_complete": bool(dependency_summary["complete"]),
@@ -13099,15 +13103,37 @@ def _original_eye_fallback_report_is_valid(
     )
 
 
-def _original_material_report_is_valid(report: Any) -> bool:
-    """Accept a restored neutral body pass with usable AIPicker_SET materials.
+def _material_pass_report_sources_are_valid(
+    source: Dict[str, Any], expected: tuple[str, ...], *, allow_legacy_original: bool = False,
+) -> bool:
+    declared = source.get("material_pass_source")
+    sources = source.get("material_pass_sources")
+    if allow_legacy_original and expected == ORIGINAL_MATERIAL_PASS_SOURCES and declared == "AIPicker_SET":
+        return sources is None or sources == ["AIPicker_SET"]
+    return declared == "|".join(expected) and type(sources) is list and sources == list(expected)
+
+
+def _material_pass_report_is_valid(
+    report: Any, *, expected_sources: tuple[str, ...], expected_profile: str,
+    allow_legacy_original: bool = False,
+) -> bool:
+    """Accept a fully restored authored-material pass for exact set names.
 
     The versioned profile invalidates gray-eye and pre-fallback caches. Authored
     eyes remain intact when usable; unavailable plug-ins need a verified native
     eye fallback, followed by exact original connection and assignment restore.
     """
     source = report if isinstance(report, dict) else {}
-    if _clean(source.get("material_pass_source")) != "AIPicker_SET":
+    if not _material_pass_report_sources_are_valid(
+        source, expected_sources, allow_legacy_original=allow_legacy_original,
+    ):
+        return False
+    for key in ("material_pass_shape_count", "material_pass_scoped_shape_count"):
+        if key in source and (type(source[key]) is not int or source[key] < 0):
+            return False
+    if "material_pass_shape_count" in source and source["material_pass_shape_count"] != source.get("preserved_eye_shape_count"):
+        return False
+    if "material_pass_scoped_shape_count" in source and source["material_pass_scoped_shape_count"] > source.get("material_pass_shape_count", -1):
         return False
     count_keys = (
         "inspected_shading_engine_count",
@@ -13144,55 +13170,65 @@ def _original_material_report_is_valid(report: Any) -> bool:
         }
     except (TypeError, ValueError):
         return False
-    base_color = source.get("base_color")
-    fill_color = source.get("fill_color")
-    diffuse = source.get("diffuse")
-    if not isinstance(base_color, (list, tuple)) or len(base_color) != 3:
-        return False
-    if any(
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or abs(float(value) - 0.5) > 1e-6
-        for value in base_color
-    ):
-        return False
-    if not isinstance(fill_color, (list, tuple)) or len(fill_color) != 3:
-        return False
-    if any(
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or abs(float(value) - 0.22) > 1e-6
-        for value in fill_color
-    ):
-        return False
-    if (
-        isinstance(diffuse, bool)
-        or not isinstance(diffuse, (int, float))
-        or not math.isfinite(diffuse)
-        or abs(float(diffuse) - 0.45) > 1e-6
-    ):
-        return False
+    is_mask = expected_profile == MASK_MATERIAL_PASS_PROFILE
+    if is_mask:
+        if any(key in source for key in ("base_color", "fill_color", "diffuse")):
+            return False
+        if (type(source.get("marker_assignment_eligible_shape_count")) is not int
+                or source["marker_assignment_eligible_shape_count"] < 0
+                or "material_pass_shape_count" not in source
+                or "material_pass_scoped_shape_count" not in source):
+            return False
+    else:
+        base_color = source.get("base_color")
+        fill_color = source.get("fill_color")
+        diffuse = source.get("diffuse")
+        if not isinstance(base_color, (list, tuple)) or len(base_color) != 3:
+            return False
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or abs(float(value) - 0.5) > 1e-6
+            for value in base_color
+        ):
+            return False
+        if not isinstance(fill_color, (list, tuple)) or len(fill_color) != 3:
+            return False
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or abs(float(value) - 0.22) > 1e-6
+            for value in fill_color
+        ):
+            return False
+        if (
+            isinstance(diffuse, bool)
+            or not isinstance(diffuse, (int, float))
+            or not math.isfinite(diffuse)
+            or abs(float(diffuse) - 0.45) > 1e-6
+        ):
+            return False
     return bool(
         _clean(source.get("profile"))
-        == ORIGINAL_MATERIAL_OVERRIDE_PROFILE
+        == expected_profile
         and source.get("requested") is True
         and _clean(source.get("status")) == "restored"
         and source.get("restore_ok") is True
         and source.get("shading_group_membership_preserved") is True
         and source.get("default_lighting_verified") is True
-        and source.get("solid_render_mode_verified") is (counts["preserved_eye_shading_engine_count"] == 0)
-        and source.get("textured_render_mode_verified") is (counts["preserved_eye_shading_engine_count"] > 0)
+        and source.get("solid_render_mode_verified") is (False if is_mask else counts["preserved_eye_shading_engine_count"] == 0)
+        and source.get("textured_render_mode_verified") is (True if is_mask else counts["preserved_eye_shading_engine_count"] > 0)
         and source.get("eye_textures_enabled") is (counts["preserved_eye_shading_engine_count"] > 0)
         and source.get("eye_materials_preserved") is True
         and source.get("eye_assignments_preserved") is True
         and source.get("eye_dependency_preflight_passed") is True
-        and source.get("soft_shading_verified") is True
-        and source.get("authored_materials_ignored") is True
-        and source.get("textures_ignored") is True
-        and source.get("authored_material_ignore_scope") == "non_eye_surfaces"
-        and source.get("opaque_surface_verified") is True
+        and source.get("soft_shading_verified") is (not is_mask)
+        and source.get("authored_materials_ignored") is (not is_mask)
+        and source.get("textures_ignored") is (not is_mask)
+        and source.get("authored_material_ignore_scope") == ("none" if is_mask else "non_eye_surfaces")
+        and source.get("opaque_surface_verified") is (not is_mask)
         and not bool(
             source.get("temporary_nodes_retained_on_restore_failure")
         )
@@ -13210,12 +13246,49 @@ def _original_material_report_is_valid(report: Any) -> bool:
         and counts["eye_missing_texture_dependency_count"] == 0
         and _original_eye_fallback_report_is_valid(source, counts)
         and counts["temporary_lambert_count"]
-        == int(counts["swapped_shading_engine_count"] + counts["split_shading_engine_count"] > 0)
+        == (0 if is_mask else int(counts["swapped_shading_engine_count"] + counts["split_shading_engine_count"] > 0))
+        and (not is_mask or (counts["swapped_shading_engine_count"] == 0
+                            and counts["split_shading_engine_count"] <= counts["eye_fallback_shading_engine_count"]))
         and counts["texture_connection_count"] == 0
         and counts["transparency_transfer_count"] == 0
         and counts["emission_transfer_count"] == 0
         and counts["normal_transfer_count"] == 0
     )
+
+
+def _original_material_report_is_valid(report: Any, *, allow_legacy: bool = True) -> bool:
+    return _material_pass_report_is_valid(
+        report, expected_sources=ORIGINAL_MATERIAL_PASS_SOURCES,
+        expected_profile=ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
+        allow_legacy_original=allow_legacy,
+    )
+
+
+
+def _mask_material_report_is_valid(report: Any) -> bool:
+    return _material_pass_report_is_valid(
+        report, expected_sources=MASK_MATERIAL_PASS_SOURCES,
+        expected_profile=MASK_MATERIAL_PASS_PROFILE,
+    )
+
+
+def _mask_material_pass_job_fields() -> Dict[str, Any]:
+    # Fixed rules are capture/cache inputs, never caller-supplied shape authority.
+    return {
+        "mask_material_pass_profile": MASK_MATERIAL_PASS_PROFILE,
+        "mask_material_pass_source": "|".join(MASK_MATERIAL_PASS_SOURCES),
+        "mask_material_pass_sources": list(MASK_MATERIAL_PASS_SOURCES),
+    }
+
+
+def _validate_mask_material_pass_confirmation(result: Any, sidecar: Any) -> Dict[str, Any]:
+    result = result if isinstance(result, dict) else {}
+    sidecar = sidecar if isinstance(sidecar, dict) else {}
+    report = result.get("mask_material_pass_report")
+    if (not _mask_material_report_is_valid(report)
+            or sidecar.get("mask_material_pass_report") != report):
+        raise RuntimeError("Mask did not verify exact AIPickerM_SET authored materials and shader restoration.")
+    return copy.deepcopy(report)
 
 
 def _original_preview_cache_is_valid(
@@ -13254,7 +13327,8 @@ def _original_preview_cache_is_valid(
             != expected["original_material_override_profile"]
         ):
             return False
-        if _clean(metadata.get("original_material_pass_source")) != expected["original_material_pass_source"]:
+        if (_clean(metadata.get("original_material_pass_source")) != expected["original_material_pass_source"]
+                or metadata.get("original_material_pass_sources") != expected["original_material_pass_sources"]):
             return False
         if (
             _clean(metadata.get("assignment_mode"))
@@ -13266,7 +13340,7 @@ def _original_preview_cache_is_valid(
             if isinstance(metadata.get("original_material_override_report"), dict)
             else {}
         )
-        if not _original_material_report_is_valid(material_report):
+        if not _original_material_report_is_valid(material_report, allow_legacy=False):
             return False
         if (
             _clean(metadata.get("mouth_card_inner_patch_policy"))
@@ -13339,6 +13413,7 @@ def _original_view_metadata(metadata: Any) -> Dict[str, Any]:
             source.get("original_material_override_profile")
         ),
         "original_material_pass_source": _clean(source.get("original_material_pass_source")),
+        "original_material_pass_sources": copy.deepcopy(source.get("original_material_pass_sources", [])),
         "original_material_override_report": (
             dict(source.get("original_material_override_report"))
             if isinstance(source.get("original_material_override_report"), dict)
@@ -13408,6 +13483,8 @@ def _operation_input_digest(kind: str, scene_text: Any, state: Dict[str, Any], s
                 "original_material_override_profile": original_fields[
                     "original_material_override_profile"
                 ],
+                "original_material_pass_source": original_fields["original_material_pass_source"],
+                "original_material_pass_sources": original_fields["original_material_pass_sources"],
                 "mouth_card_inner_patch_policy": original_fields[
                     "mouth_card_inner_patch_policy"
                 ],
@@ -13528,6 +13605,11 @@ def _operation_input_digest(kind: str, scene_text: Any, state: Dict[str, Any], s
             payload["snapshot_frame"] = float(
                 requested_frame if requested_frame is not None else normalized.get("snapshot_frame") or 0.0
             )
+    if kind_text in {"run_video", "render_snapshot"} and _picker_scene_engine(scene_text) == "maya":
+        if normalized.get("original_enabled"):
+            payload["original_material_pass_sources"] = list(ORIGINAL_MATERIAL_PASS_SOURCES)
+        if normalized.get("mask_enabled"):
+            payload.update(_mask_material_pass_job_fields())
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -16135,7 +16217,10 @@ class HMBVideoPickerLibrary(DataNode):
                         # a concurrent UI worker may replace state after this.
                         state_snapshot = state
                     else:
-                        self._schedule_video_removal_output_sync()
+                        # Retained snapshot polling is a read. Reuse the
+                        # worker's current preparation instead of invalidating
+                        # its publication token on every pending read.
+                        self._ensure_video_output_preparation()
                         raise _HMBPickerMediaPreparing("VideoPicker media is still preparing; keep the current Shot selection.")
                 else:
                     probe_cache = {}
@@ -19038,6 +19123,16 @@ class HMBVideoPickerLibrary(DataNode):
             self._write_state(state)
         return state
 
+    def _ensure_video_output_preparation(self) -> None:
+        """Start missing readiness work without superseding an active worker."""
+        lock = getattr(self, "_hmb_command_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._hmb_command_lock = lock
+        with lock:
+            if not getattr(self, "_hmb_video_removal_sync_running", False):
+                self._schedule_video_removal_output_sync()
+
     def _schedule_video_removal_output_sync(self) -> None:
         """Coalesce deletes; media probes run outside the UI/catalog state lock."""
         loop = _picker_running_loop()
@@ -21338,7 +21433,7 @@ class HMBVideoPickerLibrary(DataNode):
             "scene_stage": "OUTLINER_READY",
             "message": (
                 f"Maya Outliner loaded with {len(outliner_nodes)} selectable asset roots. "
-                "Enable Original Playblast for a neutral midgray body with AIPicker_SET materials, using Maya defaults when their renderer is unavailable."
+                "Enable Original Playblast for a neutral midgray body with AIPicker_SET and AIPickerM_SET materials, using Maya defaults when their renderer is unavailable."
             ),
             "scene_path": str(scene_path).replace("\\", "/"),
             "scene_draft_path": str(scene_path).replace("\\", "/"),
@@ -21731,6 +21826,7 @@ class HMBVideoPickerLibrary(DataNode):
             "fps": source_fps,
             "apply_marker_shaders": False,
             "apply_original_lambert_override": True,
+            "original_material_pass_sources": list(ORIGINAL_MATERIAL_PASS_SOURCES),
             "original_material_override_profile": (
                 ORIGINAL_MATERIAL_OVERRIDE_PROFILE
             ),
@@ -21755,7 +21851,7 @@ class HMBVideoPickerLibrary(DataNode):
         state.update({
             "status": "GENERATING_ORIGINAL",
             "scene_stage": "GENERATING_ORIGINAL",
-            "message": f"Maya {maya_version} is rendering the midgray Original body and AIPicker_SET materials with Maya fallback for unavailable renderers.",
+            "message": f"Maya {maya_version} is rendering the midgray Original body and AIPicker_SET and AIPickerM_SET materials with Maya fallback for unavailable renderers.",
             "original_preview_enabled": False,
             "maya_executable": str(mayabatch).replace("\\", "/"),
             "maya_version": maya_version,
@@ -21775,7 +21871,7 @@ class HMBVideoPickerLibrary(DataNode):
                 f"Original preview Maya render started with camera {camera}, frames "
                 f"{start_frame:g}-{end_frame:g}, {source_fps:g} FPS, and forced "
                 f"full-detail viewport profile {ORIGINAL_VIEWPORT_QUALITY_PROFILE} "
-                "with a neutral Maya Lambert body and AIPicker_SET materials or verified Maya fallback for unavailable renderers."
+                "with a neutral Maya Lambert body and AIPicker_SET and AIPickerM_SET materials or verified Maya fallback for unavailable renderers."
             ),
         )
         self._write_state(state)
@@ -21886,7 +21982,7 @@ class HMBVideoPickerLibrary(DataNode):
             )
             else {}
         )
-        if not _original_material_report_is_valid(runner_material_report):
+        if not _original_material_report_is_valid(runner_material_report, allow_legacy=False):
             validation_errors.append("Original body/eye restoration report")
         if list(runner_sidecar.get("markers") or []):
             validation_errors.append("marker isolation")
@@ -22574,8 +22670,10 @@ class HMBVideoPickerLibrary(DataNode):
         }
         if role == "original":
             job.update(apply_original_lambert_override=True,
-                       original_material_override_profile=ORIGINAL_MATERIAL_OVERRIDE_PROFILE)
+                       original_material_override_profile=ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
+                       original_material_pass_sources=list(ORIGINAL_MATERIAL_PASS_SOURCES))
         elif role == "mask":
+            job.update(_mask_material_pass_job_fields())
             job["capture_pass"] = "color"
         elif role == "depth":
             job.update(capture_pass="depth", generate_depth_playblast=True,
@@ -22644,11 +22742,12 @@ class HMBVideoPickerLibrary(DataNode):
             raise RuntimeError("Maya Snapshot PNG dimensions do not match the requested output.")
         if role == "mask":
             _validate_world_pattern_runner_confirmation(result, sidecar)
+            _validate_mask_material_pass_confirmation(result, sidecar)
             if len(sidecar.get("markers") or []) != len(bindings):
                 raise RuntimeError("Mask Snapshot did not retain the requested Color Assignment.")
         elif role == "original":
-            if _clean(sidecar.get("original_material_override_profile")) != ORIGINAL_MATERIAL_OVERRIDE_PROFILE or not _original_material_report_is_valid(sidecar.get("original_material_override_report")):
-                raise RuntimeError("Original Snapshot did not verify neutral body, usable AIPicker_SET materials, and original shader restoration.")
+            if _clean(sidecar.get("original_material_override_profile")) != ORIGINAL_MATERIAL_OVERRIDE_PROFILE or not _original_material_report_is_valid(sidecar.get("original_material_override_report"), allow_legacy=False):
+                raise RuntimeError("Original Snapshot did not verify neutral body, usable AIPicker_SET and AIPickerM_SET materials, and original shader restoration.")
             if sidecar.get("markers"):
                 raise RuntimeError("Original Snapshot inherited Color Assignment markers.")
         else:
@@ -23054,6 +23153,7 @@ class HMBVideoPickerLibrary(DataNode):
         _validate_full_smooth_confirmation(result, sidecar, label=f"{label} Playblast")
         if role == "mask":
             _validate_world_pattern_runner_confirmation(result, sidecar)
+            _validate_mask_material_pass_confirmation(result, sidecar)
             Image, _chops, _draw, image_error, _version = _screen_space._require_pillow()
             for index, path in enumerate(paths):
                 if not path.is_file() or not path.stat().st_size:
@@ -23327,6 +23427,7 @@ class HMBVideoPickerLibrary(DataNode):
 
         _write_json(job_path, {
             "operation": "render",
+            **_mask_material_pass_job_fields(),
             "scene_path": str(scene_path),
             "output_folder": str(output_folder),
             "output_name": output_name,
@@ -23644,6 +23745,7 @@ class HMBVideoPickerLibrary(DataNode):
             result,
             runner_sidecar,
         )
+        _validate_mask_material_pass_confirmation(result, runner_sidecar)
         depth_runner_sidecar: Dict[str, Any] = {}
         depth_range_report: Dict[str, Any] = {}
         depth_validation_report: Dict[str, Any] = {}

@@ -18,6 +18,10 @@ CATALOG_PATH = ROOT / "resources" / "picker" / "HMB_Marker_Catalog.json"
 
 maya_package = types.ModuleType("maya")
 maya_cmds_module = types.ModuleType("maya.cmds")
+def _empty_object_sets(*args, **kwargs):
+    assert not args and kwargs == {"type": "objectSet", "long": True}
+    return []  # This marker-performance fixture contains no authored object sets.
+maya_cmds_module.ls = _empty_object_sets
 maya_package.cmds = maya_cmds_module
 sys.modules.setdefault("maya", maya_package)
 sys.modules.setdefault("maya.cmds", maya_cmds_module)

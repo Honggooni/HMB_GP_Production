@@ -50,6 +50,9 @@ ORIGINAL_MATERIAL_OVERRIDE_PROFILE = (
 ORIGINAL_LAMBERT_ASSIGNMENT_MODE = (
     "original_midgray_body_authored_eyes"
 )
+ORIGINAL_MATERIAL_PASS_SETS = ("AIPicker_SET", "AIPickerM_SET")
+MASK_MATERIAL_PASS_SETS = ("AIPickerM_SET",)
+MASK_MATERIAL_PASS_PROFILE = "mask_authored_set_material_pass_v1"
 SCREEN_SPACE_PATTERN_PROFILE = "hmb_screen_space_pattern_post_v2"
 SCREEN_SPACE_PATTERN_LINEAR_SCALE_DIVISOR = 3
 SCREEN_SPACE_PATTERN_BASE_CELL_DIVISOR = 8
@@ -4559,10 +4562,12 @@ def _original_wire_record(
     return "texture"
 
 
-def _original_pass_set_shapes():
-    """Resolve authored AIPicker_SET membership to exact final surface paths."""
+def _material_pass_set_shapes(set_names, pass_name):
+    """Resolve exact set leaves, including namespaces, to final surface paths."""
     shapes = set()
     visited_sets = set()
+    set_names = tuple(set_names)
+    set_label = "|".join(set_names)
 
     def add_surface(path):
         if cmds.nodeType(path) in ("mesh", "nurbsSurface") and not _is_intermediate_shape(path):
@@ -4575,7 +4580,7 @@ def _original_pass_set_shapes():
         try:
             members = cmds.sets(set_name, query=True) or []
         except Exception as exc:
-            raise RuntimeError("Original could not read AIPicker_SET membership: {0} ({1})".format(set_name, exc))
+            raise RuntimeError("{0} could not read {1} membership: {2} ({3})".format(pass_name, set_label, set_name, exc))
         for member in members:
             owner = _clean(member).split(".", 1)[0]
             if not owner:
@@ -4584,7 +4589,7 @@ def _original_pass_set_shapes():
             if owner.startswith("|"):
                 paths = [path for path in paths if path == owner]
             if len(paths) != 1:
-                raise RuntimeError("AIPicker_SET member must identify one exact object path: " + _clean(member))
+                raise RuntimeError(set_label + " member must identify one exact object path: " + _clean(member))
             path = paths[0]
             kind = cmds.nodeType(path)
             if kind == "objectSet":
@@ -4600,10 +4605,18 @@ def _original_pass_set_shapes():
                         add_surface(descendant)
 
     for set_name in cmds.ls(type="objectSet", long=True) or []:
-        if (_clean(set_name).rsplit(":", 1)[-1] == "AIPicker_SET"
+        if (_clean(set_name).rsplit(":", 1)[-1] in set_names
                 and cmds.nodeType(set_name) == "objectSet"):
             visit_set(set_name)
     return shapes
+
+
+def _original_pass_set_shapes():
+    return _material_pass_set_shapes(ORIGINAL_MATERIAL_PASS_SETS, "Original")
+
+
+def _mask_pass_set_shapes():
+    return _material_pass_set_shapes(MASK_MATERIAL_PASS_SETS, "Mask")
 
 
 def _original_eye_shape(shape, preserved_shapes=None):
@@ -4664,9 +4677,10 @@ class _OriginalLambertOverrideController(object):
     exact body memberships, then restored before publication. No scene is saved.
     """
 
-    def __init__(self, job):
+    def __init__(self, job, material_pass_only=False):
         self.job = job if isinstance(job, dict) else {}
-        if _clean(self.job.get("original_material_override_profile")) != ORIGINAL_MATERIAL_OVERRIDE_PROFILE:
+        self.material_pass_only = bool(material_pass_only)
+        if not self.material_pass_only and _clean(self.job.get("original_material_override_profile")) != ORIGINAL_MATERIAL_OVERRIDE_PROFILE:
             raise RuntimeError("Unsupported Original solid material override profile.")
         self.connections = []
         self.created_nodes = []
@@ -4708,8 +4722,10 @@ class _OriginalLambertOverrideController(object):
             "preserved_eye_shape_count": 0,
             "preserved_eye_component_count": 0,
             "preserved_eye_shading_engine_count": 0,
-            "material_pass_source": "AIPicker_SET",
+            "material_pass_source": "|".join(ORIGINAL_MATERIAL_PASS_SETS),
+            "material_pass_sources": list(ORIGINAL_MATERIAL_PASS_SETS),
             "material_pass_shape_count": 0,
+            "material_pass_scoped_shape_count": 0,
             "split_shading_engine_count": 0,
             "split_body_member_count": 0,
             "eye_materials_preserved": True,
@@ -4738,6 +4754,18 @@ class _OriginalLambertOverrideController(object):
             "textured_render_mode_verified": False,
             "warnings": [],
         }
+        if self.material_pass_only:
+            for original_only_field in ("base_color", "diffuse", "fill_color"):
+                self.report.pop(original_only_field, None)
+            self.report.update({
+                "profile": MASK_MATERIAL_PASS_PROFILE,
+                "material_pass_source": "|".join(MASK_MATERIAL_PASS_SETS),
+                "material_pass_sources": list(MASK_MATERIAL_PASS_SETS),
+                "authored_materials_ignored": False,
+                "textures_ignored": False,
+                "authored_material_ignore_scope": "none",
+                "marker_assignment_eligible_shape_count": int(self.job.get("_mask_marker_assignment_eligible_shape_count") or 0),
+            })
 
     @staticmethod
     def _group_members(group):
@@ -4748,6 +4776,9 @@ class _OriginalLambertOverrideController(object):
 
     def _scoped_shading_groups(self):
         shapes = _authored_cutout_scope_shapes(self.job)
+        if self.material_pass_only:
+            selected = set(self.job.get("_mask_material_pass_shapes") or [])
+            shapes = [shape for shape in shapes if shape in selected]
         self.scope_shapes = list(shapes)
         self.report["scoped_shape_path_count"] = len(shapes)
         groups = set()
@@ -4798,9 +4829,13 @@ class _OriginalLambertOverrideController(object):
         return last - first + 1
 
     def _eye_group_plan(self, active_groups):
-        preserved_shapes = _original_pass_set_shapes()
+        preserved_shapes = (
+            set(self.job.get("_mask_material_pass_shapes") or [])
+            if self.material_pass_only else _original_pass_set_shapes()
+        )
         named_eye_shapes = [shape for shape in self.scope_shapes if _original_eye_shape(shape, preserved_shapes)]
         self.report["material_pass_shape_count"] = len(named_eye_shapes)
+        self.report["material_pass_scoped_shape_count"] = len(named_eye_shapes)
         named_eye_groups = set()
         for shape in named_eye_shapes:
             named_eye_groups.update(_shape_shading_groups(shape))
@@ -4836,6 +4871,7 @@ class _OriginalLambertOverrideController(object):
         if named_eye_shapes and not plan:
             raise RuntimeError("Original found eye geometry without a resolvable authored eye shadingEngine.")
         self.report["preserved_eye_shape_count"] = len(retained_shapes)
+        self.report["material_pass_shape_count"] = len(retained_shapes)
         self.report["preserved_eye_component_count"] = retained_face_count
         self.report["preserved_eye_shading_engine_count"] = len(plan)
         self.report["eye_textures_enabled"] = bool(plan)
@@ -5102,6 +5138,44 @@ class _OriginalLambertOverrideController(object):
         _original_connect(shader + ".outColor", group + ".surfaceShader")
         return group
 
+    def _create_authored_split_group(self, source_group):
+        """Keep non-pass members on their unchanged authored graph during fallback."""
+        group = cmds.sets(renderable=True, noSurfaceShader=True, empty=True,
+                          name="HMB_Mask_Authored_RemainderSG#")
+        self.created_nodes.append(group)
+        for attribute in ("surfaceShader", "displacementShader", "volumeShader"):
+            for source in self.eye_connection_snapshot.get(source_group + "." + attribute, []):
+                _original_connect(source, group + "." + attribute)
+        return group
+
+    def _apply_material_pass_only(self, active_groups, eye_plan):
+        """Mask keeps native pass materials; only unavailable providers use fallback."""
+        for group in active_groups:
+            if group not in eye_plan or group not in self.eye_fallback_groups:
+                continue
+            body_members = eye_plan[group]
+            if body_members:
+                # An SG can also own hidden/out-of-scope non-pass objects.
+                # Keep those on the original graph, never the pass fallback.
+                split_group = self._create_authored_split_group(group)
+                self.split_memberships.append((group, body_members))
+                cmds.sets(body_members, edit=True, forceElement=split_group)
+                if self._group_members(group) != sorted(set(self.membership_snapshot[group]) - set(body_members)):
+                    raise RuntimeError("Mask pass fallback did not preserve the exact pass memberships.")
+                if self._group_members(split_group) != sorted(body_members):
+                    raise RuntimeError("Mask pass fallback did not preserve the authored remainder memberships.")
+                self.report["split_shading_engine_count"] += 1
+                self.report["split_body_member_count"] += len(body_members)
+            self._apply_eye_fallback(group)
+        for destination, sources in self.eye_connection_snapshot.items():
+            expected = self.eye_fallback_expected_connections.get(destination, sources)
+            if sorted(_incoming_source_plugs(destination)) != sorted(expected):
+                self.report["eye_materials_preserved"] = False
+                raise RuntimeError("Mask changed an authored pass shader connection: " + destination)
+        self._finish_eye_fallback_report()
+        self.report["status"] = "applied"
+        return dict(self.report)
+
     def _create_lambert(self):
         shader = cmds.shadingNode("lambert", asShader=True, name="HMB_Original_Midgray_Lambert#")
         self.created_nodes.append(shader)
@@ -5175,7 +5249,8 @@ class _OriginalLambertOverrideController(object):
         self.report["restore_ok"] = not bool(failures)
         self.report["status"] = "restore_failed" if failures else "restored"
         if failures:
-            raise RuntimeError("Original solid override could not restore Maya material state: " + " | ".join(failures[:10]))
+            label = "Mask material pass" if self.material_pass_only else "Original solid override"
+            raise RuntimeError(label + " could not restore Maya material state: " + " | ".join(failures[:10]))
 
     def apply(self):
         try:
@@ -5189,6 +5264,8 @@ class _OriginalLambertOverrideController(object):
             self.report["inspected_shading_engine_count"] = len(active_groups)
             self.report["contributing_shading_engine_count"] = len(active_groups)
             eye_plan = self._eye_group_plan(active_groups)
+            if self.material_pass_only:
+                return self._apply_material_pass_only(active_groups, eye_plan)
             body_group_count = sum(group not in eye_plan or bool(eye_plan[group]) for group in active_groups)
             shader = self._create_lambert() if body_group_count else ""
             self.report["temporary_lambert_count"] = int(bool(shader))
@@ -5243,12 +5320,16 @@ class _OriginalLambertOverrideController(object):
             self.report["status"] = "applied"
             return dict(self.report)
         except Exception as original_exc:
+            report_key = "_mask_material_pass_report" if self.material_pass_only else "_original_material_override_report"
             try:
                 self._restore()
             except Exception as restore_exc:
-                self.job["_original_material_override_report"] = dict(self.report)
-                raise RuntimeError("Original solid override and rollback failed: {0} | {1}".format(original_exc, restore_exc))
-            self.job["_original_material_override_report"] = dict(self.report)
+                self.job[report_key] = dict(self.report)
+                label = "Mask material pass" if self.material_pass_only else "Original solid override"
+                raise RuntimeError("{0} and rollback failed: {1} | {2}".format(label, original_exc, restore_exc))
+            self.job[report_key] = dict(self.report)
+            if self.material_pass_only:
+                raise RuntimeError("Mask material pass failed: {0}".format(original_exc))
             raise
 
     def finish(self):
@@ -6317,6 +6398,11 @@ def _apply_marker_shaders(bindings, job):
         if isinstance((job or {}).get("_render_scope_binding_shapes"), dict)
         else {}
     )
+    # Material passes are exact authored SET memberships, never eye-like names.
+    # Resolve before any temporary marker assignment can change an authored SG.
+    material_pass_shapes = _mask_pass_set_shapes()
+    captured_pass_shapes = set()
+    marker_eligible_shapes = set()
     for record in bindings:
         color = record["color"]
         root = record["subject_root"]
@@ -6326,7 +6412,15 @@ def _apply_marker_shaders(bindings, job):
             if root in scoped_by_root
             else _marker_renderable_shapes(raw_shapes)
         )
+        selected_pass_shapes = [shape for shape in shapes if shape in material_pass_shapes]
+        captured_pass_shapes.update(selected_pass_shapes)
+        shapes = [shape for shape in shapes if shape not in material_pass_shapes]
+        marker_eligible_shapes.update(shapes)
         if not shapes:
+            if selected_pass_shapes:
+                # An all-pass binding is a successful authored-material Mask,
+                # not an empty/hidden Color Assignment error.
+                continue
             if raw_shapes:
                 warnings.append(
                     "Color Assignment target is authored-hidden or disabled by "
@@ -6474,6 +6568,8 @@ def _apply_marker_shaders(bindings, job):
     cutout_report = dict((job or {}).get("_authored_cutout_report") or {})
     cutout_report["verified_shape_path_count"] = len(set(verified_cutout_shapes))
     job["_marker_cutout_transparency"] = cutout_report
+    job["_mask_material_pass_shapes"] = sorted(captured_pass_shapes)
+    job["_mask_marker_assignment_eligible_shape_count"] = len(marker_eligible_shapes)
     if world_space_patterns:
         try:
             scene_linear_unit = _clean(cmds.currentUnit(query=True, linear=True))
@@ -17177,13 +17273,15 @@ def run(job_path):
         original_mouth_report = {}
         original_material_controller = None
         original_material_report = {}
+        mask_material_controller = None
+        mask_material_report = {}
         output_paths = []
         frame_map = []
         if apply_original_lambert_override:
             _write_progress(
                 job,
                 "preparing_original_lambert_materials",
-                "Applying a soft midgray body while preserving AIPicker_SET materials.",
+                "Applying a soft midgray body while preserving AIPicker_SET and AIPickerM_SET materials.",
             )
             try:
                 original_material_controller = (
@@ -17231,6 +17329,19 @@ def run(job_path):
                         quality_restore = None
                 raise
         try:
+            if apply_marker_shaders and not capture_auxiliary_only:
+                mask_material_controller = _OriginalLambertOverrideController(
+                    job, material_pass_only=True,
+                )
+                mask_material_report = mask_material_controller.apply()
+                mask_material_controller.report.update({
+                    "default_lighting_verified": bool(render_options_report.get("default_lighting_verified")),
+                    "textured_render_mode_verified": bool(render_options_report.get("textured_render_mode_verified")),
+                })
+                for warning in mask_material_controller.report.get("warnings", []):
+                    if warning and warning not in warnings:
+                        warnings.append(warning)
+                job["_mask_material_pass_report"] = dict(mask_material_controller.report)
             if original_material_controller is not None:
                 _write_progress(
                     job,
@@ -17283,14 +17394,21 @@ def run(job_path):
                         ),
                     )
             finally:
-                if original_mouth_controller is not None:
-                    original_mouth_report = original_mouth_controller.finish()
-                    job["_mouth_inner_patch_original_report"] = dict(
-                        original_mouth_report
-                    )
-                    quality_report["mouth_card_inner_patch"] = dict(
-                        original_mouth_report
-                    )
+                try:
+                    if original_mouth_controller is not None:
+                        original_mouth_report = original_mouth_controller.finish()
+                        job["_mouth_inner_patch_original_report"] = dict(
+                            original_mouth_report
+                        )
+                        quality_report["mouth_card_inner_patch"] = dict(
+                            original_mouth_report
+                        )
+                finally:
+                    if mask_material_controller is not None:
+                        # Auxiliary passes must see the authored graph, never
+                        # a temporary Mask-only unavailable-provider fallback.
+                        mask_material_report = mask_material_controller.finish()
+                        job["_mask_material_pass_report"] = dict(mask_material_report)
             artifact_status["color"]["ok"] = not capture_auxiliary_only
             # Depth is a scene-space pass, not a Color Assignment pass.  After
             # the assignment-scoped Mask has rendered, release its disposable
@@ -17419,6 +17537,12 @@ def run(job_path):
                     _emit_console("WARNING", warning)
         finally:
             material_restore_error = None
+            if mask_material_controller is not None:
+                try:
+                    mask_material_report = mask_material_controller.finish()
+                    job["_mask_material_pass_report"] = dict(mask_material_report)
+                except Exception as exc:
+                    material_restore_error = exc
             if original_material_controller is not None:
                 try:
                     original_material_report = (
@@ -17520,6 +17644,8 @@ def run(job_path):
             payload["original_material_override_report"] = dict(
                 original_material_report
             )
+        elif apply_marker_shaders and not capture_auxiliary_only:
+            payload["mask_material_pass_report"] = dict(mask_material_report)
         elif force_high_quality_viewport and not apply_marker_shaders:
             payload["assignment_mode"] = "original_full_detail_no_marker"
         if not capture_auxiliary_only:
@@ -17686,6 +17812,8 @@ def run(job_path):
             result["original_material_override_report"] = dict(
                 original_material_report
             )
+        elif apply_marker_shaders and not capture_auxiliary_only:
+            result["mask_material_pass_report"] = dict(mask_material_report)
         if screen_space_patterns:
             result["screen_space_pattern_profile"] = SCREEN_SPACE_PATTERN_PROFILE
             result["screen_space_render_options"] = render_options_report

@@ -30,16 +30,16 @@ const HMB_MIN_NODE_WIDTH = 760;
 const HMB_HEADER_LAYOUT_VERSION = 2;
 const HMB_LEGACY_IMAGE_SOURCES_DEFAULT_HEIGHT = 542;
 const HMB_GROUP_START_HEIGHTS = Object.freeze({
-  // Match VideoPicker's 68px header without changing the established
-  // 1800x1193 outer startup size. Only the fresh/default image editor absorbs
-  // the 10px delta; persisted user group heights remain authoritative.
+  // Keep the established 1193px editor-group baseline. Header/tabs and
+  // 21px of bottom space independently raise the final startup height to 1350px;
+  // persisted user group heights remain authoritative.
   imageSources: 514,
   imageText: 200,
   videoSources: 200,
   videoText: 150,
 });
 const HMB_GROUP_MIN_HEIGHTS = Object.freeze({
-  // Keep the outer 1193px minimum while reserving the VideoPicker header chrome.
+  // Retain the legacy 1193px editor minimum without shrinking stored groups.
   imageSources: 514,
   imageText: 200,
   videoSources: 200,
@@ -54,6 +54,9 @@ const HMB_DEFAULT_NODE_HEIGHT =
   HMB_START_LAYOUT_CHROME_HEIGHT +
   HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT;
 const HMB_MIN_NODE_HEIGHT = HMB_DEFAULT_NODE_HEIGHT;
+const HMB_MANAGER_HEADER_TABS_HEIGHT = 68 + 44 + 24;
+const HMB_START_BOTTOM_PADDING = 21;
+const HMB_MANAGER_DEFAULT_NODE_HEIGHT = HMB_DEFAULT_NODE_HEIGHT + HMB_MANAGER_HEADER_TABS_HEIGHT + HMB_START_BOTTOM_PADDING;
 const HMB_RESIZE_MODE = "stacked_outer_1000";
 const HMB_GROUP_MAX_HEIGHT = 6000;
 const HMB_GROUP_KEYS = Object.keys(HMB_GROUP_MIN_HEIGHTS);
@@ -2338,6 +2341,7 @@ function normalizeUi(input) {
     resize_mode: HMB_RESIZE_MODE,
     header_layout_version: HMB_HEADER_LAYOUT_VERSION,
     language,
+    shot_editor_expanded: source.shot_editor_expanded !== false,
   };
 }
 
@@ -2869,6 +2873,8 @@ export function normalizeState(input) {
   return {
     schema: "prompt-library-state",
     mode: "prompt_only_role_dashboard",
+    multi_shot_enabled: input?.multi_shot_enabled === true,
+    shot_documents: hmbNormalizePromptShotDocuments(input?.shot_documents),
     source_sync_revision: normalizeSourceSyncRevision(input?.source_sync_revision),
     [UI_EDIT_REVISION_KEY]: normalizeUiEditRevision(input?.[UI_EDIT_REVISION_KEY]),
     image_taxonomy: imageTaxonomy,
@@ -2891,6 +2897,62 @@ export function normalizeState(input) {
       max_videos: MAX_VIDEOS,
     },
   };
+}
+
+export function hmbPromptDocumentKey(shot) {
+  const selected = normalizeShotSelection(shot);
+  return selected.channel_uuid && selected.shot_uuid
+    ? `${selected.channel_uuid}/${selected.shot_uuid}` : "__unbound__";
+}
+
+function hmbNormalizePromptShotDocuments(value) {
+  const result = Object.create(null);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return result;
+  for (const [key, document] of Object.entries(value)) {
+    if (key.length > 300 || key.includes("\u0000") || (key !== "__unbound__" && key.split("/").length !== 2)) continue;
+    if (typeof document === "string" && document) result[key] = document;
+    else if (document && typeof document === "object" && !Array.isArray(document)) {
+      const { shot_documents: _nested, ...body } = document;
+      result[key] = JSON.stringify(body);
+    }
+  }
+  return result;
+}
+
+export function hmbStorePromptShotDocument(state) {
+  if (state?.multi_shot_enabled !== true) return state;
+  const { shot_documents: documentsValue, disabled: _disabled, ...body } = state;
+  const documents = hmbNormalizePromptShotDocuments(documentsValue);
+  documents[hmbPromptDocumentKey(state.shot)] = JSON.stringify(body);
+  state.shot_documents = documents;
+  return state;
+}
+
+export function hmbSwitchPromptShot(state, shotUuid) {
+  const selected = hmbPromptVerifiedShotCatalog(state).find((item) => item.shot_uuid === clean(shotUuid));
+  if (!selected) return false;
+  if (state.multi_shot_enabled !== true) { state.shot = selected; return true; }
+  hmbStorePromptShotDocument(state);
+  const currentKey = hmbPromptDocumentKey(state.shot);
+  const key = hmbPromptDocumentKey(selected);
+  if (key === currentKey) { state.shot = selected; return true; }
+  const documents = state.shot_documents;
+  let saved = null;
+  try { if (documents[key]) saved = JSON.parse(documents[key]); } catch (_error) {}
+  if (!saved && currentKey === "__unbound__" && Object.keys(documents).length === 1) saved = state;
+  const target = normalizeState(saved || defaultState());
+  target.multi_shot_enabled = true;
+  target.shot_documents = documents;
+  target.shot = selected;
+  target.source_sync_revision = state.source_sync_revision;
+  target[UI_EDIT_REVISION_KEY] = state[UI_EDIT_REVISION_KEY];
+  target.disabled = state.disabled;
+  for (const [owner, fields] of [["image_asset", ["shot_catalog", "shot_catalog_routing"]], ["picker", ["shot_catalog"]]]) {
+    for (const field of fields) target[owner][field] = state[owner]?.[field];
+  }
+  Object.keys(state).forEach((field) => delete state[field]);
+  Object.assign(state, target);
+  return true;
 }
 
 function emit(props, state, container = null) {
@@ -3326,6 +3388,10 @@ export function hmbRememberPromptDirtyTextControl(container, element, state) {
     }
   }
   if (!entry) return false;
+  if(state?.multi_shot_enabled){
+    entry.documentKey=hmbPromptDocumentKey(state.shot);
+    entry.documentShot=normalizeShotSelection(state.shot);
+  }
   const dirty = container.__hmbPromptLibraryDirtyText instanceof Map
     ? container.__hmbPromptLibraryDirtyText
     : new Map();
@@ -3340,7 +3406,7 @@ export function hmbRememberPromptDirtyTextControl(container, element, state) {
         entry.arrayField,
         entry.arrayIndex,
       ].join(":");
-  dirty.set(identity, entry);
+  dirty.set(entry.documentKey ? `${entry.documentKey}|${identity}` : identity, entry);
   container.__hmbPromptLibraryDirtyText = dirty;
   return true;
 }
@@ -3396,6 +3462,18 @@ export function hmbMergePromptDirtyTextState(authoritativeValue, dirtyEntries) {
       : [];
   entries.forEach((entry) => {
     if (!entry || typeof entry !== "object") return;
+    if(next.multi_shot_enabled && entry.documentKey && entry.documentKey!==hmbPromptDocumentKey(next.shot)){
+      // A source restore can change the visible UUID during an unfinished edit.
+      // Preserve that draft in its original authoring document, never another
+      // Shot that happens to share text keys or the same asset UID.
+      let archived=null;
+      try{archived=JSON.parse(next.shot_documents[entry.documentKey]||"null");}catch(_error){}
+      if(!archived || typeof archived!=="object")archived={...defaultState(),multi_shot_enabled:true,shot:entry.documentShot};
+      const restored=hmbMergePromptDirtyTextState(archived,[{...entry,documentKey:""}]);
+      const {shot_documents:_nested,disabled:_disabled,...body}=restored;
+      next.shot_documents[entry.documentKey]=JSON.stringify(body);
+      return;
+    }
     const value = String(entry.value ?? "");
     if (entry.kind === "text") {
       const key = clean(entry.key);
@@ -3652,7 +3730,7 @@ function hmbRestorePromptControlFocus(container) {
   try { target.focus({ preventScroll: true }); } catch (_error) { try { target.focus(); } catch (__error) {} }
 }
 
-const HMB_SOURCE_SCROLL_KEYS = ["imageSources", "videoSources"];
+const HMB_SOURCE_SCROLL_KEYS = ["imageSources", "videoSources", "managerBody"];
 
 function hmbScrollMemory(container) {
   if (!container) return {};
@@ -3663,11 +3741,13 @@ function hmbScrollMemory(container) {
 }
 
 function hmbScrollDatasetKey(key) {
+  if (key === "managerBody") return "hmbManagerBodyScrollTop";
   return key === "videoSources" ? "hmbVideoSourceScrollTop" : "hmbImageSourceScrollTop";
 }
 
 function hmbSourceScrollbox(container, key) {
   try {
+    if (key === "managerBody") return container?.querySelector?.('[data-prompt-manager="true"] .center') || null;
     return container ? container.querySelector(`.group-card[data-group-id="${key}"] .source-scrollbox`) : null;
   } catch (_e) {
     return null;
@@ -3736,6 +3816,9 @@ export function hmbInstallPromptInteractionIsolation(container, listeners) {
   // node itself. Node selection and resize activation belong to the native
   // purple title bar only.
   canvasPanRoots.forEach((element) => element.classList?.remove("nopan", "nowheel"));
+  // The manager's four groups share one bounded native scroll viewport.
+  // Keep wheel input there while leaving middle-button canvas pan available.
+  container.querySelector?.('[data-prompt-manager="true"] .center')?.classList?.add("nowheel");
   const interactionSelectors = [
     "input",
     "textarea",
@@ -4387,12 +4470,41 @@ function hmbPromptOnlyIntentMatchesSourceAuthority(uiState, sourceState) {
   );
 }
 
+function hmbMergePromptShotDocumentRevisions(sourceDocuments, uiDocuments) {
+  const merged = { ...sourceDocuments };
+  const parse = raw => { try { const value = JSON.parse(raw); return value && typeof value === "object" && !Array.isArray(value) ? value : null; } catch { return null; } };
+  const revision = (document, key) => { const value = Number(document?.[key] || 0); return Number.isFinite(value) ? Math.max(0, Math.min(MAX_SOURCE_SYNC_REVISION, Math.trunc(value))) : 0; };
+  Object.entries(uiDocuments).forEach(([key, incoming]) => {
+    const existing = merged[key];
+    if (existing === undefined) { merged[key] = incoming; return; }
+    if (existing === incoming) return;
+    const source = parse(existing), ui = parse(incoming);
+    if (!ui) return;
+    const sourceUi = revision(source, UI_EDIT_REVISION_KEY), incomingUi = revision(ui, UI_EDIT_REVISION_KEY);
+    if (!source || incomingUi > sourceUi || (incomingUi === sourceUi
+      && revision(ui, "source_sync_revision") > revision(source, "source_sync_revision"))) merged[key] = incoming;
+  });
+  return merged;
+}
+
 export function hmbMergePromptRevisionAxes(sourceState, uiState) {
   const source = normalizeState(sourceState || {});
   const ui = normalizeState(uiState || {});
-  hmbReconcilePromptSourceIdentities(ui, source);
+  if (source.multi_shot_enabled && ui.multi_shot_enabled) {
+    const documents = hmbMergePromptShotDocumentRevisions(source.shot_documents, ui.shot_documents);
+    source.shot_documents = documents;
+    if(hmbPromptVerifiedShotCatalog(source).some(shot=>shot.shot_uuid===clean(ui.shot?.shot_uuid)
+      && shot.channel_uuid===clean(ui.shot?.channel_uuid)))hmbSwitchPromptShot(source, ui.shot?.shot_uuid);
+    source.shot_documents = documents;
+  }
+  // A source-only restore may choose an archived UUID while the previous UI
+  // body is unbound/deleted. Authoring follows its exact document identity;
+  // valid concurrent UI Shot switches were materialized above before merging.
+  const authoredUi = source.multi_shot_enabled && ui.multi_shot_enabled
+    && hmbPromptDocumentKey(source.shot) !== hmbPromptDocumentKey(ui.shot) ? source : ui;
+  hmbReconcilePromptSourceIdentities(authoredUi, source);
   const uiImages = new Map();
-  ui.images.forEach((item, index) => {
+  authoredUi.images.forEach((item, index) => {
     const identity = hmbPromptFrameRangeIdentity(item, index);
     if (!uiImages.has(identity)) uiImages.set(identity, item);
   });
@@ -4409,7 +4521,7 @@ export function hmbMergePromptRevisionAxes(sourceState, uiState) {
     }
   });
   const uiVideos = new Map();
-  ui.videos.forEach((item, index) => {
+  authoredUi.videos.forEach((item, index) => {
     const identity = hmbPromptVideoRevisionIdentity(item, index);
     if (!uiVideos.has(identity)) uiVideos.set(identity, item);
   });
@@ -4422,13 +4534,13 @@ export function hmbMergePromptRevisionAxes(sourceState, uiState) {
       item.label = hmbPromptCloneRangeField(uiItem.label);
     }
   });
-  source.text = hmbPromptCloneRangeField(ui.text) || source.text;
-  source.ui = hmbPromptCloneRangeField(ui.ui) || source.ui;
+  source.text = hmbPromptCloneRangeField(authoredUi.text) || source.text;
+  source.ui = hmbPromptCloneRangeField(authoredUi.ui) || source.ui;
   // Connected-source parsing owns these diagnostics. Keep the newest source
   // generation instead of replacing it with an older dashboard snapshot.
   source.picker = source.picker && typeof source.picker === "object" ? source.picker : {};
   source.picker.slot_suppressions = hmbPromptCloneRangeField(
-    ui?.picker?.slot_suppressions,
+    authoredUi?.picker?.slot_suppressions,
   ) || {};
   const selectedShotUuid = clean(ui?.shot?.shot_uuid);
   if (!selectedShotUuid) {
@@ -4437,7 +4549,8 @@ export function hmbMergePromptRevisionAxes(sourceState, uiState) {
     }
   } else {
     const selectedShot = hmbPromptVerifiedShotCatalog(source)
-      .find((shot) => clean(shot.shot_uuid) === selectedShotUuid);
+      .find((shot) => clean(shot.shot_uuid) === selectedShotUuid
+        && clean(shot.channel_uuid) === clean(ui?.shot?.channel_uuid));
     if (selectedShot) source.shot = normalizeShotSelection(selectedShot);
   }
   source.source_sync_revision = Math.max(
@@ -4503,14 +4616,19 @@ function hmbPromptRevisionDisposition(container, nextProps, incomingState) {
     let currentValue = "";
     try {
       const pending = container.__hmbPromptLibraryInteractionCommit;
-      currentValue = JSON.stringify(normalizeState(pending && !pending.cancelled ? pending.state : parseValue(
-        container.__hmbPromptLatestLocalStateValue
-          || container.__hmbPromptLastPaintedValue,
-      )));
+      // A serialized snapshot is already canonical after parseValue. Only a
+      // live pending draft still needs normalization; do not walk all five
+      // archived Shot documents twice for the same revision comparison.
+      const currentState = pending && !pending.cancelled ? normalizeState(pending.state) : parseValue(
+        container.__hmbPromptLatestLocalStateValue || container.__hmbPromptLastPaintedValue,
+      );
+      currentValue = JSON.stringify(currentState);
     } catch (_error) {}
     if (currentValue) {
       let incomingValue = "";
-      try { incomingValue = JSON.stringify(normalizeState(incomingState)); } catch (_error) {}
+      // The sole caller obtains incomingState from parseValue in this same
+      // update. Reuse it only for this comparison, never across revisions.
+      try { incomingValue = JSON.stringify(incomingState); } catch (_error) {}
       if (incomingValue && currentValue !== incomingValue) return "stale";
     }
   }
@@ -4732,6 +4850,8 @@ export function hmbEmitLocalPromptState(container, props, state, onFinalFailure 
   }
   const normalized = normalizeState(state);
   normalized[UI_EDIT_REVISION_KEY] = nextUiEditRevision;
+  hmbStorePromptShotDocument(normalized);
+  if (state?.multi_shot_enabled) state.shot_documents = normalized.shot_documents;
   const serialized = JSON.stringify(normalized);
   if (container) {
     try {
@@ -4790,7 +4910,7 @@ export function hmbEmitLocalPromptState(container, props, state, onFinalFailure 
 // any retained-mode transaction can delay the feedback.
 export function hmbCommitLocalPromptStructure(container, props, state, remount, paint = null) {
   hmbClearImmediateStateCommit(container);
-  hmbCaptureUiBeforeStateEmit(container, state);
+  if (!container?.__hmbPromptShotSwitchInProgress) hmbCaptureUiBeforeStateEmit(container, state);
   const rollbackValue = typeof container?.__hmbPromptLastPaintedValue === "string"
     ? container.__hmbPromptLastPaintedValue
     : "";
@@ -4849,7 +4969,7 @@ export function hmbTakePromptRevisionMerge(container) {
   return merged && typeof merged === "object" ? merged : null;
 }
 
-export function hmbConsumePendingPromptStateEcho(container, nextProps, currentState = null) {
+export function hmbConsumePendingPromptStateEcho(container, nextProps, currentState = null, parsedIncoming = null) {
   if (!container || !nextProps) return false;
   container.__hmbPromptLastConsumedEchoWasStale = false;
   try { delete container.__hmbPromptPendingRevisionMerge; } catch (_error) {}
@@ -4859,6 +4979,7 @@ export function hmbConsumePendingPromptStateEcho(container, nextProps, currentSt
     // parseValue already returns a canonical state. A second normalization
     // walks every image/video row again on each retained-mode props update.
     incomingState = parseValue(nextProps.value);
+    if (parsedIncoming) parsedIncoming.state = incomingState;
     incoming = JSON.stringify(incomingState);
   } catch (_error) {
     return false;
@@ -5934,6 +6055,13 @@ export function hmbApplyPromptShotFeedback(container, state) {
   return Boolean(selectorPatched || dashboard);
 }
 
+function hmbApplyPromptDisabledFeedback(container, disabled) {
+  container.querySelector?.(".hmb-dashboard")?.classList?.toggle("disabled", Boolean(disabled));
+  for (const tab of container.querySelectorAll?.("[data-prompt-shot]") || []) {
+    if (tab.disabled !== Boolean(disabled)) tab.disabled = Boolean(disabled);
+  }
+}
+
 export const HMB_PROMPT_ONLY_SHOT_VALUE = "__hmb_only__";
 
 export function hmbPromptVerifiedShotCatalog(state) {
@@ -5963,15 +6091,16 @@ export function hmbPromptShotOptions(state) {
     item.shot_uuid === current.shot_uuid && item.channel_uuid === current.channel_uuid
   ));
   return [
+    ...(state?.multi_shot_enabled ? [] : [
     {
       value: HMB_PROMPT_ONLY_SHOT_VALUE,
       shot_uuid: "",
       channel_uuid: "",
       number: 0,
-      name: "Only",
+      name: "샷 선택",
       selected: !exact,
       only: true,
-    },
+    }]),
     ...catalog.map((item) => ({
       ...item,
       value: item.shot_uuid,
@@ -5990,7 +6119,7 @@ function hmbPromptShotOptionNodes(selector) {
 
 function hmbPromptShotOptionLabel(item) {
   return item.only
-    ? "Only"
+    ? "샷 선택"
     : `${String(item.number).padStart(2, "0")} · ${item.name}`;
 }
 
@@ -5999,6 +6128,16 @@ function hmbPromptShotOptionLabel(item) {
 // publisher-owned Shot UUID, so add/rename/delete does not rebuild the topbar
 // or disturb an editor elsewhere in the Prompt dashboard.
 export function hmbPatchPromptShotSelector(container, state) {
+  if (state?.multi_shot_enabled) {
+    const list = container?.querySelector?.(".prompt-shot-list");
+    if (!list) return false;
+    const markup = renderPromptShotRows(state);
+    const staging = list.ownerDocument.createElement("div");
+    staging.innerHTML = markup;
+    hmbPatchPromptShotSections(list, staging.firstElementChild, true);
+    hmbApplyDashboardHostSizing(container, state);
+    return true;
+  }
   const selector = container?.querySelector?.("[data-shot-selector]");
   if (!selector) return false;
   const desired = hmbPromptShotOptions(state);
@@ -6068,6 +6207,8 @@ function hmbPromptNonShotNormalizedFingerprint(normalizedState) {
   const {
     source_sync_revision: _sourceSyncRevision,
     shot: _shot,
+    shot_documents: _shotDocuments,
+    disabled: _disabled,
     image_asset: imageAssetValue,
     picker: pickerValue,
     ...rest
@@ -6087,16 +6228,29 @@ export function hmbPromptNonShotStateFingerprint(stateValue) {
 }
 
 function renderShotSelector(state) {
+  if (state.multi_shot_enabled) return "";
   const options = hmbPromptShotOptions(state);
   const hasRemote = options.length > 1;
   const remoteStatus = hasRemote ? "<i>REMOTE</i>" : "";
   const markup = options.map((item) => {
     const label = item.only
-      ? "Only"
+      ? "샷 선택"
       : `${String(item.number).padStart(2, "0")} · ${item.name}`;
     return `<option value="${escapeHtml(item.value)}"${item.only ? "" : ` data-shot-number="${item.number}"`}${item.selected ? " selected" : ""}>${escapeHtml(label)}</option>`;
   }).join("");
   return `<label class="shot-selector-shell"><span>SHOT</span><select class="shot-selector" data-shot-selector aria-label="Active Shot"${hasRemote && !state.disabled ? "" : " disabled"}>${markup}</select>${remoteStatus}</label>`;
+}
+
+function renderPromptShotRows(state, editorMarkup = "") {
+  if (!state.multi_shot_enabled) return "";
+  const catalog = hmbPromptVerifiedShotCatalog(state);
+  const selected = normalizeShotSelection(state.shot);
+  if (!catalog.length) return `<div class="prompt-shot-list"><div class="prompt-shot-empty">${escapeHtml(uiLanguage(state) === "ko" ? "ImageAsset 프로젝트의 샷을 연결하세요." : "Connect an ImageAsset project Shot.")}</div></div>`;
+  return `<div class="prompt-shot-list" role="tablist" aria-label="Prompt Shots">${catalog.map((shot) => {
+    const active = shot.shot_uuid === selected.shot_uuid;
+    const expanded = active;
+    return `<section class="prompt-shot-section" data-shot-uuid="${escapeHtml(shot.shot_uuid)}"><button type="button" role="tab" title="${escapeHtml(hmbPromptShotOptionLabel(shot))}" class="prompt-shot-row nodrag nopan nowheel${active ? " active" : ""}" data-prompt-shot="${escapeHtml(shot.shot_uuid)}" data-prompt-shot-number="${shot.number}" aria-expanded="${expanded}" aria-selected="${active}"${state.disabled ? " disabled" : ""}><span class="prompt-shot-number">${String(shot.number).padStart(2, "0")}</span><b>${escapeHtml(shot.name)}</b></button>${expanded && editorMarkup ? `<div role="tabpanel" class="prompt-shot-content" data-shot-editor="${escapeHtml(shot.shot_uuid)}">${editorMarkup}</div>` : ""}</section>`;
+  }).join("")}</div>`;
 }
 
 function render(state, includeStyle = true) {
@@ -6109,6 +6263,14 @@ function render(state, includeStyle = true) {
   const hImageText = groupHeightStyle(state, "imageText");
   const hVideoSources = groupHeightStyle(state, "videoSources");
   const hVideoText = groupHeightStyle(state, "videoText");
+  const editorMarkup = `<div class="layout">
+      <main class="center">
+        <section class="group-card image-card" data-group-id="imageSources" ${hImageSources}><h3>${escapeHtml(uiText(state, "image_source_binding", "IMAGE SOURCE BINDING"))} <b>${state.status.active_images} / ${state.status.max_images}</b></h3><div class="group-body source-scrollbox" data-scroll-id="imageSources"><div class="source-header image-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "target", "TARGET"))}</span><span class="image-video-surface-columns"><span>${escapeHtml(uiText(state, "video_color_pick", "VIDEO / COLOR PICK"))}</span><span class="image-surface-heading">${escapeHtml(uiText(state, "surface_2d", "2DSurface"))}</span></span><span></span></div>${images.map((item, idx) => renderImageRow(item, idx, images, state)).join("")}${renderImageAddRow(images, state)}</div><div class="group-resize-bar nodrag" data-resize-group="imageSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
+        <section class="group-card imgtext" data-group-id="imageText" ${hImageText}><h3>${escapeHtml(uiText(state, "image_text_context", "SHOT TEXT DIRECTION / EXACT LITERALS"))} <b>${escapeHtml(uiText(state, "scene_level_notes", "scene-level notes"))}</b></h3><div class="group-body"><div class="text-grid">${groupBFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="imageText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
+        <section class="group-card video-card" data-group-id="videoSources" ${hVideoSources}><h3>${escapeHtml(uiText(state, "video_source_binding", "VIDEO SOURCE BINDING"))} <b>${state.status.active_videos} / ${state.status.max_videos}</b></h3><div class="group-body source-scrollbox" data-scroll-id="videoSources"><div class="source-header video-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "keep_out", "KEEP OUT"))}</span><span></span></div>${videos.map((item, idx) => renderVideoRow(item, idx, images, state)).join("")}${renderVideoAddRow(videos, state)}</div><div class="group-resize-bar nodrag" data-resize-group="videoSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
+        <section class="group-card vtext" data-group-id="videoText" ${hVideoText}><h3>${escapeHtml(uiText(state, "video_vfx", "VFX"))}</h3><div class="group-body"><div class="text-grid">${groupDFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="videoText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
+      </main>
+    </div>`;
   return `${includeStyle ? `<style>
       .hmb-dashboard :is(button,input,select,textarea){font-family:inherit}
       .image-video-surface-columns{display:grid;grid-template-columns:minmax(0,1fr) 4.5rem;gap:8px;align-items:start;min-width:0}
@@ -6212,17 +6374,19 @@ function render(state, includeStyle = true) {
     /* Shared HMB header typography and Shot selector sizing. */
     .hmb-dashboard .title{font-size:15px;font-weight:800;letter-spacing:.01em;line-height:normal}
     .hmb-dashboard .shot-selector{flex:0 1 210px;width:210px;min-width:120px;max-width:210px;height:44px;padding:0 10px;font-size:13px;font-weight:800;line-height:normal}
+    .prompt-shot-section{display:contents}.prompt-shot-content{display:flex;flex-direction:column;grid-row:2;grid-column:1/-1;min-width:0;min-height:0;overflow:hidden}.prompt-shot-content>.layout{height:0;min-height:0;flex:1 1 auto;padding:0}.prompt-shot-content .center{min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}.prompt-shot-list{display:grid!important;grid-template-columns:repeat(5,minmax(0,1fr));grid-template-rows:44px minmax(0,1fr);gap:8px!important;flex:1 1 auto!important;min-height:0;min-width:0;padding:8px!important;overflow:hidden}.prompt-shot-section>.prompt-shot-row{grid-row:1;grid-template-columns:30px minmax(0,1fr);gap:7px;min-width:0;max-width:100%;padding:5px 7px}.prompt-shot-section>.prompt-shot-row b{min-width:0;max-width:100%}.prompt-shot-empty{grid-column:1/-1}.hmb-dashboard[data-prompt-manager="true"] .topbar{min-width:0;flex-shrink:0}.hmb-dashboard[data-prompt-manager="true"] .topbar-controls{min-width:0;flex-shrink:1}.hmb-dashboard[data-prompt-manager="true"] .title{min-width:0}
+    .prompt-shot-list{display:flex;flex-direction:column;gap:6px;flex:0 0 auto;padding:8px 8px 0}.prompt-shot-row{--row-accent:#F472B6;--row-rgb:244,114,182;display:grid;grid-template-columns:34px minmax(90px,1fr) auto 20px;gap:10px;align-items:center;width:100%;height:44px;padding:5px 10px;border:1px solid rgba(var(--row-rgb),.4);border-radius:7px;background:linear-gradient(90deg,rgba(var(--row-rgb),.18),rgba(8,13,23,.86));color:#d9e6f3;text-align:left;cursor:pointer}.prompt-shot-row[data-prompt-shot-number="2"]{--row-accent:#3B82F6;--row-rgb:59,130,246}.prompt-shot-row[data-prompt-shot-number="3"]{--row-accent:#10B981;--row-rgb:16,185,129}.prompt-shot-row[data-prompt-shot-number="4"]{--row-accent:#8B5CF6;--row-rgb:139,92,246}.prompt-shot-row[data-prompt-shot-number="5"]{--row-accent:#EAB308;--row-rgb:234,179,8}.prompt-shot-row.active,.prompt-shot-row:focus-visible{border-color:var(--row-accent);outline:none;box-shadow:inset 0 0 0 1px rgba(var(--row-rgb),.2)}.prompt-shot-number{display:grid;place-items:center;height:30px;border:1px solid rgba(var(--row-rgb),.6);border-radius:7px;color:var(--row-accent);font-size:11px;font-weight:950}.prompt-shot-row b{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.prompt-shot-state{font-size:10px;color:var(--row-accent)}.prompt-shot-empty{height:44px;display:flex;align-items:center;padding:0 10px;color:#8fa3b8;font-size:12px}
+    .hmb-dashboard[data-prompt-manager="true"] .topbar{background:linear-gradient(90deg,rgba(var(--hmb-shot-rgb),.32),rgba(var(--hmb-shot-rgb),.12) 58%,#0d1625);border-bottom:1px solid rgba(var(--hmb-shot-rgb),.7);box-shadow:inset 4px 0 var(--hmb-shot-accent)}
+    .hmb-dashboard[data-prompt-manager="true"] .title-mark{background:rgba(var(--hmb-shot-rgb),.2);border-color:var(--hmb-shot-accent)}
+    .prompt-shot-row{background:linear-gradient(90deg,rgba(var(--row-rgb),.08),rgba(8,13,23,.92));touch-action:manipulation}
+    .prompt-shot-row:hover:not(:disabled){border-color:var(--row-accent);background:linear-gradient(90deg,rgba(var(--row-rgb),.22),rgba(8,13,23,.9))}
+    .prompt-shot-row.active{border:2px solid var(--row-accent);padding:4px 6px;background:linear-gradient(105deg,rgba(var(--row-rgb),.42),rgba(var(--row-rgb),.16));color:#f8fafc;box-shadow:inset 3px 0 var(--row-accent),0 0 12px rgba(var(--row-rgb),.2)}
+    .prompt-shot-row.active .prompt-shot-number{border-color:var(--row-accent);background:var(--row-accent);color:#07111e;box-shadow:0 0 10px rgba(var(--row-rgb),.24)}
+    .prompt-shot-row:focus-visible{outline:2px solid var(--row-accent);outline-offset:2px}.prompt-shot-row:active:not(:disabled){filter:brightness(1.15)}
     @media (prefers-reduced-motion: reduce){.hmb-dashboard,.hmb-dashboard *,.hmb-dashboard *::before,.hmb-dashboard *::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
-  </style>` : ""}<div class="hmb-dashboard-clip nodrag"><div class="hmb-dashboard ${state.disabled ? "disabled" : ""}" data-shot-number="${paletteShotNumber}">
+  </style>` : ""}<div class="hmb-dashboard-clip nodrag"><div class="hmb-dashboard ${state.disabled ? "disabled" : ""}" data-shot-number="${paletteShotNumber}" data-prompt-manager="${Boolean(state.multi_shot_enabled)}">
     <div class="topbar"><div class="title"><span class="title-mark" aria-hidden="true">PL</span><span>HMBPromptLibrary</span></div><div class="prompt-publish-status" data-prompt-publication-status role="status" aria-live="polite" aria-atomic="true"></div><div class="topbar-controls">${renderShotSelector(state)}<button type="button" class="language-button" data-language-toggle aria-label="Language">${uiLanguage(state) === "ko" ? "한국어" : "EN"}</button></div></div>
-    <div class="layout">
-      <main class="center">
-        <section class="group-card image-card" data-group-id="imageSources" ${hImageSources}><h3>${escapeHtml(uiText(state, "image_source_binding", "IMAGE SOURCE BINDING"))} <b>${state.status.active_images} / ${state.status.max_images}</b></h3><div class="group-body source-scrollbox" data-scroll-id="imageSources"><div class="source-header image-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "target", "TARGET"))}</span><span class="image-video-surface-columns"><span>${escapeHtml(uiText(state, "video_color_pick", "VIDEO / COLOR PICK"))}</span><span class="image-surface-heading">${escapeHtml(uiText(state, "surface_2d", "2DSurface"))}</span></span><span></span></div>${images.map((item, idx) => renderImageRow(item, idx, images, state)).join("")}${renderImageAddRow(images, state)}</div><div class="group-resize-bar nodrag" data-resize-group="imageSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
-        <section class="group-card imgtext" data-group-id="imageText" ${hImageText}><h3>${escapeHtml(uiText(state, "image_text_context", "SHOT TEXT DIRECTION / EXACT LITERALS"))} <b>${escapeHtml(uiText(state, "scene_level_notes", "scene-level notes"))}</b></h3><div class="group-body"><div class="text-grid">${groupBFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="imageText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
-        <section class="group-card video-card" data-group-id="videoSources" ${hVideoSources}><h3>${escapeHtml(uiText(state, "video_source_binding", "VIDEO SOURCE BINDING"))} <b>${state.status.active_videos} / ${state.status.max_videos}</b></h3><div class="group-body source-scrollbox" data-scroll-id="videoSources"><div class="source-header video-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "keep_out", "KEEP OUT"))}</span><span></span></div>${videos.map((item, idx) => renderVideoRow(item, idx, images, state)).join("")}${renderVideoAddRow(videos, state)}</div><div class="group-resize-bar nodrag" data-resize-group="videoSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
-        <section class="group-card vtext" data-group-id="videoText" ${hVideoText}><h3>${escapeHtml(uiText(state, "video_vfx", "VFX"))}</h3><div class="group-body"><div class="text-grid">${groupDFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="videoText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
-      </main>
-    </div>
+    ${state.multi_shot_enabled ? renderPromptShotRows(state, editorMarkup) : editorMarkup}
   </div></div>`;
 }
 
@@ -6292,24 +6456,26 @@ export function hmbGuardSelectedNodeKeyboardDelete(container, event) {
   return true;
 }
 
-function hmbApplyInitialNodeSizeOnce(container) {
+function hmbApplyInitialNodeSizeOnce(container, state = null) {
   const shell = hmbFindSafeReactFlowNode(container);
   if (!shell || !shell.style) return;
+  container.__hmbPromptLibraryFixedStartupSize = true;
   if (shell.dataset && shell.dataset.hmbPromptLibraryInitialSizeApplied === "1") return;
   try {
-    const rect = shell.getBoundingClientRect ? shell.getBoundingClientRect() : null;
-    const currentWidth = rect && rect.width ? rect.width : 0;
-    const currentHeight = rect && rect.height ? rect.height : 0;
-    // Apply the final required startup size before the widget HTML is mounted.
-    // The earlier threshold-based check allowed intermediate engine sizes (for
-    // example 1040px) to render first and expand on the next animation frame,
-    // which caused the lower edge to visibly jump once during opening.
-    const needsWidth = !currentWidth || currentWidth < HMB_DEFAULT_NODE_WIDTH - 1;
-    const needsHeight = !currentHeight || currentHeight < HMB_DEFAULT_NODE_HEIGHT - 1;
-    if (needsWidth) shell.style.width = `${HMB_DEFAULT_NODE_WIDTH}px`;
-    if (needsHeight) shell.style.height = `${HMB_DEFAULT_NODE_HEIGHT}px`;
+    // Normalize each newly mounted workflow shell before rendering, including
+    // saved legacy nodes hydrated into managers later. Use CSS pixels directly:
+    // getBoundingClientRect includes canvas zoom and is not a node size.
+    // The shell-owned one-shot marker keeps later edits, tab changes and resize
+    // observer updates from restoring this startup size during the session.
+    const manager = Boolean(state?.multi_shot_enabled);
+    const width = `${HMB_DEFAULT_NODE_WIDTH}px`;
+    const height = `${HMB_MANAGER_DEFAULT_NODE_HEIGHT}px`;
+    const needsWidth = shell.style.width !== width;
+    const needsHeight = shell.style.height !== height;
+    if (needsWidth) shell.style.width = width;
+    if (needsHeight) shell.style.height = height;
     shell.style.minWidth = `${HMB_MIN_NODE_WIDTH}px`;
-    shell.style.minHeight = `${HMB_MIN_NODE_HEIGHT}px`;
+    shell.style.minHeight = `${manager ? 240 : HMB_MIN_NODE_HEIGHT}px`;
     shell.style.maxHeight = "none";
     shell.style.overflow = "visible";
     shell.style.boxSizing = "border-box";
@@ -6349,6 +6515,9 @@ function hmbLocalHostAncestors(container) {
 }
 
 function hmbPromptInnerRequiredHeight(container, state) {
+  const manager = Boolean(state?.multi_shot_enabled);
+  const editorVisible = !manager || (hmbPromptVerifiedShotCatalog(state).length > 0 && state.ui?.shot_editor_expanded !== false);
+  if (!editorVisible) return 80 + Math.max(1, hmbPromptVerifiedShotCatalog(state).length) * 50;
   let groupTotal = 0;
   HMB_GROUP_KEYS.forEach((key) => {
     const minHeight = HMB_GROUP_MIN_HEIGHTS[key] || 120;
@@ -6367,13 +6536,54 @@ function hmbPromptInnerRequiredHeight(container, state) {
     const centerPadding = centerStyle ? (parseFloat(centerStyle.paddingTop) || 0) + (parseFloat(centerStyle.paddingBottom) || 0) : 16;
     const layoutPadding = layoutStyle ? (parseFloat(layoutStyle.paddingTop) || 0) + (parseFloat(layoutStyle.paddingBottom) || 0) : 16;
     const topbarHeight = topbar ? Number(topbar.offsetHeight || 68) : 68;
-    chrome = topbarHeight + layoutPadding + centerPadding + gap * Math.max(0, HMB_GROUP_KEYS.length - 1) + 8;
+    const shotsHeight = state?.multi_shot_enabled ? Math.max(1, hmbPromptVerifiedShotCatalog(state).length) * 50 + 2 : 0;
+    chrome = topbarHeight + shotsHeight + layoutPadding + centerPadding + gap * Math.max(0, HMB_GROUP_KEYS.length - 1) + 8;
   } catch (_e) {}
   return Math.max(HMB_DEFAULT_NODE_HEIGHT, Math.round(groupTotal + chrome));
 }
 
-function hmbApplyDashboardHostSizing(container, state) {
+function hmbPromptUsesFluidLayout(container, state) {
+  // Legacy hydration can precede manager state. A normalized startup shell
+  // still needs a bounded editor; presentation never changes authored mode.
+  return Boolean(state?.multi_shot_enabled || container?.__hmbPromptLibraryFixedStartupSize);
+}
+
+function hmbMeasurePromptHostHeights(container) {
+  const ancestors = hmbLocalHostAncestors(container);
+  const geometry = hmbReadPromptHostGeometry(container);
+  const heights = new Map([container, ...ancestors].map(element => (
+    [element, hmbPromptAvailableHeightFromGeometry(element, geometry)]
+  )));
+  return {ancestors, heights};
+}
+
+function hmbApplyDashboardHostSizing(container, state, measuredHosts = null) {
   if (!container || !container.style) return 0;
+  if (hmbPromptUsesFluidLayout(container, state)) {
+    // Read the shared node geometry and every local host before writing any
+    // height. Interleaving a parent write with the next parent's rect read
+    // otherwise forces a full layout of the 50-row editor per wrapper.
+    const {ancestors, heights} = measuredHosts || hmbMeasurePromptHostHeights(container);
+    const available = heights.get(container);
+    const assign = (element, values) => {
+      if (!element?.style) return;
+      for (const [key, value] of Object.entries(values)) if (element.style[key] !== value) element.style[key] = value;
+    };
+    // Serialized widget ui_options may retain an older fixed-height SDK
+    // wrapper. Resize only this widget's local host chain, never the node or
+    // canvas, so it cannot clip the bounded editor after a workflow restore.
+    for (const ancestor of ancestors) {
+      const ancestorHeight = heights.get(ancestor);
+      assign(ancestor,{height:`${ancestorHeight}px`,minHeight:"0",maxHeight:`${ancestorHeight}px`,overflow:"hidden",boxSizing:"border-box"});
+    }
+    assign(container, {width:"100%",minWidth:"0",maxWidth:"100%",height:`${available}px`,minHeight:"0",maxHeight:`${available}px`,overflow:"hidden",boxSizing:"border-box"});
+    container.classList?.add("nodrag");
+    container.classList?.remove("nowheel");
+    for (const element of [container.querySelector?.(".hmb-dashboard-clip"),container.querySelector?.(".hmb-dashboard")]) {
+      assign(element,{width:"100%",height:"100%",minWidth:"0",minHeight:"0",maxWidth:"100%",maxHeight:"100%",overflow:"hidden",boxSizing:"border-box"});
+    }
+    return available;
+  }
   const required = hmbPromptInnerRequiredHeight(container, state);
   const applyMinimum = (element) => {
     if (!element || !element.style) return;
@@ -6417,6 +6627,36 @@ function hmbApplyDashboardHostSizing(container, state) {
   return required;
 }
 
+function hmbReadPromptHostGeometry(container) {
+  const shell = hmbFindSafeReactFlowNode(container);
+  if (shell) {
+    try {
+      const scale = hmbElementVisualScaleY(shell) || 1;
+      const shellRect = shell.getBoundingClientRect();
+      const shellHeight = Number(shell.clientHeight) || shellRect.height / Math.max(.05,scale);
+      const style = window.getComputedStyle(shell);
+      const bottom = 8+(parseFloat(style.paddingBottom)||0)+(parseFloat(style.borderBottomWidth)||0);
+      return {shellRect, scale, shellHeight, bottom};
+    } catch (_error) {}
+  }
+  return null;
+}
+
+function hmbPromptAvailableHeightFromGeometry(container, geometry) {
+  if (geometry) {
+    try {
+      const ownRect = container.getBoundingClientRect();
+      const top = Math.max(0,(ownRect.top-geometry.shellRect.top)/Math.max(.05,geometry.scale));
+      return Math.max(120,Math.floor(geometry.shellHeight-top-geometry.bottom));
+    } catch (_error) {}
+  }
+  return Math.max(120,Number(container?.parentElement?.clientHeight)||Number(container?.clientHeight)||HMB_DEFAULT_NODE_HEIGHT);
+}
+
+export function hmbPromptResponsiveAvailableHeight(container) {
+  return hmbPromptAvailableHeightFromGeometry(container, hmbReadPromptHostGeometry(container));
+}
+
 function hmbInstallFluidLayoutSync(container, getState) {
   let observer = null;
   let frame = 0;
@@ -6446,6 +6686,7 @@ function hmbInstallFluidLayoutSync(container, getState) {
     if (typeof ResizeObserver !== "undefined") {
       observer = new ResizeObserver(apply);
       observer.observe(container);
+      hmbLocalHostAncestors(container).forEach(ancestor => observer.observe(ancestor));
       const shell = hmbFindSafeReactFlowNode(container);
       if (shell) observer.observe(shell);
     }
@@ -6509,7 +6750,10 @@ function hmbStoreGroupHeight(container, key, value) {
   const height = Math.max(minHeight, Math.min(HMB_GROUP_MAX_HEIGHT, Math.round(Number(value) || minHeight)));
   const memory = hmbGroupHeightMemory(container);
   memory[key] = height;
-  try { container.dataset[hmbGroupDatasetKey(key)] = String(height); } catch (_e) {}
+  try {
+    const name = hmbGroupDatasetKey(key), value = String(height);
+    if (container.dataset[name] !== value) container.dataset[name] = value;
+  } catch (_e) {}
 }
 
 function hmbReadStoredGroupHeight(container, key) {
@@ -6664,10 +6908,8 @@ function hmbApplyExactGroupFlex(card, height) {
   const minHeight = HMB_GROUP_MIN_HEIGHTS[groupId] || 120;
   const finalHeight = Math.max(minHeight, Math.min(HMB_GROUP_MAX_HEIGHT, Math.round(Number(height) || minHeight)));
   try {
-    card.style.flex = `0 0 ${finalHeight}px`;
-    card.style.flexBasis = `${finalHeight}px`;
-    card.style.minHeight = `${minHeight}px`;
-    card.style.height = "";
+    const values = {flex:`0 0 ${finalHeight}px`,flexBasis:`${finalHeight}px`,minHeight:`${minHeight}px`,height:""};
+    for (const [key, value] of Object.entries(values)) if (card.style[key] !== value) card.style[key] = value;
   } catch (_e) {}
 }
 
@@ -6685,14 +6927,14 @@ function hmbNodeShellHeight(shell) {
   return 0;
 }
 
-function hmbApplyOuterNodeHeight(container, height) {
+function hmbApplyOuterNodeHeight(container, height, minimumHeight = HMB_MIN_NODE_HEIGHT) {
   const shell = hmbFindSafeReactFlowNode(container);
   if (!shell || !shell.style) return null;
-  const nextHeight = Math.max(HMB_MIN_NODE_HEIGHT, Math.min(6000, Math.round(Number(height) || HMB_DEFAULT_NODE_HEIGHT)));
+  const nextHeight = Math.max(minimumHeight, Math.min(6000, Math.round(Number(height) || HMB_DEFAULT_NODE_HEIGHT)));
   const previousHeight = hmbNodeShellHeight(shell);
   try {
     shell.style.height = `${nextHeight}px`;
-    shell.style.minHeight = `${HMB_MIN_NODE_HEIGHT}px`;
+    shell.style.minHeight = `${minimumHeight}px`;
     shell.style.maxHeight = "none";
     shell.style.overflow = "visible";
     shell.style.boxSizing = "border-box";
@@ -6717,7 +6959,7 @@ function hmbRequiredOuterNodeHeight(container, state) {
     const style = shell && window.getComputedStyle ? window.getComputedStyle(shell) : null;
     if (style) bottomInset += (parseFloat(style.paddingBottom) || 0) + (parseFloat(style.borderBottomWidth) || 0);
   } catch (_e) {}
-  return Math.max(HMB_MIN_NODE_HEIGHT, Math.ceil(topOffset + innerRequired + bottomInset));
+  return Math.max(state?.multi_shot_enabled ? 80 : HMB_MIN_NODE_HEIGHT, Math.ceil(topOffset + innerRequired + bottomInset));
 }
 
 function hmbDominoContainerDelta(startSize, startRequiredSize, requiredDelta) {
@@ -6760,6 +7002,7 @@ function hmbApplyDominoGroupFrame(container, state, card, groupId, nextHeight, r
   hmbStoreGroupHeight(container, groupId, height);
   hmbApplyExactGroupFlex(card, height);
   hmbApplyDashboardHostSizing(container, state);
+  if (hmbPromptUsesFluidLayout(container,state)) return {groupHeight:height,nodeHeight:hmbNodeShellHeight(hmbFindSafeReactFlowNode(container)),requiredHeight:hmbPromptResponsiveAvailableHeight(container)};
 
   const nextRequiredHeight = hmbRequiredOuterNodeHeight(container, state);
   const nextNodeHeight = hmbDominoOuterHeight(
@@ -6777,6 +7020,7 @@ function hmbApplyDominoGroupFrame(container, state, card, groupId, nextHeight, r
 
 function hmbEnsureOuterNodeFitsGroups(container, state, allowShrink, sizingAlreadyApplied = false) {
   if (!container || !state || hmbIsGroupResizeDragging(container)) return;
+  if (hmbPromptUsesFluidLayout(container,state)) { if (!sizingAlreadyApplied) hmbApplyDashboardHostSizing(container,state); return; }
   if (container.__hmbEnsuringOuterHeight) return;
   const shell = hmbFindSafeReactFlowNode(container);
   if (!shell) return;
@@ -6788,7 +7032,7 @@ function hmbEnsureOuterNodeFitsGroups(container, state, allowShrink, sizingAlrea
   if (Math.abs(next - current) <= 1) return;
   try {
     container.__hmbEnsuringOuterHeight = true;
-    hmbApplyOuterNodeHeight(container, next);
+    hmbApplyOuterNodeHeight(container, next, state?.multi_shot_enabled ? 80 : HMB_MIN_NODE_HEIGHT);
     try { shell.style.minHeight = `${required}px`; } catch (_e) {}
   } finally {
     hmbPromptLifecycleFrame(container, () => {
@@ -6797,11 +7041,11 @@ function hmbEnsureOuterNodeFitsGroups(container, state, allowShrink, sizingAlrea
   }
 }
 
-function hmbFitGroupHeightsToCenter(container, state) {
+function hmbFitGroupHeightsToCenter(container, state, measuredHosts = null) {
   if (!container || !state || hmbIsGroupResizeDragging(container)) return;
   state.ui = normalizeUi(state.ui);
   const center = container.querySelector ? container.querySelector(".center") : null;
-  if (center && center.style) center.style.overflowY = "hidden";
+  if (center && center.style) center.style.overflowY = hmbPromptUsesFluidLayout(container,state) ? "auto" : "hidden";
   HMB_GROUP_KEYS.forEach((key) => {
     const minHeight = HMB_GROUP_MIN_HEIGHTS[key] || 120;
     const stored = Number(state.ui.group_heights[key]);
@@ -6812,8 +7056,8 @@ function hmbFitGroupHeightsToCenter(container, state) {
     const card = container.querySelector(`.group-card[data-group-id="${key}"]`);
     if (card) hmbApplyExactGroupFlex(card, value);
   });
-  hmbApplyDashboardHostSizing(container, state);
-  hmbEnsureOuterNodeFitsGroups(container, state, false, true);
+  hmbApplyDashboardHostSizing(container, state, measuredHosts);
+  hmbEnsureOuterNodeFitsGroups(container, state, Boolean(state.multi_shot_enabled && state.ui.shot_editor_expanded === false), true);
 }
 
 function hmbApplyStoredGroupHeightsToDom(container, state) {
@@ -6955,7 +7199,7 @@ function hmbInstallGroupResizers(container, state, props, listeners) {
         state.ui = normalizeUi(state.ui);
         state.ui.group_heights[groupId] = lastHeight;
         hmbStoreGroupHeight(container, groupId, lastHeight);
-        hmbApplyOuterNodeHeight(container, lastNodeHeight);
+        if (!hmbPromptUsesFluidLayout(container,state)) hmbApplyOuterNodeHeight(container, lastNodeHeight);
 
         hmbCaptureUiBeforeStateEmit(container, state);
         emit(props, state, container);
@@ -7162,7 +7406,7 @@ function hmbInstallKeepOutResizers(container, state, props, listeners) {
         state.ui.textarea_heights[key] = lastTextareaHeight;
         state.ui.group_heights[groupId] = lastGroupHeight;
         hmbStoreGroupHeight(container, groupId, lastGroupHeight);
-        hmbApplyOuterNodeHeight(container, lastNodeHeight);
+        if (!hmbPromptUsesFluidLayout(container,state)) hmbApplyOuterNodeHeight(container, lastNodeHeight);
 
         hmbCaptureUiBeforeStateEmit(container, state);
         emit(props, state, container);
@@ -7434,6 +7678,10 @@ export function hmbPatchPromptSourceSection(currentSection, nextSection) {
       if (contentChanged) {
         if (preserveActiveEditor) {
           hmbPatchPromptElementTree(row, nextRow, row.ownerDocument.activeElement);
+        } else if (typeof row.replaceChildren === "function") {
+          // Staging already parsed these exact children. Move them once into
+          // the retained row instead of serializing and parsing them again.
+          row.replaceChildren(...Array.from(nextRow.childNodes));
         } else row.innerHTML = nextRow.innerHTML;
       }
     }
@@ -7456,6 +7704,51 @@ export function hmbPatchPromptSourceSection(currentSection, nextSection) {
   const currentResize = currentSection.querySelector?.("[data-resize-group]");
   const nextResize = nextSection.querySelector?.("[data-resize-group]");
   if (currentResize && nextResize) hmbCopyPromptElementAttributes(currentResize, nextResize);
+  return true;
+}
+
+function hmbPatchPromptShotSections(currentList, nextList, keepExistingEditor = false) {
+  if (!currentList || !nextList) return false;
+  const sections = new Map(Array.from(currentList.children).filter((node) => node.matches?.(".prompt-shot-section"))
+    .map((node) => [node.getAttribute("data-shot-uuid"), node]));
+  let currentEditor = currentList.querySelector(".prompt-shot-content");
+  const requestedEditor = nextList.querySelector('.prompt-shot-row[aria-expanded="true"]')?.getAttribute("data-prompt-shot");
+  if (currentEditor && currentEditor.getAttribute("data-shot-editor") !== requestedEditor) {
+    currentEditor.remove();
+    currentEditor = null;
+  }
+  let retainedEditor = null;
+  const retained = new Set();
+  let previousSection = null;
+  for (const nextSection of Array.from(nextList.children)) {
+    const uuid = nextSection.getAttribute("data-shot-uuid");
+    let section = sections.get(uuid);
+    if (!section) section = nextSection;
+    else {
+      const header = section.querySelector(".prompt-shot-row");
+      const nextHeader = nextSection.querySelector(".prompt-shot-row");
+      if (header && nextHeader) {
+        hmbCopyPromptElementAttributes(header, nextHeader);
+        if (header.innerHTML !== nextHeader.innerHTML) header.innerHTML = nextHeader.innerHTML;
+      }
+    }
+    retained.add(section);
+    const header = nextSection.querySelector(".prompt-shot-row");
+    const nextEditor = nextSection.querySelector(".prompt-shot-content");
+    if (nextEditor || (keepExistingEditor && header?.getAttribute("aria-expanded") === "true")) {
+      retainedEditor = currentEditor || nextEditor;
+      if (retainedEditor) {
+        if (nextEditor && nextEditor !== retainedEditor) nextEditor.remove();
+        retainedEditor.setAttribute("data-shot-editor", uuid);
+        if (retainedEditor.parentElement !== section) section.appendChild(retainedEditor);
+      }
+    }
+    const expectedPosition = retained.size === 1 ? currentList.firstElementChild : previousSection.nextElementSibling;
+    if (section !== expectedPosition) currentList.insertBefore(section, expectedPosition || null);
+    previousSection = section;
+  }
+  if (currentEditor && currentEditor !== retainedEditor) currentEditor.remove();
+  for (const old of Array.from(currentList.children)) if (!retained.has(old)) old.remove();
   return true;
 }
 
@@ -7512,16 +7805,28 @@ export function hmbPatchPromptDashboard(container, markup) {
       // The Shot dropdown remains open across an unrelated topbar repaint.
     } else currentTopbar.innerHTML = nextTopbar.innerHTML;
   }
+  // Capture the staged sections before Shot reconciliation retains the live
+  // editor and detaches its staged counterpart. Otherwise the subsequent query
+  // sees no new groups and drops authoritative Asset/Picker row changes.
+  const nextSections = Array.from(nextRoot.querySelectorAll?.("[data-group-id]") || []);
+  const currentShots = currentRoot.querySelector?.(".prompt-shot-list");
+  const nextShots = nextRoot.querySelector?.(".prompt-shot-list");
+  if (currentShots && nextShots) hmbPatchPromptShotSections(currentShots, nextShots);
+  else if (!currentShots && nextShots) currentTopbar?.after?.(nextShots);
+  else if (currentShots && !nextShots) currentShots.remove?.();
 
   const currentSections = new Map(
     Array.from(currentRoot.querySelectorAll?.("[data-group-id]") || []).map((section) => (
       [section.getAttribute("data-group-id"), section]
     )),
   );
-  for (const nextSection of Array.from(nextRoot.querySelectorAll?.("[data-group-id]") || [])) {
+  for (const nextSection of nextSections) {
     const groupId = nextSection.getAttribute("data-group-id");
     const currentSection = currentSections.get(groupId);
-    if (!currentSection) continue;
+    // Switching UUID installs the already-staged editor itself. Its sections
+    // are now the live sections; patching a node against itself would walk
+    // every new source row and form control without changing a single value.
+    if (!currentSection || currentSection === nextSection) continue;
     if (["imageSources", "videoSources"].includes(groupId)) {
       hmbPatchPromptSourceSection(currentSection, nextSection);
     } else if (currentSection.innerHTML !== nextSection.innerHTML) {
@@ -7638,11 +7943,12 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
   hmbRememberPromptRevisionState(container, state, state.disabled, false);
   state.ui = state.ui && typeof state.ui === "object" ? state.ui : defaultUi();
   const listeners = [];
-  hmbApplyInitialNodeSizeOnce(container);
+  hmbApplyInitialNodeSizeOnce(container, state);
   const stopFluidSync = hmbInstallFluidLayoutSync(container, () => state);
   hmbApplyDashboardHostSizing(container, state);
   let discoveryRequested = false;
   let renderRevision = 0;
+  let identicalPropsEcho = null;
   const remount = (nextState = null, stateIsNormalized = false) => {
     const ownRenderRevision = ++renderRevision;
     if (nextState && typeof nextState === "object") {
@@ -7650,6 +7956,11 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
       hmbReconcilePromptSourceIdentities(state, normalizedNextState);
       state = normalizedNextState;
     }
+    // The bounded host depends on its outer SDK shell, not on the source rows
+    // being patched. Measure it before mutating those rows and consume this
+    // snapshot only in this synchronous paint; resize callbacks read afresh.
+    const measuredHosts = hmbPromptUsesFluidLayout(container, state)
+      ? hmbMeasurePromptHostHeights(container) : null;
     hmbClearActivePromptResize(container);
     try { container.__hmbFrameRangeDragCleanup?.(); } catch (_e) {}
     const preserveActiveText = Boolean(
@@ -7661,9 +7972,11 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
       hmbRememberPromptDirtyTextControl(container, activeText, state);
     }
     const compositionWasActive = Boolean(container.__hmbPromptLibraryCompositionActive);
-    hmbCaptureTextEditingState(container);
-    hmbCapturePromptControlFocus(container);
-    hmbCaptureUiBeforeStateEmit(container, state);
+    if (!container.__hmbPromptShotSwitchInProgress) {
+      hmbCaptureTextEditingState(container);
+      hmbCapturePromptControlFocus(container);
+      hmbCaptureUiBeforeStateEmit(container, state);
+    }
     for (const [el, event, handler, options] of listeners.splice(0)) {
       try { el.removeEventListener(event, handler, options); } catch (_e) {}
     }
@@ -7688,7 +8001,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
       && (!activeText || !container.contains?.(activeText))
     ) hmbReleasePromptCompositionLatch(container);
     hmbSyncAllSourceRowActivation(container);
-    hmbFitGroupHeightsToCenter(container, state);
+    hmbFitGroupHeightsToCenter(container, state, measuredHosts);
     hmbInstallPromptInteractionIsolation(container, listeners);
     hmbInstallSourceScrollPositionLock(container, listeners);
     hmbInstallGroupResizers(container, state, props, listeners);
@@ -7698,6 +8011,12 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
     hmbRestorePromptControlFocus(container);
     hmbRestoreTextEditingStateDeferred(container);
     const clearTextFocusOnPointerDown = (event) => {
+      if (event?.target?.closest?.("[data-prompt-shot]")) {
+        hmbCaptureTextEditingState(container);
+        container.__hmbPromptShotPointerFocus = container.__hmbPromptLibraryTextFocus;
+        return;
+      }
+      delete container.__hmbPromptShotPointerFocus;
       hmbRememberPromptTextPointerTarget(container, event);
       if (!hmbIsEditableTextControl(event && event.target)) hmbClearTextEditingState(container);
     };
@@ -7747,7 +8066,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
     scheduleLifecycleFrame(() => {
       if (ownRenderRevision !== renderRevision) return;
       hmbApplyStoredGroupHeightsToDom(container, state);
-      hmbEnsureOuterNodeFitsGroups(container, state, false);
+      hmbEnsureOuterNodeFitsGroups(container, state, false, hmbPromptUsesFluidLayout(container, state));
       hmbRestoreSourceScroll(container);
       hmbRestorePromptControlFocus(container);
       hmbRestoreTextEditingState(container);
@@ -8177,6 +8496,46 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
       listeners.push([button, "click", handler]);
     });
 
+    if (state.multi_shot_enabled) {
+      const handler = (event) => {
+        const button = event.target?.closest?.("[data-prompt-shot]");
+        if (!button || !container.contains(button) || state.disabled || button.disabled) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const nextUuid = clean(button.getAttribute("data-prompt-shot"));
+        const sameShot = nextUuid === state.shot?.shot_uuid;
+        if (sameShot) return;
+        hmbCaptureUiBeforeStateEmit(container, state);
+        const pointerTextFocus = container.__hmbPromptShotPointerFocus;
+        delete container.__hmbPromptShotPointerFocus;
+        hmbCaptureSourceScroll(container);
+        const memories = container.__hmbPromptShotInteractionStates || new Map();
+        memories.set(hmbPromptDocumentKey(state.shot), {
+          text: pointerTextFocus || container.__hmbPromptLibraryTextFocus,
+          scroll: { ...(container.__hmbPromptLibraryScrollMemory || {}) },
+        });
+        container.__hmbPromptShotInteractionStates = memories;
+        if (!sameShot && !hmbSwitchPromptShot(state, nextUuid)) return;
+        state.ui.shot_editor_expanded = true;
+        hmbClearImmediateStateCommit(container);
+        hmbReleasePromptCompositionLatch(container);
+        hmbClearPromptDirtyText(container);
+        const memory = memories.get(hmbPromptDocumentKey(state.shot));
+        container.__hmbPromptLibraryTextFocus = memory?.text || null;
+        container.__hmbPromptLibraryControlFocus = null;
+        container.__hmbPromptLibraryScrollMemory = memory?.scroll || { imageSources: 0, videoSources: 0 };
+        HMB_GROUP_KEYS.forEach((key) => hmbStoreGroupHeight(container, key, state.ui?.group_heights?.[key] || HMB_GROUP_START_HEIGHTS[key]));
+        container.__hmbPromptShotSwitchInProgress = true;
+        try {
+          hmbCommitLocalPromptStructure(container, props, state, remount);
+          hmbEnsureOuterNodeFitsGroups(container, state, true, hmbPromptUsesFluidLayout(container, state));
+        }
+        finally { container.__hmbPromptShotSwitchInProgress = false; }
+      };
+      container.addEventListener("click", handler, true);
+      listeners.push([container, "click", handler, true]);
+    }
+
     const shotSelector = container.querySelector("[data-shot-selector]");
     if (shotSelector) {
       const handler = () => {
@@ -8260,7 +8619,8 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
   };
   remount();
   const applyPropsNow = (nextProps = {}) => {
-    if (hmbConsumePendingPromptStateEcho(container, nextProps || {}, state)) {
+    const parsedIncoming = {};
+    if (hmbConsumePendingPromptStateEcho(container, nextProps || {}, state, parsedIncoming)) {
       // Do not replace the live callbacks/state with an older retained-mode
       // payload. Exact current echoes may refresh host callbacks, while stale
       // lower-revision echoes are acknowledgements only.
@@ -8271,7 +8631,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
       }
       state.disabled = Boolean(nextProps?.disabled);
       hmbRememberPromptRevisionState(container, state, state.disabled, false);
-      container.querySelector?.(".hmb-dashboard")?.classList?.toggle("disabled", state.disabled);
+      hmbApplyPromptDisabledFeedback(container, state.disabled);
       return;
     }
     const revisionMergedState = hmbTakePromptRevisionMerge(container);
@@ -8297,7 +8657,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
     }
     let nextState = hmbMergeStoredGroupHeights(
       container,
-      revisionMergedState || parseValue(nextProps?.value),
+      revisionMergedState || parsedIncoming.state || parseValue(nextProps?.value),
     );
     if (dirtyText.length) {
       nextState = hmbMergePromptDirtyTextState(nextState, dirtyText);
@@ -8312,10 +8672,12 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
     const normalizedCurrentState = normalizeState(state);
     const normalizedNextState = nextState;
     const currentValue = JSON.stringify(normalizedCurrentState);
-    const nextValue = JSON.stringify(normalizedNextState);
+    const { disabled: _nextDisabled, ...canonicalNextState } = normalizedNextState;
+    const nextValue = JSON.stringify(canonicalNextState);
     const disabledChanged = Boolean(state.disabled) !== Boolean(nextState.disabled);
     const shotRegionOnly = Boolean(
       !disabledChanged
+      && (!state.multi_shot_enabled || hmbPromptDocumentKey(state.shot) === hmbPromptDocumentKey(nextState.shot))
       && hmbPromptNonShotNormalizedFingerprint(normalizedCurrentState)
         === hmbPromptNonShotNormalizedFingerprint(normalizedNextState)
     );
@@ -8323,6 +8685,11 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
     if (currentValue === nextValue && !disabledChanged) {
       if (dirtyText.length || shouldRepublishRevisionMerge) {
         hmbScheduleImmediateStateCommit(container, props, state);
+      } else if (typeof nextProps?.value === "string") {
+        // Repeated retained-mode status echoes are identical bytes. Cache only
+        // after canonical equality; revisions and pending edits guard reuse.
+        identicalPropsEcho = {value:nextProps.value,disabled:state.disabled,renderRevision,
+          uiRevision:state[UI_EDIT_REVISION_KEY],sourceRevision:state.source_sync_revision};
       }
       return;
     }
@@ -8346,10 +8713,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
     hmbRememberPromptRevisionState(container, state, state.disabled, false);
     if (shotRegionOnly) {
       hmbApplyPromptShotFeedback(container, state);
-      container.querySelector?.(".hmb-dashboard")?.classList?.toggle(
-        "disabled",
-        state.disabled,
-      );
+      hmbApplyPromptDisabledFeedback(container, state.disabled);
       try { container.__hmbPromptLastPaintedValue = JSON.stringify(state); } catch (_e) {}
     } else {
       remount(null, !hadUncommittedText);
@@ -8359,6 +8723,23 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
     }
   };
   const applyProps = (nextProps = {}) => {
+    if (identicalPropsEcho && typeof nextProps.value === "string"
+      && nextProps.value === identicalPropsEcho.value
+      && Boolean(nextProps.disabled) === identicalPropsEcho.disabled
+      && renderRevision === identicalPropsEcho.renderRevision
+      && state[UI_EDIT_REVISION_KEY] === identicalPropsEcho.uiRevision
+      && state.source_sync_revision === identicalPropsEcho.sourceRevision
+      && !container.__hmbPromptLibraryCommitPending
+      && !container.__hmbPromptLibraryCompositionActive
+      && !(container.__hmbPromptLibraryDirtyText instanceof Map)
+      && !container.__hmbPromptLibraryInteractionCommit
+      && !container.__hmbPromptLibrarySourcePropsApply
+      && !container.__hmbPromptPendingRevisionMerge
+      && !(container.__hmbPromptPendingLocalValues?.length)) {
+      props = nextProps;
+      return;
+    }
+    identicalPropsEcho = null;
     if (hmbShouldDeferPromptSourceProps(container, nextProps, state)) {
       hmbSchedulePromptSourcePropsApply(container, nextProps, applyPropsNow);
       return;
@@ -8372,6 +8753,8 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
   );
   const cleanup = () => {
     disposeLifecycle();
+    delete container.__hmbPromptShotPointerFocus;
+    delete container.__hmbPromptShotInteractionStates;
     stopExternalCommitBoundary();
     hmbInvalidatePromptPublication(container);
     try { hmbClearActivePromptResize(container); } catch (_e) {}

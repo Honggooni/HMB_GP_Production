@@ -108,7 +108,7 @@ def main() -> None:
     node._hmb_native_prompt_read_active = True
     with patch.object(agent._BaseAgent, "get_parameter_list_value", return_value=caller_rules, create=True), patch.object(
         agent._BaseAgent, "get_parameter_value", lambda _self, name: native_values.get(name), create=True
-    ), patch.object(agent._BaseAgent, "_process", lambda _self, native, text: (native, text), create=True):
+    ), patch.object(agent._BaseAgent, "_process", lambda _self, native, text, *args: (native, text, args), create=True):
         combined = node.get_parameter_list_value("rulesets")
         assert combined == caller_rules + [
             {"name": node._hmb_ruleset_names[0], "rules": projects},
@@ -118,11 +118,19 @@ def main() -> None:
         assert combined is not caller_rules
         if agent._BuiltinAgent is not None:
             native_module = sys.modules[agent._BuiltinAgent.__module__]
-            native_rules = native_module.build_rulesets_from_configs(
-                [native_module.ruleset_to_config(item) for item in combined]
-            )
-            assert [native_module.ruleset_to_config(item) for item in native_rules] == combined
-            assert [rule.value for ruleset in native_rules[1:] for rule in ruleset.rules] == projects + shots
+            if hasattr(native_module, "rulesets_from_inputs"):
+                # Current Standard/PydanticAI consumes normalized dictionary
+                # rulesets. Verify the exact native normalizer and all eight
+                # full rules rather than a retired Griptape-object adapter.
+                native_rules = native_module.rulesets_from_inputs(combined)
+                assert native_rules == combined
+                assert [rule for ruleset in native_rules[1:] for rule in ruleset["rules"]] == projects + shots
+            else:
+                native_rules = native_module.build_rulesets_from_configs(
+                    [native_module.ruleset_to_config(item) for item in combined]
+                )
+                assert [native_module.ruleset_to_config(item) for item in native_rules] == combined
+                assert [rule.value for ruleset in native_rules[1:] for rule in ruleset.rules] == projects + shots
         assert node.get_parameter_value("prompt") == node._hmb_runtime_prompt
         for name in ("additional_context", "output_schema", "model"):
             assert node.get_parameter_value(name) is native_values[name]
@@ -134,8 +142,10 @@ def main() -> None:
         context_json = enriched.split("HMB ADDITIONAL CONTEXT DATA (JSON):\n", 1)[1].splitlines()[0]
         assert json.loads(context_json) == native_values["additional_context"]
         native_sentinel = object()
-        returned, model_input = node._process(native_sentinel, enriched)
+        native_output_type = object()
+        returned, model_input, forwarded = node._process(native_sentinel, enriched, native_output_type)
         assert returned is native_sentinel
+        assert forwarded == (native_output_type,)
         assert model_input == agent._with_english_agent_output_contract(enriched)
         assert enriched in model_input
         node._hmb_native_prompt_read_active = False

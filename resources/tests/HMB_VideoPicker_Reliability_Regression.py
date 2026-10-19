@@ -706,17 +706,27 @@ prompt_manifest = next(item for item in manifest["nodes"] if item["class_name"] 
 assert picker_manifest["metadata"]["width"] == 1400
 assert prompt_manifest["metadata"]["width"] == 1800
 assert picker_manifest["metadata"]["height"] == 360
-assert prompt_manifest["metadata"]["height"] == 1193
+assert prompt_manifest["metadata"]["height"] == 1350
 for prompt_height_key in (
-    "height", "default_height", "initial_height", "min_height",
+    "height", "default_height", "initial_height",
 ):
-    assert prompt_manifest["metadata"][prompt_height_key] == 1193
+    assert prompt_manifest["metadata"][prompt_height_key] == 1350
+assert prompt_manifest["metadata"]["min_height"] == 1193
 for prompt_height_key in (
-    "height", "default_height", "preferred_height", "initial_height", "min_height",
+    "height", "default_height", "preferred_height", "initial_height",
 ):
-    assert prompt_manifest["metadata"]["ui_options"][prompt_height_key] == 1193
+    assert prompt_manifest["metadata"]["ui_options"][prompt_height_key] == 1350
+assert prompt_manifest["metadata"]["ui_options"]["min_height"] == 1193
 assert prompt.PROMPT_NATIVE_ASSET_INPUT_ROW_HEIGHT == 0
-assert prompt.PROMPT_START_HEIGHT == prompt.PROMPT_MIN_HEIGHT == 1193
+assert prompt.PROMPT_START_HEIGHT == 1350
+assert prompt.PROMPT_MIN_HEIGHT == 1193
+finish_manifest = next(item for item in manifest["nodes"] if item["class_name"] == "HMBFinishLookLibrary")
+for finish_options in (finish_manifest["metadata"], finish_manifest["metadata"]["ui_options"]):
+    for height_key in ("height", "default_height", "preferred_height", "initial_height"):
+        assert finish_options[height_key] == 1091
+    assert finish_options["min_height"] == 620
+for size_key in ("node_size", "default_size", "initial_size"):
+    assert finish_manifest["metadata"]["ui_options"][size_key] == {"width": 980, "height": 1091}
 assert picker_manifest["metadata"]["ui_options"]["initial_width"] == 1400
 assert picker_manifest["metadata"]["ui_options"]["initial_height"] == 360
 assert picker_manifest["metadata"]["ui_options"]["min_height"] == 360
@@ -1835,10 +1845,12 @@ with tempfile.TemporaryDirectory() as temp_dir:
                          "original_material_override_profile": (
                              picker.ORIGINAL_MATERIAL_OVERRIDE_PROFILE
                          ),
-                         "original_material_pass_source": "AIPicker_SET",
+                         "original_material_pass_source": "AIPicker_SET|AIPickerM_SET",
+                         "original_material_pass_sources": ["AIPicker_SET", "AIPickerM_SET"],
                          "original_material_override_report": {
                              "profile": picker.ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
-                             "material_pass_source": "AIPicker_SET",
+                             "material_pass_source": "AIPicker_SET|AIPickerM_SET",
+                             "material_pass_sources": ["AIPicker_SET", "AIPickerM_SET"],
                              "material_pass_shape_count": 0,
                              "requested": True,
                              "status": "restored",
