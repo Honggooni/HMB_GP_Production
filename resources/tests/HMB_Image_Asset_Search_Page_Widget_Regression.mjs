@@ -146,10 +146,11 @@ try{
   await page.evaluate(()=>{window.wc.cleanup();window.bc.cleanup();});
   for(const mode of ['throw','reject','timeout','rejected-result']){
     await page.goto(`http://127.0.0.1:${server.address().port}`);await page.waitForFunction(()=>window.ready);
-    if(mode==='timeout')await page.evaluate(()=>{const native=window.setTimeout;window.setTimeout=(fn,ms,...args)=>native(fn,ms===15000?40:ms,...args);});
+    if(mode==='timeout')await page.evaluate(()=>{const native=window.setTimeout;window.restoreFixtureTimeout=()=>{window.setTimeout=native;delete window.restoreFixtureTimeout;};window.setTimeout=(fn,ms,...args)=>native(fn,ms===15000?40:ms,...args);});
     await page.evaluate(({state,mode})=>window.boot(state,1,mode),{state,mode});
     if(mode==='rejected-result')await page.evaluate(()=>window.bc.update({value:{...window.requests[0],phase:'result',outcome:'rejected'},onChange:()=>{}}));
     await page.waitForFunction(()=>window.root.__hmbImageAssetPageControl.disabledContext);
+    if(mode==='timeout')await page.evaluate(()=>window.restoreFixtureTimeout());
     assert.equal(await page.evaluate(()=>window.root.__hmbImageAssetLatestState.assets.length),5000,`${mode} falls back to full canonical catalog`);
     await page.locator('[data-search]').fill('ID-4999');await page.waitForFunction(()=>document.querySelectorAll('[data-asset-key]').length===1);
     assert.equal(await page.locator('[data-asset-key]').getAttribute('data-asset-key'),'asset-4999');
@@ -157,6 +158,9 @@ try{
     await page.evaluate(()=>{window.bc.update({value:window.idle,onChange:value=>{if(value.operation==='catalog_page')window.requests.push(value);}});
       const full=structuredClone(window.full);full.project_root='C:/fixture/next-project';full.project_uid='next-project';full.project_cache_uid='next-cache';full.project_id='Next';full.ui_edit_revision=200;window.updateFull(full);});
     await page.waitForFunction(()=>window.requests.length===2);
+    // The later valid request uses the product's 15-second deadline, even when
+    // its response arrives after the earlier negative fixture's 40-ms deadline.
+    if(mode==='timeout')await page.waitForTimeout(80);
     await page.evaluate(()=>window.answer(window.requests.at(-1)));
     await page.waitForFunction(()=>Boolean(window.root.__hmbImageAssetLatestState.catalog_page));
     assert.equal(await page.evaluate(()=>window.root.__hmbImageAssetLatestState.project_uid),'next-project',`${mode} new project resumes page mode`);
