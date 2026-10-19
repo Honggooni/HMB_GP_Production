@@ -32,7 +32,10 @@ OLD = {"anyio":"4.14.2", "charset-normalizer":"3.5.1", "idna":"3.19", "urllib3":
 class InstallerRepair(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="hmb-tos-installer-contract-")
-        self.root = Path(self.tmp.name) / "HMB_GP_Production"
+        # The public protocol resolves its root before constructing owned paths.
+        # CI TEMP may use an 8.3 alias; private inventory helpers require that
+        # same canonical root rather than a second spelling of the directory.
+        self.root = (Path(self.tmp.name) / "HMB_GP_Production").resolve()
         self.site = self.root / ".venv/Lib/site-packages"
         self.site.mkdir(parents=True)
         (self.root/"griptape-nodes-library.json").write_text('{"name":"HMB_GP_Production"}',encoding="utf-8")

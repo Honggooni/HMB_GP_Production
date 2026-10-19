@@ -28,7 +28,8 @@ class Coordinator(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='hmb-coordinator-')
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        # The coordinator canonicalizes owned paths before its module guard.
+        self.root = Path(self.tmp.name).resolve()
         self.file = self.root / '_hmb_library_bootstrap.py'
         self.file.write_text('# exact fixture owner\n', encoding='utf-8')
         self.manifest = self.root / 'griptape-nodes-library.json'
