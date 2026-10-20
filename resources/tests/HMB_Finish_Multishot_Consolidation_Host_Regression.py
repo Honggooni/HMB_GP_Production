@@ -85,6 +85,7 @@ def media_fixture(source):
     source._hmb_hydration_adopted = True
     source._hmb_shot_routing_catalog = lambda: deepcopy(catalog)
     source._hmb_shot_routing_snapshot = lambda *a, **k: deepcopy(snapshot)
+    source._hmb_shot_routing_snapshot_for = lambda **kwargs: deepcopy(snapshot)
     source._hmb_project_identity = lambda: dict(PROJECT)
     source._hmb_shot_channel_subscription = lambda: dict(schema="hmb-shot-channel-subscription", version=1,
         participant_kind="image_asset", enabled=True, channel_uuid=CHANNEL,

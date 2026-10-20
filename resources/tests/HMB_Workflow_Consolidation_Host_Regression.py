@@ -244,8 +244,8 @@ async def canonical_case(engine, directory):
         finally:
             with migration._LOCK:
                 migration._INFLIGHT.get(engine, set()).discard(flow.name)
-        # A single legacy independent Agent also upgrades without a Prompt;
-        # its inputs stay native and its unassigned identity is only archived.
+        # Independent legacy content now stays visible until its owner chooses
+        # a real Shot. Missing ImageAsset choices cannot justify deleting it.
         legacy_agent = create("HMBAgentLibrary", "Single legacy unbound Agent")
         legacy_agent.set_parameter_value("additional_context", "Unassigned authored native value", initial_setup=True)
         legacy_raw = legacy_agent._hmb_widget_value(shot={}, shot_catalog={}, shot_manager=True)
@@ -253,10 +253,11 @@ async def canonical_case(engine, directory):
         legacy_agent._hmb_capture_saved_parameter_value(agents._AGENT_WIDGET_PARAMETER, legacy_raw)
         agent_before = legacy_agent.get_parameter_value("additional_context")
         agent_only = await migration.migrate_flow(engine, other.flow_name, backup_root=directory / "backups")
-        assert agent_only["ok"] and set(agent_only["survivors"]) == {"agent"}, agent_only
+        assert agent_only["code"] == "migration_conflict" and agent_only["backup_path"], agent_only
         assert legacy_agent.get_parameter_value("additional_context") == agent_before
-        assert legacy_agent.name in legacy_agent._hmb_agent_migration_archives
-        print("PASS explicit cross-flow-target mutations/load are blocked during commit; Agent-only legacy input upgrades without guessed Shot")
+        assert engine.node_manager.get_node_by_name(legacy_agent.name) is legacy_agent
+        assert not agent_only["manual_rebind_editors"]
+        print("PASS explicit cross-flow-target mutations/load are blocked during commit; independent legacy Agent is backed up and retained pending an ImageAsset Shot choice")
         # A library unload invalidates the queued generation, clears loading,
         # and retains an explicit blocked result without running migration.
         before_unload = migration._stamp(engine, flow)
@@ -273,7 +274,7 @@ async def canonical_case(engine, directory):
         LibraryRegistry.unregister_library("HMB_GP_Production", event_manager=engine.event_manager)
 
 
-async def actual_saved_file_case(engine, directory):
+async def actual_saved_file_case(engine, directory, *, complete_manual_rebind=False):
     """Replay the untouched user document in an isolated engine from a copy.
 
     Only the library registration line is replaced: source-under-test classes
@@ -358,6 +359,63 @@ async def actual_saved_file_case(engine, directory):
                 "legacy_widget_present": isinstance(item.get("legacy_widget"), dict)}
                 for name, item in failed_backup["authoring_exports"].items() if item.get("schema") == "hmb-agent-authoring-export"}
             print("FAILED_SAVED_AGENT_EXPORTS=" + json.dumps(diagnostic, ensure_ascii=False))
+        manual_rebound_originals = False
+        if outcome and outcome.get("code") == "migration_conflict" and outcome.get("manual_rebind_editors"):
+            # Current release requires a human choice for old independent
+            # editors. The original real file contains two unbound Agents;
+            # silently archiving/deleting them is no longer the approved path.
+            # The separate ManualRebindHost covers ten actual UI confirmations,
+            # consolidation, native inputs and Generator recovery preservation.
+            flow = engine.flow_manager.get_flow_by_name(outcome["flow_name"])
+            assert len(flow.nodes) == len(failed_backup["nodes"]) == 17
+            assert migration._edge_records(engine, set(flow.nodes)) == failed_backup["edges"]
+            assert len(failed_backup["edges"]) == 26
+            unbound_names = []
+            for name, exported in failed_backup["authoring_exports"].items():
+                if exported.get("schema") != "hmb-agent-authoring-export":
+                    continue
+                raw = expected.get((name, agents._AGENT_WIDGET_PARAMETER, False))
+                if isinstance(raw, str):
+                    raw = json.loads(raw)
+                if isinstance(raw, dict) and not raw.get("shot", {}).get("shot_uuid"):
+                    unbound_names.append(name)
+                    assert exported.get("legacy_widget") == raw
+                    node = flow.nodes[name]
+                    assert node._hmb_native_slot_snapshot() == exported["native_slot"]
+                    assert getattr(node, "_hmb_manual_rebind", {}).get("required") is True
+            assert len(unbound_names) == 2
+            assert set(outcome["manual_rebind_editors"]) == set(unbound_names)
+            assert source.read_bytes() == original_bytes
+            print("PASS original saved Prompt5/Agent5/Gen5 preserved: two independent Agents require explicit rebind before consolidation; backup17/edges26; models/renders0")
+            if complete_manual_rebind:
+                # This is an explicit fixture user's choice, never a production
+                # rule deriving ownership from a node name or display number.
+                publisher = next(node for node in flow.nodes.values()
+                    if node.metadata.get("node_type") == "HMBImageAssetLibrary")
+                catalog = publisher._hmb_shot_routing_catalog()
+                targets = sorted(catalog["shots"], key=lambda row: row["number"])[3:5]
+                for index, (name, shot) in enumerate(zip(sorted(unbound_names), targets), 1):
+                    node = flow.nodes[name]
+                    confirmed = node._hmb_apply_manual_rebind({"kind": "manual_rebind",
+                        "request_id": f"{index:032x}", "channel_uuid": catalog["channel_uuid"],
+                        "shot_uuid": shot["shot_uuid"],
+                        "expected_source_digest": node._hmb_manual_rebind["expected_source_digest"]})
+                    assert confirmed["ok"] is True
+                for _ in range(250):
+                    await asyncio.sleep(.02)
+                    retried = migration.last_migration_result(engine, flow.name)
+                    if retried and retried.get("code") == "consolidated":
+                        break
+                assert retried and retried.get("ok") is True and retried.get("code") == "consolidated", retried
+                assert len(flow.nodes) == 9
+                assert len([node for node in flow.nodes.values() if node.metadata.get("node_type") == "HMBPromptLibrary"]) == 1
+                assert len([node for node in flow.nodes.values() if node.metadata.get("node_type") == "HMBAgentLibrary"]) == 1
+                assert source.read_bytes() == original_bytes
+                print("PASS fixture user explicitly reconnected the two original independent Agents; one Prompt/Agent manager, five Generators; no inferred binding or execution")
+                manual_rebound_originals = True
+                outcome = retried
+            else:
+                return
         assert outcome and outcome["ok"] and outcome["code"] == "consolidated", outcome
         flow = engine.flow_manager.get_flow_by_name(outcome["flow_name"])
         assert len(flow.nodes) == 9 and len(outcome["removed_nodes"]) == 8, outcome
@@ -374,10 +432,18 @@ async def actual_saved_file_case(engine, directory):
                 raw = json.loads(raw)
             if isinstance(raw, dict) and not raw.get("shot", {}).get("shot_uuid"):
                 unbound.append(name)
-                assert exported.get("legacy_widget") == raw, name
-                assert not exported["active_subscription"].get("enabled"), name
                 archive = manager._hmb_agent_migration_archives[name]
-                assert archive["unbound_slots"] and archive["source_digest"] == exported["digest"]
+                if manual_rebound_originals:
+                    assert failed_backup["authoring_exports"][name]["legacy_widget"] == raw
+                    assert exported["active_subscription"]["enabled"] is True
+                    assert any(item.get("legacy_widget") == raw
+                        and item.get("native_slot") == failed_backup["authoring_exports"][name]["native_slot"]
+                        for item in archive["source_archives"].values())
+                    assert not exported["native_slot"]["outputs"].get("output")
+                else:
+                    assert exported.get("legacy_widget") == raw, name
+                    assert not exported["active_subscription"].get("enabled"), name
+                    assert archive["unbound_slots"] and archive["source_digest"] == exported["digest"]
         assert len(unbound) == 2, unbound
         for name, saved in backup["nodes"].items():
             if saved["raw"]["metadata"].get("node_type") == "HMBSeedanceGeneration":

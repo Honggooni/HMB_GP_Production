@@ -16193,6 +16193,7 @@ class HMBVideoPickerLibrary(DataNode):
         state_snapshot: Optional[Dict[str, Any]] = None,
         probe_cache: Optional[Dict[str, Optional[Path]]] = None,
         validate_media: bool = True,
+        _target_shot_uuid: str = "",
     ) -> Dict[str, Any]:
         lock = getattr(self, "_hmb_shot_snapshot_lock", None)
         if lock is None:
@@ -16230,7 +16231,34 @@ class HMBVideoPickerLibrary(DataNode):
                 state_snapshot=state_snapshot,
                 probe_cache=probe_cache,
                 validate_media=validate_media,
+                target_shot_uuid=_target_shot_uuid,
             )
+
+    def _hmb_shot_routing_snapshot_for(
+        self,
+        *,
+        channel_uuid: str,
+        shot_uuid: str,
+        state_snapshot: Optional[Dict[str, Any]] = None,
+        probe_cache: Optional[Dict[str, Optional[Path]]] = None,
+        validate_media: bool = True,
+    ) -> Dict[str, Any]:
+        """Read only the exact Shot's ordered media; preserve full-read strictness.
+
+        A deleted local file in another Shot must not invalidate this owner's
+        references. Full and scoped reads share the publisher generation clock,
+        so alternating views can never reuse a generation for different hashes.
+        """
+        channel, target = _uuid_text(channel_uuid), _uuid_text(shot_uuid)
+        if not channel or not target:
+            raise ValueError("VideoPicker exact Shot identity is unavailable.")
+        return self._hmb_shot_routing_snapshot(
+            expected_channel_uuid=channel,
+            state_snapshot=state_snapshot,
+            probe_cache=probe_cache,
+            validate_media=validate_media,
+            _target_shot_uuid=target,
+        )
 
     def _hmb_shot_routing_snapshot_locked(
         self,
@@ -16239,6 +16267,7 @@ class HMBVideoPickerLibrary(DataNode):
         state_snapshot: Optional[Dict[str, Any]] = None,
         probe_cache: Optional[Dict[str, Optional[Path]]] = None,
         validate_media: bool = True,
+        target_shot_uuid: str = "",
     ) -> Dict[str, Any]:
         # Output publication supplies its exact immutable state revision here.
         # Falling back to ``_picker_state`` remains the public read contract,
@@ -16278,6 +16307,25 @@ class HMBVideoPickerLibrary(DataNode):
         ):
             raise ValueError("VideoPicker automatic Shot route is incomplete.")
 
+        target = _uuid_text(target_shot_uuid)
+        catalog_shots = catalog["shots"]
+        target_uids: Optional[set[str]] = None
+        if target:
+            catalog_shots = [row for row in catalog_shots if row["shot_uuid"] == target]
+            if len(catalog_shots) != 1:
+                raise ValueError("VideoPicker target Shot is unavailable.")
+            target_rows = [row for row in state.get("picker_shots", [])
+                if isinstance(row, dict) and _uuid_text(row.get("workspace_uuid") if standalone
+                    else row.get("bound_shot_uuid")) == target]
+            if len(target_rows) > 1:
+                raise ValueError("Duplicate local VideoPicker Shot binding is invalid.")
+            fallback = state.get("picker_legacy_membership_fallbacks")
+            target_row = target_rows[0] if target_rows else (
+                fallback.get(target) if isinstance(fallback, dict) else None)
+            target_uids = set(_picker_representative_video_uids(
+                target_row.get("selected_video_uids", []) if isinstance(target_row, dict) else [],
+                target_row.get("preview_video_uid", "") if isinstance(target_row, dict) else ""))
+
         source_items: Dict[str, Dict[str, Any]] = {}
         source_media_by_uid: Dict[str, str] = {}
         for raw in state.get("videos", []):
@@ -16285,6 +16333,8 @@ class HMBVideoPickerLibrary(DataNode):
                 continue
             item = dict(raw)
             uid = _clean(item.get("video_uid") or item.get("source_uid"))
+            if target_uids is not None and uid not in target_uids:
+                continue
             media = _select_synchronized_video_media(
                 item,
                 # A web readiness snapshot reads authored source identity only.
@@ -16316,7 +16366,7 @@ class HMBVideoPickerLibrary(DataNode):
             else {}
         )
         shots: List[Dict[str, Any]] = []
-        for catalog_shot in catalog["shots"]:
+        for catalog_shot in catalog_shots:
             # A bound local workspace is exact authority.  The dedicated
             # one-way overflow map is only a lossless migration fallback for
             # an unbound remote row (Only + five historical remote buckets do

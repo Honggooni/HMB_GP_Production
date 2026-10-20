@@ -113,7 +113,13 @@ export function hmbAgentState(props) {
   const channelUuid = String(shot.channel_uuid || "").trim().slice(0, 128);
   const bound = Boolean(shotUuid && channelUuid);
   const catalog = hmbAgentCatalog(state.shot_catalog);
-  const catalogMatchesChannel = !bound || catalog.channel_uuid === channelUuid;
+  const manualRaw=state.manual_rebind && typeof state.manual_rebind==="object" ? state.manual_rebind : {};
+  const manual=/^[0-9a-f]{64}$/.test(String(manualRaw.expected_source_digest || "")) ? {
+    required:manualRaw.required===true,status:String(manualRaw.status || ""),reason:String(manualRaw.reason || ""),
+    error:String(manualRaw.error || ""),request_id:String(manualRaw.request_id || ""),
+    source_node_name:String(manualRaw.source_node_name || ""),backup_path:String(manualRaw.backup_path || ""),
+    expected_source_digest:String(manualRaw.expected_source_digest)} : null;
+  const catalogMatchesChannel = manual?.required || !bound || catalog.channel_uuid === channelUuid;
   const selected = bound && catalogMatchesChannel
     ? (catalog.shots || []).find((item) => item.shot_uuid === shotUuid) || null
     : null;
@@ -128,6 +134,7 @@ export function hmbAgentState(props) {
     shot_editor_expanded: state.shot_editor_expanded !== false,
     shot_states: Object.fromEntries(Object.entries(state.shot_states || {}).filter(([, value]) => ["running", "succeeded", "failed", "cancelled"].includes(value))),
     shot_catalog: catalogMatchesChannel ? catalog : {},
+    ...(manual ? {manual_rebind:manual} : {}),
     shot: {
       channel_uuid: selected ? channelUuid : "",
       shot_uuid: selected ? selected.shot_uuid : "",
@@ -237,7 +244,7 @@ function hmbAgentExecutionStatus(phase) {
   })[String(phase || "")] || "";
 }
 
-export function hmbAgentWidgetHeight(state) { return 64; }
+export function hmbAgentWidgetHeight(state) { return state?.manual_rebind?.required ? 144 : 64; }
 
 function hmbAgentRows(state) {
   if (!state.shot_manager) return "";
@@ -255,7 +262,7 @@ function hmbAgentRows(state) {
 }
 
 function renderAgentDashboard(state, container) {
-  const paletteShotNumber = hmbAgentPaletteShotNumber(state);
+  const paletteShotNumber = hmbAgentDisplayShotNumber(container, state);
   const executionStatus = hmbAgentExecutionStatus(state.execution_phase);
   const height = hmbAgentWidgetHeight(state);
   return `
@@ -272,6 +279,10 @@ function renderAgentDashboard(state, container) {
       .hmb-agent-dashboard .agent-heading b{font-size:15px;font-weight:800;letter-spacing:.01em;line-height:normal}
       .hmb-agent-dashboard .agent-shot-select{height:44px;font-size:13px;font-weight:800;line-height:normal}
       .hmb-agent-dashboard .agent-topbar{height:64px}
+      .hmb-agent-dashboard .agent-rebind-panel{display:none;padding:0 12px 10px;gap:6px;flex-wrap:wrap;align-items:center;font-size:10px;color:var(--hmb-text)}
+      .hmb-agent-dashboard .agent-rebind-panel>span{flex:1 0 100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#FBBF24}
+      .hmb-agent-dashboard .agent-rebind-select{flex:1;min-width:100px;height:32px;border:1px solid var(--hmb-chip-line);border-radius:6px;background:#0b1020;color:var(--hmb-text)}
+      .hmb-agent-dashboard .agent-rebind-confirm{height:32px;border:1px solid var(--hmb-chip-line);border-radius:6px;background:var(--hmb-chip-bg);color:var(--hmb-text);padding:0 10px}
       .hmb-agent-dashboard .agent-only-toggle{flex:0 0 auto;height:29px;padding:0 10px;border:1px solid var(--hmb-chip-line);border-radius:7px;background:var(--hmb-chip-bg);color:var(--hmb-chip-text);font:inherit;font-size:10px;font-weight:850}
       .hmb-agent-dashboard .agent-only-toggle[aria-pressed="true"]{box-shadow:0 0 10px var(--hmb-chip-glow);border-color:var(--hmb-shot-accent)}
       .hmb-agent-dashboard .agent-shot-list{padding:0 8px 8px;display:flex;flex-direction:column;gap:0}
@@ -290,6 +301,7 @@ function renderAgentDashboard(state, container) {
         <div class="agent-heading"><b>HMBAgentLibrary</b></div>
         <span class="agent-publication-status" role="status" aria-live="polite" aria-atomic="true">${hmbAgentEscape(executionStatus)}</span>
       </header>
+      <div class="agent-rebind-panel"><span role="status"></span><select class="agent-rebind-select" aria-label="기존 Agent를 연결할 샷 선택"></select><button type="button" class="agent-rebind-confirm">직접 재연결</button></div>
     </div>`;
 }
 
@@ -303,11 +315,19 @@ function compactAgentWidgetHost(container, state = null) {
 }
 
 function hmbRefreshAgentDashboard(container, props) {
-  const root = container?.querySelector?.(".hmb-agent-dashboard");
+  const root = hmbAgentDashboardRoot(container);
   if (!root) return false;
   const state = hmbAgentState(props);
   compactAgentWidgetHost(container, state);
   if (root.style.height !== `${hmbAgentWidgetHeight(state)}px`) root.style.height = `${hmbAgentWidgetHeight(state)}px`;
+  hmbPrepareAgentCanvasGestures(container);
+  const paletteShotNumber = hmbAgentDisplayShotNumber(container, state);
+  const error = container.__hmbAgentShotChangeError || "";
+  const signature = JSON.stringify([paletteShotNumber, state.execution_phase, error,
+    state.shot_manager, state.only_mode, state.shot, state.shot_catalog,state.manual_rebind,
+    container.__hmbAgentManualPending?.request_id,container.__hmbAgentManualError]);
+  if (root.__hmbAgentPresentationSignature === signature) return true;
+  root.__hmbAgentPresentationSignature = signature;
   const toggle = root.querySelector?.(".agent-only-toggle");
   if (toggle) { toggle.setAttribute("aria-pressed", String(state.only_mode)); toggle.disabled = Boolean(state.execution_phase); }
   const rows = root.querySelector?.(".agent-shot-list");
@@ -316,23 +336,37 @@ function hmbRefreshAgentDashboard(container, props) {
     const html = hmbAgentRows(state);
     if (rows.__hmbRowsMarkup !== html) { rows.innerHTML = html; rows.__hmbRowsMarkup = html; }
   }
-  hmbAgentSetAttribute(root,"data-shot-number",String(hmbAgentPaletteShotNumber(state)));
+  hmbAgentSetAttribute(root,"data-shot-number",String(paletteShotNumber));
   hmbAgentSetAttribute(root,"data-execution-phase",state.execution_phase || "");
   const select = root.querySelector?.(".agent-shot-select");
   if (select) {
     hmbSyncAgentShotSelect(select, state);
     select.style.display = state.shot_manager || state.only_mode ? "none" : "";
   }
-  const error = container.__hmbAgentShotChangeError || "";
   const executionStatus = hmbAgentExecutionStatus(state.execution_phase);
+  hmbRefreshManualAgentRebind(container,state);
   hmbSetAgentStatus(
     container,
     error ? "Save failed · previous Shot restored" : executionStatus,
     error || executionStatus,
   );
   if (select) select.disabled = Boolean(state.execution_phase);
-  hmbPrepareAgentCanvasGestures(container);
   return true;
+}
+
+function hmbRefreshManualAgentRebind(container,state){
+  const panel=container.querySelector?.(".agent-rebind-panel");if(!panel)return;
+  const manual=state.manual_rebind || {},pending=container.__hmbAgentManualPending;
+  if(pending && manual.request_id===pending.request_id){clearTimeout(pending.timer);pending.guardCleanup?.();delete container.__hmbAgentManualPending;}
+  panel.style.display=manual.required ? "flex" : "none";
+  if(!manual.required)return;
+  const select=panel.querySelector("select"),button=panel.querySelector("button"),message=panel.querySelector("span");
+  const options=hmbAgentShotOptions(state),signature=JSON.stringify(options.map(item=>[item.key,item.name,item.number]));
+  if(select.__hmbOptionSignature!==signature){const value=select.value;select.innerHTML='<option value="">재연결할 샷 선택…</option>'+options.map(item=>`<option value="${hmbAgentEscape(item.key)}">${hmbAgentEscape(hmbAgentShotOptionLabel(item))}</option>`).join("");select.__hmbOptionSignature=signature;select.value=options.some(item=>item.key===value) ? value : "";}
+  const busy=Boolean(container.__hmbAgentManualPending);select.disabled=busy;button.disabled=busy || !select.value;
+  message.textContent=container.__hmbAgentManualError || manual.error || manual.reason || "기존 입력을 보존했습니다. 해당 샷을 직접 선택한 뒤 재연결하세요.";
+  message.title=manual.backup_path || "";
+  button.textContent=busy ? "확인 중…" : "직접 재연결";
 }
 
 function hmbAgentShotKey(state) {
@@ -341,6 +375,14 @@ function hmbAgentShotKey(state) {
 }
 
 function hmbAgentResolveShotEcho(container, incomingProps) {
+  const manualPending=container.__hmbAgentManualPending;
+  if(manualPending && incomingProps!==container.__hmbAgentLatestProps){
+    const incoming=hmbAgentState(incomingProps).manual_rebind;
+    if(!incoming || incoming.expected_source_digest!==manualPending.expected_source_digest
+        || (!incoming.required && incoming.request_id!==manualPending.request_id)){
+      return {props:container.__hmbAgentLatestProps || incomingProps,stale:true};
+    }
+  }
   const pending = container.__hmbAgentPendingShot;
   if (!pending || incomingProps === container.__hmbAgentLatestProps) return { props: incomingProps, stale: false };
   const incoming = hmbAgentState(incomingProps);
@@ -376,9 +418,31 @@ export function hmbPrepareAgentCanvasGestures(container) {
   // grab -> grabbing cursor transition.
   for (const name of ["nopan","nowheel"]) if (container.classList?.contains(name)) container.classList.remove(name);
   if (!container.classList?.contains("nodrag")) container.classList?.add("nodrag");
-  const root = container.querySelector?.(".hmb-agent-dashboard");
+  const root = hmbAgentDashboardRoot(container);
   for (const name of ["nopan","nowheel"]) if (root?.classList?.contains(name)) root.classList.remove(name);
   if (root && !root.classList?.contains("nodrag")) root.classList?.add("nodrag");
+}
+
+function hmbAgentDashboardRoot(container) {
+  let root = container?.__hmbAgentDashboardRoot;
+  if (!root || container?.contains?.(root) === false) {
+    root = container?.querySelector?.(".hmb-agent-dashboard");
+    if (root) container.__hmbAgentDashboardRoot = root;
+  }
+  return root;
+}
+
+function hmbAgentDisplayShotNumber(container, state) {
+  const fallback = hmbAgentPaletteShotNumber(state);
+  const channel = state?.shot_catalog?.channel_uuid || state?.shot?.channel_uuid;
+  const entry = hmbAgentRowChannels.get(channel);
+  const host = hmbAgentNodeRoot(container);
+  if (!entry || !host) return fallback;
+  const pending = entry.pending;
+  if (pending?.kind === "select" && !pending.recovering && hmbAgentNodeRoot(pending.owner) === host) return pending.shotNumber;
+  const confirmed = entry.themes.get(host);
+  return confirmed && (state.shot_catalog?.shots || []).some(shot => shot.shot_uuid === confirmed.shotUuid)
+    ? confirmed.number : fallback;
 }
 
 function hmbAgentNodeRoot(container) {
@@ -490,6 +554,26 @@ function hmbNativeUiImplementation(container, props) {
     try { window.dispatchEvent(new CustomEvent("hmb-shot-routing-discover-v1")); } catch (_error) {}
   }
   const shotSelect = container.querySelector?.(".agent-shot-select");
+  const manualSelect=container.querySelector?.(".agent-rebind-select"),manualConfirm=container.querySelector?.(".agent-rebind-confirm");
+  const manualSelectHandler=()=>{delete container.__hmbAgentManualError;hmbRefreshManualAgentRebind(container,hmbAgentState(container.__hmbAgentLatestProps || props));};
+  const manualConfirmHandler=()=>{
+    const live=container.__hmbAgentLatestProps || props,state=hmbAgentState(live),manual=state.manual_rebind;
+    if(!ownsLifecycle() || !manual?.required || live.disabled || container.__hmbAgentManualPending || typeof live.onChange!=="function")return;
+    const selected=hmbAgentShotOptions(state).find(item=>item.key===manualSelect?.value);if(!selected)return;
+    const bytes=new Uint8Array(16);crypto.getRandomValues(bytes);const requestId=Array.from(bytes,byte=>byte.toString(16).padStart(2,"0")).join("");
+    const ticket={request_id:requestId,expected_source_digest:manual.expected_source_digest,owner:container,recovering:false};
+    container.__hmbAgentManualPending=ticket;delete container.__hmbAgentManualError;
+    ticket.guardCleanup=hmbGuardPendingAgentEditor(container,ticket);
+    const pending=()=>ownsLifecycle() && container.__hmbAgentManualPending===ticket;
+    const uncertain=()=>{if(!pending())return;ticket.recovering=true;container.__hmbAgentManualError="응답 확인이 필요합니다. 자동 재전송하지 않으며 현재 안내를 다시 확인하세요.";hmbRefreshManualAgentRebind(container,hmbAgentState(container.__hmbAgentLatestProps || props));};
+    ticket.timer=setTimeout(uncertain,15000);
+    hmbRefreshManualAgentRebind(container,state);
+    const next={...state,action:{kind:"manual_rebind",request_id:requestId,
+      expected_source_digest:manual.expected_source_digest,channel_uuid:selected.channel_uuid,shot_uuid:selected.shot_uuid}};
+    try{Promise.resolve(live.onChange(next)).catch(uncertain);}catch{uncertain();}
+  };
+  manualSelect?.addEventListener?.("change",manualSelectHandler);manualConfirm?.addEventListener?.("click",manualConfirmHandler);
+  hmbRefreshManualAgentRebind(container,hmbAgentState(props));
   const shotChangeHandler = (requestedState = null) => {
     const liveProps = container.__hmbAgentLatestProps || props || {};
     const option = hmbAgentShotOptions(hmbAgentState(liveProps)).find((item) => item.key === shotSelect?.value);
@@ -570,6 +654,9 @@ function hmbNativeUiImplementation(container, props) {
     container.removeEventListener?.("keydown", stopNodeDeleteShortcut);
     container.removeEventListener?.("pointerdown", stopInteriorNodeSelection);
     shotSelect?.removeEventListener?.("change", legacyShotChangeHandler);
+    manualSelect?.removeEventListener?.("change",manualSelectHandler);manualConfirm?.removeEventListener?.("click",manualConfirmHandler);
+    const manualPending=container.__hmbAgentManualPending;if(manualPending){clearTimeout(manualPending.timer);manualPending.guardCleanup?.();delete container.__hmbAgentManualPending;}
+    delete container.__hmbAgentManualError;
     container.removeAttribute?.("data-hmb-node-delete-protected");
     try {
       container.style.removeProperty("height");
@@ -584,6 +671,7 @@ function hmbNativeUiImplementation(container, props) {
       delete container.__hmbAgentCleanup;
     }
     delete container.__hmbAgentLatestProps;
+    delete container.__hmbAgentDashboardRoot;
     delete container.__hmbAgentPendingShot;
     // Preserve monotonic ownership across a real cleanup/remount. Deleting
     // this counter allowed a replacement mount to reuse an old pending
@@ -624,6 +712,8 @@ export function hmbAgentShotRowState(props) {
     shot:valid ? {channel_uuid:shot.channel_uuid,shot_uuid:shot.shot_uuid,number,name:String(shot.name || `Shot ${number}`).slice(0,128),revision:Number(shot.revision)||0} : {},
     selected:valid && raw.selected === true,expanded:valid && raw.expanded === true,
     request_id:/^[0-9a-f]{32}$/.test(String(raw?.request_id || "")) ? raw.request_id : "",
+    ...(/^[0-9a-f]{32}$/.test(String(raw?.rejected_request_id || "")) && raw?.error_code==="SHOT_IDENTITY_UNAVAILABLE"
+      ? {rejected_request_id:raw.rejected_request_id,error_code:raw.error_code} : {}),
     status:["running","succeeded","failed","cancelled"].includes(raw?.status) ? raw.status : ""};
 }
 
@@ -634,11 +724,18 @@ const hmbAgentRowChannels = new Map();
 function hmbGuardPendingAgentEditor(container,ticket) {
   const host=hmbAgentNodeRoot(container);
   if(!host?.addEventListener)return ()=>{};
-  // The SDK owns the native editor and its element IDs. Guard its events
-  // during the short switch lease instead of moving/disabling React's DOM.
+  // The SDK owns native parameter rows and their element IDs. Quarantine only
+  // those editors and Shot actions while their identity is unconfirmed. The
+  // host header, Delete menu and canvas must remain usable even after a lost
+  // ACK; guarding the whole node made a local transport error look like a hang.
   const guard=event=>{
-    if(Number(event.button)===1 || event.target?.closest?.(".react-flow__resize-control,.react-flow__node-resizer,[class*='node-resizer']"))return;
+    if(Number(event.button)===1 || event.target?.closest?.(".react-flow__handle,.react-flow__resize-control,.react-flow__node-resizer,[class*='node-resizer']"))return;
     if(ticket.recovering && event.target?.closest?.(".agent-shot-run")===container.querySelector?.(".agent-shot-run"))return;
+    const action=event.target?.closest?.(".agent-shot-tab,.agent-shot-run");
+    const parameter=event.target?.closest?.("[data-parameter-name],[data-parameter],[data-parameter-key]");
+    const name=String(parameter?.getAttribute?.("data-parameter-name") || parameter?.getAttribute?.("data-parameter") || parameter?.getAttribute?.("data-parameter-key") || "");
+    const nativeEditor=parameter && host.contains?.(parameter) && name!=="HMB_AGENT_UI" && !/^HMB_AGENT_SHOT_ROW_[1-5]$/.test(name);
+    if(!action && !nativeEditor)return;
     event.preventDefault?.();event.stopImmediatePropagation?.();event.stopPropagation?.();
   };
   const events=["pointerdown","mousedown","click","dblclick","keydown","beforeinput","input","change","paste","drop"];
@@ -652,14 +749,21 @@ function hmbAgentShotRowWidget(container, initialProps) {
     container.__hmbAgentRowHandle.update(initialProps);
     return container.__hmbAgentRowHandle;
   }
-  let props=initialProps || {};let disposed=false;let channel="";let acceptedAck="";let lastError="";
+  let props=initialProps || {};let disposed=false;let channel="";let acceptedAck="";let lastError="";let lastRejected=false;
   const retiredAcks=new Set();
   const channelEntry=()=>hmbAgentRowChannels.get(channel);
   const refreshChannel=()=>{for(const owner of channelEntry()?.owners || [])owner.refresh();};
   const unregister=()=>{const entry=channelEntry();if(!entry)return;if(entry.pending?.owner===container)finish(entry.pending);entry.owners.delete(owner);if(!entry.owners.size)hmbAgentRowChannels.delete(channel);};
-  const register=()=>{const next=hmbAgentShotRowState(props).shot.channel_uuid || "";if(next===channel)return;unregister();channel=next;acceptedAck="";retiredAcks.clear();if(channel){if(!hmbAgentRowChannels.has(channel))hmbAgentRowChannels.set(channel,{owners:new Set(),pending:null});channelEntry().owners.add(owner);}};
+  const register=()=>{const next=hmbAgentShotRowState(props).shot.channel_uuid || "";if(next===channel)return;unregister();channel=next;acceptedAck="";retiredAcks.clear();if(channel){if(!hmbAgentRowChannels.has(channel))hmbAgentRowChannels.set(channel,{owners:new Set(),pending:null,themes:new WeakMap()});channelEntry().owners.add(owner);}};
+  const rememberTheme=state=>{const host=hmbAgentNodeRoot(container);if(state.selected && host)channelEntry()?.themes.set(host,{shotUuid:state.shot.shot_uuid,number:state.shot.number});};
   const finish=(ticket,error)=>{const entry=channelEntry();if(entry?.pending!==ticket)return;for(const id of ticket.frames)cancelAnimationFrame(id);clearTimeout(ticket.fallback);clearTimeout(ticket.expiry);ticket.guardCleanup?.();entry.pending=null;if(error && !disposed)lastError=String(error?.message||error);refreshChannel();};
-  const recover=(ticket,error)=>{if(disposed || channelEntry()?.pending!==ticket)return;ticket.recovering=true;lastError=String(error?.message||error);clearTimeout(ticket.expiry);refreshChannel();};
+  const recover=(ticket,error)=>{if(disposed || channelEntry()?.pending!==ticket)return;ticket.recovering=true;lastRejected=false;lastError=String(error?.message||error);clearTimeout(ticket.expiry);refreshChannel();};
+  const reject=(ticket,error)=>{
+    if(disposed || channelEntry()?.pending!==ticket)return;
+    for(const id of ticket.acceptedIds)retiredAcks.add(id);
+    while(retiredAcks.size>256)retiredAcks.delete(retiredAcks.values().next().value);
+    lastRejected=true;finish(ticket,error);
+  };
   container.classList?.add("nodrag");container.classList?.remove("nopan","nowheel");
   container.setAttribute?.("data-hmb-node-delete-protected","true");
   const state=hmbAgentShotRowState(props);
@@ -667,27 +771,38 @@ function hmbAgentShotRowWidget(container, initialProps) {
   const style=header.match(/<style>[\s\S]*?<\/style>/)?.[0] || "";
   container.innerHTML=style+`<div class="hmb-agent-dashboard hmb-agent-shot-accordion nodrag" style="height:42px;border-radius:7px;box-shadow:none" data-shot-number="${state.shot.number || 1}"><div class="agent-shot-row" style="height:40px" data-shot-number="${state.shot.number || 1}"><button type="button" class="agent-shot-tab nodrag" data-agent-shot="${hmbAgentEscape(state.shot.shot_uuid || "")}" aria-expanded="false"><span class="agent-row-number"></span><b></b><span class="agent-row-status"></span><span class="agent-row-chevron" aria-hidden="true"></span></button><button type="button" class="agent-shot-run nodrag" aria-label="Run Shot Agent"></button></div></div>`;
   const root=container.querySelector(".hmb-agent-dashboard"),row=container.querySelector(".agent-shot-row"),select=container.querySelector(".agent-shot-tab"),run=container.querySelector(".agent-shot-run");
+  const number=select.querySelector(".agent-row-number"),label=select.querySelector("b"),status=select.querySelector(".agent-row-status"),chevron=select.querySelector(".agent-row-chevron");
+  let presentationSignature="";
   const refresh=()=>{
     const canonical=hmbAgentShotRowState(props);const shot=canonical.shot;
     const ticket=channelEntry()?.pending;const switching=ticket?.kind==="select" && !ticket.recovering;
     const own=ticket?.owner===container;
     const current=switching ? {...canonical,selected:own,expanded:own && ticket.expanded} : canonical;
+    const recovering=own && ticket?.recovering;
+    const text=own ? (recovering ? "응답 확인 필요" : switching ? "전환 중…" : "전달 중…") : lastError ? (lastRejected ? "요청 거절됨" : "응답 확인 필요") : ({running:"Agent 실행 중…",succeeded:"완료",failed:"실패",cancelled:"취소"})[current.status] || "";
+    const running=current.status==="running",runText=recovering ? "↻" : running ? "■" : "▷";
+    const title=recovering?"현재 상태만 확인합니다. Agent/Run은 다시 실행하지 않습니다.":lastError || (running?"이 샷 Agent만 취소":"이 샷 Agent만 실행");
+    const disabled=Boolean(ticket) || !shot.shot_uuid,runDisabled=disabled && !recovering;
+    // The host may update geometry independently of the authored value.
+    for(const [key,value] of [["height","42px"],["min-height","42px"],["max-height","42px"],["flex","0 0 42px"],["overflow","hidden"]])if(container.style?.getPropertyValue?.(key)!==value)container.style?.setProperty?.(key,value,"important");
+    const signature=JSON.stringify([shot,current.selected,current.expanded,text,runText,title,Boolean(ticket),disabled,runDisabled,Boolean(props.disabled)]);
+    if(signature===presentationSignature)return;
+    presentationSignature=signature;
     hmbAgentSetAttribute(root,"data-shot-number",String(shot.number || 1));hmbAgentSetAttribute(row,"data-shot-number",String(shot.number || 1));
     hmbAgentSetAttribute(row,"data-active",String(current.selected));hmbAgentSetAttribute(row,"data-shot-uuid",shot.shot_uuid || "");
     hmbAgentSetAttribute(select,"data-agent-shot",shot.shot_uuid || "");hmbAgentSetAttribute(select,"aria-expanded",String(current.expanded));hmbAgentSetAttribute(select,"aria-pressed",String(current.selected));
-    const number=select.querySelector(".agent-row-number"),label=select.querySelector("b"),status=select.querySelector(".agent-row-status"),chevron=select.querySelector(".agent-row-chevron");
     if(number.textContent!==String(shot.number||0).padStart(2,"0"))number.textContent=String(shot.number||0).padStart(2,"0");
     if(label.textContent!==(shot.name||""))label.textContent=shot.name||"";
-    const recovering=own && ticket?.recovering;
-    const text=own ? (recovering ? "응답 확인 필요" : switching ? "전환 중…" : "전달 중…") : lastError ? "응답 확인 필요" : ({running:"Agent 실행 중…",succeeded:"완료",failed:"실패",cancelled:"취소"})[current.status] || "";
     if(status.textContent!==text)status.textContent=text;
     const arrow=current.expanded ? "▾" : "▸";if(chevron.textContent!==arrow)chevron.textContent=arrow;
-    const running=current.status==="running";const runText=recovering ? "↻" : running ? "■" : "▷";if(run.textContent!==runText)run.textContent=runText;
-    hmbAgentSetAttribute(run,"aria-label",recovering?"Refresh Agent Shot":running?"Cancel Shot Agent":"Run Shot Agent");hmbAgentSetAttribute(run,"title",recovering?"현재 상태만 확인합니다. Agent/Run은 다시 실행하지 않습니다.":lastError || (running?"이 샷 Agent만 취소":"이 샷 Agent만 실행"));
+    if(run.textContent!==runText)run.textContent=runText;
+    hmbAgentSetAttribute(run,"aria-label",recovering?"Refresh Agent Shot":running?"Cancel Shot Agent":"Run Shot Agent");hmbAgentSetAttribute(run,"title",title);
     hmbAgentSetAttribute(row,"aria-busy",String(Boolean(ticket)));
-    const disabled=Boolean(ticket) || !shot.shot_uuid;if(select.disabled!==disabled)select.disabled=disabled;
-    const runDisabled=disabled && !recovering;if(run.disabled!==runDisabled)run.disabled=runDisabled;
-    for(const [key,value] of [["height","42px"],["min-height","42px"],["max-height","42px"],["flex","0 0 42px"],["overflow","hidden"]])if(container.style?.getPropertyValue?.(key)!==value)container.style?.setProperty?.(key,value,"important");
+    if(select.disabled!==disabled)select.disabled=disabled;
+    if(run.disabled!==runDisabled)run.disabled=runDisabled;
+    const host=hmbAgentNodeRoot(container),header=host?.querySelector?.(".hmb-agent-dashboard:not(.hmb-agent-shot-accordion)");
+    const headerContainer=header?.parentElement,headerProps=headerContainer?.__hmbAgentLatestProps;
+    if(headerProps)hmbAgentSetAttribute(header,"data-shot-number",String(hmbAgentDisplayShotNumber(headerContainer,hmbAgentState(headerProps))));
   };
   const send=(kind)=>{
     const previous=channelEntry()?.pending;
@@ -697,13 +812,19 @@ function hmbAgentShotRowWidget(container, initialProps) {
     const requestId=Array.from(bytes,byte=>byte.toString(16).padStart(2,"0")).join("");
     const acceptedIds=new Set([...(previous?.acceptedIds || []),requestId]);
     while(acceptedIds.size>256)acceptedIds.delete(acceptedIds.values().next().value);
-    const ticket={owner:container,kind,requestId,acceptedIds,expanded:current.selected ? !current.expanded : true,frames:[],dispatched:false};
-    const next={...current,action:{kind,request_id:requestId,...(kind==="select" ? {expanded:ticket.expanded} : {})}};
-    lastError="";
+    const mutationIds=new Set(previous?.mutationIds || []),rejectedIds=new Set(previous?.rejectedIds || []);
+    if(kind!=="refresh")mutationIds.add(requestId);
+    const ticket={owner:container,kind,requestId,acceptedIds,mutationIds,rejectedIds,shotNumber:current.shot.number,expanded:current.selected ? !current.expanded : true,frames:[],dispatched:false};
+    const {rejected_request_id:_rejectedRequest,error_code:_errorCode,...commandState}=current;
+    const next={...commandState,action:{kind,request_id:requestId,...(kind==="select" ? {expanded:ticket.expanded} : {})}};
+    lastError="";lastRejected=false;
     if(previous)finish(previous);
     channelEntry().pending=ticket;ticket.guardCleanup=hmbGuardPendingAgentEditor(container,ticket);refreshChannel();
     const dispatch=()=>{
       if(disposed || channelEntry()?.pending!==ticket || ticket.dispatched)return;
+      if(props.disabled && !["refresh","cancel_selected"].includes(kind)){
+        reject(ticket,new Error("Griptape에서 잠긴 요청은 전달하지 않았습니다. 잠금이 해제된 후 다시 선택하세요."));return;
+      }
       ticket.dispatched=true;clearTimeout(ticket.fallback);
       let result;try{result=props.onChange(next);}catch(error){recover(ticket,error);return;}
       // Resolution alone only confirms delivery. Keep the row/Run lease until
@@ -725,13 +846,24 @@ function hmbAgentShotRowWidget(container, initialProps) {
     if(disposed)return;
     const incoming=hmbAgentShotRowState(next || props),previous=hmbAgentShotRowState(props);
     const same=incoming.shot.channel_uuid===previous.shot.channel_uuid && incoming.shot.shot_uuid===previous.shot.shot_uuid;
+    const pending=channelEntry()?.pending;
+    const rejected=pending?.owner===container && pending.acceptedIds.has(incoming.rejected_request_id);
+    if(rejected){
+      pending.rejectedIds.add(incoming.rejected_request_id);
+      const error=new Error("샷 목록이 변경되어 요청이 적용되지 않았습니다. 현재 샷을 다시 선택하세요.");
+      // A rejection of a later read-only Refresh says nothing about an older
+      // uncertain mutation. Keep that lease until its own NACK or exact ACK.
+      if([...pending.mutationIds].every(id=>pending.rejectedIds.has(id)))reject(pending,error);
+      else recover(pending,error);
+    }
     // A late unacknowledged echo must not move the editor highlight backwards.
-    if(same && acceptedAck && (!incoming.request_id || retiredAcks.has(incoming.request_id)))return;
+    if(same && !rejected && (retiredAcks.has(incoming.request_id) || (acceptedAck && !incoming.request_id)))return;
     // The SDK keeps five row parameter IDs while catalog numbering can move a
     // different UUID into a row. An acknowledgement belongs to that UUID,
     // never to the row's previous occupant or its replacement after deletion.
-    if(!same){acceptedAck="";retiredAcks.clear();lastError="";}
+    if(!same){acceptedAck="";retiredAcks.clear();if(!rejected){lastError="";lastRejected=false;}}
     props=next || props;register();
+    if(incoming.selected && (!same || !previous.selected || incoming.shot.number!==previous.shot.number || incoming.request_id!==previous.request_id))rememberTheme(incoming);
     const ticket=channelEntry()?.pending;
     if(ticket?.owner===container && (!same || ticket.acceptedIds.has(incoming.request_id))){
       if(ticket.acceptedIds.has(incoming.request_id)){
@@ -746,7 +878,7 @@ function hmbAgentShotRowWidget(container, initialProps) {
     if(disposed)return;disposed=true;unregister();
     select.removeEventListener("click",selectClick);run.removeEventListener("click",runClick);container.removeEventListener?.("keydown",keydown);container.removeEventListener?.("pointerdown",pointerdown);container.removeAttribute?.("data-hmb-node-delete-protected");delete container.__hmbAgentRowHandle;container.innerHTML="";
   }};
-  container.__hmbAgentRowHandle=handle;register();refresh();return handle;
+  container.__hmbAgentRowHandle=handle;register();rememberTheme(state);refresh();return handle;
 }
 
 

@@ -3343,7 +3343,7 @@ class _HMBAIBrokerBridge:
             idempotency_key=client_request_id,
         )
 
-    def refresh_job(self, job_id: str, *, timeout: float = 60) -> dict[str, Any]:
+    def refresh_job(self, job_id: str, *, timeout: float = 300) -> dict[str, Any]:
         value = str(job_id or "").strip()
         if _TASK_ID_PATTERN.fullmatch(value) is None:
             raise _BrokerProtocolError("FN AI Broker job ID is invalid.")
@@ -6392,14 +6392,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             generation["local_preview"] = local_preview
         return generation
 
-    def _sync_seedance_shot_widget(self, *, emit_change: bool = False) -> None:
+    def _sync_seedance_shot_widget(
+        self, *, emit_change: bool = False, available_catalog: dict[str, Any] | None = None,
+    ) -> None:
         parameter = self.get_parameter_by_name(SEEDANCE_SHOT_WIDGET_PARAMETER)
         if parameter is None:
             return
         identity = self._shot_identity()
-        available_catalog = self._hmb_available_seedance_shot_catalog(
-            self._hmb_shot_catalog_snapshot
-        )
+        if available_catalog is None:
+            available_catalog = self._hmb_available_seedance_shot_catalog(
+                self._hmb_shot_catalog_snapshot
+            )
         next_value = _seedance_widget_value(
             {
                 "channel_uuid": identity["channel_uuid"],
@@ -6465,11 +6468,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         requested_shot_uuid: Any,
         *,
         fallback_to_available: bool = True,
+        available_catalog: dict[str, Any] | None = None,
     ) -> None:
         previous_identity = self._shot_identity()
         requested = self._shot_uuid(requested_shot_uuid)
         snapshot = self._hmb_shot_catalog_snapshot
-        available_snapshot = self._hmb_available_seedance_shot_catalog(snapshot)
+        available_snapshot = (available_catalog if available_catalog is not None
+                              else self._hmb_available_seedance_shot_catalog(snapshot))
         available_shots = (
             available_snapshot.get("shots", [])
             if isinstance(available_snapshot, dict)
@@ -6534,7 +6539,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # complete widget state after any Agent route has also been pre-armed.
         # _sync_seedance_shot_widget remembers explicit publications, so an
         # equal backend value still reaches a newly mounted React widget once.
-        self._sync_seedance_shot_widget()
+        self._sync_seedance_shot_widget(available_catalog=available_snapshot)
 
     def _hmb_seedance_mode_intent(self) -> dict[str, Any]:
         """Read optional author intent; never treat it as source/media authority.
@@ -6711,7 +6716,105 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self._hmb_remote_prompt_route = current_route
             else:
                 self._hmb_remote_prompt_route = discovered_route
+            self._hmb_refresh_managed_prompt_projection()
             self._sync_seedance_shot_widget(emit_change=True)
+
+    def _hmb_managed_prompt_projection(self) -> str | None:
+        """Read this Generator's public Shot text, never the Agent's open row.
+
+        ``None`` keeps ordinary/Only/legacy prompt inputs native.  An exact
+        manager edge opts into per-Shot presentation, including an empty result
+        for a Shot that has not run.  The bounded retained connection index is
+        read directly: rendering/saving a prompt must not reconcile the graph
+        or perform a whole-Flow discovery pass.
+        """
+        if hasattr(self, "_web_owner") or bool(getattr(self, "_hmb_node_deleted", False)):
+            return None
+        identity = self._shot_identity()
+        if not identity.get("channel_uuid") or not identity.get("shot_uuid"):
+            return None
+        try:
+            connections = GriptapeNodes.FlowManager().get_connections()
+            prompt = self.get_parameter_by_name("prompt")
+            edges = connections.get_incoming_connections_to_parameter(self, prompt) if prompt is not None else []
+        except Exception:
+            return None
+        if not isinstance(edges, (list, tuple)) or len(edges) != 1:
+            return None
+        edge = edges[0]
+        if (getattr(edge, "target_node", None) is not self
+                or getattr(getattr(edge, "target_parameter", None), "name", "") != "prompt"
+                or getattr(getattr(edge, "source_parameter", None), "name", "") != "output"):
+            return None
+        source = getattr(edge, "source_node", None)
+        manager = getattr(source, "_hmb_shot_manager_enabled", None)
+        preview = getattr(source, "_hmb_agent_shot_preview", None)
+        if not callable(manager) or not callable(preview):
+            return None
+        try:
+            if manager() is not True:
+                return None
+            # The edge object carries the actual node instance, so a deleted
+            # or replaced owner cannot donate another instance's visible text.
+            if bool(getattr(source, "_hmb_node_deleted", False)):
+                return ""
+            value = preview(channel_uuid=identity["channel_uuid"], shot_uuid=identity["shot_uuid"])
+        except Exception:
+            return ""
+        if not isinstance(value, dict) or not isinstance(value.get("text"), str):
+            return ""
+        shot = value.get("shot")
+        if (not isinstance(shot, dict)
+                or any(shot.get(key) != identity.get(key)
+                       for key in ("channel_uuid", "shot_uuid"))):
+            return ""
+        return value["text"]
+
+    def _get_raw_parameter_value(self, param_name: str) -> Any:
+        if param_name == "prompt":
+            projected = self._hmb_managed_prompt_projection()
+            if projected is not None:
+                return projected
+        return super()._get_raw_parameter_value(param_name)
+
+    def _hmb_refresh_managed_prompt_projection(
+        self, *, source_node: Any = None, channel_uuid: str = "", shot_uuid: str = "", force: bool = False,
+    ) -> bool:
+        """Refresh only an exact manager-owned prompt; never execute an Agent."""
+        if bool(getattr(self, "_hmb_prompt_projection_syncing", False)):
+            return False
+        identity = self._shot_identity()
+        if ((channel_uuid and channel_uuid != identity.get("channel_uuid"))
+                or (shot_uuid and shot_uuid != identity.get("shot_uuid"))):
+            return False
+        if source_node is not None:
+            try:
+                connections = GriptapeNodes.FlowManager().get_connections()
+                parameter = self.get_parameter_by_name("prompt")
+                edges = connections.get_incoming_connections_to_parameter(self, parameter) if parameter is not None else []
+                if len(edges) != 1 or getattr(edges[0], "source_node", None) is not source_node:
+                    return False
+            except Exception:
+                return False
+        projected = self._hmb_managed_prompt_projection()
+        if projected is None:
+            return False
+        if not force and getattr(self, "parameter_values", {}).get("prompt") == projected:
+            return False
+        self._hmb_prompt_projection_syncing = True
+        try:
+            # Store the same value that SDK serialization and native UI events
+            # read.  Public graph ports remain unchanged for old workflows.
+            super().set_parameter_value("prompt", projected)
+        finally:
+            self._hmb_prompt_projection_syncing = False
+        return True
+
+    def after_incoming_connection(self, source_node: Any, source_parameter: Any, target_parameter: Any) -> None:
+        result = super().after_incoming_connection(source_node, source_parameter, target_parameter)
+        if getattr(target_parameter, "name", "") == "prompt":
+            self._hmb_refresh_managed_prompt_projection(source_node=source_node, force=True)
+        return result
 
     @staticmethod
     def _agent_route_subscription(source_node: Any, identity: dict[str, Any]) -> Any:
@@ -6861,6 +6964,26 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
         if isinstance(selected, dict) and selected not in available_shots:
             selected = None
+        if (not intent and identity.get("channel_uuid") and identity.get("shot_uuid")
+                and selected is None):
+            # Legacy auto-bound workflows have no explicit mode metadata yet.
+            # Removing one Shot must retain its exact owner just like removing
+            # the whole publisher. Otherwise clearing the visible quartet lets
+            # this Generator claim another Shot on the following routing turn.
+            # Persist the pending identity so saving while it is absent is safe.
+            pending_identity = dict(identity)
+            self._hmb_suspended_shot_identity = pending_identity
+            suspended = pending_identity
+            self.metadata = {
+                **dict(getattr(self, "metadata", {}) or {}),
+                SEEDANCE_EXECUTION_MODE_METADATA: {
+                    "schema": SEEDANCE_EXECUTION_MODE_SCHEMA,
+                    "version": 1,
+                    "revision": 1,
+                    "mode": "shot",
+                    **pending_identity,
+                },
+            }
         labels: list[str] = []
         selector_map: dict[str, dict[str, Any]] = {}
         for item in available_shots:
@@ -6884,6 +7007,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._apply_seedance_shot_selection(
             selected["shot_uuid"] if isinstance(selected, dict) else "",
             fallback_to_available=fallback_to_available,
+            available_catalog=available_snapshot,
         )
         if self._shot_identity().get("shot_uuid"):
             self._hmb_suspended_shot_identity = None
@@ -7000,6 +7124,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 result = _shot_routing.reconcile_shot_routing(self)
         finally:
             self._hmb_shared_routing_in_progress = False
+        if (strict and isinstance(result, dict)
+                and result.get("code") == "workflow_migration_failed"
+                and self._hmb_seedance_execution_mode() != "only"):
+            raise RuntimeError(
+                "Legacy Shot connections need confirmation. Reconnect the original Prompt/Agent "
+                "to their own Shots before rendering. Original inputs and recovery records are preserved."
+            )
         if strict and self._hmb_shot_channel_subscription()["enabled"]:
             if not isinstance(result, dict):
                 raise RuntimeError("Seedance Shot routing result is invalid.")
@@ -7083,6 +7214,19 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 value = parsed_value
             else:
                 value = {}
+        elif param_name == "prompt":
+            projected = self._hmb_managed_prompt_projection()
+            if projected is not None:
+                value = projected
+                if (not initial_setup
+                        and getattr(self, "parameter_values", {}).get("prompt") == projected):
+                    # The shared native Agent output port also echoes its
+                    # currently displayed Shot on ordinary editor changes.
+                    # An authenticated managed receiver already has its own
+                    # exact UUID result; do not publish the same full native
+                    # parameter again to every connected Generator. Hydration
+                    # and unmanaged/Only inputs keep the native setter path.
+                    return
 
         previous_model_id = ""
         if param_name == "model_id":
@@ -9295,10 +9439,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 raise RuntimeError(
                     "Seedance direct source does not expose the atomic Shot snapshot API."
                 )
-            try:
-                raw_snapshot = snapshot_api(subscription["channel_uuid"])
-            except TypeError:
-                raw_snapshot = snapshot_api()
+            exact_snapshot_api = getattr(source_node, "_hmb_shot_routing_snapshot_for", None)
+            if callable(exact_snapshot_api):
+                raw_snapshot = exact_snapshot_api(
+                    channel_uuid=subscription["channel_uuid"],
+                    shot_uuid=subscription["shot_uuid"],
+                )
+            else:
+                try:
+                    raw_snapshot = snapshot_api(subscription["channel_uuid"])
+                except TypeError:
+                    raw_snapshot = snapshot_api()
             source_snapshot = self._validate_direct_media_snapshot(
                 raw_snapshot,
                 source_kind=source_kind,
@@ -13450,7 +13601,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             response = await asyncio.to_thread(
                 bridge.refresh_job,
                 generation_id,
-                timeout=60,
+                timeout=300,
             )
             if not self._runtime_node_is_live(require_registered=True):
                 return
@@ -14454,7 +14605,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             response = await asyncio.to_thread(
                 bridge.refresh_job,
                 generation_id,
-                timeout=min(60.0, max(1.0, deadline - now)),
+                timeout=min(300.0, max(1.0, deadline - now)),
             )
             if not self._runtime_node_is_live(require_registered=True):
                 return
@@ -15010,6 +15161,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                                 generator=self)
             self._hmb_managed_agent_request = None
 
+    def _managed_agent_input_fingerprint(self, params: Mapping[str, Any]) -> str:
+        """Compare billable inputs around inference, excluding editor-only data."""
+        keys = ("model_id", TASK_PARAMETER, "input_mode", "resolution", "ratio", "duration",
+                "generate_audio", "watermark", "output_format", "return_last_frame",
+                "draft_action", "draft_job_id", "resume_generation_id", "first_frame", "last_frame",
+                "reference_images", "video_references", "video_reference_slots", "reference_audio",
+                "_hmb_finish_look_out", "_hmb_draft_source_bindings")
+        return self._canonical_sha256({key: params.get(key) for key in keys})
+
     async def _prepare_managed_agent_shot(self) -> None:
         """Pull one exact Shot from a manager without executing sibling Agents.
 
@@ -15044,6 +15204,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         selection = validation.get("_hmb_imageasset_project_selection")
         if not isinstance(selection, dict):
             raise _AgentResultUnavailable("The selected Shot project is unavailable. No render was submitted.")
+        prepared_inputs = self._managed_agent_input_fingerprint(validation)
         origin = self._capture_generated_video_origin()
         record = await run_api(channel_uuid=channel, shot_uuid=shot,
                                prompt_owner=prompt_owner, generator=self)
@@ -15058,16 +15219,27 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise asyncio.CancelledError()
         self._assert_imageasset_project_selection(selection)
         current = self._hmb_shot_channel_subscription()
+        current_origin = self._capture_generated_video_origin()
         if (self._manual_agent_prompt_source() is not source
                 or current.get("channel_uuid") != channel or current.get("shot_uuid") != shot
-                or self._capture_generated_video_origin() != origin):
+                or any(current_origin.get(key) != origin.get(key)
+                       for key in ("channel_uuid", "shot_uuid", "source_node_instance_id"))):
             raise _AgentResultUnavailable("The selected Shot changed during Agent execution. No render was submitted.")
+        current_inputs = self._resolve_exact_shot_generation_inputs(self._get_parameters())
+        if self._managed_agent_input_fingerprint(current_inputs) != prepared_inputs:
+            raise _AgentResultUnavailable(
+                "The selected Shot media or generation settings changed during Agent execution. "
+                "Run this Shot again; no render was submitted."
+            )
         if not isinstance(record, dict) or not isinstance(record.get("result"), dict):
             raise _AgentResultUnavailable("The Shot Agent returned no completed result. No render was submitted.")
-        identity_fields = ("channel_uuid", "shot_uuid", "shot_number", "shot_name")
+        # Display name/number may legitimately change after the worker returns.
+        # The frozen ticket stays byte-for-byte intact; current catalog metadata
+        # supplies the submission label, while immutable UUIDs own the result.
+        identity_fields = ("channel_uuid", "shot_uuid")
         result_shot = record.get("shot")
         if (not isinstance(result_shot, dict)
-                or any(result_shot.get(key) != subscription.get(key) for key in identity_fields)):
+                or any(result_shot.get(key) != current.get(key) for key in identity_fields)):
             raise _AgentResultUnavailable("The Agent result belongs to a different Shot. No render was submitted.")
         text, result = record.get("text"), record["result"]
         if (not isinstance(text, str) or not text.strip() or result.get("status") != "succeeded"
@@ -15379,6 +15551,16 @@ class _HMBWebRerenderSource:
             raw = method(channel_uuid, cached_only=True)
         self.snapshots[self.kind] = deepcopy(raw)
         return raw
+
+    def _hmb_shot_routing_snapshot_for(self, *, channel_uuid: str, shot_uuid: str) -> dict[str, Any]:
+        method = getattr(self.source, "_hmb_shot_routing_snapshot_for", None)
+        if callable(method):
+            options = ({"validate_media": False} if self.kind == "video_picker"
+                       else {"cached_only": True})
+            raw = method(channel_uuid=channel_uuid, shot_uuid=shot_uuid, **options)
+            self.snapshots[self.kind] = deepcopy(raw)
+            return raw
+        return self._hmb_shot_routing_snapshot(channel_uuid)
 
 
 class _HMBWebRerenderExecution(HMBSeedanceGeneration):

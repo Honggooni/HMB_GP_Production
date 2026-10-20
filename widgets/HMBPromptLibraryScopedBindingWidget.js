@@ -2873,6 +2873,7 @@ export function normalizeState(input) {
   return {
     schema: "prompt-library-state",
     mode: "prompt_only_role_dashboard",
+    ...(normalizeManualRebindNotice(input?.manual_rebind) ? {manual_rebind:normalizeManualRebindNotice(input.manual_rebind)} : {}),
     multi_shot_enabled: input?.multi_shot_enabled === true,
     shot_documents: hmbNormalizePromptShotDocuments(input?.shot_documents),
     source_sync_revision: normalizeSourceSyncRevision(input?.source_sync_revision),
@@ -2899,6 +2900,15 @@ export function normalizeState(input) {
   };
 }
 
+function normalizeManualRebindNotice(value) {
+  if (!value || value.required !== true || !/^[0-9a-f]{64}$/.test(String(value.expected_source_digest || ""))) return null;
+  const result = {required:true,source_node_name:clean(value.source_node_name).slice(0,256),
+    expected_source_digest:value.expected_source_digest,message:clean(value.message).slice(0,512)};
+  if (value.confirmation && typeof value.confirmation === "object") result.confirmation = {
+    channel_uuid:clean(value.confirmation.channel_uuid).slice(0,128),shot_uuid:clean(value.confirmation.shot_uuid).slice(0,128)};
+  return result;
+}
+
 export function hmbPromptDocumentKey(shot) {
   const selected = normalizeShotSelection(shot);
   return selected.channel_uuid && selected.shot_uuid
@@ -2921,7 +2931,7 @@ function hmbNormalizePromptShotDocuments(value) {
 
 export function hmbStorePromptShotDocument(state) {
   if (state?.multi_shot_enabled !== true) return state;
-  const { shot_documents: documentsValue, disabled: _disabled, ...body } = state;
+  const { shot_documents: documentsValue, disabled: _disabled, manual_rebind: _manualRebind, ...body } = state;
   const documents = hmbNormalizePromptShotDocuments(documentsValue);
   documents[hmbPromptDocumentKey(state.shot)] = JSON.stringify(body);
   state.shot_documents = documents;
@@ -6263,7 +6273,7 @@ function render(state, includeStyle = true) {
   const hImageText = groupHeightStyle(state, "imageText");
   const hVideoSources = groupHeightStyle(state, "videoSources");
   const hVideoText = groupHeightStyle(state, "videoText");
-  const editorMarkup = `<div class="layout">
+  const editorMarkup = `<div class="layout"${state.manual_rebind?.required ? ' inert aria-disabled="true"' : ""}>
       <main class="center">
         <section class="group-card image-card" data-group-id="imageSources" ${hImageSources}><h3>${escapeHtml(uiText(state, "image_source_binding", "IMAGE SOURCE BINDING"))} <b>${state.status.active_images} / ${state.status.max_images}</b></h3><div class="group-body source-scrollbox" data-scroll-id="imageSources"><div class="source-header image-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "target", "TARGET"))}</span><span class="image-video-surface-columns"><span>${escapeHtml(uiText(state, "video_color_pick", "VIDEO / COLOR PICK"))}</span><span class="image-surface-heading">${escapeHtml(uiText(state, "surface_2d", "2DSurface"))}</span></span><span></span></div>${images.map((item, idx) => renderImageRow(item, idx, images, state)).join("")}${renderImageAddRow(images, state)}</div><div class="group-resize-bar nodrag" data-resize-group="imageSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card imgtext" data-group-id="imageText" ${hImageText}><h3>${escapeHtml(uiText(state, "image_text_context", "SHOT TEXT DIRECTION / EXACT LITERALS"))} <b>${escapeHtml(uiText(state, "scene_level_notes", "scene-level notes"))}</b></h3><div class="group-body"><div class="text-grid">${groupBFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="imageText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
@@ -6386,6 +6396,7 @@ function render(state, includeStyle = true) {
     @media (prefers-reduced-motion: reduce){.hmb-dashboard,.hmb-dashboard *,.hmb-dashboard *::before,.hmb-dashboard *::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
   </style>` : ""}<div class="hmb-dashboard-clip nodrag"><div class="hmb-dashboard ${state.disabled ? "disabled" : ""}" data-shot-number="${paletteShotNumber}" data-prompt-manager="${Boolean(state.multi_shot_enabled)}">
     <div class="topbar"><div class="title"><span class="title-mark" aria-hidden="true">PL</span><span>HMBPromptLibrary</span></div><div class="prompt-publish-status" data-prompt-publication-status role="status" aria-live="polite" aria-atomic="true"></div><div class="topbar-controls">${renderShotSelector(state)}<button type="button" class="language-button" data-language-toggle aria-label="Language">${uiLanguage(state) === "ko" ? "한국어" : "EN"}</button></div></div>
+    ${state.manual_rebind?.required ? `<div class="warning" data-manual-rebind-notice role="status" style="flex:0 0 auto;margin:6px 8px 0">${escapeHtml(state.manual_rebind.message || "기존 입력과 결과를 보존했습니다. 상단 샷 선택에서 연결할 샷을 직접 선택하세요.")}</div>` : ""}
     ${state.multi_shot_enabled ? renderPromptShotRows(state, editorMarkup) : editorMarkup}
   </div></div>`;
 }
@@ -8541,6 +8552,7 @@ function hmbNativeUiImplementation(container, props) {
       const handler = () => {
         const shotUuid = clean(shotSelector.value);
         if (shotUuid === HMB_PROMPT_ONLY_SHOT_VALUE) {
+          if (state.manual_rebind?.required) return;
           state.shot = normalizeShotSelection({});
           hmbCommitLocalPromptStructure(
             container,
@@ -8556,6 +8568,8 @@ function hmbNativeUiImplementation(container, props) {
         const selected = catalog.find((item) => item.shot_uuid === shotUuid);
         if (!selected) return;
         state.shot = selected;
+        if (state.manual_rebind?.required) state.manual_rebind.confirmation = {
+          channel_uuid:selected.channel_uuid,shot_uuid:selected.shot_uuid};
         hmbCommitLocalPromptStructure(
           container,
           props,

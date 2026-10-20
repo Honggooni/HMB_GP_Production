@@ -8574,7 +8574,7 @@ class HMBImageAssetLibrary(DataNode):
                 "HMB shot routing channel mismatch: expected "
                 f"{expected!r}, publisher has {snapshot['channel_uuid']!r}."
             )
-        return {
+        result = {
             "schema": snapshot["schema"],
             "version": snapshot["version"],
             "publisher_instance_uuid": snapshot["publisher_instance_uuid"],
@@ -8602,6 +8602,92 @@ class HMBImageAssetLibrary(DataNode):
             ],
             "media_by_source_uid": dict(snapshot["media_by_source_uid"]),
         }
+        return self._hmb_image_shot_snapshot_view(result)
+
+    def _hmb_image_shot_snapshot_view(self, snapshot: Dict[str, Any], *, scoped: bool = False) -> Dict[str, Any]:
+        """Give full/scoped reads one monotonic private snapshot hash clock.
+
+        The reusable catalog, serialized widget and output dependency caches
+        keep their own publication generation. Only this returned immutable
+        view changes: alternating exact Shots cannot reuse one generation for
+        different hashes or invalidate an older full-read document on upgrade.
+        """
+        identity = _sha256_canonical({key: snapshot[key] for key in (
+            "publisher_instance_uuid", "channel_uuid", "project_id", "shots",
+            "ordered_assets", "media_sha256")})
+        lock = getattr(self, "_hmb_scan_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._hmb_scan_lock = lock
+        with lock:
+            previous = getattr(self, "_hmb_image_snapshot_view_identity", "")
+            previous_generation = _non_negative_int(getattr(self, "_hmb_image_snapshot_view_generation", 0))
+            floor = max(1, _non_negative_int(snapshot["generation"]),
+                        _non_negative_int(getattr(self, "_hmb_shot_routing_generation", 0)))
+            generation = max(floor, previous_generation)
+            if identity != previous:
+                # A saved older workflow may already contain the full hash at
+                # floor before this private view clock has been created.
+                generation = max(generation, previous_generation + 1, floor + int(scoped))
+            self._hmb_image_snapshot_view_identity = identity
+            self._hmb_image_snapshot_view_generation = generation
+        result = dict(snapshot, generation=generation)
+        result["metadata_sha256"] = _sha256_canonical({key: result[key] for key in (
+            "channel_uuid", "generation", "project_id", "shots", "ordered_assets")})
+        return result
+
+    def _hmb_shot_routing_snapshot_for(
+        self,
+        *,
+        channel_uuid: str,
+        shot_uuid: str,
+        cached_only: bool = False,
+    ) -> Dict[str, Any]:
+        """Resolve only one exact Shot and reject every missing owned source.
+
+        Another Shot's unavailable share/file must not erase or block this
+        Shot's references. Authored empty [] remains valid; selected missing
+        media is an error, never a successful empty/partial publication.
+        """
+        state = self._current_state()
+        routing = state["shot_routing"]
+        channel, target = _uuid_text(channel_uuid), _uuid_text(shot_uuid)
+        if not channel or not target or channel != routing["channel_uuid"]:
+            raise ValueError("ImageAsset exact Shot channel or identity is unavailable.")
+        selected = next((row for row in routing["shots"] if row["shot_uuid"] == target), None)
+        if selected is None:
+            raise ValueError("ImageAsset exact Shot is no longer in the current catalog.")
+        requested = list(selected["selected_source_uids"])
+        by_uid = {_clean(row.get("source_uid")): row for row in state["assets"]
+                  if row.get("selected")}
+        if any(uid not in by_uid for uid in requested):
+            raise ValueError("ImageAsset exact Shot addresses an unavailable selected image.")
+        scoped = dict(state)
+        scoped["assets"] = [dict(by_uid[uid], selected=True, selection_order=index)
+                            for index, uid in enumerate(requested, 1)]
+        scoped["shot_routing"] = dict(routing, shots=[dict(selected, selected_source_uids=requested)],
+                                       active_shot_uuid=target)
+        self._consume_selection_resolution()
+        cache = self._resolution_cache_for_state(scoped)
+        revision = _non_negative_int(getattr(self, "_hmb_import_revision", 0))
+        if cached_only:
+            if any(_asset_resolution_cache_key(row, scoped, revision) not in cache for row in scoped["assets"]):
+                raise _ImageAssetSelectionPreparing("ImageAsset exact Shot media cache is still preparing.")
+        else:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None and self._defer_project_selection_resolution(scoped):
+                raise _ImageAssetSelectionPreparing("ImageAsset exact Shot media is still preparing.")
+        snapshot = _build_shot_routing_snapshot(scoped,
+            getattr(self, "_hmb_import_media_by_uid", {}), resolution_cache=cache,
+            import_revision=revision, generation=max(1, _non_negative_int(routing["generation"])), normalized=True)
+        actual = snapshot["shots"][0]["selected_source_uids"]
+        if actual != requested:
+            missing = [uid for uid in requested if uid not in snapshot["media_by_source_uid"]]
+            raise ValueError("ImageAsset exact Shot selected image media is unavailable: " + ", ".join(missing))
+        return self._hmb_image_shot_snapshot_view(snapshot, scoped=True)
 
     def _hmb_shot_routing_catalog(self) -> Dict[str, Any]:
         """Return the bounded, media-free Shot catalog used by same-flow peers."""
@@ -8643,7 +8729,19 @@ class HMBImageAssetLibrary(DataNode):
         }
 
     def _hmb_shot_channel_subscription(self) -> Dict[str, Any]:
-        routing = self._current_state()["shot_routing"]
+        # The accepted canonical native value owns this bounded scalar view.
+        # A pending setter/hydration with a different raw value must follow the
+        # original normalizer; never reuse another generation by names/count.
+        baseline = getattr(self, "_hmb_shot_subscription_baseline", None)
+        raw = _get_parameter_raw(self, WIDGET_STATE_PARAMETER)
+        if (isinstance(baseline, tuple) and len(baseline) == 2
+                and isinstance(baseline[0], str)
+                and isinstance(raw, str) and raw == baseline[0]):
+            return dict(baseline[1])
+        return self._hmb_shot_subscription_value(self._current_state()["shot_routing"])
+
+    @staticmethod
+    def _hmb_shot_subscription_value(routing: Dict[str, Any]) -> Dict[str, Any]:
         active = next(
             (
                 item
@@ -9055,6 +9153,10 @@ class HMBImageAssetLibrary(DataNode):
         self._hmb_catalog_search_selected = tuple(
             asset for asset in normalized_state.get("assets", []) if asset.get("selected"))
         self._hmb_last_accepted_widget_state = serialized or _json_text(normalized_state)
+        self._hmb_shot_subscription_baseline = (
+            self._hmb_last_accepted_widget_state,
+            self._hmb_shot_subscription_value(normalized_state["shot_routing"]),
+        )
         self._hmb_last_accepted_widget_revisions = (
             _non_negative_int(normalized_state.get("scan_revision")),
             _non_negative_int(normalized_state.get(UI_EDIT_REVISION_KEY)),

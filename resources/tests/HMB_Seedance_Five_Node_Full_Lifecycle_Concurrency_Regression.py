@@ -287,6 +287,17 @@ class FullLifecycleNode(target.HMBSeedanceGeneration):
     def _get_parameters(self) -> dict:
         return dict(self.params)
 
+    def _get_parameters_for_start_validation(self) -> dict:
+        # Validate the same synthetic Text-only request that this fixture
+        # submits, rather than the unedited native constructor defaults.
+        # The production validation and submission functions remain real.
+        return self._get_parameters()
+
+    def _manual_agent_prompt_source(self):
+        # These standalone transport fixtures have no retained host graph or
+        # upstream Agent. Real connected prompt ownership has SDK coverage.
+        return None
+
     def _resolve_exact_shot_generation_inputs(
         self,
         params: dict,

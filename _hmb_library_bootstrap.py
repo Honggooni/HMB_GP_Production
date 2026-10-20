@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import ast
+import asyncio
 import hashlib
 import inspect
 import ipaddress
@@ -1169,6 +1170,33 @@ except ImportError:
     _LOAD_TYPES = ()
     is_loading_workflow = lambda: False
 
+try:
+    from griptape_nodes.retained_mode.events import flow_events, node_events, workflow_events
+    _SERIALIZE_TYPES = tuple(value for module, name in (
+        (flow_events, "SerializeFlowToCommandsRequest"),
+        (node_events, "SerializeNodeToCommandsRequest"),
+        (node_events, "SerializeSelectedNodesToCommandsRequest"),
+    ) if isinstance(value := getattr(module, name, None), type))
+    _SAVE_TYPES = tuple(value for name in (
+        "SaveWorkflowRequest", "SaveWorkflowFileFromSerializedFlowRequest", "SaveSubflowToWorkflowRequest",
+    ) if isinstance(value := getattr(workflow_events, name, None), type))
+except ImportError:
+    _SERIALIZE_TYPES, _SAVE_TYPES = (), ()
+
+_CONTEXT_SNAPSHOT_BUSY_MESSAGE = (
+    "The workflow is still loading, consolidating, or being serialized. "
+    "Wait for it to finish, then retry this request. "
+    "This request was refused; it was not queued and no workflow file was written."
+)
+
+
+def _context_snapshot_owner() -> tuple[int, int]:
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    return threading.get_ident(), id(task) if task is not None else 0
+
 
 def _migration_module() -> Any:
     path = Path(__file__).with_name("_hmb_workflow_migration.py")
@@ -1240,6 +1268,10 @@ class _Registration:
         self.load_requests: dict[int, Any] = {}
         self.load_post_hook = self.after_workflow_load
         self.load_post_types: list[Any] = []
+        self.snapshot_requests: dict[int, tuple[Any, tuple[int, int]]] = {}
+        self.snapshot_refused_loads: dict[int, Any] = {}
+        self.snapshot_post_hook = self.after_context_snapshot
+        self.snapshot_post_types: list[Any] = []
         self.web_worker_module = None
 
     def start_web_worker(self) -> None:
@@ -1271,8 +1303,15 @@ class _Registration:
         # Dispatch is also the late-loop wakeup after a desktop startup that
         # loaded libraries before initializing its event queue.
         self.start_web_worker()
+        snapshot_failure = self._guard_context_snapshot_request(request)
+        if snapshot_failure is not None:
+            return snapshot_failure
         migration_failure = self._guard_migration_mutation(request)
         if migration_failure is not None:
+            if type(request) in _LOAD_TYPES:
+                with self.lock:
+                    self.load_requests.pop(id(request), None)
+                    self.snapshot_refused_loads[id(request)] = weakref.ref(request)
             return migration_failure
         self._observe_workflow_load(request)
         prompt_failure = self._guard_prompt_creation(request)
@@ -1532,6 +1571,9 @@ class _Registration:
         if not self._prompt_owner(engine, manager):
             return
         with self.lock:
+            refused = self.snapshot_refused_loads.pop(id(request), None)
+            if refused is not None and refused() is request:
+                return  # A refused load never owned migration/load state.
             self.load_requests.pop(id(request), None)
             self.load_requests = {key: owner for key, owner in self.load_requests.items() if owner() is not None}
             if self.load_requests:
@@ -1542,6 +1584,59 @@ class _Registration:
         else:
             for name in migration.pending_flow_names(engine):
                 migration.clear_flow_migration_pending(engine, name)
+
+    def _guard_context_snapshot_request(self, request: Any) -> Any:
+        """Refuse overlapping SDK scopes without repairing or guessing a Flow.
+
+        SDK serialization enters process-shared Flow/Node context stacks. A
+        second thread/task must not enter those scopes while a load or another
+        serializer owns them. Only short registry updates hold ``self.lock``;
+        it is never held across a handler, await, or detached post hook.
+        """
+        request_type = type(request)
+        if request_type not in (*_SERIALIZE_TYPES, *_SAVE_TYPES, *_LOAD_TYPES):
+            return None
+        engine, manager = self.engine(), self.manager()
+        if not self._prompt_owner(engine, manager):
+            return None
+        migration = sys.modules.get("_hmb_workflow_migration")
+        internal = bool(migration is not None and migration.mutation_is_internal())
+        owner = _context_snapshot_owner()
+        with self.lock:
+            self.load_requests = {key: reference for key, reference in self.load_requests.items() if reference() is not None}
+            self.snapshot_requests = {key: value for key, value in self.snapshot_requests.items() if value[0]() is not None}
+            another_serializer = any(value[1] != owner for value in self.snapshot_requests.values())
+            if request_type in _LOAD_TYPES:
+                busy = another_serializer
+            else:
+                loading = bool(self.load_requests) and not is_loading_workflow()
+                migrating = bool(migration is not None and migration.flow_migration_inflight(engine))
+                busy = bool(not internal and (loading or migrating))
+                if request_type in _SERIALIZE_TYPES:
+                    busy = busy or another_serializer
+            if busy:
+                if request_type in _LOAD_TYPES:
+                    self.snapshot_refused_loads[id(request)] = weakref.ref(request)
+                from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
+                return GenericResultFailure(result_details=_CONTEXT_SNAPSHOT_BUSY_MESSAGE)
+            if request_type in _LOAD_TYPES:
+                # Publish the admission while still holding the same lock as
+                # the serializer check. Waiting until _observe_workflow_load
+                # leaves a window where another thread can admit a snapshot.
+                self.load_requests[id(request)] = weakref.ref(request)
+            if request_type in _SERIALIZE_TYPES and request_type in self.snapshot_post_types:
+                # Nested SerializeNode/Flow requests in the same synchronous
+                # owner are balanced native scopes, as are sequential requests
+                # whose detached completion notifications have not run yet.
+                self.snapshot_requests[id(request)] = (weakref.ref(request), owner)
+        return None
+
+    async def after_context_snapshot(self, request: Any, _result: Any) -> None:
+        """Release only this request's admission, including native failures."""
+        with self.lock:
+            previous = self.snapshot_requests.get(id(request))
+            if previous is not None and previous[0]() is request:
+                self.snapshot_requests.pop(id(request), None)
 
     def _guard_migration_mutation(self, request: Any) -> Any:
         engine = self.engine()
@@ -1613,6 +1708,9 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
                         for request_type in _LOAD_TYPES:
                             manager.add_post_dispatch_hook(request_type, registration.load_post_hook)
                             registration.load_post_types.append(request_type)
+                        for request_type in _SERIALIZE_TYPES:
+                            manager.add_post_dispatch_hook(request_type, registration.snapshot_post_hook)
+                            registration.snapshot_post_types.append(request_type)
                     _REGISTRATIONS[manager] = registration
                 elif registration.engine() is not engine:
                     return
@@ -1636,6 +1734,8 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
                     _release_windows_transport_close_guard(registration)
                     registration.prompt_pending.clear()
                     registration.load_requests.clear()
+                    registration.snapshot_requests.clear()
+                    registration.snapshot_refused_loads.clear()
                     engine = registration.engine()
                     migration = sys.modules.get("_hmb_workflow_migration")
                     if migration is not None and engine is not None:
@@ -1660,6 +1760,12 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
                             except Exception:
                                 pass
                         registration.load_post_types.clear()
+                        for request_type in registration.snapshot_post_types:
+                            try:
+                                manager.remove_post_dispatch_hook(request_type, registration.snapshot_post_hook)
+                            except Exception:
+                                pass
+                        registration.snapshot_post_types.clear()
                         if _REGISTRATIONS.get(manager) is registration:
                             _REGISTRATIONS.pop(manager, None)
             self._registrations.clear()

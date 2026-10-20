@@ -1,10 +1,10 @@
 {
-  "canonical_source_sha256": "c9446f206914c75bd06a624f9b86fd8113a7415d4faeb7c967f009372afdf138",
+  "canonical_source_sha256": "9e11dc3a60933979278a953636c423e86d78d7caee9bca8dd958b8cb43ec8e7c",
   "schema": "hmb-release-pair-parity",
-  "target_odd_release_label": "v0.8.11",
-  "target_odd_version": "0.8.11",
-  "tested_even_archive_sha256": "bbe16bb4f9a2a3c74e5212aabc23551b02a82c25ad3c6437f86677c224a20a0c",
-  "tested_even_release_label": "v0.8.10",
-  "tested_even_version": "0.8.10",
+  "target_odd_release_label": "v0.8.13",
+  "target_odd_version": "0.8.13",
+  "tested_even_archive_sha256": "def52c8ab0016b1ebfa0028f3cf071618d09b55263277abae8429f8afdac905c",
+  "tested_even_release_label": "v0.8.12",
+  "tested_even_version": "0.8.12",
   "version": 1
 }

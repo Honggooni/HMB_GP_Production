@@ -1024,7 +1024,15 @@ assert '_AGENT_SHOT_ROW_PREFIX = "HMB_AGENT_SHOT_ROW_"' in agent_source
 assert '"traits"] = {Widget(name=_AGENT_WIDGET_NAME' in row_source
 assert 'self.add_parameter(Parameter(**kwargs))' in row_source
 assert '"schema": "hmb-agent-shot-row"' in layout_source
-assert 'ordered.extend(body)' in layout_source and 'reorder([item.name for item in ordered])' in layout_source
+assert 'ordered.extend(body)' in layout_source
+# Root ordering now has one atomic publication boundary. The installed SDK
+# accordion host regression verifies native identity, descendants and events;
+# this source surface check must not require the removed remove/add lifecycle.
+assert "_hmb_publish_editor_element_order" in agent_methods
+assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    and node.func.attr == "_hmb_publish_editor_element_order"
+    and len(node.args) == 1 and isinstance(node.args[0], ast.Name) and node.args[0].id == "ordered"
+    for node in ast.walk(agent_methods["_hmb_layout_shot_editor"]))
 assert 'rawValue?.schema === "hmb-agent-shot-row"' in agent_widget
 assert 'hmb-agent-shot-accordion' in agent_widget and 'class="agent-shot-tab nodrag"' in agent_widget
 assert 'aria-expanded=' in agent_widget and 'class="agent-shot-run nodrag"' in agent_widget

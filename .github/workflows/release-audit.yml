@@ -254,6 +254,10 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Separates all five Shot Prompt documents, native Agent settings, execution results and Generator deliveries by immutable Shot UUID. Switching the visible Agent tab cannot copy its output to sibling Generators; stale, deleted or reassigned workers cannot publish results.",
+            "- Preserves ambiguous legacy Prompt and Agent nodes with a verified recovery snapshot until each original editor is explicitly assigned to its own Shot. Conflicting authoring is never overwritten. Confirmed recovery survives disconnected notifications and host shutdown; verified consolidation restores normal full-shot exports.",
+            "- Updates Shot additions, deletions and exact-UUID restoration through bounded catalog reconciliation, target-only media validation and a stable native Agent accordion. A missing sibling image/video stays local to its Shot, and media/settings changed during inference are rejected before a new render submission.",
+            "- Restores the workflow context for additional Generator, Color LUT and Finish Look creation. Saved media, Task IDs, authored options and existing connections remain protected during lifecycle recovery.",
             "- Supports normal Git Update/Override without requiring the ZIP installer. The next cold library load checks known legacy editor dependencies, preserves a verified recovery copy and performs targeted cleanup. Loaded modules defer cleanup until a full Griptape restart; unknown or customized dependency layouts are preserved.",
             "- Keeps optional TOS uploads in a dedicated .venv-tos child interpreter. TOS preparation runs separately from Cloud generation, saved Tasks and local previews; rendering never installs packages. Interrupted or unverifiable migration cannot be mistaken for successful cleanup.",
             "- Applies Griptape's disabled state to all nine HMB widgets, including same-value updates and retired callbacks. Playback, available result retrieval and cancellation remain usable; existing palettes, dimensions and native local-video previews are preserved.",

@@ -3243,6 +3243,22 @@ def _normalize_shot_selection(value: Any) -> Dict[str, Any]:
     }
 
 
+def _normalize_manual_rebind_notice(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict) or value.get("required") is not True:
+        return {}
+    digest = _clean_string(value.get("expected_source_digest"))
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return {}
+    notice = {"required": True, "source_node_name": _clean_string(value.get("source_node_name"))[:256],
+        "expected_source_digest": digest,
+        "message": _clean_string(value.get("message"))[:512]}
+    confirmation = value.get("confirmation")
+    if isinstance(confirmation, dict):
+        notice["confirmation"] = {key: _clean_string(confirmation.get(key))[:128]
+            for key in ("channel_uuid", "shot_uuid")}
+    return notice
+
+
 def _normalize_shot_catalog(value: Any) -> List[Dict[str, Any]]:
     if not isinstance(value, (list, tuple)):
         return []
@@ -3968,6 +3984,29 @@ def _shot_catalog_from_snapshot(snapshot: Dict[str, Any]) -> List[Dict[str, Any]
     ]
 
 
+def _shot_catalog_from_exact_snapshot(
+    snapshot: Dict[str, Any],
+    catalog: Dict[str, Any],
+    previous: Any,
+) -> List[Dict[str, Any]]:
+    """Keep full selector choices while one exact Shot supplies media facts."""
+    if snapshot["channel_uuid"] != catalog["channel_uuid"]:
+        raise _ShotRoutingContractError("Exact Shot snapshot and selector channels differ.")
+    previous_by_uuid = {row["shot_uuid"]: row for row in _normalize_shot_catalog(previous)
+        if row["channel_uuid"] == snapshot["channel_uuid"]}
+    exact_by_uuid = {row["shot_uuid"]: row for row in snapshot["shots"]}
+    catalog_by_uuid = {row["shot_uuid"]: row for row in catalog["shots"]}
+    for shot_uuid, row in exact_by_uuid.items():
+        expected = catalog_by_uuid.get(shot_uuid)
+        if expected is None or any(row[key] != expected[key] for key in ("number", "name")):
+            raise _ShotRoutingContractError("Exact Shot snapshot and selector metadata differ.")
+    return [{"shot_uuid": row["shot_uuid"], "channel_uuid": catalog["channel_uuid"],
+        "name": row["name"], "number": row["number"],
+        "selected_source_uids": list(exact_by_uuid.get(row["shot_uuid"],
+            previous_by_uuid.get(row["shot_uuid"], {})).get("selected_source_uids", []))}
+        for row in catalog["shots"]]
+
+
 def _compact_catalog_from_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     shots = [
         {
@@ -4353,6 +4392,8 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "schema": STATE_SCHEMA,
         "mode": MODE_NAME,
+        **({"manual_rebind": _normalize_manual_rebind_notice(state.get("manual_rebind"))}
+            if _normalize_manual_rebind_notice(state.get("manual_rebind")) else {}),
         "multi_shot_enabled": state.get("multi_shot_enabled") is True,
         # Dormant editors remain encoded data. Normalizing one visible editor
         # must not parse and rebuild another four source dashboards.
@@ -4406,7 +4447,7 @@ def _store_prompt_shot_document(state: Dict[str, Any]) -> Dict[str, Any]:
     if state.get("multi_shot_enabled") is not True:
         return state
     documents = _normalize_prompt_shot_documents(state.get("shot_documents"))
-    payload = {key: value for key, value in state.items() if key not in {"shot_documents", "disabled"}}
+    payload = {key: value for key, value in state.items() if key not in {"shot_documents", "disabled", "manual_rebind"}}
     documents[_prompt_document_key(state.get("shot"))] = _json_dumps(payload)
     state["shot_documents"] = documents
     return state
@@ -4415,7 +4456,7 @@ def _store_prompt_shot_document(state: Dict[str, Any]) -> Dict[str, Any]:
 def _prompt_authoring_sync_fingerprint(value: Any) -> str:
     state = _normalize_state(value if isinstance(value, dict) else _parse_state(value))
     return _canonical_sha256({key: item for key, item in state.items()
-        if key not in {"ui", "shot_documents", SOURCE_SYNC_REVISION_KEY, UI_EDIT_REVISION_KEY}})
+        if key not in {"ui", "shot_documents", "manual_rebind", SOURCE_SYNC_REVISION_KEY, UI_EDIT_REVISION_KEY}})
 
 
 def _prompt_document_intent_fingerprint(value: Any) -> str:
@@ -10409,6 +10450,9 @@ class HMBPromptLibrary(DataNode):
     ) -> tuple[Dict[str, Any], List[str], List[str], bool, bool]:
         """Project one graph-owned shot generation onto Prompt state/media."""
 
+        if self._hmb_manual_rebind_pending():
+            raise _ShotRoutingContractError("Legacy Prompt requires an explicit Shot rebind before execution.")
+
         self._hmb_picker_route_hydration_pending = False
         normalized = state if already_normalized else _normalize_state(state)
         sources = getattr(self, "_hmb_connected_source_nodes", {})
@@ -10452,13 +10496,22 @@ class HMBPromptLibrary(DataNode):
         image_api = getattr(
             image_source_node, "_hmb_shot_routing_snapshot", None
         )
+        image_target_api = getattr(image_source_node, "_hmb_shot_routing_snapshot_for", None)
+        image_catalog_api = getattr(image_source_node, "_hmb_shot_routing_catalog", None)
+        compact_catalog = None
         if image_source_node is not None and not callable(image_api):
             raise _ShotRoutingContractError(
                 "Connected ImageAsset publisher has no exact Shot snapshot API."
             )
         if callable(image_api):
             image_exact = True
-            raw_snapshot = image_api(expected_channel_uuid=expected_channel)
+            if callable(image_target_api) and callable(image_catalog_api) and current_shot["shot_uuid"]:
+                compact_catalog = _validate_shot_routing_catalog(image_catalog_api(),
+                    expected_channel_uuid=expected_channel)
+            image_targeted = bool(compact_catalog and any(
+                row["shot_uuid"] == current_shot["shot_uuid"] for row in compact_catalog["shots"]))
+            raw_snapshot = (image_target_api(channel_uuid=expected_channel, shot_uuid=current_shot["shot_uuid"])
+                if image_targeted else image_api(expected_channel_uuid=expected_channel))
             image_snapshot = _validate_shot_routing_snapshot(
                 raw_snapshot,
                 expected_channel_uuid=expected_channel,
@@ -10470,7 +10523,11 @@ class HMBPromptLibrary(DataNode):
                     if isinstance(normalized.get("image_asset"), dict) else {},
                 label="ImageAsset shot routing",
             )
-            compact_catalog = _compact_catalog_from_snapshot(image_snapshot)
+            if compact_catalog is None:
+                compact_catalog = _compact_catalog_from_snapshot(image_snapshot)
+            image_catalog_rows = (_shot_catalog_from_exact_snapshot(image_snapshot, compact_catalog,
+                normalized.get("image_asset", {}).get("shot_catalog")) if image_targeted
+                else _shot_catalog_from_snapshot(image_snapshot))
             selected_uuid_exists = any(
                 item["shot_uuid"] == current_shot["shot_uuid"]
                 for item in image_snapshot["shots"]
@@ -10499,7 +10556,7 @@ class HMBPromptLibrary(DataNode):
                 )
                 image_asset["shot_catalog"] = (
                     self._hmb_available_prompt_shot_catalog(
-                        _shot_catalog_from_snapshot(image_snapshot),
+                        image_catalog_rows,
                         current_shot,
                     )
                 )
@@ -10541,7 +10598,7 @@ class HMBPromptLibrary(DataNode):
                 )
                 image_asset["shot_catalog"] = (
                     self._hmb_available_prompt_shot_catalog(
-                        _shot_catalog_from_snapshot(image_snapshot),
+                        image_catalog_rows,
                         current_shot,
                     )
                 )
@@ -10557,6 +10614,9 @@ class HMBPromptLibrary(DataNode):
 
         picker_api = getattr(
             picker_source_node, "_hmb_shot_routing_snapshot", None
+        )
+        picker_target_api = getattr(
+            picker_source_node, "_hmb_shot_routing_snapshot_for", None
         )
         if picker_source_node is not None and not callable(picker_api):
             raise _ShotRoutingContractError(
@@ -10634,9 +10694,15 @@ class HMBPromptLibrary(DataNode):
                 )
             picker_exact = True
             try:
-                raw_picker_snapshot = picker_api(
-                    expected_channel_uuid=expected_channel
-                )
+                if callable(picker_target_api):
+                    raw_picker_snapshot = picker_target_api(
+                        channel_uuid=expected_channel,
+                        shot_uuid=current_shot["shot_uuid"],
+                    )
+                else:
+                    raw_picker_snapshot = picker_api(
+                        expected_channel_uuid=expected_channel
+                    )
             except ValueError as exc:
                 transient_messages = {
                     "VideoPicker Shot channel is unavailable or does not match.",
@@ -10715,8 +10781,11 @@ class HMBPromptLibrary(DataNode):
                 if isinstance(normalized.get("picker"), dict)
                 else {}
             )
-            picker_state["shot_catalog"] = _shot_catalog_from_snapshot(
-                picker_snapshot
+            picker_state["shot_catalog"] = (
+                _shot_catalog_from_exact_snapshot(picker_snapshot, compact_catalog,
+                    picker_state.get("shot_catalog"))
+                if callable(picker_target_api) and compact_catalog is not None
+                else _shot_catalog_from_snapshot(picker_snapshot)
             )
             picker_state["shot_routing"] = _routing_projection(
                 picker_snapshot, picker_shot["selected_source_uids"]
@@ -10744,7 +10813,7 @@ class HMBPromptLibrary(DataNode):
             "schema": "hmb-shot-channel-subscription",
             "version": 1,
             "participant_kind": "prompt",
-            "enabled": bool(shot["channel_uuid"] and shot["shot_uuid"]),
+            "enabled": bool(shot["channel_uuid"] and shot["shot_uuid"] and not self._hmb_manual_rebind_pending()),
             "channel_uuid": shot["channel_uuid"],
             "shot_uuid": shot["shot_uuid"],
             "shot_number": shot["number"],
@@ -10780,6 +10849,160 @@ class HMBPromptLibrary(DataNode):
             self._accept_widget_state_baseline(raw)
         finally:
             self._hmb_ui_syncing = previous
+
+    @staticmethod
+    def _hmb_manual_rebind_authored(state: Dict[str, Any]) -> Dict[str, Any]:
+        authored = {key: copy.deepcopy(state.get(key)) for key in
+            ("images", "videos", "text", "shot_documents", _SOURCE_INTENT_FALLBACKS_KEY)}
+        # ``present`` is derived again when a formerly independent row gains
+        # a Shot scope. It is not a user-authored value or rebind authority.
+        for field in ("images", "videos"):
+            for row in authored.get(field) or []:
+                if isinstance(row, dict):
+                    row.pop("present", None)
+        return authored
+
+    def _hmb_manual_rebind_pending(self) -> bool:
+        if getattr(self, "_hmb_manual_rebind_committing", False):
+            return False
+        if isinstance(getattr(self, "_hmb_manual_rebind", None), dict):
+            return True
+        raw = _get_parameter_raw(self, WIDGET_PARAMETER_NAME)
+        baseline = getattr(self, "_hmb_last_accepted_widget_state", None)
+        cached = getattr(self, "_hmb_last_accepted_manual_rebind_pending", None)
+        if isinstance(raw, str) and raw == baseline and isinstance(cached, tuple) and cached[0] is baseline:
+            return cached[1] is True
+        return self._current_state().get("manual_rebind", {}).get("required") is True
+
+    def _hmb_manual_rebind_state(self, state: Dict[str, Any]) -> None:
+        raw = _json_dumps(state)
+        self._hmb_write_merged_prompt_state(raw)
+        publisher = getattr(self, "publish_update_to_parameter", None)
+        if callable(publisher):
+            try:
+                publisher(WIDGET_PARAMETER_NAME, raw)
+            except Exception as error:
+                # The canonical state and controller token already own the
+                # notice. A disconnected editor may retrieve it after reload;
+                # a transient UI notification cannot strand that transaction.
+                _diagnostic_exception("Manual Shot binding notice publication failed", error)
+
+    def _hmb_prepare_manual_rebind(self, catalog: Any, info: Any) -> bool:
+        """Expose choices without assigning an ambiguous legacy editor's work."""
+        with self._hmb_sync_lock:
+            state = self._current_state()
+            if self._hmb_node_deleted or state.get("multi_shot_enabled") is True:
+                return False
+            if isinstance(getattr(self, "_hmb_manual_rebind", None), dict):
+                return True
+            catalog = _validate_shot_routing_catalog(catalog)
+            digest = _clean_string(info.get("expected_source_digest")) if isinstance(info, dict) else ""
+            if digest != self._hmb_prompt_merge_snapshot()["state_sha256"]:
+                return False
+            self._hmb_manual_rebind = {"catalog": copy.deepcopy(catalog), "info": copy.deepcopy(info),
+                "authored": self._hmb_manual_rebind_authored(state), "original_state": copy.deepcopy(state),
+                "outputs": copy.deepcopy(dict(self.parameter_output_values))}
+            self._hmb_initial_shot_autoclaim_pending = False
+            self._hmb_initial_shot_preferred_uuid = ""
+            self._hmb_sync_generation += 1
+            self._hmb_sync_queued_token = None
+            state["image_asset"]["shot_catalog"] = [{**row, "channel_uuid": catalog["channel_uuid"],
+                "selected_source_uids": []} for row in catalog["shots"]]
+            state["image_asset"]["shot_catalog_routing"] = _catalog_routing_projection(catalog)
+            state["manual_rebind"] = {"required": True, "expected_source_digest": digest,
+                "source_node_name": _clean_string(info.get("source_node_name"))[:256],
+                "message": "기존 입력과 결과를 보존했습니다. 상단 샷 선택에서 연결할 샷을 직접 선택하세요."}
+            state[SOURCE_SYNC_REVISION_KEY] = min(MAX_SOURCE_SYNC_REVISION,
+                int(state.get(SOURCE_SYNC_REVISION_KEY) or 0) + 1)
+            self._hmb_manual_rebind_state(state)
+            return True
+
+    def _hmb_apply_manual_rebind(self, value: Any) -> bool:
+        """Consume one explicit legacy dropdown action; never a manager tab."""
+        with self._hmb_sync_lock:
+            return self._hmb_apply_manual_rebind_locked(value)
+
+    def _hmb_apply_manual_rebind_locked(self, value: Any) -> bool:
+        marker = getattr(self, "_hmb_manual_rebind", None)
+        if not isinstance(marker, dict):
+            return False
+        state = self._current_state()
+        incoming = value if isinstance(value, dict) else _parse_state(value)
+        raw_notice = incoming.get("manual_rebind", {}) if isinstance(incoming, dict) else {}
+        confirmation = raw_notice.get("confirmation") if isinstance(raw_notice, dict) else None
+        runtime_fields = ("_hmb_last_prompt_output", "_hmb_last_machine_prompt_output",
+            "_hmb_last_prompt_semantic_fingerprint", "_hmb_compile_cache_epoch", "_hmb_compiled_prompt_pairs",
+            "_hmb_last_shot_context", "_hmb_last_agent_context_pair", "_hmb_current_shot_images",
+            "_hmb_current_shot_videos", "_hmb_pending_prompt_notification", "_hmb_prompt_notification_generation",
+            "_hmb_hydrated_document_sources", "_hmb_hydrated_document_routes")
+        sentinel = object()
+        saved_runtime = {name: getattr(self, name, sentinel) for name in runtime_fields}
+        saved_outputs = dict(self.parameter_output_values)
+        try:
+            if state.get("multi_shot_enabled") is True or not isinstance(confirmation, dict):
+                raise ValueError("상단 샷 선택에서 연결할 샷을 직접 선택하세요.")
+            if raw_notice.get("expected_source_digest") != marker["info"]["expected_source_digest"]:
+                raise ValueError("이전 화면의 재연결 요청은 적용하지 않았습니다. 현재 샷을 다시 선택하세요.")
+            normalized = _normalize_state(incoming)
+            if self._hmb_manual_rebind_authored(state) != marker["authored"]:
+                raise ValueError("원본 입력이 변경되어 연결을 적용하지 않았습니다. 저장한 작업을 다시 확인하세요.")
+            if self._hmb_manual_rebind_authored(normalized) != marker["authored"]:
+                raise ValueError("재연결 요청에 다른 입력값이 포함되어 적용하지 않았습니다. 현재 샷을 다시 선택하세요.")
+            requested = _normalize_shot_selection(normalized.get("shot"))
+            if any(confirmation.get(key) != requested[key] for key in ("channel_uuid", "shot_uuid")):
+                raise ValueError("재연결할 샷의 UUID가 일치하지 않습니다.")
+            exact = next((row for row in marker["catalog"]["shots"]
+                if row["shot_uuid"] == requested["shot_uuid"] and marker["catalog"]["channel_uuid"] == requested["channel_uuid"]), None)
+            if exact is None:
+                raise ValueError("선택한 샷이 현재 프로젝트에 없습니다.")
+            key = _prompt_document_key(requested)
+            if key in _normalize_prompt_shot_documents(state.get("shot_documents")) and key != _prompt_document_key(state.get("shot")):
+                raise ValueError("선택한 샷에 기존 프롬프트가 있어 덮어쓰지 않았습니다.")
+            from _hmb_workflow_migration import validate_manual_rebind, confirm_manual_rebind
+            admitted = validate_manual_rebind(self, marker["info"]["expected_source_digest"],
+                channel_uuid=requested["channel_uuid"], shot_uuid=requested["shot_uuid"])
+            if not isinstance(admitted, dict) or admitted.get("ok") is not True:
+                raise ValueError("현재 워크플로와 프로젝트 연결을 확인하지 못했습니다.")
+            target = copy.deepcopy(state)
+            target["shot"] = {**exact, "channel_uuid": requested["channel_uuid"], "selected_source_uids": []}
+            target.pop("manual_rebind", None)
+            target["image_asset"]["shot_routing"] = {}
+            target["picker"]["shot_routing"] = {}
+            target[UI_EDIT_REVISION_KEY] = max(int(state.get(UI_EDIT_REVISION_KEY) or 0),
+                int(normalized.get(UI_EDIT_REVISION_KEY) or 0)) + 1
+            self._hmb_manual_rebind_committing = True
+            self._hmb_manual_rebind_state(target)
+            self._hmb_compile_cache_epoch = int(getattr(self, "_hmb_compile_cache_epoch", 0)) + 1
+            self._hmb_compiled_prompt_pairs = {}
+            self._hmb_last_prompt_output = self._hmb_last_machine_prompt_output = None
+            self._hmb_last_prompt_semantic_fingerprint = ""
+            self._hmb_last_shot_context = self._hmb_last_agent_context_pair = {}
+            self._hmb_current_shot_images = self._hmb_current_shot_videos = []
+            self._hmb_pending_prompt_notification = None
+            self._hmb_hydrated_document_sources = {}
+            self._hmb_hydrated_document_routes = {}
+            for output, empty in (("PROMPT_OUT", ""), (SHOT_IMAGE_OUTPUT_PARAMETER_NAME, []), (SHOT_VIDEO_OUTPUT_PARAMETER_NAME, [])):
+                set_output(self, output, empty)
+            result = confirm_manual_rebind(self, marker["info"]["expected_source_digest"])
+            if not isinstance(result, dict) or result.get("ok") is not True:
+                raise ValueError("재연결 확인이 완료되지 않아 원본 입력으로 복원했습니다.")
+            self._hmb_manual_rebind = None
+            return True
+        except Exception as error:
+            self._hmb_manual_rebind_committing = False
+            for name, previous in saved_runtime.items():
+                if previous is sentinel:
+                    self.__dict__.pop(name, None)
+                else:
+                    setattr(self, name, previous)
+            self.parameter_output_values.clear()
+            self.parameter_output_values.update(saved_outputs)
+            state["manual_rebind"]["message"] = _clean_string(str(error))[:512]
+            state["manual_rebind"].pop("confirmation", None)
+            self._hmb_manual_rebind_state(state)
+            return True
+        finally:
+            self._hmb_manual_rebind_committing = False
 
     def _hmb_import_prompt_documents(self, documents: Any, *, expected_state_sha256: str) -> Dict[str, Any]:
         """CAS-import authored documents; the caller owns graph migration."""
@@ -10837,6 +11060,8 @@ class HMBPromptLibrary(DataNode):
         assertion is rebuilt from the registered publisher before it is used.
         """
         with self._hmb_sync_lock:
+            if self._hmb_manual_rebind_pending():
+                raise RuntimeError("Legacy Prompt requires an explicit Shot rebind before execution.")
             if self._hmb_node_deleted:
                 raise RuntimeError("HMB Prompt owner was deleted.")
             current = _normalize_state(self._current_state())
@@ -11424,6 +11649,10 @@ class HMBPromptLibrary(DataNode):
 
         parent_setter = getattr(super(), "set_parameter_value")
         is_widget_write = param_name == WIDGET_PARAMETER_NAME
+        if (is_widget_write and not initial_setup and not getattr(self, "_hmb_ui_syncing", False)
+                and not getattr(self, "_hmb_compact_route_syncing", False)
+                and self._hmb_apply_manual_rebind(value)):
+            return
         if is_widget_write and initial_setup:
             self._hmb_initial_shot_autoclaim_pending = False
             self._hmb_initial_shot_preferred_uuid = ""
@@ -11637,6 +11866,8 @@ class HMBPromptLibrary(DataNode):
             return
         normalized = _normalize_state(state)
         self._hmb_last_accepted_widget_state = _json_dumps(normalized)
+        self._hmb_last_accepted_manual_rebind_pending = (self._hmb_last_accepted_widget_state,
+            normalized.get("manual_rebind", {}).get("required") is True)
         self._hmb_last_accepted_widget_revisions = (
             int(normalized.get(SOURCE_SYNC_REVISION_KEY) or 0),
             int(normalized.get(UI_EDIT_REVISION_KEY) or 0),
@@ -12619,6 +12850,8 @@ class HMBPromptLibrary(DataNode):
         with self._hmb_sync_lock:
             if bool(getattr(self, "_hmb_node_deleted", False)):
                 return
+            if self._hmb_manual_rebind_pending():
+                return
             self._retire_deleted_document_sources()
             retry_identity = self._prompt_sync_retry_identity()
             failure = getattr(self, "_hmb_prompt_sync_failure", None)
@@ -12740,6 +12973,11 @@ class HMBPromptLibrary(DataNode):
                 _diagnostic_exception("Parent after_value_set failed", exc)
             try:
                 name = getattr(parameter, "name", "") or ""
+                if self._hmb_manual_rebind_pending() and not getattr(self, "_hmb_ui_syncing", False):
+                    if name == WIDGET_PARAMETER_NAME and not getattr(self, "_hmb_widget_write_in_progress", False):
+                        self._restore_accepted_widget_state()
+                        self._hmb_apply_manual_rebind(value)
+                    return result
                 ui_only_widget_write = bool(getattr(self, "_hmb_ui_only_widget_write", False))
                 if (name == WIDGET_PARAMETER_NAME and not getattr(self, "_hmb_widget_write_in_progress", False)
                         and getattr(self, "_hmb_last_accepted_widget_state", None)):
@@ -13035,6 +13273,8 @@ class HMBPromptLibrary(DataNode):
     def process(self) -> None:
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return None
+        if self._hmb_manual_rebind_pending():
+            raise RuntimeError("Legacy Prompt requires an explicit Shot rebind before execution.")
         self._ensure_prompt_output()
         # The workflow executor owns normal process-output propagation.
         _begin_prompt_output_side_effect_callback(self)

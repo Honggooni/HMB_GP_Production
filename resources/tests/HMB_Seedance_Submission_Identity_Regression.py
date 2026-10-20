@@ -179,7 +179,7 @@ async def verify_bad_create(response):
     bridge.refresh_job = mock.Mock(return_value={"job_id": "canonical-resolved", "status": "failed"})
     reopened._ensure_broker_connected = mock.AsyncMock(return_value=bridge)
     await reopened._refresh_async()
-    bridge.refresh_job.assert_called_once_with(checkpoint["task_id"], timeout=60.0)
+    bridge.refresh_job.assert_called_once_with(checkpoint["task_id"], timeout=300.0)
     assert reopened._generation_recovery_state()["task_id"] == "canonical-resolved"
     assert not reopened._generation_recovery_blocks_new_submission()
     assert bridge.generate_seedance.call_count == 1

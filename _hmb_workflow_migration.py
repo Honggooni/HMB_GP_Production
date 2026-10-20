@@ -35,6 +35,7 @@ _INFLIGHT: Any = weakref.WeakKeyDictionary()
 _RESULTS: Any = weakref.WeakKeyDictionary()
 _SCHEDULE_GENERATIONS: Any = weakref.WeakKeyDictionary()
 _BLOCKED: Any = weakref.WeakKeyDictionary()
+_MANUAL_REBINDS: Any = weakref.WeakKeyDictionary()
 _INTERNAL = contextvars.ContextVar("hmb_workflow_migration_internal", default=False)
 
 
@@ -78,6 +79,159 @@ def flow_migration_pending(engine: Any, flow_name: str) -> bool:
 def flow_migration_blocked(engine: Any, flow_name: str) -> dict[str, Any] | None:
     with _LOCK:
         return deepcopy(_BLOCKED.get(engine, {}).get(flow_name))
+
+
+def _node_manual_rebind_required(node: Any) -> bool:
+    value = getattr(node, "_hmb_manual_rebind", None)
+    pending = getattr(node, "_hmb_manual_rebind_pending", None)
+    return bool(isinstance(value, dict) and value.get("required")) or bool(callable(pending) and pending())
+
+
+def _finish_manual_rebind(engine: Any, flow: Any, editors: list[Any]) -> None:
+    """Retire transaction-only export filters after the graph verifies."""
+    _require(not any(_node_manual_rebind_required(node) for node in editors),
+        "Confirm every original editor before completing its recovery")
+    for node in editors:
+        clear = getattr(node, "_hmb_clear_manual_rebind", None)
+        manual = getattr(node, "_hmb_manual_rebind", None)
+        if callable(clear) and isinstance(manual, dict) and manual.get("status") == "confirmed":
+            clear("verified_workflow_consolidation")
+    with _LOCK:
+        _MANUAL_REBINDS.get(engine, {}).pop(flow.name, None)
+
+
+def _manual_rebind_context(node: Any, expected_source_digest: str) -> tuple[Any, Any, dict, dict]:
+    from griptape_nodes.retained_mode.engine import current_engine
+    engine = current_engine()
+    _require(engine is not None, "Manual rebind requires the current workflow engine")
+    name = str(getattr(node, "name", ""))
+    _require(engine.node_manager.get_node_by_name(name) is node,
+        "The original editor was deleted or replaced; reopen the saved workflow")
+    flow_name = engine.node_manager.get_node_parent_flow_by_name(name)
+    flow = _registered_flow(engine, flow_name)
+    _require(not flow_migration_pending(engine, flow_name),
+        "Wait for the workflow connection check to finish before reconnecting a Shot")
+    _require(not engine.flow_manager.check_for_existing_running_flow(),
+        "Stop the running workflow before reconnecting an existing Shot")
+    with _LOCK:
+        transaction = _MANUAL_REBINDS.get(engine, {}).get(flow_name)
+        entry = transaction.get("nodes", {}).get(name) if isinstance(transaction, dict) else None
+        _require(isinstance(entry, dict) and entry["node"]() is node
+            and entry["digest"] == expected_source_digest and not entry.get("confirmed"),
+            "The manual rebind request is stale; use the current editor notice")
+    backup = Path(transaction["backup_path"])
+    _require(backup.is_file() and hashlib.sha256(backup.read_bytes()).hexdigest() == transaction["backup_sha256"],
+        "The original recovery snapshot is unavailable; no Shot was rebound")
+    return engine, flow, transaction, entry
+
+
+def validate_manual_rebind(node: Any, expected_source_digest: str, *, channel_uuid: str, shot_uuid: str) -> dict[str, Any]:
+    """Validate one explicit human choice; never guess from a name or number."""
+    engine, flow, transaction, entry = _manual_rebind_context(node, expected_source_digest)
+    publisher = transaction["publisher"]()
+    _require(publisher is not None and flow.nodes.get(publisher.name) is publisher,
+        "The ImageAsset publisher was replaced; reopen the existing workflow")
+    candidates = [item for item in flow.nodes.values() if isinstance(getattr(item, "metadata", None), dict)
+        and item.metadata.get("library") == _LIBRARY
+        and item.metadata.get("node_type") == "HMBImageAssetLibrary"]
+    _require(candidates == [publisher], "Choose one ImageAsset publisher before reconnecting Shots")
+    catalog = publisher._hmb_shot_routing_catalog()
+    _require(catalog.get("publisher_instance_uuid") == transaction["publisher_instance_uuid"]
+        and catalog.get("channel_uuid") == channel_uuid
+        and sum(row.get("shot_uuid") == shot_uuid for row in catalog.get("shots", [])) == 1,
+        "The selected Shot no longer belongs to the original ImageAsset publisher")
+    with _LOCK:
+        _require(not any(other is not entry and other.get("confirmed")
+            and other["kind"] == entry["kind"]
+            and other.get("target") == (channel_uuid, shot_uuid)
+            for other in transaction["nodes"].values()),
+            "Another original editor was already assigned to this Shot; choose its own Shot")
+    return {"ok": True, "backup_path": transaction["backup_path"]}
+
+
+def confirm_manual_rebind(node: Any, expected_source_digest: str) -> dict[str, Any]:
+    """Resume consolidation only after every original editor was confirmed."""
+    engine, flow, transaction, entry = _manual_rebind_context(node, expected_source_digest)
+    exported = getattr(node, _EXPORT_HOOKS[entry["kind"]])()
+    subscription = _subscription(node, exported)
+    _require(subscription.get("enabled") is True, "Select the exact target Shot before confirming")
+    channel, shot = subscription.get("channel_uuid"), subscription.get("shot_uuid")
+    validate_manual_rebind(node, expected_source_digest, channel_uuid=channel, shot_uuid=shot)
+    with _LOCK:
+        _require(not entry.get("confirmed"), "This original editor was already confirmed")
+        _require(not any(other is not entry and other.get("confirmed")
+            and other["kind"] == entry["kind"] and other.get("target") == (channel, shot)
+            for other in transaction["nodes"].values()),
+            "Another original editor was already assigned to this Shot")
+        entry.update(confirmed=True, target=(channel, shot))
+        remaining = [name for name, item in transaction["nodes"].items() if not item.get("confirmed")]
+    retry_scheduled = False
+    if not remaining:
+        # Confirmation is committed above. A closing host event loop can reject
+        # call_soon_threadsafe after the scheduler's liveness check; that must
+        # not make an editor roll back a target already recorded in the ledger.
+        # Keep the original graph and its blocked execution state for reopen.
+        try:
+            mark_flow_migration_pending(engine, flow.name)
+            schedule_loaded_flow_migrations(engine)
+            retry_scheduled = flow_migration_pending(engine, flow.name)
+        except Exception:
+            clear_flow_migration_pending(engine, flow.name)
+            logging.getLogger("griptape_nodes").warning(
+                "Manual Shot rebind was recorded; consolidation awaits workflow reopen")
+    return {"ok": True, "code": "manual_rebind_recorded", "remaining_editors": remaining,
+            "migration_retry_scheduled": retry_scheduled, "backup_path": transaction["backup_path"]}
+
+
+def _offer_manual_rebind(engine: Any, flow: Any, exports: dict[str, Any], recovery: Path) -> list[str]:
+    """Expose readonly choices only after preserving the complete original graph."""
+    publishers = [node for node in flow.nodes.values() if isinstance(getattr(node, "metadata", None), dict)
+        and node.metadata.get("library") == _LIBRARY and node.metadata.get("node_type") == "HMBImageAssetLibrary"]
+    if len(publishers) != 1:
+        return []
+    publisher = publishers[0]
+    catalog = publisher._hmb_shot_routing_catalog()
+    if not isinstance(catalog, dict) or not catalog.get("shots"):
+        return []
+    prepared = {}
+    transaction = {"publisher": weakref.ref(publisher),
+        "publisher_instance_uuid": catalog["publisher_instance_uuid"],
+        "backup_path": str(recovery), "backup_sha256": hashlib.sha256(recovery.read_bytes()).hexdigest(),
+        "nodes": prepared}
+    with _LOCK:
+        _MANUAL_REBINDS.setdefault(engine, {})[flow.name] = transaction
+    for name, exported in exports.items():
+        node = flow.nodes.get(name)
+        kind = _kind(node)
+        prepare = getattr(node, "_hmb_prepare_manual_rebind", None)
+        if kind not in {"prompt", "agent"} or not callable(prepare):
+            continue
+        subscription = _subscription(node, exported)
+        current_shot = next((row for row in catalog["shots"]
+            if row.get("shot_uuid") == subscription.get("shot_uuid")), None)
+        if (subscription.get("enabled") is True
+                and subscription.get("channel_uuid") == catalog["channel_uuid"]
+                and isinstance(current_shot, dict)
+                and current_shot.get("number") == subscription.get("shot_number")
+                and current_shot.get("name") == subscription.get("shot_name")
+                and not _node_manual_rebind_required(node)):
+            continue  # Exact, already valid original bindings stay untouched.
+        digest = str(exported.get("state_sha256") if kind == "prompt" else exported.get("digest") or "")
+        if not digest:
+            continue
+        entry = {"node": weakref.ref(node), "digest": digest, "kind": kind, "confirmed": False}
+        prepared[name] = entry
+        try:
+            accepted = prepare(deepcopy(catalog), {"required": True,
+                "reason": "기존 샷 연결을 확인한 뒤 직접 다시 선택하세요. 원본 입력은 복구 파일에 보존되어 있습니다.",
+                "backup_path": str(recovery), "source_node_name": name,
+                "publisher_node_name": publisher.name, "expected_source_digest": digest})
+            if accepted is False:
+                prepared.pop(name, None)
+        except Exception:
+            prepared.pop(name, None)
+            logging.getLogger("griptape_nodes").warning("Manual Shot rebind choices could not be prepared for %s", name)
+    return list(prepared)
 
 
 def _block_flow(engine: Any, flow_name: str, value: dict[str, Any]) -> None:
@@ -245,7 +399,14 @@ def _validate_source_identity(engine: Any, flow: Any, groups: dict[str, list[Any
     for kind, nodes in groups.items():
         for node in nodes:
             subscription = _subscription(node, exports[node.name])
+            _require(not _node_manual_rebind_required(node),
+                "An original Prompt/Agent still needs its explicit Shot rebind confirmation")
             if subscription.get("enabled") is not True:
+                legacy = (kind == "prompt" and not node._hmb_shot_manager_enabled()) or (
+                    kind == "agent" and isinstance(exports[node.name].get("legacy_widget"), dict)
+                    and node.metadata.get(METADATA_KEY, {}).get("schema") != SCHEMA)
+                _require(not legacy,
+                    "An original Prompt/Agent needs an explicit Shot selection before consolidation; originals retained")
                 continue
             owner = catalogs.get(subscription.get("channel_uuid"))
             _require(owner is not None, "A legacy Shot has no authoritative ImageAsset publisher")
@@ -462,12 +623,14 @@ async def migrate_flow(engine: Any, flow_name: str, *, backup_root: Path | None 
         flow = _registered_flow(engine, flow_name)
         groups, exports = _capture_editors(flow)
         existing = [node for nodes in groups.values() for node in nodes]
-        requires_upgrade = any(not bool(getattr(node, "_hmb_shot_manager_enabled", lambda: False)())
+        requires_upgrade = any(_node_manual_rebind_required(node)
+            or not bool(getattr(node, "_hmb_shot_manager_enabled", lambda: False)())
             or (_kind(node) in {"agent", "finish_look"} and isinstance(exports[node.name].get("legacy_widget"), dict)
                 and node.metadata.get(METADATA_KEY, {}).get("schema") != SCHEMA) for node in existing)
         if all(len(nodes) <= 1 for nodes in groups.values()) and not requires_upgrade:
             # Loading an already consolidated graph suspended its constructor
             # callbacks too. Resume its exact publisher once after pending clears.
+            _finish_manual_rebind(engine, flow, existing)
             committed = True
             return _result(engine, flow_name, {"ok": True, "code": "already_single", "flow_name": flow_name})
         survivors = {kind: nodes[0] for kind, nodes in groups.items() if nodes}
@@ -545,6 +708,8 @@ async def migrate_flow(engine: Any, flow_name: str, *, backup_root: Path | None 
                 await _send(engine, DeleteNodeRequest(node_name=node.name), DeleteNodeResultSuccess)
         _require(all(sum(_kind(node) == kind for node in flow.nodes.values()) == 1 for kind, nodes in groups.items() if nodes), "Consolidated editor count is not one per kind")
         _require(_edge_records(engine, set(flow.nodes)) == planned_edges, "Consolidated connections changed during final cleanup")
+        stage = "complete_manual_rebind"
+        _finish_manual_rebind(engine, flow, list(survivors.values()))
         committed = True
         return _result(engine, flow_name, {"ok": True, "code": "consolidated", "flow_name": flow_name,
             "survivors": {kind: node.name for kind, node in survivors.items()},
@@ -579,6 +744,22 @@ async def migrate_flow(engine: Any, flow_name: str, *, backup_root: Path | None 
             "flow_name": flow_name, "reason": str(error), "rollback": rollback,
             "stage": stage,
             "backup_path": str(recovery) if recovery else None, "executed_nodes": 0}
+        if isinstance(error, MigrationConflict) and rollback in {"not_needed", "verified"}:
+            # Even a preflight mismatch needs a durable original before a team
+            # member explicitly reconnects legacy editors. Never infer a Shot
+            # from its display number, delete originals, or admit old outputs.
+            try:
+                flow = _registered_flow(engine, flow_name)
+                _groups, current_exports = _capture_editors(flow)
+                if recovery is None:
+                    preserved = await _snapshot(engine, flow, current_exports)
+                    recovery = _write_recovery(preserved, backup_root)
+                    value["backup_path"] = str(recovery)
+                value["manual_rebind_editors"] = _offer_manual_rebind(engine, flow, current_exports, recovery)
+            except Exception:
+                # Original nodes remain intact if recovery/choice preparation
+                # is unavailable. Do not present that state as a successful fix.
+                value["manual_rebind_editors"] = []
         _block_flow(engine, flow_name, value)
         return _result(engine, flow_name, value)
     finally:

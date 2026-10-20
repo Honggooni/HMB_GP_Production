@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from contextlib import contextmanager
 import asyncio
 import copy
 import hashlib
@@ -130,6 +131,35 @@ _FROZEN_PROMPT_SHOT_ATTRIBUTE = "_hmb_frozen_prompt_shot_source"
 
 _WEB_AUTHORITY_SEAL = object()
 _EXECUTION_GATE_GUARD = threading.Lock()
+
+
+def _hmb_native_values_equal(left, right):
+    """Compare authored native values without conflating False, zero or None.
+
+    Unknown SDK objects deliberately compare by identity only. Their equality
+    may be stateful or array-valued, so a redundant native setter is safer than
+    silently losing an actual model/tool/schema change.
+    """
+    if left is right:
+        return True
+    if type(left) is not type(right):
+        return False
+    if type(left) in (str, int, float, bool, bytes, type(None)):
+        return left == right
+    if type(left) in (list, tuple):
+        return len(left) == len(right) and all(
+            _hmb_native_values_equal(a, b) for a, b in zip(left, right))
+    if type(left) is dict:
+        if len(left) != len(right):
+            return False
+        key_types = (str, int, float, bool, bytes, type(None))
+        if any(type(key) not in key_types for key in (*left, *right)):
+            return False
+        typed_right = {(type(key), key): value for key, value in right.items()}
+        return all((type(key), key) in typed_right
+                   and _hmb_native_values_equal(value, typed_right[(type(key), key)])
+                   for key, value in left.items())
+    return False
 
 
 class _HMBWebRerenderAuthority:
@@ -1544,6 +1574,11 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_native_editor_collapsed = False
         self._hmb_row_syncing = False
         self._hmb_layout_syncing = False
+        self._hmb_editor_update_depth = 0
+        self._hmb_editor_store_pending = False
+        self._hmb_editor_layout_pending = False
+        self._hmb_editor_preview_pending = False
+        self._hmb_row_action_rejections = {}
         self._hmb_agent_migration_archives = {}
         self._hmb_shot_slots: dict[str, Any] = {}
         self._hmb_active_slot_key = "__hmb_only__"
@@ -1559,6 +1594,9 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_shot_local_tasks = set()
         self._hmb_shot_context: dict[str, Any] = {}
         self._hmb_shot_catalog_snapshot: dict[str, Any] = {}
+        self._hmb_manual_rebind: dict[str, Any] = {}
+        self._hmb_manual_rebind_lock = threading.RLock()
+        self._hmb_manual_rebind_hydration_pending = False
         # Instance-local execution authority.  Display widget writes and
         # same-flow route callbacks may interleave while several Agents run,
         # but they must not change the exact Shot being consumed by this run.
@@ -1610,6 +1648,208 @@ class HMBAgentLibrary(_BaseAgent):
         self._ensure_hmb_shot_store()
         self._ensure_agent_shot_rows()
 
+    def _hmb_assert_rebind_execution_ready(self):
+        blocked = bool(getattr(self, "_hmb_manual_rebind", {}).get("required"))
+        if not blocked:
+            try:
+                from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+                from _hmb_workflow_migration import flow_migration_blocked
+                engine = GriptapeNodes.get_instance()
+                if engine.node_manager.get_node_by_name(self.name) is self:
+                    flow_name = engine.node_manager.get_node_parent_flow_by_name(self.name)
+                    blocked = bool(flow_migration_blocked(engine, flow_name))
+            except Exception:
+                pass
+        if blocked:
+            raise RuntimeError("[HMB REBIND REQUIRED] 기존 샷 연결을 직접 확인한 뒤 다시 선택하세요. 원본 출력은 보존되어 있으며 새 렌더는 시작되지 않았습니다.")
+
+    def _hmb_manual_rebind_authoring_digest(self):
+        slot = self._hmb_native_slot_snapshot()
+        return self._hmb_authoring_digest({"values": slot.get("values", {}), "children": slot.get("children", {})})
+
+    def _hmb_publish_manual_rebind(self):
+        raw = self._native_parameter_value(_AGENT_WIDGET_PARAMETER, {})
+        selected = raw.get("shot", {}) if isinstance(raw, dict) else {}
+        value = self._hmb_widget_value(selected, getattr(self, "_hmb_shot_catalog_snapshot", {}))
+        self.set_parameter_value(_AGENT_WIDGET_PARAMETER, value)
+
+    def _hmb_prepare_manual_rebind(self, catalog, info):
+        """Offer an explicit recovery choice after the migration backup exists."""
+        if (getattr(self, "_hmb_node_deleted", False) or not isinstance(info, dict)
+                or info.get("required") is not True
+                or not re.fullmatch(r"[0-9a-f]{64}", str(info.get("expected_source_digest") or ""))):
+            return False
+        normalized = _agent_widget_shot_catalog(catalog)
+        if not normalized or not normalized.get("shots") or getattr(self, "_hmb_shot_workers", {}):
+            return False
+        current = getattr(self, "_hmb_manual_rebind", {})
+        if current.get("required") and current.get("expected_source_digest") == info["expected_source_digest"]:
+            return True
+        original = self._hmb_native_slot_snapshot()
+        exported = self._hmb_export_agent_authoring_state()
+        self._hmb_manual_rebind = {key: copy.deepcopy(info[key]) for key in (
+            "required", "reason", "backup_path", "source_node_name", "publisher_node_name", "expected_source_digest") if key in info}
+        self._hmb_manual_rebind.update(status="required", error="", request_id="",
+            source_slot=copy.deepcopy(original), source_authoring_digest=self._hmb_manual_rebind_authoring_digest(),
+            original_slots=copy.deepcopy(self._hmb_shot_slots), original_results=copy.deepcopy(self._hmb_shot_results),
+            source_active_slot_key=str(exported.get("active_slot_key") or ""),
+            source_subscription=copy.deepcopy(exported.get("active_subscription") or {}),
+            original_request_records=[copy.deepcopy(ticket.get("record", {})) for ticket in self._hmb_shot_request_records.values()],
+            original_legacy_widget=copy.deepcopy(getattr(self, "_hmb_legacy_saved_widget_value", None)))
+        self._hmb_shot_catalog_snapshot = copy.deepcopy(normalized)
+        self._hmb_persist_shot_store(emit_change=False)
+        try:
+            self._hmb_publish_manual_rebind()
+        except Exception:
+            # The durable source and root-issued recovery lease already exist.
+            # A disconnected notification transport cannot revoke that lease.
+            print("[HMB_PRODUCTION][WARN] Manual Agent rebind notice is awaiting editor refresh.")
+        return True
+
+    def _hmb_clear_manual_rebind(self, reason=""):
+        previous = getattr(self, "_hmb_manual_rebind", {})
+        self._hmb_manual_rebind = ({key: copy.deepcopy(previous[key]) for key in (
+            "expected_source_digest", "source_node_name", "backup_path", "request_id") if key in previous}
+            if previous.get("expected_source_digest") else {})
+        if self._hmb_manual_rebind:
+            self._hmb_manual_rebind.update(required=False, status="cleared", error="")
+        self._hmb_persist_shot_store(emit_change=False)
+        try:
+            self._hmb_publish_manual_rebind()
+        except Exception:
+            print("[HMB_PRODUCTION][WARN] Cleared Agent rebind notice is awaiting editor refresh.")
+        return True
+
+    def _hmb_apply_manual_rebind(self, action):
+        with self._hmb_manual_rebind_lock:
+            self._hmb_manual_rebind_inflight = True
+            try:
+                return self._hmb_apply_manual_rebind_locked(action)
+            finally:
+                self._hmb_manual_rebind_inflight = False
+
+    def _hmb_apply_manual_rebind_locked(self, action):
+        """Copy authored inputs only after an exact human choice and two CAS gates."""
+        manual = getattr(self, "_hmb_manual_rebind", {})
+        request_id = str(action.get("request_id") or "")
+        before = None
+        try:
+            if (manual.get("required") is not True or not re.fullmatch(r"[0-9a-f]{32}", request_id)
+                    or action.get("expected_source_digest") != manual.get("expected_source_digest")):
+                raise RuntimeError("재연결 요청이 오래되었습니다. 현재 안내에서 샷을 다시 선택하세요.")
+            channel, shot_uuid = str(action.get("channel_uuid") or ""), str(action.get("shot_uuid") or "")
+            catalog = getattr(self, "_hmb_shot_catalog_snapshot", {})
+            matches = [row for row in catalog.get("shots", []) if row.get("shot_uuid") == shot_uuid]
+            if channel != catalog.get("channel_uuid") or len(matches) != 1:
+                raise RuntimeError("현재 ImageAsset에 있는 샷을 선택하세요.")
+            from _hmb_workflow_migration import validate_manual_rebind, confirm_manual_rebind
+            validated = validate_manual_rebind(self, manual["expected_source_digest"], channel_uuid=channel, shot_uuid=shot_uuid)
+            if not isinstance(validated, dict) or validated.get("ok") is not True:
+                raise RuntimeError("현재 워크플로의 재연결 승인을 확인할 수 없습니다.")
+            if self._hmb_manual_rebind_authoring_digest() != manual.get("source_authoring_digest"):
+                raise RuntimeError("원본 Agent 입력이 변경되었습니다. 저장 후 다시 열어 현재 입력을 먼저 보존하세요.")
+            key = self._hmb_slot_key(channel, shot_uuid)
+            target = self._hmb_shot_slots.get(key)
+            neutral = self._hmb_shot_slots.get("__hmb_default_settings__")
+            own_target = key == manual.get("source_active_slot_key") and isinstance(target, dict) and all(
+                _hmb_native_values_equal(target.get(field, {}), manual["source_slot"].get(field, {}))
+                for field in ("values", "children"))
+            if target and not own_target and (not isinstance(neutral, dict) or not _hmb_native_values_equal(target, neutral)):
+                raise RuntimeError("선택한 샷에는 이미 Agent 입력이 있습니다. 기존 값을 덮어쓰지 않았습니다.")
+            if not own_target and (self._hmb_shot_results.get(key) or any(ticket.get("key") == key for ticket in self._hmb_shot_request_records.values())):
+                raise RuntimeError("선택한 샷에는 기존 실행 기록이 있습니다. 다른 빈 샷을 선택하세요.")
+            before = {"slots": copy.deepcopy(self._hmb_shot_slots), "results": copy.deepcopy(self._hmb_shot_results),
+                "archives": copy.deepcopy(getattr(self, "_hmb_agent_migration_archives", {})),
+                "values": copy.deepcopy(dict(self.parameter_values)), "outputs": copy.deepcopy(dict(self.parameter_output_values)),
+                "manual": copy.deepcopy(manual), "active": self._hmb_active_slot_key,
+                "tickets": dict(self._hmb_shot_request_records),
+                "legacy": copy.deepcopy(getattr(self, "_hmb_legacy_saved_widget_value", None)),
+                "loaded": bool(getattr(self, "_hmb_loaded_durable_shot_store", False)),
+                "execution_result": copy.deepcopy(self._hmb_execution_result),
+                "preview_active": bool(getattr(self, "_hmb_prompt_preview_active", False)),
+                "prompt_before_preview": getattr(self, "_hmb_prompt_before_preview", "")}
+            source = manual["source_slot"]
+            slot = {"values": copy.deepcopy(source.get("values", {})), "children": copy.deepcopy(source.get("children", {})),
+                    "outputs": {"output": "", "logs": "", "agent": None}, "result": {}}
+            self._hmb_shot_slots[key] = slot
+            archive_key = "manual-rebind:" + manual["expected_source_digest"]
+            archives = copy.deepcopy(getattr(self, "_hmb_agent_migration_archives", {}))
+            archives[archive_key] = {"source_node_name": manual.get("source_node_name", self.name),
+                "source_digest": manual["expected_source_digest"], "native_slot": copy.deepcopy(source),
+                "original_slots": copy.deepcopy(manual.get("original_slots", {})),
+                "original_results": copy.deepcopy(manual.get("original_results", {})),
+                "original_request_records": copy.deepcopy(manual.get("original_request_records", [])),
+                "legacy_widget": copy.deepcopy(manual.get("original_legacy_widget")), "backup_path": manual.get("backup_path", "")}
+            self._hmb_agent_migration_archives = archives
+            self._hmb_manual_rebind = {**manual, "required": False, "status": "confirmed", "error": "",
+                "request_id": request_id, "target_key": key}
+            self._hmb_legacy_saved_widget_value = None
+            self._hmb_loaded_durable_shot_store = True
+            self._hmb_active_slot_key = key
+            self._hmb_shot_results.pop(key, None)
+            self._hmb_shot_request_records = {ticket_id: ticket for ticket_id, ticket in self._hmb_shot_request_records.items()
+                if ticket.get("key") != key}
+            row = matches[0]
+            header = self._hmb_widget_value({"channel_uuid": channel, **row}, catalog)
+            self.parameter_values[_AGENT_WIDGET_PARAMETER] = copy.deepcopy(header)
+            for name in ("output", "logs"):
+                self.parameter_values[name] = ""
+                self.parameter_output_values[name] = ""
+            self.parameter_output_values["agent"] = None
+            self._hmb_execution_result = {}
+            self.parameter_values[_AGENT_EXECUTION_RESULT_PARAMETER] = {}
+            self.parameter_output_values[_AGENT_EXECUTION_RESULT_PARAMETER] = {}
+            self._hmb_prompt_preview_active = False
+            self._hmb_prompt_before_preview = str(slot["values"].get("prompt") or "")
+            # Commit all authoritative local state before the shared ledger.
+            # Transport notifications cannot undo a recorded confirmation.
+            self._hmb_persist_shot_store(emit_change=False)
+            confirmed = confirm_manual_rebind(self, manual["expected_source_digest"])
+            if not isinstance(confirmed, dict) or confirmed.get("ok") is not True:
+                raise RuntimeError("워크플로 재연결 확인에 실패했습니다. 원본 입력을 그대로 유지했습니다.")
+            self._hmb_manual_rebind_committing = True
+            self._hmb_slot_switching = True
+            try:
+                for publish in (
+                    lambda: super(HMBAgentLibrary, self).set_parameter_value("output", ""),
+                    lambda: super(HMBAgentLibrary, self).set_parameter_value("logs", ""),
+                    self._hmb_persist_shot_store,
+                    # Force one canonical header ACK after the staged dictionary.
+                    lambda: super(HMBAgentLibrary, self).set_parameter_value(_AGENT_WIDGET_PARAMETER, header),
+                    self._hmb_layout_shot_editor,
+                ):
+                    try:
+                        publish()
+                    except Exception:
+                        print("[HMB_PRODUCTION][WARN] Confirmed Agent rebind is awaiting editor refresh.")
+            finally:
+                self._hmb_slot_switching = False
+                self._hmb_manual_rebind_committing = False
+            return confirmed
+        except Exception:
+            if before is not None:
+                self._hmb_shot_slots, self._hmb_shot_results = before["slots"], before["results"]
+                self._hmb_shot_request_records = before["tickets"]
+                self._hmb_agent_migration_archives = before["archives"]
+                self.parameter_values.clear(); self.parameter_values.update(before["values"])
+                self.parameter_output_values.clear(); self.parameter_output_values.update(before["outputs"])
+                self._hmb_manual_rebind = before["manual"]
+                self._hmb_active_slot_key = before["active"]
+                self._hmb_legacy_saved_widget_value = before["legacy"]
+                self._hmb_loaded_durable_shot_store = before["loaded"]
+                self._hmb_execution_result = before["execution_result"]
+                self._hmb_prompt_preview_active = before["preview_active"]
+                self._hmb_prompt_before_preview = before["prompt_before_preview"]
+            if getattr(self, "_hmb_manual_rebind", {}).get("required"):
+                self._hmb_manual_rebind.update(status="rejected", request_id=request_id,
+                    error="재연결하지 않았습니다. 원본 입력 변경 여부와 빈 샷을 확인하세요.")
+                self._hmb_persist_shot_store(emit_change=False)
+                try:
+                    self._hmb_publish_manual_rebind()
+                except Exception:
+                    print("[HMB_PRODUCTION][WARN] Rejected Agent rebind notice is awaiting editor refresh.")
+            raise
+
     def _hmb_widget_value(self, shot=None, shot_catalog=None, execution_phase="", shot_manager=None):
         value = _agent_widget_value(shot, shot_catalog, execution_phase,
                                    getattr(self, "_hmb_shot_manager_mode", False) if shot_manager is None else shot_manager)
@@ -1619,6 +1859,11 @@ class HMBAgentLibrary(_BaseAgent):
             for key, status in getattr(self, "_hmb_shot_run_status", {}).items()
             if status in {"running", "succeeded", "failed", "cancelled"}
         }
+        manual = getattr(self, "_hmb_manual_rebind", {})
+        if isinstance(manual, dict) and manual:
+            value["manual_rebind"] = {key: copy.deepcopy(manual[key]) for key in (
+                "required", "reason", "backup_path", "source_node_name", "publisher_node_name",
+                "expected_source_digest", "status", "request_id", "error") if key in manual}
         return value
 
     @staticmethod
@@ -1649,22 +1894,66 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_agent_migration_archives = copy.deepcopy(raw.get("migration_archives") or {})
         self._hmb_active_slot_key = str(raw.get("active") or "__hmb_only__")
         self._hmb_shot_results = copy.deepcopy(raw.get("results") or {})
+        self._hmb_manual_rebind = copy.deepcopy(raw.get("manual_rebind") or {})
+        self._hmb_manual_rebind_hydration_pending = False
 
-    def _hmb_persist_shot_store(self):
+    @contextmanager
+    def _hmb_editor_update(self):
+        """Commit one native selection, durable snapshot and canonical row ACK."""
+        self._hmb_editor_update_depth = getattr(self, "_hmb_editor_update_depth", 0) + 1
+        try:
+            yield
+        finally:
+            self._hmb_editor_update_depth -= 1
+            if not self._hmb_editor_update_depth:
+                store = getattr(self, "_hmb_editor_store_pending", False)
+                layout = getattr(self, "_hmb_editor_layout_pending", False)
+                preview = getattr(self, "_hmb_editor_preview_pending", False)
+                self._hmb_editor_store_pending = False
+                self._hmb_editor_layout_pending = False
+                self._hmb_editor_preview_pending = False
+                if store:
+                    self._hmb_persist_shot_store()
+                if layout:
+                    self._hmb_layout_shot_editor()
+                if preview:
+                    self._hmb_notify_shot_preview()
+
+    def _hmb_request_shot_store_persist(self):
+        if getattr(self, "_hmb_editor_update_depth", 0):
+            self._hmb_editor_store_pending = True
+        else:
+            self._hmb_persist_shot_store()
+
+    def _hmb_request_editor_layout(self):
+        if getattr(self, "_hmb_editor_update_depth", 0):
+            self._hmb_editor_layout_pending = True
+        else:
+            self._hmb_layout_shot_editor()
+
+    def _hmb_persist_shot_store(self, *, emit_change=True):
         if getattr(self, "_hmb_shot_store_syncing", False) or getattr(self, "_hmb_node_deleted", False):
+            return
+        if getattr(self, "_hmb_editor_update_depth", 0):
+            self._hmb_editor_store_pending = True
             return
         self._hmb_shot_store_syncing = True
         try:
             value = {"schema": _AGENT_SHOT_STORE_SCHEMA, "version": 1,
                      "manager": True,
                      "editor_expanded": bool(getattr(self, "_hmb_shot_editor_expanded", True)),
-                     "migration_archives": copy.deepcopy(getattr(self, "_hmb_agent_migration_archives", {})),
+                     "migration_archives": getattr(self, "_hmb_agent_migration_archives", {}),
                      "active": self._hmb_active_slot_key,
-                     "slots": copy.deepcopy(self._hmb_shot_slots),
-                     "results": copy.deepcopy(self._hmb_shot_results)}
+                     "slots": self._hmb_shot_slots,
+                     "results": self._hmb_shot_results}
+            if getattr(self, "_hmb_manual_rebind", None):
+                value["manual_rebind"] = self._hmb_manual_rebind
             current = self._native_parameter_value(_AGENT_SHOT_STORE_PARAMETER, {})
-            if current != value:
-                super().set_parameter_value(_AGENT_SHOT_STORE_PARAMETER, value)
+            if not _hmb_native_values_equal(current, value):
+                # Copy only the final changed document. Native setters and
+                # preview refreshes can request persistence during one switch.
+                super().set_parameter_value(_AGENT_SHOT_STORE_PARAMETER, copy.deepcopy(value),
+                    **({} if emit_change else {"emit_change": False}))
         finally:
             self._hmb_shot_store_syncing = False
 
@@ -1714,12 +2003,37 @@ class HMBAgentLibrary(_BaseAgent):
 
     def _hmb_capture_active_slot(self):
         if (getattr(self, "_hmb_slot_switching", False) or getattr(self, "_hmb_node_deleted", False)
+                or getattr(self, "_hmb_manual_rebind", {}).get("required")
                 or not _parameter_exists(self, _AGENT_SHOT_STORE_PARAMETER)):
             return
         self._hmb_shot_slots[self._hmb_active_slot_key] = self._hmb_native_slot_snapshot()
-        self._hmb_persist_shot_store()
+        self._hmb_request_shot_store_persist()
 
     def _hmb_switch_native_slot(self, channel_uuid="", shot_uuid=""):
+        if getattr(self, "_hmb_manual_rebind", {}).get("required"):
+            return
+        with self._hmb_editor_update():
+            self._hmb_restore_native_slot(channel_uuid, shot_uuid)
+
+    def _hmb_default_native_slot(self):
+        """Use the same neutral initial settings for unopened and viewed Shots.
+
+        Older workflow stores may not have the manager template yet. Native
+        conversation/memory and list children belong to their authored Shot,
+        so the visible editor can supply common model settings only.
+        """
+        template = self._hmb_shot_slots.get("__hmb_default_settings__")
+        if not isinstance(template, dict):
+            captured = self._hmb_shot_slots.get(self._hmb_active_slot_key)
+            template = copy.deepcopy(captured) if isinstance(captured, dict) else self._hmb_native_slot_snapshot()
+            template.setdefault("values", {}).update(prompt="", agent=None, agent_memory={}, tools=[], rulesets=[])
+            template["children"] = {}
+            template["outputs"] = {"output": "", "logs": "", "agent": None}
+            template["result"] = {}
+            self._hmb_shot_slots["__hmb_default_settings__"] = copy.deepcopy(template)
+        return copy.deepcopy(template)
+
+    def _hmb_restore_native_slot(self, channel_uuid="", shot_uuid=""):
         target = self._hmb_slot_key(channel_uuid, shot_uuid)
         if not _parameter_exists(self, _AGENT_SHOT_STORE_PARAMETER):
             self._hmb_active_slot_key = target
@@ -1727,28 +2041,20 @@ class HMBAgentLibrary(_BaseAgent):
         if target == getattr(self, "_hmb_active_slot_key", "__hmb_only__") or getattr(self, "_hmb_slot_switching", False):
             return
         self._hmb_capture_active_slot()
-        template = self._hmb_shot_slots.get("__hmb_default_settings__")
-        if not isinstance(template, dict):
-            template = self._hmb_native_slot_snapshot()
-            template["values"]["prompt"] = ""
-            template["values"]["agent"] = None
-            template["values"]["agent_memory"] = {}
-            template["values"]["tools"] = []
-            template["values"]["rulesets"] = []
-            template["children"] = {}
-            template["outputs"] = {"output": "", "logs": "", "agent": None}
-            template["result"] = {}
-            self._hmb_shot_slots["__hmb_default_settings__"] = copy.deepcopy(template)
+        template = self._hmb_default_native_slot()
         slot = copy.deepcopy(self._hmb_shot_slots.get(target, template))
         self._hmb_slot_switching = True
         try:
             for key in _AGENT_NATIVE_SETTING_KEYS:
-                if key in slot.get("values", {}):
+                # Read after the preceding setter: a real provider change can
+                # replace model defaults which the desired Shot must restore.
+                if (key in slot.get("values", {}) and not _hmb_native_values_equal(
+                        self._native_parameter_value(key, None), slot["values"][key])):
                     super().set_parameter_value(key, copy.deepcopy(slot["values"][key]))
             for key in ("tools", "rulesets"):
                 parameter = _parameter_by_name(self, key)
                 desired = slot.get("values", {}).get(key, [])
-                if parameter is not None:
+                if parameter is not None and not _hmb_native_values_equal(self._hmb_slot_native_list_value(key), desired):
                     setter = getattr(self, "set_parameter_list_value", None)
                     if callable(setter):
                         setter(key, copy.deepcopy(desired))
@@ -1759,15 +2065,17 @@ class HMBAgentLibrary(_BaseAgent):
                 for child in list(getattr(parameter, "children", []) or []):
                     active_child = str(getattr(child, "name", "")) in slot.get("children", {})
                     try:
-                        child.hide = not active_child
-                        child.hide_property = not active_child
+                        if bool(getattr(child, "hide", False)) == active_child:
+                            child.hide = not active_child
+                        if bool(getattr(child, "hide_property", False)) == active_child:
+                            child.hide_property = not active_child
                     except Exception:
                         pass
             for key, value in slot.get("children", {}).items():
-                if _parameter_exists(self, key):
+                if _parameter_exists(self, key) and not _hmb_native_values_equal(self._native_parameter_value(key, None), value):
                     super().set_parameter_value(key, copy.deepcopy(value))
             for key, value in slot.get("outputs", {}).items():
-                if key != "agent":
+                if key != "agent" and not _hmb_native_values_equal(self._native_parameter_value(key, None), value):
                     super().set_parameter_value(key, copy.deepcopy(value))
                 self.parameter_output_values[key] = copy.deepcopy(value)
             self._hmb_execution_result = copy.deepcopy(slot.get("result") or {})
@@ -1780,13 +2088,14 @@ class HMBAgentLibrary(_BaseAgent):
             self._refresh_hmb_execution_result_messages()
         finally:
             self._hmb_slot_switching = False
-        self._hmb_persist_shot_store()
+        self._hmb_request_shot_store_persist()
+        self._hmb_editor_preview_pending = True
 
     def _hmb_shot_manager_enabled(self):
         return bool(getattr(self, "_hmb_shot_manager_mode", False))
 
     def _hmb_shot_manager_paused_for(self, *, channel_uuid, shot_uuid):
-        return False
+        return bool(getattr(self, "_hmb_manual_rebind", {}).get("required"))
 
     def _hmb_agent_shot_subscriptions(self):
         if not self._hmb_shot_manager_enabled():
@@ -1810,6 +2119,8 @@ class HMBAgentLibrary(_BaseAgent):
         return candidate
 
     def _hmb_agent_shot_result(self, *, channel_uuid, shot_uuid, run_id=None, generator=None):
+        if getattr(self, "_hmb_manual_rebind", {}).get("required"):
+            return {}
         key = self._hmb_slot_key(channel_uuid, shot_uuid)
         with self._hmb_shot_result_lock:
             if run_id is not None:
@@ -1819,6 +2130,73 @@ class HMBAgentLibrary(_BaseAgent):
                     return {}
                 return copy.deepcopy(ticket["record"])
             return copy.deepcopy(self._hmb_shot_results.get(key) or {})
+
+    def _hmb_agent_shot_preview(self, *, channel_uuid, shot_uuid):
+        """Return only this exact catalog Shot's public final text for display.
+
+        This is not execution authority. Typed result/ticket validation remains
+        in ``_hmb_agent_shot_result``. In particular the currently open native
+        editor and default/other Shot slots can never supply this preview.
+        """
+        if getattr(self, "_hmb_node_deleted", False) or not self._hmb_shot_manager_enabled():
+            return None
+        if getattr(self, "_hmb_manual_rebind", {}).get("required"):
+            return None
+        catalog = getattr(self, "_hmb_shot_catalog_snapshot", {})
+        if not channel_uuid or catalog.get("channel_uuid") != channel_uuid or not shot_uuid:
+            return None
+        matches = [item for item in catalog.get("shots", [])
+                   if isinstance(item, dict) and item.get("shot_uuid") == shot_uuid]
+        if len(matches) != 1:
+            return None
+        shot = matches[0]
+        key = self._hmb_slot_key(channel_uuid, shot_uuid)
+        record = getattr(self, "_hmb_shot_results", {}).get(key)
+        slot = getattr(self, "_hmb_shot_slots", {}).get(key)
+        record_shot = record.get("shot") if isinstance(record, dict) else None
+        if (isinstance(record_shot, dict) and record_shot.get("channel_uuid") == channel_uuid
+                and record_shot.get("shot_uuid") == shot_uuid and isinstance(record.get("text"), str)):
+            text = record["text"]
+        elif isinstance(slot, dict):
+            outputs = slot.get("outputs", {})
+            output = outputs.get("output") if isinstance(outputs, dict) else None
+            text = output if isinstance(output, str) else ""
+        else:
+            return None
+        return {"text": text, "shot": {"channel_uuid": channel_uuid, "shot_uuid": shot_uuid,
+                "shot_number": shot.get("number"), "shot_name": shot.get("name")}}
+
+    def _hmb_notify_shot_preview(self, *, channel_uuid="", shot_uuid=""):
+        """Refresh connected Generator presentations through the output index.
+
+        No graph discovery/reconciliation, input rerouting or model execution
+        occurs. Each receiver independently verifies the physical edge and its
+        own Shot identity; one failed/deleted target cannot block other Shots.
+        """
+        if getattr(self, "_hmb_node_deleted", False):
+            return
+        try:
+            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+            connections = GriptapeNodes.FlowManager().get_connections()
+            parameter = _parameter_by_name(self, "output")
+            edges = connections.get_outgoing_connections_from_parameter(self, parameter) if parameter is not None else []
+        except Exception:
+            return
+        notified = set()
+        for edge in edges:
+            if (getattr(edge, "source_node", None) is not self
+                    or getattr(getattr(edge, "source_parameter", None), "name", "") != "output"
+                    or getattr(getattr(edge, "target_parameter", None), "name", "") != "prompt"):
+                continue
+            target = getattr(edge, "target_node", None)
+            refresh = getattr(target, "_hmb_refresh_managed_prompt_projection", None)
+            if id(target) in notified or not callable(refresh):
+                continue
+            notified.add(id(target))
+            try:
+                refresh(source_node=self, channel_uuid=channel_uuid, shot_uuid=shot_uuid, force=False)
+            except Exception:
+                continue
 
     def _hmb_release_agent_shot_result(self, *, channel_uuid, shot_uuid, run_id, generator):
         key = self._hmb_slot_key(channel_uuid, shot_uuid)
@@ -1844,14 +2222,15 @@ class HMBAgentLibrary(_BaseAgent):
             finally:
                 self._hmb_execution_phase_syncing = False
 
-    def _hmb_publish_shot_failure(self, key, execution, *, cancelled=False):
+    def _hmb_publish_shot_failure(self, key, execution, *, cancelled=False, source_unavailable=False):
         getter = getattr(execution, "_hmb_execution_result_snapshot", None)
         previous = getter() if callable(getter) else {}
         if not isinstance(previous, dict):
             previous = {}
-        code = "CANCELLED" if cancelled else str(previous.get("code") or "SOURCE_UNAVAILABLE")
+        code = "CANCELLED" if cancelled else "SOURCE_UNAVAILABLE" if source_unavailable else str(previous.get("code") or "SOURCE_UNAVAILABLE")
         message = ("[HMB EXECUTION CANCELLED] This Shot Agent was cancelled. No new render was submitted."
-                   if cancelled else str(previous.get("message") or _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE))
+                   if cancelled else _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE if source_unavailable
+                   else str(previous.get("message") or _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE))
         result = {**previous, "status": "failed", "code": code, "message": message,
                   "run_id": str(previous.get("run_id") or secrets.token_hex(16)),
                   "output_sha256": _prompt_text_sha256(message)}
@@ -1873,20 +2252,44 @@ class HMBAgentLibrary(_BaseAgent):
             finally:
                 self._hmb_slot_switching = False
         self._hmb_persist_shot_store()
+        channel, separator, shot_uuid = key.partition("\x1f")
+        if separator:
+            self._hmb_notify_shot_preview(channel_uuid=channel, shot_uuid=shot_uuid)
 
-    async def _hmb_run_agent_shot(self, *, channel_uuid, shot_uuid, prompt_owner, generator=None):
-        lifecycle_generation = int(getattr(self, "_hmb_lifecycle_generation", 0) or 0)
+    def _hmb_current_run_subscription(self, *, channel_uuid, shot_uuid, prompt_owner,
+                                     lifecycle_generation, generator=None):
+        """Revalidate immutable ownership around waits, never the open editor.
+
+        A queued run may outlive a rename, deletion, disconnect or replacement.
+        Mutable row metadata is taken from the current catalog after its UUID
+        lock is acquired. A completed worker keeps its frozen inputs, but may
+        publish only while that exact UUID and registered Prompt owner remain.
+        """
         if not self._hmb_lifecycle_is_live(lifecycle_generation):
             raise asyncio.CancelledError()
+        self._hmb_assert_rebind_execution_ready()
+        if generator is not None and (bool(getattr(generator, "_hmb_node_deleted", False))
+                or bool(getattr(generator, "is_cancellation_requested", False))):
+            raise asyncio.CancelledError()
         if not self._hmb_shot_manager_enabled():
-            raise RuntimeError("Agent Shot manager is not enabled.")
-        if self._hmb_manager_prompt_owner(channel_uuid=channel_uuid, shot_uuid=shot_uuid) is not prompt_owner:
-            raise RuntimeError("Agent Shot Prompt owner changed.")
+            raise RuntimeError(_HMB_TOPOLOGY_UNAVAILABLE_MESSAGE)
         subscriptions = self._hmb_agent_shot_subscriptions()
         matches = [item for item in subscriptions if item["channel_uuid"] == channel_uuid and item["shot_uuid"] == shot_uuid]
         if len(matches) != 1:
-            raise RuntimeError("Agent Shot identity is unavailable.")
-        subscription = copy.deepcopy(matches[0])
+            raise RuntimeError(_HMB_TOPOLOGY_UNAVAILABLE_MESSAGE)
+        try:
+            owner = self._hmb_manager_prompt_owner(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+        except Exception:
+            raise RuntimeError(_HMB_TOPOLOGY_UNAVAILABLE_MESSAGE) from None
+        if owner is not prompt_owner or bool(getattr(prompt_owner, "_hmb_node_deleted", False)):
+            raise RuntimeError(_HMB_TOPOLOGY_UNAVAILABLE_MESSAGE)
+        return copy.deepcopy(matches[0])
+
+    async def _hmb_run_agent_shot(self, *, channel_uuid, shot_uuid, prompt_owner, generator=None):
+        lifecycle_generation = int(getattr(self, "_hmb_lifecycle_generation", 0) or 0)
+        run_identity = dict(channel_uuid=channel_uuid, shot_uuid=shot_uuid, prompt_owner=prompt_owner,
+            lifecycle_generation=lifecycle_generation, generator=generator)
+        self._hmb_current_run_subscription(**run_identity)
         key = self._hmb_slot_key(channel_uuid, shot_uuid)
         lock = self._hmb_shot_execution_locks.setdefault(key, threading.Lock())
         while not lock.acquire(blocking=False):
@@ -1896,11 +2299,10 @@ class HMBAgentLibrary(_BaseAgent):
             await asyncio.sleep(0.05)
         execution = None
         try:
-            if not self._hmb_lifecycle_is_live(lifecycle_generation):
-                raise asyncio.CancelledError()
+            subscription = self._hmb_current_run_subscription(**run_identity)
             if self._hmb_active_slot_key == key:
                 self._hmb_capture_active_slot()
-            slot = copy.deepcopy(self._hmb_shot_slots.get(key) or self._hmb_shot_slots.get("__hmb_default_settings__") or self._hmb_native_slot_snapshot())
+            slot = copy.deepcopy(self._hmb_shot_slots.get(key) or self._hmb_default_native_slot())
             document = prompt_owner._hmb_prompt_shot_document(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
             execution = _HMBAgentShotExecution._from_owner(self, prompt_owner, document, subscription, slot, generator)
             self._hmb_shot_run_status[key] = "running"
@@ -1914,6 +2316,10 @@ class HMBAgentLibrary(_BaseAgent):
                 # worker belongs to its old instance and must not publish a
                 # result/ticket or a cancellation banner into that lifecycle.
                 raise asyncio.CancelledError()
+            # The model can finish after a Shot was removed or its registered
+            # source was replaced. Such a result must never become an admission
+            # record/ticket, even while this manager's own lifecycle is live.
+            subscription = self._hmb_current_run_subscription(**run_identity)
             result = execution._hmb_execution_result_snapshot()
             text = execution.parameter_output_values.get("output")
             record = {"text": str(text or ""), "result": copy.deepcopy(result),
@@ -1947,6 +2353,7 @@ class HMBAgentLibrary(_BaseAgent):
                 finally:
                     self._hmb_slot_switching = False
             self._hmb_persist_shot_store()
+            self._hmb_notify_shot_preview(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
             if generator is not None:
                 with self._hmb_shot_result_lock:
                     tickets = getattr(self, "_hmb_shot_request_records", None)
@@ -1961,7 +2368,7 @@ class HMBAgentLibrary(_BaseAgent):
                     self._hmb_shot_results.pop(key, None)
                 self._hmb_publish_shot_failure(key, execution, cancelled=True)
             raise
-        except Exception:
+        except Exception as exc:
             if not self._hmb_lifecycle_is_live(lifecycle_generation):
                 raise asyncio.CancelledError() from None
             self._hmb_shot_run_status[key] = "failed"
@@ -1969,7 +2376,8 @@ class HMBAgentLibrary(_BaseAgent):
             # an admissible result for this new Generator execution.
             with self._hmb_shot_result_lock:
                 self._hmb_shot_results.pop(key, None)
-            self._hmb_publish_shot_failure(key, execution)
+            self._hmb_publish_shot_failure(key, execution,
+                source_unavailable=str(exc) == _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE)
             raise
         finally:
             if execution is not None:
@@ -1987,6 +2395,10 @@ class HMBAgentLibrary(_BaseAgent):
         request_id = str(action.get("request_id") or "")
         if not re.fullmatch(r"[0-9a-f]{32}", request_id) or request_id in self._hmb_shot_action_ids:
             return
+        if action.get("kind") == "manual_rebind":
+            return self._hmb_apply_manual_rebind(action)
+        if action.get("kind") in {"run_selected", "cancel_selected"}:
+            self._hmb_assert_rebind_execution_ready()
         self._hmb_shot_action_ids.add(request_id)
         if len(self._hmb_shot_action_ids) > 256:
             self._hmb_shot_action_ids = {request_id}
@@ -2073,7 +2485,14 @@ class HMBAgentLibrary(_BaseAgent):
                     catalog = saved
             rows = {int(item["number"]): item for item in catalog.get("shots", []) if isinstance(item, dict)}
             selected_uuid = str(selected.get("shot_uuid") or "")
-            expanded = bool(selected_uuid and getattr(self, "_hmb_shot_editor_expanded", True))
+            manual_pending = bool(getattr(self, "_hmb_manual_rebind", {}).get("required"))
+            header_parameter = _parameter_by_name(self, _AGENT_WIDGET_PARAMETER)
+            header_height = 144 if manual_pending else _AGENT_WIDGET_HEIGHT
+            if header_parameter is not None:
+                for option in ("height", "min_height", "max_height", "widget_height", "default_height", "preferred_height", "initial_height"):
+                    if (getattr(header_parameter, "ui_options", {}) or {}).get(option) != header_height:
+                        header_parameter.update_ui_options_key(option, header_height)
+            expanded = manual_pending or bool(selected_uuid and getattr(self, "_hmb_shot_editor_expanded", True))
             body = list(self._hmb_native_editor_elements)
             if not expanded and not self._hmb_native_editor_collapsed:
                 self._hmb_native_editor_visibility = {str(item.name): bool((getattr(item, "ui_options", {}) or {}).get("hide", getattr(item, "hide", False))) for item in body}
@@ -2096,7 +2515,7 @@ class HMBAgentLibrary(_BaseAgent):
                 if parameter is None:
                     continue
                 shot = rows.get(number)
-                visible = shot is not None
+                visible = shot is not None and not manual_pending
                 if bool((getattr(parameter, "ui_options", {}) or {}).get("hide", False)) == visible:
                     parameter.update_ui_options_key("hide", not visible)
                 if getattr(parameter, "hide_property", False) == visible:
@@ -2108,6 +2527,9 @@ class HMBAgentLibrary(_BaseAgent):
                     "request_id": getattr(self, "_hmb_row_action_ack", {}).get(self._hmb_slot_key(catalog.get("channel_uuid"), shot["shot_uuid"]), ""),
                     "status": self._hmb_shot_run_status.get(self._hmb_slot_key(catalog.get("channel_uuid"), shot["shot_uuid"]), "")}
                     if shot else {"schema": "hmb-agent-shot-row", "version": 1, "shot": {}, "selected": False, "expanded": False, "status": ""})
+                rejection = getattr(self, "_hmb_row_action_rejections", {}).get(parameter.name)
+                if isinstance(rejection, dict):
+                    value.update(rejection)
                 if self._native_parameter_value(parameter.name, {}) != value:
                     self._hmb_row_syncing = True
                     try:
@@ -2131,14 +2553,77 @@ class HMBAgentLibrary(_BaseAgent):
             if not inserted:
                 ordered.extend(body)
             ordered.extend(trailing)
+            if manual_pending:
+                # Recovery keeps the original stock form directly beneath its
+                # header. Ordinary Shot tabs are dormant until explicit rebind.
+                ordered = prefix + ([header] if header else []) + body + row_elements + trailing
             if [id(item) for item in ordered] != [id(item) for item in current]:
-                reorder = getattr(self, "reorder_elements", None)
-                if callable(reorder):
-                    reorder([item.name for item in ordered])
-                elif isinstance(getattr(root, "children", None), list):
-                    root.children[:] = ordered
+                self._hmb_publish_editor_element_order(ordered)
         finally:
             self._hmb_layout_syncing = False
+
+    def _hmb_editor_structure(self, elements):
+        """Describe root identity/order only; leave native descendants intact."""
+        result = []
+        for element in elements:
+            value = {"element_id": element.element_id, "name": element.name,
+                     "parent_group_name": getattr(element, "parent_group_name", None),
+                     "parent_container_name": getattr(element, "parent_container_name", None)}
+            modes = getattr(element, "allowed_modes", None)
+            if modes is not None:
+                value.update(mode_allowed_input=ParameterMode.INPUT in modes,
+                             mode_allowed_property=ParameterMode.PROPERTY in modes,
+                             mode_allowed_output=ParameterMode.OUTPUT in modes)
+            result.append(value)
+        return result
+
+    def _hmb_publish_editor_element_order(self, ordered):
+        """Publish one final root order without native remove/add lifecycles.
+
+        The installed SDK exposes ``children`` as its mutable ordered list and
+        ``track_change``/``emit_parameter_changes`` as its batched UI interface.
+        Reordering that same list retains each element's parent, UID, native
+        editor and connections. Older hosts without that interface retain the
+        ordinary SDK reorder path. No broadcasts or concurrent output events
+        are suppressed, and the structural message carries no mutable values.
+        """
+        if getattr(self, "_hmb_node_deleted", False):
+            return False
+        root = getattr(self, "root_ui_element", None)
+        children = getattr(root, "children", None)
+        current = list(children or [])
+        ordered = list(ordered)
+        current_ids = [id(item) for item in current]
+        ordered_ids = [id(item) for item in ordered]
+        element_ids = [str(getattr(item, "element_id", "") or "") for item in current]
+        if (len(ordered) != len(current) or len(set(ordered_ids)) != len(ordered_ids)
+                or set(ordered_ids) != set(current_ids)):
+            raise RuntimeError("Agent editor membership changed before layout publication.")
+        if current_ids == ordered_ids:
+            return False
+        track = getattr(root, "track_change", None)
+        flush = getattr(self, "emit_parameter_changes", None)
+        if not isinstance(children, list) or not callable(track) or not callable(flush):
+            reorder = getattr(self, "reorder_elements", None)
+            if callable(reorder):
+                reorder([item.name for item in ordered])
+                return True
+            raise RuntimeError("Agent editor order publication is unavailable.")
+        if not all(element_ids) or len(set(element_ids)) != len(element_ids):
+            raise RuntimeError("Agent editor element identity is unavailable.")
+        structure = self._hmb_editor_structure(ordered)
+        previous_structure = self._hmb_editor_structure(current)
+        children[:] = ordered
+        try:
+            track("children", structure)
+            flush()
+        except Exception:
+            # A failed publication is not a successful switch. Restore the
+            # authoritative tree and retain a rollback snapshot for recovery.
+            children[:] = current
+            track("children", previous_structure)
+            raise
+        return True
 
     def _set_parameter_visibility(self, names, *, visible):
         collapsed = bool(getattr(self, "_hmb_native_editor_collapsed", False))
@@ -2172,6 +2657,8 @@ class HMBAgentLibrary(_BaseAgent):
         action = value.get("action")
         if not isinstance(action, dict) or action.get("kind") not in {"select", "run_selected", "cancel_selected", "refresh"}:
             return
+        if getattr(self, "_hmb_manual_rebind", {}).get("required") and action.get("kind") != "refresh":
+            raise RuntimeError("기존 Agent는 상단의 재연결 안내에서 먼저 샷을 선택하세요.")
         request_id = str(action.get("request_id") or "")
         if not re.fullmatch(r"[0-9a-f]{32}", request_id):
             return
@@ -2179,10 +2666,19 @@ class HMBAgentLibrary(_BaseAgent):
             self._hmb_layout_shot_editor()
             return
         catalog = getattr(self, "_hmb_shot_catalog_snapshot", {})
-        requested = value.get("shot", {})
+        requested = value.get("shot")
+        requested = requested if isinstance(requested, dict) else {}
         exact = [item for item in catalog.get("shots", []) if item.get("shot_uuid") == requested.get("shot_uuid")
             and _AGENT_SHOT_ROW_PREFIX + str(item.get("number")) == parameter.name]
         if len(exact) != 1 or requested.get("channel_uuid") != catalog.get("channel_uuid"):
+            # This validation precedes every mutation/Run. Only this definite
+            # rejection may release the matching frontend request lease.
+            if not hasattr(self, "_hmb_row_action_rejections"):
+                self._hmb_row_action_rejections = {}
+            if parameter.name in {_AGENT_SHOT_ROW_PREFIX + str(number) for number in range(1, 6)}:
+                self._hmb_row_action_rejections[parameter.name] = {
+                    "rejected_request_id": request_id, "error_code": "SHOT_IDENTITY_UNAVAILABLE"}
+                self._hmb_request_editor_layout()
             raise RuntimeError("Agent Shot row identity is unavailable.")
         if action["kind"] == "refresh":
             # Read the current editor, even if the missing action never applied.
@@ -2190,7 +2686,8 @@ class HMBAgentLibrary(_BaseAgent):
             if not hasattr(self, "_hmb_row_action_ack"):
                 self._hmb_row_action_ack = {}
             self._hmb_row_action_ack[self._hmb_slot_key(catalog["channel_uuid"], exact[0]["shot_uuid"])] = request_id
-            self._hmb_layout_shot_editor()
+            getattr(self, "_hmb_row_action_rejections", {}).pop(parameter.name, None)
+            self._hmb_request_editor_layout()
             return
         if action["kind"] == "select":
             self._hmb_shot_action_ids.add(request_id)
@@ -2207,13 +2704,15 @@ class HMBAgentLibrary(_BaseAgent):
             else not self._hmb_shot_editor_expanded if same and action["kind"] == "select" else True)
         if action["kind"] != "select":
             next_value["action"] = {"kind": action["kind"], "request_id": request_id}
-        self.set_parameter_value(_AGENT_WIDGET_PARAMETER, next_value)
-        # A transport promise is not proof that the native editor switched.
-        # Publish this acknowledgement only after its exact Shot action applied.
-        if not hasattr(self, "_hmb_row_action_ack"):
-            self._hmb_row_action_ack = {}
-        self._hmb_row_action_ack[self._hmb_slot_key(catalog["channel_uuid"], shot["shot_uuid"])] = request_id
-        self._hmb_layout_shot_editor()
+        with self._hmb_editor_update():
+            self.set_parameter_value(_AGENT_WIDGET_PARAMETER, next_value)
+            # A transport promise is not proof that the native editor switched.
+            # Commit the canonical row once, after all exact native settings.
+            if not hasattr(self, "_hmb_row_action_ack"):
+                self._hmb_row_action_ack = {}
+            self._hmb_row_action_ack[self._hmb_slot_key(catalog["channel_uuid"], shot["shot_uuid"])] = request_id
+            getattr(self, "_hmb_row_action_rejections", {}).pop(parameter.name, None)
+            self._hmb_request_editor_layout()
 
     @staticmethod
     def _hmb_authoring_digest(value):
@@ -2236,6 +2735,12 @@ class HMBAgentLibrary(_BaseAgent):
             return
         if not isinstance(value, dict):
             return
+        manual = value.get("manual_rebind") if normalized_name == _AGENT_WIDGET_PARAMETER.casefold() else None
+        if (isinstance(manual, dict) and manual.get("required") is True
+                and re.fullmatch(r"[0-9a-f]{64}", str(manual.get("expected_source_digest") or ""))):
+            # Header values replay before the durable store. An empty hidden
+            # Prompt input in between must not erase the saved native text.
+            self._hmb_manual_rebind_hydration_pending = True
         if normalized_name == _AGENT_SHOT_STORE_PARAMETER.casefold() and value.get("schema") == _AGENT_SHOT_STORE_SCHEMA and value.get("version") == 1 and isinstance(value.get("slots"), dict):
             self._hmb_loaded_durable_shot_store = True
         elif normalized_name == _AGENT_WIDGET_PARAMETER.casefold() and value.get("shot_manager") is not True:
@@ -2245,7 +2750,14 @@ class HMBAgentLibrary(_BaseAgent):
         slot = self._hmb_native_slot_snapshot()
         slots = copy.deepcopy(getattr(self, "_hmb_shot_slots", {}))
         subscription = copy.deepcopy(self._hmb_shot_channel_subscription())
+        manual = getattr(self, "_hmb_manual_rebind", {})
         legacy_widget = getattr(self, "_hmb_legacy_saved_widget_value", None)
+        if manual.get("required") and isinstance(manual.get("source_subscription"), dict):
+            # A recovery header presents the new publisher's choices. Saving
+            # and reopening that presentation must never turn an unconfirmed
+            # original into a binding to the first visible candidate.
+            subscription = copy.deepcopy(manual["source_subscription"])
+            legacy_widget = copy.deepcopy(manual.get("original_legacy_widget"))
         if isinstance(legacy_widget, dict):
             legacy_shot = legacy_widget.get("shot") or {}
             channel = str(legacy_shot.get("channel_uuid") or "")
@@ -2260,6 +2772,12 @@ class HMBAgentLibrary(_BaseAgent):
                 slots = {}
         active = self._hmb_slot_key(subscription.get("channel_uuid"), subscription.get("shot_uuid"))
         slots[active] = copy.deepcopy(slot)
+        manual_target = manual.get("target_key") if manual.get("status") == "confirmed" else None
+        if manual_target and manual_target == active and manual_target in self._hmb_shot_slots:
+            # Archived old UUIDs remain in the durable original/vault, but are
+            # not routing claims during this explicit recovery transaction.
+            slot = copy.deepcopy(self._hmb_shot_slots[manual_target])
+            slots = {manual_target: copy.deepcopy(slot)}
         children = {}
         for parent_name in ("tools", "rulesets"):
             parent = _parameter_by_name(self, parent_name)
@@ -2272,7 +2790,7 @@ class HMBAgentLibrary(_BaseAgent):
                 for child in list(getattr(parent, "children", []) or [])]
         data = {"schema": "hmb-agent-authoring-export", "version": 1, "source_node": str(self.name),
             "active_subscription": subscription, "active_slot_key": active, "native_slot": copy.deepcopy(slot),
-            "slots": slots, "results": ({} if isinstance(legacy_widget, dict) and not getattr(self, "_hmb_loaded_durable_shot_store", False)
+            "slots": slots, "results": ({} if manual_target or isinstance(legacy_widget, dict) and not getattr(self, "_hmb_loaded_durable_shot_store", False)
                 else copy.deepcopy(getattr(self, "_hmb_shot_results", {}))),
             "child_parameters": children,
             "archives": copy.deepcopy(getattr(self, "_hmb_agent_migration_archives", {})),
@@ -3758,6 +4276,10 @@ class HMBAgentLibrary(_BaseAgent):
     def _refresh_routed_prompt_preview(self) -> None:
         """Project the selected Shot's visible Prompt into the native editor."""
 
+        if (getattr(self, "_hmb_manual_rebind", {}).get("required")
+                or getattr(self, "_hmb_manual_rebind_hydration_pending", False)
+                or getattr(self, "_hmb_manual_rebind_committing", False)):
+            return
         try:
             enabled = bool(
                 self._hmb_shot_channel_subscription().get("enabled")
@@ -3870,6 +4392,11 @@ class HMBAgentLibrary(_BaseAgent):
         if parameter_name == _AGENT_PROMPT_INPUT_PARAMETER:
             normalized = self._public_prompt_value_after_private_echo(value)
         elif parameter_name == _AGENT_WIDGET_PARAMETER:
+            saved_manual = value.get("manual_rebind") if isinstance(value, dict) else None
+            if (not getattr(self, "_hmb_manual_rebind", {}) and isinstance(saved_manual, dict)
+                    and saved_manual.get("required") is True
+                    and re.fullmatch(r"[0-9a-f]{64}", str(saved_manual.get("expected_source_digest") or ""))):
+                self._hmb_manual_rebind_hydration_pending = True
             authoritative_catalog = getattr(self, "_hmb_shot_catalog_snapshot", None)
             if not authoritative_catalog and isinstance(value, dict):
                 authoritative_catalog = value.get("shot_catalog")
@@ -3995,7 +4522,7 @@ class HMBAgentLibrary(_BaseAgent):
             try:
                 if getattr(parameter, "default_value", None) != normalized:
                     parameter.default_value = normalized
-                height = _AGENT_WIDGET_HEIGHT
+                height = 144 if getattr(self, "_hmb_manual_rebind", {}).get("required") else _AGENT_WIDGET_HEIGHT
                 for option in ("height", "min_height", "max_height", "widget_height", "default_height", "preferred_height", "initial_height"):
                     updater = getattr(parameter, "update_ui_options_key", None)
                     if callable(updater) and (getattr(parameter, "ui_options", {}) or {}).get(option) != height:
@@ -4040,8 +4567,8 @@ class HMBAgentLibrary(_BaseAgent):
             self._hmb_pending_shot_action = None
             if action is not None:
                 self._hmb_handle_shot_action(action)
-            self._hmb_layout_shot_editor()
-            self._hmb_persist_shot_store()
+            self._hmb_request_editor_layout()
+            self._hmb_request_shot_store_persist()
         elif str(getattr(parameter, "name", "") or "") == _AGENT_SHOT_PROMPT_INPUT_PARAMETER:
             self._refresh_routed_prompt_preview()
         elif str(getattr(parameter, "name", "") or "") == _AGENT_SHOT_STORE_PARAMETER:
@@ -4062,6 +4589,10 @@ class HMBAgentLibrary(_BaseAgent):
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return None
         normalized_name = self._publication_parameter_name(name)
+        if (getattr(self, "_hmb_manual_rebind_inflight", False)
+                and (normalized_name in set(_AGENT_NATIVE_SETTING_KEYS) | {"tools", "rulesets"}
+                     or normalized_name.startswith(("tools_", "rulesets_", "behavior")))):
+            raise RuntimeError("Agent 재연결을 확인하는 동안 입력을 변경할 수 없습니다.")
         if kwargs.get("initial_setup"):
             self._hmb_capture_saved_parameter_value(name, value)
         if (normalized_name == _AGENT_SHOT_PROMPT_INPUT_PARAMETER.casefold()
@@ -4088,7 +4619,11 @@ class HMBAgentLibrary(_BaseAgent):
             return None
         self._hmb_restore_widget_write = bool(kwargs.get("initial_setup", False)) if normalized_name == _AGENT_WIDGET_PARAMETER.casefold() else getattr(self, "_hmb_restore_widget_write", False)
         try:
-            result = super().set_parameter_value(name, value, *args, **kwargs)
+            if normalized_name == _AGENT_WIDGET_PARAMETER.casefold() and not kwargs.get("initial_setup"):
+                with self._hmb_editor_update():
+                    result = super().set_parameter_value(name, value, *args, **kwargs)
+            else:
+                result = super().set_parameter_value(name, value, *args, **kwargs)
         finally:
             if normalized_name == _AGENT_WIDGET_PARAMETER.casefold():
                 self._hmb_restore_widget_write = False

@@ -15,7 +15,9 @@ const browser=await playwright.chromium.launch({headless:true,executablePath:pro
 try{
  const page=await browser.newPage({viewport:{width:820,height:800}});const errors=[];
  page.on('pageerror',e=>errors.push(e.message));await page.route('**/*',route=>{receipt.external_requests++;return route.abort();});
- await page.setContent('<!doctype html><meta charset="utf-8"><style>body{background:#101019;font-family:system-ui;color:white;margin:20px}.mount{width:720px;margin:6px 0}#native{background:#252535;padding:20px}</style><section id="sdk" class="react-flow__node"><div id="row1" class="mount"></div><div id="row2" class="mount"></div><div id="row3" class="mount"></div><div id="row4" class="mount"></div><div id="row5" class="mount"></div><div id="native">SDK-owned original native body<input id="native-input" value="Authored Shot 1"><button id="native-run">Native Run</button></div></section>');
+ // Match the installed editor's native parameter-row contract. Pending Shot
+ // protection intentionally excludes the node header and canvas, not this body.
+ await page.setContent('<!doctype html><meta charset="utf-8"><style>body{background:#101019;font-family:system-ui;color:white;margin:20px}.mount{width:720px;margin:6px 0}#native{background:#252535;padding:20px}</style><section id="sdk" class="react-flow__node"><div id="row1" class="mount"></div><div id="row2" class="mount"></div><div id="row3" class="mount"></div><div id="row4" class="mount"></div><div id="row5" class="mount"></div><div id="native" data-parameter-name="prompt" data-param-node="Synthetic Agent">SDK-owned original native body<input id="native-input" value="Authored Shot 1"><button id="native-run">Native Run</button></div></section>');
  await page.evaluate(async code=>{
   window.widget=await import(`data:text/javascript;base64,${btoa(unescape(encodeURIComponent(code)))}`);
   window.selected=1;window.expanded=true;window.acks={};window.statuses={};window.calls=[];window.requests=[];window.command=null;window.frames=0;window.timing={};window.frameActive=true;

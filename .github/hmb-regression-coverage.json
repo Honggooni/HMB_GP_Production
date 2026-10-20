@@ -3,6 +3,64 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_Agent_Atomic_Accordion_Order_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed Standard Agent and SDK to verify one structural publication, stable native element identities, concurrent outputs and serialized Shot state without live-engine or provider calls."
+    },
+    {
+      "name": "HMB_Agent_Accordion_Stable_Header_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Workflow_Context_Snapshot_Guard_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Workflow_Context_Snapshot_Guard_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires the installed SDK in a disposable profile to verify overlapping workflow loading, serialization admission, deferred post hooks, native saving and node creation without changing user workflows or calling providers."
+    },
+    {
+      "name": "HMB_Agent_Shot_Switch_Native_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed Standard Agent and SDK to verify provider callbacks, connected native tool/ruleset child IDs and exact stale-row rejection without model or live-engine calls."
+    },
+    {
+      "name": "HMB_Agent_Pending_Editor_Scope_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Agent_Shot_Switch_Performance_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Managed_Prompt_Projection_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Managed_Prompt_Projection_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed Standard Agent and SDK graph to verify five bound Generator previews, inactive Shot publication and serialized workflow values without provider or live-engine calls."
+    },
+    {
       "name": "HMB_Override_Environment_Coordinator_Host_Regression.py",
       "mode": "manual",
       "coverage": "installed_sdk",
@@ -2484,6 +2542,72 @@
       "mode": "manual",
       "required": false,
       "reason": "Seeded real Chromium 4/50 image profiles, remount/stale echo checkpoints and CPU sampling; timings are diagnostic, not CI machine-independent gates."
+    },
+    {
+      "name": "HMB_Agent_Managed_Worker_Lifecycle_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires isolated installed Standard Agent and SDK; exercises actual native Agent workers with local TestModel across five concurrent Shot lifecycles without provider or live-engine calls."
+    },
+    {
+      "name": "HMB_Shot_Add_Immediate_Delivery_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires isolated installed SDK; measures actual ImageAsset Shot add/delete/restore fanout, exact UUID ownership and five independent Generator outputs without paid requests."
+    },
+    {
+      "name": "HMB_Picker_Target_Shot_Failure_Isolation_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires isolated installed SDK; verifies exact target Picker snapshots, Prompt documents and Generator media fail only their owning Shot."
+    },
+    {
+      "name": "HMB_ImageAsset_Exact_Shot_Media_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Legacy_Manual_Rebind_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Isolated installed SDK verifies durable original backups, explicit ten editor confirmations, stale edits, ownership conflicts and per-Shot Generator preservation."
+    },
+    {
+      "name": "HMB_Prompt_Legacy_Manual_Rebind_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Legacy_Manual_Rebind_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Agent_Manual_Rebind_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Isolated Standard Agent and SDK verify five exact manual rebind targets, preserved authoring, stale source rejection and original result isolation."
+    },
+    {
+      "name": "HMB_Agent_Manual_Rebind_UI_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Scoped_Snapshot_Cold_Reload_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Isolated installed SDK verifies actual scoped ImageAsset and Picker snapshots after 120 reads, native serialization and cold reload across all five dormant Prompt documents."
     }
   ]
 }

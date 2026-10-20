@@ -69,7 +69,7 @@ async def exercise(engine, directory, helpers, native_hydration, native_schedule
     from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
     from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, DeleteConnectionRequest
     helpers.NATIVE_HYDRATION_SCHEDULER = native_hydration
-    await helpers.actual_saved_file_case(engine, directory)
+    await helpers.actual_saved_file_case(engine, directory, complete_manual_rebind=True)
     library, advanced, _images, _prompts, _agents, _generators = helpers.register_library(engine)
     try:
         flow = next(engine.flow_manager.get_flow_by_name(name) for name in engine.flow_manager._name_to_parent_name
@@ -87,7 +87,11 @@ async def exercise(engine, directory, helpers, native_hydration, native_schedule
         prompts._validate_shot_routing_snapshot(image_snapshot)
         prompts._validate_picker_shot_routing_snapshot(picker_snapshot, expected_channel_uuid=catalog["channel_uuid"])
         source._hmb_shot_routing_snapshot = lambda **kwargs: deepcopy(image_snapshot)
+        # Both official readers represent this fixture's same synthetic,
+        # no-media source epoch. Real target-isolation is tested separately.
+        source._hmb_shot_routing_snapshot_for = lambda **kwargs: deepcopy(image_snapshot)
         picker_node._hmb_shot_routing_snapshot = lambda **kwargs: deepcopy(picker_snapshot)
+        picker_node._hmb_shot_routing_snapshot_for = lambda **kwargs: deepcopy(picker_snapshot)
         picker_node._hmb_shot_channel_subscription = lambda: {"participant_kind": "video_picker",
             "enabled": True, "channel_uuid": catalog["channel_uuid"]}
         manager._reconcile_connected_source_inputs_from_graph()
@@ -116,6 +120,7 @@ async def exercise(engine, directory, helpers, native_hydration, native_schedule
             specific_library_name="HMB_GP_Production", node_name="Foreign Epoch Picker", initial_setup=True))
         foreign = engine.node_manager.get_node_by_name(created.node_name)
         foreign._hmb_shot_routing_snapshot = lambda **kwargs: deepcopy(picker_snapshot)
+        foreign._hmb_shot_routing_snapshot_for = lambda **kwargs: deepcopy(picker_snapshot)
         foreign._hmb_shot_channel_subscription = picker_node._hmb_shot_channel_subscription
         row = catalog["shots"][1]
         def must_reject():

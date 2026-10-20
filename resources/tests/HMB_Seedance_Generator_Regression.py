@@ -158,6 +158,7 @@ class FakeBrokerBridge:
         self.account_calls = 0
         self.generate_payloads: list[dict] = []
         self.refresh_ids: list[str] = []
+        self.refresh_timeouts: list[float] = []
 
     def account_snapshot(self, *, connect: bool):
         assert connect is True
@@ -180,9 +181,10 @@ class FakeBrokerBridge:
             "nested": {"credential": self.SECRET_VALUES[1]},
         }
 
-    def refresh_job(self, job_id: str, *, timeout: float = 60) -> dict:
+    def refresh_job(self, job_id: str, *, timeout: float = 300) -> dict:
         assert timeout > 0
         self.refresh_ids.append(job_id)
+        self.refresh_timeouts.append(timeout)
         if not self.refresh_responses:
             raise AssertionError("Unexpected extra Broker refresh")
         return self.refresh_responses.pop(0)
@@ -3016,6 +3018,7 @@ def assert_broker_generation_contract() -> None:
 
     assert bridge.account_calls == 1
     assert bridge.refresh_ids == ["broker-job-1"]
+    assert bridge.refresh_timeouts == [300.0]
     assert len(bridge.generate_payloads) == 1
     payload = bridge.generate_payloads[0]
     assert payload["provider"] == "volcengine_ark"
@@ -3074,6 +3077,7 @@ def assert_broker_generation_contract() -> None:
     asyncio.run(resumed._process_generation())
     assert resume_bridge.generate_payloads == []
     assert resume_bridge.refresh_ids == ["broker-resume-9"]
+    assert resume_bridge.refresh_timeouts == [300.0]
     assert resumed.downloads == ["https://cdn.example/resumed-broker.mp4"]
 
     refresh_bridge = FakeBrokerBridge(
@@ -3089,7 +3093,21 @@ def assert_broker_generation_contract() -> None:
     refreshed.parameter_output_values["generation_id"] = "broker-refresh-3"
     asyncio.run(refreshed._refresh_async())
     assert refresh_bridge.refresh_ids == ["broker-refresh-3"]
+    assert refresh_bridge.refresh_timeouts == [300]
     assert refreshed.downloads == ["https://cdn.example/refreshed-broker.mp4"]
+
+    # A status request must still respect the authored total deadline and
+    # retrieve the same Task without submitting a replacement.
+    short_bridge = FakeBrokerBridge([{"status": "completed", "job_id": "broker-short-budget-1",
+                                      "output": "https://cdn.example/short-budget.mp4"}])
+    short = BrokerScriptedNode(short_bridge)
+    short.set_parameter_value("generation_timeout_seconds", 45)
+    short.set_parameter_value("resume_generation_id", "broker-short-budget-1")
+    asyncio.run(short._process_generation())
+    assert short_bridge.refresh_timeouts == [45.0]
+    assert short_bridge.refresh_ids == ["broker-short-budget-1"]
+    assert short_bridge.generate_payloads == []
+    assert short.get_parameter_value("poll_interval_seconds") == 30
 
     # A response error while polling an already-authoritative task is not a
     # create rejection. It must retain the task and its safe retrieve action,

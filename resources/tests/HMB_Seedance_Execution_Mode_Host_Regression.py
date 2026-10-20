@@ -264,9 +264,28 @@ async def exercise(engine, phase, out):
         assert node._shot_identity()["shot_name"] == "Renamed exact UUID" and authored(t, node) == preserved
         record("waiting_new_uuid_and_foreign_channel_rejected_exact_uuid_restored")
 
-        # Preserve one waiting binding across native save; it must not open as Only.
+        # Legacy auto-bound nodes have no mode intent. A missing single Shot
+        # must gain a durable exact pending identity, not claim its replacement.
+        legacy = create("Legacy pending Shot 5", "shot", SHOTS[4])
+        configure(t, legacy, 7)
+        legacy._hmb_reconcile_shot_routing(catalog(t))
+        legacy.metadata.pop(t.SEEDANCE_EXECUTION_MODE_METADATA)
+        without_five = SHOTS[:4]
+        legacy._hmb_reconcile_shot_routing(catalog(t, shots=without_five, generation=2))
+        assert legacy._hmb_seedance_execution_mode() == "waiting"
+        assert legacy._hmb_seedance_requested_shot_identity()["shot_uuid"] == SHOTS[4]["shot_uuid"]
+        assert legacy.metadata[t.SEEDANCE_EXECUTION_MODE_METADATA]["mode"] == "shot"
+        replacement = [*without_five, dict(SHOTS[4], shot_uuid="55555555-5555-4555-8555-555555555555")]
+        legacy._hmb_reconcile_shot_routing(catalog(t, shots=replacement, generation=3))
+        assert legacy._hmb_seedance_execution_mode() == "waiting"
+        legacy._hmb_reconcile_shot_routing(catalog(t, generation=4))
+        assert legacy._shot_identity()["shot_uuid"] == SHOTS[4]["shot_uuid"]
+        legacy._hmb_reconcile_shot_routing(catalog(t, shots=without_five, generation=5))
+        record("legacy_missing_shot_keeps_exact_durable_owner_and_rejects_same_number_new_uuid")
+
+        # Preserve waiting bindings across native save; they must not open as Only.
         node._hmb_clear_shot_routing_catalog()
-        all_nodes = [only, *generators, target]
+        all_nodes = [only, *generators, target, legacy]
         expected = {n.name: dict(intent=deepcopy(n.metadata[t.SEEDANCE_EXECUTION_MODE_METADATA]),
             literal=deepcopy(n.metadata["preserved_literal"]), authored=authored(t, n)) for n in all_nodes}
         serialized = send(engine, SerializeFlowToCommandsRequest(flow_name=flow.name)).serialized_flow_commands
@@ -276,7 +295,7 @@ async def exercise(engine, phase, out):
         calls = {__import__("ast").unparse(n.func).rsplit(".", 1)[-1] for n in __import__("ast").walk(tree) if isinstance(n, __import__("ast").Call)}
         assert not calls & {"StartFlowRequest", "StartFlowFromNodeRequest", "ExecuteNodeRequest", "ResolveNodeRequest"}, calls
         expected_file.write_text(json.dumps(expected, ensure_ascii=False, indent=2), encoding="utf-8")
-        record("actual_native_save_six_generators", path=str(saved), SHA256=hashlib.sha256(saved.read_bytes()).hexdigest(), execute_calls=0)
+        record("actual_native_save_seven_generators_including_legacy_pending", path=str(saved), SHA256=hashlib.sha256(saved.read_bytes()).hexdigest(), execute_calls=0)
 
         # Separate disposable flow: a manually connected HMB manager is a local
         # admission failure. Native StartFlow must finish, without inference.
