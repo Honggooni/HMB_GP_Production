@@ -48,7 +48,10 @@ def protected(path: Path) -> tuple[bytes, int, int]:
 
 
 with tempfile.TemporaryDirectory(prefix="hmb-nested-project-") as temporary:
-    projects = Path(temporary) / "projects"
+    # Windows hosted runners may expose TEMP through an 8.3 username alias.
+    # Discovery returns canonical enumerated paths; the fixture must select
+    # that same canonical identity rather than weaken the product path fence.
+    projects = Path(temporary).resolve() / "projects"
     legacy = projects / "Ai_Ct_image"
     old_sw = legacy / "superwings12"
     old_ka = legacy / "Katuri8"
@@ -146,7 +149,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-nested-project-") as temporary:
 
 
 with tempfile.TemporaryDirectory(prefix="hmb-nested-manifest-") as temporary:
-    projects = Path(temporary) / "projects"
+    projects = Path(temporary).resolve() / "projects"
     old = projects / "Ai_Ct_image" / "superwings12"
     manifest = make_project(old, "4", absolute=True)
     original = protected(manifest)
