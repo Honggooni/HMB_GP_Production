@@ -69,7 +69,9 @@ class ColorLUTNodeRegression(unittest.TestCase):
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="hmb_lut_node_")
-        self.root = Path(self.temporary.name)
+        # Match native export/proof paths on Windows runners whose TEMP uses
+        # an 8.3 alias; all authoring and provenance assertions remain exact.
+        self.root = Path(self.temporary.name).resolve()
         self.addCleanup(self.temporary.cleanup)
         ControlledThread.pending = []
         self.patches = [
