@@ -24,7 +24,7 @@ packager_spec.loader.exec_module(packager)
 # The receipt fixture follows the shipped closure, independently of the reader.
 # Building it from diag.RUNTIME_FILE_PATHS concealed an omitted runtime member.
 runtime_paths = tuple(packager.RUNTIME_INSTALL_FILES)
-assert len(runtime_paths) == 40
+assert len(runtime_paths) == 41
 
 with tempfile.TemporaryDirectory(prefix="hmb-build-diag-") as directory:
     root = Path(directory)
@@ -45,7 +45,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-build-diag-") as directory:
         result = diag.get_build_diagnostics(root, verify_policy=False)
     assert result["install"]["receipt_status"] == "matches_recorded_inventory"
     assert result["runtime"]["fingerprint_sha256"] == expected
-    assert result["runtime"]["file_count"] == result["runtime"]["present_count"] == 40
+    assert result["runtime"]["file_count"] == result["runtime"]["present_count"] == 41
     assert "_hmb_image_limits.py" in result["runtime"]["file_sha256"]
     assert result["channel"] == "local_even"
     assert result["policy"]["signature_status"] == "not_checked"

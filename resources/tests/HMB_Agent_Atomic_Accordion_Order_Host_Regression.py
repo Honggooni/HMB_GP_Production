@@ -123,7 +123,8 @@ def exercise(engine):
         measurements = []
         original_put = engine.event_manager.put_event
         original_add, original_remove = type(root).add_child, type(root).remove_child
-        with mock.patch.object(node, "_hmb_manager_prompt_owner", return_value=prompt):
+        with mock.patch.object(node, "_hmb_manager_prompt_owner", return_value=prompt), \
+                mock.patch.object(node, "_hmb_prompt_display_owner", return_value=prompt):
             def select(number, *, expanded=True):
                 row_name = agents._AGENT_SHOT_ROW_PREFIX + str(number)
                 row = deepcopy(node.get_parameter_value(row_name))
@@ -163,6 +164,9 @@ def exercise(engine):
                     select(number)
                 structures = [value for event in events if type(value := payload(event)).__name__ == "AlterElementEvent"
                               and value.element_details.get("element_id") == root.element_id]
+                store_events = [value for event in events if type(value := payload(event)).__name__ == "AlterElementEvent"
+                    and value.element_details.get("parameter_name") == agents._AGENT_SHOT_STORE_PARAMETER]
+                assert not store_events, "Page selection republished the hidden five-Shot store"
                 assert len(structures) == 1
                 assert counts["root_add"] == counts["root_remove"] == 0
                 assert not [event for event in events if type(payload(event)).__name__ == "RemoveElementEvent"]
@@ -185,6 +189,7 @@ def exercise(engine):
                     assert len(incoming) == 1 and incoming[0].source_parameter.name == f"{name}_source_{number}"
                 assert_own_slots()
                 measurements.append({"shot": number, "root_remove": 0, "root_add": 0, "structural_alter": 1,
+                                     "hidden_store_events": len(store_events),
                                      "all_execution_events": len(events)})
             for number in range(1, 6):
                 events = []

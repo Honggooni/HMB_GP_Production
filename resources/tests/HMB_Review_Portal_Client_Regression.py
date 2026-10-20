@@ -5,6 +5,7 @@ import ast
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import sys
 import tempfile
@@ -23,6 +24,7 @@ from uuid import UUID
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 import _hmb_review as review
+import _hmb_broker_config as broker_config
 
 CAPABILITIES = {"schema": "hmb-review-portal", "version": 1, "review_portal": True,
                 "page_url": "/reviews", "page_size": 20, "retention_days": 30,
@@ -57,7 +59,12 @@ def production_namespace(queued: list, opened: list, tokens: list) -> dict:
     def token(**kwargs):
         tokens.append(kwargs.get("server_url", "default"))
         return "credential-canary"
-    namespace = dict(globals(), _review=review, _TASK_ID_PATTERN=review._TASK_ID,
+    isolated_config = SimpleNamespace(
+        normalize_broker_base_url=broker_config.normalize_broker_base_url,
+        join_broker_url=broker_config.join_broker_url,
+        load_broker_base_url=lambda: "https://default.example",
+    )
+    namespace = dict(globals(), _review=review, _broker_config=isolated_config, _TASK_ID_PATTERN=review._TASK_ID,
         AI_BROKER_SERVER_URL="https://default.example", AI_BROKER_INTERNAL_ORIGIN="http://internal.example",
         MAX_REQUEST_BYTES=64 * 1024 * 1024, AI_BROKER_MAX_JSON_BYTES=2 * 1024 * 1024,
         _broker_load_token=token, _broker_clear_token=lambda **_kwargs: None,
@@ -214,7 +221,8 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="hmb-portal-client-") as directory:
         base = Path(directory)
         original_root = review.review_root
-        with patch.object(review, "review_root", side_effect=lambda root=None: original_root(root or base)), \
+        with patch.dict(os.environ, {"APPDATA": str(base / "appdata"), "LOCALAPPDATA": str(base / "localappdata")}), \
+             patch.object(review, "review_root", side_effect=lambda root=None: original_root(root or base)), \
              patch("socket.create_connection", side_effect=AssertionError("External network forbidden")), \
              patch("socket.socket.connect", side_effect=AssertionError("External network forbidden")):
             case = review.start_case("client-a", {"settings": {"model_id": "seedance-2.5", "duration": 5},

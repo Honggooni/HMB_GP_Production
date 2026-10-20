@@ -443,6 +443,18 @@ def deletion_order_tests():
         lut._hmb_initial_shot_autoclaim_pending = False
         lut._hmb_initial_shot_preferred_uuid = ""
         lut._source_token = 0
+        # This isolated routing fixture deliberately bypasses __init__ and
+        # replaces _publish/_queue_source below. Mirror the constructor's
+        # worker fences so real switch/status callbacks can invalidate a
+        # prepared upload without creating any worker or network request.
+        lut._web_upload_wake = threading.Event()
+        lut._web_upload_epoch = 0
+        lut._web_upload_context = {}
+        lut._web_upload_probe_key = ""
+        lut._web_upload_pending = None
+        lut._web_upload_probe = None
+        lut._web_upload_worker = None
+        lut._web_upload = {"enabled": False, "phase": "unavailable", "reason": "offline fixture"}
         lut._pending_source_key = None
         lut._restoring_source = {}
         lut._publish = mock.Mock()

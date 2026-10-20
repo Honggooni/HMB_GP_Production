@@ -11,12 +11,45 @@ const libraryRoot = path.resolve(argument("--library-root") || fileURLToPath(new
 const sourcePath = path.join(libraryRoot, "widgets/HMBSeedanceGenerationWidget.js");
 const sourceBytes = fs.readFileSync(sourcePath);
 const source = sourceBytes.toString("utf8");
+const widgetModule = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+const normalize = widgetModule.hmbSeedanceNormalizeBrokerUrl;
+const validAddresses = [
+  ["", ""], ["  ", ""],
+  [" https://BROKER.example.com:443/ ", "https://broker.example.com"],
+  ["https://broker.example.com:8443/GripTapeServer/", "https://broker.example.com:8443/GripTapeServer"],
+  ["https://app.funnyflux.kr/GripTapeServer/", "https://app.funnyflux.kr/GripTapeServer"],
+  ["https://broker.example.com/a-b/c_d/e.f/~gateway/", "https://broker.example.com/a-b/c_d/e.f/~gateway"],
+  ["https://[::1]:8443/GripTapeServer/", "https://[::1]:8443/GripTapeServer"],
+  ["https://192.168.203.245:8443/Gateway/", "https://192.168.203.245:8443/Gateway"],
+];
+for (const [raw, canonical] of validAddresses) {
+  assert.deepEqual(normalize(raw), { ok: true, value: canonical, error: "" }, `Canonical shared Broker URL: ${JSON.stringify(raw)}`);
+}
+const invalidAddresses = [
+  "http://broker.example.com", "javascript:alert(1)", "//broker.example.com", "https://",
+  "https://user:password@broker.example.com", "https://@broker.example.com", "https://broker.example.com?",
+  "https://broker.example.com#", "https://broker.example.com/a?b=c", "https://broker.example.com/a#b",
+  "https://broker.example.com/a%2fb", "https://broker.example.com/%2e%2e/a", "https://broker.example.com/a%252fb",
+  "https://broker.example.com/a//b", "https://broker.example.com//", "https://broker.example.com/a/../b",
+  "https://broker.example.com/./b", "https://broker.example.com/a/.", "https://broker.example.com/a/..",
+  "https://broker.example.com\\gateway", "https://broker.example.com/a\\b", "https://broker.example.com/has space",
+  "https://broker.example.com/한글", "https://broker.example.com\n/ab", "\thttps://broker.example.com", "\n",
+  "https://broker.example.com:65536/", `https://broker.example.com/${"a".repeat(2050)}`,
+  "https://127.1", "https://0x7f000001", "https://192.168.1.001", "https://broker.example.com:0",
+  "https://broker.example.com:", "https://broker.example.com.", "https://broker..example.com",
+  "https://-broker.example.com", "https://broker-.example.com", `https://${"a".repeat(64)}.example.com`,
+];
+for (const raw of invalidAddresses) {
+  assert.equal(normalize(raw).ok, false, `Reject unsafe shared Broker URL: ${JSON.stringify(raw)}`);
+  assert.equal(normalize(raw).value, "");
+}
 const sha = (value) => crypto.createHash("sha256").update(value).digest("hex");
 const evidenceDir = argument("--evidence-dir") || process.env.HMB_SEEDANCE_BROKER_EVIDENCE_DIR;
 if (evidenceDir) fs.mkdirSync(evidenceDir, { recursive: true });
 const lifecycleEvidence = { schema: "hmb-seedance-broker-modal-ownership", version: 1, source_root: libraryRoot,
   source_sha256: sha(sourceBytes), scope: "Actual Chrome native-row fixtures with controlled pending transport and second-node modal click event; no live engine, credentials, network or paid API",
   provider_paid_calls: 0, cases: [] };
+lifecycleEvidence.url_validation = { valid: validAddresses.length, invalid: invalidAddresses.length, network_calls: 0 };
 const saveEvidence = () => { if (evidenceDir) fs.writeFileSync(path.join(evidenceDir, "modal-ownership-receipt.json"), JSON.stringify(lifecycleEvidence, null, 2)); };
 const require = createRequire(import.meta.url);
 let playwright;
@@ -188,6 +221,8 @@ try {
   assert.equal(await dialog.count(), 1, "A widget factory refresh must not dismiss an open settings dialog");
   await assertCompactModelSpacing("Repeated custom widget factory");
   assert.equal(await dialog.locator("[data-broker-url]").inputValue(), "");
+  assert.match(await dialog.locator("#hmb-seedance-broker-help").innerText(), /모든 제네레이터.*재시작.*미설정/);
+  assert.doesNotMatch(await dialog.locator("#hmb-seedance-broker-help").innerText(), /기존 기본 브로커/);
   await dialog.locator("[data-broker-url]").press("Shift+Tab");
   assert.equal(await page.evaluate(() => document.activeElement?.hasAttribute("data-broker-save")), true);
   await dialog.locator("[data-broker-save]").press("Tab");
@@ -196,20 +231,20 @@ try {
   await dialog.locator("[data-broker-save]").click();
   assert.match(await dialog.locator("[data-broker-error]").innerText(), /HTTPS/);
   assert.deepEqual(await page.evaluate(() => window.savedUrls), []);
-  await dialog.locator("[data-broker-url]").fill("https://other.example.com:8443/path");
+  await dialog.locator("[data-broker-url]").fill("https://other.example.com:8443/a/../path");
   await dialog.locator("[data-broker-save]").click();
-  assert.match(await dialog.locator("[data-broker-error]").innerText(), /원점/);
+  assert.match(await dialog.locator("[data-broker-error]").innerText(), /경로/);
   assert.deepEqual(await page.evaluate(() => window.savedUrls), []);
-  await dialog.locator("[data-broker-url]").fill("https://other.example.com:8443/");
+  await dialog.locator("[data-broker-url]").fill("https://other.example.com:8443/GripTapeServer/");
   await dialog.locator("[data-broker-save]").click();
   await dialog.waitFor({ state: "detached" });
-  assert.deepEqual(await page.evaluate(() => window.savedUrls), ["https://other.example.com:8443"]);
+  assert.deepEqual(await page.evaluate(() => window.savedUrls), ["https://other.example.com:8443/GripTapeServer"]);
   assert.equal(await page.locator("#model-select").inputValue(), "Seedance 2.5");
   assert.equal(await page.evaluate(() => window.nodePointerDowns), 0, "Settings button should not initiate graph drag");
 
   await page.evaluate(() => {
     window.seedanceWidget.update({
-      value: "https://other.example.com:8443",
+      value: "https://other.example.com:8443/GripTapeServer",
       onChange: (value) => { window.savedUrls.push(value); return Promise.resolve(); },
     });
     const old = document.getElementById("model");
@@ -224,11 +259,11 @@ try {
   await assertCompactModelSpacing("Native Model React rerender");
   await icon.click();
   await dialog.waitFor();
-  assert.equal(await dialog.locator("[data-broker-url]").inputValue(), "https://other.example.com:8443");
+  assert.equal(await dialog.locator("[data-broker-url]").inputValue(), "https://other.example.com:8443/GripTapeServer");
   await dialog.locator("[data-broker-url]").fill("");
   await dialog.locator("[data-broker-save]").click();
   await dialog.waitFor({ state: "detached" });
-  assert.deepEqual(await page.evaluate(() => window.savedUrls), ["https://other.example.com:8443", ""]);
+  assert.deepEqual(await page.evaluate(() => window.savedUrls), ["https://other.example.com:8443/GripTapeServer", ""]);
 
   await page.evaluate(() => {
     for (const id of ["command-slot", "broker-slot"]) {
@@ -251,6 +286,58 @@ try {
   await dialog.waitFor();
   await dialog.locator("[data-broker-url]").press("Escape");
   await dialog.waitFor({ state: "detached" });
+
+  // The engine owns persistence and broadcasts its authoritative endpoint to
+  // every Generator. Mount, host updates and reopen must never save an old
+  // workflow parameter or a UI fallback over that shared setting.
+  await page.evaluate(() => {
+    window.sharedBrokerValue = "";
+    window.sharedBrokerWrites = [];
+    const second = document.createElement("div");
+    second.className = "react-flow__node";
+    second.id = "shared-node";
+    second.innerHTML = '<div data-parameter-name="model_id" id="shared-model"><label>Model shared</label></div><div data-parameter-name="broker_server_url"><div id="shared-container"></div></div>';
+    document.body.appendChild(second);
+    window.sharedBrokerProps = () => ({
+      value: window.sharedBrokerValue,
+      defaultValue: "https://obsolete-workflow.example.com",
+      onChange: async (value) => {
+        window.sharedBrokerWrites.push(value);
+        window.sharedBrokerValue = value;
+        window.seedanceWidget.update(window.sharedBrokerProps());
+        window.sharedBrokerWidget.update(window.sharedBrokerProps());
+      },
+    });
+    window.seedanceWidget.update(window.sharedBrokerProps());
+    window.sharedBrokerWidget = window.seedance.default(document.getElementById("shared-container"), window.sharedBrokerProps());
+  });
+  assert.deepEqual(await page.evaluate(() => window.sharedBrokerWrites), [], "Hydrating shared settings must never invoke a write");
+  await icon.click();
+  assert.equal(await dialog.locator("[data-broker-url]").inputValue(), "", "An explicit empty shared URL must beat a stale workflow default");
+  await dialog.locator("[data-broker-url]").fill("https://BROKER.example.com:443/GripTapeServer/");
+  await dialog.locator("[data-broker-save]").click();
+  await dialog.waitFor({ state: "detached" });
+  await page.locator("#shared-model .hmb-seedance-broker-icon").click();
+  assert.equal(await dialog.locator("[data-broker-url]").inputValue(), "https://broker.example.com/GripTapeServer", "A second Generator must show the backend's same canonical endpoint");
+  await dialog.locator("[data-broker-url]").fill("");
+  await dialog.locator("[data-broker-save]").click();
+  await dialog.waitFor({ state: "detached" });
+  await icon.click();
+  assert.equal(await dialog.locator("[data-broker-url]").inputValue(), "", "Clearing any Generator's settings must clear all backend-synchronized widgets");
+  await dialog.locator("[data-broker-url]").fill("https://external.example.com/StudioGateway/");
+  await dialog.locator("[data-broker-save]").click();
+  await dialog.waitFor({ state: "detached" });
+  await page.evaluate(() => {
+    window.seedanceWidget.cleanup();
+    window.seedanceWidget = window.seedance.default(document.getElementById("broker-container"), window.sharedBrokerProps());
+  });
+  await icon.click();
+  assert.equal(await dialog.locator("[data-broker-url]").inputValue(), "https://external.example.com/StudioGateway", "Reopened UI must show the persisted host value, without node-local storage");
+  assert.deepEqual(await page.evaluate(() => window.sharedBrokerWrites), ["https://broker.example.com/GripTapeServer", "", "https://external.example.com/StudioGateway"]);
+  lifecycleEvidence.cases.push({ case: "shared-host-authority-save-clear-and-remount", result: "PASS", explicit_writes: 3, hydration_writes: 0,
+    scope: "Two production widgets using simulated engine broadcast; durable filesystem/reboot behavior belongs to backend regression" });
+  await dialog.locator("[data-broker-cancel]").click();
+  await page.evaluate(() => { window.sharedBrokerWidget.cleanup(); document.getElementById("shared-node").remove(); });
 
   // Model a host opening node B's settings while A's previous save is pending.
   // The actual production click handler replaces the document-owned dialog.

@@ -22,6 +22,22 @@ def denied(*args,**kwargs):
     import traceback
     caller=traceback.extract_stack(limit=3)[-2];ATTEMPTS.append((Path(caller.filename).name,caller.name,caller.lineno));raise AssertionError("Inspection must never execute, upload, submit, write or reconcile")
 
+def exact_snapshot(snapshot, *, channel_uuid, shot_uuid, **_kwargs):
+    """The cached-media fixture implements both whole and exact-source APIs."""
+    assert channel_uuid==snapshot["channel_uuid"]
+    result=deepcopy(snapshot)
+    selected=next(row for row in result["shots"] if row["shot_uuid"]==shot_uuid)
+    result["shots"]=[selected]
+    uids=selected["selected_source_uids"]
+    records="ordered_videos" if "ordered_videos" in result else "ordered_assets"
+    result[records]=[row for row in result[records] if row["source_uid"] in uids]
+    result["media_by_source_uid"]={uid:result["media_by_source_uid"][uid] for uid in uids}
+    keys=("channel_uuid","generation","shots",records)
+    if "project_id" in result:keys+=("project_id",)
+    result["metadata_sha256"]=digest({key:result[key] for key in keys})
+    result["media_sha256"]=digest({"media_descriptors":[{"source_uid":uid,"media_value_sha256":hashlib.sha256(result["media_by_source_uid"][uid].encode()).hexdigest()} for uid in uids]})
+    return result
+
 async def exercise(engine):
     import HMBSeedanceGeneration as seedance
     import HMBImageAssetLibrary as images
@@ -53,9 +69,11 @@ async def exercise(engine):
         snap=media_snapshot(count=0);catalog_doc={"channel_uuid":CHANNEL,"generation":1,"shots":deepcopy(SHOTS)}
         catalog={"schema":"hmb-shot-routing-catalog","version":1,"publisher_instance_uuid":snap["publisher_instance_uuid"],**catalog_doc,"metadata_sha256":digest(catalog_doc)}
         source._hmb_shot_routing_catalog=lambda:deepcopy(catalog);source._hmb_shot_routing_snapshot=lambda *a,**kw:deepcopy(snap)
+        source._hmb_shot_routing_snapshot_for=lambda **kw:exact_snapshot(snap,**kw)
         source._hmb_project_identity=lambda:deepcopy(PROJECT);source._hmb_shot_channel_subscription=lambda:subscription(kind="image_asset")
         picker=register(pickers.HMBVideoPickerLibrary(name="Read-only exact Picker"));picker._hmb_shot_channel_subscription=lambda:subscription(kind="video_picker")
         picker_snap=media_snapshot("video_picker",count=0);picker._hmb_shot_routing_snapshot=lambda *a,**kw:deepcopy(picker_snap)
+        picker._hmb_shot_routing_snapshot_for=lambda **kw:exact_snapshot(picker_snap,**kw)
         prompt=register(prompts.HMBPromptLibrary(name="Read-only Prompt manager"));agent=register(agents.HMBAgentLibrary(name="Read-only Agent manager"));finish=register(finishes.HMBFinishLookLibrary(name="Read-only Finish manager"))
         gens=[]
         for n,shot in enumerate(SHOTS,1):

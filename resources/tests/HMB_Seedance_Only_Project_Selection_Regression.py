@@ -47,6 +47,8 @@ CANONICAL_PROJECTS = {
     "katuri8": "까투리8",
     "superwings12": "슈퍼윙즈12",
 }
+ACTIVE_ONLY_PROJECTS = {project_id: CANONICAL_PROJECTS[project_id]
+                        for project_id in ("superwings12", "katuri8")}
 SHOT_CHANNEL = "10000000-0000-4000-8000-000000000001"
 SHOT_UUID = "10000000-0000-4000-8000-000000000002"
 REVIEW_CAPABILITIES_PATH = "/api/v1/reviews/capabilities"
@@ -198,8 +200,8 @@ class OnlyProjectSelectionTests(unittest.TestCase):
         node = t.HMBSeedanceGeneration(name="Only project default fixture")
         self.assertEqual(node.get_parameter_value(ONLY_PROJECT_PARAMETER), ONLY_PROJECT_UNSELECTED)
 
-    def test_three_explicit_ids_and_display_names_capture_registered_only_context(self):
-        for project_id, name in CANONICAL_PROJECTS.items():
+    def test_active_explicit_ids_and_display_names_capture_registered_only_context(self):
+        for project_id, name in ACTIVE_ONLY_PROJECTS.items():
             for authored in (project_id, name):
                 with self.subTest(project=project_id, authored=authored):
                     node = Node(); graph = Graph(node); node.select(authored)
@@ -217,8 +219,8 @@ class OnlyProjectSelectionTests(unittest.TestCase):
                     self.assertEqual(selected["edges"], [])
                     self.assertEqual(node.parameter_values, before)
 
-    def test_three_projects_editing_extension_keep_manual_inputs_and_submit_once(self):
-        for project_id, name in CANONICAL_PROJECTS.items():
+    def test_active_projects_editing_extension_keep_manual_inputs_and_submit_once(self):
+        for project_id, name in ACTIVE_ONLY_PROJECTS.items():
             for task in (t.TASK_VIDEO_EDITING, t.TASK_VIDEO_EXTENSION):
                 with self.subTest(project=project_id, task=task):
                     authored = values_for(task)
@@ -342,13 +344,13 @@ class OnlyProjectSelectionTests(unittest.TestCase):
     def test_connected_imageasset_remains_authority_and_only_conflict_fails(self):
         for graph_project in CANONICAL_PROJECTS:
             node = Node(); graph = Graph(node); graph.direct(project=graph_project)
-            node.select(graph_project)
+            node.select(graph_project if graph_project in ACTIVE_ONLY_PROJECTS else ONLY_PROJECT_UNSELECTED)
             with graph.context():
                 captured = node._capture_imageasset_project_selection()
                 self.assertEqual(captured["schema"], t.PROJECT_SELECTION_SCHEMA)
                 self.assertEqual(captured["project"]["project_id"], graph_project)
                 self.assertTrue(captured["sources"])
-                node.select(next(value for value in CANONICAL_PROJECTS if value != graph_project))
+                node.select(next(value for value in ACTIVE_ONLY_PROJECTS if value != graph_project))
                 with self.assertRaises(ValueError):
                     node._capture_imageasset_project_selection()
 
@@ -557,6 +559,10 @@ class OnlyProjectSelectionTests(unittest.TestCase):
                 node = Node(); graph = Graph(node)
                 node.parameter_values["model_id"] = t.MODEL_NAME_SEEDANCE_2_5
                 source = deepcopy(base.SOURCE)
+                # Current manual choices are the two active shows. Legacy
+                # Dinoster Final/Resume preservation is covered separately by
+                # test_final_and_resume_keep_original_task_project_without_new_only_selection.
+                source.update(project_id="superwings12", project_name=CANONICAL_PROJECTS["superwings12"])
                 node.select(source["project_id"] if context == "same" else
                             "katuri8" if context == "other" else
                             "unknown" if context == "unknown" else ONLY_PROJECT_UNSELECTED)

@@ -42,6 +42,12 @@ t = base.t
 # literals are supplied below; the live server's isolated contract suite checks
 # the actual global literals as well as first-accept record immutability.
 SERVER_FIXTURE_AST_SHA256 = "63413b947e7e5f19d075c2c1fc6d1b1f5cc8bfef3b0565f9931291b7edc64525"
+# Local server candidate inspected 2026-10-20 adds only the optional captured
+# Shot metadata capability. It has not been deployed. Preserve the published
+# frozen contract above, and recognize this exact additive candidate separately
+# when auditing a developer's optional API SERVER checkout. Arbitrary server
+# drift, including a changed existing profile or route, must still fail.
+SERVER_SHOT_METADATA_CANDIDATE_AST_SHA256 = "b9c18f5e60bb1e8a22d16f676301f997b9eec4c91db55bb7a1551d419b53ffe9"
 SEEDANCE_DRAFT_SOURCE_TTL_SECONDS = 7 * 24 * 60 * 60
 GENERATION_MODE_METADATA_SCHEMA = "hmb-generation-mode-v1"
 GENERATION_MODE_METADATA_FIELD = "hmb_generation_mode"
@@ -234,6 +240,9 @@ def route_formats(document, *, ordinary=None, draft=None):
 
 class CapabilityRoutingTests(unittest.TestCase):
     def setUp(self):
+        selected = mock.patch.object(t._broker_config, "load_broker_base_url", return_value=base.ORIGIN)
+        selected.start()
+        self.addCleanup(selected.stop)
         self.boundaries = mock.patch.object(t, "_resolve_mp4_decode_verifier",
             return_value=SimpleNamespace(executable="offline-fixture", backend="test"))
         self.boundaries.start()
@@ -297,15 +306,25 @@ class CapabilityRoutingTests(unittest.TestCase):
         local_server = Path("C:/API SERVER/app.py")
         if local_server.is_file():
             actual = function_node(local_server.read_text(encoding="utf-8-sig"))
-            self.assertEqual(function_hash(actual), SERVER_FIXTURE_AST_SHA256)
+            actual_hash = function_hash(actual)
+            self.assertIn(actual_hash, {SERVER_FIXTURE_AST_SHA256,
+                                      SERVER_SHOT_METADATA_CANDIDATE_AST_SHA256})
             namespace = {name: globals()[name] for name in (
                 "SEEDANCE_DRAFT_SOURCE_TTL_SECONDS", "GENERATION_MODE_METADATA_SCHEMA",
                 "GENERATION_MODE_METADATA_FIELD", "GENERATION_MODE_METADATA_CHOICES",
                 "GENERATION_TASK_METADATA_FIELD", "GENERATION_TASK_METADATA_CHOICES")}
+            candidate = actual_hash == SERVER_SHOT_METADATA_CANDIDATE_AST_SHA256
+            shot_capability = {"schema": "hmb-generation-shot-metadata", "version": 1,
+                               "field": "hmb_shot", "enabled": True}
+            if candidate:
+                namespace["review_submission_shots"] = SimpleNamespace(
+                    capability=lambda: deepcopy(shot_capability))
             exec(compile(ast.Module(body=[actual], type_ignores=[]), "<pure-server-fixture>", "exec"), namespace)
             for selected in (False, True):
-                self.assertEqual(namespace[actual.name](draft=selected),
-                                 seedance_generation_capabilities(draft=selected))
+                expected = seedance_generation_capabilities(draft=selected)
+                if candidate:
+                    expected["generation_shot_metadata"] = deepcopy(shot_capability)
+                self.assertEqual(namespace[actual.name](draft=selected), expected)
 
     def test_actual_bridge_ordinary_v2_route_and_wire_never_opt_into_draft(self):
         node = RoutingNode()

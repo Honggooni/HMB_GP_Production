@@ -855,11 +855,31 @@ function hmbSeedanceBrokerContainer(container) {
 }
 
 export function hmbSeedanceNormalizeBrokerUrl(raw) {
-  const value = String(raw ?? "").trim();
+  const authored = String(raw ?? "");
+  const value = authored.trim();
+  if (/[\x00-\x1f\x7f]/.test(authored)) {
+    return { ok: false, value: "", error: "제어 문자가 없는 HTTPS 브로커 주소를 입력하세요." };
+  }
   if (!value) return { ok: true, value: "", error: "" };
   if (value.length > 2048) {
     return { ok: false, value: "", error: "브로커 주소가 너무 깁니다." };
   }
+  // Validate the authored path before URL canonicalization can silently remove
+  // dot segments, backslashes or duplicate separators. The desktop backend owns
+  // the shared persistent setting; this widget never stores an independent URL.
+  const literal = /^https:\/\/([^/?#]+)(\/[^?#]*)?$/i.exec(value);
+  const rawPath = literal?.[2] || "";
+  const segments = rawPath.replace(/\/$/, "").split("/").slice(1);
+  const invalid = () => ({
+    ok: false,
+    value: "",
+    error: "HTTPS 서버 주소와 선택 경로만 허용합니다. 계정·쿼리·인코딩·중복 또는 상위 경로는 제외하세요.",
+  });
+  if (!literal || /[\s\\%]/.test(value)
+    || /[^\x21-\x7e]/.test(value) || literal[1].includes("@")
+    || rawPath.includes("//")
+    || segments.some((segment) => !/^[A-Za-z0-9._~-]+$/.test(segment)
+      || segment === "." || segment === "..")) return invalid();
   let parsed;
   try { parsed = new URL(value); } catch {
     return { ok: false, value: "", error: "올바른 HTTPS 브로커 주소를 입력하세요." };
@@ -867,19 +887,27 @@ export function hmbSeedanceNormalizeBrokerUrl(raw) {
   if (
     parsed.protocol !== "https:"
     || !parsed.hostname
+    || parsed.port === "0"
+    || literal[1].endsWith(":")
     || parsed.username
     || parsed.password
-    || !["", "/"].includes(parsed.pathname)
     || value.includes("?")
     || value.includes("#")
   ) {
-    return {
-      ok: false,
-      value: "",
-      error: "기본 브로커 외의 주소는 HTTPS 서버 원점만 허용합니다. 경로·계정·쿼리는 제외하세요.",
-    };
+    return invalid();
   }
-  return { ok: true, value: parsed.origin, error: "" };
+  if (!parsed.hostname.startsWith("[")) {
+    const host = parsed.hostname.toLowerCase();
+    const rawHost = literal[1].split(":")[0].toLowerCase();
+    const labels = host.split(".");
+    if (rawHost !== host
+      || !/^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/.test(host)
+      || labels.some((part) => !part || part.length > 63 || part.startsWith("-") || part.endsWith("-"))
+      || (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) && /^(?:\d+|0x[0-9a-f]+)$/.test(labels.at(-1)))) {
+      return invalid();
+    }
+  }
+  return { ok: true, value: `${parsed.origin}${rawPath.replace(/\/$/, "")}`, error: "" };
 }
 
 function hmbSeedanceInstallBrokerStyles(ownerDocument) {
@@ -947,7 +975,7 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
     backdrop.innerHTML = `
       <form class="hmb-seedance-broker-dialog" role="dialog" aria-modal="true" aria-labelledby="hmb-seedance-broker-title" aria-describedby="hmb-seedance-broker-help">
         <h2 id="hmb-seedance-broker-title">FN AI Broker 주소</h2>
-        <p id="hmb-seedance-broker-help">다른 서버는 HTTPS 주소만 입력하세요. 비워두면 기존 기본 브로커를 사용합니다. 저장해도 렌더나 연결을 시작하지 않습니다.</p>
+        <p id="hmb-seedance-broker-help">HTTPS 서버 주소를 입력하세요. 모든 제네레이터에 공통 적용되며, 재시작 후에도 직접 바꾸기 전까지 유지됩니다. 비워서 저장하면 미설정 상태로 연결하지 않습니다. 저장만으로 렌더를 시작하지 않습니다.</p>
         <label for="hmb-seedance-broker-url">서버 주소</label>
         <input id="hmb-seedance-broker-url" data-broker-url type="url" inputmode="url" autocomplete="off" spellcheck="false" maxlength="2048" placeholder="https://broker.example.com:8080" value="${escapeHtml(latestProps?.value ?? latestProps?.parameterValue ?? latestProps?.defaultValue ?? "")}">
         <div class="hmb-seedance-broker-error" data-broker-error role="alert" aria-live="polite"></div>
@@ -1088,7 +1116,7 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
       }
       clicked.disabled = true;
       try {
-        // Backend resolves this exact node's validated origin. Credentials,
+        // Backend resolves the validated shared server and optional prefix. Credentials,
         // URLs and Task IDs never cross the browser command boundary.
         await bridge.dispatch({ action: "open_gallery", action_id: `gallery-${Date.now()}-${Math.random().toString(16).slice(2)}`,
           issued_at_ms: Date.now() });
@@ -1365,7 +1393,11 @@ export function hmbSeedanceConnectLocalPreview(container, generation, video, bin
   const src = video.getAttribute?.("src") || "";
   const revision = boundedInteger(generation?.media_revision);
   const previousOriginal = container.__hmbSeedanceLocalOriginalPreview;
-  if (raw === local.source && sameLocalPreviewUrl(src, local.url)) {
+  // The display-only ParameterVideo may already receive the exact local HTTP
+  // URL, while VIDEO_OUT retains the canonical file. Accept only that proved
+  // pair; an unrelated HTTP source must never acquire another result's state.
+  const matchingOriginal = raw === local.source || raw === local.url;
+  if (matchingOriginal && sameLocalPreviewUrl(src, local.url)) {
     // An unchanged, versioned local URL still denotes the same saved bytes
     // when a restored session rebases its private media counter. Adopt that
     // counter without reloading; the actual decoder owns source readiness.
@@ -1387,11 +1419,11 @@ export function hmbSeedanceConnectLocalPreview(container, generation, video, bin
   // The native converter retains its last HTTP URL while resolving a new
   // artifact. Replace only that previously proved original on a newer result;
   // unrelated native HTTP sources and converted fallbacks remain untouched.
-  const replacingPreviousOriginal = raw === local.source
+  const replacingPreviousOriginal = matchingOriginal
     && canonicalPreviewPhase(generation?.phase) === "succeeded"
     && previousOriginal && revision > previousOriginal.media_revision
     && sameLocalPreviewUrl(src, previousOriginal.url);
-  if ((raw && raw !== local.source) || (src !== local.source && !(raw === local.source && !src))) {
+  if ((raw && !matchingOriginal) || (src !== local.source && !(raw === local.source && !src))) {
     if (!replacingPreviousOriginal) return false;
   }
   const key = `${revision}\u001f${local.source}\u001f${local.url}`;
@@ -1962,7 +1994,7 @@ export function hmbSeedanceSyncPreviewOverlay(container, state, onRetrieve = nul
   // A new descriptor can precede React's raw artifact update. Never reload the
   // retained old HTTP source while waiting for that exact original to arrive.
   const awaitingLocalOriginal = Boolean(localOriginal && (
-    (nativeRaw && nativeRaw !== localOriginal.source)
+    (nativeRaw && nativeRaw !== localOriginal.source && nativeRaw !== localOriginal.url)
     || !sameLocalPreviewUrl(video?.getAttribute?.("src"), localOriginal.url)
   ));
   const awaitingDecodedRevision = binding?.awaitingRevision === generation.media_revision

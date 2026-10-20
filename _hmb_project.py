@@ -39,6 +39,12 @@ def _identity(value: Any, *, path: bool = False) -> str:
         if any(part in {".", ".."} for part in pieces):
             raise ValueError("project_identity_invalid")
         text = pieces[-1]
+        # A show's image collection may live directly inside its own folder:
+        # projects/<show>/Ai_Ct_image. The catalog root itself is never a
+        # project. Keep identity validation on the known immediate show name,
+        # including all explicit-field mismatch checks below.
+        if text.casefold() == "ai_ct_image" and len(pieces) > 1:
+            text = pieces[-2]
     elif "/" in text or "\\" in text or ":" in text:
         raise ValueError("project_identity_invalid")
     identity = _ALIASES.get(text.casefold())

@@ -4465,6 +4465,52 @@ def _prompt_document_intent_fingerprint(value: Any) -> str:
         **{key: state.get(key) for key in ("images", "videos", "text", _SOURCE_INTENT_FALLBACKS_KEY)}})
 
 
+def _prompt_same_authoring_write(previous: Any, incoming: Any) -> bool:
+    """UI-only writes cannot hide an edit to a dormant Shot document."""
+    if _prompt_authoring_sync_fingerprint(previous) != _prompt_authoring_sync_fingerprint(incoming):
+        return False
+    before = previous if isinstance(previous, dict) else _parse_state(previous)
+    after = incoming if isinstance(incoming, dict) else _parse_state(incoming)
+    old_docs = _normalize_prompt_shot_documents(before.get("shot_documents"))
+    new_docs = _normalize_prompt_shot_documents(after.get("shot_documents"))
+    return old_docs.keys() == new_docs.keys() and all(old_docs[key] == new_docs[key] or
+        _prompt_authoring_sync_fingerprint(old_docs[key]) == _prompt_authoring_sync_fingerprint(new_docs[key])
+        for key in old_docs)
+
+
+def _prompt_page_only_write(previous: Any, incoming: Any) -> bool:
+    """Recognize a durable editor-page move, without treating it as Run.
+
+    Compare the requested page with the already saved document, including all
+    authored controls. A combined edit+selection, changed source proof or stale
+    document is deliberately left on the normal synchronization path.
+    """
+    before = _parse_state(previous) if not isinstance(previous, dict) else previous
+    after = _parse_state(incoming) if not isinstance(incoming, dict) else incoming
+    if not before.get("multi_shot_enabled") or not after.get("multi_shot_enabled"):
+        return False
+    selected = _normalize_shot_selection(after.get("shot"))
+    if _prompt_document_key(before.get("shot")) == _prompt_document_key(selected):
+        return False
+    if not any(item["channel_uuid"] == selected["channel_uuid"] and
+               item["shot_uuid"] == selected["shot_uuid"]
+               for item in _verified_prompt_shot_catalog(before)):
+        return False
+    expected = _select_prompt_shot_document(copy.deepcopy(before), selected)
+    if _prompt_authoring_sync_fingerprint(expected) != _prompt_authoring_sync_fingerprint(after):
+        return False
+    _store_prompt_shot_document(expected)
+    # The outgoing visible document can legitimately acquire the latest clocks
+    # when the browser stores it. No authored sibling edit may be discarded.
+    expected_docs = _normalize_prompt_shot_documents(expected.get("shot_documents"))
+    incoming_docs = _normalize_prompt_shot_documents(after.get("shot_documents"))
+    if expected_docs.keys() != incoming_docs.keys():
+        return False
+    return all(expected_docs[key] == incoming_docs[key] or
+        _prompt_authoring_sync_fingerprint(expected_docs[key]) ==
+        _prompt_authoring_sync_fingerprint(incoming_docs[key]) for key in expected_docs)
+
+
 def _select_prompt_shot_document(state: Dict[str, Any], selected: Any) -> Dict[str, Any]:
     """Switch only the editing projection; every UUID retains its own inputs."""
     selected = _normalize_shot_selection(selected)
@@ -9890,6 +9936,11 @@ class HMBPromptLibrary(DataNode):
         self._hmb_picker_connected = False
         self._hmb_image_asset_connected = False
         self._hmb_connected_source_nodes: Dict[str, Any] = {}
+        # Prepared display pages are independent of execution snapshots.
+        self._hmb_prompt_shot_views = {}
+        self._hmb_prompt_view_catalog_keys = None
+        self._hmb_prompt_view_revision = 0
+        self._hmb_prompt_view_warmup_pending = False
         self._hmb_current_shot_images: List[str] = []
         self._hmb_current_shot_videos: List[str] = []
         self._hmb_last_shot_context: Dict[str, Any] = {}
@@ -10808,7 +10859,7 @@ class HMBPromptLibrary(DataNode):
     def _hmb_shot_channel_subscription(self) -> Dict[str, Any]:
         """Return the durable selector identity used by the edge helper."""
 
-        shot = _normalize_shot_selection(self._current_state().get("shot"))
+        shot = _normalize_shot_selection(self._hmb_prompt_selector_state().get("shot"))
         return {
             "schema": "hmb-shot-channel-subscription",
             "version": 1,
@@ -10821,7 +10872,21 @@ class HMBPromptLibrary(DataNode):
         }
 
     def _hmb_shot_manager_enabled(self) -> bool:
-        return self._current_state().get("multi_shot_enabled") is True
+        return self._hmb_prompt_selector_state().get("multi_shot_enabled") is True
+
+    def _hmb_prompt_selector_state(self) -> Dict[str, Any]:
+        """Reuse the accepted selector/catalog when its native value is current."""
+        # Exact execution facades deliberately override their state reader for
+        # a different Shot. Their registered owner's raw native value cannot
+        # supply that facade's selector (nor a custom state-reader adapter's).
+        if "_current_state" in vars(self):
+            return self._current_state()
+        cached = getattr(self, "_hmb_prompt_selector_projection", None)
+        if isinstance(cached, tuple):
+            raw = _get_parameter_raw(self, WIDGET_PARAMETER_NAME)
+            if isinstance(raw, str) and (raw == cached[0] or raw == cached[1]):
+                return cached[2]
+        return self._current_state()
 
     def _hmb_prompt_merge_snapshot(self) -> Dict[str, Any]:
         """Capture migration input without compiling or touching the graph."""
@@ -10974,6 +11039,7 @@ class HMBPromptLibrary(DataNode):
             self._hmb_manual_rebind_state(target)
             self._hmb_compile_cache_epoch = int(getattr(self, "_hmb_compile_cache_epoch", 0)) + 1
             self._hmb_compiled_prompt_pairs = {}
+            self._hmb_prompt_shot_views = {}
             self._hmb_last_prompt_output = self._hmb_last_machine_prompt_output = None
             self._hmb_last_prompt_semantic_fingerprint = ""
             self._hmb_last_shot_context = self._hmb_last_agent_context_pair = {}
@@ -11043,7 +11109,7 @@ class HMBPromptLibrary(DataNode):
             return self._hmb_prompt_merge_snapshot()
 
     def _hmb_prompt_shot_subscriptions(self) -> List[Dict[str, Any]]:
-        state = self._current_state()
+        state = self._hmb_prompt_selector_state()
         if state.get("multi_shot_enabled") is not True:
             return [self._hmb_shot_channel_subscription()]
         return [{
@@ -11052,6 +11118,149 @@ class HMBPromptLibrary(DataNode):
             "channel_uuid": shot["channel_uuid"], "shot_uuid": shot["shot_uuid"],
             "shot_number": shot["number"], "shot_name": shot["name"],
         } for shot in _verified_prompt_shot_catalog(state)]
+
+    @staticmethod
+    def _hmb_prompt_view_fingerprint(state: Dict[str, Any]) -> str:
+        # Source clocks and catalog-wide generations are transport proofs, not
+        # changes to another Shot's displayed text. Actual execution validates
+        # all those proofs again through _hmb_prompt_shot_document.
+        return _canonical_sha256({key: state.get(key) for key in (
+            "shot", "images", "videos", "text", _SOURCE_INTENT_FALLBACKS_KEY)})
+
+    def _hmb_remember_prompt_shot_view(self, state: Dict[str, Any], visible: str) -> None:
+        selected = _normalize_shot_selection(state.get("shot"))
+        if not selected["channel_uuid"] or not selected["shot_uuid"]:
+            return
+        key = _prompt_document_key(selected)
+        fingerprint = self._hmb_prompt_view_fingerprint(state)
+        cache = getattr(self, "_hmb_prompt_shot_views", {})
+        old = cache.get(key, {})
+        sources = tuple(getattr(self, "_hmb_connected_source_nodes", {}).values())
+        if old.get("fingerprint") == fingerprint and old.get("visible_prompt") == visible:
+            old["_sources"] = sources
+            return
+        self._hmb_prompt_view_revision = int(getattr(self, "_hmb_prompt_view_revision", 0)) + 1
+        cache[key] = {"schema": "hmb-prompt-shot-view", "version": 1,
+            "subscription": {"channel_uuid": selected["channel_uuid"],
+                "shot_uuid": selected["shot_uuid"]},
+            "visible_prompt": str(visible), "revision": self._hmb_prompt_view_revision,
+            "fingerprint": fingerprint,
+            "_sources": sources}
+        self._hmb_prompt_shot_views = cache
+
+    def _hmb_prepare_prompt_shot_views(self) -> set[str]:
+        """Prepare changed display pages on load/content change, never on read.
+
+        Native Run still uses the separate, fully verified execution snapshot.
+        Only a changed Shot's display text is rebuilt; sibling ready pages and
+        all execution inputs/results remain untouched.
+        """
+        with self._hmb_sync_lock:
+            if self._hmb_node_deleted or self._hmb_manual_rebind_pending():
+                self._hmb_prompt_shot_views = {}
+                return set()
+            changed: set[str] = set()
+            current = _normalize_state(self._current_state())
+            catalog = _verified_prompt_shot_catalog(current)
+            if not current.get("multi_shot_enabled"):
+                key = _prompt_document_key(current.get("shot"))
+                catalog = [row for row in catalog if _prompt_document_key(row) == key]
+            keys = {_prompt_document_key(row) for row in catalog}
+            cache = getattr(self, "_hmb_prompt_shot_views", {})
+            self._hmb_prompt_shot_views = {key: value for key, value in cache.items() if key in keys}
+            for selected in catalog:
+                key = _prompt_document_key(selected)
+                try:
+                    state = _select_prompt_shot_document(copy.deepcopy(current), selected)
+                    view = copy.copy(self)
+                    view._hmb_sync_lock = threading.RLock()
+                    # Prepared pages use the same registered source proofs as
+                    # execution snapshots. The clone cannot consume the live
+                    # editor's deleted-source authoring recovery archive.
+                    view._hmb_execution_registered_owner = self
+                    state, _images, _videos, exact, _picker = view._apply_exact_shot_routes(state)
+                    if not exact or _prompt_document_key(state.get("shot")) != key:
+                        self._hmb_prompt_shot_views.pop(key, None)
+                        continue
+                    cached = self._hmb_prompt_shot_views.get(key, {})
+                    if cached.get("fingerprint") != self._hmb_prompt_view_fingerprint(state):
+                        self._hmb_remember_prompt_shot_view(state, _build_prompt_package(state))
+                        changed.add(key)
+                    else:
+                        cached["_sources"] = tuple(getattr(self, "_hmb_connected_source_nodes", {}).values())
+                except Exception:
+                    # A source can be between native hydrate/connection events.
+                    # Never expose its former display under a replacement UUID.
+                    self._hmb_prompt_shot_views.pop(key, None)
+            return changed
+
+    def _hmb_notify_prompt_view_consumers(self, keys: set[str] | None = None) -> None:
+        """Refresh changed display recipients through physical output edges."""
+        try:
+            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+            connections = GriptapeNodes.FlowManager().get_connections()
+            parameter = _get_parameter_obj(self, "PROMPT_OUT")
+            edges = connections.get_outgoing_connections_from_parameter(self, parameter) if parameter is not None else []
+            seen = set()
+            for edge in edges:
+                target = getattr(edge, "target_node", None)
+                refresh = getattr(target, "_hmb_hydrate_shot_prompt_from_source", None)
+                if (getattr(edge, "source_node", None) is not self or not callable(refresh)
+                        or id(target) in seen or bool(getattr(target, "lock", False))):
+                    continue
+                try:
+                    if keys is not None:
+                        subscription = target._hmb_shot_channel_subscription()
+                        if _prompt_document_key(subscription) not in keys:
+                            continue
+                    seen.add(id(target))
+                    refresh(self, "PROMPT_OUT")
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _hmb_prompt_shot_view(self, *, channel_uuid: Any, shot_uuid: Any) -> Dict[str, Any]:
+        """Read a prepared display only; no source IO, compile or graph work."""
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            return {}
+        pending = getattr(self, "_hmb_last_accepted_manual_rebind_pending", None)
+        if isinstance(pending, tuple) and pending[1]:
+            return {}
+        key = str(channel_uuid or "").strip() + "/" + str(shot_uuid or "").strip()
+        allowed = getattr(self, "_hmb_prompt_view_catalog_keys", None)
+        if allowed is not None and key not in allowed:
+            return {}
+        cached = getattr(self, "_hmb_prompt_shot_views", {}).get(key)
+        if cached and not any(bool(getattr(source, "_hmb_node_deleted", False))
+                              for source in cached.get("_sources", ())):
+            return {"schema": cached["schema"], "version": cached["version"],
+                "subscription": dict(cached["subscription"]),
+                "visible_prompt": cached["visible_prompt"], "revision": cached["revision"]}
+        if not bool(getattr(self, "_hmb_prompt_view_warmup_pending", False)):
+            try:
+                from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+                loop = GriptapeNodes.EventManager().event_loop
+                if loop is not None and loop.is_running():
+                    self._hmb_prompt_view_warmup_pending = True
+                    def warm() -> None:
+                        # A first connection can request its page before the
+                        # source's deferred preparation finishes. Refresh only
+                        # physical Prompt consumers, without publishing output,
+                        # running an Agent or probing unrelated Generators.
+                        try:
+                            self._hmb_prepare_prompt_shot_views()
+                            self._hmb_notify_prompt_view_consumers()
+                        except Exception:
+                            pass
+                        finally:
+                            # Keep this coalescing flag while consumers read a
+                            # still-preparing source, avoiding a call_soon loop.
+                            self._hmb_prompt_view_warmup_pending = False
+                    loop.call_soon_threadsafe(warm)
+            except Exception:
+                self._hmb_prompt_view_warmup_pending = False
+        return {}
 
     def _hmb_prompt_shot_document(self, *, channel_uuid: Any, shot_uuid: Any) -> Dict[str, Any]:
         """Read one exact execution document without changing the visible Shot.
@@ -11102,6 +11311,7 @@ class HMBPromptLibrary(DataNode):
                 "participant_kind": "prompt", "enabled": True,
                 "channel_uuid": selected["channel_uuid"], "shot_uuid": selected["shot_uuid"],
                 "shot_number": selected["number"], "shot_name": selected["name"]}
+            self._hmb_remember_prompt_shot_view(state, visible)
             return copy.deepcopy({"schema": "hmb-prompt-shot-document", "version": 1,
                 "shot": state["shot"], "subscription": subscription, "visible_prompt": visible,
                 "machine_prompt": machine, "paired_snapshot": paired, "generation": generation,
@@ -11665,6 +11875,7 @@ class HMBPromptLibrary(DataNode):
             if hasattr(self, "_hmb_sync_lock"):
                 self._hmb_compile_cache_epoch = int(getattr(self, "_hmb_compile_cache_epoch", 0)) + 1
                 self._hmb_compiled_prompt_pairs = {}
+                self._hmb_prompt_shot_views = {}
                 self._hmb_last_prompt_semantic_fingerprint = ""
                 self._hmb_last_prompt_output = None
                 self._hmb_last_machine_prompt_output = None
@@ -11697,9 +11908,13 @@ class HMBPromptLibrary(DataNode):
         previous_widget_revisions = getattr(
             self, "_hmb_last_accepted_widget_revisions", (0, 0)
         )
+        previous_selector_projection = getattr(self, "_hmb_prompt_selector_projection", None)
+        previous_view_catalog_keys = getattr(self, "_hmb_prompt_view_catalog_keys", None)
+        previous_manual_rebind_pending = getattr(self, "_hmb_last_accepted_manual_rebind_pending", None)
         previous_ui_only_write = getattr(self, "_hmb_ui_only_widget_write", False)
         self._hmb_ui_only_widget_write = bool(guarded_widget_write and previous_widget_state
-            and _prompt_authoring_sync_fingerprint(previous_widget_state) == _prompt_authoring_sync_fingerprint(value))
+            and (_prompt_page_only_write(previous_widget_state, value)
+                 or _prompt_same_authoring_write(previous_widget_state, value)))
         if is_widget_write:
             self._accept_widget_state_baseline(value)
             self._hmb_widget_write_in_progress = True
@@ -11720,6 +11935,9 @@ class HMBPromptLibrary(DataNode):
                 self._hmb_last_accepted_widget_revisions = (
                     previous_widget_revisions
                 )
+                self._hmb_prompt_selector_projection = previous_selector_projection
+                self._hmb_prompt_view_catalog_keys = previous_view_catalog_keys
+                self._hmb_last_accepted_manual_rebind_pending = previous_manual_rebind_pending
             raise
         finally:
             if is_widget_write:
@@ -11865,7 +12083,14 @@ class HMBPromptLibrary(DataNode):
         if not isinstance(state, dict) or not state:
             return
         normalized = _normalize_state(state)
+        self._hmb_prompt_view_catalog_keys = frozenset(
+            _prompt_document_key(row) for row in _verified_prompt_shot_catalog(normalized))
         self._hmb_last_accepted_widget_state = _json_dumps(normalized)
+        self._hmb_prompt_selector_projection = (value if isinstance(value, str) else None,
+            self._hmb_last_accepted_widget_state, {"shot": normalized["shot"],
+                "multi_shot_enabled": normalized["multi_shot_enabled"],
+                "image_asset": {key: normalized["image_asset"].get(key)
+                    for key in ("shot_catalog", "shot_catalog_routing")}})
         self._hmb_last_accepted_manual_rebind_pending = (self._hmb_last_accepted_widget_state,
             normalized.get("manual_rebind", {}).get("required") is True)
         self._hmb_last_accepted_widget_revisions = (
@@ -12193,6 +12418,10 @@ class HMBPromptLibrary(DataNode):
             state, prompt, machine_prompt, fingerprint = (
                 self._compile_current_prompt_pair()
             )
+        # Finish preparing display pages before content publication can wake an
+        # Agent. Page-only writes never enter this synchronization method.
+        self._hmb_remember_prompt_shot_view(state, prompt)
+        changed_prompt_views = self._hmb_prepare_prompt_shot_views()
         output_values = getattr(self, "parameter_output_values", {})
         output_getter = getattr(output_values, "get", None)
         current_output = output_getter("PROMPT_OUT") if callable(output_getter) else None
@@ -12225,6 +12454,8 @@ class HMBPromptLibrary(DataNode):
             and cached_output is not None
             and cached_machine is not None
         ):
+            if changed_prompt_views:
+                self._hmb_notify_prompt_view_consumers(changed_prompt_views)
             if current_images != shot_images:
                 set_output(self, SHOT_IMAGE_OUTPUT_PARAMETER_NAME, shot_images)
             if current_videos != shot_videos:
@@ -12981,7 +13212,8 @@ class HMBPromptLibrary(DataNode):
                 ui_only_widget_write = bool(getattr(self, "_hmb_ui_only_widget_write", False))
                 if (name == WIDGET_PARAMETER_NAME and not getattr(self, "_hmb_widget_write_in_progress", False)
                         and getattr(self, "_hmb_last_accepted_widget_state", None)):
-                    ui_only_widget_write = _prompt_authoring_sync_fingerprint(self._hmb_last_accepted_widget_state) == _prompt_authoring_sync_fingerprint(value)
+                    ui_only_widget_write = (_prompt_page_only_write(self._hmb_last_accepted_widget_state, value)
+                        or _prompt_same_authoring_write(self._hmb_last_accepted_widget_state, value))
                 if (
                     name == WIDGET_PARAMETER_NAME
                     and not getattr(self, "_hmb_ui_syncing", False)
@@ -13148,6 +13380,7 @@ class HMBPromptLibrary(DataNode):
 
         def invalidate() -> None:
             self._hmb_node_deleted = True
+            self._hmb_prompt_shot_views = {}
             self._hmb_initial_source_hydration_pending = False
             self._hmb_compiled_prompt_pairs = {}
             self._hmb_compile_cache_epoch = int(getattr(self, "_hmb_compile_cache_epoch", 0)) + 1

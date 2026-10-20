@@ -48,6 +48,11 @@ class RegisteredPrompt:
     def _hmb_prompt_shot_document(self,*,channel_uuid,shot_uuid):
         assert channel_uuid=="channel"
         return copy.deepcopy(self.documents[int(shot_uuid.rsplit("-",1)[1])])
+    def _hmb_prompt_shot_view(self,*,channel_uuid,shot_uuid):
+        assert channel_uuid=="channel"
+        document=self.documents[int(shot_uuid.rsplit("-",1)[1])]
+        return {"subscription":copy.deepcopy(document["subscription"]),
+                "visible_prompt":document["visible_prompt"],"revision":1}
     def _hmb_shot_channel_subscription(self):return subscription(self.active_shot,"prompt")
 
 def make_agent(number,source):
@@ -117,12 +122,14 @@ class BridgeContracts(unittest.TestCase):
 
     def test_hydration_and_preview_use_individual_uuid_without_editing_prompt_manager(self):
         node=self.nodes[3];node.set_parameter_value=Mock(side_effect=lambda name,value:node.parameter_values.update({name:value}))
+        self.source._hmb_prompt_shot_document=Mock(side_effect=AssertionError("Display read execution document"))
         node._set_native_prompt_preview=Mock();self.assertTrue(node._hmb_hydrate_shot_prompt_from_source(self.source))
         node.set_parameter_value.assert_called_with("SHOT_PROMPT_IN","Visible instruction 4")
         node._refresh_routed_prompt_preview()
         node._set_native_prompt_preview.assert_called_with("Visible instruction 4",enabled=True)
         self.assertEqual(self.source.active_shot,1)
         self.assertEqual(self.source.parameter_output_values["PROMPT_OUT"],"Visible instruction 1")
+        self.source._hmb_prompt_shot_document.assert_not_called()
 
     def test_catalog_offers_manager_shots_without_stealing_other_agents(self):
         node=self.nodes[2]

@@ -77,6 +77,8 @@ class IntervalAdmission(unittest.TestCase):
         for name in ("AI_BROKER_SERVER_URL", "AI_BROKER_INTERNAL_ORIGIN"):
             patch = mock.patch.object(t, name, self.origin)
             patch.start(); self.addCleanup(patch.stop)
+        patch = mock.patch.object(t._broker_config, "LEGACY_INTERNAL_ORIGIN", self.origin)
+        patch.start(); self.addCleanup(patch.stop)
         self.bridge = t._HMBAIBrokerBridge(server_url=self.origin)
         self.bridge._load_access_token = lambda: "synthetic-account-only"
     def payload(self, *, final=False, index=1):

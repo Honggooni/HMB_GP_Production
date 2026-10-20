@@ -37,6 +37,10 @@ def surface():
     parameters = {}
     node.get_parameter_by_name = parameters.get
     node._native_parameter_value = lambda name, default=None: node.parameter_values.get(name, default)
+    # The graph-free fixture substitutes only physical edge discovery; actual
+    # UUID view validation and execution-document separation remain real.
+    node._hmb_prompt_display_owner = lambda: node._hmb_manager_prompt_owner(
+        **{key: node._hmb_shot_channel_subscription()[key] for key in ("channel_uuid", "shot_uuid")})
     node._hmb_shot_catalog_snapshot = catalog(1)
     node._hmb_shot_editor_expanded = True
     node._hmb_native_editor_collapsed = False
@@ -151,7 +155,10 @@ class CatalogPresentationTests(unittest.TestCase):
         node._hmb_prompt_preview_active = True
         node._hmb_prompt_preview_value = "Confirmed selected document"
         node._hmb_prompt_before_preview = "Original editable value"
-        source._hmb_prompt_shot_document = Mock(return_value={"visible_prompt": "Confirmed selected document"})
+        source._hmb_shot_manager_enabled = lambda: True
+        source._hmb_prompt_shot_document = Mock(side_effect=AssertionError("Display compiled execution document"))
+        source._hmb_prompt_shot_view = Mock(return_value={"visible_prompt": "Confirmed selected document",
+            "subscription": {"channel_uuid": "channel", "shot_uuid": "shot-1"}})
         node._hmb_manager_prompt_owner = lambda **kwargs: source
         node.parameter_values[module._AGENT_SHOT_PROMPT_INPUT_PARAMETER] = "Other visible Prompt Shot"
         before = copy.deepcopy(node.parameter_values["prompt"])
@@ -161,12 +168,14 @@ class CatalogPresentationTests(unittest.TestCase):
             self.assertEqual(node.parameter_values["prompt"], before)
             self.assertEqual(publications, [])
             self.assertEqual(writes, [])
-            source._hmb_prompt_shot_document.return_value = {"visible_prompt": "New selected document RGB(1, 2, 3) OFF 0"}
+            source._hmb_prompt_shot_view.return_value = {"visible_prompt": "New selected document RGB(1, 2, 3) OFF 0",
+                "subscription": {"channel_uuid": "channel", "shot_uuid": "shot-1"}}
             node.set_parameter_value(module._AGENT_SHOT_PROMPT_INPUT_PARAMETER, "Other visible Prompt Shot")
         self.assertEqual(node.parameter_values["prompt"], "New selected document RGB(1, 2, 3) OFF 0")
         self.assertEqual(publications, ["prompt"])
         self.assertEqual(writes, ["prompt"])
-        source._hmb_prompt_shot_document.assert_called_with(channel_uuid="channel", shot_uuid="shot-1")
+        source._hmb_prompt_shot_view.assert_called_with(channel_uuid="channel", shot_uuid="shot-1")
+        source._hmb_prompt_shot_document.assert_not_called()
 
     def _late_deleted_worker(self, *, raises=False):
         node, source = manager()

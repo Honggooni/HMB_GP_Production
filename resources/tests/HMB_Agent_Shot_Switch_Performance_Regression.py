@@ -74,7 +74,7 @@ class ShotSwitchPerformanceTests(unittest.TestCase):
             node._hmb_switch_native_slot("channel", "shot-2")
         self.assertEqual(calls, [("prompt", "Other Shot")])
         node._hmb_persist_shot_store.assert_called_once()
-        node._hmb_notify_shot_preview.assert_called_once_with()
+        node._hmb_notify_shot_preview.assert_not_called()
         self.assertEqual(before, {name: id(item) for name, item in parameters.items()})
         self.assertEqual(node._hmb_shot_slots["channel\x1fshot-1"]["values"]["prompt"], "Original")
         self.assertEqual(node.parameter_output_values["output"], "Original result")

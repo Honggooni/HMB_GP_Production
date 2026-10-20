@@ -37,6 +37,7 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "HMBVideoPickerLibrary.py",
     "_hmb_agent_media.py",
     "_hmb_agent_session.py",
+    "_hmb_broker_config.py",
     "_hmb_build_diagnostics.py",
     "_hmb_library_bootstrap.py",
     "_hmb_workflow_migration.py",

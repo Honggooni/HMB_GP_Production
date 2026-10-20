@@ -120,6 +120,7 @@ from _hmb_mp4_verify import (
 )
 import _hmb_shot_routing as _shot_routing
 import _hmb_review as _review
+import _hmb_broker_config as _broker_config
 from _hmb_image_limits import inspect_seedance_image_payload
 from _hmb_project import PROJECTS, project_from_asset_payload, resolve_project
 from _hmb_build_diagnostics import get_build_diagnostics as _get_build_diagnostics
@@ -137,9 +138,12 @@ TOS_ACCESS_KEY_ID_SECRET = "TOS_ACCESS_KEY_ID"
 TOS_SECRET_ACCESS_KEY_SECRET = "TOS_SECRET_ACCESS_KEY"
 TOS_BUCKET_NAME_SECRET = "TOS_BUCKET_NAME"
 AI_BROKER_INTERNAL_ORIGIN = "http://192.168.203.245:8080"
-AI_BROKER_SERVER_URL = os.environ.get(
-    "HMB_AI_BROKER_URL", AI_BROKER_INTERNAL_ORIGIN
-).rstrip("/")
+AI_BROKER_SERVER_URL = _broker_config.DEFAULT_BROKER_BASE_URL
+# This is the same operated Broker behind its public gateway, not a general
+# credential fallback for user-entered third-party addresses.
+_BROKER_LEGACY_AUTH_GATEWAY = "https://app.funnyflux.kr/GripTapeServer"
+_BROKER_LEGACY_AUTH_MIGRATION_LOCK = threading.RLock()
+_BROKER_SETTING_NODES: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
 AI_BROKER_MAX_JSON_BYTES = 16 * 1024 * 1024
 AI_BROKER_DEVICE_AUTH_TIMEOUT_SECONDS = 5 * 60
 AI_BROKER_DEVICE_POLL_SECONDS = 2.0
@@ -352,6 +356,8 @@ BROKER_SEEDANCE_CAPABILITIES_VERSION = 2
 GENERATION_MODE_METADATA_SCHEMA = "hmb-generation-mode-v1"
 GENERATION_MODE_METADATA_FIELD = "hmb_generation_mode"
 GENERATION_TASK_METADATA_FIELD = "hmb_generation_task"
+GENERATION_SHOT_METADATA_SCHEMA = "hmb-generation-shot-metadata"
+GENERATION_SHOT_METADATA_FIELD = "hmb_shot"
 BROKER_SEEDANCE_DRAFT_CAPABILITIES_VERSION = 3
 DRAFT_ACTION_OFF = "Off"
 DRAFT_ACTION_PREVIEW = "Draft 480p"
@@ -815,6 +821,29 @@ def _generated_video_origin(value: Any = None) -> dict[str, Any]:
             "name": name, "source_node_instance_id": instance}
 
 
+def _generation_submission_shot(value: Any) -> dict[str, Any]:
+    """Project only the frozen creation identity, never a live selector or path.
+
+    Titles remain optional Broker display metadata. Keep the existing public
+    name exclusion rules; an unsafe/blank name falls back to its captured slot
+    number without exporting a path, URL or credential-like value.
+    """
+    fields = {"channel_uuid", "shot_uuid", "source_node_instance_id", "number", "name"}
+    if not isinstance(value, dict) or set(value) != fields:
+        return {}
+    if (type(value.get("number")) is not int or not 1 <= value["number"] <= 5
+            or any(not isinstance(value.get(key), str)
+                or not value[key]
+                or _seedance_uuid_text(value[key]) != value[key]
+                for key in fields - {"number", "name"})
+            or not isinstance(value.get("name"), str)):
+        return {}
+    name = _review._public_shot_name(value["name"])
+    if not name or any(0xD800 <= ord(character) <= 0xDFFF for character in name):
+        name = f"Shot {value['number']}"
+    return {key: (name if key == "name" else value[key]) for key in fields}
+
+
 def _generated_video_source_value(value: Any = None) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
@@ -1018,7 +1047,7 @@ def _seedance_recovery_value(value: Any = None) -> dict[str, Any]:
                     _broker_validated_server_url(explicit_origin)
                     if explicit_origin else ""
                 )
-            elif _broker_validated_server_url() == AI_BROKER_INTERNAL_ORIGIN:
+            elif os.environ.get("HMB_AI_BROKER_URL", AI_BROKER_INTERNAL_ORIGIN).rstrip("/") == AI_BROKER_INTERNAL_ORIGIN:
                 broker_server_url = AI_BROKER_INTERNAL_ORIGIN
         except _BrokerError:
             # A corrupt explicit origin must not silently redirect a paid
@@ -1914,68 +1943,19 @@ def _broker_log_transport_error(
 
 
 def _broker_validated_server_url(raw_url: str | None = None) -> str:
-    """Return one canonical origin; a new remote endpoint must use HTTPS."""
+    """Resolve the durable common setting, or validate an explicitly pinned task."""
+    try:
+        value = _broker_config.load_broker_base_url() if raw_url is None else raw_url
+        return _broker_config.normalize_broker_base_url(value)
+    except (ValueError, OSError) as exc:
+        raise _BrokerUnavailableError(str(exc)) from exc
 
-    def canonical(value: str) -> str:
-        if (
-            not value
-            or len(value) > 2048
-            or value != value.strip()
-            or any(ord(char) <= 32 or ord(char) == 127 for char in value)
-            or "\\" in value
-            or "?" in value
-            or "#" in value
-            or "%" in value
-        ):
-            raise _BrokerUnavailableError("FN AI Broker server URL is invalid.")
-        try:
-            parsed = urlparse(value)
-            scheme = parsed.scheme.lower()
-            hostname = parsed.hostname
-            port = parsed.port
-        except ValueError as exc:
-            raise _BrokerUnavailableError("FN AI Broker server URL is invalid.") from exc
-        if scheme not in {"http", "https"} or not hostname or not parsed.netloc:
-            raise _BrokerUnavailableError("FN AI Broker server URL is invalid.")
-        if parsed.username is not None or parsed.password is not None:
-            raise _BrokerUnavailableError(
-                "FN AI Broker server URL must not contain credentials."
-            )
-        if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
-            raise _BrokerUnavailableError(
-                "FN AI Broker server URL must contain only an origin."
-            )
-        if port == 0 or (port is None and parsed.netloc.endswith(":")):
-            raise _BrokerUnavailableError("FN AI Broker server port is invalid.")
-        host = hostname.lower()
-        try:
-            address = ipaddress.ip_address(host)
-        except ValueError:
-            if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?", host):
-                raise _BrokerUnavailableError("FN AI Broker server host is invalid.")
-            if any(not label or len(label) > 63 or label.startswith("-") or label.endswith("-")
-                   for label in host.split(".")):
-                raise _BrokerUnavailableError("FN AI Broker server host is invalid.")
-        else:
-            host = f"[{address.compressed}]" if address.version == 6 else str(address)
-        default_port = 443 if scheme == "https" else 80
-        return f"{scheme}://{host}" + (f":{port}" if port and port != default_port else "")
 
-    default_origin = canonical(AI_BROKER_SERVER_URL)
-    if default_origin != AI_BROKER_INTERNAL_ORIGIN and not default_origin.startswith("https://"):
-        raise _BrokerUnavailableError(
-            "Other FN AI Broker servers require HTTPS."
-        )
-    if raw_url is None or raw_url == "":
-        return default_origin
-    if not isinstance(raw_url, str):
-        raise _BrokerUnavailableError("FN AI Broker server URL is invalid.")
-    selected_origin = canonical(raw_url)
-    if selected_origin != AI_BROKER_INTERNAL_ORIGIN and not selected_origin.startswith("https://"):
-        raise _BrokerUnavailableError(
-            "Other FN AI Broker servers require HTTPS. Use the default server for the approved internal HTTP exception."
-        )
-    return selected_origin
+def _broker_display_server_url() -> str:
+    try:
+        return _broker_config.load_broker_base_url()
+    except (ValueError, OSError):
+        return ""
 
 
 def _broker_token_path(*, server_url: str | None = None) -> Path:
@@ -2025,38 +2005,69 @@ def _broker_dpapi(data: bytes, *, protect: bool) -> bytes:
         ctypes.windll.kernel32.LocalFree(destination.pbData)
 
 
-def _broker_save_token(token: str, *, server_url: str | None = None) -> None:
+def _broker_save_token(
+    token: str, *, server_url: str | None = None, only_if_missing: bool = False,
+) -> None:
     value = str(token or "").strip()
     if not value:
         raise _BrokerProtocolError("FN AI Broker returned an empty access token.")
-    destination = _broker_token_path(server_url=server_url)
-    temporary = destination.with_name(f".{destination.stem}.{uuid4().hex}.tmp")
-    try:
-        with temporary.open("xb") as stream:
-            stream.write(_broker_dpapi(value.encode("utf-8"), protect=True))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, destination)
-    finally:
-        with suppress(FileNotFoundError):
-            temporary.unlink()
+    selected = _broker_validated_server_url(server_url)
+    with _BROKER_LEGACY_AUTH_MIGRATION_LOCK:
+        if (only_if_missing and selected == _BROKER_LEGACY_AUTH_GATEWAY
+                and _broker_legacy_migration_block_path(selected).exists()):
+            raise _BrokerAuthenticationError("FN AI Broker login is required.")
+        destination = _broker_token_path(server_url=selected)
+        temporary = destination.with_name(f".{destination.stem}.{uuid4().hex}.tmp")
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(_broker_dpapi(value.encode("utf-8"), protect=True))
+                stream.flush()
+                os.fsync(stream.fileno())
+            if only_if_missing:
+                # Publish a complete protected file without replacing a login
+                # made by another process during credential verification.
+                if os.name == "nt":
+                    os.rename(temporary, destination)
+                else:
+                    os.link(temporary, destination)
+            else:
+                os.replace(temporary, destination)
+            if selected == _BROKER_LEGACY_AUTH_GATEWAY and not only_if_missing:
+                _broker_legacy_migration_block_path(selected).unlink(missing_ok=True)
+        finally:
+            with suppress(FileNotFoundError):
+                temporary.unlink()
+
+
+def _broker_legacy_migration_block_path(server_url: str | None = None) -> Path:
+    return _broker_token_path(server_url=server_url).with_suffix(".no-legacy")
 
 
 def _broker_clear_token(*, server_url: str | None = None) -> None:
     selected_origin = _broker_validated_server_url(server_url)
-    if selected_origin != AI_BROKER_INTERNAL_ORIGIN:
-        with suppress(FileNotFoundError):
-            _broker_token_path(server_url=selected_origin).unlink()
-        return
-    root = Path(os.environ.get("APPDATA") or Path.home())
-    for path in (
-        root / "FNAIBroker" / "access_token_v2.dpapi",
-        root / "CompanyAIBroker" / "access_token_v2.dpapi",
-    ):
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+    with _BROKER_LEGACY_AUTH_MIGRATION_LOCK:
+        if selected_origin != AI_BROKER_INTERNAL_ORIGIN:
+            if selected_origin == _BROKER_LEGACY_AUTH_GATEWAY:
+                # A rejected/cleared scoped login must not silently switch back
+                # to an old account, including after restarting the editor.
+                marker = _broker_legacy_migration_block_path(selected_origin)
+                try:
+                    with marker.open("xb") as stream:
+                        stream.write(b"Scoped login cleared; explicit authentication required.\n")
+                except FileExistsError:
+                    pass
+            with suppress(FileNotFoundError):
+                _broker_token_path(server_url=selected_origin).unlink()
+            return
+        root = Path(os.environ.get("APPDATA") or Path.home())
+        for path in (
+            root / "FNAIBroker" / "access_token_v2.dpapi",
+            root / "CompanyAIBroker" / "access_token_v2.dpapi",
+        ):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _broker_load_token(*, server_url: str | None = None) -> str:
@@ -2110,6 +2121,76 @@ def _broker_require_exact_response_url(response: Any, expected_url: str) -> None
         )
 
 
+def _broker_migrate_legacy_gateway_token(*, server_url: str) -> str:
+    """Adopt an existing user's login only after this gateway authenticates it.
+
+    No create/device-login request is made. The original protected credential
+    and all task origins remain untouched. This runs at the background Bridge
+    authentication boundary, never when loading settings or constructing UI.
+    """
+    selected = _broker_validated_server_url(server_url)
+    if selected != _BROKER_LEGACY_AUTH_GATEWAY:
+        raise _BrokerAuthenticationError("FN AI Broker login is required.")
+    with _BROKER_LEGACY_AUTH_MIGRATION_LOCK:
+        path = _broker_token_path(server_url=selected)
+        if path.exists():
+            return _broker_load_token(server_url=selected)
+        if _broker_legacy_migration_block_path(selected).exists():
+            raise _BrokerAuthenticationError("FN AI Broker login is required.")
+        try:
+            token = _broker_load_bearer_token_readonly()
+        except RuntimeError as exc:
+            raise _BrokerAuthenticationError("FN AI Broker login is required.") from exc
+        url = _broker_config.join_broker_url(selected, "/api/me")
+        request = urllib.request.Request(
+            url, headers={"Accept": "application/json", "Authorization": "Bearer " + token},
+            method="GET",
+        )
+        try:
+            with _broker_build_opener().open(request, timeout=10) as response:
+                _broker_require_exact_response_url(response, url)
+                if int(getattr(response, "status", 0)) != 200:
+                    raise _BrokerProtocolError("FN AI Broker login could not be verified.")
+                account = _broker_read_json(response, max_bytes=64 * 1024)
+            mappings = [account]
+            if isinstance(account, dict) and isinstance(account.get("user"), dict):
+                mappings.append(account["user"])
+            if (not isinstance(account, dict)
+                    or not _HMBAIBrokerBridge._account_from_mapping(account)
+                    or any(row.get("enabled") is False
+                           or str(row.get("approval_status") or "").lower() in {"pending", "rejected", "blocked"}
+                           for row in mappings if isinstance(row, dict))):
+                raise _BrokerProtocolError("FN AI Broker account authentication could not be verified.")
+        except urllib.error.HTTPError as exc:
+            if exc.code in {401, 403}:
+                raise _BrokerAuthenticationError(
+                    "The existing FN AI Broker login was not accepted by the gateway.",
+                    status_code=exc.code,
+                ) from exc
+            raise _BrokerError(
+                "FN AI Broker gateway authentication is temporarily unavailable.",
+                status_code=exc.code,
+            ) from exc
+        except (TimeoutError, urllib.error.URLError, OSError) as exc:
+            raise _BrokerUnavailableError(
+                "FN AI Broker gateway authentication did not respond. The existing login was preserved."
+            ) from exc
+        # Never replace a newer scoped login established during verification.
+        if path.exists():
+            return _broker_load_token(server_url=selected)
+        if _broker_legacy_migration_block_path(selected).exists():
+            raise _BrokerAuthenticationError("FN AI Broker login is required.")
+        try:
+            _broker_save_token(token, server_url=selected, only_if_missing=True)
+        except FileExistsError:
+            return _broker_load_token(server_url=selected)
+        except OSError as exc:
+            raise _BrokerUnavailableError(
+                "FN AI Broker could not save the verified gateway login. The existing login was preserved."
+            ) from exc
+        return token
+
+
 def _broker_device_login(
     *, opener: Any | None = None, server_url: str | None = None,
 ) -> dict[str, Any]:
@@ -2124,7 +2205,7 @@ def _broker_device_login(
         if backoff_seconds:
             time.sleep(backoff_seconds)
         start_request = urllib.request.Request(
-            server_url + "/api/device/start",
+            _broker_config.join_broker_url(server_url, "/api/device/start"),
             data=b"{}",
             headers={
                 "Content-Type": "application/json",
@@ -2169,10 +2250,16 @@ def _broker_device_login(
     device_code = str(start_result.get("device_code") or "").strip()
     device_secret = str(start_result.get("device_secret") or "").strip()
     verification_url = str(start_result.get("verification_url") or "").strip()
+    parsed_verification = urlparse(verification_url)
+    expected_verification = urlparse(server_url)
+    gateway_path = expected_verification.path.rstrip("/")
     if (
         _TASK_ID_PATTERN.fullmatch(device_code) is None
         or len(device_secret) < 20
         or not _broker_same_origin(verification_url, server_url)
+        or parsed_verification.path not in {gateway_path, gateway_path + "/"}
+        or parsed_verification.fragment
+        or parsed_verification.query != urlencode({"device": device_code})
     ):
         raise _BrokerProtocolError(
             "FN AI Broker device authorization response was invalid."
@@ -2200,7 +2287,7 @@ def _broker_device_login(
         if remaining <= 0:
             break
         token_request = urllib.request.Request(
-            server_url + "/api/device/token",
+            _broker_config.join_broker_url(server_url, "/api/device/token"),
             data=token_payload,
             headers={
                 "Content-Type": "application/json",
@@ -2408,6 +2495,7 @@ class _HMBAIBrokerBridge:
             "draft_job_id",
             GENERATION_MODE_METADATA_FIELD,
             GENERATION_TASK_METADATA_FIELD,
+            GENERATION_SHOT_METADATA_FIELD,
         }
     )
     _COMMON_SEEDANCE_FIELDS = frozenset(
@@ -2432,6 +2520,7 @@ class _HMBAIBrokerBridge:
             "project_selection_schema",
             GENERATION_MODE_METADATA_FIELD,
             GENERATION_TASK_METADATA_FIELD,
+            GENERATION_SHOT_METADATA_FIELD,
         }
     )
     _REFERENCE_MODE_FIELDS = frozenset(
@@ -2463,6 +2552,7 @@ class _HMBAIBrokerBridge:
         self._server_url = _broker_validated_server_url(server_url)
         self._seedance_capabilities: dict[str, Any] | None = None
         self._generation_mode_metadata_capability: dict[str, frozenset[str]] = {}
+        self._generation_shot_metadata_supported = False
         self._generation_mode_metadata_checked_at: float | None = None
 
     @property
@@ -2477,10 +2567,17 @@ class _HMBAIBrokerBridge:
 
     def review_capabilities(self) -> dict[str, Any]:
         result = self._request_json("GET", "/api/v1/reviews/capabilities", payload=None, timeout=5)
+        mounted_page = urlparse(self.server_url).path.rstrip("/") + "/reviews"
+        retention = (type(result.get("retention_days")) is int and result["retention_days"] == 30)
+        manual_retention = (result.get("retention_days", False) is None
+                            and result.get("automatic_deletion") is False
+                            and result.get("retention_policy") == "manual_only")
         if (result.get("schema") != "hmb-review-portal" or type(result.get("version")) is not int
                 or result["version"] != 1 or result.get("review_portal") is not True
-                or result.get("page_url") != "/reviews" or result.get("page_size") != 20
-                or result.get("retention_days") != 30):
+                or not isinstance(result.get("page_url"), str)
+                or result["page_url"] not in {"/reviews", mounted_page}
+                or type(result.get("page_size")) is not int or result["page_size"] != 20
+                or not (retention or manual_retention)):
             raise _BrokerProtocolError("Broker review portal capabilities are unsupported.")
         return result
 
@@ -2586,19 +2683,19 @@ class _HMBAIBrokerBridge:
         return {"items": rows, "has_more": True}
 
     def _load_access_token(self) -> str:
-        # Preserve the original default-server call contract for installed
-        # integrations while explicitly scoping alternate-server credentials.
-        return (
-            _broker_load_token()
-            if self.server_url == _broker_validated_server_url()
-            else _broker_load_token(server_url=self.server_url)
-        )
+        try:
+            return _broker_load_token(server_url=self.server_url)
+        except _BrokerAuthenticationError:
+            # A corrupt or rejected scoped credential is never overwritten by
+            # the old login. Only a previously unconfigured official gateway
+            # may verify and adopt the existing user's protected token.
+            if (self.server_url != _BROKER_LEGACY_AUTH_GATEWAY
+                    or _broker_token_path(server_url=self.server_url).exists()):
+                raise
+            return _broker_migrate_legacy_gateway_token(server_url=self.server_url)
 
     def _clear_access_token(self) -> None:
-        if self.server_url == _broker_validated_server_url():
-            _broker_clear_token()
-        else:
-            _broker_clear_token(server_url=self.server_url)
+        _broker_clear_token(server_url=self.server_url)
 
     @staticmethod
     def _safe_account(value: Any) -> str:
@@ -2788,7 +2885,7 @@ class _HMBAIBrokerBridge:
                 )
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(
-            self.server_url + path,
+            _broker_config.join_broker_url(self.server_url, path),
             data=body,
             headers=headers,
             method=method.upper(),
@@ -2911,13 +3008,7 @@ class _HMBAIBrokerBridge:
         if not logged_in:
             if not connect:
                 return _BrokerAccountSnapshot("login_required", False, "")
-            login_result = (
-                _broker_device_login()
-                if self.server_url == _broker_validated_server_url()
-                else _broker_device_login(
-                    opener=self._opener, server_url=self.server_url,
-                )
-            )
+            login_result = _broker_device_login(opener=self._opener, server_url=self.server_url)
             status = str(login_result.get("status") or "").strip().lower()
             if status in {"pending", "rejected", "blocked"}:
                 return _BrokerAccountSnapshot("approval_" + status, False, "")
@@ -2964,6 +3055,7 @@ class _HMBAIBrokerBridge:
         """Cache optional display provenance, independently of model features."""
         self._generation_mode_metadata_checked_at = time.monotonic()
         self._generation_mode_metadata_capability = {}
+        self._generation_shot_metadata_supported = False
         if (not isinstance(response, dict)
                 or response.get("schema") != BROKER_SEEDANCE_CAPABILITIES_SCHEMA
                 or type(response.get("version")) is not int
@@ -2985,6 +3077,14 @@ class _HMBAIBrokerBridge:
             "modes": frozenset(modes).intersection({"only", "shot"}),
             "tasks": frozenset(tasks).intersection(TASK_STORAGE_CHOICES),
         }
+        shot = response.get("generation_shot_metadata")
+        self._generation_shot_metadata_supported = bool(
+            isinstance(shot, dict)
+            and shot.get("schema") == GENERATION_SHOT_METADATA_SCHEMA
+            and type(shot.get("version")) is int and shot["version"] == 1
+            and shot.get("field") == GENERATION_SHOT_METADATA_FIELD
+            and shot.get("enabled") is True
+        )
 
     def _apply_generation_mode_metadata(self, payload: dict[str, Any], *,
                                         task: str, timeout: float) -> None:
@@ -2996,6 +3096,7 @@ class _HMBAIBrokerBridge:
         """
         mode = payload.pop(GENERATION_MODE_METADATA_FIELD, None)
         captured_task = payload.pop(GENERATION_TASK_METADATA_FIELD, None)
+        captured_shot = _generation_submission_shot(payload.pop(GENERATION_SHOT_METADATA_FIELD, None))
         if type(mode) is not str or mode not in {"only", "shot"}:
             mode = None
         if (type(captured_task) is not str or captured_task not in TASK_STORAGE_CHOICES
@@ -3023,6 +3124,9 @@ class _HMBAIBrokerBridge:
             payload[GENERATION_MODE_METADATA_FIELD] = mode
         if captured_task in capability.get("tasks", ()):
             payload[GENERATION_TASK_METADATA_FIELD] = captured_task
+        if (mode == "shot" and mode in capability.get("modes", ())
+                and self._generation_shot_metadata_supported and captured_shot):
+            payload[GENERATION_SHOT_METADATA_FIELD] = captured_shot
 
     def require_seedance_features(
         self,
@@ -3366,7 +3470,7 @@ class _HMBAIBrokerBridge:
         try:
             return (
                 re.fullmatch(
-                    r"/api/assets/[A-Za-z0-9_-]{43}", candidate.path
+                    re.escape(broker.path.rstrip("/")) + r"/api/assets/[A-Za-z0-9_-]{43}", candidate.path
                 )
                 is not None
                 and "%" not in raw_url
@@ -3902,14 +4006,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
         broker_url_kwargs: dict[str, Any] = {
             "name": BROKER_SERVER_URL_PARAMETER,
-            "default_value": "",
+            "default_value": _broker_display_server_url(),
             "tooltip": (
-                "Optional HTTPS FN AI Broker origin for this node. Leave blank "
-                "to use the configured default. Login and task recovery remain "
-                "bound to the selected server."
+                "Shared FN AI Broker address for every Generator on this Windows account. "
+                "Settings survive restarts and library updates. Clear to disconnect; "
+                "existing tasks retain their original server."
             ),
             "allowed_modes": {ParameterMode.PROPERTY},
-            "serializable": True,
+            "serializable": False,
             "ui_options": {
                 "display_name": "",
                 "is_full_width": True,
@@ -3950,6 +4054,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         )
                     )
         self.add_parameter(broker_url_parameter)
+        _BROKER_SETTING_NODES[str(id(self))] = self
+        _broker_config.subscribe_broker_changes(self._on_shared_broker_address_changed)
         self.add_parameter(
             ParameterString(
                 name=TASK_PARAMETER,
@@ -3980,10 +4086,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 ),
                 allowed_modes={ParameterMode.PROPERTY},
                 traits={Options(choices=[ONLY_PROJECT_UNSELECTED, *(
-                    project["project_name"] for project in PROJECTS.values()
+                    PROJECTS[key]["project_name"] for key in ("superwings12", "katuri8")
                 )])},
                 ui_options={"display_name": "Project (Only)", "simple_dropdown": [
-                    ONLY_PROJECT_UNSELECTED, *(project["project_name"] for project in PROJECTS.values())
+                    ONLY_PROJECT_UNSELECTED, *(PROJECTS[key]["project_name"] for key in ("superwings12", "katuri8"))
                 ]},
             )
         )
@@ -4448,7 +4554,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 ),
                 allowed_modes={ParameterMode.PROPERTY},
                 settable=False,
-                pulse_on_run=True,
+                # Rendering progress is shown by the HMB overlay. Pulsing this
+                # read-only retained preview also leaves the native player in
+                # its loading state while a different result is being prepared.
+                pulse_on_run=False,
                 clickable_file_browser=False,
                 ui_options={"display_name": "Video"},
             )
@@ -5211,7 +5320,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "output_file": self._current_recovery_output_file(),
                 "broker_server_url": (
                     AI_BROKER_INTERNAL_ORIGIN
-                    if _broker_validated_server_url() == AI_BROKER_INTERNAL_ORIGIN
+                    if os.environ.get("HMB_AI_BROKER_URL", AI_BROKER_INTERNAL_ORIGIN).rstrip("/") == AI_BROKER_INTERNAL_ORIGIN
                     else ""
                 ),
             }
@@ -5508,7 +5617,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     def _capture_last_success_video(self) -> VideoUrlArtifact | None:
         """Keep the last complete preview visible while another task runs."""
 
-        current = self.parameter_output_values.get("video_url")
+        current = (self.parameter_output_values.get("VIDEO_OUT")
+                   or self.parameter_output_values.get("video_url"))
+        if (self._generation_artifact_is_present(current)
+                and current is self.parameter_output_values.get("video_url")
+                and not self.parameter_output_values.get("VIDEO_OUT")
+                and str(getattr(current, "value", "")).startswith(("http://127.0.0.1:", "http://localhost:", "http://[::1]:"))):
+            # The visible property can contain a temporary loopback read URL;
+            # it is never the canonical generated file retained for rerenders.
+            current = getattr(self, "_hmb_last_success_video", None)
         if self._generation_artifact_is_present(current):
             self._hmb_last_success_video = current
             current_frame = self.parameter_output_values.get("last_frame_url")
@@ -5917,9 +6034,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return
         checkpoint = self._generation_recovery_state()
         generation_id = str(checkpoint.get("task_id") or "").strip()
+        refresh_native = getattr(self, "_refresh_native_local_video_preview", None)
+        if callable(refresh_native):
+            refresh_native()
         current_video = self.parameter_output_values.get(
-            "video_url"
-        ) or self.parameter_output_values.get("VIDEO_OUT")
+            "VIDEO_OUT"
+        ) or self.parameter_output_values.get("video_url")
         video_present = self._generation_artifact_is_locally_available(
             current_video
         )
@@ -6117,8 +6237,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if stage:
                 return True
             current_video = self.parameter_output_values.get(
-                "video_url"
-            ) or self.parameter_output_values.get("VIDEO_OUT")
+                "VIDEO_OUT"
+            ) or self.parameter_output_values.get("video_url")
             return not self._generation_artifact_is_locally_available(
                 current_video
             )
@@ -6335,8 +6455,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         """Mint a read URL for the existing original; never publish or convert it."""
         if getattr(self, "_hmb_node_deleted", False):
             return {}
-        artifact = (self.parameter_output_values.get("video_url")
-                    or self.parameter_output_values.get("VIDEO_OUT")
+        artifact = (self.parameter_output_values.get("VIDEO_OUT")
+                    or self.parameter_output_values.get("video_url")
                     or getattr(self, "_hmb_last_success_video", None))
         source = getattr(artifact, "value", None)
         if (not isinstance(source, str) or not source.strip()
@@ -6355,7 +6475,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             path = Path(str(getattr(resolved, "location", resolved))).resolve()
             if not path.is_file():
                 return {}
+            before = path.stat()
+            identity = lambda stat: (stat.st_dev, stat.st_ino, stat.st_size,
+                                     stat.st_mtime_ns, stat.st_ctime_ns)
             url = driver.create_signed_download_url(path)
+            if identity(before) != identity(path.stat()):
+                return {}  # Never bind a read URL across an original replacement.
             preview = _seedance_local_preview_value({"source": source, "url": url})
             if not preview:
                 return {}
@@ -6371,8 +6496,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 expected = f"{driver.base_url.rsplit('/workspace', 1)[0]}/external/{external}"
             if urlparse(url)._replace(query="").geturl() != expected:
                 return {}
-            current = (self.parameter_output_values.get("video_url")
-                       or self.parameter_output_values.get("VIDEO_OUT")
+            current = (self.parameter_output_values.get("VIDEO_OUT")
+                       or self.parameter_output_values.get("video_url")
                        or getattr(self, "_hmb_last_success_video", None))
             if (getattr(self, "_hmb_node_deleted", False) or current is not artifact
                     or getattr(current, "value", None) != source):
@@ -6382,6 +6507,79 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             # Preview is optional; an absent/incompatible local server must not
             # change the completed Task, existing artifact, or generation path.
             return {}
+
+    def _native_local_video_preview_artifact(self, artifact: Any) -> Any:
+        """Project an original file into the native player without conversion.
+
+        VIDEO_OUT, recovery and finishing provenance keep the original local
+        MOV/MP4. Only the read-only video_url property receives the exact local
+        storage read URL. The desktop otherwise requests MOV conversion and can
+        keep its center loading indicator after the original is already ready.
+        """
+        if artifact is None or getattr(self, "_hmb_node_deleted", False):
+            return artifact
+        try:
+            preview = self._local_original_generation_preview()
+            source = str(getattr(artifact, "value", "") or "")
+            if not preview or preview.get("source") != source:
+                return artifact
+            url = preview["url"]
+            key = (id(artifact), source, url)
+            cached = getattr(self, "_hmb_native_local_video_preview", None)
+            if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == key:
+                return cached[1]
+            # A workflow can already contain this exact read URL. Reuse its
+            # artifact ID as well, instead of restarting playback on hydration.
+            current = self.parameter_output_values.get("video_url")
+            if (current is not artifact and getattr(current, "value", None) == url
+                    and getattr(current, "name", None) == getattr(artifact, "name", None)):
+                projected = current
+            else:
+                metadata = getattr(artifact, "meta", None)
+                projected = VideoUrlArtifact(value=url,
+                    name=getattr(artifact, "name", None) or Path(source).name,
+                    meta=deepcopy(metadata) if isinstance(metadata, dict) else {})
+            self._hmb_native_local_video_preview = (key, projected)
+            return projected
+        except Exception:
+            # Optional display transport must never turn a saved render into
+            # a failure, change Task identity, or fall back to server media.
+            return artifact
+
+    def get_display_value_for_output(self, parameter_name: str, output_value: Any) -> Any:
+        """Project native output replay as well as ordinary completion events.
+
+        The SDK restores is_output=True values directly into its output dict;
+        it does not call set_parameter_value or after_value_set. Both the dict's
+        AlterElementEvent and the initial GetAllNodeInfo/GetNodeElementDetails
+        snapshot use this supported display hook. Keep raw saved file identity
+        intact and never rely on a guessed deserialization lifecycle callback.
+        """
+        if parameter_name == "video_url":
+            projected = self._native_local_video_preview_artifact(output_value)
+            if projected is not output_value:
+                return projected
+        parent = getattr(super(), "get_display_value_for_output", None)
+        return parent(parameter_name, output_value) if callable(parent) else output_value
+
+    def _refresh_native_local_video_preview(self) -> None:
+        """Remint a local read URL after saved outputs and recovery hydrate."""
+        if getattr(self, "_hmb_node_deleted", False):
+            return
+        artifact = (self.parameter_output_values.get("VIDEO_OUT")
+                    or self.parameter_output_values.get("video_url")
+                    or getattr(self, "_hmb_last_success_video", None))
+        source = str(getattr(artifact, "value", "") or "")
+        if not source or urlparse(source).scheme in {"http", "https"}:
+            return
+        projected = self._native_local_video_preview_artifact(artifact)
+        if projected is artifact:
+            return
+        if self.parameter_output_values.get("VIDEO_OUT") is not artifact:
+            self.parameter_output_values["VIDEO_OUT"] = artifact
+        self._hmb_last_success_video = artifact
+        if self.parameter_output_values.get("video_url") is not projected:
+            self.parameter_output_values["video_url"] = projected
 
     def _generation_preview_for_widget(self) -> dict[str, Any]:
         """Build trusted display state for both stored values and UI events."""
@@ -7190,6 +7388,29 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         workflows and to prevent an unknown model from silently becoming Full.
         """
 
+        if param_name == BROKER_SERVER_URL_PARAMETER:
+            # Workflow hydration is never permission to replace the user's
+            # PC-wide setting. Old serialized per-node values are ignored.
+            if initial_setup:
+                super().set_parameter_value(param_name, _broker_display_server_url(),
+                    initial_setup=True, emit_change=emit_change, skip_before_value_set=True)
+                return
+            try:
+                selected = _broker_config.normalize_broker_base_url(value, allow_empty=True)
+            except ValueError as exc:
+                raise _BrokerUnavailableError(str(exc)) from exc
+            current = _broker_display_server_url()
+            if selected != current:
+                for node in tuple(_BROKER_SETTING_NODES.values()):
+                    active = getattr(node, "_generation_run_active", None)
+                    if ((active is not None and active.is_set())
+                            or getattr(node, "_generation_refresh_running", False)
+                            or getattr(node, "_broker_action_running", False)
+                            or getattr(node, "_hmb_draft_finalize_pending", False)):
+                        raise ValueError("Wait for active Broker work to finish before changing the shared address.")
+            _broker_config.save_broker_base_url(selected)
+            self._on_shared_broker_address_changed(selected)
+            return
         if param_name == SEEDANCE_RECOVERY_PARAMETER:
             value = _seedance_recovery_value(value)
             if not value["journal_id"]:
@@ -7514,37 +7735,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if parameter.name == SEEDANCE_RECOVERY_PARAMETER:
             normalized = _seedance_recovery_value(value)
         elif parameter.name == BROKER_SERVER_URL_PARAMETER:
-            selected_origin = _broker_validated_server_url(value)
-            default_origin = _broker_validated_server_url()
-            current_raw = getattr(self, "parameter_values", {}).get(
-                BROKER_SERVER_URL_PARAMETER, ""
-            )
-            current_origin = _broker_validated_server_url(current_raw)
-            if selected_origin != current_origin:
-                if (
-                    self._generation_run_active.is_set()
-                    or self._generation_refresh_running
-                    or self._broker_action_running
-                ):
-                    raise ValueError(
-                        "Wait for the current Broker connection or render to finish before changing its server."
-                    )
-                recovery = _seedance_recovery_value(
-                    getattr(self, "parameter_values", {}).get(
-                        SEEDANCE_RECOVERY_PARAMETER
-                    )
-                )
-                unresolved = bool(
-                    recovery.get("task_id")
-                    and recovery.get("stage") != "local_succeeded"
-                    and recovery.get("terminal") is not True
-                    and recovery.get("status") not in TERMINAL_FAILURE_STATUSES
-                )
-                if unresolved and recovery.get("broker_server_url") != selected_origin:
-                    raise ValueError(
-                        "This node still has an unresolved Broker task. Refresh it on its original server, or use a new Seedance node for another Broker."
-                    )
-            normalized = "" if selected_origin == default_origin else selected_origin
+            normalized = _broker_config.normalize_broker_base_url(value, allow_empty=True)
         elif parameter.name == "model_id":
             model_value = str(value or "").strip()
             if model_value in RETIRED_SEEDANCE_MODEL_VALUES:
@@ -7942,10 +8133,21 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._restore_generation_recovery_preview()
         return result
 
+    def _on_shared_broker_address_changed(self, value: str) -> None:
+        if self.get_parameter_by_name(BROKER_SERVER_URL_PARAMETER) is None:
+            return
+        if self.get_parameter_value(BROKER_SERVER_URL_PARAMETER) == value:
+            return
+        super().set_parameter_value(BROKER_SERVER_URL_PARAMETER, value,
+            emit_change=True, skip_before_value_set=True)
+
     def _selected_broker_server_url(self) -> str:
-        return _broker_validated_server_url(
-            self.get_parameter_value(BROKER_SERVER_URL_PARAMETER)
-        )
+        # A claimed background web execution is a frozen operation, not a
+        # new submission from the live desktop node.
+        web_params = getattr(self, "_web_params", None)
+        if isinstance(web_params, dict) and web_params.get("_hmb_broker_server_url"):
+            return _broker_validated_server_url(web_params["_hmb_broker_server_url"])
+        return _broker_validated_server_url()
 
     def _broker_server_for_task(
         self, task_id: str, *, checkpoint: dict[str, Any] | None = None,
@@ -7968,16 +8170,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     def _get_broker_bridge(
         self, *, server_url: str | None = None,
     ) -> _HMBAIBrokerBridge:
-        selected_origin = _broker_validated_server_url(
-            server_url if server_url is not None else self.get_parameter_value(BROKER_SERVER_URL_PARAMETER)
-        )
+        selected_origin = _broker_validated_server_url(server_url) if server_url is not None else self._selected_broker_server_url()
         current = self._broker_bridge_instance
         if current is None or getattr(current, "server_url", selected_origin) != selected_origin:
-            self._broker_bridge_instance = (
-                self._create_broker_bridge()
-                if selected_origin == _broker_validated_server_url()
-                else self._create_broker_bridge(server_url=selected_origin)
-            )
+            self._broker_bridge_instance = self._create_broker_bridge(server_url=selected_origin)
         return self._broker_bridge_instance
 
     @staticmethod
@@ -9727,6 +9923,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if not isinstance(value, str):
             raise ValueError("Select a valid Project (Only) before rendering.")
         project = resolve_project(value, default_legacy=False)
+        if project["project_id"] not in {"superwings12", "katuri8"}:
+            raise ValueError("This project is not active. Select Super Wings 12 or Katuri 8 in Project (Only).")
         return {key: project[key] for key in ("project_id", "project_name")}
 
     def _hmb_generation_project(self) -> dict[str, str]:
@@ -11929,6 +12127,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if type(captured_mode) is str and captured_mode in {"only", "shot"}:
                 payload[GENERATION_MODE_METADATA_FIELD] = captured_mode
                 payload[GENERATION_TASK_METADATA_FIELD] = task
+                if captured_mode == "shot":
+                    captured_shot = _generation_submission_shot(params.get("_hmb_generation_origin"))
+                    if captured_shot:
+                        payload[GENERATION_SHOT_METADATA_FIELD] = captured_shot
         project = resolve_project(params)
         payload.update({key: project[key] for key in ("project_id", "project_name")})
         selection = params.get("_hmb_imageasset_project_selection")
@@ -12025,7 +12227,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if candidate.startswith(("http://", "https://")):
                 return candidate
             if candidate.startswith("/") and not candidate.startswith("//"):
-                return urljoin(_broker_validated_server_url(server_url) + "/", candidate)
+                base = _broker_validated_server_url(server_url)
+                prefix = urlparse(base).path.rstrip("/")
+                prefixed_asset = bool(prefix and re.fullmatch(
+                    re.escape(prefix) + r"/api/assets/[A-Za-z0-9_-]{43}", urlparse(candidate).path))
+                return _broker_config.join_broker_url(base, candidate, allow_prefixed=prefixed_asset)
             return ""
         if isinstance(value, dict):
             for key in (
@@ -12617,8 +12823,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self.parameter_output_values["generation_id"] = ""
         self.parameter_output_values["generation_status"] = ""
         self.parameter_output_values["provider_response"] = None
-        self.parameter_output_values["video_url"] = previous_video
         self.parameter_output_values["VIDEO_OUT"] = previous_video
+        self.parameter_output_values["video_url"] = self._native_local_video_preview_artifact(previous_video)
         self.parameter_output_values["last_frame_url"] = (
             self._hmb_last_success_last_frame_url
             if previous_video is not None
@@ -13336,8 +13542,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 )
         if not self._runtime_node_is_live(require_registered=True):
             return
-        self.parameter_output_values["video_url"] = artifact
         self.parameter_output_values["VIDEO_OUT"] = artifact
+        self.parameter_output_values["video_url"] = self._native_local_video_preview_artifact(artifact)
         self.parameter_output_values["last_frame_url"] = frame_artifact
         self._hmb_last_success_video = artifact
         self._hmb_last_success_last_frame_url = frame_artifact
@@ -13487,7 +13693,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             # target and actual artifact must agree; the current output field
             # is editable and is never evidence for this older task.
             saved_target = str(checkpoint.get("output_file") or "").strip()
-            current = self.parameter_output_values.get("video_url") or self.parameter_output_values.get("VIDEO_OUT")
+            current = self.parameter_output_values.get("VIDEO_OUT") or self.parameter_output_values.get("video_url")
             path = artifact_path(current)
             if (not saved_target or path is None
                     or path != artifact_path(saved_target)):
@@ -13526,13 +13732,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if file_identity is None:
             return False
 
-        artifact = self.parameter_output_values.get("video_url")
+        artifact = self.parameter_output_values.get("VIDEO_OUT")
         if artifact_path(artifact) != path:
-            artifact = self.parameter_output_values.get("VIDEO_OUT")
+            artifact = self.parameter_output_values.get("video_url")
         if artifact_path(artifact) != path:
             artifact = VideoUrlArtifact(value=str(path), name=path.name)
-        self.parameter_output_values["video_url"] = artifact
         self.parameter_output_values["VIDEO_OUT"] = artifact
+        self.parameter_output_values["video_url"] = self._native_local_video_preview_artifact(artifact)
         self._hmb_last_success_video = artifact
         self.parameter_output_values["generation_id"] = generation_id
         self.parameter_output_values["generation_status"] = "succeeded"
@@ -13585,12 +13791,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 action="none",
             )
             broker_origin = self._broker_server_for_task(generation_id)
-            if broker_origin == self._selected_broker_server_url():
-                bridge = await self._ensure_broker_connected()
-            else:
-                bridge = await self._ensure_broker_connected(
-                    server_url=broker_origin,
-                )
+            bridge = await self._ensure_broker_connected(server_url=broker_origin)
             if not self._runtime_node_is_live(require_registered=True):
                 return
             if self._authoritative_existing_generation_id() != generation_id:
@@ -14146,10 +14347,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if (not resume_generation_id and draft_final
                 and draft_source.get("draft_job_id") == params.get("draft_job_id")):
             broker_origin = draft_source["broker_server_url"]
-        if broker_origin == self._selected_broker_server_url():
-            bridge = await self._ensure_broker_connected()
-        else:
-            bridge = await self._ensure_broker_connected(server_url=broker_origin)
+        bridge = await self._ensure_broker_connected(server_url=broker_origin)
         params["_hmb_broker_server_url"] = broker_origin
         if not self._runtime_node_is_live(require_registered=True):
             return
@@ -14834,7 +15032,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # Legacy completed outputs can be ready without touching their paths.
         # The new operation has separate media preflight and its own output path.
         return not (not checkpoint.get("stage") and status in BROKER_SUCCESS_STATUSES
-                    and self._generation_artifact_is_present(self.parameter_output_values.get("video_url")))
+                    and self._generation_artifact_is_present(self.parameter_output_values.get("VIDEO_OUT")
+                        or self.parameter_output_values.get("video_url")))
 
     @asynccontextmanager
     async def _hmb_web_rerender_claim(self, snapshot: dict[str, Any]):
@@ -14963,7 +15162,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "command_id": command_id, "case_id": run._hmb_review_case_id,
                 "status": str(run.parameter_output_values.get("generation_status") or ""),
                 "checkpoint": deepcopy(run._generation_recovery_state()),
-                "video": _web_rerender_plain(run.parameter_output_values.get("video_url")),
+                "video": _web_rerender_plain(run.parameter_output_values.get("VIDEO_OUT")
+                    or run.parameter_output_values.get("video_url")),
                 "agent_run_id": agent_result["run_id"]}
 
     async def aprocess(self) -> None:

@@ -116,7 +116,7 @@ class FakeLifecycleBroker(target._HMBAIBrokerBridge):
         coordinator: FullLifecycleCoordinator,
     ) -> None:
         # Supplying a harmless object avoids even constructing a system opener.
-        super().__init__(opener=SimpleNamespace())
+        super().__init__(opener=SimpleNamespace(), server_url="https://fake-broker.invalid")
         self.node_number = node_number
         self.coordinator = coordinator
         self.refresh_count = 0
@@ -281,7 +281,8 @@ class FullLifecycleNode(target.HMBSeedanceGeneration):
         del required, reason
         return True
 
-    def _create_broker_bridge(self):
+    def _create_broker_bridge(self, *, server_url=None):
+        assert server_url is None or target._broker_validated_server_url(server_url) == self.bridge.server_url
         return self.bridge
 
     def _get_parameters(self) -> dict:
@@ -347,7 +348,9 @@ class FullLifecycleNode(target.HMBSeedanceGeneration):
 
 async def run_full_lifecycle() -> tuple[list[FullLifecycleNode], FullLifecycleCoordinator]:
     coordinator = FullLifecycleCoordinator()
-    with tempfile.TemporaryDirectory() as temporary:
+    with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+        target._broker_config, "load_broker_base_url", return_value="https://fake-broker.invalid",
+    ):
         output_root = Path(temporary)
         nodes = [
             FullLifecycleNode(number, coordinator, output_root)

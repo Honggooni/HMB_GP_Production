@@ -2929,12 +2929,28 @@ function hmbNormalizePromptShotDocuments(value) {
   return result;
 }
 
+// Normalized authoring documents are prepared once per received source state.
+// Paging only changes which prepared document is presented; it must not run
+// taxonomy/range migration again. This is runtime-only and never persisted.
+const HMB_PROMPT_PREPARED_DOCUMENTS = new WeakMap();
+
+function hmbPreparedPromptDocuments(state) {
+  let prepared = HMB_PROMPT_PREPARED_DOCUMENTS.get(state);
+  if (!prepared) {
+    prepared = new Map();
+    HMB_PROMPT_PREPARED_DOCUMENTS.set(state, prepared);
+  }
+  return prepared;
+}
+
 export function hmbStorePromptShotDocument(state) {
   if (state?.multi_shot_enabled !== true) return state;
   const { shot_documents: documentsValue, disabled: _disabled, manual_rebind: _manualRebind, ...body } = state;
   const documents = hmbNormalizePromptShotDocuments(documentsValue);
-  documents[hmbPromptDocumentKey(state.shot)] = JSON.stringify(body);
+  const key = hmbPromptDocumentKey(state.shot);
+  documents[key] = JSON.stringify(body);
   state.shot_documents = documents;
+  hmbPreparedPromptDocuments(state).set(key, { value: documents[key], body });
   return state;
 }
 
@@ -2947,10 +2963,17 @@ export function hmbSwitchPromptShot(state, shotUuid) {
   const key = hmbPromptDocumentKey(selected);
   if (key === currentKey) { state.shot = selected; return true; }
   const documents = state.shot_documents;
+  const prepared = hmbPreparedPromptDocuments(state);
+  const cached = prepared.get(key);
   let saved = null;
-  try { if (documents[key]) saved = JSON.parse(documents[key]); } catch (_error) {}
+  if (!cached || cached.value !== documents[key]) {
+    try { if (documents[key]) saved = JSON.parse(documents[key]); } catch (_error) {}
+  }
   if (!saved && currentKey === "__unbound__" && Object.keys(documents).length === 1) saved = state;
-  const target = normalizeState(saved || defaultState());
+  const target = cached && cached.value === documents[key]
+    ? { ...cached.body }
+    : normalizeState(saved || defaultState());
+  prepared.set(key, { value: documents[key], body: target });
   target.multi_shot_enabled = true;
   target.shot_documents = documents;
   target.shot = selected;
@@ -2985,6 +3008,7 @@ function hmbClearImmediateStateCommit(container) {
 
 export function hmbScheduleImmediateStateCommit(container, props, state) {
   if (!container) return;
+  delete container.__hmbPromptNavigationOnlyState;
   // Any newly edited draft supersedes an exact-payload transport retry that
   // may still be waiting from the preceding publication.
   hmbInvalidatePromptPublication(container);
@@ -3815,7 +3839,7 @@ function hmbRestoreSourceScroll(container) {
 }
 
 
-export function hmbInstallPromptInteractionIsolation(container, listeners) {
+export function hmbInstallPromptInteractionIsolation(container, listeners, installGlobal = true) {
   if (!container || typeof container.querySelectorAll !== "function" || !Array.isArray(listeners)) return;
   const canvasPanRoots = [
     container,
@@ -3841,7 +3865,8 @@ export function hmbInstallPromptInteractionIsolation(container, listeners) {
     "[data-resize-group]",
     "[data-resize-textarea]"
   ];
-  const isolated = new Set();
+  const isolated = container.__hmbPromptIsolatedControls || new WeakSet();
+  container.__hmbPromptIsolatedControls = isolated;
   const stopPointerPropagation = (event) => event.stopPropagation();
   const isolatePointer = (element) => {
     if (!element || isolated.has(element)) return;
@@ -3862,6 +3887,7 @@ export function hmbInstallPromptInteractionIsolation(container, listeners) {
   interactionSelectors.forEach((selector) => {
     container.querySelectorAll(selector).forEach(isolatePointer);
   });
+  if (!installGlobal) return;
   const stopNodeDeleteShortcut = (event) => {
     if (["Backspace", "Delete"].includes(event?.key)) event.stopPropagation?.();
   };
@@ -4858,11 +4884,21 @@ export function hmbEmitLocalPromptState(container, props, state, onFinalFailure 
   if (state && typeof state === "object") {
     state[UI_EDIT_REVISION_KEY] = nextUiEditRevision;
   }
-  const normalized = normalizeState(state);
+  const navigationOnly = container?.__hmbPromptNavigationOnlyState === state;
+  delete container?.__hmbPromptNavigationOnlyState;
+  const { disabled: _navigationDisabled, ...navigationState } = navigationOnly ? state : {};
+  const normalized = navigationOnly ? navigationState : normalizeState(state);
   normalized[UI_EDIT_REVISION_KEY] = nextUiEditRevision;
   hmbStorePromptShotDocument(normalized);
   if (state?.multi_shot_enabled) state.shot_documents = normalized.shot_documents;
   const serialized = JSON.stringify(normalized);
+  if (container) {
+    if (navigationOnly) container.__hmbPromptNavigationEcho = {
+      value: serialized, state, uiRevision: nextUiEditRevision,
+      sourceRevision: state.source_sync_revision,
+    };
+    else delete container.__hmbPromptNavigationEcho;
+  }
   if (container) {
     try {
       container.__hmbPromptLatestLocalStateValue = serialized;
@@ -4919,6 +4955,7 @@ export function hmbEmitLocalPromptState(container, props, state, onFinalFailure 
 // host echo is still consumed, while the user sees the structural result before
 // any retained-mode transaction can delay the feedback.
 export function hmbCommitLocalPromptStructure(container, props, state, remount, paint = null) {
+  if (!container?.__hmbPromptShotSwitchInProgress) delete container?.__hmbPromptNavigationOnlyState;
   hmbClearImmediateStateCommit(container);
   if (!container?.__hmbPromptShotSwitchInProgress) hmbCaptureUiBeforeStateEmit(container, state);
   const rollbackValue = typeof container?.__hmbPromptLastPaintedValue === "string"
@@ -7953,7 +7990,82 @@ function hmbNativeUiImplementation(container, props) {
   state.disabled = Boolean(props.disabled);
   hmbRememberPromptRevisionState(container, state, state.disabled, false);
   state.ui = state.ui && typeof state.ui === "object" ? state.ui : defaultUi();
-  const listeners = [];
+  let listeners = [];
+  const sharedListeners = [];
+  const preparedViews = new Map();
+  const sharedControls = new WeakSet();
+  const controlValues = new WeakMap();
+  let sharedListenersInstalled = false;
+  let preparingViews = false;
+  // Native range/resize handlers live as long as their prepared controls.
+  // Resolve current props/state at the instant of an interaction so a later
+  // source generation never leaves those handlers holding an old document.
+  const liveState = new Proxy({}, {
+    get: (_target, key) => state[key],
+    set: (_target, key, value) => { state[key] = value; return true; },
+    has: (_target, key) => key in state,
+    ownKeys: () => Reflect.ownKeys(state),
+    getOwnPropertyDescriptor: (_target, key) => key in state
+      ? { configurable: true, enumerable: true, writable: true, value: state[key] } : undefined,
+  });
+  const liveProps = new Proxy({}, { get: (_target, key) => props?.[key] });
+  const releaseListeners = (entries) => {
+    for (const [el, event, handler, options] of entries.splice(0)) {
+      try { el.removeEventListener(event, handler, options); } catch (_e) {}
+      container.__hmbPromptIsolatedControls?.delete?.(el);
+    }
+  };
+  const retainCurrentView = () => {
+    const editor = container.querySelector?.('.prompt-shot-content');
+    if (!editor) return;
+    const key = editor.getAttribute('data-shot-editor');
+    const prior = preparedViews.get(key);
+    if (prior && prior.editor !== editor) releaseListeners(prior.listeners);
+    const documentKey = `${state.shot?.channel_uuid || ''}/${key}`;
+    preparedViews.set(key, { editor, listeners, documentKey,
+      value: state.shot_documents?.[documentKey] });
+    listeners = [];
+    editor.remove();
+  };
+  const clearPreparedViews = () => {
+    for (const entry of preparedViews.values()) releaseListeners(entry.listeners);
+    preparedViews.clear();
+  };
+  const invalidateChangedPreparedViews = (nextState) => {
+    const currentUuids = new Set(hmbPromptVerifiedShotCatalog(nextState).map((shot) => shot.shot_uuid));
+    for (const [uuid, entry] of preparedViews) {
+      if (entry.value !== nextState.shot_documents?.[entry.documentKey]
+        || !nextState.multi_shot_enabled || !currentUuids.has(uuid)
+        || nextState.shot?.channel_uuid !== entry.documentKey.split('/')[0]) {
+        releaseListeners(entry.listeners);
+        preparedViews.delete(uuid);
+      }
+    }
+  };
+  const showPreparedView = () => {
+    const key = state.shot?.shot_uuid;
+    const entry = preparedViews.get(key);
+    const section = Array.from(container.querySelectorAll('.prompt-shot-section'))
+      .find((node) => node.getAttribute('data-shot-uuid') === key);
+    if (!entry || !section) return false;
+    retainCurrentView();
+    preparedViews.delete(key);
+    section.appendChild(entry.editor);
+    listeners = entry.listeners;
+    for (const tab of container.querySelectorAll('[data-prompt-shot]')) {
+      const active = tab.getAttribute('data-prompt-shot') === key;
+      tab.classList.toggle('active', active);
+      tab.setAttribute('aria-expanded', String(active));
+      tab.setAttribute('aria-selected', String(active));
+    }
+    container.querySelector('.hmb-dashboard')?.setAttribute('data-shot-number', String(hmbPromptPaletteShotNumber(state)));
+    const languageButton = container.querySelector('[data-language-toggle]');
+    if (languageButton) languageButton.textContent = uiLanguage(state) === 'ko' ? '한국어' : 'EN';
+    hmbRestoreSourceScroll(container);
+    hmbRestoreTextEditingStateDeferred(container);
+    try { container.__hmbPromptLastPaintedValue = JSON.stringify(state); } catch (_e) {}
+    return true;
+  };
   hmbApplyInitialNodeSizeOnce(container, state);
   const stopFluidSync = hmbInstallFluidLayoutSync(container, () => state);
   hmbApplyDashboardHostSizing(container, state);
@@ -7967,6 +8079,7 @@ function hmbNativeUiImplementation(container, props) {
       hmbReconcilePromptSourceIdentities(state, normalizedNextState);
       state = normalizedNextState;
     }
+    invalidateChangedPreparedViews(state);
     // The bounded host depends on its outer SDK shell, not on the source rows
     // being patched. Measure it before mutating those rows and consume this
     // snapshot only in this synchronous paint; resize callbacks read afresh.
@@ -7988,8 +8101,14 @@ function hmbNativeUiImplementation(container, props) {
       hmbCapturePromptControlFocus(container);
       hmbCaptureUiBeforeStateEmit(container, state);
     }
-    for (const [el, event, handler, options] of listeners.splice(0)) {
-      try { el.removeEventListener(event, handler, options); } catch (_e) {}
+    if (preparingViews && state.multi_shot_enabled) retainCurrentView();
+    else {
+      const editor = container.querySelector?.('.prompt-shot-content');
+      const key = editor?.getAttribute('data-shot-editor');
+      const prior = preparedViews.get(key);
+      if (prior && prior.listeners !== listeners) releaseListeners(prior.listeners);
+      preparedViews.delete(key);
+      releaseListeners(listeners);
     }
     state = hmbMergeStoredGroupHeights(
       container,
@@ -8013,14 +8132,20 @@ function hmbNativeUiImplementation(container, props) {
     ) hmbReleasePromptCompositionLatch(container);
     hmbSyncAllSourceRowActivation(container);
     hmbFitGroupHeightsToCenter(container, state, measuredHosts);
-    hmbInstallPromptInteractionIsolation(container, listeners);
+    hmbInstallPromptInteractionIsolation(container, listeners, !sharedListenersInstalled);
     hmbInstallSourceScrollPositionLock(container, listeners);
-    hmbInstallGroupResizers(container, state, props, listeners);
-    hmbInstallKeepOutResizers(container, state, props, listeners);
-    hmbInstallFrameRangeInteractions(container, state, props, listeners);
+    hmbInstallGroupResizers(container, liveState, liveProps, listeners);
+    hmbInstallKeepOutResizers(container, liveState, liveProps, listeners);
+    hmbInstallFrameRangeInteractions(container, liveState, liveProps, listeners);
     hmbRestoreSourceScroll(container);
     hmbRestorePromptControlFocus(container);
     hmbRestoreTextEditingStateDeferred(container);
+    if (!sharedListenersInstalled) {
+    const contentChanged = () => { delete container.__hmbPromptNavigationOnlyState; };
+    container.addEventListener('input', contentChanged, true);
+    container.addEventListener('change', contentChanged, true);
+    listeners.push([container, 'input', contentChanged, true]);
+    listeners.push([container, 'change', contentChanged, true]);
     const clearTextFocusOnPointerDown = (event) => {
       if (event?.target?.closest?.("[data-prompt-shot]")) {
         hmbCaptureTextEditingState(container);
@@ -8058,7 +8183,10 @@ function hmbNativeUiImplementation(container, props) {
       const shotCatalogHandler = (event) => {
         const result = hmbApplyRemoteShotCatalog(state, event?.detail);
         state = result.state || state;
-        if (result.changed) hmbCommitLocalPromptStructure(container, props, state, remount);
+        if (result.changed) {
+          hmbCommitLocalPromptStructure(container, props, state, remount);
+          warmPreparedViews();
+        }
       };
       window.addEventListener("hmb-shot-routing-catalog-v1", shotCatalogHandler);
       listeners.push([window, "hmb-shot-routing-catalog-v1", shotCatalogHandler]);
@@ -8073,6 +8201,7 @@ function hmbNativeUiImplementation(container, props) {
         discoveryRequested = true;
         scheduleLifecycleMicrotask(discover);
       }
+    }
     }
     scheduleLifecycleFrame(() => {
       if (ownRenderRevision !== renderRevision) return;
@@ -8507,15 +8636,18 @@ function hmbNativeUiImplementation(container, props) {
       listeners.push([button, "click", handler]);
     });
 
-    if (state.multi_shot_enabled) {
+    if (!sharedListenersInstalled) {
       const handler = (event) => {
         const button = event.target?.closest?.("[data-prompt-shot]");
-        if (!button || !container.contains(button) || state.disabled || button.disabled) return;
+        if (!state.multi_shot_enabled || !button || !container.contains(button) || state.disabled || button.disabled) return;
         event.preventDefault();
         event.stopPropagation();
         const nextUuid = clean(button.getAttribute("data-prompt-shot"));
         const sameShot = nextUuid === state.shot?.shot_uuid;
         if (sameShot) return;
+        const navigationOnly = !container.__hmbPromptLibraryCommitPending
+          && !container.__hmbPromptLibraryCompositionActive
+          && !(container.__hmbPromptLibraryDirtyText instanceof Map);
         hmbCaptureUiBeforeStateEmit(container, state);
         const pointerTextFocus = container.__hmbPromptShotPointerFocus;
         delete container.__hmbPromptShotPointerFocus;
@@ -8527,6 +8659,8 @@ function hmbNativeUiImplementation(container, props) {
         });
         container.__hmbPromptShotInteractionStates = memories;
         if (!sameShot && !hmbSwitchPromptShot(state, nextUuid)) return;
+        if (navigationOnly) container.__hmbPromptNavigationOnlyState = state;
+        else delete container.__hmbPromptNavigationOnlyState;
         state.ui.shot_editor_expanded = true;
         hmbClearImmediateStateCommit(container);
         hmbReleasePromptCompositionLatch(container);
@@ -8538,8 +8672,12 @@ function hmbNativeUiImplementation(container, props) {
         HMB_GROUP_KEYS.forEach((key) => hmbStoreGroupHeight(container, key, state.ui?.group_heights?.[key] || HMB_GROUP_START_HEIGHTS[key]));
         container.__hmbPromptShotSwitchInProgress = true;
         try {
-          hmbCommitLocalPromptStructure(container, props, state, remount);
-          hmbEnsureOuterNodeFitsGroups(container, state, true, hmbPromptUsesFluidLayout(container, state));
+          hmbCommitLocalPromptStructure(container, props, state, remount, () => {
+            if (!showPreparedView()) {
+              preparingViews = true;
+              try { remount(null, true); } finally { preparingViews = false; }
+            }
+          });
         }
         finally { container.__hmbPromptShotSwitchInProgress = false; }
       };
@@ -8548,7 +8686,8 @@ function hmbNativeUiImplementation(container, props) {
     }
 
     const shotSelector = container.querySelector("[data-shot-selector]");
-    if (shotSelector) {
+    if (shotSelector && !sharedControls.has(shotSelector)) {
+      sharedControls.add(shotSelector);
       const handler = () => {
         const shotUuid = clean(shotSelector.value);
         if (shotUuid === HMB_PROMPT_ONLY_SHOT_VALUE) {
@@ -8583,7 +8722,8 @@ function hmbNativeUiImplementation(container, props) {
     }
 
     const languageButton = container.querySelector("[data-language-toggle]");
-    if (languageButton) {
+    if (languageButton && !sharedControls.has(languageButton)) {
+      sharedControls.add(languageButton);
       const handler = (event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -8628,11 +8768,95 @@ function hmbNativeUiImplementation(container, props) {
       listeners.push([field, "input", inputHandler]);
       listeners.push([field, "blur", blurHandler]);
     });
+    // Dashboard controls and global guards belong to the widget lifecycle;
+    // source controls belong to their cached page. Neither is re-registered
+    // by a plain page selection.
+    const pageListeners = [];
+    for (let index = sharedListeners.length - 1; index >= 0; index--) {
+      const [element, event, handler, options] = sharedListeners[index];
+      if (element === container || element === globalThis.window || container.contains(element)) continue;
+      try { element.removeEventListener(event, handler, options); } catch (_e) {}
+      container.__hmbPromptIsolatedControls?.delete?.(element);
+      sharedListeners.splice(index, 1);
+    }
+    for (const binding of listeners) {
+      const element = binding[0];
+      if (element === container || element === globalThis.window
+        || element?.closest?.('.topbar,.prompt-shot-row')) sharedListeners.push(binding);
+      else {
+        const [, event, handler, options] = binding;
+        const owner = element?.closest?.('.prompt-shot-content')?.getAttribute('data-shot-editor');
+        if ('value' in element && !controlValues.has(element)) controlValues.set(element, {
+          value: element.value, checked: element.checked,
+        });
+        const guarded = function (eventValue) {
+          if (!container.contains(element) || (owner && owner !== state.shot?.shot_uuid)) {
+            const previous = controlValues.get(element);
+            if (previous) {
+              element.value = previous.value;
+              if ('checked' in element) element.checked = previous.checked;
+            }
+            return;
+          }
+          try { return handler.call(this, eventValue); }
+          finally {
+            if ('value' in element) controlValues.set(element, {value: element.value, checked: element.checked});
+          }
+        };
+        element.removeEventListener(event, handler, options);
+        element.addEventListener(event, guarded, options);
+        pageListeners.push([element, event, guarded, options]);
+      }
+    }
+    listeners = pageListeners;
+    sharedListenersInstalled = true;
     try { container.__hmbPromptLastPaintedValue = JSON.stringify(state); } catch (_e) {}
     return state;
   };
   remount();
+  const warmPreparedViews = () => {
+    if (!state.multi_shot_enabled || state.manual_rebind?.required) return;
+    const selected = state.shot?.shot_uuid;
+    const catalog = hmbPromptVerifiedShotCatalog(state);
+    if (!selected || catalog.length < 2) return;
+    if (!catalog.some((shot) => shot.shot_uuid !== selected && !preparedViews.has(shot.shot_uuid))) return;
+    preparingViews = true;
+    container.__hmbPromptShotSwitchInProgress = true;
+    try {
+      for (const shot of catalog) {
+        if (shot.shot_uuid === selected || preparedViews.has(shot.shot_uuid)) continue;
+        hmbSwitchPromptShot(state, shot.shot_uuid);
+        remount(null, true);
+      }
+      hmbSwitchPromptShot(state, selected);
+      if (!showPreparedView()) remount(null, true);
+    } finally {
+      preparingViews = false;
+      container.__hmbPromptShotSwitchInProgress = false;
+    }
+  };
+  warmPreparedViews();
   const applyPropsNow = (nextProps = {}) => {
+    const navigationEcho = container.__hmbPromptNavigationEcho;
+    if (navigationEcho && nextProps.value === navigationEcho.value
+      && state === navigationEcho.state
+      && state[UI_EDIT_REVISION_KEY] === navigationEcho.uiRevision
+      && state.source_sync_revision === navigationEcho.sourceRevision
+      && !container.__hmbPromptLibraryCommitPending
+      && !container.__hmbPromptLibraryCompositionActive
+      && !(container.__hmbPromptLibraryDirtyText instanceof Map)
+      && !container.__hmbPromptLibraryInteractionCommit
+      && !container.__hmbPromptLibrarySourcePropsApply
+      && !container.__hmbPromptPendingRevisionMerge) {
+      // Exact bytes generated by this current prepared-page selection are an
+      // acknowledgement, not a source payload requiring normalization.
+      props = nextProps;
+      state.disabled = Boolean(nextProps.disabled);
+      hmbRememberPromptRevisionState(container, state, state.disabled, false);
+      hmbApplyPromptDisabledFeedback(container, state.disabled);
+      return;
+    }
+    delete container.__hmbPromptNavigationEcho;
     const parsedIncoming = {};
     if (hmbConsumePendingPromptStateEcho(container, nextProps || {}, state, parsedIncoming)) {
       // Do not replace the live callbacks/state with an older retained-mode
@@ -8649,6 +8873,8 @@ function hmbNativeUiImplementation(container, props) {
       return;
     }
     const revisionMergedState = hmbTakePromptRevisionMerge(container);
+    delete container.__hmbPromptNavigationOnlyState;
+    delete container.__hmbPromptNavigationEcho;
     const shouldRepublishRevisionMerge = Boolean(revisionMergedState);
     hmbInvalidatePromptPublication(container);
     const hadUncommittedText = Boolean(
@@ -8707,6 +8933,10 @@ function hmbNativeUiImplementation(container, props) {
       }
       return;
     }
+    // Only authoritative document/content changes invalidate their prepared
+    // controls. A metadata rename or an acknowledgement keeps all five pages.
+    invalidateChangedPreparedViews(normalizedNextState);
+    HMB_PROMPT_PREPARED_DOCUMENTS.delete(state);
     state = normalizedNextState;
     state.disabled = Boolean(nextProps?.disabled);
     const pendingInteraction = container.__hmbPromptLibraryInteractionCommit;
@@ -8732,6 +8962,7 @@ function hmbNativeUiImplementation(container, props) {
     } else {
       remount(null, !hadUncommittedText);
     }
+    if (!shotRegionOnly) warmPreparedViews();
     if (dirtyText.length || shouldRepublishRevisionMerge) {
       hmbScheduleImmediateStateCommit(container, props, state);
     }
@@ -8769,6 +9000,8 @@ function hmbNativeUiImplementation(container, props) {
     disposeLifecycle();
     delete container.__hmbPromptShotPointerFocus;
     delete container.__hmbPromptShotInteractionStates;
+    delete container.__hmbPromptNavigationOnlyState;
+    delete container.__hmbPromptNavigationEcho;
     stopExternalCommitBoundary();
     hmbInvalidatePromptPublication(container);
     try { hmbClearActivePromptResize(container); } catch (_e) {}
@@ -8792,9 +9025,11 @@ function hmbNativeUiImplementation(container, props) {
     try { container.__hmbFrameRangeDragCleanup?.(); } catch (_e) {}
     try { hmbClearScheduledFrameTrackPreview(container); } catch (_e) {}
     try { stopFluidSync && stopFluidSync(); } catch (_e) {}
-    for (const [el, event, handler, options] of listeners.splice(0)) {
-      try { el.removeEventListener(event, handler, options); } catch (_e) {}
-    }
+    releaseListeners(listeners);
+    clearPreparedViews();
+    releaseListeners(sharedListeners);
+    HMB_PROMPT_PREPARED_DOCUMENTS.delete(state);
+    delete container.__hmbPromptIsolatedControls;
     if (container.__hmbPromptLibraryApplyProps === applyProps) {
       delete container.__hmbPromptLibraryApplyProps;
     }

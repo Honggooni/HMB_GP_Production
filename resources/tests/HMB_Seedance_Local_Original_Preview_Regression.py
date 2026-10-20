@@ -265,7 +265,7 @@ class LocalOriginalPreviewTests(unittest.TestCase):
                     if kind == 'deleted':
                         node._hmb_node_deleted = True
                     else:
-                        node.parameter_output_values['video_url'] = SimpleNamespace(value=str(self.path))
+                        node.parameter_output_values['VIDEO_OUT'] = SimpleNamespace(value=str(self.path))
                     return result
                 with mock.patch.object(self.driver, 'create_signed_download_url', side_effect=changed):
                     self.assertEqual(node._local_original_generation_preview(), {})

@@ -705,6 +705,44 @@ def _looks_like_direct_project(root: Path) -> bool:
     )
 
 
+def _image_project_child(root: Path, name: str) -> Path | None:
+    """Find one regular child directory, without following a project redirect."""
+    candidate = root / name
+    try:
+        if candidate.is_dir() and not _is_reparse_point(candidate):
+            candidate.resolve().relative_to(root.resolve())
+            return candidate.resolve()
+        # Windows shares are case insensitive. Keep that contract in portable
+        # tests and on case-sensitive project mounts as well.
+        for child in root.iterdir():
+            if child.name.casefold() != name.casefold():
+                continue
+            if child.is_dir() and not _is_reparse_point(child):
+                child.resolve().relative_to(root.resolve())
+                return child.resolve()
+    except (FileNotFoundError, NotADirectoryError, ValueError):
+        return None
+    return None
+
+
+def _nested_image_project_root(show: Path) -> Path | None:
+    """A show's own Ai_Ct_image is its image boundary, never its pipelines."""
+    storage = _image_project_child(show, "Ai_Ct_image")
+    if storage is None:
+        return None
+    # Retain the original project folder name/relative image paths when the
+    # complete old project directory was moved into its show, as in SW12/KA8.
+    return _image_project_child(storage, show.name) or storage
+
+
+def _legacy_image_catalog_parent(root: Path) -> Path | None:
+    """Keep saved projects/Ai_Ct_image roots usable after that folder moves."""
+    if (root.name.casefold() == "ai_ct_image"
+            and root.parent.name.casefold() == "projects"):
+        return root.parent
+    return None
+
+
 def _discover_project_catalog(projects_root: Any) -> Dict[str, Any]:
     root_text = _project_root_text(projects_root) or str(DEFAULT_PROJECTS_ROOT)
     root = Path(root_text).expanduser()
@@ -712,38 +750,72 @@ def _discover_project_catalog(projects_root: Any) -> Dict[str, Any]:
         root = root.resolve()
     except Exception:
         root = Path(root_text)
-    if not root.is_dir():
+    legacy_parent = _legacy_image_catalog_parent(root)
+    discovery_root = legacy_parent or root
+    if not discovery_root.is_dir():
         raise ValueError(
             f"Projects root does not exist or is not a directory: {root}"
         )
 
     project_paths: List[Path]
-    if _looks_like_direct_project(root):
+    own_nested_root = _nested_image_project_root(root) if legacy_parent is None else None
+    if own_nested_root is not None:
+        project_paths = [own_nested_root]
+    elif legacy_parent is None and _looks_like_direct_project(root):
         project_paths = [root]
     else:
         project_paths = []
         try:
-            candidates = list(root.iterdir())
+            candidates = list(discovery_root.iterdir())
         except Exception as exc:
-            raise ValueError(f"Unable to enumerate projects in {root}: {exc}") from exc
+            raise ValueError(f"Unable to enumerate projects in {discovery_root}: {exc}") from exc
+        nested_paths: Dict[str, Path] = {}
         for candidate in candidates:
-            if len(project_paths) >= MAX_PROJECTS:
+            if len(nested_paths) >= MAX_PROJECTS:
                 break
             try:
                 if not candidate.is_dir() or _is_reparse_point(candidate):
                     continue
                 resolved = candidate.resolve()
-                resolved.relative_to(root)
-            except Exception:
+                resolved.relative_to(discovery_root)
+            except (FileNotFoundError, NotADirectoryError, ValueError):
                 continue
-            project_paths.append(resolved)
-        project_paths.sort(key=lambda value: _natural_key(value.name))
+            nested = _nested_image_project_root(resolved)
+            if nested is not None:
+                nested_paths[_project_identity_key(_project_id(nested))] = nested
+        project_paths.extend(nested_paths.values())
+        # The old flat catalog remains a read-compatible fallback for projects
+        # which have not moved. A moved project's own storage always wins.
+        flat_root = root if legacy_parent is not None else _image_project_child(root, "Ai_Ct_image")
+        flat_candidates: List[Path] = []
+        if flat_root is not None and flat_root.is_dir():
+            try:
+                flat_candidates = list(flat_root.iterdir())
+            except OSError as exc:
+                raise ValueError(f"Unable to enumerate projects in {flat_root}: {exc}") from exc
+        elif not nested_paths and legacy_parent is None:
+            # Unrelated user-selected flat catalogs keep their existing mode.
+            flat_candidates = candidates
+        for candidate in flat_candidates:
+            if len(project_paths) >= MAX_PROJECTS:
+                break
+            try:
+                if (not candidate.is_dir() or candidate.name.startswith(".")
+                        or _is_reparse_point(candidate)):
+                    continue
+                resolved = candidate.resolve()
+                resolved.relative_to(flat_root or root)
+            except (FileNotFoundError, NotADirectoryError, ValueError):
+                continue
+            if _project_identity_key(_project_id(resolved)) not in nested_paths:
+                project_paths.append(resolved)
+        project_paths.sort(key=lambda value: _natural_key(_project_id(value)))
 
     projects = [
         {
             "project_id": _project_id(path),
             "project_uid": _project_uid(path),
-            "name": path.name,
+            "name": _project_id(path),
             "path": str(path).replace("\\", "/"),
         }
         for path in project_paths
@@ -1800,7 +1872,7 @@ def _embedded_extension(value: str) -> str:
 
 
 def _project_id(root: Path) -> str:
-    return root.name
+    return root.parent.name if root.name.casefold() == "ai_ct_image" else root.name
 
 
 def _project_identity_key(value: Any) -> str:
@@ -2079,7 +2151,67 @@ def _existing_asset_manifest_path(root: Path) -> Path | None:
         *(metadata_root / name for name in MANIFEST_NAMES),
         *(root.resolve() / name for name in MANIFEST_NAMES),
     ]
-    return next((candidate for candidate in candidates if candidate.is_file()), None)
+    local = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if local is not None:
+        return local
+    # During an asset-library move the images and registrations may be moved
+    # separately. This narrowly scoped fallback only reads the same show's old
+    # projects/Ai_Ct_image/<show> metadata; it never chooses another show.
+    legacy_root = _legacy_image_project_root(root)
+    if (legacy_root is None or not legacy_root.is_dir()
+            or _is_reparse_point(legacy_root) or _is_reparse_point(legacy_root.parent)):
+        return None
+    legacy_metadata = _asset_metadata_directory(legacy_root)
+    legacy_candidates = [
+        *(legacy_metadata / name for name in MANIFEST_NAMES),
+        *(legacy_root / name for name in MANIFEST_NAMES),
+    ]
+    return next((candidate for candidate in legacy_candidates if candidate.is_file()), None)
+
+
+def _legacy_image_project_root(root: Path) -> Path | None:
+    """Map only a show-local image boundary to its former flat project root."""
+    if root.parent.name.casefold() == "ai_ct_image":
+        show = root.parent.parent
+        if root.name.casefold() != show.name.casefold():
+            return None
+    elif root.name.casefold() == "ai_ct_image":
+        show = root.parent
+    else:
+        return None
+    if show.parent.name.casefold() != "projects":
+        return None
+    return show.parent / "Ai_Ct_image" / show.name
+
+
+def _manifest_asset_relative_path(root: Path, record: Dict[str, Any]) -> str:
+    """Read moved registrations against the new media root without rewriting JSON."""
+    legacy = _legacy_image_project_root(root)
+    roots = [root.as_posix()]
+    if legacy is not None:
+        roots.append(legacy.as_posix())
+    # The production mapped drive and canonical UNC denote the same share.
+    # Do not infer aliases for arbitrary user drives or for other projects.
+    production_share = "//192.168.200.19/v"
+    for value in tuple(roots):
+        if value.casefold().startswith(production_share.casefold() + "/"):
+            roots.append("P:" + value[len(production_share):])
+    for field in ("path", "relative_path"):
+        text = _relocate_image_project_path(record.get(field)).replace("\\", "/")
+        if not text:
+            continue
+        if text.startswith("/") or re.match(r"^[A-Za-z]:", text):
+            match = next((prefix for prefix in roots
+                          if text.casefold().startswith(prefix.rstrip("/").casefold() + "/")), None)
+            if match is None:
+                continue
+            text = text[len(match.rstrip("/")) + 1:]
+        parts = text.split("/")
+        if (not text or any(not part or part in (".", "..") for part in parts)
+                or ":" in text or text.startswith("/")):
+            continue
+        return text
+    return ""
 
 
 def _asset_manifest_path(root: Path) -> Path:
@@ -2193,7 +2325,11 @@ def _asset_manifest_signature(root: Path) -> str:
         manifest_stat = manifest_path.stat()
         payload = "|".join(
             (
-                manifest_path.relative_to(root).as_posix().casefold(),
+                # An old registration file is a read-only source during a
+                # move; include its actual location in cache invalidation.
+                (manifest_path.relative_to(root).as_posix()
+                 if manifest_path.is_relative_to(root)
+                 else "legacy:" + manifest_path.as_posix()).casefold(),
                 str(manifest_stat.st_size),
                 str(manifest_stat.st_mtime_ns),
                 str(manifest_stat.st_ctime_ns),
@@ -2346,6 +2482,16 @@ def _load_asset_manifest_document(
         raise ValueError(
             f"{manifest_path.name} exceeds the {MAX_ASSETS}-asset safety limit."
         )
+    # A subsequent explicit Add writes only the new project's canonical JSON.
+    # Carry old absolute-path registrations as project-relative copies so the
+    # old read-only file is neither changed nor duplicated as unregistered media.
+    records = [
+        {**record, "path": relative}
+        if isinstance(record, dict)
+        and (relative := _manifest_asset_relative_path(root.resolve(), record))
+        else record
+        for record in records
+    ]
     return manifest_path, payload, records
 
 
@@ -2494,12 +2640,7 @@ def _read_asset_manifest(root: Path) -> Dict[str, Dict[str, Any]]:
         for raw in records[:MAX_ASSETS]:
             if not isinstance(raw, dict):
                 continue
-            relative_text = _clean(
-                raw.get("path") or raw.get("relative_path")
-            ).replace(
-                "\\",
-                "/",
-            )
+            relative_text = _manifest_asset_relative_path(resolved_root, raw)
             if relative_text:
                 overrides[relative_text.casefold()] = raw
 
@@ -2544,6 +2685,9 @@ def _refresh_manifest_document(
     candidates = (
         [metadata / name for name in MANIFEST_NAMES] if metadata_exists else []
     ) + [root / name for name in MANIFEST_NAMES]
+    inherited = _existing_asset_manifest_path(root)
+    if inherited is not None and inherited not in candidates:
+        candidates.append(inherited)
     for candidate in candidates:
         try:
             facts = _refresh_manifest_regular_stat(candidate)
@@ -2560,6 +2704,13 @@ def _refresh_manifest_document(
         records = payload.get("assets") if isinstance(payload, dict) else payload
         if not isinstance(records, list) or len(records) > MAX_ASSETS:
             raise ValueError("Refresh requires a complete, bounded assets list.")
+        records = [
+            {**record, "path": relative}
+            if isinstance(record, dict)
+            and (relative := _manifest_asset_relative_path(root, record))
+            else record
+            for record in records
+        ]
         return candidate, original, payload, records
     return None, b"", None, []
 
@@ -2715,7 +2866,7 @@ def _audit_project_manifest_refresh(root: Path) -> Dict[str, Any]:
             "unregistered_paths": unregistered,
             "missing_count": len(missing_paths),
             "unregistered_count": len(unregistered),
-            "safe_to_clean": True,
+            "safe_to_clean": source_path is None or source_path.is_relative_to(root),
         })
     except Exception as exc:
         review["safe_to_clean"] = False
@@ -3135,7 +3286,7 @@ def _build_asset_tree(
     root: Dict[str, Any] = {
         "kind": "root",
         "id": "$root",
-        "label": Path(project_root).name if project_root else "Select Project",
+        "label": (project_id or Path(project_root).name) if project_root else "Select Project",
         "path": project_root,
         "folder_path": "",
         "asset_count": 0,
@@ -4463,9 +4614,12 @@ def _load_project_catalog(
     selected_path = _clean(selected.get("path")) if selected else ""
     if not selected_path and len(catalog["projects"]) == 1:
         only_project = catalog["projects"][0]
-        if _clean(only_project.get("path")).casefold() == _clean(
+        direct_root = Path(catalog["catalog_root"])
+        nested_root = _nested_image_project_root(direct_root)
+        if (_clean(only_project.get("path")).casefold() == _clean(
             catalog["catalog_root"]
-        ).casefold():
+        ).casefold() or (nested_root is not None
+                        and _clean(only_project.get("path")).casefold() == nested_root.as_posix().casefold())):
             selected_path = _clean(only_project.get("path"))
     if selected_path:
         cached = (
@@ -4748,9 +4902,25 @@ def _state_project_belongs_to_catalog(
     try:
         project = Path(project_text).resolve()
         catalog = Path(catalog_text).resolve()
-        # Discovery treats the chosen root either as one direct project or as
-        # a container whose immediate child directories are projects.
-        return project == catalog or project.parent == catalog
+        if project == catalog or project.parent == catalog:
+            return True
+        discovery = _legacy_image_catalog_parent(catalog) or catalog
+        try:
+            parts = project.relative_to(discovery).parts
+        except ValueError:
+            return False
+        keys = tuple(part.casefold() for part in parts)
+        # One bounded show/Ai_Ct_image[/show] boundary, or the former flat
+        # Ai_Ct_image/show layout. Unrelated descendants remain out of scope.
+        return bool(
+            (len(keys) == 2 and keys[1] == "ai_ct_image")
+            or (len(keys) == 3 and keys[1] == "ai_ct_image" and keys[0] == keys[2])
+            or (len(keys) == 2 and keys[0] == "ai_ct_image"
+                and discovery.name.casefold() == "projects")
+            or (len(keys) == 1 and keys[0] == "ai_ct_image"
+                and _project_id(project).casefold() == catalog.name.casefold())
+            or (len(keys) == 2 and keys[0] == "ai_ct_image" and keys[1] == catalog.name.casefold())
+        )
     except Exception:
         return False
 

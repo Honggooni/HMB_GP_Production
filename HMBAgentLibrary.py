@@ -1898,26 +1898,40 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_manual_rebind_hydration_pending = False
 
     @contextmanager
-    def _hmb_editor_update(self):
+    def _hmb_editor_update(self, *, page_only=False):
         """Commit one native selection, durable snapshot and canonical row ACK."""
         self._hmb_editor_update_depth = getattr(self, "_hmb_editor_update_depth", 0) + 1
+        if page_only:
+            self._hmb_editor_page_only_depth = getattr(self, "_hmb_editor_page_only_depth", 0) + 1
         try:
             yield
         finally:
             self._hmb_editor_update_depth -= 1
-            if not self._hmb_editor_update_depth:
-                store = getattr(self, "_hmb_editor_store_pending", False)
-                layout = getattr(self, "_hmb_editor_layout_pending", False)
-                preview = getattr(self, "_hmb_editor_preview_pending", False)
-                self._hmb_editor_store_pending = False
-                self._hmb_editor_layout_pending = False
-                self._hmb_editor_preview_pending = False
-                if store:
-                    self._hmb_persist_shot_store()
-                if layout:
-                    self._hmb_layout_shot_editor()
-                if preview:
-                    self._hmb_notify_shot_preview()
+            try:
+                if not self._hmb_editor_update_depth:
+                    store = getattr(self, "_hmb_editor_store_pending", False)
+                    layout = getattr(self, "_hmb_editor_layout_pending", False)
+                    preview = getattr(self, "_hmb_editor_preview_pending", False)
+                    self._hmb_editor_store_pending = False
+                    self._hmb_editor_layout_pending = False
+                    self._hmb_editor_preview_pending = False
+                    if store:
+                        if getattr(self, "_hmb_editor_page_only_depth", 0):
+                            # This hidden, backend-owned document is still
+                            # durable and serialized by Save. The canonical
+                            # native fields/header/row ACK already update the
+                            # editor; sending all five large stored results on
+                            # every page change only triggers another UI pass.
+                            self._hmb_persist_shot_store(emit_change=False)
+                        else:
+                            self._hmb_persist_shot_store()
+                    if layout:
+                        self._hmb_layout_shot_editor()
+                    if preview:
+                        self._hmb_notify_shot_preview()
+            finally:
+                if page_only:
+                    self._hmb_editor_page_only_depth -= 1
 
     def _hmb_request_shot_store_persist(self):
         if getattr(self, "_hmb_editor_update_depth", 0):
@@ -2089,7 +2103,9 @@ class HMBAgentLibrary(_BaseAgent):
         finally:
             self._hmb_slot_switching = False
         self._hmb_request_shot_store_persist()
-        self._hmb_editor_preview_pending = True
+        # Changing the open native page does not change any Shot's result.
+        # Completion/failure and source updates publish exact Shot projections
+        # separately. A page switch must not re-query every Generator preview.
 
     def _hmb_shot_manager_enabled(self):
         return bool(getattr(self, "_hmb_shot_manager_mode", False))
@@ -2704,7 +2720,7 @@ class HMBAgentLibrary(_BaseAgent):
             else not self._hmb_shot_editor_expanded if same and action["kind"] == "select" else True)
         if action["kind"] != "select":
             next_value["action"] = {"kind": action["kind"], "request_id": request_id}
-        with self._hmb_editor_update():
+        with self._hmb_editor_update(page_only=action["kind"] == "select"):
             self.set_parameter_value(_AGENT_WIDGET_PARAMETER, next_value)
             # A transport promise is not proof that the native editor switched.
             # Commit the canonical row once, after all exact native settings.
@@ -4079,6 +4095,47 @@ class HMBAgentLibrary(_BaseAgent):
         finally:
             setattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, previous_source)
 
+    def _hmb_prompt_manager_view(self, source, *, subscription=None):
+        """Read a prepared public page without building an execution document.
+
+        The Prompt owns invalidation/preparation when authored inputs change.
+        A page miss is deliberately not a reason to compile on the Agent's
+        selection callback. Execution continues to use the independently
+        verified document/snapshot path above, never this display cache.
+        """
+        if not _is_prompt_shot_manager(source) or bool(getattr(source, "_hmb_node_deleted", False)):
+            return None
+        selected = self._normalize_execution_shot_binding(subscription or self._hmb_shot_channel_subscription())
+        getter = getattr(source, "_hmb_prompt_shot_view", None)
+        if not selected or not callable(getter):
+            return None
+        try:
+            value = getter(channel_uuid=selected["channel_uuid"], shot_uuid=selected["shot_uuid"])
+        except Exception:
+            # A temporarily unavailable display cache must not erase the
+            # selected Shot's already preserved native form.
+            return None
+        if not isinstance(value, dict) or not isinstance(value.get("visible_prompt"), str):
+            return None
+        identity = value.get("subscription")
+        if (not isinstance(identity, dict) or any(identity.get(key) != selected[key]
+                for key in ("channel_uuid", "shot_uuid"))):
+            return None
+        return value
+
+    def _hmb_prompt_display_owner(self):
+        """Get the direct registered Prompt for presentation, without a DAG scan.
+
+        Run retains the full same-flow ownership resolver. A display read only
+        needs the current canonical edge and a prepared exact-UUID public view;
+        enumerating all Prompt subscriptions here would parse all five pages.
+        """
+        if not _is_direct_hmb_prompt_library_connection(self):
+            return None
+        source = getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
+        return source if (_is_prompt_shot_manager(source)
+            and not bool(getattr(source, "_hmb_node_deleted", False))) else None
+
 
     def _hmb_revalidate_prompt_manager_owner(self):
         view = getattr(self, _FROZEN_PROMPT_SHOT_ATTRIBUTE, None)
@@ -4289,16 +4346,29 @@ class HMBAgentLibrary(_BaseAgent):
         if self._hmb_shot_manager_enabled():
             value = ""
             projection_ready = False
+            projection_pending = False
             if enabled:
                 try:
                     selected = self._hmb_shot_channel_subscription()
-                    owner = self._hmb_manager_prompt_owner(channel_uuid=selected["channel_uuid"], shot_uuid=selected["shot_uuid"])
-                    document = owner._hmb_prompt_shot_document(channel_uuid=selected["channel_uuid"], shot_uuid=selected["shot_uuid"])
-                    value = str(document.get("visible_prompt") or "")
-                    projection_ready = bool(value)
+                    owner = self._hmb_prompt_display_owner()
+                    if owner is None:
+                        raise RuntimeError("HMB Prompt display connection is unavailable.")
+                    view = self._hmb_prompt_manager_view(owner, subscription=selected)
+                    if view is not None:
+                        value = view["visible_prompt"]
+                        projection_ready = True
+                    else:
+                        projection_pending = True
                 except Exception:
                     value = ""
-            if not projection_ready and bool(getattr(self, "_hmb_prompt_preview_hydration_pending", False)):
+            if not projection_ready and (projection_pending or bool(
+                    getattr(self, "_hmb_prompt_preview_hydration_pending", False))):
+                # The selected native slot already contains that Shot's saved
+                # prompt/settings. Keep it while the Prompt's input-change
+                # preparation finishes; never substitute another visible page
+                # or synchronously build all execution/media documents here.
+                if projection_pending:
+                    self._hmb_prompt_preview_hydration_pending = True
                 return
             if projection_ready:
                 self._hmb_prompt_preview_hydration_pending = False
@@ -4326,11 +4396,14 @@ class HMBAgentLibrary(_BaseAgent):
             value = view.visible_prompt
         elif enabled:
             try:
-                from _hmb_shot_routing import resolve_shot_prompt_owner
                 selected = self._hmb_shot_channel_subscription()
-                owner = resolve_shot_prompt_owner(self, channel_uuid=selected["channel_uuid"], shot_uuid=selected["shot_uuid"])
+                owner = self._hmb_prompt_display_owner()
                 if _is_prompt_shot_manager(owner):
-                    value = self._hmb_prompt_manager_document(owner).visible_prompt
+                    view = self._hmb_prompt_manager_view(owner, subscription=selected)
+                    if view is None:
+                        self._hmb_prompt_preview_hydration_pending = True
+                        return
+                    value = view["visible_prompt"]
             except Exception:
                 if getattr(self, "_hmb_prompt_manager_source_hint", None) is not None:
                     value = ""
@@ -4358,8 +4431,16 @@ class HMBAgentLibrary(_BaseAgent):
         value: Any = sentinel
         if _is_prompt_shot_manager(source_node):
             try:
-                value = self._hmb_prompt_manager_document(source_node).visible_prompt
+                selected = self._hmb_shot_channel_subscription()
+                owner = self._hmb_prompt_display_owner()
+                if owner is not source_node:
+                    return False
                 self._hmb_prompt_manager_source_hint = source_node
+                view = self._hmb_prompt_manager_view(source_node, subscription=selected)
+                if view is None:
+                    self._hmb_prompt_preview_hydration_pending = True
+                    return False
+                value = view["visible_prompt"]
             except Exception:
                 return False
         outputs = getattr(source_node, "parameter_output_values", {})

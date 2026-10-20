@@ -189,7 +189,9 @@ class WebDraftChainTests(unittest.TestCase):
         self.directory = Path(self.context.enter_context(tempfile.TemporaryDirectory(
             prefix='hmb-web-draft-chain-')))
         self.context.enter_context(mock.patch.dict(os.environ,
-            {'LOCALAPPDATA': str(self.directory / 'local')}))
+            {'LOCALAPPDATA': str(self.directory / 'local'), 'APPDATA': str(self.directory / 'appdata')}))
+        self.context.enter_context(mock.patch.object(g._broker_config,
+            'load_broker_base_url', return_value=g.AI_BROKER_INTERNAL_ORIGIN))
         original_connect = socket.socket.connect
 
         def offline_only(sock, address):

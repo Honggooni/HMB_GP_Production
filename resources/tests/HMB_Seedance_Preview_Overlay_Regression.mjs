@@ -811,6 +811,89 @@ assert.equal(restoredNative.getAttribute("src"), nextRestoredUrl);
 assert.equal(restoredNative.loadCount, 2, "The next completed result after restoration must switch exactly once.");
 widget.hmbSeedanceCleanupPreviewOverlay(restoredCounter.container);
 
+// Display-only HTTP artifacts bypass Griptape's asynchronous local-path
+// conversion. They still denote precisely the canonical local original in
+// local_preview; adopting them must not reload a decoded native element.
+for (let shot = 1; shot <= 5; shot += 1) {
+  const direct = previewFixture();
+  const source = `C:\\shots\\shot_${shot}.mov`;
+  const url = `http://localhost:8124/workspace/shot_${shot}.mov?v=first`;
+  const native = element("video", "", { src: url, "data-raw-video-value": url });
+  native.currentSrc = url;
+  native.readyState = 4;
+  native.controls = true;
+  native.play = () => assert.fail("A direct local preview must not autoplay.");
+  direct.region.append(native);
+  const state = generation("succeeded", {
+    job_id: `completed-http-artifact-${shot}`, media_revision: 7,
+    local_preview: { source, url },
+  });
+  direct.container.__hmbSeedanceLatestProps = { value: {
+    schema: "hmb-seedance-shot-ui", schema_version: 2, generation: state,
+  } };
+  widget.hmbSeedanceSyncPreviewOverlay(direct.container, { generation: state });
+  assert.equal(direct.container.__hmbSeedanceLocalOriginalPreview.source, source);
+  assert.equal(direct.container.__hmbSeedancePreviewVideoBinding.confirmedRevision, 7);
+  assert.equal(native.loadCount, 0, "An already decoded HTTP original must retain playback.");
+  for (const phase of ["running", "queued", "failed", "retrieving", "succeeded"]) {
+    for (let echo = 0; echo < 100; echo += 1) {
+      widget.hmbSeedanceSyncPreviewOverlay(direct.container, {
+        generation: { ...state, phase, elapsed_seconds: echo },
+      });
+    }
+  }
+  assert.equal(native.loadCount, 0, "Progress state must not reload the direct HTTP original.");
+  assert.equal(native.controls, true);
+  assert.equal(direct.region.querySelector(".hmb-seedance-preview-overlay"), null);
+  assert.equal(state.job_id, `completed-http-artifact-${shot}`);
+  // A fresh process may rebase the private counter while the saved bytes stay
+  // unchanged. The next result is then eligible to replace that same element.
+  const reopened = { ...state, media_revision: 0 };
+  widget.hmbSeedanceSyncPreviewOverlay(direct.container, { generation: reopened });
+  assert.equal(direct.container.__hmbSeedancePreviewVideoBinding.confirmedRevision, 0);
+  const nextUrl = url.replace("v=first", "v=second");
+  const next = { ...state, job_id: `rerender-http-artifact-${shot}`, media_revision: 1,
+    local_preview: { source, url: nextUrl } };
+  widget.hmbSeedanceSyncPreviewOverlay(direct.container, { generation: next });
+  assert.equal(native.loadCount, 0, "A future descriptor must not retarget the prior raw URL.");
+  native.setAttribute("data-raw-video-value", nextUrl);
+  widget.hmbSeedanceSyncPreviewOverlay(direct.container, { generation: next });
+  assert.equal(native.getAttribute("src"), nextUrl);
+  assert.equal(native.loadCount, 1, "A newer matching HTTP artifact replaces only its proved original.");
+  native.fire("canplay");
+  assert.equal(direct.container.__hmbSeedancePreviewVideoBinding.confirmedRevision, null,
+    "A queued old-source ready event must not confirm the new HTTP artifact.");
+  native.currentSrc = nextUrl;
+  native.readyState = 4;
+  native.fire("canplay");
+  await Promise.resolve();
+  widget.hmbSeedanceSyncPreviewOverlay(direct.container, { generation: next });
+  assert.equal(direct.container.__hmbSeedancePreviewVideoBinding.confirmedRevision, 1);
+  widget.hmbSeedanceSyncPreviewOverlay(direct.container, { generation: reopened });
+  assert.equal(native.getAttribute("src"), nextUrl, "A stale descriptor must not restore an earlier result.");
+  assert.equal(native.loadCount, 1);
+  widget.hmbSeedanceCleanupPreviewOverlay(direct.container);
+}
+for (const rawUrl of [
+  "http://localhost:8124/workspace/another-shot.mov?v=first",
+  "http://localhost:8124/workspace/original.mov?v=unconfirmed",
+  "https://broker.invalid/workspace/original.mov?v=123",
+]) {
+  const foreign = previewFixture();
+  const native = element("video", "", { src: rawUrl, "data-raw-video-value": rawUrl });
+  native.currentSrc = rawUrl;
+  native.readyState = 4;
+  foreign.region.append(native);
+  widget.hmbSeedanceSyncPreviewOverlay(foreign.container, { generation: generation("succeeded", {
+    media_revision: 2, local_preview: localDescriptor,
+  }) });
+  assert.equal(native.getAttribute("src"), rawUrl);
+  assert.equal(native.loadCount, 0);
+  assert.equal(foreign.container.__hmbSeedanceLocalOriginalPreview, undefined,
+    "An unrelated HTTP artifact must not be adopted as the declared local original.");
+  widget.hmbSeedanceCleanupPreviewOverlay(foreign.container);
+}
+
 const exceptionalContainer = {};
 const exceptionalVideo = element("video", "", { src: localSource });
 const exceptionalBinding = { canPlay: false, previewError: true, awaitingRevision: null, confirmedRevision: null, mediaKey: "matching-failure" };

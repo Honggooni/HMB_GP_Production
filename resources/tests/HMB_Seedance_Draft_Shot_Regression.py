@@ -137,6 +137,11 @@ async def await_final_idle(node):
 
 
 class DraftShotTests(unittest.TestCase):
+    def setUp(self):
+        selected = mock.patch.object(t._broker_config, 'load_broker_base_url', return_value=ORIGIN)
+        self.selected_broker = selected.start()
+        self.addCleanup(selected.stop)
+
     def tearDown(self):
         while base.TEMPORARIES:
             base.TEMPORARIES.pop().cleanup()
@@ -248,7 +253,7 @@ class DraftShotTests(unittest.TestCase):
             lambda n: n.parameter_values.__setitem__(t.DRAFT_OWNER_PARAMETER, SHOT_B),
             lambda n: n.bind(channel=SHOT_B),
             lambda n: n.current_project.update(project_id='katuri8', project_name='까투리8'),
-            lambda n: n.parameter_values.__setitem__(t.BROKER_SERVER_URL_PARAMETER, 'https://synthetic-broker.invalid'),
+            lambda n: setattr(self.selected_broker, 'return_value', 'https://synthetic-broker.invalid'),
         )
         for index, change in enumerate(mutations):
             with self.subTest(mutation=index):
@@ -291,7 +296,7 @@ class DraftShotTests(unittest.TestCase):
     def test_only_legacy_source_retains_original_endpoint_and_project(self):
         node = Node(shot=False)
         node.parameter_values[t.DRAFT_SOURCE_PARAMETER] = deepcopy(base.SOURCE)
-        node.parameter_values[t.BROKER_SERVER_URL_PARAMETER] = 'https://synthetic-broker.invalid'
+        self.selected_broker.return_value = 'https://synthetic-broker.invalid'
         self.assertEqual(node._validated_draft_final_source(), base.SOURCE)
         # Deserialized legacy identity is retained, but availability now waits
         # for an advisory GET against that original authenticated Broker.

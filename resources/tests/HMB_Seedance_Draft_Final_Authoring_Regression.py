@@ -51,6 +51,8 @@ class DraftFinalAuthoringTests(unittest.TestCase):
     def setUp(self):
         self.boundaries = ExitStack()
         self.addCleanup(self.boundaries.close)
+        self.boundaries.enter_context(mock.patch.object(
+            t._broker_config, 'load_broker_base_url', return_value=fixture.ORIGIN))
         # A future fixture regression must fail rather than reach any network.
         original_connect = socket.socket.connect
 

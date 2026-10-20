@@ -478,10 +478,22 @@ class CapturingOpener:
 original_request_limit = seedance.MAX_REQUEST_BYTES
 original_load_token = seedance._broker_load_token
 capturing_opener = CapturingOpener()
+transport_broker = "https://media-preflight.example/GripTapeServer"
+token_endpoints = []
+
+
+def load_fixture_token(*, server_url: str) -> str:
+    assert server_url == transport_broker, (
+        "Media submission must request credentials for its frozen Broker gateway."
+    )
+    token_endpoints.append(server_url)
+    return "regression-token"
+
+
 seedance.MAX_REQUEST_BYTES = len(expected_transport_body)
-seedance._broker_load_token = lambda: "regression-token"
+seedance._broker_load_token = load_fixture_token
 try:
-    bridge = seedance._HMBAIBrokerBridge(opener=capturing_opener)
+    bridge = seedance._HMBAIBrokerBridge(opener=capturing_opener, server_url=transport_broker)
     response = bridge._request_json(
         "POST",
         "/api/v1/generate/video",
@@ -492,8 +504,11 @@ try:
     assert response == {"status": "accepted", "_http_status": 200}
     assert len(capturing_opener.requests) == 1
     sent_request, sent_timeout = capturing_opener.requests[0]
+    assert sent_request.full_url == transport_broker + "/api/v1/generate/video"
+    assert sent_request.get_header("Authorization") == "Bearer regression-token"
     assert sent_request.data == expected_transport_body
     assert sent_timeout == 3.0
+    assert token_endpoints == [transport_broker]
 
     seedance.MAX_REQUEST_BYTES = len(expected_transport_body) - 1
     try:
@@ -509,6 +524,9 @@ try:
     else:
         raise AssertionError("Oversized exact Broker body reached the opener")
     assert len(capturing_opener.requests) == 1
+    assert token_endpoints and set(token_endpoints) == {transport_broker}, (
+        "Every credential lookup, including rejected media, must keep its explicit Broker gateway."
+    )
 finally:
     seedance.MAX_REQUEST_BYTES = original_request_limit
     seedance._broker_load_token = original_load_token

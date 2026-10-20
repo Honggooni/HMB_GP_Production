@@ -81,6 +81,11 @@ class Node(fixture.Node):
 
 class DraftFinalStateSyncTests(unittest.TestCase):
     def setUp(self):
+        # The scenario explicitly selects its synthetic Draft's original
+        # Broker; production defaults are unrelated to this saved Task.
+        selected = mock.patch.object(t._broker_config, "load_broker_base_url", return_value=fixture.ORIGIN)
+        selected.start()
+        self.addCleanup(selected.stop)
         self.guard = mock.patch("urllib.request.OpenerDirector.open", side_effect=AssertionError("Unmocked HTTP"))
         self.guard.start()
     def tearDown(self):

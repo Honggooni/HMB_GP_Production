@@ -72,7 +72,7 @@ class LiveRetrieveNode(target.HMBSeedanceGeneration):
         del require_registered
         return not bool(self._hmb_node_deleted)
 
-    async def _ensure_broker_connected(self):
+    async def _ensure_broker_connected(self, *, server_url=None):
         return self.bridge
 
     def _validate_task_id(self, value):

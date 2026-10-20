@@ -28,7 +28,8 @@ class SavedPreview(unittest.TestCase):
     def test_initial_setup_setter_preserves_saved_editor_until_exact_document_ready(self):
         node, source, _, _, writes, _, setter = surface()
         expected = deepcopy(node.parameter_values["prompt"])
-        source._hmb_prompt_shot_document = lambda **kwargs: {"visible_prompt": "Exact restored Shot document"}
+        source._hmb_shot_manager_enabled = lambda: True
+        source._hmb_prompt_shot_view = lambda **kwargs: {"visible_prompt": "Exact restored Shot document", "subscription": kwargs}
         node._hmb_manager_prompt_owner = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("Legacy Prompt consolidation pending"))
         with patch.object(module._BaseAgent, "set_parameter_value", setter), \
                 patch.object(module._BaseAgent, "after_value_set", lambda *args: None):

@@ -252,7 +252,7 @@ class BrokerScriptedNode(RuntimeRegisteredSeedance):
         self.downloads: list[str] = []
         self.sleeps: list[float] = []
 
-    def _create_broker_bridge(self):
+    def _create_broker_bridge(self, *, server_url=None):
         return self.bridge
 
     def _resolve_exact_shot_generation_inputs(
@@ -363,7 +363,7 @@ def assert_constructor_and_public_contract() -> None:
         target.SEEDANCE_2_0_FAST_MODEL_ID: (9, 3, 3),
         target.SEEDANCE_2_5_MODEL_ID: (30, 10, 10),
     }
-    assert target.AI_BROKER_SERVER_URL == "http://192.168.203.245:8080"
+    assert target.AI_BROKER_SERVER_URL == "https://app.funnyflux.kr/GripTapeServer"
     assert target.MODEL_RESOLUTIONS[target.SEEDANCE_2_0_MODEL_ID] == (
         "4k",
         "1080p",
@@ -2188,9 +2188,11 @@ def assert_seedance_discarded_workflow_snapshot_contract() -> None:
                     assert not reopened._generation_recovery_blocks_new_submission()
                     source = reopened._hmb_generated_video_source_snapshot()
                     if saved_success:
-                        for key in ("video_url", "VIDEO_OUT"):
-                            artifact = reopened.parameter_output_values[key]
-                            assert str(getattr(artifact, "value", artifact)) == str(media_a), (key, artifact)
+                        artifact = reopened.parameter_output_values["VIDEO_OUT"]
+                        assert str(getattr(artifact, "value", artifact)) == str(media_a), artifact
+                        native = reopened.parameter_output_values["video_url"]
+                        assert native.value == reopened._local_original_generation_preview()["url"]
+                        assert native.name == artifact.name
                         assert reopened.parameter_output_values["generation_id"] == "job-saved-A"
                         assert source["path"] == str(media_a) and source["task_id"] == "job-saved-A"
                         assert all(source[key] == value for key, value in origin.items())
@@ -4496,7 +4498,10 @@ def assert_mov_and_last_frame_pair_refresh_contract() -> None:
 
         video_artifact = node.parameter_output_values["VIDEO_OUT"]
         frame_artifact = node.parameter_output_values["last_frame_url"]
-        assert node.parameter_output_values["video_url"] is video_artifact
+        native = node.parameter_output_values["video_url"]
+        local_preview = node._local_original_generation_preview()
+        assert native.value == (local_preview["url"] if local_preview else video_artifact.value)
+        assert native.name == video_artifact.name
         assert type(video_artifact).__name__ == "VideoUrlArtifact"
         assert Path(video_artifact.value) == video_path
         assert type(frame_artifact).__name__ == "ImageUrlArtifact"
@@ -4856,10 +4861,10 @@ def assert_atomic_final_output_publication() -> None:
             Path(project_node.parameter_output_values["VIDEO_OUT"].value)
             == indexed_project_path
         )
-        assert (
-            project_node.parameter_output_values["video_url"]
-            is project_node.parameter_output_values["VIDEO_OUT"]
-        )
+        assert project_node.parameter_output_values["video_url"].value == (
+            project_node._local_original_generation_preview()["url"])
+        assert project_node.parameter_output_values["video_url"].name == (
+            project_node.parameter_output_values["VIDEO_OUT"].name)
         assert indexed_project_path.is_absolute()
         assert indexed_project_path.is_file()
         assert indexed_project_path.suffix == ".mp4"
@@ -4956,6 +4961,7 @@ def assert_hidden_task_evidence_and_gallery_contract() -> None:
         display_name=f"Gallery callback {stamp}", flow_name=f"GalleryCallback_{stamp}"))
     assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
     flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
+    original_broker_address = target._broker_config.load_broker_base_url()
     try:
         native = target.HMBSeedanceGeneration(name=f"NativeGallery_{stamp}")
         flow.add_node(native)
@@ -4981,6 +4987,7 @@ def assert_hidden_task_evidence_and_gallery_contract() -> None:
     finally:
         deleted = asyncio.run(GriptapeNodes.ahandle_request(DeleteWorkflowRequest(name=ensured.workflow_name)))
         assert isinstance(deleted, DeleteWorkflowResultSuccess)
+        target._broker_config.save_broker_base_url(original_broker_address)
 
 
 assert_hidden_task_evidence_and_gallery_contract()

@@ -1,4 +1,4 @@
-"""Offline regression for per-node FN AI Broker server selection.
+"""Offline regression for persistent shared FN AI Broker gateway selection.
 
 The test uses clean-CI Griptape stubs, temporary token storage and a fake
 opener. It never contacts a Broker, starts device authorization or creates a
@@ -8,7 +8,9 @@ billable render.
 from __future__ import annotations
 
 import importlib.util
+import atexit
 import io
+import json
 import os
 from pathlib import Path
 import sys
@@ -22,6 +24,14 @@ from _hmb_seedance_clean_ci_stubs import install_clean_ci_griptape_stubs
 
 
 install_clean_ci_griptape_stubs()
+_isolated = tempfile.TemporaryDirectory(prefix="hmb-broker-shared-regression-")
+atexit.register(_isolated.cleanup)
+_isolated_environment = mock.patch.dict(os.environ, {
+    "APPDATA": str(Path(_isolated.name) / "roaming"),
+    "LOCALAPPDATA": str(Path(_isolated.name) / "local"),
+})
+_isolated_environment.start()
+atexit.register(_isolated_environment.stop)
 spec = importlib.util.spec_from_file_location(
     "hmb_seedance_broker_server_selection", ROOT / "HMBSeedanceGeneration.py"
 )
@@ -31,9 +41,10 @@ sys.modules[spec.name] = target
 spec.loader.exec_module(target)
 
 
-DEFAULT_URL = target.AI_BROKER_SERVER_URL
-SERVER_A = "https://broker-a.example:8443"
-SERVER_B = "https://broker-b.example"
+DEFAULT_URL = target._broker_config.DEFAULT_BROKER_BASE_URL
+LEGACY_URL = target.AI_BROKER_INTERNAL_ORIGIN
+SERVER_A = "https://broker-a.example:8443/StudioA"
+SERVER_B = "https://broker-a.example:8443/StudioB"
 
 
 def expect_invalid_server(value: str) -> None:
@@ -50,12 +61,18 @@ def expect_invalid_server(value: str) -> None:
 assert target._broker_validated_server_url() == DEFAULT_URL
 assert target._broker_validated_server_url(SERVER_A) == SERVER_A
 assert target._broker_validated_server_url(SERVER_B) == SERVER_B
+assert target._broker_validated_server_url(SERVER_A + "/") == SERVER_A
+assert target._broker_validated_server_url(LEGACY_URL) == LEGACY_URL
+assert not target._broker_config.broker_settings_path().exists(), "Reading initial settings must not write a config."
 for invalid in (
     "http://broker-a.example:8443",  # Only the installed LAN origin has an HTTP exception.
     "http://192.168.203.246:8080",
     "ftp://broker-a.example",
     "https://user:secret@broker-a.example",
-    "https://broker-a.example/path",
+    "https://broker-a.example/a/../path",
+    "https://broker-a.example/a//path",
+    "https://broker-a.example/a%2fpath",
+    "https://@broker-a.example/path",
     "https://broker-a.example/?token=canary",
     "https://broker-a.example/#fragment",
     "https://broker-a.example:invalid",
@@ -93,15 +110,18 @@ class UnauthorizedOpener:
 
 
 with tempfile.TemporaryDirectory(prefix="hmb-broker-origin-regression-") as temporary:
-    with mock.patch.dict(os.environ, {"APPDATA": temporary}):
+    with mock.patch.dict(os.environ, {"APPDATA": temporary, "LOCALAPPDATA": temporary}):
         default_path = target._broker_token_path(server_url=DEFAULT_URL)
+        legacy_path = target._broker_token_path(server_url=LEGACY_URL)
         path_a = target._broker_token_path(server_url=SERVER_A)
         path_b = target._broker_token_path(server_url=SERVER_B)
         assert default_path != path_a != path_b
         assert path_a != path_b
-        assert default_path.name == "access_token_v2.dpapi", (
+        assert legacy_path.name == "access_token_v2.dpapi", (
             "The installed Broker and Agent must retain their legacy token path."
         )
+        assert default_path != legacy_path
+        assert path_a != path_b, "Separate gateways on the same host require separate tokens."
 
         with (
             mock.patch.object(target, "_broker_dpapi", side_effect=fake_dpapi),
@@ -117,10 +137,10 @@ with tempfile.TemporaryDirectory(prefix="hmb-broker-origin-regression-") as temp
 
             # The pre-existing default/Agent credential is a separate file.
             default_path.write_bytes(b"existing-default-token-must-survive")
-            # A later environment override must not inherit the shared LAN
-            # credential, even when the node leaves its URL field empty.
+            legacy_path.write_bytes(b"existing-lan-token-must-survive")
+            # A durable common override must not inherit a sibling gateway or
+            # historical LAN credential. No node hydration may change it.
             with (
-                mock.patch.object(target, "AI_BROKER_SERVER_URL", SERVER_B),
                 mock.patch.object(
                     target, "_broker_load_bearer_token_readonly",
                     side_effect=AssertionError(
@@ -128,21 +148,23 @@ with tempfile.TemporaryDirectory(prefix="hmb-broker-origin-regression-") as temp
                     ),
                 ),
             ):
+                target._broker_config.save_broker_base_url(SERVER_B)
                 assert target._broker_validated_server_url() == SERVER_B
-                assert target._broker_token_path() == path_b
-                assert target._broker_token_path() != default_path
-                assert target._broker_load_token() == "alternate-b-token"
+                assert target._broker_token_path(server_url=SERVER_B) == path_b
+                assert target._broker_load_token(server_url=SERVER_B) == "alternate-b-token"
                 assert default_path.read_bytes() == b"existing-default-token-must-survive"
+                assert legacy_path.read_bytes() == b"existing-lan-token-must-survive"
 
-                legacy_without_origin = target._seedance_recovery_value({
-                    "task_id": "job-legacy-unknown-origin",
-                    "task_identity": "broker_task",
-                    "stage": "accepted",
-                    "status": "running",
-                })
-                assert legacy_without_origin["broker_server_url"] == "", (
-                    "A legacy task must not inherit a changed environment default."
-                )
+                with mock.patch.dict(os.environ, {"HMB_AI_BROKER_URL": SERVER_B}):
+                    legacy_without_origin = target._seedance_recovery_value({
+                        "task_id": "job-legacy-unknown-origin",
+                        "task_identity": "broker_task",
+                        "stage": "accepted",
+                        "status": "running",
+                    })
+                    assert legacy_without_origin["broker_server_url"] == "", (
+                        "A legacy task must not inherit a changed environment default."
+                    )
                 legacy_node = target.HMBSeedanceGeneration(
                     name="Legacy task with changed environment"
                 )
@@ -174,6 +196,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-broker-origin-regression-") as temp
             assert not path_a.exists(), "401 must clear only this server's token."
             assert path_b.exists(), "401 on server A must not log out server B."
             assert default_path.read_bytes() == b"existing-default-token-must-survive"
+            assert legacy_path.read_bytes() == b"existing-lan-token-must-survive"
 
 
 trusted_path = "/api/assets/" + "a" * 43
@@ -191,6 +214,12 @@ assert target._HMBAIBrokerBridge(server_url=SERVER_A).is_trusted_broker_url(
 assert not target._HMBAIBrokerBridge(server_url=SERVER_A).is_trusted_broker_url(
     DEFAULT_URL + trusted_path
 )
+assert not target._HMBAIBrokerBridge(server_url=SERVER_A).is_trusted_broker_url(
+    SERVER_B + trusted_path
+), "An asset on a sibling gateway must never reuse this gateway's credentials."
+assert not target._HMBAIBrokerBridge(server_url=SERVER_A).is_trusted_broker_url(
+    "https://broker-a.example:8443" + trusted_path
+)
 
 # Older saved workflows have no address field. Their existing task IDs must
 # continue to resolve against the previously installed/default Broker.
@@ -198,7 +227,7 @@ legacy_checkpoint = target._seedance_recovery_value({
     "task_id": "job-legacy", "task_identity": "broker_task",
     "stage": "accepted", "status": "running",
 })
-assert legacy_checkpoint["broker_server_url"] == DEFAULT_URL
+assert legacy_checkpoint["broker_server_url"] == LEGACY_URL
 
 
 class NoNetworkOpener:
@@ -220,9 +249,9 @@ with (
     fresh = target.HMBSeedanceGeneration(name="Fresh server selection")
     server_parameter = fresh.get_parameter_by_name("broker_server_url")
     assert server_parameter is not None
-    assert server_parameter.serializable is True
-    assert fresh.get_parameter_value("broker_server_url") == "", (
-        "A fresh node inherits the installed environment/default Broker."
+    assert server_parameter.serializable is False
+    assert fresh.get_parameter_value("broker_server_url") == DEFAULT_URL, (
+        "A fresh node displays the PC-wide built-in default until explicitly changed."
     )
     assert fresh._get_broker_bridge().server_url == DEFAULT_URL
     fresh.set_parameter_value("broker_server_url", SERVER_A)
@@ -230,9 +259,13 @@ with (
     assert fresh._get_broker_bridge().server_url == SERVER_A
 
     reopened = target.HMBSeedanceGeneration(name="Reopened server selection")
-    reopened.set_parameter_value("broker_server_url", SERVER_A, initial_setup=True)
+    saved_settings = target._broker_config.broker_settings_path().read_bytes()
+    reopened.set_parameter_value("broker_server_url", SERVER_B, initial_setup=True)
     assert reopened.get_parameter_value("broker_server_url") == SERVER_A
     assert reopened._get_broker_bridge().server_url == SERVER_A
+    assert target._broker_config.broker_settings_path().read_bytes() == saved_settings, (
+        "Restoring an old workflow must not overwrite the durable PC-wide setting."
+    )
 
     # A durable task is inseparable from the origin on which it was submitted.
     checkpoint = reopened._set_generation_recovery_checkpoint(
@@ -240,18 +273,126 @@ with (
         task_identity="client_request", status="submitting",
     )
     assert checkpoint["broker_server_url"] == SERVER_A
-    try:
-        reopened.set_parameter_value("broker_server_url", SERVER_B)
-    except (target._BrokerError, ValueError):
-        pass
-    assert reopened.get_parameter_value("broker_server_url") == SERVER_A, (
-        "An unresolved task must not be silently rebound to another Broker."
-    )
+    reopened.set_parameter_value("broker_server_url", SERVER_B)
+    assert reopened.get_parameter_value("broker_server_url") == SERVER_B
+    assert fresh.get_parameter_value("broker_server_url") == SERVER_B
+    assert fresh._get_broker_bridge().server_url == SERVER_B
     assert reopened._generation_recovery_state()["broker_server_url"] == SERVER_A
+    assert reopened._broker_server_for_task("hmb-origin-locked-task") == SERVER_A, (
+        "The common address may change, but existing Tasks stay pinned to their original gateway."
+    )
+    assert reopened._get_broker_bridge(server_url=SERVER_A).server_url == SERVER_A
+    assert reopened._get_broker_bridge().server_url == SERVER_B
+
+    reopened.set_parameter_value("broker_server_url", "")
+    assert reopened.get_parameter_value("broker_server_url") == ""
+    assert fresh.get_parameter_value("broker_server_url") == ""
+    assert target._broker_config.load_broker_base_url() == ""
+    try:
+        fresh._get_broker_bridge()
+    except target._BrokerUnavailableError:
+        pass
+    else:
+        raise AssertionError("An explicitly cleared common address must not fall back or connect.")
+    assert reopened._broker_server_for_task("hmb-origin-locked-task") == SERVER_A
+
+    restored = target.HMBSeedanceGeneration(name="Restored cleared server setting")
+    restored.set_parameter_value("broker_server_url", SERVER_A, initial_setup=True)
+    assert restored.get_parameter_value("broker_server_url") == ""
+    restored.set_parameter_value("broker_server_url", SERVER_B)
+    assert all(node.get_parameter_value("broker_server_url") == SERVER_B for node in (fresh, reopened, restored))
+    # An in-flight operation cannot have its common target changed under it.
+    fresh._generation_run_active.set()
+    try:
+        try:
+            restored.set_parameter_value("broker_server_url", SERVER_A)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Active Broker work must block a shared endpoint change.")
+        assert target._broker_config.load_broker_base_url() == SERVER_B
+    finally:
+        fresh._generation_run_active.clear()
+
+
+class DeviceResponse(io.BytesIO):
+    def __init__(self, url: str, payload: dict, *, status: int) -> None:
+        super().__init__(json.dumps(payload).encode("utf-8"))
+        self.status = status
+        self.url = url
+
+    def geturl(self) -> str:
+        return self.url
+
+
+class DeviceOpener:
+    def __init__(self, verification_url: str, *, start_status: int = 201,
+                 redirected_token: bool = False) -> None:
+        self.verification_url = verification_url
+        self.start_status = start_status
+        self.redirected_token = redirected_token
+        self.requests = []
+
+    def open(self, request, timeout: float):
+        assert 0 < timeout <= 10
+        assert request.method == "POST"
+        assert request.get_header("Authorization") is None
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            assert request.full_url == SERVER_A + "/api/device/start"
+            assert json.loads(request.data) == {}
+            return DeviceResponse(request.full_url, {
+                "device_code": "device-regression-01", "device_secret": "fixture-device-secret-not-live",
+                "verification_url": self.verification_url,
+            }, status=self.start_status)
+        assert len(self.requests) == 2
+        assert request.full_url == SERVER_A + "/api/device/token"
+        assert json.loads(request.data) == {
+            "device_code": "device-regression-01", "device_secret": "fixture-device-secret-not-live",
+        }
+        return DeviceResponse(SERVER_B + "/api/device/token" if self.redirected_token else request.full_url,
+            {"access_token": "fixture-authorized-not-live"}, status=200)
+
+
+for slash in ("", "/"):
+    verification_url = SERVER_A + slash + "?device=device-regression-01"
+    opener = DeviceOpener(verification_url)
+    with (
+        mock.patch.object(target.webbrowser, "open", return_value=True) as browser,
+        mock.patch.object(target, "_broker_save_token") as save_token,
+    ):
+        assert target._broker_device_login(opener=opener, server_url=SERVER_A) == {"status": "connected"}
+        browser.assert_called_once_with(verification_url, new=2, autoraise=True)
+        save_token.assert_called_once_with("fixture-authorized-not-live", server_url=SERVER_A)
+        assert len(opener.requests) == 2
+
+for verification_url, status, redirected_token in (
+    (SERVER_B + "/?device=device-regression-01", 201, False),
+    ("https://broker-a.example:8443/?device=device-regression-01", 201, False),
+    (SERVER_A + "/?device=device-regression-01#other", 201, False),
+    (SERVER_A + "/?device=device-regression-01", 200, False),
+    (SERVER_A + "/?device=device-regression-01", 201, True),
+):
+    opener = DeviceOpener(verification_url, start_status=status, redirected_token=redirected_token)
+    with (
+        mock.patch.object(target.webbrowser, "open", return_value=True) as browser,
+        mock.patch.object(target, "_broker_save_token") as save_token,
+    ):
+        try:
+            target._broker_device_login(opener=opener, server_url=SERVER_A)
+        except target._BrokerProtocolError:
+            pass
+        else:
+            raise AssertionError("Invalid gateway device authorization was accepted.")
+        save_token.assert_not_called()
+        if not redirected_token:
+            browser.assert_not_called()
 
 print(
     "HMB Seedance Broker server selection: PASS "
-    "(origin policy, per-server credentials/401, changed-default "
-    "isolation, trusted result, saved node, unresolved task binding; "
+    "(gateway policy, per-gateway credentials/401, durable shared setting, "
+    "hydration isolation, trusted result, pinned Tasks, gateway device login; "
     "no network/render)"
 )
+_isolated_environment.stop()
+_isolated.cleanup()

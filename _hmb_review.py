@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from _hmb_broker_config import normalize_broker_base_url
 from _hmb_project import resolve_project
 
 SCHEMA = "hmb-generation-casecard"
@@ -173,18 +174,24 @@ def bind_task_origin(task_id: str, origin: str, *, root: Path | str | None = Non
     """Private credential-free routing metadata, never a public casecard field."""
     if not _public_id(task_id):
         raise ValueError("Invalid Task ID.")
-    parsed = urlsplit(origin)
-    if (parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password
-            or parsed.query or parsed.fragment or parsed.path not in {"", "/"}):
-        raise ValueError("Invalid Task origin.")
-    canonical = origin.rstrip("/")
+    # A gateway's base path is part of the Task's immutable routing identity.
+    # Never reduce it to scheme/host or follow a later shared-address change.
+    try:
+        canonical = normalize_broker_base_url(origin)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid Task origin.") from exc
     path = review_root(root) / "task-origins" / (hashlib.sha256(task_id.encode()).hexdigest() + ".json")
     with _LOCK:
         previous = _read(path)
         if path.exists() and previous is None:
             raise ValueError("Task origin record is unreadable.")
-        if previous and (previous.get("task_id") != task_id or previous.get("origin") != canonical):
-            raise ValueError("Task origin is immutable.")
+        if previous:
+            try:
+                previous_base = normalize_broker_base_url(previous.get("origin"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Task origin record is unreadable.") from exc
+            if previous.get("task_id") != task_id or previous_base != canonical:
+                raise ValueError("Task origin is immutable.")
         if not previous:
             _write(path, {"schema": "hmb-private-task-origin", "version": 1,
                           "task_id": task_id, "origin": canonical})

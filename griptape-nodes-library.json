@@ -279,10 +279,10 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.8.13",
+    "library_version": "0.8.17",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
-      "archive_source_count": 44,
+      "archive_source_count": 45,
       "mode": "bundled_signed_dat",
       "runtime_path": "resources/agent/superwings12/hmb_agent_core.dat",
       "policy_version": "2026-10-15.agent-shot-quality.v7.0",

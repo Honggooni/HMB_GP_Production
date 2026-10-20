@@ -19,6 +19,11 @@ t, base = fixture.t, fixture.base
 
 
 class FinalParityTests(unittest.TestCase):
+    def setUp(self):
+        selected = mock.patch.object(t._broker_config, 'load_broker_base_url', return_value=base.ORIGIN)
+        selected.start()
+        self.addCleanup(selected.stop)
+
     def tearDown(self):
         while base.TEMPORARIES:
             base.TEMPORARIES.pop().cleanup()

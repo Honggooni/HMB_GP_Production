@@ -390,9 +390,8 @@ async def optional_project_policy_readiness():
     return len(cases)
 
 
-async def broker_origin_rotation():
+async def broker_origin_rotation(origin_a="https://broker.example", origin_b="https://different.example"):
     """Fence an in-flight A command and recover only authenticated A lineage."""
-    origin_a, origin_b = "https://broker.example", "https://different.example"
     for fail_new_auth in (False, True):
         with tempfile.TemporaryDirectory(prefix="hmb-web-origin-") as directory:
             engine, node, agent = Engine(), Generator(), Agent()
@@ -436,6 +435,7 @@ async def broker_origin_rotation():
                         "parent_task_id": "job-parent"})
                     journal.transition(record["operation_key"], {"accepted"}, "completed", result={"task_id": child})
                 request, executing_protocol = command(), Protocol()
+                executing_protocol.bridge.server_url = origin_a
                 request["target_id"] = first_id
                 running = asyncio.create_task(worker.execute(node, agent, snapshot, executing_protocol, request))
                 worker.active[first_id] = running

@@ -22,6 +22,7 @@ from uuid import UUID, uuid4
 import weakref
 
 import _hmb_review as _review
+from _hmb_broker_config import join_broker_url, normalize_broker_base_url
 from _hmb_project import resolve_project
 
 logger = logging.getLogger(__name__)
@@ -524,7 +525,7 @@ class CommandSubmissionOpener:
         self._attempted = False
 
     def open(self, request: Any, *, timeout: float) -> Any:
-        expected = self.protocol.bridge.server_url + "/api/v1/generate/video"
+        expected = join_broker_url(self.protocol.bridge.server_url, "/api/v1/generate/video")
         if request.full_url != expected or request.get_method() != "POST":
             return self.opener.open(request, timeout=timeout)
         with self._lock:
@@ -662,10 +663,16 @@ class EngineWorker:
             return ""
         pinned = await asyncio.to_thread(_review.task_origin, parent)
         saved = str(checkpoint.get("broker_server_url") or "") if checkpoint_id == parent else ""
-        if pinned and saved and pinned.rstrip("/") != saved.rstrip("/"):
+        try:
+            current_base = normalize_broker_base_url(origin)
+            pinned_base = normalize_broker_base_url(pinned) if pinned else ""
+            saved_base = normalize_broker_base_url(saved) if saved else ""
+        except (TypeError, ValueError):
+            return ""  # Malformed saved metadata never grants rerender authority.
+        if pinned_base and saved_base and pinned_base != saved_base:
             return ""
-        recorded = pinned or saved
-        return parent if recorded and recorded.rstrip("/") == origin.rstrip("/") else ""
+        recorded = pinned_base or saved_base
+        return parent if recorded and recorded == current_base else ""
 
     def _rotate_target(self, node: Any, origin: str) -> str:
         """Fence the old binding; its task callback retains cleanup ownership."""

@@ -3,6 +3,110 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_Seedance_Native_Local_Preview_Replay_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed SDK to verify native output replay, official display projection, serialization and cold reopen without a live workflow or paid requests."
+    },
+    {
+      "name": "HMB_Seedance_Native_Local_Preview_Projection_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Only_Active_Projects_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Review_Gateway_Capabilities_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Broker_Legacy_Gateway_Authentication_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Project_Nested_Image_Root_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_ImageAsset_Nested_Project_Discovery_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Submission_Shot_Title_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Color_LUT_Web_Upload_Widget_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Color_LUT_Web_Upload_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Page_View_Rollback_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Prepared_Page_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Page_Only_Shot_Switch_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed SDK to verify five retained pages, independent execution, exact source bindings, native serialization and cold reopen without paid or live service requests."
+    },
+    {
+      "name": "HMB_Agent_Page_View_Cache_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Broker_Persistent_Config_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Global_Broker_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Broker_Gateway_Review_Routing_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_Agent_Atomic_Accordion_Order_Host_Regression.py",
       "mode": "manual",
       "coverage": "installed_sdk",

@@ -148,6 +148,15 @@ class PreflightTests(unittest.TestCase):
                     self.assertEqual(node.parameter_values,before)
                     for project_id,project_name in fixture.CANONICAL_PROJECTS.items():
                         node.select(project_name)
+                        if project_id not in {"superwings12", "katuri8"}:
+                            inactive_before=deepcopy(node.parameter_values)
+                            with self.assertRaisesRegex(ValueError,"not active"):
+                                node._capture_imageasset_project_selection()
+                            inactive_report=node._hmb_render_preflight_report()
+                            self.assertFalse(inactive_report["ok"],inactive_report)
+                            self.assertIn("project_unverified",[item["code"] for item in inactive_report["rows"][0]["issues"]])
+                            self.assertEqual(node.parameter_values,inactive_before)
+                            continue
                         selected=node._capture_imageasset_project_selection()
                         self.assertEqual(selected["schema"],fixture.ONLY_PROJECT_SELECTION_SCHEMA)
                         self.assertEqual(selected["project"],{"project_id":project_id,"project_name":project_name})
