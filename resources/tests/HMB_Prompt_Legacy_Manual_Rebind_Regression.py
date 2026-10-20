@@ -70,7 +70,8 @@ def difference(left, right, path=""):
 def exercise():
     notification, state, info = create()
     original_outputs = public_outputs(notification)
-    with mock.patch.object(notification, "publish_update_to_parameter", side_effect=ConnectionResetError(10054, "Synthetic editor disconnect")):
+    with mock.patch.object(notification, "publish_update_to_parameter", create=True,
+            side_effect=ConnectionResetError(10054, "Synthetic editor disconnect")):
         assert notification._hmb_prepare_manual_rebind(CATALOG, info) is True
     assert notification._hmb_manual_rebind_pending()
     assert notification._hmb_manual_rebind["info"]["expected_source_digest"] == info["expected_source_digest"]
