@@ -254,6 +254,9 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Preserves verified per-Shot Agent results and exact Generator delivery when optional persistence, UI notification or cleanup fails. Cancellation, deletion and stale responses cannot retain execution locks or overwrite another Shot.",
+            "- Preserves validated Color LUT export videos and completed state through optional archive, preview and cold-reopen notification failures. Missing or invalid media remain errors; web publication still requires verified export evidence and server support.",
+            "- Releases Video Picker worker and catalog reservations after preflight, cancellation and terminal publication errors so the next operation remains available. Adds required regressions for these failure boundaries while preserving progressive output, existing media and bindings.",
             "- Uses https://app.funnyflux.kr/GripTapeServer as the default Broker gateway. All Generators share one durable user setting; explicitly saved addresses survive restarts and updates. Gateway path prefixes are retained for authentication, API requests, review links and media retrieval.",
             "- Reuses an existing login only for the exact approved legacy-to-gateway migration, after the target validates it. Custom Broker credentials remain isolated, explicit sign-out suppresses legacy fallback, and uncertain create requests are never resubmitted automatically.",
             "- Makes Prompt and Agent page selection reuse prepared per-Shot inputs, settings, bindings and results. Selecting another page does not recompile prompts or overwrite sibling Generator outputs; individual execution and saved-workflow restoration keep their original ownership.",

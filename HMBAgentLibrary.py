@@ -80,6 +80,7 @@ _AGENT_NATIVE_SETTING_KEYS = ("model_provider", "model", "agent", "include_detai
 _AGENT_EXECUTION_FAILED_WARNING = "HMB_AGENT_EXECUTION_FAILED_WARNING"
 _AGENT_CREATED_WARNING = "HMB_AGENT_CREATED_WARNING"
 _AGENT_PROJECT_POLICY_ABSENT_WARNING = "HMB_AGENT_PROJECT_POLICY_ABSENT_WARNING"
+_AGENT_PUBLICATION_WARNING = "HMB_AGENT_PUBLICATION_WARNING"
 _AGENT_PROJECT_POLICY_ABSENT_MESSAGE = (
     "선택한 프로젝트의 정책이 없습니다. 프로젝트 정책을 적용하지 않고 원본 샷 입력으로 계속 실행합니다. "
     "다른 프로젝트의 정책은 대신 적용하지 않습니다."
@@ -1952,7 +1953,15 @@ class HMBAgentLibrary(_BaseAgent):
             self._hmb_editor_store_pending = True
             return
         self._hmb_shot_store_syncing = True
+        # A later ordinary edit/save may retry an earlier native store event.
+        # Clear only the resolved store warning in the document being saved;
+        # retain it if this attempt fails as well.
+        store_warnings = []
         try:
+            for slot in self._hmb_shot_slots.values():
+                warnings = slot.get("publication_warnings") if isinstance(slot, dict) else None
+                if isinstance(warnings, dict) and "store" in warnings:
+                    store_warnings.append((warnings, warnings.pop("store")))
             value = {"schema": _AGENT_SHOT_STORE_SCHEMA, "version": 1,
                      "manager": True,
                      "editor_expanded": bool(getattr(self, "_hmb_shot_editor_expanded", True)),
@@ -1968,6 +1977,10 @@ class HMBAgentLibrary(_BaseAgent):
                 # preview refreshes can request persistence during one switch.
                 super().set_parameter_value(_AGENT_SHOT_STORE_PARAMETER, copy.deepcopy(value),
                     **({} if emit_change else {"emit_change": False}))
+        except BaseException:
+            for warnings, previous in store_warnings:
+                warnings["store"] = previous
+            raise
         finally:
             self._hmb_shot_store_syncing = False
 
@@ -2238,9 +2251,65 @@ class HMBAgentLibrary(_BaseAgent):
             finally:
                 self._hmb_execution_phase_syncing = False
 
+    def _hmb_shot_publication_step(self, key, stage, callback):
+        """Keep optional host events separate from verified model admission.
+
+        Only bounded stage/type diagnostics are retained: exception text can
+        contain private provider, policy or source data. A failed display or
+        save event never authorizes another model call or changes result facts.
+        """
+        try:
+            callback()
+            if not getattr(self, "_hmb_node_deleted", False):
+                slot = self._hmb_shot_slots.get(key)
+                warnings = slot.get("publication_warnings") if isinstance(slot, dict) else None
+                if isinstance(warnings, dict) and stage in warnings:
+                    warnings.pop(stage)
+                    if not warnings:
+                        slot.pop("publication_warnings", None)
+            return True
+        except Exception as exc:
+            # Successful publication must be a diagnostics no-op. A late
+            # worker cannot add even an empty sidecar to a deleted manager.
+            if not getattr(self, "_hmb_node_deleted", False):
+                slot = self._hmb_shot_slots.get(key)
+                if isinstance(slot, dict):
+                    warnings = slot.get("publication_warnings")
+                    if not isinstance(warnings, dict):
+                        warnings = slot["publication_warnings"] = {}
+                    warnings[stage] = type(exc).__name__
+            try:
+                print(f"[HMB_PRODUCTION][WARN] Agent Shot publication deferred: stage={stage} type={type(exc).__name__}")
+            except Exception:
+                pass
+            return False
+
+    def _hmb_project_shot_outputs(self, key, outputs, result):
+        if self._hmb_active_slot_key != key or self._hmb_node_deleted:
+            return
+        self._hmb_slot_switching = True
+        try:
+            # Backend facts are retained even when the native setter emits a
+            # failing UI event. Subsequent page selection can project them.
+            for name, value in outputs.items():
+                self.parameter_output_values[name] = copy.deepcopy(value)
+            self._hmb_execution_result = copy.deepcopy(result)
+            self.parameter_values[_AGENT_EXECUTION_RESULT_PARAMETER] = copy.deepcopy(result)
+            self.parameter_output_values[_AGENT_EXECUTION_RESULT_PARAMETER] = copy.deepcopy(result)
+            for name, value in outputs.items():
+                if name != "agent":
+                    self._hmb_shot_publication_step(key, "display_" + name,
+                        lambda name=name, value=value: super(HMBAgentLibrary, self).set_parameter_value(name, copy.deepcopy(value)))
+            self._hmb_shot_publication_step(key, "result_messages", self._refresh_hmb_execution_result_messages)
+        finally:
+            self._hmb_slot_switching = False
+
     def _hmb_publish_shot_failure(self, key, execution, *, cancelled=False, source_unavailable=False):
         getter = getattr(execution, "_hmb_execution_result_snapshot", None)
-        previous = getter() if callable(getter) else {}
+        try:
+            previous = getter() if callable(getter) else {}
+        except Exception:
+            previous = {}
         if not isinstance(previous, dict):
             previous = {}
         code = "CANCELLED" if cancelled else "SOURCE_UNAVAILABLE" if source_unavailable else str(previous.get("code") or "SOURCE_UNAVAILABLE")
@@ -2256,21 +2325,13 @@ class HMBAgentLibrary(_BaseAgent):
         slot["result"] = copy.deepcopy(result)
         slot["outputs"] = {"output": message, "logs": "", "agent": {}}
         self._hmb_shot_slots[key] = slot
-        if self._hmb_active_slot_key == key and not self._hmb_node_deleted:
-            self._hmb_slot_switching = True
-            try:
-                super().set_parameter_value("output", message)
-                self.parameter_output_values["output"] = message
-                self._hmb_execution_result = copy.deepcopy(result)
-                self.parameter_values[_AGENT_EXECUTION_RESULT_PARAMETER] = copy.deepcopy(result)
-                self.parameter_output_values[_AGENT_EXECUTION_RESULT_PARAMETER] = copy.deepcopy(result)
-                self._refresh_hmb_execution_result_messages()
-            finally:
-                self._hmb_slot_switching = False
-        self._hmb_persist_shot_store()
+        self._hmb_shot_publication_step(key, "projection",
+            lambda: self._hmb_project_shot_outputs(key, slot["outputs"], result))
+        self._hmb_shot_publication_step(key, "store", self._hmb_persist_shot_store)
         channel, separator, shot_uuid = key.partition("\x1f")
         if separator:
-            self._hmb_notify_shot_preview(channel_uuid=channel, shot_uuid=shot_uuid)
+            self._hmb_shot_publication_step(key, "notify",
+                lambda: self._hmb_notify_shot_preview(channel_uuid=channel, shot_uuid=shot_uuid))
 
     def _hmb_current_run_subscription(self, *, channel_uuid, shot_uuid, prompt_owner,
                                      lifecycle_generation, generator=None):
@@ -2314,6 +2375,8 @@ class HMBAgentLibrary(_BaseAgent):
                 raise asyncio.CancelledError()
             await asyncio.sleep(0.05)
         execution = None
+        admitted_result = False
+        admitted_run_id = ""
         try:
             subscription = self._hmb_current_run_subscription(**run_identity)
             if self._hmb_active_slot_key == key:
@@ -2323,7 +2386,7 @@ class HMBAgentLibrary(_BaseAgent):
             execution = _HMBAgentShotExecution._from_owner(self, prompt_owner, document, subscription, slot, generator)
             self._hmb_shot_run_status[key] = "running"
             self._hmb_shot_workers[key] = execution
-            self._hmb_publish_shot_status()
+            self._hmb_shot_publication_step(key, "running_status", self._hmb_publish_shot_status)
             # Reuse the complete canonical policy, model, media and sanitization
             # pipeline; only frozen native input getters differ from the editor.
             await execution._hmb_aprocess_locked()
@@ -2346,43 +2409,47 @@ class HMBAgentLibrary(_BaseAgent):
                 raise RuntimeError(str(result.get("message") or "Agent Shot execution failed."))
             if result.get("output_sha256") != _prompt_text_sha256(record["text"]):
                 raise RuntimeError("Agent Shot result identity is invalid.")
-            with self._hmb_shot_result_lock:
-                self._hmb_shot_results[key] = copy.deepcopy(record)
+            if not isinstance(result.get("run_id"), str) or not result["run_id"].strip():
+                raise RuntimeError("Agent Shot result identity is invalid.")
             # Editing another Shot or changing this Shot's future settings
             # must not be overwritten by the completed input snapshot.
             slot = copy.deepcopy(self._hmb_shot_slots.get(key) or slot)
             slot["outputs"] = {name: copy.deepcopy(execution.parameter_output_values.get(name)) for name in ("output", "logs", "agent")}
             slot["result"] = copy.deepcopy(result)
-            self._hmb_shot_slots[key] = slot
-            self._hmb_shot_run_status[key] = "succeeded"
-            if self._hmb_active_slot_key == key and not self._hmb_node_deleted:
-                self._hmb_slot_switching = True
-                try:
-                    for name, value in slot["outputs"].items():
-                        if name != "agent":
-                            super().set_parameter_value(name, copy.deepcopy(value))
-                        self.parameter_output_values[name] = copy.deepcopy(value)
-                    self._hmb_execution_result = copy.deepcopy(result)
-                    self.parameter_values[_AGENT_EXECUTION_RESULT_PARAMETER] = copy.deepcopy(result)
-                    self.parameter_output_values[_AGENT_EXECUTION_RESULT_PARAMETER] = copy.deepcopy(result)
-                    self._refresh_hmb_execution_result_messages()
-                finally:
-                    self._hmb_slot_switching = False
-            self._hmb_persist_shot_store()
-            self._hmb_notify_shot_preview(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
-            if generator is not None:
-                with self._hmb_shot_result_lock:
+            # Prepare every fallible result copy before changing admission.
+            admitted = copy.deepcopy(record)
+            ticket = {"key": key, "generator": generator, "record": copy.deepcopy(record)} if generator is not None else None
+            with self._hmb_shot_result_lock:
+                self._hmb_shot_results[key] = admitted
+                self._hmb_shot_slots[key] = slot
+                self._hmb_shot_run_status[key] = "succeeded"
+                if ticket is not None:
                     tickets = getattr(self, "_hmb_shot_request_records", None)
                     if tickets is None:
                         tickets = self._hmb_shot_request_records = {}
-                    tickets[str(result["run_id"])] = {"key": key, "generator": generator, "record": copy.deepcopy(record)}
+                    tickets[str(result["run_id"])] = ticket
+                admitted_run_id = result["run_id"]
+                admitted_result = True
+            self._hmb_shot_publication_step(key, "projection",
+                lambda: self._hmb_project_shot_outputs(key, slot["outputs"], result))
+            self._hmb_shot_publication_step(key, "store", self._hmb_persist_shot_store)
+            self._hmb_shot_publication_step(key, "notify",
+                lambda: self._hmb_notify_shot_preview(channel_uuid=channel_uuid, shot_uuid=shot_uuid))
             return copy.deepcopy(record)
         except asyncio.CancelledError:
-            if self._hmb_lifecycle_is_live(lifecycle_generation):
+            if admitted_result:
+                # A host callback can raise cancellation after the immutable
+                # model result was committed. Preserve that verified result,
+                # but an abandoned Generator await must retain no run ticket.
+                if generator is not None:
+                    self._hmb_release_agent_shot_result(channel_uuid=channel_uuid, shot_uuid=shot_uuid,
+                        run_id=admitted_run_id, generator=generator)
+            elif self._hmb_lifecycle_is_live(lifecycle_generation):
                 self._hmb_shot_run_status[key] = "cancelled"
                 with self._hmb_shot_result_lock:
                     self._hmb_shot_results.pop(key, None)
-                self._hmb_publish_shot_failure(key, execution, cancelled=True)
+                self._hmb_shot_publication_step(key, "failure_publication",
+                    lambda: self._hmb_publish_shot_failure(key, execution, cancelled=True))
             raise
         except Exception as exc:
             if not self._hmb_lifecycle_is_live(lifecycle_generation):
@@ -2392,18 +2459,57 @@ class HMBAgentLibrary(_BaseAgent):
             # an admissible result for this new Generator execution.
             with self._hmb_shot_result_lock:
                 self._hmb_shot_results.pop(key, None)
-            self._hmb_publish_shot_failure(key, execution,
-                source_unavailable=str(exc) == _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE)
+            self._hmb_shot_publication_step(key, "failure_publication",
+                lambda: self._hmb_publish_shot_failure(key, execution,
+                    source_unavailable=str(exc) == _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE))
             raise
         finally:
-            if execution is not None:
-                execution._hmb_shot_cancelled = True
-                execution._clear_hmb_runtime_policy()
-                execution.parameter_values.clear()
-                execution.parameter_output_values.clear()
-            self._hmb_shot_workers.pop(key, None)
-            self._hmb_publish_shot_status()
-            lock.release()
+            # Nothing in cleanup or host publication may strand a per-Shot
+            # lock. Even BaseException from one cleanup must allow the other
+            # transient buffers and worker registration to be released.
+            cleanup_abort = None
+            try:
+                steps = []
+                if execution is not None:
+                    steps.extend((
+                        ("cancel_cleanup", lambda: setattr(execution, "_hmb_shot_cancelled", True)),
+                        ("policy_cleanup", lambda: execution._clear_hmb_runtime_policy()),
+                        ("input_cleanup", lambda: execution.parameter_values.clear()),
+                        ("output_cleanup", lambda: execution.parameter_output_values.clear())))
+                steps.append(("worker_cleanup", lambda: self._hmb_shot_workers.pop(key, None)))
+                for stage, callback in steps:
+                    try:
+                        self._hmb_shot_publication_step(key, stage, callback)
+                    except BaseException as exc:
+                        if cleanup_abort is None:
+                            cleanup_abort = exc
+                terminal_steps = []
+                slot = self._hmb_shot_slots.get(key)
+                if isinstance(slot, dict) and "store" in slot.get("publication_warnings", {}):
+                    # One bounded retry, never another model invocation.
+                    terminal_steps.append(("store", lambda: self._hmb_persist_shot_store()))
+                terminal_steps.extend((
+                    ("terminal_status", lambda: self._hmb_publish_shot_status()),
+                    ("result_messages", lambda: self._refresh_hmb_execution_result_messages())))
+                for stage, callback in terminal_steps:
+                    try:
+                        self._hmb_shot_publication_step(key, stage, callback)
+                    except BaseException as exc:
+                        if cleanup_abort is None:
+                            cleanup_abort = exc
+                if (admitted_result and generator is not None
+                        and (cleanup_abort is not None or sys.exc_info()[0] is not None)):
+                    # No caller can consume a ticket when terminal cleanup
+                    # aborts its await. Keep the verified Shot result, but
+                    # release this exact Generator request before unlocking.
+                    self._hmb_release_agent_shot_result(channel_uuid=channel_uuid, shot_uuid=shot_uuid,
+                        run_id=admitted_run_id, generator=generator)
+            finally:
+                lock.release()
+            # Do not replace the original model/source/cancellation exception
+            # with a secondary cleanup abort while it is already propagating.
+            if cleanup_abort is not None and sys.exc_info()[0] is None:
+                raise cleanup_abort
 
     def _hmb_handle_shot_action(self, action):
         if not isinstance(action, dict) or not self._hmb_shot_manager_enabled():
@@ -2971,6 +3077,13 @@ class HMBAgentLibrary(_BaseAgent):
                     title="프로젝트 정책 없음 · 계속 실행",
                     variant="info", hide=True, value=_AGENT_PROJECT_POLICY_ABSENT_MESSAGE,
                 ))
+            if not any(getattr(child, "name", "") == _AGENT_PUBLICATION_WARNING for child in children):
+                self.add_node_element(ParameterMessage(
+                    name=_AGENT_PUBLICATION_WARNING,
+                    title="Agent 결과 보존 · 저장/표시 재확인",
+                    variant="warning", hide=True,
+                    value="Agent 실행 결과는 보존되었습니다. 저장 또는 화면 갱신에 문제가 있어 재확인이 필요합니다. Agent를 다시 실행할 필요는 없습니다.",
+                ))
         self._refresh_hmb_execution_result_messages()
 
     def _hmb_execution_result_snapshot(self) -> dict[str, Any]:
@@ -2984,8 +3097,11 @@ class HMBAgentLibrary(_BaseAgent):
         result = self._hmb_execution_result_snapshot()
         created = (result.get("status") == "created" and result.get("code") == "AGENT_CREATED"
                    and result.get("inference_started") is False and result.get("policy_applied") is False)
+        slot = getattr(self, "_hmb_shot_slots", {}).get(getattr(self, "_hmb_active_slot_key", ""))
+        publication_warning = bool(slot.get("publication_warnings")) if isinstance(slot, dict) else False
         for name, visible in ((_AGENT_EXECUTION_FAILED_WARNING, result.get("status") == "failed"),
                               (_AGENT_CREATED_WARNING, created),
+                              (_AGENT_PUBLICATION_WARNING, publication_warning),
                               (_AGENT_PROJECT_POLICY_ABSENT_WARNING, result.get("policy_status") == "absent")):
             try:
                 if visible:

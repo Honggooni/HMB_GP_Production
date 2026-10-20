@@ -755,13 +755,21 @@ class HMBColorLUTLibrary(DataNode):
             self._source_token += 1
             self._web_upload_wake.set()
             token = self._source_token
+            queue_warnings = []
             if _source_identity(self._hmb_color_lut_state["source"] or self._restoring_source) != _source_identity(snap):
                 self._hmb_color_lut_state["result"] = {}
-                self._publish_result_url()
+                try:
+                    self._publish_result_url()
+                except Exception as exc:
+                    queue_warnings.append(("output_notification", exc))
             self._restoring_source = {}
             self._hmb_color_lut_state["source"] = {}
-            self._source_pending = (token, snap, path)
-            self._publish()
+            self._hmb_color_lut_state["status"] = {"phase": "probing", "message": "", "progress": 0}
+            self._source_pending = (token, snap, path, queue_warnings)
+            try:
+                self._publish()
+            except Exception as exc:
+                queue_warnings.append(("ui_notification", exc))
             if self._source_worker is not None and self._source_worker.is_alive():
                 return
         def load() -> None:
@@ -772,32 +780,94 @@ class HMBColorLUTLibrary(DataNode):
                     if pending is None or self._hmb_node_deleted:
                         self._source_worker = None
                         return
-                token, snap, path = pending
+                token, snap, path, warnings = pending
                 try:
                     info = probe_source(path)
                     media = Path(str(info.get("path") or path)).resolve()
                     source = {**snap, **info, "_reference_path": str(snap.get("_reference_path") or path),
-                              "path": str(media), "url": _media_url(media), "name": media.name,
+                              "path": str(media), "url": "", "name": media.name,
                               "fps": float(info.get("frame_rate") or info.get("fps") or 0),
                               "revision": str(snap.get("result_revision") or media.stat().st_mtime_ns)}
                     with self._lock:
                         if token != self._source_token or self._hmb_node_deleted:
                             continue
-                        self._hmb_color_lut_state["source"] = source
-                        result = self._hmb_color_lut_state["result"]
-                        if result.get("path") and Path(result["path"]).is_file() and result.get("source_path") == source["path"]:
-                            if Path(result["path"]).suffix.lower() != ".cube":
-                                result["url"] = _media_url(Path(result["path"]))
-                                self._publish_result_url(result["url"])
-                        self._remember_selection()
-                    self._publish()
-                    self._schedule_upload_probe()
+                        result = copy.deepcopy(self._hmb_color_lut_state["result"])
+                    if result.get("path") and result.get("source_path") != source["path"]:
+                        raise ValueError("The saved Color LUT video does not belong to this source.")
+                    restored = bool(result.get("path") and result.get("source_path") == source["path"]
+                                    and Path(result["path"]).suffix.lower() != ".cube")
+                    if restored:
+                        # A saved path or existing filename is not proof of a
+                        # playable grade. Validate it before declaring success.
+                        result_probe = probe_source(result["path"])
+                        if (result_probe.get("width"), result_probe.get("height")) != (info.get("width"), info.get("height")):
+                            raise ValueError("The saved Color LUT video dimensions do not match its source.")
+                    try:
+                        source["url"] = _media_url(media)
+                    except Exception as exc:
+                        # A native preview outage is independent of a probed
+                        # local source, including restoration of a saved grade.
+                        warnings.append(("preview", exc))
+                    if restored:
+                        try:
+                            result["url"] = _media_url(Path(result["path"]))
+                        except Exception as exc:
+                            result["url"] = ""
+                            warnings.append(("preview", exc))
                 except Exception as exc:
                     with self._lock:
                         if token != self._source_token or self._hmb_node_deleted:
                             continue
                         self._pending_source_key = None
-                    self._status("error", str(exc))
+                        self._hmb_color_lut_state["result"] = {}
+                        self._hmb_color_lut_state["status"] = {"phase": "error", "message": str(exc), "progress": 0}
+                        try:
+                            self._publish_result_url()
+                            self._status("error", str(exc))
+                            self._publish()
+                        except Exception:
+                            LOGGER.debug("Color LUT invalid media notification deferred", exc_info=True)
+                    continue
+                with self._lock:
+                    if token != self._source_token or self._hmb_node_deleted:
+                        continue
+                    self._hmb_color_lut_state["source"] = source
+                    self._hmb_color_lut_state["result"] = result
+                    self._hmb_color_lut_state["status"] = {"phase": "complete" if restored else "idle", "message": str(result["path"]) if restored else "", "progress": 1 if restored else 0}
+                    def remember_warning(stage: str, exc: Exception) -> None:
+                        owner = result if restored else source
+                        self._export_warning(owner, stage, exc)
+                        self._hmb_color_lut_state["status"]["message"] = (str(result["path"]) + ". " if restored else "") + "; ".join(
+                            f"{item['stage']}: {item['message']}" for item in owner.get("postprocess_warnings", []))
+                    for stage, exc in warnings:
+                        remember_warning(stage, exc)
+                    callbacks = [("output_notification", lambda: self._publish_result_url(result.get("url", "")))] if restored else []
+                    callbacks += [("selection_cache", self._remember_selection), ("upload_probe", self._schedule_upload_probe), ("ui_notification", self._publish)]
+                    for stage, callback in callbacks:
+                        if token != self._source_token or self._hmb_node_deleted:
+                            break
+                        try:
+                            callback()
+                        except Exception as exc:
+                            if token != self._source_token or self._hmb_node_deleted:
+                                break
+                            # Preview/UI/cache failures cannot undo either a
+                            # validated local source or a validated saved grade.
+                            remember_warning(stage, exc)
+                            if stage == "selection_cache":
+                                self._hmb_color_lut_state["shot_states"][_selection_key(self._hmb_color_lut_state)] = copy.deepcopy({
+                                    key: self._hmb_color_lut_state[key] for key in ("settings", "output", "source", "result", "preset_name")})
+                            if stage == "ui_notification":
+                                try:
+                                    _set_parameter_silently(self, UI, copy.deepcopy(self._hmb_color_lut_state))
+                                except Exception as storage_error:
+                                    remember_warning("state_storage", storage_error)
+                            LOGGER.debug("Color LUT restored media notification deferred: %s", stage, exc_info=True)
+                    if token == self._source_token and not self._hmb_node_deleted:
+                        # Cache the final warning-bearing result even if an
+                        # earlier optional cache or native notification failed.
+                        self._hmb_color_lut_state["shot_states"][_selection_key(self._hmb_color_lut_state)] = copy.deepcopy({
+                            key: self._hmb_color_lut_state[key] for key in ("settings", "output", "source", "result", "preset_name")})
         with self._lock:
             self._source_worker = threading.Thread(target=contextvars.copy_context().run, args=(load,), name="HMB LUT source", daemon=True)
             self._source_worker.start()
@@ -918,6 +988,110 @@ class HMBColorLUTLibrary(DataNode):
             json.dump(record, stream, ensure_ascii=False, indent=2)
         return {"lut_path": str(cube), "metadata_path": str(metadata)}
 
+    @staticmethod
+    def _export_warning(result: dict[str, Any], stage: str, error: Exception) -> None:
+        raw = result.get("postprocess_warnings")
+        warnings = [{"stage": item["stage"][:80], "message": item["message"][:1024]}
+                    for item in (raw if isinstance(raw, list) else [])
+                    if isinstance(item, Mapping) and isinstance(item.get("stage"), str) and isinstance(item.get("message"), str)][-15:]
+        warning = {"stage": stage, "message": str(error)[:1024]}
+        if warning not in warnings:
+            warnings.append(warning)
+        result["postprocess_warnings"] = warnings
+
+    def _retain_export_result(self, state: Mapping[str, Any], result: dict[str, Any], key: str, job_id: str) -> bool:
+        """Commit the verified file independently of archive and editor services."""
+        with self._lock:
+            if self._hmb_node_deleted or self._job_id != job_id:
+                return False
+            history = self._hmb_color_lut_state["shot_states"].get(key)
+            if isinstance(history, dict) and _source_identity(history.get("source")) == _source_identity(state["source"]):
+                history["result"] = copy.deepcopy(result)
+            current = (key == _selection_key(self._hmb_color_lut_state)
+                       and _source_identity(self._hmb_color_lut_state["source"]) == _source_identity(state["source"]))
+            if current:
+                self._hmb_color_lut_state["result"] = copy.deepcopy(result)
+                warnings = result.get("postprocess_warnings", [])
+                message = str(result["path"])
+                if warnings:
+                    prefix = "영상 저장 완료 · 후처리 경고" if self._hmb_color_lut_state["language"] == "ko" else "Video saved · Postprocessing warning"
+                    message = f"{prefix}: {message}. " + "; ".join(f"{item['stage']}: {item['message']}" for item in warnings)
+                self._hmb_color_lut_state["status"] = {"phase": "complete", "message": message, "progress": 1}
+            return current
+
+    def _finish_local_export(self, state: dict[str, Any], result: dict[str, Any], key: str, job_id: str,
+                             cancel: threading.Event) -> None:
+        # export_video has already probed the complete artifact and published
+        # it exclusively. Cancellation before this commit still publishes no
+        # result; cancellation during optional work cannot undo a saved file.
+        with self._lock:
+            if self._hmb_node_deleted or self._job_id != job_id:
+                return
+            if cancel.is_set():
+                if key == _selection_key(self._hmb_color_lut_state) and _source_identity(self._hmb_color_lut_state["source"]) == _source_identity(state["source"]):
+                    try:
+                        self._status("cancelled", "취소되었습니다." if self._hmb_color_lut_state["language"] == "ko" else "Cancelled.")
+                    except Exception:
+                        LOGGER.debug("Color LUT cancellation notification deferred", exc_info=True)
+                return
+            self._retain_export_result(state, result, key, job_id)
+        archive_ok = False
+        try:
+            result.update(self._archive_grade(state, result, job_id))
+            archive_ok = True
+        except Exception as exc:
+            result.pop("web_export_proof", None)
+            self._export_warning(result, "archive", exc)
+        try:
+            result["url"] = _media_url(Path(result["path"]))
+        except Exception as exc:
+            result["url"] = ""
+            self._export_warning(result, "preview", exc)
+        if archive_ok:
+            try:
+                self._record_export_proof(state, result, cancel)
+            except Exception as exc:
+                result.pop("web_export_proof", None)
+                # Only exports have no web provenance by design.
+                if state["shot"].get("shot_uuid"):
+                    self._export_warning(result, "web_receipt", exc)
+        current = self._retain_export_result(state, result, key, job_id)
+        # Each notification is independent: a broken output subscriber or UI
+        # bridge must not reclassify a successfully saved local video as error.
+        callbacks = [("output_notification", lambda: self._publish_result_url(result.get("url", "")))] if current else []
+        callbacks.append(("upload_probe", self._schedule_upload_probe))
+        for stage, callback in callbacks:
+            with self._lock:
+                if self._hmb_node_deleted or self._job_id != job_id:
+                    return
+                if stage == "output_notification" and (key != _selection_key(self._hmb_color_lut_state)
+                        or _source_identity(self._hmb_color_lut_state["source"]) != _source_identity(state["source"])):
+                    continue
+                try:
+                    callback()
+                except Exception as exc:
+                    self._export_warning(result, stage, exc)
+                    self._retain_export_result(state, result, key, job_id)
+                    LOGGER.debug("Color LUT saved export notification deferred: %s", stage, exc_info=True)
+        # Publish the final dashboard once. Only use a silent recovery write if
+        # the native publication path fails; normal exports need no duplicate
+        # full-state publication.
+        with self._lock:
+            if self._hmb_node_deleted or self._job_id != job_id:
+                return
+            self._retain_export_result(state, result, key, job_id)
+            try:
+                self._publish()
+            except Exception as exc:
+                self._export_warning(result, "ui_notification", exc)
+                self._retain_export_result(state, result, key, job_id)
+                try:
+                    _set_parameter_silently(self, UI, copy.deepcopy(self._hmb_color_lut_state))
+                except Exception as storage_error:
+                    self._export_warning(result, "state_storage", storage_error)
+                    self._retain_export_result(state, result, key, job_id)
+                LOGGER.debug("Color LUT saved export UI notification deferred", exc_info=True)
+
     def _hmb_follow_image_asset_project(self, project: Any) -> None:
         project = dict(project) if isinstance(project, Mapping) else {}
         with self._lock:
@@ -991,34 +1165,16 @@ class HMBColorLUTLibrary(DataNode):
                 result = export_video(source, destination, state["settings"], codec=codec, cancel_event=cancel, progress=progress)
             result = {**result, "shot": state["shot"], "project_id": state["project_id"], "settings": state["settings"], "job_id": job_id}
             if action == "export":
-                try:
-                    result.update(self._archive_grade(state, result, job_id))
-                except Exception as exc:
-                    raise RuntimeError(f"Video saved: {result['path']}. Automatic LUT data save failed: {exc}") from exc
-                result["url"] = _media_url(Path(result["path"]))
-                try:
-                    self._record_export_proof(state, result, cancel)
-                except Exception:
-                    # A finished local export remains successful when the
-                    # optional private web receipt cannot be written.
-                    LOGGER.debug("Color LUT upload receipt could not be prepared", exc_info=True)
-            with self._lock:
-                if self._hmb_node_deleted:
-                    return
-                history = self._hmb_color_lut_state["shot_states"].setdefault(key, {})
-                if _source_identity(history.get("source")) == _source_identity(state["source"]):
-                    history["result"] = copy.deepcopy(result)
-                if key == _selection_key(self._hmb_color_lut_state) and _source_identity(self._hmb_color_lut_state["source"]) == _source_identity(state["source"]):
-                    self._hmb_color_lut_state["result"] = result
-                    if action == "export":
-                        self._publish_result_url(result["url"])
-                    self._status("complete", str(result["path"]), 1)
-                else:
-                    self._publish()
-            self._schedule_upload_probe()
+                self._finish_local_export(state, result, key, job_id, cancel)
         except Exception as exc:
-            if key == _selection_key(self._hmb_color_lut_state) and _source_identity(self._hmb_color_lut_state["source"]) == _source_identity(state["source"]) and not self._hmb_node_deleted:
-                self._status("cancelled" if cancel.is_set() else "error", str(exc))
+            with self._lock:
+                if (self._job_id == job_id and key == _selection_key(self._hmb_color_lut_state)
+                        and _source_identity(self._hmb_color_lut_state["source"]) == _source_identity(state["source"])
+                        and not self._hmb_node_deleted):
+                    try:
+                        self._status("cancelled" if cancel.is_set() else "error", str(exc))
+                    except Exception:
+                        LOGGER.debug("Color LUT failed operation notification deferred", exc_info=True)
 
     def _hmb_shot_channel_subscription(self) -> dict[str, Any]:
         shot = self._hmb_color_lut_state["shot"]

@@ -181,6 +181,12 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
             agent.set_parameter_value("output", "STALE_SUCCESS_MUST_NOT_RENDER")
             agent.parameter_output_values["output"] = "STALE_SUCCESS_MUST_NOT_RENDER"
             generator.set_parameter_value("prompt", "STALE_SUCCESS_MUST_NOT_RENDER")
+            # Current Only execution requires an explicit project even when
+            # the billable generation boundary is replaced by this fixture.
+            generator._hmb_commit_seedance_mode()
+            generator.set_parameter_value("only_project", seedance_module.PROJECTS["katuri8"]["project_name"])
+            generator.set_parameter_value(seedance_module.TASK_PARAMETER, seedance_module.TASK_TEXT_ONLY)
+            assert generator._selected_only_project()["project_id"] == "katuri8"
             assert flow.add_connection(
                 agent, agent.get_parameter_by_name("output"),
                 generator, generator.get_parameter_by_name("prompt"),
@@ -200,7 +206,9 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
         assert machine.is_complete(), machine.current_state
         assert not machine.is_errored(), machine.get_error_message()
         assert all(node.state == NodeResolutionState.RESOLVED for node in agents + generators)
-        assert sorted(n for kind, n, _ in events if kind == "generation_finished") == [2, 3, 4, 5]
+        assert sorted(n for kind, n, _ in events if kind == "generation_finished") == [2, 3, 4, 5], [
+            (node.name, node.parameter_output_values.get("result_details")) for node in generators
+        ]
         assert not any(kind == "generation_started" and n == 1 for kind, n, _ in events)
         failed_at = next(at for kind, _, at in events if kind == "agent_failed")
         assert any(kind == "agent_started" and at > failed_at for kind, _, at in events), events

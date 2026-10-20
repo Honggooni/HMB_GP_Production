@@ -22,7 +22,7 @@ import time
 import uuid
 import zlib
 from dataclasses import dataclass
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from fractions import Fraction
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence
@@ -17293,6 +17293,37 @@ class HMBVideoPickerLibrary(DataNode):
             _append_activity_log(state, "WARNING", state["message"])
             self._write_state(state)
             return
+        owner_generation = int(getattr(self, "_hmb_lifecycle_generation", 0) or 0)
+        try:
+            self._run_reserved_ui_operation(action, incoming, action_id)
+        finally:
+            # Native state/output publication can fail before Maya starts or
+            # while a completed worker clears its process card. The worker
+            # owns this reservation until this unconditional finalizer; no UI
+            # or cleanup exception may permanently block the next operation.
+            self._hmb_active_operation = None
+            with self._hmb_operation_control_lock:
+                if self._hmb_pending_operation_id == action_id:
+                    self._hmb_pending_operation_id = ""
+                if self._hmb_worker_thread is threading.current_thread():
+                    self._hmb_worker_thread = None
+                pending_selection = self._hmb_pending_scene_selection
+                self._hmb_pending_scene_selection = None
+                self._hmb_process_lock.release()
+            if (pending_selection and not getattr(self, "_hmb_node_deleted", False)
+                    and owner_generation == int(getattr(self, "_hmb_lifecycle_generation", 0) or 0)
+                    and not self._hmb_pending_operation_id
+                    and self._hmb_pending_scene_selection is None):
+                pending_path, pending_source = pending_selection
+                try:
+                    self._schedule_scene_selection(pending_path, pending_source)
+                except Exception as exc:
+                    _diagnostic_exception("pending Maya scene selection failed", exc)
+
+    def _run_reserved_ui_operation(
+        self, action: str, incoming: Dict[str, Any], action_id: str,
+    ) -> None:
+        """Run one operation while _start_ui_operation owns its reservation."""
         with self._hmb_operation_control_lock:
             cancelled_before_start = self._hmb_cancel_requested.is_set()
         if cancelled_before_start:
@@ -17330,12 +17361,6 @@ class HMBVideoPickerLibrary(DataNode):
             )
             self._write_state(state)
             self._sync_outputs_from_state(state)
-            with self._hmb_operation_control_lock:
-                if self._hmb_pending_operation_id == action_id:
-                    self._hmb_pending_operation_id = ""
-                if self._hmb_worker_thread is threading.current_thread():
-                    self._hmb_worker_thread = None
-            self._hmb_process_lock.release()
             return
         incoming["pending_action"] = ""
         scene_text = next(
@@ -17370,12 +17395,6 @@ class HMBVideoPickerLibrary(DataNode):
                 failed_preflight_state["operation_kind"] = action
                 failed_preflight_state["operation_started_at_ms"] = int(time.time() * 1000)
                 self._write_state(failed_preflight_state)
-            with self._hmb_operation_control_lock:
-                if self._hmb_pending_operation_id == action_id:
-                    self._hmb_pending_operation_id = ""
-                if self._hmb_worker_thread is threading.current_thread():
-                    self._hmb_worker_thread = None
-            self._hmb_process_lock.release()
             raise
         self._hmb_active_operation = context
         self._hmb_operation_thread_id = threading.get_ident()
@@ -17483,7 +17502,6 @@ class HMBVideoPickerLibrary(DataNode):
         terminal_generation_records: List[Dict[str, Any]] = []
         terminal_provisional_uids: List[str] = []
         terminal_publication_error: Optional[Exception] = None
-        pending_selection_to_schedule: Optional[tuple[str, str]] = None
         try:
             self._write_state(incoming)
             self._cleanup_transient_paths()
@@ -17649,71 +17667,48 @@ class HMBVideoPickerLibrary(DataNode):
                 self._set_failed_state(exc)
         finally:
             active = self._hmb_active_process
-            if active is not None and active.poll() is None:
-                _terminate_process(active)
-            self._clear_active_process(active)
-            self._cleanup_transient_paths()
-            terminal_commit_context = None
+            # Independent cleanup steps must not suppress validated role
+            # publication, nor prevent the outer reservation finalizer.
+            for label, cleanup in (
+                ("active process termination", lambda: _terminate_process(active)
+                 if active is not None and active.poll() is None else None),
+                ("active process state publication", lambda: self._clear_active_process(active)),
+                ("transient path cleanup", self._cleanup_transient_paths),
+            ):
+                try:
+                    cleanup()
+                except Exception as exc:
+                    with suppress(Exception):
+                        _diagnostic_exception(f"Picker {label} failed", exc)
             terminal_committed_state: Optional[Dict[str, Any]] = None
-            if terminal_success_state is not None:
-                terminal_commit_context = self._hmb_catalog_state_commit()
-                terminal_commit_context.__enter__()
+            terminal_commit_context = (
+                self._hmb_catalog_state_commit()
+                if terminal_success_state is not None else nullcontext()
+            )
+            # Hold catalog ownership through output publication. A normal
+            # context manager also releases on cancellation/BaseException,
+            # including exceptions that happen inside terminal state commit.
+            with terminal_commit_context:
+                if terminal_success_state is not None:
+                    try:
+                        terminal_committed_state = self._commit_generate_terminal_state(
+                            terminal_success_state,
+                            context,
+                            terminal_generation_records,
+                            terminal_provisional_uids,
+                        )
+                    except Exception as exc:
+                        terminal_publication_error = exc
+                if self._hmb_active_operation and self._hmb_active_operation.operation_id == context.operation_id:
+                    self._hmb_active_operation = None
                 try:
-                    terminal_committed_state = self._commit_generate_terminal_state(
-                        terminal_success_state,
-                        context,
-                        terminal_generation_records,
-                        terminal_provisional_uids,
-                    )
+                    if terminal_committed_state is not None:
+                        self._sync_outputs_from_state(terminal_committed_state)
                 except Exception as exc:
-                    terminal_publication_error = (
-                        exc
-                        if isinstance(exc, Exception)
-                        else RuntimeError(str(exc))
-                    )
-            if self._hmb_active_operation and self._hmb_active_operation.operation_id == context.operation_id:
-                self._hmb_active_operation = None
-            with self._hmb_operation_control_lock:
-                if self._hmb_worker_thread is threading.current_thread():
-                    self._hmb_worker_thread = None
-            if self._hmb_process_lock.locked():
-                self._hmb_process_lock.release()
-            try:
-                if terminal_committed_state is not None:
-                    self._sync_outputs_from_state(terminal_committed_state)
-            except Exception as exc:
-                if terminal_publication_error is None:
-                    terminal_publication_error = (
-                        exc
-                        if isinstance(exc, Exception)
-                        else RuntimeError(str(exc))
-                    )
-            finally:
-                # Keep the operation reservation and catalog commit through
-                # terminal publication, but never leak either if an output
-                # callback rejects the newly committed state.
-                with self._hmb_operation_control_lock:
-                    if self._hmb_pending_operation_id == action_id:
-                        self._hmb_pending_operation_id = ""
-                if terminal_commit_context is not None:
-                    terminal_commit_context.__exit__(None, None, None)
-            pending_selection = self._hmb_pending_scene_selection
-            self._hmb_pending_scene_selection = None
-            if pending_selection:
-                pending_selection_to_schedule = pending_selection
-        try:
-            if terminal_publication_error is not None:
-                self._set_failed_state(terminal_publication_error)
-        finally:
-            # A Maya scene selected during generation must start after the old
-            # operation's terminal state is published, otherwise that terminal
-            # echo can overwrite the newly scheduled READ state.
-            if pending_selection_to_schedule:
-                pending_path, pending_source = pending_selection_to_schedule
-                try:
-                    self._schedule_scene_selection(pending_path, pending_source)
-                except Exception as exc:
-                    _diagnostic_exception("pending Maya scene selection failed", exc)
+                    if terminal_publication_error is None:
+                        terminal_publication_error = exc
+        if terminal_publication_error is not None:
+            self._set_failed_state(terminal_publication_error)
 
     def _prepare_run_state(
         self,
