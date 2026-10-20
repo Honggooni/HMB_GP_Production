@@ -919,8 +919,12 @@ assert.doesNotMatch(agentSource, /<(?:input|textarea)\b/i,
 const agentCustomButtons = [...agentSource.matchAll(/<button\b[^>]*class="([^"]+)"/g)]
   .map((match) => match[1].split(/\s+/)[0]);
 assert.deepEqual([...new Set(agentCustomButtons)].sort(),
-  ["agent-shot-run", "agent-shot-tab"],
-  "Custom Agent buttons are limited to per-Shot selection and execution.");
+  ["agent-rebind-confirm", "agent-shot-run", "agent-shot-tab"],
+  "Custom Agent buttons are limited to per-Shot selection/execution and explicit legacy recovery.");
+assert.match(agentSource, /panel\.style\.display\s*=\s*manual\.required\s*\?\s*"flex"\s*:\s*"none"/,
+  "Explicit recovery controls must stay hidden during ordinary Agent use.");
+assert.match(agentSource, /if\(!ownsLifecycle\(\)\s*\|\|\s*!manual\?\.required\s*\|\|\s*live\.disabled\s*\|\|\s*container\.__hmbAgentManualPending/,
+  "Recovery confirmation must reject stale, ordinary, disabled and already pending editors.");
 
 for (const [name, source] of [
   ["PromptLibrary", promptSource],
