@@ -123,8 +123,9 @@ class SavedPreview(unittest.TestCase):
             node.reorder_elements.assert_called_once()
             self.assertEqual(node._hmb_shot_catalog_snapshot, {})
             self.assertEqual(node._hmb_agent_shot_subscriptions(), [])
-            with self.assertRaisesRegex(RuntimeError, "Shot identity is unavailable"):
+            with self.assertRaises(RuntimeError) as denied:
                 asyncio.run(node._hmb_run_agent_shot(channel_uuid="channel", shot_uuid="shot-1", prompt_owner=source))
+            self.assertEqual(str(denied.exception), module._HMB_TOPOLOGY_UNAVAILABLE_MESSAGE)
             worker.assert_not_called()
             node.reorder_elements.reset_mock(); writes.clear()
             for _ in range(25):

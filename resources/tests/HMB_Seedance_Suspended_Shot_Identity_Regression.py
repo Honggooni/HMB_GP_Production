@@ -26,8 +26,8 @@ class Node:
     def _set_seedance_shot_choices(self,labels):self.choices=labels
     def _hmb_available_seedance_shot_catalog(self,snapshot):return deepcopy(snapshot) if snapshot else {}
     def get_parameter_value(self,name):return name=='autoclaim'
-    def _apply_seedance_shot_selection(self,requested,*,fallback_to_available):
-        snapshot=self._hmb_shot_catalog_snapshot
+    def _apply_seedance_shot_selection(self,requested,*,fallback_to_available,available_catalog=None):
+        snapshot=available_catalog if available_catalog is not None else self._hmb_shot_catalog_snapshot
         shots=snapshot['shots'] if snapshot else []
         selected=next((row for row in shots if row['shot_uuid']==requested),None)
         if not selected and fallback_to_available and shots:selected=shots[0]

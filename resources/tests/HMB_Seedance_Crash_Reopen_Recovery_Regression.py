@@ -721,7 +721,7 @@ with mock.patch.object(
 ), mock.patch.object(checkpoint_only, "_set_status_results", create=True):
     asyncio.run(checkpoint_only._refresh_async())
 
-assert checkpoint_only_bridge.refresh_calls == [(checkpoint_only_id, 60)]
+assert checkpoint_only_bridge.refresh_calls == [(checkpoint_only_id, 300)]
 assert checkpoint_only_bridge.create_calls == []
 assert checkpoint_only.parameter_output_values["generation_id"] == checkpoint_only_id
 
@@ -775,7 +775,7 @@ with mock.patch.object(
 local_success_checkpoint = target._seedance_recovery_value(
     local_success.get_parameter_value(target.SEEDANCE_RECOVERY_PARAMETER)
 )
-assert local_success_bridge.refresh_calls == [(local_success_id, 60)]
+assert local_success_bridge.refresh_calls == [(local_success_id, 300)]
 assert local_success_bridge.create_calls == []
 assert local_success_checkpoint["stage"] == "local_succeeded"
 assert local_success_checkpoint["task_id"] == local_success_id
@@ -807,7 +807,7 @@ with mock.patch.object(
 ), mock.patch.object(refresh_node, "_set_status_results", create=True):
     asyncio.run(refresh_node._refresh_async())
 
-assert bridge.refresh_calls == [(refresh_id, 60)]
+assert bridge.refresh_calls == [(refresh_id, 300)]
 assert bridge.create_calls == []
 assert refresh_node.parameter_output_values["generation_id"] == refresh_id
 assert refresh_node.parameter_output_values["generation_status"] == "running"
@@ -877,7 +877,7 @@ with mock.patch.object(
 resolved_checkpoint = target._seedance_recovery_value(
     client_refresh.get_parameter_value(target.SEEDANCE_RECOVERY_PARAMETER)
 )
-assert resolving_bridge.refresh_calls == [(client_refresh_id, 60)]
+assert resolving_bridge.refresh_calls == [(client_refresh_id, 300)]
 assert resolved_checkpoint["task_id"] == "job-resolved-from-client-request"
 assert resolved_checkpoint["task_identity"] == "broker_task"
 assert resolved_checkpoint["stage"] == "refresh"

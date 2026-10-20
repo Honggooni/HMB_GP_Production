@@ -186,7 +186,12 @@ assert.match(
   "Agent remount replaces stale gesture blockers with its nodrag-only background.",
 );
 assert.doesNotMatch(agentGestureContainer.innerHTML, /\bnopan\b|\bnowheel\b/);
-assert.doesNotMatch(agentGestureContainer.innerHTML, /<(?:select|button)\b/i,
+const agentNativeHeader = agentGestureContainer.innerHTML.match(/<header\b[^>]*class="agent-topbar"[^>]*>([\s\S]*?)<\/header>/i);
+assert.ok(agentNativeHeader, "The native Agent header must remain present.");
+assert.doesNotMatch(agentNativeHeader[1], /<(?:select|button)\b/i,
+  "Ordinary native header controls must not be reintroduced by legacy recovery.");
+assert.doesNotMatch(agentGestureContainer.innerHTML,
+  /<(?:select|button)\b[^>]*class="[^"]*\bagent-(?:only-toggle|shot-select)\b/i,
   "The native Agent header must not render retired Only or Shot controls.");
 for (const element of [agentGestureContainer, agentGestureRoot]) {
   assert.ok(element.classList.contains("nodrag"), "Agent gesture surfaces prevent whole-node dragging.");

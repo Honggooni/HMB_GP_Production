@@ -27,6 +27,7 @@ body=[node for node in source.body if not (isinstance(node,(ast.ImportFrom,ast.T
 class Dummy:pass
 namespace={'__name__':'_hmb_windows_close_guard_test','__file__':str(ROOT/'_hmb_library_bootstrap.py'),
     'AdvancedNodeLibrary':object,'current_engine':None,'_LOAD_TYPES':(),
+    '_SERIALIZE_TYPES':(),'_SAVE_TYPES':(),
     'is_loading_workflow':lambda:False,'LibraryRegistry':Dummy,'WorkflowRegistry':Dummy,
     **{name:type(name,(),{}) for name in ('CreateNodeRequest','CreateNodeResultFailure',
         'DeserializeSelectedNodesFromCommandsRequest','DeserializeSelectedNodesFromCommandsResultFailure',
