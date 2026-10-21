@@ -115,6 +115,11 @@ def make_generator(source, number: int = 1):
     node._hmb_draft_controls_syncing = False
     node._hmb_draft_pending_source = {}
     node._detached_submission_tasks = set()
+    # This fixture deliberately bypasses the native constructor. Preserve its
+    # preparation-local upload ownership fields without mocking the lease code.
+    node._temporary_video_uploads = []
+    node._temporary_tos_video_uploads = []
+    node._hmb_reference_upload_lease_id = ""
     node._hmb_expected_agent_result = None
     node.source = source
     node.checkpoint = {}

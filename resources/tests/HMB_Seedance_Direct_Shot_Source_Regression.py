@@ -1567,6 +1567,8 @@ def capture_bridge_request(
     idempotency_key: str = "",
 ) -> dict[str, Any]:
     if method == "GET":
+        if path == "/api/v1/maintenance-intake/capabilities":
+            raise target._BrokerError("Synthetic native-only Broker", status_code=404)
         assert path == target.BROKER_SEEDANCE_CAPABILITIES_PATH
         assert payload is None
         return {

@@ -19,6 +19,7 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+import time
 import zipfile
 from unittest import mock
 
@@ -168,7 +169,26 @@ async def build_team(engine, package, modules):
     print("TEAM801_BUILD=PASS nodes22 actual published legacy classes; five Prompt/Agent/Finish documents; no execution")
 
 
-async def consume_current(engine, package, modules):
+async def serialize_after_native_dispatch(engine, flow):
+    """Let detached native completion hooks release their own admissions."""
+    from griptape_nodes.retained_mode.events.flow_events import SerializeFlowToCommandsRequest
+    deadline = time.monotonic() + 10
+    refused = 0
+    while True:
+        request = SerializeFlowToCommandsRequest(flow_name=flow.name)
+        request.broadcast_result = False
+        result = engine.handle_request(request)
+        if result.succeeded():
+            print(f"NATIVE_SERIALIZE_SETTLED=PASS busy_refusals={refused}")
+            return result.serialized_flow_commands
+        message = str(result.result_details)
+        assert "The workflow is still loading, consolidating, or being serialized." in message, message
+        refused += 1
+        assert time.monotonic() < deadline, ("Native post-dispatch did not settle", refused, message)
+        await asyncio.sleep(.01)
+
+
+async def consume_current(engine, package, modules, *, resume_native_dispatch):
     from griptape_nodes.retained_mode.events.flow_events import DeserializeFlowFromCommandsRequest, SerializeFlowToCommandsRequest, DeleteFlowRequest
     from griptape_nodes.serialization.values import decode_value, encode_value
     import _hmb_workflow_migration as migration
@@ -202,6 +222,9 @@ async def consume_current(engine, package, modules):
     migration.mark_flow_migration_pending(engine, flow.name)
     result = await migration.migrate_flow(engine, flow.name, backup_root=OUT / "migration-backups")
     assert result["ok"] and result["code"] == "consolidated", result
+    # The pre-migration capture is complete. Restore the real notification
+    # scheduler before serialization and the second native deserialize.
+    resume_native_dispatch()
     assert len(flow.nodes) == 10 and len(result["removed_nodes"]) == 12
     prompt = next(n for n in flow.nodes.values() if n.metadata.get("node_type") == KINDS[2])
     agent = next(n for n in flow.nodes.values() if n.metadata.get("node_type") == KINDS[3])
@@ -255,7 +278,7 @@ async def consume_current(engine, package, modules):
     assert first_edges == expected_edges, "Migration must preserve exactly the contracted legacy connections"
     backup = decode_value(json.loads(Path(result["backup_path"]).read_text("utf-8")))
     assert len(backup["nodes"]) == 22 and len(backup["edges"]) == len(expected["edges"])
-    serialized = send(engine, SerializeFlowToCommandsRequest(flow_name=flow.name)).serialized_flow_commands
+    serialized = await serialize_after_native_dispatch(engine, flow)
     # SDK enforces current-context ordering during DeleteFlow. Explicitly pop
     # its child Node context before deleting only this isolated test flow.
     while engine.context_manager.has_current_flow():
@@ -265,6 +288,7 @@ async def consume_current(engine, package, modules):
     assert loaded.succeeded(), str(loaded.result_details)
     flow = engine.flow_manager.get_flow_by_name(loaded.flow_name)
     engine.context_manager.push_flow(flow)
+    await serialize_after_native_dispatch(engine, flow)
     prompt = flow.nodes[prompt.name];agent = flow.nodes[agent.name];finish = flow.nodes[finish.name]
     issues_after = verify()
     assert edges(engine, flow) == first_edges
@@ -292,6 +316,7 @@ def phase(which):
     modules = {kind: importlib.import_module(kind) for kind in KINDS}
     import _hmb_shot_routing as routing
     with ExitStack() as guard:
+        resume_native_dispatch = lambda: None
         import _hmb_library_bootstrap as bootstrap
         guard.enter_context(mock.patch.object(bootstrap._Registration, "start_web_worker", lambda *a, **k: None))
         if which == "current":
@@ -299,7 +324,10 @@ def phase(which):
             # The public deserialize pre-dispatch capture remains real. Keep
             # its coordinator paused only until pre-migration diagnostics are
             # captured; the native migrate/rollback implementation runs below.
-            guard.enter_context(mock.patch.object(migration, "schedule_loaded_flow_migrations", lambda *a, **k: None))
+            pause = mock.patch.object(migration, "schedule_loaded_flow_migrations", lambda *a, **k: None)
+            pause.start()
+            guard.callback(pause.stop)
+            resume_native_dispatch = pause.stop
         for name in ("schedule_post_registration_reconcile", "schedule_post_hydration_reconcile"):
             guard.enter_context(mock.patch.object(routing, name, lambda *a, **k: False))
         guard.enter_context(mock.patch.object(modules[KINDS[0]].HMBImageAssetLibrary, "_schedule_catalog_scan", lambda *a, **k: None))
@@ -308,7 +336,8 @@ def phase(which):
         logging.disable(logging.CRITICAL)
         from griptape_nodes.retained_mode.engine import engine_scope
         with engine_scope() as engine:
-            asyncio.run(build_team(engine, package, modules) if which == "team" else consume_current(engine, package, modules))
+            asyncio.run(build_team(engine, package, modules) if which == "team" else consume_current(
+                engine, package, modules, resume_native_dispatch=resume_native_dispatch))
         assert not ATTEMPTS
 
 

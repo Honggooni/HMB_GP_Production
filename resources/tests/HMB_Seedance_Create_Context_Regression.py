@@ -116,7 +116,7 @@ def refuses_without_mutation(engine, payload):
 
 class Fixture:
     """Canonical SDK loader/callbacks, without discovery, pip or AI services."""
-    def __init__(self, engine, *, actual=False, name="HMB_GP_Production"):
+    def __init__(self, engine, *, actual=False, actual_image=False, name="HMB_GP_Production"):
         global SERIAL
         SERIAL += 1
         self.engine = engine
@@ -131,6 +131,8 @@ class Fixture:
             "    def __init__(self, name, metadata=None):\n"
             "        super().__init__(name=name, metadata=metadata)\n"
             "        type(self).created.append(name)\n"
+            "class HMBImageGeneration(DataNode):\n"
+            "    pass\n"
             "class HMBImageAssetLibrary(DataNode):\n"
             "    pass\n", encoding="utf-8")
         raw = copy.deepcopy(BASE_SCHEMA)
@@ -138,9 +140,10 @@ class Fixture:
         raw["metadata"]["dependencies"] = None
         definitions = {item["class_name"]: item for item in raw["nodes"]}
         selected = []
-        for class_name in ("HMBSeedanceGeneration", "HMBImageAssetLibrary"):
+        for class_name in ("HMBSeedanceGeneration", "HMBImageGeneration", "HMBImageAssetLibrary"):
             definition = copy.deepcopy(definitions[class_name])
-            definition["file_path"] = str(ROOT / "HMBSeedanceGeneration.py") if actual and class_name == "HMBSeedanceGeneration" else str(self.fixture_file)
+            use_source = (actual and class_name == "HMBSeedanceGeneration") or (actual_image and class_name == "HMBImageGeneration")
+            definition["file_path"] = str(ROOT / (class_name + ".py")) if use_source else str(self.fixture_file)
             selected.append(definition)
         raw["nodes"] = selected
         self.schema = LibrarySchema.model_validate(raw)
@@ -174,11 +177,11 @@ class Fixture:
             LibraryRegistry.unregister_library(self.name, event_manager=self.engine.event_manager)
 
 
-async def case(name, callback, *, actual=False):
+async def case(name, callback, *, actual=False, actual_image=False):
     WorkflowRegistry.clear_user_workflows()
     with engine_scope() as engine:
         engine.event_manager.initialize_queue()
-        fixture = Fixture(engine, actual=actual)
+        fixture = Fixture(engine, actual=actual, actual_image=actual_image)
         try:
             outcome = callback(engine, fixture)
             if asyncio.iscoroutine(outcome):
@@ -205,6 +208,33 @@ def cold(engine, fixture):
     assert engine.context_manager.get_current_flow().name == result.parent_flow_name
     assert len(engine.flow_manager._name_to_parent_name) == 1
     assert engine.library_manager.is_worker is False
+
+
+def cold_image(engine, fixture):
+    assert snapshot(engine) == (None, None, {}, {}, {})
+    payload = request(node_type="HMBImageGeneration", node_name="ColdImageGenerator")
+    result = succeeds(engine, payload)
+    assert payload.override_parent_flow_name == result.parent_flow_name
+    assert engine.context_manager.get_current_flow().name == result.parent_flow_name
+    assert len(engine.flow_manager._name_to_parent_name) == 1
+    assert type(engine.node_manager.get_node_by_name(result.node_name)).__name__ == "HMBImageGeneration"
+    assert fixture.library._node_types["HMBSeedanceGeneration"]._resolved is None
+
+
+def active_image(engine, fixture):
+    ensured = send(engine, EnsureWorkflowAndFlowRequest(flow_name="ImageActiveFlow"))
+    assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
+    before = engine.context_manager.get_current_flow()
+    payload = request(node_type="HMBImageGeneration", node_name="ActiveImageGenerator")
+    result = succeeds(engine, payload)
+    assert payload.override_parent_flow_name is None
+    assert engine.context_manager.get_current_flow() is before
+    assert result.parent_flow_name == ensured.flow_name
+
+
+def image_worker(engine, fixture):
+    engine.library_manager._is_worker = True
+    refuses_without_mutation(engine, request(node_type="HMBImageGeneration"))
 
 
 def native_baseline(engine, fixture):
@@ -413,6 +443,14 @@ async def main():
          mock.patch.object(socket, "getaddrinfo", side_effect=deny_network):
         await old_engine_accessor_unavailable()
         await case("cold actual native CreateNode", cold)
+        await case("cold image CreateNode uses the same guarded official bootstrap", cold_image)
+        await case("actual source image constructor through cold lazy native CreateNode", cold_image, actual_image=True)
+        await case("active image flow stays current without bootstrap", active_image)
+        await case("image worker bypass", image_worker)
+        for name, changes in (("image initial_setup bypass", {"initial_setup": True}),
+                              ("image set-as-context bypass", {"set_as_new_context": True})):
+            await case(name, lambda engine, fixture, changes=changes: refuses_without_mutation(
+                engine, request(node_type="HMBImageGeneration", **changes)))
         await case("registered lazy native baseline fails before hook repair", native_baseline)
         await case("registered unsaved workflow without flow", unsaved)
         await case("existing active flow stays current", active)

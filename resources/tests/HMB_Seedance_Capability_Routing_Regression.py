@@ -48,6 +48,11 @@ SERVER_FIXTURE_AST_SHA256 = "63413b947e7e5f19d075c2c1fc6d1b1f5cc8bfef3b0565f9931
 # when auditing a developer's optional API SERVER checkout. Arbitrary server
 # drift, including a changed existing profile or route, must still fail.
 SERVER_SHOT_METADATA_CANDIDATE_AST_SHA256 = "b9c18f5e60bb1e8a22d16f676301f997b9eec4c91db55bb7a1551d419b53ffe9"
+# Independently inspected frozen server R10 extracts the same pure response
+# into a shared builder. Pin both sides of that call and compare full outputs;
+# accepting an arbitrary wrapper hash would miss changes inside its helper.
+SERVER_SHARED_WRAPPER_AST_SHA256 = "92f75ac457109b2fbdc40811cc4ce109a082183e93d7d795b9bc9d851a64c242"
+SERVER_SHARED_BUILDER_AST_SHA256 = "b81653e3804ac82c3259f0fa19e451ed1e1a1c91567aebeddaae0c134a9b2181"
 SEEDANCE_DRAFT_SOURCE_TTL_SECONDS = 7 * 24 * 60 * 60
 GENERATION_MODE_METADATA_SCHEMA = "hmb-generation-mode-v1"
 GENERATION_MODE_METADATA_FIELD = "hmb_generation_mode"
@@ -94,10 +99,10 @@ SYNTHETIC_TOKEN = "offline-capability-routing-token"
 METRICS = Counter()
 
 
-def function_node(source):
+def function_node(source, name="seedance_generation_capabilities"):
     return next(node for node in ast.parse(source).body
                 if isinstance(node, ast.FunctionDef)
-                and node.name == "seedance_generation_capabilities")
+                and node.name == name)
 
 
 def function_hash(node):
@@ -159,6 +164,11 @@ class RouteOpener:
                 "owner_user_id": 1, "idempotency_key": t._seedance_draft_final_request_id(source_id),
                 "child_task_id": None, "child_status": None, **base.PROJECT}
             METRICS["synthetic_draft_final_state_gets"] += 1
+        elif method == "GET" and path == "/api/v1/maintenance-intake/capabilities":
+            # This fixture represents the older native-only Broker. Preserve
+            # all original capability/body assertions; the optional new route
+            # is explicitly absent rather than a forged queue-readiness flag.
+            raise urllib.error.HTTPError(request.full_url, 404, "No intake adapter", {}, io.BytesIO(b'{}'))
         elif method == "GET":
             assert path in (CAP_PATH, DRAFT_PATH), path
             assert request.data is None
@@ -308,17 +318,28 @@ class CapabilityRoutingTests(unittest.TestCase):
             actual = function_node(local_server.read_text(encoding="utf-8-sig"))
             actual_hash = function_hash(actual)
             self.assertIn(actual_hash, {SERVER_FIXTURE_AST_SHA256,
-                                      SERVER_SHOT_METADATA_CANDIDATE_AST_SHA256})
+                                      SERVER_SHOT_METADATA_CANDIDATE_AST_SHA256,
+                                      SERVER_SHARED_WRAPPER_AST_SHA256})
             namespace = {name: globals()[name] for name in (
                 "SEEDANCE_DRAFT_SOURCE_TTL_SECONDS", "GENERATION_MODE_METADATA_SCHEMA",
                 "GENERATION_MODE_METADATA_FIELD", "GENERATION_MODE_METADATA_CHOICES",
                 "GENERATION_TASK_METADATA_FIELD", "GENERATION_TASK_METADATA_CHOICES")}
-            candidate = actual_hash == SERVER_SHOT_METADATA_CANDIDATE_AST_SHA256
+            candidate = actual_hash in {SERVER_SHOT_METADATA_CANDIDATE_AST_SHA256,
+                                       SERVER_SHARED_WRAPPER_AST_SHA256}
             shot_capability = {"schema": "hmb-generation-shot-metadata", "version": 1,
                                "field": "hmb_shot", "enabled": True}
             if candidate:
                 namespace["review_submission_shots"] = SimpleNamespace(
                     capability=lambda: deepcopy(shot_capability))
+            if actual_hash == SERVER_SHARED_WRAPPER_AST_SHA256:
+                helper = function_node(local_server.with_name("seedance_capabilities.py").read_text(
+                    encoding="utf-8-sig"), name="build_capabilities")
+                self.assertEqual(function_hash(helper), SERVER_SHARED_BUILDER_AST_SHA256)
+                helper_namespace = {"review_submission_shots": namespace["review_submission_shots"]}
+                exec(compile(ast.Module(body=[helper], type_ignores=[]),
+                             "<pure-shared-capability-builder>", "exec"), helper_namespace)
+                namespace["seedance_capabilities"] = SimpleNamespace(
+                    build_capabilities=helper_namespace[helper.name])
             exec(compile(ast.Module(body=[actual], type_ignores=[]), "<pure-server-fixture>", "exec"), namespace)
             for selected in (False, True):
                 expected = seedance_generation_capabilities(draft=selected)

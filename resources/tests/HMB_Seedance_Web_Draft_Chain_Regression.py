@@ -131,6 +131,9 @@ class SyntheticOpener:
 
     def open(self, request, *, timeout):
         path = urlparse(request.full_url).path
+        if request.get_method() == 'GET' and path == '/api/v1/maintenance-intake/capabilities':
+            import urllib.error
+            raise urllib.error.HTTPError(request.full_url,404,'Synthetic native-only Broker',{},io.BytesIO(b'{}'))
         if request.get_method() == 'GET' and path == g.BROKER_SEEDANCE_CAPABILITIES_PATH:
             self.capability_reads.append(request.full_url)
             return Response({'schema': g.BROKER_SEEDANCE_CAPABILITIES_SCHEMA,

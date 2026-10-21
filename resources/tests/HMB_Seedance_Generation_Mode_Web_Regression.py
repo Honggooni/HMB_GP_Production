@@ -164,17 +164,21 @@ class GenerationModeWebRegression(unittest.TestCase):
             payload["client_request_id"] = "hmb-final-fixed"
             bridge = g._HMBAIBrokerBridge(server_url=g.AI_BROKER_INTERNAL_ORIGIN)
             bridge.require_seedance_draft_features = mock.Mock(return_value="mov")
+            bridge._load_access_token = mock.Mock(return_value="SYNTHETIC_NATIVE_ONLY_TOKEN")
             requests = []
             def request(method, path, **kwargs):
                 requests.append((method, path, deepcopy(kwargs)))
+                if method == "GET" and path == "/api/v1/maintenance-intake/capabilities":
+                    raise g._BrokerError("Synthetic native-only Broker", status_code=404)
                 return {"job_id": "job-" + "b" * 32}
             bridge._request_json = request
             bridge.generate_seedance(payload, timeout=1)
-            self.assertEqual(len(requests), 1)
-            self.assertEqual(requests[0][:2], ("POST", "/api/v1/generate/video"))
-            self.assertEqual(requests[0][2]["payload"], payload)
-            self.assertEqual(requests[0][2]["idempotency_key"], "hmb-final-fixed")
-            self.assertFalse(META & requests[0][2]["payload"].keys())
+            self.assertEqual(len(requests), 2)
+            self.assertEqual(requests[0][:2], ("GET", "/api/v1/maintenance-intake/capabilities"))
+            self.assertEqual(requests[1][:2], ("POST", "/api/v1/generate/video"))
+            self.assertEqual(requests[1][2]["payload"], payload)
+            self.assertEqual(requests[1][2]["idempotency_key"], "hmb-final-fixed")
+            self.assertFalse(META & requests[1][2]["payload"].keys())
             bridge.require_seedance_draft_features.assert_called_once()
 
 

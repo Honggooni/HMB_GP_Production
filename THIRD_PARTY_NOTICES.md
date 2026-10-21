@@ -2,7 +2,9 @@
 
 HMB GP Production declares the following direct editor/runtime dependencies:
 
-- Pillow 12.3.0 — MIT-CMU license
+- Pillow >=12.3.0,<14 — MIT-CMU license. This is a declared compatibility
+  range, not a bundled Pillow distribution. A compatible host-installed
+  version is reused, including the current engine's Pillow 13.
 - imageio-ffmpeg 0.6.0 — BSD-2-Clause license
 - HTTPX 0.28.1 — BSD-3-Clause license
 - The FFmpeg executable supplied through imageio-ffmpeg is governed by the

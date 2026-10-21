@@ -3,6 +3,82 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_Maintenance_Queue_Admission_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Broker_Reference_Auth_Continuity_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Reference_Lease_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated actual SDK for native checkpoint and Only controller checks. Synthetic Cloud/TOS handles verify maintenance acceptance, unknown outcomes, per-account Task ownership and cleanup without network, billing or historical journal access."
+    },
+    {
+      "name": "HMB_Pillow_Host_Compatibility_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Color_LUT_Usage_Node_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Color_LUT_Usage_Protocol_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_My_Box_Node_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires isolated actual SDK for private My Box Only lifecycle, native saved checkpoint and original MOV projection. HTTP/decoder fixtures only; live network, billing, installation and user workflow writes are prohibited."
+    },
+    {
+      "name": "HMB_My_Box_Protocol_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Generation_Header_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Generation_Protocol_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Generation_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated actual SDK to verify personal image nodes, native preview outputs, local save, same-Task retrieval and native serialize/delete/reopen. All Broker results are synthetic and network calls are prohibited."
+    },
+    {
+      "name": "HMB_Image_Generation_Node_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed SDK for personal image lifecycle, native parameter compatibility, cancellation, duplicate submission guards and saved command hydration. Model and Broker transport are mocked."
+    },
+    {
       "name": "HMB_Seedance_Native_Local_Preview_Replay_Host_Regression.py",
       "mode": "manual",
       "coverage": "installed_sdk",

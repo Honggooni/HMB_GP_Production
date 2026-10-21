@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import base64
 from copy import deepcopy
+from contextlib import contextmanager
+import hashlib
 import io
 import importlib.util
 import json
@@ -147,6 +149,9 @@ class FakeOutputFile:
 
 
 class FakeBrokerBridge:
+    # This is a mock authentication boundary, not a bearer/epoch emulator.
+    # The real Bridge continuity is covered by the native Reference Lease suite.
+    FIXTURE_PRINCIPAL = hashlib.sha256(b"offline-stable-principal").hexdigest()
     SECRET_VALUES = (
         "broker-access-token-canary",
         "provider-api-key-canary",
@@ -154,6 +159,9 @@ class FakeBrokerBridge:
     )
 
     def __init__(self, refresh_responses: list[dict]) -> None:
+        self._reference_account_fingerprint = ""
+        self._fixture_authenticated_principal = ""
+        self._fixture_response_proofs: dict[int, tuple[dict, str]] = {}
         self.refresh_responses = list(refresh_responses)
         self.account_calls = 0
         self.generate_payloads: list[dict] = []
@@ -163,23 +171,41 @@ class FakeBrokerBridge:
     def account_snapshot(self, *, connect: bool):
         assert connect is True
         self.account_calls += 1
+        self._fixture_authenticated_principal = self.FIXTURE_PRINCIPAL
+        self._reference_account_fingerprint = self.FIXTURE_PRINCIPAL
         return target._BrokerAccountSnapshot(
             state="connected",
             connected=True,
             account="Broker Artist",
         )
 
+    def _fixture_verified_response(self, response: dict) -> dict:
+        principal = self._fixture_authenticated_principal
+        if principal and self._reference_account_fingerprint == principal:
+            self._fixture_response_proofs[id(response)] = (response, principal)
+        return response
+
+    @contextmanager
+    def _reference_principal_scope(self, response=None):
+        principal = self._fixture_authenticated_principal
+        current = principal if principal and self._reference_account_fingerprint == principal else ""
+        if response is not None:
+            proof = self._fixture_response_proofs.get(id(response))
+            if not proof or proof[0] is not response or proof[1] != current:
+                current = ""
+        yield current
+
     def generate_seedance(self, payload: dict, *, timeout: float) -> dict:
         assert timeout > 0
         self.generate_payloads.append(dict(payload))
-        return {
+        return self._fixture_verified_response({
             "status": "pending",
             "job_id": "broker-job-1",
             "token": self.SECRET_VALUES[0],
             "api_key": self.SECRET_VALUES[1],
             "authorization": self.SECRET_VALUES[2],
             "nested": {"credential": self.SECRET_VALUES[1]},
-        }
+        })
 
     def refresh_job(self, job_id: str, *, timeout: float = 300) -> dict:
         assert timeout > 0
@@ -187,11 +213,39 @@ class FakeBrokerBridge:
         self.refresh_timeouts.append(timeout)
         if not self.refresh_responses:
             raise AssertionError("Unexpected extra Broker refresh")
-        return self.refresh_responses.pop(0)
+        return self._fixture_verified_response(self.refresh_responses.pop(0))
 
     @staticmethod
     def is_trusted_broker_url(_url: str) -> bool:
         return False
+
+
+def assert_fake_broker_authentication_boundary() -> None:
+    refreshed = {"job_id": "broker-job-1", "status": "completed"}
+    bridge = FakeBrokerBridge([refreshed])
+    with bridge._reference_principal_scope() as principal:
+        assert principal == ""
+    bridge._reference_account_fingerprint = bridge.FIXTURE_PRINCIPAL
+    with bridge._reference_principal_scope() as principal:
+        assert principal == ""  # A fingerprint field alone is not authentication.
+    bridge._reference_account_fingerprint = ""
+    before_auth = bridge.generate_seedance({}, timeout=1)
+    bridge.account_snapshot(connect=True)
+    with bridge._reference_principal_scope() as principal:
+        assert principal == bridge.FIXTURE_PRINCIPAL
+    with bridge._reference_principal_scope(before_auth) as principal:
+        assert principal == ""
+    issued = bridge.generate_seedance({}, timeout=1)
+    with bridge._reference_principal_scope(issued) as principal:
+        assert principal == bridge.FIXTURE_PRINCIPAL
+    for unverified in (dict(issued), deepcopy(issued), {"status": "completed"}):
+        with bridge._reference_principal_scope(unverified) as principal:
+            assert principal == ""
+    exact_refresh = bridge.refresh_job("broker-job-1", timeout=1)
+    assert exact_refresh is refreshed
+    with bridge._reference_principal_scope(exact_refresh) as principal:
+        assert principal == bridge.FIXTURE_PRINCIPAL
+    print("FAKE_BROKER_AUTH_BOUNDARY=PASS authenticated_exact_objects_only copied_unseen_unverified")
 
 
 class RuntimeRegisteredSeedance(target.HMBSeedanceGeneration):
@@ -3990,8 +4044,8 @@ def assert_local_video_temporary_publication() -> None:
         assert unknown_preview["job_id"] == unknown_generation_id
         assert unknown_preview["action"] == "refresh_existing"
         assert unknown_driver.deletes == []
-        assert len(unknown_deferred_uploads) == 1
-        assert unknown_deferred_uploads[0][1] == unknown_driver.uploads[0]["path"]
+        assert unknown_deferred_uploads == []  # Ownership moved before POST, never into a cleanup timer.
+        assert target._reference_leases.pending_metadata(unknown_node._hmb_reference_upload_lease_id)["unresolved"] is True
 
         class BlockingSubmissionBridge(FakeBrokerBridge):
             def __init__(self) -> None:
@@ -4058,8 +4112,8 @@ def assert_local_video_temporary_publication() -> None:
         assert cancelled_generation_id.startswith("hmb-")
         assert blocking_node._submission_outcome_unknown is True
         assert blocking_driver.deletes == []
-        assert len(deferred_uploads) == 1
-        assert deferred_uploads[0][1] == blocking_driver.uploads[0]["path"]
+        assert deferred_uploads == []
+        assert target._reference_leases.pending_metadata(blocking_node._hmb_reference_upload_lease_id)["unresolved"] is True
 
 
 def assert_tos_local_video_temporary_publication() -> None:
@@ -4990,6 +5044,7 @@ def assert_hidden_task_evidence_and_gallery_contract() -> None:
         target._broker_config.save_broker_base_url(original_broker_address)
 
 
+assert_fake_broker_authentication_boundary()
 assert_hidden_task_evidence_and_gallery_contract()
 assert_constructor_and_public_contract()
 assert_priority_model_visibility_and_saved_value_contract()

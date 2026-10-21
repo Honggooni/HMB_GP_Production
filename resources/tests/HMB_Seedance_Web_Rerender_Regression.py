@@ -173,6 +173,7 @@ async def checks(root):
             return Response(json.dumps({"job_id": "web-new-task", "status": "succeeded", "video_url": "https://example.com/new.mp4"}).encode())
     wire_bridge = target._HMBAIBrokerBridge(opener=Opener(), server_url=target.AI_BROKER_INTERNAL_ORIGIN)
     wire_bridge._load_access_token = lambda: "offline-test"
+    wire_bridge.queue_admission = lambda **kwargs: None  # Native POST-only transport fixture.
     wire_bridge.account_snapshot = lambda **kwargs: SimpleNamespace(connected=True)
     async with node._hmb_web_rerender_claim(snapshot) as claim:
         node._hmb_web_rerender_bind_parent_settings(claim, wire_settings(claim.snapshot["generation_settings"]))
@@ -367,6 +368,7 @@ async def command_submission_contracts(root):
                                         "video_url": "https://example.com/new.mp4"}).encode())
     bare = target._HMBAIBrokerBridge(opener=Opener(), server_url=target.AI_BROKER_INTERNAL_ORIGIN)
     bare._load_access_token = lambda: "offline-test"
+    bare.queue_admission = lambda **kwargs: None  # Native POST-only transport fixture.
     bare.account_snapshot = lambda **kwargs: SimpleNamespace(connected=True)
     def record_prepared(received_command, event, **fields):
         assert received_command == command and event == "prepared"

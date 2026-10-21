@@ -257,6 +257,7 @@ class ProjectSourceTests(unittest.TestCase):
             payload = node._build_broker_payload(node._resolve_exact_shot_generation_inputs(base.params()))
         payload['client_request_id'] = 'hmb-project-fixture'
         bridge = t._HMBAIBrokerBridge(server_url=base.ORIGIN)
+        bridge.queue_admission = mock.Mock(return_value=None)  # Native body-only seam; no HTTP fixture.
         with mock.patch.object(bridge, '_request_json', return_value={'job_id': base.JOB}) as request:
             bridge.generate_seedance(payload, timeout=1)
             self.assertEqual(request.call_args.kwargs['payload']['project_selection_schema'], t.PROJECT_SELECTION_SCHEMA)

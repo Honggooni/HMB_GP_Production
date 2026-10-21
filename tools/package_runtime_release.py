@@ -18,8 +18,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.8.19"
-RELEASE_VERSION = "0.8.19"
+RELEASE_LABEL = "v0.8.23"
+RELEASE_VERSION = "0.8.23"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -45,6 +45,7 @@ RUNTIME_INSTALL_FILES = (
     "HMBColorLUTLibrary.py",
     "HMBFinishLookLibrary.py",
     "HMBImageAssetLibrary.py",
+    "HMBImageGeneration.py",
     "HMBPromptLibrary.py",
     "HMBSeedanceGeneration.py",
     "HMBVideoPickerLibrary.py",
@@ -55,6 +56,11 @@ RUNTIME_INSTALL_FILES = (
     "_hmb_library_bootstrap.py",
     "_hmb_workflow_migration.py",
     "_hmb_image_limits.py",
+    "_hmb_image_generation.py",
+    "_hmb_my_box.py",
+    "_hmb_my_box_node.py",
+    "_hmb_reference_leases.py",
+    "_hmb_queue_admission.py",
     "_hmb_project.py",
     "_hmb_review.py",
     "_hmb_web_rerender.py",
@@ -62,6 +68,7 @@ RUNTIME_INSTALL_FILES = (
     "_hmb_mp4_verify.py",
     "_hmb_common.py",
     "_hmb_color_lut.py",
+    "_hmb_color_lut_usage.py",
     "_hmb_screen_space.py",
     "_hmb_video_tools.py",
     "widgets/HMBAgentLibraryWidget.js",
@@ -69,6 +76,7 @@ RUNTIME_INSTALL_FILES = (
     "widgets/HMBFinishLookLibraryWidget.js",
     "widgets/HMBImageAssetLibraryWidget.js",
     "widgets/HMBImageAssetThumbnailPatchBridgeWidget.js",
+    "widgets/HMBImageGenerationWidget.js",
     "widgets/HMBPromptLibraryScopedBindingWidget.js",
     "widgets/HMBSeedanceGenerationWidget.js",
     "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
@@ -97,7 +105,7 @@ CANONICAL_LF_SOURCE_FILES = {
     if PurePosixPath(relative).suffix.casefold() in {".py", ".js", ".json", ".md"}
     or relative == "LICENSE"
 }
-if len(RUNTIME_INSTALL_FILES) != 41 or len(DISTRIBUTION_ONLY_FILES) != 4:
+if len(RUNTIME_INSTALL_FILES) != 49 or len(DISTRIBUTION_ONLY_FILES) != 4:
     raise RuntimeError("Runtime/distribution release boundary count mismatch.")
 if set(RUNTIME_INSTALL_FILES) & set(DISTRIBUTION_ONLY_FILES):
     raise RuntimeError("Runtime and distribution-only release files overlap.")
@@ -155,6 +163,13 @@ STANDARD_AGENT_LIBRARY_ENV = "HMB_GRIPTAPE_STANDARD_LIBRARY_PATH"
 STANDARD_AGENT_MANIFEST_NAME = "griptape_nodes_library.json"
 STANDARD_AGENT_MODEL_CATALOG_SHA256 = (
     "716609b618b90ffe90f7f7fa71ec68a41402b0d918700a5a50e72a9faff086fc"
+)
+EXPECTED_EDITOR_DEPENDENCIES = frozenset((
+    "httpx==0.28.1", "imageio-ffmpeg==0.6.0", "Pillow>=12.3.0,<14",
+))
+PILLOW_DECLARATION_COMMENT = (
+    "Declared editor dependency: Pillow>=12.3.0,<14. No Pillow distribution "
+    "is bundled; a compatible host-installed version is reused."
 )
 
 
@@ -596,6 +611,27 @@ def validate_no_policy_artifacts_in_zip(
         raise RuntimeError(f"{label} is not a valid ZIP archive.") from exc
 
 
+def validate_editor_dependency_contract(
+    project: dict[str, Any], library_manifest: dict[str, Any], sbom: dict[str, Any],
+) -> None:
+    """Keep bounded host-compatible requirements and honest unbundled metadata."""
+    declarations = (
+        project.get("project", {}).get("dependencies"),
+        library_manifest.get("metadata", {}).get("dependencies", {}).get("pip_dependencies"),
+    )
+    for values in declarations:
+        if (not isinstance(values, list) or len(values) != len(EXPECTED_EDITOR_DEPENDENCIES)
+                or not all(isinstance(value, str) for value in values)
+                or set(values) != EXPECTED_EDITOR_DEPENDENCIES):
+            raise RuntimeError("Editor dependency declarations differ from the bounded compatibility contract.")
+    pillow = [item for item in sbom.get("packages", [])
+              if isinstance(item, dict) and item.get("SPDXID") == "SPDXRef-Pillow"]
+    if (len(pillow) != 1 or pillow[0].get("versionInfo") != "NOASSERTION"
+            or pillow[0].get("downloadLocation") != "https://pypi.org/project/Pillow/"
+            or pillow[0].get("comment") != PILLOW_DECLARATION_COMMENT):
+        raise RuntimeError("Pillow SBOM must distinguish its declared range from a bundled version.")
+
+
 def validate_sources() -> tuple[str, list[dict[str, Any]]]:
     # Package checks are read-only for the approved signed DAT. A Manager
     # mirror is an explicit authoring operation, not an incidental side effect
@@ -621,6 +657,7 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
     if str(project.get("project", {}).get("version", "")).strip() != release_version:
         raise RuntimeError("Manifest and package release versions differ.")
     sbom = json.loads((ROOT / "SBOM.spdx.json").read_text(encoding="utf-8"))
+    validate_editor_dependency_contract(project, library_manifest, sbom)
     sbom_package = next(
         (
             item

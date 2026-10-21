@@ -206,7 +206,8 @@ class GenerationModeTests(unittest.TestCase):
         self.assertEqual(opener.posts[0]["body"]["client_request_id"], opener.posts[1]["body"]["client_request_id"])
         # Server initial-accept immutability is a server contract, not claimed
         # by these synthetic transport responses. The client never patches it.
-        self.assertTrue(all(call["path"] in (transport.CAP_PATH, transport.GENERATE_PATH) for call in opener.calls))
+        self.assertTrue(all(call["path"] in (transport.CAP_PATH, transport.GENERATE_PATH,
+            "/api/v1/maintenance-intake/capabilities") for call in opener.calls))
 
     def test_partial_capability_never_sends_an_unadvertised_literal(self):
         def partial(doc, *args):

@@ -29,6 +29,8 @@ class LocalBroker(BaseHTTPRequestHandler):
         self.send_response(status); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
     def do_GET(self):
+        if self.path == "/api/v1/maintenance-intake/capabilities":
+            return self.reply(404, {"error": "synthetic native-only Broker"})
         barrier = self.server.capability_barrier
         if barrier is not None: barrier.wait(timeout=10)
         self.reply(200, base.capability())
@@ -217,6 +219,8 @@ class IntervalAdmission(unittest.TestCase):
         class WebOpener(CommandSubmissionOpener):
             def open(inner, request, *, timeout):
                 if request.get_method() == "GET":
+                    if request.full_url.endswith("/api/v1/maintenance-intake/capabilities"):
+                        raise urllib.error.HTTPError(request.full_url,404,"Synthetic native-only Broker",{},io.BytesIO(b'{}'))
                     response = io.BytesIO(json.dumps(base.capability()).encode())
                     response.status = 200; response.geturl = lambda: request.full_url
                     return response

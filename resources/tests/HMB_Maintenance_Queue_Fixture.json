@@ -1,0 +1,353 @@
+{
+  "admission_generation": 1,
+  "execution_revalidation_required": true,
+  "generation_ready": false,
+  "image_syntax": {
+    "client_request_lookup": true,
+    "enabled": false,
+    "max_request_bytes": 67108864,
+    "models": [
+      {
+        "aspect_ratios": [
+          "1:1",
+          "3:2",
+          "2:3",
+          "3:4",
+          "4:3",
+          "4:5",
+          "5:4",
+          "9:16",
+          "16:9",
+          "21:9"
+        ],
+        "credential_ready": false,
+        "defaults": {
+          "image_size": "1K",
+          "output_format": "png",
+          "ratio": "16:9",
+          "task": "text-to-image"
+        },
+        "display_name": "Nano Banana Pro",
+        "enabled": false,
+        "image_sizes": [
+          "1K",
+          "2K",
+          "4K"
+        ],
+        "max_reference_bytes": 12582912,
+        "max_reference_images": 14,
+        "model_id": "gemini-3-pro-image",
+        "option_schema": {
+          "properties": {
+            "temperature": {
+              "default": 1,
+              "label": "Temperature",
+              "maximum": 2,
+              "minimum": 0,
+              "step": 0.1,
+              "type": "number"
+            },
+            "top_p": {
+              "default": 0.95,
+              "label": "Top P",
+              "maximum": 1,
+              "minimum": 0,
+              "step": 0.05,
+              "type": "number"
+            },
+            "use_google_search": {
+              "default": false,
+              "enum": [
+                false
+              ],
+              "label": "Google Search",
+              "type": "boolean"
+            }
+          },
+          "revision": "google-gemini-3-pro-image-options-v1",
+          "schema": "hmb-image-model-options-v1"
+        },
+        "output_formats": [
+          "png"
+        ],
+        "provider": "google",
+        "provider_model": "gemini-3-pro-image",
+        "tasks": [
+          "text-to-image",
+          "image-to-image"
+        ]
+      },
+      {
+        "aspect_ratios": [
+          "1:1",
+          "1:4",
+          "1:8",
+          "2:3",
+          "3:2",
+          "3:4",
+          "4:1",
+          "4:3",
+          "4:5",
+          "5:4",
+          "8:1",
+          "9:16",
+          "16:9",
+          "21:9"
+        ],
+        "credential_ready": false,
+        "defaults": {
+          "image_size": "1K",
+          "output_format": "png",
+          "ratio": "16:9",
+          "task": "text-to-image"
+        },
+        "display_name": "Nano Banana 2",
+        "enabled": false,
+        "image_sizes": [
+          "512",
+          "1K",
+          "2K",
+          "4K"
+        ],
+        "max_reference_bytes": 12582912,
+        "max_reference_images": 14,
+        "model_id": "gemini-3.1-flash-image",
+        "option_schema": {
+          "properties": {
+            "temperature": {
+              "default": 1,
+              "label": "Temperature",
+              "maximum": 2,
+              "minimum": 0,
+              "step": 0.1,
+              "type": "number"
+            },
+            "top_p": {
+              "default": 0.95,
+              "label": "Top P",
+              "maximum": 1,
+              "minimum": 0,
+              "step": 0.05,
+              "type": "number"
+            },
+            "use_google_image_search": {
+              "default": false,
+              "enum": [
+                false
+              ],
+              "label": "Google Image Search",
+              "type": "boolean"
+            },
+            "use_google_search": {
+              "default": false,
+              "enum": [
+                false
+              ],
+              "label": "Google Search",
+              "type": "boolean"
+            }
+          },
+          "revision": "google-gemini-3.1-flash-image-options-v1",
+          "schema": "hmb-image-model-options-v1"
+        },
+        "output_formats": [
+          "png"
+        ],
+        "provider": "google",
+        "provider_model": "gemini-3.1-flash-image",
+        "tasks": [
+          "text-to-image",
+          "image-to-image"
+        ]
+      }
+    ],
+    "persistence_scope": "personal_local",
+    "publish_to_reviews": false,
+    "result_retention_hours": 72,
+    "schema": "hmb-image-generation-capabilities-v1",
+    "version": 1
+  },
+  "mode": "capture",
+  "native_readiness_verified": false,
+  "only_syntax": {
+    "automatic_deletion_enabled": false,
+    "budget_limits_supported": false,
+    "budget_policy": "nonzero_budget_limits_block_generation",
+    "default_management_days": 30,
+    "draft_final_contract": {
+      "client_key_namespace_conflicts_rejected": true,
+      "detail_field": "draft_final",
+      "eligibility_scope": "source_only",
+      "existing_child_has_precedence": true,
+      "expiry_basis": "source_creation_provider_limit",
+      "final_child_detail_state": "not_draft",
+      "final_client_request_id_required": false,
+      "final_client_request_id_rule": "mbx-final-v1-{source_task_hex32}",
+      "projection_scope": "preview_source_detail_only",
+      "requires_generation_enabled": true,
+      "resubmit_allowed": false,
+      "schema": "hmb-only-my-box-draft-final-v1",
+      "source_ttl_seconds": 604800,
+      "states": [
+        "available",
+        "reserved",
+        "running",
+        "completed",
+        "expired",
+        "not_draft"
+      ],
+      "version": 1
+    },
+    "draft_final_detail_supported": true,
+    "enabled": false,
+    "generation_enabled": false,
+    "generation_endpoint": "/api/v1/generate/video",
+    "generation_modes": [
+      "only"
+    ],
+    "image_results_included": false,
+    "implemented": true,
+    "management_deadline_disables_media": false,
+    "output_media_types": [
+      "video"
+    ],
+    "preview_generation_enabled": false,
+    "project_source_reuse_enabled": false,
+    "publish_to_reviews": false,
+    "reason_code": "maintenance_queue_only",
+    "schema": "hmb-only-my-box-capabilities-v1",
+    "scope": "personal_my_box",
+    "selection_schema": "hmb-only-my-box-selection-v1",
+    "selection_source": "only_my_box",
+    "source_reference_ttl_seconds": 10800,
+    "version": 1,
+    "web_generation_supported": true,
+    "workspace": null,
+    "workspace_management_enabled": true
+  },
+  "operations": [
+    "video",
+    "only",
+    "image",
+    "draft_final"
+  ],
+  "principal": {
+    "id": 7,
+    "username": "fixture-member"
+  },
+  "project_routing": {
+    "generation_project_selection_schema": "hmb-imageasset-project-selection-v1",
+    "generation_project_selection_schemas": [
+      "hmb-imageasset-project-selection-v1",
+      "hmb-only-project-selection-v1"
+    ],
+    "project_ids": [
+      "dinoster5",
+      "katuri8",
+      "superwings12"
+    ],
+    "projects": [
+      {
+        "project_id": "dinoster5",
+        "project_name": "다이노스터"
+      },
+      {
+        "project_id": "katuri8",
+        "project_name": "까투리8"
+      },
+      {
+        "project_id": "superwings12",
+        "project_name": "슈퍼윙즈12"
+      }
+    ],
+    "schema": "hmb-project-routing-v1"
+  },
+  "queue_only": true,
+  "schema": "hmb-maintenance-queue-only-capabilities-v1",
+  "source_instance": "fixture-source-01",
+  "version": 1,
+  "video_models": [
+    {
+      "model": "doubao-seedance-2-0-260128",
+      "provider": "volcengine_ark"
+    },
+    {
+      "model": "doubao-seedance-2-0-fast-260128",
+      "provider": "volcengine_ark"
+    },
+    {
+      "model": "doubao-seedance-2-5-260628",
+      "provider": "volcengine_ark"
+    }
+  ],
+  "video_syntax": {
+    "generation_mode_metadata": {
+      "choices": [
+        "only",
+        "shot"
+      ],
+      "field": "hmb_generation_mode",
+      "schema": "hmb-generation-mode-v1",
+      "task_field": "hmb_generation_task",
+      "tasks": [
+        "Text Only",
+        "First/Last Frame",
+        "Reference to Video",
+        "Video Editing",
+        "Video Extension"
+      ]
+    },
+    "generation_shot_metadata": {
+      "enabled": true,
+      "field": "hmb_shot",
+      "schema": "hmb-generation-shot-metadata",
+      "version": 1
+    },
+    "models": {
+      "doubao-seedance-2-5-260628": {
+        "draft": {
+          "final_resolution": "1080p",
+          "preview_resolution": "480p",
+          "source_reference": "broker_job_id",
+          "source_ttl_seconds": 604800
+        },
+        "draft_final_resolution": "1080p",
+        "draft_generation": true,
+        "draft_output_formats": [
+          "mp4",
+          "mov"
+        ],
+        "draft_preview_resolution": "480p",
+        "draft_source_reference": "broker_job_id",
+        "draft_source_ttl_seconds": 604800,
+        "output_formats": [
+          "mp4",
+          "mov"
+        ],
+        "return_last_frame": true,
+        "tasks": [
+          "text_to_video",
+          "first_last_frame",
+          "reference_to_video",
+          "video_editing",
+          "video_extension"
+        ]
+      }
+    },
+    "schema": "hmb-seedance-generation-capabilities",
+    "version": 3
+  },
+  "workspace_intent": {
+    "created_at": 0,
+    "scope": "personal_my_box",
+    "selection": {
+      "explicit_selection": true,
+      "schema": "hmb-only-my-box-selection-v1",
+      "scope": "personal_my_box",
+      "selection_source": "only_my_box",
+      "version": 1,
+      "workspace_id": "mbx_b96d87bcaf49735029bf7010927b6b73"
+    },
+    "workspace_id": "mbx_b96d87bcaf49735029bf7010927b6b73"
+  }
+}

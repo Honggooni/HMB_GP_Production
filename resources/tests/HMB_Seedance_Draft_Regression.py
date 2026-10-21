@@ -87,6 +87,9 @@ class FakeBridge:
 
     def _authenticated_capability_bridge(self):
         bridge = t._HMBAIBrokerBridge(server_url=self.server_url)
+        # This seam injects only a native capability document, not an HTTP
+        # server. Maintenance discovery is exercised by its own wire fixture.
+        bridge.queue_admission = mock.Mock(return_value=None)
 
         def capability_request(method, path, **kwargs):
             if method != "GET":
@@ -224,6 +227,10 @@ class Node(t.HMBSeedanceGeneration):
 
 
 class DraftTests(unittest.TestCase):
+    def setUp(self):
+        native = mock.patch.object(t._HMBAIBrokerBridge, "queue_admission", return_value=None)
+        native.start(); self.addCleanup(native.stop)
+
     def tearDown(self):
         while TEMPORARIES:
             TEMPORARIES.pop().cleanup()

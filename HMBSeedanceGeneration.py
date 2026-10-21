@@ -26,7 +26,7 @@ import urllib.request
 import webbrowser
 import weakref
 from collections.abc import Iterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
 from copy import copy, deepcopy
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -121,6 +121,8 @@ from _hmb_mp4_verify import (
 import _hmb_shot_routing as _shot_routing
 import _hmb_review as _review
 import _hmb_broker_config as _broker_config
+import _hmb_my_box_node as _my_box_node
+import _hmb_reference_leases as _reference_leases
 from _hmb_image_limits import inspect_seedance_image_payload
 from _hmb_project import PROJECTS, project_from_asset_payload, resolve_project
 from _hmb_build_diagnostics import get_build_diagnostics as _get_build_diagnostics
@@ -798,7 +800,7 @@ def _seedance_refresh_command_value(value: Any = None) -> dict[str, Any]:
     }
     if action in {"finalize_draft", "cancel_draft_final"}:
         expected = source.get("expected_draft_job_id")
-        if not isinstance(expected, str) or re.fullmatch(r"job-[0-9a-f]{32}", expected) is None:
+        if not isinstance(expected, str) or re.fullmatch(r"job-(?:mybox-)?[0-9a-f]{32}", expected) is None:
             result.update(action="", action_id="")
         else:
             result["expected_draft_job_id"] = expected
@@ -1078,6 +1080,7 @@ def _seedance_recovery_value(value: Any = None) -> dict[str, Any]:
         "output_file": output_file,
         "broker_server_url": broker_server_url,
         "generation_origin": _generated_video_origin(source.get("generation_origin")) if task_id else {},
+        "reference_lease_id": _reference_leases.lease_id(source.get("reference_lease_id")) if task_id else "",
     }
     if source.get("draft_action") in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}:
         checkpoint["draft_action"] = source["draft_action"]
@@ -1091,6 +1094,9 @@ def _seedance_recovery_value(value: Any = None) -> dict[str, Any]:
         started = source.get("draft_started_at_ms")
         if type(started) is int and 0 < started < 9_999_999_999_999:
             checkpoint["draft_started_at_ms"] = started
+    if task_id and source.get("queue_only_headers"):
+        import _hmb_queue_admission as queue
+        checkpoint["queue_only_headers"] = queue.identity(source["queue_only_headers"])
     draft_source = _seedance_draft_source_value(source.get("draft_source"))
     if draft_source:
         checkpoint["draft_source"] = draft_source
@@ -2554,6 +2560,77 @@ class _HMBAIBrokerBridge:
         self._generation_mode_metadata_capability: dict[str, frozenset[str]] = {}
         self._generation_shot_metadata_supported = False
         self._generation_mode_metadata_checked_at: float | None = None
+        # Private transport evidence only. Neither bearer digests nor response
+        # proofs enter parameters, checkpoints, journals or public JSON.
+        self._reference_auth_lock = threading.RLock()
+        self._reference_auth_digest = ""
+        self._reference_auth_epoch = 0
+        self._reference_verified_epoch = -1
+        self._reference_account_fingerprint = ""
+        self._reference_response_proofs: dict[int, tuple[Any, int, str]] = {}
+        self._queue_admission_binding = None
+        self._queue_admission_checked_epoch = None
+
+    def queue_admission(self, *, timeout: float = 15, refresh: bool = False) -> Any:
+        """Discover queue acceptance without asserting renderer/key readiness."""
+        import _hmb_queue_admission as queue
+        with self._reference_auth_lock:
+            self._load_access_token()
+            binding = getattr(self, "_queue_admission_binding", None)
+            if binding is not None and not refresh:
+                self._queue_admission_headers(binding[0], next(iter(binding[0].operations)))
+                return binding[0]
+            if not refresh and getattr(self, "_queue_admission_checked_epoch", None) == self._reference_auth_epoch:
+                return None
+            self._queue_admission_binding = None
+            checked_epoch = self._reference_auth_epoch
+        try:
+            raw = self._request_json("GET", queue.PATH, payload=None, timeout=timeout)
+        except _BrokerError as exc:
+            if exc.status_code in (404, 405, 501):
+                with self._reference_auth_lock:
+                    if checked_epoch == self._reference_auth_epoch:
+                        self._queue_admission_checked_epoch = checked_epoch
+                return None  # Older native Brokers do not implement this opt-in.
+            raise
+        admission = queue.parse(raw)
+        if admission is None:
+            with self._reference_auth_lock:
+                if checked_epoch == self._reference_auth_epoch:
+                    self._queue_admission_checked_epoch = checked_epoch
+            return None
+        with self._reference_principal_scope(raw) as principal:
+            verified = bool(principal)
+        if not verified:
+            # Image Run may not have needed Connect yet. Only /api/me proves
+            # the credential owner; never trust a principal supplied by a UI.
+            self._request_json("GET", "/api/me", payload=None, timeout=timeout)
+            raw = self._request_json("GET", queue.PATH, payload=None, timeout=timeout)
+            admission = queue.parse(raw)
+            if admission is None:
+                return None
+        with self._reference_principal_scope(raw) as principal:
+            expected = _reference_leases.principal_fingerprint({"id": admission.principal_id}, self.server_url)
+            if not principal or principal != expected:
+                raise queue.QueueAdmissionError("Maintenance admission belongs to another credential owner.")
+            self._queue_admission_binding = (admission, self._reference_auth_epoch, principal, self.server_url, self)
+        return admission
+
+    def _queue_admission_headers(self, admission: Any, operation: str) -> dict[str, str]:
+        import _hmb_queue_admission as queue
+        with self._reference_auth_lock:
+            self._load_access_token()
+            binding = getattr(self, "_queue_admission_binding", None)
+            if (binding is None or binding[0] is not admission or binding[1] != self._reference_auth_epoch
+                    or binding[2] != self._reference_account_fingerprint or binding[3] != self.server_url or binding[4] is not self
+                    or self._reference_verified_epoch != self._reference_auth_epoch):
+                raise queue.QueueAdmissionError("Maintenance admission authentication changed. Refresh before submitting.")
+            admission.require(operation)
+            return admission.headers
+
+    def _queue_syntax(self, path: str, *, name: str, timeout: float) -> dict[str, Any]:
+        admission = self.queue_admission(timeout=timeout)
+        return admission.profile(name) if admission is not None else self._request_json("GET", path, payload=None, timeout=timeout)
 
     @property
     def server_url(self) -> str:
@@ -2586,7 +2663,10 @@ class _HMBAIBrokerBridge:
             return
         if schema != ONLY_PROJECT_SELECTION_SCHEMA:
             raise _BrokerProtocolError("The generation project selection schema is unsupported.")
-        capabilities = self.review_capabilities()
+        admission = self.queue_admission(timeout=timeout)
+        if admission is not None:
+            self._queue_admission_headers(admission, "only")
+        capabilities = {"project_routing": admission.profile("project_routing")} if admission is not None else self.review_capabilities()
         routing = capabilities.get("project_routing")
         supported = routing.get("generation_project_selection_schemas") if isinstance(routing, dict) else None
         if (not isinstance(supported, list) or not supported
@@ -2683,19 +2763,85 @@ class _HMBAIBrokerBridge:
         return {"items": rows, "has_more": True}
 
     def _load_access_token(self) -> str:
-        try:
-            return _broker_load_token(server_url=self.server_url)
-        except _BrokerAuthenticationError:
-            # A corrupt or rejected scoped credential is never overwritten by
-            # the old login. Only a previously unconfigured official gateway
-            # may verify and adopt the existing user's protected token.
-            if (self.server_url != _BROKER_LEGACY_AUTH_GATEWAY
-                    or _broker_token_path(server_url=self.server_url).exists()):
+        with self._reference_auth_lock:
+            try:
+                try:
+                    token = _broker_load_token(server_url=self.server_url)
+                except _BrokerAuthenticationError:
+                    # A corrupt or rejected scoped credential is never overwritten by
+                    # the old login. Only a previously unconfigured official gateway
+                    # may verify and adopt the existing user's protected token.
+                    if (self.server_url != _BROKER_LEGACY_AUTH_GATEWAY
+                            or _broker_token_path(server_url=self.server_url).exists()):
+                        raise
+                    token = _broker_migrate_legacy_gateway_token(server_url=self.server_url)
+            except Exception:
+                self._forget_reference_auth()
                 raise
-            return _broker_migrate_legacy_gateway_token(server_url=self.server_url)
+            digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+            if digest != self._reference_auth_digest:
+                self._forget_reference_auth()
+                self._reference_auth_digest = digest
+            return token
 
     def _clear_access_token(self) -> None:
-        _broker_clear_token(server_url=self.server_url)
+        with self._reference_auth_lock:
+            self._forget_reference_auth()
+            _broker_clear_token(server_url=self.server_url)
+
+    def _forget_reference_auth(self) -> None:
+        with self._reference_auth_lock:
+            self._reference_auth_epoch += 1
+            self._reference_auth_digest = ""
+            self._reference_verified_epoch = -1
+            self._reference_account_fingerprint = ""
+            self._reference_response_proofs.clear()
+            self._queue_admission_binding = None
+            self._queue_admission_checked_epoch = None
+
+    def _reference_auth_response(self, response: dict[str, Any], epoch: int, *, account: bool = False) -> dict[str, Any]:
+        """Keep evidence beside the exact response object, never inside it."""
+        with self._reference_auth_lock:
+            if epoch != self._reference_auth_epoch or not self._reference_auth_digest:
+                return response
+            if account:
+                principal = _reference_leases.principal_fingerprint(response, self.server_url)
+                if principal != self._reference_account_fingerprint:
+                    self._reference_response_proofs.clear()
+                    self._queue_admission_binding = None
+                    self._queue_admission_checked_epoch = None
+                self._reference_account_fingerprint = principal
+                self._reference_verified_epoch = epoch if principal else -1
+            principal = self._reference_account_fingerprint
+            if principal and self._reference_verified_epoch == epoch:
+                self._reference_response_proofs[id(response)] = (response, epoch, principal)
+                # Strong object identity prevents id reuse; bounded retention
+                # makes old/evicted responses conservative cleanup holds.
+                while len(self._reference_response_proofs) > 16:
+                    self._reference_response_proofs.pop(next(iter(self._reference_response_proofs)))
+        return response
+
+    @contextmanager
+    def _reference_principal_scope(self, response: Any = None) -> Iterator[str]:
+        """Hold auth continuity through lease capture/observation without I/O."""
+        with self._reference_auth_lock:
+            principal = self._reference_account_fingerprint
+            if (not self._reference_auth_digest
+                    or self._reference_verified_epoch != self._reference_auth_epoch):
+                principal = ""
+            if response is not None:
+                proof = self._reference_response_proofs.get(id(response))
+                if (not proof or proof[0] is not response
+                        or proof[1] != self._reference_auth_epoch or proof[2] != principal):
+                    principal = ""
+            yield principal
+
+    def _reference_transfer_response(self, raw: Any, checked: dict[str, Any]) -> dict[str, Any]:
+        """Carry evidence only across an explicit successful private projection."""
+        with self._reference_principal_scope(raw) as principal:
+            if principal:
+                self._reference_auth_response(checked, self._reference_auth_epoch)
+        return checked
 
     @staticmethod
     def _safe_account(value: Any) -> str:
@@ -2860,14 +3006,25 @@ class _HMBAIBrokerBridge:
         timeout: float,
         submission: bool = False,
         idempotency_key: str = "",
+        queue_admission: Any = None,
+        queue_operation: str = "",
     ) -> dict[str, Any]:
         if not path.startswith("/") or path.startswith("//"):
             raise _BrokerProtocolError("FN AI Broker request path is invalid.")
+        if submission and path in {"/api/v1/generate/video", "/api/v1/generate/image"}:
+            import _hmb_queue_admission as queue
+            queue.validate_create(payload, path, queue_operation, queue_only=queue_admission is not None)
         body = None
-        headers = {
-            "Accept": "application/json",
-            "Authorization": "Bearer " + self._load_access_token(),
-        }
+        with self._reference_auth_lock:
+            token = self._load_access_token()
+            reference_auth_epoch = self._reference_auth_epoch
+            queue_headers = {}
+            if queue_admission is not None:
+                if not submission or method.upper() != "POST" or path not in {"/api/v1/generate/video", "/api/v1/generate/image"}:
+                    raise _BrokerProtocolError("Queue admission is restricted to an explicit create request.")
+                queue_headers = self._queue_admission_headers(queue_admission, queue_operation)
+        headers = {"Accept": "application/json", "Authorization": "Bearer " + token}
+        headers.update(queue_headers)
         if idempotency_key:
             if _TASK_ID_PATTERN.fullmatch(idempotency_key) is None:
                 raise _BrokerProtocolError(
@@ -2942,7 +3099,7 @@ class _HMBAIBrokerBridge:
                     in (BROKER_FAILURE_STATUSES | BROKER_CANCELLED_STATUSES | BROKER_EXPIRED_STATUSES)
                 ):
                     terminal_result["_http_status"] = int(exc.code)
-                    return terminal_result
+                    return self._reference_auth_response(terminal_result, reference_auth_epoch)
             message = self._safe_http_error_message(
                     exc, body=error_body, secret=headers["Authorization"][7:]
                 )
@@ -2991,9 +3148,16 @@ class _HMBAIBrokerBridge:
                 submission_outcome_unknown=submission,
             )
         result["_http_status"] = status_code
-        return result
+        return self._reference_auth_response(result, reference_auth_epoch,
+            account=method.upper() == "GET" and path == "/api/me")
 
     def account_snapshot(self, *, connect: bool) -> _BrokerAccountSnapshot:
+        # Only this call's authenticated /api/me response can authorize release
+        # of temporary references. Never reuse a prior account after 401/error.
+        with self._reference_auth_lock:
+            self._reference_account_fingerprint = ""
+            self._reference_verified_epoch = -1
+            self._reference_response_proofs.clear()
         login_result: dict[str, Any] = {}
         me_result: dict[str, Any] = {}
         try:
@@ -3019,6 +3183,8 @@ class _HMBAIBrokerBridge:
             else self._request_json("GET", "/api/me", payload=None, timeout=10)
         )
         account = self._account_from_mapping(me) or account
+        # The transport binds only the principal from this exact /api/me
+        # request's bearer epoch. A late response cannot revive an old account.
         return _BrokerAccountSnapshot("connected", True, account)
 
     @staticmethod
@@ -3171,10 +3337,9 @@ class _HMBAIBrokerBridge:
                       self._seedance_capabilities)
         if capability is None:
             try:
-                response = self._request_json(
-                    "GET",
+                response = self._queue_syntax(
                     BROKER_SEEDANCE_CAPABILITIES_PATH + ("?draft=1" if draft else ""),
-                    payload=None,
+                    name="video_syntax",
                     timeout=max(1.0, min(float(timeout), 30.0)),
                 )
             except Exception as exc:
@@ -3251,8 +3416,8 @@ class _HMBAIBrokerBridge:
         requested_format = str(output_format or "").strip().lower()
         if requested_format not in OUTPUT_FORMAT_CHOICES:
             raise _BrokerProtocolError("Unsupported Seedance Draft output format. No render was submitted.")
-        response = self._request_json(
-            "GET", BROKER_SEEDANCE_CAPABILITIES_PATH + "?draft=1", payload=None,
+        response = self._queue_syntax(
+            BROKER_SEEDANCE_CAPABILITIES_PATH + "?draft=1", name="video_syntax",
             timeout=max(1.0, min(float(timeout), 30.0)),
         )
         profile = response.get("models", {}).get(SEEDANCE_2_5_MODEL_ID) if isinstance(response, dict) and isinstance(response.get("models"), dict) else None
@@ -3295,11 +3460,26 @@ class _HMBAIBrokerBridge:
         payload: dict[str, Any],
         *,
         timeout: float,
+        queue_only_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         if set(payload) - self._ALLOWED_GENERATION_FIELDS:
             raise _BrokerProtocolError(
                 "Seedance Broker payload contained unsupported fields."
             )
+        admission = self.queue_admission(timeout=min(float(timeout), 15))
+        if queue_only_headers is not None:
+            import _hmb_queue_admission as queue
+            expected_headers = queue.identity(queue_only_headers)
+            if admission is None or admission.headers != expected_headers:
+                raise queue.QueueAdmissionError("Maintenance admission changed after the request checkpoint. No create was attempted.")
+        queue_operation = "draft_final" if payload.get("draft_job_id") else "only" if payload.get("project_selection_schema") == ONLY_PROJECT_SELECTION_SCHEMA else "video"
+        queue_kwargs = {}
+        if admission is not None:
+            self._queue_admission_headers(admission, queue_operation)
+            queue_kwargs = {"queue_admission": admission, "queue_operation": queue_operation}
+            models = json.loads(admission._document).get("video_models")
+            if not isinstance(models, list) or {"provider": "volcengine_ark", "model": payload.get("model")} not in models:
+                raise _BrokerProtocolError("This maintenance queue does not advertise the selected video model.")
         request_payload = {
             key: value
             for key, value in payload.items()
@@ -3345,9 +3525,16 @@ class _HMBAIBrokerBridge:
                 timeout=min(float(timeout), 30.0),
                 output_format=str(request_payload.get("output_format", DEFAULT_OUTPUT_FORMAT)),
             )
+            if admission is not None:
+                state = self._request_json("GET", self._review_task_path(draft_source) + "/draft-final", payload=None, timeout=min(timeout, 15))
+                if (state.get("source_task_id") != draft_source or state.get("owner_user_id") != admission.principal_id
+                        or state.get("state") != "available" or state.get("eligible") is not True or state.get("child_task_id")
+                        or type(state.get("expires_at")) is not int or time.time() >= state["expires_at"]
+                        or any(state.get(k) != request_payload[k] for k in ("project_id", "project_name") if k in request_payload)):
+                    raise _BrokerProtocolError("Draft Final source is unavailable, expired or already reserved. Retrieve the same Task.")
             return self._request_json("POST", "/api/v1/generate/video", payload=request_payload, timeout=timeout,
                                       submission=True,
-                                      idempotency_key=str(request_payload.get("client_request_id") or ""))
+                                      idempotency_key=str(request_payload.get("client_request_id") or ""), **queue_kwargs)
         if draft:
             if request_payload.get("quality") != "480p" or request_payload.get("resolution") != "480p":
                 raise _BrokerProtocolError("Draft previews require 480p.")
@@ -3445,6 +3632,7 @@ class _HMBAIBrokerBridge:
             timeout=timeout,
             submission=True,
             idempotency_key=client_request_id,
+            **queue_kwargs,
         )
 
     def refresh_job(self, job_id: str, *, timeout: float = 300) -> dict[str, Any]:
@@ -3574,6 +3762,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             tuple[GriptapeCloudStorageDriver, Path]
         ] = []
         self._temporary_tos_video_uploads: list[tuple[Any, str, str]] = []
+        self._hmb_reference_upload_lease_id = ""
         self._submission_outcome_unknown = False
         self._detached_submission_tasks: set[asyncio.Task[Any]] = set()
         self._broker_bridge_instance: _HMBAIBrokerBridge | None = None
@@ -3623,6 +3812,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._hmb_pending_gallery_origin = ""
         self._hmb_processed_generation_command_ids: set[str] = set()
         self._hmb_node_deleted = False
+        self._hmb_my_box_controller_instance = None
+        self._hmb_my_box_parameters_ready = False
         self._hmb_preflight_epoch = 0
         self._hmb_preflight_task = None
         self._hmb_preflight_command_ids: set[str] = set()
@@ -4087,12 +4278,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 allowed_modes={ParameterMode.PROPERTY},
                 traits={Options(choices=[ONLY_PROJECT_UNSELECTED, *(
                     PROJECTS[key]["project_name"] for key in ("superwings12", "katuri8")
-                )])},
+                ), _my_box_node.protocol.MY_BOX_LABEL])},
                 ui_options={"display_name": "Project (Only)", "simple_dropdown": [
-                    ONLY_PROJECT_UNSELECTED, *(PROJECTS[key]["project_name"] for key in ("superwings12", "katuri8"))
+                    ONLY_PROJECT_UNSELECTED, *(PROJECTS[key]["project_name"] for key in ("superwings12", "katuri8")), _my_box_node.protocol.MY_BOX_LABEL
                 ]},
             )
         )
+        # Keep private Only controls beside its explicit selection. The native
+        # status/Broker/recovery footer must remain the final UI children.
+        _my_box_node.install_parameters(self)
         self.add_parameter(
             ParameterString(
                 name="input_mode",
@@ -4762,8 +4956,23 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._claim_generation_recovery_journal(
             _seedance_recovery_value(self.get_parameter_value(SEEDANCE_RECOVERY_PARAMETER))
         )
+        self._hmb_my_box_parameters_ready = True
         self._update_parameter_visibility()
         _shot_routing.schedule_post_registration_reconcile(self)
+
+    def _hmb_my_box_controller(self) -> Any:
+        controller = getattr(self, "_hmb_my_box_controller_instance", None)
+        if controller is None:
+            controller = _my_box_node.MyBoxController(self,
+                broker_factory=getattr(self, "_hmb_my_box_broker_factory", None),
+                journal_root=getattr(self, "_hmb_my_box_journal_root", None))
+            self._hmb_my_box_controller_instance = controller
+        return controller
+
+    def _hmb_my_box_existing_task(self) -> bool:
+        controller = getattr(self, "_hmb_my_box_controller_instance", None)
+        return bool((controller is not None and controller.handles_existing())
+            or str(self.parameter_output_values.get("generation_id") or "").startswith("job-mybox-"))
 
     @staticmethod
     def _shot_uuid(value: Any) -> str:
@@ -5088,6 +5297,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     async def _discard_unsent_generation_checkpoint(self, *, reason: str) -> None:
         """Clear a provisional identity after proving no create call began."""
+        await self._run_blocking_generation_stage(self._reject_unsubmitted_reference_lease)
         self._release_unsubmitted_draft_reservation()
         self.parameter_output_values["generation_id"] = ""
         self.parameter_output_values["generation_status"] = ""
@@ -5142,6 +5352,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         })
 
     def _hmb_generated_video_source_snapshot(self) -> dict[str, Any]:
+        if self._hmb_my_box_controller().current_output_is_private():
+            return {}
         source = _generated_video_source_value(getattr(self, "_hmb_generated_video_source", None))
         if not source:
             source = _generated_video_source_value(
@@ -5153,6 +5365,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     def _restore_completed_video_source_for_lut(self) -> dict[str, Any]:
         """Adopt a saved pre-LUT success, without rendering or downloading again."""
+        if self._hmb_my_box_controller().current_output_is_private():
+            return {}
         if getattr(self, "_hmb_node_deleted", False):
             return {}
         artifact = self.parameter_output_values.get("VIDEO_OUT") or self.parameter_output_values.get("video_url")
@@ -5337,6 +5551,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         ``resume_generation_id`` can never redirect an unresolved paid task.
         """
 
+        if _my_box_node.is_selected(self):
+            checkpoint = self._hmb_my_box_controller().checkpoint()
+            if checkpoint:
+                return str(checkpoint.get("job_id") or checkpoint.get("client_request_id") or "")
+        if self._hmb_my_box_existing_task():
+            return str(self.parameter_output_values.get("generation_id") or "")
         checkpoint = self._generation_recovery_state()
         checkpoint_id = str(checkpoint.get("task_id") or "").strip()
         checkpoint_status = str(checkpoint.get("status") or "").strip().lower()
@@ -5457,6 +5677,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     if stage != "pre_submit" and previous.get("task_id") == task_id
                     else {}
                 ),
+                "reference_lease_id": (
+                    source_params.get("_hmb_reference_upload_lease_id", "") if stage == "pre_submit"
+                    else previous.get("reference_lease_id", "")
+                ),
+                "queue_only_headers": source_params.get("_hmb_queue_only_headers", {}) if stage == "pre_submit" else previous.get("queue_only_headers", {}),
             }
         )
         self.set_parameter_value(
@@ -5726,6 +5951,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     def _record_review_stage(self, phase: str, task_id: str = "") -> None:
         """Observe status transitions without changing recovery or billing authority."""
+        if (_my_box_node.is_selected(self) or task_id.startswith("job-mybox-")
+                or getattr(getattr(self, "_hmb_my_box_controller_instance", None), "_busy", False)):
+            return
         previous = getattr(self, "_hmb_review_stage", "")
         if phase == previous:
             return
@@ -6323,6 +6551,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     def _on_finalize_draft_clicked(self, _button: Any, _details: Any, *, action_id: str = "",
                                    expected_draft_job_id: str = "") -> Any:
         """Capture one exact completed Draft and dispatch only this Generator."""
+        if _my_box_node.is_selected(self):
+            return self._hmb_my_box_controller().schedule_final(_details, expected_draft_job_id)
         reserved_here = False
         try:
             if not self._runtime_node_is_live(require_registered=True):
@@ -6814,6 +7044,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             value.update(channel_uuid=catalog["channel_uuid"], shot_uuid=selected["shot_uuid"],
                          shot_number=selected["number"], shot_name=selected["name"])
         self.metadata = {**dict(getattr(self, "metadata", {}) or {}), SEEDANCE_EXECUTION_MODE_METADATA: value}
+        controller = getattr(self, "_hmb_my_box_controller_instance", None)
+        if controller is not None:
+            controller.invalidate()
 
     def _hmb_seedance_mode_widget_fields(self) -> dict[str, Any]:
         intent = self._hmb_seedance_mode_intent()
@@ -7495,6 +7728,16 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "simple_dropdown": list(OUTPUT_FORMAT_CHOICES),
                 }
             value = raw_format
+        elif param_name == "draft_action" and initial_setup:
+            # Native cold replay can restore Draft before its 480p resolution
+            # and Only selection. A constructor's Off-only visible menu must
+            # not coerce a known saved action to Off before callbacks can run.
+            if not isinstance(value, str) or value not in DRAFT_ACTION_CHOICES:
+                raise ValueError("Unsupported saved Draft action.")
+            draft_parameter = self.get_parameter_by_name("draft_action")
+            if draft_parameter is not None:
+                draft_parameter.ui_options = {**draft_parameter.ui_options,
+                    "simple_dropdown": list(DRAFT_ACTION_CHOICES)}
         elif param_name == "duration":
             # Griptape's Options converter reads ``simple_dropdown`` as the
             # accepted value set. Use the 2.5 superset while storing the raw
@@ -7622,6 +7865,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self._hmb_output_format_initial_setup_seen = True
         if param_name == "return_last_frame" and initial_setup:
             self._hmb_return_last_frame_initial_setup_seen = True
+        if (param_name in {ONLY_PROJECT_PARAMETER, _my_box_node.CHECKPOINT_PARAMETER}
+                and getattr(self, "_hmb_my_box_parameters_ready", False)):
+            # Hydration suppresses after_value_set; selection itself remains
+            # pure and does not contact/create a personal server workspace.
+            self._update_parameter_visibility()
+            if param_name == _my_box_node.CHECKPOINT_PARAMETER and _my_box_node.is_selected(self):
+                self._hmb_my_box_controller().schedule_local_restore()
         if param_name == "output_format" and not initial_setup:
             self._sync_output_filename(str(value))
         if param_name in {"output_file", "last_frame_file"}:
@@ -7772,7 +8022,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             elif (normalized["action"] == "finalize_draft" and action_id and action_id not in processed_ids
                     and self._runtime_node_is_live(require_registered=True)
                     and self._draft_ui_state()["final_available"]
-                    and self._draft_source_record().get("draft_job_id") == normalized.get("expected_draft_job_id")):
+                    and ((self._draft_ui_state().get("job_id") if _my_box_node.is_selected(self)
+                          else self._draft_source_record().get("draft_job_id")) == normalized.get("expected_draft_job_id"))):
                 self._hmb_pending_generation_command_id = action_id
                 self._hmb_pending_generation_command_action = "finalize_draft"
             elif (normalized["action"] == "cancel_draft_final" and action_id and action_id not in processed_ids
@@ -7897,6 +8148,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     def after_value_set(self, parameter: Parameter, value: Any) -> None:
         """Mirror Standard Seedance media visibility for the selected mode."""
+        controller = getattr(self, "_hmb_my_box_controller_instance", None)
+        if controller is not None and parameter.name in {ONLY_PROJECT_PARAMETER, BROKER_SERVER_URL_PARAMETER}:
+            controller.invalidate()
+        if parameter.name == _my_box_node.CHECKPOINT_PARAMETER:
+            if _my_box_node.is_selected(self):
+                self._hmb_my_box_controller().schedule_local_restore()
+            return None
         if parameter.name == SEEDANCE_PREFLIGHT_PARAMETER:
             if not getattr(self, "_hmb_preflight_publishing", False):
                 self._hmb_handle_preflight_command(value)
@@ -7968,6 +8226,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "draft_job_id",
             DRAFT_SOURCE_PARAMETER,
             DRAFT_SOURCES_PARAMETER,
+            ONLY_PROJECT_PARAMETER,
             SHOT_CHANNEL_UUID_PARAMETER,
             SHOT_UUID_PARAMETER,
             SHOT_NUMBER_PARAMETER,
@@ -8592,6 +8851,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self.show_parameter_by_name(ONLY_PROJECT_PARAMETER)
         else:
             self.hide_parameter_by_name(ONLY_PROJECT_PARAMETER)
+        for name in (_my_box_node.TITLE_PARAMETER, _my_box_node.SOURCE_PARAMETER):
+            if self.get_parameter_by_name(name) is not None:
+                (self.show_parameter_by_name if _my_box_node.is_selected(self) else self.hide_parameter_by_name)(name)
         if manual_output_controls:
             self.show_parameter_by_name(["output_format", "return_last_frame"])
         else:
@@ -10730,6 +10992,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         return deepcopy(record)
 
     def _draft_ui_state(self) -> dict[str, Any]:
+        if _my_box_node.is_selected(self):
+            return self._hmb_my_box_controller().draft_ui_state()
         model = str(self.get_parameter_value("model_id") or "")
         supported = MODEL_ID_ALIASES.get(model, model) == SEEDANCE_2_5_MODEL_ID and self._draft_mode_supported()
         resolution = str(self.get_parameter_value("resolution") or "")
@@ -11066,6 +11330,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # Shots. Keep native structural errors global, but recheck HMB render
         # admission at execution and publish this Shot's explicit Skipped result.
         # This record is diagnostic only: a later repaired binding must recover.
+        if _my_box_node.is_selected(self):
+            # Private selection is validated without production project/Agent IO.
+            try:
+                self._hmb_my_box_controller().validate_start()
+            except Exception as exc:
+                self._hmb_local_preflight_failure = self._safe_exception_message(exc)
+            else:
+                self._hmb_local_preflight_failure = ""
+            return
         try:
             self._validate_local_render_preflight()
         except Exception as exc:
@@ -12045,6 +12318,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     close()
 
     def _cleanup_temporary_video_uploads(self) -> None:
+        # Only preparation-local, never-submitted objects remain on these
+        # lists. Accepted/possibly accepted objects belong to a process lease.
         uploads = list(reversed(self._temporary_video_uploads))
         self._temporary_video_uploads = []
         self._delete_temporary_video_uploads(uploads)
@@ -12053,25 +12328,55 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._delete_temporary_tos_video_uploads(tos_uploads)
 
     def _defer_temporary_video_upload_cleanup(self) -> None:
+        """Hold unknown inputs; a timer is not evidence of remote completion."""
         uploads = list(reversed(self._temporary_video_uploads))
         self._temporary_video_uploads = []
         tos_uploads = list(reversed(self._temporary_tos_video_uploads))
         self._temporary_tos_video_uploads = []
-        cleanup_targets = (
-            (self._delete_temporary_video_uploads, uploads, "cloud"),
-            (self._delete_temporary_tos_video_uploads, tos_uploads, "tos"),
-        )
-        for cleanup, pending, label in cleanup_targets:
-            if not pending:
-                continue
-            timer = threading.Timer(
-                AMBIGUOUS_UPLOAD_CLEANUP_DELAY_SECONDS,
-                cleanup,
-                args=(pending,),
-            )
-            timer.name = f"{self.name}-ambiguous-{label}-upload-cleanup"
-            timer.daemon = True
-            timer.start()
+        _reference_leases.hold_unscoped(uploads, tos_uploads)
+
+    def _bind_temporary_reference_lease(self, bridge: Any, origin: str, client_id: str, *, scope: str = "video") -> str:
+        principal_scope = getattr(bridge, "_reference_principal_scope", None)
+        with principal_scope() if callable(principal_scope) else nullcontext("") as principal:
+            identifier = _reference_leases.acquire(origin=origin, principal=principal,
+                client_request_id=client_id, cloud=self._temporary_video_uploads,
+                tos=self._temporary_tos_video_uploads, scope=scope)
+        self._hmb_reference_upload_lease_id = identifier
+        self._hmb_reference_upload_origin = origin
+        self._hmb_reference_upload_bridge = bridge
+        self._hmb_reference_upload_client_id = client_id
+        # Transfer ownership only after the metadata journal is durable.
+        self._temporary_video_uploads = []
+        self._temporary_tos_video_uploads = []
+        return identifier
+
+    def _reject_unsubmitted_reference_lease(self) -> None:
+        uploads, tos = _reference_leases.reject_unsubmitted(getattr(self, "_hmb_reference_upload_lease_id", ""))
+        self._delete_temporary_video_uploads(uploads)
+        self._delete_temporary_tos_video_uploads(tos)
+
+    def _observe_reference_lease(self, response: Any, *, bridge: Any, origin: str, requested_id: str,
+                                 identifier: str = "", private_scope: bool = False) -> None:
+        """Private cleanup only: never restore credentials or publish UI here."""
+        try:
+            if not private_scope:
+                self._normalize_broker_task(response, fallback_job_id=requested_id, server_url=origin)
+            identifier = identifier or getattr(self, "_hmb_reference_upload_lease_id", "")
+            principal_scope = getattr(bridge, "_reference_principal_scope", None)
+            with principal_scope(response) if callable(principal_scope) else nullcontext("") as principal:
+                uploads, tos = _reference_leases.observe(identifier, origin=origin, principal=principal,
+                    requested_id=requested_id, response=response)
+        except (OSError, ValueError, TypeError, _BrokerError):
+            # An unavailable journal or malformed lookup cannot authorize
+            # deletion. The process-owned handles remain held for remote TTL.
+            return
+        self._delete_temporary_video_uploads(uploads)
+        self._delete_temporary_tos_video_uploads(tos)
+
+    def _observe_reference_lease_response(self, response: Any, bridge: Any, origin: str,
+                                        requested_id: str, identifier: str) -> None:
+        self._observe_reference_lease(response, bridge=bridge, origin=origin,
+            requested_id=requested_id, identifier=identifier)
 
     def _build_broker_payload(self, params: dict[str, Any]) -> dict[str, Any]:
         """Map the HMB media contract to the FN AI Broker Seedance schema."""
@@ -12336,6 +12641,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "status": status,
             "broker_status": str(raw_status or status).strip().lower(),
         }
+        task.update(_reference_leases.safe_queue_fields(response))
         error_code = str(response.get("error_code") or "").strip().lower()
         if _BROKER_PUBLIC_CODE_PATTERN.fullmatch(error_code):
             task["error_code"] = error_code
@@ -12438,6 +12744,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "resubmit_allowed",
             "recovery_action",
             "provider_task_registered",
+            "maintenance_queued",
+            "maintenance_state",
+            "submission_outcome_unknown",
         ):
             if name in task:
                 provider_response[name] = task[name]
@@ -13118,6 +13427,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         cancel_before_start = threading.Event()
         submission_started = False
         submission_prompt = getattr(self, "_hmb_agent_submission_prompt", None)
+        reference_lease = getattr(self, "_hmb_reference_upload_lease_id", "")
+        reference_origin = getattr(self, "_hmb_reference_upload_origin", "")
+        reference_bridge = getattr(self, "_hmb_reference_upload_bridge", None)
+        reference_client = getattr(self, "_hmb_reference_upload_client_id", "")
 
         def invoke_paced_submission() -> Any:
             nonlocal submission_started
@@ -13162,7 +13475,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             try:
                 # Capability refreshes happen here. The transport additionally
                 # paces actual POSTs and rechecks this native run after waits.
-                return function(*args, **kwargs)
+                result = function(*args, **kwargs)
+                self._observe_reference_lease(result, bridge=reference_bridge,
+                    origin=reference_origin, requested_id=reference_client, identifier=reference_lease)
+                return result
             finally:
                 _BROKER_NATIVE_SUBMISSION_CONTEXT.callbacks = previous
 
@@ -13759,6 +14075,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     async def _refresh_async(self) -> None:
         """Refresh one Broker job without ever creating a replacement task."""
+        if _my_box_node.is_selected(self) or self._hmb_my_box_existing_task():
+            await self._hmb_my_box_controller().run(refresh=True)
+            return
         if not self._runtime_node_is_live(require_registered=True):
             return
         # A running generation already owns automatic polling.  Mixing a
@@ -13859,6 +14178,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             # authoritative task identity and must replace the provisional
             # recovery identity.
             generation_id = resolved_generation_id
+            await self._run_blocking_generation_stage(self._observe_reference_lease_response,
+                response, bridge, broker_origin, requested_generation_id,
+                recovery_contract.get("reference_lease_id", ""))
             if preserve_local_success:
                 operation_phase = "local_validation"
                 if await self._reuse_saved_generation_result(generation_id, recovery_contract):
@@ -14169,6 +14491,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # abort cleanly without leaving a live node that has surrendered Shot
         # ownership.
         self._discard_dangling_owned_list_connections_before_delete()
+        controller = getattr(self, "_hmb_my_box_controller_instance", None)
+        if controller is not None:
+            controller.invalidate(deleted=True)
         if not bool(getattr(self, "_hmb_node_deleted", False)):
             self._hmb_node_deleted = True
             draft_status_future = getattr(self, "_hmb_draft_final_status_future", None)
@@ -14211,6 +14536,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             {} if str(self.get_parameter_value("resume_generation_id") or "").strip()
             else self._capture_generated_video_origin()
         )
+        self._hmb_reference_upload_lease_id = self._generation_recovery_state().get("reference_lease_id", "")
         await self._run_blocking_generation_stage(
             self._cleanup_temporary_video_uploads
         )
@@ -14349,6 +14675,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             broker_origin = draft_source["broker_server_url"]
         bridge = await self._ensure_broker_connected(server_url=broker_origin)
         params["_hmb_broker_server_url"] = broker_origin
+        if not resume_generation_id:
+            discover_queue = getattr(bridge, "queue_admission", None)
+            admission = await asyncio.to_thread(discover_queue, refresh=True) if callable(discover_queue) else None
+            if admission is not None:
+                selected_project = params.get("_hmb_imageasset_project_selection")
+                operation = "draft_final" if draft_final else "only" if isinstance(selected_project, dict) and selected_project.get("schema") == ONLY_PROJECT_SELECTION_SCHEMA else "video"
+                params["_hmb_queue_only_headers"] = bridge._queue_admission_headers(admission, operation)
         if not self._runtime_node_is_live(require_registered=True):
             return
         if draft_final and not resume_generation_id and not isinstance(self, _HMBWebRerenderExecution):
@@ -14514,6 +14847,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
             if not self._runtime_node_is_live(require_registered=True):
                 return
+            params["_hmb_reference_upload_lease_id"] = await self._run_blocking_generation_stage(
+                self._bind_temporary_reference_lease, bridge, broker_origin, client_request_id)
             self._set_broker_task_outputs(
                 {"id": client_request_id, "status": "submitting"},
                 generation_id=client_request_id,
@@ -14548,6 +14883,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self.parameter_output_values["generation_id"] = ""
                 self.parameter_output_values["provider_response"] = None
                 self._release_unsubmitted_draft_reservation()
+                await self._run_blocking_generation_stage(self._reject_unsubmitted_reference_lease)
                 self._clear_generation_recovery_checkpoint()
                 self._set_generation_status(
                     "failed",
@@ -14573,10 +14909,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "Seedance submission was cancelled before the create request started."
                 )
             try:
+                import _hmb_queue_admission as queue
                 response, submission_cancelled = await self._await_submission_result(
                     bridge.generate_seedance,
                     payload,
                     timeout=min(float(timeout), 1200.0),
+                    **({"queue_only_headers": params["_hmb_queue_only_headers"]} if params.get("_hmb_queue_only_headers") else {}),
                 )
                 try:
                     if not isinstance(response, dict):
@@ -14594,6 +14932,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         "Submission could not be confirmed; use Refresh / Retrieve Result.",
                         submission_outcome_unknown=True,
                     ) from exc
+            except queue.QueueAdmissionError:
+                # This local exception can only originate before the HTTP
+                # create boundary. It is never inferred from response JSON.
+                await self._discard_unsent_generation_checkpoint(reason="queue_admission_changed_before_submission")
+                raise
             except _ProjectSelectionChanged:
                 await self._discard_unsent_generation_checkpoint(reason="project_selection_changed_at_submission_gate")
                 raise
@@ -14659,6 +15002,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     # hmb-* value is only this client's idempotency key until a
                     # successful Broker response returns an authoritative job ID.
                     exc.definitive_submission_rejection = True
+                    # A gateway 404/5xx is not storage-release evidence, even
+                    # when the legacy UI classifies that HTTP as a rejection.
+                    if exc.status_code in {400, 401, 403, 409, 413, 422, 429}:
+                        await self._run_blocking_generation_stage(self._reject_unsubmitted_reference_lease)
                     self._release_unsubmitted_draft_reservation()
                     self.parameter_output_values["generation_id"] = ""
                     self.parameter_output_values["provider_response"] = None
@@ -14819,6 +15166,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
             if str(task["id"]) != generation_id and not resolving_client_request:
                 raise _BrokerError("FN AI Broker returned a different task ID.")
+            await self._run_blocking_generation_stage(self._observe_reference_lease_response,
+                response, bridge, broker_origin, requested_generation_id,
+                provisional.get("reference_lease_id", ""))
             if resolving_client_request:
                 # Resume Task ID can explicitly resume the saved client key.
                 # Only its first successful same-key lookup may promote that
@@ -15190,6 +15540,18 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     async def _aprocess_impl(self) -> None:
         if not self._runtime_node_is_live(require_registered=True):
+            return
+        if _my_box_node.is_selected(self):
+            # Never enter production preflight, managed Agent, public recovery
+            # ledger or review publishing for a private Only invocation.
+            self._clear_execution_status()
+            self._hmb_expected_agent_result = None
+            self._hmb_agent_submission_prompt = None
+            self._hmb_managed_agent_request = None
+            self._hmb_project_selection_guard = None
+            raw_model = str(self.get_parameter_value("model_id") or "")
+            await self._hmb_my_box_controller().run(final=(MODEL_ID_ALIASES.get(raw_model, raw_model) == SEEDANCE_2_5_MODEL_ID
+                and self.get_parameter_value("draft_action") == DRAFT_ACTION_FINAL))
             return
         self._clear_execution_status()
         self._hmb_expected_agent_result = None
@@ -15816,6 +16178,7 @@ class _HMBWebRerenderExecution(HMBSeedanceGeneration):
         run._web_parameter_cache[SEEDANCE_RECOVERY_PARAMETER] = _seedance_recovery_value({"journal_id": str(uuid4())})
         run._temporary_video_uploads = []
         run._temporary_tos_video_uploads = []
+        run._hmb_reference_upload_lease_id = ""
         run._detached_submission_tasks = set()
         run._submission_outcome_unknown = False
         run._broker_bridge_instance = bridge

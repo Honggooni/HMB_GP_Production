@@ -39,7 +39,8 @@ if not HOST:
 CHANNEL = "11111111-1111-4111-8111-111111111111"
 PUBLISHER = "22222222-2222-4222-8222-222222222222"
 SHOTS = [dict(shot_uuid=f"33333333-3333-4333-8333-{i:012d}", number=i,
-              name=f"Authored asset {i}", revision=1, selected_source_uids=[]) for i in range(1, 6)]
+              name=f"Authored asset {i}", revision=1,
+              selected_source_uids=[f"import:manager-image-{i}"]) for i in range(1, 6)]
 PROJECT = {"project_id": "katuri8", "project_name": "까투리8"}
 
 
@@ -175,6 +176,8 @@ async def exercise(engine):
         shot_record = self._hmb_managed_agent_request["record"]
         assert shot_record["shot"]["shot_uuid"] == SHOTS[number - 1]["shot_uuid"]
         prepared = self._resolve_exact_shot_generation_inputs(params)
+        assert prepared["reference_images"] == [f"https://fixture.invalid/manager-image-{number}.png"], prepared["reference_images"]
+        assert not prepared["video_references"] and not prepared["reference_audio"]
         exact_finish = finish_manager._hmb_finish_look_shot_snapshot_for(
             channel_uuid=CHANNEL, shot_uuid=SHOTS[number - 1]["shot_uuid"])
         finish_observations.append((number, params["prompt"], prepared, exact_finish,
@@ -209,12 +212,32 @@ async def exercise(engine):
         source = image_module.HMBImageAssetLibrary(name="offline_manager_image")
         source._hmb_initial_catalog_scan_pending = False
         source._hmb_hydration_adopted = True
-        snapshot = dict(schema="hmb-shot-routing-snapshot", version=1, publisher_instance_uuid=PUBLISHER,
-            channel_uuid=CHANNEL, generation=1, project_id=PROJECT["project_id"], shots=deepcopy(SHOTS),
-            ordered_assets=[], media_by_source_uid={})
-        snapshot["metadata_sha256"] = digest({key: snapshot[key] for key in
-            ("channel_uuid", "generation", "project_id", "shots", "ordered_assets")})
-        snapshot["media_sha256"] = digest({"media_descriptors": []})
+        # The current Prompt uses the exact scoped ImageAsset API, which reads
+        # canonical authored state rather than the broad routing snapshot.
+        # Author that real state as well as the media-free discovery fixture;
+        # keep the scoped validation/materialization implementation unmocked.
+        project_root = Path.cwd() / "synthetic-projects" / "Katuri8"
+        project_root.mkdir(parents=True, exist_ok=True)
+        (project_root / "hmb_image_assets.json").write_text('{"assets": []}', encoding="utf-8")
+        source_state = image_module._select_catalog_project(
+            image_module._load_project_catalog(project_root.parent, source._current_state()), project_root)
+        # A bound Shot intentionally uses Reference to Video. Supply one
+        # distinct synthetic URL record per Shot; no URL is fetched because
+        # the existing native model/video boundaries remain offline fixtures.
+        source_state["assets"] = [dict(
+            asset_library_id=f"import:manager-image-{n}", source_uid=f"import:manager-image-{n}",
+            source_kind="user", asset_id=f"manager-actor-{n}", image_name=f"Manager Actor {n}",
+            path=f"https://fixture.invalid/manager-image-{n}.png", selected=True,
+            selection_order=n, import_index=n, connected=True, registered=False,
+            media_ref_kind="url") for n in range(1, 6)]
+        source_state["shot_routing"].update(channel_uuid=CHANNEL,
+            publisher_instance_uuid=PUBLISHER, generation=1,
+            shots=deepcopy(SHOTS), active_shot_uuid=SHOTS[0]["shot_uuid"])
+        # Match the real selection publication, including the native root and
+        # ASSET_OUT projections. process() is intentionally an offline no-op
+        # below, so a widget-only initial_setup write cannot publish them later.
+        source._publish_state(source_state)
+        snapshot = deepcopy(source._hmb_shot_routing_snapshot(CHANNEL, cached_only=True))
         catalog_document = dict(channel_uuid=CHANNEL, generation=1,
             shots=[{key: row[key] for key in ("shot_uuid", "number", "name", "revision")} for row in SHOTS])
         catalog = dict(schema="hmb-shot-routing-catalog", version=1, publisher_instance_uuid=PUBLISHER,
@@ -501,7 +524,9 @@ async def exercise(engine):
         assert manager._hmb_shot_channel_subscription()["shot_number"] == 4
         generators[0].request_cancellation()
         release.set()
-        await asyncio.wait_for(asyncio.gather(first, second), timeout=10)
+        outcomes = await asyncio.wait_for(asyncio.gather(first, second, return_exceptions=True), timeout=10)
+        assert isinstance(outcomes[0], asyncio.CancelledError), outcomes
+        assert outcomes[1] is None, outcomes
         assert [n for kind, n, _ in events if kind == "generation_finished"] == [2], events
         generators[0].clear_cancellation()
         native_mode["block"] = None
@@ -516,6 +541,16 @@ async def exercise(engine):
         policy_payload = agent_module._hmb._load_agent_rule_payload()
         assert policy_payload["final_policy_version"].endswith("v7.0")
         PROJECT.update(project_id="superwings12", project_name="슈퍼윙즈12")
+        project_root = Path.cwd() / "synthetic-projects" / "superwings12"
+        project_root.mkdir(parents=True, exist_ok=True)
+        (project_root / "hmb_image_assets.json").write_text('{"assets": []}', encoding="utf-8")
+        authored_routing = deepcopy(source._current_state()["shot_routing"])
+        authored_images = deepcopy(source._current_state()["assets"])
+        source_state = image_module._select_catalog_project(
+            image_module._load_project_catalog(project_root.parent, source._current_state()), project_root)
+        source_state["assets"] = authored_images
+        source_state["shot_routing"] = dict(authored_routing, generation=2)
+        source._publish_state(source_state)
         snapshot.update(project_id=PROJECT["project_id"], generation=2)
         snapshot["metadata_sha256"] = digest({key: snapshot[key] for key in
             ("channel_uuid", "generation", "project_id", "shots", "ordered_assets")})

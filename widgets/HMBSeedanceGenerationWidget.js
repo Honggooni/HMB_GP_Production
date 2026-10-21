@@ -1296,7 +1296,9 @@ function hmbSeedanceCommandBridgeWidget(container, props) {
         }
         const expectedDraftJobId = text(source.expected_draft_job_id, 160);
         const draftCommand = ["finalize_draft", "cancel_draft_final"].includes(action);
-        if (draftCommand && !/^job-[0-9a-f]{32}$/.test(expectedDraftJobId)) {
+        // This is an identity assertion only. The host separately authorizes
+        // public Shot/Only and owner-private My Box sources before any submit.
+        if (draftCommand && !/^job-(?:mybox-)?[0-9a-f]{32}$/.test(expectedDraftJobId)) {
           throw new Error("Seedance Final requires the displayed completed Draft identity.");
         }
         return latestProps.onChange({

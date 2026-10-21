@@ -4,7 +4,9 @@ import{createRequire}from'node:module';import{fileURLToPath}from'node:url';
 const root=fileURLToPath(new URL('../..',import.meta.url)),require=createRequire(import.meta.url);
 const files=['HMBSeedanceGenerationWidget.js','HMBAgentLibraryWidget.js','HMBPromptLibraryScopedBindingWidget.js','HMBFinishLookLibraryWidget.js','HMBColorLUTLibraryWidget.js','HMBImageAssetLibraryWidget.js','HMBVideoPickerLibraryWidget_v032.js','HMBVideoPickerCommandBridgeWidget_v032.js','HMBImageAssetThumbnailPatchBridgeWidget.js'];
 const hash=v=>crypto.createHash('sha256').update(v).digest('hex');const sources=files.map(f=>fs.readFileSync(path.join(root,'widgets',f),'utf8'));
-const helper=s=>s.slice(s.indexOf('// HMB_NATIVE_DISABLED_ADAPTER_V1_BEGIN'),s.indexOf('// HMB_NATIVE_DISABLED_ADAPTER_V1_END'));
+// Git and the runtime packager canonicalize JS to LF. Compare the same literal
+// across Windows checkouts without changing any adapter behavior assertions.
+const helper=s=>s.slice(s.indexOf('// HMB_NATIVE_DISABLED_ADAPTER_V1_BEGIN'),s.indexOf('// HMB_NATIVE_DISABLED_ADAPTER_V1_END')).replace(/\r\n?/g,'\n');
 for(const s of sources)assert.equal(helper(s),helper(sources[0]),'The bounded module-local lock adapter must remain identical in all nine widgets.');
 let playwright;try{playwright=require('playwright');}catch{playwright=require(path.join(os.homedir(),'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'));}
 const browser=await playwright.chromium.launch({executablePath:process.env.HMB_WIDGET_TEST_BROWSER||'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',headless:true});

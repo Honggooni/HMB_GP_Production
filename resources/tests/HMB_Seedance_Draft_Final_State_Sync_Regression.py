@@ -52,6 +52,9 @@ class Opener:
         self.reply = None
     def open(self, request, timeout=None):
         self.calls.append((request.method, request.selector, timeout))
+        if request.method == "GET" and request.selector == "/api/v1/maintenance-intake/capabilities":
+            import urllib.error
+            raise urllib.error.HTTPError(request.full_url, 404, "Synthetic native-only Broker", {}, io.BytesIO(b'{}'))
         if request.method != "GET":
             raise AssertionError("State synchronization must never write or create")
         reply = self.reply(request) if callable(self.reply) else self.reply

@@ -60,6 +60,8 @@ def command(project="superwings12"):
 
 class ProjectRegression(unittest.TestCase):
     def setUp(self):
+        native = patch.object(generator._HMBAIBrokerBridge, "queue_admission", return_value=None)
+        native.start(); self.addCleanup(native.stop)
         temporary = tempfile.TemporaryDirectory(prefix="hmb-project-routing-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)

@@ -138,13 +138,13 @@ async def verify_bad_create(response):
     item._preflight_output_destination = lambda *args: None
     item._build_broker_payload = lambda params: {}
     def prepare(params):
-        item._temporary_video_uploads = ["cloud-reference"]
-        item._temporary_tos_video_uploads = ["tos-reference"]
+        item._temporary_video_uploads = [(SimpleNamespace(delete_file=mock.Mock()), Path("artifact_url_storage/fixture/reference.mov"))]
+        item._temporary_tos_video_uploads = [(SimpleNamespace(delete_object=mock.Mock(), close=mock.Mock()), "fixture-bucket", "hmb-seedance-temp/reference.mov")]
         return params
     item._prepare_video_references_for_run = prepare
     item._delete_temporary_video_uploads = mock.Mock()
     item._delete_temporary_tos_video_uploads = mock.Mock()
-    bridge = SimpleNamespace(generate_seedance=mock.Mock(return_value=response))
+    bridge = SimpleNamespace(generate_seedance=mock.Mock(return_value=response), _reference_account_fingerprint="offline-stable-principal")
     item._ensure_broker_connected = mock.AsyncMock(return_value=bridge)
     timers = []
     def timer(delay, callback, args):
@@ -165,11 +165,10 @@ async def verify_bad_create(response):
     assert item._generation_recovery_blocks_new_submission()
     assert item._hmb_generation_preview_state["action"] == "refresh_existing"
     assert bridge.generate_seedance.call_count == 1
-    assert len(timers) == 2
-    assert all(timer.delay == target.AMBIGUOUS_UPLOAD_CLEANUP_DELAY_SECONDS and timer.start.call_count == 1 for timer in timers)
+    assert timers == []
     assert all(not call.args[0] for call in item._delete_temporary_video_uploads.call_args_list)
     assert all(not call.args[0] for call in item._delete_temporary_tos_video_uploads.call_args_list)
-    assert {timer.args[0][0] for timer in timers} == {"cloud-reference", "tos-reference"}
+    assert target._reference_leases.pending_metadata(checkpoint["reference_lease_id"])["unresolved"] is True
     # Reopening retains the same client key. Refresh may promote this key to a
     # confirmed terminal Broker ID, never replay the create request.
     reopened = node()

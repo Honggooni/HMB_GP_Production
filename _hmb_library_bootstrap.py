@@ -60,6 +60,7 @@ except ImportError:
 
 _LIBRARY_NAME = "HMB_GP_Production"
 _NODE_TYPE = "HMBSeedanceGeneration"
+_IMAGE_NODE_TYPE = "HMBImageGeneration"
 _PROMPT_NODE_TYPE = "HMBPromptLibrary"
 _AGENT_NODE_TYPE = "HMBAgentLibrary"
 _FINISH_NODE_TYPE = "HMBFinishLookLibrary"
@@ -1319,7 +1320,7 @@ class _Registration:
             return prompt_failure
         if (
             type(request) is not CreateNodeRequest
-            or request.node_type != _NODE_TYPE
+            or request.node_type not in (_NODE_TYPE, _IMAGE_NODE_TYPE)
             or request.specific_library_name not in (None, _LIBRARY_NAME)
             or request.override_parent_flow_name is not None
             or request.initial_setup is not False

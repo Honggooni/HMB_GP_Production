@@ -1,4 +1,4 @@
-"""Only's two active choices without changing historical project identities.
+"""Only's two active projects and separate personal My Box choice.
 
 The existing synthetic graph imports the actual Generator implementation.
 No account token, live API, provider request, user workflow or media is used.
@@ -16,10 +16,11 @@ TESTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TESTS))
 import HMB_Seedance_Only_Project_Selection_Regression as fixture
 from _hmb_project import PROJECTS, resolve_project
+from _hmb_my_box import MY_BOX_LABEL
 
 t, Graph, Node = fixture.t, fixture.Graph, fixture.Node
 ACTIVE = ("superwings12", "katuri8")
-EXPECTED_CHOICES = [t.ONLY_PROJECT_UNSELECTED, *(PROJECTS[key]["project_name"] for key in ACTIVE)]
+EXPECTED_CHOICES = [t.ONLY_PROJECT_UNSELECTED, *(PROJECTS[key]["project_name"] for key in ACTIVE), MY_BOX_LABEL]
 
 
 class OnlyActiveProjects(unittest.TestCase):
@@ -54,7 +55,10 @@ class OnlyActiveProjects(unittest.TestCase):
         self.assertEqual(len(traits), 1)
         self.assertEqual(list(traits[0].choices), EXPECTED_CHOICES)
         self.assertEqual(node.get_parameter_value(t.ONLY_PROJECT_PARAMETER), t.ONLY_PROJECT_UNSELECTED)
-        self.assertEqual(EXPECTED_CHOICES, ["Select Project", "슈퍼윙즈12", "까투리8"])
+        self.assertEqual(EXPECTED_CHOICES, ["Select Project", "슈퍼윙즈12", "까투리8", "My Box"])
+        self.assertEqual(EXPECTED_CHOICES.count(MY_BOX_LABEL), 1)
+        self.assertNotIn(MY_BOX_LABEL, PROJECTS)
+        self.assertFalse(any(row["project_name"] == MY_BOX_LABEL for row in PROJECTS.values()))
 
     def test_saved_active_ids_names_and_supported_aliases_resolve_without_network(self):
         aliases = {"superwings12": ("superwings12", "슈퍼윙즈12", "슈퍼윙스12", "Super Wings 12"),

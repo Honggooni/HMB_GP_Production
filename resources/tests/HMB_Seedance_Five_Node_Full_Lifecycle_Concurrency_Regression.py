@@ -122,6 +122,11 @@ class FakeLifecycleBroker(target._HMBAIBrokerBridge):
         self.refresh_count = 0
         self.account_calls = 0
 
+    def queue_admission(self, **kwargs):
+        # This transport deliberately models the established native-only
+        # Broker; its POST barriers remain the lifecycle boundary under test.
+        return None
+
     def account_snapshot(self, *, connect: bool):
         assert connect is True
         self.account_calls += 1

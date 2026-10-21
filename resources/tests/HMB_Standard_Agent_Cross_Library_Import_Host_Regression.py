@@ -27,6 +27,8 @@ parser.add_argument("--case", choices=("canonical-control", "advanced-front", "c
 parser.add_argument("--expect", choices=("native", "unavailable"), default="native")
 parser.add_argument("--advanced-site", type=Path,
                     help="Explicit read-only clone site-packages for pre-install compatibility proof")
+parser.add_argument("--product-root", type=Path,
+                    help="Explicit source/package root; defaults to the installed HMB library")
 parser.add_argument("--report", type=Path)
 args = parser.parse_args()
 assert os.environ.get("HMB_SDK_GUARD_RECEIPT"), "Run through the SDK offline guard"
@@ -34,7 +36,9 @@ assert os.environ.get("HMB_SDK_ISOLATED_ROOT"), "An isolated SDK config root is 
 os.environ.pop("HMB_GRIPTAPE_STANDARD_LIBRARY_PATH", None)
 
 libraries = Path.home() / "Documents/GriptapeNodes/libraries"
-target = libraries / "HMB_GP_Production"
+installed = libraries / "HMB_GP_Production"
+target = (args.product_root or installed).resolve(strict=True)
+assert (target / "HMBAgentLibrary.py").is_file() and (target / "_hmb_common.py").is_file()
 standard = libraries / "griptape-nodes-library-standard"
 advanced = libraries / "griptape-nodes-library-advanced-media"
 standard_site = (standard / ".venv/Lib/site-packages").resolve(strict=True)
@@ -42,7 +46,10 @@ advanced_site = (args.advanced_site or advanced / ".venv/Lib/site-packages").res
 assert advanced_site.is_dir() and (advanced_site / "anthropic/__init__.py").is_file(), \
     "Advanced dependency fixture requires an existing Anthropic package directory"
 assert any(advanced_site.glob("anthropic-*.dist-info/METADATA")), "Anthropic distribution metadata is required"
-hmb_site = (target / ".venv/Lib/site-packages").resolve(strict=True)
+# A pre-install source/package proof changes the code origin only. The edit
+# environment remains the real installed HMB environment, as in the default
+# installed case; a source checkout's developer venv is not an editor venv.
+hmb_site = (installed / ".venv/Lib/site-packages").resolve(strict=True)
 assert str(standard_site) not in sys.path, "Fixture must not externally inject Standard's dependencies"
 assert "anthropic" not in sys.modules, "Fixture requires a fresh dependency cache"
 
@@ -146,6 +153,8 @@ else:
 anthropic = sys.modules.get("anthropic")
 record = {"schema": "hmb-standard-agent-cross-library-import-v1", "passed": True,
           "case": args.case, "expected": args.expect, "native_agent_available": native is not None,
+          "product_root": str(target), "product_root_explicit": args.product_root is not None,
+          "edit_environment_site": str(hmb_site),
           "actual_sdk_module_loader_used": True, "standard_dependencies_externally_injected": False,
           "product_appended_standard_site": True,
           "advanced_site": str(advanced_site), "advanced_site_explicit_clone": args.advanced_site is not None,

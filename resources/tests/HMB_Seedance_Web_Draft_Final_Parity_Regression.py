@@ -100,6 +100,7 @@ class FinalParityTests(unittest.TestCase):
         _, body = self.header_final()
         bridge = t._HMBAIBrokerBridge(server_url=base.ORIGIN)
         with mock.patch.object(bridge, 'require_seedance_draft_features'), \
+             mock.patch.object(bridge, 'queue_admission', return_value=None), \
              mock.patch.object(bridge, '_request_json', return_value={'job_id': base.JOB}) as request:
             bridge.generate_seedance(body, timeout=1)
         self.assertEqual(request.call_args.args[:2], ('POST', '/api/v1/generate/video'))

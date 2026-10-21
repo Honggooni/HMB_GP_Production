@@ -10,6 +10,7 @@ import types
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -77,6 +78,66 @@ class ColorLUTUploadRegression(unittest.TestCase):
                 "display_name": "HMB Color LUT", "source_kind": "HMB Color LUT", "bytes": context["size"], "created": True,
                 **{key: context[key] for key in
                 ("source_task_id", "project_id", "project_name", "channel_uuid", "shot_uuid", "sha256", "shot_name")}}
+
+    def mounted_responses(self, prefix):
+        """The server's broker_path mounts advertised URLs, as well as HTTP."""
+        capability = copy.deepcopy(self.bridge.review_capabilities())
+        capability["color_lut_upload"]["upload_path"] = prefix + "/api/v1/reviews/tasks/{source_task_id}/color-lut"
+        original = self.bridge._request_json
+        def request(method, path, **kwargs):
+            result = copy.deepcopy(original(method, path, **kwargs))
+            if "upload_path" in result:
+                result["upload_path"] = prefix + "/api/v1/reviews/tasks/" + self.source["task_id"] + "/color-lut"
+            return result
+        self.bridge.review_capabilities = lambda: copy.deepcopy(capability)
+        self.bridge._request_json = request
+
+    def test_advertised_paths_accept_only_fixed_or_exact_gateway_mount(self):
+        expected = "/api/v1/reviews/tasks/{source_task_id}/color-lut"
+        for server in ("https://broker.test", "https://broker.test/gateway", "https://broker.test/Company/Gateway/"):
+            prefix = urlsplit(server).path.rstrip("/")
+            for accepted in {expected, prefix + expected}:
+                self.assertTrue(target._advertised_api_path_matches(accepted, expected, server))
+            for bad in (None, 1, {}, [], "https://broker.test" + prefix + expected,
+                        "https://other.test" + expected, "//other.test" + expected,
+                        "/other" + expected, "/gateway2" + expected, prefix + prefix + expected if prefix else "//" + expected,
+                        expected + "?token=fixture", expected + "#fragment", expected + "/",
+                        "/gateway/../gateway" + expected, "/%67ateway" + expected,
+                        expected.replace("/tasks/", "/tasks//"), expected.replace("/api/", "/API/")):
+                with self.subTest(server=server, path=bad):
+                    self.assertFalse(target._advertised_api_path_matches(bad, expected, server))
+        self.assertFalse(target._advertised_api_path_matches(expected, expected, "https://user:fixture@broker.test/gateway"))
+
+    def test_bare_and_mounted_server_responses_prepare_same_shot(self):
+        bare = self.ready()
+        prefix = urlsplit(self.bridge.server_url).path
+        self.mounted_responses(prefix)
+        mounted = self.ready()
+        for key in ("source_task_id", "project_id", "shot_name", "source_revision", "upload_id", "receipt_id"):
+            self.assertEqual(mounted[key], bare[key])
+
+    def test_untrusted_capability_and_eligibility_paths_block_upload(self):
+        expected_cap = "/api/v1/reviews/tasks/{source_task_id}/color-lut"
+        expected_item = "/api/v1/reviews/tasks/" + self.source["task_id"] + "/color-lut"
+        cap = copy.deepcopy(self.bridge.review_capabilities())
+        request = self.bridge._request_json
+        for prefix, suffix in (("/other", ""), ("/gateway/gateway", ""), ("https://evil.test", ""),
+                               ("https://broker.test/gateway", ""), ("/gateway", "?extra=1"), ("/gateway", "#fragment")):
+            changed = copy.deepcopy(cap)
+            changed["color_lut_upload"]["upload_path"] = prefix + expected_cap + suffix
+            with self.subTest(stage="capability", prefix=prefix, suffix=suffix), \
+                 mock.patch.object(self.bridge, "review_capabilities", return_value=changed):
+                with self.assertRaises(ValueError):
+                    self.ready()
+            def bad_eligibility(method, path, **kwargs):
+                result = copy.deepcopy(request(method, path, **kwargs))
+                if "upload_path" in result:
+                    result["upload_path"] = prefix + expected_item + suffix
+                return result
+            with self.subTest(stage="eligibility", prefix=prefix, suffix=suffix), \
+                 mock.patch.object(self.bridge, "_request_json", side_effect=bad_eligibility):
+                with self.assertRaises(ValueError):
+                    self.ready()
 
     def test_registered_shot_uses_asset_library_name_not_task_title(self):
         context = self.ready()
@@ -213,6 +274,7 @@ class ColorLUTUploadRegression(unittest.TestCase):
             self.assertFalse(self.node._upload_projection()["enabled"])
 
     def test_wire_contract_streams_file_without_paths_names_or_owner_overrides(self):
+        self.mounted_responses(urlsplit(self.bridge.server_url).path)
         context = self.ready()
         captured = {}
         class Response:
@@ -230,6 +292,7 @@ class ColorLUTUploadRegression(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"HMBSeedanceGeneration": fake_seedance}):
             self.node._upload_request(context, retrieve=False, cancel=threading.Event())
         request, body = captured["request"], captured["body"]
+        self.assertEqual(request.full_url, self.bridge.server_url + "/api/v1/reviews/tasks/" + self.source["task_id"] + "/color-lut")
         self.assertEqual(int(request.get_header("Content-length")), len(body))
         self.assertEqual(request.get_header("Idempotency-key"), context["upload_id"])
         metadata = json.loads(body.split(b"\r\n\r\n", 1)[1].split(b"\r\n--", 1)[0])

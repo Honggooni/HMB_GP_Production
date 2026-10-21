@@ -279,10 +279,10 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.8.19",
+    "library_version": "0.8.23",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
-      "archive_source_count": 45,
+      "archive_source_count": 53,
       "mode": "bundled_signed_dat",
       "runtime_path": "resources/agent/superwings12/hmb_agent_core.dat",
       "policy_version": "2026-10-15.agent-shot-quality.v7.0",
@@ -467,7 +467,7 @@
     "dependencies": {
       "pip_dependencies": [
         "imageio-ffmpeg==0.6.0",
-        "Pillow==12.3.0",
+        "Pillow>=12.3.0,<14",
         "httpx==0.28.1"
       ]
     }
@@ -670,6 +670,27 @@
       }
     },
     {
+      "class_name": "HMBImageGeneration",
+      "file_path": "HMBImageGeneration.py",
+      "metadata": {
+        "category": "HMB_GP_Production",
+        "description": "Personal image generation through FN AI Broker with a provider-neutral single model selector, native preview, local save and image output. No project or Shot binding and no web work-management publication. Nano Banana is the first model family; provider credentials remain on the Broker.",
+        "display_name": "HMB Image Generation",
+        "icon": "Image",
+        "group": "create",
+        "tags": [
+          "image",
+          "generation",
+          "HMB",
+          "fn-ai-broker",
+          "native-image-preview",
+          "personal-local",
+          "no-web-publication",
+          "server-managed-provider-credentials"
+        ]
+      }
+    },
+    {
       "class_name": "HMBSeedanceGeneration",
       "file_path": "HMBSeedanceGeneration.py",
       "metadata": {
@@ -804,6 +825,11 @@
       "name": "HMBImageAssetThumbnailPatchBridgeWidget",
       "path": "widgets/HMBImageAssetThumbnailPatchBridgeWidget.js",
       "description": "Hidden compact request/result transport for ImageAsset thumbnail hydration; persistent catalog and Shot authority remain in HMBImageAssetLibraryWidget."
+    },
+    {
+      "name": "HMBImageGenerationWidget",
+      "path": "widgets/HMBImageGenerationWidget.js",
+      "description": "Compact personal HMB Image Generation header using the existing library colors, with native model, prompt, image preview and output controls preserved below."
     },
     {
       "name": "HMBPromptLibraryScopedBindingWidget",

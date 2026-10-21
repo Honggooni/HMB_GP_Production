@@ -3,12 +3,14 @@ from __future__ import annotations
 """Local, post-generation color finishing. Commands never execute upstream nodes."""
 
 import copy
+from collections import Counter
 import contextvars
 import json
 import hashlib
 import logging
 import os
 import re
+import stat
 import subprocess
 import threading
 import tempfile
@@ -16,7 +18,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from HMBFinishLookLibrary import (
     DataNode, _add_parameter, _add_widget_parameter, _hidden_transport_ui_options,
@@ -38,7 +40,25 @@ LOGGER = logging.getLogger("griptape_nodes")
 _PROFILE_LOCK = threading.RLock()
 _UPLOAD_LOCK = threading.RLock()
 _UPLOAD_ACTIVE: set[str] = set()
+_USAGE_LOCK = threading.RLock()
+_USAGE_ACTIVE: set[str] = set()
 COLOR_LUT_UPLOAD_SCHEMA = "hmb-color-lut-upload"
+
+
+def _advertised_api_path_matches(value: Any, expected: str, server_url: str) -> bool:
+    """Accept the fixed API path with at most this Broker's exact mount prefix.
+
+    Advertised paths are validation evidence only. Requests keep using the
+    fixed backend-relative path so the shared Bridge adds the gateway once.
+    """
+    if type(value) is not str:
+        return False
+    from _hmb_broker_config import normalize_broker_base_url
+    try:
+        prefix = urlsplit(normalize_broker_base_url(server_url)).path
+    except (TypeError, ValueError):
+        return False
+    return value == expected or bool(prefix and value == prefix + expected)
 
 
 def _digest(value: Any) -> str:
@@ -91,27 +111,184 @@ def _upload_bridge(origin: str) -> Any:
     return _HMBAIBrokerBridge(server_url=origin)
 
 
+def _usage_bridge(origin: str) -> Any:
+    """Use an existing login only; optional statistics never change that login."""
+    from HMBSeedanceGeneration import _HMBAIBrokerBridge, _broker_load_token
+    bridge = _HMBAIBrokerBridge(server_url=origin)
+    token = _broker_load_token(server_url=bridge.server_url)
+    if not token:
+        return None
+    # A queued observation stays with the same authentication identity even
+    # if another operation changes the active login. No token is persisted here.
+    bridge._load_access_token = lambda: token
+    bridge._clear_access_token = lambda: None
+    return bridge
+
+
+def _usage_record_path(identity: str) -> Path:
+    if re.fullmatch(r"[a-f0-9]{64}", identity) is None:
+        raise ValueError("Invalid LUT usage identity.")
+    return _profiles_path().parent / "usage-events" / (identity + ".json")
+
+
+def _write_usage_record(identity: str, value: dict[str, Any]) -> None:
+    destination = _usage_record_path(identity)
+    _validate_profiles_path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _validate_profiles_path(destination)
+    temporary = destination.with_name(uuid.uuid4().hex + ".tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, sort_keys=True, allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _validate_profiles_path(destination)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_usage_record(identity: str) -> dict[str, Any]:
+    path = _usage_record_path(identity)
+    _validate_profiles_path(path)
+    try:
+        if path.stat().st_size > 16384:
+            raise ValueError("Invalid LUT usage receipt.")
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("Invalid LUT usage receipt.")
+    return value
+
+
+def _verified_export_hash(path: Path, cancel: threading.Event) -> dict[str, Any]:
+    """One bounded streaming read, tied to the verified output file identity."""
+    def identity(info: Any) -> tuple[Any, ...]:
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    before = path.stat()
+    if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+        raise ValueError("Verified export is unavailable.")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        if identity(os.fstat(stream.fileno())) != identity(before):
+            raise ValueError("Export identity changed.")
+        remaining = before.st_size
+        while remaining:
+            if cancel.is_set():
+                raise ValueError("Export observation cancelled.")
+            block = stream.read(min(1024 * 1024, remaining))
+            if not block:
+                raise ValueError("Export identity changed.")
+            digest.update(block)
+            remaining -= len(block)
+        if identity(os.fstat(stream.fileno())) != identity(before):
+            raise ValueError("Export identity changed.")
+    if cancel.is_set() or identity(path.stat()) != identity(before):
+        raise ValueError("Export identity changed.")
+    return {"sha256": digest.hexdigest(), "size": before.st_size, "mtime_ns": before.st_mtime_ns,
+            "device": before.st_dev, "inode": before.st_ino}
+
+
 def _profiles_path() -> Path:
     return Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".local"))) / "HMB_GP_Production" / "color-lut" / "personal-presets.json"
 
 
 def _profiles(value: Any = None) -> list[dict[str, Any]]:
-    return [{"id": str(p.get("id") or uuid.uuid4().hex), "name": str(p["name"])[:80],
-             "project_id": str(p.get("project_id") or ""), "settings": normalize_settings(p.get("settings"))}
-            for p in (value if isinstance(value, list) else []) if isinstance(p, Mapping) and p.get("name")]
+    rows = value if isinstance(value, list) else []
+    ids = Counter(_profile_id(p.get("id")) for p in rows if isinstance(p, Mapping))
+    return [{"id": _profile_id(p.get("id")), "name": str(p["name"])[:80],
+             "project_id": str(p.get("project_id") or ""), "settings": normalize_settings(p.get("settings")),
+             "deletable": _profile_deletable(p) and ids[_profile_id(p.get("id"))] == 1}
+            for p in rows if isinstance(p, Mapping) and p.get("name")]
+
+
+def _profile_id(value: Any) -> str:
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) else ""
+
+
+def _profile_deletable(row: Mapping[str, Any], *, allow_missing_id: bool = False) -> bool:
+    # This file is the current OS user's personal store. Older locally authored
+    # rows have no scope metadata; imported/protected rows must not gain rights
+    # merely because the UI projects only their name and settings.
+    missing_id = row.get("id") in (None, "")
+    if ((not _profile_id(row.get("id")) and not (allow_missing_id and missing_id))
+            or not isinstance(row.get("name"), str)
+            or not row["name"] or len(row["name"]) > 80
+            or not isinstance(row.get("project_id", ""), str)):
+        return False
+    metadata = row.get("metadata")
+    if metadata is not None and not isinstance(metadata, Mapping):
+        return False
+    for fields in (row, metadata or {}):
+        for flag in ("readonly", "read_only", "readOnly", "protected", "is_default", "default", "system", "is_system", "shared", "is_shared", "builtin", "built_in"):
+            if fields.get(flag) not in (None, False, ""):
+                return False
+        if ("deletable" in fields and fields["deletable"] is not True
+                or "user_created" in fields and fields["user_created"] is not True):
+            return False
+        if any(fields.get(key) not in (None, "") for key in ("owner", "owner_id", "owner_user_id", "user_id")):
+            return False  # No cross-account ownership system is inferred locally.
+        if any(key in fields and fields[key] not in ("local_user", "personal", "user") for key in ("scope", "source")):
+            return False
+    return True
+
+
+def _validate_profiles_path(destination: Path) -> None:
+    if not destination.is_absolute():
+        raise ValueError("Personal preset storage must be a local absolute path.")
+    for path in (destination, *destination.parents):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise ValueError("Personal preset storage cannot use a symbolic link or reparse point.")
+
+
+def _read_profile_rows() -> list[Any]:
+    destination = _profiles_path()
+    _validate_profiles_path(destination)
+    try:
+        rows = json.loads(destination.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    if not isinstance(rows, list):
+        raise ValueError("Personal preset storage is invalid; no presets were changed.")
+    return rows
+
+
+def _write_profile_rows(rows: list[Any]) -> None:
+    destination = _profiles_path()
+    _validate_profiles_path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _validate_profiles_path(destination)
+    temp = destination.with_name(f".{uuid.uuid4().hex}.tmp")
+    created = False
+    try:
+        with temp.open("x", encoding="utf-8") as stream:
+            created = True
+            json.dump(rows, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _validate_profiles_path(destination)
+        os.replace(temp, destination)
+    finally:
+        if created:
+            temp.unlink(missing_ok=True)
 
 
 def _read_profiles() -> list[dict[str, Any]]:
     try:
         with _PROFILE_LOCK:
-            return _profiles(json.loads(_profiles_path().read_text(encoding="utf-8")))
+            return _profiles(_read_profile_rows())
     except (OSError, ValueError):
         return _profiles()
 
 
 def default_state() -> dict[str, Any]:
     return {"schema_version": 1, "revision": 0, "language": "ko", "shot": _shot_only(),
-            "shot_catalog": {}, "project_id": "", "project": {}, "preset_name": "", "profiles": _read_profiles(),
+            "shot_catalog": {}, "project_id": "", "project": {}, "preset_name": "", "preset_id": "", "profiles": _read_profiles(),
             "settings": default_settings(), "source": {}, "output": {
                 "codec": "hevc10", "manual_output_enabled": False, "path": ""},
             "status": {"phase": "idle", "message": "", "progress": 0}, "result": {}, "shot_states": {}}
@@ -334,15 +511,154 @@ class HMBColorLUTLibrary(DataNode):
                 "source_node_instance_id": actual["source_node_instance_id"], "source_identity": list(_source_identity(actual)),
                 "source_token": source_token, "route_epoch": route_epoch}
 
+    def _capture_usage_operation(self, state: dict[str, Any]) -> None:
+        from _hmb_broker_config import load_broker_base_url
+        classification = "custom"
+        try:
+            matches = [p for p in _read_profiles() if p["id"] == state.get("preset_id") and p["id"]
+                       and p["project_id"] == state["project_id"] and p["name"] == state.get("preset_name")
+                       and p["deletable"] and p["settings"] == normalize_settings(state["settings"])]
+            if len(matches) == 1:
+                classification = "personal"
+        except Exception:
+            pass
+        origin = load_broker_base_url()
+        try:
+            bridge = _usage_bridge(origin)
+        except Exception:
+            bridge = None
+        state["_usage_export"] = {"operation_id": str(uuid.uuid4()), "preset_classification": classification,
+                                  "origin": origin, "bridge": bridge}
+
+    def _capture_usage_artifact(self, state: dict[str, Any], result: dict[str, Any], cancel: threading.Event) -> dict[str, Any]:
+        captured = state.get("_usage_export")
+        if not isinstance(captured, dict):
+            return {}
+        artifact = _verified_export_hash(Path(result["path"]), cancel)
+        captured["artifact"] = artifact
+        import _hmb_color_lut_usage as usage
+        event = usage.build_event(export_operation_id=captured["operation_id"], stage="local_export",
+            settings=normalize_settings(state["settings"]), codec=state["output"]["codec"],
+            preset_classification=captured["preset_classification"], export_sha256=artifact["sha256"])
+        captured["event"] = event
+        result["usage_collection"] = {"export_operation_id": captured["operation_id"],
+                                     "local_export": {"phase": "pending", "reason": "awaiting_existing_login"}}
+        return event
+
+    def _usage_status(self, operation_id: str, stage: str, phase: str, reason: str) -> None:
+        # Advisory metadata only; never overwrite video success or UI selection.
+        with self._lock:
+            states = [self._hmb_color_lut_state, *self._hmb_color_lut_state["shot_states"].values()]
+            for state in states:
+                if not isinstance(state, dict):
+                    continue
+                result = state.get("result")
+                collection = result.get("usage_collection") if isinstance(result, dict) else None
+                if isinstance(collection, dict) and collection.get("export_operation_id") == operation_id:
+                    collection[stage] = {"phase": phase, "reason": reason}
+        try:
+            self._publish()
+        except Exception:
+            LOGGER.debug("Color LUT optional usage status notification unavailable")
+
+    def _queue_usage_event(self, event: dict[str, Any], origin: str, *, expected_owner: str = "",
+                           captured_bridge: Any = None, captured_login: bool = False) -> None:
+        """Send immutable metadata in the background, at most one POST per scope."""
+        import _hmb_color_lut_usage as usage
+        frozen = usage.validate_event(copy.deepcopy(event))
+        operation, stage = frozen["export_operation_id"], frozen["stage"]
+        def collect() -> None:
+            identity, claimed, sent = "", False, False
+            try:
+                if self._hmb_node_deleted:
+                    self._usage_status(operation, stage, "not_collected", "node_deleted")
+                    return
+                bridge = captured_bridge if captured_login else _usage_bridge(origin)
+                if bridge is None:
+                    self._usage_status(operation, stage, "not_collected", "existing_login_required")
+                    return
+                me = bridge._request_json("GET", "/api/me", payload=None, timeout=5)
+                owner = me.get("id", me.get("user_id", (me.get("user") or {}).get("id")))
+                if type(owner) is not int or owner <= 0 or expected_owner and str(owner) != expected_owner:
+                    self._usage_status(operation, stage, "not_collected", "account_identity_mismatch")
+                    return
+                scope = _digest([bridge.server_url, owner])
+                identity = _digest([operation, stage])
+                with _USAGE_LOCK:
+                    if identity in _USAGE_ACTIVE:
+                        return
+                    _USAGE_ACTIVE.add(identity)
+                    claimed = True
+                    previous = _read_usage_record(identity)
+                    if previous and previous.get("scope_sha256") != scope:
+                        self._usage_status(operation, stage, "not_collected", "account_identity_mismatch")
+                        return
+                    if previous and (previous.get("schema") != "hmb-color-lut-local-usage-v1"
+                                     or type(previous.get("version")) is not int or previous["version"] != 1
+                                     or previous.get("phase") not in {"pending", "complete"}
+                                     or set(previous) != {"schema", "version", "scope_sha256", "phase", "event", *(["receipt"] if previous.get("phase") == "complete" else [])}
+                                     or previous.get("event") != frozen):
+                        raise ValueError("LUT usage record conflict.")
+                    if previous.get("phase") == "complete":
+                        usage.validate_receipt(previous.get("receipt"), frozen)
+                        self._usage_status(operation, stage, "complete", "recorded")
+                        return
+                capabilities = usage.check_capabilities(bridge)
+                if self._hmb_node_deleted:
+                    self._usage_status(operation, stage, "not_collected", "node_deleted")
+                    return
+                durable = {"schema": "hmb-color-lut-local-usage-v1", "version": 1,
+                           "scope_sha256": scope, "phase": "pending", "event": frozen}
+                with _USAGE_LOCK:
+                    if not previous:
+                        _write_usage_record(identity, durable)
+                # Pending is durable before POST. Subsequent attempts only GET
+                # this exact operation and stage, including after a restart.
+                sent = True
+                receipt = (usage.retrieve_event(bridge, frozen) if previous
+                           else usage.submit_event(bridge, frozen, capabilities=capabilities))
+                with _USAGE_LOCK:
+                    _write_usage_record(identity, {**durable, "phase": "complete", "receipt": receipt})
+                self._usage_status(operation, stage, "complete", "recorded")
+            except Exception:
+                self._usage_status(operation, stage, "pending" if sent else "not_collected",
+                                   "same_operation_lookup_required" if sent else "statistics_unavailable")
+                LOGGER.debug("Color LUT optional usage collection deferred")
+            finally:
+                if claimed:
+                    with _USAGE_LOCK:
+                        _USAGE_ACTIVE.discard(identity)
+        threading.Thread(target=contextvars.copy_context().run, args=(collect,), name="HMB LUT usage metadata", daemon=True).start()
+
+    def _queue_web_usage(self, context: dict[str, Any]) -> None:
+        import _hmb_color_lut_usage as usage
+        if not context.get("usage_event"):
+            return  # Older exports have no frozen operation; never invent one.
+        local = usage.validate_event(context["usage_event"])
+        if (local["stage"] != "local_export" or local["export_sha256"] != context["sha256"]
+                or local["settings_sha256"] != context["settings_sha256"]):
+            raise ValueError("Frozen LUT usage identity changed.")
+        event = usage.validate_event({**local, "stage": "web_upload", "source_task_id": context["source_task_id"],
+                                      "upload_idempotency_key": context["upload_id"]})
+        self._queue_usage_event(event, context["server_url"], expected_owner=context["owner_id"])
+
     def _record_export_proof(self, state: dict[str, Any], result: dict[str, Any], cancel: threading.Event) -> None:
         """Private durable receipt, never accepted from browser state."""
         self._upload_graph_context(state)
         path = Path(result["path"]).resolve()
         info = path.stat()
+        captured = state.get("_usage_export")
+        artifact = captured.get("artifact") if isinstance(captured, dict) else None
+        if isinstance(captured, dict) and (not isinstance(artifact, dict)
+                or (artifact.get("size"), artifact.get("mtime_ns"), artifact.get("device"), artifact.get("inode"))
+                   != (info.st_size, info.st_mtime_ns, info.st_dev, info.st_ino)):
+            raise ValueError("Verified export identity is unavailable.")
         proof = {"schema": "hmb-color-lut-local-export-v1", "source_identity": list(_source_identity(state["source"])),
                  "selection": _selection_key(state), "settings": normalize_settings(state["settings"]),
                  "path": str(path), "size": info.st_size, "mtime_ns": info.st_mtime_ns,
-                 "sha256": _file_digest(path, cancel), "job_id": result["job_id"]}
+                 "sha256": artifact["sha256"] if artifact else _file_digest(path, cancel), "job_id": result["job_id"]}
+        if isinstance(captured, dict) and captured.get("event"):
+            proof["usage_event"] = copy.deepcopy(captured["event"])
         identity = _digest(proof)
         _write_upload_receipt(identity, proof)
         result["web_export_proof"] = identity
@@ -369,7 +685,8 @@ class HMBColorLUTLibrary(DataNode):
         cap = capabilities.get("color_lut_upload", {})
         if (not isinstance(cap, dict) or cap.get("schema") != COLOR_LUT_UPLOAD_SCHEMA or type(cap.get("version")) is not int or cap.get("version") != 1
                 or cap.get("enabled") is not True or cap.get("display_name") != "HMB Color LUT"
-                or cap.get("upload_path") != "/api/v1/reviews/tasks/{source_task_id}/color-lut"):
+                or not _advertised_api_path_matches(cap.get("upload_path"),
+                    "/api/v1/reviews/tasks/{source_task_id}/color-lut", context["server_url"])):
             raise ValueError("브로커가 Color LUT 웹 업로드를 아직 지원하지 않습니다. 서버 업데이트가 필요합니다.")
         maximum = cap.get("max_bytes")
         if type(maximum) is not int or not 1 <= maximum <= 536870912 or info.st_size > maximum:
@@ -384,7 +701,8 @@ class HMBColorLUTLibrary(DataNode):
                 or any(eligibility.get(key) != context[key] for key in ("source_task_id", "project_id", "project_name"))
                 or any(bound.get(key) != context[key] for key in ("channel_uuid", "shot_uuid", "source_node_instance_id"))
                 or bound.get("name") != context["shot_name"]
-                or eligibility.get("upload_path") != "/api/v1/reviews/tasks/" + quote(context["source_task_id"], safe="") + "/color-lut"
+                or not _advertised_api_path_matches(eligibility.get("upload_path"),
+                    "/api/v1/reviews/tasks/" + quote(context["source_task_id"], safe="") + "/color-lut", context["server_url"])
                 or type(eligibility.get("max_bytes")) is not int or not info.st_size <= eligibility["max_bytes"] <= maximum
                 or re.fullmatch(r"[a-f0-9]{64}", str(eligibility.get("source_sha256") or "")) is None
                 or re.fullmatch(r"[a-f0-9]{64}", str(eligibility.get("source_revision") or "")) is None):
@@ -396,6 +714,8 @@ class HMBColorLUTLibrary(DataNode):
         context.update(path=str(path), size=info.st_size, mtime_ns=info.st_mtime_ns, sha256=proof["sha256"],
                        settings=proof["settings"], owner_id=owner, bridge=bridge, state_stamp=self._upload_state_stamp(state),
                        source_revision=eligibility["source_revision"], settings_sha256=_digest(proof["settings"]))
+        if isinstance(proof.get("usage_event"), dict):
+            context["usage_event"] = copy.deepcopy(proof["usage_event"])
         context["upload_id"] = hashlib.sha256("\n".join(("hmb-color-lut-upload-v1", context["source_task_id"], context["sha256"], context["settings_sha256"], context["shot_uuid"])).encode("utf-8")).hexdigest()
         context["receipt_id"] = _digest([context["server_url"], context["owner_id"], context["upload_id"]])
         return context
@@ -585,6 +905,10 @@ class HMBColorLUTLibrary(DataNode):
                     if not self._hmb_node_deleted and context["state_stamp"] == self._upload_state_stamp(self._hmb_color_lut_state):
                         self._web_upload_context = context
                         self._web_upload = {"enabled": False, "phase": "complete", "reason": "웹 업로드 완료 · HMB Color LUT"}
+                try:
+                    self._queue_web_usage(context)
+                except Exception:
+                    LOGGER.debug("Color LUT optional upload usage metadata unavailable")
             except Exception as exc:
                 absent = bool(sent and retrieve and (getattr(exc, "status_code", None) == 404 or getattr(exc, "code", None) == 404))
                 if sent and identity:
@@ -610,6 +934,7 @@ class HMBColorLUTLibrary(DataNode):
             if self._hmb_color_lut_state["language"] == "ko":
                 message = {"Loading video…": "영상을 불러오는 중…", "Processing original source…": "원본 영상 처리 중…",
                     "Encoding original source…": "원본 영상 인코딩 중…", "Preset saved.": "프리셋을 저장했습니다.",
+                    "Preset deleted.": "프리셋을 삭제했습니다.",
                     "A local operation is already running.": "로컬 작업이 이미 진행 중입니다."}.get(message, message)
             status = {"phase": phase, "message": message, "progress": progress}
             if status == self._hmb_color_lut_state["status"]:
@@ -619,7 +944,7 @@ class HMBColorLUTLibrary(DataNode):
 
     def _remember_selection(self) -> None:
         self._hmb_color_lut_state["shot_states"][_selection_key(self._hmb_color_lut_state)] = copy.deepcopy({
-            key: self._hmb_color_lut_state[key] for key in ("settings", "output", "source", "result", "preset_name")})
+            key: self._hmb_color_lut_state[key] for key in ("settings", "output", "source", "result", "preset_name", "preset_id")})
         while len(self._hmb_color_lut_state["shot_states"]) > 128:
             del self._hmb_color_lut_state["shot_states"][next(iter(self._hmb_color_lut_state["shot_states"]))]
 
@@ -638,6 +963,7 @@ class HMBColorLUTLibrary(DataNode):
         saved = saved if isinstance(saved, Mapping) else {}
         self._hmb_color_lut_state["settings"] = normalize_settings(saved.get("settings"))
         self._hmb_color_lut_state["preset_name"] = str(saved.get("preset_name") or "")
+        self._hmb_color_lut_state["preset_id"] = _profile_id(saved.get("preset_id"))
         self._hmb_color_lut_state["output"] = _output(saved.get("output"))
         self._hmb_color_lut_state["result"] = copy.deepcopy(saved.get("result", {}))
         self._restoring_source = copy.deepcopy(saved.get("source", {}))
@@ -719,6 +1045,7 @@ class HMBColorLUTLibrary(DataNode):
             self._hmb_color_lut_state["language"] = "en" if value.get("language") == "en" else "ko"
             if initial or not changed:
                 self._hmb_color_lut_state["preset_name"] = str(value.get("preset_name") or "")[:80]
+                self._hmb_color_lut_state["preset_id"] = _profile_id(value.get("preset_id"))
             self._hmb_color_lut_state["revision"] = revision if initial_setup else max(revision, self._hmb_color_lut_state["revision"]) + 1
             self._remember_selection()
             if initial and not initial_setup and not shot.get("shot_uuid") and self._hmb_color_lut_state["source"].get("path"):
@@ -856,7 +1183,7 @@ class HMBColorLUTLibrary(DataNode):
                             remember_warning(stage, exc)
                             if stage == "selection_cache":
                                 self._hmb_color_lut_state["shot_states"][_selection_key(self._hmb_color_lut_state)] = copy.deepcopy({
-                                    key: self._hmb_color_lut_state[key] for key in ("settings", "output", "source", "result", "preset_name")})
+                                    key: self._hmb_color_lut_state[key] for key in ("settings", "output", "source", "result", "preset_name", "preset_id")})
                             if stage == "ui_notification":
                                 try:
                                     _set_parameter_silently(self, UI, copy.deepcopy(self._hmb_color_lut_state))
@@ -867,7 +1194,7 @@ class HMBColorLUTLibrary(DataNode):
                         # Cache the final warning-bearing result even if an
                         # earlier optional cache or native notification failed.
                         self._hmb_color_lut_state["shot_states"][_selection_key(self._hmb_color_lut_state)] = copy.deepcopy({
-                            key: self._hmb_color_lut_state[key] for key in ("settings", "output", "source", "result", "preset_name")})
+                            key: self._hmb_color_lut_state[key] for key in ("settings", "output", "source", "result", "preset_name", "preset_id")})
         with self._lock:
             self._source_worker = threading.Thread(target=contextvars.copy_context().run, args=(load,), name="HMB LUT source", daemon=True)
             self._source_worker.start()
@@ -895,6 +1222,10 @@ class HMBColorLUTLibrary(DataNode):
                 return
             if action == "upload_web" and self._web_upload_worker is not None and self._web_upload_worker.is_alive():
                 return
+            if action == "delete_profile" and any(worker is not None and worker.is_alive()
+                    for worker in (self._worker, self._source_worker, self._web_upload_worker)):
+                self._status("busy", "A local operation is already running.")
+                return
             captured = copy.deepcopy(self._hmb_color_lut_state)
             # Commands may arrive before the debounced property update. Capture the
             # current UI settings, but never trust a UI-supplied source/provenance.
@@ -902,6 +1233,15 @@ class HMBColorLUTLibrary(DataNode):
             if isinstance(authored, Mapping) and _selection_key(authored) != _selection_key(captured):
                 # Delayed buttons belong to their original Project/Shot.
                 # Cancellation was handled above and may still stop that job.
+                return
+            if action == "delete_profile":
+                # Deletion never reapplies authored grading/media/output fields.
+                try:
+                    revision = max(0, min(2**53 - 2, int(authored.get("revision") or 0))) if isinstance(authored, Mapping) else 0
+                except (TypeError, ValueError, OverflowError):
+                    revision = 0
+                self._hmb_color_lut_state["revision"] = max(self._hmb_color_lut_state["revision"], revision) + 1
+                self._delete_profile(captured, value, authored)
                 return
             if isinstance(authored, Mapping) and _selection_key(authored) == _selection_key(captured):
                 # A native onCommand need not echo the property edit first.
@@ -914,11 +1254,14 @@ class HMBColorLUTLibrary(DataNode):
                 self._hmb_color_lut_state["revision"] = max(self._hmb_color_lut_state["revision"], authored_revision) + 1
                 captured["settings"] = normalize_settings(authored.get("settings", captured["settings"]))
                 captured["preset_name"] = str(authored.get("preset_name") or "")[:80]
+                captured["preset_id"] = _profile_id(authored.get("preset_id", captured.get("preset_id")))
                 raw = authored.get("output")
                 if isinstance(raw, Mapping):
                     captured["output"] = _output(raw)
                 self._hmb_color_lut_state["settings"] = copy.deepcopy(captured["settings"])
                 self._hmb_color_lut_state["output"] = copy.deepcopy(captured["output"])
+                self._hmb_color_lut_state["preset_name"] = captured["preset_name"]
+                self._hmb_color_lut_state["preset_id"] = captured["preset_id"]
                 self._remember_selection()
             if action == "save_profile":
                 self._save_profile(captured, authored)
@@ -938,6 +1281,10 @@ class HMBColorLUTLibrary(DataNode):
                 except Exception as exc:
                     self._status("error", f"Unable to resolve the workflow data folder: {exc}")
                     return
+                try:
+                    self._capture_usage_operation(captured)
+                except Exception:
+                    LOGGER.debug("Color LUT optional usage snapshot unavailable")
             key, cancel = _selection_key(captured), self._cancel
             self._status("working", "Loading video…" if action == "browse_video" else "Processing original source…")
             self._worker = threading.Thread(target=contextvars.copy_context().run, args=(self._run_command, action, captured, request_id, key, cancel), name="HMB LUT export", daemon=True)
@@ -946,29 +1293,69 @@ class HMBColorLUTLibrary(DataNode):
     def _save_profile(self, state: dict[str, Any], authored: Any) -> None:
         try:
             with _PROFILE_LOCK:
-                profiles = _read_profiles()
+                rows = _read_profile_rows()
                 name = str((authored if isinstance(authored, Mapping) else state).get("preset_name") or "").strip()[:80]
                 if not name:
                     raise ValueError("프리셋 이름을 입력하세요. / Enter a preset name.")
-                item = next((p for p in profiles if p["project_id"] == state["project_id"] and p["name"] == name), None)
+                matches = [p for p in rows if isinstance(p, Mapping) and p.get("project_id", "") == state["project_id"] and p.get("name") == name]
+                if len(matches) > 1:
+                    raise ValueError("Duplicate personal preset names are protected. Save with a different name.")
+                item = matches[0] if matches else None
                 if item is None:
-                    item = {"id": uuid.uuid4().hex, "project_id": state["project_id"], "name": name}
-                    profiles.append(item)
+                    item = {"id": uuid.uuid4().hex, "project_id": state["project_id"], "name": name,
+                            "scope": "local_user", "user_created": True}
+                    rows.append(item)
+                elif item.get("id") in (None, "") and _profile_deletable(item, allow_missing_id=True):
+                    # Explicit Save upgrades only this unambiguous legacy
+                    # personal row. Merely reading it never grants delete rights.
+                    item["id"] = uuid.uuid4().hex
+                elif not _profile_deletable(item) or sum(isinstance(p, Mapping) and p.get("id") == item["id"] for p in rows) != 1:
+                    raise ValueError("This preset is protected. Save your settings with a different name.")
                 item["settings"] = normalize_settings(state["settings"])
-                destination = _profiles_path()
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                temp = destination.with_name(f".{uuid.uuid4().hex}.tmp")
-                try:
-                    temp.write_text(json.dumps(profiles, ensure_ascii=False, indent=2), encoding="utf-8")
-                    os.replace(temp, destination)
-                finally:
-                    temp.unlink(missing_ok=True)
-                self._hmb_color_lut_state["profiles"] = profiles
+                _write_profile_rows(rows)
+                self._hmb_color_lut_state["profiles"] = _profiles(rows)
                 self._hmb_color_lut_state["preset_name"] = name
+                self._hmb_color_lut_state["preset_id"] = item["id"]
                 self._remember_selection()
-            self._status("complete", "Preset saved.")
         except Exception as exc:
             self._status("error", str(exc))
+            return
+        self._profile_committed_status("Preset saved.")
+
+    def _delete_profile(self, state: dict[str, Any], command: Mapping[str, Any], authored: Any) -> None:
+        try:
+            selected = authored if isinstance(authored, Mapping) else state
+            identity, project, name = command.get("preset_id"), command.get("project_id"), command.get("preset_name")
+            if (not _profile_id(identity) or not isinstance(project, str) or not isinstance(name, str)
+                    or project != state["project_id"] or identity != selected.get("preset_id")
+                    or name != selected.get("preset_name") or not name or len(name) > 80):
+                raise ValueError("Select the exact personal preset before deleting it.")
+            with _PROFILE_LOCK:
+                rows = _read_profile_rows()
+                matches = [i for i, p in enumerate(rows) if isinstance(p, Mapping) and p.get("id") == identity]
+                if len(matches) != 1:
+                    raise ValueError("The selected personal preset is missing or ambiguous; nothing was deleted.")
+                index = matches[0]
+                item = rows[index]
+                if item.get("project_id", "") != project or item.get("name") != name or not _profile_deletable(item):
+                    raise ValueError("The selected preset is protected or changed; nothing was deleted.")
+                _write_profile_rows(rows[:index] + rows[index + 1:])
+                self._hmb_color_lut_state["profiles"] = _profiles(rows[:index] + rows[index + 1:])
+                self._hmb_color_lut_state["preset_name"] = name
+                self._hmb_color_lut_state["preset_id"] = ""
+                self._remember_selection()
+        except Exception as exc:
+            self._status("error", str(exc))
+            return
+        self._profile_committed_status("Preset deleted.")
+
+    def _profile_committed_status(self, message: str) -> None:
+        try:
+            self._status("complete", message)
+        except Exception:
+            # The atomic personal-store edit already succeeded. An optional
+            # editor notification cannot turn that durable success into failure.
+            LOGGER.debug("Color LUT committed preset notification was unavailable", exc_info=True)
 
     def _archive_grade(self, state: dict[str, Any], result: dict[str, Any], job_id: str) -> dict[str, str]:
         directory = Path(state["data_directory"])
@@ -1035,6 +1422,40 @@ class HMBColorLUTLibrary(DataNode):
                         LOGGER.debug("Color LUT cancellation notification deferred", exc_info=True)
                 return
             self._retain_export_result(state, result, key, job_id)
+        # Only/manual exports did not previously need a checksum. Publish the
+        # saved player first so this new optional read cannot leave it loading.
+        early_preview = bool(not state["shot"].get("shot_uuid") and state.get("_usage_export"))
+        if early_preview:
+            result["usage_collection"] = {"export_operation_id": state["_usage_export"]["operation_id"],
+                "local_export": {"phase": "pending", "reason": "checksum_pending"}}
+            try:
+                result["url"] = _media_url(Path(result["path"]))
+            except Exception as exc:
+                result["url"] = ""
+                self._export_warning(result, "preview", exc)
+            current = self._retain_export_result(state, result, key, job_id)
+            if current:
+                for stage, callback in (("output_notification", lambda: self._publish_result_url(result.get("url", ""))),
+                                        ("ui_notification", self._publish)):
+                    with self._lock:
+                        if (self._hmb_node_deleted or self._job_id != job_id
+                                or key != _selection_key(self._hmb_color_lut_state)
+                                or _source_identity(state["source"]) != _source_identity(self._hmb_color_lut_state["source"])):
+                            break
+                        try:
+                            callback()
+                        except Exception as exc:
+                            self._export_warning(result, stage, exc)
+        usage_event: dict[str, Any] = {}
+        try:
+            usage_event = self._capture_usage_artifact(state, result, cancel)
+        except Exception:
+            captured = state.get("_usage_export") or {}
+            operation = captured.get("operation_id", "")
+            result["usage_collection"] = {"export_operation_id": operation,
+                "local_export": {"phase": "not_collected", "reason": "cancelled" if cancel.is_set()
+                                 else "statistics_metadata_unavailable" if captured.get("artifact") else "export_hash_unavailable"}}
+            LOGGER.debug("Color LUT verified export usage hash unavailable")
         archive_ok = False
         try:
             result.update(self._archive_grade(state, result, job_id))
@@ -1042,11 +1463,12 @@ class HMBColorLUTLibrary(DataNode):
         except Exception as exc:
             result.pop("web_export_proof", None)
             self._export_warning(result, "archive", exc)
-        try:
-            result["url"] = _media_url(Path(result["path"]))
-        except Exception as exc:
-            result["url"] = ""
-            self._export_warning(result, "preview", exc)
+        if not early_preview:
+            try:
+                result["url"] = _media_url(Path(result["path"]))
+            except Exception as exc:
+                result["url"] = ""
+                self._export_warning(result, "preview", exc)
         if archive_ok:
             try:
                 self._record_export_proof(state, result, cancel)
@@ -1058,7 +1480,7 @@ class HMBColorLUTLibrary(DataNode):
         current = self._retain_export_result(state, result, key, job_id)
         # Each notification is independent: a broken output subscriber or UI
         # bridge must not reclassify a successfully saved local video as error.
-        callbacks = [("output_notification", lambda: self._publish_result_url(result.get("url", "")))] if current else []
+        callbacks = [("output_notification", lambda: self._publish_result_url(result.get("url", "")))] if current and not early_preview else []
         callbacks.append(("upload_probe", self._schedule_upload_probe))
         for stage, callback in callbacks:
             with self._lock:
@@ -1091,6 +1513,14 @@ class HMBColorLUTLibrary(DataNode):
                     self._export_warning(result, "state_storage", storage_error)
                     self._retain_export_result(state, result, key, job_id)
                 LOGGER.debug("Color LUT saved export UI notification deferred", exc_info=True)
+        if usage_event:
+            try:
+                captured = state["_usage_export"]
+                self._queue_usage_event(usage_event, captured["origin"],
+                                        captured_bridge=captured["bridge"], captured_login=True)
+            except Exception:
+                self._usage_status(usage_event["export_operation_id"], "local_export", "not_collected", "statistics_unavailable")
+                LOGGER.debug("Color LUT optional usage dispatch unavailable")
 
     def _hmb_follow_image_asset_project(self, project: Any) -> None:
         project = dict(project) if isinstance(project, Mapping) else {}

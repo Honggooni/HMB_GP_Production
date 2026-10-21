@@ -85,6 +85,26 @@ commandState.settings.exposure = -3;
 assert.equal(command.state.settings.exposure, 1, "Export owns an immutable snapshot, not a later slider value.");
 assert.equal(command.id, "captured-export-1");
 assert.throws(() => widget.hmbColorLUTCommand("generate", defaults));
+const personalPreset = { id: "personal-one", name: "개인 로컬 룩", project_id: "superwings12", settings: grade, deletable: true };
+const presetSelection = widget.hmbColorLUTState({ ...bound, project_id: "superwings12", preset_name: personalPreset.name,
+  preset_id: personalPreset.id, profiles: [personalPreset], settings: grade });
+assert.equal(widget.hmbColorLUTCanDeleteProfile(presetSelection), true);
+const deleteCommand = widget.hmbColorLUTCommand("delete_profile", presetSelection, "delete-one");
+assert.equal(deleteCommand.preset_id, personalPreset.id);
+assert.equal(deleteCommand.project_id, "superwings12");
+assert.equal(deleteCommand.preset_name, personalPreset.name);
+assert.deepEqual(deleteCommand.state.settings, presetSelection.settings);
+assert.equal(presetSelection.profiles.length, 1, "A command must not optimistically remove an unsaved preset.");
+for (const value of [
+  { ...presetSelection, preset_id: "" }, { ...presetSelection, preset_name: "다른 이름" },
+  { ...presetSelection, project_id: "katuri8" },
+  { ...presetSelection, profiles: [{ ...personalPreset, deletable: false }] },
+  { ...presetSelection, profiles: [{ ...personalPreset, read_only: true }] },
+  { ...presetSelection, profiles: [personalPreset, personalPreset] },
+]) {
+  assert.equal(widget.hmbColorLUTCanDeleteProfile(value), false);
+  assert.throws(() => widget.hmbColorLUTCommand("delete_profile", value), /saved personal preset/);
+}
 
 for (const language of ["ko", "en"]) {
   const html = widget.hmbRenderColorLUTWidget({ ...bound, language });
@@ -96,6 +116,9 @@ for (const language of ["ko", "en"]) {
   assert.match(html, /data-manual-output/);
   assert.match(html, /value="hevc10"/); assert.match(html, /value="prores"/); assert.match(html, /value="ffv1"/);
   assert.match(html, language === "ko" ? /프리셋 저장/ : /Save preset/);
+  assert.match(html, language === "ko" ? /프리셋 삭제/ : /Delete preset/);
+  assert.match(html, /cl-profile-actions/);
+  assert.match(html, /grid-template-columns:minmax\(0,7fr\) minmax\(0,3fr\)/);
   assert.doesNotMatch(html, /data-action="export_lut"|data-wipe type=|class="cl-compare"/);
   assert.match(html, /data-wipe-handle role="slider"/);
   assert.match(html, /data-project disabled/);
@@ -227,5 +250,27 @@ const fineCapture = legacyUI.publications.at(-1).__hmb_color_lut_command__.state
 assert.equal(fineCapture.exposure, 1.25); assert.equal(fineCapture.contrast, -2);
 assert.equal(fineCapture.precision_version, 2);
 legacyUI.controller.cleanup();
+const presetUI = harness(presetSelection);
+const presetCanvas = presetUI.q("[data-preview]");
+const presetVideo = presetUI.videos[0];
+assert.equal(presetUI.q('[data-action="delete_profile"]').disabled, false);
+presetUI.q('[data-action="delete_profile"]').dispatch("click");
+const requestedDelete = presetUI.publications.at(-1).__hmb_color_lut_command__;
+assert.equal(requestedDelete.action, "delete_profile");
+assert.equal(requestedDelete.preset_id, personalPreset.id);
+assert.deepEqual(requestedDelete.state.settings, presetSelection.settings);
+presetUI.controller.update(presetUI.props({ ...presetSelection, revision: 100, preset_id: "", profiles: [], status: { phase: "complete", message: "Preset deleted." } }));
+assert.equal(presetUI.q('[data-action="delete_profile"]').disabled, true);
+assert.equal(presetUI.q("[data-preview]"), presetCanvas);
+assert.equal(presetUI.videos[0], presetVideo);
+assert.equal(presetUI.container.mounts, 1, "Preset deletion must keep the preview DOM and decoder.");
+const beforeProtectedClick = presetUI.publications.length;
+presetUI.q('[data-action="delete_profile"]').dispatch("click");
+assert.equal(presetUI.publications.length, beforeProtectedClick);
+presetUI.q("[data-profile-name]").value = "새 프리셋 이름";
+presetUI.q("[data-profile-name]").dispatch("change");
+assert.equal(presetUI.publications.at(-1).preset_id, "");
+assert.equal(presetUI.q('[data-action="delete_profile"]').disabled, true);
+presetUI.controller.cleanup();
 await Promise.resolve();
 console.log("HMB Color LUT widget regression: PASS (LUT parity, commands, localization, persistent DOM, media ownership, playback cleanup)");

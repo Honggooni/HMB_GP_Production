@@ -42,7 +42,8 @@ def production_namespace(queued: list, opened: list, tokens: list) -> dict:
     bridge = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == "_HMBAIBrokerBridge")
     methods = {"__init__", "server_url", "_review_task_path", "review_capabilities", "put_task_casecard", "get_task_casecard",
                "get_task_captured_title", "post_task_captured_title", "post_task_feedback", "task_feedback",
-               "_load_access_token", "_clear_access_token", "_request_json"}
+               "_load_access_token", "_clear_access_token", "_request_json",
+               "_forget_reference_auth", "_reference_auth_response"}
     definitions.append(ast.ClassDef(name="Bridge", bases=[], keywords=[], decorator_list=[], body=[
         item for item in bridge.body if isinstance(item, ast.FunctionDef) and item.name in methods]))
     node = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == "HMBSeedanceGeneration")
@@ -72,7 +73,7 @@ def production_namespace(queued: list, opened: list, tokens: list) -> dict:
         _broker_build_opener=lambda: (_ for _ in ()).throw(AssertionError("Real network opener requested")),
         logger=SimpleNamespace(warning=lambda *_args: None),
         webbrowser=SimpleNamespace(open=lambda url, **_kwargs: opened.append(url)),
-        threading=SimpleNamespace(Lock=threading.Lock, Thread=DeferredThread),
+        threading=SimpleNamespace(Lock=threading.Lock, RLock=threading.RLock, Thread=DeferredThread),
         GriptapeNodes=SimpleNamespace(EventManager=lambda: SimpleNamespace(event_loop=None)))
     for item in tree.body:
         if (isinstance(item, ast.Assign) and len(item.targets) == 1 and isinstance(item.targets[0], ast.Name)

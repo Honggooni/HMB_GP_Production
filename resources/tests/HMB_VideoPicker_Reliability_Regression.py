@@ -664,7 +664,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
 assert f'version = "{manifest["metadata"]["library_version"]}"' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
-assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
+assert "Pillow>=12.3.0,<14" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
 assert registered_widgets == {
     "HMBAgentLibraryWidget",
@@ -672,6 +672,7 @@ assert registered_widgets == {
     "HMBFinishLookLibraryWidget",
     "HMBImageAssetLibraryWidget",
     "HMBImageAssetThumbnailPatchBridgeWidget",
+    "HMBImageGenerationWidget",
     "HMBPromptLibraryScopedBindingWidget",
     "HMBSeedanceGenerationWidget",
     "HMBVideoPickerCommandBridgeWidget",
@@ -681,6 +682,7 @@ assert (ROOT / "widgets/HMBFinishLookLibraryWidget.js").is_file()
 assert (ROOT / "widgets/HMBImageAssetThumbnailPatchBridgeWidget.js").is_file()
 assert (ROOT / "widgets/HMBVideoPickerCommandBridgeWidget_v032.js").is_file()
 assert (ROOT / "widgets/HMBSeedanceGenerationWidget.js").is_file()
+assert (ROOT / "widgets/HMBImageGenerationWidget.js").is_file()
 obsolete_picker_widgets = (
     "HMBVideoPickerLibraryWidget.js",
     "HMBVideoPickerLibraryWidget_v028.js",

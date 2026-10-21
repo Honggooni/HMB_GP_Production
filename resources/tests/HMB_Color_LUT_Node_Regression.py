@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import stat
 import sys
 import tempfile
 import threading
@@ -76,6 +77,7 @@ class ColorLUTNodeRegression(unittest.TestCase):
         ControlledThread.pending = []
         self.patches = [
             mock.patch.object(target, "_profiles_path", return_value=self.root / "profiles.json"),
+            mock.patch.object(target, "_usage_bridge", return_value=None),
             mock.patch.object(target, "_workflow_data_directory", return_value=self.root / "workflow" / "data"),
             mock.patch.object(target, "_media_url", side_effect=lambda p: "http://local.test/" + Path(p).name),
             mock.patch.object(target, "probe_source", side_effect=self.probe),
@@ -299,6 +301,220 @@ class ColorLUTNodeRegression(unittest.TestCase):
         self.assertEqual(self.node._hmb_color_lut_state["settings"], target.default_settings())
         self.node._hmb_follow_image_asset_project({"id": "project-1", "name": "Actual Asset Project"})
         self.assertEqual(self.node._hmb_color_lut_state["settings"]["temperature"], 3)
+
+    def save_preset(self, name, command_id="save-preset"):
+        authored = copy.deepcopy(self.node._hmb_color_lut_state)
+        authored["preset_name"] = name
+        self.node._command({"id": command_id, "action": "save_profile", "state": authored})
+        return next(p for p in target._read_profiles() if p["name"] == name and p["project_id"] == authored["project_id"])
+
+    def delete_preset(self, profile, command_id="delete-preset", authored=None, **changes):
+        state = copy.deepcopy(self.node._hmb_color_lut_state) if authored is None else copy.deepcopy(authored)
+        state.update(preset_id=profile["id"], preset_name=profile["name"])
+        command = {"id": command_id, "action": "delete_profile", "preset_id": profile["id"],
+                   "project_id": profile["project_id"], "preset_name": profile["name"], "state": state}
+        command.update(changes)
+        self.node._command(command)
+
+    def test_personal_preset_stable_id_survives_save_switch_and_hydration(self):
+        self.select()
+        first = self.save_preset("Stable", "stable-first")
+        self.assertTrue(first["deletable"])
+        self.apply(settings={"enabled": True, "temperature": 2})
+        second = self.save_preset("Stable", "stable-second")
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(second["settings"]["temperature"], 2)
+        self.select(SHOT_B)
+        self.assertEqual(self.node._hmb_color_lut_state["preset_id"], "")
+        self.select(SHOT_A)
+        self.assertEqual(self.node._hmb_color_lut_state["preset_id"], first["id"])
+        saved = copy.deepcopy(self.node._hmb_color_lut_state)
+        restored = target.HMBColorLUTLibrary(name="Preset identity restore")
+        restored._apply_ui(saved, initial_setup=True)
+        self.assertEqual(restored._hmb_color_lut_state["preset_id"], first["id"])
+
+    def test_delete_only_selected_row_preserves_media_grade_and_other_metadata(self):
+        self.node._hmb_follow_image_asset_project({"id": "show-a", "name": "A"})
+        self.select(); self.load()
+        self.apply(settings={"enabled": True, "exposure": .5})
+        selected = self.save_preset("Remove")
+        untouched = [{"id": "shared", "name": "Shared", "project_id": "show-a", "source": "shared", "metadata": {"keep": [1, 2]}},
+                     {"id": "other-project", "name": "Keep", "project_id": "show-b", "custom": "exact"}]
+        path = self.root / "profiles.json"
+        rows = json.loads(path.read_text(encoding="utf-8")) + untouched
+        path.write_text(json.dumps(rows), encoding="utf-8")
+        before = copy.deepcopy(self.node._hmb_color_lut_state)
+        authored = {**before, "settings": {"exposure": 9}, "source": {"path": "forged"},
+                    "result": {"path": "forged"}, "output": {"path": "forged"}}
+        with mock.patch.object(target, "export_video", side_effect=AssertionError("No encode")), \
+                mock.patch.object(target, "_upload_bridge", side_effect=AssertionError("No upload")):
+            self.delete_preset(selected, authored=authored)
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), untouched)
+        for key in ("settings", "source", "result", "output", "shot", "project_id"):
+            self.assertEqual(self.node._hmb_color_lut_state[key], before[key], key)
+        self.assertEqual(self.node._hmb_color_lut_state["preset_name"], "Remove")
+        self.assertEqual(self.node._hmb_color_lut_state["preset_id"], "")
+
+    def test_rapid_selection_delete_accepts_explicit_fresh_row_without_regrading(self):
+        selected_a = self.save_preset("A", "save-a")
+        selected_b = self.save_preset("B", "save-b")
+        self.apply(preset_id=selected_a["id"], preset_name="A", settings={"enabled": True, "exposure": .25})
+        before = copy.deepcopy(self.node._hmb_color_lut_state)
+        authored = {**before, "revision": before["revision"] + 50, "settings": {"exposure": 7}}
+        self.delete_preset(selected_b, authored=authored)
+        self.assertEqual([p["id"] for p in target._read_profiles()], [selected_a["id"]])
+        self.assertEqual(self.node._hmb_color_lut_state["settings"], before["settings"])
+        self.assertEqual(self.node._hmb_color_lut_state["preset_name"], "B")
+        self.assertGreater(self.node._hmb_color_lut_state["revision"], authored["revision"])
+
+    def test_protected_and_legacy_rows_never_gain_delete_rights_from_ui(self):
+        path = self.root / "profiles.json"
+        protected = [{"name": "Legacy", "project_id": "", "settings": {}},
+            *[{"id": "protected-" + str(i), "name": "Protected " + str(i), "project_id": "", **flags}
+              for i, flags in enumerate(({"scope": "system"}, {"source": "shared"}, {"readonly": True},
+                  {"read_only": True}, {"is_default": True}, {"owner_user_id": 42}, {"user_created": False},
+                  {"metadata": {"shared": True}}, {"scope": {}}, {"metadata": []}))]]
+        original = json.dumps(protected)
+        path.write_text(original, encoding="utf-8")
+        projections = target._read_profiles()
+        self.assertEqual(projections[0]["id"], "")
+        self.assertTrue(all(p["deletable"] is False for p in projections))
+        self.assertEqual(target._read_profiles(), projections)
+        for index, profile in enumerate(projections):
+            self.node._hmb_color_lut_state["profiles"] = [{**profile, "deletable": True}]
+            self.delete_preset(profile, command_id="protected-" + str(index))
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+            self.assertEqual(self.node._hmb_color_lut_state["status"]["phase"], "error")
+        for index, profile in enumerate(projections[1:]):
+            authored = {**self.node._hmb_color_lut_state, "preset_name": profile["name"]}
+            self.node._command({"id": "protected-save-" + str(index), "action": "save_profile", "state": authored})
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_explicit_save_upgrades_only_unprotected_legacy_personal_row(self):
+        path = self.root / "profiles.json"
+        other = {"id": "keep", "name": "Keep", "project_id": "other", "metadata": {"custom": [1, 2]}}
+        for index, identity in enumerate((None, "")):
+            legacy = {"name": "Legacy", "project_id": "", "settings": {}, "metadata": {"custom": "preserve"}}
+            if identity is not None:
+                legacy["id"] = identity
+            path.write_text(json.dumps([legacy, other]), encoding="utf-8")
+            self.assertFalse(target._read_profiles()[0]["deletable"])
+            authored = {**copy.deepcopy(self.node._hmb_color_lut_state), "preset_name": "Legacy",
+                        "settings": {"precision_version": 2, "enabled": True, "exposure": .75}}
+            self.node._command({"id": "legacy-save-" + str(index), "action": "save_profile", "state": authored})
+            saved, untouched = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(untouched, other)
+            self.assertEqual(saved["metadata"], legacy["metadata"])
+            self.assertEqual(saved["settings"]["exposure"], .75)
+            self.assertRegex(saved["id"], r"^[a-f0-9]{32}$")
+            self.assertEqual(self.node._hmb_color_lut_state["status"]["phase"], "complete")
+            self.assertTrue(target._read_profiles()[0]["deletable"])
+            self.delete_preset(target._read_profiles()[0], command_id="legacy-delete-" + str(index))
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), [other])
+
+    def test_malformed_explicit_delete_grants_and_ids_remain_protected(self):
+        for index, flag in enumerate((False, None, "false", "true", 0, 1, [], {})):
+            for nested in (False, True):
+                row = {"id": "grant", "name": "Grant", "project_id": ""}
+                row["metadata"] = {"deletable": flag} if nested else {}
+                if not nested:
+                    row["deletable"] = flag
+                with self.subTest(flag=flag, nested=nested):
+                    self.assertFalse(target._profile_deletable(row))
+        path = self.root / "profiles.json"
+        for index, identity in enumerate((42, "bad/id", [], {})):
+            row = {"id": identity, "name": "Malformed", "project_id": ""}
+            original = json.dumps([row])
+            path.write_text(original, encoding="utf-8")
+            self.node._command({"id": "malformed-save-" + str(index), "action": "save_profile",
+                                "state": {**self.node._hmb_color_lut_state, "preset_name": "Malformed"}})
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_committed_save_delete_remain_successful_when_editor_notification_fails(self):
+        with mock.patch.object(self.node, "publish_update_to_parameter", side_effect=RuntimeError("fixture editor offline")):
+            profile = self.save_preset("Committed")
+            self.assertEqual(self.node._hmb_color_lut_state["status"]["phase"], "complete")
+            self.delete_preset(profile)
+            self.assertEqual(self.node._hmb_color_lut_state["status"]["phase"], "complete")
+        self.assertEqual(target._read_profiles(), [])
+
+    def test_delete_rechecks_store_not_browser_catalogue_and_duplicate_ids_are_protected(self):
+        profile = self.save_preset("Changed")
+        path = self.root / "profiles.json"
+        rows = json.loads(path.read_text(encoding="utf-8"))
+        rows[0]["read_only"] = True
+        path.write_text(json.dumps(rows), encoding="utf-8")
+        self.delete_preset(profile)
+        self.assertEqual(len(json.loads(path.read_text(encoding="utf-8"))), 1)
+        self.assertEqual(self.node._hmb_color_lut_state["status"]["phase"], "error")
+        rows[0].pop("read_only")
+        rows.append({**rows[0], "project_id": "different-project"})
+        path.write_text(json.dumps(rows), encoding="utf-8")
+        self.assertTrue(all(not row["deletable"] for row in target._read_profiles()))
+        self.delete_preset(profile, command_id="duplicate-id")
+        self.assertEqual(len(json.loads(path.read_text(encoding="utf-8"))), 2)
+
+    def test_delete_rejects_stale_identity_name_project_and_delayed_shot(self):
+        self.select()
+        profile = self.save_preset("Exact")
+        path = self.root / "profiles.json"
+        original = path.read_bytes()
+        for index, changes in enumerate(({"preset_id": "missing"}, {"preset_name": "Different"}, {"project_id": "other"})):
+            self.delete_preset(profile, command_id="mismatch-" + str(index), **changes)
+            self.assertEqual(path.read_bytes(), original)
+        old = copy.deepcopy(self.node._hmb_color_lut_state)
+        self.select(SHOT_B)
+        self.delete_preset(profile, command_id="late-shot", authored=old)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_delete_dedup_busy_and_atomic_failure_preserve_store(self):
+        profile = self.save_preset("Retain")
+        path = self.root / "profiles.json"
+        original = path.read_bytes()
+        for slot in ("_worker", "_source_worker", "_web_upload_worker"):
+            with mock.patch.object(self.node, slot, types.SimpleNamespace(is_alive=lambda: True)):
+                self.delete_preset(profile, command_id="busy-" + slot)
+            self.assertEqual(path.read_bytes(), original)
+        with mock.patch.object(target.os, "replace", side_effect=OSError("fixture replace failed")):
+            self.delete_preset(profile, command_id="atomic-failure")
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(self.root.glob(".*.tmp")), [])
+        with mock.patch.object(target, "_write_profile_rows", wraps=target._write_profile_rows) as write:
+            self.delete_preset(profile, command_id="once")
+            self.delete_preset(profile, command_id="once")
+            self.assertEqual(write.call_count, 1)
+        self.assertEqual(target._read_profiles(), [])
+
+    def test_corrupt_store_and_reparse_path_cannot_be_overwritten(self):
+        path = self.root / "profiles.json"
+        path.write_text("{invalid-json", encoding="utf-8")
+        self.node._command({"id": "corrupt-save", "action": "save_profile", "state": {**self.node._hmb_color_lut_state, "preset_name": "New"}})
+        self.assertEqual(path.read_text(encoding="utf-8"), "{invalid-json")
+        self.assertEqual(self.node._hmb_color_lut_state["status"]["phase"], "error")
+        real_lstat = Path.lstat
+        def reparse_lstat(item, *args, **kwargs):
+            return types.SimpleNamespace(st_mode=stat.S_IFREG, st_file_attributes=0x400) if item == path else real_lstat(item, *args, **kwargs)
+        with mock.patch.object(Path, "lstat", reparse_lstat):
+            with self.assertRaisesRegex(ValueError, "reparse"):
+                target._read_profile_rows()
+        self.assertEqual(path.read_text(encoding="utf-8"), "{invalid-json")
+
+    def test_concurrent_personal_save_and_delete_preserve_unrelated_row(self):
+        profile = self.save_preset("Delete A")
+        second = target.HMBColorLUTLibrary(name="Other LUT")
+        authored = {**copy.deepcopy(second._hmb_color_lut_state), "preset_name": "Keep B"}
+        gate = threading.Barrier(3)
+        def save():
+            gate.wait(); second._save_profile(authored, authored)
+        def delete():
+            gate.wait(); self.delete_preset(profile)
+        workers = [threading.Thread(target=save), threading.Thread(target=delete)]
+        for worker in workers: worker.start()
+        gate.wait()
+        for worker in workers:
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual([row["name"] for row in target._read_profiles()], ["Keep B"])
 
     def test_fine_precision_survives_presets_shots_reload_and_export(self):
         self.select()

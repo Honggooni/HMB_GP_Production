@@ -452,12 +452,12 @@ class OnlyProjectSelectionTests(unittest.TestCase):
         bridge.require_generation_project_selection(t.PROJECT_SELECTION_SCHEMA)
         self.assertEqual(opener.calls, [])
         bridge.require_generation_project_selection(ONLY_PROJECT_SELECTION_SCHEMA)
-        self.assertEqual([call["path"] for call in opener.calls], [REVIEW_CAPABILITIES_PATH])
-        bridge._load_access_token.assert_called_once_with()
+        self.assertEqual([call["path"] for call in opener.calls], ["/api/v1/maintenance-intake/capabilities", REVIEW_CAPABILITIES_PATH])
+        self.assertEqual(bridge._load_access_token.call_args_list, [mock.call(), mock.call(), mock.call()])
         bridge._clear_access_token.assert_not_called()
         with self.assertRaises(t._BrokerProtocolError):
             bridge.require_generation_project_selection("arbitrary-project-schema")
-        self.assertEqual(len(opener.calls), 1)
+        self.assertEqual(len(opener.calls), 2)
 
     def test_missing_malformed_or_failed_only_support_never_uploads_or_submits(self):
         def support(document, value, *, missing=False):
@@ -482,7 +482,7 @@ class OnlyProjectSelectionTests(unittest.TestCase):
                 self.assertEqual(node.upload_calls, 0)
                 self.assertEqual(node.bridge.posts, [])
                 self.assertEqual(node.saved, [])
-                self.assertEqual([call["path"] for call in node.transport.calls], [REVIEW_CAPABILITIES_PATH])
+                self.assertEqual([call["path"] for call in node.transport.calls], ["/api/v1/maintenance-intake/capabilities", REVIEW_CAPABILITIES_PATH])
                 if index == 2:
                     node.bridge._clear_access_token.assert_called_once_with()
 

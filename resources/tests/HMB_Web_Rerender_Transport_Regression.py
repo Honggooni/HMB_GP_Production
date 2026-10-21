@@ -577,6 +577,7 @@ class TransportRegression(unittest.TestCase):
         wire = RecordingOpener()
         with patch.object(generator, "_broker_load_token", return_value="offline-synthetic-token"), patch.object(generator, "_broker_validated_server_url", return_value=ORIGIN):
             bridge = generator._HMBAIBrokerBridge(opener=wire, server_url=ORIGIN)
+            bridge.queue_admission = lambda **kwargs: None  # Native filtered-POST fixture, no discovery server.
             protocol = PreparedProtocol(bridge)
             current = freeze_command(command(), {"model": generator.SEEDANCE_2_0_MODEL_ID,
                 "input_mode": generator.INPUT_MODE_TEXT_ONLY, "resolution": "1080p",

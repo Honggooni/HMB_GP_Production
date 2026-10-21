@@ -74,7 +74,8 @@ def main() -> None:
         method = next(item for item in node.body if isinstance(item, ast.FunctionDef) and item.name == "_record_review_stage")
         module = ast.Module(body=[method], type_ignores=[])
         clock = SimpleNamespace(monotonic=lambda: 10.)
-        namespace = {"time": clock, "_review": review, "logger": SimpleNamespace(warning=lambda *args: None)}
+        namespace = {"time": clock, "_review": review, "logger": SimpleNamespace(warning=lambda *args: None),
+                     "_my_box_node": SimpleNamespace(is_selected=lambda node: bool(getattr(node, "_fixture_my_box", False)))}
         exec(compile(ast.fix_missing_locations(module), "<actual-generator-review-stage>", "exec"), namespace)
         runner = SimpleNamespace(_hmb_review_case_id=case_id, _hmb_review_stage="preparing",
                                  _hmb_review_stage_started=7., _hmb_review_stage_seconds={})
@@ -86,6 +87,19 @@ def main() -> None:
         assert review.read_case("broker-A", root=base)["status"] == "succeeded"
         assert review.read_case("broker-A", root=base)["input_evidence_sha256"] == evidence
         checks += 3
+        # Private Only results must never mutate a production casecard. The
+        # actual My Box selector/controller is exercised by the SDK regression.
+        with patch.object(review, "update_case") as publish:
+            runner._fixture_my_box = True
+            namespace["_record_review_stage"](runner, "failed", "broker-A")
+            runner._fixture_my_box = False
+            namespace["_record_review_stage"](runner, "failed", "job-mybox-" + "a" * 32)
+            runner._hmb_my_box_controller_instance = SimpleNamespace(_busy=True)
+            namespace["_record_review_stage"](runner, "failed", "broker-A")
+            publish.assert_not_called()
+            del runner._hmb_my_box_controller_instance
+        assert runner._hmb_review_stage == "succeeded"
+        checks += 4
         review.update_case("broker-A", status="succeeded", stage_elapsed_seconds={"unrelated_new_run": 900.}, root=base)
         assert review.read_case("broker-A", root=base)["stage_elapsed_seconds"] == {"preparing": 3.}
         checks += 1

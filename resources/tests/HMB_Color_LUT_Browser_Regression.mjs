@@ -60,14 +60,18 @@ try {
     const layout = await page.locator('.hmb-color-lut').evaluate(el => {
       const root = el.getBoundingClientRect(), screen = el.querySelector('.cl-screen').getBoundingClientRect();
       const preview = el.querySelector('.cl-preview').getBoundingClientRect(), grade = el.querySelector('.cl-grade').getBoundingClientRect();
+      const apply = el.querySelector('[data-apply-profile]').getBoundingClientRect(), remove = el.querySelector('[data-action="delete_profile"]').getBoundingClientRect();
       return {width:el.clientWidth, height:el.clientHeight, scrollWidth:el.scrollWidth,
         contentBottom:el.querySelector('.cl-status').getBoundingClientRect().bottom-root.top,
-        previewRatio:screen.width/screen.height, panelsAligned:Math.abs(preview.top-grade.top)<1};
+        previewRatio:screen.width/screen.height, panelsAligned:Math.abs(preview.top-grade.top)<1,
+        applyPresetFraction:apply.width/(apply.width+remove.width), presetActionsAligned:Math.abs(apply.top-remove.top)<1};
     });
     assert.ok(layout.contentBottom <= layout.height, `${label}: output/status must fit at startup: ${JSON.stringify(layout)}`);
     assert.ok(layout.scrollWidth <= layout.width + 1, `${label}: no horizontal scrolling at startup`);
     assert.ok(layout.panelsAligned, `${label}: preview and grade panels remain side by side`);
     assert.ok(Math.abs(layout.previewRatio - 1.6) < .01, `${label}: preserve the preview aspect ratio`);
+    assert.ok(layout.presetActionsAligned, `${label}: preset apply/delete must share one row`);
+    assert.ok(Math.abs(layout.applyPresetFraction-.7)<.01, `${label}: preset actions must use the approved 70/30 split`);
     initialLayouts.push({label, ...layout});
   }
   page.setDefaultTimeout(10000);
@@ -161,6 +165,27 @@ try {
       if (step < 12) await slider.press('ArrowRight');
     }
   }
+  // User presets are synthetic state only. No user's local preset store or
+  // Broker is accessed by this browser fixture.
+  await page.evaluate(() => {
+    const next=structuredClone(window.publications.at(-1));next.revision+=10;
+    const preset={id:'personal-browser-preset',name:'개인 로컬 프리셋',project_id:'superwings12',deletable:true,settings:structuredClone(next.settings)};
+    Object.assign(next,{project_id:'superwings12',preset_id:preset.id,preset_name:preset.name,profiles:[preset]});
+    window.presetCommands=[];window.state=next;window.presetMediaCount=window.media.length;
+    window.controller.update({value:next,onChange:value=>window.publications.push(value),onCommand:value=>window.presetCommands.push(JSON.parse(value))});
+  });
+  assert.equal(await page.locator('[data-action="delete_profile"]').isEnabled(),true);
+  await page.locator('[data-action="delete_profile"]').click();
+  assert.deepEqual(await page.evaluate(()=>({action:window.presetCommands[0].action,id:window.presetCommands[0].preset_id,name:window.presetCommands[0].preset_name})),
+    {action:'delete_profile',id:'personal-browser-preset',name:'개인 로컬 프리셋'});
+  assert.equal(await page.evaluate(()=>JSON.stringify(window.presetCommands[0].state.settings)===JSON.stringify(window.state.settings)),true);
+  await page.evaluate(()=>{
+    const next={...window.state,revision:window.presetCommands[0].state.revision+1,preset_id:'',profiles:[],status:{phase:'complete',message:'Preset deleted.'}};
+    window.controller.update({value:next,onChange:value=>window.publications.push(value)});
+  });
+  assert.equal(await page.locator('[data-action="delete_profile"]').isDisabled(),true);
+  assert.equal(await page.evaluate(()=>document.querySelector('[data-preview]')===window.originalCanvas&&window.media.length===window.presetMediaCount),true,
+    'Preset deletion response must keep the preview canvas and decoder.');
   const wideScreenshot = path.join(temporary, "color-lut-production-wide.png");
   await page.screenshot({ path: wideScreenshot, fullPage: true });
   await page.locator("[data-shot-selector]").selectOption("test-channel\u001fshot-2");

@@ -183,6 +183,19 @@ try {
     });
     assert.equal(result.disabled, true); assert.equal(result.pending, false); assert.equal(result.error, ""); assert.equal(result.accepted, false);
   });
+  await check("private-My-Box-Final-assertion-retains-exact-source-and-no-property-write", async () => {
+    const result = await page.evaluate(async () => {
+      const id = `job-mybox-${"a".repeat(32)}`;
+      const f = createFixture(makeState(0, { job_id: id, effective_resolution: "480p" }));
+      f.button().click(); f.button().click(); await flushFrames();
+      return { id, commands: f.commands, authored: f.authored, ...view(f) };
+    });
+    assert.equal(result.commands.length, 1);
+    assert.equal(result.commands[0].expected_draft_job_id, result.id);
+    assert.equal(result.commands[0].action, "finalize_draft");
+    assert.equal(result.authored.length, 0);
+    assert.equal(result.disabled, true);
+  });
   await check("Shot-change-before-dispatch-cancels-old-Draft-and-stale-echo", async () => {
     const result = await page.evaluate(async () => {
       const f = createFixture(); f.button().click();
