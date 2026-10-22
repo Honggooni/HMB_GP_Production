@@ -1555,6 +1555,9 @@ assert "priority" not in seedance_2_5_payload
 # model/provider, and fail before network I/O for forbidden values or fields.
 bridge_calls: list[dict[str, Any]] = []
 seedance_2_5_bridge = target._HMBAIBrokerBridge(opener=object())
+# Transport is synthetic below. Bind admission's initial authentication read
+# to this fixture as well, so a clean runner never consults a user's login.
+seedance_2_5_bridge._load_access_token = lambda: "isolated-direct-shot-source-fixture"  # type: ignore[method-assign]
 
 
 def capture_bridge_request(
