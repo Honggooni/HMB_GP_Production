@@ -143,7 +143,9 @@ class RouteOpener:
 
     def open(self, request, timeout):
         assert request.get_header("Authorization") == "Bearer " + SYNTHETIC_TOKEN
-        assert 0 < timeout <= 60
+        # Existing-task refresh uses the approved per-request 300-second cap.
+        # Project/capability ownership must not depend on the old 60s fixture.
+        assert 0 < timeout <= 300
         parsed = urlsplit(request.full_url)
         path = parsed.path + ("?" + parsed.query if parsed.query else "")
         method = request.get_method()

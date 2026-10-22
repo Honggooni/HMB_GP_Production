@@ -324,6 +324,13 @@ class FullLifecycleNode(target.HMBSeedanceGeneration):
     def _sync_seedance_shot_widget(self, *, emit_change: bool = False) -> None:
         del emit_change
 
+    def _schedule_review_sync(self, task_id: str) -> bool:
+        # Optional review bookkeeping is outside this transport fixture. The
+        # dedicated review/SDK suites exercise its real publication boundary.
+        # Do not start unrelated filesystem workers while timing five barriers.
+        del task_id
+        return False
+
     def _clear_execution_status(self) -> None:
         return None
 
@@ -355,6 +362,8 @@ async def run_full_lifecycle() -> tuple[list[FullLifecycleNode], FullLifecycleCo
     coordinator = FullLifecycleCoordinator()
     with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
         target._broker_config, "load_broker_base_url", return_value="https://fake-broker.invalid",
+    ), mock.patch.object(target._review, "bind_task_origin"), mock.patch.object(
+        target._review, "bind_task_project",
     ):
         output_root = Path(temporary)
         nodes = [
@@ -376,7 +385,10 @@ async def run_full_lifecycle() -> tuple[list[FullLifecycleNode], FullLifecycleCo
         ):
             await asyncio.wait_for(
                 asyncio.gather(*(node.aprocess() for node in nodes)),
-                timeout=12.0,
+                # Shared CI scheduling is not a performance benchmark. Each
+                # eight-second barrier still rejects serialized transport, and
+                # every stage must prove five overlapping distinct workers.
+                timeout=60.0,
             )
 
         expected_numbers = list(range(1, NODE_COUNT + 1))
