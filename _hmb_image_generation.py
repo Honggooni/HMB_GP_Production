@@ -7,6 +7,7 @@ after the server advertises this exact contract and its registered models.
 from __future__ import annotations
 
 import base64
+from copy import deepcopy
 from dataclasses import dataclass, replace, field
 import hashlib
 import io
@@ -27,6 +28,7 @@ import _hmb_queue_admission as queue
 
 CAPABILITIES_SCHEMA = "hmb-image-generation-capabilities-v1"
 JOB_SCHEMA = "hmb-image-generation-job-v1"
+GOOGLE_NATIVE_CONTRACT = "google-native-image-v1"
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_IMAGE_PIXELS = 64 * 1024 * 1024
@@ -207,6 +209,15 @@ class ImageModelCapability:
     option_schema_revision: str = ""
     options: tuple[ImageOption, ...] = ()
     defaults: tuple[tuple[str, str], ...] = ()
+    provider_request_contract: str = ""
+    max_reference_image_bytes: int = 0
+    max_result_images: int = 1
+    _native_contract_json: str = field(default="null", repr=False)
+    _legacy_profile_json: str = field(default="{}", repr=False)
+
+    @property
+    def native_contract(self) -> dict[str, Any] | None:
+        return json.loads(self._native_contract_json)
 
 
 @dataclass(frozen=True)
@@ -221,6 +232,48 @@ class ImageCapabilities:
 
 def model_defaults(model: ImageModelCapability) -> dict[str, str]:
     return dict(model.defaults)
+
+
+def _with_native_google_contract(model: ImageModelCapability, raw: dict[str, Any]) -> ImageModelCapability:
+    marker = raw.get("provider_request_contract", "")
+    if not marker:
+        return model
+    _identifier(marker, "provider request contract")
+    if marker != GOOGLE_NATIVE_CONTRACT:
+        return replace(model, provider_request_contract=marker)
+    if model.provider != "google" or model.model_id not in {"gemini-3-pro-image", "gemini-3.1-flash-image"}:
+        _fail("The native Google contract belongs to a different model.", "IMAGE_OPTION_SCHEMA_INVALID")
+    native = raw.get("native_contract")
+    if not isinstance(native, dict):
+        _fail("The Broker native Google contract is missing.", "IMAGE_OPTION_SCHEMA_INVALID")
+    formats = _strings(native.get("output_formats"), "native output formats", allowed=frozenset({"native"}))
+    revision, options = parse_option_schema(native.get("option_schema"))
+    defaults = native.get("defaults")
+    choices = {"task": model.tasks, "ratio": model.aspect_ratios, "image_size": model.image_sizes, "output_format": formats}
+    if (not isinstance(defaults, dict) or set(defaults) - set(choices)
+            or any(not isinstance(value, str) or value not in choices[name] for name, value in defaults.items())):
+        _fail("The native Google defaults are invalid.", "IMAGE_OPTION_SCHEMA_INVALID")
+    per_image, combined, results = (native.get(name) for name in (
+        "max_reference_image_bytes", "max_reference_bytes", "max_result_images"))
+    if (type(per_image) is not int or not 1 <= per_image <= MAX_IMAGE_BYTES
+            or type(combined) is not int or not 1 <= combined <= MAX_IMAGE_BYTES
+            or type(results) is not int or not 1 <= results <= 128):
+        _fail("The native Google media limits are invalid.", "IMAGE_OPTION_SCHEMA_INVALID")
+    # Retain only validated descriptors. This cache is an offline UI hint and
+    # can never replace fresh Broker capabilities at the create boundary.
+    checked = {"output_formats": list(formats), "defaults": dict(defaults),
+        "option_schema": serialize_option_schema(revision, options),
+        "max_reference_image_bytes": per_image, "max_reference_bytes": combined, "max_result_images": results}
+    legacy = {name: deepcopy(raw[name]) for name in ("provider", "model_id", "display_name", "enabled", "credential_ready",
+        "tasks", "aspect_ratios", "image_sizes", "output_formats", "max_reference_images", "max_reference_bytes")}
+    for name in ("defaults", "option_schema"):
+        if name in raw:
+            legacy[name] = deepcopy(raw[name])
+    return replace(model, provider_request_contract=marker, output_formats=formats,
+        option_schema_revision=revision, options=options, defaults=tuple(defaults.items()),
+        max_reference_bytes=combined, max_reference_image_bytes=per_image, max_result_images=results,
+        _native_contract_json=json.dumps(checked, ensure_ascii=False, allow_nan=False),
+        _legacy_profile_json=json.dumps(legacy, ensure_ascii=False, allow_nan=False))
 
 
 def parse_capabilities(raw: Any) -> ImageCapabilities:
@@ -244,13 +297,14 @@ def parse_capabilities(raw: Any) -> ImageCapabilities:
         if (not isinstance(defaults, dict) or set(defaults) - set(_DEFAULT_FIELDS)
                 or any(not isinstance(value, str) or value not in item.get(_DEFAULT_FIELDS[key], []) for key, value in defaults.items())):
             _fail("Image generation model defaults are invalid.")
-        parsed_models.append(ImageModelCapability(
+        model = ImageModelCapability(
             _identifier(item.get("provider"), "provider"), _identifier(item.get("model_id"), "model"),
             _text(item.get("display_name"), "model name"), item["enabled"], item["credential_ready"],
             _strings(item.get("tasks"), "tasks", allowed=_TASKS),
             _strings(item.get("aspect_ratios"), "aspect ratios"), _strings(item.get("image_sizes"), "image sizes"),
             _strings(item.get("output_formats"), "output formats", allowed=frozenset(_MIME_FORMATS.values())),
-            count, byte_limit, revision, options, tuple(defaults.items())))
+            count, byte_limit, revision, options, tuple(defaults.items()))
+        parsed_models.append(_with_native_google_contract(model, item))
     if len({(item.provider, item.model_id) for item in parsed_models}) != len(parsed_models):
         _fail("Image generation models are duplicated.")
     lookup = raw.get("client_request_lookup", False)
@@ -425,6 +479,31 @@ def _shrink_reference(image: ValidatedImage, byte_limit: int) -> ValidatedImage:
     _fail("Reference images could not fit this model's byte budget after local resize.", "IMAGE_LIMIT")
 
 
+def _shrink_native_reference(image: ValidatedImage, byte_limit: int) -> ValidatedImage:
+    """Use Standard's lossless-first WebP strategy, on a worker thread."""
+    if len(image.data) <= byte_limit:
+        return image
+    from PIL import Image
+    with Image.open(io.BytesIO(image.data)) as source:
+        source.load()
+        if source.mode in {"P", "LA"}:
+            source = source.convert("RGBA")
+        buffer = io.BytesIO()
+        source.save(buffer, format="WEBP", lossless=True, method=6)
+        if len(buffer.getvalue()) <= byte_limit:
+            return validate_image_bytes(buffer.getvalue(), advertised_mime="image/webp")
+        for scale in (1.0, 0.75, 0.5):
+            size = (max(1, int(source.width * scale)), max(1, int(source.height * scale)))
+            resized = source if size == source.size else source.resize(size)
+            for quality in (100, 95, 85):
+                buffer = io.BytesIO()
+                resized.save(buffer, format="WEBP", quality=quality, method=6)
+                if len(buffer.getvalue()) <= byte_limit:
+                    return validate_image_bytes(buffer.getvalue(), advertised_mime="image/webp")
+    _fail("Input images could not fit the native image or Broker request byte budget. "
+        "Use smaller references; no image was submitted.", "IMAGE_LIMIT")
+
+
 def _validated_model_options(model: ImageModelCapability, supplied: Any) -> dict[str, Any]:
     if supplied is None:
         supplied = {}
@@ -444,7 +523,8 @@ def _validated_model_options(model: ImageModelCapability, supplied: Any) -> dict
 def prepare_invocation(capabilities: ImageCapabilities, *, model_id: str, provider: str = "",
                        task: str, prompt: str, ratio: str, image_size: str,
                        output_format: str, references: Iterable[Any] = (), client_request_id: str = "",
-                       model_options: dict[str, Any] | None = None, auto_image_resize: bool = False) -> ImageInvocation:
+                       model_options: dict[str, Any] | None = None, auto_image_resize: bool = False,
+                       provider_request_contract: str = "") -> ImageInvocation:
     admission = capabilities._queue_admission
     if admission is not None:
         admission.require("image")
@@ -454,6 +534,13 @@ def prepare_invocation(capabilities: ImageCapabilities, *, model_id: str, provid
     if len(models) != 1:
         _fail("Select a model advertised by this Broker.", "IMAGE_MODEL_REQUIRED")
     model = models[0]
+    if provider_request_contract:
+        if (provider_request_contract != GOOGLE_NATIVE_CONTRACT
+                or model.provider_request_contract != provider_request_contract):
+            _fail("Update the Broker native Google image adapter before generating. No image was submitted.",
+                  "IMAGE_NATIVE_CONTRACT_REQUIRED")
+    elif output_format == "native":
+        _fail("Native image output requires an advertised provider contract.", "IMAGE_NATIVE_CONTRACT_REQUIRED")
     if (not model.enabled or not model.credential_ready) and admission is None:
         _fail("The selected image model is not ready. Register its API key on the Broker server.", "IMAGE_MODEL_NOT_READY")
     if task not in model.tasks or ratio not in model.aspect_ratios or image_size not in model.image_sizes or output_format not in model.output_formats:
@@ -475,6 +562,8 @@ def prepare_invocation(capabilities: ImageCapabilities, *, model_id: str, provid
                "persistence_scope": "personal_local", "publish_to_reviews": False,
                "ratio": ratio, "image_size": image_size, "output_format": output_format,
                "reference_images": [], "client_request_id": request_id}
+    if provider_request_contract:
+        payload["provider_request_contract"] = provider_request_contract
     if model.option_schema_revision:
         payload["model_options"] = effective_options
         payload["model_options_schema_revision"] = model.option_schema_revision
@@ -486,6 +575,11 @@ def prepare_invocation(capabilities: ImageCapabilities, *, model_id: str, provid
     used_bytes = 0
     for value in refs:
         image = _reference_data(value, max_bytes=MAX_IMAGE_BYTES if auto_image_resize else model.max_reference_bytes)
+        if provider_request_contract and len(image.data) > model.max_reference_image_bytes:
+            if not auto_image_resize:
+                _fail("An input image exceeds the native per-image limit. Turn on Auto Image Resize or use a smaller image.",
+                    "IMAGE_LIMIT")
+            image = _shrink_native_reference(image, model.max_reference_image_bytes)
         used_bytes += len(image.data)
         if used_bytes > (MAX_RESIZE_INPUT_BYTES if auto_image_resize else model.max_reference_bytes):
             _fail("Combined reference images exceed the model byte limit.", "IMAGE_LIMIT")
@@ -493,7 +587,8 @@ def prepare_invocation(capabilities: ImageCapabilities, *, model_id: str, provid
     if used_bytes > reference_budget:
         if not auto_image_resize or reference_budget <= 0:
             _fail("Reference images exceed the model or Broker request byte budget.", "IMAGE_LIMIT")
-        decoded = [_shrink_reference(image, max(1, reference_budget * len(image.data) // used_bytes)) for image in decoded]
+        shrink = _shrink_native_reference if provider_request_contract else _shrink_reference
+        decoded = [shrink(image, max(1, reference_budget * len(image.data) // used_bytes)) for image in decoded]
     payload["reference_images"] = ["data:" + image.mime_type + ";base64," + base64.b64encode(image.data).decode("ascii") for image in decoded]
     serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     if len(serialized.encode("utf-8")) > request_limit:
@@ -521,12 +616,28 @@ def validate_job(raw: Any, *, expected_job_id: str = "", invocation: ImageInvoca
         ("provider", invocation.provider), ("model", invocation.model_id)
     )):
         _fail("Image result belongs to a different model.", "IMAGE_IDENTITY_MISMATCH")
+    if invocation and (contract := invocation.payload().get("provider_request_contract")):
+        if raw.get("provider_request_contract") != contract:
+            _fail("Image result belongs to a different provider contract.", "IMAGE_IDENTITY_MISMATCH")
     if raw["status"] in JOB_SUCCESS_STATUSES:
-        result = raw.get("result")
-        if not isinstance(result, dict) or not isinstance(result.get("url"), str) or result.get("mime_type") not in _MIME_FORMATS:
-            _fail("Broker did not return one supported image result.")
-        if result.get("sha256") and (not isinstance(result["sha256"], str) or re.fullmatch(r"[a-fA-F0-9]{64}", result["sha256"]) is None):
-            _fail("Broker image result checksum is invalid.")
+        results = raw.get("results", [raw.get("result")])
+        if (not isinstance(results, list) or not 1 <= len(results) <= 128
+                or results[0] != raw.get("result")):
+            _fail("Broker returned an invalid ordered image result list.")
+        urls = set()
+        for result in results:
+            if not isinstance(result, dict) or not isinstance(result.get("url"), str) or result.get("mime_type") not in _MIME_FORMATS:
+                _fail("Broker did not return a supported image result.")
+            if result["url"] in urls:
+                _fail("Broker returned duplicate image results.", "IMAGE_IDENTITY_MISMATCH")
+            urls.add(result["url"])
+            if result.get("sha256") and (not isinstance(result["sha256"], str) or re.fullmatch(r"[a-fA-F0-9]{64}", result["sha256"]) is None):
+                _fail("Broker image result checksum is invalid.")
+            if "results" in raw and not result.get("sha256"):
+                _fail("Ordered image results require individual checksums.")
+        text = raw.get("text", "")
+        if not isinstance(text, str) or len(text) > 65536:
+            _fail("Broker returned invalid image commentary.")
     # Return a detached record: callers cannot mutate a transport-owned cache.
     return json.loads(json.dumps(raw, ensure_ascii=False))
 
@@ -629,7 +740,8 @@ class ImageGenerationBroker:
             task=payload["task"], prompt=payload["prompt"],
             ratio=payload["ratio"], image_size=payload["image_size"], output_format=payload["output_format"],
             references=payload["reference_images"], client_request_id=invocation.client_request_id,
-            model_options=payload.get("model_options"))
+            model_options=payload.get("model_options"),
+            provider_request_contract=payload.get("provider_request_contract", ""))
         if checked != invocation:
             _fail("Image invocation no longer matches its prepared snapshot.", "IMAGE_IDENTITY_MISMATCH")
         if on_submission_prepared is not None:
@@ -663,12 +775,15 @@ class ImageGenerationBroker:
                             client_request_id=client_request_id, allow_client_lookup=lookup)
 
     def save_result(self, job: dict[str, Any], output_path: str | Path, *,
-                    is_alive: Callable[[], bool] | None = None) -> SavedImage:
+                    is_alive: Callable[[], bool] | None = None, result_index: int = 0) -> SavedImage:
         job = validate_job(job)
         if job["status"] not in JOB_SUCCESS_STATUSES:
             _fail("Image Task has not completed successfully.", "IMAGE_RESULT_NOT_READY")
         _check_alive(is_alive)
-        result = job["result"]
+        results = job.get("results", [job["result"]])
+        if type(result_index) is not int or not 0 <= result_index < len(results):
+            _fail("Select an image belonging to this completed Task.", "IMAGE_IDENTITY_MISMATCH")
+        result = results[result_index]
         url = result["url"]
         if re.fullmatch(re.escape(self.server_url) + r"/api/assets/[A-Za-z0-9_-]{43}", url) is None:
             _fail("Broker authorization was refused for an external or invalid image URL.", "IMAGE_RESULT_UNTRUSTED")

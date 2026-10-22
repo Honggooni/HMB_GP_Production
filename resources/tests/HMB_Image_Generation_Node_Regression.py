@@ -53,7 +53,22 @@ LEGACY_RAW_CAPABILITIES = {
                     max_reference_images=3, max_reference_bytes=1024 * 1024)
                for provider, model, label in (("google", "gemini-3-pro-image", "Nano Banana Pro"),
                     ("future-provider", "future-model", "Independent future model"))]}
-CAPABILITIES = protocol.parse_capabilities(LEGACY_RAW_CAPABILITIES)
+def native_contract(raw):
+    raw = deepcopy(raw)
+    for model in raw['models']:
+        if model['provider'] != 'google':
+            continue
+        model['provider_request_contract'] = protocol.GOOGLE_NATIVE_CONTRACT
+        model['native_contract'] = {
+            'output_formats': ['native'],
+            'defaults': {**model.get('defaults', {}), 'output_format': 'native'},
+            'option_schema': deepcopy(model.get('option_schema') or protocol.serialize_option_schema(
+                'native-fixture-v1', next(p.options for p in protocol.BUILTIN_IMAGE_MODEL_PROFILES if p.model_id == model['model_id']))),
+            'max_reference_image_bytes': 7 * 1024 * 1024,
+            'max_reference_bytes': model['max_reference_bytes'], 'max_result_images': 32}
+    return raw
+
+CAPABILITIES = protocol.parse_capabilities(native_contract(LEGACY_RAW_CAPABILITIES))
 
 
 def option_capabilities(*, include_future=False):
@@ -92,7 +107,7 @@ def option_capabilities(*, include_future=False):
             "custom_label": {"type": "string", "label": "Custom String", "default": "base", "max_length": 64},
         }}
         raw["models"].append(future)
-    return protocol.parse_capabilities(raw)
+    return protocol.parse_capabilities(native_contract(raw))
 
 
 def forbidden(*_args, **_kwargs):
@@ -122,6 +137,8 @@ class Backend:
         self.job_fields = {}
         self.save_error = None
         self.after_save = None
+        self.result_bytes = {}
+        self.failed_result_indices = set()
         self.block_capabilities = False
         self.capabilities_started = threading.Event()
         self.capabilities_release = threading.Event()
@@ -136,6 +153,8 @@ class Backend:
             persistence_scope="personal_local", publish_to_reviews=False,
             result=dict(url="https://broker.invalid/api/assets/" + "a" * 43, mime_type="image/png",
                         sha256=hashlib.sha256(PNG).hexdigest()))
+        if invocation.payload().get('provider_request_contract'):
+            record['provider_request_contract'] = invocation.payload()['provider_request_contract']
         record.update(deepcopy(self.job_fields))
         return record
 
@@ -170,11 +189,14 @@ class Backend:
                 backend.refreshed.append((job_id, client_request_id))
                 invocation = next(value for value in backend.created if value.client_request_id == client_request_id)
                 return backend.record(invocation, backend.status)
-            def save_result(self, job, output_path, *, is_alive=None):
+            def save_result(self, job, output_path, *, is_alive=None, result_index=0):
                 backend.saved.append(job["job_id"])
                 if backend.save_error:
                     raise backend.save_error
-                saved = protocol.save_image_atomic(protocol.validate_image_bytes(PNG), output_path, is_alive=is_alive)
+                if result_index in backend.failed_result_indices:
+                    raise protocol.ImageGenerationError("Synthetic failed image download")
+                saved = protocol.save_image_atomic(protocol.validate_image_bytes(backend.result_bytes.get(result_index, PNG)),
+                    output_path, is_alive=is_alive)
                 if backend.after_save:
                     backend.after_save()
                 return saved
@@ -187,7 +209,7 @@ class PersonalImageNodeTests(unittest.TestCase):
         raw=json.loads((ROOT/'resources/tests/HMB_Maintenance_Queue_Fixture.json').read_text('utf-8'))
         admission=queue.parse(raw)
         self.authored()
-        self.backend.capabilities=replace(protocol.parse_capabilities(raw['image_syntax']),_queue_admission=admission)
+        self.backend.capabilities=replace(protocol.parse_capabilities(native_contract(raw['image_syntax'])),_queue_admission=admission)
         self.backend.error=protocol.ImageGenerationError('Synthetic response loss',submission_outcome_unknown=True)
         self.run_node()
         cp=self.node._checkpoint()
@@ -519,6 +541,7 @@ class PersonalImageNodeTests(unittest.TestCase):
 
     def test_live_edits_during_discovery_change_only_the_next_run(self):
         self.authored()
+        self.node.set_parameter_value("ratio", "1:1")
         self.backend.block_capabilities = True
         async def scenario():
             running = asyncio.create_task(self.node.aprocess())
@@ -748,7 +771,7 @@ class PersonalImageNodeTests(unittest.TestCase):
     def test_native_stop_interrupts_poll_wait_without_another_lookup(self):
         self.authored()
         self.backend.status = "queued"
-        self.assertEqual(self.node.POLL_INTERVAL_SECONDS, 30)
+        self.assertEqual(self.node.POLL_INTERVAL_SECONDS, 5)
         async def scenario():
             running = asyncio.create_task(self.node.aprocess())
             self.assertTrue(await asyncio.to_thread(self.backend.started.wait, 5))
@@ -833,14 +856,136 @@ class PersonalImageNodeTests(unittest.TestCase):
         self.assertEqual(len(self.backend.created), 1)
         self.assertEqual(len(self.backend.saved), 1)
 
-    def test_external_reference_is_rejected_before_create(self):
+    def test_unreadable_external_reference_is_rejected_before_create(self):
         self.authored()
         self.node.set_parameter_value("task", "image-to-image")
         self.references(["https://outside.invalid/private.png"])
-        self.run_node()
+        with mock.patch.object(target.File, "aread_data_uri", mock.AsyncMock(side_effect=OSError("Synthetic missing source"))):
+            self.run_node()
         self.assertFalse(self.node._execution_succeeded)
         self.assertFalse(self.backend.created)
         self.assertFalse(self.node._busy)
+
+    def test_native_url_and_nested_references_are_read_in_order_without_broker_auth(self):
+        import base64
+        self.authored()
+        self.node.set_parameter_value("task", "text-to-image")  # Hidden legacy value is not authoritative.
+        uri = "data:image/png;base64," + base64.b64encode(PNG).decode()
+        self.references([[ImageUrlArtifact(value="https://source.invalid/one.png"), [uri]]])
+        reader = mock.AsyncMock(return_value=uri)
+        with mock.patch.object(target.File, "aread_data_uri", reader):
+            self.run_node()
+        self.assert_success()
+        reader.assert_awaited_once_with(fallback_mime="image/png")
+        payload = self.backend.created[0].payload()
+        self.assertEqual(payload["task"], "image-to-image")
+        self.assertEqual(payload["reference_images"], [uri, uri])
+        self.assertEqual(payload["output_format"], "native")
+        self.assertEqual(payload["provider_request_contract"], protocol.GOOGLE_NATIVE_CONTRACT)
+        self.assertEqual(self.node.get_parameter_value("task"), "text-to-image")
+
+    def configure_multiple_results(self):
+        results = []
+        for index, (fmt, mime) in enumerate((("PNG", "image/png"), ("JPEG", "image/jpeg"), ("WEBP", "image/webp"))):
+            buffer = io.BytesIO()
+            Image.new("RGB", (19, 11), (34, 67, 120)).save(buffer, fmt)
+            raw = self.backend.result_bytes[index] = buffer.getvalue()
+            results.append({"url": "https://broker.invalid/api/assets/" + chr(97 + index) * 43,
+                "mime_type": mime, "sha256": hashlib.sha256(raw).hexdigest()})
+        self.backend.job_fields.update(result=results[0], results=results, text="literal model text <not HTML>")
+
+    def test_all_native_images_and_text_save_and_reopen_without_duplicate_downloads(self):
+        self.authored()
+        self.configure_multiple_results()
+        self.run_node()
+        self.assert_success()
+        artifacts = self.node.parameter_output_values["all_images"]
+        self.assertEqual(len(artifacts), 3)
+        self.assertEqual([Path(item.value).suffix for item in artifacts], [".png", ".jpg", ".webp"])
+        for index, artifact in enumerate(artifacts):
+            self.assertEqual(Path(artifact.value).read_bytes(), self.backend.result_bytes[index])
+        self.assertEqual(self.node.parameter_output_values["text"], "literal model text <not HTML>")
+        self.node = self.reopen_options_node(self.node)
+        self.run_node(action="retrieve")
+        self.assertEqual(len(self.backend.created), 1)
+        self.assertEqual(len(self.backend.saved), 3)
+        self.assertEqual([item.value for item in self.node.parameter_output_values["all_images"]],
+            [item.value for item in artifacts])
+
+    def test_partial_native_download_retains_successes_and_retries_only_missing_image(self):
+        self.authored()
+        self.configure_multiple_results()
+        self.backend.failed_result_indices.add(0)
+        self.run_node()
+        self.assertTrue(self.node._execution_succeeded)
+        self.assertEqual(len(self.node.parameter_output_values["all_images"]), 2)
+        self.assertEqual(self.node._checkpoint()["saved_index"], 1)
+        self.assertIn("1 image(s)", self.node.parameter_output_values["result_details"])
+        previous = [item.value for item in self.node.parameter_output_values["all_images"]]
+        self.node = self.reopen_options_node(self.node)
+        self.backend.failed_result_indices.clear()
+        self.run_node(action="retrieve")
+        self.assert_success()
+        self.assertEqual(len(self.backend.created), 1)
+        self.assertEqual(len(self.backend.saved), 4)
+        self.assertEqual([item.value for item in self.node.parameter_output_values["all_images"]][1:], previous)
+
+    def test_poll_timeout_native_defaults_and_invalid_value_before_submission(self):
+        self.assertEqual(self.node.get_parameter_value("timeout"), 600)
+        self.assertEqual(self.node.POLL_INTERVAL_SECONDS, 5)
+        self.assertEqual(self.node.get_parameter_by_name("timeout").allowed_modes,
+            {ParameterMode.INPUT, ParameterMode.PROPERTY})
+        self.authored()
+        self.node.parameter_values["timeout"] = -1
+        self.run_node()
+        self.assertFalse(self.backend.created)
+        self.node.parameter_values["timeout"] = 0
+        self.run_node()
+        self.assert_success()
+        self.assertNotIn("timeout", self.backend.created[0].payload())
+
+    def test_connected_native_setting_survives_generic_hydration_model_switch_and_flow_reopen(self):
+        from griptape_nodes.exe_types.core_types import Parameter
+        from griptape_nodes.exe_types.node_types import SuccessFailureNode
+        from griptape_nodes.exe_types.param_types.parameter_float import ParameterFloat
+        from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, ListConnectionsForNodeRequest
+        from griptape_nodes.retained_mode.events.flow_events import (
+            SerializeFlowToCommandsRequest, DeleteFlowRequest, DeserializeFlowFromCommandsRequest)
+        class ScalarSource(SuccessFailureNode):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.add_parameter(ParameterFloat(name="value", default_value=0.4,
+                    allowed_modes={ParameterMode.PROPERTY, ParameterMode.OUTPUT}))
+            async def aprocess(self):
+                pass
+        definition = next(item for item in self.schema.nodes if item.class_name == "HMBImageGeneration")
+        self.library.register_lazy_node_type("NativeScalarFixture", definition.metadata, lambda: ScalarSource)
+        self.backend.capabilities = option_capabilities()
+        self.run_node(action="connect")
+        original = self.option_parameter("temperature")
+        name = original.name
+        self.node.remove_parameter_element(original)
+        generic = Parameter(name=name, type="float", input_types=["float"], default_value=0.4,
+            allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY})
+        generic.parent_element_name = self.node._generation_settings.name
+        self.node.add_parameter(generic)
+        source = self.send(CreateNodeRequest(node_type="NativeScalarFixture", specific_library_name=self.schema.name,
+            node_name="Native input source", create_error_proxy_on_failure=False))
+        self.send(CreateConnectionRequest(source_node_name=source.node_name, source_parameter_name="value",
+            target_node_name=self.node.name, target_parameter_name=name))
+        self.run_node(action="connect")
+        self.assertIs(self.node.get_parameter_by_name(name), generic)
+        self.node.set_parameter_value("model_id", "google/gemini-3.1-flash-image")
+        self.node.set_parameter_value("model_id", "google/gemini-3-pro-image")
+        self.assertIs(self.node.get_parameter_by_name(name), generic)
+        saved_name = self.node.name
+        saved = self.send(SerializeFlowToCommandsRequest(flow_name=self.flow.name))
+        self.send(DeleteFlowRequest(flow_name=None))
+        self.send(DeserializeFlowFromCommandsRequest(serialized_flow_commands=saved.serialized_flow_commands))
+        edges = self.send(ListConnectionsForNodeRequest(node_name=saved_name))
+        self.assertTrue(any(edge.source_node_name == source.node_name and edge.target_parameter_name == name
+            for edge in edges.incoming_connections))
+        self.assertFalse(self.backend.created)
 
     def test_image_edit_submits_original_reference_bytes(self):
         self.authored()
@@ -950,9 +1095,9 @@ class PersonalImageNodeTests(unittest.TestCase):
         for key, value in overrides.items():
             parameter = self.option_parameter(key)
             self.assertIsInstance(parameter, types[key])
-            self.assertEqual(parameter.allowed_modes, {ParameterMode.PROPERTY})
+            self.assertEqual(parameter.allowed_modes, {ParameterMode.INPUT, ParameterMode.PROPERTY})
             self.assertTrue(parameter.serializable, "Native scalar options must not poison the SDK shared value tracker")
-            self.assertTrue(parameter.ui_options.get("hide_handles"))
+            self.assertFalse(parameter.ui_options.get("hide_handles"))
             self.set_option(key, value)
         self.run_node()
         self.assert_success()
@@ -1042,21 +1187,14 @@ class PersonalImageNodeTests(unittest.TestCase):
         self.assertEqual(calls_before, (self.backend.capability_calls, len(self.backend.created), len(self.backend.saved)),
                          "Cold reopen or cached model switching made a request")
 
-    def test_legacy_catalogue_keeps_eleven_wire_fields_and_rejects_custom_advanced_values(self):
+    def test_legacy_broker_is_refused_before_any_new_google_submission(self):
         self.authored()
-        self.run_node()
-        self.assert_success()
-        expected = {"provider", "model", "task", "prompt", "persistence_scope", "publish_to_reviews",
-                    "ratio", "image_size", "output_format", "reference_images", "client_request_id"}
-        self.assertEqual(set(self.backend.created[-1].payload()), expected)
-        self.set_option("temperature", 0.3)
-        previous = deepcopy(self.node.get_parameter_value("image_recovery"))
+        self.backend.capabilities = protocol.parse_capabilities(LEGACY_RAW_CAPABILITIES)
         self.run_node()
         self.assertFalse(self.node._execution_succeeded)
-        self.assertEqual(len(self.backend.created), 1, "A legacy Broker silently ignored authored advanced options")
-        self.assertEqual(self.option_value("temperature"), 0.3)
-        self.assertEqual(self.node.get_parameter_value("image_recovery"), previous)
-        self.assertRegex(str(self.node.get_parameter_value("result_details") or ""), "(?i)option|temperature|support|legacy")
+        self.assertFalse(self.backend.created)
+        self.assertFalse(self.node.get_parameter_value("image_recovery"))
+        self.assertIn("Update the Broker native Google image adapter", self.node.get_parameter_value("result_details"))
 
     def test_removed_advertised_custom_option_is_preserved_and_rejected_before_create(self):
         self.backend.capabilities = option_capabilities()
@@ -1216,6 +1354,139 @@ class PersonalImageNodeTests(unittest.TestCase):
         self.assertEqual(self.assert_success(reopened).value, first.value)
         self.assertEqual(len(self.backend.created), 1)
         self.assertEqual(len(self.backend.saved), 1)
+
+
+    def assert_local_display(self, node=None):
+        from urllib.parse import urlsplit, unquote
+        from griptape_nodes.retained_mode.events.node_events import GetAllNodeInfoRequest
+        from griptape_nodes.retained_mode.events.parameter_events import GetNodeElementDetailsRequest, GetParameterValueRequest
+        node = node or self.node
+        stored = node.parameter_output_values["IMAGE_OUT"]
+        details = self.send(GetNodeElementDetailsRequest(node_name=node.name))
+        snapshot = self.send(GetAllNodeInfoRequest(node_name=node.name))
+        for name in ("IMAGE_OUT", "image_url"):
+            element = node.get_parameter_by_name(name).element_id
+            display = details.element_details["element_id_to_value"][element]
+            self.assertIsNot(display, stored)
+            self.assertTrue(display.value.startswith(("http://localhost:", "http://127.0.0.1:")))
+            driver = node.engine.static_files_manager.storage_driver
+            served = unquote(urlsplit(display.value).path)
+            base_path = urlsplit(driver.base_url).path
+            if served.startswith(base_path + "/"):
+                resolved = Path(driver.workspace_directory) / served[len(base_path) + 1:]
+            else:
+                external = base_path.rsplit("/workspace", 1)[0] + "/external/"
+                self.assertTrue(served.startswith(external))
+                resolved = Path(served[len(external):])
+            self.assertEqual(resolved.resolve(), Path(stored.value).resolve())
+            self.assertEqual(display.name, stored.name)
+            self.assertEqual(display.meta, stored.meta)
+            self.assertEqual(snapshot.element_id_to_value[element].value, display.value)
+            self.assertEqual(snapshot.element_id_to_value[element].id, display.id)
+            raw = self.send(GetParameterValueRequest(node_name=node.name, parameter_name=name)).value
+            self.assertEqual(raw.value, stored.value)
+        return display
+
+    def test_preview_snapshots_keep_original_files_task_and_outputs(self):
+        self.authored(); self.run_node()
+        stored = self.assert_success()
+        checkpoint = self.node._checkpoint()
+        before = Path(stored.value).stat()
+        display = self.assert_local_display()
+        self.assertIs(self.node.parameter_output_values["IMAGE_OUT"], stored)
+        self.assertEqual(self.node._checkpoint(), checkpoint)
+        self.assertEqual(Path(stored.value).stat(), before)
+        self.assertEqual(self.assert_local_display().id, display.id)
+        self.assertEqual(len(self.backend.created), 1)
+        self.assertEqual(len(self.backend.saved), 1)
+
+    def test_preview_native_save_reopen_remints_current_port_without_retrieve(self):
+        self.authored(); self.run_node()
+        original = self.assert_success()
+        checkpoint = self.node._checkpoint()
+        self.assert_local_display()
+        reopened = self.reopen_options_node(self.node)
+        driver = reopened.engine.static_files_manager.storage_driver
+        with mock.patch.object(driver, "base_url", "http://127.0.0.1:9918/workspace"):
+            display = self.assert_local_display(reopened)
+            self.assertTrue(display.value.startswith("http://127.0.0.1:9918/"))
+        self.assertEqual(reopened._checkpoint(), checkpoint)
+        self.assertEqual(reopened.parameter_output_values["IMAGE_OUT"].value, original.value)
+        self.assertEqual(reopened.parameter_output_values["generation_id"], checkpoint["task_id"])
+        self.assertEqual(len(self.backend.created), 1)
+        self.assertEqual(len(self.backend.saved), 1)
+
+    def test_preview_literal_unicode_space_hash_and_percent_filename(self):
+        from urllib.parse import urlsplit, unquote
+        path = self.folder / "개인 #100% result.png"
+        path.write_bytes(PNG)
+        artifact = ImageUrlArtifact(value=str(path), name=path.name)
+        self.node.parameter_output_values["IMAGE_OUT"] = artifact
+        self.node.parameter_output_values["image_url"] = artifact
+        display = self.assert_local_display()
+        self.assertEqual(urlsplit(display.value).fragment, "")
+        self.assertIn("%23", display.value)
+        self.assertIn("%25", display.value)
+        self.assertTrue(unquote(urlsplit(display.value).path).endswith(path.name))
+        self.assertEqual(path.read_bytes(), PNG)
+        self.assertFalse(self.backend.created)
+
+    def test_preview_does_not_use_cloud_or_custom_storage_driver(self):
+        self.authored(); self.run_node()
+        stored = self.assert_success()
+        driver = SimpleNamespace(create_signed_download_url=mock.Mock(side_effect=forbidden))
+        with mock.patch.object(self.node.engine.static_files_manager, "storage_driver", driver):
+            self.assertIs(self.node.get_display_value_for_output("IMAGE_OUT", stored), stored)
+            driver.create_signed_download_url.assert_not_called()
+        self.assert_success()
+
+    def test_preview_rejects_unrelated_or_remote_read_url(self):
+        self.authored(); self.run_node()
+        stored = self.assert_success()
+        driver = self.node.engine.static_files_manager.storage_driver
+        for url in ("https://broker.invalid/image.png?v=1", "http://localhost:8124/workspace/wrong.png?v=1"):
+            with mock.patch.object(driver, "create_signed_download_url", return_value=url):
+                self.assertIs(self.node.get_display_value_for_output("IMAGE_OUT", stored), stored)
+        with mock.patch.object(driver, "base_url", "https://remote.invalid/workspace"):
+            self.assertIs(self.node.get_display_value_for_output("IMAGE_OUT", stored), stored)
+        self.assert_success()
+
+    def test_preview_missing_file_or_mint_error_does_not_reverse_success(self):
+        self.authored(); self.run_node()
+        stored = self.assert_success(); checkpoint = self.node._checkpoint()
+        driver = self.node.engine.static_files_manager.storage_driver
+        with mock.patch.object(driver, "create_signed_download_url", side_effect=RuntimeError("fixture display unavailable")):
+            self.assertIs(self.node.get_display_value_for_output("IMAGE_OUT", stored), stored)
+        Path(stored.value).unlink()
+        self.assertIs(self.node.get_display_value_for_output("IMAGE_OUT", stored), stored)
+        self.assertEqual(self.node._checkpoint(), checkpoint)
+        self.assertTrue(self.node._execution_succeeded)
+
+    def test_preview_replacement_or_deletion_during_mint_is_not_published(self):
+        self.authored(); self.run_node()
+        stored = self.assert_success(); path = Path(stored.value)
+        driver = self.node.engine.static_files_manager.storage_driver
+        mint = driver.create_signed_download_url
+        def replaced(p):
+            url = mint(p)
+            path.write_bytes(PNG + b"fixture replacement")
+            return url
+        with mock.patch.object(driver, "create_signed_download_url", side_effect=replaced):
+            self.assertIs(self.node.get_display_value_for_output("IMAGE_OUT", stored), stored)
+        path.write_bytes(PNG)
+        def deleted(p):
+            url = mint(p); self.node._deleted = True; return url
+        with mock.patch.object(driver, "create_signed_download_url", side_effect=deleted):
+            self.assertIs(self.node.get_display_value_for_output("IMAGE_OUT", stored), stored)
+        self.assertTrue(self.node._execution_succeeded)
+
+    def test_preview_remote_artifact_and_unrelated_outputs_keep_native_values(self):
+        image = ImageUrlArtifact(value="https://example.invalid/existing.png", name="existing.png")
+        self.assertIs(self.node.get_display_value_for_output("IMAGE_OUT", image), image)
+        self.assertIsNone(self.node.get_display_value_for_output("IMAGE_OUT", None))
+        self.assertEqual(self.node.get_display_value_for_output("generation_id", "saved-task"), "saved-task")
+        self.assertEqual(self.node.get_display_value_for_output("text", "literal result"), "literal result")
+        self.assertFalse(self.backend.created)
 
 
 if __name__ == "__main__":

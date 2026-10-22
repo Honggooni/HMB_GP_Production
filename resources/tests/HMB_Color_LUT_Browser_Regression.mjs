@@ -150,7 +150,7 @@ try {
   assert.equal(await page.locator('[data-text="manual"]').innerText(), "Set output path");
   await checkInitialLayout('Shot / en');
   await page.locator('[data-action="export"]').click();
-  assert.deepEqual(await page.evaluate(() => { const c = window.publications.at(-1).__hmb_color_lut_command__; return { action: c.action, temperature: c.state.settings.temperature, precision: c.state.settings.precision_version, shot: c.state.shot.shot_uuid }; }), { action: "export", temperature: 2.75, precision: 2, shot: "shot-1" });
+  assert.deepEqual(await page.evaluate(() => { const c = window.publications.at(-1).__hmb_color_lut_command__; return { action: c.action, temperature: c.state.settings.temperature, precision: c.state.settings.precision_version, shot: c.state.shot.shot_uuid }; }), { action: "export_upload", temperature: 2.75, precision: 2, shot: "shot-1" });
   for (const key of ['exposure','temperature','contrast','saturation','shadows','highlights']) {
     const slider = page.locator(`[data-adjust="${key}"]`);
     assert.equal(await slider.getAttribute('min'), '-12');
@@ -250,6 +250,8 @@ try {
     slider.value = '9'; slider.dispatchEvent(new Event('input', { bubbles: true }));
     window.controller.update({ value: { ...window.state, revision: 1020,
       project_id: 'isolated-project-B', project: { name: 'Isolated Project B' }, shot: {}, source: {},
+      manual_project: { id: 'isolated-project-B', name: 'Isolated Project B' },
+      upload_projects: [{ id: 'isolated-project-B', name: 'Isolated Project B' }],
       settings: { precision_version: 2, enabled: true, exposure: .5 } }, onChange: value => window.publications.push(value) });
     await new Promise(resolve => setTimeout(resolve, 250));
     return { project: document.querySelector('[data-project]').value,

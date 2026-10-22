@@ -41,6 +41,10 @@ export function hmbColorLUTShotCatalog(value) {
     generation: s.generation, metadata_sha256: s.metadata_sha256.toLowerCase(), shots: shots.sort((a, b) => a.number - b.number) };
 }
 const onlyShot = () => ({ channel_uuid: "", shot_uuid: "", number: 1, name: "Only" });
+const uploadProject = (value) => {
+  const p = record(value), id = clean(p.id, 128), name = clean(p.name, 256);
+  return /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(id) && name ? { id, name } : null;
+};
 export function hmbColorLUTShotOptions(value) {
   const state = record(value), catalog = hmbColorLUTShotCatalog(state.shot_catalog);
   const selected = catalog.channel_uuid === state.shot?.channel_uuid && catalog.shots?.find((s) => s.shot_uuid === state.shot?.shot_uuid);
@@ -66,14 +70,18 @@ export function hmbColorLUTState(input = {}) {
     deletable: p.deletable === true, read_only: p.read_only === true,
   }));
   const sourceMatches = shot.shot_uuid ? source.shot_uuid === shot.shot_uuid && source.channel_uuid === shot.channel_uuid : !source.shot_uuid;
+  const manualProject = uploadProject(s.manual_project) || {};
+  const projects = (Array.isArray(s.upload_projects) ? s.upload_projects : []).slice(0, 100).map(uploadProject).filter(Boolean);
+  const manualReady = manualProject.id && projects.some(p => p.id === manualProject.id && p.name === manualProject.name) && source.path;
   return { schema_version: 1, revision: Math.max(0, Math.trunc(finite(s.revision))), language: s.language === "en" ? "en" : "ko",
     shot, shot_catalog: catalog, project_id: clean(s.project_id), project: record(s.project), preset_name: clean(s.preset_name, 80), preset_id: clean(s.preset_id, 128), profiles,
+    manual_project: manualProject, upload_projects: projects,
     settings: hmbColorLUTSettings(s.settings), source: sourceMatches ? { path: clean(source.path), url: clean(source.url), name: clean(source.name, 256),
       revision: clean(source.revision, 128), shot_uuid: clean(source.shot_uuid, 128), channel_uuid: clean(source.channel_uuid, 128),
       width: Math.max(0, finite(source.width)), height: Math.max(0, finite(source.height)), fps: Math.max(0, finite(source.fps)), duration: Math.max(0, finite(source.duration)) } : {},
     output: { codec: ["hevc10", "prores", "ffv1"].includes(output.codec) ? output.codec : "hevc10", manual_output_enabled: output.manual_output_enabled === true, path: clean(output.path) },
     status: { phase: clean(status.phase, 40) || "idle", message: clean(status.message), progress: clamp(finite(status.progress)) },
-    web_upload: { enabled: upload.enabled === true && Boolean(shot.shot_uuid), phase: clean(upload.phase, 32), reason: clean(upload.reason, 512) },
+    web_upload: { enabled: upload.enabled === true && Boolean(shot.shot_uuid || manualReady), phase: clean(upload.phase, 32), reason: clean(upload.reason, 512) },
     result: { ...result, path: clean(result.path), url: clean(result.url) } };
 }
 export const hmbNormalizeColorLUTWidgetValue = hmbColorLUTState;
@@ -172,7 +180,7 @@ export function hmbColorLUTGradePixels(data, width, cube, mode, wipe, size = HMB
   return data;
 }
 export function hmbColorLUTCommand(action, state, id = `cl-${Date.now()}-${Math.random().toString(36).slice(2)}`) {
-  if (!["browse_video", "export", "cancel", "save_profile", "delete_profile", "upload_web"].includes(action)) throw new Error("Unsupported Color LUT action.");
+  if (!["browse_video", "export", "export_upload", "cancel", "save_profile", "delete_profile", "upload_web", "select_upload_project", "refresh_upload_projects"].includes(action)) throw new Error("Unsupported Color LUT action.");
   const captured = hmbColorLUTState(state);
   if (action === "delete_profile") {
     if (!hmbColorLUTCanDeleteProfile(captured)) throw new Error("Select a saved personal preset before deleting.");
@@ -186,12 +194,12 @@ const TEXT = {
     browse: "영상 불러오기", standalone: "Only · 독립 영상 입력", empty: "완료 영상을 연결하거나 영상 불러오기로 시작하세요", loading: "영상을 불러오는 중", ready: "준비됨", sourceError: "영상을 읽을 수 없습니다", previewError: "컬러 미리보기를 표시할 수 없습니다", transportError: "상태 전송을 사용할 수 없습니다", commandError: "요청을 전달할 수 없습니다",
     play: "▶ 재생", pause: "Ⅱ 일시정지", step: "한 프레임", seek: "프레임 탐색", frame: "프레임", enable: "사용", grade: "프로젝트 룩 · 샷 보정", project: "프로젝트", profileName: "프리셋 이름", apply: "프리셋 적용", deleteProfile: "프리셋 삭제", deleteProfileHint: "현재 선택한 개인 로컬 프리셋만 삭제", reset: "원본 값", save: "프리셋 저장", upload: "웹 업로드", uploadCheck: "업로드 상태 확인", uploaded: "웹 업로드 완료", uploading: "웹 업로드 중…", neutral: "기본", stage: "단계",
     exposure: "노출", temperature: "색온도", contrast: "대비", saturation: "채도", shadows: "그림자", highlights: "하이라이트", low: ["어둡게", "차갑게", "부드럽게", "낮게", "깊게", "억제"], high: ["밝게", "따뜻하게", "선명하게", "높게", "밝게", "강조"],
-    enabled: "샷별 보정 적용 중", disabled: "원본 유지 · 보정 사용 안함", live: "조절 중 미리보기", output: "최종 영상 출력", outputNote: "원본 해상도 · FPS 유지 / 원본에서 1회 인코딩", manual: "출력 경로 직접 지정", path: "출력 경로", autoPath: "자동 · 입력 영상 폴더 / 새 버전 파일", customPath: "저장할 전체 파일 경로", codec: "출력 형식", hevc: "HEVC 10-bit · 고품질", prores: "ProRes 422 HQ · 마스터", ffv1: "FFV1 · 무손실", cancel: "출력 취소", result: "출력 영상 열기", pending: "요청을 처리하는 중", bound: "샷 연결", unbound: "샷 바인딩 없음" },
+    enabled: "샷별 보정 적용 중", disabled: "원본 유지 · 보정 사용 안함", live: "조절 중 미리보기", output: "최종 영상 출력", outputUpload: "최종 영상 출력후 업로드", outputNote: "원본 해상도 · FPS 유지 / 원본에서 1회 인코딩", manual: "출력 경로 직접 지정", path: "출력 경로", autoPath: "자동 · 입력 영상 폴더 / 새 버전 파일", customPath: "저장할 전체 파일 경로", codec: "출력 형식", hevc: "HEVC 10-bit · 고품질", prores: "ProRes 422 HQ · 마스터", ffv1: "FFV1 · 무손실", cancel: "출력 취소", result: "출력 영상 열기", pending: "요청을 처리하는 중", bound: "샷 연결", unbound: "샷 바인딩 없음" },
   en: { subtitle: "Final video color finishing", language: "Language", shot: "Bound shot", preview: "Preview", original: "Original", compare: "Compare", graded: "Graded", wipe: "Compare position",
     browse: "Import video", standalone: "Only · Standalone video", empty: "Connect a completed video or import a video to begin", loading: "Loading video", ready: "Ready", sourceError: "Unable to load video", previewError: "Unable to display color preview", transportError: "State transport is unavailable", commandError: "Unable to deliver request",
     play: "▶ Play", pause: "Ⅱ Pause", step: "One frame", seek: "Seek frame", frame: "Frame", enable: "Enable", grade: "Project look · Shot grade", project: "Project", profileName: "Preset name", apply: "Apply preset", deleteProfile: "Delete preset", deleteProfileHint: "Delete only the selected personal local preset", reset: "Original values", save: "Save preset", upload: "Upload to web", uploadCheck: "Check upload", uploaded: "Uploaded", uploading: "Uploading…", neutral: "Neutral", stage: "stage",
     exposure: "Exposure", temperature: "Temperature", contrast: "Contrast", saturation: "Saturation", shadows: "Shadows", highlights: "Highlights", low: ["Darker", "Cooler", "Softer", "Lower", "Deeper", "Suppress"], high: ["Brighter", "Warmer", "Sharper", "Higher", "Brighter", "Emphasize"],
-    enabled: "Shot grade enabled", disabled: "Original · Grading disabled", live: "Live preview while adjusting", output: "Export final video", outputNote: "Original resolution · FPS / Encode once from source", manual: "Set output path", path: "Output path", autoPath: "Automatic · Source folder / New version file", customPath: "Full output file path", codec: "Output format", hevc: "HEVC 10-bit · High quality", prores: "ProRes 422 HQ · Master", ffv1: "FFV1 · Lossless", cancel: "Cancel export", result: "Open output video", pending: "Processing request", bound: "Shot linked", unbound: "No shot binding" },
+    enabled: "Shot grade enabled", disabled: "Original · Grading disabled", live: "Live preview while adjusting", output: "Export final video", outputUpload: "Export final video and upload", outputNote: "Original resolution · FPS / Encode once from source", manual: "Set output path", path: "Output path", autoPath: "Automatic · Source folder / New version file", customPath: "Full output file path", codec: "Output format", hevc: "HEVC 10-bit · High quality", prores: "ProRes 422 HQ · Master", ffv1: "FFV1 · Lossless", cancel: "Cancel export", result: "Open output video", pending: "Processing request", bound: "Shot linked", unbound: "No shot binding" },
 };
 const textFor = (s) => TEXT[s.language] || TEXT.ko;
 const stageLabel = (s, key) => {
@@ -211,7 +219,7 @@ export function hmbRenderColorLUTWidget(input = {}) {
 .hmb-color-lut .cl-input{display:flex;align-items:center;gap:9px;padding:10px 14px;border-bottom:1px solid var(--cl-line);flex-wrap:wrap}.hmb-color-lut .cl-dot{width:7px;height:7px;border-radius:50%;background:var(--cl-accent)}.hmb-color-lut .cl-source{flex:1;min-width:120px;overflow-wrap:anywhere}.hmb-color-lut .cl-input small{color:var(--cl-muted);font-size:10px}.hmb-color-lut .cl-input button{font-size:11px}.hmb-color-lut .cl-work{display:grid;grid-template-columns:minmax(0,1.85fr) minmax(250px,1fr);gap:12px;padding:12px}.hmb-color-lut :is(.cl-preview,.cl-grade){min-width:0;border:1px solid var(--cl-line);border-radius:8px;background:var(--cl-panel);overflow:hidden}.hmb-color-lut .cl-panel-head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--cl-line);min-height:46px}.hmb-color-lut .cl-panel-head>span:first-child{flex:1}.hmb-color-lut .cl-mode{display:flex;gap:4px}.hmb-color-lut .cl-mode button{font-size:11px;min-height:28px;padding:4px 8px}
 .hmb-color-lut .cl-screen{position:relative;background:#05070c;aspect-ratio:16/10;overflow:hidden}.hmb-color-lut canvas{position:absolute;width:100%;height:100%;object-fit:contain;inset:0}.hmb-color-lut .cl-seam{position:absolute;inset:0 auto 0 50%;width:1px;background:#fff;pointer-events:none}.hmb-color-lut .cl-seam button{position:absolute;top:45%;left:-20px;width:40px;height:40px;min-width:40px;min-height:40px;padding:0;border-radius:50%;background:#142033;border:1px solid #b8c9e1;display:grid;place-items:center;pointer-events:auto;touch-action:none;cursor:ew-resize}.hmb-color-lut .cl-label{position:absolute;top:12px;font-size:11px;padding:4px 8px;border-radius:4px;background:#090e18dc;pointer-events:none}.hmb-color-lut .cl-before{left:12px}.hmb-color-lut .cl-after{right:12px;color:var(--cl-accent)}.hmb-color-lut .cl-empty{position:absolute;inset:0;background:#0a101b;display:grid;place-items:center;padding:20px;text-align:center;color:var(--cl-muted)}.hmb-color-lut input[type=range]{width:100%;accent-color:var(--cl-accent);cursor:pointer;margin:0;min-height:23px;touch-action:pan-y}.hmb-color-lut .cl-transport{padding:12px;border-top:1px solid var(--cl-line)}.hmb-color-lut .cl-player-row{display:flex;align-items:center;gap:8px;margin-top:7px}.hmb-color-lut .cl-player-row small{margin-left:auto;color:var(--cl-muted);font-size:10px;font-variant-numeric:tabular-nums}.hmb-color-lut .cl-player-row button{font-size:11px;min-height:29px}.hmb-color-lut .cl-note{display:flex;justify-content:space-between;gap:8px;padding:10px 12px;border-top:1px solid var(--cl-line);color:var(--cl-muted);font-size:10px}
 .hmb-color-lut .cl-grade-body{padding:12px}.hmb-color-lut .cl-project{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}.hmb-color-lut .cl-project label{display:flex;flex-direction:column;gap:5px;color:var(--cl-muted);font-size:11px}.hmb-color-lut .cl-project :is(select,input){width:100%;font-size:12px}.hmb-color-lut .cl-project button{grid-column:1/-1;font-size:11px}.hmb-color-lut .cl-profile-actions{grid-column:1/-1;display:grid;grid-template-columns:minmax(0,7fr) minmax(0,3fr);gap:8px}.hmb-color-lut .cl-profile-actions button{grid-column:auto;min-width:0}.hmb-color-lut .cl-enable{display:flex;align-items:center;gap:6px;font-size:11px}.hmb-color-lut input[type=checkbox]{accent-color:var(--cl-accent);width:14px;height:14px}.hmb-color-lut .cl-control{margin:0 0 9px}.hmb-color-lut .cl-control label{display:flex;flex-direction:column;gap:2px;font-size:12px}.hmb-color-lut .cl-control label>span:first-child{display:flex;justify-content:space-between;gap:6px}.hmb-color-lut .cl-value{color:var(--cl-accent);font-size:11px}.hmb-color-lut .cl-endpoints{display:flex;justify-content:space-between;color:#8795aa;font-size:10px;margin-top:-3px}.hmb-color-lut .cl-grade-actions{display:flex;gap:6px;padding-top:8px;border-top:1px solid var(--cl-line)}.hmb-color-lut .cl-grade-actions button{flex:1;font-size:11px}.hmb-color-lut .cl-grade-actions button:last-child{border-color:rgba(var(--cl-rgb),.65)}
-.hmb-color-lut .cl-web-upload{display:flex;flex-direction:column;gap:3px;margin-top:4px}.hmb-color-lut .cl-web-upload button{width:100%;font-weight:700;border-color:rgba(var(--cl-rgb),.65)}.hmb-color-lut .cl-web-upload small{color:var(--cl-muted);font-size:10px;line-height:1.4;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;max-height:2.8em}.hmb-color-lut .cl-output{padding:12px;border-top:1px solid var(--cl-line);background:#0c1220}.hmb-color-lut .cl-output-top{display:flex;gap:10px;align-items:center;margin-bottom:9px}.hmb-color-lut .cl-output-top>span{flex:1}.hmb-color-lut .cl-output-top small{color:var(--cl-muted);font-size:10px}.hmb-color-lut .cl-output-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.hmb-color-lut .cl-output-controls label{display:flex;gap:6px;align-items:center;font-size:11px;white-space:nowrap}.hmb-color-lut .cl-output-controls input[type=text]{flex:1;min-width:120px;font-size:11px}.hmb-color-lut .cl-output-controls :is(select,button){font-size:11px}.hmb-color-lut .cl-export{background:rgba(var(--cl-rgb),.85);border-color:var(--cl-accent);color:#090d17;font-weight:700}.hmb-color-lut .cl-status{padding:10px 14px;border-top:1px solid var(--cl-line);display:flex;align-items:center;gap:8px;color:#b5c0d0;font-size:11px;min-height:38px;overflow-wrap:anywhere}.hmb-color-lut .cl-status progress{width:80px;accent-color:var(--cl-accent)}.hmb-color-lut .cl-status a{color:var(--cl-accent)}
+.hmb-color-lut .cl-web-upload{display:flex;flex-direction:column;gap:3px;margin-top:4px}.hmb-color-lut .cl-web-upload button{width:100%;font-weight:700;border-color:rgba(var(--cl-rgb),.65)}.hmb-color-lut .cl-web-upload small{color:var(--cl-muted);font-size:10px;line-height:1.4;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;max-height:2.8em}.hmb-color-lut .cl-output{padding:12px;border-top:1px solid var(--cl-line);background:#0c1220}.hmb-color-lut .cl-output-top{display:flex;gap:10px;align-items:center;margin-bottom:9px}.hmb-color-lut .cl-output-top>span{flex:1}.hmb-color-lut .cl-output-top small{color:var(--cl-muted);font-size:10px}.hmb-color-lut .cl-output-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.hmb-color-lut .cl-output-controls label{display:flex;gap:6px;align-items:center;font-size:11px;white-space:nowrap}.hmb-color-lut .cl-output-controls input[type=text]{flex:1;min-width:120px;font-size:11px}.hmb-color-lut .cl-output-controls :is(select,button){font-size:11px}.hmb-color-lut .cl-export{flex:0 0 auto;width:auto;min-width:max-content;white-space:nowrap;padding-inline:16px;background:rgba(var(--cl-rgb),.85);border-color:var(--cl-accent);color:#090d17;font-weight:700}.hmb-color-lut .cl-status{padding:10px 14px;border-top:1px solid var(--cl-line);display:flex;align-items:center;gap:8px;color:#b5c0d0;font-size:11px;min-height:38px;overflow-wrap:anywhere}.hmb-color-lut .cl-status progress{width:80px;accent-color:var(--cl-accent)}.hmb-color-lut .cl-status a{color:var(--cl-accent)}
 @container(max-width:720px){.hmb-color-lut .cl-head{gap:9px;padding:0 12px}.hmb-color-lut .cl-brand small{display:none}.hmb-color-lut .cl-shot-shell{flex:1;width:auto}.hmb-color-lut .cl-work{grid-template-columns:1fr}.hmb-color-lut .cl-control-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 16px}.hmb-color-lut .cl-output-controls input[type=text]{min-width:50%;flex-basis:60%}.hmb-color-lut .cl-output-top{flex-wrap:wrap}}
 @container(max-width:430px){.hmb-color-lut .cl-mark,.hmb-color-lut .cl-shot-shell>span{display:none}.hmb-color-lut .cl-brand strong{font-size:12px}.hmb-color-lut .cl-lang{min-width:46px;padding-inline:5px}.hmb-color-lut .cl-work{padding:7px}.hmb-color-lut .cl-panel-head{flex-wrap:wrap}.hmb-color-lut .cl-note{flex-wrap:wrap}.hmb-color-lut .cl-output-controls>*{max-width:100%}}
 </style><div class="hmb-color-lut nodrag nowheel" data-language="${s.language}" data-shot-number="${hmbColorLUTShotOptions(s).find((x) => x.selected)?.number || 0}" tabindex="0">
@@ -387,7 +395,7 @@ function hmbNativeUiImplementation(container, props = {}) {
   };
   const sync = () => {
     if (disposed) return;
-    const t = textFor(state), accent = hmbColorLUTShotAccent(state), busy = ["working", "busy", "exporting", "running", "probing", "encoding", "cancelling"].includes(state.status.phase);
+    const t = textFor(state), accent = hmbColorLUTShotAccent(state), busy = state.web_upload.phase === "uploading" || ["working", "busy", "exporting", "running", "probing", "encoding", "cancelling"].includes(state.status.phase);
     root.style.setProperty("--cl-accent", accent); root.style.setProperty("--cl-rgb", accent.slice(1).match(/../g).map((x) => parseInt(x, 16)).join(","));
     root.setAttribute("data-language", state.language); root.setAttribute("data-shot-number", String(hmbColorLUTShotOptions(state).find((s) => s.selected)?.number || 0));
     for (const el of all("[data-text]")) el.textContent = t[el.getAttribute("data-text")] || "";
@@ -402,9 +410,13 @@ function hmbNativeUiImplementation(container, props = {}) {
     q("[data-enable]").checked = state.settings.enabled;
     for (const key of HMB_COLOR_LUT_CONTROLS) { const el = q(`[data-adjust="${key}"]`); el.value = String(sliderStep(state.settings[key])); el.setAttribute("aria-valuetext", stageLabel(state, key)); el.setAttribute("aria-label", t[key]); q(`[data-value="${key}"]`).textContent = stageLabel(state, key); }
     const project = q("[data-project]");
-    const projectMarkup = `<option value="${escape(state.project_id)}">${escape(state.project.name || "—")}</option>`;
+    const boundProject = Boolean(state.shot.shot_uuid);
+    const manual = state.manual_project;
+    const projectMarkup = boundProject ? `<option value="${escape(state.project_id)}">${escape(state.project.name || "—")}</option>`
+      : `<option value="">—</option>${manual.id && !state.upload_projects.some(p => p.id === manual.id) ? `<option value="${escape(manual.id)}" disabled>${escape(manual.name)}</option>` : ""}${state.upload_projects.map(p => `<option value="${escape(p.id)}">${escape(p.name)}</option>`).join("")}`;
     if (project.innerHTML !== projectMarkup) project.innerHTML = projectMarkup;
-    project.value = state.project_id;
+    project.value = boundProject ? state.project_id : manual.id || "";
+    project.disabled = boundProject || busy || state.web_upload.phase === "uploading";
     if (doc.activeElement !== q("[data-profile-name]")) q("[data-profile-name]").value = state.preset_name;
     const presets = q("[data-presets]");
     const presetOptions = state.profiles.filter((p) => p.project_id === state.project_id).map((p) => `<option value="${escape(p.name)}"></option>`).join("");
@@ -414,7 +426,10 @@ function hmbNativeUiImplementation(container, props = {}) {
     q("[data-manual-output]").checked = state.output.manual_output_enabled;
     const path = q("[data-output-path]"); path.disabled = !state.output.manual_output_enabled; path.placeholder = state.output.manual_output_enabled ? t.customPath : t.autoPath; path.setAttribute("aria-label", t.path); if (doc.activeElement !== path) path.value = state.output.path;
     q("[data-codec]").value = state.output.codec; q("[data-codec]").setAttribute("aria-label", t.codec);
-    q('[data-action="export"]').disabled = busy || !state.source.path && !state.source.url; q('[data-action="cancel"]').hidden = !busy;
+    const destination = state.output.codec !== "ffv1" && Boolean(state.shot.shot_uuid || state.manual_project.id);
+    const exportButton = q('[data-action="export"]'); exportButton.disabled = busy || state.web_upload.phase === "uploading" || !state.source.path && !state.source.url;
+    exportButton.textContent = destination ? t.outputUpload : t.output;
+    exportButton.title = destination ? t.outputUpload : t.output; q('[data-action="cancel"]').hidden = !busy;
     const upload = q('[data-action="upload_web"]'); upload.disabled = busy || !state.web_upload.enabled; upload.title = state.web_upload.reason; upload.textContent = state.web_upload.phase === "uploading" ? t.uploading : state.web_upload.phase === "complete" ? t.uploaded : state.web_upload.phase === "unknown" ? t.uploadCheck : t.upload; q("[data-upload-reason]").textContent = state.web_upload.reason;
     q("[data-progress]").hidden = !busy; q("[data-progress]").value = state.status.progress;
     q("[data-status]").textContent = localMessage || state.status.message || t.ready;
@@ -438,7 +453,8 @@ function hmbNativeUiImplementation(container, props = {}) {
   };
   const invalidateUpload = () => { state.web_upload.enabled = false; const button = q('[data-action="upload_web"]'); if (button) button.disabled = true; };
   const scheduleCommit = () => { invalidateUpload(); responseRevision++; pendingEdit = true; if (commitTimer) win.clearTimeout(commitTimer); commitTimer = win.setTimeout(publish, 180); };
-  const command = (action) => {
+  const command = (action, extra = {}) => {
+    if (action === "export" && state.output.codec !== "ffv1" && (state.shot.shot_uuid || state.manual_project.id)) action = "export_upload";
     if (action === "delete_profile" && !hmbColorLUTCanDeleteProfile(state)) return;
     if (action === "upload_web" && !state.web_upload.enabled) return;
     if (action === "upload_web") { state.web_upload.enabled = false; state.web_upload.phase = "uploading"; }
@@ -448,14 +464,15 @@ function hmbNativeUiImplementation(container, props = {}) {
     if (authoredPresetName !== state.preset_name) state.preset_id = "";
     state.preset_name = authoredPresetName;
     if (action === "delete_profile" && !hmbColorLUTCanDeleteProfile(state)) { sync(); return; }
-    state.revision++; settingsCache.set(cacheKey(), copy(state.settings)); const captured = copy(state), request = hmbColorLUTCommand(action, captured);
+    const quiet = action === "refresh_upload_projects";
+    if (!quiet) state.revision++; settingsCache.set(cacheKey(), copy(state.settings)); const captured = copy(state), request = { ...hmbColorLUTCommand(action, captured), ...extra };
     const token = ++responseRevision, current = () => !disposed && token === responseRevision;
     try {
       let result;
       if (typeof latestProps.onCommand === "function") result = latestProps.onCommand(JSON.stringify(request));
       else if (typeof latestProps.onChange === "function") result = latestProps.onChange({ ...captured, [HMB_COLOR_LUT_COMMAND_FIELD]: request });
       else throw new Error(textFor(state).transportError);
-      if (current()) { say(textFor(state).pending); sync(); }
+      if (current()) { if (!quiet) say(textFor(state).pending); sync(); }
       Promise.resolve(result).catch((error) => { if (current()) say(`${textFor(state).commandError}: ${error.message || error}`); });
     } catch (error) { if (current()) say(`${textFor(state).commandError}: ${error.message || error}`); }
   };
@@ -469,6 +486,8 @@ function hmbNativeUiImplementation(container, props = {}) {
     state.settings = copy(settingsCache.get(cacheKey()) || hmbColorLUTSettings()); state.source = {}; state.result = {}; state.web_upload = { enabled: false, phase: "unavailable", reason: "" }; localMessage = ""; publish(true); sync();
   };
   bind(q("[data-shot-selector]"), "change", (event) => { const option = hmbColorLUTShotOptions(state).find((s) => s.key === event.target.value); if (option) switchContext(() => { state.shot = option.only ? onlyShot() : { channel_uuid: option.channel_uuid, shot_uuid: option.shot_uuid, number: option.number, name: option.name }; }); });
+  bind(q("[data-project]"), "change", (event) => { if (!state.shot.shot_uuid && event.target.value !== (state.manual_project.id || "")) { invalidateUpload(); command("select_upload_project", { project_id: clean(event.target.value, 128) }); } });
+  bind(q("[data-project]"), "focus", () => { if (!state.shot.shot_uuid) command("refresh_upload_projects"); });
   bind(q("[data-profile-name]"), "change", (event) => { state.preset_name = clean(event.target.value, 80); const matches = state.profiles.filter((profile) => profile.project_id === state.project_id && profile.name === state.preset_name); state.preset_id = matches.length === 1 ? matches[0].id : ""; publish(); sync(); });
   bind(q("[data-language-toggle]"), "click", () => { state.language = state.language === "ko" ? "en" : "ko"; localMessage = ""; publish(); sync(); });
   bind(q("[data-enable]"), "change", (event) => { state.settings.enabled = event.target.checked; publish(); sync(); });

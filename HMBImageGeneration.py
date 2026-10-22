@@ -17,10 +17,10 @@ from pathlib import Path
 import re
 import threading
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from griptape.artifacts import ImageUrlArtifact
-from griptape_nodes.exe_types.core_types import ParameterGroup, ParameterList, ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterGroup, ParameterList, ParameterMode
 try:
     from griptape_nodes.exe_types.core_types import NodeMessageResult
 except ImportError:  # Older supported hosts predate the native button result.
@@ -53,6 +53,7 @@ from _hmb_image_generation import (
     JOB_PENDING_STATUSES, MAX_IMAGE_BYTES, prepare_invocation, validate_image_bytes,
     BUILTIN_IMAGE_MODEL_PROFILES, CAPABILITIES_SCHEMA, model_defaults, parse_capabilities,
     serialize_option_schema, serialize_option_spec,
+    GOOGLE_NATIVE_CONTRACT,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,8 +69,8 @@ _BUILTIN_PROFILES = {item.provider + "/" + item.model_id: item for item in BUILT
 class HMBImageGeneration(SuccessFailureNode):
     """One independent personal image workspace; models come from the Broker."""
 
-    POLL_INTERVAL_SECONDS = 30
-    POLL_TIMEOUT_SECONDS = 3600
+    POLL_INTERVAL_SECONDS = 5
+    POLL_TIMEOUT_SECONDS = 600
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -101,6 +102,9 @@ class HMBImageGeneration(SuccessFailureNode):
                 "hide_handles": True, "is_full_width": True,
                 "height": 64, "min_height": 64, "max_height": 64, "widget_height": 64,
                 "expandable": False, "resizable": False, "compact": True}))
+        self.add_parameter(ParameterInt(name="timeout", default_value=self.POLL_TIMEOUT_SECONDS,
+            min_val=0, max_val=86400, allowed_modes=_PARAM_MODES,
+            tooltip="Polling timeout in seconds. Set to 0 for no timeout."))
         # Native Options has no separate value/label mapping. Keep the original
         # serializable model_id for saved workflows, input edges and transport;
         # this property-only view displays names without changing that identity.
@@ -114,11 +118,11 @@ class HMBImageGeneration(SuccessFailureNode):
             placeholder_text="Describe the image, or the changes to your reference images...",
             allowed_modes=_PARAM_MODES, ui_options={"display_name": "Prompt"}))
         self.add_parameter(ParameterList(name="reference_images", type="ImageUrlArtifact",
-            input_types=["ImageUrlArtifact", "ImageArtifact", "str"], output_type="str",
-            default_value="", allowed_modes={ParameterMode.INPUT},
+            input_types=["ImageUrlArtifact", "ImageArtifact", "str", "list", "list[ImageArtifact]", "list[ImageUrlArtifact]"],
+            default_value=[], allowed_modes={ParameterMode.INPUT},
             tooltip="Ordered image references. Local image files and connected image artifacts are supported.",
-            ui_options={"display_name": "Reference Images"}))
-        self._add_choice("ratio", "1:1", list(BUILTIN_IMAGE_MODEL_PROFILES[0].aspect_ratios), "Aspect Ratio")
+            ui_options={"display_name": "Input Images", "expander": True, "hide_property": True}))
+        self._add_choice("ratio", "16:9", list(BUILTIN_IMAGE_MODEL_PROFILES[0].aspect_ratios), "Aspect Ratio")
         self._add_choice("image_size", "1K", ["1K", "2K", "4K"], "Resolution / 해상도")
         self._add_choice("output_format", "png", ["png"], "Output Format")
         self.get_parameter_by_name("image_size").tooltip = (
@@ -126,10 +130,10 @@ class HMBImageGeneration(SuccessFailureNode):
             "Nano Banana Pro: 1K / 2K / 4K; Nano Banana 2 also supports 512.")
         self._generation_settings = ParameterGroup(name="Generation Settings", ui_options={"collapsed": True})
         self._generation_settings.add_child(ParameterBool(name="auto_image_resize", default_value=True,
-            allowed_modes={ParameterMode.PROPERTY},
+            allowed_modes=_PARAM_MODES,
             tooltip="Reduce input references only when they exceed the model or request byte budget. "
                     "The original files and generated output resolution are unchanged.",
-            ui_options={"display_name": "Auto Resize References", "hide_handles": True}))
+            ui_options={"display_name": "Auto Image Resize"}))
         self.add_node_element(self._generation_settings)
         # Keep the first installed preview alias for existing saved edges, but
         # expose one canonical image preview/output in the current surface.
@@ -141,7 +145,14 @@ class HMBImageGeneration(SuccessFailureNode):
             allowed_modes={ParameterMode.PROPERTY, ParameterMode.OUTPUT},
             ui_options={"display_name": "Image", "hide_property": False},
             tooltip="Original saved image, connectable to an Image loader or HMBImageAssetLibrary.IMAGE_IMPORT_IN."))
-        self._output_file = ProjectFileParameter(node=self, name="output_file", default_filename="hmb_image.png",
+        self.add_parameter(Parameter(name="all_images", output_type="list[ImageUrlArtifact]",
+            type="list[ImageUrlArtifact]", default_value=[], settable=False,
+            allowed_modes={ParameterMode.PROPERTY, ParameterMode.OUTPUT}, hide=True, hide_property=True,
+            ui_options={"hide": True, "hide_handles": True}))
+        self.add_parameter(ParameterString(name="text", default_value="", settable=False, multiline=True,
+            allowed_modes={ParameterMode.PROPERTY, ParameterMode.OUTPUT}, hide=True, hide_property=True,
+            ui_options={"hide": True, "hide_handles": True}))
+        self._output_file = ProjectFileParameter(node=self, name="output_file", default_filename="hmb_image.jpeg",
             ui_options={"hide_handles": True})
         self._output_file.add_parameter()
 
@@ -213,6 +224,84 @@ class HMBImageGeneration(SuccessFailureNode):
         with suppress(Exception):
             self.publish_update_to_parameter(name, value)
 
+    def _local_image_display_artifact(self, artifact: Any) -> Any:
+        """Read an existing original through the native local file server.
+
+        This projection is display-only: stored outputs, downstream connections
+        and recovery keep the original file identity. It performs no upload,
+        copy, decode, provider request or file write.
+        """
+        if self._deleted or not isinstance(artifact, ImageUrlArtifact):
+            return artifact
+        source = artifact.value
+        if (not isinstance(source, str) or not source or len(source) > 4096
+                or re.search(r"[\x00-\x1f\x7f]", source)
+                or (urlsplit(source).scheme and not re.match(r"^[A-Za-z]:[\\/]", source))):
+            return artifact
+        try:
+            from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
+            from griptape_nodes.files.path_utils import canonicalize_to_posix, strip_windows_long_path_prefix
+
+            driver = self.engine.static_files_manager.storage_driver
+            if not isinstance(driver, LocalStorageDriver):
+                return artifact  # Never publish personal media to a cloud driver.
+            path = Path(File(source).resolve()).resolve()
+            if not path.is_file():
+                return artifact
+            identity = lambda stat: (stat.st_dev, stat.st_ino, stat.st_size,
+                                     stat.st_mtime_ns, stat.st_ctime_ns)
+            before = identity(path.stat())
+            url = driver.create_signed_download_url(path)
+            base = urlsplit(driver.base_url)
+            if (base.scheme not in {"http", "https"}
+                    or base.hostname not in {"localhost", "127.0.0.1", "::1"}
+                    or base.username or base.password or base.query or base.fragment
+                    or before != identity(path.stat()) or self._deleted):
+                return artifact
+            absolute = Path(strip_windows_long_path_prefix(path))
+            workspace = Path(strip_windows_long_path_prefix(driver.workspace_directory)).resolve()
+            try:
+                display_path = f"{base.path}/{absolute.relative_to(workspace).as_posix()}"
+            except ValueError:
+                external = canonicalize_to_posix(str(absolute)).removeprefix("/")
+                display_path = f"{base.path.rsplit('/workspace', 1)[0]}/external/{external}"
+            expected = base._replace(path=display_path).geturl()
+            if not url.startswith(expected):
+                return artifact
+            version = url[len(expected):]
+            if re.fullmatch(r"\?v=[A-Za-z0-9_-]{1,128}", version) is None:
+                return artifact
+            # Encode literal %, #, ?, spaces and Unicode as filename content,
+            # after proving the driver's exact original-file route.
+            url = base._replace(path=quote(display_path, safe="/:"), query=version[1:]).geturl()
+            key = (id(artifact), source, before, url)
+            cache = getattr(self, "_local_image_display_cache", None)
+            if not isinstance(cache, dict):
+                cache = self._local_image_display_cache = {}
+            if key in cache:
+                return cache[key]
+            projected = ImageUrlArtifact(value=url, name=artifact.name or path.name,
+                meta=deepcopy(artifact.meta))
+            # Saved legacy/canonical aliases may hydrate as distinct objects.
+            # Keep both display identities stable across repeated snapshots.
+            if len(cache) >= 2:
+                cache.pop(next(iter(cache)))
+            cache[key] = projected
+            return projected
+        except Exception:
+            # An optional display failure cannot reverse a saved success.
+            return artifact
+
+    def get_display_value_for_output(self, parameter_name: str, output_value: Any) -> Any:
+        # Native saved-output replay bypasses setters/after_value_set. The SDK
+        # uses this hook for completion events and initial/reopened snapshots.
+        if parameter_name in {"IMAGE_OUT", "image_url"}:
+            projected = self._local_image_display_artifact(output_value)
+            if projected is not output_value:
+                return projected
+        parent = getattr(super(), "get_display_value_for_output", None)
+        return parent(parameter_name, output_value) if callable(parent) else output_value
+
     def _complete_success(self, details: str) -> None:
         # The validated file and immutable task have already been committed.
         # Status display is supplementary and cannot reverse that success.
@@ -240,6 +329,17 @@ class HMBImageGeneration(SuccessFailureNode):
         path = raw.get("output_path")
         if not isinstance(path, str) or not path or len(path) > 4096 or "\x00" in path:
             raise ImageGenerationError("The saved image output path is invalid.")
+        if raw.get("provider_request_contract", "") not in {"", GOOGLE_NATIVE_CONTRACT}:
+            raise ImageGenerationError("The saved image provider contract is invalid.")
+        entries = raw.get("saved_images", [])
+        if (not isinstance(entries, list) or len(entries) > 128
+                or any(not isinstance(entry, dict) or type(entry.get("index")) is not int
+                    or not 0 <= entry["index"] < 128 or not isinstance(entry.get("path"), str)
+                    or not entry["path"] or len(entry["path"]) > 4096 or "\x00" in entry["path"]
+                    or not isinstance(entry.get("sha256"), str)
+                    or re.fullmatch(r"[a-f0-9]{64}", entry["sha256"]) is None for entry in entries)
+                or len({entry["index"] for entry in entries}) != len(entries)):
+            raise ImageGenerationError("The saved image list is invalid.")
         return deepcopy(raw)
 
     def _store_checkpoint(self, value: dict[str, Any]) -> None:
@@ -322,6 +422,11 @@ class HMBImageGeneration(SuccessFailureNode):
 
     @staticmethod
     def _profile_state(model: Any) -> dict[str, Any]:
+        if model.provider_request_contract == GOOGLE_NATIVE_CONTRACT:
+            result = json.loads(model._legacy_profile_json)
+            result.update(enabled=False, credential_ready=False,
+                provider_request_contract=model.provider_request_contract, native_contract=model.native_contract)
+            return result
         result = {"provider": model.provider, "model_id": model.model_id, "display_name": model.display_name,
             "enabled": False, "credential_ready": False, "tasks": list(model.tasks),
             "aspect_ratios": list(model.aspect_ratios), "image_sizes": list(model.image_sizes),
@@ -385,7 +490,7 @@ class HMBImageGeneration(SuccessFailureNode):
         # Native saved dynamic structure reopens as a generic Parameter. Rebuild
         # this unconnected property through public SDK APIs to restore typed
         # validation/traits; authored values are restored from the stable cache.
-        if existing is not None and not isinstance(existing, cls):
+        if existing is not None and not isinstance(existing, cls) and not self._has_input_connection(existing):
             self.hide_parameter_by_name(name)
             self.remove_parameter_element(existing)
             existing = None
@@ -394,8 +499,8 @@ class HMBImageGeneration(SuccessFailureNode):
             # value pool: opting out True/False can otherwise also omit another
             # field containing that same interned scalar (including success).
             kwargs = {"name": name, "default_value": deepcopy(spec.default),
-                "allowed_modes": {ParameterMode.PROPERTY},
-                "ui_options": {"display_name": spec.label, "hide_handles": True},
+                "allowed_modes": _PARAM_MODES,
+                "ui_options": {"display_name": spec.label},
                 "tooltip": "Model option: " + spec.name}
             if spec.choices:
                 kwargs["traits"] = {Options(choices=list(spec.choices), allow_custom=True)}
@@ -412,6 +517,13 @@ class HMBImageGeneration(SuccessFailureNode):
             self.add_parameter(existing)
         self._option_bindings[name] = (model_key, spec.name)
         return name
+
+    def _has_input_connection(self, parameter: Any) -> bool:
+        # Hydration can restore a connected dynamic control as a generic
+        # Parameter. Never replace it (or its edge) just to change its UI type.
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        return bool(GriptapeNodes.FlowManager().get_connections()
+            .get_incoming_connections_to_parameter(self, parameter))
 
     def _select_model_ui(self, key: str, *, remember_current: bool = True) -> None:
         if not self._model_settings_ready or self._restoring_model_settings:
@@ -450,13 +562,16 @@ class HMBImageGeneration(SuccessFailureNode):
             self._active_option_parameters = active
             self._selected_model = key
             self._sync_model_label()
+            for parameter_name in ("task", "output_format"):
+                (self.hide_parameter_by_name if key in _BUILTIN_PROFILES else self.show_parameter_by_name)(parameter_name)
             # Reuse other models' controls, but discard superseded descriptors
             # of this model after hiding them. Schema refreshes stay bounded.
             for name, binding in tuple(self._option_bindings.items()):
                 if binding[0] == key and name not in active.values():
                     self.hide_parameter_by_name(name)
-                    self.remove_parameter_element_by_name(name)
-                    self._option_bindings.pop(name, None)
+                    if not self._has_input_connection(self.get_parameter_by_name(name)):
+                        self.remove_parameter_element_by_name(name)
+                        self._option_bindings.pop(name, None)
         finally:
             self._restoring_model_settings = False
         self._store_model_settings()
@@ -506,8 +621,9 @@ class HMBImageGeneration(SuccessFailureNode):
             for parameter in tuple(self.parameters):
                 if parameter.name.startswith("model_option__") and parameter.name not in retained:
                     self.hide_parameter_by_name(parameter.name)
-                    self.remove_parameter_element(parameter)
-                    self._option_bindings.pop(parameter.name, None)
+                    if not self._has_input_connection(parameter):
+                        self.remove_parameter_element(parameter)
+                        self._option_bindings.pop(parameter.name, None)
         except (ValueError, TypeError, ImageGenerationError) as exc:
             # Optional UI cache corruption must not turn an existing workflow
             # into an unloadable placeholder or start work with guessed inputs.
@@ -597,15 +713,35 @@ class HMBImageGeneration(SuccessFailureNode):
         if isinstance(item, dict) and "value" in item:
             item = item["value"]
         value = getattr(item, "value", item)
+        if not isinstance(value, (str, bytes, Path)) and getattr(item, "base64", None):
+            value = item.base64
+        if isinstance(value, bytes):
+            return value
+        if not isinstance(value, (str, Path)):
+            raise ImageGenerationError("Connect a supported input image artifact or file.")
         if isinstance(value, str) and not value.startswith("data:"):
-            # SDK File resolves its own local static URLs and project macros.
-            # An external HTTP reference stays a URL and is refused before any
-            # fetch; a Broker bearer token is never sent to a reference host.
             resolved = File(value).resolve()
-            if urlsplit(resolved).scheme in {"http", "https", "file"}:
-                raise ImageGenerationError("Import the reference image locally before generating.")
+            if urlsplit(resolved).scheme in {"http", "https"}:
+                # Read selected URL artifacts through the same native File
+                # loader as Standard. No Broker bearer is passed to this host.
+                return resolved
+            if urlsplit(resolved).scheme == "file":
+                raise ImageGenerationError("Use a local file path or an input image artifact.")
             return Path(resolved)
-        return item
+        return value
+
+    @staticmethod
+    async def _prepare_references(references: tuple[Any, ...]) -> tuple[Any, ...]:
+        result = []
+        for value in references:
+            if isinstance(value, str) and urlsplit(value).scheme in {"http", "https"}:
+                try:
+                    value = await File(value).aread_data_uri(fallback_mime="image/png")
+                except Exception as exc:
+                    raise ImageGenerationError("An input image could not be loaded. No image was submitted.",
+                        code="INVALID_REFERENCE") from exc
+            result.append(value)
+        return tuple(result)
 
     def _capture_inputs(self) -> tuple[dict[str, Any], tuple[Any, ...], str]:
         if self._model_settings_error:
@@ -623,7 +759,18 @@ class HMBImageGeneration(SuccessFailureNode):
         refs = deepcopy(self.get_parameter_value("reference_images") or [])
         if not isinstance(refs, (list, tuple)):
             refs = [refs]
-        refs = tuple(self._resolve_reference(item) for item in refs if item not in (None, ""))
+        def flatten(values: Any, depth: int = 0) -> list[Any]:
+            if depth > 16:
+                raise ImageGenerationError("Image reference nesting exceeds the supported depth.")
+            if isinstance(values, (list, tuple)):
+                return [item for value in values for item in flatten(value, depth + 1)]
+            return [] if values is None or isinstance(values, str) and not values else [values]
+        refs = tuple(self._resolve_reference(item) for item in flatten(refs))
+        if selected in _BUILTIN_PROFILES:
+            # Native Google infers text/image mode from the connected images;
+            # legacy authored controls remain serialized, never hidden inputs.
+            inputs.update(task="image-to-image" if refs else "text-to-image",
+                output_format="native", provider_request_contract=GOOGLE_NATIVE_CONTRACT)
         output = str(self._output_file.build_file(_index=1).resolve())
         if urlsplit(output).scheme in {"http", "https", "file"}:
             raise ImageGenerationError("Select a local image output path.")
@@ -650,15 +797,22 @@ class HMBImageGeneration(SuccessFailureNode):
         return inputs
 
     @staticmethod
-    def _cached_image(checkpoint: dict[str, Any], job: dict[str, Any]) -> Path | None:
-        path = checkpoint.get("saved_path")
+    def _cached_image(checkpoint: dict[str, Any], job: dict[str, Any], result_index: int = 0) -> Path | None:
+        results = job.get("results", [job["result"]])
+        entry = next((item for item in checkpoint.get("saved_images", [])
+            if isinstance(item, dict) and item.get("index") == result_index), None)
+        if entry is None and result_index == checkpoint.get("saved_index", 0):
+            entry = {"path": checkpoint.get("saved_path"), "sha256": checkpoint.get("saved_sha256", "")}
+        if entry is None:
+            return None
+        path = entry.get("path")
         if not isinstance(path, str) or not path or len(path) > 4096:
             return None
         try:
             with Path(path).open("rb") as stream:
                 raw = stream.read(MAX_IMAGE_BYTES + 1)
-            validate_image_bytes(raw, advertised_mime=job["result"]["mime_type"],
-                advertised_sha256=job["result"].get("sha256") or checkpoint.get("saved_sha256", ""))
+            validate_image_bytes(raw, advertised_mime=results[result_index]["mime_type"],
+                advertised_sha256=results[result_index].get("sha256") or entry.get("sha256", ""))
             return Path(path)
         except (OSError, ValueError, ImageGenerationError):
             return None
@@ -671,6 +825,54 @@ class HMBImageGeneration(SuccessFailureNode):
                 raise ImageGenerationError("The retrieved image belongs to a different request.")
         if checkpoint["task_id"] != checkpoint["client_request_id"] and job.get("job_id") != checkpoint["task_id"]:
             raise ImageGenerationError("The retrieved image Task ID does not match.")
+        if (contract := checkpoint.get("provider_request_contract")) and job.get("provider_request_contract") != contract:
+            raise ImageGenerationError("The retrieved image provider contract does not match.")
+
+    async def _save_completed_images(self, broker: Any, checkpoint: dict[str, Any],
+                                     job: dict[str, Any], token: threading.Event) -> None:
+        results = job.get("results", [job["result"]])
+        saved_images = []
+        for index, result in enumerate(results):
+            if not self._is_live(token):
+                return
+            existing = await asyncio.to_thread(self._cached_image, checkpoint, job, index)
+            try:
+                if existing is not None:
+                    path, digest = existing, result.get("sha256")
+                    if not digest:
+                        digest = await asyncio.to_thread(lambda: hashlib.sha256(path.read_bytes()).hexdigest())
+                else:
+                    saved = await asyncio.to_thread(broker.save_result, job, Path(checkpoint["output_path"]),
+                        is_alive=lambda: self._is_live(token), result_index=index)
+                    path, digest = saved.path, saved.sha256
+            except (ImageGenerationError, OSError):
+                # Standard keeps all successfully downloaded results even if
+                # another output fails. Retrieve retries missing outputs only.
+                logger.warning("%s image output %s could not be saved; same Task retained", self.name, index + 1)
+                continue
+            if not self._is_live(token):
+                return
+            saved_images.append({"index": index, "path": str(path), "sha256": digest})
+            checkpoint["saved_images"] = saved_images + [entry for entry in checkpoint.get("saved_images", [])
+                if entry.get("index") not in {item["index"] for item in saved_images}]
+            first = saved_images[0]
+            checkpoint.update(saved_path=first["path"], saved_sha256=first["sha256"], saved_index=first["index"])
+            self._store_checkpoint(checkpoint)
+        if not saved_images:
+            raise ImageGenerationError("Image Task completed, but no image could be saved. "
+                "Retrieve this same Task; no replacement was submitted.", code="IMAGE_DOWNLOAD_FAILED")
+        checkpoint["saved_images"] = saved_images
+        self._store_checkpoint(checkpoint)
+        artifacts = [ImageUrlArtifact(value=entry["path"], name=Path(entry["path"]).name) for entry in saved_images]
+        self._publish("IMAGE_OUT", artifacts[0])
+        self._publish("image_url", artifacts[0])
+        self._publish("all_images", artifacts)
+        self._publish("text", job.get("text", ""))
+        details = f"SUCCESS: {job['job_id']}\n" + "\n".join("Saved image: " + entry["path"] for entry in saved_images)
+        missing = len(results) - len(saved_images)
+        if missing:
+            details += f"\n{missing} image(s) could not be saved. Retrieve this Task to retry those downloads."
+        self._complete_success(details)
 
     async def aprocess(self) -> None:
         await self._execute("run")
@@ -684,6 +886,9 @@ class HMBImageGeneration(SuccessFailureNode):
             token = self._operation_token = threading.Event()
         checkpoint: dict[str, Any] = {}
         try:
+            poll_timeout = self.get_parameter_value("timeout")
+            if type(poll_timeout) is not int or not 0 <= poll_timeout <= 86400:
+                raise ImageGenerationError("Polling timeout must be between 0 and 86400 seconds.")
             if action != "connect":
                 self._clear_execution_status()
             origin = broker_config.load_broker_base_url()
@@ -737,6 +942,13 @@ class HMBImageGeneration(SuccessFailureNode):
                     return
                 self._apply_capabilities(caps, origin)
                 frozen_inputs = self._options_for_capabilities(caps, inputs)
+                # Check native support before resolving any remote reference.
+                if frozen_inputs.get("provider_request_contract") and not any(
+                        model.provider == inputs["provider"] and model.model_id == inputs["model_id"]
+                        and model.provider_request_contract == GOOGLE_NATIVE_CONTRACT for model in caps.models):
+                    raise ImageGenerationError("Update the Broker native Google image adapter before generating. "
+                        "No image was submitted.", code="IMAGE_NATIVE_CONTRACT_REQUIRED")
+                refs = await self._prepare_references(refs)
                 invocation = await asyncio.to_thread(prepare_invocation, caps, references=refs, **frozen_inputs)
                 if not self._is_live(token):
                     return
@@ -744,6 +956,8 @@ class HMBImageGeneration(SuccessFailureNode):
                     "provider": invocation.provider, "model_id": invocation.model_id,
                     "client_request_id": invocation.client_request_id, "task_id": invocation.client_request_id,
                     "status": "submitting", "output_path": output}
+                if invocation.payload().get("provider_request_contract"):
+                    checkpoint["provider_request_contract"] = invocation.payload()["provider_request_contract"]
                 if getattr(caps, "_queue_admission", None) is not None:
                     checkpoint["queue_only_headers"] = json.loads(invocation._queue_headers_json)
                 self._store_checkpoint(checkpoint)
@@ -755,7 +969,7 @@ class HMBImageGeneration(SuccessFailureNode):
                         self._store_checkpoint(checkpoint)
                     raise
 
-            deadline = asyncio.get_running_loop().time() + self.POLL_TIMEOUT_SECONDS
+            deadline = asyncio.get_running_loop().time() + poll_timeout if poll_timeout else math.inf
             while self._is_live(token):
                 self._verify_recovered_job(job, checkpoint)
                 checkpoint.update(task_id=job["job_id"], status=job["status"])
@@ -774,23 +988,7 @@ class HMBImageGeneration(SuccessFailureNode):
                         submission_outcome_unknown=True)
                 self._store_checkpoint(checkpoint)
                 if job["status"] == "succeeded":
-                    # A repeated Retrieve must not create another local copy.
-                    existing = await asyncio.to_thread(self._cached_image, checkpoint, job)
-                    if existing is not None:
-                        saved_path = existing
-                    else:
-                        saved = await asyncio.to_thread(broker.save_result, job, Path(checkpoint["output_path"]),
-                            is_alive=lambda: self._is_live(token))
-                        saved_path = saved.path
-                        checkpoint["saved_sha256"] = saved.sha256
-                    if not self._is_live(token):
-                        return
-                    checkpoint["saved_path"] = str(saved_path)
-                    self._store_checkpoint(checkpoint)
-                    artifact = ImageUrlArtifact(value=str(saved_path), name=saved_path.name)
-                    self._publish("IMAGE_OUT", artifact)
-                    self._publish("image_url", artifact)
-                    self._complete_success(f"SUCCESS: {job['job_id']}\nSaved image: {saved_path}")
+                    await self._save_completed_images(broker, checkpoint, job, token)
                     return
                 if job["status"] in JOB_FAILURE_STATUSES:
                     raise ImageGenerationError(f"Image generation ended: {job['status']}. Task {job['job_id']} retained.")

@@ -87,6 +87,13 @@ async def exercise(engine, directory):
     nb2["option_schema"]["revision"] = "nb2-host-v1"
     nb2["option_schema"]["properties"]["use_google_image_search"] = {"type": "boolean", "default": False}
     raw_capabilities["models"].append(nb2)
+    for model in raw_capabilities['models']:
+        model['provider_request_contract'] = protocol.GOOGLE_NATIVE_CONTRACT
+        model['native_contract'] = {'output_formats': ['native'],
+            'defaults': {**model['defaults'], 'output_format': 'native'},
+            'option_schema': deepcopy(model['option_schema']),
+            'max_reference_image_bytes': 7 * 1024 * 1024,
+            'max_reference_bytes': model['max_reference_bytes'], 'max_result_images': 32}
     caps = protocol.parse_capabilities(raw_capabilities)
     records, creates, refreshes, downloads = {}, [], [], []
 
@@ -116,6 +123,7 @@ async def exercise(engine, directory):
                    "persistence_scope": "personal_local", "publish_to_reviews": False,
                    "result": {"url": self.server_url + "/api/assets/" + "A" * 43,
                               "mime_type": "image/png", "sha256": verified.sha256}}
+            job["provider_request_contract"] = payload["provider_request_contract"]
             records[job["job_id"]] = deepcopy(job)
             return deepcopy(job)
 
@@ -123,7 +131,7 @@ async def exercise(engine, directory):
             refreshes.append(task_id)
             return deepcopy(records[task_id])
 
-        def save_result(self, job, output_path, *, is_alive):
+        def save_result(self, job, output_path, *, is_alive, result_index=0):
             assert is_alive()
             downloads.append(job["job_id"])
             return protocol.save_image_atomic(verified, output_path, is_alive=is_alive)
@@ -172,11 +180,15 @@ async def exercise(engine, directory):
             "execution_succeeded": node._execution_succeeded,
             "result_details": node.get_parameter_value("result_details"),
         }
-        element_id = node.get_parameter_by_name("image_url").element_id
         details = send(engine, GetNodeElementDetailsRequest(node_name=node.name))
-        assert details.element_details["element_id_to_value"][element_id].value == str(path)
         snapshot = send(engine, GetAllNodeInfoRequest(node_name=node.name))
-        assert snapshot.element_id_to_value[element_id].value == str(path)
+        for key in ("IMAGE_OUT", "image_url"):
+            element_id = node.get_parameter_by_name(key).element_id
+            displayed = details.element_details["element_id_to_value"][element_id]
+            assert displayed.value.startswith(("http://127.0.0.1:", "http://localhost:"))
+            assert Path(File(displayed.value).resolve()).resolve() == path.resolve()
+            assert snapshot.element_id_to_value[element_id].value == displayed.value
+            assert snapshot.element_id_to_value[element_id].id == displayed.id
         return identity(path)
 
     try:

@@ -2802,6 +2802,18 @@
       "required": true
     },
     {
+      "name": "HMB_Color_LUT_Manual_Upload_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Color_LUT_Direct_Upload_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_VideoPicker_Worker_Reservation_Resilience_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",

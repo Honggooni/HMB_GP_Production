@@ -202,7 +202,7 @@ assert.equal(ui.q('[data-adjust="exposure"]').value, "3", "Old host echo cannot 
 assert.equal(ui.videos.length, 1, "State updates must not reopen the decoder.");
 ui.q('[data-action="export"]').dispatch("click");
 assert.equal(ui.publications.at(-1).__hmb_color_lut_command__.state.settings.exposure, .75);
-assert.equal(ui.publications.at(-1).__hmb_color_lut_command__.action, "export");
+assert.equal(ui.publications.at(-1).__hmb_color_lut_command__.action, "export_upload");
 assert.equal(ui.q("[data-preview]"), canvas);
 ui.q("[data-play]").dispatch("click"); assert.equal(videoA.paused, false); assert.equal(videoA.frameCallbacks.size, 1);
 ui.q("[data-play]").dispatch("click"); assert.equal(videoA.paused, true); assert.equal(videoA.frameCallbacks.size, 0);

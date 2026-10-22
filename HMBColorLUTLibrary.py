@@ -15,6 +15,7 @@ import subprocess
 import threading
 import tempfile
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Any, Mapping
@@ -43,6 +44,8 @@ _UPLOAD_ACTIVE: set[str] = set()
 _USAGE_LOCK = threading.RLock()
 _USAGE_ACTIVE: set[str] = set()
 COLOR_LUT_UPLOAD_SCHEMA = "hmb-color-lut-upload"
+COLOR_LUT_MANUAL_UPLOAD_SCHEMA = "hmb-color-lut-manual-upload"
+COLOR_LUT_MANUAL_UPLOAD_PATH = "/api/v1/reviews/color-lut/manual"
 
 
 def _advertised_api_path_matches(value: Any, expected: str, server_url: str) -> bool:
@@ -107,8 +110,10 @@ def _read_upload_receipt(identity: str) -> dict[str, Any]:
 def _upload_bridge(origin: str) -> Any:
     # Reuse the Generator's origin-scoped credentials and redirect protections.
     # Opening a Color LUT never starts device login or upstream generation.
-    from HMBSeedanceGeneration import _HMBAIBrokerBridge
-    return _HMBAIBrokerBridge(server_url=origin)
+    bridge = _usage_bridge(origin)
+    if bridge is None:
+        raise ValueError("브로커 로그인이 필요합니다. Generator에서 로그인한 뒤 다시 확인하세요.")
+    return bridge
 
 
 def _usage_bridge(origin: str) -> Any:
@@ -288,7 +293,7 @@ def _read_profiles() -> list[dict[str, Any]]:
 
 def default_state() -> dict[str, Any]:
     return {"schema_version": 1, "revision": 0, "language": "ko", "shot": _shot_only(),
-            "shot_catalog": {}, "project_id": "", "project": {}, "preset_name": "", "preset_id": "", "profiles": _read_profiles(),
+            "shot_catalog": {}, "project_id": "", "project": {}, "manual_project": {}, "preset_name": "", "preset_id": "", "profiles": _read_profiles(),
             "settings": default_settings(), "source": {}, "output": {
                 "codec": "hevc10", "manual_output_enabled": False, "path": ""},
             "status": {"phase": "idle", "message": "", "progress": 0}, "result": {}, "shot_states": {}}
@@ -297,6 +302,22 @@ def default_state() -> dict[str, Any]:
 def _selection_key(state: Mapping[str, Any]) -> str:
     shot = state.get("shot") if isinstance(state.get("shot"), Mapping) else {}
     return json.dumps([state.get("project_id", ""), shot.get("channel_uuid", ""), shot.get("shot_uuid", "")], ensure_ascii=False)
+
+
+def _export_selection(state: Mapping[str, Any]) -> str:
+    # A manual export's pixels do not change when its upload destination changes.
+    return _selection_key(state) if state.get("shot", {}).get("shot_uuid") else "manual"
+
+
+def _upload_project(value: Any) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        return {}
+    identity, name = value.get("project_id", value.get("id")), value.get("project_name", value.get("name"))
+    if (not isinstance(identity, str) or re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}", identity) is None
+            or not isinstance(name, str) or not name.strip() or len(name) > 256
+            or any(ord(c) < 32 or ord(c) == 127 for c in name)):
+        return {}
+    return {"id": identity, "name": name}
 
 
 def _source_identity(source: Any) -> tuple[str, str, str]:
@@ -367,7 +388,7 @@ class HMBColorLUTLibrary(DataNode):
             self.metadata = dict(getattr(self, "metadata", None) or kwargs.get("metadata") or {})
             self.metadata.setdefault("size", {"width": COLOR_LUT_NODE_WIDTH, "height": COLOR_LUT_NODE_HEIGHT})
         self.category = "HMB_GP_Production"
-        self.description = "Shot-bound local SDR color preview, project LUT and final video export."
+        self.description = "Local SDR color preview, project LUT, final export and explicit project web upload."
         self._lock = threading.RLock()
         # BaseNode._state is Griptape's NodeResolutionState, not dashboard data.
         # Keep our state namespaced across registration, invalidation and reset.
@@ -375,6 +396,11 @@ class HMBColorLUTLibrary(DataNode):
         self._syncing = False
         self._hydrated = False
         self._project_authoritative = False
+        self._bound_project: dict[str, Any] = {}
+        self._manual_projects: list[dict[str, str]] = []
+        self._manual_projects_origin = ""
+        self._manual_projects_worker: threading.Thread | None = None
+        self._manual_projects_checked = 0.0
         self._hmb_node_deleted = False
         self._hmb_initial_shot_autoclaim_pending = True
         self._hmb_initial_shot_preferred_uuid = ""
@@ -387,7 +413,8 @@ class HMBColorLUTLibrary(DataNode):
         self._worker: threading.Thread | None = None
         self._cancel = threading.Event()
         self._job_id = ""
-        self._web_upload: dict[str, Any] = {"enabled": False, "phase": "unavailable", "reason": "Only / 영상 불러오기는 웹 업로드를 지원하지 않습니다."}
+        self._web_upload: dict[str, Any] = {"enabled": False, "phase": "unavailable", "reason": "영상과 업로드할 프로젝트를 선택하세요."}
+        self._upload_source_facts: dict[tuple[Any, ...], dict[str, Any]] = {}
         self._web_upload_context: dict[str, Any] = {}
         self._web_upload_worker: threading.Thread | None = None
         self._web_upload_probe: threading.Thread | None = None
@@ -427,6 +454,7 @@ class HMBColorLUTLibrary(DataNode):
             try:
                 state = copy.deepcopy(self._hmb_color_lut_state)
                 state["web_upload"] = self._upload_projection()
+                state["upload_projects"] = copy.deepcopy(self._manual_projects)
                 state["_web_node_id"] = self._web_node_id
                 _set_parameter_silently(self, UI, state)
                 publisher = getattr(self, "publish_update_to_parameter", None)
@@ -445,17 +473,96 @@ class HMBColorLUTLibrary(DataNode):
         view = copy.deepcopy(self._web_upload)
         context = self._web_upload_context
         current = self._hmb_color_lut_state
-        if not current["shot"].get("shot_uuid"):
-            return {"enabled": False, "phase": "unavailable", "reason": "Only / 영상 불러오기는 웹 업로드를 지원하지 않습니다."}
+        if not current["shot"].get("shot_uuid") and not _upload_project(current.get("manual_project")):
+            return {"enabled": False, "phase": "unavailable", "reason": "업로드할 프로젝트를 선택하세요."}
         if context.get("state_stamp") != self._upload_state_stamp(current):
-            return {"enabled": False, "phase": "unavailable", "reason": "현재 샷의 보정 영상을 먼저 최종 출력하세요."}
+            return {"enabled": False, "phase": "unavailable", "reason": "현재 영상의 업로드 연결을 확인하는 중입니다."}
         if (context.get("source_token") != self._source_token or context.get("route_epoch") != self._web_upload_epoch
                 or getattr(context.get("generator"), "_hmb_node_deleted", False)
                 or getattr(context.get("asset"), "_hmb_node_deleted", False)):
             return {"enabled": False, "phase": "unavailable", "reason": "원본 샷 연결이 변경되었습니다."}
         if self._hmb_node_deleted:
             view["enabled"] = False
+        if context.get("manual"):
+            from _hmb_broker_config import load_broker_base_url
+            try:
+                same_origin = context.get("server_url") == load_broker_base_url()
+            except ValueError:
+                same_origin = False
+            if not same_origin:
+                return {"enabled": False, "phase": "unavailable", "reason": "브로커 주소가 변경되었습니다. 프로젝트를 다시 확인하세요."}
         return view
+
+    def _schedule_manual_projects(self, *, force: bool = False) -> None:
+        """Authenticated advisory reads off the editor thread; never log in or upload."""
+        with self._lock:
+            if self._hmb_node_deleted or self._manual_projects_worker is not None and self._manual_projects_worker.is_alive():
+                return
+            if not force and time.monotonic() - self._manual_projects_checked < 30:
+                return
+            self._manual_projects_checked = time.monotonic()
+        def load() -> None:
+            origin, projects = "", []
+            try:
+                from _hmb_broker_config import load_broker_base_url
+                origin = load_broker_base_url()
+                bridge = _usage_bridge(origin)  # Existing protected login only.
+                if bridge is None:
+                    raise ValueError("브로커 로그인이 필요합니다.")
+                cap = bridge.review_capabilities().get("color_lut_manual_upload", {})
+                if (not isinstance(cap, dict) or cap.get("schema") != COLOR_LUT_MANUAL_UPLOAD_SCHEMA
+                        or type(cap.get("version")) is not int or cap["version"] != 1
+                        or not _advertised_api_path_matches(cap.get("projects_path"), COLOR_LUT_MANUAL_UPLOAD_PATH + "/projects", origin)):
+                    raise ValueError("서버 업데이트 후 프로젝트를 선택할 수 있습니다.")
+                projects = self._manual_project_rows(bridge)
+            except Exception:
+                LOGGER.debug("Color LUT manual projects unavailable")
+            with self._lock:
+                if self._hmb_node_deleted:
+                    return
+                self._manual_projects, self._manual_projects_origin = projects, origin
+                self._hmb_color_lut_state["revision"] += 1
+                self._web_upload_probe_key = ""
+            self._publish()
+            self._schedule_upload_probe()
+        self._manual_projects_worker = threading.Thread(target=contextvars.copy_context().run, args=(load,), name="HMB LUT projects", daemon=True)
+        self._manual_projects_worker.start()
+
+    @staticmethod
+    def _manual_project_rows(bridge: Any) -> list[dict[str, str]]:
+        reply = bridge._request_json("GET", COLOR_LUT_MANUAL_UPLOAD_PATH + "/projects", payload=None, timeout=5)
+        rows = reply.get("projects")
+        if (reply.get("schema") != "hmb-color-lut-manual-projects" or type(reply.get("version")) is not int or reply["version"] != 1
+                or not isinstance(rows, list) or len(rows) > 100):
+            raise ValueError("서버 프로젝트 목록을 확인할 수 없습니다.")
+        result = [_upload_project(row) for row in rows]
+        if any(not row for row in result) or len({row["id"] for row in result}) != len(result):
+            raise ValueError("서버 프로젝트 목록이 올바르지 않습니다.")
+        return result
+
+    def _upload_source_context(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        if state["shot"].get("shot_uuid"):
+            return self._upload_graph_context(state)
+        from _hmb_broker_config import load_broker_base_url
+        from _hmb_shot_routing import _same_flow_nodes
+        project = _upload_project(state.get("manual_project"))
+        flow, nodes = _same_flow_nodes(self)
+        if not flow or self not in nodes or self._hmb_node_deleted or not state["source"].get("path"):
+            raise ValueError("먼저 영상을 불러오세요.")
+        if state["source"].get("shot_uuid") or state["source"].get("channel_uuid"):
+            raise ValueError("Only 영상의 샷 연결이 남아 있습니다. 영상을 다시 불러오세요.")
+        if not project:
+            raise ValueError("업로드할 프로젝트를 선택하세요.")
+        # Source names come from the probed local file, never widget/title input.
+        name = Path(state["source"]["path"]).name
+        if (not name or len(name) > 128 or any(c in name for c in '/\\:*?"<>|') or name.endswith((".", " ")) or not Path(name).suffix
+                or any(unicodedata.category(c) in {"Cc", "Cs"} or unicodedata.bidirectional(c) in
+                       {"LRE", "RLE", "LRO", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI"} for c in name)):
+            raise ValueError("업로드할 원본 파일명을 확인하세요. (최대 128자)")
+        return {"manual": True, "flow": flow, "server_url": load_broker_base_url(),
+                "project_id": project["id"], "project_name": project["name"], "file_name": name,
+                "source_identity": list(_source_identity(state["source"])),
+                "source_token": self._source_token, "route_epoch": self._web_upload_epoch}
 
     def _upload_graph_context(self, state: Mapping[str, Any]) -> dict[str, Any]:
         """Resolve provenance from registered objects and physical data edges."""
@@ -638,13 +745,15 @@ class HMBColorLUTLibrary(DataNode):
         if (local["stage"] != "local_export" or local["export_sha256"] != context["sha256"]
                 or local["settings_sha256"] != context["settings_sha256"]):
             raise ValueError("Frozen LUT usage identity changed.")
-        event = usage.validate_event({**local, "stage": "web_upload", "source_task_id": context["source_task_id"],
+        source_task = context.get("uploaded_task_id") if context.get("manual") else context["source_task_id"]
+        event = usage.validate_event({**local, "stage": "web_upload", "source_task_id": source_task,
                                       "upload_idempotency_key": context["upload_id"]})
         self._queue_usage_event(event, context["server_url"], expected_owner=context["owner_id"])
 
     def _record_export_proof(self, state: dict[str, Any], result: dict[str, Any], cancel: threading.Event) -> None:
         """Private durable receipt, never accepted from browser state."""
-        self._upload_graph_context(state)
+        if state["shot"].get("shot_uuid"):
+            self._upload_graph_context(state)
         path = Path(result["path"]).resolve()
         info = path.stat()
         captured = state.get("_usage_export")
@@ -654,7 +763,7 @@ class HMBColorLUTLibrary(DataNode):
                    != (info.st_size, info.st_mtime_ns, info.st_dev, info.st_ino)):
             raise ValueError("Verified export identity is unavailable.")
         proof = {"schema": "hmb-color-lut-local-export-v1", "source_identity": list(_source_identity(state["source"])),
-                 "selection": _selection_key(state), "settings": normalize_settings(state["settings"]),
+                 "selection": _export_selection(state), "settings": normalize_settings(state["settings"]), "output": _output(state["output"]),
                  "path": str(path), "size": info.st_size, "mtime_ns": info.st_mtime_ns,
                  "sha256": artifact["sha256"] if artifact else _file_digest(path, cancel), "job_id": result["job_id"]}
         if isinstance(captured, dict) and captured.get("event"):
@@ -663,8 +772,7 @@ class HMBColorLUTLibrary(DataNode):
         _write_upload_receipt(identity, proof)
         result["web_export_proof"] = identity
 
-    def _prepare_upload_context(self, state: dict[str, Any], *, recheck_file: bool = True) -> dict[str, Any]:
-        context = self._upload_graph_context(state)
+    def _export_upload_proof(self, state: dict[str, Any], *, recheck_file: bool = True) -> dict[str, Any]:
         result = state["result"]
         proof = _read_upload_receipt(str(result.get("web_export_proof") or "")) if result.get("web_export_proof") else {}
         if proof.get("schema") != "hmb-color-lut-local-export-v1" or _digest(proof) != result.get("web_export_proof"):
@@ -675,13 +783,69 @@ class HMBColorLUTLibrary(DataNode):
         info = path.stat()
         if (proof.get("schema") != "hmb-color-lut-local-export-v1" or _digest(proof) != result.get("web_export_proof")
                 or proof.get("settings") != normalize_settings(state["settings"])
+                or ("output" in proof and proof["output"] != _output(state["output"]))
                 or proof.get("source_identity") != list(_source_identity(state["source"]))
-                or proof.get("selection") != _selection_key(state) or proof.get("path") != str(path)
+                or proof.get("selection") != _export_selection(state) or proof.get("path") != str(path)
                 or proof.get("size") != info.st_size or proof.get("mtime_ns") != info.st_mtime_ns
                 or (recheck_file and proof.get("sha256") != _file_digest(path))):
             raise ValueError("현재 설정으로 최종 출력한 보정 영상이 필요합니다.")
+        return proof
+
+    def _prepare_upload_context(self, state: dict[str, Any], *, recheck_file: bool = True,
+                                artifact: str = "export") -> dict[str, Any]:
+        context = self._upload_source_context(state)
+        if artifact == "source":
+            path = Path(state["source"]["path"]).resolve()
+            info = path.stat()
+            cache_key = (str(path), info.st_size, info.st_mtime_ns, info.st_dev, info.st_ino)
+            with self._lock:
+                facts = copy.deepcopy(self._upload_source_facts.get(cache_key))
+            if recheck_file or not facts:
+                facts = _verified_export_hash(path, threading.Event())
+                with self._lock:
+                    self._upload_source_facts[cache_key] = copy.deepcopy(facts)
+                    while len(self._upload_source_facts) > 4:
+                        del self._upload_source_facts[next(iter(self._upload_source_facts))]
+            # These bytes are the original, regardless of the preview sliders.
+            proof = {**facts, "settings": default_settings()}
+        elif artifact == "export":
+            proof = self._export_upload_proof(state, recheck_file=recheck_file)
+            path = Path(proof["path"])
+            info = path.stat()
+        else:
+            raise ValueError("Unknown upload artifact.")
+        context["artifact"] = artifact
         bridge = _upload_bridge(context["server_url"])
         capabilities = bridge.review_capabilities()
+        if context.get("manual"):
+            cap = capabilities.get("color_lut_manual_upload", {})
+            if (not isinstance(cap, dict) or cap.get("schema") != COLOR_LUT_MANUAL_UPLOAD_SCHEMA
+                    or type(cap.get("version")) is not int or cap["version"] != 1 or cap.get("enabled") is not True
+                    or cap.get("display_name") != "HMB Color LUT"
+                    or not _advertised_api_path_matches(cap.get("upload_path"), COLOR_LUT_MANUAL_UPLOAD_PATH, context["server_url"])
+                    or not _advertised_api_path_matches(cap.get("status_path"), COLOR_LUT_MANUAL_UPLOAD_PATH + "/{idempotency_key}", context["server_url"])
+                    or not _advertised_api_path_matches(cap.get("projects_path"), COLOR_LUT_MANUAL_UPLOAD_PATH + "/projects", context["server_url"])):
+                raise ValueError("브로커의 Only Color LUT 업로드 지원·활성화를 확인하세요.")
+            maximum = cap.get("max_bytes")
+            if type(maximum) is not int or not 1 <= maximum <= 536870912 or info.st_size > maximum:
+                raise ValueError("보정 영상이 서버의 업로드 용량 제한을 초과했습니다.")
+            if path.suffix.lower() not in {".mov", ".mp4"}:
+                raise ValueError("이 출력 형식은 웹 업로드를 지원하지 않습니다.")
+            projects = self._manual_project_rows(bridge)
+            if {"id": context["project_id"], "name": context["project_name"]} not in projects:
+                raise ValueError("선택한 프로젝트가 서버의 업로드 목록에 없습니다. 프로젝트를 다시 선택하세요.")
+            me = bridge._request_json("GET", "/api/me", payload=None, timeout=5)
+            owner = str(me.get("id") or me.get("user_id") or (me.get("user") or {}).get("id") or "")
+            if not owner:
+                raise ValueError("브로커 로그인 계정을 확인하세요.")
+            context.update(path=str(path), size=info.st_size, mtime_ns=info.st_mtime_ns, sha256=proof["sha256"],
+                           settings=proof["settings"], owner_id=owner, bridge=bridge, state_stamp=self._upload_state_stamp(state),
+                           settings_sha256=_digest(proof["settings"]))
+            if isinstance(proof.get("usage_event"), dict):
+                context["usage_event"] = copy.deepcopy(proof["usage_event"])
+            context["upload_id"] = hashlib.sha256("\n".join(("hmb-color-lut-manual-upload-v1", context["project_id"], context["file_name"], context["sha256"], context["settings_sha256"])).encode("utf-8")).hexdigest()
+            context["receipt_id"] = _digest([context["server_url"], context["owner_id"], context["upload_id"]])
+            return context
         cap = capabilities.get("color_lut_upload", {})
         if (not isinstance(cap, dict) or cap.get("schema") != COLOR_LUT_UPLOAD_SCHEMA or type(cap.get("version")) is not int or cap.get("version") != 1
                 or cap.get("enabled") is not True or cap.get("display_name") != "HMB Color LUT"
@@ -726,7 +890,9 @@ class HMBColorLUTLibrary(DataNode):
                 return
             state = copy.deepcopy(self._hmb_color_lut_state)
             stamp = self._upload_state_stamp(state)
-            if not state["shot"].get("shot_uuid") or not state["result"].get("web_export_proof"):
+            if not state["source"].get("path"):
+                return
+            if not state["shot"].get("shot_uuid") and not _upload_project(state.get("manual_project")):
                 return
             if self._web_upload_probe_key == stamp and (self._web_upload_context.get("bridge") is not None
                     or self._web_upload_probe is not None and self._web_upload_probe.is_alive()):
@@ -753,9 +919,19 @@ class HMBColorLUTLibrary(DataNode):
                     selected_stamp = self._upload_state_stamp(selected)
                     token, epoch = self._source_token, self._web_upload_epoch
                     self._web_upload_wake.clear()
-                context, error = {}, ""
+                context, error, local_error = {}, "", False
                 try:
-                    context = self._prepare_upload_context(selected, recheck_file=retry == 0)
+                    # Invalid local ownership/route is not an offline service.
+                    # Do not hold a readiness worker waiting for the Broker.
+                    self._upload_source_context(selected)
+                    if not Path(selected["source"]["path"]).is_file():
+                        raise ValueError("업로드할 로컬 영상 파일이 없습니다.")
+                except Exception as exc:
+                    error, local_error = str(exc), True
+                try:
+                    if local_error:
+                        raise ValueError(error)
+                    context = self._prepare_upload_context(selected, recheck_file=False, artifact="source")
                 except Exception as exc:
                     error = str(exc)
                 with self._lock:
@@ -768,9 +944,13 @@ class HMBColorLUTLibrary(DataNode):
                     complete = receipt.get("phase") == "complete"
                     pending = receipt.get("phase") in {"pending", "unknown"}
                     self._web_upload = {"enabled": bool(context) and not complete, "phase": "complete" if complete else "unknown" if pending else "ready" if context else "unavailable",
-                                        "reason": "웹 업로드 완료" if complete else error or "현재 보정 영상을 웹에 업로드합니다."}
-                self._publish()
-                if context:
+                                        "reason": "원본 웹 업로드 완료" if complete else error or "최종 출력 없이 원본 영상을 바로 업로드합니다."}
+                    self._hmb_color_lut_state["revision"] += 1
+                try:
+                    self._publish()
+                except Exception:
+                    LOGGER.debug("Color LUT readiness notification deferred", exc_info=True)
+                if context or local_error:
                     selected = None
                     continue
                 # A held/offline Broker can become available later. One
@@ -789,6 +969,12 @@ class HMBColorLUTLibrary(DataNode):
         return self._hmb_node_deleted
 
     def _upload_metadata(self, context: dict[str, Any]) -> dict[str, Any]:
+        if context.get("manual"):
+            return {"schema": COLOR_LUT_MANUAL_UPLOAD_SCHEMA, "version": 1,
+                    **{key: context[key] for key in ("project_id", "file_name", "settings_sha256")},
+                    "workflow_id": context["flow"], "color_lut_node_id": self._web_node_id,
+                    "export_sha256": context["sha256"], "export_bytes": context["size"],
+                    "output_format": Path(context["path"]).suffix.lower().lstrip(".")}
         return {"schema": COLOR_LUT_UPLOAD_SCHEMA, "version": 1,
                 **{key: context[key] for key in ("source_task_id", "source_revision", "channel_uuid", "shot_uuid", "settings_sha256")},
                 "workflow_id": context["flow"], "generator_node_id": context["source_node_instance_id"],
@@ -801,7 +987,8 @@ class HMBColorLUTLibrary(DataNode):
         from urllib.request import Request
         from urllib.parse import quote as urlquote
         bridge, identity = context["bridge"], context["upload_id"]
-        path = "/api/v1/reviews/tasks/" + urlquote(context["source_task_id"], safe="") + "/color-lut"
+        path = (COLOR_LUT_MANUAL_UPLOAD_PATH if context.get("manual") else
+                "/api/v1/reviews/tasks/" + urlquote(context["source_task_id"], safe="") + "/color-lut")
         metadata = context.get("frozen_metadata") or self._upload_metadata(context)
         if retrieve:
             return bridge._request_json("GET", path + "/" + identity, payload=None, timeout=30)
@@ -839,23 +1026,27 @@ class HMBColorLUTLibrary(DataNode):
             _broker_require_exact_response_url(response, request.full_url)
             return _broker_read_json(response, max_bytes=65536)
 
-    def _start_web_upload(self, state: dict[str, Any]) -> None:
-        # This is an explicit user command, never a side effect of export or Run.
-        if not self._upload_projection().get("enabled"):
+    def _start_web_upload(self, state: dict[str, Any], *, artifact: str = "export",
+                          chained: bool = False, cancel_event: threading.Event | None = None) -> None:
+        # Only upload_web or the explicit export_upload command may submit.
+        if not chained and not self._upload_projection().get("enabled"):
             self._status("error", self._upload_projection().get("reason", "웹 업로드 준비가 필요합니다."))
             return
         self._web_upload = {"enabled": False, "phase": "uploading", "reason": "웹 업로드 중…"}
-        cancel = self._cancel = threading.Event()
+        cancel = self._cancel = cancel_event if cancel_event is not None else threading.Event()
         def upload() -> None:
             identity, sent, claimed, retrieve, context, durable = "", False, False, False, {}, {}
             try:
-                context = self._prepare_upload_context(state)
+                if cancel.is_set() or self._hmb_node_deleted:
+                    return
+                context = self._prepare_upload_context(state, artifact=artifact)
                 identity = context["upload_id"]
-                current = self._upload_graph_context(state)
+                current = self._upload_source_context(state)
                 if any(current.get(key) != context.get(key) for key in current):
                     raise ValueError("원본 Generator 또는 샷 연결이 변경되었습니다.")
                 with self._lock:
-                    if self._hmb_node_deleted or context["state_stamp"] != self._upload_state_stamp(self._hmb_color_lut_state):
+                    if (cancel.is_set() or self._hmb_node_deleted or context["state_stamp"] != self._upload_state_stamp(self._hmb_color_lut_state)
+                            or context["source_token"] != self._source_token or context["route_epoch"] != self._web_upload_epoch):
                         raise ValueError("현재 샷 또는 보정 설정이 변경되었습니다.")
                 with _UPLOAD_LOCK:
                     if identity in _UPLOAD_ACTIVE:
@@ -887,14 +1078,20 @@ class HMBColorLUTLibrary(DataNode):
                     # uncertain response is retrieved with the same ID only.
                     sent = True
                     response = self._upload_request(context, retrieve=retrieve, cancel=cancel)
-                if (not isinstance(response, dict) or response.get("schema") != "hmb-color-lut-upload-result" or type(response.get("version")) is not int or response.get("version") != 1
+                manual = context.get("manual") is True
+                expected_schema = "hmb-color-lut-manual-upload-result" if manual else "hmb-color-lut-upload-result"
+                identity_fields = ("project_id", "project_name", "sha256", "file_name") if manual else ("source_task_id", "project_id", "project_name", "channel_uuid", "shot_uuid", "sha256", "shot_name")
+                if (not isinstance(response, dict) or response.get("schema") != expected_schema or type(response.get("version")) is not int or response.get("version") != 1
                         or any(response.get(key) != context[key] for key in
-                               ("source_task_id", "project_id", "project_name", "channel_uuid", "shot_uuid", "sha256", "shot_name"))
+                               identity_fields)
+                        or (manual and (response.get("manual") is not True or any(response.get(key) is not None for key in ("source_task_id", "channel_uuid", "shot_uuid", "shot_name"))))
                         or type(response.get("bytes")) is not int or response.get("bytes") != context["size"] or type(response.get("created")) is not bool
                         or response.get("display_name") != "HMB Color LUT" or response.get("source_kind") != "HMB Color LUT"
                         or not isinstance(response.get("asset_id"), str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", response["asset_id"]) is None
                         or not isinstance(response.get("derived_task_id"), str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", response["derived_task_id"]) is None):
                     raise ValueError("서버가 동일 보정 영상의 업로드 완료를 확인하지 못했습니다.")
+                if manual:
+                    context["uploaded_task_id"] = response["derived_task_id"]
                 try:
                     _write_upload_receipt(context["receipt_id"], {**durable, "schema": COLOR_LUT_UPLOAD_SCHEMA, "phase": "complete", "upload_id": identity, "response": response})
                 except OSError:
@@ -902,9 +1099,11 @@ class HMBColorLUTLibrary(DataNode):
                     # server upload. The server retains this idempotency key.
                     LOGGER.debug("Color LUT completed upload receipt could not be saved", exc_info=True)
                 with self._lock:
-                    if not self._hmb_node_deleted and context["state_stamp"] == self._upload_state_stamp(self._hmb_color_lut_state):
+                    if (not self._hmb_node_deleted and context["state_stamp"] == self._upload_state_stamp(self._hmb_color_lut_state)
+                            and context["source_token"] == self._source_token and context["route_epoch"] == self._web_upload_epoch):
                         self._web_upload_context = context
                         self._web_upload = {"enabled": False, "phase": "complete", "reason": "웹 업로드 완료 · HMB Color LUT"}
+                        self._hmb_color_lut_state["revision"] += 1
                 try:
                     self._queue_web_usage(context)
                 except Exception:
@@ -917,7 +1116,8 @@ class HMBColorLUTLibrary(DataNode):
                     except OSError:
                         LOGGER.debug("Color LUT pending upload receipt could not be saved", exc_info=True)
                 with self._lock:
-                    if not self._hmb_node_deleted and self._upload_state_stamp(state) == self._upload_state_stamp(self._hmb_color_lut_state):
+                    if (not self._hmb_node_deleted and self._upload_state_stamp(state) == self._upload_state_stamp(self._hmb_color_lut_state)
+                            and (not context or context.get("source_token") == self._source_token and context.get("route_epoch") == self._web_upload_epoch)):
                         self._web_upload = {"enabled": bool(sent), "phase": "ready" if absent else "unknown" if sent else "unavailable",
                                             "reason": "서버에 업로드가 없습니다. 다시 누르면 동일 ID로 업로드합니다." if absent else "동일 업로드 상태 확인이 필요합니다. 다시 누르면 새 업로드 없이 조회합니다." if sent else str(exc)}
             finally:
@@ -925,6 +1125,12 @@ class HMBColorLUTLibrary(DataNode):
                     if claimed:
                         _UPLOAD_ACTIVE.discard(identity)
                 self._publish()
+                if artifact == "export":
+                    # The separate Web Upload button always represents the raw
+                    # source. The output button retries its own frozen export.
+                    with self._lock:
+                        self._web_upload_probe_key = ""
+                    self._schedule_upload_probe()
         self._web_upload_worker = threading.Thread(target=contextvars.copy_context().run, args=(upload,), name="HMB LUT web upload", daemon=True)
         self._web_upload_worker.start()
         self._publish()
@@ -956,6 +1162,12 @@ class HMBColorLUTLibrary(DataNode):
 
     def _switch(self, shot: Any, project: str | None = None) -> None:
         self._remember_selection()
+        if shot != self._hmb_color_lut_state["shot"]:
+            selected = (_upload_project(self._hmb_color_lut_state.get("manual_project")) if not shot.get("shot_uuid")
+                        else getattr(self, "_bound_project", {}))
+            if selected:
+                project = str(selected.get("id") or "")
+                self._hmb_color_lut_state["project"] = copy.deepcopy(selected)
         self._hmb_color_lut_state["shot"] = copy.deepcopy(shot)
         if project is not None:
             self._hmb_color_lut_state["project_id"] = project
@@ -991,8 +1203,10 @@ class HMBColorLUTLibrary(DataNode):
             self._hydrated = True
             supplied_project = str(value.get("project_id") or "")
             current_project = self._hmb_color_lut_state["project_id"]
+            initial_manual = bool(initial and isinstance(value.get("shot"), Mapping) and not value["shot"].get("shot_uuid")
+                                  and _upload_project(value.get("manual_project")))
             if ("project_id" in value and supplied_project != current_project
-                    and (not initial or (self._project_authoritative and supplied_project))):
+                    and (not initial or (self._project_authoritative and supplied_project and not initial_manual))):
                 # A debounced edit/command can arrive after ImageAsset has
                 # changed the project. Never reinterpret its settings as an
                 # edit of the newly selected project, even at a higher UI rev.
@@ -1016,6 +1230,10 @@ class HMBColorLUTLibrary(DataNode):
                 if not self._project_authoritative:
                     self._hmb_color_lut_state["project_id"] = str(value.get("project_id") or "")
                     self._hmb_color_lut_state["project"] = dict(value.get("project") or {}) if isinstance(value.get("project"), Mapping) else {}
+                self._hmb_color_lut_state["manual_project"] = _upload_project(value.get("manual_project"))
+                if initial_manual:
+                    manual = self._hmb_color_lut_state["manual_project"]
+                    self._hmb_color_lut_state.update(project_id=manual["id"], project=copy.deepcopy(manual))
                 if isinstance(value.get("shot_catalog"), Mapping):
                     self._hmb_color_lut_state["shot_catalog"] = _normalize_shot_catalog(value["shot_catalog"], allow_sparse=True)
             try:
@@ -1059,6 +1277,7 @@ class HMBColorLUTLibrary(DataNode):
         self._publish()
         if changed:
             self._reconcile()
+        self._schedule_upload_probe()
         if command:
             self._command(command)
 
@@ -1217,10 +1436,13 @@ class HMBColorLUTLibrary(DataNode):
             if action == "cancel":
                 self._cancel.set()
                 return
-            if action in {"export", "browse_video", "upload_web"} and self._worker is not None and self._worker.is_alive():
+            if action == "refresh_upload_projects":
+                self._schedule_manual_projects()
+                return
+            if action in {"export", "export_upload", "browse_video", "upload_web"} and self._worker is not None and self._worker.is_alive():
                 self._status("busy", "A local operation is already running.")
                 return
-            if action == "upload_web" and self._web_upload_worker is not None and self._web_upload_worker.is_alive():
+            if action in {"upload_web", "export", "export_upload", "browse_video"} and self._web_upload_worker is not None and self._web_upload_worker.is_alive():
                 return
             if action == "delete_profile" and any(worker is not None and worker.is_alive()
                     for worker in (self._worker, self._source_worker, self._web_upload_worker)):
@@ -1233,6 +1455,32 @@ class HMBColorLUTLibrary(DataNode):
             if isinstance(authored, Mapping) and _selection_key(authored) != _selection_key(captured):
                 # Delayed buttons belong to their original Project/Shot.
                 # Cancellation was handled above and may still stop that job.
+                return
+            if action == "select_upload_project":
+                if captured["shot"].get("shot_uuid"):
+                    return
+                from _hmb_broker_config import load_broker_base_url
+                identity = value.get("project_id")
+                projects = self._manual_projects if self._manual_projects_origin == load_broker_base_url() else []
+                project = next((row for row in projects if row["id"] == identity), None) if identity else {}
+                if project is None:
+                    self._status("error", "서버 프로젝트 목록에서 선택하세요.")
+                    self._schedule_manual_projects()
+                    return
+                self._remember_selection()
+                self._hmb_color_lut_state.update(manual_project=copy.deepcopy(project), project=copy.deepcopy(project), project_id=project.get("id", ""))
+                self._hmb_color_lut_state["preset_id"] = ""
+                try:
+                    revision = max(0, min(2**53 - 2, int(authored.get("revision") or 0))) if isinstance(authored, Mapping) else 0
+                except (TypeError, ValueError, OverflowError):
+                    revision = 0
+                self._hmb_color_lut_state["revision"] = max(captured["revision"], revision) + 1
+                self._web_upload_epoch += 1
+                self._web_upload_probe_key = ""
+                self._web_upload_context = {}
+                self._remember_selection()
+                self._publish()
+                self._schedule_upload_probe()
                 return
             if action == "delete_profile":
                 # Deletion never reapplies authored grading/media/output fields.
@@ -1267,13 +1515,23 @@ class HMBColorLUTLibrary(DataNode):
                 self._save_profile(captured, authored)
                 return
             if action == "upload_web":
-                self._start_web_upload(captured)
+                self._start_web_upload(captured, artifact="source")
                 return
-            if action not in {"export", "browse_video"}:
+            if action not in {"export", "export_upload", "browse_video"}:
                 return
             self._cancel = threading.Event()
             self._job_id = request_id
-            if action == "export":
+            if action in {"export", "export_upload"}:
+                if action == "export_upload":
+                    try:
+                        self._upload_source_context(captured)
+                        if CODEC_EXTENSIONS[captured["output"]["codec"]] not in {".mov", ".mp4"}:
+                            raise ValueError("웹 업로드에는 MOV 또는 MP4 출력 형식을 선택하세요.")
+                    except Exception as exc:
+                        self._status("error", str(exc))
+                        return
+                    captured["_upload_chain"] = {"stamp": self._export_operation_stamp(captured),
+                        "source_token": self._source_token, "route_epoch": self._web_upload_epoch}
                 # Capture before dispatch: changing the active workflow mid-export
                 # must not redirect this export's collection to another project.
                 try:
@@ -1474,9 +1732,7 @@ class HMBColorLUTLibrary(DataNode):
                 self._record_export_proof(state, result, cancel)
             except Exception as exc:
                 result.pop("web_export_proof", None)
-                # Only exports have no web provenance by design.
-                if state["shot"].get("shot_uuid"):
-                    self._export_warning(result, "web_receipt", exc)
+                self._export_warning(result, "web_receipt", exc)
         current = self._retain_export_result(state, result, key, job_id)
         # Each notification is independent: a broken output subscriber or UI
         # bridge must not reclassify a successfully saved local video as error.
@@ -1526,7 +1782,10 @@ class HMBColorLUTLibrary(DataNode):
         project = dict(project) if isinstance(project, Mapping) else {}
         with self._lock:
             self._project_authoritative = True
+            self._bound_project = copy.deepcopy(project)
             state = self._hmb_color_lut_state
+            if not state["shot"].get("shot_uuid") and state.get("manual_project"):
+                return
             if state["project"] == project:
                 return
             project_id = str(project.get("id") or "")
@@ -1577,7 +1836,19 @@ class HMBColorLUTLibrary(DataNode):
                 if key == _selection_key(self._hmb_color_lut_state):
                     self._status("cancelled", "취소되었습니다." if self._hmb_color_lut_state["language"] == "ko" else "Cancelled.")
                 return
-            if action == "export":
+            if action == "export_upload" and state["result"].get("web_export_proof"):
+                try:
+                    reusable = self._export_upload_proof(state)
+                    if reusable.get("output") != _output(state["output"]):
+                        raise ValueError("Choose a fresh export for the current output settings.")
+                except (ValueError, OSError):
+                    pass
+                else:
+                    # Also after restart/unknown receipt: retrieve the same
+                    # exported bytes rather than re-encoding a replacement.
+                    self._continue_export_upload(state, cancel)
+                    return
+            if action in {"export", "export_upload"}:
                 if not source:
                     raise ValueError("No matching completed video is loaded.")
                 directory = Path(state["data_directory"])
@@ -1594,8 +1865,10 @@ class HMBColorLUTLibrary(DataNode):
                         self._status("working", "Encoding original source…", float(value))
                 result = export_video(source, destination, state["settings"], codec=codec, cancel_event=cancel, progress=progress)
             result = {**result, "shot": state["shot"], "project_id": state["project_id"], "settings": state["settings"], "job_id": job_id}
-            if action == "export":
+            if action in {"export", "export_upload"}:
                 self._finish_local_export(state, result, key, job_id, cancel)
+                if action == "export_upload":
+                    self._continue_export_upload(state, cancel)
         except Exception as exc:
             with self._lock:
                 if (self._job_id == job_id and key == _selection_key(self._hmb_color_lut_state)
@@ -1605,6 +1878,26 @@ class HMBColorLUTLibrary(DataNode):
                         self._status("cancelled" if cancel.is_set() else "error", str(exc))
                     except Exception:
                         LOGGER.debug("Color LUT failed operation notification deferred", exc_info=True)
+
+    def _export_operation_stamp(self, state: Mapping[str, Any]) -> str:
+        return _digest([_selection_key(state), _source_identity(state.get("source")),
+                        normalize_settings(state.get("settings")), _output(state.get("output")),
+                        state.get("manual_project")])
+
+    def _continue_export_upload(self, state: dict[str, Any], cancel: threading.Event) -> None:
+        chain = state.get("_upload_chain", {})
+        with self._lock:
+            current = self._hmb_color_lut_state
+            if (cancel.is_set() or self._hmb_node_deleted
+                    or chain.get("stamp") != self._export_operation_stamp(current)
+                    or chain.get("source_token") != self._source_token
+                    or chain.get("route_epoch") != self._web_upload_epoch):
+                return
+            captured = copy.deepcopy(current)
+            current["status"] = {"phase": "complete", "message": str(current["result"].get("path") or ""), "progress": 1}
+        # This continuation is authorized by the output-and-upload click. A
+        # failed upload never changes the completed local file into a failure.
+        self._start_web_upload(captured, artifact="export", chained=True, cancel_event=cancel)
 
     def _hmb_shot_channel_subscription(self) -> dict[str, Any]:
         shot = self._hmb_color_lut_state["shot"]
@@ -1680,6 +1973,7 @@ class HMBColorLUTLibrary(DataNode):
         if not self._hmb_node_deleted:
             self._reconcile()
             self._hmb_post_hydration_state_restore()
+            self._schedule_manual_projects()
 
     def _hmb_post_hydration_state_restore(self) -> None:
         with self._lock:
@@ -1701,7 +1995,9 @@ class HMBColorLUTLibrary(DataNode):
                 value.pop("__hmb_color_lut_command__", None)
                 supplied_project = str(value.get("project_id") or "")
                 current_project = str(self._hmb_color_lut_state.get("project_id") or "")
-                if self._project_authoritative and supplied_project != current_project:
+                manual = _upload_project(value.get("manual_project"))
+                manual_restore = bool(manual and supplied_project == manual["id"] and isinstance(value.get("shot"), Mapping) and not value["shot"].get("shot_uuid"))
+                if self._project_authoritative and supplied_project != current_project and not manual_restore:
                     value = copy.deepcopy(self._hmb_color_lut_state)
             result = super().set_parameter_value(name, value, *args, **kwargs)
             if saved:

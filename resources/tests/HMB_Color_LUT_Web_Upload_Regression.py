@@ -66,9 +66,9 @@ class ColorLUTUploadRegression(unittest.TestCase):
         self.node._record_export_proof(copy.deepcopy(self.node._hmb_color_lut_state), result, threading.Event())
         self.node._hmb_color_lut_state["result"] = result
 
-    def ready(self):
+    def ready(self, artifact="source"):
         state = copy.deepcopy(self.node._hmb_color_lut_state)
-        context = self.node._prepare_upload_context(state)
+        context = self.node._prepare_upload_context(state, artifact=artifact)
         self.node._web_upload_context = context
         self.node._web_upload = {"enabled": True, "phase": "ready", "reason": "ready"}
         return context
@@ -167,7 +167,7 @@ class ColorLUTUploadRegression(unittest.TestCase):
         state["result"]["path"] = str(self.root / "unrelated.mov")
         with self.assertRaises(ValueError): self.node._prepare_upload_context(state)
         Path(self.node._hmb_color_lut_state["result"]["path"]).write_bytes(b"changed")
-        with self.assertRaises(ValueError): self.ready()
+        with self.assertRaises(ValueError): self.ready("export")
 
     def test_settings_change_disables_immediately_and_old_grade_never_uploads(self):
         self.ready()
@@ -190,9 +190,9 @@ class ColorLUTUploadRegression(unittest.TestCase):
         def online(_delay):
             self.bridge.review_capabilities = ready
             return False
-        original = target._file_digest
+        original = target._verified_export_hash
         with mock.patch.object(self.node, "_upload_retry_wait", side_effect=online) as wait, \
-             mock.patch.object(target, "_file_digest", wraps=original) as hashed:
+             mock.patch.object(target, "_verified_export_hash", wraps=original) as hashed:
             self.node._schedule_upload_probe()
             self.node._schedule_upload_probe()
             self.assertEqual(len(ControlledThread.pending), 1)
@@ -298,9 +298,10 @@ class ColorLUTUploadRegression(unittest.TestCase):
         metadata = json.loads(body.split(b"\r\n\r\n", 1)[1].split(b"\r\n--", 1)[0])
         self.assertEqual(set(metadata), {"schema", "version", "source_task_id", "source_revision", "channel_uuid", "shot_uuid", "workflow_id", "generator_node_id", "color_lut_node_id", "export_sha256", "export_bytes", "output_format", "settings_sha256"})
         self.assertNotIn(str(self.root).encode(), body)
-        self.assertIn(b'filename="color-lut.mov"', body)
-        self.assertIn(b"Content-Type: video/quicktime", body)
-        self.assertIn(b"offline-graded-video", body)
+        self.assertIn(b'filename="color-lut.mp4"', body)
+        self.assertIn(b"Content-Type: video/mp4", body)
+        self.assertIn(Path(self.source["path"]).read_bytes(), body)
+        self.assertNotIn(b"offline-graded-video", body)
         expected = __import__("hashlib").sha256("\n".join(("hmb-color-lut-upload-v1", context["source_task_id"], context["sha256"], context["settings_sha256"], context["shot_uuid"])).encode()).hexdigest()
         self.assertEqual(context["upload_id"], expected)
 

@@ -177,6 +177,22 @@ class ColorLUTHydrationLifecycle(unittest.TestCase):
         self.node._hmb_post_registration_shot_discovery()
         self.queued.assert_called_once_with(state['source'])
 
+    def test_only_upload_destination_restores_without_adopting_image_asset_project(self):
+        self.node._hmb_follow_image_asset_project({'id':'asset-project','name':'Asset project'})
+        self.publisher.reset_mock()
+        state=target.default_state()
+        state.update(project_id='katuri8', project={'id':'katuri8','name':'까투리8'},
+                     manual_project={'id':'katuri8','name':'까투리8'}, source={'path':'C:/synthetic/11-12.mp4'})
+        state['settings'].update(enabled=True,exposure=.75)
+        state['result']={'path':'C:/synthetic/graded.mov','web_export_proof':'a'*64}
+        self.send(state)
+        actual=self.node._hmb_color_lut_state
+        for key in ('manual_project','project_id','project','source','settings','result'):
+            self.assertEqual(actual[key],state[key])
+        self.node._hmb_follow_image_asset_project({'id':'other-asset','name':'Other asset'})
+        self.assertEqual(self.node._hmb_color_lut_state['project_id'],'katuri8')
+        self.publisher.assert_not_called();self.commands.assert_not_called();self.queued.assert_not_called()
+
     def test_late_live_edit_from_prior_project_stays_rejected(self):
         state=saved_state();self.send(state)
         self.node._hmb_follow_image_asset_project({'id':'project-B','name':'B'})
@@ -197,5 +213,5 @@ class ColorLUTHydrationLifecycle(unittest.TestCase):
 if __name__=='__main__':
     suite=unittest.defaultTestLoader.loadTestsFromTestCase(ColorLUTHydrationLifecycle)
     result=unittest.TextTestRunner(verbosity=2).run(suite)
-    if result.wasSuccessful() and not result.skipped:print('HMB_COLOR_LUT_HYDRATION_LIFECYCLE=PASS (11 real native initial_setup regressions, synthetic blocked-probe boundary, no export/model execution)')
+    if result.wasSuccessful() and not result.skipped:print('HMB_COLOR_LUT_HYDRATION_LIFECYCLE=PASS (12 real native initial_setup regressions, synthetic blocked-probe boundary, no export/model execution)')
     raise SystemExit(0 if result.wasSuccessful() and not result.skipped else 1)

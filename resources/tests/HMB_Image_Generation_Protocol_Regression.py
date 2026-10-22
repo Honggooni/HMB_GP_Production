@@ -450,4 +450,81 @@ with tempfile.TemporaryDirectory(prefix="hmb-image-auto-resize-") as temporary:
     rejects(lambda: images.prepare_invocation(CAPS, **OPTIONS, auto_image_resize="true"), "IMAGE_OPTION_INVALID")
     rejects(lambda: images.prepare_invocation(replace(CAPS, max_request_bytes=32), **OPTIONS), "IMAGE_LIMIT")
 
+# New clients negotiate the additive contract; historical PNG requests keep
+# their exact shape. Verify the real helper create revalidation as well.
+native_raw = copy.deepcopy(RAW_CAPS)
+native_model = native_raw["models"][0]
+native_model.update(provider="google", model_id="gemini-3.1-flash-image", max_reference_images=14,
+    provider_request_contract=images.GOOGLE_NATIVE_CONTRACT)
+native_model["native_contract"] = {
+    "output_formats": ["native"],
+    "defaults": {"task": "text-to-image", "ratio": "16:9", "image_size": "1K", "output_format": "native"},
+    "option_schema": images.serialize_option_schema("native-parity-fixture-v1", images.BUILTIN_IMAGE_MODEL_PROFILES[1].options),
+    "max_reference_image_bytes": 7 * 1024 * 1024, "max_reference_bytes": 14900000, "max_result_images": 32}
+native_caps = images.parse_capabilities(native_raw)
+native_options = OPTIONS | {"provider": "google", "model_id": "gemini-3.1-flash-image", "output_format": "native",
+    "provider_request_contract": images.GOOGLE_NATIVE_CONTRACT,
+    "model_options": {"temperature": 0.0, "top_p": 0.0, "use_google_search": True, "use_google_image_search": True}}
+native_invocation = images.prepare_invocation(native_caps, **native_options)
+check(native_invocation.payload()["output_format"] == "native")
+check(native_invocation.payload()["model_options"]["use_google_image_search"] is True)
+check(native_model["output_formats"] == ["png", "jpeg", "webp"], "Native overlay mutated legacy capabilities")
+old_google = copy.deepcopy(native_raw)
+old_google["models"][0].pop("provider_request_contract")
+old_google["models"][0].pop("native_contract")
+rejects(lambda: images.prepare_invocation(images.parse_capabilities(old_google), **native_options), "IMAGE_NATIVE_CONTRACT_REQUIRED")
+rejects(lambda: images.prepare_invocation(native_caps, **(native_options | {"provider_request_contract": ""})), "IMAGE_NATIVE_CONTRACT_REQUIRED")
+for bad_value in (None, {}, {"output_formats": ["png"]}):
+    bad = copy.deepcopy(native_raw)
+    bad["models"][0]["native_contract"] = bad_value
+    rejects(lambda: images.parse_capabilities(bad))
+
+native_bridge = FakeBridge()
+native_bridge.capabilities_result = native_raw
+native_transport = images.ImageGenerationBroker(native_bridge)
+native_transport.capabilities()
+native_job = job_for(native_invocation, status="succeeded")
+native_job["provider_request_contract"] = images.GOOGLE_NATIVE_CONTRACT
+native_job["results"] = [copy.deepcopy(native_job["result"])]
+originals = [PNG, image_bytes("JPEG"), image_bytes("WEBP")]
+for index, mime in ((1, "image/jpeg"), (2, "image/webp")):
+    native_job["results"].append({"url": native_bridge.server_url + "/api/assets/" + chr(97 + index) * 43,
+        "mime_type": mime, "sha256": hashlib.sha256(originals[index]).hexdigest()})
+native_job["text"] = "literal generated text <plain>"
+native_bridge.result = native_job
+check(native_transport.create(native_invocation)["results"] == native_job["results"])
+check(native_bridge.calls[-1][2]["payload"] == native_invocation.payload())
+bad = copy.deepcopy(native_job)
+bad.pop("provider_request_contract")
+rejects(lambda: images.validate_job(bad, invocation=native_invocation), "IMAGE_IDENTITY_MISMATCH")
+for mutation in (lambda j: j["results"].reverse(), lambda j: j["results"][1].pop("sha256"),
+                 lambda j: j["results"].append(j["results"][0]), lambda j: j.update(text="x" * 65537)):
+    bad = copy.deepcopy(native_job)
+    mutation(bad)
+    rejects(lambda: images.validate_job(bad, invocation=native_invocation))
+with tempfile.TemporaryDirectory(prefix="hmb-native-images-") as folder:
+    for index, raw in enumerate(originals):
+        with mock.patch.object(native_bridge._opener, "open",
+                side_effect=lambda request, timeout, raw=raw: FakeResponse(request.full_url, raw)):
+            saved = native_transport.save_result(native_job, Path(folder) / "image.png", result_index=index)
+        check(saved.path.read_bytes() == raw)
+        check(saved.path.suffix == (".png", ".jpg", ".webp")[index])
+    rejects(lambda: native_transport.save_result(native_job, Path(folder) / "image.png", result_index=3), "IMAGE_IDENTITY_MISMATCH")
+    before = len(native_bridge.downloads)
+    bad = copy.deepcopy(native_job)
+    bad["results"][1]["url"] = "https://other.invalid/api/assets/" + "z" * 43
+    rejects(lambda: native_transport.save_result(bad, Path(folder) / "image.png", result_index=1), "IMAGE_RESULT_UNTRUSTED")
+    check(len(native_bridge.downloads) == before)
+
+# Native reference count/order and WebP compression match the installed
+# Standard strategy. Direct Broker request budget is additionally enforced.
+edit_native = native_options | {"task": "image-to-image"}
+many = images.prepare_invocation(native_caps, **edit_native, references=[PNG] * 14)
+check(len(many.payload()["reference_images"]) == 14)
+rejects(lambda: images.prepare_invocation(native_caps, **edit_native, references=[PNG] * 15), "IMAGE_LIMIT")
+small_native = replace(native_caps, models=(replace(native_caps.models[0], max_reference_image_bytes=100),))
+rejects(lambda: images.prepare_invocation(small_native, **edit_native, references=[image_bytes(size=(100, 60))]), "IMAGE_LIMIT")
+shrunk = images.prepare_invocation(small_native, **edit_native, references=[image_bytes(size=(100, 60))], auto_image_resize=True)
+check(shrunk.payload()["reference_images"][0].startswith("data:image/webp;base64,"))
+check(len(base64.b64decode(shrunk.payload()["reference_images"][0].split(",", 1)[1])) <= 100)
 print(json.dumps({"status": "PASS", "checks": checks, "network": "mock-only", "paid_generation": False}))

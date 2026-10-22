@@ -54,7 +54,9 @@ with tempfile.TemporaryDirectory(prefix="hmb-motion-png-") as temporary:
         # shared Maya staging. Only the authored frame name crosses the limit.
         while len(str(directory)) < 100:
             directory = directory / "capture-staging"
-        directory.mkdir(parents=True)
+        # A long CI TEMP root can already satisfy the staging length. In that
+        # case TemporaryDirectory has created this exact directory for us.
+        directory.mkdir(parents=True, exist_ok=True)
         for total in (270, 300):
             long = directory / ("x" * (total - len(str(directory)) - 5) + ".png")
             assert len(str(long)) == total and len(long.name) < 256
