@@ -261,7 +261,30 @@ class MyBoxNodeTests(unittest.TestCase):
     def test_preflight_has_no_auth_workspace_upload_or_post(self):
         before=self.authored(); self.controller().preflight()
         self.assertEqual(self.authored(),before); self.assertFalse(self.backend.calls)
+    def test_removed_source_field_stays_hidden_after_visibility_refresh(self):
+        field=self.node.get_parameter_by_name(controller_module.SOURCE_PARAMETER)
+        self.assertTrue(field.hide); self.assertTrue(field.hide_property)
+        self.assertFalse(self.node.get_parameter_by_name(controller_module.TITLE_PARAMETER).hide)
+        field.update_ui_options({'hide':False,'hide_property':False})
+        self.node._update_parameter_visibility()
+        self.assertTrue(field.hide); self.assertTrue(field.hide_property)
+        self.assertFalse(self.backend.calls)
+    def test_legacy_source_is_preserved_on_reopen_but_never_used_for_new_submission(self):
+        legacy='old hidden source value which is no longer a render input'
+        self.node.set_parameter_value(controller_module.SOURCE_PARAMETER,legacy)
+        self.node=self.reopen()
+        field=self.node.get_parameter_by_name(controller_module.SOURCE_PARAMETER)
+        self.assertTrue(field.hide); self.assertTrue(field.hide_property)
+        self.assertEqual(self.node.get_parameter_value(controller_module.SOURCE_PARAMETER),legacy)
         self.node._ensure_broker_connected.assert_not_awaited()
+        self.controller().preflight(); self.run_node(); self.assert_success()
+        self.assertEqual(len(self.backend.created),1)
+        self.assertFalse(self.backend.created[-1].get('video_urls'))
+        self.assertFalse(self.backend.posts('/source-reference'))
+        saved=self.checkpoint()['job_id']; creates=len(self.backend.created)
+        self.node=self.reopen(); self.run_node(refresh=True); self.assert_success()
+        self.assertEqual(self.checkpoint()['job_id'],saved); self.assertEqual(len(self.backend.created),creates)
+        self.assertFalse(self.backend.posts('/source-reference'))
     def test_native_run_dispatches_private_only_without_agent_or_public_renderer(self):
         asyncio.run(self.node._aprocess_impl()); self.assert_success()
         self.node._prepare_managed_agent_shot.assert_not_awaited()
@@ -452,20 +475,24 @@ class MyBoxNodeTests(unittest.TestCase):
         self.assertEqual(self.checkpoint()['queue_only_headers'],admission.headers)
         self.assertFalse(self.backend.posts('/workspace'))
 
-    def test_queue_private_editing_uses_owner_get_and_typed_source_no_grant(self):
+    def test_queue_private_editing_uses_explicit_video_not_legacy_source_field(self):
         self.run_node(); source=self.checkpoint()['job_id']
+        previous_calls=len(self.backend.calls)
         admission=self.enable_queue()
         self.node.set_parameter_value('task',target.TASK_VIDEO_EDITING)
         self.node.set_parameter_value(controller_module.SOURCE_PARAMETER,source)
+        reference='https://93.184.216.34/synthetic-fixture-only/explicit-source.mp4'
+        self.node.set_parameter_value(target.VIDEO_REFERENCES_PARAMETER,[VideoUrlArtifact(value=reference)])
         self.node.set_parameter_value('draft_action',target.DRAFT_ACTION_OFF)
         self.run_node(); self.assert_success()
         self.assertEqual(len(self.backend.created),2,self.node.parameter_output_values.get('result_details'))
-        self.assertEqual(self.backend.created[-1]['video_urls'],['hmb-queue-only-source://'+source])
+        self.assertEqual(self.backend.created[-1]['video_urls'],[reference])
         self.assertEqual(self.backend.created[-1].get('omni_reference_task_type'),'edit')
         self.assertEqual(self.backend.created[-1]['duration_seconds'],-1)
         self.assertEqual(self.backend.created[-1]['aspect_ratio'],'adaptive')
         self.assertFalse(self.backend.posts('/source-reference'))
-        self.assertTrue(any(m=='GET' and p==protocol.API+'/items/'+source for m,p,k in self.backend.calls))
+        self.assertFalse(any(m=='GET' and p==protocol.API+'/items/'+source
+            for m,p,k in self.backend.calls[previous_calls:]))
         self.assertEqual(self.checkpoint()['queue_only_headers'],admission.headers)
 
     def test_queue_private_final_preserves_authored480_and_fresh_source(self):
@@ -521,6 +548,37 @@ class MyBoxNodeTests(unittest.TestCase):
         preview=self.node.parameter_output_values['video_url']
         self.assertIsInstance(preview,VideoUrlArtifact)
         self.assertNotIn('/api/v1/only/my-box/',str(preview.value))
+    def test_local_completion_and_same_task_restore_clear_download_preview(self):
+        self.backend.block_stage='download'
+        async def exercise():
+            running=asyncio.create_task(self.controller().run())
+            try:
+                self.assertTrue(await asyncio.to_thread(self.backend.started.wait,3))
+                self.assertEqual(self.node._hmb_generation_preview_state['phase'],'downloading')
+                self.assertNotEqual(self.checkpoint()['stage'],'local_succeeded')
+            finally:self.backend.release.set()
+            await running
+        asyncio.run(exercise()); path=self.assert_success()
+        self.assertEqual(self.node._hmb_generation_preview_state['phase'],'succeeded')
+        self.assertEqual(self.node._hmb_generation_preview_state['media_revision'],self.node._hmb_generation_media_revision)
+        task=self.checkpoint()['job_id']; before=self.authored()
+        self.run_node(refresh=True)
+        self.assertEqual(self.assert_success(),path)
+        self.assertEqual(self.node._hmb_generation_preview_state['phase'],'succeeded')
+        reopened=self.reopen()
+        self.run_node(reopened,refresh=True)
+        self.assertEqual(self.assert_success(reopened),path)
+        self.assertEqual(reopened._hmb_generation_preview_state['phase'],'succeeded')
+        self.assertEqual(self.checkpoint(reopened)['job_id'],task)
+        self.assertEqual(self.authored(reopened),before)
+        self.assertEqual(len(self.backend.created),1)
+        self.assertEqual(len(self.backend.downloads),1)
+    def test_remote_success_is_not_local_preview_success(self):
+        controller=self.controller()
+        controller._status('succeeded','job-mybox-'+'a'*32)
+        self.assertEqual(self.node._hmb_generation_preview_state['phase'],'downloading')
+        controller._status('verifying','job-mybox-'+'a'*32)
+        self.assertEqual(self.node._hmb_generation_preview_state['phase'],'verifying')
     def test_private_video_is_never_observable_with_stale_production_provenance(self):
         parameter=target.GENERATED_VIDEO_SOURCE_PARAMETER
         old=dict(schema='legacy-production-fixture',project_id='superwings12',shot_name='Old production Shot')
@@ -711,7 +769,7 @@ class MyBoxNodeTests(unittest.TestCase):
             self.run_node()
         self.assertTrue(self.checkpoint().get('job_id')); self.assertFalse(self.node._execution_succeeded)
         immediate.assert_not_called(); self.assertTrue(deferred.called,'Unconfirmed remote Task references were not retained')
-    def test_own_editing_and_extension_use_target_request_bound_source_grant(self):
+    def test_editing_and_extension_use_explicit_video_after_source_field_removal(self):
         source='job-mybox-'+'a'*32
         source_payload=dict(provider='volcengine_ark',model=target.SEEDANCE_2_5_MODEL_ID,
             client_request_id='source-request',hmb_generation_task=target.TASK_TEXT_ONLY)
@@ -722,22 +780,25 @@ class MyBoxNodeTests(unittest.TestCase):
                 self.node.set_parameter_value('draft_action',target.DRAFT_ACTION_OFF)
                 self.node.set_parameter_value('resolution','720p')
                 self.node.set_parameter_value(controller_module.SOURCE_PARAMETER,source)
+                reference='https://93.184.216.34/synthetic-fixture-only/explicit-source.mp4'
+                self.node.set_parameter_value(target.VIDEO_REFERENCES_PARAMETER,[VideoUrlArtifact(value=reference)])
                 self.run_node(); self.assert_success()
                 payload=self.backend.created[-1]
                 self.assertEqual(payload.get('omni_reference_task_type'),target.TASK_OMNI_REFERENCE_TYPES[task])
-                grants=self.backend.posts('/source-reference'); self.assertTrue(grants)
-                self.assertEqual(grants[-1][2]['payload'],dict(target_client_request_id=payload['client_request_id'],task=task))
-                self.assertIn(BASE+protocol.API+'/provider-source/'+'A'*43,payload['video_urls'])
+                self.assertFalse(self.backend.posts('/source-reference'))
+                self.assertEqual(payload['video_urls'],[reference])
                 self.assertFalse(FORBIDDEN_PROJECT_FIELDS & set(payload))
-    def test_foreign_workspace_source_cannot_issue_grant_or_create(self):
+    def test_legacy_foreign_source_is_not_a_hidden_input_for_new_render(self):
         source='job-mybox-'+'b'*32
         source_payload=dict(provider='volcengine_ark',model=target.SEEDANCE_2_5_MODEL_ID,
             client_request_id='source-request',hmb_generation_task=target.TASK_TEXT_ONLY)
         self.backend.jobs[source]=dict(self.backend.job(source_payload,11),task_id=source,job_id=source,
             workspace_id='mbx_'+'b'*32)
-        self.node.set_parameter_value('task',target.TASK_VIDEO_EDITING)
+        self.node.set_parameter_value('task',target.TASK_TEXT_ONLY)
         self.node.set_parameter_value(controller_module.SOURCE_PARAMETER,source)
-        self.run_node(); self.assertFalse(self.backend.created); self.assertFalse(self.backend.posts('/source-reference'))
+        self.run_node(); self.assert_success(); self.assertEqual(len(self.backend.created),1)
+        self.assertFalse(self.backend.posts('/source-reference'))
+        self.assertFalse(any(m=='GET' and p==protocol.API+'/items/'+source for m,p,k in self.backend.calls))
     def test_unsupported_final_projection_cannot_enable_or_submit_final(self):
         self.run_node(); self.assert_success(); before=self.authored()
         self.assertFalse(self.controller().draft_ui_state()['final_available'])

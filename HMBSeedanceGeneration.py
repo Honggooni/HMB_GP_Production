@@ -8851,9 +8851,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self.show_parameter_by_name(ONLY_PROJECT_PARAMETER)
         else:
             self.hide_parameter_by_name(ONLY_PROJECT_PARAMETER)
-        for name in (_my_box_node.TITLE_PARAMETER, _my_box_node.SOURCE_PARAMETER):
+        for name in (_my_box_node.TITLE_PARAMETER,):
             if self.get_parameter_by_name(name) is not None:
                 (self.show_parameter_by_name if _my_box_node.is_selected(self) else self.hide_parameter_by_name)(name)
+        legacy_source = self.get_parameter_by_name(_my_box_node.SOURCE_PARAMETER)
+        if legacy_source is not None and (not legacy_source.hide or not legacy_source.hide_property):
+            legacy_source.update_ui_options({"hide": True, "hide_property": True})
         if manual_output_controls:
             self.show_parameter_by_name(["output_format", "return_last_frame"])
         else:

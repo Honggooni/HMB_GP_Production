@@ -91,6 +91,8 @@ class HMBImageGeneration(SuccessFailureNode):
         self._active_option_parameters: dict[str, str] = {}
         self._option_bindings: dict[str, tuple[str, str]] = {}
         self._model_settings_error = ""
+        self._model_label_keys: dict[str, str] = {}
+        self._syncing_model_label = False
 
         header_traits = {Widget(name="HMBImageGenerationWidget", library="HMB_GP_Production")} if Widget is not None else set()
         self.add_parameter(ParameterString(name="HMB_IMAGE_GENERATION_UI", default_value="HMBImageGeneration",
@@ -99,7 +101,14 @@ class HMBImageGeneration(SuccessFailureNode):
                 "hide_handles": True, "is_full_width": True,
                 "height": 64, "min_height": 64, "max_height": 64, "widget_height": 64,
                 "expandable": False, "resizable": False, "compact": True}))
-        self._add_choice("model_id", "google/gemini-3-pro-image", list(_BUILTIN_PROFILES), "Image Model")
+        # Native Options has no separate value/label mapping. Keep the original
+        # serializable model_id for saved workflows, input edges and transport;
+        # this property-only view displays names without changing that identity.
+        self._add_choice("image_model", "Nano Banana Pro",
+            [item.display_name for item in BUILTIN_IMAGE_MODEL_PROFILES], "Image Model",
+            allowed_modes={ParameterMode.PROPERTY}, serializable=False)
+        self._add_choice("model_id", "google/gemini-3-pro-image", list(_BUILTIN_PROFILES), "Model ID",
+            hide=True, hide_property=True)
         self._add_choice("task", "text-to-image", ["text-to-image", "image-to-image"], "Task")
         self.add_parameter(ParameterString(name="prompt", default_value="", multiline=True,
             placeholder_text="Describe the image, or the changes to your reference images...",
@@ -176,14 +185,15 @@ class HMBImageGeneration(SuccessFailureNode):
             "options": {}, "auto_image_resize": True}
         self._select_model_ui(initial_model, remember_current=False)
 
-    def _add_choice(self, name: str, value: str, choices: list[str], label: str) -> None:
+    def _add_choice(self, name: str, value: str, choices: list[str], label: str, **kwargs: Any) -> None:
         # Saved future model/options must survive an offline cold open. The
         # Broker capability validator, rather than a dropdown converter, is
         # the authority at submission time.
         trait = Options(choices=choices, allow_custom=True)
         self._choices[name] = trait
-        self.add_parameter(ParameterString(name=name, default_value=value, allowed_modes=_PARAM_MODES,
-            traits={trait}, ui_options={"display_name": label, "hide_handles": True}))
+        modes = kwargs.pop("allowed_modes", _PARAM_MODES)
+        self.add_parameter(ParameterString(name=name, default_value=value, allowed_modes=modes,
+            traits={trait}, ui_options={"display_name": label, "hide_handles": True}, **kwargs))
 
     def _is_live(self, token: threading.Event | None = None) -> bool:
         # This predicate also runs in transport workers: no retained-engine
@@ -253,6 +263,46 @@ class HMBImageGeneration(SuccessFailureNode):
     def _update_model_choices(self) -> None:
         models = self._capabilities.models if self._capabilities is not None else BUILTIN_IMAGE_MODEL_PROFILES
         self._set_choices("model_id", [item.provider + "/" + item.model_id for item in models])
+        self._sync_model_label()
+
+    def _sync_model_label(self) -> None:
+        """A memory-only display view; labels never become model identities."""
+        canonical = self.get_parameter_by_name("model_id")
+        if not canonical.hide or not canonical.hide_property:
+            # Legacy saved node-element metadata may restore its former visible
+            # ID dropdown. Keep those input edges and values, show one selector.
+            canonical.update_ui_options({"hide": True, "hide_property": True})
+        models = self._capabilities.models if self._capabilities is not None else BUILTIN_IMAGE_MODEL_PROFILES
+        selected = str(self.get_parameter_value("model_id"))
+        keys = [item.provider + "/" + item.model_id for item in models]
+        if selected not in keys:
+            keys.append(selected)  # Preserve offline/future saved selections.
+        names = {}
+        for key in keys:
+            profile = _BUILTIN_PROFILES.get(key) or self._model_profile(key)
+            names[key] = profile.display_name if profile is not None else key
+        # Provider-supplied duplicate names must not select the wrong model.
+        # Reserve the two built-in names for their exact provider/model IDs.
+        reserved = {item.display_name: key for key, item in _BUILTIN_PROFILES.items()}
+        labels = {}
+        for key, name in names.items():
+            label = name
+            if (name in reserved and reserved[name] != key) or (
+                    name not in reserved and sum(value == name for value in names.values()) > 1):
+                label = f"{name} ({key})"
+            while label in labels:
+                label += f" ({key})"
+            labels[label] = key
+        self._model_label_keys = labels
+        self._set_choices("image_model", labels)
+        label = next(name for name, key in labels.items() if key == selected)
+        self._syncing_model_label = True
+        try:
+            self._write_ui_value("image_model", label)
+        finally:
+            self._syncing_model_label = False
+        parameter = self.get_parameter_by_name("image_model")
+        parameter.tooltip = f"Actual model: {selected}"
 
     def _set_choices(self, name: str, values: Any) -> None:
         values = list(values)
@@ -399,6 +449,7 @@ class HMBImageGeneration(SuccessFailureNode):
                 self.hide_parameter_by_name(name)
             self._active_option_parameters = active
             self._selected_model = key
+            self._sync_model_label()
             # Reuse other models' controls, but discard superseded descriptors
             # of this model after hiding them. Schema refreshes stay bounded.
             for name, binding in tuple(self._option_bindings.items()):
@@ -496,7 +547,14 @@ class HMBImageGeneration(SuccessFailureNode):
         super().after_value_set(parameter, value)
         if not getattr(self, "_model_settings_ready", False) or self._restoring_model_settings:
             return
-        if parameter.name == "model_id":
+        if parameter.name == "image_model":
+            if not self._syncing_model_label:
+                key = self._model_label_keys.get(str(value))
+                if key is not None:
+                    self.set_parameter_value("model_id", key)
+                else:
+                    self._sync_model_label()
+        elif parameter.name == "model_id":
             self._model_settings_error = ""
             self._select_model_ui(str(value))  # Memory-only; no fetch or inference.
         elif parameter.name == "image_model_settings" and value:

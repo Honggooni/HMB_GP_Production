@@ -369,6 +369,83 @@ class PersonalImageNodeTests(unittest.TestCase):
         self.assertFalse(self.backend.created)
         self.assertEqual(self.backend.capability_calls, 0)
 
+    def test_model_display_names_keep_exact_saved_and_wire_ids(self):
+        self.assertEqual(self.node.get_parameter_value("image_model"), "Nano Banana Pro")
+        self.assertEqual(self.node._choices["image_model"].choices, ["Nano Banana Pro", "Nano Banana 2"])
+        canonical = self.node.get_parameter_by_name("model_id")
+        self.assertTrue(canonical.hide)
+        self.assertTrue(canonical.hide_property)
+        self.assertTrue(canonical.serializable)
+        display = self.node.get_parameter_by_name("image_model")
+        self.assertFalse(display.serializable)
+        self.assertEqual(display.allowed_modes, {ParameterMode.PROPERTY})
+        self.backend.capabilities = option_capabilities()
+        self.run_node(action="connect")
+        self.authored()
+        calls = self.backend.capability_calls
+        for label, model in (("Nano Banana 2", "gemini-3.1-flash-image"),
+                             ("Nano Banana Pro", "gemini-3-pro-image")):
+            self.node.set_parameter_value("image_model", label)
+            self.assertEqual(self.node.get_parameter_value("model_id"), "google/" + model)
+            self.assertEqual(self.backend.capability_calls, calls)
+            self.assertIn("google/" + model, self.node.get_parameter_by_name("image_model").tooltip)
+            self.run_node()
+            self.assert_success()
+            self.assertEqual(self.backend.created[-1].payload()["model"], model)
+            self.assertEqual(self.backend.created[-1].payload()["provider"], "google")
+            calls = self.backend.capability_calls
+
+    def test_model_labels_preserve_per_model_options_and_saved_reopen(self):
+        self.backend.capabilities = option_capabilities()
+        self.run_node(action="connect")
+        self.node.set_parameter_value("image_model", "Nano Banana Pro")
+        self.node.set_parameter_value("image_size", "4K")
+        self.set_option("temperature", 0.0)
+        self.node.set_parameter_value("image_model", "Nano Banana 2")
+        self.node.set_parameter_value("image_size", "512")
+        self.set_option("temperature", 2.0)
+        before = self.model_settings()
+        reopened = self.reopen_options_node(self.node)
+        self.assertEqual(reopened.get_parameter_value("image_model"), "Nano Banana 2")
+        self.assertEqual(reopened.get_parameter_value("model_id"), "google/gemini-3.1-flash-image")
+        self.assertEqual(reopened.get_parameter_value("image_size"), "512")
+        self.assertEqual(self.option_value("temperature", reopened), 2.0)
+        reopened.set_parameter_value("image_model", "Nano Banana Pro")
+        self.assertEqual(reopened.get_parameter_value("image_size"), "4K")
+        self.assertEqual(self.option_value("temperature", reopened), 0.0)
+        self.assertEqual(self.model_settings(reopened), before)
+        self.assertFalse(self.backend.created)
+
+    def test_legacy_canonical_model_hydration_updates_display_without_network(self):
+        canonical = self.node.get_parameter_by_name("model_id")
+        canonical.update_ui_options({"hide": False, "hide_property": False})
+        self.node.set_parameter_value("model_id", "google/gemini-3.1-flash-image", initial_setup=True)
+        self.assertTrue(canonical.hide)
+        self.assertTrue(canonical.hide_property)
+        self.assertEqual(self.node.get_parameter_value("image_model"), "Nano Banana 2")
+        self.node.set_parameter_value("model_id", "google/gemini-3-pro-image", initial_setup=True)
+        self.assertEqual(self.node.get_parameter_value("image_model"), "Nano Banana Pro")
+        self.node.set_parameter_value("model_id", "future-provider/not-advertised", initial_setup=True)
+        self.assertEqual(self.node.get_parameter_value("image_model"), "future-provider/not-advertised")
+        self.assertFalse(self.backend.created)
+        self.assertEqual(self.backend.capability_calls, 0)
+
+    def test_duplicate_or_stale_model_label_never_changes_model_identity(self):
+        caps = option_capabilities(include_future=True)
+        future = replace(caps.models[-1], display_name="Nano Banana Pro")
+        self.backend.capabilities = replace(caps, models=(*caps.models[:-1], future))
+        self.run_node(action="connect")
+        qualified = "Nano Banana Pro (synthetic-provider/synthetic-image-model)"
+        self.assertIn(qualified, self.node._choices["image_model"].choices)
+        self.node.set_parameter_value("image_model", qualified)
+        self.assertEqual(self.node.get_parameter_value("model_id"), "synthetic-provider/synthetic-image-model")
+        self.node.set_parameter_value("image_model", "Nano Banana Pro")
+        self.assertEqual(self.node.get_parameter_value("model_id"), "google/gemini-3-pro-image")
+        self.node.set_parameter_value("image_model", "stale catalogue entry")
+        self.assertEqual(self.node.get_parameter_value("image_model"), "Nano Banana Pro")
+        self.assertEqual(self.node.get_parameter_value("model_id"), "google/gemini-3-pro-image")
+        self.assertFalse(self.backend.created)
+
     def test_status_buttons_keep_the_original_native_callback_dispatch(self):
         details = SimpleNamespace(label="fixture")
         sentinel = object()

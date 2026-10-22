@@ -266,6 +266,9 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Displays Nano Banana Pro and Nano Banana 2 in Image Model while preserving the exact Google model IDs, saved per-model options, reference connections and existing Tasks.",
+            "- Clears the My Box downloading overlay only after the original video is verified and saved locally. Remote render completion alone continues to show the transfer stage; same-task recovery preserves the saved result.",
+            "- Removes the My Box Source Task ID editor input. Editing and Extension use Reference Videos; legacy saved values remain inert and existing Task/checkpoint retrieval stays available.",
             "- Adds HMB Image Generation as a model-selectable personal image node. Supported Nano Banana models, resolutions and model options come from authenticated Broker capabilities; provider keys remain on the server. Results are saved locally and exposed as an image output without project or web publication.",
             "- Adds the personal My Box selection to Seedance Only mode for intermediate source videos, Editing and Extension. It uses the existing review project's selector and owner-scoped APIs; image generation and production library project lists remain separate. Confirm, Keep and retention follow the server's declared policy.",
             "- Stops image polling on an explicit unconfirmed submission while preserving the original Task, request identity and save destination. Retrieve and repeated Run recover the same unfinished request; no replacement generation is submitted automatically.",

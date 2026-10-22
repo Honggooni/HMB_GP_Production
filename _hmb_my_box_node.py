@@ -55,10 +55,12 @@ def install_parameters(node: Any) -> None:
     m = _host(node)
     for name, label, default, tooltip in (
         (TITLE_PARAMETER, "My Box Title", "Only video", "Private video title. This does not create a production Shot."),
-        (SOURCE_PARAMETER, "My Box Source Task ID", "", "Optional completed job-mybox-... owned by this account for Editing / Extension."),
+        (SOURCE_PARAMETER, "My Box Source Task ID", "", "Legacy saved value; new renders use Reference Videos."),
     ):
         node.add_parameter(m.ParameterString(name=name, default_value=default, allowed_modes={m.ParameterMode.PROPERTY},
-            tooltip=tooltip, hide=True, ui_options={"display_name": label, "hide_handles": True, "hide": True}))
+            tooltip=tooltip, hide=True, hide_property=(name == SOURCE_PARAMETER),
+            ui_options={"display_name": label, "hide_handles": True, "hide": True,
+                        "hide_property": name == SOURCE_PARAMETER}))
     node.add_parameter(m.ParameterDict(name=CHECKPOINT_PARAMETER, default_value={}, allowed_modes={m.ParameterMode.PROPERTY},
         settable=False, serializable=True, hide=True, hide_property=True, hide_label=True,
         ui_options={"hide": True, "hide_property": True, "hide_label": True, "hide_handles": True}))
@@ -234,7 +236,7 @@ class MyBoxController:
             raise ValueError("Select Only and My Box explicitly before private generation.")
         self.node._assert_only_mode_inputs()
         params = self._snapshot()
-        self._validate_snapshot(params, self.node.get_parameter_value(TITLE_PARAMETER), self.node.get_parameter_value(SOURCE_PARAMETER) or "")
+        self._validate_snapshot(params, self.node.get_parameter_value(TITLE_PARAMETER), "")
         return params
 
     def _validate_snapshot(self, params: dict[str, Any], title: Any, source: Any) -> None:
@@ -324,7 +326,13 @@ class MyBoxController:
         self._output("provider_response", {"transport": "fn_ai_broker", "scope": protocol.SCOPE,
             "id": identifier, "status": status, "resubmit_allowed": False})
         with suppress(Exception):
-            node._publish_generation_preview(node._generation_preview_phase_for_status(status), generation_id=identifier,
+            # The public status mapper treats remote "succeeded" as the start
+            # of download. A verified, locally committed private result has
+            # already passed that boundary; keep its final preview terminal.
+            phase = ("succeeded" if status == "succeeded" and successful is True else
+                status if status in {"downloading", "verifying"} else
+                node._generation_preview_phase_for_status(status))
+            node._publish_generation_preview(phase, generation_id=identifier,
                 action="refresh_existing" if identifier and status not in {"succeeded", "failed"} else "none")
         if successful is not None:
             try:
@@ -652,7 +660,10 @@ class MyBoxController:
             # Capability/queue waits must not turn a click into a later edit.
             frozen_params = deepcopy(self._snapshot())
             frozen_title = self.node.get_parameter_value(TITLE_PARAMETER)
-            frozen_source = self.node.get_parameter_value(SOURCE_PARAMETER) or ""
+            # Preserve old serialized fields for a lossless reopen, but a
+            # removed editor control must never be a hidden render input.
+            # Recovery uses the durable checkpoint/Task, not this legacy value.
+            frozen_source = ""
             frozen_action = self.node.get_parameter_value("draft_action")
             if frozen_params["model_id"] != _host(self.node).SEEDANCE_2_5_MODEL_ID:
                 frozen_action = _host(self.node).DRAFT_ACTION_OFF
