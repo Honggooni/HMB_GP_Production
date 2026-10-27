@@ -140,6 +140,31 @@ jobs:
       - name: Require complete regression registration
         shell: pwsh
         run: python tools/audit_regression_coverage.py --check
+      - name: Prepare the pinned stock editor fixture for native UI checks
+        shell: pwsh
+        run: |
+          # Use the upstream wheel as data only. Do not install, execute or
+          # redistribute the stock editor in this repository or Runtime ZIP.
+          $wheel = Join-Path $env:RUNNER_TEMP 'griptape_nodes_editor_dist-0.128.1-py3-none-any.whl'
+          $url = 'https://files.pythonhosted.org/packages/d4/a7/d7346fffd0a1c77bb73e06a1480484506384171d8a77fbe1dfba1509ab0b/griptape_nodes_editor_dist-0.128.1-py3-none-any.whl'
+          Invoke-WebRequest -Uri $url -OutFile $wheel -MaximumRetryCount 2 -RetryIntervalSec 3
+          $expected = '3214157ea071a0ce94f159c4a51e5557cd43035a3ed9e6c6d8e12eef009f10b0'
+          if ((Get-FileHash -LiteralPath $wheel -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expected) {
+            throw 'The pinned stock editor wheel failed its SHA256 check.'
+          }
+          $fixture = Join-Path $PWD 'reports/color-lut-native-header-20261023/index-DEZU41rc.original.js'
+          python -c "import hashlib,pathlib,sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); data=z.read('griptape_nodes_editor_dist/editor/assets/index-DEZU41rc.js'); assert len(data)==12111101; assert hashlib.sha256(data).hexdigest()=='1a0429b88c6b8dd1c7e6e053836d03f734a4d6453f8886e0693527c7498909e2'; p=pathlib.Path(sys.argv[2]); p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(data)" $wheel $fixture
+          if ($LASTEXITCODE -ne 0) { throw 'The supported stock editor fixture is unavailable or changed.' }
+          $cssFixture = Join-Path $PWD 'reports/color-lut-native-header-20261023/index-C-Si1lvW.original.css'
+          python -c "import hashlib,pathlib,sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); data=z.read('griptape_nodes_editor_dist/editor/assets/index-C-Si1lvW.css'); assert len(data)==978519; assert hashlib.sha256(data).hexdigest()=='0cdeb2a95665f7539e7f296a04b79ac44c5c3ff9772f2b88a4c050e4653a5032'; pathlib.Path(sys.argv[2]).write_bytes(data)" $wheel $cssFixture
+          if ($LASTEXITCODE -ne 0) { throw 'The supported stock editor CSS fixture is unavailable or changed.' }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_NATIVE_HEADER_EDITOR_SOURCE=$fixture"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_NATIVE_HEADER_EDITOR_CSS=$cssFixture"
+          $python = python -c "import sys; print(sys.executable)"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "$python")) { throw 'The regression Python interpreter is unavailable.' }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_REGRESSION_PYTHON=$python"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_NATIVE_HEADER_PYTHON=$python"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_IMAGE_BASH_WORKSPACE_PYTHON=$python"
       - name: JavaScript widget regressions with required browser coverage
         shell: pwsh
         run: python tools/audit_regression_coverage.py --run javascript --report "${{ runner.temp }}/hmb-coverage/javascript.json"
@@ -266,56 +291,45 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
-            "- Displays Nano Banana Pro and Nano Banana 2 in Image Model while preserving the exact Google model IDs, saved per-model options, reference connections and existing Tasks.",
-            "- Clears the My Box downloading overlay only after the original video is verified and saved locally. Remote render completion alone continues to show the transfer stage; same-task recovery preserves the saved result.",
-            "- Removes the My Box Source Task ID editor input. Editing and Extension use Reference Videos; legacy saved values remain inert and existing Task/checkpoint retrieval stays available.",
-            "- Adds HMB Image Generation as a model-selectable personal image node. Supported Nano Banana models, resolutions and model options come from authenticated Broker capabilities; provider keys remain on the server. Results are saved locally and exposed as an image output without project or web publication.",
-            "- Adds the personal My Box selection to Seedance Only mode for intermediate source videos, Editing and Extension. It uses the existing review project's selector and owner-scoped APIs; image generation and production library project lists remain separate. Confirm, Keep and retention follow the server's declared policy.",
-            "- Stops image polling on an explicit unconfirmed submission while preserving the original Task, request identity and save destination. Retrieve and repeated Run recover the same unfinished request; no replacement generation is submitted automatically.",
-            "- Keeps temporary Cloud/TOS references while maintenance acceptance or provider outcome is unresolved. Cleanup is scoped to the original Broker, account, request and Task; timers, cancellation, workflow deletion, missing queue markers and connection errors cannot authorize deletion. Saved metadata never reconstructs storage clients or deletes historical references after restart.",
-            "- Preserves verified per-Shot Agent results and exact Generator delivery when optional persistence, UI notification or cleanup fails. Cancellation, deletion and stale responses cannot retain execution locks or overwrite another Shot.",
-            "- Preserves validated Color LUT export videos and completed state through optional archive, preview and cold-reopen notification failures. Original web upload verifies the source directly; graded upload requires matching completed export evidence and server support.",
-            "- Releases Video Picker worker and catalog reservations after preflight, cancellation and terminal publication errors so the next operation remains available. Progressive output, existing media, bindings and JSON/video-only output folders are preserved.",
-            "- Uses https://app.funnyflux.kr/GripTapeServer as the default Broker gateway. All Generators share one durable user setting; explicitly saved addresses survive restarts and updates. Gateway path prefixes are retained for authentication, API requests, review links and media retrieval.",
-            "- Reuses an existing login only for the exact approved legacy-to-gateway migration, after the target validates it. Custom Broker credentials remain isolated, explicit sign-out suppresses legacy fallback, and uncertain create requests are never resubmitted automatically.",
-            "- Makes Prompt and Agent page selection reuse prepared per-Shot inputs, settings, bindings and results. Selecting another page does not recompile prompts or overwrite sibling Generator outputs; individual execution and saved-workflow restoration keep their original ownership.",
-            "- Discovers project-local Ai_Ct_image folders and relocated catalog JSON records. New Only submissions offer Superwings12 and Katuri8; historical project identities and existing Task retrieval remain compatible.",
-            "- Publishes completed Shot titles through the mounted review gateway and projects the original local MOV/MP4 into the native preview through the supported SDK display hook. Canonical output files, Task IDs and downstream video connections stay intact across rerender and save/reopen.",
-            "- Allows Color LUT Web Upload to send the original video immediately. Shot-bound flows retain their verified project and Shot name; Only and loaded videos require an explicitly selected authenticated project or personal My Box and use the source filename. The lower Export and Upload button creates the graded output before transferring it. Local-only export remains available without a destination and for FFV1.",
-            "- Restores generated-image previews through the native SDK image publication path and durable local image reference, preserving existing image files, Task IDs and saved workflow restoration without a replacement generation.",
-            "- Aligns Nano Banana model options, timeout, references and submitted image settings with the installed Standard image node; only provider credential handling stays on the Broker.",
-            "- Requires the matching authenticated Broker capabilities for My Box, web publication, project metadata and maintenance admission. Missing support fails before media upload or generation; this library release does not deploy or reconfigure the server.",
-            "- Separates all five Shot Prompt documents, native Agent settings, execution results and Generator deliveries by immutable Shot UUID. Switching the visible Agent tab cannot copy its output to sibling Generators; stale, deleted or reassigned workers cannot publish results.",
-            "- Preserves ambiguous legacy Prompt and Agent nodes with a verified recovery snapshot until each original editor is explicitly assigned to its own Shot. Conflicting authoring is never overwritten. Confirmed recovery survives disconnected notifications and host shutdown; verified consolidation restores normal full-shot exports.",
-            "- Updates Shot additions, deletions and exact-UUID restoration through bounded catalog reconciliation, target-only media validation and a stable native Agent accordion. A missing sibling image/video stays local to its Shot, and media/settings changed during inference are rejected before a new render submission.",
-            "- Restores the workflow context for additional Generator, Color LUT and Finish Look creation. Saved media, Task IDs, authored options and existing connections remain protected during lifecycle recovery.",
-            "- Supports normal Git Update/Override without requiring the ZIP installer. The next cold library load checks known legacy editor dependencies, preserves a verified recovery copy and performs targeted cleanup. Loaded modules defer cleanup until a full Griptape restart; unknown or customized dependency layouts are preserved.",
-            "- Keeps optional TOS uploads in a dedicated .venv-tos child interpreter. TOS preparation runs separately from Cloud generation, saved Tasks and local previews; rendering never installs packages. Interrupted or unverifiable migration cannot be mistaken for successful cleanup.",
-            "- Accepts Pillow 12.3 through the supported 13.x host range without forcing the engine's Pillow 13 down to 12.3. Bounded declarations, source metadata and dependency notices are checked together, with image processing regressions at the minimum and current host versions.",
-            "- Applies Griptape's disabled state to all nine HMB widgets, including same-value updates and retired callbacks. Playback, available result retrieval and cancellation remain usable; existing palettes, dimensions and native local-video previews are preserved.",
-            "- Isolates a Shot's HMB render admission failure before managed Agent execution or generation submission. A waiting binding, missing project or invalid option skips that Shot while healthy peers continue. Native structural validation remains authoritative.",
-            "- Persists explicit Only and exact Shot identity through save/open, source deletion, recreation and rapid selection. Only stays independent; a waiting Shot cannot silently switch to a different UUID. Metadata-free legacy workflows retain automatic routing compatibility.",
-            "- Preserves the existing Standard Agent native adapter and model catalog, original local MOV/MP4 files, Task IDs, project selections and same-task recovery protections.",
-            "- Retains authored 480p/Draft settings, the explicit one-use Draft final action, mode-preserving web rerenders, reference media and the bundled signed Superwings12 v7.0 policy. Other project policies retain their existing preparation status.",
-            "- Expands registered Python, JavaScript, browser and offline native-host regressions for lifecycle, migration, playback and submission contracts. Refer to this audit run's coverage receipts for actual pass, failure and not-run counts; manual SDK/DCC checks are counted only when executed.",
-            "- Release validation does not submit new paid provider generations or deploy the Broker. Offline render-state and request-contract tests do not establish provider availability, LLM policy reasoning or animation aesthetic quality.",
-            "- Includes SHA256 integrity checks and audited even-to-team-release functional parity. Private policy sources, signing material, credentials and local reports are excluded from the runtime distribution.",
+            "- Adds HMB ImageBash as a local image workspace with remote ImageAsset selection, native image output, local save and durable workspace restoration. Existing production Shot slots remain separate.",
+            "- Applies the unified rounded native header to HMB VideoPicker, HMB Agent, HMB ImageAsset Library, HMBPrompt, HMB ImageBash, Color LUT and Finish Look while retaining their existing palettes, controls and connections.",
+            "- Uses the dedicated fold control for the rounded Soft Link capsule and Double Click to Unlock restoration. Other header double-clicks select compact mode only where supported. Capsule restore, edge resizing and popup hit areas retain native port behavior.",
+            "- Adds common connected-node deletion protection to every registered HMB tool, including future types. Trash, Delete, context-menu, batch and engine paths refuse removal while a real wire or accepted remote binding remains and identify the connected targets.",
+            "- Adds Connection Management to inspect, disconnect and reconnect exact original relationships without deleting Shot inputs, prompts, settings, media, results or Task IDs. Saved disconnect fences survive reopening; missing or replaced owners are never silently substituted.",
+            "- Reduces unnecessary Agent and Prompt page calculations, repeated image resolution, idle acknowledgements and duplicate layout work. All five Shot inputs, bindings, model settings and results retain independent ownership during switching and execution.",
+            "- Restores CGT account and installed-SDK integration with pinned server trust, own-task lookup and a project-plus-episode selector. Episode filtering reuses the received catalog without clearing selected Shots.",
+            "- Restores explicit parent and child Shot assignment, including a child that also heads a separate bundle. Cycles are rejected; all five Shot UUIDs and individual executions remain independent. Bundle names include direct children and use the available name area without moving the fixed selection note.",
+            "- Preserves legacy standalone Prompt and Agent authoring, saved model identities, existing Task IDs, per-Shot outputs and recovery snapshots. The workflow serialization compatibility layer prevents temporary-list identity collisions without editing the Griptape SDK.",
+            "- Keeps user-authored schemas and structured Agent results containing shot_uuid fields separate from actual binding metadata during legacy reopen. Detached Shot stores and ambiguous original ownership still require their existing explicit recovery checks.",
+            "- Makes Color LUT Web Upload transfer the original immediately. The wider final-output button exports the graded result before uploading. Bound uploads keep the verified project and generation-time Shot name even if the current library bundle is renamed; manual uploads use an authenticated project or personal My Box and the source filename.",
+            "- Includes the native editor patch in the Runtime ZIP installer. It checks the supported editor version and exact bundle hashes before replacement, skips an identical patch and rolls library and editor changes back together on failure. Unknown editor builds are preserved and rejected.",
+            "- Preserves personal local image generation with Nano Banana Pro and Nano Banana 2, model-specific options, exact provider IDs and existing Task recovery. Provider keys remain on the Broker; generated images are not published to project review lists.",
+            "- Preserves original local image and MOV/MP4 previews, My Box result retrieval, mode-preserving web rerenders and ambiguous-submission protection. Release tests never submit replacement paid generations.",
+            "- Keeps the durable shared Broker address, authenticated project discovery, Only mode, explicit Draft settings, isolated optional TOS environment and bundled signed Agent runtime. Matching Broker APIs and permissions are required for web review and publication; this client package does not deploy the server.",
+            "- Includes registered Python, JavaScript, browser, installed-SDK and DCC checks. Coverage receipts distinguish actual executions, historical evidence and not-run items; offline fixtures do not establish live provider or animation quality.",
+            "- Includes SHA256 integrity manifests and verified local-to-team functional parity. Private policy sources, signing material, credentials, test data and local reports are excluded from the distribution.",
             "",
-            "Use Griptape Git Update/Override and then fully restart Griptape once. The cold-load check migrates known legacy environments automatically; an initial stale dependency warning may require a normal library Refresh after successful cleanup. The Runtime ZIP and included Install_HMB_GP_Production.ps1 remain available for explicit installation and recovery. Fresh optional TOS setup can use -PrepareTosRuntime. Do not replace files while a workflow is executing."
+            "For the complete native UI, save your workflow, fully close Griptape, extract the Runtime ZIP and run Install_HMB_GP_Production.ps1. Git Update/Override updates library code only and does not install the native editor integration. The installer preserves existing workflows, settings and outputs and records recovery data. Fully restart Griptape after installation. Fresh optional TOS setup can use -PrepareTosRuntime."
           ) | Set-Content -LiteralPath $notesPath -Encoding utf8
-          gh release view $env:GITHUB_REF_NAME --repo $repository *> $null
-          if ($LASTEXITCODE -eq 0) {
+          $releaseLookup = @(gh api "repos/$repository/releases/tags/$env:GITHUB_REF_NAME" --include --silent 2>&1)
+          $releaseLookupExitCode = $LASTEXITCODE
+          if ($releaseLookupExitCode -eq 0) {
             gh release upload $env:GITHUB_REF_NAME $archive $checksum --clobber --repo $repository
+            if ($LASTEXITCODE -ne 0) { throw "Could not upload the audited release assets." }
             gh release edit $env:GITHUB_REF_NAME `
               --title "HMB GP Production $env:GITHUB_REF_NAME" `
               --notes-file $notesPath `
               --latest `
               --repo $repository
-          } else {
+            if ($LASTEXITCODE -ne 0) { throw "Could not update the release metadata." }
+          } elseif (($releaseLookup -join "`n") -match '(?m)^HTTP/\S+\s+404(?:\s|$)') {
             gh release create $env:GITHUB_REF_NAME $archive $checksum `
               --verify-tag `
               --title "HMB GP Production $env:GITHUB_REF_NAME" `
               --notes-file $notesPath `
               --latest `
               --repo $repository
+            if ($LASTEXITCODE -ne 0) { throw "Could not create the audited team release." }
+          } else {
+            throw "Could not determine whether the release exists (GitHub CLI exit $releaseLookupExitCode); publication stopped."
           }

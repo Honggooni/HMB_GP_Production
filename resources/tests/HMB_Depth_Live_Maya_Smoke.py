@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 import HMBVideoPickerLibrary as picker
+from _hmb_maya_smoke_fixture import isolated_maya_environment
 
 
 def sha256(path: Path) -> str:
@@ -26,9 +27,9 @@ if mayabatch is None or ffmpeg is None:
     raise SystemExit(0)
 
 mayapy = Path(mayabatch).with_name("mayapy.exe")
-builder = ROOT / ".tmp" / "build_motion_guide_smoke_scene.py"
-if not mayapy.is_file() or not builder.is_file():
-    print("HMB live Depth smoke: SKIP (fixture builder is unavailable)")
+builder = Path(__file__).with_name("_hmb_maya_smoke_fixture.py")
+if not mayapy.is_file():
+    print("HMB live Depth smoke: SKIP (mayapy is unavailable)")
     raise SystemExit(0)
 
 run_folder = (
@@ -45,6 +46,8 @@ with build_log.open("w", encoding="utf-8", errors="replace") as handle:
         [str(mayapy), str(builder), str(scene_path)],
         stdout=handle,
         stderr=subprocess.STDOUT,
+        env=isolated_maya_environment(run_folder),
+        creationflags=picker._creation_flags(),
         timeout=300,
         check=False,
     )
@@ -124,7 +127,7 @@ job_path.write_text(
 )
 
 scene_hash_before = sha256(scene_path)
-environment = picker._maya_subprocess_environment(job_path)
+environment = isolated_maya_environment(run_folder, picker._maya_subprocess_environment(job_path))
 command = [
     str(mayabatch),
     "-command",
@@ -137,6 +140,7 @@ with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
         stderr=subprocess.STDOUT,
         cwd=str(job_path.parent),
         env=environment,
+        creationflags=picker._creation_flags(),
         timeout=900,
         check=False,
     )

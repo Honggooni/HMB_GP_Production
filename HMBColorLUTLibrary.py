@@ -34,9 +34,38 @@ COMMAND = "HMB_COLOR_LUT_COMMAND"
 SOURCE = "COLOR_LUT_SOURCE_IN"
 # Leave room for Griptape's title, flow row and video_url output around the widget.
 COLOR_LUT_NODE_WIDTH = 1220
-COLOR_LUT_NODE_HEIGHT = 1080
+COLOR_LUT_NODE_HEIGHT = 1160
 COLOR_LUT_WIDGET_WIDTH = 1180
-COLOR_LUT_WIDGET_HEIGHT = 920
+COLOR_LUT_WIDGET_HEIGHT = 1000
+COLOR_LUT_NATIVE_GEOMETRY_HINT = "hmb_color_lut_native_initial_geometry"
+_COLOR_LUT_NATIVE_FACTORY_REQUEST = "hmb_color_lut_native_factory_request"
+
+
+def _native_initial_geometry_hint(metadata: Any) -> dict[str, Any] | None:
+    """Opt in only for a fresh, prototype-editor placement without authored size.
+
+    The SDK does not forward CreateNodeRequest.initial_setup to constructors.
+    Its editor placement paths therefore supply an explicit, transient marker;
+    deserialization and duplication never pass through those placement paths.
+    Existing size/expanded dimensions and all other authored metadata win.
+    """
+    if not isinstance(metadata, Mapping) or set(metadata) - {
+            "position", "tempId", _COLOR_LUT_NATIVE_FACTORY_REQUEST,
+            "library_node_metadata", "library", "node_type"}:
+        return None
+    if ("library" in metadata and metadata["library"] != "HMB_GP_Production"
+            or "node_type" in metadata and metadata["node_type"] != "HMBColorLUTLibrary"):
+        return None
+    request = metadata.get(_COLOR_LUT_NATIVE_FACTORY_REQUEST)
+    temp_id = metadata.get("tempId")
+    if (not isinstance(request, Mapping) or request.get("schema") != "hmb-color-lut-native-factory-request-v1"
+            or not isinstance(temp_id, str) or not 1 <= len(temp_id) <= 160 or request.get("temp_id") != temp_id):
+        return None
+    return {"schema": "hmb-color-lut-native-initial-geometry-v1", "version": 1,
+            "width": 1225, "height": 1057, "factory_width": COLOR_LUT_NODE_WIDTH,
+            "factory_height": COLOR_LUT_NODE_HEIGHT, "token": uuid.uuid4().hex, "status": "pending"}
+
+
 LOGGER = logging.getLogger("griptape_nodes")
 _PROFILE_LOCK = threading.RLock()
 _UPLOAD_LOCK = threading.RLock()
@@ -378,6 +407,10 @@ def _workflow_data_directory() -> Path:
 
 class HMBColorLUTLibrary(DataNode):
     def __init__(self, **kwargs: Any) -> None:
+        native_geometry_hint = _native_initial_geometry_hint(kwargs.get("metadata"))
+        if isinstance(kwargs.get("metadata"), Mapping) and _COLOR_LUT_NATIVE_FACTORY_REQUEST in kwargs["metadata"]:
+            kwargs = {**kwargs, "metadata": {key: value for key, value in kwargs["metadata"].items()
+                                            if key != _COLOR_LUT_NATIVE_FACTORY_REQUEST}}
         super().__init__(**kwargs)
         # Use the native initial-size contract once. Saved/manual sizes remain
         # authoritative and updates, shot binding and reset must not resize them.
@@ -387,6 +420,14 @@ class HMBColorLUTLibrary(DataNode):
         else:
             self.metadata = dict(getattr(self, "metadata", None) or kwargs.get("metadata") or {})
             self.metadata.setdefault("size", {"width": COLOR_LUT_NODE_WIDTH, "height": COLOR_LUT_NODE_HEIGHT})
+        if native_geometry_hint is not None:
+            self.metadata[COLOR_LUT_NATIVE_GEOMETRY_HINT] = native_geometry_hint
+        elif isinstance(self.metadata.get(COLOR_LUT_NATIVE_GEOMETRY_HINT), Mapping):
+            prior_hint = self.metadata[COLOR_LUT_NATIVE_GEOMETRY_HINT]
+            if prior_hint.get("status") == "pending":
+                # Even a workflow saved before the editor's acknowledgement is
+                # state to restore, never permission to resize on reopening.
+                self.metadata[COLOR_LUT_NATIVE_GEOMETRY_HINT] = {**prior_hint, "status": "restored"}
         self.category = "HMB_GP_Production"
         self.description = "Local SDR color preview, project LUT, final export and explicit project web upload."
         self._lock = threading.RLock()
@@ -864,13 +905,20 @@ class HMBColorLUTLibrary(DataNode):
                 or eligibility.get("display_name") != "HMB Color LUT"
                 or any(eligibility.get(key) != context[key] for key in ("source_task_id", "project_id", "project_name"))
                 or any(bound.get(key) != context[key] for key in ("channel_uuid", "shot_uuid", "source_node_instance_id"))
-                or bound.get("name") != context["shot_name"]
                 or not _advertised_api_path_matches(eligibility.get("upload_path"),
                     "/api/v1/reviews/tasks/" + quote(context["source_task_id"], safe="") + "/color-lut", context["server_url"])
                 or type(eligibility.get("max_bytes")) is not int or not info.st_size <= eligibility["max_bytes"] <= maximum
                 or re.fullmatch(r"[a-f0-9]{64}", str(eligibility.get("source_sha256") or "")) is None
                 or re.fullmatch(r"[a-f0-9]{64}", str(eligibility.get("source_revision") or "")) is None):
             raise ValueError("서버에서 본인 소유의 동일 프로젝트·샷 원본을 확인하지 못했습니다.")
+        # UUID/task/project checks above establish the completed result. A
+        # later hierarchy edit must not relabel those existing video bytes.
+        import _hmb_review as review
+        captured_name = review._public_shot_name(bound.get("name"))
+        if not captured_name or captured_name != bound.get("name"):
+            raise ValueError("서버에 저장된 생성 당시 샷 이름을 확인하지 못했습니다.")
+        context["library_shot_name"] = context["shot_name"]
+        context["shot_name"] = captured_name
         me = bridge._request_json("GET", "/api/me", payload=None, timeout=5)
         owner = str(me.get("id") or me.get("user_id") or (me.get("user") or {}).get("id") or "")
         if not owner:
@@ -943,8 +991,11 @@ class HMBColorLUTLibrary(DataNode):
                     receipt = _read_upload_receipt(context["receipt_id"]) if context else {}
                     complete = receipt.get("phase") == "complete"
                     pending = receipt.get("phase") in {"pending", "unknown"}
+                    reason = "원본 웹 업로드 완료" if complete else error or "최종 출력 없이 원본 영상을 바로 업로드합니다."
+                    if context and context.get("library_shot_name") and context["library_shot_name"] != context.get("shot_name"):
+                        reason += " 생성 당시 샷: " + context["shot_name"]
                     self._web_upload = {"enabled": bool(context) and not complete, "phase": "complete" if complete else "unknown" if pending else "ready" if context else "unavailable",
-                                        "reason": "원본 웹 업로드 완료" if complete else error or "최종 출력 없이 원본 영상을 바로 업로드합니다."}
+                                        "reason": reason}
                     self._hmb_color_lut_state["revision"] += 1
                 try:
                     self._publish()

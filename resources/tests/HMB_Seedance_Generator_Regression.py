@@ -1166,6 +1166,11 @@ def assert_seedance_25_output_format_and_last_frame_ui_contract() -> None:
     # must contain zero 2.5-only fields for both 2.0 variants.
     posted: list[dict] = []
     bridge = target._HMBAIBrokerBridge(opener=object())
+    # This fixture verifies native wire formats, not maintenance admission.
+    # An accepting native intake has no queue-only authority object. Keep that
+    # boundary explicit so the fixture never loads a real login credential.
+    bridge.queue_admission = mock.Mock(return_value=None)
+    bridge._load_access_token = mock.Mock(side_effect=AssertionError("Wire-format fixture read credentials"))
 
     def capture_request(method, path, *, payload, timeout, **kwargs):
         if method == "GET":
@@ -1247,6 +1252,8 @@ def assert_seedance_25_output_format_and_last_frame_ui_contract() -> None:
     # on the authenticated GET boundary without reaching the create-task POST.
     unsupported_calls: list[tuple[str, str]] = []
     unsupported_bridge = target._HMBAIBrokerBridge(opener=object())
+    unsupported_bridge.queue_admission = mock.Mock(return_value=None)
+    unsupported_bridge._load_access_token = mock.Mock(side_effect=AssertionError("Wire-format fixture read credentials"))
 
     def reject_capability(method, path, *, payload, timeout, **kwargs):
         del payload, timeout, kwargs

@@ -145,6 +145,32 @@ class ColorLUTUploadRegression(unittest.TestCase):
         self.assertEqual(context["source_task_id"], "job-offline-lut")
         self.assertTrue(self.node._upload_projection()["enabled"])
 
+    def test_hierarchy_rename_keeps_captured_name_and_same_task_receipt(self):
+        before = self.ready()
+        routing_shot = self.asset._hmb_shot_routing_catalog()["shots"][0]
+        routing_shot["name"] = "e201_s001c001-s002c001__"
+        old_catalog = self.asset._hmb_shot_routing_catalog()
+        old_catalog["shots"][0]["name"] = routing_shot["name"]
+        self.asset._hmb_shot_routing_catalog = lambda: copy.deepcopy(old_catalog)
+        after = self.ready()
+        self.assertEqual(after["library_shot_name"], "e201_s001c001-s002c001__")
+        self.assertEqual(after["shot_name"], "e201s001c001__")
+        for key in ("source_task_id", "shot_uuid", "channel_uuid", "source_revision", "upload_id", "receipt_id"):
+            self.assertEqual(after[key], before[key])
+        self.assertEqual(self.node._upload_metadata(after), self.node._upload_metadata(before))
+
+    def test_invalid_captured_name_still_blocks_after_hierarchy_rename(self):
+        original = self.bridge._request_json
+        for value in (None, "", "bad\nname", "x" * 129):
+            def invalid(method, path, _value=value, **kwargs):
+                result = original(method, path, **kwargs)
+                if path != "/api/me":
+                    result["shot"]["name"] = _value
+                return result
+            with mock.patch.object(self.bridge, "_request_json", side_effect=invalid):
+                with self.assertRaises(ValueError):
+                    self.ready()
+
     def test_only_loader_removed_edges_duplicate_owner_and_other_project_block(self):
         state = copy.deepcopy(self.node._hmb_color_lut_state)
         with mock.patch.object(routing, "_incoming_connections", return_value=[]):

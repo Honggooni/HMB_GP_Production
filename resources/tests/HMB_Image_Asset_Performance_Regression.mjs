@@ -1096,6 +1096,21 @@ assert.equal(rootReplacements, 0);
 assert.equal(untouchedCardQueries, 0);
 assert.equal(untouchedThumbnail.getAttribute("class"), "asset-thumb untouched");
 
+// Bash may contain the same asset more than once. Every occurrence of a
+// completed source is patched through its retained index, without scanning
+// the root or touching a different source's cards.
+const bashThumbnails = [thumbnailElement("selected-thumb loading-a"), thumbnailElement("selected-thumb loading-b")];
+bashThumbnails.forEach(thumbnail => { thumbnail.ownerDocument = patchOwnerDocument; });
+let unrelatedBashQueries = 0;
+targetOnlyContainer.__hmbImageAssetBashCardsByLibraryId = new Map([
+  ["patch-target", bashThumbnails.map(thumbnail => ({ querySelector(selector) { assert.equal(selector, ".selected-thumb"); return thumbnail; } }))],
+  ["patch-untouched", [{ querySelector() { unrelatedBashQueries++; throw new Error("Unrelated Bash source was touched."); } }]],
+]);
+assert.equal(assetWidget.hmbPatchImageAssetThumbnailMedia(targetOnlyContainer, targetOnlyState, ["patch-target"]), 3);
+assert.equal(rootSearches, 0);
+assert.equal(unrelatedBashQueries, 0);
+assert.ok(bashThumbnails.every(thumbnail => thumbnail.getAttribute("class").includes("selected-thumb")));
+
 // The compact thumbnail-only transition must be selected before the legacy
 // whole-state stringify comparison; otherwise large catalogs still pay the
 // serialization cost on every worker completion.

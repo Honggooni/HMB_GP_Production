@@ -1340,8 +1340,20 @@ export function hmbNativeMayaScenePath(container) {
   return "";
 }
 
+function hmbPickerContainsEventNode(container, target) {
+  if (!container || !target) return false;
+  // Window focus targets Window, not Node. Use the owner's native Node brand
+  // check rather than global instanceof, which rejects valid iframe/adopted
+  // Nodes. Lightweight non-DOM fixtures retain their own contains contract.
+  const nodePrototype = container.ownerDocument?.defaultView?.Node?.prototype;
+  if (typeof nodePrototype?.isSameNode === "function") {
+    try { nodePrototype.isSameNode.call(target, target); } catch (_error) { return false; }
+  }
+  try { return container.contains?.(target) === true; } catch (_error) { return false; }
+}
+
 export function hmbIsExactNativeMayaPickerTarget(container, target) {
-  if (!container || !target || container.contains?.(target)) return false;
+  if (!container || !target || hmbPickerContainsEventNode(container, target)) return false;
   const snapshot = hmbNativeMayaPickerSnapshot(container);
   return snapshot.elements.includes(target) || snapshot.hosts.includes(target);
 }
@@ -6074,6 +6086,7 @@ function hmbPickerDeleteEditingTarget(event) {
 
 export function hmbGuardSelectedNodeKeyboardDelete(container, event) {
   if (!["Backspace", "Delete"].includes(event?.key)) return false;
+  if (container?.ownerDocument?.documentElement?.getAttribute?.("data-hmb-native-deletion-guard") === "engine-preflight") return false;
   if (event?.target?.closest?.("[data-hmb-node-delete-protected='true']")) return false;
   if (hmbPickerDeleteEditingTarget(event)) return false;
   if (!hmbPickerNodeIsSelected(findReactFlowNode(container) || videoPickerNodeRoot(container))) return false;
@@ -6211,6 +6224,7 @@ export function hmbVideoPickerInternalHeaderDoubleClickTarget(container, event) 
   const rawTarget = event?.target || null;
   const target = rawTarget?.nodeType === 3 ? rawTarget.parentElement : rawTarget;
   if (!target || !container.contains?.(target)) return null;
+  if (target.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]")) return null;
   const header = target.closest?.(".top[data-picker-toggle-surface='header']") || null;
   if (!header || !container.contains?.(header)) return null;
   try {
@@ -6327,42 +6341,73 @@ export function hmbInstallPickerValueControlDelegation(
   return true;
 }
 
+export function hmbCancelVideoPickerFileInput(container, expectedToken = "") {
+  const session = container?.__hmbVideoImportDialogSession;
+  if (!session || (expectedToken && session.token !== expectedToken)) return false;
+  session.cleanup();
+  if (container.__hmbVideoImportDialogSession !== session) return false;
+  delete container.__hmbVideoImportDialogSession;
+  delete container.__hmbVideoImportDialogPending;
+  delete container.__hmbVideoImportDialogToken;
+  delete container.__hmbPendingImportWorkspaceUuid;
+  delete container.__hmbPendingImportPreserveEditWorkspace;
+  return true;
+}
+
 export function hmbOpenVideoPickerFileInput(container, workspaceUuidValue) {
   const workspaceUuid = hmbUuid(workspaceUuidValue);
   const input = container?.querySelector?.("#import-video-asset") || null;
-  if (!workspaceUuid || !input?.click || container.__hmbVideoImportDialogPending === true) return false;
+  if (!workspaceUuid || !input?.click || container.__hmbVideoPickerDeleted === true
+      || container.__hmbVideoImportDialogPending === true) return false;
   const token = `${workspaceUuid}:${Date.now()}:${Math.random().toString(16).slice(2, 8)}`;
+  const view = input.ownerDocument?.defaultView || globalThis;
+  let focusTimer = null, sawBlur = false;
+  const cancel = () => hmbCancelVideoPickerFileInput(container, token);
+  const blur = () => { sawBlur = true; };
+  const focus = () => {
+    if (!sawBlur || container.__hmbVideoImportDialogSession?.token !== token) return;
+    if (focusTimer !== null) view.clearTimeout(focusTimer);
+    // Older desktop hosts may omit input.cancel. Only a real window blur /
+    // return can retire an empty chooser, after the native change event queue.
+    // Time spent choosing files never expires the captured Shot owner.
+    focusTimer = view.setTimeout(() => {
+      focusTimer = null;
+      if (container.__hmbVideoImportDialogSession?.token === token && !input.files?.length) cancel();
+    }, 100);
+  };
+  const session = { token, input, workspaceUuid,
+    preserveEditWorkspace: container.__hmbPendingImportPreserveEditWorkspace === true,
+    cleanup() {
+      if (focusTimer !== null) view.clearTimeout(focusTimer);
+      input.removeEventListener?.("cancel", cancel);
+      view.removeEventListener?.("blur", blur);
+      view.removeEventListener?.("focus", focus);
+    },
+  };
+  container.__hmbVideoImportDialogSession = session;
   container.__hmbVideoImportDialogPending = true;
   container.__hmbVideoImportDialogToken = token;
   container.__hmbPendingImportWorkspaceUuid = workspaceUuid;
+  input.addEventListener?.("cancel", cancel);
+  view.addEventListener?.("blur", blur);
+  view.addEventListener?.("focus", focus);
   try { input.value = ""; } catch (_error) {}
   try {
     input.click();
   } catch (_error) {
-    delete container.__hmbVideoImportDialogPending;
-    delete container.__hmbVideoImportDialogToken;
-    delete container.__hmbPendingImportWorkspaceUuid;
+    cancel();
     return false;
   }
-  // File dialogs are modal in the desktop host. This timer runs only after the
-  // dialog closes and makes Cancel retryable without permitting double-open.
-  setTimeout(() => {
-    if (clean(container.__hmbVideoImportDialogToken) !== token) return;
-    delete container.__hmbVideoImportDialogPending;
-    delete container.__hmbVideoImportDialogToken;
-    delete container.__hmbPendingImportWorkspaceUuid;
-  }, 750);
   return true;
 }
 
-export function hmbConsumeVideoPickerFileInputTarget(container, fallbackWorkspaceUuid = "") {
-  const workspaceUuid = hmbUuid(container?.__hmbPendingImportWorkspaceUuid)
-    || hmbUuid(fallbackWorkspaceUuid);
-  if (container) {
-    delete container.__hmbVideoImportDialogPending;
-    delete container.__hmbVideoImportDialogToken;
-    delete container.__hmbPendingImportWorkspaceUuid;
-  }
+export function hmbConsumeVideoPickerFileInputTarget(container, _fallbackWorkspaceUuid = "", sourceInput = null) {
+  const session = container?.__hmbVideoImportDialogSession;
+  if (!session || container.__hmbVideoPickerDeleted === true
+      || session.token !== container.__hmbVideoImportDialogToken
+      || (sourceInput && sourceInput !== session.input)) return "";
+  const workspaceUuid = hmbUuid(session.workspaceUuid);
+  hmbCancelVideoPickerFileInput(container, session.token);
   return workspaceUuid;
 }
 
@@ -7244,12 +7289,76 @@ export function hmbSetVideoPickerNativeResizeLocked(container, locked) {
   return true;
 }
 
+// Native Editor controls remain React-owned. Keep each portal container alive
+// across retained markup updates and controller rebuilds; never morph its children.
+export function hmbInstallVideoPickerNativeHeader(container) {
+  if (!container) return null;
+  if (container.__hmbVideoPickerNativeHeader) return container.__hmbVideoPickerNativeHeader;
+  const doc = container.ownerDocument || globalThis.document;
+  const win = doc?.defaultView || globalThis;
+  let active = false, disposed = false, announcedRoot = null;
+  const slots = container.__hmbVideoPickerNativeHeaderSlots || {};
+  container.__hmbVideoPickerNativeHeaderSlots = slots;
+  const toggle = (element, name, value) => {
+    if (element?.classList && element.classList.contains(name) !== value) element.classList.toggle(name, value);
+  };
+  const announce = phase => {
+    if (typeof win.CustomEvent === "function") doc?.dispatchEvent?.(new win.CustomEvent(`hmb-color-lut-header-${phase}`, { detail: { container } }));
+  };
+  const apply = () => {
+    const root = container.querySelector?.(".hmbvp");
+    if (!root) return;
+    const value = active ? "active" : "fallback";
+    if (root.getAttribute?.("data-hmb-native-header") !== value) root.setAttribute?.("data-hmb-native-header", value);
+    toggle(container, "nodrag", !active);
+    toggle(root, "nodrag", !active);
+    toggle(container.querySelector?.(".hmbvp-clip"), "nodrag", !active);
+    for (const body of root.querySelectorAll?.(":scope > :not(.top):not(style)") || []) toggle(body, "nodrag", true);
+    for (const control of root.querySelectorAll?.(".top > .project-switch,.top > .header-actions") || []) toggle(control, "nodrag", true);
+  };
+  const onState = event => {
+    if (disposed || event.target !== container) return;
+    active = event.detail?.active === true;
+    apply();
+  };
+  container.addEventListener?.("hmb-color-lut-header-state", onState);
+  const api = {
+    sync() {
+      if (disposed) return;
+      const root = container.querySelector?.(".hmbvp");
+      if (!root) return;
+      for (const name of ["identity", "actions"]) {
+        const incoming = root.querySelector?.(`[data-hmb-native-${name}]`);
+        if (!incoming) return;
+        if (slots[name] && slots[name] !== incoming) incoming.replaceWith?.(slots[name]);
+        else slots[name] = incoming;
+      }
+      if (!container.hasAttribute?.("data-hmb-color-lut-widget")) container.setAttribute?.("data-hmb-color-lut-widget", "");
+      if (container.getAttribute?.("data-hmb-native-node-type") !== "HMBVideoPickerLibrary") container.setAttribute?.("data-hmb-native-node-type", "HMBVideoPickerLibrary");
+      apply();
+      if (announcedRoot !== root) { announcedRoot = root; announce("ready"); }
+    },
+    cleanup() {
+      if (disposed) return;
+      announce("retire"); active = false; apply(); disposed = true;
+      container.removeEventListener?.("hmb-color-lut-header-state", onState);
+      container.removeAttribute?.("data-hmb-color-lut-widget");
+      container.removeAttribute?.("data-hmb-native-node-type");
+      if (container.__hmbVideoPickerNativeHeader === api) delete container.__hmbVideoPickerNativeHeader;
+      // Retain the slots, including React children, until React unmounts them.
+    },
+  };
+  container.__hmbVideoPickerNativeHeader = api;
+  return api;
+}
+
 export function hmbAdoptVideoPickerFixedTop(container) {
   if (!container) return null;
   const retained = container.__hmbVideoPickerFixedTop || null;
   const incoming = container.querySelector?.(".top[data-picker-toggle-surface='header']") || null;
   if (!retained && incoming) {
     container.__hmbVideoPickerFixedTop = incoming;
+    hmbInstallVideoPickerNativeHeader(container)?.sync();
     return incoming;
   }
   if (!retained) return null;
@@ -7258,6 +7367,7 @@ export function hmbAdoptVideoPickerFixedTop(container) {
     const picker = container.querySelector?.(".hmbvp") || null;
     if (picker) picker.insertBefore?.(retained, picker.firstChild || null);
   }
+  hmbInstallVideoPickerNativeHeader(container)?.sync();
   return retained;
 }
 
@@ -8136,6 +8246,7 @@ export function hmbSetVideoPickerHybridView(
   }
 
   container.insertBefore?.(compactStyle, clip);
+  compactSummary.classList?.add?.("nodrag");
   root.append?.(compactSummary);
   if (!hmbVideoPickerHasMountedBody(container, false)) return false;
   root.classList?.add?.("hmbvp-compact");
@@ -10798,9 +10909,11 @@ export function hmbInstallPickerInteractionIsolation(container, cleanupList) {
   // four delegated listeners replace four listeners on every row/control.
   // This keeps a 1,000-row Outliner at O(1) event-listener installation cost.
   container.querySelectorAll(interactionSelector).forEach((element) => {
-    element.classList?.add("nodrag", "nopan", "nowheel");
+    if (!element.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]")) element.classList?.add("nodrag", "nopan", "nowheel");
   });
+  hmbInstallVideoPickerNativeHeader(container)?.sync();
   const stopDelegatedInteraction = (event) => {
+    if (event?.target?.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]")) return;
     let interaction = null;
     try { interaction = event?.target?.closest?.(interactionSelector) || null; } catch (_error) {}
     if (!interaction) return;
@@ -10812,6 +10925,7 @@ export function hmbInstallPickerInteractionIsolation(container, cleanupList) {
     container.addEventListener?.(eventName, stopDelegatedInteraction);
   });
   const stopNodeDeleteShortcut = (event) => {
+    if (event?.target?.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]")) return;
     if (["Backspace", "Delete"].includes(event?.key)) event.stopPropagation?.();
   };
   const stopSelectedNodeDeleteShortcut = (event) => hmbGuardSelectedNodeKeyboardDelete(container, event);
@@ -10833,6 +10947,7 @@ export function hmbInstallPickerInteractionIsolation(container, cleanupList) {
 
 function hmbMorphNodeKey(node) {
   if (!node || node.nodeType !== 1) return "";
+  for (const name of ["identity", "actions"]) if (node.hasAttribute?.(`data-hmb-native-${name}`)) return `native:${name}`;
   const id = clean(node.getAttribute?.("id"));
   if (id) return `id:${id}`;
   for (const name of [
@@ -10907,6 +11022,8 @@ function hmbMorphPickerNode(current, desired) {
     if (current.nodeValue !== desired.nodeValue) current.nodeValue = desired.nodeValue;
     return current;
   }
+  if (current.matches?.("[data-hmb-native-identity],[data-hmb-native-actions]")
+    && desired.matches?.("[data-hmb-native-identity],[data-hmb-native-actions]")) return current;
   hmbSyncPickerElementAttributes(current, desired);
   hmbMorphPickerChildren(current, desired);
   return current;
@@ -11574,7 +11691,10 @@ export function hmbVideoPickerIsHostMeasurementClone(container) {
         || ["hidden", "collapse"].includes(inlineVisibility)
         || inlineDisplay === "none";
     } catch (_error) {}
-    if (!hidden) {
+    // Visibility matters only for the exact inert measurement wrapper below.
+    // Ordinary live ancestors cannot establish clone ownership; resolving
+    // their computed styles on every state echo forces unrelated layout work.
+    if (exactHostMeasurementWrapper && !hidden && !explicitMeasurementMarker) {
       try {
         const ownerView = current.ownerDocument?.defaultView
           || (typeof window !== "undefined" ? window : null);
@@ -12204,7 +12324,9 @@ function hmbNativeUiImplementation(container, props) {
   let recoverMissingMountedPicker = () => false;
   const cleanup = () => {
     if (disposed) return;
+    container.__hmbVideoPickerNativeHeader?.cleanup();
     disposed = true;
+    hmbCancelVideoPickerFileInput(container);
     if (Number(container.__hmbVideoPickerMountGeneration || 0) === pickerMountGeneration) {
       hmbCancelVideoPickerPendingPreviewStart(container);
       hmbCancelVideoPickerPlaybackIntent(container);
@@ -12374,15 +12496,16 @@ function hmbNativeUiImplementation(container, props) {
   const sharedImportInputMarkup = `
           <input type="file" id="import-video-asset" data-picker-shared-import-input accept=".mp4,video/mp4" multiple hidden/>`;
   const fixedTopPaintMarkup = `<style>
-      .hmbvp :is(button,input,select,textarea){font-family:inherit}
+      .hmbvp :is(button,input,select,textarea):not([data-hmb-native-identity] *,[data-hmb-native-actions] *){font-family:inherit}
       .hmbvp>.app-header.top[data-picker-toggle-surface="header"]{--hmb-primary-top:#F472B6;--hmb-primary-bottom:#BE185D;--hmb-primary-line:#F3A8CE;--hmb-focus:#22D3EE;--hmb-accent:#22D3EE;--hmb-glow:rgba(168,85,247,.16);--selection-rgb:244,114,182;--selection-deep-rgb:190,24,93;--selection-text:#F8C6DF;--selection-soft:#F3A8CE;--selection-strong:#FFE4F2;background:linear-gradient(90deg,rgba(72,35,101,.44),rgba(14,23,38,.92) 44%,rgba(6,9,18,.96))!important;background-color:#060912!important;border-bottom-color:rgba(148,163,184,.19)!important;box-shadow:none!important;filter:none!important;backdrop-filter:none!important;transition:none!important}
-      .hmbvp>.app-header.top[data-picker-toggle-surface="header"] *{transition:none!important}.hmbvp>.app-header.top[data-picker-toggle-surface="header"] button{box-shadow:none!important}.hmbvp>.app-header.top[data-picker-toggle-surface="header"] .brand-mark{border-color:rgba(34,211,238,.70)!important;background:rgba(8,145,178,.12)!important;color:#22D3EE!important;box-shadow:none!important}
+      .hmbvp>.app-header.top[data-picker-toggle-surface="header"] *:not([data-hmb-native-identity] *,[data-hmb-native-actions] *){transition:none!important}.hmbvp>.app-header.top[data-picker-toggle-surface="header"] button:not([data-hmb-native-identity] *,[data-hmb-native-actions] *){box-shadow:none!important}.hmbvp>.app-header.top[data-picker-toggle-surface="header"] .brand-mark{border-color:rgba(34,211,238,.70)!important;background:rgba(8,145,178,.12)!important;color:#22D3EE!important;box-shadow:none!important}
+      .hmbvp .hmb-native-identity,.hmbvp .hmb-native-actions{display:none;min-width:0;--node-header-text:#e8eef7}.hmbvp[data-hmb-native-header="active"]>.top>.brand{display:none}.hmbvp[data-hmb-native-header="active"]>.top>.hmb-native-identity{display:flex;align-items:center;flex:1;min-width:0}.hmbvp[data-hmb-native-header="active"]>.top>.hmb-native-actions{display:flex;align-items:center;flex:0 0 auto}.hmbvp .hmb-native-identity>div{min-width:0;max-width:100%}.hmbvp .hmb-native-actions svg{flex-shrink:0}.hmbvp[data-hmb-native-header="active"]>.top{cursor:grab}.hmbvp[data-hmb-native-header="active"]>.top:active{cursor:grabbing}
       .hmbvp>.app-header.top[data-picker-toggle-surface="header"][data-picker-view-transition-pending="true"]{cursor:progress!important}
       .hmbvp .picker-shot-tabs[data-picker-shot-layout="expanded"]>.picker-shot-tab.active{border-color:color-mix(in srgb,var(--local-shot-accent) 48%,#263449)!important;box-shadow:none!important}.hmbvp .picker-shot-tabs[data-picker-shot-layout="expanded"] .picker-shot-activate[aria-pressed="true"]{outline:2px solid var(--local-shot-accent)!important;outline-offset:-3px;border-radius:6px;box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--local-shot-accent) 38%,transparent)!important}
       .hmbvp.hmbvp-compact .compact-shot-row.active{border-color:rgba(var(--shot-rgb),.38)!important;box-shadow:none!important}.hmbvp.hmbvp-compact .compact-shot-row.active .compact-shot-head>.picker-shot-number{outline:2px solid var(--shot-accent)!important;outline-offset:2px;border-radius:4px;box-shadow:none!important}
     </style>`;
-  const fixedTopMarkup = `${fixedTopPaintMarkup}<header class="app-header top" data-picker-toggle-surface="header" aria-label="HMB VideoPicker">
-        <div class="brand"><span class="brand-mark"></span><span>HMBVideoPickerLibrary</span></div>
+  const fixedTopMarkup = `${fixedTopPaintMarkup}<header class="app-header top group" data-picker-toggle-surface="header" aria-label="HMB VideoPicker">
+        <div class="brand"><span class="brand-mark"></span><span>HMB VideoPicker</span></div><div class="hmb-native-identity" data-hmb-native-identity></div><div class="hmb-native-actions nodrag" data-hmb-native-actions></div>
         <div class="header-actions" data-no-picker-toggle>
           <span class="picker-active-shot-controls" data-picker-active-shot-controls="${escapeHtml(fixedTopActiveShot?.workspace_uuid || "")}"><b data-picker-shot-name>${escapeHtml(fixedTopActiveShot?.name || "Shot 1")}</b><button type="button" class="picker-shot-rename" data-picker-shot-rename="${escapeHtml(fixedTopActiveShot?.workspace_uuid || "")}" aria-label="Rename ${escapeHtml(fixedTopActiveShot?.name || "Shot 1")}" ${initialLocked ? "disabled" : ""}>✎</button></span>
           ${sharedImportInputMarkup}
@@ -12393,7 +12516,7 @@ function hmbNativeUiImplementation(container, props) {
     <style>
       .hmbvp-clip{width:100%;min-width:0;min-height:0;overflow:hidden;background:#090c16;box-sizing:border-box;display:flex;flex-direction:column}
       .hmbvp{--hmb-deep:#090c16;position:relative;width:100%;min-width:0;min-height:0;padding:0;display:flex;flex-direction:column;background:#0b1020;color:#dbe4ec;border:1px solid rgba(148,163,184,.22);border-radius:10px;overflow:hidden;font-family:"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif;font-size:12px}
-      .hmbvp *{box-sizing:border-box;min-width:0}.hmbvp button,.hmbvp select{font:inherit;color:inherit}.app-header{position:relative;z-index:30;height:58px;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 13px;background:linear-gradient(90deg,rgba(72,35,101,.44),rgba(14,23,38,.9) 44%);border-bottom:1px solid rgba(148,163,184,.22);user-select:none}.brand{display:flex;align-items:center;gap:12px;min-width:0;flex:1;font-size:15px;font-weight:850}.brand-mark{width:35px;height:35px;flex:0 0 35px;display:grid;place-items:center;border:1px solid var(--hmb-primary-line);border-radius:8px;background:rgba(var(--selection-rgb),.12)}.brand-mark:after{content:"VP";font-size:9px;font-weight:950}.header-actions{display:flex;align-items:center;gap:7px}.header-actions button,.header-actions select{height:31px;padding:0 9px;border:1px solid rgba(var(--selection-rgb),.42);border-radius:7px;background:#080d17;color:#eef2f7}.add-picker-shot-button{border-color:var(--hmb-primary-line)!important;background:linear-gradient(180deg,var(--hmb-primary-top),var(--hmb-primary-bottom))!important;color:#fff!important;font-weight:850}.shot-selector-wrap{display:flex;align-items:center;gap:5px}.shot-selector-label{font-size:9px;font-weight:900;letter-spacing:.12em;color:#8ea0b5}.shot-selector{min-width:132px;max-width:220px}.shot-selector-conflict{display:none}.compact-current-videos{margin:8px;padding:8px;min-height:0;flex:1 1 auto;display:flex;flex-direction:column;border:1px solid rgba(16,185,129,.58);border-radius:8px;background:linear-gradient(90deg,rgba(4,120,87,.22),rgba(6,78,59,.08));box-shadow:inset 0 0 0 1px rgba(52,211,153,.06)}
+      .hmbvp *{box-sizing:border-box;min-width:0}.hmbvp button:not([data-hmb-native-identity] *,[data-hmb-native-actions] *),.hmbvp select:not([data-hmb-native-identity] *,[data-hmb-native-actions] *){font:inherit;color:inherit}.app-header{position:relative;z-index:30;height:58px;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 13px;background:linear-gradient(90deg,rgba(72,35,101,.44),rgba(14,23,38,.9) 44%);border-bottom:1px solid rgba(148,163,184,.22);user-select:none}.brand{display:flex;align-items:center;gap:12px;min-width:0;flex:1;font-size:15px;font-weight:850}.brand-mark{width:35px;height:35px;flex:0 0 35px;display:grid;place-items:center;border:1px solid var(--hmb-primary-line);border-radius:8px;background:rgba(var(--selection-rgb),.12)}.brand-mark:after{content:"VP";font-size:9px;font-weight:950}.header-actions{display:flex;align-items:center;gap:7px}.header-actions button,.header-actions select{height:31px;padding:0 9px;border:1px solid rgba(var(--selection-rgb),.42);border-radius:7px;background:#080d17;color:#eef2f7}.add-picker-shot-button{border-color:var(--hmb-primary-line)!important;background:linear-gradient(180deg,var(--hmb-primary-top),var(--hmb-primary-bottom))!important;color:#fff!important;font-weight:850}.shot-selector-wrap{display:flex;align-items:center;gap:5px}.shot-selector-label{font-size:9px;font-weight:900;letter-spacing:.12em;color:#8ea0b5}.shot-selector{min-width:132px;max-width:220px}.shot-selector-conflict{display:none}.compact-current-videos{margin:8px;padding:8px;min-height:0;flex:1 1 auto;display:flex;flex-direction:column;border:1px solid rgba(16,185,129,.58);border-radius:8px;background:linear-gradient(90deg,rgba(4,120,87,.22),rgba(6,78,59,.08));box-shadow:inset 0 0 0 1px rgba(52,211,153,.06)}
       .picker-shot-tabs{display:flex;align-items:stretch;gap:6px;overflow-x:auto;padding:0 0 7px}.picker-shot-tab{display:grid;grid-template-columns:30px minmax(72px,1fr) 34px 24px 26px 26px;align-items:center;gap:4px;flex:1 1 190px;min-width:190px;max-width:300px;height:36px;padding:3px;border:1px solid color-mix(in srgb,var(--local-shot-accent) 48%,#263449);border-radius:7px;background:color-mix(in srgb,var(--local-shot-deep) 16%,#0d1423)}.picker-shot-tab.active{border-color:var(--local-shot-accent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--local-shot-accent) 38%,transparent)}.picker-shot-activate,.picker-shot-rename,.picker-shot-delete{height:28px;border:1px solid color-mix(in srgb,var(--local-shot-accent) 42%,#334155);border-radius:5px;background:#101827;color:#fff;cursor:pointer}.picker-shot-number{font-size:9px;font-weight:950}.picker-shot-name-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;font-weight:800;color:#eef2f7}.picker-shot-binding-chip{height:20px;display:grid;place-items:center;border-left:3px solid var(--remote-shot-accent,#64748b);border-radius:4px;background:#111827;color:#aeb9c1;font-size:7px;font-weight:900}.picker-shot-video-count{font-size:8px;text-align:center;color:#a7f3d0}.picker-shot-actions{min-height:48px;display:flex;align-items:center;gap:9px;margin-bottom:7px}.picker-shot-actions .spacer{flex:1}.picker-shot-actions .shot-selector{background:#0b1320;border:1px solid rgba(var(--selection-rgb),.58);border-radius:6px;color:var(--selection-strong)}
       .compact-current-videos-title{color:#a7f3d0;font-size:11px;font-weight:900;letter-spacing:.08em}.video-selected-count{font-size:9px;color:#a7f3d0;font-variant-numeric:tabular-nums}.import-video-button{height:27px;padding:0 12px;border:1px solid #34d399;border-radius:6px;background:linear-gradient(180deg,#047857,#065f46);color:#ecfdf5;font-weight:850;cursor:pointer}.import-video-button:disabled{opacity:.45;cursor:not-allowed}.import-video-icon{display:none}
       .video-assets-body{overflow-x:auto;overflow-y:hidden;contain:layout paint}.video-asset-grid{display:flex;align-items:stretch;gap:8px;min-height:94px}.video-assets-empty{flex:1 1 100%;min-height:92px;display:grid;place-items:center;border:1px dashed rgba(52,211,153,.30);border-radius:7px;color:#86a99c}.video-asset-card{position:relative;display:grid;grid-template-columns:112px 92px;flex:0 0 204px;min-height:88px;border:1px solid #263449;border-radius:7px;background:#0d1423;overflow:hidden}.video-asset-card.selected{border-color:#34d399;box-shadow:inset 0 0 0 1px rgba(52,211,153,.35),0 0 12px rgba(16,185,129,.18)}.video-asset-card.selection-blocked{opacity:.58}.video-asset-thumb{position:relative;min-height:86px;background:#050812;overflow:hidden}.video-asset-thumb-media{width:100%;height:100%;display:block;object-fit:cover;background:#050812}.video-asset-thumb-fallback{height:100%;display:grid;place-items:center;color:#64748b;font-size:10px}.video-asset-role{position:absolute;left:4px;bottom:4px;max-width:70px;padding:2px 4px;border-radius:3px;background:rgba(0,0,0,.72);font-size:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.selected-video-order{position:absolute;left:4px;top:4px;padding:2px 5px;border-radius:4px;background:#047857;color:#fff;font-size:8px;font-weight:900}.video-asset-play{position:absolute;inset:0;width:100%;height:100%;border:0;background:transparent;color:transparent;cursor:pointer}.video-asset-play:focus-visible{outline:2px solid #34d399;outline-offset:-2px}.video-asset-copy{display:flex;flex-direction:column;justify-content:center;gap:4px;padding:8px;cursor:pointer}.video-asset-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#e4ebf4;font-size:10px}.video-asset-details{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#7f8da0;font-size:8px}.video-asset-delete{display:none}.video-order-hint{margin-top:5px;color:#86a99c;font-size:8px;text-align:right}.section-resize-handle{display:none}
@@ -12421,9 +12544,9 @@ function hmbNativeUiImplementation(container, props) {
     <style>
       .hmbvp-clip{width:100%;height:100%;min-width:0;min-height:0;max-width:none;max-height:none;overflow:hidden;background:#050812;box-sizing:border-box;display:flex;flex-direction:column;flex:1 1 auto}
       .hmbvp{--safe-x:16px;position:relative;width:100%;height:100%;min-width:0;min-height:960px;max-width:none;max-height:none;padding-left:var(--safe-x);padding-right:var(--safe-x);display:flex;flex-direction:column;flex:1 1 auto;background:#101820;color:#dbe4ec;border:1px solid rgba(148,163,184,.2);border-radius:11px;box-shadow:0 0 34px rgba(14,165,233,.12);overflow:hidden;resize:none;container-type:inline-size;font-family:"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif;font-size:12px}
-      .hmbvp *{box-sizing:border-box;min-width:0}.hmbvp button,.hmbvp select,.hmbvp input,.hmbvp textarea{font:inherit;pointer-events:auto}.hmbvp button{color:inherit}.hmbvp .nodrag{touch-action:auto}.app-header{position:relative;z-index:30}.header-actions{position:relative;z-index:31}
+      .hmbvp *{box-sizing:border-box;min-width:0}.hmbvp button:not([data-hmb-native-identity] *,[data-hmb-native-actions] *),.hmbvp select:not([data-hmb-native-identity] *,[data-hmb-native-actions] *),.hmbvp input:not([data-hmb-native-identity] *,[data-hmb-native-actions] *),.hmbvp textarea:not([data-hmb-native-identity] *,[data-hmb-native-actions] *){font:inherit;pointer-events:auto}.hmbvp button:not([data-hmb-native-identity] *,[data-hmb-native-actions] *){color:inherit}.hmbvp .nodrag{touch-action:auto}.app-header{position:relative;z-index:30}.header-actions{position:relative;z-index:31}
       .setting-select{width:100%;height:27px;padding:0 8px;border:1px solid #2c3b46;border-radius:2px;background:#202d36;color:#d7dfe4;cursor:pointer;outline:0}.setting-select:disabled{opacity:.5;cursor:not-allowed}
-      .hmbvp button,.hmbvp input,.hmbvp select{transition:border-color 80ms ease,color 80ms ease}
+      .hmbvp button:not([data-hmb-native-identity] *,[data-hmb-native-actions] *),.hmbvp input:not([data-hmb-native-identity] *,[data-hmb-native-actions] *),.hmbvp select:not([data-hmb-native-identity] *,[data-hmb-native-actions] *){transition:border-color 80ms ease,color 80ms ease}
       .hmbvp .side-section,.hmbvp .viewport-panel{transition-property:background-color,border-color,opacity;transition-duration:140ms;transition-timing-function:ease}.viewport-panel.is-switching .viewport-stage{opacity:.78}.viewport-panel.is-switching .viewport-title small:after{content:" …"}
       .preview-load-status{position:absolute;z-index:8;left:12px;right:12px;bottom:12px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 11px;border:1px solid rgba(251,113,133,.72);border-radius:7px;background:rgba(64,14,26,.94);color:#ffe4e8;font-size:10px;line-height:1.35;box-shadow:0 8px 22px rgba(0,0,0,.36)}.preview-load-status[hidden]{display:none}.preview-load-status span{flex:1}.preview-load-status button{height:27px;flex:0 0 auto;padding:0 10px;border:1px solid rgba(255,255,255,.3);border-radius:5px;background:#71283a;color:#fff;cursor:pointer;font-weight:800}
       @media (prefers-reduced-motion:reduce){.hmbvp *{animation:none!important;transition:none!important}}
@@ -12508,10 +12631,10 @@ function hmbNativeUiImplementation(container, props) {
       .hmbvp[data-theme] .activity-body{background:var(--hmb-deep)}
       .hmbvp[data-theme] .activity-log-view{color:var(--hmb-text)}
       .hmbvp[data-theme] .scene-path-input,.hmbvp[data-theme] .scene-load-bar button,.hmbvp[data-theme] .original-preview-toggle,.hmbvp[data-theme] .mask-playblast-toggle,.hmbvp[data-theme] .depth-playblast-toggle,.hmbvp[data-theme] .motion-guide-toggle,.hmbvp[data-theme] .setting-select,.hmbvp[data-theme] .video-controls button,.hmbvp[data-theme] .frame-number-label input,.hmbvp[data-theme] .snapshot-toolbar>button,.hmbvp[data-theme] .header-actions button,.hmbvp[data-theme] .activity-clear,.hmbvp[data-theme] .import-video-button,.hmbvp[data-theme] .search-input,.hmbvp[data-theme] .camera-fixed,.hmbvp[data-theme] .camera-dropdown summary,.hmbvp[data-theme] .palette-label,.hmbvp[data-theme] .setting-value,.hmbvp[data-theme] .preview-nav button,.hmbvp[data-theme] .video-asset-footer button,.hmbvp[data-theme] .video-order-actions button{border-color:var(--hmb-line-soft);border-radius:7px;background:linear-gradient(180deg,rgba(255,255,255,.032),rgba(255,255,255,.006)),var(--hmb-field);color:var(--hmb-text);box-shadow:inset 0 1px 0 rgba(255,255,255,.018)}
-      .hmbvp[data-theme] button{letter-spacing:.01em}
+      .hmbvp[data-theme] button:not([data-hmb-native-identity] *,[data-hmb-native-actions] *){letter-spacing:.01em}
       .hmbvp[data-theme] .scene-load-bar .load-scene-button,.hmbvp[data-theme] .snapshot-toolbar #create-snapshot,.hmbvp[data-theme] .generate-button,.hmbvp[data-theme] .import-video-button{border-color:var(--hmb-primary-line);border-radius:7px;background:linear-gradient(180deg,var(--hmb-primary-top),var(--hmb-primary-bottom));color:#fff;box-shadow:0 0 14px var(--hmb-glow),inset 0 1px 0 rgba(255,255,255,.10)}
       .hmbvp[data-theme] .header-actions .stop-button,.hmbvp[data-theme] .snapshot-toolbar #delete-snapshot,.hmbvp[data-theme] .video-asset-delete{border-color:rgba(251,113,133,.50);background:linear-gradient(180deg,rgba(159,18,57,.74),rgba(76,5,25,.84));color:#ffe4e8;box-shadow:inset 0 1px 0 rgba(255,255,255,.07)}
-      .hmbvp[data-theme] .scene-path-input:focus,.hmbvp[data-theme] .setting-select:focus,.hmbvp[data-theme] .frame-number-label input:focus,.hmbvp[data-theme] .search-input:focus,.hmbvp[data-theme] .camera-dropdown summary:focus-visible,.hmbvp[data-theme] button:focus-visible{outline:0;border-color:var(--hmb-focus);box-shadow:0 0 0 1px var(--hmb-focus),0 0 14px var(--hmb-glow)}
+      .hmbvp[data-theme] .scene-path-input:focus,.hmbvp[data-theme] .setting-select:focus,.hmbvp[data-theme] .frame-number-label input:focus,.hmbvp[data-theme] .search-input:focus,.hmbvp[data-theme] .camera-dropdown summary:focus-visible,.hmbvp[data-theme] button:not([data-hmb-native-identity] *,[data-hmb-native-actions] *):focus-visible{outline:0;border-color:var(--hmb-focus);box-shadow:0 0 0 1px var(--hmb-focus),0 0 14px var(--hmb-glow)}
       .hmbvp[data-theme] .scene-load-bar button:not(:disabled):hover,.hmbvp[data-theme] .generate-playblast-toolbar .generate-button:not(:disabled):hover,.hmbvp[data-theme] .video-controls button:not(:disabled):hover,.hmbvp[data-theme] .snapshot-toolbar>button:not(:disabled):hover,.hmbvp[data-theme] .header-actions button:not(:disabled):hover,.hmbvp[data-theme] .preview-nav button:not(:disabled):hover,.hmbvp[data-theme] .activity-clear:not(:disabled):hover,.hmbvp[data-theme] .import-video-button:not(:disabled):hover,.hmbvp[data-theme] .video-asset-footer button:not(:disabled):hover,.hmbvp[data-theme] .video-order-actions button:not(:disabled):hover{border-color:var(--hmb-focus);color:#fff;box-shadow:0 0 12px var(--hmb-glow)}
       .hmbvp[data-theme] .outliner-row.selected{background:var(--hmb-selected);box-shadow:inset 2px 0 0 var(--hmb-accent-2),0 0 12px var(--hmb-glow)}
       .hmbvp[data-theme] .outliner-row:hover{background:var(--hmb-hover)}
@@ -14491,7 +14614,8 @@ function hmbNativeUiImplementation(container, props) {
     return true;
   };
   const scheduleNativeMayaPathSync = (event = null) => {
-    if (event?.target && container.contains?.(event.target)) return;
+    if (disposed || container.__hmbVideoPickerDeleted === true) return;
+    if (hmbPickerContainsEventNode(container, event?.target)) return;
     const exactNativeTarget = hmbIsExactNativeMayaPickerTarget(container, event?.target);
     if (!exactNativeTarget && !hmbNativeMayaBrowseSessionActive(container)) return;
     const browseSessionActive = hmbNativeMayaBrowseSessionActive(container);
@@ -15396,12 +15520,20 @@ function hmbNativeUiImplementation(container, props) {
   );
   on(container.querySelector("#import-video-asset"), "change", (event) => {
     const files = Array.from(event.target?.files || []);
-    const preserveEditWorkspace = container.__hmbPendingImportPreserveEditWorkspace === true;
-    delete container.__hmbPendingImportPreserveEditWorkspace;
+    const preserveEditWorkspace = container.__hmbVideoImportDialogSession?.preserveEditWorkspace === true;
+    const liveState = currentWidgetState();
     const pickerShotUuid = hmbConsumeVideoPickerFileInputTarget(
       container,
-      currentWidgetState().active_picker_shot_uuid,
+      liveState.active_picker_shot_uuid,
+      event.target,
     );
+    // A cancelled/deleted/remounted chooser has no owner. Never import its
+    // late files into whichever Shot happens to be active now.
+    if (!pickerShotUuid || !liveState.picker_shots.some(row => row.workspace_uuid === pickerShotUuid)
+        || container.__hmbVideoPickerDeleted === true || disposed) {
+      event.target.value = "";
+      return;
+    }
     if (!files.length) {
       event.target.value = "";
       return;
@@ -16053,5 +16185,5 @@ function hmbNativeUiContract(container, props, mount, policy) {
 // HMB_NATIVE_DISABLED_ADAPTER_V1_END
 
 export default function HMBVideoPickerLibraryWidget(container, props) {
-  return hmbNativeUiContract(container, props, hmbNativeUiImplementation, { kind: "picker", allowControl: target => Boolean(target?.closest?.("#video-play-toggle,#video-seek,#video-frame-number,#snapshot-prev,#snapshot-next,#stop-read,[data-picker-import-cancel],[data-picker-tool-action='cancel']")) });
+  return hmbNativeUiContract(container, props, hmbNativeUiImplementation, { kind: "picker", allowControl: target => Boolean(target?.closest?.("#video-play-toggle,#video-seek,#video-frame-number,#snapshot-prev,#snapshot-next,#stop-read,[data-picker-import-cancel],[data-picker-tool-action='cancel'],[data-hmb-native-identity],[data-hmb-native-actions]")) });
 }

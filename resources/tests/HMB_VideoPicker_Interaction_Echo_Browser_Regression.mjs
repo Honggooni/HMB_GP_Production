@@ -97,7 +97,11 @@ const crossedEchoFixture=()=>{
 let browser;
 const failures=[];
 try {
-  browser=await playwright.chromium.launch({executablePath,headless:true});
+  // Windows may allocate an otherwise valid ephemeral port that Chromium
+  // blocks (for example 6697). Allow this fixture's exact loopback port only;
+  // the request route below still rejects every non-fixture destination.
+  browser=await playwright.chromium.launch({executablePath,headless:true,
+    args:[`--explicitly-allowed-ports=${server.address().port}`]});
   const page=await browser.newPage({viewport:{width:1700,height:1300}});
   const origin=`http://127.0.0.1:${server.address().port}`;
   await page.route('**/*',route=>route.request().url().startsWith(origin)?route.continue():route.abort());

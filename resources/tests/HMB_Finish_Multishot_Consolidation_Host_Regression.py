@@ -200,6 +200,8 @@ async def exercise(engine, directory):
         assert any(value.get("documents") == raw_store["documents"] for value in saved_stores), [list(value.get("documents", {})) for value in saved_stores]
         merged_documents = manager._hmb_finish_merge_snapshot()["documents"]
         old_name = flow.name
+        from HMB_Workflow_Consolidation_Host_Regression import disconnect_fixture_nodes
+        disconnect_fixture_nodes(engine, flow, tuple(flow.nodes))
         # SDK CreateFlow(None) means the ambient flow when one exists. A real
         # reopen clears that context; discard this fixture's deleted canvas
         # before replay so it cannot become its own parent by name.

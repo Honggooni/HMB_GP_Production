@@ -267,7 +267,7 @@ function renderAgentDashboard(state, container) {
   const height = hmbAgentWidgetHeight(state);
   return `
     <style>
-      .hmb-agent-dashboard :is(button,input,select,textarea){font-family:inherit}
+      .hmb-agent-dashboard :is(button,input,select,textarea):not([data-hmb-native-identity] *):not([data-hmb-native-actions] *){font-family:inherit}
       .hmb-agent-dashboard{--hmb-shot-accent:#F472B6;--hmb-shot-rgb:244,114,182;--hmb-shot-deep:#BE185D;--hmb-shot-soft:#FBCFE8;--hmb-shot-line:rgba(244,114,182,.48);--hmb-shot-glow:rgba(244,114,182,.2);--hmb-bg-top:#0b1020;--hmb-bg-bottom:#060912;--hmb-line:var(--hmb-shot-line);--hmb-accent:var(--hmb-shot-accent);--hmb-highlight:var(--hmb-shot-soft);--hmb-text:#e6edf7;--hmb-muted:#8fa3b8;--hmb-haze:var(--hmb-shot-glow);--hmb-head-wash:rgba(var(--hmb-shot-rgb),.22);--hmb-mark-bg:rgba(var(--hmb-shot-rgb),.12);--hmb-mark-line:var(--hmb-shot-line);--hmb-mark-glow:var(--hmb-shot-glow);--hmb-chip-bg:rgba(var(--hmb-shot-rgb),.18);--hmb-chip-line:var(--hmb-shot-line);--hmb-chip-text:var(--hmb-shot-soft);--hmb-chip-glow:var(--hmb-shot-glow);--hmb-status-error:#FB7185;--hmb-status-warning:#FBBF24;--hmb-status-success:#34D399;container-type:inline-size;position:relative;width:100%;height:64px;overflow:hidden;border:1px solid var(--hmb-line);border-radius:11px;background:radial-gradient(circle at 8% -42%,var(--hmb-haze),transparent 54%),linear-gradient(90deg,var(--hmb-head-wash),rgba(14,23,38,.95) 46%,var(--hmb-bg-bottom));color:var(--hmb-text);box-shadow:inset 0 1px 0 rgba(255,255,255,.035),0 8px 24px rgba(0,0,0,.24),0 0 18px var(--hmb-chip-glow);font-family:"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif;box-sizing:border-box;user-select:none}
       .hmb-agent-dashboard[data-shot-number="2"]{--hmb-shot-accent:#3B82F6;--hmb-shot-rgb:59,130,246;--hmb-shot-deep:#1D4ED8;--hmb-shot-soft:#DBEAFE;--hmb-shot-line:rgba(59,130,246,.5);--hmb-shot-glow:rgba(59,130,246,.2)}
       .hmb-agent-dashboard[data-shot-number="3"]{--hmb-shot-accent:#10B981;--hmb-shot-rgb:16,185,129;--hmb-shot-deep:#047857;--hmb-shot-soft:#D1FAE5;--hmb-shot-line:rgba(16,185,129,.5);--hmb-shot-glow:rgba(16,185,129,.2)}
@@ -294,14 +294,22 @@ function renderAgentDashboard(state, container) {
       .hmb-agent-dashboard .agent-shot-tab b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hmb-agent-dashboard .agent-row-status{margin-left:auto;color:var(--hmb-muted);font-size:9px}
       .hmb-agent-dashboard .agent-shot-run{flex:0 0 29px;height:29px;margin-right:6px;border:1px solid rgba(var(--row-rgb),.5);border-radius:7px;background:rgba(var(--row-rgb),.12);color:var(--hmb-shot-accent);font-size:16px}
       .hmb-agent-dashboard .agent-shot-empty{height:42px;display:flex;align-items:center;justify-content:center;color:var(--hmb-muted);font-size:10px}
+      .hmb-agent-dashboard .agent-native-identity,.hmb-agent-dashboard .agent-native-actions{display:none;min-width:0;--node-header-text:var(--hmb-text)}
+      .hmb-agent-dashboard[data-hmb-native-header="active"] .agent-mark,.hmb-agent-dashboard[data-hmb-native-header="active"] .agent-heading{display:none}
+      .hmb-agent-dashboard[data-hmb-native-header="active"] .agent-native-identity{display:flex;align-items:center;flex:1;min-width:0}
+      .hmb-agent-dashboard[data-hmb-native-header="active"] .agent-native-actions{display:flex;align-items:center;flex:0 0 auto}
+      .hmb-agent-dashboard .agent-native-identity>div{min-width:0;max-width:100%}.hmb-agent-dashboard .agent-native-actions svg{flex-shrink:0}
+      .hmb-agent-dashboard[data-hmb-native-header="active"] .agent-topbar{cursor:grab}.hmb-agent-dashboard[data-hmb-native-header="active"] .agent-topbar:active{cursor:grabbing}
     </style>
     <div class="hmb-agent-dashboard nodrag" data-shot-number="${paletteShotNumber}" data-execution-phase="${hmbAgentEscape(state.execution_phase)}" style="height:${height}px" tabindex="0">
-      <header class="agent-topbar">
+      <header class="agent-topbar group">
         <div class="agent-mark" aria-hidden="true"><span>AG</span></div>
-        <div class="agent-heading"><b>HMBAgentLibrary</b></div>
+        <div class="agent-heading"><b>HMB Agent</b></div>
+        <div class="agent-native-identity" data-hmb-native-identity></div>
+        <div class="agent-native-actions nodrag" data-hmb-native-actions></div>
         <span class="agent-publication-status" role="status" aria-live="polite" aria-atomic="true">${hmbAgentEscape(executionStatus)}</span>
       </header>
-      <div class="agent-rebind-panel"><span role="status"></span><select class="agent-rebind-select" aria-label="기존 Agent를 연결할 샷 선택"></select><button type="button" class="agent-rebind-confirm">직접 재연결</button></div>
+      <div class="agent-rebind-panel nodrag"><span role="status"></span><select class="agent-rebind-select" aria-label="기존 Agent를 연결할 샷 선택"></select><button type="button" class="agent-rebind-confirm">직접 재연결</button></div>
     </div>`;
 }
 
@@ -417,10 +425,15 @@ export function hmbPrepareAgentCanvasGestures(container) {
   // handlers, Griptape owns left/middle-button pan, wheel zoom, and its native
   // grab -> grabbing cursor transition.
   for (const name of ["nopan","nowheel"]) if (container.classList?.contains(name)) container.classList.remove(name);
-  if (!container.classList?.contains("nodrag")) container.classList?.add("nodrag");
+  const nativeActive = container.__hmbAgentNativeHeaderActive === true;
+  container.classList?.toggle("nodrag", !nativeActive);
   const root = hmbAgentDashboardRoot(container);
   for (const name of ["nopan","nowheel"]) if (root?.classList?.contains(name)) root.classList.remove(name);
-  if (root && !root.classList?.contains("nodrag")) root.classList?.add("nodrag");
+  root?.classList?.toggle("nodrag", !nativeActive);
+}
+
+function hmbAgentNativeHeaderTarget(target) {
+  return Boolean(target?.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]"));
 }
 
 function hmbAgentDashboardRoot(container) {
@@ -474,6 +487,7 @@ function hmbAgentDeleteEditingTarget(event) {
 
 export function hmbGuardSelectedNodeKeyboardDelete(container, event) {
   if (!["Backspace", "Delete"].includes(event?.key)) return false;
+  if (container?.ownerDocument?.documentElement?.getAttribute?.("data-hmb-native-deletion-guard") === "engine-preflight") return false;
   if (event?.target?.closest?.("[data-hmb-node-delete-protected='true']")) return false;
   if (hmbAgentDeleteEditingTarget(event)) return false;
   if (!hmbAgentNodeIsSelected(hmbAgentNodeRoot(container))) return false;
@@ -542,12 +556,27 @@ function hmbNativeUiImplementation(container, props) {
   );
 
   compactAgentWidgetHost(container, hmbAgentState(props));
+  const hadContainerNoDrag = container.classList?.contains("nodrag");
   container.setAttribute?.("data-hmb-node-delete-protected", "true");
+  container.setAttribute?.("data-hmb-color-lut-widget", "");
+  container.setAttribute?.("data-hmb-native-node-type", "HMBAgentLibrary");
   container.innerHTML = hmbScopeWidgetStyleMarkup(
     renderAgentDashboard(hmbAgentState(props), container),
     ".hmb-agent-dashboard",
   );
   hmbPrepareAgentCanvasGestures(container);
+  const documentRef = container.ownerDocument || (typeof document !== "undefined" ? document : null);
+  const announceNativeHeader = (phase) => {
+    const Event = documentRef?.defaultView?.CustomEvent || (typeof CustomEvent !== "undefined" ? CustomEvent : null);
+    if (Event) documentRef?.dispatchEvent?.(new Event(`hmb-color-lut-header-${phase}`, {detail:{container}}));
+  };
+  const nativeHeaderState = (event) => {
+    if (!ownsLifecycle() || event.target !== container) return;
+    container.__hmbAgentNativeHeaderActive = event.detail?.active === true;
+    hmbAgentDashboardRoot(container)?.setAttribute("data-hmb-native-header", container.__hmbAgentNativeHeaderActive ? "active" : "fallback");
+    hmbPrepareAgentCanvasGestures(container);
+  };
+  container.addEventListener?.("hmb-color-lut-header-state", nativeHeaderState);
   // Discovery asks a local publisher to refresh its backend state. The
   // process-global response is deliberately not observed by this widget.
   if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
@@ -635,15 +664,20 @@ function hmbNativeUiImplementation(container, props) {
     window.addEventListener("keydown", stopSelectedNodeDeleteShortcut, true);
   }
   const stopNodeDeleteShortcut = (event) => {
+    if (hmbAgentNativeHeaderTarget(event.target)) return;
     if (["Backspace", "Delete"].includes(event?.key)) event.stopPropagation?.();
   };
   const stopInteriorNodeSelection = (event) => {
+    if (hmbAgentNativeHeaderTarget(event.target)
+      || container.__hmbAgentNativeHeaderActive && event.target?.closest?.(".agent-topbar")
+        && !event.target?.closest?.("button,input,select,textarea,label,a")) return;
     if (Number(event?.button) !== 1) event.stopPropagation?.();
   };
   container.addEventListener?.("keydown", stopNodeDeleteShortcut);
   container.addEventListener?.("pointerdown", stopInteriorNodeSelection);
 
   const cleanup = () => {
+    announceNativeHeader("retire");
     disposed = true;
     if (container.__hmbAgentLifecycleEpoch === lifecycleEpoch) {
       container.__hmbAgentLifecycleEpoch = lifecycleEpoch + 1;
@@ -653,11 +687,16 @@ function hmbNativeUiImplementation(container, props) {
     }
     container.removeEventListener?.("keydown", stopNodeDeleteShortcut);
     container.removeEventListener?.("pointerdown", stopInteriorNodeSelection);
+    container.removeEventListener?.("hmb-color-lut-header-state", nativeHeaderState);
     shotSelect?.removeEventListener?.("change", legacyShotChangeHandler);
     manualSelect?.removeEventListener?.("change",manualSelectHandler);manualConfirm?.removeEventListener?.("click",manualConfirmHandler);
     const manualPending=container.__hmbAgentManualPending;if(manualPending){clearTimeout(manualPending.timer);manualPending.guardCleanup?.();delete container.__hmbAgentManualPending;}
     delete container.__hmbAgentManualError;
     container.removeAttribute?.("data-hmb-node-delete-protected");
+    container.removeAttribute?.("data-hmb-color-lut-widget");
+    container.removeAttribute?.("data-hmb-native-node-type");
+    delete container.__hmbAgentNativeHeaderActive;
+    container.classList?.toggle("nodrag", Boolean(hadContainerNoDrag));
     try {
       container.style.removeProperty("height");
       container.style.removeProperty("min-height");
@@ -684,6 +723,7 @@ function hmbNativeUiImplementation(container, props) {
     container.innerHTML = "";
   };
   container.__hmbAgentCleanup = cleanup;
+  announceNativeHeader("ready");
   return {
     cleanup: container.__hmbAgentCleanupProxy,
     update(nextProps) {
@@ -711,6 +751,7 @@ export function hmbAgentShotRowState(props) {
   return {schema:"hmb-agent-shot-row",version:1,
     shot:valid ? {channel_uuid:shot.channel_uuid,shot_uuid:shot.shot_uuid,number,name:String(shot.name || `Shot ${number}`).slice(0,128),revision:Number(shot.revision)||0} : {},
     selected:valid && raw.selected === true,expanded:valid && raw.expanded === true,
+    ...(raw?.routing_pending===true ? {routing_pending:true} : {}),
     request_id:/^[0-9a-f]{32}$/.test(String(raw?.request_id || "")) ? raw.request_id : "",
     ...(/^[0-9a-f]{32}$/.test(String(raw?.rejected_request_id || "")) && raw?.error_code==="SHOT_IDENTITY_UNAVAILABLE"
       ? {rejected_request_id:raw.rejected_request_id,error_code:raw.error_code} : {}),
@@ -779,10 +820,10 @@ function hmbAgentShotRowWidget(container, initialProps) {
     const own=ticket?.owner===container;
     const current=switching ? {...canonical,selected:own,expanded:own && ticket.expanded} : canonical;
     const recovering=own && ticket?.recovering;
-    const text=own ? (recovering ? "응답 확인 필요" : switching ? "전환 중…" : "전달 중…") : lastError ? (lastRejected ? "요청 거절됨" : "응답 확인 필요") : ({running:"Agent 실행 중…",succeeded:"완료",failed:"실패",cancelled:"취소"})[current.status] || "";
+    const text=canonical.routing_pending ? "샷 연결 확인 중…" : own ? (recovering ? "응답 확인 필요" : switching ? "전환 중…" : "전달 중…") : lastError ? (lastRejected ? "요청 거절됨" : "응답 확인 필요") : ({running:"Agent 실행 중…",succeeded:"완료",failed:"실패",cancelled:"취소"})[current.status] || "";
     const running=current.status==="running",runText=recovering ? "↻" : running ? "■" : "▷";
     const title=recovering?"현재 상태만 확인합니다. Agent/Run은 다시 실행하지 않습니다.":lastError || (running?"이 샷 Agent만 취소":"이 샷 Agent만 실행");
-    const disabled=Boolean(ticket) || !shot.shot_uuid,runDisabled=disabled && !recovering;
+    const disabled=Boolean(ticket) || Boolean(canonical.routing_pending) || !shot.shot_uuid,runDisabled=disabled && (!recovering || Boolean(canonical.routing_pending));
     // The host may update geometry independently of the authored value.
     for(const [key,value] of [["height","42px"],["min-height","42px"],["max-height","42px"],["flex","0 0 42px"],["overflow","hidden"]])if(container.style?.getPropertyValue?.(key)!==value)container.style?.setProperty?.(key,value,"important");
     const signature=JSON.stringify([shot,current.selected,current.expanded,text,runText,title,Boolean(ticket),disabled,runDisabled,Boolean(props.disabled)]);
@@ -807,7 +848,7 @@ function hmbAgentShotRowWidget(container, initialProps) {
   const send=(kind)=>{
     const previous=channelEntry()?.pending;
     if(disposed || (previous && !(kind==="refresh" && previous.recovering && previous.owner===container)) || typeof props.onChange!=="function")return;
-    const current=hmbAgentShotRowState(props);if(!current.shot.shot_uuid)return;
+    const current=hmbAgentShotRowState(props);if(!current.shot.shot_uuid || current.routing_pending)return;
     const bytes=new Uint8Array(16);crypto.getRandomValues(bytes);
     const requestId=Array.from(bytes,byte=>byte.toString(16).padStart(2,"0")).join("");
     const acceptedIds=new Set([...(previous?.acceptedIds || []),requestId]);
@@ -982,6 +1023,7 @@ function hmbNativeUiContract(container, props, mount, policy) {
 
 export default function HMBAgentLibraryWidget(container, props) {
   return hmbNativeUiContract(container, props, hmbNativeUiImplementation, { kind: "agent", allowControl: (target, props, container) => {
+    if (hmbAgentNativeHeaderTarget(target)) return true;
     const button = target?.closest?.(".agent-shot-run");
     if (!button) return false;
     const state = hmbAgentShotRowState(props), pending = hmbAgentRowChannels.get(state.shot.channel_uuid)?.pending;

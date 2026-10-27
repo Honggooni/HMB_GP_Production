@@ -257,6 +257,7 @@ _HMB_EXECUTION_FAILED_MESSAGE = (
 )
 
 _HMB_NATIVE_FAILURE_CODES = frozenset({
+    "MODEL_SELECTION_REQUIRED",
     "MODEL_CREDENTIAL",
     "MODEL_ACCESS",
     "MODEL_RATE_LIMIT",
@@ -268,10 +269,19 @@ _HMB_NATIVE_FAILURE_CODES = frozenset({
 })
 
 
+class _HMBModelSelectionRequired(RuntimeError):
+    """A saved model must never be replaced by a different paid model."""
+
+
 def _hmb_execution_failure_message(code: str) -> str:
     """Describe an existing native failure without publishing provider payloads."""
 
     guidance = {
+        "MODEL_SELECTION_REQUIRED": (
+            "The saved model/provider selection is preserved but is no longer supported. "
+            "Choose a supported model explicitly before running the Agent. "
+            "No replacement model was invoked."
+        ),
         "MODEL_TIMEOUT": (
             "The Agent model response timed out. This is not a local policy DAT "
             "error. Retry the Agent or check the selected model/provider. "
@@ -296,6 +306,8 @@ def _hmb_execution_failure_message(code: str) -> str:
 def _hmb_native_failure_code(exc: BaseException) -> str:
     """Reduce a native/Cloud exception to a policy-free operational code."""
 
+    if isinstance(exc, _HMBModelSelectionRequired):
+        return "MODEL_SELECTION_REQUIRED"
     status = None
     for candidate in (
         getattr(exc, "status_code", None),
@@ -358,6 +370,9 @@ _LEGACY_HMB_ELEMENTS = {
     "project_load_path",
     "Task",
 }
+_LEGACY_HMB_SAVED_PROPERTIES = frozenset({
+    "projects_root", "project", "episode", "shot", "project_load_path",
+})
 _PUBLIC_OUTPUT_STATE_KEYS = frozenset(
     {
         "agent_memory",
@@ -1614,7 +1629,10 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_prompt_preview_active = False
         self._hmb_prompt_preview_value = ""
         self._hmb_prompt_before_preview = ""
+        self._hmb_model_identity_ready = False
+        self._hmb_explicit_provider_change = False
         super().__init__(**kwargs)
+        self._hmb_model_identity_ready = True
         # Give newly created nodes room for the compact header, five Shot rows
         # and the stock editor. The official SDK setter preserves saved sizes;
         # this is a creation default, never a resize/hydration correction.
@@ -1638,6 +1656,8 @@ class HMBAgentLibrary(_BaseAgent):
         # options after construction. Every deserialize must therefore run the
         # idempotent surface normalizers again instead of being skipped by a
         # construction-only guard.
+        for name in ("model_provider", "model"):
+            self._hmb_preserve_native_model_value(name, self._native_parameter_value(name, None))
         self._ensure_hmb_shot_prompt_input()
         self._remove_legacy_hmb_elements()
         _configure_native_output_ports(self)
@@ -1648,6 +1668,61 @@ class HMBAgentLibrary(_BaseAgent):
         self._ensure_hmb_execution_result()
         self._ensure_hmb_shot_store()
         self._ensure_agent_shot_rows()
+
+    def _hmb_preserve_native_model_value(self, name, value):
+        """Keep this node's authored tokens; do not expand supported models."""
+        if not getattr(self, "_hmb_model_identity_ready", False) or name not in {"model", "model_provider"}:
+            return
+        access = getattr(self, "_model_access", None)
+        migrations = getattr(access, "_deprecated_values", None)
+        if isinstance(migrations, dict):
+            # The native component owns a per-instance copy. Its converter and
+            # refresh continue to run, but cannot retire an authored paid model
+            # into another model. Preserved tokens are not model_choices.
+            if any(key != target for key, target in migrations.items()):
+                access._deprecated_values = {key: key for key in migrations}
+            if name == "model" and isinstance(value, str) and value not in access.model_choices:
+                access._deprecated_values.setdefault(value, value)
+        if not isinstance(value, str):
+            return
+        parameter = _parameter_by_name(self, name)
+        if parameter is None:
+            return
+        try:
+            from griptape_nodes.traits.options import Options
+        except ImportError:
+            return
+        for trait in parameter.find_elements_by_type(Options):
+            if value not in trait.choices:
+                trait.choices = [*trait.choices, value]
+
+    def _update_option_choices(self, param, choices, default):
+        if (getattr(self, "_hmb_model_identity_ready", False)
+                and param in {"model", "model_provider"}
+                and not (param == "model" and getattr(self, "_hmb_explicit_provider_change", False)
+                         and not getattr(self, "_hmb_slot_switching", False))):
+            current = self._native_parameter_value(param, None)
+            if isinstance(current, str):
+                self._hmb_preserve_native_model_value(param, current)
+                choices = [*choices] if current in choices else [*choices, current]
+                default = current
+        return super()._update_option_choices(param, choices, default)
+
+    def _resolve_model_config(self, model_input, provider_name):
+        # Connected configs are parsed by native code, and connected Agent state
+        # bypasses this method. Its own model remains the execution authority.
+        access = getattr(self, "_model_access", None)
+        if (isinstance(model_input, str) and provider_name == "griptape_cloud"
+                and access is not None and model_input not in access.model_choices):
+            raise _HMBModelSelectionRequired(
+                f"Saved model {model_input!r} is unavailable for {provider_name!r}; "
+                "select a supported model explicitly. No replacement model was invoked.")
+        result = super()._resolve_model_config(model_input, provider_name)
+        if isinstance(model_input, str) and getattr(result, "model", None) != model_input:
+            raise _HMBModelSelectionRequired(
+                f"Native model resolution would replace {model_input!r}; "
+                "select a supported model explicitly. No replacement model was invoked.")
+        return result
 
     def _hmb_assert_rebind_execution_ready(self):
         blocked = bool(getattr(self, "_hmb_manual_rebind", {}).get("required"))
@@ -2077,6 +2152,7 @@ class HMBAgentLibrary(_BaseAgent):
                 # replace model defaults which the desired Shot must restore.
                 if (key in slot.get("values", {}) and not _hmb_native_values_equal(
                         self._native_parameter_value(key, None), slot["values"][key])):
+                    self._hmb_preserve_native_model_value(key, slot["values"][key])
                     super().set_parameter_value(key, copy.deepcopy(slot["values"][key]))
             for key in ("tools", "rulesets"):
                 parameter = _parameter_by_name(self, key)
@@ -2568,7 +2644,8 @@ class HMBAgentLibrary(_BaseAgent):
         if not getattr(self, "_hmb_native_editor_elements", None):
             header_index = next((index for index, item in enumerate(children) if getattr(item, "name", "") == _AGENT_WIDGET_PARAMETER), len(children))
             self._hmb_native_editor_elements = [item for item in children[header_index + 1:]
-                if (not str(getattr(item, "name", "")).startswith(("HMB_", "SHOT_"))
+                if getattr(item, "name", "") not in _LEGACY_HMB_SAVED_PROPERTIES
+                and (not str(getattr(item, "name", "")).startswith(("HMB_", "SHOT_"))
                     or getattr(item, "name", "") in {_AGENT_EXECUTION_FAILED_WARNING, _AGENT_CREATED_WARNING,
                         _AGENT_PROJECT_POLICY_ABSENT_WARNING, _HMB_POLICY_WARNING_NAME, _HMB_TOPOLOGY_WARNING_NAME})]
         for number in range(1, 6):
@@ -2596,7 +2673,9 @@ class HMBAgentLibrary(_BaseAgent):
             raw = self._native_parameter_value(_AGENT_WIDGET_PARAMETER, {})
             selected = raw.get("shot", {}) if isinstance(raw, dict) else {}
             catalog = getattr(self, "_hmb_shot_catalog_snapshot", {})
+            routing_pending = False
             if not catalog and restored_catalog is not None:
+                self._hmb_restored_shot_row_catalog = {}
                 # Initial-setup values can arrive after the registered hydration
                 # callback, before live Source discovery. Saved rows may place
                 # the one SDK-owned body, but never become routing authority.
@@ -2604,7 +2683,17 @@ class HMBAgentLibrary(_BaseAgent):
                 if (saved and saved.get("channel_uuid") == selected.get("channel_uuid")
                         and any(item["shot_uuid"] == selected.get("shot_uuid")
                                 for item in saved["shots"])):
+                    self._hmb_restored_shot_row_catalog = copy.deepcopy(saved)
+            if not catalog:
+                saved = getattr(self, "_hmb_restored_shot_row_catalog", {})
+                if (saved and saved.get("channel_uuid") == selected.get("channel_uuid")
+                        and any(item["shot_uuid"] == selected.get("shot_uuid")
+                                for item in saved.get("shots", []))):
+                    # Preserve the restored rows throughout source hydration,
+                    # including an early rejected request's layout refresh.
+                    # This presentation cache never enters routing/Run APIs.
                     catalog = saved
+                    routing_pending = True
             rows = {int(item["number"]): item for item in catalog.get("shots", []) if isinstance(item, dict)}
             selected_uuid = str(selected.get("shot_uuid") or "")
             manual_pending = bool(getattr(self, "_hmb_manual_rebind", {}).get("required"))
@@ -2649,6 +2738,8 @@ class HMBAgentLibrary(_BaseAgent):
                     "request_id": getattr(self, "_hmb_row_action_ack", {}).get(self._hmb_slot_key(catalog.get("channel_uuid"), shot["shot_uuid"]), ""),
                     "status": self._hmb_shot_run_status.get(self._hmb_slot_key(catalog.get("channel_uuid"), shot["shot_uuid"]), "")}
                     if shot else {"schema": "hmb-agent-shot-row", "version": 1, "shot": {}, "selected": False, "expanded": False, "status": ""})
+                if shot and routing_pending:
+                    value["routing_pending"] = True
                 rejection = getattr(self, "_hmb_row_action_rejections", {}).get(parameter.name)
                 if isinstance(rejection, dict):
                     value.update(rejection)
@@ -2850,9 +2941,11 @@ class HMBAgentLibrary(_BaseAgent):
             return
         normalized_name = self._publication_parameter_name(name)
         if normalized_name == _AGENT_SHOT_PROMPT_INPUT_PARAMETER.casefold():
-            if isinstance(getattr(value, "value", value), str) and str(getattr(value, "value", value) or "").strip():
-                # Serialized Prompt edges can hydrate before the unique Prompt
-                # manager exists. Unready projection is not a user disconnect.
+            if isinstance(getattr(value, "value", value), str):
+                # A first save of an older Agent can add the hidden port's
+                # empty constructor default. It is not an authored deletion.
+                # Keep the saved native body until an exact live Shot document
+                # is ready; that document may legitimately contain empty text.
                 self._hmb_prompt_preview_hydration_pending = True
             return
         if not isinstance(value, dict):
@@ -3188,7 +3281,13 @@ class HMBAgentLibrary(_BaseAgent):
         self.parameter_output_values[_AGENT_EXECUTION_RESULT_PARAMETER] = dict(result)
         self._refresh_hmb_execution_result_messages()
 
+    def _hmb_assert_web_rerender_connections(self, generator):
+        from _hmb_connection_management import target_has_suspended_role
+        if target_has_suspended_role(self) or target_has_suspended_role(generator):
+            raise RuntimeError("[HMB_CONNECTION_DETACHED] Restore the Agent and Generator connections before requesting a web rerender.")
+
     def _hmb_issue_web_rerender_authority(self, *, request_id, generator, owner_key):
+        self._hmb_assert_web_rerender_connections(generator)
         return _issue_hmb_web_rerender_authority(
             self, request_id=request_id, generator=generator, owner_key=owner_key
         )
@@ -3307,6 +3406,7 @@ class HMBAgentLibrary(_BaseAgent):
         if type(request_identity) is not _HMBWebRerenderAuthority:
             raise TypeError("Web rerender requires engine-issued authority.")
         request_identity._claim(self)
+        self._hmb_assert_web_rerender_connections(request_identity.generator)
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 54000:
             raise ValueError("Web rerender prompt must contain 1 to 54000 characters.")
         media, settings = _web_rerender_snapshots(media_snapshot, generation_settings, prompt)
@@ -3334,6 +3434,8 @@ class HMBAgentLibrary(_BaseAgent):
             else:
                 gate = await _acquire_agent_execution_gate(self)
                 gate_owned = True
+            # A queued web request may outlive an explicit remote detach.
+            self._hmb_assert_web_rerender_connections(request_identity.generator)
             cancel_source = self if native_settings is None else request_identity.generator
             if not self._hmb_lifecycle_is_live() or bool(getattr(cancel_source, "is_cancellation_requested", False)):
                 raise RuntimeError("Web rerender Agent is unavailable.")
@@ -3380,7 +3482,7 @@ class HMBAgentLibrary(_BaseAgent):
                 "Generator instruction. No video generation was submitted."
             ) from None
         except Exception as exc:
-            if str(exc) == _HMB_POLICY_UNAVAILABLE_MESSAGE:
+            if str(exc) == _HMB_POLICY_UNAVAILABLE_MESSAGE or str(exc).startswith("[HMB_CONNECTION_DETACHED]"):
                 raise
             code = str(getattr(execution, "_hmb_native_failure_code", "") or _hmb_native_failure_code(exc))
             raise RuntimeError(_hmb_execution_failure_message(code)) from None
@@ -3760,6 +3862,7 @@ class HMBAgentLibrary(_BaseAgent):
             return self._hmb_shot_channel_subscription()
 
         self._hmb_shot_catalog_snapshot = {}
+        self._hmb_restored_shot_row_catalog = {}
         self._hmb_shot_context = {}
         self._clear_execution_shot_binding()
         self._hmb_shot_route_status = {
@@ -4054,6 +4157,7 @@ class HMBAgentLibrary(_BaseAgent):
             "metadata_sha256": snapshot["metadata_sha256"],
             "shots": [dict(item) for item in shots],
         }
+        self._hmb_restored_shot_row_catalog = {}
         current = self._hmb_shot_channel_subscription()
         selected = next(
             (item for item in shots if isinstance(item, dict) and str(item.get("shot_uuid") or "") == current["shot_uuid"]),
@@ -4786,6 +4890,7 @@ class HMBAgentLibrary(_BaseAgent):
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return None
         normalized_name = self._publication_parameter_name(name)
+        self._hmb_preserve_native_model_value(normalized_name, value)
         if (getattr(self, "_hmb_manual_rebind_inflight", False)
                 and (normalized_name in set(_AGENT_NATIVE_SETTING_KEYS) | {"tools", "rulesets"}
                      or normalized_name.startswith(("tools_", "rulesets_", "behavior")))):
@@ -4815,6 +4920,12 @@ class HMBAgentLibrary(_BaseAgent):
             self._hmb_publication_buffer[normalized_name] = str(value or "")
             return None
         self._hmb_restore_widget_write = bool(kwargs.get("initial_setup", False)) if normalized_name == _AGENT_WIDGET_PARAMETER.casefold() else getattr(self, "_hmb_restore_widget_write", False)
+        provider_scope = normalized_name == "model_provider" and bool(getattr(self, "_hmb_model_identity_ready", False))
+        previous_provider_change = getattr(self, "_hmb_explicit_provider_change", False)
+        if provider_scope:
+            self._hmb_explicit_provider_change = (not kwargs.get("initial_setup")
+                and not getattr(self, "_hmb_slot_switching", False)
+                and self._native_parameter_value("model_provider", None) != value)
         try:
             if normalized_name == _AGENT_WIDGET_PARAMETER.casefold() and not kwargs.get("initial_setup"):
                 with self._hmb_editor_update():
@@ -4822,6 +4933,8 @@ class HMBAgentLibrary(_BaseAgent):
             else:
                 result = super().set_parameter_value(name, value, *args, **kwargs)
         finally:
+            if provider_scope:
+                self._hmb_explicit_provider_change = previous_provider_change
             if normalized_name == _AGENT_WIDGET_PARAMETER.casefold():
                 self._hmb_restore_widget_write = False
         if (
@@ -4841,13 +4954,24 @@ class HMBAgentLibrary(_BaseAgent):
             restored_ui = self._native_parameter_value(_AGENT_WIDGET_PARAMETER, {})
             if normalized_name == _AGENT_WIDGET_PARAMETER.casefold() and isinstance(restored_ui, dict):
                 self._hmb_shot_editor_expanded = restored_ui.get("shot_editor_expanded", True) is not False
+                self._hmb_restored_shot_row_catalog = {}
             self._hmb_layout_shot_editor(restored_catalog=(
                 restored_ui.get("shot_catalog") if isinstance(restored_ui, dict) else None))
+        elif (bool(kwargs.get("initial_setup", False))
+                and normalized_name.startswith(_AGENT_SHOT_ROW_PREFIX.casefold())
+                and getattr(self, "_hmb_restored_shot_row_catalog", None)):
+            # Saved row parameters follow the header in generated workflows.
+            # Their historical writable flag must not reopen controls before a
+            # registered live publisher has validated this runtime's catalog.
+            self._hmb_layout_shot_editor()
         if (
             normalized_name == _AGENT_SHOT_PROMPT_INPUT_PARAMETER.casefold()
             and not bool(getattr(self, "_hmb_prompt_preview_syncing", False))
-            and (bool(kwargs.get("initial_setup", False)) or not self._hmb_shot_manager_enabled())
+            and not bool(kwargs.get("initial_setup", False))
+            and not self._hmb_shot_manager_enabled()
         ):
+            # Initial replay restores values, not a live source publication.
+            # The router refreshes the exact selected document after hydration.
             self._refresh_routed_prompt_preview()
         if (
             normalized_name == _AGENT_WIDGET_PARAMETER.casefold()
@@ -4907,8 +5031,28 @@ class HMBAgentLibrary(_BaseAgent):
             parameters.pop(name, None)
 
     def _remove_legacy_hmb_elements(self) -> None:
-        """Remove project/save UI left by earlier HMBAgentLibrary builds."""
-        for name in sorted(_LEGACY_HMB_ELEMENTS - {"PROJECT"}):
+        """Retain old saved literals without restoring project UI or authority."""
+        for name in sorted(_LEGACY_HMB_SAVED_PROPERTIES):
+            parameter = _parameter_by_name(self, name)
+            if parameter is None:
+                parameter = Parameter(
+                    name=name, type="str", default_value="",
+                    allowed_modes={ParameterMode.PROPERTY},
+                    hide=True, hide_property=True, hide_label=True,
+                    ui_options={"hide": True, "hide_property": True, "hide_handles": True},
+                    allow_variable_substitution=False,
+                )
+                self.add_parameter(parameter)
+            # These inert values are not routing inputs, native Agent settings,
+            # paths to inspect, or UI controls. Normalization is idempotent and
+            # deliberately never writes an existing saved value.
+            parameter.allowed_modes = {ParameterMode.PROPERTY}
+            parameter.serializable = True
+            parameter.allow_variable_substitution = False
+            parameter.ui_options = {**dict(getattr(parameter, "ui_options", {}) or {}),
+                "hide": True, "hide_property": True, "hide_label": True, "hide_handles": True}
+        removed_elements = _LEGACY_HMB_ELEMENTS - _LEGACY_HMB_SAVED_PROPERTIES
+        for name in sorted(removed_elements - {"PROJECT"}):
             self._remove_parameter(name)
         try:
             root = getattr(self, "root_ui_element", None)
@@ -4919,7 +5063,7 @@ class HMBAgentLibrary(_BaseAgent):
                 children[:] = [
                     child
                     for child in children
-                    if getattr(child, "name", None) not in _LEGACY_HMB_ELEMENTS
+                    if getattr(child, "name", None) not in removed_elements
                 ]
         except Exception:
             pass

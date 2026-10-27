@@ -17,7 +17,11 @@ const source = fs.readFileSync(widgetPath, "utf8");
 const hash = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
 const originalCss = "16fb5e7c19e4e1ee1b0dcdd31f827e743ace6cd1c4c89449cd3a8910a4129c34";
 const css = source.match(/function render\(state\) \{[\s\S]*?<style>([\s\S]*?)<\/style>/)?.[1];
-assert.equal(hash(css), originalCss, "Execution labels must preserve existing layout, colours and player CSS.");
+// The opt-in host header adds only its own slots and excludes host controls
+// from generic styling. All legacy header/body/player CSS remains byte-identical.
+const legacyCss = css.replace(/^[ \t]*\/\* HMB_NATIVE_HEADER_SLOTS_BEGIN \*\/[\s\S]*?\/\* HMB_NATIVE_HEADER_SLOTS_END \*\/\r?\n/m, "")
+  .replaceAll(":not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *))", "");
+assert.equal(hash(legacyCss), originalCss, "Native header integration must preserve existing layout, colours and player CSS.");
 const require = createRequire(import.meta.url);
 let playwright;
 try { playwright = require("playwright"); }

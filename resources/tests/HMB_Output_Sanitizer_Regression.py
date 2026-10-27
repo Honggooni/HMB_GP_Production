@@ -639,7 +639,43 @@ assert timed_out.native_calls == 2
 assert timed_out._hmb_native_failure_code == ""
 assert timed_out.parameter_output_values["output"] == "FINAL ENGLISH OUTPUT"
 
-for obsolete in ("PROJECT", "project", "episode", "shot", "projects_root", "project_load_path", "Task"):
+for obsolete in ("PROJECT", "Task"):
     assert obsolete not in node.parameters
+
+# Existing workflows retain their authored legacy properties as inert saved
+# values. They must not reappear as inputs, visible controls or substitutions.
+legacy_saved_values = {
+    "projects_root": "P:/legacy/{PROJECT}/0 OFF 한글",
+    "project": "",
+    "episode": "e201",
+    "shot": "e201_s001c001-s002c001__",
+    "project_load_path": "P:/legacy/project/settings.json",
+}
+legacy_parameters = {}
+for name, value in legacy_saved_values.items():
+    parameter = node.parameters[name]
+    legacy_parameters[name] = parameter
+    assert parameter.allowed_modes == {module.ParameterMode.PROPERTY}
+    assert parameter.serializable is True
+    assert parameter.allow_variable_substitution is False
+    assert all(parameter.ui_options.get(flag) is True for flag in (
+        "hide", "hide_property", "hide_label", "hide_handles",
+    ))
+    node.set_parameter_value(name, value, initial_setup=True, emit_change=False)
+
+for _ in range(2):
+    node._remove_legacy_hmb_elements()
+    for name, value in legacy_saved_values.items():
+        parameter = node.parameters[name]
+        assert parameter is legacy_parameters[name]
+        assert node.get_parameter_value(name) == value
+        assert parameter.allowed_modes == {module.ParameterMode.PROPERTY}
+        assert parameter.serializable is True
+        assert parameter.allow_variable_substitution is False
+        assert all(parameter.ui_options.get(flag) is True for flag in (
+            "hide", "hide_property", "hide_label", "hide_handles",
+        ))
+    for obsolete in ("PROJECT", "Task"):
+        assert obsolete not in node.parameters
 
 print("HMB native single-execution and runtime-state protection regression: PASS")

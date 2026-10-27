@@ -46,7 +46,12 @@ async def scenario(engine):
     native=node.get_parameter_value(finish.WIDGET_PARAMETER_NAME)
     assert not native['shot']['channel_uuid'] and not native['shot']['shot_uuid']
     assert not native['shot_catalog'] and not node._hmb_finish_route_ready
-    assert node not in routing._POST_REGISTRATION_PENDING
+    # Generated saved-property replay has no after_deserialize callback. The
+    # accepted durable store must now signal hydration, while still granting no
+    # remote catalog authority and preserving the exact private saved owner.
+    pending=routing._POST_REGISTRATION_PENDING.get(node)
+    assert pending is not None and pending.phase=='hydrated'
+    assert pending.fingerprint==routing._subscription_fingerprint(node)
     subscription=routing._subscription_for(node)
     assert subscription is not None and not subscription.enabled
     assert routing._already_local_catalog(subscription) is False, 'Private saved Shot ownership still needs clearing'
@@ -56,8 +61,17 @@ async def scenario(engine):
         assert callback.call_count==1
         assert node._hmb_finish_active_key=='__standalone__'
         assert {key:node._hmb_finish_documents[key] for key in keys}==before
+        # Finish now owns a real queued hydration notification. Let that exact
+        # generation acknowledge the newest (cleared) durable state before
+        # asserting the already-local fast path. Pending replay must still use
+        # the conservative clear path rather than hide an unprocessed store.
+        await asyncio.sleep(.05)
+        assert node not in routing._POST_REGISTRATION_PENDING
+        completed_calls=callback.call_count
+        assert node._hmb_finish_active_key=='__standalone__'
+        assert {key:node._hmb_finish_documents[key] for key in keys}==before
         routing._clear_remote_catalog(node,'publisher_unavailable',subscription=routing._subscription_for(node))
-        assert callback.call_count==1, 'Already-local native/private owner should remain a no-op'
+        assert callback.call_count==completed_calls, 'Already-local native/private owner should remain a no-op after hydration'
     node.after_node_deleted()
 
 

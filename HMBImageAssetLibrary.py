@@ -115,6 +115,10 @@ IMAGE_IMPORT_PARAMETER = "IMAGE_IMPORT_IN"
 OUTPUT_PARAMETER = "IMAGE_ASSET_OUT"
 MEDIA_OUTPUT_PARAMETER = "IMAGE_OUT"
 SHOT_ASSET_OUTPUT_PARAMETER = "SHOT_ASSET_OUT"
+IMAGE_BASH_IMAGES_OUTPUT_PARAMETER = "IMAGE_BASH_IMAGES_OUT"
+IMAGE_BASH_CONTEXT_OUTPUT_PARAMETER = "IMAGE_BASH_CONTEXT_OUT"
+IMAGE_BASH_CONTEXT_SCHEMA = "hmb-image-bash-inputs-v1"
+IMAGE_BASH_WORKSPACE_REQUEST_SCHEMA = "hmb-image-bash-workspace-edit-v1"
 OUTPUT_DISPLAY_NAME = "ASSET_OUT"
 MEDIA_OUTPUT_DISPLAY_NAME = "Video Generation Out"
 STATE_SCHEMA = "hmb-image-asset-library-state"
@@ -132,7 +136,8 @@ IMAGE_ASSET_EDIT_FIELDS = (
     "selected_main_type", "selected_sub_type", "selected_source_view",
     "search", "language", "asset_view_mode", "refresh_revision",
     "thumbnail_request", "asset_registration_request", "asset_cleanup_request",
-    "disconnect_import_uid", "shot_routing",
+    "disconnect_import_uid", "shot_routing", "shot_hierarchy", "shot_hierarchy_request",
+    "image_bash_workspace", "image_bash_active", "image_bash_workspace_request",
 )
 MAX_UI_EDIT_REVISION = (1 << 53) - 1
 OUTPUT_VERSION = 4
@@ -434,6 +439,19 @@ def _normalize_thumbnail_bridge(value: Any) -> Dict[str, Any]:
     bridge = _default_thumbnail_bridge(raw.get("runtime_instance_id"))
     operation = _clean(raw.get("operation")).casefold()
     phase = _clean(raw.get("phase")).casefold()
+    if operation in {"cgt_catalog", "cgt_confirm", "cgt_cancel"} and phase in {"request", "result"}:
+        bridge.update(operation=operation, phase=phase)
+        for key in ("request_id", "session_id", "project_identity"):
+            bridge[key] = str(raw.get(key) or "")[:4096 if key == "project_identity" else 128]
+        bridge["cgt_project_id"] = _clean(raw.get("cgt_project_id"))[:128]
+        if operation == "cgt_confirm" and phase == "request":
+            command = raw.get("hierarchy_request")
+            if isinstance(command, dict) and len(_json_text(command)) <= 32768:
+                bridge["hierarchy_request"] = command
+        if phase == "result":
+            bridge["outcome"] = _clean(raw.get("outcome"))[:40]
+            bridge["state"] = raw.get("state") if isinstance(raw.get("state"), dict) else {}
+        return bridge
     if operation == "catalog_page" and phase in {"request", "result"}:
         for field in ("request_id", "session_id", "project_uid", "project_cache_uid", "manifest_signature", "folder_signature"):
             bridge[field] = _clean(raw.get(field))[:256]
@@ -3526,6 +3544,42 @@ def _new_uuid_text() -> str:
     return str(uuid.uuid4())
 
 
+def _normalize_image_bash_workspace(value: Any, channel_uuid: str) -> Dict[str, Any]:
+    if not value:
+        return {}
+    raw = value if isinstance(value, dict) else {}
+    identity = _uuid_text(raw.get("workspace_id"))
+    if not identity:
+        raise ValueError("Image Bash 작업 공간에는 고유한 ID가 필요합니다.")
+    instances: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for row in raw.get("instances", []) if isinstance(raw.get("instances"), list) else []:
+        if not isinstance(row, dict) or set(row) != {"instance_id", "source_uid"}:
+            raise ValueError("Image Bash 이미지 인스턴스 구성이 올바르지 않습니다.")
+        instance, source = _uuid_text(row.get("instance_id")), _clean(row.get("source_uid"))
+        if not instance or not source or len(source) > 512 or instance in seen:
+            raise ValueError("Image Bash 이미지마다 고유한 인스턴스 ID가 필요합니다.")
+        instances.append({"instance_id": instance, "source_uid": source})
+        seen.add(instance)
+    if len(instances) > MAX_SELECTED_IMAGES:
+        raise ValueError(f"Image Bash에는 최대 {MAX_SELECTED_IMAGES}개 이미지를 배치할 수 있습니다.")
+    return {"workspace_id": identity, "revision": min(MAX_UI_EDIT_REVISION, _non_negative_int(raw.get("revision"))),
+            "instances": instances}
+
+
+def _normalize_image_bash_workspace_request(value: Any) -> Dict[str, Any]:
+    if not value:
+        return {}
+    fields = {"schema", "version", "operation", "request_id", "workspace_id", "expected_revision"}
+    if (not isinstance(value, dict) or set(value) != fields
+            or value.get("schema") != IMAGE_BASH_WORKSPACE_REQUEST_SCHEMA or type(value.get("version")) is not int
+            or value["version"] != 1 or value.get("operation") != "create"
+            or not _uuid_text(value.get("request_id")) or not _uuid_text(value.get("workspace_id"))
+            or type(value.get("expected_revision")) is not int or not 0 <= value["expected_revision"] <= MAX_UI_EDIT_REVISION):
+        raise ValueError("Image Bash 추가 요청이 올바르지 않습니다.")
+    return copy.deepcopy(value)
+
+
 def _sha256_canonical(value: Any) -> str:
     canonical = json.dumps(
         value,
@@ -3764,6 +3818,10 @@ def _default_state() -> Dict[str, Any]:
         },
     }
     state["shot_routing"] = _normalize_shot_routing({}, [])
+    state["shot_hierarchy"] = {}
+    state["image_bash_workspace"] = {}
+    state["image_bash_active"] = False
+    state["image_bash_workspace_request"] = {}
     return state
 
 
@@ -3950,6 +4008,24 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
             },
         }
     )
+    state["shot_hierarchy"] = _hmb_shot_routing.validate_shot_hierarchy_routing(
+        source.get("shot_hierarchy"), state["shot_routing"]
+    )
+    state["image_bash_workspace"] = _normalize_image_bash_workspace(source.get("image_bash_workspace"),
+        state["shot_routing"]["channel_uuid"])
+    state["image_bash_active"] = source.get("image_bash_active") is True
+    state["image_bash_workspace_request"] = _normalize_image_bash_workspace_request(source.get("image_bash_workspace_request"))
+    binding = state["shot_hierarchy"]
+    if (binding and not binding["project_identity"]
+            and _hmb_shot_routing.hierarchy_project_key(state)
+            and all(row["origin"] == "manual" for row in binding["members"])):
+        # Locally named Shots may be added before selecting a project. Adopt
+        # only that previously empty scope on the first project selection;
+        # never relabel an authenticated CGT or another project's binding.
+        # Slot UUIDs, selected media, authored names and downstream results
+        # remain untouched by this metadata-only transition.
+        binding["project_identity"] = _hmb_shot_routing.hierarchy_project_key(state)
+        binding["revision"] = min((1 << 53) - 1, binding["revision"] + 1)
     return state
 
 
@@ -3964,6 +4040,8 @@ _IMAGE_ASSET_RESET_DURABLE_FIELDS = (
     "folder_signature",
     "folders",
     "assets",
+    "shot_hierarchy",
+    "image_bash_workspace",
 )
 
 
@@ -4133,6 +4211,8 @@ def _merge_scan_with_state(
 
 
 _ASYNC_SCAN_LIVE_STATE_FIELDS = (
+    "image_bash_workspace",
+    "image_bash_active",
     "root_edit_enabled",
     "selected_folder_path",
     "expanded_folders",
@@ -4149,6 +4229,7 @@ _ASYNC_SCAN_LIVE_STATE_FIELDS = (
     "thumbnail_revision",
     "thumbnail_busy",
     "shot_routing",
+    "shot_hierarchy",
     "asset_registration_request",
     "asset_registration_result",
     "disconnect_import_uid",
@@ -5370,6 +5451,13 @@ def _remap_shot_routing_source_uid(
     new_uid = _clean(new_source_uid)
     if not old_uid or not new_uid or old_uid == new_uid:
         return
+    workspace = copy.deepcopy(state.get("image_bash_workspace") or {})
+    if workspace and any(row["source_uid"] == old_uid for row in workspace.get("instances", [])):
+        for row in workspace["instances"]:
+            if row["source_uid"] == old_uid:
+                row["source_uid"] = new_uid
+        workspace["revision"] = min(MAX_UI_EDIT_REVISION, _non_negative_int(workspace.get("revision")) + 1)
+        state["image_bash_workspace"] = workspace
     routing = copy.deepcopy(state.get("shot_routing"))
     if not isinstance(routing, dict):
         return
@@ -6324,10 +6412,13 @@ def _ensure_import_child_removal_observers(node: Any) -> Dict[str, Any]:
         )):
             return state
         owner_ref = weakref.ref(node)
+        observer_owner = object()
 
         def before_remove(request: Any, _context: Any) -> Any:
             # Observer exceptions must never prevent unrelated host operations.
             try:
+                if state.get("observer_owner") is not observer_owner:
+                    return None
                 owner = owner_ref()
                 if (owner is None or not isinstance(request, RemoveParameterFromNodeRequest)
                     or _clean(getattr(request, "node_name", "")) != _clean(owner.name)
@@ -6367,6 +6458,8 @@ def _ensure_import_child_removal_observers(node: Any) -> Dict[str, Any]:
 
         def after_remove(request: Any, result: Any) -> None:
             try:
+                if state.get("observer_owner") is not observer_owner:
+                    return
                 with state["lock"]:
                     entry = state["active"].pop(id(request), None)
                     if entry is None or entry[0] is not request:
@@ -6391,17 +6484,35 @@ def _ensure_import_child_removal_observers(node: Any) -> Dict[str, Any]:
             return state
 
         def unregister() -> None:
+            for remove, args in (
+                (manager.remove_pre_dispatch_hook, (before_remove,)),
+                (manager.remove_post_dispatch_hook, (RemoveParameterFromNodeRequest, after_remove)),
+            ):
+                try:
+                    remove(*args)
+                except Exception:
+                    pass
+
+        def finalize_unregister() -> None:
+            # GC can run while the SDK snapshots hooks under its non-reentrant
+            # pre/post-dispatch locks. Removing hooks on this thread deadlocks
+            # the request that triggered collection. This short-lived worker
+            # owns only callbacks/manager (the node is weak), requires no engine
+            # loop, and may acquire the locks after the finalizer has returned.
             try:
-                manager.remove_pre_dispatch_hook(before_remove)
-                manager.remove_post_dispatch_hook(RemoveParameterFromNodeRequest, after_remove)
-            except Exception:
+                threading.Thread(target=unregister, name="HMBImageImportHookCleanup", daemon=True).start()
+            except (RuntimeError, OSError):
+                # Interpreter shutdown may refuse new threads. Weak-owner and
+                # registration-token guards keep any remaining callback inert.
                 pass
 
         previous_finalizer = state.get("finalizer")
         if callable(previous_finalizer):
             previous_finalizer()
         state["manager"] = manager
-        state["finalizer"] = weakref.finalize(node, unregister)
+        state["observer_owner"] = observer_owner
+        state["unregister"] = unregister
+        state["finalizer"] = weakref.finalize(node, finalize_unregister)
     except Exception:
         # Older hosts retain explicit registration cleanup, but must not race a
         # native minus operation through an unobserved asynchronous callback.
@@ -6414,7 +6525,16 @@ def _release_import_child_removal_observers(node: Any) -> None:
     if not isinstance(state, dict):
         return
     finalizer = state.get("finalizer")
-    if callable(finalizer):
+    # Normal node deletion runs outside the dispatch-hook locks. Keep that
+    # explicit cleanup synchronous, and detach the GC-only deferred fallback.
+    state["observer_owner"] = None
+    detach = getattr(finalizer, "detach", None)
+    if callable(detach):
+        detach()
+    unregister = state.pop("unregister", None)
+    if callable(unregister):
+        unregister()
+    elif callable(finalizer):
         finalizer()
     with state["lock"]:
         for key in ("active", "retired", "pending", "generations"):
@@ -7574,6 +7694,56 @@ def _add_media_output(node: Any) -> None:
         )
 
 
+def _add_image_bash_outputs(node: Any) -> None:
+    for name, kind, default in ((IMAGE_BASH_IMAGES_OUTPUT_PARAMETER, "list[ImageUrlArtifact]", []),
+                                (IMAGE_BASH_CONTEXT_OUTPUT_PARAMETER, "dict", {})):
+        if not parameter_exists(node, name):
+            kwargs = {"name": name, "type": kind, "output_type": kind, "default_value": default,
+                "input_types": [], "allow_input": False, "allow_output": True, "allow_property": False,
+                "settable": False, "ui_options": {"hide": True, "hide_property": True, "hide_handles": True,
+                    "height": 1, "min_height": 0, "max_height": 1}}
+            modes = _mode_set("OUTPUT")
+            if modes is not None:
+                kwargs["allowed_modes"] = modes
+            _safe_add_parameter(node, **kwargs)
+
+
+def _build_image_bash_outputs(state: Dict[str, Any], media_by_uid: Dict[str, Any] | None = None,
+                              *, resolution_cache: Any = None, import_revision: int = 0,
+                              force: bool = False) -> tuple[list[Any], Dict[str, Any]] | None:
+    """Resolve a separate workspace; never modify the five Shot selections.
+
+    Missing inputs retain the last good pair instead of silently deleting
+    canvas layers. Duplicate catalog assets remain distinct input instances.
+    """
+    workspace = state["image_bash_workspace"]
+    if not workspace:
+        return [], {}
+    instances = workspace["instances"]
+    order = {row["source_uid"]: index + 1 for index, row in enumerate(instances)}
+    scoped = dict(state, assets=[dict(asset, selected=asset["source_uid"] in order,
+        selection_order=order.get(asset["source_uid"], 0)) for asset in state["assets"]])
+    selection = _resolve_selected_assets(scoped, media_by_uid, resolution_cache=resolution_cache,
+        import_revision=import_revision, force=force, normalized=True)
+    resolved = {row["source_uid"]: row for row in selection["resolved"]}
+    if any(row["source_uid"] not in resolved for row in instances):
+        return None
+    if instances:
+        from griptape.artifacts.image_url_artifact import ImageUrlArtifact
+    records, images = [], []
+    for instance in instances:
+        item = resolved[instance["source_uid"]]
+        asset, url = item["asset"], item["media"]
+        record = {"source_uid": instance["instance_id"], "catalog_uid": instance["source_uid"],
+                  "url": url, "name": _clean(asset.get("image_name")) or "Image"}
+        if asset.get("media_signature"):
+            record["media_signature"] = _clean(asset["media_signature"])
+        records.append(record)
+        images.append(ImageUrlArtifact(value=url, name=record["name"]))
+    return images, {"schema": IMAGE_BASH_CONTEXT_SCHEMA, "workspace_id": workspace["workspace_id"],
+                    "revision": workspace["revision"], "ready": True, "records": records}
+
+
 def _add_shot_asset_output(node: Any) -> None:
     """Add the tiny dependency token used by cable-free Shot routing.
 
@@ -7878,9 +8048,11 @@ def _add_thumbnail_patch_bridge(node: Any) -> None:
                 "resizable": False,
                 "hide_label": True,
                 "hide_handles": True,
-                "hide": True,
-                # The row is invisible, but the property must stay mounted so
-                # the dedicated bridge widget can exchange compact patches.
+                # Native hide=True excludes the property from the editor's
+                # allocator entirely, so no transport widget would mount.
+                # The dedicated inert widget hides itself without removing
+                # its supported PROPERTY/onChange transport lifecycle.
+                "hide": False,
                 "hide_property": False,
             },
         }
@@ -7914,7 +8086,7 @@ def _add_thumbnail_patch_bridge(node: Any) -> None:
         ("type", "dict"),
         ("input_types", ["dict"]),
         ("settable", True),
-        ("hide", True),
+        ("hide", False),
         ("hide_property", False),
         ("serializable", True),
     ):
@@ -7948,7 +8120,7 @@ def _add_thumbnail_patch_bridge(node: Any) -> None:
                 "resizable": False,
                 "hide_label": True,
                 "hide_handles": True,
-                "hide": True,
+                "hide": False,
                 "hide_property": False,
             }
         )
@@ -7987,13 +8159,14 @@ def _propagate_image_output_to_connections(
     value: Any,
     *,
     owner_pending: Any = None,
+    pending_attribute: str = "_hmb_pending_output_notifications",
 ) -> None:
     """Forward one late compact output through real retained-mode edges."""
 
     def still_owned() -> bool:
         if owner_pending is None:
             return True
-        pending = getattr(node, "_hmb_pending_output_notifications", None)
+        pending = getattr(node, pending_attribute, None)
         return isinstance(pending, dict) and pending.get(name) is owner_pending
 
     try:
@@ -8416,6 +8589,7 @@ class HMBImageAssetLibrary(DataNode):
         _add_output(self)
         _add_media_output(self)
         _add_shot_asset_output(self)
+        _add_image_bash_outputs(self)
         _add_image_import_input(self)
         _add_project_root(self)
         _add_widget_state(self)
@@ -8433,6 +8607,12 @@ class HMBImageAssetLibrary(DataNode):
         """Adopt serialized hydration as a fresh instance-local baseline."""
 
         parent_setter = getattr(super(), "set_parameter_value")
+        if initial_setup and param_name in {WIDGET_STATE_PARAMETER, THUMBNAIL_PATCH_PARAMETER}:
+            # Native cold restore applies saved AlterParameterDetails after
+            # construction and does not invoke our legacy after_deserialize
+            # helper. Repair only the inert transport's UI contract when the
+            # supported initial-setup value hydration reaches this node.
+            _add_thumbnail_patch_bridge(self)
         if (
             ParameterMode is None
             and param_name == WIDGET_STATE_PARAMETER
@@ -8454,6 +8634,7 @@ class HMBImageAssetLibrary(DataNode):
         }:
             self._hmb_fresh_registration_scan_key = ""
         if initial_setup and param_name == WIDGET_STATE_PARAMETER:
+            self._hmb_publication_cursor_restore_pending = True
             self._accept_widget_state_baseline(value)
         if (
             ParameterMode is None
@@ -8910,6 +9091,17 @@ class HMBImageAssetLibrary(DataNode):
             return dict(baseline[1])
         return self._hmb_shot_subscription_value(self._current_state()["shot_routing"])
 
+    def _hmb_shot_hierarchy_snapshot(self, channel_uuid: str, shot_uuid: str) -> Dict[str, Any]:
+        state = self._current_state()
+        binding = _hmb_shot_routing.validate_shot_hierarchy_routing(
+            state.get("shot_hierarchy"), state["shot_routing"]
+        )
+        if (not binding or binding["channel_uuid"] != channel_uuid
+                or binding["project_identity"] != _hmb_shot_routing.hierarchy_project_key(state)
+                or not any(row["gp_shot_uuid"] == shot_uuid for row in binding["members"])):
+            return {}
+        return copy.deepcopy(binding)
+
     @staticmethod
     def _hmb_shot_subscription_value(routing: Dict[str, Any]) -> Dict[str, Any]:
         active = next(
@@ -9212,6 +9404,8 @@ class HMBImageAssetLibrary(DataNode):
         Legacy full snapshots keep their existing hydration/scan contract.
         """
         raw = dict(_parse_mapping(value))
+        if raw.get("schema") == STATE_SCHEMA and raw.get("shot_hierarchy_request"):
+            return self._prepare_shot_hierarchy_edit(raw, raw["shot_hierarchy_request"])
         if raw.get("schema") == STATE_SCHEMA and isinstance(raw.get("catalog_page"), dict):
             # Display pages never replace the full canonical persisted catalog.
             base = _parse_mapping(getattr(self, "_hmb_last_accepted_widget_state", ""))
@@ -9252,6 +9446,10 @@ class HMBImageAssetLibrary(DataNode):
         selected = raw.get("selected_source_uids")
         if not isinstance(edits, dict) or set(edits) - set(IMAGE_ASSET_EDIT_FIELDS):
             raise ValueError("Image asset edit contains unsupported fields.")
+        if edits.get("shot_hierarchy_request"):
+            return self._prepare_shot_hierarchy_edit(raw, edits["shot_hierarchy_request"])
+        if edits.get("shot_hierarchy", base.get("shot_hierarchy", {})) != base.get("shot_hierarchy", {}):
+            raise ValueError("샷 구성은 연필 창에서 확정해야 합니다.")
         if (not isinstance(selected, list) or len(selected) > MAX_SELECTED_IMAGES
                 or any(not isinstance(uid, str) or not uid for uid in selected)
                 or len(set(selected)) != len(selected)):
@@ -9293,6 +9491,28 @@ class HMBImageAssetLibrary(DataNode):
                 raise ValueError("Image asset Shot membership/name requires a newer Shot revision.")
         if routing.get("active_shot_uuid") not in {row["shot_uuid"] for row in rows}:
             raise ValueError("Image asset active Shot is no longer present.")
+        if "image_bash_active" in edits and type(edits["image_bash_active"]) is not bool:
+            raise ValueError("Image Bash 화면 선택이 올바르지 않습니다.")
+        if "image_bash_workspace" in edits:
+            old_workspace = base["image_bash_workspace"]
+            workspace = _normalize_image_bash_workspace(edits["image_bash_workspace"], current_routing["channel_uuid"])
+            changed = workspace.get("instances", []) != old_workspace.get("instances", [])
+            if ((not workspace and bool(old_workspace))
+                    or (workspace and ((old_workspace and workspace["workspace_id"] != old_workspace["workspace_id"])
+                    or workspace["revision"] != (old_workspace["revision"] + int(changed) if old_workspace else 0)))):
+                raise ValueError("Image Bash 작업 공간이 변경되었습니다. 다시 선택하세요.")
+            old_instances = {row["instance_id"]: row["source_uid"] for row in old_workspace.get("instances", [])}
+            known_sources = {_clean(row.get("source_uid")) for row in base.get("assets", [])}
+            if any((row["instance_id"] in old_instances and old_instances[row["instance_id"]] != row["source_uid"])
+                   or (row["instance_id"] not in old_instances and row["source_uid"] not in known_sources)
+                   for row in workspace.get("instances", [])):
+                raise ValueError("Image Bash 이미지 원본이 변경되었습니다. 새 인스턴스로 추가하세요.")
+            edits["image_bash_workspace"] = workspace
+        if edits.get("image_bash_workspace_request"):
+            command = _normalize_image_bash_workspace_request(edits["image_bash_workspace_request"])
+            workspace = edits.get("image_bash_workspace", base["image_bash_workspace"])
+            if not workspace or command["workspace_id"] != workspace["workspace_id"] or command["expected_revision"] != workspace["revision"]:
+                raise ValueError("Image Bash 추가 요청의 작업 공간이 변경되었습니다.")
         base.update(edits)
         base[UI_EDIT_REVISION_KEY] = raw.get(UI_EDIT_REVISION_KEY)
         order = {uid: index + 1 for index, uid in enumerate(selected)}
@@ -9300,6 +9520,38 @@ class HMBImageAssetLibrary(DataNode):
                                selection_order=order.get(_clean(item.get("source_uid")), 0))
                           for item in base.get("assets", [])]
         return base
+
+    def _prepare_shot_hierarchy_edit(self, raw: Dict[str, Any], request: Any) -> Dict[str, Any]:
+        base = dict(_parse_mapping(getattr(self, "_hmb_last_accepted_widget_state", "")))
+        if not base or base.get("schema") != STATE_SCHEMA or self._widget_state_is_stale(raw):
+            raise ValueError("샷 라이브러리를 새로 확인한 뒤 다시 구성하세요.")
+        prepared = _hmb_shot_routing.apply_shot_hierarchy_edit(base, request)
+        edited = prepared.get("shot_hierarchy", {})
+        if any(row.get("origin") == "cgt" for row in edited.get("members", [])):
+            # Renaming a locally authored member does not change a CGT
+            # selection. Allow that narrow transaction without contacting CGT;
+            # all authenticated rows, grouping, scope and native identities
+            # must remain byte-for-byte equivalent to accepted authority.
+            prior = base.get("shot_hierarchy", {})
+            old_rows, new_rows = prior.get("members", []), edited.get("members", [])
+            ignored = {"revision", "members"}
+            manual_name_only = bool(prior) and len(old_rows) == len(new_rows) and (
+                {key: value for key, value in prior.items() if key not in ignored}
+                == {key: value for key, value in edited.items() if key not in ignored})
+            name_changed = False
+            for old, new in zip(old_rows, new_rows):
+                if old.get("origin") == new.get("origin") == "manual":
+                    names = {"source_name", "canonical_name"}
+                    manual_name_only = manual_name_only and (
+                        {key: value for key, value in old.items() if key not in names}
+                        == {key: value for key, value in new.items() if key not in names})
+                    name_changed = name_changed or any(old.get(key) != new.get(key) for key in names)
+                elif old != new:
+                    manual_name_only = False
+            if not manual_name_only or not name_changed:
+                raise ValueError("CGT 샷은 본인 작업을 다시 검증한 뒤 확정해야 합니다.")
+        prepared[UI_EDIT_REVISION_KEY] = raw.get(UI_EDIT_REVISION_KEY, base.get(UI_EDIT_REVISION_KEY, 0))
+        return prepared
 
     def _accept_normalized_widget_state_baseline(
         self,
@@ -9323,6 +9575,17 @@ class HMBImageAssetLibrary(DataNode):
         self._hmb_catalog_search_selected = tuple(
             asset for asset in normalized_state.get("assets", []) if asset.get("selected"))
         self._hmb_last_accepted_widget_state = serialized or _json_text(normalized_state)
+        self._hmb_durable_shot_generation = (
+            self._hmb_last_accepted_widget_state,
+            normalized_state["shot_routing"]["generation"],
+        )
+        workspace = normalized_state.get("image_bash_workspace", {})
+        routing = normalized_state["shot_routing"]
+        self._hmb_image_bash_catalog_baseline = (self._hmb_last_accepted_widget_state,
+            {"schema": "hmb-image-bash-workspace-catalog-v1", "source_node": self.name,
+             "channel_uuid": routing["channel_uuid"], "publisher_instance_uuid": routing["publisher_instance_uuid"],
+             "workspaces": [{"workspace_id": workspace["workspace_id"], "name": "HMBImageBash",
+                 "revision": workspace["revision"], "count": len(workspace["instances"])}]} if workspace else {})
         self._hmb_shot_subscription_baseline = (
             self._hmb_last_accepted_widget_state,
             self._hmb_shot_subscription_value(normalized_state["shot_routing"]),
@@ -9659,6 +9922,378 @@ class HMBImageAssetLibrary(DataNode):
             raise
         return True
 
+    def _sync_image_bash_output(self, state: Dict[str, Any], *, force: bool = False) -> None:
+        workspace = state["image_bash_workspace"]
+        if workspace:
+            wanted = {row["source_uid"] for row in workspace["instances"]}
+            scoped = dict(state, assets=[dict(row, selected=row["source_uid"] in wanted)
+                                        for row in state["assets"]])
+            fingerprint = _sha256_canonical([workspace, _project_output_fingerprint(scoped,
+                getattr(self, "_hmb_import_media_by_uid", {}), getattr(self, "_hmb_import_revision", 0)),
+                [(row["source_uid"], row.get("media_signature")) for row in state["assets"] if row["source_uid"] in wanted]])
+        else:
+            fingerprint = "empty-workspace"
+        pair = getattr(self, "_hmb_last_image_bash_pair", None)
+        if force or fingerprint != getattr(self, "_hmb_last_image_bash_fingerprint", "") or pair is None:
+            pair = _build_image_bash_outputs(state, getattr(self, "_hmb_import_media_by_uid", {}),
+                resolution_cache=self._resolution_cache_for_state(state),
+                import_revision=getattr(self, "_hmb_import_revision", 0), force=force)
+            if pair is None:
+                # A temporarily missing share/image must not delete edited
+                # layers. The new request still invalidates the last Apply:
+                # hold its image bytes but mark this context non-runnable.
+                self._hmb_last_image_bash_fingerprint = ""
+                previous = getattr(self, "_hmb_last_image_bash_pair", None)
+                previous = previous if isinstance(previous, tuple) else ([], {})
+                same_workspace = previous[1].get("workspace_id") == workspace.get("workspace_id")
+                pair = (previous[0] if same_workspace else [], {"schema": IMAGE_BASH_CONTEXT_SCHEMA,
+                    "workspace_id": workspace.get("workspace_id", ""), "revision": workspace.get("revision", 0),
+                    "ready": False, "records": copy.deepcopy(previous[1].get("records", [])) if same_workspace else [],
+                    "error": "Image Bash에서 선택한 이미지 원본을 확인할 수 없습니다. 원본 연결을 복구하세요."})
+            else:
+                self._hmb_last_image_bash_pair = pair
+                self._hmb_last_image_bash_fingerprint = fingerprint
+        outputs = ((IMAGE_BASH_IMAGES_OUTPUT_PARAMETER, pair[0]), (IMAGE_BASH_CONTEXT_OUTPUT_PARAMETER, pair[1]))
+        changed = force or any(getattr(self, "parameter_output_values", {}).get(name) != value for name, value in outputs)
+        if changed:
+            generation = getattr(self, "_hmb_image_bash_output_generation", 0) + 1
+            self._hmb_image_bash_output_generation = generation
+            # Stage both siblings before either subscriber may read them.
+            for name, value in outputs:
+                set_output(self, name, value)
+            self._hmb_image_bash_pending_notifications = {
+                name: (generation, value) for name, value in outputs
+            }
+        pending = getattr(self, "_hmb_image_bash_pending_notifications", {})
+        if not isinstance(pending, dict):
+            return
+        for name, item in list(pending.items()):
+            if getattr(self, "_hmb_image_bash_pending_notifications", {}).get(name) is not item:
+                continue
+            _, value = item
+            try:
+                self.publish_update_to_parameter(name, value)
+                if getattr(self, "_hmb_image_bash_pending_notifications", {}).get(name) is not item:
+                    continue
+                _propagate_image_output_to_connections(self, name, value, owner_pending=item,
+                    pending_attribute="_hmb_image_bash_pending_notifications")
+            except Exception as exc:
+                _diagnostic_exception("Image Bash output notification deferred", exc)
+            else:
+                current = getattr(self, "_hmb_image_bash_pending_notifications", {})
+                if current.get(name) is item:
+                    current.pop(name, None)
+
+    def _hmb_image_bash_catalog(self) -> Dict[str, Any]:
+        """Media-free workspace discovery, separate from the five Shot rows."""
+        flow_name, _ = _hmb_shot_routing._same_flow_nodes(self)
+        if not flow_name or bool(getattr(self, "_hmb_node_deleted", False)):
+            return {}
+        baseline = getattr(self, "_hmb_image_bash_catalog_baseline", None)
+        raw = _get_parameter_raw(self, WIDGET_STATE_PARAMETER)
+        if not isinstance(baseline, tuple) or len(baseline) != 2 or raw != baseline[0]:
+            return {}
+        return copy.deepcopy(baseline[1])
+
+    def _hmb_image_bash_snapshot(self, workspace_id: str, cached_only: bool = True) -> tuple[Any, Dict[str, Any]]:
+        """Read the exact current pair; a catalog/selector never resolves files."""
+        catalog = self._hmb_image_bash_catalog()
+        workspace = next((row for row in catalog.get("workspaces", []) if row["workspace_id"] == _uuid_text(workspace_id)), None)
+        if workspace is None:
+            raise ValueError("Image Bash 작업 공간이 변경되었습니다. 다시 선택하세요.")
+        if not cached_only:
+            self._sync_image_bash_output(self._current_state())
+        generation = getattr(self, "_hmb_image_bash_output_generation", 0)
+        values = getattr(self, "parameter_output_values", {})
+        images, context = values.get(IMAGE_BASH_IMAGES_OUTPUT_PARAMETER), values.get(IMAGE_BASH_CONTEXT_OUTPUT_PARAMETER)
+        if (not isinstance(images, list) or not isinstance(context, dict)
+                or context.get("schema") != IMAGE_BASH_CONTEXT_SCHEMA
+                or context.get("workspace_id") != workspace["workspace_id"]
+                or context.get("revision") != workspace["revision"]
+                or generation != getattr(self, "_hmb_image_bash_output_generation", 0)):
+            raise _ImageAssetSelectionPreparing("Image Bash 이미지 작업 공간을 동기화하는 중입니다.")
+        return list(images), copy.deepcopy(context)
+
+    def _image_bash_binding_state(self, target: Any, workspace_id: str, expected: Any = None) -> tuple[Any, ...]:
+        for node in (self, target):
+            resolution = getattr(node, "state", None)
+            if (bool(getattr(node, "lock", False)) or bool(getattr(node, "_hmb_node_deleted", False))
+                    or _clean(getattr(resolution, "value", resolution)).casefold() == "resolving"
+                    or _clean(getattr(resolution, "name", "")).casefold() == "resolving"):
+                raise ValueError("ImageAsset와 Image Bash의 실행을 마치고 편집 잠금을 해제하세요.")
+        flow_name, nodes = _hmb_shot_routing._same_flow_nodes(self)
+        if (not flow_name or type(target).__name__ != "HMBImageBash"
+                or not any(node is target for node in nodes)):
+            raise ValueError("같은 워크플로에 등록된 Image Bash만 연결할 수 있습니다.")
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        manager = GriptapeNodes.NodeManager()
+        if (manager.get_node_by_name(target.name) is not target
+                or manager.get_node_parent_flow_by_name(target.name) != flow_name):
+            raise ValueError("Image Bash 노드가 교체되었습니다. 다시 선택하세요.")
+        state = getattr(self, "_hmb_catalog_search_authority", None)
+        if (not isinstance(state, dict) or _get_parameter_raw(self, WIDGET_STATE_PARAMETER)
+                != getattr(self, "_hmb_last_accepted_widget_state", None)):
+            raise ValueError("ImageAsset 변경을 적용하는 중입니다. 다시 연결하세요.")
+        workspace, routing = state["image_bash_workspace"], state["shot_routing"]
+        if not workspace or _uuid_text(workspace_id) != workspace["workspace_id"]:
+            raise ValueError("Image Bash 작업 공간이 변경되었습니다. 다시 선택하세요.")
+        identity = (flow_name, workspace["workspace_id"], workspace["revision"], routing["channel_uuid"], routing["publisher_instance_uuid"])
+        if expected is not None and identity != expected:
+            raise ValueError("Image Bash 연결 중 작업 공간이 변경되었습니다. 다시 선택하세요.")
+        return identity, state, nodes
+
+    def _hmb_bind_image_bash_workspace(self, target_node: Any, workspace_id: str, enabled: bool = True) -> None:
+        """Bind exactly two native ports, or release only this source's pair."""
+        if type(enabled) is not bool:
+            raise ValueError("Image Bash 연결 요청이 올바르지 않습니다.")
+        if not hasattr(self, "_hmb_image_bash_binding_lock"):
+            self._hmb_image_bash_binding_lock = threading.RLock()
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.events.connection_events import (
+            CreateConnectionRequest, DeleteConnectionRequest, ListConnectionsForNodeRequest)
+        from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
+        target = target_node
+        ports = ((IMAGE_BASH_IMAGES_OUTPUT_PARAMETER, "input_images"),
+                 (IMAGE_BASH_CONTEXT_OUTPUT_PARAMETER, "image_bash_context"))
+        relevant_names = {item[1] for item in ports}
+        with self._hmb_image_bash_binding_lock:
+            identity, state, nodes = self._image_bash_binding_state(target, workspace_id)
+            def check() -> None:
+                self._image_bash_binding_state(target, workspace_id, identity)
+            def inspect(node: Any) -> Any:
+                result = GriptapeNodes.handle_request(ListConnectionsForNodeRequest(node_name=node.name))
+                check()
+                if not result.succeeded():
+                    raise ValueError("Image Bash 연결 상태를 확인할 수 없습니다.")
+                return result
+            def relevant(edge: Any) -> bool:
+                return edge.target_parameter_name in relevant_names or edge.target_parameter_name.startswith("input_images_")
+            incoming = [edge for edge in inspect(target).incoming_connections if relevant(edge)]
+            if any(edge.source_node_name != self.name or
+                    (edge.source_parameter_name, edge.target_parameter_name) not in ports for edge in incoming):
+                raise ValueError("Image Bash에 다른 이미지 원본이 연결되어 있습니다. 기존 연결을 먼저 해제하세요.")
+            if (not enabled and not incoming and not (
+                    target.metadata.get("hmb_image_bash_workspace_id") == identity[1]
+                    and target.metadata.get("hmb_image_bash_channel_uuid") == identity[3])):
+                raise ValueError("이 이미지 라이브러리가 소유한 Image Bash 연결이 없습니다.")
+            if enabled:
+                occupied = [node for node in nodes if node is not target and type(node).__name__ == "HMBImageBash"
+                    and node.metadata.get("hmb_image_bash_workspace_id") == identity[1]
+                    and node.metadata.get("hmb_image_bash_channel_uuid") == identity[3]]
+                outgoing = inspect(self).outgoing_connections
+                names = {node.name for node in nodes if node is not target and type(node).__name__ == "HMBImageBash"}
+                if occupied or any(edge.target_node_name in names and (edge.source_parameter_name, edge.target_parameter_name) in ports
+                                   for edge in outgoing):
+                    raise ValueError("이 Image Bash 작업 공간은 다른 노드에 연결되어 있습니다. 먼저 연결을 해제하세요.")
+            old_values = {name: copy.deepcopy(target.get_parameter_value(name)) for _, name in ports}
+            input_list = target.get_parameter_by_name("input_images")
+            old_child_values = {child.name: copy.deepcopy(target.get_parameter_value(child.name))
+                                for child in input_list.get_child_parameters()}
+            keys = ("hmb_image_bash_workspace_id", "hmb_image_bash_channel_uuid")
+            old_metadata = {key: copy.deepcopy(target.metadata[key]) for key in keys if key in target.metadata}
+            created, removed = [], []
+            was_syncing = bool(getattr(target, "_hmb_syncing", False))
+            target._hmb_syncing = True
+            def set_transport(name: str, value: Any, *, restore: bool = False) -> None:
+                result = GriptapeNodes.handle_request(SetParameterValueRequest(node_name=target.name,
+                    parameter_name=name, value=value, initial_setup=restore,
+                    **({"incoming_connection_source_node_name": self.name,
+                        "incoming_connection_source_parameter_name": dict((item[1], item[0]) for item in ports)[name]}
+                       if enabled and not restore else {})))
+                if not result.succeeded():
+                    raise ValueError("Image Bash 입력을 갱신할 수 없습니다.")
+                if not restore:
+                    check()
+            try:
+                if enabled:
+                    # No source publication/target callback occurs until all
+                    # lock, ownership, foreign-edge and occupancy checks pass.
+                    self._sync_image_bash_output(state)
+                    check()
+                    for output, input_name in ports:
+                        if not any(edge.source_parameter_name == output and edge.target_parameter_name == input_name for edge in incoming):
+                            result = GriptapeNodes.handle_request(CreateConnectionRequest(source_node_name=self.name,
+                                source_parameter_name=output, target_node_name=target.name, target_parameter_name=input_name))
+                            if not result.succeeded():
+                                raise ValueError("Image Bash 입력 연결을 완료하지 못했습니다. 다시 연결하세요.")
+                            created.append((output, input_name))
+                            check()
+                    actual = [edge for edge in inspect(target).incoming_connections if relevant(edge)]
+                    if len(actual) != 2 or {(edge.source_node_name, edge.source_parameter_name, edge.target_parameter_name)
+                            for edge in actual} != {(self.name, output, name) for output, name in ports}:
+                        raise ValueError("Image Bash의 두 입력 연결을 다시 확인하세요.")
+                    images, context = self._hmb_image_bash_snapshot(workspace_id, cached_only=True)
+                    for name, value in (("input_images", images), ("image_bash_context", context)):
+                        set_transport(name, value)
+                    target.metadata.update({keys[0]: identity[1], keys[1]: identity[3]})
+                else:
+                    for edge in reversed(incoming):
+                        result = GriptapeNodes.handle_request(DeleteConnectionRequest(source_node_name=self.name,
+                            source_parameter_name=edge.source_parameter_name, target_node_name=target.name,
+                            target_parameter_name=edge.target_parameter_name))
+                        if not result.succeeded():
+                            raise ValueError("Image Bash 연결을 해제할 수 없습니다.")
+                        removed.append((edge.source_parameter_name, edge.target_parameter_name))
+                        check()
+                    set_transport("input_images", [])
+                    set_transport("image_bash_context", {})
+                    # Without a whole-list wire the SDK aggregates the list's
+                    # scalar children again. Retire those local transport
+                    # values too; keep their parameters and the Bash scene.
+                    for name in old_child_values:
+                        set_transport(name, None, restore=True)
+                        check()
+                    for key in keys:
+                        target.metadata.pop(key, None)
+                check()
+            except Exception:
+                # Roll back only edges changed by this invocation. An older
+                # partial pair survives and can be completed by a later bind.
+                try:
+                    registered = GriptapeNodes.NodeManager().get_node_by_name(target.name) is target
+                    if registered:
+                        for output, name in reversed(created):
+                            result = GriptapeNodes.handle_request(DeleteConnectionRequest(source_node_name=self.name,
+                                source_parameter_name=output, target_node_name=target.name, target_parameter_name=name))
+                            if not result.succeeded():
+                                raise RuntimeError("Image Bash 연결 복원에 실패했습니다.")
+                        for output, name in reversed(removed):
+                            result = GriptapeNodes.handle_request(CreateConnectionRequest(source_node_name=self.name,
+                                source_parameter_name=output, target_node_name=target.name, target_parameter_name=name))
+                            if not result.succeeded():
+                                raise RuntimeError("Image Bash 연결 복원에 실패했습니다.")
+                        for name, value in old_values.items():
+                            set_transport(name, value, restore=True)
+                        for name, value in old_child_values.items():
+                            set_transport(name, value, restore=True)
+                        for key in keys:
+                            if key in old_metadata:
+                                target.metadata[key] = old_metadata[key]
+                            else:
+                                target.metadata.pop(key, None)
+                except Exception as rollback_error:
+                    _diagnostic_exception("Image Bash binding rollback incomplete", rollback_error)
+                raise
+            finally:
+                target._hmb_syncing = was_syncing
+            if enabled and not was_syncing:
+                target._sync_metadata_with_input_images()
+            elif not enabled and not was_syncing:
+                target._clear_output()
+                target._status("REMOTE 연결 해제 · 편집 내용은 유지됩니다")
+            publish_header = getattr(target, "_publish_header", None)
+            if callable(publish_header) and not was_syncing:
+                publish_header()
+
+    def _create_image_bash_workspace_node(self, command: Any) -> str:
+        command = _normalize_image_bash_workspace_request(command)
+        if not command:
+            return ""
+        if bool(getattr(self, "lock", False)) or bool(getattr(self, "_hmb_node_deleted", False)) or str(getattr(self, "state", "")).casefold() == "resolving":
+            raise ValueError("라이브러리 편집 잠금을 해제한 뒤 Image Bash를 추가하세요.")
+        state = self._current_state()
+        workspace = state["image_bash_workspace"]
+        if not workspace or command["workspace_id"] != workspace["workspace_id"] or command["expected_revision"] != workspace["revision"]:
+            raise ValueError("Image Bash 작업 공간이 변경되었습니다. 다시 추가하세요.")
+        flow_name, nodes = _hmb_shot_routing._same_flow_nodes(self)
+        if not flow_name:
+            raise ValueError("현재 라이브러리의 워크플로 등록이 끝난 뒤 Image Bash를 추가하세요.")
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
+        candidates = [node for node in nodes if type(node).__name__ == "HMBImageBash"
+            and node.metadata.get("hmb_image_bash_workspace_id") == workspace["workspace_id"]
+            and node.metadata.get("hmb_image_bash_channel_uuid") == state["shot_routing"]["channel_uuid"]]
+        if len(candidates) > 1:
+            raise ValueError("같은 Image Bash 작업 공간 노드가 여러 개 있습니다. 연결을 확인하세요.")
+        if candidates:
+            target = candidates[0]
+        else:
+            position = self.metadata.get("position", {})
+            result = GriptapeNodes.handle_request(CreateNodeRequest(node_type="HMBImageBash", specific_library_name=WIDGET_LIBRARY_NAME,
+                node_name="HMBImageBash", override_parent_flow_name=flow_name, set_as_new_context=False,
+                create_error_proxy_on_failure=False, parent_group_name=getattr(getattr(self, "parent_group", None), "name", None),
+                metadata={"hmb_image_bash_workspace_id": workspace["workspace_id"],
+                    "hmb_image_bash_channel_uuid": state["shot_routing"]["channel_uuid"],
+                    "position": {"x": float(position.get("x", 0)) + ASSET_NODE_WIDTH + 120, "y": float(position.get("y", 0))}}))
+            if not result.succeeded():
+                raise ValueError("HMB Image Bash 노드를 만들 수 없습니다. 라이브러리 등록 상태를 확인하세요.")
+            target = GriptapeNodes.NodeManager().get_node_by_name(result.node_name)
+        self._hmb_bind_image_bash_workspace(target, workspace["workspace_id"])
+        return target.name
+
+    def _hmb_restore_publication_cursor(self) -> None:
+        """Repair an older saved cursor only after live hydration is complete."""
+        if bool(getattr(self, "_hmb_restoring_publication_cursor", False)):
+            return
+        state = self._current_state()
+        routing = state["shot_routing"]
+        own = max(1, _non_negative_int(routing["generation"]),
+                  _non_negative_int(getattr(self, "_hmb_shot_routing_generation", 0)))
+        floor = _hmb_shot_routing.restored_shot_catalog_generation_floor(
+            self, publisher_instance_uuid=routing["publisher_instance_uuid"],
+            channel_uuid=routing["channel_uuid"], current_generation=own,
+        )
+        if floor <= own:
+            self._hmb_publication_cursor_restore_pending = False
+            return
+        if floor >= 9007199254740991:
+            raise ValueError("ImageAsset restored Shot generation exceeds the safe publication range.")
+        routing["generation"] = floor + 1
+        self._hmb_restoring_publication_cursor = True
+        self._hmb_publication_cursor_restore_pending = False
+        try:
+            self._hmb_shot_routing_input_identity = ""
+            self._publish_state(state, normalized=True)
+        except Exception:
+            self._hmb_publication_cursor_restore_pending = True
+            raise
+        finally:
+            self._hmb_restoring_publication_cursor = False
+
+    def _persist_shot_routing_facts(self, state: Dict[str, Any], snapshot: Dict[str, Any]) -> None:
+        """Save the live publication cursor before any peer can accept it.
+
+        UI edits and async selection completion can publish without going through
+        _publish_state. Persist only derived routing facts on the matching live
+        authored state, never a saved output token or another worker's document.
+        """
+        raw = _get_parameter_raw(self, WIDGET_STATE_PARAMETER)
+        baseline = getattr(self, "_hmb_durable_shot_generation", None)
+        if (isinstance(baseline, tuple) and len(baseline) == 2
+                and raw == baseline[0] and baseline[1] == snapshot.get("generation")):
+            return
+        current = self._current_state()
+        current_routing = current["shot_routing"]
+        if current_routing.get("generation") == snapshot.get("generation"):
+            return
+
+        def authored_routing(value: Dict[str, Any]) -> tuple:
+            routing = value["shot_routing"]
+            return (routing["publisher_instance_uuid"], routing["channel_uuid"],
+                    tuple((row["shot_uuid"], row["number"], row["name"], row["revision"],
+                           tuple(row["selected_source_uids"])) for row in routing["shots"]))
+
+        if authored_routing(current) != authored_routing(state):
+            return
+        media = getattr(self, "_hmb_import_media_by_uid", {})
+        revision = _non_negative_int(getattr(self, "_hmb_import_revision", 0))
+        if (_project_output_fingerprint(current, media, revision)
+                != _project_output_fingerprint(state, media, revision)):
+            return
+        if _non_negative_int(current_routing.get("generation")) > _non_negative_int(snapshot.get("generation")):
+            return
+        _apply_shot_routing_state_facts(current, snapshot)
+        serialized = _json_text(current)
+        previous_syncing = bool(getattr(self, "_hmb_state_syncing", False))
+        self._hmb_state_syncing = True
+        try:
+            _set_parameter_value(self, WIDGET_STATE_PARAMETER, serialized)
+            if _get_parameter_raw(self, WIDGET_STATE_PARAMETER) != serialized:
+                raise ValueError("ImageAsset Shot publication could not persist its current routing cursor.")
+            self._accept_normalized_widget_state_baseline(current, serialized)
+        finally:
+            self._hmb_state_syncing = previous_syncing
+
     def _sync_output(
         self,
         state: Dict[str, Any],
@@ -9679,6 +10314,8 @@ class HMBImageAssetLibrary(DataNode):
                     work["ready"] = None
         elif self._defer_project_selection_resolution(normalized):
             return normalized
+        if normalized.get("image_bash_workspace") or getattr(self, "_hmb_last_image_bash_pair", None) is not None:
+            self._sync_image_bash_output(normalized, force=force)
         import_media = getattr(self, "_hmb_import_media_by_uid", {})
         if not isinstance(import_media, dict):
             import_media = {}
@@ -9717,6 +10354,7 @@ class HMBImageAssetLibrary(DataNode):
                 normalized,
                 normalized=True,
             )
+            self._persist_shot_routing_facts(normalized, shot_snapshot)
             shot_token = self._shot_asset_dependency_token(shot_snapshot)
             current_shot_output = (
                 output_getter(SHOT_ASSET_OUTPUT_PARAMETER)
@@ -9792,6 +10430,7 @@ class HMBImageAssetLibrary(DataNode):
         shot_snapshot = self._cache_shot_routing_snapshot(
             normalized, force=force, normalized=True
         )
+        self._persist_shot_routing_facts(normalized, shot_snapshot)
         _stage_and_notify_image_output_pair(
             self,
             asset_output_value,
@@ -9837,6 +10476,10 @@ class HMBImageAssetLibrary(DataNode):
         else:
             assets = [asset for asset in state.get("assets", [])
                       if asset.get("selected") or _clean(asset.get("asset_library_id")) in wanted]
+        retained = {row["source_uid"] for row in state.get("image_bash_workspace", {}).get("instances", [])}
+        existing = {_clean(row.get("source_uid")) for row in assets}
+        assets.extend(row for row in state.get("assets", [])
+                      if row.get("source_uid") in retained and row.get("source_uid") not in existing)
         # The retained tree repeats every asset ID. The widget derives its
         # folder tree from folders/counts, so never copy that full export here.
         dto = {key: value for key, value in state.items() if key not in {"assets", "catalog_page", "tree"}}
@@ -10098,6 +10741,7 @@ class HMBImageAssetLibrary(DataNode):
         state["asset_registration_request"] = {}
         state["asset_cleanup_request"] = {}
         state["disconnect_import_uid"] = ""
+        state["image_bash_workspace_request"] = {}
         normalized_state = state if normalized else _normalize_state(state)
         normalized = normalized_state
         pending_only = bool(
@@ -12075,10 +12719,140 @@ class HMBImageAssetLibrary(DataNode):
             self._reconcile_hmb_shot_routing(catalog_identity)
         return normalized
 
+    def _request_cgt_read(self, request: Dict[str, Any]) -> None:
+        """One bounded worker, newest pending intent, host-loop-only publication."""
+        current = self._current_state()
+        if (request.get("runtime_instance_id") != self._thumbnail_runtime_id(current)
+                or request.get("project_identity") != _hmb_shot_routing.hierarchy_project_key(current)
+                or not request.get("session_id") or not request.get("request_id")):
+            return
+        if not hasattr(self, "_hmb_cgt_lock"):
+            self._hmb_cgt_lock = threading.RLock()
+            self._hmb_cgt_generation = 0
+            self._hmb_cgt_pending = None
+            self._hmb_cgt_ready = None
+            self._hmb_cgt_thread = None
+        with self._hmb_cgt_lock:
+            self._hmb_cgt_generation += 1
+            generation = self._hmb_cgt_generation
+            if request["operation"] == "cgt_cancel":
+                self._hmb_cgt_pending = None
+                self._hmb_cgt_ready = None
+                return
+            command = request.get("hierarchy_request")
+            if request["operation"] == "cgt_confirm":
+                if bool(getattr(self, "lock", False)) or str(getattr(self, "state", "")).casefold() == "resolving":
+                    return
+                # Validate the complete transaction before any network request.
+                _hmb_shot_routing.apply_shot_hierarchy_edit(current, command)
+                scope_id = ((command.get("binding") or {}).get("cgt_scope") or {}).get("project_id")
+                if (request.get("cgt_project_id") and scope_id
+                        and request["cgt_project_id"].lower() != scope_id.lower()):
+                    raise ValueError("확정할 CGT 프로젝트가 선택한 샷 범위와 다릅니다.")
+                request = dict(request, cgt_project_id=scope_id or request.get("cgt_project_id", ""))
+            self._hmb_cgt_pending = (generation, copy.deepcopy(request), _clean(current.get("project_id")))
+            if self._hmb_cgt_thread is not None:
+                return
+            host_context = contextvars.copy_context()
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is None:
+                try:
+                    from griptape_nodes.retained_mode.engine import has_current_engine
+                    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+                    if has_current_engine():
+                        loop = GriptapeNodes.EventManager().event_loop
+                except (ImportError, AttributeError):
+                    pass
+            node_ref = weakref.ref(self)
+
+            def worker() -> None:
+                import _hmb_cgt
+                owner = node_ref()
+                if owner is None:
+                    return
+                while True:
+                    with owner._hmb_cgt_lock:
+                        job = owner._hmb_cgt_pending
+                        owner._hmb_cgt_pending = None
+                        if job is None:
+                            owner._hmb_cgt_thread = None
+                            return
+                    serial, intent, project_id = job
+                    command = intent.get("hierarchy_request") or {}
+                    binding = command.get("binding") if intent["operation"] == "cgt_confirm" else None
+                    try:
+                        result = _hmb_cgt.catalog(project_id, binding=binding,
+                            cgt_project_id=intent.get("cgt_project_id") or None)
+                    except Exception:
+                        result = {"status": "SDK_UNAVAILABLE", "tasks": [], "projects": []}
+                    with owner._hmb_cgt_lock:
+                        if serial != owner._hmb_cgt_generation or bool(getattr(owner, "_hmb_node_deleted", False)):
+                            continue
+                        owner._hmb_cgt_ready = (serial, intent, project_id, result)
+                    if loop is not None and loop.is_running():
+                        loop.call_soon_threadsafe(host_context.copy().run, owner._consume_cgt_result)
+
+            self._hmb_cgt_thread = threading.Thread(target=worker, name="HMB-CGT-own-tasks", daemon=True)
+            self._hmb_cgt_thread.start()
+
+    def _consume_cgt_result(self) -> None:
+        lock = getattr(self, "_hmb_cgt_lock", None)
+        if lock is None:
+            return
+        with lock:
+            ready = self._hmb_cgt_ready
+            self._hmb_cgt_ready = None
+            if not ready or ready[0] != self._hmb_cgt_generation or bool(getattr(self, "_hmb_node_deleted", False)):
+                return
+        serial, request, project_id, result = ready
+        current = self._current_state()
+        if (request["runtime_instance_id"] != self._thumbnail_runtime_id(current)
+                or request["project_identity"] != _hmb_shot_routing.hierarchy_project_key(current)
+                or project_id != _clean(current.get("project_id"))):
+            result = {"status": "SOURCE_CHANGED", "tasks": [], "projects": []}
+        outcome = "ready" if result.get("status") == "ready" else "rejected"
+        if request["operation"] == "cgt_confirm" and outcome == "ready":
+            try:
+                import _hmb_cgt
+                command = request["hierarchy_request"]
+                if bool(getattr(self, "lock", False)) or str(getattr(self, "state", "")).casefold() == "resolving":
+                    raise ValueError("Griptape 편집 잠금")
+                _hmb_cgt.verify_binding(command["binding"], project_id, result)
+                prepared = _hmb_shot_routing.apply_shot_hierarchy_edit(current, command)
+                try:
+                    self._publish_state(prepared)
+                except Exception:
+                    # A local publication failure must not strand a partially
+                    # accepted name/binding snapshot or trigger another CGT read.
+                    self._publish_state(current)
+                    raise
+                outcome = "committed"
+                # The live list belongs to this dialog, not to persistent native
+                # media/Prompt/Agent state. Save only the confirmed binding.
+                result = {"status": "committed"}
+            except Exception:
+                outcome = "rejected"
+                result = {"status": "SOURCE_CHANGED", "tasks": [], "projects": []}
+        response = {key: request[key] for key in ("schema", "version", "runtime_instance_id", "session_id", "request_id", "project_identity", "operation")}
+        response["cgt_project_id"] = request.get("cgt_project_id", "")
+        response.update(phase="result", outcome=outcome, state=result)
+        self._set_thumbnail_bridge_value(response)
+
     def _apply_thumbnail_bridge_request(self, value: Any) -> None:
+        early = _normalize_thumbnail_bridge(value)
+        if early.get("operation") == "cgt_cancel" and early.get("phase") == "request":
+            self._request_cgt_read(early)
+            return
+        self._consume_cgt_result()
         self._consume_catalog_search_result()
         self._consume_pending_catalog_probe_result()
         bridge = _normalize_thumbnail_bridge(value)
+        if bridge.get("operation") in {"cgt_catalog", "cgt_confirm", "cgt_cancel"} and bridge.get("phase") == "request":
+            self._request_cgt_read(bridge)
+            return
         if bridge.get("operation") == "catalog_page" and bridge.get("phase") == "request":
             self._request_catalog_search(bridge)
             return
@@ -12339,6 +13113,14 @@ class HMBImageAssetLibrary(DataNode):
                 if not self._hmb_state_syncing and not self._hmb_restoring_widget_state:
                     self._accept_widget_state_baseline(value)
                 self._apply_widget_state(value)
+                command = _parse_mapping(value).get("image_bash_workspace_request")
+                if command:
+                    # A presentation-only edit can leave all normal Shot
+                    # outputs unchanged, so _apply_widget_state need not
+                    # publish. Consume explicit intent even on that path (or
+                    # on a partial wiring failure) before performing it.
+                    self._publish_state(self._current_state())
+                    self._create_image_bash_workspace_node(command)
             elif name == THUMBNAIL_PATCH_PARAMETER:
                 self._apply_thumbnail_bridge_request(value)
         finally:
@@ -12426,6 +13208,7 @@ class HMBImageAssetLibrary(DataNode):
         return result
 
     def after_deserialize(self, *args: Any, **kwargs: Any) -> Any:
+        self._hmb_publication_cursor_restore_pending = True
         self._hmb_refresh_authority = None
         removal_state = getattr(self, "_hmb_import_child_removal_state", None)
         if isinstance(removal_state, dict):

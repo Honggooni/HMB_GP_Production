@@ -236,9 +236,16 @@ assert.doesNotMatch(
   /\.hmbvp button,.hmbvp input,.hmbvp select,.hmbvp \.panel/,
   "Structural panels are no longer animated during state synchronization.",
 );
-assert.match(
-  widgetSource,
-  /\.hmbvp button,.hmbvp input,.hmbvp select\{transition:border-color 80ms ease,color 80ms ease\}/,
+const bodyControlTransitions = Array.from(widgetSource.matchAll(
+  /([^{}\n]+)\{transition:border-color 80ms ease,color 80ms ease\}/g,
+));
+assert.equal(bodyControlTransitions.length, 1, "The existing body controls retain one bounded color/border transition rule.");
+assert.equal(
+  bodyControlTransitions[0][1].trim(),
+  ["button", "input", "select"].map((tag) =>
+    `.hmbvp ${tag}:not([data-hmb-native-identity] *,[data-hmb-native-actions] *)`,
+  ).join(","),
+  "Body controls retain their 80ms transitions while both native identity and action controls are explicitly excluded.",
 );
 assert.doesNotMatch(widgetSource, /\.hmbvp \.outliner-row\{transition:/);
 assert.doesNotMatch(widgetSource, /transition:[^}\n]*background(?:-color)?/);

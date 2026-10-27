@@ -234,7 +234,8 @@ class WatchdogActivityTests(unittest.TestCase):
                 raise ReachedWatchdog()
 
             node._wait_for_process_with_progress = wait
-            with patch.object(picker, "_find_blender", return_value=root / "blender.exe"), \
+            with patch.dict(os.environ, {"LOCALAPPDATA": str(root)}), \
+                    patch.object(picker, "_find_blender", return_value=root / "blender.exe"), \
                     patch.object(picker, "_blender_display_version", return_value="Fixture"), \
                     patch.object(picker.subprocess, "Popen", side_effect=launch):
                 with self.assertRaises(ReachedWatchdog):

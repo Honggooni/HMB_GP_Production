@@ -49,6 +49,12 @@ try {
   page.on("pageerror", (error) => failures.push(error.message));
   await page.goto(origin);
   await page.waitForFunction(() => window.ready);
+  await page.evaluate(() => {
+    window.focusListeners = new Set();
+    const add = window.addEventListener.bind(window), remove = window.removeEventListener.bind(window);
+    window.addEventListener = (type, handler, options) => { if (type === "focus") focusListeners.add(handler); return add(type, handler, options); };
+    window.removeEventListener = (type, handler, options) => { if (type === "focus") focusListeners.delete(handler); return remove(type, handler, options); };
+  });
   const first = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const shots = [first, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "dddddddd-dddd-4ddd-8ddd-dddddddddddd", "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"];
   const bound = {
@@ -63,6 +69,7 @@ try {
     const error = await page.evaluate((value) => { try { window.mountPicker(value); return ""; } catch (e) { return `${e.name}: ${e.message}`; } }, state);
     assert.equal(error, "", "The complete production widget factory must mount without an initialization error.");
     await page.waitForFunction(() => document.querySelector('.hmbvp[data-picker-view="compact"]'));
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
     assert.ok(await page.locator("[data-picker-shot-row]").count() >= 1);
     for (const view of ["expanded", "compact"]) {
       await page.locator('[data-picker-toggle-surface="header"]').dispatchEvent("dblclick");
@@ -110,9 +117,30 @@ try {
   assert.equal(commands[0].payload.import_id, "loading-1");
   await page.evaluate(() => window.controller.update(window.props(window.current)));
   assert.equal(await page.locator("[data-picker-import-id]").count(), 0, "A stale loading echo cannot repaint the cancelled card.");
+  // Native workflow/file popup return dispatches window.focus with Window as
+  // target. It is not a Node, even though the browser event has a target.
+  const targetChecks = await page.evaluate(() => {
+    const host = document.getElementById("widget"), foreign = document.createElement("iframe");
+    document.body.appendChild(foreign);
+    const crossRealmNode = foreign.contentDocument.createElement("button");
+    foreign.contentDocument.body.appendChild(crossRealmNode);
+    const result = [window, {}, null, crossRealmNode].map(target => window.widget.hmbIsExactNativeMayaPickerTarget(host, target));
+    host.appendChild(crossRealmNode); // adoption preserves the object's original realm.
+    result.push(window.widget.hmbIsExactNativeMayaPickerTarget(host, crossRealmNode));
+    crossRealmNode.remove(); foreign.remove();
+    window.widget.hmbClaimNativeMayaBrowseSession(host, "focus-return-fixture", "", Date.now() + 2000);
+    for (let n = 0; n < 5; n++) window.dispatchEvent(new Event("focus"));
+    return result;
+  });
+  assert.deepEqual(targetChecks, [false, false, false, false, false]);
+  await page.waitForTimeout(600);
+  assert.equal(await page.evaluate(() => window.widget.hmbNativeMayaBrowseSessionActive(document.getElementById("widget"))), false,
+    "Focus return with no selected path must retire only its native browse session.");
   await page.evaluate(() => window.controller.cleanup());
+  assert.equal(await page.evaluate(() => window.focusListeners.size), 0, "Teardown must remove all window-focus handlers.");
+  await page.evaluate(() => { for (let n = 0; n < 5; n++) window.dispatchEvent(new Event("focus")); });
   assert.deepEqual(failures, []);
-  console.log("Picker cold-mount browser regression: PASS (actual widget factory, empty/5 Shots, ko/en, compact/expanded, remount, cancel, stale echo, cleanup).");
+  console.log("Picker cold-mount browser regression: PASS (actual widget factory, empty/5 Shots, ko/en, compact/expanded, remount, cancel, stale echo, Window/cross-realm focus targets and teardown).");
 } finally {
   await browser?.close();
   await new Promise((resolve) => server.close(resolve));

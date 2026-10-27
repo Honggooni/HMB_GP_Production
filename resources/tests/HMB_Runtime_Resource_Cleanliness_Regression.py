@@ -6,6 +6,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_RESOURCES = {
+    "resources/image_bash/compatibility.json",
+    "resources/cgt/server-trust.json",
     "resources/maya/HMB_Maya_Background_Preview.py",
     "resources/blender/HMB_Blender_Background_Preview.py",
     "resources/picker/HMB_Marker_Catalog.json",
@@ -19,6 +21,9 @@ DISTRIBUTION_ONLY_FILES = (
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
     "SBOM.spdx.json",
+    "tools/hmb_color_lut_native_header_patch.py",
+    "resources/editor/hmb-color-lut-native-header.js",
+    "resources/editor/native-editor-patch.json",
 )
 EXCLUDED_PACKAGE_FILES = {
     "README.md",
@@ -49,13 +54,13 @@ diagnostics = importlib.util.module_from_spec(diagnostics_spec)
 diagnostics_spec.loader.exec_module(diagnostics)
 # The diagnostic receipt reader must recognize the same independently packaged
 # members. A valid installer receipt must not be rejected as an extra-file list.
-assert len(diagnostics.RUNTIME_FILE_PATHS) == len(set(diagnostics.RUNTIME_FILE_PATHS)) == 49
+assert len(diagnostics.RUNTIME_FILE_PATHS) == len(set(diagnostics.RUNTIME_FILE_PATHS)) == 60
 assert set(diagnostics.RUNTIME_FILE_PATHS) == set(runtime_install_files)
 distribution_only_files = tuple(packager.DISTRIBUTION_ONLY_FILES)
-assert len(runtime_install_files) == 49
+assert len(runtime_install_files) == 60
 assert distribution_only_files == DISTRIBUTION_ONLY_FILES
 assert source_files == (*runtime_install_files, *distribution_only_files)
-assert len(source_files) == 53
+assert len(source_files) == 67
 assert not EXCLUDED_PACKAGE_FILES.intersection(source_files)
 assert not set(runtime_install_files).intersection(distribution_only_files)
 assert {
@@ -93,17 +98,21 @@ assert "LocalApplicationData" in installer
 assert "Rollback data must be stored outside the Griptape libraries folder" in installer
 assert "MyInvocation.MyCommand.Path" in installer
 assert "Could not resolve the extracted HMB package directory" in installer
-assert "[int]$manifest.install_file_count -ne 49" in installer
-assert "$records.Count -ne 53" in installer
+assert "[int]$manifest.install_file_count -ne 60" in installer
+assert "$records.Count -ne 67" in installer
 assert "_hmb_reference_leases.py" in runtime_install_files
 assert "HMBImageGeneration.py" in runtime_install_files
 assert "_hmb_image_generation.py" in runtime_install_files
 assert "widgets/HMBImageGenerationWidget.js" in runtime_install_files
+assert "widgets/HMBImageBashWidget.js" in runtime_install_files
 assert "_hmb_agent_media.py" in runtime_install_files
 assert "_hmb_build_diagnostics.py" in runtime_install_files
 assert "_hmb_broker_config.py" in runtime_install_files
 assert "_hmb_library_bootstrap.py" in runtime_install_files
+assert "_hmb_deletion_guard.py" in runtime_install_files
+assert "_hmb_connection_management.py" in runtime_install_files
 assert "_hmb_workflow_migration.py" in runtime_install_files
+assert "_hmb_workflow_serialization_compat.py" in runtime_install_files
 assert "_hmb_image_limits.py" in runtime_install_files
 assert "_hmb_review.py" in runtime_install_files
 assert "_hmb_web_rerender.py" in runtime_install_files

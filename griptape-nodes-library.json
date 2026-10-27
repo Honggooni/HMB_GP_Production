@@ -279,10 +279,10 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.8.27",
+    "library_version": "0.8.31",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
-      "archive_source_count": 53,
+      "archive_source_count": 67,
       "mode": "bundled_signed_dat",
       "runtime_path": "resources/agent/superwings12/hmb_agent_core.dat",
       "policy_version": "2026-10-15.agent-shot-quality.v7.0",
@@ -508,7 +508,7 @@
         "icon": "Palette",
         "group": "edit",
         "width": 1220,
-        "height": 1080,
+        "height": 1160,
         "min_width": 760,
         "min_height": 700,
         "resizable": true,
@@ -520,7 +520,7 @@
         ],
         "ui_options": {
           "width": 1220,
-          "height": 1080,
+          "height": 1160,
           "min_width": 760,
           "min_height": 700,
           "resizable": true
@@ -533,7 +533,7 @@
       "metadata": {
         "category": "HMB_GP_Production",
         "description": "Runs the stock Griptape Agent model surface with the bundled signed HMB policy.\nThe model declaration mirrors the installed Standard Agent for host permission and accounting; it is not an HMB content allowlist.",
-        "display_name": "HMBAgentLibrary",
+        "display_name": "HMB Agent",
         "declarations": [
           {
             "type": "model_usage",
@@ -592,13 +592,13 @@
         "icon": "SlidersHorizontal",
         "group": "edit",
         "width": 980,
-        "height": 1091,
+        "height": 864,
         "default_width": 980,
-        "default_height": 1091,
+        "default_height": 864,
         "preferred_width": 980,
-        "preferred_height": 1091,
+        "preferred_height": 864,
         "initial_width": 980,
-        "initial_height": 1091,
+        "initial_height": 864,
         "min_width": 700,
         "min_height": 620,
         "resizable": true,
@@ -611,24 +611,24 @@
         ],
         "ui_options": {
           "width": 980,
-          "height": 1091,
+          "height": 864,
           "default_width": 980,
-          "default_height": 1091,
+          "default_height": 864,
           "preferred_width": 980,
-          "preferred_height": 1091,
+          "preferred_height": 864,
           "initial_width": 980,
-          "initial_height": 1091,
+          "initial_height": 864,
           "node_size": {
             "width": 980,
-            "height": 1091
+            "height": 864
           },
           "default_size": {
             "width": 980,
-            "height": 1091
+            "height": 864
           },
           "initial_size": {
             "width": 980,
-            "height": 1091
+            "height": 864
           },
           "min_width": 700,
           "min_height": 620,
@@ -642,7 +642,7 @@
       "metadata": {
         "category": "HMB_GP_Production",
         "description": "Browses project images and groups them by Shot.\nOutputs ordered assets for prompts or generators.",
-        "display_name": "HMBImageAssetLibrary",
+        "display_name": "HMB ImageAsset Library",
         "width": 1400,
         "height": 1200,
         "default_width": 1400,
@@ -667,6 +667,17 @@
           "min_height": 560,
           "resizable": true
         }
+      }
+    },
+    {
+      "class_name": "HMBImageBash",
+      "file_path": "HMBImageBash.py",
+      "metadata": {
+        "category": "HMB_GP_Production",
+        "display_name": "HMBImageBash",
+        "description": "ImageAsset Library Image Bash workspace. Preserves the native Image Bash editor and verifies exact Apply PNG output, durable scene restore, and Standard compatibility.",
+        "width": 700,
+        "height": 720
       }
     },
     {
@@ -741,7 +752,7 @@
       "metadata": {
         "category": "HMB_GP_Production",
         "description": "Builds prompts from manual text and media settings.\nWorks alone or with optional Asset and Picker.",
-        "display_name": "HMBPromptLibrary",
+        "display_name": "HMBPrompt",
         "width": 1800,
         "height": 1350,
         "default_width": 1800,
@@ -772,7 +783,7 @@
       "metadata": {
         "category": "HMB_GP_Production",
         "description": "Captures Maya .mb/.ma and Blender .blend scene snapshots and video variants in one Shot-bound picker.\nOrders videos for prompts or generators. Expanded mode includes independent concatenation and spatial crop tools.",
-        "display_name": "HMBVideoPickerLibrary",
+        "display_name": "HMB VideoPicker",
         "width": 1400,
         "height": 360,
         "default_width": 1400,
@@ -801,6 +812,11 @@
     }
   ],
   "widgets": [
+    {
+      "name": "HMBImageBashWidget",
+      "path": "widgets/HMBImageBashWidget.js",
+      "description": "HMBImageBash header with verified same-flow image workspace remote binding."
+    },
     {
       "name": "HMBColorLUTLibraryWidget",
       "path": "widgets/HMBColorLUTLibraryWidget.js",

@@ -79,10 +79,12 @@ FINISH_LOOK_SHOT_SNAPSHOT_VERSION = 2
 MAX_SHOTS = 5
 FINISH_LOOK_NODE_WIDTH = 980
 FINISH_LOOK_SHOT_TAB_HEIGHT = 51
-FINISH_LOOK_NODE_HEIGHT = 1040 + FINISH_LOOK_SHOT_TAB_HEIGHT
+# Beauty controls, five fixed Shot tabs and the status footer fit without the
+# old empty tail. Native Flow rows/frame add 76 px around the visible widget.
+FINISH_LOOK_WIDGET_HEIGHT = 737 + FINISH_LOOK_SHOT_TAB_HEIGHT
+FINISH_LOOK_NODE_HEIGHT = FINISH_LOOK_WIDGET_HEIGHT + 76
 FINISH_LOOK_NODE_MIN_WIDTH = 700
 FINISH_LOOK_NODE_MIN_HEIGHT = 620
-FINISH_LOOK_WIDGET_HEIGHT = 940 + FINISH_LOOK_SHOT_TAB_HEIGHT
 FINISH_LOOK_WIDGET_MIN_HEIGHT = 180
 
 
@@ -2415,6 +2417,18 @@ class HMBFinishLookLibrary(DataNode):
                 self._last_valid_state = copy.deepcopy(normalized["finish_look"])
                 self._hmb_finish_active_key = key
                 self._hmb_finish_capture()
+        if saved and name in {WIDGET_PARAMETER_NAME, SHOT_STORE_PARAMETER_NAME}:
+            # Generated workflow builds replay properties with initial_setup
+            # and do not call after_deserialize. Publish only the durable local
+            # subscription's hydration signal; the live ImageAsset publisher
+            # still has to validate and supply the remote catalog. Without this
+            # signal the flow-wide authority barrier waits on Finish forever.
+            try:
+                from _hmb_shot_routing import schedule_post_hydration_reconcile
+
+                schedule_post_hydration_reconcile(self)
+            except Exception:
+                pass
         return result
 
     def after_deserialize(self, *args: Any, **kwargs: Any) -> Any:

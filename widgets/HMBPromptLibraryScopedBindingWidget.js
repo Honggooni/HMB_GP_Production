@@ -2958,10 +2958,10 @@ export function hmbSwitchPromptShot(state, shotUuid) {
   const selected = hmbPromptVerifiedShotCatalog(state).find((item) => item.shot_uuid === clean(shotUuid));
   if (!selected) return false;
   if (state.multi_shot_enabled !== true) { state.shot = selected; return true; }
-  hmbStorePromptShotDocument(state);
   const currentKey = hmbPromptDocumentKey(state.shot);
   const key = hmbPromptDocumentKey(selected);
   if (key === currentKey) { state.shot = selected; return true; }
+  hmbStorePromptShotDocument(state);
   const documents = state.shot_documents;
   const prepared = hmbPreparedPromptDocuments(state);
   const cached = prepared.get(key);
@@ -3001,12 +3001,13 @@ function hmbClearImmediateStateCommit(container) {
   const timer = container.__hmbPromptLibraryCommitTimer;
   try { if (timer) clearTimeout(timer); } catch (_e) {}
   try { container.__hmbPromptLibraryCommitTimer = null; } catch (_e) {}
+  try { delete container.__hmbPromptLibraryCommitIsReconciliation; } catch (_e) {}
   const pending = Boolean(container.__hmbPromptLibraryCommitPending);
   try { container.__hmbPromptLibraryCommitPending = false; } catch (_e) {}
   return pending;
 }
 
-export function hmbScheduleImmediateStateCommit(container, props, state) {
+export function hmbScheduleImmediateStateCommit(container, props, state, publicationOptions = null) {
   if (!container) return;
   delete container.__hmbPromptNavigationOnlyState;
   // Any newly edited draft supersedes an exact-payload transport retry that
@@ -3014,11 +3015,12 @@ export function hmbScheduleImmediateStateCommit(container, props, state) {
   hmbInvalidatePromptPublication(container);
   hmbCaptureTextEditingState(container);
   const active = typeof document !== "undefined" ? document.activeElement : null;
-  if (active && container.contains?.(active)) {
+  if (!publicationOptions?.reconcileOnly && active && container.contains?.(active)) {
     hmbRememberPromptDirtyTextControl(container, active, state);
   }
   hmbClearImmediateStateCommit(container);
   container.__hmbPromptLibraryCommitPending = true;
+  container.__hmbPromptLibraryCommitIsReconciliation = publicationOptions?.reconcileOnly === true;
   const timer = setTimeout(() => {
     if (container.__hmbPromptLibraryCommitTimer !== timer) return;
     container.__hmbPromptLibraryCommitTimer = null;
@@ -3026,14 +3028,14 @@ export function hmbScheduleImmediateStateCommit(container, props, state) {
       // A composing IME value is not final. Keep one trailing commit armed;
       // ordinary focus is intentionally not a blocker because users can run a
       // downstream node without blurring the current Prompt field first.
-      hmbScheduleImmediateStateCommit(container, props, state);
+      hmbScheduleImmediateStateCommit(container, props, state, publicationOptions);
       return;
     }
     container.__hmbPromptLibraryCommitPending = false;
     hmbCaptureUiBeforeStateEmit(container, state);
     // Register the exact local value before calling the host. A synchronous
     // props echo can then be consumed without replacing the focused control.
-    hmbEmitLocalPromptState(container, props, state);
+    hmbEmitLocalPromptState(container, props, state, null, publicationOptions);
   }, 260);
   container.__hmbPromptLibraryCommitTimer = timer;
 }
@@ -3186,7 +3188,7 @@ export function hmbShouldDeferPromptSourceProps(container, nextProps, state) {
   if (!container || !nextProps) return false;
   if (Boolean(nextProps.disabled) !== Boolean(state?.disabled)) return false;
   if (
-    container.__hmbPromptLibraryCommitPending
+    container.__hmbPromptLibraryCommitPending && !container.__hmbPromptLibraryCommitIsReconciliation
     || container.__hmbPromptLibraryCompositionActive
     || container.__hmbPromptLibraryDirtyText instanceof Map
     || (
@@ -3769,7 +3771,9 @@ const HMB_SOURCE_SCROLL_KEYS = ["imageSources", "videoSources", "managerBody"];
 function hmbScrollMemory(container) {
   if (!container) return {};
   if (!container.__hmbPromptLibraryScrollMemory || typeof container.__hmbPromptLibraryScrollMemory !== "object") {
-    container.__hmbPromptLibraryScrollMemory = { imageSources: 0, videoSources: 0 };
+    // Missing values may still be restored from an older host dataset. A saved
+    // zero is distinct: that page was explicitly left at its top position.
+    container.__hmbPromptLibraryScrollMemory = {};
   }
   return container.__hmbPromptLibraryScrollMemory;
 }
@@ -3793,13 +3797,13 @@ function hmbStoreSourceScroll(container, key, value) {
   const top = Math.max(0, Math.round(Number(value) || 0));
   const memory = hmbScrollMemory(container);
   memory[key] = top;
-  try { container.dataset[hmbScrollDatasetKey(key)] = String(top); } catch (_e) {}
+  try { const name=hmbScrollDatasetKey(key),next=String(top);if(container.dataset[name]!==next)container.dataset[name]=next; } catch (_e) {}
 }
 
 function hmbReadStoredSourceScroll(container, key) {
   const memory = hmbScrollMemory(container);
   const own = Number(memory[key]);
-  if (Number.isFinite(own) && own > 0) return own;
+  if (Number.isFinite(own) && own >= 0) return own;
   try {
     const data = Number(container && container.dataset ? container.dataset[hmbScrollDatasetKey(key)] : 0);
     if (Number.isFinite(data) && data > 0) return data;
@@ -3818,17 +3822,22 @@ function hmbRestoreSourceScrollNow(container) {
   HMB_SOURCE_SCROLL_KEYS.forEach((key) => {
     const box = hmbSourceScrollbox(container, key);
     if (!box) return;
+    const requested = hmbReadStoredSourceScroll(container, key);
+    const current = box.scrollTop || 0;
+    // Most page changes retain the existing scroll position. Avoid measuring
+    // every hidden/prepared source group when no restoration is necessary.
+    if (Math.abs(current - requested) <= 1) return;
     const maxTop = Math.max(0, (box.scrollHeight || 0) - (box.clientHeight || 0));
-    const target = Math.max(0, Math.min(maxTop, hmbReadStoredSourceScroll(container, key)));
-    if (Math.abs((box.scrollTop || 0) - target) > 1) {
+    const target = Math.max(0, Math.min(maxTop, requested));
+    if (Math.abs(current - target) > 1) {
       try { box.scrollTop = target; } catch (_e) {}
     }
   });
 }
 
-function hmbRestoreSourceScroll(container) {
+function hmbRestoreSourceScroll(container, deferInitial = false) {
   if (hmbIsGroupResizeDragging(container)) return;
-  hmbRestoreSourceScrollNow(container);
+  if (!deferInitial) hmbRestoreSourceScrollNow(container);
   hmbPromptLifecycleFrame(container, () => {
     if (hmbIsGroupResizeDragging(container)) return;
     hmbRestoreSourceScrollNow(container);
@@ -3869,11 +3878,12 @@ export function hmbInstallPromptInteractionIsolation(container, listeners, insta
   container.__hmbPromptIsolatedControls = isolated;
   const stopPointerPropagation = (event) => event.stopPropagation();
   const isolatePointer = (element) => {
-    if (!element || isolated.has(element)) return;
+    if (!element || isolated.has(element) || hmbPromptNativeHeaderTarget(element)) return;
     isolated.add(element);
     // A concrete control keeps its native pointer and wheel behavior. The
     // surrounding open-hand background remains free for Griptape pan/zoom.
-    element.classList?.add("nodrag", "nopan", "nowheel");
+    const missing = ["nodrag", "nopan", "nowheel"].filter(name => !element.classList?.contains?.(name));
+    if (missing.length) element.classList?.add(...missing);
     ["pointerdown", "mousedown", "click", "dblclick"].forEach((eventName) => {
       element.addEventListener?.(eventName, stopPointerPropagation);
       listeners.push([element, eventName, stopPointerPropagation]);
@@ -3889,10 +3899,14 @@ export function hmbInstallPromptInteractionIsolation(container, listeners, insta
   });
   if (!installGlobal) return;
   const stopNodeDeleteShortcut = (event) => {
+    if (hmbPromptNativeHeaderTarget(event.target)) return;
     if (["Backspace", "Delete"].includes(event?.key)) event.stopPropagation?.();
   };
   const stopSelectedNodeDeleteShortcut = (event) => hmbGuardSelectedNodeKeyboardDelete(container, event);
   const stopInteriorNodeSelection = (event) => {
+    if (hmbPromptNativeHeaderTarget(event.target)
+      || container.__hmbPromptNativeHeaderActive && event.target?.closest?.(".topbar")
+        && !event.target?.closest?.("button,input,select,textarea,label,a")) return;
     if (Number(event?.button) !== 1) event.stopPropagation?.();
   };
   container.addEventListener?.("keydown", stopNodeDeleteShortcut);
@@ -4410,6 +4424,15 @@ function hmbNextPromptUiEditRevision(container, state) {
   return Math.min(MAX_SOURCE_SYNC_REVISION, Math.max(current, latestLocal) + 1);
 }
 
+function hmbPromptHasPendingAuthoredEdit(container) {
+  return Boolean(container && (
+    container.__hmbPromptLibraryCommitPending
+    || container.__hmbPromptLibraryCompositionActive
+    || container.__hmbPromptLibraryDirtyText instanceof Map && container.__hmbPromptLibraryDirtyText.size
+    || container.__hmbPromptLibraryInteractionCommit && !container.__hmbPromptLibraryInteractionCommit.cancelled
+  ));
+}
+
 const HMB_PROMPT_IMAGE_UI_FIELDS = Object.freeze([
   "owner",
   "look_custom_instruction",
@@ -4639,6 +4662,9 @@ function hmbPromptRevisionDisposition(container, nextProps, incomingState) {
     ? Math.sign(incomingUiRevision - latestUiRevision)
     : 0;
   if (sourceDirection > 0) {
+    // Merge the UI-owned Range/text fields even at equal UI clocks. Whether
+    // that merge needs transport is decided from its canonical result below;
+    // an unchanged ACK is never another authored edit.
     return hasUiRevision && uiDirection <= 0 ? "merge" : "authoritative";
   }
   if (sourceDirection < 0) return uiDirection > 0 ? "merge" : "stale";
@@ -4859,7 +4885,7 @@ function hmbPublishPromptStateValue(
   return publicationToken;
 }
 
-export function hmbEmitLocalPromptState(container, props, state, onFinalFailure = null) {
+export function hmbEmitLocalPromptState(container, props, state, onFinalFailure = null, publicationOptions = null) {
   // A direct publication supersedes any paint-first interaction batch. The
   // live state object already includes those edits, so a second delayed echo
   // would only add latency and a possible stale repaint.
@@ -4880,7 +4906,12 @@ export function hmbEmitLocalPromptState(container, props, state, onFinalFailure 
     currentSourceSyncRevision: container?.__hmbPromptCurrentSourceSyncRevision,
     currentDisabled: container?.__hmbPromptCurrentDisabled,
   };
-  const nextUiEditRevision = hmbNextPromptUiEditRevision(container, state);
+  const reconcileOnly = publicationOptions?.reconcileOnly === true;
+  const nextUiEditRevision = reconcileOnly ? Math.max(
+    normalizeUiEditRevision(state?.[UI_EDIT_REVISION_KEY]),
+    normalizeUiEditRevision(container?.__hmbPromptCurrentUiEditRevision),
+    normalizeUiEditRevision(container?.__hmbPromptLatestLocalUiEditRevision),
+  ) : hmbNextPromptUiEditRevision(container, state);
   if (state && typeof state === "object") {
     state[UI_EDIT_REVISION_KEY] = nextUiEditRevision;
   }
@@ -4892,6 +4923,18 @@ export function hmbEmitLocalPromptState(container, props, state, onFinalFailure 
   hmbStorePromptShotDocument(normalized);
   if (state?.multi_shot_enabled) state.shot_documents = normalized.shot_documents;
   const serialized = JSON.stringify(normalized);
+  let reconciliations = null;
+  if (reconcileOnly && container) {
+    reconciliations = container.__hmbPromptReconciledPublications;
+    if (!(reconciliations instanceof Set)) container.__hmbPromptReconciledPublications = reconciliations = new Set();
+    // Exact retries remain owned by hmbPublishPromptStateValue. A second
+    // retained-mode ACK must not independently submit the same reconciliation.
+    if (reconciliations.has(serialized)) return true;
+    reconciliations.add(serialized);
+    // Older clocks are already rejected by the durable revision guards; only
+    // the two in-flight/recent exact snapshots need a strong string reference.
+    while (reconciliations.size > 2) reconciliations.delete(reconciliations.values().next().value);
+  }
   if (container) {
     if (navigationOnly) container.__hmbPromptNavigationEcho = {
       value: serialized, state, uiRevision: nextUiEditRevision,
@@ -4911,6 +4954,7 @@ export function hmbEmitLocalPromptState(container, props, state, onFinalFailure 
     true,
   );
   const restoreRejectedRevision = (error, publicationToken) => {
+    reconciliations?.delete(serialized);
     // A transport rejection is not host authority. Re-admit the exact
     // pre-edit backend revision so its next retained-mode props update can
     // repaint the optimistic control instead of being discarded as stale.
@@ -5020,6 +5064,7 @@ export function hmbConsumePendingPromptStateEcho(container, nextProps, currentSt
   if (!container || !nextProps) return false;
   container.__hmbPromptLastConsumedEchoWasStale = false;
   try { delete container.__hmbPromptPendingRevisionMerge; } catch (_error) {}
+  try { delete container.__hmbPromptPendingRevisionMergeNeedsPublication; } catch (_error) {}
   let incoming = "";
   let incomingState = null;
   try {
@@ -5081,6 +5126,7 @@ export function hmbConsumePendingPromptStateEcho(container, nextProps, currentSt
       sourceState,
       uiState,
     );
+    container.__hmbPromptPendingRevisionMergeNeedsPublication = JSON.stringify(container.__hmbPromptPendingRevisionMerge) !== incoming;
     hmbClearPendingPromptStateEchoes(container);
     return false;
   }
@@ -6292,8 +6338,8 @@ function renderPromptShotRows(state, editorMarkup = "") {
   if (!state.multi_shot_enabled) return "";
   const catalog = hmbPromptVerifiedShotCatalog(state);
   const selected = normalizeShotSelection(state.shot);
-  if (!catalog.length) return `<div class="prompt-shot-list"><div class="prompt-shot-empty">${escapeHtml(uiLanguage(state) === "ko" ? "ImageAsset 프로젝트의 샷을 연결하세요." : "Connect an ImageAsset project Shot.")}</div></div>`;
-  return `<div class="prompt-shot-list" role="tablist" aria-label="Prompt Shots">${catalog.map((shot) => {
+  if (!catalog.length) return `<div class="prompt-shot-list nodrag"><div class="prompt-shot-empty">${escapeHtml(uiLanguage(state) === "ko" ? "ImageAsset 프로젝트의 샷을 연결하세요." : "Connect an ImageAsset project Shot.")}</div></div>`;
+  return `<div class="prompt-shot-list nodrag" role="tablist" aria-label="Prompt Shots">${catalog.map((shot) => {
     const active = shot.shot_uuid === selected.shot_uuid;
     const expanded = active;
     return `<section class="prompt-shot-section" data-shot-uuid="${escapeHtml(shot.shot_uuid)}"><button type="button" role="tab" title="${escapeHtml(hmbPromptShotOptionLabel(shot))}" class="prompt-shot-row nodrag nopan nowheel${active ? " active" : ""}" data-prompt-shot="${escapeHtml(shot.shot_uuid)}" data-prompt-shot-number="${shot.number}" aria-expanded="${expanded}" aria-selected="${active}"${state.disabled ? " disabled" : ""}><span class="prompt-shot-number">${String(shot.number).padStart(2, "0")}</span><b>${escapeHtml(shot.name)}</b></button>${expanded && editorMarkup ? `<div role="tabpanel" class="prompt-shot-content" data-shot-editor="${escapeHtml(shot.shot_uuid)}">${editorMarkup}</div>` : ""}</section>`;
@@ -6310,7 +6356,7 @@ function render(state, includeStyle = true) {
   const hImageText = groupHeightStyle(state, "imageText");
   const hVideoSources = groupHeightStyle(state, "videoSources");
   const hVideoText = groupHeightStyle(state, "videoText");
-  const editorMarkup = `<div class="layout"${state.manual_rebind?.required ? ' inert aria-disabled="true"' : ""}>
+  const editorMarkup = `<div class="layout nodrag"${state.manual_rebind?.required ? ' inert aria-disabled="true"' : ""}>
       <main class="center">
         <section class="group-card image-card" data-group-id="imageSources" ${hImageSources}><h3>${escapeHtml(uiText(state, "image_source_binding", "IMAGE SOURCE BINDING"))} <b>${state.status.active_images} / ${state.status.max_images}</b></h3><div class="group-body source-scrollbox" data-scroll-id="imageSources"><div class="source-header image-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "target", "TARGET"))}</span><span class="image-video-surface-columns"><span>${escapeHtml(uiText(state, "video_color_pick", "VIDEO / COLOR PICK"))}</span><span class="image-surface-heading">${escapeHtml(uiText(state, "surface_2d", "2DSurface"))}</span></span><span></span></div>${images.map((item, idx) => renderImageRow(item, idx, images, state)).join("")}${renderImageAddRow(images, state)}</div><div class="group-resize-bar nodrag" data-resize-group="imageSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card imgtext" data-group-id="imageText" ${hImageText}><h3>${escapeHtml(uiText(state, "image_text_context", "SHOT TEXT DIRECTION / EXACT LITERALS"))} <b>${escapeHtml(uiText(state, "scene_level_notes", "scene-level notes"))}</b></h3><div class="group-body"><div class="text-grid">${groupBFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="imageText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
@@ -6319,7 +6365,7 @@ function render(state, includeStyle = true) {
       </main>
     </div>`;
   return `${includeStyle ? `<style>
-      .hmb-dashboard :is(button,input,select,textarea){font-family:inherit}
+      .hmb-dashboard :is(button,input,select,textarea):not([data-hmb-native-identity] *):not([data-hmb-native-actions] *){font-family:inherit}
       .image-video-surface-columns{display:grid;grid-template-columns:minmax(0,1fr) 4.5rem;gap:8px;align-items:start;min-width:0}
       .image-surface-heading{text-align:center;white-space:nowrap}
       .image-surface-control{display:flex;align-items:center;justify-content:center;min-height:30px;cursor:pointer}
@@ -6431,9 +6477,15 @@ function render(state, includeStyle = true) {
     .prompt-shot-row.active .prompt-shot-number{border-color:var(--row-accent);background:var(--row-accent);color:#07111e;box-shadow:0 0 10px rgba(var(--row-rgb),.24)}
     .prompt-shot-row:focus-visible{outline:2px solid var(--row-accent);outline-offset:2px}.prompt-shot-row:active:not(:disabled){filter:brightness(1.15)}
     @media (prefers-reduced-motion: reduce){.hmb-dashboard,.hmb-dashboard *,.hmb-dashboard *::before,.hmb-dashboard *::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
+    .hmb-dashboard .prompt-native-identity,.hmb-dashboard .prompt-native-actions{display:none;min-width:0;--node-header-text:var(--hmb-text)}
+    .hmb-dashboard[data-hmb-native-header="active"] .topbar>.title{display:none}
+    .hmb-dashboard[data-hmb-native-header="active"] .prompt-native-identity{display:flex;align-items:center;flex:1;min-width:0}
+    .hmb-dashboard[data-hmb-native-header="active"] .prompt-native-actions{display:flex;align-items:center;flex:0 0 auto}
+    .hmb-dashboard .prompt-native-identity>div{min-width:0;max-width:100%}.hmb-dashboard .prompt-native-actions svg{flex-shrink:0}
+    .hmb-dashboard[data-hmb-native-header="active"] .topbar{cursor:grab}.hmb-dashboard[data-hmb-native-header="active"] .topbar:active{cursor:grabbing}
   </style>` : ""}<div class="hmb-dashboard-clip nodrag"><div class="hmb-dashboard ${state.disabled ? "disabled" : ""}" data-shot-number="${paletteShotNumber}" data-prompt-manager="${Boolean(state.multi_shot_enabled)}">
-    <div class="topbar"><div class="title"><span class="title-mark" aria-hidden="true">PL</span><span>HMBPromptLibrary</span></div><div class="prompt-publish-status" data-prompt-publication-status role="status" aria-live="polite" aria-atomic="true"></div><div class="topbar-controls">${renderShotSelector(state)}<button type="button" class="language-button" data-language-toggle aria-label="Language">${uiLanguage(state) === "ko" ? "한국어" : "EN"}</button></div></div>
-    ${state.manual_rebind?.required ? `<div class="warning" data-manual-rebind-notice role="status" style="flex:0 0 auto;margin:6px 8px 0">${escapeHtml(state.manual_rebind.message || "기존 입력과 결과를 보존했습니다. 상단 샷 선택에서 연결할 샷을 직접 선택하세요.")}</div>` : ""}
+    <div class="topbar group"><div class="title"><span class="title-mark" aria-hidden="true">PL</span><span>HMBPrompt</span></div><div class="prompt-native-identity" data-hmb-native-identity></div><div class="prompt-native-actions nodrag" data-hmb-native-actions></div><div class="prompt-publish-status" data-prompt-publication-status role="status" aria-live="polite" aria-atomic="true"></div><div class="topbar-controls nodrag">${renderShotSelector(state)}<button type="button" class="language-button" data-language-toggle aria-label="Language">${uiLanguage(state) === "ko" ? "한국어" : "EN"}</button></div></div>
+    ${state.manual_rebind?.required ? `<div class="warning nodrag" data-manual-rebind-notice role="status" style="flex:0 0 auto;margin:6px 8px 0">${escapeHtml(state.manual_rebind.message || "기존 입력과 결과를 보존했습니다. 상단 샷 선택에서 연결할 샷을 직접 선택하세요.")}</div>` : ""}
     ${state.multi_shot_enabled ? renderPromptShotRows(state, editorMarkup) : editorMarkup}
   </div></div>`;
 }
@@ -6495,6 +6547,7 @@ function hmbPromptDeleteEditingTarget(event) {
 
 export function hmbGuardSelectedNodeKeyboardDelete(container, event) {
   if (!["Backspace", "Delete"].includes(event?.key)) return false;
+  if (container?.ownerDocument?.documentElement?.getAttribute?.("data-hmb-native-deletion-guard") === "engine-preflight") return false;
   if (event?.target?.closest?.("[data-hmb-node-delete-protected='true']")) return false;
   if (hmbPromptDeleteEditingTarget(event)) return false;
   if (!hmbPromptNodeIsSelected(hmbFindSafeReactFlowNode(container))) return false;
@@ -6625,7 +6678,7 @@ function hmbApplyDashboardHostSizing(container, state, measuredHosts = null) {
       assign(ancestor,{height:`${ancestorHeight}px`,minHeight:"0",maxHeight:`${ancestorHeight}px`,overflow:"hidden",boxSizing:"border-box"});
     }
     assign(container, {width:"100%",minWidth:"0",maxWidth:"100%",height:`${available}px`,minHeight:"0",maxHeight:`${available}px`,overflow:"hidden",boxSizing:"border-box"});
-    container.classList?.add("nodrag");
+    container.classList?.toggle("nodrag", container.__hmbPromptNativeHeaderActive !== true);
     container.classList?.remove("nowheel");
     for (const element of [container.querySelector?.(".hmb-dashboard-clip"),container.querySelector?.(".hmb-dashboard")]) {
       assign(element,{width:"100%",height:"100%",minWidth:"0",minHeight:"0",maxWidth:"100%",maxHeight:"100%",overflow:"hidden",boxSizing:"border-box"});
@@ -6647,7 +6700,7 @@ function hmbApplyDashboardHostSizing(container, state, measuredHosts = null) {
     container.style.minWidth = "0";
     container.style.maxWidth = "none";
     applyMinimum(container);
-    container.classList.add("nodrag");
+    container.classList.toggle("nodrag", container.__hmbPromptNativeHeaderActive !== true);
     container.classList.remove("nowheel");
     hmbLocalHostAncestors(container).forEach(applyMinimum);
     const clip = container.querySelector(".hmb-dashboard-clip");
@@ -7093,7 +7146,10 @@ function hmbFitGroupHeightsToCenter(container, state, measuredHosts = null) {
   if (!container || !state || hmbIsGroupResizeDragging(container)) return;
   state.ui = normalizeUi(state.ui);
   const center = container.querySelector ? container.querySelector(".center") : null;
-  if (center && center.style) center.style.overflowY = hmbPromptUsesFluidLayout(container,state) ? "auto" : "hidden";
+  if (center && center.style) {
+    const overflow = hmbPromptUsesFluidLayout(container,state) ? "auto" : "hidden";
+    if (center.style.overflowY !== overflow) center.style.overflowY = overflow;
+  }
   HMB_GROUP_KEYS.forEach((key) => {
     const minHeight = HMB_GROUP_MIN_HEIGHTS[key] || 120;
     const stored = Number(state.ui.group_heights[key]);
@@ -7525,7 +7581,7 @@ export function hmbUpdateImageDragIndicators(container, row, sourceIndex, after)
 function hmbSyncSourceRowActivation(row) {
   if (!row || row.classList.contains("image-add-row") || row.classList.contains("video-add-row")) return;
   const nameInput = row.querySelector('.source-label-input[data-field="label"]');
-  row.classList.remove("name-missing");
+  if (row.classList.contains("name-missing")) row.classList.remove("name-missing");
   row.querySelectorAll('.source-select, .source-target-input, .custom-field-input, .custom-inline-input, .source-note-input, .remove-color-pick, .add-color-pick, .frame-range-toggle, .frame-domain-number').forEach((control) => {
     if (control === nameInput) return;
     if (!control.hasAttribute("data-hmb-base-disabled")) control.setAttribute("data-hmb-base-disabled", control.disabled ? "1" : "0");
@@ -7538,17 +7594,28 @@ function hmbSyncAllSourceRowActivation(container) {
   container.querySelectorAll('.source-row[data-index]').forEach(hmbSyncSourceRowActivation);
 }
 
-function hmbCopyPromptElementAttributes(target, source) {
+function hmbCopyPromptElementAttributes(target, source, retainRuntimeSizing = false) {
   if (!target || !source) return;
   const nextNames = new Set(Array.from(source.attributes || []).map((attribute) => attribute.name));
+  const isolatedControl = target.matches?.("input,textarea,select,button,label,summary,[role='button'],[contenteditable='true'],[data-resize-group],[data-resize-textarea]");
+  const runtimeClasses = isolatedControl ? ["nodrag", "nopan", "nowheel"].filter(name => target.classList?.contains(name)) : [];
+  const baseDisabled = target.hasAttribute?.("data-hmb-base-disabled") && !nextNames.has("data-hmb-base-disabled")
+    ? (source.disabled ? "1" : "0") : null;
   Array.from(target.attributes || []).forEach((attribute) => {
-    if (!nextNames.has(attribute.name)) target.removeAttribute(attribute.name);
+    if (!nextNames.has(attribute.name)
+      && !(retainRuntimeSizing && attribute.name === "style")
+      && !(runtimeClasses.length && attribute.name === "class")
+      && !(baseDisabled !== null && attribute.name === "data-hmb-base-disabled")) target.removeAttribute(attribute.name);
   });
   Array.from(source.attributes || []).forEach((attribute) => {
-    if (target.getAttribute(attribute.name) !== attribute.value) {
-      target.setAttribute(attribute.name, attribute.value);
+    const value = attribute.name === "class" && runtimeClasses.length
+      ? Array.from(new Set([...attribute.value.split(/\s+/).filter(Boolean), ...runtimeClasses])).join(" ") : attribute.value;
+    if (target.getAttribute(attribute.name) !== value) {
+      target.setAttribute(attribute.name, value);
     }
   });
+  if (runtimeClasses.length && !nextNames.has("class") && target.getAttribute("class") !== runtimeClasses.join(" ")) target.setAttribute("class", runtimeClasses.join(" "));
+  if (baseDisabled !== null && target.getAttribute("data-hmb-base-disabled") !== baseDisabled) target.setAttribute("data-hmb-base-disabled", baseDisabled);
 }
 
 // Retain only the active control path while adopting every authoritative
@@ -7802,6 +7869,37 @@ function hmbPatchPromptShotSections(currentList, nextList, keepExistingEditor = 
 
 let HMB_PROMPT_SCOPED_STYLE_MARKUP = "";
 
+function hmbPromptNativeHeaderTarget(target) {
+  return Boolean(target?.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]"));
+}
+
+function hmbSyncPromptNativeHeaderSurface(container) {
+  const active = container.__hmbPromptNativeHeaderActive === true;
+  const root = container.querySelector?.(".hmb-dashboard");
+  const mode = active ? "active" : "fallback";
+  if (root && root.getAttribute("data-hmb-native-header") !== mode) root.setAttribute("data-hmb-native-header", mode);
+  container.classList?.toggle("nodrag", !active);
+  container.querySelector?.(".hmb-dashboard-clip")?.classList?.toggle("nodrag", !active);
+}
+
+function hmbAnnouncePromptNativeHeader(container, phase) {
+  const documentRef = container.ownerDocument || (typeof document !== "undefined" ? document : null);
+  const Event = documentRef?.defaultView?.CustomEvent || (typeof CustomEvent !== "undefined" ? CustomEvent : null);
+  if (Event) documentRef?.dispatchEvent?.(new Event(`hmb-color-lut-header-${phase}`, {detail:{container}}));
+}
+
+function hmbReplacePromptDashboardMarkup(container, markup) {
+  // Even the structural fallback retains the exact native portal targets.
+  // Normal page/authority updates use the retained patch below instead.
+  const slots = ["[data-hmb-native-identity]", "[data-hmb-native-actions]"].map(selector => [selector, container.querySelector?.(selector)]);
+  container.innerHTML = markup;
+  for (const [selector, slot] of slots) {
+    const placeholder = container.querySelector?.(selector);
+    if (slot && placeholder) placeholder.parentNode?.replaceChild(slot, placeholder);
+  }
+  hmbSyncPromptNativeHeaderSurface(container);
+}
+
 function hmbPromptFullDashboardMarkup(state) {
   if (HMB_PROMPT_SCOPED_STYLE_MARKUP) {
     return HMB_PROMPT_SCOPED_STYLE_MARKUP + render(state, false);
@@ -7838,20 +7936,28 @@ export function hmbPatchPromptDashboard(container, markup) {
   const nextRoot = nextClip?.querySelector?.(".hmb-dashboard")
     || staging.querySelector?.(".hmb-dashboard");
   if (!nextRoot) return false;
-  if (currentClip && nextClip) hmbCopyPromptElementAttributes(currentClip, nextClip);
-  hmbCopyPromptElementAttributes(currentRoot, nextRoot);
+  // The native header owns this presentation flag, not a saved Prompt page.
+  const nativeMode = currentRoot.getAttribute("data-hmb-native-header");
+  if (nativeMode) nextRoot.setAttribute("data-hmb-native-header", nativeMode);
+  if (container.__hmbPromptNativeHeaderActive === true) nextClip?.classList?.remove("nodrag");
+  if (currentClip && nextClip) hmbCopyPromptElementAttributes(currentClip, nextClip, true);
+  hmbCopyPromptElementAttributes(currentRoot, nextRoot, true);
 
   const currentTopbar = currentRoot.querySelector?.(".topbar");
   const nextTopbar = nextRoot.querySelector?.(".topbar");
   if (currentTopbar && nextTopbar && currentTopbar.innerHTML !== nextTopbar.innerHTML) {
     const active = currentTopbar.ownerDocument?.activeElement;
-    if (
-      active?.matches?.("select")
-      && currentTopbar.contains?.(active)
-      && hmbPatchPromptElementTree(currentTopbar, nextTopbar, active)
-    ) {
-      // The Shot dropdown remains open across an unrelated topbar repaint.
-    } else currentTopbar.innerHTML = nextTopbar.innerHTML;
+    // Empty staged slots must never reconcile the native React subtree.
+    // Only Prompt-owned siblings are patched; the title and Lock/Reset/Run
+    // retain their original DOM, callbacks, focus and editable title state.
+    for (const selector of [".title", ".prompt-publish-status", ".topbar-controls"]) {
+      const currentPart = currentTopbar.querySelector(selector), nextPart = nextTopbar.querySelector(selector);
+      if (!currentPart || !nextPart || currentPart.innerHTML === nextPart.innerHTML) continue;
+      if (active?.matches?.("select") && currentPart.contains?.(active)
+        && hmbPatchPromptElementTree(currentPart, nextPart, active)) continue;
+      hmbCopyPromptElementAttributes(currentPart, nextPart);
+      currentPart.innerHTML = nextPart.innerHTML;
+    }
   }
   // Capture the staged sections before Shot reconciliation retains the live
   // editor and detaches its staged counterpart. Otherwise the subsequent query
@@ -7985,7 +8091,16 @@ function hmbNativeUiImplementation(container, props) {
   };
   container.__hmbPromptLibraryLifecycle = lifecycle;
   container.__hmbPromptLibraryScheduleFrame = scheduleLifecycleFrame;
+  const hadContainerNoDrag = container.classList?.contains("nodrag");
   container.setAttribute?.("data-hmb-node-delete-protected", "true");
+  container.setAttribute?.("data-hmb-color-lut-widget", "");
+  container.setAttribute?.("data-hmb-native-node-type", "HMBPromptLibrary");
+  const nativeHeaderState = (event) => {
+    if (!lifecycleCurrent() || event.target !== container) return;
+    container.__hmbPromptNativeHeaderActive = event.detail?.active === true;
+    hmbSyncPromptNativeHeaderSurface(container);
+  };
+  container.addEventListener?.("hmb-color-lut-header-state", nativeHeaderState);
   let state = hmbMergeStoredGroupHeights(container, parseValue(props.value));
   state.disabled = Boolean(props.disabled);
   hmbRememberPromptRevisionState(container, state, state.disabled, false);
@@ -8061,7 +8176,10 @@ function hmbNativeUiImplementation(container, props) {
     container.querySelector('.hmb-dashboard')?.setAttribute('data-shot-number', String(hmbPromptPaletteShotNumber(state)));
     const languageButton = container.querySelector('[data-language-toggle]');
     if (languageButton) languageButton.textContent = uiLanguage(state) === 'ko' ? '한국어' : 'EN';
-    hmbRestoreSourceScroll(container);
+    // A top-position page needs no synchronous layout read immediately after
+    // reattaching its controls. Keep nonzero restoration synchronous so a rapid
+    // next selection cannot capture a not-yet-restored position.
+    hmbRestoreSourceScroll(container, HMB_SOURCE_SCROLL_KEYS.every((key) => hmbReadStoredSourceScroll(container, key) === 0));
     hmbRestoreTextEditingStateDeferred(container);
     try { container.__hmbPromptLastPaintedValue = JSON.stringify(state); } catch (_e) {}
     return true;
@@ -8121,10 +8239,10 @@ function hmbNativeUiImplementation(container, props) {
     if (dashboardMounted) {
       const dynamicMarkup = render(state, false);
       if (!hmbPatchPromptDashboard(container, dynamicMarkup)) {
-        container.innerHTML = hmbPromptFullDashboardMarkup(state);
+        hmbReplacePromptDashboardMarkup(container, hmbPromptFullDashboardMarkup(state));
       }
     } else {
-      container.innerHTML = hmbPromptFullDashboardMarkup(state);
+      hmbReplacePromptDashboardMarkup(container, hmbPromptFullDashboardMarkup(state));
     }
     if (
       compositionWasActive
@@ -8837,6 +8955,7 @@ function hmbNativeUiImplementation(container, props) {
   };
   warmPreparedViews();
   const applyPropsNow = (nextProps = {}) => {
+    const hadPendingAuthoredEdit = hmbPromptHasPendingAuthoredEdit(container);
     const navigationEcho = container.__hmbPromptNavigationEcho;
     if (navigationEcho && nextProps.value === navigationEcho.value
       && state === navigationEcho.state
@@ -8875,8 +8994,10 @@ function hmbNativeUiImplementation(container, props) {
     const revisionMergedState = hmbTakePromptRevisionMerge(container);
     delete container.__hmbPromptNavigationOnlyState;
     delete container.__hmbPromptNavigationEcho;
-    const shouldRepublishRevisionMerge = Boolean(revisionMergedState);
+    const shouldRepublishRevisionMerge = Boolean(revisionMergedState && container.__hmbPromptPendingRevisionMergeNeedsPublication);
+    delete container.__hmbPromptPendingRevisionMergeNeedsPublication;
     hmbInvalidatePromptPublication(container);
+    if (container.__hmbPromptLibraryCommitIsReconciliation) hmbClearImmediateStateCommit(container);
     const hadUncommittedText = Boolean(
       container.__hmbPromptLibraryCommitPending
       || container.__hmbPromptLibraryCompositionActive
@@ -8924,7 +9045,8 @@ function hmbNativeUiImplementation(container, props) {
     props = nextProps || {};
     if (currentValue === nextValue && !disabledChanged) {
       if (dirtyText.length || shouldRepublishRevisionMerge) {
-        hmbScheduleImmediateStateCommit(container, props, state);
+        hmbScheduleImmediateStateCommit(container, props, state,
+          {reconcileOnly: !hadPendingAuthoredEdit && !dirtyText.length});
       } else if (typeof nextProps?.value === "string") {
         // Repeated retained-mode status echoes are identical bytes. Cache only
         // after canonical equality; revisions and pending edits guard reuse.
@@ -8964,7 +9086,8 @@ function hmbNativeUiImplementation(container, props) {
     }
     if (!shotRegionOnly) warmPreparedViews();
     if (dirtyText.length || shouldRepublishRevisionMerge) {
-      hmbScheduleImmediateStateCommit(container, props, state);
+      hmbScheduleImmediateStateCommit(container, props, state,
+        {reconcileOnly: !hadPendingAuthoredEdit && !dirtyText.length});
     }
   };
   const applyProps = (nextProps = {}) => {
@@ -8997,7 +9120,9 @@ function hmbNativeUiImplementation(container, props) {
     container, () => ({ props, state }),
   );
   const cleanup = () => {
+    hmbAnnouncePromptNativeHeader(container, "retire");
     disposeLifecycle();
+    container.removeEventListener?.("hmb-color-lut-header-state", nativeHeaderState);
     delete container.__hmbPromptShotPointerFocus;
     delete container.__hmbPromptShotInteractionStates;
     delete container.__hmbPromptNavigationOnlyState;
@@ -9029,6 +9154,8 @@ function hmbNativeUiImplementation(container, props) {
     clearPreparedViews();
     releaseListeners(sharedListeners);
     HMB_PROMPT_PREPARED_DOCUMENTS.delete(state);
+    delete container.__hmbPromptReconciledPublications;
+    delete container.__hmbPromptPendingRevisionMergeNeedsPublication;
     delete container.__hmbPromptIsolatedControls;
     if (container.__hmbPromptLibraryApplyProps === applyProps) {
       delete container.__hmbPromptLibraryApplyProps;
@@ -9057,9 +9184,14 @@ function hmbNativeUiImplementation(container, props) {
       delete container.__hmbFrameRangePreviewJob;
     } catch (_e) {}
     container.removeAttribute?.("data-hmb-node-delete-protected");
+    container.removeAttribute?.("data-hmb-color-lut-widget");
+    container.removeAttribute?.("data-hmb-native-node-type");
+    delete container.__hmbPromptNativeHeaderActive;
+    container.classList?.toggle("nodrag", Boolean(hadContainerNoDrag));
     container.innerHTML = "";
   };
   container.__hmbPromptLibraryCleanup = cleanup;
+  hmbAnnouncePromptNativeHeader(container, "ready");
   return {
     cleanup: container.__hmbPromptLibraryCleanupProxy,
     update(nextProps) {
@@ -9168,5 +9300,5 @@ function hmbNativeUiContract(container, props, mount, policy) {
 // HMB_NATIVE_DISABLED_ADAPTER_V1_END
 
 export default function HMBPromptLibraryScopedBindingWidget(container, props) {
-  return hmbNativeUiContract(container, props, hmbNativeUiImplementation, { kind: "prompt", allowControl: null });
+  return hmbNativeUiContract(container, props, hmbNativeUiImplementation, { kind: "prompt", allowControl: hmbPromptNativeHeaderTarget });
 }

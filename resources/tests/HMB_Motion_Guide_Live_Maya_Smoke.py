@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 import HMBVideoPickerLibrary as picker
+from _hmb_maya_smoke_fixture import isolated_maya_environment
 
 
 def sha256(path: Path) -> str:
@@ -37,13 +38,15 @@ run_folder = (
 )
 run_folder.mkdir(parents=True, exist_ok=False)
 scene_path = run_folder / "HMB_Motion_Guide_Smoke.ma"
-builder = ROOT / ".tmp" / "build_motion_guide_smoke_scene.py"
+builder = Path(__file__).with_name("_hmb_maya_smoke_fixture.py")
 build_log = run_folder / "build.log"
 with build_log.open("w", encoding="utf-8", errors="replace") as handle:
     built = subprocess.run(
         [str(mayapy), str(builder), str(scene_path)],
         stdout=handle,
         stderr=subprocess.STDOUT,
+        env=isolated_maya_environment(run_folder),
+        creationflags=picker._creation_flags(),
         timeout=300,
         check=False,
     )
@@ -132,7 +135,7 @@ job_path.write_text(
 )
 
 scene_hash_before = sha256(scene_path)
-environment = picker._maya_subprocess_environment(job_path)
+environment = isolated_maya_environment(run_folder, picker._maya_subprocess_environment(job_path))
 command = [
     str(mayabatch),
     "-command",
@@ -145,6 +148,7 @@ with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
         stderr=subprocess.STDOUT,
         cwd=str(job_path.parent),
         env=environment,
+        creationflags=picker._creation_flags(),
         timeout=900,
         check=False,
     )

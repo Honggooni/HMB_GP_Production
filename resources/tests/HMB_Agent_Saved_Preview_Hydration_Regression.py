@@ -71,11 +71,59 @@ class SavedPreview(unittest.TestCase):
         self.assertEqual(node.parameter_values["prompt"], "")
         self.assertEqual(writes, ["prompt"])
 
-    def test_output_and_empty_saved_values_never_arm_deferred_authority(self):
+    def test_output_and_non_string_saved_values_do_not_arm_hydration(self):
         node, _, *_ = surface()
         node._hmb_capture_saved_parameter_value(module._AGENT_SHOT_PROMPT_INPUT_PARAMETER, "Saved", is_output=True)
-        node._hmb_capture_saved_parameter_value(module._AGENT_SHOT_PROMPT_INPUT_PARAMETER, "")
+        node._hmb_capture_saved_parameter_value(module._AGENT_SHOT_PROMPT_INPUT_PARAMETER, None)
         self.assertFalse(getattr(node, "_hmb_prompt_preview_hydration_pending", False))
+
+    def test_empty_saved_hidden_default_preserves_native_only_and_five_shot_slots(self):
+        for number in (None, 1, 2, 3, 4, 5):
+            with self.subTest(shot=number):
+                node, _, _, _, writes, _, setter = surface()
+                if number is None:
+                    node._hmb_shot_channel_subscription = lambda: {"enabled": False}
+                else:
+                    node._hmb_shot_channel_subscription = lambda n=number: {
+                        "enabled": True, "channel_uuid": "channel", "shot_uuid": "shot-"+str(n),
+                        "shot_number": n, "shot_name": "Shot "+str(n)}
+                node._hmb_manager_prompt_owner = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("Source hydration pending"))
+                expected = deepcopy(node.parameter_values["prompt"])
+                slots = deepcopy(node._hmb_shot_slots)
+                outputs = deepcopy(node.parameter_output_values)
+                with patch.object(module._BaseAgent, "set_parameter_value", setter), \
+                        patch.object(module._BaseAgent, "after_value_set", lambda *args: None):
+                    node.set_parameter_value(module._AGENT_SHOT_PROMPT_INPUT_PARAMETER, "", initial_setup=True)
+                    self.assertTrue(node._hmb_prompt_preview_hydration_pending)
+                    for _ in range(5): node._refresh_routed_prompt_preview()
+                self.assertEqual(node.parameter_values["prompt"], expected)
+                self.assertNotIn("prompt", writes)
+                self.assertEqual(node._hmb_shot_slots, slots)
+                self.assertEqual(node.parameter_output_values, outputs)
+
+    def test_saved_empty_waits_for_exact_live_blank_and_rejects_sibling_blank(self):
+        node, source, _, _, writes, _, setter = surface()
+        source._hmb_shot_manager_enabled = lambda: True
+        source._hmb_prompt_shot_view = lambda **kwargs: {"visible_prompt": "", "subscription": kwargs}
+        node._hmb_manager_prompt_owner = lambda **kwargs: source
+        expected = deepcopy(node.parameter_values["prompt"])
+        with patch.object(module._BaseAgent, "set_parameter_value", setter), \
+                patch.object(module._BaseAgent, "after_value_set", lambda *args: None):
+            # Initial replay cannot turn even a ready display cache into an
+            # authoring edit before all saved native values have been restored.
+            node.set_parameter_value(module._AGENT_SHOT_PROMPT_INPUT_PARAMETER, "", initial_setup=True)
+            self.assertEqual(node.parameter_values["prompt"], expected)
+            self.assertNotIn("prompt", writes)
+            source._hmb_prompt_shot_view = lambda **kwargs: {"visible_prompt": "", "subscription": {
+                "channel_uuid": "channel", "shot_uuid": "shot-2"}}
+            node.set_parameter_value(module._AGENT_SHOT_PROMPT_INPUT_PARAMETER, "")
+            self.assertEqual(node.parameter_values["prompt"], expected)
+            self.assertTrue(node._hmb_prompt_preview_hydration_pending)
+            source._hmb_prompt_shot_view = lambda **kwargs: {"visible_prompt": "", "subscription": kwargs}
+            node.set_parameter_value(module._AGENT_SHOT_PROMPT_INPUT_PARAMETER, "")
+            self.assertEqual(node.parameter_values["prompt"], "")
+            self.assertFalse(node._hmb_prompt_preview_hydration_pending)
+        self.assertEqual(writes, ["prompt"])
 
     def test_equal_canonical_ack_and_registered_hydration_repair_root_once_without_native_writes(self):
         node, _, body, rows, writes, publications, setter = surface()

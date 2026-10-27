@@ -50,6 +50,40 @@ def send(engine, request):
     return result
 
 
+def disconnect_fixture_nodes(engine, flow, names):
+    """Use the public connection command before intentionally deleting fixtures.
+
+    Snapshot native inputs/outputs and five-Shot stores separately from the
+    connection metadata. A teardown must obey the same protection as the UI.
+    """
+    import _hmb_connection_management as connections
+    import _hmb_deletion_guard as deletion
+
+    def authored():
+        return {name: deepcopy({
+            "inputs": dict(node.parameter_values),
+            "outputs": dict(node.parameter_output_values),
+            "agent_slots": getattr(node, "_hmb_shot_slots", None),
+            "agent_results": getattr(node, "_hmb_shot_results", None),
+            "finish_documents": getattr(node, "_hmb_finish_documents", None),
+        }) for name, node in flow.nodes.items()}
+
+    identities = {name: id(node) for name, node in flow.nodes.items()}
+    before = authored()
+    engine.context_manager.push_flow(flow)
+    try:
+        for name in names:
+            state = send(engine, connections.HMBGetNodeConnectionsRequest(node_name=name))
+            if state.can_disconnect:
+                send(engine, connections.HMBManageNodeConnectionsRequest(
+                    node_name=name, operation="disconnect", expected_state_token=state.state_token))
+            assert not deletion.connected_targets(engine, [name]), name
+        assert identities == {name: id(node) for name, node in flow.nodes.items()}
+        assert authored() == before, "Explicit fixture detach changed saved inputs or Shot results"
+    finally:
+        engine.context_manager.pop_flow()
+
+
 def register_library(engine):
     import HMBImageAssetLibrary as images
     import HMBPromptLibrary as prompts
@@ -204,9 +238,11 @@ async def canonical_case(engine, directory):
         assert migration._stamp(engine, flow) == before_failure
         print("PASS first-hook post-commit failure and cancellation during deletion each finish a verified rollback before releasing the flow")
         from griptape_nodes.retained_mode.events.node_events import DeleteNodeRequest
-        for name, node in tuple(flow.nodes.items()):
-            if node.metadata.get("node_type") in {"HMBAgentLibrary", "HMBSeedanceGeneration"}:
-                send(engine, DeleteNodeRequest(node_name=name))
+        removed_names = [name for name, node in flow.nodes.items()
+            if node.metadata.get("node_type") in {"HMBAgentLibrary", "HMBSeedanceGeneration"}]
+        disconnect_fixture_nodes(engine, flow, removed_names)
+        for name in removed_names:
+            send(engine, DeleteNodeRequest(node_name=name))
         prompt_only = await migration.migrate_flow(engine, flow.name, backup_root=directory / "backups")
         assert prompt_only["ok"] and set(prompt_only["survivors"]) == {"prompt"}, prompt_only
         assert len(flow.nodes) == 2
@@ -244,20 +280,21 @@ async def canonical_case(engine, directory):
         finally:
             with migration._LOCK:
                 migration._INFLIGHT.get(engine, set()).discard(flow.name)
-        # Independent legacy content now stays visible until its owner chooses
-        # a real Shot. Missing ImageAsset choices cannot justify deleting it.
+        # One ordinary standalone editor requires no Shot choice when there is
+        # no publisher and no saved binding. Preserve it without consolidation.
         legacy_agent = create("HMBAgentLibrary", "Single legacy unbound Agent")
         legacy_agent.set_parameter_value("additional_context", "Unassigned authored native value", initial_setup=True)
         legacy_raw = legacy_agent._hmb_widget_value(shot={}, shot_catalog={}, shot_manager=True)
         legacy_raw.pop("shot_manager", None)
         legacy_agent._hmb_capture_saved_parameter_value(agents._AGENT_WIDGET_PARAMETER, legacy_raw)
-        agent_before = legacy_agent.get_parameter_value("additional_context")
+        agent_before = deepcopy(migration._raw_node_state(legacy_agent))
         agent_only = await migration.migrate_flow(engine, other.flow_name, backup_root=directory / "backups")
-        assert agent_only["code"] == "migration_conflict" and agent_only["backup_path"], agent_only
-        assert legacy_agent.get_parameter_value("additional_context") == agent_before
+        assert agent_only["ok"] and agent_only["code"] == "standalone_preserved", agent_only
+        assert migration._raw_node_state(legacy_agent) == agent_before
         assert engine.node_manager.get_node_by_name(legacy_agent.name) is legacy_agent
-        assert not agent_only["manual_rebind_editors"]
-        print("PASS explicit cross-flow-target mutations/load are blocked during commit; independent legacy Agent is backed up and retained pending an ImageAsset Shot choice")
+        assert not migration.flow_migration_blocked(engine, other.flow_name)
+        assert not agent_only.get("backup_path")
+        print("PASS explicit cross-flow-target mutations/load are blocked during commit; one standalone legacy Agent is preserved exactly without an invented Shot choice")
         # A library unload invalidates the queued generation, clears loading,
         # and retains an explicit blocked result without running migration.
         before_unload = migration._stamp(engine, flow)
@@ -458,6 +495,7 @@ async def actual_saved_file_case(engine, directory, *, complete_manual_rebind=Fa
             SerializeFlowToCommandsRequest, DeleteFlowRequest, DeserializeFlowFromCommandsRequest)
         serialized = send(engine, SerializeFlowToCommandsRequest(flow_name=flow.name)).serialized_flow_commands
         old_name = flow.name
+        disconnect_fixture_nodes(engine, flow, tuple(flow.nodes))
         send(engine, DeleteFlowRequest(flow_name=old_name))
         with migration._LOCK:
             migration._RESULTS.get(engine, {}).pop(old_name, None)

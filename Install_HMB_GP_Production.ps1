@@ -49,6 +49,26 @@ function Get-HmbRelativePath {
     return $Path.Substring($prefix.Length)
 }
 
+function Assert-HmbNoReparsePath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    # Check the named path itself as well as every existing ancestor. Resolving
+    # the path first would hide a junction that redirects user data elsewhere.
+    $cursor = [System.IO.Path]::GetFullPath($Path)
+    while ($cursor) {
+        try {
+            $attributes = [System.IO.File]::GetAttributes($cursor)
+            if ($attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw "Refusing an HMB install path containing a reparse point: $cursor"
+            }
+        }
+        catch [System.IO.FileNotFoundException] { }
+        catch [System.IO.DirectoryNotFoundException] { }
+        $parent = [System.IO.Directory]::GetParent($cursor)
+        if ($null -eq $parent) { break }
+        $cursor = $parent.FullName
+    }
+}
+
 function Assert-HmbRelativeMember {
     param([Parameter(Mandatory = $true)][string]$Path)
     if (
@@ -120,6 +140,20 @@ if report.get('ok') is not True:
     return ($output | ConvertFrom-Json)
 }
 
+function Invoke-HmbNativeEditorPatch {
+    param([ValidateSet('prepare', 'apply', 'rollback')][string]$Action, [string]$Plan)
+    $python = Get-HmbFullPath -Path $EnginePython
+    if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+        throw 'The bundled Griptape Python is required to verify and install the native editor UI.'
+    }
+    $patcher = Join-Path $source 'tools\hmb_color_lut_native_header_patch.py'
+    $arguments = @('-I', '-B', $patcher, '--release-action', $Action)
+    if ($Plan) { $arguments += @('--release-plan', $Plan) }
+    $output = & $python @arguments
+    if ($LASTEXITCODE -ne 0) { throw "Native editor $Action failed; installation was not completed." }
+    return ($output | ConvertFrom-Json)
+}
+
 $source = Get-HmbFullPath -Path $SourceRoot
 $target = Get-HmbFullPath -Path $TargetRoot
 $expectedParent = Get-HmbFullPath -Path (
@@ -146,6 +180,24 @@ if (
 ) {
     throw 'Rollback data must be stored outside the Griptape libraries folder.'
 }
+foreach ($boundary in @($source, $target, $rollbackRootPath, (Get-HmbFullPath -Path $EnginePython))) {
+    Assert-HmbNoReparsePath -Path $boundary
+}
+
+# One install owns the library and native-editor transaction together. The
+# per-target OS mutex is released automatically if an installer process exits.
+$mutexHasher = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $mutexKey = [System.BitConverter]::ToString($mutexHasher.ComputeHash(
+        [System.Text.Encoding]::UTF8.GetBytes($target.ToLowerInvariant()))).Replace('-', '')
+}
+finally { $mutexHasher.Dispose() }
+$installMutex = New-Object System.Threading.Mutex($false, ('Local\HMB_GP_Production.Install.' + $mutexKey))
+$ownsInstallMutex = $false
+try {
+    try { $ownsInstallMutex = $installMutex.WaitOne(0) }
+    catch [System.Threading.AbandonedMutexException] { $ownsInstallMutex = $true }
+    if (-not $ownsInstallMutex) { throw 'Another HMB installation for this library is already in progress.' }
 
 $running = Get-Process -ErrorAction SilentlyContinue | Where-Object {
     $_.ProcessName -match 'griptape' -or
@@ -157,6 +209,8 @@ if ($running) {
 
 $manifestPath = Join-Path $source 'release-manifest.json'
 $checksumsPath = Join-Path $source 'SHA256SUMS'
+Assert-HmbNoReparsePath -Path $manifestPath
+Assert-HmbNoReparsePath -Path $checksumsPath
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
     throw "Verified runtime package manifest not found: $manifestPath"
 }
@@ -173,9 +227,9 @@ if ($records.Count -ne [int]$manifest.file_count) {
     throw 'HMB release manifest file_count does not match its file list.'
 }
 if (
-    [int]$manifest.install_file_count -ne 49 -or
-    [int]$manifest.distribution_file_count -ne 4 -or
-    $records.Count -ne 53
+    [int]$manifest.install_file_count -ne 60 -or
+    [int]$manifest.distribution_file_count -ne 7 -or
+    $records.Count -ne 67
 ) {
     throw 'HMB release manifest install/distribution boundary mismatch.'
 }
@@ -195,6 +249,7 @@ foreach ($record in $records) {
         throw "HMB release member has an invalid install flag: $relative"
     }
     $sourceFile = Join-Path $source $relative
+    Assert-HmbNoReparsePath -Path $sourceFile
     if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) {
         throw "Missing HMB release member: $relative"
     }
@@ -219,7 +274,10 @@ $expectedDistributionOnlyMembers = @(
     'Install_HMB_GP_Production.ps1',
     'LICENSE',
     'THIRD_PARTY_NOTICES.md',
-    'SBOM.spdx.json'
+    'SBOM.spdx.json',
+    'tools\hmb_color_lut_native_header_patch.py',
+    'resources\editor\hmb-color-lut-native-header.js',
+    'resources\editor\native-editor-patch.json'
 )
 if (
     $installRecords.Count -ne [int]$manifest.install_file_count -or
@@ -259,7 +317,11 @@ $needsTosMigration = $false
 $environmentMigration = $null
 $preservedUserMembers = @()
 $relocatedUserMembers = New-Object 'System.Collections.Generic.List[string]'
-if (Test-Path -LiteralPath $target) {
+$nativeEditorPlan = $null
+$nativeEditorResult = $null
+$hadExistingTarget = Test-Path -LiteralPath $target
+$backupMoved = $false
+if ($hadExistingTarget) {
     foreach ($migrationLock in @('.hmb-tos-migration.lock', '.hmb-tos-prepare.lock')) {
         if (Test-Path -LiteralPath (Join-Path $target $migrationLock)) {
             throw 'An environment migration lock remains. Close Griptape and let its guarded recovery finish before installing; existing files were preserved.'
@@ -293,19 +355,20 @@ if (Test-Path -LiteralPath $target) {
     if (Test-Path -LiteralPath $rollback) {
         throw "Refusing to overwrite an existing rollback directory: $rollback"
     }
-    Move-Item -LiteralPath $target -Destination $rollback
-    $candidateVenv = Join-Path $rollback '.venv'
+    # Complete all discovery while the original target is still in place.
+    # Only the destination paths below refer to the planned rollback folder.
+    $candidateVenv = Join-Path $target '.venv'
     if (Test-Path -LiteralPath $candidateVenv -PathType Container) {
-        $preservedVenv = $candidateVenv
+        $preservedVenv = Join-Path $rollback '.venv'
     }
-    $candidateTosVenv = Join-Path $rollback '.venv-tos'
+    $candidateTosVenv = Join-Path $target '.venv-tos'
     if (Test-Path -LiteralPath $candidateTosVenv -PathType Container) {
-        $preservedTosVenv = $candidateTosVenv
+        $preservedTosVenv = Join-Path $rollback '.venv-tos'
     }
     # Runtime code is replaced only from the verified package. Carry legacy
     # user reports forward; current recovery/review data lives in LocalAppData
     # and project media lives outside this target, so neither is touched.
-    $preservedUserMembers = @(Get-ChildItem -LiteralPath $rollback -Force | Where-Object {
+    $preservedUserMembers = @(Get-ChildItem -LiteralPath $target -Force | Where-Object {
         $relative = [string]$_.Name
         if ($installMembers.Contains($relative) -or $relative -eq '.hmb-install-receipt.json' -or
             $relative -eq 'release-manifest.json' -or $relative -eq 'SHA256SUMS') { return $false }
@@ -314,7 +377,14 @@ if (Test-Path -LiteralPath $target) {
     } | ForEach-Object { [string]$_.Name })
 }
 
+# Validate the editor before the first runtime move. Unsupported app versions,
+# modified bundles or a running desktop leave the existing library untouched.
+$nativeEditorPlan = Invoke-HmbNativeEditorPatch -Action 'prepare'
 try {
+    if ($hadExistingTarget) {
+        Move-Item -LiteralPath $target -Destination $rollback
+        $backupMoved = $true
+    }
     New-Item -ItemType Directory -Path $target -Force | Out-Null
     foreach ($relative in $installMembers) {
         $sourceFile = Join-Path $source $relative
@@ -377,6 +447,7 @@ try {
     $environmentMigration = Repair-HmbTosIsolation -LibraryRoot $target `
         -PrepareRuntime ($PrepareTosRuntime.IsPresent -or $legacyTosEnvironment) `
         -CleanLegacyEnvironment $needsTosMigration
+    $nativeEditorResult = Invoke-HmbNativeEditorPatch -Action 'apply' -Plan $nativeEditorPlan.plan
     $receipt = [ordered]@{
         schema = 'hmb-install-receipt'; version = 1
         release_version = [string]$manifest.release_version
@@ -391,13 +462,21 @@ try {
         })
         preserved_user_members = @($relocatedUserMembers)
         isolated_tos_migration = $environmentMigration
+        native_editor_patch = $nativeEditorResult
     }
     $receiptPath = Join-Path $target '.hmb-install-receipt.json'
     [System.IO.File]::WriteAllText($receiptPath, (ConvertTo-Json -InputObject $receipt -Depth 8),
         (New-Object System.Text.UTF8Encoding($false)))
 }
 catch {
-    if ($rollback -and (Test-Path -LiteralPath $rollback)) {
+    $installFailure = $_
+    $nativeRollbackFailure = $null
+    if ($nativeEditorPlan) {
+        try { Invoke-HmbNativeEditorPatch -Action 'rollback' -Plan $nativeEditorPlan.plan | Out-Null }
+        catch { $nativeRollbackFailure = $_ }
+    }
+    if ($rollback -and (Test-Path -LiteralPath $rollback) -and
+        ($backupMoved -or -not (Test-Path -LiteralPath $target))) {
         # If receipt writing fails after carrying user data forward, put those
         # exact paths back before restoring the old library.
         foreach ($relative in $relocatedUserMembers) {
@@ -417,12 +496,16 @@ catch {
         }
         Move-Item -LiteralPath $rollback -Destination $target
     }
-    elseif (Test-Path -LiteralPath $target) {
+    elseif (-not $hadExistingTarget -and (Test-Path -LiteralPath $target)) {
         New-Item -ItemType Directory -Path $rollbackRootPath -Force | Out-Null
         $failedTarget = Join-Path $rollbackRootPath ('failed-first-install-' + [guid]::NewGuid().ToString('N'))
         Move-Item -LiteralPath $target -Destination $failedTarget
     }
-    throw
+    if ($nativeRollbackFailure) {
+        throw ("Library rollback completed, but native editor recovery requires inspection: " +
+            $nativeRollbackFailure.Exception.Message + ' Original install error: ' + $installFailure.Exception.Message)
+    }
+    throw $installFailure
 }
 
 Write-Output 'HMB_RUNTIME_INSTALL_OK'
@@ -436,3 +519,10 @@ Write-Output ("BUILD_FINGERPRINT=$($manifest.build_fingerprint_sha256)")
 Write-Output ("SOURCE_MANIFEST_SHA256=$manifestSha256")
 Write-Output ("PRESERVED_USER_MEMBERS=$($relocatedUserMembers.Count)")
 Write-Output ("RECEIPT=$receiptPath")
+Write-Output ("NATIVE_EDITOR_SHA256=$($nativeEditorResult.sha256)")
+Write-Output ("NATIVE_EDITOR_CHANGED=$($nativeEditorResult.changed)")
+}
+finally {
+    if ($ownsInstallMutex) { $installMutex.ReleaseMutex() }
+    $installMutex.Dispose()
+}

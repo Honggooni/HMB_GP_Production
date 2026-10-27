@@ -32,6 +32,7 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "HMBColorLUTLibrary.py",
     "HMBFinishLookLibrary.py",
     "HMBImageAssetLibrary.py",
+    "HMBImageBash.py",
     "HMBImageGeneration.py",
     "HMBPromptLibrary.py",
     "HMBSeedanceGeneration.py",
@@ -41,8 +42,14 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "_hmb_broker_config.py",
     "_hmb_build_diagnostics.py",
     "_hmb_library_bootstrap.py",
+    "_hmb_deletion_guard.py",
+    "_hmb_connection_management.py",
     "_hmb_workflow_migration.py",
+    "_hmb_workflow_serialization_compat.py",
     "_hmb_image_limits.py",
+    "_hmb_image_bash_compat.py",
+    "_hmb_image_bash_render.py",
+    "_hmb_image_bash_state.py",
     "_hmb_image_generation.py",
     "_hmb_my_box.py",
     "_hmb_my_box_node.py",
@@ -52,6 +59,7 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "_hmb_review.py",
     "_hmb_web_rerender.py",
     "_hmb_shot_routing.py",
+    "_hmb_cgt.py",
     "_hmb_mp4_verify.py",
     "_hmb_common.py",
     "_hmb_color_lut.py",
@@ -64,6 +72,7 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "widgets/HMBImageAssetLibraryWidget.js",
     "widgets/HMBImageAssetThumbnailPatchBridgeWidget.js",
     "widgets/HMBImageGenerationWidget.js",
+    "widgets/HMBImageBashWidget.js",
     "widgets/HMBPromptLibraryScopedBindingWidget.js",
     "widgets/HMBSeedanceGenerationWidget.js",
     "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
@@ -71,6 +80,8 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "resources/maya/HMB_Maya_Background_Preview.py",
     "resources/blender/HMB_Blender_Background_Preview.py",
     "resources/picker/HMB_Marker_Catalog.json",
+    "resources/cgt/server-trust.json",
+    "resources/image_bash/compatibility.json",
     "resources/agent/superwings12/hmb_agent_core.dat",
     "resources/agent/Dinoster5/project.json",
     "resources/agent/Katuri8/project.json",
@@ -81,6 +92,9 @@ EXPECTED_DISTRIBUTION_ONLY_FILES = (
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
     "SBOM.spdx.json",
+    "tools/hmb_color_lut_native_header_patch.py",
+    "resources/editor/hmb-color-lut-native-header.js",
+    "resources/editor/native-editor-patch.json",
 )
 EXPECTED_SOURCE_FILES = (
     *EXPECTED_RUNTIME_INSTALL_FILES,
@@ -513,6 +527,49 @@ with tempfile.TemporaryDirectory(prefix="hmb-ci-tracked-content-") as temporary:
 assert gate_result.returncode == 0, gate_result.stdout + gate_result.stderr
 assert "HMB_CI_TRACKED_GATE_PASS allowed=5 rejected=23" in gate_result.stdout
 
+# The editor adapter is distribution-only, but still belongs to the signed-off
+# release surface. No upstream editor bundle or private prototype receipt is
+# needed to validate the packaged descriptor and its exact tool/helper hashes.
+native_descriptor = builder.validate_native_editor_patch_sources()
+with tempfile.TemporaryDirectory(prefix="hmb-native-release-boundary-") as native_tmp:
+    native_root = Path(native_tmp)
+    descriptor_relative = "resources/editor/native-editor-patch.json"
+    for relative in (descriptor_relative, native_descriptor["patcher_path"], native_descriptor["helper_path"]):
+        destination = native_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes((ROOT / relative).read_bytes())
+    descriptor_file = native_root / descriptor_relative
+    with mock.patch.object(builder, "ROOT", native_root):
+        assert builder.validate_native_editor_patch_sources() == native_descriptor
+        for field, invalid in (
+            ("version", True), ("editor_version", "0.128.2"),
+            ("bundle_name", "other.js"), ("helper_path", "../other.js"),
+            ("patcher_sha256", "0" * 64), ("helper_sha256", "0" * 64),
+            ("candidate_sha256", native_descriptor["source_sha256"]),
+            ("candidate_sha256", "not-a-digest"),
+            ("previous_candidate", None),
+            ("previous_candidate", []),
+            ("previous_candidate", {"bundle_sha256": "0" * 64, "helper_sha256": "0" * 64}),
+            ("previous_candidate", {**native_descriptor["previous_candidate"], "helper_sha256": "0" * 64}),
+            ("previous_candidate", {**native_descriptor["previous_candidate"], "extra": "unreviewed"}),
+        ):
+            mutated = dict(native_descriptor, **{field: invalid})
+            descriptor_file.write_text(json.dumps(mutated), encoding="utf-8")
+            try:
+                builder.validate_native_editor_patch_sources()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("Native editor descriptor accepted mutation: " + field)
+        descriptor_file.write_text(json.dumps(native_descriptor), encoding="utf-8")
+        (native_root / native_descriptor["helper_path"]).unlink()
+        try:
+            builder.validate_native_editor_patch_sources()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Native editor descriptor accepted a missing UI helper.")
+
 release_version, records = builder.validate_sources()
 record_paths = tuple(str(record["path"]) for record in records)
 assert record_paths == EXPECTED_SOURCE_FILES
@@ -826,6 +883,42 @@ with tempfile.TemporaryDirectory(prefix="hmb-release-parity-") as temporary_root
         assert written_proof["tested_even_version"] == RELEASE_VERSION
         target_odd_version = written_proof["target_odd_version"]
         proof_payload = json.loads(proof_path.read_text(encoding="utf-8"))
+        local_proof = builder.check_local_parity_proof(proof_path, current_archive_path)
+        assert local_proof["local_candidate_only"] is True
+        assert local_proof["team_release_authorized"] is False
+        assert local_proof["local_version"] == RELEASE_VERSION
+        assert local_proof["tested_even_archive_sha256"] == builder.digest(first_archive)
+        checked_archive = builder.check_output(current_archive_path)
+        with mock.patch.object(builder, "check_output", return_value=dict(checked_archive, archive_sha256="0" * 64)):
+            try:
+                builder.check_local_parity_proof(proof_path, current_archive_path)
+            except RuntimeError as error:
+                assert "changed during" in str(error)
+            else:
+                raise AssertionError("Local proof accepted an archive changed after package validation.")
+            try:
+                builder.write_parity_proof(temporary_path / "changed-archive-proof.json", current_archive_path)
+            except RuntimeError as error:
+                assert "changed during" in str(error)
+            else:
+                raise AssertionError("Parity proof was written for an archive changed after validation.")
+        wrong_archive_proof = dict(proof_payload, tested_even_archive_sha256="0" * 64)
+        proof_path.write_text(json.dumps(wrong_archive_proof), encoding="utf-8")
+        try:
+            builder.check_local_parity_proof(proof_path, current_archive_path)
+        except RuntimeError as error:
+            assert "does not identify" in str(error)
+        else:
+            raise AssertionError("Local proof accepted a different archive identity.")
+        proof_path.write_text(json.dumps(proof_payload), encoding="utf-8")
+        # The local-only command must not silently turn an even candidate into
+        # an approved team release, and the original odd-only gate stays strict.
+        try:
+            builder.check_parity_proof(proof_path)
+        except RuntimeError as error:
+            assert "odd team version" in str(error)
+        else:
+            raise AssertionError("Team proof gate accepted a local even release.")
     else:
         tested_even_version = (
             f"{current_parts[0]}.{current_parts[1]}.{current_parts[2] - 1}"

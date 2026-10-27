@@ -192,15 +192,28 @@ with patch.dict(sys.modules,{'asyncio.proactor_events':private}),patch.object(sy
         namespace['current_engine']=lambda:engine
         data=Dummy();data.name='HMB_GP_Production';library=Dummy()
         a,b=namespace['HMBProductionLibrary'](),namespace['HMBProductionLibrary']()
-        a.before_library_nodes_loaded(data,library);a.before_library_nodes_loaded(data,library)
-        b.before_library_nodes_loaded(data,library)
-        assert len(engine.event_manager.pre)==1 and diagnostics()['owner_count']==1
-        assert transport_class._call_connection_lost is wrapper
-        a.before_library_unregistered(data,library)
-        assert diagnostics()['owner_count']==1 and transport_class._call_connection_lost is wrapper
-        b.before_library_unregistered(data,library)
-        assert diagnostics()['owner_count']==0 and transport_class._call_connection_lost is original
-        assert engine.event_manager.pre==engine.event_manager.post==[]
+        # This stdlib-only fixture does not construct an SDK payload registry.
+        # Typed deletion/connection registration is tested by the real SDK
+        # regressions; provide their optional registration seam here explicitly.
+        installed=[];optional={}
+        for module_name in ('_hmb_deletion_guard','_hmb_connection_management'):
+            stub=ModuleType(module_name)
+            def install(_engine,registration,_name=module_name):
+                assert _engine is engine
+                installed.append((_name,registration))
+                return Dummy()
+            stub.install_request_handlers=install;optional[module_name]=stub
+        with patch.dict(sys.modules,optional):
+            a.before_library_nodes_loaded(data,library);a.before_library_nodes_loaded(data,library)
+            b.before_library_nodes_loaded(data,library)
+            assert len(installed)==2 and len({id(item[1]) for item in installed})==1
+            assert len(engine.event_manager.pre)==1 and diagnostics()['owner_count']==1
+            assert transport_class._call_connection_lost is wrapper
+            a.before_library_unregistered(data,library)
+            assert diagnostics()['owner_count']==1 and transport_class._call_connection_lost is wrapper
+            b.before_library_unregistered(data,library)
+            assert diagnostics()['owner_count']==0 and transport_class._call_connection_lost is original
+            assert engine.event_manager.pre==engine.event_manager.post==[]
     finally:
         logger.removeHandler(handler);logger.setLevel(old_level)
         transport_class._call_connection_lost=original

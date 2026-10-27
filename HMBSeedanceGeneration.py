@@ -1100,6 +1100,16 @@ def _seedance_recovery_value(value: Any = None) -> dict[str, Any]:
     draft_source = _seedance_draft_source_value(source.get("draft_source"))
     if draft_source:
         checkpoint["draft_source"] = draft_source
+    if task_id and source.get("shot_hierarchy"):
+        try:
+            hierarchy = _shot_routing.normalize_shot_hierarchy(source["shot_hierarchy"])
+            origin = checkpoint["generation_origin"]
+            if (hierarchy["channel_uuid"] == origin.get("channel_uuid")
+                    and _shot_routing.hierarchy_derived_names(hierarchy).get(origin.get("shot_uuid")) == origin.get("name")):
+                checkpoint["shot_hierarchy"] = hierarchy
+        except (ValueError, TypeError, KeyError):
+            # Optional management data cannot discard an existing paid Task.
+            pass
     return checkpoint
 
 
@@ -5676,6 +5686,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     else previous.get("generation_origin")
                     if stage != "pre_submit" and previous.get("task_id") == task_id
                     else {}
+                ),
+                "shot_hierarchy": (
+                    source_params.get("_hmb_shot_hierarchy", {}) if stage == "pre_submit"
+                    else previous.get("shot_hierarchy", {})
                 ),
                 "reference_lease_id": (
                     source_params.get("_hmb_reference_upload_lease_id", "") if stage == "pre_submit"
@@ -14618,12 +14632,20 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if captured_origin and captured_origin != resolved_origin:
                 raise ValueError("The selected Shot changed before generation inputs were prepared. Run the selected Shot again.")
             params["_hmb_generation_origin"] = captured_origin or resolved_origin
+            if isinstance(self, _HMBWebRerenderExecution):
+                params["_hmb_shot_hierarchy"] = deepcopy(self._web_params.get("_hmb_shot_hierarchy", {}))
+            else:
+                origin = params["_hmb_generation_origin"]
+                params["_hmb_shot_hierarchy"] = _shot_routing.capture_shot_hierarchy(
+                    self, origin.get("channel_uuid", ""), origin.get("shot_uuid", "")
+                )
         else:
             params["_hmb_generation_origin"] = _generated_video_origin(
                 params.get("_hmb_draft_source", {}).get("generation_origin") if draft_final and not params["resume_generation_id"] else
                 recovery_before_run.get("generation_origin")
                 if recovery_before_run.get("task_id") == params["resume_generation_id"] else None
             )
+            params["_hmb_shot_hierarchy"] = deepcopy(recovery_before_run.get("shot_hierarchy", {}))
         self._validate_parameters(params)
         resume_generation_id = params["resume_generation_id"]
         decode_verifier: _MP4DecodeVerifier | None = None
@@ -15274,15 +15296,24 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         """
         if not self._runtime_node_is_live(require_registered=True):
             raise RuntimeError("The connected Generator is no longer available.")
+        from _hmb_connection_management import target_has_suspended_role
+        if target_has_suspended_role(self):
+            raise RuntimeError("[HMB_CONNECTION_DETACHED] Restore the Generator connections before requesting a web rerender.")
         agent = self._manual_agent_prompt_source()
         if agent is None or not callable(getattr(agent, "_hmb_run_web_rerender", None)):
             raise RuntimeError("Connect an HMB Agent before requesting a web rerender.")
+        if target_has_suspended_role(agent):
+            raise RuntimeError("[HMB_CONNECTION_DETACHED] Restore the Agent connections before requesting a web rerender.")
         view = _HMBWebRerenderExecution.read_view(self)
         params = view._get_parameters()
         params["resume_generation_id"] = ""
         params = view._resolve_exact_shot_generation_inputs(params)
         params.pop("prompt", None)
         params["_hmb_generation_origin"] = deepcopy(self._capture_generated_video_origin())
+        origin = params["_hmb_generation_origin"]
+        params["_hmb_shot_hierarchy"] = _shot_routing.capture_shot_hierarchy(
+            self, origin.get("channel_uuid", ""), origin.get("shot_uuid", "")
+        )
         params["_hmb_broker_server_url"] = self._selected_broker_server_url()
         # Validation needs text, but neither original Prompt text nor this
         # non-submitted sentinel is put into the returned execution snapshot.
@@ -15391,24 +15422,31 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     @asynccontextmanager
     async def _hmb_web_rerender_claim(self, snapshot: dict[str, Any]):
         """Serialize web Agent + render with native Run and native Refresh."""
-        with self._generation_refresh_lock:
-            if self._generation_run_active.is_set() or self._generation_refresh_running or self._hmb_draft_finalize_pending:
-                raise RuntimeError("The connected Generator is busy.")
-            if self._hmb_web_rerender_recovery_blocked():
-                raise RuntimeError("An earlier Generator submission still requires confirmation.")
-            claim = _HMBWebRerenderClaim(self, deepcopy(snapshot))
-            self._hmb_web_rerender_active_claim = claim
-            self._generation_run_active.set()
-            self._hmb_active_draft_action = DRAFT_ACTION_OFF
+        from _hmb_connection_management import execution_reservation
+        claim = None
         try:
-            self._hmb_web_rerender_validate_claim(claim)
+            # Connection changes and activation share one short reservation.
+            # Never retain it while awaiting the Agent, uploads, or rendering.
+            with execution_reservation():
+                with self._generation_refresh_lock:
+                    if self._generation_run_active.is_set() or self._generation_refresh_running or self._hmb_draft_finalize_pending:
+                        raise RuntimeError("The connected Generator is busy.")
+                    if self._hmb_web_rerender_recovery_blocked():
+                        raise RuntimeError("An earlier Generator submission still requires confirmation.")
+                    claim = _HMBWebRerenderClaim(self, deepcopy(snapshot))
+                    self._hmb_web_rerender_active_claim = claim
+                    self._generation_run_active.set()
+                    self._hmb_active_draft_action = DRAFT_ACTION_OFF
+                self._hmb_web_rerender_validate_claim(claim)
             yield claim
         finally:
-            with self._generation_refresh_lock:
-                if getattr(self, "_hmb_web_rerender_active_claim", None) is claim:
-                    self._hmb_web_rerender_active_claim = None
-                    self._generation_run_active.clear()
-                claim.active = False
+            if claim is not None:
+                with execution_reservation():
+                    with self._generation_refresh_lock:
+                        if getattr(self, "_hmb_web_rerender_active_claim", None) is claim:
+                            self._hmb_web_rerender_active_claim = None
+                            self._generation_run_active.clear()
+                        claim.active = False
 
     def _hmb_web_rerender_validate_claim(self, claim: Any) -> None:
         if (not isinstance(claim, _HMBWebRerenderClaim) or claim.owner is not self

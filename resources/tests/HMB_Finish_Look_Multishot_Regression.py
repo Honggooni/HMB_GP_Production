@@ -43,11 +43,14 @@ class FinishMultishot(unittest.TestCase):
     def test_default_height_adds_tab_chrome_and_preserves_custom_saved_size(self):
         n=m.HMBFinishLookLibrary(name='New default Finish')
         self.assertEqual(m.FINISH_LOOK_SHOT_TAB_HEIGHT,51)
-        self.assertEqual(m.FINISH_LOOK_NODE_HEIGHT,1091);self.assertEqual(m.FINISH_LOOK_WIDGET_HEIGHT,991)
-        self.assertEqual(n.ui_options['default_height'],1091)
+        self.assertEqual(m.FINISH_LOOK_NODE_HEIGHT,864);self.assertEqual(m.FINISH_LOOK_WIDGET_HEIGHT,788)
+        self.assertEqual(n.ui_options['default_height'],864)
         saved=m.HMBFinishLookLibrary(name='Saved custom Finish',metadata={'size':{'width':1130,'height':1275}})
         self.assertEqual(saved.height,1275);self.assertEqual(saved.width,1130)
         self.assertEqual(saved.metadata['size'],{'width':1130,'height':1275})
+        old_default=m.HMBFinishLookLibrary(name='Saved prior default Finish',metadata={'size':{'width':980,'height':1091}})
+        self.assertEqual(old_default.metadata['size'],{'width':980,'height':1091})
+        self.assertEqual((old_default.width,old_default.height),(980,1091))
 
     def test_five_target_states_and_snapshots_are_independent(self):
         n=node()

@@ -147,6 +147,11 @@ class RetainedHost:
 
 
 class OutputHost(RetainedHost):
+    def _persist_shot_routing_facts(self, state, snapshot):
+        # This fixture isolates output notification ordering. Full real-node
+        # persistence is exercised by HMB_Image_Asset_Publication_Cursor_Regression.
+        assert state == self.live
+
     def __init__(self):
         super().__init__()
         self._hmb_last_output_fingerprint = "cached-pair"

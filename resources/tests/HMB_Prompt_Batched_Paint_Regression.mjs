@@ -8,12 +8,12 @@ import {createRequire} from 'node:module';
 const source=fs.readFileSync(new URL('../../widgets/HMBPromptLibraryScopedBindingWidget.js',import.meta.url),'utf8');
 const css=source.match(/includeStyle \? `<style>\n([\s\S]*?)<\/style>` : ""/);
 assert.ok(css);
-assert.equal(crypto.createHash('sha256').update(css[1]).digest('hex'),'06c4e1eb664a9d1437733118a6b42f979acf2d51b5a0a56190f3fc181ef78c81','Approved palette, CSS, geometry and responsive design bytes remain unchanged.');
+assert.equal(crypto.createHash('sha256').update(css[1]).digest('hex'),'34ace2162729313a100151a385b57431820200036d7fe356a4bd13ac6bce2a97','Approved palette, geometry and responsive design, including the approved native header slots, remain unchanged.');
 const instrumented=source.replace('export function normalizeState(input) {','export function normalizeState(input) { globalThis.__hmbPaintNormalizeCalls=(globalThis.__hmbPaintNormalizeCalls||0)+1;')+'\nexport {hmbMeasurePromptHostHeights,hmbApplyDashboardHostSizing,hmbStoreGroupHeight,hmbApplyExactGroupFlex};';
 const widget=await import('data:text/javascript;base64,'+Buffer.from(instrumented).toString('base64'));
 const saved={document:globalThis.document,window:globalThis.window};const events=[];
 const make=(name,top,height,parent=null)=>{
- const values={};const element={name,parentElement:parent,className:'sdk-wrapper',dataset:{},clientHeight:height,offsetHeight:height,getAttribute(){return null;},getBoundingClientRect(){events.push('read:'+name);return {top,height:this.offsetHeight*2,bottom:top+this.offsetHeight*2};},classList:{add(){},remove(){}},querySelector(){return null;}};
+ const values={},classes=new Set();const element={name,parentElement:parent,className:'sdk-wrapper',dataset:{},clientHeight:height,offsetHeight:height,getAttribute(){return null;},getBoundingClientRect(){events.push('read:'+name);return {top,height:this.offsetHeight*2,bottom:top+this.offsetHeight*2};},classList:{add(...names){names.forEach(name=>classes.add(name));},remove(...names){names.forEach(name=>classes.delete(name));},contains(name){return classes.has(name);},toggle(name,force){const next=force===undefined?!classes.has(name):Boolean(force);if(next)classes.add(name);else classes.delete(name);return next;}},querySelector(){return null;}};
  element.style=new Proxy(values,{set(owner,key,value){events.push('write:'+name+':'+String(key));owner[key]=value;return true;}});return element;
 };
 try{

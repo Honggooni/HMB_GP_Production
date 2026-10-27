@@ -24,7 +24,7 @@ packager_spec.loader.exec_module(packager)
 # The receipt fixture follows the shipped closure, independently of the reader.
 # Building it from diag.RUNTIME_FILE_PATHS concealed an omitted runtime member.
 runtime_paths = tuple(packager.RUNTIME_INSTALL_FILES)
-assert len(runtime_paths) == 49
+assert len(runtime_paths) == 60
 
 with tempfile.TemporaryDirectory(prefix="hmb-build-diag-") as directory:
     root = Path(directory)
@@ -45,8 +45,10 @@ with tempfile.TemporaryDirectory(prefix="hmb-build-diag-") as directory:
         result = diag.get_build_diagnostics(root, verify_policy=False)
     assert result["install"]["receipt_status"] == "matches_recorded_inventory"
     assert result["runtime"]["fingerprint_sha256"] == expected
-    assert result["runtime"]["file_count"] == result["runtime"]["present_count"] == 49
+    assert result["runtime"]["file_count"] == result["runtime"]["present_count"] == 60
     assert "_hmb_image_limits.py" in result["runtime"]["file_sha256"]
+    assert "_hmb_deletion_guard.py" in result["runtime"]["file_sha256"]
+    assert "_hmb_workflow_serialization_compat.py" in result["runtime"]["file_sha256"]
     assert result["channel"] == "local_even"
     assert result["policy"]["signature_status"] == "not_checked"
     assert result["policy"]["source_status"] == "not_inspected"
@@ -58,6 +60,12 @@ with tempfile.TemporaryDirectory(prefix="hmb-build-diag-") as directory:
     assert limits_drift["install"]["receipt_status"] == "mismatch"
     assert limits_drift["package"]["mismatch_paths"] == ["_hmb_image_limits.py"]
     limits_path.write_bytes(untouched[limits_path])
+    guard_path = root / "_hmb_deletion_guard.py"
+    guard_path.write_bytes(b"changed deletion guard fixture")
+    guard_drift = diag.get_build_diagnostics(root, verify_policy=False)
+    assert guard_drift["install"]["receipt_status"] == "mismatch"
+    assert guard_drift["package"]["mismatch_paths"] == ["_hmb_deletion_guard.py"]
+    guard_path.write_bytes(untouched[guard_path])
     (root/"_hmb_common.py").write_bytes((ROOT/"_hmb_common.py").read_bytes())
     (root/"resources/agent/superwings12/hmb_agent_core.dat").write_bytes((ROOT/"resources/agent/superwings12/hmb_agent_core.dat").read_bytes())
     # Standalone signed verification must not initialize SDK/session modules or

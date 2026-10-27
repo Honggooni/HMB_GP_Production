@@ -18,8 +18,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.8.27"
-RELEASE_VERSION = "0.8.27"
+RELEASE_LABEL = "v0.8.31"
+RELEASE_VERSION = "0.8.31"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -45,6 +45,7 @@ RUNTIME_INSTALL_FILES = (
     "HMBColorLUTLibrary.py",
     "HMBFinishLookLibrary.py",
     "HMBImageAssetLibrary.py",
+    "HMBImageBash.py",
     "HMBImageGeneration.py",
     "HMBPromptLibrary.py",
     "HMBSeedanceGeneration.py",
@@ -54,8 +55,14 @@ RUNTIME_INSTALL_FILES = (
     "_hmb_broker_config.py",
     "_hmb_build_diagnostics.py",
     "_hmb_library_bootstrap.py",
+    "_hmb_deletion_guard.py",
+    "_hmb_connection_management.py",
     "_hmb_workflow_migration.py",
+    "_hmb_workflow_serialization_compat.py",
     "_hmb_image_limits.py",
+    "_hmb_image_bash_compat.py",
+    "_hmb_image_bash_render.py",
+    "_hmb_image_bash_state.py",
     "_hmb_image_generation.py",
     "_hmb_my_box.py",
     "_hmb_my_box_node.py",
@@ -65,6 +72,7 @@ RUNTIME_INSTALL_FILES = (
     "_hmb_review.py",
     "_hmb_web_rerender.py",
     "_hmb_shot_routing.py",
+    "_hmb_cgt.py",
     "_hmb_mp4_verify.py",
     "_hmb_common.py",
     "_hmb_color_lut.py",
@@ -77,6 +85,7 @@ RUNTIME_INSTALL_FILES = (
     "widgets/HMBImageAssetLibraryWidget.js",
     "widgets/HMBImageAssetThumbnailPatchBridgeWidget.js",
     "widgets/HMBImageGenerationWidget.js",
+    "widgets/HMBImageBashWidget.js",
     "widgets/HMBPromptLibraryScopedBindingWidget.js",
     "widgets/HMBSeedanceGenerationWidget.js",
     "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
@@ -84,6 +93,8 @@ RUNTIME_INSTALL_FILES = (
     "resources/maya/HMB_Maya_Background_Preview.py",
     "resources/blender/HMB_Blender_Background_Preview.py",
     "resources/picker/HMB_Marker_Catalog.json",
+    "resources/cgt/server-trust.json",
+    "resources/image_bash/compatibility.json",
     "resources/agent/superwings12/hmb_agent_core.dat",
     "resources/agent/Dinoster5/project.json",
     "resources/agent/Katuri8/project.json",
@@ -94,6 +105,9 @@ DISTRIBUTION_ONLY_FILES = (
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
     "SBOM.spdx.json",
+    "tools/hmb_color_lut_native_header_patch.py",
+    "resources/editor/hmb-color-lut-native-header.js",
+    "resources/editor/native-editor-patch.json",
 )
 SOURCE_FILES = (*RUNTIME_INSTALL_FILES, *DISTRIBUTION_ONLY_FILES)
 CANONICAL_CRLF_SOURCE_FILES = {
@@ -105,7 +119,7 @@ CANONICAL_LF_SOURCE_FILES = {
     if PurePosixPath(relative).suffix.casefold() in {".py", ".js", ".json", ".md"}
     or relative == "LICENSE"
 }
-if len(RUNTIME_INSTALL_FILES) != 49 or len(DISTRIBUTION_ONLY_FILES) != 4:
+if len(RUNTIME_INSTALL_FILES) != 60 or len(DISTRIBUTION_ONLY_FILES) != 7:
     raise RuntimeError("Runtime/distribution release boundary count mismatch.")
 if set(RUNTIME_INSTALL_FILES) & set(DISTRIBUTION_ONLY_FILES):
     raise RuntimeError("Runtime and distribution-only release files overlap.")
@@ -175,6 +189,70 @@ PILLOW_DECLARATION_COMMENT = (
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def validate_native_editor_patch_sources() -> dict[str, Any]:
+    """Bind the installer adapter to the reviewed native editor transformation.
+
+    The upstream editor bundle is never redistributed. Installers transform the
+    user's exact supported bundle locally, replace the approved prior helper,
+    or accept the exact candidate as an idempotent no-op. These distribution
+    files are part of release parity.
+    """
+    descriptor_path = ROOT / "resources/editor/native-editor-patch.json"
+    if not descriptor_path.is_file() or descriptor_path.is_symlink():
+        raise RuntimeError("Native editor patch descriptor is missing or linked.")
+    payload = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    expected_keys = {
+        "schema", "version", "editor_version", "bundle_name", "source_sha256",
+        "candidate_sha256", "helper_path", "helper_sha256", "patcher_path", "patcher_sha256",
+    }
+    if not isinstance(payload, dict) or set(payload) not in (expected_keys, expected_keys | {"previous_candidate"}):
+        raise RuntimeError("Native editor patch descriptor boundary is invalid.")
+    if (
+        payload["schema"] != "hmb-native-editor-patch-release"
+        or type(payload["version"]) is not int or payload["version"] != 1
+        or payload["editor_version"] != "0.128.1"
+        or payload["bundle_name"] != "index-DEZU41rc.js"
+        or payload["source_sha256"] != "1a0429b88c6b8dd1c7e6e053836d03f734a4d6453f8886e0693527c7498909e2"
+        or payload["helper_path"] != "resources/editor/hmb-color-lut-native-header.js"
+        or payload["patcher_path"] != "tools/hmb_color_lut_native_header_patch.py"
+    ):
+        raise RuntimeError("Native editor patch target is not the reviewed editor.")
+    for field in ("source_sha256", "candidate_sha256", "helper_sha256", "patcher_sha256"):
+        if not isinstance(payload[field], str) or re.fullmatch(r"[0-9a-f]{64}", payload[field]) is None:
+            raise RuntimeError("Native editor patch digest is invalid: " + field)
+    if payload["candidate_sha256"] == payload["source_sha256"]:
+        raise RuntimeError("Native editor patch candidate must differ from its pristine source.")
+    if "previous_candidate" in payload and payload["previous_candidate"] != {
+        "bundle_sha256": "7bad6f6517c781c54e6d2e0cf170f0b2ed3bdef28b3cca57be79cce54bdd11bf",
+        "helper_sha256": "39e5901cc8aa37d1d11850a255bcc209ab4724afe488817fc3f684a72ab01b63",
+    }:
+        raise RuntimeError("Native editor previous candidate is not the reviewed patch.")
+    for kind in ("patcher", "helper"):
+        relative = payload[kind + "_path"]
+        path = ROOT / relative
+        if not path.is_file() or path.is_symlink():
+            raise RuntimeError("Native editor patch source is missing or linked: " + relative)
+        encoded = canonical_release_source_data(PurePosixPath(relative), path.read_bytes())
+        if digest(encoded) != payload[kind + "_sha256"]:
+            raise RuntimeError("Native editor patch descriptor hash mismatch: " + relative)
+    patcher = ROOT / payload["patcher_path"]
+    for constant, key in (
+        ("EXPECTED_SOURCE_SHA256", "source_sha256"),
+        ("EXPECTED_EDITOR_VERSION", "editor_version"),
+        ("EXPECTED_BUNDLE_NAME", "bundle_name"),
+    ):
+        if module_string_constant(patcher, constant) != payload[key]:
+            raise RuntimeError("Native editor patcher and descriptor target differ.")
+    if "previous_candidate" in payload:
+        for constant, key in (
+            ("SUPPORTED_PREVIOUS_CANDIDATE_SHA256", "bundle_sha256"),
+            ("SUPPORTED_PREVIOUS_HELPER_SHA256", "helper_sha256"),
+        ):
+            if module_string_constant(patcher, constant) != payload["previous_candidate"][key]:
+                raise RuntimeError("Native editor patcher and previous candidate differ.")
+    return payload
 
 
 def verify_signed_agent_policy_bytes(encoded: bytes) -> dict[str, str]:
@@ -636,6 +714,7 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
     # Package checks are read-only for the approved signed DAT. A Manager
     # mirror is an explicit authoring operation, not an incidental side effect
     # of validating or comparing a release from another chat.
+    validate_native_editor_patch_sources()
     policy_path = ROOT / Path(BUNDLED_AGENT_POLICY_MEMBER.as_posix())
     if not policy_path.is_file() or policy_path.is_symlink():
         raise RuntimeError("Bundled signed Agent policy is unavailable.")
@@ -1150,6 +1229,8 @@ def write_parity_proof(proof_path: Path, tested_archive_path: Path) -> dict[str,
     archive_result = check_output(tested_archive_path)
     archive = tested_archive_path.resolve()
     tested_archive_sha256 = digest(archive.read_bytes())
+    if tested_archive_sha256 != archive_result["archive_sha256"]:
+        raise RuntimeError("Local archive changed during parity proof creation.")
     target_version = f"{major}.{minor}.{patch + 1}"
     payload = {
         "canonical_source_sha256": canonical_source_fingerprint(source_records),
@@ -1260,6 +1341,40 @@ def check_parity_proof(proof_path: Path) -> dict[str, Any]:
         source_records,
     )
     return {**result, "proof": str(proof)}
+
+
+def check_local_parity_proof(proof_path: Path, tested_archive_path: Path) -> dict[str, Any]:
+    """Verify the exact local candidate without granting an odd team release.
+
+    Unlike the team gate this checks the referenced ZIP again. A source hash
+    alone is not evidence that the on-disk local package is still the tested
+    package. The odd release validator and its adjacency rule stay unchanged.
+    """
+    release_version, source_records = validate_sources()
+    major, minor, patch = release_version_parts(release_version)
+    if patch % 2 != 0:
+        raise RuntimeError("Local parity verification requires an even local-test version.")
+    proof = proof_path.resolve()
+    if not proof.is_file():
+        raise RuntimeError(f"Release parity proof is missing: {proof}")
+    payload = json.loads(proof.read_text(encoding="utf-8"))
+    validated = validate_parity_proof_payload(payload, f"{major}.{minor}.{patch + 1}", source_records)
+    archive_result = check_output(tested_archive_path)
+    actual_digest = digest(tested_archive_path.resolve().read_bytes())
+    if actual_digest != archive_result["archive_sha256"]:
+        raise RuntimeError("Local archive changed during parity verification.")
+    if actual_digest != validated["tested_even_archive_sha256"]:
+        raise RuntimeError("Local parity proof does not identify this tested archive.")
+    return {
+        "local_candidate_only": True,
+        "team_release_authorized": False,
+        "local_version": release_version,
+        "canonical_source_sha256": validated["canonical_source_sha256"],
+        "tested_even_archive_sha256": actual_digest,
+        "archive": archive_result["archive"],
+        "proof": str(proof),
+        "verified": True,
+    }
 
 
 def current_zip_date_time() -> tuple[int, int, int, int, int, int]:
@@ -1517,17 +1632,23 @@ def main() -> None:
         type=Path,
         help="Validate a tested even-to-odd parity proof for the current release.",
     )
+    parser.add_argument(
+        "--check-local-parity-proof",
+        type=Path,
+        help="Verify an even local candidate and exact --output ZIP without authorizing a team release.",
+    )
     args = parser.parse_args()
     primary_modes = (
         args.check,
         args.check_output,
         args.write_parity_proof,
         args.check_parity_proof,
+        args.check_local_parity_proof,
     )
     if sum(bool(item) for item in primary_modes) > 1:
         parser.error(
             "--check, --check-output, --write-parity-proof, and "
-            "--check-parity-proof are mutually exclusive"
+            "--check-parity-proof, and --check-local-parity-proof are mutually exclusive"
         )
     if args.reference_sha256 and not args.parity_with:
         parser.error("--reference-sha256 requires --parity-with")
@@ -1535,12 +1656,14 @@ def main() -> None:
         parser.error("--parity-with requires --reference-sha256")
     if args.parity_with and not (args.check or args.check_output):
         parser.error("--parity-with requires --check or --check-output")
-    if args.parity_with and (args.write_parity_proof or args.check_parity_proof):
+    if args.parity_with and (args.write_parity_proof or args.check_parity_proof or args.check_local_parity_proof):
         parser.error("--parity-with cannot be combined with parity proof modes")
     if args.write_parity_proof:
         result = write_parity_proof(args.write_parity_proof, args.output)
     elif args.check_parity_proof:
         result = check_parity_proof(args.check_parity_proof)
+    elif args.check_local_parity_proof:
+        result = check_local_parity_proof(args.check_local_parity_proof, args.output)
     elif args.check_output:
         result = check_output(args.output)
     elif args.check:

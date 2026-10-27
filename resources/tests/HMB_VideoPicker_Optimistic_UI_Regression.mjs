@@ -13,10 +13,11 @@ class FakeClassList {
 }
 
 class FakeElement {
-  constructor({ parent = null, classes = [] } = {}) {
+  constructor({ parent = null, classes = [], nativeHeader = false } = {}) {
     this.parentElement = parent;
     this.classList = new FakeClassList(...classes);
     this.listeners = new Map();
+    this.nativeHeader = nativeHeader;
   }
   addEventListener(name, handler) {
     const handlers = this.listeners.get(name) || [];
@@ -27,7 +28,12 @@ class FakeElement {
     const handlers = this.listeners.get(name) || [];
     this.listeners.set(name, handlers.filter((candidate) => candidate !== handler));
   }
-  closest() { return this; }
+  closest(selector) {
+    if (String(selector).includes("[data-hmb-native-identity]") || String(selector).includes("[data-hmb-native-actions]")) {
+      return this.nativeHeader ? this : null;
+    }
+    return String(selector).includes("input") || String(selector).includes("button") ? this : null;
+  }
 }
 
 const windowListeners = new Map();
@@ -40,7 +46,7 @@ globalThis.window = {
 };
 
 const widget = await import(
-  `data:text/javascript;base64,${Buffer.from(widgetSource).toString("base64")}`
+  `data:text/javascript;base64,${Buffer.from(widgetSource + "\nexport { hmbPickerContainsEventNode };").toString("base64")}`
 );
 
 
@@ -50,6 +56,7 @@ const widget = await import(
 const clip = new FakeElement({ classes: ["nopan", "nowheel"] });
 const picker = new FakeElement({ classes: ["nodrag", "nopan", "nowheel"] });
 const controls = Array.from({ length: 1000 }, () => new FakeElement());
+const nativeControls = [new FakeElement({ nativeHeader: true }), new FakeElement({ nativeHeader: true })];
 const container = new FakeElement();
 container.querySelector = (selector) => {
   if (selector === ".hmbvp-clip") return clip;
@@ -57,9 +64,9 @@ container.querySelector = (selector) => {
   return null;
 };
 container.querySelectorAll = (selector) => (
-  String(selector).includes(",") ? controls : []
+  String(selector).includes(",") ? [...controls, ...nativeControls] : []
 );
-container.contains = (element) => controls.includes(element);
+container.contains = (element) => controls.includes(element) || nativeControls.includes(element);
 const cleanup = [];
 widget.hmbInstallPickerInteractionIsolation(container, cleanup);
 assert.equal(cleanup.length, 1, "One cleanup owns all delegated interaction listeners.");
@@ -72,6 +79,10 @@ for (const control of controls) {
     0,
     "Rows and controls must not receive per-element listeners.",
   );
+}
+for (const control of nativeControls) {
+  for (const name of ["nodrag", "nopan", "nowheel"]) assert.equal(control.classList.contains(name), false,
+    "Original native header controls keep their host interaction classes.");
 }
 for (const eventName of ["pointerdown", "mousedown", "click", "dblclick", "keydown"]) {
   assert.equal(container.listeners.get(eventName)?.length, 1, `${eventName} is delegated once.`);
@@ -101,12 +112,17 @@ container.listeners.get("pointerdown")[0]({
   stopPropagation() { delegatedStops += 1; },
 });
 assert.equal(delegatedStops, 2, "Control pointerdown stays inside the widget.");
+container.listeners.get("click")[0]({ target: nativeControls[0], stopPropagation() { delegatedStops += 1; } });
+container.listeners.get("pointerdown")[0]({ target: nativeControls[1], stopPropagation() { delegatedStops += 1; } });
+assert.equal(delegatedStops, 2, "Native identity/action gestures are owned by the host.");
 let deleteStops = 0;
 container.listeners.get("keydown")[0]({
   key: "Delete",
   stopPropagation() { deleteStops += 1; },
 });
 assert.equal(deleteStops, 1, "Delete protection remains intact after delegation.");
+container.listeners.get("keydown")[0]({ key: "Delete", target: nativeControls[0], stopPropagation() { deleteStops += 1; } });
+assert.equal(deleteStops, 1, "Native editable title keeps the host keyboard contract.");
 cleanup[0]();
 for (const eventName of ["pointerdown", "mousedown", "click", "dblclick", "keydown"]) {
   assert.equal(container.listeners.get(eventName)?.length || 0, 0);
@@ -445,7 +461,21 @@ assert.match(widgetSource, /HMB_SCOPED_STYLE_CACHE\.has\(key\)/);
 assert.match(widgetSource, /const HMB_NATIVE_PICKER_CACHE_TTL_MS = 350/);
 assert.match(widgetSource, /__hmbNativeMayaPickerCache/);
 assert.match(main, /for \(const delay of \[0, 500\]\)/);
-assert.match(main, /if \(event\?\.target && container\.contains\?\.\(event\.target\)\) return/);
+assert.match(main, /if \(hmbPickerContainsEventNode\(container, event\?\.target\)\) return/);
+const nativeEventNode = {};
+let containsCalls = 0;
+const nativeEventContainer = {
+  ownerDocument: { defaultView: { Node: { prototype: {
+    isSameNode(other) { if (this !== nativeEventNode || other !== nativeEventNode) throw new TypeError("Not a Node"); },
+  } } } },
+  contains(target) { containsCalls += 1; return target === nativeEventNode; },
+};
+assert.equal(widget.hmbPickerContainsEventNode(nativeEventContainer, nativeEventNode), true,
+  "An internal Node event must not trigger native file-picker discovery.");
+assert.equal(widget.hmbPickerContainsEventNode(nativeEventContainer, { window: true }), false,
+  "Window focus is not passed to Node.contains and must remain safe.");
+assert.equal(containsCalls, 1, "Only a branded Node reaches contains.");
+assert.equal(widget.hmbPickerContainsEventNode({ contains() { throw new TypeError("Detached document"); } }, nativeEventNode), false);
 
 
 console.log(

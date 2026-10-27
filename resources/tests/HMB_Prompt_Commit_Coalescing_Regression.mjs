@@ -382,8 +382,13 @@ assert.match(
 );
 assert.match(
   source,
-  /const remount = \(nextState = null, stateIsNormalized = false\) => \{[\s\S]*?const compositionWasActive = Boolean\([\s\S]*?if \(dashboardMounted\) \{[\s\S]*?const dynamicMarkup = render\(state, false\);[\s\S]*?if \(!hmbPatchPromptDashboard\(container, dynamicMarkup\)\) \{\s*container\.innerHTML = hmbPromptFullDashboardMarkup\(state\);\s*\}[\s\S]*?if \(\s*compositionWasActive[\s\S]*?\) hmbReleasePromptCompositionLatch\(container\);/,
+  /const remount = \(nextState = null, stateIsNormalized = false\) => \{[\s\S]*?const compositionWasActive = Boolean\([\s\S]*?if \(dashboardMounted\) \{[\s\S]*?const dynamicMarkup = render\(state, false\);[\s\S]*?if \(!hmbPatchPromptDashboard\(container, dynamicMarkup\)\) \{\s*hmbReplacePromptDashboardMarkup\(container, hmbPromptFullDashboardMarkup\(state\)\);\s*\}[\s\S]*?if \(\s*compositionWasActive[\s\S]*?\) hmbReleasePromptCompositionLatch\(container\);/,
   "A remount must patch first and release composition only when the composing control was replaced.",
+);
+assert.match(
+  source,
+  /function hmbReplacePromptDashboardMarkup\(container, markup\) \{[\s\S]*?const slots = \["\[data-hmb-native-identity\]", "\[data-hmb-native-actions\]"\][\s\S]*?container\.innerHTML = markup;[\s\S]*?if \(slot && placeholder\) placeholder\.parentNode\?\.replaceChild\(slot, placeholder\);/,
+  "The structural fallback must retain the exact native identity/action nodes and their callbacks.",
 );
 assert.match(
   source,

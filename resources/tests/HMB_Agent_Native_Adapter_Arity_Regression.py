@@ -47,10 +47,14 @@ GLOBALS = {
     'NativeBoundary': NativeBoundary,
 }
 FUNCTIONS = [method('_run_native_with_literal_hmb_input'), method('_hmb_native_failure_code')]
+MODEL_SELECTION_ERROR = deepcopy(next(
+    n for n in TREE.body
+    if isinstance(n, ast.ClassDef) and n.name == '_HMBModelSelectionRequired'
+))
 CLASS = ast.ClassDef(name='ProductAdapter', bases=[ast.Name(id='NativeBoundary', ctx=ast.Load())],
                      keywords=[], body=[method('_process')], decorator_list=[])
 compiled = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0),
-                           *FUNCTIONS, CLASS], type_ignores=[])
+                           MODEL_SELECTION_ERROR, *FUNCTIONS, CLASS], type_ignores=[])
 exec(compile(ast.fix_missing_locations(compiled), str(SOURCE), 'exec'), GLOBALS)
 Adapter = GLOBALS['ProductAdapter']
 literal_run = GLOBALS['_run_native_with_literal_hmb_input']
@@ -173,6 +177,10 @@ class NativeAdapterArity(unittest.TestCase):
             callback()
         self.assertEqual(classify(failure.exception), 'HOST_ADAPTER')
         inspect.signature(Adapter._process).bind(self.node, self.state, self.prompt, self.output_type)
+
+    def test_saved_unsupported_model_requires_selection_without_host_adapter_fallback(self):
+        error = GLOBALS['_HMBModelSelectionRequired']('Saved model is unavailable.')
+        self.assertEqual(classify(error), 'MODEL_SELECTION_REQUIRED')
 
 
 if __name__ == '__main__':

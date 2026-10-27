@@ -13,6 +13,7 @@ import hashlib
 from pathlib import Path
 import sys
 import threading
+import time
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -768,6 +769,13 @@ class ImportChildCleanupRegression(unittest.TestCase):
             self.assertEqual(len(self.host.event_manager.pre_hooks), 2)
             self.assertEqual(len(self.host.event_manager.post_hooks[RemoveParameterFromNodeRequest]), 2)
             state["finalizer"]()
+            # GC cleanup deliberately leaves the SDK dispatch-hook lock before
+            # unregistering. Await that bounded worker, not a scheduling race.
+            deadline = time.monotonic() + 2
+            while (len(self.host.event_manager.pre_hooks) > 1
+                    or len(self.host.event_manager.post_hooks[RemoveParameterFromNodeRequest]) > 1):
+                self.assertLess(time.monotonic(), deadline, 'Deferred finalizer did not remove only its hooks')
+                time.sleep(.001)
         self.assertEqual(self.host.event_manager.pre_hooks, [sentinel_pre])
         self.assertEqual(self.host.event_manager.post_hooks[RemoveParameterFromNodeRequest], [sentinel_post])
         self.assertEqual(self.mutations(), [])

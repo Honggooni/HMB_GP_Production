@@ -150,6 +150,57 @@ function bridgeValue(props) {
   return value && typeof value === "object" ? value : {};
 }
 
+function bridgeOwnerRank(container) {
+  // This transport's own element is intentionally zero-height/transparent.
+  // Rank its native host instead, so a measurement/footer clone cannot replace
+  // a still-mounted interactive row solely because it mounted last.
+  if (container?.isConnected === false) return null;
+  const view = container?.ownerDocument?.defaultView;
+  let rank = 0;
+  for (let element = container?.parentElement, depth = 0; element && depth < 32; element = element.parentElement, depth += 1) {
+    const style = view?.getComputedStyle?.(element) || element.style || {};
+    if (element.hidden || style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") rank -= 100;
+    const ownHiddenRow = element.getAttribute?.("data-parameter-name") === "HMB_IMAGE_ASSET_THUMBNAIL_PATCH";
+    if (!ownHiddenRow && style.opacity !== "" && style.opacity != null && Number(style.opacity) === 0) rank -= 50;
+    if (element.matches?.(".react-flow__node")) break;
+  }
+  return rank;
+}
+
+function bridgeLiveOwner(owners) {
+  let chosen = null, chosenRank = -Infinity;
+  for (const owner of owners.values()) {
+    if (!owner.live()) continue;
+    const rank = bridgeOwnerRank(owner.container);
+    // Equal ranks retain the previous last-writer behavior. Real visible
+    // native rows win over later hidden measurement/footer copies.
+    if (rank !== null && rank >= chosenRank) { chosen = owner; chosenRank = rank; }
+  }
+  return chosen;
+}
+
+function publishBridgeOwners(registry, runtimeId, owners) {
+  const prior = registry?.get(runtimeId) || {};
+  const owner = bridgeLiveOwner(owners);
+  if (owner) {
+    const entry = { ...prior, bridgeOwners: owners, bridgeToken: owner.token,
+      catalogPageVersion: owner.catalogPageVersion,
+      dispatch(request) {
+        const current = registry?.get(runtimeId);
+        if (current?.bridgeOwners !== owners) throw new Error("This image bridge is no longer mounted.");
+        const live = bridgeLiveOwner(owners);
+        if (!live) throw new Error("This image bridge has no mounted owner.");
+        return live.dispatch(request);
+      } };
+    registry?.set(runtimeId, entry);
+    return entry;
+  }
+  const { bridgeOwners: _owners, bridgeToken: _token, dispatch: _dispatch, ...consumers } = prior;
+  if (hasConsumers(consumers)) registry?.set(runtimeId, consumers);
+  else registry?.delete(runtimeId);
+  return null;
+}
+
 function hmbNativeUiImplementation(container, props) {
   if (!container) return { cleanup() {}, update() {} };
   container.__hmbImageAssetThumbnailBridgeCleanup?.();
@@ -157,16 +208,18 @@ function hmbNativeUiImplementation(container, props) {
 
   let latestProps = props || {};
   let runtimeId = "";
+  let disposed = false;
   let deliveredResultKey = "";
   const token = `hmb-image-thumbnail-bridge-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const registry = bridgeRegistry();
 
   const dispatch = (rawRequest) => {
+    if (disposed) throw new Error("This image bridge is no longer mounted.");
     if (typeof latestProps?.onChange !== "function") {
       throw new Error("HMB image thumbnail bridge did not receive props.onChange.");
     }
     const source = rawRequest && typeof rawRequest === "object" ? rawRequest : {};
-    const operation = ["catalog_probe", "catalog_page"].includes(clean(source.operation))
+    const operation = ["catalog_probe", "catalog_page", "cgt_catalog", "cgt_confirm", "cgt_cancel"].includes(clean(source.operation))
       ? clean(source.operation) : "hydrate";
     const request = {
       schema: "hmb-image-asset-thumbnail-bridge",
@@ -181,7 +234,18 @@ function hmbNativeUiImplementation(container, props) {
     };
     const projectCacheUid = clean(source.project_cache_uid);
     if (projectCacheUid) request.project_cache_uid = projectCacheUid;
-    if (operation === "catalog_page") {
+    if (operation.startsWith("cgt_")) {
+      request.session_id = clean(source.session_id);
+      request.project_identity = clean(source.project_identity);
+      if (!request.session_id || !request.request_id || request.runtime_instance_id !== runtimeId
+          || (operation === "cgt_confirm" && !request.project_identity)) throw new Error("Invalid CGT dialog request.");
+      const cgtProjectId = clean(source.cgt_project_id);
+      if (cgtProjectId) {
+        if (!/^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/.test(cgtProjectId)) throw new Error("Invalid CGT project identity.");
+        request.cgt_project_id = cgtProjectId;
+      }
+      if (operation === "cgt_confirm") request.hierarchy_request = source.hierarchy_request;
+    } else if (operation === "catalog_page") {
       Object.assign(request,{session_id:clean(source.session_id),sequence:Math.max(0,Math.floor(Number(source.sequence)||0)),
         query:String(source.query||"").slice(0,256),folder:clean(source.folder).replaceAll("\\","/"),
         folder_signature:clean(source.folder_signature),source_view:source.source_view==="user"?"user":"project",
@@ -224,7 +288,7 @@ function hmbNativeUiImplementation(container, props) {
       || clean(value?.runtime_instance_id) !== runtimeId
     ) return false;
     const operation = clean(value?.operation);
-    if (operation !== "hydrate" && operation !== "catalog_probe" && operation !== "catalog_page") return false;
+    if (!["hydrate", "catalog_probe", "catalog_page", "cgt_catalog", "cgt_confirm", "cgt_cancel"].includes(operation)) return false;
     const resultKey = `${operation}:${clean(value.request_id)}:${Math.max(0, Math.floor(Number(value.thumbnail_revision) || 0))}:${clean(value.outcome)}`;
     if (!resultKey || resultKey === deliveredResultKey) return false;
     const current = registry?.get(runtimeId) || {};
@@ -264,42 +328,32 @@ function hmbNativeUiImplementation(container, props) {
 
   const register = (value) => {
     const nextRuntimeId = clean(value?.runtime_instance_id);
-    if (runtimeId) {
-      const prior = registry?.get(runtimeId);
-      if (prior?.bridgeToken === token) {
-        const {
-          bridgeToken: _bridgeToken,
-          dispatch: _dispatch,
-          ...consumerEntry
-        } = prior;
-        if (hasConsumers(consumerEntry)) {
-          registry.set(runtimeId, consumerEntry);
-        }
-        else registry.delete(runtimeId);
-      }
+    if (runtimeId && runtimeId !== nextRuntimeId) {
+      const owners = registry?.get(runtimeId)?.bridgeOwners;
+      if (owners instanceof Map) { owners.delete(token); publishBridgeOwners(registry, runtimeId, owners); }
     }
     runtimeId = nextRuntimeId;
     if (runtimeId && registry) {
       const prior = registry.get(runtimeId) || {};
-      const entry={ ...prior, bridgeToken: token, dispatch, catalogPageVersion:Number(value?.catalog_page_version)||0 };
-      registry.set(runtimeId, entry);
-      wakeCatalogConsumers(entry);
+      const owners = prior.bridgeOwners instanceof Map ? prior.bridgeOwners : new Map();
+      owners.delete(token);
+      owners.set(token, { token, container, dispatch, live: () => !disposed,
+        catalogPageVersion: Number(value?.catalog_page_version) || 0 });
+      const entry = publishBridgeOwners(registry, runtimeId, owners);
+      if (entry) wakeCatalogConsumers(entry);
     }
     deliverResult(value);
   };
   register(bridgeValue(latestProps));
 
   const cleanup = () => {
-    const current = runtimeId ? registry?.get(runtimeId) : null;
-    if (current?.bridgeToken === token) {
-      const {
-        bridgeToken: _bridgeToken,
-        dispatch: _dispatch,
-        ...consumerEntry
-      } = current;
-      if (hasConsumers(consumerEntry)) {
-        registry.set(runtimeId, consumerEntry);
-      } else registry.delete(runtimeId);
+    if (disposed) return;
+    disposed = true;
+    const owners = runtimeId ? registry?.get(runtimeId)?.bridgeOwners : null;
+    if (owners instanceof Map && owners.delete(token)) {
+      // Teardown restores transport ownership without scheduling fresh work.
+      // The surviving visible consumer keeps its existing cadence/requests.
+      publishBridgeOwners(registry, runtimeId, owners);
     }
     if (container.__hmbImageAssetThumbnailBridgeCleanup === cleanup) {
       delete container.__hmbImageAssetThumbnailBridgeCleanup;
@@ -310,6 +364,7 @@ function hmbNativeUiImplementation(container, props) {
   return {
     cleanup,
     update(nextProps) {
+      if (disposed) return;
       latestProps = nextProps || {};
       register(bridgeValue(latestProps));
       makeContainerInert(container);

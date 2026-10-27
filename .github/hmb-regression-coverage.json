@@ -3,6 +3,78 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_Workflow_Serialization_Identity_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Isolated installed SDK verifies serialization identity lifetime, exact encoding, aliases, empty media lists, artifacts, failed saves and owner unload/reacquire without provider execution."
+    },
+    {
+      "name": "HMB_Native_Editor_Installer_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Web_Rerender_Connection_Fence_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Native_Connection_Manager_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Common_Connection_Management_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Actual SDK verifies persistent detach, exact five-shot reconnect, transaction rollback, lock and busy boundaries, serialization, flow identity and future HMB tools without provider execution."
+    },
+    {
+      "name": "HMB_Library_Layout_Read_Budget_Regression.mjs",
+      "mode": "ci",
+      "coverage": "javascript_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Connected_Deletion_Guard_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Isolated actual SDK verifies native delete/reset/group/flow/forced clear refusal before mutation, future HMB identity and live remote dependencies, disconnected deletion and ordinary workflow replacement without provider execution."
+    },
+    {
+      "name": "HMB_Native_Connected_Deletion_Guard_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Library_Native_Header_Widget_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": false,
+      "reason": "Offline installed React portals with actual HMB product widgets verify stable native slots, body lock boundaries, retained shot pages and cleanup; SDK actions and transport are synthetic."
+    },
+    {
+      "name": "HMB_Generation_Finish_Native_Header_Widget_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": false,
+      "reason": "Offline Chromium product headers verify native slot lifecycle, original fields, lock and pointer boundaries without live generation or uploads."
+    },
+    {
+      "name": "HMB_Image_Bash_Header_Widget_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": false,
+      "reason": "Actual Chromium with synthetic host callbacks checks the HMBImageBash remote selector, source escaping, scoped red image connection, hidden internal context edge and mount cleanup. Does not establish live Griptape Apply or Run."
+    },
+    {
       "name": "HMB_Maintenance_Queue_Admission_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
@@ -2818,6 +2890,227 @@
       "mode": "ci",
       "coverage": "python_contract",
       "required": true
+    },
+    {
+      "name": "HMB_Shot_Hierarchy_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Shot_Hierarchy_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Shot_Hierarchy_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Explicit isolated installed SDK test: five independent native Prompt/Agent/Generator paths, grouped display names, immutable Task checkpoint and graph save/reopen without paid requests."
+    },
+    {
+      "name": "HMB_CGT_Own_Task_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_CGT_Hierarchy_Widget_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_CGT_Hierarchy_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Isolated actual SDK cold node deserialization and five native independent Prompt/Agent/Generator paths. CGT task IDs, model responses and render boundaries are synthetic; no live network or charges."
+    },
+    {
+      "name": "HMB_Image_Bash_Render_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Bash_State_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Bash_Compatibility_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Bash_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires isolated installed Griptape SDK. Verifies exact Apply PNG Run output and native saved workflow restore without paid generation or changing the user canvas."
+    },
+    {
+      "name": "HMB_Color_LUT_Native_Header_Portal_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": false,
+      "reason": "Requires the pinned installed editor React and native header bundle plus Chrome to validate the local Color LUT host prototype, native callbacks, hidden measurement isolation and handle geometry lifecycle. SDK transport is synthetic; live installation and user workflows are not changed."
+    },
+    {
+      "name": "HMB_Color_LUT_Native_Header_Reset_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed SDK and FFmpeg to validate native ResetNodeToDefaultsRequest, compatible connections, node identity, position, size and locked-node rejection. Uses temporary nodes and local media; no live workflow or provider calls."
+    },
+    {
+      "name": "HMB_Image_Bash_Workspace_Widget_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": false,
+      "reason": "Requires Chrome and an isolated installed SDK to cross-check actual ImageAsset workspace UI with native ImageUrlArtifact output order. Uses synthetic catalog media and preserves the five Shot records; no provider calls or installation."
+    },
+    {
+      "name": "HMB_Image_Bash_ImageAsset_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed SDK to verify ImageAsset Image Bash workspace outputs, two native connections, stable instance identities, automatic node creation and native save/reopen. Synthetic local catalog fixtures only; no live app, provider or installation writes."
+    },
+    {
+      "name": "HMB_Color_LUT_Native_Initial_Geometry_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": false,
+      "reason": "Requires the pinned local editor bundle, Chrome and isolated installed SDK to validate fresh Color LUT native placement hints, one-time compact geometry, deferred ReactFlow queue and restore/custom-size preservation. No live workflow, installation or provider writes."
+    },
+    {
+      "name": "HMB_Seedance_Preflight_Modal_Lifecycle_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": false,
+      "reason": "Product preflight popup focus, single-owner, async response, Escape, cleanup and repeated lifecycle in isolated Chrome. No live workflow or paid calls."
+    },
+    {
+      "name": "HMB_VideoPicker_File_Chooser_Owner_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": false,
+      "reason": "Product file chooser owner retained through long waits, cancellation, stale inputs, deleted workspace and cleanup in isolated Chrome. No live OS chooser or provider calls."
+    },
+    {
+      "name": "HMB_Image_Asset_Native_Clone_Isolation_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": false,
+      "reason": "Actual product Asset factory and opacity-zero footer/hidden allocator copies in isolated Chrome. Protects visible widget columns and PROJECT_ROOT-only concealment."
+    },
+    {
+      "name": "HMB_Image_Asset_Thumbnail_Bridge_Owner_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": false,
+      "reason": "Actual Asset CGT dialog and thumbnail bridge owner lifecycle in isolated Chrome, preserving live dispatch after measurement or footer cleanup. No live account mutations."
+    },
+    {
+      "name": "HMB_CGT_Thumbnail_Bridge_Mount_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed SDK to verify the zero-height PROPERTY transport remains mountable, legacy native hide overrides are repaired during cold hydration, and all five Shot identities and bridge values survive save/reopen. No live CGT, account, provider or user workflow writes."
+    },
+    {
+      "name": "HMB_Native_Studio_Icon_Header_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": false,
+      "reason": "Requires the pinned installed editor React and native header/icon/collapse functions plus Chrome to verify compact icon and expanded header lifecycle with actual Asset/Picker bodies. SDK transport, store and animation boundaries are synthetic; no live app, installation or provider writes."
+    },
+    {
+      "name": "HMB_Native_Studio_Icon_Geometry_Regression.mjs",
+      "mode": "manual",
+      "coverage": "javascript_contract",
+      "required": false,
+      "reason": "Requires the pinned local editor source and guarded Python patch tool to execute exact native constructor/dimension/style/store functions in an isolated VM. Verifies compact geometry, cold restore and unrelated-node preservation with synthetic SDK data; no live app or installation writes."
+    },
+    {
+      "name": "HMB_Image_Asset_Publication_Cursor_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Bash_Metadata_Refresh_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Actual isolated SDK metadata refresh and owner lease; no provider calls."
+    },
+    {
+      "name": "HMB_Image_Bash_Topology_Refresh_Widget_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": false,
+      "reason": "Actual Chrome public topology observer and product widget; synthetic SDK transport."
+    },
+    {
+      "name": "HMB_Prompt_Idle_ACK_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": false,
+      "reason": "Actual product widget with bounded synthetic backend ACK timing and preserved five-shot documents."
+    },
+    {
+      "name": "HMB_Agent_Hydration_Pending_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Shot_Restored_Cursor_Floor_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Shot_Routing_Generated_Restore_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Isolated SDK generated-workflow save/cold replay with five independent documents and live authority; no provider calls."
+    },
+    {
+      "name": "HMB_Agent_Hydration_Pending_Widget_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": false,
+      "reason": "Real product Agent widget retains pending saved rows without enabling selection or execution before live authority."
+    },
+    {
+      "name": "HMB_Image_Asset_Hook_Finalizer_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Actual SDK pre/post-hook locks and GC cleanup; bounded isolated processes, no provider calls."
+    },
+    {
+      "name": "HMB_Agent_Model_Identity_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Isolated native SDK preserves saved provider/model identities and rejects unsupported execution before provider calls."
+    },
+    {
+      "name": "HMB_Workflow_Standalone_Legacy_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Isolated native SDK preserves unbound standalone legacy editors without hydration recalculation; ambiguous or previously bound workflows retain migration protection."
     }
   ]
 }

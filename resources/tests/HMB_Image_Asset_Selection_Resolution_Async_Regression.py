@@ -48,6 +48,12 @@ def selected_state(name="A", project="ProjectA"):
 def fake_node(state):
     node = object.__new__(asset.HMBImageAssetLibrary)
     live = {"state": state}
+    node.name = "synthetic_async_selection"
+    node.get_parameter_value = lambda name: asset._json_text(live["state"]) if name == asset.WIDGET_STATE_PARAMETER else ""
+    def set_value(name, value):
+        assert name == asset.WIDGET_STATE_PARAMETER
+        live["state"] = asset._normalize_state(value)
+    node.set_parameter_value = set_value
     node._current_state = lambda: deepcopy(live["state"])
     node._scan_owner_is_current = lambda: not getattr(node, "_hmb_node_deleted", False)
     node._hmb_import_media_by_uid = {}

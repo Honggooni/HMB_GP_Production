@@ -1,9 +1,12 @@
 from pathlib import Path
+import atexit
+from contextlib import ExitStack
 import copy
 import hashlib
 import importlib.util
 import io
 import json
+import os
 import queue
 import random
 import re
@@ -15,6 +18,21 @@ import types
 from unittest import mock
 
 from _hmb_bundled_policy_session import install_bundled_policy_session
+
+
+# Keep the script's module-global fixtures intact while entering its supported
+# diagnostic/cache roots before any product import. ExitStack closes on normal
+# completion and assertion failure alike; no user's profile is used by CI.
+_CI_ISOLATION = ExitStack()
+atexit.register(_CI_ISOLATION.close)
+_CI_PROFILE_ROOT = Path(_CI_ISOLATION.enter_context(tempfile.TemporaryDirectory(prefix="hmb-picker-reliability-env-")))
+_CI_PROFILE_ENV = {key: str(_CI_PROFILE_ROOT / key) for key in (
+    "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+    "XDG_STATE_HOME", "XDG_CACHE_HOME", "TEMP", "TMP",
+)}
+for _CI_DIRECTORY in _CI_PROFILE_ENV.values():
+    Path(_CI_DIRECTORY).mkdir()
+_CI_ISOLATION.enter_context(mock.patch.dict(os.environ, _CI_PROFILE_ENV))
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -667,6 +685,7 @@ assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow>=12.3.0,<14" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
 assert registered_widgets == {
+    "HMBImageBashWidget",
     "HMBAgentLibraryWidget",
     "HMBColorLUTLibraryWidget",
     "HMBFinishLookLibraryWidget",
@@ -683,6 +702,7 @@ assert (ROOT / "widgets/HMBImageAssetThumbnailPatchBridgeWidget.js").is_file()
 assert (ROOT / "widgets/HMBVideoPickerCommandBridgeWidget_v032.js").is_file()
 assert (ROOT / "widgets/HMBSeedanceGenerationWidget.js").is_file()
 assert (ROOT / "widgets/HMBImageGenerationWidget.js").is_file()
+assert (ROOT / "widgets/HMBImageBashWidget.js").is_file()
 obsolete_picker_widgets = (
     "HMBVideoPickerLibraryWidget.js",
     "HMBVideoPickerLibraryWidget_v028.js",
@@ -725,10 +745,10 @@ assert prompt.PROMPT_MIN_HEIGHT == 1193
 finish_manifest = next(item for item in manifest["nodes"] if item["class_name"] == "HMBFinishLookLibrary")
 for finish_options in (finish_manifest["metadata"], finish_manifest["metadata"]["ui_options"]):
     for height_key in ("height", "default_height", "preferred_height", "initial_height"):
-        assert finish_options[height_key] == 1091
+        assert finish_options[height_key] == 864
     assert finish_options["min_height"] == 620
 for size_key in ("node_size", "default_size", "initial_size"):
-    assert finish_manifest["metadata"]["ui_options"][size_key] == {"width": 980, "height": 1091}
+    assert finish_manifest["metadata"]["ui_options"][size_key] == {"width": 980, "height": 864}
 assert picker_manifest["metadata"]["ui_options"]["initial_width"] == 1400
 assert picker_manifest["metadata"]["ui_options"]["initial_height"] == 360
 assert picker_manifest["metadata"]["ui_options"]["min_height"] == 360

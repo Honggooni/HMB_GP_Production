@@ -25,6 +25,7 @@ for (const [name, declaration] of [
   assert.ok(source.includes(declaration), declaration);
   source = source.replace(declaration, `${declaration}\nif (globalThis.__pageProbe) { globalThis.__pageProbe.${name}++; ${name === 'normalize' ? 'globalThis.__pageStacks.push(new Error().stack);' : ''} }`);
 }
+source += '\nexport {hmbReadStoredSourceScroll};';
 const server = http.createServer((request, response) => {
   response.setHeader('Content-Type', request.url === '/widget.js' ? 'text/javascript; charset=utf-8' : 'text/html; charset=utf-8');
   response.end(request.url === '/widget.js' ? source : '<!doctype html><meta charset="utf-8"><div class="react-flow__node" id="shell" style="height:1350px;width:1800px"><div style="height:96px">Synthetic native header</div><div id="host"></div></div>');
@@ -43,6 +44,11 @@ try {
   await page.goto(`http://127.0.0.1:${server.address().port}`);
   receipt.result = await page.evaluate(async (imageRows) => {
     const widget = await import('/widget.js');
+    const legacy={dataset:{hmbImageSourceScrollTop:'210',hmbVideoSourceScrollTop:'320',hmbManagerBodyScrollTop:'430'}};
+    const scrollKeys=['imageSources','videoSources','managerBody'];
+    if(JSON.stringify(scrollKeys.map(key=>widget.hmbReadStoredSourceScroll(legacy,key)))!=='[210,320,430]')throw Error('Legacy dataset scroll was discarded');
+    legacy.__hmbPromptLibraryScrollMemory={imageSources:0,videoSources:17,managerBody:0};
+    if(JSON.stringify(scrollKeys.map(key=>widget.hmbReadStoredSourceScroll(legacy,key)))!=='[0,17,0]')throw Error('Explicit zero scroll leaked a previous page dataset');
     const channel = '11111111-1111-4111-8111-111111111111';
     const shots = Array.from({length: 5}, (_, index) => ({channel_uuid: channel, shot_uuid: `22222222-2222-4222-8222-${String(index + 1).padStart(12, '0')}`, number: index + 1, name: `Prepared asset ${index + 1}`, selected_source_uids: []}));
     let latest = widget.normalizeState({multi_shot_enabled: true, shot: shots[0], source_sync_revision: 1, image_asset: {shot_catalog: shots, shot_catalog_routing: {publisher_instance_uuid: channel, channel_uuid: channel, generation: 1, metadata_sha256: 'a'.repeat(64)}}});
@@ -174,10 +180,74 @@ try {
     controller.update(props(restored)); await frames(); await frames();
     await select(2);
     if (host.querySelector(`[data-text-key="${key}"]`).value !== expected.get(shots[2].shot_uuid)) throw Error('Exact UUID restoration lost its document');
-    const max = Math.max(...durations);
+    // Prepared-page interaction regression: nonzero per-shot scroll and restored
+    // focus/caret survive switches, including a rapid unacknowledged burst.
+    const expectedScroll = new Map();
+    for (let index=0;index<5;index++) {
+      await select(index);
+      const center=host.querySelector('.group-card[data-group-id="imageSources"] .source-scrollbox');
+      for(const [key,value] of [['height','120px'],['min-height','120px'],['max-height','120px'],['overflow-y','auto'],['flex','0 0 120px']])center.style.setProperty(key,value,'important');
+      await frames();
+      center.scrollTop=index===2 ? 0 : 200+index*170;
+      center.dispatchEvent(new Event('scroll'));
+      expectedScroll.set(shots[index].shot_uuid,center.scrollTop);
+      if(index!==2 && center.scrollTop<=0)throw Error('Scroll fixture did not overflow '+JSON.stringify({height:center.clientHeight,scroll:center.scrollHeight,overflow:getComputedStyle(center).overflowY,html:center.outerHTML.slice(0,300)}));
+    }
+    for(const index of [4,2,0,3,1,4,0]) {
+      await select(index);
+      const actual=host.querySelector('.group-card[data-group-id="imageSources"] .source-scrollbox').scrollTop;
+      if(Math.abs(actual-expectedScroll.get(shots[index].shot_uuid))>1)throw Error(`Nonzero shot scroll lost ${index}: ${actual} expected ${expectedScroll.get(shots[index].shot_uuid)}`);
+    }
+    for(let index=0;index<40;index++)host.querySelector(`[data-prompt-shot="${shots[(index*3+1)%5].shot_uuid}"]`).click();
+    await frames();await frames();
+    const afterBurst=host.querySelector('.group-card[data-group-id="imageSources"] .source-scrollbox').scrollTop;
+    if(Math.abs(afterBurst-expectedScroll.get(latest.shot.shot_uuid))>1)throw Error('Rapid switch lost selected shot scroll');
+    const beforeLateAck=structuredClone(latest);
+    for(const index of [2,4,2,0,2,1])host.querySelector(`[data-prompt-shot="${shots[index].shot_uuid}"]`).click();
+    controller.update(props(beforeLateAck));
+    await frames();await frames();
+    if(latest.shot.shot_uuid!==shots[1].shot_uuid || host.querySelector(`[data-prompt-shot="${shots[1].shot_uuid}"]`).getAttribute('aria-selected')!=='true')throw Error('Stale ACK changed the selected page');
+    const afterLateAck=host.querySelector('.group-card[data-group-id="imageSources"] .source-scrollbox').scrollTop;
+    if(Math.abs(afterLateAck-expectedScroll.get(shots[1].shot_uuid))>1)throw Error('Stale ACK or deferred callback changed the new page scroll');
+    const selectWithPointer = async (index) => {
+      const button=host.querySelector(`[data-prompt-shot="${shots[index].shot_uuid}"]`);
+      button.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0}));button.click();await frames();await frames();
+    };
+    for(let index=0;index<5;index++) {
+      await selectWithPointer(index);
+      const field=host.querySelector(`[data-text-key="${key}"]`);
+      field.focus({preventScroll:true});field.setSelectionRange(index+1,index+3);
+      await selectWithPointer((index+1)%5);
+    }
+    for(const index of [4,2,0,3,1]) {
+      await selectWithPointer(index);
+      const field=host.querySelector(`[data-text-key="${key}"]`);
+      if(document.activeElement!==field || field.selectionStart!==index+1 || field.selectionEnd!==index+3)throw Error('Per-shot focus or caret lost '+index);
+      if(field.value!==expected.get(shots[index].shot_uuid))throw Error('Focus restore changed authored text');
+    }
+    const finalSaved=JSON.parse(JSON.stringify(latest));
     controller.cleanup();
+    controller=widget.default(host,props(finalSaved));await frames();await frames();
+    for(let index=0;index<5;index++){
+      await select(index);
+      if(host.querySelector(`[data-text-key="${key}"]`).value!==expected.get(shots[index].shot_uuid))throw Error('Reconstruction after mixed scroll lost authored text');
+      if(latest.images[0].owner!==`Target ${index+1} {literal}`)throw Error('Reconstruction after mixed scroll lost binding');
+      const box=host.querySelector('.group-card[data-group-id="imageSources"] .source-scrollbox');
+      for(const [key,value] of [['height','120px'],['min-height','120px'],['max-height','120px'],['overflow-y','auto'],['flex','0 0 120px']])box.style.setProperty(key,value,'important');
+      await frames();box.scrollTop=index%2 ? 0 : 90+index*70;box.dispatchEvent(new Event('scroll'));expectedScroll.set(shots[index].shot_uuid,box.scrollTop);
+    }
+    for(const index of [3,4,1,0,2]){
+      await select(index);
+      if(Math.abs(host.querySelector('.group-card[data-group-id="imageSources"] .source-scrollbox').scrollTop-expectedScroll.get(shots[index].shot_uuid))>1)throw Error('Reconstructed zero/nonzero page scroll leaked');
+    }
+    const max = Math.max(...durations);
+    host.querySelector(`[data-prompt-shot="${shots[1].shot_uuid}"]`).click();
+    controller.cleanup();
+    const cleanupPublications=publications;
+    await frames();await frames();
+    if(publications!==cleanupPublications)throw Error('Cleanup allowed a deferred navigation publication');
     if (host.children.length || host.__hmbPromptLibraryApplyProps || host.__hmbPromptLibraryLifecycle) throw Error('Cleanup left a cached page or lifecycle behind');
-    return {shots: 5, image_rows_per_shot: imageRows, burst_selections: 40, acknowledged_selections: 10, pure_navigation_work: pure, max_click_ms: max, per_shot_dirty_edit: 5, save_reopen_checks: 5, deleted_replaced_restored_uuid: true, publications, passed: true};
+    return {shots: 5, image_rows_per_shot: imageRows, burst_selections: 40, acknowledged_selections: 10, pure_navigation_work: pure, max_click_ms: max, per_shot_dirty_edit: 5, save_reopen_checks: 5, deleted_replaced_restored_uuid: true, publications, scroll_checks:17, rapid_scroll_switches:46, focus_caret_checks:5, legacy_scroll_checks:6, stale_scroll_ack_checks:1, post_scroll_save_reopen_checks:5, deferred_cleanup_checks:1, passed: true};
   }, imageRows);
   assert.deepEqual(errors, []);
   assert.equal(receipt.external_requests, 0);

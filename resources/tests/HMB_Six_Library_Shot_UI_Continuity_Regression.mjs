@@ -13,7 +13,13 @@ const files = [
 const modules = await Promise.all(files.map(async ([file, root]) => {
   const url = new URL(`../../widgets/${file}`, import.meta.url);
   const source = fs.readFileSync(url, 'utf8');
-  assert.ok(source.includes(`${root} :is(button,input,select,textarea){font-family:inherit}`), `${file}: native controls inherit the common font, without overriding size/weight.`);
+  const scopedFontRules = [
+    ':not([data-hmb-native-identity] *,[data-hmb-native-actions] *)',
+    ':not([data-hmb-native-identity] *):not([data-hmb-native-actions] *)',
+    ':not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *))',
+  ];
+  assert.ok(scopedFontRules.some(scope => source.includes(`${root} :is(button,input,select,textarea)${scope}{font-family:inherit}`)),
+    `${file}: body controls inherit font without size/weight overrides; native header controls retain host styling.`);
   assert.ok(source.includes('"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif'));
   return import(url);
 }));

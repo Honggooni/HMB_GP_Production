@@ -380,6 +380,128 @@ def _subscription(node: Any, export: dict[str, Any]) -> dict[str, Any]:
     return deepcopy(value) if isinstance(value, dict) else {}
 
 
+def _has_saved_shot_identity(value: Any) -> bool:
+    """Do not mistake a detached former Shot editor for a standalone editor."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str) and (
+                key.endswith("channel_uuid") or key.endswith("shot_uuid")
+                or key == "publisher_instance_uuid"
+            ) and item:
+                return True
+            if _has_saved_shot_identity(item):
+                return True
+    elif isinstance(value, (list, tuple)):
+        return any(_has_saved_shot_identity(item) for item in value)
+    return False
+
+
+def _has_saved_editor_authoring_identity(kind: str, exported: dict[str, Any]) -> bool:
+    """Keep native Agent payloads distinct from their typed ownership metadata."""
+    if kind != "agent":
+        return _has_saved_shot_identity(exported)
+
+    def visit(value: Any, role: str = "export") -> bool:
+        if not isinstance(value, dict):
+            return _has_saved_shot_identity(value)
+        for key, item in value.items():
+            # These are actual native slot parameter/output names. Their
+            # contents can be a user's JSON schema, tool data or model result,
+            # including arbitrary fields named shot_uuid. Unknown slot fields,
+            # execution receipts and legacy widgets remain strict metadata.
+            if (role == "values" and key in {"output_schema", "prompt", "additional_context",
+                    "agent_memory", "agent", "tools", "rulesets"}
+                    or role == "outputs" and key in {"output", "logs", "agent"}
+                    or role == "slot" and key == "children"):
+                continue
+            if isinstance(key, str) and (
+                    key.endswith("channel_uuid") or key.endswith("shot_uuid")
+                    or key == "publisher_instance_uuid") and item:
+                return True
+            next_role = "metadata"
+            if role in {"export", "cache"}:
+                if role == "export" and key == "native_slot":
+                    next_role = "slot"
+                elif key == "slots":
+                    next_role = "slot_map"
+                elif key == "archives":
+                    next_role = "archive_map"
+                elif role == "export" and key == "private_cache":
+                    next_role = "cache"
+            elif role == "archive":
+                if key == "native_slot":
+                    next_role = "slot"
+                elif key in {"original_slots", "unbound_slots"}:
+                    next_role = "slot_map"
+                elif key == "source_archives":
+                    next_role = "archive_map"
+            elif role == "slot_map":
+                if isinstance(key, str) and "\x1f" in key:
+                    return True
+                next_role = "slot"
+            elif role == "archive_map":
+                next_role = "archive"
+            elif role == "slot" and key in {"values", "outputs"}:
+                next_role = key
+            if visit(item, next_role):
+                return True
+        return False
+
+    return visit(exported)
+
+
+def _has_saved_editor_store_identity(kind: str, exported: dict[str, Any]) -> bool:
+    """Inspect only typed editor stores, not arbitrary user text/schema keys."""
+    cache = exported.get("private_cache")
+    cache = cache if isinstance(cache, dict) else {}
+    if kind == "prompt":
+        state = exported.get("state")
+        state = state if isinstance(state, dict) else {}
+        stores = (exported.get("materialized_documents"), state.get("shot_documents"))
+        separator = "/"
+        active = ()
+    elif kind == "agent":
+        stores = tuple(owner.get(key) for owner in (exported, cache) for key in ("slots", "results"))
+        separator = "\x1f"
+        active = (exported.get("active_slot_key"), cache.get("active_slot_key"))
+    elif kind == "finish_look":
+        stores = (exported.get("documents"), cache.get("documents"), cache.get("remote_owners"))
+        separator = "\x1f"
+        active = (cache.get("active"),)
+    else:
+        return False
+    keys = list(active)
+    for store in stores:
+        if isinstance(store, dict):
+            keys.extend(store)
+    # Reserved Only/default/unbound keys contain no separator. Even a partial
+    # saved composite identity remains ambiguous and must use existing checks.
+    return any(isinstance(key, str) and separator in key for key in keys)
+
+
+def _single_standalone_editors(flow: Any, groups: dict[str, list[Any]],
+    exports: dict[str, Any]) -> bool:
+    """Preserve ordinary unbound editors without manufacturing Shot ownership."""
+    if not any(groups.values()) or any(len(nodes) > 1 for nodes in groups.values()):
+        return False
+    if any(isinstance(getattr(node, "metadata", None), dict)
+            and node.metadata.get("library") == _LIBRARY
+            and node.metadata.get("node_type") == "HMBImageAssetLibrary"
+            for node in flow.nodes.values()):
+        return False
+    for nodes in groups.values():
+        for node in nodes:
+            exported = exports[node.name]
+            subscription = _subscription(node, exported)
+            if (_node_manual_rebind_required(node)
+                    or subscription.get("enabled") is True
+                    or _has_saved_shot_identity(subscription)
+                    or _has_saved_editor_authoring_identity(_kind(node), exported)
+                    or _has_saved_editor_store_identity(_kind(node), exported)):
+                return False
+    return True
+
+
 def _validate_source_identity(engine: Any, flow: Any, groups: dict[str, list[Any]],
     exports: dict[str, Any], edges: list[dict[str, Any]]) -> None:
     """Authored UUIDs must still identify the registered same-flow publisher."""
@@ -623,6 +745,15 @@ async def migrate_flow(engine: Any, flow_name: str, *, backup_root: Path | None 
         flow = _registered_flow(engine, flow_name)
         groups, exports = _capture_editors(flow)
         existing = [node for nodes in groups.values() for node in nodes]
+        if _single_standalone_editors(flow, groups, exports):
+            # A legacy widget does not imply a Shot workflow. One unbound
+            # editor of each kind with no publisher or saved Shot identity
+            # needs no consolidation, backup rewrite, or invented binding.
+            # There is no publisher to resume. Re-projecting its ordinary
+            # Prompt outputs here would overwrite restored downstream inputs.
+            return _result(engine, flow_name, {"ok": True,
+                "code": "standalone_preserved", "flow_name": flow_name,
+                "executed_nodes": 0, "removed_nodes": []})
         requires_upgrade = any(_node_manual_rebind_required(node)
             or not bool(getattr(node, "_hmb_shot_manager_enabled", lambda: False)())
             or (_kind(node) in {"agent", "finish_look"} and isinstance(exports[node.name].get("legacy_widget"), dict)

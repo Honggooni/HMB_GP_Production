@@ -1,3 +1,55 @@
+// Module-local opt-in to the host's original React header portals. No SDK calls.
+function hmbNativeHeaderTarget(target) {
+  return Boolean(target?.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]"));
+}
+function hmbInstallNativeHeaderBridge(container, nodeType, selector) {
+  const previous = container.__hmbUnifiedNativeHeader;
+  if (previous?.nodeType === nodeType) { previous.refresh(); return previous; }
+  previous?.cleanup();
+  const doc = container.ownerDocument, win = doc?.defaultView || globalThis;
+  const oldContainerNoDrag = Boolean(container.classList?.contains?.("nodrag"));
+  const oldMarker = container.getAttribute?.("data-hmb-color-lut-widget");
+  const oldType = container.getAttribute?.("data-hmb-native-node-type");
+  const roots = new Map();
+  let active = false, disposed = false;
+  const noDrag = (element, value) => { if (Boolean(element?.classList?.contains?.("nodrag")) === value) return; if (value) element?.classList?.add?.("nodrag"); else element?.classList?.remove?.("nodrag"); };
+  const refresh = () => {
+    if (disposed) return;
+    const root = container.querySelector?.(selector);
+    if (root) {
+      if (!roots.has(root)) roots.set(root, Boolean(root.classList?.contains?.("nodrag")));
+      const status = active ? "active" : "fallback";
+      if (root.getAttribute?.("data-hmb-native-header") !== status) root.setAttribute?.("data-hmb-native-header", status);
+      noDrag(root, active ? false : roots.get(root));
+    }
+    noDrag(container, active ? false : oldContainerNoDrag);
+  };
+  const announce = phase => {
+    if (typeof win.CustomEvent === "function") doc?.dispatchEvent?.(new win.CustomEvent(`hmb-color-lut-header-${phase}`, { detail: { container } }));
+  };
+  const state = event => {
+    if (disposed || event.target !== container) return;
+    active = event.detail?.active === true; refresh();
+  };
+  const bridge = { nodeType, get active() { return active; }, refresh, cleanup() {
+    if (disposed) return;
+    announce("retire"); disposed = true; active = false;
+    container.removeEventListener?.("hmb-color-lut-header-state", state);
+    noDrag(container, oldContainerNoDrag);
+    for (const [root, old] of roots) { root.removeAttribute?.("data-hmb-native-header"); noDrag(root, old); }
+    if (oldMarker === null || oldMarker === undefined) container.removeAttribute?.("data-hmb-color-lut-widget");
+    else container.setAttribute?.("data-hmb-color-lut-widget", oldMarker);
+    if (oldType === null || oldType === undefined) container.removeAttribute?.("data-hmb-native-node-type");
+    else container.setAttribute?.("data-hmb-native-node-type", oldType);
+    if (container.__hmbUnifiedNativeHeader === bridge) delete container.__hmbUnifiedNativeHeader;
+  } };
+  container.setAttribute?.("data-hmb-color-lut-widget", "");
+  container.setAttribute?.("data-hmb-native-node-type", nodeType);
+  container.addEventListener?.("hmb-color-lut-header-state", state);
+  container.__hmbUnifiedNativeHeader = bridge;
+  refresh(); announce("ready"); return bridge;
+}
+
 export const HMB_FINISH_LOOK_SCHEMA_VERSION = 2;
 export const HMB_FINISH_LOOK_WIDGET_SCHEMA_VERSION = 1;
 export const HMB_FINISH_LOOK_ONLY_SHOT_VALUE = "__hmb_only__";
@@ -628,15 +680,15 @@ function hmbRenderFinishLook(state) {
   const headerSubtitle = t.subtitle;
   return `
     <style>
-      .hmb-finish-look :is(button,input,select,textarea){font-family:inherit}
+      .hmb-finish-look :is(button,input,select,textarea):not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)){font-family:inherit}
       .hmb-finish-look__field output{color:var(--hmb-shot-soft);font-size:11px;font-weight:750;min-height:16px;overflow-wrap:anywhere}.hmb-finish-look__field input[type="range"]{width:100%;height:26px;margin:0;cursor:ew-resize;accent-color:var(--hmb-shot-accent);touch-action:pan-y}.hmb-finish-look__field .hmb-finish-look__step-ends{display:flex;justify-content:space-between;gap:8px;color:var(--hmb-muted);font-size:8px}.hmb-finish-look__step-ends small:last-child{text-align:right}.hmb-finish-look__field:has(input:disabled) output{opacity:.42}
       .hmb-finish-look{--jewel-pink:#F472B6;--jewel-blue:#3B82F6;--jewel-green:#10B981;--jewel-purple:#8B5CF6;--jewel-yellow:#EAB308;--hmb-bg:#090c16;--hmb-panel:#0f1726;--hmb-panel-2:#111c2d;--hmb-line:#263b58;--hmb-text:#e8eef7;--hmb-muted:#91a2b7;--hmb-accent:#3B82F6;--hmb-soft:#DBEAFE;position:relative;width:100%;height:100%;min-height:720px;overflow:hidden;container-type:inline-size;border:1px solid rgba(59,130,246,.52);border-radius:11px;background:radial-gradient(circle at 8% -24%,rgba(59,130,246,.2),transparent 42%),linear-gradient(180deg,#0b1020,var(--hmb-bg));color:var(--hmb-text);box-shadow:inset 0 1px 0 rgba(255,255,255,.035),0 8px 24px rgba(0,0,0,.24);font-family:"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif;box-sizing:border-box;user-select:none}
-      .hmb-finish-look *{box-sizing:border-box;min-width:0}.hmb-finish-look [hidden]{display:none!important}.hmb-finish-look__scroll{height:100%;min-height:720px;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding-bottom:12px}.hmb-finish-look[data-dropdown-open="true"] .hmb-finish-look__scroll{padding-bottom:230px}
+      .hmb-finish-look *:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)){box-sizing:border-box;min-width:0}.hmb-finish-look [hidden]{display:none!important}.hmb-finish-look__scroll{height:100%;min-height:720px;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding-bottom:12px}.hmb-finish-look[data-dropdown-open="true"] .hmb-finish-look__scroll{padding-bottom:230px}
       .hmb-finish-look__topbar{position:sticky;z-index:30;top:0;display:flex;align-items:center;height:68px;min-height:68px;gap:16px;padding:0 16px;border-bottom:1px solid rgba(59,130,246,.35);background:linear-gradient(90deg,rgba(30,58,96,.98),rgba(9,12,22,.98))}.hmb-finish-look__mark{flex:0 0 30px;width:30px;height:30px;display:grid;place-items:center;border:1px solid rgba(59,130,246,.65);border-radius:8px;background:rgba(59,130,246,.13);color:#93c5fd;font-size:9px;font-weight:950;letter-spacing:.06em}.hmb-finish-look__heading{display:flex;flex:1 1 auto;flex-direction:column;gap:2px;overflow:hidden}.hmb-finish-look__heading b,.hmb-finish-look__heading span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hmb-finish-look__heading b{font-size:15px}.hmb-finish-look__heading span{color:var(--hmb-muted);font-size:9px}.hmb-finish-look__remote-badge{padding:4px 7px;border:1px solid rgba(244,114,182,.65);border-radius:999px;background:rgba(190,24,93,.25);color:#fbcfe8;font-size:8px;font-weight:950;letter-spacing:.12em}.hmb-finish-look__language{height:30px;min-width:58px;padding:0 10px;border:1px solid rgba(96,165,250,.55);border-radius:7px;background:#101a2a;color:#bfdbfe;font-size:12px;font-weight:800;cursor:pointer}
-      .hmb-finish-look__content{display:grid;grid-template-columns:minmax(0,1fr);gap:9px;padding:10px}.hmb-finish-look__section{border:1px solid rgba(59,130,246,.28);border-radius:9px;background:rgba(15,23,38,.9);overflow:visible}.hmb-finish-look__section-header{display:flex;align-items:center;gap:8px;min-height:39px;padding:7px 10px;border-bottom:1px solid rgba(148,163,184,.13);background:linear-gradient(90deg,rgba(59,130,246,.13),transparent)}.hmb-finish-look__section-header h2{flex:1;margin:0;color:#dbeafe;font-size:12px;letter-spacing:.055em}.hmb-finish-look__enable{display:flex;align-items:center;gap:6px;color:#cbd5e1;font-size:10px;cursor:pointer}.hmb-finish-look__enable input{accent-color:var(--hmb-accent)}.hmb-finish-look__section-body{padding:9px}.hmb-finish-look__subhead{margin:8px 0 6px;color:#7fb4f0;font-size:9px;font-weight:900;letter-spacing:.1em}.hmb-finish-look__subhead:first-child{margin-top:0}.hmb-finish-look__grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.hmb-finish-look__field{display:flex;flex-direction:column;gap:4px}.hmb-finish-look__field--wide{grid-column:1/-1}.hmb-finish-look__field>span{color:#b7c5d6;font-size:9px;font-weight:750}.hmb-finish-look input,.hmb-finish-look select,.hmb-finish-look button{font:inherit}.hmb-finish-look input[type="number"],.hmb-finish-look input[type="text"],.hmb-finish-look select{width:100%;height:30px;padding:0 8px;border:1px solid rgba(148,163,184,.28);border-radius:6px;outline:none;background:#080f1b;color:#e5edf7;font-size:10px}.hmb-finish-look input:focus,.hmb-finish-look select:focus,.hmb-finish-look button:focus-visible{border-color:#60a5fa;outline:none;box-shadow:0 0 0 1px rgba(96,165,250,.5)}.hmb-finish-look input:disabled,.hmb-finish-look select:disabled,.hmb-finish-look button:disabled{opacity:.42;cursor:not-allowed}.hmb-finish-look input[aria-invalid="true"]{border-color:#fb7185}
+      .hmb-finish-look__content{display:grid;grid-template-columns:minmax(0,1fr);gap:9px;padding:10px}.hmb-finish-look__section{border:1px solid rgba(59,130,246,.28);border-radius:9px;background:rgba(15,23,38,.9);overflow:visible}.hmb-finish-look__section-header{display:flex;align-items:center;gap:8px;min-height:39px;padding:7px 10px;border-bottom:1px solid rgba(148,163,184,.13);background:linear-gradient(90deg,rgba(59,130,246,.13),transparent)}.hmb-finish-look__section-header h2{flex:1;margin:0;color:#dbeafe;font-size:12px;letter-spacing:.055em}.hmb-finish-look__enable{display:flex;align-items:center;gap:6px;color:#cbd5e1;font-size:10px;cursor:pointer}.hmb-finish-look__enable input{accent-color:var(--hmb-accent)}.hmb-finish-look__section-body{padding:9px}.hmb-finish-look__subhead{margin:8px 0 6px;color:#7fb4f0;font-size:9px;font-weight:900;letter-spacing:.1em}.hmb-finish-look__subhead:first-child{margin-top:0}.hmb-finish-look__grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.hmb-finish-look__field{display:flex;flex-direction:column;gap:4px}.hmb-finish-look__field--wide{grid-column:1/-1}.hmb-finish-look__field>span{color:#b7c5d6;font-size:9px;font-weight:750}.hmb-finish-look input:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)),.hmb-finish-look select:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)),.hmb-finish-look button:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)){font:inherit}.hmb-finish-look input:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *))[type="number"],.hmb-finish-look input:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *))[type="text"],.hmb-finish-look select:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)){width:100%;height:30px;padding:0 8px;border:1px solid rgba(148,163,184,.28);border-radius:6px;outline:none;background:#080f1b;color:#e5edf7;font-size:10px}.hmb-finish-look input:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)):focus,.hmb-finish-look select:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)):focus,.hmb-finish-look button:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)):focus-visible{border-color:#60a5fa;outline:none;box-shadow:0 0 0 1px rgba(96,165,250,.5)}.hmb-finish-look input:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)):disabled,.hmb-finish-look select:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)):disabled,.hmb-finish-look button:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)):disabled{opacity:.42;cursor:not-allowed}.hmb-finish-look input:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *))[aria-invalid="true"]{border-color:#fb7185}
       .hmb-finish-look__status{min-height:28px;margin:8px 10px 10px;padding:6px 9px;border:1px solid rgba(148,163,184,.16);border-radius:7px;background:#0a111d;color:#93a4b8;font-size:9px}.hmb-finish-look__status[data-tone="error"]{border-color:rgba(251,113,133,.48);color:#fda4af}.hmb-finish-look__status[data-tone="success"]{border-color:rgba(52,211,153,.4);color:#6ee7b7}
       .hmb-finish-look{--hmb-shot-accent:#64748B;--hmb-shot-rgb:100,116,139;--hmb-shot-deep:#334155;--hmb-shot-soft:#CBD5E1;--hmb-shot-line:rgba(100,116,139,.4);--hmb-shot-glow:rgba(100,116,139,.08);--hmb-accent:var(--hmb-shot-accent);--hmb-soft:var(--hmb-shot-soft);border-color:var(--hmb-shot-line);background:radial-gradient(circle at 8% -24%,var(--hmb-shot-glow),transparent 42%),linear-gradient(180deg,#0b1020,var(--hmb-bg));box-shadow:inset 0 1px 0 rgba(255,255,255,.035),0 8px 24px rgba(0,0,0,.24),0 0 18px var(--hmb-shot-glow)}.hmb-finish-look[data-shot-number="1"]{--hmb-shot-accent:#F472B6;--hmb-shot-rgb:244,114,182;--hmb-shot-deep:#BE185D;--hmb-shot-soft:#FBCFE8;--hmb-shot-line:rgba(244,114,182,.5);--hmb-shot-glow:rgba(244,114,182,.2)}.hmb-finish-look[data-shot-number="2"]{--hmb-shot-accent:#3B82F6;--hmb-shot-rgb:59,130,246;--hmb-shot-deep:#1D4ED8;--hmb-shot-soft:#DBEAFE;--hmb-shot-line:rgba(59,130,246,.5);--hmb-shot-glow:rgba(59,130,246,.2)}.hmb-finish-look[data-shot-number="3"]{--hmb-shot-accent:#10B981;--hmb-shot-rgb:16,185,129;--hmb-shot-deep:#047857;--hmb-shot-soft:#D1FAE5;--hmb-shot-line:rgba(16,185,129,.5);--hmb-shot-glow:rgba(16,185,129,.2)}.hmb-finish-look[data-shot-number="4"]{--hmb-shot-accent:#8B5CF6;--hmb-shot-rgb:139,92,246;--hmb-shot-deep:#6D28D9;--hmb-shot-soft:#EDE9FE;--hmb-shot-line:rgba(139,92,246,.5);--hmb-shot-glow:rgba(139,92,246,.2)}.hmb-finish-look[data-shot-number="5"]{--hmb-shot-accent:#EAB308;--hmb-shot-rgb:234,179,8;--hmb-shot-deep:#A16207;--hmb-shot-soft:#FEF3C7;--hmb-shot-line:rgba(234,179,8,.5);--hmb-shot-glow:rgba(234,179,8,.2)}
-      .hmb-finish-look__topbar{border-bottom-color:var(--hmb-shot-line);background:linear-gradient(90deg,rgba(var(--hmb-shot-rgb),.2),rgba(9,12,22,.98))}.hmb-finish-look__mark{border-color:var(--hmb-shot-line);background:rgba(var(--hmb-shot-rgb),.13);color:var(--hmb-shot-soft);box-shadow:0 0 12px var(--hmb-shot-glow)}.hmb-finish-look__section{border-color:rgba(var(--hmb-shot-rgb),.28)}.hmb-finish-look__section-header{background:linear-gradient(90deg,rgba(var(--hmb-shot-rgb),.13),transparent)}.hmb-finish-look__section-header h2,.hmb-finish-look__subhead{color:var(--hmb-shot-soft)}.hmb-finish-look input:focus,.hmb-finish-look select:focus,.hmb-finish-look button:focus-visible{border-color:var(--hmb-shot-accent);box-shadow:0 0 0 1px var(--hmb-shot-line)}.hmb-finish-look__tab.is-active{border-color:var(--hmb-shot-accent);background:rgba(var(--hmb-shot-rgb),.2);color:var(--hmb-shot-soft)}.hmb-finish-look__actions .is-primary{border-color:var(--hmb-shot-accent);background:rgba(var(--hmb-shot-rgb),.22)}
+      .hmb-finish-look__topbar{border-bottom-color:var(--hmb-shot-line);background:linear-gradient(90deg,rgba(var(--hmb-shot-rgb),.2),rgba(9,12,22,.98))}.hmb-finish-look__mark{border-color:var(--hmb-shot-line);background:rgba(var(--hmb-shot-rgb),.13);color:var(--hmb-shot-soft);box-shadow:0 0 12px var(--hmb-shot-glow)}.hmb-finish-look__section{border-color:rgba(var(--hmb-shot-rgb),.28)}.hmb-finish-look__section-header{background:linear-gradient(90deg,rgba(var(--hmb-shot-rgb),.13),transparent)}.hmb-finish-look__section-header h2,.hmb-finish-look__subhead{color:var(--hmb-shot-soft)}.hmb-finish-look input:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)):focus,.hmb-finish-look select:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)):focus,.hmb-finish-look button:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)):focus-visible{border-color:var(--hmb-shot-accent);box-shadow:0 0 0 1px var(--hmb-shot-line)}.hmb-finish-look__tab.is-active{border-color:var(--hmb-shot-accent);background:rgba(var(--hmb-shot-rgb),.2);color:var(--hmb-shot-soft)}.hmb-finish-look__actions .is-primary{border-color:var(--hmb-shot-accent);background:rgba(var(--hmb-shot-rgb),.22)}
       .hmb-finish-look__shot-shell{flex:0 1 210px;width:210px;min-width:120px;max-width:210px;display:flex;align-items:center;gap:7px}.hmb-finish-look__shot-shell>span{flex:0 0 auto;color:var(--hmb-muted);font-size:8px;font-weight:900;letter-spacing:.12em}.hmb-finish-look__shot-select{width:100%;height:44px;padding:0 10px;border:1px solid var(--hmb-shot-line);border-radius:7px;outline:none;background:linear-gradient(180deg,rgba(var(--hmb-shot-rgb),.14),rgba(8,15,27,.96));color:var(--hmb-shot-soft);box-shadow:0 0 10px var(--hmb-shot-glow);font-size:13px;font-weight:800;line-height:normal}.hmb-finish-look__shot-select option{background:#0b1020;color:#e8eef7}.hmb-finish-look__shot-select:disabled{border-color:rgba(100,116,139,.28);background:#0b111c;color:#7c8a9d;box-shadow:none;opacity:.78}.hmb-finish-look__bound-badge,.hmb-finish-look__remote-badge{padding:4px 7px;border-radius:999px;font-size:8px;font-weight:950;letter-spacing:.12em;white-space:nowrap}.hmb-finish-look__bound-badge{border:1px solid var(--hmb-shot-line);background:rgba(var(--hmb-shot-rgb),.2);color:var(--hmb-shot-soft);box-shadow:0 0 10px var(--hmb-shot-glow)}.hmb-finish-look__language{border-color:var(--hmb-shot-line);color:var(--hmb-shot-soft)}
       .hmb-finish-look{--hmb-mode-rgb:var(--hmb-shot-rgb);--hmb-mode-soft:var(--hmb-shot-soft);border-color:rgba(var(--hmb-mode-rgb),.5)}.hmb-finish-look__topbar{border-bottom-color:rgba(var(--hmb-mode-rgb),.48);background:linear-gradient(90deg,rgba(var(--hmb-mode-rgb),.24),rgba(9,12,22,.98));cursor:default}.hmb-finish-look__mark{border-color:rgba(var(--hmb-mode-rgb),.62);background:rgba(var(--hmb-mode-rgb),.15);color:var(--hmb-mode-soft)}.hmb-finish-look__heading b{font-weight:800}.hmb-finish-look__heading em{margin-top:1px;color:rgba(var(--hmb-mode-rgb),.82);font-size:8px;font-style:normal;font-weight:750}
       @container(max-width:780px){.hmb-finish-look__heading span{display:none}.hmb-finish-look__shot-shell{flex-basis:210px;width:210px}.hmb-finish-look__bound-badge,.hmb-finish-look__remote-badge{padding-inline:5px;font-size:7px}}@container(max-width:680px){.hmb-finish-look__content{grid-template-columns:1fr}.hmb-finish-look__topbar{gap:9px;padding-inline:10px}.hmb-finish-look__shot-shell{flex:1 1 auto;width:auto;max-width:none}.hmb-finish-look__shot-shell>span,.hmb-finish-look__bound-badge{display:none}}@container(max-width:500px){.hmb-finish-look__heading{display:flex}.hmb-finish-look__heading span,.hmb-finish-look__heading em,.hmb-finish-look__shot-shell>span,.hmb-finish-look__bound-badge{display:none}.hmb-finish-look__mark{display:none}.hmb-finish-look__shot-shell{min-width:0}.hmb-finish-look__language{min-width:46px;padding-inline:6px}}@container(max-width:400px){.hmb-finish-look__grid{grid-template-columns:repeat(3,minmax(0,1fr))}.hmb-finish-look__remote-badge{display:none}}
@@ -644,11 +696,17 @@ function hmbRenderFinishLook(state) {
       .hmb-finish-look__shot-tabs{flex:0 0 auto;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px;padding:9px 10px 0;min-width:0}.hmb-finish-look__shot-tab{min-width:0;--tab:#F472B6}.hmb-finish-look__shot-tab[data-shot-number="2"]{--tab:#3B82F6}.hmb-finish-look__shot-tab[data-shot-number="3"]{--tab:#10B981}.hmb-finish-look__shot-tab[data-shot-number="4"]{--tab:#8B5CF6}.hmb-finish-look__shot-tab[data-shot-number="5"]{--tab:#EAB308}
       .hmb-finish-look__shot-tab button{display:flex;align-items:center;gap:7px;min-width:0;width:100%;height:42px;padding:6px 8px;border:1px solid color-mix(in srgb,var(--tab) 34%,transparent);border-radius:7px;background:color-mix(in srgb,var(--tab) 6%,#080f1b);color:#aebed0;font-size:10px;font-weight:750;text-align:left}.hmb-finish-look__shot-tab button[aria-pressed="true"]{border-color:var(--tab);background:color-mix(in srgb,var(--tab) 23%,#080f1b);color:var(--hmb-text);box-shadow:inset 3px 0 var(--tab),0 0 10px color-mix(in srgb,var(--tab) 18%,transparent)}.hmb-finish-look__shot-tab span{flex:0 0 auto;color:var(--tab);font-size:10px}.hmb-finish-look__shot-tab b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
       @container(max-width:460px){.hmb-finish-look__shot-tabs{grid-template-columns:repeat(3,minmax(0,1fr))}.hmb-finish-look__shot-tab button{padding:5px;gap:4px}}
+      .hmb-finish-look__native-identity,.hmb-finish-look__native-actions{display:none;min-width:0;--node-header-text:#e8eef7}
+      .hmb-finish-look[data-hmb-native-header=active]{border:0;border-radius:0;box-shadow:none}
+      .hmb-finish-look[data-hmb-native-header=active] .hmb-finish-look__mark,.hmb-finish-look[data-hmb-native-header=active] .hmb-finish-look__heading{display:none}
+      .hmb-finish-look[data-hmb-native-header=active] .hmb-finish-look__native-identity{display:flex;align-items:center;flex:1 1 auto}
+      .hmb-finish-look[data-hmb-native-header=active] .hmb-finish-look__native-actions{display:flex;align-items:center;flex:0 0 auto}
+      .hmb-finish-look__native-identity>div{min-width:0;max-width:100%}
     </style>
     <div class="hmb-finish-look nodrag nowheel" data-language="${state.language}" data-remote-connected="${remoteLocked ? "true" : "false"}" data-shot-number="${paletteShotNumber}" data-shot-bound="${shotBound ? "true" : "false"}" data-workspace-mode="finish" tabindex="0">
-        <header class="hmb-finish-look__topbar"><div class="hmb-finish-look__mark" aria-hidden="true">${headerMark}</div><div class="hmb-finish-look__heading"><b>${hmbEscape(headerTitle)}</b><span>${hmbEscape(headerSubtitle)}</span></div><label class="hmb-finish-look__shot-shell nodrag" data-no-finish-toggle${managed ? " hidden" : ""}><span>${hmbEscape(t.shot)}</span><select class="hmb-finish-look__shot-select nodrag" data-shot-selector aria-label="Shot"${shotOptions.length > 1 ? "" : " disabled"}>${hmbFinishLookShotOptionsMarkup(state)}</select></label><span class="hmb-finish-look__bound-badge" data-shot-bound-badge${shotBound ? "" : " hidden"}>${hmbEscape(t.bound)}</span><span class="hmb-finish-look__remote-badge"${remoteLocked ? "" : " hidden"}>REMOTE</span><button type="button" class="hmb-finish-look__language nodrag" data-no-finish-toggle data-language-toggle aria-label="${hmbEscape(t.language)}">${state.language === "ko" ? "한국어" : "EN"}</button></header>
-        <nav class="hmb-finish-look__shot-tabs" aria-label="Shots"${managed ? "" : " hidden"}>${tabs}</nav>
-      <div class="hmb-finish-look__scroll">
+        <header class="hmb-finish-look__topbar group"><div class="hmb-finish-look__mark" aria-hidden="true">${headerMark}</div><div class="hmb-finish-look__heading"><b>${hmbEscape(headerTitle)}</b><span>${hmbEscape(headerSubtitle)}</span></div><div class="hmb-finish-look__native-identity" data-hmb-native-identity></div><div class="hmb-finish-look__native-actions nodrag" data-hmb-native-actions></div><label class="hmb-finish-look__shot-shell nodrag" data-no-finish-toggle${managed ? " hidden" : ""}><span>${hmbEscape(t.shot)}</span><select class="hmb-finish-look__shot-select nodrag" data-shot-selector aria-label="Shot"${shotOptions.length > 1 ? "" : " disabled"}>${hmbFinishLookShotOptionsMarkup(state)}</select></label><span class="hmb-finish-look__bound-badge" data-shot-bound-badge${shotBound ? "" : " hidden"}>${hmbEscape(t.bound)}</span><span class="hmb-finish-look__remote-badge"${remoteLocked ? "" : " hidden"}>REMOTE</span><button type="button" class="hmb-finish-look__language nodrag" data-no-finish-toggle data-language-toggle aria-label="${hmbEscape(t.language)}">${state.language === "ko" ? "한국어" : "EN"}</button></header>
+        <nav class="hmb-finish-look__shot-tabs nodrag" aria-label="Shots"${managed ? "" : " hidden"}>${tabs}</nav>
+      <div class="hmb-finish-look__scroll nodrag">
         <main class="hmb-finish-look__content">
           <section class="hmb-finish-look__section" data-finish-section="beauty"><header class="hmb-finish-look__section-header"><h2>${hmbEscape(t.beauty)}</h2><label class="hmb-finish-look__enable"><input type="checkbox" data-enable="beauty"${beauty.enabled ? " checked" : ""}${remoteLocked ? " disabled" : ""}><span>${hmbEscape(t.enable)}</span></label></header><div class="hmb-finish-look__section-body"><div class="hmb-finish-look__subhead">${hmbEscape(t.primary)}</div><div class="hmb-finish-look__grid">${hmbNumericField("beauty.soften_shadows", t.softenShadows, beauty.soften_shadows, beautyDisabled)}${hmbNumericField("beauty.shadow_threshold", t.shadowThreshold, beauty.shadow_threshold, beautyDisabled)}${hmbNumericField("beauty.saturation", t.saturation, beauty.saturation, beautyDisabled)}${hmbNumericField("beauty.brightness", t.brightness, beauty.brightness, beautyDisabled)}</div><div class="hmb-finish-look__subhead">${hmbEscape(t.advanced)}</div><div class="hmb-finish-look__grid">${hmbNumericField("beauty.glow_brightness", t.glowBrightness, beauty.glow_brightness, beautyDisabled)}${hmbNumericField("beauty.glow_threshold", t.glowThreshold, beauty.glow_threshold, beautyDisabled)}${hmbNumericField("beauty.glow_width", t.glowWidth, beauty.glow_width, beautyDisabled)}${hmbNumericField("beauty.soft_focus", t.softFocus, beauty.soft_focus, beautyDisabled)}${hmbNumericField("beauty.blur_amount", t.blurAmount, beauty.blur_amount, beautyDisabled)}${hmbNumericField("beauty.pore_size", t.poreSize, beauty.pore_size, beautyDisabled)}${hmbNumericField("beauty.reduce_shine", t.reduceShine, beauty.reduce_shine, beautyDisabled)}</div></div></section>
         </main>
@@ -691,6 +749,7 @@ function hmbEditingTarget(event) {
 
 export function hmbGuardSelectedNodeKeyboardDelete(container, event) {
   if (!["Backspace", "Delete"].includes(event?.key)) return false;
+  if (container?.ownerDocument?.documentElement?.getAttribute?.("data-hmb-native-deletion-guard") === "engine-preflight") return false;
   if (event?.target?.closest?.("[data-hmb-node-delete-protected='true']")) return false;
   if (hmbEditingTarget(event)) return false;
   if (!hmbNodeSelected(hmbNodeRoot(container))) return false;
@@ -770,6 +829,8 @@ function hmbMorphFinishLook(current, desired) {
   }
   if (current.nodeType === 3) {if(current.nodeValue!==desired.nodeValue)current.nodeValue=desired.nodeValue;return;}
   if (current.nodeType !== 1) return;
+  // React owns the portal children; morphology must retain their slot and subtree.
+  if (current.hasAttribute("data-hmb-native-identity") || current.hasAttribute("data-hmb-native-actions")) return;
   for(const attribute of Array.from(current.attributes))if(!desired.hasAttribute(attribute.name))current.removeAttribute(attribute.name);
   for(const attribute of Array.from(desired.attributes))if(current.getAttribute(attribute.name)!==attribute.value)current.setAttribute(attribute.name,attribute.value);
   if (current.tagName === "INPUT") {
@@ -800,6 +861,7 @@ function hmbNativeUiImplementation(container, props) {
 
   let state = hmbNormalizeFinishLookWidgetValue(incoming);
   let disposed = false;
+  let nativeHeader = null;
   let listenerCleanups = [];
   let publicationOwner = 0;
   let pendingShot = null;
@@ -967,6 +1029,7 @@ function hmbNativeUiImplementation(container, props) {
       clearListeners();container.innerHTML=markup;
       container.classList?.add("nodrag");container.setAttribute?.("data-hmb-node-delete-protected","true");installInteractions();
     }
+    nativeHeader = hmbInstallNativeHeaderBridge(container, "HMBFinishLookLibrary", ".hmb-finish-look");
     hmbRestoreFinishLookView(container, view);
   };
 
@@ -1112,14 +1175,16 @@ function hmbNativeUiImplementation(container, props) {
       });
     }
     const stopInteriorInteraction = (event) => {
+      if (hmbNativeHeaderTarget(event.target)) return;
       if (event.target?.closest?.("button,input,select,textarea,[role='option']")) event.stopPropagation?.();
     };
     const stopInteriorDelete = (event) => {
+      if (hmbNativeHeaderTarget(event.target)) return;
       if (["Backspace", "Delete"].includes(event.key)) event.stopPropagation?.();
     };
     bind(container, "pointerdown", stopInteriorInteraction);
     bind(container, "keydown", stopInteriorDelete);
-    const guardDelete = (event) => hmbGuardSelectedNodeKeyboardDelete(container, event);
+    const guardDelete = (event) => { if (!hmbNativeHeaderTarget(event.target)) hmbGuardSelectedNodeKeyboardDelete(container, event); };
     const ownerWindow = ownerDocument?.defaultView || (typeof window !== "undefined" ? window : null);
     bind(ownerWindow, "keydown", guardDelete, true);
   }
@@ -1170,6 +1235,7 @@ function hmbNativeUiImplementation(container, props) {
     remount();
   };
   const cleanup = () => {
+    nativeHeader?.cleanup();
     disposed = true;
     clearTransportSchedule();clearTimeout(transportTimer);transportQueue=[];transportFlight=null;
     cancelQueuedTab();
@@ -1310,5 +1376,5 @@ function hmbNativeUiContract(container, props, mount, policy) {
 // HMB_NATIVE_DISABLED_ADAPTER_V1_END
 
 export default function HMBFinishLookLibraryWidget(container, props) {
-  return hmbNativeUiContract(container, props, hmbNativeUiImplementation, { kind: "finish", allowControl: null });
+  return hmbNativeUiContract(container, props, hmbNativeUiImplementation, { kind: "finish", allowControl: hmbNativeHeaderTarget });
 }

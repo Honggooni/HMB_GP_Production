@@ -177,7 +177,7 @@ try{
  receipt.cases.push('synchronous selection acknowledgements cannot overwrite the pending user checkbox or slider edit');
  await page.setViewportSize({width:1080,height:1200});
  await page.evaluate(()=>{
-  const node=document.querySelector('.react-flow__node');node.style.width='980px';node.style.height='1091px';
+  const node=document.querySelector('.react-flow__node');node.style.width='980px';node.style.height='864px';
   const selected=structuredClone(initial);selected.shot={channel_uuid:'channel',...catalog.shots[3]};selected.finish_look=structuredClone(selected.shot_documents['channel\x1fuuid-4']);
   window.finalPreview=widget.default(mount,{value:selected,onChange(){}});
  });

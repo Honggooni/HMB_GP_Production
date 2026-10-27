@@ -279,6 +279,10 @@ async def consume_current(engine, package, modules, *, resume_native_dispatch):
     backup = decode_value(json.loads(Path(result["backup_path"]).read_text("utf-8")))
     assert len(backup["nodes"]) == 22 and len(backup["edges"]) == len(expected["edges"])
     serialized = await serialize_after_native_dispatch(engine, flow)
+    # Preserve the connected save, then explicitly detach only this diagnostic
+    # graph before its teardown. The shared helper also asserts authored data.
+    from HMB_Workflow_Consolidation_Host_Regression import disconnect_fixture_nodes
+    disconnect_fixture_nodes(engine, flow, list(flow.nodes))
     # SDK enforces current-context ordering during DeleteFlow. Explicitly pop
     # its child Node context before deleting only this isolated test flow.
     while engine.context_manager.has_current_flow():

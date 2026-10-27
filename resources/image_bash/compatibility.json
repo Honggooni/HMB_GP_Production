@@ -1,0 +1,98 @@
+{
+  "schema": "hmb-image-bash-compatibility-v1",
+  "adapter_revision": 1,
+  "review_policy": "Any changed hash/version requires explicit source review, adapter regression, real editor Apply/Run comparison and save/reopen verification before this baseline is deliberately replaced. This baseline is never auto-updated.",
+  "standard": {
+    "library_version": "0.89.0",
+    "manifest_sha256": "74959ef446637a1f9147abf406663a2cb9dbf0d144b62d0af1bccf271f0441d4",
+    "source_sha256": "a41d5dad2dc08aaf34698bdf0e2484c70b173c44c19bd2556251f7748426a81f",
+    "source_relative": "griptape_nodes_library/image/image_bash.py",
+    "contract": {
+      "class_name": "ImageBash",
+      "parameters": [
+        "background_color",
+        "bash_image",
+        "canvas_size",
+        "comp_on_run",
+        "height",
+        "input_images",
+        "output_file",
+        "output_image",
+        "width"
+      ],
+      "methods": [
+        "__init__",
+        "_build_konva_images",
+        "_calculate_image_fit_and_position",
+        "_create_konva_layer",
+        "_create_new_bash_image",
+        "_create_viewport_metadata",
+        "_enable_custom_dimensions",
+        "_get_canvas_dimensions",
+        "_get_existing_background_color",
+        "_get_image_dimensions",
+        "_get_image_name",
+        "_handle_bash_image_change",
+        "_handle_canvas_size_change",
+        "_handle_input_images_change",
+        "_handle_input_images_removed",
+        "_is_brush_layer",
+        "_pil_to_bytes",
+        "_process_input_image",
+        "_process_output_image",
+        "_set_preset_dimensions",
+        "_sync_metadata_with_input_images",
+        "_update_bash_image_metadata",
+        "_update_output_image",
+        "after_incoming_connection_removed",
+        "after_value_set",
+        "process"
+      ],
+      "modal": "ImageBashModal",
+      "scene_metadata_keys": [
+        "input_images",
+        "konva_json",
+        "viewport"
+      ],
+      "scene_collection_keys": [
+        "images",
+        "lines"
+      ]
+    }
+  },
+  "editor": {
+    "files": {
+      ".version": "7d5a3d51ab69c9831ffd5f79a4e7abc581e764824b4858b6d4583d8ea88191c6"
+    },
+    "bundles": {
+      "assets/index-DEZU41rc.js": {
+        "sha256": "1a0429b88c6b8dd1c7e6e053836d03f734a4d6453f8886e0693527c7498909e2",
+        "scopes": {
+          "modal_store": {
+            "sha256": "ba64b92c2abfbd6bb19d12df6f28f7f2d3f429db7c164b7f08d47f8a00bb10f5",
+            "bytes": 2076
+          },
+          "parameter_launch": {
+            "sha256": "d767a95a1dc93d37a72083b2984764a86c749fa647db47db7e9299541f7d3e67",
+            "bytes": 1655
+          },
+          "brush_layers_load_export_modal": {
+            "sha256": "267cc0b0ee0e5337484f42b0ac19bdee0b97e7de000fa849f83397ab2511f39b",
+            "bytes": 82042
+          },
+          "modal_settings": {
+            "sha256": "1a617716c8f3172ed090e450c5a0c115ff05f7044711b73a8e2605587e9f2310",
+            "bytes": 2578
+          }
+        }
+      }
+    },
+    "scope_review": {
+      "verified_original_bundle_sha256": "1a0429b88c6b8dd1c7e6e053836d03f734a4d6453f8886e0693527c7498909e2",
+      "initial_observed_bundle_sha256": "5e479a335fe192656ab29668d2adaf08c7df1004ccbe0964972e8978a313caab",
+      "color_lut_patched_bundle_sha256": "640168bcbc739c2dd8fabd87ad82cbb7c70f579c78001b4f4cbec2d64f660bf7",
+      "exact_feature_regions_unchanged": true,
+      "scope_policy": "Gate editor version and exact Image Bash store, parameter-launch, brush/layer/modal load/export and settings source sections. Record whole-bundle SHA drift separately so unrelated reviewed Color LUT changes do not block Image Bash."
+    }
+  }
+}

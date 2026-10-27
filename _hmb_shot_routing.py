@@ -16,15 +16,284 @@ from dataclasses import dataclass, replace
 from contextlib import contextmanager
 import logging
 import json
+import copy
+import re
 import threading
 from typing import Any, Iterable, Iterator, Mapping
 import weakref
+from uuid import UUID
 
 
 SUBSCRIPTION_SCHEMA = "hmb-shot-channel-subscription"
 SUBSCRIPTION_VERSION = 1
 SHOT_ROUTING_PROTOCOL_VERSION = "2026-08-20.shot-routing.v1"
 MAX_SHOTS = 5
+
+# Management data lives beside the native, fixed-shape Shot identity.  It must
+# never enter Agent prompts/rules, media identity rows, or CGT status writes.
+SHOT_HIERARCHY_SCHEMA = "hmb-shot-hierarchy"
+SHOT_HIERARCHY_REQUEST_SCHEMA = "hmb-shot-hierarchy-edit"
+
+
+def _hierarchy_uuid(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("샷 구성 ID가 올바르지 않습니다.")
+    try:
+        parsed = UUID(value)
+    except (ValueError, AttributeError):
+        raise ValueError("샷 구성 ID가 올바르지 않습니다.") from None
+    if str(parsed) != value or parsed.version not in {1, 2, 3, 4, 5}:
+        raise ValueError("샷 구성 ID가 올바르지 않습니다.")
+    return value
+
+
+def hierarchy_shot_name(value: Any) -> str:
+    """Reject unsupported names; never silently shorten an authored token."""
+    if (not isinstance(value, str) or not value or value != value.strip()
+            or len(value.encode("utf-16-le")) // 2 > 128 or re.search(r"[\\/:?*\"<>|#\x00-\x1f\x7f]", value)
+            or value in {".", ".."}
+            or any(char.isspace() and char != " " for char in value)
+            or "  " in value or re.search(r"https?://|data:|Bearer\s|(?:api[_-]?key|access[_-]?token)\s*[=:]", value, re.I)):
+        raise ValueError("샷 이름은 공백·경로·제어문자 없이 1~128자로 입력하세요. 이름은 자동 축약하지 않습니다.")
+    if re.search(r"\b(authorization|api[_ -]?key|access[_ -]?token|bearer|password|secret|session[_ -]?token)\b\s*[:=]?\s*\S+", value, re.I):
+        raise ValueError("샷 이름에 인증정보 형식의 문구를 사용할 수 없습니다.")
+    return value
+
+
+def hierarchy_project_key(state: Mapping[str, Any]) -> str:
+    # The catalog root is durable across scans; transient cache IDs are not.
+    root = str(state.get("project_root") or "").replace("\\", "/").rstrip("/").lower()
+    return root or str(state.get("project_uid") or "").strip()
+
+
+def hierarchy_parse_name(value: Any) -> dict[str, str]:
+    """Parse naming context only; this never establishes a CGT identity."""
+    if not isinstance(value, str) or len(value) > 256:
+        raise ValueError("샷 이름이 올바르지 않습니다.")
+    match = re.fullmatch(r"(?:(e[0-9]{3,})/)?((e[0-9]{3,})(s[0-9]{3,})(c[0-9]{3,})__)", value)
+    if match:
+        context, canonical, episode, shot, split_cut = match.groups()
+        if context and context != episode:
+            raise ValueError("에피소드 접두 문맥과 샷 코드가 다릅니다.")
+        return dict(source_name=value, canonical_name=hierarchy_shot_name(canonical),
+                    context_episode=context or "", episode=episode, shot=shot, split_cut=split_cut)
+    return dict(source_name=value, canonical_name=hierarchy_shot_name(value),
+                context_episode="", episode="", shot="", split_cut="")
+
+
+def _cgt_identity_id(value: Any) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value):
+        raise ValueError("CGT 원본 ID가 올바르지 않습니다.")
+    return value
+
+
+def normalize_shot_hierarchy(value: Any) -> dict[str, Any]:
+    if value is None or value == {}:
+        return {}
+    fields = {"schema", "version", "binding_id", "revision", "project_identity", "channel_uuid", "cgt_account_id", "members"}
+    version = value.get("version") if isinstance(value, dict) else None
+    if version == 2:
+        fields.add("cgt_scope")
+    if (not isinstance(value, dict) or set(value) != fields
+            or value.get("schema") != SHOT_HIERARCHY_SCHEMA or type(version) is not int or version not in {1, 2}
+            or type(value.get("revision")) is not int or not 1 <= value["revision"] <= (1 << 53) - 1
+            or (version == 1 and value.get("cgt_account_id") is not None)):
+        raise ValueError("지원하지 않는 샷 구성입니다.")
+    _hierarchy_uuid(value["binding_id"])
+    _hierarchy_uuid(value["channel_uuid"])
+    project = value["project_identity"]
+    if not isinstance(project, str) or len(project) > 4096 or any(ord(c) < 32 for c in project):
+        raise ValueError("샷 구성의 프로젝트가 올바르지 않습니다.")
+    members = value["members"]
+    if not isinstance(members, list) or len(members) > MAX_SHOTS:
+        raise ValueError("대표와 하위를 합쳐 최대 5개 샷을 선택할 수 있습니다.")
+    member_fields = {"member_id", "origin", "manual_uuid", "source_name", "canonical_name", "gp_shot_uuid", "parent_id", "selection_order", "cgt_task_id", "artist", "status"}
+    scope = value.get("cgt_scope")
+    cgt_members = [item for item in members if isinstance(item, dict) and item.get("origin") == "cgt"]
+    # A local, manually authored Shot is useful before a catalog project has
+    # been selected.  Its channel UUID remains the owner.  An authenticated CGT
+    # selection always requires its real project and account scope.
+    if cgt_members and not project:
+        raise ValueError("CGT 샷을 연결하려면 라이브러리 프로젝트를 먼저 선택하세요.")
+    if version == 2:
+        member_fields.add("cgt_identity")
+        if cgt_members:
+            scope_fields = {"origin", "project_id", "project_db", "module", "module_type", "pipeline_id", "account_id"}
+            if (not isinstance(scope, dict) or set(scope) != scope_fields
+                    or scope["module"] != "shot" or scope["module_type"] != "task"
+                    or not isinstance(scope["origin"], str)
+                    or not re.fullmatch(r"https://[a-zA-Z0-9.\[\]:-]+", scope["origin"])
+                    or not isinstance(scope["project_db"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", scope["project_db"])
+                    or _cgt_identity_id(scope["account_id"]) != value["cgt_account_id"]):
+                raise ValueError("CGT 계정·프로젝트·공정 범위가 올바르지 않습니다.")
+            for key in ("project_id", "pipeline_id"):
+                _cgt_identity_id(scope[key])
+        elif scope is not None or value["cgt_account_id"] is not None:
+            raise ValueError("CGT 항목이 없는 구성에 다른 계정 범위를 남길 수 없습니다.")
+    identities: set[str] = set()
+    slots: set[str] = set()
+    names: set[str] = set()
+    episodes: set[str] = set()
+    for index, item in enumerate(members, 1):
+        if (not isinstance(item, dict) or set(item) != member_fields or item.get("origin") not in ({"manual", "cgt"} if version == 2 else {"manual"})
+                or type(item.get("selection_order")) is not int or item["selection_order"] != index):
+            raise ValueError("샷 구성 항목이 올바르지 않습니다.")
+        manual = _hierarchy_uuid(item["manual_uuid"])
+        slot = _hierarchy_uuid(item["gp_shot_uuid"])
+        if item["origin"] == "manual":
+            if (item["member_id"] != "manual:" + manual or any(item.get(key) is not None for key in ("cgt_task_id", "artist", "status", "cgt_identity"))):
+                raise ValueError("수동 항목은 CGT 계정·상태를 가질 수 없습니다.")
+        else:
+            identity = item["cgt_identity"]
+            if (not isinstance(identity, dict) or set(identity) != {"entity_id", "task_id", "pipeline_id"}
+                    or _cgt_identity_id(item["cgt_task_id"]) != identity["task_id"]
+                    or _cgt_identity_id(identity["pipeline_id"]) != scope["pipeline_id"]
+                    or item["member_id"] != "cgt:" + item["cgt_task_id"].lower()
+                    or any(not isinstance(item[key], str) or len(item[key]) > 256 or any(ord(c) < 32 for c in item[key]) for key in ("artist", "status"))):
+                raise ValueError("CGT 원본 작업 범위가 일치하지 않습니다.")
+            _cgt_identity_id(identity["entity_id"])
+        if item["member_id"] in identities or slot in slots:
+            raise ValueError("같은 컷 또는 같은 샷 슬롯을 두 번 선택할 수 없습니다.")
+        name = hierarchy_shot_name(item["canonical_name"])
+        parsed_name = hierarchy_parse_name(item["source_name"])
+        if parsed_name["episode"]:
+            episodes.add(parsed_name["episode"])
+        if parsed_name["canonical_name"] != name:
+            raise ValueError("입력한 정식 샷 이름과 실행명이 다릅니다.")
+        if name in names:
+            raise ValueError("동일한 수동 샷 이름이 있습니다. 서로 다른 이름을 입력하세요.")
+        identities.add(item["member_id"]); slots.add(slot); names.add(name)
+    if len(episodes) > 1:
+        raise ValueError("서로 다른 에피소드의 샷을 같은 구성에 연결할 수 없습니다.")
+    by_id = {row["member_id"]: row for row in members}
+    for item in members:
+        parent = item["parent_id"]
+        if parent is not None and (not isinstance(parent, str) or parent not in by_id):
+            raise ValueError("선택한 대표 샷이 현재 구성에 없습니다.")
+    # A Shot can remain a child while owning its own group. Each slot still
+    # has one parent; following that chain must never return to a seen Shot.
+    for item in members:
+        seen = {item["member_id"]}
+        parent = item["parent_id"]
+        while parent is not None:
+            if parent in seen:
+                raise ValueError("자기 자신이나 자신의 하위 샷을 대표로 지정할 수 없습니다.")
+            seen.add(parent)
+            parent = by_id[parent]["parent_id"]
+    normalized = copy.deepcopy(value)
+    hierarchy_derived_names(normalized)
+    return normalized
+
+
+def hierarchy_derived_names(binding: Mapping[str, Any]) -> dict[str, str]:
+    rows = binding.get("members", [])
+    result: dict[str, str] = {}
+    for row in rows:
+        group = [row] + [child for child in rows if child["parent_id"] == row["member_id"]]
+        parts = [hierarchy_parse_name(item["source_name"]) for item in group]
+        # Human-approved aggregate naming. s is the shot, c is its revision
+        # split, never a provider render version. Singletons remain canonical.
+        if len(group) > 1 and all(item["episode"] and item["episode"] == parts[0]["episode"] for item in parts):
+            name = parts[0]["episode"] + "_" + "-".join(item["shot"] + item["split_cut"] for item in parts) + "__"
+        else:
+            name = "+".join(item["canonical_name"] for item in group)
+        result[row["gp_shot_uuid"]] = hierarchy_shot_name(name)
+    return result
+
+
+def validate_shot_hierarchy_routing(binding: Any, routing: Mapping[str, Any]) -> dict[str, Any]:
+    binding = normalize_shot_hierarchy(binding)
+    if not binding:
+        return {}
+    rows = {row["shot_uuid"]: row for row in routing.get("shots", [])}
+    if binding["channel_uuid"] != routing.get("channel_uuid"):
+        raise ValueError("다른 라이브러리의 샷 구성을 적용할 수 없습니다.")
+    for slot, name in hierarchy_derived_names(binding).items():
+        if slot not in rows or rows[slot].get("name") != name:
+            raise ValueError("묶음에 연결된 샷은 연필의 샷 구성에서 수정·해제하세요.")
+    return binding
+
+
+def apply_shot_hierarchy_edit(state: Mapping[str, Any], request: Any) -> dict[str, Any]:
+    """Pure, atomic transaction. Existing native slots and their media survive."""
+    fields = {"schema", "version", "expected_generation", "expected_binding_revision", "removed_member_ids", "binding"}
+    if (not isinstance(request, dict) or set(request) != fields
+            or request.get("schema") != SHOT_HIERARCHY_REQUEST_SCHEMA
+            or type(request.get("version")) is not int or request["version"] != 1):
+        raise ValueError("샷 구성 요청이 올바르지 않습니다.")
+    routing = state.get("shot_routing") or {}
+    prior = validate_shot_hierarchy_routing(state.get("shot_hierarchy"), routing)
+    if (type(request.get("expected_generation")) is not int or request["expected_generation"] != routing.get("generation")
+            or type(request.get("expected_binding_revision")) is not int
+            or request["expected_binding_revision"] != prior.get("revision", 0)):
+        raise ValueError("샷이 변경되었습니다. 창을 닫고 다시 열어 주세요.")
+    binding = normalize_shot_hierarchy(request["binding"])
+    if (not binding or binding["channel_uuid"] != routing.get("channel_uuid")
+            or binding["project_identity"] != hierarchy_project_key(state)
+            or binding["revision"] != prior.get("revision", 0) + 1
+            or (prior and binding["binding_id"] != prior["binding_id"])):
+        raise ValueError("현재 프로젝트·샷 구성의 소유권이 변경되었습니다.")
+    old_members = {row["member_id"]: row for row in prior.get("members", [])}
+    new_members = {row["member_id"]: row for row in binding["members"]}
+    removed = request["removed_member_ids"]
+    if (not isinstance(removed, list) or any(not isinstance(key, str) for key in removed)
+            or len(set(removed)) != len(removed) or set(removed) != set(old_members) - set(new_members)):
+        raise ValueError("연결 해제 항목을 명시적으로 확인하세요. 기존 실행 샷은 삭제되지 않습니다.")
+    if prior and prior["project_identity"] != binding["project_identity"] and set(old_members) & set(new_members):
+        raise ValueError("이전 프로젝트의 연결을 먼저 모두 해제하세요. 수동 ID는 다른 프로젝트로 옮기지 않습니다.")
+    for key, old in old_members.items():
+        if key in new_members and old["gp_shot_uuid"] != new_members[key]["gp_shot_uuid"]:
+            raise ValueError("기존 컷의 독립 샷 슬롯은 변경할 수 없습니다.")
+        if key in new_members and old.get("origin") == "cgt":
+            if (prior.get("cgt_scope") != binding.get("cgt_scope")
+                    or old.get("cgt_identity") != new_members[key].get("cgt_identity")):
+                raise ValueError("기존 CGT 작업의 계정·프로젝트·원본 ID는 변경할 수 없습니다. 먼저 명시적으로 해제하세요.")
+            if any(old.get(field) != new_members[key].get(field)
+                   for field in ("source_name", "canonical_name")):
+                raise ValueError("CGT에서 선택한 샷 이름은 직접 수정할 수 없습니다. 기존 이름을 유지하세요.")
+        # The complete final forest plus the explicit removal list proves
+        # every detach. Children are never silently removed with their parent;
+        # even explicitly unlinked rows retain their native execution slots.
+    result = copy.deepcopy(dict(state))
+    rows = result["shot_routing"]["shots"]
+    by_slot = {row["shot_uuid"]: row for row in rows}
+    # Retain removed slots; only undo their derived group name. No execution
+    # owner, selected media, Prompt/Agent state or Task record is deleted.
+    names = {row["gp_shot_uuid"]: row["canonical_name"] for row in prior.get("members", [])}
+    names.update(hierarchy_derived_names(binding))
+    additions = [row for row in binding["members"] if row["gp_shot_uuid"] not in by_slot]
+    if len(rows) + len(additions) > MAX_SHOTS:
+        raise ValueError("기존 샷을 포함해 최대 5개입니다. 기존 샷 슬롯을 명시적으로 선택하세요.")
+    for item in additions:
+        row = {"shot_uuid": item["gp_shot_uuid"], "number": len(rows) + 1,
+               "name": names[item["gp_shot_uuid"]], "name_is_custom": True, "revision": 0,
+               "selected_source_uids": [], "media_count": 0, "metadata_sha256": "", "media_sha256": ""}
+        rows.append(row); by_slot[row["shot_uuid"]] = row
+    for slot, name in names.items():
+        if slot in by_slot and (by_slot[slot]["name"] != name or not by_slot[slot].get("name_is_custom")):
+            by_slot[slot].update(name=name, name_is_custom=True, revision=int(by_slot[slot].get("revision", 0)) + 1)
+    # Reconfirmation of an unchanged forest is a no-op, including revisions.
+    same = prior and all(binding.get(key) == prior.get(key) for key in binding if key != "revision")
+    if same:
+        return copy.deepcopy(dict(state))
+    result["shot_routing"]["generation"] += 1
+    result["shot_hierarchy"] = binding
+    result.pop("shot_hierarchy_request", None)
+    validate_shot_hierarchy_routing(binding, result["shot_routing"])
+    return result
+
+
+def capture_shot_hierarchy(node: Any, channel_uuid: str, shot_uuid: str) -> dict[str, Any]:
+    """Snapshot one exact same-flow publisher; never consult a global catalog."""
+    if _seedance_execution_mode(node) in {"only", "waiting"}:
+        return {}
+    flow, nodes = _same_flow_nodes(node)
+    publishers = [candidate for candidate in nodes if (sub := _subscription_for(candidate)) is not None
+                  and sub.kind == KIND_IMAGE_ASSET and sub.enabled and sub.channel_uuid == channel_uuid]
+    if not flow or len(publishers) != 1:
+        return {}
+    getter = getattr(publishers[0], "_hmb_shot_hierarchy_snapshot", None)
+    return copy.deepcopy(getter(channel_uuid, shot_uuid)) if callable(getter) else {}
 
 KIND_IMAGE_ASSET = "image_asset"
 KIND_VIDEO_PICKER = "video_picker"
@@ -398,7 +667,11 @@ def _resolve_shot_owner(node: Any, kind: str, channel_uuid: str, shot_uuid: str)
     else:
         selected, duplicate = _single(subscriptions, kind=kind,
                                       channel_uuid=channel_uuid, shot_uuid=shot_uuid)
-    return selected.node if selected is not None and not duplicate else None
+    if selected is not None and not duplicate:
+        from _hmb_connection_management import relationship_suspended
+        if not relationship_suspended(selected.node, node):
+            return selected.node
+    return None
 
 
 def _same_flow_nodes(node: Any) -> tuple[str, list[Any]]:
@@ -730,6 +1003,78 @@ def _mark_authoritative(node: Any) -> tuple[str, bool, str, str] | None:
         with _ROUTING_LOCK:
             _AUTHORITATIVE_FINGERPRINTS[node] = fingerprint
     return fingerprint
+
+
+def restored_shot_catalog_generation_floor(
+    publisher: Any, *, publisher_instance_uuid: str, channel_uuid: str,
+    current_generation: int,
+) -> int:
+    """Recover only a numeric cursor for a fresh, live ImageAsset publication.
+
+    Older builds could save the source document before its live generation was
+    advanced. Same-flow recipients then retained a higher accepted watermark.
+    These numbers may prevent reuse of an old epoch, but never supply catalog
+    rows, media, selection, hashes or source authority. The caller must rebuild
+    its own current content and persist the resulting fresh generation.
+    """
+    maximum = (1 << 53) - 1
+    def cursor(value: Any) -> int:
+        return value if type(value) is int and 1 <= value <= maximum else 0
+
+    floor = cursor(current_generation)
+    flow_name, nodes = _same_flow_nodes(publisher)
+    source = _subscription_for(publisher)
+    if (not flow_name or source is None or source.kind != KIND_IMAGE_ASSET
+            or not source.enabled or source.channel_uuid != channel_uuid
+            or bool(getattr(publisher, "_hmb_node_deleted", False))):
+        return floor
+    try:
+        state = publisher._current_state()
+        routing = state.get("shot_routing") if isinstance(state, Mapping) else None
+    except Exception:
+        return floor
+    if (not isinstance(routing, Mapping)
+            or routing.get("publisher_instance_uuid") != publisher_instance_uuid
+            or routing.get("channel_uuid") != channel_uuid
+            or not publisher_instance_uuid or not channel_uuid):
+        return floor
+    parameter_names = {
+        KIND_VIDEO_PICKER: "HMB_PICKER_STATE", KIND_PROMPT: "HMB_UI_STATE",
+        KIND_AGENT: "HMB_AGENT_UI", KIND_FINISH_LOOK: "HMB_FINISH_LOOK_UI_STATE",
+    }
+    for node in nodes:
+        participant = _subscription_for(node)
+        if (participant is None or not participant.enabled
+                or participant.channel_uuid != channel_uuid
+                or participant.kind not in parameter_names):
+            continue
+        try:
+            value = node.get_parameter_value(parameter_names[participant.kind])
+            if isinstance(value, str):
+                value = json.loads(value)
+        except Exception:
+            continue
+        if not isinstance(value, Mapping):
+            continue
+        if participant.kind == KIND_VIDEO_PICKER:
+            watermarks = ({
+                "publisher_instance_uuid": value.get("accepted_shot_catalog_publisher_instance_uuid"),
+                "channel_uuid": value.get("accepted_shot_catalog_channel_uuid"),
+                "generation": value.get("accepted_shot_catalog_generation"),
+            },)
+        elif participant.kind == KIND_PROMPT:
+            image = value.get("image_asset")
+            # Rich per-Shot media snapshots have an independent publication
+            # generation. Only the compact source catalog cursor is comparable.
+            watermarks = (image.get("shot_catalog_routing"),) if isinstance(image, Mapping) else ()
+        else:
+            watermarks = (value.get("shot_catalog"),)
+        for watermark in watermarks:
+            if (isinstance(watermark, Mapping)
+                    and watermark.get("publisher_instance_uuid") == publisher_instance_uuid
+                    and watermark.get("channel_uuid") == channel_uuid):
+                floor = max(floor, cursor(watermark.get("generation")))
+    return floor
 
 
 def _flow_migration_is_pending(flow_name: str) -> bool:
@@ -1245,6 +1590,10 @@ def _create_connection(edge: ShotEdge) -> bool:
 
 
 def _ensure_edge(edge: ShotEdge, subscriptions: dict[str, ShotSubscription]) -> tuple[bool, str]:
+    from _hmb_connection_management import relationship_suspended
+    if relationship_suspended(edge.source, edge.target, source_parameter=edge.source_parameter,
+                              target_parameter=edge.target_parameter):
+        return False, "connection management detached this relation"
     if _seedance_execution_mode(edge.target) in {"only", "waiting"}:
         return False, "Seedance execution mode does not accept a managed Shot route"
     if not _has_parameter(edge.source, edge.source_parameter):
@@ -1298,6 +1647,9 @@ def _clear_hmb_route(
     other source parameter, remain user-owned and are never touched.
     """
 
+    from _hmb_connection_management import target_has_suspended_role
+    if target_has_suspended_role(target):
+        return 0, "connection management preserves detached inputs"
     removed = 0
     for item in _incoming_connections(target):
         if str(getattr(item, "target_parameter_name", "")) != target_parameter:
@@ -1313,6 +1665,9 @@ def _clear_hmb_route(
 
 
 def _notify_status(node: Any, *, ok: bool, code: str, details: str = "") -> None:
+    from _hmb_connection_management import target_has_suspended_role
+    if target_has_suspended_role(node):
+        return
     callback = getattr(node, "_hmb_shot_routing_status", None)
     if not callable(callback):
         return
@@ -1357,12 +1712,15 @@ def _reconcile_color_lut_routes(
     nodes: list[Any],
 ) -> int:
     """Attach completed results by origin, independent of current source selection."""
+    from _hmb_connection_management import is_detached, target_has_suspended_role
     _reconcile_color_lut_projects(nodes)
     completed: dict[tuple[str, str], list[ShotSubscription]] = {}
     eligible = {id(item.node) for item in values}
     generators = {name: item for name, item in subscriptions.items()
                   if item.kind == KIND_SEEDANCE}
     for source in generators.values():
+        if is_detached(source.node):
+            continue
         getter = getattr(source.node, "_hmb_generated_video_source_snapshot", None)
         try:
             snapshot = getter() if callable(getter) else None
@@ -1385,6 +1743,8 @@ def _reconcile_color_lut_routes(
     changed = 0
     for target in subscriptions.values():
         if target.kind != KIND_COLOR_LUT:
+            continue
+        if target_has_suspended_role(target.node):
             continue
         candidates = completed.get((target.channel_uuid, target.shot_uuid), [])
         available = target.enabled and id(target.node) in eligible
@@ -1428,11 +1788,15 @@ def _reconcile_color_lut_routes(
 
 
 def _reconcile_color_lut_projects(nodes: list[Any], project_source: Any = None, project_state: Any = None) -> None:
-    targets = [n for n in nodes if callable(getattr(n, "_hmb_follow_image_asset_project", None))]
+    from _hmb_connection_management import is_detached, target_has_suspended_role
+    targets = [n for n in nodes if callable(getattr(n, "_hmb_follow_image_asset_project", None))
+               and not target_has_suspended_role(n)]
     if not targets:
         return
     project = {}
     for source in nodes:
+        if is_detached(source):
+            continue
         sub = _subscription_for(source)
         if sub is None or sub.kind != KIND_IMAGE_ASSET or getattr(source, "_hmb_node_deleted", False):
             continue
@@ -1928,6 +2292,9 @@ def reconcile_shot_routing(
     nodes have not opted into Shot routing.
     """
 
+    from _hmb_connection_management import transaction_active, relationship_suspended, target_has_suspended_role
+    if transaction_active():
+        return {"ok": True, "code": "connection_management", "changed": 0}
     flow_name, nodes = _same_flow_nodes(node)
     if not flow_name:
         return {"ok": True, "code": "not_registered", "changed": 0}
@@ -1989,6 +2356,26 @@ def reconcile_shot_routing(
                         },
                         covered_node_ids=(id(value) for value in nodes),
                     )
+
+            # Restored recipients may carry a later accepted numeric cursor
+            # than an older source document persisted. Wait until every exact
+            # participant has finished durable hydration before asking the live
+            # publisher to rebuild its own content in a fresh output epoch.
+            # Saved recipient catalogs never become source authority here.
+            for item in values:
+                if (_allow_unready_cleanup or item.kind != KIND_IMAGE_ASSET
+                        or not bool(getattr(item.node, "_hmb_publication_cursor_restore_pending", False))):
+                    continue
+                restore_cursor = getattr(item.node, "_hmb_restore_publication_cursor", None)
+                if callable(restore_cursor):
+                    try:
+                        restore_cursor()
+                    except Exception as exc:
+                        return _ReconcileResult(
+                            {"ok": False, "code": "incomplete", "changed": 0,
+                             "failures": (f"{item.node_name}: publication_cursor_restore: {exc}",)},
+                            covered_node_ids=(id(value) for value in nodes),
+                        )
 
             # Video Tools migrated into VideoPicker; Finish Look no longer
             # consumes Picker media. Retire the former automatic dependency
@@ -2092,6 +2479,8 @@ def reconcile_shot_routing(
             for recipient in tuple(values):
                 if recipient.kind == KIND_IMAGE_ASSET:
                     continue
+                if target_has_suspended_role(recipient.node, "image_asset"):
+                    continue  # A detached authority is intent, not orphan loss.
                 publisher_available = bool(
                     recipient.channel_uuid in known_image_channels
                     or (
@@ -2230,6 +2619,8 @@ def reconcile_shot_routing(
                     continue
                 for recipient in catalog_recipients:
                     if recipient.node is source.node:
+                        continue
+                    if relationship_suspended(source.node, recipient.node):
                         continue
                     if (recipient.kind == KIND_SEEDANCE
                             and not _seedance_catalog_allowed(recipient.node, snapshot)):
@@ -2438,6 +2829,8 @@ def reconcile_shot_routing(
                 source, snapshot = standalone_picker_catalogs[0]
                 for recipient in catalog_recipients:
                     if recipient.kind not in {KIND_SEEDANCE, KIND_COLOR_LUT}:
+                        continue
+                    if relationship_suspended(source.node, recipient.node):
                         continue
                     if (recipient.kind == KIND_SEEDANCE
                             and not _seedance_catalog_allowed(recipient.node, snapshot)):
@@ -3503,6 +3896,7 @@ __all__ = [
     "SUBSCRIPTION_VERSION",
     "prepare_node_deletion",
     "release_node_lifecycle",
+    "restored_shot_catalog_generation_floor",
     "reconcile_shot_routing",
     "resolve_shot_prompt_owner",
     "resolve_shot_agent_owner",

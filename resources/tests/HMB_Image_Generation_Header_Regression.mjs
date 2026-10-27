@@ -23,7 +23,12 @@ const report = {
   screenshot_kind: "synthetic fixture of the actual widget in isolated Chrome; no live Griptape claim",
 };
 assert.doesNotMatch(source, /\b(?:fetch|XMLHttpRequest|WebSocket|MutationObserver|ResizeObserver|setInterval|setTimeout)\b/);
-assert.doesNotMatch(source, /(?:addEventListener|dispatchEvent|onChange|onCommand)\s*(?:\(|[=:])/);
+assert.doesNotMatch(source, /\b(?:onChange|onCommand)\b/);
+// Approved DOM-only portal lifecycle; provider/engine transports remain forbidden.
+const listenedEvents = [...source.matchAll(/(?:addEventListener|removeEventListener)\?\.\("([^"]+)"/g)].map(match => match[1]);
+assert.deepEqual(listenedEvents, ["hmb-color-lut-header-state", "hmb-color-lut-header-state"]);
+assert.deepEqual([...source.matchAll(/announce\("([^"]+)"\)/g)].map(match => match[1]), ["retire", "ready"]);
+assert.match(source, /new win\.CustomEvent\(`hmb-color-lut-header-\$\{phase\}`/);
 const moduleUrl = "data:text/javascript;base64," + Buffer.from(source).toString("base64");
 const browser = await playwright.chromium.launch({
   headless: true,

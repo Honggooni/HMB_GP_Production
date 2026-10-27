@@ -1274,6 +1274,8 @@ class _Registration:
         self.snapshot_post_hook = self.after_context_snapshot
         self.snapshot_post_types: list[Any] = []
         self.web_worker_module = None
+        self.deletion_handlers = None
+        self.connection_handlers = None
 
     def start_web_worker(self) -> None:
         engine = self.engine()
@@ -1314,6 +1316,12 @@ class _Registration:
                     self.load_requests.pop(id(request), None)
                     self.snapshot_refused_loads[id(request)] = weakref.ref(request)
             return migration_failure
+        deletion_failure = self._guard_connected_deletion(request)
+        if deletion_failure is not None:
+            return deletion_failure
+        connection_failure = self._guard_managed_connections(request)
+        if connection_failure is not None:
+            return connection_failure
         self._observe_workflow_load(request)
         prompt_failure = self._guard_prompt_creation(request)
         if prompt_failure is not None:
@@ -1407,6 +1415,33 @@ class _Registration:
             # Once bootstrap was attempted, do not continue against an unknown
             # newly changed context and accidentally create in another canvas.
             return _native_failure() if attempted_bootstrap else None
+
+    def _guard_connected_deletion(self, request: Any) -> Any:
+        if type(request).__name__ not in {
+            "DeleteNodeRequest", "ResetNodeToDefaultsRequest", "DeleteFlowRequest",
+            "ClearAllObjectStateRequest", "DeleteWorkflowRequest",
+        }:
+            return None
+        engine, manager = self.engine(), self.manager()
+        if not self._prompt_owner(engine, manager):
+            return None
+        # Consolidation transfers retained identities/results before removing
+        # obsolete instances. Only its private scoped transaction may bypass
+        # artist deletion protection; no request flag grants this privilege.
+        migration = sys.modules.get("_hmb_workflow_migration")
+        if migration is not None and migration.mutation_is_internal():
+            return None
+        from _hmb_deletion_guard import guard_request
+        return guard_request(engine, request)
+
+    def _guard_managed_connections(self, request: Any) -> Any:
+        if type(request).__name__ not in {"CreateConnectionRequest", "ResolveNodeRequest"}:
+            return None
+        engine, manager = self.engine(), self.manager()
+        if not self._prompt_owner(engine, manager):
+            return None
+        from _hmb_connection_management import guard_request
+        return guard_request(engine, request)
 
     def _prompt_owner(self, engine: Any, manager: Any) -> bool:
         return bool(
@@ -1718,7 +1753,18 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
                 with registration.lock:
                     registration.owners[self] = library_reference
                     self._registrations.add(registration)
+                    if registration.deletion_handlers is None:
+                        from _hmb_deletion_guard import install_request_handlers
+                        registration.deletion_handlers = install_request_handlers(engine, registration)
+                    if registration.connection_handlers is None:
+                        from _hmb_connection_management import install_request_handlers
+                        registration.connection_handlers = install_request_handlers(engine, registration)
                     _acquire_windows_transport_close_guard(registration)
+                    try:
+                        from _hmb_workflow_serialization_compat import acquire as acquire_save_identity_guard
+                        acquire_save_identity_guard(registration)
+                    except ImportError:
+                        pass  # Older hosts can omit this optional SDK seam.
                     registration.start_web_worker()
         except Exception:
             # Optional cold-start compatibility never blocks library loading.
@@ -1733,6 +1779,11 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
                         continue
                     registration.active = False
                     _release_windows_transport_close_guard(registration)
+                    try:
+                        from _hmb_workflow_serialization_compat import release as release_save_identity_guard
+                        release_save_identity_guard(registration)
+                    except ImportError:
+                        pass
                     registration.prompt_pending.clear()
                     registration.load_requests.clear()
                     registration.snapshot_requests.clear()

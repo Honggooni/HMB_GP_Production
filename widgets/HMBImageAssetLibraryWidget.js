@@ -58,9 +58,12 @@ const HMB_IMAGE_ASSET_SHOT_PALETTE = Object.freeze([
 ]);
 const SHOT_ROUTING_SCHEMA = "hmb-shot-routing";
 const SHOT_ROUTING_VERSION = 1;
+const SHOT_HIERARCHY_SCHEMA = "hmb-shot-hierarchy";
+const SHOT_HIERARCHY_EDIT_SCHEMA = "hmb-shot-hierarchy-edit";
 const MAX_IMAGE_ASSET_REVISION = Number.MAX_SAFE_INTEGER;
 const IMAGE_ASSET_UI_EDIT_REVISION_KEY = "ui_edit_revision";
 const IMAGE_ASSET_EDIT_SCHEMA = "hmb-image-asset-edit-v1";
+const IMAGE_BASH_WORKSPACE_EDIT_SCHEMA = "hmb-image-bash-workspace-edit-v1";
 const ROOT_FOLDER_KEY = "$root";
 const IMAGE_ASSET_STATE_VERSION = 4;
 const IMAGE_TAXONOMY_SCHEMA = "hmb-image-taxonomy";
@@ -655,6 +658,159 @@ function clean(value) {
   return String(value ?? "").trim();
 }
 
+export function hmbHierarchyShotName(value) {
+  if (typeof value !== "string" || !value || value !== value.trim() || value.length > 128
+      || /[\\/:?*"<>|#\x00-\x1f\x7f]/.test(value) || [".", ".."].includes(value)
+      || /[^\S ]| {2}/.test(value)
+      || /https?:\/\/|data:|Bearer\s|(?:api[_-]?key|access[_-]?token)\s*[=:]/i.test(value)) {
+    throw new Error("샷 이름은 공백·경로·제어문자 없이 1~128자로 입력하세요. 이름은 자동 축약하지 않습니다.");
+  }
+  if (/\b(authorization|api[_ -]?key|access[_ -]?token|bearer|password|secret|session[_ -]?token)\b\s*[:=]?\s*\S+/i.test(value)) throw new Error("샷 이름에 인증정보 형식의 문구를 사용할 수 없습니다.");
+  return value;
+}
+
+export function hmbHierarchyParseName(value) {
+  if (typeof value !== "string" || [...value].length > 256) throw new Error("샷 이름이 올바르지 않습니다.");
+  const match = /^(?:(e[0-9]{3,})\/)?((e[0-9]{3,})(s[0-9]{3,})(c[0-9]{3,})__)$/.exec(value);
+  if (!match) return { source_name: value, canonical_name: hmbHierarchyShotName(value), context_episode: "", episode: "", shot: "", split_cut: "" };
+  const [, context, canonical, episode, shot, splitCut] = match;
+  if (context && context !== episode) throw new Error("에피소드 접두 문맥과 샷 코드가 다릅니다.");
+  return { source_name: value, canonical_name: hmbHierarchyShotName(canonical), context_episode: context || "", episode, shot, split_cut: splitCut };
+}
+
+function hierarchyProjectKey(state) {
+  return String(state?.project_root || "").replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase() || clean(state?.project_uid);
+}
+
+export function hmbHierarchyDerivedNames(binding) {
+  const rows = binding?.members || [];
+  return Object.fromEntries(rows.map(row => {
+    const group = [row, ...rows.filter(child => child.parent_id === row.member_id)];
+    const parts = group.map(item => hmbHierarchyParseName(item.source_name));
+    const name = group.length > 1 && parts.every(item => item.episode && item.episode === parts[0].episode)
+      ? `${parts[0].episode}_${parts.map(item => item.shot + item.split_cut).join("-")}__`
+      : group.map(item => item.canonical_name).join("+");
+    return [row.gp_shot_uuid, hmbHierarchyShotName(name)];
+  }));
+}
+
+export function hmbNormalizeShotHierarchy(value) {
+  if (value == null || (typeof value === "object" && !Array.isArray(value) && !Object.keys(value).length)) return {};
+  const fields = ["schema", "version", "binding_id", "revision", "project_identity", "channel_uuid", "cgt_account_id", "members"];
+  if (value.version === 2) fields.push("cgt_scope");
+  const exact = (item, keys) => item && !Array.isArray(item) && typeof item === "object" && Object.keys(item).length === keys.length && keys.every(key => Object.hasOwn(item, key));
+  const uuid = id => typeof id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id);
+  const cgtId = id => typeof id === "string" && /^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/.test(id);
+  if (!exact(value, fields) || value.schema !== SHOT_HIERARCHY_SCHEMA || ![1, 2].includes(value.version)
+      || !Number.isSafeInteger(value.revision) || value.revision < 1 || !uuid(value.binding_id) || !uuid(value.channel_uuid)
+      || (value.version === 1 && value.cgt_account_id !== null) || typeof value.project_identity !== "string"
+      || value.project_identity.length > 4096 || /[\x00-\x1f]/.test(value.project_identity)) throw new Error("지원하지 않는 샷 구성입니다.");
+  if (!Array.isArray(value.members) || value.members.length > 5) throw new Error("대표와 하위를 합쳐 최대 5개 샷을 선택할 수 있습니다.");
+  const memberFields = ["member_id", "origin", "manual_uuid", "source_name", "canonical_name", "gp_shot_uuid", "parent_id", "selection_order", "cgt_task_id", "artist", "status"];
+  const scope = value.cgt_scope;
+  if (value.version === 2) {
+    memberFields.push("cgt_identity");
+    if (value.members.some(row => row?.origin === "cgt")) {
+      if (!value.project_identity || !exact(scope, ["origin", "project_id", "project_db", "module", "module_type", "pipeline_id", "account_id"])
+          || scope.module !== "shot" || scope.module_type !== "task" || !/^https:\/\/[a-zA-Z0-9.\[\]:-]+$/.test(scope.origin)
+          || !/^[A-Za-z0-9_-]{1,128}$/.test(scope.project_db) || !cgtId(scope.project_id) || !cgtId(scope.pipeline_id)
+          || !cgtId(scope.account_id) || scope.account_id !== value.cgt_account_id) throw new Error("CGT 계정·프로젝트·공정 범위가 올바르지 않습니다.");
+    } else if (scope !== null || value.cgt_account_id !== null) throw new Error("CGT 항목이 없는 구성에 다른 계정 범위를 남길 수 없습니다.");
+  }
+  const ids = new Set(); const slots = new Set(); const names = new Set();
+  const episodes = new Set();
+  value.members.forEach((row, i) => {
+    if (!exact(row, memberFields) || !(value.version === 2 ? ["manual", "cgt"] : ["manual"]).includes(row.origin) || row.selection_order !== i + 1) throw new Error("샷 구성 항목이 올바르지 않습니다.");
+    if (row.origin === "manual") {
+      if (row.member_id !== `manual:${row.manual_uuid}` || [row.cgt_task_id, row.artist, row.status, row.cgt_identity ?? null].some(item => item !== null)) throw new Error("수동 항목은 CGT 계정·상태를 가질 수 없습니다.");
+    } else if (!exact(row.cgt_identity, ["entity_id", "task_id", "pipeline_id"]) || !cgtId(row.cgt_task_id)
+        || row.cgt_identity.task_id !== row.cgt_task_id || !cgtId(row.cgt_identity.entity_id) || row.cgt_identity.pipeline_id !== scope.pipeline_id
+        || row.member_id !== `cgt:${row.cgt_task_id.toLowerCase()}` || [row.artist, row.status].some(item => typeof item !== "string" || item.length > 256 || /[\x00-\x1f]/.test(item))) throw new Error("CGT 원본 작업 범위가 일치하지 않습니다.");
+    if (!uuid(row.manual_uuid) || !uuid(row.gp_shot_uuid) || ids.has(row.member_id) || slots.has(row.gp_shot_uuid)) throw new Error("같은 컷 또는 같은 샷 슬롯을 두 번 선택할 수 없습니다.");
+    const name = hmbHierarchyShotName(row.canonical_name);
+    const parsedName = hmbHierarchyParseName(row.source_name);
+    if (parsedName.episode) episodes.add(parsedName.episode);
+    if (parsedName.canonical_name !== name) throw new Error("입력한 정식 샷 이름과 실행명이 다릅니다.");
+    if (names.has(name)) throw new Error("동일한 수동 샷 이름이 있습니다. 서로 다른 이름을 입력하세요.");
+    ids.add(row.member_id); slots.add(row.gp_shot_uuid); names.add(name);
+  });
+  if (episodes.size > 1) throw new Error("서로 다른 에피소드의 샷을 같은 구성에 연결할 수 없습니다.");
+  const byId = new Map(value.members.map(row => [row.member_id, row]));
+  value.members.forEach(row => {
+    if (row.parent_id !== null && !byId.has(row.parent_id)) throw new Error("선택한 대표 샷이 현재 구성에 없습니다.");
+  });
+  value.members.forEach(row => {
+    const seen = new Set([row.member_id]);
+    let parent = row.parent_id;
+    while (parent !== null) {
+      if (seen.has(parent)) throw new Error("자기 자신이나 자신의 하위 샷을 대표로 지정할 수 없습니다.");
+      seen.add(parent); parent = byId.get(parent).parent_id;
+    }
+  });
+  hmbHierarchyDerivedNames(value);
+  return JSON.parse(JSON.stringify(value));
+}
+
+export function hmbValidateHierarchyRouting(binding, routing) {
+  const normalized = hmbNormalizeShotHierarchy(binding);
+  if (!normalized.schema) return {};
+  if (normalized.channel_uuid !== routing?.channel_uuid) throw new Error("다른 라이브러리의 샷 구성을 적용할 수 없습니다.");
+  const rows = new Map((routing.shots || []).map(row => [row.shot_uuid, row]));
+  for (const [slot, name] of Object.entries(hmbHierarchyDerivedNames(normalized))) {
+    if (rows.get(slot)?.name !== name) throw new Error("묶음에 연결된 샷은 + Shot의 샷 구성에서 수정·해제하세요.");
+  }
+  return normalized;
+}
+
+export function hmbApplyShotHierarchyEdit(state, request) {
+  const fields = ["schema", "version", "expected_generation", "expected_binding_revision", "removed_member_ids", "binding"];
+  if (!request || Object.keys(request).length !== fields.length || fields.some(key => !Object.hasOwn(request, key))
+      || request.schema !== SHOT_HIERARCHY_EDIT_SCHEMA || request.version !== 1) throw new Error("샷 구성 요청이 올바르지 않습니다.");
+  const routing = state.shot_routing;
+  const prior = hmbValidateHierarchyRouting(state.shot_hierarchy, routing);
+  if (!Number.isSafeInteger(request.expected_generation) || request.expected_generation !== routing.generation
+      || !Number.isSafeInteger(request.expected_binding_revision) || request.expected_binding_revision !== (prior.revision || 0)) throw new Error("샷이 변경되었습니다. 창을 닫고 다시 열어 주세요.");
+  const binding = hmbNormalizeShotHierarchy(request.binding);
+  if (!binding.schema || binding.channel_uuid !== routing.channel_uuid
+      || binding.project_identity !== hierarchyProjectKey(state) || binding.revision !== (prior.revision || 0) + 1
+      || (prior.schema && binding.binding_id !== prior.binding_id)) throw new Error("현재 프로젝트·샷 구성의 소유권이 변경되었습니다.");
+  const byId = new Map(binding.members.map(row => [row.member_id, row]));
+  const removed = request.removed_member_ids;
+  const expectedRemoved = (prior.members || []).filter(row => !byId.has(row.member_id)).map(row => row.member_id);
+  if (!Array.isArray(removed) || removed.some(key => typeof key !== "string") || new Set(removed).size !== removed.length
+      || removed.length !== expectedRemoved.length || expectedRemoved.some(key => !removed.includes(key))) throw new Error("연결 해제 항목을 명시적으로 확인하세요. 기존 실행 샷은 삭제되지 않습니다.");
+  if (prior.schema && prior.project_identity !== binding.project_identity && (prior.members || []).some(row => byId.has(row.member_id))) throw new Error("이전 프로젝트의 연결을 먼저 모두 해제하세요. 수동 ID는 다른 프로젝트로 옮기지 않습니다.");
+  (prior.members || []).forEach(old => {
+    if (byId.has(old.member_id) && byId.get(old.member_id).gp_shot_uuid !== old.gp_shot_uuid) throw new Error("기존 컷의 독립 샷 슬롯은 변경할 수 없습니다.");
+    const next = byId.get(old.member_id);
+    if (next && next.origin !== old.origin) throw new Error("기존 샷의 생성 출처를 변경할 수 없습니다.");
+    if (next && old.origin === "cgt" && (Object.keys(prior.cgt_scope || {}).some(key => prior.cgt_scope[key] !== binding.cgt_scope?.[key])
+        || Object.keys(old.cgt_identity || {}).some(key => old.cgt_identity[key] !== next.cgt_identity?.[key])
+        || old.source_name !== next.source_name || old.canonical_name !== next.canonical_name)) {
+      throw new Error("CGT에서 선택한 샷의 원본 이름과 작업 ID는 변경할 수 없습니다.");
+    }
+  });
+  const rows = routing.shots.map(row => ({ ...row, selected_source_uids: [...row.selected_source_uids] }));
+  const bySlot = new Map(rows.map(row => [row.shot_uuid, row]));
+  const names = Object.fromEntries((prior.members || []).map(row => [row.gp_shot_uuid, row.canonical_name]));
+  Object.assign(names, hmbHierarchyDerivedNames(binding));
+  const additions = binding.members.filter(row => !bySlot.has(row.gp_shot_uuid));
+  if (rows.length + additions.length > 5) throw new Error("기존 샷을 포함해 최대 5개입니다. 기존 샷 슬롯을 명시적으로 선택하세요.");
+  additions.forEach(item => {
+    const row = { shot_uuid: item.gp_shot_uuid, number: rows.length + 1, name: names[item.gp_shot_uuid], name_is_custom: true, revision: 0, selected_source_uids: [], media_count: 0, metadata_sha256: "", media_sha256: "" };
+    rows.push(row); bySlot.set(row.shot_uuid, row);
+  });
+  Object.entries(names).forEach(([slot, name]) => {
+    const row = bySlot.get(slot);
+    if (row && (row.name !== name || !row.name_is_custom)) Object.assign(row, { name, name_is_custom: true, revision: row.revision + 1 });
+  });
+  if (prior.schema && Object.keys(binding).every(key => key === "revision" || JSON.stringify(binding[key]) === JSON.stringify(prior[key]))) return { ...state };
+  const result = { ...state, shot_routing: { ...routing, generation: routing.generation + 1, shots: rows }, shot_hierarchy: binding };
+  delete result.shot_hierarchy_request;
+  hmbValidateHierarchyRouting(binding, result.shot_routing);
+  return result;
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -1079,6 +1235,71 @@ function normalizeImageTaxonomyContract(value) {
   };
 }
 
+export function hmbNormalizeImageBashWorkspace(value) {
+  const workspaceId = imageAssetUuid(value?.workspace_id);
+  if (!workspaceId) return {};
+  const instances = [], seen = new Set();
+  for (const raw of Array.isArray(value?.instances) ? value.instances : []) {
+    const instanceId = imageAssetUuid(raw?.instance_id), sourceUid = clean(raw?.source_uid).slice(0, 512);
+    if (!instanceId || !sourceUid || seen.has(instanceId)) continue;
+    seen.add(instanceId); instances.push({ instance_id: instanceId, source_uid: sourceUid });
+    if (instances.length >= MAX_SELECTED_IMAGES) break;
+  }
+  return { workspace_id: workspaceId, revision: hmbNormalizeImageAssetRevision(value.revision), instances };
+}
+
+export function hmbCreateImageBashWorkspace(state) {
+  if (!state) return false;
+  if (!hmbNormalizeImageBashWorkspace(state.image_bash_workspace).workspace_id) {
+    state.image_bash_workspace = { workspace_id: newImageAssetUuid(), revision: 0, instances: [] };
+  }
+  state.image_bash_active = true;
+  return true;
+}
+
+export function hmbImageBashWorkspaceAssets(state) {
+  const byUid = new Map((state?.assets || []).map(asset => [clean(asset.source_uid), asset]));
+  return (state?.image_bash_workspace?.instances || []).map(instance => ({
+    ...instance, asset: byUid.get(instance.source_uid) || null,
+  }));
+}
+
+export function hmbAddImageBashSource(state, sourceUid) {
+  const workspace = state?.image_bash_workspace, uid = clean(sourceUid);
+  const asset = state?.assets?.find(row => row.source_uid === uid);
+  if (!workspace?.workspace_id || !asset || !hmbImageAssetCanSelect(asset) || workspace.instances.length >= MAX_SELECTED_IMAGES) return false;
+  workspace.instances.push({ instance_id: newImageAssetUuid(), source_uid: uid });
+  workspace.revision += 1; return true;
+}
+
+export function hmbRemoveImageBashInstance(state, instanceId) {
+  const workspace = state?.image_bash_workspace;
+  const index = workspace?.instances?.findIndex(row => row.instance_id === instanceId) ?? -1;
+  if (index < 0) return false;
+  workspace.instances.splice(index, 1); workspace.revision += 1; return true;
+}
+
+export function hmbDuplicateImageBashInstance(state, instanceId) {
+  const workspace = state?.image_bash_workspace;
+  const index = workspace?.instances?.findIndex(row => row.instance_id === instanceId) ?? -1;
+  if (index < 0 || workspace.instances.length >= MAX_SELECTED_IMAGES) return false;
+  workspace.instances.splice(index + 1, 0, { ...workspace.instances[index], instance_id: newImageAssetUuid() });
+  workspace.revision += 1; return true;
+}
+
+export function hmbReorderImageBashInstance(state, fromId, toId) {
+  const workspace = state?.image_bash_workspace;
+  const from = workspace?.instances?.findIndex(row => row.instance_id === fromId) ?? -1;
+  const to = workspace?.instances?.findIndex(row => row.instance_id === toId) ?? -1;
+  if (from < 0 || to < 0 || from === to) return false;
+  const [instance] = workspace.instances.splice(from, 1); workspace.instances.splice(to, 0, instance);
+  workspace.revision += 1; return true;
+}
+
+function imageBashSourceUids(state) {
+  return new Set((state?.image_bash_workspace?.instances || []).map(row => row.source_uid));
+}
+
 function normalizeState(value) {
   const input = parseValue(value);
   const taxonomy = normalizeImageTaxonomyContract(input.taxonomy);
@@ -1113,6 +1334,14 @@ function normalizeState(value) {
     : "project";
   const selectedMainType = clean(input.selected_main_type);
   const selectedSubType = clean(input.selected_sub_type);
+  const shotRouting = normalizeImageAssetShotRouting(input.shot_routing, assets);
+  const shotHierarchy = hmbValidateHierarchyRouting(input.shot_hierarchy, shotRouting);
+  const selectedProjectKey = hierarchyProjectKey({ project_root: projectRoot, project_uid: input.project_uid });
+  if (shotHierarchy.schema && !shotHierarchy.project_identity && selectedProjectKey
+      && shotHierarchy.members.every(row => row.origin === "manual")) {
+    shotHierarchy.project_identity = selectedProjectKey;
+    shotHierarchy.revision = Math.min(Number.MAX_SAFE_INTEGER, shotHierarchy.revision + 1);
+  }
   return markCanonicalImageAssetState({
     schema: "hmb-image-asset-library-state",
     version: IMAGE_ASSET_STATE_VERSION,
@@ -1132,7 +1361,12 @@ function normalizeState(value) {
     folders,
     assets,
     ...(hmbCatalogPage(input.catalog_page) ? {catalog_page:hmbCatalogPage(input.catalog_page)} : {}),
-    shot_routing: normalizeImageAssetShotRouting(input.shot_routing, assets),
+    shot_routing: shotRouting,
+    shot_hierarchy: shotHierarchy,
+    shot_hierarchy_request: input.shot_hierarchy_request || {},
+    image_bash_workspace: hmbNormalizeImageBashWorkspace(input.image_bash_workspace),
+    image_bash_active: Boolean(input.image_bash_active && imageAssetUuid(input.image_bash_workspace?.workspace_id)),
+    image_bash_workspace_request: input.image_bash_workspace_request || {},
     root_edit_enabled: Boolean(input.root_edit_enabled),
     selected_folder_path: folders.includes(selectedFolderPath) ? selectedFolderPath : "",
     expanded_folders: expandedFolders,
@@ -1248,6 +1482,8 @@ export function hmbMergeImageAssetThumbnailResponse(
 }
 
 function imageAssetShotAuthorityMatches(localState, incomingState) {
+  if (JSON.stringify(localState?.image_bash_workspace) !== JSON.stringify(incomingState?.image_bash_workspace)
+      || Boolean(localState?.image_bash_active) !== Boolean(incomingState?.image_bash_active)) return false;
   const localRouting = localState?.shot_routing;
   const incomingRouting = incomingState?.shot_routing;
   const localShots = Array.isArray(localRouting?.shots) ? localRouting.shots : [];
@@ -1509,6 +1745,7 @@ export function hmbAddImageAssetShot(state) {
 }
 
 export function hmbDeleteImageAssetShot(state, shotUuid) {
+  if (state.shot_hierarchy?.members?.some(row => row.gp_shot_uuid === shotUuid)) return false;
   const routing = ensureImageAssetShotRouting(state);
   const target = imageAssetUuid(shotUuid);
   const deleteIndex = routing?.shots.findIndex((shot) => shot.shot_uuid === target) ?? -1;
@@ -1566,6 +1803,7 @@ export function hmbActivateImageAssetShot(state, shotUuid) {
 }
 
 export function hmbRenameImageAssetShot(state, shotUuid, value) {
+  if (state.shot_hierarchy?.members?.some(row => row.gp_shot_uuid === shotUuid)) return false;
   const routing = ensureImageAssetShotRouting(state);
   const shot = routing?.shots.find((item) => item.shot_uuid === imageAssetUuid(shotUuid));
   const name = clean(value).slice(0, 128);
@@ -1574,6 +1812,23 @@ export function hmbRenameImageAssetShot(state, shotUuid, value) {
   shot.name_is_custom = true;
   bumpImageAssetShotRouting(routing, shot);
   return true;
+}
+
+export function hmbImageAssetShotCanRename(state, shotUuid) {
+  return !state.shot_hierarchy?.members?.some(row => row.gp_shot_uuid === shotUuid && row.origin === "cgt");
+}
+
+export function hmbImageAssetManualRenameRequest(state, shotUuid, value) {
+  const binding = hmbValidateHierarchyRouting(state.shot_hierarchy, state.shot_routing);
+  const member = binding.members?.find(row => row.gp_shot_uuid === shotUuid);
+  if (!member) return null;
+  if (member.origin !== "manual") throw new Error("CGT에서 선택한 샷의 이름은 변경할 수 없습니다.");
+  const parsed = hmbHierarchyParseName(value);
+  return { schema: SHOT_HIERARCHY_EDIT_SCHEMA, version: 1,
+    expected_generation: state.shot_routing.generation, expected_binding_revision: binding.revision,
+    removed_member_ids: [], binding: { ...binding, revision: binding.revision + 1,
+      members: binding.members.map(row => row === member
+        ? { ...row, source_name: parsed.source_name, canonical_name: parsed.canonical_name } : row) } };
 }
 
 export function hmbToggleImageAssetShotSource(state, shotUuid, sourceUid) {
@@ -1766,6 +2021,7 @@ export function hmbMergeImageAssetSelectionDelta(
   // Preserve it across a delayed catalog echo, then filter it against the
   // authoritative master assets during normalization.
   authoritative.shot_routing = local.shot_routing;
+  authoritative.shot_hierarchy = local.shot_hierarchy;
   return normalizeState(authoritative);
 }
 
@@ -1994,7 +2250,8 @@ export function hmbBuildImageAssetCompactEdit(state, acceptedIdentity) {
     "root_edit_enabled", "selected_folder_path", "expanded_folders", "selected_main_type",
     "selected_sub_type", "selected_source_view", "search", "language", "asset_view_mode",
     "refresh_revision", "thumbnail_request", "asset_registration_request",
-    "asset_cleanup_request", "disconnect_import_uid", "shot_routing",
+    "asset_cleanup_request", "disconnect_import_uid", "shot_routing", "shot_hierarchy", "shot_hierarchy_request",
+    "image_bash_workspace", "image_bash_active", "image_bash_workspace_request",
   ]) edits[field] = state[field];
   return {
     schema: IMAGE_ASSET_EDIT_SCHEMA, version: 1,
@@ -2381,7 +2638,8 @@ function hmbImageAssetLocalPageProjection(value,current,container) {
   const page=hmbCatalogPage(current?.catalog_page);
   if(!page || !Array.isArray(value?.assets) || hmbCatalogPageContextKey(value)!==hmbCatalogPageContextKey(current))return value;
   const wanted=new Set(page.asset_library_ids);
-  return {...value,catalog_page:page,assets:value.assets.filter(asset=>asset.selected || wanted.has(asset.asset_library_id))};
+  const workspaceUids=imageBashSourceUids(value);
+  return {...value,catalog_page:page,assets:value.assets.filter(asset=>asset.selected || workspaceUids.has(asset.source_uid) || wanted.has(asset.asset_library_id))};
 }
 
 export function hmbRequestImageAssetCatalogPage(container,state,offset=0) {
@@ -2597,6 +2855,10 @@ function restoreImageAssetUi(container, state, memory) {
 function imageAssetDomKey(node) {
   if (!node || node.nodeType !== 1) return "";
   for (const attribute of [
+    "data-hmb-native-identity",
+    "data-hmb-native-actions",
+    "data-image-bash-instance",
+    "data-image-bash-panel",
     "data-asset-key",
     "data-selected-key",
     "data-compact-shot-row",
@@ -2661,6 +2923,8 @@ export function hmbPatchImageAssetElement(current, desired) {
     return true;
   }
   if (current.nodeType !== 1 || current.tagName !== desired.tagName) return false;
+  if (current.matches?.("[data-hmb-native-identity],[data-hmb-native-actions]")
+    && desired.matches?.("[data-hmb-native-identity],[data-hmb-native-actions]")) return true;
   hmbSyncImageAssetAttributes(current, desired);
 
   const original = Array.from(current.childNodes || []);
@@ -2837,8 +3101,9 @@ function renderAssetCard(asset, selectedCount, search, state, shot = activeImage
     ? `${asset.width} × ${asset.height}`
     : imageAssetText(state, "metadata_pending");
   const selectable = hmbImageAssetCanSelect(asset);
-  const selectedForShot = imageAssetShotContains(shot, asset.source_uid);
-  const selectionBlocked = selectable && !selectedForShot && selectedCount >= MAX_SHOT_IMAGES;
+  const selectedForShot = state.image_bash_active ? imageBashSourceUids(state).has(asset.source_uid) : imageAssetShotContains(shot, asset.source_uid);
+  const selectionBlocked = selectable && (state.image_bash_active
+    ? state.image_bash_workspace.instances.length >= MAX_SELECTED_IMAGES : !selectedForShot && selectedCount >= MAX_SHOT_IMAGES);
   const cardTitle = !selectable
     ? imageAssetText(state, "register_before_select")
     : selectionBlocked
@@ -2945,9 +3210,10 @@ export function hmbImageAssetThumbnailRequestIds(
   // to the currently opened folder or Shot. Selected/visible rows keep
   // priority; the remainder drains through successive 64-item post-paint
   // batches, so a 5,000-item catalog never blocks the initial paint.
+  const workspaceAssets = hmbImageBashWorkspaceAssets(canonical).map(row => row.asset).filter(Boolean);
   const candidates = options.includeCatalog === false
-    ? [...selectedAssets(canonical), ...visible]
-    : [...selectedAssets(canonical), ...visible, ...canonical.assets];
+    ? [...selectedAssets(canonical), ...workspaceAssets, ...visible]
+    : [...selectedAssets(canonical), ...workspaceAssets, ...visible, ...canonical.assets];
   const seen = new Set();
   return candidates
     .filter((asset) => {
@@ -3438,10 +3704,10 @@ export function hmbResumeImageAssetThumbnailRequest(container, state, props = {}
 function imageAssetThumbnailAssetForElement(container, state, image) {
   if (!state || !Array.isArray(state.assets) || !image) return null;
   const keyedOwner = image.closest?.("[data-asset-key]")
-    || image.closest?.("[data-selected-key]");
+    || image.closest?.("[data-selected-key]") || image.closest?.("[data-image-bash-asset-key]");
   const libraryId = clean(
     keyedOwner?.getAttribute?.("data-asset-key")
-    || keyedOwner?.getAttribute?.("data-selected-key"),
+    || keyedOwner?.getAttribute?.("data-selected-key") || keyedOwner?.getAttribute?.("data-image-bash-asset-key"),
   );
   if (libraryId) {
     return state.assets.find((asset) => clean(asset.asset_library_id) === libraryId) || null;
@@ -3909,8 +4175,9 @@ function renderSelectedCard(asset, index, selected, state, shot = activeImageAss
 function hmbApplyImageAssetCardFeedback(card, asset, selectedCount, state, shot = activeImageAssetShot(state)) {
   if (!card || !asset) return false;
   const selectable = hmbImageAssetCanSelect(asset);
-  const selectedForShot = imageAssetShotContains(shot, asset.source_uid);
-  const selectionBlocked = selectable && !selectedForShot && selectedCount >= MAX_SHOT_IMAGES;
+  const selectedForShot = state.image_bash_active ? imageBashSourceUids(state).has(asset.source_uid) : imageAssetShotContains(shot, asset.source_uid);
+  const selectionBlocked = selectable && (state.image_bash_active
+    ? state.image_bash_workspace.instances.length >= MAX_SELECTED_IMAGES : !selectedForShot && selectedCount >= MAX_SHOT_IMAGES);
   card.classList?.toggle("selected", selectedForShot);
   card.classList?.toggle("selection-blocked", selectionBlocked);
   card.setAttribute?.("data-selection-disabled", selectionBlocked ? "1" : "0");
@@ -4745,7 +5012,8 @@ function renderRegistrationDialog(state, draft) {
          </div>
         <footer class="passport-actions">
           <button type="button" data-registration-cancel>${escapeHtml(imageAssetText(state, "cancel"))}</button>
-          <button type="button" class="passport-register" data-registration-submit ${registrationDraftIsComplete(draft) ? "" : "disabled"}>${escapeHtml(imageAssetText(state, "register_asset"))}</button>
+          ${externalImport && state.image_bash_active && state.image_bash_workspace?.workspace_id ? `<button type="button" data-registration-bash-add ${draft.bash_pending || state.image_bash_workspace.instances.length >= MAX_SELECTED_IMAGES ? "disabled" : ""}>HMBImageBash에 추가</button>` : ""}
+          <button type="button" class="passport-register" data-registration-submit ${registrationDraftIsComplete(draft) && !draft.bash_pending ? "" : "disabled"}>${escapeHtml(imageAssetText(state, "register_asset"))}</button>
         </footer>
       </section>
     </div>
@@ -4966,18 +5234,33 @@ export function hmbInstallImageAssetRefreshReviewEvents(container, state, props,
   });
 }
 
+function renderImageBashWorkspace(state, compact = false) {
+  const workspace = state.image_bash_workspace;
+  if (!workspace?.workspace_id) return "";
+  const active = Boolean(state.image_bash_active), rows = hmbImageBashWorkspaceAssets(state);
+  const cards = rows.map(({ instance_id: id, source_uid: sourceUid, asset }, index) => {
+    const name = clean(asset?.image_name) || clean(asset?.asset_id) || sourceUid;
+    return `<article class="${compact ? "compact-shot-asset" : "selected-card"} image-bash-card ${asset ? "" : "missing"}" data-image-bash-instance="${escapeHtml(id)}" data-image-bash-source="${escapeHtml(sourceUid)}" data-image-bash-asset-key="${escapeHtml(asset?.asset_library_id || "")}" draggable="true" role="listitem" aria-posinset="${index + 1}" aria-setsize="${rows.length}" title="${escapeHtml(name)}"><div class="selected-card-top"><strong class="slot">${String(index + 1).padStart(2, "0")}</strong><div class="selected-actions"><button type="button" data-image-bash-duplicate="${id}" aria-label="Duplicate image" title="${imageAssetLanguage(state) === "ko" ? "이미지 인스턴스 복제" : "Duplicate image instance"}" ${rows.length >= MAX_SELECTED_IMAGES ? "disabled" : ""}>⧉</button><button type="button" data-image-bash-remove="${id}" aria-label="Remove image instance">×</button></div></div><div class="selected-card-body">${asset ? thumbnailHtml(asset, "selected-thumb") : '<span class="image-bash-missing">이미지 연결 확인 필요</span>'}</div>${compact ? `<b>${escapeHtml(name)}</b>` : ""}</article>`;
+  }).join("");
+  const tray = active || compact ? `<div class="${compact ? "compact-shot-assets" : "tray-scroll"}" data-image-bash-tray="${workspace.workspace_id}" role="list">${cards || `<div class="tray-empty">${imageAssetLanguage(state) === "ko" ? "라이브러리 이미지를 클릭하여 추가하세요. 중복 이미지도 개별로 유지됩니다." : "Click library images to add independent image instances."}</div>`}</div>` : "";
+  return `<section class="${compact ? "compact-shot-row" : "shot-panel"} image-bash-panel ${active ? "active" : "collapsed"}" data-image-bash-panel="${workspace.workspace_id}" style="--shot-accent:#22d3ee;--shot-rgb:34,211,238"><header class="shot-panel-head"><button type="button" class="shot-panel-toggle" data-image-bash-tab aria-expanded="${active}"><small>IB</small><b>HMBImageBash</b><span>${escapeHtml(imageAssetText(state, "selected_images"))}</span><em>${rows.length}/${MAX_SELECTED_IMAGES}</em><i>REMOTE</i></button></header>${tray}</section>`;
+}
+
 function renderImageAssetShotStack(state) {
   const routing = ensureImageAssetShotRouting(state);
   const active = routing.shots.find((shot) => shot.shot_uuid === routing.active_shot_uuid)
     || routing.shots[0];
   const isKorean = imageAssetLanguage(state) === "ko";
   return `<section class="shot-stack" data-shot-stack data-channel="${escapeHtml(routing.channel_uuid)}">${routing.shots.map((shot) => {
-    const isActive = shot.shot_uuid === active.shot_uuid;
+    const isActive = !state.image_bash_active && shot.shot_uuid === active.shot_uuid;
     const palette = hmbImageAssetShotPalette(shot.number);
     const shotAssets = imageAssetShotAssets(state, shot);
+    const hierarchyBound = state.shot_hierarchy?.members?.some(row => row.gp_shot_uuid === shot.shot_uuid);
     const number = String(shot.number).padStart(2, "0");
+    const canRename = hmbImageAssetShotCanRename(state, shot.shot_uuid);
+    const renameLabel = canRename ? imageAssetText(state, "rename_shot") : (isKorean ? "CGT 샷 이름은 원본으로 유지됩니다" : "CGT shot names are fixed");
     const addButton = shot.number === 1
-      ? `<button type="button" class="shot-add" data-shot-add ${routing.shots.length >= MAX_IMAGE_ASSET_SHOTS ? "disabled" : ""}>+ Shot</button>`
+      ? `<button type="button" class="shot-add" data-shot-add title="${escapeHtml(isKorean ? "CGT 선택 · 수동 샷 추가 · 묶음 구성" : "Select CGT shots · Add manual shots · Manage groups")}">+ Shot</button>`
       : "";
     const tray = isActive
       ? `<div class="tray-scroll" data-shot-tray="${escapeHtml(shot.shot_uuid)}">${shotAssets.map((asset, index) => renderSelectedCard(asset, index, shotAssets, state, shot)).join("") || `<div class="tray-empty">${escapeHtml(imageAssetText(state, "tray_empty"))}</div>`}</div>`
@@ -4986,10 +5269,10 @@ function renderImageAssetShotStack(state) {
       <header class="shot-panel-head">
         <button type="button" class="shot-panel-toggle" data-shot-tab="${escapeHtml(shot.shot_uuid)}" aria-expanded="${isActive ? "true" : "false"}" title="${escapeHtml(isKorean ? "클릭하여 Shot 열기" : "Open Shot")}">
           <small>${number}</small><b data-shot-name>${escapeHtml(shot.name)}</b><span>${escapeHtml(imageAssetText(state, "selected_images"))}</span><em>${shotAssets.length}/${MAX_SHOT_IMAGES}</em><i>REMOTE</i>
-        </button><button type="button" class="shot-rename" data-shot-rename="${escapeHtml(shot.shot_uuid)}" aria-label="${escapeHtml(imageAssetText(state, "rename_shot"))}" title="${escapeHtml(imageAssetText(state, "rename_shot"))}">✎</button><button type="button" class="shot-delete" data-shot-delete="${escapeHtml(shot.shot_uuid)}" aria-label="${escapeHtml(imageAssetText(state, "delete_shot"))}" title="${escapeHtml(routing.shots.length <= 1 ? imageAssetText(state, "keep_one_shot") : imageAssetText(state, "delete_shot"))}" ${routing.shots.length <= 1 ? "disabled" : ""}>&times;</button>${addButton}
+        </button><button type="button" class="shot-rename" data-shot-rename="${escapeHtml(shot.shot_uuid)}" aria-label="${escapeHtml(renameLabel)}" title="${escapeHtml(renameLabel)}" ${canRename ? "" : "disabled"}>✎</button><button type="button" class="shot-delete" data-shot-delete="${escapeHtml(shot.shot_uuid)}" aria-label="${escapeHtml(imageAssetText(state, "delete_shot"))}" title="${escapeHtml(hierarchyBound ? "묶음 구성에서 연결 해제 후 삭제하세요" : routing.shots.length <= 1 ? imageAssetText(state, "keep_one_shot") : imageAssetText(state, "delete_shot"))}" ${routing.shots.length <= 1 || hierarchyBound ? "disabled" : ""}>&times;</button>${addButton}
       </header>${tray}
     </section>`;
-  }).join("")}</section>`;
+  }).join("")}${renderImageBashWorkspace(state)}</section>`;
 }
 
 export function hmbImageAssetCompactShotRows(state) {
@@ -5002,7 +5285,7 @@ export function hmbImageAssetCompactShotRows(state) {
     shot_uuid: shot.shot_uuid,
     number: shot.number,
     name: shot.name,
-    active: shot.shot_uuid === routing.active_shot_uuid,
+    active: !state.image_bash_active && shot.shot_uuid === routing.active_shot_uuid,
     palette: hmbImageAssetShotPalette(shot.number),
     assets: imageAssetShotAssets(state, shot, selectedByUid).map((asset, index) => ({
       ...asset,
@@ -5038,7 +5321,7 @@ export function hmbRenderImageAssetCompactSummary(state) {
   const rows = hmbImageAssetCompactShotRows(state);
   return `<section class="library-compact-summary" data-library-compact-summary hidden aria-label="HMBImageAssetLibrary Shot summary">${rows.map(
     (row) => renderImageAssetCompactShotRow(state, row),
-  ).join("")}</section>`;
+  ).join("")}${renderImageBashWorkspace(state, true)}</section>`;
 }
 
 function hmbPatchImageAssetThumbnailFragment(current, markup) {
@@ -5064,6 +5347,7 @@ function hmbRebuildImageAssetIndexes(container, state) {
   const cardById = new Map();
   const selectedById = new Map();
   const compactById = new Map();
+  const bashById = new Map();
   container.querySelectorAll?.("[data-asset-key]").forEach((card) => {
     const key = clean(card.getAttribute?.("data-asset-key"));
     if (key) cardById.set(key, card);
@@ -5080,11 +5364,19 @@ function hmbRebuildImageAssetIndexes(container, state) {
     cards.push(card);
     compactById.set(assetId, cards);
   });
+  container.querySelectorAll?.("[data-image-bash-asset-key]").forEach((card) => {
+    const assetId = clean(card.getAttribute?.("data-image-bash-asset-key"));
+    if (!assetId) return;
+    const cards = bashById.get(assetId) || [];
+    cards.push(card);
+    bashById.set(assetId, cards);
+  });
   container.__hmbImageAssetByLibraryId = assetsById;
   container.__hmbImageAssetBySourceUid = assetsBySourceUid;
   container.__hmbImageAssetCardByLibraryId = cardById;
   container.__hmbImageAssetSelectedCardByLibraryId = selectedById;
   container.__hmbImageAssetCompactCardsByLibraryId = compactById;
+  container.__hmbImageAssetBashCardsByLibraryId = bashById;
   return true;
 }
 
@@ -5097,6 +5389,15 @@ export function hmbPatchImageAssetThumbnailMedia(container, state, assetLibraryI
   }
   const assetsById = container.__hmbImageAssetByLibraryId;
   let patched = 0;
+  changed.forEach(assetLibraryId => {
+    const asset = assetsById.get(assetLibraryId);
+    if (!asset) return;
+    const cards = container.__hmbImageAssetBashCardsByLibraryId?.get(assetLibraryId) || [];
+    cards.forEach(card => {
+      const thumbnail = card.querySelector?.(".selected-thumb");
+      if (thumbnail && hmbPatchImageAssetThumbnailFragment(thumbnail, thumbnailHtml(asset, "selected-thumb"))) patched += 1;
+    });
+  });
   changed.forEach((assetLibraryId) => {
     const asset = assetsById.get(assetLibraryId);
     const card = container.__hmbImageAssetCardByLibraryId?.get(assetLibraryId);
@@ -5159,10 +5460,74 @@ function hmbSetImageAssetCompactThumbnailsActive(summary, active) {
   });
 }
 
+// Native Editor controls remain React-owned. Keep each portal container alive
+// across retained markup updates and controller rebuilds; never morph its children.
+export function hmbInstallImageAssetNativeHeader(container) {
+  if (!container) return null;
+  if (container.__hmbImageAssetNativeHeader) return container.__hmbImageAssetNativeHeader;
+  const doc = container.ownerDocument || globalThis.document;
+  const win = doc?.defaultView || globalThis;
+  let active = false, disposed = false, announcedRoot = null;
+  const slots = container.__hmbImageAssetNativeHeaderSlots || {};
+  container.__hmbImageAssetNativeHeaderSlots = slots;
+  const toggle = (element, name, value) => {
+    if (element?.classList && element.classList.contains(name) !== value) element.classList.toggle(name, value);
+  };
+  const announce = phase => {
+    if (typeof win.CustomEvent === "function") doc?.dispatchEvent?.(new win.CustomEvent(`hmb-color-lut-header-${phase}`, { detail: { container } }));
+  };
+  const apply = () => {
+    const root = container.querySelector?.(".hmb-image-assets");
+    if (!root) return;
+    const value = active ? "active" : "fallback";
+    if (root.getAttribute?.("data-hmb-native-header") !== value) root.setAttribute?.("data-hmb-native-header", value);
+    toggle(container, "nodrag", !active);
+    toggle(root, "nodrag", !active);
+
+    for (const body of root.querySelectorAll?.("[data-library-expanded],[data-library-compact-summary]") || []) toggle(body, "nodrag", true);
+    for (const control of root.querySelectorAll?.(".top > .project-switch,.top > .header-actions") || []) toggle(control, "nodrag", true);
+  };
+  const onState = event => {
+    if (disposed || event.target !== container) return;
+    active = event.detail?.active === true;
+    apply();
+  };
+  container.addEventListener?.("hmb-color-lut-header-state", onState);
+  const api = {
+    sync() {
+      if (disposed) return;
+      const root = container.querySelector?.(".hmb-image-assets");
+      if (!root) return;
+      for (const name of ["identity", "actions"]) {
+        const incoming = root.querySelector?.(`[data-hmb-native-${name}]`);
+        if (!incoming) return;
+        if (slots[name] && slots[name] !== incoming) incoming.replaceWith?.(slots[name]);
+        else slots[name] = incoming;
+      }
+      if (!container.hasAttribute?.("data-hmb-color-lut-widget")) container.setAttribute?.("data-hmb-color-lut-widget", "");
+      if (container.getAttribute?.("data-hmb-native-node-type") !== "HMBImageAssetLibrary") container.setAttribute?.("data-hmb-native-node-type", "HMBImageAssetLibrary");
+      apply();
+      if (announcedRoot !== root) { announcedRoot = root; announce("ready"); }
+    },
+    cleanup() {
+      if (disposed) return;
+      announce("retire"); active = false; apply(); disposed = true;
+      container.removeEventListener?.("hmb-color-lut-header-state", onState);
+      container.removeAttribute?.("data-hmb-color-lut-widget");
+      container.removeAttribute?.("data-hmb-native-node-type");
+      if (container.__hmbImageAssetNativeHeader === api) delete container.__hmbImageAssetNativeHeader;
+      // Retain the slots, including React children, until React unmounts them.
+    },
+  };
+  container.__hmbImageAssetNativeHeader = api;
+  return api;
+}
+
 function renderImageAssetFixedTop(state) {
-  return `<header class="top" data-library-toggle-surface="header">
+  return `<header class="top group" data-library-toggle-surface="header">
       <div class="mark">IA</div>
-      <div class="heading"><b>HMBImageAssetLibrary</b><span>${escapeHtml(displayWindowsPath(state.catalog_root))} → ${escapeHtml(hmbImageAssetProjectDisplayName(state) || imageAssetText(state, "select_a_project"))}</span></div>
+      <div class="heading"><b>HMB ImageAsset Library</b><span>${escapeHtml(displayWindowsPath(state.catalog_root))} → ${escapeHtml(hmbImageAssetProjectDisplayName(state) || imageAssetText(state, "select_a_project"))}</span></div>
+      <div class="hmb-native-identity" data-hmb-native-identity></div><div class="hmb-native-actions nodrag" data-hmb-native-actions></div>
       <div class="project-switch">
         <div class="project-actions">
           <button type="button" class="project-action" data-project-set aria-label="${escapeHtml(imageAssetText(state, "project_set"))}" title="${escapeHtml(imageAssetText(state, "project_set"))}" ${state.scan_busy ? "disabled" : ""}>S</button>
@@ -5202,6 +5567,7 @@ export function hmbPatchCompactImageAssetState(container, state) {
   else root.removeAttribute?.("aria-busy");
   root.style?.setProperty?.("--active-shot-accent", palette.accent);
   root.style?.setProperty?.("--active-shot-rgb", palette.rgb);
+  hmbInstallImageAssetNativeHeader(container)?.sync();
   hmbSetImageAssetCompactThumbnailsActive(summary, !summary.hidden);
   container.__hmbImageAssetLatestState = state;
   hmbRebuildImageAssetIndexes(container, state);
@@ -5247,7 +5613,7 @@ function render(
   const viewToggleLabel = imageAssetText(state, detailView ? "image_only_view" : "details_view");
   return `
     <style>
-      .hmb-image-assets :is(button,input,select,textarea){font-family:inherit}
+      .hmb-image-assets :is(button,input,select,textarea):not([data-hmb-native-identity] *,[data-hmb-native-actions] *){font-family:inherit}
       .hmb-image-assets .compact-shot-asset[draggable="true"]{cursor:grab;user-select:none}
       .hmb-image-assets .compact-shot-asset.dragging{cursor:grabbing;opacity:.6}
       .hmb-image-assets .compact-shot-asset.drop-target{border-color:var(--shot-accent);box-shadow:inset 0 0 0 1px var(--shot-accent)}
@@ -5259,14 +5625,14 @@ function render(
       @keyframes hmb-image-leaf-pulse{0%,12.5%{opacity:1;filter:brightness(1.65);box-shadow:0 0 7px rgba(226,232,240,.42)}37.5%,100%{opacity:.2;filter:brightness(.62);box-shadow:none}}.thumbnail-loading .thumbnail-placeholder,.thumbnail-loading .asset-thumb-placeholder,.thumbnail-loading .compact-shot-placeholder{display:grid!important;width:100%;height:100%;place-items:center;background:rgba(5,9,16,.82)}.thumbnail-loading .thumbnail-placeholder{min-width:100%;min-height:100%}.hmb-image-leaf-loader{position:relative;display:block!important;pointer-events:none;width:38px!important;height:38px!important;min-width:38px!important;min-height:38px!important;background:transparent!important}.hmb-image-leaf-loader>i{--leaf-angle:calc(var(--leaf-index) * 45deg);position:absolute;left:50%;top:50%;width:6px;height:12px;margin:-6px 0 0 -3px;border-radius:90% 12% 90% 12%;background:linear-gradient(135deg,#fff 4%,#cbd5e1 48%,#64748b 100%);transform:rotate(var(--leaf-angle)) translateY(-13px) rotate(45deg);transform-origin:50% 50%;opacity:.2;animation:hmb-image-leaf-pulse 1s linear infinite;animation-delay:calc(var(--leaf-index) * .125s)}@media (prefers-reduced-motion:reduce){.hmb-image-leaf-loader>i{animation:none;opacity:.45;filter:none;box-shadow:none}.hmb-image-leaf-loader>i:first-child{opacity:.9}}
       .hmb-image-leaf-loader,.hmb-image-leaf-loader *{pointer-events:none}
       .thumbnail-failed .thumbnail-placeholder,.thumbnail-failed .asset-thumb-placeholder,.thumbnail-failed .compact-shot-placeholder{display:grid!important;width:100%;height:100%;place-items:center;background:rgba(5,9,16,.82)}.thumbnail-failed .thumbnail-placeholder{min-width:100%;min-height:100%}.hmb-image-thumbnail-unavailable{display:grid!important;place-items:center;width:30px!important;height:30px!important;border:1px solid rgba(248,113,113,.42);border-radius:50%;background:rgba(69,10,10,.36)!important;color:#fca5a5;font-size:15px;font-weight:950;line-height:1}.thumbnail-failed{animation:none!important}
-      .shot-panel .shot-rename{width:29px;height:29px;flex:0 0 29px;padding:0;border:1px solid rgba(var(--shot-rgb),.42);border-radius:7px;background:rgba(var(--shot-rgb),.10);color:var(--shot-accent);font-size:13px;cursor:pointer}.shot-panel .shot-rename:hover,.shot-panel .shot-rename:focus-visible{border-color:var(--shot-accent);background:rgba(var(--shot-rgb),.22);outline:none}.shot-name-input{width:min(180px,100%);height:24px;border:1px solid var(--shot-accent);border-radius:5px;background:#060b13;color:#f8fafc;padding:0 6px;font:inherit;outline:none;box-shadow:0 0 0 2px rgba(var(--shot-rgb),.2)}
+      .shot-panel .shot-rename{width:29px;height:29px;flex:0 0 29px;padding:0;border:1px solid rgba(var(--shot-rgb),.42);border-radius:7px;background:rgba(var(--shot-rgb),.10);color:var(--shot-accent);font-size:13px;cursor:pointer}.shot-panel .shot-rename:disabled{opacity:.28;cursor:default}.shot-panel .shot-rename:hover:not(:disabled),.shot-panel .shot-rename:focus-visible{border-color:var(--shot-accent);background:rgba(var(--shot-rgb),.22);outline:none}.shot-name-input{width:min(180px,100%);height:24px;border:1px solid var(--shot-accent);border-radius:5px;background:#060b13;color:#f8fafc;padding:0 6px;font:inherit;outline:none;box-shadow:0 0 0 2px rgba(var(--shot-rgb),.2)}
       .toolbar-status{flex:0 0 190px;width:190px;min-width:190px;height:30px;display:flex;align-items:center;justify-content:flex-end;overflow:hidden;color:var(--muted);font-size:8px}.toolbar-status strong{display:block;width:100%;color:${state.error ? "#fda4af" : "#86efac"};font-variant-numeric:tabular-nums;letter-spacing:-.02em;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.toolbar .filter-chip{flex:0 0 120px;width:120px;max-width:120px;text-align:center}
       .asset-view-toggle{flex:0 0 31px;width:31px;height:30px;display:grid;place-items:center;padding:0;border:1px solid rgba(96,165,250,.46);border-radius:7px;background:linear-gradient(180deg,rgba(37,99,235,.2),rgba(15,23,42,.88));color:#7dd3fc;cursor:pointer}.asset-view-toggle:hover,.asset-view-toggle:focus-visible,.asset-view-toggle[aria-pressed="true"]{border-color:var(--accent);background:linear-gradient(180deg,rgba(37,99,235,.38),rgba(15,23,42,.94));color:#e0f2fe;outline:none;box-shadow:0 0 10px rgba(34,211,238,.2)}.asset-view-toggle svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
       .hmb-image-assets .asset-card{min-height:167px;padding:10px}.hmb-image-assets .asset-thumb{width:123px;height:145px}.hmb-image-assets .asset-add{min-width:52px;height:28px;padding:0 10px;font-size:10px}.hmb-image-assets .asset-source-name{font-size:9px}.hmb-image-assets[data-asset-view="image"] .asset-grid{grid-template-columns:repeat(auto-fill,145px);align-content:start;justify-content:start;gap:9px}.hmb-image-assets[data-asset-view="image"] .asset-card{width:145px;grid-template-columns:123px;gap:0}.hmb-image-assets[data-asset-view="image"] .asset-content,.hmb-image-assets[data-asset-view="image"] .asset-extension-badge{display:none}.hmb-image-assets[data-asset-view="detail"] .asset-grid{grid-template-columns:repeat(auto-fill,286px);align-content:start;justify-content:start;gap:9px}.hmb-image-assets[data-asset-view="detail"] .asset-card{width:286px;grid-template-columns:123px minmax(0,1fr);gap:11px}.hmb-image-assets[data-asset-view="detail"] .asset-content{display:flex}
       .tray{margin:0 8px 8px;border:1px solid rgba(244,114,182,.34);border-radius:10px;background:linear-gradient(180deg,rgba(30,14,30,.9),rgba(8,11,19,.96));overflow:hidden}.tray-head{height:34px;display:flex;align-items:center;gap:9px;padding:0 10px;border-bottom:1px solid rgba(244,114,182,.2)}.tray-head b{font-size:9px;letter-spacing:.07em;color:#f9c2df}.tray-head span{color:#8ea3b8;font-size:7px}.tray-head em{margin-left:auto;color:var(--asset-selection);font-size:7px;font-style:normal}.tray-scroll{height:132px;display:flex;align-items:stretch;gap:8px;overflow-x:auto;overflow-y:hidden;padding:7px}.selected-card{position:relative;flex:0 0 244.5px;display:grid;grid-template-rows:25px minmax(0,1fr);padding:6px;border:1px solid rgba(244,114,182,.25);border-radius:8px;background:linear-gradient(145deg,rgba(61,23,49,.6),rgba(12,17,28,.94));cursor:grab}.selected-card:active{cursor:grabbing}.selected-card.dragging{opacity:.35}.selected-card.drop-target{border-color:var(--accent);box-shadow:0 0 0 1px rgba(34,211,238,.28)}.selected-card.missing{border-color:rgba(248,113,113,.5)}.selected-card-top{display:flex;align-items:center;gap:7px}.slot{min-width:30px;height:21px;display:grid;place-items:center;border:1px solid rgba(96,165,250,.68);border-radius:5px;background:rgba(37,99,235,.24);color:#93c5fd;font-size:10px;font-weight:950}.selected-actions{display:flex;gap:3px;margin-left:auto}.selected-actions button{width:23px;height:21px;border:1px solid rgba(148,163,184,.2);border-radius:5px;background:#0a101b;color:#b9cad9;cursor:pointer}.selected-actions button:hover{border-color:var(--accent);color:#fff}.selected-card-body{display:grid;grid-template-columns:102px minmax(0,1fr);align-items:center;gap:9px}.selected-thumb{position:relative;width:102px;height:82px;display:grid;place-items:center;overflow:hidden;border:1px solid rgba(244,114,182,.25);border-radius:6px;background:#060912;color:#725a70;font-size:7px;font-weight:900}.selected-thumb img{width:100%;height:100%;object-fit:cover}.selected-thumb span{display:none}.selected-thumb.fallback span{display:block}.selected-copy{display:flex;flex-direction:column;gap:4px}.selected-copy b,.selected-copy span,.selected-copy small{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.selected-copy b{font-size:10px}.selected-copy span{color:#a7b7c8;font-size:8px}.selected-copy em{color:#f3a8ce;font-size:7px;font-style:normal;font-weight:900}.selected-copy small{color:#667e94;font-size:7px}.tray-empty{min-width:100%;display:grid;place-items:center;border:1px dashed rgba(244,114,182,.18);border-radius:7px;color:#765d70;font-size:9px}
       .selected-card{flex-basis:120px;width:120px;height:118px;grid-template-rows:23px minmax(0,1fr)}.selected-card-top{gap:4px}.slot{flex:0 0 28px;width:28px;min-width:28px;height:21px;font-size:9px;font-variant-numeric:tabular-nums}.selected-actions{display:flex;gap:2px;margin-left:auto}.selected-actions button{width:22px;height:21px;padding:0;display:grid;place-items:center}.selected-card-body{display:grid;grid-template-columns:1fr;place-items:center;gap:0;min-height:0}.selected-thumb{width:106px;height:81px}.selected-copy{display:none}
       .shot-routing{margin:0 8px 8px;border:1px solid rgba(34,211,238,.3);border-radius:9px;background:linear-gradient(180deg,rgba(7,28,40,.94),rgba(6,10,18,.98));overflow:hidden}.shot-routing-head{height:38px;display:flex;align-items:center;gap:7px;padding:0 8px}.shot-toggle,.shot-add,.shot-tab,.shot-source button{border:1px solid rgba(34,211,238,.24);border-radius:6px;background:#08131e;color:#a9c6d8;cursor:pointer}.shot-toggle{width:25px;height:25px;padding:0;color:var(--accent)}.shot-routing-head>b{font-size:8px;letter-spacing:.08em;color:var(--accent);white-space:nowrap}.shot-channel{max-width:58px;color:#5f7f94;font-size:7px;font-family:ui-monospace,monospace}.shot-tabs{display:flex;flex:1;align-items:center;gap:5px;min-width:0;overflow-x:auto;padding:2px}.shot-tab{height:27px;display:flex;align-items:center;gap:5px;padding:0 7px;white-space:nowrap}.shot-tab small{color:#5e7e93;font-size:6px}.shot-tab b{max-width:92px;overflow:hidden;text-overflow:ellipsis;font-size:8px}.shot-tab em{color:#6f90a5;font-size:7px;font-style:normal}.shot-tab.active{border-color:var(--accent);background:rgba(8,145,178,.18);color:#e6fbff}.shot-add{height:27px;padding:0 9px;color:#bceef5;font-size:8px;font-weight:900;white-space:nowrap}.shot-add:disabled,.shot-source button:disabled{opacity:.28;cursor:default}.shot-routing-body{min-height:78px;display:grid;grid-template-columns:190px minmax(0,1fr);gap:8px;padding:7px 9px 9px;border-top:1px solid rgba(34,211,238,.14)}.shot-routing-summary{display:flex;flex-direction:column;gap:3px;padding:7px;border:1px solid rgba(34,211,238,.16);border-radius:7px;background:rgba(4,14,24,.65)}.shot-routing-summary b{color:#d9f8ff;font-size:10px}.shot-routing-summary span{color:var(--accent);font-size:8px;font-weight:900}.shot-routing-summary small{color:#708ba0;font-size:7px;line-height:1.35}.shot-sources{display:flex;align-content:flex-start;gap:5px;overflow-x:auto;padding:3px}.shot-source{height:30px;display:flex;flex:0 0 auto;align-items:stretch}.shot-source>button:first-child{max-width:145px;display:flex;align-items:center;gap:5px;padding:0 7px}.shot-source i{color:#5d7d91;font-size:8px;font-style:normal}.shot-source span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:8px}.shot-source.selected>button:first-child{border-color:rgba(244,114,182,.62);background:rgba(131,24,67,.22);color:#ffe0f1}.shot-source.selected i{color:#f9a8d4}.shot-source .shot-source-move{width:22px;margin-left:2px;padding:0;color:#8eb6ca}.shot-routing-empty{align-self:center;color:#607b90;font-size:8px}
-      .shot-stack{max-height:360px;margin:0 8px 8px;display:flex;flex-direction:column;gap:5px;overflow:auto;scrollbar-gutter:stable}.shot-panel{flex:0 0 auto;overflow:hidden;border:1px solid rgba(var(--shot-rgb),.34);border-radius:10px;background:linear-gradient(180deg,rgba(var(--shot-rgb),.10),rgba(8,11,19,.96));box-shadow:0 0 16px rgba(var(--shot-rgb),.07)}.shot-panel-head{height:38px;display:flex;align-items:center;gap:6px;padding:4px 7px;border-bottom:1px solid transparent}.shot-panel.active .shot-panel-head{border-bottom-color:rgba(var(--shot-rgb),.20)}.shot-panel-toggle{height:29px;min-width:0;flex:1;display:grid;grid-template-columns:30px minmax(70px,auto) minmax(120px,1fr) auto auto;align-items:center;gap:7px;padding:0 8px;border:1px solid rgba(var(--shot-rgb),.32);border-radius:7px;background:linear-gradient(90deg,rgba(var(--shot-rgb),.16),rgba(8,13,23,.72));color:#d9e6f3;text-align:left;cursor:pointer}.shot-panel-toggle small{color:var(--shot-accent);font-size:8px;font-weight:950}.shot-panel-toggle b{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f8fafc;font-size:10px}.shot-panel-toggle span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(var(--shot-rgb),.92);font-size:8px;font-weight:900;letter-spacing:.06em}.shot-panel-toggle em{color:var(--shot-accent);font-size:8px;font-style:normal;font-weight:900}.shot-panel-toggle i{color:#7f95a8;font-size:7px;font-style:normal;letter-spacing:.08em}.shot-panel.active{border-color:rgba(var(--shot-rgb),.68);box-shadow:0 0 18px rgba(var(--shot-rgb),.14)}.shot-panel.active .shot-panel-toggle{border-color:var(--shot-accent);box-shadow:0 0 10px rgba(var(--shot-rgb),.14)}.shot-panel .shot-delete{width:29px;height:29px;flex:0 0 29px;padding:0;border:1px solid rgba(var(--shot-rgb),.42);border-radius:7px;background:rgba(var(--shot-rgb),.10);color:var(--shot-accent);font-size:16px;line-height:1;cursor:pointer}.shot-panel .shot-delete:hover:not(:disabled),.shot-panel .shot-delete:focus-visible{border-color:var(--shot-accent);background:rgba(var(--shot-rgb),.22);outline:none;box-shadow:0 0 10px rgba(var(--shot-rgb),.18)}.shot-panel .shot-delete:disabled{opacity:.25;cursor:default}.shot-panel .shot-add{height:29px;padding:0 11px;border:1px solid rgba(var(--shot-rgb),.54);border-radius:7px;background:rgba(var(--shot-rgb),.14);color:var(--shot-accent);font-size:8px;font-weight:950;white-space:nowrap;cursor:pointer}.shot-panel .shot-add:disabled{opacity:.3;cursor:default}.shot-panel .tray-scroll{height:132px;display:flex;align-items:stretch;gap:8px;overflow-x:auto;overflow-y:hidden;padding:7px}.shot-panel .selected-card{border-color:rgba(var(--shot-rgb),.30);background:linear-gradient(145deg,rgba(var(--shot-rgb),.15),rgba(12,17,28,.94))}.shot-panel .selected-thumb{border-color:rgba(var(--shot-rgb),.30)}.shot-panel .slot{border-color:rgba(var(--shot-rgb),.70);background:rgba(var(--shot-rgb),.20);color:var(--shot-accent)}.shot-panel .tray-empty{border-color:rgba(var(--shot-rgb),.22);color:rgba(var(--shot-rgb),.72)}.hmb-image-assets .asset-card.selected{border-color:var(--active-shot-accent);box-shadow:inset 0 0 0 .3px rgba(var(--active-shot-rgb),.48),0 0 15px rgba(var(--active-shot-rgb),.34),0 0 4px rgba(var(--active-shot-rgb),.55)}
+      .shot-stack{max-height:360px;margin:0 8px 8px;display:flex;flex-direction:column;gap:5px;overflow:auto;scrollbar-gutter:stable}.shot-panel{flex:0 0 auto;overflow:hidden;border:1px solid rgba(var(--shot-rgb),.34);border-radius:10px;background:linear-gradient(180deg,rgba(var(--shot-rgb),.10),rgba(8,11,19,.96));box-shadow:0 0 16px rgba(var(--shot-rgb),.07)}.shot-panel-head{height:38px;display:flex;align-items:center;gap:6px;padding:4px 7px;min-width:0;border-bottom:1px solid transparent}.shot-panel.active .shot-panel-head{border-bottom-color:rgba(var(--shot-rgb),.20)}.shot-panel-toggle{height:29px;min-width:0;flex:1;display:grid;grid-template-columns:30px minmax(0,1fr) minmax(0,1fr) auto auto;align-items:center;gap:7px;padding:0 8px;border:1px solid rgba(var(--shot-rgb),.32);border-radius:7px;background:linear-gradient(90deg,rgba(var(--shot-rgb),.16),rgba(8,13,23,.72));color:#d9e6f3;text-align:left;cursor:pointer}.shot-panel-toggle small{color:var(--shot-accent);font-size:8px;font-weight:950}.shot-panel-toggle b{max-width:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f8fafc;font-size:10px}.shot-panel-toggle span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(var(--shot-rgb),.92);font-size:8px;font-weight:900;letter-spacing:.06em}.shot-panel-toggle em{color:var(--shot-accent);font-size:8px;font-style:normal;font-weight:900}.shot-panel-toggle i{color:#7f95a8;font-size:7px;font-style:normal;letter-spacing:.08em}.shot-panel.active{border-color:rgba(var(--shot-rgb),.68);box-shadow:0 0 18px rgba(var(--shot-rgb),.14)}.shot-panel.active .shot-panel-toggle{border-color:var(--shot-accent);box-shadow:0 0 10px rgba(var(--shot-rgb),.14)}.shot-panel .shot-delete{width:29px;height:29px;flex:0 0 29px;padding:0;border:1px solid rgba(var(--shot-rgb),.42);border-radius:7px;background:rgba(var(--shot-rgb),.10);color:var(--shot-accent);font-size:16px;line-height:1;cursor:pointer}.shot-panel .shot-delete:hover:not(:disabled),.shot-panel .shot-delete:focus-visible{border-color:var(--shot-accent);background:rgba(var(--shot-rgb),.22);outline:none;box-shadow:0 0 10px rgba(var(--shot-rgb),.18)}.shot-panel .shot-delete:disabled{opacity:.25;cursor:default}.shot-panel .shot-add{flex:0 0 auto;height:29px;padding:0 11px;border:1px solid rgba(var(--shot-rgb),.54);border-radius:7px;background:rgba(var(--shot-rgb),.14);color:var(--shot-accent);font-size:8px;font-weight:950;white-space:nowrap;cursor:pointer}.shot-panel .shot-add:disabled{opacity:.3;cursor:default}.shot-panel .tray-scroll{height:132px;display:flex;align-items:stretch;gap:8px;overflow-x:auto;overflow-y:hidden;padding:7px}.shot-panel .selected-card{border-color:rgba(var(--shot-rgb),.30);background:linear-gradient(145deg,rgba(var(--shot-rgb),.15),rgba(12,17,28,.94))}.shot-panel .selected-thumb{border-color:rgba(var(--shot-rgb),.30)}.shot-panel .slot{border-color:rgba(var(--shot-rgb),.70);background:rgba(var(--shot-rgb),.20);color:var(--shot-accent)}.shot-panel .tray-empty{border-color:rgba(var(--shot-rgb),.22);color:rgba(var(--shot-rgb),.72)}.hmb-image-assets .asset-card.selected{border-color:var(--active-shot-accent);box-shadow:inset 0 0 0 .3px rgba(var(--active-shot-rgb),.48),0 0 15px rgba(var(--active-shot-rgb),.34),0 0 4px rgba(var(--active-shot-rgb),.55)}
       .asset-registration-backdrop{position:absolute;inset:0;z-index:80;display:grid;place-items:center;padding:18px;background:rgba(1,4,10,.78);backdrop-filter:blur(5px)}.asset-passport{width:min(390px,100%);max-height:calc(100% - 12px);display:flex;flex-direction:column;overflow:auto;border:1px solid rgba(244,114,182,.62);border-radius:18px 18px 28px 28px;background:radial-gradient(circle at 50% -8%,rgba(190,24,93,.24),transparent 30%),linear-gradient(180deg,#171020,#090d17 45%,#060912);box-shadow:0 24px 70px rgba(0,0,0,.62),0 0 28px rgba(244,114,182,.2)}.passport-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 10px;border-bottom:1px solid rgba(244,114,182,.2)}.passport-head small{display:block;color:#d8a2be;font-size:7px;font-weight:900;letter-spacing:.18em}.passport-head h2{margin:3px 0 0;color:#fff1f8;font-size:15px;letter-spacing:.08em}.passport-head button{width:28px;height:28px;border:1px solid rgba(244,114,182,.25);border-radius:50%;background:#0b0d16;color:#e7b9d1;font-size:18px;line-height:1;cursor:pointer}.passport-photo{position:relative;width:128px;aspect-ratio:3/4;display:grid;place-items:center;align-self:center;margin:14px 0 8px;overflow:hidden;border:1px solid rgba(244,114,182,.38);border-radius:8px;background:#050910;color:#84677a;font-size:10px;font-weight:900;box-shadow:0 0 18px rgba(244,114,182,.12)}.passport-photo img{width:100%;height:100%;object-fit:cover}.passport-photo>span{display:none}.passport-photo.fallback img{display:none}.passport-photo.fallback>span{display:block}.passport-file{display:flex;flex-direction:column;gap:3px;padding:0 18px 12px;text-align:center}.passport-file b,.passport-file span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.passport-file b{color:#d7e2ef;font-size:8px}.passport-file span{color:#73899d;font-size:7px}.passport-fields{display:grid;grid-template-columns:1fr 1fr;gap:9px;padding:12px 16px;border-top:1px dashed rgba(244,114,182,.24)}.passport-fields label{display:flex;flex-direction:column;gap:4px}.passport-fields label:nth-last-child(1){grid-column:1/-1}.passport-fields label span{color:#bb8fa8;font-size:7px;font-weight:900;letter-spacing:.06em}.passport-fields input,.passport-fields select{width:100%;height:32px;border:1px solid rgba(148,163,184,.27);border-radius:7px;background:#060b13;color:#eef5ff;padding:0 8px;font-size:9px;outline:none}.passport-fields input:focus,.passport-fields select:focus{border-color:var(--asset-selection);box-shadow:0 0 0 1px rgba(244,114,182,.18)}.passport-fields select:disabled{opacity:.42}.passport-actions{display:flex;justify-content:flex-end;gap:7px;padding:11px 16px 15px}.passport-actions button{height:31px;padding:0 13px;border:1px solid rgba(148,163,184,.24);border-radius:7px;background:#0a101a;color:#bac9d8;font-size:8px;font-weight:900;cursor:pointer}.passport-actions .passport-register{border-color:rgba(244,114,182,.62);background:linear-gradient(180deg,rgba(190,24,93,.55),rgba(88,28,135,.42));color:#ffe4f2;box-shadow:0 0 12px rgba(244,114,182,.18)}.passport-actions button:disabled{opacity:.32;cursor:default;box-shadow:none}
       .passport-fields .passport-folder{grid-column:1/-1}.passport-taxonomy-contract{grid-column:1/-1;display:flex;flex-direction:column;gap:4px;padding:8px 9px;border:1px solid rgba(148,163,184,.18);border-radius:7px;background:rgba(2,6,14,.58)}.passport-taxonomy-contract[hidden]{display:none}.passport-taxonomy-contract small{color:#bb8fa8;font-size:7px;font-weight:900;letter-spacing:.06em}.passport-taxonomy-contract span{color:#cbd8e6;font-size:8px;line-height:1.45}
       .asset-refresh-review{width:min(580px,100%)}.refresh-review-body{padding:4px 16px 12px;font-size:10px;line-height:1.6;color:#cbd8e6}.refresh-review-body h3{margin:14px 0 4px;font-size:11px;color:var(--selection-text)}.refresh-review-body p{margin:7px 0}.refresh-review-body ul{max-height:120px;overflow:auto;margin:8px 0;padding:9px 9px 9px 26px;border:1px solid rgba(148,163,184,.2);border-radius:7px;background:#060b13}.refresh-review-body li,.refresh-review-root,.refresh-review-path{overflow-wrap:anywhere;white-space:pre-wrap}.refresh-review-error{color:#fca5a5}.refresh-review-confirm{padding:10px;border:1px solid var(--selection-soft);border-radius:7px;color:var(--selection-strong);background:rgba(var(--selection-rgb),.12)}
@@ -5283,6 +5649,8 @@ function render(
       .hmb-image-assets[data-busy="true"] .project-switch{opacity:.72}.hmb-image-assets[data-busy="true"] .project-action svg{animation:hmb-image-spin .8s linear infinite}@keyframes hmb-image-spin{to{transform:rotate(360deg)}}
       .transport-status{position:absolute;z-index:70;top:48px;left:50%;max-width:min(520px,80%);transform:translateX(-50%);padding:7px 12px;border:1px solid rgba(248,113,113,.65);border-radius:8px;background:rgba(69,10,10,.96);color:#fecaca;font-size:9px;font-weight:800;box-shadow:0 8px 24px rgba(0,0,0,.35)}.transport-status:empty{display:none}
       .library-expanded{height:100%;min-height:622px;display:grid;grid-template-rows:minmax(0,1fr) auto;overflow:hidden}.library-expanded[hidden],.library-compact-summary[hidden]{display:none!important}.top[data-library-toggle-surface="header"]{cursor:default}.library-compact-summary{position:relative;width:100%;display:flex;flex-direction:column;gap:6px;padding:6px;background:#060912;cursor:default}.compact-shot-row{display:flex;flex-direction:column;gap:6px;padding:6px;border:1px solid rgba(var(--shot-rgb),.38);border-radius:7px;background:linear-gradient(90deg,rgba(var(--shot-rgb),.17),rgba(8,13,23,.86));color:#d9e6f3;overflow:hidden}.compact-shot-row.active{border-color:var(--shot-accent);box-shadow:inset 0 0 0 1px rgba(var(--shot-rgb),.16)}.compact-shot-head{height:28px;display:grid;grid-template-columns:34px minmax(90px,auto) minmax(120px,1fr) auto auto;align-items:center;gap:8px;padding:0 4px}.compact-shot-head small{color:var(--shot-accent);font-size:9px;font-weight:950}.compact-shot-head b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px}.compact-shot-head span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8ea3b8;font-size:7px}.compact-shot-head em{color:var(--shot-accent);font-size:8px;font-style:normal}.compact-shot-head i{color:#688096;font-size:7px;font-style:normal}.compact-shot-assets{height:132px;display:flex;align-items:stretch;gap:8px;padding:7px;overflow-x:auto;overflow-y:hidden;scrollbar-gutter:stable;border-top:1px solid rgba(var(--shot-rgb),.18)}.compact-shot-assets.empty{height:38px;display:grid;place-items:center}.compact-shot-empty{color:#688096;font-size:8px}.compact-shot-asset{position:relative;flex:0 0 120px;width:120px;height:118px;display:grid;grid-template-rows:81px minmax(0,1fr);gap:4px;padding:6px;border:1px solid rgba(var(--shot-rgb),.28);border-radius:8px;background:rgba(5,9,16,.82);overflow:hidden}.compact-shot-thumb{position:relative;width:106px;height:81px;display:grid;place-items:center;overflow:hidden;border-radius:6px;background:#050910}.compact-shot-thumb img{width:100%;height:100%;display:block;object-fit:cover}.compact-shot-thumb>small{position:absolute;top:3px;left:3px;min-width:22px;padding:2px 3px;border-radius:3px;background:rgba(0,0,0,.76);color:var(--shot-accent);font-size:7px;font-weight:950;text-align:center}.compact-shot-placeholder{width:100%;height:100%;background:linear-gradient(135deg,rgba(var(--shot-rgb),.17),rgba(15,23,42,.84))}.compact-shot-asset>b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#cbd8e5;font-size:7px}.hmb-image-assets[data-library-compact="true"]{height:auto!important;min-height:0!important;grid-template-rows:58px auto;background:#060912}.hmb-image-assets[data-library-compact="true"] .library-compact-summary{display:flex}
+      .image-bash-panel .shot-panel-head{display:flex;align-items:center;min-height:38px}.image-bash-panel .shot-panel-toggle{min-width:0;flex:1}.image-bash-panel .selected-actions{display:flex;gap:3px}.image-bash-panel .selected-actions button{min-width:18px}.image-bash-panel .selected-actions button:disabled{opacity:.3}.image-bash-card.compact-shot-asset{grid-template-rows:18px 60px 12px;gap:4px}.image-bash-card.compact-shot-asset .selected-thumb{width:100%;height:60px}.image-bash-card.compact-shot-asset .selected-card-top{margin:0}.image-bash-missing{font-size:8px;color:#94a3b8}.image-bash-panel .tray-scroll{min-height:110px}
+      .hmb-image-assets .hmb-native-identity,.hmb-image-assets .hmb-native-actions{display:none;min-width:0;--node-header-text:#e8eef7}.hmb-image-assets[data-hmb-native-header="active"]>.top>.mark,.hmb-image-assets[data-hmb-native-header="active"]>.top>.heading{display:none}.hmb-image-assets[data-hmb-native-header="active"]>.top>.hmb-native-identity{display:flex;align-items:center;flex:1;min-width:0}.hmb-image-assets[data-hmb-native-header="active"]>.top>.hmb-native-actions{display:flex;align-items:center;flex:0 0 auto}.hmb-image-assets .hmb-native-identity>div{min-width:0;max-width:100%}.hmb-image-assets .hmb-native-actions svg{flex-shrink:0}.hmb-image-assets[data-hmb-native-header="active"]>.top{cursor:grab}.hmb-image-assets[data-hmb-native-header="active"]>.top:active{cursor:grabbing}
       @media (prefers-reduced-motion:reduce){.hmb-image-assets *{scroll-behavior:auto!important;animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}}
     </style>
     <div class="hmb-image-assets nodrag" data-hmb-library="image-asset" data-library-compact="false" data-theme="P" data-shot-number="${activeShot?.number || 1}" data-asset-view="${detailView ? "detail" : "image"}" data-busy="${state.scan_busy ? "true" : "false"}" ${state.scan_busy ? 'aria-busy="true"' : ""} style="--active-shot-accent:${activePalette.accent};--active-shot-rgb:${activePalette.rgb}" tabindex="0">
@@ -5440,6 +5808,8 @@ export function hmbInstallImageAssetImportHandleDecoration(container) {
 
 const IMAGE_ASSET_INTERNAL_TOGGLE_INTERACTIVE_SELECTOR = [
   ".project-switch",
+  "[data-hmb-native-identity]",
+  "[data-hmb-native-actions]",
   "button",
   "input",
   "select",
@@ -5775,9 +6145,12 @@ function hmbImageAssetCompactSummaryHeight(summary) {
 function hmbImageAssetMountIsVisible(container) {
   for (let current = container, depth = 0; current && depth < 16; depth += 1) {
     if (current.hidden || current.hasAttribute?.("hidden")) return false;
-    const display = clean(current.style?.display).toLowerCase();
-    const visibility = clean(current.style?.visibility).toLowerCase();
-    if (display === "none" || visibility === "hidden") return false;
+    let computed = null;
+    try { computed = current.ownerDocument?.defaultView?.getComputedStyle?.(current); } catch (_error) {}
+    const display = clean(computed?.display || current.style?.display).toLowerCase();
+    const visibility = clean(computed?.visibility || current.style?.visibility).toLowerCase();
+    const opacity = Number.parseFloat(computed?.opacity || current.style?.opacity);
+    if (display === "none" || ["hidden", "collapse"].includes(visibility) || opacity === 0) return false;
     current = current.parentElement;
   }
   try {
@@ -6161,6 +6534,7 @@ function hmbImageAssetDeleteEditingTarget(event) {
 
 export function hmbGuardSelectedNodeKeyboardDelete(container, event) {
   if (!["Backspace", "Delete"].includes(event?.key)) return false;
+  if (container?.ownerDocument?.documentElement?.getAttribute?.("data-hmb-native-deletion-guard") === "engine-preflight") return false;
   if (event?.target?.closest?.("[data-hmb-node-delete-protected='true']")) return false;
   if (hmbImageAssetDeleteEditingTarget(event)) return false;
   if (!isSelectedNodeRoot(findNodeRoot(container))) return false;
@@ -6250,7 +6624,10 @@ function nativeProjectRootValue(container) {
 
 export function hmbCollapseNativeProjectRootRows(container) {
   const shell = findNodeRoot(container);
-  if (!shell) return 0;
+  // Native collapsed footers can contain a third, opacity:0 widget copy in
+  // addition to the regular visibility:hidden measurement row. Neither copy
+  // may prune the live node's authoring column through a sibling PROJECT_ROOT.
+  if (!shell || !hmbImageAssetMountIsVisible(container)) return 0;
   let collapsed = 0;
   nativeProjectRootHosts(container).forEach((host) => {
     let branch = host;
@@ -6258,11 +6635,13 @@ export function hmbCollapseNativeProjectRootRows(container) {
       branch?.parentElement
       && branch.parentElement !== shell
       && !branch.parentElement.contains?.(container)
+      && !branch.parentElement.querySelector?.(".hmb-image-assets")
       && !clean(branch.parentElement.className).toLowerCase().includes("react-flow__")
     ) {
       branch = branch.parentElement;
     }
-    if (!branch?.style || branch === shell || branch.contains?.(container)) return;
+    if (!branch?.style || branch === shell || branch.contains?.(container)
+        || branch.querySelector?.(".hmb-image-assets")) return;
     branch.dataset.hmbProjectRootLayoutCollapsed = "1";
     ["height", "min-height", "max-height", "margin", "padding", "border"].forEach((property) => {
       branch.style.setProperty(property, property.includes("height") ? "0px" : "0", "important");
@@ -6275,6 +6654,7 @@ export function hmbCollapseNativeProjectRootRows(container) {
 }
 
 function concealNativeProjectRootPicker(container) {
+  if (!hmbImageAssetMountIsVisible(container)) return;
   hmbCollapseNativeProjectRootRows(container);
   nativeProjectRootHosts(container).forEach((host) => {
     host.setAttribute("aria-hidden", "true");
@@ -6325,6 +6705,424 @@ function openNativeProjectRootPicker(container) {
   return false;
 }
 
+function hmbInstallShotHierarchyDragging(dialog, doc) {
+  let drag = null;
+  let moved = false;
+  const clampPosition = () => {
+    if (!dialog.open) return;
+    const view = doc.defaultView;
+    let ancestorZoom = 1;
+    for (let ancestor = dialog.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      const raw = String(view.getComputedStyle(ancestor).zoom || "1");
+      const zoom = Number.parseFloat(raw) / (raw.endsWith("%") ? 100 : 1);
+      if (Number.isFinite(zoom) && zoom > 0) ancestorZoom *= zoom;
+    }
+    // Chromium's top layer cancels ancestor zoom visually but can retain it in
+    // hit testing. Counteract it explicitly so buttons and drag targets agree.
+    dialog.style.zoom = String(1 / ancestorZoom);
+    const rect = dialog.getBoundingClientRect();
+    const sx = rect.width / dialog.offsetWidth || 1, sy = rect.height / dialog.offsetHeight || 1;
+    const left = moved ? Math.min(Math.max(0, view.innerWidth - rect.width), rect.left) : (view.innerWidth - rect.width) / 2;
+    const top = moved ? Math.min(Math.max(0, view.innerHeight - rect.height), rect.top) : (view.innerHeight - rect.height) / 2;
+    // Native dialog auto margins use a zoomed body viewport in Chromium.
+    // Position from the actual top-layer bounds so graph/body zoom cannot offset it.
+    Object.assign(dialog.style, { margin: "0", right: "auto", bottom: "auto", left: `${Math.max(0, left) / sx}px`, top: `${Math.max(0, top) / sy}px` });
+  };
+  const stop = event => { if (!drag || (event && event.pointerId !== drag.id)) return; drag = null; };
+  dialog.addEventListener("pointerdown", event => {
+    if (event.button !== 0 || !event.target.closest?.("[data-hier-drag-handle]")
+        || event.target.closest?.("button,input,select,a")) return;
+    const rect = dialog.getBoundingClientRect();
+    const sx = rect.width / dialog.offsetWidth || 1, sy = rect.height / dialog.offsetHeight || 1;
+    moved = true;
+    drag = { id: event.pointerId, x: event.clientX, y: event.clientY, left: rect.left, top: rect.top, width: rect.width, height: rect.height, sx, sy };
+    Object.assign(dialog.style, { position: "fixed", margin: "0", right: "auto", bottom: "auto", left: `${rect.left / sx}px`, top: `${rect.top / sy}px` });
+    dialog.setPointerCapture?.(event.pointerId);
+    event.preventDefault(); event.stopPropagation();
+  });
+  dialog.addEventListener("pointermove", event => {
+    if (!drag || drag.id !== event.pointerId) return;
+    const view = doc.defaultView;
+    const left = Math.max(0, Math.min(Math.max(0, view.innerWidth - drag.width), drag.left + event.clientX - drag.x));
+    const top = Math.max(0, Math.min(Math.max(0, view.innerHeight - drag.height), drag.top + event.clientY - drag.y));
+    dialog.style.left = `${left / drag.sx}px`; dialog.style.top = `${top / drag.sy}px`;
+    event.preventDefault(); event.stopPropagation();
+  });
+  dialog.addEventListener("pointerup", stop);
+  dialog.addEventListener("pointercancel", stop);
+  dialog.addEventListener("lostpointercapture", stop);
+  doc.defaultView?.addEventListener("resize", clampPosition);
+  const dispose = () => doc.defaultView?.removeEventListener("resize", clampPosition);
+  dispose.reposition = clampPosition;
+  return dispose;
+}
+
+export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, commit, addImageBash = null) {
+  const root = container.querySelector?.(".hmb-image-assets");
+  const doc = container.ownerDocument;
+  if (!root || !doc?.createElement || container.__hmbHierarchyDialog) return false;
+  const prior = hmbValidateHierarchyRouting(state.shot_hierarchy, state.shot_routing);
+  const draft = prior.schema ? hmbNormalizeShotHierarchy(prior) : {
+    schema: SHOT_HIERARCHY_SCHEMA, version: 1, binding_id: newImageAssetUuid(), revision: 1,
+    project_identity: hierarchyProjectKey(state), channel_uuid: state.shot_routing.channel_uuid,
+    cgt_account_id: null, members: [],
+  };
+  draft.revision = (prior.revision || 0) + 1;
+  draft.project_identity = hierarchyProjectKey(state);
+  const initialGeneration = state.shot_routing.generation;
+  const dialog = doc.createElement("dialog");
+  dialog.className = "shot-hierarchy-dialog";
+  dialog.setAttribute("aria-labelledby", "hmb-hierarchy-title");
+  dialog.setAttribute("data-shot-hierarchy-dialog", "");
+  container.__hmbHierarchyDialog = dialog;
+  const cgtSession = newImageAssetUuid();
+  let cgtState = { status: "not_requested", tasks: [], projects: [] };
+  let cgtRequest = "";
+  let cgtTimer = null;
+  let confirmingCgt = false;
+  let hierarchyClosed = false;
+  let cgtQuery = "";
+  let cgtPage = 0;
+  let cgtEpisode = "";
+  let cgtProjectId = "";
+  let cgtProjects = [];
+  let disposePositioning = null;
+  const sendCgt = (operation, command = null) => {
+    if (operation === "cgt_confirm" && !hierarchyProjectKey(state)) return false;
+    const bridge = imageAssetThumbnailBridgeRegistry()?.get(imageAssetThumbnailRuntimeId(state));
+    if (typeof bridge?.dispatch !== "function") return false;
+    const requestId = newImageAssetUuid();
+    const request = { schema: "hmb-image-asset-thumbnail-bridge", version: 1, operation, phase: "request",
+      runtime_instance_id: imageAssetThumbnailRuntimeId(state), session_id: cgtSession, request_id: requestId,
+      project_identity: hierarchyProjectKey(state) };
+    const selectedProject = operation === "cgt_confirm" ? command?.binding?.cgt_scope?.project_id : cgtProjectId;
+    if (selectedProject) request.cgt_project_id = selectedProject;
+    if (command) request.hierarchy_request = command;
+    if (operation !== "cgt_cancel") {
+      cgtRequest = requestId;
+      if (cgtTimer !== null) clearTimeout(cgtTimer);
+      cgtTimer = setTimeout(() => {
+        cgtRequest = ""; confirmingCgt = false; cgtState = { status: "TIMEOUT", tasks: [] };
+        sendCgt("cgt_cancel"); renderDraft(); notice("CGT 응답 시간이 초과됐습니다. 기존 샷은 유지됩니다. 새로고침 후 다시 확인하세요.");
+      }, 45000);
+    }
+    try {
+      const delivery = bridge.dispatch(request);
+      Promise.resolve(delivery).catch(() => {
+        if (cgtRequest !== requestId) return;
+        cgtRequest = ""; confirmingCgt = false;
+        if (cgtTimer !== null) clearTimeout(cgtTimer);
+        cgtState = { status: "SDK_UNAVAILABLE", tasks: [] }; renderDraft();
+      });
+      return true;
+    } catch (error) {
+      cgtRequest = ""; confirmingCgt = false;
+      if (cgtTimer !== null) clearTimeout(cgtTimer);
+      return false;
+    }
+  };
+  const close = () => {
+    if (confirmingCgt || hierarchyClosed) return;
+    hierarchyClosed = true;
+    if (cgtTimer !== null) clearTimeout(cgtTimer);
+    disposePositioning?.();
+    sendCgt("cgt_cancel");
+    delete container.__hmbHierarchyReceive;
+    delete container.__hmbHierarchyDispose;
+    dialog.close?.(); dialog.remove();
+    if (container.__hmbHierarchyDialog === dialog) delete container.__hmbHierarchyDialog;
+    container.querySelector?.("[data-shot-add]")?.focus?.({ preventScroll: true });
+  };
+  const notice = message => { dialog.querySelector("[data-hier-message]").textContent = message; };
+  const changed = action => {
+    try { action(); renderDraft(); } catch (error) { notice(error.message); }
+  };
+  const makeRequest = candidate => ({ schema: SHOT_HIERARCHY_EDIT_SCHEMA, version: 1, expected_generation: initialGeneration,
+    expected_binding_revision: prior.revision || 0,
+    removed_member_ids: (prior.members || []).filter(item => !candidate.members.some(row => row.member_id === item.member_id)).map(item => item.member_id),
+    binding: hmbNormalizeShotHierarchy(candidate) });
+  const renderCgt = () => {
+    const panel = dialog.querySelector("[data-hier-cgt]");
+    if (!panel) return;
+    const messages = { not_requested: "CGT 연결 확인 필요 · 새로고침으로 본인 작업을 확인하세요.", loading: "CGT 본인 작업 조회 중…",
+      LOGIN_REQUIRED: "CGT 앱에서 로그인 후 새로고침하세요.", TLS_REJECTED: "CGT 인증서 검증에 실패했습니다. 관리자에게 인증서 상태를 확인하세요.",
+      SELECT_GP_PROJECT: "먼저 이미지 라이브러리의 프로젝트를 선택하세요.", PROJECT_UNAVAILABLE: "선택한 GP 프로젝트의 CGT 접근 권한을 확인하세요.",
+      SOURCE_CHANGED: "CGT 계정·프로젝트·작업이 변경되었습니다. 새로고침 후 다시 선택하세요.",
+      ACCOUNT_CHANGED: "CGT 로그인 계정이 기존 연결과 다릅니다. 기존 연결은 유지됩니다. 올바른 계정으로 로그인 후 다시 확인하세요.",
+      SDK_UNAVAILABLE: "CGT 앱과 설치된 Python SDK 연결을 확인한 뒤 새로고침하세요.", TIMEOUT: "CGT 응답 시간 초과 · 새로고침 후 다시 확인하세요." };
+    const ready = cgtState.status === "ready";
+    const projects = cgtProjects;
+    const project = cgtState.project || null;
+    const canBind = !!project && !!hierarchyProjectKey(state) && cgtState.can_bind !== false;
+    const imageBashTarget = dialog.querySelector("[data-hier-slot]")?.value === "image_bash";
+    const episodeOf = row => {
+      if (clean(row.episode)) return clean(row.episode);
+      try { return hmbHierarchyParseName(row.source_name).episode || "__unassigned__"; }
+      catch { return "__unassigned__"; }
+    };
+    const episodes = ready ? [...new Set(cgtState.tasks.map(episodeOf))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })) : [];
+    if (ready && cgtEpisode && !episodes.includes(cgtEpisode)) cgtEpisode = "";
+    const matching = ready ? cgtState.tasks.filter(row => (!cgtEpisode || episodeOf(row) === cgtEpisode)
+      && (!cgtQuery || `${row.source_name} ${row.status}`.toLowerCase().includes(cgtQuery.toLowerCase()))) : [];
+    cgtPage = Math.min(cgtPage, Math.max(0, Math.ceil(matching.length / 50) - 1));
+    const visible = matching.slice(cgtPage * 50, (cgtPage + 1) * 50);
+    const selected = new Set(draft.members.filter(row => row.origin === "cgt").map(row => row.cgt_task_id));
+    panel.innerHTML = `<div class="hier-tools hier-project-tools"><label>프로젝트<select data-hier-cgt-project aria-label="CGT 프로젝트" ${!projects.length || cgtRequest || confirmingCgt ? "disabled" : ""}><option value="" ${!project ? "selected" : ""}>프로젝트 선택 필요</option>${projects.map(row => `<option value="${escapeHtml(row.id)}" ${row.id === project?.id ? "selected" : ""}>${escapeHtml(row.name)}</option>`).join("")}${project && !projects.some(row => row.id === project.id) ? `<option value="${escapeHtml(project.id)}" selected>${escapeHtml(project.name)}</option>` : ""}</select></label><label>에피소드<select data-hier-cgt-episode aria-label="CGT 에피소드" ${!ready || !project || !episodes.length || cgtRequest || confirmingCgt ? "disabled" : ""}><option value="">전체 에피소드</option>${episodes.map(episode => `<option value="${escapeHtml(episode)}" ${episode === cgtEpisode ? "selected" : ""}>${escapeHtml(episode === "__unassigned__" ? "에피소드 미지정" : episode)}</option>`).join("")}</select></label><button type="button" data-hier-cgt-refresh ${cgtRequest || confirmingCgt ? "disabled" : ""}>새로고침</button></div>
+      ${ready && cgtState.account ? `<small data-hier-cgt-account>${escapeHtml(cgtState.account)} / ${escapeHtml(cgtState.account_name)} · AI_Shot · ${cgtState.tasks.length}건${cgtState.truncated ? " (추가 작업 있음)" : ""}</small>` : ""}
+      ${ready && project ? `<label class="hier-query">샷 · 상태 검색<input data-hier-cgt-query value="${escapeHtml(cgtQuery)}" autocomplete="off"></label>` : ""}
+      <div class="hier-cgt-scroll" data-hier-cgt-scroll><table class="hier-table"><thead><tr><th>Shot</th><th>Artist</th><th>Task status</th><th></th></tr></thead><tbody>${visible.map(row => `<tr><td>${escapeHtml(row.source_name)}</td><td>${escapeHtml(row.artist)}</td><td>${escapeHtml(row.status)}</td><td><button type="button" data-hier-cgt-add="${escapeHtml(row.task_id)}" ${selected.has(row.task_id) || confirmingCgt || !canBind || imageBashTarget ? "disabled" : ""}>${selected.has(row.task_id) ? "선택됨" : "선택 추가"}</button></td></tr>`).join("")}</tbody></table></div>
+      ${matching.length > 50 ? `<div class="hier-tools"><button type="button" data-hier-cgt-prev ${cgtPage ? "" : "disabled"}>이전</button><small>${cgtPage + 1} / ${Math.ceil(matching.length / 50)}</small><button type="button" data-hier-cgt-next ${(cgtPage + 1) * 50 < matching.length ? "" : "disabled"}>다음</button></div>` : ""}
+      <p class="hier-offline" data-hier-cgt-status>${escapeHtml(ready ? !project ? "CGT 프로젝트를 선택하세요." : !canBind ? !hierarchyProjectKey(state) ? "먼저 이미지 라이브러리의 프로젝트를 선택하세요. CGT 작업은 조회만 할 수 있습니다." : "현재 라이브러리와 다른 CGT 프로젝트입니다. 작업 조회만 가능하며 샷은 연결하지 않습니다." : cgtState.tasks.length ? "CGT 원본의 본인 배정 작업만 표시합니다." : "본인에게 배정된 AI_Shot 작업이 없습니다." : messages[cgtState.status] || "CGT 작업을 확인할 수 없습니다. 새로고침하세요.")}</p>`;
+    const loadCatalog = () => {
+      cgtState = { ...cgtState, status: "loading", tasks: [] };
+      if (!sendCgt("cgt_catalog")) cgtState = { ...cgtState, status: "SDK_UNAVAILABLE", tasks: [] };
+      renderCgt();
+    };
+    panel.querySelector("[data-hier-cgt-refresh]").addEventListener("click", loadCatalog);
+    panel.querySelector("[data-hier-cgt-project]").addEventListener("change", event => {
+      cgtProjectId = event.target.value;
+      cgtQuery = ""; cgtPage = 0; cgtEpisode = "";
+      loadCatalog();
+    });
+    panel.querySelector("[data-hier-cgt-episode]").addEventListener("change", event => {
+      cgtEpisode = event.target.value; cgtPage = 0;
+      renderCgt();
+      panel.querySelector("[data-hier-cgt-episode]")?.focus({ preventScroll: true });
+    });
+    panel.querySelector("[data-hier-cgt-query]")?.addEventListener("input", event => {
+      const start = event.target.selectionStart, end = event.target.selectionEnd;
+      cgtQuery = event.target.value; cgtPage = 0; renderCgt();
+      const input = panel.querySelector("[data-hier-cgt-query]"); input?.focus({ preventScroll: true }); input?.setSelectionRange(start, end);
+    });
+    panel.querySelector("[data-hier-cgt-prev]")?.addEventListener("click", () => { cgtPage -= 1; renderCgt(); });
+    panel.querySelector("[data-hier-cgt-next]")?.addEventListener("click", () => { cgtPage += 1; renderCgt(); });
+    panel.querySelectorAll("[data-hier-cgt-add]").forEach(button => button.addEventListener("click", () => changed(() => {
+      if (cgtState.status !== "ready" || confirmingCgt) throw new Error("CGT 본인 작업을 먼저 확인하세요.");
+      if (!hierarchyProjectKey(state) || !cgtState.project || cgtState.can_bind === false) throw new Error("현재 라이브러리 프로젝트의 CGT 작업만 연결할 수 있습니다.");
+      const task = cgtState.tasks.find(row => row.task_id === button.dataset.hierCgtAdd);
+      if (!task) throw new Error("CGT 작업이 변경되었습니다.");
+      const scope = { origin: cgtState.origin, project_id: cgtState.project.id, project_db: cgtState.project.database,
+        module: "shot", module_type: "task", pipeline_id: task.pipeline_id, account_id: cgtState.account_id };
+      if (draft.members.some(row => row.origin === "cgt") && Object.keys(scope).some(key => draft.cgt_scope?.[key] !== scope[key])) throw new Error("다른 CGT 계정·프로젝트·공정은 함께 연결할 수 없습니다.");
+      const parsed = hmbHierarchyParseName(task.source_name);
+      const slot = dialog.querySelector("[data-hier-slot]").value;
+      if (slot === "image_bash") throw new Error("HMBImageBash는 아래 추가 버튼으로 추가하세요.");
+      const row = { member_id: `cgt:${task.task_id.toLowerCase()}`, origin: "cgt", manual_uuid: newImageAssetUuid(),
+        source_name: parsed.source_name, canonical_name: parsed.canonical_name, gp_shot_uuid: slot === "new" ? newImageAssetUuid() : slot,
+        parent_id: null, selection_order: draft.members.length + 1, cgt_task_id: task.task_id, cgt_identity: task.identity, artist: task.artist, status: task.status };
+      const next = { ...draft, version: 2, cgt_scope: scope, cgt_account_id: cgtState.account_id,
+        members: [...draft.members.map(item => ({ ...item, cgt_identity: item.cgt_identity || null })), row] };
+      hmbApplyShotHierarchyEdit(state, makeRequest(next)); Object.assign(draft, next);
+    })));
+    disposePositioning?.reposition?.();
+  };
+  container.__hmbHierarchyReceive = response => {
+    if (response?.session_id !== cgtSession || response.request_id !== cgtRequest || response.project_identity !== hierarchyProjectKey(state)
+        || response.runtime_instance_id !== imageAssetThumbnailRuntimeId(state)) return false;
+    if (cgtTimer !== null) clearTimeout(cgtTimer);
+    cgtRequest = "";
+    if (response.operation === "cgt_confirm") {
+      confirmingCgt = false;
+      if (response.outcome === "committed") { close(); return true; }
+      cgtState = { status: response.state?.status || "SOURCE_CHANGED", tasks: [] }; renderDraft();
+      notice("CGT 검증 또는 현재 샷 구성이 변경되어 적용하지 않았습니다. 기존 샷은 유지됩니다.");
+      return true;
+    }
+    cgtState = response.state || { status: "SDK_UNAVAILABLE", tasks: [] };
+    if (cgtState.status === "ready") {
+      cgtProjectId = cgtState.project?.id || "";
+      cgtProjects = Array.isArray(cgtState.projects) ? cgtState.projects : [];
+    }
+    if (["ACCOUNT_CHANGED", "LOGIN_REQUIRED", "SOURCE_CHANGED"].includes(cgtState.status)
+        || (cgtState.status === "ready" && draft.cgt_account_id && draft.cgt_account_id !== cgtState.account_id)) {
+      if (cgtState.status === "ready") cgtState = { status: "ACCOUNT_CHANGED", tasks: [] };
+      cgtProjects = []; cgtProjectId = "";
+    }
+    renderCgt(); return true;
+  };
+  const renderNamePreview = () => {
+    const preview = dialog.querySelector("[data-hier-name-preview]");
+    if (!preview) return;
+    const names = hmbHierarchyDerivedNames(draft);
+    preview.innerHTML = `<h3>예상 네이밍</h3><div class="hier-name-values" data-hier-name-values>${draft.members.map(row => `<small class="hier-output" title="${escapeHtml(names[row.gp_shot_uuid])}">${escapeHtml(names[row.gp_shot_uuid])}</small>`).join("") || "<small>샷을 선택하면 예상 실행명이 표시됩니다.</small>"}</div>`;
+  };
+  const renderDraft = (manualDraft = null) => {
+    const scrollPositions = [".hier-body", "[data-hier-cgt-scroll]", "[data-hier-selected-scroll]"].map(selector => [selector, dialog.querySelector(selector)?.scrollTop || 0]);
+    const used = new Set(draft.members.map(row => row.gp_shot_uuid));
+    const roots = draft.members.filter(row => row.parent_id === null);
+    const depths = new Map();
+    const visit = (row, depth) => {
+      depths.set(row.member_id, depth);
+      return [row, ...draft.members.filter(child => child.parent_id === row.member_id).flatMap(child => visit(child, depth + 1))];
+    };
+    const ordered = roots.flatMap(row => visit(row, 0));
+    const slotNumber = row => state.shot_routing.shots.find(shot => shot.shot_uuid === row.gp_shot_uuid)?.number
+      || state.shot_routing.shots.length + draft.members.filter(item => !state.shot_routing.shots.some(shot => shot.shot_uuid === item.gp_shot_uuid)).indexOf(row) + 1;
+    const canParent = (candidate, row) => {
+      let current = candidate;
+      const seen = new Set();
+      while (current) {
+        if (current.member_id === row.member_id || seen.has(current.member_id)) return false;
+        seen.add(current.member_id);
+        current = draft.members.find(item => item.member_id === current.parent_id);
+      }
+      return true;
+    };
+    const representativeCount = draft.members.filter(row => row.parent_id === null
+      || draft.members.some(child => child.parent_id === row.member_id)).length;
+    const sameBase = row => {
+      const p = hmbHierarchyParseName(row.source_name);
+      return p.shot && draft.members.some(other => {
+        const q = hmbHierarchyParseName(other.source_name);
+        return other.member_id !== row.member_id && q.episode === p.episode && q.shot === p.shot;
+      });
+    };
+    dialog.innerHTML = `<style>
+      .shot-hierarchy-dialog{box-sizing:border-box;position:fixed;inset:0;margin:auto;transform:none;translate:none;width:min(1000px,94vw);max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);display:flex;flex-direction:column;padding:0;border:1px solid #9f4a79;border-radius:12px;background:#0b1020;color:#e6edf7;font:12px/1.5 system-ui,sans-serif;box-shadow:0 16px 80px #000a;overflow:hidden}
+      .shot-hierarchy-dialog::backdrop{background:#050814b8}.shot-hierarchy-dialog *{box-sizing:border-box}.shot-hierarchy-dialog header,.shot-hierarchy-dialog footer{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;background:linear-gradient(100deg,#402039,#101626 70%)}
+      .shot-hierarchy-dialog h2{margin:0;font-size:15px}.shot-hierarchy-dialog h3{margin:0 0 10px;font-size:13px}.shot-hierarchy-dialog p{margin:6px 0}.shot-hierarchy-dialog small{display:block;color:#9fb0c8}.shot-hierarchy-dialog button,.shot-hierarchy-dialog input,.shot-hierarchy-dialog select{font:inherit;color:inherit;background:#090e1a;border:1px solid #40506a;border-radius:6px;padding:7px 9px;min-height:32px;max-width:100%}.shot-hierarchy-dialog button{cursor:pointer}.shot-hierarchy-dialog button:disabled{opacity:.4;cursor:default}.shot-hierarchy-dialog :focus-visible{outline:2px solid #f472b6;outline-offset:2px}.shot-hierarchy-dialog .hier-primary{background:#88305f;border-color:#f472b6}.shot-hierarchy-dialog .hier-body{padding:14px 18px;overflow:auto;min-height:0}.shot-hierarchy-dialog header,.shot-hierarchy-dialog footer{flex-shrink:0}.shot-hierarchy-dialog .hier-split{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:14px;align-items:start}.shot-hierarchy-dialog .hier-pane{min-width:0;border:1px solid #354058;border-radius:8px;padding:12px;background:#0e1525}.shot-hierarchy-dialog .hier-row{margin:9px 0;padding:10px;border:1px solid var(--shot-accent);border-radius:7px;background:linear-gradient(100deg,rgba(var(--shot-rgb),.18),#0b1020 90%)}.shot-hierarchy-dialog .hier-child{margin-left:20px}.shot-hierarchy-dialog .hier-row input{width:100%;margin:5px 0}.shot-hierarchy-dialog .hier-tools{display:flex;flex-wrap:wrap;gap:6px;align-items:center}.shot-hierarchy-dialog .hier-tools label{flex:1;min-width:130px}.shot-hierarchy-dialog .hier-tools select{width:100%}.shot-hierarchy-dialog .hier-project-tools{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end}.shot-hierarchy-dialog .hier-project-tools label{display:grid;gap:4px;min-width:0}.shot-hierarchy-dialog .hier-project-tools button{white-space:nowrap}.shot-hierarchy-dialog .hier-query{display:grid;gap:4px;margin:10px 0}.shot-hierarchy-dialog .hier-query input{width:100%}.shot-hierarchy-dialog .hier-cgt-scroll{max-height:min(46vh,420px);overflow:auto;overscroll-behavior:contain}.shot-hierarchy-dialog .hier-cgt-scroll thead{position:sticky;top:0;background:#0e1525;z-index:1}.shot-hierarchy-dialog .hier-table td{padding:6px;vertical-align:top;overflow-wrap:anywhere}.shot-hierarchy-dialog .hier-table td:last-child{width:70px}.shot-hierarchy-dialog .hier-selection-list{max-height:min(44vh,420px);overflow:auto;overscroll-behavior:contain}.shot-hierarchy-dialog .hier-name-preview{margin:10px 0;padding:10px;border:1px solid #354058;border-radius:7px;background:#0b1020}.shot-hierarchy-dialog .hier-name-preview h3{margin-bottom:4px}.shot-hierarchy-dialog .hier-manual label{display:grid;gap:4px}.shot-hierarchy-dialog .hier-manual input,.shot-hierarchy-dialog .hier-manual select{width:100%}.shot-hierarchy-dialog .hier-manual{display:grid;gap:8px;margin-top:18px;padding-top:12px;border-top:1px solid #354058}.shot-hierarchy-dialog .hier-table{width:100%;border-collapse:collapse}.shot-hierarchy-dialog th{padding:6px;text-align:left;border-bottom:1px solid #354058}.shot-hierarchy-dialog .hier-offline{padding:12px 4px;color:#e6bd85}.shot-hierarchy-dialog [data-hier-message]{min-height:20px;color:#fda4af;white-space:pre-wrap}.shot-hierarchy-dialog .hier-output{overflow-wrap:anywhere;white-space:pre-wrap}.shot-hierarchy-dialog footer{flex-wrap:wrap}.shot-hierarchy-dialog .hier-actions{display:flex;gap:8px;margin-left:auto}@media(max-width:700px){.shot-hierarchy-dialog .hier-split{grid-template-columns:1fr}.shot-hierarchy-dialog .hier-child{margin-left:10px}}
+      .shot-hierarchy-dialog [data-hier-drag-handle]{cursor:move;touch-action:none;user-select:none}.shot-hierarchy-dialog [data-hier-drag-handle] button{cursor:pointer}
+      .shot-hierarchy-dialog .hier-name-tools{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px;align-items:end}.shot-hierarchy-dialog .hier-name-tools label{display:grid;gap:4px;min-width:0}.shot-hierarchy-dialog .hier-name-tools input{margin:0;min-width:0}.shot-hierarchy-dialog .hier-name-tools button{white-space:nowrap}.shot-hierarchy-dialog .hier-name-preview{display:flex;align-items:center;gap:10px;min-width:0;overflow:hidden}.shot-hierarchy-dialog .hier-name-preview h3{flex:0 0 auto;margin:0;white-space:nowrap}.shot-hierarchy-dialog .hier-name-values{display:flex;align-items:center;gap:12px;min-width:0;overflow-x:auto;white-space:nowrap;overscroll-behavior:contain}.shot-hierarchy-dialog .hier-name-values small{flex:0 0 auto;white-space:nowrap}
+      .shot-hierarchy-dialog{height:min(682px,calc(100dvh - 24px))}.shot-hierarchy-dialog .hier-body{flex:1}.shot-hierarchy-dialog [data-hier-message]:empty,.shot-hierarchy-dialog [hidden],.shot-hierarchy-dialog .hier-selection-list:empty{display:none!important}.shot-hierarchy-dialog .hier-offline{margin:6px 0 0;padding:6px 0;line-height:1.4}.shot-hierarchy-dialog .hier-name-preview{margin:8px 0 0;padding:8px 10px}.shot-hierarchy-dialog .hier-selection-list:not(:empty){margin-top:8px}.shot-hierarchy-dialog .hier-manual{gap:6px;margin-top:10px;padding-top:10px}.shot-hierarchy-dialog .hier-manual h3{margin:0}.shot-hierarchy-dialog .hier-selection-list:empty+.hier-manual{margin-top:8px;padding-top:8px}.shot-hierarchy-dialog .hier-query{margin:8px 0}@media(max-width:700px){.shot-hierarchy-dialog{height:calc(100dvh - 24px)}}
+      .shot-hierarchy-dialog .hier-project-tools{grid-template-columns:minmax(0,1.3fr) minmax(0,1fr) auto}.shot-hierarchy-dialog .hier-project-tools select{min-width:0}.shot-hierarchy-dialog .hier-row-head{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:8px}.shot-hierarchy-dialog .hier-row-head b{white-space:nowrap}.shot-hierarchy-dialog .hier-row-head select{width:100%;min-width:0}.shot-hierarchy-dialog .hier-child{margin-left:calc(var(--hier-depth,1) * 12px)}
+    </style><header data-hier-drag-handle title="제목 표시줄을 드래그하여 창 이동"><div><h2 id="hmb-hierarchy-title">CGT 샷 선택 · 묶음 구성</h2></div><button type="button" data-hier-cancel aria-label="취소하고 닫기">×</button></header>
+    <div class="hier-body"><p data-hier-message role="status" aria-live="polite"></p><div class="hier-split">
+    <section class="hier-pane" data-hier-source-pane><h3>CGT 본인 작업 목록</h3><div data-hier-cgt></div></section>
+    <section class="hier-pane" data-hier-selected-pane><h3>선택한 샷 · 대표 / 하위 (${draft.members.length}/5)</h3><div class="hier-name-preview" data-hier-name-preview></div><div class="hier-selection-list" data-hier-selected-scroll>${ordered.map(row => {
+      const number = slotNumber(row);
+      const palette = hmbImageAssetShotPalette(number);
+      const parts = hmbHierarchyParseName(row.source_name);
+      const hasChildren = draft.members.some(child => child.parent_id === row.member_id);
+      const parentOptions = draft.members.filter(candidate => canParent(candidate, row));
+      const role = row.parent_id ? hasChildren ? "하위 · 대표" : "하위" : "대표";
+      return `<article class="hier-row ${row.parent_id ? "hier-child" : ""}" data-hier-member="${row.manual_uuid}" style="--shot-accent:${palette.accent};--shot-rgb:${palette.rgb};--hier-depth:${depths.get(row.member_id) || 0}"><div class="hier-row-head"><b>${String(number).padStart(2, "0")} · ${role}</b><select data-hier-parent="${row.manual_uuid}" aria-label="${escapeHtml(row.source_name)} 대표·하위 선택" title="하위 샷도 다른 샷의 대표로 선택할 수 있습니다"><option value="" ${row.parent_id === null ? "selected" : ""}>독립 대표</option>${parentOptions.map(parent => `<option value="${escapeHtml(parent.member_id)}" ${parent.member_id === row.parent_id ? "selected" : ""}>${String(slotNumber(parent)).padStart(2, "0")} · ${escapeHtml(parent.canonical_name)}의 하위</option>`).join("")}</select></div><small>${row.origin === "cgt" ? `CGT · ${escapeHtml(row.artist)} · ${escapeHtml(row.status)}` : "수동 · CGT 미연결"}</small>${parts.shot ? `<small>에피소드 ${parts.episode} · 샷 ${parts.shot} · 분리컷 ${parts.split_cut}${sameBase(row) ? " · 같은 원본 샷의 분리컷" : ""}</small>` : ""}<div class="hier-name-tools" data-hier-name-tools><label>정식 이름<input data-hier-name="${row.manual_uuid}" value="${escapeHtml(row.source_name)}" autocomplete="off" ${row.origin === "cgt" ? "readonly" : ""}></label><button type="button" data-hier-remove="${row.manual_uuid}" ${hasChildren ? "disabled title=\"하위를 먼저 선택 해제하세요\"" : ""}>선택 해제</button></div></article>`;
+    }).join("")}</div>
+    <div class="hier-manual"><h3 data-hier-manual-title>수동 샷 추가</h3><label data-hier-manual-name-field>샷 이름<input data-hier-manual-name placeholder="정식 샷 코드 또는 수동 이름" autocomplete="off"></label><label>연결할 슬롯<select data-hier-slot><option value="new">새 독립 샷 추가</option>${state.shot_routing.shots.map(shot => `<option value="${shot.shot_uuid}" ${used.has(shot.shot_uuid) ? "disabled" : ""}>${String(shot.number).padStart(2, "0")} · ${escapeHtml(shot.name)} (입력·연결 유지)</option>`).join("")}${typeof addImageBash === "function" ? '<option value="image_bash">HMBImageBash</option>' : ""}</select></label><small data-hier-slot-help>기존 슬롯을 선택하면 UUID·미디어·설정·결과를 보존하고 이름만 적용합니다.</small><button type="button" data-hier-add>수동 추가</button></div></section></div></div>
+    <footer><span>${representativeCount}개 대표 · ${draft.members.length - roots.length}개 하위</span><div class="hier-actions"><button type="button" data-hier-cancel>취소</button><button type="button" class="hier-primary" data-hier-confirm>선택 확정</button></div></footer>`;
+    dialog.querySelectorAll("[data-hier-cancel]").forEach(button => button.addEventListener("click", close));
+    const add = () => {
+      if (dialog.querySelector("[data-hier-slot]").value === "image_bash") {
+        if (typeof addImageBash !== "function") return;
+        if (JSON.stringify(draft.members) !== JSON.stringify(prior.members || [])) {
+          notice("샷 선택 변경을 먼저 확정한 뒤 HMBImageBash를 추가하세요. 기존 샷은 유지됩니다."); return;
+        }
+        if (container.__hmbNativeUiContract?.props?.disabled) return;
+        close(); addImageBash(); return;
+      }
+      changed(() => {
+        const parsed = hmbHierarchyParseName(dialog.querySelector("[data-hier-manual-name]").value);
+        const slot = dialog.querySelector("[data-hier-slot]").value;
+        const id = newImageAssetUuid();
+        const row = { member_id: `manual:${id}`, origin: "manual", manual_uuid: id, source_name: parsed.source_name, canonical_name: parsed.canonical_name,
+          gp_shot_uuid: slot === "new" ? newImageAssetUuid() : slot, parent_id: null, selection_order: draft.members.length + 1, cgt_task_id: null, artist: null, status: null };
+        if (draft.version === 2) row.cgt_identity = null;
+        const next = { ...draft, members: [...draft.members, row] };
+        const request = { schema: SHOT_HIERARCHY_EDIT_SCHEMA, version: 1, expected_generation: initialGeneration, expected_binding_revision: prior.revision || 0,
+          removed_member_ids: (prior.members || []).filter(item => !next.members.some(row => row.member_id === item.member_id)).map(item => item.member_id), binding: next };
+        hmbApplyShotHierarchyEdit(state, request);
+        draft.members = next.members;
+      });
+    };
+    dialog.querySelector("[data-hier-add]").addEventListener("click", add);
+    const syncManualSlot = () => {
+      const imageBash = dialog.querySelector("[data-hier-slot]").value === "image_bash";
+      dialog.querySelector("[data-hier-manual-name-field]").hidden = imageBash;
+      dialog.querySelector("[data-hier-manual-name]").disabled = imageBash;
+      dialog.querySelector("[data-hier-manual-title]").textContent = imageBash ? "HMBImageBash 추가" : "수동 샷 추가";
+      dialog.querySelector("[data-hier-add]").textContent = imageBash ? "HMBImageBash 추가" : "수동 추가";
+      dialog.querySelector("[data-hier-slot-help]").textContent = imageBash
+        ? "Shot 1~5와 별도의 이미지 작업 공간을 추가합니다."
+        : "기존 슬롯을 선택하면 UUID·미디어·설정·결과를 보존하고 이름만 적용합니다.";
+    };
+    if (manualDraft) {
+      dialog.querySelector("[data-hier-manual-name]").value = manualDraft.name;
+      dialog.querySelector("[data-hier-slot]").value = manualDraft.slot;
+      syncManualSlot();
+    }
+    dialog.querySelector("[data-hier-slot]").addEventListener("change", () => {
+      notice("");
+      syncManualSlot();
+      renderCgt();
+    });
+    dialog.querySelector("[data-hier-manual-name]").addEventListener("keydown", event => {
+      if (event.key === "Enter" && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); add(); }
+    });
+    dialog.querySelectorAll("[data-hier-name]").forEach(input => input.addEventListener("change", () => {
+      try {
+        const row = draft.members.find(item => item.manual_uuid === input.dataset.hierName);
+        if (row.origin !== "manual") throw new Error("CGT에서 선택한 샷의 이름은 변경할 수 없습니다.");
+        const parsed = hmbHierarchyParseName(input.value);
+        const candidate = { ...draft, members: draft.members.map(item => item === row ? { ...item, source_name: parsed.source_name, canonical_name: parsed.canonical_name } : item) };
+        hmbNormalizeShotHierarchy(candidate); draft.members = candidate.members;
+        // Keep the clicked action alive: blur/change occurs before its click.
+        // Replacing the dialog here used to swallow Confirm's first click.
+        renderNamePreview();
+        notice("");
+      } catch (error) { notice(error.message); }
+    }));
+    dialog.querySelectorAll("[data-hier-parent]").forEach(select => select.addEventListener("change", () => {
+      try {
+        if (confirmingCgt || container.__hmbNativeUiContract?.props?.disabled) throw new Error("Griptape에서 편집이 잠겨 있습니다.");
+        const candidate = { ...draft, members: draft.members.map(row => row.manual_uuid === select.dataset.hierParent
+          ? { ...row, parent_id: select.value || null } : row) };
+        hmbApplyShotHierarchyEdit(state, makeRequest(candidate));
+        draft.members = candidate.members;
+        const key = select.dataset.hierParent;
+        renderDraft({ name: dialog.querySelector("[data-hier-manual-name]").value,
+          slot: dialog.querySelector("[data-hier-slot]").value });
+        dialog.querySelector(`[data-hier-parent="${key}"]`)?.focus({ preventScroll: true });
+      } catch (error) {
+        select.value = draft.members.find(row => row.manual_uuid === select.dataset.hierParent)?.parent_id || "";
+        notice(error.message);
+      }
+    }));
+    dialog.querySelectorAll("[data-hier-remove]").forEach(button => button.addEventListener("click", () => changed(() => {
+      const row = draft.members.find(item => item.manual_uuid === button.dataset.hierRemove);
+      if (draft.members.some(child => child.parent_id === row.member_id)) throw new Error("하위를 먼저 선택 해제하세요.");
+      draft.members = draft.members.filter(item => item !== row).map((item, i) => ({ ...item, selection_order: i + 1 }));
+      if (draft.version === 2 && !draft.members.some(item => item.origin === "cgt")) { draft.cgt_scope = null; draft.cgt_account_id = null; }
+    })));
+    dialog.querySelector("[data-hier-confirm]").addEventListener("click", () => {
+      try {
+        if (container.__hmbNativeUiContract?.props?.disabled) throw new Error("Griptape에서 편집이 잠겨 있습니다.");
+        const names = new Map([...dialog.querySelectorAll("[data-hier-name]")].map(input => [input.dataset.hierName, hmbHierarchyParseName(input.value)]));
+        const candidate = { ...draft, members: draft.members.map(row => ({ ...row,
+          source_name: names.get(row.manual_uuid).source_name, canonical_name: names.get(row.manual_uuid).canonical_name })) };
+        const request = { schema: SHOT_HIERARCHY_EDIT_SCHEMA, version: 1, expected_generation: initialGeneration, expected_binding_revision: prior.revision || 0,
+          removed_member_ids: (prior.members || []).filter(item => !candidate.members.some(row => row.member_id === item.member_id)).map(item => item.member_id), binding: hmbNormalizeShotHierarchy(candidate) };
+        // Validate against current authority again; background changes cannot be
+        // overwritten by an older dialog. No render or CGT request is made.
+        hmbApplyShotHierarchyEdit(container.__hmbImageAssetLatestState || state, request);
+        if (candidate.members.some(row => row.origin === "cgt")) {
+          confirmingCgt = true;
+          if (!sendCgt("cgt_confirm", request)) { confirmingCgt = false; throw new Error("CGT 확인 연결이 준비되지 않았습니다. 새로고침하세요."); }
+          renderDraft(); notice("CGT 계정·본인 배정·샷 구성을 확인하고 있습니다…");
+          return;
+        }
+        close(); commit(request);
+      } catch (error) { notice(error.message); }
+    });
+    renderCgt();
+    renderNamePreview();
+    scrollPositions.forEach(([selector, top]) => { const target = dialog.querySelector(selector); if (target) target.scrollTop = top; });
+    disposePositioning?.reposition?.();
+    if (confirmingCgt) dialog.querySelectorAll("button,input,select").forEach(control => { control.disabled = true; });
+  };
+  dialog.addEventListener("cancel", event => { event.preventDefault(); close(); });
+  container.__hmbHierarchyDispose = () => { confirmingCgt = false; close(); };
+  dialog.addEventListener("keydown", event => event.stopPropagation());
+  disposePositioning = hmbInstallShotHierarchyDragging(dialog, doc);
+  try {
+    // The modal belongs to the viewport, outside the graph node's zoom and transform.
+    renderDraft(); (doc.body || root).appendChild(dialog); dialog.showModal();
+    dialog.querySelector("[data-hier-manual-name]").focus({ preventScroll: true });
+    cgtState = { ...cgtState, status: "loading", tasks: [] };
+    if (!sendCgt("cgt_catalog")) cgtState = { ...cgtState, status: "SDK_UNAVAILABLE", tasks: [] };
+    renderCgt();
+  } catch (error) { close(); throw error; }
+  return true;
+}
+
 function installEvents(container, state, props, remount, listeners) {
   const on = (target, type, handler, options) => {
     if (!target?.addEventListener) return;
@@ -6333,12 +7131,17 @@ function installEvents(container, state, props, remount, listeners) {
   };
 
   const stopNodeDeleteShortcut = (event) => {
+    if (event?.target?.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]")) return;
     if (["Backspace", "Delete"].includes(event?.key)) event.stopPropagation?.();
   };
   on(container, "keydown", stopNodeDeleteShortcut);
   const stopSelectedNodeDeleteShortcut = (event) => hmbGuardSelectedNodeKeyboardDelete(container, event);
   if (typeof window !== "undefined") on(window, "keydown", stopSelectedNodeDeleteShortcut, true);
   const stopInteriorNodeSelection = (event) => {
+    const target = event?.target;
+    if (target?.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]")) return;
+    const nativeHeader = target?.closest?.('.hmb-image-assets[data-hmb-native-header="active"] > .top');
+    if (nativeHeader && !target?.closest?.(".project-switch")) return;
     if (Number(event?.button) !== 1) event.stopPropagation();
   };
   on(container, "pointerdown", stopInteriorNodeSelection);
@@ -6564,10 +7367,76 @@ function installEvents(container, state, props, remount, listeners) {
     on(window, "hmb-shot-routing-discover-v1", publishShotRouting);
     publishShotRouting();
   }
+  const commitImageBashMutation = (mutate, create = false, completion = null) => {
+    if (container.__hmbNativeUiContract?.props?.disabled || typeof mutate !== "function") return false;
+    hmbFlushImageAssetSelectionCommit(container);
+    state = container.__hmbImageAssetLatestState || state;
+    const previous = state;
+    const candidate = { ...state, shot_routing: cloneImageAssetShotRouting(state.shot_routing),
+      image_bash_workspace: hmbNormalizeImageBashWorkspace(state.image_bash_workspace), image_bash_workspace_request: {} };
+    if (!mutate(candidate)) return false;
+    if (create) candidate.image_bash_workspace_request = { schema: IMAGE_BASH_WORKSPACE_EDIT_SCHEMA, version: 1,
+      operation: "create", request_id: newImageAssetUuid(), workspace_id: candidate.image_bash_workspace.workspace_id,
+      expected_revision: candidate.image_bash_workspace.revision };
+    hmbInvalidateImageAssetPublication(container);
+    state = remount(candidate);
+    const optimistic = state;
+    let failed = false, published = null;
+    published = emit(props, state, container, error => {
+      failed = true;
+      try { completion?.onFailure?.(error); } catch (_error) {}
+      if (container.__hmbImageAssetLatestState === optimistic || container.__hmbImageAssetLatestState === published) state = remount(previous);
+      else if (JSON.stringify(container.__hmbImageAssetLatestState?.image_bash_workspace) === JSON.stringify(candidate.image_bash_workspace)) {
+        // A view-only remount replaces the canonical object, but does not
+        // supersede this exact workspace edit or its rollback ownership.
+        state = remount({ ...container.__hmbImageAssetLatestState, image_bash_workspace: previous.image_bash_workspace,
+          image_bash_active: previous.image_bash_active, image_bash_workspace_request: {} });
+      }
+      hmbShowImageAssetTransportError(container, error, state);
+    }, { onSuccess: () => {
+      if (typeof completion?.onSuccess !== "function") return;
+      Promise.resolve().then(() => {
+        // A canonical acknowledgement may advance the publication clock.
+        // The accepted workspace and the caller's draft guard own completion.
+        if (!failed && JSON.stringify(container.__hmbImageAssetLatestState?.image_bash_workspace) === JSON.stringify(candidate.image_bash_workspace)) completion.onSuccess();
+      });
+    } });
+    if (!failed) {
+      // Only the explicit HMBImageBash add publication carries the create command.
+      // Selection, page switches and cold restoration never replay it.
+      published.image_bash_workspace_request = {};
+      if (container.__hmbImageAssetLatestState === optimistic) { state = published; container.__hmbImageAssetLatestState = published; }
+    }
+    return !failed;
+  };
+  const commitHierarchyRequest = request => {
+    const previous = container.__hmbImageAssetLatestState || state;
+    const candidate = hmbApplyShotHierarchyEdit(previous, request);
+    candidate.shot_hierarchy_request = request;
+    let failed = false;
+    let published = null;
+    let optimistic = null;
+    published = emit(props, candidate, container, error => {
+      failed = true;
+      if (container.__hmbImageAssetLatestState === previous || container.__hmbImageAssetLatestState === published
+          || (optimistic && container.__hmbImageAssetLatestState === optimistic)) state = remount(previous);
+      hmbShowImageAssetTransportError(container, error, state);
+    });
+    if (!failed) {
+      published.shot_hierarchy_request = {};
+      // A synchronous host acknowledgement may already contain a newer scan
+      // or canonical metadata. Never replace it with the optimistic payload.
+      if (container.__hmbImageAssetLatestState === previous) { optimistic = remount(published); state = optimistic; }
+    }
+  };
   on(container.querySelector("[data-shot-add]"), "click", (event) => {
     event.preventDefault();
     event.stopPropagation();
-    commitShotMutation(() => hmbAddImageAssetShot(state));
+    if (container.__hmbNativeUiContract?.props?.disabled) return;
+    hmbFlushImageAssetSelectionCommit(container);
+    state = container.__hmbImageAssetLatestState || state;
+    hmbOpenShotHierarchyDialog(container, state, state.shot_routing.active_shot_uuid, commitHierarchyRequest,
+      () => commitImageBashMutation(candidate => hmbCreateImageBashWorkspace(candidate), true));
   });
   container.querySelectorAll("[data-shot-delete]").forEach((button) => {
     const shotUuid = clean(button.getAttribute("data-shot-delete"));
@@ -6582,7 +7451,11 @@ function installEvents(container, state, props, remount, listeners) {
     on(button, "click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      if (event.target?.closest?.("[data-shot-rename]")) return;
+      if (event.target?.closest?.("[data-shot-rename],[data-shot-rename-input]")) return;
+      if (state.image_bash_active) {
+        commitImageBashMutation(candidate => { candidate.image_bash_active = false; hmbActivateImageAssetShot(candidate, shotUuid); return true; });
+        return;
+      }
       const previousShot = activeImageAssetShot(state);
       commitShotMutation(
         () => hmbActivateImageAssetShot(state, shotUuid),
@@ -6594,12 +7467,46 @@ function installEvents(container, state, props, remount, listeners) {
       );
     });
   });
+  on(container, "click", event => {
+    const tab = event.target?.closest?.("[data-image-bash-tab]");
+    const remove = event.target?.closest?.("[data-image-bash-remove]");
+    const duplicate = event.target?.closest?.("[data-image-bash-duplicate]");
+    const action = tab || remove || duplicate;
+    if (!action || !container.contains(action)) return;
+    event.preventDefault(); event.stopPropagation();
+    if (tab) commitImageBashMutation(candidate => { if (candidate.image_bash_active) return false; candidate.image_bash_active = true; return true; });
+    else if (remove) commitImageBashMutation(candidate => hmbRemoveImageBashInstance(candidate, remove.dataset.imageBashRemove));
+    else commitImageBashMutation(candidate => hmbDuplicateImageBashInstance(candidate, duplicate.dataset.imageBashDuplicate));
+  });
+  let imageBashDrag = null;
+  on(container, "dragstart", event => {
+    const card = event.target?.closest?.("[data-image-bash-instance]");
+    if (!card || !container.contains(card) || container.__hmbNativeUiContract?.props?.disabled) return;
+    imageBashDrag = { workspace_id: state.image_bash_workspace.workspace_id, instance_id: card.dataset.imageBashInstance };
+    event.dataTransfer?.setData("application/x-hmb-image-bash-instance", JSON.stringify(imageBashDrag));
+    event.dataTransfer?.setData("text/plain", imageBashDrag.instance_id);
+    if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+    event.stopPropagation();
+  });
+  on(container, "dragover", event => {
+    if (imageBashDrag && event.target?.closest?.("[data-image-bash-instance]")) { event.preventDefault(); event.stopPropagation(); }
+  });
+  on(container, "drop", event => {
+    const target = event.target?.closest?.("[data-image-bash-instance]");
+    if (!target || !imageBashDrag || !container.contains(target)) return;
+    event.preventDefault(); event.stopPropagation();
+    const dragged = imageBashDrag; imageBashDrag = null;
+    if (dragged.workspace_id !== state.image_bash_workspace.workspace_id) return;
+    commitImageBashMutation(candidate => hmbReorderImageBashInstance(candidate, dragged.instance_id, target.dataset.imageBashInstance));
+  });
+  on(container, "dragend", () => { imageBashDrag = null; });
   const bindShotRenameInput = (input, renameButton, shotUuid) => {
     const routing = ensureImageAssetShotRouting(state);
     const shot = routing.shots.find((item) => item.shot_uuid === shotUuid);
     const ownerDocument = input?.ownerDocument || container.ownerDocument
       || (typeof document !== "undefined" ? document : null);
     if (!shot || !input || !renameButton || !ownerDocument?.createElement) return false;
+    const initialName = input.value;
     renameButton.disabled = true;
     let settled = false;
     const finish = (save) => {
@@ -6608,12 +7515,22 @@ function installEvents(container, state, props, remount, listeners) {
       const value = clean(input.value);
       const restored = ownerDocument.createElement("b");
       restored.setAttribute("data-shot-name", "");
-      restored.textContent = save && value ? value : shot.name;
+      restored.textContent = save && value && value !== initialName ? value : shot.name;
       input.replaceWith(restored);
-      renameButton.disabled = false;
+      renameButton.disabled = !hmbImageAssetShotCanRename(container.__hmbImageAssetLatestState || state, shotUuid);
       try { renameButton.focus?.({ preventScroll: true }); } catch (_error) { renameButton.focus?.(); }
-      if (save && value && value !== shot.name) {
-        commitShotMutation(() => hmbRenameImageAssetShot(state, shotUuid, value));
+      if (save && value && value !== initialName) {
+        try {
+          hmbFlushImageAssetSelectionCommit(container);
+          state = container.__hmbImageAssetLatestState || state;
+          if (container.__hmbNativeUiContract?.props?.disabled) throw new Error("Griptape에서 편집이 잠겨 있습니다.");
+          const request = hmbImageAssetManualRenameRequest(state, shotUuid, value);
+          if (request) commitHierarchyRequest(request);
+          else commitShotMutation(() => hmbRenameImageAssetShot(state, shotUuid, value));
+        } catch (error) {
+          restored.textContent = shot.name;
+          hmbShowImageAssetTransportError(container, error, state);
+        }
       }
     };
     on(input, "keydown", (keyEvent) => {
@@ -6642,24 +7559,21 @@ function installEvents(container, state, props, remount, listeners) {
     on(renameButton, "click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      const routing = ensureImageAssetShotRouting(state);
-      const shot = routing.shots.find((item) => item.shot_uuid === shotUuid);
-      const panel = renameButton.closest?.("[data-shot-panel]");
-      const label = panel?.querySelector?.("[data-shot-name]");
-      const ownerDocument = label?.ownerDocument || container.ownerDocument
-        || (typeof document !== "undefined" ? document : null);
-      if (!shot || !label || !ownerDocument?.createElement) return;
-      const input = ownerDocument.createElement("input");
-      input.type = "text";
-      input.className = "shot-name-input";
+      hmbFlushImageAssetSelectionCommit(container);
+      state = container.__hmbImageAssetLatestState || state;
+      if (renameButton.disabled || container.__hmbNativeUiContract?.props?.disabled
+          || !hmbImageAssetShotCanRename(state, shotUuid)) return;
+      const label = renameButton.closest("[data-shot-panel]")?.querySelector("[data-shot-name]");
+      const shot = state.shot_routing.shots.find(row => row.shot_uuid === shotUuid);
+      if (!label || !shot) return;
+      const input = container.ownerDocument.createElement("input");
+      input.type = "text"; input.className = "shot-name-input"; input.maxLength = 128;
+      input.value = state.shot_hierarchy?.members?.find(row => row.gp_shot_uuid === shotUuid)?.source_name || shot.name;
       input.setAttribute("data-shot-rename-input", shotUuid);
       input.setAttribute("aria-label", imageAssetText(state, "rename_shot"));
-      input.maxLength = 128;
-      input.value = shot.name;
       label.replaceWith(input);
-      if (!bindShotRenameInput(input, renameButton, shotUuid)) return;
-      try { input.focus?.({ preventScroll: true }); } catch (_error) { input.focus?.(); }
-      input.select?.();
+      bindShotRenameInput(input, renameButton, shotUuid);
+      input.focus({ preventScroll: true }); input.select();
     });
   });
   const projectSelect = container.querySelector("[data-project-select]");
@@ -6821,6 +7735,9 @@ function installEvents(container, state, props, remount, listeners) {
       const asset = container.__hmbImageAssetByLibraryId?.get(key) || assetsByLibraryId.get(key);
       if (!asset) return;
       if (!hmbImageAssetCanSelect(asset)) return;
+      if (state.image_bash_active) {
+        commitImageBashMutation(candidate => hmbAddImageBashSource(candidate, asset.source_uid)); return;
+      }
       const activeShot = activeImageAssetShot(state);
       if (!activeShot) return;
       const selected = imageAssetShotAssets(state, activeShot);
@@ -6924,6 +7841,9 @@ function installEvents(container, state, props, remount, listeners) {
   // duplicate action during the transition to retained windows.
   const toggleDelegatedAsset = (card, asset) => {
     if (!hmbImageAssetCanSelect(asset)) return;
+    if (state.image_bash_active) {
+      commitImageBashMutation(candidate => hmbAddImageBashSource(candidate, asset.source_uid)); return;
+    }
     const activeShot = activeImageAssetShot(state);
     if (!activeShot) return;
     const selected = imageAssetShotAssets(state, activeShot);
@@ -7055,6 +7975,28 @@ function installEvents(container, state, props, remount, listeners) {
     remount(deferredProps ? normalizeState(deferredProps?.value) : state);
     restoreRegistrationOpener(returnFocus);
   };
+  on(container.querySelector("[data-registration-bash-add]"), "click", event => {
+    event.preventDefault(); event.stopPropagation();
+    if (container.__hmbNativeUiContract?.props?.disabled) return;
+    const draft = container.__hmbImageAssetRegistrationDraft;
+    if (!draft || draft.bash_pending) return;
+    const deferredProps = hmbTakeDeferredImageAssetProps(container);
+    if (deferredProps) state = remount(normalizeState(deferredProps.value));
+    const current = container.__hmbImageAssetLatestState || state;
+    const asset = current.assets.find(row => row.asset_library_id === draft.asset_library_id && row.source_uid === draft.source_uid);
+    if (!current.image_bash_active || !current.image_bash_workspace?.workspace_id || !asset
+        || asset.source_kind !== "user" || Number(asset.import_index || 0) <= 0
+        || !hmbImageAssetCanSelect(asset) || current.image_bash_workspace.instances.length >= MAX_SELECTED_IMAGES) return;
+    draft.bash_pending = true;
+    const started = commitImageBashMutation(candidate => hmbAddImageBashSource(candidate, asset.source_uid), false, {
+      onFailure() { if (container.__hmbImageAssetRegistrationDraft === draft) delete draft.bash_pending; },
+      onSuccess() {
+        if (container.__hmbImageAssetRegistrationDraft !== draft) return;
+        delete draft.bash_pending; closeRegistration();
+      },
+    });
+    if (!started) { delete draft.bash_pending; state = remount(state); }
+  });
   container.querySelectorAll("[data-registration-cancel]").forEach((button) => {
     on(button, "click", (event) => {
       event.preventDefault();
@@ -7074,7 +8016,7 @@ function installEvents(container, state, props, remount, listeners) {
     if (submit) {
       submit.disabled = !registrationDraftIsComplete(
         container.__hmbImageAssetRegistrationDraft,
-      );
+      ) || Boolean(container.__hmbImageAssetRegistrationDraft?.bash_pending);
     }
   };
   container.querySelectorAll("[data-registration-field]").forEach((input) => {
@@ -7274,6 +8216,8 @@ function hmbNativeUiImplementation(container, props) {
   rememberNodeInternalsUpdater(props);
   const cleanupImportHandles = hmbInstallImageAssetImportHandleDecoration(container);
   let state = normalizeState(props?.value);
+  // A saved value is state, not permission to recreate a graph node.
+  state.image_bash_workspace_request = {};
   container.__hmbImageAssetAcceptedEditCatalogIdentity = imageAssetEditCatalogIdentity(state);
   hmbRememberImageAssetPresentation(state);
   hmbAdoptImageAssetPresentation(state);
@@ -7284,7 +8228,8 @@ function hmbNativeUiImplementation(container, props) {
   let renderRevision = 0;
   const catalogPages=hmbInstallImageAssetCatalogPages(container,()=>state,(dto)=>{
     const page=normalizeState(dto),selected=selectedAssets(state),selectedIds=new Set(selected.map(asset=>asset.source_uid));
-    const byId=new Map(selected.map(asset=>[asset.asset_library_id,asset]));
+    const retained=[...selected,...hmbImageBashWorkspaceAssets(state).map(row=>row.asset).filter(Boolean)];
+    const byId=new Map(retained.map(asset=>[asset.asset_library_id,asset]));
     const visible=new Map(state.assets.map(asset=>[asset.asset_library_id,asset]));
     for(const asset of page.assets)if(!byId.has(asset.asset_library_id)){
       const prior=visible.get(asset.asset_library_id);
@@ -7324,6 +8269,7 @@ function hmbNativeUiImplementation(container, props) {
   );
 
   const consumeThumbnailPresentationPatch = (patch) => {
+    if (patch?.operation?.startsWith("cgt_")) return container.__hmbHierarchyReceive?.(patch) || false;
     const applied = hmbApplyImageAssetThumbnailPresentationPatch(
       container.__hmbImageAssetLatestState || state,
       patch,
@@ -7412,6 +8358,8 @@ function hmbNativeUiImplementation(container, props) {
     const uiMemory = container.__hmbImageAssetCompactUiMemory
       || captureImageAssetUi(container, state);
     const reusableImages = detachReusableImageAssets(container);
+    const hierarchyDialog = container.__hmbHierarchyDialog;
+    if (hierarchyDialog?.isConnected && container.contains(hierarchyDialog)) { hierarchyDialog.close?.(); hierarchyDialog.remove(); }
     clearListeners();
     state = normalizeState(nextState);
     hmbRememberImageAssetPresentation(state);
@@ -7456,11 +8404,16 @@ function hmbNativeUiImplementation(container, props) {
     }
     hmbSetImageAssetRefreshReviewInert(container, Boolean(refreshReview && !container.__hmbImageAssetRegistrationDraft));
     hmbPrepareImageAssetCanvasGestures(container);
+    hmbInstallImageAssetNativeHeader(container)?.sync();
     restoreReusableImageAssets(container, reusableImages);
     concealNativeProjectRootPicker(container);
     installEvents(container, state, props, remount, listeners);
     hmbRebuildImageAssetIndexes(container, state);
     restoreImageAssetUi(container, state, uiMemory);
+    if (hierarchyDialog && container.__hmbHierarchyDialog === hierarchyDialog) {
+      if (!hierarchyDialog.isConnected) (container.ownerDocument?.body || container.querySelector(".hmb-image-assets"))?.appendChild(hierarchyDialog);
+      if (!hierarchyDialog.open) hierarchyDialog.showModal?.();
+    }
     if (refreshReview && !container.__hmbImageAssetRegistrationDraft) {
       const backdrop = container.querySelector("[data-refresh-review-backdrop]");
       const active = typeof document !== "undefined" ? document.activeElement : null;
@@ -7532,6 +8485,7 @@ function hmbNativeUiImplementation(container, props) {
       return;
     }
     const incomingState = normalizeState(hmbImageAssetLocalPageProjection(rawIncoming,state,container));
+    incomingState.image_bash_workspace_request = {};
     const queuedOwnerAction = container.__hmbImageAssetPendingSlowAction;
     if (
       queuedOwnerAction
@@ -7715,6 +8669,10 @@ function hmbNativeUiImplementation(container, props) {
   container.__hmbImageAssetApplyProps = applyProps;
 
   const cleanup = () => {
+    container.__hmbHierarchyDispose?.();
+    container.__hmbHierarchyDialog?.close?.();
+    container.__hmbHierarchyDialog?.remove?.();
+    delete container.__hmbHierarchyDialog;
     catalogPages.cleanup();
     cleanupImportHandles();
     hmbCancelImageAssetCompactGeometrySettle(container);
@@ -7777,6 +8735,7 @@ function hmbNativeUiImplementation(container, props) {
     delete container.__hmbImageAssetBySourceUid;
     delete container.__hmbImageAssetSelectedCardByLibraryId;
     delete container.__hmbImageAssetCompactCardsByLibraryId;
+    delete container.__hmbImageAssetBashCardsByLibraryId;
     delete container.__hmbImageAssetThumbnailConsumer;
     delete container.__hmbImageAssetCatalogProbeConsumer;
     delete container.__hmbImageAssetRenderLimit;
@@ -7799,6 +8758,7 @@ function hmbNativeUiImplementation(container, props) {
       delete container.__hmbImageAssetMountToken;
     }
     container.removeAttribute?.("data-hmb-node-delete-protected");
+    container.__hmbImageAssetNativeHeader?.cleanup();
     container.innerHTML = "";
   };
   container.__hmbImageAssetCleanup = cleanup;
@@ -7912,5 +8872,5 @@ function hmbNativeUiContract(container, props, mount, policy) {
 // HMB_NATIVE_DISABLED_ADAPTER_V1_END
 
 export default function HMBImageAssetLibraryWidget(container, props) {
-  return hmbNativeUiContract(container, props, hmbNativeUiImplementation, { kind: "asset", allowControl: null });
+  return hmbNativeUiContract(container, props, hmbNativeUiImplementation, { kind: "asset", allowControl: target => Boolean(target?.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]")) });
 }

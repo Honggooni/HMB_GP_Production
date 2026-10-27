@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 spec = importlib.util.spec_from_file_location("_explicit_only_router_test", ROOT / "_hmb_shot_routing.py")
 assert spec is not None and spec.loader is not None
 routing = importlib.util.module_from_spec(spec)

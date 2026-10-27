@@ -3,14 +3,18 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 import ast
+import hashlib
 import importlib.metadata as metadata
 import io
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -177,6 +181,323 @@ class InstallerRepair(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,"Unsupported"):
             self.run_repair(root=wrong)
         self.assertEqual(self.calls,[])
+
+
+@unittest.skipUnless(os.name == "nt" and shutil.which("powershell"), "Windows PowerShell installer transaction")
+class InstallerTransaction(unittest.TestCase):
+    """Run the real transaction against a workspace-only installation fixture."""
+
+    def setUp(self):
+        work = ROOT / "reports" / "predeploy-fixes-20261026" / "installer"
+        work.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(prefix="installer-transaction-", dir=work)
+        self.base = Path(self.tmp.name).resolve()
+        self.junctions = []
+        self.engine_python = sys.executable
+        self.target = self.base / "libraries" / "HMB_GP_Production"
+        self.rollback = self.base / "rollback"
+        self.source = self.base / "source"
+        self.source.mkdir()
+        self.target.mkdir(parents=True)
+        for name, content in {
+            "old-runtime.py": b"previous runtime retained",
+            ".hmb-install-receipt.json": b'{"previous":true}',
+            "reports/result.json": b'{"task_id":"fixture-task","result":"preserve"}',
+            ".venv/Scripts/keep.bin": b"existing environment retained",
+            ".venv-tos/Scripts/keep.bin": b"existing isolated environment retained",
+        }.items():
+            path = self.target / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        self.before = self.inventory(self.target)
+        constants = {}
+        for node in ast.parse((ROOT / "tools/package_runtime_release.py").read_text("utf-8")).body:
+            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+                if node.targets[0].id in ("RUNTIME_INSTALL_FILES", "DISTRIBUTION_ONLY_FILES"):
+                    constants[node.targets[0].id] = ast.literal_eval(node.value)
+        # Installer paths and explicit fault injection are fixture-only. No
+        # production path, app process or provider is accessed.
+        expected_parent = "Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'GriptapeNodes\\libraries'"
+        self.assertEqual(TEXT.count(expected_parent), 1)
+        fixture_text = TEXT.replace(expected_parent, "'" + str(self.target.parent).replace("'", "''") + "'")
+        fixture_text = fixture_text.replace("    $receiptPath = Join-Path $target '.hmb-install-receipt.json'",
+            "    if ($global:fixtureFailure -eq 'receipt') { throw 'INJECTED receipt failure after native apply' }\n"
+            "    $receiptPath = Join-Path $target '.hmb-install-receipt.json'")
+        self.native_original = b"synthetic pristine editor for PS installation transaction\n"
+        self.native_candidate = b"synthetic patched editor for PS installation transaction\n"
+        self.native = self.base / "app/current/resources/editor-bundle/assets/index-DEZU41rc.js"
+        self.native.parent.mkdir(parents=True)
+        self.native.write_bytes(self.native_original)
+        (self.native.parent.parent / ".version").write_text("0.128.1")
+        self.native_state = self.base / "native-editor-installs"
+        patcher_name = "tools/hmb_color_lut_native_header_patch.py"
+        patcher_text = (ROOT / patcher_name).read_text("utf-8")
+        footer = ("\nDEFAULT_SOURCE = Path(" + repr(str(self.native)) + ")\n"
+                  "RELEASE_STATE_ROOT = Path(" + repr(str(self.native_state)) + ")\n"
+                  "EXPECTED_SOURCE_SHA256 = " + repr(hashlib.sha256(self.native_original).hexdigest()) + "\n"
+                  "patch_editor_source = lambda source: (" + repr(self.native_candidate.decode()) + ", {})\n"
+                  "_require_release_stopped = lambda: None\n")
+        self.assertEqual(patcher_text.count('if __name__ == "__main__":'), 1)
+        patcher_data = patcher_text.replace('if __name__ == "__main__":', footer + '\nif __name__ == "__main__":').encode("utf-8")
+        helper_name = "resources/editor/hmb-color-lut-native-header.js"
+        helper_data = (ROOT / helper_name).read_bytes()
+        descriptor_data = json.dumps({
+            "schema": "hmb-native-editor-patch-release", "version": 1, "editor_version": "0.128.1",
+            "bundle_name": "index-DEZU41rc.js", "source_sha256": hashlib.sha256(self.native_original).hexdigest(),
+            "candidate_sha256": hashlib.sha256(self.native_candidate).hexdigest(),
+            "helper_path": helper_name, "helper_sha256": hashlib.sha256(helper_data).hexdigest(),
+            "patcher_path": patcher_name, "patcher_sha256": hashlib.sha256(patcher_data).hexdigest(),
+        }).encode()
+        overrides = {"Install_HMB_GP_Production.ps1": fixture_text.encode("utf-8-sig"),
+                     patcher_name: patcher_data, helper_name: helper_data,
+                     "resources/editor/native-editor-patch.json": descriptor_data}
+        rows = []
+        for name in (*constants["RUNTIME_INSTALL_FILES"], *constants["DISTRIBUTION_ONLY_FILES"]):
+            data = overrides[name] if name in overrides else (ROOT / name).read_bytes()
+            destination = self.source / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+            rows.append({"path": name, "install": name in constants["RUNTIME_INSTALL_FILES"],
+                         "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+        self.runtime = [row for row in rows if row["install"]]
+        manifest = {"schema": "hmb-release-closure", "version": 1, "release_version": "0.8.30",
+                    "file_count": 67, "install_file_count": 60, "distribution_file_count": 7,
+                    "files": rows, "policy_identity": {"fixture": True},
+                    "build_fingerprint_sha256": self.fingerprint(rows),
+                    "runtime_fingerprint_sha256": self.fingerprint(self.runtime)}
+        encoded = json.dumps(manifest, ensure_ascii=True).encode()
+        (self.source / "release-manifest.json").write_bytes(encoded)
+        (self.source / "SHA256SUMS").write_text("".join(row["sha256"] + "  " + row["path"] + "\n" for row in rows)
+                                                + hashlib.sha256(encoded).hexdigest() + "  release-manifest.json\n", encoding="utf-8")
+
+    def tearDown(self):
+        # TemporaryDirectory owns only the verified workspace fixture subtree.
+        self.assertTrue(self.base.is_relative_to((ROOT / "reports").resolve()))
+        for junction, original in reversed(self.junctions):
+            self.assertTrue(junction.is_relative_to(self.base))
+            # On Windows rmdir removes the junction itself, never its target.
+            os.rmdir(junction)
+            original.rename(junction)
+        self.tmp.cleanup()
+
+    def make_junction(self, folder):
+        self.assertTrue(folder.is_relative_to(self.base))
+        original = self.base / ("private-junction-target-" + str(len(self.junctions)))
+        folder.rename(original)
+        result = subprocess.run(["cmd", "/c", "mklink", "/J", str(folder), str(original)],
+                                capture_output=True, text=True, timeout=10)
+        if result.returncode:
+            original.rename(folder)
+            self.fail("Could not create the isolated junction fixture: " + result.stderr)
+        self.junctions.append((folder, original))
+        return original
+
+    @staticmethod
+    def inventory(folder):
+        return {path.relative_to(folder).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in folder.rglob("*") if path.is_file()}
+
+    @staticmethod
+    def fingerprint(rows):
+        values = [{key: row[key] for key in ("bytes", "path", "sha256")}
+                  for row in sorted(rows, key=lambda row: row["path"])]
+        return hashlib.sha256(json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def run_install(self, failure="none", *, background=False):
+        quote = lambda value: "'" + str(value).replace("'", "''") + "'"
+        harness = self.base / ("fixture-run-" + failure + ".ps1")
+        prefix = "\n".join([
+            "$global:fixtureRoot = " + quote(self.base), "$global:fixtureTarget = " + quote(self.target),
+            "$global:fixtureFailure = " + quote(failure), "$global:backupPerformed = $false",
+        ])
+        harness.write_text(prefix + r'''
+$ErrorActionPreference = 'Stop'
+# A PowerShell 7 parent may pass its PSModulePath to Windows PowerShell 5.1.
+# Load the child's own built-ins before installing the fixture interceptors.
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1')
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Management\Microsoft.PowerShell.Management.psd1')
+function Assert-FixturePath([string]$Path) {
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not $full.StartsWith($global:fixtureRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Outside fixture' }
+}
+function Get-Process { [CmdletBinding()] param() return @() }
+function Move-Item {
+    [CmdletBinding()] param([string]$LiteralPath, [string]$Destination)
+    Assert-FixturePath $LiteralPath; Assert-FixturePath $Destination
+    $backup = $LiteralPath -eq $global:fixtureTarget -and -not $global:backupPerformed
+    if ($backup -and $global:fixtureFailure -eq 'move') { throw 'INJECTED backup move failure' }
+    if ($backup -and $global:fixtureFailure -eq 'pause_before_move') {
+        [IO.File]::WriteAllText((Join-Path $global:fixtureRoot 'mutex-held'), 'ready')
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-Path -LiteralPath (Join-Path $global:fixtureRoot 'mutex-release'))) {
+            if ($watch.Elapsed.TotalSeconds -gt 15) { throw 'fixture concurrency wait expired' }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+    Microsoft.PowerShell.Management\Move-Item @PSBoundParameters
+    if ($backup) {
+        $global:backupPerformed = $true
+        if ($global:fixtureFailure -eq 'after_move') { throw 'INJECTED after completed move' }
+    }
+}
+function New-Item {
+    [CmdletBinding()] param([string]$ItemType, [string]$Path, [switch]$Force)
+    Assert-FixturePath $Path
+    if ($Path -eq $global:fixtureTarget -and $global:backupPerformed -and $global:fixtureFailure -eq 'create') {
+        throw 'INJECTED immediate post-backup failure'
+    }
+    Microsoft.PowerShell.Management\New-Item @PSBoundParameters
+}
+function Get-ChildItem {
+    [CmdletBinding()] param([string]$LiteralPath, [switch]$Force, [switch]$Recurse, [switch]$Directory, [switch]$File, [string]$Filter)
+    Assert-FixturePath $LiteralPath
+    if ($LiteralPath -eq $global:fixtureTarget -and -not $Recurse -and $global:fixtureFailure -eq 'enumerate') {
+        throw 'INJECTED preflight inventory failure'
+    }
+    Microsoft.PowerShell.Management\Get-ChildItem @PSBoundParameters
+}
+try {
+''' + "& " + quote(self.source / "Install_HMB_GP_Production.ps1") + " -SourceRoot " + quote(self.source)
+                           + " -TargetRoot " + quote(self.target) + " -RollbackRoot " + quote(self.rollback)
+                           + " -EnginePython " + quote(self.engine_python)
+                           + "\n} catch { Write-Output $_.Exception.Message; exit 17 }\n", encoding="utf-8-sig")
+        arguments = [shutil.which("powershell"), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(harness)]
+        if background:
+            return subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        result = subprocess.run(arguments,
+                                capture_output=True, text=True, timeout=45)
+        return result
+
+    def assert_preserved_failure(self, mode, message):
+        result = self.run_install(mode)
+        self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
+        self.assertIn(message, result.stdout)
+        self.assertEqual(self.inventory(self.target), self.before)
+        self.assertFalse(list(self.rollback.glob("failed-first-install-*")))
+        self.assertEqual(self.native.read_bytes(), self.native_original)
+
+    def test_backup_move_failure_leaves_existing_target_untouched(self):
+        self.assert_preserved_failure("move", "INJECTED backup move failure")
+        self.assertEqual(list(self.rollback.iterdir()), [])
+
+    def test_immediate_post_backup_failure_restores_exact_previous_files(self):
+        self.assert_preserved_failure("create", "INJECTED immediate post-backup failure")
+        self.assertEqual(list(self.rollback.iterdir()), [])
+
+    def test_completed_backup_move_then_error_is_also_recovered(self):
+        self.assert_preserved_failure("after_move", "INJECTED after completed move")
+        self.assertEqual(list(self.rollback.iterdir()), [])
+
+    def test_preflight_inventory_failure_never_moves_target(self):
+        self.assert_preserved_failure("enumerate", "INJECTED preflight inventory failure")
+        self.assertFalse(list(self.rollback.glob("v*")))
+
+    def test_receipt_failure_restores_native_editor_and_old_library(self):
+        self.assert_preserved_failure("receipt", "INJECTED receipt failure after native apply")
+        self.assertEqual(len(list(self.rollback.glob("failed-new-*"))), 1)
+        plans = list(self.native_state.glob("*/plan.json"))
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(json.loads(plans[0].read_text())["status"], "rolled_back")
+
+    def test_unknown_native_editor_fails_before_runtime_move(self):
+        self.native.write_bytes(b"foreign native editor")
+        result = self.run_install()
+        self.assertEqual(result.returncode, 17)
+        self.assertIn("Native editor prepare failed", result.stdout + result.stderr)
+        self.assertEqual(self.inventory(self.target), self.before)
+        self.assertEqual(self.native.read_bytes(), b"foreign native editor")
+        self.assertFalse(list(self.rollback.glob("v*")))
+
+    def test_already_current_native_editor_is_kept(self):
+        self.native.write_bytes(self.native_candidate)
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.native.read_bytes(), self.native_candidate)
+        receipt = json.loads((self.target / ".hmb-install-receipt.json").read_text("utf-8-sig"))
+        self.assertTrue(receipt["native_editor_patch"]["already_current"])
+        self.assertFalse(receipt["native_editor_patch"]["changed"])
+
+    def test_concurrent_second_installer_is_blocked_before_any_move(self):
+        first = self.run_install("pause_before_move", background=True)
+        try:
+            deadline = time.monotonic() + 10
+            while not (self.base / "mutex-held").exists() and first.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue((self.base / "mutex-held").exists(), "first installer did not hold the transaction mutex")
+            second = self.run_install()
+            self.assertEqual(second.returncode, 17, second.stdout + second.stderr)
+            self.assertIn("Another HMB installation", second.stdout)
+            self.assertEqual(self.inventory(self.target), self.before)
+            self.assertEqual(self.native.read_bytes(), self.native_original)
+            (self.base / "mutex-release").write_text("release")
+            stdout, stderr = first.communicate(timeout=30)
+            self.assertEqual(first.returncode, 0, stdout + stderr)
+            self.assertEqual(self.native.read_bytes(), self.native_candidate)
+        finally:
+            (self.base / "mutex-release").write_text("release")
+            if first.poll() is None:
+                first.communicate(timeout=30)
+
+    def assert_reparse_rejected(self, original):
+        before = self.inventory(original)
+        result = self.run_install()
+        self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
+        self.assertIn("reparse point", result.stdout)
+        self.assertEqual(self.inventory(original), before)
+        self.assertEqual(self.inventory(self.target), self.before)
+        self.assertEqual(self.native.read_bytes(), self.native_original)
+        self.assertFalse(self.native_state.exists())
+        self.assertFalse(list(self.rollback.glob("v*")))
+
+    def test_target_root_junction_cannot_move_external_user_data(self):
+        self.assert_reparse_rejected(self.make_junction(self.target))
+
+    def test_target_parent_junction_is_rejected_before_mutation(self):
+        self.assert_reparse_rejected(self.make_junction(self.target.parent))
+
+    def test_source_root_junction_is_rejected_before_mutation(self):
+        self.assert_reparse_rejected(self.make_junction(self.source))
+
+    def test_source_member_parent_junction_is_rejected_before_mutation(self):
+        self.assert_reparse_rejected(self.make_junction(self.source / "resources"))
+
+    def test_rollback_root_junction_is_rejected_before_mutation(self):
+        self.rollback.mkdir()
+        (self.rollback / "private.txt").write_text("preserve")
+        self.assert_reparse_rejected(self.make_junction(self.rollback))
+
+    def test_missing_rollback_below_junction_parent_is_rejected(self):
+        parent = self.base / "backups"
+        parent.mkdir()
+        self.rollback = parent / "rollback"
+        self.assert_reparse_rejected(self.make_junction(parent))
+
+    def test_engine_python_parent_junction_is_rejected_before_execution(self):
+        engine = self.base / "engine-python"
+        engine.mkdir()
+        self.engine_python = engine / "python.exe"
+        self.engine_python.write_bytes(b"not an executable; must never be invoked")
+        self.assert_reparse_rejected(self.make_junction(engine))
+
+    def test_success_verifies_60_runtime_files_and_preserves_user_state(self):
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("HMB_RUNTIME_INSTALL_OK", result.stdout)
+        self.assertIn("RUNTIME_FILES=60", result.stdout)
+        receipt = json.loads((self.target / ".hmb-install-receipt.json").read_text("utf-8-sig"))
+        self.assertEqual(receipt["runtime_fingerprint_sha256"], self.fingerprint(self.runtime))
+        self.assertEqual(len(receipt["runtime_files"]), 60)
+        self.assertTrue(receipt["native_editor_patch"]["changed"])
+        self.assertEqual(self.native.read_bytes(), self.native_candidate)
+        installed = self.inventory(self.target)
+        for row in self.runtime:
+            self.assertEqual(installed[row["path"]], row["sha256"])
+        for name in ("reports/result.json", ".venv/Scripts/keep.bin", ".venv-tos/Scripts/keep.bin"):
+            self.assertEqual(installed[name], self.before[name])
+        backups = list(self.rollback.glob("v*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(self.inventory(backups[0]), {name: value for name, value in self.before.items()
+                                                     if name in ("old-runtime.py", ".hmb-install-receipt.json")})
 
 
 if __name__=="__main__":

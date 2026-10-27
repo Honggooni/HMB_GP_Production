@@ -12,6 +12,11 @@ function fakeClassList() {
     add(...items) { items.forEach((item) => values.add(item)); },
     remove(...items) { items.forEach((item) => values.delete(item)); },
     contains(item) { return values.has(item); },
+    toggle(item, force) {
+      const next = force === undefined ? !values.has(item) : Boolean(force);
+      if (next) values.add(item); else values.delete(item);
+      return next;
+    },
   };
 }
 
@@ -186,8 +191,10 @@ assert.match(
   "Agent remount replaces stale gesture blockers with its nodrag-only background.",
 );
 assert.doesNotMatch(agentGestureContainer.innerHTML, /\bnopan\b|\bnowheel\b/);
-const agentNativeHeader = agentGestureContainer.innerHTML.match(/<header\b[^>]*class="agent-topbar"[^>]*>([\s\S]*?)<\/header>/i);
+const agentNativeHeader = agentGestureContainer.innerHTML.match(/<header\b[^>]*class="agent-topbar(?:\s[^"]*)?"[^>]*>([\s\S]*?)<\/header>/i);
 assert.ok(agentNativeHeader, "The native Agent header must remain present.");
+assert.match(agentNativeHeader[1], /data-hmb-native-identity/);
+assert.match(agentNativeHeader[1], /data-hmb-native-actions/);
 assert.doesNotMatch(agentNativeHeader[1], /<(?:select|button)\b/i,
   "Ordinary native header controls must not be reintroduced by legacy recovery.");
 assert.doesNotMatch(agentGestureContainer.innerHTML,
@@ -211,6 +218,17 @@ assert.equal(
   "Agent interior pointerdown must stay local so only the native title bar selects the node.",
 );
 assert.equal(agentGestureRoot.handler("pointerdown"), undefined);
+agentGestureContainer.__hmbAgentNativeHeaderActive = true;
+agentWidget.hmbPrepareAgentCanvasGestures(agentGestureContainer);
+for (const element of [agentGestureContainer, agentGestureRoot]) {
+  assert.equal(element.classList.contains("nodrag"), false, "An active native Agent header retains host dragging.");
+  assert.equal(element.classList.contains("nopan"), false);
+  assert.equal(element.classList.contains("nowheel"), false);
+}
+agentGestureContainer.__hmbAgentNativeHeaderActive = false;
+agentWidget.hmbPrepareAgentCanvasGestures(agentGestureContainer);
+assert.ok(agentGestureContainer.classList.contains("nodrag"));
+assert.ok(agentGestureRoot.classList.contains("nodrag"));
 let agentPointerStops = 0;
 agentGestureContainer.handler("pointerdown")({ button: 1, stopPropagation() { agentPointerStops += 1; } });
 assert.equal(agentPointerStops, 0, "The Agent header must pass middle-button pan to the native canvas.");
@@ -342,7 +360,12 @@ const pickerGuardDashboard = fakeElement(pickerGuardClip, "hmbvp");
 const pickerGuardControl = fakeElement(pickerGuardDashboard, "picker-control");
 const pickerBroadPanel = fakeElement(pickerGuardDashboard, "right-stack");
 pickerGuardDashboard.closest = () => null;
-pickerGuardControl.closest = () => pickerGuardControl;
+pickerGuardControl.closest = (selector) => (
+  String(selector).includes("data-hmb-native-identity")
+    || String(selector).includes("data-hmb-native-actions")
+    ? null
+    : pickerGuardControl
+);
 for (const element of [pickerGuardContainer, pickerGuardClip, pickerGuardDashboard]) {
   element.classList.add("nodrag", "nopan", "nowheel");
 }

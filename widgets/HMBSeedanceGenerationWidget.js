@@ -1,3 +1,55 @@
+// Module-local opt-in to the host's original React header portals. No SDK calls.
+function hmbNativeHeaderTarget(target) {
+  return Boolean(target?.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]"));
+}
+function hmbInstallNativeHeaderBridge(container, nodeType, selector) {
+  const previous = container.__hmbUnifiedNativeHeader;
+  if (previous?.nodeType === nodeType) { previous.refresh(); return previous; }
+  previous?.cleanup();
+  const doc = container.ownerDocument, win = doc?.defaultView || globalThis;
+  const oldContainerNoDrag = Boolean(container.classList?.contains?.("nodrag"));
+  const oldMarker = container.getAttribute?.("data-hmb-color-lut-widget");
+  const oldType = container.getAttribute?.("data-hmb-native-node-type");
+  const roots = new Map();
+  let active = false, disposed = false;
+  const noDrag = (element, value) => { if (Boolean(element?.classList?.contains?.("nodrag")) === value) return; if (value) element?.classList?.add?.("nodrag"); else element?.classList?.remove?.("nodrag"); };
+  const refresh = () => {
+    if (disposed) return;
+    const root = container.querySelector?.(selector);
+    if (root) {
+      if (!roots.has(root)) roots.set(root, Boolean(root.classList?.contains?.("nodrag")));
+      const status = active ? "active" : "fallback";
+      if (root.getAttribute?.("data-hmb-native-header") !== status) root.setAttribute?.("data-hmb-native-header", status);
+      noDrag(root, active ? false : roots.get(root));
+    }
+    noDrag(container, active ? false : oldContainerNoDrag);
+  };
+  const announce = phase => {
+    if (typeof win.CustomEvent === "function") doc?.dispatchEvent?.(new win.CustomEvent(`hmb-color-lut-header-${phase}`, { detail: { container } }));
+  };
+  const state = event => {
+    if (disposed || event.target !== container) return;
+    active = event.detail?.active === true; refresh();
+  };
+  const bridge = { nodeType, get active() { return active; }, refresh, cleanup() {
+    if (disposed) return;
+    announce("retire"); disposed = true; active = false;
+    container.removeEventListener?.("hmb-color-lut-header-state", state);
+    noDrag(container, oldContainerNoDrag);
+    for (const [root, old] of roots) { root.removeAttribute?.("data-hmb-native-header"); noDrag(root, old); }
+    if (oldMarker === null || oldMarker === undefined) container.removeAttribute?.("data-hmb-color-lut-widget");
+    else container.setAttribute?.("data-hmb-color-lut-widget", oldMarker);
+    if (oldType === null || oldType === undefined) container.removeAttribute?.("data-hmb-native-node-type");
+    else container.setAttribute?.("data-hmb-native-node-type", oldType);
+    if (container.__hmbUnifiedNativeHeader === bridge) delete container.__hmbUnifiedNativeHeader;
+  } };
+  container.setAttribute?.("data-hmb-color-lut-widget", "");
+  container.setAttribute?.("data-hmb-native-node-type", nodeType);
+  container.addEventListener?.("hmb-color-lut-header-state", state);
+  container.__hmbUnifiedNativeHeader = bridge;
+  refresh(); announce("ready"); return bridge;
+}
+
 const HMB_SHOT_ONLY_KEY = "__hmb_shot_only__";
 const HMB_SHOT_WAITING_KEY = "__hmb_shot_waiting__";
 const HMB_SEEDANCE_MODE_SELECTION_SCHEMA = "hmb-seedance-mode-selection";
@@ -581,10 +633,10 @@ function render(state) {
   const theme = SHOT_THEME[number];
   return `
     <style>
-      .hmb-seedance-shot :is(button,input,select,textarea){font-family:inherit}
+      .hmb-seedance-shot :is(button,input,select,textarea):not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)){font-family:inherit}
       .hmb-seedance-preview-overlay :is(button,input,select,textarea){font-family:inherit}
       .hmb-seedance-shot{--shot-accent:${accent};--shot-rgb:${theme.rgb};--shot-soft:${theme.soft};position:relative;width:100%;height:64px;overflow:hidden;box-sizing:border-box;border:1px solid rgba(var(--shot-rgb),.5);border-radius:11px;background:radial-gradient(circle at 8% -45%,rgba(var(--shot-rgb),.25),transparent 54%),linear-gradient(90deg,rgba(var(--shot-rgb),.2),rgba(14,23,38,.96) 46%,#060912);color:#e6edf7;box-shadow:inset 0 1px 0 rgba(255,255,255,.04),0 8px 24px rgba(0,0,0,.24),0 0 18px rgba(var(--shot-rgb),.18);font-family:"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif;user-select:none}
-      .hmb-seedance-shot *{box-sizing:border-box;min-width:0}.hmb-seedance-shot__row{height:100%;display:flex;align-items:center;gap:11px;padding:8px 13px}.hmb-seedance-shot__mark{flex:0 0 35px;width:35px;height:35px;display:grid;place-items:center;border:1px solid rgba(var(--shot-rgb),.52);border-radius:8px;background:linear-gradient(145deg,rgba(var(--shot-rgb),.14),rgba(5,9,16,.86));color:var(--shot-accent);box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 0 12px rgba(var(--shot-rgb),.19);font-size:9px;font-weight:950;letter-spacing:.06em}.hmb-seedance-shot__title{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#e6edf7;font-size:14px;font-weight:850}.hmb-seedance-shot__status{flex:0 1 190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fb7185;font-size:8px;font-weight:800;text-align:right}.hmb-seedance-shot__status:empty{display:none}.hmb-seedance-shot__select{flex:0 1 210px;width:210px;height:29px;margin-left:auto;padding:0 28px 0 10px;border:1px solid rgba(var(--shot-rgb),.52);border-radius:7px;outline:none;background:linear-gradient(180deg,rgba(255,255,255,.04),transparent),rgba(var(--shot-rgb),.16);color:var(--shot-soft);box-shadow:inset 0 1px 0 rgba(255,255,255,.045),0 0 12px rgba(var(--shot-rgb),.18);font:inherit;font-size:10px;font-weight:850;letter-spacing:.035em}.hmb-seedance-shot__select:focus{border-color:var(--shot-accent);box-shadow:0 0 0 2px rgba(var(--shot-rgb),.18)}.hmb-seedance-shot__select option{background:#0b1020;color:#e6edf7}@container(max-width:360px){.hmb-seedance-shot__status{display:none}.hmb-seedance-shot__select{flex-basis:120px;width:120px}.hmb-seedance-shot__title{font-size:12px}}
+      .hmb-seedance-shot *:not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)){box-sizing:border-box;min-width:0}.hmb-seedance-shot__row{height:100%;display:flex;align-items:center;gap:11px;padding:8px 13px}.hmb-seedance-shot__mark{flex:0 0 35px;width:35px;height:35px;display:grid;place-items:center;border:1px solid rgba(var(--shot-rgb),.52);border-radius:8px;background:linear-gradient(145deg,rgba(var(--shot-rgb),.14),rgba(5,9,16,.86));color:var(--shot-accent);box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 0 12px rgba(var(--shot-rgb),.19);font-size:9px;font-weight:950;letter-spacing:.06em}.hmb-seedance-shot__title{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#e6edf7;font-size:14px;font-weight:850}.hmb-seedance-shot__status{flex:0 1 190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fb7185;font-size:8px;font-weight:800;text-align:right}.hmb-seedance-shot__status:empty{display:none}.hmb-seedance-shot__select{flex:0 1 210px;width:210px;height:29px;margin-left:auto;padding:0 28px 0 10px;border:1px solid rgba(var(--shot-rgb),.52);border-radius:7px;outline:none;background:linear-gradient(180deg,rgba(255,255,255,.04),transparent),rgba(var(--shot-rgb),.16);color:var(--shot-soft);box-shadow:inset 0 1px 0 rgba(255,255,255,.045),0 0 12px rgba(var(--shot-rgb),.18);font:inherit;font-size:10px;font-weight:850;letter-spacing:.035em}.hmb-seedance-shot__select:focus{border-color:var(--shot-accent);box-shadow:0 0 0 2px rgba(var(--shot-rgb),.18)}.hmb-seedance-shot__select option{background:#0b1020;color:#e6edf7}@container(max-width:360px){.hmb-seedance-shot__status{display:none}.hmb-seedance-shot__select{flex-basis:120px;width:120px}.hmb-seedance-shot__title{font-size:12px}}
       /* Match the Prompt header while preserving the existing selector position and responsive width. */
       .hmb-seedance-shot__title{font-size:15px;font-weight:800;letter-spacing:.01em;line-height:normal}
       .hmb-seedance-shot__select{height:44px;font-size:13px;font-weight:800;line-height:normal}
@@ -610,12 +662,22 @@ function render(state) {
       .hmb-seedance-preview-overlay__action{margin-top:5px;padding:7px 11px;border:1px solid rgba(var(--shot-rgb),.7);border-radius:7px;background:rgba(var(--shot-rgb),.2);color:var(--shot-soft);font:inherit;font-size:10px;font-weight:850;cursor:pointer;pointer-events:auto}
       .hmb-seedance-preview-overlay__action:hover{background:rgba(var(--shot-rgb),.34)}.hmb-seedance-preview-overlay__action:disabled{cursor:wait;opacity:.55}
       .react-flow__edge[${HMB_SEEDANCE_PROMPT_EDGE_ATTRIBUTE}="true"]{display:none!important}
+      /* HMB_NATIVE_HEADER_SLOTS_BEGIN */
+      .hmb-seedance-shot__native-identity,.hmb-seedance-shot__native-actions{display:none;min-width:0;--node-header-text:#e6edf7}
+      .hmb-seedance-shot[data-hmb-native-header=active]{border:0;border-radius:0;box-shadow:none}
+      .hmb-seedance-shot[data-hmb-native-header=active] .hmb-seedance-shot__mark,.hmb-seedance-shot[data-hmb-native-header=active] .hmb-seedance-shot__title{display:none}
+      .hmb-seedance-shot[data-hmb-native-header=active] .hmb-seedance-shot__native-identity{display:flex;align-items:center;flex:1 1 auto}
+      .hmb-seedance-shot[data-hmb-native-header=active] .hmb-seedance-shot__native-actions{display:flex;align-items:center;flex:0 0 auto}
+      .hmb-seedance-shot__native-identity>div{min-width:0;max-width:100%}
+      /* HMB_NATIVE_HEADER_SLOTS_END */
       @keyframes hmb-seedance-preview-spin{to{transform:rotate(360deg)}}
     </style>
     <div class="hmb-seedance-shot nodrag" data-shot-number="${number}">
-      <div class="hmb-seedance-shot__row">
+      <div class="hmb-seedance-shot__row group">
         <div class="hmb-seedance-shot__mark" aria-hidden="true">SD</div>
         <div class="hmb-seedance-shot__title">HMBSeedanceGeneration</div>
+        <div class="hmb-seedance-shot__native-identity" data-hmb-native-identity></div>
+        <div class="hmb-seedance-shot__native-actions nodrag" data-hmb-native-actions></div>
         <span class="hmb-seedance-shot__status" role="status" aria-live="polite" aria-atomic="true"></span>
         <button type="button" class="hmb-seedance-shot__final nodrag" data-hmb-seedance-finalize-draft hidden disabled title="완료된 Draft로 현재 Generator만 1회 실행해 1080p로 받습니다. 현재 프롬프트·소스·설정은 다시 전송하지 않으며 Agent도 재실행하지 않습니다. MOV 기본 · MOV 미지원 시 MP4.">Draft final</button>
         <span class="hmb-seedance-shot__number" data-seedance-shot-number>${hmbSeedanceShotBadge(state)}</span>
@@ -2214,6 +2276,7 @@ function hmbSeedanceNodeSelected(root) {
 
 export function hmbGuardSelectedNodeKeyboardDelete(container, event) {
   if (!["Backspace", "Delete"].includes(event?.key)) return false;
+  if (container?.ownerDocument?.documentElement?.getAttribute?.("data-hmb-native-deletion-guard") === "engine-preflight") return false;
   if (event?.target?.closest?.("[data-hmb-node-delete-protected='true']")) return false;
   if (event?.target?.closest?.(
     "input,textarea,select,[contenteditable='true'],[contenteditable=''],[role='textbox'],.CodeMirror,.cm-editor",
@@ -2254,6 +2317,7 @@ function refresh(container, props) {
   installPreviewObserver(container);
   hmbSeedanceSyncRemotePromptEdge(container, state);
   container.__hmbSeedanceFlushShotQueue?.();
+  container.__hmbUnifiedNativeHeader?.refresh();
   return true;
 }
 
@@ -2370,6 +2434,9 @@ function hmbSeedanceResolveShotEcho(container, incomingProps) {
 }
 
 const HMB_SEEDANCE_PREFLIGHT_SCHEMA = "hmb-seedance-render-preflight";
+// A document can display one preflight owner. Retiring the old owner also
+// retires its timers/results before another Generator opens the same dialog.
+const HMB_SEEDANCE_PREFLIGHT_DIALOGS = new WeakMap();
 
 export function hmbSeedancePreflightReport(props) {
   const raw=props?.value ?? props?.parameterValue ?? props?.defaultValue ?? {};
@@ -2414,9 +2481,26 @@ function hmbSeedancePreflightWidget(container,initialProps) {
   const summaryText=()=>pending?"로컬 상태 점검 중…":report.phase==="complete"?(report.ok?(report.rows.some(row=>row.status==="warning") || report.issues.some(item=>item.severity==="warning")?"로컬 오류 없음 · 경고 확인":"로컬 오류 없음 · 결과 보기"):"확인할 항목 있음 · 결과 보기"):report.phase==="stale"?"선택 변경 · 다시 점검":"생성 없이 연결·입력 확인";
   const syncSummary=()=>{const text=summaryText();if(summary.textContent!==text)summary.textContent=text;};
   const stop=()=>{if(!pending)return;for(const id of pending.frames)win.cancelAnimationFrame(id);win.clearTimeout(pending.fallback);win.clearTimeout(pending.timeout);retired.add(pending.id);while(retired.size>256)retired.delete(retired.values().next().value);pending=null;};
-  const close=()=>{if(!dialog)return;dialog.remove();dialog=null;stop();syncSummary();};
+  const focusDialog=selector=>{
+    const target=dialog?.querySelector(selector || "[data-preflight-cancel],[data-preflight-recheck],[data-preflight-close]");
+    target?.focus?.({preventScroll:true});
+  };
+  const containFocus=event=>{
+    if(!disposed && dialog && HMB_SEEDANCE_PREFLIGHT_DIALOGS.get(doc)===close && !dialog.contains(event.target))focusDialog();
+  };
+  const close=(options={})=>{
+    if(!dialog)return;
+    const owns=HMB_SEEDANCE_PREFLIGHT_DIALOGS.get(doc)===close;
+    if(owns)HMB_SEEDANCE_PREFLIGHT_DIALOGS.delete(doc);
+    doc.removeEventListener("focusin",containFocus,true);
+    dialog.remove();dialog=null;stop();syncSummary();
+    if(!disposed && owns && options.restoreFocus!==false && openButton.isConnected)openButton.focus?.({preventScroll:true});
+  };
   const renderDialog=()=>{
     if(!dialog)return;
+    const active=doc.activeElement,hadFocus=dialog.contains(active);
+    const focusSelector=["data-preflight-close","data-preflight-cancel","data-preflight-recheck"].find(name=>active?.hasAttribute?.(name));
+    const scrollTop=dialog.querySelector(".hmb-preflight-scroll")?.scrollTop || 0;
     const rows=report.rows.map(row=>`<tr data-preflight-row="${row.number}" style="--preflight-accent:${HMB_SEEDANCE_JEWEL_NIGHT_PALETTE[row.number]}"><th scope="row"><b>${escapeHtml(String(row.number).padStart(2,"0"))} · ${escapeHtml(row.name)}</b><small>${escapeHtml(row.generator)}</small></th><td>${escapeHtml(row.model)}<small>${escapeHtml(row.task)} · ${escapeHtml(row.resolution)}</small></td><td>이미지 ${Number.isInteger(row.media.images)?row.media.images:"미확인"} · 영상 ${Number.isInteger(row.media.videos)?row.media.videos:"미확인"} · 오디오 ${Number.isInteger(row.media.audio)?row.media.audio:"미확인"}<small>${escapeHtml(row.connections)}</small></td><td>${escapeHtml(row.output || "—")}</td><td data-preflight-status="${row.status}"><b>${({ready:"로컬 확인",warning:"주의",error:"확인 필요"})[row.status]}</b>${row.issues.filter(item=>item.severity!=="info").map(item=>`<small>${escapeHtml(item.message)}</small>`).join("")}</td></tr>`).join("");
     dialog.innerHTML=`<style>
       .hmb-preflight-backdrop{position:fixed;inset:0;z-index:2147483001;display:grid;place-items:center;padding:20px;background:rgba(1,5,14,.78);font-family:Inter,"Noto Sans KR",system-ui,sans-serif;color:#e7edf7}
@@ -2429,6 +2513,8 @@ function hmbSeedancePreflightWidget(container,initialProps) {
       const previous=pending;stop();report={...report,phase:"cancelled",rows:[],issues:[{severity:"info",message:"점검을 취소했습니다. 생성 작업에는 영향이 없습니다."}]};renderDialog();syncSummary();
       if(previous?.dispatched && typeof props.onChange==="function")try{Promise.resolve(props.onChange({schema:HMB_SEEDANCE_PREFLIGHT_SCHEMA,version:1,action:"cancel",request_id:previous.id,client_session:clientSession,sequence:previous.sequence})).catch(()=>{});}catch{}
     });
+    const scroll=dialog.querySelector(".hmb-preflight-scroll");if(scroll)scroll.scrollTop=scrollTop;
+    if(hadFocus)focusDialog(focusSelector && dialog.querySelector(`[${focusSelector}]`)?`[${focusSelector}]`:null);
   };
   const inspect=()=>{
     if(disposed || pending)return;
@@ -2437,7 +2523,28 @@ function hmbSeedancePreflightWidget(container,initialProps) {
     const dispatch=()=>{if(disposed || pending!==ticket || ticket.dispatched)return;ticket.dispatched=true;win.clearTimeout(ticket.fallback);try{if(typeof props.onChange!=="function")throw Error("No transport");Promise.resolve(props.onChange({schema:HMB_SEEDANCE_PREFLIGHT_SCHEMA,version:1,action:"inspect",request_id:id,client_session:clientSession,sequence:ticket.sequence})).catch(fail);}catch{fail();}};
     ticket.frames.push(win.requestAnimationFrame(()=>{if(!disposed && pending===ticket)ticket.frames.push(win.requestAnimationFrame(dispatch));}));ticket.fallback=win.setTimeout(dispatch,120);ticket.timeout=win.setTimeout(fail,10000);
   };
-  const open=()=>{if(disposed)return;if(!dialog){dialog=doc.createElement("div");dialog.className="hmb-preflight-backdrop nodrag";doc.body.appendChild(dialog);dialog.addEventListener("click",event=>{if(event.target===dialog)close();});dialog.addEventListener("keydown",event=>{event.stopPropagation?.();if(event.key==="Escape")close();});}renderDialog();if(!report.rows.length)inspect();};
+  const open=()=>{
+    if(disposed)return;
+    if(!dialog){
+      const previous=HMB_SEEDANCE_PREFLIGHT_DIALOGS.get(doc);if(previous && previous!==close)previous({restoreFocus:false});
+      dialog=doc.createElement("div");dialog.className="hmb-preflight-backdrop nodrag";doc.body.appendChild(dialog);
+      HMB_SEEDANCE_PREFLIGHT_DIALOGS.set(doc,close);
+      dialog.addEventListener("pointerdown",event=>event.stopPropagation?.());
+      dialog.addEventListener("click",event=>{event.stopPropagation?.();if(event.target===dialog)close();});
+      dialog.addEventListener("keydown",event=>{
+        event.stopPropagation?.();
+        if(event.key==="Escape"){event.preventDefault?.();close();return;}
+        if(event.key!=="Tab")return;
+        const controls=Array.from(dialog.querySelectorAll("button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex='-1'])"));
+        if(!controls.length)return;
+        const index=controls.indexOf(doc.activeElement);
+        if(event.shiftKey && index<=0){event.preventDefault?.();controls.at(-1).focus?.({preventScroll:true});}
+        else if(!event.shiftKey && (index<0 || index===controls.length-1)){event.preventDefault?.();controls[0].focus?.({preventScroll:true});}
+      });
+      doc.addEventListener("focusin",containFocus,true);
+    }
+    renderDialog();if(!report.rows.length)inspect();focusDialog();
+  };
   const isolate=event=>{if(Number(event.button)!==1)event.stopPropagation?.();};
   openButton.addEventListener("click",open);container.addEventListener?.("pointerdown",isolate);
   const handle={update(next){if(disposed)return;props=next || props;const incoming=hmbSeedancePreflightReport(props);if(!pending || !["complete","stale","cancelled"].includes(incoming.phase) || retired.has(incoming.request_id) || incoming.request_id!==pending.id)return;stop();report=incoming;renderDialog();syncSummary();},cleanup(){if(disposed)return;disposed=true;close();stop();openButton.removeEventListener("click",open);container.removeEventListener?.("pointerdown",isolate);delete container.__hmbSeedancePreflightHandle;container.innerHTML="";}};
@@ -2487,6 +2594,7 @@ function hmbNativeUiImplementation(container, props) {
   compactHost(container);
   const initialState = hmbSeedanceShotState(resolved.props);
   container.innerHTML = render(initialState);
+  const nativeHeader = hmbInstallNativeHeaderBridge(container, "HMBSeedanceGeneration", ".hmb-seedance-shot");
   hmbSeedanceSyncDraftAction(container, initialState);
   hmbSeedanceSyncPreviewOverlay(container, initialState);
   installPreviewObserver(container);
@@ -2608,19 +2716,23 @@ function hmbNativeUiImplementation(container, props) {
     onShotChange();
   };
   select?.addEventListener?.("change", onShotChange);
-  const guardDelete = (event) => hmbGuardSelectedNodeKeyboardDelete(container, event);
+  const guardDelete = (event) => { if (!hmbNativeHeaderTarget(event.target)) hmbGuardSelectedNodeKeyboardDelete(container, event); };
   if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
     window.addEventListener("keydown", guardDelete, true);
   }
   const stopInteriorDelete = (event) => {
+    if (hmbNativeHeaderTarget(event.target)) return;
     if (["Backspace", "Delete"].includes(event?.key)) event.stopPropagation?.();
   };
   const stopInteriorSelection = (event) => {
+    if (hmbNativeHeaderTarget(event.target)) return;
+    if (nativeHeader.active && !event.target?.closest?.("button,input,select,textarea")) return;
     if (Number(event?.button) !== 1) event.stopPropagation?.();
   };
   container.addEventListener?.("keydown", stopInteriorDelete);
   container.addEventListener?.("pointerdown", stopInteriorSelection);
   const cleanup = () => {
+    nativeHeader.cleanup();
     hmbSeedanceCleanupRemotePromptEdge(container);
     hmbSeedanceCleanupPreviewOverlay(container);
     if (typeof window !== "undefined" && typeof window.removeEventListener === "function") {
@@ -2764,7 +2876,7 @@ export default function HMBSeedanceGenerationWidget(container, props) {
   return hmbNativeUiContract(container, props, hmbNativeUiImplementation, { kind: "seedance", allowControl: (target, props) => {
     const el = target?.closest?.("button,input,select,textarea") || target;
     const state = hmbSeedanceShotState(props);
-    return Boolean(el?.matches?.("[data-hmb-seedance-preview-action]") && state.generation.action === "refresh_existing")
+    return hmbNativeHeaderTarget(target) || Boolean(el?.matches?.("[data-hmb-seedance-preview-action]") && state.generation.action === "refresh_existing")
       || Boolean(el?.matches?.("[data-hmb-seedance-finalize-draft]") && state.draft.cancel_available)
       || Boolean(el?.matches?.("[data-preflight-open],[data-preflight-recheck],[data-preflight-cancel],[data-preflight-close]"));
   } });

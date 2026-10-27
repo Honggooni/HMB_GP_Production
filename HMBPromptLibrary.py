@@ -10348,6 +10348,12 @@ class HMBPromptLibrary(DataNode):
         target-side payload.
         """
 
+        from _hmb_connection_management import target_has_suspended_role
+        if target_has_suspended_role(self):
+            # Managed detach retains authored source inputs across cold replay.
+            # Execution is separately fenced by the native request guard.
+            return True
+
         try:
             from griptape_nodes.retained_mode.events.connection_events import (  # type: ignore
                 ListConnectionsForNodeRequest,

@@ -415,20 +415,36 @@ assert.match(
   "Wheel input over the Asset viewport must scroll locally and remain non-passive.",
 );
 assert.doesNotMatch(
-  assetSource,
+  assetModule.hmbInstallImageAssetScrollGestures.toString(),
   /beginMiddlePan|moveMiddlePan|endMiddlePan|setPointerCapture|globalPanTarget|__hmbImageAssetViewportPanning|__hmbImageAssetCancelViewportPan/,
   "The Asset viewport must not own, capture, or mutate middle-button drag state.",
 );
+// The CGT modal is draggable by its left-button title bar. Its local pointer
+// capture is unrelated to the canvas middle-button pan contract above.
+const hierarchyDragSource = assetSource.slice(
+  assetSource.indexOf("function hmbInstallShotHierarchyDragging("),
+  assetSource.indexOf("export function hmbOpenShotHierarchyDialog("),
+);
+assert.match(hierarchyDragSource, /if \(event\.button !== 0 \|\| !event\.target\.closest\?\.\("\[data-hier-drag-handle\]"\)/,
+  "CGT dragging may start only with the left button on its own title bar.");
+assert.match(hierarchyDragSource, /event\.target\.closest\?\.\("button,input,select,a"\)/,
+  "CGT title controls must not start modal dragging.");
+assert.match(hierarchyDragSource, /dialog\.setPointerCapture\?\.\(event\.pointerId\)/,
+  "Only the local CGT dialog owns its drag pointer.");
 assert.doesNotMatch(
   assetSource,
   /on\(assetScroll, "(?:pointerdown|pointermove|pointerup|pointercancel|mousedown|mousemove|mouseup|auxclick)"/,
   "Middle pointer and mouse events over an image card must pass through to Griptape.",
 );
-assert.match(
-  assetSource,
-  /const stopInteriorNodeSelection = \(event\) => \{\s*if \(Number\(event\?\.button\) !== 1\) event\.stopPropagation\(\);\s*\};/,
-  "The generic card pointer guard must pass middle-button input to the canvas while retaining left-click isolation.",
-);
+const assetInteriorGuardSource = assetSource.match(/const stopInteriorNodeSelection = (\(event\) => \{[\s\S]*?\n  \});/)?.[1];
+assert.ok(assetInteriorGuardSource, "The Asset interior pointer guard must remain present.");
+const assetInteriorGuard = new Function(`return ${assetInteriorGuardSource}`)();
+for (const button of [0, 1]) {
+  let stopped = 0;
+  assetInteriorGuard({ button, target: { closest: () => null }, stopPropagation: () => { stopped++; } });
+  assert.equal(stopped, button === 1 ? 0 : 1,
+    "The actual interior guard must pass middle-button input and retain left-click isolation, including native-header exceptions.");
+}
 assert.match(
   assetSource,
   /on\(container, "click", \(event\) => \{[\s\S]*?event\.target\?\.closest\?\.\("\[data-asset-key\]"\)[\s\S]*?toggleDelegatedAsset\(card, asset\);\s*\}\);/,
@@ -835,7 +851,7 @@ assert.doesNotMatch(
   /PROJECT_IDENTITY_SOURCE_AUTHORITY_AND_LANGUAGE|SHOT_ACTIVATION_IDENTIFIERS_IMAGE_AND_MARKER_BINDING/,
   "Agent widget source must not contain internal policy identifiers.",
 );
-assert.match(agentSource, /<b>HMBAgentLibrary<\/b>/, "Agent must use the HMBAgentLibrary title.");
+assert.match(agentSource, /<b>HMB Agent<\/b>/, "Agent must use the approved HMB Agent display title while retaining its node type.");
 assert.doesNotMatch(agentSource, /DISPLAY → FINAL TEXT/, "Agent header must omit the retired subtitle.");
 assert.match(agentSource, /class="hmb-agent-dashboard hmb-agent-shot-accordion nodrag"/,
   "Agent Shot selection must use independent native accordion row widgets.");
@@ -871,13 +887,13 @@ assert.match(
 );
 assert.match(
   agentSource,
-  /for \(const name of \["nopan","nowheel"\]\) if \(container\.classList\?\.contains\(name\)\) container\.classList\.remove\(name\);\s*if \(!container\.classList\?\.contains\("nodrag"\)\) container\.classList\?\.add\("nodrag"\);/,
-  "Agent's persistent host must clear stale blockers without rewriting unchanged gesture classes.",
+  /for \(const name of \["nopan","nowheel"\]\) if \(container\.classList\?\.contains\(name\)\) container\.classList\.remove\(name\);\s*const nativeActive = container\.__hmbAgentNativeHeaderActive === true;\s*container\.classList\?\.toggle\("nodrag", !nativeActive\);/,
+  "Agent's persistent host must clear stale blockers and permit dragging only through its active native header.",
 );
 assert.match(
   agentSource,
-  /for \(const name of \["nopan","nowheel"\]\) if \(root\?\.classList\?\.contains\(name\)\) root\.classList\.remove\(name\);\s*if \(root && !root\.classList\?\.contains\("nodrag"\)\) root\.classList\?\.add\("nodrag"\);/,
-  "Agent's rendered dashboard must also clear stale blockers without repeated class mutations.",
+  /for \(const name of \["nopan","nowheel"\]\) if \(root\?\.classList\?\.contains\(name\)\) root\.classList\.remove\(name\);\s*root\?\.classList\?\.toggle\("nodrag", !nativeActive\);/,
+  "Agent's rendered dashboard must also clear stale blockers and track the same native-header gesture mode.",
 );
 assert.match(
   agentSource,
@@ -896,15 +912,50 @@ assert.doesNotMatch(
   "Agent markup must never ship with a pan or wheel blocker.",
 );
 assert.match(agentSource, /container\.addEventListener\?\.\("pointerdown", stopInteriorNodeSelection\)/);
-assert.match(
-  agentSource,
-  /const stopInteriorNodeSelection = \(event\) => \{\s*if \(Number\(event\?\.button\) !== 1\) event\.stopPropagation\?\.\(\);\s*\};/,
-  "Agent background must pass middle-button pan to Griptape.",
-);
+// Evaluate the current interior handler rather than pinning its former single
+// if-statement: native portal controls and an active title drag surface must
+// reach Griptape, while ordinary body controls retain left-click isolation.
+function assertNativeHeaderInteriorGuard(source, {
+  name, handlerName, nativeTargetName, activeProperty, headerSelector,
+}) {
+  const escaped = handlerName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const handlerSource = source.match(new RegExp(`const ${escaped} = (\\(event\\) => \\{[\\s\\S]*?\\n  \\});`))?.[1];
+  assert.ok(handlerSource, `${name} must retain its actual interior pointer handler.`);
+  const targetSource = source.match(new RegExp(`function ${nativeTargetName}\\(target\\) \\{([\\s\\S]*?)\\n\\}`))?.[1];
+  assert.ok(targetSource, `${name} must retain the bounded native-header target helper.`);
+  assert.match(targetSource, /\[data-hmb-native-identity\],\[data-hmb-native-actions\]/,
+    `${name} may bypass body isolation only for the native identity/action slots.`);
+  const nativeTarget = new Function("target", targetSource);
+  const container = { [activeProperty]: false }, nativeHeader = { active: false };
+  const handler = new Function("container", "nativeHeader", nativeTargetName, `return ${handlerSource}`)(container, nativeHeader, nativeTarget);
+  const target = (kind) => ({ closest(selector) {
+    if (selector === "[data-hmb-native-identity],[data-hmb-native-actions]") return kind === "native" ? this : null;
+    if (selector === headerSelector) return ["header", "control"].includes(kind) ? this : null;
+    if (selector === "button,input,select,textarea,label,a" || selector === "button,input,select,textarea") return kind === "control" ? this : null;
+    return null;
+  } });
+  for (const active of [false, true]) {
+    container[activeProperty] = active; nativeHeader.active = active;
+    for (const kind of ["body", "header", "control", "native"]) for (const button of [0, 1]) {
+      let stopped = 0;
+      handler({ button, target: target(kind), stopPropagation: () => { stopped++; } });
+      const nativePass = kind === "native" || active && (kind === "header" || !headerSelector && kind === "body");
+      assert.equal(stopped, button === 1 || nativePass ? 0 : 1,
+        `${name}: middle-button pan, native slots and active header drag must pass; body/control left clicks remain isolated (${active}/${kind}/${button}).`);
+    }
+  }
+}
+assertNativeHeaderInteriorGuard(agentSource, {
+  name: "Agent", handlerName: "stopInteriorNodeSelection", nativeTargetName: "hmbAgentNativeHeaderTarget",
+  activeProperty: "__hmbAgentNativeHeaderActive", headerSelector: ".agent-topbar",
+});
+const agentNativeDragRules = /\.hmb-agent-dashboard\[data-hmb-native-header="active"\] \.agent-topbar(?::active)?\{cursor:(?:grab|grabbing)\}/g;
+assert.equal([...agentSource.matchAll(agentNativeDragRules)].length, 2,
+  "Only the active native title has its explicit grab/grabbing cursor pair.");
 assert.doesNotMatch(
-  agentSource,
+  agentSource.replace(agentNativeDragRules, ""),
   /(?:^|[;{])\s*cursor\s*:|pointer-events\s*:/m,
-  "Agent must inherit Griptape's native grab/grabbing cursor and pointer hit testing.",
+  "The remaining Agent body must inherit native cursor and hit testing; no broad pointer/cursor override is allowed.",
 );
 assert.doesNotMatch(agentSource, /<select\b[^>]*class="agent-shot-select\b/i,
   "The singleton Agent must not render the retired header Shot selector.");
@@ -1503,16 +1554,14 @@ assert.match(
   /stopInteriorNodeSelection/,
   "Prompt interior clicks must not select or resize the node; the native title bar owns activation.",
 );
-assert.match(
-  promptSource,
-  /const stopInteriorNodeSelection = \(event\) => \{\s*if \(Number\(event\?\.button\) !== 1\) event\.stopPropagation\?\.\(\);\s*\};/,
-  "Prompt background must pass middle-button pan to Griptape.",
-);
-assert.match(
-  seedanceSource,
-  /const stopInteriorSelection = \(event\) => \{\s*if \(Number\(event\?\.button\) !== 1\) event\.stopPropagation\?\.\(\);\s*\};/,
-  "Seedance background must pass middle-button pan to Griptape.",
-);
+assertNativeHeaderInteriorGuard(promptSource, {
+  name: "Prompt", handlerName: "stopInteriorNodeSelection", nativeTargetName: "hmbPromptNativeHeaderTarget",
+  activeProperty: "__hmbPromptNativeHeaderActive", headerSelector: ".topbar",
+});
+assertNativeHeaderInteriorGuard(seedanceSource, {
+  name: "Seedance", handlerName: "stopInteriorSelection", nativeTargetName: "hmbNativeHeaderTarget",
+  activeProperty: "unused", headerSelector: "",
+});
 assert.match(promptSource, /container\.querySelector\?\.\("\.image-card"\)/);
 assert.match(
   promptSource,
@@ -1529,13 +1578,36 @@ assert.match(
   /delegatedEvents\.forEach\(\(eventName\) => \{/,
   "Picker controls must keep delegated node/canvas pointer isolation.",
 );
-for (const source of [videoSource, promptSource]) {
-  assert.match(
-    source,
-    /element\.classList\?\.add\("nodrag", "nopan", "nowheel"\);/,
-    "Concrete controls must retain their native pointer and wheel behavior.",
-  );
-}
+assert.match(
+  pickerModule.hmbInstallPickerInteractionIsolation.toString(),
+  /element\.classList\?\.add\("nodrag", "nopan", "nowheel"\);/,
+  "Picker concrete controls retain their native pointer and wheel behavior.",
+);
+assert.match(
+  promptModule.hmbInstallPromptInteractionIsolation.toString(),
+  /const missing = \["nodrag", "nopan", "nowheel"\]\.filter\(name => !element\.classList\?\.contains\?\.\(name\)\);\s*if \(missing\.length\) element\.classList\?\.add\(\.\.\.missing\);/,
+  "Prompt preserves all three native gesture classes without rewriting classes already present.",
+);
+const promptIsolationClasses = new Set(["nodrag"]);
+const promptIsolationClassWrites = [];
+const promptIsolationControl = {
+  classList: {
+    contains(name) { return promptIsolationClasses.has(name); },
+    add(...names) { promptIsolationClassWrites.push(names); names.forEach(name => promptIsolationClasses.add(name)); },
+  },
+  closest() { return null; },
+  addEventListener() {},
+};
+const promptIsolationContainer = {
+  classList: { remove() {} }, querySelector() { return null; },
+  querySelectorAll(selector) { return selector === "input" ? [promptIsolationControl] : []; },
+};
+const promptIsolationListeners = [];
+promptModule.hmbInstallPromptInteractionIsolation(promptIsolationContainer, promptIsolationListeners, false);
+promptModule.hmbInstallPromptInteractionIsolation(promptIsolationContainer, promptIsolationListeners, false);
+assert.deepEqual([...promptIsolationClasses].sort(), ["nodrag", "nopan", "nowheel"].sort());
+assert.deepEqual(promptIsolationClassWrites, [["nopan", "nowheel"]], "Only the missing gesture classes are written once.");
+assert.equal(promptIsolationListeners.length, 4, "Repeated isolation retains one set of pointer listeners.");
 assert.match(videoSource, /class="hmbvp-clip nodrag"/);
 assert.ok(
   (promptSource.match(/"lostpointercapture", (?:cancelHandler|cancelDrag)/g) || []).length >= 3,
