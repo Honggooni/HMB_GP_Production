@@ -300,7 +300,7 @@ function hmbNativeGuardNodeDeletion(changes, nodes, apply) {
       if (result?.protection_ready !== true || result?.protection_version !== 2) {
         release();
         ig.warning("삭제 보호를 다시 시작해야 합니다", {
-          description: result?.readiness_error || "HMB 삭제 보호 코드가 현재 엔진과 일치하지 않습니다. 작업을 저장하고 Griptape를 완전히 종료한 뒤 다시 시작하세요. 통합 UI가 적용되지 않았다면 Runtime ZIP의 공식 설치기를 실행하세요. 노드와 결과는 유지됩니다.",
+          description: result?.readiness_error || "HMB 삭제 보호 코드가 현재 엔진과 일치하지 않습니다. Override 업데이트 로그를 확인하고 작업을 저장한 뒤 Griptape를 완전히 종료하고 다시 시작하세요. 자동 적용 실패 또는 상태 확인 불가 시 HMB 업데이트 로그의 원인을 확인하세요. 노드와 결과는 유지됩니다.",
           duration: 8000,
         });
         return;

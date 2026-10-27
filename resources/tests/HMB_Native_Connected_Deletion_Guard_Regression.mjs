@@ -103,6 +103,7 @@ for (const result of [
   check(h.calls.length === 1 && h.calls[0][0] === "request", "Old or unready protection never dispatches a destructive request");
   check(h.notices.length === 1 && h.notices[0][0] === "삭제 보호를 다시 시작해야 합니다", "A stale engine has an explicit restart requirement");
   if (result.readiness_error) check(h.notices[0][1].description === result.readiness_error, "Exact readiness diagnostic is preserved");
+  else check(/Override.*로그/.test(h.notices[0][1].description) && !/ZIP|\.ps1|공식 설치기/i.test(h.notices[0][1].description), "A legacy acknowledgement explains Override/logs and normal restart without a ZIP installer requirement");
 }
 {
   const h = harness(); let resolve;

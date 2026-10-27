@@ -3,9 +3,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
-import os from 'node:os';
-import path from 'node:path';
-import {createRequire} from 'node:module';
+import {nativeTestPlaywright} from './_hmb_native_editor_fixture.mjs';
 import * as widget from '../../widgets/HMBImageBashWidget.js';
 
 const schema=widget.HMB_IMAGE_BASH_HEADER_SCHEMA;
@@ -32,8 +30,7 @@ assert.equal(widget.hmbImageBashEdgeMatches(element(contextId,'Edge from Library
 assert.equal(widget.hmbImageBashEdgeMatches(element(contextId,'Edge from Library A to BashNode'),{...route,connected:false},'context'),false);
 assert.equal(widget.hmbImageBashHeaderRoute({...route,source_parameter:'Other'}).connected,false);
 
-const require=createRequire(import.meta.url);
-const playwright=require(path.join(os.homedir(),'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'));
+const playwright=nativeTestPlaywright();
 const widgetSource=fs.readFileSync(new URL('../../widgets/HMBImageBashWidget.js',import.meta.url),'utf8');
 const encodedState=JSON.stringify(state).replaceAll('<','\\u003c');
 const html=`<!doctype html><meta charset="utf-8"><title>Offline HMB Image Bash header fixture</title>

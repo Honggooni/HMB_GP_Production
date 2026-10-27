@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import struct
 import subprocess
 import tempfile
 import uuid
@@ -35,6 +36,8 @@ SUPPORTED_PREVIOUS_CANDIDATE_SHA256 = "7bad6f6517c781c54e6d2e0cf170f0b2ed3bdef28
 SUPPORTED_PREVIOUS_HELPER_SHA256 = "39e5901cc8aa37d1d11850a255bcc209ab4724afe488817fc3f684a72ab01b63"
 SUPPORTED_CURRENT_CANDIDATE_SHA256 = "93b497d21995e23ef6707f0d3a3d39dd897a76d0388f7d7c9677d5cd54ef57c1"
 SUPPORTED_CURRENT_HELPER_SHA256 = "2ed5f48b1c454039e84d9cba7499e290111e1d9f1038b157c0391aae794903f8"
+SUPPORTED_RECENT_CANDIDATE_SHA256 = "5e358586ae4b47fd698225c640fb65a4ed5b53dd27a398aa291b0606501e3131"
+SUPPORTED_RECENT_HELPER_SHA256 = "34657ae82e7862d3c5fa798184623369537d798fe0b4baa313188e33fb15cec6"
 HELPER = REPO / "resources/editor/hmb-color-lut-native-header.js"
 DEFAULT_SOURCE = Path(os.environ.get("LOCALAPPDATA", "")) / (
     "ai.griptape.nodes.desktop/current/resources/editor-bundle/assets/" + EXPECTED_BUNDLE_NAME
@@ -42,6 +45,10 @@ DEFAULT_SOURCE = Path(os.environ.get("LOCALAPPDATA", "")) / (
 REPORT_DIR = REPO / "reports/color-lut-native-header-20261023"
 RELEASE_DESCRIPTOR = REPO / "resources/editor/native-editor-patch.json"
 RELEASE_STATE_ROOT = Path(os.environ.get("LOCALAPPDATA", "")) / "HMB_GP_Production/native-editor-installs"
+
+
+class NativeEditorWriteBusy(RuntimeError):
+    """A cooperating installer already owns the native editor write boundary."""
 
 
 def sha256(value: bytes | str) -> str:
@@ -408,15 +415,18 @@ def _release_descriptor() -> tuple[dict, str]:
 
 
 def _release_previous_candidates(descriptor: dict) -> list[dict]:
-    """Accept the original single predecessor or the exact two-release chain."""
+    """Accept only the pinned three-release chain and its released old schemas."""
     older = {"bundle_sha256": SUPPORTED_PREVIOUS_CANDIDATE_SHA256,
              "helper_sha256": SUPPORTED_PREVIOUS_HELPER_SHA256}
     recent = {"bundle_sha256": SUPPORTED_CURRENT_CANDIDATE_SHA256,
               "helper_sha256": SUPPORTED_CURRENT_HELPER_SHA256}
+    latest = {"bundle_sha256": SUPPORTED_RECENT_CANDIDATE_SHA256,
+              "helper_sha256": SUPPORTED_RECENT_HELPER_SHA256}
     if "previous_candidates" in descriptor:
-        if "previous_candidate" in descriptor or descriptor["previous_candidates"] != [recent, older]:
+        candidates = descriptor["previous_candidates"]
+        if "previous_candidate" in descriptor or candidates not in ([latest, recent, older], [recent, older]):
             raise ValueError("Unsupported previous native editor candidates.")
-        return [recent, older]
+        return list(candidates)
     if "previous_candidate" in descriptor:
         if descriptor["previous_candidate"] != older:
             raise ValueError("Unsupported previous native editor candidate.")
@@ -603,7 +613,7 @@ def _release_write_lock():
                 fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             acquired = True
         except OSError:
-            raise RuntimeError("Another native editor write is in progress; no editor file was changed.") from None
+            raise NativeEditorWriteBusy("Another native editor write is in progress; no editor file was changed.") from None
         try:
             yield
         finally:
@@ -732,6 +742,147 @@ def rollback_release_install(path: Path) -> dict:
         return _rollback_release_install_unlocked(path)
 
 
+def _git_override_app_identity() -> dict:
+    """Read the packaged-app prefix only; never write or extract app.asar."""
+    resources = _release_plain_path(DEFAULT_SOURCE.parents[2])
+    if DEFAULT_SOURCE != resources / "editor-bundle/assets" / EXPECTED_BUNDLE_NAME:
+        raise ValueError("Git override target is outside the fixed packaged editor location.")
+    archive = _release_plain_path(resources / "app.asar")
+    info = archive.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("Packaged Griptape app.asar is not a regular file.")
+    with archive.open("rb") as stream:
+        prefix = stream.read(16)
+    if len(prefix) != 16:
+        raise ValueError("Packaged Griptape app.asar prefix is invalid.")
+    size_pickle, header_size, header_pickle, json_size = struct.unpack("<4I", prefix)
+    if (size_pickle != 4 or not 0 < json_size <= header_pickle <= header_size
+            or header_size > 16 * 1024 * 1024 or 8 + header_size > info.st_size):
+        raise ValueError("Packaged Griptape app.asar prefix is invalid.")
+    return {"path": str(archive), "size": info.st_size, "mtime_ns": info.st_mtime_ns,
+            "prefix_sha256": sha256(prefix)}
+
+
+def _git_override_result(status: str, reason: str, **details) -> dict:
+    ready = status in ("current", "applied")
+    return {"schema": "hmb-native-editor-git-override", "version": 1,
+            "status": status, "disk_ready": ready, "restart_required": ready,
+            "renderer_verified": False, "reason": reason,
+            "editor_version": EXPECTED_EDITOR_VERSION, "changed": None if status == "error" else False,
+            "already_current": status == "current", **details}
+
+
+def _git_override_apply_unlocked() -> dict:
+    """One bounded disk transaction. Running renderer modules are untouched.
+
+    This explicit Git lifecycle path permits a single atomic file replacement
+    while the app is running. It does not weaken the stopped-only ZIP API. A
+    sharing violation leaves the original intact and returns a retry state.
+    There are no engine requests, reloads, process stops, retries or watchers.
+    """
+    descriptor, descriptor_sha = _release_descriptor()
+    target = _release_target()
+    app_identity = _git_override_app_identity()
+    sdk_preflight = _release_sdk_preflight()
+    original = target.read_bytes()
+    original_sha = sha256(original)
+    if original_sha not in _release_original_hashes(descriptor):
+        raise ValueError("Unknown installed editor hash; Git override preserved the existing file.")
+    details = {"target": str(target), "candidate_sha256": descriptor["candidate_sha256"],
+               "descriptor_sha256": descriptor_sha, "sdk_preflight": sdk_preflight}
+    if original_sha == descriptor["candidate_sha256"]:
+        return _git_override_result("current", "Pinned editor is already on disk; loaded renderer was not verified.", **details)
+    if original_sha == EXPECTED_SOURCE_SHA256:
+        candidate = patch_editor_source(original.decode("utf-8"))[0].encode("utf-8")
+    else:
+        candidate = _upgrade_previous_helper(original, descriptor)
+    if sha256(candidate) != descriptor["candidate_sha256"]:
+        raise ValueError("Generated native editor candidate differs from the verified Git release.")
+    transaction = _release_plain_path(RELEASE_STATE_ROOT) / uuid.uuid4().hex
+    transaction.mkdir(parents=True, exist_ok=False)
+    _atomic_write(transaction / "before.js", original)
+    _atomic_write(transaction / "candidate.js", candidate)
+    path = transaction / "plan.json"
+    plan = {"schema": "hmb-native-editor-git-override-plan", "version": 1,
+            **details, "original_sha256": original_sha, "app_identity": app_identity,
+            "already_current": False, "status": "prepared"}
+    _json_write(path, plan)
+    details.update(plan=str(path), backup=str(transaction / "before.js"))
+
+    # Re-read both package and app immediately before writing. Git checkout or
+    # desktop auto-updates racing preparation must never broaden the allowlist.
+    def precommit() -> None:
+        if _release_descriptor()[1] != descriptor_sha:
+            raise ValueError("Git release changed during native preparation; target preserved.")
+        if (_release_target() != target or _git_override_app_identity() != app_identity
+                or _release_sdk_preflight() != sdk_preflight):
+            raise ValueError("Packaged app or SDK changed during native preparation; target preserved.")
+        if sha256(_release_plain_path(target).read_bytes()) != original_sha:
+            raise ValueError("Native editor changed during Git preparation; target preserved.")
+        if (sha256(_release_plain_path(transaction / "before.js").read_bytes()) != original_sha
+                or sha256(_release_plain_path(transaction / "candidate.js").read_bytes()) != descriptor["candidate_sha256"]):
+            raise ValueError("Git native staged candidate or backup changed; target preserved.")
+
+    precommit()
+    plan = {**plan, "status": "applying"}
+    _json_write(path, plan)
+    # Check again after the durable write-ownership receipt. Only this invocation
+    # owns rollback; a later invocation seeing current bytes must not undo them.
+    precommit()
+    try:
+        _atomic_write(target, candidate)
+        if sha256(target.read_bytes()) != descriptor["candidate_sha256"]:
+            raise RuntimeError("Installed Git native editor hash mismatch.")
+        _json_write(path, {**plan, "status": "applied"})
+    except Exception as error:
+        current = sha256(_release_plain_path(target).read_bytes())
+        if current == original_sha:
+            # os.replace can fail because Windows holds the destination open.
+            # No delete/truncate/retry is attempted and the saved backup remains.
+            _json_write(path, {**plan, "status": "pending"})
+            if isinstance(error, OSError):
+                return _git_override_result("pending", "Native editor replacement was blocked; original retained. Retry after a normal restart.",
+                                            reason_code="atomic_replace_blocked", **details)
+            raise
+        if current != descriptor["candidate_sha256"]:
+            raise RuntimeError("Native editor changed outside this Git transaction; foreign bytes preserved and rollback refused.") from error
+        # Restore only the exact bytes owned by this transaction, never a
+        # different updater's content. Verify the durable backup before use.
+        backup = _release_plain_path(transaction / "before.js").read_bytes()
+        if sha256(backup) != original_sha:
+            raise RuntimeError("Git native backup changed; rollback refused.") from error
+        try:
+            _atomic_write(target, backup)
+            if sha256(target.read_bytes()) != original_sha:
+                raise RuntimeError("Git native rollback hash mismatch.")
+            _json_write(path, {**plan, "status": "rolled_back"})
+        except Exception as recovery_error:
+            return _git_override_result("error", "Native editor recovery could not be confirmed; inspect the preserved backup: " + str(recovery_error),
+                                        reason_code="rollback_unconfirmed", **details)
+        return _git_override_result("error", "Native editor transaction failed and restored its exact original.",
+                                    reason_code="rolled_back", changed=False, **details)
+    return _git_override_result("applied", "Native editor is ready on disk. Save work and restart Griptape normally once.",
+                                changed=True, **details)
+
+
+def apply_git_override() -> dict:
+    """Public ZIP-free lifecycle API; results describe disk state only."""
+    try:
+        # Reject unsupported source/package/app before even creating lock state.
+        _release_descriptor()
+        _release_target()
+        _git_override_app_identity()
+        _release_sdk_preflight()
+        with _release_write_lock():
+            return _git_override_apply_unlocked()
+    except NativeEditorWriteBusy as error:
+        return _git_override_result("pending", str(error), reason_code="write_lock_busy")
+    except ValueError as error:
+        return _git_override_result("unsupported", str(error), reason_code="preflight_rejected")
+    except Exception as error:
+        return _git_override_result("error", str(error), reason_code="native_transaction_failed")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
@@ -741,7 +892,17 @@ def main() -> None:
     parser.add_argument("--rollback", type=Path)
     parser.add_argument("--release-action", choices=("prepare", "apply", "rollback"))
     parser.add_argument("--release-plan", type=Path)
+    parser.add_argument("--apply-git-override", action="store_true")
     args = parser.parse_args()
+    if args.apply_git_override:
+        if (args.release_action or args.release_plan or args.apply or args.rollback
+                or args.source != DEFAULT_SOURCE or args.output != REPORT_DIR / "index-DEZU41rc.hmb-native-header.js"
+                or args.manifest != REPORT_DIR / "candidate.json"):
+            raise ValueError("Git override cannot be combined with target, prototype or release options.")
+        # -I ignores Python encoding environment overrides. Keep this pipe
+        # ASCII-safe even under Windows CP949 or a non-Latin user profile;
+        # the parent decodes JSON bytes as UTF-8.
+        print(json.dumps(apply_git_override(), ensure_ascii=True)); return
     if args.release_action:
         if args.apply or args.rollback or args.source != DEFAULT_SOURCE:
             raise ValueError("Release installation cannot be combined with prototype target options.")

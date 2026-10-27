@@ -78,6 +78,241 @@ _DELETION_PROTECTION_VERSION = 2
 _WINDOWS_CLOSE_GUARD_MARKER = "_hmb_windows_transport_close_guard_v1"
 _WINDOWS_CLOSE_GUARD_AST_SHA256 = "1726d603431044758617fdb85927f558ed7c179445672c34e73ce1712bdc1958"
 _WINDOWS_CLOSE_GUARD_LOCK_KEY = "_hmb_windows_transport_close_lock_v1"
+_HMB_NATIVE_EDITOR_STATE_MODULE = "_hmb_gp_production_native_editor_update_state_v1"
+_HMB_NATIVE_EDITOR_RESPONSE_LIMIT = 1024 * 1024
+_HMB_NATIVE_EDITOR_TIMEOUT_SECONDS = 20
+
+
+def _hmb_native_editor_documents_path() -> Path:
+    """Use the Windows Documents known folder, including redirected folders."""
+    if os.name != "nt":
+        raise LookupError("unsupported_platform")
+    import ctypes
+    from ctypes import wintypes
+
+    class Guid(ctypes.Structure):
+        _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+    identity = Guid.from_buffer_copy(UUID("fdd39ad0-238f-46af-adb4-6c85480369c7").bytes_le)
+    shell, memory = ctypes.windll.shell32, ctypes.windll.ole32
+    shell.SHGetKnownFolderPath.argtypes = [ctypes.POINTER(Guid), wintypes.DWORD,
+        wintypes.HANDLE, ctypes.POINTER(ctypes.c_void_p)]
+    shell.SHGetKnownFolderPath.restype = wintypes.LONG
+    memory.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    memory.CoTaskMemFree.restype = None
+    allocated = ctypes.c_void_p()
+    try:
+        if shell.SHGetKnownFolderPath(ctypes.byref(identity), 0, None, ctypes.byref(allocated)) or not allocated.value:
+            raise OSError("The Windows Documents folder is unavailable")
+        path = Path(ctypes.wstring_at(allocated.value))
+        if not path.is_absolute():
+            raise OSError("The Windows Documents folder is not absolute")
+        return path
+    finally:
+        if allocated.value:
+            memory.CoTaskMemFree(allocated)
+
+
+def _hmb_native_editor_plain_path(path: Path) -> Path:
+    absolute = Path(os.path.abspath(path))
+    for item in (absolute, *absolute.parents):
+        try:
+            info = item.lstat()
+        except FileNotFoundError:
+            continue
+        if item.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise ValueError("Linked native editor source is unsupported")
+    return absolute
+
+
+def _hmb_native_editor_sources(engine: Any, library_data: Any) -> tuple[Path, Path, dict[str, str], dict[str, Any]]:
+    """Only the registered Documents installation may spawn the fixed updater.
+
+    Developer checkouts and SDK fixtures exit before opening support files or
+    creating a process. No caller can supply an alternative app target.
+    """
+    if getattr(library_data, "name", None) != _LIBRARY_NAME:
+        raise LookupError("not_hmb_library")
+    root = _hmb_native_editor_plain_path(Path(__file__).parent)
+    documents = _hmb_native_editor_documents_path()
+    expected = Path(os.path.abspath(documents / "GriptapeNodes/libraries/HMB_GP_Production"))
+    if os.path.normcase(str(root)) != os.path.normcase(str(expected)):
+        raise LookupError("not_installed_library")
+    _hmb_native_editor_plain_path(expected)
+    manager = getattr(engine, "library_manager", None)
+    lookup = getattr(manager, "get_library_info_by_library_name", None)
+    if getattr(manager, "is_worker", None) is not False or not callable(lookup):
+        raise LookupError("not_registered_orchestrator")
+    manifest = _hmb_native_editor_plain_path(root / "griptape-nodes-library.json")
+    info = lookup(_LIBRARY_NAME)
+    if info is None or _hmb_native_editor_plain_path(Path(info.library_path)) != manifest:
+        raise LookupError("registered_library_path_changed")
+    paths = {
+        "manifest": manifest, "bootstrap": _hmb_native_editor_plain_path(Path(__file__)),
+        "descriptor": _hmb_native_editor_plain_path(root / "resources/editor/native-editor-patch.json"),
+        "patcher": _hmb_native_editor_plain_path(root / "tools/hmb_color_lut_native_header_patch.py"),
+        "helper": _hmb_native_editor_plain_path(root / "resources/editor/hmb-color-lut-native-header.js"),
+    }
+    contents = {}
+    for key, path in paths.items():
+        if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
+            raise ValueError("native_support_source_missing_or_oversized")
+        contents[key] = path.read_bytes()
+    metadata = json.loads(contents["manifest"].decode("utf-8-sig"))
+    if (metadata.get("name") != _LIBRARY_NAME or metadata.get("advanced_library_path") != "_hmb_library_bootstrap.py"
+            or paths["bootstrap"] != root / "_hmb_library_bootstrap.py"):
+        raise ValueError("native_support_manifest_owner_changed")
+    descriptor = json.loads(contents["descriptor"].decode("utf-8-sig"))
+    if (descriptor.get("schema") != "hmb-native-editor-patch-release" or type(descriptor.get("version")) is not int
+            or descriptor["version"] != 1 or descriptor.get("editor_version") != "0.128.1"
+            or descriptor.get("bundle_name") != "index-DEZU41rc.js"
+            or descriptor.get("helper_path") != "resources/editor/hmb-color-lut-native-header.js"
+            or descriptor.get("patcher_path") != "tools/hmb_color_lut_native_header_patch.py"):
+        raise ValueError("native_support_descriptor_unsupported")
+    hashes = {key: hashlib.sha256(value).hexdigest() for key, value in contents.items()}
+    for key in ("patcher", "helper"):
+        if descriptor.get(key + "_sha256") != hashes[key]:
+            raise ValueError("native_support_" + key + "_hash_changed")
+    candidate = descriptor.get("candidate_sha256")
+    if not isinstance(candidate, str) or len(candidate) != 64 or any(c not in "0123456789abcdef" for c in candidate):
+        raise ValueError("native_support_candidate_hash_invalid")
+    python = Path(sys.executable).resolve(strict=True)
+    if sys.version_info[:2] != (3, 12) or python.is_relative_to(root) or not python.is_file():
+        raise ValueError("native_support_external_python_required")
+    return root, python, hashes, descriptor
+
+
+def _hmb_native_editor_state() -> Any:
+    candidate = types.ModuleType(_HMB_NATIVE_EDITOR_STATE_MODULE)
+    candidate.schema = 1
+    candidate.lock = threading.RLock()
+    candidate.jobs = {}
+    state = sys.modules.setdefault(_HMB_NATIVE_EDITOR_STATE_MODULE, candidate)
+    if (type(state) is not types.ModuleType or getattr(state, "schema", None) != 1
+            or not isinstance(getattr(state, "jobs", None), dict)
+            or not callable(getattr(getattr(state, "lock", None), "acquire", None))):
+        raise ValueError("native_coordinator_owner_changed")
+    return state
+
+
+def _hmb_native_editor_summary(status: str, reason: str, *, restart_required: bool = False) -> dict[str, Any]:
+    return {"schema": "hmb-native-editor-git-override", "version": 1, "status": status,
+        "reason": reason, "disk_ready": False, "restart_required": restart_required, "renderer_verified": False}
+
+
+def _hmb_native_editor_child(root: Path, python: Path, descriptor: dict[str, Any]) -> dict[str, Any]:
+    """Fresh CLI process, no import-cache mutation, bounded lifetime and output."""
+    environment = {key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR", "LOCALAPPDATA", "APPDATA",
+        "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP") if key in os.environ}
+    command = [str(python), "-I", "-B", str(root / "tools/hmb_color_lut_native_header_patch.py"), "--apply-git-override"]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, cwd=str(root), env=environment,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), close_fds=True)
+    close_job = None
+    try:
+        close_job = _hmb_environment_job(process)
+        output, _ = process.communicate(timeout=_HMB_NATIVE_EDITOR_TIMEOUT_SECONDS)
+        if len(output) > _HMB_NATIVE_EDITOR_RESPONSE_LIMIT:
+            raise ValueError("native_update_response_oversized")
+        value = json.loads(output)
+        if (not isinstance(value, dict) or value.get("schema") != "hmb-native-editor-git-override"
+                or type(value.get("version")) is not int or value["version"] != 1
+                or value.get("status") not in {"current", "applied", "pending", "unsupported", "error"}
+                or any(type(value.get(key)) is not bool for key in ("disk_ready", "restart_required", "renderer_verified"))
+                or value["renderer_verified"] is not False or not isinstance(value.get("reason"), str)
+                or len(value["reason"]) > 4096 or any(ord(c) < 32 for c in value["reason"])):
+            raise ValueError("native_update_response_invalid")
+        success = value["status"] in {"current", "applied"}
+        if success and (process.returncode != 0 or value["disk_ready"] is not True
+                or value.get("candidate_sha256") != descriptor["candidate_sha256"]
+                or value.get("editor_version") != descriptor["editor_version"]
+                or value["status"] == "applied" and value["restart_required"] is not True):
+            raise ValueError("native_update_success_unverified")
+        if not success and value["disk_ready"] is not False:
+            raise ValueError("native_update_failure_claimed_ready")
+        return value
+    finally:
+        if close_job is not None:
+            close_job()
+        if process.poll() is None:
+            process.kill()
+            try:
+                process.communicate(timeout=2)
+            except Exception:
+                pass
+
+
+def _hmb_native_editor_publish(owner: Any, engine: Any, identity: Any, summary: dict[str, Any]) -> None:
+    if getattr(owner, "_hmb_native_editor_update_identity", None) == identity:
+        owner._hmb_native_editor_update_summary = dict(summary)
+    if getattr(engine, "_hmb_native_editor_update_identity", None) == identity:
+        engine._hmb_native_editor_update_summary = dict(summary)
+
+
+def _hmb_coordinate_native_editor_update(owner: Any, engine: Any, library_data: Any) -> dict[str, Any]:
+    """Start at most one asynchronous Git/Override disk update per source pin.
+
+    Native disk readiness never grants deletion permission or claims that the
+    renderer switched code. A cold app restart clears old Python/JS generations.
+    """
+    try:
+        root, python, hashes, descriptor = _hmb_native_editor_sources(engine, library_data)
+        state = _hmb_native_editor_state()
+        identity = (str(root), tuple(sorted(hashes.items())))
+    except LookupError as exc:
+        summary = _hmb_native_editor_summary("unsupported", str(exc))
+        owner._hmb_native_editor_update_identity = None
+        engine._hmb_native_editor_update_identity = None
+        _hmb_native_editor_publish(owner, engine, None, summary)
+        return summary
+    except Exception as exc:
+        summary = _hmb_native_editor_summary("error", "native_support_check_failed:" + type(exc).__name__, restart_required=True)
+        owner._hmb_native_editor_update_identity = None
+        engine._hmb_native_editor_update_identity = None
+        _hmb_native_editor_publish(owner, engine, None, summary)
+        logging.getLogger(__name__).warning("[HMB_NATIVE_EDITOR_UPDATE] %s", summary["reason"])
+        return summary
+    with state.lock:
+        owner._hmb_native_editor_update_identity = identity
+        engine._hmb_native_editor_update_identity = identity
+        existing = state.jobs.get(identity)
+        if existing is not None:
+            summary = dict(existing["summary"], cached=True)
+            _hmb_native_editor_publish(owner, engine, identity, summary)
+            return summary
+        summary = _hmb_native_editor_summary("pending", "native_update_check_running", restart_required=True)
+        state.jobs[identity] = {"summary": dict(summary)}
+        _hmb_native_editor_publish(owner, engine, identity, summary)
+    def update() -> None:
+        try:
+            result = _hmb_native_editor_child(root, python, descriptor)
+        except subprocess.TimeoutExpired:
+            result = _hmb_native_editor_summary("pending", "native_update_timeout", restart_required=True)
+        except Exception as exc:
+            result = _hmb_native_editor_summary("error", "native_update_failed:" + type(exc).__name__, restart_required=True)
+        with state.lock:
+            state.jobs[identity] = {"summary": dict(result)}
+            live_owner, live_engine = owner_ref(), engine_ref()
+            if live_owner is not None and live_engine is not None:
+                _hmb_native_editor_publish(live_owner, live_engine, identity, result)
+        if result["status"] == "current":
+            logging.getLogger(__name__).info("[HMB_NATIVE_EDITOR_UPDATE] current; 편집기 파일이 최신입니다. 실행 중인 화면 확인은 별도입니다.")
+        elif result["status"] == "applied":
+            logging.getLogger(__name__).warning("[HMB_NATIVE_EDITOR_UPDATE] %s; 편집기 파일 확인 완료. 현재 작업을 저장하고 Griptape를 정상 재시작하면 새 UI가 적용됩니다. 실행 중인 화면 확인은 별도입니다.", result["status"])
+        else:
+            logging.getLogger(__name__).warning("[HMB_NATIVE_EDITOR_UPDATE] %s: %s; 자동 적용을 확인하지 못했습니다. 현재 작업을 저장하고 로그와 복구 파일을 확인한 뒤 정상 재시작하여 다시 확인하세요.", result["status"], result["reason"])
+    try:
+        owner_ref, engine_ref = weakref.ref(owner), weakref.ref(engine)
+        thread = threading.Thread(target=update, name="HMB native editor update", daemon=True)
+        thread.start()
+    except Exception as exc:
+        result = _hmb_native_editor_summary("error", "native_update_start_failed:" + type(exc).__name__, restart_required=True)
+        with state.lock:
+            state.jobs[identity] = {"summary": dict(result)}
+            _hmb_native_editor_publish(owner, engine, identity, result)
+        return result
+    return summary
 
 
 # Fixed child program. This literal has no import-time execution; both the
@@ -1861,6 +2096,19 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
         if engine.library_manager.is_worker is not False:
             self._hmb_deletion_readiness_error = "[HMB_DELETE_GUARD_NOT_READY] Engine 편집기/worker 소유권을 확인하지 못했습니다."
             raise _DeletionProtectionError(self._hmb_deletion_readiness_error)
+        # A Git/Override update may retain an older guard module. Schedule the
+        # cache-free, independently validated disk update before that explicit
+        # restart-required boundary; its outcome never grants deletion access.
+        try:
+            _hmb_coordinate_native_editor_update(self, engine, library_data)
+        except Exception as exc:
+            # This optional disk/UI step must never skip the required engine
+            # protection below, including unexpected coordinator failures.
+            summary = _hmb_native_editor_summary("error", "native_coordinator_failed:" + type(exc).__name__, restart_required=True)
+            self._hmb_native_editor_update_identity = None
+            engine._hmb_native_editor_update_identity = None
+            _hmb_native_editor_publish(self, engine, None, summary)
+            logging.getLogger(__name__).warning("[HMB_NATIVE_EDITOR_UPDATE] %s", summary["reason"])
         manager = engine.event_manager
         try:
             with _REGISTRY_LOCK:

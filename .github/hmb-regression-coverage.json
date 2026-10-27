@@ -3,6 +3,12 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_Native_Editor_Git_Override_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_Native_Stock_Deletion_Safety_Browser_Regression.mjs",
       "mode": "ci",
       "coverage": "host_browser",
