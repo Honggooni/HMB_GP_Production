@@ -9,7 +9,13 @@ import {randomUUID} from 'node:crypto';
 import * as w from '../../widgets/HMBImageAssetLibraryWidget.js';
 
 const require=createRequire(import.meta.url);
-const playwright=require(path.join(os.homedir(),'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'));
+let playwrightModule;
+try{playwrightModule=require.resolve('playwright');}
+catch(error){
+ if(error.code!=='MODULE_NOT_FOUND')throw error;
+ playwrightModule=path.join(os.homedir(),'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
+}
+const playwright=require(playwrightModule);
 const browserPath=process.env.HMB_IMAGE_ASSET_TEST_BROWSER||'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const report=process.env.HMB_CGT_REPORT_DIR;
 if(report)fs.mkdirSync(report,{recursive:true});
