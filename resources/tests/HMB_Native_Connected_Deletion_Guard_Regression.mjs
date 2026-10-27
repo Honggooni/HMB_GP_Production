@@ -18,7 +18,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 function harness(names = ["HMB_A", "ordinary"]) {
   const calls = [], notices = [], applied = [], cleared = [];
   const nodes = names.map(id => ({ id, type: "CustomNode", data: { node_type: id === "ordinary" ? "Ordinary" : "FutureTool", metadata: {} } }));
-  let response = { can_delete: true, hmb_node_names: names.filter(name => name !== "ordinary") };
+  let response = { protection_ready: true, protection_version: 2, can_delete: true, hmb_node_names: names.filter(name => name !== "ordinary") };
   const ctx = vm.createContext({
     console, Map, Set, WeakMap, WeakSet, Promise, Date,
     Xd: {
@@ -44,7 +44,7 @@ function harness(names = ["HMB_A", "ordinary"]) {
 
 for (const reason of ["visible wire", "remote binding"]) {
   const h = harness();
-  h.setResponse({ can_delete: false, blocked: { HMB_A: [reason] }, hmb_node_names: ["HMB_A"], message: reason });
+  h.setResponse({ protection_ready: true, protection_version: 2, can_delete: false, blocked: { HMB_A: [reason] }, hmb_node_names: ["HMB_A"], message: reason });
   h.handler([{ type: "remove", id: "HMB_A" }, { type: "remove", id: "ordinary" }]);
   await tick();
   check(h.calls.length === 1 && h.calls[0][1] === "HMBCheckNodeDeletionRequest", `${reason}: one whole-batch preflight`);
@@ -75,14 +75,14 @@ for (const reason of ["visible wire", "remote binding"]) {
   check(h.cleared.includes("HMB_A"), "Cache cleanup occurs after success");
 }
 {
-  const h = harness(); h.setResponse({ can_delete: true, hmb_node_names: [] });
+  const h = harness(); h.setResponse({ protection_ready: true, protection_version: 2, can_delete: true, hmb_node_names: [] });
   h.handler([{ type: "remove", id: "ordinary" }]); await tick();
   check(!h.nodes.some(node => node.id === "ordinary"), "Standard-only deletion retains native optimistic behavior after preflight");
   check(h.cleared.includes("ordinary"), "Standard-only native cleanup remains");
 }
 {
   const h = harness(["not-an-HMB-type-prefix"]);
-  h.setResponse({ can_delete: true, hmb_node_names: ["not-an-HMB-type-prefix"] });
+  h.setResponse({ protection_ready: true, protection_version: 2, can_delete: true, hmb_node_names: ["not-an-HMB-type-prefix"] });
   h.handler([{ type: "remove", id: "not-an-HMB-type-prefix" }]); await tick();
   check(h.nodes.length === 1, "Engine library identity protects future HMB tool names");
 }
@@ -92,6 +92,18 @@ for (const result of [new Error("timeout"), null, { can_delete: "true" }]) {
   check(h.nodes.length === 2 && h.calls.length === 1, "Transport or malformed acknowledgement fails closed");
   check(h.notices.length === 1, "Failed verification displays an explanation");
 }
+for (const result of [
+  { can_delete: true, hmb_node_names: ["HMB_A"] },
+  { protection_ready: true, protection_version: 1, can_delete: true, hmb_node_names: ["HMB_A"] },
+  { protection_ready: false, protection_version: 2, readiness_error: "Restart the retained engine", can_delete: true, hmb_node_names: ["HMB_A"] },
+]) {
+  const h = harness(); h.setResponse(result);
+  h.handler([{ type: "remove", id: "HMB_A" }]); await tick();
+  check(h.nodes.length === 2 && !h.cleared.length, "Old or unready protection cannot remove HMB UI/cache even with can_delete=true");
+  check(h.calls.length === 1 && h.calls[0][0] === "request", "Old or unready protection never dispatches a destructive request");
+  check(h.notices.length === 1 && h.notices[0][0] === "삭제 보호를 다시 시작해야 합니다", "A stale engine has an explicit restart requirement");
+  if (result.readiness_error) check(h.notices[0][1].description === result.readiness_error, "Exact readiness diagnostic is preserved");
+}
 {
   const h = harness(); let resolve;
   h.setResponse(() => new Promise(done => { resolve = done; }));
@@ -99,7 +111,7 @@ for (const result of [new Error("timeout"), null, { can_delete: "true" }]) {
   h.handler([{ type: "remove", id: "HMB_A" }]); await tick();
   check(h.calls.length === 1, "Repeated Delete cannot create duplicate pending requests");
   vm.runInContext("hmbNativeStudioResetCollapseIntents()", h.ctx);
-  resolve({ can_delete: true, hmb_node_names: ["HMB_A"] }); await tick();
+  resolve({ protection_ready: true, protection_version: 2, can_delete: true, hmb_node_names: ["HMB_A"] }); await tick();
   check(h.calls.length === 1 && h.nodes.length === 2, "An old flow acknowledgement cannot delete a new workflow");
 }
 {
@@ -113,11 +125,11 @@ for (const result of [new Error("timeout"), null, { can_delete: "true" }]) {
   h.ctx.m = (_event, listener) => listener;
   const clear = vm.runInContext(candidate.slice(start + 3, end + 1), h.ctx);
   clear(); h.nodes.push({ id: "HMB_A", type: "CustomNode", data: {} });
-  resolve({ can_delete: true, hmb_node_names: ["HMB_A"] }); await tick();
+  resolve({ protection_ready: true, protection_version: 2, can_delete: true, hmb_node_names: ["HMB_A"] }); await tick();
   check(h.calls.length === 1 && h.nodes.length === 1, "ClearAll invalidates an old check before a replacement graph is constructed");
 }
 {
-  const h = harness(); h.setResponse({ can_delete: false, message: "connected" });
+  const h = harness(); h.setResponse({ protection_ready: true, protection_version: 2, can_delete: false, message: "connected" });
   h.handler([{ type: "position", id: "ordinary", position: { x: 1, y: 2 } }, { type: "remove", id: "HMB_A" }]);
   check(h.applied.length === 1 && h.applied[0][0].type === "position", "Non-destructive changes are not delayed by deletion checks");
   await tick(); check(h.nodes.length === 2, "Denied removal is not replayed after non-destructive updates");
@@ -136,8 +148,10 @@ assert.match(candidate, /i===`failure`&&\(o===`PermissionDeniedResult`\?GGi\(t,r
   vm.runInContext(helper, ctx);
   vm.runInContext("hmbUseNativeDeletionGuardHost();hmbUseNativeDeletionGuardHost()", ctx);
   check(attributes.get("data-hmb-native-deletion-guard") === "engine-preflight", "Patched native host exposes the public deletion contract");
+  check(attributes.get("data-hmb-native-deletion-protection-version") === "2", "Native positive admission requires the current readiness contract");
   cleanups[0](); check(attributes.has("data-hmb-native-deletion-guard"), "One mounted owner cannot remove another host's marker");
   cleanups[1](); check(!attributes.has("data-hmb-native-deletion-guard"), "The marker is removed with its final native owner");
+  check(!attributes.has("data-hmb-native-deletion-protection-version"), "The readiness version is removed with its final native owner");
 }
 for (const name of ["HMBAgentLibraryWidget.js", "HMBFinishLookLibraryWidget.js", "HMBImageAssetLibraryWidget.js",
   "HMBPromptLibraryScopedBindingWidget.js", "HMBSeedanceGenerationWidget.js", "HMBVideoPickerLibraryWidget_v032.js"]) {

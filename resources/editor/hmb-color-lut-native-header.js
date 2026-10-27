@@ -252,11 +252,16 @@ function hmbUseNativeDeletionGuardHost() {
     if (!root) return;
     hmbNativeDeletionHostCount += 1;
     root.setAttribute("data-hmb-native-deletion-guard", "engine-preflight");
+    root.setAttribute("data-hmb-native-deletion-protection-version", "2");
     return () => {
       hmbNativeDeletionHostCount -= 1;
       if (!hmbNativeDeletionHostCount
         && root.getAttribute("data-hmb-native-deletion-guard") === "engine-preflight") {
         root.removeAttribute("data-hmb-native-deletion-guard");
+      }
+      if (!hmbNativeDeletionHostCount
+        && root.getAttribute("data-hmb-native-deletion-protection-version") === "2") {
+        root.removeAttribute("data-hmb-native-deletion-protection-version");
       }
     };
   }, []);
@@ -292,6 +297,14 @@ function hmbNativeGuardNodeDeletion(changes, nodes, apply) {
   Promise.resolve().then(() => Xd.request("HMBCheckNodeDeletionRequest", { node_names: names }))
     .then(result => {
       if (epoch !== hmbNativeStudioFlowEpoch) { release(); return; }
+      if (result?.protection_ready !== true || result?.protection_version !== 2) {
+        release();
+        ig.warning("삭제 보호를 다시 시작해야 합니다", {
+          description: result?.readiness_error || "HMB 삭제 보호 코드가 현재 엔진과 일치하지 않습니다. 작업을 저장하고 Griptape를 완전히 종료한 뒤 다시 시작하세요. 통합 UI가 적용되지 않았다면 Runtime ZIP의 공식 설치기를 실행하세요. 노드와 결과는 유지됩니다.",
+          duration: 8000,
+        });
+        return;
+      }
       if (result?.can_delete !== true) {
         release();
         ig.warning("삭제할 수 없습니다", {

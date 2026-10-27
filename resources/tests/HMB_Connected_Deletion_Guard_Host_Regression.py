@@ -152,6 +152,22 @@ async def exercise(engine, _phase, out):
             flow = harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name="DeletionGuardSDK")).flow_name
             source, target = create("connected source"), create("connected target")
             edge = wire(source, target)
+            readiness = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[source.name]))
+            assert readiness.protection_ready is True and readiness.protection_version == 2
+            assert readiness.readiness_error == "" and not readiness.can_delete
+            lifetime_gate = getattr(manager, guard.LIFETIME_GATE_ATTRIBUTE)
+            assert lifetime_gate.engine_ref() is engine and lifetime_gate.manager_ref() is manager
+            harness.record("version2_readiness_requires_installed_engine_lifetime_gate")
+            manager.remove_pre_dispatch_hook(lifetime_gate.hook)
+            assert guard.protection_readiness(engine)[0] is False
+            missing_hook = engine.handle_request(guard.HMBCheckNodeDeletionRequest(node_names=[source.name], broadcast_result=False))
+            assert not missing_hook.succeeded() and not missing_hook.protection_ready
+            await blocked(DeleteNodeRequest(node_name=source.name), "removed_lifetime_hook_fails_readiness_and_active_lease_still_protects")
+            with mock.patch.object(bootstrap._Registration, "start_web_worker", lambda *a: None):
+                owner.before_library_nodes_loaded(schema, library)
+            assert lifetime_gate.is_registered() and guard.protection_readiness(engine) == (True, "")
+            assert sum(hook is lifetime_gate.hook for hook in manager._pre_dispatch_hooks) == 1
+            harness.record("missing_lifetime_hook_is_repaired_only_through_official_idempotent_API")
             before = snapshot(engine)
             for names in (None, "connected source", [""], [17], ["not retained"] * 4097):
                 invalid = engine.handle_request(guard.HMBCheckNodeDeletionRequest(node_names=names, broadcast_result=False))
@@ -187,6 +203,24 @@ async def exercise(engine, _phase, out):
             remote.subscription = subscription("video_picker")
             await blocked(DeleteNodeRequest(node_name=publisher.name), "catalog_only_remote_authority_blocks_delete")
             await blocked(DeleteNodeRequest(node_name=remote.name), "catalog_only_remote_subscriber_blocks_delete")
+            # Git Update can unregister the library while its retained graph
+            # remains visible. This is not permission to remove wires/nodes.
+            stable_handler = registration.deletion_handlers
+            owner.before_library_unregistered(schema, library)
+            assert not registration.active and not owner._registrations
+            gap = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[source.name, publisher.name]))
+            assert gap.protection_ready is True and gap.protection_version == 2 and not gap.can_delete
+            await blocked(DeleteNodeRequest(node_name=source.name), "unload_gap_wire_delete_before_mutation")
+            forced = ResetNodeToDefaultsRequest(node_name=source.name); forced.force = True
+            await blocked(forced, "unload_gap_forced_reset_before_mutation")
+            await blocked(DeleteNodeRequest(node_name=publisher.name), "unload_gap_live_remote_delete_before_mutation")
+            await blocked(ClearAllObjectStateRequest(i_know_what_im_doing=True), "unload_gap_forced_clear_before_mutation")
+            with mock.patch.object(bootstrap._Registration, "start_web_worker", lambda *a: None):
+                owner.before_library_nodes_loaded(schema, library)
+            registration = next(iter(owner._registrations))
+            assert registration.deletion_handlers is stable_handler
+            assert registration.deletion_protection is lifetime_gate
+            harness.record("retained_unload_gap_read_only_preflight_and_stable_reload")
             remote.subscription = subscription("video_picker", enabled=False)
             assert not guard.connected_targets(engine, [remote.name])
             harness.record("Only_disabled_subscription_without_wire_does_not_block")
@@ -372,6 +406,122 @@ async def exercise(engine, _phase, out):
             wire(source, target)
             await blocked(DeleteNodeRequest(node_name=source.name), "real_library_refresh_preserves_central_guard")
             harness.record("actual_library_unload_reload_rebinds_typed_preflight_and_transition")
+            # Optional compatibility must never switch off an installed gate.
+            with mock.patch.object(bootstrap, "_acquire_windows_transport_close_guard", side_effect=RuntimeError("optional fixture failure")):
+                owner.before_library_nodes_loaded(schema, library)
+            assert guard.protection_readiness(engine) == (True, "")
+            await blocked(DeleteNodeRequest(node_name=source.name), "optional_bootstrap_failure_cannot_disable_deletion_gate")
+
+            # A failed typed-handler initialization is visible and retains the
+            # engine gate instead of reporting a silently successful load.
+            owner.before_library_unregistered(schema, library)
+            with mock.patch.object(guard, "install_request_handlers", side_effect=RuntimeError("critical fixture failure")):
+                try:
+                    owner.before_library_nodes_loaded(schema, library)
+                except bootstrap._DeletionProtectionError as exc:
+                    assert "HMB_DELETE_GUARD_NOT_READY" in str(exc)
+                else:
+                    raise AssertionError("Critical deletion initialization was silently ignored")
+            registration = next(iter(owner._registrations))
+            failed = engine.handle_request(guard.HMBCheckNodeDeletionRequest(node_names=[source.name], broadcast_result=False))
+            assert not failed.succeeded() and not failed.protection_ready and failed.protection_version == 2
+            assert "HMB_DELETE_GUARD_NOT_READY" in failed.readiness_error
+            await blocked(DeleteNodeRequest(node_name=source.name), "critical_install_failure_retains_backend_wire_gate")
+            with mock.patch.object(bootstrap._Registration, "start_web_worker", lambda *a: None):
+                owner.before_library_nodes_loaded(schema, library)
+            assert guard.protection_readiness(engine) == (True, "")
+            harness.record("critical_handler_failure_is_explicit_and_retry_restores_readiness")
+
+            for api in ("add_pre_dispatch_hook", "remove_pre_dispatch_hook", "register_request_handlers"):
+                with mock.patch.object(manager, api, None):
+                    try:
+                        owner.before_library_nodes_loaded(schema, library)
+                    except bootstrap._DeletionProtectionError as exc:
+                        assert "HMB_DELETE_GUARD_UNSUPPORTED" in str(exc)
+                    else:
+                        raise AssertionError("Missing required SDK API was silently accepted: " + api)
+                    assert guard.protection_readiness(engine)[0] is False
+                    await blocked(DeleteNodeRequest(node_name=source.name), "unsupported_API_keeps_existing_gate_" + api)
+                with mock.patch.object(bootstrap._Registration, "start_web_worker", lambda *a: None):
+                    owner.before_library_nodes_loaded(schema, library)
+            harness.record("all_required_SDK_APIs_fail_explicitly_without_losing_existing_protection")
+
+            callback = lifetime_gate.callback
+            check_type = guard.HMBCheckNodeDeletionRequest
+            stable_handler = registration.deletion_handlers
+            with mock.patch.object(guard, "PROTECTION_VERSION", 1), mock.patch.object(guard, "install_request_handlers", harness.deny), mock.patch.object(importlib, "reload", harness.deny):
+                try:
+                    owner.before_library_nodes_loaded(schema, library)
+                except bootstrap._DeletionProtectionError as exc:
+                    assert "HMB_DELETE_GUARD_RESTART_REQUIRED" in str(exc)
+                else:
+                    raise AssertionError("A cached legacy helper was silently promoted to ready")
+                assert lifetime_gate.callback is callback and lifetime_gate.ready is False
+                assert guard.HMBCheckNodeDeletionRequest is check_type and registration.deletion_handlers is stable_handler
+                await blocked(DeleteNodeRequest(node_name=source.name), "cached_legacy_helper_retains_exact_backend_callback")
+            with mock.patch.object(bootstrap._Registration, "start_web_worker", lambda *a: None):
+                owner.before_library_nodes_loaded(schema, library)
+            assert guard.protection_readiness(engine) == (True, "")
+            # Evicting a module does not evict SDK payload classes. A new
+            # helper generation must never overwrite a registered old class.
+            from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+            registry_before = PayloadRegistry.get_registry()
+            get_type = PayloadRegistry.get_type
+            foreign_payload = type("OldDeletionPayloadFixture", (), {})
+            owner.before_library_unregistered(schema, library)
+            with mock.patch.object(PayloadRegistry, "get_type", side_effect=lambda name: (
+                    foreign_payload if name == "HMBCheckNodeDeletionResultSuccess" else get_type(name))):
+                try:
+                    owner.before_library_nodes_loaded(schema, library)
+                except bootstrap._DeletionProtectionError as exc:
+                    assert "HMB_DELETE_GUARD_RESTART_REQUIRED" in str(exc)
+                else:
+                    raise AssertionError("A foreign SDK payload generation was overwritten")
+            registration = next(iter(owner._registrations))
+            assert PayloadRegistry.get_registry() == registry_before
+            await blocked(DeleteNodeRequest(node_name=source.name), "foreign_payload_generation_keeps_backend_gate_without_overwrite")
+            with mock.patch.object(bootstrap._Registration, "start_web_worker", lambda *a: None):
+                owner.before_library_nodes_loaded(schema, library)
+            assert guard.protection_readiness(engine) == (True, "")
+            harness.record("registered_foreign_payload_identity_requires_restart_without_registry_mutation")
+            with mock.patch.object(bootstrap, "current_engine", None):
+                try:
+                    owner.before_library_nodes_loaded(schema, library)
+                except bootstrap._DeletionProtectionError as exc:
+                    assert "HMB_DELETE_GUARD_UNSUPPORTED" in str(exc)
+                else:
+                    raise AssertionError("Missing main Engine context was silently accepted")
+            harness.record("cached_legacy_protocol_never_reimports_or_reregisters_payloads_and_main_context_failure_is_explicit")
+            # Healthy New/Close releases only the view, including during Git
+            # unload. Its saved source and media references remain untouched.
+            commands = harness.send(engine, SerializeFlowToCommandsRequest(flow_name=flow)).serialized_flow_commands
+            saved_gap = out / "unload-close-preserved-workflow.py"
+            await harness.asend(engine, SaveWorkflowFileFromSerializedFlowRequest(
+                serialized_flow_commands=commands, file_name=saved_gap.stem, file_path=str(saved_gap), display_name="Unload close fixture"))
+            saved_bytes = saved_gap.read_bytes()
+            owner.before_library_unregistered(schema, library)
+            assert not registration.active and guard.protection_readiness(engine) == (True, "")
+            await harness.asend(engine, guard.HMBPrepareWorkflowTransitionRequest(broadcast_result=False))
+            assert not engine.node_manager._name_to_parent_flow_name and saved_gap.read_bytes() == saved_bytes
+            inactive_empty = engine.handle_request(guard.HMBCheckNodeDeletionRequest(node_names=[], broadcast_result=False))
+            assert not inactive_empty.succeeded()
+            harness.record("healthy_unload_gap_New_Close_releases_view_and_preserves_saved_source")
+
+            harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name="Standard only after unload"))
+            for callback in (None, harness.deny):
+                standard = create("ordinary independent", hmb=False)
+                with mock.patch.object(lifetime_gate, "callback", callback):
+                    deleted = await engine.ahandle_request(DeleteNodeRequest(node_name=standard.name, broadcast_result=False))
+                assert deleted.succeeded() and standard.name not in engine.node_manager._name_to_parent_flow_name
+            harness.record("positively_standard_only_graph_is_native_owned_even_when_guard_callback_is_unavailable")
+            standard = create("ordinary unknown inventory", hmb=False)
+            before_unknown = snapshot(engine)
+            with mock.patch.object(engine.node_manager, "_name_to_parent_flow_name", None):
+                unknown = await engine.ahandle_request(DeleteNodeRequest(node_name=standard.name, broadcast_result=False))
+                assert not unknown.succeeded() and "HMB_DELETE_CHECK_FAILED" in str(unknown.result_details)
+            assert snapshot(engine) == before_unknown
+            harness.send(engine, DeleteNodeRequest(node_name=standard.name))
+            harness.record("unknown_retained_inventory_fails_closed_before_native_mutation")
             assert not harness.ATTEMPTS
     finally:
         # The explicit view transition is the only intended connected teardown.

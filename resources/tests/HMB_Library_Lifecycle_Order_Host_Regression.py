@@ -62,7 +62,8 @@ async def asend(engine, request):
 
 
 def create_project(images, folder):
-    root = folder / "Projects" / "katuri8"
+    catalog = folder / "Projects"
+    root = catalog / "Katuri8" / "Ai_Ct_image"
     entries = []
     for number in range(1, 11):
         path = root / "Character" / f"asset-{number}.png"
@@ -70,8 +71,10 @@ def create_project(images, folder):
         path.write_bytes(PNG)
         entries.append(dict(path=path.relative_to(root).as_posix(), asset_id=f"NativeAsset{number}",
             image_name=f"Native asset {number}", image_main_type="Character", image_sub_type="Full Appearance"))
-    (root / "hmb_image_assets.json").write_text(json.dumps(dict(assets=entries)), encoding="utf-8")
-    state = images._select_catalog_project(images._load_project_catalog(root.parent, images._default_state()), root)
+    metadata = root / ".json"
+    metadata.mkdir()
+    (metadata / "hmb_image_assets.json").write_text(json.dumps(dict(assets=entries)), encoding="utf-8")
+    state = images._select_catalog_project(images._load_project_catalog(catalog, images._default_state()), root)
     assert len(state["assets"]) == 10 and all(row["registered"] for row in state["assets"])
     ordered = sorted(state["assets"], key=lambda row: int(row["asset_id"].removeprefix("NativeAsset")))
     for number, row in enumerate(ordered, 1):

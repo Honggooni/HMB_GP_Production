@@ -173,17 +173,31 @@ ASSET_MANIFEST_SCHEMA = "hmb-image-assets"
 ASSET_MANIFEST_VERSION = 1
 ASSET_MANIFEST_LOCK_NAME = ".hmb_image_assets.lock"
 ASSET_MANIFEST_LOCK_TIMEOUT_SECONDS = 10.0
-PRODUCTION_PROJECTS_ROOT = "//192.168.200.19/v/projects/Ai_Ct_image"
+PRODUCTION_PROJECTS_ROOT = "//192.168.200.19/v/projects"
 _RETIRED_PROJECTS_ROOT = "//fin-rcomp1/Composite_Team/projects_AI"
 
 
 def _relocate_image_project_path(value: Any) -> str:
-    """Rebase only the retired share; keep project identity and custom roots."""
+    """Replace retired saved addresses in memory; never read the old storage."""
     text = str(value or "").strip()
     path = text.replace("\\", "/")
     prefix = _RETIRED_PROJECTS_ROOT
     if path.casefold() == prefix.casefold() or path.casefold().startswith(prefix.casefold() + "/"):
-        return PRODUCTION_PROJECTS_ROOT + path[len(prefix):]
+        parts = path[len(prefix):].strip("/").split("/")
+        if not parts[0]:
+            return PRODUCTION_PROJECTS_ROOT
+        if any(part in (".", "..") for part in parts):
+            return text
+        return "/".join((PRODUCTION_PROJECTS_ROOT, parts[0], "Ai_Ct_image", *parts[1:]))
+    if "://" in path or any(part in (".", "..") for part in path.split("/")):
+        return text
+    flat = re.fullmatch(r"(.*?/projects)/ai_ct_image(?:/([^/]+)(/.*)?)?/?", path, re.IGNORECASE)
+    if flat:
+        base, show, suffix = flat.groups()
+        return base if not show else base + "/" + show + "/Ai_Ct_image" + (suffix or "")
+    nested = re.fullmatch(r"(.*?/projects/([^/]+)/ai_ct_image)/([^/]+)(/.*)?", path, re.IGNORECASE)
+    if nested and nested[2].casefold() == nested[3].casefold():
+        return nested[1] + (nested[4] or "")
     return text
 
 
@@ -745,20 +759,7 @@ def _image_project_child(root: Path, name: str) -> Path | None:
 
 def _nested_image_project_root(show: Path) -> Path | None:
     """A show's own Ai_Ct_image is its image boundary, never its pipelines."""
-    storage = _image_project_child(show, "Ai_Ct_image")
-    if storage is None:
-        return None
-    # Retain the original project folder name/relative image paths when the
-    # complete old project directory was moved into its show, as in SW12/KA8.
-    return _image_project_child(storage, show.name) or storage
-
-
-def _legacy_image_catalog_parent(root: Path) -> Path | None:
-    """Keep saved projects/Ai_Ct_image roots usable after that folder moves."""
-    if (root.name.casefold() == "ai_ct_image"
-            and root.parent.name.casefold() == "projects"):
-        return root.parent
-    return None
+    return _image_project_child(show, "Ai_Ct_image")
 
 
 def _discover_project_catalog(projects_root: Any) -> Dict[str, Any]:
@@ -768,52 +769,44 @@ def _discover_project_catalog(projects_root: Any) -> Dict[str, Any]:
         root = root.resolve()
     except Exception:
         root = Path(root_text)
-    legacy_parent = _legacy_image_catalog_parent(root)
-    discovery_root = legacy_parent or root
-    if not discovery_root.is_dir():
+    if not root.is_dir():
         raise ValueError(
             f"Projects root does not exist or is not a directory: {root}"
         )
 
     project_paths: List[Path]
-    own_nested_root = _nested_image_project_root(root) if legacy_parent is None else None
+    own_nested_root = None if root.name.casefold() == "projects" else _nested_image_project_root(root)
     if own_nested_root is not None:
         project_paths = [own_nested_root]
-    elif legacy_parent is None and _looks_like_direct_project(root):
+    elif root.name.casefold() == "ai_ct_image" or (root.name.casefold() != "projects" and _looks_like_direct_project(root)):
         project_paths = [root]
     else:
         project_paths = []
         try:
-            candidates = list(discovery_root.iterdir())
+            candidates = list(root.iterdir())
         except Exception as exc:
-            raise ValueError(f"Unable to enumerate projects in {discovery_root}: {exc}") from exc
+            raise ValueError(f"Unable to enumerate projects in {root}: {exc}") from exc
         nested_paths: Dict[str, Path] = {}
         for candidate in candidates:
             if len(nested_paths) >= MAX_PROJECTS:
                 break
+            # The retired global catalog is not a project and is never probed.
+            if candidate.name.casefold() == "ai_ct_image":
+                continue
             try:
                 if not candidate.is_dir() or _is_reparse_point(candidate):
                     continue
                 resolved = candidate.resolve()
-                resolved.relative_to(discovery_root)
+                resolved.relative_to(root)
             except (FileNotFoundError, NotADirectoryError, ValueError):
                 continue
             nested = _nested_image_project_root(resolved)
             if nested is not None:
                 nested_paths[_project_identity_key(_project_id(nested))] = nested
         project_paths.extend(nested_paths.values())
-        # The old flat catalog remains a read-compatible fallback for projects
-        # which have not moved. A moved project's own storage always wins.
-        flat_root = root if legacy_parent is not None else _image_project_child(root, "Ai_Ct_image")
-        flat_candidates: List[Path] = []
-        if flat_root is not None and flat_root.is_dir():
-            try:
-                flat_candidates = list(flat_root.iterdir())
-            except OSError as exc:
-                raise ValueError(f"Unable to enumerate projects in {flat_root}: {exc}") from exc
-        elif not nested_paths and legacy_parent is None:
-            # Unrelated user-selected flat catalogs keep their existing mode.
-            flat_candidates = candidates
+        # Preserve unrelated explicit flat catalogs. Official projects catalogs
+        # only discover <show>/Ai_Ct_image; old global storage is never scanned.
+        flat_candidates = candidates if not nested_paths and root.name.casefold() != "projects" else []
         for candidate in flat_candidates:
             if len(project_paths) >= MAX_PROJECTS:
                 break
@@ -822,7 +815,7 @@ def _discover_project_catalog(projects_root: Any) -> Dict[str, Any]:
                         or _is_reparse_point(candidate)):
                     continue
                 resolved = candidate.resolve()
-                resolved.relative_to(flat_root or root)
+                resolved.relative_to(root)
             except (FileNotFoundError, NotADirectoryError, ValueError):
                 continue
             if _project_identity_key(_project_id(resolved)) not in nested_paths:
@@ -2169,51 +2162,20 @@ def _existing_asset_manifest_path(root: Path) -> Path | None:
         *(metadata_root / name for name in MANIFEST_NAMES),
         *(root.resolve() / name for name in MANIFEST_NAMES),
     ]
-    local = next((candidate for candidate in candidates if candidate.is_file()), None)
-    if local is not None:
-        return local
-    # During an asset-library move the images and registrations may be moved
-    # separately. This narrowly scoped fallback only reads the same show's old
-    # projects/Ai_Ct_image/<show> metadata; it never chooses another show.
-    legacy_root = _legacy_image_project_root(root)
-    if (legacy_root is None or not legacy_root.is_dir()
-            or _is_reparse_point(legacy_root) or _is_reparse_point(legacy_root.parent)):
-        return None
-    legacy_metadata = _asset_metadata_directory(legacy_root)
-    legacy_candidates = [
-        *(legacy_metadata / name for name in MANIFEST_NAMES),
-        *(legacy_root / name for name in MANIFEST_NAMES),
-    ]
-    return next((candidate for candidate in legacy_candidates if candidate.is_file()), None)
-
-
-def _legacy_image_project_root(root: Path) -> Path | None:
-    """Map only a show-local image boundary to its former flat project root."""
-    if root.parent.name.casefold() == "ai_ct_image":
-        show = root.parent.parent
-        if root.name.casefold() != show.name.casefold():
-            return None
-    elif root.name.casefold() == "ai_ct_image":
-        show = root.parent
-    else:
-        return None
-    if show.parent.name.casefold() != "projects":
-        return None
-    return show.parent / "Ai_Ct_image" / show.name
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
 
 
 def _manifest_asset_relative_path(root: Path, record: Dict[str, Any]) -> str:
     """Read moved registrations against the new media root without rewriting JSON."""
-    legacy = _legacy_image_project_root(root)
     roots = [root.as_posix()]
-    if legacy is not None:
-        roots.append(legacy.as_posix())
     # The production mapped drive and canonical UNC denote the same share.
     # Do not infer aliases for arbitrary user drives or for other projects.
     production_share = "//192.168.200.19/v"
     for value in tuple(roots):
         if value.casefold().startswith(production_share.casefold() + "/"):
             roots.append("P:" + value[len(production_share):])
+        elif value.casefold().startswith("p:/projects/"):
+            roots.append(production_share + value[2:])
     for field in ("path", "relative_path"):
         text = _relocate_image_project_path(record.get(field)).replace("\\", "/")
         if not text:
@@ -2425,6 +2387,8 @@ def _project_folder_metadata_signature(project_root: Any) -> str:
         safe_directories: List[str] = []
         for name in sorted(directory_names, key=_natural_key):
             if name.startswith(".") or len(folder_paths) >= MAX_FOLDERS:
+                continue
+            if current == root and root.name.casefold() == "ai_ct_image" and name.casefold() == root.parent.name.casefold():
                 continue
             candidate = current / name
             try:
@@ -2778,7 +2742,7 @@ def _audit_project_manifest_refresh(root: Path) -> Dict[str, Any]:
         "error": "",
     }
     try:
-        root = Path(root).expanduser()
+        root = Path(_project_root_text(root)).expanduser()
         root_facts = _refresh_manifest_regular_stat(root)
         if not stat.S_ISDIR(root_facts.st_mode):
             raise ValueError("Refresh project root is not a regular directory.")
@@ -2812,6 +2776,8 @@ def _audit_project_manifest_refresh(root: Path) -> Dict[str, Any]:
                 raise ValueError("Refresh exceeded the complete-folder inspection limit.")
             with os.scandir(directory) as entries:
                 for entry in entries:
+                    if directory == root and root.name.casefold() == "ai_ct_image" and entry.name.casefold() == root.parent.name.casefold():
+                        continue
                     path = Path(entry.path)
                     entry_facts = _refresh_manifest_regular_stat(path)
                     # Match the normal catalog's intentional hidden-file scope.
@@ -3056,6 +3022,8 @@ def _scan_project_assets(project_root: Any) -> Dict[str, Any]:
         safe_directories: List[str] = []
         for name in directory_names:
             if name.startswith(".") or len(folders) >= MAX_FOLDERS:
+                continue
+            if current == root and root.name.casefold() == "ai_ct_image" and name.casefold() == root.parent.name.casefold():
                 continue
             candidate = current / name
             try:
@@ -4016,6 +3984,15 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
     state["image_bash_active"] = source.get("image_bash_active") is True
     state["image_bash_workspace_request"] = _normalize_image_bash_workspace_request(source.get("image_bash_workspace_request"))
     binding = state["shot_hierarchy"]
+    if binding and binding["project_identity"]:
+        previous_identity = binding["project_identity"]
+        previous_key = _hmb_shot_routing.hierarchy_project_key({"project_root": previous_identity})
+        canonical_identity = _relocate_image_project_path(previous_identity).replace("\\", "/").rstrip("/").lower()
+        if (canonical_identity != previous_key
+                and canonical_identity == _hmb_shot_routing.hierarchy_project_key(state)):
+            # A retired address of this same project is metadata, not a new
+            # binding. Preserve its IDs, revision, CGT scope and membership.
+            binding["project_identity"] = canonical_identity
     if (binding and not binding["project_identity"]
             and _hmb_shot_routing.hierarchy_project_key(state)
             and all(row["origin"] == "manual" for row in binding["members"])):
@@ -4682,6 +4659,7 @@ def _load_project_catalog(
     *,
     use_shared_cache: bool = True,
 ) -> Dict[str, Any]:
+    previous_state = _normalize_state(previous_state)
     catalog = _discover_project_catalog(projects_root)
     state = dict(previous_state)
     state["catalog_root"] = catalog["catalog_root"]
@@ -4696,7 +4674,7 @@ def _load_project_catalog(
     if not selected_path and len(catalog["projects"]) == 1:
         only_project = catalog["projects"][0]
         direct_root = Path(catalog["catalog_root"])
-        nested_root = _nested_image_project_root(direct_root)
+        nested_root = None if direct_root.name.casefold() == "projects" else _nested_image_project_root(direct_root)
         if (_clean(only_project.get("path")).casefold() == _clean(
             catalog["catalog_root"]
         ).casefold() or (nested_root is not None
@@ -4981,26 +4959,21 @@ def _state_project_belongs_to_catalog(
     if not project_text or not catalog_text:
         return False
     try:
-        project = Path(project_text).resolve()
+        project = Path(_project_root_text(project_text)).resolve()
         catalog = Path(catalog_text).resolve()
         if project == catalog or project.parent == catalog:
             return True
-        discovery = _legacy_image_catalog_parent(catalog) or catalog
         try:
-            parts = project.relative_to(discovery).parts
+            parts = project.relative_to(catalog).parts
         except ValueError:
             return False
         keys = tuple(part.casefold() for part in parts)
-        # One bounded show/Ai_Ct_image[/show] boundary, or the former flat
-        # Ai_Ct_image/show layout. Unrelated descendants remain out of scope.
+        # One direct show/Ai_Ct_image boundary. Retired saved addresses are
+        # replaced before this check; unrelated descendants stay out of scope.
         return bool(
             (len(keys) == 2 and keys[1] == "ai_ct_image")
-            or (len(keys) == 3 and keys[1] == "ai_ct_image" and keys[0] == keys[2])
-            or (len(keys) == 2 and keys[0] == "ai_ct_image"
-                and discovery.name.casefold() == "projects")
             or (len(keys) == 1 and keys[0] == "ai_ct_image"
                 and _project_id(project).casefold() == catalog.name.casefold())
-            or (len(keys) == 2 and keys[0] == "ai_ct_image" and keys[1] == catalog.name.casefold())
         )
     except Exception:
         return False
@@ -12235,7 +12208,11 @@ class HMBImageAssetLibrary(DataNode):
                 "The selected project is no longer available in the active project catalog."
             )
         current_signature = _asset_manifest_signature(Path(selected["path"]))
-        if current_signature == _clean(normalized.get("manifest_signature")):
+        if (current_signature == _clean(normalized.get("manifest_signature"))
+                and _project_root_text(selected["path"]).casefold()
+                == _project_root_text(normalized.get("project_root")).casefold()
+                and _project_root_text(catalog["catalog_root"]).casefold()
+                == _project_root_text(normalized.get("catalog_root")).casefold()):
             self._hmb_last_manifest_poll_error = ""
             return normalized, None
 
@@ -12284,11 +12261,14 @@ class HMBImageAssetLibrary(DataNode):
         state["asset_refresh_review"] = {}
         token = uuid.uuid4().hex
         project_root = _project_root_text(state.get("project_root"))
+        effective_project_root = project_root
         report: Dict[str, Any] = {}
 
         def refresh() -> Any:
+            nonlocal effective_project_root
             if project_root:
-                audit = _audit_project_manifest_refresh(Path(project_root))
+                effective_project_root = _project_root_text(project_root)
+                audit = _audit_project_manifest_refresh(Path(effective_project_root))
                 report.update(audit)
                 report.update({
                     "request_id": token,
@@ -12301,7 +12281,7 @@ class HMBImageAssetLibrary(DataNode):
                     return state
             loaded = _load_project_catalog(catalog_root, state, use_shared_cache=False)
             if project_root and (
-                _project_root_text(loaded.get("project_root")).casefold() != project_root.casefold()
+                _project_root_text(loaded.get("project_root")).casefold() != effective_project_root.casefold()
                 or _clean(loaded.get("project_uid")) != _clean(state.get("project_uid"))
             ):
                 raise ValueError("The selected project is no longer available; the previous catalog was retained.")
@@ -12312,11 +12292,11 @@ class HMBImageAssetLibrary(DataNode):
             if not project_root:
                 return merged
             if result.get("error"):
-                report.update({"request_id": token, "project_root": project_root,
+                report.update({"request_id": token, "project_root": effective_project_root,
                                "status": "error", "safe_to_clean": False,
                                "error": _clean(result.get("error"))})
             same_project = (
-                _project_root_text(merged.get("project_root")).casefold() == project_root.casefold()
+                _project_root_text(merged.get("project_root")).casefold() == effective_project_root.casefold()
                 and _clean(merged.get("project_uid")) == _clean(state.get("project_uid"))
             )
             if same_project:

@@ -18,8 +18,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.8.31"
-RELEASE_VERSION = "0.8.31"
+RELEASE_LABEL = "v0.8.33"
+RELEASE_VERSION = "0.8.33"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -207,7 +207,9 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
         "schema", "version", "editor_version", "bundle_name", "source_sha256",
         "candidate_sha256", "helper_path", "helper_sha256", "patcher_path", "patcher_sha256",
     }
-    if not isinstance(payload, dict) or set(payload) not in (expected_keys, expected_keys | {"previous_candidate"}):
+    if not isinstance(payload, dict) or set(payload) not in (
+        expected_keys, expected_keys | {"previous_candidate"}, expected_keys | {"previous_candidates"}
+    ):
         raise RuntimeError("Native editor patch descriptor boundary is invalid.")
     if (
         payload["schema"] != "hmb-native-editor-patch-release"
@@ -229,6 +231,17 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
         "helper_sha256": "39e5901cc8aa37d1d11850a255bcc209ab4724afe488817fc3f684a72ab01b63",
     }:
         raise RuntimeError("Native editor previous candidate is not the reviewed patch.")
+    if "previous_candidates" in payload and payload["previous_candidates"] != [
+        {
+            "bundle_sha256": "93b497d21995e23ef6707f0d3a3d39dd897a76d0388f7d7c9677d5cd54ef57c1",
+            "helper_sha256": "2ed5f48b1c454039e84d9cba7499e290111e1d9f1038b157c0391aae794903f8",
+        },
+        {
+            "bundle_sha256": "7bad6f6517c781c54e6d2e0cf170f0b2ed3bdef28b3cca57be79cce54bdd11bf",
+            "helper_sha256": "39e5901cc8aa37d1d11850a255bcc209ab4724afe488817fc3f684a72ab01b63",
+        },
+    ]:
+        raise RuntimeError("Native editor previous candidates are not the reviewed patches.")
     for kind in ("patcher", "helper"):
         relative = payload[kind + "_path"]
         path = ROOT / relative
@@ -252,6 +265,11 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
         ):
             if module_string_constant(patcher, constant) != payload["previous_candidate"][key]:
                 raise RuntimeError("Native editor patcher and previous candidate differ.")
+    if "previous_candidates" in payload:
+        for row, prefix in zip(payload["previous_candidates"], ("SUPPORTED_CURRENT", "SUPPORTED_PREVIOUS")):
+            for suffix, key in (("_CANDIDATE_SHA256", "bundle_sha256"), ("_HELPER_SHA256", "helper_sha256")):
+                if module_string_constant(patcher, prefix + suffix) != row[key]:
+                    raise RuntimeError("Native editor patcher and previous candidates differ.")
     return payload
 
 

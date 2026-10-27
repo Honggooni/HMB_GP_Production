@@ -541,6 +541,10 @@ with tempfile.TemporaryDirectory(prefix="hmb-native-release-boundary-") as nativ
     descriptor_file = native_root / descriptor_relative
     with mock.patch.object(builder, "ROOT", native_root):
         assert builder.validate_native_editor_patch_sources() == native_descriptor
+        legacy_previous = {
+            "bundle_sha256": "7bad6f6517c781c54e6d2e0cf170f0b2ed3bdef28b3cca57be79cce54bdd11bf",
+            "helper_sha256": "39e5901cc8aa37d1d11850a255bcc209ab4724afe488817fc3f684a72ab01b63",
+        }
         for field, invalid in (
             ("version", True), ("editor_version", "0.128.2"),
             ("bundle_name", "other.js"), ("helper_path", "../other.js"),
@@ -550,8 +554,18 @@ with tempfile.TemporaryDirectory(prefix="hmb-native-release-boundary-") as nativ
             ("previous_candidate", None),
             ("previous_candidate", []),
             ("previous_candidate", {"bundle_sha256": "0" * 64, "helper_sha256": "0" * 64}),
-            ("previous_candidate", {**native_descriptor["previous_candidate"], "helper_sha256": "0" * 64}),
-            ("previous_candidate", {**native_descriptor["previous_candidate"], "extra": "unreviewed"}),
+            ("previous_candidate", {**legacy_previous, "helper_sha256": "0" * 64}),
+            ("previous_candidate", {**legacy_previous, "extra": "unreviewed"}),
+            ("previous_candidates", None),
+            ("previous_candidates", {}),
+            ("previous_candidates", []),
+            ("previous_candidates", list(reversed(native_descriptor["previous_candidates"]))),
+            ("previous_candidates", [*native_descriptor["previous_candidates"], legacy_previous]),
+            ("previous_candidates", [legacy_previous, legacy_previous]),
+            ("previous_candidates", [
+                {**native_descriptor["previous_candidates"][0], "helper_sha256": "0" * 64},
+                legacy_previous,
+            ]),
         ):
             mutated = dict(native_descriptor, **{field: invalid})
             descriptor_file.write_text(json.dumps(mutated), encoding="utf-8")
@@ -561,6 +575,21 @@ with tempfile.TemporaryDirectory(prefix="hmb-native-release-boundary-") as nativ
                 pass
             else:
                 raise AssertionError("Native editor descriptor accepted mutation: " + field)
+        # The older single-previous descriptor remains a supported format,
+        # but mixing formats or adding an unreviewed helper never does.
+        legacy_descriptor = {key: value for key, value in native_descriptor.items() if key != "previous_candidates"}
+        legacy_descriptor["previous_candidate"] = legacy_previous
+        descriptor_file.write_text(json.dumps(legacy_descriptor), encoding="utf-8")
+        assert builder.validate_native_editor_patch_sources() == legacy_descriptor
+        for invalid in (None, [], {**legacy_previous, "helper_sha256": "0" * 64},
+                        {**legacy_previous, "extra": "unreviewed"}):
+            descriptor_file.write_text(json.dumps(dict(legacy_descriptor, previous_candidate=invalid)), encoding="utf-8")
+            try:
+                builder.validate_native_editor_patch_sources()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("Native editor accepted an unreviewed legacy helper.")
         descriptor_file.write_text(json.dumps(native_descriptor), encoding="utf-8")
         (native_root / native_descriptor["helper_path"]).unlink()
         try:

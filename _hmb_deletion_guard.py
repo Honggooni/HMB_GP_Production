@@ -14,6 +14,8 @@ from typing import Any
 
 LIBRARY = "HMB_GP_Production"
 CODE = "HMB_DELETE_CONNECTED"
+PROTECTION_VERSION = 2
+LIFETIME_GATE_ATTRIBUTE = "_hmb_connected_deletion_lifetime_v2"
 _DESTRUCTIVE = {
     "DeleteNodeRequest": ("node_events", "DeleteNodeResultFailure"),
     "ResetNodeToDefaultsRequest": ("node_events", "ResetNodeToDefaultsResultFailure"),
@@ -28,6 +30,27 @@ _LOAD_PARENTS = {"RunWorkflowFromScratchRequest", "RunWorkflowFromRegistryReques
 _TEARDOWN_CHILDREN = {"ClearAllObjectStateRequest", "DeleteFlowRequest", "DeleteNodeRequest"}
 _teardown_engine: ContextVar[int | None] = ContextVar("hmb_deletion_load_teardown", default=None)
 _HANDLERS = globals().get("_HANDLERS", weakref.WeakKeyDictionary())
+
+
+def protection_readiness(engine: Any) -> tuple[bool, str]:
+    """Report the installed engine gate, never an optimistic library lease."""
+    gate = getattr(engine.event_manager, LIFETIME_GATE_ATTRIBUTE, None)
+    if (getattr(gate, "protection_version", None) != PROTECTION_VERSION
+            or not callable(getattr(gate, "engine_ref", None))
+            or gate.engine_ref() is not engine
+            or getattr(gate, "installed", False) is not True):
+        return False, "[HMB_DELETE_GUARD_NOT_READY] 삭제 보호가 준비되지 않았습니다. Griptape를 다시 시작하세요."
+    try:
+        installed = callable(getattr(gate, "is_registered", None)) and gate.is_registered()
+    except Exception:
+        installed = False
+    if not installed:
+        gate.ready = False
+        gate.readiness_error = "[HMB_DELETE_GUARD_NOT_READY] 삭제 보호 요청 gate가 등록되어 있지 않습니다. 라이브러리를 새로고침하거나 Griptape를 다시 시작하세요."
+        return False, gate.readiness_error
+    if getattr(gate, "ready", False) is not True:
+        return False, str(getattr(gate, "readiness_error", "")) or "[HMB_DELETE_GUARD_NOT_READY] 삭제 보호 초기화가 완료되지 않았습니다."
+    return True, ""
 
 
 def _is_hmb(node: Any) -> bool:
@@ -359,15 +382,28 @@ def install_request_handlers(engine: Any, registration: Any) -> Any:
     is the editor's existing New/Close view action after its save/discard UI;
     it releases the loaded view, never deletes a saved workflow or media file.
     """
-    from dataclasses import dataclass, field
+    from dataclasses import dataclass, field, fields
     from griptape_nodes.retained_mode.events.base_events import (
         RequestPayload, ResultPayloadSuccess, ResultPayloadFailure)
     from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
     from griptape_nodes.retained_mode.request_handlers import handles
 
+    payload_names = ("HMBCheckNodeDeletionRequest", "HMBCheckNodeDeletionResultSuccess",
+                     "HMBCheckNodeDeletionResultFailure", "HMBPrepareWorkflowTransitionRequest")
+    for name in payload_names:
+        registered = PayloadRegistry.get_type(name)
+        if registered is not None and globals().get(name) is not registered:
+            raise RuntimeError("[HMB_DELETE_GUARD_RESTART_REQUIRED] 이전 삭제 보호 payload가 Engine에 남아 있습니다. Griptape를 다시 시작하세요.")
+    existing_result = globals().get("HMBCheckNodeDeletionResultSuccess")
+    if existing_result is not None and not {
+            "protection_ready", "protection_version", "readiness_error"}.issubset(
+                {row.name for row in fields(existing_result)}):
+        raise RuntimeError("[HMB_DELETE_GUARD_RESTART_REQUIRED] 이전 삭제 보호 응답 형식이 남아 있습니다. Griptape를 다시 시작하세요.")
+
     # The SDK owns one handler per payload type and forbids duplicate
     # registration. Keep that handler stable over a library refresh, changing
-    # only its weak lease to the current registration. Unload leaves it inert.
+    # only its weak lease to the current registration. During an unload gap,
+    # retained HMB data can still use the engine-owned read-only preflight.
     previous = _HANDLERS.get(engine)
     if previous is not None:
         previous.owner_ref = weakref.ref(registration)
@@ -387,11 +423,16 @@ def install_request_handlers(engine: Any, registration: Any) -> Any:
             blocked: dict[str, list[str]] = field(default_factory=dict)
             hmb_node_names: list[str] = field(default_factory=list)
             message: str = ""
+            protection_ready: bool = False
+            protection_version: int = PROTECTION_VERSION
+            readiness_error: str = ""
 
         @PayloadRegistry.register
         @dataclass
         class HMBCheckNodeDeletionResultFailure(ResultPayloadFailure):
-            pass
+            protection_ready: bool = False
+            protection_version: int = PROTECTION_VERSION
+            readiness_error: str = ""
 
         @PayloadRegistry.register
         @dataclass
@@ -413,15 +454,21 @@ def install_request_handlers(engine: Any, registration: Any) -> Any:
         def check(self, request: Any) -> Any:
             owner, current = self.owner_ref(), self.engine_ref()
             failure = globals()["HMBCheckNodeDeletionResultFailure"]
-            if owner is None or not owner.active or current is None:
+            if current is None:
                 return failure(result_details="HMB 삭제 보호를 사용할 수 없습니다. 라이브러리를 새로고침하세요.")
             if (not isinstance(request.node_names, list) or len(request.node_names) > 4096
                     or any(not isinstance(name, str) or not name for name in request.node_names)):
                 return failure(result_details="삭제할 노드 목록이 올바르지 않습니다.")
             try:
+                retained = _retained_nodes(current)
+                if ((owner is None or not owner.active)
+                        and not any(_is_hmb(node) for node in retained.values())):
+                    return failure(result_details="HMB 삭제 보호를 사용할 수 없습니다. 라이브러리를 새로고침하세요.")
+                ready, readiness_error = protection_readiness(current)
+                if not ready:
+                    return failure(result_details=readiness_error, readiness_error=readiness_error)
                 names = _selection_scope(current, request.node_names)
                 blocked = connected_targets(current, names)
-                retained = _retained_nodes(current)
                 hmb = {name for name in names if name in retained and _is_hmb(retained[name])}
                 # A selected standard group owns its HMB children. Keep that
                 # group visible until native deletion succeeds as well; a new
@@ -439,7 +486,8 @@ def install_request_handlers(engine: Any, registration: Any) -> Any:
                         owner = getattr(retained.get(owner_name), "parent_group", None)
                 return globals()["HMBCheckNodeDeletionResultSuccess"](
                     can_delete=not blocked, blocked=blocked, hmb_node_names=sorted(hmb),
-                    message=message(blocked) if blocked else "", result_details="HMB deletion preflight completed.")
+                    message=message(blocked) if blocked else "", result_details="HMB deletion preflight completed.",
+                    protection_ready=True)
             except Exception:
                 return failure(result_details="[HMB_DELETE_CHECK_FAILED] 연결 상태 확인에 실패하여 삭제하지 않았습니다.")
 
@@ -448,8 +496,18 @@ def install_request_handlers(engine: Any, registration: Any) -> Any:
             from griptape_nodes.retained_mode.events.object_events import (
                 ClearAllObjectStateRequest, ClearAllObjectStateResultFailure)
             owner, current = self.owner_ref(), self.engine_ref()
-            if owner is None or not owner.active or current is None:
+            if current is None:
                 return ClearAllObjectStateResultFailure(result_details="HMB 워크플로 전환을 사용할 수 없습니다.")
+            try:
+                ready, readiness_error = protection_readiness(current)
+                retained = _retained_nodes(current)
+                if not ready:
+                    return ClearAllObjectStateResultFailure(result_details=readiness_error)
+                if ((owner is None or not owner.active)
+                        and not any(_is_hmb(node) for node in retained.values())):
+                    return ClearAllObjectStateResultFailure(result_details="HMB 워크플로 전환을 사용할 수 없습니다.")
+            except Exception:
+                return ClearAllObjectStateResultFailure(result_details="[HMB_DELETE_CHECK_FAILED] 워크플로 전환 상태를 확인하지 못했습니다.")
             token = _teardown_engine.set(id(current))
             try:
                 return await current.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))

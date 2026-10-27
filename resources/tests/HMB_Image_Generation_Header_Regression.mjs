@@ -22,7 +22,11 @@ const report = {
   source_sha256: crypto.createHash("sha256").update(source).digest("hex"),
   screenshot_kind: "synthetic fixture of the actual widget in isolated Chrome; no live Griptape claim",
 };
-assert.doesNotMatch(source, /\b(?:fetch|XMLHttpRequest|WebSocket|MutationObserver|ResizeObserver|setInterval|setTimeout)\b/);
+// The static image header stays observer-free. The separately tested common
+// stock-editor deletion lease owns one document observer for every HMB widget.
+const headerSource = source.split("// HMB_NATIVE_STOCK_SAFETY_V1_BEGIN", 1)[0];
+assert.doesNotMatch(headerSource, /\b(?:MutationObserver|ResizeObserver)\b/);
+assert.doesNotMatch(source, /\b(?:fetch|XMLHttpRequest|WebSocket|setInterval|setTimeout)\b/);
 assert.doesNotMatch(source, /\b(?:onChange|onCommand)\b/);
 // Approved DOM-only portal lifecycle; provider/engine transports remain forbidden.
 const listenedEvents = [...source.matchAll(/(?:addEventListener|removeEventListener)\?\.\("([^"]+)"/g)].map(match => match[1]);

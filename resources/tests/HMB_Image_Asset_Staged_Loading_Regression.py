@@ -55,7 +55,7 @@ if os.environ.get("LOCALAPPDATA") and not os.environ.get(
 asset_library._ASSET_THUMBNAIL_CACHE_ROOT = temporary / "runtime-cache"
 try:
     catalog_root = temporary / "Projects"
-    project_root = catalog_root / "ProjectA"
+    project_root = catalog_root / "ProjectA" / "Ai_Ct_image"
     asset_folder = project_root / "Assets"
     asset_folder.mkdir(parents=True)
     hero_path = asset_folder / "Hero.png"
@@ -1366,7 +1366,7 @@ try:
     catalog_project_path = next(
         item["path"]
         for item in catalog_state["projects"]
-        if item["name"] == project_root.name
+        if item["name"] == project_root.parent.name
     )
     catalog_state = asset_library._select_catalog_project(
         catalog_state,

@@ -27,9 +27,8 @@ from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 try:
     from griptape_nodes.retained_mode.engine import current_engine
 except ImportError:
-    # The declared Engine 0.93 minimum predates the engine-scoped accessor.
-    # Keep the library loadable there; only this optional cold-start guard
-    # requires that newer API.
+    # Keep import possible so the library-load hook can report the required
+    # deletion-protection API explicitly, rather than silently omitting it.
     current_engine = None
 from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowRequest,
@@ -74,6 +73,8 @@ _EMPTY_CONTEXT_MESSAGE = (
 )
 _REGISTRY_LOCK = threading.RLock()
 _REGISTRATIONS: Any = weakref.WeakKeyDictionary()
+_DELETION_GATE_ATTRIBUTE = "_hmb_connected_deletion_lifetime_v2"
+_DELETION_PROTECTION_VERSION = 2
 _WINDOWS_CLOSE_GUARD_MARKER = "_hmb_windows_transport_close_guard_v1"
 _WINDOWS_CLOSE_GUARD_AST_SHA256 = "1726d603431044758617fdb85927f558ed7c179445672c34e73ce1712bdc1958"
 _WINDOWS_CLOSE_GUARD_LOCK_KEY = "_hmb_windows_transport_close_lock_v1"
@@ -1254,6 +1255,126 @@ def _registered_unsaved_workflow(name: Any) -> bool:
         return False
 
 
+class _DeletionProtectionError(RuntimeError):
+    """A critical editor safety seam was not installed; never optional success."""
+
+
+class _DeletionLifetimeGate:
+    """Engine-owned guard independent of unloadable library registration leases."""
+    protection_version = _DELETION_PROTECTION_VERSION
+
+    def __init__(self, engine: Any, manager: Any, callback: Any) -> None:
+        self.engine_ref = weakref.ref(engine)
+        self.manager_ref = weakref.ref(manager)
+        self.callback = callback
+        self.installed = False
+        self.ready = False
+        self.readiness_error = "[HMB_DELETE_GUARD_NOT_READY] 삭제 보호 초기화가 완료되지 않았습니다."
+        self.hook = self.before_dispatch
+
+    def is_registered(self) -> bool:
+        manager = self.manager_ref()
+        if manager is None:
+            return False
+        hooks = getattr(manager, "_pre_dispatch_hooks", None)
+        lock = getattr(manager, "_pre_dispatch_hooks_lock", None) or getattr(manager, "_lock", None)
+        if not isinstance(hooks, list) or not hasattr(lock, "__enter__") or not hasattr(lock, "__exit__"):
+            raise RuntimeError("The SDK deletion-hook inventory is unavailable")
+        with lock:
+            return any(hook is self.hook for hook in hooks)
+
+    def before_dispatch(self, request: Any, _result_context: Any) -> Any:
+        if type(request).__name__ not in {"DeleteNodeRequest", "ResetNodeToDefaultsRequest",
+                "DeleteFlowRequest", "ClearAllObjectStateRequest", "DeleteWorkflowRequest"}:
+            return None
+        engine, manager = self.engine_ref(), self.manager_ref()
+        if engine is None or manager is None:
+            return None
+        # A trusted consolidation transaction transfers retained identities
+        # before removing obsolete instances. Request flags never grant this.
+        try:
+            inventory = engine.node_manager._name_to_parent_flow_name
+            if not isinstance(inventory, dict):
+                raise RuntimeError("Retained HMB inventory is unavailable")
+            has_hmb = False
+            for name in tuple(inventory):
+                node = engine.node_manager.get_node_by_name(name)
+                metadata = getattr(node, "metadata", None)
+                if node is None or not isinstance(metadata, dict):
+                    raise RuntimeError("Retained node ownership is unavailable")
+                has_hmb = has_hmb or metadata.get("library") == _LIBRARY_NAME
+            if not has_hmb:
+                return None  # A positively inventoried standard-only graph is native-owned.
+            migration = sys.modules.get("_hmb_workflow_migration")
+            if migration is not None and migration.mutation_is_internal():
+                return None
+            if engine.event_manager is not manager or not callable(self.callback):
+                raise RuntimeError("The engine deletion gate lost its request handler")
+            return self.callback(engine, request)
+        except Exception:
+            from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
+            return GenericResultFailure(result_details=(
+                "[HMB_DELETE_CHECK_FAILED] 삭제 보호 상태를 확인하지 못해 요청을 중단했습니다. "
+                "Griptape를 다시 시작하세요. 기존 데이터는 유지됩니다."))
+
+
+def _install_deletion_lifetime_gate(engine: Any, manager: Any) -> tuple[Any, Any]:
+    required = ("add_pre_dispatch_hook", "remove_pre_dispatch_hook", "register_request_handlers")
+    if any(not callable(getattr(manager, name, None)) for name in required):
+        error = (
+            "[HMB_DELETE_GUARD_UNSUPPORTED] HMB 삭제 보호에는 Engine 0.101.3 이상의 "
+            "predispatch/request-handler API가 필요합니다. Griptape를 업데이트하세요.")
+        existing = getattr(manager, _DELETION_GATE_ATTRIBUTE, None)
+        if (getattr(existing, "protection_version", None) == _DELETION_PROTECTION_VERSION
+                and callable(getattr(existing, "engine_ref", None))
+                and existing.engine_ref() is engine):
+            existing.ready = False
+            existing.readiness_error = error
+        raise _DeletionProtectionError(error)
+    gate = getattr(manager, _DELETION_GATE_ATTRIBUTE, None)
+    if gate is None:
+        gate = _DeletionLifetimeGate(engine, manager, None)
+        manager.add_pre_dispatch_hook(gate.hook)
+        setattr(manager, _DELETION_GATE_ATTRIBUTE, gate)
+    elif (getattr(gate, "protection_version", None) != _DELETION_PROTECTION_VERSION
+            or not callable(getattr(gate, "engine_ref", None))
+            or gate.engine_ref() is not engine
+            or not callable(getattr(gate, "manager_ref", None))
+            or gate.manager_ref() is not manager
+            or not callable(getattr(gate, "is_registered", None))):
+        raise _DeletionProtectionError("[HMB_DELETE_GUARD_NOT_READY] 삭제 보호 등록의 소유권을 확인하지 못했습니다. Griptape를 다시 시작하세요.")
+    gate.ready = False
+    gate.readiness_error = "[HMB_DELETE_GUARD_NOT_READY] 삭제 보호 초기화가 완료되지 않았습니다."
+    if not gate.is_registered():
+        manager.add_pre_dispatch_hook(gate.hook)
+    if not gate.is_registered():
+        raise _DeletionProtectionError(gate.readiness_error)
+    gate.installed = True
+    try:
+        module = importlib.import_module("_hmb_deletion_guard")
+    except Exception as exc:
+        raise _DeletionProtectionError(gate.readiness_error) from exc
+    expected = Path(__file__).with_name("_hmb_deletion_guard.py").resolve()
+    if Path(getattr(module, "__file__", "")).resolve() != expected:
+        gate.readiness_error = "[HMB_DELETE_GUARD_NOT_READY] 다른 HMB 설치의 삭제 보호 모듈이 로드되어 있습니다. Griptape를 다시 시작하세요."
+        raise _DeletionProtectionError(gate.readiness_error)
+    callback = getattr(module, "guard_request", None)
+    if callable(callback):
+        gate.callback = callback
+    # Git updates do not necessarily evict this helper from sys.modules. Keep
+    # its exact old guard callable alive; never re-register SDK payload types.
+    if (getattr(module, "PROTECTION_VERSION", None) != _DELETION_PROTECTION_VERSION
+            or not callable(getattr(module, "protection_readiness", None))):
+        gate.ready = False
+        gate.readiness_error = "[HMB_DELETE_GUARD_RESTART_REQUIRED] 이전 삭제 보호 코드가 메모리에 남아 있습니다. Griptape를 완전히 종료한 뒤 다시 시작하세요."
+        raise _DeletionProtectionError(gate.readiness_error)
+    if not callable(callback):
+        gate.ready = False
+        gate.readiness_error = "[HMB_DELETE_GUARD_NOT_READY] 삭제 보호 함수가 준비되지 않았습니다."
+        raise _DeletionProtectionError(gate.readiness_error)
+    return gate, module
+
+
 class _Registration:
     def __init__(self, engine: Any, manager: Any) -> None:
         self.engine = weakref.ref(engine)
@@ -1275,6 +1396,7 @@ class _Registration:
         self.snapshot_post_types: list[Any] = []
         self.web_worker_module = None
         self.deletion_handlers = None
+        self.deletion_protection = None
         self.connection_handlers = None
 
     def start_web_worker(self) -> None:
@@ -1423,6 +1545,12 @@ class _Registration:
         }:
             return None
         engine, manager = self.engine(), self.manager()
+        gate = getattr(manager, _DELETION_GATE_ATTRIBUTE, None)
+        try:
+            if gate is not None and gate.is_registered():
+                return None  # The engine-owned gate already ran before this lease.
+        except Exception:
+            pass  # An active legacy lease still protects an unverifiable gate.
         if not self._prompt_owner(engine, manager):
             return None
         # Consolidation transfers retained identities/results before removing
@@ -1719,17 +1847,33 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
 
     def before_library_nodes_loaded(self, library_data: Any, library: Any) -> None:
         """Register at library load, before the first lazy CreateNode check."""
+        if library_data.name != _LIBRARY_NAME:
+            return
+        if not callable(current_engine):
+            self._hmb_deletion_readiness_error = "[HMB_DELETE_GUARD_UNSUPPORTED] Engine 현재 컨텍스트 API를 사용할 수 없습니다. Griptape를 업데이트하세요."
+            raise _DeletionProtectionError(self._hmb_deletion_readiness_error)
+        engine = current_engine()
+        if engine is None:
+            self._hmb_deletion_readiness_error = "[HMB_DELETE_GUARD_NOT_READY] 현재 Engine 컨텍스트를 확인하지 못했습니다. Griptape를 다시 시작하세요."
+            raise _DeletionProtectionError(self._hmb_deletion_readiness_error)
+        if engine.library_manager.is_worker is True:
+            return  # Worker execution is not the retained desktop editor.
+        if engine.library_manager.is_worker is not False:
+            self._hmb_deletion_readiness_error = "[HMB_DELETE_GUARD_NOT_READY] Engine 편집기/worker 소유권을 확인하지 못했습니다."
+            raise _DeletionProtectionError(self._hmb_deletion_readiness_error)
+        manager = engine.event_manager
         try:
-            if library_data.name != _LIBRARY_NAME or not callable(current_engine):
-                return
-            engine = current_engine()
-            if engine.library_manager.is_worker is not False:
-                return
-            manager = engine.event_manager
-            if not callable(getattr(manager, "add_pre_dispatch_hook", None)) or not callable(
-                getattr(manager, "remove_pre_dispatch_hook", None)
-            ):
-                return
+            with _REGISTRY_LOCK:
+                gate, deletion_module = _install_deletion_lifetime_gate(engine, manager)
+        except Exception as exc:
+            error = str(exc) if isinstance(exc, _DeletionProtectionError) else "[HMB_DELETE_GUARD_NOT_READY] 삭제 보호 초기화에 실패했습니다. Griptape를 다시 시작하세요."
+            self._hmb_deletion_readiness_error = error
+            if isinstance(exc, _DeletionProtectionError):
+                raise
+            raise _DeletionProtectionError(error) from exc
+        gate.ready = False
+        gate.readiness_error = "[HMB_DELETE_GUARD_NOT_READY] 삭제 보호 등록이 완료되지 않았습니다."
+        try:
             library_reference = weakref.ref(library)
             with _REGISTRY_LOCK:
                 registration = _REGISTRATIONS.get(manager)
@@ -1749,13 +1893,18 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
                             registration.snapshot_post_types.append(request_type)
                     _REGISTRATIONS[manager] = registration
                 elif registration.engine() is not engine:
-                    return
+                    raise _DeletionProtectionError("[HMB_DELETE_GUARD_NOT_READY] 등록된 Engine 소유권이 변경되었습니다.")
                 with registration.lock:
                     registration.owners[self] = library_reference
                     self._registrations.add(registration)
+                    registration.deletion_protection = gate
                     if registration.deletion_handlers is None:
-                        from _hmb_deletion_guard import install_request_handlers
-                        registration.deletion_handlers = install_request_handlers(engine, registration)
+                        registration.deletion_handlers = deletion_module.install_request_handlers(engine, registration)
+                    if registration.deletion_handlers is None:
+                        raise _DeletionProtectionError("[HMB_DELETE_GUARD_NOT_READY] 삭제 보호 요청 핸들러가 등록되지 않았습니다.")
+                    gate.ready = True
+                    gate.readiness_error = ""
+                    self._hmb_deletion_readiness_error = ""
                     if registration.connection_handlers is None:
                         from _hmb_connection_management import install_request_handlers
                         registration.connection_handlers = install_request_handlers(engine, registration)
@@ -1766,9 +1915,15 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
                     except ImportError:
                         pass  # Older hosts can omit this optional SDK seam.
                     registration.start_web_worker()
-        except Exception:
-            # Optional cold-start compatibility never blocks library loading.
-            return
+        except Exception as exc:
+            if not gate.ready:
+                gate.readiness_error = (str(exc) if "[HMB_DELETE_GUARD_RESTART_REQUIRED]" in str(exc)
+                    else "[HMB_DELETE_GUARD_NOT_READY] 삭제 보호 초기화에 실패했습니다. Griptape를 다시 시작하세요.")
+                self._hmb_deletion_readiness_error = gate.readiness_error
+                raise _DeletionProtectionError(gate.readiness_error) from exc
+            # Windows compatibility, environment coordination and the web
+            # worker are optional. Their failure must not remove a ready gate.
+            logging.getLogger(__name__).warning("[HMB_OPTIONAL_BOOTSTRAP_FAILED] %s", type(exc).__name__)
 
     def before_library_unregistered(self, _library_data: Any, _library: Any) -> None:
         with _REGISTRY_LOCK:

@@ -229,6 +229,15 @@ class InstallerTransaction(unittest.TestCase):
         self.native.parent.mkdir(parents=True)
         self.native.write_bytes(self.native_original)
         (self.native.parent.parent / ".version").write_text("0.128.1")
+        sdk_site = self.native.parents[2] / "engine-bundle/python/Lib/site-packages"
+        self.sdk_engine = sdk_site / "griptape_nodes/retained_mode/engine.py"
+        sdk_events = self.sdk_engine.parent / "managers/event_manager.py"
+        sdk_metadata = sdk_site / "griptape_nodes-0.101.3.dist-info/METADATA"
+        for path in (self.sdk_engine, sdk_events, sdk_metadata):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        self.sdk_engine.write_text("raise AssertionError('SDK must not execute')\ndef current_engine(): pass\n")
+        sdk_events.write_text("class EventManager:\n    def add_pre_dispatch_hook(self, hook): pass\n    def remove_pre_dispatch_hook(self, hook): pass\n    def register_request_handlers(self, owner): pass\n")
+        sdk_metadata.write_text("Name: griptape-nodes\nVersion: 0.101.3\n")
         self.native_state = self.base / "native-editor-installs"
         patcher_name = "tools/hmb_color_lut_native_header_patch.py"
         patcher_text = (ROOT / patcher_name).read_text("utf-8")
@@ -378,6 +387,17 @@ try {
 
     def test_backup_move_failure_leaves_existing_target_untouched(self):
         self.assert_preserved_failure("move", "INJECTED backup move failure")
+        self.assertEqual(list(self.rollback.iterdir()), [])
+
+    def test_unsupported_sdk_stops_before_first_library_move(self):
+        self.sdk_engine.write_text("def unsupported_old_engine(): pass\n")
+        result = self.run_install()
+        self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
+        self.assertIn("Native editor prepare failed", result.stdout)
+        self.assertIn("Missing engine.current_engine", result.stderr)
+        self.assertEqual(self.inventory(self.target), self.before)
+        self.assertEqual(self.native.read_bytes(), self.native_original)
+        self.assertFalse(self.native_state.exists())
         self.assertEqual(list(self.rollback.iterdir()), [])
 
     def test_immediate_post_backup_failure_restores_exact_previous_files(self):

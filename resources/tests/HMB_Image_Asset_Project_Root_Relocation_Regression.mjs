@@ -16,9 +16,19 @@ const source = sourceBytes.toString('utf8');
 const sha = (value) => crypto.createHash('sha256').update(value).digest('hex');
 const widget = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
 const old = '//fin-rcomp1/Composite_Team/projects_AI';
-const next = '//192.168.200.19/v/projects/Ai_Ct_image';
+const next = '//192.168.200.19/v/projects';
+const show = next + '/superwings12/Ai_Ct_image';
 for (const prefix of [old, old.toUpperCase(), old.replaceAll('/', '\\')]) {
-  assert.equal(widget.hmbRelocateImageProjectPath(prefix + '/superwings12/캐릭터/Hero.png'), next + '/superwings12/캐릭터/Hero.png');
+  assert.equal(widget.hmbRelocateImageProjectPath(prefix + '/superwings12/캐릭터/Hero.png'), show + '/캐릭터/Hero.png');
+}
+for (const base of ['P:/projects', next]) {
+  assert.equal(widget.hmbRelocateImageProjectPath(base + '/Ai_Ct_image'), base);
+  for (const suffix of ['', '/CH/Hero.png']) {
+    const expected = base + '/superwings12/Ai_Ct_image' + suffix;
+    assert.equal(widget.hmbRelocateImageProjectPath(base + '/Ai_Ct_image/superwings12' + suffix), expected);
+    assert.equal(widget.hmbRelocateImageProjectPath(base + '/superwings12/Ai_Ct_image/superwings12' + suffix), expected);
+    assert.equal(widget.hmbRelocateImageProjectPath(expected), expected);
+  }
 }
 for (const path of [old + '_archive/Hero.png', '//artist-server/custom-projects', 'D:/MyProject', 'https://example.com/hero.png']) {
   assert.equal(widget.hmbRelocateImageProjectPath(path), path);
@@ -31,16 +41,77 @@ raw.shot_routing = widget.hmbNormalizeImageAssetState({}).shot_routing;
 const before = JSON.stringify(raw);
 const moved = widget.hmbNormalizeImageAssetState(raw);
 assert.equal(moved.catalog_root,next);
-assert.equal(moved.project_root,next+'/superwings12');
+assert.equal(moved.project_root,show);
 assert.equal(moved.projects[0].path,moved.project_root);
-assert.equal(moved.assets[0].path,next+'/superwings12/Character/Hero.png');
+assert.equal(moved.assets[0].path,show+'/Character/Hero.png');
 for (const key of ['asset_library_id','source_uid','asset_id','selected','selection_order']) assert.equal(moved.assets[0][key],raw.assets[0][key]);
-assert.deepEqual(widget.hmbNormalizeImageAssetState(JSON.parse(before.replaceAll(old,next))),moved);
+assert.deepEqual(widget.hmbNormalizeImageAssetState(JSON.parse(before.replaceAll(old+'/superwings12',show).replaceAll(old,next))),moved);
 assert.deepEqual(widget.hmbNormalizeImageAssetState(moved),moved);
 assert.equal(JSON.stringify(raw),before);
 assert.equal(widget.hmbNormalizeImageAssetState({}).catalog_root,next);
 assert.match(source,/const nativePath = hmbRelocateImageProjectPath\(nativeProjectRootValue\(container\)\)/);
 console.log('ImageAsset UI share relocation, saved state and native-root echo: PASS');
+
+// Preserve the complete authenticated CGT forest while replacing only a
+// retired address of the same project. The root may already be canonical.
+const cgtFixture = (root) => {
+  let state = widget.hmbNormalizeImageAssetState({ ...structuredClone(raw), project_root: root });
+  const account = crypto.randomUUID(), pipeline = crypto.randomUUID();
+  const members = Array.from({ length: 5 }, (_, offset) => {
+    const index = offset + 1, task = crypto.randomUUID(), name = `e201s${String(index).padStart(3, '0')}c001__`;
+    return { member_id: 'cgt:' + task, origin: 'cgt', manual_uuid: crypto.randomUUID(),
+      source_name: name, canonical_name: name, gp_shot_uuid: offset ? crypto.randomUUID() : state.shot_routing.shots[0].shot_uuid,
+      parent_id: null, selection_order: index, cgt_task_id: task, artist: 'Fixture Artist', status: 'InProgress',
+      cgt_identity: { entity_id: crypto.randomUUID(), task_id: task, pipeline_id: pipeline } };
+  });
+  members[1].parent_id = members[0].member_id;
+  members[2].parent_id = members[1].member_id;
+  members[4].parent_id = members[3].member_id;
+  const binding = { schema: 'hmb-shot-hierarchy', version: 2, binding_id: crypto.randomUUID(), revision: 1,
+    project_identity: root.toLowerCase(), channel_uuid: state.shot_routing.channel_uuid, cgt_account_id: account,
+    cgt_scope: { origin: 'https://cgt.fixture.invalid', project_id: crypto.randomUUID(), project_db: 'fixture_sw12',
+      module: 'shot', module_type: 'task', pipeline_id: pipeline, account_id: account }, members };
+  state = widget.hmbApplyShotHierarchyEdit(state, { schema: 'hmb-shot-hierarchy-edit', version: 1,
+    expected_generation: state.shot_routing.generation, expected_binding_revision: 0, removed_member_ids: [], binding });
+  state.shot_routing.shots.forEach(shot => { shot.selected_source_uids = [state.assets[0].source_uid]; });
+  return widget.hmbNormalizeImageAssetState(state);
+};
+let hierarchyCases = 0;
+for (const previousRoot of [old + '/superwings12', next + '/Ai_Ct_image/superwings12',
+  'P:/projects/Ai_Ct_image/superwings12', next + '/superwings12/Ai_Ct_image/superwings12', next + '/Ai_Ct_image/Katuri8']) {
+  const canonicalRoot = widget.hmbRelocateImageProjectPath(previousRoot), expected = cgtFixture(canonicalRoot);
+  for (const savedRoot of [previousRoot, canonicalRoot]) {
+    const saved = structuredClone(expected);
+    saved.project_root = savedRoot;
+    saved.shot_hierarchy.project_identity = previousRoot.toLowerCase();
+    const untouched = JSON.stringify(saved), restored = widget.hmbNormalizeImageAssetState(JSON.parse(untouched));
+    assert.deepEqual(restored.shot_hierarchy, expected.shot_hierarchy);
+    assert.deepEqual(restored.shot_routing, expected.shot_routing);
+    assert.equal(restored.project_uid, expected.project_uid);
+    assert.equal(restored.project_cache_uid, expected.project_cache_uid);
+    assert.deepEqual(widget.hmbNormalizeImageAssetState(JSON.parse(JSON.stringify(restored))), restored);
+    assert.deepEqual(widget.hmbValidateHierarchyRouting(restored.shot_hierarchy, restored.shot_routing), expected.shot_hierarchy);
+    const reconfirm = structuredClone(restored.shot_hierarchy); reconfirm.revision += 1;
+    assert.deepEqual(widget.hmbApplyShotHierarchyEdit(restored, { schema: 'hmb-shot-hierarchy-edit', version: 1,
+      expected_generation: restored.shot_routing.generation, expected_binding_revision: restored.shot_hierarchy.revision,
+      removed_member_ids: [], binding: reconfirm }), restored);
+    assert.equal(JSON.stringify(saved), untouched);
+    hierarchyCases += 1;
+  }
+  for (const foreignIdentity of [next + '/Ai_Ct_image/Other_Show', 'D:/explicit/custom-project']) {
+    const foreign = structuredClone(expected);
+    foreign.shot_hierarchy.project_identity = foreignIdentity.toLowerCase();
+    const rejected = widget.hmbNormalizeImageAssetState(foreign);
+    assert.deepEqual(rejected.shot_hierarchy, foreign.shot_hierarchy);
+    const stolen = structuredClone(rejected.shot_hierarchy);
+    stolen.project_identity = canonicalRoot.toLowerCase(); stolen.revision += 1;
+    assert.throws(() => widget.hmbApplyShotHierarchyEdit(rejected, { schema: 'hmb-shot-hierarchy-edit', version: 1,
+      expected_generation: rejected.shot_routing.generation, expected_binding_revision: rejected.shot_hierarchy.revision,
+      removed_member_ids: [], binding: stolen }));
+    hierarchyCases += 1;
+  }
+}
+console.log(`ImageAsset UI CGT v2 hierarchy relocation/5-slot identity/reopen/foreign scope: PASS (${hierarchyCases} cases)`);
 
 // A scan deliberately clears project_id/UID/cache until the backend resolves
 // authority. Its catalog name is display evidence only, never a replacement ID.
@@ -278,13 +349,13 @@ if (!playwright || !fs.existsSync(executablePath)) {
     // must be synchronized after its children are reordered/renamed/removed,
     // and a temporarily missing catalog cannot erase a selected project path.
     await page.evaluate(() => {
-      const f = fixture, root = '//192.168.200.19/v/projects/Ai_Ct_image';
+      const f = fixture, root = '//192.168.200.19/v/projects';
       f.uncProjects = ['Dinoster5', 'Katuri8', 'superwings12'].map((name) => ({
-        path: `${root}/${name}`, name, project_id: name, project_uid: `uid-${name}`,
+        path: `${root}/${name}/Ai_Ct_image`, name, project_id: name, project_uid: `uid-${name}`,
       }));
       f.uncMount = (from, compact, catalog) => {
         const projects = catalog === 'retained-selected-row'
-          ? [{ path: `${root}/Other`, name: 'Other', project_id: 'Other', project_uid: 'uid-Other' }, f.uncProjects[0]]
+          ? [{ path: `${root}/Other/Ai_Ct_image`, name: 'Other', project_id: 'Other', project_uid: 'uid-Other' }, f.uncProjects[0]]
           : f.uncProjects;
         const selected = projects.find((row) => row.name === from);
         f.mount({ ...f.base, catalog_root: root, projects, assets: [],
@@ -333,7 +404,7 @@ if (!playwright || !fs.existsSync(executablePath)) {
     for (const compact of [false, true]) {
       for (const config of dropdownConfigs) {
         await page.evaluate(({ config, compact }) => fixture.uncMount(config.from, compact, config.catalog), { config, compact });
-        const expectedPath = `//192.168.200.19/v/projects/Ai_Ct_image/${config.to}`;
+        const expectedPath = `//192.168.200.19/v/projects/${config.to}/Ai_Ct_image`;
         await page.selectOption('#widget [data-project-select]', expectedPath);
         await page.evaluate(async () => { fixture.dropdownSnap('selected-immediate'); await fixture.dropdownFrames('selected'); });
         await page.waitForFunction(() => fixture.writes.length > 0);
@@ -347,7 +418,7 @@ if (!playwright || !fs.existsSync(executablePath)) {
           if (config.catalog === 'empty') f.dropdownBusy.projects = [];
           if (config.catalog === 'retained-selected-row') f.dropdownBusy.projects = [f.uncProjects[0]];
           if (config.catalog === 'replacement') f.dropdownBusy.projects = [
-            { path: '//192.168.200.19/v/projects/Ai_Ct_image/NewProject', name: 'NewProject', project_id: 'NewProject' },
+            { path: '//192.168.200.19/v/projects/NewProject/Ai_Ct_image', name: 'NewProject', project_id: 'NewProject' },
             ...f.uncProjects.filter((row) => row.name !== config.to),
           ];
           f.update(f.dropdownBusy); f.dropdownSnap('busy-immediate'); await f.dropdownFrames('busy');
@@ -378,7 +449,7 @@ if (!playwright || !fs.existsSync(executablePath)) {
       await page.evaluate((compact) => fixture.uncMount('', compact), compact);
       const roundtrips = [];
       for (const [index, name] of ['Dinoster5', 'superwings12', 'Dinoster5', 'superwings12'].entries()) {
-        const expectedPath = `//192.168.200.19/v/projects/Ai_Ct_image/${name}`;
+        const expectedPath = `//192.168.200.19/v/projects/${name}/Ai_Ct_image`;
         await page.selectOption('#widget [data-project-select]', expectedPath);
         await page.evaluate(async () => { fixture.dropdownTimeline = []; fixture.dropdownSnap('selected-immediate'); await fixture.dropdownFrames('selected'); });
         await page.waitForFunction((count) => fixture.writes.length > count, index);
@@ -397,7 +468,7 @@ if (!playwright || !fs.existsSync(executablePath)) {
       evidence.cases.push({ case: 'dropdown-dirty-selectedness-roundtrips', compact, roundtrips });
     }
     await page.evaluate(() => fixture.uncMount('superwings12', false));
-    await page.selectOption('#widget [data-project-select]', '//192.168.200.19/v/projects/Ai_Ct_image/Dinoster5');
+    await page.selectOption('#widget [data-project-select]', '//192.168.200.19/v/projects/Dinoster5/Ai_Ct_image');
     await page.waitForFunction(() => fixture.writes.length > 0);
     const rollback = await page.evaluate(async () => {
       fixture.writes[0].reject(new Error('UNC selection transport failed'));
@@ -405,7 +476,7 @@ if (!playwright || !fs.existsSync(executablePath)) {
       fixture.dropdownSnap('rollback-immediate'); await fixture.dropdownFrames('rollback');
       return fixture.dropdownTimeline;
     });
-    checkDropdown('dropdown-transport-rollback', rollback, '//192.168.200.19/v/projects/Ai_Ct_image/superwings12', 'superwings12');
+    checkDropdown('dropdown-transport-rollback', rollback, '//192.168.200.19/v/projects/superwings12/Ai_Ct_image', 'superwings12');
     evidence.cases.push({ case: 'dropdown-transport-rollback', timeline: rollback });
     const cleared = await page.evaluate(() => {
       fixture.update({ ...fixture.container.__hmbImageAssetLatestState, project_root: '', project_id: '',
@@ -424,7 +495,7 @@ if (!playwright || !fs.existsSync(executablePath)) {
       ? JSON.parse(fs.readFileSync(nativeTemporalPath, 'utf8').replace(/^\uFEFF/, '')).cases
       : await page.evaluate(() => {
         const f = fixture, pixel = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j14sAAAAASUVORK5CYII=';
-        let before = { ...f.base, catalog_root: '//192.168.200.19/v/projects/Ai_Ct_image', projects: f.uncProjects,
+        let before = { ...f.base, catalog_root: '//192.168.200.19/v/projects', projects: f.uncProjects,
           project_root: '', project_id: '', project_uid: '', project_cache_uid: '', assets: [],
           scan_revision: 0, ui_edit_revision: 0, scan_busy: false };
         return ['Dinoster5', 'Katuri8', 'Dinoster5'].map((name, index) => {
@@ -519,7 +590,7 @@ if (!playwright || !fs.existsSync(executablePath)) {
           };
           document.addEventListener('change', f.prepaintHandler);
         }, { config, compact });
-        await page.selectOption('#widget [data-project-select]', '//192.168.200.19/v/projects/Ai_Ct_image/Dinoster5');
+        await page.selectOption('#widget [data-project-select]', '//192.168.200.19/v/projects/Dinoster5/Ai_Ct_image');
         const outcome = await page.evaluate(async () => {
           const f = fixture; await f.dropdownFrames('deferred-paint'); await new Promise((resolve) => setTimeout(resolve, 30));
           f.dropdownSnap('after-deferred-command'); document.removeEventListener('change', f.prepaintHandler);
@@ -535,7 +606,7 @@ if (!playwright || !fs.existsSync(executablePath)) {
         assert.equal(outcome.emitted_before_first_paint, false, 'Project publication must remain deferred until after the first paint.');
         if (config.expected === 'Dinoster5') {
           if (outcome.selection_writes.length !== 1) dropdownFailures.push({ case: caseName, failures: [outcome] });
-          checkDropdown(caseName, outcome.timeline, '//192.168.200.19/v/projects/Ai_Ct_image/Dinoster5', 'Dinoster5');
+          checkDropdown(caseName, outcome.timeline, '//192.168.200.19/v/projects/Dinoster5/Ai_Ct_image', 'Dinoster5');
           if (outcome.selection_writes.length) {
             assert.equal(outcome.selection_writes[0].callback_owner, 'latest');
             assert.equal(outcome.selection_writes[0].manifest_signature, 'latest-before-paint', 'The deferred command must rebase onto the latest canonical metadata.');
@@ -587,7 +658,7 @@ if (!playwright || !fs.existsSync(executablePath)) {
         };
         document.addEventListener('change', f.prepaintHandler);
       }, replaceOwner);
-      await page.selectOption('#widget [data-project-select]', '//192.168.200.19/v/projects/Ai_Ct_image/Dinoster5');
+      await page.selectOption('#widget [data-project-select]', '//192.168.200.19/v/projects/Dinoster5/Ai_Ct_image');
       const ownerOutcome = await page.evaluate(async () => {
         const f = fixture; await f.dropdownFrames('owner-deferred-paint'); await new Promise((resolve) => setTimeout(resolve, 30));
         document.removeEventListener('change', f.prepaintHandler); f.dropdownSnap('after-owner-deferred-command');
@@ -632,7 +703,7 @@ if (!playwright || !fs.existsSync(executablePath)) {
       };
       document.addEventListener('change', fixture.prepaintHandler);
     });
-    await page.selectOption('#widget [data-project-select]', '//192.168.200.19/v/projects/Ai_Ct_image/Dinoster5');
+    await page.selectOption('#widget [data-project-select]', '//192.168.200.19/v/projects/Dinoster5/Ai_Ct_image');
     const queuedCleanup = await page.evaluate(async () => {
       await new Promise((resolve) => setTimeout(resolve, 50)); document.removeEventListener('change', fixture.prepaintHandler);
       return { writes: fixture.writes.length, dom_children: fixture.container.children.length,
@@ -647,7 +718,7 @@ if (!playwright || !fs.existsSync(executablePath)) {
       };
       document.addEventListener('change', fixture.prepaintHandler);
     });
-    await page.selectOption('#widget [data-project-select]', '//192.168.200.19/v/projects/Ai_Ct_image/Dinoster5');
+    await page.selectOption('#widget [data-project-select]', '//192.168.200.19/v/projects/Dinoster5/Ai_Ct_image');
     const queuedReplacement = await page.evaluate(async () => {
       await new Promise((resolve) => setTimeout(resolve, 50)); document.removeEventListener('change', fixture.prepaintHandler);
       return { writes: fixture.writes.length, select_label: fixture.snap().select_label,

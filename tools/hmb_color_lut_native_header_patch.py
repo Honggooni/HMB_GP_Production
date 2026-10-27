@@ -10,6 +10,7 @@ changed, or provider contacted by this tool.
 from __future__ import annotations
 
 import argparse
+import ast
 from contextlib import contextmanager
 import csv
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import tempfile
@@ -28,8 +30,11 @@ REPO = Path(__file__).resolve().parents[1]
 EXPECTED_SOURCE_SHA256 = "1a0429b88c6b8dd1c7e6e053836d03f734a4d6453f8886e0693527c7498909e2"
 EXPECTED_EDITOR_VERSION = "0.128.1"
 EXPECTED_BUNDLE_NAME = "index-DEZU41rc.js"
+MINIMUM_SDK_VERSION = (0, 101, 3)
 SUPPORTED_PREVIOUS_CANDIDATE_SHA256 = "7bad6f6517c781c54e6d2e0cf170f0b2ed3bdef28b3cca57be79cce54bdd11bf"
 SUPPORTED_PREVIOUS_HELPER_SHA256 = "39e5901cc8aa37d1d11850a255bcc209ab4724afe488817fc3f684a72ab01b63"
+SUPPORTED_CURRENT_CANDIDATE_SHA256 = "93b497d21995e23ef6707f0d3a3d39dd897a76d0388f7d7c9677d5cd54ef57c1"
+SUPPORTED_CURRENT_HELPER_SHA256 = "2ed5f48b1c454039e84d9cba7499e290111e1d9f1038b157c0391aae794903f8"
 HELPER = REPO / "resources/editor/hmb-color-lut-native-header.js"
 DEFAULT_SOURCE = Path(os.environ.get("LOCALAPPDATA", "")) / (
     "ai.griptape.nodes.desktop/current/resources/editor-bundle/assets/" + EXPECTED_BUNDLE_NAME
@@ -394,12 +399,7 @@ def _release_descriptor() -> tuple[dict, str]:
         digest = value.get(key)
         if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
             raise ValueError("Invalid native editor release hash.")
-    previous = value.get("previous_candidate")
-    if "previous_candidate" in value and previous != {
-        "bundle_sha256": SUPPORTED_PREVIOUS_CANDIDATE_SHA256,
-        "helper_sha256": SUPPORTED_PREVIOUS_HELPER_SHA256,
-    }:
-        raise ValueError("Unsupported previous native editor candidate.")
+    _release_previous_candidates(value)
     if sha256(_release_plain_path(HELPER).read_bytes()) != value["helper_sha256"]:
         raise ValueError("Native editor helper differs from the verified release.")
     if sha256(_release_plain_path(Path(__file__)).read_bytes()) != value["patcher_sha256"]:
@@ -407,17 +407,35 @@ def _release_descriptor() -> tuple[dict, str]:
     return value, sha256(encoded)
 
 
+def _release_previous_candidates(descriptor: dict) -> list[dict]:
+    """Accept the original single predecessor or the exact two-release chain."""
+    older = {"bundle_sha256": SUPPORTED_PREVIOUS_CANDIDATE_SHA256,
+             "helper_sha256": SUPPORTED_PREVIOUS_HELPER_SHA256}
+    recent = {"bundle_sha256": SUPPORTED_CURRENT_CANDIDATE_SHA256,
+              "helper_sha256": SUPPORTED_CURRENT_HELPER_SHA256}
+    if "previous_candidates" in descriptor:
+        if "previous_candidate" in descriptor or descriptor["previous_candidates"] != [recent, older]:
+            raise ValueError("Unsupported previous native editor candidates.")
+        return [recent, older]
+    if "previous_candidate" in descriptor:
+        if descriptor["previous_candidate"] != older:
+            raise ValueError("Unsupported previous native editor candidate.")
+        return [older]
+    return []
+
+
 def _release_original_hashes(descriptor: dict) -> set[str]:
     hashes = {EXPECTED_SOURCE_SHA256, descriptor["candidate_sha256"]}
-    if descriptor.get("previous_candidate"):
-        hashes.add(descriptor["previous_candidate"]["bundle_sha256"])
+    hashes.update(item["bundle_sha256"] for item in _release_previous_candidates(descriptor))
     return hashes
 
 
 def _upgrade_previous_helper(original: bytes, descriptor: dict) -> bytes:
     """Replace only the pinned helper; every other editor byte stays intact."""
-    previous = descriptor.get("previous_candidate")
-    if not previous or sha256(original) != previous["bundle_sha256"]:
+    original_sha = sha256(original)
+    previous = next((item for item in _release_previous_candidates(descriptor)
+                     if item["bundle_sha256"] == original_sha), None)
+    if not previous:
         raise ValueError("Unknown previous native editor candidate.")
     start_marker = b"/* HMB_COLOR_LUT_NATIVE_HEADER_PORTAL_V1"
     end_marker = b"/* END_HMB_COLOR_LUT_NATIVE_HEADER_PORTAL_V1 */"
@@ -451,6 +469,71 @@ def _release_target() -> Path:
     if version.read_text("utf-8").strip() != EXPECTED_EDITOR_VERSION:
         raise ValueError("Unsupported installed editor version; no installation was performed.")
     return target
+
+
+def _release_sdk_preflight() -> dict:
+    """Inspect the target SDK without importing it or starting an engine.
+
+    An editor patch cannot compensate for an SDK lacking the pre-dispatch
+    boundary. Check the installed sources as well as package metadata before
+    the caller moves any library files. These are capability checks, not a
+    claim that the guard is already registered in a running engine.
+    """
+    site = _release_plain_path(DEFAULT_SOURCE.parents[2] / "engine-bundle/python/Lib/site-packages")
+    prefix = "Unsupported Griptape SDK; update Griptape before installing HMB. "
+    metadata = sorted(site.glob("griptape_nodes-*.dist-info/METADATA"))
+    if len(metadata) != 1:
+        raise ValueError(prefix + "Expected one griptape-nodes package metadata record.")
+
+    def read_file(path: Path) -> bytes:
+        path = _release_plain_path(path)
+        try:
+            if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
+                raise ValueError(prefix + "Required SDK source is missing or oversized: " + path.name)
+            return path.read_bytes()
+        except OSError as error:
+            raise ValueError(prefix + "Cannot read required SDK source: " + path.name) from error
+
+    metadata_bytes = read_file(metadata[0])
+    metadata_text = metadata_bytes.decode("utf-8-sig")
+    names = re.findall(r"^Name: (.+)$", metadata_text, re.MULTILINE)
+    versions = re.findall(r"^Version: (.+)$", metadata_text, re.MULTILINE)
+    if len(names) != 1 or names[0].strip().lower().replace("_", "-") != "griptape-nodes" or len(versions) != 1:
+        raise ValueError(prefix + "Invalid griptape-nodes package metadata.")
+    version = versions[0].strip()
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version) or tuple(map(int, version.split("."))) < MINIMUM_SDK_VERSION:
+        raise ValueError(prefix + "griptape-nodes 0.101.3 or newer is required; found " + version + ".")
+    sources = {
+        "engine": site / "griptape_nodes/retained_mode/engine.py",
+        "event_manager": site / "griptape_nodes/retained_mode/managers/event_manager.py",
+    }
+    trees, hashes = {}, {"metadata": sha256(metadata_bytes)}
+    for name, path in sources.items():
+        encoded = read_file(path)
+        try:
+            trees[name] = ast.parse(encoded, filename=str(path))
+        except (SyntaxError, ValueError) as error:
+            raise ValueError(prefix + "Required SDK source cannot be parsed: " + path.name) from error
+        hashes[name] = sha256(encoded)
+    current = [node for node in trees["engine"].body if isinstance(node, ast.FunctionDef) and node.name == "current_engine"]
+    managers = [node for node in trees["event_manager"].body if isinstance(node, ast.ClassDef) and node.name == "EventManager"]
+    if len(current) != 1 or len(managers) != 1:
+        raise ValueError(prefix + "Missing engine.current_engine or EventManager API.")
+    current_args = current[0].args
+    if len(current_args.posonlyargs) + len(current_args.args) != len(current_args.defaults) or any(value is None for value in current_args.kw_defaults):
+        raise ValueError(prefix + "engine.current_engine must accept a call without arguments.")
+    required = ("add_pre_dispatch_hook", "remove_pre_dispatch_hook", "register_request_handlers")
+    for name in required:
+        methods = [node for node in managers[0].body if isinstance(node, ast.FunctionDef) and node.name == name]
+        if len(methods) != 1:
+            raise ValueError(prefix + "Missing synchronous EventManager." + name + " API.")
+        args = methods[0].args
+        positional = args.posonlyargs + args.args
+        if len(positional) < 2 or len(positional) - len(args.defaults) > 2 or any(value is None for value in args.kw_defaults):
+            raise ValueError(prefix + "EventManager." + name + " must accept one hook argument.")
+    return {"package": "griptape-nodes", "version": version,
+            "capabilities": ["current_engine", *required], "source_sha256": hashes,
+            "verification": "metadata-and-ast-only; active guard checked after app startup"}
 
 
 def _require_release_stopped() -> None:
@@ -535,6 +618,7 @@ def _release_write_lock():
 def prepare_release_install() -> dict:
     descriptor, descriptor_sha = _release_descriptor()
     target = _release_target()
+    sdk_preflight = _release_sdk_preflight()
     original = target.read_bytes()
     original_sha = sha256(original)
     if original_sha not in _release_original_hashes(descriptor):
@@ -557,14 +641,15 @@ def prepare_release_install() -> dict:
             "target": str(target), "editor_version": EXPECTED_EDITOR_VERSION,
             "descriptor_sha256": descriptor_sha, "original_sha256": original_sha,
             "candidate_sha256": descriptor["candidate_sha256"], "already_current": already_current,
-            "status": "prepared"}
+            "sdk_preflight": sdk_preflight, "status": "prepared"}
     if not already_current:
         _atomic_write(transaction / "before.js", original)
         _atomic_write(transaction / "candidate.js", candidate)
     path = transaction / "plan.json"
     _json_write(path, plan)
     return {"plan": str(path), "already_current": already_current, "editor_version": EXPECTED_EDITOR_VERSION,
-            "original_sha256": original_sha, "candidate_sha256": descriptor["candidate_sha256"]}
+            "original_sha256": original_sha, "candidate_sha256": descriptor["candidate_sha256"],
+            "sdk_preflight": sdk_preflight}
 
 
 def _release_restore(plan: dict, path: Path) -> dict:
@@ -594,11 +679,13 @@ def _release_restore(plan: dict, path: Path) -> dict:
 def _apply_release_install_unlocked(path: Path) -> dict:
     plan, path, _ = _release_plan(path)
     _require_release_stopped()
+    if _release_sdk_preflight() != plan.get("sdk_preflight"):
+        raise ValueError("Griptape SDK changed after preflight; installation refused.")
     target = _release_target()
     current = sha256(target.read_bytes())
     if plan.get("status") == "applied" and current == plan["candidate_sha256"]:
         return {"plan": str(path), "already_current": plan["already_current"], "changed": not plan["already_current"],
-                "editor_version": EXPECTED_EDITOR_VERSION, "sha256": current}
+                "editor_version": EXPECTED_EDITOR_VERSION, "sha256": current, "sdk_preflight": plan["sdk_preflight"]}
     if current != plan["original_sha256"]:
         raise ValueError("Native editor changed after preflight; installation refused.")
     if not plan["already_current"]:
@@ -621,6 +708,7 @@ def _apply_release_install_unlocked(path: Path) -> dict:
         raise
     return {"plan": str(path), "already_current": plan["already_current"], "changed": not plan["already_current"],
             "editor_version": EXPECTED_EDITOR_VERSION, "sha256": plan["candidate_sha256"],
+            "sdk_preflight": plan["sdk_preflight"],
             "backup": None if plan["already_current"] else str(path.parent / "before.js")}
 
 

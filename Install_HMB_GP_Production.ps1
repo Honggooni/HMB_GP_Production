@@ -150,7 +150,9 @@ function Invoke-HmbNativeEditorPatch {
     $arguments = @('-I', '-B', $patcher, '--release-action', $Action)
     if ($Plan) { $arguments += @('--release-plan', $Plan) }
     $output = & $python @arguments
-    if ($LASTEXITCODE -ne 0) { throw "Native editor $Action failed; installation was not completed." }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Native editor $Action failed; installation was not completed. Check the SDK/editor compatibility error above, update Griptape if required, then use the verified Runtime ZIP."
+    }
     return ($output | ConvertFrom-Json)
 }
 

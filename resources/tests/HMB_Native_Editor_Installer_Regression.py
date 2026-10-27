@@ -28,6 +28,15 @@ class NativeEditorInstall(unittest.TestCase):
         self.m.DEFAULT_SOURCE.write_bytes(self.original)
         self.version = self.m.DEFAULT_SOURCE.parent.parent / ".version"
         self.version.write_text(self.m.EXPECTED_EDITOR_VERSION)
+        self.sdk_site = self.m.DEFAULT_SOURCE.parents[2] / "engine-bundle/python/Lib/site-packages"
+        self.sdk_engine = self.sdk_site / "griptape_nodes/retained_mode/engine.py"
+        self.sdk_events = self.sdk_engine.parent / "managers/event_manager.py"
+        self.sdk_metadata = self.sdk_site / "griptape_nodes-0.101.3.dist-info/METADATA"
+        for path in (self.sdk_engine, self.sdk_events, self.sdk_metadata):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        self.sdk_engine.write_text("raise AssertionError('SDK must not execute')\ndef current_engine():\n    return None\n")
+        self.sdk_events.write_text("raise AssertionError('SDK must not execute')\nclass EventManager:\n    def add_pre_dispatch_hook(self, hook): pass\n    def remove_pre_dispatch_hook(self, hook): pass\n    def register_request_handlers(self, owner): pass\n")
+        self.sdk_metadata.write_text("Name: griptape-nodes\nVersion: 0.101.3\n")
         self.m.RELEASE_STATE_ROOT = self.base / "native-editor-installs"
         self.m.HELPER = self.base / "package/resources/editor/hmb-color-lut-native-header.js"
         self.m.HELPER.parent.mkdir(parents=True)
@@ -188,12 +197,110 @@ class NativeEditorInstall(unittest.TestCase):
         self.assertTrue(self.m.rollback_release_install(first)["rolled_back"])
         self.assertEqual(self.m.DEFAULT_SOURCE.read_bytes(), previous)
 
+    def test_two_previous_releases_upgrade_with_exact_individual_backup(self):
+        for use_recent in (True, False):
+            with self.subTest(use_recent=use_recent):
+                previous = self.previous_candidate()
+                if use_recent:
+                    self.m.SUPPORTED_CURRENT_CANDIDATE_SHA256 = self.m.SUPPORTED_PREVIOUS_CANDIDATE_SHA256
+                    self.m.SUPPORTED_CURRENT_HELPER_SHA256 = self.m.SUPPORTED_PREVIOUS_HELPER_SHA256
+                    self.m.SUPPORTED_PREVIOUS_CANDIDATE_SHA256 = "1" * 64
+                    self.m.SUPPORTED_PREVIOUS_HELPER_SHA256 = "2" * 64
+                else:
+                    self.m.SUPPORTED_CURRENT_CANDIDATE_SHA256 = "3" * 64
+                    self.m.SUPPORTED_CURRENT_HELPER_SHA256 = "4" * 64
+                self.descriptor.pop("previous_candidate")
+                self.descriptor["previous_candidates"] = [
+                    {"bundle_sha256": self.m.SUPPORTED_CURRENT_CANDIDATE_SHA256, "helper_sha256": self.m.SUPPORTED_CURRENT_HELPER_SHA256},
+                    {"bundle_sha256": self.m.SUPPORTED_PREVIOUS_CANDIDATE_SHA256, "helper_sha256": self.m.SUPPORTED_PREVIOUS_HELPER_SHA256},
+                ]
+                self.m.RELEASE_DESCRIPTOR.write_text(json.dumps(self.descriptor))
+                path = self.prepare()
+                self.assertEqual((path.parent / "before.js").read_bytes(), previous)
+                self.assertTrue(self.m.apply_release_install(path)["changed"])
+                self.assertEqual(self.m.DEFAULT_SOURCE.read_bytes(), self.candidate)
+                self.assertTrue(self.m.rollback_release_install(path)["rolled_back"])
+                self.assertEqual(self.m.DEFAULT_SOURCE.read_bytes(), previous)
+
+    def test_previous_array_rejects_unreviewed_pairs_duplicates_or_mixed_formats(self):
+        older = {"bundle_sha256": self.m.SUPPORTED_PREVIOUS_CANDIDATE_SHA256, "helper_sha256": self.m.SUPPORTED_PREVIOUS_HELPER_SHA256}
+        recent = {"bundle_sha256": self.m.SUPPORTED_CURRENT_CANDIDATE_SHA256, "helper_sha256": self.m.SUPPORTED_CURRENT_HELPER_SHA256}
+        for change in (
+            {"previous_candidates": [older, recent]},
+            {"previous_candidates": [recent, recent]},
+            {"previous_candidates": [recent, {**older, "helper_sha256": "0" * 64}]},
+            {"previous_candidates": [recent, older], "previous_candidate": older},
+        ):
+            with self.subTest(change=change):
+                self.m.RELEASE_DESCRIPTOR.write_text(json.dumps({**self.descriptor, **change}))
+                with self.assertRaisesRegex(ValueError, "Unsupported previous"):
+                    self.prepare()
+                self.assertFalse(self.m.RELEASE_STATE_ROOT.exists())
+                self.assertEqual(self.m.DEFAULT_SOURCE.read_bytes(), self.original)
+
     def test_pristine_prepare_preserves_editor_and_captures_exact_backup(self):
         path = self.prepare()
         self.assertEqual(self.m.DEFAULT_SOURCE.read_bytes(), self.original)
         self.assertEqual((path.parent / "before.js").read_bytes(), self.original)
         self.assertEqual((path.parent / "candidate.js").read_bytes(), self.candidate)
         self.transform.assert_called_once_with(self.original.decode())
+
+    def test_sdk_preflight_reads_metadata_and_ast_without_executing_sdk(self):
+        path = self.prepare()
+        evidence = json.loads(path.read_text())["sdk_preflight"]
+        self.assertEqual(evidence["version"], "0.101.3")
+        self.assertEqual(evidence["capabilities"], ["current_engine", "add_pre_dispatch_hook", "remove_pre_dispatch_hook", "register_request_handlers"])
+        self.assertEqual(evidence["source_sha256"]["engine"], self.m.sha256(self.sdk_engine.read_bytes()))
+        self.assertEqual(self.m.apply_release_install(path)["sdk_preflight"], evidence)
+
+    def test_unsupported_sdk_blocks_before_native_preparation(self):
+        cases = (
+            (self.sdk_metadata, "Name: griptape-nodes\nVersion: 0.93.0\n", "0.101.3"),
+            (self.sdk_metadata, "Name: griptape-nodes-engine\nVersion: 0.104.2\n", "metadata"),
+            (self.sdk_engine, "def old_engine(): pass\n", "current_engine"),
+            (self.sdk_engine, "def current_engine(required): pass\n", "without arguments"),
+            (self.sdk_engine, "def current_engine(:\n", "cannot be parsed"),
+            (self.sdk_events, "class EventManager:\n    def add_pre_dispatch_hook(self, hook): pass\n", "remove_pre_dispatch_hook"),
+            (self.sdk_events, "class EventManager:\n    def add_pre_dispatch_hook(self, hook): pass\n    def remove_pre_dispatch_hook(self, hook): pass\n", "register_request_handlers"),
+            (self.sdk_events, "class EventManager:\n    async def add_pre_dispatch_hook(self, hook): pass\n    def remove_pre_dispatch_hook(self, hook): pass\n", "synchronous"),
+            (self.sdk_events, "class EventManager:\n    def add_pre_dispatch_hook(self, hook, required): pass\n    def remove_pre_dispatch_hook(self, hook): pass\n", "one hook"),
+        )
+        for target, replacement, message in cases:
+            with self.subTest(target=target.name, message=message):
+                original = target.read_bytes()
+                try:
+                    target.write_text(replacement)
+                    with self.assertRaisesRegex(ValueError, message):
+                        self.prepare()
+                    self.assertFalse(self.m.RELEASE_STATE_ROOT.exists())
+                    self.assertEqual(self.m.DEFAULT_SOURCE.read_bytes(), self.original)
+                finally:
+                    target.write_bytes(original)
+
+    def test_sdk_metadata_ambiguity_and_missing_source_block_before_native_preparation(self):
+        duplicate = self.sdk_site / "griptape_nodes-0.102.0.dist-info/METADATA"
+        duplicate.parent.mkdir()
+        duplicate.write_text("Name: griptape-nodes\nVersion: 0.102.0\n")
+        with self.assertRaisesRegex(ValueError, "one griptape-nodes"):
+            self.prepare()
+        duplicate.unlink()
+        self.sdk_engine.unlink()
+        with self.assertRaisesRegex(ValueError, "missing"):
+            self.prepare()
+        self.assertFalse(self.m.RELEASE_STATE_ROOT.exists())
+
+    def test_sdk_change_after_prepare_blocks_apply_but_does_not_block_rollback(self):
+        path = self.prepare()
+        self.sdk_engine.write_text(self.sdk_engine.read_text() + "# external SDK update\n")
+        with self.assertRaisesRegex(ValueError, "SDK changed after preflight"):
+            self.m.apply_release_install(path)
+        self.assertEqual(self.m.DEFAULT_SOURCE.read_bytes(), self.original)
+        self.assertFalse(self.m.rollback_release_install(path)["rolled_back"])
+        path = self.prepare()
+        self.m.apply_release_install(path)
+        self.sdk_engine.unlink()
+        self.assertTrue(self.m.rollback_release_install(path)["rolled_back"])
+        self.assertEqual(self.m.DEFAULT_SOURCE.read_bytes(), self.original)
 
     def test_apply_rollback_and_repeat_apply_are_idempotent(self):
         path = self.prepare()

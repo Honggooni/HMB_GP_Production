@@ -4,13 +4,19 @@
   "editor_version": "0.128.1",
   "bundle_name": "index-DEZU41rc.js",
   "source_sha256": "1a0429b88c6b8dd1c7e6e053836d03f734a4d6453f8886e0693527c7498909e2",
-  "candidate_sha256": "93b497d21995e23ef6707f0d3a3d39dd897a76d0388f7d7c9677d5cd54ef57c1",
+  "candidate_sha256": "5e358586ae4b47fd698225c640fb65a4ed5b53dd27a398aa291b0606501e3131",
   "helper_path": "resources/editor/hmb-color-lut-native-header.js",
-  "helper_sha256": "2ed5f48b1c454039e84d9cba7499e290111e1d9f1038b157c0391aae794903f8",
+  "helper_sha256": "34657ae82e7862d3c5fa798184623369537d798fe0b4baa313188e33fb15cec6",
   "patcher_path": "tools/hmb_color_lut_native_header_patch.py",
-  "patcher_sha256": "ccce72acbeb19bab4be297e43a8a788fa99ef12a21b8ccc7ef1fe3794bff5acd",
-  "previous_candidate": {
-    "bundle_sha256": "7bad6f6517c781c54e6d2e0cf170f0b2ed3bdef28b3cca57be79cce54bdd11bf",
-    "helper_sha256": "39e5901cc8aa37d1d11850a255bcc209ab4724afe488817fc3f684a72ab01b63"
-  }
+  "patcher_sha256": "6c5f007145a07f806e6a28967091d6d8e6e4102617a65cb946190caac125738b",
+  "previous_candidates": [
+    {
+      "bundle_sha256": "93b497d21995e23ef6707f0d3a3d39dd897a76d0388f7d7c9677d5cd54ef57c1",
+      "helper_sha256": "2ed5f48b1c454039e84d9cba7499e290111e1d9f1038b157c0391aae794903f8"
+    },
+    {
+      "bundle_sha256": "7bad6f6517c781c54e6d2e0cf170f0b2ed3bdef28b3cca57be79cce54bdd11bf",
+      "helper_sha256": "39e5901cc8aa37d1d11850a255bcc209ab4724afe488817fc3f684a72ab01b63"
+    }
+  ]
 }

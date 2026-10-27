@@ -183,18 +183,21 @@ with patch.dict(sys.modules,{'asyncio.proactor_events':private}),patch.object(sy
 
         # Run the actual Advanced-library hook bodies with isolated weak owners.
         class Manager:
-            def __init__(self):self.pre=[];self.post=[];self.event_loop=None
+            def __init__(self):
+                self.pre=[];self.post=[];self.event_loop=None
+                self._pre_dispatch_hooks=self.pre;self._lock=namespace['threading'].RLock()
             def add_pre_dispatch_hook(self,hook):self.pre.append(hook)
             def remove_pre_dispatch_hook(self,hook):self.pre.remove(hook)
             def add_post_dispatch_hook(self,kind,hook):self.post.append((kind,hook))
             def remove_post_dispatch_hook(self,kind,hook):self.post.remove((kind,hook))
+            def register_request_handlers(self,handler):pass
         engine=Dummy();engine.event_manager=Manager();engine.library_manager=Dummy();engine.library_manager.is_worker=False
         namespace['current_engine']=lambda:engine
         data=Dummy();data.name='HMB_GP_Production';library=Dummy()
         a,b=namespace['HMBProductionLibrary'](),namespace['HMBProductionLibrary']()
         # This stdlib-only fixture does not construct an SDK payload registry.
-        # Typed deletion/connection registration is tested by the real SDK
-        # regressions; provide their optional registration seam here explicitly.
+        # Typed registration is tested by real SDK regressions. The stdlib
+        # fixture supplies the mandatory critical seam explicitly.
         installed=[];optional={}
         for module_name in ('_hmb_deletion_guard','_hmb_connection_management'):
             stub=ModuleType(module_name)
@@ -203,17 +206,23 @@ with patch.dict(sys.modules,{'asyncio.proactor_events':private}),patch.object(sy
                 installed.append((_name,registration))
                 return Dummy()
             stub.install_request_handlers=install;optional[module_name]=stub
+            if module_name=='_hmb_deletion_guard':
+                stub.__file__=str(ROOT/'_hmb_deletion_guard.py')
+                stub.PROTECTION_VERSION=2;stub.protection_readiness=lambda _engine:(True,'')
+                stub.guard_request=lambda _engine,_request:None
         with patch.dict(sys.modules,optional):
             a.before_library_nodes_loaded(data,library);a.before_library_nodes_loaded(data,library)
             b.before_library_nodes_loaded(data,library)
             assert len(installed)==2 and len({id(item[1]) for item in installed})==1
-            assert len(engine.event_manager.pre)==1 and diagnostics()['owner_count']==1
+            gate=getattr(engine.event_manager,'_hmb_connected_deletion_lifetime_v2')
+            assert len(engine.event_manager.pre)==2 and diagnostics()['owner_count']==1
             assert transport_class._call_connection_lost is wrapper
             a.before_library_unregistered(data,library)
             assert diagnostics()['owner_count']==1 and transport_class._call_connection_lost is wrapper
             b.before_library_unregistered(data,library)
             assert diagnostics()['owner_count']==0 and transport_class._call_connection_lost is original
-            assert engine.event_manager.pre==engine.event_manager.post==[]
+            assert engine.event_manager.pre==[gate.hook] and engine.event_manager.post==[]
+            assert gate.is_registered() and gate.engine_ref() is engine
     finally:
         logger.removeHandler(handler);logger.setLevel(old_level)
         transport_class._call_connection_lost=original

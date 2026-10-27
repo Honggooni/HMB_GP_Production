@@ -36,7 +36,7 @@ tmp_parent.mkdir(parents=True, exist_ok=True)
 test_root = Path(tempfile.mkdtemp(prefix="hmb_asset_registration_", dir=tmp_parent))
 try:
     catalog_root = test_root / "Projects"
-    project_root = catalog_root / "shot_registration"
+    project_root = catalog_root / "shot_registration" / "Ai_Ct_image"
     existing_path = project_root / "Environment" / "Background" / "existing.png"
     candidate_path = (
         project_root

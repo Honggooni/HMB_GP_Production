@@ -116,7 +116,7 @@ def refuses_without_mutation(engine, payload):
 
 class Fixture:
     """Canonical SDK loader/callbacks, without discovery, pip or AI services."""
-    def __init__(self, engine, *, actual=False, actual_image=False, name="HMB_GP_Production"):
+    def __init__(self, engine, *, actual=False, actual_image=False, name="HMB_GP_Production", protection_unsupported=False):
         global SERIAL
         SERIAL += 1
         self.engine = engine
@@ -169,6 +169,10 @@ class Fixture:
             nodes_loader = engine.library_manager._attempt_load_nodes_from_library
         nodes_loader(
             self.schema, self.library, self.directory, self.info, lazy_loading=True)
+        if protection_unsupported:
+            assert len(self.info.problems) == 1 and type(self.info.problems[0]).__name__ == "BeforeLibraryCallbackProblem"
+            assert "HMB_DELETE_GUARD_UNSUPPORTED" in self.advanced._hmb_deletion_readiness_error
+            return
         assert not self.info.problems, [type(problem).__name__ for problem in self.info.problems]
         assert self.library._node_types["HMBSeedanceGeneration"]._resolved is None, "Fixture was not lazy"
 
@@ -238,7 +242,7 @@ def image_worker(engine, fixture):
 
 
 def native_baseline(engine, fixture):
-    hook = engine.event_manager._pre_dispatch_hooks[0]
+    hook = next(iter(fixture.advanced._registrations)).hook
     engine.event_manager.remove_pre_dispatch_hook(hook)
     try:
         result = refuses_without_mutation(engine, request())
@@ -353,22 +357,23 @@ def foreign(engine, fixture):
 
 
 def duplicate_unload(engine, fixture):
-    assert len(engine.event_manager._pre_dispatch_hooks) == 1
+    gate = getattr(engine.event_manager, "_hmb_connected_deletion_lifetime_v2")
+    assert len(engine.event_manager._pre_dispatch_hooks) == 2
     fixture.advanced.before_library_nodes_loaded(fixture.schema, fixture.library)
     fixture.advanced.before_library_nodes_loaded(fixture.schema, fixture.library)
-    assert len(engine.event_manager._pre_dispatch_hooks) == 1
-    stale_hook = engine.event_manager._pre_dispatch_hooks[0]
+    assert len(engine.event_manager._pre_dispatch_hooks) == 2
+    stale_hook = next(iter(fixture.advanced._registrations)).hook
     fixture.unload()
-    assert not engine.event_manager._pre_dispatch_hooks
+    assert engine.event_manager._pre_dispatch_hooks == [gate.hook]
     assert stale_hook(request(), {}) is None
     refuses_without_mutation(engine, request())
     fresh = Fixture(engine)
-    assert len(engine.event_manager._pre_dispatch_hooks) == 1
+    assert len(engine.event_manager._pre_dispatch_hooks) == 2
     fixture.advanced.before_library_unregistered(fixture.schema, fixture.library)
-    assert len(engine.event_manager._pre_dispatch_hooks) == 1
+    assert len(engine.event_manager._pre_dispatch_hooks) == 2
     succeeds(engine, request(node_name="AfterReload"))
     fresh.unload()
-    assert not engine.event_manager._pre_dispatch_hooks
+    assert engine.event_manager._pre_dispatch_hooks == [gate.hook]
 
 
 def race(engine, fixture):
@@ -395,7 +400,7 @@ def actual_hmb(engine, fixture):
 
 
 async def old_engine_accessor_unavailable():
-    """The real loader/native handler still work without the optional new API."""
+    """Missing critical SDK support is an explicit library-load failure."""
     WorkflowRegistry.clear_user_workflows()
     attempted_imports = []
     original_import = builtins.__import__
@@ -408,29 +413,23 @@ async def old_engine_accessor_unavailable():
 
     with engine_scope() as engine:
         engine.event_manager.initialize_queue()
+        before_load = snapshot(engine)
         with mock.patch.object(builtins, "__import__", side_effect=older_import):
-            fixture = Fixture(engine)
+            fixture = Fixture(engine, protection_unsupported=True)
         try:
+            assert snapshot(engine) == before_load
             assert attempted_imports, "The real Advanced loader did not exercise the missing import"
             assert not engine.event_manager._pre_dispatch_hooks
             result = refuses_without_mutation(engine, request())
             assert "Current Context was empty" in str(result.result_details)
-            assert fixture.library._node_types["HMBSeedanceGeneration"]._resolved is None
             ensured = send(engine, EnsureWorkflowAndFlowRequest(flow_name="OlderNativeFlow"))
             assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
-            payload = request(node_name="OlderNativeNode")
-            result = succeeds(engine, payload)
-            assert payload.override_parent_flow_name is None
-            assert result.parent_flow_name == ensured.flow_name
-            engine.context_manager.pop_flow()
-            result = succeeds(engine, request(node_name="OlderExplicitNode",
-                                             override_parent_flow_name=ensured.flow_name))
-            assert result.parent_flow_name == ensured.flow_name
-            assert not engine.context_manager.has_current_flow()
+            assert "HMB_DELETE_GUARD_UNSUPPORTED" in fixture.advanced._hmb_deletion_readiness_error
+            assert not engine.node_manager._name_to_parent_flow_name
         finally:
             fixture.unload()
         assert not engine.event_manager._pre_dispatch_hooks
-    RESULTS.append("older engine accessor unavailable: library load/native behavior preserved")
+    RESULTS.append("missing critical engine accessor: explicit library-load failure, no retained mutation, native context API preserved")
     print("PASS " + RESULTS[-1])
 
 

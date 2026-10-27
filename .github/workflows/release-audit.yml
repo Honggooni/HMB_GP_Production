@@ -291,6 +291,10 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Prevents the stock editor from optimistically removing HMB nodes after a Git-only update. Until the complete native integration is installed, canvas deletion is stopped with an explicit installation notice; input editing and internal asset/Shot actions remain available.",
+            "- Keeps the engine deletion gate active across library unload/reload while HMB nodes remain. Native deletion requires the current protection readiness contract; unsupported SDK APIs and initialization failures are reported instead of silently disabling protection.",
+            "- Requires griptape-nodes 0.101.3 or newer plus the actual pre-dispatch APIs. The installer validates SDK metadata and source definitions before moving files, verifies them again before applying, and upgrades either reviewed previous native patch atomically.",
+            "- Reads image projects only from projects/<project>/Ai_Ct_image, including superwings12 and Katuri8. Known old saved addresses are replaced in memory; retired folders are never read as compatibility or recovery locations. Existing Shot and bundle identities remain intact.",
             "- Adds HMB ImageBash as a local image workspace with remote ImageAsset selection, native image output, local save and durable workspace restoration. Existing production Shot slots remain separate.",
             "- Applies the unified rounded native header to HMB VideoPicker, HMB Agent, HMB ImageAsset Library, HMBPrompt, HMB ImageBash, Color LUT and Finish Look while retaining their existing palettes, controls and connections.",
             "- Uses the dedicated fold control for the rounded Soft Link capsule and Double Click to Unlock restoration. Other header double-clicks select compact mode only where supported. Capsule restore, edge resizing and popup hit areas retain native port behavior.",

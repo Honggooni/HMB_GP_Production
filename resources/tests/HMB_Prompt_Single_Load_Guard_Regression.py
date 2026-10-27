@@ -284,10 +284,12 @@ async def main():
                 print("PASS twelve simultaneous new Prompt requests create exactly one node")
             finally:
                 LibraryRegistry.unregister_library("HMB_GP_Production", event_manager=engine.event_manager)
-            assert not engine.event_manager._pre_dispatch_hooks
+            gate = getattr(engine.event_manager, "_hmb_connected_deletion_lifetime_v2")
+            assert engine.event_manager._pre_dispatch_hooks == [gate.hook]
+            assert gate.is_registered() and gate.engine_ref() is engine
             assert all(not values for values in engine.event_manager._post_dispatch_hooks.values())
             assert not advanced._registrations
-            print("PASS unload removes pre/post hooks and releases pending claims")
+            print("PASS unload removes library pre/post hooks and pending claims while retaining only the engine deletion gate")
         assert NETWORK_ATTEMPTS == []
     print(json.dumps({"status": "PASS", "sdk_engine_version": importlib.metadata.version("griptape-nodes-engine"),
         "native_create_and_paste_handlers_mocked": False, "network_requests": 0, "live_user_workflow_changed": False}))
