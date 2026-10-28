@@ -1,6 +1,7 @@
 """Offline shot provenance, export proof and exactly-once web publication checks."""
 from __future__ import annotations
 
+import ast
 import copy
 import importlib.util
 import json
@@ -273,19 +274,30 @@ class ColorLUTUploadRegression(unittest.TestCase):
             self.assertEqual(request.call_args.args[0]["upload_id"], context["upload_id"])
 
     def test_unknown_upload_diagnostics_do_not_expose_exception_text(self):
-        from HMBSeedanceGeneration import _BrokerAuthenticationError, _BrokerUnavailableError
+        # Exercise the real Broker exception definitions without importing the
+        # provider/desktop SDK. This suite deliberately runs in offline CI.
+        source_path = ROOT / "HMBSeedanceGeneration.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8-sig"), filename=str(source_path))
+        names = {"_BrokerError", "_BrokerAuthenticationError", "_BrokerUnavailableError"}
+        definitions = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name in names]
+        self.assertEqual({node.name for node in definitions}, names)
+        broker = types.ModuleType("HMBSeedanceGeneration")
+        exec(compile(ast.Module(body=definitions, type_ignores=[]), str(source_path), "exec"), broker.__dict__)
+        _BrokerAuthenticationError = broker._BrokerAuthenticationError
+        _BrokerUnavailableError = broker._BrokerUnavailableError
         cases = ((HTTPError("https://secret.invalid", 403, "secret", {}, None), "권한"),
                  (HTTPError("https://secret.invalid", 503, "secret", {}, None), "서버 오류"),
                  (HTTPError("https://secret.invalid", 404, "secret", {}, None), "HTTP 404"),
                  (URLError("secret"), "연결"), (TimeoutError("secret"), "시간"),
                  (_BrokerAuthenticationError("secret", status_code=None), "로그인이 필요"),
                  (_BrokerUnavailableError("secret", status_code=None), "연결"))
-        for error, expected in cases:
-            with self.subTest(error=type(error).__name__, code=getattr(error, "code", None)):
-                reason = target._unknown_upload_reason(error)
-                self.assertIn(expected, reason)
-                self.assertIn("새 업로드 없이 조회", reason)
-                self.assertNotIn("secret", reason)
+        with mock.patch.dict(sys.modules, {"HMBSeedanceGeneration": broker}):
+            for error, expected in cases:
+                with self.subTest(error=type(error).__name__, code=getattr(error, "code", None)):
+                    reason = target._unknown_upload_reason(error)
+                    self.assertIn(expected, reason)
+                    self.assertIn("새 업로드 없이 조회", reason)
+                    self.assertNotIn("secret", reason)
 
     def test_confirmed_absent_allows_only_next_click_retry_with_frozen_metadata(self):
         self.ready()
