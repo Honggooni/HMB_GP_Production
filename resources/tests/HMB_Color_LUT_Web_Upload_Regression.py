@@ -10,6 +10,7 @@ import types
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -254,6 +255,37 @@ class ColorLUTUploadRegression(unittest.TestCase):
             self.fixture.drain()
             self.assertTrue(request.call_args.kwargs["retrieve"])
             self.assertEqual(request.call_count, 1)
+
+    def test_upload_auth_error_is_explained_and_same_id_is_retrieved(self):
+        context = self.ready()
+        failure = HTTPError("https://broker.invalid/private?token=must-not-appear", 401, "fixture", {}, None)
+        with mock.patch.object(self.node, "_upload_request", side_effect=failure) as request:
+            self.node._command({"id": "auth-unknown", "action": "upload_web", "state": copy.deepcopy(self.node._hmb_color_lut_state)})
+            self.fixture.drain()
+            self.assertFalse(request.call_args.kwargs["retrieve"])
+        self.assertEqual(self.node._web_upload["phase"], "unknown")
+        self.assertIn("로그인이 만료", self.node._web_upload["reason"])
+        self.assertNotIn("must-not-appear", self.node._web_upload["reason"])
+        with mock.patch.object(self.node, "_upload_request", side_effect=lambda actual, **_kw: self.acknowledgement(actual)) as request:
+            self.node._command({"id": "auth-retrieve", "action": "upload_web", "state": copy.deepcopy(self.node._hmb_color_lut_state)})
+            self.fixture.drain()
+            self.assertTrue(request.call_args.kwargs["retrieve"])
+            self.assertEqual(request.call_args.args[0]["upload_id"], context["upload_id"])
+
+    def test_unknown_upload_diagnostics_do_not_expose_exception_text(self):
+        from HMBSeedanceGeneration import _BrokerAuthenticationError, _BrokerUnavailableError
+        cases = ((HTTPError("https://secret.invalid", 403, "secret", {}, None), "권한"),
+                 (HTTPError("https://secret.invalid", 503, "secret", {}, None), "서버 오류"),
+                 (HTTPError("https://secret.invalid", 404, "secret", {}, None), "HTTP 404"),
+                 (URLError("secret"), "연결"), (TimeoutError("secret"), "시간"),
+                 (_BrokerAuthenticationError("secret", status_code=None), "로그인이 필요"),
+                 (_BrokerUnavailableError("secret", status_code=None), "연결"))
+        for error, expected in cases:
+            with self.subTest(error=type(error).__name__, code=getattr(error, "code", None)):
+                reason = target._unknown_upload_reason(error)
+                self.assertIn(expected, reason)
+                self.assertIn("새 업로드 없이 조회", reason)
+                self.assertNotIn("secret", reason)
 
     def test_confirmed_absent_allows_only_next_click_retry_with_frozen_metadata(self):
         self.ready()

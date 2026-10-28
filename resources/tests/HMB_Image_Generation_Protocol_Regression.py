@@ -78,10 +78,10 @@ for field, value in (("credential_ready", "yes"), ("enabled", 1), ("max_referenc
     bad = copy.deepcopy(RAW_CAPS)
     bad["models"][0][field] = value
     rejects(lambda: images.parse_capabilities(bad))
-for field in ("enabled", "credential_ready"):
+for field, expected in (("enabled", "IMAGE_MODEL_DISABLED"), ("credential_ready", "IMAGE_CREDENTIAL_NOT_READY")):
     bad = copy.deepcopy(RAW_CAPS)
     bad["models"][0][field] = False
-    rejects(lambda: images.prepare_invocation(images.parse_capabilities(bad), **OPTIONS), "IMAGE_MODEL_NOT_READY")
+    rejects(lambda: images.prepare_invocation(images.parse_capabilities(bad), **OPTIONS), expected)
 bad = copy.deepcopy(RAW_CAPS)
 bad["enabled"] = False
 rejects(lambda: images.prepare_invocation(images.parse_capabilities(bad), **OPTIONS), "IMAGE_GENERATION_UNAVAILABLE")
@@ -209,6 +209,16 @@ for http_status, code in ((404, "IMAGE_GENERATION_UNSUPPORTED"), (405, "IMAGE_GE
     check(not any(call[1] == "/api/v1/generate/image" for call in bridge.calls))
 bridge.capability_error = None
 bridge.calls.clear()
+AuthFailure = type("_BrokerAuthenticationError", (RuntimeError,), {"__module__": "HMBSeedanceGeneration"})
+for error in (AuthFailure("missing secret token body"), AuthFailure("undecryptable secret token body")):
+    bridge.capability_error = error
+    denied = rejects(lambda: transport.capabilities(), "IMAGE_BROKER_LOGIN_REQUIRED")
+    check("secret" not in str(denied) and "login" in str(denied).lower())
+bridge.capability_error = RuntimeError("synthetic TLS network error")
+denied = rejects(lambda: transport.capabilities(), "IMAGE_BROKER_UNAVAILABLE")
+check("login" not in str(denied).lower())
+bridge.capability_error = None
+bridge.calls.clear()
 transport.capabilities()
 check(bridge.calls[0][1] == "/api/v1/image-generation/capabilities")
 prepared = []
@@ -226,6 +236,22 @@ check(not {"project_id", "project_name", "shot", "shot_name", "title"} & set(cre
 check(transport.refresh("job-image-one", invocation=INVOCATION)["job_id"] == "job-image-one")
 check(transport.refresh(INVOCATION.client_request_id, client_request_id=INVOCATION.client_request_id,
     invocation=INVOCATION)["job_id"] == "job-image-one")
+for error in (AuthFailure("private expired token"), RuntimeError("private connection detail")):
+    bridge.error = error
+    denied = rejects(lambda: transport.refresh("job-image-one", client_request_id=INVOCATION.client_request_id),
+                     "IMAGE_BROKER_LOGIN_REQUIRED" if isinstance(error, AuthFailure) else "IMAGE_STATUS_UNAVAILABLE")
+    check("private" not in str(denied) and "job-image-one" in str(denied) and "same Task" in str(denied))
+bridge.error = None
+check(len([call for call in bridge.calls if call[1] == "/api/v1/generate/image"]) == 1,
+      "A status/auth failure resubmitted the create request")
+for code, phrase in (("image_model_not_allowed", "model"), ("image_credentials_not_ready", "credential"),
+                     ("image_provider_rejected", "provider"), ("image_storage_unavailable", "storage")):
+    job = job_for(status="failed")
+    job["error"] = {"code": code, "message": "private secret provider body"}
+    guidance = images.image_job_failure_message(job)
+    check(phrase in guidance.lower() and "private" not in guidance and "secret" not in guidance)
+for unsafe in ({"code": "private secret"}, {"message": "private secret"}, "private secret", None):
+    check(images.image_job_failure_message({"error": unsafe}) == "")
 for key, bad_value in (("job_id", "job-other"), ("provider", "other-provider"), ("model", "other-model"),
                        ("client_request_id", "img-other")):
     bad = job_for()
@@ -385,7 +411,7 @@ check("use_google_image_search" not in {item.name for item in pro.options})
 check("use_google_image_search" in {item.name for item in banana2.options})
 check(not any(item.enabled or item.credential_ready for item in (pro, banana2)))
 rejects(lambda: images.prepare_invocation(images.ImageCapabilities(True, (pro,)),
-    **(OPTIONS | {"model_id": pro.model_id}), model_options={}), "IMAGE_MODEL_NOT_READY")
+    **(OPTIONS | {"model_id": pro.model_id}), model_options={}), "IMAGE_MODEL_DISABLED")
 actual_pro_fixture = replace(pro, enabled=True, credential_ready=True)
 rejects(lambda: images.prepare_invocation(images.ImageCapabilities(True, (actual_pro_fixture,)),
     **(OPTIONS | {"model_id": pro.model_id}), model_options={"use_google_image_search": False}), "IMAGE_OPTION_UNSUPPORTED")

@@ -131,6 +131,7 @@ class Backend:
         self.capability_calls = 0
         self.account_calls = 0
         self.error = None
+        self.refresh_error = None
         self.capability_error = None
         self.account_error = None
         self.status = "succeeded"
@@ -187,6 +188,8 @@ class Backend:
                 return backend.record(invocation, backend.status)
             def refresh(self, job_id, *, client_request_id="", **kwargs):
                 backend.refreshed.append((job_id, client_request_id))
+                if backend.refresh_error:
+                    raise backend.refresh_error
                 invocation = next(value for value in backend.created if value.client_request_id == client_request_id)
                 return backend.record(invocation, backend.status)
             def save_result(self, job, output_path, *, is_alive=None, result_index=0):
@@ -575,6 +578,37 @@ class PersonalImageNodeTests(unittest.TestCase):
         self.assert_success()
         self.assertEqual(len(self.backend.created), 1)
         self.assertEqual(self.backend.refreshed[0], (checkpoint["task_id"], checkpoint["client_request_id"]))
+
+    def test_login_failure_preserves_unknown_task_for_same_task_recovery(self):
+        self.authored()
+        self.backend.error = protocol.ImageGenerationError("simulated accepted timeout", submission_outcome_unknown=True)
+        self.run_node()
+        checkpoint = deepcopy(self.node.get_parameter_value("image_recovery"))
+        self.backend.error = None
+        self.backend.refresh_error = protocol.ImageGenerationError(
+            f"Broker login required. Task {checkpoint['task_id']} retained; reconnect and retrieve the same Task.",
+            code="IMAGE_BROKER_LOGIN_REQUIRED")
+        self.run_node(action="retrieve")
+        self.assertEqual(self.node.get_parameter_value("image_recovery"), checkpoint)
+        self.assertIn(checkpoint["task_id"], self.node.get_parameter_value("result_details"))
+        self.assertIn("reconnect", self.node.get_parameter_value("result_details"))
+        self.assertEqual(len(self.backend.created), 1)
+        self.backend.refresh_error = None
+        self.run_node(action="retrieve")
+        self.assert_success()
+        self.assertEqual(len(self.backend.created), 1)
+        self.assertEqual(self.backend.refreshed, [(checkpoint["task_id"], checkpoint["client_request_id"])] * 2)
+
+    def test_terminal_error_uses_safe_fixed_message_only(self):
+        self.authored()
+        self.backend.status = "failed"
+        self.backend.job_fields = {"error": {"code": "image_credentials_not_ready", "message": "provider-secret-must-not-leak"}}
+        self.run_node()
+        details = self.node.get_parameter_value("result_details")
+        self.assertIn("credential", details.lower())
+        self.assertNotIn("provider-secret", details)
+        self.assertEqual(self.node.get_parameter_value("image_recovery")["status"], "failed")
+        self.assertEqual(len(self.backend.created), 1)
 
     def test_running_unknown_create_stops_without_polling_or_replacement(self):
         self.authored()

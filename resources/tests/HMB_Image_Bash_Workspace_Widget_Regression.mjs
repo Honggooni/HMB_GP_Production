@@ -93,12 +93,12 @@ const outputCode=`import ast,json,sys
 from pathlib import Path
 from typing import Any,Dict
 source=Path(sys.argv[1]).read_text(encoding='utf-8-sig')
-node=next(row for row in ast.parse(source).body if isinstance(row,ast.FunctionDef) and row.name=='_build_image_bash_outputs')
+nodes=[row for row in ast.parse(source).body if isinstance(row,ast.FunctionDef) and row.name in ('_build_image_bash_outputs','_image_bash_selection_state')]
 state=json.load(sys.stdin)
 def resolve(scoped,*args,**kwargs):
  return {'resolved':[{'source_uid':row['source_uid'],'asset':row,'media':'file:///'+row['source_uid']+'.png'} for row in scoped['assets'] if row['selected']]}
 scope={'Any':Any,'Dict':Dict,'_resolve_selected_assets':resolve,'_clean':lambda value:str(value or '').strip(),'IMAGE_BASH_CONTEXT_SCHEMA':'hmb-image-bash-inputs-v1'}
-exec(compile(ast.Module(body=[node],type_ignores=[]),'<actual HMBImageAsset output-pair builder>','exec'),scope)
+exec(compile(ast.Module(body=nodes,type_ignores=[]),'<actual HMBImageAsset output-pair builder>','exec'),scope)
 images,context=scope['_build_image_bash_outputs'](state)
 print(json.dumps({'images':[{'url':image.value,'name':image.name} for image in images],'context':context,'state':state}))`;
 const installedPython=path.join(process.env.LOCALAPPDATA||'', 'ai.griptape.nodes.desktop/current/resources/engine-bundle/python/python.exe');
@@ -153,7 +153,7 @@ try{
  const workspace=()=>expanded.locator('[data-image-bash-panel]');
  const browserSnapshot=()=>page.evaluate(()=>structuredClone(window.host));
  const assertBrowserShots=async label=>assertShotsUntouched(await browserSnapshot(),label);
- const addImageBash=async()=>{await page.locator('[data-hier-slot]').selectOption('image_bash');await page.locator('[data-hier-add]').click();};
+ const addImageBash=async()=>{await page.locator('[data-hier-slot]').selectOption('image_bash');await page.locator('[data-hier-confirm]').click();};
  // Product UI assertions follow the public data attributes, rather than a
  // second implementation of workspace actions or node-creation commands.
  assert.equal(await page.locator('[data-shot-panel]').count(),5);
@@ -173,7 +173,7 @@ try{
  await page.locator('[data-hier-slot]').selectOption('image_bash');
  assert.equal(await page.locator('[data-hier-manual-name-field]').isVisible(),false);
  assert.equal(await page.locator('[data-hier-manual-name]').isDisabled(),true);
- assert.equal(await page.locator('[data-hier-add]').innerText(),'HMBImageBash 추가');
+ assert.equal(await page.locator('[data-hier-add]').isVisible(),false,'The single confirm button owns the Bash selection');
  await page.locator('[data-hier-slot]').selectOption('new');
  assert.equal(await page.locator('[data-hier-manual-name]').isVisible(),true);
  assert.equal(await page.locator('[data-hier-manual-name]').isEnabled(),true);
@@ -373,6 +373,32 @@ try{
  await page.evaluate(value=>window.openGraph(value),finalWorkspaceSaved);
  assert.equal(await page.evaluate(()=>window.writes.some(raw=>Boolean((raw.edits||raw).asset_registration_request?.request_id))),false,'All pre-registration Bash paths issue zero registration/JSON-write commands');checks++;
  await assertBrowserShots('Capacity, lock and late-failure checks retain every original Shot');
+ // No bound CGT/manual hierarchy: cancel is inert, and a single confirm
+ // creates the separate workspace without inventing Shot or CGT commits.
+ const unbound=structuredClone(initial);unbound.shot_hierarchy={};unbound.image_bash_workspace={};unbound.image_bash_active=false;
+ await page.evaluate(value=>window.openGraph(value),unbound);
+ await page.locator('[data-shot-add]').first().click();
+ assert.match(await page.locator('[data-hier-selected-pane] h3').first().innerText(),/\(0\/5\)/);
+ await page.locator('[data-hier-slot]').selectOption('image_bash');
+ assert.equal(await page.locator('[data-hier-add]').isVisible(),false);
+ if(report)await page.screenshot({path:path.join(report,'bash-confirm-zero-shots-before-synthetic.png')});
+ const beforeCancel=await page.evaluate(()=>({writes:window.writes.length,creates:window.createRequests.length}));
+ await page.locator('[data-hier-add]').dispatchEvent('click');
+ assert.deepEqual(await page.evaluate(()=>({writes:window.writes.length,creates:window.createRequests.length})),beforeCancel,'The hidden former add control cannot create a workspace');
+ await page.locator('[data-hier-cancel]').first().click();
+ assert.deepEqual(await page.evaluate(()=>({writes:window.writes.length,creates:window.createRequests.length})),beforeCancel);
+ await page.locator('[data-shot-add]').first().click();await addImageBash();
+ await page.waitForFunction(n=>window.createRequests.length===n,beforeCancel.creates+1);
+ const unboundAdded=await browserSnapshot();
+ assert.deepEqual(unboundAdded.shot_hierarchy,unbound.shot_hierarchy);
+ assert.deepEqual(unboundAdded.shot_routing,unbound.shot_routing);
+ assert.ok(unboundAdded.image_bash_workspace.workspace_id);
+ if(report)await page.screenshot({path:path.join(report,'bash-confirm-zero-shots-after-synthetic.png')});
+ await page.locator('[data-shot-add]').first().click();await addImageBash();
+ await page.waitForFunction(n=>window.createRequests.length===n,beforeCancel.creates+2);
+ assert.equal((await browserSnapshot()).image_bash_workspace.workspace_id,unboundAdded.image_bash_workspace.workspace_id,'Repeated confirm reuses the existing workspace');
+ assert.equal(await workspace().count(),1,'Repeated confirm never adds a duplicate workspace');checks+=9;
+ await page.evaluate(value=>window.openGraph(value),finalWorkspaceSaved);
  await page.evaluate(()=>window.controller.cleanup());
  assert.equal(await page.evaluate(()=>document.getElementById('widget').__hmbImageAssetBashCardsByLibraryId===undefined),true,'Cleanup retires the Bash thumbnail card index');checks++;
  await page.evaluate(value=>window.openGraph(value),finalWorkspaceSaved);

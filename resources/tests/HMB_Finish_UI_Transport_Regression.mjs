@@ -37,12 +37,12 @@ try{
  await page.setContent('<style>body{background:#080b12;margin:20px}#mount{width:980px;height:991px}</style><div id="mount"></div>');
  await page.evaluate(async source=>{
   window.widget=await import('data:text/javascript;base64,'+btoa(unescape(encodeURIComponent(source))));window.mount=document.querySelector('#mount');
-  window.sent=[];window.replies=[];window.pending=[];window.hold='';
+  window.sent=[];window.replies=[];window.completed=[];window.pending=[];window.hold='';
   window.install=async()=>{
-   window.controller?.cleanup();const initial=await finishBackend({kind:'reset'});window.initial=initial.value;sent=[];replies=[];pending=[];hold='';
+   window.controller?.cleanup();const initial=await finishBackend({kind:'reset'});window.initial=initial.value;sent=[];replies=[];completed=[];pending=[];hold='';
    window.props={value:structuredClone(initial.value),onChange:payload=>{
     sent.push(structuredClone(payload));
-    const send=async()=>{const result=await finishBackend({kind:'request',payload});replies.push(result.value);controller.update({...props,value:result.value});return result;};
+    const send=async()=>{const result=await finishBackend({kind:'request',payload});completed.push({request_id:payload.ui_transport.request_id,sequence:payload.ui_transport.sequence});replies.push(result.value);controller.update({...props,value:result.value});return result;};
     return hold===payload.ui_transport.operation?new Promise((resolve,reject)=>pending.push(()=>send().then(resolve,reject))):send();
    }};window.controller=widget.default(mount,props);
   };
@@ -52,7 +52,16 @@ try{
   window.changeBrightness=value=>{const input=mount.querySelector('[data-finish-step="beauty.brightness"]');input.value=String(widget.HMB_FINISH_LOOK_STEPS['beauty.brightness'].findIndex(row=>row.value===value));input.dispatchEvent(new Event('change',{bubbles:true}));};
   await install();
  },fs.readFileSync(path.join(root,'widgets/HMBFinishLookLibraryWidget.js'),'utf8'));
- const settle=async()=>{await page.waitForTimeout(55);await page.waitForFunction(()=>pending.length===0 && sent.length===replies.length);await page.waitForTimeout(20);};
+ // Tab publications are deferred for two rAFs with a 120ms fallback. Zero
+ // requests and zero replies do not establish that the deferred work settled.
+ const settle=async()=>{
+  await page.waitForTimeout(140);
+  await page.waitForFunction(()=>{
+   return sent.length>0 && pending.length===0 && sent.length===replies.length
+    && sent.every(({ui_transport:request})=>completed.some(reply=>reply.request_id===request.request_id && reply.sequence===request.sequence));
+  },null,{timeout:5000});
+  await page.waitForTimeout(40);
+ };
  const reset=async()=>{await page.evaluate(()=>install());};
  assert.equal(await page.locator('[data-finish-shot]').count(),5);assert.equal(await page.locator('[data-finish-step]').count(),11);
  assert.equal(await page.evaluate(()=>Object.keys(widget.hmbFinishLookPublication(initial)).length),9);

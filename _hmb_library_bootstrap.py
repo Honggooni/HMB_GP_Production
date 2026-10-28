@@ -164,8 +164,8 @@ def _hmb_native_editor_sources(engine: Any, library_data: Any) -> tuple[Path, Pa
             or paths["bootstrap"] != root / "_hmb_library_bootstrap.py"):
         raise ValueError("native_support_manifest_owner_changed")
     descriptor = json.loads(contents["descriptor"].decode("utf-8-sig"))
-    if (descriptor.get("schema") != "hmb-native-editor-patch-release" or type(descriptor.get("version")) is not int
-            or descriptor["version"] != 1 or descriptor.get("editor_version") != "0.128.1"
+    if ("editor_version" in descriptor or descriptor.get("schema") != "hmb-native-editor-patch-release" or type(descriptor.get("version")) is not int
+            or descriptor["version"] != 1 or descriptor.get("source_profile") != "reviewed-stock"
             or descriptor.get("bundle_name") != "index-DEZU41rc.js"
             or descriptor.get("helper_path") != "resources/editor/hmb-color-lut-native-header.js"
             or descriptor.get("patcher_path") != "tools/hmb_color_lut_native_header_patch.py"):
@@ -174,6 +174,34 @@ def _hmb_native_editor_sources(engine: Any, library_data: Any) -> tuple[Path, Pa
     for key in ("patcher", "helper"):
         if descriptor.get(key + "_sha256") != hashes[key]:
             raise ValueError("native_support_" + key + "_hash_changed")
+    profiles = descriptor.get("additional_profiles", [])
+    if not isinstance(profiles, list) or len(profiles) > 16:
+        raise ValueError("native_support_profiles_invalid")
+    for profile in profiles:
+        required = {"source_sha256", "candidate_sha256", "adapter_path", "adapter_sha256", "structural_fallback"}
+        if (not isinstance(profile, dict) or not required.issubset(profile)
+                or set(profile) - required - {"previous_candidate_sha256"}
+                or profile.get("adapter_path") != "tools/hmb_native_semantic_adapter.py"
+                or type(profile.get("structural_fallback")) is not bool):
+            raise ValueError("native_support_profile_invalid")
+        for key in ("source_sha256", "candidate_sha256", "adapter_sha256"):
+            value = profile.get(key)
+            if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+                raise ValueError("native_support_profile_hash_invalid")
+        previous = profile.get("previous_candidate_sha256", [])
+        if (not isinstance(previous, list) or len(previous) > 16
+                or any(not isinstance(value, str) or len(value) != 64
+                       or any(c not in "0123456789abcdef" for c in value) for value in previous)
+                or len(set(previous)) != len(previous)
+                or any(value in (profile["source_sha256"], profile["candidate_sha256"]) for value in previous)):
+            raise ValueError("native_support_previous_profile_hash_invalid")
+        adapter = _hmb_native_editor_plain_path(root / profile["adapter_path"])
+        if not adapter.is_file() or adapter.stat().st_size > 4 * 1024 * 1024:
+            raise ValueError("native_support_adapter_missing_or_oversized")
+        adapter_hash = hashlib.sha256(adapter.read_bytes()).hexdigest()
+        if adapter_hash != profile["adapter_sha256"]:
+            raise ValueError("native_support_adapter_hash_changed")
+        hashes["adapter:" + profile["adapter_path"]] = adapter_hash
     candidate = descriptor.get("candidate_sha256")
     if not isinstance(candidate, str) or len(candidate) != 64 or any(c not in "0123456789abcdef" for c in candidate):
         raise ValueError("native_support_candidate_hash_invalid")
@@ -181,6 +209,41 @@ def _hmb_native_editor_sources(engine: Any, library_data: Any) -> tuple[Path, Pa
     if sys.version_info[:2] != (3, 12) or python.is_relative_to(root) or not python.is_file():
         raise ValueError("native_support_external_python_required")
     return root, python, hashes, descriptor
+
+
+def _hmb_native_editor_runtime_fingerprint() -> tuple[str, str, str]:
+    """Fingerprint the *active* editor, so vendor updates invalidate a cache.
+
+    This is read-only and bounded. Never trust a supplied or cached target:
+    the release updater repeats its own stricter preflight before any write.
+    """
+    import re
+
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        raise ValueError("native_editor_local_appdata_missing")
+    root = _hmb_native_editor_plain_path(Path(local) / "ai.griptape.nodes.desktop/current/resources/editor-bundle")
+    entry = _hmb_native_editor_plain_path(root / "index-editor.html")
+
+    def read_stable(path: Path, limit: int) -> bytes:
+        before = path.stat()
+        if not path.is_file() or before.st_size > limit:
+            raise ValueError("native_editor_file_missing_or_oversized")
+        encoded = path.read_bytes()
+        after = path.stat()
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or len(encoded) != before.st_size:
+            raise ValueError("native_editor_file_changed_during_read")
+        return encoded
+
+    html = read_stable(entry, 1024 * 1024)
+    matches = re.findall(r'''\bsrc\s*=\s*["']\./assets/(index-[A-Za-z0-9_-]+\.js)["']''', html.decode("utf-8"))
+    if len(matches) != 1:
+        raise ValueError("native_editor_entry_ambiguous")
+    target = _hmb_native_editor_plain_path(root / "assets" / matches[0])
+    encoded = read_stable(target, 64 * 1024 * 1024)
+    if read_stable(entry, 1024 * 1024) != html:
+        raise ValueError("native_editor_entry_changed_during_read")
+    return str(target), hashlib.sha256(html).hexdigest(), hashlib.sha256(encoded).hexdigest()
 
 
 def _hmb_native_editor_state() -> Any:
@@ -224,9 +287,13 @@ def _hmb_native_editor_child(root: Path, python: Path, descriptor: dict[str, Any
                 or len(value["reason"]) > 4096 or any(ord(c) < 32 for c in value["reason"])):
             raise ValueError("native_update_response_invalid")
         success = value["status"] in {"current", "applied"}
+        candidates = {descriptor["candidate_sha256"]}
+        candidates.update(p["candidate_sha256"] for p in descriptor.get("additional_profiles", []))
+        candidate = value.get("candidate_sha256")
         if success and (process.returncode != 0 or value["disk_ready"] is not True
-                or value.get("candidate_sha256") != descriptor["candidate_sha256"]
-                or value.get("editor_version") != descriptor["editor_version"]
+                or candidate not in candidates
+                or value.get("source_profile") not in {"reviewed-stock", "reviewed-adapter"}
+                or "editor_version" in value
                 or value["status"] == "applied" and value["restart_required"] is not True):
             raise ValueError("native_update_success_unverified")
         if not success and value["disk_ready"] is not False:
@@ -259,7 +326,8 @@ def _hmb_coordinate_native_editor_update(owner: Any, engine: Any, library_data: 
     try:
         root, python, hashes, descriptor = _hmb_native_editor_sources(engine, library_data)
         state = _hmb_native_editor_state()
-        identity = (str(root), tuple(sorted(hashes.items())))
+        runtime = _hmb_native_editor_runtime_fingerprint()
+        identity = (str(root), tuple(sorted(hashes.items())), runtime)
     except LookupError as exc:
         summary = _hmb_native_editor_summary("unsupported", str(exc))
         owner._hmb_native_editor_update_identity = None
@@ -285,14 +353,29 @@ def _hmb_coordinate_native_editor_update(owner: Any, engine: Any, library_data: 
         state.jobs[identity] = {"summary": dict(summary)}
         _hmb_native_editor_publish(owner, engine, identity, summary)
     def update() -> None:
+        final_runtime = None
         try:
             result = _hmb_native_editor_child(root, python, descriptor)
+            final_runtime = _hmb_native_editor_runtime_fingerprint()
+            if (final_runtime[:2] != runtime[:2]
+                    or (result.get("status") in {"current", "applied"}
+                        and final_runtime[2] != result.get("candidate_sha256"))
+                    or (result.get("status") not in {"current", "applied"}
+                        and final_runtime[2] != runtime[2])):
+                result = _hmb_native_editor_summary("pending", "native_editor_changed_during_update", restart_required=True)
         except subprocess.TimeoutExpired:
             result = _hmb_native_editor_summary("pending", "native_update_timeout", restart_required=True)
         except Exception as exc:
             result = _hmb_native_editor_summary("error", "native_update_failed:" + type(exc).__name__, restart_required=True)
         with state.lock:
-            state.jobs[identity] = {"summary": dict(result)}
+            # An applied transaction replaces the bytes represented by its
+            # original cache key. Keeping a successful result under that key
+            # would later misreport ready if an app update restores those
+            # exact original bytes. A future check must run again instead.
+            if result.get("status") == "applied" and final_runtime != runtime:
+                state.jobs.pop(identity, None)
+            else:
+                state.jobs[identity] = {"summary": dict(result)}
             live_owner, live_engine = owner_ref(), engine_ref()
             if live_owner is not None and live_engine is not None:
                 _hmb_native_editor_publish(live_owner, live_engine, identity, result)
@@ -1540,6 +1623,8 @@ class _DeletionLifetimeGate:
                 has_hmb = has_hmb or metadata.get("library") == _LIBRARY_NAME
             if not has_hmb:
                 return None  # A positively inventoried standard-only graph is native-owned.
+            if not self.ready:
+                raise RuntimeError("The HMB deletion gate is not ready")
             migration = sys.modules.get("_hmb_workflow_migration")
             if migration is not None and migration.mutation_is_internal():
                 return None
@@ -1557,8 +1642,8 @@ def _install_deletion_lifetime_gate(engine: Any, manager: Any) -> tuple[Any, Any
     required = ("add_pre_dispatch_hook", "remove_pre_dispatch_hook", "register_request_handlers")
     if any(not callable(getattr(manager, name, None)) for name in required):
         error = (
-            "[HMB_DELETE_GUARD_UNSUPPORTED] HMB 삭제 보호에는 Engine 0.101.3 이상의 "
-            "predispatch/request-handler API가 필요합니다. Griptape를 업데이트하세요.")
+            "[HMB_DELETE_GUARD_UNSUPPORTED] HMB 삭제 보호에 필요한 "
+            "predispatch/request-handler 기능을 확인할 수 없습니다. 현재 작업을 저장하고 지원 상태를 확인하세요.")
         existing = getattr(manager, _DELETION_GATE_ATTRIBUTE, None)
         if (getattr(existing, "protection_version", None) == _DELETION_PROTECTION_VERSION
                 and callable(getattr(existing, "engine_ref", None))
@@ -1579,6 +1664,9 @@ def _install_deletion_lifetime_gate(engine: Any, manager: Any) -> tuple[Any, Any
             or not callable(getattr(gate, "is_registered", None))):
         raise _DeletionProtectionError("[HMB_DELETE_GUARD_NOT_READY] 삭제 보호 등록의 소유권을 확인하지 못했습니다. Griptape를 다시 시작하세요.")
     gate.ready = False
+    # A previous hot-loaded gate may still be an older class that does not
+    # consult `ready`. Remove its callable until the stronger barrier is proven.
+    gate.callback = None
     gate.readiness_error = "[HMB_DELETE_GUARD_NOT_READY] 삭제 보호 초기화가 완료되지 않았습니다."
     if not gate.is_registered():
         manager.add_pre_dispatch_hook(gate.hook)
@@ -1594,12 +1682,11 @@ def _install_deletion_lifetime_gate(engine: Any, manager: Any) -> tuple[Any, Any
         gate.readiness_error = "[HMB_DELETE_GUARD_NOT_READY] 다른 HMB 설치의 삭제 보호 모듈이 로드되어 있습니다. Griptape를 다시 시작하세요."
         raise _DeletionProtectionError(gate.readiness_error)
     callback = getattr(module, "guard_request", None)
-    if callable(callback):
-        gate.callback = callback
     # Git updates do not necessarily evict this helper from sys.modules. Keep
     # its exact old guard callable alive; never re-register SDK payload types.
     if (getattr(module, "PROTECTION_VERSION", None) != _DELETION_PROTECTION_VERSION
-            or not callable(getattr(module, "protection_readiness", None))):
+            or not callable(getattr(module, "protection_readiness", None))
+            or not callable(getattr(module, "install_reentrant_barrier", None))):
         gate.ready = False
         gate.readiness_error = "[HMB_DELETE_GUARD_RESTART_REQUIRED] 이전 삭제 보호 코드가 메모리에 남아 있습니다. Griptape를 완전히 종료한 뒤 다시 시작하세요."
         raise _DeletionProtectionError(gate.readiness_error)
@@ -2078,6 +2165,21 @@ class _Registration:
 class HMBProductionLibrary(AdvancedNodeLibrary):
     def __init__(self) -> None:
         self._registrations: set[_Registration] = set()
+        # The SDK may log and continue after a before-load hook throws. Arm
+        # the engine-owned deletion boundaries in the constructor, whose
+        # failure rejects registration before HMB node classes are loaded.
+        if not callable(current_engine):
+            raise _DeletionProtectionError("[HMB_DELETE_GUARD_UNSUPPORTED] Engine 보호 컨텍스트를 확인할 수 없습니다.")
+        engine = current_engine()
+        manager = getattr(engine, "library_manager", None) if engine is not None else None
+        is_worker = getattr(manager, "is_worker", None)
+        if is_worker is not True and is_worker is not False:
+            raise _DeletionProtectionError("[HMB_DELETE_GUARD_NOT_READY] Engine 편집기 소유권을 확인할 수 없습니다.")
+        if is_worker is False:
+            with _REGISTRY_LOCK:
+                gate, deletion_module = _install_deletion_lifetime_gate(engine, engine.event_manager)
+                deletion_module.install_reentrant_barrier(engine)
+                deletion_module.install_handler_barrier(engine)
         self._hmb_environment_repair_summary = _hmb_coordinate_environment_repair()
 
     def before_library_nodes_loaded(self, library_data: Any, library: Any) -> None:
@@ -2150,6 +2252,13 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
                         registration.deletion_handlers = deletion_module.install_request_handlers(engine, registration)
                     if registration.deletion_handlers is None:
                         raise _DeletionProtectionError("[HMB_DELETE_GUARD_NOT_READY] 삭제 보호 요청 핸들러가 등록되지 않았습니다.")
+                    barrier = deletion_module.install_reentrant_barrier(engine)
+                    if (not callable(getattr(barrier, "is_installed", None))
+                            or not barrier.is_installed()
+                            or not callable(getattr(barrier, "engine_ref", None))
+                            or barrier.engine_ref() is not engine):
+                        raise _DeletionProtectionError("[HMB_DELETE_GUARD_NOT_READY] 재진입 삭제 보호가 준비되지 않았습니다.")
+                    gate.callback = deletion_module.guard_request
                     gate.ready = True
                     gate.readiness_error = ""
                     self._hmb_deletion_readiness_error = ""

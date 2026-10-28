@@ -16,6 +16,8 @@ _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
+from _hmb_deletion_guard import hmb_binding_mutation
+
 
 def _load_hmb_common():
     module_path = _THIS_DIR / "_hmb_common.py"
@@ -10958,6 +10960,7 @@ class HMBPromptLibrary(DataNode):
                 # a transient UI notification cannot strand that transaction.
                 _diagnostic_exception("Manual Shot binding notice publication failed", error)
 
+    @hmb_binding_mutation
     def _hmb_prepare_manual_rebind(self, catalog: Any, info: Any) -> bool:
         """Expose choices without assigning an ambiguous legacy editor's work."""
         with self._hmb_sync_lock:
@@ -11102,6 +11105,7 @@ class HMBPromptLibrary(DataNode):
                 self._register_hydrated_document_routes(state)
             return self._hmb_prompt_merge_snapshot()
 
+    @hmb_binding_mutation
     def _hmb_restore_prompt_merge_snapshot(self, snapshot: Any, *, expected_state_sha256: str) -> Dict[str, Any]:
         with self._hmb_sync_lock:
             if (not isinstance(snapshot, dict) or snapshot.get("schema") != "hmb-prompt-merge-snapshot"
@@ -11548,6 +11552,7 @@ class HMBPromptLibrary(DataNode):
                     self._hmb_compact_route_syncing = False
             return self._hmb_shot_channel_subscription()
 
+    @hmb_binding_mutation
     def _hmb_clear_shot_routing_catalog(
         self, reason: str = "publisher_unavailable"
     ) -> Dict[str, Any]:
@@ -11623,6 +11628,7 @@ class HMBPromptLibrary(DataNode):
             self._sync_prompt_output_from_state(publish_shot_media=True)
             return self._hmb_shot_channel_subscription()
 
+    @hmb_binding_mutation
     def _hmb_reconcile_shot_routing(
         self,
         routing_snapshot: Any = None,
@@ -11846,6 +11852,7 @@ class HMBPromptLibrary(DataNode):
         except Exception:
             return False
 
+    @hmb_binding_mutation
     def set_parameter_value(
         self,
         param_name: str,
@@ -13196,6 +13203,7 @@ class HMBPromptLibrary(DataNode):
             _diagnostic_exception("Event-loop deferred sync scheduling failed", exc)
         run_sync()
 
+    @hmb_binding_mutation
     def after_value_set(self, parameter: Any, value: Any) -> Any:
         _begin_prompt_output_side_effect_callback(self)
         try:

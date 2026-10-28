@@ -14,6 +14,7 @@ import logging
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import tempfile
 from unittest import mock
@@ -29,9 +30,10 @@ async def exercise(engine):
     from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest
     from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, SerializeNodeToCommandsRequest, DeserializeNodeFromCommandsRequest
     from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
-    from griptape_nodes.serialization.values import decode_value
+    from griptape_nodes.serialization.values import decode_value, encode_value
     import HMBImageAssetLibrary as source
     import _hmb_shot_routing as routing
+    import _hmb_cgt as cgt
 
     schema = LibrarySchema.model_validate_json((ROOT / "griptape-nodes-library.json").read_text("utf-8"))
     library = LibraryRegistry.generate_new_library(schema)
@@ -111,6 +113,46 @@ async def exercise(engine):
             restored.after_deserialize()
             bridge_contract(restored)
             assert restored._current_state()["shot_routing"] == state_before
+            # A serialized pending dialog request is data, never a fresh user
+            # action. Drive the actual SDK initial-setup request path and
+            # prohibit every CGT read/write helper and process/network escape.
+            with ExitStack() as inert:
+                cgt_read = inert.enter_context(mock.patch.object(cgt, "catalog", side_effect=AssertionError("CGT read forbidden")))
+                cgt_write = inert.enter_context(mock.patch.object(cgt, "start_own_wait_after_commit", side_effect=AssertionError("CGT write forbidden")))
+                dispatch = inert.enter_context(mock.patch.object(restored, "_request_cgt_read", side_effect=AssertionError("CGT request dispatched")))
+                inert.enter_context(mock.patch.object(socket.socket, "connect", side_effect=AssertionError("network forbidden")))
+                inert.enter_context(mock.patch.object(subprocess, "run", side_effect=AssertionError("subprocess forbidden")))
+                inert.enter_context(mock.patch.object(subprocess, "Popen", side_effect=AssertionError("subprocess forbidden")))
+                bridge_command = next(indirect for indirect in serialized.set_parameter_value_commands
+                    if indirect.set_parameter_value_command.parameter_name == source.THUMBNAIL_PATCH_PARAMETER)
+                def restore_saved_bridge(saved):
+                    # Model a serialized old workflow's value pool and replay
+                    # the SDK's own saved command through initial_setup.
+                    saved_pool = deepcopy(pool)
+                    saved_pool[bridge_command.unique_value_uuid] = encode_value(saved)
+                    request = deepcopy(bridge_command.set_parameter_value_command)
+                    request.node_name = restored.name
+                    request.value = decode_value(saved_pool[bridge_command.unique_value_uuid])
+                    request.initial_setup = True
+                    return engine.handle_request(request)
+                for operation in ("cgt_catalog", "cgt_confirm", "cgt_cancel"):
+                    saved = {**source._default_thumbnail_bridge("fixture-runtime"), "operation": operation,
+                        "phase": "request", "request_id": "saved-request", "session_id": "saved-session",
+                        "project_identity": "fixture-project", "hierarchy_request": {"fixture": True}}
+                    hydrated = restore_saved_bridge(saved)
+                    assert hydrated.succeeded(), hydrated.result_details
+                    actual = restored.get_parameter_value(source.THUMBNAIL_PATCH_PARAMETER)
+                    assert actual["operation"] == actual["phase"] == "idle", actual
+                for operation in ("cgt_confirm", "catalog_page"):
+                    saved = {**source._default_thumbnail_bridge("fixture-runtime"), "operation": operation,
+                        "phase": "result", "request_id": "saved-result", "session_id": "saved-session",
+                        "outcome": "ready", "state": {"fixture": True}}
+                    expected = source._normalize_thumbnail_bridge(saved)
+                    hydrated = restore_saved_bridge(saved)
+                    assert hydrated.succeeded(), hydrated.result_details
+                    assert restored.get_parameter_value(source.THUMBNAIL_PATCH_PARAMETER) == expected
+                assert not cgt_read.called and not cgt_write.called and not dispatch.called
+                assert restored._current_state()["shot_routing"] == state_before
             resaved = engine.handle_request(SerializeNodeToCommandsRequest(node_name=restored.name,
                 unique_parameter_uuid_to_values={}, serialize_all_parameter_values=True))
             assert resaved.succeeded(), resaved.result_details
@@ -120,7 +162,8 @@ async def exercise(engine):
             assert len(engine.flow_manager.get_flow_by_name(cold_flow.flow_name).nodes) == 1
     print(json.dumps({"test": "HMB_CGT_Thumbnail_Bridge_Mount_Host_Regression", "status": "PASS",
         "actual_sdk": True, "fresh_bridge_property_mountable": True, "legacy_native_hide_override_repaired": True,
-        "five_shots_preserved": True, "bridge_identity_preserved": True, "cgt_calls": 0, "paid_calls": 0}))
+        "five_shots_preserved": True, "bridge_identity_preserved": True,
+        "saved_cgt_requests_inert": True, "saved_results_preserved": True, "cgt_calls": 0, "paid_calls": 0}))
 
 
 def main():

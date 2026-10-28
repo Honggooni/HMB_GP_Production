@@ -5,11 +5,13 @@ from copy import deepcopy
 import io
 import json
 import os
+import ssl
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import types
+import requests
 from unittest import mock
 from uuid import uuid4
 
@@ -255,6 +257,53 @@ with mock.patch.dict(os.environ, {'GT_CLOUD_API_KEY': 'fixture-secret', 'NO_PROX
     with mock.patch.object(cgt.subprocess, 'run', side_effect=subprocess.TimeoutExpired('fixture', 40)) as run:
         assert cgt.catalog('superwings12')['status'] == 'TIMEOUT' and run.call_count == 1
 checks += 5
+
+# Exact trusted failure codes survive the child-process boundary. Arbitrary
+# server text and secrets are never echoed to the widget.
+for code in ('SOURCE_SCHEMA', 'INVALID_ORIGIN', 'TRUST_CHANGED', 'READ_SCOPE_REJECTED',
+             'OWNERSHIP_CHANGED', 'INVALID_BINDING'):
+    assert cgt._classify_read_failure(ValueError(code)) == code
+    child_out = io.StringIO()
+    with mock.patch.object(sys, 'stdin', types.SimpleNamespace(buffer=io.BytesIO(b'{}'))), \
+         mock.patch.object(sys, 'stdout', child_out), \
+         mock.patch.object(cgt, '_read_own', side_effect=ValueError(code)):
+        cgt._main()
+    assert json.loads(child_out.getvalue())['status'] == code
+    checks += 2
+for exc, code in ((ssl.SSLError('private certificate detail'), 'TLS_REJECTED'),
+                  (TimeoutError('private timeout detail'), 'TIMEOUT'),
+                  (RuntimeError('token has expired: private secret'), 'LOGIN_REQUIRED'),
+                  (ValueError('SOURCE_SCHEMA private secret'), 'SDK_UNAVAILABLE')):
+    child_out = io.StringIO()
+    with mock.patch.object(sys, 'stdin', types.SimpleNamespace(buffer=io.BytesIO(b'{}'))), \
+         mock.patch.object(sys, 'stdout', child_out), \
+         mock.patch.object(cgt, '_read_own', side_effect=exc):
+        cgt._main()
+    value = child_out.getvalue()
+    assert json.loads(value)['status'] == code and 'private' not in value and 'secret' not in value
+    checks += 1
+
+# Exercise genuine requests exception classes without any network call.
+http_cases = [(401, 'LOGIN_REQUIRED'), (403, 'ACCESS_DENIED'), (429, 'RATE_LIMITED'),
+              (500, 'SERVER_UNAVAILABLE'), (503, 'SERVER_UNAVAILABLE'), (400, 'REQUEST_REJECTED'),
+              (404, 'REQUEST_REJECTED')]
+errors = []
+for status, code in http_cases:
+    response = requests.Response()
+    response.status_code = status
+    errors.append((requests.HTTPError('private response secret', response=response), code))
+errors.extend([(requests.ConnectionError('private network secret'), 'CONNECTION_FAILED'),
+               (requests.exceptions.SSLError('private TLS secret'), 'TLS_REJECTED'),
+               (requests.exceptions.ReadTimeout('private timeout secret'), 'TIMEOUT')])
+for exc, code in errors:
+    child_out = io.StringIO()
+    with mock.patch.object(sys, 'stdin', types.SimpleNamespace(buffer=io.BytesIO(b'{}'))), \
+         mock.patch.object(sys, 'stdout', child_out), \
+         mock.patch.object(cgt, '_read_own', side_effect=exc):
+        cgt._main()
+    value = child_out.getvalue()
+    assert json.loads(value)['status'] == code and 'private' not in value and 'secret' not in value
+    checks += 1
 
 def make_node():
     node = object.__new__(image.HMBImageAssetLibrary)

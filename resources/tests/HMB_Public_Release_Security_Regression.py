@@ -93,6 +93,7 @@ EXPECTED_DISTRIBUTION_ONLY_FILES = (
     "THIRD_PARTY_NOTICES.md",
     "SBOM.spdx.json",
     "tools/hmb_color_lut_native_header_patch.py",
+    "tools/hmb_native_semantic_adapter.py",
     "resources/editor/hmb-color-lut-native-header.js",
     "resources/editor/native-editor-patch.json",
 )
@@ -534,13 +535,52 @@ native_descriptor = builder.validate_native_editor_patch_sources()
 with tempfile.TemporaryDirectory(prefix="hmb-native-release-boundary-") as native_tmp:
     native_root = Path(native_tmp)
     descriptor_relative = "resources/editor/native-editor-patch.json"
-    for relative in (descriptor_relative, native_descriptor["patcher_path"], native_descriptor["helper_path"]):
+    for relative in (descriptor_relative, native_descriptor["patcher_path"], native_descriptor["helper_path"],
+                     "tools/hmb_native_semantic_adapter.py"):
         destination = native_root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes((ROOT / relative).read_bytes())
     descriptor_file = native_root / descriptor_relative
     with mock.patch.object(builder, "ROOT", native_root):
         assert builder.validate_native_editor_patch_sources() == native_descriptor
+        # Reviewed profiles must bind exact packaged bytes. Unknown structural
+        # fallback stays disabled even when a reviewed renderer is enrolled.
+        for reviewed in native_descriptor.get("additional_profiles", []):
+            assert reviewed["structural_fallback"] is False
+            assert reviewed["adapter_sha256"] == builder.digest(
+                (native_root / reviewed["adapter_path"]).read_bytes())
+        adapter = native_root / "tools/hmb_native_semantic_adapter.py"
+        profile = {
+            "source_sha256": "a" * 64, "candidate_sha256": "b" * 64,
+            "adapter_path": "tools/hmb_native_semantic_adapter.py",
+            "adapter_sha256": builder.digest(adapter.read_bytes()), "structural_fallback": False,
+        }
+        profiled = dict(native_descriptor, additional_profiles=[profile])
+        descriptor_file.write_text(json.dumps(profiled), encoding="utf-8")
+        assert builder.validate_native_editor_patch_sources() == profiled
+        for bad_profiles in (None, {}, [profile] * 2,
+                             [{**profile, "adapter_path": "../adapter.py"}],
+                             [{**profile, "adapter_sha256": "0" * 64}],
+                             [{**profile, "structural_fallback": True}],
+                             [{**profile, "source_sha256": native_descriptor["source_sha256"]}],
+                             [{**profile, "candidate_sha256": profile["source_sha256"]}]):
+            descriptor_file.write_text(json.dumps(dict(native_descriptor, additional_profiles=bad_profiles)), encoding="utf-8")
+            try:
+                builder.validate_native_editor_patch_sources()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("Native editor accepted an invalid adapter profile.")
+        descriptor_file.write_text(json.dumps(profiled), encoding="utf-8")
+        original_adapter = adapter.read_bytes()
+        adapter.write_bytes(original_adapter + b"\n# mutated\n")
+        try:
+            builder.validate_native_editor_patch_sources()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Native editor accepted a changed adapter.")
+        adapter.write_bytes(original_adapter)
         legacy_previous = {
             "bundle_sha256": "7bad6f6517c781c54e6d2e0cf170f0b2ed3bdef28b3cca57be79cce54bdd11bf",
             "helper_sha256": "39e5901cc8aa37d1d11850a255bcc209ab4724afe488817fc3f684a72ab01b63",

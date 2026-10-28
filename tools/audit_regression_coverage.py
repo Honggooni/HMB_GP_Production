@@ -51,7 +51,7 @@ def validate_registry(root: Path = ROOT, registry: str = REGISTRY) -> list[dict[
         if not isinstance(row, dict):
             raise ValueError("Invalid coverage entry")
         name = row.get("name")
-        if (not isinstance(name, str) or not re.fullmatch(r"HMB_[A-Za-z0-9_]+\.(?:py|mjs)", name)
+        if (not isinstance(name, str) or not re.fullmatch(r"HMB_[A-Za-z0-9_]+\.(?:py|mjs|cjs)", name)
                 or name in seen or row.get("coverage") not in COVERAGE_TYPES
                 or row.get("mode") not in {"ci", "manual"} or type(row.get("required")) is not bool):
             raise ValueError(f"Invalid or duplicate coverage entry: {name}")
@@ -68,7 +68,7 @@ def validate_registry(root: Path = ROOT, registry: str = REGISTRY) -> list[dict[
                 raise ValueError(f"Invalid manual native extension: {name}")
         seen.add(name)
     discovered = {path.name for path in (root / "resources/tests").iterdir()
-                  if path.is_file() and path.name.startswith("HMB_") and path.suffix in {".py", ".mjs"}}
+                  if path.is_file() and path.name.startswith("HMB_") and path.suffix in {".py", ".mjs", ".cjs"}}
     missing, stale = sorted(discovered - seen), sorted(seen - discovered)
     if missing or stale:
         raise ValueError(f"Regression registration mismatch: unregistered={missing}; missing_files={stale}")
@@ -86,8 +86,8 @@ def classify_result(row: dict[str, Any], returncode: int, output: str) -> tuple[
 def run_registered(root: Path, rows: list[dict[str, Any]], language: str,
                    report: Path, *, node: str = "node") -> int:
     _configure_console()
-    suffix = ".py" if language == "python" else ".mjs"
-    selected = [row for row in rows if row["name"].endswith(suffix)]
+    suffixes = (".py",) if language == "python" else (".mjs", ".cjs")
+    selected = [row for row in rows if row["name"].endswith(suffixes)]
     results = [{"name": row["name"], "coverage": row["coverage"], "status": "not_run",
                 "reason": row.get("reason", "earlier_test_failed"), "required": row["required"]} for row in selected]
     failed = False
@@ -100,7 +100,8 @@ def run_registered(root: Path, rows: list[dict[str, Any]], language: str,
             # Browser-to-Python fixtures also run on CI without a repository
             # .venv; their worker must use the interpreter selected here.
             child_env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8",
-                             HMB_REGRESSION_PYTHON=sys.executable)
+                             HMB_REGRESSION_PYTHON=sys.executable,
+                             HMB_TEST_PYTHON=sys.executable)
             completed = subprocess.run(command, cwd=root, text=True, encoding="utf-8", errors="replace",
                                        capture_output=True, timeout=900, env=child_env)
             output = completed.stdout + completed.stderr

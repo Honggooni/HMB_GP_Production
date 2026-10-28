@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _hmb_deletion_guard import hmb_binding_mutation
+
 """Same-flow Shot routing for the HMB production nodes.
 
 The public UI presents this as a cable-free Shot selector.  The retained-mode
@@ -2280,6 +2282,7 @@ def _subscription_requires_authority(subscription: ShotSubscription) -> bool:
     )
 
 
+@hmb_binding_mutation
 def reconcile_shot_routing(
     node: Any,
     *,

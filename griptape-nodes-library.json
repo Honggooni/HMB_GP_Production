@@ -279,10 +279,10 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.8.35",
-    "engine_version": "0.101.3",
+    "library_version": "0.8.39",
+    "engine_version": "",
     "agent_policy_delivery": {
-      "archive_source_count": 67,
+      "archive_source_count": 68,
       "mode": "bundled_signed_dat",
       "runtime_path": "resources/agent/superwings12/hmb_agent_core.dat",
       "policy_version": "2026-10-15.agent-shot-quality.v7.0",
@@ -676,8 +676,8 @@
         "category": "HMB_GP_Production",
         "display_name": "HMBImageBash",
         "description": "ImageAsset Library Image Bash workspace. Preserves the native Image Bash editor and verifies exact Apply PNG output, durable scene restore, and Standard compatibility.",
-        "width": 700,
-        "height": 720
+        "width": 800,
+        "height": 680
       }
     },
     {

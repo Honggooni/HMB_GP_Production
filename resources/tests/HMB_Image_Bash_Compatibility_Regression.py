@@ -53,6 +53,7 @@ class CompatibilityRegression(unittest.TestCase):
             for scope, (start, end) in compat.EDITOR_SCOPES.items()
         )
         (self.editor / "assets" / "index-fixture.js").write_text(self.editor_source, encoding="utf-8")
+        (self.editor / "index-editor.html").write_text('<script src="./assets/index-fixture.js"></script>', encoding="utf-8")
         self.baseline = self.workspace / "baseline.json"
         self.baseline.write_text(json.dumps({
             "schema": compat.ADAPTER_CONTRACT,
@@ -90,13 +91,30 @@ class CompatibilityRegression(unittest.TestCase):
             compat.require_standard_compatibility(self.stock, baseline_path=self.baseline, editor_root=self.editor)
         self.assertEqual(caught.exception.diagnostics["status"], "review_required")
 
-    def test_manifest_update_requires_review_even_if_image_bash_is_unchanged(self):
+    def test_library_version_is_not_collected_and_unrelated_manifest_update_is_diagnostic_only(self):
+        payload = json.loads(self.manifest.read_text(encoding="utf-8"))
+        payload["metadata"]["library_version"] = "fixture-2"
+        payload["nodes"].append({"class_name": "UnrelatedNode", "file_path": "other.py"})
+        self.manifest.write_text(json.dumps(payload), encoding="utf-8")
+        result = self.inspect()
+        self.assertTrue(result["compatible"], result)
+        self.assertNotIn("library_version", result["standard"])
+        self.assertTrue(any("manifest_sha256 changed" in value for value in result["standard"]["observations"]))
+
+    def test_library_version_change_cannot_approve_changed_source(self):
         payload = json.loads(self.manifest.read_text(encoding="utf-8"))
         payload["metadata"]["library_version"] = "fixture-2"
         self.manifest.write_text(json.dumps(payload), encoding="utf-8")
+        self.source.write_text(self.source.read_text(encoding="utf-8") + "\n# altered source\n", encoding="utf-8")
         result = self.inspect()
         self.assertFalse(result["compatible"])
-        self.assertTrue(any("library_version changed" in value for value in result["errors"]))
+        self.assertTrue(any("source_sha256 changed" in value for value in result["errors"]))
+
+    def test_ambiguous_duplicate_image_bash_registration_is_rejected(self):
+        payload = json.loads(self.manifest.read_text(encoding="utf-8"))
+        payload["nodes"].append({"class_name": "ImageBash", "file_path": "other.py"})
+        self.manifest.write_text(json.dumps(payload), encoding="utf-8")
+        self.assertFalse(self.inspect()["compatible"])
 
     def test_modal_contract_break_has_actionable_diagnostic(self):
         self.source.write_text(self.source.read_text(encoding="utf-8").replace("ImageBashModal", "ReplacementModal"), encoding="utf-8")
@@ -133,9 +151,9 @@ class CompatibilityRegression(unittest.TestCase):
         self.assertTrue(result["editor"]["bundles"]["assets/index-fixture.js"]["whole_bundle_changed"])
         self.assertEqual(len(result["editor"]["observations"]), 1)
 
-    def test_editor_version_change_still_requires_review(self):
+    def test_editor_version_label_change_does_not_override_identical_reviewed_feature_regions(self):
         (self.editor / ".version").write_text("fixture editor 2", encoding="utf-8")
-        self.assertFalse(self.inspect()["compatible"])
+        self.assertTrue(self.inspect()["compatible"])
 
     def test_missing_or_ambiguous_section_boundary_is_rejected(self):
         first_anchor = next(iter(compat.EDITOR_SCOPES.values()))[0]
@@ -157,10 +175,41 @@ class CompatibilityRegression(unittest.TestCase):
             self.assertTrue(source_only["compatible"])
             self.assertEqual(source_only["editor"]["status"], "unavailable")
 
-    def test_baseline_cannot_escape_editor_directory(self):
+    def test_active_editor_entry_cannot_escape_editor_directory(self):
+        (self.editor / "index-editor.html").write_text('<script src="./assets/../../baseline.json"></script>', encoding="utf-8")
+        self.assertFalse(self.inspect()["compatible"])
+
+    def test_active_filename_change_with_identical_reviewed_regions_is_allowed(self):
+        (self.editor / "assets" / "index-fixture.js").rename(self.editor / "assets" / "index-new.js")
+        (self.editor / "index-editor.html").write_text('<script src="./assets/index-new.js"></script>', encoding="utf-8")
+        result = self.inspect()
+        self.assertTrue(result["compatible"], result)
+        self.assertEqual(result["editor"]["active_bundle"], "assets/index-new.js")
+
+    def test_active_new_bundle_must_match_reviewed_profile_not_stale_old_file(self):
+        (self.editor / "assets" / "index-new.js").write_text("// unknown editor", encoding="utf-8")
+        (self.editor / "index-editor.html").write_text('<script src="./assets/index-new.js"></script>', encoding="utf-8")
+        self.assertFalse(self.inspect()["compatible"])
+
+    def test_ambiguous_active_entry_is_rejected(self):
+        (self.editor / "index-editor.html").write_text('<script src="./assets/index-fixture.js"></script><script src="./assets/index-new.js"></script>', encoding="utf-8")
+        self.assertFalse(self.inspect()["compatible"])
+
+    def test_additional_profile_requires_explicit_approval_and_exact_regions(self):
         payload = json.loads(self.baseline.read_text(encoding="utf-8"))
-        payload["editor"]["files"] = {"../baseline.json": digest(self.baseline)}
+        regions = {}
+        for name, (start, end) in compat.EDITOR_SCOPES.items():
+            region = start + f"/* new {name} */"
+            regions[name] = {"start": start, "end": end, "sha256": hashlib.sha256(region.encode()).hexdigest(), "bytes": len(region.encode())}
+        payload["editor"]["profiles"] = [{"id": "future-fixture", "review_status": "pending", "regions": regions}]
+        new_source = "\n".join(v["start"] + f"/* new {k} */" + v["end"] for k, v in regions.items())
+        (self.editor / "assets" / "index-fixture.js").write_text(new_source, encoding="utf-8")
         self.baseline.write_text(json.dumps(payload), encoding="utf-8")
+        self.assertFalse(self.inspect()["compatible"])
+        payload["editor"]["profiles"][0]["review_status"] = "approved"
+        self.baseline.write_text(json.dumps(payload), encoding="utf-8")
+        self.assertTrue(self.inspect()["compatible"])
+        (self.editor / "assets" / "index-fixture.js").write_text(new_source.replace("new modal_store", "changed modal_store"), encoding="utf-8")
         self.assertFalse(self.inspect()["compatible"])
 
     def test_wrong_registration_path_is_rejected(self):

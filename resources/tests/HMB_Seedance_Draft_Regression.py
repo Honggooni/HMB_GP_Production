@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 import importlib.util
+import io
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import time
@@ -12,6 +14,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 from uuid import uuid4
+import urllib.error
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -234,6 +237,76 @@ class DraftTests(unittest.TestCase):
     def tearDown(self):
         while TEMPORARIES:
             TEMPORARIES.pop().cleanup()
+
+    def test_capability_transport_error_identity_and_status_survive_without_create(self):
+        # Exercise the actual request classifier through a synthetic opener.
+        # No credentials, HTTP connection, upload or generation are accessed.
+        cases = ((401, t._BrokerAuthenticationError), (403, t._BrokerError),
+                 (503, t._BrokerError), ("network", t._BrokerUnavailableError))
+        for draft in (False, True):
+            for failure, expected in cases:
+                with self.subTest(draft=draft, failure=failure):
+                    methods = []
+                    def open_fixture(request, **_kwargs):
+                        methods.append(request.get_method())
+                        if failure == "network":
+                            raise urllib.error.URLError("fixture connection refused")
+                        raise urllib.error.HTTPError(request.full_url, failure, "fixture", {}, io.BytesIO(b"{}"))
+                    opener = SimpleNamespace(open=mock.Mock(side_effect=open_fixture))
+                    bridge = t._HMBAIBrokerBridge(opener=opener, server_url="https://broker.invalid")
+                    with mock.patch.object(bridge, "_load_access_token", return_value="fixture-token"), \
+                         mock.patch.object(bridge, "_clear_access_token"), \
+                         mock.patch.object(socket.socket, "connect", side_effect=AssertionError("network forbidden")), \
+                         mock.patch.object(socket, "create_connection", side_effect=AssertionError("network forbidden")):
+                        with self.assertRaises(expected) as caught:
+                            if draft:
+                                bridge.require_seedance_draft_features(output_format="mov")
+                            else:
+                                bridge.require_seedance_features(model_id=t.SEEDANCE_2_5_MODEL_ID,
+                                    task=t.TASK_TEXT_ONLY, output_format="mov", return_last_frame=False)
+                    self.assertIs(type(caught.exception), expected)
+                    self.assertEqual(caught.exception.status_code, failure if isinstance(failure, int) else None)
+                    self.assertFalse(caught.exception.submission_outcome_unknown)
+                    self.assertEqual(methods, ["GET"])
+
+    def test_malformed_capability_response_is_protocol_error_without_create(self):
+        class Response:
+            status = 200
+            def __init__(self, url): self.url = url
+            def geturl(self): return self.url
+            def read(self, _limit): return b'{}'
+            def __enter__(self): return self
+            def __exit__(self, *_args): pass
+        for draft in (False, True):
+            methods = []
+            def open_fixture(request, **_kwargs):
+                methods.append(request.get_method()); return Response(request.full_url)
+            bridge = t._HMBAIBrokerBridge(opener=SimpleNamespace(open=open_fixture), server_url="https://broker.invalid")
+            with self.subTest(draft=draft), mock.patch.object(bridge, "_load_access_token", return_value="fixture-token"), \
+                 mock.patch.object(socket.socket, "connect", side_effect=AssertionError("network forbidden")), \
+                 mock.patch.object(socket, "create_connection", side_effect=AssertionError("network forbidden")):
+                with self.assertRaises(t._BrokerProtocolError) as caught:
+                    if draft:
+                        bridge.require_seedance_draft_features(output_format="mov")
+                    else:
+                        bridge.require_seedance_features(model_id=t.SEEDANCE_2_5_MODEL_ID,
+                            task=t.TASK_TEXT_ONLY, output_format="mov", return_last_frame=False)
+            self.assertFalse(caught.exception.submission_outcome_unknown)
+            self.assertEqual(methods, ["GET"])
+
+    def test_raw_capability_timeout_is_unavailable_and_never_creates(self):
+        for draft in (False, True):
+            bridge = t._HMBAIBrokerBridge(server_url="https://broker.invalid")
+            with self.subTest(draft=draft), \
+                 mock.patch.object(bridge, "_queue_syntax", side_effect=TimeoutError("fixture timeout")), \
+                 mock.patch.object(bridge, "_request_json", side_effect=AssertionError("unexpected request")):
+                with self.assertRaises(t._BrokerUnavailableError) as caught:
+                    if draft:
+                        bridge.require_seedance_draft_features(output_format="mov")
+                    else:
+                        bridge.require_seedance_features(model_id=t.SEEDANCE_2_5_MODEL_ID,
+                            task=t.TASK_TEXT_ONLY, output_format="mov", return_last_frame=False)
+            self.assertFalse(caught.exception.submission_outcome_unknown)
 
     def test_normal_480p_without_draft_flag(self):
         node = Node()

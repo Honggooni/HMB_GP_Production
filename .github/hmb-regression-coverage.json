@@ -3,6 +3,87 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_CGT_Native_Work_Start_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_CGT_Work_Start_Node_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_CGT_Work_Start_Plan_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_CGT_Work_Start_Notice_Widget_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Finish_Error_Response_Widget_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_VideoPicker_Expanded_Retry_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Native_Bash_Live_Input_Regression.cjs",
+      "mode": "ci",
+      "coverage": "javascript_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Native_Connection_Port_Notice_Regression.cjs",
+      "mode": "ci",
+      "coverage": "javascript_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Native_First_Paint_Style_Regression.cjs",
+      "mode": "ci",
+      "coverage": "javascript_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Native_Studio_Metadata_Contract_Regression.cjs",
+      "mode": "ci",
+      "coverage": "javascript_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Bash_Live_Sync_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed Griptape SDK, registered Standard ImageBash and reviewed editor bundle; verifies no-Run add/remove/reorder, Apply output and cold restoration with synthetic media. Generic CI has none of these installed host dependencies."
+    },
+    {
+      "name": "HMB_Image_Bash_Two_Way_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated actual Griptape SDK, registered Standard ImageBash and reviewed editor bundle; verifies both palette creation orders, exact workspace ownership, saved explicit detach and cold restoration without provider execution."
+    },
+    {
+      "name": "HMB_Seedance_Legacy_Prompt_Recovery_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed Griptape SDK and native binding/bootstrap lifecycle; verifies inert saved legacy prompt recovery and managed input ownership without Broker or render calls."
+    },
+    {
       "name": "HMB_Native_Editor_Git_Override_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",

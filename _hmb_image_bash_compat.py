@@ -1,7 +1,7 @@
 """Read-only compatibility gate for HMB's adapter of the installed Image Bash.
 
-An upstream version string alone is insufficient: locally patched source and a
-changed built-in editor must also require review. This module never rewrites an
+An upstream version string is diagnostic only. A changed Image Bash source or
+built-in editor feature region requires review. This module never rewrites an
 upstream file or updates its own approved baseline.
 """
 from __future__ import annotations
@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Any
 
@@ -82,12 +83,12 @@ def _standard_root(candidate: str | Path) -> Path:
     if manifest.get("name") != STANDARD_NAME:
         raise ValueError("Expected the registered Griptape Nodes Library")
     records = manifest.get("nodes", [])
-    if not any(
-        isinstance(record, dict)
-        and record.get("class_name") == "ImageBash"
-        and str(record.get("file_path", "")).replace("\\", "/") == SOURCE_RELATIVE
-        for record in records
-    ):
+    if not isinstance(records, list):
+        raise ValueError("Invalid Standard Library node registrations")
+    registrations = [record for record in records
+                     if isinstance(record, dict) and record.get("class_name") == "ImageBash"]
+    if (len(registrations) != 1
+            or str(registrations[0].get("file_path", "")).replace("\\", "/") != SOURCE_RELATIVE):
         raise ValueError("Canonical ImageBash registration is missing")
     _inside(root, SOURCE_RELATIVE)
     return root
@@ -216,14 +217,14 @@ def source_contract(source: str) -> dict[str, Any]:
     }
 
 
-def editor_contract(source: str) -> dict[str, dict[str, Any]]:
+def editor_contract(source: str, anchors: dict[str, tuple[str, str]] | None = None) -> dict[str, dict[str, Any]]:
     """Hash exact reviewed feature regions while retaining unrelated bundle drift.
 
     No candidate JavaScript executes. Both boundary anchors must occur exactly
     once; missing, ambiguous or reordered sections fail closed.
     """
     result: dict[str, dict[str, Any]] = {}
-    for scope, (start_anchor, end_anchor) in EDITOR_SCOPES.items():
+    for scope, (start_anchor, end_anchor) in (anchors or EDITOR_SCOPES).items():
         if source.count(start_anchor) != 1 or source.count(end_anchor) != 1:
             raise ValueError(f"Image Bash editor anchors changed or are ambiguous: {scope}")
         start, end = source.index(start_anchor), source.index(end_anchor)
@@ -232,6 +233,72 @@ def editor_contract(source: str) -> dict[str, dict[str, Any]]:
         raw = source[start:end].encode("utf-8")
         result[scope] = {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
     return result
+
+
+def _active_editor_bundle(root: Path) -> tuple[str, bytes]:
+    """Inspect only the bundle named by the current editor entry, without writes."""
+    entry = _inside(root, "index-editor.html")
+    if entry.stat().st_size > 1024 * 1024:
+        raise ValueError("Editor entry is too large")
+    html = entry.read_bytes()
+    matches = re.findall(rb'''\bsrc\s*=\s*["']\./assets/(index-[A-Za-z0-9_-]+\.js)["']''', html)
+    if len(matches) != 1:
+        raise ValueError("Active editor entry is missing or ambiguous")
+    relative = "assets/" + matches[0].decode("ascii")
+    path = _inside(root, relative)
+    before = path.stat()
+    if before.st_size > 64 * 1024 * 1024:
+        raise ValueError("Editor bundle is too large")
+    source = path.read_bytes()
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or len(source) != before.st_size:
+        raise ValueError("Editor bundle changed during inspection")
+    if entry.read_bytes() != html:
+        raise ValueError("Active editor entry changed during inspection")
+    return relative, source
+
+
+def _editor_profiles(baseline: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build only explicitly approved scope profiles; never approve observed code."""
+    editor = baseline.get("editor", {})
+    profiles = []
+    # The historical reviewed four-region baseline remains valid independent
+    # of the original filename or editor version label.
+    bundles = editor.get("bundles", {})
+    if not isinstance(bundles, dict):
+        raise ValueError("Invalid Image Bash legacy profiles")
+    for relative, bundle in bundles.items():
+        if not isinstance(bundle, dict) or set(bundle.get("scopes", {})) != set(EDITOR_SCOPES):
+            raise ValueError("Incomplete Image Bash legacy profile")
+        profiles.append({"id": "legacy:" + relative, "anchors": EDITOR_SCOPES,
+                         "scopes": bundle["scopes"], "sha256": bundle.get("sha256")})
+    additional = editor.get("profiles", [])
+    if not isinstance(additional, list) or len(additional) > 16:
+        raise ValueError("Invalid Image Bash profile list")
+    for row in additional:
+        if not isinstance(row, dict) or row.get("review_status") != "approved":
+            continue
+        scope_rows = row.get("regions")
+        if not isinstance(scope_rows, dict) or set(scope_rows) != set(EDITOR_SCOPES):
+            raise ValueError("Incomplete Image Bash approved profile")
+        anchors, hashes = {}, {}
+        for name, region in scope_rows.items():
+            if not isinstance(region, dict) or set(region) != {"start", "end", "sha256", "bytes"}:
+                raise ValueError("Invalid Image Bash approved region")
+            start, end, digest, size = (region[k] for k in ("start", "end", "sha256", "bytes"))
+            if (not all(isinstance(v, str) and 0 < len(v) <= 512 for v in (start, end))
+                    or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                    or type(size) is not int or not 0 < size <= 64 * 1024 * 1024):
+                raise ValueError("Invalid Image Bash approved region values")
+            anchors[name] = (start, end)
+            hashes[name] = {"sha256": digest, "bytes": size}
+        profile_id = row.get("id")
+        if not isinstance(profile_id, str) or not profile_id or len(profile_id) > 128:
+            raise ValueError("Invalid Image Bash profile identity")
+        profiles.append({"id": profile_id, "anchors": anchors, "scopes": hashes, "sha256": row.get("sha256")})
+    if not profiles:
+        raise ValueError("The approved Image Bash editor section baseline is missing")
+    return profiles
 
 
 def inspect_standard_compatibility(
@@ -255,15 +322,22 @@ def inspect_standard_compatibility(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
         contract = source_contract(source_path.read_text(encoding="utf-8-sig"))
         current = {
-            "root": str(root), "library_version": manifest.get("metadata", {}).get("library_version"),
+            "root": str(root),
             "manifest_sha256": _sha256(manifest_path), "source_sha256": _sha256(source_path),
             "source_relative": SOURCE_RELATIVE, "contract": contract,
         }
         result["standard"] = current
         approved = baseline["standard"]
-        for key in ("library_version", "manifest_sha256", "source_sha256"):
-            if current[key] != approved[key]:
-                errors.append(f"Standard {key} changed; review and adapter regression are required")
+        # Griptape's release label is neither stored nor consulted. Admit only
+        # canonical registration, reviewed source and source/editor contracts.
+        # Unrelated manifest changes cannot approve a changed implementation.
+        current["observations"] = [
+            f"Standard {key} changed; exact ImageBash source and contract were checked"
+            for key in ("manifest_sha256",)
+            if current[key] != approved.get(key)
+        ]
+        if current["source_sha256"] != approved.get("source_sha256"):
+            errors.append("Standard source_sha256 changed; review and adapter regression are required")
         for parameter in REQUIRED_PARAMETERS:
             if parameter not in contract["parameters"]:
                 errors.append(f"ImageBash parameter is missing: {parameter}")
@@ -284,45 +358,34 @@ def inspect_standard_compatibility(
             if require_editor:
                 errors.append("The actual editor bundle is unavailable; editor compatibility is unverified")
         else:
-            observed: dict[str, str] = {}
-            observed_bundles: dict[str, Any] = {}
-            editor_errors: list[str] = []
-            observations: list[str] = []
-            expected_files = baseline.get("editor", {}).get("files", {})
-            if not expected_files:
-                editor_errors.append("The approved editor baseline is missing")
-            for relative, expected_hash in expected_files.items():
+            relative, raw = _active_editor_bundle(editor)
+            source = raw.decode("utf-8")
+            full_hash = hashlib.sha256(raw).hexdigest()
+            observations, reasons, accepted = [], [], None
+            for profile in _editor_profiles(baseline):
                 try:
-                    file_path = _inside(editor, relative)
-                    observed[relative] = _sha256(file_path)
-                    if observed[relative] != expected_hash:
-                        editor_errors.append(f"Editor file changed: {relative}")
-                except (OSError, ValueError) as exc:
-                    editor_errors.append(f"Editor file is missing or invalid: {relative} ({type(exc).__name__})")
-            expected_bundles = baseline.get("editor", {}).get("bundles", {})
-            if not expected_bundles:
-                editor_errors.append("The approved Image Bash editor section baseline is missing")
-            for relative, approved_bundle in expected_bundles.items():
-                try:
-                    file_path = _inside(editor, relative)
-                    full_hash = _sha256(file_path)
-                    scopes = editor_contract(file_path.read_text(encoding="utf-8"))
-                    observed_bundles[relative] = {"sha256": full_hash, "scopes": scopes,
-                                                  "whole_bundle_changed": full_hash != approved_bundle.get("sha256")}
-                    approved_scopes = approved_bundle.get("scopes", {})
-                    if set(approved_scopes) != set(EDITOR_SCOPES):
-                        editor_errors.append("The approved Image Bash editor section baseline is incomplete")
-                    for scope, observed_scope in scopes.items():
-                        if observed_scope != approved_scopes.get(scope):
-                            editor_errors.append(f"Image Bash editor section changed: {scope}")
-                    if full_hash != approved_bundle.get("sha256"):
-                        observations.append(f"Editor bundle SHA changed: {relative}; exact Image Bash sections checked separately")
-                except (OSError, ValueError) as exc:
-                    editor_errors.append(f"Image Bash editor bundle cannot be verified: {relative} ({exc})")
-            status = "changed" if editor_errors else "matches_contract" if observations else "matches_baseline"
-            result["editor"] = {"status": status, "root": str(editor), "files": observed,
-                                "bundles": observed_bundles, "observations": observations}
-            errors.extend(editor_errors)
+                    scopes = editor_contract(source, profile["anchors"])
+                    changed = [scope for scope, observed in scopes.items() if observed != profile["scopes"].get(scope)]
+                    if changed:
+                        reasons.extend(f"Image Bash editor section changed: {scope}" for scope in changed)
+                        continue
+                    accepted = (profile, scopes)
+                    break
+                except ValueError as exc:
+                    reasons.append(str(exc))
+            observed = {"sha256": full_hash}
+            if accepted is None:
+                result["editor"] = {"status": "changed", "root": str(editor), "active_bundle": relative,
+                                    "bundles": {relative: observed}, "observations": []}
+                errors.extend(reasons or ["Active Image Bash editor has no reviewed feature profile"])
+            else:
+                profile, scopes = accepted
+                observed.update(scopes=scopes, whole_bundle_changed=full_hash != profile.get("sha256"))
+                if observed["whole_bundle_changed"]:
+                    observations.append(f"Editor bundle SHA changed: {relative}; exact Image Bash sections checked separately")
+                result["editor"] = {"status": "matches_contract" if observations else "matches_baseline",
+                                    "root": str(editor), "active_bundle": relative, "profile": profile["id"],
+                                    "bundles": {relative: observed}, "observations": observations}
     except Exception as exc:
         errors.append(f"Compatibility inspection failed: {exc}")
     result["compatible"] = not errors

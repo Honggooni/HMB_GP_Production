@@ -16,7 +16,10 @@ spec.loader.exec_module(fixture)
 
 
 class NativeGitOverride(unittest.TestCase):
-    setUp = fixture.NativeEditorInstall.setUp
+    def setUp(self):
+        fixture.NativeEditorInstall.setUp(self)
+        (self.m.DEFAULT_SOURCE.parent.parent / 'index-editor.html').write_text(
+            '<script type="module" src="./assets/index-DEZU41rc.js"></script>', encoding='utf-8')
     tearDown = fixture.NativeEditorInstall.tearDown
     previous_candidate = fixture.NativeEditorInstall.previous_candidate
 
@@ -203,15 +206,15 @@ class NativeGitOverride(unittest.TestCase):
                     for path, value in before.items():
                         path.write_bytes(value)
 
-    def test_unknown_source_and_version_are_unsupported_not_partial_success(self):
+    def test_unknown_source_is_unsupported_but_version_metadata_is_not_a_gate(self):
         self.app()
         self.m.DEFAULT_SOURCE.write_bytes(b"unknown modified bundle")
         self.assertEqual(self.result()["status"], "unsupported")
         self.assertEqual(list(self.m.RELEASE_STATE_ROOT.glob("*/plan.json")), [])
         self.m.DEFAULT_SOURCE.write_bytes(self.original)
         self.version.write_text("0.999.0")
-        self.assertEqual(self.result()["status"], "unsupported")
-        self.assertEqual(self.m.DEFAULT_SOURCE.read_bytes(), self.original)
+        self.assertEqual(self.result()["status"], "applied")
+        self.assertEqual(self.m.DEFAULT_SOURCE.read_bytes(), self.candidate)
 
     def test_descriptor_helper_patcher_mismatch_unsupported(self):
         self.app()
@@ -303,6 +306,24 @@ class NativeGitOverride(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "Unsupported previous"):
                     self.m._release_previous_candidates({"previous_candidates": chain, "previous_candidate": chain[2]})
 
+    def test_fourth_reviewed_helper_predecessor_upgrades_with_exact_backup(self):
+        self.app()
+        previous = self.previous_candidate()
+        self.m.SUPPORTED_LATEST_CANDIDATE_SHA256 = self.m.SUPPORTED_PREVIOUS_CANDIDATE_SHA256
+        self.m.SUPPORTED_LATEST_HELPER_SHA256 = self.m.SUPPORTED_PREVIOUS_HELPER_SHA256
+        self.m.SUPPORTED_PREVIOUS_CANDIDATE_SHA256 = 'e' * 64
+        self.m.SUPPORTED_PREVIOUS_HELPER_SHA256 = 'd' * 64
+        self.descriptor.pop('previous_candidate')
+        self.descriptor['previous_candidates'] = [
+            {'bundle_sha256':getattr(self.m, f'SUPPORTED_{name}_CANDIDATE_SHA256'),
+             'helper_sha256':getattr(self.m, f'SUPPORTED_{name}_HELPER_SHA256')}
+            for name in ('LATEST','RECENT','CURRENT','PREVIOUS')]
+        self.m.RELEASE_DESCRIPTOR.write_text(json.dumps(self.descriptor), encoding='utf-8')
+        result = self.result()
+        self.assertEqual(result['status'], 'applied')
+        self.assertEqual(self.m.DEFAULT_SOURCE.read_bytes(), self.candidate)
+        self.assertEqual(Path(result['backup']).read_bytes(), previous)
+
     def test_cli_outputs_one_json_object_and_rejects_user_target_options(self):
         self.app()
         with mock.patch("sys.argv", [self.m.__file__, "--apply-git-override"]), mock.patch("sys.stdout", new_callable=io.StringIO) as output:
@@ -348,6 +369,203 @@ class NativeGitOverride(unittest.TestCase):
         self.assertNotIn("time.sleep", body)
         self.assertNotIn("handle_request", body)
         self.assertEqual(list(__import__("inspect").signature(self.m.apply_git_override).parameters), [])
+
+    def active_profile_fixture(self, *, structural_fallback=False):
+        self.app()
+        self.m.REPO = self.base / "package"
+        adapter = self.m.REPO / "tools/hmb_native_semantic_adapter.py"
+        adapter.parent.mkdir(parents=True, exist_ok=True)
+        adapter.write_text("def approval_evidence():\n    return {'status':'approved', 'structural_anchors':'matched', 'live_renderer_verified':True, 'deletion_verified':True}\ndef patch_editor_source(source, helper):\n    return source.replace('vendor-body','hmb-body'), approval_evidence()\n", encoding="utf-8")
+        stock = b"fixture-vendor-body\n"
+        candidate = b"fixture-hmb-body\n"
+        approval = {'status':'approved', 'structural_anchors':'matched', 'live_renderer_verified':True,
+                    'deletion_verified':True, 'source_sha256':self.m.sha256(stock),
+                    'candidate_sha256':self.m.sha256(candidate), 'helper_sha256':self.descriptor['helper_sha256']}
+        adapter.write_text("def approval_evidence():\n    return " + repr(approval) + "\ndef patch_editor_source(source, helper):\n    return source.replace('vendor-body','hmb-body'), approval_evidence()\n", encoding='utf-8')
+        active = self.m.DEFAULT_SOURCE.parent / "index-newBuild.js"
+        active.write_bytes(stock)
+        entry = active.parent.parent / "index-editor.html"
+        entry.write_text('<script type="module" src="./assets/index-newBuild.js"></script>', encoding="utf-8")
+        self.version.write_text("999.42.0", encoding="utf-8")
+        self.descriptor["additional_profiles"] = [{"source_sha256": self.m.sha256(stock),
+            "candidate_sha256": self.m.sha256(candidate),
+            "adapter_path": "tools/hmb_native_semantic_adapter.py", "adapter_sha256": self.m.sha256(adapter.read_bytes()),
+            "structural_fallback": structural_fallback}]
+        self.m.RELEASE_DESCRIPTOR.write_text(json.dumps(self.descriptor), encoding="utf-8")
+        return active, entry, stock, candidate
+
+    def test_active_entry_is_selected_by_reviewed_bytes_not_version_or_filename(self):
+        active, entry, stock, candidate = self.active_profile_fixture()
+        legacy = self.m.DEFAULT_SOURCE.read_bytes()
+        result = self.result()
+        self.assertEqual(result["status"], "applied")
+        self.assertNotIn("editor_version", result)
+        self.assertEqual(result["source_profile"], "reviewed-adapter")
+        self.assertEqual(active.read_bytes(), candidate)
+        self.assertEqual(self.m.DEFAULT_SOURCE.read_bytes(), legacy)
+        self.assertEqual(Path(result["backup"]).read_bytes(), stock)
+        self.assertEqual(self.result()["status"], "current")
+
+    def test_missing_editor_version_file_does_not_block_reviewed_active_source(self):
+        active, entry, stock, candidate = self.active_profile_fixture()
+        self.version.unlink()
+        result=self.result()
+        self.assertEqual(result['status'],'applied')
+        self.assertNotIn('editor_version',result)
+        self.assertEqual(active.read_bytes(),candidate)
+
+    def previous_adapter_fixture(self):
+        active, entry, stock, candidate = self.active_profile_fixture()
+        previous = b"fixture-reviewed-previous-hmb-body\n"
+        adapter = self.m.REPO / 'tools/hmb_native_semantic_adapter.py'
+        text = adapter.read_text('utf-8')
+        adapter.write_text(text.replace("source.replace('vendor-body','hmb-body')", "'fixture-hmb-body\\n'"), encoding='utf-8')
+        profile = self.descriptor['additional_profiles'][0]
+        profile['adapter_sha256'] = self.m.sha256(adapter.read_bytes())
+        profile['previous_candidate_sha256'] = [self.m.sha256(previous)]
+        self.m.RELEASE_DESCRIPTOR.write_text(json.dumps(self.descriptor), encoding='utf-8')
+        active.write_bytes(previous)
+        return active, previous, candidate
+
+    def test_exact_reviewed_adapter_predecessor_upgrades_without_stock_backup(self):
+        active, previous, candidate = self.previous_adapter_fixture()
+        result = self.result()
+        self.assertEqual(result['status'], 'applied')
+        self.assertEqual(active.read_bytes(), candidate)
+        self.assertEqual(Path(result['backup']).read_bytes(), previous)
+        self.assertEqual(self.result()['status'], 'current')
+
+    def test_modified_adapter_predecessor_is_preserved(self):
+        active, previous, candidate = self.previous_adapter_fixture()
+        active.write_bytes(previous + b'foreign edit')
+        result = self.result()
+        self.assertEqual(result['status'], 'unsupported')
+        self.assertEqual(active.read_bytes(), previous + b'foreign edit')
+
+    def test_duplicate_or_malformed_adapter_predecessors_are_rejected(self):
+        for value in ('not-a-list', ['x' * 64], ['a' * 64, 'a' * 64]):
+            with self.subTest(value=value):
+                active, previous, candidate = self.previous_adapter_fixture()
+                self.descriptor['additional_profiles'][0]['previous_candidate_sha256'] = value
+                self.m.RELEASE_DESCRIPTOR.write_text(json.dumps(self.descriptor), encoding='utf-8')
+                self.assertEqual(self.result()['status'], 'unsupported')
+                self.assertEqual(active.read_bytes(), previous)
+
+    def test_stale_approval_hashes_cannot_mark_existing_candidate_ready(self):
+        active, entry, stock, candidate = self.active_profile_fixture()
+        active.write_bytes(candidate)
+        adapter = self.m.REPO / 'tools/hmb_native_semantic_adapter.py'
+        text = adapter.read_text('utf-8')
+        for field in ('source_sha256', 'candidate_sha256', 'helper_sha256'):
+            with self.subTest(field=field):
+                old = self.descriptor['additional_profiles'][0].get(field, self.descriptor['helper_sha256'])
+                changed = text.replace(repr(old), repr('0' * 64))
+                self.assertNotEqual(changed, text)
+                adapter.write_text(changed, encoding='utf-8')
+                self.descriptor['additional_profiles'][0]['adapter_sha256'] = self.m.sha256(adapter.read_bytes())
+                self.m.RELEASE_DESCRIPTOR.write_text(json.dumps(self.descriptor), encoding='utf-8')
+                result = self.result()
+                self.assertEqual(result['status'], 'unsupported')
+                self.assertIn('approval hashes are stale', result['reason'])
+                self.assertFalse(result['disk_ready'])
+                self.assertEqual(active.read_bytes(), candidate)
+
+    def test_legacy_reviewed_source_can_move_and_change_version_without_stale_file_write(self):
+        self.app()
+        active = self.m.DEFAULT_SOURCE.parent / 'index-renamed.js'
+        active.write_bytes(self.original)
+        (active.parent.parent / 'index-editor.html').write_text(
+            '<script src="./assets/index-renamed.js"></script>', encoding='utf-8')
+        self.version.write_text('200.0.0', encoding='utf-8')
+        result = self.result()
+        self.assertEqual(result['status'], 'applied')
+        self.assertEqual(active.read_bytes(), self.candidate)
+        self.assertEqual(self.m.DEFAULT_SOURCE.read_bytes(), self.original)
+
+    def test_reviewed_adapter_wrong_candidate_cannot_change_editor(self):
+        active, entry, stock, candidate = self.active_profile_fixture()
+        adapter = self.m.REPO / 'tools/hmb_native_semantic_adapter.py'
+        adapter.write_text("def patch_editor_source(source, helper):\n    return 'incorrect candidate', {}\n", encoding='utf-8')
+        self.descriptor['additional_profiles'][0]['adapter_sha256'] = self.m.sha256(adapter.read_bytes())
+        self.m.RELEASE_DESCRIPTOR.write_text(json.dumps(self.descriptor), encoding='utf-8')
+        result = self.result()
+        self.assertEqual(result['status'], 'unsupported')
+        self.assertEqual(active.read_bytes(), stock)
+        self.assertFalse(list(self.m.RELEASE_STATE_ROOT.glob('*/plan.json')))
+
+    def test_adapter_missing_or_unapproved_evidence_never_writes(self):
+        active, entry, stock, candidate = self.active_profile_fixture()
+        adapter = self.m.REPO / 'tools/hmb_native_semantic_adapter.py'
+        for evidence in ({}, {'status':'unvalidated','structural_anchors':'matched',
+                              'live_renderer_verified':False,'deletion_verified':False},
+                         {'status':'approved','structural_anchors':'matched',
+                          'live_renderer_verified':True,'deletion_verified':False}):
+            with self.subTest(evidence=evidence):
+                adapter.write_text("def patch_editor_source(source, helper):\n    return source.replace('vendor-body','hmb-body'), " + repr(evidence) + "\n", encoding='utf-8')
+                self.descriptor['additional_profiles'][0]['adapter_sha256'] = self.m.sha256(adapter.read_bytes())
+                self.m.RELEASE_DESCRIPTOR.write_text(json.dumps(self.descriptor), encoding='utf-8')
+                result = self.result()
+                self.assertEqual(result['status'], 'unsupported')
+                self.assertIn('not approved', result['reason'])
+                self.assertEqual(active.read_bytes(), stock)
+                self.assertFalse(list(self.m.RELEASE_STATE_ROOT.glob('*/plan.json')))
+
+    def test_adapter_approved_evidence_still_requires_reviewed_candidate_hash(self):
+        active, entry, stock, candidate = self.active_profile_fixture()
+        result = self.result()
+        self.assertEqual(result['status'], 'applied')
+        self.assertEqual(active.read_bytes(), candidate)
+        self.assertEqual(Path(result['backup']).read_bytes(), stock)
+
+    def test_candidate_already_on_disk_still_rejects_absent_or_revoked_approval(self):
+        active, entry, stock, candidate = self.active_profile_fixture()
+        self.assertEqual(self.result()['status'],'applied')
+        adapter = self.m.REPO / 'tools/hmb_native_semantic_adapter.py'
+        for source in ("def patch_editor_source(source, helper):\n    return source, {}\n",
+                       "def approval_evidence():\n    return {'status':'unvalidated','structural_anchors':'matched','live_renderer_verified':False,'deletion_verified':False}\n"):
+            adapter.write_text(source,encoding='utf-8')
+            self.descriptor['additional_profiles'][0]['adapter_sha256'] = self.m.sha256(adapter.read_bytes())
+            self.m.RELEASE_DESCRIPTOR.write_text(json.dumps(self.descriptor),encoding='utf-8')
+            result=self.result()
+            self.assertEqual(result['status'],'unsupported')
+            self.assertFalse(result['disk_ready'])
+            self.assertEqual(active.read_bytes(),candidate)
+
+    def test_unreviewed_structural_fallback_is_not_written(self):
+        active, entry, stock, candidate = self.active_profile_fixture(structural_fallback=True)
+        active.write_bytes(b"different structurally unverified editor\n")
+        result = self.result()
+        self.assertEqual(result["status"], "unsupported")
+        self.assertEqual(active.read_bytes(), b"different structurally unverified editor\n")
+
+    def test_ambiguous_active_entries_refused_before_any_editor_write(self):
+        active, entry, stock, candidate = self.active_profile_fixture()
+        entry.write_text('<script src="./assets/index-newBuild.js"></script><script src="./assets/index-other.js"></script>', encoding="utf-8")
+        result = self.result()
+        self.assertEqual(result["status"], "unsupported")
+        self.assertEqual(active.read_bytes(), stock)
+
+    def test_missing_entry_does_not_patch_a_stale_legacy_bundle(self):
+        self.app()
+        entry = self.m.DEFAULT_SOURCE.parent.parent / 'index-editor.html'
+        entry.unlink()
+        before = self.m.DEFAULT_SOURCE.read_bytes()
+        result = self.result()
+        self.assertEqual(result['status'], 'unsupported')
+        self.assertEqual(self.m.DEFAULT_SOURCE.read_bytes(), before)
+        self.assertFalse(self.m.RELEASE_STATE_ROOT.exists())
+
+    def test_active_entry_changes_during_staging_are_rejected(self):
+        active, entry, stock, candidate = self.active_profile_fixture()
+        real_write = self.m._json_write
+        def change_entry(path, value):
+            real_write(path, value)
+            if value.get('status') == 'applying':
+                entry.write_text('<script src="./assets/index-unknown.js"></script>', encoding='utf-8')
+        with mock.patch.object(self.m, '_json_write', side_effect=change_entry):
+            result = self.result()
+        self.assertEqual(result['status'], 'unsupported')
+        self.assertEqual(active.read_bytes(), stock)
 
 
 if __name__ == "__main__":

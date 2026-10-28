@@ -12,6 +12,7 @@ LICENSE text eol=lf
 *.yaml text eol=lf
 *.js text eol=lf
 *.mjs text eol=lf
+*.cjs text eol=lf
 *.txt text eol=lf
 *.ps1 text eol=crlf
 *.bat text eol=crlf

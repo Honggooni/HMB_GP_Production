@@ -572,6 +572,51 @@ function imageAssetLanguage(state) {
   return language === "en" ? "en" : "ko";
 }
 
+export function hmbCgtStatusMessage(status, language = "ko") {
+  const messages = {
+    ko: {
+      not_requested: "CGT 연결 확인 필요 · 새로고침으로 본인 작업을 확인하세요.", loading: "CGT 본인 작업 조회 중…",
+      LOGIN_REQUIRED: "CGT 앱에서 로그인 후 새로고침하세요.", TLS_REJECTED: "CGT 인증서 검증에 실패했습니다. 관리자에게 인증서 상태를 확인하세요.",
+      TRUST_CHANGED: "CGT 신뢰 인증서 정보가 변경되었습니다. 관리자에게 확인하세요.", INVALID_ORIGIN: "CGT 서버 주소가 올바르지 않습니다. 관리자에게 확인하세요.",
+      READ_SCOPE_REJECTED: "CGT 읽기 요청이 허용된 조회 범위를 벗어났습니다. 관리자에게 확인하세요.",
+      SOURCE_SCHEMA: "CGT 프로젝트 또는 작업 데이터 형식을 확인할 수 없습니다. 관리자에게 확인하세요.",
+      OWNERSHIP_CHANGED: "조회된 작업의 담당자가 현재 CGT 계정과 일치하지 않습니다. 새로고침 후 다시 확인하세요.",
+      INVALID_BINDING: "CGT 샷 연결 정보가 올바르지 않습니다. 현재 샷을 다시 선택하세요.",
+      SELECT_GP_PROJECT: "먼저 이미지 라이브러리의 프로젝트를 선택하세요.", PROJECT_UNAVAILABLE: "선택한 GP 프로젝트의 CGT 접근 권한을 확인하세요.",
+      SOURCE_CHANGED: "CGT 계정·프로젝트·작업이 변경되었습니다. 새로고침 후 다시 선택하세요.",
+      ACCOUNT_CHANGED: "CGT 로그인 계정이 기존 연결과 다릅니다. 기존 연결은 유지됩니다. 올바른 계정으로 로그인 후 다시 확인하세요.",
+      SDK_UNAVAILABLE: "CGT 앱과 설치된 Python SDK 연결을 확인한 뒤 새로고침하세요.", TIMEOUT: "CGT 응답 시간 초과 · 새로고침 후 다시 확인하세요.",
+      ACCESS_DENIED: "CGT에서 현재 계정의 조회 접근을 거부했습니다. 관리자에게 권한을 확인하세요.",
+      RATE_LIMITED: "CGT 조회 요청이 제한되었습니다. 잠시 후 새로고침하세요.",
+      SERVER_UNAVAILABLE: "CGT 서버가 조회 요청을 처리하지 못했습니다. 서버 상태를 확인하고 다시 시도하세요.",
+      CONNECTION_FAILED: "CGT 서버에 연결할 수 없습니다. 네트워크와 서버 상태를 확인하세요.",
+      REQUEST_REJECTED: "CGT가 조회 요청을 거부했습니다. 관리자에게 요청 설정을 확인하세요.",
+      empty: "본인에게 배정된 AI_Shot 작업이 없습니다.", unknown: "CGT 작업을 확인할 수 없습니다. 새로고침하세요.",
+    },
+    en: {
+      not_requested: "Check the CGT connection and refresh to see your tasks.", loading: "Loading your CGT tasks…",
+      LOGIN_REQUIRED: "Sign in to the CGT app and refresh.", TLS_REJECTED: "CGT certificate verification failed. Ask the administrator to check the certificate.",
+      TRUST_CHANGED: "The trusted CGT certificate information changed. Ask the administrator to check it.", INVALID_ORIGIN: "The CGT server address is invalid. Ask the administrator to check it.",
+      READ_SCOPE_REJECTED: "The CGT request is outside the allowed read scope. Ask the administrator to check it.",
+      SOURCE_SCHEMA: "The CGT project or task data format could not be verified. Ask the administrator to check it.",
+      OWNERSHIP_CHANGED: "A returned task is not assigned to the current CGT account. Refresh and check again.",
+      INVALID_BINDING: "The CGT shot binding is invalid. Select the current shots again.",
+      SELECT_GP_PROJECT: "Select a project in the image library first.", PROJECT_UNAVAILABLE: "Check your CGT access to the selected GP project.",
+      SOURCE_CHANGED: "The CGT account, project, or task changed. Refresh and select again.",
+      ACCOUNT_CHANGED: "The CGT account differs from the existing binding. The binding is retained; sign in with the correct account and check again.",
+      SDK_UNAVAILABLE: "Check the CGT app and installed Python SDK connection, then refresh.", TIMEOUT: "CGT did not respond in time. Refresh and try again.",
+      ACCESS_DENIED: "CGT denied read access for this account. Ask the administrator to check its permissions.",
+      RATE_LIMITED: "CGT read requests are temporarily limited. Wait and refresh.",
+      SERVER_UNAVAILABLE: "The CGT server could not process the read request. Check its status and try again.",
+      CONNECTION_FAILED: "Could not connect to the CGT server. Check the network and server status.",
+      REQUEST_REJECTED: "CGT rejected the read request. Ask the administrator to check the request configuration.",
+      empty: "No AI_Shot tasks are assigned to your account.", unknown: "CGT tasks could not be checked. Refresh and try again.",
+    },
+  };
+  const copy = messages[language === "en" ? "en" : "ko"];
+  return copy[status] || copy.unknown;
+}
+
 function imageAssetText(state, key) {
   const language = imageAssetLanguage(state);
   return IMAGE_ASSET_UI_TEXT[language]?.[key] || IMAGE_ASSET_UI_TEXT.en[key] || key;
@@ -599,6 +644,65 @@ function imageAssetStatusCount(value) {
 
 export function hmbImageAssetStatusSummary(state) {
   return `${imageAssetStatusCount(state?.status?.registered_asset_count)} ${imageAssetText(state, "registered")} | ${imageAssetStatusCount(state?.status?.unregistered_asset_count)} ${imageAssetText(state, "unregistered")} | ${imageAssetStatusCount(state?.status?.selected_count)}/${MAX_SELECTED_IMAGES} ${imageAssetText(state, "selected")}`;
+}
+
+export function hmbNormalizeCgtWorkStartNotice(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.schema !== "hmb-cgt-work-start-notice-v1"
+      || !["queued","running","completed","partial","failed","unknown"].includes(value.status)
+      || typeof value.request_id !== "string" || !/^[A-Za-z0-9_.:-]{1,128}$/.test(value.request_id)) return {};
+  const notice={schema:value.schema,status:value.status,request_id:value.request_id};
+  for(const key of ["updated_count","already_work_count","skipped_count","failed_count"]){
+    if(!Number.isSafeInteger(value[key]) || value[key]<0 || value[key]>5)return {};
+    notice[key]=value[key];
+  }
+  return notice;
+}
+
+export function hmbCgtWorkStartNoticeMessage(value, language = "ko") {
+  const notice=hmbNormalizeCgtWorkStartNotice(value);
+  if(!notice.schema)return "";
+  const english=language==="en";
+  const counts=english
+    ? "Work "+notice.updated_count+" · already Work "+notice.already_work_count+" · skipped "+notice.skipped_count+" · failed "+notice.failed_count
+    : "Work 변경 "+notice.updated_count+" · 이미 Work "+notice.already_work_count+" · 건너뜀 "+notice.skipped_count+" · 실패 "+notice.failed_count;
+  const messages={
+    queued:english?"CGT start notice queued.":"CGT 작업 시작 알림 대기 중입니다.",
+    running:english?"Applying CGT Wait → Work.":"CGT Wait → Work 변경 중입니다.",
+    completed:english?"CGT start notice completed.":"CGT 작업 시작 알림이 완료되었습니다.",
+    partial:english?"Some CGT start notices failed. Local shots are retained; refresh CGT to check.":"CGT 작업 시작 알림 일부가 실패했습니다. 로컬 샷은 유지됩니다. CGT를 새로고침하여 확인하세요.",
+    failed:english?"CGT start notice failed. Local shots are retained; refresh CGT to check.":"CGT 작업 시작 알림에 실패했습니다. 로컬 샷은 유지됩니다. CGT를 새로고침하여 확인하세요.",
+    unknown:english?"CGT start status is unconfirmed. Refresh CGT to check; no automatic resubmission.":"CGT 작업 시작 상태가 미확정입니다. CGT를 새로고침하여 확인하세요. 자동 재요청하지 않습니다.",
+  };
+  return messages[notice.status]+" "+counts;
+}
+
+function hmbImageAssetDisplayStatus(state) {
+  return state.scan_busy ? imageAssetText(state,"busy_loading")
+    : state.error ? state.error
+    : state.asset_registration_result?.ok && state.asset_registration_result.message
+      ? state.asset_registration_result.message
+      : hmbCgtWorkStartNoticeMessage(state.cgt_work_start_notice,imageAssetLanguage(state))
+        || hmbImageAssetStatusSummary(state);
+}
+
+function hmbImageAssetDisplayStatusTitle(state) {
+  return [...new Set([hmbImageAssetDisplayStatus(state),hmbImageAssetStatusSummary(state),
+    hmbCgtWorkStartNoticeMessage(state.cgt_work_start_notice,imageAssetLanguage(state))].filter(Boolean))].join("\n");
+}
+
+export function hmbApplyCgtWorkStartNotice(container, state) {
+  const notice=hmbCgtWorkStartNoticeMessage(state?.cgt_work_start_notice,imageAssetLanguage(state));
+  const status=container?.querySelector?.(".toolbar-status strong");
+  if(status){
+    status.textContent=hmbImageAssetDisplayStatus(state);
+    status.setAttribute?.("title",hmbImageAssetDisplayStatusTitle(state));
+  }
+  const cgtStatus=container?.__hmbHierarchyDialog?.querySelector?.("[data-hier-cgt-status]");
+  if(cgtStatus){
+    const base=cgtStatus.getAttribute("data-hier-cgt-base-status") || "";
+    cgtStatus.textContent=[base,notice].filter(Boolean).join(" · ");
+  }
 }
 
 export function hmbSetImageAssetBusy(container, busy, message = "") {
@@ -1413,6 +1517,8 @@ function normalizeState(value) {
     asset_registration_result: normalizeRegistrationResult(input.asset_registration_result),
     asset_refresh_review: normalizeAssetRefreshReview(input.asset_refresh_review),
     asset_cleanup_request: normalizeAssetCleanupRequest(input.asset_cleanup_request),
+    ...(hmbNormalizeCgtWorkStartNotice(input.cgt_work_start_notice).schema
+      ? {cgt_work_start_notice:hmbNormalizeCgtWorkStartNotice(input.cgt_work_start_notice)} : {}),
     disconnect_import_uid: clean(input.disconnect_import_uid).startsWith("import:")
       ? clean(input.disconnect_import_uid).slice(0, 512)
       : "",
@@ -4663,9 +4769,9 @@ export function hmbApplyImageAssetSelectionFeedback(container, state, options = 
   container.__hmbImageAssetSelectedCardByLibraryId = selectedCardById;
   const status = container.querySelector?.(".toolbar-status strong");
   if (status && !state.error && !state.asset_registration_result?.message) {
-    const summary = hmbImageAssetStatusSummary(state);
+    const summary = hmbImageAssetDisplayStatus(state);
     status.textContent = summary;
-    status.setAttribute?.("title", summary);
+    status.setAttribute?.("title", hmbImageAssetDisplayStatusTitle(state));
   }
   return { cardScanCount, selectedCount, tray: trayResult };
 }
@@ -5594,6 +5700,7 @@ export function hmbPatchCompactImageAssetState(container, state) {
   hmbInstallImageAssetNativeHeader(container)?.sync();
   hmbSetImageAssetCompactThumbnailsActive(summary, !summary.hidden);
   container.__hmbImageAssetLatestState = state;
+  hmbApplyCgtWorkStartNotice(container,state);
   hmbRebuildImageAssetIndexes(container, state);
   container.__hmbImageAssetExpandedDirty = true;
   if (container.__hmbImageAssetExpandedGeometry) {
@@ -5622,14 +5729,7 @@ function render(
   const catalog = hmbRenderImageAssetGrid(state, renderLimit, renderOffset);
   const activeShot = activeImageAssetShot(state);
   const activePalette = hmbImageAssetShotPalette(activeShot?.number || 1);
-  const registrationResult = state.asset_registration_result;
-  const statusText = state.scan_busy
-    ? imageAssetText(state, "busy_loading")
-    : state.error
-    ? state.error
-    : registrationResult?.ok && registrationResult.message
-      ? registrationResult.message
-      : hmbImageAssetStatusSummary(state);
+  const statusText = hmbImageAssetDisplayStatus(state);
   const filterLabel = state.selected_source_view === "user"
     ? imageAssetText(state, "import_in")
     : state.selected_folder_path || imageAssetText(state, "project_root");
@@ -5691,7 +5791,7 @@ function render(
               <svg viewBox="0 0 18 18" aria-hidden="true"><rect x="2" y="2.5" width="4.5" height="4.5" rx=".8"/><path d="M9 4.75h7"/><rect x="2" y="11" width="4.5" height="4.5" rx=".8"/><path d="M9 13.25h7"/></svg>
             </button>
             <input data-search value="${escapeHtml(state.search)}" placeholder="${escapeHtml(imageAssetText(state, "search_placeholder"))}" aria-label="${escapeHtml(imageAssetText(state, "search_placeholder"))}"/>
-            <div class="toolbar-status" data-count-digits="4" aria-live="polite"><strong title="${escapeHtml(statusText)}">${escapeHtml(statusText)}</strong></div>
+            <div class="toolbar-status" data-count-digits="4" aria-live="polite"><strong title="${escapeHtml(hmbImageAssetDisplayStatusTitle(state))}">${escapeHtml(statusText)}</strong></div>
             <span class="filter-chip">${escapeHtml(filterLabel)}</span>
           </div>
           <div class="asset-scroll nodrag nopan nowheel" data-asset-scroll>
@@ -6805,7 +6905,6 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
   let cgtTimer = null;
   let confirmingCgt = false;
   let hierarchyClosed = false;
-  let cgtQuery = "";
   let cgtPage = 0;
   let cgtEpisode = "";
   let cgtProjectId = "";
@@ -6868,12 +6967,6 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
   const renderCgt = () => {
     const panel = dialog.querySelector("[data-hier-cgt]");
     if (!panel) return;
-    const messages = { not_requested: "CGT 연결 확인 필요 · 새로고침으로 본인 작업을 확인하세요.", loading: "CGT 본인 작업 조회 중…",
-      LOGIN_REQUIRED: "CGT 앱에서 로그인 후 새로고침하세요.", TLS_REJECTED: "CGT 인증서 검증에 실패했습니다. 관리자에게 인증서 상태를 확인하세요.",
-      SELECT_GP_PROJECT: "먼저 이미지 라이브러리의 프로젝트를 선택하세요.", PROJECT_UNAVAILABLE: "선택한 GP 프로젝트의 CGT 접근 권한을 확인하세요.",
-      SOURCE_CHANGED: "CGT 계정·프로젝트·작업이 변경되었습니다. 새로고침 후 다시 선택하세요.",
-      ACCOUNT_CHANGED: "CGT 로그인 계정이 기존 연결과 다릅니다. 기존 연결은 유지됩니다. 올바른 계정으로 로그인 후 다시 확인하세요.",
-      SDK_UNAVAILABLE: "CGT 앱과 설치된 Python SDK 연결을 확인한 뒤 새로고침하세요.", TIMEOUT: "CGT 응답 시간 초과 · 새로고침 후 다시 확인하세요." };
     const ready = cgtState.status === "ready";
     const projects = cgtProjects;
     const project = cgtState.project || null;
@@ -6886,17 +6979,23 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
     };
     const episodes = ready ? [...new Set(cgtState.tasks.map(episodeOf))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })) : [];
     if (ready && cgtEpisode && !episodes.includes(cgtEpisode)) cgtEpisode = "";
-    const matching = ready ? cgtState.tasks.filter(row => (!cgtEpisode || episodeOf(row) === cgtEpisode)
-      && (!cgtQuery || `${row.source_name} ${row.status}`.toLowerCase().includes(cgtQuery.toLowerCase()))) : [];
+    const matching = ready ? cgtState.tasks.filter(row => !cgtEpisode || episodeOf(row) === cgtEpisode) : [];
     cgtPage = Math.min(cgtPage, Math.max(0, Math.ceil(matching.length / 50) - 1));
     const visible = matching.slice(cgtPage * 50, (cgtPage + 1) * 50);
     const selected = new Set(draft.members.filter(row => row.origin === "cgt").map(row => row.cgt_task_id));
+    const accountSummary=dialog.querySelector("[data-hier-cgt-account]");
+    if(accountSummary){
+      const summary=ready && cgtState.account
+        ? cgtState.account+" / "+cgtState.account_name+" · AI_Shot · "+cgtState.tasks.length+"건"+(cgtState.truncated?" (추가 작업 있음)":"") : "";
+      accountSummary.textContent=summary;accountSummary.title=summary;accountSummary.hidden=!summary;
+    }
     panel.innerHTML = `<div class="hier-tools hier-project-tools"><label>프로젝트<select data-hier-cgt-project aria-label="CGT 프로젝트" ${!projects.length || cgtRequest || confirmingCgt ? "disabled" : ""}><option value="" ${!project ? "selected" : ""}>프로젝트 선택 필요</option>${projects.map(row => `<option value="${escapeHtml(row.id)}" ${row.id === project?.id ? "selected" : ""}>${escapeHtml(row.name)}</option>`).join("")}${project && !projects.some(row => row.id === project.id) ? `<option value="${escapeHtml(project.id)}" selected>${escapeHtml(project.name)}</option>` : ""}</select></label><label>에피소드<select data-hier-cgt-episode aria-label="CGT 에피소드" ${!ready || !project || !episodes.length || cgtRequest || confirmingCgt ? "disabled" : ""}><option value="">전체 에피소드</option>${episodes.map(episode => `<option value="${escapeHtml(episode)}" ${episode === cgtEpisode ? "selected" : ""}>${escapeHtml(episode === "__unassigned__" ? "에피소드 미지정" : episode)}</option>`).join("")}</select></label><button type="button" data-hier-cgt-refresh ${cgtRequest || confirmingCgt ? "disabled" : ""}>새로고침</button></div>
-      ${ready && cgtState.account ? `<small data-hier-cgt-account>${escapeHtml(cgtState.account)} / ${escapeHtml(cgtState.account_name)} · AI_Shot · ${cgtState.tasks.length}건${cgtState.truncated ? " (추가 작업 있음)" : ""}</small>` : ""}
-      ${ready && project ? `<label class="hier-query">샷 · 상태 검색<input data-hier-cgt-query value="${escapeHtml(cgtQuery)}" autocomplete="off"></label>` : ""}
       <div class="hier-cgt-scroll" data-hier-cgt-scroll><table class="hier-table"><thead><tr><th>Shot</th><th>Artist</th><th>Task status</th><th></th></tr></thead><tbody>${visible.map(row => `<tr><td>${escapeHtml(row.source_name)}</td><td>${escapeHtml(row.artist)}</td><td>${escapeHtml(row.status)}</td><td><button type="button" data-hier-cgt-add="${escapeHtml(row.task_id)}" ${selected.has(row.task_id) || confirmingCgt || !canBind || imageBashTarget ? "disabled" : ""}>${selected.has(row.task_id) ? "선택됨" : "선택 추가"}</button></td></tr>`).join("")}</tbody></table></div>
       ${matching.length > 50 ? `<div class="hier-tools"><button type="button" data-hier-cgt-prev ${cgtPage ? "" : "disabled"}>이전</button><small>${cgtPage + 1} / ${Math.ceil(matching.length / 50)}</small><button type="button" data-hier-cgt-next ${(cgtPage + 1) * 50 < matching.length ? "" : "disabled"}>다음</button></div>` : ""}
-      <p class="hier-offline" data-hier-cgt-status>${escapeHtml(ready ? !project ? "CGT 프로젝트를 선택하세요." : !canBind ? !hierarchyProjectKey(state) ? "먼저 이미지 라이브러리의 프로젝트를 선택하세요. CGT 작업은 조회만 할 수 있습니다." : "현재 라이브러리와 다른 CGT 프로젝트입니다. 작업 조회만 가능하며 샷은 연결하지 않습니다." : cgtState.tasks.length ? "CGT 원본의 본인 배정 작업만 표시합니다." : "본인에게 배정된 AI_Shot 작업이 없습니다." : messages[cgtState.status] || "CGT 작업을 확인할 수 없습니다. 새로고침하세요.")}</p>`;
+      <p class="hier-offline" data-hier-cgt-status>${escapeHtml(ready ? !project ? "CGT 프로젝트를 선택하세요." : !canBind ? !hierarchyProjectKey(state) ? "먼저 이미지 라이브러리의 프로젝트를 선택하세요. CGT 작업은 조회만 할 수 있습니다." : "현재 라이브러리와 다른 CGT 프로젝트입니다. 작업 조회만 가능하며 샷은 연결하지 않습니다." : cgtState.tasks.length ? "CGT 원본의 본인 배정 작업만 표시합니다." : hmbCgtStatusMessage("empty", imageAssetLanguage(state)) : hmbCgtStatusMessage(cgtState.status, imageAssetLanguage(state)))}</p>`;
+    const cgtStatus=panel.querySelector("[data-hier-cgt-status]");
+    cgtStatus?.setAttribute("data-hier-cgt-base-status",cgtStatus.textContent);
+    hmbApplyCgtWorkStartNotice(container,container.__hmbImageAssetLatestState || state);
     const loadCatalog = () => {
       cgtState = { ...cgtState, status: "loading", tasks: [] };
       if (!sendCgt("cgt_catalog")) cgtState = { ...cgtState, status: "SDK_UNAVAILABLE", tasks: [] };
@@ -6905,18 +7004,13 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
     panel.querySelector("[data-hier-cgt-refresh]").addEventListener("click", loadCatalog);
     panel.querySelector("[data-hier-cgt-project]").addEventListener("change", event => {
       cgtProjectId = event.target.value;
-      cgtQuery = ""; cgtPage = 0; cgtEpisode = "";
+      cgtPage = 0; cgtEpisode = "";
       loadCatalog();
     });
     panel.querySelector("[data-hier-cgt-episode]").addEventListener("change", event => {
       cgtEpisode = event.target.value; cgtPage = 0;
       renderCgt();
       panel.querySelector("[data-hier-cgt-episode]")?.focus({ preventScroll: true });
-    });
-    panel.querySelector("[data-hier-cgt-query]")?.addEventListener("input", event => {
-      const start = event.target.selectionStart, end = event.target.selectionEnd;
-      cgtQuery = event.target.value; cgtPage = 0; renderCgt();
-      const input = panel.querySelector("[data-hier-cgt-query]"); input?.focus({ preventScroll: true }); input?.setSelectionRange(start, end);
     });
     panel.querySelector("[data-hier-cgt-prev]")?.addEventListener("click", () => { cgtPage -= 1; renderCgt(); });
     panel.querySelector("[data-hier-cgt-next]")?.addEventListener("click", () => { cgtPage += 1; renderCgt(); });
@@ -7004,14 +7098,17 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
     dialog.innerHTML = `<style>
       .shot-hierarchy-dialog{box-sizing:border-box;position:fixed;inset:0;margin:auto;transform:none;translate:none;width:min(1000px,94vw);max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);display:flex;flex-direction:column;padding:0;border:1px solid #9f4a79;border-radius:12px;background:#0b1020;color:#e6edf7;font:12px/1.5 system-ui,sans-serif;box-shadow:0 16px 80px #000a;overflow:hidden}
       .shot-hierarchy-dialog::backdrop{background:#050814b8}.shot-hierarchy-dialog *{box-sizing:border-box}.shot-hierarchy-dialog header,.shot-hierarchy-dialog footer{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;background:linear-gradient(100deg,#402039,#101626 70%)}
-      .shot-hierarchy-dialog h2{margin:0;font-size:15px}.shot-hierarchy-dialog h3{margin:0 0 10px;font-size:13px}.shot-hierarchy-dialog p{margin:6px 0}.shot-hierarchy-dialog small{display:block;color:#9fb0c8}.shot-hierarchy-dialog button,.shot-hierarchy-dialog input,.shot-hierarchy-dialog select{font:inherit;color:inherit;background:#090e1a;border:1px solid #40506a;border-radius:6px;padding:7px 9px;min-height:32px;max-width:100%}.shot-hierarchy-dialog button{cursor:pointer}.shot-hierarchy-dialog button:disabled{opacity:.4;cursor:default}.shot-hierarchy-dialog :focus-visible{outline:2px solid #f472b6;outline-offset:2px}.shot-hierarchy-dialog .hier-primary{background:#88305f;border-color:#f472b6}.shot-hierarchy-dialog .hier-body{padding:14px 18px;overflow:auto;min-height:0}.shot-hierarchy-dialog header,.shot-hierarchy-dialog footer{flex-shrink:0}.shot-hierarchy-dialog .hier-split{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:14px;align-items:start}.shot-hierarchy-dialog .hier-pane{min-width:0;border:1px solid #354058;border-radius:8px;padding:12px;background:#0e1525}.shot-hierarchy-dialog .hier-row{margin:9px 0;padding:10px;border:1px solid var(--shot-accent);border-radius:7px;background:linear-gradient(100deg,rgba(var(--shot-rgb),.18),#0b1020 90%)}.shot-hierarchy-dialog .hier-child{margin-left:20px}.shot-hierarchy-dialog .hier-row input{width:100%;margin:5px 0}.shot-hierarchy-dialog .hier-tools{display:flex;flex-wrap:wrap;gap:6px;align-items:center}.shot-hierarchy-dialog .hier-tools label{flex:1;min-width:130px}.shot-hierarchy-dialog .hier-tools select{width:100%}.shot-hierarchy-dialog .hier-project-tools{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end}.shot-hierarchy-dialog .hier-project-tools label{display:grid;gap:4px;min-width:0}.shot-hierarchy-dialog .hier-project-tools button{white-space:nowrap}.shot-hierarchy-dialog .hier-query{display:grid;gap:4px;margin:10px 0}.shot-hierarchy-dialog .hier-query input{width:100%}.shot-hierarchy-dialog .hier-cgt-scroll{max-height:min(46vh,420px);overflow:auto;overscroll-behavior:contain}.shot-hierarchy-dialog .hier-cgt-scroll thead{position:sticky;top:0;background:#0e1525;z-index:1}.shot-hierarchy-dialog .hier-table td{padding:6px;vertical-align:top;overflow-wrap:anywhere}.shot-hierarchy-dialog .hier-table td:last-child{width:70px}.shot-hierarchy-dialog .hier-selection-list{max-height:min(44vh,420px);overflow:auto;overscroll-behavior:contain}.shot-hierarchy-dialog .hier-name-preview{margin:10px 0;padding:10px;border:1px solid #354058;border-radius:7px;background:#0b1020}.shot-hierarchy-dialog .hier-name-preview h3{margin-bottom:4px}.shot-hierarchy-dialog .hier-manual label{display:grid;gap:4px}.shot-hierarchy-dialog .hier-manual input,.shot-hierarchy-dialog .hier-manual select{width:100%}.shot-hierarchy-dialog .hier-manual{display:grid;gap:8px;margin-top:18px;padding-top:12px;border-top:1px solid #354058}.shot-hierarchy-dialog .hier-table{width:100%;border-collapse:collapse}.shot-hierarchy-dialog th{padding:6px;text-align:left;border-bottom:1px solid #354058}.shot-hierarchy-dialog .hier-offline{padding:12px 4px;color:#e6bd85}.shot-hierarchy-dialog [data-hier-message]{min-height:20px;color:#fda4af;white-space:pre-wrap}.shot-hierarchy-dialog .hier-output{overflow-wrap:anywhere;white-space:pre-wrap}.shot-hierarchy-dialog footer{flex-wrap:wrap}.shot-hierarchy-dialog .hier-actions{display:flex;gap:8px;margin-left:auto}@media(max-width:700px){.shot-hierarchy-dialog .hier-split{grid-template-columns:1fr}.shot-hierarchy-dialog .hier-child{margin-left:10px}}
+      .shot-hierarchy-dialog h2{margin:0;font-size:15px}.shot-hierarchy-dialog h3{margin:0 0 10px;font-size:13px}.shot-hierarchy-dialog p{margin:6px 0}.shot-hierarchy-dialog small{display:block;color:#9fb0c8}.shot-hierarchy-dialog button,.shot-hierarchy-dialog input,.shot-hierarchy-dialog select{font:inherit;color:inherit;background:#090e1a;border:1px solid #40506a;border-radius:6px;padding:7px 9px;min-height:32px;max-width:100%}.shot-hierarchy-dialog button{cursor:pointer}.shot-hierarchy-dialog button:disabled{opacity:.4;cursor:default}.shot-hierarchy-dialog :focus-visible{outline:2px solid #f472b6;outline-offset:2px}.shot-hierarchy-dialog .hier-primary{background:#88305f;border-color:#f472b6}.shot-hierarchy-dialog .hier-body{padding:14px 18px;overflow:auto;min-height:0}.shot-hierarchy-dialog header,.shot-hierarchy-dialog footer{flex-shrink:0}.shot-hierarchy-dialog .hier-split{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:14px;align-items:start}.shot-hierarchy-dialog .hier-pane{min-width:0;border:1px solid #354058;border-radius:8px;padding:12px;background:#0e1525}.shot-hierarchy-dialog .hier-row{margin:9px 0;padding:10px;border:1px solid var(--shot-accent);border-radius:7px;background:linear-gradient(100deg,rgba(var(--shot-rgb),.18),#0b1020 90%)}.shot-hierarchy-dialog .hier-child{margin-left:20px}.shot-hierarchy-dialog .hier-row input{width:100%;margin:5px 0}.shot-hierarchy-dialog .hier-tools{display:flex;flex-wrap:wrap;gap:6px;align-items:center}.shot-hierarchy-dialog .hier-tools label{flex:1;min-width:130px}.shot-hierarchy-dialog .hier-tools select{width:100%}.shot-hierarchy-dialog .hier-project-tools{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end}.shot-hierarchy-dialog .hier-project-tools label{display:grid;gap:4px;min-width:0}.shot-hierarchy-dialog .hier-project-tools button{white-space:nowrap}.shot-hierarchy-dialog .hier-cgt-scroll{max-height:min(46vh,420px);overflow:auto;overscroll-behavior:contain}.shot-hierarchy-dialog .hier-cgt-scroll thead{position:sticky;top:0;background:#0e1525;z-index:1}.shot-hierarchy-dialog .hier-table td{padding:6px;vertical-align:top;overflow-wrap:anywhere}.shot-hierarchy-dialog .hier-table td:last-child{width:70px}.shot-hierarchy-dialog .hier-selection-list{max-height:min(44vh,420px);overflow:auto;overscroll-behavior:contain}.shot-hierarchy-dialog .hier-name-preview{margin:10px 0;padding:10px;border:1px solid #354058;border-radius:7px;background:#0b1020}.shot-hierarchy-dialog .hier-name-preview h3{margin-bottom:4px}.shot-hierarchy-dialog .hier-manual label{display:grid;gap:4px}.shot-hierarchy-dialog .hier-manual input,.shot-hierarchy-dialog .hier-manual select{width:100%}.shot-hierarchy-dialog .hier-manual{display:grid;gap:8px;margin-top:18px;padding-top:12px;border-top:1px solid #354058}.shot-hierarchy-dialog .hier-table{width:100%;border-collapse:collapse}.shot-hierarchy-dialog th{padding:6px;text-align:left;border-bottom:1px solid #354058}.shot-hierarchy-dialog .hier-offline{padding:12px 4px;color:#e6bd85}.shot-hierarchy-dialog [data-hier-message]{min-height:20px;color:#fda4af;white-space:pre-wrap}.shot-hierarchy-dialog .hier-output{overflow-wrap:anywhere;white-space:pre-wrap}.shot-hierarchy-dialog footer{flex-wrap:wrap}.shot-hierarchy-dialog .hier-actions{display:flex;gap:8px;margin-left:auto}@media(max-width:700px){.shot-hierarchy-dialog .hier-split{grid-template-columns:1fr}.shot-hierarchy-dialog .hier-child{margin-left:10px}}
       .shot-hierarchy-dialog [data-hier-drag-handle]{cursor:move;touch-action:none;user-select:none}.shot-hierarchy-dialog [data-hier-drag-handle] button{cursor:pointer}
       .shot-hierarchy-dialog .hier-name-tools{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px;align-items:end}.shot-hierarchy-dialog .hier-name-tools label{display:grid;gap:4px;min-width:0}.shot-hierarchy-dialog .hier-name-tools input{margin:0;min-width:0}.shot-hierarchy-dialog .hier-name-tools button{white-space:nowrap}.shot-hierarchy-dialog .hier-name-preview{display:flex;align-items:center;gap:10px;min-width:0;overflow:hidden}.shot-hierarchy-dialog .hier-name-preview h3{flex:0 0 auto;margin:0;white-space:nowrap}.shot-hierarchy-dialog .hier-name-values{display:flex;align-items:center;gap:12px;min-width:0;overflow-x:auto;white-space:nowrap;overscroll-behavior:contain}.shot-hierarchy-dialog .hier-name-values small{flex:0 0 auto;white-space:nowrap}
-      .shot-hierarchy-dialog{height:min(682px,calc(100dvh - 24px))}.shot-hierarchy-dialog .hier-body{flex:1}.shot-hierarchy-dialog [data-hier-message]:empty,.shot-hierarchy-dialog [hidden],.shot-hierarchy-dialog .hier-selection-list:empty{display:none!important}.shot-hierarchy-dialog .hier-offline{margin:6px 0 0;padding:6px 0;line-height:1.4}.shot-hierarchy-dialog .hier-name-preview{margin:8px 0 0;padding:8px 10px}.shot-hierarchy-dialog .hier-selection-list:not(:empty){margin-top:8px}.shot-hierarchy-dialog .hier-manual{gap:6px;margin-top:10px;padding-top:10px}.shot-hierarchy-dialog .hier-manual h3{margin:0}.shot-hierarchy-dialog .hier-selection-list:empty+.hier-manual{margin-top:8px;padding-top:8px}.shot-hierarchy-dialog .hier-query{margin:8px 0}@media(max-width:700px){.shot-hierarchy-dialog{height:calc(100dvh - 24px)}}
+      .shot-hierarchy-dialog{height:min(682px,calc(100dvh - 24px))}.shot-hierarchy-dialog .hier-body{flex:1}.shot-hierarchy-dialog [data-hier-message]:empty,.shot-hierarchy-dialog [hidden],.shot-hierarchy-dialog .hier-selection-list:empty{display:none!important}.shot-hierarchy-dialog .hier-offline{margin:6px 0 0;padding:6px 0;line-height:1.4}.shot-hierarchy-dialog .hier-name-preview{margin:8px 0 0;padding:8px 10px}.shot-hierarchy-dialog .hier-selection-list:not(:empty){margin-top:8px}.shot-hierarchy-dialog .hier-manual{gap:6px;margin-top:10px;padding-top:10px}.shot-hierarchy-dialog .hier-manual h3{margin:0}.shot-hierarchy-dialog .hier-selection-list:empty+.hier-manual{margin-top:8px;padding-top:8px}@media(max-width:700px){.shot-hierarchy-dialog{height:calc(100dvh - 24px)}}
       .shot-hierarchy-dialog .hier-project-tools{grid-template-columns:minmax(0,1.3fr) minmax(0,1fr) auto}.shot-hierarchy-dialog .hier-project-tools select{min-width:0}.shot-hierarchy-dialog .hier-row-head{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:8px}.shot-hierarchy-dialog .hier-row-head b{white-space:nowrap}.shot-hierarchy-dialog .hier-row-head select{width:100%;min-width:0}.shot-hierarchy-dialog .hier-child{margin-left:calc(var(--hier-depth,1) * 12px)}
+      .shot-hierarchy-dialog .hier-cgt-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0}.shot-hierarchy-dialog .hier-cgt-heading>span{flex:0 0 auto}.shot-hierarchy-dialog .hier-cgt-heading>[data-hier-cgt-account]{min-width:0;margin-left:auto;font-size:10px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:right}
+      .shot-hierarchy-dialog .hier-split{height:100%;grid-template-rows:minmax(0,1fr)}.shot-hierarchy-dialog [data-hier-source-pane]{height:100%;min-height:0;display:flex;flex-direction:column}.shot-hierarchy-dialog [data-hier-cgt]{flex:1;min-height:0;display:flex;flex-direction:column}.shot-hierarchy-dialog [data-hier-source-pane] .hier-cgt-scroll{flex:1;min-height:0;max-height:none}.shot-hierarchy-dialog [data-hier-source-pane] .hier-tools,.shot-hierarchy-dialog [data-hier-source-pane] .hier-offline{flex-shrink:0}.shot-hierarchy-dialog .hier-table td:last-child{white-space:nowrap}.shot-hierarchy-dialog [data-hier-cgt-add]{min-width:68px;white-space:nowrap}
+      @media(max-width:700px){.shot-hierarchy-dialog .hier-split{height:auto;grid-template-rows:none}.shot-hierarchy-dialog [data-hier-source-pane]{height:min(546px,calc(100dvh - 160px))}}
     </style><header data-hier-drag-handle title="제목 표시줄을 드래그하여 창 이동"><div><h2 id="hmb-hierarchy-title">CGT 샷 선택 · 묶음 구성</h2></div><button type="button" data-hier-cancel aria-label="취소하고 닫기">×</button></header>
     <div class="hier-body"><p data-hier-message role="status" aria-live="polite"></p><div class="hier-split">
-    <section class="hier-pane" data-hier-source-pane><h3>CGT 본인 작업 목록</h3><div data-hier-cgt></div></section>
+    <section class="hier-pane" data-hier-source-pane><h3 class="hier-cgt-heading"><span>CGT 본인 작업 목록</span><small data-hier-cgt-account hidden></small></h3><div data-hier-cgt></div></section>
     <section class="hier-pane" data-hier-selected-pane><h3>선택한 샷 · 대표 / 하위 (${draft.members.length}/5)</h3><div class="hier-name-preview" data-hier-name-preview></div><div class="hier-selection-list" data-hier-selected-scroll>${ordered.map(row => {
       const number = slotNumber(row);
       const palette = hmbImageAssetShotPalette(number);
@@ -7019,20 +7116,21 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
       const hasChildren = draft.members.some(child => child.parent_id === row.member_id);
       const parentOptions = draft.members.filter(candidate => canParent(candidate, row));
       const role = row.parent_id ? hasChildren ? "하위 · 대표" : "하위" : "대표";
-      return `<article class="hier-row ${row.parent_id ? "hier-child" : ""}" data-hier-member="${row.manual_uuid}" style="--shot-accent:${palette.accent};--shot-rgb:${palette.rgb};--hier-depth:${depths.get(row.member_id) || 0}"><div class="hier-row-head"><b>${String(number).padStart(2, "0")} · ${role}</b><select data-hier-parent="${row.manual_uuid}" aria-label="${escapeHtml(row.source_name)} 대표·하위 선택" title="하위 샷도 다른 샷의 대표로 선택할 수 있습니다"><option value="" ${row.parent_id === null ? "selected" : ""}>독립 대표</option>${parentOptions.map(parent => `<option value="${escapeHtml(parent.member_id)}" ${parent.member_id === row.parent_id ? "selected" : ""}>${String(slotNumber(parent)).padStart(2, "0")} · ${escapeHtml(parent.canonical_name)}의 하위</option>`).join("")}</select></div><small>${row.origin === "cgt" ? `CGT · ${escapeHtml(row.artist)} · ${escapeHtml(row.status)}` : "수동 · CGT 미연결"}</small>${parts.shot ? `<small>에피소드 ${parts.episode} · 샷 ${parts.shot} · 분리컷 ${parts.split_cut}${sameBase(row) ? " · 같은 원본 샷의 분리컷" : ""}</small>` : ""}<div class="hier-name-tools" data-hier-name-tools><label>정식 이름<input data-hier-name="${row.manual_uuid}" value="${escapeHtml(row.source_name)}" autocomplete="off" ${row.origin === "cgt" ? "readonly" : ""}></label><button type="button" data-hier-remove="${row.manual_uuid}" ${hasChildren ? "disabled title=\"하위를 먼저 선택 해제하세요\"" : ""}>선택 해제</button></div></article>`;
+      return `<article class="hier-row ${row.parent_id ? "hier-child" : ""}" data-hier-member="${row.manual_uuid}" style="--shot-accent:${palette.accent};--shot-rgb:${palette.rgb};--hier-depth:${depths.get(row.member_id) || 0}"><div class="hier-row-head"><b>${String(number).padStart(2, "0")} · ${role}</b><select data-hier-parent="${row.manual_uuid}" aria-label="${escapeHtml(row.source_name)} 대표·하위 선택" title="하위 샷도 다른 샷의 대표로 선택할 수 있습니다"><option value="" ${row.parent_id === null ? "selected" : ""}>독립 대표</option>${parentOptions.map(parent => `<option value="${escapeHtml(parent.member_id)}" ${parent.member_id === row.parent_id ? "selected" : ""}>${String(slotNumber(parent)).padStart(2, "0")} · ${escapeHtml(parent.canonical_name)}의 하위</option>`).join("")}</select></div>${parts.shot ? `<small>에피소드 ${parts.episode} · 샷 ${parts.shot} · 분리컷 ${parts.split_cut}${sameBase(row) ? " · 같은 원본 샷의 분리컷" : ""}</small>` : ""}<div class="hier-name-tools" data-hier-name-tools><label>정식 이름<input data-hier-name="${row.manual_uuid}" value="${escapeHtml(row.source_name)}" autocomplete="off" ${row.origin === "cgt" ? "readonly" : ""}></label><button type="button" data-hier-remove="${row.manual_uuid}" ${hasChildren ? "disabled title=\"하위를 먼저 선택 해제하세요\"" : ""}>선택 해제</button></div></article>`;
     }).join("")}</div>
     <div class="hier-manual"><h3 data-hier-manual-title>수동 샷 추가</h3><label data-hier-manual-name-field>샷 이름<input data-hier-manual-name placeholder="정식 샷 코드 또는 수동 이름" autocomplete="off"></label><label>연결할 슬롯<select data-hier-slot><option value="new">새 독립 샷 추가</option>${state.shot_routing.shots.map(shot => `<option value="${shot.shot_uuid}" ${used.has(shot.shot_uuid) ? "disabled" : ""}>${String(shot.number).padStart(2, "0")} · ${escapeHtml(shot.name)} (입력·연결 유지)</option>`).join("")}${typeof addImageBash === "function" ? '<option value="image_bash">HMBImageBash</option>' : ""}</select></label><small data-hier-slot-help>기존 슬롯을 선택하면 UUID·미디어·설정·결과를 보존하고 이름만 적용합니다.</small><button type="button" data-hier-add>수동 추가</button></div></section></div></div>
     <footer><span>${representativeCount}개 대표 · ${draft.members.length - roots.length}개 하위</span><div class="hier-actions"><button type="button" data-hier-cancel>취소</button><button type="button" class="hier-primary" data-hier-confirm>선택 확정</button></div></footer>`;
     dialog.querySelectorAll("[data-hier-cancel]").forEach(button => button.addEventListener("click", close));
-    const add = () => {
-      if (dialog.querySelector("[data-hier-slot]").value === "image_bash") {
-        if (typeof addImageBash !== "function") return;
-        if (JSON.stringify(draft.members) !== JSON.stringify(prior.members || [])) {
-          notice("샷 선택 변경을 먼저 확정한 뒤 HMBImageBash를 추가하세요. 기존 샷은 유지됩니다."); return;
-        }
-        if (container.__hmbNativeUiContract?.props?.disabled) return;
-        close(); addImageBash(); return;
+    const confirmImageBash = () => {
+      if (confirmingCgt || hierarchyClosed || typeof addImageBash !== "function") return;
+      if (JSON.stringify(draft.members) !== JSON.stringify(prior.members || [])) {
+        notice("샷 선택 변경을 먼저 확정한 뒤 HMBImageBash를 추가하세요. 기존 샷은 유지됩니다."); return;
       }
+      if (container.__hmbNativeUiContract?.props?.disabled) return;
+      close(); addImageBash();
+    };
+    const add = () => {
+      if (dialog.querySelector("[data-hier-slot]").value === "image_bash") return;
       changed(() => {
         const parsed = hmbHierarchyParseName(dialog.querySelector("[data-hier-manual-name]").value);
         const slot = dialog.querySelector("[data-hier-slot]").value;
@@ -7053,7 +7151,8 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
       dialog.querySelector("[data-hier-manual-name-field]").hidden = imageBash;
       dialog.querySelector("[data-hier-manual-name]").disabled = imageBash;
       dialog.querySelector("[data-hier-manual-title]").textContent = imageBash ? "HMBImageBash 추가" : "수동 샷 추가";
-      dialog.querySelector("[data-hier-add]").textContent = imageBash ? "HMBImageBash 추가" : "수동 추가";
+      dialog.querySelector("[data-hier-add]").hidden = imageBash;
+      dialog.querySelector("[data-hier-add]").disabled = imageBash;
       dialog.querySelector("[data-hier-slot-help]").textContent = imageBash
         ? "Shot 1~5와 별도의 이미지 작업 공간을 추가합니다."
         : "기존 슬롯을 선택하면 UUID·미디어·설정·결과를 보존하고 이름만 적용합니다.";
@@ -7109,6 +7208,10 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
     dialog.querySelector("[data-hier-confirm]").addEventListener("click", () => {
       try {
         if (container.__hmbNativeUiContract?.props?.disabled) throw new Error("Griptape에서 편집이 잠겨 있습니다.");
+        // The selected workspace uses the same confirmation action even when
+        // no Shot is selected. A pending Shot edit still retains the existing
+        // CGT confirmation boundary and must be confirmed separately.
+        if (dialog.querySelector("[data-hier-slot]").value === "image_bash") { confirmImageBash(); return; }
         const names = new Map([...dialog.querySelectorAll("[data-hier-name]")].map(input => [input.dataset.hierName, hmbHierarchyParseName(input.value)]));
         const candidate = { ...draft, members: draft.members.map(row => ({ ...row,
           source_name: names.get(row.manual_uuid).source_name, canonical_name: names.get(row.manual_uuid).canonical_name })) };
@@ -8417,6 +8520,7 @@ function hmbNativeUiImplementation(container, props) {
       refreshReview,
     ), ".hmb-image-assets");
     hmbPatchImageAssetMarkup(container, markup);
+    hmbApplyCgtWorkStartNotice(container,state);
     if (container.__hmbImageAssetRegistrationDraft) {
       const root = container.querySelector(".hmb-image-assets");
       const expanded = root?.querySelector?.("[data-library-expanded]");
@@ -8958,9 +9062,9 @@ function hmbAcquireNativeStockSafety(container) {
       notice.setAttribute("data-hmb-native-safety-notice", "required");
       notice.setAttribute("role", "alert");
       Object.assign(notice.style, { position: "fixed", zIndex: "2147483647", right: "20px", bottom: "64px", maxWidth: "420px", padding: "18px", border: "1px solid #b89458", borderRadius: "18px", background: "#151c29", color: "#f8fafc", font: "13px/1.6 system-ui,sans-serif", boxShadow: "0 8px 32px #0008" });
-      const title = doc.createElement("strong"); title.textContent = "HMB 업데이트 상태 확인이 필요합니다";
+      const title = doc.createElement("strong"); title.textContent = "HMB 편집기·삭제 보호 확인이 필요합니다";
       const text = doc.createElement("p");
-      text.textContent = "Override 업데이트 로그에서 current/applied 확인 → 작업 저장 → Griptape 완전 종료 → 재시작 후 다시 확인하세요. current/applied는 디스크 파일 상태이며 현재 화면의 통합 상태를 보장하지 않습니다. 실패 또는 상태 확인 불가 시 HMB 업데이트 로그의 원인을 확인하세요. 최신 UI와 엔진 보호가 확인되기 전까지 HMB 노드 삭제를 일시 중단하며, 연결된 노드는 계속 보호됩니다.";
+      text.textContent = "Override 업데이트 로그에서 current/applied를 확인하세요. UI 또는 엔진 보호 상태를 확인하지 못해 감지된 HMB 노드 삭제 시도를 중단했습니다. 작업 저장 후 Griptape 완전 종료·재시작하세요. current/applied는 디스크 파일 상태이며 현재 화면의 통합 상태를 보장하지 않습니다. 실패 시 로그의 원인을 확인하세요. 이 안내만으로 다른 삭제 경로의 엔진 보호가 준비됐다고 보장할 수 없습니다.";
       const close = doc.createElement("button"); close.type = "button"; close.textContent = "확인";
       Object.assign(close.style, { border: "1px solid #64748b", borderRadius: "999px", background: "#243044", color: "#f8fafc", padding: "6px 18px", cursor: "pointer" });
       close.addEventListener("click", dismiss); notice.append(title, text, close); doc.body.append(notice); close.focus();
@@ -8992,8 +9096,8 @@ function hmbAcquireNativeStockSafety(container) {
       if (badge?.isConnected || !doc.body) return;
       badge = doc.createElement("button"); badge.type = "button";
       badge.setAttribute("data-hmb-native-safety-status", "required");
-      badge.setAttribute("aria-label", "HMB Override 업데이트 및 재시작 안내");
-      badge.textContent = "HMB 업데이트 확인 · 안전 삭제 보호 중";
+      badge.setAttribute("aria-label", "HMB Override 업데이트·재시작 및 삭제 보호 상태 확인");
+      badge.textContent = "HMB UI·삭제 보호 상태 확인";
       Object.assign(badge.style, { position: "fixed", zIndex: "2147483646", right: "20px", bottom: "20px", border: "1px solid #b89458", borderRadius: "999px", padding: "7px 14px", background: "#151c29", color: "#f5d49a", font: "12px system-ui,sans-serif", cursor: "pointer", boxShadow: "0 4px 18px #0006" });
       badge.addEventListener("click", show); doc.body.append(badge);
     };

@@ -230,8 +230,8 @@ if ($records.Count -ne [int]$manifest.file_count) {
 }
 if (
     [int]$manifest.install_file_count -ne 60 -or
-    [int]$manifest.distribution_file_count -ne 7 -or
-    $records.Count -ne 67
+    [int]$manifest.distribution_file_count -ne 8 -or
+    $records.Count -ne 68
 ) {
     throw 'HMB release manifest install/distribution boundary mismatch.'
 }
@@ -278,6 +278,7 @@ $expectedDistributionOnlyMembers = @(
     'THIRD_PARTY_NOTICES.md',
     'SBOM.spdx.json',
     'tools\hmb_color_lut_native_header_patch.py',
+    'tools\hmb_native_semantic_adapter.py',
     'resources\editor\hmb-color-lut-native-header.js',
     'resources\editor\native-editor-patch.json'
 )

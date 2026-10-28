@@ -56,9 +56,9 @@ async def exercise(engine):
     from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
     from griptape_nodes.retained_mode.events.flow_events import (CreateFlowRequest,
         SerializeFlowToCommandsRequest, DeserializeFlowFromCommandsRequest, DeleteFlowRequest)
-    from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, SerializeNodeToCommandsRequest, DeserializeNodeFromCommandsRequest
+    from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, DeleteNodeRequest, SerializeNodeToCommandsRequest, DeserializeNodeFromCommandsRequest, SetNodeMetadataRequest
     from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, CreateConnectionResultFailure, ListConnectionsForNodeRequest
-    from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeRequest, SetParameterValueRequest
+    from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeRequest, SetParameterValueRequest, SetParameterValueResultFailure
     from griptape_nodes.retained_mode.events.execution_events import ResolveNodeRequest
     from griptape_nodes.retained_mode.events.workflow_events import SaveWorkflowFileFromSerializedFlowRequest
     from griptape_nodes.exe_types.node_types import NodeResolutionState
@@ -219,6 +219,7 @@ async def exercise(engine):
         name = node._create_image_bash_workspace_node(command)
         target = engine.node_manager.get_node_by_name(name)
         assert isinstance(target, HMBImageBash)
+        assert target.metadata.get("size") == {"width": 800, "height": 680}, target.metadata
         assert target.name == "HMBImageBash", target.name
         connections = engine.handle_request(ListConnectionsForNodeRequest(node_name=name))
         assert connections.succeeded() and len(connections.incoming_connections) == 2, connections
@@ -237,6 +238,38 @@ async def exercise(engine):
         assert accepted.succeeded(), accepted.result_details
         assert len(engine.flow_manager.get_flow_by_name(ensured.flow_name).nodes) == before_count + 1
         assert node._current_state()["image_bash_workspace_request"] == {}
+        # Exercise the actual UI edit transport. A workspace edit must publish
+        # the native port pair and update the connected Bash without Run.
+        initial_instances = deepcopy(node._current_state()["image_bash_workspace"]["instances"])
+        added = dict(instance_id=str(uuid4()), source_uid="import:a")
+        sequences = [initial_instances + [added], [added] + initial_instances,
+                     [added] + initial_instances[1:], initial_instances]
+        with mock.patch.object(node, "process", side_effect=AssertionError("ImageAsset Run forbidden")), \
+             mock.patch.object(target, "process", side_effect=AssertionError("Image Bash Run forbidden")):
+            for requested_instances in sequences:
+                current = node._current_state()
+                workspace = deepcopy(current["image_bash_workspace"])
+                workspace["instances"] = deepcopy(requested_instances)
+                workspace["revision"] += 1
+                edit = dict(schema=source.IMAGE_ASSET_EDIT_SCHEMA, version=1,
+                    ui_edit_revision=current[source.UI_EDIT_REVISION_KEY] + 1,
+                    catalog_identity={key: current.get(key) for key in ("catalog_root", "project_root", "project_uid",
+                        "project_cache_uid", "manifest_signature", "folder_signature", "scan_revision")},
+                    selected_source_uids=[row["source_uid"] for row in current["assets"] if row["selected"]],
+                    edits=dict(shot_routing=deepcopy(current["shot_routing"]), image_bash_workspace=workspace,
+                               image_bash_active=True))
+                changed = engine.handle_request(SetParameterValueRequest(node_name=node.name,
+                    parameter_name=source.WIDGET_STATE_PARAMETER, value=source._json_text(edit)))
+                assert changed.succeeded(), changed.result_details
+                assert [row["source_uid"] for row in target._records()] == [row["instance_id"] for row in requested_instances]
+                assert target.get_parameter_value("image_bash_context")["revision"] == workspace["revision"]
+                scene = target.get_parameter_value("bash_image")
+                scene_uids = {row.get("source_uid") for row in scene.get("meta", {}).get("input_images", [])}
+                assert scene_uids == {row["instance_id"] for row in requested_instances}, (scene_uids, target.get_parameter_value("HMB_BASH_STATUS"))
+        if os.environ.get("HMB_BASH_LIVE_SYNC_ONLY") == "1":
+            from HMB_Image_Bash_Live_Sync_Host_Regression import exercise_live_sync
+            await exercise_live_sync(engine, node, target, source, schema, shots_before)
+            return
         # Normal publication refreshes derived media hashes/counts only.
         for old, current in zip(shots_before["shots"], node._current_state()["shot_routing"]["shots"]):
             for key in ("shot_uuid", "number", "name", "name_is_custom", "revision", "selected_source_uids"):
@@ -400,7 +433,9 @@ async def exercise(engine):
         wired = engine.handle_request(CreateConnectionRequest(source_node_name=node.name,
             source_parameter_name=source.IMAGE_BASH_IMAGES_OUTPUT_PARAMETER,
             target_node_name=child_target.name, target_parameter_name=child_parameter.name))
-        assert wired.failed() and "type mismatch" in str(wired.result_details)
+        details = str(wired.result_details).casefold()
+        assert wired.failed() and ("type mismatch" in details or "rejected the connection" in details), (
+            wired.succeeded(), wired.failed(), wired.result_details)
         assert (node.parameter_output_values[source.IMAGE_BASH_IMAGES_OUTPUT_PARAMETER],
             node.parameter_output_values[source.IMAGE_BASH_CONTEXT_OUTPUT_PARAMETER]) == pair_before_bad_connection
         assert target.get_parameter_value("bash_image") == scene_before_bad_connection
@@ -573,6 +608,56 @@ async def exercise(engine):
         assert transport_view(child_target) == local_before_release
         second._hmb_bind_image_bash_workspace(child_target, second_id)
         secondary_scene = deepcopy(child_target.get_parameter_value("bash_image"))
+        before_failed_unbind = transport_view(child_target)
+        old_child = list(child_target.get_parameter_by_name("input_images").get_child_parameters())
+        old_child_values = {c.name: deepcopy(child_target.get_parameter_value(c.name)) for c in old_child}
+        fired_unbind_failure = []
+        def fail_after_parent_cleared(request):
+            if (isinstance(request, SetParameterValueRequest) and request.node_name == child_target.name
+                    and request.parameter_name == "image_bash_context" and request.value == {}
+                    and not getattr(request, "initial_setup", False) and not fired_unbind_failure):
+                fired_unbind_failure.append(True)
+                return SetParameterValueResultFailure(result_details="Synthetic unbind failure after parent clear")
+            return dispatch(request)
+        with mock.patch.object(GriptapeNodes, "handle_request", side_effect=fail_after_parent_cleared):
+            expect_rejected(lambda: second._hmb_bind_image_bash_workspace(child_target, second_id, False),
+                            "injected failure after parent clear")
+        assert fired_unbind_failure
+        restored_children = list(child_target.get_parameter_by_name("input_images").get_child_parameters())
+        assert [c.name for c in restored_children] == [c.name for c in old_child], ([c.name for c in restored_children], [c.name for c in old_child])
+        assert all(current is original for current, original in zip(restored_children, old_child))
+        assert {c.name: child_target.get_parameter_value(c.name) for c in restored_children} == old_child_values
+        assert transport_view(child_target) == before_failed_unbind
+        assert len(engine.handle_request(ListConnectionsForNodeRequest(node_name=child_target.name)).incoming_connections) == 2
+        foreign_child = []
+        def foreign_edit_after_parent_clear(request):
+            if (isinstance(request, SetParameterValueRequest) and request.node_name == child_target.name
+                    and request.parameter_name == "image_bash_context" and request.value == {}
+                    and not getattr(request, "initial_setup", False) and not foreign_child):
+                foreign_child.append(child_target.get_parameter_by_name("input_images").add_child_parameter())
+                return SetParameterValueResultFailure(result_details="Synthetic concurrent edit")
+            return dispatch(request)
+        with mock.patch.object(GriptapeNodes, "handle_request", side_effect=foreign_edit_after_parent_clear):
+            try:
+                second._hmb_bind_image_bash_workspace(child_target, second_id, False)
+            except ValueError as exc:
+                assert "연결 복원이 완료되지 않았습니다" in str(exc)
+            else:
+                raise AssertionError("Concurrent foreign child was overwritten")
+        assert list(child_target.get_parameter_by_name("input_images").get_child_parameters()) == foreign_child
+        assert child_target.get_parameter_value("bash_image") == secondary_scene
+        # Explicit synthetic recovery: retire only the test's foreign row,
+        # restore the original instance, then reconnect the original lease.
+        input_list = child_target.get_parameter_by_name("input_images")
+        input_list.remove_child(foreign_child[0])
+        for child in old_child:
+            input_list.add_child(child)
+            result = engine.handle_request(SetParameterValueRequest(node_name=child_target.name,
+                parameter_name=child.name, value=old_child_values[child.name], initial_setup=True))
+            assert result.succeeded(), result.result_details
+        second._hmb_bind_image_bash_workspace(child_target, second_id)
+        assert len(engine.handle_request(ListConnectionsForNodeRequest(node_name=child_target.name)).incoming_connections) == 2
+        assert child_target.get_parameter_value("bash_image") == secondary_scene
         second._hmb_bind_image_bash_workspace(child_target, second_id, False)
         assert child_target.get_parameter_value("input_images") == []
         assert child_target.get_parameter_value("image_bash_context") == {}
@@ -580,10 +665,24 @@ async def exercise(engine):
         # Save a real two-node/two-wire flow, retire both instances and cold
         # reopen it through the native SDK. No explicit create command is
         # persisted or replayed; the normal saved native edges own the route.
+        existing_size = {"width": 1139, "height": 779}
+        loaded_sized = engine.handle_request(CreateNodeRequest(node_type="HMBImageBash", specific_library_name=schema.name,
+            node_name="SyntheticExistingSizedBash", override_parent_flow_name=cold_flow.flow_name,
+            metadata={"size": existing_size, "synthetic_tag": "preserved"}, create_error_proxy_on_failure=False))
+        assert loaded_sized.succeeded(), loaded_sized.result_details
+        loaded_node = engine.node_manager.get_node_by_name(loaded_sized.node_name)
+        assert loaded_node.metadata.get("size") == existing_size and loaded_node.metadata.get("synthetic_tag") == "preserved"
+        removed_sized = engine.handle_request(DeleteNodeRequest(node_name=loaded_node.name))
+        assert removed_sized.succeeded(), removed_sized.result_details
         cold_target_created = engine.handle_request(CreateNodeRequest(node_type="HMBImageBash", specific_library_name=schema.name,
             node_name="SyntheticColdRemoteBash", override_parent_flow_name=cold_flow.flow_name, create_error_proxy_on_failure=False))
         assert cold_target_created.succeeded(), cold_target_created.result_details
         cold_target = engine.node_manager.get_node_by_name(cold_target_created.node_name)
+        assert cold_target.metadata.get("size") == {"width": 800, "height": 680}
+        custom_size = {"width": 1013, "height": 817}
+        resized = engine.handle_request(SetNodeMetadataRequest(node_name=cold_target.name,
+            metadata={"size": custom_size, "collapsed": True, "hmb_native_studio_expanded_size": custom_size}))
+        assert resized.succeeded(), resized.result_details
         cold_source._hmb_bind_image_bash_workspace(cold_target, workspace_id)
         for parameter, value in (("width", 4), ("height", 2), ("output_file", str(Path.cwd() / "cold-two-wire-run.png"))):
             changed = engine.handle_request(SetParameterValueRequest(node_name=cold_target.name,
@@ -595,10 +694,11 @@ async def exercise(engine):
         changed = engine.handle_request(SetParameterValueRequest(node_name=cold_target.name,
             parameter_name="bash_image", value=cold_scene, broadcast_result=False))
         assert changed.succeeded(), changed.result_details
-        cold_scene = deepcopy(cold_target.get_parameter_value("bash_image"))
         cold_source.state = NodeResolutionState.RESOLVED
         cold_run = await asyncio.wait_for(engine.ahandle_request(ResolveNodeRequest(node_name=cold_target.name)), timeout=15)
         assert cold_run.succeeded(), str(getattr(cold_run, "validation_exceptions", cold_run.result_details))
+        await asyncio.sleep(0)
+        cold_scene = deepcopy(cold_target.get_parameter_value("bash_image"))
         original_cold_source, original_cold_target = cold_source, cold_target
         cold_commands = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=cold_flow.flow_name,
             include_create_flow_command=True))
@@ -618,6 +718,14 @@ async def exercise(engine):
         cold_source = reopened_nodes[original_cold_source.name]
         cold_target = reopened_nodes[original_cold_target.name]
         assert len(reopened_nodes) == 2 and cold_source is not original_cold_source and cold_target is not original_cold_target
+        assert cold_target.get_parameter_value("bash_image") == cold_scene
+        assert cold_target.metadata.get("size") == custom_size
+        assert cold_target.metadata.get("collapsed") is True
+        assert cold_target.metadata.get("hmb_native_studio_expanded_size") == custom_size
+        expanded = engine.handle_request(SetNodeMetadataRequest(node_name=cold_target.name,
+            metadata={"collapsed": False, "size": custom_size}))
+        assert expanded.succeeded(), expanded.result_details
+        assert cold_target.metadata.get("size") == custom_size and cold_target.metadata.get("collapsed") is False
         assert cold_target.get_parameter_value("bash_image") == cold_scene
         assert cold_source._current_state()["image_bash_workspace"] == state["image_bash_workspace"]
         assert cold_source._current_state()["shot_routing"] == shots_before
@@ -740,10 +848,11 @@ async def exercise(engine):
             assigned = engine.handle_request(SetParameterValueRequest(node_name=import_target.name,
                 parameter_name="bash_image", value=import_scene, broadcast_result=False))
             assert assigned.succeeded(), assigned.result_details
-            import_scene = deepcopy(import_target.get_parameter_value("bash_image"))
             imported_source.state = NodeResolutionState.RESOLVED
             imported_run = await asyncio.wait_for(engine.ahandle_request(ResolveNodeRequest(node_name=import_target.name)), timeout=15)
             assert imported_run.succeeded(), str(getattr(imported_run, "validation_exceptions", imported_run.result_details))
+            await asyncio.sleep(0)
+            import_scene = deepcopy(import_target.get_parameter_value("bash_image"))
             assert File(import_target.parameter_output_values["output_image"].value).read_bytes() == applied_png
             import_commands = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=import_flow.flow_name,
                 include_create_flow_command=True))
@@ -776,6 +885,9 @@ async def exercise(engine):
             assert not list(import_directory.rglob("*.json"))
             assert {path.name: path.read_bytes() for path in import_paths} == original_files
     print(json.dumps({"status": "PASS", "shot_rows_preserved": 5, "image_instances": 3,
+        "bash_new_node_size": {"width": 800, "height": 680},
+        "bash_saved_resized_node": {"size": {"width": 1013, "height": 817}, "collapsed": True,
+            "expanded_size": {"width": 1013, "height": 817}},
         "duplicate_asset_instances": "distinct stable IDs", "native_connections": 2,
         "auto_created_node_name": "HMBImageBash",
         "image_transport_handles": "hidden; list[ImageUrlArtifact] two-wire contract retained",

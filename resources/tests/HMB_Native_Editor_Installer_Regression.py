@@ -27,15 +27,26 @@ class NativeEditorInstall(unittest.TestCase):
         self.m.DEFAULT_SOURCE.parent.mkdir(parents=True)
         self.m.DEFAULT_SOURCE.write_bytes(self.original)
         self.version = self.m.DEFAULT_SOURCE.parent.parent / ".version"
-        self.version.write_text(self.m.EXPECTED_EDITOR_VERSION)
+        self.version.write_text("untrusted-fixture-label")
         self.sdk_site = self.m.DEFAULT_SOURCE.parents[2] / "engine-bundle/python/Lib/site-packages"
         self.sdk_engine = self.sdk_site / "griptape_nodes/retained_mode/engine.py"
         self.sdk_events = self.sdk_engine.parent / "managers/event_manager.py"
         self.sdk_metadata = self.sdk_site / "griptape_nodes-0.101.3.dist-info/METADATA"
-        for path in (self.sdk_engine, self.sdk_events, self.sdk_metadata):
+        self.sdk_nodes = self.sdk_engine.parent / "managers/node_manager.py"
+        self.payload_dir = self.sdk_engine.parent / "events"
+        for path in (self.sdk_engine, self.sdk_events, self.sdk_metadata, self.sdk_nodes, self.payload_dir / 'placeholder'):
             path.parent.mkdir(parents=True, exist_ok=True)
         self.sdk_engine.write_text("raise AssertionError('SDK must not execute')\ndef current_engine():\n    return None\n")
-        self.sdk_events.write_text("raise AssertionError('SDK must not execute')\nclass EventManager:\n    def add_pre_dispatch_hook(self, hook): pass\n    def remove_pre_dispatch_hook(self, hook): pass\n    def register_request_handlers(self, owner): pass\n")
+        self.sdk_events.write_text("raise AssertionError('SDK must not execute')\ndef current_request_type(): pass\nclass EventManager:\n    def __init__(self):\n        self._pre_dispatch_hooks=[]\n        self._pre_dispatch_hooks_lock=None\n        self._hook_evaluation=None\n        self._request_type_to_manager={}\n    def _run_pre_dispatch_hooks(self, request, context): pass\n    def add_pre_dispatch_hook(self, hook): pass\n    def remove_pre_dispatch_hook(self, hook): pass\n    def register_request_handlers(self, owner): pass\n")
+        self.sdk_nodes.write_text("class NodeManager:\n    def __init__(self): self._name_to_parent_flow_name={}\n    def get_node_by_name(self, name): pass\n    def get_node_parent_flow_by_name(self, name): pass\n    async def on_delete_node_request(self, request): pass\n    async def on_reset_node_to_defaults_request(self, request): pass\n    def on_add_nodes_to_node_group_request(self, request): pass\n    def on_remove_node_from_node_group_request(self, request): pass\n")
+        for name, names in {
+            'node_events': ('DeleteNodeRequest','DeleteNodeResultFailure','ResetNodeToDefaultsRequest','ResetNodeToDefaultsResultFailure','MoveNodeToNewFlowRequest','MoveNodeToNewFlowResultFailure','AddNodesToNodeGroupRequest','AddNodesToNodeGroupResultFailure','RemoveNodeFromNodeGroupRequest','RemoveNodeFromNodeGroupResultFailure'),
+            'flow_events': ('DeleteFlowRequest','DeleteFlowResultFailure'),
+            'workflow_events': ('DeleteWorkflowRequest','DeleteWorkflowResultFailure'),
+            'object_events': ('ClearAllObjectStateRequest','ClearAllObjectStateResultFailure','RenameObjectRequest','RenameObjectResultFailure'),
+            'connection_events': ('CreateConnectionRequest','CreateConnectionResultFailure','ListConnectionsForNodeRequest'),
+        }.items():
+            (self.payload_dir / (name + '.py')).write_text(''.join('class '+n+': pass\n' for n in names))
         self.sdk_metadata.write_text("Name: griptape-nodes\nVersion: 0.101.3\n")
         self.m.RELEASE_STATE_ROOT = self.base / "native-editor-installs"
         self.m.HELPER = self.base / "package/resources/editor/hmb-color-lut-native-header.js"
@@ -45,7 +56,7 @@ class NativeEditorInstall(unittest.TestCase):
         self.m.EXPECTED_SOURCE_SHA256 = self.m.sha256(self.original)
         self.descriptor = {
             "schema": "hmb-native-editor-patch-release", "version": 1,
-            "editor_version": self.m.EXPECTED_EDITOR_VERSION, "bundle_name": self.m.EXPECTED_BUNDLE_NAME,
+            "source_profile": self.m.SOURCE_PROFILE, "bundle_name": self.m.EXPECTED_BUNDLE_NAME,
             "source_sha256": self.m.EXPECTED_SOURCE_SHA256, "candidate_sha256": self.m.sha256(self.candidate),
             "helper_path": "resources/editor/hmb-color-lut-native-header.js",
             "helper_sha256": self.m.sha256(self.m.HELPER.read_bytes()),
@@ -248,14 +259,13 @@ class NativeEditorInstall(unittest.TestCase):
     def test_sdk_preflight_reads_metadata_and_ast_without_executing_sdk(self):
         path = self.prepare()
         evidence = json.loads(path.read_text())["sdk_preflight"]
-        self.assertEqual(evidence["version"], "0.101.3")
-        self.assertEqual(evidence["capabilities"], ["current_engine", "add_pre_dispatch_hook", "remove_pre_dispatch_hook", "register_request_handlers"])
+        self.assertNotIn("version", evidence)
+        self.assertEqual(evidence["capabilities"], ["current_engine", "add_pre_dispatch_hook", "remove_pre_dispatch_hook", "register_request_handlers", "reentrant_dispatch", "guarded_handler_ownership", "node_inventory", "guarded_request_payloads"])
         self.assertEqual(evidence["source_sha256"]["engine"], self.m.sha256(self.sdk_engine.read_bytes()))
         self.assertEqual(self.m.apply_release_install(path)["sdk_preflight"], evidence)
 
     def test_unsupported_sdk_blocks_before_native_preparation(self):
         cases = (
-            (self.sdk_metadata, "Name: griptape-nodes\nVersion: 0.93.0\n", "0.101.3"),
             (self.sdk_metadata, "Name: griptape-nodes-engine\nVersion: 0.104.2\n", "metadata"),
             (self.sdk_engine, "def old_engine(): pass\n", "current_engine"),
             (self.sdk_engine, "def current_engine(required): pass\n", "without arguments"),
@@ -288,6 +298,43 @@ class NativeEditorInstall(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing"):
             self.prepare()
         self.assertFalse(self.m.RELEASE_STATE_ROOT.exists())
+
+    def test_required_guard_capabilities_block_missing_fields_payloads_and_node_lookup(self):
+        cases = ((self.sdk_events, '_hook_evaluation', 'ownership fields'),
+                 (self.sdk_events, '_run_pre_dispatch_hooks', 'reentrant dispatch'),
+                 (self.sdk_nodes, '_name_to_parent_flow_name', 'inventory'),
+                 (self.sdk_nodes, 'get_node_by_name', 'lookup'),
+                 (self.sdk_nodes, 'on_add_nodes_to_node_group_request', 'lookup'),
+                 (self.sdk_nodes, 'on_remove_node_from_node_group_request', 'lookup'),
+                 (self.payload_dir/'node_events.py', 'AddNodesToNodeGroupRequest', 'request or result capability'),
+                 (self.payload_dir/'node_events.py', 'RemoveNodeFromNodeGroupRequest', 'request or result capability'),
+                 (self.payload_dir/'connection_events.py', 'CreateConnectionRequest', 'request or result capability'))
+        for path, token, message in cases:
+            with self.subTest(token=token):
+                before=path.read_text()
+                try:
+                    path.write_text(before.replace(token, 'missing_fixture_token'))
+                    with self.assertRaisesRegex(ValueError,message):self.m._release_sdk_preflight()
+                    self.assertEqual(self.m.DEFAULT_SOURCE.read_bytes(),self.original)
+                finally:path.write_text(before)
+
+    def test_guard_boundaries_reject_incompatible_signatures(self):
+        cases = ((self.sdk_events, '_run_pre_dispatch_hooks(self, request, context)',
+                  '_run_pre_dispatch_hooks(self, request, context, required)', 'dispatch must accept'),
+                 (self.sdk_nodes, 'get_node_by_name(self, name)',
+                  'get_node_by_name(self, name, required)', 'node method must accept'),
+                 (self.sdk_nodes, 'on_add_nodes_to_node_group_request(self, request)',
+                  'on_add_nodes_to_node_group_request(self, request, required)', 'node method must accept'),
+                 (self.sdk_nodes, 'on_remove_node_from_node_group_request(self, request)',
+                  'on_remove_node_from_node_group_request(self, request, required)', 'node method must accept'))
+        for path, old, new, message in cases:
+            with self.subTest(old=old):
+                before=path.read_text()
+                try:
+                    self.assertIn(old,before)
+                    path.write_text(before.replace(old,new))
+                    with self.assertRaisesRegex(ValueError,message):self.m._release_sdk_preflight()
+                finally:path.write_text(before)
 
     def test_sdk_change_after_prepare_blocks_apply_but_does_not_block_rollback(self):
         path = self.prepare()
@@ -327,11 +374,14 @@ class NativeEditorInstall(unittest.TestCase):
             self.prepare()
         self.assertFalse(self.m.RELEASE_STATE_ROOT.exists())
 
-    def test_unknown_editor_version_is_rejected_before_creating_state(self):
+    def test_editor_version_does_not_gate_reviewed_source(self):
         self.version.write_text("0.999.0")
-        with self.assertRaisesRegex(ValueError, "Unsupported installed editor version"):
-            self.prepare()
-        self.assertFalse(self.m.RELEASE_STATE_ROOT.exists())
+        self.assertTrue(self.prepare().is_file())
+
+    def test_sdk_metadata_version_is_ignored_when_capabilities_are_unchanged(self):
+        before = self.m._release_sdk_preflight()
+        self.sdk_metadata.write_text("Name: griptape-nodes\nVersion: arbitrary-vendor-label\n")
+        self.assertEqual(self.m._release_sdk_preflight(), before)
 
     def test_helper_or_patcher_hash_mismatch_is_rejected(self):
         for key in ("helper_sha256", "patcher_sha256"):

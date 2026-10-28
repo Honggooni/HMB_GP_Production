@@ -55,9 +55,9 @@ async def exercise(engine, _phase, out):
     from griptape_nodes.node_library.library_registry import LibraryRegistry
     from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
     from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, DeleteConnectionRequest
-    from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, DeleteNodeRequest, ResetNodeToDefaultsRequest
+    from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, DeleteNodeRequest, ResetNodeToDefaultsRequest, GetNodeMetadataRequest, MoveNodeToNewFlowRequest
     from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, DeleteFlowRequest, SerializeFlowToCommandsRequest
-    from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+    from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest, RenameObjectRequest
     from griptape_nodes.retained_mode.events.workflow_events import (
         DeleteWorkflowRequest, SaveWorkflowFileFromSerializedFlowRequest,
         RunWorkflowFromScratchRequest, RunWorkflowFromRegistryRequest, RegisterWorkflowRequest)
@@ -109,6 +109,12 @@ async def exercise(engine, _phase, out):
     library.register_lazy_node_type("FutureHMBTool", metadata, lambda: FutureHMBTool)
     engine.event_manager.initialize_queue()
     manager = engine.event_manager
+    preexisting = {"enabled": False, "node_name": None, "results": []}
+    def preexisting_owner_hook(request, context):
+        if preexisting["enabled"] and isinstance(request, GetNodeMetadataRequest):
+            preexisting["results"].append(engine.handle_request(DeleteNodeRequest(node_name=preexisting["node_name"])))
+        return None
+    manager.add_pre_dispatch_hook(preexisting_owner_hook)
     owner = bootstrap.HMBProductionLibrary.__new__(bootstrap.HMBProductionLibrary)
     owner._registrations = set()
     with mock.patch.object(bootstrap._Registration, "start_web_worker", lambda *a: None):
@@ -135,7 +141,9 @@ async def exercise(engine, _phase, out):
         request.broadcast_result = False
         result = await engine.ahandle_request(request)
         assert not result.succeeded(), (label, type(result).__name__, str(result.result_details))
-        assert guard.CODE in str(result.result_details), (label, str(result.result_details))
+        details = str(result.result_details)
+        assert (guard.CODE in details or (not guard.protection_readiness(engine)[0]
+                and any(code in details for code in ("HMB_DELETE_CHECK_FAILED", "HMB_DELETE_GUARD_NOT_READY")))), (label, details)
         assert snapshot(engine) == before, label + " partially mutated the retained graph"
         harness.record(label, result_type=type(result).__name__, retained_state_unchanged=True)
 
@@ -152,6 +160,600 @@ async def exercise(engine, _phase, out):
             flow = harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name="DeletionGuardSDK")).flow_name
             source, target = create("connected source"), create("connected target")
             edge = wire(source, target)
+            barrier = getattr(manager, guard.REENTRANT_BARRIER_ATTRIBUTE)
+            assert barrier.is_installed() and barrier.engine_ref() is engine
+            assert guard.install_reentrant_barrier(engine) is barrier
+            # This independent owner registered before HMB. Its hook runs
+            # before the lifetime gate but cannot re-enter a destructive route.
+            assert manager._pre_dispatch_hooks.index(preexisting_owner_hook) < manager._pre_dispatch_hooks.index(registration.deletion_protection.hook)
+            preexisting.update(enabled=True, node_name=source.name)
+            before_preexisting = snapshot(engine)
+            try:
+                assert engine.handle_request(GetNodeMetadataRequest(node_name=target.name)).succeeded()
+            finally:
+                preexisting['enabled'] = False
+            assert len(preexisting['results']) == 1 and not preexisting['results'][0].succeeded()
+            assert guard.CODE in str(preexisting['results'][0].result_details)
+            assert snapshot(engine) == before_preexisting
+            assert preexisting_owner_hook in manager._pre_dispatch_hooks
+            harness.record("preexisting_other_hook_reentrant_delete_is_blocked_and_owner_preserved")
+
+            # A different SDK hook can dispatch recursively. SDK 0.102.0
+            # normally skips its *whole* hook list in this case, so verify the
+            # real request path, including failure-before-mutation semantics.
+            def forced_reset():
+                request = ResetNodeToDefaultsRequest(node_name=source.name)
+                request.force = True
+                return request
+            for label, make_request in (
+                ("node", lambda: DeleteNodeRequest(node_name=source.name)),
+                ("forced_reset", forced_reset),
+                ("flow", lambda: DeleteFlowRequest(flow_name=flow)),
+                ("forced_clear", lambda: ClearAllObjectStateRequest(i_know_what_im_doing=True)),
+            ):
+                for async_outer in (False, True):
+                    seen = []
+                    def other_owner_hook(request, context):
+                        if isinstance(request, GetNodeMetadataRequest):
+                            seen.append(engine.handle_request(make_request()))
+                        return None
+                    manager.add_pre_dispatch_hook(other_owner_hook)
+                    before_reentrant = snapshot(engine)
+                    try:
+                        outer_request = GetNodeMetadataRequest(node_name=target.name, broadcast_result=False)
+                        outer = await engine.ahandle_request(outer_request) if async_outer else engine.handle_request(outer_request)
+                    finally:
+                        manager.remove_pre_dispatch_hook(other_owner_hook)
+                    assert outer.succeeded() and len(seen) == 1 and not seen[0].succeeded(), (label, seen)
+                    assert guard.CODE in str(seen[0].result_details), (label, seen[0].result_details)
+                    assert snapshot(engine) == before_reentrant, "nested " + label + " mutated graph"
+                    harness.record("other_hook_reentrant_" + label + ("_async" if async_outer else "_sync"))
+
+            # A disconnected HMB node is still removable from a nested request.
+            unlinked = create("nested unconnected deletion")
+            nested = []
+            def ordinary_hook(request, context):
+                if isinstance(request, GetNodeMetadataRequest):
+                    nested.append(engine.handle_request(DeleteNodeRequest(node_name=unlinked.name)))
+                return None
+            manager.add_pre_dispatch_hook(ordinary_hook)
+            try:
+                assert engine.handle_request(GetNodeMetadataRequest(node_name=target.name)).succeeded()
+            finally:
+                manager.remove_pre_dispatch_hook(ordinary_hook)
+            assert len(nested) == 1 and nested[0].succeeded()
+            assert unlinked.name not in engine.node_manager._name_to_parent_flow_name
+            harness.record("other_hook_reentrant_unconnected_deletion_remains_native")
+
+            # A UI preflight describes object identities, not reusable names.
+            checked = create("checked unconnected")
+            receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[checked.name]))
+            assert receipt.can_delete and receipt.check_token
+            removed = await engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
+                node_name=checked.name, check_token=receipt.check_token, broadcast_result=False))
+            assert removed.succeeded() and checked.name not in engine.node_manager._name_to_parent_flow_name
+            before_repeat = snapshot(engine)
+            repeated = await engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
+                node_name=checked.name, check_token=receipt.check_token, broadcast_result=False))
+            assert not repeated.succeeded() and snapshot(engine) == before_repeat
+            harness.record("checked_deletion_is_one_use_per_selected_object")
+
+            old = create("checked same name")
+            receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[old.name]))
+            harness.send(engine, DeleteNodeRequest(node_name=old.name))
+            replacement = create(old.name)
+            before_replacement = snapshot(engine)
+            refused = await engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
+                node_name=replacement.name, check_token=receipt.check_token, broadcast_result=False))
+            assert not refused.succeeded() and snapshot(engine) == before_replacement
+            harness.send(engine, DeleteNodeRequest(node_name=replacement.name))
+            harness.record("checked_deletion_refuses_same_name_replacement_before_mutation")
+
+            checked_source, checked_target = create("checked source"), create("checked target")
+            receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[checked_source.name]))
+            wire(checked_source, checked_target)
+            before_late = snapshot(engine)
+            refused = await engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
+                node_name=checked_source.name, check_token=receipt.check_token, broadcast_result=False))
+            assert not refused.succeeded() and snapshot(engine) == before_late
+            harness.record("checked_identity_receipt_never_bypasses_new_connection_guard")
+
+            expired = create("checked expired")
+            receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[expired.name]))
+            before_expired = snapshot(engine)
+            with mock.patch.object(guard.time, "monotonic", return_value=guard.time.monotonic() + 61):
+                refused = await engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
+                    node_name=expired.name, check_token=receipt.check_token, broadcast_result=False))
+            assert not refused.succeeded() and snapshot(engine) == before_expired
+            harness.send(engine, DeleteNodeRequest(node_name=expired.name))
+            harness.record("expired_selection_receipt_refuses_without_side_effects")
+
+            checked_group = BaseNodeGroup("checked group", metadata={"library": "Native_Group"})
+            checked_flow = engine.flow_manager.get_flow_by_name(flow)
+            checked_flow.add_node(checked_group)
+            engine.object_manager.add_object_by_name(checked_group.name, checked_group)
+            engine.node_manager._name_to_parent_flow_name[checked_group.name] = flow
+            child = create("checked child")
+            checked_group.add_nodes_to_group([child])
+            receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[checked_group.name]))
+            added = create("checked late child")
+            checked_group.add_nodes_to_group([added])
+            before_group_change = snapshot(engine)
+            refused = await engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
+                node_name=checked_group.name, check_token=receipt.check_token, broadcast_result=False))
+            assert not refused.succeeded() and snapshot(engine) == before_group_change
+            harness.record("checked_group_refuses_changed_descendant_set")
+            inner_groups = [BaseNodeGroup(name, metadata={"library": "Native_Group"})
+                            for name in ("checked inner one", "checked inner two")]
+            for group in inner_groups:
+                checked_flow.add_node(group)
+                engine.object_manager.add_object_by_name(group.name, group)
+                engine.node_manager._name_to_parent_flow_name[group.name] = flow
+            checked_group.add_nodes_to_group(inner_groups)
+            checked_group.delete_nodes_from_group([added])
+            inner_groups[0].add_nodes_to_group([added])
+            receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[checked_group.name]))
+            inner_groups[0].delete_nodes_from_group([added])
+            inner_groups[1].add_nodes_to_group([added])
+            before_reparent = snapshot(engine)
+            refused = await engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
+                node_name=checked_group.name, check_token=receipt.check_token, broadcast_result=False))
+            assert not refused.succeeded() and snapshot(engine) == before_reparent
+            harness.record("checked_group_refuses_reparenting_with_identical_descendant_names")
+            receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(
+                node_names=[checked_group.name, child.name, added.name, *(group.name for group in inner_groups)]))
+            for selected in (child, added, *inner_groups, checked_group):
+                removed = await engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
+                    node_name=selected.name, check_token=receipt.check_token, broadcast_result=False))
+                assert removed.succeeded()
+            harness.record("checked_children_then_group_accepts_only_original_selected_objects")
+
+            # Native Subflow teardown relocates children before deleting its
+            # empty subflow. Only the owning delete context may make that move.
+            from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
+            from griptape_nodes.retained_mode.events.node_events import MoveNodeToNewFlowRequest
+            class ProbeSubflow(SubflowNodeGroup):
+                async def aprocess(self):
+                    raise AssertionError("node execution is forbidden in this test")
+            def make_subflow(suffix):
+                group = ProbeSubflow("private subflow " + suffix, metadata={"library": "Native_Group"})
+                checked_flow.add_node(group)
+                engine.object_manager.add_object_by_name(group.name, group)
+                engine.node_manager._name_to_parent_flow_name[group.name] = flow
+                member = create("private member " + suffix)
+                group.add_nodes_to_group([member])
+                return group, member
+
+            from griptape_nodes.retained_mode.events.node_events import (
+                AddNodesToNodeGroupRequest, RemoveNodeFromNodeGroupRequest)
+            for use_receipt in (False, True):
+                suffix = "checked" if use_receipt else "direct"
+                group = BaseNodeGroup("private plain " + suffix, metadata={"library": "Native_Group"})
+                checked_flow.add_node(group)
+                engine.object_manager.add_object_by_name(group.name, group)
+                engine.node_manager._name_to_parent_flow_name[group.name] = flow
+                member = create("private plain member " + suffix)
+                outsider = create("private plain connected " + suffix)
+                peer = create("private plain peer " + suffix, hmb=False)
+                wire(outsider, peer)
+                group.add_nodes_to_group([member])
+                saved_values = (deepcopy(dict(member.parameter_values)), deepcopy(dict(member.parameter_output_values)))
+                receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[group.name]))
+                entered, finish = asyncio.Event(), asyncio.Event()
+                original_cancel = engine.node_manager.cancel_conditionally
+                async def plain_pending_cancel(*args, **kwargs):
+                    if args[2] is group:
+                        entered.set()
+                        await finish.wait()
+                    return await original_cancel(*args, **kwargs)
+                request = (guard.HMBDeleteCheckedNodeRequest(node_name=group.name, check_token=receipt.check_token, broadcast_result=False)
+                           if use_receipt else DeleteNodeRequest(node_name=group.name, broadcast_result=False))
+                with mock.patch.object(engine.node_manager, "cancel_conditionally", plain_pending_cancel):
+                    pending_delete = asyncio.create_task(engine.ahandle_request(request))
+                    await asyncio.wait_for(entered.wait(), timeout=5)
+                    added = await engine.ahandle_request(AddNodesToNodeGroupRequest(
+                        node_names=[outsider.name], node_group_name=group.name, flow_name=flow, broadcast_result=False))
+                    removed = await engine.ahandle_request(RemoveNodeFromNodeGroupRequest(
+                        node_names=[member.name], node_group_name=group.name, flow_name=flow, broadcast_result=False))
+                    assert not added.succeeded() and not removed.succeeded()
+                    assert outsider.parent_group is None and member.parent_group is group
+                    finish.set()
+                    assert (await asyncio.wait_for(pending_delete, timeout=5)).succeeded()
+                assert group.name not in engine.node_manager._name_to_parent_flow_name
+                assert engine.node_manager.get_node_by_name(member.name) is member and member.parent_group is None
+                assert (dict(member.parameter_values), dict(member.parameter_output_values)) == saved_values
+                assert outsider.parent_group is None and guard.connected_targets(engine, [outsider.name])[outsider.name] == [peer.name]
+                harness.record("plain_group_" + suffix + "_blocks_concurrent_membership_and_releases_live_child")
+
+            unrelated_group = BaseNodeGroup("private unrelated plain group", metadata={"library": "Native_Group"})
+            checked_flow.add_node(unrelated_group)
+            engine.object_manager.add_object_by_name(unrelated_group.name, unrelated_group)
+            engine.node_manager._name_to_parent_flow_name[unrelated_group.name] = flow
+            standard_member = create("private unrelated standard member", hmb=False)
+            unrelated_group.add_nodes_to_group([standard_member])
+            deleted = await engine.ahandle_request(DeleteNodeRequest(node_name=unrelated_group.name, broadcast_result=False))
+            assert deleted.succeeded()
+            # Preserve the SDK's own behavior for a standard-only group.
+            assert standard_member.parent_group is unrelated_group
+            harness.record("plain_group_standard_only_behavior_is_not_modified")
+
+            group, member = make_subflow("normal membership")
+            extra = create("private normal membership extra")
+            added = await engine.ahandle_request(AddNodesToNodeGroupRequest(
+                node_names=[extra.name], node_group_name=group.name, flow_name=flow, broadcast_result=False))
+            assert added.succeeded() and extra.parent_group is group
+            removed = await engine.ahandle_request(RemoveNodeFromNodeGroupRequest(
+                node_names=[extra.name], node_group_name=group.name, flow_name=flow, broadcast_result=False))
+            assert removed.succeeded() and extra.parent_group is None
+            assert engine.node_manager.get_node_parent_flow_by_name(extra.name) == flow
+            assert (await engine.ahandle_request(DeleteNodeRequest(node_name=group.name, broadcast_result=False))).succeeded()
+            harness.record("subflow_group_membership_still_works_outside_delete")
+
+            for use_receipt in (False, True):
+                group, member = make_subflow("checked" if use_receipt else "direct")
+                peer = create("private connected peer " + str(use_receipt), hmb=False)
+                group.add_nodes_to_group([peer])
+                connection = wire(member, peer)
+                before = snapshot(engine)
+                if use_receipt:
+                    denied = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[group.name]))
+                    assert not denied.can_delete and member.name in denied.blocked
+                else:
+                    denied = await engine.ahandle_request(DeleteNodeRequest(node_name=group.name, broadcast_result=False))
+                    assert not denied.succeeded()
+                assert snapshot(engine) == before
+                harness.send(engine, DeleteConnectionRequest(**connection))
+                retained_values = (deepcopy(dict(member.parameter_values)), deepcopy(dict(member.parameter_output_values)))
+                if use_receipt:
+                    receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[group.name]))
+                    deleted = await engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
+                        node_name=group.name, check_token=receipt.check_token, broadcast_result=False))
+                else:
+                    deleted = await engine.ahandle_request(DeleteNodeRequest(node_name=group.name, broadcast_result=False))
+                assert deleted.succeeded(), (type(deleted).__name__, str(deleted.result_details))
+                assert group.name not in engine.node_manager._name_to_parent_flow_name
+                assert engine.node_manager.get_node_by_name(member.name) is member
+                assert member.parent_group is None and engine.node_manager.get_node_parent_flow_by_name(member.name) == flow
+                assert (dict(member.parameter_values), dict(member.parameter_output_values)) == retained_values
+                harness.record("subflow_" + ("checked" if use_receipt else "direct") + "_preserves_child_and_blocks_connections")
+
+            group, member = make_subflow("concurrent move")
+            receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[group.name]))
+            entered, finish = asyncio.Event(), asyncio.Event()
+            original_cancel = engine.node_manager.cancel_conditionally
+            async def group_pending_cancel(*args, **kwargs):
+                entered.set()
+                await finish.wait()
+                return await original_cancel(*args, **kwargs)
+            with mock.patch.object(engine.node_manager, "cancel_conditionally", group_pending_cancel):
+                pending_group = asyncio.create_task(engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
+                    node_name=group.name, check_token=receipt.check_token, broadcast_result=False)))
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                move = await engine.ahandle_request(MoveNodeToNewFlowRequest(
+                    node_name=member.name, target_flow_name=flow, broadcast_result=False))
+                assert not move.succeeded() and member.parent_group is group
+                finish.set()
+                assert (await asyncio.wait_for(pending_group, timeout=5)).succeeded()
+            assert member.parent_group is None and engine.node_manager.get_node_parent_flow_by_name(member.name) == flow
+            harness.record("subflow_delete_blocks_unrelated_concurrent_move_but_allows_owned_teardown")
+
+            group, member = make_subflow("other delete lease")
+            unrelated = create("parent flow pending unrelated delete")
+            entered, finish = asyncio.Event(), asyncio.Event()
+            original_cancel = engine.node_manager.cancel_conditionally
+            async def unrelated_pending_cancel(*args, **kwargs):
+                if args[2] is unrelated:
+                    entered.set()
+                    await finish.wait()
+                return await original_cancel(*args, **kwargs)
+            with mock.patch.object(engine.node_manager, "cancel_conditionally", unrelated_pending_cancel):
+                other_delete = asyncio.create_task(engine.ahandle_request(DeleteNodeRequest(
+                    node_name=unrelated.name, broadcast_result=False)))
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[group.name]))
+                refused = await engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
+                    node_name=group.name, check_token=receipt.check_token, broadcast_result=False))
+                assert not refused.succeeded() and member.parent_group is group
+                assert engine.node_manager.get_node_parent_flow_by_name(member.name) == group.metadata["subflow_name"]
+                finish.set()
+                assert (await asyncio.wait_for(other_delete, timeout=5)).succeeded()
+            receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[group.name]))
+            assert (await engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
+                node_name=group.name, check_token=receipt.check_token, broadcast_result=False))).succeeded()
+            assert member.parent_group is None
+            harness.record("subflow_owned_move_never_borrows_another_delete_reservation")
+
+            # A retained node can exist in the actual subflow without being
+            # recorded as a member. Native teardown would move group members
+            # before discovering a protected node in a nested flow.
+            group, member = make_subflow("ungrouped nested")
+            nested_flow = harness.send(engine, CreateFlowRequest(
+                flow_name="private nested orphan flow", parent_flow_name=group.metadata["subflow_name"],
+                set_as_new_context=False)).flow_name
+            orphan = create("private nested ungrouped HMB", flow=nested_flow)
+            orphan_peer = create("private nested ungrouped peer", flow=nested_flow, hmb=False)
+            connection = wire(orphan, orphan_peer)
+            before = snapshot(engine)
+            receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[group.name]))
+            assert not receipt.can_delete and orphan.name in receipt.blocked
+            direct = await engine.ahandle_request(DeleteNodeRequest(node_name=group.name, broadcast_result=False))
+            assert not direct.succeeded() and snapshot(engine) == before
+            assert member.parent_group is group
+            harness.record("subflow_nested_ungrouped_connected_refuses_before_any_move")
+            harness.send(engine, DeleteConnectionRequest(**connection))
+            before = snapshot(engine)
+            receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[group.name]))
+            assert not receipt.can_delete and "HMB_SUBFLOW_UNGROUPED" in receipt.message
+            direct = await engine.ahandle_request(DeleteNodeRequest(node_name=group.name, broadcast_result=False))
+            assert not direct.succeeded() and "HMB_SUBFLOW_UNGROUPED" in str(direct.result_details)
+            assert snapshot(engine) == before and member.parent_group is group
+            harness.record("subflow_nested_ungrouped_unconnected_refuses_without_side_effect")
+            for node in (orphan, orphan_peer):
+                moved = await engine.ahandle_request(MoveNodeToNewFlowRequest(
+                    node_name=node.name, target_flow_name=flow, broadcast_result=False))
+                assert moved.succeeded()
+            receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[group.name]))
+            assert receipt.can_delete
+            deleted = await engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
+                node_name=group.name, check_token=receipt.check_token, broadcast_result=False))
+            assert deleted.succeeded() and member.parent_group is None
+            assert engine.node_manager.get_node_by_name(orphan.name) is orphan
+            harness.record("subflow_delete_recovers_after_ungrouped_nodes_moved_to_safety")
+
+            # Failure while resolving the SDK's group type must not strand the
+            # deletion reservation or prevent a subsequent ordinary delete.
+            import builtins
+            group, member = make_subflow("missing sdk group")
+            original_import = builtins.__import__
+            def reject_group_import(name, *args, **kwargs):
+                if name == "griptape_nodes.exe_types.node_groups.subflow_node_group":
+                    raise ImportError("synthetic missing SDK group API")
+                return original_import(name, *args, **kwargs)
+            before = snapshot(engine)
+            with mock.patch.object(builtins, "__import__", side_effect=reject_group_import):
+                result = await engine.ahandle_request(DeleteNodeRequest(node_name=group.name, broadcast_result=False))
+            assert not result.succeeded() and snapshot(engine) == before
+            handler_barrier = getattr(manager, guard.HANDLER_BARRIER_ATTRIBUTE)
+            assert not handler_barrier.deleting and not handler_barrier.deleting_flows
+            assert (await engine.ahandle_request(DeleteNodeRequest(node_name=group.name, broadcast_result=False))).succeeded()
+            assert member.parent_group is None
+            harness.record("subflow_sdk_import_failure_releases_delete_reservation")
+
+            pending = create("checked pending")
+            receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[pending.name]))
+            entered, finish = asyncio.Event(), asyncio.Event()
+            original_cancel = engine.node_manager.cancel_conditionally
+            async def pending_cancel(*args, **kwargs):
+                entered.set()
+                await finish.wait()
+                return await original_cancel(*args, **kwargs)
+            with mock.patch.object(engine.node_manager, "cancel_conditionally", pending_cancel):
+                first_delete = asyncio.create_task(engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
+                    node_name=pending.name, check_token=receipt.check_token, broadcast_result=False)))
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                for _ in range(2):
+                    duplicate = await engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
+                        node_name=pending.name, check_token=receipt.check_token, broadcast_result=False))
+                    assert not duplicate.succeeded() and pending.deleted_calls == 0
+                finish.set()
+                assert (await asyncio.wait_for(first_delete, timeout=5)).succeeded()
+            assert pending.deleted_calls == 1
+            harness.record("rejected_duplicate_cannot_release_another_checked_request_lease")
+
+            failed_native = create("checked native failure")
+            receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[failed_native.name]))
+            with mock.patch.object(failed_native, "after_node_deleted", side_effect=ValueError("isolated failure")) as callback:
+                refused = await engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
+                    node_name=failed_native.name, check_token=receipt.check_token, broadcast_result=False))
+                assert not refused.succeeded() and callback.call_count == 1
+                refused_again = await engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
+                    node_name=failed_native.name, check_token=receipt.check_token, broadcast_result=False))
+                assert not refused_again.succeeded() and callback.call_count == 1
+            harness.send(engine, DeleteNodeRequest(node_name=failed_native.name))
+            harness.record("checked_receipt_is_not_retried_after_native_failure")
+
+            # A later hook can add a connection after the original preflight.
+            # The final handler check must see it before deletion begins.
+            late_source, late_target = create("late source"), create("late target")
+            late_results = []
+            def late_connection(request, context):
+                if isinstance(request, DeleteNodeRequest) and request.node_name == late_source.name:
+                    late_results.append(engine.handle_request(CreateConnectionRequest(
+                        source_node_name=late_source.name, source_parameter_name="output",
+                        target_node_name=late_target.name, target_parameter_name="input",
+                        initial_setup=True, broadcast_result=False)))
+                return None
+            manager.add_pre_dispatch_hook(late_connection)
+            try:
+                late_delete = await engine.ahandle_request(DeleteNodeRequest(
+                    node_name=late_source.name, broadcast_result=False))
+            finally:
+                manager.remove_pre_dispatch_hook(late_connection)
+            assert len(late_results) == 1 and late_results[0].succeeded()
+            assert not late_delete.succeeded() and guard.CODE in str(late_delete.result_details)
+            assert late_source.name in engine.node_manager._name_to_parent_flow_name
+            assert guard.connected_targets(engine, [late_source.name])[late_source.name] == [late_target.name]
+            harness.record("connection_added_after_preflight_denied_at_handler")
+
+            # A foreign replacement of pre-dispatch cannot bypass the final
+            # handler; ownership loss fails closed and the graph stays intact.
+            before_foreign_bypass = snapshot(engine)
+            original_dispatch = manager._run_pre_dispatch_hooks
+            manager._run_pre_dispatch_hooks = lambda request, context: None
+            try:
+                assert not guard.protection_readiness(engine)[0]
+                foreign_bypass = await engine.ahandle_request(DeleteNodeRequest(
+                    node_name=source.name, broadcast_result=False))
+                assert not foreign_bypass.succeeded()
+                assert "HMB_DELETE_GUARD_NOT_READY" in str(foreign_bypass.result_details)
+            finally:
+                manager._run_pre_dispatch_hooks = original_dispatch
+            assert snapshot(engine) == before_foreign_bypass
+            harness.record("nondelegating_hook_replacement_denied_at_handler")
+
+            direct_source, direct_target = create("direct source"), create("direct target")
+            wire(direct_source, direct_target)
+            before_direct = snapshot(engine)
+            direct = await engine.node_manager.on_delete_node_request(
+                DeleteNodeRequest(node_name=direct_source.name, broadcast_result=False))
+            assert not direct.succeeded() and guard.CODE in str(direct.result_details)
+            assert snapshot(engine) == before_direct
+            harness.record("direct_manager_delete_denied_at_handler")
+
+            # A native delete can await cancellation after the handler check.
+            # A connection to its reserved HMB node must fail while that await
+            # is active; unrelated connections remain available.
+            for direct_create in (False, True):
+                await_source, await_target = create("await source"), create("await target")
+                other_source, other_target = create("other source"), create("other target")
+                original_cancel = engine.node_manager.cancel_conditionally
+                observed = []
+                async def cancel_with_connection(*args, **kwargs):
+                    await asyncio.sleep(0)
+                    request = CreateConnectionRequest(
+                        source_node_name=await_source.name, source_parameter_name="output",
+                        target_node_name=await_target.name, target_parameter_name="input",
+                        initial_setup=True, broadcast_result=False)
+                    observed.append(engine.flow_manager.on_create_connection_request(request)
+                                    if direct_create else engine.handle_request(request))
+                    observed.append(engine.handle_request(CreateConnectionRequest(
+                        source_node_name=other_source.name, source_parameter_name="output",
+                        target_node_name=other_target.name, target_parameter_name="input",
+                        initial_setup=True, broadcast_result=False)))
+                    return await original_cancel(*args, **kwargs)
+                with mock.patch.object(engine.node_manager, "cancel_conditionally", cancel_with_connection):
+                    outcome = await engine.ahandle_request(DeleteNodeRequest(
+                        node_name=await_source.name, broadcast_result=False))
+                assert len(observed) == 2 and not observed[0].succeeded() and observed[1].succeeded()
+                assert "HMB_DELETE_IN_PROGRESS" in str(observed[0].result_details)
+                assert outcome.succeeded() and await_source.name not in engine.node_manager._name_to_parent_flow_name
+                assert guard.connected_targets(engine, [other_source.name])[other_source.name] == [other_target.name]
+                harness.record("wire_connection_during_delete_await_denied_" + ("direct" if direct_create else "request"))
+
+            # No reservation may leak if a native delete callback raises.
+            failure_source, failure_target = create("failure source"), create("failure target")
+            async def cancelled_with_error(*args, **kwargs):
+                await asyncio.sleep(0)
+                raise RuntimeError("synthetic deletion error")
+            with mock.patch.object(engine.node_manager, "cancel_conditionally", cancelled_with_error):
+                try:
+                    await engine.node_manager.on_delete_node_request(DeleteNodeRequest(
+                        node_name=failure_source.name, broadcast_result=False))
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("synthetic error did not propagate")
+            assert failure_source.name not in getattr(manager, guard.HANDLER_BARRIER_ATTRIBUTE).deleting
+            wire(failure_source, failure_target)
+            assert guard.connected_targets(engine, [failure_source.name])[failure_source.name] == [failure_target.name]
+            harness.record("wire_reservation_released_on_delete_error")
+
+            # Cooperative remote writers use the same flow reservation as the
+            # delete handler, with neither lock held across SDK async work.
+            remote_source, remote_target = create("changing remote source"), create("changing remote target")
+            original_cancel = engine.node_manager.cancel_conditionally
+            remote_results = []
+            async def cancel_with_cooperative_binding(*args, **kwargs):
+                await asyncio.sleep(0)
+                try:
+                    with guard.binding_mutation(remote_target):
+                        remote_source.subscription = subscription("image_asset", "race-channel")
+                        remote_target.subscription = subscription("video_picker", "race-channel")
+                except RuntimeError as exc:
+                    remote_results.append(str(exc))
+                return await original_cancel(*args, **kwargs)
+            with mock.patch.object(engine.node_manager, "cancel_conditionally", cancel_with_cooperative_binding):
+                result = await engine.ahandle_request(DeleteNodeRequest(
+                    node_name=remote_source.name, broadcast_result=False))
+            assert result.succeeded() and len(remote_results) == 1 and "HMB_DELETE_IN_PROGRESS" in remote_results[0]
+            assert remote_target.subscription is None
+            harness.record("cooperative_remote_mutation_during_delete_is_denied")
+
+            writer_source = create("active remote writer")
+            before_writer = snapshot(engine)
+            with guard.binding_mutation(writer_source):
+                outcome = await engine.ahandle_request(DeleteNodeRequest(
+                    node_name=writer_source.name, broadcast_result=False))
+            assert not outcome.succeeded() and "HMB_CONNECTION_IN_PROGRESS" in str(outcome.result_details)
+            assert snapshot(engine) == before_writer
+            harness.record("active_remote_mutation_denies_delete_before_mutation")
+
+            destination = harness.send(engine, CreateFlowRequest(
+                parent_flow_name=flow, flow_name="Reservation destination", set_as_new_context=False)).flow_name
+            moving_node = create("binding moving node")
+            with guard.binding_mutation(moving_node):
+                move = engine.handle_request(MoveNodeToNewFlowRequest(
+                    node_name=moving_node.name, target_flow_name=destination, broadcast_result=False))
+                assert not move.succeeded() and "HMB_CONNECTION_IN_PROGRESS" in str(move.result_details)
+            assert engine.node_manager.get_node_parent_flow_by_name(moving_node.name) == flow
+            move = engine.handle_request(MoveNodeToNewFlowRequest(
+                node_name=moving_node.name, target_flow_name=destination, broadcast_result=False))
+            assert move.succeeded() and engine.node_manager.get_node_parent_flow_by_name(moving_node.name) == destination
+            harness.record("flow_move_serialized_with_binding_mutation")
+
+            moving_source, moving_peer = create("deleting while move"), create("move while deleting")
+            original_cancel = engine.node_manager.cancel_conditionally
+            move_results = []
+            async def cancel_with_move(*args, **kwargs):
+                await asyncio.sleep(0)
+                move_results.append(engine.handle_request(MoveNodeToNewFlowRequest(
+                    node_name=moving_peer.name, target_flow_name=destination, broadcast_result=False)))
+                return await original_cancel(*args, **kwargs)
+            with mock.patch.object(engine.node_manager, "cancel_conditionally", cancel_with_move):
+                outcome = await engine.ahandle_request(DeleteNodeRequest(node_name=moving_source.name, broadcast_result=False))
+            assert outcome.succeeded() and len(move_results) == 1 and not move_results[0].succeeded()
+            assert "HMB_CONNECTION_IN_PROGRESS" in str(move_results[0].result_details)
+            assert engine.node_manager.get_node_parent_flow_by_name(moving_peer.name) == flow
+            harness.record("flow_move_denied_during_delete_await")
+
+            rename_node = create("rename mutation node")
+            with guard.binding_mutation(rename_node):
+                rename = engine.handle_request(RenameObjectRequest(object_name=rename_node.name,
+                    requested_name="renamed mutation node", broadcast_result=False))
+                assert not rename.succeeded() and "HMB_CONNECTION_IN_PROGRESS" in str(rename.result_details), (type(rename).__name__, rename.result_details)
+            assert rename_node.name == "rename mutation node"
+            rename = engine.handle_request(RenameObjectRequest(object_name=rename_node.name,
+                requested_name="renamed mutation node", broadcast_result=False))
+            assert rename.succeeded() and rename_node.name == "renamed mutation node"
+            harness.record("node_rename_serialized_with_binding_mutation")
+
+            renaming_source, renaming_peer = create("deleting during rename"), create("rename during deletion")
+            original_cancel = engine.node_manager.cancel_conditionally
+            rename_results = []
+            async def cancel_with_rename(*args, **kwargs):
+                await asyncio.sleep(0)
+                rename_results.append(engine.handle_request(RenameObjectRequest(object_name=renaming_peer.name,
+                    requested_name="should not be renamed", broadcast_result=False)))
+                return await original_cancel(*args, **kwargs)
+            with mock.patch.object(engine.node_manager, "cancel_conditionally", cancel_with_rename):
+                outcome = await engine.ahandle_request(DeleteNodeRequest(node_name=renaming_source.name, broadcast_result=False))
+            assert outcome.succeeded() and len(rename_results) == 1 and not rename_results[0].succeeded()
+            assert "HMB_CONNECTION_IN_PROGRESS" in str(rename_results[0].result_details)
+            assert renaming_peer.name == "rename during deletion"
+            harness.record("node_rename_denied_during_delete_await")
+
+            # A foreign wrapper must not be replaced or reported as ready.
+            current_wrapper = manager._run_pre_dispatch_hooks
+            def foreign_wrapper(request, context):
+                return current_wrapper(request, context)
+            manager._run_pre_dispatch_hooks = foreign_wrapper
+            try:
+                assert not guard.protection_readiness(engine)[0]
+                before_foreign = snapshot(engine)
+                foreign_result = engine.handle_request(DeleteNodeRequest(node_name=source.name))
+                assert not foreign_result.succeeded() and "HMB_DELETE_GUARD_NOT_READY" in str(foreign_result.result_details)
+                assert snapshot(engine) == before_foreign
+                try:
+                    guard.install_reentrant_barrier(engine)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("foreign wrapper was silently accepted")
+                assert manager._run_pre_dispatch_hooks is foreign_wrapper
+            finally:
+                manager._run_pre_dispatch_hooks = current_wrapper
+            assert guard.protection_readiness(engine)[0]
+            harness.record("foreign_hook_wrapper_is_not_replaced_and_readiness_fails_closed")
             readiness = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[source.name]))
             assert readiness.protection_ready is True and readiness.protection_version == 2
             assert readiness.readiness_error == "" and not readiness.can_delete
@@ -203,6 +805,45 @@ async def exercise(engine, _phase, out):
             remote.subscription = subscription("video_picker")
             await blocked(DeleteNodeRequest(node_name=publisher.name), "catalog_only_remote_authority_blocks_delete")
             await blocked(DeleteNodeRequest(node_name=remote.name), "catalog_only_remote_subscriber_blocks_delete")
+            for candidate in (publisher, remote):
+                nested_remote = []
+                def nested_remote_hook(request, context):
+                    if isinstance(request, GetNodeMetadataRequest):
+                        nested_remote.append(engine.handle_request(DeleteNodeRequest(node_name=candidate.name)))
+                    return None
+                manager.add_pre_dispatch_hook(nested_remote_hook)
+                before_remote = snapshot(engine)
+                try:
+                    assert engine.handle_request(GetNodeMetadataRequest(node_name=target.name)).succeeded()
+                finally:
+                    manager.remove_pre_dispatch_hook(nested_remote_hook)
+                assert len(nested_remote) == 1 and not nested_remote[0].succeeded()
+                assert guard.CODE in str(nested_remote[0].result_details)
+                assert snapshot(engine) == before_remote
+                harness.record("other_hook_reentrant_live_remote_blocks_" + candidate.name.replace(" ", "_"))
+
+            # Turning the gate unready must also block nested *unconnected*
+            # HMB deletion while retained HMB data remains in the engine.
+            nested_unready_node = create("nested unready node")
+            nested_unready = []
+            def unready_hook(request, context):
+                if isinstance(request, GetNodeMetadataRequest):
+                    nested_unready.append(engine.handle_request(DeleteNodeRequest(node_name=nested_unready_node.name)))
+                return None
+            manager.add_pre_dispatch_hook(unready_hook)
+            gate_ready_before = lifetime_gate.ready
+            lifetime_gate.ready = False
+            unready_snapshot = snapshot(engine)
+            try:
+                assert engine.handle_request(GetNodeMetadataRequest(node_name=target.name)).succeeded()
+            finally:
+                lifetime_gate.ready = gate_ready_before
+                manager.remove_pre_dispatch_hook(unready_hook)
+            assert len(nested_unready) == 1 and not nested_unready[0].succeeded()
+            assert "HMB_DELETE_GUARD_NOT_READY" in str(nested_unready[0].result_details)
+            assert snapshot(engine) == unready_snapshot
+            harness.send(engine, DeleteNodeRequest(node_name=nested_unready_node.name))
+            harness.record("unready_gate_blocks_reentrant_unconnected_until_ready")
             # Git Update can unregister the library while its retained graph
             # remains visible. This is not permission to remove wires/nodes.
             stable_handler = registration.deletion_handlers
@@ -218,6 +859,7 @@ async def exercise(engine, _phase, out):
             with mock.patch.object(bootstrap._Registration, "start_web_worker", lambda *a: None):
                 owner.before_library_nodes_loaded(schema, library)
             registration = next(iter(owner._registrations))
+            assert preexisting_owner_hook in manager._pre_dispatch_hooks
             assert registration.deletion_handlers is stable_handler
             assert registration.deletion_protection is lifetime_gate
             harness.record("retained_unload_gap_read_only_preflight_and_stable_reload")
@@ -456,7 +1098,7 @@ async def exercise(engine, _phase, out):
                     assert "HMB_DELETE_GUARD_RESTART_REQUIRED" in str(exc)
                 else:
                     raise AssertionError("A cached legacy helper was silently promoted to ready")
-                assert lifetime_gate.callback is callback and lifetime_gate.ready is False
+                assert lifetime_gate.callback is None and lifetime_gate.ready is False
                 assert guard.HMBCheckNodeDeletionRequest is check_type and registration.deletion_handlers is stable_handler
                 await blocked(DeleteNodeRequest(node_name=source.name), "cached_legacy_helper_retains_exact_backend_callback")
             with mock.patch.object(bootstrap._Registration, "start_web_worker", lambda *a: None):

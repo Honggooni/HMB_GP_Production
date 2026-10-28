@@ -19,6 +19,7 @@ import unicodedata
 import uuid
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.error import URLError
 from urllib.parse import quote, urlsplit
 
 from HMBFinishLookLibrary import (
@@ -28,6 +29,7 @@ from HMBFinishLookLibrary import (
     _shot_only, set_output,
 )
 from _hmb_color_lut import CODEC_EXTENSIONS, default_settings, normalize_settings, probe_source, export_video, write_cube
+from _hmb_deletion_guard import hmb_binding_mutation
 
 UI = "HMB_COLOR_LUT_UI_STATE"
 COMMAND = "HMB_COLOR_LUT_COMMAND"
@@ -143,6 +145,31 @@ def _upload_bridge(origin: str) -> Any:
     if bridge is None:
         raise ValueError("브로커 로그인이 필요합니다. Generator에서 로그인한 뒤 다시 확인하세요.")
     return bridge
+
+
+def _unknown_upload_reason(error: Exception) -> str:
+    """Explain the observed failure without exposing URL, token or response body.
+
+    A failed transport never proves the upload was absent. The user must still
+    retrieve the same idempotency key before sending any replacement.
+    """
+    # The Broker wraps HTTP transport and missing-token failures in its own
+    # exception types; inspect types/status only, never exception text.
+    try:
+        from HMBSeedanceGeneration import _BrokerAuthenticationError, _BrokerUnavailableError
+    except ImportError:
+        _BrokerAuthenticationError = _BrokerUnavailableError = ()
+    code = getattr(error, "status_code", None)
+    if code is None:
+        code = getattr(error, "code", None)
+    prefix = ("브로커 로그인이 만료되었습니다. 다시 로그인하세요. " if code == 401 else
+              "브로커 로그인이 필요합니다. 로그인한 뒤 다시 확인하세요. " if isinstance(error, _BrokerAuthenticationError) else
+              "브로커가 업로드 권한을 거부했습니다 (HTTP 403). " if code == 403 else
+              "브로커 서버 오류가 발생했습니다. " if type(code) is int and 500 <= code <= 599 else
+              f"브로커가 업로드 요청을 거부했습니다 (HTTP {code}). " if type(code) is int and 400 <= code <= 499 else
+              "브로커 연결이 끊겼거나 응답 시간이 초과되었습니다. "
+              if isinstance(error, (TimeoutError, ConnectionError, URLError)) or isinstance(error, _BrokerUnavailableError) else "")
+    return prefix + "동일 업로드 상태 확인이 필요합니다. 다시 누르면 새 업로드 없이 조회합니다."
 
 
 def _usage_bridge(origin: str) -> Any:
@@ -1170,7 +1197,7 @@ class HMBColorLUTLibrary(DataNode):
                     if (not self._hmb_node_deleted and self._upload_state_stamp(state) == self._upload_state_stamp(self._hmb_color_lut_state)
                             and (not context or context.get("source_token") == self._source_token and context.get("route_epoch") == self._web_upload_epoch)):
                         self._web_upload = {"enabled": bool(sent), "phase": "ready" if absent else "unknown" if sent else "unavailable",
-                                            "reason": "서버에 업로드가 없습니다. 다시 누르면 동일 ID로 업로드합니다." if absent else "동일 업로드 상태 확인이 필요합니다. 다시 누르면 새 업로드 없이 조회합니다." if sent else str(exc)}
+                                            "reason": "서버에 업로드가 없습니다. 다시 누르면 동일 ID로 업로드합니다." if absent else _unknown_upload_reason(exc) if sent else str(exc)}
             finally:
                 with _UPLOAD_LOCK:
                     if claimed:
@@ -1211,6 +1238,7 @@ class HMBColorLUTLibrary(DataNode):
         if callable(publish):
             publish("video_url", value)
 
+    @hmb_binding_mutation
     def _switch(self, shot: Any, project: str | None = None) -> None:
         self._remember_selection()
         if shot != self._hmb_color_lut_state["shot"]:
@@ -1240,6 +1268,7 @@ class HMBColorLUTLibrary(DataNode):
         if not shot.get("shot_uuid") and saved.get("source", {}).get("path"):
             self._queue_source(saved["source"])
 
+    @hmb_binding_mutation
     def _apply_ui(self, value: Any, *, initial_setup: bool = False) -> None:
         if not isinstance(value, Mapping):
             return
@@ -1961,6 +1990,7 @@ class HMBColorLUTLibrary(DataNode):
         if self._hmb_initial_shot_autoclaim_pending:
             self._hmb_initial_shot_preferred_uuid = str(shot_uuid or "")
 
+    @hmb_binding_mutation
     def _hmb_reconcile_shot_routing(self, snapshot: Any) -> None:
         catalog = _normalize_shot_catalog(snapshot, strict=True)
         with self._lock:
@@ -1979,6 +2009,7 @@ class HMBColorLUTLibrary(DataNode):
                 self._hmb_color_lut_state["revision"] += 1
         self._publish()
 
+    @hmb_binding_mutation
     def _hmb_clear_shot_routing_catalog(self, reason: str = "publisher_unavailable") -> dict[str, Any]:
         with self._lock:
             self._hmb_color_lut_state["shot_catalog"] = {}
@@ -2032,6 +2063,7 @@ class HMBColorLUTLibrary(DataNode):
             if not self._hmb_node_deleted and self._hydrated and not state["shot"].get("shot_uuid") and state["source"].get("path"):
                 self._queue_source(state["source"])
 
+    @hmb_binding_mutation
     def set_parameter_value(self, name: str, value: Any, *args: Any, **kwargs: Any) -> Any:
         lock = getattr(self, "_lock", None)
         if lock is None:
@@ -2064,6 +2096,7 @@ class HMBColorLUTLibrary(DataNode):
                 LOGGER.debug("Color LUT hydration discovery deferred", exc_info=True)
         return result
 
+    @hmb_binding_mutation
     def after_value_set(self, parameter: Any, value: Any) -> Any:
         # Wait for another thread\'s publication; only same-thread echoes may be skipped.
         with self._lock:

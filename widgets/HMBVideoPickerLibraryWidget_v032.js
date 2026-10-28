@@ -11302,6 +11302,54 @@ export function hmbShowPickerPreviewLoadFailure(container, messageText) {
   return true;
 }
 
+// An explicit retry of the current URL must reset its failed decoder. Normal
+// source staging intentionally leaves an unchanged URL alone.
+export function hmbRetryPickerViewportVideoSource(video, cleanupList, onReady, onFailure, ownsRequest = () => true) {
+  if (!video || typeof video.load !== "function") return false;
+  if (video.__hmbPickerOwnedReload) return true;
+  const owner = {};
+  const source = clean(video.getAttribute?.("src") || video.src);
+  const position = Math.max(0, Number(video.currentTime) || 0);
+  let disposed = false, timer = null;
+  const current = () => !disposed && video.__hmbPickerOwnedReload === owner && ownsRequest();
+  const restorePosition = () => {
+    if (!current()) return;
+    const duration = Number(video.duration);
+    try { video.currentTime = Number.isFinite(duration) && duration > 0 ? Math.min(position, duration) : position; } catch (_error) {}
+  };
+  const cleanup = () => {
+    if (disposed) return;
+    disposed = true;
+    if (timer !== null) clearTimeout(timer);
+    video.removeEventListener?.("loadedmetadata", restorePosition);
+    video.removeEventListener?.("loadeddata", ready);
+    video.removeEventListener?.("canplay", ready);
+    video.removeEventListener?.("error", failed);
+    if (video.__hmbPickerOwnedReload === owner) delete video.__hmbPickerOwnedReload;
+    if (video.__hmbPendingPickerVideoOwner === owner) {
+      delete video.__hmbPendingPickerVideoOwner;
+      if (clean(video.__hmbPendingPickerVideoSource) === source) delete video.__hmbPendingPickerVideoSource;
+    }
+    if (video.__hmbPickerCancelProbe === cleanup) delete video.__hmbPickerCancelProbe;
+  };
+  const ready = () => { const owned = current(); if (owned) restorePosition(); cleanup(); if (owned) onReady(); };
+  const failed = () => { const owned = current(); cleanup(); if (owned) onFailure(); };
+  video.__hmbPickerOwnedReload = owner;
+  // Reuse the existing source-stage ownership contract: a native pause queued
+  // by load() must not retire this request before its ready/error event.
+  video.__hmbPendingPickerVideoSource = source;
+  video.__hmbPendingPickerVideoOwner = owner;
+  video.__hmbPickerCancelProbe = cleanup;
+  video.addEventListener?.("loadedmetadata", restorePosition);
+  video.addEventListener?.("loadeddata", ready);
+  video.addEventListener?.("canplay", ready);
+  video.addEventListener?.("error", failed);
+  timer = setTimeout(failed, HMB_PICKER_VIDEO_PRELOAD_TIMEOUT_MS);
+  if (Array.isArray(cleanupList)) cleanupList.push(cleanup);
+  try { video.load(); } catch (_error) { failed(); }
+  return true;
+}
+
 export function hmbStagePickerViewportVideoSource(
   video,
   cleanupList,
@@ -13018,6 +13066,24 @@ function hmbNativeUiImplementation(container, props) {
       hmbClearVideoPickerSourceSwapPauseMarker(stagedVideo);
     }
     container.__hmbPickerPreviewRequestToken = requestToken;
+    if (restoreDesiredSource && stagedVideo && requestedUrl
+      && clean(stagedVideo.getAttribute?.("src")) === requestedUrl) {
+      const requestedShot = clean(currentWidgetState().active_picker_shot_uuid);
+      const ownsRetry = () => {
+        const live = currentWidgetState(), descriptor = hmbVideoPickerPreviewDescriptor(live, container);
+        return !disposed && Number(container.__hmbVideoPickerMountGeneration || 0) === pickerMountGeneration
+          && container.__hmbPickerPreviewRequestToken === requestToken
+          && container.querySelector("#picker-video") === stagedVideo
+          && clean(live.active_picker_shot_uuid) === requestedShot
+          && descriptor.kind === "video" && clean(descriptor.videoUid) === requestedUid
+          && clean(descriptor.url) === requestedUrl;
+      };
+      if (!stagedVideo.paused && !stagedVideo.ended) hmbRecordVideoPickerPauseDebt(stagedVideo, requestToken, requestedUrl);
+      markRequestedPreviewSwitchBusy();
+      return hmbRetryPickerViewportVideoSource(stagedVideo, activeCleanup,
+        () => completeRequestedPreviewSwitch(requestedUid, requestedUrl, requestToken),
+        () => failRequestedPreviewSwitch(requestedUid, requestToken), ownsRetry);
+    }
     if (
       restoreDesiredSource
       && stagedVideo
@@ -13047,6 +13113,7 @@ function hmbNativeUiImplementation(container, props) {
   const retryRequestedPreviewLoad = (event) => {
     event?.preventDefault?.();
     event?.stopPropagation?.();
+    if (disposed || retryPreviewLoad.disabled) return;
     const liveDescriptor = hmbVideoPickerPreviewDescriptor(currentWidgetState(), container);
     const retryUid = clean(liveDescriptor.videoUid);
     const retryUrl = clean(liveDescriptor.url);
@@ -16247,9 +16314,9 @@ function hmbAcquireNativeStockSafety(container) {
       notice.setAttribute("data-hmb-native-safety-notice", "required");
       notice.setAttribute("role", "alert");
       Object.assign(notice.style, { position: "fixed", zIndex: "2147483647", right: "20px", bottom: "64px", maxWidth: "420px", padding: "18px", border: "1px solid #b89458", borderRadius: "18px", background: "#151c29", color: "#f8fafc", font: "13px/1.6 system-ui,sans-serif", boxShadow: "0 8px 32px #0008" });
-      const title = doc.createElement("strong"); title.textContent = "HMB 업데이트 상태 확인이 필요합니다";
+      const title = doc.createElement("strong"); title.textContent = "HMB 편집기·삭제 보호 확인이 필요합니다";
       const text = doc.createElement("p");
-      text.textContent = "Override 업데이트 로그에서 current/applied 확인 → 작업 저장 → Griptape 완전 종료 → 재시작 후 다시 확인하세요. current/applied는 디스크 파일 상태이며 현재 화면의 통합 상태를 보장하지 않습니다. 실패 또는 상태 확인 불가 시 HMB 업데이트 로그의 원인을 확인하세요. 최신 UI와 엔진 보호가 확인되기 전까지 HMB 노드 삭제를 일시 중단하며, 연결된 노드는 계속 보호됩니다.";
+      text.textContent = "Override 업데이트 로그에서 current/applied를 확인하세요. UI 또는 엔진 보호 상태를 확인하지 못해 감지된 HMB 노드 삭제 시도를 중단했습니다. 작업 저장 후 Griptape 완전 종료·재시작하세요. current/applied는 디스크 파일 상태이며 현재 화면의 통합 상태를 보장하지 않습니다. 실패 시 로그의 원인을 확인하세요. 이 안내만으로 다른 삭제 경로의 엔진 보호가 준비됐다고 보장할 수 없습니다.";
       const close = doc.createElement("button"); close.type = "button"; close.textContent = "확인";
       Object.assign(close.style, { border: "1px solid #64748b", borderRadius: "999px", background: "#243044", color: "#f8fafc", padding: "6px 18px", cursor: "pointer" });
       close.addEventListener("click", dismiss); notice.append(title, text, close); doc.body.append(notice); close.focus();
@@ -16281,8 +16348,8 @@ function hmbAcquireNativeStockSafety(container) {
       if (badge?.isConnected || !doc.body) return;
       badge = doc.createElement("button"); badge.type = "button";
       badge.setAttribute("data-hmb-native-safety-status", "required");
-      badge.setAttribute("aria-label", "HMB Override 업데이트 및 재시작 안내");
-      badge.textContent = "HMB 업데이트 확인 · 안전 삭제 보호 중";
+      badge.setAttribute("aria-label", "HMB Override 업데이트·재시작 및 삭제 보호 상태 확인");
+      badge.textContent = "HMB UI·삭제 보호 상태 확인";
       Object.assign(badge.style, { position: "fixed", zIndex: "2147483646", right: "20px", bottom: "20px", border: "1px solid #b89458", borderRadius: "999px", padding: "7px 14px", background: "#151c29", color: "#f5d49a", font: "12px system-ui,sans-serif", cursor: "pointer", boxShadow: "0 4px 18px #0006" });
       badge.addEventListener("click", show); doc.body.append(badge);
     };

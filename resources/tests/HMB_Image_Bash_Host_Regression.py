@@ -54,8 +54,8 @@ def png_bytes(image):
 async def exercise(engine, directory):
     from PIL import Image
     import HMBImageBash as target
-    from griptape_nodes.exe_types.core_types import ParameterMode
-    from griptape_nodes.exe_types.node_types import NodeResolutionState
+    from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
+    from griptape_nodes.exe_types.node_types import DataNode, NodeResolutionState
     from griptape_nodes.files.file import File
     from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
     from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
@@ -63,7 +63,8 @@ async def exercise(engine, directory):
     from griptape_nodes.retained_mode.events.flow_events import (
         DeleteFlowRequest, DeserializeFlowFromCommandsRequest, SerializeFlowToCommandsRequest,
     )
-    from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
+    from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, DeleteNodeRequest
+    from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, DeleteConnectionRequest
     from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
     from griptape_nodes.retained_mode.events.workflow_events import SaveWorkflowFileFromSerializedFlowRequest
 
@@ -74,16 +75,47 @@ async def exercise(engine, directory):
         definition = deepcopy(document["nodes"][0])
         definition.update(class_name="HMBImageBash", file_path="HMBImageBash.py")
         document["nodes"].append(definition)
+    probe_definition = deepcopy(document["nodes"][0])
+    probe_definition.update(class_name="HMBApplyProbe", file_path="HMBImageBash.py")
+    document["nodes"].append(probe_definition)
     schema = LibrarySchema.model_validate(document)
     library = LibraryRegistry.generate_new_library(schema)
     definition = next(row for row in schema.nodes if row.class_name == "HMBImageBash")
     library.register_lazy_node_type("HMBImageBash", definition.metadata, lambda: target.HMBImageBash)
+    class ApplyProbe(DataNode):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.events = []
+            self.change_hook = None
+            self.add_parameter(Parameter(name="image", type="ImageUrlArtifact", input_types=["ImageUrlArtifact"], allowed_modes={ParameterMode.INPUT}))
+            self.add_parameter(ParameterList(name="images", type="ImageArtifact", tooltip="Synthetic list input", input_types=["ImageUrlArtifact"], allowed_modes={ParameterMode.INPUT}))
+        def after_value_set(self, parameter, value):
+            if parameter.name == "image" or parameter.name.startswith("images"):
+                self.events.append((parameter.name, target._url(value)))
+                if callable(self.change_hook):
+                    callback, self.change_hook = self.change_hook, None
+                    callback()
+            return super().after_value_set(parameter, value)
+        def process(self):
+            raise AssertionError("Apply propagation must never execute its target")
+    probe_metadata = next(row.metadata for row in schema.nodes if row.class_name == "HMBApplyProbe")
+    library.register_lazy_node_type("HMBApplyProbe", probe_metadata, lambda: ApplyProbe)
     engine.event_manager.initialize_queue()
     ensured = send(engine, EnsureWorkflowAndFlowRequest(display_name="Synthetic Image Bash SDK",
                                                        flow_name="ImageBashSDKRegression"))
     created = send(engine, CreateNodeRequest(node_type="HMBImageBash", node_name="Synthetic Image Bash",
         specific_library_name=schema.name, initial_setup=True, create_error_proxy_on_failure=False))
     node = engine.node_manager.get_node_by_name(created.node_name)
+    scalar_created = send(engine, CreateNodeRequest(node_type="HMBApplyProbe", node_name="Apply Scalar Sink",
+        specific_library_name=schema.name, initial_setup=True, create_error_proxy_on_failure=False))
+    scalar_sink = engine.node_manager.get_node_by_name(scalar_created.node_name)
+    list_created = send(engine, CreateNodeRequest(node_type="HMBApplyProbe", node_name="Apply List Sink",
+        specific_library_name=schema.name, initial_setup=True, create_error_proxy_on_failure=False))
+    list_sink = engine.node_manager.get_node_by_name(list_created.node_name)
+    list_child = list_sink.get_parameter_by_name("images").add_child_parameter().name
+    for sink, parameter in ((scalar_sink, "image"), (list_sink, list_child)):
+        send(engine, CreateConnectionRequest(source_node_name=node.name, source_parameter_name="output_image",
+            target_node_name=sink.name, target_parameter_name=parameter, initial_setup=True))
 
     def set_value(name, value, *, owner=None, initial=False):
         current = node if owner is None else owner
@@ -119,6 +151,8 @@ async def exercise(engine, directory):
         set_value("width", 4)
         set_value("height", 2)
         set_value("background_color", "#ffffff")
+        output_path = directory / "run-output.png"
+        set_value("output_file", str(output_path))
         source_a, source_b, brush_path = (directory / leaf for leaf in ("source-a.png", "source-b.png", "brush.png"))
         Image.new("RGBA", (2, 2), (255, 0, 0, 255)).save(source_a)
         Image.new("RGBA", (2, 2), (0, 0, 255, 128)).save(source_b)
@@ -173,20 +207,144 @@ async def exercise(engine, directory):
         project["value"] = "data:image/png;base64," + base64.b64encode(applied_png).decode("ascii")
         project["name"] = "Synthetic browser-shaped Apply fixture"
         set_value("bash_image", project)
+        await asyncio.sleep(.05)
+        assert output_path.read_bytes() == applied_png
+        assert File(node.parameter_output_values["output_image"].value).read_bytes() == applied_png
+        assert File(target._url(scalar_sink.get_parameter_value("image"))).read_bytes() == applied_png
+        assert File(target._url(list_sink.get_parameter_value(list_child))).read_bytes() == applied_png
         committed = deepcopy(node.get_parameter_value("bash_image"))
         receipt = committed["meta"]["hmb_image_bash"]["apply"]
         assert receipt["png_sha256"] == hashlib.sha256(applied_png).hexdigest()
+        assert committed["meta"]["hmb_image_bash"]["workspace_id"] == context["workspace_id"]
+        assert committed["meta"]["hmb_image_bash"]["workspace_revision"] == context["revision"]
+        assert committed["meta"]["hmb_image_bash"]["node_instance_uuid"] == node._remote_source_instance(node)
         assert len(committed["meta"]["konva_json"]["images"]) == 4
         assert committed["meta"]["viewport"] == project["meta"]["viewport"]
         assert committed["meta"]["konva_json"]["images"][-1] == brush
-        output_path = directory / "run-output.png"
-        set_value("output_file", str(output_path))
+        # Reject before the SDK stores the incoming value. Neither a stale
+        # modal nor malformed bindings may overwrite the approved receipt.
+        def rejected_apply(candidate, label):
+            before = deepcopy(node.get_parameter_value("bash_image"))
+            output = deepcopy(node.parameter_output_values.get("output_image"))
+            verification = deepcopy(node.get_parameter_value("HMB_BASH_VERIFICATION"))
+            files = {path.name:path.read_bytes() for path in directory.glob("run-output*.png")}
+            epoch, generation = node._hmb_apply_epoch, node._hmb_output_generation
+            result = engine.handle_request(SetParameterValueRequest(node_name=node.name,
+                parameter_name="bash_image", value=candidate, broadcast_result=False))
+            assert not result.succeeded(), label
+            assert "Apply" in str(result.result_details), (label, result.result_details)
+            assert node.get_parameter_value("bash_image") == before, label
+            assert node.parameter_output_values.get("output_image") == output, label
+            assert node.get_parameter_value("HMB_BASH_VERIFICATION") == verification, label
+            assert (node._hmb_apply_epoch, node._hmb_output_generation) == (epoch, generation), label
+            assert {path.name:path.read_bytes() for path in directory.glob("run-output*.png")} == files, label
+        for label, bindings in (("missing original", committed["meta"]["hmb_image_bash"]["source_bindings"][:-1]),
+                ("duplicate original", committed["meta"]["hmb_image_bash"]["source_bindings"] * 2),
+                ("malformed original", None), ("invalid original uid", [{"source_uid": ""}])):
+            invalid = deepcopy(committed)
+            invalid["meta"]["created_at"] += "-" + label
+            invalid["meta"]["hmb_image_bash"]["source_bindings"] = bindings
+            rejected_apply(invalid, label)
+        for key, bad_value in (("workspace_id", "other-workspace"), ("channel_uuid", "other-channel"),
+                ("node_instance_uuid", "replaced-node"), ("workspace_revision", context["revision"] - 1),
+                ("workspace_revision", context["revision"] + 1), ("workspace_revision", True)):
+            invalid = deepcopy(committed)
+            invalid["meta"]["created_at"] += "-stale-" + key
+            invalid["meta"]["hmb_image_bash"][key] = bad_value
+            rejected_apply(invalid, key)
+        partial = deepcopy(committed)
+        partial["meta"]["created_at"] += "-partial-scope"
+        partial["meta"]["hmb_image_bash"].pop("node_instance_uuid")
+        rejected_apply(partial, "partial scope cannot bypass as legacy")
+        target.HMBImageBash._validate_apply_source_bindings({"meta": {}}, [])
+        target.HMBImageBash._validate_apply_source_bindings(
+            {"meta": {"hmb_image_bash": {"source_bindings": []}}}, [])
+        # Inputs may reach Python before their UI notification. Hold only scene
+        # synchronization to reproduce that ordering with real SDK setters.
+        with mock.patch.object(node, "_sync_metadata_with_input_images"):
+            late_context = deepcopy(context)
+            late_context["records"].append({**records[0], "source_uid": "fixture-late-original"})
+            late_context["revision"] += 1
+            set_inputs(late_context["records"])
+            set_value("image_bash_context", late_context)
+            stale = deepcopy(committed)
+            stale["meta"]["created_at"] += "-late-input"
+            rejected_apply(stale, "late source arrived before UI event")
+            children = list(node.get_parameter_by_name("input_images").get_child_parameters())
+            set_value(children[-1].name, None)
+            set_inputs(records)
+            set_value("image_bash_context", context)
+        assert node._records() == records
+        assert node.get_parameter_value("bash_image") == committed
+        print("PASS source UID fence rejects stale/malformed Apply before SDK mutation and preserves approved scene, receipt, PNG and outputs; legacy empty source set remains valid", flush=True)
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.events.os_events import WriteFileRequest
+        old_output = node.parameter_output_values["output_image"]
+        old_events = (len(scalar_sink.events), len(list_sink.events))
+        old_files = {path.name:path.read_bytes() for path in directory.glob("run-output*.png")}
+        original_handle = GriptapeNodes.handle_request
+        def fail_apply_save(request, *args, **kwargs):
+            if isinstance(request, WriteFileRequest):
+                return mock.Mock(succeeded=lambda: False, result_details="synthetic denied save")
+            return original_handle(request, *args, **kwargs)
+        failed_save = deepcopy(committed)
+        failed_save["meta"]["created_at"] = "2026-10-23T01:01:01.001Z-failed-save"
+        with mock.patch.object(GriptapeNodes, "handle_request", side_effect=fail_apply_save):
+            set_value("bash_image", failed_save)
+            await asyncio.sleep(.05)
+        assert node.parameter_output_values["output_image"] == old_output
+        assert (len(scalar_sink.events), len(list_sink.events)) == old_events
+        assert {path.name:path.read_bytes() for path in directory.glob("run-output*.png")} == old_files
+        assert "실패" in node.get_parameter_value("HMB_BASH_STATUS")
+        list_child_events = lambda: [row for row in list_sink.events if row[0] == list_child]
+        scalar_events, list_events = len(scalar_sink.events), len(list_child_events())
+        next_apply = deepcopy(committed)
+        next_apply["meta"]["created_at"] = "2026-10-23T01:01:01.001Z-reapply"
+        with mock.patch.object(target, "_busy", side_effect=lambda candidate: candidate is scalar_sink):
+            set_value("bash_image", next_apply)
+            await asyncio.sleep(.05)
+        assert len(scalar_sink.events) == scalar_events, (scalar_sink.events[scalar_events:], node._hmb_output_pending)
+        assert len(list_child_events()) == list_events + 1 and list_child_events()[-1][1]
+        assert "연결된 입력" in node.get_parameter_value("HMB_BASH_STATUS")
+        delayed_files = {path.name:path.read_bytes() for path in directory.glob("run-output*.png")}
+        node.process()
+        assert len(scalar_sink.events) == scalar_events + 1 and scalar_sink.events[-1][1]
+        assert len(list_child_events()) == list_events + 1
+        assert {path.name:path.read_bytes() for path in directory.glob("run-output*.png")} == delayed_files
+        committed = deepcopy(node.get_parameter_value("bash_image"))
+        receipt = committed["meta"]["hmb_image_bash"]["apply"]
+        output_path = Path(File(node.parameter_output_values["output_image"].value).resolve())
+        # The first target may remove a later edge during its own callback.
+        # That later snapshot must not receive the new Apply.
+        list_event_start = len(list_child_events())
+        def remove_list_edge():
+            send(engine, DeleteConnectionRequest(source_node_name=node.name, source_parameter_name="output_image",
+                target_node_name=list_sink.name, target_parameter_name=list_child))
+        scalar_sink.change_hook = remove_list_edge
+        edge_apply = deepcopy(committed)
+        edge_apply["meta"]["created_at"] = "2026-10-23T01:01:01.001Z-edge-change"
+        set_value("bash_image", edge_apply)
+        await asyncio.sleep(.05)
+        new_output_url = target._url(node.parameter_output_values["output_image"])
+        assert all(row[1] != new_output_url for row in list_child_events()[list_event_start:])
+        assert node._hmb_output_pending
+        send(engine, CreateConnectionRequest(source_node_name=node.name, source_parameter_name="output_image",
+            target_node_name=list_sink.name, target_parameter_name=list_child, initial_setup=True))
+        node.process()
+        committed = deepcopy(node.get_parameter_value("bash_image"))
+        receipt = committed["meta"]["hmb_image_bash"]["apply"]
+        output_path = Path(File(node.parameter_output_values["output_image"].value).resolve())
+        before_echo = {path.name: path.read_bytes() for path in directory.glob("run-output*.png")}
+        before_echo_events = (len(scalar_sink.events), len(list_sink.events))
         # SDK hydration can materialize a different root JsonArtifact object.
         # Envelope identity is not layer/source identity or authored pixels.
         materialized = deepcopy(committed)
         materialized["id"] = "0123456789abcdef0123456789abcdef"
         materialized["reference"] = "synthetic-sdk-envelope-reference"
         set_value("bash_image", materialized)
+        assert {path.name: path.read_bytes() for path in directory.glob("run-output*.png")} == before_echo
+        assert (len(scalar_sink.events), len(list_sink.events)) == before_echo_events
+        assert File(node.parameter_output_values["output_image"].value).read_bytes() == applied_png
         assert node.get_parameter_value("bash_image")["meta"]["hmb_image_bash"]["apply"] == receipt
         assert node.get_parameter_value("bash_image")["meta"]["konva_json"] == committed["meta"]["konva_json"]
         committed = deepcopy(node.get_parameter_value("bash_image"))
@@ -318,6 +476,7 @@ async def exercise(engine, directory):
         reversed_context["revision"] += 1
         set_inputs(reversed_context["records"])
         set_value("image_bash_context", reversed_context)
+        await asyncio.sleep(.05)
         reordered = node.get_parameter_value("bash_image")
         assert {layer["id"]: (layer["x"], layer["y"], layer["opacity"])
                 for layer in reordered["meta"]["konva_json"]["images"]} == before_positions
@@ -327,6 +486,7 @@ async def exercise(engine, directory):
         reapplied = deepcopy(reordered)
         reapplied["meta"]["created_at"] = "2026-10-23T01:02:02.002Z"
         set_value("bash_image", reapplied)
+        await asyncio.sleep(.05)
         committed = deepcopy(node.get_parameter_value("bash_image"))
 
         # The advanced flag can only publish after the corrected metadata
@@ -340,7 +500,7 @@ async def exercise(engine, directory):
             assert "Apply" in str(exc) and "픽셀" in str(exc), str(exc)
         else:
             raise AssertionError("Advanced Run published a render with different pixels than Apply")
-        assert node.parameter_output_values.get("output_image") is None
+        assert File(node.parameter_output_values["output_image"].value).read_bytes() == applied_png
         assert output_path.read_bytes() == original_output
 
         # Independently calculated source-over pixels: blue alpha128 over
@@ -383,6 +543,7 @@ async def exercise(engine, directory):
                 record["url"] = str(replacement)
         set_inputs(replaced_context["records"])
         set_value("image_bash_context", replaced_context)
+        await asyncio.sleep(.05)
         stale_modal["meta"]["created_at"] = "2026-10-23T01:04:04.004Z"
         failed_apply = engine.handle_request(SetParameterValueRequest(node_name=node.name,
             parameter_name="bash_image", value=stale_modal, broadcast_result=False))
@@ -407,10 +568,16 @@ async def exercise(engine, directory):
         node.process()
         output_path = Path(File(node.parameter_output_values["output_image"].value).resolve())
         assert output_path.read_bytes() == applied_png
+        committed = deepcopy(node.get_parameter_value("bash_image"))
+        receipt = committed["meta"]["hmb_image_bash"]["apply"]
         print("PASS source URL changes while editor is open reject stale Apply; synchronized scene accepts one refreshed Apply", flush=True)
 
         # Native save captures the authoritative receipt/embedded PNG. Delete
         # the graph, create a fresh node from native commands, then Run again.
+        # These in-memory synthetic sink types are not installed library types;
+        # they validate real SDK propagation above, not workflow persistence.
+        send(engine, DeleteNodeRequest(node_name=scalar_sink.name))
+        send(engine, DeleteNodeRequest(node_name=list_sink.name))
         serialized = send(engine, SerializeFlowToCommandsRequest(flow_name=ensured.flow_name,
             include_create_flow_command=True)).serialized_flow_commands
         save_path = directory / "synthetic-image-bash-workflow.py"
@@ -422,6 +589,7 @@ async def exercise(engine, directory):
         compile(tree, str(save_path), "exec")
         assert receipt["png_base64"] in save_path.read_text(encoding="utf-8")
         old_node = node
+        before_reopen_files = {path.name: path.read_bytes() for path in directory.glob("run-output*.png")}
         send(engine, DeleteFlowRequest(flow_name=ensured.flow_name))
         reopened = await engine.ahandle_request(DeserializeFlowFromCommandsRequest(
             serialized_flow_commands=serialized, broadcast_result=False))
@@ -429,9 +597,31 @@ async def exercise(engine, directory):
         flow = engine.flow_manager.get_flow_by_name(reopened.flow_name)
         node = flow.nodes[created.node_name]
         assert node is not old_node
+        await asyncio.sleep(.05)
         restored_project = node.get_parameter_value("bash_image")
         assert restored_project == committed, (restored_project, committed)
         assert node.get_parameter_value("comp_on_run") is False
+        assert {path.name: path.read_bytes() for path in directory.glob("run-output*.png")} == before_reopen_files
+        assert File(node.parameter_output_values["output_image"].value).read_bytes() == applied_png
+        # Missing approved local output during restoration must never be
+        # recreated silently, and must retain the authored receipt.
+        missing_path = Path(restored_project["meta"]["hmb_image_bash"]["apply"]["output_path"])
+        parked_path = missing_path.with_suffix(".parked")
+        missing_path.rename(parked_path)
+        try:
+            node._clear_output_now()
+            node._hmb_restore_pending = True
+            node._schedule_restore()
+            await asyncio.sleep(.05)
+            assert not missing_path.exists()
+            assert node.get_parameter_value("bash_image")["meta"]["hmb_image_bash"]["apply"] == restored_project["meta"]["hmb_image_bash"]["apply"]
+            assert node.parameter_output_values.get("output_image") is None
+            assert "파일" in node.get_parameter_value("HMB_BASH_STATUS")
+        finally:
+            parked_path.rename(missing_path)
+        node._sync_metadata_with_input_images()
+        await asyncio.sleep(.05)
+        assert File(node.parameter_output_values["output_image"].value).read_bytes() == applied_png
         node.process()
         verified_output = File(node.parameter_output_values["output_image"].value)
         assert verified_output.read_bytes() == applied_png
@@ -452,6 +642,9 @@ async def exercise(engine, directory):
         saved_files = {path.name: path.read_bytes() for path in directory.glob("run-output*.png")}
         set_value("image_bash_context", unavailable)
         assert node.get_parameter_value("bash_image") == scene_before_unavailable
+        await asyncio.sleep(.05)
+        assert File(node.parameter_output_values["output_image"].value).read_bytes() == applied_png
+        assert "확인 대기" in node.get_parameter_value("HMB_BASH_STATUS")
         try:
             node.process()
         except ValueError as exc:
@@ -472,7 +665,9 @@ async def exercise(engine, directory):
         foreign_workspace["workspace_id"] = "fixture-other-image-bash-workspace"
         saved_files = {path.name: path.read_bytes() for path in directory.glob("run-output*.png")}
         set_value("image_bash_context", foreign_workspace)
-        assert node.get_parameter_value("bash_image") == scene_before_unavailable
+        foreign_envelope = deepcopy(scene_before_unavailable)
+        foreign_envelope["meta"]["hmb_image_bash"].update(node._apply_scope())
+        assert node.get_parameter_value("bash_image") == foreign_envelope
         try:
             node.process()
         except ValueError as exc:
@@ -511,6 +706,51 @@ async def exercise(engine, directory):
         set_value("bash_image", restored_project)
         node.process()
         print("PASS retained Apply receipt cannot authorize tampered exported PNG pixels", flush=True)
+
+        # Neither a host compatibility refusal nor a denied local write may
+        # claim success, erase the authored receipt, or replace an older file.
+        scene_before_failure = deepcopy(node.get_parameter_value("bash_image"))
+        output_before_failure = node.parameter_output_values.get("output_image")
+        proof_before_failure = deepcopy(node.get_parameter_value("HMB_BASH_VERIFICATION"))
+        with mock.patch.object(target, "require_standard_compatibility",
+                               side_effect=ValueError("Synthetic editor compatibility check failed")):
+            try:
+                node.process()
+            except ValueError as exc:
+                assert "compatibility" in str(exc)
+            else:
+                raise AssertionError("An incompatible editor was allowed to Run")
+        assert "compatibility" in node.get_parameter_value("HMB_BASH_STATUS")
+        assert node.parameter_output_values.get("output_image") == output_before_failure
+        assert node.get_parameter_value("HMB_BASH_VERIFICATION") == proof_before_failure
+        assert node.get_parameter_value("bash_image") == scene_before_failure
+        assert output_path.read_bytes() == original_output
+
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.events.os_events import WriteFileRequest
+        handle_request = GriptapeNodes.handle_request
+        def reject_output_write(request, *args, **kwargs):
+            if isinstance(request, WriteFileRequest):
+                return mock.Mock(succeeded=lambda: False, result_details="Synthetic local permission denied")
+            return handle_request(request, *args, **kwargs)
+        # A new destination requires a new write; an unchanged destination is
+        # intentionally reused without another WriteFileRequest.
+        set_value("output_file", str(directory / "denied-output.png"))
+        with mock.patch.object(GriptapeNodes, "handle_request", side_effect=reject_output_write):
+            try:
+                node.process()
+            except ValueError as exc:
+                assert "Apply PNG 저장 실패" in str(exc) and "permission denied" in str(exc)
+            else:
+                raise AssertionError("A rejected local write was reported as successful")
+        assert "Apply PNG 저장 실패" in node.get_parameter_value("HMB_BASH_STATUS")
+        assert node.parameter_output_values.get("output_image") == output_before_failure
+        assert node.get_parameter_value("HMB_BASH_VERIFICATION") == proof_before_failure
+        assert node.get_parameter_value("bash_image") == scene_before_failure
+        assert output_path.read_bytes() == original_output
+        node.process()
+        assert File(node.parameter_output_values["output_image"].value).read_bytes() == applied_png
+        print("PASS incompatible host and denied local save show distinct Run errors; receipt/previous PNG survive and retry saves exact Apply", flush=True)
         source_a.write_bytes(png_bytes(Image.new("RGBA", (2, 2), (1, 2, 3, 255))))
         try:
             node.process()
@@ -533,6 +773,21 @@ async def exercise(engine, directory):
             raise AssertionError("Missing layer yielded a partial composite")
         assert node.parameter_output_values.get("output_image") is None
         assert output_path.read_bytes() == original_output
+        # An Apply callback queued just before deletion must not save or publish.
+        source_a.write_bytes(source_bytes_before["fixture-asset-a"])
+        set_value("comp_on_run", False)
+        set_value("image_bash_context", ready_context)
+        set_value("bash_image", restored_project)
+        await asyncio.sleep(.05)
+        cancelled_path = directory / "deleted-before-apply.png"
+        set_value("output_file", str(cancelled_path))
+        pending_apply = node._sync_project(deepcopy(node.get_parameter_value("bash_image")), node._records(), add_missing=False)
+        pending_apply["meta"]["hmb_image_bash"]["prepared_source_hashes"] = node._source_hashes(pending_apply)
+        pending_apply["meta"]["created_at"] = "2026-10-23T01:06:06.006Z-delete"
+        set_value("bash_image", pending_apply)
+        send(engine, DeleteNodeRequest(node_name=node.name))
+        await asyncio.sleep(.05)
+        assert not cancelled_path.exists()
         assert not ATTEMPTS, ATTEMPTS
         print(json.dumps({"status": "PASS", "scope": "installed SDK synthetic fixtures", "pixel_equal": True,
             "native_parameter_events": True, "native_save_cold_reopen": True,
@@ -548,6 +803,8 @@ async def exercise(engine, directory):
             "stale_modal_source_replacement_rejected_then_reapplied": True,
             "unready_context_blocks_previous_images": True, "workspace_apply_isolation": True,
             "source_content_change_blocked": True, "failed_load_no_partial_output": True,
+            "incompatible_host_error_preserves_scene": True,
+            "local_save_denied_error_preserves_previous_png": True,
             "live_browser_ui_verified": False, "network_calls": 0}, sort_keys=True), flush=True)
     finally:
         LibraryRegistry.unregister_library(schema.name, event_manager=engine.event_manager)

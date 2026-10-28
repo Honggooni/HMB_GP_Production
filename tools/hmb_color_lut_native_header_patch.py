@@ -16,6 +16,7 @@ import csv
 from datetime import datetime, timezone
 import hashlib
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -23,21 +24,23 @@ import re
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 import uuid
 
 
 REPO = Path(__file__).resolve().parents[1]
 EXPECTED_SOURCE_SHA256 = "1a0429b88c6b8dd1c7e6e053836d03f734a4d6453f8886e0693527c7498909e2"
-EXPECTED_EDITOR_VERSION = "0.128.1"
+SOURCE_PROFILE = "reviewed-stock"
 EXPECTED_BUNDLE_NAME = "index-DEZU41rc.js"
-MINIMUM_SDK_VERSION = (0, 101, 3)
 SUPPORTED_PREVIOUS_CANDIDATE_SHA256 = "7bad6f6517c781c54e6d2e0cf170f0b2ed3bdef28b3cca57be79cce54bdd11bf"
 SUPPORTED_PREVIOUS_HELPER_SHA256 = "39e5901cc8aa37d1d11850a255bcc209ab4724afe488817fc3f684a72ab01b63"
 SUPPORTED_CURRENT_CANDIDATE_SHA256 = "93b497d21995e23ef6707f0d3a3d39dd897a76d0388f7d7c9677d5cd54ef57c1"
 SUPPORTED_CURRENT_HELPER_SHA256 = "2ed5f48b1c454039e84d9cba7499e290111e1d9f1038b157c0391aae794903f8"
 SUPPORTED_RECENT_CANDIDATE_SHA256 = "5e358586ae4b47fd698225c640fb65a4ed5b53dd27a398aa291b0606501e3131"
 SUPPORTED_RECENT_HELPER_SHA256 = "34657ae82e7862d3c5fa798184623369537d798fe0b4baa313188e33fb15cec6"
+SUPPORTED_LATEST_CANDIDATE_SHA256 = "c7100b21f4cca2fa55a368b9ac2740c923b5545c3a526005835b3fe47c65e343"
+SUPPORTED_LATEST_HELPER_SHA256 = "9d67418745b5264ec892835370da1d19a0695d878cb03c80de696f00601f52b5"
 HELPER = REPO / "resources/editor/hmb-color-lut-native-header.js"
 DEFAULT_SOURCE = Path(os.environ.get("LOCALAPPDATA", "")) / (
     "ai.griptape.nodes.desktop/current/resources/editor-bundle/assets/" + EXPECTED_BUNDLE_NAME
@@ -66,7 +69,7 @@ def _replace_once(source: str, old: str, new: str, anchor: str, counts: dict) ->
 def patch_editor_source(source: str) -> tuple[str, dict]:
     """Return patched text and evidence, rejecting every unpinned source bundle."""
     if sha256(source) != EXPECTED_SOURCE_SHA256:
-        raise ValueError("Editor source hash is not the reviewed 0.128.1 bundle; no patch was produced.")
+        raise ValueError("Editor source hash is not the reviewed source; no patch was produced.")
     counts: dict[str, int] = {}
     helper = HELPER.read_text(encoding="utf-8")
     if source.count("HMB_COLOR_LUT_NATIVE_HEADER_PORTAL_V1"):
@@ -274,7 +277,7 @@ def patch_editor_source(source: str) -> tuple[str, dict]:
         "hmb_delete_invalidate_pending_checks_on_clear", counts)
     evidence = {
         "schema": "hmb-color-lut-native-header-prototype", "version": 1,
-        "editor_version": EXPECTED_EDITOR_VERSION,
+        "source_profile": SOURCE_PROFILE,
         "source_sha256": EXPECTED_SOURCE_SHA256, "candidate_sha256": sha256(source),
         "helper_sha256": sha256(helper), "native_header_before_sha256": native_header_sha256,
         "native_identity_jsx_sha256": sha256(identity), "native_actions_jsx_sha256": sha256(actions),
@@ -313,17 +316,12 @@ def patch_editor_source(source: str) -> tuple[str, dict]:
 def _read_pinned_source(source: Path) -> str:
     if source.name != EXPECTED_BUNDLE_NAME:
         raise ValueError("Editor bundle filename is not the reviewed target.")
-    version_file = source.parent.parent / ".version"
-    if version_file.is_file():
-        if version_file.read_text(encoding="utf-8").strip() != EXPECTED_EDITOR_VERSION:
-            raise ValueError("Installed editor version changed; no patch was produced.")
-    else:
+    if source.resolve() != DEFAULT_SOURCE.resolve():
         # A follow-up candidate may use the original baseline saved by this
         # installer. Never patch an already modified bundle or an arbitrary copy.
         receipt_file = REPORT_DIR / "local-editor-install.json"
         receipt = json.loads(receipt_file.read_text(encoding="utf-8"))
         if (receipt.get("schema") != "hmb-color-lut-native-header-install"
-                or receipt.get("editor_version") != EXPECTED_EDITOR_VERSION
                 or receipt.get("source_sha256") != EXPECTED_SOURCE_SHA256
                 or Path(receipt.get("backup", "")).resolve() != source.resolve()
                 or (REPORT_DIR / "backups").resolve() not in source.resolve().parents):
@@ -395,12 +393,12 @@ def _release_descriptor() -> tuple[dict, str]:
     value = json.loads(encoded)
     expected = {
         "schema": "hmb-native-editor-patch-release", "version": 1,
-        "editor_version": EXPECTED_EDITOR_VERSION, "bundle_name": EXPECTED_BUNDLE_NAME,
+        "source_profile": SOURCE_PROFILE, "bundle_name": EXPECTED_BUNDLE_NAME,
         "source_sha256": EXPECTED_SOURCE_SHA256,
         "helper_path": "resources/editor/hmb-color-lut-native-header.js",
         "patcher_path": "tools/hmb_color_lut_native_header_patch.py",
     }
-    if any(value.get(key) != item for key, item in expected.items()):
+    if "editor_version" in value or any(value.get(key) != item for key, item in expected.items()):
         raise ValueError("Unsupported native editor release descriptor.")
     for key in ("helper_sha256", "patcher_sha256", "candidate_sha256"):
         digest = value.get(key)
@@ -411,20 +409,96 @@ def _release_descriptor() -> tuple[dict, str]:
         raise ValueError("Native editor helper differs from the verified release.")
     if sha256(_release_plain_path(Path(__file__)).read_bytes()) != value["patcher_sha256"]:
         raise ValueError("Native editor patcher differs from the verified release.")
+    _additional_profiles(value)
     return value, sha256(encoded)
 
 
+def _additional_profiles(descriptor: dict) -> list[dict]:
+    """Accept release-reviewed adapters, independent of version or bundle name."""
+    profiles = descriptor.get("additional_profiles", [])
+    if not isinstance(profiles, list) or len(profiles) > 16:
+        raise ValueError("Invalid native editor adapter list.")
+    seen = {EXPECTED_SOURCE_SHA256, descriptor.get("candidate_sha256")}
+    seen.update(item["bundle_sha256"] for item in _release_previous_candidates(descriptor))
+    result = []
+    for profile in profiles:
+        required = {
+            "source_sha256", "candidate_sha256", "adapter_path", "adapter_sha256", "structural_fallback"
+        }
+        if (not isinstance(profile, dict) or not required.issubset(profile)
+                or set(profile) - required - {"previous_candidate_sha256"}):
+            raise ValueError("Invalid native editor adapter profile.")
+        if type(profile["structural_fallback"]) is not bool:
+            raise ValueError("Invalid native editor structural compatibility policy.")
+        if profile["structural_fallback"]:
+            raise ValueError("Unreviewed structural fallback cannot be enabled before renderer and safety validation.")
+        for key in ("source_sha256", "candidate_sha256", "adapter_sha256"):
+            digest = profile[key]
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError("Invalid native editor adapter hash.")
+        if profile["source_sha256"] in seen or profile["candidate_sha256"] in seen or profile["source_sha256"] == profile["candidate_sha256"]:
+            raise ValueError("Duplicate native editor adapter hash.")
+        previous = profile.get("previous_candidate_sha256", [])
+        if (not isinstance(previous, list) or len(previous) > 16
+                or any(not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{64}", item) for item in previous)
+                or len(set(previous)) != len(previous)
+                or any(item in seen or item in (profile["source_sha256"], profile["candidate_sha256"]) for item in previous)):
+            raise ValueError("Invalid previous native editor adapter candidates.")
+        if profile["adapter_path"] != "tools/hmb_native_semantic_adapter.py":
+            raise ValueError("Unsupported native editor adapter path.")
+        path = _release_plain_path(REPO / profile["adapter_path"])
+        if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024 or sha256(path.read_bytes()) != profile["adapter_sha256"]:
+            raise ValueError("Native editor adapter differs from the verified release.")
+        seen.update((profile["source_sha256"], profile["candidate_sha256"]))
+        seen.update(previous)
+        result.append(profile)
+    return result
+
+
+def _active_git_profile(descriptor: dict) -> tuple[Path, dict | None] | None:
+    """Resolve the editor's actual entry point, then match only reviewed bytes.
+
+    No version number, supplied path, wildcard search, or old-file fallback is
+    used. A missing or ambiguous entry is unsupported and never patched.
+    """
+    root = _release_plain_path(DEFAULT_SOURCE.parent.parent)
+    entry = _release_plain_path(root / "index-editor.html")
+    if not entry.exists():
+        raise ValueError("Installed editor entry HTML is missing; existing files preserved.")
+    if not entry.is_file() or entry.stat().st_size > 1024 * 1024:
+        raise ValueError("Invalid installed editor entry HTML.")
+    html = entry.read_text("utf-8")
+    matches = re.findall(r'''\bsrc\s*=\s*["']\./assets/(index-[A-Za-z0-9_-]+\.js)["']''', html)
+    if len(matches) != 1:
+        raise ValueError("Installed editor entry must reference one unambiguous JS bundle.")
+    target = _release_plain_path(root / "assets" / matches[0])
+    if not target.is_file() or target.stat().st_size > 64 * 1024 * 1024:
+        raise ValueError("Installed editor entry bundle is missing or oversized.")
+    digest = sha256(target.read_bytes())
+    if digest in _release_original_hashes(descriptor):
+        return target, None
+    for profile in _additional_profiles(descriptor):
+        if digest in (profile["source_sha256"], profile["candidate_sha256"], *profile.get("previous_candidate_sha256", [])):
+            return target, profile
+    fallback = [profile for profile in _additional_profiles(descriptor) if profile["structural_fallback"]]
+    if len(fallback) == 1:
+        return target, fallback[0]
+    raise ValueError("Unknown installed editor bundle; existing file preserved.")
+
+
 def _release_previous_candidates(descriptor: dict) -> list[dict]:
-    """Accept only the pinned three-release chain and its released old schemas."""
+    """Accept only reviewed helper chains and their previously released schemas."""
     older = {"bundle_sha256": SUPPORTED_PREVIOUS_CANDIDATE_SHA256,
              "helper_sha256": SUPPORTED_PREVIOUS_HELPER_SHA256}
     recent = {"bundle_sha256": SUPPORTED_CURRENT_CANDIDATE_SHA256,
               "helper_sha256": SUPPORTED_CURRENT_HELPER_SHA256}
     latest = {"bundle_sha256": SUPPORTED_RECENT_CANDIDATE_SHA256,
               "helper_sha256": SUPPORTED_RECENT_HELPER_SHA256}
+    current = {"bundle_sha256": SUPPORTED_LATEST_CANDIDATE_SHA256,
+               "helper_sha256": SUPPORTED_LATEST_HELPER_SHA256}
     if "previous_candidates" in descriptor:
         candidates = descriptor["previous_candidates"]
-        if "previous_candidate" in descriptor or candidates not in ([latest, recent, older], [recent, older]):
+        if "previous_candidate" in descriptor or candidates not in ([current, latest, recent, older], [latest, recent, older], [recent, older]):
             raise ValueError("Unsupported previous native editor candidates.")
         return list(candidates)
     if "previous_candidate" in descriptor:
@@ -475,9 +549,6 @@ def _release_target() -> Path:
     target = _release_plain_path(DEFAULT_SOURCE)
     if target.name != EXPECTED_BUNDLE_NAME:
         raise ValueError("Unsupported native editor target.")
-    version = _release_plain_path(target.parent.parent / ".version")
-    if version.read_text("utf-8").strip() != EXPECTED_EDITOR_VERSION:
-        raise ValueError("Unsupported installed editor version; no installation was performed.")
     return target
 
 
@@ -507,17 +578,16 @@ def _release_sdk_preflight() -> dict:
     metadata_bytes = read_file(metadata[0])
     metadata_text = metadata_bytes.decode("utf-8-sig")
     names = re.findall(r"^Name: (.+)$", metadata_text, re.MULTILINE)
-    versions = re.findall(r"^Version: (.+)$", metadata_text, re.MULTILINE)
-    if len(names) != 1 or names[0].strip().lower().replace("_", "-") != "griptape-nodes" or len(versions) != 1:
+    if len(names) != 1 or names[0].strip().lower().replace("_", "-") != "griptape-nodes":
         raise ValueError(prefix + "Invalid griptape-nodes package metadata.")
-    version = versions[0].strip()
-    if not re.fullmatch(r"\d+\.\d+\.\d+", version) or tuple(map(int, version.split("."))) < MINIMUM_SDK_VERSION:
-        raise ValueError(prefix + "griptape-nodes 0.101.3 or newer is required; found " + version + ".")
     sources = {
         "engine": site / "griptape_nodes/retained_mode/engine.py",
         "event_manager": site / "griptape_nodes/retained_mode/managers/event_manager.py",
+        "node_manager": site / "griptape_nodes/retained_mode/managers/node_manager.py",
+        **{name: site / ("griptape_nodes/retained_mode/events/" + name + ".py")
+           for name in ("node_events", "flow_events", "workflow_events", "object_events", "connection_events")},
     }
-    trees, hashes = {}, {"metadata": sha256(metadata_bytes)}
+    trees, hashes = {}, {}
     for name, path in sources.items():
         encoded = read_file(path)
         try:
@@ -541,8 +611,51 @@ def _release_sdk_preflight() -> dict:
         positional = args.posonlyargs + args.args
         if len(positional) < 2 or len(positional) - len(args.defaults) > 2 or any(value is None for value in args.kw_defaults):
             raise ValueError(prefix + "EventManager." + name + " must accept one hook argument.")
-    return {"package": "griptape-nodes", "version": version,
-            "capabilities": ["current_engine", *required], "source_sha256": hashes,
+    event_methods = {n.name: n for n in managers[0].body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    if "_run_pre_dispatch_hooks" not in event_methods or not any(
+            isinstance(n, ast.FunctionDef) and n.name == "current_request_type" for n in trees["event_manager"].body):
+        raise ValueError(prefix + "Missing reentrant dispatch or request context capability.")
+    boundary = event_methods["_run_pre_dispatch_hooks"]
+    args = boundary.args
+    positional = args.posonlyargs + args.args
+    if (not isinstance(boundary, ast.FunctionDef) or len(positional) < 3
+            or len(positional) - len(args.defaults) > 3 or any(value is None for value in args.kw_defaults)):
+        raise ValueError(prefix + "Reentrant dispatch must accept request and context.")
+    event_attrs = {n.attr for n in ast.walk(managers[0]) if isinstance(n, ast.Attribute)}
+    if not {"_pre_dispatch_hooks", "_pre_dispatch_hooks_lock", "_hook_evaluation", "_request_type_to_manager"} <= event_attrs:
+        raise ValueError(prefix + "Missing guarded dispatch ownership fields.")
+    node_managers = [n for n in trees["node_manager"].body if isinstance(n, ast.ClassDef) and n.name == "NodeManager"]
+    if len(node_managers) != 1:
+        raise ValueError(prefix + "Missing node manager capability.")
+    node_methods = {n.name for n in node_managers[0].body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    guarded_node_methods = ("get_node_by_name", "get_node_parent_flow_by_name", "on_delete_node_request",
+                            "on_reset_node_to_defaults_request", "on_add_nodes_to_node_group_request",
+                            "on_remove_node_from_node_group_request")
+    if not set(guarded_node_methods) <= node_methods:
+        raise ValueError(prefix + "Missing node lookup or guarded delete/reset capability.")
+    for name in guarded_node_methods:
+        method = next(n for n in node_managers[0].body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name)
+        args = method.args
+        positional = args.posonlyargs + args.args
+        if len(positional) < 2 or len(positional) - len(args.defaults) > 2 or any(value is None for value in args.kw_defaults):
+            raise ValueError(prefix + "Guarded node method must accept its request/name: " + name)
+    if not any(isinstance(n, ast.Attribute) and n.attr == "_name_to_parent_flow_name" for n in ast.walk(node_managers[0])):
+        raise ValueError(prefix + "Missing retained-node inventory capability.")
+    required_payloads = {
+        "node_events": {"DeleteNodeRequest", "DeleteNodeResultFailure", "ResetNodeToDefaultsRequest", "ResetNodeToDefaultsResultFailure", "MoveNodeToNewFlowRequest", "MoveNodeToNewFlowResultFailure",
+                        "AddNodesToNodeGroupRequest", "AddNodesToNodeGroupResultFailure",
+                        "RemoveNodeFromNodeGroupRequest", "RemoveNodeFromNodeGroupResultFailure"},
+        "flow_events": {"DeleteFlowRequest", "DeleteFlowResultFailure"},
+        "workflow_events": {"DeleteWorkflowRequest", "DeleteWorkflowResultFailure"},
+        "object_events": {"ClearAllObjectStateRequest", "ClearAllObjectStateResultFailure", "RenameObjectRequest", "RenameObjectResultFailure"},
+        "connection_events": {"CreateConnectionRequest", "CreateConnectionResultFailure", "ListConnectionsForNodeRequest"},
+    }
+    for name, names_required in required_payloads.items():
+        classes = {n.name for n in trees[name].body if isinstance(n, ast.ClassDef)}
+        if not names_required <= classes:
+            raise ValueError(prefix + "Missing guarded request or result capability: " + name)
+    return {"package": "griptape-nodes",
+            "capabilities": ["current_engine", *required, "reentrant_dispatch", "guarded_handler_ownership", "node_inventory", "guarded_request_payloads"], "source_sha256": hashes,
             "verification": "metadata-and-ast-only; active guard checked after app startup"}
 
 
@@ -580,7 +693,7 @@ def _release_plan(path: Path) -> tuple[dict, Path, dict]:
     descriptor, descriptor_sha = _release_descriptor()
     target = _release_target()
     expected = {"schema": "hmb-native-editor-install-plan", "version": 1,
-                "target": str(target), "editor_version": EXPECTED_EDITOR_VERSION,
+                "target": str(target), "source_profile": SOURCE_PROFILE,
                 "descriptor_sha256": descriptor_sha, "candidate_sha256": descriptor["candidate_sha256"]}
     if any(value.get(key) != item for key, item in expected.items()):
         raise ValueError("Native editor install plan changed or belongs to another release.")
@@ -648,7 +761,7 @@ def prepare_release_install() -> dict:
     transaction = root / uuid.uuid4().hex
     transaction.mkdir(parents=True, exist_ok=False)
     plan = {"schema": "hmb-native-editor-install-plan", "version": 1,
-            "target": str(target), "editor_version": EXPECTED_EDITOR_VERSION,
+            "target": str(target), "source_profile": SOURCE_PROFILE,
             "descriptor_sha256": descriptor_sha, "original_sha256": original_sha,
             "candidate_sha256": descriptor["candidate_sha256"], "already_current": already_current,
             "sdk_preflight": sdk_preflight, "status": "prepared"}
@@ -657,7 +770,7 @@ def prepare_release_install() -> dict:
         _atomic_write(transaction / "candidate.js", candidate)
     path = transaction / "plan.json"
     _json_write(path, plan)
-    return {"plan": str(path), "already_current": already_current, "editor_version": EXPECTED_EDITOR_VERSION,
+    return {"plan": str(path), "already_current": already_current, "source_profile": SOURCE_PROFILE,
             "original_sha256": original_sha, "candidate_sha256": descriptor["candidate_sha256"],
             "sdk_preflight": sdk_preflight}
 
@@ -695,7 +808,7 @@ def _apply_release_install_unlocked(path: Path) -> dict:
     current = sha256(target.read_bytes())
     if plan.get("status") == "applied" and current == plan["candidate_sha256"]:
         return {"plan": str(path), "already_current": plan["already_current"], "changed": not plan["already_current"],
-                "editor_version": EXPECTED_EDITOR_VERSION, "sha256": current, "sdk_preflight": plan["sdk_preflight"]}
+                "source_profile": SOURCE_PROFILE, "sha256": current, "sdk_preflight": plan["sdk_preflight"]}
     if current != plan["original_sha256"]:
         raise ValueError("Native editor changed after preflight; installation refused.")
     if not plan["already_current"]:
@@ -717,7 +830,7 @@ def _apply_release_install_unlocked(path: Path) -> dict:
         _release_restore(plan, path)
         raise
     return {"plan": str(path), "already_current": plan["already_current"], "changed": not plan["already_current"],
-            "editor_version": EXPECTED_EDITOR_VERSION, "sha256": plan["candidate_sha256"],
+            "source_profile": SOURCE_PROFILE, "sha256": plan["candidate_sha256"],
             "sdk_preflight": plan["sdk_preflight"],
             "backup": None if plan["already_current"] else str(path.parent / "before.js")}
 
@@ -768,7 +881,7 @@ def _git_override_result(status: str, reason: str, **details) -> dict:
     return {"schema": "hmb-native-editor-git-override", "version": 1,
             "status": status, "disk_ready": ready, "restart_required": ready,
             "renderer_verified": False, "reason": reason,
-            "editor_version": EXPECTED_EDITOR_VERSION, "changed": None if status == "error" else False,
+            "changed": None if status == "error" else False,
             "already_current": status == "current", **details}
 
 
@@ -788,7 +901,7 @@ def _git_override_apply_unlocked() -> dict:
     original_sha = sha256(original)
     if original_sha not in _release_original_hashes(descriptor):
         raise ValueError("Unknown installed editor hash; Git override preserved the existing file.")
-    details = {"target": str(target), "candidate_sha256": descriptor["candidate_sha256"],
+    details = {"target": str(target), "source_profile": SOURCE_PROFILE, "candidate_sha256": descriptor["candidate_sha256"],
                "descriptor_sha256": descriptor_sha, "sdk_preflight": sdk_preflight}
     if original_sha == descriptor["candidate_sha256"]:
         return _git_override_result("current", "Pinned editor is already on disk; loaded renderer was not verified.", **details)
@@ -865,16 +978,146 @@ def _git_override_apply_unlocked() -> dict:
                                 changed=True, **details)
 
 
+def _git_override_apply_active_unlocked() -> dict:
+    """Apply a reviewed profile to the active entry, without version matching.
+
+    A structural candidate for previously unseen bytes is deliberately not
+    authorized by this path until its adapter contract and actual renderer
+    behavior have been validated. Unknown input is never written.
+    """
+    descriptor, descriptor_sha = _release_descriptor()
+    selected = _active_git_profile(descriptor)
+    if selected is None:
+        return _git_override_apply_unlocked()
+    target, profile = selected
+    app_identity = _git_override_app_identity()
+    sdk_preflight = _release_sdk_preflight()
+    original = target.read_bytes()
+    original_sha = sha256(original)
+    expected_candidate = descriptor["candidate_sha256"] if profile is None else profile["candidate_sha256"]
+    source_hash = EXPECTED_SOURCE_SHA256 if profile is None else profile["source_sha256"]
+    if original_sha not in ({source_hash, expected_candidate, *profile.get("previous_candidate_sha256", [])} if profile is not None else _release_original_hashes(descriptor)):
+        raise ValueError("Editor structure has not been validated for automatic application; existing file preserved.")
+    details = {"target": str(target), "source_profile": SOURCE_PROFILE if profile is None else "reviewed-adapter",
+               "candidate_sha256": expected_candidate, "descriptor_sha256": descriptor_sha,
+               "sdk_preflight": sdk_preflight}
+    candidate = None
+    if profile is not None:
+        adapter_path = _release_plain_path(REPO / profile["adapter_path"])
+        code = adapter_path.read_bytes()
+        if sha256(code) != profile["adapter_sha256"]:
+            raise ValueError("Native editor adapter changed; existing file preserved.")
+        module_name = "_hmb_reviewed_native_adapter_" + uuid.uuid4().hex
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(module_name, loader=None))
+        module.__file__ = str(adapter_path)
+        sys.modules[module_name] = module
+        try:
+            exec(compile(code, str(adapter_path), "exec"), module.__dict__)
+            if original_sha == expected_candidate:
+                # The transform cannot run again on already-patched bytes.
+                # Require an explicit readiness report rather than returning
+                # `current` solely from the candidate hash.
+                approval = getattr(module, "approval_evidence", None)
+                if not callable(approval):
+                    raise ValueError("Native editor adapter has no current-install approval evidence.")
+                evidence = approval()
+            else:
+                transform = getattr(module, "patch_editor_source", None)
+                if not callable(transform):
+                    raise ValueError("Reviewed native editor adapter has no transform.")
+                transformed, evidence = transform(original.decode("utf-8"), HELPER.read_text("utf-8"))
+                if not isinstance(transformed, str):
+                    raise ValueError("Native editor adapter returned an invalid candidate.")
+                candidate = transformed.encode("utf-8")
+        finally:
+            if sys.modules.get(module_name) is module:
+                sys.modules.pop(module_name, None)
+        if not isinstance(evidence, dict):
+            raise ValueError("Native editor adapter returned invalid evidence.")
+        # This is a conservative eligibility gate, not proof that a renderer
+        # or deletion path was actually tested. The release still needs an
+        # independently reviewed descriptor, source and candidate hashes, and
+        # corresponding real-runtime evidence before a profile is shipped.
+        if (evidence.get("status") != "approved"
+                or evidence.get("structural_anchors") != "matched"
+                or evidence.get("live_renderer_verified") is not True
+                or evidence.get("deletion_verified") is not True):
+            raise ValueError("Native editor adapter is not approved for automatic installation; existing file preserved.")
+        if (evidence.get("source_sha256") != source_hash
+                or evidence.get("candidate_sha256") != expected_candidate
+                or evidence.get("helper_sha256") != descriptor["helper_sha256"]):
+            raise ValueError("Native editor adapter approval hashes are stale; existing file preserved.")
+    if original_sha == expected_candidate:
+        return _git_override_result("current", "Pinned editor is already on disk; loaded renderer was not verified.", **details)
+    if profile is None:
+        candidate = (patch_editor_source(original.decode("utf-8"))[0].encode("utf-8")
+                     if original_sha == source_hash else _upgrade_previous_helper(original, descriptor))
+    if sha256(candidate) != expected_candidate:
+        raise ValueError("Native editor candidate differs from the reviewed profile.")
+    transaction = _release_plain_path(RELEASE_STATE_ROOT) / uuid.uuid4().hex
+    transaction.mkdir(parents=True, exist_ok=False)
+    _atomic_write(transaction / "before.js", original)
+    _atomic_write(transaction / "candidate.js", candidate)
+    path = transaction / "plan.json"
+    plan = {"schema": "hmb-native-editor-git-override-plan", "version": 1,
+            **details, "original_sha256": original_sha, "app_identity": app_identity,
+            "already_current": False, "status": "prepared"}
+    _json_write(path, plan)
+    details.update(plan=str(path), backup=str(transaction / "before.js"))
+    def precommit() -> None:
+        current_descriptor, digest = _release_descriptor()
+        current = _active_git_profile(current_descriptor)
+        if (digest != descriptor_sha or current != (target, profile)
+                or _git_override_app_identity() != app_identity or _release_sdk_preflight() != sdk_preflight):
+            raise ValueError("Editor entry or release changed during preparation; target preserved.")
+        if (sha256(target.read_bytes()) != original_sha
+                or sha256((transaction / "before.js").read_bytes()) != original_sha
+                or sha256((transaction / "candidate.js").read_bytes()) != expected_candidate):
+            raise ValueError("Editor or staged bytes changed during preparation; target preserved.")
+    precommit()
+    plan = {**plan, "status": "applying"}
+    _json_write(path, plan)
+    precommit()
+    try:
+        _atomic_write(target, candidate)
+        if sha256(target.read_bytes()) != expected_candidate:
+            raise RuntimeError("Installed native editor hash mismatch.")
+        _json_write(path, {**plan, "status": "applied"})
+    except Exception as error:
+        current = sha256(_release_plain_path(target).read_bytes())
+        if current == original_sha:
+            _json_write(path, {**plan, "status": "pending"})
+            if isinstance(error, OSError):
+                return _git_override_result("pending", "Native editor replacement was blocked; original retained. Retry after a normal restart.", reason_code="atomic_replace_blocked", **details)
+            raise
+        if current != expected_candidate:
+            raise RuntimeError("Native editor changed outside this Git transaction; foreign bytes preserved and rollback refused.") from error
+        backup = _release_plain_path(transaction / "before.js").read_bytes()
+        if sha256(backup) != original_sha:
+            raise RuntimeError("Native editor backup changed; rollback refused.") from error
+        try:
+            _atomic_write(target, backup)
+            if sha256(target.read_bytes()) != original_sha:
+                raise RuntimeError("Native editor rollback hash mismatch.")
+            _json_write(path, {**plan, "status": "rolled_back"})
+        except Exception as recovery_error:
+            return _git_override_result("error", "Native editor recovery could not be confirmed; inspect the preserved backup: " + str(recovery_error), reason_code="rollback_unconfirmed", **details)
+        return _git_override_result("error", "Native editor transaction failed and restored its exact original.", reason_code="rolled_back", changed=False, **details)
+    return _git_override_result("applied", "Native editor is ready on disk. Save work and restart Griptape normally once.", changed=True, **details)
+
+
 def apply_git_override() -> dict:
     """Public ZIP-free lifecycle API; results describe disk state only."""
     try:
         # Reject unsupported source/package/app before even creating lock state.
-        _release_descriptor()
-        _release_target()
+        descriptor, _ = _release_descriptor()
+        selected = _active_git_profile(descriptor)
+        if selected is None:
+            _release_target()
         _git_override_app_identity()
         _release_sdk_preflight()
         with _release_write_lock():
-            return _git_override_apply_unlocked()
+            return _git_override_apply_active_unlocked() if selected is not None else _git_override_apply_unlocked()
     except NativeEditorWriteBusy as error:
         return _git_override_result("pending", str(error), reason_code="write_lock_busy")
     except ValueError as error:

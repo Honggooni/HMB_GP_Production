@@ -232,11 +232,22 @@ class InstallerTransaction(unittest.TestCase):
         sdk_site = self.native.parents[2] / "engine-bundle/python/Lib/site-packages"
         self.sdk_engine = sdk_site / "griptape_nodes/retained_mode/engine.py"
         sdk_events = self.sdk_engine.parent / "managers/event_manager.py"
+        sdk_nodes = self.sdk_engine.parent / "managers/node_manager.py"
+        payload_dir = self.sdk_engine.parent / "events"
         sdk_metadata = sdk_site / "griptape_nodes-0.101.3.dist-info/METADATA"
-        for path in (self.sdk_engine, sdk_events, sdk_metadata):
+        for path in (self.sdk_engine, sdk_events, sdk_metadata, sdk_nodes, payload_dir / "placeholder"):
             path.parent.mkdir(parents=True, exist_ok=True)
         self.sdk_engine.write_text("raise AssertionError('SDK must not execute')\ndef current_engine(): pass\n")
-        sdk_events.write_text("class EventManager:\n    def add_pre_dispatch_hook(self, hook): pass\n    def remove_pre_dispatch_hook(self, hook): pass\n    def register_request_handlers(self, owner): pass\n")
+        sdk_events.write_text("raise AssertionError('SDK fixture must not execute')\ndef current_request_type(): pass\nclass EventManager:\n    def __init__(self):\n        self._pre_dispatch_hooks=[]\n        self._pre_dispatch_hooks_lock=None\n        self._hook_evaluation=None\n        self._request_type_to_manager={}\n    def _run_pre_dispatch_hooks(self, request, context): pass\n    def add_pre_dispatch_hook(self, hook): pass\n    def remove_pre_dispatch_hook(self, hook): pass\n    def register_request_handlers(self, owner): pass\n")
+        sdk_nodes.write_text("class NodeManager:\n    def __init__(self): self._name_to_parent_flow_name={}\n    def get_node_by_name(self, name): pass\n    def get_node_parent_flow_by_name(self, name): pass\n    async def on_delete_node_request(self, request): pass\n    async def on_reset_node_to_defaults_request(self, request): pass\n    def on_add_nodes_to_node_group_request(self, request): pass\n    def on_remove_node_from_node_group_request(self, request): pass\n")
+        for name, names in {
+            "node_events": ("DeleteNodeRequest", "DeleteNodeResultFailure", "ResetNodeToDefaultsRequest", "ResetNodeToDefaultsResultFailure", "MoveNodeToNewFlowRequest", "MoveNodeToNewFlowResultFailure", "AddNodesToNodeGroupRequest", "AddNodesToNodeGroupResultFailure", "RemoveNodeFromNodeGroupRequest", "RemoveNodeFromNodeGroupResultFailure"),
+            "flow_events": ("DeleteFlowRequest", "DeleteFlowResultFailure"),
+            "workflow_events": ("DeleteWorkflowRequest", "DeleteWorkflowResultFailure"),
+            "object_events": ("ClearAllObjectStateRequest", "ClearAllObjectStateResultFailure", "RenameObjectRequest", "RenameObjectResultFailure"),
+            "connection_events": ("CreateConnectionRequest", "CreateConnectionResultFailure", "ListConnectionsForNodeRequest"),
+        }.items():
+            (payload_dir / (name + ".py")).write_text("".join("class " + value + ": pass\n" for value in names))
         sdk_metadata.write_text("Name: griptape-nodes\nVersion: 0.101.3\n")
         self.native_state = self.base / "native-editor-installs"
         patcher_name = "tools/hmb_color_lut_native_header_patch.py"
@@ -251,7 +262,7 @@ class InstallerTransaction(unittest.TestCase):
         helper_name = "resources/editor/hmb-color-lut-native-header.js"
         helper_data = (ROOT / helper_name).read_bytes()
         descriptor_data = json.dumps({
-            "schema": "hmb-native-editor-patch-release", "version": 1, "editor_version": "0.128.1",
+            "schema": "hmb-native-editor-patch-release", "version": 1, "source_profile": "reviewed-stock",
             "bundle_name": "index-DEZU41rc.js", "source_sha256": hashlib.sha256(self.native_original).hexdigest(),
             "candidate_sha256": hashlib.sha256(self.native_candidate).hexdigest(),
             "helper_path": helper_name, "helper_sha256": hashlib.sha256(helper_data).hexdigest(),
@@ -270,7 +281,8 @@ class InstallerTransaction(unittest.TestCase):
                          "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
         self.runtime = [row for row in rows if row["install"]]
         manifest = {"schema": "hmb-release-closure", "version": 1, "release_version": "0.8.30",
-                    "file_count": 67, "install_file_count": 60, "distribution_file_count": 7,
+                    "file_count": len(rows), "install_file_count": len(self.runtime),
+                    "distribution_file_count": len(rows) - len(self.runtime),
                     "files": rows, "policy_identity": {"fixture": True},
                     "build_fingerprint_sha256": self.fingerprint(rows),
                     "runtime_fingerprint_sha256": self.fingerprint(self.runtime)}

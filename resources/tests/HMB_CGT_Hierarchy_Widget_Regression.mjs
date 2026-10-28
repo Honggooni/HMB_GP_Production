@@ -102,7 +102,10 @@ try{
   assert.match(await page.locator('.hier-manual').innerText(),/기존 슬롯을 선택하면 UUID·미디어·설정·결과를 보존하고 이름만 적용합니다\./,`${label}: unmarked manual-slot identity help remains`);
   assert.match(await page.locator('[data-shot-hierarchy-dialog] footer > span').innerText(),/\d개 대표 · \d개 하위/);
   assert.equal(await page.locator('[data-hier-confirm]').count(),1);assert.equal(await page.locator('[data-hier-cancel]').count(),2);
-  checks+=18;
+  assert.equal(await page.locator('[data-hier-cgt-query],.hier-query').count(),0,`${label}: removed search UI cannot hide task rows`);
+  const cardDetails=await page.locator('[data-hier-member]').evaluateAll(nodes=>nodes.map(node=>Array.from(node.children).filter(child=>child.tagName==='SMALL').map(child=>child.textContent)));
+  assert.ok(cardDetails.every(details=>details.every(text=>text.startsWith('에피소드 '))),`${label}: only episode/shot/cut details remain; CGT/manual origin, artist and status rows are removed`);
+  checks+=20;
  };
  const noProject=await page.evaluate(()=>window.w.hmbNormalizeImageAssetState({}));
  await page.evaluate(value=>window.openGraph(value),noProject);
@@ -183,6 +186,13 @@ try{
  };
  const assertCompactSelectedRows=async label=>{
   await assertConciseDialog(label);
+  const accountHeading=await page.locator('.hier-cgt-heading').evaluate(node=>{
+   const title=node.querySelector('span').getBoundingClientRect(),account=node.querySelector('[data-hier-cgt-account]'),box=account.getBoundingClientRect(),heading=node.getBoundingClientRect();
+   return {title:{right:title.right,center:title.y+title.height/2},account:{left:box.left,right:box.right,center:box.y+box.height/2,width:box.width},heading:{right:heading.right},hidden:account.hidden,titleText:account.title};
+  });
+  assert.equal(accountHeading.hidden,false,`${label}: account summary is visible in the heading`);
+  assert.match(accountHeading.titleText,/fixture-login.*Synthetic Artist.*AI_Shot/);
+  assert.ok(Math.abs(accountHeading.title.center-accountHeading.account.center)<2&&accountHeading.title.right<=accountHeading.account.left&&Math.abs(accountHeading.account.right-accountHeading.heading.right)<2&&accountHeading.account.width>10,`${label}: account summary aligns right on the heading line without overlap`);
   assert.equal(await page.locator('[data-hier-parent]').count(),5,`${label}: every shot exposes its own parent selection`);
   const roleHeaders=await page.locator('[data-hier-member]').evaluateAll(nodes=>nodes.map(node=>{
    const title=node.querySelector('b').getBoundingClientRect(),select=node.querySelector('[data-hier-parent]').getBoundingClientRect(),row=node.getBoundingClientRect();
@@ -217,7 +227,7 @@ try{
    const result={moved:node.scrollLeft,right:last.right,edge:box.right};node.scrollLeft=before;return result;
   });
   assert.ok(scrolled.moved>0&&scrolled.right<=scrolled.edge+2,`${label}: horizontal scrolling actually reveals the fifth complete name`);
-  checks+=11;
+  checks+=14;
  };
  for(const size of emptyDialogGeometryBaseline){
   await page.setViewportSize({width:size.width,height:size.height});
@@ -311,7 +321,7 @@ try{
  assert.equal(await page.locator('[data-image-bash-add]').count(),0,'Image Bash uses the shared slot selector and add action');
  assert.equal(await page.locator('[data-hier-manual-name-field]').isVisible(),false);
  assert.equal(await page.locator('[data-hier-manual-name]').isDisabled(),true);
- assert.equal(await page.locator('[data-hier-add]').innerText(),'HMBImageBash 추가');
+ assert.equal(await page.locator('[data-hier-add]').isVisible(),false,'Bash uses the shared selection confirmation');
  assert.equal(await page.locator('[data-hier-cgt-add]').evaluateAll(buttons=>buttons.every(button=>button.disabled)),true,'CGT tasks cannot bind to the Image Bash workspace sentinel');
  assert.equal(await page.evaluate(()=>window.requests.length),beforeSlotRequests,'Changing the add target is local and does not refetch CGT');
  if(report)await page.screenshot({path:path.join(report,'cgt-image-bash-slot-synthetic.png')});
@@ -372,6 +382,12 @@ try{
  assert.equal(await page.locator('[data-hier-cancel]').first().isDisabled(),true);
  assert.equal(await page.evaluate(()=>window.host.shot_routing.shots.length),1);
  assert.equal(await page.evaluate(()=>window.pending.operation),'cgt_confirm');
+ const beforeForgedConfirm=await page.evaluate(()=>({requests:window.requests.length,writes:window.localWrites.length}));
+ await page.evaluate(()=>{const dialog=document.querySelector('[data-shot-hierarchy-dialog]');
+  dialog.querySelector('[data-hier-slot]').value='image_bash';
+  dialog.querySelector('[data-hier-confirm]').dispatchEvent(new MouseEvent('click',{bubbles:true}));});
+ assert.deepEqual(await page.evaluate(()=>({requests:window.requests.length,writes:window.localWrites.length})),beforeForgedConfirm,
+  'A forged Bash confirmation cannot bypass a pending CGT commit');
  assert.equal(await page.evaluate(()=>window.pending.cgt_project_id),projectId,'Confirmation uses the selected binding project, never the currently browsed project');
  const sentMembers=await page.evaluate(()=>structuredClone(window.pending.hierarchy_request.binding.members));
  const parentValues=[null,'cgt:'+tasks[0].task_id.toLowerCase(),'cgt:'+tasks[1].task_id.toLowerCase(),null,'cgt:'+tasks[3].task_id.toLowerCase()];
@@ -413,7 +429,7 @@ try{
  assert.equal(await page.locator('[data-hier-manual-name]').inputValue(),'Pending Bash target name','A hidden pending name survives parent redraw');
  assert.equal(await page.locator('[data-hier-manual-name-field]').isVisible(),false,'Restored Image Bash target retains its matching visibility');
  assert.equal(await page.locator('[data-hier-manual-name]').isDisabled(),true);
- assert.equal(await page.locator('[data-hier-add]').innerText(),'HMBImageBash 추가');checks+=5;
+ assert.equal(await page.locator('[data-hier-add]').isVisible(),false);checks+=5;
  assert.match(await page.locator('[data-shot-hierarchy-dialog] footer > span').innerText(),/4개 대표 · 4개 하위/,'An existing root with children may become a child under an unrelated child');
  assert.equal(await page.evaluate(()=>window.commits.length),1,'Changing the draft parent does not commit or contact CGT');
  await page.keyboard.press('Escape');
@@ -467,6 +483,15 @@ try{
  assert.match(await page.locator('[data-hier-cgt-status]').innerText(),/조회 중/);
  await page.evaluate(()=>{window.catalog={status:'TLS_REJECTED',tasks:[]};window.finish();});
  assert.match(await page.locator('[data-hier-cgt-status]').innerText(),/인증서 검증/);checks+=5;
+ for(const [status,expected] of [['TRUST_CHANGED',/신뢰 인증서/],['INVALID_ORIGIN',/서버 주소/],
+  ['READ_SCOPE_REJECTED',/조회 범위/],['SOURCE_SCHEMA',/데이터 형식/],
+  ['OWNERSHIP_CHANGED',/담당자/],['INVALID_BINDING',/연결 정보/],
+  ['ACCESS_DENIED',/접근을 거부/],['RATE_LIMITED',/요청이 제한/],['SERVER_UNAVAILABLE',/서버가 조회 요청/],
+  ['CONNECTION_FAILED',/연결할 수 없습니다/],['REQUEST_REJECTED',/조회 요청을 거부/]]){
+  await page.locator('[data-hier-cgt-refresh]').click();
+  await page.evaluate(value=>{window.catalog={status:value,tasks:[]};window.finish();},status);
+  assert.match(await page.locator('[data-hier-cgt-status]').innerText(),expected);checks++;
+ }
  await page.evaluate(value=>{window.catalog={...value,tasks:Array.from({length:120},(_,i)=>({...value.tasks[0],task_id:crypto.randomUUID(),source_name:`e201s${String(i+1).padStart(3,'0')}c001__`}))};},snapshot);
  await page.locator('[data-hier-cgt-refresh]').click();await page.evaluate(()=>window.finish());
  assert.equal(await page.locator('[data-hier-cgt-add]').count(),50);
@@ -474,8 +499,66 @@ try{
  const requestsBefore=await page.evaluate(()=>window.requests.length);
  await page.locator('[data-hier-cgt-next]').click();assert.equal(await page.locator('[data-hier-cgt-add]').count(),50);
  await page.locator('[data-hier-cgt-next]').click();assert.equal(await page.locator('[data-hier-cgt-add]').count(),20);
- await page.locator('[data-hier-cgt-query]').fill('s115');assert.equal(await page.locator('[data-hier-cgt-add]').count(),1);
+ assert.equal(await page.locator('[data-hier-cgt-query]').count(),0);
+ assert.equal(await page.locator('[data-hier-cgt-add]').count(),20,'Removing search leaves every row on the final page visible');
  assert.equal(await page.evaluate(()=>window.requests.length),requestsBefore);checks+=5;
+ // Compare the live product DOM with the exact former presentation fragments
+ // restored in this synthetic fixture only. No task, parent or authoring state
+ // is edited. This is an isolated Chromium comparison, not a desktop capture.
+ const layoutComparisons=[];
+ const comparisonRequests=await page.evaluate(()=>window.requests.length);
+ for(const view of [{width:1250,height:1000,zoom:1},{width:900,height:720,zoom:.8},
+   {width:600,height:850,zoom:1},{width:1250,height:1000,zoom:1.25}]){
+  await page.setViewportSize({width:view.width,height:view.height});
+  const comparison=await page.evaluate(view=>{
+   document.body.style.zoom=String(view.zoom);
+   const dialog=document.querySelector('[data-shot-hierarchy-dialog]'),body=dialog.querySelector('.hier-body');
+   const source=dialog.querySelector('[data-hier-source-pane]'),selected=dialog.querySelector('[data-hier-selected-pane]');
+   const tasks=dialog.querySelector('[data-hier-cgt-scroll]'),cards=dialog.querySelector('[data-hier-selected-scroll]');
+   const heading=dialog.querySelector('.hier-cgt-heading'),account=heading.querySelector('[data-hier-cgt-account]');
+   const rect=element=>{const r=element.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height,top:r.top,bottom:r.bottom};};
+   const measure=()=>{
+    body.scrollTop=0;tasks.scrollTop=0;cards.scrollTop=0;
+    const root=rect(dialog),b=rect(body),t=rect(tasks),clip={top:Math.max(b.top,t.top),bottom:Math.min(b.bottom,t.bottom)};
+    const visibleRows=[...tasks.querySelectorAll('tbody tr')].filter(row=>{const r=rect(row);return r.top>=clip.top-.5&&r.bottom<=clip.bottom+.5;}).length;
+    const taskButtons=[...tasks.querySelectorAll('[data-hier-cgt-add]')].map(button=>({height:button.getBoundingClientRect().height/view.zoom,lines:button.scrollHeight>button.clientHeight+1,whiteSpace:getComputedStyle(button).whiteSpace}));
+    if(innerWidth<=700)body.scrollTop+=selected.getBoundingClientRect().top-body.getBoundingClientRect().top;
+    const c=rect(cards),viewport=rect(body),third=cards.querySelectorAll('[data-hier-member]')[2],thirdRect=rect(third);
+    const result={root,task_client_height:tasks.clientHeight,task_visible_height:Math.max(0,clip.bottom-clip.top),fully_visible_task_rows:visibleRows,
+     third_card_height:third.offsetHeight,third_card_fully_visible:thirdRect.top>=Math.max(c.top,viewport.top)-1&&thirdRect.bottom<=Math.min(c.bottom,viewport.bottom)+1,
+     task_buttons:taskButtons};
+    body.scrollTop=0;return result;
+   };
+   const current=measure();
+   const formerStyle=document.createElement('style');
+   formerStyle.textContent='.shot-hierarchy-dialog .hier-split{height:auto;grid-template-rows:none}.shot-hierarchy-dialog [data-hier-source-pane]{height:auto;display:block}.shot-hierarchy-dialog [data-hier-cgt]{display:block;flex:initial}.shot-hierarchy-dialog [data-hier-source-pane] .hier-cgt-scroll{flex:initial;min-height:auto;max-height:min(46vh,420px)}.shot-hierarchy-dialog .hier-query{display:grid;gap:4px;margin:8px 0}.shot-hierarchy-dialog .hier-query input{width:100%}.shot-hierarchy-dialog .hier-table td:last-child{white-space:normal}.shot-hierarchy-dialog [data-hier-cgt-add]{min-width:0;white-space:normal}';
+   dialog.append(formerStyle);
+   const tools=source.querySelector('.hier-project-tools');tools.after(account);
+   const query=document.createElement('label');query.className='hier-query';query.textContent='샷 · 상태 검색';
+   const input=document.createElement('input');query.append(input);account.after(query);
+   const oldMetadata=[];
+   for(const card of cards.querySelectorAll('[data-hier-member]')){
+    const text=document.createElement('small');text.textContent='CGT · Synthetic Artist · Work';
+    card.querySelector('.hier-row-head').after(text);oldMetadata.push(text);
+   }
+   const before=measure();
+   formerStyle.remove();query.remove();heading.append(account);oldMetadata.forEach(node=>node.remove());
+   const restored=measure();
+   return {view,baseline_scope:'former UI-only DOM fragments restored in synthetic fixture',before,after:current,restored};
+  },view);
+  assert.deepEqual(comparison.restored,comparison.after,'Comparison restored the product DOM exactly');
+  for(const key of ['x','y','width','height'])assert.ok(Math.abs(comparison.before.root[key]-comparison.after.root[key])<1,'Outer dialog changed during internal cleanup');
+  assert.ok(comparison.after.third_card_height<comparison.before.third_card_height,'Removing origin metadata must reduce each selected card height');
+  assert.ok(comparison.after.task_buttons.every(button=>button.whiteSpace==='nowrap'&&!button.lines),'Task Add buttons remain one line');
+  assert.ok(comparison.after.task_client_height>100,'The task list must retain a usable viewport in the stacked mobile grid');
+  assert.ok(comparison.after.fully_visible_task_rows>=comparison.before.fully_visible_task_rows,'The table must receive reclaimed visible height');
+  layoutComparisons.push(comparison);
+  if(report)await page.screenshot({path:path.join(report,'cgt-layout-current-'+view.width+'-'+view.height+'-zoom-'+view.zoom+'-synthetic.png')});
+  checks+=5;
+ }
+ assert.equal(await page.evaluate(()=>window.requests.length),comparisonRequests,'Layout inspection made no CGT request');
+ if(report)fs.writeFileSync(path.join(report,'cgt-layout-before-after-synthetic.json'),JSON.stringify({scope:'Isolated Chromium; product current vs former presentation fragments restored in the fixture',cases:layoutComparisons,cgt_writes:0,paid_requests:0},null,2));
+ await page.setViewportSize({width:1250,height:1000});await page.evaluate(()=>{document.body.style.zoom='1';});
  // A manually authored slot remains editable even when other slots retain
  // authenticated CGT assignments. All CGT identities and results are untouched.
  const mixed=await page.evaluate(value=>{
@@ -500,6 +583,19 @@ try{
  await page.evaluate(value=>window.openGraph(JSON.parse(value)),mixedSaved);
  assert.equal(await page.locator('[data-shot-name]').last().innerText(),'Manual mixed renamed');
  assert.equal(await page.locator('[data-shot-rename]:disabled').count(),4);checks+=6;
+ // Actual English rendering uses fixed local copy, including an empty result.
+ const englishState=await page.evaluate(()=>({...window.host,language:'en'}));
+ await page.evaluate(value=>{window.openGraph(value);window.catalog={status:'SOURCE_SCHEMA',tasks:[]};},englishState);
+ await openShots();await page.evaluate(()=>window.finish());
+ assert.match(await page.locator('[data-hier-cgt-status]').innerText(),/data format could not be verified/);
+ await page.locator('[data-hier-cgt-refresh]').click();
+ await page.evaluate(value=>{window.catalog={...value,tasks:[]};window.finish();},snapshot);
+ assert.match(await page.locator('[data-hier-cgt-status]').innerText(),/No AI_Shot tasks are assigned/);
+ const englishDiagnostics=await page.evaluate(()=>['TRUST_CHANGED','INVALID_ORIGIN','READ_SCOPE_REJECTED','OWNERSHIP_CHANGED','INVALID_BINDING',
+  'ACCESS_DENIED','RATE_LIMITED','SERVER_UNAVAILABLE','CONNECTION_FAILED','REQUEST_REJECTED']
+  .map(status=>window.w.hmbCgtStatusMessage(status,'en')));
+ assert(englishDiagnostics.every(value=>value.length>12&&!value.includes('could not be checked')));
+ assert(!await page.evaluate(()=>window.w.hmbCgtStatusMessage('secret-provider-body','en').includes('secret-provider-body')));checks+=13;
  assert.deepEqual(errors,[]);
 }finally{await browser?.close();await new Promise(resolve=>server.close(resolve));}
 console.log(JSON.stringify({status:'PASS',checks,synthetic_cgt_tasks:tasks.length,independent_slots:5,user_driven_multilevel_grouping:true,episode_filter:true,real_product_widgets:true,live_cgt_requests:0,cgt_writes:0,paid_requests:0}));

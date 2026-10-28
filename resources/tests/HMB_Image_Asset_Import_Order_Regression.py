@@ -1055,7 +1055,7 @@ try:
     assert not asset_library.parameter_exists(node, "IMAGE_MEDIA_OUT")
     expected_projects_root = os.environ.get(
         "HMB_IMAGE_PROJECTS_ROOT",
-        r"\\192.168.200.19\v\projects\Ai_Ct_image",
+        r"\\192.168.200.19\v\projects",
     )
     assert str(asset_library.DEFAULT_PROJECTS_ROOT) == expected_projects_root
     assert asset_library._default_state()["catalog_root"] == expected_projects_root.replace(

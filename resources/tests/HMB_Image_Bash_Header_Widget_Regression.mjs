@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
+import path from 'node:path';
 import {nativeTestPlaywright} from './_hmb_native_editor_fixture.mjs';
 import * as widget from '../../widgets/HMBImageBashWidget.js';
 
@@ -34,14 +35,14 @@ const playwright=nativeTestPlaywright();
 const widgetSource=fs.readFileSync(new URL('../../widgets/HMBImageBashWidget.js',import.meta.url),'utf8');
 const encodedState=JSON.stringify(state).replaceAll('<','\\u003c');
 const html=`<!doctype html><meta charset="utf-8"><title>Offline HMB Image Bash header fixture</title>
-<style>body{background:#101420;color:white}.react-flow__node{width:900px;min-height:210px}.react-flow__handle{background:rgb(100,100,100);border:1px solid rgb(90,90,90)}.react-flow__edge-path{stroke:rgb(22,33,44)}.react-flow__edge{display:inline}</style>
+<style>body{background:#101420;color:white}.react-flow__node{width:800px;min-height:210px}.react-flow__handle{background:rgb(100,100,100);border:1px solid rgb(90,90,90)}.react-flow__edge-path{stroke:rgb(22,33,44)}.react-flow__edge{display:inline}</style>
 <div id="flow"><svg class="react-flow__edges" width="900" height="120">
 <g class="react-flow__edge" id="image-edge" data-hmb-image-bash-image-edge="previous" data-id="${imageId}" aria-label="Edge from Library A to BashNode"><path class="react-flow__edge-path" d="M0 20L500 20"/></g>
 <g class="react-flow__edge" id="context-edge" data-id="${contextId}" aria-label="Edge from Library A to BashNode"><path class="react-flow__edge-path" d="M0 30L500 30"/></g>
 <g class="react-flow__edge" id="wrong-label" data-id="${imageId}-other" aria-label="Edge from Foreign to BashNode"><path class="react-flow__edge-path" d="M0 40L500 40"/></g>
 <g class="react-flow__edge" id="wrong-handle" data-id="Library A-IMAGE_BASH_IMAGES_OUT-BashNode-input_images_0-uuid" aria-label="Edge from Library A to BashNode"><path class="react-flow__edge-path" d="M0 50L500 50"/></g>
 <g class="react-flow__edge" id="foreign-edge" data-id="Library A-OTHER-BashNode-other-uuid" aria-label="Edge from Library A to BashNode"><path class="react-flow__edge-path" d="M0 60L500 60"/></g>
-</svg><div class="react-flow__nodes"><div class="react-flow__node" data-id="BashNode" data-hmb-image-bash="prior" id="node" style="width:900px;min-height:210px">
+</svg><div class="react-flow__nodes"><div class="react-flow__node" data-id="BashNode" data-hmb-image-bash="prior" id="node" style="width:800px;min-height:210px">
 <header id="native-header"><button id="native-run">Native Run</button></header>
 <span class="react-flow__handle" data-handleid="input_images" id="parent-handle"></span><span class="react-flow__handle" data-handleid="input_images_0" id="child-handle"></span><span class="react-flow__handle" data-handleid="image_bash_context" id="context-handle"></span>
 <div id="widget" style="height:77px;min-height:33px;color:rgb(8,9,10)"></div><div id="second-widget"></div><button id="stock-editor-button">Open Image Bash Editor</button></div>
@@ -97,7 +98,7 @@ try {
  const portal=await page.evaluate(()=>{
   const carrier=document.getElementById('widget'),identity=carrier.querySelector('[data-hmb-native-identity]'),actions=carrier.querySelector('[data-hmb-native-actions]');
   identity.append(Object.assign(document.createElement('input'),{value:'Native title'}));
-  actions.append(Object.assign(document.createElement('button'),{textContent:'Native unlock'}));
+  const button=Object.assign(document.createElement('button'),{textContent:'Native unlock'});button.style.width='96px';actions.append(button);
   window.nativeSlots=[identity,actions];
   carrier.dispatchEvent(new CustomEvent('hmb-color-lut-header-state',{detail:{active:true}}));
   return {active:carrier.querySelector('[data-hmb-image-bash-header]').getAttribute('data-hmb-native-header'),
@@ -113,7 +114,27 @@ try {
  assert.equal(await page.locator('#context-edge').evaluate(node=>getComputedStyle(node).display),'none');
  for(const id of ['wrong-label','wrong-handle','foreign-edge'])assert.equal(await stroke(id),'rgb(22, 33, 44)');
  assert.equal(await page.locator('#native-header').isVisible(),true);assert.equal(await page.locator('#stock-editor-button').isVisible(),true);
- assert.equal(await page.locator('#node').getAttribute('style'),'width:900px;min-height:210px');
+ assert.equal(await page.locator('#node').getAttribute('style'),'width:800px;min-height:210px');
+ const headerRects=await page.locator('[data-hmb-image-bash-header]').evaluate(header=>{
+  const rect=element=>{const r=element.getBoundingClientRect();return {left:r.left,right:r.right,top:r.top,bottom:r.bottom};};
+  return {header:rect(header),controls:[...header.querySelectorAll('[data-hmb-native-identity], [data-hmb-native-actions], [data-bash-count], [data-bash-source]')].map(rect)};
+ });
+ for(const item of headerRects.controls){assert.ok(item.left>=headerRects.header.left&&item.right<=headerRects.header.right,'800px header keeps controls inside its frame');}
+ for(let i=0;i<headerRects.controls.length;i++)for(let j=i+1;j<headerRects.controls.length;j++){
+  const a=headerRects.controls[i],b=headerRects.controls[j];assert.ok(a.right<=b.left||b.right<=a.left||a.bottom<=b.top||b.bottom<=a.top,'800px header controls do not overlap');
+ }
+ if(process.env.HMB_BASH_HEADER_REPORT_DIR){fs.mkdirSync(process.env.HMB_BASH_HEADER_REPORT_DIR,{recursive:true});
+  await page.locator('[data-hmb-image-bash-header]').screenshot({path:path.join(process.env.HMB_BASH_HEADER_REPORT_DIR,'header-800-synthetic.png')});
+  fs.writeFileSync(path.join(process.env.HMB_BASH_HEADER_REPORT_DIR,'header-800-geometry.json'),JSON.stringify({scope:'offline Chrome widget; native actions are synthetic',...headerRects},null,2));}
+ const beforeApplyStatus=await page.evaluate(()=>({writes:window.writes.length,state:structuredClone(window.current)}));
+ for(const status of ['Apply 검증 완료 · 이미지 저장 중','Apply 저장 및 이미지 출력 완료','저장된 Apply 이미지 복원 완료']){
+  await page.evaluate(status=>window.render({...window.current,status}),status);
+  assert.equal(await page.locator('[data-bash-status]').textContent(),status,'Header preserves the authoritative automatic Apply/restore status');
+  assert.equal(await page.locator('[data-bash-status]').getAttribute('title'),status);
+  assert.doesNotMatch(await page.locator('[data-bash-status]').textContent(),/Run/,'Successful Apply/restore adds no Run requirement');
+  assert.equal(await page.evaluate(()=>window.writes.length),beforeApplyStatus.writes,'Output or restore status does not issue another header command');
+ }
+ await page.evaluate(state=>window.render(state),beforeApplyStatus.state);
  const autoRefresh=await page.evaluate(async()=>{
   const pause=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
   const create=(id,visibility='visible')=>{const carrier=document.createElement('div');carrier.id=id;carrier.style.visibility=visibility;document.getElementById('node').append(carrier);return carrier;};
@@ -228,7 +249,8 @@ try {
  console.log(JSON.stringify({status:'PASS',scope:'offline Chromium product widget',persistent_64px_header:true,
   bind_unbind_refresh:true,latest_callback_unique_commands:true,locked_guard:true,escaping:true,
   exact_route_edges_only:true,mutation_reconcile:true,shared_carrier_cleanup:true,
-  one_visible_post_hydration_refresh:true,measurement_no_commands:true,live_griptape_verified:false}));
+  one_visible_post_hydration_refresh:true,measurement_no_commands:true,
+  automatic_apply_restore_status_no_extra_command:true,live_griptape_verified:false}));
 } finally {
  await browser?.close();await new Promise(resolve=>server.close(resolve));
 }

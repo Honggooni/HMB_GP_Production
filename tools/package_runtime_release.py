@@ -18,8 +18,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.8.35"
-RELEASE_VERSION = "0.8.35"
+RELEASE_LABEL = "v0.8.39"
+RELEASE_VERSION = "0.8.39"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -106,6 +106,7 @@ DISTRIBUTION_ONLY_FILES = (
     "THIRD_PARTY_NOTICES.md",
     "SBOM.spdx.json",
     "tools/hmb_color_lut_native_header_patch.py",
+    "tools/hmb_native_semantic_adapter.py",
     "resources/editor/hmb-color-lut-native-header.js",
     "resources/editor/native-editor-patch.json",
 )
@@ -119,7 +120,7 @@ CANONICAL_LF_SOURCE_FILES = {
     if PurePosixPath(relative).suffix.casefold() in {".py", ".js", ".json", ".md"}
     or relative == "LICENSE"
 }
-if len(RUNTIME_INSTALL_FILES) != 60 or len(DISTRIBUTION_ONLY_FILES) != 7:
+if len(RUNTIME_INSTALL_FILES) != 60 or len(DISTRIBUTION_ONLY_FILES) != 8:
     raise RuntimeError("Runtime/distribution release boundary count mismatch.")
 if set(RUNTIME_INSTALL_FILES) & set(DISTRIBUTION_ONLY_FILES):
     raise RuntimeError("Runtime and distribution-only release files overlap.")
@@ -204,17 +205,19 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
         raise RuntimeError("Native editor patch descriptor is missing or linked.")
     payload = json.loads(descriptor_path.read_text(encoding="utf-8"))
     expected_keys = {
-        "schema", "version", "editor_version", "bundle_name", "source_sha256",
+        "schema", "version", "source_profile", "bundle_name", "source_sha256",
         "candidate_sha256", "helper_path", "helper_sha256", "patcher_path", "patcher_sha256",
     }
-    if not isinstance(payload, dict) or set(payload) not in (
-        expected_keys, expected_keys | {"previous_candidate"}, expected_keys | {"previous_candidates"}
+    valid_keys = (expected_keys, expected_keys | {"previous_candidate"},
+                  expected_keys | {"previous_candidates"})
+    if not isinstance(payload, dict) or not any(
+        set(payload) in (keys, keys | {"additional_profiles"}) for keys in valid_keys
     ):
         raise RuntimeError("Native editor patch descriptor boundary is invalid.")
     if (
         payload["schema"] != "hmb-native-editor-patch-release"
         or type(payload["version"]) is not int or payload["version"] != 1
-        or payload["editor_version"] != "0.128.1"
+        or payload["source_profile"] != "reviewed-stock"
         or payload["bundle_name"] != "index-DEZU41rc.js"
         or payload["source_sha256"] != "1a0429b88c6b8dd1c7e6e053836d03f734a4d6453f8886e0693527c7498909e2"
         or payload["helper_path"] != "resources/editor/hmb-color-lut-native-header.js"
@@ -233,6 +236,10 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
         raise RuntimeError("Native editor previous candidate is not the reviewed patch.")
     reviewed_previous = [
         {
+            "bundle_sha256": "c7100b21f4cca2fa55a368b9ac2740c923b5545c3a526005835b3fe47c65e343",
+            "helper_sha256": "9d67418745b5264ec892835370da1d19a0695d878cb03c80de696f00601f52b5",
+        },
+        {
             "bundle_sha256": "5e358586ae4b47fd698225c640fb65a4ed5b53dd27a398aa291b0606501e3131",
             "helper_sha256": "34657ae82e7862d3c5fa798184623369537d798fe0b4baa313188e33fb15cec6",
         },
@@ -246,7 +253,7 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
         },
     ]
     if "previous_candidates" in payload and payload["previous_candidates"] not in (
-        reviewed_previous, reviewed_previous[1:]
+        reviewed_previous, reviewed_previous[1:], reviewed_previous[2:]
     ):
         raise RuntimeError("Native editor previous candidates are not the reviewed patches.")
     for kind in ("patcher", "helper"):
@@ -260,7 +267,7 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
     patcher = ROOT / payload["patcher_path"]
     for constant, key in (
         ("EXPECTED_SOURCE_SHA256", "source_sha256"),
-        ("EXPECTED_EDITOR_VERSION", "editor_version"),
+        ("SOURCE_PROFILE", "source_profile"),
         ("EXPECTED_BUNDLE_NAME", "bundle_name"),
     ):
         if module_string_constant(patcher, constant) != payload[key]:
@@ -273,13 +280,50 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
             if module_string_constant(patcher, constant) != payload["previous_candidate"][key]:
                 raise RuntimeError("Native editor patcher and previous candidate differ.")
     if "previous_candidates" in payload:
-        prefixes = ("SUPPORTED_RECENT", "SUPPORTED_CURRENT", "SUPPORTED_PREVIOUS")
-        if len(payload["previous_candidates"]) == 2:
-            prefixes = prefixes[1:]
+        prefixes = ("SUPPORTED_LATEST", "SUPPORTED_RECENT", "SUPPORTED_CURRENT", "SUPPORTED_PREVIOUS")
+        prefixes = prefixes[4 - len(payload["previous_candidates"]):]
         for row, prefix in zip(payload["previous_candidates"], prefixes):
             for suffix, key in (("_CANDIDATE_SHA256", "bundle_sha256"), ("_HELPER_SHA256", "helper_sha256")):
                 if module_string_constant(patcher, prefix + suffix) != row[key]:
                     raise RuntimeError("Native editor patcher and previous candidates differ.")
+    # A profile is an integrity-bound descriptor, not evidence that an adapter
+    # is approved. Runtime independently requires explicit readiness evidence.
+    profiles = payload.get("additional_profiles", [])
+    if not isinstance(profiles, list) or len(profiles) > 16:
+        raise RuntimeError("Native editor adapter profiles are invalid.")
+    seen = {payload["source_sha256"], payload["candidate_sha256"]}
+    seen.update(row["bundle_sha256"] for row in payload.get("previous_candidates", []))
+    if "previous_candidate" in payload:
+        seen.add(payload["previous_candidate"]["bundle_sha256"])
+    for profile in profiles:
+        required = {
+            "source_sha256", "candidate_sha256", "adapter_path", "adapter_sha256", "structural_fallback"
+        }
+        if (not isinstance(profile, dict) or not required.issubset(profile)
+            or set(profile) - required - {"previous_candidate_sha256"}
+            or profile["adapter_path"] != "tools/hmb_native_semantic_adapter.py"
+            or profile["structural_fallback"] is not False):
+            raise RuntimeError("Native editor adapter profile is invalid.")
+        for field in ("source_sha256", "candidate_sha256", "adapter_sha256"):
+            if not isinstance(profile[field], str) or re.fullmatch(r"[0-9a-f]{64}", profile[field]) is None:
+                raise RuntimeError("Native editor adapter profile hash is invalid: " + field)
+        source_hash, candidate_hash = profile["source_sha256"], profile["candidate_sha256"]
+        if source_hash in seen or candidate_hash in seen or source_hash == candidate_hash:
+            raise RuntimeError("Native editor adapter profile hash is duplicated.")
+        previous = profile.get("previous_candidate_sha256", [])
+        if (not isinstance(previous, list) or len(previous) > 16
+                or any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in previous)
+                or len(set(previous)) != len(previous)
+                or any(value in seen or value in (source_hash, candidate_hash) for value in previous)):
+            raise RuntimeError("Native editor previous adapter candidates are invalid.")
+        adapter = ROOT / profile["adapter_path"]
+        if not adapter.is_file() or adapter.is_symlink() or adapter.stat().st_size > 4 * 1024 * 1024:
+            raise RuntimeError("Native editor adapter is missing, linked or oversized.")
+        encoded = canonical_release_source_data(PurePosixPath(profile["adapter_path"]), adapter.read_bytes())
+        if digest(encoded) != profile["adapter_sha256"]:
+            raise RuntimeError("Native editor adapter profile hash mismatch.")
+        seen.update((source_hash, candidate_hash))
+        seen.update(previous)
     return payload
 
 

@@ -19,6 +19,8 @@ _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
+from _hmb_deletion_guard import hmb_binding_mutation
+
 
 def _load_hmb_common() -> Any:
     module_path = _THIS_DIR / "_hmb_common.py"
@@ -1663,6 +1665,7 @@ class HMBFinishLookLibrary(DataNode):
             return {"schema": "hmb-finish-authoring-import", "version": 1, "imported_count": len(exports),
                 "parameter_aliases": {}, "state_sha256": self._hmb_finish_authoring_state_sha256()}
 
+    @hmb_binding_mutation
     def _hmb_restore_finish_merge_snapshot(self, exported, *, expected_state_sha256=None):
         with self._state_lock:
             if expected_state_sha256 is not None and not hmac.compare_digest(str(expected_state_sha256), self._hmb_finish_authoring_state_sha256()):
@@ -1833,6 +1836,7 @@ class HMBFinishLookLibrary(DataNode):
         # authenticated catalog remains in _hmb_shot_catalog_snapshot.
         return {**normalized, "metadata_sha256": metadata_sha256, "shots": shots}
 
+    @hmb_binding_mutation
     def _hmb_reconcile_shot_routing(self, snapshot: Any) -> None:
         """Adopt one UUID-backed Shot without changing authored look values."""
 
@@ -1931,6 +1935,7 @@ class HMBFinishLookLibrary(DataNode):
             "code": "catalog_ready" if shot["shot_uuid"] else "only",
         }
 
+    @hmb_binding_mutation
     def _hmb_clear_shot_routing_catalog(
         self,
         reason: str = "publisher_unavailable",
@@ -2089,6 +2094,7 @@ class HMBFinishLookLibrary(DataNode):
                 raise RuntimeError("Finish Look could not republish its migrated Character Beauty snapshot.")
         return snapshot
 
+    @hmb_binding_mutation
     def _hmb_publish_routed_finish_snapshot(self, *, force: bool = False) -> bool:
         """Publish once after the router has attached the exact Seedance edge."""
 
@@ -2309,6 +2315,7 @@ class HMBFinishLookLibrary(DataNode):
             self._hmb_finish_persist_store()
             return copy.deepcopy(status)
 
+    @hmb_binding_mutation
     def after_value_set(self, parameter: Any, value: Any) -> Any:
         parent = getattr(super(), "after_value_set", None)
         result = parent(parameter, value) if callable(parent) else None
@@ -2394,6 +2401,7 @@ class HMBFinishLookLibrary(DataNode):
                 normalized = parent_value
         return normalized
 
+    @hmb_binding_mutation
     def set_parameter_value(self, name, value, *args, **kwargs):
         saved = kwargs.get("initial_setup") and not getattr(self, "_hmb_finish_store_syncing", False) and not getattr(self, "_syncing_widget", False)
         if saved:

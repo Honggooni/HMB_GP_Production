@@ -12,8 +12,21 @@ const hmbNativeStudioWidgets = new Set([
   "HMBImageAssetLibraryWidget", "HMBImageBashWidget", "HMBImageGenerationWidget",
   "HMBSeedanceGenerationWidget", "HMBPromptLibraryScopedBindingWidget", "HMBVideoPickerLibraryWidget",
 ]);
-const hmbIsNativeStudioType = (nodeType) => hmbNativeStudioTypes.has(nodeType);
-const hmbIsNativeStudioWidget = (widgetName) => hmbNativeStudioWidgets.has(widgetName);
+// Existing widgets retain their known UI behavior. New tools must explicitly
+// opt in with metadata owned by this library; a name prefix alone is not proof
+// that a third-party node supports this host UI contract. A new widget also
+// supplies [data-hmb-color-lut-widget], its node-type marker, the identity/action
+// slots and the existing header-ready/header-retire lifecycle events.
+function hmbNativeStudioDeclaredContract(metadata) {
+  const contract = metadata?.hmb_native_studio_ui;
+  return metadata?.library === "HMB_GP_Production" && contract?.schema === "hmb-native-studio-ui"
+    && contract?.version === 1 && typeof contract.node_type === "string" && !!contract.node_type
+    && typeof contract.widget === "string" && !!contract.widget ? contract : null;
+}
+const hmbIsNativeStudioType = (nodeType, metadata = null) => typeof nodeType === "string"
+  && (hmbNativeStudioTypes.has(nodeType) || hmbNativeStudioDeclaredContract(metadata)?.node_type === nodeType);
+const hmbIsNativeStudioWidget = (widgetName, metadata = null) => typeof widgetName === "string"
+  && (hmbNativeStudioWidgets.has(widgetName) || hmbNativeStudioDeclaredContract(metadata)?.widget === widgetName);
 const hmbNativeStudioCollapsedWidth = 320;
 const hmbNativeStudioCollapsedHeight = 64;
 const hmbNativeStudioViewMemory = new WeakMap();
@@ -71,7 +84,7 @@ function hmbNativeConnectionActions(nodeName, library, actions, className, style
     onPointerDown: stop, onDoubleClick: stop,
     onClick: event => { event.preventDefault(); event.stopPropagation(); hmbNativeOpenConnections(nodeName); },
     style: { ...style, width: 24, height: 24, padding: 3, display: "inline-flex", alignItems: "center",
-      justifyContent: "center", flexShrink: 0, cursor: "pointer" },
+      justifyContent: "center", flexShrink: 0, alignSelf: "center", cursor: "pointer" },
     children: (0, R.jsxs)("svg", { viewBox: "0 0 24 24", width: 17, height: 17, fill: "none",
       stroke: "currentColor", strokeWidth: 1.7, strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": true,
       children: [(0, R.jsx)("path", { d: "M10 13a5 5 0 0 0 7.1 0l3-3a5 5 0 0 0-7.1-7.1l-1.7 1.7" }),
@@ -392,21 +405,58 @@ function hmbNativeStudioNode(nodeName) {
   return typeof document === "undefined" ? null
     : document.querySelector(`.react-flow__node[data-id="${CSS.escape(nodeName)}"]`);
 }
-function hmbNativeStudioRecordCollapsed(nodeType, nodeName, collapsed) {
-  if (!hmbIsNativeStudioType(nodeType)) return;
+function hmbNativeStudioRecordCollapsed(nodeType, nodeName, collapsed, metadata = null) {
+  if (!hmbIsNativeStudioType(nodeType, metadata)) return;
   const node = hmbNativeStudioNode(nodeName);
   if (!node) return;
   const current = hmbNativeStudioCurrentController(node);
   if (current) current.intent = collapsed;
 }
+// Repair only the legacy impossible combination of an expanded HMB node and
+// the exact capsule dimensions, with a recorded expanded size. The node and
+// live geometry are checked immediately before the partial metadata update.
+function hmbNativeStudioRepairLegacySize(data, getNodes, updateNode) {
+  const metadata = data?.metadata, size = metadata?.size, expanded = hmbNativeStudioSavedSize(metadata?.hmb_native_studio_expanded_size);
+  if (!hmbIsNativeStudioType(data?.node_type, metadata) || data?.collapsed !== false || metadata?.rolledUp === true
+    || size?.width !== hmbNativeStudioCollapsedWidth || size?.height !== hmbNativeStudioCollapsedHeight || !expanded
+    || typeof getNodes !== "function" || typeof updateNode !== "function") return () => {};
+  let cancelled = false, frame = null, attempts = 0; const epoch = hmbNativeStudioFlowEpoch;
+  const same = live => !!live && live.id === data.node_name && live.data?.node_type === data.node_type && live.data?.collapsed === false
+    && live.data?.metadata?.size?.width === hmbNativeStudioCollapsedWidth && live.data?.metadata?.size?.height === hmbNativeStudioCollapsedHeight
+    && live.data?.metadata?.hmb_native_studio_expanded_size?.width === expanded.width
+    && live.data?.metadata?.hmb_native_studio_expanded_size?.height === expanded.height && !live.resizing;
+  const attempt = () => {
+    if (cancelled || epoch !== hmbNativeStudioFlowEpoch) return;
+    const live = getNodes().find(item => item.id === data.node_name);
+    if (!same(live)) return;
+    if (Number(live.width) !== expanded.width || Number(live.height) !== expanded.height) {
+      if (++attempts < 6) frame = requestAnimationFrame(attempt); return;
+    }
+    Xd.request("SetNodeMetadataRequest", { node_name: data.node_name, metadata: { size: { width: expanded.width, height: expanded.height } } })
+      .then(result => {
+        if (cancelled || epoch !== hmbNativeStudioFlowEpoch || result?.succeeded === false) return;
+        updateNode(data.node_name, latest => same(latest) && Number(latest.width) === expanded.width && Number(latest.height) === expanded.height
+          ? { ...latest, data: { ...latest.data, metadata: { ...latest.data.metadata, size: { width: expanded.width, height: expanded.height } } } } : latest);
+      }).catch(() => {});
+  };
+  frame = requestAnimationFrame(attempt);
+  return () => { cancelled = true; if (frame !== null) cancelAnimationFrame(frame); };
+}
 function hmbUseNativeStudioCollapseState(data, collapsed, setCollapsed, rolledUp = false, animatedSize = null) {
   const owner = (0, S.useRef)({});
-  const { updateNode } = Nu();
+  const { updateNode, getNodes } = Nu();
   const epoch = hmbNativeStudioFlowEpoch;
+  (0, S.useLayoutEffect)(() => hmbNativeStudioRepairLegacySize(data, getNodes, updateNode),
+    [data.node_name, data.node_type, data.collapsed, data.metadata?.rolledUp, data.metadata?.size?.width, data.metadata?.size?.height,
+      data.metadata?.hmb_native_studio_expanded_size?.width, data.metadata?.hmb_native_studio_expanded_size?.height, getNodes, updateNode, epoch]);
   (0, S.useLayoutEffect)(() => {
-    if (!hmbIsNativeStudioType(data.node_type)) return;
+    if (!hmbIsNativeStudioType(data.node_type, data.metadata)) return;
     const node = hmbNativeStudioNode(data.node_name);
     if (!node) return;
+    // Shell styling belongs to the HMB node, not to asynchronous widget slots.
+    // Layout effects run before paint; a retiring/reloading portal may fall
+    // back to native controls without revealing the stock rectangular frame.
+    node.setAttribute("data-hmb-native-studio-shell", "active");
     hmbInstallColorLUTUnifiedFrame(node.ownerDocument);
     if (collapsed) node.setAttribute("data-hmb-native-icon-layout", "active");
     else node.removeAttribute("data-hmb-native-icon-layout");
@@ -416,13 +466,14 @@ function hmbUseNativeStudioCollapseState(data, collapsed, setCollapsed, rolledUp
     else node.removeAttribute("data-hmb-native-rollup-layout");
     let current = hmbNativeStudioCollapseControllers.get(node);
     if (!current || current.owner !== owner.current || current.epoch !== epoch) {
-      current = { owner: owner.current, epoch, nodeType: data.node_type, intent: null,
+      current = { owner: owner.current, epoch, nodeType: data.node_type, metadata: data.metadata, intent: null,
         accent: hmbNativeStudioAccent(data.metadata?.hmb_native_studio_capsule_accent),
         expandedSize: data.collapsed ? hmbNativeStudioSavedSize(data.metadata?.hmb_native_studio_expanded_size) : null,
         rolledUp: !!data.metadata?.rolledUp,
         rollupSize: data.metadata?.rolledUp ? hmbNativeStudioSavedSize(data.metadata?.hmb_native_studio_rollup_size) : null };
       hmbNativeStudioCollapseControllers.set(node, current);
     }
+    current.metadata = data.metadata;
     current.animating = !!animatedSize;
     node.style.setProperty("--hmb-native-capsule-accent", current.accent || "#73517e");
     const wanted = typeof current.intent === "boolean" ? current.intent : data.collapsed;
@@ -442,13 +493,13 @@ function hmbUseNativeStudioCollapseState(data, collapsed, setCollapsed, rolledUp
       node.setAttribute("data-hmb-native-collapse-metadata", String(data.metadata?.collapsed));
       node.setAttribute("data-hmb-native-collapse-intent", String(current.intent));
     }
-  }, [data.node_type, data.node_name, data.collapsed, data.metadata?.collapsed,
+  }, [data.node_type, data.metadata?.library, data.metadata?.hmb_native_studio_ui, data.node_name, data.collapsed, data.metadata?.collapsed,
     data.metadata?.synthetic_diagnostic, collapsed, rolledUp, animatedSize, setCollapsed, updateNode, epoch]);
   (0, S.useEffect)(() => {
-    if (!hmbIsNativeStudioType(data.node_type) && data.collapsed !== void 0 && data.collapsed !== collapsed) setCollapsed(data.collapsed);
-  }, [data.node_type, data.collapsed]);
+    if (!hmbIsNativeStudioType(data.node_type, data.metadata) && data.collapsed !== void 0 && data.collapsed !== collapsed) setCollapsed(data.collapsed);
+  }, [data.node_type, data.metadata?.library, data.metadata?.hmb_native_studio_ui, data.collapsed]);
   (0, S.useLayoutEffect)(() => {
-    if (!hmbIsNativeStudioType(data.node_type)) return;
+    if (!hmbIsNativeStudioType(data.node_type, data.metadata)) return;
     const node = hmbNativeStudioNode(data.node_name), current = hmbNativeStudioCurrentController(node);
     if (!node || !current) return;
     if (!collapsed && !rolledUp) { hmbNativeStudioRestoreFoldedStyles(node, current); return; }
@@ -470,20 +521,21 @@ function hmbUseNativeStudioCollapseState(data, collapsed, setCollapsed, rolledUp
     const observer = new MutationObserver(force);
     observer.observe(node, { attributes: true, attributeFilter: ["style"] });
     return () => observer.disconnect();
-  }, [data.node_type, data.node_name, collapsed, rolledUp, animatedSize, epoch]);
+  }, [data.node_type, data.metadata?.library, data.metadata?.hmb_native_studio_ui, data.node_name, collapsed, rolledUp, animatedSize, epoch]);
   (0, S.useLayoutEffect)(() => () => {
-    if (!hmbIsNativeStudioType(data.node_type)) return;
+    if (!hmbIsNativeStudioType(data.node_type, data.metadata)) return;
     const node = hmbNativeStudioNode(data.node_name);
     if (node && hmbNativeStudioCollapseControllers.get(node)?.owner === owner.current) {
       hmbNativeStudioRestoreFoldedStyles(node, hmbNativeStudioCollapseControllers.get(node));
       node.removeAttribute("data-hmb-native-icon-layout");
       node.removeAttribute("data-hmb-native-rollup-layout");
       node.removeAttribute("data-hmb-native-fold-transition");
+      node.removeAttribute("data-hmb-native-studio-shell");
       node.style.removeProperty("--hmb-native-capsule-accent");
       hmbNativeStudioCollapseControllers.delete(node);
       for (const suffix of ["local", "prop", "metadata", "intent"]) node.removeAttribute(`data-hmb-native-collapse-${suffix}`);
     }
-  }, [data.node_type, data.node_name]);
+  }, [data.node_type, data.metadata?.library, data.metadata?.hmb_native_studio_ui, data.node_name]);
 }
 function hmbNativeStudioVisible(element, node) {
   if (!element?.isConnected || !element.getClientRects().length) return false;
@@ -516,8 +568,8 @@ function hmbNativeStudioToggleCompact(nodeType, nodeName, fallback) {
     } finally { hmbNativeStudioCompactDispatching.delete(node); }
   };
 }
-function hmbNativeStudioDoubleClick(nodeType, nodeName, fallback) {
-  if (!hmbIsNativeStudioType(nodeType)) return fallback;
+function hmbNativeStudioDoubleClick(nodeType, nodeName, fallback, metadata = null) {
+  if (!hmbIsNativeStudioType(nodeType, metadata)) return fallback;
   // Only existing product compact views toggle from a header double click.
   // A HMB node without that view must not expose native rollup as a substitute.
   return hmbNativeStudioCompactSurfaces[nodeType]
@@ -525,11 +577,19 @@ function hmbNativeStudioDoubleClick(nodeType, nodeName, fallback) {
 }
 function hmbNativeStudioCollapseMetadata(node, collapsed, maintainWidth) {
   const nodeType = node?.data?.node_type;
-  if (!hmbIsNativeStudioType(nodeType)) return {};
+  if (!hmbIsNativeStudioType(nodeType, node?.data?.metadata)) return {};
   const root = hmbNativeStudioNode(node.id), controller = hmbNativeStudioCurrentController(root);
   if (maintainWidth) return { hmb_native_studio_rollup_size: controller?.rollupSize || null };
-  const result = { hmb_native_studio_expanded_size: controller?.expandedSize || null,
+  const savedSize = node?.data?.metadata?.size, expanded = controller?.expandedSize, target = controller?.geometryTarget;
+  // A restore can otherwise persist collapsed:false alongside the old capsule
+  // size. Correct only a known capsule-to-expanded transition; a manual size
+  // or a width-preserving rollup remains owned by the native editor.
+  const restoringCapsule = !collapsed && !maintainWidth && savedSize?.width === hmbNativeStudioCollapsedWidth
+    && savedSize?.height === hmbNativeStudioCollapsedHeight && expanded && target
+    && target.newWidth === expanded.width && target.newHeight === expanded.height;
+  const result = { hmb_native_studio_expanded_size: expanded || null,
     hmb_native_studio_rollup_size: controller?.rollupSize || null,
+    ...(restoringCapsule ? { size: { width: expanded.width, height: expanded.height } } : {}),
     ...(controller?.accent ? { hmb_native_studio_capsule_accent: controller.accent } : {}) };
   if (!hmbNativeStudioCompactSurfaces[nodeType]) return result;
   if (!collapsed) return { ...result, hmb_native_studio_view: null };
@@ -551,12 +611,19 @@ function hmbNativeStudioRestoreView(nodeType, node, hint) {
   if (current.view !== wanted.view) hmbNativeStudioToggleCompact(nodeType, node.getAttribute("data-id"))();
 }
 function hmbNativeStudioConstructedNode(node) {
-  if (!hmbIsNativeStudioType(node?.data?.node_type) || node.type === "GroupNode" || !node.data.collapsed) return node;
-  return { ...node, width: hmbNativeStudioCollapsedWidth, height: hmbNativeStudioCollapsedHeight,
-    data: { ...node.data, hmb_native_studio_restore_view: node.data.metadata?.hmb_native_studio_view || null } };
+  if (!hmbIsNativeStudioType(node?.data?.node_type, node?.data?.metadata) || node.type === "GroupNode") return node;
+  const metadata = node.data.metadata || {};
+  if (node.data.collapsed) return { ...node, width: hmbNativeStudioCollapsedWidth, height: hmbNativeStudioCollapsedHeight,
+    data: { ...node.data, hmb_native_studio_restore_view: metadata.hmb_native_studio_view || null } };
+  const expanded = hmbNativeStudioSavedSize(metadata.hmb_native_studio_expanded_size);
+  if (metadata.collapsed === false && metadata.rolledUp !== true && expanded
+    && metadata.size?.width === hmbNativeStudioCollapsedWidth && metadata.size?.height === hmbNativeStudioCollapsedHeight) {
+    return { ...node, width: expanded.width, height: expanded.height };
+  }
+  return node;
 }
-function hmbNativeStudioDimensions(nodeType, collapsed, maintainWidth, width, height, metadataSize, restoreHeight, nodeName) {
-  if (!hmbIsNativeStudioType(nodeType)) return Tjr(collapsed, maintainWidth, width, height, metadataSize, restoreHeight);
+function hmbNativeStudioDimensions(nodeType, collapsed, maintainWidth, width, height, metadataSize, restoreHeight, nodeName, metadata = null) {
+  if (!hmbIsNativeStudioType(nodeType, metadata)) return Tjr(collapsed, maintainWidth, width, height, metadataSize, restoreHeight);
   const node = hmbNativeStudioNode(nodeName), current = hmbNativeStudioCurrentController(node);
   const size = hmbNativeStudioSavedSize({ version: 1, width: Number(width), height: Number(height) });
   if (maintainWidth) {
@@ -585,12 +652,12 @@ function hmbNativeStudioDimensions(nodeType, collapsed, maintainWidth, width, he
   return target;
 }
 function hmbNativeStudioFolded(node) {
-  if (!hmbIsNativeStudioType(node?.data?.node_type)) return false;
+  if (!hmbIsNativeStudioType(node?.data?.node_type, node?.data?.metadata)) return false;
   const root = hmbNativeStudioNode(node.id), current = hmbNativeStudioCurrentController(root);
   return !!(node.data.collapsed || node.data.metadata?.rolledUp || current?.intent === true || current?.rolledUp);
 }
 function hmbNativeStudioSuppressInitialSize(node, dimensions) {
-  if (!hmbIsNativeStudioType(node?.data?.node_type)) return false;
+  if (!hmbIsNativeStudioType(node?.data?.node_type, node?.data?.metadata)) return false;
   if (hmbNativeStudioFolded(node)) return true;
   const root = hmbNativeStudioNode(node.id), current = hmbNativeStudioCurrentController(root);
   if (!current?.geometryTarget) return false;
@@ -600,7 +667,7 @@ function hmbNativeStudioSuppressInitialSize(node, dimensions) {
   return false;
 }
 function hmbNativeStudioCollapsedMeasuredNode(node) {
-  const hmb = hmbIsNativeStudioType(node?.data?.node_type);
+  const hmb = hmbIsNativeStudioType(node?.data?.node_type, node?.data?.metadata);
   const current = hmb ? hmbNativeStudioCurrentController(hmbNativeStudioNode(node.id)) : null;
   if (current?.animating) return node;
   const size = hmb ? hmbNativeStudioCollapsedWidth : 300;
@@ -620,7 +687,7 @@ function hmbNativeStudioCollapsedMeasuredNodes(nodes, ids) {
 }
 function hmbNativeStudioOutgoingMetadata(nodeName, metadata) {
   const current = hmbNativeStudioCurrentController(hmbNativeStudioNode(nodeName));
-  if (!current || !hmbIsNativeStudioType(current.nodeType)) return metadata;
+  if (!current || !hmbIsNativeStudioType(current.nodeType, current.metadata)) return metadata;
   // Native geometry/position persistence spreads an older metadata snapshot.
   // Its dimensions remain original, but it cannot undo the latest view action.
   return { ...metadata,
@@ -630,11 +697,15 @@ function hmbNativeStudioOutgoingMetadata(nodeName, metadata) {
     ...(current.rollupSize ? { hmb_native_studio_rollup_size: current.rollupSize } : {}),
     ...(current.accent ? { hmb_native_studio_capsule_accent: current.accent } : {}) };
 }
-function hmbNativeStudioNodeStyle(nodeType, animatedSize, collapsed, minHeight, minWidth, locked, rolledUp) {
+function hmbNativeStudioNodeStyle(nodeType, animatedSize, collapsed, minHeight, minWidth, locked, rolledUp, metadata = null) {
   const original = Sjr(animatedSize, collapsed, minHeight, minWidth, locked, rolledUp);
-  return hmbIsNativeStudioType(nodeType) && collapsed && !animatedSize
-    ? { ...original, width: hmbNativeStudioCollapsedWidth, height: hmbNativeStudioCollapsedHeight,
-      minWidth: hmbNativeStudioCollapsedWidth, minHeight: hmbNativeStudioCollapsedHeight, overflow: "visible" } : original;
+  if (!hmbIsNativeStudioType(nodeType, metadata)) return original;
+  if (collapsed && !animatedSize) return { ...original, width: hmbNativeStudioCollapsedWidth, height: hmbNativeStudioCollapsedHeight,
+    minWidth: hmbNativeStudioCollapsedWidth, minHeight: hmbNativeStudioCollapsedHeight, overflow: "visible" };
+  // Keep native dimensions, animation overflow, locked opacity and error state.
+  // These visual defaults are present in the first React commit, before a
+  // widget mounts or a header-ready/retire event can change portal ownership.
+  return { ...original, background: "#0b111b", borderRadius: 24, boxShadow: "none" };
 }
 function hmbNativeStudioCollapsedHeader(nodeName, icon, headerStyle, expand, locked, error) {
   const restore = event => { event.preventDefault(); event.stopPropagation(); expand?.(); };
@@ -666,11 +737,11 @@ function hmbNativeStudioCollapsedHeader(nodeName, icon, headerStyle, expand, loc
       children: "Double Click to Unlock" })] });
 }
 
-function hmbUseColorLUTNativeHeader(nodeType, nodeName, hostExpanded, doubleClick, restoreView, collapsed = false) {
+function hmbUseColorLUTNativeHeader(nodeType, nodeName, hostExpanded, doubleClick, restoreView, collapsed = false, metadata = null) {
   const [slots, setSlots] = (0, S.useState)(null);
   const current = (0, S.useRef)(null);
   const refreshNodeGeometry = FEr();
-  const eligible = hmbIsNativeStudioType(nodeType) && hostExpanded;
+  const eligible = hmbIsNativeStudioType(nodeType, metadata) && hostExpanded;
   const valid = (candidate) => {
     if (!candidate?.container?.isConnected || !candidate.identity?.isConnected || !candidate.actions?.isConnected) return false;
     const node = candidate.container.closest?.(".react-flow__node");
@@ -697,7 +768,7 @@ function hmbUseColorLUTNativeHeader(nodeType, nodeName, hostExpanded, doubleClic
     container?.dispatchEvent?.(new CustomEvent("hmb-color-lut-header-state", { detail: { active } }));
   };
   (0, S.useLayoutEffect)(() => {
-    if (!hmbIsNativeStudioType(nodeType)) return;
+    if (!hmbIsNativeStudioType(nodeType, metadata)) return;
     let cancelled = false, frame = null, attempts = 0;
     const discover = (container) => {
       if (cancelled || !container) return false;
@@ -734,7 +805,8 @@ function hmbUseColorLUTNativeHeader(nodeType, nodeName, hostExpanded, doubleClic
       document.removeEventListener("hmb-color-lut-header-retire", retire);
       notify(current.current?.container, false); current.current = null;
     };
-  }, [nodeType, nodeName]);
+  }, [nodeType, nodeName, metadata?.library, metadata?.hmb_native_studio_ui?.schema,
+    metadata?.hmb_native_studio_ui?.version, metadata?.hmb_native_studio_ui?.node_type, metadata?.hmb_native_studio_ui?.widget]);
   const active = !!eligible && valid(slots);
   (0, S.useLayoutEffect)(() => {
     // ReactFlow may reuse a node DOM shell while opening a saved Workflow.
@@ -795,6 +867,8 @@ function hmbInstallColorLUTUnifiedFrame(doc) {
 .react-flow__node[data-hmb-native-rollup-layout=active]{min-height:48px!important}
 .react-flow__node[data-hmb-native-rollup-layout=active]:not([data-hmb-native-fold-transition]){height:48px!important}
 .hmb-native-capsule:focus-visible{outline:2px solid var(--hmb-native-capsule-accent,#c9a8d4);outline-offset:4px}
+.react-flow__node[data-hmb-native-studio-shell=active]:not([data-hmb-native-icon-layout=active])>div{background:#0b111b!important;border-radius:24px!important;box-shadow:none!important}
+.react-flow__node[data-hmb-native-studio-shell=active]:not([data-hmb-native-icon-layout=active])>div .group[class~="h-[48px]"]{background:#0b111b!important;border-radius:22px 22px 0 0!important;box-shadow:none!important}
 .react-flow__node[data-hmb-color-lut-native-layout=active]>div{background:#0b111b!important;border:1px solid #273241;border-radius:24px!important;box-shadow:none!important;overflow:visible!important}
 .react-flow__node[data-hmb-color-lut-native-layout=active].selected>div{border-color:#51637d}
 .react-flow__node[data-hmb-color-lut-native-layout=active] .bg-card{background:transparent!important}
@@ -804,6 +878,7 @@ function hmbInstallColorLUTUnifiedFrame(doc) {
 .react-flow__node[data-hmb-color-lut-native-layout=active] [data-handleid=video_url]{right:10px!important}
 .react-flow__node[data-hmb-color-lut-native-layout=active] .react-flow__handle-left:not([data-handleid=exec_in]){left:10px!important}
 .react-flow__node[data-hmb-color-lut-native-layout=active] .react-flow__handle-right:not([data-handleid=exec_out]){right:10px!important}
+.react-flow__node[data-hmb-color-lut-native-layout=active] .react-flow__handle{z-index:8!important}
 .react-flow__node[data-hmb-color-lut-native-layout=active] .react-flow__resize-control{opacity:0!important;background:transparent!important;border-color:transparent!important;box-shadow:none!important;z-index:6}
 .react-flow__node[data-hmb-color-lut-native-layout=active] .react-flow__resize-control.line:is(.left,.right){width:10px}
 .react-flow__node[data-hmb-color-lut-native-layout=active] .react-flow__resize-control.line:is(.top,.bottom){height:10px}
@@ -812,10 +887,10 @@ function hmbInstallColorLUTUnifiedFrame(doc) {
   doc.head.appendChild(style);
 }
 
-function hmbUseColorLUTFrameActive(nodeType, nodeName) {
+function hmbUseColorLUTFrameActive(nodeType, nodeName, metadata = null) {
   const [active, setActive] = (0, S.useState)(false);
   (0, S.useLayoutEffect)(() => {
-    if (!hmbIsNativeStudioType(nodeType)) return;
+    if (!hmbIsNativeStudioType(nodeType, metadata)) { setActive(false); return; }
     const node = document.querySelector(`.react-flow__node[data-id="${CSS.escape(nodeName)}"]`);
     if (!node) return;
     const sync = () => {
@@ -826,7 +901,8 @@ function hmbUseColorLUTFrameActive(nodeType, nodeName) {
     observer.observe(node, { attributes: true, attributeFilter: ["data-hmb-color-lut-native-layout"] });
     sync();
     return () => observer.disconnect();
-  }, [nodeType, nodeName]);
+  }, [nodeType, nodeName, metadata?.library, metadata?.hmb_native_studio_ui?.schema,
+    metadata?.hmb_native_studio_ui?.version, metadata?.hmb_native_studio_ui?.node_type, metadata?.hmb_native_studio_ui?.widget]);
   return active;
 }
 

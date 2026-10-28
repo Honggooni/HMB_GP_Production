@@ -1,15 +1,19 @@
 {
   "schema": "hmb-native-editor-patch-release",
   "version": 1,
-  "editor_version": "0.128.1",
+  "source_profile": "reviewed-stock",
   "bundle_name": "index-DEZU41rc.js",
   "source_sha256": "1a0429b88c6b8dd1c7e6e053836d03f734a4d6453f8886e0693527c7498909e2",
-  "candidate_sha256": "8dac42cd252f1a20aa31be61c7bafe1ff57e18f7e6ba34c3f5145207310e5ffc",
+  "candidate_sha256": "86ee3125de3fc8a89af95a9140dc1fc81d3a426f6f03bfdfbe673b561ff87a5a",
   "helper_path": "resources/editor/hmb-color-lut-native-header.js",
-  "helper_sha256": "a84dbe5302cfbf2edfc9c7a738801ba771df38df52064783debd775f7af44d3f",
+  "helper_sha256": "03137c19feb8f4fa4d5e371eb52bae3aaaccf4afb6a29f0098e815bccf65ee25",
   "patcher_path": "tools/hmb_color_lut_native_header_patch.py",
-  "patcher_sha256": "dbe90e7bf87975dae21c02b7ecefe3f9ddbfb6d91efdb5867ef95071e6d45bfb",
+  "patcher_sha256": "1270911855336771986b98e740f5dc4d7498a2543af92795a7f66c9c07cfb9bc",
   "previous_candidates": [
+    {
+      "bundle_sha256": "c7100b21f4cca2fa55a368b9ac2740c923b5545c3a526005835b3fe47c65e343",
+      "helper_sha256": "9d67418745b5264ec892835370da1d19a0695d878cb03c80de696f00601f52b5"
+    },
     {
       "bundle_sha256": "5e358586ae4b47fd698225c640fb65a4ed5b53dd27a398aa291b0606501e3131",
       "helper_sha256": "34657ae82e7862d3c5fa798184623369537d798fe0b4baa313188e33fb15cec6"
@@ -21,6 +25,19 @@
     {
       "bundle_sha256": "7bad6f6517c781c54e6d2e0cf170f0b2ed3bdef28b3cca57be79cce54bdd11bf",
       "helper_sha256": "39e5901cc8aa37d1d11850a255bcc209ab4724afe488817fc3f684a72ab01b63"
+    }
+  ],
+  "additional_profiles": [
+    {
+      "source_sha256": "157e06c446d68d77bab30cba4578f5a71289da74d62c44c95b0b6ddd046edde6",
+      "candidate_sha256": "72dc87c51089c65554a9fcb44f80e38872338bb5a9c1ca4c9058d582e981f6e5",
+      "adapter_path": "tools/hmb_native_semantic_adapter.py",
+      "adapter_sha256": "bebedaa8006a7a9c239501a48c7818d0c1c9081fd55838b78a6f7f185249665d",
+      "structural_fallback": false,
+      "previous_candidate_sha256": [
+        "ccabfc9bfddb67896231e0e75b067e659287f19fca143b2355f2c295d5da5251",
+        "bcb4ea1649a78258c87b795cb73762e09c96575b0f811cb8ec34f609e21c3e17"
+      ]
     }
   ]
 }

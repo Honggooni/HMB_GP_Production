@@ -149,6 +149,22 @@ with tempfile.TemporaryDirectory(prefix="hmb-direct-image-projects-") as tempora
         future = projects / "FutureShow" / "AI_CT_IMAGE"
         future.mkdir(parents=True)
         assert any(row["path"] == future.as_posix() for row in module._discover_project_catalog(projects)["projects"])
+    # A show vanishing from the same catalog is not a user request to clear
+    # its project, assets, or five saved Shot identities.
+    displaced = base / "temporarily-unavailable-show"
+    sw.rename(displaced)
+    try:
+        try:
+            module._load_project_catalog(projects, moved, use_shared_cache=False)
+        except ValueError as exc:
+            assert "no longer available" in str(exc)
+        else:
+            raise AssertionError("Disappeared selected project was silently cleared")
+        assert moved["shot_routing"] == before["shot_routing"]
+        assert moved["assets"] == before["assets"]
+        assert digest(workflow["bound_nodes"]) == authored_hash
+    finally:
+        displaced.rename(sw)
     for path in (sw_manifest, ka_manifest):
         assert (path.read_bytes(), path.stat().st_mtime_ns) == registration_before[str(path)]
     # A specifically configured independent catalog remains supported.

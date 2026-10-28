@@ -32,6 +32,8 @@ _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
+from _hmb_deletion_guard import hmb_binding_mutation
+
 import _hmb_screen_space as _screen_space
 import _hmb_shot_routing as _shot_routing
 import _hmb_video_tools as _video_tools
@@ -15663,6 +15665,7 @@ class HMBVideoPickerLibrary(DataNode):
         if isinstance(value, dict):
             self._hmb_shot_route_status = copy.deepcopy(value)
 
+    @hmb_binding_mutation
     def _hmb_reconcile_shot_routing(
         self,
         routing_snapshot: Any = None,
@@ -15838,6 +15841,7 @@ class HMBVideoPickerLibrary(DataNode):
                 self._sync_outputs_from_state(normalized)
             return self._hmb_shot_channel_subscription()
 
+    @hmb_binding_mutation
     def _hmb_reconcile_shot_routing_commit(
         self,
         routing_snapshot: Any = None,
@@ -16072,6 +16076,7 @@ class HMBVideoPickerLibrary(DataNode):
             self._sync_outputs_from_state(normalized)
         return self._hmb_shot_channel_subscription()
 
+    @hmb_binding_mutation
     def _hmb_clear_shot_routing_catalog(
         self,
         reason: str = "publisher_unavailable",
@@ -18257,6 +18262,7 @@ class HMBVideoPickerLibrary(DataNode):
             return _parse_picker_command(final_value)
         return final_value
 
+    @hmb_binding_mutation
     def set_parameter_value(
         self,
         param_name: str,
@@ -20200,6 +20206,7 @@ class HMBVideoPickerLibrary(DataNode):
             return
         raise ValueError(f"Unsupported HMB picker command: {action}")
 
+    @hmb_binding_mutation
     def after_value_set(
         self,
         parameter: Any,

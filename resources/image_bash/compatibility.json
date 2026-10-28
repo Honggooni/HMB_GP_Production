@@ -1,9 +1,8 @@
 {
   "schema": "hmb-image-bash-compatibility-v1",
   "adapter_revision": 1,
-  "review_policy": "Any changed hash/version requires explicit source review, adapter regression, real editor Apply/Run comparison and save/reopen verification before this baseline is deliberately replaced. This baseline is never auto-updated.",
+  "review_policy": "Changed Image Bash source or editor feature regions require explicit source review, adapter regression, real editor Apply/Run comparison and save/reopen verification before a baseline is deliberately replaced. Griptape release labels are not collected or consulted. Unrelated manifest changes are diagnostic only. This baseline is never auto-updated.",
   "standard": {
-    "library_version": "0.89.0",
     "manifest_sha256": "74959ef446637a1f9147abf406663a2cb9dbf0d144b62d0af1bccf271f0441d4",
     "source_sha256": "a41d5dad2dc08aaf34698bdf0e2484c70b173c44c19bd2556251f7748426a81f",
     "source_relative": "griptape_nodes_library/image/image_bash.py",
@@ -61,9 +60,6 @@
     }
   },
   "editor": {
-    "files": {
-      ".version": "7d5a3d51ab69c9831ffd5f79a4e7abc581e764824b4858b6d4583d8ea88191c6"
-    },
     "bundles": {
       "assets/index-DEZU41rc.js": {
         "sha256": "1a0429b88c6b8dd1c7e6e053836d03f734a4d6453f8886e0693527c7498909e2",
@@ -92,7 +88,71 @@
       "initial_observed_bundle_sha256": "5e479a335fe192656ab29668d2adaf08c7df1004ccbe0964972e8978a313caab",
       "color_lut_patched_bundle_sha256": "640168bcbc739c2dd8fabd87ad82cbb7c70f579c78001b4f4cbec2d64f660bf7",
       "exact_feature_regions_unchanged": true,
-      "scope_policy": "Gate editor version and exact Image Bash store, parameter-launch, brush/layer/modal load/export and settings source sections. Record whole-bundle SHA drift separately so unrelated reviewed Color LUT changes do not block Image Bash."
-    }
+      "scope_policy": "Gate exact Image Bash store, parameter-launch, brush/layer/modal load/export and settings source sections. Record whole-bundle SHA drift separately so unrelated editor changes do not block Image Bash. Version labels are diagnostic only."
+    },
+    "profiles": [
+      {
+        "id": "reviewed-image-bash-feature-regions",
+        "review_status": "approved",
+        "sha256": "157e06c446d68d77bab30cba4578f5a71289da74d62c44c95b0b6ddd046edde6",
+        "regions": {
+          "modal_store": {
+            "start": "var c6n={brushType:",
+            "end": ",f6n={isOpen:",
+            "sha256": "06ca8e832eb01b60ab0fa2f1f9eef52792ebb4aea35669e20d96eca7206b2d92",
+            "bytes": 2076
+          },
+          "parameter_launch": {
+            "start": "function yLr(e){let t=(0,w.c)(33),{label:",
+            "end": "function bLr(e){",
+            "sha256": "2ab03ef05d083264d3953078167f40fec8f1d3e9ecb13ff47a94484b6fb7cb06",
+            "bytes": 1655
+          },
+          "brush_layers_load_export_modal": {
+            "start": "function m5(e){if(e.startsWith(`rgba(`))",
+            "end": "function ari(e,t){var r,i;return e&&t?",
+            "sha256": "826292fb968e5b08a25604d9fa519af9d16207bee8052577b61bab1d65a0f208",
+            "bytes": 81979
+          },
+          "modal_settings": {
+            "start": "function jfi(e,t,r,i,a={min:0,max:1,step:.01})",
+            "end": ",Nfi=.15;",
+            "sha256": "e558188f374215a585c373202fc9c6071df84ecca9b3e14394672876c061ffd6",
+            "bytes": 2578
+          }
+        }
+      },
+      {
+        "id": "reviewed-hmb-live-image-bash-inputs",
+        "review_status": "approved",
+        "sha256": "72dc87c51089c65554a9fcb44f80e38872338bb5a9c1ca4c9058d582e981f6e5",
+        "regions": {
+          "modal_store": {
+            "start": "var c6n={brushType:",
+            "end": ",f6n={isOpen:",
+            "sha256": "06ca8e832eb01b60ab0fa2f1f9eef52792ebb4aea35669e20d96eca7206b2d92",
+            "bytes": 2076
+          },
+          "parameter_launch": {
+            "start": "function yLr(e){let t=(0,w.c)(33),{label:",
+            "end": "function bLr(e){",
+            "sha256": "2ab03ef05d083264d3953078167f40fec8f1d3e9ecb13ff47a94484b6fb7cb06",
+            "bytes": 1655
+          },
+          "brush_layers_load_export_modal": {
+            "start": "function m5(e){if(e.startsWith(`rgba(`))",
+            "end": "function ari(e,t){var r,i;return e&&t?",
+            "sha256": "cebdc2f0dfadf55b441365e78c4ddb851e1e4bbc51a67252304c122fa25a2e62",
+            "bytes": 95421
+          },
+          "modal_settings": {
+            "start": "function jfi(e,t,r,i,a={min:0,max:1,step:.01})",
+            "end": ",Nfi=.15;",
+            "sha256": "e558188f374215a585c373202fc9c6071df84ecca9b3e14394672876c061ffd6",
+            "bytes": 2578
+          }
+        }
+      }
+    ]
   }
 }

@@ -14,6 +14,7 @@ import threading
 import types
 from types import SimpleNamespace
 import uuid
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -273,6 +274,44 @@ try:
             asset_library._state_catalog_is_current = original_current_check
             asset_library._read_catalog_index = original_index_reader
         assert process_loads == [requested_process_root]
+
+        # A failed project reload must retain the last verified outputs and
+        # fail explicit Run instead of publishing them as freshly loaded data.
+        class FailedProjectProbe(ProcessRootProbe):
+            def __init__(self):
+                self.current = deepcopy(indexed_state)
+                self.synced = False
+            def _current_state(self):
+                return self.current
+            def _load_catalog(self, root_value):
+                self.current = dict(self.current, catalog_root=str(root_value), error="project root unavailable")
+                return self.current
+            def _sync_output(self, state, *, force=False):
+                self.synced = True
+                return state
+
+        failed = FailedProjectProbe()
+        retained_assets = deepcopy(failed.current["assets"])
+        with patch.object(asset_library, "_get_parameter_raw", side_effect=lambda _node, name:
+                          requested_process_root if name == asset_library.PROJECT_ROOT_PARAMETER else None):
+            try:
+                asset_library.HMBImageAssetLibrary.process(failed)
+                raise AssertionError("Unavailable selected project reported successful execution")
+            except ValueError as exc:
+                assert "previous selection and outputs were retained" in str(exc)
+        assert failed.current["assets"] == retained_assets and not failed.synced
+
+        # Failure publication must not stage the old project outputs.
+        class PublicationProbe:
+            def _current_state(self):
+                return deepcopy(indexed_state)
+            def _publish_state(self, state, **kwargs):
+                assert kwargs.get("preserve_outputs") is True
+                return state
+        with patch.object(asset_library, "_load_project_catalog", side_effect=OSError("project root unavailable")), \
+             patch.object(asset_library, "_diagnostic_exception"):
+            published = asset_library.HMBImageAssetLibrary._load_catalog(PublicationProbe(), requested_process_root)
+        assert published["assets"] == indexed_state["assets"] and "unavailable" in published["error"]
     finally:
         asset_library._ASSET_CATALOG_INDEX_ROOT = original_index_root
 

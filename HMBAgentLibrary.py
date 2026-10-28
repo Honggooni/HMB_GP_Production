@@ -20,6 +20,8 @@ _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
+from _hmb_deletion_guard import hmb_binding_mutation
+
 
 def _load_hmb_common():
     module_path = _THIS_DIR / "_hmb_common.py"
@@ -264,6 +266,8 @@ _HMB_NATIVE_FAILURE_CODES = frozenset({
     "MODEL_TIMEOUT",
     "MODEL_NETWORK",
     "MODEL_PROVIDER",
+    "MODEL_OR_ENDPOINT_NOT_FOUND",
+    "MODEL_REQUEST_INVALID",
     "HOST_ADAPTER",
     "EMPTY_OUTPUT",
 })
@@ -273,7 +277,12 @@ class _HMBModelSelectionRequired(RuntimeError):
     """A saved model must never be replaced by a different paid model."""
 
 
-def _hmb_execution_failure_message(code: str) -> str:
+_HMB_NATIVE_FAILURE_STAGES = frozenset({
+    "build_agent", "invoke_model", "capture_output", "node_finalize", "native_step", "native_process",
+})
+
+
+def _hmb_execution_failure_message(code: str, *, stage: str = "") -> str:
     """Describe an existing native failure without publishing provider payloads."""
 
     guidance = {
@@ -293,6 +302,14 @@ def _hmb_execution_failure_message(code: str) -> str:
         "MODEL_RATE_LIMIT": "The Agent model provider reported a rate or quota limit.",
         "MODEL_NETWORK": "The Agent model connection failed. Check the provider connection.",
         "MODEL_PROVIDER": "The Agent model provider reported an execution failure.",
+        "MODEL_OR_ENDPOINT_NOT_FOUND": (
+            "The Agent service returned HTTP 404. Check the selected model registration "
+            "and provider service path; this response alone does not identify which is missing."
+        ),
+        "MODEL_REQUEST_INVALID": (
+            "The Agent provider rejected the request with HTTP 400/422. Check the selected "
+            "model's supported inputs and request settings. No replacement model was invoked."
+        ),
         "HOST_ADAPTER": "The native Agent or model adapter could not complete execution.",
         "EMPTY_OUTPUT": "The Agent model returned no final text.",
     }
@@ -300,7 +317,9 @@ def _hmb_execution_failure_message(code: str) -> str:
     detail = guidance.get(normalized)
     if detail is None:
         return _HMB_EXECUTION_FAILED_MESSAGE
-    return f"{_HMB_EXECUTION_FAILED_MESSAGE} Reason: {normalized}. {detail}"
+    safe_stage = str(stage or "").strip().casefold()
+    suffix = f" Stage: {safe_stage}." if safe_stage in _HMB_NATIVE_FAILURE_STAGES else ""
+    return f"{_HMB_EXECUTION_FAILED_MESSAGE} Reason: {normalized}. {detail}{suffix}"
 
 
 def _hmb_native_failure_code(exc: BaseException) -> str:
@@ -309,20 +328,34 @@ def _hmb_native_failure_code(exc: BaseException) -> str:
     if isinstance(exc, _HMBModelSelectionRequired):
         return "MODEL_SELECTION_REQUIRED"
     status = None
-    for candidate in (
-        getattr(exc, "status_code", None),
-        getattr(getattr(exc, "response", None), "status_code", None),
-        getattr(exc, "code", None),
-    ):
-        try:
-            status = int(candidate)
+    current, seen = exc, set()
+    # SDK wrappers may retain the actual HTTP failure only as their cause.
+    # Inspect a bounded chain without retaining or publishing any payload text.
+    for _ in range(6):
+        if not isinstance(current, BaseException) or id(current) in seen:
             break
-        except (TypeError, ValueError, OverflowError):
-            continue
+        seen.add(id(current))
+        for candidate in (getattr(current, "status_code", None),
+                          getattr(getattr(current, "response", None), "status_code", None),
+                          getattr(current, "code", None)):
+            try:
+                parsed = int(candidate)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if 400 <= parsed <= 599:
+                status = parsed
+                break
+        if status is not None:
+            break
+        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
     if status == 401:
         return "MODEL_CREDENTIAL"
     if status == 403:
         return "MODEL_ACCESS"
+    if status == 404:
+        return "MODEL_OR_ENDPOINT_NOT_FOUND"
+    if status in {400, 422}:
+        return "MODEL_REQUEST_INVALID"
     if status == 429:
         return "MODEL_RATE_LIMIT"
     if status in {408, 504}:
@@ -1749,6 +1782,7 @@ class HMBAgentLibrary(_BaseAgent):
         value = self._hmb_widget_value(selected, getattr(self, "_hmb_shot_catalog_snapshot", {}))
         self.set_parameter_value(_AGENT_WIDGET_PARAMETER, value)
 
+    @hmb_binding_mutation
     def _hmb_prepare_manual_rebind(self, catalog, info):
         """Offer an explicit recovery choice after the migration backup exists."""
         if (getattr(self, "_hmb_node_deleted", False) or not isinstance(info, dict)
@@ -3485,7 +3519,8 @@ class HMBAgentLibrary(_BaseAgent):
             if str(exc) == _HMB_POLICY_UNAVAILABLE_MESSAGE or str(exc).startswith("[HMB_CONNECTION_DETACHED]"):
                 raise
             code = str(getattr(execution, "_hmb_native_failure_code", "") or _hmb_native_failure_code(exc))
-            raise RuntimeError(_hmb_execution_failure_message(code)) from None
+            raise RuntimeError(_hmb_execution_failure_message(
+                code, stage=getattr(execution, "_hmb_native_failure_stage", ""))) from None
         finally:
             if execution is not None:
                 execution._hmb_web_cancelled = True
@@ -3519,6 +3554,8 @@ class HMBAgentLibrary(_BaseAgent):
             return
         self._hmb_native_inference_started = False
         self._hmb_native_run_completed = False
+        self._hmb_native_failure_code = ""
+        self._hmb_native_failure_stage = ""
         self._hmb_run_hmb_source = False
         self._hmb_run_policy_applied = False
         self._hmb_policy_omitted = False
@@ -3547,7 +3584,8 @@ class HMBAgentLibrary(_BaseAgent):
             if str(exc) in known:
                 message, code = str(exc), known[str(exc)]
             else:
-                message = _hmb_execution_failure_message(code)
+                message = _hmb_execution_failure_message(
+                    code, stage=getattr(self, "_hmb_native_failure_stage", ""))
             self._publish_hmb_execution_block(message)
             self._set_hmb_execution_result("failed", code=code, message=message)
             return
@@ -3853,6 +3891,7 @@ class HMBAgentLibrary(_BaseAgent):
             "shot_name": name if bound else "Only",
         }
 
+    @hmb_binding_mutation
     def _hmb_clear_shot_routing_catalog(
         self, reason: str = "publisher_unavailable"
     ) -> dict[str, Any]:
@@ -4056,6 +4095,7 @@ class HMBAgentLibrary(_BaseAgent):
         self._set_native_prompt_preview("", enabled=False)
         return self._hmb_shot_channel_subscription()
 
+    @hmb_binding_mutation
     def _hmb_reconcile_shot_routing(self, snapshot: Any) -> None:
         """Adopt only the compact active-shot identity from an ImageAsset catalog."""
         if bool(getattr(self, "_hmb_node_deleted", False)):
@@ -4768,6 +4808,7 @@ class HMBAgentLibrary(_BaseAgent):
                 normalized = parent_value
         return normalized
 
+    @hmb_binding_mutation
     def after_value_set(self, parameter, value):
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return None
@@ -4884,6 +4925,7 @@ class HMBAgentLibrary(_BaseAgent):
     def _publication_parameter_name(value: Any) -> str:
         return str(getattr(value, "name", value) or "").strip().casefold()
 
+    @hmb_binding_mutation
     def set_parameter_value(self, name, value, *args, **kwargs):
         """Buffer protected output/log writes until final sanitization."""
 
@@ -5484,14 +5526,7 @@ class HMBAgentLibrary(_BaseAgent):
         """Retain only bounded diagnostics; never retain provider payload text."""
 
         normalized_stage = str(stage or "native_process").strip().casefold()
-        if normalized_stage not in {
-            "build_agent",
-            "invoke_model",
-            "capture_output",
-            "node_finalize",
-            "native_step",
-            "native_process",
-        }:
+        if normalized_stage not in _HMB_NATIVE_FAILURE_STAGES:
             normalized_stage = "native_process"
         normalized_code = str(code or "").strip().upper()
         if normalized_code not in _HMB_NATIVE_FAILURE_CODES:
@@ -6120,7 +6155,8 @@ class HMBAgentLibrary(_BaseAgent):
             pass
         if native_failed:
             failure_message = _hmb_execution_failure_message(
-                getattr(self, "_hmb_native_failure_code", "")
+                getattr(self, "_hmb_native_failure_code", ""),
+                stage=getattr(self, "_hmb_native_failure_stage", ""),
             )
             self._publish_hmb_execution_block(failure_message)
             raise RuntimeError(failure_message) from None
@@ -6372,6 +6408,7 @@ class _HMBWebRerenderExecution(HMBAgentLibrary):
     def _load_hmb_rules(self):
         raise RuntimeError("Web revision preserves parent policy; policy reload is unavailable.")
 
+    @hmb_binding_mutation
     def set_parameter_value(self, name, value, *args, **kwargs):
         key = self._publication_parameter_name(name)
         if self._hmb_capture_publications and key in {"output", "logs"}:
@@ -6548,6 +6585,7 @@ class _HMBAgentShotExecution(HMBAgentLibrary):
         self._hmb_shot_policy_identity = copy.deepcopy(self._hmb_policy_identity)
         return value
 
+    @hmb_binding_mutation
     def set_parameter_value(self, name, value, *args, **kwargs):
         key = self._publication_parameter_name(name)
         if self._hmb_capture_publications and key in {"output", "logs"}:

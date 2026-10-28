@@ -81,6 +81,8 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import write_si
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.traits.options import Options
 
+_HMB_LEGACY_PROMPT_RECOVERY_METADATA = "hmb_legacy_prompt_recovery_v1"
+
 
 def _write_generation_sidecar(file_path: Path, metadata: Any) -> None:
     """Use the installed host's sidecar API, without retrying a partial write."""
@@ -108,6 +110,8 @@ except Exception:  # Older Griptape Nodes builds keep the legacy selector alive.
 _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
+
+from _hmb_deletion_guard import hmb_binding_mutation
 
 from _hmb_mp4_verify import (
     MP4DecodeVerifier as _MP4DecodeVerifier,
@@ -3352,9 +3356,14 @@ class _HMBAIBrokerBridge:
                     name="video_syntax",
                     timeout=max(1.0, min(float(timeout), 30.0)),
                 )
-            except Exception as exc:
-                raise _BrokerProtocolError(
-                    "FN AI Broker Seedance 2.5 capabilities could not be verified. "
+            except _BrokerError:
+                # Keep authentication, transport and HTTP status diagnostics
+                # from the read-only capability request.  This is before any
+                # upload or create request; it is not an unknown submission.
+                raise
+            except (TimeoutError, OSError) as exc:
+                raise _BrokerUnavailableError(
+                    "FN AI Broker Seedance 2.5 capabilities could not be reached. "
                     "No render was submitted."
                 ) from exc
             if (
@@ -3426,10 +3435,18 @@ class _HMBAIBrokerBridge:
         requested_format = str(output_format or "").strip().lower()
         if requested_format not in OUTPUT_FORMAT_CHOICES:
             raise _BrokerProtocolError("Unsupported Seedance Draft output format. No render was submitted.")
-        response = self._queue_syntax(
-            BROKER_SEEDANCE_CAPABILITIES_PATH + "?draft=1", name="video_syntax",
-            timeout=max(1.0, min(float(timeout), 30.0)),
-        )
+        try:
+            response = self._queue_syntax(
+                BROKER_SEEDANCE_CAPABILITIES_PATH + "?draft=1", name="video_syntax",
+                timeout=max(1.0, min(float(timeout), 30.0)),
+            )
+        except _BrokerError:
+            raise
+        except (TimeoutError, OSError) as exc:
+            raise _BrokerUnavailableError(
+                "FN AI Broker Seedance Draft capabilities could not be reached. "
+                "No render was submitted."
+            ) from exc
         profile = response.get("models", {}).get(SEEDANCE_2_5_MODEL_ID) if isinstance(response, dict) and isinstance(response.get("models"), dict) else None
         if (not isinstance(response, dict)
                 or response.get("schema") != BROKER_SEEDANCE_CAPABILITIES_SCHEMA
@@ -5413,6 +5430,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self.parameter_output_values[GENERATED_VIDEO_SOURCE_PARAMETER] = deepcopy(source)
         return source
 
+    @hmb_binding_mutation
     def _hmb_publish_generated_video_source(self, *, force: bool = False) -> bool:
         """Republish the last success without executing this generator."""
         if getattr(self, "_hmb_node_deleted", False):
@@ -7363,6 +7381,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             }
         )
 
+    @hmb_binding_mutation
     def _hmb_reconcile_shot_routing(self, routing_snapshot: Any) -> None:
         snapshot = self._validate_shot_catalog_snapshot(routing_snapshot)
         identity = self._shot_identity()
@@ -7468,6 +7487,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "details": "",
         }
 
+    @hmb_binding_mutation
     def _hmb_reconcile_replacement_shot_routing(
         self,
         routing_snapshot: Any,
@@ -7498,6 +7518,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._hmb_clear_shot_routing_catalog("channel_replaced")
         self._hmb_reconcile_shot_routing(snapshot)
 
+    @hmb_binding_mutation
     def _hmb_clear_shot_routing_catalog(
         self,
         reason: str = "publisher_unavailable",
@@ -7618,6 +7639,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
         self._restore_generation_recovery_preview()
 
+    @hmb_binding_mutation
     def set_parameter_value(
         self,
         param_name: str,
@@ -7685,6 +7707,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         elif param_name == "prompt":
             projected = self._hmb_managed_prompt_projection()
             if projected is not None:
+                # A legacy workflow can carry an authored input even when its
+                # live port is now managed by an Agent. Preserve the exact
+                # serialized input before applying the per-Shot projection.
+                # Recovery is inert metadata: never send it to a model, expose
+                # it as a port, or overwrite an older recovery on reopen.
+                metadata = getattr(self, "metadata", None)
+                if (initial_setup and isinstance(value, str) and value and value != projected
+                        and isinstance(metadata, dict) and _HMB_LEGACY_PROMPT_RECOVERY_METADATA not in metadata):
+                    metadata[_HMB_LEGACY_PROMPT_RECOVERY_METADATA] = {
+                        "schema": "hmb-legacy-prompt-recovery", "version": 1, "value": value,
+                    }
                 value = projected
                 if (not initial_setup
                         and getattr(self, "parameter_values", {}).get("prompt") == projected):
@@ -8160,6 +8193,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 normalized = parent_value
         return normalized
 
+    @hmb_binding_mutation
     def after_value_set(self, parameter: Parameter, value: Any) -> None:
         """Mirror Standard Seedance media visibility for the selected mode."""
         controller = getattr(self, "_hmb_my_box_controller_instance", None)
@@ -16256,6 +16290,7 @@ class _HMBWebRerenderExecution(HMBSeedanceGeneration):
         self._web_parameter_cache[name] = value
         return deepcopy(value)
 
+    @hmb_binding_mutation
     def set_parameter_value(self, name: str, value: Any, *args: Any, **kwargs: Any) -> None:
         self._web_parameter_cache[name] = deepcopy(value)
         self.parameter_values[name] = deepcopy(value)

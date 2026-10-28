@@ -53,7 +53,7 @@ from _hmb_image_generation import (
     JOB_PENDING_STATUSES, MAX_IMAGE_BYTES, prepare_invocation, validate_image_bytes,
     BUILTIN_IMAGE_MODEL_PROFILES, CAPABILITIES_SCHEMA, model_defaults, parse_capabilities,
     serialize_option_schema, serialize_option_spec,
-    GOOGLE_NATIVE_CONTRACT,
+    GOOGLE_NATIVE_CONTRACT, image_job_failure_message,
 )
 
 logger = logging.getLogger(__name__)
@@ -991,7 +991,9 @@ class HMBImageGeneration(SuccessFailureNode):
                     await self._save_completed_images(broker, checkpoint, job, token)
                     return
                 if job["status"] in JOB_FAILURE_STATUSES:
-                    raise ImageGenerationError(f"Image generation ended: {job['status']}. Task {job['job_id']} retained.")
+                    reason = image_job_failure_message(job)
+                    details = f"Image generation ended: {job['status']}. Task {job['job_id']} retained."
+                    raise ImageGenerationError(details + (" " + reason if reason else ""))
                 if asyncio.get_running_loop().time() >= deadline:
                     raise ImageGenerationError("Image polling timed out. Retrieve the same Task; no replacement was submitted.")
                 pause_until = asyncio.get_running_loop().time() + self.POLL_INTERVAL_SECONDS

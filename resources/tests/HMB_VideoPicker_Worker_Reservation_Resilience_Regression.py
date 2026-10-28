@@ -92,6 +92,27 @@ class WorkerReservationResilience(unittest.TestCase):
         self.assert_released(node)
         self.assert_next_read_runs(case)
 
+    def test_missing_dcc_and_ffmpeg_report_reason_without_losing_completed_output(self):
+        case = self.case()
+        node = case.node
+        node._start_ui_operation('run_video', self.reserve(node))
+        initial = node._picker_state()
+        self.assertTrue(initial['videos'])
+        original_videos = [item['video_uid'] for item in initial['videos']]
+        original_output = list(node.parameter_output_values['VIDEO_OUT'])
+        for message in ('No mayabatch installation was found.',
+                        'FFmpeg was not found. Install imageio-ffmpeg.',
+                        'Blender executable was not found.',
+                        'Could not save output file: permission denied.'):
+            with self.subTest(message=message):
+                state = node._picker_state(); state['operation_kind'] = 'run_video'; node._write_state(state)
+                node._set_failed_state(FileNotFoundError(message))
+                after = node._picker_state()
+                self.assertEqual(after['status'], 'FAILED')
+                self.assertIn(message, after['message'])
+                self.assertEqual([item['video_uid'] for item in after['videos']], original_videos)
+                self.assertEqual(node.parameter_output_values['VIDEO_OUT'], original_output)
+
     def test_original_preflight_releases_when_failure_card_publication_rejects(self):
         case = self.case()
         node = case.node

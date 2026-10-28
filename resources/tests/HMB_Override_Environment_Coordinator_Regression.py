@@ -251,7 +251,7 @@ class NativeEditorCoordinator(unittest.TestCase):
         self.patcher=self.root/'tools/hmb_color_lut_native_header_patch.py';self.patcher.write_text('# fixed private CLI\n','utf-8')
         self.helper=self.root/'resources/editor/hmb-color-lut-native-header.js';self.helper.write_text('// private helper\n','utf-8')
         self.descriptor=self.root/'resources/editor/native-editor-patch.json'
-        self.descriptor_value=dict(schema='hmb-native-editor-patch-release',version=1,editor_version='0.128.1',
+        self.descriptor_value=dict(schema='hmb-native-editor-patch-release',version=1,source_profile='reviewed-stock',
             bundle_name='index-DEZU41rc.js',helper_path='resources/editor/hmb-color-lut-native-header.js',
             patcher_path='tools/hmb_color_lut_native_header_patch.py',candidate_sha256='a'*64)
         self.update_descriptor()
@@ -266,6 +266,10 @@ class NativeEditorCoordinator(unittest.TestCase):
         self.ns['_HMB_NATIVE_EDITOR_STATE_MODULE']+='_'+self.root.parents[3].name.replace('-','_')
         self.addCleanup(lambda:sys.modules.pop(self.ns['_HMB_NATIVE_EDITOR_STATE_MODULE'],None))
         self.ns['_hmb_native_editor_documents_path']=lambda:self.documents
+        # Default worker identity models an already-matching editor. Individual
+        # tests below exercise the real fingerprint reader and file races.
+        self.runtime=('private/editor.js','e'*64,'a'*64)
+        self.ns['_hmb_native_editor_runtime_fingerprint']=lambda:self.runtime
         self.ns['_hmb_environment_job']=lambda process:lambda:None
         class Owner:pass
         self.owner=Owner();self.engine=Owner()
@@ -288,7 +292,7 @@ class NativeEditorCoordinator(unittest.TestCase):
         success=status in {'current','applied'}
         return dict(schema='hmb-native-editor-git-override',version=1,status=status,reason='private_fixture',
             disk_ready=success,restart_required=True,renderer_verified=False,
-            candidate_sha256='a'*64,editor_version='0.128.1')
+            candidate_sha256='a'*64,source_profile='reviewed-stock')
     def run_coordinator(self,owner=None):
         return self.ns['_hmb_coordinate_native_editor_update'](owner or self.owner,self.engine,self.data)
     def settled(self,owner=None):
@@ -313,6 +317,20 @@ class NativeEditorCoordinator(unittest.TestCase):
         self.data.name='Foreign'
         self.assertEqual(self.run_coordinator()['reason'],'not_hmb_library')
         self.assertEqual(self.calls,[])
+    def test_reviewed_adapter_is_integrity_checked_and_part_of_worker_identity(self):
+        adapter=self.root/'tools/hmb_native_semantic_adapter.py'
+        adapter.write_text('# private reviewed adapter\n','utf-8')
+        self.descriptor_value['additional_profiles']=[dict(source_sha256='b'*64,candidate_sha256='c'*64,
+            adapter_path='tools/hmb_native_semantic_adapter.py',adapter_sha256=hashlib.sha256(adapter.read_bytes()).hexdigest(),
+            structural_fallback=False)]
+        self.update_descriptor()
+        value=self.run_coordinator();self.assertEqual(value['status'],'pending')
+        self.assertEqual(self.settled()['status'],'applied')
+        self.assertEqual(len(self.calls),1)
+        self.assertIn('adapter:tools/hmb_native_semantic_adapter.py',dict(self.owner._hmb_native_editor_update_identity[1]))
+        adapter.write_text('# changed untrusted adapter\n','utf-8')
+        self.assertEqual(self.run_coordinator()['status'],'error')
+        self.assertEqual(len(self.calls),1)
     def test_all_support_sources_required_and_integrity_checked(self):
         for path in (self.patcher,self.helper,self.descriptor):
             before=path.read_bytes();path.unlink()
@@ -362,6 +380,61 @@ class NativeEditorCoordinator(unittest.TestCase):
         self.assertEqual(self.run_coordinator()['status'],'error')
         self.assertFalse(self.engine._hmb_native_editor_update_summary['disk_ready'])
         self.assertEqual(len(self.calls),1)
+    def test_changed_active_editor_invalidates_success_and_starts_fresh_check(self):
+        self.run_coordinator();self.assertTrue(self.settled()['disk_ready'])
+        self.runtime=('private/new-editor.js','f'*64,'b'*64)
+        self.response=self.reply('unsupported')
+        self.run_coordinator();self.assertEqual(self.settled()['status'],'unsupported')
+        self.assertFalse(self.engine._hmb_native_editor_update_summary['disk_ready'])
+        self.assertEqual(len(self.calls),2)
+    def test_editor_changed_during_child_cannot_publish_success(self):
+        def child(*args):
+            self.calls.append(args)
+            self.runtime=('private/new-editor.js','f'*64,'b'*64)
+            return self.reply('applied')
+        self.ns['_hmb_native_editor_child']=child
+        self.run_coordinator();value=self.settled()
+        self.assertEqual(value['reason'],'native_editor_changed_during_update')
+        self.assertFalse(value['disk_ready']);self.assertFalse(value['renderer_verified'])
+    def test_applied_candidate_changes_only_bundle_hash_and_can_publish(self):
+        self.runtime=('private/editor.js','e'*64,'b'*64)
+        def child(*args):
+            self.calls.append(args)
+            self.runtime=('private/editor.js','e'*64,'a'*64)
+            return self.reply('applied')
+        self.ns['_hmb_native_editor_child']=child
+        self.run_coordinator();self.assertEqual(self.settled()['status'],'applied')
+        # The vendor restores the exact original bytes in the same process.
+        # The previous successful application must not be reused for them.
+        self.runtime=('private/editor.js','e'*64,'b'*64)
+        self.run_coordinator();self.assertEqual(self.settled()['status'],'applied')
+        self.assertEqual(len(self.calls),2)
+    def test_runtime_fingerprint_uses_active_entry_and_rejects_ambiguous_or_changing_html(self):
+        node=next(n for n in TREE.body if isinstance(n,ast.FunctionDef) and n.name=='_hmb_native_editor_runtime_fingerprint')
+        exec(compile(ast.Module([node],[]),str(SOURCE),'exec'),self.ns)
+        root=self.root/'local/ai.griptape.nodes.desktop/current/resources/editor-bundle'
+        assets=root/'assets';assets.mkdir(parents=True)
+        first=assets/'index-first.js';second=assets/'index-second.js'
+        first.write_text('first private bytes');second.write_text('second private bytes')
+        html=root/'index-editor.html';html.write_text('<script src="./assets/index-first.js"></script>')
+        with mock.patch.dict(os.environ,{'LOCALAPPDATA':str(self.root/'local')}):
+            fingerprint=self.ns['_hmb_native_editor_runtime_fingerprint']()
+            self.assertEqual(Path(fingerprint[0]),first)
+            first.write_text('changed private bytes')
+            self.assertNotEqual(fingerprint,self.ns['_hmb_native_editor_runtime_fingerprint']())
+            html.write_text('<script src="./assets/index-second.js"></script>')
+            self.assertEqual(Path(self.ns['_hmb_native_editor_runtime_fingerprint']()[0]),second)
+            original_read=Path.read_bytes
+            def change_entry_after_bundle(path):
+                data=original_read(path)
+                if path==second:html.write_text('<script src="./assets/index-first.js"></script>')
+                return data
+            with mock.patch.object(Path,'read_bytes',change_entry_after_bundle):
+                with self.assertRaisesRegex(ValueError,'entry_changed'):
+                    self.ns['_hmb_native_editor_runtime_fingerprint']()
+            html.write_text('<script src="./assets/index-first.js"></script><script src="./assets/index-second.js"></script>')
+            with self.assertRaisesRegex(ValueError,'ambiguous'):
+                self.ns['_hmb_native_editor_runtime_fingerprint']()
     def test_late_old_generation_cannot_replace_new_engine_status(self):
         entered=threading.Event();release=threading.Event();old_owner=self.owner
         def child(*args):
@@ -393,6 +466,16 @@ class NativeEditorCoordinator(unittest.TestCase):
         self.assertEqual(command,[str(Path(sys.executable)),'-I','-B',str(self.patcher),'--apply-git-override'])
         self.assertNotIn('API_KEY',kwargs['env']);self.assertNotIn('HMB_FAKE_TOKEN',kwargs['env'])
         self.assertIs(kwargs['close_fds'],True);self.assertEqual(kwargs['cwd'],str(self.root))
+    def test_additional_reviewed_candidate_is_accepted_without_matching_editor_version(self):
+        self.descriptor_value['additional_profiles']=[dict(source_sha256='b'*64,candidate_sha256='c'*64,
+            adapter_path='tools/hmb_native_semantic_adapter.py',adapter_sha256='d'*64,structural_fallback=False)]
+        response=self.reply('applied');response.update(candidate_sha256='c'*64,source_profile='reviewed-adapter')
+        class Process:
+            returncode=0
+            def communicate(self,*,timeout):return json.dumps(response).encode(),None
+            def poll(self):return 0
+        with mock.patch.object(subprocess,'Popen',return_value=Process()):
+            self.assertEqual(self.child_function()(self.root,Path(sys.executable),self.descriptor_value),response)
     def test_malformed_or_false_ready_child_replies_are_errors(self):
         child=self.child_function();payload=self.reply('applied');code=0
         class Process:
@@ -410,7 +493,7 @@ class NativeEditorCoordinator(unittest.TestCase):
             code=0;payload=self.reply('pending');payload['disk_ready']=True
             with self.assertRaises(ValueError):child(self.root,Path(sys.executable),self.descriptor_value)
     def test_real_isolated_child_cli_uses_private_fixture_only(self):
-        self.patcher.write_text('import json,os,sys\nprint(json.dumps(dict(schema="hmb-native-editor-git-override",version=1,status="current",reason="private_fixture",disk_ready=True,restart_required=True,renderer_verified=False,editor_version="0.128.1",candidate_sha256="a"*64,isolated=sys.flags.isolated,bytecode=sys.dont_write_bytecode,secret="HMB_FAKE_TOKEN" in os.environ)))\n','utf-8')
+        self.patcher.write_text('import json,os,sys\nprint(json.dumps(dict(schema="hmb-native-editor-git-override",version=1,status="current",reason="private_fixture",disk_ready=True,restart_required=True,renderer_verified=False,source_profile="reviewed-stock",candidate_sha256="a"*64,isolated=sys.flags.isolated,bytecode=sys.dont_write_bytecode,secret="HMB_FAKE_TOKEN" in os.environ)))\n','utf-8')
         child=self.child_function()
         with mock.patch.dict(os.environ,{'HMB_FAKE_TOKEN':'fixture-only'}):
             result=child(self.root,Path(sys.executable),self.descriptor_value)
@@ -428,6 +511,7 @@ nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and (n.name.startsw
 scope=dict(Path=Path,Any=object,sys=sys,os=os,hashlib=hashlib,json=json,threading=threading,logging=logging,types=types,weakref=weakref,UUID=UUID,__file__=str(folder/'_hmb_library_bootstrap.py'),__name__='private_process_fixture',_LIBRARY_NAME='HMB_GP_Production')
 exec(compile(ast.Module(body=nodes,type_ignores=[]),str(source),'exec'),scope)
 scope['_hmb_native_editor_documents_path']=lambda:documents
+scope['_hmb_native_editor_runtime_fingerprint']=lambda:('private/editor.js','e'*64,'a'*64)
 calls=[]
 def child(*args):
     calls.append(True)

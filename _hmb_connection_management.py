@@ -7,6 +7,8 @@ No provider, renderer, media decoder, file probe or account operation is used.
 """
 from __future__ import annotations
 
+from _hmb_deletion_guard import hmb_binding_management
+
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
@@ -516,6 +518,7 @@ def _native(engine: Any, operation: str, row: dict) -> None:
         raise ValueError(str(result.result_details))
 
 
+@hmb_binding_management
 def manage(engine: Any, node_name: str, operation: str, expected_state_token: str) -> dict:
     if operation not in {"disconnect", "reconnect", "forget_missing"} or not isinstance(expected_state_token, str) or not expected_state_token:
         raise ValueError("연결 관리 요청이 올바르지 않습니다.")
@@ -670,6 +673,55 @@ def guard_request(engine: Any, request: Any) -> Any:
     return None
 
 
+def _leased_port_removal(engine: Any, request: Any) -> bool:
+    """Protect actual detached wire endpoints and their containers, not nodes."""
+    if _INTERNAL.get() or type(request).__name__ != "RemoveParameterFromNodeRequest":
+        return False
+    name = request.node_name
+    if not name:
+        context = engine.context_manager
+        if not context.has_current_node():
+            return False
+        name = context.get_current_node().name
+    with _LOCK:
+        nodes, parents = _inventory(engine)
+        node = nodes.get(name)
+        if node is None or not _id(node):
+            return False
+        requested = request.parameter_name
+        for row in _fences(node):
+            if row.get("kind") != "wire":
+                continue
+            owner_matches = [value for value in nodes.values() if _id(value) == row.get("owner_id")]
+            if len(owner_matches) != 1:
+                continue
+            owner = owner_matches[0]
+            if (parents.get(owner.name) != parents.get(name) or not is_detached(owner)
+                    or _state(owner).get("recipe", {}).get("flow_name") != parents.get(name)
+                    or not any(_record_key(item) == _record_key(row)
+                               for item in _state(owner).get("recipe", {}).get("relations", []))):
+                continue
+            try:
+                _endpoint(nodes, parents, row.get("source_id", ""), parents[name])
+                _endpoint(nodes, parents, row.get("target_id", ""), parents[name])
+            except ValueError:
+                # An orphaned record cannot reserve a surviving node's ports.
+                continue
+            for side in ("source", "target"):
+                if row.get(side + "_id") != _id(node):
+                    continue
+                port_name = row.get(side + "_parameter_name")
+                port = node.get_parameter_by_name(port_name) if port_name else None
+                seen = set()
+                while port is not None and port.name not in seen:
+                    seen.add(port.name)
+                    if port.name == requested:
+                        return True
+                    parent = getattr(port, "parent_container_name", None)
+                    port = node.get_parameter_by_name(parent) if parent else None
+        return False
+
+
 def install_request_handlers(engine: Any, registration: Any) -> Any:
     from dataclasses import dataclass, field
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayloadSuccess, ResultPayloadFailure
@@ -718,6 +770,17 @@ def install_request_handlers(engine: Any, registration: Any) -> Any:
         def __init__(self, owner_ref, engine_ref):
             self.owner_ref, self.engine_ref = owner_ref, engine_ref
 
+        def protect_detached_ports(self, request, _context):
+            owner, current = self.owner_ref(), self.engine_ref()
+            if owner is None or not owner.active or current is None:
+                return None
+            if _leased_port_removal(current, request):
+                from griptape_nodes.retained_mode.events.parameter_events import RemoveParameterFromNodeResultFailure
+                return RemoveParameterFromNodeResultFailure(result_details=(
+                    "[HMB_CONNECTION_PORT_RETAINED] 다시 연결할 원본 포트입니다. "
+                    "연결을 복구하거나 연결 기록을 정리한 뒤 제거하세요."))
+            return None
+
         def reply(self, request, mutation=False):
             owner, current = self.owner_ref(), self.engine_ref()
             try:
@@ -740,6 +803,7 @@ def install_request_handlers(engine: Any, registration: Any) -> Any:
             return self.reply(request, True)
 
     handler = Handlers(weakref.ref(registration), weakref.ref(engine))
+    engine.event_manager.add_pre_dispatch_hook(handler.protect_detached_ports)
     engine.event_manager.register_request_handlers(handler)
     _HANDLERS[engine] = handler
     return handler

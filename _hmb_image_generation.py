@@ -541,8 +541,10 @@ def prepare_invocation(capabilities: ImageCapabilities, *, model_id: str, provid
                   "IMAGE_NATIVE_CONTRACT_REQUIRED")
     elif output_format == "native":
         _fail("Native image output requires an advertised provider contract.", "IMAGE_NATIVE_CONTRACT_REQUIRED")
-    if (not model.enabled or not model.credential_ready) and admission is None:
-        _fail("The selected image model is not ready. Register its API key on the Broker server.", "IMAGE_MODEL_NOT_READY")
+    if not model.enabled and admission is None:
+        _fail("The selected image model is disabled on the Broker. Ask the server administrator to enable it.", "IMAGE_MODEL_DISABLED")
+    if not model.credential_ready and admission is None:
+        _fail("The selected image model credential is not ready. Ask the server administrator to check its provider API key.", "IMAGE_CREDENTIAL_NOT_READY")
     if task not in model.tasks or ratio not in model.aspect_ratios or image_size not in model.image_sizes or output_format not in model.output_formats:
         _fail("The selected image generation option is not supported by this model.", "IMAGE_OPTION_UNSUPPORTED")
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > MAX_PROMPT_LENGTH or "\x00" in prompt:
@@ -686,6 +688,33 @@ def save_image_atomic(image: ValidatedImage, output_path: str | Path, *,
             pass
 
 
+def _broker_auth_failure(exc: BaseException) -> bool:
+    """Recognize the real Broker authentication type without importing video at module load."""
+    if getattr(exc, "status_code", None) == 401:
+        return True
+    return any(cls.__name__ == "_BrokerAuthenticationError" and cls.__module__ == "HMBSeedanceGeneration"
+               for cls in type(exc).__mro__)
+
+
+_SAFE_IMAGE_JOB_FAILURES = {
+    # Server-owned finite codes; never surface raw error text or provider bodies.
+    "image_model_not_allowed": "The selected image model is not allowed or enabled on the Broker. Ask the server administrator to check it.",
+    "image_credentials_not_ready": "The image provider credential is not ready on the Broker. Ask the server administrator to check it.",
+    "image_readiness_changed": "The image model or provider configuration changed while this Task was queued. Ask the server administrator to check it.",
+    "image_search_not_ready": "The requested image search capability is not ready on the Broker.",
+    "image_reserved_input_invalid": "The Broker could not use the saved image inputs for this Task.",
+    "image_storage_unavailable": "The Broker image storage was unavailable for this Task.",
+    "image_provider_rejected": "The image provider rejected this Task. Ask the server administrator to check the provider status.",
+}
+
+
+def image_job_failure_message(job: dict[str, Any]) -> str:
+    """Return only a fixed message for recognized terminal server codes."""
+    error = job.get("error") if isinstance(job, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return _SAFE_IMAGE_JOB_FAILURES.get(code, "") if isinstance(code, str) else ""
+
+
 class ImageGenerationBroker:
     """Image-specific protocol over the existing user-wide Broker auth session."""
     def __init__(self, bridge: Any = None, *, server_url: str | None = None) -> None:
@@ -708,13 +737,13 @@ class ImageGenerationBroker:
             raw = admission.profile("image_syntax") if admission is not None else self._bridge._request_json("GET", "/api/v1/image-generation/capabilities", payload=None, timeout=timeout)
         except Exception as exc:
             status = getattr(exc, "status_code", None)
+            if _broker_auth_failure(exc):
+                raise ImageGenerationError("Broker login is required before checking image models. Connect again; no image was submitted.",
+                    code="IMAGE_BROKER_LOGIN_REQUIRED") from exc
             if status in {404, 405, 501}:
                 raise ImageGenerationError(
                     "This Broker image adapter is not installed yet. No image was submitted.",
                     code="IMAGE_GENERATION_UNSUPPORTED") from exc
-            if status == 401:
-                raise ImageGenerationError("Broker login is required before checking image models.",
-                    code="IMAGE_BROKER_LOGIN_REQUIRED") from exc
             raise ImageGenerationError("The Broker image model catalogue is temporarily unavailable. No image was submitted.",
                 code="IMAGE_BROKER_UNAVAILABLE") from exc
         result = replace(parse_capabilities(raw), _queue_admission=admission)
@@ -769,8 +798,17 @@ class ImageGenerationBroker:
         lookup = bool(self._capabilities and self._capabilities.client_request_lookup)
         if client_request_id and job_id == client_request_id and not lookup:
             _fail("This Broker has not advertised recovery by client request ID. Keep this ID for server recovery.", "IMAGE_RECOVERY_UNSUPPORTED")
-        raw = self._bridge._request_json("POST", "/api/v1/jobs/" + quote(job_id, safe="") + "/refresh",
-                                         payload=None, timeout=timeout)
+        try:
+            raw = self._bridge._request_json("POST", "/api/v1/jobs/" + quote(job_id, safe="") + "/refresh",
+                                             payload=None, timeout=timeout)
+        except Exception as exc:
+            if _broker_auth_failure(exc):
+                raise ImageGenerationError(
+                    f"Broker login is unavailable or expired. Connect again and retrieve the same Task {job_id}; no replacement image was submitted.",
+                    code="IMAGE_BROKER_LOGIN_REQUIRED") from exc
+            raise ImageGenerationError(
+                f"The Broker could not check image Task {job_id}. Retrieve the same Task again; no replacement image was submitted.",
+                code="IMAGE_STATUS_UNAVAILABLE") from exc
         return validate_job(raw, expected_job_id=job_id, invocation=invocation,
                             client_request_id=client_request_id, allow_client_lookup=lookup)
 
