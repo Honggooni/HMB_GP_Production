@@ -44,6 +44,7 @@ def state_for(count=5000):
 
 def node_for(state):
     node = image.HMBImageAssetLibrary.__new__(image.HMBImageAssetLibrary)
+    node.name = "ImageAssetSearchFixture"
     node._hmb_node_deleted = False
     node._hmb_import_revision = 0
     node._scan_owner_is_current = lambda: not node._hmb_node_deleted

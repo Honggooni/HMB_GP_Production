@@ -19,6 +19,7 @@ state['assets'] = [dict(asset_library_id=f'library-{i}', asset_id=f'asset-{i}', 
                    for i in range(1000)]
 state = image._normalize_state(state)
 node = image.HMBImageAssetLibrary.__new__(image.HMBImageAssetLibrary)
+node.name = 'ImageAssetCompactEditFixture'
 node._hmb_last_accepted_widget_state = None
 node._hmb_last_accepted_widget_revisions = (0, 0)
 node._hmb_last_accepted_thumbnail_revision = 0
@@ -107,6 +108,7 @@ for changed in [dict(latest, projects=[]), dict(latest, catalog_root=root + '/Ot
     assert rebase(intent, prior, changed) is None
 
 race = image.HMBImageAssetLibrary.__new__(image.HMBImageAssetLibrary)
+race.name = 'ImageAssetProjectIntentRaceFixture'
 race._hmb_state_syncing = race._hmb_restoring_widget_state = False
 race._hmb_last_accepted_widget_state = image._json_text(prior)
 race._hmb_last_accepted_widget_revisions = (7, 12)

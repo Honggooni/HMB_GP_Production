@@ -83,6 +83,7 @@ def registration_state() -> tuple[dict, dict]:
 
 def fake_node(initial_state: dict):
     node = object.__new__(asset_library.HMBImageAssetLibrary)
+    node.name = "ImageAssetBackgroundFixture"
     live = {"state": asset_library._normalize_state(initial_state)}
     published = []
     node._hmb_manifest_poll_received = False
@@ -210,6 +211,7 @@ assert initial_node._hmb_hydration_adopted is False
 # A pending acknowledgement is a UI-only publication.  It must not resolve
 # media, read manifests through output synchronization, or reconcile the graph.
 pending_publish_node = object.__new__(asset_library.HMBImageAssetLibrary)
+pending_publish_node.name = "ImageAssetPendingPublishFixture"
 pending_publish_node._hmb_root_syncing = False
 pending_publish_node._hmb_state_syncing = False
 pending_publish_node._hmb_refresh_revision = 0

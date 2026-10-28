@@ -1334,6 +1334,7 @@ try:
     # A newer UI transaction carrying a delayed pre-hydration echo keeps its
     # edits while the accepted thumbnail revision/media field remains durable.
     echo_node = object.__new__(asset_library.HMBImageAssetLibrary)
+    echo_node.name = "ImageAssetThumbnailEchoFixture"
     echo_node._hmb_last_accepted_widget_state = None
     echo_node._hmb_last_accepted_widget_revisions = (0, 0)
     echo_node._hmb_last_accepted_thumbnail_revision = 0

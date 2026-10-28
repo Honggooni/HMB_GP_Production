@@ -7,6 +7,7 @@ import types
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 SPEC = importlib.util.spec_from_file_location(
     "_hmb_shot_routing_pass_cache_regression",
     ROOT / "_hmb_shot_routing.py",

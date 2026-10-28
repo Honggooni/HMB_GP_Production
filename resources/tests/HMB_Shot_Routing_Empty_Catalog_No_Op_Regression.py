@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 ROOT=Path(__file__).resolve().parents[2]
+sys.path.insert(0,str(ROOT))
 spec=importlib.util.spec_from_file_location('_routing_empty_catalog_test',ROOT/'_hmb_shot_routing.py')
 routing=importlib.util.module_from_spec(spec);sys.modules[spec.name]=routing;spec.loader.exec_module(routing)
 

@@ -3,10 +3,14 @@ from __future__ import annotations
 import ast
 from copy import deepcopy
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 from typing import Any
 
 ROOT=Path(__file__).resolve().parents[2]
+sys.path.insert(0,str(ROOT))
+from _hmb_deletion_guard import hmb_binding_mutation
+
 tree=ast.parse((ROOT/'HMBSeedanceGeneration.py').read_text('utf-8'))
 cls=next(node for node in tree.body if isinstance(node,ast.ClassDef) and node.name=='HMBSeedanceGeneration')
 names={'_hmb_clear_shot_routing_catalog','_hmb_reconcile_shot_routing',
@@ -14,7 +18,8 @@ names={'_hmb_clear_shot_routing_catalog','_hmb_reconcile_shot_routing',
 methods={node.name:node for node in cls.body if isinstance(node,ast.FunctionDef) and node.name in names}
 assert set(methods)==names
 routing=SimpleNamespace(_same_flow_nodes=lambda node:('synthetic',node.siblings))
-scope={'Any':Any,'deepcopy':deepcopy,'_shot_routing':routing,'SHOT_AUTOCLAIM_ENABLED_PARAMETER':'autoclaim'}
+scope={'Any':Any,'deepcopy':deepcopy,'_shot_routing':routing,'SHOT_AUTOCLAIM_ENABLED_PARAMETER':'autoclaim',
+       'hmb_binding_mutation':hmb_binding_mutation}
 exec(compile(ast.Module(body=list(methods.values()),type_ignores=[]),str(ROOT/'HMBSeedanceGeneration.py'),'exec'),scope)
 
 class Node:

@@ -22,6 +22,7 @@ DISTRIBUTION_ONLY_FILES = (
     "THIRD_PARTY_NOTICES.md",
     "SBOM.spdx.json",
     "tools/hmb_color_lut_native_header_patch.py",
+    "tools/hmb_native_semantic_adapter.py",
     "resources/editor/hmb-color-lut-native-header.js",
     "resources/editor/native-editor-patch.json",
 )
@@ -60,7 +61,7 @@ distribution_only_files = tuple(packager.DISTRIBUTION_ONLY_FILES)
 assert len(runtime_install_files) == 60
 assert distribution_only_files == DISTRIBUTION_ONLY_FILES
 assert source_files == (*runtime_install_files, *distribution_only_files)
-assert len(source_files) == 67
+assert len(source_files) == 68
 assert not EXCLUDED_PACKAGE_FILES.intersection(source_files)
 assert not set(runtime_install_files).intersection(distribution_only_files)
 assert {
@@ -99,7 +100,7 @@ assert "Rollback data must be stored outside the Griptape libraries folder" in i
 assert "MyInvocation.MyCommand.Path" in installer
 assert "Could not resolve the extracted HMB package directory" in installer
 assert "[int]$manifest.install_file_count -ne 60" in installer
-assert "$records.Count -ne 67" in installer
+assert "$records.Count -ne 68" in installer
 assert "_hmb_reference_leases.py" in runtime_install_files
 assert "HMBImageGeneration.py" in runtime_install_files
 assert "_hmb_image_generation.py" in runtime_install_files

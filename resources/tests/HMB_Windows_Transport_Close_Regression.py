@@ -19,6 +19,7 @@ from types import ModuleType
 from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[2]
+sys.path.insert(0,str(ROOT))
 source=ast.parse((ROOT/'_hmb_library_bootstrap.py').read_text(encoding='utf-8'))
 def sdk_import(node):
     return any(isinstance(child,ast.ImportFrom) and (child.module or '').startswith('griptape_nodes')
@@ -194,7 +195,6 @@ with patch.dict(sys.modules,{'asyncio.proactor_events':private}),patch.object(sy
         engine=Dummy();engine.event_manager=Manager();engine.library_manager=Dummy();engine.library_manager.is_worker=False
         namespace['current_engine']=lambda:engine
         data=Dummy();data.name='HMB_GP_Production';library=Dummy()
-        a,b=namespace['HMBProductionLibrary'](),namespace['HMBProductionLibrary']()
         # This stdlib-only fixture does not construct an SDK payload registry.
         # Typed registration is tested by real SDK regressions. The stdlib
         # fixture supplies the mandatory critical seam explicitly.
@@ -210,7 +210,14 @@ with patch.dict(sys.modules,{'asyncio.proactor_events':private}),patch.object(sy
                 stub.__file__=str(ROOT/'_hmb_deletion_guard.py')
                 stub.PROTECTION_VERSION=2;stub.protection_readiness=lambda _engine:(True,'')
                 stub.guard_request=lambda _engine,_request:None
+                barrier=Dummy();barrier.is_installed=lambda:True;barrier.engine_ref=lambda:engine
+                def install_barrier(_engine):
+                    assert _engine is engine
+                    return barrier
+                stub.install_reentrant_barrier=install_barrier
+                stub.install_handler_barrier=install_barrier
         with patch.dict(sys.modules,optional):
+            a,b=namespace['HMBProductionLibrary'](),namespace['HMBProductionLibrary']()
             a.before_library_nodes_loaded(data,library);a.before_library_nodes_loaded(data,library)
             b.before_library_nodes_loaded(data,library)
             assert len(installed)==2 and len({id(item[1]) for item in installed})==1
