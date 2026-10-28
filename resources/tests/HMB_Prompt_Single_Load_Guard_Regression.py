@@ -34,12 +34,14 @@ try:
     from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
     from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, CreateConnectionResultSuccess
     from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
+    from griptape_nodes.retained_mode.events.parameter_events import RemoveParameterFromNodeRequest
     from griptape_nodes.retained_mode.events.node_events import (
         CreateNodeRequest, CreateNodeResultFailure, CreateNodeResultSuccess,
         DeserializeSelectedNodesFromCommandsRequest, DeserializeSelectedNodesFromCommandsResultFailure,
         DeserializeSelectedNodesFromCommandsResultSuccess,
         SerializeSelectedNodesToCommandsRequest, SerializeSelectedNodesToCommandsResultSuccess,
         DuplicateSelectedNodesRequest, DuplicateSelectedNodesResultFailure,
+        ResetNodeToDefaultsRequest, ResetNodeToDefaultsResultSuccess,
     )
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 except ImportError:
@@ -92,9 +94,9 @@ def actual_failure(result, result_type=CreateNodeResultFailure):
     assert all(detail.level >= logging.ERROR for detail in result.result_details.result_details)
 
 
-def fixture(engine):
+def fixture(engine, directory_name="fixture"):
     raw = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8-sig"))
-    directory = ISOLATED / "fixture"
+    directory = ISOLATED / directory_name
     directory.mkdir()
     source = directory / "fixture_nodes.py"
     source.write_text("from griptape_nodes.exe_types.node_types import DataNode\n"
@@ -111,12 +113,14 @@ def fixture(engine):
         "class HMBAgentLibrary(FixtureNode):\n"
         "    created = []\n"
         "class HMBFinishLookLibrary(FixtureNode):\n"
+        "    created = []\n"
+        "class HMBImageBash(FixtureNode):\n"
         "    created = []\n", encoding="utf-8")
     raw.update(advanced_library_path=str(ROOT / "_hmb_library_bootstrap.py"),
         widgets=[], scripts=[], workflows=[], settings=[])
     raw["metadata"]["dependencies"] = None
     raw["nodes"] = [{**definition, "file_path": str(source)} for definition in raw["nodes"]
-        if definition["class_name"] in {"HMBPromptLibrary", "HMBAgentLibrary", "HMBFinishLookLibrary"}]
+        if definition["class_name"] in {"HMBPromptLibrary", "HMBAgentLibrary", "HMBFinishLookLibrary", "HMBImageBash"}]
     schema = LibrarySchema.model_validate(raw)
     loading = getattr(engine.library_manager, "module_loading", engine.library_manager)
     advanced_loader = getattr(loading, "load_advanced_library_module", None) or engine.library_manager._load_advanced_library_module
@@ -246,6 +250,83 @@ async def main():
                     assert inventory(engine) == before_editor
                 print("PASS Prompt/Agent/Finish create, paste and duplicate are quiet; same-flow owners and requests unchanged")
 
+                # Image Bash is one editor per flow as well. Admission happens
+                # before any constructor, copied value or copied edge can run.
+                bash_first = send(engine, CreateNodeRequest(node_type="HMBImageBash", specific_library_name="HMB_GP_Production",
+                    node_name="BashOne", metadata={"size": {"width": 800, "height": 680}}, create_error_proxy_on_failure=False))
+                assert isinstance(bash_first, CreateNodeResultSuccess), str(bash_first.result_details)
+                bash = engine.node_manager.get_node_by_name(bash_first.node_name)
+                bash.set_parameter_value("authored", "Preserved Bash scene and Apply receipt", initial_setup=True)
+                bash.parameter_output_values["authored"] = "Preserved Bash PNG"
+                bash_serialized = send(engine, SerializeSelectedNodesToCommandsRequest(nodes_to_serialize=[[bash.name, "fixture"]]))
+                assert isinstance(bash_serialized, SerializeSelectedNodesToCommandsResultSuccess)
+                bash_clipboard = DeserializeSelectedNodesFromCommandsRequest(
+                    deserialize_commands=bash_serialized.serialized_selected_node_commands,
+                    pickled_values=bash_serialized.pickled_values)
+                before_bash, bash_constructors = inventory(engine), list(type(bash).created)
+                for request, result_type in (
+                    (CreateNodeRequest(node_type="HMBImageBash", specific_library_name="HMB_GP_Production",
+                        node_name="BashPaletteDuplicate", create_error_proxy_on_failure=False), CreateNodeResultFailure),
+                    (copy.deepcopy(bash_clipboard), DeserializeSelectedNodesFromCommandsResultFailure),
+                    (DuplicateSelectedNodesRequest(nodes_to_duplicate=[[bash.name, "fixture"]]), DuplicateSelectedNodesResultFailure),
+                ):
+                    request.broadcast_result = False
+                    request_before = copy.deepcopy(vars(request))
+                    result = send(engine, request)
+                    quiet(result, result_type)
+                    assert "existing Image Bash workspace" in str(result.result_details)
+                    assert vars(request) == request_before and inventory(engine) == before_bash
+                    assert type(bash).created == bash_constructors
+                # Saved legacy duplicate canvases are never removed or merged
+                # by this new-create guard. Subsequent fresh requests stay blocked.
+                restored_bash = send(engine, CreateNodeRequest(node_type="HMBImageBash", specific_library_name="HMB_GP_Production",
+                    node_name="LegacyBashTwo", initial_setup=True, create_error_proxy_on_failure=False))
+                assert isinstance(restored_bash, CreateNodeResultSuccess), str(restored_bash.result_details)
+                legacy_bash = engine.node_manager.get_node_by_name(restored_bash.node_name)
+                legacy_bash.set_parameter_value("authored", "Distinct legacy scene", initial_setup=True)
+                legacy_bash.parameter_output_values["authored"] = "Distinct legacy PNG"
+                before_legacy = inventory(engine)
+                quiet(send(engine, CreateNodeRequest(node_type="HMBImageBash", specific_library_name="HMB_GP_Production",
+                    node_name="BashAfterLegacy", create_error_proxy_on_failure=False)), CreateNodeResultFailure)
+                assert inventory(engine) == before_legacy
+                print("PASS Bash palette, duplicate and paste are blocked before construction; existing and legacy scenes/outputs stay exact")
+
+                bash_batch = send(engine, SerializeSelectedNodesToCommandsRequest(nodes_to_serialize=[
+                    [bash.name, "fixture"], [legacy_bash.name, "fixture"]]))
+                assert isinstance(bash_batch, SerializeSelectedNodesToCommandsResultSuccess)
+                bash_empty = send(engine, CreateFlowRequest(flow_name="BashEmptyBatchFlow", parent_flow_name=None, set_as_new_context=True))
+                assert isinstance(bash_empty, CreateFlowResultSuccess)
+                before_bash_batch = inventory(engine)
+                quiet(send(engine, DeserializeSelectedNodesFromCommandsRequest(
+                    deserialize_commands=bash_batch.serialized_selected_node_commands,
+                    pickled_values=bash_batch.pickled_values)), DeserializeSelectedNodesFromCommandsResultFailure)
+                assert inventory(engine) == before_bash_batch
+                print("PASS a two-Bash paste into an empty flow is refused atomically before either constructor")
+
+                bash_flow = send(engine, CreateFlowRequest(flow_name="BashOtherFlow", parent_flow_name=None, set_as_new_context=True))
+                assert isinstance(bash_flow, CreateFlowResultSuccess)
+                bash_pasted = send(engine, copy.deepcopy(bash_clipboard))
+                assert isinstance(bash_pasted, DeserializeSelectedNodesFromCommandsResultSuccess), str(bash_pasted.result_details)
+                assert len(engine.flow_manager.get_flow_by_name("BashOtherFlow").nodes) == 1
+                pasted_bash = engine.node_manager.get_node_by_name(bash_pasted.node_names[0])
+                assert pasted_bash.get_parameter_value("authored") == bash.get_parameter_value("authored")
+                print("PASS cross-flow Bash paste creates exactly one editor with the authored scene")
+
+                bash_race_flow = send(engine, CreateFlowRequest(flow_name="ConcurrentBashFlow", parent_flow_name=None, set_as_new_context=True))
+                assert isinstance(bash_race_flow, CreateFlowResultSuccess)
+                def simultaneous_bash(number):
+                    with engine_scope(engine):
+                        return send(engine, CreateNodeRequest(node_type="HMBImageBash", specific_library_name="HMB_GP_Production",
+                            node_name=f"ConcurrentBash{number}", create_error_proxy_on_failure=False))
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    bash_results = list(executor.map(simultaneous_bash, range(12)))
+                assert sum(isinstance(result, CreateNodeResultSuccess) for result in bash_results) == 1
+                assert sum(isinstance(result, CreateNodeResultFailure) for result in bash_results) == 11
+                for result in bash_results:
+                    if isinstance(result, CreateNodeResultFailure): quiet(result, CreateNodeResultFailure)
+                assert len(engine.flow_manager.get_flow_by_name("ConcurrentBashFlow").nodes) == 1
+                print("PASS twelve simultaneous new Bash requests create exactly one editor")
+
                 before_error = inventory(engine)
                 invalid_parent = create(engine, "InvalidParent", override_parent_flow_name="MissingParent")
                 actual_failure(invalid_parent)
@@ -282,6 +363,18 @@ async def main():
                     if isinstance(result, CreateNodeResultFailure): quiet(result, CreateNodeResultFailure)
                 assert len(engine.flow_manager.get_flow_by_name("ConcurrentFlow").nodes) == 1
                 print("PASS twelve simultaneous new Prompt requests create exactly one node")
+
+                # Hold an actual detached native wire across unload/reload.
+                import _hmb_connection_management as connection_api
+                with engine.context_manager.flow("PromptFlowB"):
+                    assert send(engine, CreateConnectionRequest(source_node_name=bash.name, source_parameter_name="authored",
+                        target_node_name=legacy_bash.name, target_parameter_name="authored", initial_setup=True)).succeeded()
+                    connected = connection_api.describe(engine, bash.name)
+                    detached = connection_api.manage(engine, bash.name, "disconnect", connected["state_token"])
+                    assert detached["detached"]
+                    port_refused = send(engine, RemoveParameterFromNodeRequest(node_name=legacy_bash.name, parameter_name="authored"))
+                    assert not port_refused.succeeded() and "HMB_CONNECTION_PORT_RETAINED" in str(port_refused.result_details)
+                    detached_before_reload = inventory(engine)
             finally:
                 LibraryRegistry.unregister_library("HMB_GP_Production", event_manager=engine.event_manager)
             gate = getattr(engine.event_manager, "_hmb_connected_deletion_lifetime_v2")
@@ -290,6 +383,59 @@ async def main():
             assert all(not values for values in engine.event_manager._post_dispatch_hooks.values())
             assert not advanced._registrations
             print("PASS unload removes library pre/post hooks and pending claims while retaining only the engine deletion gate")
+
+            def unrelated_hook(_request, _context):
+                return None
+            engine.event_manager.add_pre_dispatch_hook(unrelated_hook)
+            reloaded_library, reloaded_advanced = fixture(engine, "fixture-reload")
+            try:
+                registration = next(iter(reloaded_advanced._registrations))
+                handler = registration.connection_handlers
+                for _ in range(3):
+                    assert connection_api.install_request_handlers(engine, registration) is handler
+                assert engine.event_manager._pre_dispatch_hooks.count(handler.protect_detached_ports) == 1
+                assert engine.event_manager._pre_dispatch_hooks.count(unrelated_hook) == 1
+                with engine.context_manager.flow("PromptFlowB"):
+                    assert inventory(engine) == detached_before_reload
+                    port_refused = send(engine, RemoveParameterFromNodeRequest(node_name=legacy_bash.name, parameter_name="authored"))
+                    assert not port_refused.succeeded() and "HMB_CONNECTION_PORT_RETAINED" in str(port_refused.result_details)
+                    assert inventory(engine) == detached_before_reload
+                    reconnected = connection_api.manage(engine, bash.name, "reconnect",
+                        connection_api.describe(engine, bash.name)["state_token"])
+                    assert not reconnected["detached"] and len(reconnected["connections"]) == 1
+                print("PASS reload reattaches exactly one port guard, retains detached leases/data and leaves unrelated hooks untouched")
+            finally:
+                LibraryRegistry.unregister_library("HMB_GP_Production", event_manager=engine.event_manager)
+            assert engine.event_manager._pre_dispatch_hooks == [gate.hook, unrelated_hook]
+            engine.event_manager.remove_pre_dispatch_hook(unrelated_hook)
+            assert engine.event_manager._pre_dispatch_hooks == [gate.hook]
+
+        # Reset establishes an engine-lifetime detached-port gate. Exercise it
+        # in a distinct engine so the existing admission/unload leak assertion
+        # above remains exact and does not mistake that separate gate for a leak.
+        with engine_scope() as reset_engine:
+            reset_engine.event_manager.initialize_queue()
+            reset_library, _reset_advanced = fixture(reset_engine, "fixture-reset")
+            try:
+                send(reset_engine, EnsureWorkflowAndFlowRequest(flow_name="BashResetFlow"))
+                created = send(reset_engine, CreateNodeRequest(node_type="HMBImageBash", specific_library_name="HMB_GP_Production",
+                    node_name="ResetBash", metadata={"size": {"width": 800, "height": 680}}, create_error_proxy_on_failure=False))
+                assert isinstance(created, CreateNodeResultSuccess), str(created.result_details)
+                old = reset_engine.node_manager.get_node_by_name(created.node_name)
+                old.set_parameter_value("authored", "Explicitly reset this fixture", initial_setup=True)
+                reset = await reset_engine.ahandle_request(ResetNodeToDefaultsRequest(node_name=old.name, broadcast_result=False))
+                assert isinstance(reset, ResetNodeToDefaultsResultSuccess), str(reset.result_details)
+                current = reset_engine.node_manager.get_node_by_name(created.node_name)
+                assert current is not old and current.get_parameter_value("authored") == "default"
+                assert current.metadata["size"] == {"width": 800, "height": 680}
+                assert len(reset_engine.flow_manager.get_flow_by_name("BashResetFlow").nodes) == 1
+                after_reset = inventory(reset_engine)
+                quiet(send(reset_engine, CreateNodeRequest(node_type="HMBImageBash", specific_library_name="HMB_GP_Production",
+                    node_name="BashAfterReset", create_error_proxy_on_failure=False)), CreateNodeResultFailure)
+                assert inventory(reset_engine) == after_reset
+                print("PASS official SDK Reset keeps one Bash and its geometry; subsequent palette admission remains guarded")
+            finally:
+                LibraryRegistry.unregister_library("HMB_GP_Production", event_manager=reset_engine.event_manager)
         assert NETWORK_ATTEMPTS == []
     print(json.dumps({"status": "PASS", "sdk_engine_version": importlib.metadata.version("griptape-nodes-engine"),
         "native_create_and_paste_handlers_mocked": False, "network_requests": 0, "live_user_workflow_changed": False}))

@@ -1,6 +1,8 @@
 """Upstream drift, editor drift and exact-host class identity boundaries."""
 from __future__ import annotations
 
+import ast
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
@@ -251,6 +253,116 @@ class CompatibilityRegression(unittest.TestCase):
         with mock.patch.dict(sys.modules, {registry_module.__name__: registry_module, stock_module.__name__: stock_module}):
             loaded = compat.load_builtin_image_bash(self.stock, baseline_path=self.baseline, editor_root=self.editor)
         self.assertIs(loaded, candidate)
+
+
+class WorkspaceReuseRegression(unittest.TestCase):
+    """Execute the actual Asset selector; native binding has separate SDK coverage."""
+
+    @classmethod
+    def setUpClass(cls):
+        path = ROOT / "HMBImageAssetLibrary.py"
+        tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+        node_class = next(row for row in tree.body if isinstance(row, ast.ClassDef) and row.name == "HMBImageAssetLibrary")
+        method = next(row for row in node_class.body if isinstance(row, ast.FunctionDef)
+                      and row.name == "_create_image_bash_workspace_node")
+        cls.method_code = compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec")
+
+    def setUp(self):
+        self.bash_class = type("HMBImageBash", (), {})
+        self.nodes, self.created, self.bound = [], [], []
+        self.workspace = {"workspace_id": "authored-workspace", "revision": 7, "instances": [{"instance_id": "same-layer"}]}
+        state = {"image_bash_workspace": self.workspace, "shot_routing": {"channel_uuid": "authored-channel"}}
+        self.source = types.SimpleNamespace(name="ImageAsset", lock=False, metadata={"position": {"x": 17, "y": 31}},
+                                            _current_state=lambda: deepcopy(state))
+        def bind(target, workspace_id):
+            if getattr(target, "foreign_binding", False):
+                raise ValueError("Different source already owns the native inputs")
+            self.bound.append((target, workspace_id))
+        self.source._hmb_bind_image_bash_workspace = bind
+        scope = {"_normalize_image_bash_workspace_request": lambda value: deepcopy(value),
+                 "_hmb_shot_routing": types.SimpleNamespace(_same_flow_nodes=lambda node: ("own-flow", self.nodes)),
+                 "WIDGET_LIBRARY_NAME": "HMB_GP_Production", "ASSET_NODE_WIDTH": 1320}
+        exec(self.method_code, scope)
+        self.select = scope["_create_image_bash_workspace_node"]
+        self.command = {"workspace_id": self.workspace["workspace_id"], "expected_revision": self.workspace["revision"]}
+        def create(request):
+            self.created.append(request)
+            target = self.bash("CreatedBash")
+            self.nodes.append(target)
+            return types.SimpleNamespace(succeeded=lambda: True, node_name=target.name)
+        sdk = types.ModuleType("griptape_nodes.retained_mode.griptape_nodes")
+        sdk.GriptapeNodes = types.SimpleNamespace(handle_request=create,
+            NodeManager=lambda: types.SimpleNamespace(get_node_by_name=lambda name: next(node for node in self.nodes if node.name == name)))
+        events = types.ModuleType("griptape_nodes.retained_mode.events.node_events")
+        events.CreateNodeRequest = lambda **values: types.SimpleNamespace(**values)
+        registry = types.ModuleType("griptape_nodes.node_library.library_registry")
+        def library(kind, owner):
+            self.assertEqual((kind, owner), ("HMBImageBash", "HMB_GP_Production"))
+            return types.SimpleNamespace(get_node_class=lambda kind: self.bash_class)
+        registry.LibraryRegistry = types.SimpleNamespace(get_library_for_node_type=library)
+        patch = mock.patch.dict(sys.modules, {module.__name__: module for module in (sdk, events, registry)})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def bash(self, name, *, owner="HMB_GP_Production", kind=None):
+        node = (kind or self.bash_class)()
+        node.name = name
+        node.metadata = {"library": owner, "node_type": "HMBImageBash"}
+        node.scene = {"layers": [{"x": 0, "opacity": 0}], "apply_receipt": {"sha256": "authored"}}
+        node.output = "existing-output.png"
+        return node
+
+    def test_unbound_palette_node_is_reused_with_scene_output_and_workspace_preserved(self):
+        target = self.bash("PaletteFirst")
+        self.nodes.append(target)
+        before = deepcopy((vars(target), self.workspace))
+        self.assertEqual(self.select(self.source, self.command), target.name)
+        self.assertEqual(self.created, [])
+        self.assertEqual(self.bound, [(target, self.workspace["workspace_id"])])
+        self.assertEqual((vars(target), self.workspace), before)
+
+    def test_matching_bound_node_is_reused_without_new_create(self):
+        target = self.bash("Existing")
+        target.metadata.update(hmb_image_bash_workspace_id=self.workspace["workspace_id"],
+                               hmb_image_bash_channel_uuid="authored-channel")
+        self.nodes.append(target)
+        self.assertEqual(self.select(self.source, self.command), target.name)
+        self.assertEqual(self.created, [])
+        self.assertIs(self.bound[0][0], target)
+
+    def test_foreign_same_named_class_is_preserved_and_never_reused(self):
+        foreign = self.bash("Foreign", owner="OtherLibrary", kind=type("HMBImageBash", (), {}))
+        self.nodes.append(foreign)
+        before = deepcopy(vars(foreign))
+        self.assertEqual(self.select(self.source, self.command), "CreatedBash")
+        self.assertEqual(len(self.created), 1)
+        self.assertIsNot(self.bound[0][0], foreign)
+        self.assertEqual(vars(foreign), before)
+
+    def test_multiple_legacy_editors_are_preserved_without_choosing_or_creating(self):
+        self.nodes.extend((self.bash("AuthoredA"), self.bash("AuthoredB")))
+        before = deepcopy([vars(node) for node in self.nodes])
+        with self.assertRaises(ValueError):
+            self.select(self.source, self.command)
+        self.assertEqual(self.created, [])
+        self.assertEqual(self.bound, [])
+        self.assertEqual([vars(node) for node in self.nodes], before)
+
+    def test_foreign_native_binding_is_not_stolen_or_replaced(self):
+        target = self.bash("AlreadyOwned")
+        target.foreign_binding = True
+        self.nodes.append(target)
+        before = deepcopy(vars(target))
+        with self.assertRaises(ValueError):
+            self.select(self.source, self.command)
+        self.assertEqual(self.created, [])
+        self.assertEqual(vars(target), before)
+
+    def test_stale_workspace_command_does_not_create_or_rebind(self):
+        self.nodes.append(self.bash("Existing"))
+        with self.assertRaises(ValueError):
+            self.select(self.source, dict(self.command, expected_revision=6))
+        self.assertEqual((self.created, self.bound), ([], []))
 
 
 if __name__ == "__main__":

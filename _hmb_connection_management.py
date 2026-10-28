@@ -730,6 +730,7 @@ def install_request_handlers(engine: Any, registration: Any) -> Any:
     previous = _HANDLERS.get(engine)
     if previous is not None:
         previous.owner_ref = weakref.ref(registration)
+        engine.event_manager.add_pre_dispatch_hook(previous.protect_detached_ports)
         return previous
     if "HMBGetNodeConnectionsRequest" not in globals():
         @PayloadRegistry.register

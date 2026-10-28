@@ -10344,9 +10344,17 @@ class HMBImageAssetLibrary(DataNode):
             raise ValueError("현재 라이브러리의 워크플로 등록이 끝난 뒤 Image Bash를 추가하세요.")
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
         from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
-        candidates = [node for node in nodes if type(node).__name__ == "HMBImageBash"
-            and node.metadata.get("hmb_image_bash_workspace_id") == workspace["workspace_id"]
-            and node.metadata.get("hmb_image_bash_channel_uuid") == state["shot_routing"]["channel_uuid"]]
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+        bash_library = LibraryRegistry.get_library_for_node_type("HMBImageBash", WIDGET_LIBRARY_NAME)
+        bash_class = bash_library.get_node_class("HMBImageBash")
+        # Palette creation and this explicit command share one retained Bash.
+        # An unbound node still owns its authored canvas/output; its old lease
+        # metadata must not cause a second editor to be created beside it.
+        candidates = [node for node in nodes if type(node) is bash_class
+            and not bool(getattr(node, "_hmb_node_deleted", False))
+            and isinstance(getattr(node, "metadata", None), dict)
+            and node.metadata.get("library") == WIDGET_LIBRARY_NAME
+            and node.metadata.get("node_type") == "HMBImageBash"]
         if len(candidates) > 1:
             raise ValueError("같은 Image Bash 작업 공간 노드가 여러 개 있습니다. 연결을 확인하세요.")
         if candidates:

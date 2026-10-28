@@ -229,6 +229,21 @@ async def exercise(engine):
         assert node._create_image_bash_workspace_node(command) == name
         assert len(engine.flow_manager.get_flow_by_name(ensured.flow_name).nodes) == before_count + 1
         assert node._current_state()["shot_routing"] == shots_before
+        # Palette-first or explicitly unbound Bash nodes no longer carry a
+        # workspace lease. The explicit Asset create command must reuse that
+        # exact retained editor and preserve its authored scene, not add one.
+        scene_before_reuse = deepcopy(target.get_parameter_value("bash_image"))
+        workspace_before_reuse = deepcopy(node._current_state()["image_bash_workspace"])
+        node._hmb_bind_image_bash_workspace(target, command["workspace_id"], False)
+        assert "hmb_image_bash_workspace_id" not in target.metadata
+        assert not engine.handle_request(ListConnectionsForNodeRequest(node_name=name)).incoming_connections
+        assert target.get_parameter_value("bash_image") == scene_before_reuse
+        assert node._create_image_bash_workspace_node(command) == name
+        assert engine.node_manager.get_node_by_name(name) is target
+        assert len(engine.flow_manager.get_flow_by_name(ensured.flow_name).nodes) == before_count + 1
+        assert target.get_parameter_value("bash_image") == scene_before_reuse
+        assert node._current_state()["image_bash_workspace"] == workspace_before_reuse
+        assert node._current_state()["shot_routing"] == shots_before
         # The real property command path consumes an explicit create intent;
         # duplicate UI commands reuse the same node and do not persist intent.
         submitted = deepcopy(state)
@@ -445,6 +460,22 @@ async def exercise(engine):
         assert len(good_edges.incoming_connections) == 2
         bad_edges = engine.handle_request(ListConnectionsForNodeRequest(node_name=child_target.name))
         assert not bad_edges.incoming_connections
+        # Legacy workflows can still contain two authored editors. Never
+        # choose one by lease metadata or delete either while adding from Asset.
+        legacy_nodes = tuple(engine.flow_manager.get_flow_by_name(ensured.flow_name).nodes.values())
+        legacy_workspace = deepcopy(node._current_state()["image_bash_workspace"])
+        legacy_scenes = [deepcopy(item.get_parameter_value("bash_image")) for item in (target, child_target)]
+        legacy_command = dict(command, workspace_id=legacy_workspace["workspace_id"],
+                              expected_revision=legacy_workspace["revision"])
+        try:
+            node._create_image_bash_workspace_node(legacy_command)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Multiple legacy Bash nodes were silently selected or replaced")
+        assert tuple(engine.flow_manager.get_flow_by_name(ensured.flow_name).nodes.values()) == legacy_nodes
+        assert [item.get_parameter_value("bash_image") for item in (target, child_target)] == legacy_scenes
+        assert node._current_state()["image_bash_workspace"] == legacy_workspace
         # Exercise the actual custom-header property command path, rather
         # than invoking its Python callback or source hooks directly.
         def header_command(operation, **payload):

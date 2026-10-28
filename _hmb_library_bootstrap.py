@@ -63,7 +63,8 @@ _IMAGE_NODE_TYPE = "HMBImageGeneration"
 _PROMPT_NODE_TYPE = "HMBPromptLibrary"
 _AGENT_NODE_TYPE = "HMBAgentLibrary"
 _FINISH_NODE_TYPE = "HMBFinishLookLibrary"
-_EDITOR_NODE_TYPES = (_PROMPT_NODE_TYPE, _AGENT_NODE_TYPE, _FINISH_NODE_TYPE)
+_BASH_NODE_TYPE = "HMBImageBash"
+_EDITOR_NODE_TYPES = (_PROMPT_NODE_TYPE, _AGENT_NODE_TYPE, _FINISH_NODE_TYPE, _BASH_NODE_TYPE)
 _PROMPT_SINGLE_LOAD_MESSAGE = (
     "HMBPromptLibrary is already loaded in this flow. "
     "Use its Shot controls to manage all Shots; another Prompt was not created."
@@ -1760,6 +1761,14 @@ class _Registration:
                     self.load_requests.pop(id(request), None)
                     self.snapshot_refused_loads[id(request)] = weakref.ref(request)
             return migration_failure
+        if type(request).__name__ == "GetWorkflowMetadataRequest":
+            try:
+                from _hmb_workflow_serialization_compat import recover_workflow_metadata
+                recovered_metadata = recover_workflow_metadata(self, request)
+                if recovered_metadata is not None:
+                    return recovered_metadata
+            except ImportError:
+                pass  # Unknown/older SDKs retain the native metadata result.
         deletion_failure = self._guard_connected_deletion(request)
         if deletion_failure is not None:
             return deletion_failure
@@ -1999,8 +2008,10 @@ class _Registration:
                     failure = (CreateNodeResultFailure if is_create else
                         DuplicateSelectedNodesResultFailure if is_duplicate else
                         DeserializeSelectedNodesFromCommandsResultFailure)
-                    message = (key[1] + " is already loaded in this flow. Use its Shot controls to manage all Shots; "
-                        "another editor was not created.")
+                    message = ((key[1] + " is already loaded in this flow. Use the existing Image Bash workspace; "
+                        "another editor was not created.") if key[1] == _BASH_NODE_TYPE else
+                        (key[1] + " is already loaded in this flow. Use its Shot controls to manage all Shots; "
+                        "another editor was not created."))
                     # This is an expected admission decision, not a broken
                     # node. Keep the typed failure so a paste/duplicate caller
                     # cannot apply copied values or edges to the existing
@@ -2308,6 +2319,12 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
                         registration.web_worker_module.stop_engine_worker(engine)
                     manager = registration.manager()
                     if manager is not None:
+                        handler = registration.connection_handlers
+                        if handler is not None and handler.owner_ref() is registration:
+                            try:
+                                manager.remove_pre_dispatch_hook(handler.protect_detached_ports)
+                            except Exception:
+                                pass  # An inactive owner cannot remove leased ports.
                         try:
                             manager.remove_pre_dispatch_hook(registration.hook)
                         except Exception:
