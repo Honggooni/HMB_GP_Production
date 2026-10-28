@@ -291,6 +291,9 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Keeps one HMB ImageBash per flow. Repeated palette, duplicate and paste actions quietly retain the existing workspace, while legacy saved Bash nodes remain loadable.",
+            "- Restores Save metadata for the current unsaved HMB canvas when its legacy workflow key is unregistered, preserving existing nodes, connections, images, values and outputs.",
+            "- Restores the owned detached-port guard exactly once after library reload, keeping original image ports, saved connections and data while leaving unrelated handlers intact.",
             "- Completes native editor integration through Git Update/Override without a separate ZIP installation. A fresh isolated updater validates the supported editor and SDK, backs up outside the checkout and atomically updates the pinned editor file; save and restart Griptape to load the new native and Python code.",
             "- Updates the reviewed native adapter by actual editor structure and source integrity. Unified headers, rounded capsules, ports and connected-node protection remain independent of the desktop release label; unknown contracts preserve data and report the unsupported state.",
             "- Automatically prepares the same ImageAsset Bash workspace whether ImageAsset or HMBImageBash is added first. Ambiguous sources require selection, occupied workspaces are preserved, and explicit disconnects never silently reconnect.",
