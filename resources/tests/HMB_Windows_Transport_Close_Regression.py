@@ -204,7 +204,12 @@ with patch.dict(sys.modules,{'asyncio.proactor_events':private}),patch.object(sy
             def install(_engine,registration,_name=module_name):
                 assert _engine is engine
                 installed.append((_name,registration))
-                return Dummy()
+                handler=Dummy()
+                if _name=='_hmb_connection_management':
+                    handler.owner_ref=lambda:registration
+                    handler.protect_detached_ports=lambda *_args:None
+                    engine.event_manager.add_pre_dispatch_hook(handler.protect_detached_ports)
+                return handler
             stub.install_request_handlers=install;optional[module_name]=stub
             if module_name=='_hmb_deletion_guard':
                 stub.__file__=str(ROOT/'_hmb_deletion_guard.py')
@@ -222,7 +227,7 @@ with patch.dict(sys.modules,{'asyncio.proactor_events':private}),patch.object(sy
             b.before_library_nodes_loaded(data,library)
             assert len(installed)==2 and len({id(item[1]) for item in installed})==1
             gate=getattr(engine.event_manager,'_hmb_connected_deletion_lifetime_v2')
-            assert len(engine.event_manager.pre)==2 and diagnostics()['owner_count']==1
+            assert len(engine.event_manager.pre)==3 and diagnostics()['owner_count']==1
             assert transport_class._call_connection_lost is wrapper
             a.before_library_unregistered(data,library)
             assert diagnostics()['owner_count']==1 and transport_class._call_connection_lost is wrapper
