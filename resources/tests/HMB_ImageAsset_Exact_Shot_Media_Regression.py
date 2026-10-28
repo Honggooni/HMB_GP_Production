@@ -136,6 +136,7 @@ for row in large["assets"][5:]:
 large = images._normalize_state(large)
 assert len(large["assets"]) == 1000
 hot = images.HMBImageAssetLibrary.__new__(images.HMBImageAssetLibrary)
+hot.name = "ImageAssetExactShotHotFixture"
 hot._accept_normalized_widget_state_baseline(large)
 native = {"value": hot._hmb_last_accepted_widget_state}
 with mock.patch.object(images,"_get_parameter_raw",side_effect=lambda _node,_name:native["value"]):
