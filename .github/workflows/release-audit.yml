@@ -291,6 +291,8 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Connects ImageAsset and HMB ImageBash automatically in either palette creation order. Creation intent is captured before the SDK and native constructor add metadata, so drag-and-drop and workspace creation prepare the same shared workspace as the explicit Shot control while authored or disconnected relationships remain intact.",
+            "- Verifies the actual palette metadata mutation and both creation orders with the installed SDK. The metadata-only owner-lease fixture uses the exact registered ImageAsset type without weakening production source identity checks.",
             "- Keeps one HMB ImageBash per flow. Repeated palette, duplicate and paste actions quietly retain the existing workspace, while legacy saved Bash nodes remain loadable.",
             "- Restores Save metadata for the current unsaved HMB canvas when its legacy workflow key is unregistered, preserving existing nodes, connections, images, values and outputs.",
             "- Restores the owned detached-port guard exactly once after library reload, keeping original image ports, saved connections and data while leaving unrelated handlers intact.",

@@ -58,7 +58,11 @@ async def exercise(engine):
     library = LibraryRegistry.generate_new_library(schema)
     metadata = next(row.metadata for row in schema.nodes if row.class_name == "HMBImageBash")
     library.register_lazy_node_type("HMBImageBash", metadata, lambda: product.HMBImageBash)
-    library.register_lazy_node_type("SyntheticBashMetadataSource", metadata, lambda: Source)
+    # Source discovery accepts only the exact class registered for the HMB
+    # ImageAsset node type. Keep this metadata-only stand-in inside that real
+    # registry contract rather than weakening the production identity guard.
+    source_metadata = next(row.metadata for row in schema.nodes if row.class_name == "HMBImageAssetLibrary")
+    library.register_lazy_node_type("HMBImageAssetLibrary", source_metadata, lambda: Source)
     engine.event_manager.initialize_queue()
     ensured = send(EnsureWorkflowAndFlowRequest(flow_name="SyntheticBashMetadataRefresh"))
 
@@ -73,7 +77,8 @@ async def exercise(engine):
 
     try:
         node = create("HMBImageBash", "Synthetic Bash metadata target")
-        source = create("SyntheticBashMetadataSource", "Synthetic source")
+        source = create("HMBImageAssetLibrary", "Synthetic source")
+        assert product._hmb_is_registered_node(source, "HMBImageAssetLibrary")
         # Authored dirty data, embedded receipt and prior output are kept even
         # when no live ImageAsset is bound. Merely listing sources cannot edit it.
         dirty = deepcopy(node.get_parameter_value("bash_image"))
@@ -109,7 +114,8 @@ async def exercise(engine):
                 assert node.get_parameter_value(product.HEADER_PARAMETER)["sources"] == []
                 assert {key: node.get_parameter_value(key) for key in before} == before
 
-                replacement = create("SyntheticBashMetadataSource", "Synthetic source")
+                replacement = create("HMBImageAssetLibrary", "Synthetic source")
+                assert product._hmb_is_registered_node(replacement, "HMBImageAssetLibrary")
                 command(node)
                 new_lease = node.get_parameter_value(product.HEADER_PARAMETER)["source_instances"][replacement.name]
                 assert new_lease != old_lease

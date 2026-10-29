@@ -55,6 +55,32 @@ def _hmb_is_registered_node(node: Any, kind: str) -> bool:
         return False
 
 
+def _hmb_is_palette_creation_metadata(metadata: Any) -> bool:
+    """Capture layout-only creation before the node adds its own metadata.
+
+    The SDK injects the registered library identity into the request's same
+    dictionary before calling this constructor. Later the native node adds
+    size and other runtime fields, so the post-create request is no longer an
+    immutable description of the user's creation intent.
+    """
+    if metadata is None:
+        return True
+    if (not isinstance(metadata, dict)
+            or set(metadata) - {"position", "tempId", "library_node_metadata", "library", "node_type"}):
+        return False
+    if not any(key in metadata for key in ("library_node_metadata", "library", "node_type")):
+        return True
+    try:
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+        library = LibraryRegistry.get_library_for_node_type("HMBImageBash", "HMB_GP_Production")
+        registered = library.get_node_metadata("HMBImageBash").model_dump(mode="json")
+        return (metadata.get("library") == "HMB_GP_Production"
+                and metadata.get("node_type") == "HMBImageBash"
+                and metadata.get("library_node_metadata") == registered)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
 def _install_bash_creation_observer(engine: Any) -> None:
     """Observe fresh create results; perform graph work only on a later tick."""
     manager = engine.event_manager
@@ -67,16 +93,14 @@ def _install_bash_creation_observer(engine: Any) -> None:
         if (not result.succeeded() or request.initial_setup
                 or request.node_type not in {"HMBImageBash", "HMBImageAssetLibrary"}):
             return
-        metadata = request.metadata or {}
-        if request.node_type == "HMBImageBash" and (not isinstance(metadata, dict)
-                or any(key not in {"position", "tempId"} for key in metadata)):
-            return
         name, flow_name, kind = result.node_name, result.parent_flow_name, request.node_type
         try:
             created_node = engine.node_manager.get_node_by_name(name)
         except Exception:
             return
         if not _hmb_is_registered_node(created_node, kind):
+            return
+        if kind == "HMBImageBash" and not getattr(created_node, "_hmb_palette_creation_layout_only", False):
             return
         loop = manager.event_loop
         if loop is None or loop.is_closed() or not loop.is_running():
@@ -169,6 +193,7 @@ class HMBImageBash(_StockImageBash):
 
     def __init__(self, **kwargs) -> None:
         incoming_metadata = kwargs.get("metadata")
+        self._hmb_palette_creation_layout_only = _hmb_is_palette_creation_metadata(incoming_metadata)
         saved_size = deepcopy(incoming_metadata.get("size")) if isinstance(incoming_metadata, dict) and "size" in incoming_metadata else None
         self._hmb_syncing = True
         super().__init__(**kwargs)

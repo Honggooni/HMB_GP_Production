@@ -46,9 +46,10 @@ async def exercise(engine):
     ensured = engine.handle_request(EnsureWorkflowAndFlowRequest(flow_name="TwoWayA"))
     assert ensured.succeeded(), ensured.result_details
 
-    def create(flow, kind, name, *, initial=False, owner=None):
+    def create(flow, kind, name, *, initial=False, owner=None, metadata=None):
         result = engine.handle_request(CreateNodeRequest(node_type=kind, specific_library_name=owner or schema.name,
-            node_name=name, override_parent_flow_name=flow, initial_setup=initial, create_error_proxy_on_failure=False))
+            node_name=name, override_parent_flow_name=flow, initial_setup=initial,
+            metadata=metadata, create_error_proxy_on_failure=False))
         assert result.succeeded(), result.result_details
         return engine.node_manager.get_node_by_name(result.node_name)
     def flow(name):
@@ -70,9 +71,16 @@ async def exercise(engine):
         for name in ("schedule_post_registration_reconcile", "schedule_post_hydration_reconcile", "reconcile_shot_routing"):
             guard.enter_context(mock.patch.object(routing, name))
         # Asset first, then the freshly created palette node.
-        first = create(ensured.flow_name, "HMBImageAssetLibrary", "FirstAsset")
+        first = create(ensured.flow_name, "HMBImageAssetLibrary", "FirstAsset",
+            metadata={"position": {"x": 100, "y": 100}, "tempId": "palette-first-asset"})
         shots = deepcopy(first._current_state()["shot_routing"])
-        fresh = create(ensured.flow_name, "HMBImageBash", "FreshBash")
+        palette_metadata = {"position": {"x": 1600, "y": 100}, "tempId": "palette-first-bash"}
+        fresh = create(ensured.flow_name, "HMBImageBash", "FreshBash", metadata=palette_metadata)
+        # The real SDK mutates this same request dictionary during construction.
+        # Inspect the original palette facts before constructor-owned size is added.
+        assert {"library", "node_type", "library_node_metadata", "size"} <= palette_metadata.keys()
+        assert fresh._hmb_palette_creation_layout_only
+        assert "_hmb_palette_creation_layout_only" not in fresh.metadata
         await settle()
         workspace = first._current_state()["image_bash_workspace"]
         assert workspace and len(incoming(fresh)) == 2, (workspace, fresh.get_parameter_value("HMB_BASH_STATUS"),
@@ -159,10 +167,12 @@ async def exercise(engine):
         assert engine.handle_request(RemoveParameterFromNodeRequest(node_name=first.name, parameter_name=orphan_child)).succeeded()
         # Reverse order: fresh Bash remains pending until the asset is created.
         fb = flow("TwoWayB")
-        pending = create(fb, "HMBImageBash", "PendingBash")
+        pending = create(fb, "HMBImageBash", "PendingBash",
+            metadata={"position": {"x": 800, "y": 100}, "tempId": "palette-pending-bash"})
         await settle()
         assert pending._hmb_auto_workspace_pending and not incoming(pending)
-        late = create(fb, "HMBImageAssetLibrary", "LateAsset")
+        late = create(fb, "HMBImageAssetLibrary", "LateAsset",
+            metadata={"position": {"x": 100, "y": 100}, "tempId": "palette-late-asset"})
         await settle()
         assert late._current_state()["image_bash_workspace"] and len(incoming(pending)) == 2
         # Two assets: no implicit selection; explicit dropdown target can
@@ -182,10 +192,27 @@ async def exercise(engine):
         # A restored/duplicated node must not create or reconnect a workspace.
         fd = flow("TwoWayD")
         restored_asset = create(fd, "HMBImageAssetLibrary", "RestoreAsset")
-        restored = create(fd, "HMBImageBash", "RestoredBash", initial=True)
+        restored = create(fd, "HMBImageBash", "RestoredBash", initial=True,
+            metadata={"position": {"x": 800, "y": 100}, "tempId": "hydrated-layout"})
         await settle()
         command(restored, "refresh")
         assert not incoming(restored) and not restored_asset._current_state()["image_bash_workspace"]
+        # Metadata authored before construction is not a fresh palette intent.
+        # Native constructor-owned size added later must not hide that boundary.
+        for label, metadata in (
+            ("SavedSize", {"size": {"width": 920, "height": 740}}),
+            ("SavedLease", {"hmb_image_bash_workspace_id": "saved-workspace"}),
+            ("Custom", {"user_note": "retain authored metadata"}),
+        ):
+            metadata_flow = flow("Metadata" + label)
+            metadata_asset = create(metadata_flow, "HMBImageAssetLibrary", "MetadataAsset" + label)
+            metadata_bash = create(metadata_flow, "HMBImageBash", "MetadataBash" + label,
+                metadata=deepcopy(metadata))
+            await settle()
+            command(metadata_bash, "refresh")
+            assert not metadata_bash._hmb_palette_creation_layout_only
+            assert not incoming(metadata_bash) and not metadata_asset._current_state()["image_bash_workspace"]
+            assert all(metadata_bash.metadata[key] == value for key, value in metadata.items())
         # An occupied workspace is never stolen by a second fresh node.
         occupied = create(fb, "HMBImageBash", "SecondBash")
         await settle()
@@ -233,7 +260,9 @@ async def exercise(engine):
         await settle()
         assert len(incoming(waiting)) == 2 and locked_asset._current_state()["image_bash_workspace"]
     print(json.dumps({"status":"PASS","scope":"isolated real SDK; no user workflow","asset_first":True,
-        "bash_first":True,"two_assets_explicit":True,"unbind_no_reconnect":True,"restore_no_reconnect":True,
+        "bash_first":True,"real_palette_metadata_in_place_mutation":True,
+        "authored_metadata_not_auto_bound":True,"palette_marker_not_serialized":True,
+        "two_assets_explicit":True,"unbind_no_reconnect":True,"restore_no_reconnect":True,
         "occupied_not_stolen":True,"edited_pending_preserved":True,"foreign_same_name_ignored":True,
         "locked_source_untouched_then_refresh":True,"dynamic_port_cleanup_blocked_then_three_wires_restored":True,
         "detached_delete_and_orphan_port_cleanup_allowed":True,
