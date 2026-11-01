@@ -329,6 +329,7 @@ jobs:
             "- Preserves personal local image generation with Nano Banana Pro and Nano Banana 2, model-specific options, exact provider IDs and existing Task recovery. Provider keys remain on the Broker; generated images are not published to project review lists.",
             "- Preserves original local image and MOV/MP4 previews, My Box result retrieval, mode-preserving web rerenders and ambiguous-submission protection. Release tests never submit replacement paid generations.",
             "- Keeps the durable shared Broker address, authenticated project discovery, Only mode, explicit Draft settings, isolated optional TOS environment and bundled signed Agent runtime. Matching Broker APIs and permissions are required for web review and publication; this client package does not deploy the server.",
+            "- Canonicalizes Windows 8.3 and long temporary paths in media test fixtures, retaining all assertions and the unchanged production crop/codec behavior.",
             "- Includes registered Python, JavaScript, browser, installed-SDK and DCC checks. Coverage receipts distinguish actual executions, historical evidence and not-run items; offline fixtures do not establish live provider or animation quality.",
             "- Includes SHA256 integrity manifests and verified local-to-team functional parity. Private policy sources, signing material, credentials, test data and local reports are excluded from the distribution.",
             "",

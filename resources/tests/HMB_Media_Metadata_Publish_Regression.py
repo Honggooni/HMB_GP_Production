@@ -116,7 +116,8 @@ class VideoPublishRegression(unittest.TestCase):
 
     def run_crop(self, candidate):
         def probe(path):
-            if Path(path) == self.source: return copy.deepcopy(self.probe)
+            # The host resolves inputs; Windows TEMP may retain an 8.3 alias.
+            if Path(path).resolve(strict=True) == self.source.resolve(strict=True): return copy.deepcopy(self.probe)
             if isinstance(candidate, BaseException): raise candidate
             return copy.deepcopy(candidate)
         def encode(command, *_args):
@@ -207,7 +208,8 @@ class RealMediaProbeRegression(unittest.TestCase):
         original = target.probe_video
         def selected(path):
             value = original(path)
-            if Path(path) == dual:
+            # Match the host's canonical identity, including short TEMP aliases.
+            if Path(path).resolve(strict=True) == dual.resolve(strict=True):
                 value.update(width=96, height=64, video_stream_index=1)
             return value
         settings = target.default_picker_tools_state()["crop"]
