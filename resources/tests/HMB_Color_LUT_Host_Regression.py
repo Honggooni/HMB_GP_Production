@@ -109,6 +109,8 @@ def main():
                     node._worker.join(timeout=60)
                     assert node._hmb_color_lut_state["status"]["phase"] == "complete", node._hmb_color_lut_state["status"]
                     assert Path(node._hmb_color_lut_state["result"]["path"]).is_file()
+                    assert Path(node._hmb_color_lut_state["result"]["path"]).name == "final.mov"
+                    assert not (root / "final.mp4").exists()
                     assert node._hmb_color_lut_state["result"]["shot"]["shot_uuid"] == shot["shot_uuid"]
                     assert Path(node._hmb_color_lut_state["result"]["lut_path"]).parent == root / "data"
                     assert Path(node._hmb_color_lut_state["result"]["metadata_path"]).is_file()

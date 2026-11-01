@@ -54,10 +54,28 @@ class DirectUploadRegression(fixture.ManualLUTRegression):
         self.assertEqual(sent.call_count,1)
         self.assertEqual(sent.call_args.args[0]['artifact'],'export')
         self.assertNotEqual(sent.call_args.args[0]['path'],state['source']['path'])
+        self.assertEqual(Path(sent.call_args.args[0]['path']).suffix,'.mov')
+        self.assertEqual(self.node._upload_metadata(sent.call_args.args[0])['output_format'],'mov')
         self.assertEqual(sent.call_args.args[0]['settings'],state['settings'])
         self.assertEqual(Path(state['source']['path']).read_bytes(),original)
         self.assertTrue(Path(state['result']['path']).is_file())
         self.assertEqual(state['status']['phase'],'complete')
+
+    def test_mybox_output_then_upload_uses_mov_and_same_export_on_retry(self):
+        rows=[*fixture.PROJECTS,{'id':'my-box','name':'My Box'}]
+        with mock.patch.object(fixture,'PROJECTS',rows):
+            self.node._manual_projects=copy.deepcopy(rows);self.choose('my-box')
+            state=self.node._hmb_color_lut_state;state['result']={}
+            state['output'].update(manual_output_enabled=True,path=str(self.root/'legacy.mp4'))
+            with mock.patch.object(target,'export_video',side_effect=self.fixture.successful_export) as encoded, \
+                 mock.patch.object(self.node,'_upload_request',side_effect=lambda c,**kw:self.ack(c)) as sent:
+                self.chain('mybox-mov');self.chain('same-mybox-mov')
+            self.assertEqual(encoded.call_count,1);self.assertEqual(sent.call_count,1)
+            context=sent.call_args.args[0]
+            self.assertEqual(context['project_id'],'my-box')
+            self.assertEqual(Path(context['path']).name,'legacy.mov')
+            self.assertEqual(context['file_name'],'11-12.mov')
+            self.assertEqual(self.node._upload_metadata(context)['output_format'],'mov')
 
     def test_output_unknown_retries_same_export_with_get_only(self):
         self.node._hmb_color_lut_state['result']={};calls=[]

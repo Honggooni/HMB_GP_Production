@@ -27,6 +27,7 @@ async def exercise_live_sync(engine, node, target, source, schema, original_shot
     from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest, AddParameterToNodeRequest
     from griptape_nodes.retained_mode.events.connection_events import ListConnectionsForNodeRequest, CreateConnectionRequest
     import HMBImageBash as bash
+    from HMB_Image_Bash_Host_Regression import await_bash_settled
 
     flow = engine.node_manager.get_node_parent_flow_by_name(node.name)
     workspace = deepcopy(node._current_state()["image_bash_workspace"])
@@ -120,6 +121,7 @@ async def exercise_live_sync(engine, node, target, source, schema, original_shot
             assert entered.wait(1), "Project verification was not queued"
             pending = target.get_parameter_value("image_bash_context")
             assert pending.get("revision") == selected["revision"] and pending.get("ready") is False
+            assert pending.get("preparation_phase") == "preparing" and pending.get("requested_count") == 1
             assert target.get_parameter_value("bash_image") == scene
             release.set()
             for _ in range(100):
@@ -127,11 +129,40 @@ async def exercise_live_sync(engine, node, target, source, schema, original_shot
                 if context.get("revision") == selected["revision"] and context.get("ready") is True:
                     break
                 await asyncio.sleep(.05)
+            assert context.get("preparation_phase") == "ready" and context.get("requested_count") == 1
             assert resolved_threads and all(t != host_thread for t in resolved_threads), (errors, output_calls.call_count, scan_calls.call_count, node._hmb_selection_resolution_work)
             assert not errors, errors
         assert target._records()[0]["source_uid"] == item["instance_id"]
         assert target.get_parameter_value("bash_image")["meta"]["input_images"][0]["source_uid"] == item["instance_id"]
         assert len(node._current_state()["shot_routing"]["shots"]) == 5
+        before_retry = deepcopy(node._current_state())
+        before_scene = deepcopy(target.get_parameter_value("bash_image"))
+        cache = node._resolution_cache_for_state(before_retry)
+        cache["unrelated-workspace-sentinel"] = {"preserved": True}
+        # An explicit Retry expires this workspace's possibly negative file
+        # facts, queues the existing share verifier, and keeps all authored data.
+        with mock.patch.object(source.HMBImageAssetLibrary, "process", side_effect=AssertionError("Retry must not Run")), \
+             mock.patch.object(bash.HMBImageBash, "process", side_effect=AssertionError("Retry must not Run")):
+            requested = node._hmb_retry_image_bash_inputs(target, workspace["workspace_id"])
+            assert requested["preparation_phase"] == "preparing" and requested["requested_count"] == 1
+            assert target.get_parameter_value("bash_image") == before_scene
+            for _ in range(100):
+                retry_context = target.get_parameter_value("image_bash_context")
+                if retry_context.get("ready") is True:
+                    break
+                await asyncio.sleep(.05)
+        assert retry_context.get("preparation_phase") == "ready"
+        assert "unrelated-workspace-sentinel" in node._resolution_cache_for_state(node._current_state())
+        after_retry = node._current_state()
+        assert after_retry["image_bash_workspace"] == before_retry["image_bash_workspace"]
+        assert after_retry["shot_routing"] == before_retry["shot_routing"]
+        assert target.get_parameter_value("bash_image") == before_scene
+        try:
+            node._hmb_retry_image_bash_inputs(target, str(uuid4()))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("A stale workspace must not retry current sources")
         workspace = deepcopy(node._current_state()["image_bash_workspace"])
         # Apply into an ImageAsset import must not erase the same workspace's
         # selected instance identities or recursively invalidate its receipt.
@@ -149,6 +180,7 @@ async def exercise_live_sync(engine, node, target, source, schema, original_shot
             result = engine.handle_request(SetParameterValueRequest(node_name=target.name, parameter_name=name,
                 value=value, broadcast_result=False))
             assert result.succeeded(), result.result_details
+        await await_bash_settled(engine)
         from base64 import b64encode
         png = BytesIO()
         Image.new("RGBA", (4, 2), (10, 20, 30, 255)).save(png, "PNG")

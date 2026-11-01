@@ -144,9 +144,18 @@ class ManualLUTRegression(unittest.TestCase):
         with self.assertRaises(ValueError): self.ready("export")
 
     def test_manual_wire_contract_uses_filename_metadata_and_exact_gateway(self):
-        context = self.ready(); metadata = self.node._upload_metadata(context)
+        self.assert_manual_wire_contract("source")
+
+    def test_manual_graded_mov_wire_contract_preserves_filename_and_exact_bytes(self):
+        self.assert_manual_wire_contract("export")
+
+    def assert_manual_wire_contract(self, artifact):
+        context = self.ready(artifact); metadata = self.node._upload_metadata(context)
         self.assertEqual(set(metadata), {"schema", "version", "project_id", "file_name", "settings_sha256", "export_sha256", "export_bytes", "output_format", "workflow_id", "color_lut_node_id"})
-        self.assertEqual(metadata["file_name"], "11-12.mp4")
+        name = "11-12.mov" if artifact == "export" else "11-12.mp4"
+        suffix = "mov" if artifact == "export" else "mp4"
+        self.assertEqual(metadata["file_name"], name)
+        self.assertEqual(metadata["output_format"], suffix)
         expected = hashlib.sha256("\n".join(("hmb-color-lut-manual-upload-v1", context["project_id"], context["file_name"], context["sha256"], context["settings_sha256"])).encode()).hexdigest()
         self.assertEqual(context["upload_id"], expected)
         seen = {}
@@ -165,10 +174,25 @@ class ManualLUTRegression(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"HMBSeedanceGeneration": generator}):
             self.node._upload_request(context, retrieve=False, cancel=threading.Event())
         self.assertEqual(seen["url"], ORIGIN + target.COLOR_LUT_MANUAL_UPLOAD_PATH)
-        self.assertIn(b'filename="color-lut.mp4"', seen["body"])
-        self.assertIn(b'"file_name":"11-12.mp4"', seen["body"])
+        self.assertIn(f'filename="color-lut.{suffix}"'.encode(), seen["body"])
+        self.assertIn(f'"file_name":"{name}"'.encode(), seen["body"])
+        self.assertIn(b"Content-Type: video/quicktime" if artifact == "export" else b"Content-Type: video/mp4", seen["body"])
+        self.assertIn(Path(context["path"]).read_bytes(), seen["body"])
         self.assertNotIn(str(self.root).encode(), seen["body"])
         self.assertEqual(int(seen["headers"]["Content-length"]), len(seen["body"]))
+
+    def test_legacy_export_proof_keeps_original_filename_and_upload_identity(self):
+        state = self.node._hmb_color_lut_state
+        proof = self.node._export_upload_proof(state)
+        proof.pop("upload_name_suffix")
+        identity = target._digest(proof)
+        target._write_upload_receipt(identity, proof)
+        state["result"]["web_export_proof"] = identity
+        context = self.ready("export")
+        self.assertEqual(context["file_name"], "11-12.mp4")
+        expected = hashlib.sha256("\n".join(("hmb-color-lut-manual-upload-v1", context["project_id"],
+            "11-12.mp4", context["sha256"], context["settings_sha256"])).encode()).hexdigest()
+        self.assertEqual(context["upload_id"], expected)
 
     def test_unknown_upload_retrieves_same_id_and_completed_reopen_never_duplicates(self):
         context = self.ready(); calls = []

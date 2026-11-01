@@ -29,7 +29,7 @@ STEP_KEYS = ("exposure", "temperature", "contrast", "saturation", "shadows", "hi
 SETTINGS_PRECISION_VERSION = 2
 STEP_SUBDIVISIONS = 4
 CUBE_SIZE = 33
-CODEC_EXTENSIONS = {"hevc10": ".mp4", "prores": ".mov", "ffv1": ".mkv"}
+CODEC_EXTENSIONS = {"hevc10": ".mov", "prores": ".mov", "ffv1": ".mkv"}
 _UNKNOWN = {"", "unknown", "unspecified", "reserved", "N/A"}
 _SDR_TRANSFERS = {"bt709", "smpte170m", "smpte240m", "bt470bg", "bt470m", "iec61966-2-1"}
 _SDR_PRIMARIES = {"bt709", "bt470bg", "smpte170m", "smpte240m", "bt470m"}
@@ -170,14 +170,18 @@ def _color_details(source: Path) -> dict[str, Any]:
     result = subprocess.run([ffmpeg, "-hide_banner", "-protocol_whitelist", "file,pipe", "-i", str(source)], capture_output=True, text=True,
                             encoding="utf-8", errors="replace", timeout=30)
     log = result.stderr or result.stdout
-    line = next((line for line in log.splitlines() if "Video:" in line), "")
+    line = next((line for line in log.splitlines() if "Video:" in line
+                 and "attached pic" not in line.lower()), "")
     if not line:
         raise ColorLUTError("Could not verify source color metadata.")
     match = re.search(r"\b(?:yuv\w+|gbr\w+|rgb\w+|bgr\w+|gray\w*)\(([^)]*)\)", line)
     details: dict[str, Any] = {"audio_streams": [], "raw_color_log": log[-32000:], "probe_backend": "ffmpeg"}
-    dimensions = re.search(r"\b(\d+)x(\d+)\b", line)
-    if dimensions:
-        details.update(width=int(dimensions.group(1)), height=int(dimensions.group(2)))
+    # Stream IDs ([0x1]) and codec tags (0x31637661) precede the picture
+    # dimensions. Only the comma-delimited positive geometry field is a size.
+    dimensions = re.search(r",\s*([1-9]\d*)x([1-9]\d*)(?=\s|,|$)", line)
+    if dimensions is None:
+        raise ColorLUTError("Could not verify positive video dimensions from FFmpeg stream metadata.")
+    details.update(width=int(dimensions.group(1)), height=int(dimensions.group(2)))
     pixel_format = re.search(r"\b(yuv\w+|gbr\w+|rgb\w+|bgr\w+|gray\w*)", line)
     details["pix_fmt"] = pixel_format.group(1) if pixel_format else ""
     codec_match = re.search(r"Video:\s*([^,\s]+)", line)
@@ -210,6 +214,12 @@ def _color_details(source: Path) -> dict[str, Any]:
 
 def _basic_probe(source: Path, details: Mapping[str, Any]) -> dict[str, Any]:
     """UTF-8-safe counterpart to the shared probe's public geometry/audio shape."""
+    try:
+        width, height = int(details.get("width") or 0), int(details.get("height") or 0)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ColorLUTError("Could not verify positive video dimensions.") from exc
+    if width <= 0 or height <= 0:
+        raise ColorLUTError("Could not verify positive video dimensions.")
     rate = str(details.get("avg_frame_rate") or details.get("r_frame_rate") or "0")
     try:
         if "/" in rate:
@@ -221,7 +231,7 @@ def _basic_probe(source: Path, details: Mapping[str, Any]) -> dict[str, Any]:
         frame_rate = 0.0
     audio = (details.get("audio_streams") or [{}])[0]
     return {"path": str(source), "probe_backend": details.get("probe_backend"),
-            "width": int(details.get("width") or 0), "height": int(details.get("height") or 0),
+            "width": width, "height": height,
             "frame_rate": frame_rate, "duration": float(details.get("duration") or details.get("format_duration") or 0),
             "has_audio": bool(details.get("audio_streams")), "video_codec": str(details.get("codec_name") or ""),
             "pixel_format": str(details.get("pix_fmt") or ""), "video_profile": str(details.get("profile") or ""),
@@ -404,7 +414,9 @@ def export_video(source_path: Any, output_path: str | Path, settings: Any, codec
     source_probe = probe_source(source)
     width, height = int(source_probe["width"]), int(source_probe["height"])
     if (codec == "hevc10" and (width % 2 or height % 2)) or (codec == "prores" and width % 2):
-        raise ColorLUTError("The selected 4:2:0/4:2:2 codec cannot preserve these odd source dimensions; use FFV1.")
+        requirement = "HEVC10 (4:2:0) requires even width and height" if codec == "hevc10" else "ProRes (4:2:2) requires an even width"
+        raise ColorLUTError(f"Source dimensions are {width}x{height}; {requirement}. "
+                            "FFV1 is already available and preserves the original dimensions; no resizing or padding was applied.")
     normalized = normalize_settings(settings)
     staging = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.part{output.suffix}")
     source_stat = source.stat()
@@ -428,7 +440,7 @@ def export_video(source_path: Any, output_path: str | Path, settings: Any, codec
             command += ["-color_primaries", "bt709", "-color_trc", "iec61966-2-1" if codec == "ffv1" else "bt709",
                         "-colorspace", "rgb" if codec == "ffv1" else "bt709", "-color_range", "pc" if codec == "ffv1" else "tv"]
             if codec != "ffv1":
-                command += ["-movflags", "+faststart"]
+                command += ["-movflags", "+faststart", "-f", "mov"]
             command += ["-progress", "pipe:1", str(staging)]
             _run_export(command, work, cancel_event, progress, float(source_probe.get("duration") or 0),
                         float(source_probe.get("format_start_time") or 0))

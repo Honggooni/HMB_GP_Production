@@ -11,6 +11,7 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+from uuid import uuid4
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -47,6 +48,11 @@ def selected_state(name="A", project="ProjectA"):
 
 def fake_node(state):
     node = object.__new__(asset.HMBImageAssetLibrary)
+    # Detached output-worker fixture: supply the fresh owner lease normally
+    # established by the real constructor before accepting any state baseline.
+    # Keep the real baseline/persistence implementation and all readiness checks.
+    node._hmb_widget_runtime_lease = str(uuid4())
+    state[asset.WIDGET_RUNTIME_LEASE_KEY] = node._hmb_widget_runtime_lease
     live = {"state": state}
     node.name = "synthetic_async_selection"
     node.get_parameter_value = lambda name: asset._json_text(live["state"]) if name == asset.WIDGET_STATE_PARAMETER else ""
@@ -66,6 +72,10 @@ def fake_node(state):
 
 class SelectionResolutionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.loop = asyncio.get_running_loop()
+        self.previous_exception_handler = self.loop.get_exception_handler()
+        self.callback_errors = []
+        self.loop.set_exception_handler(lambda _loop, context: self.callback_errors.append(context))
         self.main_thread = threading.get_ident()
         self.release = threading.Event()
         self.entered = threading.Event()
@@ -98,6 +108,8 @@ class SelectionResolutionTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.04)
         for patcher in reversed(self.patchers):
             patcher.stop()
+        self.loop.set_exception_handler(self.previous_exception_handler)
+        self.assertEqual(self.callback_errors, [], "Background callback raised unexpectedly")
 
     async def wait_until(self, predicate):
         deadline = time.monotonic() + 2
@@ -123,6 +135,39 @@ class SelectionResolutionTests(unittest.IsolatedAsyncioTestCase):
         count = len(self.reads)
         node._sync_output(state)
         self.assertEqual(len(self.reads), count)
+
+    async def test_explicit_import_retry_uses_bounded_worker_without_host_unc_reads(self):
+        state = selected_state("UNC")
+        state["assets"][0].update(source_kind="user", source_uid="user:retry-unc",
+            path="//synthetic.invalid/share/UNC.png", registered=False)
+        state = asset._normalize_state(state)
+        node, live = fake_node(state)
+        key = asset._asset_resolution_cache_key(state["assets"][0], state, 0)
+        node._hmb_image_bash_retry_cache_keys = {key}
+        threads = []
+        def slow_unc(value):
+            threads.append(threading.get_ident())
+            self.entered.set()
+            assert threading.get_ident() != self.main_thread, "UNC retry blocked the host"
+            assert self.release.wait(2), "Fixture UNC worker was not released"
+            return str(value)
+        before = deepcopy(live["state"])
+        sentinel = {"old": "last-good"}
+        node.parameter_output_values.update(sentinel)
+        with patch.object(asset, "_resolved_media_value", side_effect=slow_unc):
+            started = time.monotonic()
+            node._sync_output(state)
+            self.assertLess(time.monotonic() - started, .08)
+            await self.wait_until(self.entered.is_set)
+            for _ in range(5):
+                node._sync_output(state)
+            self.assertEqual(node.parameter_output_values, sentinel)
+            self.assertEqual(len(threads), 1, "Duplicate Retry must reuse its active worker")
+            self.release.set()
+            await self.wait_until(lambda: bool(self.published))
+        self.assertEqual(live["state"], before)
+        self.assertEqual(self.published[-1][1], [state["assets"][0]["path"]])
+        self.assertEqual(len(threads), 1)
 
     async def test_rapid_selection_keeps_only_latest_queued_click(self):
         node, live = fake_node(selected_state("A"))

@@ -318,15 +318,16 @@ def _metadata_context(registration: Any) -> tuple[Any, Any, Any, Any, Any, tuple
 def recover_workflow_metadata(registration: Any, request: Any) -> Any:
     """Lease the original legacy metadata request to an honest native scratch key.
 
-    Only the current pathless, unregistered literal ``workflow`` HMB canvas is
-    eligible. Its existing context/flow/node objects are retained. The native
-    metadata handler builds the response; no saved metadata/history is invented.
+    Only the exact current pathless, unregistered HMB canvas is eligible. Its
+    original request name is leased while context/flow/node objects are retained.
+    The native metadata handler builds the response; no saved history is invented.
     """
     try:
         from griptape_nodes.retained_mode.events.workflow_events import (
             GetWorkflowMetadataRequest, GetWorkflowMetadataResultSuccess,
         )
-        if type(request) is not GetWorkflowMetadataRequest or request.workflow_name != "workflow":
+        if (type(request) is not GetWorkflowMetadataRequest
+                or type(request.workflow_name) is not str or not request.workflow_name):
             return None
         with registration.lock:
             state = _metadata_context(registration)
@@ -337,8 +338,12 @@ def recover_workflow_metadata(registration: Any, request: Any) -> Any:
             lease = getattr(registration, "_hmb_legacy_metadata_lease", None)
             name = context.get_current_workflow_name()
             if lease is not None:
+                # Older registrations only leased the literal name "workflow".
+                request_name = lease.get("request_name", "workflow")
+                if request.workflow_name != request_name:
+                    return None  # Unrelated native lookups cannot revoke this lease.
                 if (lease["context"]() is not record or lease["flow"]() is not flow
-                        or name != lease["key"] or registry.has_workflow_with_name("workflow")
+                        or name != lease["key"] or registry.has_workflow_with_name(request_name)
                         or not registry.has_workflow_with_name(name)
                         or registry.get_workflow_by_name(name) is not lease["workflow"]()
                         or registry.get_workflow_by_name(name).is_saved is not False):
@@ -347,7 +352,7 @@ def recover_workflow_metadata(registration: Any, request: Any) -> Any:
                 translated = GetWorkflowMetadataRequest(workflow_name=name, broadcast_result=False)
                 result = engine.handle_request(translated)
                 return result if type(result) is GetWorkflowMetadataResultSuccess else None
-            if name != "workflow" or registry.has_workflow_with_name(name):
+            if request.workflow_name != name or registry.has_workflow_with_name(name):
                 return None
             key = "unsaved:" + str(uuid4())
             flags = engine.workflow_manager.variable_substitution._enabled
@@ -356,7 +361,7 @@ def recover_workflow_metadata(registration: Any, request: Any) -> Any:
             try:
                 if registry.has_workflow_with_name(key):
                     return None
-                created = registry.ensure_unsaved(key, display_name="workflow")
+                created = registry.ensure_unsaved(key, display_name=name)
                 if (registry.get_workflow_by_name(key) is not created or created.is_saved is not False
                         or created.file_path is not None or _metadata_context(registration)[-1] != signature):
                     raise RuntimeError("The retained workflow changed during metadata recovery")
@@ -369,7 +374,8 @@ def recover_workflow_metadata(registration: Any, request: Any) -> Any:
                         or current[-1] != signature or context.get_current_workflow_name() != key
                         or registry.get_workflow_by_name(key) is not created):
                     raise RuntimeError("Native metadata recovery did not retain the exact canvas")
-                registration._hmb_legacy_metadata_lease = {"key": key, "context": weakref.ref(record),
+                registration._hmb_legacy_metadata_lease = {"key": key, "request_name": request.workflow_name,
+                    "context": weakref.ref(record),
                     "flow": weakref.ref(flow), "workflow": weakref.ref(created)}
                 return result
             except Exception:

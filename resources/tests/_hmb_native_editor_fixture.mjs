@@ -69,3 +69,15 @@ export function nativeTestPlaywright(){
  }
  return require(resolved);
 }
+
+export function nativeTestBrowserPath(){
+ const configured=process.env.HMB_WIDGET_TEST_BROWSER||process.env.HMB_NATIVE_HEADER_TEST_BROWSER
+  ||process.env.HMB_IMAGE_ASSET_TEST_BROWSER||process.env.HMB_IMAGE_BASH_TEST_BROWSER||process.env.HMB_COLOR_LUT_TEST_BROWSER
+  ||process.env.HMB_PROMPT_TEST_BROWSER||process.env.HMB_PICKER_TEST_BROWSER||process.env.HMB_SEEDANCE_TEST_BROWSER;
+ if(configured){assert.ok(fs.existsSync(configured),'Configured regression browser does not exist: '+configured);return configured;}
+ const local=process.platform==='win32'?'C:/Program Files/Google/Chrome/Application/chrome.exe':null;
+ if(local&&fs.existsSync(local))return local;
+ const bundled=nativeTestPlaywright().chromium.executablePath();
+ assert.ok(fs.existsSync(bundled),'A regression browser is required: set HMB_WIDGET_TEST_BROWSER or install Playwright Chromium.');
+ return bundled;
+}

@@ -134,6 +134,11 @@ try:
                 "project_video_path": project_macro,
                 "video_url": "http://127.0.0.1:8124/external/stale-color.mp4",
             },
+            # This fixture verifies saved URL hydration, not poster decoding.
+            # Preserve the lexical UNC record without asking the thumbnail
+            # resolver to stat a real share before the controlled resolver
+            # below is installed. Poster recovery has separate regressions.
+            defer_thumbnail=True,
         )
         state.update(
             {

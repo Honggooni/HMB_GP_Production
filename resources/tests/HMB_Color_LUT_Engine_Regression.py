@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 import shutil
 import struct
 import subprocess
@@ -14,7 +16,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+ROOT = Path(os.environ.get("HMB_COLOR_LUT_TEST_ROOT", str(Path(__file__).resolve().parents[2])))
+sys.path.insert(0, str(ROOT))
 import _hmb_color_lut as target
 
 
@@ -143,11 +146,11 @@ class ColorLUTRegression(unittest.TestCase):
     def test_cancellation_cleans_only_own_staging(self) -> None:
         event = threading.Event()
         event.set()
-        output = self.root / "cancelled.mp4"
+        output = self.root / "cancelled.mov"
         with self.assertRaisesRegex(target.ColorLUTError, "cancelled"):
             target.export_video(self.source, output, {}, cancel_event=event)
         self.assertFalse(output.exists())
-        sentinel = self.root / "unrelated.part.mp4"
+        sentinel = self.root / "unrelated.part.mov"
         sentinel.write_bytes(b"keep")
         event.clear()
         # Cancel after FFmpeg has actually started; _notify(0) before startup
@@ -183,9 +186,82 @@ class ColorLUTRegression(unittest.TestCase):
     def test_ffmpeg_fallback_preserves_hdr_evidence(self) -> None:
         with mock.patch.object(target, "_find_ffprobe", return_value=""):
             source = target.probe_source(self.source)
+        self.assertEqual((source["width"], source["height"]), (96, 64))
+        self.assertEqual(source["probe_backend"], "ffmpeg")
         self.assertEqual(source["color_primaries"], "bt709")
         self.assertEqual(source["color_range"], "tv")
         self.assertEqual(source["audio_streams"][0]["codec_name"], "aac")
+
+    def test_real_fallback_header_ignores_hex_ids_and_exports_main10_mov(self) -> None:
+        header = subprocess.run([self.ffmpeg, "-hide_banner", "-i", str(self.source)], capture_output=True,
+                                text=True, encoding="utf-8", errors="replace", timeout=30)
+        line = next(line for line in header.stderr.splitlines() if "Video:" in line)
+        # Prove the old matcher reads the real MP4 stream ID or codec tag as
+        # geometry before checking the fixed fallback and actual encoder.
+        old = re.search(r"\b(\d+)x(\d+)\b", line)
+        self.assertIsNotNone(old)
+        self.assertEqual(int(old.group(1)), 0)
+        ffprobe = target._find_ffprobe(self.ffmpeg)
+        self.assertTrue(ffprobe, "Independent MOV metadata verification requires ffprobe")
+        output = self.root / "fallback_main10.mov"
+        with mock.patch.object(target, "_find_ffprobe", return_value=""):
+            source = target.probe_source(self.source)
+            result = target.export_video(self.source, output, {"enabled": True, "exposure": .25})
+        self.assertEqual((source["width"], source["height"]), (96, 64))
+        self.assertEqual((result["width"], result["height"]), (96, 64))
+        self.assertEqual(result["probe_backend"], "ffmpeg")
+        self.assertEqual(result["audio_mode"], "copy")
+        details = subprocess.run([ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(output)],
+                                 capture_output=True, text=True, encoding="utf-8", check=True, timeout=30)
+        payload = json.loads(details.stdout)
+        video = next(stream for stream in payload["streams"] if stream["codec_type"] == "video")
+        audio = next(stream for stream in payload["streams"] if stream["codec_type"] == "audio")
+        self.assertEqual(payload["format"]["tags"]["major_brand"].strip(), "qt")
+        self.assertEqual((video["codec_name"], video["codec_tag_string"], video["profile"], video["pix_fmt"]),
+                         ("hevc", "hvc1", "Main 10", "yuv420p10le"))
+        self.assertEqual((video["width"], video["height"], int(video["nb_frames"])), (96, 64, 6))
+        self.assertAlmostEqual(float(video["duration"]), .5, delta=.0011)
+        self.assertAlmostEqual(float(video["start_time"]), 0, delta=.0011)
+        self.assertEqual((audio["codec_name"], int(audio["sample_rate"])), ("aac", 48000))
+        self.run_ffmpeg("-i", str(output), "-f", "null", "-")
+        decoded_audio = self.run_ffmpeg("-i", str(output), "-map", "0:a:0", "-f", "s16le", "pipe:1")
+        self.assertGreater(len(decoded_audio), 0)
+        self.assertEqual(digest(self.source), self.original_hash)
+
+    def test_invalid_dimensions_fail_instead_of_using_hex_tokens(self) -> None:
+        for width, height in ((0, 64), (96, 0), (-1, 64), (None, None)):
+            with self.subTest(width=width, height=height), self.assertRaisesRegex(target.ColorLUTError, "positive video dimensions"):
+                target._basic_probe(self.source, {"width": width, "height": height})
+        header = "Stream #0:0[0x1]: Video: h264 (avc1 / 0x31637661), yuv420p, 0x64, 12 fps"
+        with mock.patch.object(target, "_find_ffprobe", return_value=""), \
+                mock.patch.object(target.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", header)), \
+                self.assertRaisesRegex(target.ColorLUTError, "positive video dimensions"):
+            target._color_details(self.source)
+
+    def test_genuine_odd_source_keeps_exact_geometry_with_ffv1(self) -> None:
+        source = self.root / "genuine_odd.mkv"
+        self.run_ffmpeg("-f", "lavfi", "-i", "testsrc=size=97x65:rate=12:duration=0.25", "-c:v", "ffv1",
+                        "-pix_fmt", "gbrp16le", "-color_primaries", "bt709", "-color_trc", "iec61966-2-1",
+                        "-colorspace", "rgb", "-color_range", "pc", str(source))
+        before = digest(source)
+        with mock.patch.object(target, "_find_ffprobe", return_value=""):
+            probe = target.probe_source(source)
+            self.assertEqual((probe["width"], probe["height"]), (97, 65))
+            for codec in ("hevc10", "prores"):
+                with self.subTest(codec=codec), self.assertRaisesRegex(target.ColorLUTError, "97x65.*FFV1 is already available"):
+                    target.export_video(source, self.root / ("odd_rejected_" + codec + ".mov"), {}, codec)
+            output = self.root / "genuine_odd_graded.mkv"
+            result = target.export_video(source, output, {}, "ffv1")
+        self.assertEqual((result["width"], result["height"]), (97, 65))
+        with tempfile.TemporaryDirectory(prefix="hmb_lut_odd_pixels_") as temporary:
+            work = Path(temporary)
+            target.write_cube(work / "grade.cube", {})
+            expected = self.run_ffmpeg("-i", str(source), "-vf", target.build_color_filter(probe, "ffv1"),
+                                       "-pix_fmt", "gbrp16le", "-f", "rawvideo", "pipe:1", cwd=work)
+        actual = self.run_ffmpeg("-i", str(output), "-pix_fmt", "gbrp16le", "-f", "rawvideo", "pipe:1")
+        self.assertEqual(len(actual), 3 * 97 * 65 * 3 * 2)
+        self.assertEqual(actual, expected)
+        self.assertEqual(digest(source), before)
 
     def test_nonzero_variable_frame_timestamps_are_preserved(self) -> None:
         ffprobe = target._find_ffprobe(self.ffmpeg)
@@ -222,7 +298,7 @@ class ColorLUTRegression(unittest.TestCase):
                 self.assertEqual(result["audio_sample_rate"], 48000)
 
     def test_late_output_collision_does_not_overwrite(self) -> None:
-        output = self.root / "late_collision.mp4"
+        output = self.root / "late_collision.mov"
         calls = []
         def concurrent_writer(value: float) -> None:
             calls.append(value)
@@ -235,7 +311,7 @@ class ColorLUTRegression(unittest.TestCase):
 
     def test_browser_and_python_cube_values_match(self) -> None:
         node = shutil.which("node")
-        widget = Path(__file__).resolve().parents[2] / "widgets" / "HMBColorLUTLibraryWidget.js"
+        widget = ROOT / "widgets" / "HMBColorLUTLibraryWidget.js"
         if not node or not widget.is_file():
             self.skipTest("Browser cross-language parity needs Node and the widget source.")
         cases = [{}, {"enabled": True}, {"enabled": True, "temperature": -1.9, "contrast": 1.9},

@@ -2042,7 +2042,9 @@ class _Registration:
         if type(request) is SetParameterValueRequest and request.initial_setup is True:
             # SDK before_value_set runs even for initial_setup and transforms
             # request.value before the node's setter sees it. Capture original
-            # saved identity here; never change that request or its value.
+            # saved identity here; never change its value. The exact Bash load
+            # below uses the SDK's wire-only success projection to avoid echoing
+            # a second full scene. In-process results and document events stay full.
             name = request.node_name
             if name is None and engine.context_manager.has_current_node():
                 name = engine.context_manager.get_current_node().name
@@ -2050,6 +2052,23 @@ class _Registration:
                 node = engine.node_manager.get_node_by_name(name)
             except (KeyError, ValueError, TypeError):
                 node = None
+            if (request.parameter_name == "bash_image"
+                    and "fields" in getattr(type(request), "__dataclass_fields__", {}) and request.fields is None
+                    and is_loading_workflow() is True and _kind_metadata(node) == _BASH_NODE_TYPE
+                    and not bool(getattr(node, "_hmb_node_deleted", False))):
+                try:
+                    with self.lock:
+                        library = LibraryRegistry.get_library_for_node_type(_BASH_NODE_TYPE, _LIBRARY_NAME)
+                        actual = library.get_node_class(_BASH_NODE_TYPE)
+                        owners = tuple(self.owners.values())
+                        if (self._prompt_owner(engine, manager) and any(reference() is library for reference in owners)
+                                and library.get_library_data().name == _LIBRARY_NAME
+                                and type(node) is actual
+                                and engine.node_manager.get_node_by_name(node.name) is node
+                                and Path(inspect.getfile(actual)).resolve() == Path(__file__).resolve().with_name("HMBImageBash.py")):
+                            request.fields = []
+                except (AttributeError, KeyError, TypeError, ValueError, OSError, RuntimeError):
+                    pass  # Unknown/foreign class layouts retain the full native result.
             hook = getattr(node, "_hmb_capture_saved_parameter_value", None)
             if (_kind_metadata(node) in (_AGENT_NODE_TYPE, _FINISH_NODE_TYPE) and callable(hook)
                     and (is_loading_workflow() or self.load_requests)):

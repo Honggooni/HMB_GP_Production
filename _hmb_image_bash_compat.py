@@ -7,6 +7,8 @@ upstream file or updates its own approved baseline.
 from __future__ import annotations
 
 import ast
+from collections import OrderedDict
+from copy import deepcopy
 import hashlib
 import importlib
 import importlib.util
@@ -15,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import threading
 from typing import Any
 
 STANDARD_NAME = "Griptape Nodes Library"
@@ -47,6 +50,39 @@ EDITOR_SCOPES = {
     "brush_layers_load_export_modal": ("function x5(e){if(e.startsWith(`rgba(`))", "function WZr(e,t){"),
     "modal_settings": ("function Z4r(e,t,r,i,a={min:0,max:1,step:.01})", ",$4r=.15;"),
 }
+
+# Cache analysis, never admission or file identity. Callers still read/hash
+# current source bytes and resolve the registered Standard/editor each time.
+_ANALYSIS_CACHE: OrderedDict[tuple, tuple] = OrderedDict()
+_ANALYSIS_LOCK = threading.RLock()
+_ANALYSIS_LIMIT = 32
+
+
+def _analysis(key: tuple, calculate) -> dict:
+    with _ANALYSIS_LOCK:
+        cached = _ANALYSIS_CACHE.get(key)
+        if cached is not None:
+            _ANALYSIS_CACHE.move_to_end(key)
+            if cached[0] == "ValueError":
+                raise ValueError(cached[1])
+            return deepcopy(cached[1])
+    try:
+        result = calculate()
+        entry = ("result", deepcopy(result))
+    except ValueError as exc:
+        # A failed feature-anchor scan is content analysis too. Cache only its
+        # small deterministic message, never a traceback, file/IO failure or
+        # approval. Current raw bytes/registration/baseline are checked outside.
+        entry = ("ValueError", str(exc))
+        result = None
+    with _ANALYSIS_LOCK:
+        _ANALYSIS_CACHE[key] = entry
+        _ANALYSIS_CACHE.move_to_end(key)
+        while len(_ANALYSIS_CACHE) > _ANALYSIS_LIMIT:
+            _ANALYSIS_CACHE.popitem(last=False)
+    if entry[0] == "ValueError":
+        raise ValueError(entry[1])
+    return result
 
 
 class ImageBashCompatibilityError(RuntimeError):
@@ -173,6 +209,11 @@ def resolve_editor_root(editor_root: str | Path | None = None) -> Path | None:
 
 def source_contract(source: str) -> dict[str, Any]:
     """Inspect the modal/scene seam without executing any candidate source."""
+    key = ("source", hashlib.sha256(source.encode("utf-8")).hexdigest())
+    return _analysis(key, lambda: _source_contract_uncached(source))
+
+
+def _source_contract_uncached(source: str) -> dict[str, Any]:
     tree = ast.parse(source)
     node = next((item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == "ImageBash"), None)
     if node is None:
@@ -223,6 +264,18 @@ def editor_contract(source: str, anchors: dict[str, tuple[str, str]] | None = No
     No candidate JavaScript executes. Both boundary anchors must occur exactly
     once; missing, ambiguous or reordered sections fail closed.
     """
+    return _editor_contract_cached(source, anchors or EDITOR_SCOPES,
+                                   hashlib.sha256(source.encode("utf-8")).hexdigest())
+
+
+def _editor_contract_cached(source: str, anchors: dict[str, tuple[str, str]],
+                            content_sha256: str) -> dict[str, dict[str, Any]]:
+    selected = anchors or EDITOR_SCOPES
+    key = ("editor", content_sha256, tuple(sorted((name, *pair) for name, pair in selected.items())))
+    return _analysis(key, lambda: _editor_contract_uncached(source, selected))
+
+
+def _editor_contract_uncached(source: str, anchors: dict[str, tuple[str, str]]) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for scope, (start_anchor, end_anchor) in (anchors or EDITOR_SCOPES).items():
         if source.count(start_anchor) != 1 or source.count(end_anchor) != 1:
@@ -364,7 +417,7 @@ def inspect_standard_compatibility(
             observations, reasons, accepted = [], [], None
             for profile in _editor_profiles(baseline):
                 try:
-                    scopes = editor_contract(source, profile["anchors"])
+                    scopes = _editor_contract_cached(source, profile["anchors"], full_hash)
                     changed = [scope for scope, observed in scopes.items() if observed != profile["scopes"].get(scope)]
                     if changed:
                         reasons.extend(f"Image Bash editor section changed: {scope}" for scope in changed)

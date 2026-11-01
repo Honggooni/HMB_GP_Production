@@ -18,6 +18,8 @@ from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _hmb_image_asset_detached_fixture import initialize_detached_image_asset
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
@@ -85,10 +87,10 @@ class ImportList(SimpleNamespace):
         return list(self.children)
 
 
-class Target:
-    _expand_widget_edit = library.HMBImageAssetLibrary._expand_widget_edit
+class Target(library.HMBImageAssetLibrary):
     def __init__(self):
         self.name = "isolated_image_asset_target"
+        initialize_detached_image_asset(self, library)
         self.lock = False
         self.children = [Child(key) for key in ("a", "b", "c")]
         self.parent = ImportList(self.children)
@@ -970,6 +972,7 @@ class RegistrationCompletionCleanupRegression(unittest.TestCase):
         self.target.state, media = library._merge_import_input(
             library._default_state(), self.target.images
         )
+        self.target._accept_normalized_widget_state_baseline(self.target.state)
         self.target._hmb_import_media_by_uid = media
         self.target._hmb_manifest_poll_received = False
         self.target._hmb_manifest_poll_pending = False

@@ -98,10 +98,95 @@ const imageAssetNativeResizeLocks = new WeakMap();
 const imageAssetImportHandleDecorations = new WeakMap();
 let imageAssetSelectionCommitSequence = 0;
 let imageAssetPublicationSequence = 0;
+const imageAssetBashHandledEvents = new WeakSet();
 let imageAssetAuthoritySequence = 0;
 const IMAGE_ASSET_TRANSPORT_RETRY_MS = 32;
 const IMAGE_ASSET_AUTHORITY_STAMP = Symbol("hmbImageAssetAuthorityStamp");
+const IMAGE_ASSET_AUTHORITY_LOCAL_SUPERSEDED = Symbol.for("hmb-imageasset-authority-local-superseded-v1");
 const IMAGE_ASSET_THUMBNAIL_FAILED_STAMP = Symbol("hmbImageAssetThumbnailFailed");
+
+// Structural edits are semantic jobs, never last-value debounced snapshots.
+// Only a canonical acknowledgement releases the next job. Native onChange
+// returning void (or resolving a Promise) is deliberately not an acknowledgement.
+export function hmbCreateImageBashEditQueue(hooks, clock = globalThis) {
+  let jobs = [], active = null, timer = null, recoveryTimer = null, recoveryAttempts = 0, firstAt = 0, stopped = "", disposed = false, preparing = false;
+  const notify = () => hooks.status?.({pending:jobs.length, active:Boolean(active), preparing, stopped});
+  const cancelTimer = () => { if(timer !== null)clock.clearTimeout(timer); timer = null; };
+  const scheduleRecovery = () => {
+    if(disposed || recoveryTimer!==null || recoveryAttempts>=3 || !(active || jobs.length))return;
+    recoveryTimer=clock.setTimeout(()=>{recoveryTimer=null;recoveryAttempts++;queue.recover(true);},500*2**recoveryAttempts);
+  };
+  const pause = message => { stopped=String(message || "연결 확인이 필요합니다.");cancelTimer();notify();
+    if(/sessionId|without a session|연결|준비 중|완료 응답/.test(stopped))scheduleRecovery();
+  };
+  const pump = async () => {
+    cancelTimer();firstAt=0;
+    if(disposed || active || preparing || stopped || !jobs.length)return;
+    const job=jobs[0];
+    if(!hooks.owned(job)){pause("작업 연결이 변경되었습니다. 대기 작업을 취소하고 현재 작업을 확인하세요.");return;}
+    preparing=true;notify();
+    try {
+      if(hooks.busy?.())throw Error("작업 준비 중입니다. 완료 후 연결을 확인합니다.");
+      await hooks.ready(job);
+      if(disposed || stopped)return;
+      if(!hooks.owned(job))throw Error("작업 연결이 변경되었습니다.");
+      if(hooks.busy?.())throw Error("작업 준비 중입니다. 완료 후 연결 확인을 눌러 주세요.");
+      jobs.shift();active=job;preparing=false;notify();
+      const started=hooks.execute(job, {
+        confirmed: () => { if(disposed || active!==job)return;active=null;recoveryAttempts=0;notify();schedule(0); },
+        failed: error => { if(disposed || active!==job)return;
+          // This exact native guard throws before transmission. Only this
+          // proven-unsent case may retain its intent for a later fresh read.
+          if(String(error?.message||error).startsWith("Refusing to send SetParameterValueRequest without a session"))jobs.unshift(job);
+          active=null;pause(error?.message || error);
+        },
+        uncertain: error => { if(disposed || active!==job)return;pause(error?.message || error); },
+      });
+      if(started===false && active===job){active=null;notify();schedule(0);}
+    } catch(error) { if(!disposed)pause(error?.message || error); }
+    finally { preparing=false;notify(); }
+  };
+  const schedule = delay => {
+    if(disposed || stopped || active || preparing || !jobs.length)return;
+    cancelTimer();timer=clock.setTimeout(pump,delay);
+  };
+  const queue = {
+    push(job) {
+      if(disposed)return false;
+      // An unsent copy followed by deleting precisely that copy can cancel.
+      // Source equality is never a reason to remove an authored instance.
+      const index=job.operation==='remove'?jobs.findIndex(row=>row.operation==='copy'&&row.new_instance_id===job.instance_id):-1;
+      if(index>=0)jobs.splice(index,1);else jobs.push(job);
+      if(!firstAt)firstAt=clock.Date?.now?.() || Date.now();
+      const elapsed=(clock.Date?.now?.() || Date.now())-firstAt;
+      schedule(Math.min(220,Math.max(0,600-elapsed)));notify();return true;
+    },
+    pause,
+    async recover(automatic = false) {
+      if(disposed || preparing)return;
+      if(recoveryTimer!==null)clock.clearTimeout(recoveryTimer);recoveryTimer=null;
+      if(!automatic)recoveryAttempts=0;
+      const job=active || jobs[0];if(!job){stopped="";notify();return;}
+      if(!hooks.owned(job)){pause("작업 연결이 변경되었습니다. 대기 작업을 취소하세요.");return;}
+      preparing=true;notify();
+      try {
+        if(hooks.busy?.())throw Error("작업 준비 중입니다. 완료 후 연결을 확인합니다.");
+        await hooks.ready(job);
+        if(disposed || !hooks.owned(job))return;
+        // A timed-out request is never blindly replayed. An exact fresh
+        // canonical workspace may confirm it; otherwise it stays held.
+        if(active){if(!hooks.reconciled?.(active))throw Error("이전 변경의 적용 여부를 확인하지 못했습니다. 대기 취소 후 현재 목록을 확인하세요.");active=null;}
+        stopped="";
+      } catch(error){if(!disposed)stopped=String(error?.message || error);}
+      finally{preparing=false;if(!disposed){notify();if(stopped)scheduleRecovery();else schedule(0);}}
+    },
+    cancel() { const cancelled=jobs;jobs=[];for(const job of cancelled)hooks.cancelled?.(job);cancelTimer();firstAt=0;if(recoveryTimer!==null)clock.clearTimeout(recoveryTimer);recoveryTimer=null;if(!active)stopped="";notify(); },
+    dispose() {disposed=true;for(const job of jobs)hooks.cancelled?.(job);jobs=[];active=null;cancelTimer();if(recoveryTimer!==null)clock.clearTimeout(recoveryTimer);},
+    snapshot: () => ({pending:jobs.length,active:Boolean(active),preparing,stopped}),
+    render: notify,
+  };
+  return queue;
+}
 
 function imageAssetThumbnailBridgeRegistry() {
   const root = typeof globalThis !== "undefined" ? globalThis : null;
@@ -110,6 +195,117 @@ function imageAssetThumbnailBridgeRegistry() {
     root[HMB_IMAGE_ASSET_THUMBNAIL_BRIDGE_REGISTRY_KEY] = new Map();
   }
   return root[HMB_IMAGE_ASSET_THUMBNAIL_BRIDGE_REGISTRY_KEY];
+}
+
+function imageAssetBridgeForNode(container, runtimeId) {
+  const entry = imageAssetThumbnailBridgeRegistry()?.get(runtimeId);
+  const root = container?.closest?.(".react-flow__node") || null;
+  const name = clean(root?.getAttribute?.("data-id") || container?.__hmbImageAssetNativeNodeName);
+  if (typeof entry?.forNode === "function") return root && name ? entry.forNode(name, root) : null;
+  return entry;
+}
+
+function hmbCancelImageAssetAuthorityWait(container) {
+  const pending = container?.__hmbImageAssetAuthorityWait;
+  if (!pending) return;
+  clearTimeout(pending.timer); delete container.__hmbImageAssetAuthorityWait;
+  pending.reject(new Error("이미지 라이브러리 연결이 변경되었습니다. 다시 선택하세요."));
+}
+
+function imageAssetLocalAuthoritySuperseded(message = "작업이 변경되었습니다. 최신 상태에서 다시 선택하세요.") {
+  const error = new Error(message);
+  error.code = "HMB_IMAGE_ASSET_AUTHORITY_LOCAL_SUPERSEDED";
+  error[IMAGE_ASSET_AUTHORITY_LOCAL_SUPERSEDED] = true;
+  return error;
+}
+
+function imageAssetRecheckAuthorityInBackground(container, state, onError) {
+  const generation = Number(container.__hmbImageAssetSemanticGeneration) || 0;
+  const mount = container.__hmbImageAssetMountToken, lease = hmbImageAssetWidgetLease(state);
+  const runtime = imageAssetThumbnailRuntimeId(state), root = container.closest?.(".react-flow__node");
+  const nodeName = clean(root?.getAttribute?.("data-id") || container.__hmbImageAssetNativeNodeName);
+  const promise = hmbWaitForImageAssetAuthority(container, state, {fresh:true});
+  promise.catch(error => {
+    const current = container.__hmbImageAssetLatestState;
+    const superseded = error?.[IMAGE_ASSET_AUTHORITY_LOCAL_SUPERSEDED];
+    // Only this mounted background read may quietly yield to its next local
+    // edit. Foreground actions and actual transport/owner failures still fail.
+    if (superseded?.promise === promise && Number.isSafeInteger(superseded.generation)
+      && error.code === "HMB_IMAGE_ASSET_AUTHORITY_LOCAL_SUPERSEDED"
+      && container.__hmbImageAssetMountToken === mount && container.isConnected !== false
+      && container.closest?.(".react-flow__node") === root
+      && clean(root?.getAttribute?.("data-id") || container.__hmbImageAssetNativeNodeName) === nodeName
+      && hmbImageAssetWidgetLease(current) === lease && imageAssetThumbnailRuntimeId(current) === runtime
+      && superseded.generation <= generation
+      && (Number(container.__hmbImageAssetSemanticGeneration) || 0) > superseded.generation) return;
+    onError(error);
+  });
+}
+
+export function hmbWaitForImageAssetAuthority(container, state, options = {}) {
+  const lease = hmbImageAssetWidgetLease(state), runtime = imageAssetThumbnailRuntimeId(state);
+  if (!lease) return Promise.resolve(state);
+  const old = container?.__hmbImageAssetAuthorityWait;
+  if (old?.lease === lease && old.runtime === runtime) { if(options.ownerScope&&!old.ownerScope)old.ownerScope=options.ownerScope;old.wake(); return old.promise; }
+  hmbCancelImageAssetAuthorityWait(container);
+  let resolve, reject;
+  const promise = new Promise((yes,no)=>{resolve=yes;reject=no});
+  const pending = {lease,runtime,promise,resolve,reject,querying:false,queried:options.fresh!==true,timer:null,ownerScope:options.ownerScope||null};
+  container.__hmbImageAssetAuthorityWait = pending;
+  const finish = (error) => {
+    if (container.__hmbImageAssetAuthorityWait !== pending) return;
+    clearTimeout(pending.timer); delete container.__hmbImageAssetAuthorityWait;
+    if(error&&pending.querying&&pending.readPromise)imageAssetBridgeForNode(container,runtime)?.retireAuthorityRead?.(pending.readPromise);
+    if (error?.[IMAGE_ASSET_AUTHORITY_LOCAL_SUPERSEDED] === true) {
+      // A Bridge read can be shared by measurement clones. Give this waiter
+      // its own receipt instead of changing the shared rejection object.
+      error = imageAssetLocalAuthoritySuperseded(error.message);
+      error[IMAGE_ASSET_AUTHORITY_LOCAL_SUPERSEDED] = {promise, generation:pending.readGeneration};
+    }
+    if (error) reject(error); else resolve(container.__hmbImageAssetLatestState || state);
+  };
+  pending.wake = () => {
+    if (container.__hmbImageAssetAuthorityWait !== pending) return;
+    const current = container.__hmbImageAssetLatestState || state;
+    if (pending.ownerScope && !imageAssetWorkspaceScopeCurrent(container, pending.ownerScope)) {
+      finish(new Error("이미지 라이브러리 연결이 변경되었습니다. 현재 작업을 다시 확인하세요.")); return;
+    }
+    if (hmbImageAssetWidgetLease(current) !== lease || imageAssetThumbnailRuntimeId(current) !== runtime) {
+      finish(new Error("이미지 라이브러리 연결이 변경되었습니다. 다시 선택하세요.")); return;
+    }
+    const bridge = imageAssetBridgeForNode(container,runtime);
+    if (!bridge) return;
+    if(typeof bridge.dispatch!=="function"&&typeof bridge.queryWidgetLease!=="function")return;
+    if(bridge.authorityProtocol!=="hmb-imageasset-authority-scope-v2" || typeof bridge.queryWidgetLease!=="function"){
+      finish(new Error("이미지 라이브러리 화면 업데이트가 필요합니다. 작업을 저장하고 Griptape를 완전히 종료한 뒤 다시 여세요."));return;
+    }
+    if(pending.readGeneration!==undefined && pending.readGeneration!==(Number(container.__hmbImageAssetSemanticGeneration)||0)){
+      finish(imageAssetLocalAuthoritySuperseded());return;
+    }
+    if(pending.queried&&pending.readCanonicalGeneration!==undefined&&pending.readCanonicalGeneration!==(Number(container.__hmbImageAssetCanonicalGeneration)||0)
+      &&bridge.authoritySnapshot?.canonical_scope&&imageAssetScopeKey(bridge.authoritySnapshot.canonical_scope)!==imageAssetScopeKey(hmbImageAssetAuthorityScope(current))){
+      finish(new Error("라이브러리 작업 정보가 변경되었습니다. 최신 상태에서 다시 선택하세요."));return;
+    }
+    if(container.__hmbImageAssetPendingPublications?.size)return;
+    if (bridge.widget_runtime_lease === lease && pending.queried) {
+      const snapshot = bridge.authoritySnapshot;
+      if (!snapshot?.canonical_scope) { finish(new Error("라이브러리 작업 정보를 확인하지 못했습니다. 다시 선택하세요.")); return; }
+      if (!container.__hmbImageAssetAdoptAuthority?.(snapshot)) return;
+      finish(); return;
+    }
+    if (pending.querying || typeof bridge.queryWidgetLease !== "function") return;
+    pending.readGeneration=Number(container.__hmbImageAssetSemanticGeneration)||0;
+    pending.readCanonicalGeneration=Number(container.__hmbImageAssetCanonicalGeneration)||0;
+    pending.querying = true;
+    const readPromise=bridge.queryWidgetLease();pending.readPromise=readPromise;
+    Promise.resolve(readPromise).then(confirmed=>{
+      pending.querying=false;pending.queried=true;
+      if (confirmed !== lease) finish(new Error("현재 이미지 라이브러리의 작업 정보를 다시 확인하세요."));
+      else pending.wake();
+    },finish);
+  };
+  pending.timer=setTimeout(()=>finish(new Error("연결을 확인하지 못했습니다. 프로젝트를 다시 선택하세요.")),10000);
+  pending.wake(); return promise;
 }
 
 function imageAssetPresentationCacheRegistry() {
@@ -1361,6 +1557,73 @@ export function hmbNormalizeImageBashWorkspace(value) {
   return { workspace_id: workspaceId, revision: hmbNormalizeImageAssetRevision(value.revision), instances };
 }
 
+export function hmbImageAssetWidgetLease(state) {
+  return imageAssetUuid(state?.widget_runtime_lease);
+}
+
+export function hmbImageAssetAuthorityScope(value) {
+  const state=parseValue(value),project={};
+  for(const key of ["catalog_root","project_root","project_id","project_uid","project_cache_uid","manifest_signature","folder_signature"])project[key]=clean(state[key]).replaceAll("\\","/");
+  return {schema:"hmb-image-bash-widget-authority-v1",widget_runtime_lease:hmbImageAssetWidgetLease(state),project,
+    publisher_instance_uuid:clean(state.shot_routing?.publisher_instance_uuid),channel_uuid:clean(state.shot_routing?.channel_uuid),
+    scan_revision:hmbNormalizeImageAssetRevision(state.scan_revision),ui_edit_revision:hmbNormalizeImageAssetRevision(state.ui_edit_revision),
+    thumbnail_revision:hmbNormalizeImageAssetRevision(state.thumbnail_revision),image_bash_workspace:hmbNormalizeImageBashWorkspace(state.image_bash_workspace),image_bash_active:state.image_bash_active===true};
+}
+function imageAssetScopeKey(value) {
+  const order=item=>Array.isArray(item)?item.map(order):item&&typeof item==="object"?Object.fromEntries(Object.keys(item).sort().map(key=>[key,order(item[key])])):item;
+  return JSON.stringify(order(value));
+}
+function imageAssetAuthorityMatches(container,value,snapshot) {
+  const name=clean(container?.closest?.(".react-flow__node")?.getAttribute?.("data-id")||container?.__hmbImageAssetNativeNodeName);
+  return Boolean(snapshot?.canonical_scope && clean(snapshot.canonical_node_name)===name
+    && imageAssetScopeKey(hmbImageAssetAuthorityScope(value))===imageAssetScopeKey(snapshot.canonical_scope));
+}
+
+function imageAssetRequestCache(state, shared) {
+  const lease = hmbImageAssetWidgetLease(state);
+  if (!shared || !lease) return shared;
+  if (!(shared.requestOwners instanceof Map)) shared.requestOwners = new Map();
+  let owned = shared.requestOwners.get(lease);
+  if (!owned) owned = {requested:new Set(), failed:new Set(), errorRetries:new Map(), inflight:new Map()};
+  shared.requestOwners.delete(lease); shared.requestOwners.set(lease, owned);
+  while (shared.requestOwners.size > 64) shared.requestOwners.delete(shared.requestOwners.keys().next().value);
+  return owned;
+}
+
+export function hmbAcceptImageAssetWidgetLease(container, state, confirmedLease) {
+  const lease = hmbImageAssetWidgetLease(state);
+  if (!container || !lease || lease !== imageAssetUuid(confirmedLease)) return false;
+  const retired = container.__hmbImageAssetRetiredWidgetLeases || new Set();
+  if (retired.has(lease)) return false;
+  const previous = container.__hmbImageAssetWidgetLease || hmbImageAssetWidgetLease(container.__hmbImageAssetLatestState);
+  if (previous && previous !== lease) {
+    retired.add(previous);
+    hmbResetImageAssetRuntimeState(container,state);
+  }
+  container.__hmbImageAssetRetiredWidgetLeases = retired;
+  container.__hmbImageAssetWidgetLease = lease;
+  return true;
+}
+function hmbResetImageAssetRuntimeState(container,state) {
+    const workspaceHold = container.__hmbImageAssetWorkspaceAuthorityUnknown;
+    if (workspaceHold && (workspaceHold.lease !== hmbImageAssetWidgetLease(state)
+      || workspaceHold.runtime !== imageAssetThumbnailRuntimeId(state))) delete container.__hmbImageAssetWorkspaceAuthorityUnknown;
+    hmbInvalidateImageAssetPublication(container);
+    hmbCancelImageAssetSelectionCommit(container);
+    hmbForgetImageAssetStateEcho(container);
+    hmbCancelImageAssetThumbnailRequest(container);
+    hmbStopImageAssetCatalogPolling(container);
+    clearTimeout(container.__hmbImageAssetSearchTimer);
+    delete container.__hmbImageAssetSearchTimer;
+    container.__hmbHierarchyDispose?.();
+    const page = container.__hmbImageAssetPageControl;
+    if (page) { clearTimeout(page.timer); page.pending = null; page.key = ""; page.acceptedContext = ""; page.disabledContext = ""; page.fullState = state; }
+    for (const key of ["CurrentScanRevision", "CurrentUiEditRevision", "LatestLocalUiEditRevision", "CanonicalSerialization",
+      "PendingSlowAction", "SlowActionToken", "PendingAuthoritativeProps", "SelectionBase", "SelectionBaseAuthority",
+      "SelectionBasePropValue", "SelectionBaseCurrentScanRevision", "SelectionBaseCurrentUiEditRevision", "SelectionBaseLatestLocalUiEditRevision",
+      "RegistrationDraft", "DeferredProps", "RegistrationReturnFocus", "SearchDraft", "LastConsumedEchoWasStale"]) delete container[`__hmbImageAsset${key}`];
+}
+
 export function hmbCreateImageBashWorkspace(state) {
   if (!state) return false;
   if (!hmbNormalizeImageBashWorkspace(state.image_bash_workspace).workspace_id) {
@@ -1380,7 +1643,7 @@ export function hmbImageBashWorkspaceAssets(state) {
 export function hmbAddImageBashSource(state, sourceUid) {
   const workspace = state?.image_bash_workspace, uid = clean(sourceUid);
   const asset = state?.assets?.find(row => row.source_uid === uid);
-  if (!workspace?.workspace_id || !asset || !hmbImageAssetCanSelect(asset) || workspace.instances.length >= MAX_SELECTED_IMAGES) return false;
+  if (!workspace?.workspace_id || !asset || !hmbImageAssetCanSelect(asset) || workspace.instances.some(row=>row.source_uid===uid) || workspace.instances.length >= MAX_SELECTED_IMAGES) return false;
   workspace.instances.push({ instance_id: newImageAssetUuid(), source_uid: uid });
   workspace.revision += 1; return true;
 }
@@ -1411,6 +1674,21 @@ export function hmbReorderImageBashInstance(state, fromId, toId) {
 
 function imageBashSourceUids(state) {
   return new Set((state?.image_bash_workspace?.instances || []).map(row => row.source_uid));
+}
+
+export function hmbBuildImageBashWorkspaceEdit(previous,next,hint={}) {
+  const before=hmbNormalizeImageBashWorkspace(previous),after=hmbNormalizeImageBashWorkspace(next);
+  if(JSON.stringify(before.instances||[])===JSON.stringify(after.instances||[]))return {};
+  const old=new Map((before.instances||[]).map(row=>[row.instance_id,row])),now=new Map((after.instances||[]).map(row=>[row.instance_id,row]));
+  const added=(after.instances||[]).filter(row=>!old.has(row.instance_id)),removed=(before.instances||[]).filter(row=>!now.has(row.instance_id));
+  const edit={schema:"hmb-image-bash-workspace-mutation-v1",version:1,operation_id:newImageAssetUuid(),workspace_id:after.workspace_id,expected_revision:before.revision||0};
+  if(added.length===1&&!removed.length){
+    Object.assign(edit,{operation:hint.operation==="copy"?"copy":"add",new_instance_id:added[0].instance_id});
+    if(edit.operation==="copy")edit.instance_id=hint.instance_id;else edit.source_uid=added[0].source_uid;
+  }else if(removed.length===1&&!added.length)Object.assign(edit,{operation:"remove",instance_id:removed[0].instance_id});
+  else if(!added.length&&!removed.length&&hint.operation==="reorder")Object.assign(edit,{operation:"reorder",instance_id:hint.instance_id,target_instance_id:hint.target_instance_id});
+  else throw new Error("이미지 작업 변경을 다시 선택하세요.");
+  return edit;
 }
 
 function normalizeState(value) {
@@ -1466,6 +1744,7 @@ function normalizeState(value) {
   }
   return markCanonicalImageAssetState({
     schema: "hmb-image-asset-library-state",
+    ...(hmbImageAssetWidgetLease(input) ? {widget_runtime_lease:hmbImageAssetWidgetLease(input)} : {}),
     version: IMAGE_ASSET_STATE_VERSION,
     edit_transport_schema: clean(input.edit_transport_schema) === IMAGE_ASSET_EDIT_SCHEMA
       ? IMAGE_ASSET_EDIT_SCHEMA : "",
@@ -1489,6 +1768,7 @@ function normalizeState(value) {
     image_bash_workspace: hmbNormalizeImageBashWorkspace(input.image_bash_workspace),
     image_bash_active: Boolean(input.image_bash_active && imageAssetUuid(input.image_bash_workspace?.workspace_id)),
     image_bash_workspace_request: input.image_bash_workspace_request || {},
+    image_bash_workspace_edit: input.image_bash_workspace_edit || {},
     root_edit_enabled: Boolean(input.root_edit_enabled),
     selected_folder_path: folders.includes(selectedFolderPath) ? selectedFolderPath : "",
     expanded_folders: expandedFolders,
@@ -1568,6 +1848,7 @@ export function hmbMergeImageAssetThumbnailResponse(
   const incoming = isCanonicalImageAssetState(incomingValue)
     ? incomingValue
     : normalizeState(incomingValue);
+  if (hmbImageAssetWidgetLease(local) && hmbImageAssetWidgetLease(incoming) !== hmbImageAssetWidgetLease(local)) return local;
   const result = incoming.thumbnail_result;
   const pendingRequestId = clean(expectedRequestId)
     || clean(local.thumbnail_request?.request_id);
@@ -1678,6 +1959,7 @@ function hmbApplyImageAssetThumbnailPresentationPatch(localValue, patchValue) {
   const pendingRequestId = clean(local.thumbnail_request?.request_id);
   if (
     !patch
+    || (hmbImageAssetWidgetLease(local) && hmbImageAssetWidgetLease(patch) !== hmbImageAssetWidgetLease(local))
     || clean(patch.schema) !== "hmb-image-asset-thumbnail-bridge"
     || clean(patch.operation) !== "hydrate"
     || clean(patch.phase) !== "result"
@@ -2294,6 +2576,56 @@ function imageAssetCompactEditEcho(container, value, request = parseValue(value)
   };
 }
 
+function imageAssetHasWorkspaceCommand(state) {
+  return Boolean(state?.image_bash_workspace_edit?.operation_id || state?.image_bash_workspace_request?.request_id);
+}
+
+function imageAssetWorkspaceScopeCurrent(container, hold) {
+  const state = container?.__hmbImageAssetLatestState;
+  const root = container?.closest?.(".react-flow__node");
+  return Boolean(hold
+    && container.isConnected !== false && container.__hmbImageAssetMountToken === hold.mount
+    && root === hold.root && root?.parentNode === hold.parent
+    && clean(root?.getAttribute?.("data-id") || container.__hmbImageAssetNativeNodeName) === hold.nodeName
+    && hmbImageAssetWidgetLease(state) === hold.lease && imageAssetThumbnailRuntimeId(state) === hold.runtime);
+}
+
+function imageAssetWorkspaceHoldOwned(container, hold) {
+  return container?.__hmbImageAssetWorkspaceAuthorityUnknown === hold && imageAssetWorkspaceScopeCurrent(container, hold);
+}
+
+function imageAssetRecheckUnknownWorkspace(container, state) {
+  const hold = container?.__hmbImageAssetWorkspaceAuthorityUnknown;
+  if (!hold) return false;
+  if (!imageAssetWorkspaceHoldOwned(container, hold)) {
+    hmbShowImageAssetTransportError(container, new Error("이미지 라이브러리 연결이 변경되었습니다. 현재 작업을 다시 확인하세요."), state);
+    return true;
+  }
+  if (hold.read) return true;
+  hmbShowImageAssetTransportError(container, new Error(imageAssetLanguage(state) === "en"
+    ? "Checking the last change. After confirmation, click Copy or Remove again."
+    : "이전 변경을 확인 중입니다. 확인 후 원하는 복제·삭제를 다시 눌러 주세요."), state);
+  hold.read = hmbWaitForImageAssetAuthority(container, state, {fresh:true,ownerScope:hold});
+  hold.read.then(() => {
+    if (!imageAssetWorkspaceHoldOwned(container, hold)) return;
+    const current = container.__hmbImageAssetLatestState;
+    const bridge = imageAssetBridgeForNode(container, hold.runtime);
+    if (!imageAssetAuthorityMatches(container, current, bridge?.authoritySnapshot)) {
+      hold.read = null;
+      hmbShowImageAssetTransportError(container, new Error("최신 작업 정보를 확인하지 못했습니다. 다시 확인하세요."), current);
+      return;
+    }
+    delete container.__hmbImageAssetWorkspaceAuthorityUnknown;
+    hmbShowImageAssetTransportError(container, new Error(imageAssetLanguage(current) === "en"
+      ? "The latest state is confirmed. Click Copy or Remove again."
+      : "최신 작업 정보를 확인했습니다. 원하는 복제·삭제를 다시 눌러 주세요."), current);
+  }, error => {
+    if (!imageAssetWorkspaceHoldOwned(container, hold)) return;
+    hold.read = null; hmbShowImageAssetTransportError(container, error, container.__hmbImageAssetLatestState);
+  });
+  return true;
+}
+
 export function hmbConsumeImageAssetStateEcho(container, nextProps = {}) {
   if (!container) return false;
   const retainedIncomingState = container.__hmbImageAssetIncomingState;
@@ -2375,10 +2707,11 @@ export function hmbBuildImageAssetCompactEdit(state, acceptedIdentity) {
     "selected_sub_type", "selected_source_view", "search", "language", "asset_view_mode",
     "refresh_revision", "thumbnail_request", "asset_registration_request",
     "asset_cleanup_request", "disconnect_import_uid", "shot_routing", "shot_hierarchy", "shot_hierarchy_request",
-    "image_bash_workspace", "image_bash_active", "image_bash_workspace_request",
+    "image_bash_workspace", "image_bash_active", "image_bash_workspace_request", "image_bash_workspace_edit",
   ]) edits[field] = state[field];
   return {
     schema: IMAGE_ASSET_EDIT_SCHEMA, version: 1,
+    ...(hmbImageAssetWidgetLease(state) ? {widget_runtime_lease:hmbImageAssetWidgetLease(state)} : {}),
     catalog_identity: identity, scan_revision: identity.scan_revision,
     [IMAGE_ASSET_UI_EDIT_REVISION_KEY]: state[IMAGE_ASSET_UI_EDIT_REVISION_KEY],
     thumbnail_revision: hmbNormalizeImageAssetRevision(state?.thumbnail_revision),
@@ -2406,6 +2739,19 @@ export function hmbPublishImageAssetState(
   }
   hmbClearImageAssetTransportRetry(container);
   const normalized = isCanonicalImageAssetState(state) ? state : normalizeState(state);
+  const lease = hmbImageAssetWidgetLease(normalized);
+  const bridge = imageAssetBridgeForNode(container, imageAssetThumbnailRuntimeId(normalized));
+  const boundScope=bridge?.authoritySnapshot?.canonical_scope;
+  const nodeName=clean(container?.closest?.(".react-flow__node")?.getAttribute?.("data-id")||container?.__hmbImageAssetNativeNodeName);
+  if (lease && (container?.__hmbImageAssetLeaseTransitionPending || container?.__hmbImageAssetRetiredWidgetLeases?.has(lease) || bridge?.authorityProtocol!=="hmb-imageasset-authority-scope-v2" || bridge?.widget_runtime_lease !== lease
+    || !boundScope || boundScope.widget_runtime_lease!==lease || clean(bridge.authoritySnapshot.canonical_node_name)!==nodeName
+    || boundScope.publisher_instance_uuid!==clean(normalized.shot_routing?.publisher_instance_uuid) || boundScope.channel_uuid!==clean(normalized.shot_routing?.channel_uuid))) {
+    const error = new Error("이미지 라이브러리 연결을 확인하고 다시 시도하세요.");
+    bridge?.queryWidgetLease?.().catch?.(() => {});
+    if (typeof onFailure === "function") onFailure(error, normalized);
+    else hmbShowImageAssetTransportError(container, error, normalized);
+    return normalized;
+  }
   const revisionBaseline = {
     currentScanRevision: container?.__hmbImageAssetCurrentScanRevision,
     currentUiEditRevision: container?.__hmbImageAssetCurrentUiEditRevision,
@@ -2425,6 +2771,8 @@ export function hmbPublishImageAssetState(
     normalized, container?.__hmbImageAssetAcceptedEditCatalogIdentity,
   );
   const value = JSON.stringify(compactEdit || normalized);
+  const workspaceCommand = imageAssetHasWorkspaceCommand(normalized)
+    ? {workspace:imageAssetScopeKey(hmbNormalizeImageBashWorkspace(normalized.image_bash_workspace))} : null;
   if (container) {
     // Cache only the exact canonical snapshot that is about to become host
     // authority. Live state remains mutable; callers may reuse this string only
@@ -2441,7 +2789,36 @@ export function hmbPublishImageAssetState(
     };
   }
   const publicationToken = ++imageAssetPublicationSequence;
-  if (container) container.__hmbImageAssetPublicationOwner = publicationToken;
+  if (container) {
+    container.__hmbImageAssetPublicationOwner = publicationToken;
+    if(lease){
+    bridge?.retireAuthorityRead?.(undefined, "local_edit");
+    container.__hmbImageAssetSemanticGeneration=(Number(container.__hmbImageAssetSemanticGeneration)||0)+1;
+    if(!(container.__hmbImageAssetPendingPublications instanceof Map))container.__hmbImageAssetPendingPublications=new Map();
+    const publicationRoot = container.closest?.(".react-flow__node");
+    const pending={wire:value,lease,runtime:imageAssetThumbnailRuntimeId(normalized),ui:nextUiEditRevision,projectRoot:clean(normalized.project_root).replaceAll("\\","/"),workspace:normalized.image_bash_workspace_edit?.operation_id?imageAssetScopeKey(hmbNormalizeImageBashWorkspace(normalized.image_bash_workspace)):null,timer:null,
+      onCanonical:options?.onCanonical,onUncertain:options?.onUncertain,
+      mount:container.__hmbImageAssetMountToken,root:publicationRoot,parent:publicationRoot?.parentNode,nodeName:clean(publicationRoot?.getAttribute?.("data-id") || container.__hmbImageAssetNativeNodeName)};
+    pending.timer=setTimeout(()=>{
+      if(container.__hmbImageAssetPendingPublications?.get(publicationToken)!==pending)return;
+      container.__hmbImageAssetPendingPublications.delete(publicationToken);
+      if (workspaceCommand && hmbImageAssetWidgetLease(container.__hmbImageAssetLatestState) === lease
+        && imageAssetThumbnailRuntimeId(container.__hmbImageAssetLatestState) === pending.runtime) {
+        const prior = container.__hmbImageAssetWorkspaceAuthorityUnknown;
+        if (!prior || pending.ui >= prior.ui) container.__hmbImageAssetWorkspaceAuthorityUnknown = {
+          lease, runtime:pending.runtime, ui:pending.ui, workspace:workspaceCommand.workspace,
+          mount:pending.mount, root:pending.root, parent:pending.parent, nodeName:pending.nodeName, read:null,
+        };
+      }
+      Promise.resolve().then(()=>container.__hmbImageAssetAuthorityWait?.wake?.());
+      const error=new Error("변경 완료 응답을 확인하지 못했습니다. 연결 확인 후 현재 작업을 확인하세요.");
+      pending.onUncertain?.(error);
+      hmbShowImageAssetTransportError(container,error,normalized);
+    },10000);
+    container.__hmbImageAssetPendingPublications.set(publicationToken,pending);
+    }
+  }
+  const settlePublication=()=>{const pending=container?.__hmbImageAssetPendingPublications?.get(publicationToken);clearTimeout(pending?.timer);container?.__hmbImageAssetPendingPublications?.delete(publicationToken);Promise.resolve().then(()=>container?.__hmbImageAssetAuthorityWait?.wake?.());};
   if (options?.suppressMatchingEcho === true) {
     hmbRememberImageAssetStateEcho(container, value, publicationToken, Boolean(compactEdit));
   }
@@ -2467,6 +2844,7 @@ export function hmbPublishImageAssetState(
   };
   const fail = (error) => {
     if (!container || container.__hmbImageAssetPublicationOwner !== publicationToken) {
+      settlePublication();
       return false;
     }
     hmbForgetImageAssetStateEcho(container, publicationToken);
@@ -2477,6 +2855,15 @@ export function hmbPublishImageAssetState(
     };
     try { console?.error?.("[HMBImageAssetLibrary] state publication failed", error); } catch (_e) {}
     if (typeof onFailure === "function") {
+      settlePublication();
+      if (workspaceCommand) {
+        // The owned structural request did not become canonical authority.
+        // Roll back its revision clocks with the caller's workspace rollback.
+        container.__hmbImageAssetCurrentScanRevision = revisionBaseline.currentScanRevision;
+        container.__hmbImageAssetCurrentUiEditRevision = revisionBaseline.currentUiEditRevision;
+        container.__hmbImageAssetLatestLocalUiEditRevision = revisionBaseline.latestLocalUiEditRevision;
+        delete container.__hmbImageAssetCanonicalSerialization;
+      }
       try { onFailure(error, normalized); } catch (_error) {}
     } else {
       // Generic semantic actions have already updated their local retained
@@ -2484,6 +2871,7 @@ export function hmbPublishImageAssetState(
       // transient host transport failure cannot leave backend/output state old.
       const retryScheduled = scheduleRetry();
       if (!retryScheduled) {
+        settlePublication();
         // The failed revision never became host authority. Restore the
         // pre-publication watermark so a canonical backend echo can recover
         // the optimistic generic control rather than being rejected as stale.
@@ -2515,7 +2903,7 @@ export function hmbPublishImageAssetState(
       return false;
     }
     attemptCount += 1;
-    if (!props || typeof props.onChange !== "function") return succeed();
+    if (!props || typeof props.onChange !== "function") { settlePublication(); return succeed(); }
     try {
       const result = props.onChange(value);
       if (result && typeof result.then === "function") {
@@ -2747,6 +3135,7 @@ function hmbImageAssetCatalogFingerprint(assets) {
 
 function hmbCatalogPageContext(state) {
   return {runtime_instance_id:clean(state?.shot_routing?.publisher_instance_uuid),
+    ...(hmbImageAssetWidgetLease(state) ? {widget_runtime_lease:hmbImageAssetWidgetLease(state)} : {}),
     project_uid:clean(state?.project_uid),project_cache_uid:clean(state?.project_cache_uid),
     manifest_signature:clean(state?.manifest_signature),folder_signature:clean(state?.folder_signature),
     scan_revision:hmbNormalizeImageAssetRevision(state?.scan_revision)};
@@ -2774,7 +3163,7 @@ function hmbImageAssetLocalPageProjection(value,current,container) {
 
 export function hmbRequestImageAssetCatalogPage(container,state,offset=0) {
   const control=container?.__hmbImageAssetPageControl;
-  const context=hmbCatalogPageContext(state),entry=imageAssetThumbnailBridgeRegistry()?.get(context.runtime_instance_id);
+  const context=hmbCatalogPageContext(state),entry=imageAssetBridgeForNode(container,context.runtime_instance_id);
   if(!control || control.disabledContext===hmbCatalogPageContextKey(state)
     || entry?.catalogPageVersion!==1 || !context.project_uid || !entry.dispatch)return false;
   const request={schema:"hmb-image-asset-thumbnail-bridge",version:1,operation:"catalog_page",phase:"request",...context,
@@ -3305,6 +3694,7 @@ function imageAssetThumbnailContextKey(state) {
   if (!projectUid) return "";
   return [
     projectUid,
+    hmbImageAssetWidgetLease(state),
     clean(state?.manifest_signature),
     hmbNormalizeImageAssetRevision(state?.scan_revision),
   ].join("\n");
@@ -3384,7 +3774,7 @@ function imageAssetThumbnailRequestTracking(container, state) {
       }
     }
     container.__hmbImageAssetThumbnailContextKey = contextKey;
-    const shared = imageAssetPresentationCacheEntry(state, true);
+    const shared = imageAssetRequestCache(state, imageAssetPresentationCacheEntry(state, true));
     // A new catalog revision may change an asset that previously failed or
     // was in flight. Valid cached URLs survive by media signature; unresolved
     // request bookkeeping must not suppress the new revision.
@@ -3534,7 +3924,7 @@ export function hmbResetImageAssetThumbnailRetryState(container, state) {
   hmbClearImageAssetThumbnailWatchdog(container);
   container.__hmbImageAssetThumbnailScheduleToken =
     (Number(container.__hmbImageAssetThumbnailScheduleToken) || 0) + 1;
-  const shared = imageAssetPresentationCacheEntry(state, true);
+  const shared = imageAssetRequestCache(state, imageAssetPresentationCacheEntry(state, true));
   shared?.requested?.clear?.();
   shared?.failed?.clear?.();
   shared?.errorRetries?.clear?.();
@@ -3651,13 +4041,13 @@ export function hmbArmImageAssetThumbnailWatchdog(
   };
   const probe = () => {
     const live = container.__hmbImageAssetLatestState || state;
-    const bridge = imageAssetThumbnailBridgeRegistry()?.get(watchdog.runtimeId);
+    const bridge = imageAssetBridgeForNode(container, watchdog.runtimeId);
     const dispatch = typeof bridge?.dispatch === "function" ? bridge.dispatch : null;
     try {
       let result;
       if (dispatch) {
         result = dispatch(watchdog.request);
-      } else if (typeof props?.onChange === "function") {
+      } else if (!hmbImageAssetWidgetLease(live) && typeof props?.onChange === "function") {
         // One bounded legacy wake-up is allowed only after the compact result
         // lease expires. It reuses the exact request ID, so the backend either
         // drains a pending result or republishes its completed envelope rather
@@ -3716,6 +4106,7 @@ export function hmbArmImageAssetThumbnailWatchdog(
 
 export function hmbResumeImageAssetThumbnailRequest(container, state, props = {}) {
   if (!container || !state || !state.thumbnail_busy) return false;
+  if (container.__hmbImageAssetLeaseTransitionPending) return false;
   const existing = container.__hmbImageAssetThumbnailWatchdog;
   if (
     clean(container.__hmbImageAssetThumbnailPendingRequestId)
@@ -3787,6 +4178,7 @@ export function hmbResumeImageAssetThumbnailRequest(container, state, props = {}
     operation: "hydrate",
     phase: "request",
     runtime_instance_id: imageAssetThumbnailRuntimeId(state),
+    ...(hmbImageAssetWidgetLease(state) ? {widget_runtime_lease:hmbImageAssetWidgetLease(state)} : {}),
     request_id: requestId,
     project_uid: clean(request.project_uid),
     project_cache_uid: clean(request.project_cache_uid || state.project_cache_uid),
@@ -3797,14 +4189,12 @@ export function hmbResumeImageAssetThumbnailRequest(container, state, props = {}
   if (hmbArmImageAssetThumbnailWatchdog(container, state, props, bridgeRequest)) {
     // Wake the backend immediately. Reusing the same request ID is idempotent:
     // it either rejoins the active single-flight or republishes its completion.
-    const bridge = imageAssetThumbnailBridgeRegistry()?.get(
-      bridgeRequest.runtime_instance_id,
-    );
+    const bridge = imageAssetBridgeForNode(container, bridgeRequest.runtime_instance_id);
     try {
       let dispatched = null;
       if (typeof bridge?.dispatch === "function") {
         dispatched = bridge.dispatch(bridgeRequest);
-      } else if (typeof props?.onChange === "function") {
+      } else if (!hmbImageAssetWidgetLease(state) && typeof props?.onChange === "function") {
         dispatched = props.onChange(JSON.stringify({
           ...state,
           thumbnail_request: {
@@ -3882,8 +4272,9 @@ export function hmbHandleImageAssetThumbnailError(container, state, image, props
   const retries = container.__hmbImageAssetThumbnailErrorRetries;
   const retryCount = Math.max(0, Number(retries.get(key)) || 0);
   asset.thumbnail_url = "";
-  const shared = imageAssetPresentationCacheEntry(liveState, false);
-  shared?.thumbnails?.delete?.(key);
+  const presentation = imageAssetPresentationCacheEntry(liveState, false);
+  presentation?.thumbnails?.delete?.(key);
+  const shared = imageAssetRequestCache(liveState, presentation);
   shared?.inflight?.delete?.(key);
   container.__hmbImageAssetLatestState = liveState;
   image.closest?.(".asset-thumb,.selected-thumb,.passport-photo,.compact-shot-asset")
@@ -3927,6 +4318,7 @@ export function hmbScheduleImageAssetThumbnailRequest(
   props,
   options = {},
 ) {
+  if (container?.__hmbImageAssetLeaseTransitionPending) return false;
   if (!container) return false;
   const liveState = container.__hmbImageAssetLatestState || state;
   if (!liveState || liveState.scan_busy || liveState.thumbnail_busy) return false;
@@ -3950,7 +4342,7 @@ export function hmbScheduleImageAssetThumbnailRequest(
     const current = container.__hmbImageAssetLatestState || liveState;
     const currentTracking = imageAssetThumbnailRequestTracking(container, current);
     const runtimeId = imageAssetThumbnailRuntimeId(current);
-    const bridge = imageAssetThumbnailBridgeRegistry()?.get(runtimeId);
+    const bridge = imageAssetBridgeForNode(container, runtimeId);
     const bridgeDispatch = typeof bridge?.dispatch === "function" ? bridge.dispatch : null;
     if (
       !currentTracking.contextKey
@@ -3991,6 +4383,7 @@ export function hmbScheduleImageAssetThumbnailRequest(
       operation: "hydrate",
       phase: "request",
       runtime_instance_id: runtimeId,
+      ...(hmbImageAssetWidgetLease(current) ? {widget_runtime_lease:hmbImageAssetWidgetLease(current)} : {}),
       request_id: requestId,
       project_uid: current.project_uid,
       project_cache_uid: current.project_cache_uid,
@@ -4040,6 +4433,10 @@ export function hmbScheduleImageAssetThumbnailRequest(
       }
       return;
     }
+    if (hmbImageAssetWidgetLease(current)) {
+      bridge?.queryWidgetLease?.().catch?.(() => {});
+      return;
+    }
     emit(props, current, container, preservePendingForWatchdog, {
       suppressMatchingEcho: true,
       preserveUiEditRevision: true,
@@ -4077,6 +4474,7 @@ function imageAssetCatalogProbeContext(state) {
     scanRevision: hmbNormalizeImageAssetRevision(state?.scan_revision),
     key: [
       runtimeId,
+      hmbImageAssetWidgetLease(state),
       hmbImageAssetPresentationCacheKey(state),
       projectRoot,
       hmbNormalizeImageAssetRevision(state?.scan_revision),
@@ -4088,6 +4486,7 @@ export function hmbAcceptImageAssetCatalogProbeResult(container, state, result) 
   const context = imageAssetCatalogProbeContext(state);
   if (
     !container
+    || (hmbImageAssetWidgetLease(state) && hmbImageAssetWidgetLease(result) !== hmbImageAssetWidgetLease(state))
     || !context
     || clean(result?.schema) !== "hmb-image-asset-thumbnail-bridge"
     || clean(result?.operation) !== "catalog_probe"
@@ -4137,10 +4536,11 @@ export function hmbStopImageAssetCatalogPolling(container) {
 
 export function hmbStartImageAssetCatalogPolling(container, state) {
   if (!container || typeof setTimeout !== "function") return false;
+  if (container.__hmbImageAssetLeaseTransitionPending) return false;
   const liveState = container.__hmbImageAssetLatestState || state;
   const context = imageAssetCatalogProbeContext(liveState);
   const bridge = context
-    ? imageAssetThumbnailBridgeRegistry()?.get(context.runtimeId)
+    ? imageAssetBridgeForNode(container, context.runtimeId)
     : null;
   if (!context || typeof bridge?.dispatch !== "function") return false;
   if (container.__hmbImageAssetCatalogProbeContextKey !== context.key) {
@@ -4163,7 +4563,7 @@ export function hmbStartImageAssetCatalogPolling(container, state) {
         !currentContext
         || currentContext.key !== container.__hmbImageAssetCatalogProbeContextKey
       ) return;
-      const currentBridge = imageAssetThumbnailBridgeRegistry()?.get(currentContext.runtimeId);
+      const currentBridge = imageAssetBridgeForNode(container, currentContext.runtimeId);
       const dispatch = typeof currentBridge?.dispatch === "function"
         ? currentBridge.dispatch
         : null;
@@ -4182,6 +4582,7 @@ export function hmbStartImageAssetCatalogPolling(container, state) {
           phase: "request",
           request_id: requestId,
           runtime_instance_id: currentContext.runtimeId,
+          ...(hmbImageAssetWidgetLease(current) ? {widget_runtime_lease:hmbImageAssetWidgetLease(current)} : {}),
           project_uid: currentContext.projectUid,
           project_cache_uid: currentContext.projectCacheUid,
           project_root: currentContext.projectRoot,
@@ -5372,7 +5773,7 @@ function renderImageBashWorkspace(state, compact = false) {
     const name = clean(asset?.image_name) || clean(asset?.asset_id) || sourceUid;
     return `<article class="${compact ? "compact-shot-asset" : "selected-card"} image-bash-card ${asset ? "" : "missing"}" data-image-bash-instance="${escapeHtml(id)}" data-image-bash-source="${escapeHtml(sourceUid)}" data-image-bash-asset-key="${escapeHtml(asset?.asset_library_id || "")}" draggable="true" role="listitem" aria-posinset="${index + 1}" aria-setsize="${rows.length}" title="${escapeHtml(name)}"><div class="selected-card-top"><strong class="slot">${String(index + 1).padStart(2, "0")}</strong><div class="selected-actions"><button type="button" data-image-bash-duplicate="${id}" aria-label="Duplicate image" title="${imageAssetLanguage(state) === "ko" ? "이미지 인스턴스 복제" : "Duplicate image instance"}" ${rows.length >= MAX_SELECTED_IMAGES ? "disabled" : ""}>⧉</button><button type="button" data-image-bash-remove="${id}" aria-label="Remove image instance">×</button></div></div><div class="selected-card-body">${asset ? thumbnailHtml(asset, "selected-thumb") : '<span class="image-bash-missing">이미지 연결 확인 필요</span>'}</div>${compact ? `<b>${escapeHtml(name)}</b>` : ""}</article>`;
   }).join("");
-  const tray = active || compact ? `<div class="${compact ? "compact-shot-assets" : "tray-scroll"}" data-image-bash-tray="${workspace.workspace_id}" role="list">${cards || `<div class="tray-empty">${imageAssetLanguage(state) === "ko" ? "라이브러리 이미지를 클릭하여 추가하세요. 중복 이미지도 개별로 유지됩니다." : "Click library images to add independent image instances."}</div>`}</div>` : "";
+  const tray = active || compact ? `<div class="${compact ? "compact-shot-assets" : "tray-scroll"}" data-image-bash-tray="${workspace.workspace_id}" role="list">${cards || `<div class="tray-empty">${imageAssetLanguage(state) === "ko" ? "라이브러리 이미지를 클릭하여 추가하세요. 같은 이미지는 복제 버튼으로 추가하세요." : "Click library images to add them. Use Duplicate for another copy."}</div>`}</div>` : "";
   return `<section class="${compact ? "compact-shot-row" : "shot-panel"} image-bash-panel ${active ? "active" : "collapsed"}" data-image-bash-panel="${workspace.workspace_id}" style="--shot-accent:#22d3ee;--shot-rgb:34,211,238"><header class="shot-panel-head"><button type="button" class="shot-panel-toggle" data-image-bash-tab aria-expanded="${active}"><small>IB</small><b>HMBImageBash</b><span>${escapeHtml(imageAssetText(state, "selected_images"))}</span><em>${rows.length}/${MAX_SELECTED_IMAGES}</em><i>REMOTE</i></button></header>${tray}</section>`;
 }
 
@@ -6912,11 +7313,12 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
   let disposePositioning = null;
   const sendCgt = (operation, command = null) => {
     if (operation === "cgt_confirm" && !hierarchyProjectKey(state)) return false;
-    const bridge = imageAssetThumbnailBridgeRegistry()?.get(imageAssetThumbnailRuntimeId(state));
+    const bridge = imageAssetBridgeForNode(container, imageAssetThumbnailRuntimeId(state));
     if (typeof bridge?.dispatch !== "function") return false;
     const requestId = newImageAssetUuid();
     const request = { schema: "hmb-image-asset-thumbnail-bridge", version: 1, operation, phase: "request",
       runtime_instance_id: imageAssetThumbnailRuntimeId(state), session_id: cgtSession, request_id: requestId,
+      ...(hmbImageAssetWidgetLease(state) ? {widget_runtime_lease:hmbImageAssetWidgetLease(state)} : {}),
       project_identity: hierarchyProjectKey(state) };
     const selectedProject = operation === "cgt_confirm" ? command?.binding?.cgt_scope?.project_id : cgtProjectId;
     if (selectedProject) request.cgt_project_id = selectedProject;
@@ -7035,6 +7437,7 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
     disposePositioning?.reposition?.();
   };
   container.__hmbHierarchyReceive = response => {
+    if (hmbImageAssetWidgetLease(state) && hmbImageAssetWidgetLease(response) !== hmbImageAssetWidgetLease(state)) return false;
     if (response?.session_id !== cgtSession || response.request_id !== cgtRequest || response.project_identity !== hierarchyProjectKey(state)
         || response.runtime_instance_id !== imageAssetThumbnailRuntimeId(state)) return false;
     if (cgtTimer !== null) clearTimeout(cgtTimer);
@@ -7415,7 +7818,7 @@ function installEvents(container, state, props, remount, listeners) {
     },
   );
   const commitSlowProjectMutation = (mutate, action = {}) => {
-    if (container.__hmbImageAssetBusy || container.__hmbImageAssetRefreshCleanupPending || typeof mutate !== "function") return false;
+    if ((container.__hmbImageAssetBusy && !container.__hmbImageAssetProjectAuthorityPending) || container.__hmbImageAssetRefreshCleanupPending || typeof mutate !== "function") return false;
     const token = `${Date.now()}-${Math.random()}`;
     const pendingAction = {
       token,
@@ -7431,8 +7834,14 @@ function installEvents(container, state, props, remount, listeners) {
     };
     container.__hmbImageAssetPendingSlowAction = pendingAction;
     container.__hmbImageAssetSlowActionToken = token;
-    hmbSetImageAssetBusy(container, true, imageAssetText(state, "busy_loading"));
-    hmbAfterImageAssetPaint(() => {
+    container.__hmbImageAssetProjectAuthorityPending = true;
+    hmbSetImageAssetBusy(container, true, imageAssetLanguage(state)==="en"?"Checking connection…":"연결 확인 중…");
+    for(const item of container.__hmbImageAssetBusyControls||[])if(item.control?.matches?.("[data-project-select]")&&!item.disabled&&!container.__hmbNativeUiContract?.props?.disabled)item.control.disabled=false;
+    hmbWaitForImageAssetAuthority(container,state,{fresh:true}).then(()=>{
+      if(container.__hmbImageAssetSlowActionToken!==token)return;
+      delete container.__hmbImageAssetProjectAuthorityPending;
+      hmbSetImageAssetBusy(container,true,imageAssetText(state,"busy_loading"));
+      hmbAfterImageAssetPaint(() => {
       if (
         container.__hmbImageAssetSlowActionToken !== token
         || container.__hmbImageAssetPendingSlowAction !== pendingAction
@@ -7485,6 +7894,11 @@ function installEvents(container, state, props, remount, listeners) {
         },
       });
       if (!failedSynchronously) state = published;
+      });
+    },error=>{
+      if(container.__hmbImageAssetSlowActionToken!==token)return;
+      delete container.__hmbImageAssetProjectAuthorityPending;delete container.__hmbImageAssetPendingSlowAction;delete container.__hmbImageAssetSlowActionToken;
+      hmbSetImageAssetBusy(container,false);state=remount(container.__hmbImageAssetLatestState||state);hmbShowImageAssetTransportError(container,error,state);
     });
     return true;
   };
@@ -7494,14 +7908,18 @@ function installEvents(container, state, props, remount, listeners) {
     on(window, "hmb-shot-routing-discover-v1", publishShotRouting);
     publishShotRouting();
   }
-  const commitImageBashMutation = (mutate, create = false, completion = null) => {
+  const executeImageBashMutation = (mutate, create = false, completion = null, event = null, hint = {}, settlement = null, job = null) => {
     if (container.__hmbNativeUiContract?.props?.disabled || typeof mutate !== "function") return false;
+    if (!settlement && imageAssetRecheckUnknownWorkspace(container, container.__hmbImageAssetLatestState || state)) return false;
+    if(event&&typeof event==="object"){if(imageAssetBashHandledEvents.has(event))return false;imageAssetBashHandledEvents.add(event);}
     hmbFlushImageAssetSelectionCommit(container);
     state = container.__hmbImageAssetLatestState || state;
     const previous = state;
     const candidate = { ...state, shot_routing: cloneImageAssetShotRouting(state.shot_routing),
-      image_bash_workspace: hmbNormalizeImageBashWorkspace(state.image_bash_workspace), image_bash_workspace_request: {} };
+      image_bash_workspace: hmbNormalizeImageBashWorkspace(state.image_bash_workspace), image_bash_workspace_request: {},image_bash_workspace_edit:{} };
     if (!mutate(candidate)) return false;
+    if(job){job.beforeWorkspace=JSON.stringify(previous.image_bash_workspace);job.expectedWorkspace=JSON.stringify(candidate.image_bash_workspace);}
+    if(!create)candidate.image_bash_workspace_edit=hmbBuildImageBashWorkspaceEdit(previous.image_bash_workspace,candidate.image_bash_workspace,hint);
     if (create) candidate.image_bash_workspace_request = { schema: IMAGE_BASH_WORKSPACE_EDIT_SCHEMA, version: 1,
       operation: "create", request_id: newImageAssetUuid(), workspace_id: candidate.image_bash_workspace.workspace_id,
       expected_revision: candidate.image_bash_workspace.revision };
@@ -7511,6 +7929,7 @@ function installEvents(container, state, props, remount, listeners) {
     let failed = false, published = null;
     published = emit(props, state, container, error => {
       failed = true;
+      settlement?.failed(error);
       try { completion?.onFailure?.(error); } catch (_error) {}
       if (container.__hmbImageAssetLatestState === optimistic || container.__hmbImageAssetLatestState === published) state = remount(previous);
       else if (JSON.stringify(container.__hmbImageAssetLatestState?.image_bash_workspace) === JSON.stringify(candidate.image_bash_workspace)) {
@@ -7520,7 +7939,14 @@ function installEvents(container, state, props, remount, listeners) {
           image_bash_active: previous.image_bash_active, image_bash_workspace_request: {} });
       }
       hmbShowImageAssetTransportError(container, error, state);
-    }, { onSuccess: () => {
+    }, { onUncertain:error=>settlement?.uncertain(error), onCanonical:canonical=>{
+      if (JSON.stringify(canonical.image_bash_workspace)!==JSON.stringify(candidate.image_bash_workspace)) {
+        settlement?.uncertain(new Error("변경 결과가 요청과 다릅니다. 연결 확인 후 현재 목록을 확인하세요."));return;
+      }
+      settlement?.confirmed();
+      try {completion?.onSuccess?.();} catch(_error){}
+    }, onSuccess: () => {
+      if(settlement)return; // A void/native callback success is not authority.
       if (typeof completion?.onSuccess !== "function") return;
       Promise.resolve().then(() => {
         // A canonical acknowledgement may advance the publication clock.
@@ -7532,9 +7958,49 @@ function installEvents(container, state, props, remount, listeners) {
       // Only the explicit HMBImageBash add publication carries the create command.
       // Selection, page switches and cold restoration never replay it.
       published.image_bash_workspace_request = {};
+      published.image_bash_workspace_edit = {};
       if (container.__hmbImageAssetLatestState === optimistic) { state = published; container.__hmbImageAssetLatestState = published; }
     }
     return !failed;
+  };
+  container.__hmbImageAssetBashQueueExecute=(job,settlement)=>executeImageBashMutation(job.mutate,job.create,job.completion,null,job.hint,settlement,job);
+  if(!container.__hmbImageAssetBashEditQueue){
+    container.__hmbImageAssetBashEditQueue=hmbCreateImageBashEditQueue({
+      owned:job=>imageAssetWorkspaceScopeCurrent(container,job.owner)
+        && clean(container.__hmbImageAssetLatestState?.project_root)===job.projectRoot
+        && (!job.workspaceId || container.__hmbImageAssetLatestState?.image_bash_workspace?.workspace_id===job.workspaceId),
+      ready:job=>hmbWaitForImageAssetAuthority(container,container.__hmbImageAssetLatestState,{fresh:true,ownerScope:job.owner}),
+      busy:()=>Boolean(container.__hmbNativeUiContract?.props?.disabled),
+      execute:(job,settlement)=>container.__hmbImageAssetBashQueueExecute?.(job,settlement),
+      cancelled:job=>{try{job.completion?.onFailure?.(new Error("아직 전송하지 않은 변경을 취소했습니다."));}catch(_error){}},
+      reconciled:job=>{
+        if(JSON.stringify(container.__hmbImageAssetLatestState?.image_bash_workspace)!==job.expectedWorkspace)return false;
+        delete container.__hmbImageAssetWorkspaceAuthorityUnknown;return true;
+      },
+      status:snapshot=>{
+        const header=container.querySelector("[data-image-bash-panel] > header");if(!header)return;
+        let bar=header.querySelector("[data-image-bash-queue-status]");
+        if(!bar){bar=container.ownerDocument.createElement("div");bar.dataset.imageBashQueueStatus="";bar.setAttribute("role","status");bar.style.cssText="padding:4px 10px;color:#67e8f9;font-size:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap";header.appendChild(bar);}
+        bar.replaceChildren();bar.hidden=!(snapshot.pending||snapshot.active||snapshot.preparing||snapshot.stopped);
+        if(bar.hidden)return;
+        const text=container.ownerDocument.createElement("span");text.textContent=snapshot.stopped
+          ? `변경 대기 · ${snapshot.stopped} (대기 ${snapshot.pending}개)`
+          : `작업 ${snapshot.preparing?'연결 확인 중':snapshot.active?'적용 확인 중':'수집 중'} · 대기 ${snapshot.pending}개 · 완료 후 저장하세요`;bar.appendChild(text);
+        if(snapshot.stopped){
+          const check=container.ownerDocument.createElement("button");check.type="button";check.textContent="연결 확인";check.onclick=event=>{event.stopPropagation();container.__hmbImageAssetBashEditQueue?.recover();};bar.appendChild(check);
+          const cancel=container.ownerDocument.createElement("button");cancel.type="button";cancel.textContent="미전송 대기 취소";cancel.onclick=event=>{event.stopPropagation();container.__hmbImageAssetBashEditQueue?.cancel();};bar.appendChild(cancel);
+        }
+      },
+    });
+  }
+  container.__hmbImageAssetBashEditQueue.render();
+  const commitImageBashMutation = (mutate, create = false, completion = null, event = null, hint = {}) => {
+    if(container.__hmbNativeUiContract?.props?.disabled || typeof mutate!=="function")return false;
+    if(event&&typeof event==="object"){if(imageAssetBashHandledEvents.has(event))return false;imageAssetBashHandledEvents.add(event);}
+    const current=container.__hmbImageAssetLatestState||state,root=container.closest?.(".react-flow__node");
+    return container.__hmbImageAssetBashEditQueue.push({mutate,create,completion,hint,...hint,
+      projectRoot:clean(current.project_root),workspaceId:current.image_bash_workspace?.workspace_id,
+      owner:{mount:container.__hmbImageAssetMountToken,root,parent:root?.parentNode,nodeName:clean(root?.getAttribute?.("data-id")||container.__hmbImageAssetNativeNodeName),lease:hmbImageAssetWidgetLease(current),runtime:imageAssetThumbnailRuntimeId(current)}});
   };
   const commitHierarchyRequest = request => {
     const previous = container.__hmbImageAssetLatestState || state;
@@ -7602,8 +8068,8 @@ function installEvents(container, state, props, remount, listeners) {
     if (!action || !container.contains(action)) return;
     event.preventDefault(); event.stopPropagation();
     if (tab) commitImageBashMutation(candidate => { if (candidate.image_bash_active) return false; candidate.image_bash_active = true; return true; });
-    else if (remove) commitImageBashMutation(candidate => hmbRemoveImageBashInstance(candidate, remove.dataset.imageBashRemove));
-    else commitImageBashMutation(candidate => hmbDuplicateImageBashInstance(candidate, duplicate.dataset.imageBashDuplicate));
+    else if (remove) commitImageBashMutation(candidate => hmbRemoveImageBashInstance(candidate, remove.dataset.imageBashRemove),false,null,event);
+    else commitImageBashMutation(candidate => hmbDuplicateImageBashInstance(candidate, duplicate.dataset.imageBashDuplicate),false,null,event,{operation:"copy",instance_id:duplicate.dataset.imageBashDuplicate});
   });
   let imageBashDrag = null;
   on(container, "dragstart", event => {
@@ -7624,7 +8090,7 @@ function installEvents(container, state, props, remount, listeners) {
     event.preventDefault(); event.stopPropagation();
     const dragged = imageBashDrag; imageBashDrag = null;
     if (dragged.workspace_id !== state.image_bash_workspace.workspace_id) return;
-    commitImageBashMutation(candidate => hmbReorderImageBashInstance(candidate, dragged.instance_id, target.dataset.imageBashInstance));
+    commitImageBashMutation(candidate => hmbReorderImageBashInstance(candidate, dragged.instance_id, target.dataset.imageBashInstance),false,null,event,{operation:"reorder",instance_id:dragged.instance_id,target_instance_id:target.dataset.imageBashInstance});
   });
   on(container, "dragend", () => { imageBashDrag = null; });
   const bindShotRenameInput = (input, renameButton, shotUuid) => {
@@ -7858,12 +8324,12 @@ function installEvents(container, state, props, remount, listeners) {
         container.querySelector?.('[data-registration-field="image_name"]')?.focus?.();
       });
     });
-    const toggle = () => {
+    const toggle = (event = null) => {
       const asset = container.__hmbImageAssetByLibraryId?.get(key) || assetsByLibraryId.get(key);
       if (!asset) return;
       if (!hmbImageAssetCanSelect(asset)) return;
       if (state.image_bash_active) {
-        commitImageBashMutation(candidate => hmbAddImageBashSource(candidate, asset.source_uid)); return;
+        commitImageBashMutation(candidate => hmbAddImageBashSource(candidate, asset.source_uid),false,null,event); return;
       }
       const activeShot = activeImageAssetShot(state);
       if (!activeShot) return;
@@ -7952,13 +8418,13 @@ function installEvents(container, state, props, remount, listeners) {
     on(card, "click", (event) => {
       if (event.target?.closest?.("input,button,select,textarea,a")) return;
       event.__hmbImageAssetCardHandled = true;
-      toggle();
+      toggle(event);
     });
     on(card, "keydown", (event) => {
       if (!["Enter", " "].includes(event.key) || event.target !== card) return;
       event.preventDefault();
       event.__hmbImageAssetCardHandled = true;
-      toggle();
+      toggle(event);
     });
   });
 
@@ -7966,10 +8432,10 @@ function installEvents(container, state, props, remount, listeners) {
   // catalog reconciler, so card interaction is also delegated from the stable
   // widget root. Existing directly-bound cards mark handled events to avoid a
   // duplicate action during the transition to retained windows.
-  const toggleDelegatedAsset = (card, asset) => {
+  const toggleDelegatedAsset = (card, asset, event = null) => {
     if (!hmbImageAssetCanSelect(asset)) return;
     if (state.image_bash_active) {
-      commitImageBashMutation(candidate => hmbAddImageBashSource(candidate, asset.source_uid)); return;
+      commitImageBashMutation(candidate => hmbAddImageBashSource(candidate, asset.source_uid),false,null,event); return;
     }
     const activeShot = activeImageAssetShot(state);
     if (!activeShot) return;
@@ -8065,7 +8531,7 @@ function installEvents(container, state, props, remount, listeners) {
       return;
     }
     if (event.target?.closest?.("input,button,select,textarea,a")) return;
-    toggleDelegatedAsset(card, asset);
+    toggleDelegatedAsset(card, asset, event);
   });
   on(container, "keydown", (event) => {
     if (event.__hmbImageAssetCardHandled || !["Enter", " "].includes(event.key)) return;
@@ -8075,7 +8541,7 @@ function installEvents(container, state, props, remount, listeners) {
     const asset = container.__hmbImageAssetByLibraryId?.get(key) || assetsByLibraryId.get(key);
     if (!asset) return;
     event.preventDefault();
-    toggleDelegatedAsset(card, asset);
+    toggleDelegatedAsset(card, asset, event);
   });
 
   const restoreRegistrationOpener = (returnFocus) => {
@@ -8121,7 +8587,7 @@ function installEvents(container, state, props, remount, listeners) {
         if (container.__hmbImageAssetRegistrationDraft !== draft) return;
         delete draft.bash_pending; closeRegistration();
       },
-    });
+    },event);
     if (!started) { delete draft.bash_pending; state = remount(state); }
   });
   container.querySelectorAll("[data-registration-cancel]").forEach((button) => {
@@ -8335,6 +8801,7 @@ function hmbNativeUiImplementation(container, props) {
   container.setAttribute?.("data-hmb-node-delete-protected", "true");
   props = hmbUpdateImageAssetPropsReference({}, props);
   const rememberNodeInternalsUpdater = (candidate = {}) => {
+    container.__hmbImageAssetNativeNodeName = clean(candidate.nodeName);
     const updater = candidate?.updateNodeInternals
       || candidate?.requestNodeInternalsUpdate
       || candidate?.onUpdateNodeInternals;
@@ -8343,8 +8810,22 @@ function hmbNativeUiImplementation(container, props) {
   rememberNodeInternalsUpdater(props);
   const cleanupImportHandles = hmbInstallImageAssetImportHandleDecoration(container);
   let state = normalizeState(props?.value);
+  container.__hmbImageAssetAuthorityCandidate = props?.value;
+  container.__hmbImageAssetWidgetLease = hmbImageAssetWidgetLease(state);
+  let leaseTransition = null, leaseDisposed = false;
+  const clearLeaseTransition = () => {
+    clearTimeout(leaseTransition?.deadline);
+    leaseTransition = null;
+    delete container.__hmbImageAssetLeaseTransitionPending;
+    delete container.__hmbImageAssetLeaseWake;
+    const root = container.querySelector?.(".hmb-image-assets");
+    if (root?.hasAttribute?.("data-hmb-connection-inert")) {
+      root.removeAttribute("inert"); root.removeAttribute("data-hmb-connection-inert");
+    }
+  };
   // A saved value is state, not permission to recreate a graph node.
   state.image_bash_workspace_request = {};
+  state.image_bash_workspace_edit = {};
   container.__hmbImageAssetAcceptedEditCatalogIdentity = imageAssetEditCatalogIdentity(state);
   hmbRememberImageAssetPresentation(state);
   hmbAdoptImageAssetPresentation(state);
@@ -8390,10 +8871,11 @@ function hmbNativeUiImplementation(container, props) {
     container.__hmbImageAssetLatestState || state,
     result,
   );
-  const wakeCatalogPolling = () => hmbStartImageAssetCatalogPolling(
-    container,
-    container.__hmbImageAssetLatestState || state,
-  );
+  const wakeCatalogPolling = () => {
+    container.__hmbImageAssetAuthorityWait?.wake?.();
+    container.__hmbImageAssetLeaseWake?.();
+    return hmbStartImageAssetCatalogPolling(container, container.__hmbImageAssetLatestState || state);
+  };
 
   const consumeThumbnailPresentationPatch = (patch) => {
     if (patch?.operation?.startsWith("cgt_")) return container.__hmbHierarchyReceive?.(patch) || false;
@@ -8576,8 +9058,35 @@ function hmbNativeUiImplementation(container, props) {
     return state;
   };
 
-  const applyProps = (nextProps = {}) => {
+  const applyProps = (nextProps = {}, forceAuthority = false) => {
     rememberNodeInternalsUpdater(nextProps);
+    const canonicalCandidate=parseValue(nextProps?.value);
+    if (canonicalCandidate?.schema === "hmb-image-asset-library-state" && imageAssetHasWorkspaceCommand(canonicalCandidate)) {
+      // Native onChange updates React optimistically before its send guard can
+      // throw. The full command echo is a request, just like a compact edit;
+      // it cannot resurrect a rejected Copy/Remove or acknowledge that write.
+      const nodeName = clean(container.closest?.(".react-flow__node")?.getAttribute?.("data-id") || container.__hmbImageAssetNativeNodeName);
+      if (hmbImageAssetWidgetLease(canonicalCandidate) === container.__hmbImageAssetWidgetLease
+        && imageAssetThumbnailRuntimeId(canonicalCandidate) === imageAssetThumbnailRuntimeId(container.__hmbImageAssetLatestState)
+        && (!clean(nextProps.nodeName) || clean(nextProps.nodeName) === nodeName)) props = hmbUpdateImageAssetPropsReference(props, nextProps, true);
+      return;
+    }
+    if(canonicalCandidate?.schema==="hmb-image-asset-library-state" && hmbImageAssetWidgetLease(canonicalCandidate)===container.__hmbImageAssetWidgetLease){
+      container.__hmbImageAssetAuthorityCandidate=nextProps.value;
+      let acknowledged=-1;
+      for(const [token,pending] of container.__hmbImageAssetPendingPublications||[]){
+        const wire=typeof nextProps.value==="string"?nextProps.value:JSON.stringify(nextProps.value);
+        if(wire!==pending.wire&&!canonicalCandidate.image_bash_workspace_edit?.operation_id&&hmbImageAssetWidgetLease(canonicalCandidate)===pending.lease
+          &&imageAssetThumbnailRuntimeId(canonicalCandidate)===pending.runtime&&hmbNormalizeImageAssetRevision(canonicalCandidate.ui_edit_revision)>=pending.ui
+          &&clean(canonicalCandidate.project_root).replaceAll("\\","/")===pending.projectRoot
+          &&(pending.workspace===null||imageAssetScopeKey(hmbNormalizeImageBashWorkspace(canonicalCandidate.image_bash_workspace))===pending.workspace))acknowledged=Math.max(acknowledged,pending.ui);
+      }
+      for(const [token,pending] of container.__hmbImageAssetPendingPublications||[])if(pending.lease===hmbImageAssetWidgetLease(canonicalCandidate)&&pending.ui<=acknowledged){
+        clearTimeout(pending.timer);container.__hmbImageAssetPendingPublications.delete(token);
+        if(imageAssetWorkspaceScopeCurrent(container,pending))Promise.resolve().then(()=>pending.onCanonical?.(canonicalCandidate));
+      }
+      Promise.resolve().then(()=>container.__hmbImageAssetAuthorityWait?.wake?.());
+    }
     const presentationPatch = hmbApplyImageAssetThumbnailPresentationPatch(
       container.__hmbImageAssetLatestState || state,
       nextProps?.thumbnailPresentationPatch || nextProps?.presentationPatch,
@@ -8599,7 +9108,7 @@ function hmbNativeUiImplementation(container, props) {
       return;
     }
     const previousPropValue = props?.value;
-    if (nextProps?.value === previousPropValue) {
+    if (!forceAuthority && nextProps?.value === previousPropValue) {
       // A callback-only host update does not change catalog authority. Keep
       // the new callbacks, but avoid normalizing/stringifying the same O(N)
       // state again.
@@ -8607,6 +9116,58 @@ function hmbNativeUiImplementation(container, props) {
       return;
     }
     const rawIncoming = parseValue(nextProps?.value);
+    if (rawIncoming?.schema === "hmb-image-asset-library-state") {
+      const incomingLease = hmbImageAssetWidgetLease(rawIncoming), currentLease = container.__hmbImageAssetWidgetLease;
+      if (currentLease && !incomingLease) return;
+      if (incomingLease && incomingLease !== currentLease) {
+        if (container.__hmbImageAssetRetiredWidgetLeases?.has(incomingLease)) return;
+        const runtime = imageAssetThumbnailRuntimeId(rawIncoming), entry = imageAssetBridgeForNode(container, runtime);
+        if (entry?.widget_runtime_lease === incomingLease && imageAssetAuthorityMatches(container,rawIncoming,entry.authoritySnapshot)) {
+          if (!hmbAcceptImageAssetWidgetLease(container, rawIncoming, incomingLease)) return;
+          clearLeaseTransition();
+        } else {
+          clearLeaseTransition();
+          container.__hmbImageAssetLeaseTransitionPending = true;
+          hmbInvalidateImageAssetPublication(container); hmbCancelImageAssetSelectionCommit(container);
+          hmbCancelImageAssetThumbnailRequest(container); hmbStopImageAssetCatalogPolling(container);
+          clearTimeout(container.__hmbImageAssetSearchTimer); delete container.__hmbImageAssetSearchTimer;
+          delete container.__hmbImageAssetPendingSlowAction; delete container.__hmbImageAssetSlowActionToken;
+          const pending = leaseTransition = {props:nextProps, lease:incomingLease, runtime, querying:false};
+          hmbSetImageAssetBusy(container, true, imageAssetLanguage(state) === "en" ? "Checking connection…" : "연결 확인 중…");
+          const root = container.querySelector?.(".hmb-image-assets");
+          if (root && !root.hasAttribute("inert")) { root.setAttribute("inert", ""); root.setAttribute("data-hmb-connection-inert", ""); }
+          pending.deadline = setTimeout(() => {
+            if (!leaseDisposed && leaseTransition === pending) hmbShowImageAssetTransportError(container,
+              new Error(imageAssetLanguage(state) === "en" ? "Connection could not be confirmed. Save your work and reopen the library." : "연결을 확인하지 못했습니다. 작업을 저장한 뒤 라이브러리를 다시 열어 주세요."), state);
+          }, 10000);
+          const confirm = () => {
+            if (leaseDisposed || leaseTransition !== pending || pending.querying) return;
+            const bridge = imageAssetBridgeForNode(container, runtime);
+            if (typeof bridge?.queryWidgetLease !== "function") return;
+            pending.querying = true;
+            Promise.resolve(bridge.queryWidgetLease()).then(confirmed => {
+              pending.querying = false;
+              if (leaseDisposed || leaseTransition !== pending) return;
+              if (confirmed !== pending.lease) {
+                if (confirmed === container.__hmbImageAssetWidgetLease) {
+                  clearLeaseTransition(); remount(state); hmbSetImageAssetBusy(container, false);
+                } else hmbShowImageAssetTransportError(container, new Error("현재 이미지 라이브러리의 작업 정보를 다시 확인하세요."), state);
+                return;
+              }
+              if(!imageAssetAuthorityMatches(container,parseValue(pending.props.value),imageAssetBridgeForNode(container,runtime)?.authoritySnapshot))return;
+              if (!hmbAcceptImageAssetWidgetLease(container, parseValue(pending.props.value), confirmed)) return;
+              clearLeaseTransition(); applyProps(pending.props);
+            }).catch(error => {
+              pending.querying = false;
+              if (!leaseDisposed && leaseTransition === pending) hmbShowImageAssetTransportError(container, error, state);
+            });
+          };
+          container.__hmbImageAssetLeaseWake = confirm; confirm();
+          return;
+        }
+      }
+      if (leaseTransition) return;
+    }
     const commandEcho = imageAssetCompactEditEcho(container, nextProps?.value, rawIncoming);
     if (commandEcho) {
       if (commandEcho.current) props = hmbUpdateImageAssetPropsReference(props, nextProps);
@@ -8614,6 +9175,22 @@ function hmbNativeUiImplementation(container, props) {
     }
     const incomingState = normalizeState(hmbImageAssetLocalPageProjection(rawIncoming,state,container));
     incomingState.image_bash_workspace_request = {};
+    incomingState.image_bash_workspace_edit = {};
+    const workspaceHold = container.__hmbImageAssetWorkspaceAuthorityUnknown;
+    if (rawIncoming?.schema === "hmb-image-asset-library-state" && !rawIncoming.image_bash_workspace_edit?.operation_id
+      && !rawIncoming.image_bash_workspace_request?.request_id && imageAssetWorkspaceHoldOwned(container, workspaceHold)
+      && hmbImageAssetRevisionDisposition(container, incomingState) !== "stale"
+      && hmbImageAssetWidgetLease(incomingState) === workspaceHold.lease
+      && imageAssetThumbnailRuntimeId(incomingState) === workspaceHold.runtime
+      && hmbNormalizeImageAssetRevision(incomingState.ui_edit_revision) >= workspaceHold.ui
+      && imageAssetScopeKey(hmbNormalizeImageBashWorkspace(incomingState.image_bash_workspace)) === workspaceHold.workspace) {
+      delete container.__hmbImageAssetWorkspaceAuthorityUnknown;
+    }
+    if(!forceAuthority&&rawIncoming?.schema==="hmb-image-asset-library-state"&&hmbImageAssetRevisionDisposition(container,incomingState)!=="stale"
+      &&imageAssetScopeKey(hmbImageAssetAuthorityScope(incomingState))!==imageAssetScopeKey(hmbImageAssetAuthorityScope(state)))container.__hmbImageAssetCanonicalGeneration=(Number(container.__hmbImageAssetCanonicalGeneration)||0)+1;
+    if(!forceAuthority && rawIncoming?.schema==="hmb-image-asset-library-state" && hmbImageAssetWidgetLease(incomingState) && hmbImageAssetRevisionDisposition(container,incomingState)==="stale"){
+      imageAssetRecheckAuthorityInBackground(container,container.__hmbImageAssetLatestState||state,error=>hmbShowImageAssetTransportError(container,error,state));
+    }
     const queuedOwnerAction = container.__hmbImageAssetPendingSlowAction;
     if (
       queuedOwnerAction
@@ -8795,8 +9372,29 @@ function hmbNativeUiImplementation(container, props) {
     }
   };
   container.__hmbImageAssetApplyProps = applyProps;
+  container.__hmbImageAssetAdoptAuthority = snapshot => {
+    const scope=snapshot?.canonical_scope,lease=container.__hmbImageAssetWidgetLease;
+    const node=container.closest?.(".react-flow__node"),name=clean(node?.getAttribute?.("data-id")||props?.nodeName);
+    if(!scope || scope.widget_runtime_lease!==lease || clean(snapshot.canonical_node_name)!==name)return false;
+    const raw=container.__hmbImageAssetAuthorityCandidate,parsed=parseValue(raw);
+    if(parsed?.schema!=="hmb-image-asset-library-state" || imageAssetScopeKey(hmbImageAssetAuthorityScope(parsed))!==imageAssetScopeKey(scope))return false;
+    if(imageAssetScopeKey(hmbImageAssetAuthorityScope(state))===imageAssetScopeKey(scope))return true;
+    const pending=container.__hmbImageAssetPendingSlowAction,token=container.__hmbImageAssetSlowActionToken,waiting=container.__hmbImageAssetProjectAuthorityPending;
+    hmbResetImageAssetRuntimeState(container,parsed);
+    if(waiting){container.__hmbImageAssetPendingSlowAction=pending;container.__hmbImageAssetSlowActionToken=token;}
+    applyProps({...props,value:raw},true);return true;
+  };
 
   const cleanup = () => {
+    container.__hmbImageAssetBashEditQueue?.dispose();delete container.__hmbImageAssetBashEditQueue;delete container.__hmbImageAssetBashQueueExecute;
+    hmbCancelImageAssetAuthorityWait(container);
+    delete container.__hmbImageAssetProjectAuthorityPending;
+    delete container.__hmbImageAssetNativeNodeName;
+    delete container.__hmbImageAssetAuthorityCandidate;delete container.__hmbImageAssetAdoptAuthority;
+    for(const pending of container.__hmbImageAssetPendingPublications?.values?.()||[])clearTimeout(pending.timer);
+    delete container.__hmbImageAssetSemanticGeneration;delete container.__hmbImageAssetPendingPublications;delete container.__hmbImageAssetCanonicalGeneration;
+    delete container.__hmbImageAssetWorkspaceAuthorityUnknown;
+    leaseDisposed = true; clearLeaseTransition();
     container.__hmbHierarchyDispose?.();
     container.__hmbHierarchyDialog?.close?.();
     container.__hmbHierarchyDialog?.remove?.();
@@ -8923,6 +9521,40 @@ function hmbNativeUiReadCommand(value, kind) {
     && (["stop_read", "cancel_pending", "cancel_video_import"].includes(command.action)
       || (command.action === "video_tools" && command.payload?.op === "cancel"));
 }
+// Locked echoes use only primitive/raw-string identity: no state clone/hash.
+// Complex values keep the original ownership-preserving update path.
+function hmbNativeUiLockedEchoKey(props) {
+  if (!props?.disabled || Object.getOwnPropertySymbols(props).length) return null;
+  const result = [typeof props.onChange === "function", typeof props.onCommand === "function"];
+  for (const key of Object.keys(props)) {
+    if (["onChange", "onCommand"].includes(key)) continue;
+    const property = Object.getOwnPropertyDescriptor(props, key);
+    if (!property || !Object.hasOwn(property, "value")) return null;
+    const value = property.value, type = typeof value;
+    if (key === "ui_options" && value !== null && type === "object") {
+      const prototype = Object.getPrototypeOf(value), keys = Object.keys(value);
+      if ((prototype !== Object.prototype && prototype !== null) || keys.length > 64 || Object.getOwnPropertySymbols(value).length) return null;
+      result.push(key, "flat-options", keys.length);
+      for (const option of keys) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, option);
+        if (!descriptor || !Object.hasOwn(descriptor, "value")) return null;
+        const field = descriptor.value, fieldType = typeof field;
+        if (field !== null && !["undefined", "boolean", "string", "number"].includes(fieldType)) return null;
+        if (fieldType === "number" && !Number.isFinite(field)) return null;
+        result.push(option, field);
+      }
+      continue;
+    }
+    if (value !== null && !["undefined", "boolean", "string", "number"].includes(type)) return null;
+    if (type === "number" && !Number.isFinite(value)) return null;
+    result.push(key, "primitive", value);
+  }
+  return result;
+}
+function hmbNativeUiLockedEchoMatches(next, previous) {
+  return next !== null && previous != null && next.length === previous.length
+    && next.every((value, index) => Object.is(value, previous[index]));
+}
 function hmbNativeUiContract(container, props, mount, policy) {
   if (!container) return mount(container, props);
   let c = container.__hmbNativeUiContract;
@@ -8962,25 +9594,33 @@ function hmbNativeUiContract(container, props, mount, policy) {
       c.observer?.observe?.(container, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled", "contenteditable"] });
     };
     c.wrap = () => {
-      const p = { ...c.props };
+      const p = { ...c.props }, cells = {};
       for (const name of ["onChange", "onCommand"]) if (typeof p[name] === "function") {
-        const callback = HMB_NATIVE_UI_CALLBACKS.get(p[name]) || p[name];
+        const cell = { callback: HMB_NATIVE_UI_CALLBACKS.get(p[name]) || p[name] };
+        cells[name] = cell;
         const fn = (...args) => {
           if (!c.active) throw new Error("This widget is no longer mounted.");
           if (c.props.disabled && !hmbNativeUiReadCommand(args[0], c.kind)) throw new Error("This control is disabled by Griptape.");
-          return callback?.(...args);
+          return cell.callback?.(...args);
         };
-        HMB_NATIVE_UI_CALLBACKS.set(fn, HMB_NATIVE_UI_CALLBACKS.get(p[name]) || p[name]); p[name] = fn;
+        HMB_NATIVE_UI_CALLBACKS.set(fn, cell.callback); p[name] = fn;
       }
-      return p;
+      c.callbackCells = cells; return p;
+    };
+    c.refreshCallbacks = () => {
+      for (const [name, cell] of Object.entries(c.callbackCells || {})) {
+        const current = c.props[name]; cell.callback = HMB_NATIVE_UI_CALLBACKS.get(current) || current;
+      }
     };
     c.proxy = {
       update(nextProps) {
         if (!c.active || c.closing) return;
-        c.restore(); c.props = nextProps || {}; const next = c.wrap();
+        const incoming = nextProps || {}, echoKey = hmbNativeUiLockedEchoKey(incoming);
+        if (hmbNativeUiLockedEchoMatches(echoKey, c.lockedEchoKey)) { c.props = incoming; c.refreshCallbacks(); return; }
+        c.lockedEchoKey = null; c.restore(); c.props = incoming; const next = c.wrap();
         if (typeof c.handle?.update === "function") c.handle.update(next);
         else c.handle = mount(container, next);
-        c.sync();
+        c.sync(); c.lockedEchoKey = c.props === incoming ? echoKey : null;
       },
       cleanup() {
         if (!c.active || c.closing) return; c.closing = true; c.restore();
@@ -8995,7 +9635,9 @@ function hmbNativeUiContract(container, props, mount, policy) {
     };
     container.__hmbNativeUiContract = c;
   }
-  c.restore(); c.props = props || c.props || {}; c.handle = mount(container, c.wrap()); c.sync(); return c.proxy;
+  const incoming = props || c.props || {}, echoKey = hmbNativeUiLockedEchoKey(incoming);
+  if (c.handle && hmbNativeUiLockedEchoMatches(echoKey, c.lockedEchoKey)) { c.props = incoming; c.refreshCallbacks(); return c.proxy; }
+  c.lockedEchoKey = null; c.restore(); c.props = incoming; c.handle = mount(container, c.wrap()); c.sync(); c.lockedEchoKey = c.props === incoming ? echoKey : null; return c.proxy;
 }
 // HMB_NATIVE_DISABLED_ADAPTER_V1_END
 

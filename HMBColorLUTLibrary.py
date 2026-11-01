@@ -834,6 +834,9 @@ class HMBColorLUTLibrary(DataNode):
                  "selection": _export_selection(state), "settings": normalize_settings(state["settings"]), "output": _output(state["output"]),
                  "path": str(path), "size": info.st_size, "mtime_ns": info.st_mtime_ns,
                  "sha256": artifact["sha256"] if artifact else _file_digest(path, cancel), "job_id": result["job_id"]}
+        # New exports retain the source title while using their actual delivery
+        # container suffix. Older proofs keep their original idempotency identity.
+        proof["upload_name_suffix"] = path.suffix.lower()
         if isinstance(captured, dict) and captured.get("event"):
             proof["usage_event"] = copy.deepcopy(captured["event"])
         identity = _digest(proof)
@@ -906,6 +909,9 @@ class HMBColorLUTLibrary(DataNode):
             owner = str(me.get("id") or me.get("user_id") or (me.get("user") or {}).get("id") or "")
             if not owner:
                 raise ValueError("브로커 로그인 계정을 확인하세요.")
+            if artifact == "export" and proof.get("upload_name_suffix") == path.suffix.lower():
+                context["source_file_name"] = context["file_name"]
+                context["file_name"] = str(Path(context["file_name"]).with_suffix(path.suffix.lower()))
             context.update(path=str(path), size=info.st_size, mtime_ns=info.st_mtime_ns, sha256=proof["sha256"],
                            settings=proof["settings"], owner_id=owner, bridge=bridge, state_stamp=self._upload_state_stamp(state),
                            settings_sha256=_digest(proof["settings"]))
@@ -1120,7 +1126,8 @@ class HMBColorLUTLibrary(DataNode):
                 context = self._prepare_upload_context(state, artifact=artifact)
                 identity = context["upload_id"]
                 current = self._upload_source_context(state)
-                if any(current.get(key) != context.get(key) for key in current):
+                if any(current.get(key) != (context.get("source_file_name", context.get(key)) if key == "file_name"
+                                            else context.get(key)) for key in current):
                     raise ValueError("원본 Generator 또는 샷 연결이 변경되었습니다.")
                 with self._lock:
                     if (cancel.is_set() or self._hmb_node_deleted or context["state_stamp"] != self._upload_state_stamp(self._hmb_color_lut_state)
@@ -1906,6 +1913,11 @@ class HMBColorLUTLibrary(DataNode):
                 destination = Path(output["path"]).expanduser()
                 if not destination.is_absolute():
                     raise ValueError("Output must be an absolute file path.")
+                # Saved HEVC destinations used MP4 before MOV became the
+                # delivery container. Only a new export changes its suffix;
+                # existing results, receipts and their upload identity stay intact.
+                if codec == "hevc10" and destination.suffix.lower() == ".mp4":
+                    destination = destination.with_suffix(".mov")
             else:
                 if not source:
                     raise ValueError("Load a video or explicitly choose an output path.")

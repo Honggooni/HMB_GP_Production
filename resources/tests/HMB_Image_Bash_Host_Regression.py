@@ -51,6 +51,37 @@ def png_bytes(image):
     return buffer.getvalue()
 
 
+async def await_bash_settled(engine, timeout=8):
+    """Wait for real completion/error, independent of machine speed."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        await asyncio.sleep(.005)
+        nodes = [engine.node_manager.get_node_by_name(name)
+                 for name in list(engine.node_manager._name_to_parent_flow_name)]
+        pending = [node for node in nodes
+                   if getattr(node, "_hmb_apply_pending", None) is not None
+                   or getattr(node, "_hmb_prepare_pending", None) is not None
+                   or getattr(node, "_hmb_cold_restore_pending", None) is not None
+                   or any((getattr(node, "_hmb_apply_work", {}) or {}).get(key)
+                          for key in ("active", "completed", "publish_scheduled"))]
+        if not pending:
+            return
+        assert loop.time() < deadline, [(node.name, node.get_parameter_value("HMB_BASH_STATUS")) for node in pending]
+
+
+def document_matches_current_snapshot(node, actual, expected):
+    """Only a host-issued, non-content document token may rotate on sync."""
+    nonce=getattr(node,"_hmb_editor_snapshot_id",None)
+    if not isinstance(nonce,str) or len(nonce)!=36:
+        return False
+    if actual.get("meta",{}).get("hmb_image_bash",{}).get("editor_snapshot_id")!=nonce:
+        return False
+    expected=deepcopy(expected)
+    expected.setdefault("meta",{}).setdefault("hmb_image_bash",{})["editor_snapshot_id"]=nonce
+    return actual==expected
+
+
 async def exercise(engine, directory):
     from PIL import Image
     import HMBImageBash as target
@@ -165,6 +196,7 @@ async def exercise(engine, directory):
                    "revision": 1, "records": records}
         set_inputs(records)
         set_value("image_bash_context", context)
+        await await_bash_settled(engine)
         project = deepcopy(node.get_parameter_value("bash_image"))
         assert len(project["meta"]["konva_json"]["images"]) == 2, {
             "project": project, "status": node.get_parameter_value("HMB_BASH_STATUS"),
@@ -207,7 +239,7 @@ async def exercise(engine, directory):
         project["value"] = "data:image/png;base64," + base64.b64encode(applied_png).decode("ascii")
         project["name"] = "Synthetic browser-shaped Apply fixture"
         set_value("bash_image", project)
-        await asyncio.sleep(.05)
+        await await_bash_settled(engine)
         assert output_path.read_bytes() == applied_png
         assert File(node.parameter_output_values["output_image"].value).read_bytes() == applied_png
         assert File(target._url(scalar_sink.get_parameter_value("image"))).read_bytes() == applied_png
@@ -267,6 +299,7 @@ async def exercise(engine, directory):
             late_context["revision"] += 1
             set_inputs(late_context["records"])
             set_value("image_bash_context", late_context)
+            await await_bash_settled(engine)
             stale = deepcopy(committed)
             stale["meta"]["created_at"] += "-late-input"
             rejected_apply(stale, "late source arrived before UI event")
@@ -274,6 +307,7 @@ async def exercise(engine, directory):
             set_value(children[-1].name, None)
             set_inputs(records)
             set_value("image_bash_context", context)
+            await await_bash_settled(engine)
         assert node._records() == records
         assert node.get_parameter_value("bash_image") == committed
         print("PASS source UID fence rejects stale/malformed Apply before SDK mutation and preserves approved scene, receipt, PNG and outputs; legacy empty source set remains valid", flush=True)
@@ -291,7 +325,7 @@ async def exercise(engine, directory):
         failed_save["meta"]["created_at"] = "2026-10-23T01:01:01.001Z-failed-save"
         with mock.patch.object(GriptapeNodes, "handle_request", side_effect=fail_apply_save):
             set_value("bash_image", failed_save)
-            await asyncio.sleep(.05)
+            await await_bash_settled(engine)
         assert node.parameter_output_values["output_image"] == old_output
         assert (len(scalar_sink.events), len(list_sink.events)) == old_events
         assert {path.name:path.read_bytes() for path in directory.glob("run-output*.png")} == old_files
@@ -302,7 +336,7 @@ async def exercise(engine, directory):
         next_apply["meta"]["created_at"] = "2026-10-23T01:01:01.001Z-reapply"
         with mock.patch.object(target, "_busy", side_effect=lambda candidate: candidate is scalar_sink):
             set_value("bash_image", next_apply)
-            await asyncio.sleep(.05)
+            await await_bash_settled(engine)
         assert len(scalar_sink.events) == scalar_events, (scalar_sink.events[scalar_events:], node._hmb_output_pending)
         assert len(list_child_events()) == list_events + 1 and list_child_events()[-1][1]
         assert "연결된 입력" in node.get_parameter_value("HMB_BASH_STATUS")
@@ -324,7 +358,7 @@ async def exercise(engine, directory):
         edge_apply = deepcopy(committed)
         edge_apply["meta"]["created_at"] = "2026-10-23T01:01:01.001Z-edge-change"
         set_value("bash_image", edge_apply)
-        await asyncio.sleep(.05)
+        await await_bash_settled(engine)
         new_output_url = target._url(node.parameter_output_values["output_image"])
         assert all(row[1] != new_output_url for row in list_child_events()[list_event_start:])
         assert node._hmb_output_pending
@@ -363,6 +397,7 @@ async def exercise(engine, directory):
                 ("resolver-descriptor:" + record["source_uid"] + ":" + record["url"]).encode()).hexdigest()
         assert [record["media_signature"] for record in signature_context["records"]] != previous_signatures
         set_value("image_bash_context", signature_context)
+        await await_bash_settled(engine)
         refreshed_signature = deepcopy(node.get_parameter_value("bash_image"))
         assert refreshed_signature["meta"]["konva_json"] == before_signature["meta"]["konva_json"]
         assert refreshed_signature["meta"]["hmb_image_bash"]["apply"] == before_signature["meta"]["hmb_image_bash"]["apply"]
@@ -476,7 +511,8 @@ async def exercise(engine, directory):
         reversed_context["revision"] += 1
         set_inputs(reversed_context["records"])
         set_value("image_bash_context", reversed_context)
-        await asyncio.sleep(.05)
+        await await_bash_settled(engine)
+        await await_bash_settled(engine)
         reordered = node.get_parameter_value("bash_image")
         assert {layer["id"]: (layer["x"], layer["y"], layer["opacity"])
                 for layer in reordered["meta"]["konva_json"]["images"]} == before_positions
@@ -486,7 +522,7 @@ async def exercise(engine, directory):
         reapplied = deepcopy(reordered)
         reapplied["meta"]["created_at"] = "2026-10-23T01:02:02.002Z"
         set_value("bash_image", reapplied)
-        await asyncio.sleep(.05)
+        await await_bash_settled(engine)
         committed = deepcopy(node.get_parameter_value("bash_image"))
 
         # The advanced flag can only publish after the corrected metadata
@@ -543,7 +579,8 @@ async def exercise(engine, directory):
                 record["url"] = str(replacement)
         set_inputs(replaced_context["records"])
         set_value("image_bash_context", replaced_context)
-        await asyncio.sleep(.05)
+        await await_bash_settled(engine)
+        await await_bash_settled(engine)
         stale_modal["meta"]["created_at"] = "2026-10-23T01:04:04.004Z"
         failed_apply = engine.handle_request(SetParameterValueRequest(node_name=node.name,
             parameter_name="bash_image", value=stale_modal, broadcast_result=False))
@@ -597,7 +634,7 @@ async def exercise(engine, directory):
         flow = engine.flow_manager.get_flow_by_name(reopened.flow_name)
         node = flow.nodes[created.node_name]
         assert node is not old_node
-        await asyncio.sleep(.05)
+        await await_bash_settled(engine)
         restored_project = node.get_parameter_value("bash_image")
         assert restored_project == committed, (restored_project, committed)
         assert node.get_parameter_value("comp_on_run") is False
@@ -612,7 +649,7 @@ async def exercise(engine, directory):
             node._clear_output_now()
             node._hmb_restore_pending = True
             node._schedule_restore()
-            await asyncio.sleep(.05)
+            await await_bash_settled(engine)
             assert not missing_path.exists()
             assert node.get_parameter_value("bash_image")["meta"]["hmb_image_bash"]["apply"] == restored_project["meta"]["hmb_image_bash"]["apply"]
             assert node.parameter_output_values.get("output_image") is None
@@ -620,7 +657,7 @@ async def exercise(engine, directory):
         finally:
             parked_path.rename(missing_path)
         node._sync_metadata_with_input_images()
-        await asyncio.sleep(.05)
+        await await_bash_settled(engine)
         assert File(node.parameter_output_values["output_image"].value).read_bytes() == applied_png
         node.process()
         verified_output = File(node.parameter_output_values["output_image"].value)
@@ -641,8 +678,9 @@ async def exercise(engine, directory):
         scene_before_unavailable = deepcopy(node.get_parameter_value("bash_image"))
         saved_files = {path.name: path.read_bytes() for path in directory.glob("run-output*.png")}
         set_value("image_bash_context", unavailable)
+        await await_bash_settled(engine)
         assert node.get_parameter_value("bash_image") == scene_before_unavailable
-        await asyncio.sleep(.05)
+        await await_bash_settled(engine)
         assert File(node.parameter_output_values["output_image"].value).read_bytes() == applied_png
         assert "확인 대기" in node.get_parameter_value("HMB_BASH_STATUS")
         try:
@@ -655,6 +693,7 @@ async def exercise(engine, directory):
         assert node.get_parameter_value("HMB_BASH_VERIFICATION") == {}
         assert {path.name: path.read_bytes() for path in directory.glob("run-output*.png")} == saved_files
         set_value("image_bash_context", ready_context)
+        await await_bash_settled(engine)
         assert node.get_parameter_value("bash_image") == scene_before_unavailable
         node.process()
         assert File(node.parameter_output_values["output_image"].value).read_bytes() == applied_png
@@ -665,9 +704,19 @@ async def exercise(engine, directory):
         foreign_workspace["workspace_id"] = "fixture-other-image-bash-workspace"
         saved_files = {path.name: path.read_bytes() for path in directory.glob("run-output*.png")}
         set_value("image_bash_context", foreign_workspace)
+        await await_bash_settled(engine)
         foreign_envelope = deepcopy(scene_before_unavailable)
         foreign_envelope["meta"]["hmb_image_bash"].update(node._apply_scope())
-        assert node.get_parameter_value("bash_image") == foreign_envelope
+        assert document_matches_current_snapshot(node,node.get_parameter_value("bash_image"),foreign_envelope)
+        # The token allowance cannot conceal an authored scene, receipt,
+        # selected UID or media-path mutation. All other data stays exact.
+        for change in ("scene","receipt","uid","path"):
+            altered=deepcopy(foreign_envelope)
+            if change=="scene":altered["meta"]["konva_json"].setdefault("lines",[]).append({"points":[0,0,1,1]})
+            elif change=="receipt":altered["meta"]["hmb_image_bash"]["apply"]["png_sha256"]="0"*64
+            elif change=="uid":altered["meta"]["input_images"][0]["id"]="foreign-source"
+            else:altered["meta"]["input_images"][0]["url"]="foreign-path"
+            assert not document_matches_current_snapshot(node,node.get_parameter_value("bash_image"),altered)
         try:
             node.process()
         except ValueError as exc:
@@ -677,7 +726,8 @@ async def exercise(engine, directory):
         assert node.parameter_output_values.get("output_image") is None
         assert {path.name: path.read_bytes() for path in directory.glob("run-output*.png")} == saved_files
         set_value("image_bash_context", ready_context)
-        assert node.get_parameter_value("bash_image") == scene_before_unavailable
+        await await_bash_settled(engine)
+        assert document_matches_current_snapshot(node,node.get_parameter_value("bash_image"),scene_before_unavailable)
         node.process()
         verified_output = File(node.parameter_output_values["output_image"].value)
         assert verified_output.read_bytes() == applied_png
@@ -777,8 +827,9 @@ async def exercise(engine, directory):
         source_a.write_bytes(source_bytes_before["fixture-asset-a"])
         set_value("comp_on_run", False)
         set_value("image_bash_context", ready_context)
+        await await_bash_settled(engine)
         set_value("bash_image", restored_project)
-        await asyncio.sleep(.05)
+        await await_bash_settled(engine)
         cancelled_path = directory / "deleted-before-apply.png"
         set_value("output_file", str(cancelled_path))
         pending_apply = node._sync_project(deepcopy(node.get_parameter_value("bash_image")), node._records(), add_missing=False)
@@ -786,7 +837,7 @@ async def exercise(engine, directory):
         pending_apply["meta"]["created_at"] = "2026-10-23T01:06:06.006Z-delete"
         set_value("bash_image", pending_apply)
         send(engine, DeleteNodeRequest(node_name=node.name))
-        await asyncio.sleep(.05)
+        await await_bash_settled(engine)
         assert not cancelled_path.exists()
         assert not ATTEMPTS, ATTEMPTS
         print(json.dumps({"status": "PASS", "scope": "installed SDK synthetic fixtures", "pixel_equal": True,

@@ -9,6 +9,8 @@ import tempfile
 import time
 from types import ModuleType, SimpleNamespace
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _hmb_image_asset_detached_fixture import initialize_detached_image_asset
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "HMBImageAssetLibrary.py"
@@ -40,6 +42,10 @@ PNG_BYTES = png_buffer.getvalue()
 
 
 with tempfile.TemporaryDirectory(prefix="hmb_asset_share_", dir=TEMP_ROOT) as temporary:
+    # Cache writes belong to this test's disposable tree, never the user's
+    # LocalAppData cache (also when run outside the clean-CI environment).
+    asset_library._ASSET_THUMBNAIL_CACHE_ROOT = Path(temporary) / "thumbnail-cache"
+    asset_library._ASSET_CATALOG_INDEX_ROOT = Path(temporary) / "catalog-index"
     catalog_root = Path(temporary) / "catalog"
     project_root = catalog_root / "ProjectA"
     project_root.mkdir(parents=True)
@@ -98,6 +104,7 @@ with tempfile.TemporaryDirectory(prefix="hmb_asset_share_", dir=TEMP_ROOT) as te
     registered_state = asset_library._normalize_state(registered_state)
 
     node = object.__new__(asset_library.HMBImageAssetLibrary)
+    initialize_detached_image_asset(node, asset_library, state=registered_state)
     node._hmb_import_media_by_uid = {}
     node._hmb_last_manifest_poll_error = ""
     node.get_parameter_value = lambda _name: []
@@ -140,16 +147,18 @@ with tempfile.TemporaryDirectory(prefix="hmb_asset_share_", dir=TEMP_ROOT) as te
         asset_library._scan_project_assets = original_scan
 
     poll_node = object.__new__(asset_library.HMBImageAssetLibrary)
+    poll_state = initialize_detached_image_asset(poll_node, asset_library, state=registered_state)
     poll_node._hmb_last_manifest_poll_nonce = ""
     poll_node._hmb_manifest_poll_pending = False
     widget_parameter = SimpleNamespace(name=asset_library.WIDGET_STATE_PARAMETER)
-    poll_payload = dict(registered_state)
+    poll_payload = dict(poll_state)
     poll_payload["__hmb_manifest_poll_nonce"] = "poll-one"
     canonical = poll_node.before_value_set(widget_parameter, json.dumps(poll_payload))
     assert poll_node._hmb_manifest_poll_pending is True
     assert "__hmb_manifest_poll_nonce" not in json.loads(canonical)
 
     no_op_node = object.__new__(asset_library.HMBImageAssetLibrary)
+    refreshed = initialize_detached_image_asset(no_op_node, asset_library, state=refreshed)
     no_op_node._hmb_manifest_poll_received = False
     no_op_node._hmb_manifest_poll_pending = False
     no_op_node._hmb_last_manifest_poll_nonce = ""

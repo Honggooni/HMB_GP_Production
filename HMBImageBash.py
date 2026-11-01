@@ -10,11 +10,17 @@ import base64
 import asyncio
 import contextvars
 from copy import deepcopy
+from collections import OrderedDict
 import hashlib
+import inspect
 from io import BytesIO
 from pathlib import Path
 import sys
+import threading
 from typing import Any
+from types import SimpleNamespace, MethodType
+from urllib.parse import urlparse
+import weakref
 from uuid import uuid4
 
 _ROOT = Path(__file__).resolve().parent
@@ -37,9 +43,14 @@ _StockImageBash = load_builtin_image_bash()
 CONTEXT_SCHEMA = "hmb-image-bash-inputs-v1"
 RECEIPT_SCHEMA = "hmb-image-bash-apply-v1"
 HEADER_PARAMETER = "HMB_IMAGE_BASH_UI"
+PREPARATION_SCHEMA = "hmb-image-bash-preparation-v1"
 _HIDDEN_UI = {"hide": True, "hide_property": True, "hide_label": True,
               "hide_handles": True, "height": 1, "min_height": 0, "max_height": 1}
 _PREPARE_WORKSPACE = "hmb-new-workspace-v1"
+
+
+class _ImageBashSourceError(ValueError):
+    """An input raster could not be freshly read or decoded."""
 
 
 def _hmb_is_registered_node(node: Any, kind: str) -> bool:
@@ -84,6 +95,7 @@ def _hmb_is_palette_creation_metadata(metadata: Any) -> bool:
 def _install_bash_creation_observer(engine: Any) -> None:
     """Observe fresh create results; perform graph work only on a later tick."""
     manager = engine.event_manager
+    _install_bash_initial_value_admission(engine)
     if getattr(manager, "_hmb_bash_creation_observer", None) is not None:
         return
     from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
@@ -131,7 +143,149 @@ def _install_bash_creation_observer(engine: Any) -> None:
         loop.call_soon_threadsafe(lambda: loop.call_later(.01, reconcile, context=contextvars.Context()))
 
     manager.add_post_dispatch_hook(CreateNodeRequest, after_create)
+    from griptape_nodes.retained_mode.events.parameter_events import GetParameterValueRequest
+    def after_header_read(request: Any, result: Any) -> None:
+        # SDK initial_setup can omit both value callbacks and a final header
+        # projection. The native launcher's first header read is a safe lazy
+        # entry point; only queue validation after resolving the current node.
+        if request.parameter_name != HEADER_PARAMETER or not result.succeeded():
+            return
+        try:
+            node = engine.node_manager.get_node_by_name(request.node_name)
+            if (_hmb_is_registered_node(node, "HMBImageBash")
+                    and getattr(node, "_hmb_prepare_phase", None) == "idle"
+                    and not getattr(node, "_hmb_node_deleted", False)):
+                node._publish_header()
+        except (AttributeError, KeyError, RuntimeError, ValueError):
+            return
+    manager.add_post_dispatch_hook(GetParameterValueRequest, after_header_read)
+    manager._hmb_bash_readiness_observer = after_header_read
     manager._hmb_bash_creation_observer = after_create
+
+
+def _install_bash_initial_value_admission(engine: Any) -> None:
+    """Carry actual SDK initial_setup into hooks without trusting document flags.
+
+    The SDK invokes before_value_set even for a saved assignment, before its
+    inputs/connections exist, but does not pass initial_setup to that hook.
+    Keep this request-scoped context on the manager so a library reload cannot
+    leave a wrapper referring to a different module's ContextVar.
+    """
+    from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
+    manager = engine.event_manager
+    mapping = getattr(manager, "_request_type_to_manager", None)
+    if not isinstance(mapping, dict):
+        raise RuntimeError("SDK 파라미터 복원 요청 경계를 확인할 수 없습니다.")
+    original = mapping.get(SetParameterValueRequest)
+    installed = getattr(manager, "_hmb_bash_initial_value_admission", None)
+    if installed is not None and original is installed:
+        return
+    if not callable(original):
+        raise RuntimeError("SDK 파라미터 복원 핸들러를 확인할 수 없습니다.")
+    # Callable handler objects (notably SDK RemoteHandler) have identity-based
+    # dispatch semantics. Preserve them exactly instead of hiding that type in
+    # a plain async function. Transparent foreign function chains remain valid.
+    try:
+        dispatch = inspect.unwrap(original)
+    except ValueError:
+        return
+    if not (inspect.isfunction(dispatch) or inspect.ismethod(dispatch)):
+        return
+    if inspect.ismethod(dispatch) and (dispatch.__self__ is not engine.node_manager
+            or getattr(dispatch.__self__, dispatch.__name__, None) != dispatch):
+        return
+    context = getattr(manager, "_hmb_bash_initial_assignment_context", None)
+    if not isinstance(context, contextvars.ContextVar):
+        context = contextvars.ContextVar("hmb_bash_initial_assignment", default=None)
+        manager._hmb_bash_initial_assignment_context = context
+    def target(request):
+        if request.initial_setup is not True or request.parameter_name != "bash_image":
+            return None
+        try:
+            node = engine.node_manager.get_node_by_name(request.node_name)
+        except (KeyError, ValueError):
+            return None
+        return node if _hmb_is_registered_node(node, "HMBImageBash") else None
+    asynchronous = inspect.iscoroutinefunction(original) or inspect.iscoroutinefunction(getattr(original, "__call__", None))
+    if asynchronous:
+        async def wrapped(request):
+            lease = {"node": target(request), "active": True}
+            token = context.set(lease)
+            try:
+                return await original(request)
+            finally:
+                lease["active"] = False
+                context.reset(token)
+    else:
+        def wrapped(request):
+            lease = {"node": target(request), "active": True}
+            token = context.set(lease)
+            try:
+                return original(request)
+            finally:
+                lease["active"] = False
+                context.reset(token)
+    # Replace only this exact observed handler; do not remove any other SDK
+    # registration or alter the previous handler's signature/result/behavior.
+    if mapping.get(SetParameterValueRequest) is not original:
+        raise RuntimeError("SDK 파라미터 복원 핸들러가 설치 중 변경되었습니다.")
+    mapping[SetParameterValueRequest] = wrapped
+    manager._hmb_bash_initial_value_admission = wrapped
+
+
+def _install_bash_snapshot_header_read(engine: Any) -> None:
+    """Refresh only the small header before its SDK reply is constructed."""
+    from griptape_nodes.retained_mode.events.parameter_events import GetParameterValueRequest, GetParameterValueResultFailure
+    manager = engine.event_manager
+    mapping = getattr(manager, "_request_type_to_manager", None)
+    if not isinstance(mapping, dict):
+        raise RuntimeError("SDK 편집기 상태 읽기 경계를 확인할 수 없습니다.")
+    original = mapping.get(GetParameterValueRequest)
+    if original is getattr(manager, "_hmb_bash_snapshot_header_read", None) and original is not None:
+        return
+    if not callable(original):
+        raise RuntimeError("SDK 편집기 상태 읽기 핸들러를 확인할 수 없습니다.")
+    try:
+        dispatch = inspect.unwrap(original)
+    except ValueError:
+        return
+    if not (inspect.isfunction(dispatch) or inspect.ismethod(dispatch)):
+        return  # Keep RemoteHandler and every special callable-object identity.
+    if inspect.ismethod(dispatch) and (dispatch.__self__ is not engine.node_manager
+            or getattr(dispatch.__self__, dispatch.__name__, None) != dispatch):
+        return
+    def target(request):
+        if request.parameter_name != HEADER_PARAMETER:
+            return None
+        try:
+            node = (engine.node_manager.get_node_by_name(request.node_name) if request.node_name is not None
+                    else engine.context_manager.get_current_node())
+        except (AttributeError, KeyError, ValueError):
+            return None
+        return node if _hmb_is_registered_node(node, "HMBImageBash") else None
+    def before(request):
+        node = target(request)
+        if node is not None and not node._publish_header():
+            return node, GetParameterValueResultFailure(result_details="현재 Bash 편집기 상태를 확인하지 못했습니다. 잠시 후 다시 시도하세요.")
+        return node, None
+    def after(node, result):
+        if (node is not None and result.succeeded()
+                and result.value != node.get_parameter_value(HEADER_PARAMETER)):
+            return GetParameterValueResultFailure(result_details="Bash 편집기 상태가 변경되었습니다. 최신 상태로 다시 시도하세요.")
+        return result
+    asynchronous = inspect.iscoroutinefunction(original) or inspect.iscoroutinefunction(getattr(original, "__call__", None))
+    if asynchronous:
+        async def wrapped(request):
+            node, failure = before(request)
+            return failure if failure is not None else after(node, await original(request))
+    else:
+        def wrapped(request):
+            node, failure = before(request)
+            return failure if failure is not None else after(node, original(request))
+    if mapping.get(GetParameterValueRequest) is not original:
+        raise RuntimeError("SDK 편집기 상태 핸들러가 설치 중 변경되었습니다.")
+    mapping[GetParameterValueRequest] = wrapped
+    manager._hmb_bash_snapshot_header_read = wrapped
 
 
 def _document(value: Any) -> dict:
@@ -246,9 +400,25 @@ class HMBImageBash(_StockImageBash):
         self._hmb_output_delivered = {}
         self._hmb_restore_pending = False
         self._hmb_restore_scheduled = False
+        self._hmb_cold_readiness_scheduled = False
+        self._hmb_cold_input_gap = False
+        self._hmb_cold_gap_admitted = False
+        self._hmb_cold_gap_recovery = None
         self._hmb_inputs_unready = False
+        self._hmb_prepare_phase = "idle"
+        self._hmb_prepare_error = ""
+        self._hmb_editor_snapshot_id = ""
+        self._hmb_snapshot_republish_pending = None
         self._hmb_value_callback_depth = 0
         self._hmb_apply_epoch = 0
+        self._hmb_apply_pending = None
+        self._hmb_prepare_pending = None
+        self._hmb_cold_restore_pending = None
+        self._hmb_apply_rollback_document = None
+        self._hmb_apply_prior_receipt = None
+        self._hmb_apply_rgba_cache = None
+        self._hmb_apply_work = {"lock": threading.RLock(), "active": False, "queued": None,
+                                "completed": None, "publish_scheduled": False}
         self._hmb_auto_workspace_pending = False
         self._hmb_user_binding_interacted = False
         self.set_parameter_value("comp_on_run", False)
@@ -258,6 +428,11 @@ class HMBImageBash(_StockImageBash):
             name: deepcopy(self.get_parameter_value(name))
             for name in ("canvas_size", "width", "height", "background_color", "comp_on_run", "output_file")
         }
+        # Required for lossless pending-draft restoration. An unsupported SDK
+        # must fail node creation visibly, allowing its saved-value proxy,
+        # rather than silently discarding a document during later hydration.
+        _install_bash_initial_value_admission(self.engine)
+        _install_bash_snapshot_header_read(self.engine)
         try:
             _install_bash_creation_observer(self.engine)
         except (AttributeError, RuntimeError):
@@ -361,14 +536,81 @@ class HMBImageBash(_StockImageBash):
                 return node
         return None
 
-    def _publish_header(self) -> None:
+    def _editor_preparation(self, context: Any, sources: list[tuple[Any, dict]], bound: Any) -> dict:
+        """Small readiness projection; never read pixels or mutate the scene here.
+
+        ImageAsset may retain the previous records while checking a new
+        revision. Requested counts come from its current catalog/context, not
+        those retained records. Browser decoding is a separate modal stage.
+        """
+        context = context if isinstance(context, dict) else {}
+        metadata = self.metadata if isinstance(self.metadata, dict) else {}
+        workspace = str(metadata.get("hmb_image_bash_workspace_id") or context.get("workspace_id") or "")
+        catalog = next((value for node, value in sources if node is bound), {})
+        requested = next((row for row in catalog.get("workspaces", []) if row.get("workspace_id") == workspace), {})
+        def integer(value: Any) -> int | None:
+            return value if type(value) is int and value >= 0 else None
+        context_revision = integer(context.get("revision"))
+        revision = integer(requested.get("revision"))
+        if revision is None:
+            revision = context_revision if context_revision is not None else 0
+        count = integer(requested.get("count"))
+        if count is None:
+            count = integer(context.get("requested_count"))
+        records = context.get("records")
+        records = records if isinstance(records, list) else []
+        phase, error = "idle", ""
+        meta, hmb = {}, {}
+        prepared = 0
+        if workspace:
+            phase = "preparing"
+            if context.get("ready") is False:
+                if context.get("preparation_phase") == "error":
+                    phase, error = "error", str(context.get("error") or "이미지 원본을 확인할 수 없습니다.")
+            elif context.get("schema") == CONTEXT_SCHEMA and context_revision == revision:
+                if self._hmb_prepare_phase == "error":
+                    phase, error = "error", self._hmb_prepare_error
+                elif self._hmb_prepare_phase == "ready":
+                    try:
+                        project = _document(self.get_parameter_value("bash_image"))
+                        meta = project.get("meta", {})
+                        hmb = meta.get("hmb_image_bash", {}) if isinstance(meta, dict) else None
+                        if not isinstance(hmb, dict):
+                            raise ValueError("Invalid editor metadata")
+                    except (TypeError, ValueError, AttributeError):
+                        phase, error, hmb = "error", "편집기 장면 정보를 확인할 수 없습니다. 입력을 다시 확인하세요.", {}
+                    actual = [_url(item) for item in _flatten(self.get_parameter_value("input_images"))]
+                    expected = [str(row.get("url", "")) for row in records if isinstance(row, dict)]
+                    if (phase != "error" and context.get("workspace_id") == workspace and len(expected) == len(records) and actual == expected
+                            and (count is None or count == len(records))
+                            and hmb.get("workspace_id") == workspace and hmb.get("workspace_revision") == revision
+                            and hmb.get("channel_uuid") == metadata.get("hmb_image_bash_channel_uuid")
+                            and hmb.get("node_instance_uuid") == self._remote_source_instance(self)
+                            and isinstance(hmb.get("prepared_source_hashes"), dict)):
+                        phase, prepared = "ready", len(records)
+                        if count is None:
+                            count = prepared
+        snapshot = hmb.get("editor_snapshot_id", "")
+        if (not isinstance(snapshot, str) or snapshot != getattr(self, "_hmb_editor_snapshot_id", "")):
+            snapshot = ""
+        commit = meta.get("created_at") if isinstance(meta, dict) else None
+        return {"schema": PREPARATION_SCHEMA, "phase": phase, "ready": phase in {"idle", "ready"},
+            "workspace_id": workspace, "workspace_revision": revision,
+            "channel_uuid": str(metadata.get("hmb_image_bash_channel_uuid") or ""),
+            "node_instance_uuid": self._remote_source_instance(self), "requested_count": count,
+            "prepared_count": prepared, "error": error[:1024],
+            "editor_snapshot_id": snapshot, "editor_commit": commit if isinstance(commit, str) else None}
+
+    def _publish_header(self) -> bool:
         if getattr(self, "_hmb_header_publishing", True):
-            return
+            return False
         self._hmb_header_publishing = True
         try:
             sources = self._remote_sources()
             bound = self._remote_bound_source(sources)
             context = self.get_parameter_value("image_bash_context") or {}
+            self._queue_saved_editor_readiness(context, sources, bound)
+            preparation = self._editor_preparation(context, sources, bound)
             projection = {"schema": "hmb-image-bash-header-v1", "sources": [
                 {"id": node.name, "label": f"{node.name} · {workspace.get('name', 'HMBImageBash')}",
                  "workspace_id": workspace["workspace_id"]}
@@ -376,7 +618,9 @@ class HMBImageBash(_StockImageBash):
                     [{"workspace_id": _PREPARE_WORKSPACE, "name": "새 이미지 작업 공간"}])],
                 "source_instances": {node.name: self._remote_source_instance(node)
                     for node, catalog in sources},
-                "bound_source": bound.name if bound else "", "image_count": len(context.get("records", [])),
+                "bound_source": bound.name if bound else "",
+                "image_count": (preparation["requested_count"] if preparation["requested_count"] is not None
+                                else len(context.get("records", []))), "preparation": preparation,
                 "status": self.get_parameter_value("HMB_BASH_STATUS") or "이미지 라이브러리를 선택하세요",
                 # Execution state is transient; the native widget disabled prop
                 # owns it. Persisting RESOLVING here can strand the selector.
@@ -387,12 +631,172 @@ class HMBImageBash(_StockImageBash):
             if self.get_parameter_value(HEADER_PARAMETER) != projection:
                 self.set_parameter_value(HEADER_PARAMETER, projection)
                 self.publish_update_to_parameter(HEADER_PARAMETER, projection)
+            # Native Get gives a serialized output cache precedence over the
+            # property map. Do not let a saved UI-only cache hide this header.
+            if HEADER_PARAMETER in self.parameter_output_values:
+                self.parameter_output_values[HEADER_PARAMETER] = projection
+            return True
         except Exception:
             # Native construction/restoration precedes registration in a flow.
             # Refresh and the next input update retry once registration exists.
-            pass
+            return False
         finally:
             self._hmb_header_publishing = False
+
+    def _queue_saved_editor_readiness(self, context: Any, sources: list[tuple[Any, dict]], bound: Any) -> None:
+        """Initial SDK hydration skips callbacks; verify a saved Apply on a tick.
+
+        Header projection remains metadata-only. The existing restore verifier
+        performs source/receipt/PNG checks after registration and real input
+        connections are available, without Run or new rendering/writing.
+        """
+        recovery = getattr(self, "_hmb_cold_gap_recovery", None)
+        recover_gap = self._hmb_prepare_phase == "error" and isinstance(recovery, dict)
+        if ((self._hmb_prepare_phase != "idle" and not recover_gap) or bound is None or not isinstance(context, dict)
+                or context.get("schema") != CONTEXT_SCHEMA or context.get("ready") is not True
+                or getattr(self, "_hmb_cold_readiness_scheduled", False)
+                or self._hmb_node_deleted or not _hmb_is_registered_node(self, "HMBImageBash")):
+            return
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        if GriptapeNodes.NodeManager().get_node_by_name(self.name) is not self:
+            return
+        try:
+            project = _document(self.get_parameter_value("bash_image"))
+        except (TypeError, ValueError, AttributeError):
+            self._hmb_prepare_phase = "error"
+            self._hmb_prepare_error = "편집기 장면 정보를 확인할 수 없습니다. 저장본을 확인하세요."
+            return
+        meta = project.get("meta", {})
+        hmb = meta.get("hmb_image_bash", {}) if isinstance(meta, dict) else {}
+        if not isinstance(hmb, dict):
+            self._hmb_prepare_phase = "error"
+            self._hmb_prepare_error = "편집기 장면 정보 형식이 올바르지 않습니다. 저장본을 확인하세요."
+            return
+        receipt = hmb.get("apply") if isinstance(hmb, dict) else None
+        retained = isinstance(receipt, dict) and bool(receipt)
+        pending = hmb.get("pending_apply")
+        saved_draft = (isinstance(pending, dict) and pending.get("schema") == "hmb-image-bash-pending-apply-v1"
+                       and isinstance(pending.get("editor_commit"), str) and bool(pending["editor_commit"])
+                       and pending.get("editor_commit") == meta.get("created_at"))
+        preparing = hmb.get("pending_prepare")
+        scope = self._apply_scope()
+        saved_preparing = (isinstance(preparing, dict)
+            and preparing.get("schema") == "hmb-image-bash-pending-prepare-v1"
+            and preparing.get("scope") == {key: scope[key] for key in ("workspace_id", "channel_uuid", "workspace_revision")}
+            and isinstance(preparing.get("source_uids"), list)
+            and all(isinstance(uid, str) and uid for uid in preparing["source_uids"]))
+        if preparing is not None and not saved_preparing:
+            self._hmb_prepare_phase, self._hmb_prepare_error = "error", "저장된 입력 준비 정보가 현재 연결과 다릅니다."
+            return
+        if pending is not None and not saved_draft:
+            self._hmb_prepare_phase, self._hmb_prepare_error = "error", "저장된 Apply 대기 정보가 올바르지 않습니다."
+            return
+        valid_digest = lambda value: (isinstance(value, str) and len(value) == 64
+                                      and all(char in "0123456789abcdef" for char in value))
+        if retained and (receipt.get("schema") != RECEIPT_SCHEMA
+                         or not isinstance(receipt.get("editor_commit"), str) or not receipt["editor_commit"]
+                         or (receipt.get("editor_commit") != meta.get("created_at") and not (saved_draft or saved_preparing))
+                         or not all(valid_digest(receipt.get(key)) for key in ("scene_sha256", "png_sha256", "rgba_sha256"))
+                         or any(type(receipt.get(key)) is not int or receipt[key] <= 0 for key in ("width", "height"))
+                         or not isinstance(receipt.get("source_hashes"), dict)
+                         or not isinstance(receipt.get("png_base64"), str) or not receipt["png_base64"]):
+            self._hmb_prepare_phase = "error"
+            self._hmb_prepare_error = "저장된 Apply 검증 정보가 올바르지 않습니다. 저장본을 확인하세요."
+            return
+        if saved_draft or saved_preparing:
+            # The editor closed while validation was pending. Preserve the new
+            # scene and the old embedded receipt/PNG as a draft, never approval.
+            retained = False
+        if (not scope["workspace_id"] or not scope["channel_uuid"]
+                or self.metadata.get("hmb_image_bash_workspace_id") != scope["workspace_id"]
+                or (not saved_preparing and any(key in hmb and hmb[key] != scope[key]
+                       for key in ("workspace_id", "channel_uuid", "workspace_revision")))):
+            self._hmb_prepare_phase = "error"
+            self._hmb_prepare_error = "저장된 작업 공간·연결·입력 버전이 현재 상태와 다릅니다. 연결을 확인하세요."
+            return
+        catalog = next((value for node, value in sources if node is bound), {})
+        current = next((row for row in catalog.get("workspaces", [])
+                        if row.get("workspace_id") == scope["workspace_id"]), {})
+        if current.get("revision") != scope["workspace_revision"]:
+            return
+        try:
+            records = self._records()
+        except (TypeError, ValueError):
+            return
+        if current.get("count") != len(records):
+            return
+        if saved_preparing and preparing["source_uids"] != [row["source_uid"] for row in records]:
+            self._hmb_prepare_phase, self._hmb_prepare_error = "error", "저장된 입력 준비의 이미지 ID가 현재 목록과 다릅니다."
+            return
+        try:
+            prior_scope = {**scope, "node_instance_uuid": hmb.get("node_instance_uuid")}
+            if not saved_preparing:
+                self._validate_apply_source_bindings(project, records, expected_scope=prior_scope)
+            if retained and receipt["scene_sha256"] != scene_fingerprint(project, records, self._canvas()):
+                # A changed authored scene/source list is a saved draft. Keep
+                # its old receipt untouched and never publish its old pixels.
+                retained = False
+        except (TypeError, ValueError) as exc:
+            self._hmb_prepare_phase, self._hmb_prepare_error = "error", str(exc)
+            self._hmb_cold_gap_recovery = None
+            return
+        if recover_gap:
+            # Connection reconstruction can pass empty source values before
+            # initial saved assignments. Only that pristine gap, followed by
+            # a real initial saved Apply, can enter the existing verifier once.
+            self._hmb_cold_gap_recovery = None
+            self._hmb_cold_input_gap = False
+            if (not retained or saved_draft or saved_preparing
+                    or recovery.get("epoch") != self._hmb_apply_epoch
+                    or recovery.get("identity") != self._cold_gap_saved_identity(project)
+                    or self._hmb_last_output is not None):
+                return
+        self._hmb_prepare_phase, self._hmb_prepare_error = "preparing", ""
+        self._hmb_restore_pending = retained
+        self._hmb_cold_readiness_scheduled = True
+        epoch, source_instance = self._hmb_apply_epoch, self._remote_source_instance(bound)
+        def complete() -> None:
+            try:
+                self._complete_cold_editor_readiness(scope, bound, source_instance, epoch, retained)
+            finally:
+                self._hmb_cold_readiness_scheduled = False
+        if not self._schedule_host_callback(complete):
+            self._hmb_cold_readiness_scheduled = False
+            self._hmb_prepare_phase = "error"
+            self._hmb_prepare_error = "저장본 준비에 필요한 호스트 이벤트 루프를 확인하세요."
+
+    @hmb_binding_mutation
+    def _complete_cold_editor_readiness(self, scope: dict, source: Any, source_instance: str,
+                                      epoch: int, retained: bool) -> None:
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        if (self._hmb_node_deleted or epoch != self._hmb_apply_epoch
+                or not _hmb_is_registered_node(self, "HMBImageBash")
+                or GriptapeNodes.NodeManager().get_node_by_name(self.name) is not self):
+            return
+        try:
+            if self._apply_scope() != scope or self.metadata.get("hmb_image_bash_workspace_id") != scope["workspace_id"]:
+                raise ValueError("작업 공간이 변경되어 저장본 준비를 중단했습니다. 연결을 확인하세요.")
+            sources = self._remote_sources()
+            if self._remote_bound_source(sources) is not source or self._remote_source_instance(source) != source_instance:
+                raise ValueError("이미지 연결이 변경되어 저장본 준비를 중단했습니다. 연결을 확인하세요.")
+            catalog = next((value for node, value in sources if node is source), {})
+            current = next((row for row in catalog.get("workspaces", [])
+                            if row.get("workspace_id") == scope["workspace_id"]), {})
+            records = self._records()
+            if current.get("revision") != scope["workspace_revision"] or current.get("count") != len(records):
+                raise ValueError("이미지 입력 버전이 변경되었습니다. 입력 준비를 다시 확인하세요.")
+            project = _document(self.get_parameter_value("bash_image"))
+            if retained:
+                self._restore_saved_output(project, records)
+                if self._hmb_cold_restore_pending is not None:
+                    return
+                if self._hmb_prepare_phase != "ready":
+                    raise ValueError(str(self.get_parameter_value("HMB_BASH_STATUS") or "저장된 Apply를 확인하지 못했습니다."))
+            else:
+                self._sync_metadata_with_input_images(force_draft=True)
+        except Exception as exc:
+            self._hmb_prepare_phase, self._hmb_prepare_error = "error", str(exc)
+            self._status("저장본 준비 실패: " + str(exc))
 
     def _header_command(self, value: Any) -> None:
         request = value.get("hmb_image_bash_command", {}) if isinstance(value, dict) else {}
@@ -404,6 +808,32 @@ class HMBImageBash(_StockImageBash):
                 # into an edit, invalidating a retained Apply unnecessarily.
                 # Input changes, Apply and Run retain their full validation.
                 self._hmb_try_auto_workspace()
+                return
+            if operation == "retry_inputs":
+                if bool(getattr(self, "lock", False)) or _busy(self):
+                    raise ValueError("노드 실행을 마치고 편집 잠금을 해제하세요.")
+                sources = self._remote_sources()
+                source = self._remote_bound_source(sources)
+                context = self.get_parameter_value("image_bash_context") or {}
+                if (source is None or request.get("source_node_name") != source.name
+                        or request.get("workspace_id") != context.get("workspace_id")
+                        or request.get("source_instance_id") != self._remote_source_instance(source)):
+                    raise ValueError("리모트 작업 공간이 변경되었습니다. 현재 연결을 다시 확인하세요.")
+                retry = getattr(source, "_hmb_retry_image_bash_inputs", None)
+                if not callable(retry):
+                    raise ValueError("이미지 라이브러리에서 원본을 다시 확인하세요.")
+                self._hmb_prepare_phase, self._hmb_prepare_error = "preparing", ""
+                self._status("작업 준비 중 · 이미지 원본을 다시 확인합니다")
+                intent = {"source": source, "workspace_id": context["workspace_id"],
+                          "channel_uuid": self.metadata.get("hmb_image_bash_channel_uuid")}
+                self._hmb_snapshot_republish_pending = intent
+                try:
+                    retry(self, context["workspace_id"])
+                    self._sync_metadata_with_input_images()
+                except Exception:
+                    if self._hmb_snapshot_republish_pending is intent:
+                        self._hmb_snapshot_republish_pending = None
+                    raise
                 return
             if operation not in {"bind", "unbind"}:
                 raise ValueError("지원하지 않는 리모트 연결 요청입니다.")
@@ -463,8 +893,22 @@ class HMBImageBash(_StockImageBash):
         self.publish_update_to_parameter("HMB_BASH_STATUS", text)
         self._publish_header()
 
-    def _clear_output(self) -> None:
+    def _clear_output(self, *, preserve_initial_gap: bool = False) -> None:
+        if not preserve_initial_gap:
+            self._hmb_cold_input_gap = False
+            self._hmb_cold_gap_recovery = None
         self._hmb_apply_epoch += 1
+        if preserve_initial_gap and isinstance(getattr(self, "_hmb_cold_gap_recovery", None), dict):
+            self._hmb_cold_gap_recovery["epoch"] = self._hmb_apply_epoch
+        self._hmb_apply_pending = None
+        self._hmb_prepare_pending = None
+        self._hmb_cold_restore_pending = None
+        self._hmb_apply_rollback_document = None
+        work = getattr(self, "_hmb_apply_work", None)
+        if isinstance(work, dict):
+            with work["lock"]:
+                work["queued"] = None
+                work["completed"] = None
         epoch = self._hmb_apply_epoch
         if self._hmb_value_callback_depth:
             if not self._schedule_host_callback(lambda: self._clear_output_now() if epoch == self._hmb_apply_epoch and not self._hmb_node_deleted else None):
@@ -473,7 +917,7 @@ class HMBImageBash(_StockImageBash):
         self._clear_output_now()
 
     @hmb_binding_mutation
-    def _clear_output_now(self) -> None:
+    def _clear_output_now(self, *, preserve_verification: bool = False) -> None:
         self._hmb_output_generation += 1
         self._hmb_output_delivered = {}
         # Invalidate the source locally without retracting a previously
@@ -481,8 +925,9 @@ class HMBImageBash(_StockImageBash):
         self.set_parameter_value("output_image", None, emit_change=False)
         self.parameter_output_values["output_image"] = None
         self.publish_update_to_parameter("output_image", None)
-        self.set_parameter_value("HMB_BASH_VERIFICATION", {})
-        self.parameter_output_values["HMB_BASH_VERIFICATION"] = {}
+        if not preserve_verification:
+            self.set_parameter_value("HMB_BASH_VERIFICATION", {})
+            self.parameter_output_values["HMB_BASH_VERIFICATION"] = {}
 
     @staticmethod
     def _schedule_host_callback(callback: Any) -> bool:
@@ -595,10 +1040,21 @@ class HMBImageBash(_StockImageBash):
                 "workspace_id": context.get("workspace_id") if isinstance(context, dict) else None}
 
     def _set_project(self, project: dict) -> None:
+        # A small host-owned coherence token lets the native launcher use its
+        # already-delivered document, avoiding another multi-MB RPC read.
+        # HMB metadata is excluded from the rendered scene/receipt fingerprint.
+        project = deepcopy(project)
+        snapshot = str(uuid4())
+        project.setdefault("meta", {}).setdefault("hmb_image_bash", {})["editor_snapshot_id"] = snapshot
         previous = self._hmb_syncing
         self._hmb_syncing = True
         try:
-            self.set_parameter_value("bash_image", project)
+            # One explicit UI publication below is sufficient. Lifecycle
+            # emission here would serialize the same multi-MB saved Apply
+            # document again; hooks/storage still run with emit_change=False.
+            self.set_parameter_value("bash_image", project, emit_change=False)
+            self._hmb_editor_snapshot_id = snapshot
+            self._publish_header()
             self.publish_update_to_parameter("bash_image", project)
         finally:
             self._hmb_syncing = previous
@@ -608,6 +1064,16 @@ class HMBImageBash(_StockImageBash):
         # file:// launches the native editor's lossy preview conversion. Mint
         # the original-file URL through the SDK's existing local storage driver
         # so the canvas receives full-quality source bytes, on Windows/UNC too.
+        editor_records = self._editor_records(records)
+        def create(record, index):
+            return self._create_konva_layer(record, index, canvas["width"], canvas["height"])
+        updated = sync_scene(project, editor_records, create, add_missing=add_missing)
+        hmb = updated.setdefault("meta", {}).setdefault("hmb_image_bash", {})
+        hmb.update(self._apply_scope())
+        return updated
+
+    @staticmethod
+    def _editor_records(records: list[dict]) -> list[dict]:
         editor_records = deepcopy(records)
         for record in editor_records:
             url = record.get("url", "")
@@ -618,38 +1084,42 @@ class HMBImageBash(_StockImageBash):
                 if not isinstance(driver, LocalStorageDriver):
                     raise ValueError("ImageAsset 원본을 제공할 로컬 파일 서비스를 확인하세요.")
                 record["url"] = driver.create_signed_download_url(Path(File(url).resolve()))
-        def create(record, index):
-            return self._create_konva_layer(record, index, canvas["width"], canvas["height"])
-        updated = sync_scene(project, editor_records, create, add_missing=add_missing)
-        hmb = updated.setdefault("meta", {}).setdefault("hmb_image_bash", {})
-        hmb.update(self._apply_scope())
-        return updated
+        return editor_records
 
-    def _sync_metadata_with_input_images(self) -> None:
+    def _sync_metadata_with_input_images(self, *, force_draft: bool = False) -> None:
         if self._hmb_syncing or getattr(self, "_initializing", False):
             return
         context = self.get_parameter_value("image_bash_context") or {}
+        self._hmb_cold_gap_recovery = None
+        self._hmb_cold_input_gap = False
         cached = self._hmb_last_output
-        if (isinstance(context, dict) and context.get("ready") is False
-                and isinstance(cached, dict) and context.get("workspace_id") == cached.get("workspace_id")):
+        if isinstance(context, dict) and context.get("ready") is False:
             # Keep the previously completed result while this workspace is
             # revalidated. _records still rejects Run and new Apply until the
             # producer publishes ready=True; no old result is re-emitted.
             self._hmb_inputs_unready = True
-            self._status("이미지 원본 확인 대기 · 이전 완료 결과 유지")
+            self._hmb_prepare_phase = "error" if context.get("preparation_phase") == "error" else "preparing"
+            self._hmb_prepare_error = str(context.get("error") or "") if self._hmb_prepare_phase == "error" else ""
+            if isinstance(cached, dict) and context.get("workspace_id") != cached.get("workspace_id"):
+                self._clear_output()
+            self._status(self._hmb_prepare_error or "작업 준비 중 · 이미지 원본 확인 대기")
             return
         self._hmb_inputs_unready = False
+        self._hmb_prepare_phase, self._hmb_prepare_error = "preparing", ""
         try:
             records = self._records()
             project = _document(self.get_parameter_value("bash_image"))
+            if self._queue_prepare(project, records, force_draft=force_draft):
+                return
             updated = self._sync_project(project, records)
             hmb = updated.setdefault("meta", {}).setdefault("hmb_image_bash", {})
             if updated != project or "prepared_source_hashes" not in hmb:
                 hmb["prepared_source_hashes"] = self._source_hashes(updated)
             if updated != project:
                 self._set_project(updated)
+            self._hmb_prepare_phase = "ready"
             receipt = updated.get("meta", {}).get("hmb_image_bash", {}).get("apply")
-            if not receipt or receipt.get("scene_sha256") != scene_fingerprint(updated, records, self._canvas()):
+            if force_draft or not receipt or receipt.get("scene_sha256") != scene_fingerprint(updated, records, self._canvas()):
                 self._clear_output()
                 self._status("입력이 변경되었습니다 · 편집기에서 Apply 필요")
             elif self._hmb_restore_pending:
@@ -657,7 +1127,23 @@ class HMBImageBash(_StockImageBash):
             elif receipt and self._hmb_last_output and not self._hmb_output_pending:
                 self._status("Apply 저장 및 이미지 출력 완료")
         except Exception as exc:
+            pristine_gap = (not isinstance(context, dict) or context.get("schema") != CONTEXT_SCHEMA)
+            if pristine_gap:
+                try:
+                    pristine_gap = (self._hmb_last_output is None and self._hmb_apply_pending is None
+                        and self._hmb_prepare_pending is None and self._hmb_cold_restore_pending is None
+                        and _document(self.get_parameter_value("bash_image")) == self._hmb_auto_pristine_project
+                        and not getattr(self, "_hmb_cold_gap_admitted", False))
+                except (AttributeError, TypeError, ValueError):
+                    pristine_gap = False
+            actual = [_url(item) for item in _flatten(self.get_parameter_value("input_images"))]
+            records = context.get("records") if isinstance(context, dict) else None
+            staging = (isinstance(records, list) and all(isinstance(row, dict) for row in records)
+                       and actual != [str(row.get("url", "")) for row in records])
+            self._hmb_prepare_phase = "preparing" if staging else "error"
+            self._hmb_prepare_error = "" if staging else str(exc)
             self._clear_output()
+            self._hmb_cold_input_gap = pristine_gap
             self._status(str(exc))
         finally:
             self._publish_header()
@@ -668,22 +1154,199 @@ class HMBImageBash(_StockImageBash):
     def _handle_input_images_removed(self) -> None:
         self._sync_metadata_with_input_images()
 
-    def _source_hashes(self, project: dict, *, cache: dict | None = None) -> dict:
+    def _queue_prepare(self, project: dict, records: list[dict], *, force_draft: bool = False) -> bool:
+        """Snapshot graph state; defer dimensions and all-raster checks off host."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        from griptape_nodes.retained_mode.engine import has_current_engine
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        if (not has_current_engine() or not loop.is_running()
+                or GriptapeNodes.NodeManager().get_node_by_name(self.name) is not self):
+            return False
+        canvas, scope = self._canvas(), self._apply_scope()
+        connections = self._apply_connection_lease()
+        republish = getattr(self, "_hmb_snapshot_republish_pending", None)
+        if republish is not None and (republish["workspace_id"] != scope["workspace_id"]
+                or republish["channel_uuid"] != scope["channel_uuid"]
+                or not any(edge[0] is republish["source"] for edge in connections)):
+            self._hmb_snapshot_republish_pending = republish = None
+        apply = self._hmb_apply_pending
+        if apply is not None and not force_draft and republish is None and self._apply_task_current(apply):
+            # Resolving the upstream node may re-publish the identical input
+            # while Apply is pending. It must not cancel that accepted edit.
+            self._hmb_prepare_phase, self._hmb_prepare_error = "ready", ""
+            return True
+        preparing = self._hmb_prepare_pending
+        if (preparing is not None and self._apply_task_current(preparing)
+                and (not force_draft or preparing.get("force_draft"))
+                and preparing.get("republish_snapshot") is republish):
+            return True
+        editor_records = self._editor_records(records)
+        read_paths = self._snapshot_read_paths(project, records=editor_records)
+        if read_paths is None:
+            return False
+        # Keep old geometry/brushes and completed PNG while the newest source
+        # list is checked. This marker authorizes no output; cold restoration
+        # revalidates the actual source list and reconciles it as a draft.
+        hmb = project.setdefault("meta", {}).setdefault("hmb_image_bash", {})
+        if (any(hmb.get(key) != scope[key] for key in ("workspace_id", "channel_uuid", "workspace_revision"))
+                or [row.get("source_uid") for row in hmb.get("source_bindings", [])]
+                    != [row["source_uid"] for row in records]):
+            hmb["pending_prepare"] = {"schema": "hmb-image-bash-pending-prepare-v1",
+                "scope": {key: scope[key] for key in ("workspace_id", "channel_uuid", "workspace_revision")},
+                "source_uids": [row["source_uid"] for row in records]}
+            self._set_project(project)
+        self._hmb_apply_epoch += 1
+        self._hmb_apply_pending = None
+        self._hmb_cold_restore_pending = None
+        self._hmb_apply_rollback_document = None
+        task = {"kind": "prepare", "epoch": self._hmb_apply_epoch, "project": deepcopy(project),
+            "force_draft": force_draft,
+            "republish_snapshot": republish,
+            "records": deepcopy(records), "editor_records": editor_records,
+            "canvas": canvas, "scope": scope, "read_paths": read_paths,
+            "read_drivers": self._snapshot_driver_lease(read_paths),
+            "scene": scene_fingerprint(project, records, canvas), "png_url": _url(project),
+            "context": deepcopy(self.get_parameter_value("image_bash_context") or {}),
+            "connections": connections}
+        self._hmb_prepare_pending = task
+        self._hmb_prepare_phase, self._hmb_prepare_error = "preparing", ""
+        self._status("작업 준비 중 · 이미지 원본과 편집 장면 확인")
+        return self._start_snapshot_task(task, loop)
+
+    @staticmethod
+    def _calculate_prepare(task: dict, is_live) -> dict:
+        rgba_cache, source_cache = OrderedDict(), {}
+        read = lambda url: HMBImageBash._snapshot_read(task, url)
+        # Hash/decode each URL once in this stage. A new layer obtains its
+        # dimensions from the same verified raster, never a fallback 400x300.
+        def dimensions(url):
+            probe = {"meta": {"input_images": [{"id": "dimensions", "url": url}]}}
+            info = HMBImageBash._source_hashes(None, probe, cache=source_cache,
+                rgba_cache=rgba_cache, is_live=is_live, read_bytes=read)["input:dimensions"]
+            return info["width"], info["height"]
+        view = SimpleNamespace(_get_image_dimensions=dimensions)
+        view._calculate_image_fit_and_position = MethodType(_StockImageBash._calculate_image_fit_and_position, view)
+        def create(record, index):
+            return _StockImageBash._create_konva_layer(view, record, index,
+                task["canvas"]["width"], task["canvas"]["height"])
+        updated = sync_scene(task["project"], task["editor_records"], create)
+        hmb = updated.setdefault("meta", {}).setdefault("hmb_image_bash", {})
+        hmb.update(task["scope"])
+        hmb.pop("pending_prepare", None)
+        hashes = HMBImageBash._source_hashes(None, updated, cache=source_cache,
+            rgba_cache=rgba_cache, is_live=is_live, read_bytes=read)
+        hmb["prepared_source_hashes"] = hashes
+        if not is_live():
+            raise ValueError("새 입력으로 이전 이미지 준비가 취소되었습니다.")
+        return {"project": updated, "rgba_cache": rgba_cache, "hashes": hashes}
+
+    @hmb_binding_mutation
+    def _finish_prepare(self, task: dict, result: dict) -> bool:
+        if not self._apply_task_current(task):
+            self._discard_apply_task(task)
+            return False
+        if not result.get("error"):
+            try:
+                current_hashes = self._source_hashes(result["project"], rgba_cache=result["rgba_cache"])
+                if current_hashes != result["hashes"]:
+                    raise _ImageBashSourceError("준비 중 이미지 원본이 변경되었습니다. 다시 준비하세요.")
+            except Exception as exc:
+                result = {"error": str(exc)}
+        if not self._apply_task_current(task):
+            self._discard_apply_task(task)
+            return False
+        self._hmb_prepare_pending = None
+        if result.get("error"):
+            self._hmb_prepare_phase, self._hmb_prepare_error = "error", result["error"]
+            self._status("입력 준비 실패: " + result["error"] + " · 기존 편집과 완료 결과는 유지됩니다. 다시 준비하세요.")
+            return False
+        current = _document(self.get_parameter_value("bash_image"))
+        updated = result["project"]
+        if "viewport" in current.get("meta", {}):
+            updated["meta"]["viewport"] = deepcopy(current["meta"]["viewport"])
+        else:
+            updated["meta"].pop("viewport", None)
+        for key in ("id", "reference"):
+            if key in current:
+                updated[key] = deepcopy(current[key])
+            else:
+                updated.pop(key, None)
+        snapshot = getattr(self, "_hmb_editor_snapshot_id", "")
+        republish = task.get("republish_snapshot")
+        force_snapshot = republish is not None and republish is getattr(self, "_hmb_snapshot_republish_pending", None)
+        if (force_snapshot or updated != current or not snapshot
+                or updated.get("meta", {}).get("hmb_image_bash", {}).get("editor_snapshot_id") != snapshot):
+            self._set_project(updated)
+        if force_snapshot:
+            self._hmb_snapshot_republish_pending = None
+        self._hmb_prepare_phase, self._hmb_prepare_error = "ready", ""
+        receipt = updated.get("meta", {}).get("hmb_image_bash", {}).get("apply")
+        if (task.get("force_draft") or not receipt or receipt.get("scene_sha256") != scene_fingerprint(updated, self._records(), self._canvas())
+                or receipt.get("source_hashes") != result["hashes"]):
+            self._clear_output()
+            self._status("입력이 변경되었습니다 · 편집기에서 Apply 필요")
+        elif self._hmb_restore_pending:
+            self._schedule_restore()
+        elif self._hmb_last_output and not self._hmb_output_pending:
+            self._status("Apply 저장 및 이미지 출력 완료")
+        return True
+
+    def _flush_pending_prepare(self) -> None:
+        task = getattr(self, "_hmb_prepare_pending", None)
+        if task is None:
+            return
+        if not self._apply_task_current(task):
+            self._discard_apply_task(task)
+            raise ValueError("이미지 준비 중 입력이 변경되었습니다. 준비 완료 후 다시 실행하세요.")
+        self._hmb_apply_epoch += 1
+        task = {**task, "epoch": self._hmb_apply_epoch}
+        self._hmb_prepare_pending = task
+        try:
+            result = self._calculate_prepare(task, lambda: not self._hmb_node_deleted and task["epoch"] == self._hmb_apply_epoch)
+        except Exception as exc:
+            self._finish_prepare(task, {"error": str(exc)})
+            raise
+        if not self._finish_prepare(task, result):
+            raise ValueError("현재 이미지 원본을 준비하지 못했습니다. 상태를 확인하세요.")
+
+    def _source_hashes(self, project: dict, *, cache: dict | None = None,
+                       rgba_cache: OrderedDict | None = None, is_live=None, read_bytes=None) -> dict:
         """Read every source before committing; a missing hidden layer also fails."""
         sources = project.get("meta", {}).get("input_images", [])
         hashes = {}
         loaded = {} if cache is None else cache
         def check(url):
+            if is_live is not None and not is_live():
+                raise ValueError("새 입력 또는 Apply로 이전 이미지 검증이 취소되었습니다.")
             if not url:
                 raise ValueError("Image Bash source URL is missing.")
             if url not in loaded:
-                raw = _read_bytes(url)
-                with Image.open(BytesIO(raw)) as image:
-                    image.load()
-                    rgba = image.convert("RGBA")
-                    loaded[url] = {"sha256": hashlib.sha256(raw).hexdigest(),
-                        "rgba_sha256": hashlib.sha256(rgba.tobytes()).hexdigest(),
-                        "width": rgba.width, "height": rgba.height}
+                try:
+                    raw = (read_bytes or _read_bytes)(url)
+                    raw_sha = hashlib.sha256(raw).hexdigest()
+                    raster = rgba_cache.get(raw_sha) if rgba_cache is not None else None
+                    if raster is None:
+                        with Image.open(BytesIO(raw)) as image:
+                            image.load()
+                            rgba = image.convert("RGBA")
+                            raster = {"rgba_sha256": hashlib.sha256(rgba.tobytes()).hexdigest(),
+                                "width": rgba.width, "height": rgba.height}
+                except Exception as exc:
+                    raise _ImageBashSourceError("이미지 원본 확인 실패: " + str(exc)) from exc
+                if rgba_cache is not None and raw_sha not in rgba_cache:
+                    if rgba_cache is not None:
+                        # Apply-owned hashes/dimensions only; no pixels or raw
+                        # bytes survive the read. Current raw SHA is mandatory.
+                        rgba_cache[raw_sha] = raster
+                        rgba_cache.move_to_end(raw_sha)
+                        while len(rgba_cache) > 128:
+                            rgba_cache.popitem(last=False)
+                elif rgba_cache is not None:
+                    rgba_cache.move_to_end(raw_sha)
+                loaded[url] = {"sha256": raw_sha, **raster}
             return {"url_sha256": hashlib.sha256(url.encode()).hexdigest(), **loaded[url]}
         for source in sources:
             url = source.get("url", "")
@@ -736,12 +1399,119 @@ class HMBImageBash(_StockImageBash):
                     or hmb["workspace_revision"] < 0 or any(hmb[key] != expected_scope[key] for key in keys)):
                 raise ValueError("Image Bash 작업 공간 또는 입력 버전이 변경되었습니다. 편집기를 다시 열어 확인하고 Apply하세요. 이전 완료 결과는 유지됩니다.")
 
+    def _admit_pending_cold_assignment(self, project: dict) -> bool:
+        """Preserve a saved pending draft before its real inputs are hydrated.
+
+        This only admits a document; the later cold readiness path still
+        verifies actual source/receipt/scope and never promotes pending pixels.
+        A marker sent by a live editor is insufficient to enter this path.
+        """
+        from griptape_nodes.retained_mode.engine import has_current_engine
+        if not has_current_engine():
+            return False
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        manager = GriptapeNodes.EventManager()
+        context = getattr(manager, "_hmb_bash_initial_assignment_context", None)
+        lease = context.get() if isinstance(context, contextvars.ContextVar) else None
+        if (not isinstance(lease, dict) or lease.get("active") is not True or lease.get("node") is not self
+                or GriptapeNodes.NodeManager().get_node_by_name(self.name) is not self):
+            return False
+        meta = project.get("meta")
+        hmb = meta.get("hmb_image_bash") if isinstance(meta, dict) else None
+        scene = meta.get("konva_json") if isinstance(meta, dict) else None
+        if (not isinstance(hmb, dict) or not isinstance(scene, dict)
+                or not isinstance(scene.get("images"), list) or not isinstance(scene.get("lines"), list)
+                or any(not isinstance(row, dict) for row in scene["images"])
+                or not isinstance(meta.get("input_images"), list)
+                or any(not isinstance(row, dict) for row in meta["input_images"])):
+            return False
+        pending, preparing = hmb.get("pending_apply"), hmb.get("pending_prepare")
+        if pending is None and preparing is None:
+            return False
+        if pending is not None and (not isinstance(pending, dict)
+                or pending.get("schema") != "hmb-image-bash-pending-apply-v1"
+                or not isinstance(pending.get("editor_commit"), str) or not pending["editor_commit"]
+                or pending["editor_commit"] != meta.get("created_at")):
+            return False
+        if preparing is not None:
+            if not isinstance(preparing, dict) or preparing.get("schema") != "hmb-image-bash-pending-prepare-v1":
+                return False
+            scope, uids = preparing.get("scope"), preparing.get("source_uids")
+            if (not isinstance(scope, dict) or set(scope) != {"workspace_id", "channel_uuid", "workspace_revision"}
+                    or any(not isinstance(scope.get(key), str) or not scope[key] for key in ("workspace_id", "channel_uuid"))
+                    or type(scope.get("workspace_revision")) is not int or scope["workspace_revision"] < 0
+                    or not isinstance(uids, list) or any(not isinstance(uid, str) or not uid for uid in uids)
+                    or len(uids) != len(set(uids))):
+                return False
+        current = _document(self.get_parameter_value("bash_image"))
+        # Native saved Python restores the same field both as its value and as
+        # output. Repeating this exact assignment cannot authorize a new edit.
+        def envelope_free(value):
+            value = dict(value)
+            value.pop("id", None)
+            value.pop("reference", None)
+            return value
+        if (getattr(self, "_hmb_cold_pending_assignment_admitted", False)
+                and envelope_free(current) == envelope_free(project)):
+            return True
+        if (self._hmb_prepare_phase != "idle" or self._hmb_apply_epoch != 0
+                or self._hmb_last_output is not None or self._hmb_apply_pending is not None
+                or self._hmb_prepare_pending is not None
+                or current != self._hmb_auto_pristine_project):
+            return False
+        self._hmb_cold_pending_assignment_admitted = True
+        return True
+
+    @staticmethod
+    def _cold_gap_saved_identity(project: dict) -> tuple | None:
+        meta = project.get("meta", {})
+        hmb = meta.get("hmb_image_bash", {}) if isinstance(meta, dict) else {}
+        receipt = hmb.get("apply") if isinstance(hmb, dict) else None
+        if (not isinstance(receipt, dict) or receipt.get("schema") != RECEIPT_SCHEMA
+                or not isinstance(meta.get("created_at"), str) or not meta["created_at"]
+                or receipt.get("editor_commit") != meta["created_at"]
+                or any(type(receipt.get(key)) is not int or receipt[key] <= 0 for key in ("width", "height"))
+                or not isinstance(receipt.get("source_hashes"), dict)
+                or not isinstance(receipt.get("png_base64"), str) or not receipt["png_base64"]
+                or hmb.get("pending_apply") is not None or hmb.get("pending_prepare") is not None
+                or any(not isinstance(hmb.get(key), str) or not hmb[key]
+                    for key in ("workspace_id", "channel_uuid", "node_instance_uuid"))
+                or type(hmb.get("workspace_revision")) is not int or hmb["workspace_revision"] < 0
+                or any(not isinstance(receipt.get(key), str) or len(receipt[key]) != 64
+                    or any(char not in "0123456789abcdef" for char in receipt[key])
+                    for key in ("scene_sha256", "png_sha256", "rgba_sha256"))):
+            return None
+        return (meta["created_at"], *(hmb[key] for key in ("workspace_id", "channel_uuid", "workspace_revision", "node_instance_uuid")),
+            *(receipt[key] for key in ("scene_sha256", "png_sha256", "rgba_sha256")))
+
+    def _initial_bash_assignment_active(self) -> bool:
+        try:
+            context = getattr(self.engine.event_manager, "_hmb_bash_initial_assignment_context", None)
+            lease = context.get() if isinstance(context, contextvars.ContextVar) else None
+            return (isinstance(lease, dict) and lease.get("active") is True and lease.get("node") is self
+                and _hmb_is_registered_node(self, "HMBImageBash")
+                and self.engine.node_manager.get_node_by_name(self.name) is self)
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            return False
+
     def before_value_set(self, parameter: Parameter, value: Any) -> Any:
         value = super().before_value_set(parameter, value)
         if (parameter.name != "bash_image" or getattr(self, "_hmb_syncing", False)
                 or getattr(self, "_initializing", False)):
             return value
         project = _document(value)
+        initial = self._initial_bash_assignment_active()
+        identity = self._cold_gap_saved_identity(project)
+        if not initial:
+            self._hmb_cold_input_gap = False
+            self._hmb_cold_gap_recovery = None
+        elif (getattr(self, "_hmb_cold_input_gap", False) and identity is not None
+                and not getattr(self, "_hmb_cold_gap_admitted", False)
+                and self._hmb_last_output is None and self._hmb_apply_pending is None
+                and self._hmb_prepare_pending is None and self._hmb_cold_restore_pending is None
+                and _document(self.get_parameter_value("bash_image")) == self._hmb_auto_pristine_project):
+            self._hmb_cold_gap_recovery = {"identity": identity, "epoch": self._hmb_apply_epoch}
+            self._hmb_cold_gap_admitted = True
         if not _url(project) or _url(project).startswith("data:image/svg"):
             return value
         meta = project.get("meta", {})
@@ -749,14 +1519,392 @@ class HMBImageBash(_StockImageBash):
         retained = hmb.get("apply") if isinstance(hmb, dict) else None
         if isinstance(retained, dict) and retained and retained.get("editor_commit") == meta.get("created_at"):
             return value
+        if HMBImageBash._admit_pending_cold_assignment(self, project):
+            return value
         try:
             self._validate_apply_source_bindings(project, self._records(), expected_scope=self._apply_scope())
         except Exception as exc:
             self._status("Apply 검증 실패: " + str(exc))
             raise
+        if getattr(self, "_hmb_apply_pending", None) is None:
+            previous = _document(self.get_parameter_value("bash_image"))
+            self._hmb_apply_prior_receipt = deepcopy(previous.get("meta", {}).get("hmb_image_bash", {}).get("apply"))
         return value
 
     def _handle_bash_image_change(self, value: Any) -> None:
+        if not (self._hmb_syncing or getattr(self, "_initializing", False) or self._hmb_node_deleted):
+            project = _document(value)
+            retained = project.get("meta", {}).get("hmb_image_bash", {}).get("apply")
+            if retained and retained.get("editor_commit") == project.get("meta", {}).get("created_at"):
+                if getattr(self, "_hmb_apply_pending", None) is not None:
+                    self._hmb_apply_epoch += 1
+                    self._hmb_apply_pending = None
+                    self._hmb_apply_rollback_document = None
+                    with self._hmb_apply_work["lock"]:
+                        self._hmb_apply_work["queued"] = None
+            if (_url(project) and not _url(project).startswith("data:image/svg")
+                    and not (retained and retained.get("editor_commit") == project.get("meta", {}).get("created_at"))):
+                try:
+                    if HMBImageBash._queue_apply(self, project):
+                        return
+                except Exception as exc:
+                    self._hmb_apply_pending = None
+                    self._hmb_apply_rollback_document = None
+                    with self._hmb_apply_work["lock"]:
+                        self._hmb_apply_work["queued"] = None
+                    failed = _document(self.get_parameter_value("bash_image"))
+                    self._preserve_failed_apply(failed, str(exc))
+                    raise
+        return HMBImageBash._handle_bash_image_change_sync(self, value)
+
+    def _queue_apply(self, project: dict) -> bool:
+        """One worker + newest intent; host acceptance means queued, not verified."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        from griptape_nodes.retained_mode.engine import has_current_engine
+        if not has_current_engine() or not loop.is_running():
+            return False
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        if GriptapeNodes.NodeManager().get_node_by_name(self.name) is not self:
+            return False
+        records, canvas, scope = self._records(), self._canvas(), self._apply_scope()
+        self._validate_apply_source_bindings(project, records, expected_scope=scope)
+        require_standard_compatibility()
+        updated = self._sync_project(project, records, add_missing=False)
+        read_paths = self._snapshot_read_paths(updated, project)
+        if read_paths is None:
+            return False  # Preserve the SDK's original remote-file read policy.
+        hmb = updated.setdefault("meta", {}).setdefault("hmb_image_bash", {})
+        if not hmb.get("apply") and isinstance(self._hmb_apply_prior_receipt, dict):
+            hmb["apply"] = deepcopy(self._hmb_apply_prior_receipt)
+        hmb["pending_apply"] = {
+            "schema": "hmb-image-bash-pending-apply-v1", "editor_commit": project.get("meta", {}).get("created_at")}
+        # Lossless scene-only reconciliation remains immediate (undo/deletion
+        # metadata); a new receipt/output is never published before the worker.
+        if updated != project:
+            self._set_project(updated)
+        self._hmb_apply_epoch += 1
+        task = {"epoch": self._hmb_apply_epoch, "project": deepcopy(project), "updated": updated,
+            "records": deepcopy(records), "canvas": deepcopy(canvas), "scope": deepcopy(scope),
+            "scene": scene_fingerprint(updated, records, canvas), "png_url": _url(updated),
+            "context": deepcopy(self.get_parameter_value("image_bash_context") or {}),
+            "connections": self._apply_connection_lease()}
+        task["kind"] = "apply"
+        task["read_paths"] = read_paths
+        task["read_drivers"] = self._snapshot_driver_lease(read_paths)
+        self._hmb_prepare_pending = None
+        self._hmb_cold_restore_pending = None
+        self._hmb_apply_pending = task
+        self._status("Apply 검증 중 · 이전 완료 결과 유지")
+        return self._start_snapshot_task(task, loop)
+
+    def _start_snapshot_task(self, task: dict, loop) -> bool:
+        """Share one daemon between Apply and preparation; keep one latest intent."""
+        work = self._hmb_apply_work
+        with work["lock"]:
+            work["queued"] = task
+            if work["active"]:
+                return True
+            work["active"] = True
+            token = work["worker_token"] = object()
+        owner_ref, host_context = weakref.ref(self), contextvars.copy_context()
+        def worker():
+            try:
+                while True:
+                    with work["lock"]:
+                        current, work["queued"] = work["queued"], None
+                        if current is None:
+                            work["active"] = False
+                            return
+                    owner = owner_ref()
+                    if owner is None:
+                        return
+                    live = lambda: (owner_ref() is not None and not owner._hmb_node_deleted
+                                    and current["epoch"] == owner._hmb_apply_epoch
+                                    and getattr(owner, "_hmb_" + current["kind"] + "_pending", None) is current)
+                    try:
+                        calculator = {"prepare": HMBImageBash._calculate_prepare,
+                                      "cold_restore": HMBImageBash._calculate_cold_restore}.get(current["kind"], HMBImageBash._calculate_apply)
+                        result = calculator(current, live)
+                    except Exception as exc:
+                        result = {"error": str(exc), "source_error": isinstance(exc, _ImageBashSourceError)}
+                    if owner_ref() is not None:
+                        # A congested host retains only the newest completed
+                        # payload, not one large scene/PNG closure per result.
+                        with work["lock"]:
+                            work["completed"] = (current, result)
+                            schedule = not work["publish_scheduled"]
+                            work["publish_scheduled"] = True
+                        if schedule:
+                            def publish():
+                                with work["lock"]:
+                                    completed, work["completed"] = work["completed"], None
+                                    work["publish_scheduled"] = False
+                                node = owner_ref()
+                                if node is not None and completed is not None:
+                                    completed_task, completed_result = completed
+                                    finish = {"prepare": node._finish_prepare,
+                                              "cold_restore": node._finish_cold_restore}.get(completed_task["kind"], node._finish_apply)
+                                    finish(completed_task, completed_result)
+                            try:
+                                loop.call_soon_threadsafe(publish, context=host_context.copy())
+                            except RuntimeError:
+                                with work["lock"]:
+                                    work["completed"] = None
+                                    work["publish_scheduled"] = False
+            finally:
+                with work["lock"]:
+                    if work.get("worker_token") is token:
+                        work["active"] = False
+        try:
+            threading.Thread(target=lambda: host_context.run(worker), name="HMBImageBashWorker", daemon=True).start()
+        except Exception:
+            with work["lock"]:
+                work["active"] = False
+            raise
+        return True
+
+    @staticmethod
+    def _snapshot_read_paths(*projects: dict, records: list[dict] | None = None) -> dict | None:
+        """Resolve SDK path policy on the host; raster I/O belongs to the worker."""
+        from griptape_nodes.files.file import _resolve_file_path
+        from griptape_nodes.files.file_driver import FileDriverRegistry
+        from griptape_nodes.files.drivers.local_file_driver import LocalFileDriver
+        from griptape_nodes.files.drivers.static_server_file_driver import StaticServerFileDriver
+        urls = {row.get("url", "") for row in records or []}
+        for project in projects:
+            if _url(project):
+                urls.add(_url(project))
+            urls.update(row.get("url", "") for row in project.get("meta", {}).get("input_images", []))
+            urls.update(row.get("src", "") for row in project.get("meta", {}).get("konva_json", {}).get("images", []))
+        paths = {}
+        for url in urls:
+            if not url or url.startswith("data:"):
+                continue
+            # Custom/subclass drivers may enforce additional policy. Only the
+            # reviewed stock local transports admit direct snapshot reads.
+            location = _resolve_file_path(File(url)._file_path)
+            if type(FileDriverRegistry.get_driver(location)) not in {LocalFileDriver, StaticServerFileDriver}:
+                return None
+            resolved = File(url).resolve()
+            if urlparse(resolved).scheme in {"http", "https"}:
+                return None
+            paths[url] = resolved
+        return paths
+
+    @staticmethod
+    def _snapshot_driver_lease(paths: dict) -> tuple:
+        from griptape_nodes.files.file import _resolve_file_path
+        from griptape_nodes.files.file_driver import FileDriverRegistry
+        return tuple((url, FileDriverRegistry.get_driver(_resolve_file_path(File(url)._file_path)))
+                     for url in sorted(paths))
+
+    @staticmethod
+    def _snapshot_read(task: dict, url: str) -> bytes:
+        if url.startswith("data:"):
+            return _read_bytes(url)
+        return Path(task["read_paths"][url]).read_bytes()
+
+    @staticmethod
+    def _calculate_apply(task: dict, is_live) -> dict:
+        """Pure snapshot validation; no host writes, parameters or graph APIs."""
+        rgba_cache = OrderedDict()
+        view = SimpleNamespace(_hmb_syncing=False, _initializing=False, _hmb_node_deleted=False,
+            _hmb_last_output=None, _hmb_apply_epoch=0, project=deepcopy(task["project"]))
+        view._records = lambda: deepcopy(task["records"])
+        view._canvas = lambda: deepcopy(task["canvas"])
+        view._apply_scope = lambda: deepcopy(task["scope"])
+        # Admission checked on the host; completion checks current registration
+        # again. These are private view callables, never serialized bypass flags.
+        view._hmb_compatibility_check = lambda: None
+        view._hmb_read_apply_bytes = lambda url: HMBImageBash._snapshot_read(task, url)
+        view._validate_apply_source_bindings = HMBImageBash._validate_apply_source_bindings
+        view._render_layers = HMBImageBash._render_layers
+        view._sync_project = lambda *args, **kwargs: deepcopy(task["updated"])
+        view._source_hashes = lambda project, **kwargs: HMBImageBash._source_hashes(
+            view, project, **{**kwargs, "rgba_cache": rgba_cache, "is_live": is_live,
+                             "read_bytes": lambda url: HMBImageBash._snapshot_read(task, url)})
+        def set_project(value): view.project = deepcopy(value)
+        view._set_project = set_project
+        view._schedule_host_callback = lambda callback: True
+        view._status = lambda text: None
+        view._clear_output = lambda: None
+        HMBImageBash._handle_bash_image_change_sync(view, task["project"])
+        if not is_live():
+            raise ValueError("새 입력 또는 Apply로 이전 이미지 검증이 취소되었습니다.")
+        # The second fresh raw read belongs immediately before host commit,
+        # not here: otherwise queued delivery would create a third I/O pass.
+        return {"project": view.project, "rgba_cache": rgba_cache}
+
+    def _apply_task_current(self, task: dict) -> bool:
+        pending = "_hmb_" + task.get("kind", "apply") + "_pending"
+        if self._hmb_node_deleted or task["epoch"] != self._hmb_apply_epoch or getattr(self, pending, None) is not task:
+            return False
+        try:
+            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+            if GriptapeNodes.NodeManager().get_node_by_name(self.name) is not self:
+                return False
+            records, canvas = self._records(), self._canvas()
+            current = _document(self.get_parameter_value("bash_image"))
+            connections = self._apply_connection_lease()
+            same_connections = (len(connections) == len(task["connections"]) and all(
+                live[0] is prior[0] and live[1:] == prior[1:]
+                for live, prior in zip(connections, task["connections"])))
+            drivers = self._snapshot_driver_lease(task["read_paths"])
+            same_drivers = len(drivers) == len(task["read_drivers"]) and all(
+                live[0] == prior[0] and live[1] is prior[1] for live, prior in zip(drivers, task["read_drivers"]))
+            return (same_connections and same_drivers and self._apply_scope() == task["scope"] and canvas == task["canvas"]
+                    and (self.get_parameter_value("image_bash_context") or {}) == task["context"]
+                    and records == task["records"] and _url(current) == task["png_url"]
+                    and scene_fingerprint(current, records, canvas) == task["scene"])
+        except (ValueError, TypeError, KeyError, RuntimeError):
+            return False
+
+    def _apply_connection_lease(self) -> tuple:
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.events.connection_events import ListConnectionsForNodeRequest
+        found = GriptapeNodes.handle_request(ListConnectionsForNodeRequest(node_name=self.name, broadcast_result=False))
+        if not found.succeeded():
+            raise ValueError("Apply 입력 연결을 확인하지 못했습니다.")
+        return tuple((GriptapeNodes.NodeManager().get_node_by_name(edge.source_node_name),
+                      edge.source_parameter_name, edge.target_parameter_name)
+                     for edge in sorted(found.incoming_connections,
+                         key=lambda row: (row.source_node_name, row.source_parameter_name, row.target_parameter_name)))
+
+    def _mark_verified_apply_ready(self, records: list[dict], canvas: dict, scope: dict, epoch: int) -> bool:
+        """A verified current Apply also completes its superseded input preparation.
+
+        Do this before publishing/writing: a later input notification must be
+        able to replace ready with preparing, rather than being overwritten by
+        an older output completion. Worker views only update their own fields.
+        """
+        try:
+            if (self._hmb_node_deleted or self._hmb_apply_epoch != epoch
+                    or self._records() != records or self._canvas() != canvas or self._apply_scope() != scope):
+                return False
+            if isinstance(self, HMBImageBash):
+                sources = self._remote_sources()
+                bound = self._remote_bound_source(sources)
+                if bound is not None:
+                    catalog = next(value for node, value in sources if node is bound)
+                    workspace = next((row for row in catalog.get("workspaces", [])
+                                      if row.get("workspace_id") == scope["workspace_id"]), {})
+                    if (type(workspace.get("revision")) is not int
+                            or workspace["revision"] != scope["workspace_revision"]
+                            or workspace.get("count") != len(records)):
+                        return False
+        except (TypeError, ValueError, KeyError):
+            return False
+        previous_prepare = getattr(self, "_hmb_prepare_pending", None)
+        previous_apply = getattr(self, "_hmb_apply_pending", None)
+        self._hmb_prepare_pending = self._hmb_apply_pending = None
+        self._hmb_cold_restore_pending = None
+        self._hmb_prepare_phase, self._hmb_prepare_error = "ready", ""
+        self._hmb_inputs_unready = False
+        work = getattr(self, "_hmb_apply_work", None)
+        if isinstance(work, dict):
+            with work["lock"]:
+                if work.get("queued") is previous_prepare or work.get("queued") is previous_apply:
+                    work["queued"] = None
+                completed = work.get("completed")
+                if completed is not None and (completed[0] is previous_prepare or completed[0] is previous_apply):
+                    work["completed"] = None
+        return True
+
+    @hmb_binding_mutation
+    def _finish_apply(self, task: dict, result: dict, *, write_output: bool = True) -> bool:
+        if not self._apply_task_current(task):
+            self._discard_apply_task(task)
+            return False
+        if not result.get("error"):
+            try:
+                raw, png = self._verify_apply(result["project"], self._records(), rgba_cache=result["rgba_cache"])
+            except Exception as exc:
+                result = {"error": str(exc), "source_error": isinstance(exc, _ImageBashSourceError)}
+        # A File resolver may re-enter the host. No verified result outranks a
+        # new owner, input, channel, scene or newer Apply accepted meanwhile.
+        if not self._apply_task_current(task):
+            self._discard_apply_task(task)
+            return False
+        if result.get("error"):
+            self._hmb_apply_pending = None
+            self._hmb_apply_rollback_document = None
+            if result.get("source_error"):
+                self._hmb_prepare_phase, self._hmb_prepare_error = "error", result["error"]
+            elif self._hmb_prepare_phase == "preparing" and self._hmb_prepare_pending is None:
+                self._hmb_prepare_phase = "error"
+                self._hmb_prepare_error = "Apply 검증 실패: " + result["error"] + " · 입력 준비를 다시 확인하세요. 편집 초안은 보존됩니다."
+            self._preserve_failed_apply(_document(self.get_parameter_value("bash_image")), result["error"])
+            return False
+        # Pan/zoom and SDK envelope materialization are deliberately excluded
+        # from the scene hash. Never rewind those newer, non-render edits.
+        current = _document(self.get_parameter_value("bash_image"))
+        completed = deepcopy(result["project"])
+        if "viewport" in current.get("meta", {}):
+            completed["meta"]["viewport"] = deepcopy(current["meta"]["viewport"])
+        else:
+            completed["meta"].pop("viewport", None)
+        for name in ("id", "reference"):
+            if name in current:
+                completed[name] = deepcopy(current[name])
+            else:
+                completed.pop(name, None)
+        if not HMBImageBash._mark_verified_apply_ready(self, task["records"], task["canvas"], task["scope"], task["epoch"]):
+            self._discard_apply_task(task)
+            return False
+        self._set_project(completed)
+        self._hmb_apply_rollback_document = None
+        if write_output:
+            self._complete_apply(task["epoch"], verified=(raw, png))
+        return True
+
+    def _preserve_failed_apply(self, project: dict, error: str) -> None:
+        """Retain edits after the modal closes, without approving their PNG."""
+        hmb = project.setdefault("meta", {}).setdefault("hmb_image_bash", {})
+        if not hmb.get("apply") and isinstance(self._hmb_apply_prior_receipt, dict):
+            hmb["apply"] = deepcopy(self._hmb_apply_prior_receipt)
+        hmb["pending_apply"] = {"schema": "hmb-image-bash-pending-apply-v1",
+            "editor_commit": project["meta"].get("created_at"), "phase": "error", "error": error[:1024]}
+        self._set_project(project)
+        self._status("Apply 검증 실패: " + error + " · 편집 초안 보존, 다시 열어 수정 후 Apply하세요. 이전 완료 결과는 유지됩니다.")
+
+    def _discard_apply_task(self, task: dict) -> None:
+        pending = "_hmb_" + task.get("kind", "apply") + "_pending"
+        if getattr(self, pending, None) is task:
+            setattr(self, pending, None)
+            self._hmb_apply_rollback_document = None
+            with self._hmb_apply_work["lock"]:
+                if self._hmb_apply_work["queued"] is task:
+                    self._hmb_apply_work["queued"] = None
+            if task.get("kind") in {"prepare", "cold_restore"} and not self._hmb_node_deleted:
+                context = self.get_parameter_value("image_bash_context") or {}
+                if isinstance(context, dict) and context.get("ready") is False:
+                    self._hmb_prepare_phase = "error" if context.get("preparation_phase") == "error" else "preparing"
+                    self._hmb_prepare_error = str(context.get("error") or "")
+                else:
+                    self._hmb_prepare_phase = "error"
+                    self._hmb_prepare_error = "입력·연결·편집 장면이 변경되어 이전 준비를 중단했습니다. 다시 준비하세요."
+                    self._status(self._hmb_prepare_error)
+
+    def _flush_pending_apply(self) -> None:
+        """An explicit Run may synchronously validate its newest queued Apply."""
+        task = self._hmb_apply_pending
+        if task is None or not self._apply_task_current(task):
+            return
+        self._hmb_apply_epoch += 1
+        task = {**task, "epoch": self._hmb_apply_epoch}
+        self._hmb_apply_pending = task
+        try:
+            result = self._calculate_apply(task, lambda: not self._hmb_node_deleted and task["epoch"] == self._hmb_apply_epoch)
+        except Exception as exc:
+            self._finish_apply(task, {"error": str(exc)}, write_output=False)
+            raise
+        if not self._finish_apply(task, result, write_output=False):
+            raise ValueError("대기 중 Apply를 현재 입력으로 확정하지 못했습니다. 상태를 확인하세요.")
+
+    def _handle_bash_image_change_sync(self, value: Any) -> None:
         if self._hmb_syncing or getattr(self, "_initializing", False) or self._hmb_node_deleted:
             return
         try:
@@ -776,6 +1924,7 @@ class HMBImageBash(_StockImageBash):
                         _raw, expected = self._verify_apply(project, self._records())
                         if (cached.get("key") == self._output_key(project, expected)
                                 and validate_png_bytes(File(cached["path"]).read_bytes()) == expected):
+                            self._adopt_verified_saved_editor_scope(project, self._records())
                             if self._hmb_output_pending:
                                 output = self.parameter_output_values.get("output_image")
                                 self._hmb_output_pending = not self._propagate_output(output, self._hmb_output_generation)
@@ -786,22 +1935,29 @@ class HMBImageBash(_StockImageBash):
                         pass
                 # Native deserialization restores stock parameters before our
                 # appended context/input connections. Defer validation to Run.
-                self._clear_output()
+                gap = getattr(self, "_hmb_cold_gap_recovery", None)
+                if (self._initial_bash_assignment_active() and isinstance(gap, dict)
+                        and gap.get("identity") == self._cold_gap_saved_identity(project)):
+                    self._clear_output(preserve_initial_gap=True)
+                else:
+                    self._clear_output()
                 self._hmb_restore_pending = True
                 self._status("저장된 Apply 복원 중 · 입력과 파일을 확인합니다")
                 return
             records = self._records()
-            self._validate_apply_source_bindings(project, records, expected_scope=self._apply_scope())
-            require_standard_compatibility()
+            scope, admission_epoch, admission_canvas = self._apply_scope(), self._hmb_apply_epoch, self._canvas()
+            self._validate_apply_source_bindings(project, records, expected_scope=scope)
+            getattr(self, "_hmb_compatibility_check", require_standard_compatibility)()
             updated = self._sync_project(project, records, add_missing=False)
             source_cache = {}
-            source_hashes = self._source_hashes(updated, cache=source_cache)
+            rgba_cache = OrderedDict()
+            source_hashes = self._source_hashes(updated, cache=source_cache, rgba_cache=rgba_cache)
             same_render = self._render_layers(updated) == self._render_layers(project)
             if same_render:
                 try:
                     # The native editor resolves C:/ paths to browser URLs.
                     # Equal decoded rasters are the same source despite an alias.
-                    self._source_hashes(project, cache=source_cache)
+                    self._source_hashes(project, cache=source_cache, rgba_cache=rgba_cache)
                     old_layers = project.get("meta", {}).get("konva_json", {}).get("images", [])
                     new_layers = updated.get("meta", {}).get("konva_json", {}).get("images", [])
                     same_render = all(
@@ -816,7 +1972,7 @@ class HMBImageBash(_StockImageBash):
                 self._set_project(updated)
                 raise ValueError("편집 중 ImageAsset 입력이 변경되었습니다. 동기화된 레이어를 확인하고 다시 Apply하세요.")
             project = updated
-            raw = _read_bytes(_url(project))
+            raw = getattr(self, "_hmb_read_apply_bytes", _read_bytes)(_url(project))
             png = validate_png_bytes(raw)
             canvas = self._canvas()
             if (png["width"], png["height"]) != (canvas["width"], canvas["height"]):
@@ -828,7 +1984,7 @@ class HMBImageBash(_StockImageBash):
                                 if key in external_keys and key in source_hashes):
                 project["meta"]["hmb_image_bash"]["prepared_source_hashes"] = source_hashes
                 self._set_project(project)
-                raise ValueError("편집기를 연 뒤 원본 이미지가 변경되었습니다. 다시 열어 확인하고 Apply하세요.")
+                raise _ImageBashSourceError("편집기를 연 뒤 원본 이미지가 변경되었습니다. 다시 열어 확인하고 Apply하세요.")
             canonical_url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
             project["value"] = canonical_url
             project["meta"]["preview_url"] = canonical_url
@@ -840,10 +1996,15 @@ class HMBImageBash(_StockImageBash):
                 "png_base64": base64.b64encode(raw).decode("ascii")}
             # The saved workflow remains usable after transient editor URLs expire.
             project.setdefault("meta", {}).setdefault("hmb_image_bash", {})["apply"] = receipt
+            project["meta"]["hmb_image_bash"].pop("pending_apply", None)
+            project["meta"]["hmb_image_bash"].pop("pending_prepare", None)
             project["meta"]["hmb_image_bash"]["prepared_source_hashes"] = source_hashes
+            if not HMBImageBash._mark_verified_apply_ready(self, records, admission_canvas, scope, admission_epoch):
+                raise ValueError("Apply 검증 중 입력·작업 공간이 변경되었습니다. 현재 입력을 확인하고 다시 Apply하세요.")
             self._set_project(project)
             self._hmb_apply_epoch += 1
             epoch = self._hmb_apply_epoch
+            self._hmb_apply_rgba_cache = (epoch, rgba_cache)
             def complete() -> None:
                 try:
                     self._complete_apply(epoch)
@@ -858,7 +2019,7 @@ class HMBImageBash(_StockImageBash):
             raise
 
     @hmb_binding_mutation
-    def _complete_apply(self, epoch: int) -> None:
+    def _complete_apply(self, epoch: int, *, verified: tuple | None = None) -> None:
         if self._hmb_node_deleted or epoch != self._hmb_apply_epoch:
             return
         try:
@@ -866,10 +2027,13 @@ class HMBImageBash(_StockImageBash):
             if GriptapeNodes.NodeManager().get_node_by_name(self.name) is not self:
                 return
             project = _document(self.get_parameter_value("bash_image"))
-            verified, expected = self._verify_apply(project, self._records())
+            cache = getattr(self, "_hmb_apply_rgba_cache", None)
+            raw, expected = (verified if verified is not None else self._verify_apply(project, self._records(),
+                rgba_cache=cache[1] if cache and cache[0] == epoch else None))
             if self._hmb_node_deleted or epoch != self._hmb_apply_epoch:
                 return
-            self._write_output(verified, expected, exact_apply=True)
+            self._write_output(raw, expected, exact_apply=True)
+            self._hmb_apply_rgba_cache = None
             if self._hmb_node_deleted or epoch != self._hmb_apply_epoch:
                 return
             self._hmb_restore_pending = False
@@ -902,16 +2066,76 @@ class HMBImageBash(_StockImageBash):
         return (receipt.get("editor_commit"), receipt.get("scene_sha256"), expected.get("png_sha256"),
                 repr(self.get_parameter_value("output_file")))
 
+    def _adopt_verified_saved_editor_scope(self, project: dict, records: list[dict]) -> bool:
+        """Renew only a saved editor's transient lease after PNG verification.
+
+        Callers have already checked the retained receipt, source rasters and
+        exact saved output PNG. A workflow reload creates a fresh Python node;
+        it must not keep the old modal lease, or the editor remains preparing.
+        No workspace, channel, revision, binding, scene or receipt is repaired.
+        """
+        if self._hmb_node_deleted or not _hmb_is_registered_node(self, "HMBImageBash"):
+            return False
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        if GriptapeNodes.NodeManager().get_node_by_name(self.name) is not self:
+            return False
+        context = self.get_parameter_value("image_bash_context") or {}
+        if (not isinstance(context, dict) or context.get("schema") != CONTEXT_SCHEMA
+                or context.get("ready") is not True):
+            return False
+        scope = self._apply_scope()
+        metadata = self.metadata if isinstance(self.metadata, dict) else {}
+        if (not scope["workspace_id"] or not scope["channel_uuid"]
+                or metadata.get("hmb_image_bash_workspace_id") != scope["workspace_id"]):
+            return False
+        sources = self._remote_sources()
+        bound = self._remote_bound_source(sources)
+        if bound is None:
+            return False
+        catalog = next((value for node, value in sources if node is bound), {})
+        current = next((row for row in catalog.get("workspaces", [])
+                        if row.get("workspace_id") == scope["workspace_id"]), {})
+        if (current.get("revision") != scope["workspace_revision"]
+                or current.get("count") != len(records)):
+            return False
+        meta = project.get("meta", {})
+        hmb = meta.get("hmb_image_bash", {}) if isinstance(meta, dict) else {}
+        retained = hmb.get("apply") if isinstance(hmb, dict) else None
+        if (not isinstance(retained, dict) or retained.get("schema") != RECEIPT_SCHEMA
+                or retained.get("editor_commit") != meta.get("created_at")
+                or not isinstance(hmb.get("node_instance_uuid"), str)
+                or not hmb["node_instance_uuid"]):
+            return False
+        prior_scope = {**scope, "node_instance_uuid": hmb["node_instance_uuid"]}
+        try:
+            self._validate_apply_source_bindings(project, records, expected_scope=prior_scope)
+        except ValueError:
+            return False
+        snapshot = getattr(self, "_hmb_editor_snapshot_id", "")
+        if (hmb["node_instance_uuid"] != scope["node_instance_uuid"]
+                or not snapshot or hmb.get("editor_snapshot_id") != snapshot):
+            updated = deepcopy(project)
+            updated["meta"]["hmb_image_bash"]["node_instance_uuid"] = scope["node_instance_uuid"]
+            self._set_project(updated)
+        self._hmb_prepare_phase, self._hmb_prepare_error = "ready", ""
+        self._hmb_inputs_unready = False
+        self._publish_header()
+        return True
+
     @hmb_binding_mutation
     def _restore_saved_output(self, project: dict, records: list[dict]) -> None:
         """Revalidate an existing saved Apply file; never recreate it on load."""
-        _raw, expected = self._verify_apply(project, records)
         receipt = project.get("meta", {}).get("hmb_image_bash", {}).get("apply", {})
         proof = self.get_parameter_value("HMB_BASH_VERIFICATION") or {}
         path = receipt.get("output_path") or (proof.get("output") if isinstance(proof, dict) else "")
         if not isinstance(path, str) or not path:
             self._status("저장된 Apply의 출력 경로가 없습니다 · 다시 Apply하세요")
             return
+        if self._queue_cold_restore(project, records, path):
+            return
+        # Unsupported/custom transports and hosts without a running loop keep
+        # the original driver policy. Never call a custom SDK driver in a worker.
+        _raw, expected = self._verify_apply(project, records)
         try:
             actual = validate_png_bytes(File(path).read_bytes())
         except Exception:
@@ -920,16 +2144,170 @@ class HMBImageBash(_StockImageBash):
         if actual != expected:
             self._status("저장된 Apply 파일이 변경되었습니다 · 다시 Apply하세요")
             return
+        # Preserve the original synchronous legacy/custom-driver behavior:
+        # adopting a REMOTE scope is optional there. The async path below has
+        # stricter eligibility and must adopt its exact captured owner lease.
+        self._adopt_verified_saved_editor_scope(project, records)
+        self._publish_verified_saved_output(project, path, expected)
+
+    def _queue_cold_restore(self, project: dict, records: list[dict], path: str) -> bool:
+        """Verify saved source rasters/PNG in the existing bounded daemon."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        from griptape_nodes.retained_mode.engine import has_current_engine
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        if (not has_current_engine() or not loop.is_running()
+                or GriptapeNodes.NodeManager().get_node_by_name(self.name) is not self):
+            return False
+        context = self.get_parameter_value("image_bash_context") or {}
+        scope = self._apply_scope()
+        metadata = self.metadata if isinstance(self.metadata, dict) else {}
+        if (not isinstance(context, dict) or context.get("ready") is not True
+                or not scope["workspace_id"] or not scope["channel_uuid"]
+                or metadata.get("hmb_image_bash_workspace_id") != scope["workspace_id"]
+                or metadata.get("hmb_image_bash_channel_uuid") != scope["channel_uuid"]):
+            return False
+        sources = self._remote_sources()
+        bound = self._remote_bound_source(sources)
+        if bound is None:
+            return False
+        catalog = next((value for node, value in sources if node is bound), {})
+        workspace = next((row for row in catalog.get("workspaces", [])
+                          if row.get("workspace_id") == scope["workspace_id"]), {})
+        if workspace.get("revision") != scope["workspace_revision"] or workspace.get("count") != len(records):
+            return False
+        pending = self._hmb_cold_restore_pending
+        if pending is not None and self._cold_restore_task_current(pending):
+            return True
+        read_paths = self._snapshot_read_paths(project, {"value": path}, records=records)
+        if read_paths is None:
+            return False
+        require_standard_compatibility()
+        canvas = self._canvas()
+        self._hmb_apply_epoch += 1
+        self._hmb_apply_pending = self._hmb_prepare_pending = None
+        self._hmb_apply_rollback_document = None
+        task = {"kind": "cold_restore", "epoch": self._hmb_apply_epoch,
+            "project": deepcopy(project), "records": deepcopy(records), "canvas": canvas, "scope": scope,
+            "read_paths": read_paths, "read_drivers": self._snapshot_driver_lease(read_paths),
+            "scene": scene_fingerprint(project, records, canvas), "png_url": _url(project),
+            "context": deepcopy(self.get_parameter_value("image_bash_context") or {}),
+            "connections": self._apply_connection_lease(), "output_path": path,
+            "output_setting": repr(self.get_parameter_value("output_file")),
+            "host_snapshot": self._hmb_editor_snapshot_id}
+        self._hmb_cold_restore_pending = task
+        self._hmb_prepare_phase, self._hmb_prepare_error = "preparing", ""
+        # A serialized output is not a newly verified live result. Keep a
+        # genuinely verified existing result while a later restore is pending.
+        if self._hmb_last_output is None:
+            # Legacy saved receipts can keep their only output path in this
+            # historical proof. Pending save/reopen must not lose that path.
+            self._clear_output_now(preserve_verification=True)
+        self._status("저장된 Apply 복원 중 · 이미지 원본과 완료 파일 확인")
+        return self._start_snapshot_task(task, loop)
+
+    @staticmethod
+    def _calculate_cold_restore(task: dict, is_live) -> dict:
+        """Pure file snapshot checks; no SDK, graph, publication or file write."""
+        rgba_cache = OrderedDict()
+        read = lambda url: HMBImageBash._snapshot_read(task, url)
+        view = SimpleNamespace(_hmb_compatibility_check=lambda: None)
+        view._canvas = lambda: task["canvas"]
+        view._source_hashes = lambda project, **kwargs: HMBImageBash._source_hashes(
+            None, project, **{**kwargs, "rgba_cache": rgba_cache, "is_live": is_live, "read_bytes": read})
+        _raw, expected = HMBImageBash._verify_apply(view, task["project"], task["records"])
+        actual = validate_png_bytes(read(task["output_path"]))
+        if actual != expected:
+            raise ValueError("저장된 Apply 파일이 변경되었습니다. 다시 Apply하세요.")
+        if not is_live():
+            raise ValueError("입력·연결·편집 변경으로 이전 저장본 확인을 중단했습니다.")
+        # Fresh byte SHA checks after PNG decoding narrow the verification
+        # window without moving UNC reads back to the host loop. External
+        # files are still sequential snapshots, not atomic filesystem locks.
+        receipt = task["project"].get("meta", {}).get("hmb_image_bash", {}).get("apply", {})
+        fresh = HMBImageBash._source_hashes(None, task["project"], rgba_cache=rgba_cache,
+            is_live=is_live, read_bytes=read)
+        if fresh != receipt.get("source_hashes"):
+            raise _ImageBashSourceError("복원 중 이미지 원본이 변경되었습니다. 입력을 다시 확인하세요.")
+        if hashlib.sha256(read(task["output_path"])).hexdigest() != expected["png_sha256"]:
+            raise ValueError("복원 중 완료 이미지 파일이 변경되었습니다. 다시 Apply하세요.")
+        if not is_live():
+            raise ValueError("새 작업으로 이전 저장본 확인을 중단했습니다.")
+        return {"expected": expected}
+
+    def _cold_restore_task_current(self, task: dict, *, adopted: bool = False) -> bool:
+        if not self._apply_task_current(task):
+            return False
+        current = _document(self.get_parameter_value("bash_image"))
+        old_meta, meta = task["project"].get("meta", {}), current.get("meta", {})
+        old_hmb, hmb = old_meta.get("hmb_image_bash", {}), meta.get("hmb_image_bash", {})
+        nonce = self._hmb_editor_snapshot_id if adopted else task["host_snapshot"]
+        return (meta.get("created_at") == old_meta.get("created_at") and hmb.get("apply") == old_hmb.get("apply")
+                and (adopted or hmb.get("editor_snapshot_id") == old_hmb.get("editor_snapshot_id"))
+                and (not adopted or hmb.get("editor_snapshot_id") == self._hmb_editor_snapshot_id)
+                and self._hmb_editor_snapshot_id == nonce
+                and repr(self.get_parameter_value("output_file")) == task["output_setting"])
+
+    @hmb_binding_mutation
+    def _finish_cold_restore(self, task: dict, result: dict) -> bool:
+        if not self._cold_restore_task_current(task):
+            self._discard_apply_task(task)
+            return False
+        if result.get("error"):
+            self._hmb_cold_restore_pending = None
+            self._hmb_prepare_phase, self._hmb_prepare_error = "error", result["error"]
+            self._status("저장본 준비 실패: " + result["error"] + " · 기존 장면과 완료 파일은 유지됩니다.")
+            return False
+        try:
+            require_standard_compatibility()
+            if not self._cold_restore_task_current(task):
+                self._discard_apply_task(task)
+                return False
+            # Viewport and SDK envelope changes are non-rendering and excluded
+            # from the scene fence. Adopt the current document, never rewind
+            # them to the worker's older snapshot.
+            current = _document(self.get_parameter_value("bash_image"))
+            if not self._adopt_verified_saved_editor_scope(current, task["records"]):
+                raise ValueError("저장된 Apply의 현재 작업 공간·연결을 확인하지 못했습니다.")
+            if not self._cold_restore_task_current(task, adopted=True):
+                self._discard_apply_task(task)
+                return False
+            if not self._publish_verified_saved_output(current, task["output_path"], result["expected"],
+                    guard=lambda: self._cold_restore_task_current(task, adopted=True)):
+                if not self._cold_restore_task_current(task, adopted=True):
+                    self._discard_apply_task(task)
+                    return False
+                raise ValueError("검증된 저장 이미지를 현재 파일 서비스로 전달하지 못했습니다.")
+            self._hmb_cold_restore_pending = None
+            return True
+        except Exception as exc:
+            if self._hmb_cold_restore_pending is task:
+                if not self._apply_task_current(task):
+                    self._discard_apply_task(task)
+                    return False
+                self._hmb_cold_restore_pending = None
+                self._hmb_prepare_phase, self._hmb_prepare_error = "error", str(exc)
+                self._status("저장본 준비 실패: " + str(exc))
+            return False
+
+    def _publish_verified_saved_output(self, project: dict, path: str, expected: dict, *, guard=None) -> bool:
+        """Host-only publication of an already verified existing file."""
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
         from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
         driver = GriptapeNodes.StaticFilesManager().storage_driver
         if not isinstance(driver, LocalStorageDriver):
             self._status("출력 이미지를 제공할 로컬 파일 서비스를 확인하세요")
-            return
+            return False
         if self._hmb_node_deleted:
-            return
+            return False
         value = ImageUrlArtifact(value=driver.create_signed_download_url(Path(File(path).resolve())))
-        verification = {"schema": "hmb-image-bash-run-v1", **actual, "apply_pixel_equal": True, "output": path}
+        # Resolving/signing stays on the host and can re-enter its request
+        # hooks. The async result must still own the exact current lease.
+        if self._hmb_node_deleted or (guard is not None and not guard()):
+            return False
+        verification = {"schema": "hmb-image-bash-run-v1", **expected, "apply_pixel_equal": True, "output": path}
         self.set_parameter_value("HMB_BASH_VERIFICATION", verification)
         self.parameter_output_values["HMB_BASH_VERIFICATION"] = verification
         self.publish_update_to_parameter("HMB_BASH_VERIFICATION", verification)
@@ -943,24 +2321,32 @@ class HMBImageBash(_StockImageBash):
         self._hmb_output_delivered = {}
         self._hmb_output_pending = not self._propagate_output(value, self._hmb_output_generation)
         self._status("저장된 Apply 복원 · 연결된 입력이 사용 가능해지면 Run으로 다시 전달하세요" if self._hmb_output_pending else "저장된 Apply 이미지 복원 완료")
+        return True
 
     def after_node_deleted(self) -> None:
         self._hmb_node_deleted = True
+        self._hmb_apply_pending = None
+        self._hmb_prepare_pending = None
+        self._hmb_cold_restore_pending = None
+        self._hmb_apply_rollback_document = None
+        with self._hmb_apply_work["lock"]:
+            self._hmb_apply_work["queued"] = None
+            self._hmb_apply_work["completed"] = None
         self._hmb_apply_epoch += 1
         self._hmb_output_generation += 1
         self._hmb_output_delivered = {}
         self._hmb_last_output = None
         return super().after_node_deleted()
 
-    def _verify_apply(self, project: dict, records: list[dict]) -> tuple[bytes, dict]:
-        require_standard_compatibility()
+    def _verify_apply(self, project: dict, records: list[dict], *, rgba_cache: OrderedDict | None = None) -> tuple[bytes, dict]:
+        getattr(self, "_hmb_compatibility_check", require_standard_compatibility)()
         receipt = project.get("meta", {}).get("hmb_image_bash", {}).get("apply", {})
         if receipt.get("schema") != RECEIPT_SCHEMA:
             raise ValueError("편집기에서 Apply한 저장본이 없습니다.")
         if receipt.get("scene_sha256") != scene_fingerprint(project, records, self._canvas()):
             raise ValueError("레이어/입력/캔버스 변경 후 다시 Apply해야 합니다.")
-        if receipt.get("source_hashes") != self._source_hashes(project):
-            raise ValueError("원본 이미지가 변경되었습니다. 다시 Apply하세요.")
+        if receipt.get("source_hashes") != self._source_hashes(project, rgba_cache=rgba_cache):
+            raise _ImageBashSourceError("원본 이미지가 변경되었습니다. 다시 Apply하세요.")
         raw = base64.b64decode(receipt["png_base64"], validate=True)
         if _url(project) != "data:image/png;base64," + receipt["png_base64"]:
             raise ValueError("편집기 이미지와 저장된 Apply 이미지가 다릅니다. 다시 Apply하세요.")
@@ -1089,10 +2475,20 @@ class HMBImageBash(_StockImageBash):
     def process(self) -> None:
         # A deliberate Run supersedes any queued Apply/restore/invalidation;
         # it performs the same current-input verification synchronously.
-        self._hmb_apply_epoch += 1
         try:
+            self._flush_pending_prepare()
+            self._flush_pending_apply()
+            cold_restore = self._hmb_cold_restore_pending
+            self._hmb_cold_restore_pending = None
+            self._hmb_apply_epoch += 1
             require_standard_compatibility()
             if self.get_parameter_value("comp_on_run") is True:
+                if cold_restore is not None:
+                    project = _document(self.get_parameter_value("bash_image"))
+                    records = self._records()
+                    self._verify_apply(project, records)
+                    if not self._adopt_verified_saved_editor_scope(project, records):
+                        raise ValueError("현재 입력으로 저장된 Apply를 확인하지 못했습니다.")
                 self._process_output_image()
             else:
                 project = _document(self.get_parameter_value("bash_image"))
@@ -1101,6 +2497,8 @@ class HMBImageBash(_StockImageBash):
                 except Exception:
                     self._clear_output()
                     raise
+                if cold_restore is not None and not self._adopt_verified_saved_editor_scope(project, self._records()):
+                    raise ValueError("현재 입력으로 저장된 Apply를 확인하지 못했습니다.")
                 self._write_output(raw, png, exact_apply=True)
         except Exception as exc:
             self._status("실행 중단: " + str(exc))

@@ -179,6 +179,28 @@ export function hmbColorLUTGradePixels(data, width, cube, mode, wipe, size = HMB
   }
   return data;
 }
+// Preview-only budget. Export/codec/source FPS never consume this state.
+export function hmbColorLUTFallbackBudget() {
+  const widths = [640, 480, 320], rates = [30, 24, 18];
+  let level = 0, slow = 0, fast = 0, average = 0, lastFrame = -Infinity;
+  return {
+    get width() { return widths[level]; },
+    get fps() { return level === 2 && average > 20 ? 12 : rates[level]; },
+    due(now) { return now - lastFrame >= 1000 / this.fps - 0.5; },
+    mark(now) { lastFrame = now; },
+    observe(ms) {
+      if (!Number.isFinite(ms) || ms < 0) return;
+      average = average ? average * 0.7 + ms * 0.3 : ms;
+      slow = average > 12 ? slow + 1 : 0;
+      fast = average < 6 ? fast + 1 : 0;
+      if (slow >= 3 && level < widths.length - 1) { level++; slow = 0; fast = 0; average = 0; }
+      else if (fast >= 60 && level > 0 && average * (widths[level - 1] / widths[level]) ** 2 < 9) {
+        level--; slow = 0; fast = 0; average = 0;
+      }
+    },
+    reset() { level = 0; slow = 0; fast = 0; average = 0; lastFrame = -Infinity; },
+  };
+}
 export function hmbColorLUTCommand(action, state, id = `cl-${Date.now()}-${Math.random().toString(36).slice(2)}`) {
   if (!["browse_video", "export", "export_upload", "cancel", "save_profile", "delete_profile", "upload_web", "select_upload_project", "refresh_upload_projects"].includes(action)) throw new Error("Unsupported Color LUT action.");
   const captured = hmbColorLUTState(state);
@@ -319,7 +341,7 @@ function createRenderer(canvas) {
   const ctx = canvas.getContext?.("2d", { willReadFrequently: true });
   if (!ctx) throw new Error("No canvas renderer available.");
   let cube;
-  return { maxWidth: 640, setCube(value) { cube = value; }, clear() { ctx.clearRect(0, 0, canvas.width, canvas.height); },
+  return { maxWidth: 640, fallback: true, setCube(value) { cube = value; }, clear() { ctx.clearRect(0, 0, canvas.width, canvas.height); },
     draw(video, mode, wipe) {
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       if (mode === 0 || !cube) return;
@@ -335,6 +357,8 @@ function hmbNativeUiImplementation(container, props = {}) {
   let latestProps = props, state = hmbColorLUTState(props), disposed = false, visible = true, sourceRevision = 0;
   let renderer = null, video = null, sourceKey = "", drawFrame = 0, playbackFrame = 0, videoFrame = 0, commitTimer = 0;
   let mode = "compare", wipe = 0.5, cubeKey = "", pendingCube = null, pendingShot = null, localMessage = "", pendingEdit = false, lastSeek = 0, responseRevision = 0;
+  const fallbackBudget = hmbColorLUTFallbackBudget();
+  let previewSettleTimer = 0, interactiveUntil = 0;
   let lastHostRevision = state.revision;
   const cleanups = [], videoCleanups = [], settingsCache = new Map(), cubeCache = new Map();
   const doc = container.ownerDocument || globalThis.document, win = doc?.defaultView || globalThis;
@@ -375,7 +399,8 @@ function hmbNativeUiImplementation(container, props = {}) {
     if (q("[data-step]")) q("[data-step]").disabled = !video || video.readyState < 2;
   };
   const stopLoop = () => { caf(playbackFrame); playbackFrame = 0; if (videoFrame && video?.cancelVideoFrameCallback) video.cancelVideoFrameCallback(videoFrame); videoFrame = 0; };
-  const pause = () => { stopLoop(); video?.pause?.(); updateFrameLabel(); };
+  const cancelPreviewSettle = () => { if (previewSettleTimer) win.clearTimeout(previewSettleTimer); previewSettleTimer = 0; };
+  const pause = () => { stopLoop(); cancelPreviewSettle(); interactiveUntil = 0; video?.pause?.(); updateFrameLabel(); };
   const cancelPendingCube = () => { pendingCube?.cancel(); pendingCube = null; };
   const installCube = (key, cube) => {
     cancelPendingCube(); renderer.setCube(cube); cubeKey = key;
@@ -386,6 +411,9 @@ function hmbNativeUiImplementation(container, props = {}) {
     drawFrame = 0;
     if (!canDraw() || !renderer || !video || video.readyState < 2) return;
     try {
+      const now = renderer.fallback ? (win.performance?.now?.() ?? Date.now()) : 0;
+      const adaptive = renderer.fallback && mode !== "original" && ((!video.paused && !video.ended) || now < interactiveUntil);
+      if (adaptive && !fallbackBudget.due(now)) return;
       const key = JSON.stringify(state.settings);
       if (key === cubeKey && pendingCube) cancelPendingCube();
       if (key !== cubeKey) {
@@ -403,12 +431,27 @@ function hmbNativeUiImplementation(container, props = {}) {
           pendingCube = requested;
         }
       }
-      const ratio = Math.min(1, renderer.maxWidth / Math.max(1, video.videoWidth)), width = Math.max(1, Math.round(video.videoWidth * ratio)), height = Math.max(1, Math.round(video.videoHeight * ratio));
+      const started = adaptive ? (win.performance?.now?.() ?? Date.now()) : 0;
+      const maxWidth = adaptive ? fallbackBudget.width : renderer.maxWidth;
+      const ratio = Math.min(1, maxWidth / Math.max(1, video.videoWidth)), width = Math.max(1, Math.round(video.videoWidth * ratio)), height = Math.max(1, Math.round(video.videoHeight * ratio));
       if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
       renderer.draw(video, mode === "original" ? 0 : mode === "compare" ? 1 : 2, wipe); updateFrameLabel();
+      if (adaptive) { fallbackBudget.mark(now); fallbackBudget.observe((win.performance?.now?.() ?? Date.now()) - started); }
     } catch (error) { pause(); say(`${textFor(state).previewError}: ${error.message || error}`); }
   };
-  const queueDraw = () => { if (canDraw() && !drawFrame) drawFrame = raf(draw); };
+  const queueDraw = (interactive = false, scheduleSettle = true) => {
+    if (interactive === true && renderer?.fallback) {
+      const owned = video, token = sourceRevision;
+      interactiveUntil = (win.performance?.now?.() ?? Date.now()) + 160;
+      cancelPreviewSettle();
+      if (scheduleSettle) previewSettleTimer = win.setTimeout(() => {
+        previewSettleTimer = 0;
+        if (disposed || token !== sourceRevision || video !== owned) return;
+        interactiveUntil = 0; queueDraw();
+      }, 180);
+    }
+    if (canDraw() && !drawFrame) drawFrame = raf(draw);
+  };
   const playLoop = () => {
     if (!canDraw() || !video || video.paused || video.ended || videoFrame || playbackFrame) return;
     const ownedVideo = video, token = sourceRevision;
@@ -418,7 +461,7 @@ function hmbNativeUiImplementation(container, props = {}) {
     else playbackFrame = raf(() => { playbackFrame = 0; if (disposed || token !== sourceRevision || video !== ownedVideo) return; queueDraw(); playLoop(); });
   };
   const clearVideo = () => {
-    sourceRevision++; stopLoop(); caf(drawFrame); drawFrame = 0; cancelPendingCube();
+    sourceRevision++; stopLoop(); caf(drawFrame); drawFrame = 0; cancelPendingCube(); cancelPreviewSettle(); interactiveUntil = 0; fallbackBudget.reset();
     for (const cleanup of videoCleanups.splice(0)) cleanup();
     if (video) { video.pause(); video.removeAttribute("src"); video.load(); video = null; }
     renderer?.clear(); updateFrameLabel();
@@ -489,6 +532,9 @@ function hmbNativeUiImplementation(container, props = {}) {
     updateFrameLabel(); queueDraw();
   };
   const publish = (shotSelection = false) => {
+    const settledInteraction = interactiveUntil > 0 || previewSettleTimer;
+    cancelPreviewSettle(); interactiveUntil = 0;
+    if (renderer?.fallback && settledInteraction) queueDraw();
     if (commitTimer) { win.clearTimeout(commitTimer); commitTimer = 0; }
     if (disposed) return false;
     pendingEdit = false; if (!shotSelection) invalidateUpload(); state.revision++; settingsCache.set(cacheKey(), copy(state.settings));
@@ -544,7 +590,7 @@ function hmbNativeUiImplementation(container, props = {}) {
   bind(q("[data-language-toggle]"), "click", () => { state.language = state.language === "ko" ? "en" : "ko"; localMessage = ""; publish(); sync(); });
   bind(q("[data-enable]"), "change", (event) => { state.settings.enabled = event.target.checked; publish(); sync(); });
   for (const el of all("[data-adjust]")) {
-    bind(el, "input", () => { const key = el.getAttribute("data-adjust"); state.settings[key] = hmbColorLUTStrengthFromStep(el.value); el.value = String(sliderStep(state.settings[key])); state.settings.enabled = true; q("[data-enable]").checked = true; el.setAttribute("aria-valuetext", stageLabel(state, key)); q(`[data-value="${key}"]`).textContent = stageLabel(state, key); q("[data-preview-note]").textContent = textFor(state).enabled; queueDraw(); scheduleCommit(); });
+    bind(el, "input", () => { const key = el.getAttribute("data-adjust"); state.settings[key] = hmbColorLUTStrengthFromStep(el.value); el.value = String(sliderStep(state.settings[key])); state.settings.enabled = true; q("[data-enable]").checked = true; el.setAttribute("aria-valuetext", stageLabel(state, key)); q(`[data-value="${key}"]`).textContent = stageLabel(state, key); q("[data-preview-note]").textContent = textFor(state).enabled; queueDraw(true, false); scheduleCommit(); });
     bind(el, "change", () => { if (pendingEdit) publish(); });
   }
   bind(q("[data-reset]"), "click", () => { state.settings = hmbColorLUTSettings(); publish(); sync(); });
@@ -556,14 +602,14 @@ function hmbNativeUiImplementation(container, props = {}) {
   for (const button of all("[data-view]")) bind(button, "click", () => { mode = button.getAttribute("data-view"); sync(); });
   const handle = q("[data-wipe-handle]");
   let wipePointer = null;
-  const setWipe = (position) => { wipe = clamp(position); q(".cl-seam").style.left = `${wipe * 100}%`; handle.setAttribute("aria-valuenow", String(Math.round(wipe * 100))); queueDraw(); };
+  const setWipe = (position) => { wipe = clamp(position); q(".cl-seam").style.left = `${wipe * 100}%`; handle.setAttribute("aria-valuenow", String(Math.round(wipe * 100))); queueDraw(true); };
   const dragWipe = (event) => { const box = q(".cl-screen").getBoundingClientRect(); if (box.width) setWipe((event.clientX - box.left) / box.width); event.preventDefault(); event.stopPropagation(); };
   bind(handle, "pointerdown", (event) => { if (event.button !== 0) return; wipePointer = event.pointerId; handle.setPointerCapture?.(wipePointer); dragWipe(event); });
   bind(handle, "pointermove", (event) => { if (event.pointerId === wipePointer) dragWipe(event); });
   const endWipe = (event) => { if (event.pointerId !== wipePointer) return; const id = wipePointer; wipePointer = null; if (handle.hasPointerCapture?.(id)) handle.releasePointerCapture(id); event.stopPropagation(); };
   bind(handle, "pointerup", endWipe); bind(handle, "pointercancel", endWipe); bind(handle, "lostpointercapture", endWipe);
   bind(handle, "keydown", (event) => { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) { event.preventDefault(); event.stopPropagation(); setWipe(event.key === "Home" ? 0 : event.key === "End" ? 1 : wipe + (event.key === "ArrowRight" ? .01 : -.01)); } });
-  const seekTo = (frame) => { if (!video || video.readyState < 2) return; pause(); const fps = state.source.fps || 24, duration = Number.isFinite(video.duration) ? video.duration : state.source.duration; lastSeek = clamp(frame / fps, 0, Math.max(0, duration - 1 / fps)); video.currentTime = lastSeek; updateFrameLabel(); };
+  const seekTo = (frame) => { if (!video || video.readyState < 2) return; pause(); const fps = state.source.fps || 24, duration = Number.isFinite(video.duration) ? video.duration : state.source.duration; lastSeek = clamp(frame / fps, 0, Math.max(0, duration - 1 / fps)); video.currentTime = lastSeek; updateFrameLabel(); queueDraw(true); };
   bind(q("[data-seek]"), "input", (event) => seekTo(finite(event.target.value)));
   bind(q("[data-step]"), "click", () => seekTo(Math.floor((video?.currentTime || lastSeek) * (state.source.fps || 24) + 0.001) + 1));
   bind(q("[data-play]"), "click", () => { if (!video) return; if (!video.paused) pause(); else { if (video.ended) video.currentTime = 0; const owned = video, token = sourceRevision; Promise.resolve(video.play()).then(() => { if (disposed || owned !== video || token !== sourceRevision) { owned.pause(); return; } updateFrameLabel(); playLoop(); }).catch((error) => { if (token === sourceRevision) say(error.message || error); }); } });
@@ -679,6 +725,40 @@ function hmbNativeUiReadCommand(value, kind) {
     && (["stop_read", "cancel_pending", "cancel_video_import"].includes(command.action)
       || (command.action === "video_tools" && command.payload?.op === "cancel"));
 }
+// Locked echoes use only primitive/raw-string identity: no state clone/hash.
+// Complex values keep the original ownership-preserving update path.
+function hmbNativeUiLockedEchoKey(props) {
+  if (!props?.disabled || Object.getOwnPropertySymbols(props).length) return null;
+  const result = [typeof props.onChange === "function", typeof props.onCommand === "function"];
+  for (const key of Object.keys(props)) {
+    if (["onChange", "onCommand"].includes(key)) continue;
+    const property = Object.getOwnPropertyDescriptor(props, key);
+    if (!property || !Object.hasOwn(property, "value")) return null;
+    const value = property.value, type = typeof value;
+    if (key === "ui_options" && value !== null && type === "object") {
+      const prototype = Object.getPrototypeOf(value), keys = Object.keys(value);
+      if ((prototype !== Object.prototype && prototype !== null) || keys.length > 64 || Object.getOwnPropertySymbols(value).length) return null;
+      result.push(key, "flat-options", keys.length);
+      for (const option of keys) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, option);
+        if (!descriptor || !Object.hasOwn(descriptor, "value")) return null;
+        const field = descriptor.value, fieldType = typeof field;
+        if (field !== null && !["undefined", "boolean", "string", "number"].includes(fieldType)) return null;
+        if (fieldType === "number" && !Number.isFinite(field)) return null;
+        result.push(option, field);
+      }
+      continue;
+    }
+    if (value !== null && !["undefined", "boolean", "string", "number"].includes(type)) return null;
+    if (type === "number" && !Number.isFinite(value)) return null;
+    result.push(key, "primitive", value);
+  }
+  return result;
+}
+function hmbNativeUiLockedEchoMatches(next, previous) {
+  return next !== null && previous != null && next.length === previous.length
+    && next.every((value, index) => Object.is(value, previous[index]));
+}
 function hmbNativeUiContract(container, props, mount, policy) {
   if (!container) return mount(container, props);
   let c = container.__hmbNativeUiContract;
@@ -718,25 +798,33 @@ function hmbNativeUiContract(container, props, mount, policy) {
       c.observer?.observe?.(container, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled", "contenteditable"] });
     };
     c.wrap = () => {
-      const p = { ...c.props };
+      const p = { ...c.props }, cells = {};
       for (const name of ["onChange", "onCommand"]) if (typeof p[name] === "function") {
-        const callback = HMB_NATIVE_UI_CALLBACKS.get(p[name]) || p[name];
+        const cell = { callback: HMB_NATIVE_UI_CALLBACKS.get(p[name]) || p[name] };
+        cells[name] = cell;
         const fn = (...args) => {
           if (!c.active) throw new Error("This widget is no longer mounted.");
           if (c.props.disabled && !hmbNativeUiReadCommand(args[0], c.kind)) throw new Error("This control is disabled by Griptape.");
-          return callback?.(...args);
+          return cell.callback?.(...args);
         };
-        HMB_NATIVE_UI_CALLBACKS.set(fn, HMB_NATIVE_UI_CALLBACKS.get(p[name]) || p[name]); p[name] = fn;
+        HMB_NATIVE_UI_CALLBACKS.set(fn, cell.callback); p[name] = fn;
       }
-      return p;
+      c.callbackCells = cells; return p;
+    };
+    c.refreshCallbacks = () => {
+      for (const [name, cell] of Object.entries(c.callbackCells || {})) {
+        const current = c.props[name]; cell.callback = HMB_NATIVE_UI_CALLBACKS.get(current) || current;
+      }
     };
     c.proxy = {
       update(nextProps) {
         if (!c.active || c.closing) return;
-        c.restore(); c.props = nextProps || {}; const next = c.wrap();
+        const incoming = nextProps || {}, echoKey = hmbNativeUiLockedEchoKey(incoming);
+        if (hmbNativeUiLockedEchoMatches(echoKey, c.lockedEchoKey)) { c.props = incoming; c.refreshCallbacks(); return; }
+        c.lockedEchoKey = null; c.restore(); c.props = incoming; const next = c.wrap();
         if (typeof c.handle?.update === "function") c.handle.update(next);
         else c.handle = mount(container, next);
-        c.sync();
+        c.sync(); c.lockedEchoKey = c.props === incoming ? echoKey : null;
       },
       cleanup() {
         if (!c.active || c.closing) return; c.closing = true; c.restore();
@@ -751,7 +839,9 @@ function hmbNativeUiContract(container, props, mount, policy) {
     };
     container.__hmbNativeUiContract = c;
   }
-  c.restore(); c.props = props || c.props || {}; c.handle = mount(container, c.wrap()); c.sync(); return c.proxy;
+  const incoming = props || c.props || {}, echoKey = hmbNativeUiLockedEchoKey(incoming);
+  if (c.handle && hmbNativeUiLockedEchoMatches(echoKey, c.lockedEchoKey)) { c.props = incoming; c.refreshCallbacks(); return c.proxy; }
+  c.lockedEchoKey = null; c.restore(); c.props = incoming; c.handle = mount(container, c.wrap()); c.sync(); c.lockedEchoKey = c.props === incoming ? echoKey : null; return c.proxy;
 }
 // HMB_NATIVE_DISABLED_ADAPTER_V1_END
 

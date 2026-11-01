@@ -8,6 +8,81 @@ team release approval are separate from this source-level eligibility.
 from __future__ import annotations
 import re
 
+def _hmb_inline_iframe_session_binding():
+    MARKER = '/* HMB_NATIVE_IFRAME_SESSION_BINDING_V1 */'
+    HELPER = '/* HMB_NATIVE_IFRAME_SESSION_BINDING_V1 */\nfunction hmbNativeCreateIframeSessionBinder(apiClient) {\n  let sessionStateObserved = false;\n  return {\n    state(message) {\n      // An explicit null is authoritative too. Never manufacture a session or\n      // retain the previous session when the parent has cleared it.\n      sessionStateObserved = true;\n      apiClient.setSessionId(message.sessionId);\n    },\n    ready(config) {\n      // READY_ACK is only the initial fallback snapshot. A SESSION_STATE that\n      // arrived while initialize() awaited it is newer authority.\n      if (!sessionStateObserved) apiClient.setSessionId(config?.sessionId ?? null);\n    },\n  };\n}\nfunction hmbNativeUseIframeSessionBinder() {\n  // Witness belongs to this provider instance, never the module/API singleton.\n  // Remounting creates a fresh fallback boundary. The existing jYt effect\n  // cleanup prevents an old initialize continuation from invoking onReady.\n  const binding = (0,C.useRef)(null);\n  if (!binding.current) binding.current = hmbNativeCreateIframeSessionBinder(Id);\n  return binding.current;\n}\n'
+    _PROVIDER = 'var gra=({children:e})=>{let t=jYt('
+    _PROVIDER_BOUND = 'var gra=({children:e})=>{let hmbIframeSessionBinding=hmbNativeUseIframeSessionBinder();let t=jYt('
+    _STATE = 'onSessionState:e=>Id.setSessionId(e.sessionId)'
+    _STATE_BOUND = 'onSessionState:e=>hmbIframeSessionBinding.state(e)'
+    _READY = 'Id.setSessionId(e.config.sessionId??null),e.config'
+    _READY_BOUND = 'hmbIframeSessionBinding.ready(e.config),e.config'
+    _GUARD = 'Refusing to send ${e} without a session: no topicOptions provided and apiClient has no sessionId.'
+
+    def _one(source: str, old: str, new: str) -> str:
+        count = source.count(old)
+        if count != 1:
+            raise ValueError(f'iframe session anchor count {count}: {old[:100]}')
+        return source.replace(old, new, 1)
+
+    def patch_iframe_session_binding(source: str) -> tuple[str, dict]:
+        """Return candidate bytes plus a small receipt; unknown shapes fail closed.
+
+    This is the ordered binder only. It does not alter no-session send guards,
+    request topics, queueing, native optimistic setters, widget props or SDK.
+    """
+        if source.count(_GUARD) != 1:
+            raise ValueError('native no-session guard is missing or ambiguous')
+        if MARKER in source:
+            if source.count(MARKER) != 1 or source.count(HELPER) != 1 or source.count(_PROVIDER_BOUND) != 1 or (source.count(_STATE_BOUND) != 1) or (source.count(_READY_BOUND) != 1) or any((anchor in source for anchor in (_PROVIDER, _STATE, _READY))):
+                raise ValueError('partial or foreign iframe session binder; bytes preserved')
+            return (source, {'kind': 'ordered_iframe_session_binder', 'changed': False, 'already_applied': True, 'guard_preserved': True})
+        source = _one(source, _PROVIDER, HELPER + _PROVIDER_BOUND)
+        source = _one(source, _STATE, _STATE_BOUND)
+        source = _one(source, _READY, _READY_BOUND)
+        return (source, {'kind': 'ordered_iframe_session_binder', 'changed': True, 'already_applied': False, 'guard_preserved': True, 'session_state': 'authoritative_including_null', 'ready_ack': 'provider_local_fallback_only'})
+    return patch_iframe_session_binding
+
+def _hmb_inline_parameter_send_first():
+    MARKER = '/* HMB_NATIVE_HMB_PARAMETER_SEND_FIRST_V1 */'
+    _HEAD = 'function pui(e){let t=(0,w.c)(12),'
+    _HEAD_PATCHED = 'function pui(e){let t=(0,w.c)(13),'
+    _MEMO = 's;t[0]===r?s=t[1]:(s=(e,t,i)=>'
+    _MEMO_PATCHED = 's;t[0]===r&&t[12]===a?s=t[1]:(s=(e,t,i)=>'
+    _TAIL = '},t[0]=r,t[1]=s);let c=s,l=hui'
+    _TAIL_PATCHED = '},t[0]=r,t[1]=s,t[12]=a);let c=s,l=hui'
+    _UPDATER = 'r(r=>{let a=r.find(t=>t.id===e);return a&&a.data.elements&&a.data.elements.map(e=>({id:e.id,name:e.name,matches_elem_id:e.id===t||e.name===t})),r.map(r=>tui(r,e,t,i))})'
+    _SEND = 'Id.send(`SetParameterValueRequest`,{node_name:e,parameter_name:t,value:i})'
+    _BODY = '{' + _UPDATER + ',' + _SEND + '}'
+    _BODY_PATCHED = '{' + MARKER + 'const hmbNode=Array.isArray(a.current)?a.current.find(node=>node.id===e):null;' + 'const hmbSendFirst=hmbNode?.data?.metadata?.library===`HMB_GP_Production`' + '&&hmbIsNativeStudioType(hmbNode?.data?.node_type,hmbNode?.data?.metadata);' + 'if(hmbSendFirst)' + _SEND + ';' + _UPDATER + ';if(!hmbSendFirst)' + _SEND + '}'
+    _GUARD = 'Refusing to send ${e} without a session: no topicOptions provided and apiClient has no sessionId.'
+
+    def patch_hmb_parameter_send_first(source: str) -> tuple[str, dict]:
+        """Retain native void/throw/guard semantics; only owned HMB order changes."""
+        if not isinstance(source, str):
+            raise TypeError('native source must be text')
+        if source.count(_GUARD) != 1 or source.count('const hmbIsNativeStudioType =') != 1:
+            raise ValueError('native session guard or existing HMB ownership predicate changed')
+        pairs = ((_HEAD, _HEAD_PATCHED), (_MEMO, _MEMO_PATCHED), (_BODY, _BODY_PATCHED), (_TAIL, _TAIL_PATCHED))
+        if MARKER in source:
+            if source.count(MARKER) != 1 or any((source.count(new) != 1 or old in source for old, new in pairs)):
+                raise ValueError('partial or foreign HMB native setter ordering patch')
+            return (source, {'kind': 'hmb_parameter_send_first', 'changed': False, 'already_applied': True, 'guard_preserved': True, 'native_return_contract': 'void_or_same_sync_throw'})
+        if any((source.count(old) != 1 for old, _ in pairs)):
+            raise ValueError('native parameter setter anchors changed or ambiguous')
+        for old, new in pairs:
+            source = source.replace(old, new, 1)
+        return (source, {'kind': 'hmb_parameter_send_first', 'changed': True, 'already_applied': False, 'guard_preserved': True, 'hmb_scope': 'owned_metadata_and_existing_type_predicate', 'memo_dependency': 'setNodes_and_nodesRef', 'native_return_contract': 'void_or_same_sync_throw', 'standard_node_order': 'optimistic_then_send', 'semantic_replay_added': False})
+    return patch_hmb_parameter_send_first
+
+_hmb_patch_iframe_session_binding = _hmb_inline_iframe_session_binding()
+_hmb_patch_parameter_send_first = _hmb_inline_parameter_send_first()
+
+def _hmb_session_bound_editor_source(source: str) -> str:
+    source = _hmb_patch_iframe_session_binding(source)[0]
+    return _hmb_patch_parameter_send_first(source)[0]
+
+
 def one(value, old, new):
     if value.count(old) != 1:
         raise ValueError(f'header anchor count {value.count(old)}: {old[:100]}')
@@ -90,6 +165,10 @@ function hmbNativeConnectionDeletionNotice(request, message) {''')
 
 
 _REVIEWED_PREVIOUS_CANDIDATES = (
+    "d208403e7463adac2b3f778151aab55d3709892460460e8142fae8e91add4fbe",
+    "c9d95e131cce8db713447a1196c273edb4e5377e24efc4d7f94ca4715e3dc02f",
+    "9ec59e780c665cd304703d5e303fa0844de4149a1583fc66490a38369da87b78",
+    "72dc87c51089c65554a9fcb44f80e38872338bb5a9c1ca4c9058d582e981f6e5",
     "ccabfc9bfddb67896231e0e75b067e659287f19fca143b2355f2c295d5da5251",
     "bcb4ea1649a78258c87b795cb73762e09c96575b0f811cb8ec34f609e21c3e17",
 )
@@ -98,7 +177,8 @@ _REVIEWED_PREVIOUS_CANDIDATES = (
 def _upgrade_reviewed_candidate(source: str, helper: str) -> str:
     """Replace only our helper in an exact previously reviewed compiled bundle."""
     import hashlib
-    if hashlib.sha256(source.encode("utf-8")).hexdigest() not in _REVIEWED_PREVIOUS_CANDIDATES:
+    source_digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    if source_digest not in _REVIEWED_PREVIOUS_CANDIDATES:
         raise ValueError("unknown previous HMB editor candidate; existing bytes preserved")
     marker = "/* HMB_COLOR_LUT_NATIVE_HEADER_PORTAL_V1"
     boundary = "\nvar k8t=({node_name:"
@@ -106,7 +186,22 @@ def _upgrade_reviewed_candidate(source: str, helper: str) -> str:
         raise ValueError("ambiguous HMB helper boundaries")
     start = source.index(marker)
     end = source.index(boundary, start)
-    return _bash_live_input_bridge(_port_retention_notice_bridge(source[:start] + _compiled_helper(helper) + source[end:]))
+    source = source[:start] + _compiled_helper(helper) + source[end:]
+    if source_digest == "d208403e7463adac2b3f778151aab55d3709892460460e8142fae8e91add4fbe":
+        return source
+    if source_digest == "c9d95e131cce8db713447a1196c273edb4e5377e24efc4d7f94ca4715e3dc02f":
+        return _bash_snapshot_transport_bridge(source)
+    if source_digest == "9ec59e780c665cd304703d5e303fa0844de4149a1583fc66490a38369da87b78":
+        return _bash_snapshot_transport_bridge(_capsule_motion_bridge(source))
+    if source_digest == "72dc87c51089c65554a9fcb44f80e38872338bb5a9c1ca4c9058d582e981f6e5":
+        return _capsule_motion_bridge(_bash_readiness_bridge(source))
+    return _capsule_motion_bridge(_bash_live_input_bridge(_port_retention_notice_bridge(source)))
+
+
+def _capsule_motion_bridge(source: str) -> str:
+    return one(source,
+        'E,(e,t,r)=>m({w:t,h:r}),d?f:void 0,d),Id.request(`SetNodeMetadataRequest`',
+        'E,(e,t,r)=>m({w:t,h:r}),d?f:hmbNativeStudioCapsuleDuration(_,s),d),Id.request(`SetNodeMetadataRequest`')
 
 
 def _bash_live_input_bridge(source: str) -> str:
@@ -144,6 +239,346 @@ def _bash_live_input_bridge(source: str) -> str:
     anchor = 'children:[(0,z.jsx)(wG,{className:`flex-1`,onClick:e=>{e.stopPropagation(),Kt()},variant:`ghost`,children:`Cancel`}),(0,z.jsx)(wG,{className:`flex-1`,disabled:_e,onClick:e=>{e.stopPropagation(),Pt()}'
     assert src.count(anchor) == 1
     src = src.replace(anchor, 'children:[hmbUiActive&&hmbWarning?(0,z.jsx)(`div`,{role:`status`,className:`text-destructive`,children:hmbWarning}):hmbUiActive&&hmbBusy?(0,z.jsx)(`div`,{role:`status`,children:`새 입력 이미지를 확인하는 중입니다.`}):null,(0,z.jsx)(wG,{className:`flex-1`,onClick:e=>{e.stopPropagation(),Kt()},variant:`ghost`,children:`Cancel`}),(0,z.jsx)(wG,{className:`flex-1`,disabled:_e||(hmbUiActive&&(hmbBusy||!!hmbWarning)),onClick:e=>{e.stopPropagation();if(!hmbUiActive){Pt();return}const scope=hmbScope.current;Pt().catch(()=>{if(scope&&hmbScope.current===scope){hmbBlocked.current=true;hmbSetWarning(`이미지를 저장할 수 없습니다. 입력을 확인하고 편집기를 다시 여세요.`)}}).finally(()=>{if(scope)hmbSaving.current=false})}', 1)
+    return _bash_readiness_bridge(src)
+
+
+def _bash_readiness_bridge(src: str) -> str:
+    """Gate editor opening and reconcile current inputs without discarding edits."""
+    helpers = r'''// HMB_BASH_PREPARATION_V1: current source readiness, not a timer or image count.
+function hmbBashPreparation(value) {
+  const p=value?.preparation;
+  if (!p || p.schema!=='hmb-image-bash-preparation-v1' || !['idle','preparing','ready','error'].includes(p.phase)
+      || typeof p.ready!=='boolean' || !Number.isInteger(p.workspace_revision) || p.workspace_revision<0
+      || typeof p.node_instance_uuid!=='string' || !p.node_instance_uuid) throw Error('preparation_unavailable');
+  return p;
+}
+function hmbBashNodeScope(node) {
+  const m=node?.data?.metadata;
+  return node?.data?.node_type==='HMBImageBash' && m?.library==='HMB_GP_Production'
+    ? {workspace:m.hmb_image_bash_workspace_id||'',channel:m.hmb_image_bash_channel_uuid||'',identity:m.hmb_connection_identity_v1||null} : null;
+}
+function hmbBashMatches(p, scope) {
+  return p.workspace_id===scope.workspace && p.channel_uuid===scope.channel;
+}
+function hmbBashSamePreparation(a,b) {
+  return a.node_instance_uuid===b.node_instance_uuid && a.workspace_id===b.workspace_id
+    && a.channel_uuid===b.channel_uuid && a.workspace_revision===b.workspace_revision && a.ready===b.ready && a.phase===b.phase;
+}
+async function hmbBashReadCurrent(name, check) {
+  const read=async parameter=>{
+    const reply=await Id.request('GetParameterValueRequest',{node_name:name,parameter_name:parameter});
+    if (!check()) throw Error('workspace_changed');
+    if (!reply || !Object.prototype.hasOwnProperty.call(reply,'value')) throw Error('preparation_unavailable');
+    return reply.value;
+  };
+  const first=hmbBashPreparation(await read('HMB_IMAGE_BASH_UI'));
+  if (!first.ready || first.phase==='preparing' || first.phase==='error') return {preparation:first,doc:null};
+  const doc=await read('bash_image'),last=hmbBashPreparation(await read('HMB_IMAGE_BASH_UI'));
+  if (!hmbBashSamePreparation(first,last)) return {preparation:last,doc:null};
+  const h=doc?.meta?.hmb_image_bash;
+  if (first.workspace_id && (!h || h.workspace_id!==first.workspace_id || h.channel_uuid!==first.channel_uuid
+      || h.node_instance_uuid!==first.node_instance_uuid || h.workspace_revision!==first.workspace_revision)) return {preparation:last,doc:null};
+  return {preparation:last,doc};
+}
+async function hmbBashOpenSnapshot(name, fallback, getNode) {
+  const initial=hmbBashNodeScope(getNode(name));
+  if (!initial) return {value:fallback};
+  const epoch=hmbNativeStudioFlowEpoch;
+  const check=()=>{const next=hmbBashNodeScope(getNode(name));return epoch===hmbNativeStudioFlowEpoch && next
+    && next.workspace===initial.workspace && next.channel===initial.channel && next.identity===initial.identity};
+  try {
+    const snapshot=await hmbBashReadCurrent(name,check);
+    if (!check() || !hmbBashMatches(snapshot.preparation,initial)) throw Error('workspace_changed');
+    if (!snapshot.doc || !snapshot.preparation.ready) {
+      CJ.info(snapshot.preparation.phase==='error'?'이미지 소스 확인이 필요합니다':'작업 준비 중…',
+        {description:snapshot.preparation.error||'최신 이미지 준비가 끝나면 편집기 열기가 활성화됩니다.'});
+      return null;
+    }
+    return {value:snapshot.doc};
+  } catch {
+    CJ.info('편집기 준비 상태를 확인할 수 없습니다',{description:'입력 연결을 확인하고 다시 시도하세요. 기존 편집은 유지됩니다.'});
+    return null;
+  }
+}
+function hmbUseBashParameterReadiness(props) {
+  const {getNode}=xu(),{subscribeToEvent}=IX(),flow=eZ(v=>v.flowName),name=props.nodeName;
+  const owned=props.parameterName==='bash_image'&&props.ui_options?.modal==='ImageBashModal'&&!!hmbBashNodeScope(getNode(name));
+  const [view,setView]=C.useState(null);
+  C.useEffect(()=>{
+    if(!owned)return;let active=true,eventGeneration=0;const epoch=hmbNativeStudioFlowEpoch;
+    const update=value=>{if(!active||epoch!==hmbNativeStudioFlowEpoch)return;try{setView(hmbBashPreparation(value))}catch{setView(null)}};
+    const off=subscribeToEvent('ExecutionEvent',event=>{if(event?.payload_type==='ParameterValueUpdateEvent'
+      &&event.payload?.node_name===name&&event.payload?.parameter_name==='HMB_IMAGE_BASH_UI'){eventGeneration++;update(event.payload.value)}});
+    const queryGeneration=eventGeneration;
+    Id.request('GetParameterValueRequest',{node_name:name,parameter_name:'HMB_IMAGE_BASH_UI'}).then(reply=>{if(queryGeneration===eventGeneration)update(reply?.value)}).catch(()=>{if(active&&epoch===hmbNativeStudioFlowEpoch&&queryGeneration===eventGeneration)setView(null)});
+    return()=>{active=false;off?.()};
+  },[owned,name,flow,subscribeToEvent]);
+  if(!owned)return props;
+  const current=hmbBashNodeScope(getNode(name)),valid=view&&current&&hmbBashMatches(view,current);
+  const busy=!valid||view.phase==='preparing',failed=valid&&view.phase==='error';
+  return {...props,executing:props.executing||busy,
+    ui_options:{...props.ui_options,button_label:busy?'작업 준비 중…':failed?'소스 확인 필요':props.ui_options.button_label},
+    tooltip:busy?'최신 원본을 확인하고 있습니다. 기존 편집 내용은 유지됩니다.':failed?(view.error||'이미지 라이브러리에서 다시 시도하세요.'):props.tooltip};
+}
+'''
+    # Keep the existing native renderer and memoization contracts. Only the HMB
+    # parameter consumes the additional readiness projection; stock nodes return
+    # their exact original props and open behavior.
+    src = one(src, 'function yLr(e){let t=(0,w.c)(33),',
+        'function yLr(e){const {getNode:hmbBashOpenNode}=xu();e=hmbUseBashParameterReadiness(e);let t=(0,w.c)(33),')
+    src = one(src, 't=await _({parameterValue:e,nodeName:l});t&&a&&!h&&a(t)',
+        'hmbOpen=await hmbBashOpenSnapshot(l,e,hmbBashOpenNode);if(!hmbOpen)return;let t=await _({parameterValue:hmbOpen.value,nodeName:l});t&&a&&!h&&a(t)')
+    # Image preview context-menu opens use the same fresh-snapshot handshake.
+    src = one(src, '}){let m=(0,C.useMemo)(()=>t?.name??`Image`,[t]),h=',
+        '}){const {getNode:hmbBashOpenNode}=xu();let m=(0,C.useMemo)(()=>t?.name??`Image`,[t]),h=')
+    src = one(src, 'T=(0,C.useCallback)(async()=>{let e=await y({parameterValue:t,nodeName:c});e&&r&&r(e)},[t,c,y,r])',
+        'T=(0,C.useCallback)(async()=>{const ready=await hmbBashOpenSnapshot(c,t,hmbBashOpenNode);if(!ready)return;let e=await y({parameterValue:ready.value,nodeName:c});e&&r&&r(e)},[t,c,y,r])')
+    start = src.index('const hmbMetaRef=(0,C.useRef)(null)')
+    boundary = '(0,C.useEffect)(()=>{if(F&&D===`select`&&fe.current)'
+    end = src.index(boundary, start)
+    hook = r'''const hmbMetaRef=C.useRef(null),hmbPending=C.useRef(null),hmbScope=C.useRef(null),hmbRevision=C.useRef(0),hmbLayers=C.useRef(j),hmbCommit=C.useRef(null),hmbQueued=C.useRef(null),hmbSaving=C.useRef(false),hmbBlocked=C.useRef(false),hmbRefresh=C.useRef(null),hmbHydrated=C.useRef(false);
+const [hmbTick,hmbSetTick]=C.useState(0),[hmbWarning,hmbSetWarning]=C.useState(''),[hmbBusy,hmbSetBusy]=C.useState(false);hmbLayers.current=j;
+const hmbUiNode=hmbLiveNode(b),hmbUiScope=hmbBashNodeScope(hmbUiNode),hmbSession=hmbScope.current?.name===b&&hmbScope.current?.flow===hmbLiveFlow&&hmbScope.current?.epoch===hmbNativeStudioFlowEpoch;
+const hmbUiActive=!!hmbSession&&!!hmbUiScope&&hmbScope.current?.workspace===hmbUiScope.workspace&&hmbScope.current?.channel===hmbUiScope.channel;
+const hmbRenderPreparing=!!(_&&hmbUiScope?.workspace&&(!hmbUiActive||hmbBusy));
+C.useEffect(()=>{
+ if(!_||!b||!hmbLiveFlow)return;const initial=hmbBashNodeScope(hmbLiveNode(b));
+ if(!initial?.workspace||!initial.channel){hmbScope.current=null;hmbSetBusy(false);hmbSetWarning('');return;}
+ const h=g?.meta?.hmb_image_bash||{},scope={name:b,flow:hmbLiveFlow,epoch:hmbNativeStudioFlowEpoch,...initial,
+   instance:h.node_instance_uuid||null,revision:Number.isInteger(h.workspace_revision)?h.workspace_revision:-1,wanted:-1};
+ hmbScope.current=scope;hmbMetaRef.current=g?.meta||{};hmbPending.current=null;hmbCommit.current=null;hmbQueued.current=null;hmbBlocked.current=false;hmbHydrated.current=false;
+ hmbSetWarning('');hmbSetBusy(true);let active=true,refreshGeneration=0;
+ const check=()=>{const n=hmbBashNodeScope(hmbLiveNode(b));return active&&hmbScope.current===scope&&scope.epoch===hmbNativeStudioFlowEpoch&&n
+   &&n.workspace===scope.workspace&&n.channel===scope.channel&&n.identity===scope.identity};scope.check=check;
+ const warning=message=>{hmbBlocked.current=true;hmbSetBusy(false);hmbSetWarning(message)};
+ const invalidate=()=>{active=false;refreshGeneration++;hmbRevision.current++;hmbPending.current=null;hmbCommit.current=null;hmbQueued.current=null;
+   warning('작업 공간이 변경되었습니다. 편집 내용은 유지됩니다. 연결을 확인하세요.')};
+ const preparing=prep=>{if(!check()||!hmbBashMatches(prep,scope)){invalidate();return;}
+   if(scope.instance&&prep.node_instance_uuid!==scope.instance){invalidate();return;}
+   scope.instance=prep.node_instance_uuid;scope.wanted=Math.max(scope.wanted,prep.workspace_revision);
+   refreshGeneration++;hmbRevision.current++;hmbPending.current=null;hmbCommit.current=null;hmbQueued.current=null;
+   if(prep.phase==='error'){warning(prep.error||'이미지 원본을 확인할 수 없습니다. 다시 시도하세요.');return;}
+   hmbBlocked.current=false;hmbSetWarning('');hmbSetBusy(true);
+ };
+ const accept=(doc,prep)=>{
+   if(!check()){invalidate();return;}const meta=doc?.meta,next=meta?.hmb_image_bash;
+   if(!prep?.ready||!hmbBashMatches(prep,scope)||!next||next.workspace_id!==scope.workspace||next.channel_uuid!==scope.channel
+     ||next.node_instance_uuid!==prep.node_instance_uuid||next.workspace_revision!==prep.workspace_revision)return;
+   if(scope.instance&&scope.instance!==next.node_instance_uuid){invalidate();return;}
+   if(next.workspace_revision<Math.max(scope.revision,scope.wanted))return;
+   if(hmbSaving.current){warning('저장 중 입력이 변경되었습니다. 저장 결과를 적용하지 않았습니다.');return;}
+   scope.instance=next.node_instance_uuid;scope.revision=next.workspace_revision;scope.wanted=next.workspace_revision;hmbBlocked.current=false;hmbSetWarning('');
+   if(hmbCommit.current){hmbQueued.current={doc,scope,check};return;}
+   hmbPending.current={doc,scope,revision:++hmbRevision.current,check};hmbSetBusy(true);hmbSetTick(v=>v+1);
+ };
+ const refresh=async()=>{
+   if(!check())return;const token=++refreshGeneration;hmbSetBusy(true);
+   try{const current=await hmbBashReadCurrent(b,()=>check()&&token===refreshGeneration);
+     if(!check()||token!==refreshGeneration)return;
+     if(!current.preparation.ready||!current.doc){preparing(current.preparation);return;}
+     accept(current.doc,current.preparation);
+   }catch(error){if(check()&&token===refreshGeneration)warning('최신 이미지 상태를 확인하지 못했습니다. 다시 시도하세요.');}
+ };hmbRefresh.current=refresh;
+ const off=hmbLiveSubscribe('ExecutionEvent',event=>{
+   if(event?.payload_type!=='ParameterValueUpdateEvent'||event.payload?.node_name!==b)return;
+   if(!check()){invalidate();return;}
+   if(event.payload.parameter_name==='HMB_IMAGE_BASH_UI'){
+     try{const prep=hmbBashPreparation(event.payload.value);if(prep.workspace_revision<scope.wanted)return;
+       if(!prep.ready)preparing(prep);else {
+         if(scope.instance&&prep.node_instance_uuid!==scope.instance){invalidate();return;}
+         if(prep.workspace_revision>Math.max(scope.revision,scope.wanted)){
+           scope.wanted=prep.workspace_revision;hmbRevision.current++;hmbPending.current=null;hmbCommit.current=null;hmbQueued.current=null;
+         }
+         if(!hmbSaving.current||prep.workspace_revision!==scope.revision)refresh();
+       }}catch{warning('입력 준비 상태가 올바르지 않습니다. 다시 시도하세요.');}
+   }else if(event.payload.parameter_name==='bash_image'&&!hmbSaving.current){refresh();}
+ });
+ const offDelete=hmbLiveSubscribe('DeleteNodeResultSuccess',event=>{if(!event?.node_name||event.node_name===b)invalidate()});
+ const offCreate=hmbLiveSubscribe('CreateNodeResultSuccess',event=>{if(event?.node_name===b)invalidate()});
+ const offReset=hmbLiveSubscribe('ResetNodeToDefaultsResultSuccess',event=>{if(event?.node_name===b)invalidate()});
+ // Subscribe before rereading: events between the button click and modal mount
+ // cannot strand an old snapshot. An already-open editor uses this same path.
+ refresh();
+ return()=>{active=false;refreshGeneration++;hmbRevision.current++;hmbPending.current=null;hmbCommit.current=null;hmbQueued.current=null;
+   if(hmbScope.current===scope){hmbScope.current=null;hmbMetaRef.current=null;hmbRefresh.current=null;}off?.();offDelete?.();offCreate?.();offReset?.();};
+},[_,b,e,hmbLiveFlow,hmbLiveNode,hmbLiveSubscribe]);
+C.useEffect(()=>{
+ const pending=hmbPending.current;if(!_||!pending||hmbCommit.current||ee||!xe||!x.current)return;
+ // Stock's private cache marker can be cleared by a delayed close callback.
+ // Observe the actual hydrated layers and stage instead of that marker.
+ if(!hmbHydrated.current){const seeded=g?.meta?.konva_json?.images||[];
+   if(seeded.some(layer=>!hmbLayers.current.some(current=>current.id===layer.id)))return;
+   hmbHydrated.current=true;}
+ let canceled=false;const aborter=new AbortController,deadline=Date.now()+30000;
+ (async()=>{try{const meta=pending.doc.meta,plan=hmbModalLivePlan(hmbMetaRef.current,meta),loaded=[];
+   for(const layer of plan.additions){let src=layer.src;try{src=(await hmbModalLiveBound(qY(src,t),aborter.signal,deadline-Date.now())).url||src}catch(error){if(error?.message==='source_timeout'||aborter.signal.aborted)throw error;}
+     await hmbModalLiveBound(hmbModalLiveImage(src,aborter.signal),aborter.signal,deadline-Date.now());loaded.push({...layer,src});}
+   if(canceled||hmbPending.current!==pending||pending.revision!==hmbRevision.current||!pending.check())return;
+   hmbModalLiveMerge(hmbLayers.current,loaded);
+   if(!loaded.length){hmbMetaRef.current=meta;hmbPending.current=null;hmbSetWarning('');hmbSetBusy(false);return;}
+   hmbCommit.current={pending,meta,loaded};M(prev=>pending.revision===hmbRevision.current&&pending.check()?hmbModalLiveMerge(prev,loaded):prev);hmbSetTick(v=>v+1);
+ }catch(error){aborter.abort();if(!canceled&&hmbPending.current===pending&&pending.check()){
+   hmbBlocked.current=true;hmbPending.current=null;hmbSetBusy(false);hmbSetWarning(error?.message==='source_timeout'?'이미지 로드 시간이 초과되었습니다. 같은 창에서 다시 시도하세요.':'이미지 소스 또는 레이어 충돌을 확인하세요. 기존 편집은 유지됩니다.');}}
+ })();return()=>{canceled=true;aborter.abort()};
+},[_,b,e,hmbLiveFlow,hmbTick,ee,xe,j,g]);
+C.useEffect(()=>{const c=hmbCommit.current;if(!c)return;
+ if(c.pending.revision!==hmbRevision.current||!c.pending.check()){hmbCommit.current=null;hmbQueued.current=null;return;}
+ const ok=c.loaded.every(x=>j.some(y=>y.id===x.id&&y.source_uid===x.source_uid));hmbCommit.current=null;hmbPending.current=null;
+ if(ok){hmbMetaRef.current=c.meta;hmbSetWarning('');const queued=hmbQueued.current;hmbQueued.current=null;
+   if(queued&&queued.check()){hmbPending.current={...queued,revision:++hmbRevision.current};hmbSetBusy(true);hmbSetTick(v=>v+1);}else hmbSetBusy(false);
+ }else{hmbBlocked.current=true;hmbQueued.current=null;hmbSetBusy(false);hmbSetWarning('이미지 레이어가 충돌합니다. 기존 편집은 유지됩니다.');}
+},[j,hmbTick,_,b,e,hmbLiveFlow]);
+const hmbRetry=()=>{const scope=hmbScope.current;if(!scope?.check?.())return;hmbSetWarning('');hmbSetBusy(true);hmbBlocked.current=false;
+ Id.request('GetParameterValueRequest',{node_name:b,parameter_name:'HMB_IMAGE_BASH_UI'}).then(reply=>{
+   if(!scope.check())throw Error('workspace_changed');const header=reply?.value,prep=hmbBashPreparation(header);
+   const source=header?.bound_source,instance=header?.source_instances?.[source];
+   if(!source||!instance||!hmbBashMatches(prep,scope))throw Error('workspace_changed');
+   return Id.request('SetParameterValueRequest',{node_name:b,parameter_name:'HMB_IMAGE_BASH_UI',value:{hmb_image_bash_command:{
+     operation:'retry_inputs',source_node_name:source,workspace_id:prep.workspace_id,source_instance_id:instance}}});
+ }).then(()=>hmbRefresh.current?.()).catch(()=>{if(scope.check()){hmbBlocked.current=true;hmbSetBusy(false);hmbSetWarning('입력을 다시 확인하지 못했습니다. 연결을 확인하세요.');}});};
+'''
+    src = src[:start] + hook + src[end:]
+    src = one(src, 'var iri=C.memo(function(){', helpers + '\nvar iri=C.memo(function(){')
+    row = 'className:`flex overflow-hidden flex-row flex-1`,children:['
+    heading = src.index('children:`Image Bash Editor`')
+    row_start = src.index(row, heading)
+    if row_start - heading > 8000:
+        raise ValueError('Image Bash editor body boundary changed')
+    overlay = 'className:`flex overflow-hidden flex-row flex-1`,style:{position:`relative`},children:[hmbRenderPreparing?(0,z.jsx)(`div`,{role:`status`,"aria-live":`polite`,style:{position:`absolute`,inset:0,zIndex:50,display:`grid`,placeItems:`center`,background:`var(--background,#111827)`},children:`작업 준비 중… 최신 이미지를 불러오고 있습니다.`}):null,'
+    src = src[:row_start] + overlay + src[row_start + len(row):]
+    src = one(src, 'hmbUiActive&&hmbWarning?(0,z.jsx)(`div`,{role:`status`,className:`text-destructive`,children:hmbWarning})',
+        'hmbUiActive&&hmbWarning?(0,z.jsxs)(`div`,{role:`status`,className:`text-destructive`,children:[hmbWarning,(0,z.jsx)(wG,{onClick:hmbRetry,disabled:!hmbScope.current?.check?.(),children:`다시 시도`})]})')
+    src = one(src, 'disabled:_e||(hmbUiActive&&(hmbBusy||!!hmbWarning))',
+        'disabled:_e||hmbRenderPreparing||(hmbUiActive&&(hmbBusy||!!hmbWarning))')
+    return _bash_snapshot_transport_bridge(src)
+
+
+def _bash_snapshot_transport_bridge(src: str) -> str:
+    """Read only small host headers; the current event document stays local.
+
+    A host-issued snapshot token plus scope and editor commit fences the local
+    value. Never fetch the canonical PNG/receipt document merely to open a
+    modal. Unknown or delayed documents remain closed until an update arrives.
+    """
+    start = src.index('async function hmbBashReadCurrent(')
+    end = src.index('async function hmbBashOpenSnapshot(', start)
+    reader = r'''const hmbBashDocumentCache=new Map();
+function hmbBashRememberDocument(name,doc,owner,kind='props') {
+  const h=doc?.meta?.hmb_image_bash;
+  const previous=hmbBashDocumentCache.get(name),owners=previous?.epoch===hmbNativeStudioFlowEpoch?previous.owners:new Set();
+  const prior=previous?.epoch===hmbNativeStudioFlowEpoch?previous:null;
+  const valid=!!h&&typeof h.editor_snapshot_id==='string'&&!!h.editor_snapshot_id;
+  const adopt=valid&&(kind==='event'||!prior?.doc||prior.kind!=='event'||h.editor_snapshot_id===prior.doc?.meta?.hmb_image_bash?.editor_snapshot_id);
+  const retired=adopt&&h.editor_snapshot_id!==prior?.retired?null:prior?.retired||null;
+  owners.add(owner);hmbBashDocumentCache.set(name,{doc:adopt?doc:prior?.doc||null,owners,kind:adopt?(prior?.kind==='event'?'event':kind):prior?.kind||kind,epoch:hmbNativeStudioFlowEpoch,
+    retired,retired_commit:retired?prior?.retired_commit||null:null});
+}
+function hmbBashParameterPresent(name) {
+  const entry=hmbBashDocumentCache.get(name);
+  return entry?.epoch===hmbNativeStudioFlowEpoch&&entry.owners.size>0;
+}
+function hmbBashReleaseDocument(name,owner) {
+  const entry=hmbBashDocumentCache.get(name);
+  if(!entry||!entry.owners.has(owner))return;
+  entry.owners.delete(owner);if(!entry.owners.size)hmbBashDocumentCache.delete(name);
+}
+function hmbBashOutgoingMeta(meta,name,commit) {
+  const h=meta?.hmb_image_bash;
+  if (!h || typeof h!=='object') return meta;
+  const entry=hmbBashDocumentCache.get(name);
+  if(entry?.epoch===hmbNativeStudioFlowEpoch&&h.editor_snapshot_id){entry.retired=h.editor_snapshot_id;entry.retired_commit=commit||null;}
+  const {editor_snapshot_id,...rest}=h;
+  return {...meta,hmb_image_bash:rest};
+}
+function hmbBashClearRejectedDocument(name,request,epoch) {
+  if(request?.node_name!==name||request?.parameter_name!=='bash_image')return;
+  const entry=hmbBashDocumentCache.get(name),h=entry?.doc?.meta?.hmb_image_bash,next=request.value?.meta?.hmb_image_bash;
+  if(entry?.epoch!==epoch||!entry.retired_commit||request.value?.meta?.created_at!==entry.retired_commit
+    ||entry.retired!==h?.editor_snapshot_id||!next||!['workspace_id','channel_uuid','workspace_revision','node_instance_uuid'].every(key=>next[key]===h[key]))return;
+  entry.retired=null;entry.retired_commit=null;
+}
+async function hmbBashReadHeader(name,check) {
+  const reply=await Id.request('GetParameterValueRequest',{node_name:name,parameter_name:'HMB_IMAGE_BASH_UI'},{timeoutMs:10000});
+  if(!check())throw Error('workspace_changed');
+  if(!reply||!Object.prototype.hasOwnProperty.call(reply,'value'))throw Error('preparation_unavailable');
+  return hmbBashPreparation(reply.value);
+}
+function hmbBashDocumentMatches(doc,p) {
+  if(!p.workspace_id)return !!doc;
+  const h=doc?.meta?.hmb_image_bash;
+  return !!h&&typeof p.editor_snapshot_id==='string'&&!!p.editor_snapshot_id
+    &&h.editor_snapshot_id===p.editor_snapshot_id&&h.workspace_id===p.workspace_id
+    &&h.channel_uuid===p.channel_uuid&&h.node_instance_uuid===p.node_instance_uuid
+    &&h.workspace_revision===p.workspace_revision
+    &&(p.editor_commit==null||doc.meta.created_at===p.editor_commit);
+}
+async function hmbBashReadCurrent(name,check,fallback) {
+  const first=await hmbBashReadHeader(name,check);
+  if(!first.ready||first.phase==='preparing'||first.phase==='error')return {preparation:first,doc:null};
+  const cached=hmbBashDocumentCache.get(name);
+  if(cached?.epoch===hmbNativeStudioFlowEpoch&&cached.retired===first.editor_snapshot_id)return {preparation:first,doc:null,waiting:true};
+  const doc=hmbBashDocumentMatches(fallback,first)?fallback:
+    cached?.epoch===hmbNativeStudioFlowEpoch&&hmbBashDocumentMatches(cached.doc,first)?cached.doc:null;
+  if(!doc)return {preparation:first,doc:null,waiting:true};
+  const last=await hmbBashReadHeader(name,check);
+  if(!hmbBashSamePreparation(first,last)||!hmbBashDocumentMatches(doc,last))return {preparation:last,doc:null,waiting:true};
+  return {preparation:last,doc};
+}
+'''
+    src = src[:start] + reader + src[end:]
+    src = one(src,
+        '&& a.channel_uuid===b.channel_uuid && a.workspace_revision===b.workspace_revision && a.ready===b.ready && a.phase===b.phase;',
+        '&& a.channel_uuid===b.channel_uuid && a.workspace_revision===b.workspace_revision && a.ready===b.ready && a.phase===b.phase\n    && a.editor_snapshot_id===b.editor_snapshot_id && a.editor_commit===b.editor_commit;')
+    src = one(src, 'const snapshot=await hmbBashReadCurrent(name,check);',
+        'const snapshot=await hmbBashReadCurrent(name,check,fallback);')
+    src = one(src, 'const [view,setView]=C.useState(null);',
+        "const [view,setView]=C.useState(null),[queryError,setQueryError]=C.useState(''),owner=C.useRef(null);if(!owner.current)owner.current={};")
+    src = one(src, "  C.useEffect(()=>{\n    if(!owned)return;let active=true,eventGeneration=0;const epoch=hmbNativeStudioFlowEpoch;",
+        "  C.useLayoutEffect(()=>{if(owned)hmbBashRememberDocument(name,props.value,owner.current);},[owned,name,flow,props.value]);\n  C.useLayoutEffect(()=>{\n    if(!owned)return;let active=true,eventGeneration=0;const epoch=hmbNativeStudioFlowEpoch;")
+    src = one(src, 'if(!owned)return;let active=true,eventGeneration=0;const epoch=hmbNativeStudioFlowEpoch;',
+        "if(!owned)return;setView(null);setQueryError('');hmbBashRememberDocument(name,props.value,owner.current);let active=true,eventGeneration=0;const epoch=hmbNativeStudioFlowEpoch;")
+    src = one(src, 'try{setView(hmbBashPreparation(value))}catch{setView(null)}};',
+        "try{setView(hmbBashPreparation(value));setQueryError('')}catch{setView(null);setQueryError('편집기 준비 정보를 확인할 수 없습니다. 다시 시도하세요.')}};")
+    src = one(src,
+        "Id.request('GetParameterValueRequest',{node_name:name,parameter_name:'HMB_IMAGE_BASH_UI'}).then(reply=>{if(queryGeneration===eventGeneration)update(reply?.value)}).catch(()=>{if(active&&epoch===hmbNativeStudioFlowEpoch&&queryGeneration===eventGeneration)setView(null)});",
+        "Id.request('GetParameterValueRequest',{node_name:name,parameter_name:'HMB_IMAGE_BASH_UI'},{timeoutMs:10000}).then(reply=>{if(queryGeneration===eventGeneration)update(reply?.value)}).catch(()=>{if(active&&epoch===hmbNativeStudioFlowEpoch&&queryGeneration===eventGeneration){setView(null);setQueryError('연결 응답이 지연됩니다. 잠시 후 다시 시도하세요.')}});")
+    src = one(src,
+        "const off=subscribeToEvent('ExecutionEvent',event=>{if(event?.payload_type==='ParameterValueUpdateEvent'\n      &&event.payload?.node_name===name&&event.payload?.parameter_name==='HMB_IMAGE_BASH_UI'){eventGeneration++;update(event.payload.value)}});",
+        "const off=subscribeToEvent('ExecutionEvent',event=>{if(event?.payload_type!=='ParameterValueUpdateEvent'||event.payload?.node_name!==name)return;\n      if(event.payload.parameter_name==='bash_image')hmbBashRememberDocument(name,event.payload.value,owner.current,'event');\n      else if(event.payload.parameter_name==='HMB_IMAGE_BASH_UI'){eventGeneration++;update(event.payload.value)}});")
+    src = one(src, 'return()=>{active=false;off?.()};',
+        "const offFailure=subscribeToEvent('SetParameterValueResultFailure',(_result,request)=>hmbBashClearRejectedDocument(name,request,epoch));\n    return()=>{active=false;off?.();offFailure?.();hmbBashReleaseDocument(name,owner.current)};")
+    src = one(src, "const busy=!valid||view.phase==='preparing',failed=valid&&view.phase==='error';",
+        "const busy=!queryError&&(!valid||view.phase==='preparing'||(!!view.workspace_id&&view.ready&&!view.editor_snapshot_id)),failed=!!queryError||(valid&&view.phase==='error');")
+    src = one(src, "failed?(view.error||'이미지 라이브러리에서 다시 시도하세요.'):props.tooltip};",
+        "failed?(queryError||view?.error||'이미지 라이브러리에서 다시 시도하세요.'):props.tooltip};")
+    src = one(src, 'hmbHydrated=C.useRef(false);', 'hmbHydrated=C.useRef(false),hmbLatestDoc=C.useRef(g);')
+    src = one(src, "hmbScope.current=scope;hmbMetaRef.current=g?.meta||{};hmbPending.current=null;",
+        "hmbScope.current=scope;hmbLatestDoc.current=g;hmbMetaRef.current=g?.meta||{};hmbPending.current=null;")
+    src = one(src, 'if(!check())return;const token=++refreshGeneration;hmbSetBusy(true);',
+        'if(!check())return;clearTimeout(scope.documentWait);const token=++refreshGeneration;hmbSetBusy(true);')
+    src = one(src, 'const current=await hmbBashReadCurrent(b,()=>check()&&token===refreshGeneration);',
+        'const current=await hmbBashReadCurrent(b,()=>check()&&token===refreshGeneration,hmbLatestDoc.current);')
+    src = one(src, 'if(!current.preparation.ready||!current.doc){preparing(current.preparation);return;}',
+        "if(current.waiting){scope.documentWait=setTimeout(()=>{if(check()&&token===refreshGeneration)warning('최신 편집 장면이 아직 도착하지 않았습니다. 기존 편집은 유지됩니다. 다시 시도하세요.')},10000);return;}\n     if(!current.preparation.ready||!current.doc){preparing(current.preparation);return;}")
+    src = one(src, "}else if(event.payload.parameter_name==='bash_image'&&!hmbSaving.current){refresh();}",
+        "}else if(event.payload.parameter_name==='bash_image'){hmbLatestDoc.current=event.payload.value;if(!hmbSaving.current)refresh();}")
+    src = one(src, 'return()=>{active=false;refreshGeneration++;hmbRevision.current++;hmbPending.current=null;',
+        'return()=>{active=false;clearTimeout(scope.documentWait);refreshGeneration++;hmbRevision.current++;hmbPending.current=null;')
+    src = one(src, '...(hmbApplySnapshot?.meta||{}),created_at:',
+        '...(hmbApplySnapshot?.meta?hmbBashOutgoingMeta(hmbApplySnapshot.meta,hmbApplySnapshot.scope.name,hmbApplySnapshot.commit):{}),created_at:')
+    src = one(src, 'meta:hmbMetaRef.current}:null;if(hmbApplySnapshot)',
+        'meta:hmbMetaRef.current,commit:new Date().toISOString()}:null;if(hmbApplySnapshot)')
+    src = one(src, 'hmbApplySnapshot.commit):{}),created_at:new Date().toISOString()',
+        'hmbApplySnapshot.commit):{}),created_at:hmbApplySnapshot?.commit||new Date().toISOString()')
+    src = one(src, "Id.request('GetParameterValueRequest',{node_name:b,parameter_name:'HMB_IMAGE_BASH_UI'}).then(reply=>{",
+        "Id.request('GetParameterValueRequest',{node_name:b,parameter_name:'HMB_IMAGE_BASH_UI'},{timeoutMs:10000}).then(reply=>{")
+    src = one(src,
+        'CKt=(e,t,r,i)=>Id.request(`SendNodeMessageRequest`,{node_name:e,optional_element_name:t,message_type:r,message:i}),',
+        'CKt=(e,t,r,i,a)=>Id.request(`SendNodeMessageRequest`,{node_name:e,optional_element_name:t,message_type:r,message:i},a),')
+    src = one(src, 'icon_position:e.icon_position||`left`}});if(t?.response)',
+        'icon_position:e.icon_position||`left`}},hmbBashParameterPresent(i)&&a===`output_file`?{timeoutMs:10000}:void 0);if(t?.response)')
+    src = one(src, 'catch(e){console.error(`Button press error:`,e)}finally{s(!1),l(!1)}}}',
+        'catch(e){console.error(`Button press error:`,e);if(hmbBashParameterPresent(i)&&a===`output_file`)CJ.error(`출력 파일 설정 응답을 확인하지 못했습니다`,{description:`설정 노드가 이미 열렸는지 확인한 뒤 다시 시도하세요. 출력 파일은 삭제하지 않습니다.`})}finally{s(!1),l(!1)}}}')
     return src
 
 
@@ -154,11 +589,16 @@ def _port_retention_notice_bridge(source: str) -> str:
         'i===`failure`&&!hmbNativePortRetainedNotice(t,r)&&(o===`PermissionDeniedResult`?Cra(t,r):w_r({result:t,request:r}))')
 
 
-def build_candidate(source: str, helper: str) -> str:
+def _build_candidate_ui_core(source: str, helper: str) -> str:
     """Return an uninstalled candidate or raise when required shape is absent."""
     if not isinstance(source, str) or not isinstance(helper, str):
         raise TypeError('editor source and HMB helper must be text')
     if 'HMB_COLOR_LUT_NATIVE_HEADER_PORTAL_V1' in source:
+        import hashlib
+        reviewed = approval_evidence()
+        if (hashlib.sha256(source.encode('utf-8')).hexdigest() == reviewed['candidate_sha256']
+                and hashlib.sha256(helper.encode('utf-8')).hexdigest() == reviewed['helper_sha256']):
+            return source  # Exact current bytes only; unknown input still fails closed.
         return _upgrade_reviewed_candidate(source, helper)
     for anchor in ('var k8t=({node_name:', '};function A8t', 'function Dqr(', '}function Oqr(', 'function lqr(', '}function uqr('):
         if source.count(anchor) != 1:
@@ -228,11 +668,15 @@ def build_candidate(source: str, helper: str) -> str:
     source = one(source, 'node_type:r.node_type,specific_library_name:r.library_name,metadata:{position:i,tempId:a},set_as_new_context:!1})', 'node_type:r.node_type,specific_library_name:r.library_name,metadata:hmbColorLUTCreateMetadata(r.node_type,{position:i,tempId:a}),set_as_new_context:!1})')
     source = one(source, 'Id.send(`DeleteNodeRequest`,{node_name:t.id})}),!a.some(e=>e.hmbGuardedDelete)&&h()', '(t.hmbGuardedDelete?hmbNativeSubmitCheckedDelete(t.id).catch(e=>hmbNativeCheckedDeleteFailure(t.id,e)):Id.send(`DeleteNodeRequest`,{node_name:t.id}))}),!a.some(e=>e.hmbGuardedDelete)&&h()')
     source = one(source, 'try{await Id.request(`DeleteNodeRequest`,{node_name:s});if(i.hmbGuardedDelete)', 'try{await(i.hmbGuardedDelete?hmbNativeSubmitCheckedDelete(s):Id.request(`DeleteNodeRequest`,{node_name:s}));if(i.hmbGuardedDelete)')
-    return _bash_live_input_bridge(_port_retention_notice_bridge(source))
+    return _capsule_motion_bridge(_bash_live_input_bridge(_port_retention_notice_bridge(source)))
+
+def build_candidate(source: str, helper: str) -> str:
+    """Preserve reviewed UI transforms, then apply the two hashed inline seams."""
+    return _hmb_session_bound_editor_source(_build_candidate_ui_core(source, helper))
 
 def approval_evidence() -> dict:
-    """Exact independently verified local candidate; desktop confirmation separate."""
-    return {'status': 'approved', 'structural_anchors': 'matched', 'live_renderer_verified': True, 'deletion_verified': True, 'desktop_verified': False, 'team_release_approved': False, 'renderer_scope': 'Exact compiled local candidate/private SDK, live Bash sources/Apply/cold browser and native reconnect; stock/store contracts scoped independently', 'source_sha256': '157e06c446d68d77bab30cba4578f5a71289da74d62c44c95b0b6ddd046edde6', 'candidate_sha256': '72dc87c51089c65554a9fcb44f80e38872338bb5a9c1ca4c9058d582e981f6e5', 'helper_sha256': '03137c19feb8f4fa4d5e371eb52bae3aaaccf4afb6a29f0098e815bccf65ee25', 'verification_sha256': {'reports\\usability-latency-20261028\\bash\\FINAL-MODAL-EVIDENCE.json': '7567474a07e271cad449887631d6a183b2660573f31981306002a575b3f69bfc', 'reports\\usability-latency-20261028\\bash\\modal-live-alias-staged.json': 'b4d3a41ac7ec84d757c2de8f752cb322afc7aa8f666065df172857c370aafaa3', 'reports\\usability-latency-20261028\\bash\\modal-live-delete-staged.json': 'c37f93ba9ab0c735390dc161393b76f669e5f40012855e796ddd68136adbe1ce', 'reports\\usability-latency-20261028\\bash\\modal-live-rapid-staged.json': '98fa882f59602dbf4825802b293b6fb5cc2596899ddd19207847a26786fa2d77', 'reports\\usability-latency-20261028\\bash\\modal-live-stale-staged.json': '4411fe533e8b29747f978f4626528acc3b488b259b7a84101129c2d96faddd4c', 'reports\\usability-latency-20261028\\bash\\modal-live-conflict-staged.json': 'dca9ed0cbaf26d517b8ace61e5adb59f8c1b2e903f1d85f88b55fcf36b291fb3', 'reports\\usability-latency-20261028\\bash\\modal-apply-race-staged.json': 'ef952f3d306bd792c293b5c0b7aabea47f4b65308dcd53be96595b298fde52bd', 'reports\\usability-latency-20261028\\bash\\modal-live-stock-staged.json': '7cd418dc2c78e11169dbd6a51a5f80078d59aadf88e962047303848ffdc25d48', 'reports\\usability-latency-20261028\\bash\\modal-live-cold-browser-staged.json': '919f512e6bf0ca305ed37b6d9ddc2386422be7a434164a5070e230fba21f915d', 'reports\\usability-latency-20261028\\native-controls\\native-cold-controls-final.json': '3179ca9259800c359b0ec28102fed0f9498a580f76915b0f993971bd09d57cf1', 'reports\\usability-latency-20261028\\bash\\backend-apply-fence\\final-frozen-payload\\HOST-REGRESSIONS.json': '18bb0ef9f37f22922c26c63c6ffc747ff6f49039dbdfa0996dc97dfa2bf48633', 'reports\\usability-latency-20261028\\native-controls\\NATIVE-EQUIVALENCE-FINAL.json': '0f7db45492bfffb3ff1c994db4c16561c4ba987673a10aab49247d87b880f361'}}
+    """Exact scoped eligibility; loaded Desktop and team release stay unverified."""
+    return {'status': 'approved', 'structural_anchors': 'matched', 'live_renderer_verified': True, 'deletion_verified': True, 'desktop_verified': False, 'team_release_approved': False, 'renderer_scope': 'Exact combined463: inherited D208 compiled/private-renderer UI evidence plus byte-identical header/deletion and four Bash regions; new ordered binder11, exact native setter22, controlled native-to-real-widget pipeline, metadata9/stock Bash, nonce27/deletion12/syntax regressions. No current Desktop, SDK backend, network or new host-profile verification.', 'source_sha256': '157e06c446d68d77bab30cba4578f5a71289da74d62c44c95b0b6ddd046edde6', 'candidate_sha256': '463f2dc87b98e63af151f11ef7aa9dbf0ea249d399a8dc5a508e4a8917352158', 'helper_sha256': 'e5b515d5cbd1652c1bcb66f7ffa411e6cb86e173163f93f9abee2082a66e74fc', 'verification_sha256': {'reports/bash-reopen-audit-20261030/native/FINAL-VALIDATION.json': '239686a6a458ec8172f847ed7eda45202605f6bd57699f9b8b98e12e910de420', 'reports/session-bound-instance-edit-20261030/NATIVE-SESSION-BINDER-FINAL-PINS.json': 'e90b398b90353b3650159e072b43a24a6a1b282517649222581485247e6c2fd2', 'reports/session-bound-instance-edit-20261030/native-parameter-setter-v3/FINAL-PINS.json': '51500555a1ee74608774de346a5b0b0d106e3ac61c35b7898958a7af9ac74136', 'reports/session-bound-instance-edit-20261030/INLINE-NATIVE-PURE-PROOF.json': '25293ca2eaa1d1832765f51a1bd56d1b0e1db27b013476575aa84177f5946453', 'reports/session-bound-instance-edit-20261030/combined-pipeline/RESULT.json': '452aa23d82ad83cea1391b50e2fe4f86f6132138b03bc5347d9087311b192f9c', 'reports/session-bound-instance-edit-20261030/native-pure-regressions/RESULT.json': '132838fdc615b5c1486f00c294b8f2378d054b5eb55fa1737330f0eaafa466d5'}}
 
 def patch_editor_source(source: str, helper: str) -> tuple[str, dict]:
     """Transform only known structures; admit only the independently tested bytes."""
@@ -241,6 +685,6 @@ def patch_editor_source(source: str, helper: str) -> tuple[str, dict]:
     evidence = approval_evidence()
     observed = tuple(hashlib.sha256(value.encode("utf-8")).hexdigest() for value in (source, result, helper))
     reviewed = tuple(evidence[key] for key in ("source_sha256", "candidate_sha256", "helper_sha256"))
-    if observed != reviewed and not (observed[0] in _REVIEWED_PREVIOUS_CANDIDATES and observed[1:] == reviewed[1:]):
+    if observed != reviewed and not (observed[0] in (*_REVIEWED_PREVIOUS_CANDIDATES, reviewed[1]) and observed[1:] == reviewed[1:]):
         evidence = {"status":"unvalidated", "structural_anchors":"matched", "live_renderer_verified":False, "deletion_verified":False}
     return result, evidence

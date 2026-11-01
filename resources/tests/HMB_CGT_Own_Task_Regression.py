@@ -1,6 +1,8 @@
 """Synthetic CGT read/confirm failure boundaries. No network or record writes."""
 from __future__ import annotations
 import contextlib
+import contextvars
+from collections import OrderedDict
 from copy import deepcopy
 import io
 import json
@@ -20,6 +22,31 @@ sys.path.insert(0, str(ROOT))
 import _hmb_cgt as cgt
 import _hmb_shot_routing as routing
 import HMBImageAssetLibrary as image
+
+
+def initialize_widget_fixture(node, value):
+    """Explicit constructor-owned fields for a detached synthetic node.
+
+    No SDK/engine is constructed. Admission remains the actual production
+    implementation; nonprivileged requests must carry this current lease.
+    """
+    node.name = 'SyntheticCGTImageAsset'
+    node.engine = types.SimpleNamespace(event_manager=types.SimpleNamespace(
+        _hmb_asset_initial_assignment_context=contextvars.ContextVar('fixture_asset_initial', default=None),
+        _hmb_asset_workspace_assignment_context=contextvars.ContextVar('fixture_asset_workspace', default=None)))
+    node._hmb_widget_runtime_lease = str(uuid4())
+    node._hmb_workspace_local_assignment = contextvars.ContextVar('fixture_asset_local', default=None)
+    node._hmb_image_bash_mutation_receipts = OrderedDict()
+    node._hmb_widget_constructing = False
+    node._hmb_state_syncing = False
+    node._hmb_restoring_widget_state = False
+    node._hmb_thumbnail_bridge_syncing = False
+    node._hmb_widget_live_authored = False
+    node._hmb_widget_hydration_digest = ''
+    current = image._normalize_state(deepcopy(value))
+    current[image.WIDGET_RUNTIME_LEASE_KEY] = node._hmb_widget_runtime_lease
+    node._accept_normalized_widget_state_baseline(current)
+    return current
 
 guid = lambda: str(uuid4()).upper()
 account, project_id, pipeline = guid(), guid(), guid()
@@ -197,7 +224,8 @@ manual_rename = dict(schema=routing.SHOT_HIERARCHY_REQUEST_SCHEMA, version=1,
 manual_rename['binding']['revision'] += 1
 manual_rename['binding']['members'][-1].update(source_name='renamed_reference', canonical_name='renamed_reference')
 local_host = object.__new__(image.HMBImageAssetLibrary)
-local_host._hmb_last_accepted_widget_state = json.dumps(mixed)
+local_host_state = initialize_widget_fixture(local_host, mixed)
+local_host._hmb_last_accepted_widget_state = json.dumps(local_host_state)
 local_host._widget_state_is_stale = lambda value: False
 with mock.patch.object(cgt, 'catalog', side_effect=AssertionError('Manual-only rename must not contact CGT')):
     renamed_mixed = local_host._prepare_shot_hierarchy_edit({image.UI_EDIT_REVISION_KEY: 1}, manual_rename)
@@ -307,18 +335,20 @@ for exc, code in errors:
 
 def make_node():
     node = object.__new__(image.HMBImageAssetLibrary)
-    holder = {'state': deepcopy(state), 'published': [], 'responses': []}
+    holder = {'state': initialize_widget_fixture(node, state), 'published': [], 'responses': []}
     node._hmb_node_deleted = False
     node.lock = False
     node._current_state = lambda: deepcopy(holder['state'])
     def publish(value):
         holder['state'] = image._normalize_state(value)
+        node._accept_normalized_widget_state_baseline(holder['state'])
         holder['published'].append(deepcopy(holder['state']))
         return holder['state']
     node._publish_state = publish
     node._set_thumbnail_bridge_value = lambda value: holder['responses'].append(deepcopy(value))
     intent = dict(schema=image.THUMBNAIL_BRIDGE_SCHEMA, version=1, operation='cgt_confirm', phase='request',
         request_id=str(uuid4()), session_id=str(uuid4()), runtime_instance_id=node._thumbnail_runtime_id(state),
+        **{image.WIDGET_RUNTIME_LEASE_KEY: node._hmb_widget_runtime_lease},
         project_identity=routing.hierarchy_project_key(state), hierarchy_request=deepcopy(command))
     return node, holder, intent
 
@@ -360,6 +390,8 @@ for case in ['success', 'cancel', 'deleted', 'locked', 'resolving', 'stale', 'ac
 # native Shot rows or bindings, including when GP has not been selected yet.
 node, holder, intent = make_node()
 holder['state'] = image._normalize_state({})
+holder['state'][image.WIDGET_RUNTIME_LEASE_KEY] = node._hmb_widget_runtime_lease
+node._accept_normalized_widget_state_baseline(holder['state'])
 intent = dict(intent, operation='cgt_catalog', cgt_project_id=other_project_id,
     runtime_instance_id=node._thumbnail_runtime_id(holder['state']), project_identity='')
 intent.pop('hierarchy_request')

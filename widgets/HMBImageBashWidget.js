@@ -1,5 +1,6 @@
 // Small HMB companion header. The stock bash_image button owns the editor.
 export const HMB_IMAGE_BASH_HEADER_SCHEMA = "hmb-image-bash-header-v1";
+export const HMB_IMAGE_BASH_PREPARATION_SCHEMA = "hmb-image-bash-preparation-v1";
 const NODE_SCOPES = new WeakMap();
 const EDGE_LAYERS = new WeakMap();
 const TOPOLOGY_LAYERS = new WeakMap();
@@ -31,7 +32,19 @@ export function hmbImageBashHeaderState(input = {}) {
     bound_source: valid ? clean(raw.bound_source) : "",
     image_count: valid && Number.isFinite(count) ? Math.max(0, Math.trunc(count)) : 0,
     status: valid ? clean(typeof raw.status === "string" ? raw.status : record(raw.status).message, 1024) : "이미지 라이브러리를 연결하세요",
-    locked: raw.locked === true, route: hmbImageBashHeaderRoute(valid ? raw.route : {}) };
+    locked: raw.locked === true, preparation: hmbImageBashPreparation(valid ? raw.preparation : {}),
+    route: hmbImageBashHeaderRoute(valid ? raw.route : {}) };
+}
+
+export function hmbImageBashPreparation(value = {}) {
+  const raw = record(value), valid = raw.schema === HMB_IMAGE_BASH_PREPARATION_SCHEMA;
+  const integer = value => Number.isInteger(value) && value >= 0 ? value : null;
+  const phase = valid && ["idle", "preparing", "ready", "error"].includes(raw.phase) ? raw.phase : "idle";
+  return {schema:HMB_IMAGE_BASH_PREPARATION_SCHEMA,phase,ready:["idle","ready"].includes(phase) && (!valid || raw.ready === true),
+    workspace_id:valid?clean(raw.workspace_id,128):"", workspace_revision:valid?integer(raw.workspace_revision)??0:0,
+    channel_uuid:valid?clean(raw.channel_uuid,128):"", node_instance_uuid:valid?clean(raw.node_instance_uuid,128):"",
+    requested_count:valid?integer(raw.requested_count):null,prepared_count:valid?integer(raw.prepared_count)??0:0,
+    error:valid?clean(raw.error,1024):""};
 }
 
 export function hmbImageBashHeaderRoute(value = {}) {
@@ -80,11 +93,12 @@ export function hmbRenderImageBashHeader(input = {}) {
 .hmb-image-bash-header[data-hmb-native-header=active] [data-hmb-native-actions]{display:flex;align-items:center;flex:0 0 auto}
 .hmb-image-bash-header[data-hmb-native-header=active] .hmb-image-bash-header__source{flex-basis:170px;width:170px}
 .hmb-image-bash-header [data-hmb-native-identity] :is(span,div){min-width:0}
+.hmb-image-bash-header__count[data-loading=true]::before{content:"";display:inline-block;width:9px;height:9px;margin-right:5px;vertical-align:-1px;border:1.5px solid currentColor;border-right-color:transparent;border-radius:50%;animation:hmb-bash-ready-spin .9s linear infinite}.hmb-image-bash-header__retry{flex:0 0 auto;padding:5px 8px;border:1px solid rgba(var(--ib-rgb),.4);border-radius:999px;background:#1b2533;color:#fbcfe8;font:inherit;font-size:10px;cursor:pointer}.hmb-image-bash-header__retry[hidden]{display:none}@keyframes hmb-bash-ready-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.hmb-image-bash-header__count[data-loading=true]::before{animation:none}}
 </style><div class="hmb-image-bash-header nodrag" data-hmb-image-bash-header>
   <div class="hmb-image-bash-header__row"><span class="hmb-image-bash-header__mark" aria-hidden="true">IB</span>
     <div class="hmb-image-bash-header__identity"><div data-hmb-native-identity></div><div class="hmb-image-bash-header__title">HMBImageBash</div>
       <div class="hmb-image-bash-header__status" data-bash-status role="status" aria-live="polite">${escape(state.status)}</div></div>
-    <div data-hmb-native-actions class="nodrag"></div><span class="hmb-image-bash-header__count" data-bash-count>이미지 ${state.image_count}</span>
+    <div data-hmb-native-actions class="nodrag"></div><span class="hmb-image-bash-header__count" data-bash-count>이미지 ${state.image_count}</span><button class="hmb-image-bash-header__retry nodrag" data-bash-retry type="button" hidden>다시 시도</button>
     <select class="hmb-image-bash-header__source nodrag" data-bash-source aria-label="REMOTE Image Bash 이미지 라이브러리">${optionMarkup(state)}</select>
   </div></div>`;
 }
@@ -276,6 +290,7 @@ function hmbNativeStockSafetyImplementation(container, props = {}) {
   const releaseNode = scopeNode(container), select = container.querySelector("[data-bash-source]");
   const header = container.querySelector("[data-hmb-image-bash-header]"), status = container.querySelector("[data-bash-status]");
   const count = container.querySelector("[data-bash-count]");
+  const retry = container.querySelector("[data-bash-retry]");
   container.setAttribute("data-hmb-color-lut-widget", "");
   container.setAttribute("data-hmb-native-node-type", "HMBImageBash");
   const nativeTarget = target => target?.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]");
@@ -294,8 +309,13 @@ function hmbNativeStockSafetyImplementation(container, props = {}) {
     if (options !== lastOptions) { select.innerHTML = options; lastOptions = options; }
     if (select.value !== state.bound_source) select.value = state.bound_source;
     if (select.disabled !== disabled()) select.disabled = disabled();
-    status.textContent = message || state.status || (state.bound_source ? "이미지 라이브러리 연결됨" : "이미지 라이브러리를 연결하세요");
-    status.title = status.textContent; count.textContent = `이미지 ${state.image_count}`;
+    const preparation=state.preparation,busy=preparation.phase==="preparing";
+    status.textContent = message || (busy?"작업 준비 중 · 이미지 원본을 확인합니다":preparation.phase==="error"?preparation.error||"소스 확인 필요 · 다시 시도하세요":state.status) || (state.bound_source ? "이미지 라이브러리 연결됨" : "이미지 라이브러리를 연결하세요");
+    status.title = status.textContent;
+    count.textContent = `이미지 ${preparation.requested_count??state.image_count}${busy?" · 준비 중":""}`;
+    count.setAttribute("data-loading",String(busy));
+    header.setAttribute("aria-busy",String(busy));header.setAttribute("data-bash-preparation",preparation.phase);
+    retry.hidden=preparation.phase!=="error";retry.disabled=disabled()||!state.route.connected;
     syncEdges(container, state.route);
   };
   const dispatch = (operation, source) => {
@@ -306,7 +326,7 @@ function hmbNativeStockSafetyImplementation(container, props = {}) {
     delete raw.hmb_image_bash_command;
     const payload = { ...raw, schema: HMB_IMAGE_BASH_HEADER_SCHEMA, hmb_image_bash_command: {
       operation, source_node_name: operation === "unbind" ? "" : source?.id || "", workspace_id: source?.workspace_id || "", request_id: requestId(container),
-      ...(["bind", "unbind"].includes(operation) ? {source_instance_id: source?.source_instance_id || ""} : {}),
+      ...(["bind", "unbind", "retry_inputs"].includes(operation) ? {source_instance_id: source?.source_instance_id || ""} : {}),
     } };
     const ticket = ++epoch;
     if(background) refreshPending = true;
@@ -329,6 +349,7 @@ function hmbNativeStockSafetyImplementation(container, props = {}) {
     dispatch(source ? "bind" : "unbind", source || state.sources.find(row => row.id === state.bound_source));
   };
   const reload = () => dispatch("refresh", state.sources.find(row => row.id === state.bound_source));
+  const retryInputs = event => {event.preventDefault();event.stopPropagation();dispatch("retry_inputs",state.sources.find(row=>row.id===state.bound_source));};
   const scheduleTopologyRefresh = () => {
     if (disposed || !topologyRefreshNeeded || topologyRefreshFrame !== null || refreshPending || disabled()) return;
     topologyRefreshFrame = win.requestAnimationFrame(() => {
@@ -363,6 +384,7 @@ function hmbNativeStockSafetyImplementation(container, props = {}) {
   };
   const stop = event => { if (!nativeTarget(event.target) && ["Delete", "Backspace"].includes(event.key)) event.stopPropagation(); };
   select.addEventListener("change", change); select.addEventListener("focus", scheduleFocusRefresh); select.addEventListener("pointerdown", scheduleFocusRefresh);
+  retry.addEventListener("click",retryInputs);
   container.addEventListener("keydown", stop);
   const controller = {
     update(nextProps) {
@@ -380,6 +402,7 @@ function hmbNativeStockSafetyImplementation(container, props = {}) {
       if(topologyRefreshFrame !== null) win.cancelAnimationFrame(topologyRefreshFrame);
       topologyRefreshFrame = null; topologyRefreshNeeded = false;
       select.removeEventListener("change", change); select.removeEventListener("focus", scheduleFocusRefresh); select.removeEventListener("pointerdown", scheduleFocusRefresh);
+      retry.removeEventListener("click",retryInputs);
       container.removeEventListener("hmb-color-lut-header-state", nativeState);
       container.removeAttribute("data-hmb-color-lut-widget");container.removeAttribute("data-hmb-native-node-type");
       container.removeEventListener("keydown", stop); releaseTopology(); releaseNode(); releaseEdges(container);

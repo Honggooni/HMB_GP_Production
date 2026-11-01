@@ -9223,6 +9223,40 @@ function hmbNativeUiReadCommand(value, kind) {
     && (["stop_read", "cancel_pending", "cancel_video_import"].includes(command.action)
       || (command.action === "video_tools" && command.payload?.op === "cancel"));
 }
+// Locked echoes use only primitive/raw-string identity: no state clone/hash.
+// Complex values keep the original ownership-preserving update path.
+function hmbNativeUiLockedEchoKey(props) {
+  if (!props?.disabled || Object.getOwnPropertySymbols(props).length) return null;
+  const result = [typeof props.onChange === "function", typeof props.onCommand === "function"];
+  for (const key of Object.keys(props)) {
+    if (["onChange", "onCommand"].includes(key)) continue;
+    const property = Object.getOwnPropertyDescriptor(props, key);
+    if (!property || !Object.hasOwn(property, "value")) return null;
+    const value = property.value, type = typeof value;
+    if (key === "ui_options" && value !== null && type === "object") {
+      const prototype = Object.getPrototypeOf(value), keys = Object.keys(value);
+      if ((prototype !== Object.prototype && prototype !== null) || keys.length > 64 || Object.getOwnPropertySymbols(value).length) return null;
+      result.push(key, "flat-options", keys.length);
+      for (const option of keys) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, option);
+        if (!descriptor || !Object.hasOwn(descriptor, "value")) return null;
+        const field = descriptor.value, fieldType = typeof field;
+        if (field !== null && !["undefined", "boolean", "string", "number"].includes(fieldType)) return null;
+        if (fieldType === "number" && !Number.isFinite(field)) return null;
+        result.push(option, field);
+      }
+      continue;
+    }
+    if (value !== null && !["undefined", "boolean", "string", "number"].includes(type)) return null;
+    if (type === "number" && !Number.isFinite(value)) return null;
+    result.push(key, "primitive", value);
+  }
+  return result;
+}
+function hmbNativeUiLockedEchoMatches(next, previous) {
+  return next !== null && previous != null && next.length === previous.length
+    && next.every((value, index) => Object.is(value, previous[index]));
+}
 function hmbNativeUiContract(container, props, mount, policy) {
   if (!container) return mount(container, props);
   let c = container.__hmbNativeUiContract;
@@ -9262,25 +9296,33 @@ function hmbNativeUiContract(container, props, mount, policy) {
       c.observer?.observe?.(container, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled", "contenteditable"] });
     };
     c.wrap = () => {
-      const p = { ...c.props };
+      const p = { ...c.props }, cells = {};
       for (const name of ["onChange", "onCommand"]) if (typeof p[name] === "function") {
-        const callback = HMB_NATIVE_UI_CALLBACKS.get(p[name]) || p[name];
+        const cell = { callback: HMB_NATIVE_UI_CALLBACKS.get(p[name]) || p[name] };
+        cells[name] = cell;
         const fn = (...args) => {
           if (!c.active) throw new Error("This widget is no longer mounted.");
           if (c.props.disabled && !hmbNativeUiReadCommand(args[0], c.kind)) throw new Error("This control is disabled by Griptape.");
-          return callback?.(...args);
+          return cell.callback?.(...args);
         };
-        HMB_NATIVE_UI_CALLBACKS.set(fn, HMB_NATIVE_UI_CALLBACKS.get(p[name]) || p[name]); p[name] = fn;
+        HMB_NATIVE_UI_CALLBACKS.set(fn, cell.callback); p[name] = fn;
       }
-      return p;
+      c.callbackCells = cells; return p;
+    };
+    c.refreshCallbacks = () => {
+      for (const [name, cell] of Object.entries(c.callbackCells || {})) {
+        const current = c.props[name]; cell.callback = HMB_NATIVE_UI_CALLBACKS.get(current) || current;
+      }
     };
     c.proxy = {
       update(nextProps) {
         if (!c.active || c.closing) return;
-        c.restore(); c.props = nextProps || {}; const next = c.wrap();
+        const incoming = nextProps || {}, echoKey = hmbNativeUiLockedEchoKey(incoming);
+        if (hmbNativeUiLockedEchoMatches(echoKey, c.lockedEchoKey)) { c.props = incoming; c.refreshCallbacks(); return; }
+        c.lockedEchoKey = null; c.restore(); c.props = incoming; const next = c.wrap();
         if (typeof c.handle?.update === "function") c.handle.update(next);
         else c.handle = mount(container, next);
-        c.sync();
+        c.sync(); c.lockedEchoKey = c.props === incoming ? echoKey : null;
       },
       cleanup() {
         if (!c.active || c.closing) return; c.closing = true; c.restore();
@@ -9295,7 +9337,9 @@ function hmbNativeUiContract(container, props, mount, policy) {
     };
     container.__hmbNativeUiContract = c;
   }
-  c.restore(); c.props = props || c.props || {}; c.handle = mount(container, c.wrap()); c.sync(); return c.proxy;
+  const incoming = props || c.props || {}, echoKey = hmbNativeUiLockedEchoKey(incoming);
+  if (c.handle && hmbNativeUiLockedEchoMatches(echoKey, c.lockedEchoKey)) { c.props = incoming; c.refreshCallbacks(); return c.proxy; }
+  c.lockedEchoKey = null; c.restore(); c.props = incoming; c.handle = mount(container, c.wrap()); c.sync(); c.lockedEchoKey = c.props === incoming ? echoKey : null; return c.proxy;
 }
 // HMB_NATIVE_DISABLED_ADAPTER_V1_END
 

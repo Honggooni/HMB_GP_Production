@@ -16,6 +16,8 @@ from types import SimpleNamespace
 import uuid
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _hmb_image_asset_detached_fixture import initialize_detached_image_asset
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "HMBImageAssetLibrary.py"
@@ -54,6 +56,8 @@ if os.environ.get("LOCALAPPDATA") and not os.environ.get(
         / "image_thumbnails"
     )
 asset_library._ASSET_THUMBNAIL_CACHE_ROOT = temporary / "runtime-cache"
+default_index_root = asset_library._ASSET_CATALOG_INDEX_ROOT
+asset_library._ASSET_CATALOG_INDEX_ROOT = temporary / "runtime-index"
 try:
     catalog_root = temporary / "Projects"
     project_root = catalog_root / "ProjectA" / "Ai_Ct_image"
@@ -662,7 +666,7 @@ try:
     # The node-level contract acknowledges immediately, completes off-thread,
     # and publishes through the retained-mode consumer without a catalog scan.
     node = object.__new__(asset_library.HMBImageAssetLibrary)
-    node_live = {"state": deepcopy(hydrated_base)}
+    node_live = {"state": initialize_detached_image_asset(node, asset_library, state=hydrated_base)}
     node._hmb_manifest_poll_received = False
     node._hmb_manifest_poll_pending = False
     node._hmb_refresh_revision = hydrated_base["refresh_revision"]
@@ -687,6 +691,7 @@ try:
 
     node._publish_state = publish_node_state
     requested_state = deepcopy(hydrated_base)
+    requested_state[asset_library.WIDGET_RUNTIME_LEASE_KEY] = node._hmb_widget_runtime_lease
     requested_state["thumbnail_request"] = hydration_request
     asset_library._asset_thumbnail_url = lambda _path, asset_id: f"memory://{asset_id}"
     try:
@@ -712,7 +717,7 @@ try:
     # worker completion updates the canonical backend state silently and emits
     # only the bounded result envelope; the full widget publisher is not used.
     bridge_node = object.__new__(asset_library.HMBImageAssetLibrary)
-    bridge_live = {"state": deepcopy(hydrated_base)}
+    bridge_live = {"state": initialize_detached_image_asset(bridge_node, asset_library, state=hydrated_base)}
     bridge_results = []
     bridge_silent_stores = []
     bridge_node._current_state = lambda: bridge_live["state"]
@@ -724,7 +729,6 @@ try:
     bridge_node._publish_state = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         AssertionError("Compact thumbnail completion used the full widget publisher.")
     )
-    bridge_node._accept_normalized_widget_state_baseline = lambda *_args, **_kwargs: None
 
     def bridge_set_parameter(name, value, *args, **kwargs):
         assert name == asset_library.WIDGET_STATE_PARAMETER
@@ -740,6 +744,7 @@ try:
     )
     runtime_id = bridge_node._thumbnail_runtime_id(bridge_live["state"])
     bridge_request = {
+        asset_library.WIDGET_RUNTIME_LEASE_KEY: bridge_node._hmb_widget_runtime_lease,
         "schema": asset_library.THUMBNAIL_BRIDGE_SCHEMA,
         "version": asset_library.THUMBNAIL_BRIDGE_VERSION,
         "runtime_instance_id": runtime_id,
@@ -892,6 +897,7 @@ try:
         results = []
         owner = owner_state if isinstance(owner_state, dict) else {"current": True}
         host_node = object.__new__(asset_library.HMBImageAssetLibrary)
+        live["state"] = initialize_detached_image_asset(host_node, asset_library, state=live["state"])
         host_node._current_state = lambda: live["state"]
         host_node._scan_owner_is_current = lambda: bool(owner["current"])
         host_node._hmb_import_media_by_uid = {}
@@ -900,9 +906,6 @@ try:
         host_node._hmb_refresh_revision = hydrated_base["refresh_revision"]
         host_node._publish_state = lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("Compact host-loop completion used the full publisher.")
-        )
-        host_node._accept_normalized_widget_state_baseline = (
-            lambda *_args, **_kwargs: None
         )
 
         def store_state(name, value, *args, **kwargs):
@@ -919,6 +922,7 @@ try:
         )
         request = {
             **bridge_request,
+            asset_library.WIDGET_RUNTIME_LEASE_KEY: host_node._hmb_widget_runtime_lease,
             "request_id": request_id,
         }
         return host_node, live, stores, results, owner, request
@@ -1137,19 +1141,41 @@ try:
             assert len(stores) == 1
             assert results == []
 
-            # An exact-request watchdog probe enters through before_value_set;
-            # that official retained-mode callback drains the immutable result
-            # without starting a replacement decoder.
+            # Hidden transport admission is side-effect free. A subsequent
+            # current canonical widget callback drains the same immutable
+            # completion, without starting a replacement decoder. Exercise
+            # both official callbacks rather than bypassing their admission.
             normalized_probe = host_node.before_value_set(
                 SimpleNamespace(name=asset_library.THUMBNAIL_PATCH_PARAMETER),
                 request,
             )
             assert normalized_probe["request_id"] == request["request_id"]
+            assert host_node._hmb_thumbnail_pending_result is not None
+            assert len(stores) == 1 and len(attempts) == 1
+            assert results == [] and hydrate_calls == 1
+            # Simulate the native property commit between its real before and
+            # after hooks. No SDK engine/parameter storage is constructed.
+            host_node._fixture_hidden_bridge_storage = deepcopy(normalized_probe)
+            host_node.after_value_set(
+                SimpleNamespace(name=asset_library.THUMBNAIL_PATCH_PARAMETER),
+                host_node._fixture_hidden_bridge_storage,
+            )
+            assert len(stores) == 1
+            assert len(results) == 1
+            assert len(attempts) == 2
+            assert hydrate_calls == 1
+            assert results[0]["request_id"] == request["request_id"]
+            assert host_node._hmb_thumbnail_pending_result is not None
+            host_node.before_value_set(
+                SimpleNamespace(name=asset_library.WIDGET_STATE_PARAMETER),
+                deepcopy(_live["state"]),
+            )
             assert host_node._hmb_thumbnail_pending_result is None
             assert host_node._hmb_thumbnail_pending_key == ""
             assert len(stores) == 2
-            assert len(results) == 1
-            assert len(attempts) == 2
+            assert len(results) == 2
+            assert len(attempts) == 3
+            assert all(item["request_id"] == request["request_id"] for item in results)
             assert hydrate_calls == 1
         finally:
             asset_library._hydrate_asset_thumbnails = original_retry_hydrator
@@ -1231,7 +1257,7 @@ try:
         asset_library._asset_thumbnail_url = original_thumbnail_url
 
     flight_node = object.__new__(asset_library.HMBImageAssetLibrary)
-    flight_live = {"state": deepcopy(hydrated_base)}
+    flight_live = {"state": initialize_detached_image_asset(flight_node, asset_library, state=hydrated_base)}
     flight_publications = []
     flight_node._current_state = lambda: flight_live["state"]
     flight_node._scan_owner_is_current = lambda: True
@@ -1295,6 +1321,7 @@ try:
         first_thread = flight_node._hmb_thumbnail_thread
         assert first_thread is not None
         live_edit = deepcopy(hydrated_base)
+        live_edit[asset_library.WIDGET_RUNTIME_LEASE_KEY] = flight_node._hmb_widget_runtime_lease
         live_edit["search"] = "semantic edit during thumbnail decode"
         live_edit[asset_library.UI_EDIT_REVISION_KEY] += 1
         live_edit["thumbnail_request"] = {
@@ -1335,10 +1362,8 @@ try:
     # edits while the accepted thumbnail revision/media field remains durable.
     echo_node = object.__new__(asset_library.HMBImageAssetLibrary)
     echo_node.name = "ImageAssetThumbnailEchoFixture"
-    echo_node._hmb_last_accepted_widget_state = None
-    echo_node._hmb_last_accepted_widget_revisions = (0, 0)
-    echo_node._hmb_last_accepted_thumbnail_revision = 0
-    echo_node._accept_widget_state_baseline(hydration_result)
+    hydration_result_for_echo = initialize_detached_image_asset(echo_node, asset_library, state=hydration_result)
+    echo_node._accept_widget_state_baseline(hydration_result_for_echo)
     assert echo_node._widget_state_is_stale(hydrated_base) is True
     delayed_ui = deepcopy(hydrated_base)
     delayed_ui["search"] = "keep this newer UI edit"
@@ -1360,6 +1385,7 @@ try:
     crash_state["thumbnail_result"] = hydration_result["thumbnail_result"]
     asset_library._ASSET_THUMBNAIL_URLS.clear()
     deserialize_node = object.__new__(asset_library.HMBImageAssetLibrary)
+    initialize_detached_image_asset(deserialize_node, asset_library, state=crash_state)
     deserialize_node._current_state = lambda: crash_state
     deserialize_node._ensure_parameters = lambda: None
     deserialize_node.get_parameter_value = lambda name: (
@@ -1555,6 +1581,7 @@ try:
     ]
 finally:
     asset_library._ASSET_THUMBNAIL_CACHE_ROOT = default_cache_root
+    asset_library._ASSET_CATALOG_INDEX_ROOT = default_index_root
     shutil.rmtree(temporary, ignore_errors=True)
 
 

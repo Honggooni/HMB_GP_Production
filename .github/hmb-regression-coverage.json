@@ -3204,6 +3204,186 @@
       "coverage": "installed_sdk",
       "required": false,
       "reason": "Isolated native SDK preserves unbound standalone legacy editors without hydration recalculation; ambiguous or previously bound workflows retain migration protection."
+    },
+    {
+      "name": "HMB_Agent_Movie_Stream_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Color_LUT_Fallback_Budget_Regression.mjs",
+      "mode": "ci",
+      "coverage": "javascript_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Asset_Authority_Lifecycle_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Asset_First_Project_Authority_Timeout_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Asset_Instance_Edit_Supersession_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Asset_Queued_Instance_Edit_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Asset_Runtime_Lease_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed Griptape retained SDK and native assignment/serialization hooks to validate widget lease ownership. Generic CI does not include that SDK; no live application is used."
+    },
+    {
+      "name": "HMB_Image_Asset_Runtime_Lease_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Asset_Session_Bound_Instance_Edit_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Bash_Apply_Readiness_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed Griptape SDK, Standard ImageBash class and reviewed editor bundle for prepare/Apply, immediate editor snapshot reopening and serializer coherence."
+    },
+    {
+      "name": "HMB_Image_Bash_Apply_Worker_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed Griptape SDK, Standard ImageBash and reviewed editor resources for real retained async Apply/prepare worker races, serialization and pending-save fences."
+    },
+    {
+      "name": "HMB_Image_Bash_Cold_Admission_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed Griptape SDK and native Standard ImageBash for retained saved-document assignment before input hydration. Generic CI lacks the host classes and reviewed editor resources."
+    },
+    {
+      "name": "HMB_Image_Bash_Cold_Admission_Wrapper_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Bash_Cold_Input_Gap_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Bash_Cold_Restore_Worker_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed Griptape SDK, Standard ImageBash and reviewed editor bundle for real saved-Apply worker restoration and stale-result fences."
+    },
+    {
+      "name": "HMB_Image_Bash_Load_Transport_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires actual installed Griptape SDK wire converter, loading manager and Standard library metadata in a private engine to validate hydration success projection; generic CI cannot substitute a mock pass."
+    },
+    {
+      "name": "HMB_Image_Bash_Performance_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires the installed SDK/Standard ImageBash to import real node and file-driver methods; bounded stand-ins exercise raw reread/hash reuse but do not remove those installed import dependencies."
+    },
+    {
+      "name": "HMB_Image_Bash_Queue_Publish_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed Griptape SDK, Standard ImageBash and reviewed editor resources to count real SDK publication bytes and verify Apply/snapshot/serializer behavior with synthetic PNGs."
+    },
+    {
+      "name": "HMB_Image_Bash_Readiness_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires installed SDK and Standard ImageBash imports to exercise actual preparation/sync/command methods on bounded stand-ins. Generic CI has no compatible host classes."
+    },
+    {
+      "name": "HMB_Image_Bash_Readiness_Widget_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Bash_Workspace_Intent_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed Griptape retained SDK for actual assignment hooks, operation ledger, replay and readonly authority contracts; metadata-only fixtures are not a substitute for the host seam."
+    },
+    {
+      "name": "HMB_Media_Metadata_Publish_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_MP4_Movie_Stream_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Native_Bash_Readiness_Regression.cjs",
+      "mode": "ci",
+      "coverage": "javascript_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Native_Capsule_Motion_Regression.cjs",
+      "mode": "ci",
+      "coverage": "javascript_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Native_Iframe_Session_Binding_Regression.cjs",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires the exact reviewed installed compiled editor/host profile or an explicit HMB_SESSION_BINDING_EDITOR_SOURCE artifact. Tests extracted compiled functions in a private VM; generic CI has only the older primary native fixture, not this host artifact."
+    },
+    {
+      "name": "HMB_Widget_Locked_Echo_Performance_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Workflow_Metadata_Name_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires an isolated installed Griptape SDK with current workflow registry/context and native metadata/save handler contracts. Private graph only; generic CI lacks those host APIs."
     }
   ]
 }

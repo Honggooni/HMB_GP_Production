@@ -590,12 +590,43 @@ class ColorLUTNodeRegression(unittest.TestCase):
     def test_collision_is_reported_without_replacing_existing_file(self):
         self.select()
         self.load()
-        output = Path(self.media("existing.mp4"))
+        output = Path(self.media("existing.mov"))
         before = output.read_bytes()
         self.apply(output={"codec": "hevc10", "manual_output_enabled": True, "path": str(output)})
         with mock.patch.object(target, "export_video", side_effect=self.successful_export):
             self.export()
         self.assertEqual(output.read_bytes(), before)
+        self.assertEqual(self.node._hmb_color_lut_state["status"]["phase"], "error")
+        self.assertFalse(self.node._hmb_color_lut_state["result"])
+
+    def test_legacy_hevc_mp4_destination_exports_mov_without_touching_saved_media(self):
+        self.select()
+        self.load()
+        legacy = Path(self.media("saved-output.mp4"))
+        original = legacy.read_bytes()
+        self.apply(output={"codec": "hevc10", "manual_output_enabled": True, "path": str(legacy)})
+        with mock.patch.object(target, "export_video", side_effect=self.successful_export) as encoded:
+            self.export()
+        expected = legacy.with_suffix(".mov")
+        self.assertEqual(Path(encoded.call_args.args[1]), expected)
+        self.assertEqual(self.node._hmb_color_lut_state["result"]["path"], str(expected))
+        self.assertEqual(legacy.read_bytes(), original)
+        saved = copy.deepcopy(self.node._hmb_color_lut_state)
+        restored = target.HMBColorLUTLibrary(name="Restored MOV result")
+        restored._apply_ui(saved, initial_setup=True)
+        self.drain()
+        self.assertEqual(restored._hmb_color_lut_state["result"]["path"], str(expected))
+
+    def test_legacy_hevc_destination_does_not_overwrite_existing_mov(self):
+        self.select()
+        self.load()
+        existing = Path(self.media("saved-output.mov"))
+        original = existing.read_bytes()
+        self.apply(output={"codec": "hevc10", "manual_output_enabled": True,
+                           "path": str(existing.with_suffix(".mp4"))})
+        with mock.patch.object(target, "export_video", side_effect=self.successful_export):
+            self.export()
+        self.assertEqual(existing.read_bytes(), original)
         self.assertEqual(self.node._hmb_color_lut_state["status"]["phase"], "error")
         self.assertFalse(self.node._hmb_color_lut_state["result"])
 

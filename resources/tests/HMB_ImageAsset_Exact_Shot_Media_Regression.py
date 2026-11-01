@@ -15,7 +15,9 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.dont_write_bytecode = True
+from _hmb_image_asset_detached_fixture import initialize_detached_image_asset
 import HMBImageAssetLibrary as images
 import HMBPromptLibrary as prompts
 
@@ -136,8 +138,8 @@ for row in large["assets"][5:]:
 large = images._normalize_state(large)
 assert len(large["assets"]) == 1000
 hot = images.HMBImageAssetLibrary.__new__(images.HMBImageAssetLibrary)
-hot.name = "ImageAssetExactShotHotFixture"
-hot._accept_normalized_widget_state_baseline(large)
+large = initialize_detached_image_asset(hot, images, state=large, name="ImageAssetExactShotHotFixture")
+assert large[images.WIDGET_RUNTIME_LEASE_KEY] == hot._hmb_widget_runtime_lease
 native = {"value": hot._hmb_last_accepted_widget_state}
 with mock.patch.object(images,"_get_parameter_raw",side_effect=lambda _node,_name:native["value"]):
     with mock.patch.object(images,"_normalize_state",wraps=images._normalize_state) as normalize:

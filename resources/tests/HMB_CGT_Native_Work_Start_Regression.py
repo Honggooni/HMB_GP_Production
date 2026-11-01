@@ -22,6 +22,22 @@ spec.loader.exec_module(fixture)
 
 
 class NativeStartTests(unittest.TestCase):
+    def test_detached_widget_fixture_enforces_current_lease(self):
+        node, holder, intent = fixture.make_node()
+        before = deepcopy(holder['state'])
+        self.assertIsNone(node.engine.event_manager._hmb_asset_initial_assignment_context.get())
+        self.assertEqual(node._admit_thumbnail_bridge(intent)[fixture.image.WIDGET_RUNTIME_LEASE_KEY],
+                         node._hmb_widget_runtime_lease)
+        self.assertEqual(node._admit_widget_state(holder['state'])[fixture.image.WIDGET_RUNTIME_LEASE_KEY],
+                         node._hmb_widget_runtime_lease)
+        foreign = {**intent, fixture.image.WIDGET_RUNTIME_LEASE_KEY:'retired-fixture-lease'}
+        with self.assertRaises(ValueError):
+            node._admit_thumbnail_bridge(foreign)
+        with self.assertRaises(ValueError):
+            node._admit_widget_state({**holder['state'], fixture.image.WIDGET_RUNTIME_LEASE_KEY:'retired-fixture-lease'})
+        self.assertEqual(holder['state'], before)
+        self.assertEqual(holder['published'], [])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="hmb-cgt-start-offline-")
         self.root = Path(self.tmp.name)

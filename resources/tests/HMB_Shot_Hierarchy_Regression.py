@@ -12,6 +12,8 @@ from unittest import mock
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _hmb_image_asset_detached_fixture import initialize_detached_image_asset
 import _hmb_shot_routing as routing
 import HMBImageAssetLibrary as image
 
@@ -167,12 +169,14 @@ reset = image._reset_image_asset_state_preserving_shot_media(restored)
 assert reset['shot_hierarchy'] == restored['shot_hierarchy']
 assert not image._normalize_state({})['shot_hierarchy']
 host = image.HMBImageAssetLibrary.__new__(image.HMBImageAssetLibrary)
-host._hmb_last_accepted_widget_state = json.dumps(image._normalize_state(base))
-host._hmb_last_accepted_widget_revisions = (0, 0)
-host._hmb_last_accepted_thumbnail_revision = 0
+initialize_detached_image_asset(host, image, state=base, name='ShotHierarchyHostFixture')
 edit = dict(schema=image.IMAGE_ASSET_EDIT_SCHEMA, version=1, ui_edit_revision=1, scan_revision=0,
+            widget_runtime_lease=host._hmb_widget_runtime_lease,
             catalog_identity={field: image._normalize_state(base)[field] for field in ('catalog_root', 'project_root', 'project_uid', 'project_cache_uid', 'manifest_signature', 'folder_signature', 'scan_revision')},
             selected_source_uids=[], edits={'shot_hierarchy_request': command})
+foreign_edit = copy.deepcopy(edit)
+foreign_edit[image.WIDGET_RUNTIME_LEASE_KEY] = str(uuid4())
+rejects(lambda: host._expand_widget_edit(foreign_edit))
 prepared = image._normalize_state(host._expand_widget_edit(edit))
 assert prepared['shot_hierarchy']['members'] == members
 assert [row['name'] for row in prepared['shot_routing']['shots']] == expected

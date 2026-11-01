@@ -338,6 +338,34 @@ class BrokerScriptedNode(RuntimeRegisteredSeedance):
         return 0.0
 
 
+def _assert_parameter_list_row_input_contract(parent, child, required: list[str]) -> None:
+    """Keep scalar contracts while allowing SDK-declared list-shaped row inputs."""
+    actual = set(child.input_types)
+    required_types = set(required)
+    declared_variants = set(parent.input_types) & {
+        "list", *(f"list[{item}]" for item in required)
+    }
+    assert len(actual) == len(child.input_types), "Row input types must remain unique"
+    assert required_types <= actual, "An existing scalar row input type was removed"
+    assert actual <= required_types | declared_variants, "An undeclared row input type was added"
+
+
+def assert_parameter_list_row_sdk_compatibility_fixture() -> None:
+    required = ["str", "ImageUrlArtifact", "ImageArtifact", "BytePlusImageAssetReference"]
+    variants = [*(f"list[{item}]" for item in required), "list"]
+    parent = SimpleNamespace(input_types=variants)
+    # Older SDKs expose only scalar item types; current SDKs additionally accept
+    # the parent container's list variants. Neither may remove the old types.
+    for inputs in (required, [*required, *variants]):
+        _assert_parameter_list_row_input_contract(parent, SimpleNamespace(input_types=inputs), required)
+    for inputs in (required[:-1], [*required, "unknown"], [*required, "list[unknown]"]):
+        try:
+            _assert_parameter_list_row_input_contract(parent, SimpleNamespace(input_types=inputs), required)
+        except AssertionError:
+            continue
+        raise AssertionError("The row-input compatibility fixture accepted an invalid contract")
+
+
 def assert_constructor_and_public_contract() -> None:
     with mock.patch.object(
         target.GriptapeNodes,
@@ -479,12 +507,12 @@ def assert_constructor_and_public_contract() -> None:
     assert image_parameter.allowed_modes == {target.ParameterMode.INPUT}
     image_child = image_parameter.append_child_parameter()
     assert image_child.type == "ImageUrlArtifact"
-    assert image_child.input_types == [
+    _assert_parameter_list_row_input_contract(image_parameter, image_child, [
         "str",
         "ImageUrlArtifact",
         "ImageArtifact",
         "BytePlusImageAssetReference",
-    ]
+    ])
     assert image_child.output_type == "str"
     image_parameter.clear_list()
 
@@ -530,11 +558,11 @@ def assert_constructor_and_public_contract() -> None:
     assert video_list_parameter._max_items == target.MAX_VIDEO_REFERENCES
     video_child = video_list_parameter.append_child_parameter()
     assert video_child.type == "VideoUrlArtifact"
-    assert video_child.input_types == [
+    _assert_parameter_list_row_input_contract(video_list_parameter, video_child, [
         "str",
         "VideoUrlArtifact",
         "BytePlusVideoAssetReference",
-    ]
+    ])
     assert video_child.output_type == "str"
     video_list_parameter.clear_list()
 
@@ -567,12 +595,12 @@ def assert_constructor_and_public_contract() -> None:
     assert audio_parameter.ui_options.get("hide_label", False) is False
     audio_child = audio_parameter.append_child_parameter()
     assert audio_child.type == "AudioArtifact"
-    assert audio_child.input_types == [
+    _assert_parameter_list_row_input_contract(audio_parameter, audio_child, [
         "AudioArtifact",
         "AudioUrlArtifact",
         "str",
         "BytePlusAudioAssetReference",
-    ]
+    ])
     assert audio_child.output_type == "AudioArtifact"
     audio_parameter.clear_list()
     assert node.get_parameter_value("auto_publish_local_videos") is True
@@ -1254,13 +1282,14 @@ def assert_seedance_25_output_format_and_last_frame_ui_contract() -> None:
     unsupported_bridge = target._HMBAIBrokerBridge(opener=object())
     unsupported_bridge.queue_admission = mock.Mock(return_value=None)
     unsupported_bridge._load_access_token = mock.Mock(side_effect=AssertionError("Wire-format fixture read credentials"))
+    capability_error = target._BrokerProtocolError("capability endpoint unavailable")
 
     def reject_capability(method, path, *, payload, timeout, **kwargs):
         del payload, timeout, kwargs
         unsupported_calls.append((method, path))
         if method == "POST":
             raise AssertionError("Advanced Seedance reached a billable POST")
-        raise target._BrokerProtocolError("capability endpoint unavailable")
+        raise capability_error
 
     unsupported_bridge._request_json = reject_capability
     try:
@@ -1276,8 +1305,10 @@ def assert_seedance_25_output_format_and_last_frame_ui_contract() -> None:
             timeout=1,
         )
     except target._BrokerProtocolError as exc:
-        assert "capabilities could not be verified" in str(exc)
-        assert "No render was submitted" in str(exc)
+        # Preserve the authenticated read's actionable error and identity. A
+        # generic wrapper must not conceal the transport/protocol diagnosis.
+        assert exc is capability_error
+        assert str(exc) == "capability endpoint unavailable"
     else:
         raise AssertionError("Missing Broker capabilities were accepted")
     assert unsupported_calls == [
@@ -2637,7 +2668,9 @@ def assert_payload_and_media_contract() -> None:
     )
     empty_child_node.set_parameter_value("prompt", "empty child is ignored")
     assert empty_child_node.get_parameter_value("reference_images") == []
-    assert empty_child_node.get_parameter_value("reference_audio") == [[]]
+    # Some hosts expose an empty row while current ParameterList hosts flatten
+    # its list value. Both must produce no outgoing audio reference below.
+    assert empty_child_node.get_parameter_value("reference_audio") in ([], [[]])
     empty_child_params = empty_child_node._get_parameters()
     assert empty_child_params["reference_images"] == []
     assert empty_child_params["reference_audio"] == []
@@ -5053,6 +5086,7 @@ def assert_hidden_task_evidence_and_gallery_contract() -> None:
 
 assert_fake_broker_authentication_boundary()
 assert_hidden_task_evidence_and_gallery_contract()
+assert_parameter_list_row_sdk_compatibility_fixture()
 assert_constructor_and_public_contract()
 assert_priority_model_visibility_and_saved_value_contract()
 assert_only_first_last_frame_ratio_ui_contract()

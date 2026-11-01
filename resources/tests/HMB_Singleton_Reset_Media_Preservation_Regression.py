@@ -129,6 +129,7 @@ try:
         }
     )
     old_image_state = image._normalize_state(old_image_state)
+    old_image_state[image.WIDGET_RUNTIME_LEASE_KEY] = old_image._hmb_widget_runtime_lease
     image._get_parameter_obj(
         old_image,
         image.WIDGET_STATE_PARAMETER,

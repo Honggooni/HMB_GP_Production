@@ -447,12 +447,12 @@ for (const button of [0, 1]) {
 }
 assert.match(
   assetSource,
-  /on\(container, "click", \(event\) => \{[\s\S]*?event\.target\?\.closest\?\.\("\[data-asset-key\]"\)[\s\S]*?toggleDelegatedAsset\(card, asset\);\s*\}\);/,
+  /on\(container, "click", \(event\) => \{[\s\S]*?event\.target\?\.closest\?\.\("\[data-asset-key\]"\)[\s\S]*?toggleDelegatedAsset\(card, asset, event\);\s*\}\);/,
   "Passing middle-button gestures through must retain left-click image selection through one delegated root handler.",
 );
 assert.match(
   assetSource,
-  /on\(container, "keydown", \(event\) => \{[\s\S]*?\["Enter", " "\]\.includes\(event\.key\)[\s\S]*?toggleDelegatedAsset\(card, asset\);\s*\}\);/,
+  /on\(container, "keydown", \(event\) => \{[\s\S]*?\["Enter", " "\]\.includes\(event\.key\)[\s\S]*?toggleDelegatedAsset\(card, asset, event\);\s*\}\);/,
   "Virtualized image cards must retain keyboard selection through root delegation.",
 );
 assert.match(
@@ -619,7 +619,8 @@ assert.deepEqual(
 const assetInstallEventsSource = assetSource.match(/function installEvents\([\s\S]*?\n\}\n\n(?:export default function HMBImageAssetLibraryWidget|function hmbNativeUiImplementation)/)?.[0] || "";
 assert.match(assetInstallEventsSource, /const assetsByLibraryId = new Map\(/, "Asset event installation must index cards in one linear pass.");
 assert.doesNotMatch(assetInstallEventsSource, /state\.assets\.find\(/, "Delegated card events must not rescan the full asset array.");
-const assetToggleSource = assetInstallEventsSource.match(/const toggleDelegatedAsset = \(card, asset\) => \{[\s\S]*?\n  \};/)?.[0] || "";
+const assetToggleSource = assetInstallEventsSource.match(/const toggleDelegatedAsset = \(card, asset, event = null\) => \{[\s\S]*?\n  \};/)?.[0] || "";
+assert.ok(assetToggleSource, "Delegated selection keeps the actual event-aware handler, including Bash duplicate-event protection.");
 const assetOrdinaryToggleSource = assetToggleSource.slice(
   0,
   assetToggleSource.indexOf("hmbScheduleImageAssetSelectionCommit(container"),

@@ -41,6 +41,8 @@ SUPPORTED_RECENT_CANDIDATE_SHA256 = "5e358586ae4b47fd698225c640fb65a4ed5b53dd27a
 SUPPORTED_RECENT_HELPER_SHA256 = "34657ae82e7862d3c5fa798184623369537d798fe0b4baa313188e33fb15cec6"
 SUPPORTED_LATEST_CANDIDATE_SHA256 = "c7100b21f4cca2fa55a368b9ac2740c923b5545c3a526005835b3fe47c65e343"
 SUPPORTED_LATEST_HELPER_SHA256 = "9d67418745b5264ec892835370da1d19a0695d878cb03c80de696f00601f52b5"
+SUPPORTED_CAPSULE_PREVIOUS_CANDIDATE_SHA256 = "86ee3125de3fc8a89af95a9140dc1fc81d3a426f6f03bfdfbe673b561ff87a5a"
+SUPPORTED_CAPSULE_PREVIOUS_HELPER_SHA256 = "03137c19feb8f4fa4d5e371eb52bae3aaaccf4afb6a29f0098e815bccf65ee25"
 HELPER = REPO / "resources/editor/hmb-color-lut-native-header.js"
 DEFAULT_SOURCE = Path(os.environ.get("LOCALAPPDATA", "")) / (
     "ai.griptape.nodes.desktop/current/resources/editor-bundle/assets/" + EXPECTED_BUNDLE_NAME
@@ -64,6 +66,13 @@ def _replace_once(source: str, old: str, new: str, anchor: str, counts: dict) ->
         raise ValueError(f"{anchor}: expected one exact anchor, found {count}")
     counts[anchor] = count
     return source.replace(old, new, 1)
+
+
+def _capsule_motion_bridge(source: str) -> str:
+    return _replace_once(source,
+        'E,(e,t,r)=>m({w:t,h:r}),d?f:void 0,d),Xd.request(`SetNodeMetadataRequest`',
+        'E,(e,t,r)=>m({w:t,h:r}),d?f:hmbNativeStudioCapsuleDuration(_,s),d),Xd.request(`SetNodeMetadataRequest`',
+        'hmb_capsule_native_duration', {})
 
 
 def patch_editor_source(source: str) -> tuple[str, dict]:
@@ -310,6 +319,8 @@ def patch_editor_source(source: str) -> tuple[str, dict]:
         "native_initial_geometry": {"width": 1225, "height": 1057,
             "scope": "explicit fresh prototype-editor placement only", "authored_metadata_unchanged": True},
     }
+    source = _capsule_motion_bridge(source)
+    evidence["candidate_sha256"] = sha256(source)
     return source, evidence
 
 
@@ -496,9 +507,11 @@ def _release_previous_candidates(descriptor: dict) -> list[dict]:
               "helper_sha256": SUPPORTED_RECENT_HELPER_SHA256}
     current = {"bundle_sha256": SUPPORTED_LATEST_CANDIDATE_SHA256,
                "helper_sha256": SUPPORTED_LATEST_HELPER_SHA256}
+    capsule_previous = {"bundle_sha256": SUPPORTED_CAPSULE_PREVIOUS_CANDIDATE_SHA256,
+                        "helper_sha256": SUPPORTED_CAPSULE_PREVIOUS_HELPER_SHA256}
     if "previous_candidates" in descriptor:
         candidates = descriptor["previous_candidates"]
-        if "previous_candidate" in descriptor or candidates not in ([current, latest, recent, older], [latest, recent, older], [recent, older]):
+        if "previous_candidate" in descriptor or candidates not in ([capsule_previous, current, latest, recent, older], [current, latest, recent, older], [latest, recent, older], [recent, older]):
             raise ValueError("Unsupported previous native editor candidates.")
         return list(candidates)
     if "previous_candidate" in descriptor:
@@ -540,6 +553,7 @@ def _upgrade_previous_helper(original: bytes, descriptor: dict) -> bytes:
     # Match the pristine transformer, which normalizes the helper to UTF-8 LF.
     replacement = HELPER.read_text(encoding="utf-8").encode("utf-8")
     candidate = original[:start] + replacement + original[end:]
+    candidate = _capsule_motion_bridge(candidate.decode("utf-8")).encode("utf-8")
     if sha256(candidate) != descriptor["candidate_sha256"]:
         raise ValueError("Upgraded native editor candidate differs from the verified release.")
     return candidate

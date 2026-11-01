@@ -1114,7 +1114,9 @@ assert.ok(bashThumbnails.every(thumbnail => thumbnail.getAttribute("class").incl
 // The compact thumbnail-only transition must be selected before the legacy
 // whole-state stringify comparison; otherwise large catalogs still pay the
 // serialization cost on every worker completion.
-const applyPropsStart = assetSource.indexOf("const applyProps = (nextProps = {}) => {");
+const applyPropsAnchor = "const applyProps = (nextProps = {}, forceAuthority = false) => {";
+assert.equal(assetSource.split(applyPropsAnchor).length - 1, 1, "Inspect the single actual applyProps boundary.");
+const applyPropsStart = assetSource.indexOf(applyPropsAnchor);
 const applyPropsEnd = assetSource.indexOf("const cleanup = () => {", applyPropsStart);
 const applyPropsSource = assetSource.slice(applyPropsStart, applyPropsEnd);
 assert.ok(applyPropsStart >= 0 && applyPropsEnd > applyPropsStart);
@@ -2303,8 +2305,10 @@ const installEventsSource = assetSource.match(
   /function installEvents\([\s\S]*?\n\}\n\n(?:export default function HMBImageAssetLibraryWidget|function hmbNativeUiImplementation)/,
 )?.[0] || "";
 const toggleSource = installEventsSource.match(
-  /const toggle = \(\) => \{[\s\S]*?\n    \};/,
+  /const toggle = \(event = null\) => \{[\s\S]*?\n    \};/,
 )?.[0] || "";
+assert.equal(installEventsSource.split("const toggle = (event = null) => {").length - 1, 1,
+  "Inspect the actual card-toggle boundary with its event argument.");
 const ordinaryToggleSource = toggleSource.slice(
   0,
   toggleSource.indexOf("hmbScheduleImageAssetSelectionCommit(container"),

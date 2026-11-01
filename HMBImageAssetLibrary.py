@@ -10,6 +10,7 @@ import copy
 import contextvars
 import hashlib
 import importlib.util
+import inspect
 from io import BytesIO
 import json
 import logging
@@ -121,6 +122,10 @@ IMAGE_BASH_IMAGES_OUTPUT_PARAMETER = "IMAGE_BASH_IMAGES_OUT"
 IMAGE_BASH_CONTEXT_OUTPUT_PARAMETER = "IMAGE_BASH_CONTEXT_OUT"
 IMAGE_BASH_CONTEXT_SCHEMA = "hmb-image-bash-inputs-v1"
 IMAGE_BASH_WORKSPACE_REQUEST_SCHEMA = "hmb-image-bash-workspace-edit-v1"
+IMAGE_BASH_WORKSPACE_EDIT_SCHEMA = "hmb-image-bash-workspace-mutation-v1"
+IMAGE_BASH_WORKSPACE_EDIT_KEY = "image_bash_workspace_edit"
+MAX_IMAGE_BASH_MUTATION_RECEIPTS = 128
+MAX_IMAGE_BASH_AUTHORITY_VIEW_BYTES = 512 * 1024
 OUTPUT_DISPLAY_NAME = "ASSET_OUT"
 MEDIA_OUTPUT_DISPLAY_NAME = "Video Generation Out"
 STATE_SCHEMA = "hmb-image-asset-library-state"
@@ -133,13 +138,14 @@ RESET_HANDOFF_IDENTITY_CONTRACT = (
 )
 UI_EDIT_REVISION_KEY = "ui_edit_revision"
 IMAGE_ASSET_EDIT_SCHEMA = "hmb-image-asset-edit-v1"
+WIDGET_RUNTIME_LEASE_KEY = "widget_runtime_lease"
 IMAGE_ASSET_EDIT_FIELDS = (
     "root_edit_enabled", "selected_folder_path", "expanded_folders",
     "selected_main_type", "selected_sub_type", "selected_source_view",
     "search", "language", "asset_view_mode", "refresh_revision",
     "thumbnail_request", "asset_registration_request", "asset_cleanup_request",
     "disconnect_import_uid", "shot_routing", "shot_hierarchy", "shot_hierarchy_request",
-    "image_bash_workspace", "image_bash_active", "image_bash_workspace_request",
+    "image_bash_workspace", "image_bash_active", "image_bash_workspace_request", IMAGE_BASH_WORKSPACE_EDIT_KEY,
 )
 MAX_UI_EDIT_REVISION = (1 << 53) - 1
 OUTPUT_VERSION = 4
@@ -443,6 +449,7 @@ def _default_thumbnail_bridge(runtime_instance_id: Any = "") -> Dict[str, Any]:
         "schema": THUMBNAIL_BRIDGE_SCHEMA,
         "version": THUMBNAIL_BRIDGE_VERSION,
         "runtime_instance_id": _clean(runtime_instance_id),
+        WIDGET_RUNTIME_LEASE_KEY: "",
         "operation": "idle",
         "phase": "idle",
         "request_id": "",
@@ -453,8 +460,21 @@ def _default_thumbnail_bridge(runtime_instance_id: Any = "") -> Dict[str, Any]:
 def _normalize_thumbnail_bridge(value: Any) -> Dict[str, Any]:
     raw = _parse_mapping(value)
     bridge = _default_thumbnail_bridge(raw.get("runtime_instance_id"))
+    bridge[WIDGET_RUNTIME_LEASE_KEY] = _uuid_text(raw.get(WIDGET_RUNTIME_LEASE_KEY))
     operation = _clean(raw.get("operation")).casefold()
     phase = _clean(raw.get("phase")).casefold()
+    if operation == "widget_authority" and phase in {"request", "result"}:
+        bridge.update(operation=operation, phase=phase,
+            request_id=_clean(raw.get("request_id"))[:128])
+        if phase == "result":
+            scope = raw.get("canonical_scope")
+            if isinstance(scope, dict) and scope.get("schema") == "hmb-image-bash-widget-authority-v1":
+                wire = _json_text(scope)
+                if len(wire.encode("utf-8")) <= 65536:
+                    bridge["canonical_scope"] = copy.deepcopy(scope)
+                    bridge["canonical_scope_sha256"] = hashlib.sha256(wire.encode("utf-8")).hexdigest()
+                    bridge["canonical_node_name"] = _clean(raw.get("canonical_node_name"))[:512]
+        return bridge
     if operation in {"cgt_catalog", "cgt_confirm", "cgt_cancel"} and phase in {"request", "result"}:
         bridge.update(operation=operation, phase=phase)
         for key in ("request_id", "session_id", "project_identity"):
@@ -3550,6 +3570,52 @@ def _normalize_image_bash_workspace_request(value: Any) -> Dict[str, Any]:
     return copy.deepcopy(value)
 
 
+def _normalize_image_bash_workspace_edit(value: Any) -> Dict[str, Any]:
+    if not value:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("Image Bash 편집 요청의 형식이 올바르지 않습니다.")
+    fields = {"schema", "version", "operation_id", "operation", "workspace_id", "expected_revision"}
+    operation = value.get("operation")
+    extras = {"add": {"source_uid", "new_instance_id"}, "copy": {"instance_id", "new_instance_id"},
+              "remove": {"instance_id"}, "reorder": {"instance_id", "target_instance_id"}}
+    if (not isinstance(operation, str) or operation not in extras or set(value) != fields | extras[operation]
+            or value.get("schema") != IMAGE_BASH_WORKSPACE_EDIT_SCHEMA
+            or type(value.get("version")) is not int or value["version"] != 1
+            or type(value.get("expected_revision")) is not int
+            or not 0 <= value["expected_revision"] <= MAX_UI_EDIT_REVISION):
+        raise ValueError("Image Bash 편집 요청을 확인한 뒤 다시 시도하세요.")
+    result = dict(value)
+    for field in ("operation_id", "workspace_id", *(key for key in extras[operation] if key.endswith("instance_id"))):
+        identity = _uuid_text(value.get(field))
+        if not identity:
+            raise ValueError("Image Bash 편집 요청에 고유한 작업·인스턴스 ID가 필요합니다.")
+        result[field] = identity
+    if operation == "add":
+        source = _clean(value.get("source_uid"))
+        if not isinstance(value.get("source_uid"), str) or not source or len(source) > 512:
+            raise ValueError("Image Bash 이미지 원본 ID가 올바르지 않습니다.")
+        result["source_uid"] = source
+    return result
+
+
+def _image_bash_widget_authority_scope(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Bounded semantic projection, identical for full and paged UI values."""
+    routing = state.get("shot_routing") if isinstance(state.get("shot_routing"), dict) else {}
+    project = {key: _clean(state.get(key)).replace("\\", "/") for key in (
+        "catalog_root", "project_root", "project_id", "project_uid", "project_cache_uid",
+        "manifest_signature", "folder_signature")}
+    return {"schema": "hmb-image-bash-widget-authority-v1",
+        WIDGET_RUNTIME_LEASE_KEY: _clean(state.get(WIDGET_RUNTIME_LEASE_KEY)), "project": project,
+        "publisher_instance_uuid": _clean(routing.get("publisher_instance_uuid")),
+        "channel_uuid": _clean(routing.get("channel_uuid")),
+        "scan_revision": _non_negative_int(state.get("scan_revision")),
+        UI_EDIT_REVISION_KEY: _non_negative_int(state.get(UI_EDIT_REVISION_KEY)),
+        "thumbnail_revision": _non_negative_int(state.get("thumbnail_revision")),
+        "image_bash_workspace": _normalize_image_bash_workspace(state.get("image_bash_workspace"),
+            _clean(routing.get("channel_uuid"))), "image_bash_active": state.get("image_bash_active") is True}
+
+
 def _sha256_canonical(value: Any) -> str:
     canonical = json.dumps(
         value,
@@ -3757,6 +3823,7 @@ def _default_state() -> Dict[str, Any]:
     state = {
         "schema": STATE_SCHEMA,
         "version": STATE_VERSION,
+        WIDGET_RUNTIME_LEASE_KEY: "",
         "edit_transport_schema": IMAGE_ASSET_EDIT_SCHEMA,
         "catalog_root": str(DEFAULT_PROJECTS_ROOT).replace("\\", "/"),
         "projects": [],
@@ -3900,6 +3967,7 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
         warnings = []
     state.update(
         {
+            WIDGET_RUNTIME_LEASE_KEY: _uuid_text(source.get(WIDGET_RUNTIME_LEASE_KEY)),
             "catalog_root": catalog_root,
             "projects": projects,
             "project_root": project_root,
@@ -7734,7 +7802,8 @@ def _build_image_bash_outputs(state: Dict[str, Any], media_by_uid: Dict[str, Any
         records.append(record)
         images.append(ImageUrlArtifact(value=url, name=record["name"]))
     return images, {"schema": IMAGE_BASH_CONTEXT_SCHEMA, "workspace_id": workspace["workspace_id"],
-                    "revision": workspace["revision"], "ready": True, "records": records}
+                    "revision": workspace["revision"], "ready": True, "records": records,
+                    "preparation_phase": "ready", "requested_count": len(instances)}
 
 
 def _image_bash_selection_state(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -8417,6 +8486,137 @@ class _ImageAssetSelectionPreparing(ValueError):
     hmb_image_asset_selection_preparing = True
 
 
+def _widget_assignment_digest(value: Any) -> str:
+    raw = dict(_parse_mapping(value))
+    raw.pop(WIDGET_RUNTIME_LEASE_KEY, None)
+    return hashlib.sha256(json.dumps(raw, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _is_registered_asset_node(engine: Any, node: Any) -> bool:
+    try:
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+        metadata = getattr(node, "metadata", {})
+        library = LibraryRegistry.get_library_for_node_type("HMBImageAssetLibrary", WIDGET_LIBRARY_NAME)
+        return (isinstance(metadata, dict) and metadata.get("library") == WIDGET_LIBRARY_NAME
+            and metadata.get("node_type") == "HMBImageAssetLibrary"
+            and type(node) is library.get_node_class("HMBImageAssetLibrary")
+            and Path(inspect.getfile(type(node))).resolve() == (_THIS_DIR / "HMBImageAssetLibrary.py").resolve()
+            and engine.node_manager.get_node_by_name(node.name) is node)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
+def _install_asset_initial_value_admission(engine: Any) -> None:
+    """Carry only a real, revocable SDK initial assignment into value hooks.
+
+    Saved files and clipboard imports can restore legacy values before inputs
+    exist. They may initialize a pristine node once, never overwrite a live
+    node merely by claiming initial_setup in their JSON. The context is shared
+    by this engine across module reloads, and expires even in copied contexts.
+    """
+    from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
+    manager = engine.event_manager
+    mapping = getattr(manager, "_request_type_to_manager", None)
+    if not isinstance(mapping, dict):
+        raise RuntimeError("SDK 이미지 라이브러리 복원 요청 경계를 확인할 수 없습니다.")
+    original = mapping.get(SetParameterValueRequest)
+    installed = getattr(manager, "_hmb_asset_initial_value_admission", None)
+    if original is installed and installed is not None:
+        return
+    # The existing Bash wrapper shares this handler. Recognize its exact
+    # captured predecessor so alternating Asset/Bash constructors do not grow
+    # a new wrapper per node. Do not alter the Bash installer or its identity.
+    bash = getattr(manager, "_hmb_bash_initial_value_admission", None)
+    if installed is not None and original is bash and inspect.isfunction(bash):
+        if inspect.getclosurevars(bash).nonlocals.get("original") is installed:
+            return
+    if not callable(original):
+        raise RuntimeError("SDK 이미지 라이브러리 복원 핸들러를 확인할 수 없습니다.")
+    try:
+        dispatch = inspect.unwrap(original)
+    except ValueError as exc:
+        raise RuntimeError("SDK 이미지 라이브러리 복원 핸들러 체인이 올바르지 않습니다.") from exc
+    # RemoteHandler and other callable objects have special dispatch identity.
+    if not (inspect.isfunction(dispatch) or inspect.ismethod(dispatch)):
+        return
+    if inspect.ismethod(dispatch) and (dispatch.__self__ is not engine.node_manager
+            or getattr(dispatch.__self__, dispatch.__name__, None) != dispatch):
+        return
+    context = getattr(manager, "_hmb_asset_initial_assignment_context", None)
+    if not isinstance(context, contextvars.ContextVar):
+        context = contextvars.ContextVar("hmb_asset_initial_assignment", default=None)
+        manager._hmb_asset_initial_assignment_context = context
+    workspace_context = getattr(manager, "_hmb_asset_workspace_assignment_context", None)
+    if not isinstance(workspace_context, contextvars.ContextVar):
+        workspace_context = contextvars.ContextVar("hmb_asset_workspace_assignment", default=None)
+        manager._hmb_asset_workspace_assignment_context = workspace_context
+    def target(request):
+        if request.initial_setup is not True or request.parameter_name not in {
+                WIDGET_STATE_PARAMETER, THUMBNAIL_PATCH_PARAMETER}:
+            return None
+        try:
+            node = (engine.node_manager.get_node_by_name(request.node_name)
+                if request.node_name is not None else engine.context_manager.get_current_node())
+        except (AttributeError, KeyError, RuntimeError, ValueError):
+            return None
+        return node if _is_registered_asset_node(engine, node) else None
+    def lease_for(request):
+        return {"node": target(request), "parameter": request.parameter_name,
+            "active": True, "allowed": set()}
+    def workspace_lease_for(request):
+        node = None
+        if request.parameter_name == WIDGET_STATE_PARAMETER and request.initial_setup is not True:
+            try:
+                candidate = (engine.node_manager.get_node_by_name(request.node_name)
+                    if request.node_name is not None else engine.context_manager.get_current_node())
+                if _is_registered_asset_node(engine, candidate):
+                    node = candidate
+            except (AttributeError, KeyError, RuntimeError, ValueError):
+                pass
+        return {"node": node, "active": True, "is_output": getattr(request, "is_output", False), "stage": None}
+    def finish_workspace(lease):
+        node = lease.get("node")
+        if node is not None:
+            node._finish_workspace_assignment(lease)
+    if inspect.iscoroutinefunction(original) or inspect.iscoroutinefunction(getattr(original, "__call__", None)):
+        async def wrapped(request):
+            lease = lease_for(request)
+            token = context.set(lease)
+            workspace = workspace_lease_for(request)
+            workspace_token = workspace_context.set(workspace)
+            try:
+                return await original(request)
+            finally:
+                try:
+                    finish_workspace(workspace)
+                finally:
+                    workspace["active"] = False
+                    workspace_context.reset(workspace_token)
+                    lease["active"] = False
+                    context.reset(token)
+    else:
+        def wrapped(request):
+            lease = lease_for(request)
+            token = context.set(lease)
+            workspace = workspace_lease_for(request)
+            workspace_token = workspace_context.set(workspace)
+            try:
+                return original(request)
+            finally:
+                try:
+                    finish_workspace(workspace)
+                finally:
+                    workspace["active"] = False
+                    workspace_context.reset(workspace_token)
+                    lease["active"] = False
+                    context.reset(token)
+    if mapping.get(SetParameterValueRequest) is not original:
+        raise RuntimeError("SDK 이미지 라이브러리 복원 핸들러가 설치 중 변경되었습니다.")
+    mapping[SetParameterValueRequest] = wrapped
+    manager._hmb_asset_initial_value_admission = wrapped
+
+
 class HMBImageAssetLibrary(DataNode):
     """Independent project image library and optional metadata source.
 
@@ -8428,6 +8628,12 @@ class HMBImageAssetLibrary(DataNode):
     """
 
     def __init__(self, **kwargs: Any):
+        self._hmb_widget_runtime_lease = str(uuid.uuid4())
+        self._hmb_image_bash_mutation_receipts: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+        self._hmb_workspace_local_assignment = contextvars.ContextVar("hmb_asset_workspace_local", default=None)
+        self._hmb_widget_constructing = True
+        self._hmb_widget_live_authored = False
+        self._hmb_widget_hydration_digest = ""
         # Widget callbacks can be delivered after a later click has already
         # committed. Keep the latest canonical local transaction so an older
         # callback cannot roll back selection/filter/dropdown state.
@@ -8572,6 +8778,19 @@ class HMBImageAssetLibrary(DataNode):
         self._accept_widget_state_baseline(
             _get_parameter_raw(self, WIDGET_STATE_PARAMETER)
         )
+        # Offline/empty nodes need authority immediately, without a catalog
+        # scan or network request. Keep both native storage slots current.
+        current = _parse_mapping(self._hmb_last_accepted_widget_state)
+        self._hmb_state_syncing = True
+        try:
+            self.set_parameter_value(WIDGET_STATE_PARAMETER, _json_text(current),
+                emit_change=False, skip_before_value_set=True)
+            self._sync_thumbnail_bridge_identity(current)
+        finally:
+            self._hmb_state_syncing = False
+        if ParameterMode is not None:
+            _install_asset_initial_value_admission(self.engine)
+        self._hmb_widget_constructing = False
         root_value = _project_root_text(
             _get_parameter_raw(self, PROJECT_ROOT_PARAMETER)
         )
@@ -8596,6 +8815,240 @@ class HMBImageAssetLibrary(DataNode):
         _add_widget_state(self)
         _add_thumbnail_patch_bridge(self)
 
+    def _widget_initial_assignment(self, name: str) -> Dict[str, Any] | None:
+        try:
+            context = getattr(self.engine.event_manager, "_hmb_asset_initial_assignment_context", None)
+            lease = context.get() if isinstance(context, contextvars.ContextVar) else None
+            if (isinstance(lease, dict) and lease.get("active") is True
+                    and lease.get("node") is self and lease.get("parameter") == name
+                    and _is_registered_asset_node(self.engine, self)):
+                return lease
+        except (AttributeError, KeyError, RuntimeError, ValueError):
+            pass
+        return None
+
+    def _workspace_assignment(self) -> Dict[str, Any] | None:
+        contexts = [getattr(self, "_hmb_workspace_local_assignment", None)]
+        try:
+            contexts.insert(0, getattr(self.engine.event_manager, "_hmb_asset_workspace_assignment_context", None))
+        except (AttributeError, RuntimeError):
+            pass
+        for context in contexts:
+            lease = context.get() if isinstance(context, contextvars.ContextVar) else None
+            if isinstance(lease, dict) and lease.get("active") is True and lease.get("node") is self:
+                return lease
+        return None
+
+    @contextmanager
+    def _workspace_assignment_scope(self):
+        current = self._workspace_assignment()
+        if current is not None:
+            yield current
+            return
+        context = getattr(self, "_hmb_workspace_local_assignment", None)
+        if not isinstance(context, contextvars.ContextVar):
+            context = contextvars.ContextVar("hmb_asset_workspace_local", default=None)
+            self._hmb_workspace_local_assignment = context
+        lease = {"node": self, "active": True, "is_output": False, "stage": None}
+        token = context.set(lease)
+        try:
+            yield lease
+        finally:
+            try:
+                self._finish_workspace_assignment(lease)
+            finally:
+                lease["active"] = False
+                context.reset(token)
+
+    def _finish_workspace_assignment(self, lease: Dict[str, Any]) -> None:
+        stage = lease.get("stage")
+        if not isinstance(stage, dict) or lease.get("node") is not self:
+            return
+        lease["stage"] = None
+        if getattr(self, "_hmb_node_deleted", False) or not self._scan_owner_is_current():
+            return
+        actual = _parse_mapping(_get_parameter_raw(self, WIDGET_STATE_PARAMETER))
+        accepted = _parse_mapping(getattr(self, "_hmb_last_accepted_widget_state", ""))
+        result = stage["workspace"]
+        if (actual.get("image_bash_workspace") == result and actual.get("schema") == STATE_SCHEMA
+                and actual.get(WIDGET_RUNTIME_LEASE_KEY) == self._hmb_widget_runtime_lease):
+            if accepted.get("image_bash_workspace") != result:
+                self._accept_normalized_widget_state_baseline(_normalize_state(actual), _json_text(actual))
+            receipts = self._hmb_image_bash_mutation_receipts
+            receipts[stage["operation_id"]] = {"fingerprint": stage["fingerprint"]}
+            receipts.move_to_end(stage["operation_id"])
+            while len(receipts) > MAX_IMAGE_BASH_MUTATION_RECEIPTS:
+                receipts.popitem(last=False)
+        elif (accepted.get("image_bash_workspace") == result
+                and actual.get("schema") == STATE_SCHEMA
+                and actual.get(WIDGET_RUNTIME_LEASE_KEY) == self._hmb_widget_runtime_lease):
+            # A before hook may stage accepted metadata before a native write
+            # fails. Reconcile to actual storage, without overwriting a later
+            # authored workspace or treating a failed write as an operation.
+            self._accept_normalized_widget_state_baseline(_normalize_state(actual), _json_text(actual))
+
+    def _workspace_edit_from_value(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+        if raw.get("schema") == IMAGE_ASSET_EDIT_SCHEMA:
+            edits = raw.get("edits")
+            return _normalize_image_bash_workspace_edit(edits.get(IMAGE_BASH_WORKSPACE_EDIT_KEY)) if isinstance(edits, dict) else {}
+        return _normalize_image_bash_workspace_edit(raw.get(IMAGE_BASH_WORKSPACE_EDIT_KEY))
+
+    def _replayed_workspace_edit(self, raw: Dict[str, Any]) -> Dict[str, Any] | None:
+        intent = self._workspace_edit_from_value(raw)
+        if not intent:
+            return None
+        receipt = getattr(self, "_hmb_image_bash_mutation_receipts", {}).get(intent["operation_id"])
+        if receipt is None:
+            return None
+        if receipt["fingerprint"] != _sha256_canonical(intent):
+            raise ValueError("같은 Image Bash 작업 ID에 다른 편집 요청을 사용할 수 없습니다.")
+        # Replays never replay other stale filters/project/selection fields.
+        return dict(_parse_mapping(self._hmb_last_accepted_widget_state))
+
+    def _canonical_workspace_edit(self, candidate: Dict[str, Any], intent: Any = None) -> Dict[str, Any]:
+        candidate = dict(candidate)
+        candidate.pop(IMAGE_BASH_WORKSPACE_EDIT_KEY, None)
+        if (getattr(self, "_hmb_widget_constructing", False) or getattr(self, "_hmb_state_syncing", False)
+                or getattr(self, "_hmb_restoring_widget_state", False)
+                or self._widget_initial_assignment(WIDGET_STATE_PARAMETER) is not None):
+            return candidate
+        base = _parse_mapping(getattr(self, "_hmb_last_accepted_widget_state", ""))
+        if base.get("schema") != STATE_SCHEMA:
+            raise ValueError("이미지 라이브러리의 현재 작업 정보를 먼저 확인하세요.")
+        current = copy.deepcopy(base.get("image_bash_workspace") or {})
+        lease = self._workspace_assignment()
+        stage = lease.get("stage") if isinstance(lease, dict) else None
+        command = _normalize_image_bash_workspace_edit(intent)
+        if not command:
+            if isinstance(stage, dict) and candidate.get("image_bash_workspace") == stage["workspace"]:
+                candidate["image_bash_workspace"] = copy.deepcopy(stage["workspace"])
+                return candidate
+            # A legacy explicit Create may initialize an empty workspace. A
+            # passive snapshot, project edit or thumbnail may never add rows.
+            creation = _normalize_image_bash_workspace_request(candidate.get("image_bash_workspace_request"))
+            if not current and creation:
+                proposed = _normalize_image_bash_workspace(candidate.get("image_bash_workspace"), "")
+                if (not proposed or proposed["instances"] or proposed["revision"] != 0
+                        or creation["workspace_id"] != proposed["workspace_id"] or creation["expected_revision"] != 0):
+                    raise ValueError("새 Image Bash 작업 공간은 빈 목록으로 생성해야 합니다.")
+                current = proposed
+            candidate["image_bash_workspace"] = current
+            return candidate
+        if lease is None or lease.get("is_output"):
+            raise ValueError("Image Bash 편집은 현재 노드의 속성 변경 요청으로만 적용할 수 있습니다.")
+        if bool(getattr(self, "lock", False)) or bool(getattr(self, "_hmb_node_deleted", False)):
+            raise ValueError("이미지 라이브러리 편집 잠금을 해제한 뒤 다시 시도하세요.")
+        fingerprint = _sha256_canonical(command)
+        if isinstance(stage, dict):
+            if stage["operation_id"] != command["operation_id"] or stage["fingerprint"] != fingerprint:
+                raise ValueError("하나의 Image Bash 변경에는 하나의 편집 요청만 적용할 수 있습니다.")
+            candidate["image_bash_workspace"] = copy.deepcopy(stage["workspace"])
+            return candidate
+        if not current:
+            if command["operation"] != "add" or command["expected_revision"] != 0:
+                raise ValueError("현재 Image Bash 작업 공간을 먼저 준비하세요.")
+            current = {"workspace_id": command["workspace_id"], "revision": 0, "instances": []}
+        if command["workspace_id"] != current["workspace_id"] or command["expected_revision"] != current["revision"]:
+            raise ValueError("Image Bash 목록이 변경되었습니다. 현재 목록을 확인하고 다시 시도하세요.")
+        rows = copy.deepcopy(current["instances"])
+        by_id = {row["instance_id"]: row for row in rows}
+        operation = command["operation"]
+        if operation == "add":
+            known = {_clean(row.get("source_uid")) for row in base.get("assets", [])}
+            if command["source_uid"] not in known:
+                raise ValueError("선택한 Image Bash 이미지 원본이 현재 라이브러리에 없습니다.")
+            if not any(row["source_uid"] == command["source_uid"] for row in rows):
+                if command["new_instance_id"] in by_id:
+                    raise ValueError("Image Bash 새 인스턴스 ID가 이미 사용 중입니다.")
+                rows.append({"instance_id": command["new_instance_id"], "source_uid": command["source_uid"]})
+        else:
+            source = by_id.get(command["instance_id"])
+            if source is None:
+                raise ValueError("편집할 Image Bash 인스턴스가 변경되었습니다.")
+            if operation == "copy":
+                if command["new_instance_id"] in by_id:
+                    raise ValueError("Image Bash 복제 인스턴스 ID가 이미 사용 중입니다.")
+                index = next(i for i, row in enumerate(rows) if row["instance_id"] == command["instance_id"])
+                rows.insert(index + 1, {"instance_id": command["new_instance_id"], "source_uid": source["source_uid"]})
+            elif operation == "remove":
+                rows = [row for row in rows if row["instance_id"] != command["instance_id"]]
+            else:
+                if command["target_instance_id"] not in by_id:
+                    raise ValueError("Image Bash 이동 대상이 변경되었습니다.")
+                old_index = next(i for i, row in enumerate(rows) if row["instance_id"] == command["instance_id"])
+                target_index = next(i for i, row in enumerate(rows) if row["instance_id"] == command["target_instance_id"])
+                rows.insert(target_index, rows.pop(old_index))
+        if len(rows) > MAX_SELECTED_IMAGES:
+            raise ValueError(f"Image Bash에는 최대 {MAX_SELECTED_IMAGES}개 이미지를 배치할 수 있습니다.")
+        changed = rows != current["instances"]
+        if changed and current["revision"] >= MAX_UI_EDIT_REVISION:
+            raise ValueError("Image Bash 입력 버전 한도에 도달했습니다. 새 작업 공간이 필요합니다.")
+        result = {"workspace_id": current["workspace_id"], "revision": current["revision"] + int(changed), "instances": rows}
+        lease["stage"] = {"operation_id": command["operation_id"], "fingerprint": fingerprint, "workspace": copy.deepcopy(result)}
+        candidate["image_bash_workspace"] = result
+        return candidate
+
+    def _admit_widget_state(self, value: Any) -> Dict[str, Any]:
+        raw = dict(_parse_mapping(value))
+        lease_id = self._hmb_widget_runtime_lease
+        if (getattr(self, "_hmb_widget_constructing", False)
+                or getattr(self, "_hmb_state_syncing", False)
+                or getattr(self, "_hmb_restoring_widget_state", False)):
+            raw[WIDGET_RUNTIME_LEASE_KEY] = lease_id
+            return raw
+        assignment = self._widget_initial_assignment(WIDGET_STATE_PARAMETER)
+        if assignment is not None:
+            digest = _widget_assignment_digest(raw)
+            if digest not in assignment["allowed"]:
+                accepted = _parse_mapping(getattr(self, "_hmb_last_accepted_widget_state", ""))
+                pristine = (not getattr(self, "_hmb_widget_live_authored", False)
+                    and not getattr(self, "_hmb_widget_hydration_digest", "")
+                    and not accepted.get("image_bash_workspace")
+                    and not any(row.get("selected") for row in accepted.get("assets", []))
+                    and not accepted.get("shot_hierarchy")
+                    and _non_negative_int(accepted.get(UI_EDIT_REVISION_KEY)) == 0
+                    and not any(accepted.get(key) for key in ("asset_registration_request",
+                        "asset_cleanup_request", "image_bash_workspace_request", "shot_hierarchy_request")))
+                duplicate = (not getattr(self, "_hmb_widget_live_authored", False)
+                    and digest == getattr(self, "_hmb_widget_hydration_digest", ""))
+                if (raw.get("schema") != STATE_SCHEMA or not (pristine or duplicate)):
+                    raise ValueError("이미 사용 중인 이미지 라이브러리는 저장된 이전 화면으로 덮어쓸 수 없습니다.")
+                if not duplicate:
+                    assignment["hydration_digest"] = digest
+                assignment["allowed"].add(digest)
+            raw[WIDGET_RUNTIME_LEASE_KEY] = lease_id
+            assignment["allowed"].add(_widget_assignment_digest(raw))
+            return raw
+        if _clean(raw.get(WIDGET_RUNTIME_LEASE_KEY)) != lease_id:
+            raise ValueError("이미지 라이브러리 화면 연결이 갱신되었습니다. 최신 화면을 확인한 뒤 다시 시도하세요.")
+        return raw
+
+    def _admit_thumbnail_bridge(self, value: Any) -> Dict[str, Any]:
+        raw = dict(_parse_mapping(value))
+        internal = (getattr(self, "_hmb_widget_constructing", False)
+            or getattr(self, "_hmb_thumbnail_bridge_syncing", False))
+        initial = self._widget_initial_assignment(THUMBNAIL_PATCH_PARAMETER)
+        if internal:
+            raw[WIDGET_RUNTIME_LEASE_KEY] = self._hmb_widget_runtime_lease
+            return _normalize_thumbnail_bridge(raw)
+        if initial is not None:
+            # A saved hidden transport is inert, not a new worker/CGT command.
+            raw = _default_thumbnail_bridge(self._thumbnail_runtime_id(self._current_state()))
+            raw[WIDGET_RUNTIME_LEASE_KEY] = self._hmb_widget_runtime_lease
+            return raw
+        if raw.get("operation") == "widget_authority":
+            allowed = {"schema", "version", "operation", "phase", "request_id",
+                "runtime_instance_id", WIDGET_RUNTIME_LEASE_KEY, "catalog_page_version"}
+            if (set(raw) - allowed or raw.get("schema") != THUMBNAIL_BRIDGE_SCHEMA
+                    or type(raw.get("version")) is not int or raw["version"] != THUMBNAIL_BRIDGE_VERSION
+                    or raw.get("phase") != "request" or not _clean(raw.get("request_id"))
+                    or len(_clean(raw.get("request_id"))) > 128):
+                raise ValueError("이미지 라이브러리 화면 권위 확인 요청이 올바르지 않습니다.")
+            return _normalize_thumbnail_bridge(raw)
+        if _clean(raw.get(WIDGET_RUNTIME_LEASE_KEY)) != self._hmb_widget_runtime_lease:
+            raise ValueError("이미지 라이브러리의 이전 화면 요청입니다. 최신 연결로 다시 시도하세요.")
+        return _normalize_thumbnail_bridge(raw)
+
     @hmb_binding_mutation
     def set_parameter_value(
         self,
@@ -8606,9 +9059,27 @@ class HMBImageAssetLibrary(DataNode):
         emit_change: bool = True,
         skip_before_value_set: bool = False,
     ) -> None:
+        if param_name == WIDGET_STATE_PARAMETER and not (
+            getattr(self, "_hmb_widget_constructing", False) or getattr(self, "_hmb_state_syncing", False)
+            or getattr(self, "_hmb_restoring_widget_state", False)
+        ):
+            with self._workspace_assignment_scope():
+                return self._set_parameter_value_guarded(param_name, value, initial_setup=initial_setup,
+                    emit_change=emit_change, skip_before_value_set=skip_before_value_set)
+        return self._set_parameter_value_guarded(param_name, value, initial_setup=initial_setup,
+            emit_change=emit_change, skip_before_value_set=skip_before_value_set)
+
+    def _set_parameter_value_guarded(
+        self, param_name: str, value: Any, *, initial_setup: bool = False,
+        emit_change: bool = True, skip_before_value_set: bool = False,
+    ) -> None:
         """Adopt serialized hydration as a fresh instance-local baseline."""
 
         parent_setter = getattr(super(), "set_parameter_value")
+        if param_name == WIDGET_STATE_PARAMETER:
+            value = _json_text(self._expand_widget_edit(value))
+        elif param_name == THUMBNAIL_PATCH_PARAMETER:
+            value = self._admit_thumbnail_bridge(value)
         if initial_setup and param_name == THUMBNAIL_PATCH_PARAMETER:
             saved_request = _normalize_thumbnail_bridge(value)
             if saved_request.get("operation") in {"cgt_catalog", "cgt_confirm", "cgt_cancel"} and saved_request.get("phase") == "request":
@@ -8677,6 +9148,9 @@ class HMBImageAssetLibrary(DataNode):
         )
         if initial_setup and param_name == WIDGET_STATE_PARAMETER:
             self._hmb_hydration_adopted = True
+            assignment = self._widget_initial_assignment(WIDGET_STATE_PARAMETER)
+            if assignment is not None and assignment.get("hydration_digest"):
+                self._hmb_widget_hydration_digest = assignment["hydration_digest"]
             self._schedule_post_hydration_shot_reconcile()
 
     def _schedule_post_hydration_shot_reconcile(self) -> bool:
@@ -9437,7 +9911,16 @@ class HMBImageAssetLibrary(DataNode):
         commands; it cannot supply catalog rows, source paths or media facts.
         Legacy full snapshots keep their existing hydration/scan contract.
         """
-        raw = dict(_parse_mapping(value))
+        raw = self._admit_widget_state(value)
+        privileged = (getattr(self, "_hmb_widget_constructing", False)
+            or getattr(self, "_hmb_state_syncing", False) or getattr(self, "_hmb_restoring_widget_state", False)
+            or self._widget_initial_assignment(WIDGET_STATE_PARAMETER) is not None)
+        if not privileged:
+            replay = self._replayed_workspace_edit(raw)
+            if replay is not None:
+                return replay
+        if raw.get("schema") == STATE_SCHEMA:
+            raw = self._canonical_workspace_edit(raw, None if privileged else raw.get(IMAGE_BASH_WORKSPACE_EDIT_KEY))
         if raw.get("schema") == STATE_SCHEMA and raw.get("shot_hierarchy_request"):
             return self._prepare_shot_hierarchy_edit(raw, raw["shot_hierarchy_request"])
         if raw.get("schema") == STATE_SCHEMA and isinstance(raw.get("catalog_page"), dict):
@@ -9480,6 +9963,10 @@ class HMBImageAssetLibrary(DataNode):
         selected = raw.get("selected_source_uids")
         if not isinstance(edits, dict) or set(edits) - set(IMAGE_ASSET_EDIT_FIELDS):
             raise ValueError("Image asset edit contains unsupported fields.")
+        edits = dict(edits)
+        workspace_edit = edits.pop(IMAGE_BASH_WORKSPACE_EDIT_KEY, None)
+        if workspace_edit and edits.get("shot_hierarchy_request"):
+            raise ValueError("Image Bash 편집과 샷 구성 확정은 각각 적용해야 합니다.")
         if edits.get("shot_hierarchy_request"):
             return self._prepare_shot_hierarchy_edit(raw, edits["shot_hierarchy_request"])
         if edits.get("shot_hierarchy", base.get("shot_hierarchy", {})) != base.get("shot_hierarchy", {}):
@@ -9527,27 +10014,13 @@ class HMBImageAssetLibrary(DataNode):
             raise ValueError("Image asset active Shot is no longer present.")
         if "image_bash_active" in edits and type(edits["image_bash_active"]) is not bool:
             raise ValueError("Image Bash 화면 선택이 올바르지 않습니다.")
-        if "image_bash_workspace" in edits:
-            old_workspace = base["image_bash_workspace"]
-            workspace = _normalize_image_bash_workspace(edits["image_bash_workspace"], current_routing["channel_uuid"])
-            changed = workspace.get("instances", []) != old_workspace.get("instances", [])
-            if ((not workspace and bool(old_workspace))
-                    or (workspace and ((old_workspace and workspace["workspace_id"] != old_workspace["workspace_id"])
-                    or workspace["revision"] != (old_workspace["revision"] + int(changed) if old_workspace else 0)))):
-                raise ValueError("Image Bash 작업 공간이 변경되었습니다. 다시 선택하세요.")
-            old_instances = {row["instance_id"]: row["source_uid"] for row in old_workspace.get("instances", [])}
-            known_sources = {_clean(row.get("source_uid")) for row in base.get("assets", [])}
-            if any((row["instance_id"] in old_instances and old_instances[row["instance_id"]] != row["source_uid"])
-                   or (row["instance_id"] not in old_instances and row["source_uid"] not in known_sources)
-                   for row in workspace.get("instances", [])):
-                raise ValueError("Image Bash 이미지 원본이 변경되었습니다. 새 인스턴스로 추가하세요.")
-            edits["image_bash_workspace"] = workspace
-        if edits.get("image_bash_workspace_request"):
-            command = _normalize_image_bash_workspace_request(edits["image_bash_workspace_request"])
-            workspace = edits.get("image_bash_workspace", base["image_bash_workspace"])
+        base.update(edits)
+        base = self._canonical_workspace_edit(base, workspace_edit)
+        if base.get("image_bash_workspace_request"):
+            command = _normalize_image_bash_workspace_request(base["image_bash_workspace_request"])
+            workspace = base["image_bash_workspace"]
             if not workspace or command["workspace_id"] != workspace["workspace_id"] or command["expected_revision"] != workspace["revision"]:
                 raise ValueError("Image Bash 추가 요청의 작업 공간이 변경되었습니다.")
-        base.update(edits)
         base[UI_EDIT_REVISION_KEY] = raw.get(UI_EDIT_REVISION_KEY)
         order = {uid: index + 1 for index, uid in enumerate(selected)}
         base["assets"] = [dict(item, selected=_clean(item.get("source_uid")) in order,
@@ -9592,6 +10065,11 @@ class HMBImageAssetLibrary(DataNode):
         normalized_state: Dict[str, Any],
         serialized: str = "",
     ) -> None:
+        normalized_state[WIDGET_RUNTIME_LEASE_KEY] = self._hmb_widget_runtime_lease
+        if serialized:
+            parsed = _parse_mapping(serialized)
+            if parsed.get(WIDGET_RUNTIME_LEASE_KEY) != self._hmb_widget_runtime_lease:
+                serialized = _json_text(normalized_state)
         # A detached scalar search projection owns index invalidation. Selection
         # and thumbnail edits do not rebuild it; same-count metadata edits do.
         fields = ("asset_id", "image_name", "relative_path", "image_main_type",
@@ -9851,6 +10329,12 @@ class HMBImageAssetLibrary(DataNode):
         self._consume_selection_resolution()
         cache = self._resolution_cache_for_state(state)
         revision = _non_negative_int(getattr(self, "_hmb_import_revision", 0))
+        # Explicit Bash Retry may also need to revisit an imported UNC file.
+        # Only those scoped keys join the existing bounded worker; ordinary
+        # imports keep their established resolution/publication behavior.
+        retry_keys = getattr(self, "_hmb_image_bash_retry_cache_keys", set())
+        if not isinstance(retry_keys, set):
+            retry_keys = set()
         # Workspace-only project sources need the same asynchronous share
         # verification as Shot selections. Resolve the two independently so
         # each selection retains its own 50-image limit.
@@ -9862,7 +10346,8 @@ class HMBImageAssetLibrary(DataNode):
             for selection in selections
             for asset in selection.get("assets", [])
             if asset.get("selected")
-            and _clean(asset.get("source_kind")).casefold() == "project"
+            and (_clean(asset.get("source_kind")).casefold() == "project"
+                 or _asset_resolution_cache_key(asset, state, revision) in retry_keys)
             and _asset_resolution_cache_key(asset, state, revision) not in cache
         ]
         if not missing:
@@ -9997,6 +10482,7 @@ class HMBImageAssetLibrary(DataNode):
             pair = (previous[0] if same_workspace else [], {"schema": IMAGE_BASH_CONTEXT_SCHEMA,
                 "workspace_id": workspace.get("workspace_id", ""), "revision": workspace.get("revision", 0),
                 "ready": False, "records": copy.deepcopy(previous[1].get("records", [])) if same_workspace else [],
+                "preparation_phase": "preparing", "requested_count": len(workspace["instances"]),
                 "error": "Image Bash 이미지 원본을 확인하는 중입니다."})
         elif force or fingerprint != getattr(self, "_hmb_last_image_bash_fingerprint", "") or pair is None:
             pair = _build_image_bash_outputs(state, getattr(self, "_hmb_import_media_by_uid", {}),
@@ -10013,6 +10499,7 @@ class HMBImageAssetLibrary(DataNode):
                 pair = (previous[0] if same_workspace else [], {"schema": IMAGE_BASH_CONTEXT_SCHEMA,
                     "workspace_id": workspace.get("workspace_id", ""), "revision": workspace.get("revision", 0),
                     "ready": False, "records": copy.deepcopy(previous[1].get("records", [])) if same_workspace else [],
+                    "preparation_phase": "error", "requested_count": len(workspace["instances"]),
                     "error": "Image Bash에서 선택한 이미지 원본을 확인할 수 없습니다. 원본 연결을 복구하세요."})
             else:
                 self._hmb_last_image_bash_pair = pair
@@ -10123,6 +10610,60 @@ class HMBImageAssetLibrary(DataNode):
                         _diagnostic_exception("Image Bash preparation rollback requires review", exc)
                 raise
             return workspace["workspace_id"]
+
+    def _hmb_retry_image_bash_inputs(self, target: Any, workspace_id: str) -> Dict[str, Any]:
+        """Revalidate only the bound Bash sources, without running either node.
+
+        A missing-file result may remain cached after the file/share recovers.
+        Retry must expire that workspace's resolution facts, not clear Shot
+        selections, edited layers, Apply receipts or unrelated project caches.
+        """
+        if not hasattr(self, "_hmb_image_bash_binding_lock"):
+            self._hmb_image_bash_binding_lock = threading.RLock()
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.events.connection_events import ListConnectionsForNodeRequest
+        with self._hmb_image_bash_binding_lock:
+            identity, state, _ = self._image_bash_binding_state(target, workspace_id)
+            metadata = getattr(target, "metadata", {})
+            if (metadata.get("hmb_image_bash_workspace_id") != identity[1]
+                    or metadata.get("hmb_image_bash_channel_uuid") != identity[3]):
+                raise ValueError("Image Bash 연결이 변경되었습니다. 현재 작업 공간을 다시 선택하세요.")
+            found = GriptapeNodes.handle_request(ListConnectionsForNodeRequest(node_name=target.name, broadcast_result=False))
+            self._image_bash_binding_state(target, workspace_id, identity)
+            ports = {(IMAGE_BASH_IMAGES_OUTPUT_PARAMETER, "input_images"),
+                     (IMAGE_BASH_CONTEXT_OUTPUT_PARAMETER, "image_bash_context")}
+            edges = [edge for edge in getattr(found, "incoming_connections", [])
+                     if edge.target_parameter_name in {"input_images", "image_bash_context"}]
+            if (not found.succeeded() or len(edges) != 2
+                    or {(edge.source_node_name, edge.source_parameter_name, edge.target_parameter_name)
+                        for edge in edges} != {(self.name, output, parameter) for output, parameter in ports}):
+                raise ValueError("현재 ImageAsset와 Image Bash의 두 입력 연결을 확인하세요.")
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = getattr(GriptapeNodes.EventManager(), "event_loop", None)
+            if loop is None or not loop.is_running() or loop.is_closed():
+                raise ValueError("이미지 확인을 예약할 호스트 이벤트 루프가 준비되지 않았습니다. 워크플로가 열린 뒤 다시 시도하세요.")
+            # Consume an already finished worker before expiring these keys;
+            # otherwise its staged negative cache could undo this explicit retry.
+            self._consume_selection_resolution()
+            cache = self._resolution_cache_for_state(state)
+            revision = _non_negative_int(getattr(self, "_hmb_import_revision", 0))
+            wanted = {row["source_uid"] for row in state["image_bash_workspace"]["instances"]}
+            retry_keys = set()
+            for asset in state.get("assets", []):
+                if asset.get("source_uid") in wanted:
+                    cache_key = _asset_resolution_cache_key(asset, state, revision)
+                    retry_keys.add(cache_key)
+                    cache.pop(cache_key, None)
+            self._hmb_image_bash_retry_cache_keys = retry_keys
+            self._hmb_last_image_bash_fingerprint = ""
+            # The existing verifier bounds work to one active worker and the
+            # latest queued request. No forced/synchronous scan is introduced.
+            self._sync_output(state, normalized=True)
+            context = self.parameter_output_values.get(IMAGE_BASH_CONTEXT_OUTPUT_PARAMETER, {})
+            return {key: copy.deepcopy(context.get(key)) for key in
+                    ("workspace_id", "revision", "ready", "preparation_phase", "requested_count")}
 
     def _image_bash_binding_state(self, target: Any, workspace_id: str, expected: Any = None) -> tuple[Any, ...]:
         for node in (self, target):
@@ -10777,7 +11318,8 @@ class HMBImageAssetLibrary(DataNode):
             thread.start()
 
     def _set_thumbnail_bridge_value(self, value: Dict[str, Any]) -> None:
-        normalized = _normalize_thumbnail_bridge(value)
+        normalized = _normalize_thumbnail_bridge(dict(value,
+            **{WIDGET_RUNTIME_LEASE_KEY: self._hmb_widget_runtime_lease}))
         self._hmb_thumbnail_bridge_syncing = True
         try:
             publisher = getattr(self, "publish_update_to_parameter", None)
@@ -10818,7 +11360,8 @@ class HMBImageAssetLibrary(DataNode):
         current = _normalize_thumbnail_bridge(
             _get_parameter_raw(self, THUMBNAIL_PATCH_PARAMETER)
         )
-        if _clean(current.get("runtime_instance_id")) != runtime_id:
+        if (_clean(current.get("runtime_instance_id")) != runtime_id
+                or current.get(WIDGET_RUNTIME_LEASE_KEY) != self._hmb_widget_runtime_lease):
             self._set_thumbnail_bridge_value(
                 _default_thumbnail_bridge(runtime_id)
             )
@@ -10830,6 +11373,7 @@ class HMBImageAssetLibrary(DataNode):
         normalized: bool = False,
     ) -> Dict[str, Any]:
         normalized_state = state if normalized else _normalize_state(state)
+        normalized_state[WIDGET_RUNTIME_LEASE_KEY] = self._hmb_widget_runtime_lease
         _store_shared_catalog_snapshot(normalized_state, normalized=True)
         serialized = _json_text(normalized_state)
         self._accept_normalized_widget_state_baseline(normalized_state, serialized)
@@ -10898,6 +11442,7 @@ class HMBImageAssetLibrary(DataNode):
         preserve_outputs: bool = False,
     ) -> Dict[str, Any]:
         state = dict(state)
+        state[WIDGET_RUNTIME_LEASE_KEY] = self._hmb_widget_runtime_lease
         state["asset_registration_request"] = {}
         state["asset_cleanup_request"] = {}
         state["disconnect_import_uid"] = ""
@@ -13182,9 +13727,45 @@ class HMBImageAssetLibrary(DataNode):
         response.update(phase="result", outcome=outcome, state=result)
         self._set_thumbnail_bridge_value(response)
 
+    def _publish_widget_authority_view(self, state: Dict[str, Any]) -> None:
+        """Public view event only; never write a property/output storage slot."""
+        from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
+        from griptape_nodes.retained_mode.events.execution_events import ParameterValueUpdateEvent
+        parameter = self.get_parameter_by_name(WIDGET_STATE_PARAMETER)
+        if parameter is None:
+            raise ValueError("이미지 라이브러리 화면 파라미터를 확인할 수 없습니다.")
+        dto = self._catalog_page_projection(state)
+        wire = _json_text(dto)
+        if len(wire.encode("utf-8")) > MAX_IMAGE_BASH_AUTHORITY_VIEW_BYTES:
+            raise ValueError("이미지 라이브러리 화면 데이터가 큽니다. 현재 작업을 저장하고 새 화면에서 다시 확인하세요.")
+        payload = ParameterValueUpdateEvent(node_name=self.name, parameter_name=WIDGET_STATE_PARAMETER,
+            data_type=parameter.type, value=wire)
+        self.engine.event_manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload)))
+
     def _apply_thumbnail_bridge_request(self, value: Any) -> None:
+        early = self._admit_thumbnail_bridge(value)
+        if early.get("operation") == "widget_authority" and early.get("phase") == "request":
+            current = _parse_mapping(getattr(self, "_hmb_last_accepted_widget_state", ""))
+            if (current.get("schema") != STATE_SCHEMA
+                    or _image_bash_widget_authority_scope(current) != _image_bash_widget_authority_scope(self._current_state())):
+                raise ValueError("이미지 라이브러리 변경을 적용 중입니다. 현재 화면을 다시 확인하세요.")
+            scope = _image_bash_widget_authority_scope(current)
+            if len(_json_text(scope).encode("utf-8")) > 65536:
+                raise ValueError("이미지 라이브러리 작업 범위가 큽니다. 현재 입력과 프로젝트 경로를 확인하세요.")
+            self._publish_widget_authority_view(current)
+            if (not self._scan_owner_is_current()
+                    or _image_bash_widget_authority_scope(_parse_mapping(self._hmb_last_accepted_widget_state)) != scope
+                    or _image_bash_widget_authority_scope(self._current_state()) != scope):
+                raise ValueError("이미지 라이브러리 상태가 갱신되었습니다. 현재 화면에서 다시 확인하세요.")
+            self._set_thumbnail_bridge_value({
+                "schema": THUMBNAIL_BRIDGE_SCHEMA, "version": THUMBNAIL_BRIDGE_VERSION,
+                "operation": "widget_authority", "phase": "result",
+                "request_id": early["request_id"],
+                "runtime_instance_id": self._thumbnail_runtime_id(current),
+                WIDGET_RUNTIME_LEASE_KEY: self._hmb_widget_runtime_lease,
+                "canonical_node_name": self.name, "canonical_scope": scope})
+            return
         self._consume_cgt_work_results()
-        early = _normalize_thumbnail_bridge(value)
         if early.get("operation") == "cgt_cancel" and early.get("phase") == "request":
             self._request_cgt_read(early)
             return
@@ -13302,6 +13883,12 @@ class HMBImageAssetLibrary(DataNode):
 
     def before_value_set(self, parameter: Any, value: Any) -> Any:
         name = _clean(getattr(parameter, "name", ""))
+        # Reject old live containers before consuming pending work or changing
+        # any baseline. Only real initial native assignments may rebase a file.
+        if name == WIDGET_STATE_PARAMETER:
+            value = self._admit_widget_state(value)
+        elif name == THUMBNAIL_PATCH_PARAMETER:
+            return self._admit_thumbnail_bridge(value)
         previous: Dict[str, Any] = {}
         external_state = name == WIDGET_STATE_PARAMETER and not (
             bool(getattr(self, "_hmb_state_syncing", False)) or bool(getattr(self, "_hmb_restoring_widget_state", False))
@@ -13359,7 +13946,15 @@ class HMBImageAssetLibrary(DataNode):
                     raw_state = rebased
                 raw_state = self._preserve_newer_thumbnail_baseline(raw_state)
                 normalized = _normalize_state(raw_state)
+                assignment = self._widget_initial_assignment(WIDGET_STATE_PARAMETER)
+                if assignment is not None:
+                    assignment["allowed"].add(_widget_assignment_digest(normalized))
                 self._accept_widget_state_baseline(normalized)
+                if external_state and assignment is None:
+                    # SDK is_output assignments still run this hook but may
+                    # skip after_value_set. They must retire the first-load
+                    # duplicate exception just like ordinary live edits.
+                    self._hmb_widget_live_authored = True
                 return _json_text(normalized)
 
             current_raw = dict(
@@ -13410,6 +14005,8 @@ class HMBImageAssetLibrary(DataNode):
                 )
                 self._hmb_manifest_poll_received = True
                 self._hmb_manifest_poll_pending = True
+            if external_state and self._widget_initial_assignment(WIDGET_STATE_PARAMETER) is None:
+                self._hmb_widget_live_authored = True
             return _json_text(_normalize_state(candidate))
         if name == PROJECT_ROOT_PARAMETER:
             return _project_root_text(value)
@@ -13419,6 +14016,23 @@ class HMBImageAssetLibrary(DataNode):
 
     @hmb_binding_mutation
     def after_value_set(self, parameter: Any, value: Any) -> Any:
+        name = _clean(getattr(parameter, "name", ""))
+        if name == WIDGET_STATE_PARAMETER:
+            try:
+                clean_state = self._expand_widget_edit(value)
+                value = _json_text(clean_state)
+                actual = _parse_mapping(_get_parameter_raw(self, WIDGET_STATE_PARAMETER))
+                if actual.get("image_bash_workspace") != clean_state.get("image_bash_workspace") or actual.get(IMAGE_BASH_WORKSPACE_EDIT_KEY):
+                    self._hmb_state_syncing = True
+                    try:
+                        self.set_parameter_value(WIDGET_STATE_PARAMETER, value, emit_change=False, skip_before_value_set=True)
+                    finally:
+                        self._hmb_state_syncing = False
+            except ValueError:
+                self._restore_accepted_widget_state()
+                raise
+        elif name == THUMBNAIL_PATCH_PARAMETER:
+            value = self._admit_thumbnail_bridge(value)
         result = None
         try:
             parent = getattr(super(), "after_value_set", None)
@@ -13426,16 +14040,22 @@ class HMBImageAssetLibrary(DataNode):
                 result = parent(parameter, value)
         except Exception as exc:
             _diagnostic_exception("Parent after_value_set failed", exc)
-        if self._hmb_state_syncing or self._hmb_thumbnail_bridge_syncing:
+        if (self._hmb_state_syncing or self._hmb_thumbnail_bridge_syncing
+                or self._hmb_restoring_widget_state):
+            return result
+        name = _clean(getattr(parameter, "name", ""))
+        if name == THUMBNAIL_PATCH_PARAMETER:
+            self._apply_thumbnail_bridge_request(value)
             return result
         self._consume_pending_import_thumbnail_result()
-        name = _clean(getattr(parameter, "name", ""))
         if name in {
             PROJECT_ROOT_PARAMETER,
             IMAGE_IMPORT_PARAMETER,
             WIDGET_STATE_PARAMETER,
         }:
             self._hmb_hydration_adopted = True
+        if name == WIDGET_STATE_PARAMETER and self._widget_initial_assignment(name) is None:
+            self._hmb_widget_live_authored = True
         _begin_image_output_side_effect_callback(self)
         try:
             if name == PROJECT_ROOT_PARAMETER and not self._hmb_root_syncing:

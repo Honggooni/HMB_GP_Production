@@ -29,6 +29,24 @@ const hmbIsNativeStudioWidget = (widgetName, metadata = null) => typeof widgetNa
   && (hmbNativeStudioWidgets.has(widgetName) || hmbNativeStudioDeclaredContract(metadata)?.widget === widgetName);
 const hmbNativeStudioCollapsedWidth = 320;
 const hmbNativeStudioCollapsedHeight = 64;
+// Only HMB capsule transitions use the shorter native duration. Preserve the
+// user's animation setting, native easing, push layout and roll-up duration.
+const hmbNativeStudioCapsuleDurationMs = 200;
+function hmbNativeStudioCapsuleDuration(node, settings) {
+  const data = node?.data, metadata = data?.metadata;
+  if (metadata?.library !== "HMB_GP_Production"
+    || !hmbIsNativeStudioType(data?.node_type, metadata)
+    || settings?.nodeAnimationEnabled !== true) return undefined;
+  try {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return undefined;
+    // The native interpolator divides by duration. One millisecond reaches its
+    // final frame without a visible tween and avoids its zero-duration NaN.
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return 1;
+  } catch { return undefined; }
+  const requested = settings.nodeAnimationDurationMs;
+  return Number.isFinite(requested) && requested >= 0
+    ? Math.max(1, Math.min(hmbNativeStudioCapsuleDurationMs, requested)) : undefined;
+}
 const hmbNativeStudioViewMemory = new WeakMap();
 const hmbNativeStudioRestoredViews = new WeakSet();
 const hmbNativeStudioCompactDispatching = new WeakSet();

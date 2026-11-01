@@ -185,11 +185,14 @@ def _video_info(path: Path, probe: Path | None, deadline: float) -> dict:
         return {}
     try:
         result = _run([str(probe), "-v", "error", "-protocol_whitelist", "file,pipe",
-                       "-show_entries", "format=duration,start_time:stream=codec_type,start_time,duration,duration_ts,time_base",
+                       "-show_entries", "format=duration,start_time:stream=codec_type,start_time,duration,duration_ts,time_base:stream_disposition=attached_pic",
                        "-of", "json", str(path)], deadline)
         data = json.loads(result.stdout)
         fmt = data.get("format", {})
-        video = next((v for v in data.get("streams", []) if v.get("codec_type") == "video"), {})
+        video = next((v for v in data.get("streams", []) if v.get("codec_type") == "video"
+                      and not v.get("disposition", {}).get("attached_pic")), None)
+        if video is None:
+            return {}  # An album cover must not borrow the audio's duration.
         duration = _number(video.get("duration"))
         if duration is None:
             ticks = _number(video.get("duration_ts"))
@@ -225,8 +228,13 @@ def _decode(source: Path | bytes, identity: tuple, seek: float | None,
                 "-protocol_whitelist", "file,pipe", "-copyts"]
         if seek is not None:
             args += ["-ss", f"{seek:.6f}"]
-        args += ["-i", "pipe:0" if isinstance(source, bytes) else str(source),
-                 "-frames:v", "1", "-an", "-sn", "-dn", "-vf",
+        args += ["-i", "pipe:0" if isinstance(source, bytes) else str(source)]
+        if seek is not None:
+            # Uppercase V excludes attached artwork/thumbnails. It matches
+            # the first actual movie stream used by _video_info, including
+            # decoder-only hosts where no FFprobe binary is available.
+            args += ["-map", "0:V:0"]
+        args += ["-frames:v", "1", "-an", "-sn", "-dn", "-vf",
                  f"scale='min({MAX_EDGE},iw)':'min({MAX_EDGE},ih)':force_original_aspect_ratio=decrease,showinfo",
                  "-threads", "1", "-c:v", "png", "-f", "image2pipe", "pipe:1"]
         result = _run(args, deadline, source if isinstance(source, bytes) else None)

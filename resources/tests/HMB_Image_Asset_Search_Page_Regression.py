@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+from collections import OrderedDict
 from copy import deepcopy
 import json
 from pathlib import Path
 import sys
 import threading
 import time
+from uuid import uuid4
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -45,6 +48,17 @@ def state_for(count=5000):
 def node_for(state):
     node = image.HMBImageAssetLibrary.__new__(image.HMBImageAssetLibrary)
     node.name = "ImageAssetSearchFixture"
+    # __new__ intentionally avoids a host/SDK constructor. Supply its ownership
+    # fields explicitly; actual production admission methods remain enabled.
+    node._hmb_widget_runtime_lease = str(uuid4())
+    node._hmb_workspace_local_assignment = contextvars.ContextVar("search_fixture_workspace", default=None)
+    node._hmb_image_bash_mutation_receipts = OrderedDict()
+    node._hmb_widget_constructing = False
+    node._hmb_state_syncing = False
+    node._hmb_restoring_widget_state = False
+    node._hmb_thumbnail_bridge_syncing = False
+    node._hmb_widget_live_authored = False
+    node._hmb_widget_hydration_digest = ""
     node._hmb_node_deleted = False
     node._hmb_import_revision = 0
     node._scan_owner_is_current = lambda: not node._hmb_node_deleted
@@ -54,6 +68,7 @@ def node_for(state):
 
 def request_for(node, state, sequence, **extra):
     request = dict(schema=image.THUMBNAIL_BRIDGE_SCHEMA, version=1, operation="catalog_page", phase="request",
+        **{image.WIDGET_RUNTIME_LEASE_KEY: node._hmb_widget_runtime_lease},
         runtime_instance_id=node._thumbnail_runtime_id(state), project_uid=state["project_uid"],
         project_cache_uid=state["project_cache_uid"], manifest_signature=state["manifest_signature"],
         folder_signature=state["folder_signature"], scan_revision=state["scan_revision"],
@@ -78,6 +93,17 @@ async def check_protocol():
     node._set_thumbnail_bridge_value = lambda value: events.append((deepcopy(value), threading.get_ident()))
     original = deepcopy(state)
     raw_before = node._hmb_last_accepted_widget_state
+    current_request = request_for(node, state, 0)
+    assert node._admit_thumbnail_bridge(current_request)[image.WIDGET_RUNTIME_LEASE_KEY] == node._hmb_widget_runtime_lease
+    for stale in ({**current_request, image.WIDGET_RUNTIME_LEASE_KEY:str(uuid4())},
+                  {**current_request, image.WIDGET_RUNTIME_LEASE_KEY:""}):
+        try:
+            node._admit_thumbnail_bridge(stale)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("A retired/missing fixture lease passed real admission")
+    assert node._hmb_last_accepted_widget_state == raw_before
     node._request_catalog_search(request_for(node, state, 1, query="캐릭터"))
     await wait_until(lambda: len(events) == 1)
     first = events[-1][0]

@@ -2,21 +2,13 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
-import os from 'node:os';
 import path from 'node:path';
-import {createRequire} from 'node:module';
 import {randomUUID} from 'node:crypto';
 import * as w from '../../widgets/HMBImageAssetLibraryWidget.js';
+import {nativeTestPlaywright,nativeTestBrowserPath} from './_hmb_native_editor_fixture.mjs';
 
-const require=createRequire(import.meta.url);
-let playwrightModule;
-try{playwrightModule=require.resolve('playwright');}
-catch(error){
- if(error.code!=='MODULE_NOT_FOUND')throw error;
- playwrightModule=path.join(os.homedir(),'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
-}
-const playwright=require(playwrightModule);
-const browserPath=process.env.HMB_IMAGE_ASSET_TEST_BROWSER||'C:/Program Files/Google/Chrome/Application/chrome.exe';
+const playwright=nativeTestPlaywright();
+const browserPath=nativeTestBrowserPath();
 const report=process.env.HMB_CGT_REPORT_DIR;
 if(report)fs.mkdirSync(report,{recursive:true});
 // Actual product Chrome measurements captured immediately before the static
@@ -47,10 +39,13 @@ const snapshot={schema:'hmb-cgt-own-tasks',version:1,status:'ready',origin:'http
  projects:[{id:projectId,entity:'superwings12',name:'Synthetic SW12',database:'proj_fixture_sw12',status:'Active'},
   {id:randomUUID().toUpperCase(),entity:'Katuri8',name:'Synthetic Katuri8',database:'proj_fixture_katuri8',status:'Active'}],
  can_bind:true,tls_verified:true,hostname_verified:true};
-const html=`<!doctype html><html><body style="background:#101420;margin:0"><div id="widget"></div><div id="bridge"></div><script type="module">
+const html=`<!doctype html><html><body style="background:#101420;margin:0"><article class="react-flow__node" data-id="CGT Fixture"><div id="widget"></div><div data-parameter-name="HMB_IMAGE_ASSET_THUMBNAIL_PATCH"><div id="bridge"></div></div></article><script type="module">
 import mount,* as w from '/widget.js';import bridgeMount from '/bridge.js';
 window.w=w;window.host=w.hmbNormalizeImageAssetState(${JSON.stringify(initial)});window.catalog=${JSON.stringify(snapshot)};
-window.requests=[];window.commits=[];window.localWrites=[];window.pending=null;window.rejected=false;window.syncEcho=false;
+window.requests=[];window.commits=[];window.localWrites=[];window.pending=null;window.rejected=false;window.syncEcho=false;window.authorityReplies=[];
+window.graphEpoch=0;
+window.bridgeProps=value=>({value,nodeName:'CGT Fixture',parameterName:'HMB_IMAGE_ASSET_THUMBNAIL_PATCH',
+ ui_options:{widget:'HMBImageAssetThumbnailPatchBridgeWidget',library:'HMB_GP_Production'},disabled:false,onChange:window.dispatch});
 window.finish=()=>{const req=window.pending;if(!req)return;window.pending=null;let state=structuredClone(window.catalog),outcome='ready';
  if(req.operation==='cgt_catalog'&&state.status==='ready'){
   if(req.cgt_project_id){const selected=state.projects.find(item=>item.id===req.cgt_project_id);
@@ -61,9 +56,21 @@ window.finish=()=>{const req=window.pending;if(!req)return;window.pending=null;l
   if(window.rejected){state={status:'SOURCE_CHANGED'};outcome='rejected';}
   else{window.host=w.hmbNormalizeImageAssetState(w.hmbApplyShotHierarchyEdit(window.host,req.hierarchy_request));
    window.commits.push(structuredClone(req.hierarchy_request));outcome='committed';state={status:'committed'};window.controller.update(window.props());}}
- window.bridgeController.update({value:{...req,phase:'result',state,outcome},onChange:window.dispatch});};
-window.dispatch=req=>{window.requests.push(structuredClone(req));if(req.operation==='cgt_cancel')window.pending=null;else window.pending=req;};
-window.props=()=>({value:JSON.stringify(window.host),onChange:value=>{
+ window.bridgeController.update(window.bridgeProps({...req,phase:'result',state,outcome}));};
+window.dispatch=req=>{window.requests.push(structuredClone(req));
+ if(req.operation==='widget_authority'){
+  const epoch=window.graphEpoch;
+  queueMicrotask(()=>{if(epoch!==window.graphEpoch)return;
+   window.controller.update(window.props());
+   const reply={...req,phase:'result',widget_runtime_lease:window.host.widget_runtime_lease,
+    canonical_node_name:'CGT Fixture',canonical_scope:w.hmbImageAssetAuthorityScope(window.host),catalog_page_version:1};
+   window.authorityReplies.push(structuredClone(reply));
+   window.bridgeController.update(window.bridgeProps(reply));});
+  return;
+ }
+ if(req.operation==='cgt_cancel')window.pending=null;else window.pending=req;};
+window.props=()=>({value:JSON.stringify(window.host),nodeName:'CGT Fixture',parameterName:'HMB_IMAGE_ASSET_STATE',
+ ui_options:{widget:'HMBImageAssetLibraryWidget',library:'HMB_GP_Production'},disabled:false,onChange:value=>{
  const raw=JSON.parse(value);if(raw.__hmb_manifest_poll_nonce)return;
  const edit=raw.edits||raw,req=edit.shot_hierarchy_request;
  if(req?.schema){
@@ -75,18 +82,24 @@ window.props=()=>({value:JSON.stringify(window.host),onChange:value=>{
  if(window.syncEcho){window.host.scan_revision+=17;window.host.manifest_signature='canonical-sync-scan';window.controller.update(window.props());}
  else queueMicrotask(()=>window.controller.update(window.props()));
 }});
-window.openGraph=value=>{window.controller?.cleanup();window.bridgeController?.cleanup();window.host=w.hmbNormalizeImageAssetState(value);
- window.bridgeController=bridgeMount(document.getElementById('bridge'),{value:{schema:'hmb-image-asset-thumbnail-bridge',version:1,runtime_instance_id:window.host.shot_routing.publisher_instance_uuid},onChange:window.dispatch});
- window.controller=mount(document.getElementById('widget'),window.props());};window.ready=true;
+window.openGraph=value=>{window.controller?.cleanup();window.bridgeController?.cleanup();window.graphEpoch++;
+ window.host=w.hmbNormalizeImageAssetState({...value,widget_runtime_lease:value.widget_runtime_lease||crypto.randomUUID()});
+ window.controller=mount(document.getElementById('widget'),window.props());
+ window.bridgeController=bridgeMount(document.getElementById('bridge'),window.bridgeProps({schema:'hmb-image-asset-thumbnail-bridge',version:1,
+  runtime_instance_id:window.host.shot_routing.publisher_instance_uuid,widget_runtime_lease:window.host.widget_runtime_lease,catalog_page_version:1}));};window.ready=true;
 </script></body></html>`;
 const source=fs.readFileSync(new URL('../../widgets/HMBImageAssetLibraryWidget.js',import.meta.url),'utf8');
 const bridge=fs.readFileSync(new URL('../../widgets/HMBImageAssetThumbnailPatchBridgeWidget.js',import.meta.url),'utf8');
 const server=http.createServer((req,res)=>{res.setHeader('Content-Type',req.url.endsWith('.js')?'text/javascript; charset=utf-8':'text/html; charset=utf-8');res.end(req.url==='/widget.js'?source:req.url==='/bridge.js'?bridge:html);});
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));let browser,checks=0;
+await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));let browser,checks=0,authorityReplyCount=0;
+const fixtureOrigin=`http://127.0.0.1:${server.address().port}`,externalRequests=[];
 try{
  browser=await playwright.chromium.launch({executablePath:browserPath,headless:true});
  const page=await browser.newPage({viewport:{width:1250,height:1000}}),errors=[];page.setDefaultTimeout(5000);page.on('pageerror',error=>errors.push(error.message));
- await page.goto(`http://127.0.0.1:${server.address().port}`);await page.waitForFunction(()=>window.ready);
+ await page.route('**/*',route=>{const url=new URL(route.request().url());
+  if(url.origin===fixtureOrigin)return route.continue();
+  externalRequests.push(url.origin);return route.abort();});
+ await page.goto(fixtureOrigin);await page.waitForFunction(()=>window.ready);
  const assertConciseDialog=async label=>{
   const text=await page.locator('[data-shot-hierarchy-dialog]').innerText();
   for(const removed of ['대표와 하위 모두 독립적으로 실행됩니다.','확정 전에는 기존 샷이 바뀌지 않습니다.',
@@ -596,6 +609,12 @@ try{
   .map(status=>window.w.hmbCgtStatusMessage(status,'en')));
  assert(englishDiagnostics.every(value=>value.length>12&&!value.includes('could not be checked')));
  assert(!await page.evaluate(()=>window.w.hmbCgtStatusMessage('secret-provider-body','en').includes('secret-provider-body')));checks+=13;
+ const authorityReplies=await page.evaluate(()=>window.authorityReplies);
+ assert(authorityReplies.length>0,'CGT fixture receives correlated read-only native authority before editable writes');
+ assert(authorityReplies.every(reply=>reply.request_id&&reply.canonical_node_name==='CGT Fixture'
+  &&reply.canonical_scope.widget_runtime_lease===reply.widget_runtime_lease
+  &&reply.canonical_scope.publisher_instance_uuid===reply.runtime_instance_id),'Every authority response owns its exact current node, runtime and lease');
+ authorityReplyCount=authorityReplies.length;assert.deepEqual(externalRequests,[],'Only the private fixture origin can receive browser requests');checks+=3;
  assert.deepEqual(errors,[]);
 }finally{await browser?.close();await new Promise(resolve=>server.close(resolve));}
-console.log(JSON.stringify({status:'PASS',checks,synthetic_cgt_tasks:tasks.length,independent_slots:5,user_driven_multilevel_grouping:true,episode_filter:true,real_product_widgets:true,live_cgt_requests:0,cgt_writes:0,paid_requests:0}));
+console.log(JSON.stringify({status:'PASS',checks,synthetic_cgt_tasks:tasks.length,independent_slots:5,user_driven_multilevel_grouping:true,episode_filter:true,real_product_widgets:true,readonly_authority_replies:authorityReplyCount,external_requests:externalRequests.length,live_cgt_requests:0,cgt_writes:0,paid_requests:0}));

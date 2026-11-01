@@ -543,6 +543,35 @@ with tempfile.TemporaryDirectory(prefix="hmb-native-release-boundary-") as nativ
     descriptor_file = native_root / descriptor_relative
     with mock.patch.object(builder, "ROOT", native_root):
         assert builder.validate_native_editor_patch_sources() == native_descriptor
+        # Five reviewed history pairs and the already shipped 4/3/2-pair
+        # suffix schemas must bind the corresponding exact patcher constants.
+        history = native_descriptor["previous_candidates"]
+        assert len(history) == 5
+        for start in range(4):
+            previous_schema = dict(native_descriptor, previous_candidates=history[start:])
+            descriptor_file.write_text(json.dumps(previous_schema), encoding="utf-8")
+            assert builder.validate_native_editor_patch_sources() == previous_schema
+        descriptor_file.write_text(json.dumps(native_descriptor), encoding="utf-8")
+        patcher_file = native_root / native_descriptor["patcher_path"]
+        original_patcher = patcher_file.read_bytes()
+        for field, key in (("CANDIDATE", "bundle_sha256"), ("HELPER", "helper_sha256")):
+            old_constant = f'SUPPORTED_CAPSULE_PREVIOUS_{field}_SHA256 = "{history[0][key]}"'
+            changed_patcher = original_patcher.replace(old_constant.encode(),
+                f'SUPPORTED_CAPSULE_PREVIOUS_{field}_SHA256 = "{"0" * 64}"'.encode(), 1)
+            assert changed_patcher != original_patcher
+            patcher_file.write_bytes(changed_patcher)
+            # Even a descriptor that truthfully hashes the altered tool may
+            # not broaden the independent reviewed previous-pair whitelist.
+            tampered = dict(native_descriptor, patcher_sha256=builder.digest(changed_patcher))
+            descriptor_file.write_text(json.dumps(tampered), encoding="utf-8")
+            try:
+                builder.validate_native_editor_patch_sources()
+            except RuntimeError as error:
+                assert "patcher and previous candidates differ" in str(error)
+            else:
+                raise AssertionError("Native editor accepted changed capsule previous constants.")
+            patcher_file.write_bytes(original_patcher)
+        descriptor_file.write_text(json.dumps(native_descriptor), encoding="utf-8")
         # Reviewed profiles must bind exact packaged bytes. Unknown structural
         # fallback stays disabled even when a reviewed renderer is enrolled.
         for reviewed in native_descriptor.get("additional_profiles", []):

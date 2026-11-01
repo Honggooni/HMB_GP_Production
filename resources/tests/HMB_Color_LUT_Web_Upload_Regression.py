@@ -344,8 +344,14 @@ class ColorLUTUploadRegression(unittest.TestCase):
             self.assertFalse(self.node._upload_projection()["enabled"])
 
     def test_wire_contract_streams_file_without_paths_names_or_owner_overrides(self):
+        self.assert_wire_contract("source")
+
+    def test_graded_mov_upload_streams_quicktime_bytes_and_mov_metadata(self):
+        self.assert_wire_contract("export")
+
+    def assert_wire_contract(self, artifact):
         self.mounted_responses(urlsplit(self.bridge.server_url).path)
-        context = self.ready()
+        context = self.ready(artifact)
         captured = {}
         class Response:
             def __enter__(self): return self
@@ -368,10 +374,13 @@ class ColorLUTUploadRegression(unittest.TestCase):
         metadata = json.loads(body.split(b"\r\n\r\n", 1)[1].split(b"\r\n--", 1)[0])
         self.assertEqual(set(metadata), {"schema", "version", "source_task_id", "source_revision", "channel_uuid", "shot_uuid", "workflow_id", "generator_node_id", "color_lut_node_id", "export_sha256", "export_bytes", "output_format", "settings_sha256"})
         self.assertNotIn(str(self.root).encode(), body)
-        self.assertIn(b'filename="color-lut.mp4"', body)
-        self.assertIn(b"Content-Type: video/mp4", body)
-        self.assertIn(Path(self.source["path"]).read_bytes(), body)
-        self.assertNotIn(b"offline-graded-video", body)
+        suffix = "mov" if artifact == "export" else "mp4"
+        self.assertEqual(metadata["output_format"], suffix)
+        self.assertIn(f'filename="color-lut.{suffix}"'.encode(), body)
+        self.assertIn(b"Content-Type: video/quicktime" if artifact == "export" else b"Content-Type: video/mp4", body)
+        self.assertIn(Path(context["path"]).read_bytes(), body)
+        if artifact == "source":
+            self.assertNotIn(b"offline-graded-video", body)
         expected = __import__("hashlib").sha256("\n".join(("hmb-color-lut-upload-v1", context["source_task_id"], context["sha256"], context["settings_sha256"], context["shot_uuid"])).encode()).hexdigest()
         self.assertEqual(context["upload_id"], expected)
 

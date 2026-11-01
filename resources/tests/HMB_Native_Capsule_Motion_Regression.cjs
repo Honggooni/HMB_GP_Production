@@ -1,0 +1,22 @@
+// HMB capsule duration is a local native argument override, never a setting.
+const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
+const root=path.resolve(__dirname,'../..'),source=fs.readFileSync(path.join(root,'resources/editor/hmb-color-lut-native-header.js'),'utf8');
+const start=source.indexOf('const hmbNativeStudioCapsuleDurationMs = 200;'),end=source.indexOf('\n}',start)+2;
+assert(start>0&&end>start);const code=source.slice(start,end);
+let reduced=false;const scope={Number,window:{matchMedia(query){assert.equal(query,'(prefers-reduced-motion: reduce)');return{matches:reduced}}},hmbIsNativeStudioType:(type,meta)=>type==='HMBImageBash'&&meta.library==='HMB_GP_Production'};
+vm.createContext(scope);vm.runInContext(code,scope);const duration=scope.hmbNativeStudioCapsuleDuration;
+const hmb={data:{node_type:'HMBImageBash',metadata:{library:'HMB_GP_Production'}}};
+const settings={nodeAnimationEnabled:true,nodeAnimationDurationMs:400};
+assert.equal(duration(hmb,settings),200);assert.equal(settings.nodeAnimationDurationMs,400);
+for(const value of [0,75,150,199,200])assert.equal(duration(hmb,{...settings,nodeAnimationDurationMs:value}),Math.max(1,value));
+for(const value of [201,250,1000])assert.equal(duration(hmb,{...settings,nodeAnimationDurationMs:value}),200);
+for(const value of [-1,NaN,Infinity,'400',null,undefined])assert.equal(duration(hmb,{...settings,nodeAnimationDurationMs:value}),undefined);
+assert.equal(duration(hmb,{...settings,nodeAnimationEnabled:false}),undefined);
+assert.equal(duration(hmb,{...settings,nodeAnimationEnabled:undefined}),undefined);
+assert.equal(duration(hmb,undefined),undefined);assert.equal(duration(null,settings),undefined);
+assert.equal(duration({data:{node_type:'HMBImageBash',metadata:{library:'Other'}}},settings),undefined);
+assert.equal(duration({data:{node_type:'Other',metadata:{library:'HMB_GP_Production'}}},settings),undefined);
+reduced=true;assert.equal(duration(hmb,settings),1);assert.equal(duration(hmb,{...settings,nodeAnimationEnabled:false}),undefined);
+scope.window.matchMedia=()=>{throw Error('unsupported')};assert.equal(duration(hmb,settings),undefined);
+scope.window={};assert.equal(duration(hmb,settings),undefined);delete scope.window;assert.equal(duration(hmb,settings),undefined);
+console.log(JSON.stringify({status:'PASS',assertions:27,scope:'Exact helper duration policy; stock native disabled branch remains unchanged, full compiled renderer checked separately'}));

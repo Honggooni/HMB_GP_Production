@@ -7,6 +7,8 @@ import sys
 import threading
 from types import SimpleNamespace
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _hmb_image_asset_detached_fixture import initialize_detached_image_asset
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import HMBImageAssetLibrary as image
 
@@ -20,9 +22,7 @@ state['assets'] = [dict(asset_library_id=f'library-{i}', asset_id=f'asset-{i}', 
 state = image._normalize_state(state)
 node = image.HMBImageAssetLibrary.__new__(image.HMBImageAssetLibrary)
 node.name = 'ImageAssetCompactEditFixture'
-node._hmb_last_accepted_widget_state = None
-node._hmb_last_accepted_widget_revisions = (0, 0)
-node._hmb_last_accepted_thumbnail_revision = 0
+state = initialize_detached_image_asset(node, image, state=state)
 node._accept_widget_state_baseline(state)
 state = json.loads(node._hmb_last_accepted_widget_state)
 source0, source1 = [asset['source_uid'] for asset in state['assets'][:2]]
@@ -31,6 +31,7 @@ routing['shots'][0]['selected_source_uids'] = [source1, source0]
 routing['shots'][0]['revision'] += 1
 routing['generation'] += 1
 edit = dict(schema=image.IMAGE_ASSET_EDIT_SCHEMA, version=1, scan_revision=7, ui_edit_revision=1,
+            widget_runtime_lease=node._hmb_widget_runtime_lease,
             catalog_identity={field:state[field] for field in ('catalog_root', 'project_root', 'project_uid',
                 'project_cache_uid', 'manifest_signature', 'folder_signature', 'scan_revision')},
             selected_source_uids=[source1, source0], edits=dict(search='hero', shot_routing=routing))
@@ -109,6 +110,9 @@ for changed in [dict(latest, projects=[]), dict(latest, catalog_root=root + '/Ot
 
 race = image.HMBImageAssetLibrary.__new__(image.HMBImageAssetLibrary)
 race.name = 'ImageAssetProjectIntentRaceFixture'
+prior = initialize_detached_image_asset(race, image, state=prior)
+latest[image.WIDGET_RUNTIME_LEASE_KEY] = race._hmb_widget_runtime_lease
+intent[image.WIDGET_RUNTIME_LEASE_KEY] = race._hmb_widget_runtime_lease
 race._hmb_state_syncing = race._hmb_restoring_widget_state = False
 race._hmb_last_accepted_widget_state = image._json_text(prior)
 race._hmb_last_accepted_widget_revisions = (7, 12)

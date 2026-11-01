@@ -214,6 +214,30 @@ def _ffmpeg_audio_channel_count(layout: str) -> int:
     return 0
 
 
+def _positive_media_number(value: Any) -> float:
+    """Read a positive finite metadata number/rational; unknown is zero."""
+    try:
+        text = str(value)
+        if "/" in text:
+            numerator, denominator = text.split("/", 1)
+            number = float(numerator) / float(denominator)
+        else:
+            number = float(text)
+        return number if math.isfinite(number) and number > 0.0 else 0.0
+    except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+        return 0.0
+
+
+def _video_geometry(width: Any, height: Any) -> tuple[int, int]:
+    try:
+        result = int(width), int(height)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise VideoToolError("Could not determine positive video dimensions.") from exc
+    if min(result) <= 0:
+        raise VideoToolError("Could not determine positive video dimensions.")
+    return result
+
+
 def probe_video(path: str | Path) -> dict[str, Any]:
     source = Path(path).resolve(strict=True)
     ffmpeg = _find_ffmpeg()
@@ -223,29 +247,31 @@ def probe_video(path: str | Path) -> dict[str, Any]:
             [ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(source)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             check=True,
         )
         payload = json.loads(completed.stdout)
         streams = payload.get("streams") if isinstance(payload, dict) else []
-        video = next((item for item in streams if item.get("codec_type") == "video"), None)
+        video = next((item for item in streams if item.get("codec_type") == "video"
+                      and not item.get("disposition", {}).get("attached_pic")), None)
         if not isinstance(video, dict):
-            raise VideoToolError(f"No video stream found in {source.name}.")
-        rate_text = str(video.get("avg_frame_rate") or video.get("r_frame_rate") or "0/1")
-        try:
-            numerator, denominator = rate_text.split("/", 1)
-            frame_rate = float(numerator) / float(denominator)
-        except Exception:
-            frame_rate = 0.0
+            raise VideoToolError(f"No movie video stream found in {source.name}; attached cover images are not videos.")
+        width, height = _video_geometry(video.get("width"), video.get("height"))
+        frame_rate = (_positive_media_number(video.get("avg_frame_rate"))
+                      or _positive_media_number(video.get("r_frame_rate")))
         audio = next((item for item in streams if item.get("codec_type") == "audio"), None)
-        duration_raw = video.get("duration") or payload.get("format", {}).get("duration") or 0
+        duration = (_positive_media_number(video.get("duration"))
+                    or _positive_media_number(payload.get("format", {}).get("duration")))
         return {
             "probe_backend": "ffprobe",
             "path": str(source),
-            "width": int(video.get("width") or 0),
-            "height": int(video.get("height") or 0),
+            "width": width,
+            "height": height,
+            "video_stream_index": int(video.get("index", streams.index(video))),
             "frame_rate": frame_rate,
-            "duration": float(duration_raw or 0),
+            "duration": duration,
             "has_audio": isinstance(audio, dict),
             "video_codec": str(video.get("codec_name") or ""),
             "pixel_format": str(video.get("pix_fmt") or ""),
@@ -260,24 +286,35 @@ def probe_video(path: str | Path) -> dict[str, Any]:
         [ffmpeg, "-hide_banner", "-i", str(source)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=30,
         check=False,
     )
     details = completed.stderr or completed.stdout
-    size = re.search(r"Video:.*?\b(\d{2,6})x(\d{2,6})\b", details)
+    # Keep metadata from the same movie stream. Cover-art/video tags such as
+    # [0x1] are not geometry; a valid small movie may be less than 10px wide.
+    video_line = next((line for line in details.splitlines() if "Video:" in line
+                       and "attached pic" not in line.lower()), "")
+    size = re.search(r",\s*([1-9]\d*)x([1-9]\d*)(?=\s|,|$)", video_line)
     if size is None:
         raise VideoToolError(f"Could not probe {source.name}.")
     duration_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", details)
     duration = 0.0
     if duration_match:
         duration = int(duration_match.group(1)) * 3600 + int(duration_match.group(2)) * 60 + float(duration_match.group(3))
-    fps_match = re.search(r"(\d+(?:\.\d+)?)\s+fps", details)
-    nominal_rate_match = re.search(r"(\d+(?:\.\d+)?)\s+tbr", details)
-    video_codec_match = re.search(r"Video:\s*([^,\s]+)", details)
-    pixel_format_match = re.search(r"Video:.*?,\s*([^,\s]+)(?:\([^)]*\))?,\s*\d{2,6}x\d{2,6}", details)
-    audio_codec_match = re.search(r"Audio:\s*([^,\s]+)", details)
-    audio_rate_match = re.search(r"Audio:.*?,\s*(\d+)\s+Hz", details)
-    audio_layout_match = re.search(r"Audio:.*?,\s*\d+\s+Hz,\s*([^,\r\n]+)", details)
+    fps_match = re.search(r"(\d+(?:\.\d+)?)\s+fps", video_line)
+    nominal_rate_match = re.search(r"(\d+(?:\.\d+)?)\s+tbr", video_line)
+    frame_rate = (_positive_media_number(fps_match.group(1)) if fps_match else 0.0)
+    if not frame_rate:
+        frame_rate = _positive_media_number(nominal_rate_match.group(1)) if nominal_rate_match else 0.0
+    video_codec_match = re.search(r"Video:\s*([^,\s]+)", video_line)
+    video_index_match = re.search(r"Stream #0:(\d+)", video_line)
+    pixel_format_match = re.search(r"\b(yuv\w+|gbr\w+|rgb\w+|bgr\w+|gray\w*)", video_line)
+    audio_line = next((line for line in details.splitlines() if "Audio:" in line), "")
+    audio_codec_match = re.search(r"Audio:\s*([^,\s]+)", audio_line)
+    audio_rate_match = re.search(r"Audio:.*?,\s*(\d+)\s+Hz", audio_line)
+    audio_layout_match = re.search(r"Audio:.*?,\s*\d+\s+Hz,\s*([^,\r\n]+)", audio_line)
     audio_layout = audio_layout_match.group(1).strip() if audio_layout_match else ""
     pixel_format = pixel_format_match.group(1) if pixel_format_match else ""
     pixel_format = pixel_format.split("(", 1)[0]
@@ -286,11 +323,8 @@ def probe_video(path: str | Path) -> dict[str, Any]:
         "path": str(source),
         "width": int(size.group(1)),
         "height": int(size.group(2)),
-        "frame_rate": (
-            float(nominal_rate_match.group(1))
-            if nominal_rate_match
-            else float(fps_match.group(1)) if fps_match else 0.0
-        ),
+        "video_stream_index": int(video_index_match.group(1)) if video_index_match else 0,
+        "frame_rate": frame_rate,
         "duration": duration,
         "has_audio": "Audio:" in details,
         "video_codec": video_codec_match.group(1) if video_codec_match else "",
@@ -402,6 +436,7 @@ def _concat_copy_signature(probe: Mapping[str, Any]) -> tuple[Any, ...]:
         str(probe.get("pixel_format") or ""),
         str(probe.get("video_profile") or ""),
         str(probe.get("video_time_base") or ""),
+        int(probe.get("video_stream_index") or 0),
         round(float(probe.get("frame_rate") or 0.0), 6),
         bool(probe.get("has_audio")),
     )
@@ -470,6 +505,7 @@ def build_crop_ffmpeg_command(
     *,
     has_audio: bool,
     processing_speed: str = "balanced",
+    video_stream_index: int | None = None,
 ) -> list[str]:
     width, height, left, top = rectangle
     preset, crf = _speed_options(processing_speed)
@@ -481,7 +517,7 @@ def build_crop_ffmpeg_command(
         "-i",
         input_path,
         "-map",
-        "0:v:0",
+        "0:v:0" if video_stream_index is None else f"0:{video_stream_index}",
     ]
     if has_audio:
         command.extend(["-map", "0:a?", "-c:a", "copy"])
@@ -514,6 +550,7 @@ def build_concat_ffmpeg_command(
     settings: Mapping[str, Any],
     *,
     has_audio: bool = True,
+    video_stream_index: int | None = None,
 ) -> list[str]:
     command = [
         ffmpeg,
@@ -527,7 +564,7 @@ def build_concat_ffmpeg_command(
         "-i",
         concat_list_path,
         "-map",
-        "0:v:0",
+        "0:v:0" if video_stream_index is None else f"0:{video_stream_index}",
         "-c:v",
         str(settings["video_codec"]),
     ]
@@ -570,8 +607,10 @@ def build_filter_concat_ffmpeg_command(
         if duration <= 0.0 or not math.isfinite(duration):
             raise VideoToolError("Every concatenated input must have a measurable positive duration.")
         duration_text = f"{duration:.6f}".rstrip("0").rstrip(".")
+        stream = probe.get("video_stream_index")
+        video_input = f"{index}:v:0" if stream is None else f"{index}:{int(stream)}"
         filters.append(
-            f"[{index}:v:0]trim=duration={duration_text},setpts=PTS-STARTPTS,fps={frame_rate},"
+            f"[{video_input}]trim=duration={duration_text},setpts=PTS-STARTPTS,fps={frame_rate},"
             f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,settb=AVTB[v{index}]"
         )
@@ -608,6 +647,11 @@ def build_filter_concat_ffmpeg_command(
     command.extend(["-map_metadata", "-1", "-map_chapters", "-1"])
     command.extend(["-c:v", str(settings["video_codec"])])
     command.extend(_video_encoder_options(settings))
+    # The concat filter may leave a fractional boundary gap when short input
+    # durations are rounded by a no-ffprobe header probe. Its nominal tbr can
+    # still say 24 while actual frames/duration is lower. Enforce the authored
+    # normalized cadence at the output, not only inside each input branch.
+    command.extend(["-r", frame_rate, "-fps_mode", "cfr"])
     if str(settings["output_format"]) in {"mp4", "mov"}:
         command.extend(["-movflags", "+faststart"])
     command.append(output_path)
@@ -662,6 +706,18 @@ def _remote_media_roots() -> tuple[Path, ...]:
     return tuple(dict.fromkeys(roots))
 
 
+def _publish_video_exclusive(staging: Path, destination: Path) -> None:
+    """Publish verified bytes atomically without replacing a concurrent file."""
+    try:
+        if os.name == "nt":
+            os.rename(staging, destination)
+        else:
+            os.link(staging, destination)
+            staging.unlink()
+    except FileExistsError as exc:
+        raise VideoToolError("Output appeared during processing; it was not overwritten.") from exc
+
+
 class VideoMediaService:
     def __init__(self) -> None:
         self._process: subprocess.Popen[str] | None = None
@@ -688,6 +744,9 @@ class VideoMediaService:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         with self._process_lock:
             self._process = process
@@ -781,6 +840,7 @@ class VideoMediaService:
                         str(temp_output),
                         settings,
                         has_audio=bool(probes[0]["has_audio"]),
+                        video_stream_index=probes[0].get("video_stream_index"),
                     )
                     process_log = self._run(command, cancel_event)
             else:
@@ -857,7 +917,7 @@ class VideoMediaService:
                 raise VideoToolError("Output appeared during processing; it was not overwritten.")
             if cancel_event is not None and cancel_event.is_set():
                 raise VideoToolError("Video operation was cancelled.")
-            os.replace(temp_output, output)
+            _publish_video_exclusive(temp_output, output)
             return {
                 "path": str(output),
                 "operation": "concatenate",
@@ -896,16 +956,23 @@ class VideoMediaService:
                 rectangle,
                 has_audio=bool(source_probe["has_audio"]),
                 processing_speed=str(settings["processing_speed"]),
+                video_stream_index=source_probe.get("video_stream_index"),
             )
             process_log = self._run(command, cancel_event)
             if not temp_output.is_file() or temp_output.stat().st_size <= 0:
                 raise VideoToolError("FFmpeg produced an empty cropped video.")
+            result_probe = probe_video(temp_output)
+            if (result_probe["width"], result_probe["height"]) != rectangle[:2]:
+                raise VideoToolError("FFmpeg crop output resolution does not match the requested rectangle.")
+            if bool(result_probe["has_audio"]) != bool(source_probe["has_audio"]):
+                raise VideoToolError("FFmpeg crop output did not preserve the source audio presence.")
+            if result_probe.get("video_codec") != "h264":
+                raise VideoToolError("FFmpeg crop output codec does not match H.264.")
             if output.exists():
                 raise VideoToolError("Output appeared during processing; it was not overwritten.")
             if cancel_event is not None and cancel_event.is_set():
                 raise VideoToolError("Video operation was cancelled.")
-            os.replace(temp_output, output)
-            result_probe = probe_video(output)
+            _publish_video_exclusive(temp_output, output)
             return {
                 "path": str(output),
                 "operation": "crop",

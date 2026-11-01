@@ -8,6 +8,8 @@ import sys
 import threading
 import time
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _hmb_image_asset_detached_fixture import initialize_detached_image_asset
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "HMBImageAssetLibrary.py"
@@ -84,7 +86,7 @@ def registration_state() -> tuple[dict, dict]:
 def fake_node(initial_state: dict):
     node = object.__new__(asset_library.HMBImageAssetLibrary)
     node.name = "ImageAssetBackgroundFixture"
-    live = {"state": asset_library._normalize_state(initial_state)}
+    live = {"state": initialize_detached_image_asset(node, asset_library, state=initial_state)}
     published = []
     node._hmb_manifest_poll_received = False
     node._hmb_manifest_poll_pending = False
@@ -98,6 +100,7 @@ def fake_node(initial_state: dict):
 
     def publish(value):
         normalized = asset_library._normalize_state(value)
+        node._accept_normalized_widget_state_baseline(normalized)
         live["state"] = normalized
         published.append(normalized)
         return normalized
@@ -212,6 +215,7 @@ assert initial_node._hmb_hydration_adopted is False
 # media, read manifests through output synchronization, or reconcile the graph.
 pending_publish_node = object.__new__(asset_library.HMBImageAssetLibrary)
 pending_publish_node.name = "ImageAssetPendingPublishFixture"
+initialize_detached_image_asset(pending_publish_node, asset_library)
 pending_publish_node._hmb_root_syncing = False
 pending_publish_node._hmb_state_syncing = False
 pending_publish_node._hmb_refresh_revision = 0
@@ -245,6 +249,7 @@ assert pending_publication["scan_busy"] is True
 
 base, request = registration_state()
 node, live, published = fake_node(base)
+base[asset_library.WIDGET_RUNTIME_LEASE_KEY] = node._hmb_widget_runtime_lease
 started = threading.Event()
 release = threading.Event()
 original_registration = asset_library._apply_asset_registration
@@ -298,6 +303,7 @@ failure_snapshot = deepcopy(failed_base)
 failure_snapshot["asset_registration_request"] = {}
 failure_snapshot = asset_library._normalize_state(failure_snapshot)
 failed_node, failed_live, _ = fake_node(failed_base)
+failed_base[asset_library.WIDGET_RUNTIME_LEASE_KEY] = failed_node._hmb_widget_runtime_lease
 
 
 def failed_registration(*_args, **_kwargs):

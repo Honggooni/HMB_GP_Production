@@ -152,6 +152,99 @@
             "bytes": 2578
           }
         }
+      },
+      {
+        "id": "reviewed-hmb-bash-source-preparation",
+        "review_status": "approved",
+        "sha256": "9ec59e780c665cd304703d5e303fa0844de4149a1583fc66490a38369da87b78",
+        "regions": {
+          "modal_store": {
+            "start": "var c6n={brushType:",
+            "end": ",f6n={isOpen:",
+            "sha256": "06ca8e832eb01b60ab0fa2f1f9eef52792ebb4aea35669e20d96eca7206b2d92",
+            "bytes": 2076
+          },
+          "parameter_launch": {
+            "start": "function yLr(e){const {getNode:hmbBashOpenNode}=xu();",
+            "end": "function bLr(e){",
+            "sha256": "d65e59144bb04c663dd5cedaf93344b1cbcde40ad774eaa6c5e46aebf459fa17",
+            "bytes": 1816
+          },
+          "brush_layers_load_export_modal": {
+            "start": "function m5(e){if(e.startsWith(`rgba(`))",
+            "end": "function ari(e,t){var r,i;return e&&t?",
+            "sha256": "b3028d8094c8ec7ff7a6cc976fb23aaa44090104f111863e004fe6040b637de0",
+            "bytes": 104547
+          },
+          "modal_settings": {
+            "start": "function jfi(e,t,r,i,a={min:0,max:1,step:.01})",
+            "end": ",Nfi=.15;",
+            "sha256": "e558188f374215a585c373202fc9c6071df84ecca9b3e14394672876c061ffd6",
+            "bytes": 2578
+          }
+        }
+      },
+      {
+        "id": "reviewed-hmb-bash-capsule-motion",
+        "review_status": "approved",
+        "sha256": "c9d95e131cce8db713447a1196c273edb4e5377e24efc4d7f94ca4715e3dc02f",
+        "regions": {
+          "modal_store": {
+            "start": "var c6n={brushType:",
+            "end": ",f6n={isOpen:",
+            "sha256": "06ca8e832eb01b60ab0fa2f1f9eef52792ebb4aea35669e20d96eca7206b2d92",
+            "bytes": 2076
+          },
+          "parameter_launch": {
+            "start": "function yLr(e){const {getNode:hmbBashOpenNode}=xu();",
+            "end": "function bLr(e){",
+            "sha256": "d65e59144bb04c663dd5cedaf93344b1cbcde40ad774eaa6c5e46aebf459fa17",
+            "bytes": 1816
+          },
+          "brush_layers_load_export_modal": {
+            "start": "function m5(e){if(e.startsWith(`rgba(`))",
+            "end": "function ari(e,t){var r,i;return e&&t?",
+            "sha256": "b3028d8094c8ec7ff7a6cc976fb23aaa44090104f111863e004fe6040b637de0",
+            "bytes": 104547
+          },
+          "modal_settings": {
+            "start": "function jfi(e,t,r,i,a={min:0,max:1,step:.01})",
+            "end": ",Nfi=.15;",
+            "sha256": "e558188f374215a585c373202fc9c6071df84ecca9b3e14394672876c061ffd6",
+            "bytes": 2578
+          }
+        }
+      },
+      {
+        "id": "reviewed-hmb-bash-small-snapshot",
+        "review_status": "approved",
+        "sha256": "d208403e7463adac2b3f778151aab55d3709892460460e8142fae8e91add4fbe",
+        "regions": {
+          "modal_store": {
+            "start": "var c6n={brushType:",
+            "end": ",f6n={isOpen:",
+            "sha256": "06ca8e832eb01b60ab0fa2f1f9eef52792ebb4aea35669e20d96eca7206b2d92",
+            "bytes": 2076
+          },
+          "parameter_launch": {
+            "start": "function yLr(e){const {getNode:hmbBashOpenNode}=xu();",
+            "end": "function bLr(e){",
+            "sha256": "d65e59144bb04c663dd5cedaf93344b1cbcde40ad774eaa6c5e46aebf459fa17",
+            "bytes": 1816
+          },
+          "brush_layers_load_export_modal": {
+            "start": "function m5(e){if(e.startsWith(`rgba(`))",
+            "end": "function ari(e,t){var r,i;return e&&t?",
+            "sha256": "a4a342d12506aec4cb296fa7b9f9afb53e268f41fd0781a50e6f9141f4356310",
+            "bytes": 109124
+          },
+          "modal_settings": {
+            "start": "function jfi(e,t,r,i,a={min:0,max:1,step:.01})",
+            "end": ",Nfi=.15;",
+            "sha256": "e558188f374215a585c373202fc9c6071df84ecca9b3e14394672876c061ffd6",
+            "bytes": 2578
+          }
+        }
       }
     ]
   }

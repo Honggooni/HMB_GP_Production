@@ -84,9 +84,11 @@ class NativeEditorInstall(unittest.TestCase):
             b"old synthetic helper\n/* END_HMB_COLOR_LUT_NATIVE_HEADER_PORTAL_V1 */\n")
         new_helper = (b"/* HMB_COLOR_LUT_NATIVE_HEADER_PORTAL_V1\n"
             b"new synthetic helper\n/* END_HMB_COLOR_LUT_NATIVE_HEADER_PORTAL_V1 */\n")
-        suffix = b"\nvar D$t=({node_name:e,node_type:t,unchanged editor suffix\n"
+        old_motion = b'E,(e,t,r)=>m({w:t,h:r}),d?f:void 0,d),Xd.request(`SetNodeMetadataRequest`'
+        new_motion = b'E,(e,t,r)=>m({w:t,h:r}),d?f:hmbNativeStudioCapsuleDuration(_,s),d),Xd.request(`SetNodeMetadataRequest`'
+        suffix = b"\nvar D$t=({node_name:e,node_type:t,unchanged editor suffix\n" + old_motion + b"\n"
         previous = b"unchanged editor prefix\n" + old_helper + suffix
-        self.candidate = b"unchanged editor prefix\n" + new_helper + suffix
+        self.candidate = (b"unchanged editor prefix\n" + new_helper + suffix).replace(old_motion, new_motion, 1)
         self.m.HELPER.write_bytes(new_helper)
         self.m.SUPPORTED_PREVIOUS_CANDIDATE_SHA256 = self.m.sha256(previous)
         self.m.SUPPORTED_PREVIOUS_HELPER_SHA256 = self.m.sha256(old_helper)

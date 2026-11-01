@@ -21,10 +21,22 @@ import socket
 import sys
 import tempfile
 from unittest import mock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+
+
+def assert_rebound_bash_document_preserved(node, before: dict, after: dict) -> None:
+    """Rebinding may renew only the host-owned editor coherence nonce."""
+    expected, actual = deepcopy(before), deepcopy(after)
+    snapshot = actual["meta"]["hmb_image_bash"].pop("editor_snapshot_id")
+    assert isinstance(snapshot, str)
+    parsed = UUID(snapshot)
+    assert parsed.version == 4 and str(parsed) == snapshot
+    assert snapshot == node._hmb_editor_snapshot_id
+    expected["meta"]["hmb_image_bash"].pop("editor_snapshot_id", None)
+    assert actual == expected
 
 
 def main():
@@ -51,6 +63,7 @@ def main():
 
 
 async def exercise(engine):
+    from HMB_Image_Bash_Host_Regression import await_bash_settled
     from PIL import Image
     from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
     from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
@@ -241,7 +254,7 @@ async def exercise(engine):
         assert node._create_image_bash_workspace_node(command) == name
         assert engine.node_manager.get_node_by_name(name) is target
         assert len(engine.flow_manager.get_flow_by_name(ensured.flow_name).nodes) == before_count + 1
-        assert target.get_parameter_value("bash_image") == scene_before_reuse
+        assert_rebound_bash_document_preserved(target, scene_before_reuse, target.get_parameter_value("bash_image"))
         assert node._current_state()["image_bash_workspace"] == workspace_before_reuse
         assert node._current_state()["shot_routing"] == shots_before
         # The real property command path consumes an explicit create intent;
@@ -278,6 +291,7 @@ async def exercise(engine):
                 assert changed.succeeded(), changed.result_details
                 assert [row["source_uid"] for row in target._records()] == [row["instance_id"] for row in requested_instances]
                 assert target.get_parameter_value("image_bash_context")["revision"] == workspace["revision"]
+                await await_bash_settled(engine)
                 scene = target.get_parameter_value("bash_image")
                 scene_uids = {row.get("source_uid") for row in scene.get("meta", {}).get("input_images", [])}
                 assert scene_uids == {row["instance_id"] for row in requested_instances}, (scene_uids, target.get_parameter_value("HMB_BASH_STATUS"))
@@ -409,6 +423,7 @@ async def exercise(engine):
             updated = engine.handle_request(SetParameterValueRequest(node_name=target.name,
                 parameter_name=parameter, value=value, broadcast_result=False))
             assert updated.succeeded(), updated.result_details
+        await await_bash_settled(engine)
         project = deepcopy(target.get_parameter_value("bash_image"))
         png_buffer = BytesIO()
         Image.new("RGBA", (4, 2), (25, 50, 100, 255)).save(png_buffer, "PNG")
@@ -719,6 +734,7 @@ async def exercise(engine):
             changed = engine.handle_request(SetParameterValueRequest(node_name=cold_target.name,
                 parameter_name=parameter, value=value, broadcast_result=False))
             assert changed.succeeded(), changed.result_details
+        await await_bash_settled(engine)
         cold_scene = deepcopy(cold_target.get_parameter_value("bash_image"))
         cold_scene["value"] = "data:image/png;base64," + base64.b64encode(applied_png).decode("ascii")
         cold_scene.setdefault("meta", {})["created_at"] = "2026-10-23T08:20:01.000Z"
@@ -729,6 +745,7 @@ async def exercise(engine):
         cold_run = await asyncio.wait_for(engine.ahandle_request(ResolveNodeRequest(node_name=cold_target.name)), timeout=15)
         assert cold_run.succeeded(), str(getattr(cold_run, "validation_exceptions", cold_run.result_details))
         await asyncio.sleep(0)
+        await await_bash_settled(engine)
         cold_scene = deepcopy(cold_target.get_parameter_value("bash_image"))
         original_cold_source, original_cold_target = cold_source, cold_target
         cold_commands = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=cold_flow.flow_name,
@@ -874,6 +891,7 @@ async def exercise(engine):
                 assigned = engine.handle_request(SetParameterValueRequest(node_name=import_target.name,
                     parameter_name=parameter, value=value, broadcast_result=False))
                 assert assigned.succeeded(), assigned.result_details
+            await await_bash_settled(engine)
             import_scene = deepcopy(import_target.get_parameter_value("bash_image"))
             import_scene["value"] = "data:image/png;base64," + base64.b64encode(applied_png).decode("ascii")
             assigned = engine.handle_request(SetParameterValueRequest(node_name=import_target.name,
@@ -883,6 +901,7 @@ async def exercise(engine):
             imported_run = await asyncio.wait_for(engine.ahandle_request(ResolveNodeRequest(node_name=import_target.name)), timeout=15)
             assert imported_run.succeeded(), str(getattr(imported_run, "validation_exceptions", imported_run.result_details))
             await asyncio.sleep(0)
+            await await_bash_settled(engine)
             import_scene = deepcopy(import_target.get_parameter_value("bash_image"))
             assert File(import_target.parameter_output_values["output_image"].value).read_bytes() == applied_png
             import_commands = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=import_flow.flow_name,
