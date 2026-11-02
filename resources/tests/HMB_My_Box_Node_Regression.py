@@ -7,6 +7,7 @@ boundaries; this script must never connect to an open editor or real Broker.
 from __future__ import annotations
 
 import asyncio
+from contextlib import ExitStack
 from copy import deepcopy
 from email.message import Message
 import hashlib
@@ -900,6 +901,104 @@ class MyBoxNodeTests(unittest.TestCase):
         self.send(DeleteNodeRequest(node_name=self.node.name))
         result=self.controller().schedule_final({},source)
         self.assertFalse(result.success); self.assertEqual(len(self.backend.created),1)
+    def test_final_scheduler_setup_failures_release_only_unsubmitted_reservation(self):
+        self.backend.enable_final(); self.run_node(); self.assert_success(); source=self.checkpoint()['job_id']
+        before=self.authored(); checkpoint=deepcopy(self.checkpoint()); calls=len(self.backend.calls)
+        loop=SimpleNamespace(is_running=lambda:True)
+        for stage in ('clear_cancellation','broker_origin','closed_loop'):
+            with self.subTest(stage=stage):
+                coroutines=[]
+                def refused(coroutine,event_loop):
+                    coroutines.append(coroutine)
+                    raise RuntimeError('Synthetic closed event loop')
+                try:
+                    with mock.patch.object(target.GriptapeNodes,'EventManager',return_value=SimpleNamespace(event_loop=loop)), \
+                         mock.patch.object(controller_module.asyncio,'run_coroutine_threadsafe',side_effect=refused):
+                        with ExitStack() as failures:
+                            if stage=='clear_cancellation':
+                                failures.enter_context(mock.patch.object(self.node,'clear_cancellation',side_effect=RuntimeError('Synthetic cancellation setup failure')))
+                            elif stage=='broker_origin':
+                                failures.enter_context(mock.patch.object(self.node,'_selected_broker_server_url',side_effect=ValueError('Synthetic origin setup failure')))
+                            result=self.controller().schedule_final({},source)
+                    self.assertFalse(result.success)
+                    self.assertFalse(self.node._hmb_draft_finalize_pending)
+                    self.assertFalse(self.controller()._busy)
+                    self.assertEqual(self.authored(),before); self.assertEqual(self.checkpoint(),checkpoint)
+                    self.assertEqual(len(self.backend.calls),calls)
+                    self.assertTrue(all(coroutine.cr_frame is None for coroutine in coroutines))
+                finally:
+                    for coroutine in coroutines:coroutine.close()
+                    self.node._hmb_draft_finalize_pending=False
+    def test_cancelled_Final_cleanup_cannot_release_a_newer_dispatch(self):
+        self.backend.enable_final(); self.run_node(); self.assert_success(); source=self.checkpoint()['job_id']
+        before=self.authored(); checkpoint=deepcopy(self.checkpoint()); calls=len(self.backend.calls)
+        async def scenario():
+            controller=self.controller(); first_started=asyncio.Event(); first_cleanup=asyncio.Event()
+            finish_old_cleanup=asyncio.Event(); second_started=asyncio.Event(); finish_second=asyncio.Event()
+            order=[]
+            async def dispatch(**kwargs):
+                number=len(order); order.append(number); controller._busy=True
+                if number==0:
+                    try:
+                        first_started.set(); await asyncio.Event().wait()
+                    finally:
+                        # The real run releases its busy flag/lock before its
+                        # awaited local-reference cleanup finishes.
+                        controller._busy=False; first_cleanup.set()
+                        await finish_old_cleanup.wait()
+                else:
+                    try:
+                        second_started.set(); await finish_second.wait()
+                    finally:controller._busy=False
+            second=None
+            with mock.patch.object(target.GriptapeNodes,'EventManager',return_value=SimpleNamespace(event_loop=asyncio.get_running_loop())), \
+                 mock.patch.object(controller,'run',side_effect=dispatch):
+                try:
+                    self.assertTrue(controller.schedule_final({},source).success)
+                    first=self.node._hmb_draft_finalize_future
+                    await asyncio.wait_for(first_started.wait(),2)
+                    first.cancel(); await asyncio.wait_for(first_cleanup.wait(),2)
+                    self.assertTrue(self.node._hmb_draft_finalize_pending)
+                    self.assertTrue(controller.schedule_final({},source).success)
+                    self.assertIs(self.node._hmb_draft_finalize_future,first)
+                    self.assertEqual(len(order),1)
+                    finish_old_cleanup.set()
+                    for _ in range(4):await asyncio.sleep(0)
+                    self.assertFalse(self.node._hmb_draft_finalize_pending)
+                    self.assertTrue(controller.schedule_final({},source).success)
+                    second=self.node._hmb_draft_finalize_future
+                    await asyncio.wait_for(second_started.wait(),2)
+                    self.assertTrue(self.node._hmb_draft_finalize_pending)
+                    for _ in range(4):await asyncio.sleep(0)
+                    self.assertTrue(self.node._hmb_draft_finalize_pending)
+                finally:
+                    finish_old_cleanup.set(); finish_second.set()
+                    if second is not None:await asyncio.wrap_future(second)
+            self.assertFalse(self.node._hmb_draft_finalize_pending)
+        asyncio.run(scenario())
+        self.assertEqual(self.authored(),before); self.assertEqual(self.checkpoint(),checkpoint)
+        self.assertEqual(len(self.backend.calls),calls)
+    def test_unstarted_cancelled_Final_cannot_run_after_a_new_dispatch(self):
+        self.backend.enable_final(); self.run_node(); self.assert_success(); source=self.checkpoint()['job_id']
+        before=self.authored(); checkpoint=deepcopy(self.checkpoint()); calls=len(self.backend.calls)
+        async def scenario():
+            controller=self.controller()
+            with mock.patch.object(target.GriptapeNodes,'EventManager',return_value=SimpleNamespace(event_loop=asyncio.get_running_loop())), \
+                 mock.patch.object(controller,'run',new_callable=mock.AsyncMock) as run:
+                self.assertTrue(controller.schedule_final({},source).success)
+                first=self.node._hmb_draft_finalize_future
+                first.cancel()
+                self.assertFalse(self.node._hmb_draft_finalize_pending)
+                self.assertTrue(controller.schedule_final({},source).success)
+                second=self.node._hmb_draft_finalize_future
+                self.assertIsNot(second,first)
+                await asyncio.wrap_future(second)
+                for _ in range(4):await asyncio.sleep(0)
+                run.assert_awaited_once_with(final=True,expected_source_task_id=source)
+                self.assertFalse(self.node._hmb_draft_finalize_pending)
+        asyncio.run(scenario())
+        self.assertEqual(self.authored(),before); self.assertEqual(self.checkpoint(),checkpoint)
+        self.assertEqual(len(self.backend.calls),calls)
     def test_stale_scheduled_final_cannot_finalize_a_newer_draft_source(self):
         self.backend.enable_final(); self.run_node(); self.assert_success(); old=self.checkpoint()['job_id']
         self.run_node(); self.assert_success(); newest=self.checkpoint()['job_id']

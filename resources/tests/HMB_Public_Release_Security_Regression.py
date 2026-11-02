@@ -543,11 +543,11 @@ with tempfile.TemporaryDirectory(prefix="hmb-native-release-boundary-") as nativ
     descriptor_file = native_root / descriptor_relative
     with mock.patch.object(builder, "ROOT", native_root):
         assert builder.validate_native_editor_patch_sources() == native_descriptor
-        # Five reviewed history pairs and the already shipped 4/3/2-pair
+        # Six reviewed history pairs and the already shipped 5/4/3/2-pair
         # suffix schemas must bind the corresponding exact patcher constants.
         history = native_descriptor["previous_candidates"]
-        assert len(history) == 5
-        for start in range(4):
+        assert len(history) == 6
+        for start in range(5):
             previous_schema = dict(native_descriptor, previous_candidates=history[start:])
             descriptor_file.write_text(json.dumps(previous_schema), encoding="utf-8")
             assert builder.validate_native_editor_patch_sources() == previous_schema
@@ -555,9 +555,9 @@ with tempfile.TemporaryDirectory(prefix="hmb-native-release-boundary-") as nativ
         patcher_file = native_root / native_descriptor["patcher_path"]
         original_patcher = patcher_file.read_bytes()
         for field, key in (("CANDIDATE", "bundle_sha256"), ("HELPER", "helper_sha256")):
-            old_constant = f'SUPPORTED_CAPSULE_PREVIOUS_{field}_SHA256 = "{history[0][key]}"'
+            old_constant = f'SUPPORTED_CONNECTION_PREVIOUS_{field}_SHA256 = "{history[0][key]}"'
             changed_patcher = original_patcher.replace(old_constant.encode(),
-                f'SUPPORTED_CAPSULE_PREVIOUS_{field}_SHA256 = "{"0" * 64}"'.encode(), 1)
+                f'SUPPORTED_CONNECTION_PREVIOUS_{field}_SHA256 = "{"0" * 64}"'.encode(), 1)
             assert changed_patcher != original_patcher
             patcher_file.write_bytes(changed_patcher)
             # Even a descriptor that truthfully hashes the altered tool may

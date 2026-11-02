@@ -228,8 +228,8 @@ async def exercise(engine, modules, folder, out):
                 (busy_peer, "_generation_refresh_running", True),
                 (busy_peer, "_generation_run_active", active_generation),
                 (busy_peer, "_hmb_web_rerender_active_claim", object()),
+                (busy_peer, "_hmb_draft_finalize_pending", True),
                 (busy_peer, "_hmb_draft_finalize_future", future),
-                (busy_peer, "_hmb_draft_final_status_future", future),
                 (busy_peer, "_hmb_my_box_controller_instance", SimpleNamespace(_busy=True)),
                 (agent, "_worker", worker), (agent, "_web_upload_worker", worker))
             try:
@@ -249,8 +249,13 @@ async def exercise(engine, modules, folder, out):
             with mock.patch.object(agent, "_hmb_thumbnail_worker", worker, create=True), mock.patch.object(agent, "_hmb_catalog_observer", worker, create=True):
                 assert get(agent).can_disconnect
             record("passive_thumbnail_and_catalog_observer_do_not_lock_connection_controls")
+            with mock.patch.object(busy_peer, "_hmb_draft_final_status_future", future, create=True):
+                assert get(agent).can_disconnect and get(busy_peer).can_disconnect
+                assert authoring(nodes) == expected and edges(engine) == original_edges
+            record("passive_saved_Draft_Final_status_observer_does_not_lock_Agent_or_Generator_connections")
 
-            detached = await manage(agent, "disconnect")
+            with mock.patch.object(busy_peer, "_hmb_draft_final_status_future", future, create=True):
+                detached = await manage(agent, "disconnect")
             assert detached.succeeded(), str(detached.result_details)
             assert get(agent).detached
             for _ in range(3):

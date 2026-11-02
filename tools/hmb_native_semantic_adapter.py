@@ -165,6 +165,8 @@ function hmbNativeConnectionDeletionNotice(request, message) {''')
 
 
 _REVIEWED_PREVIOUS_CANDIDATES = (
+    "e594ed5b6e94d68b7dbc4cdfda0440190fff95e9588e03838a0f9284f9d55f67",
+    "463f2dc87b98e63af151f11ef7aa9dbf0ea249d399a8dc5a508e4a8917352158",
     "d208403e7463adac2b3f778151aab55d3709892460460e8142fae8e91add4fbe",
     "c9d95e131cce8db713447a1196c273edb4e5377e24efc4d7f94ca4715e3dc02f",
     "9ec59e780c665cd304703d5e303fa0844de4149a1583fc66490a38369da87b78",
@@ -187,7 +189,9 @@ def _upgrade_reviewed_candidate(source: str, helper: str) -> str:
     start = source.index(marker)
     end = source.index(boundary, start)
     source = source[:start] + _compiled_helper(helper) + source[end:]
-    if source_digest == "d208403e7463adac2b3f778151aab55d3709892460460e8142fae8e91add4fbe":
+    if source_digest in {"e594ed5b6e94d68b7dbc4cdfda0440190fff95e9588e03838a0f9284f9d55f67",
+                         "463f2dc87b98e63af151f11ef7aa9dbf0ea249d399a8dc5a508e4a8917352158",
+                         "d208403e7463adac2b3f778151aab55d3709892460460e8142fae8e91add4fbe"}:
         return source
     if source_digest == "c9d95e131cce8db713447a1196c273edb4e5377e24efc4d7f94ca4715e3dc02f":
         return _bash_snapshot_transport_bridge(source)
@@ -675,8 +679,8 @@ def build_candidate(source: str, helper: str) -> str:
     return _hmb_session_bound_editor_source(_build_candidate_ui_core(source, helper))
 
 def approval_evidence() -> dict:
-    """Exact scoped eligibility; loaded Desktop and team release stay unverified."""
-    return {'status': 'approved', 'structural_anchors': 'matched', 'live_renderer_verified': True, 'deletion_verified': True, 'desktop_verified': False, 'team_release_approved': False, 'renderer_scope': 'Exact combined463: inherited D208 compiled/private-renderer UI evidence plus byte-identical header/deletion and four Bash regions; new ordered binder11, exact native setter22, controlled native-to-real-widget pipeline, metadata9/stock Bash, nonce27/deletion12/syntax regressions. No current Desktop, SDK backend, network or new host-profile verification.', 'source_sha256': '157e06c446d68d77bab30cba4578f5a71289da74d62c44c95b0b6ddd046edde6', 'candidate_sha256': '463f2dc87b98e63af151f11ef7aa9dbf0ea249d399a8dc5a508e4a8917352158', 'helper_sha256': 'e5b515d5cbd1652c1bcb66f7ffa411e6cb86e173163f93f9abee2082a66e74fc', 'verification_sha256': {'reports/bash-reopen-audit-20261030/native/FINAL-VALIDATION.json': '239686a6a458ec8172f847ed7eda45202605f6bd57699f9b8b98e12e910de420', 'reports/session-bound-instance-edit-20261030/NATIVE-SESSION-BINDER-FINAL-PINS.json': 'e90b398b90353b3650159e072b43a24a6a1b282517649222581485247e6c2fd2', 'reports/session-bound-instance-edit-20261030/native-parameter-setter-v3/FINAL-PINS.json': '51500555a1ee74608774de346a5b0b0d106e3ac61c35b7898958a7af9ac74136', 'reports/session-bound-instance-edit-20261030/INLINE-NATIVE-PURE-PROOF.json': '25293ca2eaa1d1832765f51a1bd56d1b0e1db27b013476575aa84177f5946453', 'reports/session-bound-instance-edit-20261030/combined-pipeline/RESULT.json': '452aa23d82ad83cea1391b50e2fe4f86f6132138b03bc5347d9087311b192f9c', 'reports/session-bound-instance-edit-20261030/native-pure-regressions/RESULT.json': '132838fdc615b5c1486f00c294b8f2378d054b5eb55fa1737330f0eaafa466d5'}}
+    """Exact reviewed capability evidence; Desktop and team release are separate."""
+    return {'status': 'approved', 'structural_anchors': 'matched', 'live_renderer_verified': True, 'deletion_verified': True, 'desktop_verified': False, 'team_release_approved': False, 'renderer_scope': 'Only two read-only deletion/blocked-connection preflight requests now carry10s timeout. Exact helper comparison excludes every other edit from the previously verified Local54 helper. Primary React27 readiness,51 connection and82 native-deletion cases pass; both profiles preserve all bytes outside helper. Previous scoped Bash/design/session evidence inherited byte-identically. No current actual Desktop or teammate verification.', 'source_sha256': '157e06c446d68d77bab30cba4578f5a71289da74d62c44c95b0b6ddd046edde6', 'candidate_sha256': '3cf11148efbf8c107daa6ce0fb597d3808794912cd1d2b913373917c481401e1', 'helper_sha256': '709aa28865aacc42b0640d9a09bd0d490ca6f98a16ed441b6182b3339dcde4a6', 'verification_sha256': {'reports/all-library-deployment-audit-20261102/native/PREPARED.json': '5a891ca3fd94e4d4ddd9b289c2b542c6c65eb08d231f36d9a92a6a6fecf6d350', 'reports/all-library-deployment-audit-20261102/native/LOCAL54-UPGRADE.json': 'ae05ec32649adce72c8d6e7e0ac98f0dc79e757b91f4663b0097dff76fa908e4', 'reports/all-library-deployment-audit-20261102/source-checks/RESULT.json': 'c5e3b0db7ef91544c8d3020c825dfed116a25f961cd651a19275c963dec21d1a', 'reports/all-library-deployment-audit-20261102/ui-final/RESULT.json': '640b82b26bfef886222266a20f2010b4699276650c9574ef29f01ae305c89bc8', 'reports/saved-agent-generator-disconnect-audit-20261102/native/APPROVED.json': '0748ad398945039aa35b0b5746db44971575931221687ee925c6608a2db651de'}}
 
 def patch_editor_source(source: str, helper: str) -> tuple[str, dict]:
     """Transform only known structures; admit only the independently tested bytes."""

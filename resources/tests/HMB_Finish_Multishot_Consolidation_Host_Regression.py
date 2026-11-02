@@ -19,7 +19,7 @@ import tempfile
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
+sys.path[:0] = [str(ROOT), str(ROOT / "resources/tests")]
 sys.dont_write_bytecode = True
 CHANNEL = "11111111-1111-4111-8111-111111111111"
 PUBLISHER = "22222222-2222-4222-8222-222222222222"

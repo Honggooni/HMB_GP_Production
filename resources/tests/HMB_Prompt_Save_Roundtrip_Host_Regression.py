@@ -167,6 +167,10 @@ async def exercise(engine, directory):
             connect(image, "SHOT_ASSET_OUT", generator, "SHOT_ASSET_IN")
             connect(picker, "SHOT_PICKER_OUT", generator, "SHOT_PICKER_IN")
         await asyncio.sleep(0)  # Drain construction-only deferred callbacks.
+        # This fixture's blank ImageAsset does not advertise the synthetic
+        # catalog. Initial hydration can clear that unverified projection;
+        # deliver it once before measuring repeated, identical catalog ACKs.
+        prompt._hmb_reconcile_shot_routing(routing_snapshot=deepcopy(catalog))
         # The exact live Prompt state is the authority after initial hydration.
         # A repeated source ACK must leave both native stored state and clocks unchanged.
         expected_prompt = deepcopy(prompt._current_state())
@@ -253,8 +257,14 @@ async def exercise(engine, directory):
         assert len(restored.nodes) == 10
         assert edge_records(engine, restored) == edges_before
         restored_prompt = restored.nodes[prompt.name]
-        assert restored_prompt._get_raw_parameter_value(prompts.WIDGET_PARAMETER_NAME) == expected_raw
-        assert restored_prompt._current_state() == expected_prompt
+        # A serialized cache cannot turn this blank publisher into an
+        # authenticated source for CHANNEL. Reopen retires only its catalog
+        # projection; every authored field and all five documents stay exact.
+        restored_expected = deepcopy(expected_prompt)
+        restored_expected["image_asset"]["shot_catalog"] = []
+        restored_expected["image_asset"]["shot_catalog_routing"] = {}
+        assert restored_prompt._get_raw_parameter_value(prompts.WIDGET_PARAMETER_NAME) == prompts._json_dumps(restored_expected)
+        assert restored_prompt._current_state() == restored_expected
         assert restored.nodes[agent.name]._native_parameter_value(agents._AGENT_SHOT_STORE_PARAMETER) == expected_agent
         assert restored.nodes[finish.name]._get_raw_parameter_value(finishes.SHOT_STORE_PARAMETER_NAME) == finish_store
         for name, values in generator_values.items():
@@ -312,10 +322,12 @@ def main():
                 # Windows creates a private loopback socketpair for its own
                 # event-loop wakeup. SDK ThreadRunner may create another one;
                 # allow only that standard-library call site, not transport.
-                with asyncio.Runner() as runner:
-                    runner.get_loop()
-                    with mock.patch.object(socket.socket, "connect", guarded_connect), mock.patch.object(socket.socket, "connect_ex", deny):
-                        with engine_scope() as engine:
+                # Runner captures ContextVars on first loop initialization.
+                # Capture this private engine rather than the default engine.
+                with engine_scope() as engine:
+                    with asyncio.Runner() as runner:
+                        runner.get_loop()
+                        with mock.patch.object(socket.socket, "connect", guarded_connect), mock.patch.object(socket.socket, "connect_ex", deny):
                             runner.run(exercise(engine, base))
             finally:
                 logging.shutdown()

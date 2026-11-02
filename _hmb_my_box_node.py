@@ -147,6 +147,7 @@ class MyBoxController:
         self._owner_journal_id = ""
         self._projection_checked_at = 0.0
         self._restore_future = None
+        self._final_dispatch = None
         self._run_epoch = 0
         self._run_origin = ""
 
@@ -572,6 +573,14 @@ class MyBoxController:
 
     def schedule_final(self, details: Any, expected_task_id: str) -> Any:
         m, node = _host(self.node), self.node
+        reserved_here = False
+        dispatched = False
+        dispatch = {"started": False}
+        def release() -> None:
+            with node._generation_refresh_lock:
+                if self._final_dispatch is dispatch:
+                    self._final_dispatch = None
+                    node._hmb_draft_finalize_pending = False
         try:
             if not node._runtime_node_is_live(require_registered=True):
                 raise ValueError("The private Generator is inactive.")
@@ -586,31 +595,52 @@ class MyBoxController:
                 if self._busy or node._generation_run_active.is_set() or node._generation_refresh_running or node._hmb_draft_finalize_pending:
                     return m.NodeMessageResult(success=True, details="Generator is busy; no duplicate private Final scheduled.", response=details, altered_workflow_state=False)
                 node._hmb_draft_finalize_pending = True
+                self._final_dispatch = dispatch
+                reserved_here = True
             clear = getattr(node, "clear_cancellation", None)
             if callable(clear):
                 clear()
             expected_epoch, expected_origin = self._epoch, node._selected_broker_server_url()
             async def execute() -> None:
+                with node._generation_refresh_lock:
+                    # Cancellation before the first instruction may already
+                    # have released this exact reservation. Never start late.
+                    if self._final_dispatch is not dispatch:
+                        return
+                    dispatch["started"] = True
                 try:
                     self._guard(expected_epoch, expected_origin)
                     if self.checkpoint().get("job_id") != expected_task_id:
                         raise ValueError("The private Draft changed before Final began; no video was submitted.")
                     await self.run(final=True, expected_source_task_id=expected_task_id)
                 finally:
-                    node._hmb_draft_finalize_pending = False
+                    release()
                     with suppress(Exception):
                         node._sync_seedance_shot_widget(emit_change=True)
-            future = asyncio.run_coroutine_threadsafe(execute(), loop)
+            coroutine = execute()
+            try:
+                future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+            except Exception:
+                coroutine.close()  # A closed loop never owns this coroutine.
+                raise
+            dispatched = True
             node._hmb_draft_finalize_future = future
             def finished(f: Any) -> None:
                 if f.cancelled():
-                    node._hmb_draft_finalize_pending = False
+                    # Active cancellation retains ownership until run's local
+                    # cleanup finishes; unstarted cancellation owns no work.
+                    with node._generation_refresh_lock:
+                        if self._final_dispatch is dispatch and not dispatch["started"]:
+                            self._final_dispatch = None
+                            node._hmb_draft_finalize_pending = False
                 else:
                     with suppress(Exception):
                         f.exception()
             future.add_done_callback(finished)
             return m.NodeMessageResult(success=True, details="Private Draft final scheduled. Saved 480p settings are unchanged.", response=details, altered_workflow_state=False)
         except Exception as exc:
+            if reserved_here and not dispatched:
+                release()
             return m.NodeMessageResult(success=False, details=str(exc), response=details, altered_workflow_state=False)
 
     def draft_ui_state(self) -> dict[str, Any]:

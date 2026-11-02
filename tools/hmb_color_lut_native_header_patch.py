@@ -43,6 +43,8 @@ SUPPORTED_LATEST_CANDIDATE_SHA256 = "c7100b21f4cca2fa55a368b9ac2740c923b5545c3a5
 SUPPORTED_LATEST_HELPER_SHA256 = "9d67418745b5264ec892835370da1d19a0695d878cb03c80de696f00601f52b5"
 SUPPORTED_CAPSULE_PREVIOUS_CANDIDATE_SHA256 = "86ee3125de3fc8a89af95a9140dc1fc81d3a426f6f03bfdfbe673b561ff87a5a"
 SUPPORTED_CAPSULE_PREVIOUS_HELPER_SHA256 = "03137c19feb8f4fa4d5e371eb52bae3aaaccf4afb6a29f0098e815bccf65ee25"
+SUPPORTED_CONNECTION_PREVIOUS_CANDIDATE_SHA256 = "984a974edb6b7218b2ff5deb35eaffcf2979fcf6d8ccd5d5c2ca5fbb1fc15552"
+SUPPORTED_CONNECTION_PREVIOUS_HELPER_SHA256 = "e5b515d5cbd1652c1bcb66f7ffa411e6cb86e173163f93f9abee2082a66e74fc"
 HELPER = REPO / "resources/editor/hmb-color-lut-native-header.js"
 DEFAULT_SOURCE = Path(os.environ.get("LOCALAPPDATA", "")) / (
     "ai.griptape.nodes.desktop/current/resources/editor-bundle/assets/" + EXPECTED_BUNDLE_NAME
@@ -509,9 +511,11 @@ def _release_previous_candidates(descriptor: dict) -> list[dict]:
                "helper_sha256": SUPPORTED_LATEST_HELPER_SHA256}
     capsule_previous = {"bundle_sha256": SUPPORTED_CAPSULE_PREVIOUS_CANDIDATE_SHA256,
                         "helper_sha256": SUPPORTED_CAPSULE_PREVIOUS_HELPER_SHA256}
+    connection_previous = {"bundle_sha256": SUPPORTED_CONNECTION_PREVIOUS_CANDIDATE_SHA256,
+                           "helper_sha256": SUPPORTED_CONNECTION_PREVIOUS_HELPER_SHA256}
     if "previous_candidates" in descriptor:
         candidates = descriptor["previous_candidates"]
-        if "previous_candidate" in descriptor or candidates not in ([capsule_previous, current, latest, recent, older], [current, latest, recent, older], [latest, recent, older], [recent, older]):
+        if "previous_candidate" in descriptor or candidates not in ([connection_previous, capsule_previous, current, latest, recent, older], [capsule_previous, current, latest, recent, older], [current, latest, recent, older], [latest, recent, older], [recent, older]):
             raise ValueError("Unsupported previous native editor candidates.")
         return list(candidates)
     if "previous_candidate" in descriptor:
@@ -553,7 +557,10 @@ def _upgrade_previous_helper(original: bytes, descriptor: dict) -> bytes:
     # Match the pristine transformer, which normalizes the helper to UTF-8 LF.
     replacement = HELPER.read_text(encoding="utf-8").encode("utf-8")
     candidate = original[:start] + replacement + original[end:]
-    candidate = _capsule_motion_bridge(candidate.decode("utf-8")).encode("utf-8")
+    # The last shipped helper already owns the capsule-duration seam. Replacing
+    # only that helper must not apply the same structural edit a second time.
+    if original_sha != SUPPORTED_CONNECTION_PREVIOUS_CANDIDATE_SHA256:
+        candidate = _capsule_motion_bridge(candidate.decode("utf-8")).encode("utf-8")
     if sha256(candidate) != descriptor["candidate_sha256"]:
         raise ValueError("Upgraded native editor candidate differs from the verified release.")
     return candidate

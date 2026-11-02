@@ -17,10 +17,11 @@ import unittest
 from unittest import mock
 from uuid import uuid4
 
+ROOT = Path(__file__).resolve().parents[2]
+sys.path[:0] = [str(ROOT), str(Path(__file__).resolve().parent)]
 from _hmb_seedance_clean_ci_stubs import install_clean_ci_griptape_stubs
 
 install_clean_ci_griptape_stubs()
-ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location(
     "seedance_discarded_workflow_recovery", ROOT / "HMBSeedanceGeneration.py"
 )

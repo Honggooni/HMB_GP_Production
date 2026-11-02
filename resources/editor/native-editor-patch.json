@@ -4,12 +4,16 @@
   "source_profile": "reviewed-stock",
   "bundle_name": "index-DEZU41rc.js",
   "source_sha256": "1a0429b88c6b8dd1c7e6e053836d03f734a4d6453f8886e0693527c7498909e2",
-  "candidate_sha256": "984a974edb6b7218b2ff5deb35eaffcf2979fcf6d8ccd5d5c2ca5fbb1fc15552",
+  "candidate_sha256": "301b4553a00bb519846a2e8d00b7e3b0af8e6b2222682b90a012dd108a84f0f9",
   "helper_path": "resources/editor/hmb-color-lut-native-header.js",
-  "helper_sha256": "e5b515d5cbd1652c1bcb66f7ffa411e6cb86e173163f93f9abee2082a66e74fc",
+  "helper_sha256": "709aa28865aacc42b0640d9a09bd0d490ca6f98a16ed441b6182b3339dcde4a6",
   "patcher_path": "tools/hmb_color_lut_native_header_patch.py",
-  "patcher_sha256": "bc4a02a9f069172a8eb382b3cc4b9650903adc9bddaaf4d2d9f004c6008e8098",
+  "patcher_sha256": "b2daaa57333e74251916c23a952103b64b6c2bcdab4e8a52d5e5142fdf52879c",
   "previous_candidates": [
+    {
+      "bundle_sha256": "984a974edb6b7218b2ff5deb35eaffcf2979fcf6d8ccd5d5c2ca5fbb1fc15552",
+      "helper_sha256": "e5b515d5cbd1652c1bcb66f7ffa411e6cb86e173163f93f9abee2082a66e74fc"
+    },
     {
       "bundle_sha256": "86ee3125de3fc8a89af95a9140dc1fc81d3a426f6f03bfdfbe673b561ff87a5a",
       "helper_sha256": "03137c19feb8f4fa4d5e371eb52bae3aaaccf4afb6a29f0098e815bccf65ee25"
@@ -34,11 +38,13 @@
   "additional_profiles": [
     {
       "source_sha256": "157e06c446d68d77bab30cba4578f5a71289da74d62c44c95b0b6ddd046edde6",
-      "candidate_sha256": "463f2dc87b98e63af151f11ef7aa9dbf0ea249d399a8dc5a508e4a8917352158",
+      "candidate_sha256": "3cf11148efbf8c107daa6ce0fb597d3808794912cd1d2b913373917c481401e1",
       "adapter_path": "tools/hmb_native_semantic_adapter.py",
-      "adapter_sha256": "be97c8de06cee6ed08f811614a06a97aeca4d4b2495757d1018ce23b50e00e6e",
+      "adapter_sha256": "f972346349b11a8db6e103956675d5cc7455337e993db1e406be79e0dd6d6d90",
       "structural_fallback": false,
       "previous_candidate_sha256": [
+        "e594ed5b6e94d68b7dbc4cdfda0440190fff95e9588e03838a0f9284f9d55f67",
+        "463f2dc87b98e63af151f11ef7aa9dbf0ea249d399a8dc5a508e4a8917352158",
         "ccabfc9bfddb67896231e0e75b067e659287f19fca143b2355f2c295d5da5251",
         "bcb4ea1649a78258c87b795cb73762e09c96575b0f811cb8ec34f609e21c3e17",
         "72dc87c51089c65554a9fcb44f80e38872338bb5a9c1ca4c9058d582e981f6e5",

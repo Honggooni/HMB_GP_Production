@@ -6608,7 +6608,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if callable(clear):
                 clear()
             command_id = action_id or "final-" + uuid4().hex
-            future = asyncio.run_coroutine_threadsafe(self._run_draft_final(source, command_id), event_loop)
+            coroutine = self._run_draft_final(source, command_id)
+            try:
+                future = asyncio.run_coroutine_threadsafe(coroutine, event_loop)
+            except Exception:
+                coroutine.close()  # Dispatch failed before the loop owned it.
+                raise
             self._hmb_draft_finalize_future = future
             def finished(_future: Any) -> None:
                 # Cancellation before the coroutine's first instruction has

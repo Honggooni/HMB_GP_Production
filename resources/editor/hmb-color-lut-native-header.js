@@ -66,7 +66,7 @@ function hmbNativeOpenConnections(nodeNames) {
 }
 function hmbNativeOpenBlockedConnections(nodeNames) {
   const epoch = hmbNativeStudioFlowEpoch;
-  Promise.resolve().then(() => Xd.request("HMBCheckNodeDeletionRequest", { node_names: nodeNames }))
+  Promise.resolve().then(() => Xd.request("HMBCheckNodeDeletionRequest", { node_names: nodeNames }, { timeoutMs: 10000 }))
     .then(result => {
       if (epoch !== hmbNativeStudioFlowEpoch) return;
       const names = Object.keys(result?.blocked || {});
@@ -140,12 +140,16 @@ function hmbNativeConnectionSnapshot(value, nodeName) {
 }
 const hmbNativeConnectionElement = (tag, props, ...children) =>
   (0, R.jsx)(tag, { ...props, children: children.length === 1 ? children[0] : children });
+function hmbNativeConnectionDirty() {
+  if (typeof kq !== "undefined") kq.getState().setDirty(true);
+}
 function hmbUseNativeConnectionManager() {
   const [view, setView] = (0, S.useState)(null);
   const [snapshot, setSnapshot] = (0, S.useState)(null);
   const [busy, setBusy] = (0, S.useState)(false);
   const [error, setError] = (0, S.useState)("");
   const sequence = (0, S.useRef)(0), pending = (0, S.useRef)(false), dialog = (0, S.useRef)(null);
+  const readiness = (0, S.useRef)({ view: null, until: 0 });
   const close = () => { sequence.current += 1; pending.current = false; setView(null); };
   (0, S.useEffect)(() => {
     const open = event => {
@@ -166,9 +170,10 @@ function hmbUseNativeConnectionManager() {
   }, []);
   (0, S.useEffect)(() => {
     if (!view) { setSnapshot(null); setBusy(false); setError(""); return; }
+    readiness.current = { view, until: Date.now() + 30000 };
     const current = ++sequence.current; let cancelled = false;
     pending.current = true; setBusy(true); setError(""); setSnapshot(null);
-    Promise.resolve().then(() => Xd.request("HMBGetNodeConnectionsRequest", { node_name: view.nodeName }))
+    Promise.resolve().then(() => Xd.request("HMBGetNodeConnectionsRequest", { node_name: view.nodeName }, { timeoutMs: 10000 }))
       .then(value => {
         if (cancelled || current !== sequence.current || view.epoch !== hmbNativeStudioFlowEpoch) return;
         setSnapshot(hmbNativeConnectionSnapshot(value, view.nodeName));
@@ -180,6 +185,33 @@ function hmbUseNativeConnectionManager() {
     return () => { cancelled = true;
       if (current === sequence.current) { sequence.current += 1; pending.current = false; } };
   }, [view]);
+  (0, S.useEffect)(() => {
+    // Only an open, visible dialog with temporarily unavailable connected
+    // controls needs readiness checks. Never poll an idle/closed editor or
+    // replay a connection mutation. The engine remains the only authority.
+    if (!view || !snapshot || busy || error || snapshot.detached || snapshot.can_disconnect
+      || snapshot.can_reconnect || snapshot.can_forget_missing || !snapshot.connections.length
+      || readiness.current.view !== view || Date.now() >= readiness.current.until
+      || document.visibilityState === "hidden") return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      if (cancelled || pending.current || view.epoch !== hmbNativeStudioFlowEpoch
+        || document.visibilityState === "hidden" || Date.now() >= readiness.current.until) return;
+      const current = ++sequence.current; pending.current = true;
+      Promise.resolve().then(() => Xd.request("HMBGetNodeConnectionsRequest", { node_name: view.nodeName }, { timeoutMs: 10000 }))
+        .then(value => {
+          if (!cancelled && current === sequence.current && view.epoch === hmbNativeStudioFlowEpoch)
+            setSnapshot(hmbNativeConnectionSnapshot(value, view.nodeName));
+        }).catch(reason => {
+          if (!cancelled && current === sequence.current && view.epoch === hmbNativeStudioFlowEpoch) {
+            setError(vg(reason)); setSnapshot(null);
+          }
+        }).finally(() => {
+          if (current === sequence.current) pending.current = false;
+        });
+    }, 1000);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [view, snapshot, busy, error]);
   (0, S.useLayoutEffect)(() => {
     if (!view) return;
     dialog.current?.focus();
@@ -194,22 +226,41 @@ function hmbUseNativeConnectionManager() {
     if (!focused || focused === document.body || !focused.isConnected) dialog.current.focus();
   }, [view?.nodeName, snapshot, busy]);
   const manage = operation => {
-    if (!view || !snapshot || pending.current || busy || view.epoch !== hmbNativeStudioFlowEpoch
+    if (!view || !snapshot || pending.current || busy || error || view.epoch !== hmbNativeStudioFlowEpoch
       || !(operation === "disconnect" ? snapshot.can_disconnect : operation === "reconnect" ? snapshot.can_reconnect
         : operation === "forget_missing" && snapshot.can_forget_missing === true)) return;
     const current = ++sequence.current; pending.current = true; setBusy(true); setError("");
     Promise.resolve().then(() => Xd.request("HMBManageNodeConnectionsRequest", {
       node_name: view.nodeName, operation, expected_state_token: snapshot.state_token,
-    })).then(value => {
+    }, { timeoutMs: 10000 })).then(value => {
       if (view.epoch !== hmbNativeStudioFlowEpoch) return;
       const accepted = hmbNativeConnectionSnapshot(value, view.nodeName);
       // A committed action still needs saving when its dialog was dismissed
       // while awaiting the engine. It never reopens that dismissed dialog.
-      if (typeof kq !== "undefined") kq.getState().setDirty(true);
+      hmbNativeConnectionDirty();
       if (current === sequence.current) setSnapshot(accepted);
-    }).catch(reason => {
+    }).catch(async reason => {
+      const timedOut = /timed out|timeout/i.test(vg(reason));
+      // A timeout is not a rejected mutation: it may already have committed.
+      // Keep save available and read the current graph once, never resubmit.
+      if (timedOut && view.epoch === hmbNativeStudioFlowEpoch) hmbNativeConnectionDirty();
       if (current === sequence.current && view.epoch === hmbNativeStudioFlowEpoch) {
-        setError(vg(reason)); setSnapshot(null);
+        setError(timedOut ? `${vg(reason)} · 연결 변경 결과를 확인 중입니다. 다시 전송하지 않습니다.` : vg(reason));
+        setSnapshot(null);
+        if (timedOut) {
+          try {
+            const observed = hmbNativeConnectionSnapshot(await Xd.request("HMBGetNodeConnectionsRequest", {
+              node_name: view.nodeName,
+            }, { timeoutMs: 10000 }), view.nodeName);
+            if (current === sequence.current && view.epoch === hmbNativeStudioFlowEpoch) {
+              setSnapshot(observed);
+              setError("연결 변경 응답이 지연되어 현재 상태를 다시 조회했습니다. 새로고침으로 확인한 뒤 계속하세요.");
+            }
+          } catch (readError) {
+            if (current === sequence.current && view.epoch === hmbNativeStudioFlowEpoch)
+              setError(`${vg(reason)} · 현재 연결 조회도 완료되지 않았습니다. 새로고침해 주세요. ${vg(readError)}`);
+          }
+        }
       }
     }).finally(() => {
       if (current === sequence.current) { pending.current = false; setBusy(false); }
@@ -271,10 +322,10 @@ function hmbUseNativeConnectionManager() {
   el("footer", { style: { display: "flex", flexWrap: "wrap", gap: 10, justifyContent: "flex-end", padding: 18, borderTop: "1px solid #313c50" } },
     el("button", { type: "button", style: actionStyle(busy), disabled: busy,
       onClick: () => setView(previous => previous ? { ...previous, nonce: previous.nonce + 1 } : previous) }, "새로고침"),
-    el("button", { type: "button", style: actionStyle(busy || !snapshot?.can_disconnect), disabled: busy || !snapshot?.can_disconnect, onClick: () => manage("disconnect") }, "연결 해제"),
-    el("button", { type: "button", style: actionStyle(busy || !snapshot?.can_reconnect), disabled: busy || !snapshot?.can_reconnect, onClick: () => manage("reconnect") }, "다시 연결"),
-    snapshot?.can_forget_missing === true ? el("button", { type: "button", style: actionStyle(busy), disabled: busy,
-      onClick: () => manage("forget_missing") }, "삭제된 연결 기록 정리") : null))), document.body, "hmb-native-connection-manager");
+    el("button", { type: "button", style: actionStyle(busy || !!error || !snapshot?.can_disconnect), disabled: busy || !!error || !snapshot?.can_disconnect, onClick: () => manage("disconnect") }, "연결 해제"),
+    el("button", { type: "button", style: actionStyle(busy || !!error || !snapshot?.can_reconnect), disabled: busy || !!error || !snapshot?.can_reconnect, onClick: () => manage("reconnect") }, "다시 연결"),
+    snapshot?.can_forget_missing === true ? el("button", { type: "button", style: actionStyle(busy || !!error),
+      disabled: busy || !!error, onClick: () => manage("forget_missing") }, "삭제된 연결 기록 정리") : null))), document.body, "hmb-native-connection-manager");
 }
 let hmbNativeDeletionHostCount = 0;
 function hmbUseNativeDeletionGuardHost() {
@@ -325,7 +376,7 @@ function hmbNativeGuardNodeDeletion(changes, nodes, apply) {
   const release = () => names.forEach(name => {
     if (hmbNativeDeletionPending.get(name) === operation) hmbNativeDeletionPending.delete(name);
   });
-  Promise.resolve().then(() => Xd.request("HMBCheckNodeDeletionRequest", { node_names: names }))
+  Promise.resolve().then(() => Xd.request("HMBCheckNodeDeletionRequest", { node_names: names }, { timeoutMs: 10000 }))
     .then(result => {
       if (epoch !== hmbNativeStudioFlowEpoch) { release(); return; }
       if (result?.protection_ready !== true || result?.protection_version !== 2) {

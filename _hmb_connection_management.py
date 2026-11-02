@@ -125,7 +125,7 @@ def _busy(node: Any) -> bool:
         return True
     if any(getattr(node, key, False) is True for key in (
             "_busy", "_hmb_run_in_progress", "_hmb_execution_pending", "_hmb_process_running",
-            "_broker_action_running", "_generation_refresh_running")):
+            "_broker_action_running", "_generation_refresh_running", "_hmb_draft_finalize_pending")):
         return True
     if getattr(node, "_hmb_active_operation", None) is not None or getattr(node, "_hmb_pending_operation_id", ""):
         return True
@@ -149,10 +149,13 @@ def _busy(node: Any) -> bool:
         worker = getattr(node, key, None)
         if callable(getattr(worker, "is_alive", None)) and worker.is_alive():
             return True
-    for key in ("_hmb_draft_finalize_future", "_hmb_draft_final_status_future"):
-        future = getattr(node, key, None)
-        if callable(getattr(future, "done", None)) and not future.done():
-            return True
+    # A saved Draft starts a passive Final-status observer on reopen. That GET
+    # watch can remain pending while the Draft is merely available or offline;
+    # it does not own topology or submit a render. Actual Final dispatch and
+    # generation/refresh ownership above must still prevent disconnection.
+    future = getattr(node, "_hmb_draft_finalize_future", None)
+    if callable(getattr(future, "done", None)) and not future.done():
+        return True
     return getattr(getattr(node, "_hmb_my_box_controller_instance", None), "_busy", False) is True
 
 
@@ -427,8 +430,8 @@ def describe(engine: Any, node_name: str) -> dict:
         peers.update((row.get("source_node_name"), row.get("target_node_name")))
     if not reason and any(name not in nodes or parents[name] != context[1] for name in peers):
         reason = "연결 상대가 없거나 다른 flow에 있습니다."
-    elif not reason and any(_busy(nodes[name]) for name in peers):
-        reason = "연결된 툴의 실행을 마치고 편집 잠금을 해제하세요."
+    elif not reason and (busy_names := sorted(name for name in peers if _busy(nodes[name]))):
+        reason = "연결된 툴의 실행을 마치고 편집 잠금을 해제하세요. (" + ", ".join(busy_names) + ")"
     elif not reason and any(_id(nodes[name]) and sum(_id(value) == _id(nodes[name]) for value in nodes.values()) != 1 for name in peers):
         reason = "복제된 노드 식별자가 있습니다. 원본 연결을 확인하세요."
     if detached and not reason:

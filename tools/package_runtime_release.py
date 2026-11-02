@@ -18,8 +18,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.8.53"
-RELEASE_VERSION = "0.8.53"
+RELEASE_LABEL = "v0.8.55"
+RELEASE_VERSION = "0.8.55"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -236,6 +236,10 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
         raise RuntimeError("Native editor previous candidate is not the reviewed patch.")
     reviewed_previous = [
         {
+            "bundle_sha256": "984a974edb6b7218b2ff5deb35eaffcf2979fcf6d8ccd5d5c2ca5fbb1fc15552",
+            "helper_sha256": "e5b515d5cbd1652c1bcb66f7ffa411e6cb86e173163f93f9abee2082a66e74fc",
+        },
+        {
             "bundle_sha256": "86ee3125de3fc8a89af95a9140dc1fc81d3a426f6f03bfdfbe673b561ff87a5a",
             "helper_sha256": "03137c19feb8f4fa4d5e371eb52bae3aaaccf4afb6a29f0098e815bccf65ee25",
         },
@@ -257,7 +261,7 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
         },
     ]
     if "previous_candidates" in payload and payload["previous_candidates"] not in (
-        reviewed_previous, reviewed_previous[1:], reviewed_previous[2:], reviewed_previous[3:]
+        reviewed_previous, reviewed_previous[1:], reviewed_previous[2:], reviewed_previous[3:], reviewed_previous[4:]
     ):
         raise RuntimeError("Native editor previous candidates are not the reviewed patches.")
     for kind in ("patcher", "helper"):
@@ -284,7 +288,7 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
             if module_string_constant(patcher, constant) != payload["previous_candidate"][key]:
                 raise RuntimeError("Native editor patcher and previous candidate differ.")
     if "previous_candidates" in payload:
-        prefixes = ("SUPPORTED_CAPSULE_PREVIOUS", "SUPPORTED_LATEST", "SUPPORTED_RECENT",
+        prefixes = ("SUPPORTED_CONNECTION_PREVIOUS", "SUPPORTED_CAPSULE_PREVIOUS", "SUPPORTED_LATEST", "SUPPORTED_RECENT",
                     "SUPPORTED_CURRENT", "SUPPORTED_PREVIOUS")
         prefixes = prefixes[len(prefixes) - len(payload["previous_candidates"]):]
         for row, prefix in zip(payload["previous_candidates"], prefixes, strict=True):

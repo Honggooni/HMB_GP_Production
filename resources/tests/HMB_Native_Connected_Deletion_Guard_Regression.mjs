@@ -22,7 +22,7 @@ function harness(names = ["HMB_A", "ordinary"]) {
   const ctx = vm.createContext({
     console, Map, Set, WeakMap, WeakSet, Promise, Date,
     Xd: {
-      request: async (name, args) => { calls.push(["request", name, args]); if (response instanceof Error) throw response; return typeof response === "function" ? response() : response; },
+      request: async (name, args, options) => { calls.push(["request", name, args, options]); if (response instanceof Error) throw response; return typeof response === "function" ? response() : response; },
       send: (name, args) => calls.push(["send", name, args]),
     },
     ig: { warning: (title, options) => notices.push([title, options]), error: (title, options) => notices.push([title, options]) },
@@ -42,6 +42,33 @@ function harness(names = ["HMB_A", "ordinary"]) {
   return { ctx, handler, calls, notices, applied, cleared, nodes, setResponse: next => { response = next; } };
 }
 
+{
+  const h = harness();
+  const lostReply = () => new Promise((resolve, reject) => {
+    const options = h.calls.at(-1)?.[3];
+    if (options?.timeoutMs === 10000) Promise.resolve().then(() => reject(Error("Request timed out after 10000ms")));
+  });
+  h.setResponse(lostReply);
+  h.handler([{ type: "remove", id: "HMB_A" }]);
+  await tick(); await tick();
+  check(h.calls[0][3]?.timeoutMs === 10000, "Deletion preflight has an explicit bounded read timeout");
+  check(h.notices.length === 1 && h.notices[0][1].description.includes("timed out"), "A lost read reply ends with the actual diagnostic");
+  check(h.nodes.length === 2 && !h.applied.length && !h.cleared.length, "A timed out preflight never deletes or clears edits");
+  h.setResponse({ protection_ready: true, protection_version: 2, can_delete: true, hmb_node_names: ["HMB_A"] });
+  h.handler([{ type: "remove", id: "HMB_A" }]); await tick();
+  check(h.calls.some(call => call[0] === "send" && call[1] === "DeleteNodeRequest"), "An explicit retry after timeout gets a new preflight instead of a stuck pending lease");
+}
+{
+  const h = harness();
+  h.setResponse(() => new Promise((resolve, reject) => {
+    if (h.calls.at(-1)?.[3]?.timeoutMs === 10000) Promise.resolve().then(() => reject(Error("Request timed out after 10000ms")));
+  }));
+  vm.runInContext("hmbNativeOpenBlockedConnections(['HMB_A'])", h.ctx);
+  await tick(); await tick();
+  check(h.calls[0][3]?.timeoutMs === 10000, "Blocked-connection lookup also has an explicit bounded read timeout");
+  check(h.notices.length === 1 && h.notices[0][0] === "연결을 확인할 수 없습니다", "Blocked-connection read failure is visible");
+  check(!h.applied.length && !h.cleared.length, "Blocked-connection timeout cannot mutate the graph");
+}
 for (const reason of ["visible wire", "remote binding"]) {
   const h = harness();
   h.setResponse({ protection_ready: true, protection_version: 2, can_delete: false, blocked: { HMB_A: [reason] }, hmb_node_names: ["HMB_A"], message: reason });

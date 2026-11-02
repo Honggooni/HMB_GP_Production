@@ -814,6 +814,27 @@ class DraftShotTests(unittest.TestCase):
         picker._hmb_shot_routing_snapshot.assert_called_once_with(CHANNEL, validate_media=False)
         self.assertEqual(node.upload_calls, 0)
 
+    def test_closed_dispatch_loop_closes_unsubmitted_Final_coroutine(self):
+        node = Node()
+        node._store_draft_source(completed_source(node))
+        coroutines = []
+        def refused(coroutine, loop):
+            coroutines.append(coroutine)
+            raise RuntimeError('Synthetic loop closed before dispatch')
+        try:
+            with run_boundaries(node), engine_loop_patch(SimpleNamespace(is_running=lambda: True)), \
+                 mock.patch.object(t.asyncio, 'run_coroutine_threadsafe', side_effect=refused):
+                result = node._on_finalize_draft_clicked(None, None,
+                    action_id='closed-loop', expected_draft_job_id=JOB)
+            self.assertFalse(result.success)
+            self.assertFalse(node._hmb_draft_finalize_pending)
+            self.assertEqual(node.bridge.posts, [])
+            self.assertEqual(len(coroutines), 1)
+            self.assertIsNone(coroutines[0].cr_frame)
+        finally:
+            for coroutine in coroutines:
+                coroutine.close()
+
     def test_ordinary_run_cannot_overtake_pending_final_on_same_node(self):
         async def scenario():
             node = Node()
