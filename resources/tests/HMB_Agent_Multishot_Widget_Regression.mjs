@@ -53,6 +53,13 @@ try{
  await page.evaluate(()=>{statuses['shot-2']='running';sync();});await page.locator('#row2 .agent-shot-run').click();await page.waitForFunction(()=>calls.at(-1)?.action?.kind==='cancel_selected' && !rows[1].querySelector('.agent-shot-run').disabled);
  assert.equal(await page.evaluate(()=>calls.at(-1).action.kind),'cancel_selected');
  receipt.cases.push("one explicit Play command and running Cancel remain scoped to the requested Shot");
+ await page.evaluate(()=>{statuses['shot-2']='preparing';sync();});
+ assert.equal(await page.locator('#row2 .agent-row-status').textContent(),'소스 준비 중…');
+ assert.equal(await page.locator('#row2 .agent-shot-run').textContent(),'■');
+ await page.locator('#row2 .agent-shot-run').click();
+ await page.waitForFunction(()=>calls.at(-1)?.action?.kind==='cancel_selected' && !rows[1].querySelector('.agent-shot-run').disabled);
+ assert.equal(await page.evaluate(()=>calls.at(-1).action.kind),'cancel_selected');
+ receipt.cases.push("source preparation displays its pending state and Cancel without a second Run");
  const unchanged=await page.evaluate(async()=>{
   statuses={};sync();await Promise.resolve();window.mutations=[];const observer=new MutationObserver(records=>mutations.push(...records));observer.observe(document.querySelector('#sdk'),{subtree:true,attributes:true,childList:true,characterData:true});const callCount=calls.length;
   for(let n=0;n<300;n++){headerHandle.update({value:structuredClone(makeState()),onChange:value=>calls.push(value)});handles.forEach((handle,i)=>handle.update({value:structuredClone(rowState(i+1)),onChange:onRow}));}

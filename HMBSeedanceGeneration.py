@@ -15840,6 +15840,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if not callable(owner_api) or not callable(run_api):
             raise _AgentResultUnavailable("The connected Agent manager needs a compatible Prompt manager.")
         prompt_owner = owner_api(channel_uuid=channel, shot_uuid=shot)
+        # First-use project/preview sources can still be decoding. Await the
+        # exact source document before the Generator's own immutable-input
+        # validation; this performs no Agent inference or video submission.
+        prepare_api = getattr(source, "_hmb_prepare_shot_document", None)
+        if callable(prepare_api):
+            await prepare_api(channel_uuid=channel, shot_uuid=shot, prompt_owner=prompt_owner,
+                lifecycle_generation=int(getattr(source, "_hmb_lifecycle_generation", 0) or 0), generator=self)
         # Validate project and direct source identity before any model call.
         # This validation copy is never persisted or submitted as a prompt.
         validation = self._resolve_exact_shot_generation_inputs(self._get_parameters())
@@ -15906,6 +15913,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "[HMB EXECUTION FAILED]", "[HMB EXECUTION CANCELLED]",
             "[HMB OUTPUT BLOCKED]", "[HMB LOCAL POLICY REQUIRED]",
             "[HMB CONNECTION CHECK FAILED]", "[HMB SOURCE CONTRACT INVALID]",
+            "[HMB SOURCE CHECK FAILED]",
             "[HMB PROJECT POLICY PENDING]",
         )
         try:

@@ -188,7 +188,7 @@ class PublicationResilienceTests(unittest.TestCase):
         self.assertFalse(self.node._hmb_slot_switching)
 
     def test_independent_auxiliary_faults_do_not_skip_other_stages(self):
-        for stage in ("running_status", "notify", "result_messages", "policy_cleanup", "input_cleanup", "output_cleanup"):
+        for stage in ("preparing_status", "running_status", "notify", "result_messages", "policy_cleanup", "input_cleanup", "output_cleanup"):
             with self.subTest(stage=stage):
                 self.setUp_case(stage)
 
@@ -202,7 +202,14 @@ class PublicationResilienceTests(unittest.TestCase):
         self.node._hmb_notify_shot_preview = Mock()
         self.node._refresh_hmb_execution_result_messages = Mock()
         error = RuntimeError("PRIVATE auxiliary fault")
-        if stage == "running_status": self.node._hmb_publish_shot_status.side_effect = [error, None]
+        status_phases = []
+        if stage in {"preparing_status", "running_status"}:
+            def status_failure():
+                phase = self.node._hmb_shot_run_status.get(KEY)
+                status_phases.append(phase)
+                if phase == stage.removesuffix("_status"):
+                    raise error
+            self.node._hmb_publish_shot_status.side_effect = status_failure
         if stage == "notify": self.node._hmb_notify_shot_preview.side_effect = error
         if stage == "result_messages": self.node._refresh_hmb_execution_result_messages.side_effect = error
         def factory(*args):
@@ -222,6 +229,9 @@ class PublicationResilienceTests(unittest.TestCase):
         self.assert_success(record)
         self.node._hmb_persist_shot_store.assert_called()
         self.node._hmb_notify_shot_preview.assert_called()
+        if stage in {"preparing_status", "running_status"}:
+            self.assertEqual(status_phases, ["preparing", "running", "succeeded"])
+            self.assertIn(stage, self.node._hmb_shot_slots[KEY]["publication_warnings"])
 
     def test_cleanup_baseexception_still_clears_worker_unlocks_and_allows_next_run(self):
         def factory(*args):
@@ -246,8 +256,14 @@ class PublicationResilienceTests(unittest.TestCase):
                 self.node, self.prompt = fixture.manager()
                 self.node._hmb_shot_results[OTHER] = {"text": "Other Shot preserved"}
                 self.other_before = copy.deepcopy(self.node._hmb_shot_slots[OTHER])
+                status_phases = []
                 if stage == "terminal_status":
-                    self.node._hmb_publish_shot_status.side_effect = [None, asyncio.CancelledError()]
+                    def terminal_cancel():
+                        phase = self.node._hmb_shot_run_status.get(KEY)
+                        status_phases.append(phase)
+                        if phase == "succeeded":
+                            raise asyncio.CancelledError()
+                    self.node._hmb_publish_shot_status.side_effect = terminal_cancel
                 def factory(*args):
                     worker = self.worker(*args)
                     if stage == "policy": worker._clear_hmb_runtime_policy.side_effect = asyncio.CancelledError()
@@ -258,6 +274,8 @@ class PublicationResilienceTests(unittest.TestCase):
                 self.assertFalse(self.node._hmb_shot_request_records)
                 self.assertEqual(self.node._hmb_shot_slots[KEY]["result"]["status"], "succeeded")
                 self.assertIn(KEY, self.node._hmb_shot_results)
+                if stage == "terminal_status":
+                    self.assertEqual(status_phases, ["preparing", "running", "succeeded"])
 
     def test_terminal_cleanup_attribute_failure_does_not_strand_lock(self):
         def factory(*args):

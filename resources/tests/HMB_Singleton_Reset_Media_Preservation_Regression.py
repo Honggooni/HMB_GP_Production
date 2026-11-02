@@ -3,8 +3,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
+import tempfile
 import types
 import uuid
 
@@ -12,6 +14,15 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# This reset contract exercises retained rows, not a mapped production share.
+# A real P: mapping can resolve the old fixture literals into UNC metadata IO.
+_fixture_directory = tempfile.TemporaryDirectory(prefix="hmb-reset-media-")
+_fixture_projects = Path(_fixture_directory.name) / "projects"
+_fixture_project = _fixture_projects / "RESET_PROJECT"
+_fixture_project.mkdir(parents=True)
+_previous_projects_root = os.environ.get("HMB_IMAGE_PROJECTS_ROOT")
+os.environ["HMB_IMAGE_PROJECTS_ROOT"] = str(_fixture_projects)
 
 import _hmb_shot_routing as routing
 import HMBImageAssetLibrary as image
@@ -69,16 +80,16 @@ try:
     old_image_state = image._default_state()
     old_image_state.update(
         {
-            "catalog_root": "P:/HMB/Projects",
+            "catalog_root": str(_fixture_projects),
             "projects": [
                 {
                     "project_uid": project_uid,
                     "project_id": "RESET_PROJECT",
                     "name": "RESET_PROJECT",
-                    "path": "P:/HMB/Projects/RESET_PROJECT",
+                    "path": str(_fixture_project),
                 }
             ],
-            "project_root": "P:/HMB/Projects/RESET_PROJECT",
+            "project_root": str(_fixture_project),
             "project_id": "RESET_PROJECT",
             "project_uid": project_uid,
             "manifest_signature": "reset-manifest",
@@ -463,6 +474,11 @@ try:
 finally:
     routing._same_flow_nodes = original_same_flow_nodes
     routing.schedule_post_deletion_reconcile = original_schedule_deletion
+    if _previous_projects_root is None:
+        os.environ.pop("HMB_IMAGE_PROJECTS_ROOT", None)
+    else:
+        os.environ["HMB_IMAGE_PROJECTS_ROOT"] = _previous_projects_root
+    _fixture_directory.cleanup()
 
 
 print("HMB singleton Reset Shot image/Loader media preservation regression: PASS")

@@ -21,6 +21,12 @@ assert.equal(
 assert.match(source, /정책 확인 중…/u);
 assert.match(source, /프롬프트 준비 중…/u);
 assert.match(source, /Agent 실행 중…/u);
+const preparing = widget.hmbAgentState({value:{shot_states:{one:"preparing",bad:"private-path-or-error"}}});
+assert.equal(preparing.shot_states.one,"preparing");
+assert.equal(preparing.shot_states.bad,undefined);
+assert.equal(widget.hmbAgentShotRowState({value:{schema:"hmb-agent-shot-row",version:1,
+  shot:{channel_uuid:"channel",shot_uuid:"one",number:1},status:"preparing"}}).status,"preparing");
+assert.match(source,/소스 준비 중…/u);
 assert.match(source, /select\.disabled = Boolean\(state\.execution_phase\)/u);
 assert.match(source, /data-execution-phase=/u);
 

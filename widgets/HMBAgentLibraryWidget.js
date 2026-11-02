@@ -132,7 +132,7 @@ export function hmbAgentState(props) {
     execution_phase: executionPhase,
     shot_manager: true,
     shot_editor_expanded: state.shot_editor_expanded !== false,
-    shot_states: Object.fromEntries(Object.entries(state.shot_states || {}).filter(([, value]) => ["running", "succeeded", "failed", "cancelled"].includes(value))),
+    shot_states: Object.fromEntries(Object.entries(state.shot_states || {}).filter(([, value]) => ["preparing", "running", "succeeded", "failed", "cancelled"].includes(value))),
     shot_catalog: catalogMatchesChannel ? catalog : {},
     ...(manual ? {manual_rebind:manual} : {}),
     shot: {
@@ -253,9 +253,9 @@ function hmbAgentRows(state) {
   return shots.map((shot) => {
     const selected = shot.shot_uuid === state.shot.shot_uuid;
     const status = state.shot_states[shot.shot_uuid] || "";
-    const running = status === "running";
+    const running = ["preparing", "running"].includes(status);
     return `<div class="agent-shot-row" data-shot-number="${shot.number}" data-active="${selected}" data-agent-row="${hmbAgentEscape(shot.shot_uuid)}">
-      <button type="button" class="agent-shot-tab nodrag" data-agent-select="${hmbAgentEscape(shot.shot_uuid)}" aria-pressed="${selected}"><span class="agent-row-number">${String(shot.number).padStart(2, "0")}</span><b>${hmbAgentEscape(shot.name)}</b><span class="agent-row-status">${({running:"Agent 실행 중…",succeeded:"완료",failed:"실패",cancelled:"취소"})[status] || ""}</span></button>
+      <button type="button" class="agent-shot-tab nodrag" data-agent-select="${hmbAgentEscape(shot.shot_uuid)}" aria-pressed="${selected}"><span class="agent-row-number">${String(shot.number).padStart(2, "0")}</span><b>${hmbAgentEscape(shot.name)}</b><span class="agent-row-status">${({preparing:"소스 준비 중…",running:"Agent 실행 중…",succeeded:"완료",failed:"실패",cancelled:"취소"})[status] || ""}</span></button>
       <button type="button" class="agent-shot-run nodrag" data-agent-run="${hmbAgentEscape(shot.shot_uuid)}" title="${running ? "이 샷 Agent만 취소" : "이 샷 Agent만 실행"}" aria-label="${running ? "Cancel Shot Agent" : "Run Shot Agent"}">${running ? "■" : "▷"}</button>
     </div>`;
   }).join("");
@@ -755,7 +755,7 @@ export function hmbAgentShotRowState(props) {
     request_id:/^[0-9a-f]{32}$/.test(String(raw?.request_id || "")) ? raw.request_id : "",
     ...(/^[0-9a-f]{32}$/.test(String(raw?.rejected_request_id || "")) && raw?.error_code==="SHOT_IDENTITY_UNAVAILABLE"
       ? {rejected_request_id:raw.rejected_request_id,error_code:raw.error_code} : {}),
-    status:["running","succeeded","failed","cancelled"].includes(raw?.status) ? raw.status : ""};
+    status:["preparing","running","succeeded","failed","cancelled"].includes(raw?.status) ? raw.status : ""};
 }
 
 // One Agent manager owns one channel. All five row widgets share this short
@@ -820,8 +820,8 @@ function hmbAgentShotRowWidget(container, initialProps) {
     const own=ticket?.owner===container;
     const current=switching ? {...canonical,selected:own,expanded:own && ticket.expanded} : canonical;
     const recovering=own && ticket?.recovering;
-    const text=canonical.routing_pending ? "샷 연결 확인 중…" : own ? (recovering ? "응답 확인 필요" : switching ? "전환 중…" : "전달 중…") : lastError ? (lastRejected ? "요청 거절됨" : "응답 확인 필요") : ({running:"Agent 실행 중…",succeeded:"완료",failed:"실패",cancelled:"취소"})[current.status] || "";
-    const running=current.status==="running",runText=recovering ? "↻" : running ? "■" : "▷";
+    const text=canonical.routing_pending ? "샷 연결 확인 중…" : own ? (recovering ? "응답 확인 필요" : switching ? "전환 중…" : "전달 중…") : lastError ? (lastRejected ? "요청 거절됨" : "응답 확인 필요") : ({preparing:"소스 준비 중…",running:"Agent 실행 중…",succeeded:"완료",failed:"실패",cancelled:"취소"})[current.status] || "";
+    const running=["preparing","running"].includes(current.status),runText=recovering ? "↻" : running ? "■" : "▷";
     const title=recovering?"현재 상태만 확인합니다. Agent/Run은 다시 실행하지 않습니다.":lastError || (running?"이 샷 Agent만 취소":"이 샷 Agent만 실행");
     const disabled=Boolean(ticket) || Boolean(canonical.routing_pending) || !shot.shot_uuid,runDisabled=disabled && (!recovering || Boolean(canonical.routing_pending));
     // The host may update geometry independently of the authored value.
@@ -878,7 +878,7 @@ function hmbAgentShotRowWidget(container, initialProps) {
     ticket.fallback=setTimeout(dispatch,120);
     ticket.expiry=setTimeout(()=>recover(ticket,new Error("Agent 응답을 확인하지 못했습니다. ↻로 현재 상태를 확인하세요. Agent/Run은 자동 재전송하지 않습니다.")),15000);
   };
-  const selectClick=()=>send("select"),runClick=()=>send(channelEntry()?.pending?.recovering ? "refresh" : hmbAgentShotRowState(props).status==="running"?"cancel_selected":"run_selected");
+  const selectClick=()=>send("select"),runClick=()=>send(channelEntry()?.pending?.recovering ? "refresh" : ["preparing","running"].includes(hmbAgentShotRowState(props).status)?"cancel_selected":"run_selected");
   const keydown=event=>{if(["Backspace","Delete"].includes(event.key))event.stopPropagation?.();};
   const pointerdown=event=>{if(Number(event.button)!==1)event.stopPropagation?.();};
   select.addEventListener("click",selectClick);run.addEventListener("click",runClick);container.addEventListener?.("keydown",keydown);container.addEventListener?.("pointerdown",pointerdown);
@@ -1071,7 +1071,7 @@ function hmbNativeStockSafetyImplementation(container, props) {
     const button = target?.closest?.(".agent-shot-run");
     if (!button) return false;
     const state = hmbAgentShotRowState(props), pending = hmbAgentRowChannels.get(state.shot.channel_uuid)?.pending;
-    return state.status === "running" || Boolean(pending?.recovering && pending.owner === container);
+    return ["preparing","running"].includes(state.status) || Boolean(pending?.recovering && pending.owner === container);
   } });
 }
 

@@ -13,6 +13,7 @@ import re
 import secrets
 import sys
 import threading
+import time
 from typing import Any
 
 
@@ -250,6 +251,67 @@ _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE = (
     "[HMB CONNECTION CHECK FAILED] Prompt 연결 상태를 안전하게 확인할 수 없어 "
     "Agent 실행을 중단했습니다. 연결 상태를 확인한 뒤 재시도하십시오."
 )
+_HMB_SOURCE_PREPARE_TIMEOUT_SECONDS = 30.0
+_HMB_SOURCE_PREPARE_RETRY_SECONDS = 0.1
+_HMB_SOURCE_FAILURE_MESSAGES = {
+    "SOURCE_PREPARATION_TIMEOUT": "소스 준비 확인 시간이 초과되었습니다. 이미지·영상 소스의 준비 상태를 확인한 뒤 다시 실행하세요.",
+    "SOURCE_MEDIA_UNAVAILABLE": "선택한 이미지·영상 소스를 읽을 수 없습니다. 해당 PC의 파일 경로와 접근 권한을 확인하세요.",
+    "SOURCE_SHOT_IDENTITY_MISMATCH": "샷 또는 소스 식별자가 변경되었습니다. 현재 샷과 원본 연결을 확인하세요.",
+    "SOURCE_PROMPT_OWNER_UNAVAILABLE": "원래 연결된 Prompt 또는 소스 노드를 확인할 수 없습니다. 현재 연결을 확인하세요.",
+    "SOURCE_CONNECTION_UNAVAILABLE": "현재 샷의 연결 확인을 완료하지 못했습니다. 연결 상태를 확인하세요.",
+    "SOURCE_VALIDATION_FAILED": "샷 입력 검증을 완료하지 못했습니다. 소스와 샷 설정을 확인하세요.",
+}
+
+
+class _HMBSourcePreparationError(RuntimeError):
+    """A bounded source-stage error, with no paths or payloads in its message."""
+
+    def __init__(self, code):
+        self.code = code if code in _HMB_SOURCE_FAILURE_MESSAGES else "SOURCE_VALIDATION_FAILED"
+        super().__init__(f"[HMB SOURCE CHECK FAILED] Reason: {self.code}. {_HMB_SOURCE_FAILURE_MESSAGES[self.code]}")
+
+
+class _HMBSourcePreparation:
+    """Cancelable reservation, never a native Agent or a saved input value."""
+
+    _hmb_source_preparing = True
+
+    def __init__(self):
+        self._hmb_shot_cancelled = False
+
+
+def _hmb_source_is_preparing(exc):
+    return isinstance(exc, ValueError) and (
+        getattr(exc, "hmb_image_asset_selection_preparing", False) is True
+        or getattr(exc, "hmb_picker_media_preparing", False) is True
+    )
+
+
+def _hmb_source_failure(exc):
+    if isinstance(exc, _HMBSourcePreparationError):
+        return exc
+    # Read only to classify. Never retain or publish the original payload.
+    text = str(exc).casefold()
+    if isinstance(exc, (FileNotFoundError, PermissionError)) or any(part in text for part in (
+        "media is unavailable", "unavailable selected image", "media unavailable", "missing media",
+    )):
+        code = "SOURCE_MEDIA_UNAVAILABLE"
+    elif any(part in text for part in (
+        "different shot", "wrong shot", "shot identity", "shot is no longer", "channel mismatch",
+        "channel or identity", "not in the current imageasset catalog", "identities do not match",
+    )):
+        code = "SOURCE_SHOT_IDENTITY_MISMATCH"
+    elif any(part in text for part in (
+        "owner", "deleted", "no exact imageasset publisher", "source node is unavailable",
+    )):
+        code = "SOURCE_PROMPT_OWNER_UNAVAILABLE"
+    elif "routing" in text or "connection" in text or str(exc) == _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE:
+        code = "SOURCE_CONNECTION_UNAVAILABLE"
+    else:
+        code = "SOURCE_VALIDATION_FAILED"
+    return _HMBSourcePreparationError(code)
+
+
 _PUBLIC_OUTPUT_BLOCKED = (
     "[HMB OUTPUT BLOCKED] Internal Agent state was detected. "
     "Use FINAL TEXT · GENERATOR for display."
@@ -1967,7 +2029,7 @@ class HMBAgentLibrary(_BaseAgent):
         value["shot_states"] = {
             key.split("\x1f", 1)[-1]: str(status)
             for key, status in getattr(self, "_hmb_shot_run_status", {}).items()
-            if status in {"running", "succeeded", "failed", "cancelled"}
+            if status in {"preparing", "running", "succeeded", "failed", "cancelled"}
         }
         manual = getattr(self, "_hmb_manual_rebind", {})
         if isinstance(manual, dict) and manual:
@@ -2414,7 +2476,7 @@ class HMBAgentLibrary(_BaseAgent):
         finally:
             self._hmb_slot_switching = False
 
-    def _hmb_publish_shot_failure(self, key, execution, *, cancelled=False, source_unavailable=False):
+    def _hmb_publish_shot_failure(self, key, execution, *, cancelled=False, source_unavailable=False, failure=None):
         getter = getattr(execution, "_hmb_execution_result_snapshot", None)
         try:
             previous = getter() if callable(getter) else {}
@@ -2422,6 +2484,15 @@ class HMBAgentLibrary(_BaseAgent):
             previous = {}
         if not isinstance(previous, dict):
             previous = {}
+        if not cancelled and isinstance(failure, BaseException) and not previous.get("message"):
+            if execution is None or isinstance(failure, _HMBSourcePreparationError):
+                diagnostic = _hmb_source_failure(failure)
+                previous = {**previous, "code": diagnostic.code, "message": str(diagnostic)}
+                print(f"[HMB_PRODUCTION][ERROR] AGENT_EXECUTION_STAGE=source_preparation CODE={diagnostic.code}")
+            else:
+                code = _hmb_native_failure_code(failure)
+                previous = {**previous, "code": code, "message": _hmb_execution_failure_message(code, stage="native_process")}
+            source_unavailable = False
         code = "CANCELLED" if cancelled else "SOURCE_UNAVAILABLE" if source_unavailable else str(previous.get("code") or "SOURCE_UNAVAILABLE")
         message = ("[HMB EXECUTION CANCELLED] This Shot Agent was cancelled. No new render was submitted."
                    if cancelled else _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE if source_unavailable
@@ -2472,10 +2543,44 @@ class HMBAgentLibrary(_BaseAgent):
             raise RuntimeError(_HMB_TOPOLOGY_UNAVAILABLE_MESSAGE)
         return copy.deepcopy(matches[0])
 
+    async def _hmb_prepare_shot_document(self, *, channel_uuid, shot_uuid, prompt_owner,
+                                       lifecycle_generation, generator=None, preparation=None):
+        """Wait only for typed source preparation, before any model submission.
+
+        Every attempt verifies the same live owner and exact Shot. Never rerun
+        inference, adopt another source, or interpret ordinary failures as waits.
+        """
+        deadline = time.monotonic() + _HMB_SOURCE_PREPARE_TIMEOUT_SECONDS
+        identity = dict(channel_uuid=channel_uuid, shot_uuid=shot_uuid, prompt_owner=prompt_owner,
+                        lifecycle_generation=lifecycle_generation, generator=generator)
+        while True:
+            if preparation is not None and preparation._hmb_shot_cancelled:
+                raise asyncio.CancelledError()
+            try:
+                self._hmb_current_run_subscription(**identity)
+                self._refresh_agent_shot_route(strict=True)
+                self._hmb_current_run_subscription(**identity)
+                document = prompt_owner._hmb_prompt_shot_document(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+                self._hmb_current_run_subscription(**identity)
+                if preparation is not None and preparation._hmb_shot_cancelled:
+                    raise asyncio.CancelledError()
+                return document
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not _hmb_source_is_preparing(exc):
+                    raise _hmb_source_failure(exc) from None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _HMBSourcePreparationError("SOURCE_PREPARATION_TIMEOUT") from None
+                await asyncio.sleep(min(_HMB_SOURCE_PREPARE_RETRY_SECONDS, remaining))
+
     async def _hmb_run_agent_shot(self, *, channel_uuid, shot_uuid, prompt_owner, generator=None):
         lifecycle_generation = int(getattr(self, "_hmb_lifecycle_generation", 0) or 0)
         run_identity = dict(channel_uuid=channel_uuid, shot_uuid=shot_uuid, prompt_owner=prompt_owner,
             lifecycle_generation=lifecycle_generation, generator=generator)
+        # Reject an unowned/unhydrated Run before admitting or publishing any
+        # result. A stale row must not overwrite an existing saved preview.
         self._hmb_current_run_subscription(**run_identity)
         key = self._hmb_slot_key(channel_uuid, shot_uuid)
         lock = self._hmb_shot_execution_locks.setdefault(key, threading.Lock())
@@ -2491,8 +2596,15 @@ class HMBAgentLibrary(_BaseAgent):
             subscription = self._hmb_current_run_subscription(**run_identity)
             if self._hmb_active_slot_key == key:
                 self._hmb_capture_active_slot()
+            preparation = _HMBSourcePreparation()
+            self._hmb_shot_run_status[key] = "preparing"
+            self._hmb_shot_workers[key] = preparation
+            self._hmb_shot_publication_step(key, "preparing_status", self._hmb_publish_shot_status)
+            document = await self._hmb_prepare_shot_document(**run_identity, preparation=preparation)
+            # Preparation may wait while this Shot's future settings are edited.
+            # Capture current authored values only after exact sources are ready.
+            subscription = self._hmb_current_run_subscription(**run_identity)
             slot = copy.deepcopy(self._hmb_shot_slots.get(key) or self._hmb_default_native_slot())
-            document = prompt_owner._hmb_prompt_shot_document(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
             execution = _HMBAgentShotExecution._from_owner(self, prompt_owner, document, subscription, slot, generator)
             self._hmb_shot_run_status[key] = "running"
             self._hmb_shot_workers[key] = execution
@@ -2571,7 +2683,7 @@ class HMBAgentLibrary(_BaseAgent):
                 self._hmb_shot_results.pop(key, None)
             self._hmb_shot_publication_step(key, "failure_publication",
                 lambda: self._hmb_publish_shot_failure(key, execution,
-                    source_unavailable=str(exc) == _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE))
+                    source_unavailable=str(exc) == _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE, failure=exc))
             raise
         finally:
             # Nothing in cleanup or host publication may strand a per-Shot

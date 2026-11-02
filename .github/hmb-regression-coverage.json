@@ -3403,6 +3403,12 @@
       "coverage": "installed_sdk",
       "required": false,
       "reason": "Requires an isolated installed Griptape SDK with current workflow registry/context and native metadata/save handler contracts. Private graph only; generic CI lacks those host APIs."
+    },
+    {
+      "name": "HMB_Agent_Cold_Source_Readiness_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
     }
   ]
 }
