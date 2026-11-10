@@ -86,6 +86,21 @@ class GatewayReviewCapabilities(unittest.TestCase):
         self.portal.capabilities = capabilities(page="/reviews")
         self.assertIsNone(self.bridge.review_capabilities()["retention_days"])
 
+    def test_current_15_30_and_legacy_20_page_sizes_do_not_reject_portal(self):
+        for size in (15, 30, 20):
+            with self.subTest(page_size=size):
+                self.portal.capabilities = {**capabilities(), "page_size": size,
+                    "review_page_sizes": [15, 30] if size != 20 else [20, 30]}
+                self.assertEqual(self.bridge.review_capabilities()["page_size"], size)
+        self.assertTrue(all(call["method"] == "GET" for call in self.portal.public_requests))
+
+    def test_invalid_page_size_types_and_unbounded_values_remain_rejected(self):
+        for size in (None, True, False, 15.0, 30.0, "15", 0, -1, 10, 50, [], {}):
+            with self.subTest(page_size=size):
+                self.portal.capabilities = {**capabilities(), "page_size": size}
+                with self.assertRaises(self.ns["_BrokerProtocolError"]):
+                    self.bridge.review_capabilities()
+
     def test_external_sibling_and_ambiguous_page_routes_are_rejected(self):
         for page in ("https://evil.example/reviews", "https://broker.example/GripTapeServer/reviews",
                      "//evil.example/reviews", "/OtherGateway/reviews", "/GripTapeServer2/reviews",

@@ -2667,7 +2667,7 @@ class _HMBAIBrokerBridge:
                 or result["version"] != 1 or result.get("review_portal") is not True
                 or not isinstance(result.get("page_url"), str)
                 or result["page_url"] not in {"/reviews", mounted_page}
-                or type(result.get("page_size")) is not int or result["page_size"] != 20
+                or type(result.get("page_size")) is not int or result["page_size"] not in (15, 20, 30)
                 or not (retention or manual_retention)):
             raise _BrokerProtocolError("Broker review portal capabilities are unsupported.")
         return result
