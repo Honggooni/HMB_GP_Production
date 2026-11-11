@@ -8,3 +8,7 @@
 4. 적용 전 Desktop 설치본과 HMB Git 태그를 함께 보관한다. 새 버전에 문제가 있으면 공식 설치본으로 복구하고 작업 파일은 기존 위치에서 연다.
 
 Team v0.8.59는 SDK 0.104의 연결과 저장 경로를 복구한다. Editor 0.130 전용 헤더 연동과 실제 화면 검증은 별도로 남아 있다.
+
+## Team v0.8.59 compatibility check
+
+The Team runtime stays on v0.8.59. On SDK 0.104.0, the installed-SDK checks passed for connected-node deletion protection and Prompt workflow save/reopen. The Editor 0.130.0 stock deletion regression also passed. Native Editor integration and interactive Team Desktop use are outside this evidence, so the upgrade preflight still rejects promotion of this editor profile. The Local Rodong Mart overlay is outside the Team runtime.
