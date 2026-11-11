@@ -468,6 +468,31 @@ def _additional_profiles(descriptor: dict) -> list[dict]:
     return result
 
 
+_TEAM_0130_STOCK_ENTRY_SHA256 = "561a68840af19500274dbbb8ef2c46e9ac8a619564e246b8b285137e63569a82"
+_TEAM_0130_CANDIDATE_ENTRY_SHA256 = "8696c149551a9326b9457c2ed353f0cef8e5aa3054e1656e8842ecc42803bbe5"
+_TEAM_0130_SOURCE_SHA256 = "841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e"
+_TEAM_0130_CANDIDATE_SHA256 = "109600be6fc2d6dde89c934bda219a7fbc4be7e4bdcaa9b8c21f5bd091af7d8e"
+
+
+def _team_0130_entry_candidate(original: bytes) -> bytes:
+    if sha256(original) == _TEAM_0130_CANDIDATE_ENTRY_SHA256:
+        return original
+    if sha256(original) != _TEAM_0130_STOCK_ENTRY_SHA256:
+        raise ValueError("Bundled editor entry is outside the reviewed Team layout.")
+    ref = b"./assets/index-B4peacnU.js"
+    versioned = ref + b"?hmb-team=" + _TEAM_0130_CANDIDATE_SHA256[:16].encode("ascii")
+    script = b'<script type="module" crossorigin src="' + ref + b'"></script>'
+    # Lazy chunks import the canonical entry. They must share the versioned
+    # module instance and its stores with the Editor.
+    mapping = b'<script type="importmap">{"imports":{"' + ref + b'":"' + versioned + b'"}}</script>'
+    if original.count(script) != 1:
+        raise ValueError("Bundled editor entry script is ambiguous.")
+    candidate = original.replace(script, mapping + b"\n    " + script.replace(ref, versioned))
+    if sha256(candidate) != _TEAM_0130_CANDIDATE_ENTRY_SHA256:
+        raise ValueError("Bundled editor entry candidate does not match the reviewed bytes.")
+    return candidate
+
+
 def _active_git_profile(descriptor: dict) -> tuple[Path, dict | None] | None:
     """Resolve the editor's actual entry point, then match only reviewed bytes.
 
@@ -477,12 +502,13 @@ def _active_git_profile(descriptor: dict) -> tuple[Path, dict | None] | None:
     root = _release_plain_path(DEFAULT_SOURCE.parent.parent)
     entry = _release_plain_path(root / "index-editor.html")
     # Desktop 0.30 serves Editor 0.130 from its bundled Python distribution.
-    # Only a reviewed stock entry is eligible here. In particular a Local
+    # Only the reviewed stock and Team entries are eligible here. In particular a Local
     # overlay uses its own entry and must not be replaced by Team Override.
     embedded = _release_plain_path(DEFAULT_SOURCE.parents[2] /
         "engine-bundle/python/Lib/site-packages/griptape_nodes_editor_dist/editor/index-editor.html")
     if embedded.is_file():
-        if embedded.stat().st_size > 1024 * 1024 or sha256(embedded.read_bytes()) != "561a68840af19500274dbbb8ef2c46e9ac8a619564e246b8b285137e63569a82":
+        if embedded.stat().st_size > 1024 * 1024 or sha256(embedded.read_bytes()) not in {
+                _TEAM_0130_STOCK_ENTRY_SHA256, _TEAM_0130_CANDIDATE_ENTRY_SHA256}:
             raise ValueError("Bundled editor entry is outside the reviewed Team layout; existing files preserved.")
         entry = embedded
         root = embedded.parent
@@ -491,7 +517,7 @@ def _active_git_profile(descriptor: dict) -> tuple[Path, dict | None] | None:
     if not entry.is_file() or entry.stat().st_size > 1024 * 1024:
         raise ValueError("Invalid installed editor entry HTML.")
     html = entry.read_text("utf-8")
-    matches = re.findall(r'''\bsrc\s*=\s*["']\./assets/(index-[A-Za-z0-9_-]+\.js)["']''', html)
+    matches = re.findall(r'''\bsrc\s*=\s*["']\./assets/(index-[A-Za-z0-9_-]+\.js)(?:\?hmb-team=[0-9a-f]{16})?["']''', html)
     if len(matches) != 1:
         raise ValueError("Installed editor entry must reference one unambiguous JS bundle.")
     target = _release_plain_path(root / "assets" / matches[0])
@@ -1088,8 +1114,20 @@ def _git_override_apply_active_unlocked() -> dict:
                 or evidence.get("candidate_sha256") != expected_candidate
                 or evidence.get("helper_sha256") != descriptor["helper_sha256"]):
             raise ValueError("Native editor adapter approval hashes are stale; existing file preserved.")
+    entry = None
+    entry_before = entry_after = None
+    if profile is not None and source_hash == _TEAM_0130_SOURCE_SHA256:
+        if expected_candidate != _TEAM_0130_CANDIDATE_SHA256:
+            raise ValueError("Team editor candidate does not match the reviewed entry.")
+        entry = _release_plain_path(target.parent.parent / "index-editor.html")
+        entry_before = entry.read_bytes()
+        entry_after = _team_0130_entry_candidate(entry_before)
+        details.update(entry_target=str(entry), entry_original_sha256=sha256(entry_before),
+                       entry_candidate_sha256=sha256(entry_after))
     if original_sha == expected_candidate:
-        return _git_override_result("current", "Pinned editor is already on disk; loaded renderer was not verified.", **details)
+        if entry_before == entry_after:
+            return _git_override_result("current", "Pinned editor is already on disk; loaded renderer was not verified.", **details)
+        candidate = original
     if profile is None:
         candidate = (patch_editor_source(original.decode("utf-8"))[0].encode("utf-8")
                      if original_sha == source_hash else _upgrade_previous_helper(original, descriptor))
@@ -1099,6 +1137,9 @@ def _git_override_apply_active_unlocked() -> dict:
     transaction.mkdir(parents=True, exist_ok=False)
     _atomic_write(transaction / "before.js", original)
     _atomic_write(transaction / "candidate.js", candidate)
+    if entry is not None:
+        _atomic_write(transaction / "before.html", entry_before)
+        _atomic_write(transaction / "candidate.html", entry_after)
     path = transaction / "plan.json"
     plan = {"schema": "hmb-native-editor-git-override-plan", "version": 1,
             **details, "original_sha256": original_sha, "app_identity": app_identity,
@@ -1115,29 +1156,49 @@ def _git_override_apply_active_unlocked() -> dict:
                 or sha256((transaction / "before.js").read_bytes()) != original_sha
                 or sha256((transaction / "candidate.js").read_bytes()) != expected_candidate):
             raise ValueError("Editor or staged bytes changed during preparation; target preserved.")
+        if entry is not None and (entry.read_bytes() != entry_before
+                or (transaction / "before.html").read_bytes() != entry_before
+                or (transaction / "candidate.html").read_bytes() != entry_after):
+            raise ValueError("Editor entry changed during preparation; target preserved.")
     precommit()
     plan = {**plan, "status": "applying"}
     _json_write(path, plan)
     precommit()
     try:
-        _atomic_write(target, candidate)
+        if original_sha != expected_candidate:
+            _atomic_write(target, candidate)
         if sha256(target.read_bytes()) != expected_candidate:
             raise RuntimeError("Installed native editor hash mismatch.")
+        if entry is not None and entry_before != entry_after:
+            if entry.read_bytes() != entry_before:
+                raise ValueError("Editor entry changed before activation.")
+            _atomic_write(entry, entry_after)
+            if entry.read_bytes() != entry_after:
+                raise RuntimeError("Installed editor entry hash mismatch.")
         _json_write(path, {**plan, "status": "applied"})
     except Exception as error:
         current = sha256(_release_plain_path(target).read_bytes())
-        if current == original_sha:
+        current_entry = _release_plain_path(entry).read_bytes() if entry is not None else None
+        if current == original_sha and current_entry == entry_before:
             _json_write(path, {**plan, "status": "pending"})
             if isinstance(error, OSError):
                 return _git_override_result("pending", "Native editor replacement was blocked; original retained. Retry after a normal restart.", reason_code="atomic_replace_blocked", **details)
             raise
-        if current != expected_candidate:
+        if current not in {original_sha, expected_candidate} or current_entry not in {entry_before, entry_after}:
             raise RuntimeError("Native editor changed outside this Git transaction; foreign bytes preserved and rollback refused.") from error
         backup = _release_plain_path(transaction / "before.js").read_bytes()
         if sha256(backup) != original_sha:
             raise RuntimeError("Native editor backup changed; rollback refused.") from error
         try:
-            _atomic_write(target, backup)
+            if entry is not None and current_entry != entry_before:
+                entry_backup = _release_plain_path(transaction / "before.html").read_bytes()
+                if entry_backup != entry_before:
+                    raise RuntimeError("Native editor entry backup changed.")
+                _atomic_write(entry, entry_backup)
+                if entry.read_bytes() != entry_before:
+                    raise RuntimeError("Native editor entry rollback hash mismatch.")
+            if current != original_sha:
+                _atomic_write(target, backup)
             if sha256(target.read_bytes()) != original_sha:
                 raise RuntimeError("Native editor rollback hash mismatch.")
             _json_write(path, {**plan, "status": "rolled_back"})

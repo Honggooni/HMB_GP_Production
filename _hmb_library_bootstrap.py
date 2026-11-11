@@ -215,6 +215,10 @@ def _hmb_native_editor_sources(engine: Any, library_data: Any) -> tuple[Path, Pa
     return root, python, hashes, descriptor
 
 
+_HMB_TEAM_0130_STOCK_ENTRY_SHA256 = "561a68840af19500274dbbb8ef2c46e9ac8a619564e246b8b285137e63569a82"
+_HMB_TEAM_0130_CANDIDATE_ENTRY_SHA256 = "8696c149551a9326b9457c2ed353f0cef8e5aa3054e1656e8842ecc42803bbe5"
+
+
 def _hmb_native_editor_runtime_fingerprint() -> tuple[str, str, str]:
     """Fingerprint the *active* editor, so vendor updates invalidate a cache.
 
@@ -243,13 +247,14 @@ def _hmb_native_editor_runtime_fingerprint() -> tuple[str, str, str]:
         "ai.griptape.nodes.desktop/current/resources/engine-bundle/python/Lib/site-packages/griptape_nodes_editor_dist/editor/index-editor.html")
     if embedded.is_file():
         embedded_html = read_stable(embedded, 1024 * 1024)
-        if hashlib.sha256(embedded_html).hexdigest() != "561a68840af19500274dbbb8ef2c46e9ac8a619564e246b8b285137e63569a82":
+        if hashlib.sha256(embedded_html).hexdigest() not in {
+                _HMB_TEAM_0130_STOCK_ENTRY_SHA256, _HMB_TEAM_0130_CANDIDATE_ENTRY_SHA256}:
             raise LookupError("native_editor_layout_unsupported")
         entry, root = embedded, embedded.parent
     if not entry.is_file():
         raise LookupError("native_editor_layout_unsupported")
     html = read_stable(entry, 1024 * 1024)
-    matches = re.findall(r'''\bsrc\s*=\s*["']\./assets/(index-[A-Za-z0-9_-]+\.js)["']''', html.decode("utf-8"))
+    matches = re.findall(r'''\bsrc\s*=\s*["']\./assets/(index-[A-Za-z0-9_-]+\.js)(?:\?hmb-team=[0-9a-f]{16})?["']''', html.decode("utf-8"))
     if len(matches) != 1:
         raise ValueError("native_editor_entry_ambiguous")
     target = _hmb_native_editor_plain_path(root / "assets" / matches[0])
@@ -370,7 +375,13 @@ def _hmb_coordinate_native_editor_update(owner: Any, engine: Any, library_data: 
         try:
             result = _hmb_native_editor_child(root, python, descriptor)
             final_runtime = _hmb_native_editor_runtime_fingerprint()
-            if (final_runtime[:2] != runtime[:2]
+            team_entry_applied = (
+                result.get("status") == "applied" and final_runtime[0] == runtime[0]
+                and runtime[1] == _HMB_TEAM_0130_STOCK_ENTRY_SHA256
+                and final_runtime[1] == _HMB_TEAM_0130_CANDIDATE_ENTRY_SHA256
+                and result.get("entry_candidate_sha256") == final_runtime[1]
+            )
+            if ((final_runtime[:2] != runtime[:2] and not team_entry_applied)
                     or (result.get("status") in {"current", "applied"}
                         and final_runtime[2] != result.get("candidate_sha256"))
                     or (result.get("status") not in {"current", "applied"}
