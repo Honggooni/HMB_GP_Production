@@ -209,8 +209,10 @@ async def exercise(engine, phase, out):
         state = images._default_state()
         state["shot_routing"].update(channel_uuid=CHANNEL, publisher_instance_uuid=PUBLISHER,
             generation=1, shots=[dict(row, selected_source_uids=[]) for row in SHOTS], active_shot_uuid=SHOTS[0]["shot_uuid"])
-        source.set_parameter_value(images.WIDGET_STATE_PARAMETER, json.dumps(state, ensure_ascii=False), initial_setup=True)
         source._hmb_initial_catalog_scan_pending = False
+        source._resolution_cache_for_state(state)
+        source._cache_shot_routing_snapshot(state, force=True)
+        source._publish_state(state)
         assert source._hmb_shot_channel_subscription()["channel_uuid"] == CHANNEL
         def create(name, mode="only", shot=None):
             value = {t.SEEDANCE_EXECUTION_MODE_METADATA: intent(t, mode, shot), "preserved_literal": {"OFF": False, "zero": 0, "text": "한글 {literal}"}}
@@ -356,8 +358,14 @@ async def exercise(engine, phase, out):
         for source, port in ((standard, "output"), (plain, "text")):
             source.metadata.update(library=schema.name, node_type=type(source).__name__)
             blocked_flow.add_node(source)
-            engine.object_manager.add_object_by_name(source.name, source)
-            engine.node_manager._name_to_parent_flow_name[source.name] = blocked_flow.name
+            current = getattr(engine, "current_workflow_or_none", None)
+            if callable(current):
+                workflow = current()
+                engine.object_manager.add_object_by_name_in(workflow, source.name, source)
+                workflow.nodes.name_to_parent_flow_name[source.name] = blocked_flow.name
+            else:
+                engine.object_manager.add_object_by_name(source.name, source)
+                engine.node_manager._name_to_parent_flow_name[source.name] = blocked_flow.name
             source.parameter_output_values[port] = "Native retained input without model execution"
             edge = dict(source_node_name=source.name, source_parameter_name=port, target_node_name=gen.name, target_parameter_name="prompt")
             send(engine, CreateConnectionRequest(**edge, initial_setup=True))

@@ -358,6 +358,25 @@ def _validate_shots(row: dict, source: Any, target: Any) -> None:
         if workspace.get("workspace_id") != row["workspace_id"] or context.get("workspace_id") != row["workspace_id"]:
             raise ValueError("원본 Image Bash 작업 공간이 변경되었습니다.")
     if row.get("kind") != "remote":
+        # A detached shot-scoped wire may retain its endpoints after the
+        # publisher removes the Shot. The endpoints alone cannot restore it.
+        authority = row.get("authority") or {}
+        if row.get("shots") and authority.get("node_id"):
+            from _hmb_deletion_guard import _remote_catalog, _remote_document
+            from _hmb_shot_routing import _same_flow_nodes, _subscription_for
+            _, peers = _same_flow_nodes(source)
+            publishers = [node for node in peers if _id(node) == authority["node_id"]]
+            if len(publishers) != 1:
+                raise ValueError("원래 샷 목록을 확인할 수 없습니다.")
+            publisher = publishers[0]
+            subscription = _subscription_for(publisher)
+            if subscription is None or not subscription.enabled or subscription.kind != "image_asset":
+                raise ValueError("원래 샷 목록을 확인할 수 없습니다.")
+            catalog = _remote_catalog(subscription, _remote_document(publisher, "HMB_IMAGE_ASSET_STATE"))
+            actual = {(subscription.channel_uuid, shot.get("shot_uuid")) for shot in catalog.get("shots", [])}
+            expected = {(shot.get("channel_uuid"), shot.get("shot_uuid")) for shot in row["shots"]}
+            if catalog.get("publisher_instance_uuid") != authority.get("publisher_instance_uuid") or not expected <= actual:
+                raise ValueError("원본 목록에서 샷이 삭제·변경되어 다시 연결할 수 없습니다.")
         return
     from _hmb_shot_routing import _subscription_for, _manager_shot_subscriptions, _is_shot_manager
     from _hmb_deletion_guard import _remote_catalog, _remote_document
@@ -799,12 +818,23 @@ def install_request_handlers(engine: Any, registration: Any) -> Any:
                 return globals()["HMBNodeConnectionsResultFailure"](result_details=str(exc))
 
         @handles(globals()["HMBGetNodeConnectionsRequest"])
-        def get(self, request):
+        def get(self, request, workflow=None):
             return self.reply(request)
 
         @handles(globals()["HMBManageNodeConnectionsRequest"])
-        def change(self, request):
+        def change(self, request, workflow=None):
             return self.reply(request, True)
+
+    if callable(getattr(engine, "current_workflow_or_none", None)):
+        import inspect
+
+        for callback in (Handlers.get, Handlers.change):
+            signature = inspect.signature(callback)
+            callback.__signature__ = signature.replace(parameters=[
+                parameter.replace(default=inspect.Parameter.empty)
+                if parameter.name == "workflow" else parameter
+                for parameter in signature.parameters.values()
+            ])
 
     handler = Handlers(weakref.ref(registration), weakref.ref(engine))
     engine.event_manager.add_pre_dispatch_hook(handler.protect_detached_ports)

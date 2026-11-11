@@ -14,6 +14,7 @@ import importlib
 import json
 import logging
 import os
+from functools import wraps
 from pathlib import Path
 import socket
 import sys
@@ -45,10 +46,17 @@ def record(name, **facts):
     CASES.append(dict(name=name, passed=True, **facts))
 
 
+def retained_node_names(engine):
+    current = getattr(engine, "current_workflow_or_none", None)
+    if callable(current):
+        return current().nodes.name_to_parent_flow_name
+    return engine.node_manager._name_to_parent_flow_name
+
+
 def edges(engine):
     from griptape_nodes.retained_mode.events.connection_events import ListConnectionsForNodeRequest
     result = set()
-    for name in tuple(engine.node_manager._name_to_parent_flow_name):
+    for name in tuple(retained_node_names(engine)):
         listing = base.send(engine, ListConnectionsForNodeRequest(node_name=name, include_internal=True))
         for edge in listing.outgoing_connections:
             result.add((name, edge.source_parameter_name, edge.target_node_name, edge.target_parameter_name))
@@ -179,7 +187,7 @@ async def exercise(engine, modules, folder, out):
                     broadcast_result=False))
 
             before_metadata = {name:deepcopy(engine.node_manager.get_node_by_name(name).metadata)
-                for name in engine.node_manager._name_to_parent_flow_name}
+                for name in retained_node_names(engine)}
             view = get(agent)
             assert not view.detached and view.can_disconnect and view.connections
             assert before_metadata == {name:deepcopy(engine.node_manager.get_node_by_name(name).metadata) for name in before_metadata}
@@ -274,7 +282,7 @@ async def exercise(engine, modules, folder, out):
             await asyncio.sleep(.06)  # Native detached serializer post hooks release their admission.
             saved_bytes = saved.read_bytes()
             identities = {name:deepcopy(engine.node_manager.get_node_by_name(name).metadata.get("hmb_connection_identity_v1"))
-                for name in engine.node_manager._name_to_parent_flow_name}
+                for name in retained_node_names(engine)}
             recipe = deepcopy(agent.metadata.get("hmb_connection_management_v1"))
             assert recipe and any(identities.values())
             deletion = importlib.import_module("_hmb_deletion_guard")
@@ -415,7 +423,7 @@ async def future_wire_cases(engine, api, schema, library, folder):
     def retained():
         return dict(edges=edges(engine), nodes={name:dict(object=id(node), metadata=deepcopy(node.metadata),
             values=deepcopy(dict(node.parameter_values)), outputs=deepcopy(dict(node.parameter_output_values)))
-            for name in engine.node_manager._name_to_parent_flow_name
+            for name in retained_node_names(engine)
             if isinstance((node:=engine.node_manager.get_node_by_name(name)), FutureHMBConnectionTool)})
 
     source, a, b = make("future source"), make("future target A"), make("future target B")
@@ -429,16 +437,18 @@ async def future_wire_cases(engine, api, schema, library, folder):
     original_delete = manager._request_type_to_manager[DeleteConnectionRequest]
     original_metadata_handler = manager._request_type_to_manager[SetNodeMetadataRequest]
     metadata_writes = []
-    def observe_metadata_write(request):
-        result = original_metadata_handler(request)
+    @wraps(original_metadata_handler)
+    def observe_metadata_write(request, *args, **kwargs):
+        result = original_metadata_handler(request, *args, **kwargs)
         metadata_writes.append(dict(node=request.node_name, values=deepcopy(request.metadata),
             broadcast=request.broadcast_result, succeeded=result.succeeded()))
         return result
     count = [0]
-    def fail_second_delete(request):
+    @wraps(original_delete)
+    def fail_second_delete(request, *args, **kwargs):
         count[0] += 1
         if count[0] == 2: return DeleteConnectionResultFailure(result_details="Injected private native deletion failure")
-        return original_delete(request)
+        return original_delete(request, *args, **kwargs)
     with mock.patch.dict(manager._request_type_to_manager, {DeleteConnectionRequest:fail_second_delete,
             SetNodeMetadataRequest:observe_metadata_write}):
         failed = await manage(source, "disconnect")
@@ -482,10 +492,11 @@ async def future_wire_cases(engine, api, schema, library, folder):
 
     original_create = manager._request_type_to_manager[CreateConnectionRequest]
     count = [0]
-    def fail_second_create(request):
+    @wraps(original_create)
+    def fail_second_create(request, *args, **kwargs):
         count[0] += 1
         if count[0] == 2: return CreateConnectionResultFailure(result_details="Injected private native creation failure")
-        return original_create(request)
+        return original_create(request, *args, **kwargs)
     with mock.patch.dict(manager._request_type_to_manager, {CreateConnectionRequest:fail_second_create}):
         failed = await manage(source, "reconnect")
     assert count[0] >= 2 and not failed.succeeded()
