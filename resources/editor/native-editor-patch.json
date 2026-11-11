@@ -55,9 +55,9 @@
     },
     {
       "source_sha256": "841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e",
-      "candidate_sha256": "9f9acd20731262fbc10f06b184d1817bf88a9532725868e2570c8337c1f475cc",
+      "candidate_sha256": "109600be6fc2d6dde89c934bda219a7fbc4be7e4bdcaa9b8c21f5bd091af7d8e",
       "adapter_path": "tools/hmb_team_editor_0130_connections.py",
-      "adapter_sha256": "5a63814b3f73583f62947f8f646625adccdbe0cc8154155af064b5f4a6a25c11",
+      "adapter_sha256": "f364b39684e0b9f03b00489f0b62902740902cf1cf7fdcd5572aced6285bfa5e",
       "structural_fallback": false
     }
   ]

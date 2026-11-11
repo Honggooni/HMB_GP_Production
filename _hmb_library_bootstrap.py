@@ -128,7 +128,7 @@ def _hmb_native_editor_plain_path(path: Path) -> Path:
 
 
 def _hmb_native_editor_sources(engine: Any, library_data: Any) -> tuple[Path, Path, dict[str, str], dict[str, Any]]:
-    """Only the registered Documents installation may spawn the fixed updater.
+    """Only the registered global-workspace installation may spawn the fixed updater.
 
     Developer checkouts and SDK fixtures exit before opening support files or
     creating a process. No caller can supply an alternative app target.
@@ -136,11 +136,14 @@ def _hmb_native_editor_sources(engine: Any, library_data: Any) -> tuple[Path, Pa
     if getattr(library_data, "name", None) != _LIBRARY_NAME:
         raise LookupError("not_hmb_library")
     root = _hmb_native_editor_plain_path(Path(__file__).parent)
-    documents = _hmb_native_editor_documents_path()
-    expected = Path(os.path.abspath(documents / "GriptapeNodes/libraries/HMB_GP_Production"))
+    configured_workspace = getattr(getattr(engine, "config_manager", None), "configured_global_workspace_path", None)
+    if callable(configured_workspace):
+        workspace = configured_workspace()
+    else:
+        workspace = _hmb_native_editor_documents_path() / "GriptapeNodes"
+    expected = _hmb_native_editor_plain_path(Path(workspace) / "libraries/HMB_GP_Production")
     if os.path.normcase(str(root)) != os.path.normcase(str(expected)):
         raise LookupError("not_installed_library")
-    _hmb_native_editor_plain_path(expected)
     manager = getattr(engine, "library_manager", None)
     lookup = getattr(manager, "get_library_info_by_library_name", None)
     if getattr(manager, "is_worker", None) is not False or not callable(lookup):
