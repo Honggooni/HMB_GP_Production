@@ -51,6 +51,22 @@ EDITOR_SCOPES = {
     "modal_settings": ("function Z4r(e,t,r,i,a={min:0,max:1,step:.01})", ",$4r=.15;"),
 }
 
+# Editor 0.130 loads Image Bash in a separate chunk. The store, launch
+# handler and lazy import stay in the entry bundle and are checked separately
+# so a header-only overlay does not invalidate the Image Bash contract.
+EDITOR_0130_MODAL = "assets/ImageBashModal-BNeRkB32.js"
+EDITOR_0130_MODAL_SHA256 = "8fde79bbd971c814faf07d7da090a2a12cf69964574a6da9eef6ca094bbc8a23"
+EDITOR_0130_ENTRY_SCOPES = {
+    "modal_store": ("aU=Ln()(kh((e,t)=>({modalState:mft", ",hft={isOpen:"),
+    "parameter_launch": ("function gDt(e){let t=(0,X.c)(33),{label:", "function _Dt("),
+    "modal_loader": ("bGt=(0,Y.lazy)(()=>Q(()=>import(`./ImageBashModal-BNeRkB32.js`)", "function wGt(){"),
+}
+EDITOR_0130_ENTRY_DIGESTS = {
+    "modal_store": {"bytes": 1651, "sha256": "ead557b4d9bb50d1a72d300d004bdb4f2b7a3d034f075d2f5a1e29fbd5c75fcc"},
+    "parameter_launch": {"bytes": 1651, "sha256": "fef00add410629578fd505a32cc8f279b00a0dfcba8e0fa82eccd4f49e1430f8"},
+    "modal_loader": {"bytes": 726, "sha256": "8e5ddb72352db18c61199370181b65501e1f8255a0574898836f93863d445f7d"},
+}
+
 # Cache analysis, never admission or file identity. Callers still read/hash
 # current source bytes and resolve the registered Standard/editor each time.
 _ANALYSIS_CACHE: OrderedDict[tuple, tuple] = OrderedDict()
@@ -197,12 +213,19 @@ def resolve_editor_root(editor_root: str | Path | None = None) -> Path | None:
         if not root.is_dir():
             raise ValueError("Configured editor bundle is not a directory")
         return root
-    candidates = [parent / "editor-bundle" for parent in Path(sys.executable).resolve().parents]
+    # Recent Desktop builds serve the editor from the bundled Python
+    # distribution. Prefer that entry over a stale unpacked editor-bundle.
+    site_editor = Path("Lib/site-packages/griptape_nodes_editor_dist/editor")
+    executable = Path(sys.executable).resolve()
+    candidates = [Path(sys.base_prefix) / site_editor, executable.parent / site_editor]
+    legacy = [parent / "editor-bundle" for parent in executable.parents]
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
-        candidates.append(Path(local_app_data) / "ai.griptape.nodes.desktop" / "current" / "resources" / "editor-bundle")
-    for candidate in candidates:
-        if candidate.is_dir() and (candidate / "assets").is_dir():
+        resources = Path(local_app_data) / "ai.griptape.nodes.desktop/current/resources"
+        candidates.append(resources / "engine-bundle/python" / site_editor)
+        legacy.append(resources / "editor-bundle")
+    for candidate in (*candidates, *legacy):
+        if (candidate / "index-editor.html").is_file() and (candidate / "assets").is_dir():
             return candidate.resolve()
     return None
 
@@ -359,6 +382,7 @@ def inspect_standard_compatibility(
     baseline_path: str | Path | None = None,
     editor_root: str | Path | None = None,
     require_editor: bool = True,
+    inspect_editor: bool = True,
 ) -> dict[str, Any]:
     """Return JSON-safe diagnostics; never import or modify upstream source."""
     result: dict[str, Any] = {
@@ -405,8 +429,11 @@ def inspect_standard_compatibility(
             errors.append("ImageBash image/brush scene collections changed")
         if contract != approved.get("contract"):
             errors.append("ImageBash source structure changed; preserve/migrate saved metadata before approval")
-        editor = resolve_editor_root(editor_root)
-        if editor is None:
+        editor = resolve_editor_root(editor_root) if inspect_editor else None
+        if not inspect_editor:
+            if require_editor:
+                errors.append("Editor inspection is required")
+        elif editor is None:
             result["editor"] = {"status": "unavailable"}
             if require_editor:
                 errors.append("The actual editor bundle is unavailable; editor compatibility is unverified")
@@ -427,6 +454,17 @@ def inspect_standard_compatibility(
                 except ValueError as exc:
                     reasons.append(str(exc))
             observed = {"sha256": full_hash}
+            if accepted is None and "./ImageBashModal-BNeRkB32.js" in source:
+                try:
+                    scopes = _editor_contract_cached(source, EDITOR_0130_ENTRY_SCOPES, full_hash)
+                    if scopes != EDITOR_0130_ENTRY_DIGESTS:
+                        raise ValueError("Image Bash 0.130 entry contract changed")
+                    modal = _inside(editor, EDITOR_0130_MODAL)
+                    if hashlib.sha256(modal.read_bytes()).hexdigest() != EDITOR_0130_MODAL_SHA256:
+                        raise ValueError("Image Bash 0.130 modal chunk changed")
+                    accepted = ({"id": "editor-0130-lazy-image-bash"}, scopes)
+                except (OSError, ValueError) as exc:
+                    reasons.append(str(exc))
             if accepted is None:
                 result["editor"] = {"status": "changed", "root": str(editor), "active_bundle": relative,
                                     "bundles": {relative: observed}, "observations": []}
@@ -460,6 +498,7 @@ def load_builtin_image_bash(
     baseline_path: str | Path | None = None,
     editor_root: str | Path | None = None,
     require_editor: bool = True,
+    inspect_editor: bool = True,
 ) -> type:
     """Return the exact registered built-in class, after read-only approval checks.
 
@@ -468,7 +507,8 @@ def load_builtin_image_bash(
     would affect unrelated Standard nodes and is deliberately avoided.
     """
     diagnostics = require_standard_compatibility(
-        standard_root, baseline_path=baseline_path, editor_root=editor_root, require_editor=require_editor,
+        standard_root, baseline_path=baseline_path, editor_root=editor_root,
+        require_editor=require_editor, inspect_editor=inspect_editor,
     )
     root = Path(diagnostics["standard"]["root"])
     expected = _inside(root, SOURCE_RELATIVE)

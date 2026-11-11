@@ -182,7 +182,7 @@ def _hmb_native_editor_sources(engine: Any, library_data: Any) -> tuple[Path, Pa
         required = {"source_sha256", "candidate_sha256", "adapter_path", "adapter_sha256", "structural_fallback"}
         if (not isinstance(profile, dict) or not required.issubset(profile)
                 or set(profile) - required - {"previous_candidate_sha256"}
-                or profile.get("adapter_path") != "tools/hmb_native_semantic_adapter.py"
+                or profile.get("adapter_path") not in {"tools/hmb_native_semantic_adapter.py", "tools/hmb_team_editor_0130_connections.py"}
                 or type(profile.get("structural_fallback")) is not bool):
             raise ValueError("native_support_profile_invalid")
         for key in ("source_sha256", "candidate_sha256", "adapter_sha256"):
@@ -236,6 +236,13 @@ def _hmb_native_editor_runtime_fingerprint() -> tuple[str, str, str]:
             raise ValueError("native_editor_file_changed_during_read")
         return encoded
 
+    embedded = _hmb_native_editor_plain_path(Path(local) /
+        "ai.griptape.nodes.desktop/current/resources/engine-bundle/python/Lib/site-packages/griptape_nodes_editor_dist/editor/index-editor.html")
+    if embedded.is_file():
+        embedded_html = read_stable(embedded, 1024 * 1024)
+        if hashlib.sha256(embedded_html).hexdigest() != "561a68840af19500274dbbb8ef2c46e9ac8a619564e246b8b285137e63569a82":
+            raise LookupError("native_editor_layout_unsupported")
+        entry, root = embedded, embedded.parent
     if not entry.is_file():
         raise LookupError("native_editor_layout_unsupported")
     html = read_stable(entry, 1024 * 1024)

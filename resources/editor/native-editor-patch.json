@@ -8,7 +8,7 @@
   "helper_path": "resources/editor/hmb-color-lut-native-header.js",
   "helper_sha256": "709aa28865aacc42b0640d9a09bd0d490ca6f98a16ed441b6182b3339dcde4a6",
   "patcher_path": "tools/hmb_color_lut_native_header_patch.py",
-  "patcher_sha256": "b2daaa57333e74251916c23a952103b64b6c2bcdab4e8a52d5e5142fdf52879c",
+  "patcher_sha256": "633c4016e6823249eb32b637aefe5c04efce7b027bc7d99979ba2c545acb510b",
   "previous_candidates": [
     {
       "bundle_sha256": "984a974edb6b7218b2ff5deb35eaffcf2979fcf6d8ccd5d5c2ca5fbb1fc15552",
@@ -52,6 +52,13 @@
         "c9d95e131cce8db713447a1196c273edb4e5377e24efc4d7f94ca4715e3dc02f",
         "d208403e7463adac2b3f778151aab55d3709892460460e8142fae8e91add4fbe"
       ]
+    },
+    {
+      "source_sha256": "841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e",
+      "candidate_sha256": "9f9acd20731262fbc10f06b184d1817bf88a9532725868e2570c8337c1f475cc",
+      "adapter_path": "tools/hmb_team_editor_0130_connections.py",
+      "adapter_sha256": "5a63814b3f73583f62947f8f646625adccdbe0cc8154155af064b5f4a6a25c11",
+      "structural_fallback": false
     }
   ]
 }

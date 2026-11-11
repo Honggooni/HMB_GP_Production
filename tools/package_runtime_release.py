@@ -18,8 +18,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.8.59"
-RELEASE_VERSION = "0.8.59"
+RELEASE_LABEL = "v0.8.61"
+RELEASE_VERSION = "0.8.61"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -107,6 +107,9 @@ DISTRIBUTION_ONLY_FILES = (
     "SBOM.spdx.json",
     "tools/hmb_color_lut_native_header_patch.py",
     "tools/hmb_native_semantic_adapter.py",
+    "tools/hmb_team_editor_0130_connections.py",
+    "tools/hmb_editor_0130_header.py",
+    "resources/editor/hmb-header-0130.js",
     "resources/editor/hmb-color-lut-native-header.js",
     "resources/editor/native-editor-patch.json",
 )
@@ -120,7 +123,7 @@ CANONICAL_LF_SOURCE_FILES = {
     if PurePosixPath(relative).suffix.casefold() in {".py", ".js", ".json", ".md"}
     or relative == "LICENSE"
 }
-if len(RUNTIME_INSTALL_FILES) != 60 or len(DISTRIBUTION_ONLY_FILES) != 8:
+if len(RUNTIME_INSTALL_FILES) != 60 or len(DISTRIBUTION_ONLY_FILES) != 11:
     raise RuntimeError("Runtime/distribution release boundary count mismatch.")
 if set(RUNTIME_INSTALL_FILES) & set(DISTRIBUTION_ONLY_FILES):
     raise RuntimeError("Runtime and distribution-only release files overlap.")
@@ -310,7 +313,7 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
         }
         if (not isinstance(profile, dict) or not required.issubset(profile)
             or set(profile) - required - {"previous_candidate_sha256"}
-            or profile["adapter_path"] != "tools/hmb_native_semantic_adapter.py"
+            or profile["adapter_path"] not in {"tools/hmb_native_semantic_adapter.py", "tools/hmb_team_editor_0130_connections.py"}
             or profile["structural_fallback"] is not False):
             raise RuntimeError("Native editor adapter profile is invalid.")
         for field in ("source_sha256", "candidate_sha256", "adapter_sha256"):

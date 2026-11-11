@@ -39,7 +39,9 @@ from _hmb_image_bash_compat import load_builtin_image_bash, require_standard_com
 from _hmb_image_bash_render import render_scene
 from _hmb_image_bash_state import sync_scene, scene_fingerprint, validate_png_bytes
 
-_StockImageBash = load_builtin_image_bash()
+# Restore the saved node even when the browser editor still needs review.
+# Apply, Run and completed-output restoration check the editor separately.
+_StockImageBash = load_builtin_image_bash(require_editor=False, inspect_editor=False)
 CONTEXT_SCHEMA = "hmb-image-bash-inputs-v1"
 RECEIPT_SCHEMA = "hmb-image-bash-apply-v1"
 HEADER_PARAMETER = "HMB_IMAGE_BASH_UI"

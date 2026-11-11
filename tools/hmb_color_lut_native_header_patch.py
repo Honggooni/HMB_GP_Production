@@ -457,7 +457,7 @@ def _additional_profiles(descriptor: dict) -> list[dict]:
                 or len(set(previous)) != len(previous)
                 or any(item in seen or item in (profile["source_sha256"], profile["candidate_sha256"]) for item in previous)):
             raise ValueError("Invalid previous native editor adapter candidates.")
-        if profile["adapter_path"] != "tools/hmb_native_semantic_adapter.py":
+        if profile["adapter_path"] not in {"tools/hmb_native_semantic_adapter.py", "tools/hmb_team_editor_0130_connections.py"}:
             raise ValueError("Unsupported native editor adapter path.")
         path = _release_plain_path(REPO / profile["adapter_path"])
         if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024 or sha256(path.read_bytes()) != profile["adapter_sha256"]:
@@ -476,6 +476,16 @@ def _active_git_profile(descriptor: dict) -> tuple[Path, dict | None] | None:
     """
     root = _release_plain_path(DEFAULT_SOURCE.parent.parent)
     entry = _release_plain_path(root / "index-editor.html")
+    # Desktop 0.30 serves Editor 0.130 from its bundled Python distribution.
+    # Only a reviewed stock entry is eligible here. In particular a Local
+    # overlay uses its own entry and must not be replaced by Team Override.
+    embedded = _release_plain_path(DEFAULT_SOURCE.parents[2] /
+        "engine-bundle/python/Lib/site-packages/griptape_nodes_editor_dist/editor/index-editor.html")
+    if embedded.is_file():
+        if embedded.stat().st_size > 1024 * 1024 or sha256(embedded.read_bytes()) != "561a68840af19500274dbbb8ef2c46e9ac8a619564e246b8b285137e63569a82":
+            raise ValueError("Bundled editor entry is outside the reviewed Team layout; existing files preserved.")
+        entry = embedded
+        root = embedded.parent
     if not entry.exists():
         raise ValueError("Installed editor entry HTML is missing; existing files preserved.")
     if not entry.is_file() or entry.stat().st_size > 1024 * 1024:
@@ -654,13 +664,23 @@ def _release_sdk_preflight() -> dict:
                             "on_remove_node_from_node_group_request")
     if not set(guarded_node_methods) <= node_methods:
         raise ValueError(prefix + "Missing node lookup or guarded delete/reset capability.")
+    workflow_scoped = any(
+        isinstance(node, ast.ClassDef) and node.name == "Engine"
+        and any(isinstance(method, ast.FunctionDef) and method.name == "current_workflow_or_none" for method in node.body)
+        for node in trees["engine"].body
+    )
     for name in guarded_node_methods:
         method = next(n for n in node_managers[0].body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name)
         args = method.args
         positional = args.posonlyargs + args.args
-        if len(positional) < 2 or len(positional) - len(args.defaults) > 2 or any(value is None for value in args.kw_defaults):
+        required_count = len(positional) - len(args.defaults)
+        scoped_request = (workflow_scoped and required_count == 3
+                          and positional[2].arg == "workflow"
+                          and positional[1].arg == "request")
+        if len(positional) < 2 or (required_count > 2 and not scoped_request) or any(value is None for value in args.kw_defaults):
             raise ValueError(prefix + "Guarded node method must accept its request/name: " + name)
-    if not any(isinstance(n, ast.Attribute) and n.attr == "_name_to_parent_flow_name" for n in ast.walk(node_managers[0])):
+    inventory = "name_to_parent_flow_name" if workflow_scoped else "_name_to_parent_flow_name"
+    if not any(isinstance(n, ast.Attribute) and n.attr == inventory for n in ast.walk(node_managers[0])):
         raise ValueError(prefix + "Missing retained-node inventory capability.")
     required_payloads = {
         "node_events": {"DeleteNodeRequest", "DeleteNodeResultFailure", "ResetNodeToDefaultsRequest", "ResetNodeToDefaultsResultFailure", "MoveNodeToNewFlowRequest", "MoveNodeToNewFlowResultFailure",
