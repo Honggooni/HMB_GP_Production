@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+from hashlib import sha256
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -35,8 +37,6 @@ def main() -> int:
         (report_dir / (name + ".log")).write_text(result.stdout + result.stderr, encoding="utf-8")
         results[name] = result.returncode == 0
 
-    from hashlib import sha256
-    import os
     resources = Path(os.environ["LOCALAPPDATA"]) / "ai.griptape.nodes.desktop/current/resources"
     legacy_entry = resources / "editor-bundle/index-editor.html"
     if legacy_entry.is_file():
@@ -57,11 +57,33 @@ def main() -> int:
     else:
         editor_reviewed = False
 
-    report = {"sdk": sdk, "sdk_checks": results, "editor_bundle_reviewed": editor_reviewed,
+    stock_result = None
+    try:
+        editor = importlib.metadata.distribution("griptape-nodes-editor-dist")
+    except importlib.metadata.PackageNotFoundError:
+        editor = None
+    if editor is not None and editor.version == "0.130.0":
+        source = editor.locate_file("griptape_nodes_editor_dist/editor/assets/index-B4peacnU.js")
+        test = ROOT / "resources/tests/HMB_Native_Stock_Deletion_Safety_Browser_Regression.mjs"
+        evidence = report_dir / "stock-editor-deletion.json"
+        try:
+            run = subprocess.run(
+                ["node", str(test), "--evidence-path", str(evidence)],
+                cwd=ROOT, env={**os.environ, "HMB_STOCK_EDITOR_0130_SOURCE": str(source)},
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+            )
+            (report_dir / "stock-editor-deletion.log").write_text(run.stdout + run.stderr, encoding="utf-8")
+            stock_result = run.returncode == 0
+        except (OSError, subprocess.TimeoutExpired) as error:
+            (report_dir / "stock-editor-deletion.log").write_text(str(error), encoding="utf-8")
+            stock_result = False
+
+    report = {"sdk": sdk, "sdk_checks": results, "editor_version": editor.version if editor else None,
+              "editor_bundle_reviewed": editor_reviewed, "stock_deletion_safety": stock_result,
               "desktop_interaction_checked": False}
     (report_dir / "upgrade-check.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report))
-    return 0 if all(results.values()) and editor_reviewed else 1
+    return 0 if all(results.values()) and editor_reviewed and stock_result is not False else 1
 
 
 if __name__ == "__main__":

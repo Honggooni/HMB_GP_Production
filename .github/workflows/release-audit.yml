@@ -165,6 +165,17 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_REGRESSION_PYTHON=$python"
           Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_NATIVE_HEADER_PYTHON=$python"
           Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_IMAGE_BASH_WORKSPACE_PYTHON=$python"
+      - name: Check stock deletion protection on Editor 0.130.0
+        shell: pwsh
+        run: |
+          $wheel = Join-Path $env:RUNNER_TEMP 'griptape_nodes_editor_dist-0.130.0-py3-none-any.whl'
+          $url = 'https://files.pythonhosted.org/packages/58/68/95d652863a4b58c25330eae41c70d0f595a6324a6bbc4c9449aeffcc4ea1/griptape_nodes_editor_dist-0.130.0-py3-none-any.whl'
+          Invoke-WebRequest -Uri $url -OutFile $wheel
+          if ((Get-FileHash $wheel -Algorithm SHA256).Hash -ine 'c62f74dcd6c72b6484b43404349ce3b1d900cbdcd5d9d975fdfbf54b0dae3374') { throw 'Editor wheel hash mismatch' }
+          $env:HMB_STOCK_EDITOR_0130_SOURCE = Join-Path $env:RUNNER_TEMP 'stock-editor-0130.js'
+          python -c "import pathlib,sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); pathlib.Path(sys.argv[2]).write_bytes(z.read('griptape_nodes_editor_dist/editor/assets/index-B4peacnU.js'))" $wheel $env:HMB_STOCK_EDITOR_0130_SOURCE
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node resources/tests/HMB_Native_Stock_Deletion_Safety_Browser_Regression.mjs --evidence-path "${{ runner.temp }}/hmb-coverage/stock-editor/stock-editor-0130.json"
       - name: JavaScript widget regressions with required browser coverage
         shell: pwsh
         run: python tools/audit_regression_coverage.py --run javascript --report "${{ runner.temp }}/hmb-coverage/javascript.json"
@@ -190,7 +201,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: hmb-regression-coverage-${{ github.run_id }}
-          path: ${{ runner.temp }}/hmb-coverage/*.json
+          path: |
+            ${{ runner.temp }}/hmb-coverage/*.json
+            ${{ runner.temp }}/hmb-coverage/stock-editor/*.json
           if-no-files-found: warn
           retention-days: 30
       - name: Summarize actual regression coverage

@@ -15,8 +15,20 @@ const source=sources[0]+'\nexport {hmbAcquireNativeStockSafety,hmbNativeStockSaf
 const browser=await playwright.chromium.launch({executablePath:process.env.HMB_WIDGET_TEST_BROWSER||'C:/Program Files/Google/Chrome/Application/chrome.exe',headless:true});
 const cases=[],errors=[],report={schema:'hmb-native-stock-deletion-safety/v1',passed:false,cases,paid_calls:0,live_app_calls:0,external_requests:0,source_sha256:names.map((name,i)=>({file:name,sha256:createHash('sha256').update(sources[i]).digest('hex')}))};
 const sync=spawnSync(regressionPython(root),['-B',path.join(root,'tools/sync_hmb_native_stock_safety.py'),'--check'],{cwd:root,encoding:'utf8'});assert.equal(sync.status,0,sync.stdout+sync.stderr);
-const stock=readNativeEditorSource(root);const start=stock.indexOf('bn=(0,S.useCallback)(e=>{let t=E.current,r=t?e.map'),end=stock.indexOf(',xn=(0,S.useCallback)',start);assert.ok(start>0&&end>start);const callback=stock.slice(start+3,end);
-const fa=stock.indexOf('o=m(`DeleteNodeResultFailure`,'),fb=stock.indexOf(',s=m(`DeleteConnectionResultSuccess`',fa);assert.ok(fa>0&&fb>fa);const failure=stock.slice(fa+2,fb);
+const newEditorPath=process.env.HMB_STOCK_EDITOR_0130_SOURCE;
+const newEditor=Boolean(newEditorPath);
+const bytes=newEditor?fs.readFileSync(newEditorPath):Buffer.from(readNativeEditorSource(root),'utf8');
+report.editor_source_sha256=createHash('sha256').update(bytes).digest('hex');
+if(newEditor)assert.equal(report.editor_source_sha256,'841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e');
+const stock=bytes.toString('utf8');
+const startAnchor=newEditor?'(S=e=>{let t=c.current,a=t?e.map':'bn=(0,S.useCallback)(e=>{let t=E.current,r=t?e.map';
+const endAnchor=newEditor?',t[0]=g,t[1]=h,t[2]=v,t[3]=_':',xn=(0,S.useCallback)';
+const start=stock.indexOf(startAnchor),end=stock.indexOf(endAnchor,start);
+assert.ok(start>0&&end>start&&stock.indexOf(startAnchor,start+1)<0);
+const callback=stock.slice(start+3,end);
+const fa=stock.indexOf(newEditor?'L=r(`DeleteNodeResultFailure`,':'o=m(`DeleteNodeResultFailure`,');
+const fb=stock.indexOf(newEditor?',R=r(`SetNodeMetadataResultSuccess`':',s=m(`DeleteConnectionResultSuccess`',fa);
+assert.ok(fa>0&&fb>fa);const failure=stock.slice(fa+2,fb);
 try{
  const page=await browser.newPage();page.on('pageerror',e=>errors.push(e.message));await page.route('**/*',r=>{report.external_requests++;return r.abort();});
  await page.setContent(`<main class="react-flow"><div class="react-flow__node selected" data-id="HMB_A"><button data-trash><svg class="lucide lucide-trash"></svg></button><div data-widget><button data-inner-trash><svg class="lucide lucide-trash"></svg></button><input data-input value="keep text"></div></div><div class="react-flow__node" data-id="Standard"><button data-standard-trash><svg class="lucide lucide-trash"></svg></button></div><div class="react-flow__node react-flow__node-GroupNode" data-id="Group"></div><div class="react-flow__panel"><button data-batch><svg class="lucide lucide-trash"></svg></button></div></main><div data-menu><button>Delete Node <span>Del</span></button></div><aside><button data-setting-delete><svg class="lucide lucide-trash"></svg>Delete secret</button></aside>`);
@@ -49,18 +61,24 @@ try{
  await check('native_rename_while_widget_unmounted_preserves_same_outer_identity_protection',async()=>{await page.evaluate(()=>node.setAttribute('data-id','Renamed_HMB'));await page.locator('[data-trash]').click();assert.equal(await page.evaluate(()=>counts.native),2);await page.getByRole('button',{name:'확인',exact:true}).click();});
  await check('actual_outer_node_removed_releases_last_capture_observer_and_status',async()=>{await page.evaluate(()=>node.remove());await page.waitForFunction(()=>document.__HMB_NATIVE_STOCK_SAFETY_V1__===undefined);assert.equal(await page.locator('[data-hmb-native-safety-status]').count(),0);assert.deepEqual(await page.evaluate(()=>guardListeners.remove.slice().sort()),['click','contextmenu','keydown']);await page.locator('[data-standard-trash]').click();assert.equal(await page.evaluate(()=>counts.native),3);});
  await check('exact_pristine_stock_callback_reproduces_optimistic_remove_before_failure',async()=>{
-  const actual=await page.evaluate(({callback,failure})=>{
+  const actual=await page.evaluate(({callback,failure,newEditor})=>{
    window.makeStock=()=>{
     const nodes=[{id:'ExactHMB',type:'CustomNode',data:{metadata:{library:'HMB_GP_Production'}}}],calls=[],clears=[];
     const env={console:{error(){}},S:{useCallback:fn=>fn},E:{current:null},w:{current:nodes},b:nodes,N:{showHelperLines:false},Ct:{current:{}},
      Xd:{send:(name,args)=>calls.push([name,args])},Dt:id=>clears.push(id),Et:()=>clears.push('pending-edits'),
      C:changes=>{for(const row of changes)if(row.type==='remove'){const i=nodes.findIndex(n=>n.id===row.id);if(i>=0)nodes.splice(i,1);}},
      x(){},yn(){},on(){},Zt(){},A(){},Ve(){},Ue(){},ze(){throw Error('Unexpected group')},ut(){throw Error('Unexpected dot')},m:(_name,fn)=>fn};
+    if(newEditor)Object.assign(env,{
+     r:(_name,fn)=>fn,c:{current:null},i:{current:nodes},o:{showHelperLines:false},
+     kUt:row=>row.type==='dimensions',OUt:row=>row.type==='remove',
+     DUt:row=>row.type==='position',EUt:row=>row.type==='dimensions',
+     TUt:row=>row.id,nO:()=>false,$D:()=>false,yn:env.Xd,g:env.Dt,h:env.Et,l:env.C,
+    });
     return{nodes,calls,clears,handler:Function('env',`with(env){return (${callback});}`)(env),failure:Function('env',`with(env){return (${failure});}`)(env)};
    };
    const f=makeStock();f.handler([{type:'remove',id:'ExactHMB'}]);f.failure({result_details:'HMB_DELETE_CONNECTED'},{node_name:'ExactHMB'});
    return{removed:f.nodes.length===0,sent:f.calls[0][0],clears:f.clears};
-  },{callback,failure});
+  },{callback,failure,newEditor});
   assert.deepEqual(actual,{removed:true,sent:'DeleteNodeRequest',clears:['ExactHMB','pending-edits']});
  });
  await check('capture_prevents_exact_stock_callback_and_cache_mutation_before_request',async()=>{
