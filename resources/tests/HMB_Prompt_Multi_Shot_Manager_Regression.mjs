@@ -338,9 +338,56 @@ try {
       assert.deepEqual(initialSize.hydratedUserResize,{width:1120,height:780},'Hydrated legacy nodes retain subsequent user resizing.');
     }
   }
+  // Team v0.8.61 hid the whole editor while a reopened Prompt waited for
+  // the verified ImageAsset catalog. Preserve the same control on recovery.
+  await page.evaluate(({ fixture, textKey }) => {
+    document.querySelector('#zoom').style.transform = '';
+    const raw = window.widget.normalizeState(fixture);
+    raw.text[textKey] = 'Saved text during source discovery';
+    raw.image_asset.shot_catalog_routing = {};
+    window.start(raw);
+  }, { fixture, textKey });
+  const recoveryField = page.locator(`[data-text-key="${textKey}"]`);
+  assert.equal(await page.locator("[data-prompt-shot]").count(), 0, "Unverified catalog cannot create tabs.");
+  assert.equal(await page.locator(".prompt-shot-empty").isVisible(), true);
+  assert.equal(await recoveryField.isVisible(), true);
+  assert.equal(await recoveryField.inputValue(), "Saved text during source discovery");
+  await recoveryField.fill("Edited while waiting 한글");
+  await page.waitForFunction(key => window.latest.text[key] === "Edited while waiting 한글", textKey);
+  await page.evaluate(catalog => {
+    window.preRecoveryControl = document.querySelector("[data-text-key]");
+    const next = structuredClone(window.latest);
+    next.image_asset.shot_catalog_routing = catalog;
+    next.source_sync_revision += 1;
+    window.latest = next;
+    window.controller.update(window.props(next));
+  }, fixture.image_asset.shot_catalog_routing);
+  await page.waitForFunction(() => document.querySelectorAll("[data-prompt-shot]").length === 5);
+  assert.equal(await page.locator(".prompt-shot-empty").count(), 0);
+  assert.equal(await page.locator(".center").count(), 1);
+  assert.equal(await recoveryField.inputValue(), "Edited while waiting 한글");
+  assert.equal(await page.evaluate(() => window.preRecoveryControl === document.querySelector("[data-text-key]")), true);
+  assert.equal(await page.locator('[aria-selected="true"]').getAttribute("data-prompt-shot"), shots[0].shot_uuid);
+  await page.evaluate(() => {
+    window.start({ multi_shot_enabled: true });
+  });
+  assert.equal(await page.locator("[data-prompt-shot]").count(), 0);
+  await recoveryField.fill("Independent draft");
+  await page.waitForFunction(key => window.latest.text?.[key] === "Independent draft", textKey);
+  await page.evaluate(({ image_asset, shot }) => {
+    const next = structuredClone(window.latest);
+    next.image_asset = image_asset;
+    next.source_sync_revision += 1;
+    window.widget.hmbSwitchPromptShot(next, shot.shot_uuid);
+    window.latest = next;
+    window.controller.update(window.props(next));
+  }, fixture);
+  await page.waitForFunction(() => document.querySelectorAll("[data-prompt-shot]").length === 5);
+  assert.equal(await recoveryField.inputValue(), "Independent draft");
+  assert.equal(await page.locator(".center").count(), 1);
   assert.equal(externalRequests, 0);
   assert.deepEqual(failures, []);
-  console.log("HMB Prompt multi Shot browser: PASS (5 independent touch tabs and clear active colors, one editor, 1800×1350px restored/new defaults across zoom, subsequent custom sizes, 4 resize/zoom states with VFX reachable, Korean IME/caret, exact echo callback/disabled/draft/source guards, 25 identical props cause 0 publications/mutations; external requests 0)");
+  console.log("HMB Prompt multi Shot browser: PASS (5 independent touch tabs and clear active colors, one editor, 1800×1350px restored/new defaults across zoom, subsequent custom sizes, 4 resize/zoom states with VFX reachable, cold unverified catalog and draft recovery, Korean IME/caret, exact echo callback/disabled/draft/source guards, 25 identical props cause 0 publications/mutations; external requests 0)");
 } finally {
   await browser.close();
   await new Promise((resolve) => server.close(resolve));

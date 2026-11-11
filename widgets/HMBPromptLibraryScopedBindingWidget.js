@@ -6338,12 +6338,15 @@ function renderPromptShotRows(state, editorMarkup = "") {
   if (!state.multi_shot_enabled) return "";
   const catalog = hmbPromptVerifiedShotCatalog(state);
   const selected = normalizeShotSelection(state.shot);
-  if (!catalog.length) return `<div class="prompt-shot-list nodrag"><div class="prompt-shot-empty">${escapeHtml(uiLanguage(state) === "ko" ? "ImageAsset 프로젝트의 샷을 연결하세요." : "Connect an ImageAsset project Shot.")}</div></div>`;
-  return `<div class="prompt-shot-list nodrag" role="tablist" aria-label="Prompt Shots">${catalog.map((shot) => {
-    const active = shot.shot_uuid === selected.shot_uuid;
+  const hasActiveShot = catalog.some((shot) => (
+    shot.shot_uuid === selected.shot_uuid && shot.channel_uuid === selected.channel_uuid
+  ));
+  const fallback = hasActiveShot ? "" : `<section class="prompt-shot-section" data-shot-uuid="" data-prompt-editor-fallback="${escapeHtml(selected.shot_uuid)}">${!catalog.length ? `<div class="prompt-shot-empty" role="status">${escapeHtml(uiLanguage(state) === "ko" ? "샷 연결 대기 중 · 편집은 계속할 수 있습니다. 연결 관리에서 ImageAsset 연결을 확인하세요." : "Waiting for Shot connection. You can keep editing. Check ImageAsset in Connection Management.")}</div>` : ""}${editorMarkup ? `<div class="prompt-shot-content" data-shot-editor="${escapeHtml(selected.shot_uuid)}">${editorMarkup}</div>` : ""}</section>`;
+  return `<div class="prompt-shot-list nodrag"${catalog.length ? ' role="tablist" aria-label="Prompt Shots"' : ""}>${catalog.map((shot) => {
+    const active = hasActiveShot && shot.shot_uuid === selected.shot_uuid;
     const expanded = active;
     return `<section class="prompt-shot-section" data-shot-uuid="${escapeHtml(shot.shot_uuid)}"><button type="button" role="tab" title="${escapeHtml(hmbPromptShotOptionLabel(shot))}" class="prompt-shot-row nodrag nopan nowheel${active ? " active" : ""}" data-prompt-shot="${escapeHtml(shot.shot_uuid)}" data-prompt-shot-number="${shot.number}" aria-expanded="${expanded}" aria-selected="${active}"${state.disabled ? " disabled" : ""}><span class="prompt-shot-number">${String(shot.number).padStart(2, "0")}</span><b>${escapeHtml(shot.name)}</b></button>${expanded && editorMarkup ? `<div role="tabpanel" class="prompt-shot-content" data-shot-editor="${escapeHtml(shot.shot_uuid)}">${editorMarkup}</div>` : ""}</section>`;
-  }).join("")}</div>`;
+  }).join("")}${fallback}</div>`;
 }
 
 function render(state, includeStyle = true) {
@@ -7827,7 +7830,9 @@ function hmbPatchPromptShotSections(currentList, nextList, keepExistingEditor = 
   const sections = new Map(Array.from(currentList.children).filter((node) => node.matches?.(".prompt-shot-section"))
     .map((node) => [node.getAttribute("data-shot-uuid"), node]));
   let currentEditor = currentList.querySelector(".prompt-shot-content");
-  const requestedEditor = nextList.querySelector('.prompt-shot-row[aria-expanded="true"]')?.getAttribute("data-prompt-shot");
+  const requestedEditor = nextList.querySelector('.prompt-shot-row[aria-expanded="true"]')?.getAttribute("data-prompt-shot")
+    ?? nextList.querySelector("[data-prompt-editor-fallback]")?.getAttribute("data-prompt-editor-fallback");
+  hmbCopyPromptElementAttributes(currentList, nextList);
   if (currentEditor && currentEditor.getAttribute("data-shot-editor") !== requestedEditor) {
     currentEditor.remove();
     currentEditor = null;
@@ -7838,7 +7843,11 @@ function hmbPatchPromptShotSections(currentList, nextList, keepExistingEditor = 
   for (const nextSection of Array.from(nextList.children)) {
     const uuid = nextSection.getAttribute("data-shot-uuid");
     let section = sections.get(uuid);
-    if (!section) section = nextSection;
+    if (!section || (nextSection.hasAttribute("data-prompt-editor-fallback") && (
+      section.getAttribute("data-prompt-editor-fallback") !== nextSection.getAttribute("data-prompt-editor-fallback")
+      || Boolean(section.querySelector(".prompt-shot-empty")) !== Boolean(nextSection.querySelector(".prompt-shot-empty"))
+      || section.querySelector(".prompt-shot-empty")?.textContent !== nextSection.querySelector(".prompt-shot-empty")?.textContent
+    ))) section = nextSection;
     else {
       const header = section.querySelector(".prompt-shot-row");
       const nextHeader = nextSection.querySelector(".prompt-shot-row");
@@ -7850,11 +7859,12 @@ function hmbPatchPromptShotSections(currentList, nextList, keepExistingEditor = 
     retained.add(section);
     const header = nextSection.querySelector(".prompt-shot-row");
     const nextEditor = nextSection.querySelector(".prompt-shot-content");
-    if (nextEditor || (keepExistingEditor && header?.getAttribute("aria-expanded") === "true")) {
+    if (nextEditor || (keepExistingEditor && (header?.getAttribute("aria-expanded") === "true"
+      || nextSection.hasAttribute("data-prompt-editor-fallback")))) {
       retainedEditor = currentEditor || nextEditor;
       if (retainedEditor) {
         if (nextEditor && nextEditor !== retainedEditor) nextEditor.remove();
-        retainedEditor.setAttribute("data-shot-editor", uuid);
+        retainedEditor.setAttribute("data-shot-editor", requestedEditor);
         if (retainedEditor.parentElement !== section) section.appendChild(retainedEditor);
       }
     }
@@ -8936,7 +8946,9 @@ function hmbNativeUiImplementation(container, props) {
     if (!state.multi_shot_enabled || state.manual_rebind?.required) return;
     const selected = state.shot?.shot_uuid;
     const catalog = hmbPromptVerifiedShotCatalog(state);
-    if (!selected || catalog.length < 2) return;
+    if (catalog.length < 2 || !catalog.some((shot) => (
+      shot.shot_uuid === selected && shot.channel_uuid === state.shot?.channel_uuid
+    ))) return;
     if (!catalog.some((shot) => shot.shot_uuid !== selected && !preparedViews.has(shot.shot_uuid))) return;
     preparingViews = true;
     container.__hmbPromptShotSwitchInProgress = true;
