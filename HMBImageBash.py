@@ -208,20 +208,20 @@ def _install_bash_initial_value_admission(engine: Any) -> None:
         return node if _hmb_is_registered_node(node, "HMBImageBash") else None
     asynchronous = inspect.iscoroutinefunction(original) or inspect.iscoroutinefunction(getattr(original, "__call__", None))
     if asynchronous:
-        async def wrapped(request):
+        async def wrapped(request, *args, **kwargs):
             lease = {"node": target(request), "active": True}
             token = context.set(lease)
             try:
-                return await original(request)
+                return await original(request, *args, **kwargs)
             finally:
                 lease["active"] = False
                 context.reset(token)
     else:
-        def wrapped(request):
+        def wrapped(request, *args, **kwargs):
             lease = {"node": target(request), "active": True}
             token = context.set(lease)
             try:
-                return original(request)
+                return original(request, *args, **kwargs)
             finally:
                 lease["active"] = False
                 context.reset(token)
@@ -275,13 +275,13 @@ def _install_bash_snapshot_header_read(engine: Any) -> None:
         return result
     asynchronous = inspect.iscoroutinefunction(original) or inspect.iscoroutinefunction(getattr(original, "__call__", None))
     if asynchronous:
-        async def wrapped(request):
+        async def wrapped(request, *args, **kwargs):
             node, failure = before(request)
-            return failure if failure is not None else after(node, await original(request))
+            return failure if failure is not None else after(node, await original(request, *args, **kwargs))
     else:
-        def wrapped(request):
+        def wrapped(request, *args, **kwargs):
             node, failure = before(request)
-            return failure if failure is not None else after(node, original(request))
+            return failure if failure is not None else after(node, original(request, *args, **kwargs))
     if mapping.get(GetParameterValueRequest) is not original:
         raise RuntimeError("SDK 편집기 상태 핸들러가 설치 중 변경되었습니다.")
     mapping[GetParameterValueRequest] = wrapped

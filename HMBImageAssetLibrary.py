@@ -8580,13 +8580,13 @@ def _install_asset_initial_value_admission(engine: Any) -> None:
         if node is not None:
             node._finish_workspace_assignment(lease)
     if inspect.iscoroutinefunction(original) or inspect.iscoroutinefunction(getattr(original, "__call__", None)):
-        async def wrapped(request):
+        async def wrapped(request, *args, **kwargs):
             lease = lease_for(request)
             token = context.set(lease)
             workspace = workspace_lease_for(request)
             workspace_token = workspace_context.set(workspace)
             try:
-                return await original(request)
+                return await original(request, *args, **kwargs)
             finally:
                 try:
                     finish_workspace(workspace)
@@ -8596,13 +8596,13 @@ def _install_asset_initial_value_admission(engine: Any) -> None:
                     lease["active"] = False
                     context.reset(token)
     else:
-        def wrapped(request):
+        def wrapped(request, *args, **kwargs):
             lease = lease_for(request)
             token = context.set(lease)
             workspace = workspace_lease_for(request)
             workspace_token = workspace_context.set(workspace)
             try:
-                return original(request)
+                return original(request, *args, **kwargs)
             finally:
                 try:
                     finish_workspace(workspace)

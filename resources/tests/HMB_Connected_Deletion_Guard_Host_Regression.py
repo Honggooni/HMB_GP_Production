@@ -26,11 +26,33 @@ sys.dont_write_bytecode = True
 import HMB_Seedance_Execution_Mode_Host_Regression as harness
 
 
+def _inventory(engine, index, name, legacy_manager):
+    getter = getattr(engine, "current_workflow_or_none", None)
+    if callable(getter):
+        workflow = getter()
+        return getattr(getattr(workflow, index), name) if workflow is not None else {}
+    return getattr(getattr(engine, legacy_manager), "_" + name.lstrip("_"))
+
+
+def _add_fixture_object(engine, name, value):
+    add_in = getattr(engine.object_manager, "add_object_by_name_in", None)
+    if callable(add_in):
+        return add_in(engine.current_workflow_or_none(), name, value)
+    return engine.object_manager.add_object_by_name(name, value)
+
+
+def _direct(engine, handler, request):
+    import inspect
+    if "workflow" in inspect.signature(handler).parameters:
+        return handler(request, workflow=engine.current_workflow_or_none())
+    return handler(request)
+
+
 def snapshot(engine):
     """Retained identity, authored results, wires and context before mutation."""
     from griptape_nodes.retained_mode.events.connection_events import ListConnectionsForNodeRequest
     nodes = {}; edges = set()
-    for name, flow in engine.node_manager._name_to_parent_flow_name.items():
+    for name, flow in _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager").items():
         node = engine.node_manager.get_node_by_name(name)
         nodes[name] = (id(node), flow, deepcopy(node.metadata),
             deepcopy(dict(node.parameter_values)), deepcopy(dict(node.parameter_output_values)),
@@ -40,8 +62,8 @@ def snapshot(engine):
             edges.add((name, edge.source_parameter_name, edge.target_node_name,
                        edge.target_parameter_name, bool(getattr(edge, "is_node_group_internal", False))))
     context = engine.context_manager
-    return dict(nodes=nodes, edges=edges, flows=deepcopy(engine.flow_manager._name_to_parent_name),
-        objects={name: id(obj) for name, obj in engine.object_manager._name_to_objects.items()},
+    return dict(nodes=nodes, edges=edges, flows=deepcopy(_inventory(engine, "flows", "name_to_parent_name", "flow_manager")),
+        objects={name: id(obj) for name, obj in _inventory(engine, "objects", "_name_to_objects", "object_manager").items()},
         workflow=context.get_current_workflow_name() if context.has_current_workflow() else None,
         flow=context.get_current_flow().name if context.has_current_flow() else None,
         node=context.get_current_node().name if context.has_current_node() else None)
@@ -222,7 +244,7 @@ async def exercise(engine, _phase, out):
             finally:
                 manager.remove_pre_dispatch_hook(ordinary_hook)
             assert len(nested) == 1 and nested[0].succeeded()
-            assert unlinked.name not in engine.node_manager._name_to_parent_flow_name
+            assert unlinked.name not in _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager")
             harness.record("other_hook_reentrant_unconnected_deletion_remains_native")
 
             # A UI preflight describes object identities, not reusable names.
@@ -231,7 +253,7 @@ async def exercise(engine, _phase, out):
             assert receipt.can_delete and receipt.check_token
             removed = await engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
                 node_name=checked.name, check_token=receipt.check_token, broadcast_result=False))
-            assert removed.succeeded() and checked.name not in engine.node_manager._name_to_parent_flow_name
+            assert removed.succeeded() and checked.name not in _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager"), str(removed.result_details)
             before_repeat = snapshot(engine)
             repeated = await engine.ahandle_request(guard.HMBDeleteCheckedNodeRequest(
                 node_name=checked.name, check_token=receipt.check_token, broadcast_result=False))
@@ -257,6 +279,8 @@ async def exercise(engine, _phase, out):
                 node_name=checked_source.name, check_token=receipt.check_token, broadcast_result=False))
             assert not refused.succeeded() and snapshot(engine) == before_late
             harness.record("checked_identity_receipt_never_bypasses_new_connection_guard")
+            if _phase == "sdk-compat-smoke":
+                return
 
             expired = create("checked expired")
             receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[expired.name]))
@@ -271,8 +295,8 @@ async def exercise(engine, _phase, out):
             checked_group = BaseNodeGroup("checked group", metadata={"library": "Native_Group"})
             checked_flow = engine.flow_manager.get_flow_by_name(flow)
             checked_flow.add_node(checked_group)
-            engine.object_manager.add_object_by_name(checked_group.name, checked_group)
-            engine.node_manager._name_to_parent_flow_name[checked_group.name] = flow
+            _add_fixture_object(engine, checked_group.name, checked_group)
+            _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager")[checked_group.name] = flow
             child = create("checked child")
             checked_group.add_nodes_to_group([child])
             receipt = harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[checked_group.name]))
@@ -287,8 +311,8 @@ async def exercise(engine, _phase, out):
                             for name in ("checked inner one", "checked inner two")]
             for group in inner_groups:
                 checked_flow.add_node(group)
-                engine.object_manager.add_object_by_name(group.name, group)
-                engine.node_manager._name_to_parent_flow_name[group.name] = flow
+                _add_fixture_object(engine, group.name, group)
+                _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager")[group.name] = flow
             checked_group.add_nodes_to_group(inner_groups)
             checked_group.delete_nodes_from_group([added])
             inner_groups[0].add_nodes_to_group([added])
@@ -318,8 +342,8 @@ async def exercise(engine, _phase, out):
             def make_subflow(suffix):
                 group = ProbeSubflow("private subflow " + suffix, metadata={"library": "Native_Group"})
                 checked_flow.add_node(group)
-                engine.object_manager.add_object_by_name(group.name, group)
-                engine.node_manager._name_to_parent_flow_name[group.name] = flow
+                _add_fixture_object(engine, group.name, group)
+                _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager")[group.name] = flow
                 member = create("private member " + suffix)
                 group.add_nodes_to_group([member])
                 return group, member
@@ -330,8 +354,8 @@ async def exercise(engine, _phase, out):
                 suffix = "checked" if use_receipt else "direct"
                 group = BaseNodeGroup("private plain " + suffix, metadata={"library": "Native_Group"})
                 checked_flow.add_node(group)
-                engine.object_manager.add_object_by_name(group.name, group)
-                engine.node_manager._name_to_parent_flow_name[group.name] = flow
+                _add_fixture_object(engine, group.name, group)
+                _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager")[group.name] = flow
                 member = create("private plain member " + suffix)
                 outsider = create("private plain connected " + suffix)
                 peer = create("private plain peer " + suffix, hmb=False)
@@ -342,7 +366,7 @@ async def exercise(engine, _phase, out):
                 entered, finish = asyncio.Event(), asyncio.Event()
                 original_cancel = engine.node_manager.cancel_conditionally
                 async def plain_pending_cancel(*args, **kwargs):
-                    if args[2] is group:
+                    if kwargs.get("node", args[-1] if args else None) is group:
                         entered.set()
                         await finish.wait()
                     return await original_cancel(*args, **kwargs)
@@ -359,7 +383,7 @@ async def exercise(engine, _phase, out):
                     assert outsider.parent_group is None and member.parent_group is group
                     finish.set()
                     assert (await asyncio.wait_for(pending_delete, timeout=5)).succeeded()
-                assert group.name not in engine.node_manager._name_to_parent_flow_name
+                assert group.name not in _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager")
                 assert engine.node_manager.get_node_by_name(member.name) is member and member.parent_group is None
                 assert (dict(member.parameter_values), dict(member.parameter_output_values)) == saved_values
                 assert outsider.parent_group is None and guard.connected_targets(engine, [outsider.name])[outsider.name] == [peer.name]
@@ -367,8 +391,8 @@ async def exercise(engine, _phase, out):
 
             unrelated_group = BaseNodeGroup("private unrelated plain group", metadata={"library": "Native_Group"})
             checked_flow.add_node(unrelated_group)
-            engine.object_manager.add_object_by_name(unrelated_group.name, unrelated_group)
-            engine.node_manager._name_to_parent_flow_name[unrelated_group.name] = flow
+            _add_fixture_object(engine, unrelated_group.name, unrelated_group)
+            _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager")[unrelated_group.name] = flow
             standard_member = create("private unrelated standard member", hmb=False)
             unrelated_group.add_nodes_to_group([standard_member])
             deleted = await engine.ahandle_request(DeleteNodeRequest(node_name=unrelated_group.name, broadcast_result=False))
@@ -386,7 +410,8 @@ async def exercise(engine, _phase, out):
                 node_names=[extra.name], node_group_name=group.name, flow_name=flow, broadcast_result=False))
             assert removed.succeeded() and extra.parent_group is None
             assert engine.node_manager.get_node_parent_flow_by_name(extra.name) == flow
-            assert (await engine.ahandle_request(DeleteNodeRequest(node_name=group.name, broadcast_result=False))).succeeded()
+            outcome = await engine.ahandle_request(DeleteNodeRequest(node_name=group.name, broadcast_result=False))
+            assert outcome.succeeded(), str(outcome.result_details)
             harness.record("subflow_group_membership_still_works_outside_delete")
 
             for use_receipt in (False, True):
@@ -411,7 +436,7 @@ async def exercise(engine, _phase, out):
                 else:
                     deleted = await engine.ahandle_request(DeleteNodeRequest(node_name=group.name, broadcast_result=False))
                 assert deleted.succeeded(), (type(deleted).__name__, str(deleted.result_details))
-                assert group.name not in engine.node_manager._name_to_parent_flow_name
+                assert group.name not in _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager")
                 assert engine.node_manager.get_node_by_name(member.name) is member
                 assert member.parent_group is None and engine.node_manager.get_node_parent_flow_by_name(member.name) == flow
                 assert (dict(member.parameter_values), dict(member.parameter_output_values)) == retained_values
@@ -442,7 +467,7 @@ async def exercise(engine, _phase, out):
             entered, finish = asyncio.Event(), asyncio.Event()
             original_cancel = engine.node_manager.cancel_conditionally
             async def unrelated_pending_cancel(*args, **kwargs):
-                if args[2] is unrelated:
+                if kwargs.get("node", args[-1] if args else None) is unrelated:
                     entered.set()
                     await finish.wait()
                 return await original_cancel(*args, **kwargs)
@@ -571,7 +596,7 @@ async def exercise(engine, _phase, out):
                 manager.remove_pre_dispatch_hook(late_connection)
             assert len(late_results) == 1 and late_results[0].succeeded()
             assert not late_delete.succeeded() and guard.CODE in str(late_delete.result_details)
-            assert late_source.name in engine.node_manager._name_to_parent_flow_name
+            assert late_source.name in _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager")
             assert guard.connected_targets(engine, [late_source.name])[late_source.name] == [late_target.name]
             harness.record("connection_added_after_preflight_denied_at_handler")
 
@@ -594,7 +619,7 @@ async def exercise(engine, _phase, out):
             direct_source, direct_target = create("direct source"), create("direct target")
             wire(direct_source, direct_target)
             before_direct = snapshot(engine)
-            direct = await engine.node_manager.on_delete_node_request(
+            direct = await _direct(engine, engine.node_manager.on_delete_node_request,
                 DeleteNodeRequest(node_name=direct_source.name, broadcast_result=False))
             assert not direct.succeeded() and guard.CODE in str(direct.result_details)
             assert snapshot(engine) == before_direct
@@ -614,7 +639,7 @@ async def exercise(engine, _phase, out):
                         source_node_name=await_source.name, source_parameter_name="output",
                         target_node_name=await_target.name, target_parameter_name="input",
                         initial_setup=True, broadcast_result=False)
-                    observed.append(engine.flow_manager.on_create_connection_request(request)
+                    observed.append(_direct(engine, engine.flow_manager.on_create_connection_request, request)
                                     if direct_create else engine.handle_request(request))
                     observed.append(engine.handle_request(CreateConnectionRequest(
                         source_node_name=other_source.name, source_parameter_name="output",
@@ -626,7 +651,7 @@ async def exercise(engine, _phase, out):
                         node_name=await_source.name, broadcast_result=False))
                 assert len(observed) == 2 and not observed[0].succeeded() and observed[1].succeeded()
                 assert "HMB_DELETE_IN_PROGRESS" in str(observed[0].result_details)
-                assert outcome.succeeded() and await_source.name not in engine.node_manager._name_to_parent_flow_name
+                assert outcome.succeeded() and await_source.name not in _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager")
                 assert guard.connected_targets(engine, [other_source.name])[other_source.name] == [other_target.name]
                 harness.record("wire_connection_during_delete_await_denied_" + ("direct" if direct_create else "request"))
 
@@ -637,7 +662,7 @@ async def exercise(engine, _phase, out):
                 raise RuntimeError("synthetic deletion error")
             with mock.patch.object(engine.node_manager, "cancel_conditionally", cancelled_with_error):
                 try:
-                    await engine.node_manager.on_delete_node_request(DeleteNodeRequest(
+                    await _direct(engine, engine.node_manager.on_delete_node_request, DeleteNodeRequest(
                         node_name=failure_source.name, broadcast_result=False))
                 except RuntimeError:
                     pass
@@ -968,8 +993,8 @@ async def exercise(engine, _phase, out):
             inner = BaseNodeGroup("inner group", metadata={"library": "Native_Group"})
             native_flow = engine.flow_manager.get_flow_by_name(flow)
             for group in (outer, inner):
-                native_flow.add_node(group); engine.object_manager.add_object_by_name(group.name, group)
-                engine.node_manager._name_to_parent_flow_name[group.name] = flow
+                native_flow.add_node(group); _add_fixture_object(engine, group.name, group)
+                _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager")[group.name] = flow
             inner.add_nodes_to_group([target]); outer.add_nodes_to_group([inner])
             assert target.parent_group is inner and inner.parent_group is outer
             before = snapshot(engine)
@@ -1004,7 +1029,7 @@ async def exercise(engine, _phase, out):
             # Normal New/Close releases loaded view without deleting a saved
             # file. Its permission must not leak to a subsequent direct clear.
             await harness.asend(engine, guard.HMBPrepareWorkflowTransitionRequest())
-            assert not engine.node_manager._name_to_parent_flow_name
+            assert not _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager")
             flow = harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name="SavedDeletionGuardSDK")).flow_name
             source, target = create("saved guard source"), create("saved guard target")
             wire(source, target)
@@ -1042,8 +1067,8 @@ async def exercise(engine, _phase, out):
             assert registration.deletion_handlers is not None, "Refresh failed to rebind typed request handlers"
             assert registration.deletion_handlers is stable_handler
             assert stable_handler.owner_ref() is registration and stable_handler.engine_ref() is engine
-            assert harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[])).can_delete
             flow = harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name="After library refresh")).flow_name
+            assert harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[])).can_delete
             source, target = create("refreshed source"), create("refreshed target")
             wire(source, target)
             await blocked(DeleteNodeRequest(node_name=source.name), "real_library_refresh_preserves_central_guard")
@@ -1144,7 +1169,7 @@ async def exercise(engine, _phase, out):
             owner.before_library_unregistered(schema, library)
             assert not registration.active and guard.protection_readiness(engine) == (True, "")
             await harness.asend(engine, guard.HMBPrepareWorkflowTransitionRequest(broadcast_result=False))
-            assert not engine.node_manager._name_to_parent_flow_name and saved_gap.read_bytes() == saved_bytes
+            assert not _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager") and saved_gap.read_bytes() == saved_bytes
             inactive_empty = engine.handle_request(guard.HMBCheckNodeDeletionRequest(node_names=[], broadcast_result=False))
             assert not inactive_empty.succeeded()
             harness.record("healthy_unload_gap_New_Close_releases_view_and_preserves_saved_source")
@@ -1154,11 +1179,14 @@ async def exercise(engine, _phase, out):
                 standard = create("ordinary independent", hmb=False)
                 with mock.patch.object(lifetime_gate, "callback", callback):
                     deleted = await engine.ahandle_request(DeleteNodeRequest(node_name=standard.name, broadcast_result=False))
-                assert deleted.succeeded() and standard.name not in engine.node_manager._name_to_parent_flow_name
+                assert deleted.succeeded() and standard.name not in _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager")
             harness.record("positively_standard_only_graph_is_native_owned_even_when_guard_callback_is_unavailable")
             standard = create("ordinary unknown inventory", hmb=False)
             before_unknown = snapshot(engine)
-            with mock.patch.object(engine.node_manager, "_name_to_parent_flow_name", None):
+            runtime = getattr(engine, "current_workflow_or_none", None)
+            inventory_owner, inventory_name = ((runtime().nodes, "name_to_parent_flow_name") if callable(runtime)
+                                               else (engine.node_manager, "_name_to_parent_flow_name"))
+            with mock.patch.object(inventory_owner, inventory_name, None):
                 unknown = await engine.ahandle_request(DeleteNodeRequest(node_name=standard.name, broadcast_result=False))
                 assert not unknown.succeeded() and "HMB_DELETE_CHECK_FAILED" in str(unknown.result_details)
             assert snapshot(engine) == before_unknown
@@ -1175,7 +1203,9 @@ async def exercise(engine, _phase, out):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, default=ROOT / "reports/predeploy-usability-fixes-20261024/connected-deletion-sdk")
-    out = parser.parse_args().out.resolve(); out.mkdir(parents=True, exist_ok=True)
+    parser.add_argument("--sdk-compat-smoke", action="store_true")
+    args = parser.parse_args()
+    out = args.out.resolve(); out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="hmb-connected-deletion-") as temp:
         env = {key: str(Path(temp) / key) for key in ("APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "GTN_ENGINE_CONFIG_DIR", "GTN_ENGINE_DATA_DIR", "GTN_ENGINE_STATE_DIR", "GTN_CONFIG_WORKSPACE_DIRECTORY")}
         for value in env.values(): Path(value).mkdir(parents=True, exist_ok=True)
@@ -1186,10 +1216,10 @@ def main():
             try:
                 with engine_scope() as engine:
                     with asyncio.Runner() as runner:
-                        runner.run(exercise(engine, "connected-deletion", out))
+                        runner.run(exercise(engine, "sdk-compat-smoke" if args.sdk_compat_smoke else "connected-deletion", out))
                 passed = True
             finally:
-                result = dict(passed=passed and not harness.ATTEMPTS, cases=harness.RESULTS,
+                result = dict(passed=passed and not harness.ATTEMPTS, smoke_only=args.sdk_compat_smoke, cases=harness.RESULTS,
                     provider_or_paid_calls=0, forbidden_execution_attempts=len(harness.ATTEMPTS),
                     source_sha256={name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                         for name in ("_hmb_deletion_guard.py", "_hmb_library_bootstrap.py")},

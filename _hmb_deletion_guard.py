@@ -64,7 +64,7 @@ def binding_mutation(node: Any, *, operation: str = "", parameter: str = ""):
             continue
         try:
             name = getattr(node, "name", None)
-            inventory = engine.node_manager._name_to_parent_flow_name
+            inventory = _node_inventory(engine)
             if not isinstance(inventory, dict):
                 raise RuntimeError("retained inventory unavailable")
             if not name or name not in inventory:
@@ -89,7 +89,7 @@ def binding_mutation(node: Any, *, operation: str = "", parameter: str = ""):
         return
     barrier, engine, name = owned
     with barrier.lock:
-        inventory = engine.node_manager._name_to_parent_flow_name
+        inventory = _node_inventory(engine)
         flow = inventory.get(name) if isinstance(inventory, dict) else None
         if not flow:
             raise RuntimeError("[HMB_DELETE_CHECK_FAILED] 노드의 작업 컨텍스트를 확인하지 못했습니다.")
@@ -294,9 +294,9 @@ class _HandlerDeletionBarrier:
                     raise RuntimeError("[HMB_DELETE_GUARD_NOT_READY] SDK 노드 생성 경계가 동기 방식이 아닙니다.")
                 def make_create(fn: Any) -> Any:
                     @functools.wraps(fn)
-                    def wrapped(request: Any) -> Any:
+                    def wrapped(request: Any, *args: Any, **kwargs: Any) -> Any:
                         reset = _reset_identity.get()
-                        result = fn(request)
+                        result = fn(request, *args, **kwargs)
                         if reset and len(reset) > 2 and reset[2].get("active") and reset[0] == id(self):
                             state = reset[2]
                             original_node = state["original"]
@@ -319,12 +319,12 @@ class _HandlerDeletionBarrier:
                     "griptape_nodes.retained_mode.events." + module_name), _result_name)
                 def make_group_change(fn: Any, failure: Any) -> Any:
                     @functools.wraps(fn)
-                    def wrapped(request: Any) -> Any:
+                    def wrapped(request: Any, *args: Any, **kwargs: Any) -> Any:
                         engine = self.engine_ref()
                         if engine is None:
                             return failure(result_details="[HMB_DELETE_GUARD_NOT_READY] 삭제 보호 엔진을 확인할 수 없습니다.")
                         with self.lock:
-                            inventory = engine.node_manager._name_to_parent_flow_name
+                            inventory = _node_inventory(engine)
                             if not isinstance(inventory, dict):
                                 return failure(result_details="[HMB_DELETE_CHECK_FAILED] 그룹 소속을 확인할 수 없습니다.")
                             group_name = getattr(request, "node_group_name", None)
@@ -346,7 +346,7 @@ class _HandlerDeletionBarrier:
                         group_flows = set(flows)
                         token = _group_mutation.set((id(self), group_flows, group_ref))
                         try:
-                            return fn(request)
+                            return fn(request, *args, **kwargs)
                         finally:
                             _group_mutation.reset(token)
                             with self.lock:
@@ -360,7 +360,7 @@ class _HandlerDeletionBarrier:
                     raise RuntimeError("[HMB_DELETE_GUARD_NOT_READY] SDK 이름 변경 경계가 동기 방식이 아닙니다.")
                 def make_rename(fn: Any) -> Any:
                     @functools.wraps(fn)
-                    def wrapped(request: Any) -> Any:
+                    def wrapped(request: Any, *args: Any, **kwargs: Any) -> Any:
                         from griptape_nodes.retained_mode.events.object_events import RenameObjectResultFailure
                         reset = _reset_identity.get()
                         old_name = getattr(request, "object_name", None)
@@ -368,13 +368,13 @@ class _HandlerDeletionBarrier:
                         internal = (reset is not None and len(reset) > 2 and reset[2].get("active") and reset[0] == id(self)
                                     and old_name == reset[1] + "_temp" and new_name == reset[1])
                         if internal:
-                            return fn(request)
+                            return fn(request, *args, **kwargs)
                         with self.lock:
                             if self.deleting_flows or self.binding_changes or self.moving_flows:
                                 return RenameObjectResultFailure(next_available_name=None, result_details="[HMB_CONNECTION_IN_PROGRESS] 연결이나 삭제가 진행 중입니다. 완료 후 이름을 변경하세요.")
                             self.identity_changes += 1
                         try:
-                            return fn(request)
+                            return fn(request, *args, **kwargs)
                         finally:
                             with self.lock:
                                 self.identity_changes -= 1
@@ -385,7 +385,7 @@ class _HandlerDeletionBarrier:
                     raise RuntimeError("[HMB_DELETE_GUARD_NOT_READY] SDK 노드 이동 경계가 동기 방식이 아닙니다.")
                 def make_move(fn: Any) -> Any:
                     @functools.wraps(fn)
-                    def wrapped(request: Any) -> Any:
+                    def wrapped(request: Any, *args: Any, **kwargs: Any) -> Any:
                         from griptape_nodes.retained_mode.events.node_events import MoveNodeToNewFlowResultFailure
                         engine = self.engine_ref()
                         if engine is None:
@@ -394,7 +394,7 @@ class _HandlerDeletionBarrier:
                         if name is None and engine.context_manager.has_current_node():
                             name = engine.context_manager.get_current_node().name
                         with self.lock:
-                            inventory = engine.node_manager._name_to_parent_flow_name
+                            inventory = _node_inventory(engine)
                             if not isinstance(inventory, dict):
                                 return MoveNodeToNewFlowResultFailure(result_details="[HMB_DELETE_CHECK_FAILED] 노드 소속을 확인할 수 없습니다.")
                             flows = list(dict.fromkeys(flow for flow in (
@@ -444,7 +444,7 @@ class _HandlerDeletionBarrier:
                                 return MoveNodeToNewFlowResultFailure(result_details="[HMB_CONNECTION_IN_PROGRESS] 해당 작업의 연결 또는 삭제가 진행 중입니다.")
                             self._increment(self.moving_flows, flows)
                         try:
-                            return fn(request)
+                            return fn(request, *args, **kwargs)
                         finally:
                             with self.lock:
                                 self._decrement(self.moving_flows, flows)
@@ -455,7 +455,7 @@ class _HandlerDeletionBarrier:
                     raise RuntimeError("[HMB_DELETE_GUARD_NOT_READY] SDK 연결 생성 경계가 동기 방식이 아닙니다.")
                 def make_connection(fn: Any) -> Any:
                     @functools.wraps(fn)
-                    def wrapped(request: Any) -> Any:
+                    def wrapped(request: Any, *args: Any, **kwargs: Any) -> Any:
                         from griptape_nodes.retained_mode.events.connection_events import CreateConnectionResultFailure
                         engine = self.engine_ref()
                         if engine is None:
@@ -470,7 +470,7 @@ class _HandlerDeletionBarrier:
                             source, target = source or current, target or current
                         names = list(dict.fromkeys(name for name in (source, target) if isinstance(name, str)))
                         with self.lock:
-                            inventory = engine.node_manager._name_to_parent_flow_name
+                            inventory = _node_inventory(engine)
                             if (not isinstance(inventory, dict) or any(inventory.get(name) in self.active_reset_flows for name in names)):
                                 return CreateConnectionResultFailure(result_details=(
                                     "[HMB_DELETE_IN_PROGRESS] 초기화 중인 작업에는 새 연결을 만들 수 없습니다."))
@@ -479,7 +479,7 @@ class _HandlerDeletionBarrier:
                                     "[HMB_DELETE_IN_PROGRESS] 해당 노드 삭제가 진행 중입니다. 완료 후 연결을 다시 시도하세요."))
                             self._increment(self.creating, names)
                         try:
-                            return fn(request)
+                            return fn(request, *args, **kwargs)
                         finally:
                             with self.lock:
                                 self._decrement(self.creating, names)
@@ -488,7 +488,7 @@ class _HandlerDeletionBarrier:
             elif inspect.iscoroutinefunction(original):
                 def make_async(fn: Any, evaluate: Any) -> Any:
                     @functools.wraps(fn)
-                    async def wrapped(request: Any) -> Any:
+                    async def wrapped(request: Any, *args: Any, **kwargs: Any) -> Any:
                         denial, selected, flows = self._begin_delete(request, evaluate)
                         if denial is not None:
                             return denial
@@ -551,7 +551,7 @@ class _HandlerDeletionBarrier:
                                     subflow_token = _subflow_teardown.set((id(self), weakref.ref(group), frozenset(flows)))
                                 elif type(group) is BaseNodeGroup and selected:
                                     plain_group = group
-                            result = await fn(request)
+                            result = await fn(request, *args, **kwargs)
                             if reset_state and not result.succeeded():
                                 replacement = reset_state.get("replacement")
                                 try:
@@ -626,12 +626,12 @@ class _HandlerDeletionBarrier:
             else:
                 def make_sync(fn: Any, evaluate: Any) -> Any:
                     @functools.wraps(fn)
-                    def wrapped(request: Any) -> Any:
+                    def wrapped(request: Any, *args: Any, **kwargs: Any) -> Any:
                         denial, selected, flows = self._begin_delete(request, evaluate)
                         if denial is not None:
                             return denial
                         try:
-                            return fn(request)
+                            return fn(request, *args, **kwargs)
                         finally:
                             with self.lock:
                                 self._decrement(self.deleting, selected)
@@ -795,10 +795,35 @@ def _is_hmb(node: Any) -> bool:
     return isinstance(metadata, dict) and metadata.get("library") == LIBRARY
 
 
+def _flow_parent(engine: Any, flow: str) -> str | None:
+    lookup = getattr(engine.flow_manager, "get_parent_flow_in", None)
+    if callable(lookup):
+        workflow = engine.current_workflow_or_none()
+        if workflow is None:
+            raise RuntimeError("retained flow inventory unavailable")
+        return lookup(workflow, flow)
+    return engine.flow_manager.get_parent_flow(flow)
+
+
+def _node_inventory(engine: Any) -> dict[str, str]:
+    """Use the SDK-selected workflow; never choose among open workflows here."""
+    current = getattr(engine, "current_workflow_or_none", None)
+    if callable(current):
+        workflow = current()
+        if workflow is None:
+            return {}
+        mapping = workflow.nodes.name_to_parent_flow_name
+    else:
+        mapping = engine.node_manager._name_to_parent_flow_name
+    if not isinstance(mapping, dict):
+        raise RuntimeError("retained node inventory unavailable")
+    return mapping
+
+
 def _retained_nodes(engine: Any) -> dict[str, Any]:
     # Read-only inventory also distinguishes an old same-name Python object
     # from the live one after a load/reset. Never trust node names alone.
-    mapping = engine.node_manager._name_to_parent_flow_name
+    mapping = _node_inventory(engine)
     return {name: engine.node_manager.get_node_by_name(name) for name in tuple(mapping)}
 
 
@@ -1052,7 +1077,7 @@ def _scope(engine: Any, request: Any) -> list[str]:
             if flow == target:
                 return True
             visited.add(flow)
-            flow = engine.flow_manager.get_parent_flow(flow)
+            flow = _flow_parent(engine, flow)
             if flow is not None and not isinstance(flow, str):
                 flow = flow.name
         return False
@@ -1094,7 +1119,7 @@ def _subflow_inventory(engine: Any, names: list[str], retained: dict[str, Any]) 
                     members.add(candidate)
                     break
                 seen.add(flow)
-                flow = engine.flow_manager.get_parent_flow(flow)
+                flow = _flow_parent(engine, flow)
                 if flow is not None and not isinstance(flow, str):
                     flow = flow.name
         result[name] = members
@@ -1312,7 +1337,7 @@ def install_request_handlers(engine: Any, registration: Any) -> Any:
             return token
 
         @handles(check_type)
-        def check(self, request: Any) -> Any:
+        def check(self, request: Any, workflow: Any = None) -> Any:
             owner, current = self.owner_ref(), self.engine_ref()
             failure = globals()["HMBCheckNodeDeletionResultFailure"]
             if current is None:
@@ -1361,7 +1386,7 @@ def install_request_handlers(engine: Any, registration: Any) -> Any:
                 return failure(result_details="[HMB_DELETE_CHECK_FAILED] 연결 상태 확인에 실패하여 삭제하지 않았습니다.")
 
         @handles(checked_type)
-        async def delete_checked(self, request: Any) -> Any:
+        async def delete_checked(self, request: Any, workflow: Any = None) -> Any:
             from griptape_nodes.retained_mode.events.node_events import DeleteNodeRequest
             failure = globals()["HMBDeleteCheckedNodeResultFailure"]
             current = self.engine_ref()
@@ -1426,7 +1451,7 @@ def install_request_handlers(engine: Any, registration: Any) -> Any:
                             selected["inflight"].discard(getattr(request, "node_name", ""))
 
         @handles(transition_type)
-        async def transition(self, request: Any) -> Any:
+        async def transition(self, request: Any, workflow: Any = None) -> Any:
             from griptape_nodes.retained_mode.events.object_events import (
                 ClearAllObjectStateRequest, ClearAllObjectStateResultFailure)
             owner, current = self.owner_ref(), self.engine_ref()
@@ -1447,6 +1472,15 @@ def install_request_handlers(engine: Any, registration: Any) -> Any:
                 return await current.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
             finally:
                 _teardown_engine.reset(token)
+
+    if callable(getattr(engine, "current_workflow_or_none", None)):
+        for handler in (Handlers.check, Handlers.delete_checked, Handlers.transition):
+            signature = inspect.signature(handler)
+            handler.__signature__ = signature.replace(parameters=[
+                parameter.replace(default=inspect.Parameter.empty)
+                if parameter.name == "workflow" else parameter
+                for parameter in signature.parameters.values()
+            ])
 
     handler = Handlers(weakref.ref(registration), weakref.ref(engine))
     engine.event_manager.register_request_handlers(handler)

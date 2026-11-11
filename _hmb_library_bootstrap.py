@@ -236,6 +236,8 @@ def _hmb_native_editor_runtime_fingerprint() -> tuple[str, str, str]:
             raise ValueError("native_editor_file_changed_during_read")
         return encoded
 
+    if not entry.is_file():
+        raise LookupError("native_editor_layout_unsupported")
     html = read_stable(entry, 1024 * 1024)
     matches = re.findall(r'''\bsrc\s*=\s*["']\./assets/(index-[A-Za-z0-9_-]+\.js)["']''', html.decode("utf-8"))
     if len(matches) != 1:
@@ -1612,7 +1614,8 @@ class _DeletionLifetimeGate:
         # A trusted consolidation transaction transfers retained identities
         # before removing obsolete instances. Request flags never grant this.
         try:
-            inventory = engine.node_manager._name_to_parent_flow_name
+            from _hmb_deletion_guard import _node_inventory
+            inventory = _node_inventory(engine)
             if not isinstance(inventory, dict):
                 raise RuntimeError("Retained HMB inventory is unavailable")
             has_hmb = False

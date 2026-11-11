@@ -51,9 +51,13 @@ def digest(value):
 
 
 def edge_records(engine, flow):
+    lookup = engine.flow_manager._get_connections_for_flow
+    import inspect
+    connections = (lookup(engine.current_workflow_or_none(), flow)
+                   if "workflow" in inspect.signature(lookup).parameters else lookup(flow))
     return sorted((item.source_node.name, item.source_parameter.name,
         item.target_node.name, item.target_parameter.name)
-        for item in engine.flow_manager._get_connections_for_flow(flow))
+        for item in connections)
 
 
 async def exercise(engine, directory):
