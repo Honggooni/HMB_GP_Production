@@ -307,8 +307,8 @@ def _registered_flow(engine: Any, flow_name: str) -> Any:
     flow = engine.flow_manager.get_flow_by_name(flow_name)
     _require(isinstance(getattr(flow, "nodes", None), dict), "Unsupported flow inventory")
     for name, node in flow.nodes.items():
-        _require(engine.node_manager._name_to_parent_flow_name.get(name) == flow_name
-            and engine.object_manager._name_to_objects.get(name) is node,
+        _require(engine.node_manager.get_node_parent_flow_by_name(name) == flow_name
+            and engine.object_manager.attempt_get_object_by_name(name) is node,
             "Unregistered or moved node in the migration flow")
     return flow
 
