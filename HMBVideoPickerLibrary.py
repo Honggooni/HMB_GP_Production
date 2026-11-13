@@ -318,6 +318,7 @@ PICKER_WIDGET_COMPACT_MOUNT_HEIGHT = 252
 PICKER_WIDGET_START_HEIGHT = PICKER_WIDGET_COMPACT_MOUNT_HEIGHT
 READ_OVERALL_TIMEOUT_SECONDS = 900
 READ_STALL_TIMEOUT_SECONDS = 180
+READ_COMPLETION_GRACE_SECONDS = 2.0
 PLAYBLAST_OVERALL_TIMEOUT_SECONDS = 7200
 PLAYBLAST_STALL_TIMEOUT_SECONDS = 600
 PROCESS_OUTPUT_ACTIVITY_SCAN_INTERVAL_SECONDS = 30.0
@@ -12161,6 +12162,39 @@ def _terminate_process(process: subprocess.Popen[Any]) -> None:
         _diagnostic_exception(f"Process wait after termination failed for PID {getattr(process, 'pid', 0)}", exc)
 
 
+def _validated_maya_read_result(result_path: Path, scene_path: Path) -> Optional[Dict[str, Any]]:
+    """Accept only complete metadata from this READ's private result file."""
+    try:
+        result = _read_json(result_path)
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(result, dict) or result.get("ok") is not True
+            or result.get("operation") != "scan"
+            or _scene_path_key(result.get("scene_path")) != _scene_path_key(str(scene_path))):
+        return None
+    for field in ("outliner_nodes", "cameras"):
+        if not isinstance(result.get(field), list) or any(not isinstance(row, dict) for row in result[field]):
+            return None
+    try:
+        start, end, current, fps = (float(result[key]) for key in ("start_frame", "end_frame", "current_frame", "fps"))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    if not all(math.isfinite(value) for value in (start, end, current, fps)) or end < start or fps <= 0:
+        return None
+    return result
+
+
+def _close_drained_process_stdout(process: Any, reader: Optional[threading.Thread]) -> bool:
+    # TextIO.close takes the same lock as readline. An inherited pipe may keep
+    # the reader blocked even after Maya exits; let its owning thread close it.
+    if reader is not None and reader.is_alive():
+        return False
+    stream = getattr(process, "stdout", None)
+    if stream is not None:
+        stream.close()
+    return True
+
+
 class _MayaNativeCaptureError(RuntimeError):
     def __init__(self, message: str, error_code: str = "", report: Any = None) -> None:
         super().__init__(message)
@@ -20431,11 +20465,14 @@ class HMBVideoPickerLibrary(DataNode):
             if embedded_command is not None:
                 action = _clean(embedded_command.get("action")) or "command"
                 action_id = _clean(embedded_command.get("action_id"))
-                if action == "video_tools":
+                if action in {"video_tools", "read_scene"}:
                     # The embedded bridge carries the edit draft and its
                     # one-shot action in the same transaction. Commit that
                     # draft before dispatch: a same-revision authoritative
                     # snapshot must not hide the just-stored widget value.
+                    # READ also carries the click-time Shot navigation and
+                    # row revisions; otherwise its ACK can remain older than
+                    # the mounted selection even after Maya finishes.
                     with self._hmb_catalog_state_commit():
                         authored = self._merge_widget_state(
                             self._picker_state(), value
@@ -21136,6 +21173,7 @@ class HMBVideoPickerLibrary(DataNode):
         output_reader: Optional[threading.Thread] = None,
         activity_paths: Optional[Sequence[Path]] = None,
         process_name: str = "Maya",
+        read_result_check: Any = None,
     ) -> int:
         """Wait while streaming an external process and progress into the UI."""
         process_label = _clean(process_name) or "External"
@@ -21147,6 +21185,8 @@ class HMBVideoPickerLibrary(DataNode):
         last_heartbeat_at = started
         stream_eof = False
         last_ui_publish_at = 0.0
+        read_completed_at: Optional[float] = None
+        read_completion_verified = False
         pending_ui_lines: List[tuple[str, str]] = []
         watched_activity_paths = tuple(Path(path) for path in (activity_paths or ()))
         activity_signature, _activity_count, _activity_size = _filesystem_activity_snapshot(
@@ -21262,6 +21302,10 @@ class HMBVideoPickerLibrary(DataNode):
                         f"{process_label.upper()} PROGRESS [{stage}] | {message}",
                     ))
                     publish_runtime_ui(message)
+                if (read_result_check is not None and payload.get("stage") == "scan_complete"
+                        and not read_completion_verified and read_result_check()):
+                    read_completion_verified = True
+                    read_completed_at = now
             except (FileNotFoundError, PermissionError, json.JSONDecodeError, ValueError):
                 pass
             except Exception as exc:
@@ -21311,7 +21355,21 @@ class HMBVideoPickerLibrary(DataNode):
                 raise RuntimeError(f"{operation_label} cancelled by user.")
             return_code = completed_return_code()
             if return_code is not None:
+                if read_completion_verified and return_code != 0:
+                    pending_ui_lines.append(("WARNING", f"{process_label.upper()} | READ metadata completed before process shutdown error {return_code}; verified result retained."))
+                    publish_runtime_ui(force=True)
+                    return 0
                 return return_code
+            if (read_completion_verified and read_completed_at is not None
+                    and now - read_completed_at >= READ_COMPLETION_GRACE_SECONDS):
+                # Only metadata READ opts in. Rendering still requires its
+                # original exit/output checks. Stop only this owned worker.
+                _terminate_process(process)
+                if process.poll() is None:
+                    raise RuntimeError(f"{operation_label} completed metadata but its owned worker could not be stopped.")
+                pending_ui_lines.append(("INFO", f"{process_label.upper()} | READ metadata verified; completed worker shutdown without waiting for plug-ins."))
+                publish_runtime_ui(force=True)
+                return 0
             if now - last_heartbeat_at >= 10.0:
                 last_heartbeat_at = now
                 elapsed = now - started
@@ -21500,6 +21558,13 @@ class HMBVideoPickerLibrary(DataNode):
                 except Exception as exc:
                     enqueue_output(f"[HMB STREAM ERROR] {exc}\n")
                 finally:
+                    # This thread owns readline, so it can release TextIO
+                    # without blocking the READ completion worker.
+                    try:
+                        if process.stdout is not None:
+                            process.stdout.close()
+                    except Exception as exc:
+                        _diagnostic_exception("Maya output reader close failed", exc)
                     enqueue_output(None)
 
             output_reader = threading.Thread(
@@ -21520,6 +21585,7 @@ class HMBVideoPickerLibrary(DataNode):
                     output_queue=output_queue,
                     output_log_handle=log_handle,
                     output_reader=output_reader,
+                    read_result_check=lambda: _validated_maya_read_result(result_path, scene_path),
                 )
                 log_handle.write(f"\nHMB MAYA PROCESS EXIT CODE: {return_code}\n")
                 log_handle.flush()
@@ -21530,8 +21596,7 @@ class HMBVideoPickerLibrary(DataNode):
             finally:
                 self._clear_active_process(process)
                 try:
-                    if process.stdout is not None:
-                        process.stdout.close()
+                    _close_drained_process_stdout(process, output_reader)
                 except Exception as exc:
                     _diagnostic_exception("Maya process stdout close failed", exc)
 

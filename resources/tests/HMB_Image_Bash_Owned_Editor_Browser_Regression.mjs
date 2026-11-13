@@ -60,7 +60,15 @@ try {
   });
   assert.deepEqual(result.size,[4,2]);
   assert.deepEqual(result.left,[255,0,0,255]);
-  assert.deepEqual(result.right,[127,127,255,255]);
+  // Canvas blend/PNG round trips differ by one 8-bit step across Chromium
+  // raster backends. Limit tolerance to the two half-blended channels;
+  // saturated blue, alpha, neutral balance and authored opacity stay exact.
+  assert.equal(result.right.length,4);
+  assert.equal(result.right[0],result.right[1]);
+  assert.ok(Number.isInteger(result.right[0]) && Math.abs(result.right[0]-127)<=1,
+    `50% blue over white red/green channel is outside one LSB: ${result.right}`);
+  assert.deepEqual(result.right.slice(2),[255,255]);
+  assert.equal(result.payload.meta.konva_json.images[1].opacity,0.5);
   assert.deepEqual(result.payload.meta.hmb_image_bash.source_bindings,result.input.meta.hmb_image_bash.source_bindings);
   assert.equal(result.payload.meta.konva_json.images[1].preserved_tag,'tag:brush');
   assert.equal(result.payload.meta.konva_json.extra,'retained');
@@ -79,7 +87,7 @@ try {
   assert.deepEqual(await page.evaluate(() => payloads.length),1);
   assert.deepEqual(external,[]);
   assert.deepEqual(errors,[]);
-  console.log('HMB-owned widget: saved image/brush layers, exact PNG pixels, Apply acknowledgement, reopen and stale scope PASS');
+  console.log('HMB-owned widget: saved image/brush layers, PNG color/alpha, Apply acknowledgement, reopen and stale scope PASS');
 } finally {
   await browser.close();
 }

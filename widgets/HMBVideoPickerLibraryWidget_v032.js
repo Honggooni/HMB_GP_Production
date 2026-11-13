@@ -16282,6 +16282,17 @@ function hmbNativeUiImplementation(container, props) {
   });
   schedulePickerFit(true);
   container.__hmbVideoPickerControllerUpdate = (nextProps) => {
+    // An ACK belongs to the raw backend receipt, not the protected media
+    // projection below (which may keep state_writer="widget" for a newer
+    // selection in another Shot). Consume only this runtime's receipt.
+    let receipt = hmbPickerStateFromProps(nextProps || {});
+    if (typeof receipt === "string") {
+      try { receipt = JSON.parse(receipt); } catch (_error) { receipt = null; }
+    }
+    const receiptRuntime = clean(receipt?.runtime_instance_id);
+    if (receiptRuntime && receiptRuntime === clean(state.runtime_instance_id)) {
+      hmbReconcilePickerCommandAcknowledgements(container, receipt);
+    }
     nextProps = { ...(nextProps || {}), value: hmbApplyOptimisticPickerSnapshotDeletions(container,
       hmbApplyOptimisticPickerVideoDeletions(container, hmbPickerStateFromProps(nextProps || {})),
     ) };
@@ -16318,6 +16329,10 @@ function hmbNativeUiImplementation(container, props) {
         || state,
     );
     if (stabilizedEcho.protected) {
+      // Retain only the protected media choices, together with the incoming
+      // operation status/metadata. Controls must not read the old pending
+      // EMPTY/READING_SCENE snapshot after the completed READ is displayed.
+      container.__hmbPendingPickerState = normalize(stabilizedEcho.state);
       patchMountedPicker({ ...(nextProps || {}), value: stabilizedEcho.state });
       return;
     }

@@ -304,7 +304,8 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
-            "- Publishes the full Team v0.8.71 feature set verified in installed Local v0.8.72, including Analysis Agent, Sound Library, Rodong Mart, 13 widgets and all six UI image sheets. Local remains v0.8.72.",
+            "- Publishes the full Team feature set shared with the verified Local build, including Analysis Agent, Sound Library, Rodong Mart, 13 widgets and all six UI image sheets.",
+            "- Fixes Picker READ completion after another Shot was rendered: reconciles captured Shot drafts before execution, accepts runtime-scoped completion acknowledgements independently of optimistic media selection, and bounds completed Maya worker/console shutdown without changing existing outputs or bindings.",
             "- Preserves the v0.8.65 saved-shot restoration hotfix, per-Shot Picker scene state, cross-Shot video concatenation, authored bindings and existing outputs.",
             "- Distinguishes imported reference videos from generated Playblasts and carries verified analysis provenance and current source references through Agent and Generator request payloads.",
             "- Verifies Korean Prompt fields, analysis observations, exact quoted text and five-Shot save restoration with current-SDK transport and browser tests. Controlled responses do not establish live model translation quality.",
