@@ -305,6 +305,7 @@ jobs:
             "## HMB GP Production $releaseLabel",
             "",
             "- Publishes the full Team feature set shared with the verified Local build, including Analysis Agent, Sound Library, Rodong Mart, 13 widgets and all six UI image sheets.",
+            "- Fixes Original output for saved Maya rigs whose eye shading groups retain hidden intermediate history meshes. Proven out-of-scope history memberships remain untouched; ambiguous render targets and material restore failures still stop safely, preserving completed outputs and Shot bindings.",
             "- Fixes Picker READ completion after another Shot was rendered: reconciles captured Shot drafts before execution, accepts runtime-scoped completion acknowledgements independently of optimistic media selection, and bounds completed Maya worker/console shutdown without changing existing outputs or bindings.",
             "- Separates READ admission and receipts for all five Shot workspaces. Object and JSON-string widget requests receive an acknowledgement before network-file inspection; queued reads, cancellation and late results retain their exact Shot and workflow ownership.",
             "- Preserves the v0.8.65 saved-shot restoration hotfix, per-Shot Picker scene state, cross-Shot video concatenation, authored bindings and existing outputs.",

@@ -291,7 +291,7 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.8.73",
+    "library_version": "0.8.75",
     "engine_version": "",
     "agent_policy_delivery": {
       "archive_source_count": 91,

@@ -4710,6 +4710,8 @@ class _OriginalLambertOverrideController(object):
         self.eye_native_resolving = set()
         self.eye_fallback_shaders = {}
         self.eye_fallback_shader_info = {}
+        self.inactive_intermediate_members = {}
+        self.material_pass_shapes_snapshot = set()
         self.finished = False
         self.report = {
             "profile": ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
@@ -4738,6 +4740,8 @@ class _OriginalLambertOverrideController(object):
             "preserved_eye_shape_count": 0,
             "preserved_eye_component_count": 0,
             "preserved_eye_shading_engine_count": 0,
+            "preserved_inactive_intermediate_member_count": 0,
+            "preserved_inactive_intermediate_members": [],
             "material_pass_source": "|".join(ORIGINAL_MATERIAL_PASS_SETS),
             "material_pass_sources": list(ORIGINAL_MATERIAL_PASS_SETS),
             "material_pass_shape_count": 0,
@@ -4844,11 +4848,50 @@ class _OriginalLambertOverrideController(object):
             raise RuntimeError("Original eye face membership has an invalid range: " + member)
         return last - first + 1
 
+    def _inactive_intermediate_member_shape(self, member, preserved_shapes):
+        """Prove a dormant history-only SG member can remain untouched.
+
+        Real saved rigs can retain face members on a hidden transform whose
+        only child is an intermediate mesh. Such a member has no final surface
+        to resolve or shade. Do not relax ambiguous final-surface handling:
+        this exception needs one exact owner, one intermediate mesh, explicit
+        hidden visibility and no render/material-pass descendant.
+        """
+        owner, separator, component = _clean(member).partition(".")
+        if separator and not re.match(r"^f\[[0-9]+(?::[0-9]+)?\]$", component):
+            return ""
+        try:
+            paths = sorted(set(cmds.ls(owner, long=True, allPaths=True) or []))
+            if len(paths) != 1:
+                return ""
+            path = paths[0]
+            if cmds.nodeType(path) not in ("transform", "joint"):
+                return ""
+            if cmds.getAttr(path + ".visibility") not in (False, 0):
+                return ""
+            shapes = sorted(set(cmds.listRelatives(path, shapes=True, fullPath=True) or []))
+            if len(shapes) != 1:
+                return ""
+            shape = shapes[0]
+            if cmds.nodeType(shape) != "mesh" or not _is_intermediate_shape(shape):
+                return ""
+            if cmds.listRelatives(path, shapes=True, noIntermediate=True, fullPath=True):
+                return ""
+            for scoped in set(self.scope_shapes) | set(preserved_shapes):
+                if scoped == path or scoped.startswith(path + "|"):
+                    return ""
+            return shape
+        except Exception:
+            # An incomplete proof must retain the original exact-resolution
+            # failure rather than silently excluding a possible render target.
+            return ""
+
     def _eye_group_plan(self, active_groups):
         preserved_shapes = (
             set(self.job.get("_mask_material_pass_shapes") or [])
             if self.material_pass_only else _original_pass_set_shapes()
         )
+        self.material_pass_shapes_snapshot = set(preserved_shapes)
         named_eye_shapes = [shape for shape in self.scope_shapes if _original_eye_shape(shape, preserved_shapes)]
         self.report["material_pass_shape_count"] = len(named_eye_shapes)
         self.report["material_pass_scoped_shape_count"] = len(named_eye_shapes)
@@ -4865,7 +4908,20 @@ class _OriginalLambertOverrideController(object):
             body_members = []
             eye_member_count = 0
             for member in members:
-                shape = self._member_shape(member)
+                try:
+                    shape = self._member_shape(member)
+                except RuntimeError:
+                    inactive_shape = self._inactive_intermediate_member_shape(member, preserved_shapes)
+                    if not inactive_shape:
+                        raise
+                    self.report["preserved_inactive_intermediate_member_count"] += 1
+                    self.inactive_intermediate_members[(group, member)] = inactive_shape
+                    self.report["preserved_inactive_intermediate_members"].append({
+                        "shading_group": group, "member": member, "shape": inactive_shape,
+                    })
+                    # Keep the exact authored membership in its original SG;
+                    # never pass a non-rendering history component to forceElement.
+                    continue
                 if _original_eye_shape(shape, preserved_shapes):
                     eye_member_count += 1
                     retained_shapes.add(shape)
@@ -5104,7 +5160,20 @@ class _OriginalLambertOverrideController(object):
                     cmds.disconnectAttr(incoming, destination)
                 expected = []
             self.eye_fallback_expected_connections[destination] = expected
-        shapes = sorted(set(self._member_shape(member) for member in self._group_members(group)))
+        shapes = set()
+        for member in self._group_members(group):
+            try:
+                shapes.add(self._member_shape(member))
+            except RuntimeError:
+                # The compatibility shader revisits the same SG after the
+                # body split. Keep only the already-proven history members
+                # excluded from rendered-shape evidence, and recheck the proof
+                # rather than accepting new or now-visible ambiguous members.
+                inactive_shape = self.inactive_intermediate_members.get((group, member))
+                if (not inactive_shape or self._inactive_intermediate_member_shape(
+                        member, self.material_pass_shapes_snapshot) != inactive_shape):
+                    raise
+        shapes = sorted(shapes)
         self.report["eye_fallback_records"].append({
             "shading_engine": group, "source_shader_plug": source,
             "native_shader": shader, "affected_shapes": shapes,

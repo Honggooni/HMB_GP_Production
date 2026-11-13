@@ -65,6 +65,14 @@ class CGTWorkNode(unittest.TestCase):
   self.result={'schema':'hmb-cgt-work-start-result-v1','status':'completed','updated_count':1,'observed_tasks':self.observed}
   self.catalog=mock.patch.object(cgt,'catalog',return_value=copy.deepcopy(self.snapshot));self.catalogmock=self.catalog.start();self.addCleanup(self.catalog.stop)
   self.start=mock.patch.object(cgt,'start_own_wait_after_commit',return_value=copy.deepcopy(self.result));self.startmock=self.start.start();self.addCleanup(self.start.stop)
+  # Join this exact fixture node before its module mocks are removed.
+  # A later setUp inside a subtest can replace self.node; retain ownership.
+  self.addCleanup(self._join_fixture_workers,self.node)
+ def _join_fixture_workers(self,node):
+  for name in ('_hmb_cgt_thread','_hmb_cgt_work_thread'):
+   worker=getattr(node,name,None)
+   if worker is not None:
+    worker.join(4);self.assertFalse(worker.is_alive(),'fixture worker leaked: '+name)
  def drain(self,which):
   worker=getattr(self.node,which,None)
   if worker is not None:worker.join(4);self.assertFalse(worker.is_alive())
@@ -144,7 +152,7 @@ class CGTWorkNode(unittest.TestCase):
  def test_confirmed_work_only_never_starts(self):
   self.command['binding']['members'][0]['status']='Work';self.snapshot['tasks'][0]['status']='Work'
   self.catalogmock.return_value=copy.deepcopy(self.snapshot)
-  self.commit();self.assertEqual(self.holder['responses'][-1]['outcome'],'committed')
+  self.commit();self.drain('_hmb_cgt_work_thread');self.assertEqual(self.holder['responses'][-1]['outcome'],'committed')
   self.assertFalse(self.startmock.called)
  def test_cancel_after_commit_does_not_cancel_work_start(self):
   entered=threading.Event();release=threading.Event()

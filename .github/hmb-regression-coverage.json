@@ -3723,6 +3723,12 @@
       "mode": "ci",
       "coverage": "host_browser",
       "required": true
+    },
+    {
+      "name": "HMB_VideoPicker_Inactive_Intermediate_Membership_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
     }
   ]
 }
