@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import shutil
 import subprocess
 import sys
@@ -203,6 +204,8 @@ class InstallerTransaction(unittest.TestCase):
             "old-runtime.py": b"previous runtime retained",
             ".hmb-install-receipt.json": b'{"previous":true}',
             "reports/result.json": b'{"task_id":"fixture-task","result":"preserve"}',
+            "user-data/workflow.json": b'{"shot_id":"shot-uuid","image_binding":"asset-uid","video_binding":"picker-uid"}',
+            "user-settings.json": b'{"active_project":"existing-project"}',
             ".venv/Scripts/keep.bin": b"existing environment retained",
             ".venv-tos/Scripts/keep.bin": b"existing isolated environment retained",
         }.items():
@@ -210,11 +213,7 @@ class InstallerTransaction(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
         self.before = self.inventory(self.target)
-        constants = {}
-        for node in ast.parse((ROOT / "tools/package_runtime_release.py").read_text("utf-8")).body:
-            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
-                if node.targets[0].id in ("RUNTIME_INSTALL_FILES", "DISTRIBUTION_ONLY_FILES"):
-                    constants[node.targets[0].id] = ast.literal_eval(node.value)
+        constants = runpy.run_path(str(ROOT / "tools/package_runtime_release.py"))
         # Installer paths and explicit fault injection are fixture-only. No
         # production path, app process or provider is accessed.
         expected_parent = "Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'GriptapeNodes\\libraries'"
@@ -280,6 +279,7 @@ class InstallerTransaction(unittest.TestCase):
             rows.append({"path": name, "install": name in constants["RUNTIME_INSTALL_FILES"],
                          "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
         self.runtime = [row for row in rows if row["install"]]
+        self.editor_support = [row for row in rows if not row["install"] and row["path"].startswith(("resources/editor/", "tools/"))]
         manifest = {"schema": "hmb-release-closure", "version": 1, "release_version": "0.8.30",
                     "file_count": len(rows), "install_file_count": len(self.runtime),
                     "distribution_file_count": len(rows) - len(self.runtime),
@@ -511,25 +511,46 @@ try {
         self.engine_python.write_bytes(b"not an executable; must never be invoked")
         self.assert_reparse_rejected(self.make_junction(engine))
 
-    def test_success_verifies_60_runtime_files_and_preserves_user_state(self):
+    def test_success_verifies_runtime_closure_and_preserves_user_state(self):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("HMB_RUNTIME_INSTALL_OK", result.stdout)
-        self.assertIn("RUNTIME_FILES=60", result.stdout)
+        self.assertIn(f"RUNTIME_FILES={len(self.runtime)}", result.stdout)
         receipt = json.loads((self.target / ".hmb-install-receipt.json").read_text("utf-8-sig"))
         self.assertEqual(receipt["runtime_fingerprint_sha256"], self.fingerprint(self.runtime))
-        self.assertEqual(len(receipt["runtime_files"]), 60)
+        self.assertEqual(len(receipt["runtime_files"]), len(self.runtime))
         self.assertTrue(receipt["native_editor_patch"]["changed"])
         self.assertEqual(self.native.read_bytes(), self.native_candidate)
         installed = self.inventory(self.target)
         for row in self.runtime:
             self.assertEqual(installed[row["path"]], row["sha256"])
-        for name in ("reports/result.json", ".venv/Scripts/keep.bin", ".venv-tos/Scripts/keep.bin"):
+        for name in ("reports/result.json", "user-data/workflow.json", "user-settings.json",
+                     ".venv/Scripts/keep.bin", ".venv-tos/Scripts/keep.bin"):
             self.assertEqual(installed[name], self.before[name])
         backups = list(self.rollback.glob("v*"))
         self.assertEqual(len(backups), 1)
         self.assertEqual(self.inventory(backups[0]), {name: value for name, value in self.before.items()
                                                      if name in ("old-runtime.py", ".hmb-install-receipt.json")})
+
+    def test_first_install_retains_editor_and_ui_support(self):
+        self.target.rename(self.base / "unused-existing-install")
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        receipt_path = self.target / ".hmb-install-receipt.json"
+        receipt = json.loads(receipt_path.read_text("utf-8-sig"))
+        self.assertEqual(receipt["runtime_fingerprint_sha256"], self.fingerprint(self.runtime))
+        expected = {row["path"]: row["sha256"] for row in self.runtime + self.editor_support}
+        installed = self.inventory(self.target)
+        installed.pop(receipt_path.name)
+        self.assertEqual(installed, expected)
+        self.assertEqual({row["path"]: row["sha256"] for row in receipt["editor_support_files"]},
+                         {row["path"]: row["sha256"] for row in self.editor_support})
+        self.assertEqual(self.native.read_bytes(), self.native_candidate)
+
+    def test_damaged_ui_asset_is_rejected_before_upgrade(self):
+        artwork = self.source / "resources/editor/hmb-continue-work-01-10.webp"
+        artwork.write_bytes(artwork.read_bytes() + b"broken")
+        self.assert_preserved_failure("none", "hmb-continue-work-01-10.webp")
 
 
 if __name__=="__main__":

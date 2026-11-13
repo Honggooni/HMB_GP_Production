@@ -294,10 +294,10 @@ for (const eventName of ["mousedown", "dblclick", "wheel"]) {
 }
 agentRowSelect.handler("click")();
 agentRowSelect.handler("click")();
-assert.equal(rowActions.length, 0, "Selection feedback must precede dispatch and yield a paint.");
+assert.equal(rowActions.length, 1, "A page command must dispatch immediately even when frame callbacks are throttled.");
 assert.equal(agentRowSelect.getAttribute("aria-expanded"), "false", "Collapse feedback is immediate.");
 paintAgentRowFrame();
-assert.equal(rowActions.length, 0, "The first frame paints the optimistic row before native work.");
+assert.equal(rowActions.length, 1, "Frame callbacks must not duplicate the pending native command.");
 paintAgentRowFrame();
 assert.equal(rowActions.length, 1, "Pending same-row clicks must not publish duplicate actions.");
 assert.equal(rowActions[0].action.kind, "select");
@@ -312,7 +312,7 @@ assert.equal(agentRowSelect.getAttribute("aria-expanded"), "false");
 assert.equal(agentRowStatus.textContent, "Agent 실행 중…");
 assert.equal(agentRowRun.getAttribute("aria-label"), "Cancel Shot Agent");
 agentRowRun.handler("click")();
-assert.equal(rowActions.length, 1, "Run/Cancel also paints its pending state before dispatch.");
+assert.equal(rowActions.length, 2, "Cancel must dispatch once immediately without a paint dependency.");
 paintAgentRowFrame(); paintAgentRowFrame();
 assert.equal(rowActions[1].action.kind, "cancel_selected", "Run controls cancel only their exact running Shot.");
 assert.deepEqual(rowActions[1].shot, rowState.shot);
@@ -964,11 +964,12 @@ promptContainer.handler("pointerdown")({
   stopPropagation() { promptRootStops += 1; },
 });
 assert.equal(promptRootStops, 1);
-assert.equal(
-  promptContainer.handler("click"),
-  undefined,
-  "Prompt background clicks are not swallowed by the widget root.",
-);
+let delegatedClickStops = 0;
+const click = { stopPropagation() { delegatedClickStops += 1; } };
+promptContainer.handler("click")({ ...click, target: { closest: () => null } });
+assert.equal(delegatedClickStops, 0, "Prompt background clicks reach the canvas.");
+promptContainer.handler("click")({ ...click, target: { closest: () => textInput } });
+assert.equal(delegatedClickStops, 1, "Prompt control clicks stay within the widget.");
 assert.equal(promptContainer.handler("wheel"), undefined);
 for (const className of ["nodrag", "nopan", "nowheel"]) {
   assert.equal(
@@ -1007,8 +1008,8 @@ assert.equal(prevented, 0, "Delete keeps its native text editing action.");
 assert.ok(textInput.classList.contains("nodrag"));
 assert.ok(textInput.classList.contains("nopan"));
 assert.ok(textInput.classList.contains("nowheel"));
-assert.equal(typeof textInput.handler("mousedown"), "function", "Mouse selection stays inside the text bar.");
-textInput.handler("mousedown")({
+promptContainer.handler("mousedown")({
+  target: { closest: () => textInput },
   stopPropagation() { stopped += 1; },
 });
 assert.equal(stopped, 3, "Mouse-down does not select the whole library node.");

@@ -17,12 +17,14 @@ import json
 from pathlib import Path
 import socket
 import sys
+import os
 import tempfile
 import threading
 import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+import wave
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -30,6 +32,9 @@ sys.dont_write_bytecode = True
 if importlib.util.find_spec("griptape_nodes") is None:
     print("HMB_AGENT_CURRENT_STANDARD_TRANSPORT=SKIP (installed SDK required)")
     raise SystemExit(0)
+
+standard = Path(os.environ.get("HMB_GRIPTAPE_STANDARD_LIBRARY_PATH") or Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard")
+sys.path.extend([str(standard), str(standard / ".venv/Lib/site-packages")])
 
 import httpx
 from openai import AsyncOpenAI
@@ -40,6 +45,7 @@ from griptape_nodes_library.llm import models as native_models
 from griptape_nodes_library.llm.agent_state import AgentState
 from griptape_nodes_library.llm.model_config import ModelConfig, ModelProvider
 import HMBAgentLibrary as hmb
+import HMBAnalysisAgent
 import HMBPromptLibrary as prompt_module
 import _hmb_agent_media as media
 from _hmb_bundled_policy_session import install_bundled_policy_session
@@ -194,6 +200,50 @@ class NativeTransport(unittest.TestCase):
         self.assertFalse(any(rule in str(self.node.parameter_output_values)
             for rule in self.node._hmb_policy_rules + self.node._hmb_binding_rules))
 
+    def test_korean_five_prompt_fields_analysis_and_exact_dialogue_reach_native_request(self):
+        fields = {
+            "PROJECT_STYLE_LOOK": "슈퍼윙스의 기존 디자인과 따뜻한 노을빛을 유지하세요.",
+            "SCENE_CONTEXT": "까투리가 왼쪽에서 들어와 소품을 집습니다.\n카메라는 천천히 오른쪽으로 이동합니다.",
+            "EMOTION_INTENT": "처음에는 당황하고, 친구를 본 뒤 안도합니다. 과장하지 마세요.",
+            "VIDEO_VFX": "@video2의 불꽃 타이밍을 참고하세요. 강도 0, 흔들림 OFF.\n이름: ‘재호’·까투리 😀",
+            "PRESERVED_TEXT": '  [Dialogue] "괜찮아, 함께 가자!"\r\n[On-screen Text] “출입 금지”\n' + LITERAL,
+        }
+        state = prompt_module._normalize_state({"text": fields})
+        restored = prompt_module._normalize_state(json.loads(prompt_module._json_dumps(state)))
+        self.assertEqual(restored["text"], fields)
+        machine = prompt_module._build_data_only_prompt_package(restored)
+        self.node._hmb_runtime_prompt = machine
+        self.snapshot["machine_sha256"] = hashlib.sha256(machine.encode("utf-8")).hexdigest()
+        scope = {"enabled": True, "channel_uuid": "korean-channel", "shot_uuid": "korean-shot"}
+        self.node._hmb_shot_channel_subscription = lambda: scope
+        self.node._hmb_revalidate_prompt_manager_owner = lambda: setattr(
+            self.node, hmb._VERIFIED_PROMPT_SOURCE_ATTRIBUTE, self.source)
+        observation = '카메라가 왼쪽으로 움직이고, 파란 불꽃이 "두 번" 나타납니다.'
+        raw = {"schema": "hmb-reference-analysis-context", "version": 1,
+            "channel_uuid": scope["channel_uuid"], "shot_uuid": scope["shot_uuid"],
+            "source_kind": "video", "source_reference": "@video2", "analysis_status": "completed",
+            "items": [{"category": "effect_timing", "observation": observation, "start": 0, "end": 1.5}]}
+        self.final_text = 'Keep the original character design. Exact dialogue: "괜찮아, 함께 가자!" On-screen text: “출입 금지”.'
+        with mock.patch("HMBAnalysisAgent.get_analysis_context", return_value=raw):
+            result = self.run_native()
+        self.assertEqual(len(self.captured), 1)
+        user = [item for item in self.captured[0]["messages"] if item["role"] == "user"][-1]["content"]
+        text = user if isinstance(user, str) else "\n".join(item["text"] for item in user if item["type"] == "text")
+        self.assertIn(machine, text)
+        sent_fields = json.loads(text.split(prompt_module.USER_DESCRIPTION_DATA_HEADER + "\n", 1)[1].splitlines()[0])
+        for field, original in fields.items():
+            self.assertEqual(sent_fields[field], original, field)
+            self.assertEqual(sent_fields[field].encode("utf-8"), original.encode("utf-8"), field)
+        analysis = json.loads(text.split("HMB SELECTED REFERENCE ANALYSIS (READ-ONLY SOURCE DATA):\n", 1)[1].splitlines()[0])
+        self.assertEqual(analysis["items"][0]["observation"], observation)
+        self.assertEqual(analysis["items"][0]["start_source_seconds"], 0)
+        self.assertEqual(analysis["source_reference"], "@video2")
+        self.assertEqual(text.count(hmb._AGENT_ENGLISH_OUTPUT_CONTRACT), 1)
+        self.assertNotIn("\ufffd", text)
+        self.assertEqual(result.output, self.final_text)
+        self.assertEqual(self.node.parameter_output_values["output"], self.final_text)
+        self.assertFalse(ATTEMPTS)
+
     def test_current_structured_output_and_native_tools(self):
         self.values["output_schema"] = {"type": "object", "properties": {"instruction": {"type": "string"}},
             "required": ["instruction"], "additionalProperties": False}
@@ -256,6 +306,93 @@ class NativeTransport(unittest.TestCase):
         self.assertTrue(media.driver_accepts_images(actual))
         actual.model.base_url = "https://offline-fixture.invalid"
         self.assertFalse(media.driver_accepts_images(actual))
+
+
+    def test_selected_analysis_is_private_context_for_agent_even_with_generator(self):
+        from _hmb_analysis_delivery import analysis_delivery_context
+
+        scope = {"enabled": True, "channel_uuid": "fixture-channel", "shot_uuid": "fixture-shot"}
+        self.node._hmb_shot_channel_subscription = lambda: scope
+        self.node._hmb_shot_generator = object()
+        # This fixture exercises the model transport without a registered graph.
+        # Production revalidation supplies the verified source at this boundary.
+        self.node._hmb_revalidate_prompt_manager_owner = lambda: setattr(
+            self.node, hmb._VERIFIED_PROMPT_SOURCE_ATTRIBUTE, self.source)
+        raw = {
+            "schema": "hmb-reference-analysis-context", "version": 1,
+            "channel_uuid": scope["channel_uuid"], "shot_uuid": scope["shot_uuid"],
+            "source_reference": "@video2", "source_id": "video:" + "a" * 64,
+            "source_origin": "prompt", "analysis_status": "completed", "original_requested": True,
+            "source_kind": "video", "items": [
+                {"category": "effect_timing", "observation": "Isolated synthetic blue pulse",
+                 "start": 0.25, "end": 0.75, "source": "PRIVATE-LOCAL-PATH"},
+                {"category": "not-selected-or-supported", "observation": "REJECT-ME"},
+            ],
+        }
+        with mock.patch("HMBAnalysisAgent.get_analysis_context", return_value=raw) as getter:
+            self.assertEqual(self.run_native().output, FINAL)
+        getter.assert_called_once_with(self.source, channel_uuid="fixture-channel",
+                                       shot_uuid="fixture-shot", destination="agent")
+        self.assert_bound()
+        serialized = json.dumps(self.captured[0], ensure_ascii=False)
+        self.assertIn("Isolated synthetic blue pulse", serialized)
+        self.assertIn("start_source_seconds", serialized)
+        self.assertIn("source_reference", serialized)
+        self.assertIn("@video2", serialized)
+        self.assertIn("completed", serialized)
+        self.assertIn("analysis_evidence", serialized)
+        self.assertNotIn("PRIVATE-LOCAL-PATH", serialized)
+        self.assertNotIn("REJECT-ME", serialized)
+        self.assertEqual(self.values["prompt"], "human view")
+        raw.update(source_reference="@video2\nPRIVATE-LOCAL-PATH", source_id="C:/private/source.mov",
+                   original_requested=False)
+        with mock.patch("HMBAnalysisAgent.get_analysis_context", return_value=raw):
+            bounded = analysis_delivery_context(self.source, channel_uuid="fixture-channel",
+                                               shot_uuid="fixture-shot", destination="agent")
+        self.assertNotIn("source_reference", bounded)
+        self.assertNotIn("source_id", bounded)
+        self.assertFalse(bounded["original_requested"])
+        raw["shot_uuid"] = "different-shot"
+        with mock.patch("HMBAnalysisAgent.get_analysis_context", return_value=raw):
+            self.assertEqual(analysis_delivery_context(self.source, channel_uuid="fixture-channel",
+                                                       shot_uuid="fixture-shot", destination="agent"), {})
+
+    def audio_original_fixture(self):
+        scope = {"enabled": True, "channel_uuid": "fixture-channel", "shot_uuid": "fixture-shot"}
+        self.node._hmb_shot_channel_subscription = lambda: scope
+        self.node._hmb_shot_generator = object()
+        self.node._hmb_revalidate_prompt_manager_owner = lambda: setattr(
+            self.node, hmb._VERIFIED_PROMPT_SOURCE_ATTRIBUTE, self.source)
+        path = Path(self.temporary.name) / "original.wav"
+        with wave.open(str(path), "wb") as sound:
+            sound.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+            sound.writeframes(b"\x10\x00" * 16000)
+        return {"kind": "audio", "path": str(path), "source_id": "fixture-audio", "start": .1, "end": .6}
+
+    def test_opted_original_audio_reaches_native_agent_once(self):
+        original = self.audio_original_fixture()
+        self.values["model"] = "gemini-2.5-flash"
+        with mock.patch("HMBAnalysisAgent.get_analysis_originals", return_value=[original]) as getter:
+            self.assertEqual(self.run_native().output, FINAL)
+        getter.assert_called_once_with(self.source, channel_uuid="fixture-channel",
+                                       shot_uuid="fixture-shot", preview=False)
+        user = [row for row in self.captured[0]["messages"] if row["role"] == "user"][-1]
+        self.assertEqual(sum(part["type"] == "input_audio" for part in user["content"]), 1)
+        self.assertIn("@analysis_original", json.dumps(user))
+        self.assertNotIn(original["path"], json.dumps(user, ensure_ascii=False).replace("\\\\", "\\"))
+
+    def test_unsupported_audio_model_stops_before_native_request(self):
+        original = self.audio_original_fixture()
+        self.values["model"] = "claude-sonnet-5"
+        with mock.patch("HMBAnalysisAgent.get_analysis_originals", return_value=[original]) as getter:
+            with self.assertRaisesRegex(RuntimeError, "Protected native Agent scheduler step failed"):
+                self.run_native()
+        getter.assert_called_once_with(self.source, channel_uuid="fixture-channel",
+                                       shot_uuid="fixture-shot", preview=False)
+        self.assertEqual(self.captured, [])
+        self.assertEqual(self.node._hmb_native_failure_code, "ANALYSIS_AUDIO_UNSUPPORTED")
+        self.assertIn("음원 입력을 지원하지 않습니다",
+                      hmb._hmb_execution_failure_message(self.node._hmb_native_failure_code))
 
 
 if __name__ == "__main__":

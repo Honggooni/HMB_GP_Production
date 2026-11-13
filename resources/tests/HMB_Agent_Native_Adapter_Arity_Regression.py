@@ -20,6 +20,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 SOURCE = Path(os.environ.get('HMB_AGENT_ADAPTER_SOURCE', ROOT / 'HMBAgentLibrary.py'))
 TREE = ast.parse(SOURCE.read_bytes(), filename=str(SOURCE))
 
@@ -47,14 +48,14 @@ GLOBALS = {
     'NativeBoundary': NativeBoundary,
 }
 FUNCTIONS = [method('_run_native_with_literal_hmb_input'), method('_hmb_native_failure_code')]
-MODEL_SELECTION_ERROR = deepcopy(next(
+ERROR_CLASSES = [deepcopy(next(
     n for n in TREE.body
-    if isinstance(n, ast.ClassDef) and n.name == '_HMBModelSelectionRequired'
-))
+    if isinstance(n, ast.ClassDef) and n.name == name
+)) for name in ('_HMBModelSelectionRequired', '_HMBAnalysisOriginalError')]
 CLASS = ast.ClassDef(name='ProductAdapter', bases=[ast.Name(id='NativeBoundary', ctx=ast.Load())],
                      keywords=[], body=[method('_process')], decorator_list=[])
 compiled = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0),
-                           MODEL_SELECTION_ERROR, *FUNCTIONS, CLASS], type_ignores=[])
+                           *ERROR_CLASSES, *FUNCTIONS, CLASS], type_ignores=[])
 exec(compile(ast.fix_missing_locations(compiled), str(SOURCE), 'exec'), GLOBALS)
 Adapter = GLOBALS['ProductAdapter']
 literal_run = GLOBALS['_run_native_with_literal_hmb_input']
@@ -106,6 +107,8 @@ class NativeAdapterArity(unittest.TestCase):
         self.node._hmb_lifecycle_generation = 1
         self.node._hmb_lifecycle_is_live = lambda generation: generation == 1
         self.node._hmb_revalidate_prompt_manager_owner = lambda: None
+        self.node._hmb_shot_channel_subscription = lambda: {"enabled": False}
+        self.node._set_hmb_execution_stage = lambda _stage: None
         self.node.is_cancellation_requested = False
         self.node._hmb_runtime_prompt = 'Verified source remains caller-owned.'
         self.state = SimpleNamespace(model='native-state')

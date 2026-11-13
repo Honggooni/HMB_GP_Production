@@ -36,7 +36,8 @@ const nativeResizeCSS=(editorCSS.match(/[^{}]*\.react-flow__resize-control[^{}]*
 assert.ok(nativeResizeCSS.includes('cursor:nwse-resize')&&nativeResizeCSS.includes('cursor:nesw-resize'),'Installed native resize cursor styles are present');
 const hook=fs.readFileSync(path.join(root,'resources/editor/hmb-color-lut-native-header.js'),'utf8');
 const selectionHelpers='var '+between(original,'NOr=e=>',';function IOr(')+';';
-const actionCallbacks=between(original,'Ge=(0,S.useCallback)(async()=>{await _q',',tt=(0,S.useCallback)');
+const actionCallbacks=between(patched,'Ge=(0,S.useCallback)(async()=>{await _q',',tt=(0,S.useCallback)');
+const resetBridge='var '+between(patched,'LBt=(e,t)=>',',RBt=')+';';
 const resolveHelper='var '+between(original,'_q=(e,t=!1)',',vq=')+';';
 const lockHelper='var '+between(original,'UBt=(e,t)=>',',WBt=')+';';
 const actionNames=between(original,'var kQ=[',';function AQ(')+';';
@@ -49,7 +50,7 @@ assert.ok(nativeCarrier.includes('hmbIsNativeStudioWidget(t)?i:void 0'),'Disable
 
 const stubs=String.raw`
 window.nativeStore={nodeResolutionState:{},involvedNodes:new Set(),resolvingNodes:new Set(),nodeErrors:{},flowRunning:false};
-window.nodes=['LUT A','LUT B','Other'].map((name,i)=>({id:name,data:{node_name:name,node_type:i<2?'HMBColorLUTLibrary':'ExampleNode',locked:false}}));
+window.nodes=['LUT A','LUT B','Other'].map((name,i)=>({id:name,data:{node_name:name,node_type:i<2?'HMBColorLUTLibrary':'ExampleNode',metadata:i<2?{library:'HMB_GP_Production'}:{},locked:false}}));
 window.selected=['LUT A'];window.sdk=[];window.failLock=false;window.failRun=false;window.cleanMode=false;window.headerItems=['run'];
 window.expanded={};window.rolledUp={};window.animatedSize={};window.showWidget={'LUT A':true,'LUT B':true};window.showMeasurement={'LUT A':true,'LUT B':true};window.measurementModes={'LUT A':'visibility','LUT B':'visibility'};window.measurementEpochs={};window.headerEpochs={};window.widgetValues={};window.widgetHandles={};window.widgetUpdates={};window.nativeRenders={};window.epochs={};window.stateEvents=[];window.nativeDoubleClicks=[];
 window.resizeProps={};window.resizeCallbacks={};window.resizeEvents=[];window.resizeRenders={};
@@ -67,6 +68,10 @@ var lUt=async()=>{},ig={success:()=>{},error:()=>{}},QV={},rq=()=>null,pBt=()=>n
 var sJ=()=>({subscribeToEvent:()=>{}}),Wq=async()=>({flow_name:'Synthetic Scratch'}),$Bt=()=>{},nVt=async()=>{},BBt=async()=>{},hu=(changes,nodes)=>nodes.filter(node=>!changes.some(change=>change.id===node.id));
 window.geometryRefreshes=[];const refreshNativeGeometry=name=>window.geometryRefreshes.push(name);var FEr=()=>refreshNativeGeometry;
 var Xd={request:async(type,payload)=>{window.sdk.push({type,payload:structuredClone(payload)});
+  if(type==='HMBGetNodeConnectionsRequest'||type==='HMBManageNodeConnectionsRequest')return {node_name:payload.node_name,
+   state_token:'fixture-connected',detached:false,can_disconnect:true,can_reconnect:false,can_refresh:true,
+   refresh_confirmed:type==='HMBManageNodeConnectionsRequest'?true:null,
+   connections:[{kind:'wire',peer_name:'Synthetic Source',source_node_name:'Synthetic Source',target_node_name:payload.node_name,shots:[]}]};
  if(type==='BatchSetNodeLockStateRequest'&&window.failLock)throw new Error('Synthetic lock rejection');
  if(type==='ResolveNodeRequest'&&window.failRun)throw new Error('Synthetic resolve rejection');return {succeeded:true};}};
 window.getNodes=()=>window.nodes;window.setNodes=update=>{window.nodes=typeof update==='function'?update(window.nodes):update;window.rerender();};
@@ -122,7 +127,7 @@ function NodeRow({data}){
   isLUT&&window.showMeasurement[name]&&(0,R.jsx)('div',{'data-measurement-carrier':name,
    style:{visibility:window.measurementModes[name]==='visibility'?'hidden':'visible',display:window.measurementModes[name]==='display'?'none':'block',opacity:window.measurementModes[name]==='opacity'?0:1,position:'absolute',left:0,top:0,width:'880px',pointerEvents:'none'},
    children:(0,R.jsx)(YTr,widgetProps,name+'-measurement-'+(window.measurementEpochs[name]||0))}),
-  (0,R.jsx)('div',{'data-native-host':name,children:(0,R.jsx)(D$t,{node_name:name,node_type:data.node_type,node_category:'HMB',...actions,
+   (0,R.jsx)('div',{'data-native-host':name,children:(0,R.jsx)(D$t,{node_name:name,node_type:data.node_type,node_category:'HMB',hmbLibrary:data.metadata?.library,...actions,
    onDoubleClick:()=>window.nativeDoubleClicks.push(name),hmbHostExpanded:!yt},name+'-header-'+(window.headerEpochs[name]||0))}),
   isLUT&&window.showWidget[name]&&(0,R.jsx)('div',{'data-visible-carrier':name,
    children:(0,R.jsx)(YTr,widgetProps,name+'-'+(window.epochs[name]||0))}),
@@ -137,7 +142,7 @@ window.rerender=()=>appRoot.render((0,R.jsx)(App,{}));window.rerender();window.r
 `.replace('const ORIGINAL_NATIVE_ACTION_CALLBACKS;','const '+actionCallbacks+';').replace('ORIGINAL_NATIVE_RESIZE_ELEMENT',nativeResize);
 
 const moduleSource="import mount,{hmbColorLUTState} from '/widget.js';\n"+runtime+'\n'+jsxRuntime+'\n'+stubs+'\n'
- +selectionHelpers+'\n'+resolveHelper+'\n'+lockHelper+'\n'+actionNames+'\n'+hook+'\n'+header+'\n'+nativeCarrier+'\n'+fixture;
+  +selectionHelpers+'\n'+resolveHelper+'\n'+lockHelper+'\n'+actionNames+'\n'+hook+'\n'+resetBridge+'\n'+header+'\n'+nativeCarrier+'\n'+fixture;
 const html=`<!doctype html><meta charset="utf-8"><title>Synthetic native React header fixture</title><style>
 body{margin:8px;background:#101420;color:white;font:14px system-ui}#app{display:flex;align-items:flex-start;gap:18px}.react-flow__node{flex:0 0 880px;min-width:0;border:1px solid #506079;position:relative}[data-native-node-frame]{position:relative}[data-native-host]>div{min-height:48px;display:flex;align-items:center;justify-content:space-between;background:#552575}.native-tooltip{display:inline-flex}.native-tooltip>button{height:32px;width:32px;padding:0;background:#192131;color:white;border:0;border-radius:6px;display:inline-grid;place-items:center}.native-tooltip>button.bg-white{background:white;color:black}.native-tooltip>button:disabled{opacity:.4}.native-text{color:white}[data-native-host] input{color:white}.widget-container{height:850px}.hmb-native-header-identity>div{display:flex;gap:6px;align-items:center}.hmb-native-header-identity span{white-space:nowrap}.hmb-native-header-actions>div,.hmb-native-header-actions>div>div{display:flex;gap:3px}.react-flow__handle{width:8px;height:8px;background:cyan;position:absolute;bottom:0}[data-port$=output]{right:0}svg[data-wire]{position:absolute;width:1px;height:1px;pointer-events:none}
 ${nativeResizeCSS}
@@ -162,7 +167,7 @@ try{
  const assertMeasurementIsolation=async(label)=>{
   for(const name of ['LUT A','LUT B']){
    assert.equal(await visible(name).locator('.hmb-color-lut').getAttribute('data-hmb-native-header'),'active',label+': visible widget keeps portal ownership');
-   assert.equal(await actions(name).locator('button').count(),3,label+': all three actual native actions stay in the visible slot');
+   assert.equal(await actions(name).locator('button').count(),4,label+': all four actual native actions stay in the visible slot');
    if(await measurement(name).count()){
     assert.notEqual(await measurement(name).locator('.hmb-color-lut').getAttribute('data-hmb-native-header'),'active',label+': hidden measurement clone never activates');
     assert.equal(await measurement(name).locator('[data-hmb-native-actions] button,[data-hmb-native-identity] button').count(),0,label+': hidden clone has no native controls');
@@ -232,8 +237,8 @@ try{
  await assertMeasurementIsolation('Native header remount discovers the visible second carrier without a ready event');
  assert.equal(await page.evaluate(()=>window.sdk.length),beforeHeaderDiscovery,'Carrier discovery does not issue an SDK request');checks++;
  assert.deepEqual(errors,[],'Actual installed React/header code mounts without runtime errors');
- assert.equal(await actions('LUT A').locator('button').count(),3);
- assert.equal(await actions('LUT B').locator('button').count(),3);
+ assert.equal(await actions('LUT A').locator('button').count(),4);
+ assert.equal(await actions('LUT B').locator('button').count(),4);
  assert.equal(await node('Other').locator('[data-native-icon="run"]').count(),1);
  assert.equal(await node('Other').locator('[data-native-icon="reset"]').count(),0,'Non-LUT header preserves the original global header choice');
  assert.equal(await node('LUT A').locator('[data-native-host]>div').evaluate(element=>getComputedStyle(element).display),'none');
@@ -248,8 +253,10 @@ try{
  assert.equal(await page.evaluate(()=>window.sdk.filter(item=>/StartFlow|export|upload/i.test(item.type)).length),0);
  await button('LUT B','run').click();await page.waitForFunction(()=>window.sdk.filter(item=>item.type==='ResolveNodeRequest').length===2);
  assert.equal(await page.evaluate(()=>window.sdk.at(-1).payload.node_name),'LUT B','Each portal retains its own native callback owner');checks+=3;
- await button('LUT A','reset').click();await page.waitForFunction(()=>window.sdk.some(item=>item.type==='ResetNodeToDefaultsRequest'));
- assert.deepEqual(await page.evaluate(()=>window.sdk.filter(item=>item.type==='ResetNodeToDefaultsRequest')),[{type:'ResetNodeToDefaultsRequest',payload:{node_name:'LUT A'}}]);checks++;
+ await button('LUT A','reset').click();await page.waitForFunction(()=>window.sdk.some(item=>item.type==='HMBManageNodeConnectionsRequest'));
+ assert.deepEqual(await page.evaluate(()=>window.sdk.filter(item=>item.type==='HMBGetNodeConnectionsRequest')),[{type:'HMBGetNodeConnectionsRequest',payload:{node_name:'LUT A'}}]);
+ assert.deepEqual(await page.evaluate(()=>window.sdk.filter(item=>item.type==='HMBManageNodeConnectionsRequest')),[{type:'HMBManageNodeConnectionsRequest',payload:{node_name:'LUT A',operation:'refresh',expected_state_token:'fixture-connected'}}]);
+ assert.equal(await page.evaluate(()=>window.sdk.some(item=>item.type==='ResetNodeToDefaultsRequest')),false,'Native HMB refresh never resets authored values');checks+=3;
  await page.evaluate(()=>{window.selected=['LUT A','LUT B','Other'];});
  await button('LUT A','lock').click();await page.waitForFunction(()=>window.nodes.slice(0,2).every(node=>node.data.locked));
  assert.deepEqual(await page.evaluate(()=>window.sdk.filter(item=>item.type==='BatchSetNodeLockStateRequest').at(-1)),
@@ -316,7 +323,7 @@ try{
  await page.evaluate(()=>{window.headerEpochs['LUT A']=(window.headerEpochs['LUT A']||0)+1;window.rerender();});
  await frames();
  await assertMeasurementIsolation('Native header rediscovery beside opacity-zero footer');
- assert.equal(await actions('LUT A').locator('button').count(),3,'The visible widget keeps all three native actions');checks++;
+ assert.equal(await actions('LUT A').locator('button').count(),4,'The visible widget keeps all four native actions');checks++;
  await page.evaluate(()=>{window.measurementModes['LUT A']='visibility';window.measurementEpochs['LUT A']++;window.rerender();});
  await frames();
  await page.evaluate(()=>{window.expanded['LUT A']=false;window.rerender();});
@@ -328,14 +335,14 @@ try{
  assert.equal(await actions('LUT A').locator('button').count(),0);
  assert.equal(await visible('LUT A').locator('.widget-container').evaluate(element=>element.classList.contains('nodrag')),true);
  assert.equal(await node('LUT A').locator('[data-native-host] [data-native-icon="run"]').count(),1);
- assert.equal(await node('LUT A').locator('[data-native-host] [data-native-icon="reset"]').count(),0,'Collapsed/fallback host preserves global header choices');
- assert.equal(await actions('LUT B').locator('button').count(),3);checks+=5;
+ assert.equal(await node('LUT A').locator('[data-native-host] [data-native-icon="reset"]').count(),1,'Collapsed/fallback host retains approved HMB refresh action');
+ assert.equal(await actions('LUT B').locator('button').count(),4);checks+=5;
  await page.evaluate(()=>{window.expanded['LUT A']=true;window.rerender();});
  await page.waitForFunction(()=>document.querySelector('.react-flow__node[data-id="LUT A"] [data-visible-carrier] .hmb-color-lut').dataset.hmbNativeHeader==='active');
  await page.evaluate(()=>{window.epochs['LUT A']=(window.epochs['LUT A']||0)+1;window.rerender();});
  await page.waitForFunction(()=>document.querySelector('.react-flow__node[data-id="LUT A"] [data-visible-carrier] .hmb-color-lut')?.dataset.hmbNativeHeader==='active');
- assert.equal(await actions('LUT A').locator('button').count(),3);
- assert.equal(await actions('LUT B').locator('button').count(),3);
+ assert.equal(await actions('LUT A').locator('button').count(),4);
+ assert.equal(await actions('LUT B').locator('button').count(),4);
  await assertMeasurementIsolation('Visible YTr remount while measurement clone remains');
  assert.deepEqual(await page.locator('[data-port]').evaluateAll(elements=>elements.map(element=>element.dataset.port)),portsBefore);
  assert.equal(await page.locator('[data-wire="A-to-B"]').getAttribute('data-source'),'LUT A-output');checks+=4;
@@ -345,7 +352,7 @@ try{
  assert.equal(await node('LUT A').locator('[data-native-host] [data-native-icon="run"]').count(),1);
  assert.notEqual(await node('LUT A').locator('[data-native-host]>div').evaluate(element=>getComputedStyle(element).display),'none','Hidden measurement alone cannot hide the native fallback header');
  assert.notEqual(await measurement('LUT A').locator('.hmb-color-lut').getAttribute('data-hmb-native-header'),'active','Hidden clone stays inactive when its visible owner retires');checks+=2;
- assert.equal(await actions('LUT B').locator('button').count(),3);
+ assert.equal(await actions('LUT B').locator('button').count(),4);
  await page.evaluate(()=>{window.showWidget['LUT A']=true;window.rerender();});
  await page.waitForFunction(()=>document.querySelector('.react-flow__node[data-id="LUT A"] [data-visible-carrier] .hmb-color-lut')?.dataset.hmbNativeHeader==='active');
  await assertMeasurementIsolation('Visible widget returns beside surviving measurement clone');
@@ -358,20 +365,24 @@ try{
  const studioTypes=['HMBAgentLibrary','HMBFinishLookLibrary','HMBImageAssetLibrary','HMBImageBash',
   'HMBImageGeneration','HMBSeedanceGeneration','HMBPromptLibrary','HMBVideoPickerLibrary'];
  for(const type of studioTypes){
-  await page.evaluate(type=>{window.nodes.find(n=>n.id==='LUT B').data.node_type=type;
-   window.epochs['LUT B']=(window.epochs['LUT B']||0)+1;window.headerEpochs['LUT B']=(window.headerEpochs['LUT B']||0)+1;window.rerender();},type);
+  const passive=['HMBImageAssetLibrary','HMBVideoPickerLibrary'].includes(type);
+  const actionCount=passive?3:4;
+  await page.evaluate(({type,actionCount})=>{window.expectedActionCount=actionCount;window.nodes.find(n=>n.id==='LUT B').data.node_type=type;
+   window.epochs['LUT B']=(window.epochs['LUT B']||0)+1;window.headerEpochs['LUT B']=(window.headerEpochs['LUT B']||0)+1;window.rerender();},{type,actionCount});
   await page.waitForFunction(()=>document.querySelector('.react-flow__node[data-id="LUT B"]')?.getAttribute('data-hmb-color-lut-native-layout')==='active'
-   &&document.querySelectorAll('.react-flow__node[data-id="LUT B"] [data-visible-carrier] [data-hmb-native-actions] button').length===3);
-  assert.equal(await actions('LUT B').locator('button').count(),3,type+': native Lock/Reset/Run ownership');
+   &&document.querySelectorAll('.react-flow__node[data-id="LUT B"] [data-visible-carrier] [data-hmb-native-actions] button').length===window.expectedActionCount);
+  assert.equal(await actions('LUT B').locator('button').count(),actionCount,type+': native Lock/Reset/Run ownership');
   assert.equal(await page.evaluate(()=>window.resizeProps['LUT B'].isVisible),true,type+': unselected resize');
   await button('LUT B','lock').click();
   await page.waitForFunction(()=>window.nodes.find(n=>n.id==='LUT B').data.locked===true);
   await button('LUT B','unlock').click();
   await page.waitForFunction(()=>window.nodes.find(n=>n.id==='LUT B').data.locked===false);
-  const before=await page.evaluate(()=>window.sdk.filter(item=>item.type==='ResolveNodeRequest').length);
-  await button('LUT B','run').click();
-  await page.waitForFunction(before=>window.sdk.filter(item=>item.type==='ResolveNodeRequest').length===before+1,before);
-  assert.equal(await page.evaluate(()=>window.sdk.filter(item=>item.type==='ResolveNodeRequest').at(-1).payload.node_name),'LUT B');
+  if(!passive){
+   const before=await page.evaluate(()=>window.sdk.filter(item=>item.type==='ResolveNodeRequest').length);
+   await button('LUT B','run').click();
+   await page.waitForFunction(before=>window.sdk.filter(item=>item.type==='ResolveNodeRequest').length===before+1,before);
+   assert.equal(await page.evaluate(()=>window.sdk.filter(item=>item.type==='ResolveNodeRequest').at(-1).payload.node_name),'LUT B');
+  }else assert.equal(await button('LUT B','run').count(),0,type+': passive host has no Run action');
   checks+=5;
  }
  assert.deepEqual(errors,[],'Every supported native host type remounts and portals without React errors');checks++;

@@ -3,7 +3,7 @@
 import importlib.util
 from pathlib import Path
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -65,4 +65,16 @@ with patch.dict(sys.modules, {engine_module.__name__: engine_module}):
             raise AssertionError("The sidecar failure was swallowed")
     assert calls == [(path, metadata, engine)]
 
-print("HMB Seedance sidecar API: PASS (legacy/current/keyword/positional engine, correct context, exactly one write, no network)")
+    owner_engine = object()
+    workflow = SimpleNamespace(engine=owner_engine)
+    def workflow_writer(file_path, value, engine, workflow):
+        calls.append((file_path, value, engine, workflow))
+    def positional_workflow_writer(file_path, value, engine, workflow, /):
+        calls.append((file_path, value, engine, workflow))
+    for writer in (workflow_writer, positional_workflow_writer):
+        calls.clear()
+        with patch.object(target, 'write_sidecar', writer):
+            target._write_generation_sidecar(path, metadata, workflow=workflow)
+        assert calls == [(path, metadata, owner_engine, workflow)]
+
+print("HMB Seedance sidecar API: PASS (legacy/current/keyword/positional, owner workflow and engine, exactly one write, no network)")

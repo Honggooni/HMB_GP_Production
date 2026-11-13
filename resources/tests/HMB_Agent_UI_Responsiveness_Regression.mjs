@@ -35,14 +35,14 @@ try{
   const visual_ms=performance.now()-timing.start;
   return {visual_ms,calls:calls.length,active:rows[3].querySelector('.agent-shot-row').dataset.active,expanded:rows[3].querySelector('.agent-shot-tab').getAttribute('aria-expanded'),allBlocked:rows.every(row=>row.querySelector('.agent-shot-run').disabled),nativeOwner:body.previousElementSibling.id,nativeValue:originalInput.value};
  });
- assert.equal(immediate.calls,0);assert.equal(immediate.active,'true');assert.equal(immediate.expanded,'true');assert.equal(immediate.allBlocked,true);assert.equal(immediate.nativeOwner,'row1');assert.equal(immediate.nativeValue,'Authored Shot 1');
+ assert.equal(immediate.calls,1);assert.equal(immediate.active,'true');assert.equal(immediate.expanded,'true');assert.equal(immediate.allBlocked,true);assert.equal(immediate.nativeOwner,'row1');assert.equal(immediate.nativeValue,'Authored Shot 1');
  const firstFrame=await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>resolve({calls:calls.length,active:rows[3].querySelector('.agent-shot-row').dataset.active}))));
  assert.equal(firstFrame.active,'true');
  await page.waitForFunction(()=>calls.length===1);
  const dispatch=await page.evaluate(()=>({...timing,frame_delta:timing.dispatch_frame-timing.start_frame}));
- assert.ok(dispatch.frame_delta>=1,JSON.stringify(dispatch));
+ assert.equal(dispatch.frame_delta,0,JSON.stringify(dispatch));
  receipt.latency={visual_ms:immediate.visual_ms,dispatch_ms:dispatch.dispatch_ms,paint_frames_before_dispatch:dispatch.frame_delta};
- receipt.cases.push('Immediate selected color/chevron precedes one deferred dispatch; original native editor/input remains on its acknowledged Shot');
+ receipt.cases.push('Immediate selected color/chevron and one same-turn dispatch; original native editor/input remains on its acknowledged Shot');
  const stale=await page.evaluate(()=>{
   for(let n=0;n<50;n++)sync();rows[1].querySelector('.agent-shot-tab').click();rows[3].querySelector('.agent-shot-run').click();
   command.resolve();return {calls:calls.length,active:rows[3].querySelector('.agent-shot-row').dataset.active,blocked:rows.every(row=>row.querySelector('.agent-shot-run').disabled),nativeOwner:body.previousElementSibling.id};
@@ -105,20 +105,20 @@ try{
  });
  await page.waitForFunction(()=>calls.length===8);
  const originalWins=await page.evaluate(async()=>{expirePending();rows[4].querySelector('.agent-shot-run').click();ack(7);await new Promise(resolve=>setTimeout(resolve,180));return {calls:calls.length,owner:body.previousElementSibling.id,blocked:rows.some(row=>row.querySelector('.agent-shot-run').disabled)};});
- assert.deepEqual(originalWins,{calls:8,owner:'row5',blocked:false});receipt.cases.push('Original exact ACK arriving before scheduled refresh wins and cancels the unpublished refresh; no stale follow-up command or permanent lock');
+ assert.deepEqual(originalWins,{calls:9,owner:'row5',blocked:false});receipt.cases.push('Original exact ACK retires the immediate read-only refresh; no replay or permanent lock');
  await page.evaluate(()=>{
   const timer=window.setTimeout;window.setTimeout=(callback,ms,...args)=>{if(ms===15000)window.expirePending=callback;return timer(callback,ms,...args);};
   timing={start:performance.now(),start_frame:frames};rows[1].querySelector('.agent-shot-tab').click();window.setTimeout=timer;
  });
- await page.waitForFunction(()=>calls.length===9);await page.evaluate(()=>{expirePending();rows[1].querySelector('.agent-shot-run').click();});
- await page.waitForFunction(()=>calls.length===10);await page.evaluate(()=>ack(8));
- await page.evaluate(()=>rows[2].querySelector('.agent-shot-tab').click());await page.waitForFunction(()=>calls.length===11);await page.evaluate(()=>ack(10));
- const retiredRefresh=await page.evaluate(()=>{const stale={...value(2),selected:true,expanded:true,request_id:requests[9].next.action.request_id};handles[1].update({value:stale,onChange:onRow});return {selected:rows.flatMap((row,i)=>row.querySelector('[aria-pressed="true"]')?[i+1]:[]),owner:body.previousElementSibling.id,blocked:rows.some(row=>row.querySelector('.agent-shot-run').disabled)};});
+ await page.waitForFunction(()=>calls.length===10);await page.evaluate(()=>{expirePending();rows[1].querySelector('.agent-shot-run').click();});
+ await page.waitForFunction(()=>calls.length===11);await page.evaluate(()=>ack(9));
+ await page.evaluate(()=>rows[2].querySelector('.agent-shot-tab').click());await page.waitForFunction(()=>calls.length===12);await page.evaluate(()=>ack(11));
+ const retiredRefresh=await page.evaluate(()=>{const stale={...value(2),selected:true,expanded:true,request_id:requests[10].next.action.request_id};handles[1].update({value:stale,onChange:onRow});return {selected:rows.flatMap((row,i)=>row.querySelector('[aria-pressed="true"]')?[i+1]:[]),owner:body.previousElementSibling.id,blocked:rows.some(row=>row.querySelector('.agent-shot-run').disabled)};});
  assert.deepEqual(retiredRefresh,{selected:[3],owner:'row3',blocked:false});receipt.cases.push('Original ACK after refresh dispatch releases its confirmed view; a later retired refresh ACK cannot overwrite a subsequent accepted Shot');
  const cleanup=await page.evaluate(async()=>{
   const before=calls.length;timing={start:performance.now(),start_frame:frames};rows[4].querySelector('.agent-shot-tab').click();handles[4].cleanup();await new Promise(resolve=>setTimeout(resolve,180));return {calls:calls.length-before,blocked:rows.slice(0,4).some(row=>row.querySelector('.agent-shot-run').disabled)};
  });
- assert.deepEqual(cleanup,{calls:0,blocked:false});receipt.cases.push('Unmount before paint cancels both frame/timer dispatch and releases remaining rows without a retired callback');
+ assert.deepEqual(cleanup,{calls:1,blocked:false});receipt.cases.push('Unmount after immediate dispatch releases remaining rows without replay or a retired callback');
  await page.locator('#sdk').screenshot({path:path.join(out,'agent-responsive.png')});
  await page.evaluate(()=>{frameActive=false;handles.forEach(handle=>handle.cleanup());});
  assert.deepEqual(errors,[]);assert.equal(receipt.external_requests,0);receipt.passed=true;

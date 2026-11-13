@@ -22,6 +22,7 @@ from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
     CreateConnectionResultSuccess,
+    DeleteConnectionRequest,
     ListConnectionsForNodeRequest,
     ListConnectionsForNodeResultSuccess,
 )
@@ -36,11 +37,10 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import (
-    CreateNodeResultSuccess,
+    CreateNodeRequest,
     DeleteNodeRequest,
     DeleteNodeResultSuccess,
     ResetNodeToDefaultsRequest,
-    ResetNodeToDefaultsResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     DeleteWorkflowRequest,
@@ -1726,6 +1726,62 @@ def assert_seedance_recreate_widget_and_list_lifecycle_contract() -> None:
     assert fake_connections.incoming_index == {}
 
 
+@contextmanager
+def protected_seedance_host():
+    from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
+    from griptape_nodes.retained_mode.engine import engine_scope
+    from _hmb_library_bootstrap import HMBProductionLibrary, _Registration
+
+    classes = {cls.__name__: cls for cls in (target.HMBSeedanceGeneration,
+        image_asset_target.HMBImageAssetLibrary, video_picker_target.HMBVideoPickerLibrary)}
+    schema = LibrarySchema.model_validate_json((ROOT / "griptape-nodes-library.json").read_text("utf-8-sig"))
+    with engine_scope() as engine:
+        engine.event_manager.initialize_queue()
+        owner = HMBProductionLibrary.__new__(HMBProductionLibrary)
+        owner._registrations = set()
+        library = LibraryRegistry.generate_new_library(schema, advanced_library=owner)
+        for definition in schema.nodes:
+            if definition.class_name in classes:
+                cls = classes[definition.class_name]
+                library.register_lazy_node_type(definition.class_name, definition.metadata, lambda cls=cls: cls)
+        with mock.patch.object(_Registration, "start_web_worker", lambda *_: None):
+            owner.before_library_nodes_loaded(schema, library)
+            try:
+                yield engine
+            finally:
+                LibraryRegistry.unregister_library(schema.name, event_manager=engine.event_manager)
+
+
+def create_host_node(node_type, name):
+    result = GriptapeNodes.handle_request(CreateNodeRequest(node_type=node_type,
+        specific_library_name="HMB_GP_Production", node_name=name,
+        create_error_proxy_on_failure=False, broadcast_result=False))
+    assert result.succeeded(), str(result.result_details)
+    return GriptapeNodes.NodeManager().get_node_by_name(result.node_name)
+
+
+def disconnect_host_node(name):
+    from _hmb_connection_management import HMBGetNodeConnectionsRequest, HMBManageNodeConnectionsRequest
+
+    state = GriptapeNodes.handle_request(HMBGetNodeConnectionsRequest(node_name=name, broadcast_result=False))
+    assert state.succeeded(), str(state.result_details)
+    if state.can_disconnect:
+        result = GriptapeNodes.handle_request(HMBManageNodeConnectionsRequest(node_name=name,
+            operation="disconnect", expected_state_token=state.state_token, broadcast_result=False))
+        assert result.succeeded(), str(result.result_details)
+
+
+def disconnect_host_wires(flow):
+    for name in tuple(flow.nodes):
+        listed = GriptapeNodes.handle_request(ListConnectionsForNodeRequest(node_name=name, broadcast_result=False))
+        assert isinstance(listed, ListConnectionsForNodeResultSuccess), listed
+        for edge in listed.incoming_connections:
+            result = GriptapeNodes.handle_request(DeleteConnectionRequest(source_node_name=edge.source_node_name,
+                source_parameter_name=edge.source_parameter_name, target_node_name=name,
+                target_parameter_name=edge.target_parameter_name, broadcast_result=False))
+            assert result.succeeded(), str(result.result_details)
+
+
 def assert_image_asset_single_wire_host_contract() -> None:
     context_manager = GriptapeNodes.ContextManager()
     assert not context_manager.has_current_workflow(), (
@@ -1746,11 +1802,6 @@ def assert_image_asset_single_wire_host_contract() -> None:
     assert ensured.created_workflow is True
     assert ensured.created_flow is True
     flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
-
-    def register(node: object) -> None:
-        flow.add_node(node)
-        GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
-        GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = flow.name
 
     def publish_selected(source: object, values: list[str]) -> None:
         state, media_by_uid = image_asset_target._merge_import_input(
@@ -1780,14 +1831,8 @@ def assert_image_asset_single_wire_host_contract() -> None:
         with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
             image_asset_target, "DEFAULT_PROJECTS_ROOT", Path(temporary)
         ):
-            source = image_asset_target.HMBImageAssetLibrary(
-                name=f"ImageAssetBatch_{stamp}"
-            )
-            destination = target.HMBSeedanceGeneration(
-                name=f"SeedanceBatch_{stamp}"
-            )
-            register(source)
-            register(destination)
+            source = create_host_node("HMBImageAssetLibrary", f"ImageAssetBatch_{stamp}")
+            destination = create_host_node("HMBSeedanceGeneration", f"SeedanceBatch_{stamp}")
             ordered = [
                 f"https://example.test/reference-{index}.png"
                 for index in (7, 2, 9, 1, 8, 3, 6, 4, 5)
@@ -1846,14 +1891,8 @@ def assert_image_asset_single_wire_host_contract() -> None:
                 == image_asset_target.MEDIA_OUTPUT_PARAMETER
             )
 
-            overflow_source = image_asset_target.HMBImageAssetLibrary(
-                name=f"ImageAssetOverflow_{stamp}"
-            )
-            overflow_destination = target.HMBSeedanceGeneration(
-                name=f"SeedanceOverflow_{stamp}"
-            )
-            register(overflow_source)
-            register(overflow_destination)
+            overflow_source = create_host_node("HMBImageAssetLibrary", f"ImageAssetOverflow_{stamp}")
+            overflow_destination = create_host_node("HMBSeedanceGeneration", f"SeedanceOverflow_{stamp}")
             # The fresh-node default is 2.5; keep the legacy nine-image
             # boundary explicit and cover the new model on the same wire.
             overflow_destination.set_parameter_value(
@@ -1885,6 +1924,7 @@ def assert_image_asset_single_wire_host_contract() -> None:
                 overflow_destination._get_parameters()
             )["image_urls"] == overflow
     finally:
+        disconnect_host_wires(flow)
         deleted = asyncio.run(
             GriptapeNodes.ahandle_request(
                 DeleteWorkflowRequest(name=ensured.workflow_name)
@@ -1923,20 +1963,9 @@ def assert_video_picker_single_wire_host_contract() -> None:
     )
     flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
 
-    def register(node: object) -> None:
-        flow.add_node(node)
-        GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
-        GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = flow.name
-
     try:
-        source = video_picker_target.HMBVideoPickerLibrary(
-            name=f"VideoPickerBatch_{stamp}"
-        )
-        destination = target.HMBSeedanceGeneration(
-            name=f"SeedanceVideoBatch_{stamp}"
-        )
-        register(source)
-        register(destination)
+        source = create_host_node("HMBVideoPickerLibrary", f"VideoPickerBatch_{stamp}")
+        destination = create_host_node("HMBSeedanceGeneration", f"SeedanceVideoBatch_{stamp}")
         selected_numbers = (4, 1, 3)
         ordered = [
             f"https://example.test/reference-video-{number}.mp4"
@@ -1996,6 +2025,7 @@ def assert_video_picker_single_wire_host_contract() -> None:
             == video_picker_target.VIDEO_OUTPUT_PARAMETER
         )
     finally:
+        disconnect_host_wires(flow)
         deleted = asyncio.run(
             GriptapeNodes.ahandle_request(
                 DeleteWorkflowRequest(name=ensured.workflow_name)
@@ -2024,13 +2054,6 @@ def assert_seedance_delete_recreate_shot1_publication_contract() -> None:
         assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
         flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
 
-        def register(node: object) -> None:
-            flow.add_node(node)
-            GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
-            GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = (
-                flow.name
-            )
-
         async def settle() -> None:
             for _ in range(8):
                 await asyncio.sleep(0.06)
@@ -2045,14 +2068,8 @@ def assert_seedance_delete_recreate_shot1_publication_contract() -> None:
                 "DEFAULT_PROJECTS_ROOT",
                 Path(temporary),
             ):
-                image = image_asset_target.HMBImageAssetLibrary(
-                    name=f"ImageAssetRecreate_{stamp}"
-                )
-                old = target.HMBSeedanceGeneration(
-                    name=f"SeedanceRecreate_{stamp}"
-                )
-                register(image)
-                register(old)
+                create_host_node("HMBImageAssetLibrary", f"ImageAssetRecreate_{stamp}")
+                old = create_host_node("HMBSeedanceGeneration", f"SeedanceRecreate_{stamp}")
                 await settle()
                 old_subscription = old._hmb_shot_channel_subscription()
                 assert old_subscription["enabled"] is True
@@ -2060,30 +2077,38 @@ def assert_seedance_delete_recreate_shot1_publication_contract() -> None:
                 assert old_subscription["shot_name"] == "Shot 1"
 
                 old_name = old.name
+                refused = await GriptapeNodes.ahandle_request(DeleteNodeRequest(node_name=old_name))
+                assert refused.failed() and "HMB_DELETE_CONNECTED" in str(refused.result_details), refused
+                assert old._hmb_shot_channel_subscription() == old_subscription
+                disconnect_host_node(old_name)
                 deleted = await GriptapeNodes.ahandle_request(
                     DeleteNodeRequest(node_name=old_name)
                 )
                 assert isinstance(deleted, DeleteNodeResultSuccess)
                 assert old._hmb_node_deleted is True
 
-                fresh = target.HMBSeedanceGeneration(name=old_name)
                 published: list[str] = []
-                original_publish = fresh.publish_update_to_parameter
+                node_class = target.HMBSeedanceGeneration
+                original_publish = node_class.publish_update_to_parameter
+                original_init = node_class.__init__
 
-                def traced_publish(name: str, value: object) -> object:
-                    published.append(name)
-                    return original_publish(name, value)
+                def traced_init(node, **kwargs):
+                    original_init(node, **kwargs)
+                    assert node._hmb_shot_channel_subscription()["enabled"] is False
+                    assert shot_choices(node) == [target.SHOT_ONLY_LABEL]
 
-                fresh.publish_update_to_parameter = (  # type: ignore[method-assign]
-                    traced_publish
-                )
-                assert fresh._hmb_shot_channel_subscription()["enabled"] is False
-                assert shot_choices(fresh) == [target.SHOT_ONLY_LABEL]
+                def traced_publish(node, name: str, value: object) -> object:
+                    if node.name == old_name:
+                        published.append(name)
+                    return original_publish(node, name, value)
 
-                register(fresh)
-                await settle()
+                with mock.patch.object(node_class, "__init__", traced_init), \
+                     mock.patch.object(node_class, "publish_update_to_parameter", traced_publish):
+                    fresh = create_host_node("HMBSeedanceGeneration", old_name)
+                    await settle()
 
                 subscription = fresh._hmb_shot_channel_subscription()
+                assert fresh is not old
                 assert subscription["enabled"] is True
                 assert subscription["shot_number"] == 1
                 assert subscription["shot_name"] == "Shot 1"
@@ -2105,6 +2130,10 @@ def assert_seedance_delete_recreate_shot1_publication_contract() -> None:
                     target.SEEDANCE_SHOT_WIDGET_PARAMETER
                 ]
         finally:
+            for node in tuple(flow.nodes.values()):
+                if isinstance(node, target.HMBSeedanceGeneration):
+                    disconnect_host_node(node.name)
+            disconnect_host_wires(flow)
             deleted_workflow = await GriptapeNodes.ahandle_request(
                 DeleteWorkflowRequest(name=ensured.workflow_name)
             )
@@ -2114,11 +2143,7 @@ def assert_seedance_delete_recreate_shot1_publication_contract() -> None:
 
 
 def assert_seedance_native_reset_fresh_recovery_contract() -> None:
-    """Use the stock Reset handler, real delete/rename and HMB constructors.
-
-    Only library discovery is replaced by the source-under-test factory. The
-    actual desktop workflow is untouched: this runs in an isolated process.
-    """
+    """Check protected Reset and the supported native delete/recreate lifecycle."""
     async def scenario():
         GriptapeNodes.EventManager().initialize_queue()
         stamp = time.time_ns()
@@ -2126,34 +2151,25 @@ def assert_seedance_native_reset_fresh_recovery_contract() -> None:
             display_name=f"Reset recovery audit {stamp}", flow_name=f"ResetRecovery_{stamp}",
         ))
         assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
-        flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
-        manager = GriptapeNodes.NodeManager()
-        def register(node):
-            node.metadata["library"] = "HMB_GP_Production"
-            flow.add_node(node)
-            GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
-            manager._name_to_parent_flow_name[node.name] = flow.name
-        def factory(request):
-            node = target.HMBSeedanceGeneration(name=request.node_name)
-            register(node)
-            return CreateNodeResultSuccess(node_name=node.name, node_type=type(node).__name__,
-                                           specific_library_name="HMB_GP_Production", parent_flow_name=flow.name,
-                                           result_details="Created source-under-test Generator")
         try:
             with tempfile.TemporaryDirectory(prefix="hmb-native-reset-") as temporary, \
                  mock.patch.object(target, "_seedance_recovery_journal_path", side_effect=lambda key: Path(temporary) / f"{key}.json"), \
-                 mock.patch.object(manager, "on_create_node_request", side_effect=factory), \
                  mock.patch.object(target._HMBAIBrokerBridge, "_request_json", side_effect=AssertionError("Reset contacted server")):
                 for status in ("running", "submission_unknown", "failed", "succeeded"):
-                    old = target.HMBSeedanceGeneration(name=f"NativeReset_{status}_{stamp}")
-                    register(old)
+                    name = f"NativeReset_{status}_{stamp}"
+                    old = create_host_node("HMBSeedanceGeneration", name)
                     old._set_generation_recovery_checkpoint(stage="accepted", task_id=f"job-{status}",
                         task_identity="broker_task", status=status, terminal=status in ("failed", "succeeded"))
                     assert await old._force_save_generation_recovery_checkpoint(required=True, reason="reset audit")
                     identity = old._generation_recovery_state()["journal_id"]
-                    result = await manager.on_reset_node_to_defaults_request(ResetNodeToDefaultsRequest(node_name=old.name))
-                    assert isinstance(result, ResetNodeToDefaultsResultSuccess), result
-                    fresh = manager.get_node_by_name(result.node_name)
+                    before = deepcopy(old._generation_recovery_state())
+                    refused = await GriptapeNodes.ahandle_request(ResetNodeToDefaultsRequest(node_name=name))
+                    assert refused.failed() and "HMB_RESET_REBIND_REQUIRED" in str(refused.result_details), refused
+                    assert GriptapeNodes.NodeManager().get_node_by_name(name) is old
+                    assert old._generation_recovery_state() == before
+                    deleted = await GriptapeNodes.ahandle_request(DeleteNodeRequest(node_name=name))
+                    assert isinstance(deleted, DeleteNodeResultSuccess), deleted
+                    fresh = create_host_node("HMBSeedanceGeneration", name)
                     assert fresh is not old and old._hmb_node_deleted
                     assert fresh._generation_recovery_state()["journal_id"] != identity
                     assert fresh._generation_recovery_state()["task_id"] == ""
@@ -2180,7 +2196,6 @@ def assert_seedance_discarded_workflow_snapshot_contract() -> None:
     async def scenario() -> None:
         GriptapeNodes.EventManager().initialize_queue()
         assert not GriptapeNodes.ContextManager().has_current_workflow()
-        manager = GriptapeNodes.NodeManager()
         stamp = time.time_ns()
         current_workflow = None
 
@@ -2192,12 +2207,7 @@ def assert_seedance_discarded_workflow_snapshot_contract() -> None:
             ))
             assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
             current_workflow = ensured.workflow_name
-            flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
-            node = target.HMBSeedanceGeneration(name=name)
-            flow.add_node(node)
-            GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
-            manager._name_to_parent_flow_name[node.name] = flow.name
-            return node
+            return create_host_node("HMBSeedanceGeneration", name)
 
         async def close_workflow() -> None:
             nonlocal current_workflow
@@ -2302,7 +2312,7 @@ def assert_seedance_discarded_workflow_snapshot_contract() -> None:
 
 
 def assert_seedance_dangling_list_delete_live_host_contract() -> None:
-    """A vanished connected list row cannot block real host node deletion."""
+    """A stale list wire can be detached before deleting the protected node."""
 
     context_manager = GriptapeNodes.ContextManager()
     assert not context_manager.has_current_workflow(), (
@@ -2319,22 +2329,9 @@ def assert_seedance_dangling_list_delete_live_host_contract() -> None:
     assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
     flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
 
-    def register(node: object) -> None:
-        flow.add_node(node)
-        GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
-        GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = (
-            flow.name
-        )
-
     try:
-        source = target.HMBSeedanceGeneration(
-            name=f"SeedanceDanglingSource_{stamp}"
-        )
-        destination = target.HMBSeedanceGeneration(
-            name=f"SeedanceDanglingDestination_{stamp}"
-        )
-        register(source)
-        register(destination)
+        source = create_host_node("HMBSeedanceGeneration", f"SeedanceDanglingSource_{stamp}")
+        destination = create_host_node("HMBSeedanceGeneration", f"SeedanceDanglingDestination_{stamp}")
         container = destination.get_parameter_by_name(
             target.VIDEO_REFERENCES_PARAMETER
         )
@@ -2376,6 +2373,13 @@ def assert_seedance_dangling_list_delete_live_host_contract() -> None:
         ]
         assert len(stale_edges) == 1
 
+        refused = asyncio.run(GriptapeNodes.ahandle_request(DeleteNodeRequest(node_name=destination.name)))
+        assert refused.failed() and "HMB_DELETE_CONNECTED" in str(refused.result_details), refused
+        assert flow.nodes[destination.name] is destination
+        disconnected = GriptapeNodes.handle_request(DeleteConnectionRequest(source_node_name=source.name,
+            source_parameter_name="VIDEO_OUT", target_node_name=destination.name,
+            target_parameter_name=child_name, broadcast_result=False))
+        assert disconnected.succeeded(), str(disconnected.result_details)
         deleted = asyncio.run(
             GriptapeNodes.ahandle_request(
                 DeleteNodeRequest(node_name=destination.name)
@@ -2397,10 +2401,10 @@ def assert_seedance_dangling_list_delete_live_host_contract() -> None:
             )
             is None
         )
-        registered_names = GriptapeNodes.NodeManager()._name_to_parent_flow_name
-        assert destination.name not in registered_names
-        assert f"{destination.name}_temp" not in registered_names
+        assert destination.name not in flow.nodes
+        assert f"{destination.name}_temp" not in flow.nodes
     finally:
+        disconnect_host_wires(flow)
         deleted_workflow = asyncio.run(
             GriptapeNodes.ahandle_request(
                 DeleteWorkflowRequest(name=ensured.workflow_name)
@@ -5049,18 +5053,19 @@ def assert_hidden_task_evidence_and_gallery_contract() -> None:
 
     # The installed SDK's real retained SetParameter handler returns success;
     # the action is routed to the exact registered node and contains no URL authority.
+    with protected_seedance_host() as engine:
+        assert_gallery_callback(engine)
+
+
+def assert_gallery_callback(engine) -> None:
     GriptapeNodes.EventManager().initialize_queue()
     stamp = time.time_ns()
     ensured = GriptapeNodes.handle_request(EnsureWorkflowAndFlowRequest(
         display_name=f"Gallery callback {stamp}", flow_name=f"GalleryCallback_{stamp}"))
     assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
-    flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
     original_broker_address = target._broker_config.load_broker_base_url()
     try:
-        native = target.HMBSeedanceGeneration(name=f"NativeGallery_{stamp}")
-        flow.add_node(native)
-        GriptapeNodes.ObjectManager().add_object_by_name(native.name, native)
-        GriptapeNodes.NodeManager()._name_to_parent_flow_name[native.name] = flow.name
+        native = create_host_node("HMBSeedanceGeneration", f"NativeGallery_{stamp}")
         native.set_parameter_value(target.BROKER_SERVER_URL_PARAMETER, "https://gallery.example")
         captures = []
         command = {"schema": target.SEEDANCE_REFRESH_COMMAND_SCHEMA, "version": 1,
@@ -5079,10 +5084,18 @@ def assert_hidden_task_evidence_and_gallery_contract() -> None:
             assert set(stored) == {"schema", "version", "action", "action_id", "issued_at_ms"}
             assert "SECRET" not in json.dumps(stored) and "browser-owned" not in json.dumps(stored)
     finally:
-        deleted = asyncio.run(GriptapeNodes.ahandle_request(DeleteWorkflowRequest(name=ensured.workflow_name)))
-        assert isinstance(deleted, DeleteWorkflowResultSuccess)
+        if hasattr(engine, "close_workflow"):
+            engine.close_workflow(engine.current_workflow())
+        else:
+            deleted = asyncio.run(GriptapeNodes.ahandle_request(DeleteWorkflowRequest(name=ensured.workflow_name)))
+            assert isinstance(deleted, DeleteWorkflowResultSuccess)
         target._broker_config.save_broker_base_url(original_broker_address)
 
+
+if "--gallery-only" in sys.argv[1:]:
+    assert_hidden_task_evidence_and_gallery_contract()
+    print("HMB_SEEDANCE_GALLERY_CURRENT_SDK=PASS registered CreateNode, duplicate pulse, sanitized state, clean close")
+    raise SystemExit(0)
 
 assert_fake_broker_authentication_boundary()
 assert_hidden_task_evidence_and_gallery_contract()
@@ -5095,12 +5108,17 @@ assert_seedance_25_output_format_and_last_frame_ui_contract()
 assert_only_shot_task_and_reference_state_contract()
 assert_only_extension_ratio_and_shot_transition_contract()
 assert_seedance_recreate_widget_and_list_lifecycle_contract()
-assert_image_asset_single_wire_host_contract()
-assert_video_picker_single_wire_host_contract()
-assert_seedance_delete_recreate_shot1_publication_contract()
-assert_seedance_native_reset_fresh_recovery_contract()
-assert_seedance_discarded_workflow_snapshot_contract()
-assert_seedance_dangling_list_delete_live_host_contract()
+for host_check in (
+    assert_image_asset_single_wire_host_contract,
+    assert_video_picker_single_wire_host_contract,
+    assert_seedance_delete_recreate_shot1_publication_contract,
+    assert_seedance_native_reset_fresh_recovery_contract,
+    assert_seedance_discarded_workflow_snapshot_contract,
+    assert_seedance_dangling_list_delete_live_host_contract,
+):
+    with protected_seedance_host():
+        host_check()
+    print(f"PASS {host_check.__name__}", flush=True)
 assert_payload_and_media_contract()
 assert_seedance_25_model_contract()
 with mock.patch.object(

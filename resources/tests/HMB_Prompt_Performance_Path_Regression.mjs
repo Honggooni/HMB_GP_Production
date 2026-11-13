@@ -188,8 +188,8 @@ assert.equal(
   "One retained-mode echo must normalize a 50-image/10-video payload once.",
 );
 delete globalThis.__hmbPromptNormalizeCalls;
-const cssMatch = source.match(/includeStyle \? `<style>\n([\s\S]*?)<\/style>` : ""/);
-assert.ok(cssMatch, "Prompt widget CSS literal must remain byte-identical behind the full-mount guard.");
+const cssMatch = source.replace(/\r\n/g, "\n").match(/includeStyle \? `<style>\n([\s\S]*?)<\/style>` : ""/);
+assert.ok(cssMatch, "The Prompt stylesheet must remain behind the full-mount guard.");
 const css = cssMatch[1];
 const markup = `<style>${css}</style><div class="hmb-dashboard"></div>`;
 const expected = `<style>${hmbScopeWidgetCss(css, ".hmb-dashboard")}</style><div class="hmb-dashboard"></div>`;

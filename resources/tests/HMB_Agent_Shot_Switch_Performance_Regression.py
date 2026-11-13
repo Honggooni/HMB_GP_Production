@@ -164,6 +164,36 @@ class ShotSwitchPerformanceTests(unittest.TestCase):
         node._hmb_handle_row_action(parameter, row)
         self.assertEqual(node._hmb_row_action_rejections, {})
 
+    def test_collapsed_run_and_cancel_dispatch_exact_row_without_opening_editor(self):
+        node, _ = manager()
+        node._hmb_shot_editor_expanded = False
+        node._hmb_layout_shot_editor = Mock()
+        node.set_parameter_value = Mock()
+        node._hmb_handle_shot_action = Mock()
+        node._hmb_active_slot_key = "channel\x1fshot-1"
+        parameter = SimpleNamespace(name=module._AGENT_SHOT_ROW_PREFIX + "2")
+        identity = {"channel_uuid": "channel", "shot_uuid": "shot-2"}
+        for kind, request_id in (("run_selected", "a" * 32), ("cancel_selected", "b" * 32)):
+            command = {"kind": kind, "request_id": request_id}
+            node._hmb_handle_row_action(parameter, {"shot": identity, "action": command})
+            node._hmb_handle_shot_action.assert_called_with(command, selected=identity)
+            self.assertEqual(node._hmb_row_action_ack["channel\x1fshot-2"], request_id)
+        node.set_parameter_value.assert_not_called()
+        node._hmb_capture_active_slot.assert_not_called()
+        node._hmb_persist_shot_store.assert_not_called()
+        self.assertEqual(node._hmb_layout_shot_editor.call_count, 2)
+        self.assertFalse(node._hmb_shot_editor_expanded)
+        self.assertEqual(node._hmb_active_slot_key, "channel\x1fshot-1")
+
+        active_worker = SimpleNamespace(_hmb_shot_cancelled=False)
+        clicked_worker = SimpleNamespace(_hmb_shot_cancelled=False)
+        node._hmb_shot_workers.update({"channel\x1fshot-1": active_worker, "channel\x1fshot-2": clicked_worker})
+        node._hmb_handle_shot_action = module.HMBAgentLibrary._hmb_handle_shot_action.__get__(node)
+        node._hmb_handle_row_action(parameter, {"shot": identity,
+            "action": {"kind": "cancel_selected", "request_id": "c" * 32}})
+        self.assertFalse(active_worker._hmb_shot_cancelled)
+        self.assertTrue(clicked_worker._hmb_shot_cancelled)
+
     def test_exact_preview_prefers_result_and_never_reads_other_or_visible_slots(self):
         node, _ = manager()
         node.parameter_output_values["output"] = "Another visible Shot"

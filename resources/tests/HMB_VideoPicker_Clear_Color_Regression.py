@@ -5,6 +5,7 @@ import copy
 import importlib.util
 import io
 import json
+import logging
 import os
 from pathlib import Path
 import sys
@@ -248,7 +249,11 @@ def main():
         for value in environment.values():
             Path(value).mkdir()
         with patch.dict(os.environ, environment):
-            _run_regression()
+            try:
+                _run_regression()
+            finally:
+                # Windows cannot remove a temporary SDK log while its handler is open.
+                logging.shutdown()
 
 
 if __name__ == "__main__":

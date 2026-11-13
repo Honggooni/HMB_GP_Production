@@ -1,4 +1,4 @@
-// Small HMB companion header. The stock bash_image button owns the editor.
+// HMB header and retained scene editor. Both mount through the SDK widget API.
 export const HMB_IMAGE_BASH_HEADER_SCHEMA = "hmb-image-bash-header-v1";
 export const HMB_IMAGE_BASH_PREPARATION_SCHEMA = "hmb-image-bash-preparation-v1";
 const NODE_SCOPES = new WeakMap();
@@ -273,6 +273,7 @@ function syncEdges(container, value) {
 
 function hmbNativeStockSafetyImplementation(container, props = {}) {
   if (!container) return { update() {}, cleanup() {} };
+  if (props.parameterName === "bash_image") return mountEditor(container, props);
   const previous = container.__hmbImageBashController;
   if (previous) { previous.update(props); return previous; }
   let latestProps = props, state = hmbImageBashHeaderState(props), disposed = false;
@@ -419,6 +420,286 @@ function hmbNativeStockSafetyImplementation(container, props = {}) {
   container.__hmbImageBashController = controller; sync(); scheduleInitialRefresh(); announceHeader("ready"); return controller;
 }
 
+const EDITOR_SCHEMA = "hmb-image-bash-editor-v1";
+const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+const ordered = layers => layers.slice().sort((first, second) => finite(first.order) - finite(second.order));
+
+function editorDocument(input) {
+  const value = record(projection(input));
+  // The widget receives the JSON artifact itself, or an SDK property envelope.
+  const project = record(input?.meta).konva_json ? input : value;
+  if (!record(project.meta).konva_json) return null;
+  const {HMB_IMAGE_BASH_UI: _header, ...document} = project;
+  return document;
+}
+
+function mountEditor(container, props = {}) {
+  const doc = container.ownerDocument, win = doc.defaultView;
+  const button = doc.createElement("button");
+  button.type = "button"; button.className = "nodrag";
+  button.textContent = "HMB Image Bash 편집기 열기";
+  button.style.cssText = "width:100%;height:36px;border:1px solid #394358;border-radius:8px;background:#192131;color:#f5e7f2;cursor:pointer";
+  container.replaceChildren(button);
+  let latest = props, dialog = null, reconcile = null;
+
+  function update(next) {
+    latest = next;
+    const project = editorDocument(next.value);
+    const snapshot = project?.meta?.hmb_image_bash?.editor_snapshot_id;
+    const authority = record(projection(record(next.value).HMB_IMAGE_BASH_UI));
+    const ready = authority.schema !== HMB_IMAGE_BASH_HEADER_SCHEMA
+      || (authority.preparation?.phase === "ready" && authority.preparation?.editor_snapshot_id === snapshot && !authority.locked);
+    button.disabled = !!next.disabled || !snapshot || !ready;
+    if (dialog) reconcile?.(project, authority);
+  }
+
+  function open() {
+    const initial = editorDocument(latest.value);
+    let snapshot = initial?.meta?.hmb_image_bash?.editor_snapshot_id;
+    if (dialog || button.disabled || !snapshot) return;
+    let draft = structuredClone(initial), meta = draft.meta;
+    let scene = structuredClone(meta.konva_json), selection = "", gesture = null, zoom = 1, epoch = 0;
+    let pending = "", stale = false, closed = false;
+    let frame = null, saveDeadline = null;
+    const history = [], redo = [], rasters = new Map();
+    const width = finite(meta.hmb_canvas?.width ?? meta.canvas_size?.width, 1920);
+    const height = finite(meta.hmb_canvas?.height ?? meta.canvas_size?.height, 1080);
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || width * height > 100_000_000) return;
+
+    const modal = doc.createElement("dialog");
+    modal.className = "hmb-owned-bash"; modal.setAttribute("aria-labelledby", "hmb-owned-bash-title");
+    modal.innerHTML = `<style>
+.hmb-owned-bash{width:min(1240px,95vw);height:min(850px,92vh);max-width:none;max-height:none;margin:auto;padding:0;overflow:hidden;border:1px solid #45435a;border-radius:16px;background:#101622;color:#e8edf6;color-scheme:dark;font:14px system-ui}
+.hmb-owned-bash::backdrop{background:#050810be}.hmb-owned-bash *{box-sizing:border-box}.hmb-owned-bash article{height:100%;display:grid;grid-template-rows:auto minmax(0,1fr) auto}.hmb-owned-bash header,.hmb-owned-bash footer,.hmb-owned-bash .tools{display:flex;align-items:center;gap:8px;padding:10px 14px}.hmb-owned-bash header{border-bottom:1px solid #33394e}.hmb-owned-bash header strong,.hmb-owned-bash footer output{flex:1}.hmb-owned-bash footer{border-top:1px solid #33394e}.hmb-owned-bash .body{display:grid;grid-template-columns:minmax(0,1fr) 265px;min-height:0}.hmb-owned-bash .stage{display:grid;grid-template-rows:auto minmax(0,1fr);min-width:0}.hmb-owned-bash .tools{flex-wrap:wrap}.hmb-owned-bash .view{overflow:auto;background:#090d15;display:grid;place-items:safe center;padding:14px}.hmb-owned-bash canvas{display:block;background:#fff;max-width:none;touch-action:none;box-shadow:0 0 0 1px #45435a}.hmb-owned-bash aside{border-left:1px solid #33394e;overflow:auto;padding:12px}.hmb-owned-bash [data-layers]{display:grid;gap:4px;margin:8px 0}.hmb-owned-bash [data-layer]{text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hmb-owned-bash [aria-pressed=true]{border-color:#ed82ba;background:#592c48}.hmb-owned-bash .fields{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:12px}.hmb-owned-bash label{display:grid;gap:3px}.hmb-owned-bash button,.hmb-owned-bash select,.hmb-owned-bash input{font:inherit;color:inherit;min-width:0;padding:5px 8px;border:1px solid #43485d;border-radius:6px;background:#20283a}.hmb-owned-bash button{cursor:pointer}.hmb-owned-bash button:disabled{opacity:.46;cursor:default}.hmb-owned-bash button:focus-visible,.hmb-owned-bash input:focus-visible{outline:2px solid #f59acb;outline-offset:1px}.hmb-owned-bash .primary{background:#733f62;border-color:#b86c9a;font-weight:700}.hmb-owned-bash output{color:#bdc6d8}.hmb-owned-bash output[data-error=true]{color:#ffb6c3}.hmb-owned-bash input[type=color]{width:38px;height:29px;padding:3px}
+</style><article><header><strong id="hmb-owned-bash-title">HMB Image Bash</strong><span data-size></span><button type="button" data-close aria-label="닫기">✕</button></header>
+<div class="body"><div class="stage"><div class="tools"><button type="button" data-undo>실행 취소</button><button type="button" data-redo>다시 실행</button>
+<label><select aria-label="도구" data-tool><option value="move">이동</option><option value="brush">브러시</option><option value="erase">지우개</option></select></label>
+<input type="color" aria-label="브러시 색" data-color value="#ff428a"><input type="number" aria-label="브러시 크기" data-brush-size min="1" max="300" value="18" style="width:66px">
+<button type="button" data-zoom-out aria-label="축소">−</button><button type="button" data-zoom-fit>맞춤</button><button type="button" data-zoom-in aria-label="확대">+</button></div><div class="view"><canvas aria-label="합성 미리보기"></canvas></div></div>
+<aside aria-label="레이어"><strong>레이어</strong><div data-layers></div><div class="tools" style="padding:0"><button type="button" data-up aria-label="레이어 위로">↑</button><button type="button" data-down aria-label="레이어 아래로">↓</button><button type="button" data-copy>복제</button><button type="button" data-delete>삭제</button></div>
+<div class="fields"><label>X<input type="number" data-field="x" step="1"></label><label>Y<input type="number" data-field="y" step="1"></label><label>회전<input type="number" data-field="rotation" step="1"></label><label>불투명도 %<input type="number" data-field="opacity" min="0" max="100" step="1"></label><label>가로 배율<input type="number" data-field="scaleX" step=".01"></label><label>세로 배율<input type="number" data-field="scaleY" step=".01"></label><label>표시<input type="checkbox" data-field="visible"></label></div></aside></div>
+<footer><output aria-live="polite"></output><button type="button" data-close>닫기</button><button type="button" class="primary" data-apply>Apply PNG</button></footer></article>`;
+    const $ = selector => modal.querySelector(selector);
+    const canvas = $("canvas"), view = $(".view"), ctx = canvas.getContext("2d");
+    const apply = $("[data-apply]"), status = $("output"), fields = [...modal.querySelectorAll("[data-field]")];
+    const ink = doc.createElement("canvas");
+    canvas.width = ink.width = width; canvas.height = ink.height = height;
+    const inkContext = ink.getContext("2d");
+    if (!ctx || !inkContext) return;
+    $("[data-size]").textContent = `${width} × ${height}`;
+
+    const images = () => Array.isArray(scene.images) ? scene.images : [];
+    const selected = () => images().find(layer => layer.id === selection);
+    function message(text, error = false) { status.textContent = text; status.dataset.error = String(error); }
+    function fit() {
+      const scale = Math.min((view.clientWidth - 28) / width, (view.clientHeight - 28) / height, 1) * zoom;
+      canvas.style.width = `${Math.max(1, width * scale)}px`;
+      canvas.style.height = `${Math.max(1, height * scale)}px`;
+    }
+    function raster(source) {
+      if (!rasters.has(source)) {
+        const url = new URL(source, win.location.href);
+        if (!['http:', 'https:', 'data:', 'blob:'].includes(url.protocol)) throw Error("브라우저에 원본 주소가 준비되지 않았습니다.");
+        const image = new win.Image(); image.crossOrigin = "anonymous";
+        rasters.set(source, new Promise((resolve, reject) => {
+          image.onload = () => resolve(image);
+          image.onerror = () => reject(Error("레이어의 원본 이미지를 열 수 없습니다. ImageAsset 연결을 확인하세요."));
+          image.src = url.href;
+        }).catch(error => { rasters.delete(source); throw error; }));
+      }
+      return rasters.get(source);
+    }
+    async function paint() {
+      const id = ++epoch;
+      apply.disabled = true;
+      try {
+        const layers = ordered(images()).filter(layer => layer.visible !== false);
+        const decoded = await Promise.all(layers.map(layer => {
+          if (!["image", "brush", undefined].includes(layer.type) || typeof layer.src !== "string" || !layer.src)
+            throw Error("저장된 레이어의 원본 또는 유형을 확인할 수 없습니다.");
+          return raster(layer.src);
+        }));
+        if (closed || id !== epoch) return false;
+        ctx.clearRect(0, 0, width, height);
+        ctx.fillStyle = meta.hmb_canvas?.background_color || "#ffffff"; ctx.fillRect(0, 0, width, height);
+        layers.forEach((layer, index) => {
+          const bitmap = decoded[index], w = finite(layer.width, bitmap.width), h = finite(layer.height, bitmap.height);
+          ctx.save(); ctx.globalAlpha = finite(layer.opacity, 1);
+          ctx.translate(finite(layer.x), finite(layer.y)); ctx.rotate(finite(layer.rotation) * Math.PI / 180);
+          ctx.scale(finite(layer.scaleX, 1), finite(layer.scaleY, 1)); ctx.drawImage(bitmap, -w / 2, -h / 2, w, h); ctx.restore();
+        });
+        inkContext.clearRect(0, 0, width, height);
+        for (const line of scene.lines || []) {
+          const points = line.points;
+          if (!Array.isArray(points) || points.length < 2 || points.length % 2 || !points.every(Number.isFinite))
+            throw Error("저장된 브러시 경로를 읽을 수 없습니다.");
+          inkContext.save(); inkContext.lineWidth = finite(line.strokeWidth, 1); inkContext.lineCap = "round"; inkContext.lineJoin = "round";
+          inkContext.strokeStyle = line.stroke || "#000000";
+          inkContext.globalCompositeOperation = line.globalCompositeOperation === "destination-out" ? "destination-out" : "source-over";
+          inkContext.beginPath(); inkContext.moveTo(points[0], points[1]);
+          if (points.length === 2) inkContext.lineTo(points[0] + .01, points[1]);
+          for (let index = 2; index < points.length; index += 2) inkContext.lineTo(points[index], points[index + 1]);
+          inkContext.stroke(); inkContext.restore();
+        }
+        ctx.drawImage(ink, 0, 0);
+        apply.disabled = stale || !!pending || !!gesture;
+        return true;
+      } catch (error) {
+        if (!closed && id === epoch && !stale) message(error.message, true);
+        return false;
+      }
+    }
+    function syncControls() {
+      const group = $("[data-layers]"), layer = selected();
+      group.replaceChildren(...ordered(images()).reverse().map((item, index) => {
+        const row = doc.createElement("button"); row.type = "button"; row.dataset.layer = item.id;
+        row.setAttribute("aria-pressed", String(item.id === selection));
+        row.textContent = `${item.visible === false ? "숨김 · " : ""}${item.name || `레이어 ${index + 1}`}`;
+        return row;
+      }));
+      for (const field of fields) {
+        const key = field.dataset.field;
+        field.disabled = !layer || stale || !!pending;
+        if (key === "visible") field.checked = !!layer && layer.visible !== false;
+        else field.value = layer ? finite(layer[key], ["scaleX", "scaleY", "opacity"].includes(key) ? 1 : 0) * (key === "opacity" ? 100 : 1) : "";
+      }
+      for (const name of ["up", "down", "copy", "delete"]) $(`[data-${name}]`).disabled = !layer || stale || !!pending;
+      $("[data-undo]").disabled = !history.length || stale || !!pending;
+      $("[data-redo]").disabled = !redo.length || stale || !!pending;
+    }
+    function redraw() {
+      if (frame !== null) return;
+      frame = win.requestAnimationFrame(() => { frame = null; void paint(); });
+    }
+    function checkpoint() {
+      history.push(structuredClone(scene)); if (history.length > 24) history.shift(); redo.length = 0;
+    }
+    function mutate(change) {
+      if (stale || pending) return;
+      checkpoint(); change(); syncControls(); redraw();
+    }
+    function reorder(direction) {
+      const layers = ordered(images()), index = layers.findIndex(layer => layer.id === selection), target = index + direction;
+      if (index < 0 || target < 0 || target >= layers.length) return;
+      mutate(() => { [layers[index], layers[target]] = [layers[target], layers[index]];
+        layers.forEach((layer, position) => { layer.order = position + 1; }); scene.images = layers; });
+    }
+    function restore(stack, destination) {
+      if (!stack.length || stale || pending) return;
+      destination.push(scene); scene = stack.pop(); syncControls(); redraw();
+    }
+    $("[data-layers]").addEventListener("click", event => {
+      const row = event.target.closest("[data-layer]"); if (row) { selection = row.dataset.layer; syncControls(); }
+    });
+    for (const field of fields) field.addEventListener("change", () => {
+      const layer = selected(), key = field.dataset.field;
+      if (!layer || (key !== "visible" && !Number.isFinite(field.valueAsNumber))) return;
+      mutate(() => { layer[key] = key === "visible" ? field.checked : key === "opacity"
+        ? Math.min(1, Math.max(0, field.valueAsNumber / 100)) : field.valueAsNumber; });
+    });
+    $("[data-up]").onclick = () => reorder(1); $("[data-down]").onclick = () => reorder(-1);
+    $("[data-delete]").onclick = () => mutate(() => { scene.images = images().filter(layer => layer.id !== selection); selection = ""; });
+    $("[data-copy]").onclick = () => mutate(() => {
+      const layer = structuredClone(selected()); layer.id = requestId(container); layer.order = Math.max(0, ...images().map(item => finite(item.order))) + 1;
+      scene.images.push(layer); selection = layer.id;
+    });
+    $("[data-undo]").onclick = () => restore(history, redo); $("[data-redo]").onclick = () => restore(redo, history);
+    modal.addEventListener("keydown", event => {
+      event.stopPropagation();
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z" && !event.target.matches("input")) {
+        event.preventDefault();
+        if (event.shiftKey) restore(redo, history); else restore(history, redo);
+      }
+    });
+    $("[data-zoom-in]").onclick = () => { zoom = Math.min(zoom * 1.25, 5); fit(); };
+    $("[data-zoom-out]").onclick = () => { zoom = Math.max(zoom / 1.25, .25); fit(); };
+    $("[data-zoom-fit]").onclick = () => { zoom = 1; fit(); };
+    function point(event) {
+      const rect = canvas.getBoundingClientRect();
+      return [(event.clientX - rect.left) * width / rect.width, (event.clientY - rect.top) * height / rect.height];
+    }
+    function hit(x, y) {
+      return ordered(images()).reverse().find(layer => {
+        const angle = -finite(layer.rotation) * Math.PI / 180, dx = x - finite(layer.x), dy = y - finite(layer.y);
+        const u = (dx * Math.cos(angle) - dy * Math.sin(angle)) / finite(layer.scaleX, 1);
+        const v = (dx * Math.sin(angle) + dy * Math.cos(angle)) / finite(layer.scaleY, 1);
+        return layer.visible !== false && Math.abs(u) <= finite(layer.width) / 2 && Math.abs(v) <= finite(layer.height) / 2;
+      });
+    }
+    canvas.addEventListener("pointerdown", event => {
+      if (event.button !== 0 || stale || pending) return;
+      const [x, y] = point(event), tool = $("[data-tool]").value;
+      const layer = tool === "move" ? hit(x, y) : null;
+      if (tool === "move" && !layer) return;
+      checkpoint();
+      if (layer) { selection = layer.id; gesture = {x, y, layer, startX: finite(layer.x), startY: finite(layer.y)}; }
+      else {
+        const line = {points:[x, y], stroke:$("[data-color]").value, strokeWidth:Math.max(1, Math.min(300, finite($("[data-brush-size]").value, 18))),
+          globalCompositeOperation: tool === "erase" ? "destination-out" : "source-over"};
+        (scene.lines ??= []).push(line); gesture = {line};
+      }
+      canvas.setPointerCapture(event.pointerId); syncControls(); redraw();
+    });
+    canvas.addEventListener("pointermove", event => {
+      if (!gesture || stale || !canvas.hasPointerCapture(event.pointerId)) return;
+      const [x, y] = point(event);
+      if (gesture.layer) { gesture.layer.x = gesture.startX + x - gesture.x; gesture.layer.y = gesture.startY + y - gesture.y; }
+      else gesture.line.points.push(x, y);
+      redraw();
+    });
+    canvas.addEventListener("lostpointercapture", () => { gesture = null; syncControls(); redraw(); });
+    apply.onclick = async () => {
+      if (stale || pending || gesture || latest.disabled) return;
+      const commit = new Date().toISOString(); pending = commit; syncControls(); message("PNG 저장 확인 중…");
+      try {
+        if (frame !== null) { win.cancelAnimationFrame(frame); frame = null; }
+        if (!(await paint()) || closed || stale) throw Error("현재 장면을 출력할 수 없습니다.");
+        const png = canvas.toDataURL("image/png");
+        if (!png.startsWith("data:image/png;base64,")) throw Error("PNG를 만들 수 없습니다.");
+        const payload = {...draft, value:png, meta:{...meta, hmb_editor:EDITOR_SCHEMA,
+          konva_json:structuredClone(scene), created_at:commit, preview_url:png}};
+        saveDeadline = win.setTimeout(() => {
+          if (pending !== commit || closed) return;
+          stale = true; syncControls(); message("저장 응답을 받지 못했습니다. 노드의 Apply 상태를 확인하세요.", true);
+        }, 60_000);
+        const response = await latest.onChange(payload);
+        if (response?.success === false || response?.succeeded === false) throw Error("엔진에서 Apply 요청을 받지 못했습니다.");
+      } catch (error) {
+        if (!closed && pending === commit) {
+          win.clearTimeout(saveDeadline); pending = ""; syncControls(); redraw(); message(error.message || "Apply 요청을 전송할 수 없습니다.", true);
+        }
+      }
+    };
+    reconcile = (project, authority) => {
+      const next = project?.meta;
+      if (pending && next?.hmb_image_bash?.apply?.editor_commit === pending && next.hmb_image_bash.apply.output_path) {
+        win.clearTimeout(saveDeadline); pending = ""; stale = false;
+        draft = structuredClone(project); meta = draft.meta; snapshot = meta.hmb_image_bash.editor_snapshot_id;
+        scene = structuredClone(meta.konva_json); syncControls(); redraw(); message("PNG 저장 완료"); return;
+      }
+      if (next?.hmb_image_bash?.editor_snapshot_id !== snapshot && !(pending && next?.created_at === pending)) {
+        stale = true; apply.disabled = true; syncControls(); message("연결 또는 장면이 바뀌었습니다. 편집기를 다시 열어 주세요.", true);
+      } else if (pending && authority.preparation?.phase === "error") {
+        win.clearTimeout(saveDeadline); stale = true; apply.disabled = true; syncControls();
+        message(authority.preparation.error || "PNG 저장에 실패했습니다. 노드 상태를 확인하세요.", true);
+      }
+    };
+    const observer = new win.ResizeObserver(fit); observer.observe(view);
+    modal.querySelectorAll("[data-close]").forEach(close => { close.onclick = () => modal.close(); });
+    modal.addEventListener("close", () => {
+      closed = true; observer.disconnect(); win.clearTimeout(saveDeadline);
+      if (frame !== null) win.cancelAnimationFrame(frame);
+      modal.remove(); if (dialog === modal) { dialog = null; reconcile = null; }
+    }, {once:true});
+    doc.body.append(modal); dialog = modal; modal.showModal();
+    selection = ordered(images()).at(-1)?.id || "";
+    fit(); syncControls(); void paint();
+  }
+
+  button.onclick = open; update(props);
+  return {update, cleanup() { dialog?.close(); button.remove(); }};
+}
+
 // HMB_NATIVE_STOCK_SAFETY_V1_BEGIN
 // Public DOM capture only. Never inspect React internals, replay Delete, or
 // pretend a disk/Git update installed the native editor safety contract.
@@ -429,7 +710,7 @@ function hmbAcquireNativeStockSafety(container) {
   let shared = doc[key];
   if (!shared) {
     const owners = new Set(), identities = new Map();
-    let contextNode = null, badge = null, notice = null, disposed = false;
+    let contextNode = null, notice = null, noticeTimer = null, disposed = false;
     const nativeReady = () => doc.documentElement.getAttribute("data-hmb-native-deletion-guard") === "engine-preflight"
       && doc.documentElement.getAttribute("data-hmb-native-deletion-protection-version") === "2";
     const rootOf = value => value?.closest?.(".react-flow__node[data-id]") || null;
@@ -470,7 +751,7 @@ function hmbAcquireNativeStockSafety(container) {
       if (!nodeMenu && !(trash && button.closest(".react-flow"))) return null;
       return { button, nodeMenu };
     };
-    const dismiss = () => { notice?.remove(); notice = null; };
+    const dismiss = () => { win.clearTimeout(noticeTimer); notice?.remove(); notice = null; };
     const show = () => {
       if (disposed || nativeReady()) return;
       if (notice?.isConnected) { notice.querySelector("button")?.focus(); return; }
@@ -478,12 +759,13 @@ function hmbAcquireNativeStockSafety(container) {
       notice.setAttribute("data-hmb-native-safety-notice", "required");
       notice.setAttribute("role", "alert");
       Object.assign(notice.style, { position: "fixed", zIndex: "2147483647", right: "20px", bottom: "64px", maxWidth: "420px", padding: "18px", border: "1px solid #b89458", borderRadius: "18px", background: "#151c29", color: "#f8fafc", font: "13px/1.6 system-ui,sans-serif", boxShadow: "0 8px 32px #0008" });
-      const title = doc.createElement("strong"); title.textContent = "HMB 편집기·삭제 보호 확인이 필요합니다";
+      const title = doc.createElement("strong"); title.textContent = "HMB 노드 삭제를 중단했습니다";
       const text = doc.createElement("p");
-      text.textContent = "Override 업데이트 로그에서 current/applied를 확인하세요. UI 또는 엔진 보호 상태를 확인하지 못해 감지된 HMB 노드 삭제 시도를 중단했습니다. 작업 저장 후 Griptape 완전 종료·재시작하세요. current/applied는 디스크 파일 상태이며 현재 화면의 통합 상태를 보장하지 않습니다. 실패 시 로그의 원인을 확인하세요. 이 안내만으로 다른 삭제 경로의 엔진 보호가 준비됐다고 보장할 수 없습니다.";
+      text.textContent = "현재 화면에서 연결 상태를 확인할 수 없습니다. 작업을 저장하고 Griptape를 다시 시작한 뒤 확인하세요.";
       const close = doc.createElement("button"); close.type = "button"; close.textContent = "확인";
       Object.assign(close.style, { border: "1px solid #64748b", borderRadius: "999px", background: "#243044", color: "#f8fafc", padding: "6px 18px", cursor: "pointer" });
       close.addEventListener("click", dismiss); notice.append(title, text, close); doc.body.append(notice); close.focus();
+      noticeTimer = win.setTimeout(dismiss, 8000);
     };
     const stop = event => { event.preventDefault(); event.stopPropagation(); event.stopImmediatePropagation(); show(); };
     const keydown = event => {
@@ -495,12 +777,12 @@ function hmbAcquireNativeStockSafety(container) {
       const action = deleteControl(event.target);
       if (action && (ownedTarget(action.button) || managed()
           || action.nodeMenu && contextNode?.isConnected && roots().has(contextNode))) stop(event);
-      else if (!event.target?.closest?.("[data-hmb-native-safety-notice],[data-hmb-native-safety-status]")) contextNode = null;
+      else if (!event.target?.closest?.("[data-hmb-native-safety-notice]")) { contextNode = null; dismiss(); }
     };
     const contextmenu = event => { contextNode = rootOf(event.target); };
     const dispose = () => {
       if (disposed) return;
-      disposed = true; observer?.disconnect(); badge?.remove(); dismiss(); contextNode = null;
+      disposed = true; observer?.disconnect(); dismiss(); contextNode = null;
       win.removeEventListener("keydown", keydown, true); win.removeEventListener("click", click, true); win.removeEventListener("contextmenu", contextmenu, true);
       if (doc[key] === shared) delete doc[key];
     };
@@ -508,14 +790,7 @@ function hmbAcquireNativeStockSafety(container) {
       if (disposed) return;
       const retained = roots();
       if (!owners.size && !retained.size) { dispose(); return; }
-      if (nativeReady() || !retained.size) { badge?.remove(); badge = null; dismiss(); return; }
-      if (badge?.isConnected || !doc.body) return;
-      badge = doc.createElement("button"); badge.type = "button";
-      badge.setAttribute("data-hmb-native-safety-status", "required");
-      badge.setAttribute("aria-label", "HMB Override 업데이트·재시작 및 삭제 보호 상태 확인");
-      badge.textContent = "HMB UI·삭제 보호 상태 확인";
-      Object.assign(badge.style, { position: "fixed", zIndex: "2147483646", right: "20px", bottom: "20px", border: "1px solid #b89458", borderRadius: "999px", padding: "7px 14px", background: "#151c29", color: "#f5d49a", font: "12px system-ui,sans-serif", cursor: "pointer", boxShadow: "0 4px 18px #0006" });
-      badge.addEventListener("click", show); doc.body.append(badge);
+      if (nativeReady() || !retained.size) dismiss();
     };
     const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(sync) : null;
     observer?.observe(doc.documentElement, { attributes: true, attributeFilter: ["data-hmb-native-deletion-guard", "data-hmb-native-deletion-protection-version", "data-id"], childList: true, subtree: true });

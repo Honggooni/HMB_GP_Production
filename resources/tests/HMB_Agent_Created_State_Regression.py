@@ -307,7 +307,8 @@ class AgentCreatedState(unittest.TestCase):
         machine = node.parameter_values["SHOT_PROMPT_IN"]
         node.parameter_values["prompt"] = "Visible HMB_GP_Production placeholder"
         settings = {"resolution": "480p", "duration": 4, "generate_audio": False, "priority": 0}
-        media = {"machine_sha256": hashlib.sha256(machine.encode()).hexdigest(),
+        media = {"schema": "hmb-agent-reference-media", "version": 1,
+                 "machine_sha256": hashlib.sha256(machine.encode()).hexdigest(),
                  "images": [{"token": "@image2", "source": "unchanged-image-source"}],
                  "videos": [{"token": "@video1", "source": "unchanged-video-source"}]}
         expected = copy.deepcopy(media)

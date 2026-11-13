@@ -48,6 +48,39 @@ class RasterReuseRegression(unittest.TestCase):
         self.assertEqual(len(cache), 128)
 
 class SnapshotPolicyRegression(unittest.TestCase):
+    def test_snapshot_paths_and_lease_use_sdk_workflow(self):
+        from griptape_nodes.files import file as file_module
+        from griptape_nodes.files.drivers.local_file_driver import LocalFileDriver
+        from griptape_nodes.files.file_driver import FileDriverRegistry
+
+        path = "C:/fixture/source.png"
+        workflow = object()
+        driver = LocalFileDriver()
+        calls = []
+
+        def resolve_file_path(file_path, workflow):
+            calls.append((file_path, workflow))
+            return file_path
+
+        with mock.patch.object(file_module, "_resolve_file_path", resolve_file_path), \
+             mock.patch.object(bash.File, "workflow", mock.PropertyMock(return_value=workflow), create=True), \
+             mock.patch.object(FileDriverRegistry, "get_driver", return_value=driver), \
+             mock.patch.object(bash.File, "resolve", return_value=path):
+            paths = bash.HMBImageBash._snapshot_read_paths(records=[{"url": path}])
+            self.assertEqual(paths, {path: path})
+            self.assertEqual(bash.HMBImageBash._snapshot_driver_lease(paths), ((path, driver),))
+        self.assertEqual(calls, [(path, workflow), (path, workflow)])
+
+    def test_unknown_resolver_signature_skips_accelerated_reads(self):
+        from griptape_nodes.files import file as file_module
+
+        def unreviewed_resolver(path, workflow, additional_context):
+            raise AssertionError("Unreviewed resolver was called")
+
+        with mock.patch.object(file_module, "_resolve_file_path", unreviewed_resolver), \
+             mock.patch.object(bash.File, "resolve", side_effect=AssertionError("Private route was used")):
+            self.assertIsNone(bash.HMBImageBash._snapshot_read_paths(records=[{"url": "C:/fixture/source.png"}]))
+
     def test_custom_driver_keeps_original_synchronous_transport(self):
         from griptape_nodes.files.file_driver import FileDriverRegistry
         from griptape_nodes.files import file as file_module

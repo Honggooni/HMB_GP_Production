@@ -77,6 +77,82 @@ class ManualLUTRegression(unittest.TestCase):
         self.node._command({"id": name, "action": "upload_web", "state": copy.deepcopy(self.node._hmb_color_lut_state)})
         self.fixture.drain()
 
+    def choose_my_box(self):
+        rows = [*PROJECTS, {"id": "my-box", "name": "My Box"}]
+        patch = mock.patch(f"{__name__}.PROJECTS", rows)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.node._manual_projects = copy.deepcopy(rows)
+        self.choose("my-box")
+
+    def recheck_shot_routes(self):
+        subscription = routing._subscription_for(self.node)
+        routing._reconcile_color_lut_routes(
+            [subscription], {subscription.node_name: subscription}, [self.node],
+        )
+        self.assertEqual(self.node._route_status["code"], "only")
+        self.assertTrue(self.node._route_status["ok"])
+
+    def test_only_rechecks_keep_my_box_original_upload_ready(self):
+        self.node._hmb_color_lut_state["result"] = {}
+        self.choose_my_box()
+        context = self.node._web_upload_context.copy()
+        self.assertTrue(self.node.get_parameter_value(target.UI)["web_upload"]["enabled"])
+        with mock.patch.object(target, "export_video", side_effect=AssertionError("Original must not be encoded")), \
+             mock.patch.object(self.node, "_upload_request", side_effect=lambda captured, **_: self.ack(captured)) as send:
+            self.recheck_shot_routes()
+            self.recheck_shot_routes()
+            self.assertEqual(self.node._web_upload_context, context)
+            self.assertTrue(self.node.get_parameter_value(target.UI)["web_upload"]["enabled"])
+            send.assert_not_called()
+            self.upload("only-my-box-original")
+        send.assert_called_once()
+        uploaded = send.call_args.args[0]
+        self.assertEqual((uploaded["project_id"], uploaded["owner_id"], uploaded["artifact"]),
+                         ("my-box", "fixture-owner", "source"))
+        self.assertEqual(uploaded["sha256"], hashlib.sha256(Path(context["path"]).read_bytes()).hexdigest())
+        self.assertEqual(self.node._web_upload["phase"], "complete")
+
+    def test_only_recheck_during_my_box_final_output_still_uploads_export(self):
+        state = self.node._hmb_color_lut_state
+        state["result"] = {}
+        state["settings"].update(enabled=True, exposure=.5)
+        self.choose_my_box()
+        original = Path(state["source"]["path"])
+        original_bytes = original.read_bytes()
+
+        def export_during_recheck(*args, **kwargs):
+            self.recheck_shot_routes()
+            return self.fixture.successful_export(*args, **kwargs)
+
+        with mock.patch.object(target, "export_video", side_effect=export_during_recheck) as encode, \
+             mock.patch.object(self.node, "_upload_request", side_effect=lambda captured, **_: self.ack(captured)) as send:
+            self.node._command({"id": "only-my-box-final", "action": "export_upload", "state": copy.deepcopy(state)})
+            self.fixture.drain()
+        encode.assert_called_once()
+        send.assert_called_once()
+        uploaded = send.call_args.args[0]
+        self.assertEqual((uploaded["project_id"], uploaded["owner_id"], uploaded["artifact"]),
+                         ("my-box", "fixture-owner", "export"))
+        rendered = Path(uploaded["path"])
+        self.assertEqual(rendered, Path(state["result"]["path"]))
+        self.assertNotEqual(rendered, original)
+        self.assertEqual(uploaded["sha256"], hashlib.sha256(rendered.read_bytes()).hexdigest())
+        self.assertEqual(original.read_bytes(), original_bytes)
+        self.assertEqual(state["status"]["phase"], "complete")
+
+    def test_unsuccessful_only_recheck_still_invalidates_upload(self):
+        self.choose_my_box()
+        self.assertTrue(self.node._upload_projection()["enabled"])
+        with mock.patch.object(routing, "_clear_hmb_route", return_value=(0, "unable to clear stale HMB route")):
+            subscription = routing._subscription_for(self.node)
+            routing._reconcile_color_lut_routes(
+                [subscription], {subscription.node_name: subscription}, [self.node],
+            )
+        self.assertEqual(self.node._route_status["code"], "only")
+        self.assertFalse(self.node._route_status["ok"])
+        self.assertFalse(self.node._upload_projection()["enabled"])
+
     def test_project_change_keeps_loaded_video_grade_and_result(self):
         before = copy.deepcopy(self.node._hmb_color_lut_state); first = self.ready()
         with mock.patch.object(target, "export_video", side_effect=AssertionError("No re-encode on project selection")):
@@ -86,6 +162,10 @@ class ManualLUTRegression(unittest.TestCase):
         self.assertNotEqual(first["upload_id"], second["upload_id"])
         self.assertEqual(second["file_name"], "11-12.mp4")
         self.assertEqual(second["project_name"], "까투리8")
+        view = self.node.get_parameter_value(target.UI)
+        self.assertEqual(view["manual_project_display_name"], "Katuri8")
+        self.assertEqual(view["manual_project"], {"id": "katuri8", "name": "까투리8"})
+        self.assertIn({"id": "katuri8", "name": "까투리8", "display_name": "Katuri8"}, view["upload_projects"])
 
     def test_explicit_project_required_and_browser_cannot_authorize_it(self):
         self.choose("")

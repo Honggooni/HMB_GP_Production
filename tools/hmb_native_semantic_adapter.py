@@ -164,7 +164,26 @@ function hmbNativeConnectionDeletionNotice(request, message) {''')
     return helper
 
 
+_SOUND_READ_PREVIOUS_CANDIDATE = "033e68f8583319ee9e4d6f4c80089b736f9057d09b2c7a2fc8644eded8b06f50"
+_SHOT_BASKET_BASE = "1abf6fb7d18cbf32bb556fe93c4c5c05a20829407423ad62ba446d5c62ab1da6"
+_SHOT_BASKET_PREVIOUS_CANDIDATE = "d7f5a296f6dbed3db3ea6018e4116caa98d70a4d9e2efba86364c80d963b096b"
+_SHOT_BASKET_HEADER_PREVIOUS_CANDIDATE = "9e601029eba8cdb0ad72f93b66700d463be2ccf09d48122a842a185bebf0f128"
+_SHOT_BASKET_SPRITE_PREVIOUS_CANDIDATE = "60dd6a2d4cfb03455be340c1bf6db83a35ad4b4d42d6bcc679c5feed0d18f44c"
+_SHOT_BASKET_COMPACT_PREVIOUS_CANDIDATE = "6e25fa65084ecad3fa13dc5beb3b9cecd21e2080d3588a3a6df7f8816e6a1b9c"
+_SHOT_BASKET_STARTUP_PREVIOUS_CANDIDATE = "56ae29378596be76fe0d72ab15d6d2fec4f7c5521a8257ed9af901be22db4cd6"
+_SHOT_BASKET_FLICKER_PREVIOUS_CANDIDATE = "21e6bac07d06895989328cb7bfd22fe4ea29a6ed79177e2bb04c50de6692326a"
+_SHOT_BASKET_HEADER_FADE_PREVIOUS_CANDIDATE = "3faf55400109cc2f7ce8fadae0533c188399d67b7e20f47365d7e15175d041c7"
+# Payload integrity only. The reviewed candidate hash below remains an
+# independent admission gate; changing UI bytes never approves a new editor.
+_SHOT_BASKET_UI_SHA256 = "5a4213870298c7d2fa1d5087e08065ac1b2c3008244f9cce44b3d019f84b8fbc"
+_SHOT_BASKET_ARTWORK_SHA256 = "e152f842096b8abdf976c9d843197fdc90e0189bc96ca712f16738601ceb6cfa"
+_SHOT_BASKET_EXTRA_ARTWORK_SHA256 = "2a17375f028dfdeb019ed2a39ca61dac5bf4b247de9618da77e370d9895b128e"
+_SHOT_BASKET_HEADER_ARTWORK_SHA256 = "d41540bd6b75b4c7d73962948f223ff1aacc0cf41f88a6ef00b6c443ae9f7b9c"
+_SHOT_BASKET_CANDIDATE = "3b4d4ad3b820c2fc194b230b4678baa3c63c0341efec2275f19eb2d9536430db"
 _REVIEWED_PREVIOUS_CANDIDATES = (
+    _SOUND_READ_PREVIOUS_CANDIDATE,
+    "47950ae47b76152c2923597fb47a6b514e3ce87dcfe4bf9291270512fa92e2df",
+    "3cf11148efbf8c107daa6ce0fb597d3808794912cd1d2b913373917c481401e1",
     "e594ed5b6e94d68b7dbc4cdfda0440190fff95e9588e03838a0f9284f9d55f67",
     "463f2dc87b98e63af151f11ef7aa9dbf0ea249d399a8dc5a508e4a8917352158",
     "d208403e7463adac2b3f778151aab55d3709892460460e8142fae8e91add4fbe",
@@ -189,7 +208,10 @@ def _upgrade_reviewed_candidate(source: str, helper: str) -> str:
     start = source.index(marker)
     end = source.index(boundary, start)
     source = source[:start] + _compiled_helper(helper) + source[end:]
-    if source_digest in {"e594ed5b6e94d68b7dbc4cdfda0440190fff95e9588e03838a0f9284f9d55f67",
+    if source_digest in {_SOUND_READ_PREVIOUS_CANDIDATE,
+                         "47950ae47b76152c2923597fb47a6b514e3ce87dcfe4bf9291270512fa92e2df",
+                         "3cf11148efbf8c107daa6ce0fb597d3808794912cd1d2b913373917c481401e1",
+                         "e594ed5b6e94d68b7dbc4cdfda0440190fff95e9588e03838a0f9284f9d55f67",
                          "463f2dc87b98e63af151f11ef7aa9dbf0ea249d399a8dc5a508e4a8917352158",
                          "d208403e7463adac2b3f778151aab55d3709892460460e8142fae8e91add4fbe"}:
         return source
@@ -600,7 +622,7 @@ def _build_candidate_ui_core(source: str, helper: str) -> str:
     if 'HMB_COLOR_LUT_NATIVE_HEADER_PORTAL_V1' in source:
         import hashlib
         reviewed = approval_evidence()
-        if (hashlib.sha256(source.encode('utf-8')).hexdigest() == reviewed['candidate_sha256']
+        if (hashlib.sha256(source.encode('utf-8')).hexdigest() == _SHOT_BASKET_BASE
                 and hashlib.sha256(helper.encode('utf-8')).hexdigest() == reviewed['helper_sha256']):
             return source  # Exact current bytes only; unknown input still fails closed.
         return _upgrade_reviewed_candidate(source, helper)
@@ -674,13 +696,371 @@ def _build_candidate_ui_core(source: str, helper: str) -> str:
     source = one(source, 'try{await Id.request(`DeleteNodeRequest`,{node_name:s});if(i.hmbGuardedDelete)', 'try{await(i.hmbGuardedDelete?hmbNativeSubmitCheckedDelete(s):Id.request(`DeleteNodeRequest`,{node_name:s}));if(i.hmbGuardedDelete)')
     return _capsule_motion_bridge(_bash_live_input_bridge(_port_retention_notice_bridge(source)))
 
+def _hmb_connection_action_bridge(source: str) -> str:
+    """Route header, selection, context menu and outliner resets by node ownership."""
+    source = one(source,
+        'let e=hmbIsNativeStudioType(t,hmbMetadata)&&hmbNativeHeader.active?[`lock`,`reset`,`run`]:w.nodeHeaderItems||[`lock`,`run`,`startFlow`];return x8t.filter',
+        'let e=hmbNativeHeaderItems(t,hmbLibrary,w.nodeHeaderItems);return x8t.filter')
+    source = one(source, '[w.nodeHeaderItems,oe,t,hmbNativeHeader.active,hmbMetadata]),we=',
+        '[w.nodeHeaderItems,oe,t,hmbLibrary]),we=')
+    source = one(source, '(0,z.jsx)(AJ,{children:`Reset Node`})]},`reset`)',
+        '(0,z.jsx)(AJ,{children:hmbNativeConnectionManaged(hmbLibrary)?`연결 다시 적용`:`Reset Node`})]},`reset`)')
+    source = one(source, 'xKt=e=>Id.request(`ResetNodeToDefaultsRequest`,{node_name:e})',
+        'xKt=(e,t)=>hmbNativeConnectionManaged(t)?hmbNativeRefreshConnections(e):Id.request(`ResetNodeToDefaultsRequest`,{node_name:e})')
+    source = one(source, 'xKt(e.id).catch(QAi)', 'xKt(e.id,e.data?.metadata?.library).catch(QAi)')
+    source = one(source, 'await Id.request(`ResetNodeToDefaultsRequest`,{node_name:e})',
+        'await xKt(e,i().find(node=>node.id===e)?.data?.metadata?.library)')
+    old = 'await Id.request(`ResetNodeToDefaultsRequest`,{node_name:t.id})'
+    if source.count(old) != 2:
+        raise ValueError("ambiguous selection/context reset routes")
+    source = source.replace(old, 'await xKt(t.id,t.data?.metadata?.library)')
+    return source
+
+
+def _build_base_candidate(source: str, helper: str) -> str:
+    """Preserve the reviewed pre-basket canvas and native controls."""
+    import hashlib
+
+    candidate = _build_candidate_ui_core(source, helper)
+    if candidate is source or hashlib.sha256(source.encode("utf-8")).hexdigest() == _SOUND_READ_PREVIOUS_CANDIDATE:
+        # This prior bundle already has the connection and session transforms.
+        return candidate
+    return _hmb_session_bound_editor_source(_hmb_connection_action_bridge(candidate))
+
+
+def _shot_basket_canvas(source: str, ui: str) -> str:
+    component = r'''
+function hmbUseRodongMartHeaderArtwork(library, nodeName, slots, collapsed) {
+  const current = C.useRef(null);
+  const synchronize = C.useRef(null);
+  const epoch = hmbNativeStudioFlowEpoch;
+  synchronize.current = () => {
+    const artwork = window.__hmbRodongMartHeaderArt;
+    if (library !== "HMB_GP_Production" || !artwork) return;
+    const node = hmbNativeStudioNode(nodeName);
+    let header;
+    if (!collapsed && slots.active && slots.identity && slots.actions) {
+      for (let row = slots.identity.parentElement; row && row !== slots.container; row = row.parentElement) {
+        if (row.contains(slots.actions)) { header = row; break; }
+      }
+    }
+    header ||= node?.querySelector("[data-hmb-native-icon-header],[data-hmb-mart-native-header]");
+    if (header && !node?.contains(header)) header = null;
+    if (current.current?.epoch !== epoch || current.current?.name !== nodeName) {
+      current.current?.cleanup?.();
+      current.current = { epoch, name: nodeName, index: artwork.next() };
+    }
+    const entry = current.current;
+    if (entry.header === header) return;
+    entry.cleanup?.();
+    entry.header = header;
+    entry.cleanup = artwork.mount(header, entry.index, true);
+  };
+  C.useLayoutEffect(() => { synchronize.current(); });
+  C.useLayoutEffect(() => {
+    if (library !== "HMB_GP_Production") return;
+    const ready = event => {
+      const container = event.detail?.container;
+      if (container?.closest(".react-flow__node")?.getAttribute("data-id") === nodeName) synchronize.current();
+    };
+    document.addEventListener("hmb-color-lut-header-ready", ready);
+    return () => {
+      document.removeEventListener("hmb-color-lut-header-ready", ready);
+      const entry = current.current;
+      entry?.cleanup?.();
+      if (entry) { entry.header = null; entry.cleanup = null; }
+    };
+  }, [library, nodeName]);
+}
+let hmbRodongMartQueuedWorkflow = "";
+let hmbRodongMartProjectHint = [];
+function hmbUseRodongMartReadAhead(connection) {
+  C.useEffect(() => {
+    if (connection !== "connected") return;
+    let active = true, retry;
+    hmbRodongMartProjectHint = [];
+    const read = async (attempt = 0) => {
+      try {
+        const result = await Id.request("HMBShotBasketRequest", { action: "status",
+          payload: { flow_name: "", workflow_name: "", prewarm: attempt === 0 } }, { timeoutMs: 5000 });
+        if (!active || result?.data?.ok !== true) return;
+        const { projects, status } = result.data;
+        if (Array.isArray(projects) && projects.length) hmbRodongMartProjectHint = projects;
+        else if (status === "discovering" && attempt < 2) retry = setTimeout(() => void read(attempt + 1), 280);
+      } catch { /* The actual view will make its own scoped request. */ }
+    };
+    void read();
+    return () => { active = false; clearTimeout(retry); hmbRodongMartProjectHint = []; };
+  }, [connection]);
+  C.useEffect(() => {
+    if (connection !== "connected" || typeof pVr === "undefined" || typeof cVr === "undefined") return;
+    const attempted = new Set();
+    let active = true, running = false, timer;
+    const schedule = () => {
+      if (!active || running || timer !== undefined) return;
+      const widgets = pVr.getState().widgets;
+      const next = [...widgets].find(([, widget]) => widget.libraryName === "HMB_GP_Production" &&
+        widget.bundleUrl && !attempted.has(widget.bundleUrl) && !cVr.has(widget.bundleUrl));
+      if (!next) return;
+      timer = setTimeout(async () => {
+        timer = undefined;
+        const [key, widget] = next;
+        if (!active || pVr.getState().widgets.get(key) !== widget) { schedule(); return; }
+        attempted.add(widget.bundleUrl);
+        running = true;
+        try {
+          const module = await import(widget.bundleUrl);
+          const mount = module.default || module[widget.name];
+          if (active && typeof mount === "function" && pVr.getState().widgets.get(key) === widget &&
+              !cVr.has(widget.bundleUrl)) cVr.set(widget.bundleUrl, mount);
+        } catch { /* Native widget loading retains its normal fallback and diagnostics. */ }
+        finally { running = false; schedule(); }
+      }, 80);
+    };
+    const unsubscribe = pVr.subscribe(schedule);
+    schedule();
+    return () => { active = false; clearTimeout(timer); unsubscribe(); };
+  }, [connection]);
+}
+function hmbQueueRodongMartBasket(workflow) {
+  hmbRodongMartQueuedWorkflow = workflow;
+  queueMicrotask(() => window.dispatchEvent(new Event("hmb-rodong-mart-workflow-ready")));
+}
+function hmbOpenQueuedRodongMartBasket(controller, context) {
+  if (hmbRodongMartQueuedWorkflow && context.ready && context.empty && context.flowName &&
+      context.workflowName === hmbRodongMartQueuedWorkflow && controller?.open(hmbRodongMartProjectHint, true)) {
+    hmbRodongMartQueuedWorkflow = "";
+    window.dispatchEvent(new Event("hmb-rodong-mart-basket-opened"));
+  }
+}
+function hmbUseRodongMartStartup(openWorkflows) {
+  const phase = C.useRef("fresh");
+  const handoffTimer = C.useRef(undefined);
+  const [visible, setVisible] = C.useState(false);
+  const [entering, setEntering] = C.useState(false);
+  const show = C.useCallback(() => {
+    if (phase.current === "visible") return;
+    if (phase.current === "done" || typeof window.__hmbMountRodongMartStartup !== "function") {
+      openWorkflows(); return;
+    }
+    phase.current = "visible";
+    setVisible(true);
+  }, [openWorkflows]);
+  const complete = C.useCallback(() => {
+    clearTimeout(handoffTimer.current);
+    phase.current = "done";
+    setEntering(false); setVisible(false);
+  }, []);
+  const dismiss = C.useCallback(() => { complete(); openWorkflows(); }, [complete, openWorkflows]);
+  const enter = C.useCallback(async create => {
+    setEntering(true);
+    const workflow = await create(hmbQueueRodongMartBasket);
+    if (!workflow) { setEntering(false); return false; }
+    if (phase.current === "visible") handoffTimer.current = setTimeout(() => {
+      if (hmbRodongMartQueuedWorkflow === workflow) hmbRodongMartQueuedWorkflow = "";
+      complete();
+    }, 30000);
+    return true;
+  }, [complete]);
+  C.useLayoutEffect(() => {
+    window.addEventListener("hmb-rodong-mart-basket-opened", complete);
+    return () => { window.removeEventListener("hmb-rodong-mart-basket-opened", complete); clearTimeout(handoffTimer.current); };
+  }, [complete]);
+  return { visible, entering, show, enter, dismiss };
+}
+function hmbRodongMartStartup({onDismiss, onEnter}) {
+  const host = C.useRef(null), latest = C.useRef(null);
+  latest.current = { onDismiss, onEnter };
+  C.useLayoutEffect(() => {
+    if (!host.current) return;
+    return window.__hmbMountRodongMartStartup?.({ host: host.current,
+      onDismiss: () => latest.current.onDismiss(), onEnter: () => latest.current.onEnter() });
+  }, []);
+  return (0,z.jsx)("div", {ref:host});
+}
+function hmbShotBasketCanvas({ready, empty, hasBasket, flowName, workflowName, onCreated}) {
+  const host = C.useRef(null), controller = C.useRef(null), latest = C.useRef(null);
+  latest.current = { ready, empty, hasBasket, flowName, workflowName, epoch: hmbNativeStudioFlowEpoch, onCreated };
+  C.useLayoutEffect(() => {
+    if (!host.current || typeof window.__hmbMountShotBasket !== "function") return;
+    controller.current = window.__hmbMountShotBasket({host:host.current, context:latest.current,
+      request: async (action, payload = {}) => {
+        const origin = latest.current;
+        if (!origin.ready || origin.epoch !== hmbNativeStudioFlowEpoch) throw Error("작업공간 연결을 확인해 주세요.");
+        const result = await Id.request("HMBShotBasketRequest", {
+          action, payload: {...payload, flow_name:payload.flow_name || origin.flowName || "",
+            workflow_name:origin.workflowName || ""}
+        }, {timeoutMs:action === "create" || action === "prepare" ? 90000 : 30000});
+        const value = result?.data;
+        if (!value || typeof value !== "object") throw Error("샷 바구니 응답을 확인할 수 없습니다.");
+        if (origin.epoch !== hmbNativeStudioFlowEpoch ||
+            (origin.workflowName && origin.workflowName !== latest.current.workflowName)) {
+          throw Error("작업공간이 변경되었습니다. 다시 열어 주세요.");
+        }
+        if (value.ok !== false && (action === "create" || action === "prepare") && value.flow_name) {
+          if (value.changed === true) hmbNativeConnectionDirty();
+          if (value.bound !== true) await latest.current.onCreated(value.flow_name, origin.epoch);
+        }
+        if (action === "apply" && (value.changed === true || value.accepted_pending === true)) hmbNativeConnectionDirty();
+        return value;
+      }});
+    const openQueued = () => hmbOpenQueuedRodongMartBasket(controller.current, latest.current);
+    window.addEventListener("hmb-rodong-mart-workflow-ready", openQueued);
+    return () => {
+      window.removeEventListener("hmb-rodong-mart-workflow-ready", openQueued);
+      controller.current?.destroy(); controller.current = null;
+    };
+  }, []);
+  C.useLayoutEffect(() => {
+    controller.current?.setContext(latest.current);
+    hmbOpenQueuedRodongMartBasket(controller.current, latest.current);
+  });
+  return (0,z.jsx)("div", {ref:host, style:{position:"absolute",inset:0,zIndex:20,pointerEvents:"none"}});
+}
+'''
+    source = one(source, 'hmbHostRestoreView,v,hmbMetadata);let{settings:w}=h$()',
+                 'hmbHostRestoreView,v,hmbMetadata);hmbUseRodongMartHeaderArtwork(hmbLibrary,e,hmbNativeHeader,v);let{settings:w}=h$()')
+    source = one(source, 'style:hmbNativeHeader.active?{display:`none`}:VJ(t)?Ee:ee,',
+                 'style:hmbNativeHeader.active?{display:`none`}:VJ(t)?Ee:ee,'
+                 '"data-hmb-mart-native-header":hmbLibrary===`HMB_GP_Production`?``:void 0,')
+    source = one(source, '(0,z.jsx)(f$,{icon:R}),(0,z.jsxs)(`span`,{className:`flex overflow-hidden flex-row gap-2 mr-4 h-full text-sm`,',
+                 'hmbLibrary===`HMB_GP_Production`?(0,z.jsx)(`span`,{"data-hmb-mart-node-icon":true,children:(0,z.jsx)(f$,{icon:R})}):(0,z.jsx)(f$,{icon:R}),(0,z.jsxs)(`span`,{className:`flex overflow-hidden flex-row gap-2 mr-4 h-full text-sm`,')
+    source = one(source, 'el("header", { style: { display: "flex", alignItems: "center", gap: 12, padding: 18, borderBottom: "1px solid #313c50" } },',
+                 'el("header", { ref: header => { if (header) window.__hmbStylePopupHeader?.(header, header.parentElement); }, style: { display: "flex", alignItems: "center", gap: 12, padding: 18, borderBottom: "1px solid #313c50" } },')
+    source = one(source, 'P9i();let l=e.hash||c||``,{isOpen:u,close:d,open:f}=N8(),{isOpen:p',
+                 'P9i();hmbUseRodongMartReadAhead(a);let l=e.hash||c||``,{isOpen:u,close:d,open:f}=N8(),hmbStartup=hmbUseRodongMartStartup(f),{isOpen:p')
+    source = one(source, 'else x(!1),f()}catch(e){console.error(`Failed to check workflow context:`,e),x(!1),f()}})()},[t,a,l,r,f]);',
+                 'else x(!1),!LX.getState().workflowName&&hmbStartup.show()}catch(e){console.error(`Failed to check workflow context:`,e),x(!1),!LX.getState().workflowName&&f()}})()},[t,a,l,r,f,hmbStartup.show]);')
+    source = one(source, 'Se=(0,C.useCallback)(async()=>{try{let e=await bY(),t=K3n(Object.keys(e.workflows));',
+                 'Se=(0,C.useCallback)(async hmbBeforeOpen=>{try{let e=await bY(),t=K3n(Object.keys(e.workflows));')
+    source = one(source, 'r(c,{isSaved:!1})}catch(e){console.error(`Failed to create workflow:`,e),',
+                 'typeof hmbBeforeOpen===`function`&&hmbBeforeOpen(c),r(c,{isSaved:!1});return c}catch(e){console.error(`Failed to create workflow:`,e),')
+    source = one(source, '});return(0,z.jsx)(W3n,{initialWorkflowName:t||``,children:(0,z.jsx)($X,{children:(0,z.jsxs)(xyi,',
+                 '});return(0,z.jsxs)(z.Fragment,{children:[(0,z.jsx)(W3n,{initialWorkflowName:t||``,children:(0,z.jsx)($X,{children:(0,z.jsxs)(xyi,')
+    source = one(source, 'g&&s&&(0,z.jsx)(M9i,{isOpen:g,onClose:_})]})},t)})}var vna=',
+                 'g&&s&&(0,z.jsx)(M9i,{isOpen:g,onClose:_})]})},t)}),hmbStartup.visible&&(hmbStartup.entering||(!t&&!u&&a===`connected`))?(0,z.jsx)(hmbRodongMartStartup,{onDismiss:hmbStartup.dismiss,onEnter:()=>hmbStartup.enter(Se)}):null]})}var vna=')
+    source = one(source, 'function Xui(){hmbUseNativeDeletionGuardHost();',
+                 ui + '\n' + component + '\nfunction Xui(){hmbUseNativeDeletionGuardHost();')
+    return one(source, 'children:[hmbConnectionManager,(0,z.jsx)(Dui,{isLoading:Ut||!e,workflowReady:e,',
+               'children:[hmbConnectionManager,(0,z.jsx)(hmbShotBasketCanvas,{ready:e&&!Ut,empty:!b.length,'
+               'hasBasket:b.some(node=>Boolean(node.data?.metadata?.hmb_shot_basket_v1)),'
+               'flowName:y,workflowName:LX.getState().workflowName,onCreated:async(flow,epoch)=>{'
+               'const graph=await p(flow);if(epoch!==hmbNativeStudioFlowEpoch)return;'
+               'x(current=>Array.from(new Map([...current,...graph.nodes].map(node=>[node.id,node])).values()));'
+               'O(current=>Array.from(new Map([...current,...graph.connections].map(edge=>[edge.id,edge])).values()));'
+               'await v();}}),(0,z.jsx)(Dui,{isLoading:Ut||!e,workflowReady:e,')
+
+
 def build_candidate(source: str, helper: str) -> str:
-    """Preserve reviewed UI transforms, then apply the two hashed inline seams."""
-    return _hmb_session_bound_editor_source(_build_candidate_ui_core(source, helper))
+    """Add the launcher only to the exact reviewed modern canvas."""
+    import base64
+    import hashlib
+    from pathlib import Path
+
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    current_art_revisions = (_SHOT_BASKET_FLICKER_PREVIOUS_CANDIDATE, _SHOT_BASKET_HEADER_FADE_PREVIOUS_CANDIDATE)
+    previous_headers = (_SHOT_BASKET_HEADER_PREVIOUS_CANDIDATE, _SHOT_BASKET_SPRITE_PREVIOUS_CANDIDATE,
+                        _SHOT_BASKET_COMPACT_PREVIOUS_CANDIDATE, _SHOT_BASKET_STARTUP_PREVIOUS_CANDIDATE,
+                        *current_art_revisions)
+    previous = (_SHOT_BASKET_PREVIOUS_CANDIDATE, *previous_headers)
+    if digest in (_SHOT_BASKET_CANDIDATE, *previous) and hashlib.sha256(helper.encode("utf-8")).hexdigest() != approval_evidence()["helper_sha256"]:
+        raise ValueError("HMB Shot Basket requires the reviewed native helper.")
+    if digest == _SHOT_BASKET_CANDIDATE:
+        return source
+    if digest in current_art_revisions:
+        base = source
+    elif digest in previous:
+        # The previous exact install already contains the reviewed base. Remove
+        # only its launcher script and JSX before checking that base's identity.
+        script = source.index('(() => {\n  const media = [\n    { type: "image", label: "이미지" },')
+        editor = source.index('function Xui(){hmbUseNativeDeletionGuardHost();', script)
+        base = source[:script] + source[editor:]
+        children = 'children:[hmbConnectionManager,'
+        launcher = base.index(children + '(0,z.jsx)(hmbShotBasketCanvas,') + len(children)
+        empty = base.index('(0,z.jsx)(Dui,{isLoading:Ut||!e,workflowReady:e,', launcher)
+        base = base[:launcher] + base[empty:]
+        if digest in previous_headers:
+            base = one(base, 'hmbUseRodongMartHeaderArtwork(hmbLibrary,e,hmbNativeHeader,v);', '')
+            base = one(base, '"data-hmb-mart-native-header":hmbLibrary===`HMB_GP_Production`?``:void 0,', '')
+        if digest == _SHOT_BASKET_STARTUP_PREVIOUS_CANDIDATE:
+            reversals = (
+                ('hmbLibrary===`HMB_GP_Production`?(0,z.jsx)(`span`,{"data-hmb-mart-node-icon":true,children:(0,z.jsx)(f$,{icon:R})}):(0,z.jsx)(f$,{icon:R})', '(0,z.jsx)(f$,{icon:R})'),
+                ('ref: header => { if (header) window.__hmbStylePopupHeader?.(header, header.parentElement); }, ', ''),
+                ('hmbStartup=hmbUseRodongMartStartup(f),', ''),
+                ('else x(!1),!LX.getState().workflowName&&hmbStartup.show()}catch(e){console.error(`Failed to check workflow context:`,e),x(!1),!LX.getState().workflowName&&f()}})()},[t,a,l,r,f,hmbStartup.show]);',
+                 'else x(!1),f()}catch(e){console.error(`Failed to check workflow context:`,e),x(!1),f()}})()},[t,a,l,r,f]);'),
+                ('Se=(0,C.useCallback)(async hmbBeforeOpen=>{try{let e=await bY(),t=K3n(Object.keys(e.workflows));',
+                 'Se=(0,C.useCallback)(async()=>{try{let e=await bY(),t=K3n(Object.keys(e.workflows));'),
+                ('typeof hmbBeforeOpen===`function`&&hmbBeforeOpen(c),r(c,{isSaved:!1});return c}catch(e){console.error(`Failed to create workflow:`,e),',
+                 'r(c,{isSaved:!1})}catch(e){console.error(`Failed to create workflow:`,e),'),
+                ('hmbStartup.visible&&!t&&!u&&a===`connected`?(0,z.jsx)(hmbRodongMartStartup,{onDismiss:hmbStartup.dismiss,onEnter:async()=>{const key=await Se(hmbQueueRodongMartBasket);if(key)hmbStartup.complete();return Boolean(key)}}):null,', ''),
+            )
+            for old, new in reversals:
+                base = one(base, old, new)
+    else:
+        base = _build_base_candidate(source, helper)
+    if digest not in current_art_revisions and hashlib.sha256(base.encode("utf-8")).hexdigest() != _SHOT_BASKET_BASE:
+        raise ValueError("HMB Shot Basket requires the reviewed modern canvas.")
+    ui_path = Path(__file__).resolve().parents[1] / "resources/editor/hmb-shot-basket.js"
+    ui = ui_path.read_bytes()
+    if hashlib.sha256(ui).hexdigest() != _SHOT_BASKET_UI_SHA256:
+        raise ValueError("HMB Shot Basket UI differs from the reviewed local build.")
+    script = ui.decode("utf-8")
+    for filename, artwork_digest, placeholder in (
+        ("hmb-rodong-mart-launcher.webp", _SHOT_BASKET_ARTWORK_SHA256, "__HMB_RODONG_MART_ARTWORK__"),
+        ("hmb-rodong-mart-launcher-extra.webp", _SHOT_BASKET_EXTRA_ARTWORK_SHA256, "__HMB_RODONG_MART_EXTRA_ARTWORK__"),
+        ("hmb-rodong-mart-header.webp", _SHOT_BASKET_HEADER_ARTWORK_SHA256, "__HMB_RODONG_MART_HEADER_ARTWORK__"),
+    ):
+        artwork = ui_path.with_name(filename).read_bytes()
+        if hashlib.sha256(artwork).hexdigest() != artwork_digest:
+            raise ValueError("HMB Rodong Mart artwork differs from the approved launcher.")
+        artwork_url = 'data:image/webp;base64,' + base64.b64encode(artwork).decode('ascii')
+        script = one(script, placeholder, artwork_url)
+    if digest in current_art_revisions:
+        # This exact revision has the current startup/read-ahead integration.
+        # Replace the art script and mount anchor without rewinding that integration.
+        start = source.index('(() => {\n  const media = [\n    { type: "image", label: "이미지" },')
+        end = source.index('\nfunction hmbUseRodongMartHeaderArtwork(', start)
+        source = source[:start] + script + '\n' + source[end:]
+        candidate = one(source, 'hmbStartup.visible&&(!t||hmbStartup.entering)&&!u&&a===`connected`?',
+                        'hmbStartup.visible&&(hmbStartup.entering||(!t&&!u&&a===`connected`))?')
+        if digest == _SHOT_BASKET_FLICKER_PREVIOUS_CANDIDATE:
+            candidate = one(candidate, '    const leading = header?.querySelector("[data-hmb-mart-node-icon],[data-hmb-capsule-disc]");\n    const target = leading || header;\n', '')
+            candidate = one(candidate, '    if (entry.header === target) return;\n    entry.cleanup?.();\n    entry.header = target;\n    entry.cleanup = artwork.mount(target, entry.index, Boolean(leading));',
+                            '    if (entry.header === header) return;\n    entry.cleanup?.();\n    entry.header = header;\n    entry.cleanup = artwork.mount(header, entry.index, true);')
+    else:
+        candidate = _shot_basket_canvas(base, script)
+    if digest != _SHOT_BASKET_HEADER_FADE_PREVIOUS_CANDIDATE:
+        passive_types = 'const hmbNativePassiveHeaderTypes = new Set([\n'
+        candidate = one(candidate, passive_types, passive_types + '  "HMBFinishLookLibrary", "HMBColorLUTLibrary",\n')
+    # The Image Bash editor is shared with stock nodes. Key the header cache
+    # on HMB ownership so a reused stock modal also removes the decoration.
+    header = 'let c;t[117]===a?c=t[118]:(c=(0,z.jsxs)(`div`,{className:`flex flex-row justify-between items-start px-8 pt-6 pb-4 w-full border-b border-gray-200 dark:border-gray-700`,children:[o,(0,z.jsx)(wG,{className:`mt-1 ml-4`,onClick:a,size:`icon`,variant:`ghost`,children:s})]}),t[117]=a,t[118]=c);let l;'
+    styled_header = header.replace('let c;t[117]===a?', 'const hmbPopupOwned=Boolean(hmbUiScope);let c;t[117]?.[0]===a&&t[117]?.[1]===hmbPopupOwned?')
+    styled_header = styled_header.replace('{className:', '{ref:header=>{if(header)window.__hmbStylePopupHeader?.(header,header.parentElement,{artworkOnly:true,enabled:hmbPopupOwned})},className:', 1)
+    return one(candidate, header, styled_header.replace('t[117]=a,', 't[117]=[a,hmbPopupOwned],'))
 
 def approval_evidence() -> dict:
     """Exact reviewed capability evidence; Desktop and team release are separate."""
-    return {'status': 'approved', 'structural_anchors': 'matched', 'live_renderer_verified': True, 'deletion_verified': True, 'desktop_verified': False, 'team_release_approved': False, 'renderer_scope': 'Only two read-only deletion/blocked-connection preflight requests now carry10s timeout. Exact helper comparison excludes every other edit from the previously verified Local54 helper. Primary React27 readiness,51 connection and82 native-deletion cases pass; both profiles preserve all bytes outside helper. Previous scoped Bash/design/session evidence inherited byte-identically. No current actual Desktop or teammate verification.', 'source_sha256': '157e06c446d68d77bab30cba4578f5a71289da74d62c44c95b0b6ddd046edde6', 'candidate_sha256': '3cf11148efbf8c107daa6ce0fb597d3808794912cd1d2b913373917c481401e1', 'helper_sha256': '709aa28865aacc42b0640d9a09bd0d490ca6f98a16ed441b6182b3339dcde4a6', 'verification_sha256': {'reports/all-library-deployment-audit-20261102/native/PREPARED.json': '5a891ca3fd94e4d4ddd9b289c2b542c6c65eb08d231f36d9a92a6a6fecf6d350', 'reports/all-library-deployment-audit-20261102/native/LOCAL54-UPGRADE.json': 'ae05ec32649adce72c8d6e7e0ac98f0dc79e757b91f4663b0097dff76fa908e4', 'reports/all-library-deployment-audit-20261102/source-checks/RESULT.json': 'c5e3b0db7ef91544c8d3020c825dfed116a25f961cd651a19275c963dec21d1a', 'reports/all-library-deployment-audit-20261102/ui-final/RESULT.json': '640b82b26bfef886222266a20f2010b4699276650c9574ef29f01ae305c89bc8', 'reports/saved-agent-generator-disconnect-audit-20261102/native/APPROVED.json': '0748ad398945039aa35b0b5746db44971575931221687ee925c6608a2db651de'}}
+    return {'status': 'approved',
+     'structural_anchors': 'matched',
+     'live_renderer_verified': True,
+     'deletion_verified': True,
+     'desktop_verified': False,
+     'team_release_approved': False,
+     'renderer_scope': 'The reviewed native controls plus the exact HMB Shot Basket canvas entry. '
+                       'The Local overlay requires separate launcher, request, and saved-workflow verification.',
+     'source_sha256': '157e06c446d68d77bab30cba4578f5a71289da74d62c44c95b0b6ddd046edde6',
+     'candidate_sha256': _SHOT_BASKET_CANDIDATE,
+     'helper_sha256': '67612a63afe072a654c2b2ce7c0ae98ffdce10f580799595c5542560c1c942bf',
+     'verification_sha256': {
+         'reports/sound-readonly-sync-local862-20261105/native/BUILD.json': 'a112f931f5449726b15d52b448cbe5defaf66d4761078c1ee53693bae571e747',
+         'reports/sound-readonly-sync-local862-20261105/widget/browser-current-v2.log': '422cba7e4f06ad3189fd6d2bb1281fe844f0d57bc8600b895da03866812993b6',
+         'reports/sound-readonly-sync-local862-20261105/native/native-connections.log': 'fbb747cdd5b3eb0420e3f3fe1571674e469abbeaed36f92787bdac6e38aa1341',
+         'reports/sound-readonly-sync-local862-20261105/native/native-deletion.log': 'fa7cb599e0f7fef422da7e0cd41c42832c12867deb5852d34341a437f64ed4ac',
+         'reports/sound-readonly-sync-local862-20261105/sdk/case-final/RESULT.json': '691a5b94e954525d92b049a2196768375ae4a57d867b475b4aeecc03d95c996b',
+     }}
+
 
 def patch_editor_source(source: str, helper: str) -> tuple[str, dict]:
     """Transform only known structures; admit only the independently tested bytes."""
@@ -689,6 +1069,10 @@ def patch_editor_source(source: str, helper: str) -> tuple[str, dict]:
     evidence = approval_evidence()
     observed = tuple(hashlib.sha256(value.encode("utf-8")).hexdigest() for value in (source, result, helper))
     reviewed = tuple(evidence[key] for key in ("source_sha256", "candidate_sha256", "helper_sha256"))
-    if observed != reviewed and not (observed[0] in (*_REVIEWED_PREVIOUS_CANDIDATES, reviewed[1]) and observed[1:] == reviewed[1:]):
+    previous = (*_REVIEWED_PREVIOUS_CANDIDATES, _SHOT_BASKET_BASE, _SHOT_BASKET_PREVIOUS_CANDIDATE,
+                _SHOT_BASKET_HEADER_PREVIOUS_CANDIDATE, _SHOT_BASKET_SPRITE_PREVIOUS_CANDIDATE,
+                _SHOT_BASKET_COMPACT_PREVIOUS_CANDIDATE, _SHOT_BASKET_STARTUP_PREVIOUS_CANDIDATE,
+                _SHOT_BASKET_FLICKER_PREVIOUS_CANDIDATE, _SHOT_BASKET_HEADER_FADE_PREVIOUS_CANDIDATE)
+    if observed != reviewed and not (observed[0] in (*previous, reviewed[1]) and observed[1:] == reviewed[1:]):
         evidence = {"status":"unvalidated", "structural_anchors":"matched", "live_renderer_verified":False, "deletion_verified":False}
     return result, evidence

@@ -184,7 +184,8 @@ const readComplete = {
   source_fps: 24,
 };
 result = buttons(readComplete, selectedPath);
-assert.equal(result.readEnabled, false);
+assert.equal(result.readEnabled, true, "A completed binary Maya input can be explicitly reloaded.");
+assert.equal(result.reload, true);
 assert.equal(result.playblastEnabled, true);
 assert.equal(result.snapshotEnabled, true);
 assert.equal(result.originalPreviewToggleEnabled, true);
@@ -240,6 +241,21 @@ const renamedReadSelection = widgetModule.hmbEnsurePickerOutlinerSelection({
 });
 assert.equal(renamedReadSelection.selected_outliner_path, "|Hero_GRP");
 assert.equal(renamedReadSelection.selected_color, "Green");
+
+// Repeated references may share UUIDs. Exact paths select their own colors;
+// deleting the requested reference must never select a sibling implicitly.
+const repeated = {
+  ...readWithoutSelection,
+  outliner_nodes: ["FireflyAa", "FireflyAa1", "FireflyAa2"].map(name => ({name, full_path:`|${name}`, maya_uuid:"shared"})),
+  slot_assignments: [{video_slot:1, bindings:[
+    {full_dag_path:"|FireflyAa",maya_uuid:"shared",color:"Red"},
+    {full_dag_path:"|FireflyAa1",maya_uuid:"shared",color:"Blue"},
+  ]}],
+  selected_outliner_uuid:"shared", selected_outliner_path:"|FireflyAa1",
+};
+assert.equal(widgetModule.hmbEnsurePickerOutlinerSelection(repeated).selected_color,"Blue");
+assert.equal(widgetModule.hmbEnsurePickerOutlinerSelection({...repeated,selected_outliner_path:"|FireflyAa2"}).selected_color,"");
+assert.equal(widgetModule.hmbEnsurePickerOutlinerSelection({...repeated,selected_outliner_path:"|removed"}).selected_outliner_path,"");
 
 const paletteButtons = ["Red", "Green"].map((color) => {
   const classes = new Set();

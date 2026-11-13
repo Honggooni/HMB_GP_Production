@@ -6,7 +6,6 @@ import binascii
 import ctypes
 import hashlib
 import hmac
-import importlib
 import inspect
 import ipaddress
 import io
@@ -84,22 +83,25 @@ from griptape_nodes.traits.options import Options
 _HMB_LEGACY_PROMPT_RECOVERY_METADATA = "hmb_legacy_prompt_recovery_v1"
 
 
-def _write_generation_sidecar(file_path: Path, metadata: Any) -> None:
+def _write_generation_sidecar(file_path: Path, metadata: Any, *, workflow: Any = None) -> None:
     """Use the installed host's sidecar API, without retrying a partial write."""
 
     parameters = inspect.signature(write_sidecar).parameters
-    engine_parameter = parameters.get("engine")
-    if engine_parameter is None:
-        # Older hosts accept only (file_path, metadata).
-        write_sidecar(file_path, metadata)
-        return
-    from griptape_nodes.retained_mode.engine import current_engine
-
-    engine = current_engine()
-    if engine_parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
-        write_sidecar(file_path, metadata, engine)
-    else:
-        write_sidecar(file_path, metadata, engine=engine)
+    context = {}
+    if "engine" in parameters:
+        from griptape_nodes.retained_mode.engine import current_engine
+        context["engine"] = getattr(workflow, "engine", None) or current_engine()
+    if "workflow" in parameters:
+        context["workflow"] = workflow
+    positional = [file_path, metadata]
+    keyword = {}
+    for name, parameter in parameters.items():
+        if name in context:
+            if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+                positional.append(context[name])
+            else:
+                keyword[name] = context[name]
+    write_sidecar(*positional, **keyword)
 
 
 try:
@@ -128,7 +130,7 @@ import _hmb_broker_config as _broker_config
 import _hmb_my_box_node as _my_box_node
 import _hmb_reference_leases as _reference_leases
 from _hmb_image_limits import inspect_seedance_image_payload
-from _hmb_project import PROJECTS, project_from_asset_payload, resolve_project
+from _hmb_project import project_display_name, resolve_project
 from _hmb_build_diagnostics import get_build_diagnostics as _get_build_diagnostics
 from _hmb_common import (
     _broker_load_bearer_token_readonly,
@@ -375,6 +377,9 @@ PROJECT_SELECTION_SCHEMA = "hmb-imageasset-project-selection-v1"
 ONLY_PROJECT_SELECTION_SCHEMA = "hmb-only-project-selection-v1"
 ONLY_PROJECT_PARAMETER = "only_project"
 ONLY_PROJECT_UNSELECTED = "Select Project"
+ONLY_ACTIVE_PROJECT_IDS = ("superwings12", "katuri8")
+ONLY_PROJECT_CHOICES = (ONLY_PROJECT_UNSELECTED, *(project_display_name(key) for key in ONLY_ACTIVE_PROJECT_IDS),
+                        _my_box_node.protocol.MY_BOX_LABEL)
 
 
 class _ProjectSelectionChanged(ValueError):
@@ -585,8 +590,13 @@ SHOT_VIDEO_INPUT_PARAMETER = "SHOT_VIDEO_IN"
 SHOT_ASSET_INPUT_PARAMETER = "SHOT_ASSET_IN"
 SHOT_PICKER_INPUT_PARAMETER = "SHOT_PICKER_IN"
 SHOT_FINISH_LOOK_INPUT_PARAMETER = "SHOT_FINISH_LOOK_IN"
+SHOT_SOUND_INPUT_PARAMETER = "SHOT_SOUND_IN"
+PROMPT_SOUND_AUDIO_DISPLAY_PARAMETER = "hmb_prompt_sound_audio_display"
 GENERATED_VIDEO_SOURCE_PARAMETER = "HMB_GENERATED_VIDEO_SOURCE"
 GENERATED_VIDEO_SOURCE_SCHEMA = "hmb-generated-video-source"
+GENERATION_SOUND_STORE_PARAMETER = "HMB_GENERATION_SOUND_STATES"
+_GENERATION_SOUND_STORE_SCHEMA = "hmb-generation-sound-states"
+_GENERATION_SOUND_STORE_LIMIT = 8
 FINISH_LOOK_SHOT_SNAPSHOT_SCHEMA = "hmb-finish-look-shot-snapshot"
 FINISH_LOOK_SHOT_SNAPSHOT_VERSION = 2
 SHOT_PICKER_LEGACY_JSON_MAX_BYTES = 1024 * 1024
@@ -4043,6 +4053,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 ui_options=dict(hidden_shot_input_ui),
             )
         )
+        self.add_parameter(ParameterDict(
+            name=SHOT_SOUND_INPUT_PARAMETER, type="dict", input_types=["dict"],
+            accept_any=False, default_value={}, allowed_modes={ParameterMode.INPUT},
+            hide=True, hide_label=True, hide_property=True, serializable=False,
+            tooltip="Exact Shot Sound dependency. Reference audio informs the model; exact timing and mixing belong to local finishing.",
+            ui_options=dict(hidden_shot_input_ui),
+        ))
+        self._hmb_sound_port_registered = True
         for name, tooltip in (
             (
                 SHOT_IMAGE_INPUT_PARAMETER,
@@ -4303,12 +4321,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "authoritative; a different manual selection is rejected."
                 ),
                 allowed_modes={ParameterMode.PROPERTY},
-                traits={Options(choices=[ONLY_PROJECT_UNSELECTED, *(
-                    PROJECTS[key]["project_name"] for key in ("superwings12", "katuri8")
-                ), _my_box_node.protocol.MY_BOX_LABEL])},
-                ui_options={"display_name": "Project (Only)", "simple_dropdown": [
-                    ONLY_PROJECT_UNSELECTED, *(PROJECTS[key]["project_name"] for key in ("superwings12", "katuri8")), _my_box_node.protocol.MY_BOX_LABEL
-                ]},
+                traits={Options(choices=list(ONLY_PROJECT_CHOICES))},
+                ui_options={"display_name": "Project (Only)", "simple_dropdown": list(ONLY_PROJECT_CHOICES)},
             )
         )
         # Keep private Only controls beside its explicit selection. The native
@@ -4604,8 +4618,20 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             ParameterBool(
                 name="generate_audio",
                 default_value=False,
-                tooltip="Generate audio with the video. Disabled by default on new nodes.",
+                tooltip="Generate audio with the video. An enabled Sound reference bound in this Shot's HMB Prompt turns it on automatically.",
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+            ParameterBool(
+                name=PROMPT_SOUND_AUDIO_DISPLAY_PARAMETER,
+                display_name="Generate Audio",
+                tooltip="On while this Shot's HMB Prompt contains an enabled Sound reference.",
+                allowed_modes={ParameterMode.PROPERTY},
+                default_value=None,
+                on_label="On",
+                settable=False,
+                serializable=False,
+                hide=True,
+                ui_options={"readonly": True},
             )
             ParameterString(
                 name="output_format",
@@ -4832,6 +4858,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 ui_options={"hide": True, "hide_property": True, "hide_handles": True},
             )
         )
+        self.add_parameter(ParameterDict(
+            name=GENERATION_SOUND_STORE_PARAMETER, default_value={},
+            tooltip="Effective Sound controls bound to completed local video jobs; retained across Save/Reopen.",
+            allowed_modes={ParameterMode.PROPERTY}, settable=False, serializable=True,
+            hide=True, hide_property=True, hide_label=True,
+            ui_options={"hide": True, "hide_property": True, "hide_handles": True},
+        ))
         self._output_file = ProjectFileParameter(
             node=self,
             name="output_file",
@@ -5479,6 +5512,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._hmb_generated_video_source = deepcopy(source)
         self.parameter_values[GENERATED_VIDEO_SOURCE_PARAMETER] = deepcopy(source)
         self.parameter_output_values[GENERATED_VIDEO_SOURCE_PARAMETER] = deepcopy(source)
+        pending_sound = getattr(self, "_hmb_pending_sound", None)
+        previous_sound = self._hmb_completed_sound_entries().get(str(generation_id))
+        if isinstance(previous_sound, dict) and previous_sound.get("origin") == identity:
+            self._hmb_captured_sound = deepcopy(previous_sound)
+        elif isinstance(pending_sound, dict):
+            pending_origin = pending_sound.get("origin") or {}
+            if _generated_video_origin(pending_origin) == identity:
+                self._hmb_captured_sound = {**deepcopy(pending_sound), "generation_id": str(generation_id)}
+                self._hmb_store_completed_sound(self._hmb_captured_sound)
         # The resulting route belongs to the completed origin even if the UI
         # has already selected another Shot. This never invokes upstream work.
         try:
@@ -7239,6 +7281,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         return value["text"]
 
     def _get_raw_parameter_value(self, param_name: str) -> Any:
+        if param_name == PROMPT_SOUND_AUDIO_DISPLAY_PARAMETER:
+            return True
         if param_name == "prompt":
             projected = self._hmb_managed_prompt_projection()
             if projected is not None:
@@ -7264,6 +7308,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     return False
             except Exception:
                 return False
+        self._hmb_refresh_prompt_sound_audio()
         projected = self._hmb_managed_prompt_projection()
         if projected is None:
             return False
@@ -7280,9 +7325,85 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     def after_incoming_connection(self, source_node: Any, source_parameter: Any, target_parameter: Any) -> None:
         result = super().after_incoming_connection(source_node, source_parameter, target_parameter)
-        if getattr(target_parameter, "name", "") == "prompt":
+        target_name = getattr(target_parameter, "name", "")
+        if target_name == "prompt":
             self._hmb_refresh_managed_prompt_projection(source_node=source_node, force=True)
+        elif target_name == SHOT_SOUND_INPUT_PARAMETER:
+            self._hmb_refresh_prompt_sound_audio()
         return result
+
+    def after_incoming_connection_removed(self, source_node: Any, source_parameter: Any, target_parameter: Any) -> None:
+        result = super().after_incoming_connection_removed(source_node, source_parameter, target_parameter)
+        if getattr(target_parameter, "name", "") in {"prompt", SHOT_SOUND_INPUT_PARAMETER}:
+            self._hmb_refresh_prompt_sound_audio()
+        return result
+
+    def _hmb_hydrate_sound_source(self, _source: Any) -> None:
+        self._hmb_refresh_prompt_sound_audio()
+
+    def _hmb_refresh_prompt_sound_audio(self) -> None:
+        """Project the exact current Prompt binding without changing saved controls."""
+        if (not getattr(self, "_hmb_sound_port_registered", False)
+                or getattr(self, "_hmb_node_deleted", False) or hasattr(self, "_web_owner")):
+            return
+        remote = self._hmb_has_prompt_sound_audio()
+        manual = self.get_parameter_by_name("generate_audio")
+        display = self.get_parameter_by_name(PROMPT_SOUND_AUDIO_DISPLAY_PARAMETER)
+        if manual is not None and display is not None:
+            if manual.settable == remote:
+                manual.settable = not remote
+            if manual.hide_property != remote:
+                manual.hide_property = remote
+            label = "Generate Audio Input" if remote else None
+            if manual.display_name != label:
+                manual.display_name = label
+            if display.hide == remote:
+                display.hide = not remote
+                display.track_change("value", True)
+                self.emit_parameter_changes()
+
+    def _hmb_has_prompt_sound_audio(self) -> bool:
+        """Read authored metadata through the retained Agent/Prompt chain."""
+        if not getattr(self, "_hmb_sound_port_registered", False):
+            return False
+        try:
+            if self._hmb_seedance_execution_mode() != "shot":
+                return False
+            raw_model = str(self.get_parameter_value("model_id") or "").strip()
+            if MODEL_ID_ALIASES.get(raw_model, raw_model) not in BROKER_SUPPORTED_MODEL_IDS:
+                return False
+            shot = self._hmb_shot_channel_subscription()
+            scope = {key: shot[key] for key in ("channel_uuid", "shot_uuid")}
+            agent = self._manual_agent_prompt_source()
+            if agent is None or self._hmb_preflight_kind(agent) != "HMBAgentLibrary":
+                return False
+            if agent._hmb_shot_manager_enabled():
+                prompt = agent._hmb_manager_prompt_owner(**scope)
+                if self._hmb_preflight_kind(prompt) != "HMBPromptLibrary":
+                    return False
+                snapshot = prompt._hmb_sound_snapshot_for(**scope)
+            else:
+                snapshot = agent._hmb_sound_snapshot_for(**scope)
+            if not snapshot:
+                return False
+            from _hmb_sound import REFERENCE_EXTENSIONS, normalize_sound_snapshot
+            snapshot = normalize_sound_snapshot(snapshot)
+            source = self._exact_incoming_source(SHOT_SOUND_INPUT_PARAMETER, "SHOT_SOUND_OUT", required=False)
+            if source is not None:
+                if self._hmb_preflight_kind(source) != "HMBSoundLibrary":
+                    return False
+                originals = normalize_sound_snapshot(source._hmb_sound_snapshot_for(**scope))
+                if originals:
+                    self._validate_prompt_sound_originals(snapshot, originals, shot)
+            return (snapshot.get("channel_uuid") == scope["channel_uuid"]
+                    and not snapshot.get("preparing") and not snapshot.get("preparation_error")
+                    and any(row["enabled"] and row["purpose"] in {"reference", "both"}
+                        and all(row[key] == value for key, value in scope.items())
+                        and Path(row["path"]).suffix.casefold() in REFERENCE_EXTENSIONS
+                        for row in snapshot.get("tracks", [])))
+        except Exception:
+            # Unavailable source information must never enable an authored control.
+            return False
 
     @staticmethod
     def _agent_route_subscription(source_node: Any, identity: dict[str, Any]) -> Any:
@@ -7643,6 +7764,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         """Restore durable preview state after the newest serialized replay."""
 
         self._restore_generation_recovery_preview()
+        self._hmb_refresh_prompt_sound_audio()
 
     @hmb_binding_mutation
     def set_parameter_value(
@@ -7685,6 +7807,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             _broker_config.save_broker_base_url(selected)
             self._on_shared_broker_address_changed(selected)
             return
+        if param_name == ONLY_PROJECT_PARAMETER and isinstance(value, str) and value not in ONLY_PROJECT_CHOICES:
+            label = project_display_name(value)
+            if label in ONLY_PROJECT_CHOICES:
+                value = label
         if param_name == SEEDANCE_RECOVERY_PARAMETER:
             value = _seedance_recovery_value(value)
             if not value["journal_id"]:
@@ -8186,6 +8312,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 authoritative_catalog,
                 self._generation_preview_for_widget(),
                 getattr(self, "_hmb_remote_prompt_route", None),
+                self._draft_ui_state(),
             )
             if callable(current_mode):
                 normalized.update(current_mode())
@@ -8388,8 +8515,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self._schedule_existing_generation_refresh()
         if not self._hmb_shot_syncing and parameter.name in {"draft_action", "resolution", "draft_job_id", DRAFT_SOURCE_PARAMETER,
                                DRAFT_SOURCES_PARAMETER, "model_id", SHOT_SELECTOR_PARAMETER,
+                               SEEDANCE_SHOT_WIDGET_PARAMETER,
                                SHOT_UUID_PARAMETER, SHOT_CHANNEL_UUID_PARAMETER, BROKER_SERVER_URL_PARAMETER,
                                ONLY_PROJECT_PARAMETER}:
+            # A header selection must publish its final authoritative mode once
+            # routing and native parameter visibility have settled. The generic
+            # setter echo may still contain the incoming request's old revision.
             with suppress(Exception):
                 self._sync_seedance_shot_widget(emit_change=True)
         return result
@@ -9880,6 +10011,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             # Only has no exact Shot finishing source. Discard a previous
             # bound-Shot transient sidecar without touching authored text.
             resolved["_hmb_finish_look_out"] = ""
+            # Only keeps its manually authored Reference Audio list. It never
+            # inherits a previously selected Shot's transient Sound contract.
+            for key in ("_hmb_sound_snapshot", "_hmb_sound_tracks", "_hmb_sound_provenance", "_hmb_sound_reference_bindings"):
+                resolved.pop(key, None)
+            resolved.pop("_hmb_reference_analysis", None)
+            resolved.pop("_hmb_analysis_media_bindings", None)
+            resolved.pop("_hmb_analysis_video_references", None)
             task = str(params.get(TASK_PARAMETER) or "").strip()
             if not task:
                 task = INPUT_MODE_TASKS.get(
@@ -9910,6 +10048,24 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             }:
                 resolved["first_frame"] = None
                 resolved["last_frame"] = None
+            sound_snapshot, sound_tracks, sound_provenance = self._resolve_exact_shot_sound(
+                {"channel_uuid": "", "shot_uuid": "", "enabled": False}, params)
+            reference_tracks = [row for row in sound_tracks if row.get("purpose") in {"reference", "both"}]
+            if reference_tracks and task not in {TASK_REFERENCE_TO_VIDEO, TASK_VIDEO_EDITING, TASK_VIDEO_EXTENSION}:
+                raise ValueError("The selected Only task does not support reference audio. Choose a reference task or use Sound mix-only for local finishing. No request was submitted.")
+            if reference_tracks:
+                from _hmb_sound import REFERENCE_EXTENSIONS
+                if any(Path(row["path"]).suffix.casefold() not in REFERENCE_EXTENSIONS for row in reference_tracks):
+                    raise ValueError("Seedance reference audio requires WAV or MP3. Choose mix-only for other local finishing formats. No request was submitted.")
+                manual_audio_count = len(resolved.get("reference_audio") or [])
+                resolved["reference_audio"] = [*list(resolved.get("reference_audio") or []), *(row["path"] for row in reference_tracks)]
+                audio_limit = MODEL_REFERENCE_LIMITS.get(str(params.get("model_id") or ""), MODEL_REFERENCE_LIMITS[SEEDANCE_2_0_MODEL_ID])[2]
+                if len(resolved["reference_audio"]) > audio_limit:
+                    raise ValueError(f"Only manual and Sound references together exceed the model's {audio_limit} audio reference limit. No request was submitted.")
+                resolved["_hmb_sound_reference_bindings"] = [{"sound": f"@sound{index}", "provider_audio": f"@audio{manual_audio_count + index}"}
+                    for index in range(1, len(reference_tracks) + 1)]
+            if sound_snapshot:
+                resolved.update(_hmb_sound_snapshot=sound_snapshot, _hmb_sound_tracks=sound_tracks, _hmb_sound_provenance=sound_provenance)
             return resolved
 
         image_node = self._exact_incoming_source(
@@ -9998,7 +10154,36 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 images = selected_media
             else:
                 videos = selected_media
-        image_limit, video_limit, _audio_limit = MODEL_REFERENCE_LIMITS.get(
+        from _hmb_analysis_delivery import route_analysis_media, analysis_video_reference_bindings
+
+        originals, excluded = [], {}
+        analysis_results_only = False
+        analysis_agent = self._manual_agent_prompt_source()
+        if analysis_agent is not None and self._hmb_preflight_kind(analysis_agent) == "HMBAgentLibrary":
+            scope = {key: subscription[key] for key in ("channel_uuid", "shot_uuid")}
+            read_originals = getattr(analysis_agent, "_hmb_reference_analysis_originals_for", None)
+            read_results_only = getattr(analysis_agent, "_hmb_reference_analysis_results_only_for", None)
+            read_owner = getattr(analysis_agent, "_hmb_reference_analysis_owner", None)
+            if callable(read_results_only):
+                analysis_results_only = read_results_only(**scope) is True
+            if not analysis_results_only and callable(read_originals):
+                originals = read_originals(**scope)
+            if callable(read_owner):
+                read_excluded = getattr(read_owner(**scope), "_hmb_analysis_excluded_media_for", None)
+                if callable(read_excluded):
+                    excluded = read_excluded(**scope)
+        if not isinstance(originals, list) or any(
+            not isinstance(row, dict) or row.get("kind") not in ("image", "video", "audio")
+            or not isinstance(row.get("path"), str) or not row["path"].strip()
+            or not isinstance(row.get("shot_reference"), str) or not row["shot_reference"].strip()
+            for row in originals
+        ):
+            raise ValueError("The selected Shot's analysis original references are invalid. No request was submitted.")
+        images, image_bindings = route_analysis_media("image", images, excluded.get("images", ()),
+            originals)
+        videos, video_bindings = route_analysis_media("video", videos, excluded.get("videos", ()),
+            originals)
+        image_limit, video_limit, audio_limit = MODEL_REFERENCE_LIMITS.get(
             model_id,
             MODEL_REFERENCE_LIMITS[SEEDANCE_2_0_MODEL_ID],
         )
@@ -10056,6 +10241,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             finish_look_out = finish_snapshot["finish_look_out"]
 
         resolved = dict(params)
+        resolved.pop("_hmb_sound_reference_bindings", None)
         resolved["prompt"] = str(params.get("prompt") or "")
         # Keep the Agent prompt untouched through normal validation. The exact
         # Finish Look sidecar is composed only at Broker payload construction,
@@ -10078,10 +10264,165 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         resolved["video_references"] = list(videos)
         resolved["video_reference_slots"] = []
         resolved["reference_audio"] = []
-        resolved["input_mode"] = INPUT_MODE_MULTIMODAL_REFERENCES
+        resolved.pop("_hmb_reference_analysis", None)
+        resolved.pop("_hmb_analysis_media_bindings", None)
+        resolved.pop("_hmb_analysis_video_references", None)
+        analysis_videos = analysis_video_reference_bindings(videos, originals, video_bindings)
+        if analysis_videos:
+            resolved["_hmb_analysis_video_references"] = analysis_videos
+        media_bindings = image_bindings + video_bindings
+        sound_snapshot, sound_tracks, sound_provenance = self._resolve_exact_shot_sound(subscription, params)
+        reference_tracks = [row for row in sound_tracks if row.get("purpose") in {"reference", "both"}]
+        audio, audio_bindings = route_analysis_media("audio", [row["path"] for row in reference_tracks], (), originals)
+        media_bindings.extend(audio_bindings)
+        if media_bindings:
+            resolved["_hmb_analysis_media_bindings"] = media_bindings
+        if len(audio) > audio_limit:
+            raise ValueError(f"Selected Shot contains {len(audio)} reference audio tracks; {model_name} accepts at most {audio_limit}. No request was submitted.")
+        if audio:
+            from _hmb_sound import REFERENCE_EXTENSIONS
+            if any(Path(path).suffix.casefold() not in REFERENCE_EXTENSIONS for path in audio):
+                raise ValueError("Seedance reference audio requires WAV or MP3. Choose mix-only for other local finishing formats. No request was submitted.")
+            resolved["reference_audio"] = audio
+            if sound_provenance.get("kind") == "exact_prompt_document" and model_id in BROKER_SUPPORTED_MODEL_IDS:
+                resolved["generate_audio"] = True
+        if sound_snapshot:
+            resolved["_hmb_sound_snapshot"] = sound_snapshot
+            resolved["_hmb_sound_tracks"] = sound_tracks
+            resolved["_hmb_sound_provenance"] = sound_provenance
+        else:
+            for key in ("_hmb_sound_snapshot", "_hmb_sound_tracks", "_hmb_sound_provenance"):
+                resolved.pop(key, None)
+        if (image_bindings or video_bindings or (analysis_results_only and excluded.get("audio"))) and not (
+            images or videos or audio
+        ):
+            resolved[TASK_PARAMETER] = TASK_TEXT_ONLY
+        resolved["input_mode"] = TASK_INPUT_MODES[resolved[TASK_PARAMETER]]
         if params.get("draft_action") == DRAFT_ACTION_PREVIEW:
             resolved["_hmb_draft_source_bindings"] = draft_source_bindings
         return resolved
+
+    def _resolve_exact_shot_sound(self, subscription: Mapping[str, Any], params: Mapping[str, Any]) -> tuple[dict, list, dict]:
+        """Keep exact Prompt authoring over the retained Sound originals.
+
+        Only uses its direct Sound/manual audio. In Shot mode a canonical
+        Prompt document owns effective enabled/purpose/timing controls; direct
+        Sound proves the unchanged base originals rather than replacing them.
+        """
+        if not getattr(self, "_hmb_sound_port_registered", False):
+            return {}, [], {}
+        from _hmb_sound import normalize_sound_snapshot, resolve_sound_tracks
+        source = self._exact_incoming_source(SHOT_SOUND_INPUT_PARAMETER, "SHOT_SOUND_OUT", required=False)
+        provenance = {}
+        base_snapshot = {}
+        if source is not None:
+            if self._hmb_preflight_kind(source) != "HMBSoundLibrary":
+                raise RuntimeError("Generator Sound input must use the registered HMB Sound Library.")
+            getter = getattr(source, "_hmb_sound_snapshot_for", None)
+            if not callable(getter):
+                raise RuntimeError("The Sound Library snapshot API is unavailable.")
+            base_snapshot = normalize_sound_snapshot(getter(channel_uuid=subscription["channel_uuid"], shot_uuid=subscription["shot_uuid"]))
+            provenance = {"kind": "sound_library", "node_name": str(source.name)}
+        normalized = base_snapshot
+        if subscription.get("enabled") is True:
+            managed = getattr(self, "_hmb_managed_agent_request", None)
+            agent = self._manual_agent_prompt_source()
+            if isinstance(managed, dict) and managed.get("source") is not agent:
+                raise RuntimeError("The retained Agent sound owner changed. No request was submitted.")
+            if agent is not None and self._hmb_preflight_kind(agent) == "HMBAgentLibrary":
+                getter = getattr(agent, "_hmb_sound_snapshot_for", None)
+                if callable(getter):
+                    effective = normalize_sound_snapshot(getter(channel_uuid=subscription["channel_uuid"], shot_uuid=subscription["shot_uuid"]))
+                    if isinstance(managed, dict):
+                        record = managed.get("record") or {}
+                        result = record.get("result") or {}
+                        ticket_getter = getattr(agent, "_hmb_agent_shot_result", None)
+                        trusted = ticket_getter(channel_uuid=subscription["channel_uuid"], shot_uuid=subscription["shot_uuid"],
+                            run_id=str(result.get("run_id") or ""), generator=self) if callable(ticket_getter) else None
+                        shot = trusted.get("shot") if isinstance(trusted, dict) else None
+                        if (not isinstance(shot, dict) or any(shot.get(key) != subscription[key] for key in ("channel_uuid", "shot_uuid"))
+                                or not result.get("run_id") or trusted.get("result", {}).get("run_id") != result["run_id"]):
+                            raise RuntimeError("The immutable Agent Sound result ticket is unavailable. No request was submitted.")
+                        recorded = normalize_sound_snapshot(trusted.get("audio_sources") or {})
+                        if recorded != effective:
+                            raise RuntimeError("The Prompt sound controls changed after Agent execution. Run this Shot again; no request was submitted.")
+                        effective = recorded
+                    if effective:
+                        if base_snapshot:
+                            self._validate_prompt_sound_originals(effective, base_snapshot, subscription)
+                        normalized = effective
+                        provenance = {"kind": "exact_prompt_document", "node_name": str(agent.name)}
+                        if source is not None:
+                            provenance["base_source_node"] = str(source.name)
+        tracks = resolve_sound_tracks(normalized, channel_uuid=subscription["channel_uuid"],
+            shot_uuid=subscription["shot_uuid"], project_id=str(params.get("project_id") or ""))
+        if normalized:
+            provenance.update(channel_uuid=subscription["channel_uuid"], shot_uuid=subscription["shot_uuid"],
+                project_id=normalized["project_id"], reference_semantics="model_reference_only", audio_observation="not_performed")
+        return normalized, tracks, provenance
+
+    @staticmethod
+    def _validate_prompt_sound_originals(effective: Mapping[str, Any], base: Mapping[str, Any], subscription: Mapping[str, Any]) -> None:
+        """Permit current-Shot authored controls, never replacement originals."""
+        if any(effective.get(key) != base.get(key) for key in ("project_id", "project_uid", "project_root", "channel_uuid", "revision")):
+            raise RuntimeError("Prompt and Generator Sound originals changed or belong to different projects. No request was submitted.")
+        originals = {row["instance_id"]: row for row in base.get("tracks", [])}
+        rows = effective.get("tracks", [])
+        identity_fields = ("instance_id", "source_uid", "relative_path", "path", "media_signature", "duration_seconds", "channel_uuid", "shot_uuid")
+        if len(rows) != len(originals):
+            raise RuntimeError("Prompt and Generator Sound track selections differ. No request was submitted.")
+        for row in rows:
+            original = originals.get(row["instance_id"])
+            if original is None or any(row.get(key) != original.get(key) for key in identity_fields):
+                raise RuntimeError("Prompt Sound refers to a different original source. No request was submitted.")
+            if (row.get("channel_uuid"), row.get("shot_uuid")) != (subscription["channel_uuid"], subscription["shot_uuid"]) and row != original:
+                raise RuntimeError("Prompt Sound authoring cannot change another Shot. No request was submitted.")
+
+    def _hmb_sound_finishing_snapshot(self) -> dict[str, Any]:
+        """Read the captured contract; this never launches a generation or mix."""
+        if getattr(self, "_hmb_node_deleted", False):
+            return {}
+        source = self._hmb_generated_video_source_snapshot()
+        if not source:
+            return {}
+        captured = self._hmb_completed_sound_entries().get(str(source.get("generation_id")))
+        if not isinstance(captured, dict):
+            return {}
+        if (captured.get("generation_id") != source.get("generation_id")
+                or _generated_video_origin(captured.get("origin")) != _generated_video_origin(source)):
+            return {}
+        from _hmb_sound import normalize_sound_snapshot, resolve_sound_tracks
+        snapshot = normalize_sound_snapshot(captured.get("snapshot") or {})
+        tracks = resolve_sound_tracks(snapshot, channel_uuid=source["channel_uuid"], shot_uuid=source["shot_uuid"],
+            project_id=str(captured.get("provenance", {}).get("project_id") or ""))
+        if tracks != captured.get("tracks", []):
+            raise RuntimeError("The completed video's stored Sound contract is invalid. Restore its original Sound selection.")
+        return deepcopy(captured)
+
+    def _hmb_completed_sound_entries(self) -> dict[str, Any]:
+        value = getattr(self, "parameter_values", {}).get(GENERATION_SOUND_STORE_PARAMETER)
+        if value is None:
+            value = self.get_parameter_value(GENERATION_SOUND_STORE_PARAMETER)
+        if not value:
+            return {}
+        if (not isinstance(value, dict) or value.get("schema") != _GENERATION_SOUND_STORE_SCHEMA
+                or value.get("version") != 1 or not isinstance(value.get("entries"), dict)
+                or len(value["entries"]) > _GENERATION_SOUND_STORE_LIMIT):
+            raise RuntimeError("Saved completed-video Sound metadata is invalid. Original source media was not changed.")
+        return deepcopy(value["entries"])
+
+    def _hmb_store_completed_sound(self, captured: Mapping[str, Any]) -> None:
+        """Persist only completed-job metadata; preparing/failed runs never write."""
+        entries = self._hmb_completed_sound_entries()
+        job = str(captured["generation_id"])
+        entries.pop(job, None)
+        entries[job] = deepcopy(dict(captured))
+        while len(entries) > _GENERATION_SOUND_STORE_LIMIT:
+            entries.pop(next(iter(entries)))
+        while len(entries) > 1 and len(json.dumps(entries, ensure_ascii=False).encode("utf-8")) > 8 * 1024 * 1024:
+            entries.pop(next(iter(entries)))
+        self.parameter_values[GENERATION_SOUND_STORE_PARAMETER] = {
+            "schema": _GENERATION_SOUND_STORE_SCHEMA, "version": 1, "entries": entries}
 
     def _project_incoming_connections(self, node: Any) -> list[Any]:
         """Read registered edges, including hidden/list-child inputs, without reconciliation."""
@@ -10241,8 +10582,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if not isinstance(value, str):
             raise ValueError("Select a valid Project (Only) before rendering.")
         project = resolve_project(value, default_legacy=False)
-        if project["project_id"] not in {"superwings12", "katuri8"}:
-            raise ValueError("This project is not active. Select Super Wings 12 or Katuri 8 in Project (Only).")
+        if project["project_id"] not in ONLY_ACTIVE_PROJECT_IDS:
+            raise ValueError("This project is not active. Select superwings12 or Katuri8 in Project (Only).")
         return {key: project[key] for key in ("project_id", "project_name")}
 
     def _hmb_generation_project(self) -> dict[str, str]:
@@ -10289,7 +10630,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         kind = metadata.get("node_type") if isinstance(metadata, dict) else None
         if metadata.get("library") != "HMB_GP_Production" or kind not in {
             "HMBImageAssetLibrary", "HMBVideoPickerLibrary", "HMBPromptLibrary",
-            "HMBAgentLibrary", "HMBFinishLookLibrary", "HMBSeedanceGeneration",
+            "HMBAgentLibrary", "HMBFinishLookLibrary", "HMBSoundLibrary", "HMBSeedanceGeneration",
         } or getattr(node, "_hmb_node_deleted", False):
             return ""
         from griptape_nodes.node_library.library_registry import LibraryRegistry
@@ -10355,6 +10696,35 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             params.update(first_frame=None, last_frame=None)
         return params
 
+    @staticmethod
+    def _hmb_route_preflight_analysis(
+        params: dict[str, Any], *, agent: Any, prompt: Any, expected: dict[str, Any], image_cache_ready: bool,
+    ) -> bool:
+        """Apply analysis routing to prepared references without opening any media."""
+        read_exclusions = getattr(prompt, "_hmb_analysis_preview_exclusions_for", None)
+        if not callable(read_exclusions):
+            return True  # Older Prompt implementations have no analysis cache.
+        scope = {key: expected[key] for key in ("channel_uuid", "shot_uuid")}
+        read_owner = getattr(agent, "_hmb_reference_analysis_owner", None)
+        if not callable(read_owner) or read_owner(**scope) is not prompt:
+            return False
+        excluded = read_exclusions(**scope)
+        if not isinstance(excluded, dict) or not {"images", "videos", "audio"} <= excluded.keys():
+            return False
+        from _hmb_analysis_delivery import analysis_originals, analysis_results_only, route_analysis_media
+
+        results_only = analysis_results_only(prompt, **scope, preview=True)
+        originals = [] if results_only else analysis_originals(prompt, **scope, preview=True)
+        images, image_bindings = route_analysis_media("image", params["reference_images"], excluded["images"], originals)
+        videos, video_bindings = route_analysis_media("video", params["video_references"], excluded["videos"], originals)
+        audio, _audio_bindings = route_analysis_media("audio", params["reference_audio"], (), originals)
+        params.update(reference_images=images, video_references=videos, reference_audio=audio)
+        if image_cache_ready and (image_bindings or video_bindings or (results_only and excluded["audio"])) and not (
+            images or videos or audio
+        ):
+            params[TASK_PARAMETER] = TASK_TEXT_ONLY
+        return True
+
     def _hmb_preflight_row(self, expected: dict[str, Any], *, nodes: dict[str, Any], source: Any = None,
             source_snapshot: Any = None, source_issue: str = "") -> dict[str, Any]:
         bound = bool(expected.get("shot_uuid"))
@@ -10364,6 +10734,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "media": {"images": 0, "videos": 0, "audio": 0}, "connections": {}, "issues": []}
         issue = lambda code, message, severity="error": row["issues"].append(self._hmb_preflight_issue(code, message, severity))
         params = self._hmb_preflight_parameters(bound=bound)
+        analysis_cache_unavailable = False
         sparse = bool(params["resume_generation_id"] or params["draft_action"] == DRAFT_ACTION_FINAL)
         row.update(model=MODEL_DISPLAY_NAME_BY_ID.get(params["model_id"], "알 수 없는 모델"),
             task="기존 Task 조회" if params["resume_generation_id"] else "Draft Final" if sparse else params["task"] if params["task"] in TASK_STORAGE_CHOICES else "알 수 없는 작업",
@@ -10384,7 +10755,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return node
         try:
             project = self._capture_imageasset_project_selection()["project"]
-            row["project"] = str(project["project_name"])
+            params.update(project)
+            row["project"] = project_display_name(project["project_id"], project["project_name"])
             if bound and source is not None:
                 canonical_project = resolve_project(source._hmb_project_identity(), default_legacy=False)
                 if project["project_id"] != canonical_project["project_id"]:
@@ -10439,6 +10811,19 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 finish = edge_source(SHOT_FINISH_LOOK_INPUT_PARAMETER, "SHOT_FINISH_LOOK_OUT", "HMBFinishLookLibrary")
                 if finish is not None and not self._hmb_preflight_declares(finish, "finish_look", expected):
                     raise ValueError("finish_identity")
+                sound_snapshot = {}
+                sound = edge_source(SHOT_SOUND_INPUT_PARAMETER, "SHOT_SOUND_OUT", "HMBSoundLibrary")
+                if sound is not None:
+                    from _hmb_sound import normalize_sound_snapshot
+                    sound_snapshot = normalize_sound_snapshot(sound._hmb_sound_snapshot_for(
+                        channel_uuid=expected["channel_uuid"], shot_uuid=expected["shot_uuid"]))
+                    if sound_snapshot and (sound_snapshot["channel_uuid"] != expected["channel_uuid"]
+                            or sound_snapshot["project_id"] != params.get("project_id")):
+                        raise ValueError("sound_identity")
+                    params["reference_audio"] = [item["path"] for item in sound_snapshot.get("tracks", [])
+                        if item["enabled"] and item["channel_uuid"] == expected["channel_uuid"]
+                        and item["shot_uuid"] == expected["shot_uuid"] and item["purpose"] in {"reference", "both"}]
+                    row["connections"]["Sound"] = "UUID 일치 · 모델 참고/최종 믹스 분리"
                 agent_edges = [edge for edge in edges if getattr(edge, "target_parameter_name", "") == "prompt"]
                 if len(agent_edges) > 1:
                     raise ValueError("ambiguous_prompt")
@@ -10457,6 +10842,22 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                                 or not self._hmb_preflight_declares(prompt, "prompt", expected)):
                             raise ValueError("prompt_identity")
                         row["connections"]["Prompt → Agent"] = "UUID 일치"
+                        sound_getter = getattr(prompt, "_hmb_sound_snapshot_for", None)
+                        if callable(sound_getter):
+                            from _hmb_sound import normalize_sound_snapshot
+                            effective_sound = normalize_sound_snapshot(sound_getter(
+                                channel_uuid=expected["channel_uuid"], shot_uuid=expected["shot_uuid"]))
+                            if effective_sound:
+                                if sound_snapshot:
+                                    self._validate_prompt_sound_originals(effective_sound, sound_snapshot, expected)
+                                params["reference_audio"] = [item["path"] for item in effective_sound.get("tracks", [])
+                                    if item["enabled"] and item["channel_uuid"] == expected["channel_uuid"]
+                                    and item["shot_uuid"] == expected["shot_uuid"] and item["purpose"] in {"reference", "both"}]
+                                row["connections"]["Sound"] = "Prompt 사운드 설정 · UUID 일치"
+                        analysis_cache_unavailable = not self._hmb_route_preflight_analysis(
+                            params, agent=agent, prompt=prompt, expected=expected, image_cache_ready=not source_issue)
+                        if analysis_cache_unavailable:
+                            issue("analysis_cache_unavailable", "분석 원본 선택의 준비 상태를 확인한 뒤 다시 점검하세요.", "warning")
                         # StartFlow also validates a placeholder before Agent output
                         # exists. This sentinel is private to the copied validator.
                         if not params["prompt"].strip():
@@ -10466,17 +10867,23 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         if not params["prompt"].strip():
                             params["prompt"] = "HMB connected prompt pending execution"
             except Exception:
-                issue("source_route", "Prompt·Agent·Finish·ImageAsset·Picker 중 연결선 또는 정확한 Shot UUID를 확인하세요.")
+                issue("source_route", "Prompt·Agent·Finish·Sound·ImageAsset·Picker 중 연결선 또는 정확한 Shot UUID를 확인하세요.")
         elif sparse:
             issue("sparse_existing_task", "기존 Task 조회/Final은 새 Prompt·미디어·Agent를 요구하지 않습니다.", "info")
             if params["draft_action"] == DRAFT_ACTION_FINAL:
                 issue("final_server_unverified", "Final 사용 가능 여부는 서버의 같은 Draft Task 상태 확인이 필요합니다.", "warning")
         row["media"] = {"images": len(params["reference_images"]), "videos": len(params["video_references"]), "audio": len(params["reference_audio"])}
+        if bound and not sparse:
+            row["task"] = params[TASK_PARAMETER]
+        if analysis_cache_unavailable:
+            row["media"] = {"images": None, "videos": None, "audio": None}
         if source_issue and bound and not sparse:
             row["media"]["images"] = None
         try:
             validation = dict(params)
-            if source_issue and bound and not sparse and not any(validation[key] for key in ("reference_images", "video_references", "reference_audio")):
+            if analysis_cache_unavailable:
+                validation.update(reference_images=["HMB unverified cached media placeholder"], video_references=[], reference_audio=[])
+            elif source_issue and bound and not sparse and not (validation["reference_images"] or validation["video_references"]):
                 validation["reference_images"] = ["HMB unverified cached media placeholder"]
             self._validate_parameters(validation)
             if not params["resume_generation_id"]:
@@ -12450,6 +12857,29 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             params.get("prompt"),
             params.get("_hmb_finish_look_out"),
         )
+        if params.get("_hmb_generation_mode") == "shot" and params.get("_hmb_analysis_media_bindings"):
+            submitted_prompt += ("\n\nHMB SHOT REFERENCE BINDINGS (READ-ONLY SOURCE DATA):\n"
+                + json.dumps(params["_hmb_analysis_media_bindings"], ensure_ascii=False, separators=(",", ":"))
+                + "\nUse the provider_reference for each authored shot_reference. A null provider_reference means "
+                  "that source was reserved for analysis and no corresponding media was attached. Keep authored wording intact.")
+        if params.get("_hmb_generation_mode") == "shot" and params.get("_hmb_analysis_video_references"):
+            submitted_prompt += ("\n\nHMB ANALYSIS VIDEO REFERENCES (READ-ONLY SOURCE DATA):\n"
+                + json.dumps(params["_hmb_analysis_video_references"], ensure_ascii=False, separators=(",", ":"))
+                + "\nThese attached videos supply reference evidence for the Agent's Shot direction. "
+                  "Their origin in VideoPicker or analysis does not assign approved-playblast or primary shot-control authority. "
+                  "Preserve explicitly authored source roles, targets and timing. Analysis observations are incorporated "
+                  "in the Agent's direction only when supplied; attachment alone does not imply completed analysis.")
+        bindings = params.get("_hmb_sound_reference_bindings") or []
+        if bindings:
+            audio_count = len(params.get("reference_audio") or [])
+            expected_bindings = [{"sound": f"@sound{index}", "provider_audio": f"@audio{audio_count - len(bindings) + index}"}
+                for index in range(1, len(bindings) + 1)] if isinstance(bindings, list) and len(bindings) <= audio_count else None
+            if params.get("_hmb_generation_mode") != "only" or bindings != expected_bindings:
+                raise ValueError("The Sound reference binding does not match the captured ordered audio inputs. No request was submitted.")
+            submitted_prompt += ("\n\nHMB SOUND REFERENCE BINDINGS (READ-ONLY SOURCE DATA):\n"
+                + json.dumps(bindings, ensure_ascii=False, separators=(",", ":"))
+                + "\nSound Library @soundN labels in the authored direction use the provider @audioN inputs mapped above. "
+                  "Preserve existing manually authored @audioN references and all original wording.")
         # Seedance 2.5 uses the provider's canonical resolution enum.  Keeping
         # the legacy 720-pixel dimensions here produced contradictory requests
         # such as ``quality=1080p`` beside ``resolution=1280x720``.  Aspect
@@ -13685,7 +14115,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 if published_macro_index is not None:
                     variables["_index"] = published_macro_index
             try:
-                _write_generation_sidecar(published, metadata)
+                _write_generation_sidecar(
+                    published, metadata,
+                    workflow=getattr(getattr(destination, "_file", None), "workflow", None),
+                )
             except Exception as exc:
                 logger.warning(
                     "Generated video was saved, but its metadata sidecar could not "
@@ -14687,6 +15120,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             params["_hmb_shot_hierarchy"] = deepcopy(recovery_before_run.get("shot_hierarchy", {}))
         self._validate_parameters(params)
         resume_generation_id = params["resume_generation_id"]
+        self._hmb_pending_sound = {"snapshot": deepcopy(params.get("_hmb_sound_snapshot") or {}),
+            "tracks": deepcopy(params.get("_hmb_sound_tracks") or []),
+            "provenance": deepcopy(params.get("_hmb_sound_provenance") or {}),
+            "origin": deepcopy(params.get("_hmb_generation_origin") or {})}
         decode_verifier: _MP4DecodeVerifier | None = None
 
         advanced_seedance_v2 = bool(
@@ -15809,7 +16246,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "generate_audio", "watermark", "output_format", "return_last_frame",
                 "draft_action", "draft_job_id", "resume_generation_id", "first_frame", "last_frame",
                 "reference_images", "video_references", "video_reference_slots", "reference_audio",
-                "_hmb_finish_look_out", "_hmb_draft_source_bindings")
+                "_hmb_finish_look_out", "_hmb_draft_source_bindings", "_hmb_sound_snapshot", "_hmb_sound_tracks",
+                "_hmb_sound_provenance", "_hmb_sound_reference_bindings",
+                "_hmb_analysis_media_bindings", "_hmb_analysis_video_references")
         return self._canonical_sha256({key: params.get(key) for key in keys})
 
     async def _prepare_managed_agent_shot(self) -> None:
@@ -16478,6 +16917,8 @@ __all__ = [
     "LEGACY_VIDEO_REFERENCE_SLOTS",
     "VIDEO_REFERENCES_PARAMETER",
     "SHOT_FINISH_LOOK_INPUT_PARAMETER",
+    "SHOT_SOUND_INPUT_PARAMETER",
+    "GENERATION_SOUND_STORE_PARAMETER",
     "FINISH_LOOK_SHOT_SNAPSHOT_SCHEMA",
     "FINISH_LOOK_SHOT_SNAPSHOT_VERSION",
     "GENERATION_PREVIEW_SCHEMA",

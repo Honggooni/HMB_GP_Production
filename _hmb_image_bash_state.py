@@ -304,6 +304,9 @@ def scene_fingerprint(project: dict, records: list, canvas: dict) -> str:
         raise ImageBashStateError("Image Bash meta must be an object")
     meta.pop("viewport", None)
     meta.pop("hmb_image_bash", None)
+    # The editor's projected canvas duplicates the authoritative node canvas
+    # below. Adding it on a legacy reopen must not invalidate its receipt.
+    meta.pop("hmb_canvas", None)
     # ImageAsset's optional resolver/cache signature can change when a native
     # Run refreshes imports, without changing any source byte. Source freshness
     # is proved separately by the receipt's actual byte/RGBA hashes.

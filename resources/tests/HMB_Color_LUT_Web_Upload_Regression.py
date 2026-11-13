@@ -215,7 +215,9 @@ class ColorLUTUploadRegression(unittest.TestCase):
     def test_server_readiness_recovers_in_one_background_worker_without_rehashing(self):
         ready = self.bridge.review_capabilities
         self.bridge.review_capabilities = lambda: {}
-        def online(_delay):
+        def online(delay):
+            if delay == 30:
+                return True
             self.bridge.review_capabilities = ready
             return False
         original = target._verified_export_hash
@@ -225,9 +227,34 @@ class ColorLUTUploadRegression(unittest.TestCase):
             self.node._schedule_upload_probe()
             self.assertEqual(len(ControlledThread.pending), 1)
             self.fixture.drain()
-            self.assertEqual(wait.call_count, 1)
+            self.assertEqual([entry.args[0] for entry in wait.call_args_list], [5, 30])
             self.assertEqual(hashed.call_count, 1)
             self.assertTrue(self.node._upload_projection()["enabled"])
+
+    def test_ready_upload_button_disables_on_shutdown_and_recovers_without_post(self):
+        ready = self.bridge.review_capabilities
+        def disconnected():
+            raise ConnectionRefusedError("synthetic stopped Broker")
+        calls = []
+        def toggle(delay):
+            calls.append(delay)
+            if len(calls) == 1:
+                self.assertTrue(self.node._upload_projection()["enabled"])
+                self.bridge.review_capabilities = disconnected
+            elif len(calls) == 2:
+                self.assertEqual(self.node._upload_projection()["phase"], "offline")
+                self.assertFalse(self.node._upload_projection()["enabled"])
+                self.bridge.review_capabilities = ready
+            else:
+                self.assertTrue(self.node._upload_projection()["enabled"])
+                return True
+            return False
+        with mock.patch.object(self.node, "_upload_retry_wait", side_effect=toggle), \
+             mock.patch.object(self.node, "_upload_request") as request:
+            self.node._schedule_upload_probe()
+            self.fixture.drain()
+            request.assert_not_called()
+        self.assertEqual(calls, [30, 5, 30])
 
     def test_duplicate_click_and_completed_reopen_never_submit_twice(self):
         self.ready()

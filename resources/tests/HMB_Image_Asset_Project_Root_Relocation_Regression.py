@@ -58,6 +58,12 @@ assert module._normalize_state(moved) == moved
 assert raw == original
 already_moved = json.loads(json.dumps(raw).replace(old + "/superwings12", show).replace(old, new))
 assert module._normalize_state(already_moved) == moved
+for label in ("Dinoster4", "Katuri7", "Katuri8", "KaturiSP", "superwings10", "superwings11", "superwings12"):
+    raw_id = label.upper()
+    row = module._normalize_project_catalog([{"project_id": raw_id, "name": "이전 이름",
+        "path": f"P:/projects/{raw_id}/Ai_Ct_image", "project_uid": "unchanged"}])[0]
+    assert row == {"project_id": raw_id, "name": label,
+                   "path": f"P:/projects/{raw_id}/Ai_Ct_image", "project_uid": "unchanged"}
 
 # A saved CGT v2 forest owns independent native slots. Replacing only its
 # retired address must not detach that forest, reissue IDs, or edit authority.

@@ -16,9 +16,14 @@ const value = { shot_catalog: catalog, shot: { channel_uuid: "channel-one", shot
 assert.equal(hmbColorLUTState(value).web_upload.enabled, true);
 assert.equal(hmbColorLUTState({ ...value, shot: {} }).web_upload.enabled, false, "Only cannot enable a web upload");
 const manual = { ...value, shot: {}, project_id: "superwings12", manual_project: { id: "superwings12", name: "슈퍼윙즈12" },
-  upload_projects: [{ id: "superwings12", name: "슈퍼윙즈12" }, { id: "katuri8", name: "까투리8" }],
+  manual_project_display_name: "superwings12",
+  upload_projects: [{ id: "superwings12", name: "슈퍼윙즈12", display_name: "superwings12" },
+    { id: "katuri8", name: "까투리8", display_name: "Katuri8" }],
   source: { path: "C:/synthetic/11-12.mp4", name: "11-12.mp4" }, result: {} };
 assert.equal(hmbColorLUTState(manual).web_upload.enabled, true, "Only with explicit server project can upload original before final export");
+assert.match(hmbRenderColorLUTWidget(manual), /<option value="katuri8">Katuri8<\/option>/);
+assert.match(hmbRenderColorLUTWidget({ ...value, project: { name: "까투리8" }, project_id: "bound-uid",
+  project_display_name: "Katuri8" }), /<option value="bound-uid">Katuri8<\/option>/);
 const mybox = { ...manual, project_id: "my-box", manual_project: { id: "my-box", name: "My Box" },
   upload_projects: [...manual.upload_projects, { id: "my-box", name: "My Box" }] };
 assert.equal(hmbColorLUTState(mybox).web_upload.enabled, true);
@@ -74,6 +79,11 @@ try {
   assert.equal(await button.isEnabled(), true);
   const outputButton = page.locator('[data-action="export"]');
   assert.equal(await outputButton.textContent(), "최종출력 & 웹 업로드");
+  await page.evaluate(() => { window.state={...window.state,revision:111,web_upload:{enabled:false,phase:'offline',reason:'브로커가 응답하지 않습니다.'}}; window.controller.update(window.props()); });
+  assert.equal(await button.isDisabled(), true);
+  assert.equal(await outputButton.isDisabled(), true);
+  assert.equal(await page.locator('[data-export-local]').isEnabled(), true);
+  await page.evaluate((manual) => { window.state={...manual,revision:112}; window.controller.update(window.props()); }, manual);
   await outputButton.click();
   assert.equal(await page.evaluate(() => window.commands.at(-1).action), "export_upload");
   for (const [index, language] of ['ko','en'].entries()) {

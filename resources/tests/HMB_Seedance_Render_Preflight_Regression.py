@@ -98,6 +98,82 @@ class PreflightTests(unittest.TestCase):
         self.source._hmb_shot_routing_snapshot.side_effect=ValueError("cache preparing")
         report=self.gens[0]._hmb_render_preflight_report();self.assertTrue(report["ok"],report)
         self.assertEqual(report["rows"][0]["status"],"warning")
+
+    def _connect_analysis_cache(self, excluded):
+        prompt = SimpleNamespace(name="Exact Prompt", metadata={"node_type": "HMBPromptLibrary"},
+            _hmb_shot_channel_subscription=lambda: subscription(kind="prompt"),
+            _hmb_analysis_preview_exclusions_for=Mock(return_value=excluded),
+            _hmb_prompt_shot_document=Mock(side_effect=AssertionError("full Prompt document")),
+            _hmb_analysis_excluded_media_for=Mock(side_effect=AssertionError("uncached exclusions")))
+        agent = SimpleNamespace(name="Exact Agent", metadata={"node_type": "HMBAgentLibrary"},
+            _hmb_shot_channel_subscription=lambda: subscription(kind="agent"),
+            _hmb_reference_analysis_owner=Mock(return_value=prompt),
+            _hmb_reference_analysis_originals_for=Mock(side_effect=AssertionError("uncached originals")))
+        self.nodes.extend([prompt, agent])
+        self.edges[agent.name] = [SimpleNamespace(source_node_name=prompt.name,
+            source_parameter_name="PROMPT_OUT", target_parameter_name="SHOT_PROMPT_IN")]
+        self.edges[self.gens[0].name].append(SimpleNamespace(source_node_name=agent.name,
+            source_parameter_name="output", target_parameter_name="prompt"))
+        return prompt, agent
+
+    def test_analysis_media_counts_follow_latest_exact_shot_policy_without_loading_originals(self):
+        import _hmb_analysis_delivery as delivery
+
+        self.source.snapshot = media_snapshot(count=2)
+        image = self.source.snapshot["media_by_source_uid"]["1-0"]
+        audio = "https://media.invalid/analysis.wav"
+        prompt, agent = self._connect_analysis_cache({"images": [image], "videos": [], "audio": [audio]})
+        originals = [{"kind": "image", "path": image, "shot_reference": "@image1"},
+            {"kind": "audio", "path": audio, "shot_reference": "@analysis_original_audio_2"}]
+        scope = {"channel_uuid": CHANNEL, "shot_uuid": SHOTS[0]["shot_uuid"]}
+        with patch.object(delivery, "analysis_results_only", return_value=False) as policy, \
+             patch.object(delivery, "analysis_originals", return_value=originals) as cached:
+            included = self.gens[3]._hmb_render_preflight_report()
+            self.assertEqual(included["rows"][0]["media"], {"images": 2, "videos": 0, "audio": 1})
+            policy.assert_called_once_with(prompt, **scope, preview=True)
+            cached.assert_called_once_with(prompt, **scope, preview=True)
+            policy.return_value = True
+            omitted = self.gens[3]._hmb_render_preflight_report()
+            self.assertEqual(omitted["rows"][0]["media"], {"images": 1, "videos": 0, "audio": 0})
+            self.assertEqual(omitted["rows"][1]["media"], included["rows"][1]["media"])
+            self.assertEqual(cached.call_count, 1)
+            prompt._hmb_analysis_preview_exclusions_for.return_value = {}
+            pending = self.gens[3]._hmb_render_preflight_report()["rows"][0]
+            self.assertEqual(pending["media"], {"images": None, "videos": None, "audio": None})
+            self.assertIn("analysis_cache_unavailable", [item["code"] for item in pending["issues"]])
+        self.assertNotIn("https://media", json.dumps(omitted))
+        agent._hmb_reference_analysis_originals_for.assert_not_called()
+        prompt._hmb_prompt_shot_document.assert_not_called()
+        prompt._hmb_analysis_excluded_media_for.assert_not_called()
+
+    def test_analysis_audio_results_only_matches_text_only_validation_when_no_media_remains(self):
+        import _hmb_analysis_delivery as delivery
+
+        self.source.snapshot = media_snapshot(count=0)
+        prompt, _agent = self._connect_analysis_cache({"images": [], "videos": [], "audio": ["C:/analysis.wav"]})
+        with patch.object(delivery, "analysis_results_only", return_value=True) as policy, \
+             patch.object(delivery, "analysis_originals", side_effect=AssertionError("checked originals")) as originals:
+            text_only = self.gens[0]._hmb_render_preflight_report()["rows"][0]
+            self.assertEqual(text_only["task"], t.TASK_TEXT_ONLY)
+            self.assertEqual(text_only["media"], {"images": 0, "videos": 0, "audio": 0})
+            self.assertNotIn("settings_invalid", [item["code"] for item in text_only["issues"]])
+            prompt._hmb_analysis_preview_exclusions_for.return_value["audio"] = []
+            ordinary = self.gens[0]._hmb_render_preflight_report()["rows"][0]
+            self.assertEqual(ordinary["task"], t.TASK_REFERENCE_TO_VIDEO)
+            self.assertIn("settings_invalid", [item["code"] for item in ordinary["issues"]])
+            prompt._hmb_analysis_preview_exclusions_for.return_value["audio"] = ["C:/analysis.wav"]
+            self.source._hmb_shot_routing_snapshot.side_effect = ValueError("cache preparing")
+            pending = self.gens[0]._hmb_render_preflight_report()["rows"][0]
+            self.assertEqual(pending["task"], t.TASK_REFERENCE_TO_VIDEO)
+            self.assertIsNone(pending["media"]["images"])
+            self.assertEqual(pending["status"], "warning")
+            policy.return_value = False
+            originals.side_effect = None
+            originals.return_value = [{"kind": "audio", "path": "C:/analysis.wav", "shot_reference": "@analysis_original"}]
+            pending_with_audio = self.gens[0]._hmb_render_preflight_report()["rows"][0]
+            self.assertEqual(pending_with_audio["media"], {"images": None, "videos": 0, "audio": 1})
+            self.assertEqual(pending_with_audio["status"], "warning")
+
     def test_cross_flow_physical_source_and_project_mix_fail_locally(self):
         self.edges[self.gens[0].name][0].source_node_name="foreign unregistered Image"
         self.gens[1]._capture_imageasset_project_selection=lambda:{"project":{"project_id":"superwings12","project_name":"슈퍼윙즈12"}}
@@ -165,7 +241,10 @@ class PreflightTests(unittest.TestCase):
                         explicit_before=deepcopy(node.parameter_values)
                         valid_report=node._hmb_render_preflight_report()
                         self.assertTrue(valid_report["ok"],valid_report)
-                        self.assertEqual(valid_report["rows"][0]["project"],project_name)
+                        # Historical saved labels remain intact; the visible
+                        # readiness report uses the exact CGT project name.
+                        from _hmb_project import project_display_name
+                        self.assertEqual(valid_report["rows"][0]["project"],project_display_name(project_id,project_name))
                         self.assertEqual(node.parameter_values,explicit_before)
                     node.select(fixture.ONLY_PROJECT_UNSELECTED)
                 self.assertEqual(node.parameter_values,before)

@@ -220,6 +220,27 @@ async def legacy_metadata_context(engine, stale_case=None):
     check("metadata lease is registration-owned and released on unload", getattr(registration,"_hmb_legacy_metadata_lease",None) is None)
     LibraryRegistry.unregister_library(schema.name,event_manager=engine.event_manager)
 
+
+async def runtime_metadata_context(engine):
+    """Modern SDK owns workflow identity; no legacy context-stack alias exists."""
+    from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
+    from griptape_nodes.retained_mode.events.workflow_events import GetWorkflowMetadataRequest, SaveWorkflowRequest
+    engine.event_manager.initialize_queue()
+    created = engine.handle_request(EnsureWorkflowAndFlowRequest(flow_name="MetadataRuntimeFixture"))
+    check("modern native workflow opens through public API", created.succeeded())
+    workflow = engine.current_workflow()
+    flow = engine.flow_manager.get_flow_by_name(created.flow_name)
+    name = engine.context_manager.get_current_workflow_name()
+    result = engine.handle_request(GetWorkflowMetadataRequest(workflow_name=name))
+    check("modern SDK resolves its exact native workflow metadata", result.succeeded())
+    check("metadata read preserves runtime and flow identity", engine.current_workflow() is workflow
+        and engine.flow_manager.get_flow_by_name(flow.name) is flow)
+    saved = await engine.ahandle_request(SaveWorkflowRequest(
+        file_name=str(Path(private.name) / "native-metadata.py"), display_name="Native metadata identity", broadcast_result=False))
+    check("modern native metadata allows a real save", saved.succeeded() and Path(saved.file_path).is_file())
+    check("native save retains the exact runtime and flow", engine.current_workflow() is workflow
+        and engine.flow_manager.get_flow_by_name(flow.name) is flow)
+
 try:
     host = target._host()
     check("exact SDK method recognized", host is not None and target._known_descriptor(original, *host))
@@ -329,11 +350,14 @@ try:
     check("foreign static function fails source recognition", not target._known_descriptor(foreign, *host))
     from griptape_nodes.retained_mode.engine import engine_scope
     with engine_scope() as engine:
-        asyncio.run(legacy_metadata_context(engine))
-    for stale_case in ("foreign", "deleted", "path_backed", "unload"):
-        with engine_scope() as engine:
-            asyncio.run(legacy_metadata_context(engine, stale_case))
+        modern_runtime = callable(getattr(engine, 'current_workflow_or_none', None))
+        asyncio.run(runtime_metadata_context(engine) if modern_runtime else legacy_metadata_context(engine))
+    if not modern_runtime:
+        for stale_case in ("foreign", "deleted", "path_backed", "unload"):
+            with engine_scope() as engine:
+                asyncio.run(legacy_metadata_context(engine, stale_case))
     print(json.dumps({"passed": True, "checks": checks, "count": len(checks),
+        "metadata_scope": "native_workflow_runtime" if modern_runtime else "legacy_context_stack_alias",
         "scope": "real SDK static serializer and library guard lifecycle; no live editor or render"}, ensure_ascii=False))
 finally:
     NodeManager._handle_value_hashing = original

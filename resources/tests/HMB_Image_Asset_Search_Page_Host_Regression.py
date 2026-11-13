@@ -33,11 +33,12 @@ async def wait_until(predicate):
 async def main():
     GriptapeNodes.EventManager().initialize_queue()
     flow = ControlFlow(name="ImageSearchPageOfflineFlow", engine=current_engine())
-    GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
+
+    from _hmb_fixture_sdk import ensure_fixture_flow
+    flow = ensure_fixture_flow(GriptapeNodes, flow.name)
     source = image.HMBImageAssetLibrary(name="ImageSearchPageOfflineSource")
-    flow.add_node(source)
-    GriptapeNodes.ObjectManager().add_object_by_name(source.name, source)
-    GriptapeNodes.NodeManager()._name_to_parent_flow_name[source.name] = flow.name
+    from _hmb_fixture_sdk import register_fixture_node
+    register_fixture_node(GriptapeNodes, flow, source)
     source._hmb_initial_catalog_scan_pending = False
     source._hmb_hydration_adopted = True
     state = source._current_state()
@@ -68,7 +69,7 @@ async def main():
             runtime_instance_id=source._thumbnail_runtime_id(state),request_id=f"native-{number}",session_id="native-page-client",
             sequence=number,project_uid=state["project_uid"],project_cache_uid=state["project_cache_uid"],
             manifest_signature=state["manifest_signature"],folder_signature=state["folder_signature"],
-            scan_revision=state["scan_revision"],query=query,folder="",source_view="project",offset=0,limit=80)
+            scan_revision=state["scan_revision"],widget_runtime_lease=source._hmb_widget_runtime_lease,query=query,folder="",source_view="project",offset=0,limit=80)
     async def dispatch(number, query="Character"):
         result = await GriptapeNodes.ahandle_request(SetParameterValueRequest(
             node_name=source.name,parameter_name=image.THUMBNAIL_PATCH_PARAMETER,value=request(number,query),data_type="dict"))

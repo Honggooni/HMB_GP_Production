@@ -123,10 +123,9 @@ def main() -> int:
         if "engine" in inspect.signature(ControlFlow).parameters:
             flow_options["engine"] = GriptapeNodes.EventManager().engine
         flow = ControlFlow(**flow_options)
-        flow.add_node(node)
-        GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
-        GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
-        GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = flow.name
+        from _hmb_fixture_sdk import ensure_fixture_flow, register_fixture_node
+        flow = ensure_fixture_flow(GriptapeNodes, flow.name)
+        register_fixture_node(GriptapeNodes, flow, node)
     original_write_state = node._write_state
 
     def traced_write_state(state: Dict[str, Any]) -> None:

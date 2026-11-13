@@ -685,6 +685,7 @@ assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow>=12.3.0,<14" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
 assert registered_widgets == {
+    "HMBAnalysisAgentWidget",
     "HMBImageBashWidget",
     "HMBAgentLibraryWidget",
     "HMBColorLUTLibraryWidget",
@@ -694,6 +695,7 @@ assert registered_widgets == {
     "HMBImageGenerationWidget",
     "HMBPromptLibraryScopedBindingWidget",
     "HMBSeedanceGenerationWidget",
+    "HMBSoundLibraryWidget",
     "HMBVideoPickerCommandBridgeWidget",
     "HMBVideoPickerLibraryWidget",
 }
@@ -726,22 +728,23 @@ assert next(
 picker_manifest = next(item for item in manifest["nodes"] if item["class_name"] == "HMBVideoPickerLibrary")
 prompt_manifest = next(item for item in manifest["nodes"] if item["class_name"] == "HMBPromptLibrary")
 assert picker_manifest["metadata"]["width"] == 1400
-assert prompt_manifest["metadata"]["width"] == 1800
+assert prompt_manifest["metadata"]["width"] == 1490
 assert picker_manifest["metadata"]["height"] == 360
-assert prompt_manifest["metadata"]["height"] == 1350
+# New Prompt geometry follows the approved compact one-Shot layout.
+assert prompt_manifest["metadata"]["height"] == 1480
 for prompt_height_key in (
     "height", "default_height", "initial_height",
 ):
-    assert prompt_manifest["metadata"][prompt_height_key] == 1350
-assert prompt_manifest["metadata"]["min_height"] == 1193
+    assert prompt_manifest["metadata"][prompt_height_key] == 1480
+assert prompt_manifest["metadata"]["min_height"] == 1269
 for prompt_height_key in (
     "height", "default_height", "preferred_height", "initial_height",
 ):
-    assert prompt_manifest["metadata"]["ui_options"][prompt_height_key] == 1350
-assert prompt_manifest["metadata"]["ui_options"]["min_height"] == 1193
+    assert prompt_manifest["metadata"]["ui_options"][prompt_height_key] == 1480
+assert prompt_manifest["metadata"]["ui_options"]["min_height"] == 1269
 assert prompt.PROMPT_NATIVE_ASSET_INPUT_ROW_HEIGHT == 0
-assert prompt.PROMPT_START_HEIGHT == 1350
-assert prompt.PROMPT_MIN_HEIGHT == 1193
+assert prompt.PROMPT_START_HEIGHT == 1480
+assert prompt.PROMPT_MIN_HEIGHT == 1269
 finish_manifest = next(item for item in manifest["nodes"] if item["class_name"] == "HMBFinishLookLibrary")
 for finish_options in (finish_manifest["metadata"], finish_manifest["metadata"]["ui_options"]):
     for height_key in ("height", "default_height", "preferred_height", "initial_height"):
@@ -759,9 +762,7 @@ for native_size_key in (
 ):
     assert native_size_key not in agent_manifest["metadata"]
 
-# The active runtime is the server-hosted signed policy. This internal
-# regression injects the private signed artifact without creating a local
-# runtime fallback or copying it into the public package.
+# Validate the bundled signed policy through the existing verification path.
 policy_payload = common._load_agent_rule_payload()
 assert str(policy_payload["final_policy_version"]).strip()
 assert re.fullmatch(
@@ -2154,12 +2155,9 @@ for binding in duplicate_actor_state["slot_assignments"][0]["bindings"]:
 assert len(node._selected_slot_job_bindings(duplicate_actor_state, 1)) == 2
 duplicate_root_state = copy.deepcopy(shared_background_state)
 duplicate_root_state["slot_assignments"][0]["bindings"][1]["full_dag_path"] = "|BackgroundA"
-try:
-    node._selected_slot_job_bindings(duplicate_root_state, 1)
-except RuntimeError as exc:
-    assert "Duplicate Maya group" in str(exc)
-else:
-    raise AssertionError("Repeated background colors must not permit duplicate Maya roots.")
+deduplicated_roots = node._selected_slot_job_bindings(duplicate_root_state, 1)
+assert len(deduplicated_roots) == 1, "One exact DAG path must never render twice."
+assert deduplicated_roots[0]["maya_uuid"] == "bg-a", "Keep the live first binding, not a stale duplicate."
 ffmpeg_command = picker._build_ffmpeg_encode_command(
     Path("ffmpeg"),
     Path("frames/shot.%06d.png"),

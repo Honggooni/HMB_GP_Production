@@ -7,7 +7,7 @@ import socket
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).parent))
@@ -76,6 +76,89 @@ class SavedPreview(unittest.TestCase):
         node._hmb_capture_saved_parameter_value(module._AGENT_SHOT_PROMPT_INPUT_PARAMETER, "Saved", is_output=True)
         node._hmb_capture_saved_parameter_value(module._AGENT_SHOT_PROMPT_INPUT_PARAMETER, None)
         self.assertFalse(getattr(node, "_hmb_prompt_preview_hydration_pending", False))
+
+    def test_analysis_delivery_refresh_only_updates_exact_owned_prompt_element(self):
+        node, source, body, _, writes, publications, setter = surface()
+        scope = {"channel_uuid": "channel", "shot_uuid": "shot-1"}
+        visible = "Authored Shot Prompt\n"
+        source._hmb_analysis_preview_view = Mock(return_value={"visible_prompt": visible, "subscription": scope})
+        node._hmb_shot_channel_subscription = lambda: {**scope, "enabled": True}
+        setattr(node, module._VERIFIED_PROMPT_SOURCE_ATTRIBUTE, source)
+        node._hmb_prompt_preview_active = True
+        node._hmb_prompt_preview_value = visible
+        node.parameter_values["prompt"] = visible.strip()
+        node._hmb_prompt_before_preview = "Native Only text"
+        node._emit_parameter_lifecycle_event = Mock()
+        node._hmb_hydrate_shot_prompt_from_source = Mock()
+        node._refresh_routed_prompt_preview = Mock()
+        children = list(node.root_ui_element.children)
+        slots = deepcopy(node._hmb_shot_slots)
+        outputs = deepcopy(node.parameter_output_values)
+        inputs = deepcopy(node.parameter_values)
+        originals = [{"kind": "image", "name": "Reference.png", "shot_reference": "@image1"}]
+        def converted_set(agent, name, value, **kwargs):
+            setter(agent, name, value.strip(), **kwargs)
+        with patch.object(module._BaseAgent, "set_parameter_value", converted_set), \
+                patch.object(module._BaseAgent, "_convert_value", side_effect=lambda parameter, value: value.strip(), create=True), \
+                patch("_hmb_analysis_delivery.analysis_originals", return_value=originals) as policy:
+            self.assertFalse(node._hmb_refresh_analysis_source_preview(object(), **scope))
+            self.assertFalse(node._hmb_refresh_analysis_source_preview(source, **{**scope, "shot_uuid": "shot-2"}))
+            source._hmb_analysis_preview_view.assert_not_called()
+            self.assertTrue(node._hmb_refresh_analysis_source_preview(source, **scope))
+            self.assertIn("@image1 = Reference.png / Analysis source", node.parameter_values["prompt"])
+            self.assertFalse(node._hmb_refresh_analysis_source_preview(source, **scope))
+            policy.assert_called_with(source, **scope, preview=True)
+            policy.return_value = []
+            self.assertTrue(node._hmb_refresh_analysis_source_preview(source, **scope))
+            self.assertEqual(node.parameter_values, inputs)
+            node.parameter_values["prompt"] = "Unapplied native draft"
+            policy.return_value = originals
+            self.assertFalse(node._hmb_refresh_analysis_source_preview(source, **scope))
+            self.assertEqual(node.parameter_values["prompt"], "Unapplied native draft")
+            node.parameter_values["prompt"] = visible.strip()
+            source._hmb_analysis_preview_view.return_value = {}
+            self.assertFalse(node._hmb_refresh_analysis_source_preview(source, **scope))
+        self.assertEqual(writes, ["prompt", "prompt"])
+        self.assertEqual(publications, [])
+        self.assertEqual(node._emit_parameter_lifecycle_event.call_count, 2)
+        for call in node._emit_parameter_lifecycle_event.call_args_list:
+            self.assertIs(call.args[0], body[0])
+        self.assertEqual(node._hmb_prompt_before_preview, "Native Only text")
+        self.assertEqual(node.root_ui_element.children, children)
+        self.assertEqual(node._hmb_shot_slots, slots)
+        self.assertEqual(node.parameter_output_values, outputs)
+        node.reorder_elements.assert_not_called()
+        node._hmb_capture_active_slot.assert_not_called()
+        node._hmb_persist_shot_store.assert_not_called()
+        node._hmb_hydrate_shot_prompt_from_source.assert_not_called()
+        node._refresh_routed_prompt_preview.assert_not_called()
+
+    def test_analysis_delivery_notifies_only_physical_prompt_consumers(self):
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from HMBPromptLibrary import HMBPromptLibrary
+
+        prompt = object.__new__(HMBPromptLibrary)
+        output = SimpleNamespace(name="PROMPT_OUT")
+        prompt.get_parameter_by_name = {"PROMPT_OUT": output}.get
+        prompt._hmb_notify_prompt_view_consumers = Mock()
+        agent = SimpleNamespace(_hmb_refresh_analysis_source_preview=Mock(),
+                                _hmb_hydrate_shot_prompt_from_source=Mock())
+        foreign = SimpleNamespace(_hmb_refresh_analysis_source_preview=Mock())
+        def edge(target, *, source=prompt, parameter=output, port="SHOT_PROMPT_IN"):
+            return SimpleNamespace(source_node=source, source_parameter=parameter,
+                                   target_node=target, target_parameter=SimpleNamespace(name=port))
+        edges = [edge(foreign, source=object()), edge(foreign, parameter=object()),
+                 edge(foreign, port="UNRELATED_IN"), edge(agent), edge(agent)]
+        lookup = Mock(return_value=edges)
+        flow = SimpleNamespace(get_connections=lambda: SimpleNamespace(get_outgoing_connections_from_parameter=lookup))
+        scope = {"channel_uuid": "channel", "shot_uuid": "shot-1"}
+        with patch.object(GriptapeNodes, "FlowManager", return_value=flow, create=True):
+            prompt._hmb_notify_analysis_delivery_changed(**scope)
+        lookup.assert_called_once_with(prompt, output)
+        agent._hmb_refresh_analysis_source_preview.assert_called_once_with(prompt, **scope)
+        foreign._hmb_refresh_analysis_source_preview.assert_not_called()
+        agent._hmb_hydrate_shot_prompt_from_source.assert_not_called()
+        prompt._hmb_notify_prompt_view_consumers.assert_not_called()
 
     def test_empty_saved_hidden_default_preserves_native_only_and_five_shot_slots(self):
         for number in (None, 1, 2, 3, 4, 5):

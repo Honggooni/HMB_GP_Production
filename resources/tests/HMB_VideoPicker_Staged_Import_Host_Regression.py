@@ -28,7 +28,7 @@ def main():
             try:
                 from griptape_nodes.retained_mode.engine import current_engine
                 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-                from griptape_nodes.exe_types.flow import ControlFlow
+                from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
                 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
             except ImportError:
                 if os.environ.get("HMB_PICKER_REQUIRE_HOST") == "1":
@@ -44,12 +44,14 @@ def main():
                 async def scenario():
                     manager = GriptapeNodes.EventManager()
                     manager.initialize_queue()
-                    flow = ControlFlow(name="IsolatedStagedImport", engine=engine)
-                    GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
+                    ensured = engine.handle_request(EnsureWorkflowAndFlowRequest(flow_name="IsolatedStagedImport"))
+                    assert ensured.succeeded(), ensured.result_details
+                    workflow = engine.open_workflows.get(ensured.workflow_id)
+                    flow = engine.flow_manager.get_flow_by_name_in(workflow, ensured.flow_name)
                     node = picker.HMBVideoPickerLibrary(name="StagedImport")
                     flow.add_node(node)
-                    GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
-                    GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = flow.name
+                    engine.object_manager.add_object_by_name_in(workflow, node.name, node)
+                    workflow.nodes.name_to_parent_flow_name[node.name] = flow.name
                     node._schedule_video_removal_output_sync = lambda: None
                     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
                     worker_errors = []

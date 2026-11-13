@@ -9,7 +9,7 @@ const assetPath = new URL("../../widgets/HMBImageAssetLibraryWidget.js", import.
 const seedancePath = new URL("../../widgets/HMBSeedanceGenerationWidget.js", import.meta.url);
 const videoSource = fs.readFileSync(videoPath, "utf8");
 const commandSource = fs.readFileSync(commandPath, "utf8");
-const promptSource = fs.readFileSync(promptPath, "utf8");
+const promptSource = fs.readFileSync(promptPath, "utf8").replace(/\r\n?/g, "\n");
 const agentSource = fs.readFileSync(agentPath, "utf8");
 const assetSource = fs.readFileSync(assetPath, "utf8");
 const seedanceSource = fs.readFileSync(seedancePath, "utf8");
@@ -152,8 +152,8 @@ for (const [name, source] of [
 assert.match(promptSource, /class="title-mark" aria-hidden="true">PL<\/span>/, "Prompt must use the rounded PL monogram.");
 assert.match(
   promptSource,
-  /imageSources: 514,[\s\S]*?const HMB_START_LAYOUT_CHROME_HEIGHT = 129;[\s\S]*?const HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT = 0;[\s\S]*?HMB_START_LAYOUT_CHROME_HEIGHT \+[\s\S]*?HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT;/,
-  "Prompt must retain editor group heights and resize minimums within the approved 1350px startup size.",
+  /imageSources: 490,[\s\S]*?imageText: 210,[\s\S]*?videoSources: 150,[\s\S]*?soundSources: 150,[\s\S]*?videoText: 190,[\s\S]*?const HMB_START_LAYOUT_CHROME_HEIGHT = 129;[\s\S]*?const HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT = 0;[\s\S]*?HMB_START_LAYOUT_CHROME_HEIGHT \+[\s\S]*?HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT;/,
+  "Prompt must retain the approved 1490×1480px startup group's heights, including Sound, without native input-row overhead.",
 );
 assert.match(promptSource, /\.topbar\{height:58px;flex:0 0 58px;padding:8px 13px/);
 assert.match(promptSource, /\.title-mark\{flex:0 0 35px;width:35px;height:35px/);
@@ -164,7 +164,7 @@ assert.doesNotMatch(
 );
 assert.match(
   promptSource,
-  /const HMB_HEADER_LAYOUT_VERSION = 2;[\s\S]*?legacyDefaultLayout[\s\S]*?HMB_LEGACY_IMAGE_SOURCES_DEFAULT_HEIGHT[\s\S]*?HMB_GROUP_START_HEIGHTS\.imageSources/,
+  /const HMB_HEADER_LAYOUT_VERSION = 2;[\s\S]*?legacyDefaultLayout[\s\S]*?HMB_LEGACY_IMAGE_SOURCES_DEFAULT_HEIGHT[\s\S]*?key === "imageSources" && legacyDefaultLayout\s*\? 514/,
   "A saved legacy default 542px Image Sources layout must migrate once to 514px without shrinking intentional custom layouts.",
 );
 const promptDefaultGeometry = promptModule.normalizeState({});
@@ -1571,7 +1571,7 @@ assert.match(
 );
 assert.match(
   promptSource,
-  /\["pointerdown", "mousedown", "click", "dblclick"\]\.forEach\(\(eventName\) => \{/,
+  /for \(const event of \["pointerdown", "mousedown", "click", "dblclick"\]\)\s*\{\s*container\.addEventListener\(event, stopControlPointer\)/,
   "Prompt controls must still stop node/canvas pointer gestures.",
 );
 assert.match(
@@ -1601,14 +1601,14 @@ const promptIsolationControl = {
 };
 const promptIsolationContainer = {
   classList: { remove() {} }, querySelector() { return null; },
-  querySelectorAll(selector) { return selector === "input" ? [promptIsolationControl] : []; },
+  querySelectorAll(selector) { return selector.split(",").includes("input") ? [promptIsolationControl] : []; },
 };
 const promptIsolationListeners = [];
 promptModule.hmbInstallPromptInteractionIsolation(promptIsolationContainer, promptIsolationListeners, false);
 promptModule.hmbInstallPromptInteractionIsolation(promptIsolationContainer, promptIsolationListeners, false);
 assert.deepEqual([...promptIsolationClasses].sort(), ["nodrag", "nopan", "nowheel"].sort());
 assert.deepEqual(promptIsolationClassWrites, [["nopan", "nowheel"]], "Only the missing gesture classes are written once.");
-assert.equal(promptIsolationListeners.length, 4, "Repeated isolation retains one set of pointer listeners.");
+assert.equal(promptIsolationListeners.length, 0, "Refreshing controls must not add delegated listeners.");
 assert.match(videoSource, /class="hmbvp-clip nodrag"/);
 assert.ok(
   (promptSource.match(/"lostpointercapture", (?:cancelHandler|cancelDrag)/g) || []).length >= 3,

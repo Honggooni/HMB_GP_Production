@@ -245,6 +245,9 @@ async def seed_scenario(engine, modules, project_state, seed, count):
         edit=dict(schema=images.IMAGE_ASSET_EDIT_SCHEMA,version=1,scan_revision=state['scan_revision'],ui_edit_revision=state[images.UI_EDIT_REVISION_KEY]+1,
             catalog_identity={key:state[key] for key in ('catalog_root','project_root','project_uid','project_cache_uid','manifest_signature','folder_signature','scan_revision')},
             selected_source_uids=[row['source_uid'] for row in sorted(state['assets'],key=lambda row:row['selection_order']) if row['selected']],edits={'shot_routing':route})
+        # Match a mounted current widget. Replacements issue a fresh lease;
+        # omission tests stale-client rejection, not valid lifecycle editing.
+        edit[images.WIDGET_RUNTIME_LEASE_KEY] = state[images.WIDGET_RUNTIME_LEASE_KEY]
         send(SetParameterValueRequest(node_name=source.name,parameter_name=images.WIDGET_STATE_PARAMETER,value=json.dumps(edit)))
     def authoring_probe(stage):
         if os.environ.get('HMB_RANDOM_DIAGNOSTICS')!='1':return

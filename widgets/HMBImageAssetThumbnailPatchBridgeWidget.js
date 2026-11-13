@@ -12,6 +12,21 @@ const IMAGE_ASSET_AUTHORITY_MAX_ATTEMPTS = 2;
 const IMAGE_ASSET_AUTHORITY_TOTAL_MS = 10000;
 const authorityNow = () => globalThis.performance?.now?.() ?? Date.now();
 const IMAGE_ASSET_AUTHORITY_LOCAL_SUPERSEDED = Symbol.for("hmb-imageasset-authority-local-superseded-v1");
+const AUTHORITY_TIMEOUT_MESSAGE = "라이브러리 연결 확인 응답을 받지 못했습니다. 프로젝트를 다시 선택하세요.";
+const AUTHORITY_ERRORS = {
+  state_changed: "이미지 라이브러리 상태가 갱신되었습니다. 현재 화면을 다시 확인하세요.",
+  view_too_large: "이미지 라이브러리 화면 데이터가 큽니다. 현재 작업을 저장하고 새 화면에서 다시 확인하세요.",
+  unavailable: "이미지 라이브러리 화면을 확인하지 못했습니다. 연결을 다시 확인하세요.",
+  locked: "이미지 라이브러리가 잠겨 있습니다. 잠금을 해제한 뒤 다시 확인하세요.",
+};
+
+function authorityError(code) {
+  return Object.assign(new Error(AUTHORITY_ERRORS[code]), { code });
+}
+
+function isRuntimeId(value) {
+  return /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value);
+}
 
 function clean(value) {
   return String(value == null ? "" : value).trim();
@@ -276,6 +291,7 @@ function hmbNativeUiImplementation(container, props) {
 
   const queryWidgetLease = () => {
     refreshScope();
+    if (latestProps.disabled) return Promise.reject(authorityError("locked"));
     if (disposed || container.isConnected === false || registry?.get(runtimeId)?.bridgeOwners?.get(token)?.container !== container
         || typeof latestProps?.onChange !== "function") return Promise.reject(new Error("Image library connection is unavailable."));
     if (authority) return authority.promise;
@@ -288,9 +304,10 @@ function hmbNativeUiImplementation(container, props) {
     const sendRead = () => {
       if(authority!==pending)return;
       const remaining=pending.deadline-authorityNow();
-      if(remaining<=0){fail(new Error("라이브러리 연결 확인 응답을 받지 못했습니다. 프로젝트를 다시 선택하세요."));return;}
+      if(remaining<=0){fail(new Error(AUTHORITY_TIMEOUT_MESSAGE));return;}
       refreshScope();
       if(authority!==pending)return;
+      if (latestProps.disabled) { fail(authorityError("locked")); return; }
       if(disposed||container.isConnected===false||scopeRoot!==pending.root||scopeName!==pending.name||runtimeId!==pending.runtime
         ||registry?.get(runtimeId)?.bridgeOwners?.get(token)?.container!==container){fail(new Error("Image library connection changed."));return;}
       clearTimeout(pending.timer);pending.attempts+=1;
@@ -298,22 +315,25 @@ function hmbNativeUiImplementation(container, props) {
       pending.timer=setTimeout(()=>{
         if(authority!==pending||pending.requestId!==requestId)return;
         if(pending.attempts<IMAGE_ASSET_AUTHORITY_MAX_ATTEMPTS)sendRead();
-        else fail(new Error("라이브러리 연결 확인 응답을 받지 못했습니다. 프로젝트를 다시 선택하세요."));
+        else fail(new Error(AUTHORITY_TIMEOUT_MESSAGE));
       },Math.min(IMAGE_ASSET_AUTHORITY_ATTEMPT_MS,remaining));
       try {
-      // This exact read-only query is needed while native authoring is locked.
-      // Use only this mounted transport's current callback; ordinary dispatch
-      // retains the shared disabled adapter and its edit/CGT restrictions.
-      const contract = container.__hmbNativeUiContract;
-      const current = contract?.active && contract.kind === "thumbnail"
-        ? contract.props?.onChange : latestProps.onChange;
-      const readonlyChange = HMB_NATIVE_UI_CALLBACKS.get(current) || current;
-      if (typeof readonlyChange !== "function") throw new Error("Image library connection is unavailable.");
-      const result = readonlyChange({ schema: "hmb-image-asset-thumbnail-bridge", version: 1,
-        operation: "widget_authority", phase: "request", runtime_instance_id: runtimeId, request_id: requestId });
-      if (result?.catch) result.catch(error => { if(pending.requestId===requestId)fail(error); });
+        const request = { schema: "hmb-image-asset-thumbnail-bridge", version: 1,
+          operation: "widget_authority", phase: "request", runtime_instance_id: runtimeId, request_id: requestId };
+        const readAuthority = container.ownerDocument?.defaultView?.__hmbReadImageAssetAuthority0130;
+        if (typeof readAuthority === "function" && pending.name) {
+          Promise.resolve(readAuthority(pending.name, request, Math.min(IMAGE_ASSET_AUTHORITY_ATTEMPT_MS, remaining)))
+            .then(value => {
+              if (authority === pending && pending.requestId === requestId && isAuthorityResult(value)) register(value);
+            })
+            .catch(() => {}); // The existing bounded timer can retry a dropped read.
+          return;
+        }
+        const result = latestProps.onChange(request);
+        if (result?.catch) result.catch(error => { if(pending.requestId===requestId)fail(error); });
       } catch (error) { fail(error); }
     };
+    pending.retry = sendRead;
     sendRead();
     return promise;
   };
@@ -352,7 +372,10 @@ function hmbNativeUiImplementation(container, props) {
         if (!/^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/.test(cgtProjectId)) throw new Error("Invalid CGT project identity.");
         request.cgt_project_id = cgtProjectId;
       }
-      if (operation === "cgt_confirm") request.hierarchy_request = source.hierarchy_request;
+      if (operation === "cgt_confirm") {
+        request.hierarchy_request = source.hierarchy_request;
+        if (source.bind_only === true) request.bind_only = true;
+      }
     } else if (operation === "catalog_page") {
       Object.assign(request,{session_id:clean(source.session_id),sequence:Math.max(0,Math.floor(Number(source.sequence)||0)),
         query:String(source.query||"").slice(0,256),folder:clean(source.folder).replaceAll("\\","/"),
@@ -389,18 +412,48 @@ function hmbNativeUiImplementation(container, props) {
     return latestProps.onChange(request);
   };
 
+  const isAuthorityResult = value => value?.schema === "hmb-image-asset-thumbnail-bridge"
+    && value.version === 1 && value.operation === "widget_authority" && value.phase === "result";
+
+  const matchesAuthorityRead = value => {
+    const pending = authority;
+    const responseRuntime = clean(value?.runtime_instance_id);
+    const requestRuntime = clean(value?.request_runtime_instance_id);
+    const lease = clean(value?.widget_runtime_lease);
+    if (!pending || !pending.requestId || latestProps.disabled || container.isConnected === false
+        || registry?.get(runtimeId)?.bridgeOwners?.get(token)?.container !== container || pending.root !== scopeRoot
+        || pending.name !== scopeName || clean(value.request_id) !== pending.requestId
+        || clean(value.canonical_node_name) !== pending.name || !isRuntimeId(lease)
+        || retiredLeases.has(lease) || !isRuntimeId(responseRuntime)
+        || (requestRuntime ? requestRuntime !== pending.runtime : responseRuntime !== pending.runtime)) return false;
+    if (value.authority_error) return Object.hasOwn(AUTHORITY_ERRORS, value.authority_error) && value.authority_error !== "locked";
+    const scope = value.canonical_scope;
+    return scope?.schema === "hmb-image-bash-widget-authority-v1" && scope.widget_runtime_lease === lease
+      && scope.publisher_instance_uuid === responseRuntime && isRuntimeId(clean(scope.channel_uuid));
+  };
+
   const deliverResult = (value) => {
     if (
       clean(value?.schema) !== "hmb-image-asset-thumbnail-bridge"
       || clean(value?.phase) !== "result"
-      || clean(value?.runtime_instance_id) !== runtimeId
     ) return false;
     const operation = clean(value?.operation);
     if (operation === "widget_authority") {
-      const pending = authority, lease = clean(value?.widget_runtime_lease);
-      if (!pending || clean(value.request_id) !== pending.requestId || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(lease) || retiredLeases.has(lease)) return false;
-      if(authorityNow()>=pending.deadline){clearTimeout(pending.timer);authority=null;pending.reject(new Error("라이브러리 연결 확인 응답을 받지 못했습니다. 프로젝트를 다시 선택하세요."));return false;}
+      if (!isAuthorityResult(value) || !matchesAuthorityRead(value)) return false;
+      const pending = authority, lease = clean(value.widget_runtime_lease);
+      if (authorityNow() >= pending.deadline) {
+        clearTimeout(pending.timer); authority = null; pending.reject(new Error(AUTHORITY_TIMEOUT_MESSAGE)); return false;
+      }
       clearTimeout(pending.timer); authority = null;
+      if (value.authority_error) {
+        authoritySnapshot = null;
+        if (value.authority_error === "state_changed" && pending.attempts < IMAGE_ASSET_AUTHORITY_MAX_ATTEMPTS) {
+          authority = pending;
+          pending.requestId = "";
+          pending.timer = setTimeout(pending.retry, Math.min(120, pending.deadline - authorityNow()));
+        } else pending.reject(authorityError(value.authority_error));
+        return true;
+      }
       if (widgetLease && widgetLease !== lease) retiredLeases.add(widgetLease);
       widgetLease = lease;
       authoritySnapshot = { ...value };
@@ -408,6 +461,7 @@ function hmbNativeUiImplementation(container, props) {
       pending.resolve(lease); if (entry) wakeCatalogConsumers(entry);
       return true;
     }
+    if (clean(value?.runtime_instance_id) !== runtimeId) return false;
     if (widgetLease && clean(value?.widget_runtime_lease) !== widgetLease) return false;
     if (!["hydrate", "catalog_probe", "catalog_page", "cgt_catalog", "cgt_confirm", "cgt_cancel"].includes(operation)) return false;
     const resultKey = `${operation}:${clean(value.request_id)}:${Math.max(0, Math.floor(Number(value.thumbnail_revision) || 0))}:${clean(value.outcome)}`;
@@ -447,18 +501,42 @@ function hmbNativeUiImplementation(container, props) {
     return true;
   };
 
-  const register = (value) => {
+  const register = (value, unlocked = false) => {
     const initialRegistration=!registeredOnce;registeredOnce=true;
     refreshScope();
+    if (latestProps.disabled) {
+      if (authority) { clearTimeout(authority.timer); authority.reject(authorityError("locked")); authority = null; }
+      authoritySnapshot = null;
+    }
     const nextRuntimeId = clean(value?.runtime_instance_id);
+    const incomingLease = clean(value?.widget_runtime_lease);
+    const authorityResult = isAuthorityResult(value);
+    if (!initialRegistration && runtimeId && nextRuntimeId !== runtimeId
+        && !authorityResult && value?.phase !== "idle") return;
+    if (authorityResult && !initialRegistration) {
+      if (!matchesAuthorityRead(value)) {
+        if (unlocked && (widgetLease || incomingLease) && !authority) queryWidgetLease().catch(() => {});
+        return;
+      }
+      if (value.authority_error) {
+        // A correlated failure may report the new publisher, but it never
+        // replaces the live registry or certifies a widget lease.
+        deliverResult(value);
+        return;
+      }
+      if (authorityNow() >= authority.deadline) {
+        const pending = authority;
+        clearTimeout(pending.timer); authority = null; pending.reject(new Error(AUTHORITY_TIMEOUT_MESSAGE));
+        return;
+      }
+    }
     if (runtimeId && runtimeId !== nextRuntimeId) {
-      if (authority) { clearTimeout(authority.timer); authority.reject(new Error("Image library connection changed.")); authority = null; }
+      if (authority && !authorityResult) { clearTimeout(authority.timer); authority.reject(new Error("Image library connection changed.")); authority = null; }
       widgetLease = ""; authoritySnapshot = null; retiredLeases.clear(); deliveredResultKey = "";
       const owners = registry?.get(runtimeId)?.bridgeOwners;
       if (owners instanceof Map) { owners.delete(token); publishBridgeOwners(registry, runtimeId, owners); }
     }
     runtimeId = nextRuntimeId;
-    const incomingLease=clean(value?.widget_runtime_lease);
     if(authority&&incomingLease&&clean(value?.phase)!=="result"&&authority.expectedLease&&incomingLease!==authority.expectedLease){
       clearTimeout(authority.timer);authority.reject(new Error("이미지 라이브러리 연결이 갱신되었습니다. 다시 선택하세요."));authority=null;
     }
@@ -476,8 +554,10 @@ function hmbNativeUiImplementation(container, props) {
       if (entry) wakeCatalogConsumers(entry);
     }
     deliverResult(value);
-    const staleAuthorityResult=clean(value?.operation)==="widget_authority"&&clean(value?.phase)==="result"&&!initialRegistration;
-    if (incomingLease && incomingLease !== widgetLease && !retiredLeases.has(incomingLease) && !authority && !staleAuthorityResult) queryWidgetLease().catch(() => {});
+    if (!latestProps.disabled && incomingLease && !retiredLeases.has(incomingLease) && !authority
+        && (incomingLease !== widgetLease || !authoritySnapshot) && (!authorityResult || initialRegistration || unlocked)) {
+      queryWidgetLease().catch(() => {});
+    }
   };
   register(bridgeValue(latestProps));
 
@@ -501,8 +581,9 @@ function hmbNativeUiImplementation(container, props) {
     cleanup,
     update(nextProps) {
       if (disposed) return;
+      const unlocked = Boolean(latestProps.disabled) && !nextProps?.disabled;
       latestProps = nextProps || {};
-      register(bridgeValue(latestProps));
+      register(bridgeValue(latestProps), unlocked);
       makeContainerInert(container);
     },
   };

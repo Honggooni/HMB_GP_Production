@@ -255,9 +255,11 @@ class MyBoxNodeTests(unittest.TestCase):
     def test_constructor_and_selection_are_offline_and_scope_is_exact(self):
         self.assertTrue(controller_module.is_selected(self.node)); self.assertFalse(self.backend.calls)
         self.assertFalse(self.backend.created); self.node._ensure_broker_connected.assert_not_awaited()
-        for selected in ('Select Project','슈퍼윙즈12','까투리8','my box',' My Box '):
+        for selected in ('Select Project','슈퍼윙즈12','까투리8','my box'):
             self.node.set_parameter_value('only_project',selected,initial_setup=True)
             self.assertFalse(controller_module.is_selected(self.node),selected)
+        self.node.set_parameter_value("only_project", " My Box ", initial_setup=True)
+        self.assertTrue(controller_module.is_selected(self.node))
         self.assertFalse(self.backend.calls)
     def test_preflight_has_no_auth_workspace_upload_or_post(self):
         before=self.authored(); self.controller().preflight()
@@ -374,12 +376,16 @@ class MyBoxNodeTests(unittest.TestCase):
         base=self.folder/'기존 이름별 저장'/node.name/'사용자 기본 이름.mov'
         # Only project-template resolution is a fixture; the SDK component's
         # filename, situation, node_name and _index propagation are real.
-        with mock.patch.object(ProjectFileDestination,'from_situation',
+        with mock.patch.object(ProjectFileDestination,'from_situation_in_workflow',
                 return_value=target._SeedanceDraftOutputDestination(str(base))) as situation:
             self.run_node(node)
         saved=self.assert_success()
         self.assertEqual(saved.parent,base.parent)
-        situation.assert_called_once_with('사용자 기본 이름.mov',node._output_file._situation_name,node_name=node.name,_index=1)
+        situation.assert_called_once()
+        args, kwargs = situation.call_args
+        self.assertEqual(args[-2:], ('사용자 기본 이름.mov', node._output_file._situation_name))
+        self.assertEqual(kwargs['node_name'], node.name)
+        self.assertEqual(kwargs['_index'], 1)
         self.assertEqual(node._output_file._situation_name,'save_node_output')
     def test_native_upstream_output_path_wins_without_overwriting_existing_file(self):
         node=self.node; del node._output_file.build_file

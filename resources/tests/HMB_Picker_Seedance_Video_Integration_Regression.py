@@ -55,9 +55,9 @@ seedance = load_module(
 
 
 def register_node(flow: Any, node: Any) -> None:
-    flow.add_node(node)
-    GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
-    GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = flow.name
+    from _hmb_fixture_sdk import register_fixture_node
+    from griptape_nodes.retained_mode.engine import current_engine
+    register_fixture_node(current_engine(), flow, node)
 
 
 def video_url(number: int) -> str:

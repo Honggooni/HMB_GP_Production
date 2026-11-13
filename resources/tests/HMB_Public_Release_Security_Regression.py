@@ -29,15 +29,21 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
     "HMBAgentLibrary.py",
+    "HMBAnalysisAgent.py",
     "HMBColorLUTLibrary.py",
     "HMBFinishLookLibrary.py",
     "HMBImageAssetLibrary.py",
     "HMBImageBash.py",
     "HMBImageGeneration.py",
     "HMBPromptLibrary.py",
+    "HMBSoundLibrary.py",
     "HMBSeedanceGeneration.py",
     "HMBVideoPickerLibrary.py",
     "_hmb_agent_media.py",
+    "_hmb_analysis_delivery.py",
+    "_hmb_reference_analysis.py",
+    "_hmb_analysis_broker.py",
+    "_hmb_sound.py",
     "_hmb_agent_session.py",
     "_hmb_broker_config.py",
     "_hmb_build_diagnostics.py",
@@ -59,6 +65,7 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "_hmb_review.py",
     "_hmb_web_rerender.py",
     "_hmb_shot_routing.py",
+    "_hmb_shot_basket.py",
     "_hmb_cgt.py",
     "_hmb_mp4_verify.py",
     "_hmb_common.py",
@@ -67,6 +74,7 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "_hmb_screen_space.py",
     "_hmb_video_tools.py",
     "widgets/HMBAgentLibraryWidget.js",
+    "widgets/HMBAnalysisAgentWidget.js",
     "widgets/HMBColorLUTLibraryWidget.js",
     "widgets/HMBFinishLookLibraryWidget.js",
     "widgets/HMBImageAssetLibraryWidget.js",
@@ -74,6 +82,7 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "widgets/HMBImageGenerationWidget.js",
     "widgets/HMBImageBashWidget.js",
     "widgets/HMBPromptLibraryScopedBindingWidget.js",
+    "widgets/HMBSoundLibraryWidget.js",
     "widgets/HMBSeedanceGenerationWidget.js",
     "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
     "widgets/HMBVideoPickerLibraryWidget_v032.js",
@@ -95,7 +104,21 @@ EXPECTED_DISTRIBUTION_ONLY_FILES = (
     "tools/hmb_color_lut_native_header_patch.py",
     "tools/hmb_native_semantic_adapter.py",
     "resources/editor/hmb-color-lut-native-header.js",
+    "resources/editor/hmb-shot-basket.js",
+    "resources/editor/hmb-rodong-mart-launcher.webp",
+    "resources/editor/hmb-rodong-mart-launcher-extra.webp",
+    "resources/editor/hmb-rodong-mart-header.webp",
     "resources/editor/native-editor-patch.json",
+    "tools/hmb_editor_0130_header.py",
+    "tools/restore_rodong_local_editor.py",
+    "tools/hmb_rodong_editor_0130.py",
+    "tools/hmb_editor_0130_override.py",
+    "resources/editor/hmb-header-0130.js",
+    "resources/editor/hmb-rodong-editor-0130.js",
+    "resources/editor/hmb-continue-work-art.js",
+    "resources/editor/hmb-continue-work-01-10.webp",
+    "resources/editor/hmb-continue-work-11-20.webp",
+    "resources/editor/hmb-continue-work-21-30.webp",
 )
 EXPECTED_SOURCE_FILES = (
     *EXPECTED_RUNTIME_INSTALL_FILES,
@@ -334,10 +357,12 @@ agent_model_ids = builder.node_model_usage_ids(manifest, "HMBAgentLibrary")
 assert agent_model_ids
 assert len(agent_model_ids) == len(set(agent_model_ids))
 catalog_model_ids = builder.library_model_catalog_ids(manifest)
-assert len(catalog_model_ids) == len(agent_model_ids)
-assert set(agent_model_ids) == set(catalog_model_ids)
+argon_catalog_id = "gtc_gemini_4_argon"
+assert builder.node_model_usage_ids(manifest, "HMBAnalysisAgent") == (argon_catalog_id,)
+assert set(agent_model_ids) == set(catalog_model_ids) - {argon_catalog_id}
+assert argon_catalog_id not in agent_model_ids
 assert (
-    builder.library_model_catalog_contract_sha256(manifest)
+    builder.library_model_catalog_contract_sha256(manifest, exclude_model_id=argon_catalog_id)
     == builder.STANDARD_AGENT_MODEL_CATALOG_SHA256
 )
 saved_standard_root = os.environ.get(builder.STANDARD_AGENT_LIBRARY_ENV)
@@ -380,7 +405,7 @@ if standard_manifest_path is not None:
         if declaration["type"] == "model_usage"
     )
     assert list(agent_model_ids) == standard_agent_ids
-    assert len(catalog_model_ids) == len(standard_agent_ids)
+    assert len(catalog_model_ids) == len(standard_agent_ids) + 1
     standard_providers = next(
         declaration["providers"]
         for declaration in standard_manifest["metadata"]["declarations"]
@@ -391,7 +416,8 @@ if standard_manifest_path is not None:
         assert {key: value for key, value in provider.items() if key != "models"} == {
             key: value for key, value in standard_provider.items() if key != "models"
         }
-        assert provider["models"] == {
+        assert {key: value for key, value in provider["models"].items()
+                if key != argon_catalog_id} == {
             model_id: metadata
             for model_id, metadata in standard_provider["models"].items()
             if model_id in standard_agent_ids
@@ -535,19 +561,19 @@ native_descriptor = builder.validate_native_editor_patch_sources()
 with tempfile.TemporaryDirectory(prefix="hmb-native-release-boundary-") as native_tmp:
     native_root = Path(native_tmp)
     descriptor_relative = "resources/editor/native-editor-patch.json"
-    for relative in (descriptor_relative, native_descriptor["patcher_path"], native_descriptor["helper_path"],
-                     "tools/hmb_native_semantic_adapter.py"):
+    editor_assets = [path for path in EXPECTED_DISTRIBUTION_ONLY_FILES if path.startswith(("resources/editor/", "tools/"))]
+    for relative in editor_assets:
         destination = native_root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes((ROOT / relative).read_bytes())
     descriptor_file = native_root / descriptor_relative
     with mock.patch.object(builder, "ROOT", native_root):
         assert builder.validate_native_editor_patch_sources() == native_descriptor
-        # Six reviewed history pairs and the already shipped 5/4/3/2-pair
-        # suffix schemas must bind the corresponding exact patcher constants.
+        # All reviewed history pairs and the previously shipped suffix schemas
+        # must bind the corresponding exact patcher constants.
         history = native_descriptor["previous_candidates"]
-        assert len(history) == 6
-        for start in range(5):
+        assert len(history) == 8
+        for start in range(len(history) - 1):
             previous_schema = dict(native_descriptor, previous_candidates=history[start:])
             descriptor_file.write_text(json.dumps(previous_schema), encoding="utf-8")
             assert builder.validate_native_editor_patch_sources() == previous_schema
@@ -555,9 +581,9 @@ with tempfile.TemporaryDirectory(prefix="hmb-native-release-boundary-") as nativ
         patcher_file = native_root / native_descriptor["patcher_path"]
         original_patcher = patcher_file.read_bytes()
         for field, key in (("CANDIDATE", "bundle_sha256"), ("HELPER", "helper_sha256")):
-            old_constant = f'SUPPORTED_CONNECTION_PREVIOUS_{field}_SHA256 = "{history[0][key]}"'
+            old_constant = f'SUPPORTED_SOUND_READ_PREVIOUS_{field}_SHA256 = "{history[0][key]}"'
             changed_patcher = original_patcher.replace(old_constant.encode(),
-                f'SUPPORTED_CONNECTION_PREVIOUS_{field}_SHA256 = "{"0" * 64}"'.encode(), 1)
+                f'SUPPORTED_SOUND_READ_PREVIOUS_{field}_SHA256 = "{"0" * 64}"'.encode(), 1)
             assert changed_patcher != original_patcher
             patcher_file.write_bytes(changed_patcher)
             # Even a descriptor that truthfully hashes the altered tool may
@@ -610,6 +636,16 @@ with tempfile.TemporaryDirectory(prefix="hmb-native-release-boundary-") as nativ
         else:
             raise AssertionError("Native editor accepted a changed adapter.")
         adapter.write_bytes(original_adapter)
+        basket_ui = native_root / "resources/editor/hmb-shot-basket.js"
+        original_basket_ui = basket_ui.read_bytes()
+        basket_ui.write_bytes(original_basket_ui + b"\n// mutated\n")
+        try:
+            builder.validate_native_editor_patch_sources()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Native editor accepted a changed Shot Basket UI.")
+        basket_ui.write_bytes(original_basket_ui)
         legacy_previous = {
             "bundle_sha256": "7bad6f6517c781c54e6d2e0cf170f0b2ed3bdef28b3cca57be79cce54bdd11bf",
             "helper_sha256": "39e5901cc8aa37d1d11850a255bcc209ab4724afe488817fc3f684a72ab01b63",

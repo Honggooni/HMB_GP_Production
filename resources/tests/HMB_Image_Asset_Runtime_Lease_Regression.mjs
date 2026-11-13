@@ -72,7 +72,7 @@ try{
  assert.equal(copied.rows.length,3);assert.equal(new Set(copied.rows.map(r=>r.instance_id)).size,3);assert(copied.sent);assert.equal(copied.sent.widget_runtime_lease,accepted.lease);
  const mixed=await page.evaluate(()=>{const f=window.leaseFixture,queue=[];let h;
   const p=value=>({value,onChange:req=>{queue.push(structuredClone(req));return Promise.resolve({})}});
-  h=f.b.default(document.getElementById('other'),p(f.projection(f.id(11))));const q=queue.at(-1);h.update(p(f.projection(f.id(11),'result',q.request_id)));
+  h=f.b.default(document.getElementById('other'),p(f.projection(f.id(11))));const q=queue.at(-1);h.update(p({...f.projection(f.id(11),'result',q.request_id),canonical_node_name:'OtherAsset'}));
   f.other=h;const registry=globalThis.__hmbImageAssetThumbnailBridgeRegistry;
   const entry=f.b.hmbImageAssetThumbnailPatchBridgeRegistry().get(f.id(1));
   const clone=document.createElement('div');clone.className='react-flow__node';clone.dataset.id='AssetLive';clone.innerHTML='<div id="same-name"></div>';document.body.append(clone);
@@ -85,14 +85,48 @@ try{
  assert.equal(mixed.live,accepted.lease);assert.notEqual(mixed.other,mixed.live);
  assert.notEqual(mixed.sameNameOtherRoot,mixed.live);assert(mixed.ambiguousNameRejected);
  const locked=await page.evaluate(async()=>{const f=window.leaseFixture,c=document.createElement('div');f.node.closest('.react-flow__node').append(c);const requests=[];
-  const props=(value,callback='first')=>({disabled:true,value,onChange:request=>{requests.push({request,callback});return Promise.resolve({})}});
-  const h=f.b.default(c,props(f.projection(f.fresh.widget_runtime_lease)));const first=requests.at(-1).request;
-  const result=f.projection(f.fresh.widget_runtime_lease,'result',first.request_id);h.update(props(result));h.update(props(result,'current'));
+  const idle=f.projection(f.fresh.widget_runtime_lease);
+  const props=(value,disabled=true,callback='first')=>({disabled,value,onChange:request=>{requests.push({request,callback});return Promise.resolve({})}});
+  const h=f.b.default(c,props(idle));
   const owner=[...f.b.hmbImageAssetThumbnailPatchBridgeRegistry().get(f.id(1)).bridgeOwners.values()].find(o=>o.container===c);
-  const pending=owner.queryWidgetLease(),last=requests.at(-1);h.update(props(f.projection(f.fresh.widget_runtime_lease,'result',last.request.request_id),'current'));await pending;
+  const lockedError=await owner.queryWidgetLease().catch(error=>error.code);
+  const lockedReads=requests.length;
   let writeBlocked=false;try{owner.dispatch({operation:'cgt_cancel',widget_runtime_lease:f.fresh.widget_runtime_lease,runtime_instance_id:f.id(1),request_id:'locked-write',session_id:'locked-session'})}catch{writeBlocked=true}
-  h.cleanup();return{readonly:first.operation==='widget_authority',fresh_callback:last.callback==='current',write_blocked:writeBlocked}});
- assert(locked.readonly&&locked.fresh_callback&&locked.write_blocked,'Readonly authority uses the locked current callback while ordinary writes remain blocked');
+  h.update(props(idle,false,'current'));
+  const pending=owner.queryWidgetLease(),last=requests.at(-1);
+  h.update(props(f.projection(f.fresh.widget_runtime_lease,'result',last.request.request_id),false,'current'));
+  const unlockedLease=await pending;
+  const inFlight=owner.queryWidgetLease().catch(error=>error.code);
+  const retired=requests.at(-1).request;
+  h.update(props(idle));
+  h.update(props(f.projection(f.fresh.widget_runtime_lease,'result',retired.request_id)));
+  const pendingLockError=await inFlight;
+  h.cleanup();return{lockedError,lockedReads,unlockedLease,expectedLease:f.fresh.widget_runtime_lease,pendingLockError,
+   fresh_callback:last.callback==='current',write_blocked:writeBlocked,requests:requests.length}});
+ assert.deepEqual(locked,{lockedError:'locked',lockedReads:0,unlockedLease:accepted.lease,expectedLease:accepted.lease,
+  pendingLockError:'locked',fresh_callback:true,write_blocked:true,requests:2});
+ const movedRuntime=await page.evaluate(async()=>{
+  const f=window.leaseFixture,node=document.createElement('div');node.className='react-flow__node';node.dataset.id='RuntimeChange';
+  const carrier=document.createElement('div');node.append(carrier);document.body.append(node);
+  const oldRuntime=f.id(1),runtime=f.id(25),requests=[];
+  const props=value=>({value,onChange:request=>requests.push(request)});
+  const h=f.b.default(carrier,props(f.projection(f.old.widget_runtime_lease)));
+  const request=requests[0],registry=f.b.hmbImageAssetThumbnailPatchBridgeRegistry();
+  const pending=registry.get(oldRuntime).forNode(node.dataset.id,node).queryWidgetLease();
+  const response=f.projection(f.fresh.widget_runtime_lease,'result',request.request_id);
+  response.runtime_instance_id=runtime;
+  response.request_runtime_instance_id=oldRuntime;
+  response.canonical_node_name=node.dataset.id;
+  response.canonical_scope.publisher_instance_uuid=runtime;
+  h.update(props(response));
+  const lease=await pending;
+  h.update(props(request));
+  const exact=registry.get(runtime)?.forNode(node.dataset.id,node)?.widget_runtime_lease;
+  const old=registry.get(oldRuntime)?.forNode(node.dataset.id,node)??null;
+  h.cleanup();node.remove();
+  return {lease,exact,old,requests:requests.length};
+ });
+ assert.deepEqual(movedRuntime,{lease:accepted.lease,exact:accepted.lease,old:null,requests:1});
  const autoemit=await page.evaluate(()=>{const f=window.leaseFixture,s=structuredClone(f.old),node=document.createElement('div');s.shot_routing.publisher_instance_uuid=f.id(90);
   s.project_uid='isolated-project';s.project_cache_uid='isolated-cache';s.manifest_signature='isolated-manifest';s.thumbnail_busy=true;
   s.thumbnail_request={request_id:'stale-auto-resume',project_uid:s.project_uid,manifest_signature:s.manifest_signature,scan_revision:1,asset_library_ids:['a']};
@@ -106,12 +140,46 @@ try{
   f.m.hmbResetImageAssetThumbnailRetryState(document.createElement('div'),fresh);f.m.hmbAdoptImageAssetPresentation(fresh);
   return{media_reused:fresh.assets[0].thumbnail_url===old.assets[0].thumbnail_url,old_request_retained:entry.requestOwners.get(old.widget_runtime_lease).requested.has('old-inflight'),fresh_request_not_suppressed:!entry.requestOwners.get(fresh.widget_runtime_lease).requested.has('old-inflight')}});
  assert(cache.media_reused&&cache.old_request_retained&&cache.fresh_request_not_suppressed);
+ await page.clock.install();
+ await page.evaluate(()=>{
+  const f=leaseFixture,owner=document.createElement('div');
+  owner.className='react-flow__node';owner.dataset.id='RecoveryAsset';
+  const node=document.createElement('div');owner.append(node);document.body.append(owner);
+  const stale=structuredClone(f.old),incoming=structuredClone(f.fresh),live=structuredClone(f.fresh);
+  incoming.shot_routing.publisher_instance_uuid=f.id(21);
+  live.shot_routing.publisher_instance_uuid=f.id(22);
+  const recovery={node,calls:0,writes:0,online:false};
+  const props=value=>({value:JSON.stringify(value),nodeName:'RecoveryAsset',onChange:()=>recovery.writes++});
+  window.__hmbReadImageAssetAuthority0130=async(name,request)=>{
+   if(name!=='RecoveryAsset'||!request.include_view)throw Error('Unscoped recovery read');
+   recovery.calls++;
+   if(!recovery.online)throw Error('Synthetic transport loss');
+   return {schema:request.schema,version:1,operation:request.operation,phase:'result',
+    request_id:request.request_id,request_runtime_instance_id:request.runtime_instance_id,canonical_node_name:name,
+    widget_runtime_lease:live.widget_runtime_lease,canonical_scope:f.m.hmbImageAssetAuthorityScope(live),canonical_view:JSON.stringify(live)};
+  };
+  recovery.handle=f.m.default(node,props(stale));
+  for(let i=0;i<5;i++)recovery.handle.update(props(incoming));
+  window.recoveryAsset=recovery;
+ });
+ await page.clock.runFor(10100);
+ const stopped=await page.evaluate(()=>{const r=recoveryAsset;return{calls:r.calls,writes:r.writes,
+  pending:r.node.__hmbImageAssetLeaseTransitionPending,busy:r.node.__hmbImageAssetBusy,
+  inert:r.node.querySelector('.hmb-image-assets').hasAttribute('inert'),retry:!!r.node.querySelector('[data-asset-connection-retry]')};});
+ assert.deepEqual(stopped,{calls:2,writes:0,pending:true,busy:false,inert:true,retry:true});
+ await page.evaluate(()=>{recoveryAsset.online=true;recoveryAsset.node.querySelector('[data-asset-connection-retry]').click();});
+ await page.clock.runFor(500);
+ const recovered=await page.evaluate(()=>{const r=recoveryAsset;return{calls:r.calls,writes:r.writes,
+  runtime:r.node.__hmbImageAssetLatestState.shot_routing.publisher_instance_uuid,
+  pending:!!r.node.__hmbImageAssetLeaseTransitionPending,busy:r.node.__hmbImageAssetBusy};});
+ assert.deepEqual(recovered,{calls:3,writes:0,runtime:'40000000-0000-4000-8000-000000000022',pending:false,busy:false});
+ await page.evaluate(()=>{recoveryAsset.handle.cleanup();recoveryAsset.node.parentElement.remove();delete window.__hmbReadImageAssetAuthority0130;});
  await page.screenshot({path:path.join(out,'SYNTHETIC-WIDGET-LEASE.png')});
  const counts=await page.evaluate(()=>{const f=window.leaseFixture;f.mainHandle.cleanup();f.handle.cleanup();f.other.cleanup();f.same.cleanup();return{semantic:f.sent.length,requests:f.requests.length}});
  assert.equal(errors.length,0,errors.join('\n'));
- proof={status:'PASS',scope:'Synthetic widget DOM in isolated Chromium; no Desktop or SDK requests',correlated,pending,accepted,retired_lease_ignored:true,same_lease_numeric_stale_guard:true,locked_readonly_authority:locked,leased_stale_autoemit_without_bridge:autoemit,presentation_vs_request_cache:cache,
+ proof={status:'PASS',scope:'Synthetic widget DOM in isolated Chromium; no Desktop or SDK requests',correlated,pending,accepted,retired_lease_ignored:true,same_lease_numeric_stale_guard:true,locked_readonly_authority:locked,correlated_runtime_transition:movedRuntime,leased_stale_autoemit_without_bridge:autoemit,presentation_vs_request_cache:cache,
   unknown_lease_cannot_relabel_old_state:true,intentional_copy:copied,mixed_persisted_publisher_scoped_by_actual_node:mixed,
-  cleanup:true,blocked_network_requests:blocked.length,errors,counts,
+  recovery_after_timeout:recovered,cleanup:true,blocked_network_requests:blocked.length,errors,counts,
   product_root:productRoot,source_test:fileURLToPath(import.meta.url),
   main_sha256:crypto.createHash('sha256').update(main).digest('hex'),bridge_sha256:crypto.createHash('sha256').update(bridge).digest('hex')};
 }catch(error){proof={status:'FAILED',error:String(error),stack:error.stack};throw error}

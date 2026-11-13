@@ -28,12 +28,14 @@ from HMBFinishLookLibrary import (
     _normalize_shot_selection, _raw_parameter, _set_parameter_silently,
     _shot_only, set_output,
 )
-from _hmb_color_lut import CODEC_EXTENSIONS, default_settings, normalize_settings, probe_source, export_video, write_cube
+from _hmb_color_lut import CODEC_EXTENSIONS, default_settings, normalize_settings, normalize_audio_mix, probe_source, export_video, write_cube
 from _hmb_deletion_guard import hmb_binding_mutation
+from _hmb_project import project_display_name
 
 UI = "HMB_COLOR_LUT_UI_STATE"
 COMMAND = "HMB_COLOR_LUT_COMMAND"
 SOURCE = "COLOR_LUT_SOURCE_IN"
+SOUND_IN = "SOUND_IN"
 # Leave room for Griptape's title, flow row and video_url output around the widget.
 COLOR_LUT_NODE_WIDTH = 1220
 COLOR_LUT_NODE_HEIGHT = 1160
@@ -147,6 +149,19 @@ def _upload_bridge(origin: str) -> Any:
     return bridge
 
 
+def _upload_error_status(error: Exception) -> int | None:
+    # HTTPError delegates unknown attributes to its response stream. A closed
+    # or absent stream must not turn error reporting into a second failure.
+    for name in ("code", "status_code"):
+        try:
+            value = getattr(error, name, None)
+        except (AttributeError, KeyError, TypeError):
+            continue
+        if type(value) is int:
+            return value
+    return None
+
+
 def _unknown_upload_reason(error: Exception) -> str:
     """Explain the observed failure without exposing URL, token or response body.
 
@@ -159,9 +174,7 @@ def _unknown_upload_reason(error: Exception) -> str:
         from HMBSeedanceGeneration import _BrokerAuthenticationError, _BrokerUnavailableError
     except ImportError:
         _BrokerAuthenticationError = _BrokerUnavailableError = ()
-    code = getattr(error, "status_code", None)
-    if code is None:
-        code = getattr(error, "code", None)
+    code = _upload_error_status(error)
     prefix = ("브로커 로그인이 만료되었습니다. 다시 로그인하세요. " if code == 401 else
               "브로커 로그인이 필요합니다. 로그인한 뒤 다시 확인하세요. " if isinstance(error, _BrokerAuthenticationError) else
               "브로커가 업로드 권한을 거부했습니다 (HTTP 403). " if code == 403 else
@@ -170,6 +183,16 @@ def _unknown_upload_reason(error: Exception) -> str:
               "브로커 연결이 끊겼거나 응답 시간이 초과되었습니다. "
               if isinstance(error, (TimeoutError, ConnectionError, URLError)) or isinstance(error, _BrokerUnavailableError) else "")
     return prefix + "동일 업로드 상태 확인이 필요합니다. 다시 누르면 새 업로드 없이 조회합니다."
+
+
+def _upload_broker_offline(error: Exception) -> bool:
+    try:
+        from HMBSeedanceGeneration import _BrokerUnavailableError
+    except ImportError:
+        _BrokerUnavailableError = ()
+    code = _upload_error_status(error)
+    return isinstance(error, (TimeoutError, ConnectionError, URLError)) or isinstance(error, _BrokerUnavailableError) or (
+        type(code) is int and 500 <= code <= 599)
 
 
 def _usage_bridge(origin: str) -> Any:
@@ -350,7 +373,7 @@ def _read_profiles() -> list[dict[str, Any]]:
 def default_state() -> dict[str, Any]:
     return {"schema_version": 1, "revision": 0, "language": "ko", "shot": _shot_only(),
             "shot_catalog": {}, "project_id": "", "project": {}, "manual_project": {}, "preset_name": "", "preset_id": "", "profiles": _read_profiles(),
-            "settings": default_settings(), "source": {}, "output": {
+            "settings": default_settings(), "audio_mix": normalize_audio_mix({}), "sound": {"connected": False, "revision": ""}, "source": {}, "output": {
                 "codec": "hevc10", "manual_output_enabled": False, "path": ""},
             "status": {"phase": "idle", "message": "", "progress": 0}, "result": {}, "shot_states": {}}
 
@@ -363,6 +386,11 @@ def _selection_key(state: Mapping[str, Any]) -> str:
 def _export_selection(state: Mapping[str, Any]) -> str:
     # A manual export's pixels do not change when its upload destination changes.
     return _selection_key(state) if state.get("shot", {}).get("shot_uuid") else "manual"
+
+
+def _audio_mix_identity(state: Mapping[str, Any]) -> dict[str, Any]:
+    settings = normalize_audio_mix(state.get("audio_mix"))
+    return {**settings, "sound_revision": str(state.get("sound", {}).get("revision") or "")} if settings["enabled"] else settings
 
 
 def _upload_project(value: Any) -> dict[str, str]:
@@ -461,6 +489,7 @@ class HMBColorLUTLibrary(DataNode):
         # BaseNode._state is Griptape's NodeResolutionState, not dashboard data.
         # Keep our state namespaced across registration, invalidation and reset.
         self._hmb_color_lut_state = default_state()
+        self._sound_snapshot: dict[str, Any] = {}
         self._syncing = False
         self._hydrated = False
         self._project_authoritative = False
@@ -510,6 +539,9 @@ class HMBColorLUTLibrary(DataNode):
                 allow_input="INPUT" in modes, allow_output=False, allow_property="PROPERTY" in modes,
                 allowed_modes=_mode(*modes), ui_options=_hidden_transport_ui_options())
             _hide_transport_parameter(parameter)
+        _add_parameter(self, name=SOUND_IN, type="dict", default_value={}, input_types=["dict"],
+            allow_input=True, allow_output=False, allow_property=False, allowed_modes=_mode("INPUT"),
+            ui_options={"display_name": "Sound Library", "hide_property": True, "hide": False, "hide_handles": False})
         _add_parameter(self, name="video_url", type="str", default_value="", output_type="str",
             allow_input=False, allow_output=True, allow_property=False, allowed_modes=_mode("OUTPUT"),
             ui_options={"display_name": "video_url"})
@@ -522,7 +554,14 @@ class HMBColorLUTLibrary(DataNode):
             try:
                 state = copy.deepcopy(self._hmb_color_lut_state)
                 state["web_upload"] = self._upload_projection()
-                state["upload_projects"] = copy.deepcopy(self._manual_projects)
+                project = state["project"]
+                state["project_display_name"] = project_display_name(project.get("id"), project.get("name"))
+                manual = state["manual_project"]
+                state["manual_project_display_name"] = project_display_name(manual.get("id"), manual.get("name"))
+                state["upload_projects"] = [
+                    {**row, "display_name": project_display_name(row["id"], row["name"])}
+                    for row in self._manual_projects
+                ]
                 state["_web_node_id"] = self._web_node_id
                 _set_parameter_silently(self, UI, state)
                 publisher = getattr(self, "publish_update_to_parameter", None)
@@ -535,7 +574,155 @@ class HMBColorLUTLibrary(DataNode):
         """Small local invalidation key; no graph/network/hash work on a UI edit."""
         result = state.get("result") if isinstance(state.get("result"), Mapping) else {}
         return _digest([_selection_key(state), _source_identity(state.get("source")),
-                        normalize_settings(state.get("settings")), result.get("path"), result.get("job_id")])
+                        normalize_settings(state.get("settings")), _audio_mix_identity(state), result.get("path"), result.get("job_id")])
+
+    def _receive_sound(self, value: Any, *, publish: bool = True) -> None:
+        # The published digest is UI/proof invalidation only. Execution reads the
+        # registered source object and never accepts a browser's track list.
+        snapshot = copy.deepcopy(value) if isinstance(value, Mapping) else {}
+        digest = _digest(snapshot) if snapshot else ""
+        with self._lock:
+            if self._sound_snapshot == snapshot:
+                return
+            old_audio = _audio_mix_identity(self._hmb_color_lut_state)
+            self._sound_snapshot = snapshot
+            self._hmb_color_lut_state["sound"] = {"connected": bool(snapshot), "revision": digest}
+            self._hmb_color_lut_state["revision"] += 1
+            refresh_upload = old_audio != _audio_mix_identity(self._hmb_color_lut_state)
+        if refresh_upload:
+            # A previous readiness worker may already have exited. Schedule the
+            # new read rather than just waking the old worker.
+            self._schedule_upload_probe()
+        if publish:
+            self._publish()
+
+    def _capture_sound_snapshot(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        from _hmb_shot_routing import _same_flow_nodes, _incoming_connections
+        import inspect
+        from _hmb_sound import normalize_sound_snapshot
+        flow, nodes = _same_flow_nodes(self)
+        edges = [edge for edge in _incoming_connections(self) if edge.target_parameter_name == SOUND_IN
+                 and edge.source_parameter_name in {"SOUND_OUT", "SHOT_SOUND_OUT"}]
+        if not flow or self not in nodes or len(edges) != 1:
+            raise ValueError("Audio Mix requires one connected Sound Library output.")
+        sources = [node for node in nodes if str(getattr(node, "name", "")) == edges[0].source_node_name]
+        if len(sources) != 1:
+            raise ValueError("The Sound Library connection is no longer available.")
+        source = sources[0]
+        metadata = getattr(source, "metadata", {}) or {}
+        try:
+            source_file = Path(inspect.getfile(type(source))).resolve()
+        except (TypeError, OSError):
+            source_file = None
+        if (type(source).__name__ != "HMBSoundLibrary" or source_file != Path(__file__).with_name("HMBSoundLibrary.py").resolve()
+                or metadata.get("library") != "HMB_GP_Production" or metadata.get("node_type") != "HMBSoundLibrary"
+                or getattr(source, "_hmb_node_deleted", False) or not callable(getattr(source, "_hmb_sound_snapshot_for", None))):
+            raise ValueError("The Sound Library connection is no longer available.")
+        shot = state["shot"]
+        snapshot = normalize_sound_snapshot(source._hmb_sound_snapshot_for(
+            channel_uuid=shot.get("channel_uuid", ""), shot_uuid=shot.get("shot_uuid", "")))
+        if not snapshot:
+            raise ValueError("The selected Shot has no valid Sound Library snapshot.")
+        project_root = str(state.get("project", {}).get("root") or "")
+        if shot.get("shot_uuid") and project_root:
+            image_root = Path(project_root)
+            if image_root.name.casefold() != "ai_ct_image" or snapshot["project_id"].casefold() != image_root.parent.name.casefold():
+                raise ValueError("The Sound Library project does not match this Shot's image project.")
+        # Reject stale UI state before capture; a delayed click must not silently
+        # export newly selected sounds under its older visible configuration.
+        expected = str(state.get("sound", {}).get("revision") or "")
+        received = normalize_sound_snapshot(self._sound_snapshot) if self._sound_snapshot else {}
+        if expected and expected != _digest(self._sound_snapshot):
+            raise ValueError("Sound selection changed; review the current sounds before exporting.")
+        if received and _digest(snapshot) != _digest(received):
+            raise ValueError("Sound Library selection is still updating. Try again after it is ready.")
+        plan_source = normalize_audio_mix(state.get("audio_mix"))["source"]
+        if plan_source == "rendered" and not shot.get("shot_uuid"):
+            raise ValueError("생성 당시 사운드는 완료된 Generator 샷 연결이 필요합니다. 현재 샷 사운드를 선택하세요.")
+        if shot.get("shot_uuid"):
+            effective = self._bound_sound_contract(state, nodes, source) if plan_source == "rendered" else self._current_shot_sound_contract(state, nodes, source)
+            if effective is not None:
+                snapshot = normalize_sound_snapshot(effective)
+                if (snapshot and (snapshot.get("channel_uuid") != shot["channel_uuid"]
+                        or snapshot.get("project_id", "").casefold() != str(source._hmb_sound_snapshot_for()["project_id"]).casefold())):
+                    raise ValueError("The finishing sound contract belongs to another Shot project.")
+        return copy.deepcopy(snapshot)
+
+    def _current_shot_sound_contract(self, state: Mapping[str, Any], nodes: list[Any], sound_source: Any) -> dict[str, Any] | None:
+        """Explicit finishing uses current exact-Shot Prompt edits when present."""
+        import inspect
+        from _hmb_sound import SoundError, normalize_sound_snapshot
+        shot, candidates = state["shot"], []
+        base = normalize_sound_snapshot(sound_source._hmb_sound_snapshot_for(channel_uuid=shot["channel_uuid"], shot_uuid=shot["shot_uuid"]))
+        base_sources = {row["instance_id"]: tuple(row.get(key) for key in ("source_uid", "path", "media_signature", "channel_uuid", "shot_uuid")) for row in base.get("tracks", [])}
+        for node in nodes:
+            metadata = getattr(node, "metadata", {}) or {}
+            if (type(node).__name__ != "HMBPromptLibrary" or metadata.get("library") != "HMB_GP_Production"
+                    or metadata.get("node_type") != "HMBPromptLibrary" or getattr(node, "_hmb_node_deleted", False)):
+                continue
+            try:
+                if Path(inspect.getfile(type(node))).resolve() != Path(__file__).with_name("HMBPromptLibrary.py").resolve():
+                    continue
+            except (TypeError, OSError):
+                continue
+            source_getter = getattr(node, "_registered_sound_source", None)
+            getter = getattr(node, "_hmb_sound_snapshot_for", None)
+            if not callable(source_getter) or not callable(getter) or source_getter() is not sound_source:
+                continue
+            try:
+                candidate = normalize_sound_snapshot(getter(channel_uuid=shot["channel_uuid"], shot_uuid=shot["shot_uuid"]))
+            except SoundError as exc:
+                if exc.code == "SOUND_SHOT_MISMATCH":
+                    continue
+                raise
+            if {row["instance_id"]: tuple(row.get(key) for key in ("source_uid", "path", "media_signature", "channel_uuid", "shot_uuid")) for row in candidate.get("tracks", [])} != base_sources:
+                raise ValueError("Prompt sound direction no longer matches the connected Sound originals.")
+            candidates.append(candidate)
+        if len(candidates) > 1:
+            raise ValueError("More than one Prompt owns sound direction for this Shot. Keep one exact Prompt binding.")
+        return copy.deepcopy(candidates[0]) if candidates else None
+
+    def _bound_sound_contract(self, state: Mapping[str, Any], nodes: list[Any], sound_source: Any) -> dict[str, Any]:
+        """Read only the completed video's plan, never today's mutable Prompt."""
+        from _hmb_shot_routing import _incoming_connections
+        import inspect
+        def actual(node: Any, kind: str) -> bool:
+            metadata = getattr(node, "metadata", {}) or {}
+            try:
+                path = Path(inspect.getfile(type(node))).resolve()
+            except (TypeError, OSError):
+                return False
+            return (type(node).__name__ == kind and path == Path(__file__).with_name(kind + ".py").resolve()
+                and metadata.get("library") == "HMB_GP_Production" and metadata.get("node_type") == kind
+                and not getattr(node, "_hmb_node_deleted", False))
+        shot, src = state["shot"], state["source"]
+        edges = [edge for edge in _incoming_connections(self) if edge.target_parameter_name == SOURCE]
+        if not edges:
+            raise ValueError("Shot Audio Mix requires the exact completed Generator video connection.")
+        if edges:
+            if len(edges) != 1 or edges[0].source_parameter_name != "HMB_GENERATED_VIDEO_SOURCE":
+                raise ValueError("The finishing video requires its exact completed Generator source.")
+            matches = [node for node in nodes if str(getattr(node, "name", "")) == edges[0].source_node_name]
+            if len(matches) != 1 or not actual(matches[0], "HMBSeedanceGeneration"):
+                raise ValueError("The finishing Generator is no longer available.")
+            generator = matches[0]
+            current = generator._hmb_generated_video_source_snapshot()
+            required = ("channel_uuid", "shot_uuid", "generation_id", "result_revision", "source_node_instance_id")
+            if (not isinstance(current, dict) or current.get("completed") is not True
+                    or not src.get("generation_id") or _source_identity(current) != _source_identity(src)
+                    or any(current.get(key) != src.get(key) for key in required)
+                    or (current.get("channel_uuid"), current.get("shot_uuid")) != (shot["channel_uuid"], shot["shot_uuid"])):
+                raise ValueError("The finishing video and captured Generator job no longer match.")
+            getter = getattr(generator, "_hmb_sound_finishing_snapshot", None)
+            captured = getter() if callable(getter) else {}
+            if captured:
+                origin = captured.get("origin") or {}
+                if (captured.get("generation_id") != src["generation_id"]
+                        or any(origin.get(key) != shot.get(key) for key in ("channel_uuid", "shot_uuid"))):
+                    raise ValueError("The completed video's sound contract belongs to a different job or Shot.")
+                if isinstance(captured.get("snapshot"), dict) and captured["snapshot"]:
+                    return copy.deepcopy(captured["snapshot"])
+        raise ValueError("이 완료 영상에는 생성 당시 사운드 기록이 없습니다. 현재 샷 사운드를 선택하세요.")
 
     def _upload_projection(self) -> dict[str, Any]:
         view = copy.deepcopy(self._web_upload)
@@ -832,8 +1019,11 @@ class HMBColorLUTLibrary(DataNode):
             raise ValueError("Verified export identity is unavailable.")
         proof = {"schema": "hmb-color-lut-local-export-v1", "source_identity": list(_source_identity(state["source"])),
                  "selection": _export_selection(state), "settings": normalize_settings(state["settings"]), "output": _output(state["output"]),
+                 "audio_mix": _audio_mix_identity(state),
                  "path": str(path), "size": info.st_size, "mtime_ns": info.st_mtime_ns,
                  "sha256": artifact["sha256"] if artifact else _file_digest(path, cancel), "job_id": result["job_id"]}
+        if state.get("audio_mix", {}).get("enabled"):
+            proof["sound_contract_sha256"] = result.get("sound_contract_sha256")
         # New exports retain the source title while using their actual delivery
         # container suffix. Older proofs keep their original idempotency identity.
         proof["upload_name_suffix"] = path.suffix.lower()
@@ -850,10 +1040,15 @@ class HMBColorLUTLibrary(DataNode):
             raise ValueError("현재 설정으로 최종 출력한 보정 영상이 필요합니다.")
         if proof.get("path") != result.get("path"):
             raise ValueError("보정 영상 경로가 변경되었습니다.")
+        if proof.get("sound_contract_sha256"):
+            current_sound = state.get("_sound_snapshot") if isinstance(state.get("_sound_snapshot"), dict) else self._capture_sound_snapshot(state)
+            if proof["sound_contract_sha256"] != _digest(current_sound):
+                raise ValueError("Sound direction changed. Export a new video before uploading.")
         path = Path(proof["path"]).resolve()
         info = path.stat()
         if (proof.get("schema") != "hmb-color-lut-local-export-v1" or _digest(proof) != result.get("web_export_proof")
                 or proof.get("settings") != normalize_settings(state["settings"])
+                or proof.get("audio_mix", normalize_audio_mix({})) != _audio_mix_identity(state)
                 or ("output" in proof and proof["output"] != _output(state["output"]))
                 or proof.get("source_identity") != list(_source_identity(state["source"]))
                 or proof.get("selection") != _export_selection(state) or proof.get("path") != str(path)
@@ -986,6 +1181,7 @@ class HMBColorLUTLibrary(DataNode):
         def prepare() -> None:
             retry = 0
             selected = None
+            monitored = None
             while True:
                 with self._lock:
                     if self._hmb_node_deleted:
@@ -994,13 +1190,22 @@ class HMBColorLUTLibrary(DataNode):
                     if self._web_upload_pending is not None:
                         selected, self._web_upload_pending = self._web_upload_pending, None
                         retry = 0
+                        monitored = None
                     if selected is None:
                         self._web_upload_probe = None
                         return
                     selected_stamp = self._upload_state_stamp(selected)
                     token, epoch = self._source_token, self._web_upload_epoch
+                    previous_view = self._web_upload
                     self._web_upload_wake.clear()
-                context, error, local_error = {}, "", False
+                if previous_view["phase"] == "uploading":
+                    monitored = None
+                    if self._upload_retry_wait(5):
+                        with self._lock:
+                            self._web_upload_probe = None
+                        return
+                    continue
+                context, error, local_error, offline = {}, "", False, False
                 try:
                     # Invalid local ownership/route is not an offline service.
                     # Do not hold a readiness worker waiting for the Broker.
@@ -1012,14 +1217,26 @@ class HMBColorLUTLibrary(DataNode):
                 try:
                     if local_error:
                         raise ValueError(error)
-                    context = self._prepare_upload_context(selected, recheck_file=False, artifact="source")
+                    if monitored is None:
+                        context = self._prepare_upload_context(selected, recheck_file=False, artifact="source")
+                    else:
+                        # Read reachability only while idle. Verify full ownership
+                        # again on recovery and before any actual upload.
+                        monitored["bridge"].review_capabilities()
+                        context = monitored
                 except Exception as exc:
                     error = str(exc)
+                    offline = not local_error and _upload_broker_offline(exc)
                 with self._lock:
                     if (self._hmb_node_deleted or selected_stamp != self._upload_state_stamp(self._hmb_color_lut_state)
                             or token != self._source_token or epoch != self._web_upload_epoch):
                         selected = None
+                        monitored = None
                         continue
+                    if self._web_upload is not previous_view:
+                        monitored = None
+                        continue
+                    old_context = self._web_upload_context
                     self._web_upload_context = context or {"state_stamp": selected_stamp, "source_token": token, "route_epoch": epoch}
                     receipt = _read_upload_receipt(context["receipt_id"]) if context else {}
                     complete = receipt.get("phase") == "complete"
@@ -1027,24 +1244,38 @@ class HMBColorLUTLibrary(DataNode):
                     reason = "원본 웹 업로드 완료" if complete else error or "최종 출력 없이 원본 영상을 바로 업로드합니다."
                     if context and context.get("library_shot_name") and context["library_shot_name"] != context.get("shot_name"):
                         reason += " 생성 당시 샷: " + context["shot_name"]
-                    self._web_upload = {"enabled": bool(context) and not complete, "phase": "complete" if complete else "unknown" if pending else "ready" if context else "unavailable",
-                                        "reason": reason}
-                    self._hmb_color_lut_state["revision"] += 1
-                try:
-                    self._publish()
-                except Exception:
-                    LOGGER.debug("Color LUT readiness notification deferred", exc_info=True)
-                if context or local_error:
+                    if offline:
+                        reason = "브로커가 응답하지 않아 웹 업로드를 사용할 수 없습니다."
+                    view = {"enabled": bool(context) and not complete, "phase": "complete" if complete else
+                            "unknown" if pending else "ready" if context else "offline" if offline else "unavailable",
+                            "reason": reason}
+                    changed = (view != self._web_upload or bool(context) != bool(old_context.get("bridge"))
+                               or any(old_context.get(key) != self._web_upload_context.get(key)
+                                      for key in ("state_stamp", "source_token", "route_epoch")))
+                    if changed:
+                        self._web_upload = view
+                        self._hmb_color_lut_state["revision"] += 1
+                if changed:
+                    try:
+                        self._publish()
+                    except Exception:
+                        LOGGER.debug("Color LUT readiness notification deferred", exc_info=True)
+                if local_error:
                     selected = None
+                    monitored = None
                     continue
-                # A held/offline Broker can become available later. One
-                # background worker retries advisory reads with backoff only;
-                # unchanged large files are not rehashed on those retries.
-                if self._upload_retry_wait(min(60, 5 * 2**min(retry, 4))):
+                # A successful probe expires too: an idle ready button cannot
+                # stay enabled after the Broker goes offline. This repeats
+                # only advisory reads; unchanged video bytes are not rehashed.
+                if context:
+                    retry = 0
+                monitored = context or None
+                if self._upload_retry_wait(30 if context else min(60, 5 * 2**min(retry, 4))):
                     with self._lock:
                         self._web_upload_probe = None
                     return
-                retry += 1
+                if not context:
+                    retry += 1
         self._web_upload_probe = threading.Thread(target=contextvars.copy_context().run, args=(prepare,), name="HMB LUT upload readiness", daemon=True)
         self._web_upload_probe.start()
 
@@ -1115,11 +1346,15 @@ class HMBColorLUTLibrary(DataNode):
         # Only upload_web or the explicit export_upload command may submit.
         if not chained and not self._upload_projection().get("enabled"):
             self._status("error", self._upload_projection().get("reason", "웹 업로드 준비가 필요합니다."))
+            # A command can carry the latest edit before the property update
+            # arrives. Keep it fail-closed, but recheck the newly captured state.
+            if self._web_upload_context.get("state_stamp") != self._upload_state_stamp(self._hmb_color_lut_state):
+                self._schedule_upload_probe()
             return
         self._web_upload = {"enabled": False, "phase": "uploading", "reason": "웹 업로드 중…"}
         cancel = self._cancel = cancel_event if cancel_event is not None else threading.Event()
         def upload() -> None:
-            identity, sent, claimed, retrieve, context, durable = "", False, False, False, {}, {}
+            identity, sent, claimed, retrieve, offline, context, durable = "", False, False, False, False, {}, {}
             try:
                 if cancel.is_set() or self._hmb_node_deleted:
                     return
@@ -1194,6 +1429,7 @@ class HMBColorLUTLibrary(DataNode):
                 except Exception:
                     LOGGER.debug("Color LUT optional upload usage metadata unavailable")
             except Exception as exc:
+                offline = not sent and _upload_broker_offline(exc)
                 absent = bool(sent and retrieve and (getattr(exc, "status_code", None) == 404 or getattr(exc, "code", None) == 404))
                 if sent and identity:
                     try:
@@ -1203,14 +1439,15 @@ class HMBColorLUTLibrary(DataNode):
                 with self._lock:
                     if (not self._hmb_node_deleted and self._upload_state_stamp(state) == self._upload_state_stamp(self._hmb_color_lut_state)
                             and (not context or context.get("source_token") == self._source_token and context.get("route_epoch") == self._web_upload_epoch)):
-                        self._web_upload = {"enabled": bool(sent), "phase": "ready" if absent else "unknown" if sent else "unavailable",
-                                            "reason": "서버에 업로드가 없습니다. 다시 누르면 동일 ID로 업로드합니다." if absent else _unknown_upload_reason(exc) if sent else str(exc)}
+                        self._web_upload = {"enabled": bool(sent), "phase": "ready" if absent else "unknown" if sent else "offline" if offline else "unavailable",
+                                            "reason": "서버에 업로드가 없습니다. 다시 누르면 동일 ID로 업로드합니다." if absent else _unknown_upload_reason(exc) if sent else
+                                            "브로커가 응답하지 않아 웹 업로드를 사용할 수 없습니다." if offline else str(exc)}
             finally:
                 with _UPLOAD_LOCK:
                     if claimed:
                         _UPLOAD_ACTIVE.discard(identity)
                 self._publish()
-                if artifact == "export":
+                if artifact == "export" or offline:
                     # The separate Web Upload button always represents the raw
                     # source. The output button retries its own frozen export.
                     with self._lock:
@@ -1235,7 +1472,7 @@ class HMBColorLUTLibrary(DataNode):
 
     def _remember_selection(self) -> None:
         self._hmb_color_lut_state["shot_states"][_selection_key(self._hmb_color_lut_state)] = copy.deepcopy({
-            key: self._hmb_color_lut_state[key] for key in ("settings", "output", "source", "result", "preset_name", "preset_id")})
+            key: self._hmb_color_lut_state[key] for key in ("settings", "audio_mix", "output", "source", "result", "preset_name", "preset_id")})
         while len(self._hmb_color_lut_state["shot_states"]) > 128:
             del self._hmb_color_lut_state["shot_states"][next(iter(self._hmb_color_lut_state["shot_states"]))]
 
@@ -1260,6 +1497,7 @@ class HMBColorLUTLibrary(DataNode):
         saved = self._hmb_color_lut_state["shot_states"].get(_selection_key(self._hmb_color_lut_state), {})
         saved = saved if isinstance(saved, Mapping) else {}
         self._hmb_color_lut_state["settings"] = normalize_settings(saved.get("settings"))
+        self._hmb_color_lut_state["audio_mix"] = normalize_audio_mix(saved.get("audio_mix"))
         self._hmb_color_lut_state["preset_name"] = str(saved.get("preset_name") or "")
         self._hmb_color_lut_state["preset_id"] = _profile_id(saved.get("preset_id"))
         self._hmb_color_lut_state["output"] = _output(saved.get("output"))
@@ -1339,6 +1577,7 @@ class HMBColorLUTLibrary(DataNode):
             else:
                 self._hmb_color_lut_state["shot"], self._hmb_color_lut_state["project_id"] = shot, project
                 self._hmb_color_lut_state["settings"] = normalize_settings(value.get("settings", self._hmb_color_lut_state["settings"]))
+                self._hmb_color_lut_state["audio_mix"] = normalize_audio_mix(value.get("audio_mix", self._hmb_color_lut_state["audio_mix"]))
                 self._hmb_color_lut_state["output"] = _output(value.get("output"))
                 if initial:
                     self._hmb_color_lut_state["result"] = copy.deepcopy(value.get("result")) if isinstance(value.get("result"), Mapping) else {}
@@ -1588,12 +1827,14 @@ class HMBColorLUTLibrary(DataNode):
                     authored_revision = self._hmb_color_lut_state["revision"]
                 self._hmb_color_lut_state["revision"] = max(self._hmb_color_lut_state["revision"], authored_revision) + 1
                 captured["settings"] = normalize_settings(authored.get("settings", captured["settings"]))
+                captured["audio_mix"] = normalize_audio_mix(authored.get("audio_mix", captured["audio_mix"]))
                 captured["preset_name"] = str(authored.get("preset_name") or "")[:80]
                 captured["preset_id"] = _profile_id(authored.get("preset_id", captured.get("preset_id")))
                 raw = authored.get("output")
                 if isinstance(raw, Mapping):
                     captured["output"] = _output(raw)
                 self._hmb_color_lut_state["settings"] = copy.deepcopy(captured["settings"])
+                self._hmb_color_lut_state["audio_mix"] = copy.deepcopy(captured["audio_mix"])
                 self._hmb_color_lut_state["output"] = copy.deepcopy(captured["output"])
                 self._hmb_color_lut_state["preset_name"] = captured["preset_name"]
                 self._hmb_color_lut_state["preset_id"] = captured["preset_id"]
@@ -1609,8 +1850,16 @@ class HMBColorLUTLibrary(DataNode):
             self._cancel = threading.Event()
             self._job_id = request_id
             if action in {"export", "export_upload"}:
+                if captured["audio_mix"]["enabled"]:
+                    try:
+                        captured["_sound_snapshot"] = self._capture_sound_snapshot(captured)
+                    except Exception as exc:
+                        self._status("error", str(exc))
+                        return
                 if action == "export_upload":
                     try:
+                        if self._upload_projection().get("phase") == "offline":
+                            raise ValueError("브로커가 응답하지 않아 웹 업로드를 사용할 수 없습니다.")
                         self._upload_source_context(captured)
                         if CODEC_EXTENSIONS[captured["output"]["codec"]] not in {".mov", ".mp4"}:
                             raise ValueError("웹 업로드에는 MOV 또는 MP4 출력 형식을 선택하세요.")
@@ -1713,6 +1962,7 @@ class HMBColorLUTLibrary(DataNode):
             "project": state.get("project", {}), "project_id": state["project_id"], "preset_name": state.get("preset_name", ""),
             "shot": state["shot"], "source_path": state["source"].get("path", ""), "output_path": result["path"],
             "generation_id": state["source"].get("generation_id", ""), "settings": state["settings"],
+            "audio_mix": _audio_mix_identity(state), "sound_tracks": result.get("sound_tracks", []),
             "codec": state["output"]["codec"], "lut_path": str(cube), "job_id": job_id}
         record["source_media"] = {key: state["source"].get(key) for key in ("width", "height", "fps", "duration", "pixel_format")}
         record["output_media"] = {key: result.get(key) for key in ("width", "height", "frame_rate", "duration", "video_codec", "pixel_format", "working_space", "cube_size", "interpolation", "color_assumptions")}
@@ -1955,7 +2205,16 @@ class HMBColorLUTLibrary(DataNode):
                     last_update[0] = now
                     if key == _selection_key(self._hmb_color_lut_state) and _source_identity(self._hmb_color_lut_state["source"]) == _source_identity(state["source"]) and not self._hmb_node_deleted:
                         self._status("working", "Encoding original source…", float(value))
-                result = export_video(source, destination, state["settings"], codec=codec, cancel_event=cancel, progress=progress)
+                audio_kwargs = {}
+                if state.get("audio_mix", {}).get("enabled"):
+                    from _hmb_sound import resolve_sound_tracks
+                    tracks = resolve_sound_tracks(state["_sound_snapshot"], channel_uuid=shot.get("channel_uuid", ""),
+                        shot_uuid=shot.get("shot_uuid", ""), project_id=state["_sound_snapshot"].get("project_id", ""))
+                    tracks = [track for track in tracks if track.get("purpose", "both") in {"mix", "both"}]
+                    audio_kwargs = {"sound_tracks": tracks, "original_audio": state["audio_mix"]["original_audio"]}
+                result = export_video(source, destination, state["settings"], codec=codec, cancel_event=cancel, progress=progress, **audio_kwargs)
+                if state.get("audio_mix", {}).get("enabled"):
+                    result["sound_contract_sha256"] = _digest(state["_sound_snapshot"])
             result = {**result, "shot": state["shot"], "project_id": state["project_id"], "settings": state["settings"], "job_id": job_id}
             if action in {"export", "export_upload"}:
                 self._finish_local_export(state, result, key, job_id, cancel)
@@ -1973,7 +2232,7 @@ class HMBColorLUTLibrary(DataNode):
 
     def _export_operation_stamp(self, state: Mapping[str, Any]) -> str:
         return _digest([_selection_key(state), _source_identity(state.get("source")),
-                        normalize_settings(state.get("settings")), _output(state.get("output")),
+                        normalize_settings(state.get("settings")), _audio_mix_identity(state), _output(state.get("output")),
                         state.get("manual_project")])
 
     def _continue_export_upload(self, state: dict[str, Any], cancel: threading.Event) -> None:
@@ -2035,6 +2294,12 @@ class HMBColorLUTLibrary(DataNode):
         self._route_status = copy.deepcopy(value)
         if isinstance(value, Mapping) and value.get("code") != "ready":
             with self._lock:
+                shot = self._hmb_color_lut_state["shot"]
+                # A successful Only reconciliation confirms there is no Shot
+                # route. Manual upload is owned by the local source and project.
+                if (value.get("code") == "only" and value.get("ok") is True
+                        and not shot.get("channel_uuid") and not shot.get("shot_uuid")):
+                    return
                 self._web_upload_context = {}
                 self._web_upload_probe_key = ""
                 self._web_upload_epoch += 1
@@ -2072,6 +2337,8 @@ class HMBColorLUTLibrary(DataNode):
     def _hmb_post_hydration_state_restore(self) -> None:
         with self._lock:
             state = self._hmb_color_lut_state
+            if not self._hmb_node_deleted and self._hydrated:
+                self._receive_sound(_raw_parameter(self, SOUND_IN))
             if not self._hmb_node_deleted and self._hydrated and not state["shot"].get("shot_uuid") and state["source"].get("path"):
                 self._queue_source(state["source"])
 
@@ -2123,6 +2390,8 @@ class HMBColorLUTLibrary(DataNode):
                 self._command(value)
             elif name == SOURCE:
                 self._queue_source(value)
+            elif name == SOUND_IN:
+                self._receive_sound(value)
             return result
 
     def process(self) -> None:
@@ -2132,6 +2401,7 @@ class HMBColorLUTLibrary(DataNode):
         # unconditional full-state publication here duplicates that large
         # payload and can stall the editor without changing any output.
         self._queue_source(_raw_parameter(self, SOURCE))
+        self._receive_sound(_raw_parameter(self, SOUND_IN))
 
     def after_node_deleted(self, *args: Any, **kwargs: Any) -> Any:
         with self._lock:

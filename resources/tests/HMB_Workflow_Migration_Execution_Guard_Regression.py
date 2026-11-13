@@ -7,6 +7,7 @@ from types import ModuleType, SimpleNamespace
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 tree = ast.parse((ROOT / '_hmb_library_bootstrap.py').read_text('utf-8'))
 method = next(item for owner in tree.body if isinstance(owner, ast.ClassDef)
               for item in owner.body if isinstance(item, ast.FunctionDef)

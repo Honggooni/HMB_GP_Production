@@ -55,6 +55,8 @@ class CGTWorkNode(unittest.TestCase):
    self.holder['state']=image._normalize_state(value);self.holder['published'].append(copy.deepcopy(self.holder['state']))
    return self.holder['state']
   self.node._publish_state=publish
+  self.holder['views']=[]
+  self.node._publish_widget_authority_view=lambda value:self.holder['views'].append(copy.deepcopy(value))
   self.node._set_thumbnail_bridge_value=lambda value:self.holder['responses'].append(copy.deepcopy(value))
   self.intent={'schema':image.THUMBNAIL_BRIDGE_SCHEMA,'version':1,'operation':'cgt_confirm','phase':'request',
    'request_id':guid(),'session_id':guid(),'runtime_instance_id':self.node._thumbnail_runtime_id(self.state),
@@ -76,6 +78,29 @@ class CGTWorkNode(unittest.TestCase):
   self.assertEqual(self.holder['state']['cgt_work_start_notice']['status'],'queued')
   self.node._queue_cgt_work_start(self.intent,self.state,self.holder['state']);self.drain('_hmb_cgt_work_thread');self.assertEqual(self.startmock.call_count,1)
   self.consume();self.assertEqual(self.holder['state']['cgt_work_start_notice']['status'],'completed')
+ def test_confirmation_never_uses_display_preparation(self):
+  with mock.patch('_hmb_shot_basket.prepared_cgt_reader',side_effect=AssertionError('display cache cannot authorize a commit')) as prepared:
+   self.commit()
+   prepared.assert_not_called()
+   self.assertEqual(self.catalogmock.call_count,1)
+   self.assertIsNotNone(self.catalogmock.call_args.kwargs['binding'])
+   self.assertEqual(self.holder['responses'][-1]['outcome'],'committed')
+ def test_cgt_commit_publishes_canonical_shots_before_terminal_ack(self):
+  original=self.node._set_thumbnail_bridge_value
+  def respond(value):
+   if value.get('outcome')=='committed':
+    self.assertEqual(len(self.holder['views']),1)
+    self.assertEqual(self.holder['views'][0]['shot_routing'],self.holder['state']['shot_routing'])
+    self.assertEqual(len(self.holder['views'][0]['shot_routing']['shots']),2)
+   original(value)
+  self.node._set_thumbnail_bridge_value=respond
+  self.commit()
+  self.assertEqual(self.holder['responses'][-1]['outcome'],'committed')
+ def test_view_transport_failure_does_not_rollback_committed_binding(self):
+  self.node._publish_widget_authority_view=mock.Mock(side_effect=RuntimeError('offline view fixture'))
+  self.commit()
+  self.assertEqual(self.holder['responses'][-1]['outcome'],'committed')
+  self.assertEqual(len(self.holder['state']['shot_routing']['shots']),2)
  def test_failed_publish_never_calls_start_or_changes_committed_state(self):
   def fail(value,**kwargs):
    if value.get('shot_hierarchy',{}).get('members'):raise RuntimeError('fixture publish failure')
@@ -161,5 +186,41 @@ class CGTWorkNode(unittest.TestCase):
   for a,b in zip(old['members'],new['members']):
    aa,bb=copy.deepcopy(a),copy.deepcopy(b);aa.pop('status');bb.pop('status');self.assertEqual(aa,bb)
   self.assertEqual(new['members'][0]['status'],'Work');self.assertEqual(new['members'][1]['parent_id'],old['members'][1]['parent_id'])
+
+ def test_open_dialog_survives_media_generation_and_factual_status_refresh(self):
+  self.commit();self.drain('_hmb_cgt_work_thread')
+  opened=copy.deepcopy(self.holder['state'])
+  binding=copy.deepcopy(opened['shot_hierarchy']);binding['revision']+=1
+  binding['members'][1]['parent_id']=None
+  command={'schema':routing.SHOT_HIERARCHY_REQUEST_SCHEMA,'version':1,
+   'expected_generation':opened['shot_routing']['generation'],
+   'expected_binding_revision':opened['shot_hierarchy']['revision'],
+   'expected_structure':routing.shot_hierarchy_edit_structure(opened),
+   'removed_member_ids':[],'binding':binding}
+  self.node._consume_cgt_work_results()
+  self.holder['state']['shot_routing']['generation']+=3
+  self.holder['state']['assets'][0].update(source_uid='latest-selection',selected=True)
+  self.holder['state']['shot_routing']['shots'][0]['selected_source_uids']=['latest-selection']
+  self.snapshot['tasks'][0]['status']='Work';self.catalogmock.return_value=copy.deepcopy(self.snapshot)
+  self.intent['hierarchy_request']=command;self.intent['request_id']=guid()
+  self.commit()
+  self.assertEqual(self.holder['responses'][-1]['outcome'],'committed')
+  saved=self.holder['state']
+  self.assertIsNone(saved['shot_hierarchy']['members'][1]['parent_id'])
+  self.assertEqual(saved['shot_hierarchy']['members'][0]['status'],'Work')
+  self.assertEqual(saved['shot_routing']['shots'][0]['selected_source_uids'],['latest-selection'])
+  self.assertEqual([r['shot_uuid'] for r in saved['shot_routing']['shots']],
+   [r['shot_uuid'] for r in opened['shot_routing']['shots']])
+
+ def test_stale_structural_confirm_returns_result_without_native_parameter_exception(self):
+  self.command['expected_structure']=routing.shot_hierarchy_edit_structure(self.state)
+  self.holder['state']['shot_routing']['generation']+=1
+  self.holder['state']['shot_routing']['shots'][0]['name']='A concurrently renamed Shot'
+  before=copy.deepcopy(self.holder['state'])
+  self.commit()
+  self.assertEqual(self.holder['responses'][-1]['outcome'],'rejected')
+  self.assertEqual(self.holder['responses'][-1]['state']['status'],'SOURCE_CHANGED')
+  self.assertEqual(self.holder['state'],before)
+  self.catalogmock.assert_not_called();self.startmock.assert_not_called()
 
 if __name__=='__main__':unittest.main(verbosity=2)

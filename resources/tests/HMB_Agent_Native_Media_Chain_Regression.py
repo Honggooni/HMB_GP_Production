@@ -79,13 +79,13 @@ def source_fixture(number, image_path):
                               label=f"Approved hero {number}", surface_2d=False)
     state["text"]["PRESERVED_TEXT"] = LITERAL
     state = prompt._normalize_state(state)
-    source = SimpleNamespace(name=f"Prompt {number}", _hmb_sync_lock=threading.RLock(),
-                             _hmb_current_shot_images=[str(image_path)],
-                             _hmb_current_shot_videos=[])
+    source = object.__new__(prompt.HMBPromptLibrary)
+    source.name = f"Prompt {number}"
+    source._hmb_sync_lock = threading.RLock()
+    source._hmb_current_shot_images = [str(image_path)]
+    source._hmb_current_shot_videos = []
     source._compile_current_prompt_pair = lambda **kw: (
         state, prompt._build_prompt_package(state), prompt._build_data_only_prompt_package(state), "fixture")
-    source._hmb_agent_reference_media = lambda expected: prompt.HMBPromptLibrary._hmb_agent_reference_media(source, expected)
-    source._hmb_agent_generation_context = lambda expected: prompt.HMBPromptLibrary._hmb_agent_generation_context(source, expected)
     settings = {
         "model_id": generator.MODEL_NAME_SEEDANCE_2_5,
         generator.TASK_PARAMETER: generator.TASK_REFERENCE_TO_VIDEO,
@@ -208,7 +208,12 @@ def run_current_native(source, renders, machine, structured=False, expected_pixe
         assert '"zero":0' in user and '"disabled":false' in user and '"unset":""' in user
         assert "HMB CURRENT GENERATOR SETTINGS" in user
         images = [] if isinstance(content, str) else [item for item in content if item["type"] == "image_url"]
-        assert len(images) == expected_pixels
+        assert len(images) == expected_pixels, {
+            "model_bound_images": len(images),
+            "expected_images": expected_pixels,
+            "source_media_count": len(source._hmb_agent_reference_media(machine).get("images", [])),
+            "observation": fixture.node._hmb_agent_reference_observation_snapshot(),
+        }
         assert str(source._hmb_current_shot_images[0]) not in user
         if structured:
             assert result.output == {"prompt": fixture.final_text}

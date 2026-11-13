@@ -56,6 +56,55 @@ const hmbNativeDeletionPending = new Map();
 const hmbNativeConnectionLibrary = "HMB_GP_Production";
 const hmbNativeConnectionNotices = new Map();
 function hmbNativeConnectionManaged(library) { return library === hmbNativeConnectionLibrary; }
+const hmbNativePassiveHeaderTypes = new Set([
+  "HMBImageAssetLibrary", "HMBSoundLibrary", "HMBVideoPickerLibrary", "HMBAnalysisAgent",
+]);
+function hmbNativeHeaderItems(nodeType, library, nativeItems) {
+  if (!hmbNativeConnectionManaged(library)) return nativeItems || ["lock", "run", "startFlow"];
+  return hmbNativePassiveHeaderTypes.has(nodeType) ? ["lock", "reset"] : ["lock", "reset", "run"];
+}
+const hmbNativeRebindPending = new Map();
+async function hmbNativeRefreshConnections(nodeName) {
+  const epoch = hmbNativeStudioFlowEpoch;
+  if (hmbNativeRebindPending.get(nodeName) === epoch) return;
+  hmbNativeRebindPending.set(nodeName, epoch);
+  try {
+    const scope = { node_name: nodeName };
+    const snapshot = hmbNativeConnectionSnapshot(await Xd.request(
+      "HMBGetNodeConnectionsRequest", scope, { timeoutMs: 10000 }), nodeName);
+    if (epoch !== hmbNativeStudioFlowEpoch) return;
+    if (snapshot.detached) {
+      hmbNativeOpenConnections(nodeName);
+      return;
+    }
+    if (snapshot.can_refresh !== true) {
+      ig.info("다시 적용할 연결을 확인하세요", { description: snapshot.connections.length
+        ? snapshot.details || "노드 잠금과 진행 중인 작업을 확인해 주세요." : "현재 연결된 소스가 없습니다." });
+      return;
+    }
+    const accepted = hmbNativeConnectionSnapshot(await Xd.request("HMBManageNodeConnectionsRequest", {
+      ...scope, operation: "refresh", expected_state_token: snapshot.state_token,
+    }, { timeoutMs: 10000 }), nodeName);
+    if (epoch === hmbNativeStudioFlowEpoch) {
+      if (accepted.refresh_confirmed !== null) hmbNativeConnectionDirty();
+      if (accepted.refresh_confirmed === false) {
+        ig.warning("일부 입력의 재적용을 확인하지 못했습니다", { description: accepted.details });
+      } else if (accepted.refresh_confirmed === null) {
+        ig.info("현재 연결을 확인했습니다", { description: accepted.details });
+      } else {
+        ig.success("연결을 다시 적용했습니다");
+      }
+    }
+  } catch (reason) {
+    if (epoch === hmbNativeStudioFlowEpoch) {
+      const description = vg(reason);
+      if (/timed out|timeout/i.test(description)) hmbNativeConnectionDirty();
+      ig.error("연결 재적용을 확인할 수 없습니다", { description });
+    }
+  } finally {
+    if (hmbNativeRebindPending.get(nodeName) === epoch) hmbNativeRebindPending.delete(nodeName);
+  }
+}
 function hmbNativeOpenConnections(nodeNames) {
   const names = [...new Set((Array.isArray(nodeNames) ? nodeNames : [nodeNames])
     .filter(name => typeof name === "string" && name.trim()))];
@@ -124,8 +173,10 @@ function hmbNativeConnectionSnapshot(value, nodeName) {
   if (!value || value.node_name !== nodeName || typeof value.state_token !== "string" || !value.state_token
     || typeof value.detached !== "boolean" || typeof value.can_disconnect !== "boolean"
     || typeof value.can_reconnect !== "boolean" || !Array.isArray(value.connections)
+    || (value.can_refresh !== undefined && typeof value.can_refresh !== "boolean")
+    || (value.refresh_confirmed != null && typeof value.refresh_confirmed !== "boolean")
     || (value.can_forget_missing !== undefined && typeof value.can_forget_missing !== "boolean")) {
-    throw Error("연결 목록을 확인할 수 없습니다. 새로고침해 주세요.");
+    throw Error("연결 목록을 확인할 수 없습니다. 상태를 다시 확인해 주세요.");
   }
   for (const row of value.connections) {
     if (!row || !["wire", "remote"].includes(row.kind)
@@ -228,6 +279,7 @@ function hmbUseNativeConnectionManager() {
   const manage = operation => {
     if (!view || !snapshot || pending.current || busy || error || view.epoch !== hmbNativeStudioFlowEpoch
       || !(operation === "disconnect" ? snapshot.can_disconnect : operation === "reconnect" ? snapshot.can_reconnect
+        : operation === "refresh" ? snapshot.can_refresh
         : operation === "forget_missing" && snapshot.can_forget_missing === true)) return;
     const current = ++sequence.current; pending.current = true; setBusy(true); setError("");
     Promise.resolve().then(() => Xd.request("HMBManageNodeConnectionsRequest", {
@@ -237,7 +289,7 @@ function hmbUseNativeConnectionManager() {
       const accepted = hmbNativeConnectionSnapshot(value, view.nodeName);
       // A committed action still needs saving when its dialog was dismissed
       // while awaiting the engine. It never reopens that dismissed dialog.
-      hmbNativeConnectionDirty();
+      if (operation !== "refresh" || accepted.refresh_confirmed !== null) hmbNativeConnectionDirty();
       if (current === sequence.current) setSnapshot(accepted);
     }).catch(async reason => {
       const timedOut = /timed out|timeout/i.test(vg(reason));
@@ -254,11 +306,11 @@ function hmbUseNativeConnectionManager() {
             }, { timeoutMs: 10000 }), view.nodeName);
             if (current === sequence.current && view.epoch === hmbNativeStudioFlowEpoch) {
               setSnapshot(observed);
-              setError("연결 변경 응답이 지연되어 현재 상태를 다시 조회했습니다. 새로고침으로 확인한 뒤 계속하세요.");
+              setError("연결 변경 응답이 지연되어 현재 상태를 다시 조회했습니다. 상태를 확인한 뒤 계속하세요.");
             }
           } catch (readError) {
             if (current === sequence.current && view.epoch === hmbNativeStudioFlowEpoch)
-              setError(`${vg(reason)} · 현재 연결 조회도 완료되지 않았습니다. 새로고침해 주세요. ${vg(readError)}`);
+              setError(`${vg(reason)} · 현재 연결 조회도 완료되지 않았습니다. 상태를 다시 확인해 주세요. ${vg(readError)}`);
           }
         }
       }
@@ -321,7 +373,9 @@ function hmbUseNativeConnectionManager() {
         row.shots.map(shot => `${shot.number == null ? "" : `${String(shot.number).padStart(2, "0")} · `}${typeof shot.name === "string" ? shot.name : ""}`).join(" / ")) : null))),
   el("footer", { style: { display: "flex", flexWrap: "wrap", gap: 10, justifyContent: "flex-end", padding: 18, borderTop: "1px solid #313c50" } },
     el("button", { type: "button", style: actionStyle(busy), disabled: busy,
-      onClick: () => setView(previous => previous ? { ...previous, nonce: previous.nonce + 1 } : previous) }, "새로고침"),
+      onClick: () => setView(previous => previous ? { ...previous, nonce: previous.nonce + 1 } : previous) }, "상태 확인"),
+    snapshot?.can_refresh === true ? el("button", { type: "button", style: actionStyle(busy || !!error),
+      disabled: busy || !!error, onClick: () => manage("refresh") }, "연결 다시 적용") : null,
     el("button", { type: "button", style: actionStyle(busy || !!error || !snapshot?.can_disconnect), disabled: busy || !!error || !snapshot?.can_disconnect, onClick: () => manage("disconnect") }, "연결 해제"),
     el("button", { type: "button", style: actionStyle(busy || !!error || !snapshot?.can_reconnect), disabled: busy || !!error || !snapshot?.can_reconnect, onClick: () => manage("reconnect") }, "다시 연결"),
     snapshot?.can_forget_missing === true ? el("button", { type: "button", style: actionStyle(busy || !!error),
@@ -462,6 +516,7 @@ function hmbNativeStudioRestoreFoldedStyles(node, current) {
 const hmbNativeStudioCompactSurfaces = {
   HMBImageAssetLibrary: "[data-library-toggle-surface=header]",
   HMBVideoPickerLibrary: "[data-picker-toggle-surface=header]",
+  HMBSoundLibrary: "[data-sound-toggle-surface=header]",
 };
 const hmbNativeStudioHeaderSurfaces = {
   HMBColorLUTLibrary: ".cl-head", HMBAgentLibrary: ".agent-topbar",
@@ -620,8 +675,11 @@ function hmbNativeStudioView(nodeType, node) {
   if (!selector || !node) return null;
   for (const surface of node.querySelectorAll(selector)) {
     if (!hmbNativeStudioVisible(surface, node)) continue;
-    const root = surface.closest(nodeType === "HMBImageAssetLibrary" ? ".hmb-image-assets" : ".hmbvp");
-    const compact = nodeType === "HMBImageAssetLibrary" ? root?.dataset.libraryCompact === "true" : root?.dataset.pickerView === "compact";
+    const root = surface.closest(nodeType === "HMBImageAssetLibrary" ? ".hmb-image-assets"
+      : nodeType === "HMBVideoPickerLibrary" ? ".hmbvp" : ".hmb-sound");
+    const compact = nodeType === "HMBImageAssetLibrary" ? root?.dataset.libraryCompact === "true"
+      : nodeType === "HMBVideoPickerLibrary" ? root?.dataset.pickerView === "compact"
+      : root?.dataset.soundView === "compact";
     return { surface, view: compact ? "compact" : "expanded" };
   }
   return null;
@@ -806,6 +864,34 @@ function hmbNativeStudioCollapsedHeader(nodeName, icon, headerStyle, expand, loc
       children: "Double Click to Unlock" })] });
 }
 
+function hmbBindNativeSoundSnapshot(container, nodeName, isCurrent) {
+  const node = container.closest(".react-flow__node[data-id]");
+  let retired = false;
+  const live = () => !retired && isCurrent() && container.isConnected && node?.isConnected
+    && node.getAttribute("data-id") === nodeName && container.closest(".react-flow__node[data-id]") === node;
+  const read = async event => {
+    const { expectedStreamId, receive } = event.detail || {};
+    if (event.target !== container || !live() || typeof receive !== "function"
+      || typeof expectedStreamId !== "string" || expectedStreamId.length > 128) return;
+    const session = Xd.getSessionId?.();
+    if (typeof session !== "string" || !session) return;
+    const epoch = hmbNativeStudioFlowEpoch;
+    try {
+      // Keep the editor's native session and request correlation. The node
+      // name is the verified owner above, never an argument from the widget.
+      const reply = await Xd.request("HMBGetSoundUISnapshotRequest", { node_name: nodeName,
+        ...(expectedStreamId ? { expected_stream_id: expectedStreamId } : {}) }, { timeoutMs: 5000 });
+      if (!live() || epoch !== hmbNativeStudioFlowEpoch || session !== Xd.getSessionId?.()
+        || reply?.node_name !== nodeName || reply.altered_workflow_state !== false) return;
+      const snapshot = reply.snapshot, stream = snapshot?.__hmb_sound_transport?.stream_id;
+      if (!snapshot || (expectedStreamId && stream !== expectedStreamId)) return;
+      receive(snapshot);
+    } catch { /* The widget owns bounded read retries and their status. */ }
+  };
+  container.addEventListener("hmb-sound-read-snapshot", read);
+  return () => { retired = true; container.removeEventListener("hmb-sound-read-snapshot", read); };
+}
+
 function hmbUseColorLUTNativeHeader(nodeType, nodeName, hostExpanded, doubleClick, restoreView, collapsed = false, metadata = null) {
   const [slots, setSlots] = (0, S.useState)(null);
   const current = (0, S.useRef)(null);
@@ -838,15 +924,23 @@ function hmbUseColorLUTNativeHeader(nodeType, nodeName, hostExpanded, doubleClic
   };
   (0, S.useLayoutEffect)(() => {
     if (!hmbIsNativeStudioType(nodeType, metadata)) return;
-    let cancelled = false, frame = null, attempts = 0;
+    let cancelled = false, frame = null, attempts = 0, releaseSoundRead = null;
+    const ownsSound = nodeType === "HMBSoundLibrary"
+      && hmbNativeStudioDeclaredContract(metadata)?.widget === "HMBSoundLibraryWidget";
     const discover = (container) => {
       if (cancelled || !container) return false;
       const candidate = { container,
         identity: container.querySelector?.("[data-hmb-native-identity]"),
         actions: container.querySelector?.("[data-hmb-native-actions]") };
       if (!valid(candidate)) return false;
-      if (current.current?.container !== container) notify(current.current?.container, false);
+      const replaced = current.current?.container !== container;
+      if (replaced) notify(current.current?.container, false);
       current.current = candidate;
+      if (ownsSound && replaced) {
+        releaseSoundRead?.();
+        releaseSoundRead = hmbBindNativeSoundSnapshot(container, nodeName,
+          () => !cancelled && current.current?.container === container);
+      }
       setSlots(previous => previous?.container === container && previous.identity === candidate.identity
         && previous.actions === candidate.actions ? previous : candidate);
       return true;
@@ -854,6 +948,7 @@ function hmbUseColorLUTNativeHeader(nodeType, nodeName, hostExpanded, doubleClic
     const ready = (event) => discover(event.detail?.container);
     const retire = (event) => {
       if (event.detail?.container !== current.current?.container) return;
+      releaseSoundRead?.(); releaseSoundRead = null;
       notify(current.current.container, false); current.current = null; setSlots(null);
     };
     const initial = () => {
@@ -872,6 +967,7 @@ function hmbUseColorLUTNativeHeader(nodeType, nodeName, hostExpanded, doubleClic
       if (frame !== null) cancelAnimationFrame(frame);
       document.removeEventListener("hmb-color-lut-header-ready", ready);
       document.removeEventListener("hmb-color-lut-header-retire", retire);
+      releaseSoundRead?.();
       notify(current.current?.container, false); current.current = null;
     };
   }, [nodeType, nodeName, metadata?.library, metadata?.hmb_native_studio_ui?.schema,

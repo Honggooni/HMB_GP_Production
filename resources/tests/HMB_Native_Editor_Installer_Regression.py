@@ -86,9 +86,31 @@ class NativeEditorInstall(unittest.TestCase):
             b"new synthetic helper\n/* END_HMB_COLOR_LUT_NATIVE_HEADER_PORTAL_V1 */\n")
         old_motion = b'E,(e,t,r)=>m({w:t,h:r}),d?f:void 0,d),Xd.request(`SetNodeMetadataRequest`'
         new_motion = b'E,(e,t,r)=>m({w:t,h:r}),d?f:hmbNativeStudioCapsuleDuration(_,s),d),Xd.request(`SetNodeMetadataRequest`'
-        suffix = b"\nvar D$t=({node_name:e,node_type:t,unchanged editor suffix\n" + old_motion + b"\n"
+        header_items = (
+            b'let e=hmbIsNativeStudioType(t)&&hmbNativeHeader.active?[`lock`,`reset`,`run`]:'
+            b'w.nodeHeaderItems||[`lock`,`run`,`startFlow`];return kQ.filter'
+        )
+        actions = (
+            (header_items, b'let e=hmbNativeHeaderItems(t,hmbLibrary,w.nodeHeaderItems);return kQ.filter'),
+            (b'[w.nodeHeaderItems,se,t,hmbNativeHeader.active]),ke=', b'[w.nodeHeaderItems,se,t,hmbLibrary]),ke='),
+            (b'(0,R.jsx)(nq,{children:`Reset Node`})]},`reset`)',
+             b'(0,R.jsx)(nq,{children:hmbNativeConnectionManaged(hmbLibrary)?`'
+             + "연결 다시 적용".encode("utf-8") + b'`:`Reset Node`})]},`reset`)'),
+            (b'LBt=e=>Xd.request(`ResetNodeToDefaultsRequest`,{node_name:e})',
+             b'LBt=(e,t)=>hmbNativeConnectionManaged(t)?hmbNativeRefreshConnections(e):'
+             b'Xd.request(`ResetNodeToDefaultsRequest`,{node_name:e})'),
+            (b'LBt(e.id).catch(Zdi)', b'LBt(e.id,e.data?.metadata?.library).catch(Zdi)'),
+            (b'await Xd.request(`ResetNodeToDefaultsRequest`,{node_name:e.node_name})',
+             b'await LBt(e.node_name,e.metadata?.library)'),
+            (b'await Xd.request(`ResetNodeToDefaultsRequest`,{node_name:t.id})',
+             b'await LBt(t.id,t.data?.metadata?.library)'),
+        )
+        prefix = b"\nvar D$t=({node_name:e,node_type:t,unchanged editor suffix\n"
+        # Selection and context menus contain distinct calls with identical syntax.
+        suffix = prefix + b"\n".join(before for before, _ in (*actions, actions[-1])) + b"\n" + old_motion + b"\n"
+        upgraded = prefix + b"\n".join(after for _, after in (*actions, actions[-1])) + b"\n" + new_motion + b"\n"
         previous = b"unchanged editor prefix\n" + old_helper + suffix
-        self.candidate = (b"unchanged editor prefix\n" + new_helper + suffix).replace(old_motion, new_motion, 1)
+        self.candidate = b"unchanged editor prefix\n" + new_helper + upgraded
         self.m.HELPER.write_bytes(new_helper)
         self.m.SUPPORTED_PREVIOUS_CANDIDATE_SHA256 = self.m.sha256(previous)
         self.m.SUPPORTED_PREVIOUS_HELPER_SHA256 = self.m.sha256(old_helper)
@@ -100,7 +122,7 @@ class NativeEditorInstall(unittest.TestCase):
         self.m.DEFAULT_SOURCE.write_bytes(previous)
         return previous
 
-    def test_previous_candidate_upgrade_only_replaces_verified_helper_and_backs_up_previous(self):
+    def test_previous_candidate_upgrade_applies_verified_seams_and_backs_up_previous(self):
         previous = self.previous_candidate()
         path = self.prepare()
         self.transform.assert_not_called()

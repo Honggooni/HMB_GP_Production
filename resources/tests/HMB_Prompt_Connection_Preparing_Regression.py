@@ -127,6 +127,31 @@ class PromptConnectionPreparationTests(unittest.TestCase):
                 self.assertEqual(self.node.parameter_output_values,old)
                 schedule.assert_not_called()
 
+    def test_picker_catalog_wait_refreshes_dashboard_only_and_rebind_reports_pending(self):
+        del self.node._sync_prompt_output_from_state
+        self.node._reconcile_shared_shot_edges = Mock()
+        self.node._hmb_picker_route_hydration_pending = True
+        self.node._hmb_prompt_pair_waiting_for_picker = True
+        dashboard = {"images": [{"label": "Verified image"}]}
+        self.node._write_dashboard_state = Mock(return_value=dashboard)
+        self.node._compiled_prompt_pair_for_state = Mock()
+        previous = copy.deepcopy(self.node.parameter_output_values)
+        self.assertIs(
+            self.node._sync_prompt_output_from_state(
+                allow_picker_hydration_pending=True, publish_shot_media=True,
+            ),
+            dashboard,
+        )
+        self.node._write_dashboard_state.assert_called_once_with(
+            allow_picker_hydration_pending=True,
+        )
+        self.node._compiled_prompt_pair_for_state.assert_not_called()
+        self.assertEqual(self.node.parameter_output_values, previous)
+        self.assertTrue(self.node._hmb_sync_publish_shot_media_pending)
+        with self.assertRaisesRegex(prompt._ShotRoutingContractError, "restoring"):
+            self.node._compile_current_prompt_pair(refresh_sources=False)
+        self.assertFalse(self.node._reconcile_initial_prompt_hydration())
+
     def test_deleted_node_never_retries_or_publishes(self):
         self.node._hmb_node_deleted=True
         old=copy.deepcopy(self.node.parameter_output_values)

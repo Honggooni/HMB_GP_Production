@@ -255,7 +255,8 @@ class NativeEditorCoordinator(unittest.TestCase):
             bundle_name='index-DEZU41rc.js',helper_path='resources/editor/hmb-color-lut-native-header.js',
             patcher_path='tools/hmb_color_lut_native_header_patch.py',candidate_sha256='a'*64)
         self.update_descriptor()
-        constants={'_HMB_NATIVE_EDITOR_STATE_MODULE','_HMB_NATIVE_EDITOR_RESPONSE_LIMIT','_HMB_NATIVE_EDITOR_TIMEOUT_SECONDS'}
+        constants={'_HMB_NATIVE_EDITOR_STATE_MODULE','_HMB_NATIVE_EDITOR_RESPONSE_LIMIT','_HMB_NATIVE_EDITOR_TIMEOUT_SECONDS',
+            '_HMB_EDITOR_0130_OVERLAY_SHA256','_HMB_EDITOR_0130_ENTRY_SHA256'}
         nodes=[n for n in TREE.body if isinstance(n,ast.FunctionDef) and
             (n.name.startswith('_hmb_native_editor_') or n.name=='_hmb_coordinate_native_editor_update') or
             isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id in constants for t in n.targets)]
@@ -506,7 +507,8 @@ from pathlib import Path
 from uuid import UUID
 source,folder,documents=map(Path,sys.argv[1:])
 tree=ast.parse(source.read_text('utf-8'))
-names={'_HMB_NATIVE_EDITOR_STATE_MODULE','_HMB_NATIVE_EDITOR_RESPONSE_LIMIT','_HMB_NATIVE_EDITOR_TIMEOUT_SECONDS'}
+names={'_HMB_NATIVE_EDITOR_STATE_MODULE','_HMB_NATIVE_EDITOR_RESPONSE_LIMIT','_HMB_NATIVE_EDITOR_TIMEOUT_SECONDS',
+    '_HMB_EDITOR_0130_OVERLAY_SHA256','_HMB_EDITOR_0130_ENTRY_SHA256'}
 nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and (n.name.startswith('_hmb_native_editor_') or n.name=='_hmb_coordinate_native_editor_update') or isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id in names for t in n.targets)]
 scope=dict(Path=Path,Any=object,sys=sys,os=os,hashlib=hashlib,json=json,threading=threading,logging=logging,types=types,weakref=weakref,UUID=UUID,__file__=str(folder/'_hmb_library_bootstrap.py'),__name__='private_process_fixture',_LIBRARY_NAME='HMB_GP_Production')
 exec(compile(ast.Module(body=nodes,type_ignores=[]),str(source),'exec'),scope)

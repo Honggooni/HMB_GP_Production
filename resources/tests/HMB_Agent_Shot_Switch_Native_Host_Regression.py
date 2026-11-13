@@ -52,8 +52,14 @@ def exercise(engine):
     source.add_parameter(Parameter(name="tool_state", type="Tool", default_value=None, allowed_modes={ParameterMode.OUTPUT}))
     for item in (node, source):
         flow.add_node(item)
-        engine.object_manager.add_object_by_name(item.name, item)
-        engine.node_manager._name_to_parent_flow_name[item.name] = flow.name
+        add_in = getattr(engine.object_manager, "add_object_by_name_in", None)
+        if callable(add_in):
+            workflow = engine.current_workflow()
+            add_in(workflow, item.name, item)
+            workflow.nodes.name_to_parent_flow_name[item.name] = flow.name
+        else:
+            engine.object_manager.add_object_by_name(item.name, item)
+            engine.node_manager._name_to_parent_flow_name[item.name] = flow.name
     children = {key: node.get_parameter_by_name(key).append_child_parameter()
                 for key in ("tools", "rulesets")}
     for name, child in children.items():

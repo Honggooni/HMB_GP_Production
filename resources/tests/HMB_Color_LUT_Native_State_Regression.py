@@ -40,9 +40,8 @@ def main():
                 flow = engine.flow_manager.get_flow_by_name(ensured.flow_name)
                 with mock.patch.object(routing, "schedule_post_registration_reconcile"), mock.patch.object(routing, "reconcile_shot_routing"):
                     node = lut.HMBColorLUTLibrary(name="HMB Color LUT State Regression")
-                    flow.add_node(node)
-                    engine.object_manager.add_object_by_name(node.name, node)
-                    engine.node_manager._name_to_parent_flow_name[node.name] = flow.name
+                    from _hmb_fixture_sdk import register_fixture_node
+                    register_fixture_node(engine, flow, node)
                     assert "VIDEO_IN" not in {p.name for p in node.parameters}
 
                     def send(value):

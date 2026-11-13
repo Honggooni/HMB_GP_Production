@@ -158,15 +158,30 @@ try {
   assert.equal(await page.locator(`[data-hier-parent="${ids[1]}"]`).inputValue(),memberKey(0));
   assert.equal(await page.locator(`[data-hier-parent="${ids[2]}"]`).inputValue(),memberKey(1));
   assert.equal(await page.locator(`[data-hier-remove="${ids[0]}"]`).isDisabled(),true,'A representative cannot be detached while its children remain');checks+=2;
-  // A background host remount preserves the draft/dialog; a new Shot
-  // generation makes its eventual confirmation fail without any host write.
+  // A background catalog/selection revision preserves the same authored
+  // hierarchy and permits unchanged confirmation without a redundant write.
   await page.evaluate(()=>{window.host.scan_revision++;window.controller.update(window.props());});
   assert.equal(await page.locator('[data-shot-hierarchy-dialog]').evaluate(node=>node.open),true);
   await page.evaluate(()=>{window.host.shot_routing.generation++;window.controller.update(window.props());});
   await page.locator('[data-hier-confirm]').click();
+  assert.equal(await page.locator('[data-shot-hierarchy-dialog]').count(),0);
+  assert.equal(await page.evaluate(()=>window.writes.length),1);
+  // A real concurrent authored edit still refuses the stale dialog.
+  await openShots().click();
+  await page.evaluate(()=>{
+    const binding=structuredClone(window.host.shot_hierarchy);binding.revision++;
+    const parsed=window.w.hmbHierarchyParseName('e201s099c001__');
+    Object.assign(binding.members[0],{source_name:parsed.source_name,canonical_name:parsed.canonical_name});
+    window.host=window.w.hmbApplyShotHierarchyEdit(window.host,{schema:'hmb-shot-hierarchy-edit',version:1,
+      expected_generation:window.host.shot_routing.generation,expected_binding_revision:window.host.shot_hierarchy.revision,
+      binding,removed_member_ids:[]});
+    window.controller.update(window.props());
+  });
+  await page.locator('[data-hier-confirm]').click();
   assert.match(await page.locator('[data-hier-message]').innerText(),/변경/);
   assert.equal(await page.evaluate(()=>window.writes.length),1);
   await page.keyboard.press('Escape');
+  await page.evaluate(value=>window.openGraph(JSON.parse(value)),saved);
   // Narrow native modal remains readable/scrollable with all controls.
   await page.setViewportSize({width:600,height:850});await openShots().click();
   const bounds=await page.locator('[data-shot-hierarchy-dialog]').boundingBox();

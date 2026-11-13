@@ -7,6 +7,7 @@ token, password, or account session is returned to the node or written to disk.
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import io
 import json
@@ -18,6 +19,8 @@ import ssl
 import stat
 import subprocess
 import sys
+from threading import Event, RLock, Thread
+from time import monotonic
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -26,7 +29,76 @@ WORK_START_PLAN_SCHEMA = "hmb-cgt-work-start-plan-v1"
 WORK_START_RESULT_SCHEMA = "hmb-cgt-work-start-result-v1"
 TRUST_ROOT_SHA256 = "1576e52257f9880faf65020926bcd6f77d57dbaed3dd88243e9dd3987fc006b1"
 MAX_TASKS = 2000
+CATALOG_TIMEOUT_SECONDS = 24
 _GUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+
+
+class CatalogPreparation:
+    """One workspace's disposable, read-only catalog preparation.
+
+    Never used for confirmation or Work writes: those always authenticate and
+    validate the selected task identities again. No login/token data is cached.
+    """
+    def __init__(self):
+        self.lock = RLock()
+        self.job = None
+        self.thread = None
+
+    def prepare(self, project_id=""):
+        if not isinstance(project_id, str) or (project_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", project_id)):
+            return
+        with self.lock:
+            if self.job and self.job["project"] == project_id and monotonic() - self.job["started"] < 15:
+                return
+            if self.job:
+                self.job["cancel"].set()
+            self.job = {"project": project_id, "started": monotonic(), "cancel": Event(), "done": Event(), "result": None}
+            if self.thread is not None:
+                return
+            self.thread = Thread(target=self._worker, name="HMB-CGT-prepare", daemon=True)
+            self.thread.start()
+
+    def _worker(self):
+        while True:
+            with self.lock:
+                job = self.job
+            try:
+                result = catalog(job["project"], cancel=job["cancel"])
+            except Exception:
+                result = _failure("SDK_UNAVAILABLE")
+            with self.lock:
+                job["result"] = result
+                job["done"].set()
+                if self.job is job:
+                    self.thread = None
+                    return
+
+    def reader(self, project_id):
+        with self.lock:
+            job = self.job
+            if (not job or job["project"] != project_id or job["cancel"].is_set()
+                    or monotonic() - job["started"] >= 15):
+                return None
+            # Take once: a deliberate refresh must perform a new authenticated
+            # read, and an old dialog must not consume another project's result.
+            if job.get("taken"):
+                return None
+            job["taken"] = True
+
+        def read(cancel):
+            deadline = monotonic() + CATALOG_TIMEOUT_SECONDS
+            while not job["done"].wait(.05):
+                if cancel.is_set() or job["cancel"].is_set() or monotonic() >= deadline:
+                    return _failure("TIMEOUT")
+            if cancel.is_set() or job["cancel"].is_set():
+                return _failure("TIMEOUT")
+            return copy.deepcopy(job["result"])
+        return read
+
+    def cancel(self):
+        with self.lock:
+            if self.job:
+                self.job["cancel"].set()
 
 
 def _failure(code: str) -> dict[str, Any]:
@@ -54,14 +126,39 @@ def _owners(value: Any) -> set[str]:
     raise ValueError("SOURCE_SCHEMA")
 
 
+def _run_catalog_child(args: list[str], payload: bytes, env: dict[str, str],
+                       options: dict[str, Any], cancel: Event | None) -> subprocess.CompletedProcess:
+    if cancel is None:
+        return subprocess.run(args, input=payload, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=CATALOG_TIMEOUT_SECONDS, env=env, **options)
+    deadline = monotonic() + CATALOG_TIMEOUT_SECONDS
+    pending_input: bytes | None = payload
+    with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, env=env, **options) as child:
+        try:
+            while not cancel.is_set() and (remaining := deadline - monotonic()) > 0:
+                try:
+                    stdout, _ = child.communicate(pending_input, timeout=min(remaining, 0.2))
+                    return subprocess.CompletedProcess(args, child.returncode, stdout)
+                except subprocess.TimeoutExpired:
+                    pending_input = None
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate()
+    raise subprocess.TimeoutExpired(args, CATALOG_TIMEOUT_SECONDS)
+
+
 def catalog(project_id: str = "", *, binding: dict[str, Any] | None = None,
-            cgt_project_id: str | None = None) -> dict[str, Any]:
+            cgt_project_id: str | None = None, cancel: Event | None = None) -> dict[str, Any]:
     """Finite child process; never import the vendor SDK into the engine."""
     if (not isinstance(project_id, str) or (project_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", project_id))
             or (binding is not None and not project_id)):
         return _failure("SELECT_GP_PROJECT")
     if cgt_project_id is not None and (not isinstance(cgt_project_id, str) or not _GUID.fullmatch(cgt_project_id)):
         return _failure("PROJECT_UNAVAILABLE")
+    if cancel is not None and cancel.is_set():
+        return _failure("TIMEOUT")
     allowed = {"SYSTEMROOT", "WINDIR", "PATH", "APPDATA", "LOCALAPPDATA", "USERPROFILE",
                "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP", "HMB_CGT_SDK_PATH"}
     env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
@@ -70,9 +167,9 @@ def catalog(project_id: str = "", *, binding: dict[str, Any] | None = None,
     if os.name == "nt":
         options["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
-        result = subprocess.run([sys.executable, "-I", "-B", str(Path(__file__).resolve()), "--read-own"],
-            input=json.dumps({"project_id": project_id, "cgt_project_id": cgt_project_id, "binding": binding}).encode("utf-8"),
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=40, env=env, **options)
+        args = [sys.executable, "-I", "-B", str(Path(__file__).resolve()), "--read-own"]
+        payload = json.dumps({"project_id": project_id, "cgt_project_id": cgt_project_id, "binding": binding}).encode("utf-8")
+        result = _run_catalog_child(args, payload, env, options, cancel)
         if result.returncode or len(result.stdout) > 2 * 1024 * 1024:
             return _failure("SDK_UNAVAILABLE")
         data = json.loads(result.stdout)
@@ -535,7 +632,13 @@ def _read_own(request: dict[str, Any], *, _after_read=None) -> dict[str, Any]:
     # Return the signed-in client's actual visible projects. A GP token only
     # chooses the initial default; a separate immutable CGT ID chooses a
     # browsing source. Database names always come from this authenticated read.
-    ids = tw.project.get_id([])
+    scoped_project = (binding.get("cgt_scope") or {}).get("project_id") if binding is not None else None
+    if scoped_project is not None:
+        scoped_project = _id(scoped_project)
+        if selected_project_id and selected_project_id.lower() != scoped_project.lower():
+            return _failure("SOURCE_CHANGED")
+        selected_project_id = scoped_project
+    ids = [scoped_project] if scoped_project else tw.project.get_id([])
     sources = tw.project.get(ids, ["project.id", "project.entity", "project.full_name", "project.database", "project.status"]) if ids else []
     projects = [{"id": _id(source["project.id"]), "entity": _text(source["project.entity"]),
                  "name": _text(source["project.full_name"]), "database": _text(source["project.database"]),
@@ -566,9 +669,10 @@ def _read_own(request: dict[str, Any], *, _after_read=None) -> dict[str, Any]:
 
     db = project["database"]
     needed = ["task.id", "shot.id", "eps.entity", "shot.entity", "pipeline.id", "pipeline.entity", "task.account_id", "task.artist", "task.status"]
-    fields = {item["sign"] for item in tw.task.fields_and_str(db, "shot")}
-    if not set(needed).issubset(fields):
-        return task_failure("SOURCE_SCHEMA")
+    if binding is None:
+        fields = {item["sign"] for item in tw.task.fields_and_str(db, "shot")}
+        if not set(needed).issubset(fields):
+            return task_failure("SOURCE_SCHEMA")
     # 'has' is the installed CGT plugin's own-task operator for the account
     # assignment field. Equality on this multi-account field returns no rows.
     query = [["task.account_id", "has", account], "and", ["pipeline.entity", "=", "AI_Shot"]]
@@ -590,6 +694,8 @@ def _read_own(request: dict[str, Any], *, _after_read=None) -> dict[str, Any]:
         if len(data) != len(page):
             return task_failure("SOURCE_CHANGED")
         for row in data:
+            if not isinstance(row, dict) or not all(field in row for field in needed):
+                return task_failure("SOURCE_SCHEMA")
             if account.lower() not in _owners(row["task.account_id"]) or row["pipeline.entity"] != "AI_Shot":
                 return task_failure("OWNERSHIP_CHANGED")
             task_id = _id(row["task.id"])

@@ -9,6 +9,18 @@ import {prepareNativeEditor,nativeTestPlaywright} from './_hmb_native_editor_fix
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const {original,patched}=prepareNativeEditor(root);
 const helper = fs.readFileSync(path.join(root, "resources/editor/hmb-color-lut-native-header.js"), "utf8");
+const currentPath = process.env.HMB_CONNECTION_EDITOR_CANDIDATE;
+const current = currentPath ? fs.readFileSync(currentPath, "utf8") : null;
+const currentHelper = current?.slice(current.indexOf("/* HMB_COLOR_LUT_NATIVE_HEADER_PORTAL_V1"),
+  current.indexOf("\nvar k8t=({node_name:"));
+if (current) {
+  assert.ok(currentHelper?.includes("function hmbNativeRefreshConnections("));
+  assert.match(current, /hmbNativeHeaderItems\(t,hmbLibrary,w\.nodeHeaderItems\);return x8t\.filter/);
+  assert.match(current, /await xKt\(e,i\(\)\.find\(node=>node\.id===e\)\?\.data\?\.metadata\?\.library\)/);
+  assert.equal(current.split("await xKt(t.id,t.data?.metadata?.library)").length - 1, 2);
+  assert.match(current, /xKt\(e\.id,e\.data\?\.metadata\?\.library\)\.catch\(QAi\)/);
+  assert.equal(current.split('Id.request(`ResetNodeToDefaultsRequest`').length - 1, 1);
+}
 const alias = original.indexOf("S=u(p(),1),C=h(),w=x(),T=u(y())");
 const runtime = original.slice(0, original.indexOf(",E=`modulepreload`", alias)) + ";";
 const jsxStart = original.indexOf("var Wn=s("), jsxEnd = original.indexOf("function Gn(", jsxStart);
@@ -22,9 +34,9 @@ const app = String.raw`
 var H8='native-menu-item',U8='menu-icon',W8='menu-label';
 window.sdk=[];window.actions=[];window.notices=[];window.held=[];window.deferNext=false;window.failNext=false;window.dirty=0;
 var kq={getState:()=>({setDirty:value=>{if(value)window.dirty++}})};
-var ig={warning:(...v)=>window.notices.push(v),error:(...v)=>window.notices.push(v)},vg=e=>e?.message||String(e);
+var ig=Object.fromEntries(['warning','error','info','success'].map(level=>[level,(...v)=>window.notices.push(v)])),vg=e=>e?.message||String(e);
 window.inventory=new Map();
-const initial=name=>({node_name:name,detached:false,state_token:'token-'+name+'-0',can_disconnect:true,can_reconnect:false,details:'',connections:[
+const initial=name=>({node_name:name,detached:false,state_token:'token-'+name+'-0',can_disconnect:true,can_reconnect:false,can_refresh:true,details:'',connections:[
 {kind:'wire',peer_name:'Video peer',source_node_name:'Video peer',target_node_name:name,source_parameter_name:'video',target_parameter_name:'input',shots:[]},
 {kind:'remote',peer_name:'Prompt peer',source_node_name:name,target_node_name:'Prompt peer',source_parameter_name:'',target_parameter_name:'',shots:[{channel_uuid:'channel-kept',shot_uuid:'shot-kept',number:2,name:'Original Shot Name'}]}]});
 var Xd={request:async(type,payload)=>{
@@ -38,19 +50,20 @@ var Xd={request:async(type,payload)=>{
   if(payload.expected_state_token!==previous.state_token)throw Error('Synthetic stale state token');
   const detached=payload.operation==='disconnect';
   window.inventory.set(payload.node_name,{...initial(payload.node_name),detached,connections:initial(payload.node_name).connections,
-   state_token:previous.state_token+'-next',can_disconnect:!detached,can_reconnect:detached,can_forget_missing:false});
+   state_token:previous.state_token+'-next',can_disconnect:!detached,can_reconnect:detached,can_refresh:!detached,can_forget_missing:false,
+   refresh_confirmed:payload.operation==='refresh'?(window.refreshResult??true):null});
  }else if(type!=='HMBGetNodeConnectionsRequest')throw Error('Forbidden synthetic request '+type);
  return structuredClone(window.inventory.get(payload.node_name));
 }};
-const names=['HMBColorLUTLibrary','HMBAgentLibrary','HMBFinishLookLibrary','HMBImageAssetLibrary','HMBImageBash','HMBImageGeneration','HMBSeedanceGeneration','HMBPromptLibrary','HMBVideoPickerLibrary','FutureArbitraryTool'];
+const names=['HMBColorLUTLibrary','HMBAgentLibrary','HMBFinishLookLibrary','HMBImageAssetLibrary','HMBImageBash','HMBImageGeneration','HMBSeedanceGeneration','HMBPromptLibrary','HMBVideoPickerLibrary','HMBSoundLibrary','HMBAnalysisAgent','FutureArbitraryTool'];
 window.nativeItems=(0,R.jsx)('div',{'data-native-menu-original':true,children:['Copy','Duplicate','Reset','Delete'].map(label=>(0,R.jsx)('button',{onClick:()=>window.actions.push(label),children:label},label))});
 function Shell(){
  const manager=hmbUseNativeConnectionManager();
  const [menu,setMenu]=(0,S.useState)(null);
- const controls=name=>(0,R.jsx)('div',{'data-original-actions':name,style:{display:'flex',gap:12},children:['lock','reset','run'].map(action=>(0,R.jsx)('button',{onClick:()=>window.actions.push(name+':'+action),children:action},action))});
+ const controls=(name,library='HMB_GP_Production')=>(0,R.jsx)('div',{'data-original-actions':name,style:{display:'flex',gap:12},children:hmbNativeHeaderItems(name,library,['lock','reset','run']).map(action=>(0,R.jsx)('button',{onClick:()=>action==='reset'&&library==='HMB_GP_Production'?hmbNativeRefreshConnections(name):window.actions.push(name+':'+action),children:action},action))});
  return (0,R.jsxs)(R.Fragment,{children:[manager,...names.map(name=>(0,R.jsxs)('div',{'data-node':name,style:{display:'flex',alignItems:'center',gap:20,margin:4},children:[
   (0,R.jsx)('span',{style:{width:220},children:name}),hmbNativeConnectionActions(name,'HMB_GP_Production',controls(name),'native-button',{color:'#aabbcc'})]},name)),
-  (0,R.jsx)('div',{'data-non-hmb':true,children:hmbNativeConnectionActions('ordinary','Elsewhere',controls('ordinary'),'native-button',{})}),
+  (0,R.jsx)('div',{'data-non-hmb':true,children:hmbNativeConnectionActions('ordinary','Elsewhere',controls('ordinary','Elsewhere'),'native-button',{})}),
   (0,R.jsx)('div',{'data-native-capsule-owner':true,onContextMenu:event=>{event.preventDefault();setMenu(true);},children:hmbNativeStudioCollapsedHeader('Capsule','image',{},()=>window.actions.push('capsule-expand'),false,false)}),
   menu?hmbNativeConnectionMenu({hmbConnectionNode:{id:'Capsule',data:{metadata:{library:'HMB_GP_Production'}}},hmbClose:()=>setMenu(null)},window.nativeItems):null,
   (0,R.jsx)('div',{'data-non-hmb-menu':true,children:hmbNativeConnectionMenu({hmbConnectionNode:{id:'ordinary',data:{metadata:{library:'Elsewhere'}}}},window.nativeItems)})]});
@@ -59,23 +72,46 @@ window.root=w.createRoot(document.getElementById('app'));window.mount=()=>window
 window.open=hmbNativeOpenConnections;window.reset=hmbNativeStudioResetCollapseIntents;window.deleteNotice=hmbNativeConnectionDeletionNotice;
 window.snapshotValidation=(value,name)=>{try{return !!hmbNativeConnectionSnapshot(value,name)}catch{return false}};
 `;
-const module = runtime + "\n" + jsx + "\n" + helper + "\n" + app;
+const module = runtime + "\n" + jsx + "\n" + (currentHelper
+  ? "(()=>{const C=S,z=R,Cl=T;\n" + currentHelper + "\n" + app
+    + "\nconst Id=Xd,CJ=ig,__r=vg,vY=kq,L8=H8,R8=U8,z8=W8;})();"
+  : helper + "\n" + app);
 const html = '<!doctype html><meta charset="utf-8"><title>Isolated HMB connection manager</title><style>body{background:#172031;color:#eee;font:14px sans-serif}button{cursor:pointer}button:disabled{opacity:.45;cursor:default}.native-menu-item{display:flex;gap:12;padding:9px}.hmb-native-capsule{margin:15px}</style><div id="app"></div><script type="module" src="/fixture.js"></script>';
 const server = http.createServer((req, res) => { res.setHeader("Content-Type", req.url === "/fixture.js" ? "text/javascript" : "text/html"); res.end(req.url === "/fixture.js" ? module : html); });
 await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
 const { chromium } = nativeTestPlaywright();
-let browser, checks = 5;
+let browser, checks = current ? 11 : 5;
 try {
   browser = await chromium.launch({ executablePath: process.env.HMB_IMAGE_ASSET_TEST_BROWSER || "C:/Program Files/Google/Chrome/Application/chrome.exe", headless: true });
   const page = await browser.newPage({ viewport: { width: 1200, height: 960 } });
   const errors = []; page.on("pageerror", error => errors.push(error.message));
   await page.goto(`http://127.0.0.1:${server.address().port}`);
   await page.locator('[data-hmb-connection-manager-button="FutureArbitraryTool"]').waitFor();
-  assert.equal(await page.locator("[data-hmb-connection-manager-button]").count(), 10); checks++;
+  assert.equal(await page.locator("[data-hmb-connection-manager-button]").count(), 12); checks++;
   assert.equal(await page.locator("[data-non-hmb] [data-hmb-connection-manager-button]").count(), 0); checks++;
   assert.equal(await page.evaluate(() => window.sdk.length), 0, "Headers never read connection data until opened"); checks++;
   const geometry = await page.locator('[data-hmb-connection-manager-button="FutureArbitraryTool"]').evaluate(element => ({ width: element.getBoundingClientRect().width, height: element.getBoundingClientRect().height, color: getComputedStyle(element).color, next: element.nextElementSibling?.textContent }));
   assert.deepEqual(geometry, { width: 24, height: 24, color: "rgb(170, 187, 204)", next: "lock" }); checks++;
+  for (const name of ["HMBImageAssetLibrary", "HMBSoundLibrary", "HMBVideoPickerLibrary", "HMBAnalysisAgent"]) {
+    const node = page.locator(`[data-node="${name}"]`);
+    assert.deepEqual(await node.locator('[data-original-actions] button:not([data-hmb-connection-manager-button])').allTextContents(), ["lock", "reset"]); checks++;
+  }
+  for (const name of ["HMBPromptLibrary", "HMBImageBash", "HMBAgentLibrary", "HMBSeedanceGeneration", "HMBImageGeneration", "HMBColorLUTLibrary", "HMBFinishLookLibrary"]) {
+    assert.equal(await page.locator(`[data-node="${name}"]`).getByRole("button", { name: "run", exact: true }).count(), 1); checks++;
+  }
+  const sound = page.locator('[data-node="HMBSoundLibrary"]');
+  await sound.getByRole("button", { name: "lock", exact: true }).click();
+  assert.deepEqual(await page.evaluate(() => window.actions), ["HMBSoundLibrary:lock"]); checks++;
+  await sound.getByRole("button", { name: "reset", exact: true }).click();
+  await page.waitForFunction(() => window.dirty === 1);
+  assert.deepEqual((await page.evaluate(() => window.sdk.at(-1))).payload,
+    {node_name:"HMBSoundLibrary",operation:"refresh",expected_state_token:"token-HMBSoundLibrary-0"}); checks++;
+  await page.evaluate(() => {const row=window.inventory.get("HMBSoundLibrary"); Object.assign(row,{detached:true,can_refresh:false,can_reconnect:true,can_disconnect:false});});
+  await sound.getByRole("button", { name: "reset", exact: true }).click();
+  await page.getByRole("dialog").waitFor();
+  assert.equal(await page.evaluate(() => window.sdk.filter(row => row.payload.operation === "refresh").length), 1); checks++;
+  assert.equal(await page.getByRole("button", {name:"연결 다시 적용",exact:true}).count(), 0); checks++;
+  await page.keyboard.press("Escape");
   for (const name of ["HMBColorLUTLibrary", "FutureArbitraryTool"]) {
     await page.locator(`[data-hmb-connection-manager-button="${name}"]`).click();
     await page.locator(`[data-hmb-connection-manager="${name}"] article`).first().waitFor();
@@ -127,7 +163,7 @@ try {
   await page.getByRole('alert').waitFor();
   assert.equal(await page.getByRole("button", { name: "연결 해제", exact: true }).isDisabled(), true); checks++;
   assert.equal(await page.getByRole("button", { name: "다시 연결", exact: true }).isDisabled(), true); checks++;
-  await page.getByRole("button", { name: "새로고침", exact: true }).click();
+  await page.getByRole("button", { name: "상태 확인", exact: true }).click();
   await page.locator('[data-hmb-connection-manager] article').first().waitFor();
   await page.evaluate(() => window.reset());
   await page.waitForFunction(() => !document.querySelector('[data-hmb-connection-manager]'));

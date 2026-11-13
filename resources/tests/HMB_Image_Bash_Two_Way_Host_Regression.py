@@ -20,6 +20,7 @@ async def exercise(engine):
     from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest, AddParameterToNodeRequest, RemoveParameterFromNodeRequest
     import HMBImageAssetLibrary as asset
     import HMBImageBash as bash
+    from griptape_nodes.exe_types.node_types import DataNode
     import _hmb_shot_routing as routing
     import _hmb_connection_management as connections
     schema = LibrarySchema.model_validate_json((ROOT / "griptape-nodes-library.json").read_text("utf-8"))
@@ -30,7 +31,7 @@ async def exercise(engine):
     foreign_schema = schema.model_copy(deep=True)
     foreign_schema.name = "Foreign_Same_Class_Names"
     foreign = LibraryRegistry.generate_new_library(foreign_schema)
-    for name, cls in (("HMBImageAssetLibrary", asset.HMBImageAssetLibrary), ("HMBImageBash", bash._StockImageBash)):
+    for name, cls in (("HMBImageAssetLibrary", asset.HMBImageAssetLibrary), ("HMBImageBash", DataNode)):
         meta = next(row.metadata for row in schema.nodes if row.class_name == name)
         fake = type(name, (cls,), {})
         foreign.register_lazy_node_type(name, meta, lambda fake=fake: fake)
@@ -40,7 +41,7 @@ async def exercise(engine):
     registration = ActiveRegistration()
     connections.install_request_handlers(engine, registration)
     observed = []
-    def observe_create(request, result):
+    def observe_create(request, result, *args, **kwargs):
         observed.append((request.node_type, request.initial_setup, result.succeeded(), request.metadata))
     engine.event_manager.add_post_dispatch_hook(CreateNodeRequest, observe_create)
     ensured = engine.handle_request(EnsureWorkflowAndFlowRequest(flow_name="TwoWayA"))
@@ -141,7 +142,13 @@ async def exercise(engine):
         assert not reconnected["detached"] and len(incoming(fresh)) == 2
         assert any(e.source_node_name == fresh.name and e.target_parameter_name == child
                    for e in incoming(first))
-        assert first._current_state() == snapshot and fresh.get_parameter_value("bash_image") == scene_before
+        restored_state = deepcopy(first._current_state())
+        restored_lease = restored_state.pop(asset.WIDGET_RUNTIME_LEASE_KEY)
+        previous_state = deepcopy(snapshot)
+        previous_lease = previous_state.pop(asset.WIDGET_RUNTIME_LEASE_KEY)
+        assert restored_lease == first._hmb_widget_runtime_lease != previous_lease
+        assert restored_state == previous_state
+        assert fresh.get_parameter_value("bash_image") == scene_before
         assert engine.handle_request(DeleteConnectionRequest(**wire)).succeeded()
         # Explicit unbind and subsequent refresh must never reconnect it.
         command(fresh, "unbind")
@@ -272,6 +279,10 @@ def main():
     import _hmb_cgt
     from griptape_nodes.retained_mode.engine import engine_scope
     from griptape_nodes.retained_mode.managers.os_manager import OSManager
+    try:
+        from griptape_nodes.retained_mode.managers.resource_types import compute_resource
+    except ImportError:
+        compute_resource = OSManager
     platform.uname()
     real_connect = socket.socket.connect
     def local(sock, addr):
@@ -284,7 +295,8 @@ def main():
             HMB_IMAGE_BASH_EDITOR_BUNDLE_PATH=str(Path.home()/"AppData/Local/ai.griptape.nodes.desktop/current/resources/editor-bundle"))
         with mock.patch.dict(os.environ, environment), mock.patch.object(socket.socket,"connect",local), \
              mock.patch.object(_hmb_cgt,"start_own_wait_after_commit",side_effect=AssertionError("CGT write forbidden")), \
-             mock.patch.object(OSManager,"_is_cuda_available",return_value=False), \
+             mock.patch.object(OSManager,"_is_cuda_available",return_value=False,create=True), \
+             mock.patch.object(compute_resource,"detect_compute_backends",return_value=[],create=True), \
              mock.patch.object(subprocess,"Popen",side_effect=AssertionError("Subprocess forbidden")):
             previous = Path.cwd()
             try:

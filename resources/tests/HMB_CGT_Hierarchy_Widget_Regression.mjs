@@ -145,11 +145,13 @@ try{
  assert.match(await page.locator('[data-hier-cgt-status]').innerText(),/프로젝트.*선택|선택.*프로젝트/);
  assert.equal(await page.locator('[data-hier-cgt-project]').isEnabled(),true);
  const actualProjectLabels=await page.locator('[data-hier-cgt-project] option').allTextContents();
- assert.ok(actualProjectLabels.some(label=>label.includes('Synthetic SW12'))&&actualProjectLabels.some(label=>label.includes('Synthetic Katuri8')),'Actual CGT projects populate the selector');
+ assert.ok(actualProjectLabels.includes('superwings12')&&actualProjectLabels.includes('Katuri8'),'Exact CGT project codes populate the selector');
+ assert.ok(!actualProjectLabels.some(label=>label.includes('Synthetic ')),'Descriptive fixture aliases do not replace CGT project codes');
  await page.locator('[data-hier-cgt-project]').selectOption(snapshot.projects[1].id);
  await page.waitForFunction(id=>window.pending?.cgt_project_id===id,snapshot.projects[1].id);
  assert.equal(await page.locator('[data-hier-cgt-refresh]').isDisabled(),true);
  await page.evaluate(()=>window.finish());
+ await page.locator('[data-hier-cgt-episode]').selectOption('e201');
  assert.equal(await page.locator('[data-hier-cgt-add]').count(),1,'CGT tasks can be browsed without attaching them to another GP project');
  assert.equal(await page.locator('[data-hier-cgt-add]').isDisabled(),true,'Browse-only tasks cannot overwrite the current GP shots');
  await page.locator('[data-hier-manual-name]').fill('Manual only');
@@ -301,11 +303,11 @@ try{
  assert.equal(await page.locator('[data-hier-manual-name]').inputValue(),'Preserved typing');
  assert.match(await page.locator('[data-hier-cgt-account]').innerText(),/fixture-login/);
  assert.equal(await page.locator('[data-hier-cgt-project]').inputValue(),projectId);
- assert.match(await page.locator('[data-hier-cgt-project] option:checked').innerText(),/Synthetic SW12/,'The selector shows the CGT catalog name, not a GP filesystem token');
+ assert.equal(await page.locator('[data-hier-cgt-project] option:checked').innerText(),'superwings12','The selector shows the authoritative CGT project code');
  const projectBox=await page.locator('[data-hier-cgt-project]').boundingBox(),episodeBox=await page.locator('[data-hier-cgt-episode]').boundingBox(),refreshBox=await page.locator('[data-hier-cgt-refresh]').boundingBox();
  assert.ok(Math.abs(projectBox.y-refreshBox.y)<2&&Math.abs(projectBox.y-episodeBox.y)<2,'Project, episode and refresh controls align on one row');
  assert.ok(projectBox.x+projectBox.width<=episodeBox.x&&episodeBox.x+episodeBox.width<=refreshBox.x,'Episode selection fits beside the narrower project selector without overlap');
- assert.equal(await page.locator('[data-hier-cgt-add]').count(),tasks.length);checks+=4;
+ assert.equal(await page.locator('[data-hier-cgt-add]').count(),0,'No tasks appear before selecting an episode');checks+=4;
  const episodeOptions=await page.locator('[data-hier-cgt-episode] option').evaluateAll(nodes=>nodes.map(node=>({value:node.value,text:node.textContent})));
  for(const value of ['', 'e201', 'CGT Special Episode', 'e202', '__unassigned__'])assert.ok(episodeOptions.some(option=>option.value===value),`Episode option is retained: ${value}`);
  assert.ok(episodeOptions.some(option=>option.value==='__unassigned__'&&option.text.includes('에피소드 미지정')));
@@ -323,12 +325,14 @@ try{
  assert.equal(await page.locator('[data-hier-cgt-refresh]').isDisabled(),true);
  await page.evaluate(()=>window.finish());
  assert.equal(await page.locator('[data-hier-cgt-episode]').inputValue(),'','Changing CGT project resets only the episode filter');
+ await page.locator('[data-hier-cgt-episode]').selectOption('e201');
  assert.equal(await page.locator('[data-hier-cgt-add]').count(),1);
  assert.equal(await page.locator('[data-hier-cgt-add]').isDisabled(),true,'A different CGT project can be browsed but cannot bind to the current GP project');
  assert.equal(await page.locator('[data-hier-member]').count(),0);
  await page.locator('[data-hier-cgt-project]').selectOption(projectId);await page.evaluate(()=>window.finish());
- assert.equal(await page.locator('[data-hier-cgt-add]').count(),tasks.length);
+ assert.equal(await page.locator('[data-hier-cgt-add]').count(),0,'No tasks appear before selecting an episode');
  assert.equal(await page.locator('[data-hier-manual-name]').inputValue(),'Preserved typing','Project browse and refresh retain the separate manual draft');checks+=6;
+ await page.locator('[data-hier-cgt-episode]').selectOption('e201');
  const beforeSlotRequests=await page.evaluate(()=>window.requests.length);
  await page.locator('[data-hier-slot]').selectOption('image_bash');
  assert.equal(await page.locator('[data-image-bash-add]').count(),0,'Image Bash uses the shared slot selector and add action');
@@ -407,6 +411,17 @@ try{
  assert.deepEqual(sentMembers.map(row=>row.parent_id),parentValues,'CGT confirmation carries the exact user-selected multi-level tree');
  assert.deepEqual(sentMembers.map(row=>row.cgt_identity),tasks.slice(0,5).map(row=>row.identity),'Grouping preserves authenticated CGT IDs');
  assert.deepEqual(sentMembers.map(row=>row.source_name),tasks.slice(0,5).map(row=>row.source_name),'Grouping never edits CGT source names');
+ const timedOutRequest=await page.evaluate(()=>{
+  const request=window.pending;window.pending=null;
+  window.bridgeController.update(window.bridgeProps({...request,phase:'result',outcome:'rejected',state:{status:'TIMEOUT'}}));
+  return request.request_id;
+ });
+ assert.match(await page.locator('[data-hier-message]').innerText(),/샷 선택을 유지/);
+ assert.equal(await page.locator('[data-hier-member]').count(),5);
+ assert.equal(await page.locator('[data-hier-confirm]').isEnabled(),true);
+ assert.equal(await page.evaluate(()=>window.commits.length),0);
+ await page.locator('[data-hier-confirm]').click();
+ assert.notEqual(await page.evaluate(()=>window.pending.request_id),timedOutRequest);
  await page.evaluate(()=>window.finish());await page.waitForFunction(()=>window.commits.length===1);
  assert.equal(await page.locator('[data-shot-hierarchy-dialog]').count(),0);
  // Persist the real user-driven confirmation, then remount it. A synthetic
@@ -419,7 +434,17 @@ try{
  assert.equal(new Set(confirmed.shot_hierarchy.members.map(row=>row.gp_shot_uuid)).size,5);
  await page.evaluate(value=>window.openGraph(JSON.parse(value)),saved);
  assert.deepEqual(await page.evaluate(()=>window.host.shot_hierarchy.members),sentMembers,'Cold widget remount retains every task, slot and parent identity');checks+=8;
+ const confirmsBeforeReview=await page.evaluate(()=>window.requests.filter(request=>request.operation==='cgt_confirm').length);
+ await openShots();await page.waitForFunction(()=>window.pending?.operation==='cgt_catalog');
+ await page.locator('[data-hier-confirm]').click();
+ await page.locator('[data-shot-hierarchy-dialog]').waitFor({state:'detached',timeout:1000});
+ assert.equal(await page.evaluate(()=>window.requests.filter(request=>request.operation==='cgt_confirm').length),confirmsBeforeReview,
+  'Confirming an unchanged saved group closes immediately even with an outstanding catalog read');
+ assert.equal(await page.evaluate(()=>JSON.stringify(window.host)),saved,'Review does not rewrite the saved group or shot UUIDs');
+ checks+=3;
  await openShots();await page.evaluate(()=>window.finish());
+ assert.equal(await page.locator('[data-hier-cgt-episode]').inputValue(),'e201','Reopening a saved group restores its episode');
+ checks++;
  assert.equal(await page.locator('.hier-child').count(),3,'Actual saved multi-level relationships remain visible');
  assert.equal(await page.locator(`[data-hier-remove="${keys[0]}"]`).isDisabled(),true,'A representative with children cannot be detached');
  assert.equal(await page.locator(`[data-hier-remove="${keys[1]}"]`).isDisabled(),true,'A child which also represents descendants cannot silently discard their parent');
@@ -507,6 +532,7 @@ try{
  }
  await page.evaluate(value=>{window.catalog={...value,tasks:Array.from({length:120},(_,i)=>({...value.tasks[0],task_id:crypto.randomUUID(),source_name:`e201s${String(i+1).padStart(3,'0')}c001__`}))};},snapshot);
  await page.locator('[data-hier-cgt-refresh]').click();await page.evaluate(()=>window.finish());
+ await page.locator('[data-hier-cgt-episode]').selectOption('e201');
  assert.equal(await page.locator('[data-hier-cgt-add]').count(),50);
  assert.equal(await page.locator('[data-hier-cgt-scroll]').evaluate(node=>['auto','scroll'].includes(getComputedStyle(node).overflowY)&&node.scrollHeight>node.clientHeight),true,'Task list has its own bounded scroll viewport');
  const requestsBefore=await page.evaluate(()=>window.requests.length);
@@ -596,6 +622,25 @@ try{
  await page.evaluate(value=>window.openGraph(JSON.parse(value)),mixedSaved);
  assert.equal(await page.locator('[data-shot-name]').last().innerText(),'Manual mixed renamed');
  assert.equal(await page.locator('[data-shot-rename]:disabled').count(),4);checks+=6;
+ // A dialog keeps its edit base while source/status notifications advance.
+ const rebased = await page.evaluate(value => {
+  const base=window.w.hmbNormalizeImageAssetState(value), binding=structuredClone(base.shot_hierarchy);
+  binding.revision++;
+  const request={schema:'hmb-shot-hierarchy-edit',version:1,expected_generation:base.shot_routing.generation,
+   expected_binding_revision:base.shot_hierarchy.revision,expected_structure:window.w.hmbShotHierarchyEditStructure(base),
+   removed_member_ids:[],binding};
+  const live=structuredClone(base);live.shot_routing.generation+=4;live.shot_hierarchy.revision++;
+  live.shot_hierarchy.members.forEach(row=>row.status='Work');
+  const result=window.w.hmbApplyShotHierarchyEdit(live,request);
+  const conflict=structuredClone(live);conflict.shot_routing.shots[0].name='Changed elsewhere';
+  let rejected=false;try{window.w.hmbApplyShotHierarchyEdit(conflict,request);}catch{rejected=true;}
+  const legacy={...request};delete legacy.expected_structure;
+  let legacyRejected=false;try{window.w.hmbApplyShotHierarchyEdit(live,legacy);}catch{legacyRejected=true;}
+  return {ids:result.shot_routing.shots.map(row=>row.shot_uuid),expected:base.shot_routing.shots.map(row=>row.shot_uuid),
+   status:result.shot_hierarchy.members.map(row=>row.status),rejected,legacyRejected};
+ },saved);
+ assert.deepEqual(rebased.ids,rebased.expected);assert(rebased.status.every(value=>value==='Work'));
+ assert(rebased.rejected);assert(rebased.legacyRejected);checks+=4;
  // Actual English rendering uses fixed local copy, including an empty result.
  const englishState=await page.evaluate(()=>({...window.host,language:'en'}));
  await page.evaluate(value=>{window.openGraph(value);window.catalog={status:'SOURCE_SCHEMA',tasks:[]};},englishState);

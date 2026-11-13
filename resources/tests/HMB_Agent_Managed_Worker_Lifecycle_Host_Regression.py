@@ -132,6 +132,7 @@ async def exercise(engine, _phase, out):
         # Preview compilation is covered by the exact physical-edge host suite;
         # this fixture retains the native row, slot and worker publication path.
         owner._refresh_routed_prompt_preview = lambda: None
+        owner._refresh_agent_shot_route = lambda **kwargs: None
         owner._model_access.raise_if_selection_denied = lambda: None
         owner._hmb_active_slot_key = "__hmb_only__"
         template = owner._hmb_native_slot_snapshot()

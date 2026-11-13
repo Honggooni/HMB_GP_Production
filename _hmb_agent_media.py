@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import threading
 import time
 from typing import Any, Callable
@@ -30,6 +31,8 @@ _CACHE_BYTES_LIMIT = 24 * 1024 * 1024
 _CACHE: OrderedDict[tuple, tuple[bytes, int, int, float | None]] = OrderedDict()
 _PROBE_CACHE: OrderedDict[tuple, dict] = OrderedDict()
 _CACHE_LOCK = threading.Lock()
+_RUNTIME_WARM_LOCK = threading.Lock()
+_RUNTIME_WARMED = False
 _PILLOW_DECODER = """
 import io, sys
 from PIL import Image, ImageOps
@@ -91,6 +94,19 @@ def driver_accepts_images(agent: Any) -> bool:
         return False
 
 
+def driver_accepts_audio(agent: Any) -> bool:
+    """Use only the curated Cloud models exercised by native audio analysis."""
+    if not _uses_native_user_content(agent) or not driver_accepts_images(agent):
+        return False
+    try:
+        from _hmb_reference_analysis import ARGON_MODEL_ID
+        return agent.model.model in (
+            "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", ARGON_MODEL_ID,
+        )
+    except Exception:
+        return False
+
+
 def _binaries() -> tuple[Path | None, Path | None]:
     candidates: list[Path] = []
     if os.environ.get("FFMPEG_PATH"):
@@ -133,7 +149,97 @@ def _binaries() -> tuple[Path | None, Path | None]:
     return ffmpeg, first_file(probe_candidates)
 
 
-def _source(value: Any, kind: str) -> tuple[Path | bytes, tuple]:
+def prewarm_local_runtime(snapshot: dict, *, is_live: Callable[[], bool] = lambda: True) -> dict:
+    """Prepare local decoder imports once, only for a frozen selected-Shot source.
+
+    No source is fetched/decoded, no model is built, and no policy session is
+    claimed. Actual pixels still use the normal bounded worker and its cache.
+    """
+    global _RUNTIME_WARMED
+    started = time.monotonic()
+    result = {"status": "not_needed", "elapsed_seconds": 0.0}
+    if (not isinstance(snapshot, dict) or snapshot.get("schema") != "hmb-agent-reference-media"
+            or snapshot.get("version") != 1 or not is_live()
+            or not any(snapshot.get(key) for key in ("images", "videos"))):
+        return result
+    with _RUNTIME_WARM_LOCK:
+        if not is_live():
+            result["status"] = "cancelled"
+        elif _RUNTIME_WARMED:
+            result["status"] = "already_ready"
+        else:
+            try:
+                _binaries()
+                _RUNTIME_WARMED = True
+                result["status"] = "ready"
+            except Exception:
+                result["status"] = "optional_preparation_failed"
+    result["elapsed_seconds"] = round(time.monotonic() - started, 6)
+    return result
+
+
+def merge_analysis_original(snapshot: dict, original: dict) -> dict:
+    """Add one verified, opted-in analysis source to the exact Prompt media pair.
+
+    The original is selected by the registered Analysis Agent, never inferred
+    from a text token or an arbitrary saved path. Preserve the Prompt snapshot
+    and avoid attaching a source already selected through its normal route.
+    """
+    if not original:
+        return snapshot
+    if not isinstance(snapshot, dict) or snapshot.get("schema") != "hmb-agent-reference-media" or snapshot.get("version") != 1:
+        return snapshot
+    kind, path = original.get("kind"), original.get("path")
+    if kind not in {"image", "video", "audio"} or not isinstance(path, str) or not path:
+        return snapshot
+    from _hmb_analysis_delivery import reference_identity
+
+    key = kind + "s"
+    rows = snapshot.get(key, [])
+    if not isinstance(rows, list):
+        return snapshot
+    identity = reference_identity(path)
+    for index, row in enumerate(rows):
+        if isinstance(row, dict) and reference_identity(str(row.get("source") or "")) == identity:
+            result = copy.deepcopy(snapshot)
+            result[key][index]["_hmb_verified_analysis_original"] = True
+            result[key][index]["reference_usage"] = "analysis_reference"
+            return result
+    result = copy.deepcopy(snapshot)
+    used = {str(row.get("token") or "") for row in rows if isinstance(row, dict)}
+    canonical = str(original.get("shot_reference") or "")
+    supplied_token = bool(re.fullmatch(r"@" + kind + r"[1-9][0-9]{0,2}", canonical)
+                          or re.fullmatch(r"@analysis_original(?:_(?:image|video|audio)(?:_?[1-9][0-9]{0,2})?)?", canonical))
+    token = canonical if supplied_token and canonical not in used else "@analysis_original"
+    if token in used:
+        token = next((f"@analysis_original_{kind}_{index}" for index in range(1, 1000)
+                      if f"@analysis_original_{kind}_{index}" not in used), "")
+    if not token:
+        return snapshot
+    record = {"source": path, "token": token, "source_type": "Analysis original",
+              "reference_usage": "analysis_reference",
+              "identity": {"source_uid": str(original.get("source_id") or "")},
+              "_hmb_verified_analysis_original": True}
+    if kind == "video":
+        start, end = original.get("start"), original.get("end")
+        if type(start) in {int, float} and type(end) in {int, float} and 0 <= start < end:
+            record["analysis_range_seconds"] = {"start": start, "end": end}
+    if kind == "audio":
+        record["start"], record["end"] = original.get("start"), original.get("end")
+    result.setdefault(key, []).append(record)
+    return result
+
+
+def merge_analysis_originals(snapshot: dict, originals: list[dict]) -> dict:
+    """Merge every exact-Shot opted original without changing the caller's snapshot."""
+    result = snapshot
+    for original in originals:
+        if isinstance(original, dict):
+            result = merge_analysis_original(result, original)
+    return result
+
+
+def _source(value: Any, kind: str, *, allow_verified_network: bool = False) -> tuple[Path | bytes, tuple]:
     """Resolve a selected local/project reference without fetching remote URLs."""
     text = str(value or "").strip()
     if not text or len(text) > MAX_INPUT_IMAGE_BYTES * 2:
@@ -146,7 +252,7 @@ def _source(value: Any, kind: str) -> tuple[Path | bytes, tuple]:
         if len(blob) > MAX_INPUT_IMAGE_BYTES:
             raise ValueError("input_limit")
         return blob, ("data", hashlib.sha256(blob).hexdigest())
-    if text.startswith(("\\\\", "//")):
+    if text.startswith(("\\\\", "//")) and not allow_verified_network:
         raise ValueError("nonlocal")
     try:
         from griptape_nodes.files.file import File
@@ -156,18 +262,28 @@ def _source(value: Any, kind: str) -> tuple[Path | bytes, tuple]:
         # reinterpret a project-relative path against the engine working dir.
         if not Path(text).is_absolute():
             raise ValueError("unavailable") from None
-    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", text) or text.startswith(("\\\\", "//", "data:", "asset:")):
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", text) or text.startswith(("data:", "asset:")) or (
+            text.startswith(("\\\\", "//")) and not allow_verified_network):
         raise ValueError("nonlocal")
     path = Path(text)
     if os.name == "nt" and path.anchor:
         import ctypes
-        if ctypes.windll.kernel32.GetDriveTypeW(str(path.anchor)) == 4:
+        if ctypes.windll.kernel32.GetDriveTypeW(str(path.anchor)) == 4 and not allow_verified_network:
             raise ValueError("nonlocal")
     if not path.is_absolute() or not path.is_file():
         raise ValueError("unavailable")
     stat = path.stat()
-    if stat.st_size <= 0 or (kind == "image" and stat.st_size > MAX_INPUT_IMAGE_BYTES):
+    if stat.st_size <= 0 or (kind == "image" and stat.st_size > MAX_INPUT_IMAGE_BYTES) or (
+            allow_verified_network and stat.st_size > 512 * 1024 * 1024):
         raise ValueError("input_limit")
+    if allow_verified_network:
+        # A verified SMB file is still untrusted media input. Reject playlists
+        # and renamed manifests before the local FFmpeg/Pillow decoder sees it.
+        from _hmb_reference_analysis import _validate_header
+        try:
+            _validate_header(path, kind)
+        except Exception:
+            raise ValueError("unavailable") from None
     return path, (str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
 
@@ -275,7 +391,7 @@ def _label(record: dict, kind: str) -> dict:
     # Source paths, URL credentials and private filesystem details stay local.
     allowed = ("token", "image", "video", "source_type", "image_main_type", "image_sub_type",
                "video_main_type", "video_sub_type", "target_id", "owner", "bindings",
-               "control_role", "control_bindings", "frame_domain", "reference_scope", "frame_ranges")
+               "control_role", "control_bindings", "frame_domain", "reference_scope", "frame_ranges", "reference_usage")
     label = {key: record[key] for key in allowed if key in record}
     label["kind"] = kind
     return label
@@ -293,7 +409,10 @@ def _number(value: Any) -> float | None:
 
 def _token(record: dict) -> str:
     value = str(record.get("token") or record.get("image") or record.get("video") or "")
-    return value if re.fullmatch(r"@(image|video)[1-9][0-9]{0,2}", value) else ""
+    if (record.get("_hmb_verified_analysis_original") is True and
+            re.fullmatch(r"@analysis_original(?:_(?:image|video|audio)(?:_?[1-9][0-9]{0,2})?)?", value)):
+        return value
+    return value if re.fullmatch(r"@(image|video|audio)[1-9][0-9]{0,2}", value) else ""
 
 
 def _audit_id(value: Any) -> str:
@@ -313,6 +432,8 @@ def _observation_row(record: dict, kind: str) -> dict:
 
 def _role(record: dict, kind: str) -> str:
     """Observation scheduling only; never change the record's source authority."""
+    if kind == "audio":
+        return "audio_original"
     if kind == "image":
         return "character" if record.get("image_main_type") == "Character" or record.get("source_type") in {
             "Character Appearance", "Partial Character Detail", "Character Sheet"} else "image"
@@ -346,6 +467,15 @@ def _bundle(record: dict) -> str:
 def _sample_plan(records: list[dict], duration: float | None) -> list[dict]:
     """Choose authored event frames, then Range midpoints and boundaries."""
     clock = _clock(records[0])
+    analysis_range = records[0].get("analysis_range_seconds")
+    if isinstance(analysis_range, dict):
+        left, right = _number(analysis_range.get("start")), _number(analysis_range.get("end"))
+        if left is not None and right is not None and 0 <= left < right:
+            stop = min(right, duration) if duration is not None else right
+            if left < stop:
+                return [{"seek": round(value, 6), "reason": "analysis_selected_range",
+                         "requested_source_frame": None}
+                        for value in (left, (left + stop) / 2, max(left, stop - .1))]
     requests: list[dict] = []
     seen: set[float] = set()
 
@@ -413,6 +543,36 @@ def _sample_plan(records: list[dict], duration: float | None) -> list[dict]:
     return requests[:64]
 
 
+def _audio_clip(record: dict, ffmpeg: Path | None, deadline: float) -> bytes:
+    """Bound one local audio original to a short, finalized PCM WAV clip."""
+    source, _identity = _source(record.get("source"), "audio",
+                                allow_verified_network=record.get("_hmb_verified_analysis_original") is True)
+    if not isinstance(source, Path) or ffmpeg is None:
+        raise ValueError("decoder_unavailable")
+    start = _number(record.get("start"))
+    end = _number(record.get("end"))
+    start = start if start is not None and start >= 0 else 0.0
+    duration = min(10.0, end - start) if end is not None and end > start else 10.0
+    if duration <= 0:
+        raise ValueError("unavailable")
+    with tempfile.TemporaryDirectory(prefix="hmb-agent-audio-") as directory:
+        output = Path(directory) / "reference.wav"
+        command = [str(ffmpeg), "-nostdin", "-n", "-v", "error", "-threads", "1",
+              "-protocol_whitelist", "file,pipe", "-ss", f"{start:.6f}", "-i", str(source),
+              "-t", f"{duration:.6f}", "-map", "0:a:0", "-vn", "-sn", "-dn",
+              "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-f", "wav", str(output)]
+        remaining = min(8.0, deadline - time.monotonic())
+        if remaining <= 0:
+            raise TimeoutError("budget")
+        subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=remaining, check=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        with output.open("rb") as file:
+            blob = file.read(MAX_ENCODED_BYTES + 1)
+    if len(blob) < 80 or len(blob) > MAX_ENCODED_BYTES or not blob.startswith(b"RIFF"):
+        raise ValueError("input_limit")
+    return blob
+
+
 def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
                    is_live: Callable[[], bool] = lambda: True,
                    report_sink: Callable[[dict], None] | None = None) -> Any:
@@ -433,6 +593,7 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
     encoded_bytes = 0
     count = 0
     image_count = 0
+    cache_summary = {"decoded_hits": 0, "decoded_misses": 0, "probe_hits": 0, "probe_misses": 0}
 
     def skip(record: dict, kind: str, reason: str, sample: dict | None = None) -> None:
         row = _observation_row(record, kind)
@@ -449,7 +610,8 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
             return prompt
         images = [v for v in snapshot.get("images", [])[:64] if isinstance(v, dict)]
         videos = [v for v in snapshot.get("videos", [])[:64] if isinstance(v, dict)]
-        records = [(v, "image") for v in images] + [(v, "video") for v in videos]
+        audios = [v for v in snapshot.get("audios", [])[:64] if isinstance(v, dict)]
+        records = [(v, "image") for v in images] + [(v, "video") for v in videos] + [(v, "audio") for v in audios]
         if not is_live() or not driver_accepts_images(agent):
             reason = "cancelled" if not is_live() else "no_vision_driver"
             for record, kind in records:
@@ -463,6 +625,29 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
             from griptape.artifacts import ImageArtifact, ListArtifact, TextArtifact
         deadline = started + PREPARATION_SECONDS
         ffmpeg, probe = _binaries()
+
+        for record in audios:
+            if not driver_accepts_audio(agent):
+                skip(record, "audio", "unsupported_audio_model")
+                continue
+            if not is_live() or count >= MAX_ATTACHMENTS or time.monotonic() >= deadline:
+                skip(record, "audio", "cancelled" if not is_live() else "attachment_cap" if count >= MAX_ATTACHMENTS else "deadline")
+                continue
+            try:
+                blob = _audio_clip(record, ffmpeg, deadline)
+                if encoded_bytes + len(blob) > MAX_ENCODED_BYTES:
+                    raise ValueError("input_limit")
+                offset = _number(record.get("start"))
+                attachments.extend([f"HMB opted-in analysis original audio clip {_token(record)}"
+                    + (f"; source offset {offset:.3f}s" if offset is not None and offset >= 0 else ""),
+                    BinaryContent(data=blob, media_type="audio/wav")])
+                encoded_bytes += len(blob)
+                count += 1
+                report["coverage"].append({**_observation_row(record, "audio"), "clip_seconds_limit": 10})
+            except Exception as exc:
+                skip(record, "audio", "deadline" if time.monotonic() >= deadline else
+                     str(exc) if isinstance(exc, ValueError) and str(exc) in {"unavailable", "nonlocal", "input_limit", "decoder_unavailable"}
+                     else "decode_unavailable")
 
         def unavailable_reason(exc: Exception) -> str:
             if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)):
@@ -480,8 +665,12 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
                 skip(record, kind, reason, sample)
                 return False
             try:
-                source, identity = _source(record.get("source"), kind)
+                source, identity = _source(record.get("source"), kind,
+                    allow_verified_network=record.get("_hmb_verified_analysis_original") is True)
                 seek = sample["seek"] if sample else None
+                with _CACHE_LOCK:
+                    hit = (*identity, seek, MAX_EDGE) in _CACHE
+                cache_summary["decoded_hits" if hit else "decoded_misses"] += 1
                 blob, width, height, actual = _decode(source, identity, seek, ffmpeg, deadline)
                 info = infos.get(_token(record), {})
                 start_pts = info.get("start_pts")
@@ -546,9 +735,11 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
 
         # Reserve a first observation for each selected role before any role
         # repeats. Character sheets cannot consume the Original/Mask/Depth slots.
-        images.sort(key=lambda v: 0 if _role(v, "image") == "character" else 1)
+        images.sort(key=lambda v: (0 if v.get("_hmb_verified_analysis_original") is True else 1,
+                                   0 if _role(v, "image") == "character" else 1))
         priorities = {"original": 0, "mask": 1, "depth": 2, "motion_guide": 3, "video": 4}
-        videos.sort(key=lambda v: priorities[_role(v, "video")])
+        videos.sort(key=lambda v: (0 if v.get("_hmb_verified_analysis_original") is True else 1,
+                                   priorities[_role(v, "video")]))
         infos: dict[str, dict] = {}
         units: list[list[dict]] = []
         grouped: dict[tuple, list[dict]] = {}
@@ -565,7 +756,9 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
                 for record in members:
                     skip(record, "video", "ambiguous_bundle_roles")
                     units.append([record])
-        units.sort(key=lambda members: min(priorities[_role(v, "video")] for v in members))
+        units.sort(key=lambda members: (0 if any(v.get("_hmb_verified_analysis_original") is True
+                                            for v in members) else 1,
+                                        min(priorities[_role(v, "video")] for v in members)))
 
         def observe_unit(members: list[dict], sample_index: int) -> None:
             if not is_live() or time.monotonic() >= deadline or count + len(members) > MAX_ATTACHMENTS:
@@ -577,11 +770,13 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
                 token = _token(record)
                 if token not in infos:
                     try:
-                        source, identity = _source(record.get("source"), "video")
+                        source, identity = _source(record.get("source"), "video",
+                            allow_verified_network=record.get("_hmb_verified_analysis_original") is True)
                         if not isinstance(source, Path):
                             raise ValueError("nonlocal")
                         with _CACHE_LOCK:
                             info = _PROBE_CACHE.get(identity)
+                        cache_summary["probe_hits" if info is not None else "probe_misses"] += 1
                         if info is None:
                             info = _video_info(source, probe, deadline)
                             if info:
@@ -682,6 +877,7 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
         observed = {row["media_token"] for row in report["coverage"]}
         report["unobserved_media_tokens"] = [_token(v) for v, _kind in records if _token(v) not in observed]
         report["native_input_status"] = "prepared" if report["coverage"] else "text_only"
+        report["cache_summary"] = cache_summary
         report["budget_summary"] = {"attachment_limit": MAX_ATTACHMENTS, "image_limit": MAX_IMAGE_ATTACHMENTS,
             "encoded_byte_limit": MAX_ENCODED_BYTES, "preparation_seconds_limit": PREPARATION_SECONDS,
             "attachments_prepared": count, "attachments_delivered": len(report["coverage"]),

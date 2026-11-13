@@ -135,6 +135,27 @@ async def exercise(engine):
         stored = [json.loads(value) for value in saved["shot_documents"].values()]
         assert min(doc["image_asset"]["shot_routing"]["generation"] for doc in stored) > 100
         assert min(doc["picker"]["shot_routing"]["generation"] for doc in stored) > 100
+        # Reading/preparing sibling pages changes the private snapshot clocks,
+        # not the active editor document. Repeated preparation used to create
+        # a retained-mode write loop even with no user/source changes.
+        prompt._write_dashboard_state()
+        prompt._hmb_prepare_prompt_shot_views()
+        prompt._write_dashboard_state()
+        idle_before = prompt._get_raw_parameter_value(prompts.WIDGET_PARAMETER_NAME)
+        proof_before = deepcopy(getattr(prompt, '_hmb_dashboard_route_content', {}))
+        for _ in range(10):
+            prompt._hmb_prepare_prompt_shot_views()
+            prompt._write_dashboard_state()
+        idle_after = prompt._get_raw_parameter_value(prompts.WIDGET_PARAMETER_NAME)
+        if idle_after != idle_before:
+            old, new = json.loads(idle_before), json.loads(idle_after)
+            def diff(a, b, prefix=''):
+                if isinstance(a, dict) and isinstance(b, dict):
+                    return [line for k in set(a)|set(b) for line in diff(a.get(k), b.get(k), prefix+'.'+k)]
+                return [] if a == b else [prefix]
+            print('state diff', diff(old, new), 'content proofs', proof_before,
+                  getattr(prompt, '_hmb_dashboard_route_content', {}))
+        assert idle_after == idle_before, "Read-only five-shot preparation rewrote the active Prompt dashboard"
         serialized = send(engine, SerializeFlowToCommandsRequest(flow_name=flow.name)).serialized_flow_commands
         original_names = set(flow.nodes)
         while engine.context_manager.has_current_flow():
@@ -160,7 +181,38 @@ async def exercise(engine):
             assert record["video_media"] == [f"https://media.invalid/video-{n}.mp4"]
         assert prompt._get_raw_parameter_value(prompts.WIDGET_PARAMETER_NAME) == raw_before
         assert len(prompt._current_state()["shot_documents"]) == 5
-        print("PASS actual Image/Picker exact readers; 120 alternating views; five saved generations >100; SDK serialize/delete/cold reload; fresh lower source clocks safely rebase all five exact Prompt/media documents without UI writes")
+        # The real Editor measures the remaining blank video textarea as 34px.
+        # Reapplying an empty Picker selection must not interpret that generated
+        # placeholder as another deselected source and erase its measured size.
+        picker_saved = deepcopy(picker._picker_state())
+        empty_picker = deepcopy(picker_saved)
+        for workspace in empty_picker["picker_shots"]:
+            workspace["selected_video_uids"] = []
+            workspace["preview_video_uid"] = ""
+        for video in empty_picker["videos"]:
+            video.update(selected=False, selection_order=0, video_slot=0)
+        send(engine, SetParameterValueRequest(node_name=picker.name,
+            parameter_name=pickers.WIDGET_STATE_PARAMETER, value=empty_picker, initial_setup=True))
+        await warm(image, picker)
+        prompt._write_dashboard_state()
+        measured = deepcopy(prompt._current_state())
+        measured["ui"]["textarea_heights"]["video:1:keep_out"] = 34
+        prompt._hmb_write_merged_prompt_state(prompts._json_dumps(measured))
+        prompt._write_dashboard_state()
+        measured = prompt._current_state()
+        assert measured["ui"]["textarea_heights"].get("video:1:keep_out") == 34, "Empty Picker erased the Editor's placeholder measurement"
+        empty_before = prompt._get_raw_parameter_value(prompts.WIDGET_PARAMETER_NAME)
+        for _ in range(10):
+            prompt._hmb_prepare_prompt_shot_views()
+            prompt._write_dashboard_state()
+        assert prompt._get_raw_parameter_value(prompts.WIDGET_PARAMETER_NAME) == empty_before
+        send(engine, SetParameterValueRequest(node_name=picker.name,
+            parameter_name=pickers.WIDGET_STATE_PARAMETER, value=picker_saved, initial_setup=True))
+        await warm(image, picker)
+        restored = prompt._write_dashboard_state()
+        assert restored["picker"]["selected_video_count"] == 1
+        print("PASS empty Picker preserves 34px Editor measurement without idle writes; real video reselection still publishes")
+        print("PASS actual Image/Picker exact readers; 120 alternating views; 10 idle five-view preparations without dashboard writes; five saved generations >100; SDK serialize/delete/cold reload; fresh lower source clocks safely rebase all five exact Prompt/media documents without UI writes")
     finally:
         LibraryRegistry.unregister_library(schema.name, event_manager=engine.event_manager)
 

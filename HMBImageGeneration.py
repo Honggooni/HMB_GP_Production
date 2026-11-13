@@ -521,6 +521,16 @@ class HMBImageGeneration(SuccessFailureNode):
     def _has_input_connection(self, parameter: Any) -> bool:
         # Hydration can restore a connected dynamic control as a generic
         # Parameter. Never replace it (or its edge) just to change its UI type.
+        request_in_workflow = getattr(self, "_handle_request_in_workflow", None)
+        if callable(request_in_workflow):
+            from griptape_nodes.retained_mode.events.connection_events import ListConnectionsForNodeRequest
+
+            result = request_in_workflow(ListConnectionsForNodeRequest(node_name=self.name, broadcast_result=False))
+            # If the node is between workflows, keep the control until an
+            # authoritative read confirms that it has no incoming edge.
+            return not result.succeeded() or any(
+                edge.target_parameter_name == parameter.name for edge in result.incoming_connections
+            )
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
         return bool(GriptapeNodes.FlowManager().get_connections()
             .get_incoming_connections_to_parameter(self, parameter))

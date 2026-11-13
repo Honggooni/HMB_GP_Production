@@ -812,6 +812,18 @@ def _node_inventory(engine: Any) -> dict[str, str]:
         workflow = current()
         if workflow is None:
             return {}
+        # Modern SDK bindings are context-local, not engine-local. During a
+        # cold reopen an older engine can still be alive and see the new
+        # engine's bound runtime. Only its actual owner may claim these nodes.
+        live = getattr(engine, "bound_live_workflow_or_none", None)
+        opened = getattr(engine, "open_workflows", None)
+        if callable(live) and opened is not None:
+            owned = live() is workflow
+            if not owned:
+                owned = (opened.is_open(workflow.workflow_id)
+                         and opened.get(workflow.workflow_id) is workflow)
+            if not owned:
+                return {}
         mapping = workflow.nodes.name_to_parent_flow_name
     else:
         mapping = engine.node_manager._name_to_parent_flow_name
@@ -1205,12 +1217,20 @@ def guard_request(engine: Any, request: Any) -> Any:
         blocked = connected_targets(engine, scope)
         ungrouped = (_subflow_ungrouped(engine, scope)
                      if kind in {"DeleteNodeRequest", "ResetNodeToDefaultsRequest"} else {})
+        hmb_reset = False
+        if kind == "ResetNodeToDefaultsRequest":
+            retained = _retained_nodes(engine)
+            hmb_reset = any(name in retained and _is_hmb(retained[name]) for name in scope)
     except Exception:
         return result_type(result_details=(
             "[HMB_DELETE_CHECK_FAILED] 연결 상태를 확인하지 못해 삭제를 중단했습니다. "
             "연결 상태를 새로고침한 뒤 다시 시도하세요. 기존 데이터는 유지됩니다."))
     if blocked:
         return result_type(result_details=message(blocked))
+    if hmb_reset:
+        return result_type(result_details=(
+            "[HMB_RESET_REBIND_REQUIRED] HMB 노드는 연결 다시 적용을 사용하세요. "
+            "새 기본 상태가 필요하면 연결을 해제하고 노드를 삭제한 뒤 새 노드를 추가하세요."))
     if ungrouped:
         rows = [f"{name} → {', '.join(nodes)}" for name, nodes in ungrouped.items()]
         return result_type(result_details=("[HMB_SUBFLOW_UNGROUPED] 그룹 하위 작업에 그룹에 속하지 않은 노드가 있어 "

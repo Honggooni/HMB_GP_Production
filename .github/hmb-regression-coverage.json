@@ -3,6 +3,72 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_Update_Preflight_Guard_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Cold_Surface_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": true,
+      "reason": "Requires local Chromium for delayed shot catalogs, deep node ancestors, replaced edges and one-click Only mode; included in the mandatory Local update preflight."
+    },
+    {
+      "name": "HMB_Analysis_Broker_Contract_Regression.py",
+      "mode": "manual",
+      "coverage": "python_contract",
+      "required": true,
+      "reason": "Separate TEST-only analysis candidate; pinned local TEST CA and mock transport, no live provider calls."
+    },
+    {
+      "name": "HMB_Editor_0130_Integrated_Header_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": true,
+      "reason": "Requires the Local Editor 0.130 overlay and a reviewed stock fixture to verify header integration and reconnect across every HMB node type."
+    },
+    {
+      "name": "HMB_Image_Bash_Owned_Editor_Browser_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Cold_Visit_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": true,
+      "reason": "Compares the candidate against the currently installed Local widget with a 50-image shot in Chromium."
+    },
+    {
+      "name": "HMB_Shot_Basket_Creation_Widget_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Shot_Basket_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": true,
+      "reason": "Requires the installed Griptape SDK for graph creation, media routing, save and reopen with synthetic inputs."
+    },
+    {
+      "name": "HMB_Agent_Analysis_Original_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_ImageAsset_Cold_Catalog_Generation_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": true,
+      "reason": "Requires the installed Griptape SDK to import ImageAsset and VideoPicker; uses detached objects to verify unchanged cold catalogs and monotonic changed Shot/project revisions without provider calls, scans or workflow writes."
+    },
+    {
       "name": "HMB_CGT_Native_Work_Start_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
@@ -2473,6 +2539,12 @@
       "required": true
     },
     {
+      "name": "HMB_VideoPicker_Maya_Binary_Shot_Scene_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_VideoPicker_Maya_Shot_Authoring_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
@@ -3408,6 +3480,212 @@
       "name": "HMB_Agent_Cold_Source_Readiness_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Agent_Execution_Stage_UI_Regression.mjs",
+      "mode": "ci",
+      "coverage": "javascript_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Agent_Execution_Timing_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_ImageAsset_First_Paint_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_ImageAsset_First_Paint_Widget_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Sound_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Sound_Widget_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Sound_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": true,
+      "reason": "Requires the installed retained Griptape SDK and a private disposable engine profile; independently run for Local acceptance without provider calls."
+    },
+    {
+      "name": "HMB_Sound_Agent_Generator_Boundary_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Sound_Library_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Sound_Library_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Sound_Delta_Transport_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Sound_Delta_Transport_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": true,
+      "reason": "Requires the actual retained SDK in a disposable private engine; verifies full saved/output state, display deltas, native command replies and fresh-process restore without provider calls."
+    },
+    {
+      "name": "HMB_Sound_LUT_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Sound_LUT_Widget_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Sound_Wire_Chain_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": true,
+      "reason": "Requires the installed retained Griptape SDK and a private disposable engine profile; independently run for Local acceptance without provider calls."
+    },
+    {
+      "name": "HMB_Sound_Automatic_Chain_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": true,
+      "reason": "Requires an actual Advanced Library loader and retained SDK in a disposable private engine; verifies unpatched automatic Sound/Image creation orders without provider calls."
+    },
+    {
+      "name": "HMB_Analysis_Agent_Widget_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Analysis_Node_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Analysis_Source_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Analysis_Source_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Analysis_Agent_Save_Reopen_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": true,
+      "reason": "Requires installed Griptape SDK and disposable profiles for native save and cold reopen."
+    },
+    {
+      "name": "HMB_Reference_Analysis_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": true,
+      "reason": "Requires FFmpeg, FFprobe and the installed Standard Agent SDK for native media serialization with a simulated provider."
+    },
+    {
+      "name": "HMB_CGT_Preparation_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Agent_Prepared_Pages_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Agent_Immediate_Page_Widget_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Sidecar_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires the installed Desktop SDK and local FFmpeg; offline MP4/MOV metadata publication."
+    },
+    {
+      "name": "HMB_Continue_Work_Artwork_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": false,
+      "reason": "Requires local continuation artwork baseline and candidate assets under the report folder."
+    },
+    {
+      "name": "HMB_Maya_Reference_UUID_Scope_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_VideoPicker_Read_Reference_Selection_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_VideoPicker_Reference_Color_Browser_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_VideoPicker_Reference_Color_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_VideoPicker_Sidecar_Compatibility_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Library_Prepared_Switch_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
       "required": true
     }
   ]

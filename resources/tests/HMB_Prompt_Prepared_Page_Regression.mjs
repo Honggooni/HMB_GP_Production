@@ -12,8 +12,9 @@ const require = createRequire(import.meta.url);
 let playwright;
 try { playwright = require('playwright'); }
 catch { playwright = require(path.join(os.homedir(), '.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright')); }
-const original = fs.readFileSync(new URL('../../widgets/HMBPromptLibraryScopedBindingWidget.js', import.meta.url), 'utf8');
+const original = fs.readFileSync(process.env.HMB_PROMPT_TEST_WIDGET || new URL('../../widgets/HMBPromptLibraryScopedBindingWidget.js', import.meta.url), 'utf8');
 const imageRows = Number(process.env.HMB_PROMPT_PREPARED_IMAGES || 4);
+const baseline = process.env.HMB_PROMPT_MEASURE_BASELINE === '1';
 assert.ok([4, 50].includes(imageRows));
 let source = original;
 for (const [name, declaration] of [
@@ -42,7 +43,7 @@ try {
     return route.continue();
   });
   await page.goto(`http://127.0.0.1:${server.address().port}`);
-  receipt.result = await page.evaluate(async (imageRows) => {
+  receipt.result = await page.evaluate(async ({imageRows, baseline}) => {
     const widget = await import('/widget.js');
     const legacy={dataset:{hmbImageSourceScrollTop:'210',hmbVideoSourceScrollTop:'320',hmbManagerBodyScrollTop:'430'}};
     const scrollKeys=['imageSources','videoSources','managerBody'];
@@ -78,30 +79,81 @@ try {
       host.querySelector(`[data-prompt-shot="${shots[index].shot_uuid}"]`).click();
       await frames(); await frames();
     };
+    const newProbe = () => ({normalize: 0, render: 0, tree_patch: 0, fit: 0, listeners: 0});
+    globalThis.__pageStacks = [];
+    globalThis.__pageProbe = newProbe();
     controller = widget.default(host, props(latest));
+    const firstMount = {...globalThis.__pageProbe};
+    globalThis.__pageProbe = null;
+    const lazy = imageRows === 50;
+    if (firstMount.render !== (lazy ? 1 : 5) || publications !== 0) throw Error(`Unexpected initial preparation: ${JSON.stringify(firstMount)}`);
     await frames();
+    globalThis.__pageProbe = newProbe();
+    const firstVisitStart = performance.now();
+    host.querySelector(`[data-prompt-shot="${shots[1].shot_uuid}"]`).click();
+    const firstVisitSyncMs = performance.now() - firstVisitStart;
+    await frames(); await frames();
+    const firstVisit = {...globalThis.__pageProbe};
+    globalThis.__pageProbe = null;
+    const firstVisitedEditor = host.querySelector('.center');
+    if (firstVisit.render !== (lazy ? 1 : 0) || !firstVisitedEditor
+      || host.querySelector(`[data-text-key="${key}"]`).value !== expected.get(shots[1].shot_uuid)) {
+      throw Error(`Unexpected first Shot visit: ${JSON.stringify(firstVisit)}`);
+    }
     const references = new Map();
     for (let index = 0; index < 5; index++) {
       await select(index);
       references.set(shots[index].shot_uuid, {center: host.querySelector('.center'), text: host.querySelector(`[data-text-key="${key}"]`), row: host.querySelector('.source-row.image')});
     }
+    if (references.get(shots[1].shot_uuid).center !== firstVisitedEditor) throw Error('First visited editor was not retained');
     const add = EventTarget.prototype.addEventListener;
     EventTarget.prototype.addEventListener = function (...args) { if (globalThis.__pageProbe) globalThis.__pageProbe.listeners++; return add.apply(this, args); };
-    globalThis.__pageProbe = {normalize: 0, render: 0, tree_patch: 0, fit: 0, listeners: 0};
+    globalThis.__pageProbe = newProbe();
     globalThis.__pageStacks = [];
+    const layoutReads = {scrollTop: 0, textareaHeight: 0};
+    let inClick = false;
+    const installLayoutProbe = (prototype, property, counter, selector) => {
+      const original = Object.getOwnPropertyDescriptor(prototype, property);
+      Object.defineProperty(prototype, property, {...original, get() {
+        if (inClick && this.matches(selector)) layoutReads[counter]++;
+        return original.get.call(this);
+      }});
+      return () => Object.defineProperty(prototype, property, original);
+    };
+    const stopLayoutProbes = [
+      installLayoutProbe(Element.prototype, 'scrollTop', 'scrollTop', '.source-scrollbox,.center'),
+      installLayoutProbe(HTMLElement.prototype, 'offsetHeight', 'textareaHeight', '.source-note-input[data-textarea-key]'),
+    ];
+    const timedClick = shot => {
+      const started = performance.now();
+      inClick = true;
+      try { host.querySelector(`[data-prompt-shot="${shot.shot_uuid}"]`).click(); }
+      finally { inClick = false; }
+      return performance.now() - started;
+    };
     const durations = [];
     for (let index = 0; index < 40; index++) {
       const shot = shots[(index * 3 + 1) % 5];
-      const started = performance.now();
-      host.querySelector(`[data-prompt-shot="${shot.shot_uuid}"]`).click();
-      durations.push(performance.now() - started);
+      durations.push(timedClick(shot));
       const originalView = references.get(shot.shot_uuid);
       if (host.querySelector('.center') !== originalView.center || host.querySelector(`[data-text-key="${key}"]`) !== originalView.text || host.querySelector('.source-row.image') !== originalView.row) throw Error('A prepared view/control was recreated during navigation');
       if (originalView.text.value !== expected.get(shot.shot_uuid)) throw Error('Cross-shot literal text changed');
-      if (host.querySelectorAll('.center').length !== 1 || host.querySelectorAll('[data-group-id]').length !== 4) throw Error('Visible editor structure duplicated');
+      const groupIds = [...host.querySelectorAll('[data-group-id]')].map(group => group.dataset.groupId);
+      if (host.querySelectorAll('.center').length !== 1
+        || JSON.stringify(groupIds) !== JSON.stringify(['imageSources', 'imageText', 'videoSources', 'soundSources', 'videoText'])) {
+        throw Error(`Visible editor structure changed or duplicated: ${JSON.stringify(groupIds)}`);
+      }
     }
     await frames(); await frames();
-    for (const index of [4, 3, 2, 1, 0, 1, 2, 3, 4, 0]) await select(index);
+    const acknowledgedDurations = [];
+    for (const index of [4, 3, 2, 1, 0, 1, 2, 3, 4, 0]) {
+      acknowledgedDurations.push(timedClick(shots[index]));
+      await frames(); await frames();
+    }
+    stopLayoutProbes.forEach(stop => stop());
+    if (!baseline && Object.values(layoutReads).some(Boolean)) {
+      throw Error(`Cached shot navigation measured live layout: ${JSON.stringify(layoutReads)}`);
+    }
     const pure = {...globalThis.__pageProbe};
     if (Object.values(pure).some(Boolean)) throw Error(`Pure navigation performed expensive work: ${JSON.stringify(pure)} ${JSON.stringify(globalThis.__pageStacks)}`);
     globalThis.__pageProbe = null;
@@ -247,8 +299,10 @@ try {
     await frames();await frames();
     if(publications!==cleanupPublications)throw Error('Cleanup allowed a deferred navigation publication');
     if (host.children.length || host.__hmbPromptLibraryApplyProps || host.__hmbPromptLibraryLifecycle) throw Error('Cleanup left a cached page or lifecycle behind');
-    return {shots: 5, image_rows_per_shot: imageRows, burst_selections: 40, acknowledged_selections: 10, pure_navigation_work: pure, max_click_ms: max, per_shot_dirty_edit: 5, save_reopen_checks: 5, deleted_replaced_restored_uuid: true, publications, scroll_checks:17, rapid_scroll_switches:46, focus_caret_checks:5, legacy_scroll_checks:6, stale_scroll_ack_checks:1, post_scroll_save_reopen_checks:5, deferred_cleanup_checks:1, passed: true};
-  }, imageRows);
+    const sorted = [...durations].sort((a, b) => a - b);
+    const median = (sorted[19] + sorted[20]) / 2;
+    return {shots: 5, image_rows_per_shot: imageRows, initial_preparation: firstMount, first_other_visit: firstVisit, lazy_heavy: lazy, burst_selections: 40, acknowledged_selections: 10, pure_navigation_work: pure, first_visit_sync_ms: firstVisitSyncMs, median_click_ms: median, max_click_ms: max, burst_clicks_ms: durations, frame_separated_clicks_ms: acknowledgedDurations, synchronous_layout_reads: layoutReads, per_shot_dirty_edit: 5, save_reopen_checks: 5, deleted_replaced_restored_uuid: true, publications, scroll_checks:17, rapid_scroll_switches:46, focus_caret_checks:5, legacy_scroll_checks:6, stale_scroll_ack_checks:1, post_scroll_save_reopen_checks:5, deferred_cleanup_checks:1, passed: true};
+  }, {imageRows, baseline});
   assert.deepEqual(errors, []);
   assert.equal(receipt.external_requests, 0);
   receipt.passed = true;
@@ -259,8 +313,8 @@ try {
 } finally {
   await browser.close();
   await new Promise(resolve => server.close(resolve));
-  const output = new URL(`../../reports/slot-switch-optimization-20261020/prompt-prepared-pages${imageRows === 50 ? '-50' : ''}.json`, import.meta.url);
-  fs.mkdirSync(path.dirname(fileURLToPath(output)), {recursive: true});
+  const output = process.env.HMB_PROMPT_TEST_OUTPUT || fileURLToPath(new URL(`../../reports/slot-switch-optimization-20261020/prompt-prepared-pages${imageRows === 50 ? '-50' : ''}.json`, import.meta.url));
+  fs.mkdirSync(path.dirname(output), {recursive: true});
   fs.writeFileSync(output, JSON.stringify(receipt, null, 2) + '\n');
   console.log(JSON.stringify(receipt));
 }

@@ -16,6 +16,7 @@ registry.
 
 from dataclasses import dataclass, replace
 from contextlib import contextmanager
+import asyncio
 import logging
 import json
 import copy
@@ -216,13 +217,57 @@ def validate_shot_hierarchy_routing(binding: Any, routing: Mapping[str, Any]) ->
     return binding
 
 
-def apply_shot_hierarchy_edit(state: Mapping[str, Any], request: Any) -> dict[str, Any]:
-    """Pure, atomic transaction. Existing native slots and their media survive."""
+def shot_hierarchy_edit_structure(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Optimistic edit base: authored structure, not a media/status cursor."""
+    routing = state.get("shot_routing") or {}
+    binding = validate_shot_hierarchy_routing(state.get("shot_hierarchy"), routing)
+    binding.pop("revision", None)
+    for member in binding.get("members", []):
+        member.pop("status", None)
+    return {"project_identity": hierarchy_project_key(state),
+            "channel_uuid": routing.get("channel_uuid"),
+            "publisher_instance_uuid": routing.get("publisher_instance_uuid"),
+            "shots": [{key: row.get(key) for key in ("shot_uuid", "number", "name", "name_is_custom")}
+                      for row in routing.get("shots", [])], "binding": binding}
+
+
+def rebase_shot_hierarchy_edit(state: Mapping[str, Any], request: Any) -> dict[str, Any]:
+    """Permit incidental refresh only when the complete edit base still matches.
+
+    Legacy commands retain strict generation checks. Never overwrite a changed
+    name, slot, group, project, publisher, account or source identity.
+    """
     fields = {"schema", "version", "expected_generation", "expected_binding_revision", "removed_member_ids", "binding"}
-    if (not isinstance(request, dict) or set(request) != fields
+    if (not isinstance(request, dict) or set(request) not in (fields, fields | {"expected_structure"})
             or request.get("schema") != SHOT_HIERARCHY_REQUEST_SCHEMA
             or type(request.get("version")) is not int or request["version"] != 1):
         raise ValueError("샷 구성 요청이 올바르지 않습니다.")
+    if "expected_structure" not in request:
+        return request
+    if (type(request.get("expected_generation")) is not int
+            or type(request.get("expected_binding_revision")) is not int
+            or request["expected_generation"] < 0 or request["expected_binding_revision"] < 0
+            or request["expected_structure"] != shot_hierarchy_edit_structure(state)):
+        raise ValueError("샷 구성이 변경되었습니다. 현재 구성을 확인한 뒤 다시 선택하세요.")
+    command = copy.deepcopy(request)
+    binding = normalize_shot_hierarchy(command["binding"])
+    if binding.get("revision") != request["expected_binding_revision"] + 1:
+        raise ValueError("샷 구성 요청의 수정 번호가 올바르지 않습니다.")
+    prior = state.get("shot_hierarchy") or {}
+    current_status = {row["member_id"]: row.get("status") for row in prior.get("members", [])}
+    for row in binding.get("members", []):
+        if row.get("origin") == "cgt" and row["member_id"] in current_status:
+            row["status"] = current_status[row["member_id"]]
+    command["expected_generation"] = state["shot_routing"]["generation"]
+    command["expected_binding_revision"] = prior.get("revision", 0)
+    binding["revision"] = command["expected_binding_revision"] + 1
+    command["binding"] = binding
+    return command
+
+
+def apply_shot_hierarchy_edit(state: Mapping[str, Any], request: Any) -> dict[str, Any]:
+    """Pure, atomic transaction. Existing native slots and their media survive."""
+    request = rebase_shot_hierarchy_edit(state, request)
     routing = state.get("shot_routing") or {}
     prior = validate_shot_hierarchy_routing(state.get("shot_hierarchy"), routing)
     if (type(request.get("expected_generation")) is not int or request["expected_generation"] != routing.get("generation")
@@ -299,6 +344,7 @@ def capture_shot_hierarchy(node: Any, channel_uuid: str, shot_uuid: str) -> dict
 
 KIND_IMAGE_ASSET = "image_asset"
 KIND_VIDEO_PICKER = "video_picker"
+KIND_SOUND = "sound"
 KIND_PROMPT = "prompt"
 KIND_AGENT = "agent"
 KIND_SEEDANCE = "seedance"
@@ -313,9 +359,10 @@ KNOWN_KINDS = frozenset(
         KIND_SEEDANCE,
         KIND_FINISH_LOOK,
         KIND_COLOR_LUT,
+        KIND_SOUND,
     }
 )
-SINGLETON_KINDS = frozenset({KIND_IMAGE_ASSET, KIND_VIDEO_PICKER})
+SINGLETON_KINDS = frozenset({KIND_IMAGE_ASSET, KIND_VIDEO_PICKER, KIND_SOUND})
 
 _LOGGER = logging.getLogger("griptape_nodes")
 _ROUTING_LOCK = threading.RLock()
@@ -580,7 +627,7 @@ def _normalize_subscription(node: Any, raw: Any) -> ShotSubscription | None:
     channel_uuid = _clean(raw.get("channel_uuid"), 128)
     shot_uuid = _clean(raw.get("shot_uuid"), 128)
     enabled = bool(raw.get("enabled")) and bool(channel_uuid)
-    if kind not in {KIND_IMAGE_ASSET, KIND_VIDEO_PICKER}:
+    if kind not in {KIND_IMAGE_ASSET, KIND_VIDEO_PICKER, KIND_SOUND}:
         enabled = enabled and bool(shot_uuid)
     return ShotSubscription(
         node=node,
@@ -1424,20 +1471,7 @@ def schedule_post_hydration_reconcile(node: Any) -> bool:
 
 
 def schedule_post_deletion_reconcile(node: Any) -> bool:
-    """Reconcile surviving participants after ``node`` leaves its flow.
-
-    ``after_node_deleted`` runs while the deleted object can still be present
-    in ``NodeManager``.  ``_subscription_for`` already excludes an object as
-    soon as its deletion flag is set, so the host deletion callback itself is
-    the safest deterministic reconciliation point: it runs on the retained-
-    mode dispatch thread, before the parent removes ordinary incident edges.
-
-    Never fall back to ``threading.Timer`` here.  NodeManager, FlowManager and
-    node setters are retained-mode state and may not be called from a timer
-    worker.  A single synchronous pass is both bounded and sufficient because
-    the deleted object remains useful as the exact same-flow anchor while its
-    subscription has already become invisible.
-    """
+    """Let the host remove the node and its wires before rebuilding Shot routes."""
 
     try:
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes  # type: ignore
@@ -1462,6 +1496,33 @@ def schedule_post_deletion_reconcile(node: Any) -> bool:
             return False
     except Exception:
         return False
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None and loop is GriptapeNodes.EventManager().event_loop:
+        # call_soon preserves this request's workflow context. Identity checks
+        # keep the callback out of a closed, replaced or same-name flow.
+        def after_removal() -> None:
+            try:
+                if GriptapeNodes.FlowManager().get_flow_by_name(flow_name) is not flow:
+                    return
+                if any(candidate is node for candidate in flow.nodes.values()):
+                    return
+                for candidate in tuple(flow.nodes.values()):
+                    if (_subscription_for(candidate) is not None
+                            and manager.get_node_by_name(candidate.name) is candidate
+                            and manager.get_node_parent_flow_by_name(candidate.name) == flow_name):
+                        reconcile_shot_routing(candidate, _allow_unready_cleanup=True)
+                        return
+            except Exception:
+                _LOGGER.debug("Post-deletion Shot routing skipped", exc_info=True)
+
+        loop.call_soon(after_removal)
+        return True
+
+    # A host without an owning event loop must stay on its dispatch thread.
     try:
         result = reconcile_shot_routing(node, _allow_unready_cleanup=True)
     except Exception:
@@ -1709,6 +1770,67 @@ def _color_lut_edge_would_cycle(
     return False
 
 
+def _reconcile_sound_routes(values: list[ShotSubscription], subscriptions: dict[str, ShotSubscription], nodes: list[Any]) -> int:
+    """Optional Sound is a third source; it never owns Shot identity or runs work."""
+    from pathlib import Path
+    from _hmb_connection_management import is_detached, relationship_suspended
+    sources = []
+    for node in nodes:
+        metadata = getattr(node, "metadata", {}) or {}
+        if (type(node).__name__ != "HMBSoundLibrary" or metadata.get("library") != "HMB_GP_Production"
+                or metadata.get("node_type") != "HMBSoundLibrary" or is_detached(node)
+                or getattr(node, "_hmb_node_deleted", False)):
+            continue
+        import inspect
+        try:
+            if Path(inspect.getfile(type(node))).resolve() != Path(__file__).with_name("HMBSoundLibrary.py").resolve():
+                continue
+        except (TypeError, OSError):
+            continue
+        sources.append(node)
+    changed = 0
+    # Disconnected Sound is optional. Ambiguous sources never overwrite a port.
+    sound = sources[0] if len(sources) == 1 else None
+    if sound is not None:
+        image_sources = [item for item in values if item.kind == KIND_IMAGE_ASSET and item.enabled and not relationship_suspended(item.node, sound)]
+        if len(image_sources) == 1:
+            image = image_sources[0]
+            sound_sub = _subscription_for(sound)
+            if sound_sub is not None and sound_sub.channel_uuid == image.channel_uuid:
+                ok, detail = _ensure_edge(ShotEdge(image.node, "SHOT_ASSET_OUT", sound, "SHOT_ASSET_IN"), subscriptions)
+                changed += int(ok and detail == "created")
+    for target in values:
+        port = "SOUND_IN" if target.kind in {KIND_PROMPT, KIND_COLOR_LUT} else "SHOT_SOUND_IN" if target.kind == KIND_SEEDANCE else ""
+        if not port or is_detached(target.node):
+            continue
+        getter = getattr(target.node, "get_parameter_by_name", None)
+        try:
+            if not callable(getter) or getter(port) is None:
+                continue
+        except Exception:
+            continue
+        eligible = sound is not None and not relationship_suspended(sound, target.node)
+        sound_sub = _subscription_for(sound) if sound is not None else None
+        if eligible and target.enabled and (sound_sub is None or not sound_sub.enabled or sound_sub.channel_uuid != target.channel_uuid):
+            eligible = False
+        if not eligible:
+            removed, _detail = _clear_hmb_route(target.node, port, subscriptions, source_parameter="SHOT_SOUND_OUT")
+            changed += removed
+            continue
+        ok, detail = _ensure_edge(ShotEdge(sound, "SHOT_SOUND_OUT", target.node, port), subscriptions)
+        changed += int(ok and detail == "created")
+        if ok:
+            hydrate = getattr(target.node, "_hmb_hydrate_sound_source", None)
+            if callable(hydrate):
+                hydrate(sound)
+            elif detail == "created":
+                setter = getattr(target.node, "set_parameter_value", None)
+                snapshot = getattr(sound, "_hmb_sound_snapshot_for", None)
+                if callable(setter) and callable(snapshot):
+                    setter(port, snapshot())
+    return changed
+
+
 def _reconcile_color_lut_routes(
     values: list[ShotSubscription], subscriptions: dict[str, ShotSubscription],
     nodes: list[Any],
@@ -1716,6 +1838,7 @@ def _reconcile_color_lut_routes(
     """Attach completed results by origin, independent of current source selection."""
     from _hmb_connection_management import is_detached, target_has_suspended_role
     _reconcile_color_lut_projects(nodes)
+    sound_changed = _reconcile_sound_routes(values, subscriptions, nodes)
     completed: dict[tuple[str, str], list[ShotSubscription]] = {}
     eligible = {id(item.node) for item in values}
     generators = {name: item for name, item in subscriptions.items()
@@ -1786,7 +1909,7 @@ def _reconcile_color_lut_routes(
             except Exception:
                 ok, detail = False, "completed source publication failed"
         _notify_status(target.node, ok=ok, code="ready" if ok else "route_incomplete", details=detail)
-    return changed
+    return changed + sound_changed
 
 
 def _reconcile_color_lut_projects(nodes: list[Any], project_source: Any = None, project_state: Any = None) -> None:
@@ -2272,6 +2395,10 @@ def _subscription_is_authoritative(subscription: ShotSubscription) -> bool:
 def _subscription_requires_authority(subscription: ShotSubscription) -> bool:
     # ImageAsset never has an Only mode, so even its constructor-default
     # channel can invalidate every downstream subscriber if treated as final.
+    # Sound consumes the catalog. Its optional saved state must not block
+    # ImageAsset -> VideoPicker -> Prompt catalog discovery.
+    if subscription.kind == KIND_SOUND:
+        return False
     # Disabled blank recipients are legitimate standalone/waiting nodes and do
     # not need to delay an unrelated Shot chain.
     return bool(
@@ -3892,6 +4019,7 @@ __all__ = [
     "KIND_PROMPT",
     "KIND_SEEDANCE",
     "KIND_VIDEO_PICKER",
+    "KIND_SOUND",
     "MAX_SHOTS",
     "SINGLETON_KINDS",
     "SHOT_ROUTING_PROTOCOL_VERSION",

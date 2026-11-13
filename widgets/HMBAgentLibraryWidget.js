@@ -52,6 +52,23 @@ function hmbAgentEscape(value) {
   }[char]));
 }
 
+const HMB_AGENT_EXECUTION_STAGES = Object.freeze({
+  source_wait: "소스 준비 중…", policy_verify: "정책 검증 중…",
+  policy_bootstrap: "최초 정책 준비 중…", prompt_prepare: "프롬프트 준비 중…",
+  native_prepare: "모델 요청 준비 중…", media_prepare: "참고 미디어 준비 중…",
+  inference: "모델 응답 대기 중…", finalize: "결과 정리 중…", complete: "",
+});
+function hmbAgentPublicProgress(raw) {
+  const stage = Object.hasOwn(HMB_AGENT_EXECUTION_STAGES, String(raw?.execution_stage || "")) ? raw.execution_stage : "";
+  const elapsed = Number(raw?.execution_elapsed_seconds);
+  return {execution_stage: stage, execution_elapsed_seconds: Number.isFinite(elapsed) && elapsed >= 0 ? Math.min(elapsed, 86400) : 0};
+}
+export function hmbAgentProgressLabel(raw, fallback = "") {
+  const progress = hmbAgentPublicProgress(raw);
+  const label = HMB_AGENT_EXECUTION_STAGES[progress.execution_stage] || fallback;
+  return label;
+}
+
 function hmbAgentCatalog(value) {
   const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
   const publisher = String(source.publisher_instance_uuid || "").trim().slice(0, 128);
@@ -130,6 +147,7 @@ export function hmbAgentState(props) {
     schema: "hmb-agent-ui", schema_version: 2, native_agent: true,
     policy_vault: "sealed", policy_injection: "runtime_only", output_sanitizer: true,
     execution_phase: executionPhase,
+    ...hmbAgentPublicProgress(state),
     shot_manager: true,
     shot_editor_expanded: state.shot_editor_expanded !== false,
     shot_states: Object.fromEntries(Object.entries(state.shot_states || {}).filter(([, value]) => ["preparing", "running", "succeeded", "failed", "cancelled"].includes(value))),
@@ -263,7 +281,7 @@ function hmbAgentRows(state) {
 
 function renderAgentDashboard(state, container) {
   const paletteShotNumber = hmbAgentDisplayShotNumber(container, state);
-  const executionStatus = hmbAgentExecutionStatus(state.execution_phase);
+  const executionStatus = hmbAgentProgressLabel(state, hmbAgentExecutionStatus(state.execution_phase));
   const height = hmbAgentWidgetHeight(state);
   return `
     <style>
@@ -331,7 +349,7 @@ function hmbRefreshAgentDashboard(container, props) {
   hmbPrepareAgentCanvasGestures(container);
   const paletteShotNumber = hmbAgentDisplayShotNumber(container, state);
   const error = container.__hmbAgentShotChangeError || "";
-  const signature = JSON.stringify([paletteShotNumber, state.execution_phase, error,
+  const signature = JSON.stringify([paletteShotNumber, state.execution_phase, state.execution_stage, state.execution_elapsed_seconds, error,
     state.shot_manager, state.only_mode, state.shot, state.shot_catalog,state.manual_rebind,
     container.__hmbAgentManualPending?.request_id,container.__hmbAgentManualError]);
   if (root.__hmbAgentPresentationSignature === signature) return true;
@@ -351,7 +369,7 @@ function hmbRefreshAgentDashboard(container, props) {
     hmbSyncAgentShotSelect(select, state);
     select.style.display = state.shot_manager || state.only_mode ? "none" : "";
   }
-  const executionStatus = hmbAgentExecutionStatus(state.execution_phase);
+  const executionStatus = hmbAgentProgressLabel(state, hmbAgentExecutionStatus(state.execution_phase));
   hmbRefreshManualAgentRebind(container,state);
   hmbSetAgentStatus(
     container,
@@ -751,10 +769,14 @@ export function hmbAgentShotRowState(props) {
   return {schema:"hmb-agent-shot-row",version:1,
     shot:valid ? {channel_uuid:shot.channel_uuid,shot_uuid:shot.shot_uuid,number,name:String(shot.name || `Shot ${number}`).slice(0,128),revision:Number(shot.revision)||0} : {},
     selected:valid && raw.selected === true,expanded:valid && raw.expanded === true,
+    ...(valid && raw.display_page && typeof raw.display_page.prompt === "string" ? {
+      display_page:Object.fromEntries(["prompt","additional_context","output"]
+        .filter(key=>typeof raw.display_page[key]==="string").map(key=>[key,raw.display_page[key]]))} : {}),
     ...(raw?.routing_pending===true ? {routing_pending:true} : {}),
     request_id:/^[0-9a-f]{32}$/.test(String(raw?.request_id || "")) ? raw.request_id : "",
     ...(/^[0-9a-f]{32}$/.test(String(raw?.rejected_request_id || "")) && raw?.error_code==="SHOT_IDENTITY_UNAVAILABLE"
       ? {rejected_request_id:raw.rejected_request_id,error_code:raw.error_code} : {}),
+    ...hmbAgentPublicProgress(raw),
     status:["preparing","running","succeeded","failed","cancelled"].includes(raw?.status) ? raw.status : ""};
 }
 
@@ -797,8 +819,8 @@ function hmbAgentShotRowWidget(container, initialProps) {
   const unregister=()=>{const entry=channelEntry();if(!entry)return;if(entry.pending?.owner===container)finish(entry.pending);entry.owners.delete(owner);if(!entry.owners.size)hmbAgentRowChannels.delete(channel);};
   const register=()=>{const next=hmbAgentShotRowState(props).shot.channel_uuid || "";if(next===channel)return;unregister();channel=next;acceptedAck="";retiredAcks.clear();if(channel){if(!hmbAgentRowChannels.has(channel))hmbAgentRowChannels.set(channel,{owners:new Set(),pending:null,themes:new WeakMap()});channelEntry().owners.add(owner);}};
   const rememberTheme=state=>{const host=hmbAgentNodeRoot(container);if(state.selected && host)channelEntry()?.themes.set(host,{shotUuid:state.shot.shot_uuid,number:state.shot.number});};
-  const finish=(ticket,error)=>{const entry=channelEntry();if(entry?.pending!==ticket)return;for(const id of ticket.frames)cancelAnimationFrame(id);clearTimeout(ticket.fallback);clearTimeout(ticket.expiry);ticket.guardCleanup?.();entry.pending=null;if(error && !disposed)lastError=String(error?.message||error);refreshChannel();};
-  const recover=(ticket,error)=>{if(disposed || channelEntry()?.pending!==ticket)return;ticket.recovering=true;lastRejected=false;lastError=String(error?.message||error);clearTimeout(ticket.expiry);refreshChannel();};
+  const finish=(ticket,error)=>{const entry=channelEntry();if(entry?.pending!==ticket)return;for(const id of ticket.frames)cancelAnimationFrame(id);clearTimeout(ticket.fallback);clearTimeout(ticket.expiry);ticket.liveCleanup?.();ticket.guardCleanup?.();entry.pending=null;if(error && !disposed)lastError=String(error?.message||error);refreshChannel();};
+  const recover=(ticket,error)=>{if(disposed || channelEntry()?.pending!==ticket)return;ticket.liveCleanup?.();ticket.liveCleanup=null;ticket.recovering=true;lastRejected=false;lastError=String(error?.message||error);clearTimeout(ticket.expiry);refreshChannel();};
   const reject=(ticket,error)=>{
     if(disposed || channelEntry()?.pending!==ticket)return;
     for(const id of ticket.acceptedIds)retiredAcks.add(id);
@@ -820,7 +842,7 @@ function hmbAgentShotRowWidget(container, initialProps) {
     const own=ticket?.owner===container;
     const current=switching ? {...canonical,selected:own,expanded:own && ticket.expanded} : canonical;
     const recovering=own && ticket?.recovering;
-    const text=canonical.routing_pending ? "샷 연결 확인 중…" : own ? (recovering ? "응답 확인 필요" : switching ? "전환 중…" : "전달 중…") : lastError ? (lastRejected ? "요청 거절됨" : "응답 확인 필요") : ({preparing:"소스 준비 중…",running:"Agent 실행 중…",succeeded:"완료",failed:"실패",cancelled:"취소"})[current.status] || "";
+    const text=canonical.routing_pending ? "샷 연결 확인 중…" : own ? (recovering ? "응답 확인 필요" : switching ? "전환 중…" : "전달 중…") : lastError ? (lastRejected ? "요청 거절됨" : "응답 확인 필요") : hmbAgentProgressLabel(current, ({preparing:"소스 준비 중…",running:"Agent 실행 중…",succeeded:"완료",failed:"실패",cancelled:"취소"})[current.status] || "");
     const running=["preparing","running"].includes(current.status),runText=recovering ? "↻" : running ? "■" : "▷";
     const title=recovering?"현재 상태만 확인합니다. Agent/Run은 다시 실행하지 않습니다.":lastError || (running?"이 샷 Agent만 취소":"이 샷 Agent만 실행");
     const disabled=Boolean(ticket) || Boolean(canonical.routing_pending) || !shot.shot_uuid,runDisabled=disabled && (!recovering || Boolean(canonical.routing_pending));
@@ -856,7 +878,7 @@ function hmbAgentShotRowWidget(container, initialProps) {
     const mutationIds=new Set(previous?.mutationIds || []),rejectedIds=new Set(previous?.rejectedIds || []);
     if(kind!=="refresh")mutationIds.add(requestId);
     const ticket={owner:container,kind,requestId,acceptedIds,mutationIds,rejectedIds,shotNumber:current.shot.number,expanded:current.selected ? !current.expanded : true,frames:[],dispatched:false};
-    const {rejected_request_id:_rejectedRequest,error_code:_errorCode,...commandState}=current;
+    const {rejected_request_id:_rejectedRequest,error_code:_errorCode,display_page:_displayPage,...commandState}=current;
     const next={...commandState,action:{kind,request_id:requestId,...(kind==="select" ? {expanded:ticket.expanded} : {})}};
     lastError="";lastRejected=false;
     if(previous)finish(previous);
@@ -868,15 +890,22 @@ function hmbAgentShotRowWidget(container, initialProps) {
       }
       ticket.dispatched=true;clearTimeout(ticket.fallback);
       let result;try{result=props.onChange(next);}catch(error){recover(ticket,error);return;}
+      // onChange clears the host's live-value store; project only afterwards.
+      // A synchronous ACK already finished the lease and must win over preview.
+      if(kind==="select" && ticket.expanded && channelEntry()?.pending===ticket &&
+          current.display_page && typeof props.onLiveChange==="function"){
+        const live=props.onLiveChange;
+        ticket.liveCleanup=()=>{try{live(Object.fromEntries(Object.keys(current.display_page).map(key=>[key,undefined])));}catch{}};
+        try{live(current.display_page);}catch{/* Hosts without live projection keep the normal native page. */}
+      }
       // Resolution alone only confirms delivery. Keep the row/Run lease until
       // its canonical request ID acknowledges the actual native editor change.
       Promise.resolve(result).catch(error=>recover(ticket,error));
     };
-    ticket.frames.push(requestAnimationFrame(()=>{if(!disposed && channelEntry()?.pending===ticket)ticket.frames.push(requestAnimationFrame(dispatch));}));
-    // Background tabs can throttle rAF. This fallback still yields to painting;
-    // the guarded dispatcher makes rAF/timer/duplicates exactly one command.
-    ticket.fallback=setTimeout(dispatch,120);
     ticket.expiry=setTimeout(()=>recover(ticket,new Error("Agent 응답을 확인하지 못했습니다. ↻로 현재 상태를 확인하세요. Agent/Run은 자동 재전송하지 않습니다.")),15000);
+    // Sending a page command is cheap. Waiting two animation frames added a
+    // visible delay and could stall indefinitely in a throttled Desktop view.
+    dispatch();
   };
   const selectClick=()=>send("select"),runClick=()=>send(channelEntry()?.pending?.recovering ? "refresh" : ["preparing","running"].includes(hmbAgentShotRowState(props).status)?"cancel_selected":"run_selected");
   const keydown=event=>{if(["Backspace","Delete"].includes(event.key))event.stopPropagation?.();};
@@ -1085,7 +1114,7 @@ function hmbAcquireNativeStockSafety(container) {
   let shared = doc[key];
   if (!shared) {
     const owners = new Set(), identities = new Map();
-    let contextNode = null, badge = null, notice = null, disposed = false;
+    let contextNode = null, notice = null, noticeTimer = null, disposed = false;
     const nativeReady = () => doc.documentElement.getAttribute("data-hmb-native-deletion-guard") === "engine-preflight"
       && doc.documentElement.getAttribute("data-hmb-native-deletion-protection-version") === "2";
     const rootOf = value => value?.closest?.(".react-flow__node[data-id]") || null;
@@ -1126,7 +1155,7 @@ function hmbAcquireNativeStockSafety(container) {
       if (!nodeMenu && !(trash && button.closest(".react-flow"))) return null;
       return { button, nodeMenu };
     };
-    const dismiss = () => { notice?.remove(); notice = null; };
+    const dismiss = () => { win.clearTimeout(noticeTimer); notice?.remove(); notice = null; };
     const show = () => {
       if (disposed || nativeReady()) return;
       if (notice?.isConnected) { notice.querySelector("button")?.focus(); return; }
@@ -1134,12 +1163,13 @@ function hmbAcquireNativeStockSafety(container) {
       notice.setAttribute("data-hmb-native-safety-notice", "required");
       notice.setAttribute("role", "alert");
       Object.assign(notice.style, { position: "fixed", zIndex: "2147483647", right: "20px", bottom: "64px", maxWidth: "420px", padding: "18px", border: "1px solid #b89458", borderRadius: "18px", background: "#151c29", color: "#f8fafc", font: "13px/1.6 system-ui,sans-serif", boxShadow: "0 8px 32px #0008" });
-      const title = doc.createElement("strong"); title.textContent = "HMB 편집기·삭제 보호 확인이 필요합니다";
+      const title = doc.createElement("strong"); title.textContent = "HMB 노드 삭제를 중단했습니다";
       const text = doc.createElement("p");
-      text.textContent = "Override 업데이트 로그에서 current/applied를 확인하세요. UI 또는 엔진 보호 상태를 확인하지 못해 감지된 HMB 노드 삭제 시도를 중단했습니다. 작업 저장 후 Griptape 완전 종료·재시작하세요. current/applied는 디스크 파일 상태이며 현재 화면의 통합 상태를 보장하지 않습니다. 실패 시 로그의 원인을 확인하세요. 이 안내만으로 다른 삭제 경로의 엔진 보호가 준비됐다고 보장할 수 없습니다.";
+      text.textContent = "현재 화면에서 연결 상태를 확인할 수 없습니다. 작업을 저장하고 Griptape를 다시 시작한 뒤 확인하세요.";
       const close = doc.createElement("button"); close.type = "button"; close.textContent = "확인";
       Object.assign(close.style, { border: "1px solid #64748b", borderRadius: "999px", background: "#243044", color: "#f8fafc", padding: "6px 18px", cursor: "pointer" });
       close.addEventListener("click", dismiss); notice.append(title, text, close); doc.body.append(notice); close.focus();
+      noticeTimer = win.setTimeout(dismiss, 8000);
     };
     const stop = event => { event.preventDefault(); event.stopPropagation(); event.stopImmediatePropagation(); show(); };
     const keydown = event => {
@@ -1151,12 +1181,12 @@ function hmbAcquireNativeStockSafety(container) {
       const action = deleteControl(event.target);
       if (action && (ownedTarget(action.button) || managed()
           || action.nodeMenu && contextNode?.isConnected && roots().has(contextNode))) stop(event);
-      else if (!event.target?.closest?.("[data-hmb-native-safety-notice],[data-hmb-native-safety-status]")) contextNode = null;
+      else if (!event.target?.closest?.("[data-hmb-native-safety-notice]")) { contextNode = null; dismiss(); }
     };
     const contextmenu = event => { contextNode = rootOf(event.target); };
     const dispose = () => {
       if (disposed) return;
-      disposed = true; observer?.disconnect(); badge?.remove(); dismiss(); contextNode = null;
+      disposed = true; observer?.disconnect(); dismiss(); contextNode = null;
       win.removeEventListener("keydown", keydown, true); win.removeEventListener("click", click, true); win.removeEventListener("contextmenu", contextmenu, true);
       if (doc[key] === shared) delete doc[key];
     };
@@ -1164,14 +1194,7 @@ function hmbAcquireNativeStockSafety(container) {
       if (disposed) return;
       const retained = roots();
       if (!owners.size && !retained.size) { dispose(); return; }
-      if (nativeReady() || !retained.size) { badge?.remove(); badge = null; dismiss(); return; }
-      if (badge?.isConnected || !doc.body) return;
-      badge = doc.createElement("button"); badge.type = "button";
-      badge.setAttribute("data-hmb-native-safety-status", "required");
-      badge.setAttribute("aria-label", "HMB Override 업데이트·재시작 및 삭제 보호 상태 확인");
-      badge.textContent = "HMB UI·삭제 보호 상태 확인";
-      Object.assign(badge.style, { position: "fixed", zIndex: "2147483646", right: "20px", bottom: "20px", border: "1px solid #b89458", borderRadius: "999px", padding: "7px 14px", background: "#151c29", color: "#f5d49a", font: "12px system-ui,sans-serif", cursor: "pointer", boxShadow: "0 4px 18px #0006" });
-      badge.addEventListener("click", show); doc.body.append(badge);
+      if (nativeReady() || !retained.size) dismiss();
     };
     const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(sync) : null;
     observer?.observe(doc.documentElement, { attributes: true, attributeFilter: ["data-hmb-native-deletion-guard", "data-hmb-native-deletion-protection-version", "data-id"], childList: true, subtree: true });

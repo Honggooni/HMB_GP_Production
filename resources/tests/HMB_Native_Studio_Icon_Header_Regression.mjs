@@ -51,7 +51,7 @@ var skr=x=>Math.max(600,Number(x)||600);
 var d8=({param})=>(0,R.jsx)('i',{'data-preserved-handle':param.parameter_name,'data-is-connectable':String(param.ui_options?.isConnectable),'data-mode':param.modes.join(','),style:{position:'absolute',width:1,height:1}});
 `;
 const app=String.raw`
-import mountAsset from '/asset.js';import mountPicker from '/picker.js';
+import mountAsset from '/asset.js';import mountPicker from '/picker.js';import mountSound from '/sound.js';
 const ownSurface={HMBColorLUTLibrary:'cl-head',HMBAgentLibrary:'agent-topbar',HMBFinishLookLibrary:'hmb-finish-look__topbar',HMBImageBash:'hmb-image-bash-header__row',HMBImageGeneration:'hmb-image-generation-header__row',HMBSeedanceGeneration:'hmb-seedance-shot__row',HMBPromptLibrary:'topbar'};
 const uid=n=>'aaaaaaaa-aaaa-4aaa-8aaa-'+String(n).padStart(12,'0');
 window.values={};window.controllers={};window.bodyCommands=[];window.carrierEpoch={};
@@ -89,6 +89,27 @@ window.load=(type,view='expanded',collapsed=false,icon='image',hasSize=true)=>{
  window.values[name]=type==='HMBImageAssetLibrary'?{project_root:'C:/fixture/project',project_id:'project',assets:[]}:type==='HMBVideoPickerLibrary'?{language:'ko',runtime_instance_id:'icon-header-test',state_revision:1,picker_shots:[{workspace_uuid:uid(1),number:1,name:'Shot 1',video_asset_uids:[],selected_video_uids:[]}],active_picker_shot_uuid:uid(1),videos:[]}:{};
  window.sdk=[];window.bodyCommands=[];window.carrierEpoch={};window.renderApp();return name;
 };window.ready=true;
+window.probeSoundNativeView=()=>{
+ const type='HMBSoundLibrary',name='Synthetic Sound compact';
+ const metadata={library:'HMB_GP_Production',hmb_native_studio_ui:{schema:'hmb-native-studio-ui',version:1,node_type:type,widget:'HMBSoundLibraryWidget'}};
+ const state={project_uid:'synthetic',shot:{},tracks:[{instance_id:'saved-sound',name:'Saved audio'}]};
+ let authoredCalls=0;
+ const mount=parent=>{const host=document.createElement('div');parent.replaceChildren(host);
+  return mountSound(host,{nodeName:name,value:state,onChange:()=>authoredCalls++});};
+ const create=()=>{const node=document.createElement('article');node.className='react-flow__node';node.dataset.id=name;
+  node.style.cssText='width:1100px;height:730px';document.body.append(node);return node;};
+ const view=node=>hmbNativeStudioView(type,node)?.view;
+ let node=create(),controller=mount(node);
+ const observed={before:view(node),metadataDeclares:hmbIsNativeStudioType(type,metadata),stockUndeclared:hmbIsNativeStudioType(type)};
+ hmbNativeStudioDoubleClick(type,name,null,metadata)();observed.compact=view(node);
+ const snapshot=hmbNativeStudioCollapseMetadata({id:name,data:{node_type:type,metadata}},true,false).hmb_native_studio_view;
+ controller.cleanup();controller=mount(node);observed.beforeRestore=view(node);
+ hmbNativeStudioRestoreView(type,node);observed.afterRestore=view(node);
+ controller.cleanup();node.remove();node=create();controller=mount(node);observed.coldDefault=view(node);
+ hmbNativeStudioRestoreView(type,node,snapshot);observed.coldRestore=view(node);
+ observed.bindingPreserved=Boolean(node.querySelector('[data-instance="saved-sound"]'));observed.authoredCalls=authoredCalls;
+ controller.cleanup();node.remove();return observed;
+};
 `.replace('ORIGINAL_FLOOR',floor).replace('ORIGINAL_ARROW',arrow);
 const fullEjrStubs=String.raw`
 const subscribeToEvent=()=>()=>{};
@@ -129,7 +150,7 @@ const hostApp=fullNative?app.replace(/function Row\(\{node\}\)\{[\s\S]*?\nconst 
 const code=runtime+'\n'+jsx+'\n'+stubs+'\n'+baseStyle+'\n'+geometry+'\n'+anchors+'\n'+helper+'\n'+icon+'\n'+header+'\n'+collapse+'\n'+nativeQueue+'\n'+nativeStoreUpdater+'\n'+controlledStoreStubs+'\n'+nativeAnimation+'\n'+(fullNative?fullEjrStubs+'\n'+fullEjr+'\n'+delayedNativeRefresh:'')+'\n'+hostApp;
 if(process.env.HMB_ICON_HEADER_DEBUG_SOURCE)fs.writeFileSync(process.env.HMB_ICON_HEADER_DEBUG_SOURCE,code);
 const html='<!doctype html><meta charset="utf-8"><style>'+css+'\nbody{margin:12px;background:#111;color:#eee}.react-flow__node{flex:0 0 auto}.synthetic-studio-header{height:64px;display:flex;align-items:center;gap:12px;background:#142236}.synthetic-studio-header [data-hmb-native-identity]{flex:1;min-width:0}.synthetic-studio-header [data-hmb-native-actions]{display:flex}.synthetic-studio-header [data-hmb-native-actions]>div{display:flex}#app{display:flex;align-items:flex-start;gap:40px} [data-node-frame]>.relative{position:relative}</style><main id="app"></main><script type="module" src="/app.js"></script>';
-const server=http.createServer((req,res)=>{let value=html,mime='text/html';if(req.url==='/app.js'){value=code;mime='text/javascript'}else if(req.url==='/asset.js'){value=fs.readFileSync(path.join(root,'widgets/HMBImageAssetLibraryWidget.js'),'utf8');mime='text/javascript'}else if(req.url==='/picker.js'){value=fs.readFileSync(path.join(root,'widgets/HMBVideoPickerLibraryWidget_v032.js'),'utf8');mime='text/javascript'}else if(req.url==='/fixture-icon.svg'){value='<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" fill="pink"/></svg>';mime='image/svg+xml'}res.setHeader('Content-Type',mime);res.end(value)});await new Promise(r=>server.listen(0,'127.0.0.1',r));
+const server=http.createServer((req,res)=>{let value=html,mime='text/html';if(req.url==='/app.js'){value=code;mime='text/javascript'}else if(req.url==='/asset.js'){value=fs.readFileSync(path.join(root,'widgets/HMBImageAssetLibraryWidget.js'),'utf8');mime='text/javascript'}else if(req.url==='/picker.js'){value=fs.readFileSync(path.join(root,'widgets/HMBVideoPickerLibraryWidget_v032.js'),'utf8');mime='text/javascript'}else if(req.url==='/sound.js'){value=fs.readFileSync(path.join(root,'widgets/HMBSoundLibraryWidget.js'),'utf8');mime='text/javascript'}else if(req.url==='/fixture-icon.svg'){value='<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" fill="pink"/></svg>';mime='image/svg+xml'}res.setHeader('Content-Type',mime);res.end(value)});await new Promise(r=>server.listen(0,'127.0.0.1',r));
 const pw=nativeTestPlaywright();let browser;const report={scope:'Exact native React/Ejr/D$t/ejr/MAr/SAr/nodeQueue/StoreUpdater with actual browser ResizeObserver and Asset/Picker bodies; isolated store API/RAF clock/SDK/icon lookup and seven other bodies; SDK replies after animation completion',checks:0,cases:[],paid_calls:0,live_editor_actions:0};
 try{
  browser=await pw.chromium.launch({headless:true,executablePath:'C:/Program Files/Google/Chrome/Application/chrome.exe'});const page=await browser.newPage({viewport:{width:1900,height:1500}}),errors=[];page.on('pageerror',e=>{errors.push(e.message);console.error('ICON fixture pageerror: '+e.message+' / '+e.stack)});page.setDefaultTimeout(8000);const origin=`http://127.0.0.1:${server.address().port}`;await page.route('**/*',r=>r.request().url().startsWith(origin)?r.continue():r.abort());await page.goto(origin);await page.waitForFunction(()=>window.ready);
@@ -196,6 +217,12 @@ try{
   assert.equal(await page.evaluate(()=>window.forbidden),0);assert.equal(await page.evaluate(()=>window.sdk.every(c=>c.type==='SetNodeMetadataRequest')),true);report.checks+=2;report.cases.push({type,status:'PASS'});
   await page.evaluate(()=>{window.store=[];window.renderApp()});await page.waitForFunction(()=>!document.querySelector('.react-flow__node'));
  }
+ // The older stock renderer in this fixture does not pass declared widget
+ // metadata. Exercise the Sound helper boundary with the current metadata.
+ const sound=await page.evaluate(()=>window.probeSoundNativeView());
+ assert.deepEqual(sound,{before:'expanded',metadataDeclares:true,stockUndeclared:false,compact:'compact',
+  beforeRestore:'expanded',afterRestore:'compact',coldDefault:'expanded',coldRestore:'compact',bindingPreserved:true,authoredCalls:0});
+ report.checks+=Object.keys(sound).length;report.sound_declared_widget_view=sound;
  await page.evaluate(()=>window.load('HMBColorLUTLibrary','expanded',true,'/fixture-icon.svg'));await page.waitForFunction(()=>document.querySelector('[data-hmb-soft-link-icon="02"]'));assert.equal(await page.locator('[data-hmb-native-icon-header] img').count(),0);assert.deepEqual(await page.locator('[data-hmb-soft-link-icon] rect').evaluateAll(els=>els.map(el=>[el.getAttribute('x'),el.getAttribute('y'),el.getAttribute('width'),el.getAttribute('height'),el.getAttribute('rx')])),[['8','22','30','20','10'],['26','22','30','20','10']]);report.checks+=2;
  await page.getByRole('button',{name:'Expand Synthetic HMBColorLUTLibrary',exact:true}).press('Enter');await page.waitForFunction(()=>!document.querySelector('[data-hmb-native-icon-header]'));report.checks++;
  await page.evaluate(()=>{window.store=[];window.renderApp()});await page.waitForFunction(()=>!document.querySelector('.react-flow__node'));

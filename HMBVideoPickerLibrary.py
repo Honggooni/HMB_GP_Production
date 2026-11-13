@@ -4972,6 +4972,88 @@ def _picker_workspace_uuid_for_bound_shot(shot_uuid: Any) -> str:
 
 
 
+_PICKER_SCENE_FIELDS = (
+    "scene_stage", "scene_path", "scene_request_path", "scene_draft_path",
+    "scene_engine", "mode", "native_read_ready", "native_read_mode",
+    "native_source_version", "native_metadata", "camera", "selected_camera",
+    "cameras", "start_frame", "end_frame", "current_frame", "source_fps",
+    "output_fps", "output_width", "output_height", "has_maya_frame_range",
+    "source_frame_count", "output_frame_count", "decoded_frame_count",
+    "source_duration_seconds", "output_duration_seconds", "outliner_nodes",
+    "outliner_expanded", "selected_outliner_path", "selected_outliner_name",
+    "selected_outliner_uuid", "selected_outliner_paths", "outliner_selection_anchor",
+    "outliner_selection_scope", "selected_color", "outliner_search", "slot_assignments",
+    "slot_visibility", "depth_settings", "original_enabled", "mask_enabled",
+    "depth_enabled", "motion_guide_enabled", "original_video_path", "original_video_url",
+    "original_metadata", "original_preview_enabled", "snapshot_frame",
+    "snapshot_request_video_uid", "static_frame_range_valid", "static_camera_metadata_valid",
+    "static_metadata_complete",
+)
+
+
+def _is_picker_binary_scene(path: Any) -> bool:
+    return _maya_scene_path_text(path).lower().endswith(".mb")
+
+
+def _project_picker_scene(state: Dict[str, Any], workspace_uuid: Any) -> None:
+    owner = _uuid_text(state.get("picker_scene_owner_uuid"))
+    states = state.get("picker_scene_states")
+    if not (owner or (isinstance(states, dict) and any(_uuid_text(key) for key in states)) or any(
+        _is_picker_binary_scene(state.get(key))
+        for key in ("scene_path", "scene_draft_path", "scene_request_path")
+    )):
+        return
+    target = _uuid_text(workspace_uuid) or PICKER_DEFAULT_WORKSPACE_UUID
+    if not owner:
+        owner = _uuid_text(state.get("active_picker_shot_uuid")) or target
+    states = dict(states) if isinstance(states, dict) else {}
+    states[owner] = {key: state[key] for key in _PICKER_SCENE_FIELDS if key in state}
+    if owner != target:
+        saved = states.get(target)
+        saved = saved if isinstance(saved, dict) else {}
+        defaults = _default_widget_state()
+        for key in _PICKER_SCENE_FIELDS:
+            if key in saved or key in defaults:
+                state[key] = copy.deepcopy(saved[key] if key in saved else defaults[key])
+            else:
+                state.pop(key, None)
+    state["picker_scene_owner_uuid"] = target
+    state["picker_scene_states"] = states
+
+
+def _reset_picker_binary_scene_work(state: Dict[str, Any], scene_path: Any) -> Dict[str, Any]:
+    state = _parse_state(state)
+    owner = _uuid_text(state.get("active_picker_shot_uuid")) or PICKER_DEFAULT_WORKSPACE_UUID
+    owned_snapshot_uids = set()
+    owned_video_uids = set()
+    for row in state.get("picker_shots", []):
+        if row.get("workspace_uuid") == owner:
+            owned_snapshot_uids.add(_clean(row.get("active_snapshot_uid")))
+            owned_video_uids.update(row.get("video_asset_uids", []))
+            row.update({"active_snapshot_uid": "", "viewport_mode": "video"})
+    state["picker_scene_owner_uuid"] = owner
+    defaults = _default_widget_state()
+    for key in _PICKER_SCENE_FIELDS:
+        if key in defaults:
+            state[key] = defaults[key]
+        else:
+            state.pop(key, None)
+    path = _maya_scene_path_text(scene_path)
+    state.update({
+        "scene_path": path, "scene_draft_path": path, "scene_request_path": path,
+        "snapshot_active": False, "snapshot_video_slot": 0, "snapshot_data_uri": "",
+        "snapshot_path": "", "snapshot_url": "", "snapshot_sha256": "",
+        "active_snapshot_uid": "", "viewport_mode": "video", "workspace_view": "outliner",
+        "snapshots": [
+            item for item in state.get("snapshots", [])
+            if _uuid_text(item.get("picker_shot_uuid")) != owner
+            and _clean(item.get("snapshot_uid")) not in owned_snapshot_uids
+            and _clean(item.get("video_uid")) not in owned_video_uids
+        ],
+    })
+    return _parse_state(state)
+
+
 def _restore_picker_workspace_projection(
     state: Dict[str, Any],
     workspace: Any,
@@ -4989,6 +5071,7 @@ def _restore_picker_workspace_projection(
     workspace_uuid = _uuid_text(workspace.get("workspace_uuid"))
     if not workspace_uuid:
         return False
+    _project_picker_scene(state, workspace_uuid)
     try:
         current_frame = float(workspace.get("preview_frame") or 0.0)
         if not math.isfinite(current_frame):
@@ -5279,8 +5362,11 @@ def _normalize_picker_workspace_fields(
         # publisher absence alone must not destroy durable Picker history.
         last_meaningful_index = 0
         for index, raw in enumerate(valid_source_rows, start=1):
+            workspace_uuid = _uuid_text(raw.get("workspace_uuid"))
             raw_tools_by_shot = state.get("video_tools_by_shot")
-            raw_tools = raw_tools_by_shot.get(_uuid_text(raw.get("workspace_uuid")), {}) if isinstance(raw_tools_by_shot, dict) else {}
+            raw_tools = raw_tools_by_shot.get(workspace_uuid, {}) if isinstance(raw_tools_by_shot, dict) else {}
+            scene_states = state.get("picker_scene_states")
+            scene = scene_states.get(workspace_uuid) if isinstance(scene_states, dict) else None
             edit_draft = _video_tools.normalize_picker_tools_state(raw_tools)
             meaningful = bool(
                 _uuid_text(raw.get("bound_shot_uuid"))
@@ -5291,6 +5377,7 @@ def _normalize_picker_workspace_fields(
                 or edit_draft["crop"]["input"]
                 or edit_draft["crop_by_source"]
                 or edit_draft["external_sources"]
+                or (isinstance(scene, dict) and _maya_scene_path_text(scene.get("scene_draft_path") or scene.get("scene_path")))
             )
             if meaningful:
                 last_meaningful_index = index
@@ -5800,6 +5887,7 @@ def _activate_picker_workspace_projection(
         if _clean(uid)
     }
     projected = dict(normalized)
+    _project_picker_scene(projected, requested_uuid)
     projected["videos"] = []
     for raw in normalized.get("videos", []):
         if not isinstance(raw, dict):
@@ -6217,32 +6305,22 @@ def _emitter_identity_from_cue(
     )
     asset_id = _clean(source.get("asset_id"))
 
-    matched: Optional[Dict[str, Any]] = None
-    for marker in markers:
-        if not isinstance(marker, dict):
-            continue
-        if maya_uuid and _clean(marker.get("maya_uuid")).casefold() == maya_uuid.casefold():
-            matched = marker
-            break
-        if (
-            subject_root
-            and _clean(
-                marker.get("subject_root") or marker.get("full_dag_path")
-            ).casefold()
-            == subject_root.casefold()
-        ):
-            matched = marker
-            break
-        if (
-            asset_id
-            and marker_color
-            and _clean(marker.get("asset_id")).casefold() == asset_id.casefold()
-            and _clean(marker.get("color")).casefold() == marker_color.casefold()
-        ):
-            matched = marker
-            break
+    candidates = [marker for marker in markers if isinstance(marker, dict)]
+    if subject_root:
+        candidates = [marker for marker in candidates if _clean(
+            marker.get("subject_root") or marker.get("full_dag_path")) == subject_root]
+    elif maya_uuid:
+        candidates = [marker for marker in candidates
+                      if _clean(marker.get("maya_uuid")).casefold() == maya_uuid.casefold()]
+    elif not (asset_id and marker_color):
+        candidates = []
+    if asset_id and marker_color:
+        candidates = [marker for marker in candidates
+                      if _clean(marker.get("asset_id")).casefold() == asset_id.casefold()
+                      and _clean(marker.get("color")).casefold() == marker_color.casefold()]
+    matched = candidates[0] if len(candidates) == 1 else None
 
-    if matched is None and marker_color and not asset_id:
+    if matched is None and marker_color and not (asset_id or subject_root or maya_uuid):
         color_matches = [
             marker
             for marker in markers
@@ -7263,6 +7341,15 @@ def _merge_activity_logs(primary: Any, secondary: Any) -> List[Dict[str, str]]:
     return merged[-80:]
 
 
+def _picker_binding_identity(value: Dict[str, Any]) -> tuple[str, str]:
+    """Identify an exact scene instance; referenced files can repeat Maya UUIDs."""
+    path = _clean(value.get("full_dag_path") or value.get("subject_root"))
+    if path:
+        return ("path", path.replace("\\", "/"))
+    maya_uuid = _clean(value.get("maya_uuid"))
+    return ("uuid", maya_uuid.casefold()) if maya_uuid else ("", "")
+
+
 def _normalize_markers(value: Any, video_slot: Optional[int] = None) -> List[Dict[str, Any]]:
     markers: List[Dict[str, Any]] = []
     if not isinstance(value, list):
@@ -7282,16 +7369,11 @@ def _normalize_markers(value: Any, video_slot: Optional[int] = None) -> List[Dic
             raw.get("full_dag_path") or raw.get("subject_root")
         )
         reference_node = _clean(raw.get("reference_node"))
-        instance_identity = (
-            ("uuid", maya_uuid.casefold())
-            if maya_uuid
-            else ("dag", full_dag_path.replace("\\", "/").casefold())
-            if full_dag_path
-            else (
-                "legacy_asset",
-                reference_node.casefold(),
-                asset_id.casefold(),
-            )
+        identity = _picker_binding_identity(raw)
+        instance_identity = identity if identity[0] else (
+            "legacy_asset",
+            reference_node.casefold(),
+            asset_id.casefold(),
         )
         if instance_identity in seen_instances:
             continue
@@ -7344,18 +7426,8 @@ def _normalize_assignment_bindings(value: Any, video_slot: Optional[int] = None)
         full_dag_path = _clean(raw.get("full_dag_path") or raw.get("subject_root"))
         group_name = _clean(raw.get("group_name") or raw.get("display_name") or full_dag_path)
         maya_uuid = _clean(raw.get("maya_uuid"))
-        # A catalog-selection collapse or an older widget echo could merge the
-        # same editable Mask row into @video1 more than once.  Color edits then
-        # replaced only the first copy and left the stale shader assignment in
-        # the Maya job.  Maya UUID is the authoritative identity; exact DAG path
-        # is the compatibility fallback for legacy rows without UUID metadata.
-        object_identity = (
-            ("uuid", maya_uuid.lower())
-            if maya_uuid
-            else ("path", full_dag_path.replace("\\", "/").lower())
-            if full_dag_path
-            else ("", "")
-        )
+        # Deduplicate an exact row, never distinct references sharing a UUID.
+        object_identity = _picker_binding_identity(raw)
         if object_identity[0] and object_identity in seen_objects:
             continue
         if object_identity[0]:
@@ -7464,7 +7536,8 @@ def _outliner_selection_after_read(
 ) -> Dict[str, str]:
     """Choose a usable Color Pick target immediately after a Maya READ.
 
-    Maya UUID is preferred when a re-read changes a DAG path. A new scene has
+    Exact DAG paths win because repeated references can share Maya UUIDs.
+    A unique UUID can restore a renamed single target. A new scene has
     no previous target, so its first root (or first readable node) becomes the
     explicit selection instead of leaving every Color Pick button disabled.
     The displayed color is restored only from the currently edited video slot.
@@ -7480,20 +7553,16 @@ def _outliner_selection_after_read(
 
     requested_uuid = _clean(previous_uuid)
     requested_path = _clean(previous_path)
-    selected = None
-    if requested_uuid:
-        selected = next(
-            (
-                item for item in readable_nodes
-                if _clean(item.get("maya_uuid")).casefold() == requested_uuid.casefold()
-            ),
-            None,
-        )
-    if selected is None and requested_path:
-        selected = next(
-            (item for item in readable_nodes if _clean(item.get("full_path")) == requested_path),
-            None,
-        )
+    selected = next(
+        (item for item in readable_nodes if requested_path and _clean(item.get("full_path")) == requested_path),
+        None,
+    )
+    uuid_matches = [item for item in readable_nodes
+                    if requested_uuid and _clean(item.get("maya_uuid")).casefold() == requested_uuid.casefold()]
+    if selected is None and len(uuid_matches) > 1:
+        return {"path": "", "name": "", "uuid": "", "color": ""}
+    if selected is None and len(uuid_matches) == 1:
+        selected = uuid_matches[0]
     if selected is None:
         selected = next(
             (item for item in readable_nodes if not _clean(item.get("parent_path"))),
@@ -7516,19 +7585,21 @@ def _outliner_selection_after_read(
         if not isinstance(slot_item, dict) or int(slot_item.get("video_slot") or 0) != active_slot:
             continue
         bindings = slot_item.get("bindings") if isinstance(slot_item.get("bindings"), list) else []
-        for binding in bindings:
-            if not isinstance(binding, dict):
-                continue
-            binding_uuid = _clean(binding.get("maya_uuid"))
-            binding_path = _clean(binding.get("full_dag_path") or binding.get("subject_root"))
-            same_target = bool(
-                (selected_uuid and binding_uuid and selected_uuid.casefold() == binding_uuid.casefold())
-                or (selected_path and binding_path and selected_path == binding_path)
-            )
-            if same_target:
-                color = _clean(binding.get("color"))
-                selected_color = color if color in MARKER_ORDER else ""
-                break
+        bindings = [item for item in bindings if isinstance(item, dict)]
+        binding = next((item for item in bindings
+                        if _clean(item.get("full_dag_path") or item.get("subject_root")) == selected_path), None)
+        # Legacy/renamed targets may use UUID only when both sides are unique.
+        # Never borrow the color of another reference with the same UUID.
+        if binding is None and selected_uuid:
+            matching_nodes = [item for item in readable_nodes
+                              if _clean(item.get("maya_uuid")).casefold() == selected_uuid.casefold()]
+            matching_bindings = [item for item in bindings
+                                 if _clean(item.get("maya_uuid")).casefold() == selected_uuid.casefold()]
+            if len(matching_nodes) == 1 and len(matching_bindings) == 1:
+                binding = matching_bindings[0]
+        if binding is not None:
+            color = _clean(binding.get("color"))
+            selected_color = color if color in MARKER_ORDER else ""
         break
     return {
         "path": selected_path,
@@ -8842,6 +8913,9 @@ def _normalized_snapshot_record(
         "sha256": content_sha256,
         "created_at_ms": _snapshot_created_at_ms(raw.get("created_at_ms")),
     }
+    owner_uuid = _uuid_text(raw.get("picker_shot_uuid"))
+    if owner_uuid:
+        record["picker_shot_uuid"] = owner_uuid
     if not record["snapshot_uid"]:
         record["snapshot_uid"] = (
             "snapshot-legacy-" + _snapshot_record_signature(record)[:24]
@@ -9036,7 +9110,7 @@ def _append_snapshot_history_record(
         if result is None:
             raise ValueError("The captured Snapshot Shot no longer exists.")
     normalized_record = _normalized_snapshot_record(
-        record,
+        {**record, "picker_shot_uuid": target_workspace_uuid},
         _snapshot_catalog_uid_by_slot(result.get("videos")),
     )
     snapshot_uid = _clean(
@@ -9094,6 +9168,7 @@ def _parse_state(value: Any) -> Dict[str, Any]:
     state = _default_widget_state()
     if isinstance(source, dict):
         state.update(source)
+    _project_picker_scene(state, state.get("active_picker_shot_uuid"))
     _normalize_shot_selection_fields(state)
     _normalize_shot_catalog_watermark_fields(state)
     recovery_diagnostics: List[str] = []
@@ -9593,6 +9668,14 @@ def _parse_state(value: Any) -> Dict[str, Any]:
         picker_shots_present=isinstance(source, dict) and "picker_shots" in source,
     )
     _normalize_outliner_selection_fields(state)
+    if state.get("picker_scene_owner_uuid"):
+        _project_picker_scene(state, state.get("active_picker_shot_uuid"))
+        scene_states = state["picker_scene_states"]
+        state["picker_scene_states"] = {
+            row["workspace_uuid"]: scene_states[row["workspace_uuid"]]
+            for row in state.get("picker_shots", [])
+            if isinstance(scene_states.get(row["workspace_uuid"]), dict)
+        }
     tools_by_shot = state.get("video_tools_by_shot")
     tools_by_shot = tools_by_shot if isinstance(tools_by_shot, dict) else {}
     state["video_tools_by_shot"] = {
@@ -13915,17 +13998,24 @@ def _picker_tools_resolve_source(source: Dict[str, Any]) -> tuple[Path, Path]:
     return resolved, origin
 
 
-def _call_picker_sidecar_api(function: Any, *args: Any) -> Any:
-    """Supply the current host engine when required, without retrying a write."""
-    engine_parameter = inspect.signature(function).parameters.get("engine")
-    if engine_parameter is None:
-        return function(*args)
-    from griptape_nodes.retained_mode.engine import current_engine  # type: ignore
-
-    engine = current_engine()
-    if engine_parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
-        return function(*args, engine)
-    return function(*args, engine=engine)
+def _call_picker_sidecar_api(function: Any, *args: Any, workflow: Any = None) -> Any:
+    """Adapt declared host context arguments before the single metadata call."""
+    parameters = inspect.signature(function).parameters
+    context = {}
+    if "engine" in parameters:
+        from griptape_nodes.retained_mode.engine import current_engine  # type: ignore
+        context["engine"] = getattr(workflow, "engine", None) or current_engine()
+    if "workflow" in parameters:
+        context["workflow"] = workflow
+    positional = list(args)
+    keyword = {}
+    for name, parameter in parameters.items():
+        if name in context:
+            if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+                positional.append(context[name])
+            else:
+                keyword[name] = context[name]
+    return function(*positional, **keyword)
 
 
 def _copy_video_to_griptape_project(
@@ -13979,7 +14069,11 @@ def _copy_video_to_griptape_project(
             "Griptape project artifact rollback support is unavailable."
         ) from exc
 
-    project_destination = ProjectFileDestination.from_situation(
+    workflow = getattr(node, "workflow", None)
+    bound_destination = getattr(ProjectFileDestination, "from_situation_in_workflow", None)
+    destination_factory = bound_destination if callable(bound_destination) else ProjectFileDestination.from_situation
+    project_destination = destination_factory(
+        *((workflow,) if callable(bound_destination) else ()),
         filename=path.name,
         situation="copy_external_file",
         node_name=node_name,
@@ -14069,7 +14163,7 @@ def _copy_video_to_griptape_project(
             )
 
         actual_metadata = Path(
-            _call_picker_sidecar_api(_resolve_sidecar_path, actual_target)
+            _call_picker_sidecar_api(_resolve_sidecar_path, actual_target, workflow=workflow)
         ).resolve()
         if _scene_path_key(actual_metadata) == _scene_path_key(actual_target):
             raise RuntimeError(
@@ -14084,7 +14178,7 @@ def _copy_video_to_griptape_project(
         )
         if actual_metadata.exists():
             actual_metadata.unlink()
-        _call_picker_sidecar_api(write_sidecar, actual_target, sidecar_content)
+        _call_picker_sidecar_api(write_sidecar, actual_target, sidecar_content, workflow=workflow)
         if not actual_metadata.is_file():
             raise RuntimeError(
                 "Griptape project metadata sidecar was not created."
@@ -14370,7 +14464,7 @@ class HMBVideoPickerLibrary(DataNode):
         self._hmb_picker_publisher_uuid = str(uuid.uuid4())
         self._hmb_processed_action_ids: set[str] = set()
         self._hmb_active_operation: Optional[_OperationContext] = None
-        self._hmb_pending_scene_selection: Optional[tuple[str, str]] = None
+        self._hmb_pending_scene_selection: Optional[tuple[str, str, str]] = None
         self._hmb_last_public_output_fingerprint = ""
         self._hmb_last_shot_output_fingerprint = ""
         self._hmb_shot_catalog_snapshot: Optional[Dict[str, Any]] = None
@@ -14737,7 +14831,16 @@ class HMBVideoPickerLibrary(DataNode):
                 # Maya progress may start from a pre-navigation snapshot. Merge
                 # current UI edits, never send the user back to the capture Shot.
                 live = _parse_state(authoritative)
+                scene_owner = _uuid_text(normalized.get("picker_scene_owner_uuid"))
+                worker_scene = normalized.get("picker_scene_states", {}).get(scene_owner)
                 normalized = self._merge_widget_state(normalized, live)
+                if isinstance(worker_scene, dict):
+                    active_owner = _uuid_text(normalized.get("picker_scene_owner_uuid"))
+                    if active_owner == scene_owner:
+                        normalized.update(copy.deepcopy(worker_scene))
+                    else:
+                        normalized["picker_scene_states"][scene_owner] = worker_scene
+                        normalized["workspace_view"] = live.get("workspace_view")
                 for key in (
                     "active_picker_shot_uuid", "preview_video_uid", "selected_video_uid",
                     "selected_video_slot", "preview_frame", "viewport_mode", "active_snapshot_uid",
@@ -14957,9 +15060,6 @@ class HMBVideoPickerLibrary(DataNode):
             # A READ result is backend authority. Delayed browser props from
             # before READ must never erase its Outliner, selected Maya object,
             # or color bindings. Current UI edits still merge normally.
-            for key in widget_authoring_fields:
-                if key in incoming:
-                    merged[key] = incoming[key]
             # Catalog rows and media are Python/ImageAsset authority even when
             # a browser echo has the same revision. Apply only workspace-UUID
             # scoped UI deltas; never accept row creation/removal, ownership,
@@ -15055,7 +15155,14 @@ class HMBVideoPickerLibrary(DataNode):
                 _uuid_text(row.get("workspace_uuid"))
                 for row in merged_rows
             }:
+                _project_picker_scene(merged, requested_active_uuid)
                 merged["active_picker_shot_uuid"] = requested_active_uuid
+            merged_scene_owner = _uuid_text(merged.get("picker_scene_owner_uuid"))
+            incoming_scene_owner = _uuid_text(incoming.get("picker_scene_owner_uuid"))
+            if not merged_scene_owner or merged_scene_owner == incoming_scene_owner:
+                for key in widget_authoring_fields:
+                    if key in incoming:
+                        merged[key] = incoming[key]
 
             if accepted_workspace_delta:
                 # ``videos[*].selected`` is the legacy global projection of
@@ -15294,13 +15401,8 @@ class HMBVideoPickerLibrary(DataNode):
             asset_id = self._derive_asset_id(group_name or full_dag_path)
             if not asset_id:
                 errors.append(f"Assignment row {index} could not derive Asset ID from Group Name: {group_name}")
-            instance_identity = (
-                ("uuid", maya_uuid.casefold())
-                if maya_uuid
-                else ("dag", full_dag_path.replace("\\", "/").casefold())
-                if full_dag_path
-                else ("group", group_name.casefold())
-            )
+            identity = _picker_binding_identity(binding)
+            instance_identity = identity if identity[0] else ("group", group_name)
             if instance_identity in seen_instances:
                 errors.append(
                     f"Duplicate Maya instance in @video{slot}: "
@@ -16721,6 +16823,9 @@ class HMBVideoPickerLibrary(DataNode):
         return state
 
     def _current_scene_text(self, fallback: Any = "") -> str:
+        state = self._picker_state()
+        if state.get("picker_scene_owner_uuid"):
+            return _maya_scene_path_text(state.get("scene_request_path") or state.get("scene_path"))
         return next(
             (
                 candidate
@@ -16730,10 +16835,10 @@ class HMBVideoPickerLibrary(DataNode):
                     ),
                     _maya_scene_path_text(fallback),
                     _maya_scene_path_text(
-                        self._picker_state().get("scene_request_path")
+                        state.get("scene_request_path")
                     ),
                     _maya_scene_path_text(
-                        self._picker_state().get("scene_path")
+                        state.get("scene_path")
                     ),
                 )
                 if candidate
@@ -16841,9 +16946,31 @@ class HMBVideoPickerLibrary(DataNode):
             target_channel_uuid=_uuid_text(state.get("channel_uuid")),
         )
 
+    def _picker_state_for_operation(self, context: Optional[_OperationContext]) -> Dict[str, Any]:
+        state = self._picker_state()
+        if (
+            context is not None and state.get("picker_scene_owner_uuid")
+            and context.picker_shot_uuid != state.get("active_picker_shot_uuid")
+        ):
+            return _activate_picker_workspace_projection(state, context.picker_shot_uuid) or state
+        return state
+
+    @staticmethod
+    def _finish_snapshot_view(state: Dict[str, Any], context: Optional[_OperationContext], stage: str) -> None:
+        changes = {"scene_stage": stage, "snapshot_request_video_uid": ""}
+        if (
+            context is not None and state.get("picker_scene_owner_uuid")
+            and context.picker_shot_uuid != state.get("active_picker_shot_uuid")
+        ):
+            scenes = state["picker_scene_states"]
+            if context.picker_shot_uuid in scenes:
+                scenes[context.picker_shot_uuid] = {**scenes[context.picker_shot_uuid], **changes}
+        else:
+            state.update(changes, workspace_view="playblast")
+
     def _operation_stage_state(self, context: Optional[_OperationContext]) -> Dict[str, Any]:
         """Use frozen generation inputs together with the latest media/navigation state."""
-        state = self._picker_state()
+        state = self._picker_state_for_operation(context)
         if context is not None and context.authoring_json:
             state.update(json.loads(context.authoring_json))
         return state
@@ -16855,9 +16982,6 @@ class HMBVideoPickerLibrary(DataNode):
         if active is None or active.operation_id != context.operation_id:
             return False
         if self._hmb_cancel_requested.is_set():
-            return False
-        current_scene = self._current_scene_text(context.scene_path)
-        if _scene_fingerprint(current_scene) != context.scene_fingerprint:
             return False
         current_state = self._picker_state()
         if bool(current_state.get("operation_invalidated")):
@@ -16872,6 +16996,13 @@ class HMBVideoPickerLibrary(DataNode):
                 return False
             if _uuid_text(current_state.get("channel_uuid")) != context.target_channel_uuid:
                 return False
+        if current_state.get("picker_scene_owner_uuid"):
+            current_state = _activate_picker_workspace_projection(current_state, context.picker_shot_uuid) or current_state
+            current_scene = _maya_scene_path_text(current_state.get("scene_request_path") or current_state.get("scene_path"))
+        else:
+            current_scene = self._current_scene_text(context.scene_path)
+        if _scene_fingerprint(current_scene) != context.scene_fingerprint:
+            return False
         return _operation_input_digest(context.kind, current_scene, current_state, context.video_slot) == context.input_digest
 
     def _assert_operation_current(self, context: Optional[_OperationContext], stage: str) -> None:
@@ -16890,7 +17021,8 @@ class HMBVideoPickerLibrary(DataNode):
         state["operation_invalidated"] = True
         state["operation_invalidation_reason"] = _clean(reason)
         state["status"] = "CANCELLING"
-        state["scene_stage"] = "STALE_RESULT_DISCARD"
+        if not state.get("picker_scene_owner_uuid") or state["active_picker_shot_uuid"] == context.picker_shot_uuid:
+            state["scene_stage"] = "STALE_RESULT_DISCARD"
         state["message"] = _clean(reason) or "Active result invalidated."
         _append_activity_log(state, "WARNING", state["message"])
         self._write_state(state)
@@ -16900,7 +17032,7 @@ class HMBVideoPickerLibrary(DataNode):
                 _terminate_process(active_process)
 
     def _set_cancelled_state(self) -> None:
-        state = self._picker_state()
+        state = self._picker_state_for_operation(self._hmb_active_operation)
         operation_kind = _clean(state.get("operation_kind"))
         korean = _clean(state.get("language")).lower() == "ko"
         state = self._mark_operation_finished(state)
@@ -16983,7 +17115,7 @@ class HMBVideoPickerLibrary(DataNode):
         active = self._hmb_active_operation
         if active is None or active.operation_id != context.operation_id:
             return
-        state = self._picker_state()
+        state = self._picker_state_for_operation(context)
         reason = _clean(state.get("operation_invalidation_reason")) or reason
         state = self._mark_operation_finished(state)
         if context.kind == "render_original_preview":
@@ -17319,9 +17451,8 @@ class HMBVideoPickerLibrary(DataNode):
                     and owner_generation == int(getattr(self, "_hmb_lifecycle_generation", 0) or 0)
                     and not self._hmb_pending_operation_id
                     and self._hmb_pending_scene_selection is None):
-                pending_path, pending_source = pending_selection
                 try:
-                    self._schedule_scene_selection(pending_path, pending_source)
+                    self._schedule_scene_selection(*pending_selection)
                 except Exception as exc:
                     _diagnostic_exception("pending Maya scene selection failed", exc)
 
@@ -17384,6 +17515,10 @@ class HMBVideoPickerLibrary(DataNode):
             scene_path = _norm_path(scene_text)
             if scene_path.suffix.lower() not in {".ma", ".mb", ".blend"} or not scene_path.is_file():
                 raise FileNotFoundError(f"Select an existing Maya .mb/.ma or Blender .blend scene before {action}.")
+            if action == "read_scene" and (
+                incoming.get("picker_scene_owner_uuid") or _is_picker_binary_scene(scene_text)
+            ):
+                incoming = _reset_picker_binary_scene_work(incoming, scene_text)
             slot = max(
                 1,
                 min(
@@ -17552,7 +17687,7 @@ class HMBVideoPickerLibrary(DataNode):
                                         if blender_scene else self._render_original_preview_mode)
                             producer(scene_text, context=context, publish_public=False)
                             original_state = _snapshot_original_preview_asset(
-                                _norm_path(scene_text), self._picker_state(),
+                                _norm_path(scene_text), self._picker_state_for_operation(context),
                             )
                             generated_item = _original_video_item_from_state(original_state)
                         else:
@@ -17562,7 +17697,7 @@ class HMBVideoPickerLibrary(DataNode):
                                 publish_public=False, selected_role=role,
                             )
                             generated_item = produced.get("generated_item")
-                        stage = self._picker_state()
+                        stage = self._picker_state_for_operation(context)
                         stage.update(accepted_generation_flags)
                         self._write_state(stage)
                         self._assert_operation_current(context, f"{role} generation completion")
@@ -17573,7 +17708,7 @@ class HMBVideoPickerLibrary(DataNode):
                         # replace the click-time catalog over user edits.
                         with self._hmb_catalog_state_commit():
                             self._assert_operation_current(context, f"{role} catalog publication")
-                            current = self._picker_state()
+                            current = self._picker_state_for_operation(context)
                             current.update(accepted_generation_flags)
                             previous_row = next((row for row in current.get("picker_shots", [])
                                                  if _uuid_text(row.get("workspace_uuid")) == context.picker_shot_uuid), {})
@@ -17612,7 +17747,7 @@ class HMBVideoPickerLibrary(DataNode):
                             })
                             _append_activity_log(current, "SUCCESS", current["message"])
                             self._write_state(current)
-                            self._sync_outputs_from_state(current)
+                            self._sync_outputs_from_state(self._picker_state())
                     except _StaleOperationError:
                         raise
                     except Exception as exc:
@@ -17624,7 +17759,7 @@ class HMBVideoPickerLibrary(DataNode):
                         warning = (f"Selected {role.replace('_', ' ').title()} failed; "
                                    f"completed outputs were preserved. {_clean(exc) or exc.__class__.__name__}")
                         generation_warnings.append(warning)
-                        current = self._picker_state()
+                        current = self._picker_state_for_operation(context)
                         if isinstance(exc, _MayaNativeCaptureError):
                             current["native_error_code"] = exc.error_code
                             current["native_error_report"] = copy.deepcopy(exc.smooth_geometry_budget_report)
@@ -17634,7 +17769,7 @@ class HMBVideoPickerLibrary(DataNode):
                         _append_activity_log(current, "ERROR", warning)
                         self._write_state(current)
                 self._assert_operation_current(context, "Generate completion")
-                final_state = self._picker_state()
+                final_state = self._picker_state_for_operation(context)
                 final_state.update(accepted_generation_flags)
                 warnings = _normalize_ui_warnings(final_state.get("warnings"))
                 final_state["warnings"] = list(dict.fromkeys([*warnings, *generation_warnings]))[-20:]
@@ -17868,7 +18003,11 @@ class HMBVideoPickerLibrary(DataNode):
             "active_snapshot_uid": "",
             "viewport_mode": "video",
             "snapshot_request_video_uid": "",
-            "snapshots": [],
+            "snapshots": (
+                state.get("snapshots", [])
+                if state.get("picker_scene_owner_uuid") or _is_picker_binary_scene(scene_text)
+                else []
+            ),
             "markers": [],
             "warnings": [],
             "pending_action": "",
@@ -17987,26 +18126,35 @@ class HMBVideoPickerLibrary(DataNode):
             _diagnostic_exception(f"{scene_engine or 'Scene'} LOAD validation failed", exc)
         return _parse_state(state)
 
-    def _schedule_scene_selection(self, scene_text: Any, source: str) -> None:
+    def _schedule_scene_selection(self, scene_text: Any, source: str, workspace_uuid: str = "") -> None:
         """Validate the native picker selection and publish READ-ready state."""
         resolved_text = _maya_scene_path_text(scene_text)
         if _scene_path_text(scene_text) and not resolved_text:
             self._store_initial_parameter_value("MAYA_SCENE", "")
         base = self._picker_state()
+        active_workspace_uuid = _uuid_text(base.get("active_picker_shot_uuid"))
+        captured_workspace_uuid = _uuid_text(workspace_uuid) or active_workspace_uuid
+        scoped = bool(base.get("picker_scene_owner_uuid") or _is_picker_binary_scene(resolved_text))
         busy_status = _clean(base.get("status")).upper() in {
             "READ_PENDING", "READING_SCENE", "RUN_PENDING", "RUNNING", "GENERATING_VIDEO",
             "SNAPSHOT_PENDING", "SNAPSHOT_RENDERING", "CANCELLING"
         }
         if busy_status or _clean(base.get("operation_kind")) or self._hmb_process_lock.locked():
-            self._hmb_pending_scene_selection = (resolved_text, _clean(source))
+            self._hmb_pending_scene_selection = (resolved_text, _clean(source), captured_workspace_uuid)
             active = self._hmb_active_operation
             current_path = active.scene_path if active is not None else _maya_scene_path_text(base.get("scene_path"))
             self._store_initial_parameter_value("MAYA_SCENE", current_path)
-            _append_activity_log(base, "INFO", "The new Maya scene is queued. It will replace the shared stage after the current operation finishes; STOP may be used to finish waiting sooner.")
+            _append_activity_log(base, "INFO", "The new scene is queued for the captured Shot. It will be ready to READ after the current operation finishes." if scoped else "The new Maya scene is queued. It will replace the shared stage after the current operation finishes; STOP may be used to finish waiting sooner.")
             self._write_state(base)
             _diagnostic(f"scene selection queued until the current operation completes: {source}")
             return
-        self._store_initial_parameter_value("MAYA_SCENE", resolved_text)
+        if scoped and captured_workspace_uuid != active_workspace_uuid:
+            base["picker_scene_owner_uuid"] = base.get("picker_scene_owner_uuid") or active_workspace_uuid
+            base = _activate_picker_workspace_projection(base, captured_workspace_uuid)
+            if base is None:
+                return
+        else:
+            self._store_initial_parameter_value("MAYA_SCENE", resolved_text)
         base["scene_request_source"] = _clean(source)
         base["scene_request_status"] = "PROCESSING"
         prepared = self._build_native_scene_selection_state(resolved_text, base_state=base)
@@ -18029,6 +18177,10 @@ class HMBVideoPickerLibrary(DataNode):
         else:
             prepared["scene_request_status"] = "IDLE" if not resolved_text else "FAILED"
         prepared["pending_action"] = ""
+        if scoped and captured_workspace_uuid != active_workspace_uuid:
+            prepared = _activate_picker_workspace_projection(prepared, active_workspace_uuid)
+            if prepared is None:
+                return
         self._write_state(prepared)
         self._sync_outputs_from_state(prepared)
 
@@ -19396,7 +19548,7 @@ class HMBVideoPickerLibrary(DataNode):
             workspace_uuid = _clean(status.get("result_picker_shot_uuid"))
             if not workspace_uuid:
                 raise _video_tools.VideoToolError(
-                    "The first concatenate source card has no captured Shot owner. Drag a Picker Shot card into the first position and render again.")
+                    "The first concatenate video has no captured Shot owner. Place a Picker Shot video first and render again.")
             if not any(row.get("workspace_uuid") == workspace_uuid for row in state.get("picker_shots", [])):
                 raise _video_tools.VideoToolError(
                     "The captured result Shot for the first concatenate source was deleted. The completed file remains available; no different Shot was selected.")
@@ -19424,6 +19576,7 @@ class HMBVideoPickerLibrary(DataNode):
             "media_kind": "imported_mp4_reference", "video_role": "user_imported_reference",
             "source_type_hint": "User Imported Cut Reference", "control_role_hint": "User Selected Video Reference",
             "markers": [], "duration_seconds": output.get("duration", 0),
+            "output_fps": output.get("frame_rate", 0),
             "width": output.get("width", 0), "height": output.get("height", 0),
         }, picker_shot_uuid=workspace_uuid)
         target = next(row for row in result["picker_shots"] if row["workspace_uuid"] == workspace_uuid)
@@ -19640,6 +19793,8 @@ class HMBVideoPickerLibrary(DataNode):
             self._handle_video_tools_command(payload, action_id)
             return
         state = self._picker_state()
+        browse_workspace_uuid = _uuid_text(state.get("active_picker_shot_uuid"))
+        browse_scene_hint = state.get("scene_request_path") or state.get("scene_path")
         if action in operation_actions and (
             self._hmb_active_operation is not None or self._hmb_process_lock.locked()
         ):
@@ -19679,9 +19834,20 @@ class HMBVideoPickerLibrary(DataNode):
                     f"{_clean(requested_workspace_uuid) or '<blank>'} is unavailable"
                 )
                 return
-            if action in operation_actions:
+            if action == "browse_maya_scene":
+                browse_workspace_uuid = _uuid_text(requested_workspace_uuid)
+                browse_scene_hint = projected_state.get("scene_request_path") or projected_state.get("scene_path")
+            elif action in operation_actions:
                 # A command can arrive after its click-time Shot is no longer
                 # displayed. Capture that destination without undoing navigation.
+                if projected_state.get("picker_scene_owner_uuid") or any(
+                    _is_picker_binary_scene(payload.get(key))
+                    for key in ("scene_path", "scene_draft_path", "scene_request_path")
+                ):
+                    if not projected_state.get("picker_scene_owner_uuid"):
+                        state["picker_scene_owner_uuid"] = state["active_picker_shot_uuid"]
+                        projected_state = _activate_picker_workspace_projection(state, requested_workspace_uuid)
+                    state = projected_state
                 state["operation_requested_picker_shot_uuid"] = _uuid_text(requested_workspace_uuid)
             elif not (payload.get("preserve_edit_workspace") is True and action in {
                 "browse_video_asset", "import_video_asset", "import_video_assets", "import_video",
@@ -19803,7 +19969,8 @@ class HMBVideoPickerLibrary(DataNode):
             state["scene_draft_path"] = scene_path
             state["scene_request_path"] = scene_path
             state["scene_path"] = scene_path
-            self._store_initial_parameter_value("MAYA_SCENE", scene_path)
+            if not state.get("picker_scene_owner_uuid"):
+                self._store_initial_parameter_value("MAYA_SCENE", scene_path)
         elif raw_scene_path_supplied:
             # A command carrying malformed scene text is an explicit invalid
             # selection, never permission to fall back to a previous scene.
@@ -20179,13 +20346,11 @@ class HMBVideoPickerLibrary(DataNode):
             self._schedule_video_removal_output_sync()
             return
         if action == "browse_maya_scene":
-            selected = _choose_maya_scene_file(
-                scene_path or state.get("scene_request_path") or state.get("scene_path")
-            )
+            selected = _choose_maya_scene_file(scene_path or browse_scene_hint)
             if not selected:
+                state = self._picker_state()
                 state.update({
                     "status": "READY",
-                    "scene_stage": "LOAD_READY" if self._current_scene_text() else "EMPTY",
                     "message": "Maya scene selection was cancelled.",
                 })
                 self._write_state(state)
@@ -20196,13 +20361,14 @@ class HMBVideoPickerLibrary(DataNode):
             if not selected_path.is_file():
                 raise FileNotFoundError(f"Maya scene does not exist: {selected_path}")
             normalized_selected = str(selected_path).replace("\\", "/")
-            _begin_state_sync(self)
-            try:
-                if not _request_parameter_value(self, "MAYA_SCENE", normalized_selected, "str"):
-                    _set_parameter_value(self, "MAYA_SCENE", normalized_selected)
-            finally:
-                _end_state_sync(self)
-            self._schedule_scene_selection(normalized_selected, "widget native OS browser")
+            if not state.get("picker_scene_owner_uuid") and not _is_picker_binary_scene(normalized_selected):
+                _begin_state_sync(self)
+                try:
+                    if not _request_parameter_value(self, "MAYA_SCENE", normalized_selected, "str"):
+                        _set_parameter_value(self, "MAYA_SCENE", normalized_selected)
+                finally:
+                    _end_state_sync(self)
+            self._schedule_scene_selection(normalized_selected, "widget native OS browser", browse_workspace_uuid)
             return
         raise ValueError(f"Unsupported HMB picker command: {action}")
 
@@ -20330,11 +20496,16 @@ class HMBVideoPickerLibrary(DataNode):
                 == active_context.kind
             )
             if active_context_still_owned and active_context is not None:
-                current_scene = self._current_scene_text(active_context.scene_path)
+                operation_state = self._picker_state_for_operation(active_context)
+                current_scene = (
+                    _maya_scene_path_text(operation_state.get("scene_request_path") or operation_state.get("scene_path"))
+                    if operation_state.get("picker_scene_owner_uuid")
+                    else self._current_scene_text(active_context.scene_path)
+                )
                 current_digest = _operation_input_digest(
                     active_context.kind,
                     current_scene,
-                    merged,
+                    operation_state,
                     active_context.video_slot,
                 )
                 if current_digest != active_context.input_digest:
@@ -20398,7 +20569,7 @@ class HMBVideoPickerLibrary(DataNode):
                 _diagnostic_exception("parent after_value_set failed", parent_exc)
 
     def _set_failed_state(self, exc: Exception) -> None:
-        state = self._picker_state()
+        state = self._picker_state_for_operation(self._hmb_active_operation)
         operation_kind = _clean(state.get("operation_kind"))
         message = _clean(exc) or exc.__class__.__name__
         if isinstance(exc, _MayaNativeCaptureError):
@@ -20712,7 +20883,9 @@ class HMBVideoPickerLibrary(DataNode):
                 serialized_parameter_path = _maya_scene_path_text(
                     getattr(self, "_hmb_serialized_maya_scene_path", "")
                 )
-                restored_scene_path = state_scene_path or serialized_parameter_path
+                restored_scene_path = state_scene_path or (
+                    "" if raw_state.get("picker_scene_owner_uuid") else serialized_parameter_path
+                )
                 if restored_scene_path:
                     # A saved widget snapshot is authoritative when present.
                     # Older workflows that serialized only MAYA_SCENE receive
@@ -21188,7 +21361,7 @@ class HMBVideoPickerLibrary(DataNode):
         if self._hmb_cancel_requested.is_set():
             raise RuntimeError("Maya Outliner READ cancelled by user.")
 
-        state = self._picker_state()
+        state = self._picker_state_for_operation(context)
         output_width, output_height = _playblast_resolution(state)
         _append_activity_log(state, "INFO", f"Stage 3/5: Validating scene file, Maya runner, and Maya {maya_version} installation.")
         _append_activity_log(state, "SUCCESS", f"Preflight passed: {scene_path.name}. Selected Maya {maya_version}: {mayabatch}")
@@ -21236,7 +21409,7 @@ class HMBVideoPickerLibrary(DataNode):
             "-command", _maya_runner_command(),
         ])
 
-        state = self._picker_state()
+        state = self._picker_state_for_operation(context)
         state.update({
             "status": "READING_SCENE",
             "scene_stage": "MAYA_READING",
@@ -21453,7 +21626,7 @@ class HMBVideoPickerLibrary(DataNode):
             _clean(item.get("full_path")) for item in outliner_nodes
             if not _clean(item.get("parent_path")) and _clean(item.get("full_path"))
         ]
-        previous_state = self._picker_state()
+        previous_state = self._picker_state_for_operation(context)
         active_slot_count = max(1, min(MAX_VIDEO_SLOTS, int(previous_state.get("active_slot_count") or 1)))
         selected_video_slot = max(1, min(active_slot_count, int(previous_state.get("selected_video_slot") or 1)))
         assignable_nodes = _all_picker_outliner_nodes(outliner_nodes)
@@ -21582,7 +21755,7 @@ class HMBVideoPickerLibrary(DataNode):
         _append_activity_log(state, "INFO", f"Diagnostic log saved: {log_path}")
         self._assert_operation_current(context, "READ atomic publish")
         self._write_state(state)
-        self._sync_outputs_from_state(state)
+        self._sync_outputs_from_state(self._picker_state())
         self._ensure_parameters()
         return {
             "mode": "scan",
@@ -21820,7 +21993,7 @@ class HMBVideoPickerLibrary(DataNode):
             )
             self._write_state(state)
             if publish_public:
-                self._sync_outputs_from_state(state)
+                self._sync_outputs_from_state(self._picker_state())
             return {"mode": "original_preview_cache", "video": str(video_path), "cached": True}
 
         mayabatch = _find_mayabatch()
@@ -22206,7 +22379,7 @@ class HMBVideoPickerLibrary(DataNode):
                     )
                     raise
 
-        state = self._picker_state()
+        state = self._picker_state_for_operation(context)
         ready_stage = "VIDEO_READY" if state.get("videos") else "OUTLINER_READY"
         merged_warnings = [_clean(item) for item in state.get("warnings", []) if _clean(item)]
         for warning in warnings:
@@ -22234,7 +22407,7 @@ class HMBVideoPickerLibrary(DataNode):
         )
         self._write_state(state)
         if publish_public:
-            self._sync_outputs_from_state(state)
+            self._sync_outputs_from_state(self._picker_state())
         return {
             "mode": "original_preview",
             "video": str(video_path),
@@ -22897,9 +23070,10 @@ class HMBVideoPickerLibrary(DataNode):
                     completed, record, picker_shot_uuid=context.picker_shot_uuid if context is not None else "")
             self._assert_operation_current(context, "SNAPSHOT batch state publish")
             ready_stage = "VIDEO_READY" if completed.get("videos") else "OUTLINER_READY"
-            completed.update(status=ready_stage, scene_stage=ready_stage,
+            self._finish_snapshot_view(completed, context, ready_stage)
+            completed.update(status=ready_stage,
                              message=f"{', '.join(role.title() for role in roles)} snapshots ready at Maya frame {frame:g}.",
-                             snapshot_request_video_uid="", workspace_view="playblast", warnings=warnings)
+                             warnings=warnings)
             completed = self._mark_operation_finished(completed)
             _append_activity_log(completed, "SUCCESS", completed["message"])
             self._write_state(completed)
@@ -24848,7 +25022,7 @@ class HMBVideoPickerLibrary(DataNode):
     ) -> Dict[str, Any]:
         scene_path = _norm_path(_maya_scene_path_text(scene_text))
         result, _job, _folder, log_path = self._blender_execute_job(
-            scene_path, "scan", {"camera": _clean(self._picker_state().get("selected_camera"))}, context,
+            scene_path, "scan", {"camera": _clean(self._picker_state_for_operation(context).get("selected_camera"))}, context,
         )
         try:
             start_frame = float(result["start_frame"])
@@ -24868,7 +25042,7 @@ class HMBVideoPickerLibrary(DataNode):
             raise RuntimeError("Blender READ selected a camera not present in the camera catalog.")
         if not selected_camera and cameras:
             selected_camera = _clean(cameras[0].get("full_path"))
-        previous = self._picker_state()
+        previous = self._picker_state_for_operation(context)
         active_slot_count = max(1, min(MAX_VIDEO_SLOTS, int(previous.get("active_slot_count") or 1)))
         previous = _reconcile_picker_mesh_authoring(previous, outliner_nodes)
         valid_paths = {_clean(item.get("full_path")) for item in _all_picker_outliner_nodes(outliner_nodes)}
@@ -24950,7 +25124,7 @@ class HMBVideoPickerLibrary(DataNode):
         _append_activity_log(state, "SUCCESS", f"Blender READ completed: {len(outliner_nodes)} asset roots, {len(cameras)} cameras, {source_frame_count} frames.")
         self._assert_operation_current(context, "Blender READ state publish")
         self._write_state(state)
-        self._sync_outputs_from_state(state)
+        self._sync_outputs_from_state(self._picker_state())
         return result
 
     @staticmethod
@@ -25083,9 +25257,9 @@ class HMBVideoPickerLibrary(DataNode):
             "created_at_ms": int(time.time() * 1000),
         }, scene_path=scene_path, picker_shot_uuid=context.picker_shot_uuid if context else "")
         ready = "VIDEO_READY" if current.get("videos") else "OUTLINER_READY"
-        current.update({"status": ready, "scene_stage": ready,
+        self._finish_snapshot_view(current, context, ready)
+        current.update({"status": ready,
                         "message": f"Blender Snapshot ready at frame {frame:g}.",
-                        "snapshot_request_video_uid": "", "workspace_view": "playblast",
                         "warnings": [_clean(item) for item in result.get("warnings", []) if _clean(item)]})
         current = self._mark_operation_finished(current)
         _append_activity_log(current, "SUCCESS", f"Blender Snapshot ready: {cache_path}; log {log_path}")
@@ -25137,7 +25311,7 @@ class HMBVideoPickerLibrary(DataNode):
             except (OSError, ValueError, RuntimeError, KeyError, TypeError):
                 cache_valid = False
         if cache_valid:
-                current = self._picker_state()
+                current = self._picker_state_for_operation(context)
                 ready = "VIDEO_READY" if current.get("videos") else "OUTLINER_READY"
                 current.update({"status": ready, "scene_stage": ready,
                                 "message": "Blender Original loaded from the validated cache.",
@@ -25150,7 +25324,7 @@ class HMBVideoPickerLibrary(DataNode):
                 current = self._apply_selected_view_fields(current)
                 self._write_state(current)
                 if publish_public:
-                    self._sync_outputs_from_state(current)
+                    self._sync_outputs_from_state(self._picker_state())
                 return {"mode": "blender_original_cache", "video": str(target_video), "cached": True}
 
         result, job, folder, log_path = self._blender_execute_job(scene_path, "render", {
@@ -25195,7 +25369,7 @@ class HMBVideoPickerLibrary(DataNode):
                 target_video=target_video, target_sidecar=target_sidecar,
                 backup_folder=folder / "backup", label="Blender Original",
             )
-        current = self._picker_state()
+        current = self._picker_state_for_operation(context)
         ready = "VIDEO_READY" if current.get("videos") else "OUTLINER_READY"
         current.update({"status": ready, "scene_stage": ready,
                         "message": f"Blender Original ready: {frame_count} frames at {fps:g} FPS.",
@@ -25210,7 +25384,7 @@ class HMBVideoPickerLibrary(DataNode):
         _append_activity_log(current, "SUCCESS", f"Blender Original published: {target_video}")
         self._write_state(current)
         if publish_public:
-            self._sync_outputs_from_state(current)
+            self._sync_outputs_from_state(self._picker_state())
         return {"mode": "blender_original", "video": str(target_video),
                 "json": str(target_sidecar), "cached": False,
                 "frame_count": frame_count, "fps": fps}

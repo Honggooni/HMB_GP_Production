@@ -165,7 +165,7 @@ function hmbAcquireNativeStockSafety(container) {
   let shared = doc[key];
   if (!shared) {
     const owners = new Set(), identities = new Map();
-    let contextNode = null, badge = null, notice = null, disposed = false;
+    let contextNode = null, notice = null, noticeTimer = null, disposed = false;
     const nativeReady = () => doc.documentElement.getAttribute("data-hmb-native-deletion-guard") === "engine-preflight"
       && doc.documentElement.getAttribute("data-hmb-native-deletion-protection-version") === "2";
     const rootOf = value => value?.closest?.(".react-flow__node[data-id]") || null;
@@ -206,7 +206,7 @@ function hmbAcquireNativeStockSafety(container) {
       if (!nodeMenu && !(trash && button.closest(".react-flow"))) return null;
       return { button, nodeMenu };
     };
-    const dismiss = () => { notice?.remove(); notice = null; };
+    const dismiss = () => { win.clearTimeout(noticeTimer); notice?.remove(); notice = null; };
     const show = () => {
       if (disposed || nativeReady()) return;
       if (notice?.isConnected) { notice.querySelector("button")?.focus(); return; }
@@ -214,12 +214,13 @@ function hmbAcquireNativeStockSafety(container) {
       notice.setAttribute("data-hmb-native-safety-notice", "required");
       notice.setAttribute("role", "alert");
       Object.assign(notice.style, { position: "fixed", zIndex: "2147483647", right: "20px", bottom: "64px", maxWidth: "420px", padding: "18px", border: "1px solid #b89458", borderRadius: "18px", background: "#151c29", color: "#f8fafc", font: "13px/1.6 system-ui,sans-serif", boxShadow: "0 8px 32px #0008" });
-      const title = doc.createElement("strong"); title.textContent = "HMB 편집기·삭제 보호 확인이 필요합니다";
+      const title = doc.createElement("strong"); title.textContent = "HMB 노드 삭제를 중단했습니다";
       const text = doc.createElement("p");
-      text.textContent = "Override 업데이트 로그에서 current/applied를 확인하세요. UI 또는 엔진 보호 상태를 확인하지 못해 감지된 HMB 노드 삭제 시도를 중단했습니다. 작업 저장 후 Griptape 완전 종료·재시작하세요. current/applied는 디스크 파일 상태이며 현재 화면의 통합 상태를 보장하지 않습니다. 실패 시 로그의 원인을 확인하세요. 이 안내만으로 다른 삭제 경로의 엔진 보호가 준비됐다고 보장할 수 없습니다.";
+      text.textContent = "현재 화면에서 연결 상태를 확인할 수 없습니다. 작업을 저장하고 Griptape를 다시 시작한 뒤 확인하세요.";
       const close = doc.createElement("button"); close.type = "button"; close.textContent = "확인";
       Object.assign(close.style, { border: "1px solid #64748b", borderRadius: "999px", background: "#243044", color: "#f8fafc", padding: "6px 18px", cursor: "pointer" });
       close.addEventListener("click", dismiss); notice.append(title, text, close); doc.body.append(notice); close.focus();
+      noticeTimer = win.setTimeout(dismiss, 8000);
     };
     const stop = event => { event.preventDefault(); event.stopPropagation(); event.stopImmediatePropagation(); show(); };
     const keydown = event => {
@@ -231,12 +232,12 @@ function hmbAcquireNativeStockSafety(container) {
       const action = deleteControl(event.target);
       if (action && (ownedTarget(action.button) || managed()
           || action.nodeMenu && contextNode?.isConnected && roots().has(contextNode))) stop(event);
-      else if (!event.target?.closest?.("[data-hmb-native-safety-notice],[data-hmb-native-safety-status]")) contextNode = null;
+      else if (!event.target?.closest?.("[data-hmb-native-safety-notice]")) { contextNode = null; dismiss(); }
     };
     const contextmenu = event => { contextNode = rootOf(event.target); };
     const dispose = () => {
       if (disposed) return;
-      disposed = true; observer?.disconnect(); badge?.remove(); dismiss(); contextNode = null;
+      disposed = true; observer?.disconnect(); dismiss(); contextNode = null;
       win.removeEventListener("keydown", keydown, true); win.removeEventListener("click", click, true); win.removeEventListener("contextmenu", contextmenu, true);
       if (doc[key] === shared) delete doc[key];
     };
@@ -244,14 +245,7 @@ function hmbAcquireNativeStockSafety(container) {
       if (disposed) return;
       const retained = roots();
       if (!owners.size && !retained.size) { dispose(); return; }
-      if (nativeReady() || !retained.size) { badge?.remove(); badge = null; dismiss(); return; }
-      if (badge?.isConnected || !doc.body) return;
-      badge = doc.createElement("button"); badge.type = "button";
-      badge.setAttribute("data-hmb-native-safety-status", "required");
-      badge.setAttribute("aria-label", "HMB Override 업데이트·재시작 및 삭제 보호 상태 확인");
-      badge.textContent = "HMB UI·삭제 보호 상태 확인";
-      Object.assign(badge.style, { position: "fixed", zIndex: "2147483646", right: "20px", bottom: "20px", border: "1px solid #b89458", borderRadius: "999px", padding: "7px 14px", background: "#151c29", color: "#f5d49a", font: "12px system-ui,sans-serif", cursor: "pointer", boxShadow: "0 4px 18px #0006" });
-      badge.addEventListener("click", show); doc.body.append(badge);
+      if (nativeReady() || !retained.size) dismiss();
     };
     const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(sync) : null;
     observer?.observe(doc.documentElement, { attributes: true, attributeFilter: ["data-hmb-native-deletion-guard", "data-hmb-native-deletion-protection-version", "data-id"], childList: true, subtree: true });

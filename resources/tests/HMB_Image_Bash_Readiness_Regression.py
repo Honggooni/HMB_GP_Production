@@ -165,6 +165,8 @@ class SavedEditorLeaseRegression(unittest.TestCase):
         self.assertTrue(self.adopt())
         updated = self.node._set_project.call_args.args[0]
         expected = deepcopy(original); expected["meta"]["hmb_image_bash"]["node_instance_uuid"] = "new-live-instance"
+        canvas = self.node._canvas()
+        expected["meta"]["hmb_canvas"] = {key: canvas[key] for key in ("width", "height", "background_color")}
         self.assertEqual(updated, expected); self.assertEqual(self.project, original)
         self.assertEqual(self.node._hmb_prepare_phase, "ready"); self.assertFalse(self.node._hmb_inputs_unready)
         self.node._publish_header.assert_called_once()

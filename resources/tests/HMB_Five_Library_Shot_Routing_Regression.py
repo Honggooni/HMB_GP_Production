@@ -37,6 +37,7 @@ assert routing.KNOWN_KINDS == {
     routing.KIND_AGENT,
     routing.KIND_SEEDANCE,
     routing.KIND_COLOR_LUT,
+    routing.KIND_SOUND,
 }
 assert (
     routing.SHOT_ROUTING_PROTOCOL_VERSION
@@ -480,6 +481,38 @@ hydration_result = routing.reconcile_shot_routing(
 assert hydration_result["ok"] is True, hydration_result
 assert hydration_agent.hydrated_from == [("HydrationPrompt", "PROMPT_OUT")]
 routing._ensure_edge = ensure_edge
+
+
+# An optional Sound node can have its saved subscription before it has a
+# retained authority fingerprint. Core media must still receive its catalog.
+saved_sound = Participant(
+    "SavedOptionalSound", routing.KIND_SOUND, enabled=True, channel_uuid=CHANNEL,
+)
+saved_picker = Participant(
+    "SavedPicker", routing.KIND_VIDEO_PICKER, enabled=True, channel_uuid=CHANNEL,
+)
+NODES[:] = [hydration_image, saved_picker, hydration_prompt, saved_sound]
+created_edges.clear()
+routing._mark_authoritative(hydration_image)
+pending = routing.reconcile_shot_routing(hydration_prompt)
+assert pending["code"] == "hydration_pending", pending
+assert pending["waiting"] == (saved_picker.name,), pending
+assert not routing._subscription_is_authoritative(routing._subscription_for(saved_sound))
+assert not created_edges
+routing._mark_authoritative(saved_picker)
+resumed = routing.reconcile_shot_routing(hydration_prompt)
+assert resumed["code"] == "ready", resumed
+assert saved_picker.catalog_count == 1
+assert (saved_picker.name, "SHOT_PICKER_OUT", hydration_prompt.name, "SHOT_PICKER_IN") in created_edges
+
+no_source_prompt = Participant("NoSourcePrompt", routing.KIND_PROMPT)
+no_source_picker = Participant("NoSourcePicker", routing.KIND_VIDEO_PICKER)
+NODES[:] = [no_source_prompt, no_source_picker, saved_sound]
+created_edges.clear()
+no_source = routing.reconcile_shot_routing(no_source_prompt)
+assert no_source["code"] == "ready" and no_source["changed"] == 0, no_source
+assert not created_edges
+assert no_source_prompt.catalog_count == no_source_picker.catalog_count == 0
 
 
 # Ambiguous duplicate Seedance claimants are both returned to Only.  The router
@@ -1022,7 +1055,10 @@ assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
 row_source = ast.get_source_segment(agent_source, row_creation)
 layout_source = ast.get_source_segment(agent_source, agent_methods["_hmb_layout_shot_editor"])
 assert '_AGENT_SHOT_ROW_PREFIX = "HMB_AGENT_SHOT_ROW_"' in agent_source
-assert '"traits"] = {Widget(name=_AGENT_WIDGET_NAME' in row_source
+assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    and node.func.id == "Widget" and any(keyword.arg == "name"
+        and isinstance(keyword.value, ast.Name) and keyword.value.id == "_AGENT_WIDGET_NAME"
+        for keyword in node.keywords) for node in ast.walk(row_creation))
 assert 'self.add_parameter(Parameter(**kwargs))' in row_source
 assert '"schema": "hmb-agent-shot-row"' in layout_source
 assert 'ordered.extend(body)' in layout_source

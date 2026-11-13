@@ -139,11 +139,31 @@ async def replay(engine, modules, folder, artifact, expected, original_edges, sc
     import _hmb_connection_management as api
     from griptape_nodes.retained_mode.events.node_events import SetLockNodeStateRequest
     from griptape_nodes.retained_mode.events.workflow_events import RunWorkflowFromScratchRequest
-    await base.asend(engine, RunWorkflowFromScratchRequest(file_path=str(artifact["path"])))
+    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    native_request = GriptapeNodes.ahandle_request
+    failures = []
+    async def inspect_request(request):
+        result = await native_request(request)
+        if not result.succeeded():
+            failures.append(dict(request=type(request).__name__,
+                node=getattr(request, "node_name", None),
+                parameter=getattr(request, "parameter_name", None),
+                details=str(result.result_details)))
+        return result
+    with mock.patch.object(GriptapeNodes, "ahandle_request", side_effect=inspect_request):
+        loaded = await base.asend(engine, RunWorkflowFromScratchRequest(file_path=str(artifact["path"])))
+    (Path(os.environ.get("HMB_LIFECYCLE_REPORT_DIR", str(folder))) / f"{scenario}-load-requests.json").write_text(
+        json.dumps(dict(status=str(getattr(loaded, "status", "")), failures=failures), indent=2), encoding="utf-8")
+    assert not failures, failures[:5]
     await asyncio.sleep(.25)
     nodes = retained_nodes(engine)
     view = capabilities(engine, nodes)
-    assert common.authoring(nodes) == expected, scenario
+    actual = common.authoring(nodes)
+    if actual != expected:
+        (Path(os.environ.get("HMB_LIFECYCLE_REPORT_DIR", str(folder))) / f"{scenario}-authoring-mismatch.json").write_text(
+            json.dumps({"expected": expected, "actual": actual}, ensure_ascii=False,
+                       indent=2, default=str), encoding="utf-8")
+    assert actual == expected, scenario
     agent = nodes[base.KINDS[3]]
     assert not agent._hmb_shot_workers
     assert not any(lock.locked() for lock in agent._hmb_shot_execution_locks.values())

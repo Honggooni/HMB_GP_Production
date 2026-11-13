@@ -16,6 +16,12 @@
                 "provider_model_id": "claude-haiku-4-5",
                 "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
               },
+              "gtc_claude_haiku_5_5": {
+                "display_name": "Claude Haiku 5.5",
+                "family": "Claude 5",
+                "provider_model_id": "claude-haiku-5-5",
+                "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
+              },
               "gtc_claude_sonnet_5_5": {
                 "display_name": "Claude Sonnet 5.5",
                 "family": "Claude 5",
@@ -79,6 +85,12 @@
           "google": {
             "display_name": "Google",
             "models": {
+              "gtc_gemini_4_argon": {
+                "display_name": "Gemini 4 Argon",
+                "family": "Gemini",
+                "provider_model_id": "gemini-4-argon",
+                "key_support": "REQUIRES_GRIPTAPE_KEY"
+              },
               "gtc_gemini_3_1_pro": {
                 "display_name": "Gemini 3.1 Pro",
                 "family": "Gemini",
@@ -279,15 +291,15 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.8.65",
+    "library_version": "0.8.71",
     "engine_version": "",
     "agent_policy_delivery": {
-      "archive_source_count": 71,
+      "archive_source_count": 91,
       "mode": "bundled_signed_dat",
       "runtime_path": "resources/agent/superwings12/hmb_agent_core.dat",
-      "policy_version": "2026-10-15.agent-shot-quality.v7.0",
-      "envelope_sha256": "5f458ebba8e1c20505057d2e57b167195a60d8d839ebc787c832b0f1b1729527",
-      "contract_sha256": "2d1e87b2efaa338ffe0e64f19426b69c4eb8a4c43e7c4ba29edcc9e0641c92d7",
+      "policy_version": "2026-11-05.agent-shot-quality.v7.2",
+      "envelope_sha256": "ab7947d7536e80149f51c4427edb1ea750bfa88a8201d00f1e7f596b50881d19",
+      "contract_sha256": "e3c88a143c1a87ec35cb200c80fb19700773a9e4a11f265396e5cda75420ed1d",
       "verification": "rsa3072_sha256_v3_contract_once_per_process",
       "default_project_id": "superwings12",
       "projects": [
@@ -503,7 +515,7 @@
       "file_path": "HMBColorLUTLibrary.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "Local post-generation SDR color grading with live preview, five project profiles, exact Shot binding and single-pass final video export.",
+        "description": "Post-generation color and exact sound finishing, original-size MOV output and explicit web upload.",
         "display_name": "HMB Color LUT",
         "icon": "Palette",
         "group": "edit",
@@ -542,6 +554,7 @@
               "gtc_claude_sonnet_5_5",
               "gtc_claude_opus_5_5",
               "gtc_claude_opus_5",
+              "gtc_claude_haiku_5_5",
               "gtc_claude_haiku_4_5",
               "gtc_gemini_3_6_flash",
               "gtc_gemini_3_5_flash",
@@ -747,32 +760,98 @@
       }
     },
     {
+      "class_name": "HMBAnalysisAgent",
+      "file_path": "HMBAnalysisAgent.py",
+      "metadata": {
+        "category": "HMB_GP_Production",
+        "display_name": "HMB Analysis Agent",
+        "description": "Analyzes a selected reference per Shot and routes observations and original media independently.",
+        "declarations": [
+          {
+            "type": "model_usage",
+            "model_ids": [
+              "gtc_gemini_4_argon"
+            ]
+          }
+        ],
+        "icon": "ScanEye",
+        "group": "general",
+        "width": 780,
+        "height": 1160,
+        "min_width": 650,
+        "min_height": 730,
+        "resizable": true,
+        "hmb_native_studio_ui": {
+          "schema": "hmb-native-studio-ui",
+          "version": 1,
+          "node_type": "HMBAnalysisAgent",
+          "widget": "HMBAnalysisAgentWidget"
+        },
+        "ui_options": {
+          "width": 780,
+          "height": 1160,
+          "min_width": 650,
+          "min_height": 730,
+          "resizable": true
+        }
+      }
+    },
+    {
+      "class_name": "HMBSoundLibrary",
+      "file_path": "HMBSoundLibrary.py",
+      "metadata": {
+        "category": "HMB_GP_Production",
+        "display_name": "HMB Sound Library",
+        "description": "Project sound catalog, exact dialogue/lip-sync timing, Shot reference audio and Color LUT final mixing.",
+        "icon": "AudioLines",
+        "group": "general",
+        "width": 1470,
+        "height": 710,
+        "min_width": 760,
+        "min_height": 640,
+        "resizable": true,
+        "hmb_native_studio_ui": {
+          "schema": "hmb-native-studio-ui",
+          "version": 1,
+          "node_type": "HMBSoundLibrary",
+          "widget": "HMBSoundLibraryWidget"
+        },
+        "ui_options": {
+          "width": 1470,
+          "height": 710,
+          "min_width": 760,
+          "min_height": 640,
+          "resizable": true
+        }
+      }
+    },
+    {
       "class_name": "HMBPromptLibrary",
       "file_path": "HMBPromptLibrary.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "Builds prompts from manual text and media settings.\nWorks alone or with optional Asset and Picker.",
+        "description": "Authors Shot intent with optional ImageAsset, VideoPicker and Sound Library sources; audio/lip-sync and VFX remain independently authored.",
         "display_name": "HMBPrompt",
-        "width": 1800,
-        "height": 1350,
-        "default_width": 1800,
-        "default_height": 1350,
-        "initial_width": 1800,
-        "initial_height": 1350,
+        "width": 1490,
+        "height": 1480,
+        "default_width": 1490,
+        "default_height": 1480,
+        "initial_width": 1490,
+        "initial_height": 1480,
         "min_width": 760,
-        "min_height": 1193,
+        "min_height": 1269,
         "resizable": true,
         "ui_options": {
-          "width": 1800,
-          "height": 1350,
-          "default_width": 1800,
-          "default_height": 1350,
-          "initial_width": 1800,
-          "initial_height": 1350,
-          "preferred_width": 1800,
-          "preferred_height": 1350,
+          "width": 1490,
+          "height": 1480,
+          "default_width": 1490,
+          "default_height": 1480,
+          "initial_width": 1490,
+          "initial_height": 1480,
+          "preferred_width": 1490,
+          "preferred_height": 1480,
           "min_width": 760,
-          "min_height": 1193,
+          "min_height": 1269,
           "resizable": true
         }
       }
@@ -815,7 +894,7 @@
     {
       "name": "HMBImageBashWidget",
       "path": "widgets/HMBImageBashWidget.js",
-      "description": "HMBImageBash header with verified same-flow image workspace remote binding."
+      "description": "HMB Image Bash editor and header with verified image workspace binding."
     },
     {
       "name": "HMBColorLUTLibraryWidget",
@@ -866,6 +945,16 @@
       "name": "HMBVideoPickerLibraryWidget",
       "path": "widgets/HMBVideoPickerLibraryWidget_v032.js",
       "description": "Maya and Blender scene preview viewport with ImageAsset-synchronized one-to-five Shot video workspaces. Each Shot owns at most ten imported or generated assets; only that Shot's ordered selected subset drives PICKER_OUT and VIDEO_OUT. Expanded mode adds Preview, Concatenate and Crop tabs using the same player, with an independent edit queue and source-local crop regions. Editing outputs are separate and are added to the loader only on request without automatic Prompt selection. The compact loader and its selection, playback and reorder behavior are unchanged."
+    },
+    {
+      "name": "HMBAnalysisAgentWidget",
+      "path": "widgets/HMBAnalysisAgentWidget.js",
+      "description": "Five Shot tabs for single-source reference analysis and selective application."
+    },
+    {
+      "name": "HMBSoundLibraryWidget",
+      "path": "widgets/HMBSoundLibraryWidget.js",
+      "description": "Project sound browser and Shot dialogue, lip-sync, reference and finishing assignments."
     }
   ]
 }

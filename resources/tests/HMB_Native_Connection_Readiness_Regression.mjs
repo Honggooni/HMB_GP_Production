@@ -61,7 +61,7 @@ try{
  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
  const disconnect=()=>page.getByRole('button',{name:'연결 해제',exact:true});
  const reconnect=()=>page.getByRole('button',{name:'다시 연결',exact:true});
- const refresh=()=>page.getByRole('button',{name:'새로고침',exact:true});
+ const refresh=()=>page.getByRole('button',{name:'상태 확인',exact:true});
  const close=()=>page.getByRole('button',{name:'연결 관리 닫기'}).click();
  const ready=()=>page.locator('[data-hmb-connection-manager] article').first().waitFor();
  const getCount=()=>page.evaluate(()=>window.calls.filter(call=>call.type==='HMBGetNodeConnectionsRequest').length);

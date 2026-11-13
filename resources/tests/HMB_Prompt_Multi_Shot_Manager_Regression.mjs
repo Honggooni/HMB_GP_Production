@@ -69,7 +69,7 @@ try {
   await page.waitForFunction(() => window.ready);
   assert.deepEqual(await page.locator('#shell').evaluate(shell => ({
     width:parseFloat(shell.style.width),height:parseFloat(shell.style.height),
-  })), {width:1800,height:1350}, 'A saved positive 1700×1250 node starts at the final 1800×1350 size.');
+  })), {width:1700,height:1250}, 'A saved positive 1700×1250 node retains its authored size.');
   if(process.env.HMB_PROMPT_START_SCREENSHOT)await page.screenshot({path:process.env.HMB_PROMPT_START_SCREENSHOT,fullPage:true});
   if(process.env.HMB_PROMPT_START_BOTTOM_SCREENSHOT){
     await page.locator('.center').evaluate(center=>{center.scrollTop=center.scrollHeight;});
@@ -80,7 +80,7 @@ try {
   assert.equal(await page.locator("[data-prompt-shot]").count(), 5);
   assert.equal(await page.locator("[data-shot-selector]").count(), 0);
   assert.equal(await page.locator(".center").count(), 1);
-  assert.equal(await page.locator(".group-card").count(), 4);
+  assert.equal(await page.locator(".group-card").count(), 5);
   assert.equal(await page.locator(".center.nowheel").count(), 1, "The bounded body keeps native scrolling instead of canvas zoom.");
   assert.deepEqual(await page.locator(".prompt-shot-row b").allTextContents(), shots.map((shot) => shot.name));
   const textKey = await page.locator("[data-text-key]").first().getAttribute("data-text-key");
@@ -100,7 +100,7 @@ try {
     await choose(index);
     const actual = await page.locator(`[data-text-key="${textKey}"]`).inputValue();
     assert.equal(actual, `Prompt_${index + 1} {literal}`);
-    assert.equal(await page.locator(".group-card").count(), 4);
+    assert.equal(await page.locator(".group-card").count(), 5);
     assert.equal(await page.locator("textarea, input, select").count(), controlCount);
     assert.equal(await page.locator(".prompt-shot-row[aria-selected=true]").count(), 1);
     const selectedColor = await page.locator('.prompt-shot-row[aria-selected="true"]').evaluate((tab) => {
@@ -119,10 +119,10 @@ try {
   }
   const repeatedTab = await page.evaluate(() => { const before = window.changes; document.querySelector('[data-prompt-shot]').click(); return window.changes-before; });
   assert.equal(repeatedTab, 0, "Clicking the active tab keeps its editor and does not publish a fold.");
-  assert.equal(await page.locator(".group-card").count(), 4);
+  assert.equal(await page.locator(".group-card").count(), 5);
   const oldCollapsed = await page.evaluate(() => { const value=structuredClone(window.latest);value.ui.shot_editor_expanded=false;return value; });
   await page.evaluate((raw) => window.start(raw), oldCollapsed);
-  assert.equal(await page.locator(".group-card").count(), 4, "A saved accordion fold cannot hide the new tab editor.");
+  assert.equal(await page.locator(".group-card").count(), 5, "A saved accordion fold cannot hide the new tab editor.");
   await choose(0);
   assert.equal(await page.locator(`[data-text-key="${textKey}"]`).inputValue(), "Prompt_1 {literal}");
   const saved = await page.evaluate(() => structuredClone(window.latest));
@@ -322,19 +322,20 @@ try {
       }
       window.controller.cleanup();return result;
     },{storedWidth,storedHeight,scale,manager});
-    assert.equal(initialSize.width,1800);assert.equal(initialSize.height,1350);
+    const expectedWidth=storedWidth>0?storedWidth:1490,expectedHeight=storedHeight>0?storedHeight:1480;
+    assert.equal(initialSize.width,expectedWidth);assert.equal(initialSize.height,expectedHeight);
     if(manager)assert.equal(initialSize.minimum,240);
-    else assert.ok(initialSize.minimum>=1193);
-    assert.equal(initialSize.cssWidth,1800);assert.equal(initialSize.cssHeight,1350);
-    assert.ok(Math.abs(initialSize.visualWidth-1800*scale)<1,JSON.stringify(initialSize));
-    assert.ok(Math.abs(initialSize.visualHeight-1350*scale)<1,JSON.stringify(initialSize));
+    else assert.equal(initialSize.minimum,Math.min(expectedHeight,1269));
+    assert.equal(initialSize.cssWidth,expectedWidth);assert.equal(initialSize.cssHeight,expectedHeight);
+    assert.ok(Math.abs(initialSize.visualWidth-expectedWidth*scale)<1,JSON.stringify(initialSize));
+    assert.ok(Math.abs(initialSize.visualHeight-expectedHeight*scale)<1,JSON.stringify(initialSize));
     assert.equal(initialSize.lastVisible,true,'The final VFX group remains reachable after cold-load normalization.');
     assert.equal(initialSize.dashboardWithinNode,true);
     assert.equal(initialSize.wrapperWithinNode,true);assert.equal(initialSize.dashboardWithinWrapper,true,'An old SDK widget-height wrapper cannot clip the final editor.');
     assert.equal(initialSize.storedGroupsPreserved,true,'Large stored group heights remain authored state and scroll internally.');
     assert.equal(initialSize.publications,0,'Startup geometry and zoom cause no property/engine publication.');
     if(!manager){
-      assert.equal(initialSize.afterHydrationHeight,1350,'Legacy-to-manager hydration cannot replace the fixed startup dimensions.');
+      assert.equal(initialSize.afterHydrationHeight,expectedHeight,'Legacy-to-manager hydration cannot replace saved shell dimensions.');
       assert.deepEqual(initialSize.hydratedUserResize,{width:1120,height:780},'Hydrated legacy nodes retain subsequent user resizing.');
     }
   }
@@ -387,7 +388,7 @@ try {
   assert.equal(await page.locator(".center").count(), 1);
   assert.equal(externalRequests, 0);
   assert.deepEqual(failures, []);
-  console.log("HMB Prompt multi Shot browser: PASS (5 independent touch tabs and clear active colors, one editor, 1800×1350px restored/new defaults across zoom, subsequent custom sizes, 4 resize/zoom states with VFX reachable, cold unverified catalog and draft recovery, Korean IME/caret, exact echo callback/disabled/draft/source guards, 25 identical props cause 0 publications/mutations; external requests 0)");
+  console.log("HMB Prompt multi Shot browser: PASS (5 independent touch tabs, 5 editor groups, saved sizes/new 1490×1480px default across zoom, VFX reachable, Korean IME/caret, exact echo callback/disabled/draft/source guards, 25 identical props cause 0 publications/mutations; external requests 0)");
 } finally {
   await browser.close();
   await new Promise((resolve) => server.close(resolve));

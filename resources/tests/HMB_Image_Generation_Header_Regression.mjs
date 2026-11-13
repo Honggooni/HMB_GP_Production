@@ -26,7 +26,8 @@ const report = {
 // stock-editor deletion lease owns one document observer for every HMB widget.
 const headerSource = source.split("// HMB_NATIVE_STOCK_SAFETY_V1_BEGIN", 1)[0];
 assert.doesNotMatch(headerSource, /\b(?:MutationObserver|ResizeObserver)\b/);
-assert.doesNotMatch(source, /\b(?:fetch|XMLHttpRequest|WebSocket|setInterval|setTimeout)\b/);
+assert.doesNotMatch(headerSource, /\b(?:fetch|XMLHttpRequest|WebSocket|setInterval|setTimeout)\b/);
+assert.doesNotMatch(source, /\b(?:fetch|XMLHttpRequest|WebSocket)\b/);
 assert.doesNotMatch(source, /\b(?:onChange|onCommand)\b/);
 // Approved DOM-only portal lifecycle; provider/engine transports remain forbidden.
 const listenedEvents = [...source.matchAll(/(?:addEventListener|removeEventListener)\?\.\("([^"]+)"/g)].map(match => match[1]);

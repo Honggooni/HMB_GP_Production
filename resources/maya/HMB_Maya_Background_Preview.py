@@ -1230,6 +1230,10 @@ def _find_named_nodes(name):
         return []
     if cmds.objExists(name):
         return cmds.ls(name, long=True) or [name]
+    # A saved absolute DAG path identifies one instance. Dropping its parent
+    # path can silently bind another copy of the same referenced asset.
+    if name.startswith("|"):
+        return []
     short_name = name.split("|")[-1]
     matches = cmds.ls(short_name, long=True) or []
     if not matches and ":" not in short_name:
@@ -1967,11 +1971,23 @@ def _all_scope_drawable_shapes():
 
 
 def _dag_object_identity(path):
+    # Referencing the same file several times preserves its UUIDs across
+    # distinct dependency nodes. UUID equality therefore does NOT establish
+    # Maya instancing. allPaths is scoped to the exact DAG node and returns
+    # all branches only when they really share one underlying object.
     try:
-        values = cmds.ls(path, uuid=True) or []
-    except Exception:
-        values = []
-    return _clean(values[0]) if len(values) == 1 else _clean(path)
+        values = sorted(set(
+            _clean(value)
+            for value in (cmds.ls(path, long=True, allPaths=True) or [])
+            if _clean(value)
+        ))
+    except Exception as exc:
+        raise RuntimeError(
+            "Picker could not resolve the exact Maya DAG object: {0}: {1}".format(path, exc)
+        )
+    if not values or _clean(path) not in values:
+        raise RuntimeError("Picker Maya DAG path is no longer available: " + _clean(path))
+    return values[0]
 
 
 def _concrete_scope_mesh(shape, require_depth_api=False):
@@ -16173,15 +16189,17 @@ def _asset_root_from_transform(transform, parent_of, reference_node_of):
 
 
 def _reference_asset_label(root, reference_node, reference_file):
-    reference_path = re.sub(r"\{\d+\}$", "", _clean(reference_file))
-    reference_name = os.path.splitext(os.path.basename(reference_path))[0]
-    if reference_name:
-        return reference_name
-    namespace = _namespace_from_leaf(_clean(root).split("|")[-1])
+    # Maya's actual instance name owns the label, including automatic 1/2/3
+    # suffixes and nested namespaces. The source filename is shared by copies.
+    leaf = _clean(root).split("|")[-1]
+    namespace = _namespace_from_leaf(leaf)
     if namespace:
         return namespace
+    if leaf:
+        return leaf
     node_name = re.sub(r"RN(?:\d+)?$", "", _clean(reference_node))
-    return node_name or _dag_leaf_without_namespace(root)
+    reference_path = re.sub(r"\{\d+\}$", "", _clean(reference_file))
+    return node_name or os.path.splitext(os.path.basename(reference_path))[0]
 
 
 def _scan_outliner_nodes(progress_callback=None):
@@ -16383,14 +16401,9 @@ def _scan_outliner_nodes(progress_callback=None):
             base_label = reference_labels.get(transform, "") or leaf
             display_name = base_label
             if label_counts.get(base_label, 0) > 1:
-                namespace = _namespace_from_leaf(leaf)
-                display_name = namespace or "{0}__{1}".format(base_label, _dag_leaf_without_namespace(transform))
-        unique_name = display_name
-        suffix = 2
-        while unique_name in used_labels:
-            unique_name = "{0}__{1}".format(display_name, suffix)
-            suffix += 1
-        display_name = unique_name
+                display_name = leaf
+        if display_name in used_labels:
+            display_name = transform
         used_labels.add(display_name)
         connection = descendant_connection.get(transform, "")
         own_hidden = own_hidden_status(transform)

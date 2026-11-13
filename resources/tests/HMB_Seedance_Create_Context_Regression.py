@@ -47,7 +47,7 @@ sys.path.insert(0, str(ROOT))
 try:
     from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
     from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
-    from griptape_nodes.retained_mode.engine import engine_scope
+    from griptape_nodes.retained_mode.engine import Engine, engine_scope
     from griptape_nodes.retained_mode.events.context_events import (
         EnsureWorkflowAndFlowRequest, EnsureWorkflowAndFlowResultSuccess,
         SetWorkflowContextRequest, SetWorkflowContextSuccess,
@@ -88,6 +88,12 @@ def send(engine, payload):
 
 
 def snapshot(engine):
+    workflow = engine.current_workflow_or_none() if hasattr(engine, "current_workflow_or_none") else None
+    if hasattr(engine, "current_workflow_or_none"):
+        if workflow is None:
+            return (None, None, {}, {}, {})
+        return (workflow.workflow_id, workflow.context.get_current_flow().name if workflow.context.has_current_flow() else None,
+                dict(workflow.flows.name_to_parent_name), dict(workflow.nodes.name_to_parent_flow_name), dict(workflow.objects._name_to_objects))
     context = engine.context_manager
     def retained(value):
         return dict(value) if type(value) is dict else value
@@ -414,8 +420,16 @@ async def old_engine_accessor_unavailable():
     with engine_scope() as engine:
         engine.event_manager.initialize_queue()
         before_load = snapshot(engine)
+        fixture = None
         with mock.patch.object(builtins, "__import__", side_effect=older_import):
-            fixture = Fixture(engine, protection_unsupported=True)
+            try:
+                fixture = Fixture(engine, protection_unsupported=True)
+            except TypeError as exc:
+                assert "HMB_DELETE_GUARD_UNSUPPORTED" in str(exc), str(exc)
+                assert snapshot(engine) == before_load and attempted_imports
+                assert not engine.event_manager._pre_dispatch_hooks
+                RESULTS.append("unsupported_constructor_rejected_before_registration")
+                return
         try:
             assert snapshot(engine) == before_load
             assert attempted_imports, "The real Advanced loader did not exercise the missing import"
@@ -433,6 +447,36 @@ async def old_engine_accessor_unavailable():
     print("PASS " + RESULTS[-1])
 
 
+def current_sdk_workflow_boundary(engine, fixture, node_type):
+    from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
+
+    empty = snapshot(engine)
+    assert empty == (None, None, {}, {}, {})
+    denied = send(engine, request(node_type=node_type))
+    assert isinstance(denied, WorkflowNotNamedResultFailure), denied
+    assert snapshot(engine) == empty
+    assert fixture.library._node_types[node_type]._resolved is None
+
+    workflow_key = set_unsaved(engine)
+    without_flow = refuses_without_mutation(engine, request(node_type=node_type))
+    assert "Current Context was empty" in str(without_flow.result_details)
+    ensured = send(engine, EnsureWorkflowAndFlowRequest(flow_name="CurrentSDKCreate"))
+    assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess), ensured
+    created = succeeds(engine, request(node_type=node_type))
+    active = engine.current_workflow()
+    assert engine.context_manager.get_current_workflow_name() == workflow_key
+    assert created.parent_flow_name == ensured.flow_name
+    assert type(active.context.get_current_flow().nodes[created.node_name]).__name__ == node_type
+    assert len(active.flows.name_to_parent_name) == 1
+    second_flow = send(engine, CreateFlowRequest(parent_flow_name=None, flow_name="ExplicitCreateTarget",
+        set_as_new_context=False))
+    assert isinstance(second_flow, CreateFlowResultSuccess), second_flow
+    explicit_node = succeeds(engine, request(node_type=node_type, node_name="ExplicitCreate",
+        override_parent_flow_name=second_flow.flow_name))
+    assert explicit_node.parent_flow_name == second_flow.flow_name
+    assert active.context.get_current_flow().name == created.parent_flow_name
+
+
 async def main():
     # Create asyncio's local wakeup sockets before enforcing no network in all
     # fixture operations, including constructors and engine callbacks.
@@ -440,6 +484,16 @@ async def main():
          mock.patch.object(socket.socket, "connect_ex", side_effect=deny_network), \
          mock.patch.object(socket, "create_connection", side_effect=deny_network), \
          mock.patch.object(socket, "getaddrinfo", side_effect=deny_network):
+        if hasattr(Engine, "current_workflow_or_none"):
+            await old_engine_accessor_unavailable()
+            for node_type in ("HMBSeedanceGeneration", "HMBImageGeneration"):
+                await case(f"current SDK workflow admission and real {node_type} creation",
+                    lambda engine, fixture, node_type=node_type: current_sdk_workflow_boundary(engine, fixture, node_type),
+                    actual=node_type == "HMBSeedanceGeneration", actual_image=node_type == "HMBImageGeneration")
+            assert not NETWORK_ATTEMPTS
+            print(json.dumps({"status": "PASS", "sdk": importlib.metadata.version("griptape-nodes"),
+                "cases": RESULTS, "create_node_handler_mocked": False, "network_requests": 0}))
+            return
         await old_engine_accessor_unavailable()
         await case("cold actual native CreateNode", cold)
         await case("cold image CreateNode uses the same guarded official bootstrap", cold_image)

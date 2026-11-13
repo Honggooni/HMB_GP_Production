@@ -11,12 +11,15 @@ import re
 import sys
 import threading
 from typing import Any, Dict, List, Sequence
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 from _hmb_deletion_guard import hmb_binding_mutation
+import _hmb_sound
 
 
 def _load_hmb_common():
@@ -143,9 +146,11 @@ image_sub_type_choices_for_main_type = _hmb.image_sub_type_choices_for_main_type
 image_taxonomy_wire_pair = _hmb.image_taxonomy_wire_pair
 image_taxonomy_payload = _hmb.image_taxonomy_payload
 WIDGET_PARAMETER_NAME = "HMB_UI_STATE"
+_ANALYSIS_SUB_TYPE = "Analysis"
 PICKER_INPUT_PARAMETER_NAME = "PICKER_IN"
 IMAGE_ASSET_INPUT_PARAMETER_NAME = "IMAGE_ASSET_IN"
 IMAGE_ASSET_INPUT_DISPLAY_NAME = "ASSET_IN"
+SOUND_INPUT_PARAMETER_NAME = "SOUND_IN"
 SHOT_ASSET_INPUT_PARAMETER_NAME = "SHOT_ASSET_IN"
 SHOT_IMAGE_OUTPUT_PARAMETER_NAME = "SHOT_IMAGE_OUT"
 SHOT_PICKER_INPUT_PARAMETER_NAME = "SHOT_PICKER_IN"
@@ -176,19 +181,17 @@ UI_RESIZE_MODE = "stacked_outer_1000"
 UI_HEADER_LAYOUT_VERSION = 2
 LEGACY_IMAGE_SOURCES_DEFAULT_HEIGHT = 542
 GROUP_START_HEIGHTS = {
-    # Match VideoPicker's 68px header while preserving the editor groups.
-    # Only the fresh/default image editor absorbs the
-    # 10px delta; persisted user group heights remain authoritative.
-    "imageSources": 514,
-    "imageText": 200,
-    "videoSources": 200,
-    "videoText": 150,
+    "imageSources": 490,
+    "imageText": 210,
+    "videoSources": 150,
+    "soundSources": 150,
+    "videoText": 190,
 }
 GROUP_MIN_HEIGHTS = {
-    # Keep the established 1193px minimum while reserving VideoPicker chrome.
-    "imageSources": 514,
+    "imageSources": 490,
     "imageText": 200,
-    "videoSources": 200,
+    "videoSources": 150,
+    "soundSources": 150,
     "videoText": 150,
 }
 GROUP_START_TOTAL_HEIGHT = sum(GROUP_START_HEIGHTS.values())
@@ -196,13 +199,13 @@ PROMPT_DASHBOARD_FIXED_HEIGHT = 129
 # Native compatibility/dependency ports are retained on the graph but rendered
 # as hidden rows. The custom dashboard therefore owns the full node.
 PROMPT_NATIVE_ASSET_INPUT_ROW_HEIGHT = 0
-# Use the approved startup size on every workflow open. User resizing after
-# construction and authored inner group heights remain independent of it.
-PROMPT_START_WIDTH = 1800
+# Fresh nodes include the Sound card; positive saved shell dimensions and
+# authored inner group heights remain independent of the new defaults.
+PROMPT_START_WIDTH = 1490
 PROMPT_MANAGER_HEADER_TABS_HEIGHT = 68 + 44 + 24
-PROMPT_START_BOTTOM_PADDING = 21
+PROMPT_START_BOTTOM_PADDING = 25
 PROMPT_START_HEIGHT = GROUP_START_TOTAL_HEIGHT + PROMPT_DASHBOARD_FIXED_HEIGHT + PROMPT_MANAGER_HEADER_TABS_HEIGHT + PROMPT_START_BOTTOM_PADDING
-PROMPT_MIN_HEIGHT = GROUP_START_TOTAL_HEIGHT + PROMPT_DASHBOARD_FIXED_HEIGHT
+PROMPT_MIN_HEIGHT = sum(GROUP_MIN_HEIGHTS.values()) + PROMPT_DASHBOARD_FIXED_HEIGHT
 GROUP_MAX_HEIGHT = 6000
 KEEP_OUT_TEXTAREA_MIN_HEIGHT = 34
 KEEP_OUT_TEXTAREA_MAX_HEIGHT = 1200
@@ -676,6 +679,28 @@ def _connected_source_fingerprint(payload: Any, connected: bool) -> str:
     except Exception:
         canonical = repr((bool(connected), source))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _dashboard_without_route_clocks(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Compare display state without read-only exact-view publication clocks.
+
+    Call only after full snapshot validation and equal source content proofs.
+    Actual media, selection, authored fields and publisher identity remain in
+    the comparison. Execution and persisted hydration validation are unchanged.
+    """
+    result = dict(state)
+    for kind in ("image_asset", "picker"):
+        source = state.get(kind)
+        if not isinstance(source, dict) or not isinstance(source.get("shot_routing"), dict):
+            continue
+        result[kind] = dict(source, shot_routing={key: value
+            for key, value in source["shot_routing"].items()
+            if key not in ("generation", "metadata_sha256")})
+        if kind == "image_asset":
+            # Exact ImageAsset selection_id is derived from metadata_sha256.
+            # The complete validated snapshot proof includes ordered UIDs.
+            result[kind].pop("selection_id", None)
+    return result
 
 
 _UNSTRUCTURED_INPUT_KEY = "__hmb_unstructured_input__"
@@ -1384,6 +1409,14 @@ def _normalize_video_timing_cues(value: Any) -> List[Dict[str, Any]]:
     return out
 
 
+def _is_retired_analysis_pick(value: Any) -> bool:
+    """Ignore stale Prompt widget commands without overwriting authored state."""
+    schema = "hmb-prompt-analysis-pick"
+    if isinstance(value, str) and schema in value:
+        value = _parse_state(value)
+    return isinstance(value, dict) and value.get("schema") == schema
+
+
 def _parse_state(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -1551,6 +1584,10 @@ def _default_widget_state() -> Dict[str, Any]:
         "images": [_default_image_item(slot) for slot in range(1, 5)],
         "videos": [_default_video_item(1)],
         "text": dict(TEXT_FIELD_DEFAULTS),
+        "sound_sources": [],
+        "sound_overlays": {},
+        "sound_direction": "",
+        "sound_connection": {},
         _SOURCE_INTENT_FALLBACKS_KEY: [],
         "ui": {
             "group_heights": {},
@@ -2367,6 +2404,50 @@ def _normalize_text(state: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
+def _normalize_analysis_generated_text(value: Any) -> Dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {name: value[name] for name in TEXT_FIELD_NAMES
+        if isinstance(value.get(name), str) and 0 < len(value[name]) <= 20000}
+
+
+def _merge_analysis_generated_text(document: Dict[str, Any], fields: Dict[str, Any]) -> bool:
+    """Replace an intact generated suffix and preserve anything the artist edited."""
+    text = document["text"]
+    generated = _normalize_analysis_generated_text(document.get("analysis_generated_text"))
+    changed = False
+    for name in TEXT_FIELD_NAMES:
+        if name not in fields or not isinstance(fields[name], str):
+            continue
+        replacement = fields[name]
+        if len(replacement) > (20000 if name == "VIDEO_VFX" else 6000):
+            continue
+        current, previous = text[name], generated.get(name, "")
+        authored = current
+        if previous:
+            if current == previous:
+                authored = ""
+            elif current.endswith("\n\n" + previous):
+                authored = current[:-(len(previous) + 2)]
+            elif current:
+                # An edited generated section has become authored text.
+                continue
+        updated = "\n\n".join(part for part in (authored, replacement) if part)
+        if updated == current:
+            continue
+        changed = True
+        text[name] = updated
+        if replacement:
+            generated[name] = replacement
+        else:
+            generated.pop(name, None)
+    if generated:
+        document["analysis_generated_text"] = generated
+    else:
+        document.pop("analysis_generated_text", None)
+    return changed
+
+
 def _normalize_ui(state: Dict[str, Any]) -> Dict[str, Any]:
     ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
     compatible = _clean_string(ui.get("resize_mode")) == UI_RESIZE_MODE
@@ -2380,11 +2461,11 @@ def _normalize_ui(state: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         legacy_image_height = -1
     legacy_companion_defaults = True
-    for key in ("imageText", "videoSources", "videoText"):
+    for key, legacy_default in (("imageText", 200), ("videoSources", 200), ("videoText", 150)):
         if key not in source_heights:
             continue
         try:
-            if int(round(float(source_heights.get(key)))) != GROUP_START_HEIGHTS[key]:
+            if int(round(float(source_heights.get(key)))) != legacy_default:
                 legacy_companion_defaults = False
         except Exception:
             legacy_companion_defaults = False
@@ -2398,7 +2479,7 @@ def _normalize_ui(state: Dict[str, Any]) -> Dict[str, Any]:
     for key, min_height in GROUP_MIN_HEIGHTS.items():
         try:
             value = (
-                GROUP_START_HEIGHTS["imageSources"]
+                514
                 if key == "imageSources" and legacy_default_layout
                 else int(round(float(source_heights.get(key))))
             )
@@ -2550,6 +2631,8 @@ def _migrate_old_video_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
     # it or normalize its lines; repeated lines and whitespace can be intentional.
     out["keep_out"] = _verbatim_text(item.get("keep_out"))
     out["picker_auto_label"] = _clean_string(item.get("picker_auto_label"))
+    if item.get("picker_speaker_mask") is True:
+        out["picker_speaker_mask"] = True
     (
         out["picker_auto_video_main_type"],
         out["picker_auto_video_sub_type"],
@@ -2847,6 +2930,30 @@ def _normalize_dormant_image_rows(
 
 def _is_active_video(item: Dict[str, Any]) -> bool:
     return _has_video_meaning(item) and item.get("source_type") != "Ignore / Unused"
+
+
+def _normal_prompt_visual_rows(
+    state: Dict[str, Any],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], set[int]]:
+    """Keep Analysis-only sources out of the ordinary Prompt publication.
+
+    The authored slot is deliberately retained.  An ordinary @image2 stays
+    @image2 even when @image1 belongs exclusively to Analysis Agent.
+    """
+    active_images = _active_image_rows_for_state(state["images"], state)
+    active_videos = [item for item in state["videos"] if _is_active_video(item)]
+    excluded_video_slots = {
+        int(item.get("slot") or 1)
+        for item in state["videos"]
+        if _clean_string(item.get("video_sub_type")) == _ANALYSIS_SUB_TYPE
+    }
+    return (
+        [item for item in active_images
+         if _clean_string(item.get("image_sub_type")) != _ANALYSIS_SUB_TYPE],
+        [item for item in active_videos
+         if int(item.get("slot") or 1) not in excluded_video_slots],
+        excluded_video_slots,
+    )
 
 
 def _normalize_picker_slot_suppressions(value: Any) -> Dict[str, str]:
@@ -4391,7 +4498,7 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
         ),
     }
 
-    return {
+    normalized = {
         "schema": STATE_SCHEMA,
         "mode": MODE_NAME,
         **({"manual_rebind": _normalize_manual_rebind_notice(state.get("manual_rebind"))}
@@ -4407,6 +4514,14 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "images": images,
         "videos": videos,
         "text": _normalize_text(state),
+        **({"analysis_generated_text": generated_text}
+            if (generated_text := _normalize_analysis_generated_text(state.get("analysis_generated_text"))) else {}),
+        "sound_sources": _normalize_prompt_sound_sources(state.get("sound_sources")),
+        "sound_overlays": _normalize_sound_overlays(state.get("sound_overlays")),
+        "sound_direction": _verbatim_text(state.get("sound_direction"))[:20000],
+        "sound_connection": {key: copy.deepcopy(value) for key, value in
+            (state.get("sound_connection") if isinstance(state.get("sound_connection"), dict) else {}).items()
+            if key in {"enabled", "project_id", "revision", "error"}},
         _SOURCE_INTENT_FALLBACKS_KEY: source_intent_fallbacks,
         "ui": _normalize_ui(state),
         "picker": picker,
@@ -4420,6 +4535,135 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
             "max_videos": MAX_VIDEOS,
         },
     }
+    normalized["speaker_sources"] = _sound_speaker_sources(normalized)
+    return normalized
+
+
+_PROMPT_SOUND_FIELDS = ("role", "purpose", "transcript", "target", "in_seconds", "out_seconds",
+                       "start_seconds", "gain_db", "enabled", "loop", "lipsync")
+_PROMPT_AUDIO_SUB_TYPES = ("Apply", "Ignore", "Analysis")
+
+
+def _normalize_sound_speaker_binding(value: Any) -> Dict[str, str] | None:
+    if not isinstance(value, dict) or value.get("kind") not in ("image", "video"):
+        return None
+    kind = value["kind"]
+    source = value.get("source_id")
+    source = source.strip() if isinstance(source, str) else ""
+    if not source or len(source) > 512:
+        return None
+    color = value.get("color")
+    return {"kind": kind, "source_id": source,
+            "color": color.strip()[:64] if kind == "video" and isinstance(color, str) else ""}
+
+
+def _sound_speaker_sources(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Offer only attached, active sources, keyed independently of row order."""
+    image_uids = set(state["image_asset"]["ordered_source_uids"])
+    picker = state["picker"]
+    video_uids = set(picker["ordered_video_uids"])
+    if not image_uids and not video_uids:
+        return []
+    images, videos, _ = _normal_prompt_visual_rows(state)
+    colors_by_video: Dict[str, Dict[str, set[tuple[str, str]]]] = {}
+    for marker in picker["markers"]:
+        uid, color = _picker_video_uid(marker), _clean_string(marker.get("color"))
+        if uid in video_uids and 0 < len(color) <= 64:
+            region = (_clean_string(marker.get("asset_id")), _clean_string(marker.get("subject_root")))
+            colors_by_video.setdefault(uid, {}).setdefault(color, set()).add(region)
+    sources = []
+    for image in images:
+        uid = _image_asset_row_uid(image)
+        if uid not in image_uids or image["image_main_type"] != "Character":
+            continue
+        token = image["token"]
+        label = _public_path_basename(image["label"], token, strip_extension=True)
+        sources.append({"kind": "image", "source_id": uid, "reference": token,
+                        "label": f"{token} · {label}", "is_mask": False, "colors": []})
+    for video in videos:
+        uid = _picker_video_uid(video)
+        if uid not in video_uids:
+            continue
+        token = video["token"]
+        label = _public_path_basename(video["label"], token, strip_extension=True)
+        is_mask = (video.get("picker_speaker_mask") is True
+                   or video.get("picker_auto_video_sub_type") == "Mask"
+                   or video["video_sub_type"] == "Mask")
+        colors = [color for color, regions in colors_by_video.get(uid, {}).items()
+                  if len(regions) == 1 and ("", "") not in regions] if is_mask else []
+        sources.append({"kind": "video", "source_id": uid, "reference": token,
+                        "label": f"{token} · {label}", "is_mask": is_mask, "colors": colors})
+    return sources
+
+
+def _resolved_sound_speaker(state: Dict[str, Any], audio: Dict[str, Any]) -> Dict[str, str]:
+    if audio.get("purpose") not in ("reference", "both"):
+        return {}
+    binding = state["sound_overlays"].get(audio["instance_id"], {}).get("speaker_binding")
+    if not binding:
+        return {}
+    matches = [source for source in state["speaker_sources"]
+               if (source["kind"], source["source_id"]) == (binding["kind"], binding["source_id"])]
+    if len(matches) != 1:
+        return {}
+    source = matches[0]
+    color = binding["color"]
+    if source["is_mask"]:
+        return {"source": source["reference"], "mask_color": color} if color in source["colors"] else {}
+    return {"source": source["reference"]} if not color else {}
+
+
+def _prompt_audio_sub_type(row: Dict[str, Any]) -> str:
+    subtype = row.get("audio_sub_type")
+    if subtype in _PROMPT_AUDIO_SUB_TYPES:
+        return subtype
+    return "Ignore" if row.get("enabled") is False else "Apply"
+
+
+def _normalize_sound_overlays(value: Any) -> Dict[str, Any]:
+    """Authored controls only; a widget can never supply a sound path or hash."""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for instance, raw in list(value.items())[:_hmb_sound.MAX_TRACKS]:
+        if not isinstance(instance, str) or not instance or len(instance) > 128 or not isinstance(raw, dict):
+            continue
+        row = {}
+        for field in _PROMPT_SOUND_FIELDS:
+            if field not in raw:
+                continue
+            item = raw[field]
+            if field in {"enabled", "loop", "lipsync"}:
+                if type(item) is bool:
+                    row[field] = item
+            elif field in {"in_seconds", "out_seconds", "start_seconds", "gain_db"}:
+                if item is None and field == "out_seconds":
+                    row[field] = None
+                elif type(item) in {int, float} and math.isfinite(item):
+                    row[field] = item
+            elif isinstance(item, str):
+                row[field] = item[:20000 if field == "transcript" else 512]
+        subtype = raw.get("audio_sub_type")
+        if subtype in _PROMPT_AUDIO_SUB_TYPES:
+            row["audio_sub_type"] = subtype
+            row.pop("enabled", None)
+        if "speaker_binding" in raw:
+            binding = _normalize_sound_speaker_binding(raw["speaker_binding"])
+            if raw["speaker_binding"] is None or binding:
+                row["speaker_binding"] = binding
+        if row:
+            result[instance] = row
+    return result
+
+
+def _normalize_prompt_sound_sources(value: Any) -> List[Dict[str, Any]]:
+    allowed = ("instance_id", "source_uid", "name", "audio", "duration_seconds", *_PROMPT_SOUND_FIELDS)
+    return [
+        {**{key: copy.deepcopy(row[key]) for key in allowed if key in row},
+         "audio_sub_type": _prompt_audio_sub_type(row)}
+        for row in (value if isinstance(value, list) else [])[:_hmb_sound.MAX_TRACKS]
+        if isinstance(row, dict) and isinstance(row.get("instance_id"), str)
+    ]
 
 
 def _prompt_document_key(shot: Any) -> str:
@@ -4464,7 +4708,7 @@ def _prompt_authoring_sync_fingerprint(value: Any) -> str:
 def _prompt_document_intent_fingerprint(value: Any) -> str:
     state = _normalize_state(value if isinstance(value, dict) else _parse_state(value))
     return _canonical_sha256({"document": _prompt_document_key(state.get("shot")),
-        **{key: state.get(key) for key in ("images", "videos", "text", _SOURCE_INTENT_FALLBACKS_KEY)}})
+        **{key: state.get(key) for key in ("images", "videos", "text", "sound_overlays", "sound_direction", _SOURCE_INTENT_FALLBACKS_KEY)}})
 
 
 def _prompt_same_authoring_write(previous: Any, incoming: Any) -> bool:
@@ -4830,6 +5074,10 @@ def _merge_prompt_revision_axes(
     # Connected source inputs do not author Prompt prose. A crossed source/UI
     # callback therefore keeps the latest accepted text generation.
     source["text"] = copy.deepcopy(authored_ui.get("text"))
+    if authored_ui.get("analysis_generated_text"):
+        source["analysis_generated_text"] = copy.deepcopy(authored_ui["analysis_generated_text"])
+    source["sound_overlays"] = copy.deepcopy(authored_ui.get("sound_overlays", {}))
+    source["sound_direction"] = authored_ui.get("sound_direction", "")
     # These fields are also authored only by the Prompt dashboard. In
     # particular, carrying the selected Shot from the newer UI axis prevents a
     # fast Shot 1 -> Shot 2 choice from being repainted by an overlapping Shot
@@ -5042,6 +5290,15 @@ def _add_image_asset_input(node: Any) -> None:
         _safe_add_parameter(node, **_image_asset_input_kwargs())
     finally:
         _repair_image_asset_input_parameter(node)
+
+
+def _add_sound_input(node: Any) -> None:
+    kwargs = _image_asset_input_kwargs()
+    kwargs.update(name=SOUND_INPUT_PARAMETER_NAME, type="dict", input_types=["dict"], default_value={},
+                  tooltip="Connect HMBSoundLibrary SOUND_OUT or SHOT_SOUND_OUT. Sound selection/timeline stay on Sound Library; this Prompt authors exact Shot sound direction.")
+    if not parameter_exists(node, SOUND_INPUT_PARAMETER_NAME):
+        _safe_add_parameter(node, **kwargs)
+    _repair_source_input_parameter(node, SOUND_INPUT_PARAMETER_NAME, kwargs)
 
 
 def _shot_asset_input_kwargs() -> Dict[str, Any]:
@@ -6160,7 +6417,8 @@ def _apply_image_asset_payload(
             item["asset_color_pick_candidates"] = asset["color_pick_candidates"]
             item["image_main_type"] = asset["image_main_type"]
             item["image_sub_type"] = (
-                asset["image_sub_type"] if created_prompt_row else previous_sub_type
+                asset["image_sub_type"] if created_prompt_row and asset["image_sub_type"] != _ANALYSIS_SUB_TYPE
+                else previous_sub_type
             )
             item["source_type"] = asset["source_type"]
             item["custom_source_type"] = (
@@ -6716,6 +6974,11 @@ def _prepare_uid_managed_video_rows(
         # Only an exact dormant UID can carry its former address forward;
         # missing/foreign UIDs still map to zero and clear invalid bindings.
         slot_map.update(picker_row_slot_map)
+    if previously_uid_managed and generated_empty_placeholder and not selected_rows:
+        # The already-empty Picker still displays the same blank row. Dormant
+        # sources were remapped on their actual deselection, not on this read.
+        # Repeating it erases the Editor's measured textarea height forever.
+        slot_map = {}
     if any(old != new for old, new in slot_map.items()):
         context_before_sync = _manual_video_context_snapshot(state)
         _remap_video_source_references_in_state(state, slot_map)
@@ -7497,6 +7760,15 @@ def _picker_media_engine(item: Any) -> str:
     return ""
 
 
+def _picker_video_is_imported_reference(item: Any) -> bool:
+    """Read the explicit import contract independently of the active DCC."""
+    return isinstance(item, dict) and all(
+        _clean_string(item.get(key)).casefold() == expected
+        for key, expected in (("generation_role", "imported"),
+                              ("media_kind", "imported_mp4_reference"),
+                              ("video_role", "user_imported_reference")))
+
+
 def _picker_blender_media_role_valid(item: Any) -> bool:
     """Require an exact Blender kind/role pair before claiming DCC provenance."""
 
@@ -7725,7 +7997,8 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             )
             continue
         item_uid = _picker_video_uid(item)
-        if payload_mode == "blender" and not _picker_blender_media_role_valid(item):
+        if (payload_mode == "blender" and not _picker_blender_media_role_valid(item)
+                and not _picker_video_is_imported_reference(item)):
             has_readable_unstructured_video_rows = True
             error = (
                 f"PICKER_OUT Blender video row {video_index} has no exact "
@@ -8531,6 +8804,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
         ).casefold()
         raw_media_kind = _clean_string(raw_video.get("media_kind")).casefold()
         raw_video_role = _clean_string(raw_video.get("video_role")).casefold()
+        imported_reference = _picker_video_is_imported_reference(raw_video)
         picker_main_type = (
             "Blender Preview / Render"
             if payload_mode == "blender"
@@ -8547,6 +8821,10 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
                 "blender_color_assignment_mask",
             }
         )
+        if generated_mask:
+            video_item["picker_speaker_mask"] = True
+        else:
+            video_item.pop("picker_speaker_mask", None)
         declared_depth = slot in claimed_depth_slots
         declared_motion_guide = slot in claimed_motion_guide_slots
         if declared_depth or declared_motion_guide:
@@ -8659,11 +8937,15 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
                 )
             )
             if taxonomy_is_picker_owned:
-                auto_sub_type = "Mask" if generated_mask else "Original Preview"
-                video_item["video_main_type"] = picker_main_type
+                # Picker transport does not make a user-imported reference an
+                # approved DCC playblast. Correct only Picker-owned defaults;
+                # authored roles and actual generated companions stay intact.
+                auto_main_type = "Custom / Context" if imported_reference and not generated_mask else picker_main_type
+                auto_sub_type = "Mask" if generated_mask else "Context" if imported_reference else "Original Preview"
+                video_item["video_main_type"] = auto_main_type
                 video_item["video_sub_type"] = auto_sub_type
                 video_item["picker_auto_video_main_type"] = (
-                    picker_main_type
+                    auto_main_type
                 )
                 video_item["picker_auto_video_sub_type"] = auto_sub_type
                 _normalize_video_taxonomy(video_item)
@@ -9009,6 +9291,9 @@ def _add_shot_media_output(node: Any, name: str) -> None:
 
 def _add_widget_state_parameter(node: Any) -> None:
     if parameter_exists(node, WIDGET_PARAMETER_NAME):
+        parameter = _get_parameter_obj(node, WIDGET_PARAMETER_NAME)
+        if hasattr(parameter, "allow_variable_substitution"):
+            parameter.allow_variable_substitution = False
         return
     kwargs: Dict[str, Any] = {
         "name": WIDGET_PARAMETER_NAME,
@@ -9025,17 +9310,17 @@ def _add_widget_state_parameter(node: Any) -> None:
             "height": PROMPT_START_HEIGHT,
             "min_height": 0,
             "widget_height": PROMPT_START_HEIGHT,
-            "width": 1800,
+            "width": PROMPT_START_WIDTH,
             "min_width": 760,
-            "preferred_width": 1800,
+            "preferred_width": PROMPT_START_WIDTH,
             "preferred_height": PROMPT_START_HEIGHT,
-            "default_width": 1800,
+            "default_width": PROMPT_START_WIDTH,
             "default_height": PROMPT_START_HEIGHT,
-            "initial_width": 1800,
+            "initial_width": PROMPT_START_WIDTH,
             "initial_height": PROMPT_START_HEIGHT,
-            "node_size": {"width": 1800, "height": PROMPT_START_HEIGHT},
-            "default_size": {"width": 1800, "height": PROMPT_START_HEIGHT},
-            "initial_size": {"width": 1800, "height": PROMPT_START_HEIGHT},
+            "node_size": {"width": PROMPT_START_WIDTH, "height": PROMPT_START_HEIGHT},
+            "default_size": {"width": PROMPT_START_WIDTH, "height": PROMPT_START_HEIGHT},
+            "initial_size": {"width": PROMPT_START_WIDTH, "height": PROMPT_START_HEIGHT},
             "resizable": True,
             "compact": False,
         },
@@ -9062,6 +9347,10 @@ def _add_widget_state_parameter(node: Any) -> None:
             last = exc
     if param is None:
         raise last or RuntimeError(f"Unable to add parameter {WIDGET_PARAMETER_NAME}")
+    # This property contains serialized UI state. The SDK must read the JSON
+    # literally during shot routing, including any braces in authored text.
+    if hasattr(param, "allow_variable_substitution"):
+        param.allow_variable_substitution = False
     if Widget is not None and not trait_attached:
         try:
             param.add_trait(Widget(name=WIDGET_NAME, library=WIDGET_LIBRARY_NAME))
@@ -9075,10 +9364,12 @@ def _build_fx_timing_source_contract(
     active_images: List[Dict[str, Any]],
     active_videos: List[Dict[str, Any]],
     control_only_bindings: List[Dict[str, Any]],
+    excluded_video_slots: set[int] | None = None,
 ) -> Dict[str, Any]:
     """Serialize authored video, range, timing, and control data neutrally."""
 
     sources: List[Dict[str, Any]] = []
+    excluded_video_slots = excluded_video_slots or set()
     for item in active_videos:
         slot = int(item.get("slot") or 1)
         token = f"@video{slot}"
@@ -9117,7 +9408,8 @@ def _build_fx_timing_source_contract(
         "schema": FX_TIMING_CONTRACT_SCHEMA,
         "version": FX_TIMING_CONTRACT_VERSION,
         "sources": sources,
-        "control_bindings": copy.deepcopy(control_only_bindings),
+        "control_bindings": [copy.deepcopy(entry) for entry in control_only_bindings
+                             if int(entry.get("video") or 0) not in excluded_video_slots],
     }
 
 
@@ -9187,9 +9479,11 @@ def _public_job_data_contract(
     active_images: List[Dict[str, Any]],
     active_videos: List[Dict[str, Any]],
     control_only_bindings: List[Dict[str, Any]],
+    excluded_video_slots: set[int] | None = None,
 ) -> Dict[str, Any]:
     """Build source, role, target, and range addresses without policy prose."""
 
+    excluded_video_slots = excluded_video_slots or set()
     active_video_slots = {
         int(item.get("slot") or 1) for item in active_videos
     }
@@ -9220,6 +9514,7 @@ def _public_job_data_contract(
                 "target_scope": _clean_string(entry.get("scope")),
             }
             for entry in _image_binding_entries(item)
+            if int(entry.get("marker_video") or 0) not in excluded_video_slots
         ]
         image_record = {
             "image": f"@image{slot}",
@@ -9339,6 +9634,8 @@ def _public_job_data_contract(
         }
         for item in active_images
         for binding in _active_frame_range_bindings(item)
+        if _video_slot_number(binding.get("video_slot"), MAX_VIDEOS)
+        not in excluded_video_slots
     ]
 
     controls = [
@@ -9357,6 +9654,7 @@ def _public_job_data_contract(
             "boundary": _clean_string(entry.get("boundary")),
         }
         for entry in control_only_bindings
+        if int(entry.get("video") or 0) not in excluded_video_slots
     ]
     return {
         "schema": PUBLIC_JOB_CONTRACT_SCHEMA,
@@ -9391,17 +9689,32 @@ def _public_user_description_data(
 def _build_data_only_prompt_package(state: Dict[str, Any]) -> str:
     state = _normalize_state(state)
     text = state["text"]
-    active_images = _active_image_rows_for_state(state["images"], state)
-    active_videos = [item for item in state["videos"] if _is_active_video(item)]
+    active_images, active_videos, excluded_video_slots = _normal_prompt_visual_rows(state)
     control_only_bindings = _parse_control_only_bindings(text)[0]
     job_data = _public_job_data_contract(
-        state, active_images, active_videos, control_only_bindings
+        state, active_images, active_videos, control_only_bindings,
+        excluded_video_slots,
     )
+    sound_rows = [row for row in state.get("sound_sources", [])
+                  if row.get("enabled") is True and row["audio_sub_type"] == "Apply"]
+    if sound_rows:
+        # These are authored directions, never a claim that audio was heard.
+        job_data["audios"] = []
+        for row in sound_rows:
+            record = {key: copy.deepcopy(row[key]) for key in
+                      ("audio", "name", *_PROMPT_SOUND_FIELDS) if key in row}
+            if speaker := _resolved_sound_speaker(state, row):
+                record["speaker_reference"] = speaker
+            job_data["audios"].append(record)
+        job_data["connections"]["sound"] = True
+    if state.get("sound_direction"):
+        job_data["sound_direction"] = state["sound_direction"]
     fx_timing_contract = _build_fx_timing_source_contract(
         state,
         active_images,
         active_videos,
         control_only_bindings,
+        excluded_video_slots,
     )
     user_data = _public_user_description_data(state, text)
     return "\n".join([
@@ -9446,8 +9759,7 @@ def _build_user_readable_prompt_package(state: Dict[str, Any]) -> str:
     """Show connection summaries, not the detailed model-bound instructions."""
 
     state = _normalize_state(state)
-    active_images = _active_image_rows_for_state(state["images"], state)
-    active_videos = [item for item in state["videos"] if _is_active_video(item)]
+    active_images, active_videos, excluded_video_slots = _normal_prompt_visual_rows(state)
     lines: List[str] = ["HMB_GP_Production", ""]
 
     korean = state.get("ui", {}).get("language") == "ko"
@@ -9473,6 +9785,8 @@ def _build_user_readable_prompt_package(state: Dict[str, Any]) -> str:
                 summary.append("2D표현: 사용" if korean else "2DSurface: On")
             lines.append(" / ".join(summary))
             for binding in _image_binding_entries(item):
+                if int(binding.get("marker_video") or 0) in excluded_video_slots:
+                    continue
                 summary = [
                     f"Binding {int(binding.get('index') or 0) + 1}",
                     f"Video: @video{int(binding.get('marker_video') or 1)}",
@@ -9504,6 +9818,19 @@ def _build_user_readable_prompt_package(state: Dict[str, Any]) -> str:
     else:
         lines.append("No video source assigned in HMBPromptLibrary.")
     lines.append("")
+    sound_rows = [row for row in state.get("sound_sources", [])
+                  if row.get("enabled") is True and row["audio_sub_type"] == "Apply"]
+    if sound_rows:
+        lines.append("SOUND SOURCE:")
+        for row in sound_rows:
+            summary = [_public_single_line(row.get("audio")),
+                       _public_single_line(row.get("name")), _public_single_line(row.get("role"))]
+            if speaker := _resolved_sound_speaker(state, row):
+                summary.append("Speaker reference: " + speaker["source"])
+                if color := speaker.get("mask_color"):
+                    summary.append("Mask color: " + color)
+            lines.append(" / ".join(summary))
+        lines.append("")
     return _compile_prompt_with_budget(lines)
 
 
@@ -9857,7 +10184,9 @@ def _prompt_start_metadata(value: Any) -> Dict[str, Any]:
     metadata = dict(value) if isinstance(value, dict) else {}
     saved_size = metadata.get("size")
     size = dict(saved_size) if isinstance(saved_size, dict) else {}
-    size.update(width=PROMPT_START_WIDTH, height=PROMPT_START_HEIGHT)
+    for key, fallback in (("width", PROMPT_START_WIDTH), ("height", PROMPT_START_HEIGHT)):
+        if type(size.get(key)) not in {int, float} or not math.isfinite(size[key]) or size[key] <= 0:
+            size[key] = fallback
     metadata["size"] = size
     return metadata
 
@@ -9912,8 +10241,9 @@ class HMBPromptLibrary(DataNode):
         # accepted the restored ImageAsset channel. That short window is not a
         # routing contract failure: preserve the saved loader projection and
         # let the identity-bound post-hydration reconcile retry it. Normal UI
-        # updates and process execution never enable this allowance.
+        # Explicit execution still requires the exact Picker route.
         self._hmb_picker_route_hydration_pending = False
+        self._hmb_prompt_pair_waiting_for_picker = False
         # A newly dragged Prompt should immediately adopt the ImageAsset's
         # active Shot and exact Picker snapshot. Serialized workflows disable
         # this one-shot path as soon as their initial widget state arrives, so
@@ -9937,6 +10267,7 @@ class HMBPromptLibrary(DataNode):
         self._hmb_ui_syncing = False
         self._hmb_picker_connected = False
         self._hmb_image_asset_connected = False
+        self._hmb_sound_connected = False
         self._hmb_connected_source_nodes: Dict[str, Any] = {}
         # Prepared display pages are independent of execution snapshots.
         self._hmb_prompt_shot_views = {}
@@ -9971,20 +10302,34 @@ class HMBPromptLibrary(DataNode):
             str, tuple[int, List[str]]
         ] = {}
         self._hmb_source_input_fingerprints = {
+            SOUND_INPUT_PARAMETER_NAME: _connected_source_fingerprint({}, False),
             PICKER_INPUT_PARAMETER_NAME: _connected_source_fingerprint({}, False),
             IMAGE_ASSET_INPUT_PARAMETER_NAME: _connected_source_fingerprint(
                 {}, False
             ),
         }
         try:
-            self.ui_options = {"width": 1800, "height": PROMPT_START_HEIGHT, "default_width": 1800, "default_height": PROMPT_START_HEIGHT, "preferred_width": 1800, "preferred_height": PROMPT_START_HEIGHT, "initial_width": 1800, "initial_height": PROMPT_START_HEIGHT, "node_size": {"width": 1800, "height": PROMPT_START_HEIGHT}, "default_size": {"width": 1800, "height": PROMPT_START_HEIGHT}, "initial_size": {"width": 1800, "height": PROMPT_START_HEIGHT}, "min_width": 760, "min_height": PROMPT_MIN_HEIGHT, "resizable": True}
-            self.width = 1800
-            self.height = PROMPT_START_HEIGHT
+            size = {"width": PROMPT_START_WIDTH, "height": PROMPT_START_HEIGHT}
+            self.ui_options = {**size, "default_width": PROMPT_START_WIDTH, "default_height": PROMPT_START_HEIGHT,
+                "preferred_width": PROMPT_START_WIDTH, "preferred_height": PROMPT_START_HEIGHT,
+                "initial_width": PROMPT_START_WIDTH, "initial_height": PROMPT_START_HEIGHT,
+                "node_size": dict(size), "default_size": dict(size), "initial_size": dict(size),
+                "min_width": 760, "min_height": PROMPT_MIN_HEIGHT, "resizable": True}
+            startup_size = dict(prepared_metadata["size"])
+            startup_width, startup_height = startup_size["width"], startup_size["height"]
+            self.ui_options.update(width=startup_width, height=startup_height,
+                preferred_width=startup_width, preferred_height=startup_height,
+                initial_width=startup_width, initial_height=startup_height,
+                node_size=dict(startup_size), initial_size=dict(startup_size),
+                min_width=min(760, startup_width), min_height=min(PROMPT_MIN_HEIGHT, startup_height))
+            self.width = startup_width
+            self.height = startup_height
         except Exception as exc:
             _diagnostic_exception("Prompt node UI sizing failed", exc)
 
         _add_image_asset_input(self)
         _add_picker_input(self)
+        _add_sound_input(self)
         _add_shot_asset_input(self)
         _add_shot_picker_input(self)
         self._ensure_prompt_output()
@@ -10319,6 +10664,10 @@ class HMBPromptLibrary(DataNode):
         except Exception as exc:
             _diagnostic_exception("PICKER_IN parameter setup failed", exc)
         try:
+            _add_sound_input(self)
+        except Exception as exc:
+            _diagnostic_exception("SOUND_IN parameter setup failed", exc)
+        try:
             _add_shot_asset_input(self)
         except Exception as exc:
             _diagnostic_exception("SHOT_ASSET_IN parameter setup failed", exc)
@@ -10338,6 +10687,138 @@ class HMBPromptLibrary(DataNode):
                 _add_shot_media_output(self, name)
             except Exception as exc:
                 _diagnostic_exception(f"{name} parameter setup failed", exc)
+
+    def _registered_sound_source(self) -> Any:
+        """Prove one retained physical edge; raw SOUND_IN is never authority."""
+        owner = getattr(self, "_hmb_execution_registered_owner", self)
+        known = getattr(owner, "_hmb_connected_source_nodes", {}).get(SOUND_INPUT_PARAMETER_NAME)
+        possible = bool(known is not None or getattr(owner, "_hmb_sound_connected", False)
+                        or _get_parameter_raw(owner, SOUND_INPUT_PARAMETER_NAME))
+        if not possible:
+            return None
+        try:
+            from griptape_nodes.retained_mode.engine import has_current_engine
+            from griptape_nodes.retained_mode.events.connection_events import ListConnectionsForNodeRequest, ListConnectionsForNodeResultSuccess
+            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+            from _hmb_shot_routing import _same_flow_nodes
+            if not has_current_engine():
+                raise ValueError("Sound requires an existing retained host")
+            if GriptapeNodes.NodeManager().get_node_by_name(owner.name) is not owner:
+                raise ValueError("Prompt is not the registered owner")
+            result = GriptapeNodes.handle_request(ListConnectionsForNodeRequest(node_name=owner.name, broadcast_result=False))
+            if not isinstance(result, ListConnectionsForNodeResultSuccess):
+                raise ValueError("Sound connection inspection failed")
+            edges = [edge for edge in result.incoming_connections if edge.target_parameter_name == SOUND_INPUT_PARAMETER_NAME]
+            if not edges:
+                return None
+            if len(edges) != 1 or edges[0].source_parameter_name not in {"SOUND_OUT", "SHOT_SOUND_OUT"}:
+                raise ValueError("Sound requires one SOUND_OUT/SHOT_SOUND_OUT physical edge")
+            source = GriptapeNodes.NodeManager().get_node_by_name(edges[0].source_node_name)
+            source_file = Path(getattr(sys.modules.get(type(source).__module__), "__file__", "")).resolve()
+            metadata = getattr(source, "metadata", {})
+            flow, nodes = _same_flow_nodes(owner)
+            if (source_file != (_THIS_DIR / "HMBSoundLibrary.py").resolve()
+                    or type(source).__name__ != "HMBSoundLibrary"
+                    or metadata.get("library") != WIDGET_LIBRARY_NAME
+                    or metadata.get("node_type") != "HMBSoundLibrary"
+                    or not flow or not any(node is source for node in nodes)
+                    or bool(getattr(source, "_hmb_node_deleted", False))
+                    or not callable(getattr(source, "_hmb_sound_snapshot_for", None))):
+                raise ValueError("Connected source is not the live registered HMBSoundLibrary")
+            if known is not None and known is not source:
+                raise ValueError("Connected Sound publisher changed")
+            return source
+        except _hmb_sound.SoundError:
+            raise
+        except Exception as exc:
+            raise _hmb_sound.SoundError("SOUND_CONNECTION_INVALID", "사운드 라이브러리의 실제 연결과 현재 노드를 확인하세요.") from exc
+
+    def _sound_snapshot_for_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        source = self._registered_sound_source()
+        if source is None:
+            return {}
+        shot = _normalize_shot_selection(state.get("shot"))
+        raw_snapshot = source._hmb_sound_snapshot_for(channel_uuid=shot["channel_uuid"], shot_uuid=shot["shot_uuid"])
+        if isinstance(raw_snapshot, dict) and not raw_snapshot:
+            # A newly dragged, physically verified Sound Library has no
+            # selected project yet. It remains an optional third source.
+            self._hmb_connected_sound_snapshot = {}
+            return {}
+        snapshot = _hmb_sound.normalize_sound_snapshot(raw_snapshot)
+        if not snapshot:
+            raise _hmb_sound.SoundError("SOUND_SNAPSHOT_INVALID", "연결된 사운드 라이브러리의 프로젝트를 선택하세요.")
+        if snapshot.get("preparing") is True:
+            raise _hmb_sound.SoundPreparingError()
+        if snapshot.get("preparation_error"):
+            raise _hmb_sound.SoundError("SOUND_PREPARATION_FAILED", "선택한 사운드 준비에 실패했습니다. 음원 연결을 확인하고 다시 선택하세요.")
+        self._hmb_connected_sound_snapshot = copy.deepcopy(snapshot)
+        project = state.get("image_asset", {}).get("project_id", "")
+        if project and snapshot["project_id"].casefold() != project.casefold():
+            raise _hmb_sound.SoundError("SOUND_PROJECT_MISMATCH", "현재 샷과 같은 프로젝트의 사운드를 연결하세요.")
+        if snapshot["channel_uuid"] != shot["channel_uuid"]:
+            raise _hmb_sound.SoundError("SOUND_SHOT_MISMATCH", "사운드 라이브러리와 Prompt의 샷 채널을 확인하세요.")
+        overlays = _normalize_sound_overlays(state.get("sound_overlays"))
+        for row in snapshot["tracks"]:
+            if row["channel_uuid"] == shot["channel_uuid"] and row["shot_uuid"] == shot["shot_uuid"]:
+                row.update(copy.deepcopy(overlays.get(row["instance_id"], {})))
+                row["enabled"] = _prompt_audio_sub_type(row) == "Apply"
+        return _hmb_sound.normalize_sound_snapshot(snapshot)
+
+    def _apply_sound_source(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        snapshot = self._sound_snapshot_for_state(state)
+        self._hmb_current_sound_snapshot = copy.deepcopy(snapshot)
+        state["sound_sources"] = []
+        state["sound_connection"] = {}
+        if snapshot:
+            shot = _normalize_shot_selection(state.get("shot"))
+            overlays = _normalize_sound_overlays(state.get("sound_overlays"))
+            # Use the shared public formatter; even disabled rows remain
+            # editable, while the model-bound formatter skips them below.
+            rows = [row for row in snapshot["tracks"] if row["channel_uuid"] == shot["channel_uuid"] and row["shot_uuid"] == shot["shot_uuid"]]
+            enabled_rows = [row for row in rows if row["enabled"]]
+            canonical = _hmb_sound.public_sound_directions(snapshot, channel_uuid=shot["channel_uuid"], shot_uuid=shot["shot_uuid"])
+            by_instance = {row["instance_id"]: direction for row, direction in zip(enabled_rows, canonical)}
+            for row in rows:
+                if row["enabled"]:
+                    direction = copy.deepcopy(by_instance[row["instance_id"]])
+                else:
+                    preview = dict(snapshot, tracks=[dict(row, enabled=True)])
+                    direction = _hmb_sound.public_sound_directions(preview, channel_uuid=shot["channel_uuid"], shot_uuid=shot["shot_uuid"])[0]
+                    direction["audio"] = ""  # Disabled cards never claim a model slot.
+                direction.update(instance_id=row["instance_id"],
+                    source_uid=row["source_uid"], enabled=row["enabled"], duration_seconds=row["duration_seconds"],
+                    audio_sub_type=_prompt_audio_sub_type({**row, **overlays.get(row["instance_id"], {})}))
+                state["sound_sources"].append(direction)
+            state["sound_connection"] = {"enabled": True, "project_id": snapshot["project_id"], "revision": snapshot["revision"]}
+        return state
+
+    def _hmb_sound_snapshot_for(self, channel_uuid: Any = "", shot_uuid: Any = "") -> Dict[str, Any]:
+        with self._hmb_sync_lock:
+            state = _normalize_state(self._current_state())
+            if channel_uuid or shot_uuid:
+                selected = next((row for row in _verified_prompt_shot_catalog(state)
+                    if row["channel_uuid"] == channel_uuid and row["shot_uuid"] == shot_uuid), None)
+                if selected is None:
+                    raise _hmb_sound.SoundError("SOUND_SHOT_MISMATCH", "현재 Prompt에 존재하는 샷의 사운드를 요청하세요.")
+                state = _select_prompt_shot_document(state, selected)
+            return copy.deepcopy(self._sound_snapshot_for_state(state))
+
+    def _hmb_agent_sound_snapshot(self, expected_machine: Any) -> Dict[str, Any]:
+        with self._hmb_sync_lock:
+            if self._registered_sound_source() is None:
+                return {}
+            incoming = str(getattr(expected_machine, "value", expected_machine) or "")
+            _state, _visible, machine, _fingerprint = self._compile_current_prompt_pair(refresh_sources=False)
+            if incoming.rstrip("\r\n") != machine.rstrip("\r\n"):
+                raise _hmb_sound.SoundError("SOUND_PROMPT_PAIR_CHANGED", "사운드 방향과 Prompt가 변경되었습니다. 현재 샷을 다시 실행하세요.")
+            return copy.deepcopy(getattr(self, "_hmb_current_sound_snapshot", {}))
+
+    def _hmb_hydrate_sound_source(self, source: Any) -> None:
+        # The routing helper invokes this after establishing the physical edge.
+        self._hmb_connected_source_nodes[SOUND_INPUT_PARAMETER_NAME] = source
+        self._hmb_sound_connected = True
+        self._registered_sound_source()
+        self._schedule_prompt_sync(source_burst=True)
 
     def _reconcile_connected_source_inputs_from_graph(self) -> bool:
         """Refresh source inputs from their actual connected output caches.
@@ -10395,6 +10876,7 @@ class HMBPromptLibrary(DataNode):
             return False
 
         source_targets = {
+            SOUND_INPUT_PARAMETER_NAME,
             PICKER_INPUT_PARAMETER_NAME,
             IMAGE_ASSET_INPUT_PARAMETER_NAME,
             SHOT_ASSET_INPUT_PARAMETER_NAME,
@@ -10428,6 +10910,7 @@ class HMBPromptLibrary(DataNode):
             IMAGE_ASSET_INPUT_PARAMETER_NAME in incoming_by_target
             or SHOT_ASSET_INPUT_PARAMETER_NAME in incoming_by_target
         )
+        self._hmb_sound_connected = SOUND_INPUT_PARAMETER_NAME in incoming_by_target
         self._hmb_connected_source_nodes = {}
         sentinel = object()
         parent_setter = getattr(super(), "set_parameter_value", None)
@@ -10439,7 +10922,7 @@ class HMBPromptLibrary(DataNode):
         # resurrect a disconnected Picker/ImageAsset during hydration.
         for target_name in source_targets - incoming_by_target.keys():
             empty_value: Any = (
-                {} if target_name == SHOT_PICKER_INPUT_PARAMETER_NAME else ""
+                {} if target_name in {SHOT_PICKER_INPUT_PARAMETER_NAME, SOUND_INPUT_PARAMETER_NAME} else ""
             )
             if _source_transport_values_equal(
                 target_name,
@@ -10513,6 +10996,7 @@ class HMBPromptLibrary(DataNode):
             raise _ShotRoutingContractError("Legacy Prompt requires an explicit Shot rebind before execution.")
 
         self._hmb_picker_route_hydration_pending = False
+        self._hmb_validated_route_content = {}
         normalized = state if already_normalized else _normalize_state(state)
         sources = getattr(self, "_hmb_connected_source_nodes", {})
         legacy_image_source_selected = False
@@ -10582,6 +11066,9 @@ class HMBPromptLibrary(DataNode):
                     if isinstance(normalized.get("image_asset"), dict) else {},
                 label="ImageAsset shot routing",
             )
+            self._hmb_validated_route_content["image_asset"] = (id(image_source_node),
+                _canonical_sha256({key: value for key, value in image_snapshot.items()
+                    if key not in ("generation", "metadata_sha256")}))
             if compact_catalog is None:
                 compact_catalog = _compact_catalog_from_snapshot(image_snapshot)
             image_catalog_rows = (_shot_catalog_from_exact_snapshot(image_snapshot, compact_catalog,
@@ -10791,6 +11278,9 @@ class HMBPromptLibrary(DataNode):
                     if isinstance(normalized.get("picker"), dict) else {},
                 label="VideoPicker shot routing",
             )
+            self._hmb_validated_route_content["picker"] = (id(picker_source_node),
+                _canonical_sha256({key: value for key, value in picker_snapshot.items()
+                    if key not in ("generation", "metadata_sha256")}))
             picker_shot = next(
                 (
                     item
@@ -10855,7 +11345,7 @@ class HMBPromptLibrary(DataNode):
                 for uid in picker_shot["selected_source_uids"]
             ]
 
-        normalized = _normalize_state(normalized)
+        normalized = self._apply_sound_source(_normalize_state(normalized))
         return (
             normalized,
             image_media,
@@ -10926,7 +11416,7 @@ class HMBPromptLibrary(DataNode):
     @staticmethod
     def _hmb_manual_rebind_authored(state: Dict[str, Any]) -> Dict[str, Any]:
         authored = {key: copy.deepcopy(state.get(key)) for key in
-            ("images", "videos", "text", "shot_documents", _SOURCE_INTENT_FALLBACKS_KEY)}
+            ("images", "videos", "text", "sound_overlays", "sound_direction", "shot_documents", _SOURCE_INTENT_FALLBACKS_KEY)}
         # ``present`` is derived again when a formerly independent row gains
         # a Shot scope. It is not a user-authored value or rebind authority.
         for field in ("images", "videos"):
@@ -11135,12 +11625,12 @@ class HMBPromptLibrary(DataNode):
         # changes to another Shot's displayed text. Actual execution validates
         # all those proofs again through _hmb_prompt_shot_document.
         return _canonical_sha256({key: state.get(key) for key in (
-            "shot", "images", "videos", "text", _SOURCE_INTENT_FALLBACKS_KEY)})
+            "shot", "images", "videos", "text", "sound_sources", "sound_overlays", "sound_direction", _SOURCE_INTENT_FALLBACKS_KEY)})
 
-    def _hmb_remember_prompt_shot_view(self, state: Dict[str, Any], visible: str) -> None:
+    def _hmb_remember_prompt_shot_view(self, state: Dict[str, Any], visible: str) -> bool:
         selected = _normalize_shot_selection(state.get("shot"))
         if not selected["channel_uuid"] or not selected["shot_uuid"]:
-            return
+            return False
         key = _prompt_document_key(selected)
         fingerprint = self._hmb_prompt_view_fingerprint(state)
         cache = getattr(self, "_hmb_prompt_shot_views", {})
@@ -11148,7 +11638,7 @@ class HMBPromptLibrary(DataNode):
         sources = tuple(getattr(self, "_hmb_connected_source_nodes", {}).values())
         if old.get("fingerprint") == fingerprint and old.get("visible_prompt") == visible:
             old["_sources"] = sources
-            return
+            return False
         self._hmb_prompt_view_revision = int(getattr(self, "_hmb_prompt_view_revision", 0)) + 1
         cache[key] = {"schema": "hmb-prompt-shot-view", "version": 1,
             "subscription": {"channel_uuid": selected["channel_uuid"],
@@ -11157,6 +11647,7 @@ class HMBPromptLibrary(DataNode):
             "fingerprint": fingerprint,
             "_sources": sources}
         self._hmb_prompt_shot_views = cache
+        return True
 
     def _hmb_prepare_prompt_shot_views(self) -> set[str]:
         """Prepare changed display pages on load/content change, never on read.
@@ -11196,8 +11687,20 @@ class HMBPromptLibrary(DataNode):
                     if cached.get("fingerprint") != self._hmb_prompt_view_fingerprint(state):
                         self._hmb_remember_prompt_shot_view(state, _build_prompt_package(state))
                         changed.add(key)
-                    else:
-                        cached["_sources"] = tuple(getattr(self, "_hmb_connected_source_nodes", {}).values())
+                    cached = self._hmb_prompt_shot_views[key]
+                    cached["_sources"] = tuple(getattr(self, "_hmb_connected_source_nodes", {}).values())
+                    sound = getattr(view, "_hmb_current_sound_snapshot", {})
+                    preview = self._hmb_project_analysis_sources(state, _images, _videos, sound)
+                    upstream_preview = self._hmb_project_analysis_sources(
+                        state, _images, _videos, sound, include_unmarked=True)
+                    exclusions = self._hmb_analysis_media_exclusions(state, _images, _videos, sound)
+                    if (cached.get("_analysis_preview", []) != preview
+                            or cached.get("_analysis_upstream_preview", []) != upstream_preview
+                            or cached.get("_analysis_exclusions", {}) != exclusions):
+                        cached["_analysis_preview"] = preview
+                        cached["_analysis_upstream_preview"] = upstream_preview
+                        cached["_analysis_exclusions"] = exclusions
+                        changed.add(key)
                 except Exception:
                     # A source can be between native hydrate/connection events.
                     # Never expose its former display under a replacement UUID.
@@ -11229,6 +11732,36 @@ class HMBPromptLibrary(DataNode):
                     continue
         except Exception:
             pass
+
+    def _hmb_notify_analysis_delivery_changed(self, *, channel_uuid: str, shot_uuid: str) -> None:
+        """Refresh the analysis note on the exact connected Agent display."""
+        if not channel_uuid or not shot_uuid or getattr(self, "_hmb_node_deleted", False):
+            return
+        try:
+            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+            parameter = _get_parameter_obj(self, "PROMPT_OUT")
+            if parameter is None:
+                return
+            connections = GriptapeNodes.FlowManager().get_connections()
+            edges = connections.get_outgoing_connections_from_parameter(self, parameter)
+        except Exception:
+            return
+        notified = set()
+        for edge in edges:
+            if (getattr(edge, "source_node", None) is not self
+                    or getattr(edge, "source_parameter", None) is not parameter
+                    or getattr(getattr(edge, "target_parameter", None), "name", "") != "SHOT_PROMPT_IN"):
+                continue
+            target = getattr(edge, "target_node", None)
+            refresh = getattr(target, "_hmb_refresh_analysis_source_preview", None)
+            if id(target) in notified or not callable(refresh):
+                continue
+            notified.add(id(target))
+            try:
+                refresh(self, channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+            except Exception:
+                continue
 
     def _hmb_prompt_shot_view(self, *, channel_uuid: Any, shot_uuid: Any) -> Dict[str, Any]:
         """Read a prepared display only; no source IO, compile or graph work."""
@@ -11272,7 +11805,10 @@ class HMBPromptLibrary(DataNode):
                 self._hmb_prompt_view_warmup_pending = False
         return {}
 
-    def _hmb_prompt_shot_document(self, *, channel_uuid: Any, shot_uuid: Any) -> Dict[str, Any]:
+    def _hmb_prompt_shot_document(
+        self, *, channel_uuid: Any, shot_uuid: Any, _analysis_sources_only: bool = False,
+        _analysis_exclusions_only: bool = False, _analysis_upstream: bool = False,
+    ) -> Dict[str, Any]:
         """Read one exact execution document without changing the visible Shot.
 
         Stored JSON carries authored controls only. Every source/media/project
@@ -11299,15 +11835,6 @@ class HMBPromptLibrary(DataNode):
             state, images, videos, image_exact, _picker_exact = view._apply_exact_shot_routes(state)
             if not image_exact or _prompt_document_key(state.get("shot")) != _prompt_document_key(selected):
                 raise RuntimeError("Requested Prompt Shot has no exact ImageAsset publisher.")
-            view._current_state = lambda: copy.deepcopy(state)
-            view._hmb_current_shot_images = list(images)
-            view._hmb_current_shot_videos = list(videos)
-            visible, machine, fingerprint = self._compiled_prompt_pair_for_state(state)
-            generation = max(1, int(state.get(UI_EDIT_REVISION_KEY) or 0) + int(state.get(SOURCE_SYNC_REVISION_KEY) or 0) + 1)
-            context = _agent_shot_context(state, prompt_generation=generation, visible_prompt=visible, image_media=images, video_media=videos)
-            paired = {"schema": "hmb-prompt-paired-snapshot", "version": 1,
-                "generation": generation, "visible_sha256": hashlib.sha256(visible.encode("utf-8")).hexdigest(),
-                "machine_sha256": hashlib.sha256(machine.encode("utf-8")).hexdigest(), "machine_prompt": machine}
             asset = state.get("image_asset", {})
             from _hmb_project import resolve_project
             source_nodes = getattr(self, "_hmb_connected_source_nodes", {})
@@ -11317,6 +11844,22 @@ class HMBPromptLibrary(DataNode):
             projected_project = resolve_project(asset.get("project_id"), default_legacy=False)
             if projected_project["project_id"] != project["project_id"]:
                 raise RuntimeError("ImageAsset project changed during the Prompt snapshot.")
+            if _analysis_sources_only:
+                sound = getattr(view, "_hmb_current_sound_snapshot", {})
+                return {"analysis_sources": self._hmb_project_analysis_sources(
+                    state, images, videos, sound, include_unmarked=_analysis_upstream)}
+            if _analysis_exclusions_only:
+                return {"analysis_excluded_media": self._hmb_analysis_media_exclusions(
+                    state, images, videos, getattr(view, "_hmb_current_sound_snapshot", {}))}
+            view._current_state = lambda: copy.deepcopy(state)
+            view._hmb_current_shot_images = list(images)
+            view._hmb_current_shot_videos = list(videos)
+            visible, machine, fingerprint = self._compiled_prompt_pair_for_state(state)
+            generation = max(1, int(state.get(UI_EDIT_REVISION_KEY) or 0) + int(state.get(SOURCE_SYNC_REVISION_KEY) or 0) + 1)
+            context = _agent_shot_context(state, prompt_generation=generation, visible_prompt=visible, image_media=images, video_media=videos)
+            paired = {"schema": "hmb-prompt-paired-snapshot", "version": 1,
+                "generation": generation, "visible_sha256": hashlib.sha256(visible.encode("utf-8")).hexdigest(),
+                "machine_sha256": hashlib.sha256(machine.encode("utf-8")).hexdigest(), "machine_prompt": machine}
             subscription = {"schema": "hmb-shot-channel-subscription", "version": 1,
                 "participant_kind": "prompt", "enabled": True,
                 "channel_uuid": selected["channel_uuid"], "shot_uuid": selected["shot_uuid"],
@@ -11327,9 +11870,231 @@ class HMBPromptLibrary(DataNode):
                 "machine_prompt": machine, "paired_snapshot": paired, "generation": generation,
                 "fingerprint": fingerprint, "context": context, "shot_context": context,
                 "image_media": images, "video_media": videos,
+                "analysis_excluded_media": self._hmb_analysis_excluded_media(state, images, videos),
+                "audio_sources": copy.deepcopy(getattr(view, "_hmb_current_sound_snapshot", {})),
                 "reference_media": view._hmb_agent_reference_media(machine),
                 "generation_context": view._hmb_agent_generation_context(machine),
                 "project_identity": {key: project[key] for key in ("project_id", "project_name")}})
+
+    @staticmethod
+    def _hmb_analysis_visual_rows(state: Dict[str, Any], images: List[str], videos: List[str]):
+        shot = _normalize_shot_selection(state.get("shot"))
+        for kind, sources, uids, uid_field in (
+            ("image", images, shot["selected_source_uids"], "asset_source_uid"),
+            ("video", videos, state.get("picker", {}).get("ordered_video_uids", []), "video_uid"),
+        ):
+            rows = {_clean_string(row.get(uid_field) or row.get("source_uid")): row
+                    for row in state.get(kind + "s", []) if isinstance(row, dict)}
+            for slot, (uid, source) in enumerate(zip(uids, sources), 1):
+                row = rows.get(uid, {})
+                marked = _clean_string(row.get(kind + "_sub_type")) == _ANALYSIS_SUB_TYPE
+                yield kind, slot, uid, source, row, marked
+
+    @staticmethod
+    def _hmb_analysis_excluded_media(
+        state: Dict[str, Any], images: List[str], videos: List[str],
+    ) -> Dict[str, List[str]]:
+        """Identify Analysis-only originals by exact same-Shot source order."""
+        excluded = {"images": [], "videos": []}
+        ordinary = {"images": set(), "videos": set()}
+        for kind, _slot, _uid, source, _row, marked in HMBPromptLibrary._hmb_analysis_visual_rows(state, images, videos):
+            if not isinstance(source, str) or not source:
+                continue
+            key = kind + "s"
+            if marked:
+                excluded[key].append(source)
+            else:
+                ordinary[key].add(source)
+        if any(excluded.values()):
+            from _hmb_analysis_delivery import reference_identity
+
+            for key, sources in excluded.items():
+                if sources:
+                    ordinary_identities = {reference_identity(source) for source in ordinary[key]}
+                    excluded[key] = list(dict.fromkeys(
+                        source for source in sources if reference_identity(source) not in ordinary_identities
+                    ))
+        return excluded
+
+    @staticmethod
+    def _hmb_project_analysis_sources(
+        state: Dict[str, Any], images: List[str], videos: List[str], sound: Dict[str, Any],
+        *, include_unmarked: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Project exact publisher media without exposing the Prompt document."""
+        shot = _normalize_shot_selection(state.get("shot"))
+        picker = state.get("picker", {})
+        durations = {row.get("video_slot"): row.get("duration_seconds") for row in picker.get("frame_metadata", [])}
+        records: List[Dict[str, Any]] = []
+
+        def add(kind: str, selector: str, source: str, name: str, **timing: Any) -> None:
+            if not selector or not isinstance(source, str) or not source:
+                return
+            if re.match(r"^[a-z][a-z0-9+.-]*://", source, re.IGNORECASE):
+                try:
+                    uri = urlsplit(source)
+                    if uri.scheme != "file" or uri.query or uri.fragment:
+                        return
+                    host = f"//{uri.netloc}" if uri.netloc and uri.netloc.casefold() != "localhost" else ""
+                    source = url2pathname(host + uri.path)
+                except (OSError, ValueError):
+                    return
+            if source.startswith("data:") and not (kind == "image" and source.startswith("data:image/")):
+                return
+            media_digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+            identity = _canonical_sha256([kind, selector, media_digest, timing.get("start_seconds"), timing.get("end_seconds")])
+            records.append({"kind": kind, "selector": selector, "source_id": f"{kind}:{identity}",
+                "path": source, "name": _clean_string(name)[:MAX_IDENTIFIER_CHARS] or kind, **timing})
+
+        for kind, slot, uid, source, row, marked in HMBPromptLibrary._hmb_analysis_visual_rows(state, images, videos):
+            if marked or include_unmarked:
+                duration = durations.get(f"@video{slot}") if kind == "video" else None
+                timing = {"duration_seconds": duration} if isinstance(duration, (int, float)) and duration > 0 else {}
+                add(kind, uid, source, row.get("label") or f"@{kind}{slot}",
+                    shot_reference=f"@{kind}{slot}", **timing)
+        analysis_audio = {row["instance_id"] for row in state.get("sound_sources", [])
+                          if row.get("audio_sub_type") == "Analysis"}
+        for row in sound.get("tracks", []):
+            marked = row["instance_id"] in analysis_audio
+            if ((marked or include_unmarked) and row.get("channel_uuid") == shot["channel_uuid"]
+                    and row.get("shot_uuid") == shot["shot_uuid"]):
+                add("audio", row["instance_id"], row["path"], row.get("name") or "Audio",
+                    duration_seconds=row["duration_seconds"], start_seconds=row["in_seconds"],
+                    end_seconds=row["out_seconds"] if row["out_seconds"] is not None else row["duration_seconds"])
+        return records
+
+    @staticmethod
+    def _hmb_analysis_media_exclusions(state: Dict[str, Any], images: List[str], videos: List[str],
+                                       sound: Dict[str, Any]) -> Dict[str, List[str]]:
+        from _hmb_analysis_delivery import reference_identity
+
+        excluded = HMBPromptLibrary._hmb_analysis_excluded_media(state, images, videos)
+        shot = _normalize_shot_selection(state.get("shot"))
+        ordinary_audio = {reference_identity(row["path"]) for row in sound.get("tracks", [])
+            if row["channel_uuid"] == shot["channel_uuid"] and row["shot_uuid"] == shot["shot_uuid"]
+            and row.get("enabled") and row.get("purpose") in {"reference", "both"}}
+        excluded["audio"] = [row["path"] for row in HMBPromptLibrary._hmb_project_analysis_sources(state, [], [], sound)
+            if reference_identity(row["path"]) not in ordinary_audio]
+        return excluded
+
+    def _hmb_analysis_catalog(self) -> Dict[str, Any]:
+        """Expose this registered Prompt's verified remote Shot identities."""
+        if self._hmb_node_deleted or self._hmb_manual_rebind_pending():
+            return {}
+        shots = [row for row in self._hmb_prompt_shot_subscriptions() if row.get("enabled")]
+        if not shots:
+            return {}
+        return {"channel_uuid": shots[0]["channel_uuid"], "shots": [
+            {"shot_uuid": row["shot_uuid"], "number": row["shot_number"], "name": row["shot_name"]}
+            for row in shots]}
+
+    def _hmb_schedule_analysis_catalog_refresh(self) -> None:
+        try:
+            from HMBAnalysisAgent import schedule_analysis_refresh
+
+            schedule_analysis_refresh(self)
+        except Exception as exc:
+            _diagnostic_exception("Analysis Shot catalog refresh failed", exc)
+
+    @hmb_binding_mutation
+    def _hmb_apply_analysis_fields(
+        self, channel_uuid: str, shot_uuid: str, fields: Dict[str, Any],
+    ) -> bool:
+        """Commit upstream analysis to the verified Shot without changing the selected tab."""
+        if not channel_uuid or not shot_uuid or not isinstance(fields, dict):
+            return False
+        with self._hmb_sync_lock:
+            if self._hmb_node_deleted or self.lock or self._hmb_manual_rebind_pending():
+                return False
+            state = self._current_state()
+            selection = {"channel_uuid": channel_uuid, "shot_uuid": shot_uuid}
+            key = _prompt_document_key(selection)
+            if key == "__unbound__":
+                return False
+            active = key == _prompt_document_key(state.get("shot"))
+            if state.get("multi_shot_enabled"):
+                selection = next((row for row in _verified_prompt_shot_catalog(state)
+                    if _prompt_document_key(row) == key), None)
+                if selection is None:
+                    return False
+            elif not active or not self._hmb_shot_channel_subscription().get("enabled"):
+                return False
+
+            target = state if active else _select_prompt_shot_document(copy.deepcopy(state), selection)
+            if not _merge_analysis_generated_text(target, fields):
+                return True
+            revision = min(MAX_SOURCE_SYNC_REVISION, int(state.get(UI_EDIT_REVISION_KEY) or 0) + 1)
+            target[UI_EDIT_REVISION_KEY] = revision
+            _store_prompt_shot_document(target)
+            state[UI_EDIT_REVISION_KEY] = revision
+            if not active:
+                state["shot_documents"] = target["shot_documents"]
+            self.set_parameter_value(WIDGET_PARAMETER_NAME, _json_dumps(state))
+            publisher = getattr(self, "publish_update_to_parameter", None)
+            if callable(publisher):
+                try:
+                    publisher(WIDGET_PARAMETER_NAME, _get_parameter_raw(self, WIDGET_PARAMETER_NAME))
+                except Exception as error:
+                    _diagnostic_exception("Analysis field update publication failed", error)
+            return True
+
+    def _hmb_analysis_sources_for(self, *, channel_uuid: Any, shot_uuid: Any) -> List[Dict[str, Any]]:
+        rows = self._hmb_analysis_originals_for(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+        return [{key: value for key, value in row.items() if key != "path"} for row in rows]
+
+    def _hmb_analysis_originals_for(self, *, channel_uuid: Any, shot_uuid: Any) -> List[Dict[str, Any]]:
+        rows = self._hmb_prompt_shot_document(channel_uuid=channel_uuid, shot_uuid=shot_uuid,
+            _analysis_sources_only=True)["analysis_sources"]
+        return [{key: value for key, value in row.items() if key != "selector"} for row in rows]
+
+    def _hmb_analysis_preview_view(self, *, channel_uuid: str, shot_uuid: str) -> Dict[str, Any]:
+        """Read only the prepared exact-Shot display cache; never hydrate on a page switch."""
+        key = _prompt_document_key({"channel_uuid": channel_uuid, "shot_uuid": shot_uuid})
+        allowed = getattr(self, "_hmb_prompt_view_catalog_keys", None)
+        if (getattr(self, "_hmb_node_deleted", False) or self._hmb_manual_rebind_pending()
+                or (allowed is not None and key not in allowed)):
+            return {}
+        cache = getattr(self, "_hmb_prompt_shot_views", {}).get(key, {})
+        if any(getattr(source, "_hmb_node_deleted", False) for source in cache.get("_sources", ())):
+            return {}
+        return cache
+
+    def _hmb_analysis_preview_sources_for(self, *, channel_uuid: str, shot_uuid: str) -> List[Dict[str, Any]]:
+        view = self._hmb_analysis_preview_view(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+        return copy.deepcopy(view.get("_analysis_preview", []))
+
+    def _hmb_analysis_upstream_preview_sources_for(self, *, channel_uuid: str, shot_uuid: str) -> List[Dict[str, Any]]:
+        view = self._hmb_analysis_preview_view(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+        return copy.deepcopy(view.get("_analysis_upstream_preview", []))
+
+    def _hmb_analysis_upstream_sources_for(self, *, channel_uuid: str, shot_uuid: str) -> List[Dict[str, Any]]:
+        rows = self._hmb_prompt_shot_document(channel_uuid=channel_uuid, shot_uuid=shot_uuid,
+            _analysis_sources_only=True, _analysis_upstream=True)["analysis_sources"]
+        return [{key: value for key, value in row.items() if key not in {"path", "selector"}} for row in rows]
+
+    def _hmb_analysis_upstream_reference_for(
+        self, *, channel_uuid: str, shot_uuid: str, kind: str, source_id: str,
+    ) -> Dict[str, Any]:
+        rows = self._hmb_prompt_shot_document(channel_uuid=channel_uuid, shot_uuid=shot_uuid,
+            _analysis_sources_only=True, _analysis_upstream=True)["analysis_sources"]
+        return next(({key: value for key, value in row.items() if key != "selector"} for row in rows
+                     if row["kind"] == kind and row["source_id"] == source_id), {})
+
+    def _hmb_analysis_preview_exclusions_for(self, *, channel_uuid: str, shot_uuid: str) -> Dict[str, List[str]]:
+        view = self._hmb_analysis_preview_view(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+        return copy.deepcopy(view.get("_analysis_exclusions", {}))
+
+    def _hmb_analysis_excluded_media_for(self, *, channel_uuid: Any, shot_uuid: Any) -> Dict[str, List[str]]:
+        return self._hmb_prompt_shot_document(channel_uuid=channel_uuid, shot_uuid=shot_uuid,
+            _analysis_exclusions_only=True)["analysis_excluded_media"]
+
+    def _hmb_analysis_reference_for(
+        self, *, channel_uuid: Any, shot_uuid: Any, kind: str, source_id: str,
+    ) -> Dict[str, Any]:
+        rows = self._hmb_prompt_shot_document(channel_uuid=channel_uuid, shot_uuid=shot_uuid,
+            _analysis_sources_only=True)["analysis_sources"]
+        return next(({key: value for key, value in row.items() if key != "selector"} for row in rows
+                     if row["kind"] == kind and row["source_id"] == source_id), {})
 
     def _hmb_available_prompt_shot_catalog(
         self,
@@ -11626,6 +12391,7 @@ class HMBPromptLibrary(DataNode):
             # caches before PROMPT_OUT as one paired Prompt generation. Empty
             # video ownership remains the valid [] no-video contract.
             self._sync_prompt_output_from_state(publish_shot_media=True)
+            self._hmb_schedule_analysis_catalog_refresh()
             return self._hmb_shot_channel_subscription()
 
     @hmb_binding_mutation
@@ -11797,6 +12563,7 @@ class HMBPromptLibrary(DataNode):
                             source_burst=True,
                             publish_shot_media=True,
                         )
+                    self._hmb_schedule_analysis_catalog_refresh()
                 return self._hmb_shot_channel_subscription()
             if image_source_node is None and picker_source_node is None:
                 self._reconcile_connected_source_inputs_from_graph()
@@ -11813,6 +12580,7 @@ class HMBPromptLibrary(DataNode):
             if _image_exact or _picker_exact:
                 self._consume_routing_hydration_rebase()
             self._sync_prompt_output_from_state(publish_shot_media=True)
+            self._hmb_schedule_analysis_catalog_refresh()
             return self._hmb_shot_channel_subscription()
 
     def _hmb_shot_routing_status(self, value: Any) -> None:
@@ -11872,6 +12640,8 @@ class HMBPromptLibrary(DataNode):
 
         parent_setter = getattr(super(), "set_parameter_value")
         is_widget_write = param_name == WIDGET_PARAMETER_NAME
+        if is_widget_write and _is_retired_analysis_pick(value):
+            return
         if (is_widget_write and not initial_setup and not getattr(self, "_hmb_ui_syncing", False)
                 and not getattr(self, "_hmb_compact_route_syncing", False)
                 and self._hmb_apply_manual_rebind(value)):
@@ -11965,6 +12735,7 @@ class HMBPromptLibrary(DataNode):
                 IMAGE_ASSET_INPUT_PARAMETER_NAME,
                 SHOT_ASSET_INPUT_PARAMETER_NAME,
                 SHOT_PICKER_INPUT_PARAMETER_NAME,
+                SOUND_INPUT_PARAMETER_NAME,
             }
             or getattr(self, "_hmb_hydration_reconciling", False)
             or not hasattr(self, "_hmb_sync_lock")
@@ -12003,7 +12774,9 @@ class HMBPromptLibrary(DataNode):
                 self._sync_prompt_output_now(
                     allow_picker_hydration_pending=True
                 )
-                committed = True
+                committed = not bool(
+                    getattr(self, "_hmb_picker_route_hydration_pending", False)
+                )
         except Exception as exc:
             if (isinstance(exc, ValueError) and (
                 getattr(exc, "hmb_image_asset_selection_preparing", False) is True
@@ -12247,8 +13020,10 @@ class HMBPromptLibrary(DataNode):
             picker_route_hydration_pending = bool(
                 getattr(self, "_hmb_picker_route_hydration_pending", False)
             )
-            self._hmb_current_shot_images = list(shot_images)
-            self._hmb_current_shot_videos = list(shot_videos)
+            self._hmb_prompt_pair_waiting_for_picker = picker_route_hydration_pending
+            if not picker_route_hydration_pending:
+                self._hmb_current_shot_images = list(shot_images)
+                self._hmb_current_shot_videos = list(shot_videos)
             image_asset_payload = _parse_image_asset_payload(
                 _get_parameter_raw(self, IMAGE_ASSET_INPUT_PARAMETER_NAME)
             )
@@ -12302,6 +13077,9 @@ class HMBPromptLibrary(DataNode):
             image_fingerprint_connected = image_exact or image_asset_connected
             picker_fingerprint_connected = picker_exact or picker_connected
             source_input_fingerprints = {
+                SOUND_INPUT_PARAMETER_NAME: _connected_source_fingerprint(
+                    getattr(self, "_hmb_connected_sound_snapshot", {}) if state.get("sound_connection") else {},
+                    bool(state.get("sound_connection", {}).get("enabled"))),
                 IMAGE_ASSET_INPUT_PARAMETER_NAME: (
                     previous_source_fingerprints.get(
                         IMAGE_ASSET_INPUT_PARAMETER_NAME,
@@ -12326,10 +13104,12 @@ class HMBPromptLibrary(DataNode):
                 ),
             }
             source_payloads = {
+                SOUND_INPUT_PARAMETER_NAME: getattr(self, "_hmb_connected_sound_snapshot", {}) if state.get("sound_connection") else {},
                 IMAGE_ASSET_INPUT_PARAMETER_NAME: image_fingerprint_payload,
                 PICKER_INPUT_PARAMETER_NAME: picker_fingerprint_payload,
             }
             source_connections = {
+                SOUND_INPUT_PARAMETER_NAME: bool(state.get("sound_connection", {}).get("enabled")),
                 IMAGE_ASSET_INPUT_PARAMETER_NAME: image_fingerprint_connected,
                 PICKER_INPUT_PARAMETER_NAME: picker_fingerprint_connected,
             }
@@ -12379,6 +13159,18 @@ class HMBPromptLibrary(DataNode):
             # backend-only fields/revisions. Switches and explicit UI writes
             # retain document snapshots; execution reads capture the current
             # visible body before reading another UUID.
+            route_content = getattr(self, "_hmb_validated_route_content", {})
+            if (route_content
+                    and route_content == getattr(self, "_hmb_dashboard_route_content", None)
+                    and _dashboard_without_route_clocks(state)
+                        == _dashboard_without_route_clocks(current_state)):
+                # Preparing five exact Shot views advances the publishers'
+                # private view clocks. Those reads must not dirty/remount this
+                # dashboard and recursively schedule another five-view refresh.
+                # Keep the last published UI proof only after current snapshots
+                # passed every identity, hash, media and monotonicity check.
+                state = current_state
+            self._hmb_dashboard_route_content = dict(route_content)
             serialized_state = _json_dumps(state)
             source_application_changed_state = (
                 serialized_state != state_before_source_sync
@@ -12422,10 +13214,16 @@ class HMBPromptLibrary(DataNode):
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return {}
         if allow_picker_hydration_pending:
-            state, prompt, machine_prompt, fingerprint = (
-                self._compile_current_prompt_pair(
-                    allow_picker_hydration_pending=True
-                )
+            self._reconcile_shared_shot_edges()
+            state = self._write_dashboard_state(allow_picker_hydration_pending=True)
+            if getattr(self, "_hmb_picker_route_hydration_pending", False):
+                # The dashboard can show verified images while Picker restores
+                # its exact catalog. Keep the last atomic output generation
+                # until the next source notification can verify both halves.
+                self._hmb_sync_publish_shot_media_pending |= publish_shot_media
+                return state
+            prompt, machine_prompt, fingerprint = self._compiled_prompt_pair_for_state(
+                state
             )
         else:
             state, prompt, machine_prompt, fingerprint = (
@@ -12433,8 +13231,10 @@ class HMBPromptLibrary(DataNode):
             )
         # Finish preparing display pages before content publication can wake an
         # Agent. Page-only writes never enter this synchronization method.
-        self._hmb_remember_prompt_shot_view(state, prompt)
+        active_view_changed = self._hmb_remember_prompt_shot_view(state, prompt)
         changed_prompt_views = self._hmb_prepare_prompt_shot_views()
+        if active_view_changed:
+            changed_prompt_views.add(_prompt_document_key(state.get("shot")))
         output_values = getattr(self, "parameter_output_values", {})
         output_getter = getattr(output_values, "get", None)
         current_output = output_getter("PROMPT_OUT") if callable(output_getter) else None
@@ -12461,6 +13261,10 @@ class HMBPromptLibrary(DataNode):
             changed_shot_outputs.append(
                 (SHOT_VIDEO_OUTPUT_PARAMETER_NAME, list(shot_videos))
             )
+        if changed_prompt_views or changed_shot_outputs:
+            # Direct source changes and authored subtype edits need the same
+            # Analysis refresh as compact topology changes.
+            self._hmb_schedule_analysis_catalog_refresh()
         if (
             fingerprint
             == getattr(self, "_hmb_last_prompt_semantic_fingerprint", "")
@@ -12529,7 +13333,6 @@ class HMBPromptLibrary(DataNode):
         self,
         *,
         refresh_sources: bool = True,
-        allow_picker_hydration_pending: bool = False,
     ) -> tuple[Dict[str, Any], str, str, str]:
         """Compile both Prompt representations from one current-state snapshot.
 
@@ -12543,14 +13346,13 @@ class HMBPromptLibrary(DataNode):
 
         if refresh_sources:
             self._reconcile_shared_shot_edges()
-            if allow_picker_hydration_pending:
-                state = self._write_dashboard_state(
-                    allow_picker_hydration_pending=True
-                )
-            else:
-                state = self._write_dashboard_state()
+            state = self._write_dashboard_state()
         else:
-            state = _normalize_state(self._current_state())
+            if getattr(self, "_hmb_prompt_pair_waiting_for_picker", False):
+                raise _ShotRoutingContractError(
+                    "VideoPicker is restoring the current Shot. Wait for the media connection."
+                )
+            state = self._apply_sound_source(_normalize_state(self._current_state()))
         prompt, machine_prompt, fingerprint = self._compiled_prompt_pair_for_state(state)
         return state, prompt, machine_prompt, fingerprint
 
@@ -12807,11 +13609,15 @@ class HMBPromptLibrary(DataNode):
                     "images": [],
                     "videos": [],
                 }
+                analysis_only_slots = {
+                    (kind, slot) for kind, slot, _uid, _source, _row, marked in
+                    self._hmb_analysis_visual_rows(state, image_media, video_media) if marked
+                }
                 for kind, sources in (("image", image_media), ("video", video_media)):
                     for record in job.get(kind + "s", []):
                         token = str(record.get(kind) or "")
                         match = re.fullmatch(r"@" + kind + r"([1-9][0-9]*)", token)
-                        if not match:
+                        if not match or (kind, int(match.group(1))) in analysis_only_slots:
                             continue
                         slot = int(match.group(1)) - 1
                         if slot >= len(sources) or not isinstance(sources[slot], str) or not sources[slot]:
@@ -13074,7 +13880,7 @@ class HMBPromptLibrary(DataNode):
             "authored": _prompt_authoring_sync_fingerprint(state),
             "inputs": {name: _connected_source_fingerprint({"value": _get_parameter_raw(self, name)}, True)
                 for name in (SHOT_ASSET_INPUT_PARAMETER_NAME, SHOT_PICKER_INPUT_PARAMETER_NAME,
-                    IMAGE_ASSET_INPUT_PARAMETER_NAME, PICKER_INPUT_PARAMETER_NAME)},
+                    IMAGE_ASSET_INPUT_PARAMETER_NAME, PICKER_INPUT_PARAMETER_NAME, SOUND_INPUT_PARAMETER_NAME)},
         })
 
     def _schedule_prompt_sync(
@@ -13140,12 +13946,10 @@ class HMBPromptLibrary(DataNode):
                         self._hmb_sync_publish_shot_media_pending
                     )
                     self._hmb_sync_publish_shot_media_pending = False
-                    if publish_media:
-                        self._sync_prompt_output_from_state(
-                            publish_shot_media=True,
-                        )
-                    else:
-                        self._sync_prompt_output_from_state()
+                    self._sync_prompt_output_from_state(
+                        publish_shot_media=publish_media,
+                        allow_picker_hydration_pending=True,
+                    )
                     self._hmb_prompt_sync_failure = None
             except Exception as exc:
                 if (
@@ -13205,6 +14009,9 @@ class HMBPromptLibrary(DataNode):
 
     @hmb_binding_mutation
     def after_value_set(self, parameter: Any, value: Any) -> Any:
+        if getattr(parameter, "name", "") == WIDGET_PARAMETER_NAME and _is_retired_analysis_pick(value):
+            self._restore_accepted_widget_state()
+            return None
         _begin_prompt_output_side_effect_callback(self)
         try:
             result = None
@@ -13254,6 +14061,7 @@ class HMBPromptLibrary(DataNode):
                 if name == IMAGE_ASSET_INPUT_PARAMETER_NAME and _clean_string(value):
                     self._hmb_image_asset_connected = True
                 if name in {
+                    SOUND_INPUT_PARAMETER_NAME,
                     WIDGET_PARAMETER_NAME,
                     PICKER_INPUT_PARAMETER_NAME,
                     IMAGE_ASSET_INPUT_PARAMETER_NAME,
@@ -13264,11 +14072,18 @@ class HMBPromptLibrary(DataNode):
                 ) and not (name == WIDGET_PARAMETER_NAME and ui_only_widget_write):
                     self._schedule_prompt_sync(
                         source_burst=name in {
+                            SOUND_INPUT_PARAMETER_NAME,
                             PICKER_INPUT_PARAMETER_NAME,
                             IMAGE_ASSET_INPUT_PARAMETER_NAME,
                             SHOT_ASSET_INPUT_PARAMETER_NAME,
                             SHOT_PICKER_INPUT_PARAMETER_NAME,
-                        }
+                        },
+                        publish_shot_media=name in {
+                            IMAGE_ASSET_INPUT_PARAMETER_NAME,
+                            SHOT_ASSET_INPUT_PARAMETER_NAME,
+                            PICKER_INPUT_PARAMETER_NAME,
+                            SHOT_PICKER_INPUT_PARAMETER_NAME,
+                        },
                     )
             except Exception as exc:
                 _diagnostic_exception("after_value_set scheduling failed", exc)
@@ -13288,13 +14103,23 @@ class HMBPromptLibrary(DataNode):
         try:
             target_name = getattr(target_parameter, "name", "")
             if target_name in {
+                SOUND_INPUT_PARAMETER_NAME,
                 PICKER_INPUT_PARAMETER_NAME,
                 IMAGE_ASSET_INPUT_PARAMETER_NAME,
                 SHOT_ASSET_INPUT_PARAMETER_NAME,
                 SHOT_PICKER_INPUT_PARAMETER_NAME,
             }:
+                # A just-removed wire already queued an immediate refresh. Let
+                # that callback see the replacement input instead of compiling
+                # the whole Prompt while the host is still creating the wire.
+                coalesce_refresh = (
+                    self._hmb_sync_queued_token is not None
+                    and not self._hmb_sync_queued_source_burst
+                )
                 if target_name == PICKER_INPUT_PARAMETER_NAME:
                     self._hmb_picker_connected = True
+                elif target_name == SOUND_INPUT_PARAMETER_NAME:
+                    self._hmb_sound_connected = True
                 elif target_name in {
                     IMAGE_ASSET_INPUT_PARAMETER_NAME,
                     SHOT_ASSET_INPUT_PARAMETER_NAME,
@@ -13321,7 +14146,11 @@ class HMBPromptLibrary(DataNode):
                 pending_media_publication = bool(
                     getattr(self, "_hmb_sync_publish_shot_media_pending", False)
                 )
-                self._sync_prompt_output_now()
+                if coalesce_refresh:
+                    self._hmb_prompt_sync_failure = None
+                    self._schedule_prompt_sync()
+                else:
+                    self._sync_prompt_output_now()
         except Exception as exc:
             if (isinstance(exc, ValueError) and (
                 getattr(exc, "hmb_image_asset_selection_preparing", False) is True
@@ -13353,6 +14182,7 @@ class HMBPromptLibrary(DataNode):
         try:
             target_name = getattr(target_parameter, "name", "")
             if target_name in {
+                SOUND_INPUT_PARAMETER_NAME,
                 PICKER_INPUT_PARAMETER_NAME,
                 IMAGE_ASSET_INPUT_PARAMETER_NAME,
                 SHOT_ASSET_INPUT_PARAMETER_NAME,
@@ -13366,6 +14196,8 @@ class HMBPromptLibrary(DataNode):
                     return None
                 if target_name == PICKER_INPUT_PARAMETER_NAME:
                     self._hmb_picker_connected = False
+                elif target_name == SOUND_INPUT_PARAMETER_NAME:
+                    self._hmb_sound_connected = False
                 elif target_name in {
                     IMAGE_ASSET_INPUT_PARAMETER_NAME,
                     SHOT_ASSET_INPUT_PARAMETER_NAME,
@@ -13376,11 +14208,11 @@ class HMBPromptLibrary(DataNode):
                     _set_parameter_value(
                         self,
                         target_name,
-                        {} if target_name == SHOT_PICKER_INPUT_PARAMETER_NAME else "",
+                        {} if target_name in {SHOT_PICKER_INPUT_PARAMETER_NAME, SOUND_INPUT_PARAMETER_NAME} else "",
                     )
                 except Exception as exc:
                     _diagnostic_exception("Source input clear failed", exc)
-                self._sync_prompt_output_now()
+                self._schedule_prompt_sync()
         except Exception as exc:
             _diagnostic_exception("Picker disconnect synchronization failed", exc)
         try:
@@ -13432,6 +14264,7 @@ class HMBPromptLibrary(DataNode):
             # creating a host freeze. Flag/generation invalidation is immediate;
             # every deferred commit re-checks ownership before publication.
             invalidate()
+            self._hmb_schedule_analysis_catalog_refresh()
         if first_delete and not bool(
             getattr(self, "_hmb_deletion_reconcile_called", False)
         ):

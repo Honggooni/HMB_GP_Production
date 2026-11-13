@@ -116,6 +116,11 @@ async def restore_generated(engine, modules, saved, expected, *, legacy_cursor=F
             return json.dumps(state, ensure_ascii=False)
         namespace = dict(__name__='offline_generated_restore', __file__=str(saved), legacy_source_value=legacy_source_value)
         exec(compile(ast.fix_missing_locations(tree), str(saved), 'exec'), namespace)
+        # Current SDK generated builders run inside the workflow opened by
+        # native loading. Reproduce that boundary, not a context-free exec.
+        if callable(getattr(engine, 'bind_workflow', None)):
+            workflow = engine.context_manager.open_workflow(file_path=str(saved))
+            guard.enter_context(engine.bind_workflow(workflow))
         with LoadProblemFrame(): await namespace['build_workflow']()
         migration.schedule_loaded_flow_migrations(engine)
         flow = engine.flow_manager.get_flow_by_name('OfflineGeneratedRestore')

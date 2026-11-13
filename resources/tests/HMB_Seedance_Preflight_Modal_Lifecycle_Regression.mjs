@@ -28,6 +28,9 @@ try{
  },source);
  const inside=()=>page.evaluate(()=>Boolean(document.activeElement?.closest('.hmb-preflight-dialog')));
  await page.locator('#one [data-preflight-open]').click();
+ await page.waitForFunction(()=>calls.length===1);
+ assert.equal(await page.locator('[data-preflight-row]').count(),0);
+ await page.evaluate(()=>one.update({...props,value:{...value,request_id:calls[0].request_id}}));
  assert.equal(await inside(),true);
  await page.keyboard.press('Shift+Tab');assert.equal(await page.locator('[data-preflight-close]').evaluate(el=>el===document.activeElement),true);
  await page.keyboard.press('Tab');assert.equal(await page.locator('[data-preflight-recheck]').evaluate(el=>el===document.activeElement),true);
@@ -44,7 +47,7 @@ try{
  assert.equal(await page.locator('.hmb-preflight-dialog').count(),1);assert.equal(await page.locator('#hmb-preflight-title').count(),1);
  await page.keyboard.press('Escape');assert.equal(await page.locator('#two [data-preflight-open]').evaluate(el=>el===document.activeElement),true);
  receipt.cases.push('Another Generator retires the previous modal; one accessible title and correct return owner');
- await page.evaluate(()=>{one.cleanup();window.one=widget.default(document.getElementById('one'),{...props,value:{...value,phase:'idle',rows:[]}});});
+ await page.evaluate(()=>{one.cleanup();calls.length=0;deliveries.length=0;window.one=widget.default(document.getElementById('one'),{...props,value:{...value,phase:'idle',rows:[]}});});
  await page.locator('#one [data-preflight-open]').click();await page.waitForFunction(()=>calls.length===1);
  await page.locator('[data-preflight-close]').focus();
  await page.evaluate(()=>one.update({...props,value:{...value,request_id:calls[0].request_id}}));
@@ -65,7 +68,8 @@ try{
  for(let i=0;i<30;i++){await page.evaluate(()=>document.querySelector('#two [data-preflight-open]').click());await page.keyboard.press('Escape');}
  assert.equal(await page.evaluate(()=>focusListeners.size),0);
  await page.evaluate(()=>{two.cleanup();window.two=widget.default(document.getElementById('two'),{...props,disabled:true,value:{...value,phase:'idle',rows:[]}});});
- await page.locator('#two [data-preflight-open]').click();await page.waitForFunction(()=>calls.length===4);
+ const beforeDisabled=await page.evaluate(()=>calls.length);
+ await page.locator('#two [data-preflight-open]').click();await page.waitForFunction(expected=>calls.length===expected,beforeDisabled+1);
  await page.keyboard.press('Escape');assert.equal(await page.locator('.hmb-preflight-backdrop').count(),0);
  receipt.cases.push('Thirty open/close cycles leave no focus listener; native disabled node permits read-only inspection and dismissal');
  const before=await page.evaluate(()=>calls.length);

@@ -229,9 +229,9 @@ if ($records.Count -ne [int]$manifest.file_count) {
     throw 'HMB release manifest file_count does not match its file list.'
 }
 if (
-    [int]$manifest.install_file_count -ne 60 -or
-    [int]$manifest.distribution_file_count -ne 8 -or
-    $records.Count -ne 68
+    [int]$manifest.install_file_count -ne 69 -or
+    [int]$manifest.distribution_file_count -ne 22 -or
+    $records.Count -ne 91
 ) {
     throw 'HMB release manifest install/distribution boundary mismatch.'
 }
@@ -272,6 +272,11 @@ $distributionOnlyMembers = @(
         Where-Object { $_.install -eq $false } |
         ForEach-Object { ([string]$_.path).Replace('/', '\') }
 )
+$editorSupportRecords = @($records | Where-Object {
+    $_.install -eq $false -and ([string]$_.path -like 'resources/editor/*' -or [string]$_.path -like 'tools/*')
+})
+$retainedRecords = @($installRecords) + @($editorSupportRecords)
+$retainedMembers = @($retainedRecords | ForEach-Object { ([string]$_.path).Replace('/', '\') })
 $expectedDistributionOnlyMembers = @(
     'Install_HMB_GP_Production.ps1',
     'LICENSE',
@@ -280,7 +285,21 @@ $expectedDistributionOnlyMembers = @(
     'tools\hmb_color_lut_native_header_patch.py',
     'tools\hmb_native_semantic_adapter.py',
     'resources\editor\hmb-color-lut-native-header.js',
-    'resources\editor\native-editor-patch.json'
+    'resources\editor\hmb-shot-basket.js',
+    'resources\editor\hmb-rodong-mart-launcher.webp',
+    'resources\editor\hmb-rodong-mart-launcher-extra.webp',
+    'resources\editor\hmb-rodong-mart-header.webp',
+    'resources\editor\native-editor-patch.json',
+    'tools\hmb_editor_0130_header.py',
+    'tools\restore_rodong_local_editor.py',
+    'tools\hmb_rodong_editor_0130.py',
+    'tools\hmb_editor_0130_override.py',
+    'resources\editor\hmb-header-0130.js',
+    'resources\editor\hmb-rodong-editor-0130.js',
+    'resources\editor\hmb-continue-work-art.js',
+    'resources\editor\hmb-continue-work-01-10.webp',
+    'resources\editor\hmb-continue-work-11-20.webp',
+    'resources\editor\hmb-continue-work-21-30.webp'
 )
 if (
     $installRecords.Count -ne [int]$manifest.install_file_count -or
@@ -389,7 +408,7 @@ try {
         $backupMoved = $true
     }
     New-Item -ItemType Directory -Path $target -Force | Out-Null
-    foreach ($relative in $installMembers) {
+    foreach ($relative in $retainedMembers) {
         $sourceFile = Join-Path $source $relative
         $destination = Join-Path $target $relative
         New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force |
@@ -397,7 +416,7 @@ try {
         Copy-Item -LiteralPath $sourceFile -Destination $destination -Force
     }
 
-    foreach ($record in $installRecords) {
+    foreach ($record in $retainedRecords) {
         $relative = ([string]$record.path).Replace('/', '\')
         $installed = Join-Path $target $relative
         $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $installed).Hash
@@ -407,7 +426,7 @@ try {
     }
 
     $resourceMembers = @(
-        $installRecords |
+        $retainedRecords |
             ForEach-Object { ([string]$_.path).Replace('/', '\') } |
             Where-Object { $_ -like 'resources\*' }
     )
@@ -424,7 +443,7 @@ try {
         Get-ChildItem -LiteralPath $target -Force -Recurse -File |
             ForEach-Object { Get-HmbRelativePath -Root $target -Path $_.FullName }
     )
-    if (@(Compare-Object @($installMembers) $installedRuntimeFiles).Count -ne 0) {
+    if (@(Compare-Object $retainedMembers $installedRuntimeFiles).Count -ne 0) {
         throw 'Installed HMB files do not match the exact runtime release closure.'
     }
 
@@ -461,6 +480,9 @@ try {
         policy_identity = $manifest.policy_identity
         verification = 'file_hashes_and_inventory_matched_unsigned_local_record'
         runtime_files = @($installRecords | ForEach-Object {
+            [ordered]@{ path = [string]$_.path; bytes = [long]$_.bytes; sha256 = [string]$_.sha256 }
+        })
+        editor_support_files = @($editorSupportRecords | ForEach-Object {
             [ordered]@{ path = [string]$_.path; bytes = [long]$_.bytes; sha256 = [string]$_.sha256 }
         })
         preserved_user_members = @($relocatedUserMembers)

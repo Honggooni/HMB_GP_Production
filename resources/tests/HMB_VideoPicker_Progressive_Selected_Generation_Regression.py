@@ -36,7 +36,8 @@ spec.loader.exec_module(picker)
 try:
     from griptape_nodes.retained_mode.engine import current_engine
     from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes as SDK
-    from griptape_nodes.exe_types.flow import ControlFlow
+    from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
+    from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest
 except ImportError:
     SDK = None
 else:
@@ -67,11 +68,16 @@ class Scenario:
         self.run_index = 0
         self.node = picker.HMBVideoPickerLibrary(name="Progressive_" + case)
         if SDK is not None:
-            flow = ControlFlow(name="ProgressiveFlow_" + case, engine=current_engine())
+            engine = current_engine()
+            ensured = engine.handle_request(EnsureWorkflowAndFlowRequest(flow_name="ProgressiveOwner_" + case))
+            assert ensured.succeeded(), ensured.result_details
+            workflow = engine.open_workflows.get(ensured.workflow_id)
+            created = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="ProgressiveFlow_" + case))
+            assert created.succeeded(), created.result_details
+            flow = engine.flow_manager.get_flow_by_name_in(workflow, created.flow_name)
             flow.add_node(self.node)
-            SDK.ObjectManager().add_object_by_name(flow.name, flow)
-            SDK.ObjectManager().add_object_by_name(self.node.name, self.node)
-            SDK.NodeManager()._name_to_parent_flow_name[self.node.name] = flow.name
+            engine.object_manager.add_object_by_name_in(workflow, self.node.name, self.node)
+            workflow.nodes.name_to_parent_flow_name[self.node.name] = flow.name
         self.node._prepare_run_state = lambda *_a, **_k: None
         state = self.node._picker_state()
         first = copy.deepcopy(state["picker_shots"][0])

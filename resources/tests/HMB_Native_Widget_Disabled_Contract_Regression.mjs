@@ -1,6 +1,7 @@
 /** Actual widgets + bounded native disabled adapter in isolated Chrome. */
 import assert from 'node:assert/strict';import fs from 'node:fs';import path from 'node:path';import os from 'node:os';import crypto from 'node:crypto';
 import{createRequire}from'node:module';import{fileURLToPath}from'node:url';
+import { execFileSync } from 'node:child_process';
 const root=fileURLToPath(new URL('../..',import.meta.url)),require=createRequire(import.meta.url);
 const files=['HMBSeedanceGenerationWidget.js','HMBAgentLibraryWidget.js','HMBPromptLibraryScopedBindingWidget.js','HMBFinishLookLibraryWidget.js','HMBColorLUTLibraryWidget.js','HMBImageAssetLibraryWidget.js','HMBVideoPickerLibraryWidget_v032.js','HMBVideoPickerCommandBridgeWidget_v032.js','HMBImageAssetThumbnailPatchBridgeWidget.js'];
 const hash=v=>crypto.createHash('sha256').update(v).digest('hex');const sources=files.map(f=>fs.readFileSync(path.join(root,'widgets',f),'utf8'));
@@ -89,21 +90,24 @@ try{
   ].every(([kind,v])=>!modules[0].hmbNativeUiReadCommand(v,kind))};
  });assert.deepEqual(exceptions,{allowed:true,rejected:true});report.cases.push('exact_schema_command_cancel_retrieve_read_exceptions_reject_run_edit_wrong_owner');
  // The adapter never writes native video attributes or blocks its controls.
- const media=await page.evaluate(async()=>{
+ const sample=execFileSync(process.env.HMB_COLOR_LUT_TEST_FFMPEG||'ffmpeg',
+  ['-v','error','-f','lavfi','-i','testsrc2=size=32x24:rate=24','-t','0.6','-c:v','libvpx','-f','webm','pipe:1']).toString('base64');
+ const media=await page.evaluate(async sample=>{
   const container=document.createElement('div'),video=document.createElement('video');video.controls=true;container.append(video);document.body.append(container);
   video.muted=true;
-  const canvas=document.createElement('canvas');canvas.width=32;canvas.height=24;const drawing=canvas.getContext('2d');drawing.fillStyle='#10b981';drawing.fillRect(0,0,32,24);
-  const stream=canvas.captureStream(24),recorder=new MediaRecorder(stream,{mimeType:'video/webm;codecs=vp8'}),chunks=[];
-  recorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data);};const stopped=new Promise(resolve=>recorder.addEventListener('stop',resolve,{once:true}));
-  let frame=0;const painting=setInterval(()=>{drawing.fillStyle=++frame%2?'#10b981':'#3b82f6';drawing.fillRect(0,0,32,24);},30);
-  recorder.start();await new Promise(resolve=>setTimeout(resolve,360));recorder.stop();await stopped;clearInterval(painting);stream.getTracks().forEach(t=>t.stop());
-  const url=URL.createObjectURL(new Blob(chunks,{type:'video/webm'}));video.src=url;
-  await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Memory video decode timeout')),3000);video.addEventListener('canplay',()=>{clearTimeout(timer);resolve();},{once:true});});
+  const url=URL.createObjectURL(new Blob([Uint8Array.from(atob(sample),character=>character.charCodeAt(0))],{type:'video/webm'}));
+  const ready=new Promise((resolve,reject)=>{
+   const timer=setTimeout(()=>reject(Error('Fixture video decode timeout')),5000);
+   video.addEventListener('canplay',()=>{clearTimeout(timer);resolve();},{once:true});
+   video.addEventListener('error',()=>{clearTimeout(timer);reject(Error(video.error?.message||'Fixture video decode failed'));},{once:true});
+  });
+  video.src=url;await ready;
   let p;const h=modules[0].hmbNativeUiContract(container,{disabled:true,onChange(){}},(_c,next)=>{p=next;return{update(v){p=v;},cleanup(){}};},{kind:'fixture'});
   const event=new MouseEvent('click',{bubbles:true,cancelable:true});video.dispatchEvent(event);
-  await video.play();await new Promise(resolve=>setTimeout(resolve,80));const advanced=video.currentTime>0;video.pause();video.currentTime=0;
+  await video.play();await new Promise(resolve=>video.addEventListener('timeupdate',resolve,{once:true}));
+  const advanced=video.currentTime>0;video.pause();video.currentTime=0;
   const result={controls:video.controls,sameSrc:video.getAttribute('src')===url,clickUnblocked:!event.defaultPrevented,sameVideo:container.firstChild===video,advanced};h.cleanup();container.remove();URL.revokeObjectURL(url);return result;
- });assert.deepEqual(media,{controls:true,sameSrc:true,clickUnblocked:true,sameVideo:true,advanced:true});report.cases.push('native_video_original_element_src_controls_and_actual_local_playback_retained_while_authoring_locked');
+ },sample);assert.deepEqual(media,{controls:true,sameSrc:true,clickUnblocked:true,sameVideo:true,advanced:true});report.cases.push('native_video_original_element_src_controls_and_actual_local_playback_retained_while_authoring_locked');
  await page.evaluate(()=>{
   const node=document.createElement('div');node.className='react-flow__node';node.innerHTML='<div data-parameter-name="model_id"></div><div data-parameter-name="broker_server_url"><div data-broker></div></div>';document.querySelector('main').append(node);
   window.broker={node,calls:[],container:node.querySelector('[data-broker]')};broker.props=disabled=>({value:'https://broker.invalid',disabled,onChange:v=>broker.calls.push(v)});

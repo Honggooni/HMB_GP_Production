@@ -89,7 +89,7 @@ async def exercise(engine):
     event_lock = threading.Lock()
     release = threading.Event()
     entered = threading.Event()
-    native_mode = {"block": None, "fail": None}
+    native_mode = {"block": None, "fail": None, "parallel_probe": None}
     policy_observations = []
     executions = []
     model_owners = []
@@ -106,8 +106,13 @@ async def exercise(engine):
         node.metadata["library"] = schema.name
         node.metadata["node_type"] = type(node).__name__
         flow.add_node(node)
-        engine.object_manager.add_object_by_name(node.name, node)
-        engine.node_manager._name_to_parent_flow_name[node.name] = flow.name
+        if callable(getattr(engine.object_manager, "add_object_by_name_in", None)):
+            workflow = engine.current_workflow()
+            engine.object_manager.add_object_by_name_in(workflow, node.name, node)
+            workflow.nodes.name_to_parent_flow_name[node.name] = flow.name
+        else:
+            engine.object_manager.add_object_by_name(node.name, node)
+            engine.node_manager._name_to_parent_flow_name[node.name] = flow.name
 
     native_context = threading.local()
     native_states = []
@@ -146,6 +151,14 @@ async def exercise(engine):
                 "identity": deepcopy(self._hmb_policy_identity),
                 "rule_hashes": [[hashlib.sha256(value.encode("utf-8")).hexdigest() for value in row["rules"]] for row in private]})
         record("model_started", number)
+        if native_mode["parallel_probe"] is not None:
+            # A 30 ms sleep measured host preparation speed, not concurrency.
+            # Hold the first call until a second provider call really starts.
+            probe = native_mode["parallel_probe"]
+            with event_lock:
+                if sum(kind == "model_started" for kind, _, _ in events) >= 2:
+                    probe.set()
+            assert probe.wait(4), "Distinct Shot provider calls did not overlap"
         if native_mode["block"] == number:
             entered.set()
             assert release.wait(5), "Offline model fixture was not released"
@@ -404,12 +417,15 @@ async def exercise(engine):
         print("PASS native SDK accordion row3/body/row4 order; original IDs, hide restoration, 100 unchanged layouts reorder zero")
 
         async def resolve(targets):
-            dag = DagBuilder(engine=engine)
+            workflow = engine.current_workflow() if callable(getattr(engine, "current_workflow", None)) else None
+            dag = (DagBuilder(connections=engine.flow_manager.get_connections())
+                   if "connections" in inspect.signature(DagBuilder).parameters else DagBuilder(engine=engine))
             for node in targets:
                 node.prepare_to_run_again()
                 dag.add_node_with_dependencies(node, node.name)
             participants = [node.node_reference for node in dag.node_to_reference.values()]
-            machine = ParallelResolutionMachine(flow.name, max_nodes_in_parallel=5, dag_builder=dag, engine=engine)
+            options = {"workflow": workflow} if "workflow" in inspect.signature(ParallelResolutionMachine).parameters else {}
+            machine = ParallelResolutionMachine(flow.name, max_nodes_in_parallel=5, dag_builder=dag, engine=engine, **options)
             await asyncio.wait_for(machine.resolve_node(), timeout=15)
             assert machine.is_complete() and not machine.is_errored(), machine.get_error_message()
             return participants
@@ -432,7 +448,11 @@ async def exercise(engine):
 
         # Source/Prompt/manager are shared SDK dependencies, not five visible
         # model nodes. Each Generator independently pulls its frozen Shot.
-        await resolve(generators)
+        native_mode["parallel_probe"] = threading.Event()
+        try:
+            await resolve(generators)
+        finally:
+            native_mode["parallel_probe"] = None
         assert sorted(number for kind, number, _ in events if kind == "model_started") == [1, 2, 3, 4, 5], events
         assert sorted(number for kind, number, _ in events if kind == "generation_finished") == [1, 2, 3, 4, 5], events
         started = sorted(at for kind, _, at in events if kind == "model_started")
@@ -539,7 +559,9 @@ async def exercise(engine):
         from _hmb_bundled_policy_session import install_bundled_policy_session
         install_bundled_policy_session(agent_module._hmb)
         policy_payload = agent_module._hmb._load_agent_rule_payload()
-        assert policy_payload["final_policy_version"].endswith("v7.0")
+        assert policy_payload["final_policy_version"] == agent_module._hmb._validate_agent_policy_payload(
+            agent_module._hmb._decode_signed_agent_policy_envelope(
+                agent_module._hmb._read_agent_policy_envelope()))["final_policy_version"]
         PROJECT.update(project_id="superwings12", project_name="슈퍼윙즈12")
         project_root = Path.cwd() / "synthetic-projects" / "superwings12"
         project_root.mkdir(parents=True, exist_ok=True)

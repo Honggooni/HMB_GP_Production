@@ -146,6 +146,7 @@ def current_pair(**kwargs):
 
 source = SimpleNamespace(name="Prompt", _hmb_sync_lock=threading.RLock())
 source._compile_current_prompt_pair = current_pair
+source._hmb_analysis_visual_rows = prompt.HMBPromptLibrary._hmb_analysis_visual_rows
 source._hmb_current_shot_images = ["C:/selected/hero.png"]
 source._hmb_current_shot_videos = ["C:/selected/preview.mp4"]
 machine = current_pair(refresh_sources=False)[2]

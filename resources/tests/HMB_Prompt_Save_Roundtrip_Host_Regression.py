@@ -33,6 +33,16 @@ ATTEMPTS: list[str] = []
 NATIVE_WAKEUPS: list[bool] = []
 
 
+def korean_shot_fields(number):
+    return {
+        "PROJECT_STYLE_LOOK": f"샷 {number}: 기존 캐릭터 디자인 유지 {{literal}} RGB(12, 34, 56) OFF 0",
+        "SCENE_CONTEXT": f"샷 {number}: 왼쪽에서 걸어와 친구를 바라봅니다.\n소품은 그대로 둡니다.",
+        "EMOTION_INTENT": f"샷 {number}: 놀람에서 안도감으로 변합니다.",
+        "VIDEO_VFX": f"샷 {number}: @video1의 불꽃만 참고합니다. 흔들림 OFF, 강도 0.",
+        "PRESERVED_TEXT": f'  [Dialogue] "안녕, 까투리 {number}!"\r\n[On-screen Text] 출입 금지 {{SIGN}} 😀',
+    }
+
+
 def deny(*args, **kwargs):
     ATTEMPTS.append("external work")
     raise AssertionError("Save fixture must not execute models, render or use network")
@@ -116,7 +126,7 @@ async def exercise(engine, directory):
         text_key = next(iter(prompts.TEXT_FIELD_DEFAULTS))
         for row in SHOTS:
             state = prompts._select_prompt_shot_document(state, row)
-            state["text"][text_key] = f"Synthetic literal {row['number']} {{literal}} RGB(12, 34, 56) OFF 0"
+            state["text"].update(korean_shot_fields(row["number"]))
             state["images"][0]["label"] = f"Authored image {row['number']}"
             state["images"][0]["color_picks"] = ["Red" if row["number"] % 2 else "Blue"]
             state["videos"][0]["keep_out"] = f"OFF 0 literal boundary {row['number']}"
@@ -275,7 +285,7 @@ async def exercise(engine, directory):
             assert {key: encode_value(restored.nodes[name]._get_raw_parameter_value(key)) for key in values} == values
         for row in SHOTS:
             view = prompts._select_prompt_shot_document(deepcopy(expected_prompt), row)
-            assert view["text"][text_key] == f"Synthetic literal {row['number']} {{literal}} RGB(12, 34, 56) OFF 0"
+            assert view["text"] == korean_shot_fields(row["number"])
             assert view["videos"][0]["keep_out"] == f"OFF 0 literal boundary {row['number']}"
             assert view["images"][0]["color_picks"] == ["Red" if row["number"] % 2 else "Blue"]
         assert not ATTEMPTS, ATTEMPTS

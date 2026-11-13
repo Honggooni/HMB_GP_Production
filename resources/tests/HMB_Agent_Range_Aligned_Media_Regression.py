@@ -175,7 +175,7 @@ class AlignedMediaTests(unittest.TestCase):
             return fake, 96, 96, seek + (.2 if identity[0].endswith("mask.mp4") else 0)
         records[1]["source"] = str(self.root / "mask.mp4")
         (self.root / "mask.mp4").touch() if not self.sources else None
-        with patch.object(media, "_source", side_effect=lambda value, kind: (Path(value), (str(value),))), \
+        with patch.object(media, "_source", side_effect=lambda value, kind, **kwargs: (Path(value), (str(value),))), \
              patch.object(media, "_decode", side_effect=shifted), \
              patch.object(media, "_video_info", return_value={"duration": 5, "start_pts": 0}):
             result, report = self.call(snapshot(videos=records))

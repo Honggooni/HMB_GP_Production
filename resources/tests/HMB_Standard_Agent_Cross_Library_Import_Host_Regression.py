@@ -33,9 +33,9 @@ parser.add_argument("--report", type=Path)
 args = parser.parse_args()
 assert os.environ.get("HMB_SDK_GUARD_RECEIPT"), "Run through the SDK offline guard"
 assert os.environ.get("HMB_SDK_ISOLATED_ROOT"), "An isolated SDK config root is required"
-os.environ.pop("HMB_GRIPTAPE_STANDARD_LIBRARY_PATH", None)
+standard_hint = os.environ.pop("HMB_GRIPTAPE_STANDARD_LIBRARY_PATH", None)
 
-libraries = Path.home() / "Documents/GriptapeNodes/libraries"
+libraries = Path(standard_hint).parent if standard_hint else Path.home() / "Documents/GriptapeNodes/libraries"
 installed = libraries / "HMB_GP_Production"
 target = (args.product_root or installed).resolve(strict=True)
 assert (target / "HMBAgentLibrary.py").is_file() and (target / "_hmb_common.py").is_file()

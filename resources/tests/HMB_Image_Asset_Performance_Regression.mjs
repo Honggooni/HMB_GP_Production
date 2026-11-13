@@ -1364,7 +1364,7 @@ assert.equal(
   "An older completion must not clear or supersede a newer pending request.",
 );
 
-// Missing thumbnails publish after paint as one deduplicated 64-id batch. A
+// Missing thumbnails publish after paint as a deduplicated 12-id first batch. A
 // completion schedules the still-missing remainder once; failed IDs stay
 // attempted for that catalog context and cannot create an idle retry loop.
 const stagedThumbnailState = assetWidget.hmbNormalizeImageAssetState({
@@ -1471,14 +1471,14 @@ try {
     firstThumbnailRequest.request_id,
     "Successful request intent clears locally while busy/pending persists to completion.",
   );
-  assert.equal(firstThumbnailRequest.asset_library_ids.length, 64);
+  assert.equal(firstThumbnailRequest.asset_library_ids.length, 12);
   assert.deepEqual(
     firstThumbnailRequest.asset_library_ids.slice(0, 3),
     ["thumbnail-stage-60", "thumbnail-stage-61", "thumbnail-stage-62"],
   );
   assert.deepEqual(
-    firstThumbnailRequest.asset_library_ids.slice(50),
-    Array.from({ length: 14 }, (_value, index) => `thumbnail-stage-${index}`),
+    firstThumbnailRequest.asset_library_ids,
+    Array.from({ length: 12 }, (_value, index) => `thumbnail-stage-${index + 60}`),
   );
 
   const firstCompleted = new Set(firstThumbnailRequest.asset_library_ids);
@@ -1517,7 +1517,8 @@ try {
   const secondThumbnailRequest = stagedPublished[1].thumbnail_request;
   assert.deepEqual(
     secondThumbnailRequest.asset_library_ids,
-    Array.from({ length: 46 }, (_value, index) => `thumbnail-stage-${index + 14}`),
+    [...Array.from({ length: 38 }, (_value, index) => `thumbnail-stage-${index + 72}`),
+      ...Array.from({ length: 26 }, (_value, index) => `thumbnail-stage-${index}`)],
   );
 
   const failedCompletion = assetWidget.hmbNormalizeImageAssetState({
@@ -1542,9 +1543,28 @@ try {
       failedCompletion,
       stagedProps,
     ),
-    false,
-    "A failed asset is attempted once per scan context instead of looping while idle.",
+    true,
+    "A failed batch must not suppress the untouched catalog remainder.",
   );
+  flushStagedAfterPaint();
+  const finalThumbnailRequest = stagedPublished[2].thumbnail_request;
+  assert.deepEqual(finalThumbnailRequest.asset_library_ids,
+    Array.from({ length: 34 }, (_value, index) => `thumbnail-stage-${index + 26}`));
+  const finalFailedCompletion = assetWidget.hmbNormalizeImageAssetState({
+    ...stagedPublished[2], thumbnail_request: {}, thumbnail_revision: 3, thumbnail_busy: false,
+    thumbnail_result: {
+      request_id: finalThumbnailRequest.request_id,
+      project_uid: finalThumbnailRequest.project_uid,
+      manifest_signature: finalThumbnailRequest.manifest_signature,
+      scan_revision: finalThumbnailRequest.scan_revision,
+      completed_asset_library_ids: [], failed_asset_library_ids: finalThumbnailRequest.asset_library_ids,
+    },
+  });
+  stagedContainer.__hmbImageAssetLatestState = finalFailedCompletion;
+  delete stagedContainer.__hmbImageAssetThumbnailPendingRequestId;
+  assert.equal(assetWidget.hmbScheduleImageAssetThumbnailRequest(
+    stagedContainer, finalFailedCompletion, stagedProps,
+  ), false, "A failed asset is attempted once per scan context instead of looping while idle.");
   const allFailedContainer = {
     __hmbImageAssetLatestState: backfillState,
     __hmbImageAssetRenderLimit: 60,
@@ -1562,7 +1582,7 @@ try {
   flushStagedAfterPaint();
   const failedFirstBatch = backfillPublished[0].thumbnail_request;
   assert.deepEqual(failedFirstBatch.asset_library_ids, Array.from(
-    { length: 64 }, (_value, index) => `thumbnail-backfill-${index}`,
+    { length: 12 }, (_value, index) => `thumbnail-backfill-${index}`,
   ));
   const afterFailure = assetWidget.hmbNormalizeImageAssetState({
     ...backfillPublished[0],
@@ -1586,7 +1606,7 @@ try {
   flushStagedAfterPaint();
   assert.deepEqual(
     backfillPublished[1].thumbnail_request.asset_library_ids,
-    Array.from({ length: 64 }, (_value, index) => `thumbnail-backfill-${index + 64}`),
+    Array.from({ length: 64 }, (_value, index) => `thumbnail-backfill-${index + 12}`),
   );
   assert.equal(
     assetWidget.hmbScheduleImageAssetThumbnailRequest(

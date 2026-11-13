@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import inspect
 from pathlib import Path
 import sys
 import tempfile
@@ -30,20 +29,23 @@ def shot_row(state: dict, number: int) -> dict:
 def registered_node():
     node = picker.HMBVideoPickerLibrary(name="blender_cross_shot_mask_regression")
     try:
-        from griptape_nodes.exe_types.flow import ControlFlow
+        from griptape_nodes.retained_mode.engine import current_engine
+        from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
+        from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
     except ImportError:
         return node  # Hostless fallback has no retained-mode registry.
-    manager = GriptapeNodes.EventManager()
-    manager.initialize_queue()
-    options = {"name": "BlenderCrossShotMaskFixture"}
-    if "engine" in inspect.signature(ControlFlow).parameters:
-        options["engine"] = manager.engine
-    flow = ControlFlow(**options)
+    GriptapeNodes.EventManager().initialize_queue()
+    engine = current_engine()
+    ensured = engine.handle_request(EnsureWorkflowAndFlowRequest(flow_name="BlenderCrossShotMaskOwner"))
+    assert ensured.succeeded(), ensured.result_details
+    workflow = engine.open_workflows.get(ensured.workflow_id)
+    created = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="BlenderCrossShotMaskFixture"))
+    assert created.succeeded(), created.result_details
+    flow = engine.flow_manager.get_flow_by_name_in(workflow, created.flow_name)
     flow.add_node(node)
-    GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
-    GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
-    GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = flow.name
+    engine.object_manager.add_object_by_name_in(workflow, node.name, node)
+    workflow.nodes.name_to_parent_flow_name[node.name] = flow.name
     return node
 
 

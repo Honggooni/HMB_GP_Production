@@ -1,7 +1,7 @@
 const fs=require('fs'),path=require('path'),vm=require('vm'),assert=require('assert/strict');
 const src=fs.readFileSync(path.join(__dirname,'..','editor','hmb-color-lut-native-header.js'),'utf8');
-let queued=[],sent=[];const frame={};const ctx={console,requestAnimationFrame:f=>(queued.push(f),queued.length),cancelAnimationFrame:()=>{},Xd:{request:async(type,body)=>(sent.push({type,body}),{})},Tjr:()=>({newWidth:999,newHeight:888}),Sjr:()=>({color:'stock'}),document:{querySelector:()=>frame},CSS:{escape:String}};vm.createContext(ctx);
-vm.runInContext(src+`;globalThis.api={isType:hmbIsNativeStudioType,isWidget:hmbIsNativeStudioWidget,construct:hmbNativeStudioConstructedNode,dimensions:hmbNativeStudioDimensions,style:hmbNativeStudioNodeStyle,collapseMetadata:hmbNativeStudioCollapseMetadata,controllers:hmbNativeStudioCollapseControllers,repair:hmbNativeStudioRepairLegacySize};`,ctx);
+let queued=[],sent=[];const frame={};const ctx={console,requestAnimationFrame:f=>(queued.push(f),queued.length),cancelAnimationFrame:()=>{},Xd:{request:async(type,body)=>(sent.push({type,body}),{})},Tjr:()=>({newWidth:999,newHeight:888}),Sjr:()=>({color:'stock'}),document:{querySelector:()=>frame},CSS:{escape:String},MouseEvent:class{constructor(type,options){this.type=type;this.options=options;}}};vm.createContext(ctx);
+vm.runInContext(src+`;globalThis.api={isType:hmbIsNativeStudioType,isWidget:hmbIsNativeStudioWidget,construct:hmbNativeStudioConstructedNode,dimensions:hmbNativeStudioDimensions,style:hmbNativeStudioNodeStyle,collapseMetadata:hmbNativeStudioCollapseMetadata,controllers:hmbNativeStudioCollapseControllers,repair:hmbNativeStudioRepairLegacySize,view:hmbNativeStudioView,doubleClick:hmbNativeStudioDoubleClick};`,ctx);
 const api=ctx.api,contract={schema:'hmb-native-studio-ui',version:1,node_type:'HMBFutureTool',widget:'HMBFutureWidget'};
 const meta={library:'HMB_GP_Production',hmb_native_studio_ui:contract};
 assert.equal(api.isType('HMBFutureTool',meta),true);assert.equal(api.isWidget('HMBFutureWidget',meta),true);
@@ -10,6 +10,14 @@ for(const value of [{...meta,library:'Other'}, {...meta,hmb_native_studio_ui:{..
 assert.equal(api.isWidget('HMBFutureWidget',{...meta,library:'Other'}),false);assert.equal(api.isWidget('DifferentWidget',meta),false);
 assert.equal(api.isType(undefined),false);assert.equal(api.isWidget(undefined),false);
 assert.equal(api.isType('HMBColorLUTLibrary'),true);assert.equal(api.isWidget('HMBColorLUTLibraryWidget'),true);
+const soundMeta={library:'HMB_GP_Production',hmb_native_studio_ui:{schema:'hmb-native-studio-ui',version:1,node_type:'HMBSoundLibrary',widget:'HMBSoundLibraryWidget'}};
+assert.equal(api.isType('HMBSoundLibrary',soundMeta),true);assert.equal(api.isWidget('HMBSoundLibraryWidget',soundMeta),true);
+const soundRoot={dataset:{soundView:'expanded'}};let soundClicks=0;
+const soundSurface={isConnected:true,getClientRects:()=>[{}],parentElement:frame,ownerDocument:{defaultView:{getComputedStyle:()=>({display:'block',visibility:'visible',opacity:'1'})}},closest:()=>soundRoot,dispatchEvent:event=>{assert.equal(event.type,'dblclick');soundClicks++;}};
+frame.querySelectorAll=selector=>selector==='[data-sound-toggle-surface=header]'?[soundSurface]:[];
+assert.equal(api.view('HMBSoundLibrary',frame).view,'expanded');
+soundRoot.dataset.soundView='compact';assert.equal(api.view('HMBSoundLibrary',frame).view,'compact');
+api.doubleClick('HMBSoundLibrary','sound',null,soundMeta)();assert.equal(soundClicks,1);
 const node={type:'custom',data:{node_type:'HMBFutureTool',metadata:meta,collapsed:true}};const out=api.construct(node);
 assert.equal(out.width,320);assert.equal(out.height,64);assert.equal(node.width,undefined);assert.strictEqual(out.data.metadata,meta);
 const foreign=api.construct({...node,data:{...node.data,metadata:{...meta,library:'Other'}}});assert.equal(foreign.width,undefined);

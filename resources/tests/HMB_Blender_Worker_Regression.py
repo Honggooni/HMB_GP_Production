@@ -167,6 +167,49 @@ class BlenderWorkerRegression(unittest.TestCase):
     def test_depth_only_capture_writes_only_depth_artifacts(self):
         self._assert_auxiliary_only_capture("depth")
 
+    def test_linked_mesh_copies_keep_numbered_names_and_separate_markers(self):
+        with tempfile.TemporaryDirectory(prefix="hmb-blender-linked-copies-") as temporary:
+            directory = Path(temporary)
+            scene = directory / "linked.blend"
+            expression = (
+                "import bpy;"
+                "s=bpy.context.scene;"
+                "o=bpy.data.objects['Cube'];o.name='FireflyAa';o.location.x=-1.5;"
+                "a=o.copy();a.name='FireflyAa';s.collection.objects.link(a);a.location.x=1.5;"
+                "assert a.data==o.data;"
+                "bpy.ops.wm.save_as_mainfile(filepath=" + repr(str(scene)) + ")"
+            )
+            run = subprocess.run([
+                str(self.binary), "--background", "--factory-startup", "--disable-autoexec",
+                "--python-exit-code", "5", "--python-expr", expression,
+            ], capture_output=True, text=True, timeout=90)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            _, scan, process = self._run_job(directory, scene, "scan")
+            self.assertTrue(scan['ok'], scan.get('error'))
+            roots = [r for r in scan['outliner_nodes'] if r['name'].startswith('FireflyAa')]
+            self.assertEqual({r['name'] for r in roots}, {'FireflyAa', 'FireflyAa.001'})
+            rows = [dict(full_dag_path=r['full_path'], group_name=r['name'], color=color)
+                    for r, color in zip(sorted(roots, key=lambda r:r['name']), ['Red','Green'])]
+            job, result, process = self._run_job(directory, scene, "render", capture_pass='color',
+                apply_marker_shaders=True, bindings=rows, width=320, height=180, end_frame=1)
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            self.assertTrue(result['ok'], result.get('error'))
+            with Image.open(next(Path(job['frames_folder']).glob('*.png'))) as image:
+                pixels=list(image.convert('RGB').getdata())
+                self.assertGreater(sum(r>100 and r>g*2 and r>b*2 for r,g,b in pixels), 20)
+                self.assertGreater(sum(g>100 and g>r*2 and g>b*2 for r,g,b in pixels), 20)
+
+    def test_missing_saved_path_cannot_rebind_by_group_name(self):
+        with tempfile.TemporaryDirectory(prefix="hmb-blender-exact-path-") as temporary:
+            directory=Path(temporary)
+            scene=self._make_scene(directory)
+            _, result, process=self._run_job(directory, scene, "render", capture_pass='color',
+                apply_marker_shaders=True,
+                bindings=[dict(full_dag_path='|RemovedParent|Cube',group_name='Cube',color='Red')])
+            self.assertNotEqual(process.returncode,0)
+            self.assertFalse(result['ok'])
+            self.assertIn('Blender marker target is missing: |RemovedParent|Cube',result['error'])
+
     def test_motion_only_capture_writes_only_motion_artifacts(self):
         self._assert_auxiliary_only_capture("motion_guide")
 

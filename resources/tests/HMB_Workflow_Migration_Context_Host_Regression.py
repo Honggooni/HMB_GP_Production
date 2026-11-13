@@ -1,7 +1,7 @@
 """Actual SDK migration: empty/nested caller context and rollback stay isolated."""
 from __future__ import annotations
 import asyncio
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 import importlib.util
 import inspect
 import json
@@ -23,6 +23,13 @@ sys.modules[spec.name] = base
 spec.loader.exec_module(base)
 
 def context_identity(manager):
+    if not hasattr(manager, "_workflow_stack"):
+        if not manager.has_current_workflow():
+            return ()
+        return ((manager.get_current_workflow_id(), manager.get_current_workflow_name(),
+            id(manager.get_current_flow()) if manager.has_current_flow() else None,
+            id(manager.get_current_node()) if manager.has_current_node() else None,
+            id(manager.get_current_element()) if manager.has_current_element() else None),)
     return tuple((id(workflow), workflow._name,
         tuple((id(flow), id(flow._flow), tuple((id(node), id(node.node),
             tuple(id(element) for element in node._element_stack))
@@ -58,7 +65,7 @@ async def exercise(engine, directory):
             caller["node"] = host.node_manager.get_node_by_name(made.node_name)
             caller["element"] = caller["node"].get_parameter_by_name("prompt")
         before = context_identity(manager)
-        mode = "empty_flow" if len(calls) % 2 == 0 else "nested_other_flow_node_element"
+        mode = ("empty_flow" if hasattr(manager, "_workflow_stack") else "native_current_flow") if len(calls) % 2 == 0 else "nested_other_flow_node_element"
         record = {"mode": mode}
         async def run_current_context():
             expected = context_identity(manager)
@@ -84,7 +91,10 @@ async def exercise(engine, directory):
                 calls.append(record)
         # This official nested Workflow scope has no Flow or Node, while the
         # real caller's entire Workflow/Flow/Node/element stack stays below it.
-        with manager.workflow(manager.get_current_workflow_name()):
+        if mode == "native_current_flow":
+            return await run_current_context()
+        scope = manager.workflow(manager.get_current_workflow_name()) if hasattr(manager, "_workflow_stack") else nullcontext()
+        with scope:
             if mode == "empty_flow":
                 assert not manager.has_current_flow() and not manager.has_current_node()
                 try:
@@ -117,7 +127,8 @@ async def exercise(engine, directory):
             mock.patch.object(migration, "_structural_request", observed_structure):
         await base.canonical_case(engine, directory)
     assert observer_samples and len(calls) >= 8
-    assert {row["mode"] for row in calls} == {"empty_flow", "nested_other_flow_node_element"}
+    expected_base_mode = "empty_flow" if hasattr(engine.context_manager, "_workflow_stack") else "native_current_flow"
+    assert {row["mode"] for row in calls} == {expected_base_mode, "nested_other_flow_node_element"}
     assert sum(row.get("rollback") == "verified" for row in calls) >= 3
     assert {"SerializeFlowToCommandsRequest", "SerializeNodeToCommandsRequest", "DeleteNodeRequest",
         "DeserializeNodeFromCommandsRequest", "SetParameterValueRequest"}.issubset(structures)

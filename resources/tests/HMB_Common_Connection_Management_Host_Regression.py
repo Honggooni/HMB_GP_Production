@@ -14,7 +14,6 @@ import importlib
 import json
 import logging
 import os
-from functools import wraps
 from pathlib import Path
 import socket
 import sys
@@ -46,17 +45,18 @@ def record(name, **facts):
     CASES.append(dict(name=name, passed=True, **facts))
 
 
-def retained_node_names(engine):
+def node_names(engine):
     current = getattr(engine, "current_workflow_or_none", None)
     if callable(current):
-        return current().nodes.name_to_parent_flow_name
-    return engine.node_manager._name_to_parent_flow_name
+        workflow = current()
+        return tuple(workflow.nodes.name_to_parent_flow_name) if workflow is not None else ()
+    return tuple(engine.node_manager._name_to_parent_flow_name)
 
 
 def edges(engine):
     from griptape_nodes.retained_mode.events.connection_events import ListConnectionsForNodeRequest
     result = set()
-    for name in tuple(retained_node_names(engine)):
+    for name in node_names(engine):
         listing = base.send(engine, ListConnectionsForNodeRequest(node_name=name, include_internal=True))
         for edge in listing.outgoing_connections:
             result.add((name, edge.source_parameter_name, edge.target_node_name, edge.target_parameter_name))
@@ -187,12 +187,24 @@ async def exercise(engine, modules, folder, out):
                     broadcast_result=False))
 
             before_metadata = {name:deepcopy(engine.node_manager.get_node_by_name(name).metadata)
-                for name in retained_node_names(engine)}
+                for name in node_names(engine)}
             view = get(agent)
-            assert not view.detached and view.can_disconnect and view.connections
+            assert not view.detached and view.can_disconnect and view.can_refresh and view.connections
             assert before_metadata == {name:deepcopy(engine.node_manager.get_node_by_name(name).metadata) for name in before_metadata}
             assert authoring(nodes) == expected and edges(engine) == original_edges
             record("initial_connection_query_is_read_only_with_five_shot_authoring_and_TaskIDs")
+            prompt = nodes[base.KINDS[2]]
+            agent_module = modules[base.KINDS[3]]
+            verified_source = agent_module._VERIFIED_PROMPT_SOURCE_ATTRIBUTE
+            setattr(agent, verified_source, object())  # An old retained source identity is unusable.
+            retained_prompt = agent._native_parameter_value("prompt", "")
+            refreshed = await manage(agent, "refresh")
+            assert refreshed.succeeded() and refreshed.can_refresh and refreshed.refresh_confirmed is True
+            assert getattr(agent, verified_source) is prompt
+            assert agent._native_parameter_value("prompt", "") == retained_prompt
+            assert authoring(nodes) == expected and edges(engine) == original_edges
+            assert before_metadata == {name:deepcopy(engine.node_manager.get_node_by_name(name).metadata) for name in before_metadata}
+            record("live_refresh_repairs_exact_Agent_Prompt_identity_without_metadata_edges_or_authoring_changes")
             durations = []
             with ExitStack() as getter_guards:
                 for node in nodes[base.KINDS[5]]:
@@ -265,7 +277,9 @@ async def exercise(engine, modules, folder, out):
             with mock.patch.object(busy_peer, "_hmb_draft_final_status_future", future, create=True):
                 detached = await manage(agent, "disconnect")
             assert detached.succeeded(), str(detached.result_details)
-            assert get(agent).detached
+            assert get(agent).detached and not get(agent).can_refresh
+            refused_refresh = await manage(agent, "refresh")
+            assert not refused_refresh.succeeded() and get(agent).detached
             for _ in range(3):
                 routing.reconcile_shot_routing(nodes[base.KINDS[0]])
                 await asyncio.sleep(.03)
@@ -282,7 +296,7 @@ async def exercise(engine, modules, folder, out):
             await asyncio.sleep(.06)  # Native detached serializer post hooks release their admission.
             saved_bytes = saved.read_bytes()
             identities = {name:deepcopy(engine.node_manager.get_node_by_name(name).metadata.get("hmb_connection_identity_v1"))
-                for name in retained_node_names(engine)}
+                for name in node_names(engine)}
             recipe = deepcopy(agent.metadata.get("hmb_connection_management_v1"))
             assert recipe and any(identities.values())
             deletion = importlib.import_module("_hmb_deletion_guard")
@@ -330,6 +344,14 @@ async def exercise(engine, modules, folder, out):
             await base.settle(lambda: edges(engine) == original_edges, seconds=3)
             assert authoring(nodes) == expected and not get(agent).detached
             record("exact_original_peers_reconnect_without_reexecution_or_authoring_loss")
+            assert get(agent).can_refresh
+            assert getattr(agent, verified_source) is nodes[base.KINDS[2]]
+            retained_prompt = agent._native_parameter_value("prompt", "")
+            refreshed = await manage(agent, "refresh")
+            assert refreshed.succeeded() and refreshed.can_refresh
+            assert agent._native_parameter_value("prompt", "") == retained_prompt
+            assert authoring(nodes) == expected and edges(engine) == original_edges
+            record("reopened_explicit_reconnect_and_refresh_rebind_exact_native_Prompt_with_existing_shot_results")
 
             # A recipe cannot silently reconnect a Shot removed after detach.
             # Restore the synthetic authored source afterwards; no render is
@@ -365,9 +387,10 @@ async def exercise(engine, modules, folder, out):
             before_only_edges = edges(engine)
             before_only_values = deepcopy(dict(only.parameter_values))
             only_view = get(only)
-            assert not only_view.can_disconnect
+            assert not only_view.can_disconnect and not only_view.can_refresh
             await manage(only, "disconnect")
             await manage(only, "reconnect")
+            assert not (await manage(only, "refresh")).succeeded()
             assert only._hmb_seedance_execution_mode() == "only"
             assert edges(engine) == before_only_edges and dict(only.parameter_values) == before_only_values
             record("unbound_explicit_Only_generator_cannot_gain_a_Shot_through_connection_controls")
@@ -380,7 +403,7 @@ async def exercise(engine, modules, folder, out):
 
 async def future_wire_cases(engine, api, schema, library, folder):
     from griptape_nodes.exe_types.node_types import DataNode
-    from griptape_nodes.exe_types.core_types import ParameterMode
+    from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
     from griptape_nodes.exe_types.param_types.parameter_string import ParameterString
     from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
     from griptape_nodes.retained_mode.events.node_events import (
@@ -423,13 +446,35 @@ async def future_wire_cases(engine, api, schema, library, folder):
     def retained():
         return dict(edges=edges(engine), nodes={name:dict(object=id(node), metadata=deepcopy(node.metadata),
             values=deepcopy(dict(node.parameter_values)), outputs=deepcopy(dict(node.parameter_output_values)))
-            for name in retained_node_names(engine)
+            for name in node_names(engine)
             if isinstance((node:=engine.node_manager.get_node_by_name(name)), FutureHMBConnectionTool)})
 
     source, a, b = make("future source"), make("future target A"), make("future target B")
     edge_a, edge_b = wire(source, a), wire(source, b)
     initial = get(source)
     assert initial.can_disconnect and len(initial.connections) == 2
+    before_refresh = retained()
+    verified = await manage(source, "refresh")
+    assert verified.succeeded() and verified.can_refresh and verified.refresh_confirmed is None
+    assert retained() == before_refresh
+    record("ordinary_native_future_wire_refresh_verifies_links_without_resets_or_projections")
+
+    finish_source = make("Retained Finish remote source")
+    finish_source.add_parameter(Parameter(name="finish_snapshot", type="dict", default_value={},
+        allowed_modes={ParameterMode.OUTPUT}))
+    finish_name = base.send(engine, CreateNodeRequest(node_type=base.KINDS[4], specific_library_name=schema.name,
+        node_name="Retained Finish remote target", override_parent_flow_name=flow,
+        create_error_proxy_on_failure=False)).node_name
+    finish = engine.node_manager.get_node_by_name(finish_name)
+    base.send(engine, CreateConnectionRequest(source_node_name=finish_source.name, source_parameter_name="finish_snapshot",
+        target_node_name=finish.name, target_parameter_name="FINISH_LOOK_REMOTE_IN", initial_setup=True))
+    assert finish._remote_connected
+    finish._remote_connected = False  # Model the absent projection after restoring this wire with hooks held.
+    documents, original_finish_edges = deepcopy(finish._hmb_finish_documents), edges(engine)
+    refreshed_finish = await manage(finish, "refresh")
+    assert refreshed_finish.succeeded() and refreshed_finish.refresh_confirmed is True and finish._remote_connected
+    assert finish._hmb_finish_documents == documents and edges(engine) == original_finish_edges
+    record("Finish_Look_reprojects_an_existing_remote_input_without_resetting_documents_or_wires")
     original = retained()
     # Inject one real native edge deletion, then a native refusal on the next
     # edge. The implementation must undo the first deletion and its recipe.
@@ -437,14 +482,12 @@ async def future_wire_cases(engine, api, schema, library, folder):
     original_delete = manager._request_type_to_manager[DeleteConnectionRequest]
     original_metadata_handler = manager._request_type_to_manager[SetNodeMetadataRequest]
     metadata_writes = []
-    @wraps(original_metadata_handler)
     def observe_metadata_write(request, *args, **kwargs):
         result = original_metadata_handler(request, *args, **kwargs)
         metadata_writes.append(dict(node=request.node_name, values=deepcopy(request.metadata),
             broadcast=request.broadcast_result, succeeded=result.succeeded()))
         return result
     count = [0]
-    @wraps(original_delete)
     def fail_second_delete(request, *args, **kwargs):
         count[0] += 1
         if count[0] == 2: return DeleteConnectionResultFailure(result_details="Injected private native deletion failure")
@@ -492,7 +535,6 @@ async def future_wire_cases(engine, api, schema, library, folder):
 
     original_create = manager._request_type_to_manager[CreateConnectionRequest]
     count = [0]
-    @wraps(original_create)
     def fail_second_create(request, *args, **kwargs):
         count[0] += 1
         if count[0] == 2: return CreateConnectionResultFailure(result_details="Injected private native creation failure")

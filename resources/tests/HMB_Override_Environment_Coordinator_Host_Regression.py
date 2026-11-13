@@ -10,6 +10,7 @@ from copy import deepcopy
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -42,6 +43,7 @@ def setup(out, name, *, loaded=False, existing_lock=True):
     schema['nodes']=[definition];schema['widgets']=[];schema['settings']=[]
     (folder/'griptape-nodes-library.json').write_text(json.dumps(schema),encoding='utf-8')
     (folder/'_hmb_library_bootstrap.py').write_bytes((ROOT/'_hmb_library_bootstrap.py').read_bytes())
+    (folder/'_hmb_deletion_guard.py').write_bytes((ROOT/'_hmb_deletion_guard.py').read_bytes())
     (folder/'HMBPromptLibrary.py').write_text('from griptape_nodes.exe_types.node_types import DataNode\nclass OfflineColdProbe(DataNode):\n    def process(self): raise AssertionError("No execution allowed")\n',encoding='utf-8')
     for package,version in [('wrapt','1.16.0'),('Deprecated','1.3.1')]:
         leaf=package.lower()+'/__init__.py'
@@ -73,6 +75,19 @@ async def exercise(engine,phase,out):
         assert result.succeeded(),str(result.result_details)
         return instances[-1]._hmb_environment_repair_summary
     with mock.patch.object(engine.library_manager.dependencies,'install_library_dependencies_request',install),mock.patch.object(engine.library_manager.module_loading,'should_lazy_load_nodes',return_value=False),mock.patch.object(engine.library_manager.module_loading,'load_advanced_library_module',load):
+        if phase == 'loaded-dependency':
+            folder,site=setup(out,'loaded-dependency',loaded=True)
+            payload=site/'wrapt/__init__.py'
+            spec=importlib.util.spec_from_file_location('_hmb_loaded_legacy_dependency_fixture',payload)
+            module=importlib.util.module_from_spec(spec);sys.modules[spec.name]=module;spec.loader.exec_module(module)
+            before=inventory(folder/'.venv')
+            loaded=await register(folder)
+            assert loaded==dict(status='pending',restart_required=True,reason='loaded_dependency'),loaded
+            assert inventory(folder/'.venv')==before
+            host.send(engine,UnloadLibraryFromRegistryRequest(library_name='HMB_GP_Production'))
+            sys.modules.pop(spec.name,None)
+            host.record('actual_loaded_record_member_preserved',summary=loaded,original_files_unchanged=True)
+            return
         folder,site=setup(out,'cold',existing_lock=False)
         before=inventory(folder/'.venv')
         own_payloads=[site/'wrapt/__init__.py',site/'deprecated/__init__.py']
@@ -103,17 +118,6 @@ async def exercise(engine,phase,out):
         assert inventory(folder/'.venv')==after
         observations.append(dict(case='new_override_loaded_nodes_defers',summary=update,original_files_unchanged=True))
         host.send(engine,UnloadLibraryFromRegistryRequest(library_name='HMB_GP_Production'))
-        second,second_site=setup(out,'loaded-dependency',loaded=True)
-        payload=second_site/'wrapt/__init__.py'
-        spec=importlib.util.spec_from_file_location('_hmb_loaded_legacy_dependency_fixture',payload)
-        module=importlib.util.module_from_spec(spec);sys.modules[spec.name]=module;spec.loader.exec_module(module)
-        second_before=inventory(second/'.venv')
-        loaded=await register(second)
-        assert loaded==dict(status='pending',restart_required=True,reason='loaded_dependency'),loaded
-        assert inventory(second/'.venv')==second_before
-        observations.append(dict(case='actual_loaded_record_member_preserved',summary=loaded,original_files_unchanged=True))
-        host.send(engine,UnloadLibraryFromRegistryRequest(library_name='HMB_GP_Production'))
-        sys.modules.pop(spec.name,None)
     for row in observations:host.record(row['case'],**{k:v for k,v in row.items() if k!='case'})
     report=dict(passed=True,scope='Actual SDK RegisterLibraryFromFileRequest and exact product constructor; disposable venv targeted uv uninstall only',cases=observations,source_sha256=hashlib.sha256((ROOT/'_hmb_library_bootstrap.py').read_bytes()).hexdigest(),actual_package_install_calls=0,actual_provider_calls=0,actual_live_engine_connections=0,actual_cleanup_commands=1,optional_tos_prepare_calls=0)
     (out/'coordinator-native-summary.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
@@ -121,7 +125,14 @@ async def exercise(engine,phase,out):
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--out',type=Path,default=ROOT/'reports/release811-local812-20261019/override-sdk/coordinator-r1')
+    parser.add_argument('--loaded-dependency',action='store_true')
     args=parser.parse_args();out=args.out.resolve();out.mkdir(parents=True,exist_ok=True)
+    if args.loaded_dependency:
+        host.exercise=exercise;host.run_phase('loaded-dependency',out)
+        return
     host.exercise=exercise;host.run_phase('coordinator-native',out)
+    # Each process keeps a single deletion-protection owner for its lifetime.
+    subprocess.run([sys.executable,'-B',str(Path(__file__).resolve()),'--out',str(out/'second-process'),
+        '--loaded-dependency'],env={**os.environ},timeout=90,check=True)
     print('HMB_OVERRIDE_COORDINATOR_NATIVE=PASS cases=4 cleanup=1 provider=0 network=0')
 if __name__=='__main__':main()

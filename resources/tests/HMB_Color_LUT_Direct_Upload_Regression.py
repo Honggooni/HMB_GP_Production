@@ -7,6 +7,28 @@ import HMB_Color_LUT_Manual_Upload_Regression as fixture
 import HMBColorLUTLibrary as target
 
 class DirectUploadRegression(fixture.ManualLUTRegression):
+    def test_authored_edit_arriving_with_original_upload_recovers_readiness_without_sending(self):
+        self.ready()
+        state = copy.deepcopy(self.node._hmb_color_lut_state)
+        state['settings'].update(enabled=True, exposure=.5)
+        with mock.patch.object(self.node, '_upload_request') as sent:
+            self.node._command({'id':'fresh-edit-first-click','action':'upload_web','state':state})
+            self.fixture.drain()
+            sent.assert_not_called()
+        self.assertTrue(self.node._upload_projection()['enabled'])
+
+    def test_sound_update_refreshes_idle_probe_only_if_audio_is_used(self):
+        self.ready()
+        with mock.patch.object(self.node, '_schedule_upload_probe', wraps=self.node._schedule_upload_probe) as refresh:
+            self.node._receive_sound({'sequence':1})
+            refresh.assert_not_called()
+            self.node._hmb_color_lut_state['audio_mix']['enabled'] = True
+            self.ready()
+            self.node._receive_sound({'sequence':2})
+            self.fixture.drain()
+            refresh.assert_called_once()
+        self.assertTrue(self.node._upload_projection()['enabled'])
+
     def test_original_upload_without_export_uses_original_bytes_and_neutral_settings(self):
         state=self.node._hmb_color_lut_state
         state['result']={};state['settings'].update(enabled=True,exposure=.5)

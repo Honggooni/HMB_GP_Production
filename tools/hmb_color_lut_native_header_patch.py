@@ -26,6 +26,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import types
 import uuid
 
 
@@ -45,6 +46,10 @@ SUPPORTED_CAPSULE_PREVIOUS_CANDIDATE_SHA256 = "86ee3125de3fc8a89af95a9140dc1fc81
 SUPPORTED_CAPSULE_PREVIOUS_HELPER_SHA256 = "03137c19feb8f4fa4d5e371eb52bae3aaaccf4afb6a29f0098e815bccf65ee25"
 SUPPORTED_CONNECTION_PREVIOUS_CANDIDATE_SHA256 = "984a974edb6b7218b2ff5deb35eaffcf2979fcf6d8ccd5d5c2ca5fbb1fc15552"
 SUPPORTED_CONNECTION_PREVIOUS_HELPER_SHA256 = "e5b515d5cbd1652c1bcb66f7ffa411e6cb86e173163f93f9abee2082a66e74fc"
+SUPPORTED_REBIND_PREVIOUS_CANDIDATE_SHA256 = "44b61f6d65543a34bcf94a0ed702f84ae55045653b3036ec9c73c224840038bf"
+SUPPORTED_REBIND_PREVIOUS_HELPER_SHA256 = "fd8523a5bf575cb26fe275da97dde0481829ec024ba5a97820f5eecd897f90bb"
+SUPPORTED_SOUND_READ_PREVIOUS_CANDIDATE_SHA256 = "dd88eb46ec485a38078eb7f14b06a0ca980f6b0335e230dba3ac9b8b1ba2985d"
+SUPPORTED_SOUND_READ_PREVIOUS_HELPER_SHA256 = "7233a7233759051e381563d3c76ec5a1df9703934264897f9815b64314ae1bd1"
 HELPER = REPO / "resources/editor/hmb-color-lut-native-header.js"
 DEFAULT_SOURCE = Path(os.environ.get("LOCALAPPDATA", "")) / (
     "ai.griptape.nodes.desktop/current/resources/editor-bundle/assets/" + EXPECTED_BUNDLE_NAME
@@ -68,6 +73,28 @@ def _replace_once(source: str, old: str, new: str, anchor: str, counts: dict) ->
         raise ValueError(f"{anchor}: expected one exact anchor, found {count}")
     counts[anchor] = count
     return source.replace(old, new, 1)
+
+
+def _connection_action_bridge(source: str, counts: dict) -> str:
+    """Use the HMB rebind action for every stock reset entry point."""
+    replacements = (
+        ("(0,R.jsx)(nq,{children:`Reset Node`})]},`reset`)",
+         "(0,R.jsx)(nq,{children:hmbNativeConnectionManaged(hmbLibrary)?`연결 다시 적용`:`Reset Node`})]},`reset`)",
+         "hmb_rebind_header_label"),
+        ("LBt=e=>Xd.request(`ResetNodeToDefaultsRequest`,{node_name:e})",
+         "LBt=(e,t)=>hmbNativeConnectionManaged(t)?hmbNativeRefreshConnections(e):Xd.request(`ResetNodeToDefaultsRequest`,{node_name:e})",
+         "hmb_rebind_action"),
+        ("LBt(e.id).catch(Zdi)", "LBt(e.id,e.data?.metadata?.library).catch(Zdi)", "hmb_rebind_outliner"),
+        ("await Xd.request(`ResetNodeToDefaultsRequest`,{node_name:e.node_name})",
+         "await LBt(e.node_name,e.metadata?.library)", "hmb_rebind_header_action"),
+    )
+    for before, after, label in replacements:
+        source = _replace_once(source, before, after, label, counts)
+    old = "await Xd.request(`ResetNodeToDefaultsRequest`,{node_name:t.id})"
+    if source.count(old) != 2:
+        raise ValueError("Ambiguous selection/context reset routes.")
+    counts["hmb_rebind_context_and_selection"] = 2
+    return source.replace(old, "await LBt(t.id,t.data?.metadata?.library)")
 
 
 def _capsule_motion_bridge(source: str) -> str:
@@ -98,9 +125,9 @@ def patch_editor_source(source: str) -> tuple[str, dict]:
         "native_header_hook", counts)
     header = _replace_once(header,
         "let e=w.nodeHeaderItems||[`lock`,`run`,`startFlow`];return kQ.filter",
-        "let e=hmbIsNativeStudioType(t)&&hmbNativeHeader.active?[`lock`,`reset`,`run`]:w.nodeHeaderItems||[`lock`,`run`,`startFlow`];return kQ.filter",
+        "let e=hmbNativeHeaderItems(t,hmbLibrary,w.nodeHeaderItems);return kQ.filter",
         "color_lut_three_native_actions", counts)
-    header = _replace_once(header, "[w.nodeHeaderItems,se]),ke=", "[w.nodeHeaderItems,se,t,hmbNativeHeader.active]),ke=",
+    header = _replace_once(header, "[w.nodeHeaderItems,se]),ke=", "[w.nodeHeaderItems,se,t,hmbLibrary]),ke=",
         "native_action_memo_dependencies", counts)
     header = _replace_once(header,
         "xe=(0,S.useMemo)(()=>FQ(b),[b])",
@@ -286,6 +313,7 @@ def patch_editor_source(source: str) -> tuple[str, dict]:
         "se=m(`ClearAllObjectStateResultSuccess`,()=>{x([]),O([]),lt()",
         "se=m(`ClearAllObjectStateResultSuccess`,()=>{hmbNativeStudioResetCollapseIntents();x([]),O([]),lt()",
         "hmb_delete_invalidate_pending_checks_on_clear", counts)
+    source = _connection_action_bridge(source, counts)
     evidence = {
         "schema": "hmb-color-lut-native-header-prototype", "version": 1,
         "source_profile": SOURCE_PROFILE,
@@ -457,7 +485,7 @@ def _additional_profiles(descriptor: dict) -> list[dict]:
                 or len(set(previous)) != len(previous)
                 or any(item in seen or item in (profile["source_sha256"], profile["candidate_sha256"]) for item in previous)):
             raise ValueError("Invalid previous native editor adapter candidates.")
-        if profile["adapter_path"] not in {"tools/hmb_native_semantic_adapter.py", "tools/hmb_team_editor_0130_connections.py"}:
+        if profile["adapter_path"] != "tools/hmb_native_semantic_adapter.py":
             raise ValueError("Unsupported native editor adapter path.")
         path = _release_plain_path(REPO / profile["adapter_path"])
         if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024 or sha256(path.read_bytes()) != profile["adapter_sha256"]:
@@ -468,31 +496,6 @@ def _additional_profiles(descriptor: dict) -> list[dict]:
     return result
 
 
-_TEAM_0130_STOCK_ENTRY_SHA256 = "561a68840af19500274dbbb8ef2c46e9ac8a619564e246b8b285137e63569a82"
-_TEAM_0130_CANDIDATE_ENTRY_SHA256 = "8696c149551a9326b9457c2ed353f0cef8e5aa3054e1656e8842ecc42803bbe5"
-_TEAM_0130_SOURCE_SHA256 = "841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e"
-_TEAM_0130_CANDIDATE_SHA256 = "109600be6fc2d6dde89c934bda219a7fbc4be7e4bdcaa9b8c21f5bd091af7d8e"
-
-
-def _team_0130_entry_candidate(original: bytes) -> bytes:
-    if sha256(original) == _TEAM_0130_CANDIDATE_ENTRY_SHA256:
-        return original
-    if sha256(original) != _TEAM_0130_STOCK_ENTRY_SHA256:
-        raise ValueError("Bundled editor entry is outside the reviewed Team layout.")
-    ref = b"./assets/index-B4peacnU.js"
-    versioned = ref + b"?hmb-team=" + _TEAM_0130_CANDIDATE_SHA256[:16].encode("ascii")
-    script = b'<script type="module" crossorigin src="' + ref + b'"></script>'
-    # Lazy chunks import the canonical entry. They must share the versioned
-    # module instance and its stores with the Editor.
-    mapping = b'<script type="importmap">{"imports":{"' + ref + b'":"' + versioned + b'"}}</script>'
-    if original.count(script) != 1:
-        raise ValueError("Bundled editor entry script is ambiguous.")
-    candidate = original.replace(script, mapping + b"\n    " + script.replace(ref, versioned))
-    if sha256(candidate) != _TEAM_0130_CANDIDATE_ENTRY_SHA256:
-        raise ValueError("Bundled editor entry candidate does not match the reviewed bytes.")
-    return candidate
-
-
 def _active_git_profile(descriptor: dict) -> tuple[Path, dict | None] | None:
     """Resolve the editor's actual entry point, then match only reviewed bytes.
 
@@ -501,23 +504,12 @@ def _active_git_profile(descriptor: dict) -> tuple[Path, dict | None] | None:
     """
     root = _release_plain_path(DEFAULT_SOURCE.parent.parent)
     entry = _release_plain_path(root / "index-editor.html")
-    # Desktop 0.30 serves Editor 0.130 from its bundled Python distribution.
-    # Only the reviewed stock and Team entries are eligible here. In particular a Local
-    # overlay uses its own entry and must not be replaced by Team Override.
-    embedded = _release_plain_path(DEFAULT_SOURCE.parents[2] /
-        "engine-bundle/python/Lib/site-packages/griptape_nodes_editor_dist/editor/index-editor.html")
-    if embedded.is_file():
-        if embedded.stat().st_size > 1024 * 1024 or sha256(embedded.read_bytes()) not in {
-                _TEAM_0130_STOCK_ENTRY_SHA256, _TEAM_0130_CANDIDATE_ENTRY_SHA256}:
-            raise ValueError("Bundled editor entry is outside the reviewed Team layout; existing files preserved.")
-        entry = embedded
-        root = embedded.parent
     if not entry.exists():
         raise ValueError("Installed editor entry HTML is missing; existing files preserved.")
     if not entry.is_file() or entry.stat().st_size > 1024 * 1024:
         raise ValueError("Invalid installed editor entry HTML.")
     html = entry.read_text("utf-8")
-    matches = re.findall(r'''\bsrc\s*=\s*["']\./assets/(index-[A-Za-z0-9_-]+\.js)(?:\?hmb-team=[0-9a-f]{16})?["']''', html)
+    matches = re.findall(r'''\bsrc\s*=\s*["']\./assets/(index-[A-Za-z0-9_-]+\.js)["']''', html)
     if len(matches) != 1:
         raise ValueError("Installed editor entry must reference one unambiguous JS bundle.")
     target = _release_plain_path(root / "assets" / matches[0])
@@ -549,9 +541,14 @@ def _release_previous_candidates(descriptor: dict) -> list[dict]:
                         "helper_sha256": SUPPORTED_CAPSULE_PREVIOUS_HELPER_SHA256}
     connection_previous = {"bundle_sha256": SUPPORTED_CONNECTION_PREVIOUS_CANDIDATE_SHA256,
                            "helper_sha256": SUPPORTED_CONNECTION_PREVIOUS_HELPER_SHA256}
+    rebind_previous = {"bundle_sha256": SUPPORTED_REBIND_PREVIOUS_CANDIDATE_SHA256,
+                       "helper_sha256": SUPPORTED_REBIND_PREVIOUS_HELPER_SHA256}
+    sound_read_previous = {"bundle_sha256": SUPPORTED_SOUND_READ_PREVIOUS_CANDIDATE_SHA256,
+                           "helper_sha256": SUPPORTED_SOUND_READ_PREVIOUS_HELPER_SHA256}
     if "previous_candidates" in descriptor:
         candidates = descriptor["previous_candidates"]
-        if "previous_candidate" in descriptor or candidates not in ([connection_previous, capsule_previous, current, latest, recent, older], [capsule_previous, current, latest, recent, older], [current, latest, recent, older], [latest, recent, older], [recent, older]):
+        reviewed = [sound_read_previous, rebind_previous, connection_previous, capsule_previous, current, latest, recent, older]
+        if "previous_candidate" in descriptor or not any(candidates == reviewed[start:] for start in range(len(reviewed) - 1)):
             raise ValueError("Unsupported previous native editor candidates.")
         return list(candidates)
     if "previous_candidate" in descriptor:
@@ -593,10 +590,20 @@ def _upgrade_previous_helper(original: bytes, descriptor: dict) -> bytes:
     # Match the pristine transformer, which normalizes the helper to UTF-8 LF.
     replacement = HELPER.read_text(encoding="utf-8").encode("utf-8")
     candidate = original[:start] + replacement + original[end:]
+    if original_sha == SUPPORTED_SOUND_READ_PREVIOUS_CANDIDATE_SHA256:
+        if sha256(candidate) != descriptor["candidate_sha256"]:
+            raise ValueError("Upgraded native editor candidate differs from the verified release.")
+        return candidate
     # The last shipped helper already owns the capsule-duration seam. Replacing
     # only that helper must not apply the same structural edit a second time.
-    if original_sha != SUPPORTED_CONNECTION_PREVIOUS_CANDIDATE_SHA256:
+    if original_sha not in {SUPPORTED_CONNECTION_PREVIOUS_CANDIDATE_SHA256, SUPPORTED_REBIND_PREVIOUS_CANDIDATE_SHA256}:
         candidate = _capsule_motion_bridge(candidate.decode("utf-8")).encode("utf-8")
+    upgraded = _replace_once(candidate.decode("utf-8"),
+        "let e=hmbIsNativeStudioType(t)&&hmbNativeHeader.active?[`lock`,`reset`,`run`]:w.nodeHeaderItems||[`lock`,`run`,`startFlow`];return kQ.filter",
+        "let e=hmbNativeHeaderItems(t,hmbLibrary,w.nodeHeaderItems);return kQ.filter", "hmb_header_actions", {})
+    upgraded = _replace_once(upgraded, "[w.nodeHeaderItems,se,t,hmbNativeHeader.active]),ke=",
+        "[w.nodeHeaderItems,se,t,hmbLibrary]),ke=", "hmb_header_dependencies", {})
+    candidate = _connection_action_bridge(upgraded, {}).encode("utf-8")
     if sha256(candidate) != descriptor["candidate_sha256"]:
         raise ValueError("Upgraded native editor candidate differs from the verified release.")
     return candidate
@@ -701,8 +708,7 @@ def _release_sdk_preflight() -> dict:
         positional = args.posonlyargs + args.args
         required_count = len(positional) - len(args.defaults)
         scoped_request = (workflow_scoped and required_count == 3
-                          and positional[2].arg == "workflow"
-                          and positional[1].arg == "request")
+                          and positional[2].arg == "workflow" and positional[1].arg == "request")
         if len(positional) < 2 or (required_count > 2 and not scoped_request) or any(value is None for value in args.kw_defaults):
             raise ValueError(prefix + "Guarded node method must accept its request/name: " + name)
     inventory = "name_to_parent_flow_name" if workflow_scoped else "_name_to_parent_flow_name"
@@ -807,6 +813,11 @@ def _release_write_lock():
 
 def prepare_release_install() -> dict:
     descriptor, descriptor_sha = _release_descriptor()
+    editor = _embedded_editor_0130()
+    if editor is not None:
+        _require_release_stopped()
+        with _release_write_lock():
+            return _editor_0130_run(editor, descriptor_sha, "prepare")
     target = _release_target()
     sdk_preflight = _release_sdk_preflight()
     original = target.read_bytes()
@@ -903,6 +914,11 @@ def _apply_release_install_unlocked(path: Path) -> dict:
 
 
 def apply_release_install(path: Path) -> dict:
+    editor = _embedded_editor_0130()
+    if editor is not None:
+        _require_release_stopped()
+        with _release_write_lock():
+            return _editor_0130_run(editor, _release_descriptor()[1], "apply", path)
     _release_plan(path)
     with _release_write_lock():
         return _apply_release_install_unlocked(path)
@@ -917,6 +933,11 @@ def _rollback_release_install_unlocked(path: Path) -> dict:
 
 
 def rollback_release_install(path: Path) -> dict:
+    editor = _embedded_editor_0130()
+    if editor is not None:
+        _require_release_stopped()
+        with _release_write_lock():
+            return _editor_0130_run(editor, _release_descriptor()[1], "rollback", path)
     _release_plan(path)
     with _release_write_lock():
         return _rollback_release_install_unlocked(path)
@@ -1114,20 +1135,8 @@ def _git_override_apply_active_unlocked() -> dict:
                 or evidence.get("candidate_sha256") != expected_candidate
                 or evidence.get("helper_sha256") != descriptor["helper_sha256"]):
             raise ValueError("Native editor adapter approval hashes are stale; existing file preserved.")
-    entry = None
-    entry_before = entry_after = None
-    if profile is not None and source_hash == _TEAM_0130_SOURCE_SHA256:
-        if expected_candidate != _TEAM_0130_CANDIDATE_SHA256:
-            raise ValueError("Team editor candidate does not match the reviewed entry.")
-        entry = _release_plain_path(target.parent.parent / "index-editor.html")
-        entry_before = entry.read_bytes()
-        entry_after = _team_0130_entry_candidate(entry_before)
-        details.update(entry_target=str(entry), entry_original_sha256=sha256(entry_before),
-                       entry_candidate_sha256=sha256(entry_after))
     if original_sha == expected_candidate:
-        if entry_before == entry_after:
-            return _git_override_result("current", "Pinned editor is already on disk; loaded renderer was not verified.", **details)
-        candidate = original
+        return _git_override_result("current", "Pinned editor is already on disk; loaded renderer was not verified.", **details)
     if profile is None:
         candidate = (patch_editor_source(original.decode("utf-8"))[0].encode("utf-8")
                      if original_sha == source_hash else _upgrade_previous_helper(original, descriptor))
@@ -1137,9 +1146,6 @@ def _git_override_apply_active_unlocked() -> dict:
     transaction.mkdir(parents=True, exist_ok=False)
     _atomic_write(transaction / "before.js", original)
     _atomic_write(transaction / "candidate.js", candidate)
-    if entry is not None:
-        _atomic_write(transaction / "before.html", entry_before)
-        _atomic_write(transaction / "candidate.html", entry_after)
     path = transaction / "plan.json"
     plan = {"schema": "hmb-native-editor-git-override-plan", "version": 1,
             **details, "original_sha256": original_sha, "app_identity": app_identity,
@@ -1156,49 +1162,29 @@ def _git_override_apply_active_unlocked() -> dict:
                 or sha256((transaction / "before.js").read_bytes()) != original_sha
                 or sha256((transaction / "candidate.js").read_bytes()) != expected_candidate):
             raise ValueError("Editor or staged bytes changed during preparation; target preserved.")
-        if entry is not None and (entry.read_bytes() != entry_before
-                or (transaction / "before.html").read_bytes() != entry_before
-                or (transaction / "candidate.html").read_bytes() != entry_after):
-            raise ValueError("Editor entry changed during preparation; target preserved.")
     precommit()
     plan = {**plan, "status": "applying"}
     _json_write(path, plan)
     precommit()
     try:
-        if original_sha != expected_candidate:
-            _atomic_write(target, candidate)
+        _atomic_write(target, candidate)
         if sha256(target.read_bytes()) != expected_candidate:
             raise RuntimeError("Installed native editor hash mismatch.")
-        if entry is not None and entry_before != entry_after:
-            if entry.read_bytes() != entry_before:
-                raise ValueError("Editor entry changed before activation.")
-            _atomic_write(entry, entry_after)
-            if entry.read_bytes() != entry_after:
-                raise RuntimeError("Installed editor entry hash mismatch.")
         _json_write(path, {**plan, "status": "applied"})
     except Exception as error:
         current = sha256(_release_plain_path(target).read_bytes())
-        current_entry = _release_plain_path(entry).read_bytes() if entry is not None else None
-        if current == original_sha and current_entry == entry_before:
+        if current == original_sha:
             _json_write(path, {**plan, "status": "pending"})
             if isinstance(error, OSError):
                 return _git_override_result("pending", "Native editor replacement was blocked; original retained. Retry after a normal restart.", reason_code="atomic_replace_blocked", **details)
             raise
-        if current not in {original_sha, expected_candidate} or current_entry not in {entry_before, entry_after}:
+        if current != expected_candidate:
             raise RuntimeError("Native editor changed outside this Git transaction; foreign bytes preserved and rollback refused.") from error
         backup = _release_plain_path(transaction / "before.js").read_bytes()
         if sha256(backup) != original_sha:
             raise RuntimeError("Native editor backup changed; rollback refused.") from error
         try:
-            if entry is not None and current_entry != entry_before:
-                entry_backup = _release_plain_path(transaction / "before.html").read_bytes()
-                if entry_backup != entry_before:
-                    raise RuntimeError("Native editor entry backup changed.")
-                _atomic_write(entry, entry_backup)
-                if entry.read_bytes() != entry_before:
-                    raise RuntimeError("Native editor entry rollback hash mismatch.")
-            if current != original_sha:
-                _atomic_write(target, backup)
+            _atomic_write(target, backup)
             if sha256(target.read_bytes()) != original_sha:
                 raise RuntimeError("Native editor rollback hash mismatch.")
             _json_write(path, {**plan, "status": "rolled_back"})
@@ -1208,11 +1194,66 @@ def _git_override_apply_active_unlocked() -> dict:
     return _git_override_result("applied", "Native editor is ready on disk. Save work and restart Griptape normally once.", changed=True, **details)
 
 
+EDITOR_0130_OVERLAY_INPUTS = {
+    "tools/hmb_editor_0130_header.py": "6a19194fb495494e05e3b41aea717a337c40a729713d6d90db13306a168c684d",
+    "tools/restore_rodong_local_editor.py": "19b72031e21044fa4320d866ecaf504da9e5c7ffc7e3d8a8308880829b3fbd63",
+    "tools/hmb_rodong_editor_0130.py": "12f717c2275cc2147ac255248a9f16618a63189b0414efc0ebadc08f560ee5b9",
+    "tools/hmb_editor_0130_override.py": "90edf0cb9bfc9fdc1c1fdd2678f67b3d01bbf07e259272f0b855751993dac189",
+    "resources/editor/hmb-header-0130.js": "488c40fdb65327be7f30c74a2e33203aa2e29948ad66b6c2c894fd5a35c54a04",
+    "resources/editor/hmb-rodong-editor-0130.js": "87a8b9b8deeb6410c43198c48c24bb69e08285a3c0efce858545bbf492d07354",
+    "resources/editor/hmb-continue-work-art.js": "419ba13a410851923241a8ec8bafa5f17c0d4cbf22162ca5b21216f05514c411",
+    "resources/editor/hmb-continue-work-01-10.webp": "2b0f9df9cb56c9efda1e972010e5ea68ef9130f7791c2ee4301de084d03626d5",
+    "resources/editor/hmb-continue-work-11-20.webp": "a5af41524cf68eeff7dab757b766964f2d75608763ecf532f66af2dd7304fd9d",
+    "resources/editor/hmb-continue-work-21-30.webp": "4a3c682ff0658c087d9f3ede003add5b8f0db10dafe94dd0a83e2dc8bc5943cf"
+}
+
+
+def _embedded_editor_0130() -> Path | None:
+    editor = _release_plain_path(DEFAULT_SOURCE.parents[2] /
+        "engine-bundle/python/Lib/site-packages/griptape_nodes_editor_dist/editor")
+    return editor if (editor / "index-editor.html").is_file() else None
+
+
+def _editor_0130_run(editor: Path, descriptor_sha: str, action: str, path: Path | None = None) -> dict:
+    """Load the fixed local overlay inputs in a private package under -I."""
+    package_name = "_hmb_editor_0130_release"
+    package = types.ModuleType(package_name)
+    package.__path__ = []
+    sys.modules[package_name] = package
+    try:
+        scripts = {}
+        for relative, expected in EDITOR_0130_OVERLAY_INPUTS.items():
+            source = _release_plain_path(REPO / relative)
+            if not source.is_file() or source.stat().st_size > 1024 * 1024:
+                raise ValueError("Editor 0.130 overlay input is missing or oversized: " + relative)
+            encoded = source.read_bytes()
+            if sha256(encoded) != expected:
+                raise ValueError("Editor 0.130 overlay input differs from the reviewed release: " + relative)
+            if source.suffix == ".py":
+                scripts[source.stem] = source, encoded
+        for module_name in ("hmb_editor_0130_header", "restore_rodong_local_editor", "hmb_rodong_editor_0130", "hmb_editor_0130_override"):
+            source, encoded = scripts[module_name]
+            qualified = package_name + "." + module_name
+            adapter = types.ModuleType(qualified)
+            adapter.__file__, adapter.__package__ = str(source), package_name
+            sys.modules[qualified] = adapter
+            exec(compile(encoded, str(source), "exec"), adapter.__dict__)
+        return adapter.run(editor, sys.modules[__name__], descriptor_sha, action, path)
+    finally:
+        for name in tuple(sys.modules):
+            if name == package_name or name.startswith(package_name + "."):
+                sys.modules.pop(name, None)
+
+
 def apply_git_override() -> dict:
     """Public ZIP-free lifecycle API; results describe disk state only."""
     try:
         # Reject unsupported source/package/app before even creating lock state.
-        descriptor, _ = _release_descriptor()
+        descriptor, descriptor_sha = _release_descriptor()
+        editor = _embedded_editor_0130()
+        if editor is not None:
+            with _release_write_lock():
+                return _editor_0130_run(editor, descriptor_sha, "git")
         selected = _active_git_profile(descriptor)
         if selected is None:
             _release_target()

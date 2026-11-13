@@ -24,7 +24,7 @@ packager_spec.loader.exec_module(packager)
 # The receipt fixture follows the shipped closure, independently of the reader.
 # Building it from diag.RUNTIME_FILE_PATHS concealed an omitted runtime member.
 runtime_paths = tuple(packager.RUNTIME_INSTALL_FILES)
-assert len(runtime_paths) == 60
+assert set(runtime_paths) == set(diag.RUNTIME_FILE_PATHS)
 
 with tempfile.TemporaryDirectory(prefix="hmb-build-diag-") as directory:
     root = Path(directory)
@@ -45,7 +45,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-build-diag-") as directory:
         result = diag.get_build_diagnostics(root, verify_policy=False)
     assert result["install"]["receipt_status"] == "matches_recorded_inventory"
     assert result["runtime"]["fingerprint_sha256"] == expected
-    assert result["runtime"]["file_count"] == result["runtime"]["present_count"] == 60
+    assert result["runtime"]["file_count"] == result["runtime"]["present_count"] == len(runtime_paths)
     assert "_hmb_image_limits.py" in result["runtime"]["file_sha256"]
     assert "_hmb_deletion_guard.py" in result["runtime"]["file_sha256"]
     assert "_hmb_workflow_serialization_compat.py" in result["runtime"]["file_sha256"]
@@ -53,6 +53,12 @@ with tempfile.TemporaryDirectory(prefix="hmb-build-diag-") as directory:
     assert result["policy"]["signature_status"] == "not_checked"
     assert result["policy"]["source_status"] == "not_inspected"
     assert untouched == {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    receipt_file = root / diag.RECEIPT_NAME
+    receipt_file.write_text(json.dumps(dict(receipt, library_descriptor_sha256="0" * 64)), encoding="utf-8")
+    stale_descriptor = diag.get_build_diagnostics(root, verify_policy=False)
+    assert stale_descriptor["install"]["receipt_status"] == "mismatch"
+    assert stale_descriptor["package"]["mismatch_paths"] == ["griptape-nodes-library.json"]
+    receipt_file.write_bytes(untouched[receipt_file])
     # The image budget helper is part of the installed identity, including drift.
     limits_path = root / "_hmb_image_limits.py"
     limits_path.write_bytes(b"changed image budget fixture")
@@ -66,6 +72,12 @@ with tempfile.TemporaryDirectory(prefix="hmb-build-diag-") as directory:
     assert guard_drift["install"]["receipt_status"] == "mismatch"
     assert guard_drift["package"]["mismatch_paths"] == ["_hmb_deletion_guard.py"]
     guard_path.write_bytes(untouched[guard_path])
+    basket_path = root / "_hmb_shot_basket.py"
+    basket_path.write_bytes(b"changed basket fixture")
+    basket_drift = diag.get_build_diagnostics(root, verify_policy=False)
+    assert basket_drift["install"]["receipt_status"] == "mismatch"
+    assert basket_drift["package"]["mismatch_paths"] == ["_hmb_shot_basket.py"]
+    basket_path.write_bytes(untouched[basket_path])
     (root/"_hmb_common.py").write_bytes((ROOT/"_hmb_common.py").read_bytes())
     (root/"resources/agent/superwings12/hmb_agent_core.dat").write_bytes((ROOT/"resources/agent/superwings12/hmb_agent_core.dat").read_bytes())
     # Standalone signed verification must not initialize SDK/session modules or
@@ -113,7 +125,8 @@ with tempfile.TemporaryDirectory(prefix="hmb-build-override-") as directory:
     manifest_path = root/"griptape-nodes-library.json"
     manifest_path.write_text(json.dumps({"metadata":{"library_version":"0.8.9"}}), encoding="utf-8")
     rows = [{"path":name,"bytes":(root/name).stat().st_size,
-             "sha256":hashlib.sha256((root/name).read_bytes()).hexdigest()} for name in runtime_paths]
+             "sha256":hashlib.sha256((root/name).read_bytes()).hexdigest()}
+            for name in runtime_paths if name != "_hmb_shot_basket.py"]
     old_receipt = {"schema":"hmb-install-receipt","version":1,"release_version":"0.8.9",
                    "runtime_files":rows,"runtime_fingerprint_sha256":diag.inventory_fingerprint(rows)}
     receipt_path = root/diag.RECEIPT_NAME
@@ -127,6 +140,9 @@ with tempfile.TemporaryDirectory(prefix="hmb-build-override-") as directory:
     assert updated["install"]["recorded_library_version"] == "0.8.9"
     assert updated["package"]["verification_status"] == "not_checked"
     assert receipt_path.read_bytes() == saved_receipt
+    old_receipt["release_version"] = "0.8.11"
+    receipt_path.write_text(json.dumps(old_receipt), encoding="utf-8")
+    assert diag.get_build_diagnostics(root, verify_policy=False)["install"]["receipt_status"] == "invalid"
     # An unobserved future version is not a historical update record.
     old_receipt["release_version"] = "0.8.13"
     receipt_path.write_text(json.dumps(old_receipt), encoding="utf-8")

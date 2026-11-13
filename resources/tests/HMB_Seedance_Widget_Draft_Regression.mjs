@@ -5,11 +5,17 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
 
 const argument = (name) => { const index = process.argv.indexOf(name); return index < 0 ? "" : process.argv[index + 1] || ""; };
 const libraryRoot = path.resolve(argument("--library-root") || fileURLToPath(new URL("../..", import.meta.url)));
 const sourcePath = path.join(libraryRoot, "widgets/HMBSeedanceGenerationWidget.js");
 const source = fs.readFileSync(sourcePath, "utf8");
+// Keep media creation independent from mocked widget requestAnimationFrame.
+const playableVideo = execFileSync(process.env.HMB_COLOR_LUT_TEST_FFMPEG || "ffmpeg", [
+  "-nostdin", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+  "color=c=green:s=32x24:r=8:d=0.5", "-an", "-c:v", "libvpx", "-f", "webm", "pipe:1",
+], { timeout: 15000, maxBuffer: 1024 * 1024 }).toString("base64");
 const evidenceDir = argument("--evidence-dir");
 const receiptPath = argument("--receipt-path");
 const require = createRequire(import.meta.url);
@@ -28,7 +34,7 @@ try {
   page.on("pageerror", (error) => errors.push(error.message));
   await page.route("**/*", (route) => { receipt.external_requests += 1; return route.abort(); });
   await page.setContent('<!doctype html><meta charset="utf-8"><style>body{background:#080c14;color:#fff}.react-flow__node{width:650px;margin:12px}</style><main></main>');
-  await page.evaluate(async (code) => {
+  await page.evaluate(async ({code, playableVideo}) => {
     window.widget = await import(`data:text/javascript;base64,${btoa(unescape(encodeURIComponent(code)))}`);
     const ids = [1, 2, 3, 4].map((n) => `10000000-0000-4000-8000-${String(n).padStart(12, "0")}`);
     const catalog = { schema: "hmb-shot-routing-catalog", version: 1, publisher_instance_uuid: ids[0],
@@ -95,21 +101,14 @@ try {
         loads: f.loads, commands: f.commands.length };
     };
     window.makePlayablePreviewVideo = async () => {
-      const canvas = document.createElement("canvas"); canvas.width = 32; canvas.height = 24;
-      const context = canvas.getContext("2d"); context.fillStyle = "#10b981"; context.fillRect(0, 0, 32, 24);
-      const stream = canvas.captureStream(8);
-      const recorder = new MediaRecorder(stream, { mimeType: "video/webm;codecs=vp8" });
-      const chunks = []; recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
-      const stopped = new Promise((resolve) => recorder.addEventListener("stop", resolve, { once: true }));
-      recorder.start(); await new Promise((resolve) => setTimeout(resolve, 180)); recorder.stop(); await stopped;
-      stream.getTracks().forEach((track) => track.stop());
+      const bytes = Uint8Array.from(atob(playableVideo), char => char.charCodeAt(0));
       const video = document.createElement("video"); video.width = 600; video.height = 240; video.muted = true;
       video.setAttribute("data-raw-video-value", "https://fixture.invalid/retained.mp4");
       const ready = new Promise((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error("Native Chromium fixture did not reach canplay")), 3000);
         video.addEventListener("canplay", () => { clearTimeout(timeout); resolve(); }, { once: true });
       });
-      video.src = URL.createObjectURL(new Blob(chunks, { type: "video/webm" }));
+      video.src = URL.createObjectURL(new Blob([bytes], { type: "video/webm" }));
       await ready; return video;
     };
     window.addPlayablePreview = async (f) => {
@@ -122,7 +121,7 @@ try {
       const cleanup = f.cleanup; f.cleanup = () => { cleanup(); URL.revokeObjectURL(video.src); };
       return f;
     };
-  }, source);
+  }, {code: source, playableVideo});
   const check = async (name, callback) => {
     await callback(); receipt.cases.push({ name, passed: true });
     await page.evaluate(() => { window.fixtures.splice(0).forEach((f) => f.cleanup()); });

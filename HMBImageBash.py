@@ -1,4 +1,4 @@
-"""HMB adapter for the stock ImageBashModal; the Standard library is read only.
+"""HMB Image Bash node and the retained document contract for its editor.
 
 The editor's PNG is the authoritative render. A saved Apply transaction embeds
 that PNG and its scene/source receipt, so a later Run never substitutes a PIL
@@ -18,8 +18,8 @@ from pathlib import Path
 import sys
 import threading
 from typing import Any
-from types import SimpleNamespace, MethodType
-from urllib.parse import urlparse
+from types import SimpleNamespace
+from urllib.parse import unquote, urlparse
 import weakref
 from uuid import uuid4
 
@@ -30,18 +30,18 @@ if str(_ROOT) not in sys.path:
 from _hmb_deletion_guard import hmb_binding_mutation
 
 from griptape.artifacts import ImageUrlArtifact
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterGroup, ParameterList, ParameterMode
+from griptape_nodes.exe_types.node_types import DataNode
+from griptape_nodes.exe_types.param_components.project_file_parameter import ProjectFileParameter
 from griptape_nodes.files.file import File
+from griptape_nodes.traits.color_picker import ColorPicker
+from griptape_nodes.traits.options import Options
 from griptape_nodes.traits.widget import Widget
 from PIL import Image
 
-from _hmb_image_bash_compat import load_builtin_image_bash, require_standard_compatibility
 from _hmb_image_bash_render import render_scene
 from _hmb_image_bash_state import sync_scene, scene_fingerprint, validate_png_bytes
 
-# Restore the saved node even when the browser editor still needs review.
-# Apply, Run and completed-output restoration check the editor separately.
-_StockImageBash = load_builtin_image_bash(require_editor=False, inspect_editor=False)
 CONTEXT_SCHEMA = "hmb-image-bash-inputs-v1"
 RECEIPT_SCHEMA = "hmb-image-bash-apply-v1"
 HEADER_PARAMETER = "HMB_IMAGE_BASH_UI"
@@ -49,10 +49,39 @@ PREPARATION_SCHEMA = "hmb-image-bash-preparation-v1"
 _HIDDEN_UI = {"hide": True, "hide_property": True, "hide_label": True,
               "hide_handles": True, "height": 1, "min_height": 0, "max_height": 1}
 _PREPARE_WORKSPACE = "hmb-new-workspace-v1"
+EDITOR_SCHEMA = "hmb-image-bash-editor-v1"
+CANVAS_PRESETS = {
+    "2K Full": (2048, 1080), "2K Flat": (1998, 1080), "2K Scope": (2048, 858),
+    "4K Full": (4096, 2160), "4K Flat": (3996, 2160), "4K Scope": (4096, 1716),
+    "HD (16:9)": (1920, 1080), "UHD (4K, 16:9)": (3840, 2160),
+    "Square 2K": (2048, 2048), "Square 4K": (4096, 4096),
+    "YouTube Shorts / TikTok / Reels": (1080, 1920), "Instagram Square": (1080, 1080),
+    "Instagram Portrait": (1080, 1350), "Twitter Landscape": (1600, 900),
+    "Twitter Portrait": (1080, 1350), "Facebook Cover": (820, 312),
+}
+_DIMENSION_MODES = {ParameterMode.INPUT, ParameterMode.PROPERTY, ParameterMode.OUTPUT}
+_EMPTY_CANVAS = "data:image/svg+xml;base64," + base64.b64encode(
+    b'<svg width="1920" height="1080" xmlns="http://www.w3.org/2000/svg"><rect width="1920" height="1080" fill="#fffffa"/></svg>'
+).decode("ascii")
 
 
 class _ImageBashSourceError(ValueError):
     """An input raster could not be freshly read or decoded."""
+
+
+def _snapshot_driver(file: File) -> Any:
+    """Use SDK driver classification only when the acceleration seam is available."""
+    try:
+        from griptape_nodes.files.file import _resolve_file_path
+        from griptape_nodes.files.file_driver import FileDriverRegistry
+        signature = inspect.signature(_resolve_file_path)
+        arguments = (file._file_path,)
+        keywords = {"workflow": file.workflow} if "workflow" in signature.parameters else {}
+        signature.bind(*arguments, **keywords)
+    except (AttributeError, ImportError, TypeError, ValueError):
+        return None  # Unknown private API: keep the normal SDK file reader.
+    location = _resolve_file_path(*arguments, **keywords)
+    return FileDriverRegistry.get_driver(location)
 
 
 def _hmb_is_registered_node(node: Any, kind: str) -> bool:
@@ -335,8 +364,18 @@ def _busy(node: Any) -> bool:
     return str(getattr(state, "name", state)).casefold() == "resolving"
 
 
-class HMBImageBash(_StockImageBash):
-    """Stock editing UI with stable ImageAsset identities and verified Apply."""
+def _editor_layer(record: dict, index: int, canvas: dict, dimensions) -> dict:
+    width, height = dimensions(record["url"])
+    scale = min(1, canvas["width"] / width, canvas["height"] / height)
+    name = record.get("name") or Path(unquote(urlparse(record["url"]).path)).stem or f"Image Layer {index + 1}"
+    return {"id": f"canvas-img-{index + 1}", "source_id": record["id"], "src": record["url"],
+            "x": canvas["width"] / 2, "y": canvas["height"] / 2, "width": width, "height": height,
+            "rotation": 0, "scaleX": scale, "scaleY": scale, "type": "image", "name": name,
+            "opacity": 1, "visible": True, "order": index + 1}
+
+
+class HMBImageBash(DataNode):
+    """HMB-owned editor with stable ImageAsset identities and verified Apply."""
 
     def allow_incoming_connection(self, source_node: Any, source_parameter: Parameter, target_parameter: Parameter) -> bool:
         # A list output belongs on the ParameterList parent. Native SDKs may
@@ -353,6 +392,7 @@ class HMBImageBash(_StockImageBash):
         saved_size = deepcopy(incoming_metadata.get("size")) if isinstance(incoming_metadata, dict) and "size" in incoming_metadata else None
         self._hmb_syncing = True
         super().__init__(**kwargs)
+        self._add_editor_parameters()
         # Serialized user geometry is authoritative. The SDK's library
         # metadata width/height alone does not set the new node's geometry.
         if saved_size is not None:
@@ -377,8 +417,6 @@ class HMBImageBash(_StockImageBash):
             "Apply와 다르면 출력을 중단합니다."
         )
         self.get_parameter_by_name("output_image").tooltip = "검증된 Image Bash Apply 이미지입니다."
-        editor = self.get_parameter_by_name("bash_image")
-        editor.ui_options = {**editor.ui_options, "button_label": "Open HMBImageBash Editor"}
         # Media arrives only through REMOTE. Retain the native typed list for
         # validation/serialization, without exposing a second input workflow.
         images = self.get_parameter_by_name("input_images")
@@ -441,6 +479,35 @@ class HMBImageBash(_StockImageBash):
             # Older hosts can still prepare a source through the explicit selector.
             pass
         self._publish_header()
+
+    def _add_editor_parameters(self) -> None:
+        with ParameterGroup(name="canvas_details", ui_options={"collapsed": True}) as details:
+            Parameter(name="canvas_size", type="string", default_value="Custom",
+                      allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+                      traits={Options(choices=[*CANVAS_PRESETS, "Custom"])})
+            for name, value in (("width", 1920), ("height", 1080)):
+                Parameter(name=name, type="int", input_types=["int"], default_value=value,
+                          allowed_modes=set(_DIMENSION_MODES))
+            Parameter(name="background_color", type="str", default_value="#ffffff",
+                      allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY}, traits={ColorPicker(format="hex")})
+        self.add_node_element(details)
+        self.add_parameter(ParameterList(name="input_images", default_value=None, type="ImageArtifact",
+            input_types=["ImageArtifact", "ImageUrlArtifact"], allowed_modes={ParameterMode.INPUT},
+            tooltip="연결된 ImageAsset 작업 공간의 이미지 목록입니다."))
+        self.add_parameter(Parameter(name="output_image", type="ImageUrlArtifact",
+            input_types=["ImageArtifact", "ImageUrlArtifact"], allowed_modes={ParameterMode.OUTPUT},
+            ui_options={"expander": True}))
+        self.add_parameter(Parameter(name="bash_image", type="JsonArtifact", allowed_modes={ParameterMode.PROPERTY},
+            default_value={"value": _EMPTY_CANVAS, "name": "Canvas Project", "meta": {"input_images": [],
+                "konva_json": {"images": [], "lines": []}, "viewport": {"x": 0, "y": 0, "scale": 1,
+                    "center_x": 960, "center_y": 540}}},
+            traits={Widget(name="HMBImageBashWidget", library="HMB_GP_Production", synced_parameters=[HEADER_PARAMETER])},
+            ui_options={"display_name": "", "hide_label": True, "hide_handles": True, "is_full_width": True,
+                        "height": 40, "min_height": 40, "max_height": 40, "expandable": False}))
+        self.add_parameter(Parameter(name="comp_on_run", type="bool", default_value=False,
+            allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY}))
+        self._output_file = ProjectFileParameter(node=self, name="output_file", default_filename="image_bash.png")
+        self._output_file.add_parameter()
 
     def _remote_sources(self) -> list[tuple[Any, dict]]:
         from _hmb_shot_routing import _same_flow_nodes
@@ -1067,10 +1134,16 @@ class HMBImageBash(_StockImageBash):
         # the original-file URL through the SDK's existing local storage driver
         # so the canvas receives full-quality source bytes, on Windows/UNC too.
         editor_records = self._editor_records(records)
+        def dimensions(url):
+            with Image.open(BytesIO(_read_bytes(url))) as image:
+                return image.size
+
         def create(record, index):
-            return self._create_konva_layer(record, index, canvas["width"], canvas["height"])
+            return _editor_layer(record, index, canvas, dimensions)
         updated = sync_scene(project, editor_records, create, add_missing=add_missing)
-        hmb = updated.setdefault("meta", {}).setdefault("hmb_image_bash", {})
+        meta = updated.setdefault("meta", {})
+        meta["hmb_canvas"] = {key: canvas[key] for key in ("width", "height", "background_color")}
+        hmb = meta.setdefault("hmb_image_bash", {})
         hmb.update(self._apply_scope())
         return updated
 
@@ -1229,13 +1302,12 @@ class HMBImageBash(_StockImageBash):
             info = HMBImageBash._source_hashes(None, probe, cache=source_cache,
                 rgba_cache=rgba_cache, is_live=is_live, read_bytes=read)["input:dimensions"]
             return info["width"], info["height"]
-        view = SimpleNamespace(_get_image_dimensions=dimensions)
-        view._calculate_image_fit_and_position = MethodType(_StockImageBash._calculate_image_fit_and_position, view)
         def create(record, index):
-            return _StockImageBash._create_konva_layer(view, record, index,
-                task["canvas"]["width"], task["canvas"]["height"])
+            return _editor_layer(record, index, task["canvas"], dimensions)
         updated = sync_scene(task["project"], task["editor_records"], create)
-        hmb = updated.setdefault("meta", {}).setdefault("hmb_image_bash", {})
+        meta = updated.setdefault("meta", {})
+        meta["hmb_canvas"] = {key: task["canvas"][key] for key in ("width", "height", "background_color")}
+        hmb = meta.setdefault("hmb_image_bash", {})
         hmb.update(task["scope"])
         hmb.pop("pending_prepare", None)
         hashes = HMBImageBash._source_hashes(None, updated, cache=source_cache,
@@ -1524,6 +1596,10 @@ class HMBImageBash(_StockImageBash):
         if HMBImageBash._admit_pending_cold_assignment(self, project):
             return value
         try:
+            if meta.get("hmb_editor") == EDITOR_SCHEMA and (
+                    self._hmb_prepare_phase != "ready" or not self._hmb_editor_snapshot_id
+                    or hmb.get("editor_snapshot_id") != self._hmb_editor_snapshot_id):
+                raise ValueError("편집 중 입력 또는 장면이 바뀌었습니다. 현재 장면을 다시 열어 주세요.")
             self._validate_apply_source_bindings(project, self._records(), expected_scope=self._apply_scope())
         except Exception as exc:
             self._status("Apply 검증 실패: " + str(exc))
@@ -1573,7 +1649,6 @@ class HMBImageBash(_StockImageBash):
             return False
         records, canvas, scope = self._records(), self._canvas(), self._apply_scope()
         self._validate_apply_source_bindings(project, records, expected_scope=scope)
-        require_standard_compatibility()
         updated = self._sync_project(project, records, add_missing=False)
         read_paths = self._snapshot_read_paths(updated, project)
         if read_paths is None:
@@ -1671,10 +1746,11 @@ class HMBImageBash(_StockImageBash):
     @staticmethod
     def _snapshot_read_paths(*projects: dict, records: list[dict] | None = None) -> dict | None:
         """Resolve SDK path policy on the host; raster I/O belongs to the worker."""
-        from griptape_nodes.files.file import _resolve_file_path
-        from griptape_nodes.files.file_driver import FileDriverRegistry
-        from griptape_nodes.files.drivers.local_file_driver import LocalFileDriver
-        from griptape_nodes.files.drivers.static_server_file_driver import StaticServerFileDriver
+        try:
+            from griptape_nodes.files.drivers.local_file_driver import LocalFileDriver
+            from griptape_nodes.files.drivers.static_server_file_driver import StaticServerFileDriver
+        except ImportError:
+            return None
         urls = {row.get("url", "") for row in records or []}
         for project in projects:
             if _url(project):
@@ -1687,10 +1763,10 @@ class HMBImageBash(_StockImageBash):
                 continue
             # Custom/subclass drivers may enforce additional policy. Only the
             # reviewed stock local transports admit direct snapshot reads.
-            location = _resolve_file_path(File(url)._file_path)
-            if type(FileDriverRegistry.get_driver(location)) not in {LocalFileDriver, StaticServerFileDriver}:
+            file = File(url)
+            if type(_snapshot_driver(file)) not in {LocalFileDriver, StaticServerFileDriver}:
                 return None
-            resolved = File(url).resolve()
+            resolved = file.resolve()
             if urlparse(resolved).scheme in {"http", "https"}:
                 return None
             paths[url] = resolved
@@ -1698,10 +1774,7 @@ class HMBImageBash(_StockImageBash):
 
     @staticmethod
     def _snapshot_driver_lease(paths: dict) -> tuple:
-        from griptape_nodes.files.file import _resolve_file_path
-        from griptape_nodes.files.file_driver import FileDriverRegistry
-        return tuple((url, FileDriverRegistry.get_driver(_resolve_file_path(File(url)._file_path)))
-                     for url in sorted(paths))
+        return tuple((url, _snapshot_driver(File(url))) for url in sorted(paths))
 
     @staticmethod
     def _snapshot_read(task: dict, url: str) -> bytes:
@@ -1718,9 +1791,6 @@ class HMBImageBash(_StockImageBash):
         view._records = lambda: deepcopy(task["records"])
         view._canvas = lambda: deepcopy(task["canvas"])
         view._apply_scope = lambda: deepcopy(task["scope"])
-        # Admission checked on the host; completion checks current registration
-        # again. These are private view callables, never serialized bypass flags.
-        view._hmb_compatibility_check = lambda: None
         view._hmb_read_apply_bytes = lambda url: HMBImageBash._snapshot_read(task, url)
         view._validate_apply_source_bindings = HMBImageBash._validate_apply_source_bindings
         view._render_layers = HMBImageBash._render_layers
@@ -1949,7 +2019,6 @@ class HMBImageBash(_StockImageBash):
             records = self._records()
             scope, admission_epoch, admission_canvas = self._apply_scope(), self._hmb_apply_epoch, self._canvas()
             self._validate_apply_source_bindings(project, records, expected_scope=scope)
-            getattr(self, "_hmb_compatibility_check", require_standard_compatibility)()
             updated = self._sync_project(project, records, add_missing=False)
             source_cache = {}
             rgba_cache = OrderedDict()
@@ -2069,7 +2138,7 @@ class HMBImageBash(_StockImageBash):
                 repr(self.get_parameter_value("output_file")))
 
     def _adopt_verified_saved_editor_scope(self, project: dict, records: list[dict]) -> bool:
-        """Renew only a saved editor's transient lease after PNG verification.
+        """Renew a saved editor's lease and view data after PNG verification.
 
         Callers have already checked the retained receipt, source rasters and
         exact saved output PNG. A workflow reload creates a fresh Python node;
@@ -2114,9 +2183,12 @@ class HMBImageBash(_StockImageBash):
         except ValueError:
             return False
         snapshot = getattr(self, "_hmb_editor_snapshot_id", "")
+        canvas = self._canvas()
+        view = {key: canvas[key] for key in ("width", "height", "background_color")}
         if (hmb["node_instance_uuid"] != scope["node_instance_uuid"]
-                or not snapshot or hmb.get("editor_snapshot_id") != snapshot):
+                or not snapshot or hmb.get("editor_snapshot_id") != snapshot or meta.get("hmb_canvas") != view):
             updated = deepcopy(project)
+            updated["meta"]["hmb_canvas"] = view
             updated["meta"]["hmb_image_bash"]["node_instance_uuid"] = scope["node_instance_uuid"]
             self._set_project(updated)
         self._hmb_prepare_phase, self._hmb_prepare_error = "ready", ""
@@ -2186,7 +2258,6 @@ class HMBImageBash(_StockImageBash):
         read_paths = self._snapshot_read_paths(project, {"value": path}, records=records)
         if read_paths is None:
             return False
-        require_standard_compatibility()
         canvas = self._canvas()
         self._hmb_apply_epoch += 1
         self._hmb_apply_pending = self._hmb_prepare_pending = None
@@ -2215,7 +2286,7 @@ class HMBImageBash(_StockImageBash):
         """Pure file snapshot checks; no SDK, graph, publication or file write."""
         rgba_cache = OrderedDict()
         read = lambda url: HMBImageBash._snapshot_read(task, url)
-        view = SimpleNamespace(_hmb_compatibility_check=lambda: None)
+        view = SimpleNamespace()
         view._canvas = lambda: task["canvas"]
         view._source_hashes = lambda project, **kwargs: HMBImageBash._source_hashes(
             None, project, **{**kwargs, "rgba_cache": rgba_cache, "is_live": is_live, "read_bytes": read})
@@ -2263,7 +2334,6 @@ class HMBImageBash(_StockImageBash):
             self._status("저장본 준비 실패: " + result["error"] + " · 기존 장면과 완료 파일은 유지됩니다.")
             return False
         try:
-            require_standard_compatibility()
             if not self._cold_restore_task_current(task):
                 self._discard_apply_task(task)
                 return False
@@ -2341,7 +2411,6 @@ class HMBImageBash(_StockImageBash):
         return super().after_node_deleted()
 
     def _verify_apply(self, project: dict, records: list[dict], *, rgba_cache: OrderedDict | None = None) -> tuple[bytes, dict]:
-        getattr(self, "_hmb_compatibility_check", require_standard_compatibility)()
         receipt = project.get("meta", {}).get("hmb_image_bash", {}).get("apply", {})
         if receipt.get("schema") != RECEIPT_SCHEMA:
             raise ValueError("편집기에서 Apply한 저장본이 없습니다.")
@@ -2370,6 +2439,17 @@ class HMBImageBash(_StockImageBash):
         self._hmb_value_callback_depth += 1
         try:
             result = super().after_value_set(parameter, value)
+            if parameter.name == "canvas_size":
+                dimensions = CANVAS_PRESETS.get(value) if isinstance(value, str) else None
+                for index, name in enumerate(("width", "height")):
+                    dimension = self.get_parameter_by_name(name)
+                    dimension.allowed_modes = {ParameterMode.OUTPUT} if dimensions else set(_DIMENSION_MODES)
+                    if dimensions:
+                        self.publish_update_to_parameter(name, dimensions[index])
+            elif "input_images" in parameter.name:
+                self._handle_input_images_change(value)
+            elif parameter.name == "bash_image" and value is not None:
+                self._handle_bash_image_change(value)
             if parameter.name == "image_bash_context":
                 self._sync_metadata_with_input_images()
             elif parameter.name in {"width", "height", "background_color", "canvas_size"}:
@@ -2377,6 +2457,11 @@ class HMBImageBash(_StockImageBash):
             return result
         finally:
             self._hmb_value_callback_depth -= 1
+
+    def after_incoming_connection_removed(self, source_node, source_parameter, target_parameter) -> None:
+        if "input_images" in target_parameter.name:
+            self._sync_metadata_with_input_images()
+        super().after_incoming_connection_removed(source_node, source_parameter, target_parameter)
 
     def _process_output_image(self) -> None:
         """Check the corrected compositor without publishing a mismatched render."""
@@ -2483,7 +2568,6 @@ class HMBImageBash(_StockImageBash):
             cold_restore = self._hmb_cold_restore_pending
             self._hmb_cold_restore_pending = None
             self._hmb_apply_epoch += 1
-            require_standard_compatibility()
             if self.get_parameter_value("comp_on_run") is True:
                 if cold_restore is not None:
                     project = _document(self.get_parameter_value("bash_image"))

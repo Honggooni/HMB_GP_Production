@@ -3,7 +3,8 @@
 Only official retained connection/metadata requests mutate the graph. A short
 transaction holds node callbacks so disconnecting never becomes a destructive
 source-clear operation. Durable per-relation fences stop automatic rebinding.
-No provider, renderer, media decoder, file probe or account operation is used.
+No provider, renderer or account operation is used. Refresh may schedule the
+existing local source check for an exact connected Image Bash workspace.
 """
 from __future__ import annotations
 
@@ -129,6 +130,8 @@ def _busy(node: Any) -> bool:
         return True
     if getattr(node, "_hmb_active_operation", None) is not None or getattr(node, "_hmb_pending_operation_id", ""):
         return True
+    if _metadata(node).get("node_type") == "HMBAnalysisAgent" and getattr(node, "_job", None) is not None:
+        return True
     # Web rerenders run in an isolated facade while the retained Generator can
     # remain RESOLVED. Its owner event/claim still protects the live sources.
     generation_active = getattr(node, "_generation_run_active", None)
@@ -187,6 +190,9 @@ def _wire_rows(engine: Any, node: Any) -> list[dict]:
 
 def _shots(source: Any, target: Any) -> list[dict]:
     from _hmb_shot_routing import _subscription_for, _manager_shot_subscriptions, _is_shot_manager
+    declared = getattr(target, "_hmb_connection_dependency_shots", None)
+    if callable(declared):
+        return declared(source)
     sub = _subscription_for(target)
     if sub is None:
         return []
@@ -384,6 +390,12 @@ def _validate_shots(row: dict, source: Any, target: Any) -> None:
                 if isinstance(shot, dict) and shot.get("channel_uuid") and shot.get("shot_uuid")}
     if not expected:
         return
+    declared = getattr(target, "_hmb_connection_dependency_shots", None)
+    if callable(declared):
+        actual = {(item["channel_uuid"], item["shot_uuid"]) for item in declared(source, include_suspended=True)}
+        if not expected <= actual:
+            raise ValueError("원래 분석 샷 또는 Prompt 연결이 변경되었습니다.")
+        return
     for node in (source, target):
         sub = _subscription_for(node)
         if sub is None or not sub.enabled:
@@ -478,6 +490,8 @@ def describe(engine: Any, node_name: str) -> dict:
     return dict(node_name=node.name, detached=detached, state_token=token,
                 can_disconnect=bool(rows) and not detached and not reason,
                 can_reconnect=bool(rows) and detached and not reason,
+                can_refresh=bool(rows) and not detached and not reason and not missing
+                    and not target_has_suspended_role(node),
                 can_forget_missing=bool(missing) and not forget_reason,
                 missing_count=len(missing), forget_missing_reason=forget_reason or (
                     f"삭제된 상대의 연결 기록 {len(missing)}개를 정리할 수 있습니다." if missing else "삭제된 상대의 연결 기록이 없습니다."),
@@ -540,9 +554,72 @@ def _native(engine: Any, operation: str, row: dict) -> None:
         raise ValueError(str(result.result_details))
 
 
+def _refresh_retained_bindings(engine: Any, relations: list[dict], nodes: dict, verify: Any, *, detached: bool = False) -> bool | None:
+    """Rehydrate approved live projections without replaying graph callbacks."""
+    callbacks = {}
+    connections = engine.flow_manager.get_connections()
+    all_confirmed = True
+    for row in relations:
+        source, target = nodes[row["source_node_name"]], nodes[row["target_node_name"]]
+        if row.get("kind") == "remote":
+            if detached or not relationship_suspended(source, target):
+                callback = getattr(target, "_hmb_refresh_retained_analysis_binding", None)
+                if callable(callback):
+                    callbacks[(id(target), id(source))] = (callback, (source,), {}, True)
+            continue
+        if detached or row.get("kind") != "wire":
+            continue
+        output, port = row["source_parameter_name"], row["target_parameter_name"]
+        if target_has_suspended_role(target) or relationship_suspended(source, target, source_parameter=output, target_parameter=port):
+            continue
+        source_port, target_port = source.get_parameter_by_name(output), target.get_parameter_by_name(port)
+        if (source_port is None or target_port is None or not any(
+                edge.source_node is source and edge.source_parameter is source_port
+                and edge.target_node is target and edge.target_parameter is target_port
+                for edge in connections.get_incoming_connections_to_parameter(target, target_port))):
+            all_confirmed = False
+            continue
+        if _metadata(target).get("library") != LIBRARY:
+            continue
+        kind = _metadata(target).get("node_type")
+        method, args, kwargs, key, requires_true = "", (), {}, (id(target), port), False
+        if kind == "HMBPromptLibrary" and port in {"IMAGE_ASSET_IN", "PICKER_IN", "SHOT_ASSET_IN", "SHOT_PICKER_IN", "SOUND_IN"}:
+            method, kwargs, key = "_reconcile_initial_prompt_hydration", {"schedule_after": False}, id(target)
+            requires_true = True
+        elif kind == "HMBAgentLibrary" and (output, port) == ("PROMPT_OUT", "SHOT_PROMPT_IN"):
+            method, args = "_hmb_refresh_retained_prompt_binding", (source,)
+            requires_true = True
+        elif kind == "HMBSeedanceGeneration" and port == "prompt":
+            method, kwargs = "_hmb_refresh_managed_prompt_projection", {"source_node": source}
+        elif kind == "HMBSeedanceGeneration" and port == "SHOT_SOUND_IN":
+            method = "_hmb_refresh_prompt_sound_audio"
+        elif kind == "HMBFinishLookLibrary" and port == "FINISH_LOOK_REMOTE_IN" and not getattr(target, "_remote_connected", False):
+            # Native restore may recreate the link with the connection hooks
+            # held. This hook reprojects the binding from the existing state.
+            method, args = "after_incoming_connection", (source, source_port, target_port)
+        elif (kind == "HMBImageBash" and (output, port) == ("IMAGE_BASH_CONTEXT_OUT", "image_bash_context")
+                and row.get("workspace_id") and _metadata(source).get("node_type") == "HMBImageAssetLibrary"):
+            callback = getattr(source, "_hmb_retry_image_bash_inputs", None)
+            if callable(callback):
+                callbacks[key] = (callback, (target, row["workspace_id"]), {}, True)
+        callback = getattr(target, method, None) if method else None
+        if callable(callback):
+            callbacks[key] = (callback, args, kwargs, requires_true)
+    for callback, args, kwargs, requires_true in callbacks.values():
+        verify()
+        try:
+            status = callback(*args, **kwargs)
+            if requires_true and status is not True and not (isinstance(status, dict) and status.get("ready") is True):
+                all_confirmed = False
+        except Exception:
+            all_confirmed = False
+    verify()
+    return all_confirmed if callbacks or not all_confirmed else None
+
+
 @hmb_binding_management
 def manage(engine: Any, node_name: str, operation: str, expected_state_token: str) -> dict:
-    if operation not in {"disconnect", "reconnect", "forget_missing"} or not isinstance(expected_state_token, str) or not expected_state_token:
+    if operation not in {"disconnect", "reconnect", "refresh", "forget_missing"} or not isinstance(expected_state_token, str) or not expected_state_token:
         raise ValueError("연결 관리 요청이 올바르지 않습니다.")
     with _LOCK:
         before = describe(engine, node_name)
@@ -564,6 +641,16 @@ def manage(engine: Any, node_name: str, operation: str, expected_state_token: st
         def verify():
             if _context(engine) != context or any(engine.node_manager.get_node_by_name(name) is not value for name, value in participants.items()):
                 raise ValueError("연결 관리 중 워크플로 또는 노드가 변경되었습니다.")
+        if operation == "refresh":
+            if any(_busy(value) for value in participants.values()):
+                raise ValueError("연결 상대가 실행 중이거나 잠겨 있습니다.")
+            confirmed = _refresh_retained_bindings(engine, relations, nodes, verify)
+            details = {
+                True: "현재 연결과 연결 입력을 새로고침했습니다. 샷과 결과는 유지됩니다.",
+                False: "현재 연결은 유지됐지만 일부 입력 새로고침을 확인하지 못했습니다.",
+                None: "현재 연결을 확인했습니다. 연결된 값은 실행 시 읽습니다.",
+            }
+            return {**describe(engine, node_name), "refresh_confirmed": confirmed, "details": details[confirmed]}
         def persist(value, metadata):
             verify()
             _persist(engine, value, metadata)
@@ -659,7 +746,12 @@ def manage(engine: Any, node_name: str, operation: str, expected_state_token: st
             raise
         if operation == "reconnect":
             from _hmb_shot_routing import schedule_post_hydration_reconcile
+            confirmed = _refresh_retained_bindings(engine, relations, nodes, verify)
             schedule_post_hydration_reconcile(node)
+            if confirmed is False:
+                return {**describe(engine, node_name), "details": "연결을 복구했습니다. 일부 입력은 새로고침을 다시 시도하세요."}
+        if operation == "disconnect":
+            _refresh_retained_bindings(engine, relations, nodes, verify, detached=True)
         return describe(engine, node_name)
 
 
@@ -775,6 +867,8 @@ def install_request_handlers(engine: Any, registration: Any) -> Any:
             state_token: str = ""
             can_disconnect: bool = False
             can_reconnect: bool = False
+            can_refresh: bool = False
+            refresh_confirmed: bool | None = None
             can_forget_missing: bool = False
             missing_count: int = 0
             forget_missing_reason: str = ""

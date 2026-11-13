@@ -56,17 +56,12 @@ async def exercise(engine):
         if definition.class_name in classes:library.register_lazy_node_type(definition.class_name,definition.metadata,lambda cls=classes[definition.class_name]:cls)
     engine.event_manager.initialize_queue();ensured=engine.handle_request(EnsureWorkflowAndFlowRequest(flow_name="OfflineReadOnlyPreflight"));assert ensured.succeeded()
     flow=engine.flow_manager.get_flow_by_name(ensured.flow_name)
+    workflow=engine.open_workflows.get(ensured.workflow_id)
     def register(node):
-        node.metadata.update(library=schema.name, node_type=type(node).__name__)
+        node.metadata.update(library=schema.name,node_type=type(node).__name__)
         flow.add_node(node)
-        current = getattr(engine, "current_workflow_or_none", None)
-        if callable(current):
-            workflow = current()
-            engine.object_manager.add_object_by_name_in(workflow, node.name, node)
-            workflow.nodes.name_to_parent_flow_name[node.name] = flow.name
-        else:
-            engine.object_manager.add_object_by_name(node.name, node)
-            engine.node_manager._name_to_parent_flow_name[node.name] = flow.name
+        engine.object_manager.add_object_by_name_in(workflow,node.name,node)
+        workflow.nodes.name_to_parent_flow_name[node.name]=flow.name
         return node
     with ExitStack() as setup:
         for name in ["schedule_post_registration_reconcile","schedule_post_hydration_reconcile"]:setup.enter_context(mock.patch.object(routing,name,lambda *a,**k:False))

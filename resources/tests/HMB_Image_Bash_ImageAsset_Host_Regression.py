@@ -147,12 +147,14 @@ async def exercise(engine):
         assert context_output.ui_options["hide"] is True and context_output.ui_options["hide_handles"] is True
         node._hmb_import_media_by_uid = {}
         node._hmb_resolution_cache = OrderedDict()
+        state[source.WIDGET_RUNTIME_LEASE_KEY] = node._hmb_widget_runtime_lease
         legacy = deepcopy(state)
         legacy.update(image_bash_workspace={}, image_bash_active=False)
         node.set_parameter_value(source.WIDGET_STATE_PARAMETER, source._json_text(legacy), initial_setup=True)
         # Every compact UI edit includes the absent workspace too. That
         # default must not prevent editing an existing five-Shot workflow.
         legacy_edit = dict(schema=source.IMAGE_ASSET_EDIT_SCHEMA, version=1, ui_edit_revision=1,
+            widget_runtime_lease=node._hmb_widget_runtime_lease,
             catalog_identity={key: legacy.get(key) for key in ("catalog_root", "project_root", "project_uid",
                 "project_cache_uid", "manifest_signature", "folder_signature", "scan_revision")},
             selected_source_uids=[row["source_uid"] for row in legacy["assets"] if row["selected"]],
@@ -166,9 +168,14 @@ async def exercise(engine):
         # Restore through the native initial-setup setter; no command may be
         # executed by saving/reopening or selecting the dedicated workspace.
         state[source.UI_EDIT_REVISION_KEY] = 2
-        node.set_parameter_value(source.WIDGET_STATE_PARAMETER, source._json_text(state), initial_setup=True)
+        # Fixture setup uses the canonical publisher; interactive edits below
+        # go through the current explicit workspace mutation protocol.
+        node._publish_state(deepcopy(state))
+        state = deepcopy(node._current_state())
+        shots_before = deepcopy(state["shot_routing"])
         compact = deepcopy(legacy_edit)
-        compact.update(ui_edit_revision=3,
+        compact.update(ui_edit_revision=3, widget_runtime_lease=node._hmb_widget_runtime_lease,
+            catalog_identity={key: state.get(key) for key in legacy_edit["catalog_identity"]},
             edits=dict(shot_routing=deepcopy(state["shot_routing"]),
                 image_bash_workspace=deepcopy(state["image_bash_workspace"]), image_bash_active=False))
         assert node._expand_widget_edit(compact)["image_bash_workspace"] == state["image_bash_workspace"]
@@ -187,12 +194,7 @@ async def exercise(engine):
             else:
                 workspace["instances"].append(dict(instance_id=str(uuid4()), source_uid="not-in-catalog"))
                 workspace["revision"] += 1
-            try:
-                node._expand_widget_edit(bad)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("Workspace authority guard accepted " + fault)
+            assert node._expand_widget_edit(bad)["image_bash_workspace"] == state["image_bash_workspace"], fault
         before_count = len(engine.flow_manager.get_flow_by_name(ensured.flow_name).nodes)
         node._sync_image_bash_output(state)
         assert len(engine.flow_manager.get_flow_by_name(ensured.flow_name).nodes) == before_count
@@ -270,22 +272,28 @@ async def exercise(engine):
         # the native port pair and update the connected Bash without Run.
         initial_instances = deepcopy(node._current_state()["image_bash_workspace"]["instances"])
         added = dict(instance_id=str(uuid4()), source_uid="import:a")
-        sequences = [initial_instances + [added], [added] + initial_instances,
-                     [added] + initial_instances[1:], initial_instances]
+        sequences = [initial_instances[:2] + [added] + initial_instances[2:], [added] + initial_instances, initial_instances]
+        commands = [dict(operation="copy", instance_id=initial_instances[1]["instance_id"], new_instance_id=added["instance_id"]),
+                    dict(operation="reorder", instance_id=added["instance_id"], target_instance_id=initial_instances[0]["instance_id"]),
+                    dict(operation="remove", instance_id=added["instance_id"])]
         with mock.patch.object(node, "process", side_effect=AssertionError("ImageAsset Run forbidden")), \
              mock.patch.object(target, "process", side_effect=AssertionError("Image Bash Run forbidden")):
-            for requested_instances in sequences:
+            for requested_instances, fields in zip(sequences, commands):
                 current = node._current_state()
                 workspace = deepcopy(current["image_bash_workspace"])
                 workspace["instances"] = deepcopy(requested_instances)
                 workspace["revision"] += 1
                 edit = dict(schema=source.IMAGE_ASSET_EDIT_SCHEMA, version=1,
+                    widget_runtime_lease=node._hmb_widget_runtime_lease,
                     ui_edit_revision=current[source.UI_EDIT_REVISION_KEY] + 1,
                     catalog_identity={key: current.get(key) for key in ("catalog_root", "project_root", "project_uid",
                         "project_cache_uid", "manifest_signature", "folder_signature", "scan_revision")},
                     selected_source_uids=[row["source_uid"] for row in current["assets"] if row["selected"]],
                     edits=dict(shot_routing=deepcopy(current["shot_routing"]), image_bash_workspace=workspace,
                                image_bash_active=True))
+                edit["edits"][source.IMAGE_BASH_WORKSPACE_EDIT_KEY] = dict(
+                    schema=source.IMAGE_BASH_WORKSPACE_EDIT_SCHEMA, version=1, operation_id=str(uuid4()),
+                    workspace_id=workspace["workspace_id"], expected_revision=current["image_bash_workspace"]["revision"], **fields)
                 changed = engine.handle_request(SetParameterValueRequest(node_name=node.name,
                     parameter_name=source.WIDGET_STATE_PARAMETER, value=source._json_text(edit)))
                 assert changed.succeeded(), changed.result_details
@@ -575,7 +583,7 @@ async def exercise(engine):
         second_state["image_bash_workspace"]["workspace_id"] = str(uuid4())
         for instance in second_state["image_bash_workspace"]["instances"]:
             instance["instance_id"] = str(uuid4())
-        second.set_parameter_value(source.WIDGET_STATE_PARAMETER, source._json_text(second_state), initial_setup=True)
+        second._publish_state(deepcopy(second_state))
         second._sync_image_bash_output(second_state)
         second_id = second_state["image_bash_workspace"]["workspace_id"]
         second_pair = second._hmb_image_bash_snapshot(second_id)
@@ -599,15 +607,19 @@ async def exercise(engine):
                         newer["image_bash_workspace"]["revision"] += 1
                     else:
                         newer["shot_routing"]["channel_uuid"] = str(uuid4())
-                    second.set_parameter_value(source.WIDGET_STATE_PARAMETER, source._json_text(newer), initial_setup=True)
+                    second._publish_state(deepcopy(newer))
                 return result
             with mock.patch.object(GriptapeNodes, "handle_request", side_effect=change_workspace_mid_connection):
                 expect_rejected(lambda: second._hmb_bind_image_bash_workspace(child_target, second_id), "mid-bind " + mutation)
             assert fired
             assert not engine.handle_request(ListConnectionsForNodeRequest(node_name=child_target.name)).incoming_connections
             assert transport_view(child_target) == empty_target
-            second.set_parameter_value(source.WIDGET_STATE_PARAMETER, source._json_text(second_state), initial_setup=True)
-            assert second._hmb_image_bash_snapshot(second_id) == second_pair
+            second._publish_state(deepcopy(second_state))
+            second._sync_image_bash_output(second._current_state())
+            observed = second._hmb_image_bash_snapshot(second_id)
+            assert observed[1] == second_pair[1], mutation
+            assert [(item.name, item.value) for item in observed[0]] == [
+                (item.name, item.value) for item in second_pair[0]], mutation
         def fail_new_context(request):
             if isinstance(request, CreateConnectionRequest) and request.target_node_name == child_target.name and request.target_parameter_name == "image_bash_context":
                 return CreateConnectionResultFailure(result_details="Synthetic transactional second-wire failure")
@@ -673,7 +685,16 @@ async def exercise(engine):
         assert [c.name for c in restored_children] == [c.name for c in old_child], ([c.name for c in restored_children], [c.name for c in old_child])
         assert all(current is original for current, original in zip(restored_children, old_child))
         assert {c.name: child_target.get_parameter_value(c.name) for c in restored_children} == old_child_values
-        assert transport_view(child_target) == before_failed_unbind
+        restored_transport = transport_view(child_target)
+        def image_values(value):
+            if isinstance(value, list) and all(hasattr(item, "value") for item in value):
+                return [(item.name, item.value) for item in value]
+            return value
+        before_failed_unbind["images"] = image_values(before_failed_unbind["images"])
+        restored_transport["images"] = image_values(restored_transport["images"])
+        assert restored_transport == before_failed_unbind, [
+            key for key, value in before_failed_unbind.items() if restored_transport[key] != value
+        ]
         assert len(engine.handle_request(ListConnectionsForNodeRequest(node_name=child_target.name)).incoming_connections) == 2
         foreign_child = []
         def foreign_edit_after_parent_clear(request):
@@ -863,10 +884,15 @@ async def exercise(engine):
             next_workspace["instances"].append(dict(instance_id=str(uuid4()), source_uid=new_uid))
             import_edit = dict(schema=source.IMAGE_ASSET_EDIT_SCHEMA, version=1,
                 ui_edit_revision=imported_state[source.UI_EDIT_REVISION_KEY] + 1,
+                widget_runtime_lease=imported_source._hmb_widget_runtime_lease,
                 catalog_identity={key: imported_state.get(key) for key in ("catalog_root", "project_root", "project_uid",
                     "project_cache_uid", "manifest_signature", "folder_signature", "scan_revision")},
                 selected_source_uids=[row["source_uid"] for row in imported_state["assets"] if row["selected"]],
-                edits=dict(shot_routing=deepcopy(import_shots), image_bash_workspace=next_workspace, image_bash_active=True))
+                edits=dict(shot_routing=deepcopy(import_shots), image_bash_workspace=next_workspace, image_bash_active=True,
+                    image_bash_workspace_edit=dict(schema=source.IMAGE_BASH_WORKSPACE_EDIT_SCHEMA, version=1,
+                        operation_id=str(uuid4()), operation="add", workspace_id=import_workspace["workspace_id"],
+                        expected_revision=import_workspace["revision"], source_uid=new_uid,
+                        new_instance_id=next_workspace["instances"][-1]["instance_id"])))
             accepted = engine.handle_request(SetParameterValueRequest(node_name=imported_source.name,
                 parameter_name=source.WIDGET_STATE_PARAMETER, value=source._json_text(import_edit), broadcast_result=False))
             assert accepted.succeeded(), accepted.result_details

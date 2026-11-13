@@ -381,7 +381,10 @@ def _bindings(job, objects, markers):
         if kind not in {"solid", "pattern"}:
             raise RuntimeError("Unsupported Blender marker kind for '{}'.".format(color))
         obj = objects.get(path)
-        if obj is None:
+        # Never replace a missing saved instance path with a similarly named
+        # object from another parent or linked asset. Legacy name-only rows
+        # still resolve when that name is unique.
+        if obj is None and not path.startswith("|"):
             candidates = [item for item in objects.values() if item.name == path or item.name == _clean(row.get("group_name"))]
             if len(candidates) == 1:
                 obj = candidates[0]

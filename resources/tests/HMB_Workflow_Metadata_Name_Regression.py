@@ -233,6 +233,24 @@ def rejection_and_rollback_case():
 
 
 async def main():
+    with engine_scope() as engine:
+        if hasattr(engine, "current_workflow_or_none"):
+            from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
+            opened = engine.handle_request(EnsureWorkflowAndFlowRequest(flow_name="MetadataFlow", display_name="Private Metadata"))
+            check("native workflow opened", opened.succeeded())
+            runtime = engine.current_workflow()
+            flow = engine.flow_manager.get_flow_by_name(opened.flow_name)
+            key = engine.context_manager.get_current_workflow_name()
+            check("exact native key resolves", engine.handle_request(GetWorkflowMetadataRequest(workflow_name=key)).succeeded())
+            check("unrelated legacy name cannot acquire current workflow",
+                not engine.handle_request(GetWorkflowMetadataRequest(workflow_name="workflow_2")).succeeded())
+            saved = await engine.ahandle_request(SaveWorkflowRequest(
+                file_name=str(Path(private.name) / "exact-name.py"), display_name="Private Metadata", broadcast_result=False))
+            check("native Save preserves runtime and flow", saved.succeeded() and Path(saved.file_path).is_file()
+                and engine.current_workflow() is runtime and engine.flow_manager.get_flow_by_name(flow.name) is flow)
+            check("saved native key resolves", engine.handle_request(GetWorkflowMetadataRequest(workflow_name=saved.workflow_name)).succeeded())
+            print(json.dumps({"passed": True, "checks": checks, "scope": "native workflow names; historical unregistered aliases require the legacy SDK"}))
+            return
     for name in ("workflow", "workflow_1", "workflow_2", "Custom HMB Canvas"):
         await exact_name_case(name)
     registered_mismatch_case()

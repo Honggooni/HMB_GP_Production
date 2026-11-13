@@ -116,11 +116,11 @@ assert.deepEqual(
 );
 assert.deepEqual(
   compatibleVideoRoleChoices({ video_main_type: "Maya Preview / Playblast" }),
-  ["Original Preview", "Mask", "Depth", "Motion Guide", "Timing / Edit"],
+  ["Original Preview", "Mask", "Depth", "Motion Guide", "Timing / Edit", "Analysis"],
 );
 assert.deepEqual(
   compatibleVideoRoleChoices({ video_main_type: "Blender Preview / Render" }),
-  ["Original Preview", "Mask", "Depth", "Motion Guide", "Timing / Edit"],
+  ["Original Preview", "Mask", "Depth", "Motion Guide", "Timing / Edit", "Analysis"],
 );
 const blenderCompanions = normalizeState({ videos: [
   { slot: 1, label: "depth.mp4", present: true, media_kind: "blender_depth_render" },
@@ -136,7 +136,7 @@ assert.equal(blenderCompanions.videos[1].picker_motion_guide_summary.target_coun
 assert.deepEqual(blenderCompanions.videos[1].picker_motion_guide_summary.semantic_groups, []);
 assert.deepEqual(
   compatibleVideoRoleChoices({ video_main_type: "Motion Reference" }),
-  ["Local Motion", "Secondary Motion", "Layout Reference"],
+  ["Local Motion", "Secondary Motion", "Layout Reference", "Analysis"],
 );
 
 // Saved UI state and every subtype transition use the same explicit wire
@@ -166,7 +166,7 @@ for (const [language, label] of [["ko", "레이아웃 참조"], ["en", "Layout R
   );
   assert.equal(select.value, "Layout Reference");
   assert.ok(select.innerHTML.includes(`value="Layout Reference" selected>${label}</option>`));
-  assert.equal((select.innerHTML.match(/<option /g) || []).length, 3);
+  assert.equal((select.innerHTML.match(/<option /g) || []).length, 4);
 }
 
 // Picker provenance sanitization must not rewrite its captured taxonomy values.

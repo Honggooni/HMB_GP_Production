@@ -6,8 +6,9 @@ const out=path.resolve(process.env.HMB_AUTHORITY_TIMEOUT_REPORT_DIR||path.join(r
 const main=fs.readFileSync(path.join(productRoot,'widgets/HMBImageAssetLibraryWidget.js'),'utf8'),bridge=fs.readFileSync(path.join(productRoot,'widgets/HMBImageAssetThumbnailPatchBridgeWidget.js'),'utf8');
 const baseline=process.argv.includes('--baseline'),browser=await nativeTestPlaywright().chromium.launch({headless:true,executablePath:nativeTestBrowserPath()});
 const proof={status:'RUNNING',scope:'Isolated real widgets; native void callback and optimistic/canonical event fixture. Virtual time is not measured production latency.',baseline,cases:{},external_requests:0,actual_Desktop:false,SDK_requests:0,paid_requests:0};
+const structuredCases=['state_changed_recovers','state_changed_persists','view_too_large','foreign_runtime_then_good','direct_sdk_reply'];
 try{
- for(const kind of (baseline?['single_selection_drop_first','drop_first','late_first','callback_throw','callback_reject']:['single_selection_drop_first','drop_first','late_first','no_event','scope_changed','disposed','callback_throw','callback_reject','lease_recreated','expired_timer','late_after_deadline'])){
+ for(const kind of (baseline?['single_selection_drop_first','drop_first','late_first','callback_throw','callback_reject']:['single_selection_drop_first','drop_first','late_first','no_event','scope_changed','disposed','callback_throw','callback_reject','lease_recreated','expired_timer','late_after_deadline',...structuredCases])){
   const context=await browser.newContext({viewport:{width:1450,height:950}}),page=await context.newPage(),errors=[];page.on('pageerror',e=>errors.push(String(e)));
   await page.route('**/*',r=>{if(r.request().url()==='http://127.0.0.1/authority-timeout')return r.fulfill({contentType:'text/html',body:'<!doctype html><html><body></body></html>'});proof.external_requests++;return r.abort()});
   await page.clock.install({time:new Date(0)});await page.goto('http://127.0.0.1/authority-timeout');await page.clock.pauseAt(new Date(1000));
@@ -22,11 +23,27 @@ try{
     onChange:wire=>{const sent=JSON.parse(wire);f.writes.push(sent);queueMicrotask(()=>{if(f.closed)return;f.mh.update({...f.mainProps(),value:wire});f.server=m.hmbNormalizeImageAssetState({...f.server,...(sent.schema==='hmb-image-asset-edit-v1'?sent.edits:sent),ui_edit_revision:sent.ui_edit_revision,scan_revision:(sent.scan_revision||0)+1,project_uid:'server-uid',image_bash_workspace_edit:{},scan_busy:false});f.mh.update(f.mainProps())})}});
    f.response=(request,server=f.server)=>({...request,phase:'result',widget_runtime_lease:server.widget_runtime_lease,canonical_node_name:f.node.dataset.id,canonical_scope:m.hmbImageAssetAuthorityScope(server),catalog_page_version:1});
    f.answer=(request,server=f.server)=>{if(!f.closed)f.bh.update(f.bridgeProps(f.response(request,server)))};
+   if(kind==='direct_sdk_reply')window.__hmbReadImageAssetAuthority0130=async(nodeName,request)=>{
+    if(nodeName!==f.node.dataset.id)throw Error('Wrong scoped node');
+    f.requests.push({...structuredClone(request),at:Date.now()});
+    return f.response(request); // The canvas never receives a property update.
+   };
    f.bridgeProps=value=>({value,nodeName:f.node.dataset.id,parameterName:'HMB_IMAGE_ASSET_THUMBNAIL_PATCH',disabled:false,onChange:request=>{
     if(request.operation!=='widget_authority')return;
     f.requests.push({...structuredClone(request),at:Date.now()});
     if(kind==='callback_throw')throw Error('read-only diagnostic callback throw');if(kind==='callback_reject')return Promise.reject(Error('read-only diagnostic callback rejection'));
-    queueMicrotask(()=>{if(f.closed)return;f.bh.update(f.bridgeProps(request));f.mh.update(f.mainProps());if(f.requests.length>1&&['drop_first','single_selection_drop_first'].includes(kind))f.answer(request)});
+    queueMicrotask(()=>{
+     if(f.closed)return;
+     f.bh.update(f.bridgeProps(request));f.mh.update(f.mainProps());
+     if(kind==='foreign_runtime_then_good'){
+      f.bh.update(f.bridgeProps({...f.response(request),runtime_instance_id:id(98)}));
+      f.answer(request);
+     }else if(kind==='state_changed_persists'||kind==='view_too_large'||(kind==='state_changed_recovers'&&f.requests.length===1)){
+      const {canonical_scope,...response}=f.response(request);
+      f.bh.update(f.bridgeProps({...response,request_runtime_instance_id:request.runtime_instance_id,
+       authority_error:kind==='view_too_large'?'view_too_large':'state_changed'}));
+     }else if(f.requests.length>1&&['drop_first','single_selection_drop_first','state_changed_recovers'].includes(kind))f.answer(request);
+    });
    }});
    f.choose=path=>{f.userSelections++;const select=f.main.querySelector('[data-project-select]');select.value=path;select.dispatchEvent(new Event('change',{bubbles:true}))};
    f.close=()=>{if(f.closed)return;f.closed=true;f.mh.cleanup();f.bh.cleanup()};
@@ -35,7 +52,8 @@ try{
    f.stages={after_mount:f.requests.length};f.choose('P:/projects/One/Ai_Ct_image');f.stages.after_first_selection=f.requests.length;window.fixture=f;
   },{main,bridge,kind});
   await page.clock.runFor(200);
-  await page.evaluate(()=>{if(fixture.kind!=='single_selection_drop_first')fixture.choose('P:/projects/Two/Ai_Ct_image');fixture.stages.after_second_selection=fixture.requests.length});
+  await page.evaluate(skipSecond=>{if(!skipSecond)fixture.choose('P:/projects/Two/Ai_Ct_image');fixture.stages.after_second_selection=fixture.requests.length},
+   kind==='single_selection_drop_first'||structuredCases.includes(kind));
   if(kind==='scope_changed')await page.evaluate(()=>{fixture.node.dataset.id='Replaced Asset'});
   if(kind==='disposed')await page.evaluate(()=>fixture.close());
   if(kind==='lease_recreated')await page.evaluate(()=>{const f=fixture;f.server={...f.server,widget_runtime_lease:f.id(9)};f.mh.update(f.mainProps());f.bh.update(f.bridgeProps({schema:'hmb-image-asset-thumbnail-bridge',version:1,phase:'idle',runtime_instance_id:f.server.shot_routing.publisher_instance_uuid,widget_runtime_lease:f.server.widget_runtime_lease,catalog_page_version:1}))});
@@ -63,6 +81,11 @@ try{
    if(kind==='lease_recreated')assert.equal(state.requests.length,2,'An old waiter cannot cancel the new lease read');
    if(kind==='expired_timer'){assert.equal(state.requests.length,1);assert.equal(state.writes,0);}
    if(kind==='late_after_deadline'){assert.equal(state.requests.length,1);assert.equal(state.writes,0);assert.equal(state.bridge_lease,'');assert.equal(state.lease,state.server_lease);assert(state.message);}
+   if(kind==='state_changed_recovers'){assert.equal(state.requests.length,2);assert.equal(state.writes,1);assert.equal(state.target,'P:/projects/One/Ai_Ct_image');}
+   if(kind==='state_changed_persists'){assert.equal(state.requests.length,2);assert.equal(state.writes,0);assert.match(state.message,/상태가 갱신되었습니다/);}
+   if(kind==='view_too_large'){assert.equal(state.requests.length,1);assert.equal(state.writes,0);assert.match(state.message,/화면 데이터가 큽니다/);}
+   if(kind==='foreign_runtime_then_good'){assert.equal(state.requests.length,1);assert.equal(state.writes,1);assert.equal(state.bridge_lease,state.server_lease);}
+   if(kind==='direct_sdk_reply'){assert.equal(state.user_selections,1);assert.equal(state.requests.length,1);assert.equal(state.writes,1);assert.equal(state.target,'P:/projects/One/Ai_Ct_image');assert.equal(state.message,'');}
    assert.deepEqual(errors,[]);
   }
   state.errors=errors;proof.cases[kind]=state;await page.evaluate(()=>fixture.close());await context.close();

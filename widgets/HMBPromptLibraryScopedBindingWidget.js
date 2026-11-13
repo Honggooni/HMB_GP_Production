@@ -2,6 +2,9 @@ const MAX_IMAGES = 50;
 const MAX_SHOT_IMAGES = MAX_IMAGES;
 const MAX_VIDEOS = 10;
 const MAX_SHOTS = 5;
+const HMB_EAGER_PROMPT_IMAGE_LIMIT = 24;
+const HMB_EAGER_PROMPT_TARGET_OPTIONS_LIMIT = 24;
+const HMB_EAGER_PROMPT_DOCUMENT_BUDGET = 250000;
 const MAX_COLOR_PICKS = 3;
 const MAX_IDENTIFIER_CHARS = 256;
 const MAX_DESCRIPTION_CHARS = 6000;
@@ -25,24 +28,23 @@ let OBJECT_COLOR_PICK_CHOICES = [...DEFAULT_OBJECT_COLOR_PICK_CHOICES];
 let COLOR_PICK_CHOICES = [
   ...new Set([...ACTOR_COLOR_PICK_CHOICES, ...OBJECT_COLOR_PICK_CHOICES]),
 ];
-const HMB_DEFAULT_NODE_WIDTH = 1800;
+const HMB_DEFAULT_NODE_WIDTH = 1490;
 const HMB_MIN_NODE_WIDTH = 760;
 const HMB_HEADER_LAYOUT_VERSION = 2;
 const HMB_LEGACY_IMAGE_SOURCES_DEFAULT_HEIGHT = 542;
 const HMB_GROUP_START_HEIGHTS = Object.freeze({
-  // Keep the established 1193px editor-group baseline. Header/tabs and
-  // 21px of bottom space independently raise the final startup height to 1350px;
-  // persisted user group heights remain authoritative.
-  imageSources: 514,
-  imageText: 200,
-  videoSources: 200,
-  videoText: 150,
+  imageSources: 490,
+  imageText: 210,
+  videoSources: 150,
+  soundSources: 150,
+  videoText: 190,
 });
 const HMB_GROUP_MIN_HEIGHTS = Object.freeze({
-  // Retain the legacy 1193px editor minimum without shrinking stored groups.
-  imageSources: 514,
+  // The new minimum applies to fresh nodes; saved shells may remain smaller.
+  imageSources: 490,
   imageText: 200,
-  videoSources: 200,
+  videoSources: 150,
+  soundSources: 150,
   videoText: 150,
 });
 const HMB_GROUP_DEFAULT_HEIGHTS = HMB_GROUP_START_HEIGHTS;
@@ -53,9 +55,11 @@ const HMB_DEFAULT_NODE_HEIGHT =
   Object.values(HMB_GROUP_START_HEIGHTS).reduce((total, height) => total + height, 0) +
   HMB_START_LAYOUT_CHROME_HEIGHT +
   HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT;
-const HMB_MIN_NODE_HEIGHT = HMB_DEFAULT_NODE_HEIGHT;
+const HMB_MIN_NODE_HEIGHT =
+  Object.values(HMB_GROUP_MIN_HEIGHTS).reduce((total, height) => total + height, 0) +
+  HMB_START_LAYOUT_CHROME_HEIGHT + HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT;
 const HMB_MANAGER_HEADER_TABS_HEIGHT = 68 + 44 + 24;
-const HMB_START_BOTTOM_PADDING = 21;
+const HMB_START_BOTTOM_PADDING = 25;
 const HMB_MANAGER_DEFAULT_NODE_HEIGHT = HMB_DEFAULT_NODE_HEIGHT + HMB_MANAGER_HEADER_TABS_HEIGHT + HMB_START_BOTTOM_PADDING;
 const HMB_RESIZE_MODE = "stacked_outer_1000";
 const HMB_GROUP_MAX_HEIGHT = 6000;
@@ -503,6 +507,7 @@ const HMB_OPTION_KO = {
   "Spatial Alignment Verification Only": "공간 정렬 검증만",
   "Derived Motion Decoding Only": "파생 모션 디코딩만",
   "FX Effect Only": "FX 효과만",
+  Analysis: "분석",
   "Lighting / Look Only": "조명 / 룩만",
   "Local Composition Check Only": "부분 구도 확인만",
   "Mask / Guide Only": "마스크 / 가이드만",
@@ -972,6 +977,104 @@ function defaultState() {
       shot_routing: {},
     },
   });
+}
+
+const HMB_SOUND_SUBTYPES = ["Apply", "Ignore", "Analysis"];
+const HMB_SOUND_FIELDS = ["role", "purpose", "audio_sub_type", "transcript", "target", "in_seconds", "out_seconds", "start_seconds", "gain_db", "enabled", "loop", "lipsync", "speaker_binding"];
+const HMB_SOUND_NUMBERS = new Set(["in_seconds", "out_seconds", "start_seconds", "gain_db"]);
+const HMB_SOUND_BOOLEANS = new Set(["enabled", "loop", "lipsync"]);
+
+function hmbNormalizeSoundSpeakerBinding(value) {
+  if (!value || !["image", "video"].includes(value.kind) || typeof value.source_id !== "string") return null;
+  const sourceId = value.source_id.trim();
+  if (!sourceId || sourceId.length > 512) return null;
+  return {kind: value.kind, source_id: sourceId,
+    color: value.kind === "video" && typeof value.color === "string" ? value.color.trim().slice(0, 64) : ""};
+}
+
+function hmbSoundSpeakerSourceKey(source) {
+  return source ? `${source.kind}:${source.source_id}` : "";
+}
+
+function hmbNormalizeSoundSpeakerSources(value) {
+  if (!Array.isArray(value)) return [];
+  const sources = [];
+  const seen = new Set();
+  for (const row of value.slice(0, MAX_IMAGES + MAX_VIDEOS)) {
+    const binding = hmbNormalizeSoundSpeakerBinding(row);
+    if (!binding) continue;
+    const key = hmbSoundSpeakerSourceKey(binding);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const isMask = binding.kind === "video" && row.is_mask === true;
+    sources.push({kind: binding.kind, source_id: binding.source_id,
+      label: typeof row.label === "string" ? row.label.trim().slice(0, 256) : "",
+      is_mask: isMask,
+      colors: isMask && Array.isArray(row.colors)
+        ? [...new Set(row.colors.slice(0, 64).filter(color => typeof color === "string")
+          .map(color => color.trim()).filter(color => color && color.length <= 64))] : []});
+  }
+  return sources;
+}
+
+function hmbPromptAudioSubtype(row) {
+  if (HMB_SOUND_SUBTYPES.includes(row.audio_sub_type)) return row.audio_sub_type;
+  return row.enabled === false ? "Ignore" : "Apply";
+}
+
+export function hmbNormalizePromptSoundOverlays(value) {
+  const result = Object.create(null);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return result;
+  for (const [instance, raw] of Object.entries(value).slice(0, 64)) {
+    if (!instance || instance.length > 128 || !raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const row = {};
+    for (const field of HMB_SOUND_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(raw, field)) continue;
+      const item = raw[field];
+      if (field === "audio_sub_type") { if (HMB_SOUND_SUBTYPES.includes(item)) row[field] = item; }
+      else if (field === "speaker_binding") {
+        const binding = hmbNormalizeSoundSpeakerBinding(item);
+        if (item === null || binding) row[field] = binding;
+      }
+      else if (HMB_SOUND_BOOLEANS.has(field)) { if (typeof item === "boolean") row[field] = item; }
+      else if (HMB_SOUND_NUMBERS.has(field)) {
+        if (field === "out_seconds" && item === null) row[field] = null;
+        else if (typeof item === "number" && Number.isFinite(item)) row[field] = item;
+      } else if (typeof item === "string") row[field] = item.slice(0, field === "transcript" ? 20000 : 512);
+    }
+    if (Object.keys(row).length) result[instance] = row;
+  }
+  return result;
+}
+
+function normalizePromptSoundSources(value) {
+  const allowed = ["instance_id", "source_uid", "name", "audio", "duration_seconds", ...HMB_SOUND_FIELDS];
+  return (Array.isArray(value) ? value : []).slice(0, 64).filter(row => row && typeof row.instance_id === "string")
+    .map(row => ({
+      ...Object.fromEntries(allowed.filter(key => Object.prototype.hasOwnProperty.call(row, key))
+        .map(key => [key, key === "speaker_binding" ? hmbNormalizeSoundSpeakerBinding(row[key]) : row[key]])),
+      audio_sub_type: hmbPromptAudioSubtype(row),
+    }));
+}
+
+export function hmbSetPromptSoundField(state, instance, field, value, allowDormant = false) {
+  if (field === "sound_direction") { state.sound_direction = verbatimText(value).slice(0, 20000); return true; }
+  if (!HMB_SOUND_FIELDS.includes(field) || (!allowDormant && !state.sound_sources?.some(row => row.instance_id === instance))) return false;
+  let item = value;
+  if (field === "audio_sub_type") {
+    if (!HMB_SOUND_SUBTYPES.includes(value)) return false;
+  } else if (field === "speaker_binding") {
+    item = hmbNormalizeSoundSpeakerBinding(value);
+    if (value !== null && !item) return false;
+  } else if (HMB_SOUND_BOOLEANS.has(field)) item = value === true;
+  else if (HMB_SOUND_NUMBERS.has(field)) {
+    if (field === "out_seconds" && (value === "" || value === null)) item = null;
+    else { item = Number(value); if (!Number.isFinite(item)) return false; }
+  } else item = verbatimText(value).slice(0, field === "transcript" ? 20000 : 512);
+  state.sound_overlays = hmbNormalizePromptSoundOverlays(state.sound_overlays);
+  state.sound_overlays[instance] = { ...state.sound_overlays[instance], [field]: item };
+  state.sound_sources = state.sound_sources.map(row => row.instance_id === instance ? { ...row, [field]: item } : row);
+  return true;
 }
 
 function parseValue(value) {
@@ -2125,6 +2228,7 @@ function migrateVideo(item, slot) {
   out.picker_auto_label = clean(item.picker_auto_label);
   out.picker_auto_video_main_type = clean(item.picker_auto_video_main_type);
   out.picker_auto_video_sub_type = clean(item.picker_auto_video_sub_type);
+  if (item.picker_speaker_mask === true) out.picker_speaker_mask = true;
   out.picker_auto_depth = normalizePickerAutoDepth(item.picker_auto_depth);
   out.picker_auto_motion_guide = normalizePickerAutoMotionGuide(
     item.picker_auto_motion_guide,
@@ -2309,14 +2413,14 @@ function normalizeUi(input) {
   const legacyDefaultLayout = compatible
     && headerLayoutVersion < HMB_HEADER_LAYOUT_VERSION
     && Math.round(Number(rawHeights.imageSources)) === HMB_LEGACY_IMAGE_SOURCES_DEFAULT_HEIGHT
-    && ["imageText", "videoSources", "videoText"].every((key) => (
+    && Object.entries({imageText: 200, videoSources: 200, videoText: 150}).every(([key, legacyDefault]) => (
       rawHeights[key] == null
-      || Math.round(Number(rawHeights[key])) === HMB_GROUP_START_HEIGHTS[key]
+      || Math.round(Number(rawHeights[key])) === legacyDefault
     ));
   const group_heights = {};
   Object.keys(HMB_GROUP_MIN_HEIGHTS).forEach((key) => {
     const value = key === "imageSources" && legacyDefaultLayout
-      ? HMB_GROUP_START_HEIGHTS.imageSources
+      ? 514
       : Number(rawHeights[key]);
     const minHeight = HMB_GROUP_MIN_HEIGHTS[key];
     if (Number.isFinite(value) && value >= minHeight && value <= HMB_GROUP_MAX_HEIGHT) {
@@ -2797,6 +2901,10 @@ export function normalizeState(input) {
   const activeVideoCount = videos.filter(isActiveVideo).length;
   const textInput = input && typeof input.text === "object" ? input.text : {};
   const text = migrateText(textInput);
+  const generated = input?.analysis_generated_text;
+  const generatedText = Object.fromEntries(TEXT_FIELDS
+    .map(([key]) => [key, generated?.[key]])
+    .filter(([, value]) => typeof value === "string" && value.length > 0 && value.length <= 20000));
   const pickerInput = input && typeof input.picker === "object" ? input.picker : {};
   const pickerMarkers = Array.isArray(pickerInput.markers) ? pickerInput.markers.filter((item) => item && typeof item === "object") : [];
   const picker = {
@@ -2883,6 +2991,13 @@ export function normalizeState(input) {
     images,
     videos,
     text,
+    ...(Object.keys(generatedText).length ? { analysis_generated_text: generatedText } : {}),
+    sound_sources: normalizePromptSoundSources(input?.sound_sources),
+    speaker_sources: hmbNormalizeSoundSpeakerSources(input?.speaker_sources),
+    sound_overlays: hmbNormalizePromptSoundOverlays(input?.sound_overlays),
+    sound_direction: verbatimText(input?.sound_direction).slice(0, 20000),
+    sound_connection: input?.sound_connection && typeof input.sound_connection === "object"
+      ? Object.fromEntries(["enabled", "project_id", "revision", "error"].filter(key => key in input.sound_connection).map(key => [key, input.sound_connection[key]])) : {},
     source_intent_fallbacks: normalizeSourceIntentFallbacks(
       input && input.source_intent_fallbacks,
     ),
@@ -3313,6 +3428,8 @@ export function hmbReleasePromptCompositionLatch(container) {
 
 function hmbTextControlIdentity(element) {
   if (!hmbIsEditableTextControl(element)) return "";
+  const soundField = element.getAttribute("data-sound-field");
+  if (soundField) return `sound:${element.getAttribute("data-sound-instance") || ""}:${soundField}`;
   const textKey = element.getAttribute("data-text-key");
   if (textKey) return `text:${textKey}`;
   const row = element.closest(".source-row");
@@ -3363,7 +3480,11 @@ export function hmbRememberPromptDirtyTextControl(container, element, state) {
   if (!container || !hmbIsEditableTextControl(element)) return false;
   const textKey = clean(element.getAttribute?.("data-text-key"));
   let entry = null;
-  if (textKey) {
+  const soundField = clean(element.getAttribute?.("data-sound-field"));
+  if (soundField) {
+    entry = { kind: "sound", instance: clean(element.getAttribute?.("data-sound-instance")),
+      field: soundField, value: String(element.value ?? "") };
+  } else if (textKey) {
     entry = {
       kind: "text",
       key: textKey,
@@ -3433,6 +3554,7 @@ export function hmbRememberPromptDirtyTextControl(container, element, state) {
     : new Map();
   const identity = entry.kind === "text"
     ? `text:${entry.key}`
+    : entry.kind === "sound" ? `sound:${entry.instance}:${entry.field}`
     : [
         "source",
         entry.sourceKind,
@@ -3511,6 +3633,10 @@ export function hmbMergePromptDirtyTextState(authoritativeValue, dirtyEntries) {
       return;
     }
     const value = String(entry.value ?? "");
+    if (entry.kind === "sound") {
+      hmbSetPromptSoundField(next, entry.instance, entry.field, value, true);
+      return;
+    }
     if (entry.kind === "text") {
       const key = clean(entry.key);
       if (key && next.text && Object.prototype.hasOwnProperty.call(next.text, key)) {
@@ -3766,7 +3892,7 @@ function hmbRestorePromptControlFocus(container) {
   try { target.focus({ preventScroll: true }); } catch (_error) { try { target.focus(); } catch (__error) {} }
 }
 
-const HMB_SOURCE_SCROLL_KEYS = ["imageSources", "videoSources", "managerBody"];
+const HMB_SOURCE_SCROLL_KEYS = ["imageSources", "videoSources", "soundSources", "managerBody"];
 
 function hmbScrollMemory(container) {
   if (!container) return {};
@@ -3780,7 +3906,7 @@ function hmbScrollMemory(container) {
 
 function hmbScrollDatasetKey(key) {
   if (key === "managerBody") return "hmbManagerBodyScrollTop";
-  return key === "videoSources" ? "hmbVideoSourceScrollTop" : "hmbImageSourceScrollTop";
+  return key === "videoSources" ? "hmbVideoSourceScrollTop" : key === "soundSources" ? "hmbSoundSourceScrollTop" : "hmbImageSourceScrollTop";
 }
 
 function hmbSourceScrollbox(container, key) {
@@ -3836,13 +3962,18 @@ function hmbRestoreSourceScrollNow(container) {
 }
 
 function hmbRestoreSourceScroll(container, deferInitial = false) {
-  if (hmbIsGroupResizeDragging(container)) return;
+  if (!container || hmbIsGroupResizeDragging(container)) return;
+  const restore = {};
+  container.__hmbPromptScrollRestore = restore;
+  const stillCurrent = () => (
+    container.__hmbPromptScrollRestore === restore && !hmbIsGroupResizeDragging(container)
+  );
   if (!deferInitial) hmbRestoreSourceScrollNow(container);
   hmbPromptLifecycleFrame(container, () => {
-    if (hmbIsGroupResizeDragging(container)) return;
+    if (!stillCurrent()) return;
     hmbRestoreSourceScrollNow(container);
     hmbPromptLifecycleFrame(container, () => {
-      if (!hmbIsGroupResizeDragging(container)) hmbRestoreSourceScrollNow(container);
+      if (stillCurrent()) hmbRestoreSourceScrollNow(container);
     });
   });
 }
@@ -3862,7 +3993,7 @@ export function hmbInstallPromptInteractionIsolation(container, listeners, insta
   // The manager's four groups share one bounded native scroll viewport.
   // Keep wheel input there while leaving middle-button canvas pan available.
   container.querySelector?.('[data-prompt-manager="true"] .center')?.classList?.add("nowheel");
-  const interactionSelectors = [
+  const interactionSelector = [
     "input",
     "textarea",
     "select",
@@ -3873,31 +4004,34 @@ export function hmbInstallPromptInteractionIsolation(container, listeners, insta
     "[contenteditable='true']",
     "[data-resize-group]",
     "[data-resize-textarea]"
-  ];
-  const isolated = container.__hmbPromptIsolatedControls || new WeakSet();
-  container.__hmbPromptIsolatedControls = isolated;
-  const stopPointerPropagation = (event) => event.stopPropagation();
+  ].join(",");
   const isolatePointer = (element) => {
-    if (!element || isolated.has(element) || hmbPromptNativeHeaderTarget(element)) return;
-    isolated.add(element);
+    if (hmbPromptNativeHeaderTarget(element)) return;
     // A concrete control keeps its native pointer and wheel behavior. The
     // surrounding open-hand background remains free for Griptape pan/zoom.
     const missing = ["nodrag", "nopan", "nowheel"].filter(name => !element.classList?.contains?.(name));
     if (missing.length) element.classList?.add(...missing);
-    ["pointerdown", "mousedown", "click", "dblclick"].forEach((eventName) => {
-      element.addEventListener?.(eventName, stopPointerPropagation);
-      listeners.push([element, eventName, stopPointerPropagation]);
-    });
   };
 
   // IMAGE SOURCE BINDING now follows the same Griptape canvas behavior as the
   // rest of the dashboard. Only concrete controls below are isolated.
   const imageSourceBinding = container.querySelector?.(".image-card");
   imageSourceBinding?.classList?.remove("nodrag", "nopan", "nowheel");
-  interactionSelectors.forEach((selector) => {
-    container.querySelectorAll(selector).forEach(isolatePointer);
-  });
+  container.querySelectorAll(interactionSelector).forEach(isolatePointer);
   if (!installGlobal) return;
+  // A control's own handler and native browser behavior run before the event
+  // reaches the widget boundary. One guard per event keeps it off the canvas
+  // without installing and wrapping listeners on every heavy source row.
+  const stopControlPointer = (event) => {
+    const control = event.target?.closest?.(interactionSelector);
+    if (control && container.contains(control) && !hmbPromptNativeHeaderTarget(control)) {
+      event.stopPropagation();
+    }
+  };
+  for (const event of ["pointerdown", "mousedown", "click", "dblclick"]) {
+    container.addEventListener(event, stopControlPointer);
+    listeners.push([container, event, stopControlPointer]);
+  }
   const stopNodeDeleteShortcut = (event) => {
     if (hmbPromptNativeHeaderTarget(event.target)) return;
     if (["Backspace", "Delete"].includes(event?.key)) event.stopPropagation?.();
@@ -3933,7 +4067,6 @@ function hmbInstallSourceScrollPositionLock(container, listeners) {
     listeners.push([box, "pointerdown", save]);
     listeners.push([box, "focusin", save]);
   });
-  hmbRestoreSourceScroll(container);
 }
 
 function escapeHtml(value) {
@@ -4011,7 +4144,7 @@ function renderSubtypeControls(item, state) {
   const knownChoices = Array.isArray(IMAGE_SUB_TYPES[clean(item.image_main_type)])
     ? IMAGE_SUB_TYPES[clean(item.image_main_type)]
     : [];
-  const choices = uniqueList([...knownChoices, subType].filter(Boolean));
+  const choices = uniqueList([...knownChoices, "Analysis", subType].filter(Boolean));
   const authorityHint = hmbImageSubtypeAuthorityHint(item, state);
   return `<div class="binding-scope-stack"><div class="binding-scope-entry"><select class="source-select binding-scope-select" data-field="image_sub_type" title="${escapeHtml(authorityHint)}">${options(["", ...choices], subType, uiText(state, "blank_subtype", "— blank / no subtype —"), state)}</select></div></div>`;
 }
@@ -4594,6 +4727,11 @@ export function hmbMergePromptRevisionAxes(sourceState, uiState) {
     }
   });
   source.text = hmbPromptCloneRangeField(authoredUi.text) || source.text;
+  if (authoredUi.analysis_generated_text) {
+    source.analysis_generated_text = { ...authoredUi.analysis_generated_text };
+  }
+  source.sound_overlays = hmbPromptCloneRangeField(authoredUi.sound_overlays) || {};
+  source.sound_direction = authoredUi.sound_direction || "";
   source.ui = hmbPromptCloneRangeField(authoredUi.ui) || source.ui;
   // Connected-source parsing owns these diagnostics. Keep the newest source
   // generation instead of replacing it with an older dashboard snapshot.
@@ -5768,15 +5906,20 @@ export function hmbReconcileImageTargetContract(images) {
   return rows;
 }
 
-export function imageTargetChoicesForRow(item, images, state = null) {
-  void state;
+function hmbImageTargetChoicesContext(images) {
   const dynamicTargets = uniqueTargetList(
     nonLookTargetCandidateRows(images)
       .flatMap((row, idx) => [clean(row?.owner), clean(row?.label), imageTargetLabel(row, idx)])
       .filter((value) => Boolean(value) && !isImageTargetModeToken(value)),
   );
-  const dynamicTargetKeys = new Set(dynamicTargets.map(imageTargetKey));
-  const lookDerivedTargetKeys = lookReferenceTargetKeys(images);
+  return {
+    dynamicTargets,
+    dynamicTargetKeys: new Set(dynamicTargets.map(imageTargetKey)),
+    lookDerivedTargetKeys: lookReferenceTargetKeys(images),
+  };
+}
+
+function hmbImageTargetChoices(item, { dynamicTargets, dynamicTargetKeys, lookDerivedTargetKeys }) {
   const lookReference = isLookReferenceImage(item);
   const currentTarget = clean(item && item.owner);
   const currentKey = imageTargetKey(currentTarget);
@@ -5796,36 +5939,67 @@ export function imageTargetChoicesForRow(item, images, state = null) {
   if (lookReference) {
     choices.push(IMAGE_GLOBAL_LOOK_TARGET, IMAGE_CUSTOM_LOOK_TARGET);
   }
-  if (currentAllowed) choices.push(currentTarget);
-  return uniqueTargetList(choices);
+  if (currentAllowed && !dynamicTargetKeys.has(currentKey)) choices.push(currentTarget);
+  return choices;
 }
 
-function targetSelectOptions(item, images, state) {
-  return options(
-    imageTargetChoicesForRow(item, images, state),
-    clean(item && item.owner),
-    uiText(state, "blank_target", "— blank / no target —"),
-    state
-  );
+export function imageTargetChoicesForRow(item, images) {
+  return hmbImageTargetChoices(item, hmbImageTargetChoicesContext(images));
 }
 
-function renderImageTargetControls(item, images, state) {
+function hmbRenderImageTargetOptions(images, state, deferred) {
+  const context = hmbImageTargetChoicesContext(images);
+  const blankLabel = uiText(state, "blank_target", "— blank / no target —");
+  const sharedMarkup = new Map();
+  return (item) => {
+    const current = clean(item?.owner);
+    const choices = hmbImageTargetChoices(item, context);
+    if (deferred) {
+      const shown = choices.includes(current) ? current : "";
+      return options([shown], shown, blankLabel, state);
+    }
+    return choices.map((choice) => {
+      if (choice === current) return options([choice], current, blankLabel, state);
+      if (!sharedMarkup.has(choice)) sharedMarkup.set(choice, options([choice], null, blankLabel, state));
+      return sharedMarkup.get(choice);
+    }).join("");
+  };
+}
+
+function renderImageTargetControls(item, renderTargetOptions, state, deferredTargets) {
   const customVisible = hmbImageCustomTargetInstructionVisible(item);
-  return `<select class="source-select source-target-select" data-field="owner" data-hmb-base-disabled="0">${targetSelectOptions(item, images, state)}</select><textarea class="source-target-input custom-field-input look-custom-instruction ${customVisible ? "" : "is-hidden"}" data-field="look_custom_instruction" maxlength="${MAX_DESCRIPTION_CHARS}" rows="2" aria-hidden="${customVisible ? "false" : "true"}" placeholder="${escapeHtml(uiText(state, "custom_look_instruction", "Specify affected properties and scope: name a target (for example, Hero lighting only) or state scene-wide."))}">${escapeHtml(item.look_custom_instruction || "")}</textarea>`;
+  return `<select class="source-select source-target-select" data-field="owner" data-hmb-base-disabled="0"${deferredTargets ? " data-hmb-target-options-pending" : ""}>${renderTargetOptions(item)}</select><textarea class="source-target-input custom-field-input look-custom-instruction ${customVisible ? "" : "is-hidden"}" data-field="look_custom_instruction" maxlength="${MAX_DESCRIPTION_CHARS}" rows="2" aria-hidden="${customVisible ? "false" : "true"}" placeholder="${escapeHtml(uiText(state, "custom_look_instruction", "Specify affected properties and scope: name a target (for example, Hero lighting only) or state scene-wide."))}">${escapeHtml(item.look_custom_instruction || "")}</textarea>`;
+}
+
+function hmbFillPromptTargetOptions(select, state, context = null) {
+  if (!select?.hasAttribute("data-hmb-target-options-pending")) return;
+  const index = Number(select.closest(".source-row.image")?.getAttribute("data-index") ?? -1);
+  const item = state.images?.[index];
+  if (!item) return;
+  const choices = hmbImageTargetChoices(item, context || hmbImageTargetChoicesContext(state.images));
+  const current = clean(item.owner);
+  hmbSyncSelectOptions(select, choices, choices.includes(current) ? current : "",
+    uiText(state, "blank_target", "— blank / no target —"), state);
+  select.removeAttribute("data-hmb-target-options-pending");
 }
 
 function refreshImageTargetControls(container, state) {
   try {
     const images = state && Array.isArray(state.images) ? state.images : [];
+    const targetContext = hmbImageTargetChoicesContext(images);
     container.querySelectorAll('.source-row.image').forEach((row) => {
       const index = Number(row.getAttribute('data-index') || -1);
       const item = images[index];
       const select = row.querySelector('select[data-field="owner"]');
       if (!item || !select) return;
+      const current = clean(item.owner);
+      const choices = hmbImageTargetChoices(item, targetContext);
+      const pending = select.hasAttribute("data-hmb-target-options-pending");
+      const shown = pending && !choices.includes(current) ? "" : current;
       hmbSyncSelectOptions(
         select,
-        imageTargetChoicesForRow(item, images, state),
-        clean(item.owner),
+        pending ? [shown] : choices,
+        shown,
         uiText(state, "blank_target", "— blank / no target —"),
         state,
       );
@@ -5859,7 +6033,7 @@ function compatibleVideoSourceTypeChoices(item, primaryVideo) {
 
 export function compatibleVideoRoleChoices(item, _primaryVideo = false) {
   const mainType = clean(item?.video_main_type);
-  return uniqueList([...(VIDEO_SUB_TYPES[mainType] || []), clean(item?.video_sub_type)].filter(Boolean));
+  return uniqueList([...(VIDEO_SUB_TYPES[mainType] || []), "Analysis", clean(item?.video_sub_type)].filter(Boolean));
 }
 
 function renderVideoCustomPanel(item, state) {
@@ -5890,7 +6064,7 @@ function hmbRefreshImageSubtypeControls(row, item, state) {
     const subType = clean(item.image_sub_type);
     hmbSyncSelectOptions(
       select,
-      uniqueList(["", ...(IMAGE_SUB_TYPES[clean(item.image_main_type)] || []), subType]),
+      uniqueList(["", ...(IMAGE_SUB_TYPES[clean(item.image_main_type)] || []), "Analysis", subType]),
       subType,
       uiText(state, "blank_subtype", "— blank / no subtype —"),
       state,
@@ -6054,7 +6228,7 @@ function hmbRefreshImageSurfaceControl(row, item) {
   checkbox.setAttribute?.("data-hmb-base-disabled", checkbox.disabled ? "1" : "0");
 }
 
-function renderImageRow(item, index, images, state) {
+function renderImageRow(item, index, images, state, renderTargetOptions, deferredTargets) {
   normalizeImageBindingFields(item, videoSlotCount(state));
   const sourceTypeChoices = uniqueList([...IMAGE_MAIN_TYPES, clean(item.image_main_type)].filter(Boolean));
   const orderManaged = Boolean(state?.image_asset?.enabled && state?.image_asset?.order_managed);
@@ -6076,7 +6250,7 @@ function renderImageRow(item, index, images, state) {
     <div class="source-label image-name-cell"><input class="source-label-input" data-field="label" maxlength="${MAX_IDENTIFIER_CHARS}" value="${escapeHtml(item.label)}" placeholder="${escapeHtml(uiText(state, "name", "Name"))}" title="${escapeHtml(identityTitle)}" ${verifiedAsset ? "readonly" : ""}/></div>
     <div class="source-role image-main-type-cell"><select class="source-select" data-field="image_main_type" ${verifiedAsset ? "disabled" : ""}>${options(sourceTypeChoices, item.image_main_type, "", state)}</select></div>
     <div class="source-role binding-scope-cell">${renderSubtypeControls(item, state)}</div>
-    <div class="source-role image-target-cell">${renderImageTargetControls(item, images, state)}</div>
+    <div class="source-role image-target-cell">${renderImageTargetControls(item, renderTargetOptions, state, deferredTargets)}</div>
     <div class="source-role color-pick-cell image-video-surface-columns"><div class="image-video-color-controls">${renderColorPickControls(item, index, images, state)}</div>${renderImageSurfaceControl(item, state)}</div>
     <div class="source-status image-actions-cell">${renderImageActions(item, state, index, images.length)}</div>
     ${renderFrameRangeRow(item, index, state)}
@@ -6152,6 +6326,9 @@ function hmbApplyPromptDisabledFeedback(container, disabled) {
   container.querySelector?.(".hmb-dashboard")?.classList?.toggle("disabled", Boolean(disabled));
   for (const tab of container.querySelectorAll?.("[data-prompt-shot]") || []) {
     if (tab.disabled !== Boolean(disabled)) tab.disabled = Boolean(disabled);
+  }
+  for (const field of container.querySelectorAll?.("[data-sound-speaker]") || []) {
+    field.disabled = Boolean(disabled) || field.hasAttribute("data-speaker-unavailable");
   }
 }
 
@@ -6349,25 +6526,102 @@ function renderPromptShotRows(state, editorMarkup = "") {
   }).join("")}${fallback}</div>`;
 }
 
+export function hmbRenderPromptSoundSources(state) {
+  const korean = uiLanguage(state) === "ko";
+  const rows = normalizePromptSoundSources(state.sound_sources);
+  const speakerSources = hmbNormalizeSoundSpeakerSources(state.speaker_sources);
+  const speakerByKey = new Map(speakerSources.map(source => [hmbSoundSpeakerSourceKey(source), source]));
+  const speakerGroups = [
+    [korean ? "캐릭터 시트" : "Character sheets", speakerSources.filter(source => source.kind === "image")],
+    [korean ? "일반 영상" : "Videos", speakerSources.filter(source => source.kind === "video" && !source.is_mask)],
+    [korean ? "마스크 영상" : "Mask videos", speakerSources.filter(source => source.is_mask)],
+  ];
+  const subtypeLabels = korean ? {Apply: "적용", Ignore: "미적용", Analysis: "분석"} : null;
+  const optionList = (values, current, labels) => values.map(value => `<option value="${escapeHtml(value)}"${value === current ? " selected" : ""}>${escapeHtml(labels?.[value] || value)}</option>`).join("");
+  const markup = rows.map((source, index) => {
+    const row = { ...source, ...state.sound_overlays?.[source.instance_id] };
+    const subtype = hmbPromptAudioSubtype(row);
+    const applies = subtype === "Apply";
+    const attrs = field => `data-sound-instance="${escapeHtml(row.instance_id)}" data-sound-field="${field}"`;
+    const numeric = (field, label, minimum = 0, maximum = 86400) => `<label>${label}<input type="number" step="0.01" min="${minimum}" max="${maximum}" ${attrs(field)} value="${row[field] == null ? "" : escapeHtml(row[field])}"/></label>`;
+    const toggle = (field, label) => `<label class="sound-toggle"><input type="checkbox" ${attrs(field)}${row[field] === true ? " checked" : ""}/>${label}</label>`;
+    const binding = hmbNormalizeSoundSpeakerBinding(row.speaker_binding);
+    const speakerKey = hmbSoundSpeakerSourceKey(binding);
+    const speakerSource = speakerByKey.get(speakerKey);
+    const missingSpeaker = binding && !speakerSource;
+    const speakerOptions = speakerGroups.map(([label, candidates]) => {
+      const options = candidates.map(candidate => {
+        const key = hmbSoundSpeakerSourceKey(candidate);
+        return `<option value="${escapeHtml(key)}"${key === speakerKey ? " selected" : ""}>${escapeHtml(candidate.label || label)}</option>`;
+      }).join("");
+      return `<optgroup label="${label}">${options || `<option disabled>${korean ? "선택 가능한 소스 없음" : "No available sources"}</option>`}</optgroup>`;
+    }).join("");
+    const speakerAttrs = (field, unavailable) => `data-sound-instance="${escapeHtml(row.instance_id)}" data-sound-speaker="${field}"${unavailable ? " data-speaker-unavailable" : ""}${unavailable || state.disabled ? " disabled" : ""}`;
+    const speakerPlaceholder = speakerSources.length || binding
+      ? (korean ? "선택 안 함" : "None")
+      : (korean ? "현재 샷에 선택된 참조 없음" : "No references selected in this Shot");
+    const colors = speakerSource?.colors || [];
+    const color = binding?.color || "";
+    const missingColor = Boolean(color && !colors.includes(color));
+    const colorPlaceholder = !colors.length
+      ? (korean ? "사용 가능한 컬러 없음" : "No available colors")
+      : missingColor ? (korean ? "컬러 다시 선택" : "Reselect color") : (korean ? "컬러 선택" : "Select color");
+    return `<div class="sound-binding-row" data-sound-row="${escapeHtml(row.instance_id)}">
+      <div class="sound-binding-main">
+        <b>${String(index + 1).padStart(2, "0")} · <span data-sound-token>${escapeHtml(applies && row.audio || "OFF")}</span> ${escapeHtml(row.name || "")}</b>
+        <label>${korean ? "역할" : "Role"}<select ${attrs("role")}>${optionList(["Dialogue", "SFX", "Ambience", "Music"], row.role)}</select></label>
+        <label>${korean ? "세부 유형" : "Subtype"}<select ${attrs("audio_sub_type")}>${optionList(HMB_SOUND_SUBTYPES, subtype, subtypeLabels)}</select></label>
+        <label>${korean ? "사용" : "Purpose"}<select ${attrs("purpose")}${applies ? "" : " disabled"}>${optionList(["reference", "mix", "both"], row.purpose)}</select></label>
+        <label>${korean ? "대상 / 화자" : "Target / speaker"}<input type="text" maxlength="512" ${attrs("target")} value="${escapeHtml(row.target || "")}"/></label>
+        ${toggle("lipsync", korean ? "립싱크" : "Lip-sync")}
+      </div>
+      <div class="sound-speaker-reference">
+        <label>${korean ? "화자 참조" : "Speaker reference"}<select ${speakerAttrs("source", !speakerSources.length && !binding)}>
+          <option value="">${speakerPlaceholder}</option>
+          ${missingSpeaker ? `<option value="${escapeHtml(speakerKey)}" selected disabled>${korean ? "참조 다시 선택" : "Reselect missing reference"}</option>` : ""}
+          ${speakerOptions}
+        </select></label>
+        ${speakerSource?.is_mask ? `<label>${korean ? "마스크 컬러" : "Mask color"}<select ${speakerAttrs("color", !colors.length)}>
+          <option value=""${!color || missingColor ? " selected" : ""}>${colorPlaceholder}</option>${optionList(colors, color)}
+        </select></label>` : ""}
+      </div>
+      <div class="sound-binding-detail">
+        <label class="sound-transcript">${korean ? "대사 / 발화문 (입력한 그대로)" : "Dialogue / transcript (exact words)"}<textarea rows="2" maxlength="20000" ${attrs("transcript")}>${escapeHtml(row.transcript || "")}</textarea></label>
+        <div class="sound-timing">${numeric("start_seconds", korean ? "샷 시작(초)" : "Shot start (s)")}${numeric("in_seconds", "IN (s)")}${numeric("out_seconds", "OUT (s)")}${numeric("gain_db", "dB", -60, 12)}${toggle("loop", korean ? "반복" : "Loop")}</div>
+      </div>
+    </div>`;
+  }).join("");
+  const empty = `<div class="sound-binding-empty">${korean ? "Sound Library에서 음원을 선택해 연결하세요. 파일과 타임라인은 Sound Library에서 관리합니다." : "Connect selected Sound Library tracks. Files and the timeline stay in Sound Library."}</div>`;
+  return `${markup || empty}<label class="sound-direction">${korean ? "사운드 / 발화 / 립싱크 방향" : "Sound / speech / lip-sync direction"}<textarea rows="2" maxlength="20000" data-sound-field="sound_direction" placeholder="${korean ? "대상, 대사 전달, 타이밍과 사용 의도를 입력하세요." : "Describe the target, delivery, timing and intended sound use."}">${escapeHtml(state.sound_direction || "")}</textarea></label>`;
+}
+
 function render(state, includeStyle = true) {
   const paletteShotNumber = hmbPromptPaletteShotNumber(state);
   const images = state.images || [];
+  const deferredTargets = images.length >= HMB_EAGER_PROMPT_TARGET_OPTIONS_LIMIT;
+  const renderTargetOptions = hmbRenderImageTargetOptions(images, state, deferredTargets);
   const videos = state.videos || [];
   const groupBFields = TEXT_FIELDS.filter((x) => x[3] === "image").map(([key, label, ph]) => textField(key, label, state.text[key], ph, state)).join("");
   const groupDFields = TEXT_FIELDS.filter((x) => x[3] === "video").map(([key, label, ph]) => textField(key, label, state.text[key], ph, state)).join("");
   const hImageSources = groupHeightStyle(state, "imageSources");
   const hImageText = groupHeightStyle(state, "imageText");
   const hVideoSources = groupHeightStyle(state, "videoSources");
+  const hSoundSources = groupHeightStyle(state, "soundSources");
   const hVideoText = groupHeightStyle(state, "videoText");
   const editorMarkup = `<div class="layout nodrag"${state.manual_rebind?.required ? ' inert aria-disabled="true"' : ""}>
       <main class="center">
-        <section class="group-card image-card" data-group-id="imageSources" ${hImageSources}><h3>${escapeHtml(uiText(state, "image_source_binding", "IMAGE SOURCE BINDING"))} <b>${state.status.active_images} / ${state.status.max_images}</b></h3><div class="group-body source-scrollbox" data-scroll-id="imageSources"><div class="source-header image-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "target", "TARGET"))}</span><span class="image-video-surface-columns"><span>${escapeHtml(uiText(state, "video_color_pick", "VIDEO / COLOR PICK"))}</span><span class="image-surface-heading">${escapeHtml(uiText(state, "surface_2d", "2DSurface"))}</span></span><span></span></div>${images.map((item, idx) => renderImageRow(item, idx, images, state)).join("")}${renderImageAddRow(images, state)}</div><div class="group-resize-bar nodrag" data-resize-group="imageSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
+        <section class="group-card image-card" data-group-id="imageSources" ${hImageSources}><h3>${escapeHtml(uiText(state, "image_source_binding", "IMAGE SOURCE BINDING"))} <b>${state.status.active_images} / ${state.status.max_images}</b></h3><div class="group-body source-scrollbox" data-scroll-id="imageSources"><div class="source-header image-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "target", "TARGET"))}</span><span class="image-video-surface-columns"><span>${escapeHtml(uiText(state, "video_color_pick", "VIDEO / COLOR PICK"))}</span><span class="image-surface-heading">${escapeHtml(uiText(state, "surface_2d", "2DSurface"))}</span></span><span></span></div>${images.map((item, idx) => renderImageRow(item, idx, images, state, renderTargetOptions, deferredTargets)).join("")}${renderImageAddRow(images, state)}</div><div class="group-resize-bar nodrag" data-resize-group="imageSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card imgtext" data-group-id="imageText" ${hImageText}><h3>${escapeHtml(uiText(state, "image_text_context", "SHOT TEXT DIRECTION / EXACT LITERALS"))} <b>${escapeHtml(uiText(state, "scene_level_notes", "scene-level notes"))}</b></h3><div class="group-body"><div class="text-grid">${groupBFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="imageText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card video-card" data-group-id="videoSources" ${hVideoSources}><h3>${escapeHtml(uiText(state, "video_source_binding", "VIDEO SOURCE BINDING"))} <b>${state.status.active_videos} / ${state.status.max_videos}</b></h3><div class="group-body source-scrollbox" data-scroll-id="videoSources"><div class="source-header video-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "keep_out", "KEEP OUT"))}</span><span></span></div>${videos.map((item, idx) => renderVideoRow(item, idx, images, state)).join("")}${renderVideoAddRow(videos, state)}</div><div class="group-resize-bar nodrag" data-resize-group="videoSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
+        <section class="group-card sound-card" data-group-id="soundSources" ${hSoundSources}><h3>${escapeHtml(uiLanguage(state) === "ko" ? "사운드 / 발화 / 립싱크 바인딩" : "SOUND / SPEECH / LIP-SYNC BINDING")} <b>${state.sound_sources?.length || 0} / 64</b></h3><div class="group-body source-scrollbox" data-scroll-id="soundSources">${hmbRenderPromptSoundSources(state)}</div><div class="group-resize-bar nodrag" data-resize-group="soundSources" title="Resize sound binding"></div></section>
         <section class="group-card vtext" data-group-id="videoText" ${hVideoText}><h3>${escapeHtml(uiText(state, "video_vfx", "VFX"))}</h3><div class="group-body"><div class="text-grid">${groupDFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="videoText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
       </main>
     </div>`;
   return `${includeStyle ? `<style>
+      .sound-card .group-body{padding:8px;display:flex;flex-direction:column;gap:8px}.sound-binding-row{border:1px solid rgba(148,163,184,.25);border-radius:6px;padding:7px;background:#101827}.sound-binding-main{display:grid;grid-template-columns:minmax(120px,1.2fr) 100px 100px minmax(120px,1fr) auto auto;align-items:center;gap:8px}.sound-binding-main b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sound-card label{display:flex;flex-direction:column;gap:3px;font-size:10px;color:#a8b8cf}.sound-card input,.sound-card select,.sound-card textarea{min-width:0;width:100%;box-sizing:border-box;background:#0a1120;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:5px;font-size:11px}.sound-card .sound-toggle{flex-direction:row;align-items:center;white-space:nowrap}.sound-toggle input{width:14px;height:14px}.sound-binding-detail{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px}.sound-timing{display:grid;grid-template-columns:repeat(4,minmax(50px,1fr)) auto;gap:6px;align-items:end}.sound-direction textarea,.sound-transcript textarea{resize:vertical;min-height:36px}.sound-binding-empty{color:#94a3b8;padding:8px;border:1px dashed #334155;font-size:11px}@container(max-width:1000px){.sound-binding-main{grid-template-columns:1fr 1fr 1fr}.sound-binding-detail{grid-template-columns:1fr}}@container(max-width:620px){.sound-binding-main,.sound-timing{grid-template-columns:1fr 1fr}}
+      .sound-speaker-reference{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+      .sound-speaker-reference label{flex:1 1 150px;min-width:0}
+      .sound-speaker-reference label:first-child{flex:2 1 220px}
       .hmb-dashboard :is(button,input,select,textarea):not([data-hmb-native-identity] *):not([data-hmb-native-actions] *){font-family:inherit}
       .image-video-surface-columns{display:grid;grid-template-columns:minmax(0,1fr) 4.5rem;gap:8px;align-items:start;min-width:0}
       .image-surface-heading{text-align:center;white-space:nowrap}
@@ -6572,14 +6826,17 @@ function hmbApplyInitialNodeSizeOnce(container, state = null) {
     // The shell-owned one-shot marker keeps later edits, tab changes and resize
     // observer updates from restoring this startup size during the session.
     const manager = Boolean(state?.multi_shot_enabled);
-    const width = `${HMB_DEFAULT_NODE_WIDTH}px`;
-    const height = `${HMB_MANAGER_DEFAULT_NODE_HEIGHT}px`;
+    // A saved user shell is independent from the new default card height.
+    const savedWidth = parseFloat(shell.style.width);
+    const savedHeight = parseFloat(shell.style.height);
+    const width = `${Number.isFinite(savedWidth) && savedWidth > 0 ? savedWidth : HMB_DEFAULT_NODE_WIDTH}px`;
+    const height = `${Number.isFinite(savedHeight) && savedHeight > 0 ? savedHeight : HMB_MANAGER_DEFAULT_NODE_HEIGHT}px`;
     const needsWidth = shell.style.width !== width;
     const needsHeight = shell.style.height !== height;
     if (needsWidth) shell.style.width = width;
     if (needsHeight) shell.style.height = height;
-    shell.style.minWidth = `${HMB_MIN_NODE_WIDTH}px`;
-    shell.style.minHeight = `${manager ? 240 : HMB_MIN_NODE_HEIGHT}px`;
+    shell.style.minWidth = `${Number.isFinite(savedWidth) && savedWidth > 0 ? Math.min(savedWidth, HMB_MIN_NODE_WIDTH) : HMB_MIN_NODE_WIDTH}px`;
+    shell.style.minHeight = `${manager ? 240 : Number.isFinite(savedHeight) && savedHeight > 0 ? Math.min(savedHeight, HMB_MIN_NODE_HEIGHT) : HMB_MIN_NODE_HEIGHT}px`;
     shell.style.maxHeight = "none";
     shell.style.overflow = "visible";
     shell.style.boxSizing = "border-box";
@@ -8085,6 +8342,15 @@ function hmbNativeUiImplementation(container, props) {
       }
     }
   };
+  const scheduleLifecycleIdle = (callback) => {
+    if (!lifecycleCurrent() || typeof requestIdleCallback !== "function") return;
+    const task = { kind: "idle", handle: 0, cancelled: false };
+    lifecycle.tasks.add(task);
+    task.handle = requestIdleCallback((deadline) => {
+      lifecycle.tasks.delete(task);
+      if (!task.cancelled && lifecycleCurrent()) callback(deadline);
+    });
+  };
   const disposeLifecycle = () => {
     lifecycle.disposed = true;
     for (const task of lifecycle.tasks) {
@@ -8092,6 +8358,8 @@ function hmbNativeUiImplementation(container, props) {
       try {
         if (task.kind === "raf" && typeof cancelAnimationFrame === "function") {
           cancelAnimationFrame(task.handle);
+        } else if (task.kind === "idle" && typeof cancelIdleCallback === "function") {
+          cancelIdleCallback(task.handle);
         } else if (task.kind === "timeout") {
           clearTimeout(task.handle);
         }
@@ -8122,6 +8390,29 @@ function hmbNativeUiImplementation(container, props) {
   const controlValues = new WeakMap();
   let sharedListenersInstalled = false;
   let preparingViews = false;
+  let targetOptionWarmup = null;
+  const pendingTargetSelector = "select[data-hmb-target-options-pending]";
+  const warmCurrentTargetOptions = () => {
+    const editor = container.querySelector(".layout");
+    targetOptionWarmup = editor ? { editor } : null;
+    if (!editor?.querySelector(pendingTargetSelector)) return;
+    const warmup = targetOptionWarmup;
+    const step = (deadline) => {
+      if (warmup !== targetOptionWarmup || !container.contains(editor)) return;
+      if (deadline.timeRemaining() >= 3) {
+        const context = hmbImageTargetChoicesContext(state.images);
+        for (let remaining = 3; remaining > 0 && deadline.timeRemaining() >= 2; remaining--) {
+          const select = editor.querySelector(pendingTargetSelector);
+          if (!select) return;
+          hmbFillPromptTargetOptions(select, state, context);
+        }
+      }
+      if (editor.querySelector(pendingTargetSelector)) scheduleLifecycleIdle(step);
+    };
+    // Leave the first presentation and immediate input ahead of background
+    // preparation. A pointer or keyboard interaction fills its own menu now.
+    scheduleLifecycleFrame(() => scheduleLifecycleFrame(() => scheduleLifecycleIdle(step)));
+  };
   // Native range/resize handlers live as long as their prepared controls.
   // Resolve current props/state at the instant of an interaction so a later
   // source generation never leaves those handlers holding an old document.
@@ -8137,7 +8428,6 @@ function hmbNativeUiImplementation(container, props) {
   const releaseListeners = (entries) => {
     for (const [el, event, handler, options] of entries.splice(0)) {
       try { el.removeEventListener(event, handler, options); } catch (_e) {}
-      container.__hmbPromptIsolatedControls?.delete?.(el);
     }
   };
   const retainCurrentView = () => {
@@ -8186,11 +8476,11 @@ function hmbNativeUiImplementation(container, props) {
     container.querySelector('.hmb-dashboard')?.setAttribute('data-shot-number', String(hmbPromptPaletteShotNumber(state)));
     const languageButton = container.querySelector('[data-language-toggle]');
     if (languageButton) languageButton.textContent = uiLanguage(state) === 'ko' ? '한국어' : 'EN';
-    // A top-position page needs no synchronous layout read immediately after
-    // reattaching its controls. Keep nonzero restoration synchronous so a rapid
-    // next selection cannot capture a not-yet-restored position.
-    hmbRestoreSourceScroll(container, HMB_SOURCE_SCROLL_KEYS.every((key) => hmbReadStoredSourceScroll(container, key) === 0));
+    // The current page's scroll events already retain its position. Restore
+    // the selected page on the next frame, after the editor has been attached.
+    hmbRestoreSourceScroll(container, true);
     hmbRestoreTextEditingStateDeferred(container);
+    warmCurrentTargetOptions();
     try { container.__hmbPromptLastPaintedValue = JSON.stringify(state); } catch (_e) {}
     return true;
   };
@@ -8265,10 +8555,20 @@ function hmbNativeUiImplementation(container, props) {
     hmbInstallGroupResizers(container, liveState, liveProps, listeners);
     hmbInstallKeepOutResizers(container, liveState, liveProps, listeners);
     hmbInstallFrameRangeInteractions(container, liveState, liveProps, listeners);
-    hmbRestoreSourceScroll(container);
+    hmbRestoreSourceScroll(container, Boolean(container.__hmbPromptShotSwitchInProgress));
     hmbRestorePromptControlFocus(container);
     hmbRestoreTextEditingStateDeferred(container);
     if (!sharedListenersInstalled) {
+    const activateTargetOptions = (event) => {
+      const select = event.target?.closest?.(pendingTargetSelector);
+      if (select && container.contains(select) && !select.disabled && !state.disabled) {
+        hmbFillPromptTargetOptions(select, state);
+      }
+    };
+    for (const event of ["focusin", "pointerdown", "mousedown", "keydown", "click"]) {
+      container.addEventListener(event, activateTargetOptions, true);
+      listeners.push([container, event, activateTargetOptions, true]);
+    }
     const contentChanged = () => { delete container.__hmbPromptNavigationOnlyState; };
     container.addEventListener('input', contentChanged, true);
     container.addEventListener('change', contentChanged, true);
@@ -8776,10 +9076,12 @@ function hmbNativeUiImplementation(container, props) {
         const navigationOnly = !container.__hmbPromptLibraryCommitPending
           && !container.__hmbPromptLibraryCompositionActive
           && !(container.__hmbPromptLibraryDirtyText instanceof Map);
-        hmbCaptureUiBeforeStateEmit(container, state);
+        // Scroll events and resize handlers already retain their values. Reading
+        // scrollTop or textarea offsetHeight here would lay out a just-attached
+        // editor synchronously, even if the user only selected another tab.
+        hmbPreserveManualGroupHeights(container, state);
         const pointerTextFocus = container.__hmbPromptShotPointerFocus;
         delete container.__hmbPromptShotPointerFocus;
-        hmbCaptureSourceScroll(container);
         const memories = container.__hmbPromptShotInteractionStates || new Map();
         memories.set(hmbPromptDocumentKey(state.shot), {
           text: pointerTextFocus || container.__hmbPromptLibraryTextFocus,
@@ -8796,7 +9098,9 @@ function hmbNativeUiImplementation(container, props) {
         const memory = memories.get(hmbPromptDocumentKey(state.shot));
         container.__hmbPromptLibraryTextFocus = memory?.text || null;
         container.__hmbPromptLibraryControlFocus = null;
-        container.__hmbPromptLibraryScrollMemory = memory?.scroll || { imageSources: 0, videoSources: 0 };
+        container.__hmbPromptLibraryScrollMemory = Object.fromEntries(
+          HMB_SOURCE_SCROLL_KEYS.map((key) => [key, memory?.scroll?.[key] ?? 0]),
+        );
         HMB_GROUP_KEYS.forEach((key) => hmbStoreGroupHeight(container, key, state.ui?.group_heights?.[key] || HMB_GROUP_START_HEIGHTS[key]));
         container.__hmbPromptShotSwitchInProgress = true;
         try {
@@ -8875,6 +9179,71 @@ function hmbNativeUiImplementation(container, props) {
       listeners.push([button, "click", handler]);
     });
 
+    container.querySelectorAll("[data-sound-field]").forEach((field) => {
+      const instance = field.getAttribute("data-sound-instance") || "";
+      const key = field.getAttribute("data-sound-field");
+      const discrete = field.type === "checkbox" || field.tagName === "SELECT";
+      const apply = () => {
+        if (!hmbSetPromptSoundField(state, instance, key, field.type === "checkbox" ? field.checked : field.value)) return false;
+        hmbRememberPromptDirtyTextControl(container, field, state);
+        return true;
+      };
+      const inputHandler = () => {
+        if (!apply()) return;
+        if (key !== "audio_sub_type") {
+          hmbScheduleImmediateStateCommit(container, props, state);
+          return;
+        }
+        const row = field.closest("[data-sound-row]");
+        const purpose = row?.querySelector('[data-sound-field="purpose"]');
+        const token = row?.querySelector("[data-sound-token]");
+        const applies = field.value === "Apply";
+        if (purpose) purpose.disabled = state.disabled || !applies;
+        if (token) {
+          const source = state.sound_sources.find(item => item.instance_id === instance);
+          token.textContent = applies && source?.audio || "OFF";
+        }
+        hmbSchedulePromptInteractionCommit(container, props, state);
+      };
+      const blurHandler = event => {
+        if (!apply()) return;
+        hmbFinalizePromptTextBlur(container, event, () => {
+          hmbCaptureUiBeforeStateEmit(container, state);
+          emit(props, state, container);
+          hmbRestoreSourceScroll(container);
+        });
+      };
+      field.addEventListener(discrete ? "change" : "input", inputHandler);
+      listeners.push([field, discrete ? "change" : "input", inputHandler]);
+      if (!discrete) { field.addEventListener("blur", blurHandler); listeners.push([field, "blur", blurHandler]); }
+    });
+
+    container.querySelectorAll("[data-sound-speaker]").forEach((field) => {
+      const instance = field.getAttribute("data-sound-instance") || "";
+      const control = field.getAttribute("data-sound-speaker");
+      const handler = () => {
+        if (state.disabled || field.disabled) return;
+        const track = state.sound_sources.find(row => row.instance_id === instance);
+        if (!track) return;
+        const previous = hmbNormalizeSoundSpeakerBinding(
+          {...track, ...state.sound_overlays?.[instance]}.speaker_binding,
+        );
+        const key = control === "source" ? field.value : hmbSoundSpeakerSourceKey(previous);
+        const source = state.speaker_sources.find(row => hmbSoundSpeakerSourceKey(row) === key);
+        let binding = null;
+        if (key) {
+          if (!source || (control === "color" && !source.is_mask)) return;
+          const color = control === "color" ? field.value : "";
+          if (color && !source.colors.includes(color)) return;
+          binding = {kind: source.kind, source_id: source.source_id, color};
+        }
+        if (!hmbSetPromptSoundField(state, instance, "speaker_binding", binding)) return;
+        hmbCommitLocalPromptStructure(container, props, state, remount);
+      };
+      field.addEventListener("change", handler);
+      listeners.push([field, "change", handler]);
+    });
+
     container.querySelectorAll("[data-text-key]").forEach((field) => {
       const key = field.getAttribute("data-text-key");
       const inputHandler = () => {
@@ -8904,7 +9273,6 @@ function hmbNativeUiImplementation(container, props) {
       const [element, event, handler, options] = sharedListeners[index];
       if (element === container || element === globalThis.window || container.contains(element)) continue;
       try { element.removeEventListener(event, handler, options); } catch (_e) {}
-      container.__hmbPromptIsolatedControls?.delete?.(element);
       sharedListeners.splice(index, 1);
     }
     for (const binding of listeners) {
@@ -8938,6 +9306,7 @@ function hmbNativeUiImplementation(container, props) {
     }
     listeners = pageListeners;
     sharedListenersInstalled = true;
+    warmCurrentTargetOptions();
     try { container.__hmbPromptLastPaintedValue = JSON.stringify(state); } catch (_e) {}
     return state;
   };
@@ -8950,6 +9319,12 @@ function hmbNativeUiImplementation(container, props) {
       shot.shot_uuid === selected && shot.channel_uuid === state.shot?.channel_uuid
     ))) return;
     if (!catalog.some((shot) => shot.shot_uuid !== selected && !preparedViews.has(shot.shot_uuid))) return;
+    // Heavy catalogs open the active editor first. An uncached Shot still uses
+    // the existing synchronous switch path and is retained after its first visit.
+    const documentChars = Object.values(state.shot_documents || {}).reduce(
+      (total, document) => total + (typeof document === "string" ? document.length : 0), 0,
+    );
+    if (state.images.length >= HMB_EAGER_PROMPT_IMAGE_LIMIT || documentChars > HMB_EAGER_PROMPT_DOCUMENT_BUDGET) return;
     preparingViews = true;
     container.__hmbPromptShotSwitchInProgress = true;
     try {
@@ -9137,6 +9512,7 @@ function hmbNativeUiImplementation(container, props) {
     container.removeEventListener?.("hmb-color-lut-header-state", nativeHeaderState);
     delete container.__hmbPromptShotPointerFocus;
     delete container.__hmbPromptShotInteractionStates;
+    delete container.__hmbPromptScrollRestore;
     delete container.__hmbPromptNavigationOnlyState;
     delete container.__hmbPromptNavigationEcho;
     stopExternalCommitBoundary();
@@ -9168,7 +9544,6 @@ function hmbNativeUiImplementation(container, props) {
     HMB_PROMPT_PREPARED_DOCUMENTS.delete(state);
     delete container.__hmbPromptReconciledPublications;
     delete container.__hmbPromptPendingRevisionMergeNeedsPublication;
-    delete container.__hmbPromptIsolatedControls;
     if (container.__hmbPromptLibraryApplyProps === applyProps) {
       delete container.__hmbPromptLibraryApplyProps;
     }
@@ -9369,7 +9744,7 @@ function hmbAcquireNativeStockSafety(container) {
   let shared = doc[key];
   if (!shared) {
     const owners = new Set(), identities = new Map();
-    let contextNode = null, badge = null, notice = null, disposed = false;
+    let contextNode = null, notice = null, noticeTimer = null, disposed = false;
     const nativeReady = () => doc.documentElement.getAttribute("data-hmb-native-deletion-guard") === "engine-preflight"
       && doc.documentElement.getAttribute("data-hmb-native-deletion-protection-version") === "2";
     const rootOf = value => value?.closest?.(".react-flow__node[data-id]") || null;
@@ -9410,7 +9785,7 @@ function hmbAcquireNativeStockSafety(container) {
       if (!nodeMenu && !(trash && button.closest(".react-flow"))) return null;
       return { button, nodeMenu };
     };
-    const dismiss = () => { notice?.remove(); notice = null; };
+    const dismiss = () => { win.clearTimeout(noticeTimer); notice?.remove(); notice = null; };
     const show = () => {
       if (disposed || nativeReady()) return;
       if (notice?.isConnected) { notice.querySelector("button")?.focus(); return; }
@@ -9418,12 +9793,13 @@ function hmbAcquireNativeStockSafety(container) {
       notice.setAttribute("data-hmb-native-safety-notice", "required");
       notice.setAttribute("role", "alert");
       Object.assign(notice.style, { position: "fixed", zIndex: "2147483647", right: "20px", bottom: "64px", maxWidth: "420px", padding: "18px", border: "1px solid #b89458", borderRadius: "18px", background: "#151c29", color: "#f8fafc", font: "13px/1.6 system-ui,sans-serif", boxShadow: "0 8px 32px #0008" });
-      const title = doc.createElement("strong"); title.textContent = "HMB 편집기·삭제 보호 확인이 필요합니다";
+      const title = doc.createElement("strong"); title.textContent = "HMB 노드 삭제를 중단했습니다";
       const text = doc.createElement("p");
-      text.textContent = "Override 업데이트 로그에서 current/applied를 확인하세요. UI 또는 엔진 보호 상태를 확인하지 못해 감지된 HMB 노드 삭제 시도를 중단했습니다. 작업 저장 후 Griptape 완전 종료·재시작하세요. current/applied는 디스크 파일 상태이며 현재 화면의 통합 상태를 보장하지 않습니다. 실패 시 로그의 원인을 확인하세요. 이 안내만으로 다른 삭제 경로의 엔진 보호가 준비됐다고 보장할 수 없습니다.";
+      text.textContent = "현재 화면에서 연결 상태를 확인할 수 없습니다. 작업을 저장하고 Griptape를 다시 시작한 뒤 확인하세요.";
       const close = doc.createElement("button"); close.type = "button"; close.textContent = "확인";
       Object.assign(close.style, { border: "1px solid #64748b", borderRadius: "999px", background: "#243044", color: "#f8fafc", padding: "6px 18px", cursor: "pointer" });
       close.addEventListener("click", dismiss); notice.append(title, text, close); doc.body.append(notice); close.focus();
+      noticeTimer = win.setTimeout(dismiss, 8000);
     };
     const stop = event => { event.preventDefault(); event.stopPropagation(); event.stopImmediatePropagation(); show(); };
     const keydown = event => {
@@ -9435,12 +9811,12 @@ function hmbAcquireNativeStockSafety(container) {
       const action = deleteControl(event.target);
       if (action && (ownedTarget(action.button) || managed()
           || action.nodeMenu && contextNode?.isConnected && roots().has(contextNode))) stop(event);
-      else if (!event.target?.closest?.("[data-hmb-native-safety-notice],[data-hmb-native-safety-status]")) contextNode = null;
+      else if (!event.target?.closest?.("[data-hmb-native-safety-notice]")) { contextNode = null; dismiss(); }
     };
     const contextmenu = event => { contextNode = rootOf(event.target); };
     const dispose = () => {
       if (disposed) return;
-      disposed = true; observer?.disconnect(); badge?.remove(); dismiss(); contextNode = null;
+      disposed = true; observer?.disconnect(); dismiss(); contextNode = null;
       win.removeEventListener("keydown", keydown, true); win.removeEventListener("click", click, true); win.removeEventListener("contextmenu", contextmenu, true);
       if (doc[key] === shared) delete doc[key];
     };
@@ -9448,14 +9824,7 @@ function hmbAcquireNativeStockSafety(container) {
       if (disposed) return;
       const retained = roots();
       if (!owners.size && !retained.size) { dispose(); return; }
-      if (nativeReady() || !retained.size) { badge?.remove(); badge = null; dismiss(); return; }
-      if (badge?.isConnected || !doc.body) return;
-      badge = doc.createElement("button"); badge.type = "button";
-      badge.setAttribute("data-hmb-native-safety-status", "required");
-      badge.setAttribute("aria-label", "HMB Override 업데이트·재시작 및 삭제 보호 상태 확인");
-      badge.textContent = "HMB UI·삭제 보호 상태 확인";
-      Object.assign(badge.style, { position: "fixed", zIndex: "2147483646", right: "20px", bottom: "20px", border: "1px solid #b89458", borderRadius: "999px", padding: "7px 14px", background: "#151c29", color: "#f5d49a", font: "12px system-ui,sans-serif", cursor: "pointer", boxShadow: "0 4px 18px #0006" });
-      badge.addEventListener("click", show); doc.body.append(badge);
+      if (nativeReady() || !retained.size) dismiss();
     };
     const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(sync) : null;
     observer?.observe(doc.documentElement, { attributes: true, attributeFilter: ["data-hmb-native-deletion-guard", "data-hmb-native-deletion-protection-version", "data-id"], childList: true, subtree: true });

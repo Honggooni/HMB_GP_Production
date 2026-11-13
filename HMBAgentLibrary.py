@@ -135,6 +135,10 @@ _FROZEN_PROMPT_SHOT_ATTRIBUTE = "_hmb_frozen_prompt_shot_source"
 
 _WEB_AUTHORITY_SEAL = object()
 _EXECUTION_GATE_GUARD = threading.Lock()
+_HMB_EXECUTION_STAGES = frozenset({
+    "source_wait", "policy_verify", "policy_bootstrap", "prompt_prepare",
+    "native_prepare", "media_prepare", "inference", "finalize", "complete",
+})
 
 
 def _hmb_native_values_equal(left, right):
@@ -254,8 +258,8 @@ _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE = (
 _HMB_SOURCE_PREPARE_TIMEOUT_SECONDS = 30.0
 _HMB_SOURCE_PREPARE_RETRY_SECONDS = 0.1
 _HMB_SOURCE_FAILURE_MESSAGES = {
-    "SOURCE_PREPARATION_TIMEOUT": "소스 준비 확인 시간이 초과되었습니다. 이미지·영상 소스의 준비 상태를 확인한 뒤 다시 실행하세요.",
-    "SOURCE_MEDIA_UNAVAILABLE": "선택한 이미지·영상 소스를 읽을 수 없습니다. 해당 PC의 파일 경로와 접근 권한을 확인하세요.",
+    "SOURCE_PREPARATION_TIMEOUT": "소스 준비 확인 시간이 초과되었습니다. 이미지·영상·사운드 소스의 준비 상태를 확인한 뒤 다시 실행하세요.",
+    "SOURCE_MEDIA_UNAVAILABLE": "선택한 이미지·영상·사운드 소스를 읽을 수 없습니다. 해당 PC의 파일 경로와 접근 권한을 확인하세요.",
     "SOURCE_SHOT_IDENTITY_MISMATCH": "샷 또는 소스 식별자가 변경되었습니다. 현재 샷과 원본 연결을 확인하세요.",
     "SOURCE_PROMPT_OWNER_UNAVAILABLE": "원래 연결된 Prompt 또는 소스 노드를 확인할 수 없습니다. 현재 연결을 확인하세요.",
     "SOURCE_CONNECTION_UNAVAILABLE": "현재 샷의 연결 확인을 완료하지 못했습니다. 연결 상태를 확인하세요.",
@@ -284,12 +288,23 @@ def _hmb_source_is_preparing(exc):
     return isinstance(exc, ValueError) and (
         getattr(exc, "hmb_image_asset_selection_preparing", False) is True
         or getattr(exc, "hmb_picker_media_preparing", False) is True
+        or getattr(exc, "hmb_sound_preparing", False) is True
     )
 
 
 def _hmb_source_failure(exc):
     if isinstance(exc, _HMBSourcePreparationError):
         return exc
+    sound_code = getattr(exc, "code", None)
+    sound_code = sound_code if isinstance(sound_code, str) else ""
+    if sound_code in {"SOUND_SOURCE_UNAVAILABLE", "SOUND_SOURCE_CHANGED", "SOUND_SOURCE_OUTSIDE_PROJECT", "SOUND_PREPARATION_FAILED"}:
+        return _HMBSourcePreparationError("SOURCE_MEDIA_UNAVAILABLE")
+    if sound_code in {"SOUND_SHOT_MISMATCH", "SOUND_PROJECT_MISMATCH", "SOUND_SOURCE_IDENTITY_INVALID"}:
+        return _HMBSourcePreparationError("SOURCE_SHOT_IDENTITY_MISMATCH")
+    if sound_code == "SOUND_OWNER_UNAVAILABLE":
+        return _HMBSourcePreparationError("SOURCE_PROMPT_OWNER_UNAVAILABLE")
+    if sound_code == "SOUND_CONNECTION_INVALID":
+        return _HMBSourcePreparationError("SOURCE_CONNECTION_UNAVAILABLE")
     # Read only to classify. Never retain or publish the original payload.
     text = str(exc).casefold()
     if isinstance(exc, (FileNotFoundError, PermissionError)) or any(part in text for part in (
@@ -330,6 +345,8 @@ _HMB_NATIVE_FAILURE_CODES = frozenset({
     "MODEL_PROVIDER",
     "MODEL_OR_ENDPOINT_NOT_FOUND",
     "MODEL_REQUEST_INVALID",
+    "ANALYSIS_AUDIO_UNSUPPORTED",
+    "ANALYSIS_ORIGINAL_UNAVAILABLE",
     "HOST_ADAPTER",
     "EMPTY_OUTPUT",
 })
@@ -337,6 +354,10 @@ _HMB_NATIVE_FAILURE_CODES = frozenset({
 
 class _HMBModelSelectionRequired(RuntimeError):
     """A saved model must never be replaced by a different paid model."""
+
+
+class _HMBAnalysisOriginalError(RuntimeError):
+    """A selected analysis original could not be prepared for the native call."""
 
 
 _HMB_NATIVE_FAILURE_STAGES = frozenset({
@@ -372,6 +393,13 @@ def _hmb_execution_failure_message(code: str, *, stage: str = "") -> str:
             "The Agent provider rejected the request with HTTP 400/422. Check the selected "
             "model's supported inputs and request settings. No replacement model was invoked."
         ),
+        "ANALYSIS_AUDIO_UNSUPPORTED": (
+            "선택한 Agent 모델은 분석 원본 음원 입력을 지원하지 않습니다. "
+            "음원 입력을 지원하는 Gemini 모델을 선택하거나 원본 사용을 해제하세요."
+        ),
+        "ANALYSIS_ORIGINAL_UNAVAILABLE": (
+            "분석 원본을 Agent에 첨부하지 못했습니다. 파일 접근, Prompt 연결, 모델의 입력 지원을 확인하세요."
+        ),
         "HOST_ADAPTER": "The native Agent or model adapter could not complete execution.",
         "EMPTY_OUTPUT": "The Agent model returned no final text.",
     }
@@ -389,6 +417,8 @@ def _hmb_native_failure_code(exc: BaseException) -> str:
 
     if isinstance(exc, _HMBModelSelectionRequired):
         return "MODEL_SELECTION_REQUIRED"
+    if isinstance(exc, _HMBAnalysisOriginalError):
+        return str(exc)
     status = None
     current, seen = exc, set()
     # SDK wrappers may retain the actual HTTP failure only as their cause.
@@ -1195,6 +1225,11 @@ class _FrozenHMBPromptShotSource:
     def _hmb_project_identity(self):
         return resolve_project(self._document.get("project_identity"), default_legacy=False)
 
+    def _hmb_agent_sound_snapshot(self, machine):
+        if machine != self.machine_prompt:
+            raise RuntimeError("Prompt Shot sound snapshot changed.")
+        return copy.deepcopy(self._document.get("audio_sources") or {})
+
 
 def _is_prompt_shot_manager(source):
     enabled = getattr(source, "_hmb_shot_manager_enabled", None)
@@ -1204,6 +1239,43 @@ def _is_prompt_shot_manager(source):
 def _prompt_transport_text(prompt_value: Any) -> str:
     value = getattr(prompt_value, "value", prompt_value)
     return str(value or "")
+
+
+def _hmb_analysis_public_source_preview(value: str, originals: list[dict]) -> str:
+    """Show opted originals in the native editor without changing Prompt data."""
+    if not value or not originals:
+        return value
+    import ntpath
+
+    additions = {"image": [], "video": [], "audio": []}
+    for row in originals:
+        if not isinstance(row, dict) or row.get("kind") not in additions:
+            continue
+        kind = row["kind"]
+        token = str(row.get("shot_reference") or "")
+        if not re.fullmatch(r"@(?:image|video)[1-9][0-9]{0,2}|@analysis_original(?:_(?:image|video|audio)(?:_?[1-9][0-9]{0,2})?)?", token):
+            token = "@analysis_original"
+        label = ntpath.basename(str(row.get("name") or "")) or ntpath.basename(str(row.get("path") or ""))
+        label = "".join(char if 32 <= ord(char) != 127 else " " for char in label).strip()[:128]
+        additions[kind].append(f"{token} = {label or kind} / Analysis source")
+    if not any(additions.values()):
+        return value
+    lines = value.splitlines()
+    for kind, title, empty in (
+            ("image", "IMAGE SOURCE:", "No image source assigned in HMBPromptLibrary."),
+            ("video", "VIDEO SOURCE:", "No video source assigned in HMBPromptLibrary."),
+            ("audio", "SOUND SOURCE:", "")):
+        extra = additions[kind]
+        if not extra:
+            continue
+        if title not in lines:
+            lines.extend([title, *extra, ""])
+            continue
+        start = lines.index(title) + 1
+        end = next((index for index in range(start, len(lines)) if not lines[index]), len(lines))
+        section = [line for line in lines[start:end] if line != empty]
+        lines[start:end] = [*section, *extra]
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _prompt_text_sha256(value: str) -> str:
@@ -2026,6 +2098,21 @@ class HMBAgentLibrary(_BaseAgent):
         value = _agent_widget_value(shot, shot_catalog, execution_phase,
                                    getattr(self, "_hmb_shot_manager_mode", False) if shot_manager is None else shot_manager)
         value["shot_editor_expanded"] = bool(getattr(self, "_hmb_shot_editor_expanded", True))
+        stage = str(getattr(self, "_hmb_execution_stage", ""))
+        selected = shot if isinstance(shot, dict) else {}
+        worker = getattr(self, "_hmb_shot_workers", {}).get(self._hmb_slot_key(selected.get("channel_uuid"), selected.get("shot_uuid")))
+        if worker is not None:
+            stage = str(getattr(worker, "_hmb_execution_stage", stage))
+            if stage in _HMB_EXECUTION_STAGES and stage != "complete":
+                execution_phase = "running"
+                value["execution_phase"] = execution_phase
+            elif stage == "complete":
+                execution_phase = ""
+                value["execution_phase"] = ""
+        if execution_phase and stage in _HMB_EXECUTION_STAGES:
+            value["execution_stage"] = stage
+            timer = getattr(worker, "_hmb_timing_snapshot", None)
+            value["execution_elapsed_seconds"] = (timer() if callable(timer) else self._hmb_timing_snapshot()).get("total_seconds", 0.0)
         value["shot_states"] = {
             key.split("\x1f", 1)[-1]: str(status)
             for key, status in getattr(self, "_hmb_shot_run_status", {}).items()
@@ -2253,6 +2340,11 @@ class HMBAgentLibrary(_BaseAgent):
             for key in ("tools", "rulesets"):
                 parameter = _parameter_by_name(self, key)
                 desired = slot.get("values", {}).get(key, [])
+                # Native list children carry wire identities shared by the
+                # retained editor. A page change selects those children below;
+                # replacing the list would delete other Shots' connections.
+                if list(getattr(parameter, "children", []) or []):
+                    continue
                 if parameter is not None and not _hmb_native_values_equal(self._hmb_slot_native_list_value(key), desired):
                     setter = getattr(self, "set_parameter_list_value", None)
                     if callable(setter):
@@ -2318,6 +2410,71 @@ class HMBAgentLibrary(_BaseAgent):
         if getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None) is not candidate:
             raise RuntimeError("The exact Shot Prompt owner does not match the managed input.")
         return candidate
+
+    def _hmb_sound_snapshot_for(self, *, channel_uuid="", shot_uuid=""):
+        """Read sound only through the exact retained Prompt owner, never UI JSON."""
+        if self._hmb_shot_manager_enabled():
+            owner = self._hmb_manager_prompt_owner(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+            document = owner._hmb_prompt_shot_document(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+            supplied = document.get("subscription") if isinstance(document, dict) else None
+            if not isinstance(supplied, dict) or supplied.get("channel_uuid") != channel_uuid or supplied.get("shot_uuid") != shot_uuid:
+                raise RuntimeError("Prompt sound document belongs to another Shot.")
+            return copy.deepcopy(document.get("audio_sources") or {})
+        if not _is_direct_hmb_prompt_library_connection(self):
+            return {}
+        source = getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
+        subscription = self._hmb_shot_channel_subscription()
+        if subscription.get("channel_uuid", "") != channel_uuid or subscription.get("shot_uuid", "") != shot_uuid:
+            raise RuntimeError("Agent sound source belongs to another Shot.")
+        getter = getattr(source, "_hmb_sound_snapshot_for", None)
+        if callable(getter):
+            return copy.deepcopy(getter(channel_uuid=channel_uuid, shot_uuid=shot_uuid))
+        return {}
+
+    def _hmb_reference_analysis_owner(self, *, channel_uuid, shot_uuid):
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            return None
+        if self._hmb_shot_manager_enabled():
+            return self._hmb_manager_prompt_owner(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+        if _is_direct_hmb_prompt_library_connection(self):
+            subscription = self._hmb_shot_channel_subscription()
+            if (subscription.get("channel_uuid"), subscription.get("shot_uuid")) == (channel_uuid, shot_uuid):
+                return getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
+        return None
+
+    def _hmb_refresh_analysis_model(self):
+        from HMBAnalysisAgent import schedule_analysis_refresh
+
+        schedule_analysis_refresh(self)
+
+    def _hmb_reference_analysis_for(self, *, channel_uuid, shot_uuid, destination):
+        """Read analysis only through the registered Prompt owner of this Shot."""
+        from _hmb_analysis_delivery import analysis_delivery_context
+
+        owner = self._hmb_reference_analysis_owner(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+        return analysis_delivery_context(owner, channel_uuid=channel_uuid, shot_uuid=shot_uuid,
+                                         destination=destination)
+
+    def _hmb_reference_analysis_original_for(self, *, channel_uuid, shot_uuid):
+        """Read the opted-in original only through the same verified Prompt owner."""
+        from _hmb_analysis_delivery import analysis_original_for_agent
+
+        owner = self._hmb_reference_analysis_owner(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+        return analysis_original_for_agent(owner, channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+
+    def _hmb_reference_analysis_originals_for(self, *, channel_uuid, shot_uuid):
+        """Expose all opted originals to the exact same-Shot Generator caller."""
+        from _hmb_analysis_delivery import analysis_originals
+
+        owner = self._hmb_reference_analysis_owner(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+        return analysis_originals(owner, channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+
+    def _hmb_reference_analysis_results_only_for(self, *, channel_uuid, shot_uuid):
+        """Read the exact registered Analysis delivery mode for Generator routing."""
+        from _hmb_analysis_delivery import analysis_results_only
+
+        owner = self._hmb_reference_analysis_owner(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+        return analysis_results_only(owner, channel_uuid=channel_uuid, shot_uuid=shot_uuid)
 
     def _hmb_agent_shot_result(self, *, channel_uuid, shot_uuid, run_id=None, generator=None):
         if getattr(self, "_hmb_manual_rebind", {}).get("required"):
@@ -2576,6 +2733,7 @@ class HMBAgentLibrary(_BaseAgent):
                 await asyncio.sleep(min(_HMB_SOURCE_PREPARE_RETRY_SECONDS, remaining))
 
     async def _hmb_run_agent_shot(self, *, channel_uuid, shot_uuid, prompt_owner, generator=None):
+        queued_at = time.monotonic()
         lifecycle_generation = int(getattr(self, "_hmb_lifecycle_generation", 0) or 0)
         run_identity = dict(channel_uuid=channel_uuid, shot_uuid=shot_uuid, prompt_owner=prompt_owner,
             lifecycle_generation=lifecycle_generation, generator=generator)
@@ -2600,12 +2758,19 @@ class HMBAgentLibrary(_BaseAgent):
             self._hmb_shot_run_status[key] = "preparing"
             self._hmb_shot_workers[key] = preparation
             self._hmb_shot_publication_step(key, "preparing_status", self._hmb_publish_shot_status)
+            source_started = time.monotonic()
             document = await self._hmb_prepare_shot_document(**run_identity, preparation=preparation)
             # Preparation may wait while this Shot's future settings are edited.
             # Capture current authored values only after exact sources are ready.
             subscription = self._hmb_current_run_subscription(**run_identity)
             slot = copy.deepcopy(self._hmb_shot_slots.get(key) or self._hmb_default_native_slot())
             execution = _HMBAgentShotExecution._from_owner(self, prompt_owner, document, subscription, slot, generator)
+            execution._hmb_source_preparation_seconds = max(0.0, time.monotonic() - source_started)
+            execution._hmb_queue_seconds = max(0.0, source_started - queued_at)
+            execution._hmb_timing_origin = queued_at
+            prewarm = getattr(execution, "_hmb_start_local_runtime_prewarm", None)
+            if callable(prewarm):
+                prewarm(document.get("reference_media"))
             self._hmb_shot_run_status[key] = "running"
             self._hmb_shot_workers[key] = execution
             self._hmb_shot_publication_step(key, "running_status", self._hmb_publish_shot_status)
@@ -2624,6 +2789,7 @@ class HMBAgentLibrary(_BaseAgent):
             result = execution._hmb_execution_result_snapshot()
             text = execution.parameter_output_values.get("output")
             record = {"text": str(text or ""), "result": copy.deepcopy(result),
+                      "audio_sources": copy.deepcopy(document.get("audio_sources") or {}),
                       "observation": execution._hmb_agent_reference_observation_snapshot(),
                       "policy_identity": copy.deepcopy(execution._hmb_shot_policy_identity),
                       "shot": copy.deepcopy(subscription)}
@@ -2733,7 +2899,7 @@ class HMBAgentLibrary(_BaseAgent):
             if cleanup_abort is not None and sys.exc_info()[0] is None:
                 raise cleanup_abort
 
-    def _hmb_handle_shot_action(self, action):
+    def _hmb_handle_shot_action(self, action, *, selected=None):
         if not isinstance(action, dict) or not self._hmb_shot_manager_enabled():
             return
         request_id = str(action.get("request_id") or "")
@@ -2746,7 +2912,8 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_shot_action_ids.add(request_id)
         if len(self._hmb_shot_action_ids) > 256:
             self._hmb_shot_action_ids = {request_id}
-        selected = self._hmb_shot_channel_subscription()
+        if selected is None:
+            selected = self._hmb_shot_channel_subscription()
         channel, shot = selected.get("channel_uuid"), selected.get("shot_uuid")
         if not channel or not shot:
             return
@@ -2804,7 +2971,14 @@ class HMBAgentLibrary(_BaseAgent):
             kwargs = {"name": name, "type": "dict", "default_value": {}, "allowed_modes": {ParameterMode.PROPERTY},
                 "hide": True, "hide_property": True, "hide_label": True, "ui_options": options}
             if Widget is not None:
-                kwargs["traits"] = {Widget(name=_AGENT_WIDGET_NAME, library=_AGENT_WIDGET_LIBRARY_NAME)}
+                # Public SDK live values are presentation-only. Never synchronize
+                # provider, tools or a private runtime prompt through the row.
+                try:
+                    trait = Widget(name=_AGENT_WIDGET_NAME, library=_AGENT_WIDGET_LIBRARY_NAME,
+                                   synced_parameters=["prompt", "additional_context", "output"])
+                except TypeError:  # Older hosts retain the authoritative ACK path.
+                    trait = Widget(name=_AGENT_WIDGET_NAME, library=_AGENT_WIDGET_LIBRARY_NAME)
+                kwargs["traits"] = {trait}
             self.add_parameter(Parameter(**kwargs))
         self._hmb_layout_shot_editor()
 
@@ -2867,6 +3041,12 @@ class HMBAgentLibrary(_BaseAgent):
             # set, immediately after the expanded row, with their original IDs.
             current = list(getattr(root, "children", []) or [])
             row_elements = []
+            display_owner = None
+            if rows and not routing_pending and not manual_pending:
+                try:
+                    display_owner = self._hmb_prompt_display_owner()
+                except RuntimeError:
+                    pass  # Unconnected native Agent is still a valid editor.
             for number in range(1, 6):
                 parameter = _parameter_by_name(self, _AGENT_SHOT_ROW_PREFIX + str(number))
                 if parameter is None:
@@ -2884,6 +3064,31 @@ class HMBAgentLibrary(_BaseAgent):
                     "request_id": getattr(self, "_hmb_row_action_ack", {}).get(self._hmb_slot_key(catalog.get("channel_uuid"), shot["shot_uuid"]), ""),
                     "status": self._hmb_shot_run_status.get(self._hmb_slot_key(catalog.get("channel_uuid"), shot["shot_uuid"]), "")}
                     if shot else {"schema": "hmb-agent-shot-row", "version": 1, "shot": {}, "selected": False, "expanded": False, "status": ""})
+                if shot:
+                    # Prepare the five small public pages while publishing the
+                    # catalog, so a click need not wait for a transport round trip.
+                    # Execution still resolves the exact owner independently.
+                    page = self._hmb_prompt_manager_view(display_owner, subscription={
+                        "schema": "hmb-shot-channel-subscription", "version": 1,
+                        "participant_kind": "agent", "enabled": True,
+                        "channel_uuid": catalog.get("channel_uuid", ""), "shot_uuid": shot["shot_uuid"],
+                        "shot_number": shot["number"], "shot_name": shot["name"]}) if display_owner else None
+                    if page is not None:
+                        saved = getattr(self, "_hmb_shot_slots", {}).get(
+                            self._hmb_slot_key(catalog.get("channel_uuid"), shot["shot_uuid"]), {})
+                        native = saved.get("values", getattr(self, "_hmb_shot_slots", {}).get(
+                            "__hmb_default_settings__", {}).get("values", {}))
+                        output = saved.get("outputs", {})
+                        value["display_page"] = {"prompt": page["visible_prompt"],
+                            "additional_context": native.get("additional_context", ""),
+                            "output": output.get("output", "")}
+                    worker = getattr(self, "_hmb_shot_workers", {}).get(self._hmb_slot_key(catalog.get("channel_uuid"), shot["shot_uuid"]))
+                    stage = str(getattr(worker, "_hmb_execution_stage", ""))
+                    if stage in _HMB_EXECUTION_STAGES:
+                        value["execution_stage"] = stage
+                        timer = getattr(worker, "_hmb_timing_snapshot", None)
+                        if callable(timer):
+                            value["execution_elapsed_seconds"] = timer().get("total_seconds", 0.0)
                 if shot and routing_pending:
                     value["routing_pending"] = True
                 rejection = getattr(self, "_hmb_row_action_rejections", {}).get(parameter.name)
@@ -3053,18 +3258,27 @@ class HMBAgentLibrary(_BaseAgent):
             if len(self._hmb_shot_action_ids) > 256:
                 self._hmb_shot_action_ids = {request_id}
             self._hmb_legacy_saved_widget_value = None
-        raw = self._native_parameter_value(_AGENT_WIDGET_PARAMETER, {})
-        current = raw.get("shot", {}) if isinstance(raw, dict) else {}
         shot = exact[0]
-        same = current.get("shot_uuid") == shot["shot_uuid"] and current.get("channel_uuid") == catalog["channel_uuid"]
-        next_value = self._hmb_widget_value({"channel_uuid": catalog["channel_uuid"], **shot}, catalog)
-        next_value["shot_editor_expanded"] = (
-            action["expanded"] if action["kind"] == "select" and type(action.get("expanded")) is bool
-            else not self._hmb_shot_editor_expanded if same and action["kind"] == "select" else True)
-        if action["kind"] != "select":
-            next_value["action"] = {"kind": action["kind"], "request_id": request_id}
-        with self._hmb_editor_update(page_only=action["kind"] == "select"):
-            self.set_parameter_value(_AGENT_WIDGET_PARAMETER, next_value)
+        action_kind = action["kind"]
+        direct_run = action_kind in {"run_selected", "cancel_selected"} and not self._hmb_shot_editor_expanded
+        with self._hmb_editor_update(page_only=action_kind == "select" or direct_run):
+            if direct_run:
+                # The collapsed row already carries the exact validated shot.
+                # Running it must not switch the editor or persist an unchanged page.
+                self._hmb_handle_shot_action({"kind": action_kind, "request_id": request_id}, selected={
+                    "channel_uuid": catalog["channel_uuid"], "shot_uuid": shot["shot_uuid"],
+                })
+            else:
+                raw = self._native_parameter_value(_AGENT_WIDGET_PARAMETER, {})
+                current = raw.get("shot", {}) if isinstance(raw, dict) else {}
+                same = current.get("shot_uuid") == shot["shot_uuid"] and current.get("channel_uuid") == catalog["channel_uuid"]
+                next_value = self._hmb_widget_value({"channel_uuid": catalog["channel_uuid"], **shot}, catalog)
+                next_value["shot_editor_expanded"] = (
+                    action["expanded"] if action_kind == "select" and type(action.get("expanded")) is bool
+                    else not self._hmb_shot_editor_expanded if same and action_kind == "select" else True)
+                if action_kind != "select":
+                    next_value["action"] = {"kind": action_kind, "request_id": request_id}
+                self.set_parameter_value(_AGENT_WIDGET_PARAMETER, next_value)
             # A transport promise is not proof that the native editor switched.
             # Commit the canonical row once, after all exact native settings.
             if not hasattr(self, "_hmb_row_action_ack"):
@@ -3412,6 +3626,9 @@ class HMBAgentLibrary(_BaseAgent):
             "policy_status": ("absent" if getattr(self, "_hmb_run_policy_omitted", False)
                               else "applied" if getattr(self, "_hmb_run_policy_applied", False) else "not_applied"),
         }
+        timings = self._hmb_timing_snapshot()
+        if timings:
+            result["timing"] = timings
         project = getattr(self, "_hmb_run_project_identity", {})
         if isinstance(project, dict) and project.get("project_id"):
             result.update(project_id=project["project_id"], project_name=project.get("project_name", ""))
@@ -3664,6 +3881,11 @@ class HMBAgentLibrary(_BaseAgent):
         """
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return
+        self._hmb_timing_started = None
+        self._hmb_timing_finished = None
+        self._hmb_execution_stage = ""
+        self._hmb_stage_durations = {}
+        self._hmb_first_native_chunk_seconds = None
         self._hmb_native_inference_started = False
         self._hmb_native_run_completed = False
         self._hmb_native_failure_code = ""
@@ -3679,13 +3901,17 @@ class HMBAgentLibrary(_BaseAgent):
         self._last_raw_output = None
         try:
             await super().aprocess()
+            if isinstance(self, _HMBAgentShotExecution) and self.is_cancellation_requested:
+                raise asyncio.CancelledError()
         except asyncio.CancelledError:
+            self._set_hmb_execution_stage("complete")
             if not bool(getattr(self, "_hmb_node_deleted", False)):
                 message = "[HMB EXECUTION CANCELLED] Agent execution was cancelled. No new render was submitted."
                 self._publish_hmb_execution_block(message)
                 self._set_hmb_execution_result("failed", code="CANCELLED", message=message)
             raise  # Explicit user/host cancellation must still stop work.
         except Exception as exc:
+            self._set_hmb_execution_stage("complete")
             code = str(getattr(self, "_hmb_native_failure_code", "") or _hmb_native_failure_code(exc))
             known = {
                 _HMB_POLICY_UNAVAILABLE_MESSAGE: "POLICY_UNAVAILABLE",
@@ -4069,6 +4295,7 @@ class HMBAgentLibrary(_BaseAgent):
         if (not bool(getattr(self, "_hmb_node_deleted", False))
                 and bool(getattr(self, "_hmb_shot_catalog_snapshot", {}).get("shots"))):
             self._hmb_layout_shot_editor()
+            self._hmb_refresh_analysis_model()
 
     def _hmb_prepare_initial_shot_selection(self, shot_uuid: Any = "") -> None:
         """Capture one unambiguous existing Prompt UUID before catalog adoption."""
@@ -4683,6 +4910,85 @@ class HMBAgentLibrary(_BaseAgent):
         finally:
             self._hmb_prompt_preview_syncing = False
 
+    def _with_analysis_public_source_preview(self, value: str, *, owner: Any, selected: dict) -> str:
+        """Add verified source names to the display mirror only."""
+        if owner is None or not isinstance(selected, dict) or not selected.get("enabled"):
+            return value
+        try:
+            from _hmb_analysis_delivery import analysis_originals
+            originals = analysis_originals(owner, channel_uuid=selected["channel_uuid"],
+                                           shot_uuid=selected["shot_uuid"], preview=True)
+            return _hmb_analysis_public_source_preview(value, originals)
+        except (RuntimeError, ValueError, TypeError, KeyError, ImportError):
+            return value
+
+    def _hmb_prompt_mirror_matches(self, current: Any, previous: str, parameter: Any) -> bool:
+        if current == previous:
+            return True
+        # Standard Agent stores the converter's value (which trims text).
+        convert = getattr(super(), "_convert_value", None)
+        return parameter is not None and callable(convert) and current == convert(parameter, previous)
+
+    def _hmb_refresh_retained_prompt_binding(self, source_node: Any) -> bool:
+        """Refresh the exact retained Prompt while preserving a native draft."""
+        if not _is_direct_hmb_prompt_library_connection(self) or source_node is not getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None):
+            return False
+        current = self._native_parameter_value(_AGENT_PROMPT_INPUT_PARAMETER, "")
+        if current:
+            previous = getattr(self, "_hmb_prompt_preview_value", "")
+            parameter = _parameter_by_name(self, _AGENT_PROMPT_INPUT_PARAMETER)
+            if not previous or not self._hmb_prompt_mirror_matches(current, previous, parameter):
+                return True  # The exact connection is valid; retain the authored editor.
+        return self._hmb_hydrate_shot_prompt_from_source(source_node, _HMB_PROMPT_OUTPUT_PARAMETER)
+
+    def _hmb_refresh_analysis_source_preview(self, source_node: Any, *, channel_uuid: str, shot_uuid: str) -> bool:
+        """Update the owned public mirror through one native parameter event."""
+        if (getattr(self, "_hmb_node_deleted", False) or getattr(self, "lock", False)
+                or not getattr(self, "_hmb_prompt_preview_active", False)
+                or getattr(self, "_hmb_prompt_preview_syncing", False)
+                or getattr(self, "_hmb_prompt_preview_hydration_pending", False)
+                or getattr(self, "_hmb_slot_switching", False)
+                or getattr(self, "_hmb_manual_rebind", {}).get("required")
+                or getattr(self, "_hmb_manual_rebind_hydration_pending", False)
+                or getattr(self, "_hmb_manual_rebind_committing", False)
+                or getattr(self, "_hmb_manual_rebind_inflight", False)
+                or source_node is not getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)):
+            return False
+        selected = self._hmb_shot_channel_subscription()
+        scope = {"channel_uuid": channel_uuid, "shot_uuid": shot_uuid}
+        if (not selected.get("enabled") or any(selected.get(key) != value for key, value in scope.items())
+                or self._hmb_slot_key(**scope) != getattr(self, "_hmb_active_slot_key", None)):
+            return False
+        previous = getattr(self, "_hmb_prompt_preview_value", "")
+        current = self._native_parameter_value(_AGENT_PROMPT_INPUT_PARAMETER, "")
+        parameter = _parameter_by_name(self, _AGENT_PROMPT_INPUT_PARAMETER)
+        if not previous or parameter is None or not self._hmb_prompt_mirror_matches(current, previous, parameter):
+            return False
+        read_cache = getattr(source_node, "_hmb_analysis_preview_view", None)
+        view = read_cache(**scope) if callable(read_cache) else {}
+        identity = view.get("subscription") if isinstance(view, dict) else None
+        if not isinstance(identity, dict) or any(identity.get(key) != value for key, value in scope.items()):
+            return False
+        visible = view.get("visible_prompt")
+        if not isinstance(visible, str) or not visible:
+            return False
+        preview = self._with_analysis_public_source_preview(visible, owner=source_node, selected=selected)
+        emit = getattr(self, "_emit_parameter_lifecycle_event", None)
+        if preview == previous or not callable(emit):
+            return False
+        if self._native_parameter_value(_AGENT_PROMPT_INPUT_PARAMETER, "") != current:
+            return False
+        self._hmb_prompt_preview_syncing = True
+        try:
+            # Initial setup skips native edit callbacks and Shot slot capture.
+            # Keep the existing element ID and publish only its display value.
+            super().set_parameter_value(_AGENT_PROMPT_INPUT_PARAMETER, preview, initial_setup=True, emit_change=False)
+            self._hmb_prompt_preview_value = preview
+            emit(parameter)
+        finally:
+            self._hmb_prompt_preview_syncing = False
+        return True
+
     def _public_prompt_value_after_private_echo(self, value: Any) -> Any:
         """Replace a host echo of the private runtime envelope with safe UI text."""
 
@@ -4744,6 +5050,7 @@ class HMBAgentLibrary(_BaseAgent):
                 return
             if projection_ready:
                 self._hmb_prompt_preview_hydration_pending = False
+                value = self._with_analysis_public_source_preview(value, owner=owner, selected=selected)
             if (value and bool(getattr(self, "_hmb_prompt_preview_active", False))
                     and value == str(getattr(self, "_hmb_prompt_preview_value", "") or "")
                     and not self._matches_active_private_runtime_prompt(
@@ -4779,6 +5086,13 @@ class HMBAgentLibrary(_BaseAgent):
             except Exception:
                 if getattr(self, "_hmb_prompt_manager_source_hint", None) is not None:
                     value = ""
+        if enabled and value:
+            try:
+                selected = self._hmb_shot_channel_subscription()
+                owner = self._hmb_prompt_display_owner()
+                value = self._with_analysis_public_source_preview(value, owner=owner, selected=selected)
+            except (RuntimeError, ValueError, AttributeError):
+                pass
         self._set_native_prompt_preview(value, enabled=enabled)
 
     def _hmb_hydrate_shot_prompt_from_source(
@@ -4833,6 +5147,7 @@ class HMBAgentLibrary(_BaseAgent):
             return False
         self.set_parameter_value(_AGENT_SHOT_PROMPT_INPUT_PARAMETER, value)
         self._refresh_routed_prompt_preview()
+        self._hmb_request_editor_layout()
         return True
 
     def before_value_set(self, parameter, value):
@@ -5031,6 +5346,8 @@ class HMBAgentLibrary(_BaseAgent):
             name = str(getattr(parameter, "name", "") or "")
             if name in _AGENT_NATIVE_SETTING_KEYS or name in {"tools", "rulesets"} or name.startswith(("Behavior", "tools_", "rulesets_")):
                 self._hmb_capture_active_slot()
+            if name in {"model", "model_provider", "agent"}:
+                self._hmb_refresh_analysis_model()
         return result
 
     @staticmethod
@@ -5059,6 +5376,7 @@ class HMBAgentLibrary(_BaseAgent):
             if self._native_parameter_value(str(name), None) == value:
                 if not getattr(self, "_hmb_prompt_preview_syncing", False):
                     self._refresh_routed_prompt_preview()
+                    self._hmb_notify_shot_preview()
                 return None
             kwargs["emit_change"] = False
         if (normalized_name == _AGENT_WIDGET_PARAMETER.casefold() or normalized_name.startswith(_AGENT_SHOT_ROW_PREFIX.casefold())) and not kwargs.get("initial_setup") and isinstance(value, dict) and "action" not in value:
@@ -5122,11 +5440,12 @@ class HMBAgentLibrary(_BaseAgent):
             normalized_name == _AGENT_SHOT_PROMPT_INPUT_PARAMETER.casefold()
             and not bool(getattr(self, "_hmb_prompt_preview_syncing", False))
             and not bool(kwargs.get("initial_setup", False))
-            and not self._hmb_shot_manager_enabled()
         ):
             # Initial replay restores values, not a live source publication.
             # The router refreshes the exact selected document after hydration.
-            self._refresh_routed_prompt_preview()
+            if not self._hmb_shot_manager_enabled():
+                self._refresh_routed_prompt_preview()
+            self._hmb_notify_shot_preview()
         if (
             normalized_name == _AGENT_WIDGET_PARAMETER.casefold()
             and bool(kwargs.get("initial_setup", False))
@@ -5151,6 +5470,10 @@ class HMBAgentLibrary(_BaseAgent):
             "output",
             "logs",
         }:
+            if normalized_name == "output" and value and getattr(self, "_hmb_first_native_chunk_seconds", None) is None:
+                started = getattr(self, "_hmb_timing_started", None)
+                if isinstance(started, (int, float)):
+                    self._hmb_first_native_chunk_seconds = max(0.0, time.monotonic() - started)
             self._hmb_publication_buffer[normalized_name] = (
                 self._hmb_publication_buffer.get(normalized_name, "")
                 + str(value or "")
@@ -5271,6 +5594,7 @@ class HMBAgentLibrary(_BaseAgent):
             # The strict execution pass revalidates the exact source and blocks
             # if a host callback supplied an unreadable value.
             self._refresh_routed_prompt_preview()
+        self._hmb_refresh_analysis_model()
         return result
 
     def after_incoming_connection_removed(
@@ -5295,6 +5619,7 @@ class HMBAgentLibrary(_BaseAgent):
         if str(getattr(target_parameter, "name", "") or "") == (
             _AGENT_SHOT_PROMPT_INPUT_PARAMETER
         ):
+            self._hmb_refresh_analysis_model()
             # SDK removal callbacks are reentrant: the old source's outgoing
             # callback can already have connected a replacement Prompt before
             # this old incoming-removal callback runs. Read the canonical live
@@ -5628,6 +5953,89 @@ class HMBAgentLibrary(_BaseAgent):
         except Exception:
             self._hmb_execution_phase_syncing = False
 
+    def _hmb_timing_snapshot(self) -> dict[str, Any]:
+        """Return bounded numeric diagnostics; source/policy content stays private."""
+        started = getattr(self, "_hmb_timing_started", None)
+        if not isinstance(started, (int, float)):
+            return {}
+        now = getattr(self, "_hmb_timing_finished", None) or time.monotonic()
+        durations = dict(getattr(self, "_hmb_stage_durations", {}))
+        stage = str(getattr(self, "_hmb_execution_stage", ""))
+        if stage in _HMB_EXECUTION_STAGES and stage != "complete":
+            durations[stage] = durations.get(stage, 0.0) + max(0.0, now - getattr(self, "_hmb_stage_started", now))
+        result = {"total_seconds": round(max(0.0, now - started), 6),
+                  "stages_seconds": {key: round(max(0.0, float(value)), 6)
+                                     for key, value in durations.items() if key in _HMB_EXECUTION_STAGES}}
+        for attribute, key in (("_hmb_source_preparation_seconds", "source_preparation_seconds"),
+                               ("_hmb_queue_seconds", "queue_seconds")):
+            value = getattr(self, attribute, None)
+            if isinstance(value, (int, float)):
+                result[key] = round(max(0.0, value), 6)
+        warmup = getattr(self, "_hmb_local_prewarm", None)
+        if isinstance(warmup, dict) and warmup.get("status") in {"not_needed", "cancelled", "already_ready", "ready", "optional_preparation_failed"}:
+            result["local_preparation"] = {"status": warmup["status"]}
+            elapsed = warmup.get("elapsed_seconds")
+            if isinstance(elapsed, (int, float)) and math.isfinite(elapsed):
+                result["local_preparation"]["elapsed_seconds"] = round(max(0.0, elapsed), 6)
+        first = getattr(self, "_hmb_first_native_chunk_seconds", None)
+        if isinstance(first, (int, float)):
+            result["first_native_chunk_seconds"] = round(max(0.0, first), 6)
+        inference = getattr(self, "_hmb_inference_started_at", None)
+        if isinstance(inference, (int, float)):
+            result["native_inference_start_seconds"] = round(max(0.0, inference - started), 6)
+            if isinstance(first, (int, float)):
+                result["first_native_chunk_after_inference_seconds"] = round(max(0.0, first - (inference - started)), 6)
+        return result
+
+    def _hmb_start_local_runtime_prewarm(self, snapshot: Any) -> None:
+        """Overlap decoder imports with this admitted exact Shot's preflight only."""
+        if not isinstance(snapshot, dict) or not any(snapshot.get(key) for key in ("images", "videos")):
+            return
+        frozen = copy.deepcopy(snapshot)
+        generation = int(getattr(self, "_hmb_lifecycle_generation", 0) or 0)
+        def prepare() -> None:
+            try:
+                from _hmb_agent_media import prewarm_local_runtime
+                self._hmb_local_prewarm = prewarm_local_runtime(frozen, is_live=lambda:
+                    self._hmb_lifecycle_is_live(generation) and not bool(getattr(self, "is_cancellation_requested", False)))
+            except Exception:
+                self._hmb_local_prewarm = {"status": "optional_preparation_failed"}
+        try:
+            threading.Thread(target=prepare, name="HMB selected Shot local preparation", daemon=True).start()
+        except Exception:
+            self._hmb_local_prewarm = {"status": "optional_preparation_failed"}
+
+    def _set_hmb_execution_stage(self, stage: str) -> None:
+        if stage not in _HMB_EXECUTION_STAGES:
+            return
+        now = time.monotonic()
+        if not isinstance(getattr(self, "_hmb_timing_started", None), (int, float)):
+            self._hmb_timing_started = now
+            self._hmb_stage_durations = {}
+        previous = str(getattr(self, "_hmb_execution_stage", ""))
+        durations = getattr(self, "_hmb_stage_durations", {})
+        if previous in _HMB_EXECUTION_STAGES and previous != "complete":
+            durations[previous] = durations.get(previous, 0.0) + max(0.0, now - getattr(self, "_hmb_stage_started", now))
+        self._hmb_stage_durations = durations
+        self._hmb_execution_stage = stage
+        self._hmb_stage_started = now
+        if stage == "inference":
+            self._hmb_inference_started_at = now
+        if stage == "complete":
+            self._hmb_timing_finished = now
+        owner = getattr(self, "_hmb_shot_owner", None)
+        if owner is not None and owner._hmb_lifecycle_is_live(getattr(self, "_hmb_shot_owner_generation", None)):
+            owner._hmb_shot_publication_step(owner._hmb_slot_key(
+                self._hmb_shot_subscription.get("channel_uuid"), self._hmb_shot_subscription.get("shot_uuid")),
+                "execution_stage", owner._hmb_publish_shot_status)
+            owner._hmb_shot_publication_step(owner._hmb_slot_key(
+                self._hmb_shot_subscription.get("channel_uuid"), self._hmb_shot_subscription.get("shot_uuid")),
+                "execution_stage_layout", owner._hmb_request_editor_layout)
+        else:
+            self._set_agent_execution_phase("running" if stage in {"native_prepare", "media_prepare", "inference", "finalize"}
+                                            else "authorizing" if stage in {"policy_verify", "policy_bootstrap"}
+                                            else "preparing" if stage in {"source_wait", "prompt_prepare"} else "")
+
     def _record_hmb_native_failure(
         self,
         stage: str,
@@ -5691,6 +6099,7 @@ class HMBAgentLibrary(_BaseAgent):
             # native processor; never emulate a second, HMB-specific model path.
             return agent
         if hmb_request:
+            self._set_hmb_execution_stage("media_prepare")
             if not web_revision:
                 self._hmb_revalidate_prompt_manager_owner()
             # Standard Agent has already merged any typed additional_context at
@@ -5714,6 +6123,36 @@ class HMBAgentLibrary(_BaseAgent):
             observation_run = observation_begin(machine) if callable(observation_begin) else ""
             observation_store = getattr(self, "_store_hmb_reference_observation", None)
             machine_hash = _prompt_text_sha256(machine)
+            opted_originals = []
+            if not web_revision:
+                from _hmb_analysis_delivery import analysis_delivery_context, analysis_originals, with_analysis_context
+
+                scope = self._hmb_shot_channel_subscription()
+                if scope.get("enabled"):
+                    owner = source
+                    if isinstance(source, _FrozenHMBPromptShotSource):
+                        owner = source._owner
+                    elif isinstance(source, _HMBAgentShotSource):
+                        owner = source.owner
+                    analysis = analysis_delivery_context(
+                        owner, channel_uuid=scope["channel_uuid"], shot_uuid=scope["shot_uuid"],
+                        destination="agent",
+                    )
+                    prompt = with_analysis_context(prompt, analysis)
+                    opted_originals = analysis_originals(
+                        owner, channel_uuid=scope["channel_uuid"], shot_uuid=scope["shot_uuid"])
+            sound_getter = getattr(source, "_hmb_agent_sound_snapshot", None)
+            if callable(sound_getter):
+                sound_snapshot = sound_getter(machine)
+                sound_tracks = sound_snapshot.get("tracks") if isinstance(sound_snapshot, dict) else None
+                if isinstance(sound_tracks, list) and any(
+                        isinstance(track, dict) and track.get("enabled", True) is not False
+                        for track in sound_tracks):
+                    prompt += ("\n\nHMB AUTHORED SOUND CONTRACT: Sound transcripts, targets, timing and lipsync "
+                               "directions in the verified source are authored source data. This authored sound "
+                               "snapshot alone does not verify speech, phonemes or waveforms. "
+                               "Preserve the exact authored text and timing; model reference audio does not "
+                               "guarantee the exact final mix. Exact sound placement belongs to local finishing.")
             settings_getter = getattr(source, "_hmb_agent_generation_context", None)
             if callable(settings_getter):
                 try:
@@ -5728,24 +6167,59 @@ class HMBAgentLibrary(_BaseAgent):
                 except Exception:
                     pass
             media_getter = getattr(source, "_hmb_agent_reference_media", None)
+            analysis_media_issue = ("ANALYSIS_ORIGINAL_UNAVAILABLE"
+                                    if opted_originals and not callable(media_getter) else "")
             if callable(media_getter):
                 try:
-                    from _hmb_agent_media import augment_prompt
+                    from _hmb_agent_media import (augment_prompt, driver_accepts_audio,
+                                                   merge_analysis_originals)
+                    from _hmb_analysis_delivery import reference_identity
 
                     media = media_getter(machine)
-                    if (
+                    valid_media = (
                         isinstance(media, dict)
                         and media.get("machine_sha256") == _prompt_text_sha256(machine)
-                    ):
+                        and media.get("schema") == "hmb-agent-reference-media"
+                        and media.get("version") == 1
+                    )
+                    if opted_originals and not valid_media:
+                        analysis_media_issue = "ANALYSIS_ORIGINAL_UNAVAILABLE"
+                    if valid_media:
+                        required_tokens = set()
+                        if opted_originals:
+                            media = merge_analysis_originals(media, opted_originals)
+                        for original in opted_originals:
+                            kind = original.get("kind")
+                            expected = reference_identity(str(original.get("path") or ""))
+                            original_token = next((str(row.get("token") or "")
+                                for row in media.get(str(kind) + "s", []) if isinstance(row, dict)
+                                and reference_identity(str(row.get("source") or "")) == expected), "")
+                            if not original_token:
+                                analysis_media_issue = "ANALYSIS_ORIGINAL_UNAVAILABLE"
+                            else:
+                                required_tokens.add(original_token)
+                            if kind == "audio" and not driver_accepts_audio(agent):
+                                analysis_media_issue = "ANALYSIS_AUDIO_UNSUPPORTED"
+                        observation = {}
+                        def _record_media_report(report):
+                            observation.update(report)
+                            if callable(observation_store):
+                                observation_store(report, observation_run, lifecycle_generation, machine_hash)
                         prompt = augment_prompt(
                             prompt, media, agent,
                             is_live=lambda: self._hmb_lifecycle_is_live(lifecycle_generation)
                             and not bool(getattr(self, "is_cancellation_requested", False)),
-                            report_sink=(lambda report: observation_store(report, observation_run,
-                                lifecycle_generation, machine_hash)) if callable(observation_store) else None,
+                            report_sink=_record_media_report,
                         )
+                        if required_tokens and not analysis_media_issue:
+                            delivered = {row.get("media_token") for row in observation.get("coverage", [])}
+                            if required_tokens - delivered:
+                                analysis_media_issue = "ANALYSIS_ORIGINAL_UNAVAILABLE"
                 except Exception:
-                    pass
+                    if opted_originals and not analysis_media_issue:
+                        analysis_media_issue = "ANALYSIS_ORIGINAL_UNAVAILABLE"
+            if analysis_media_issue:
+                raise _HMBAnalysisOriginalError(analysis_media_issue)
         if hmb_request:
             if (
                 not self._hmb_lifecycle_is_live(lifecycle_generation)
@@ -5760,8 +6234,10 @@ class HMBAgentLibrary(_BaseAgent):
                 marker(observation_run, True)
             self._hmb_native_inference_started = True
             self._hmb_run_policy_applied = bool(self._hmb_rules_active) and not bool(getattr(self, "_hmb_policy_omitted", False))
+            self._set_hmb_execution_stage("inference")
             return _run_native_with_literal_hmb_input(native_processor, agent, prompt, *native_args)
         self._hmb_native_inference_started = True
+        self._set_hmb_execution_stage("inference")
         return native_processor(agent, prompt, *native_args)
 
     def _run_native_agent_once(self, lifecycle_generation: int | None = None):
@@ -5992,6 +6468,14 @@ class HMBAgentLibrary(_BaseAgent):
         """
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return None
+        origin = getattr(self, "_hmb_timing_origin", None)
+        self._hmb_timing_started = origin if isinstance(origin, (int, float)) else time.monotonic()
+        self._hmb_timing_finished = None
+        self._hmb_execution_stage = ""
+        self._hmb_stage_durations = {}
+        self._hmb_first_native_chunk_seconds = None
+        self._hmb_inference_started_at = None
+        self._set_hmb_execution_stage("source_wait")
         lifecycle_generation = int(
             getattr(self, "_hmb_lifecycle_generation", 0) or 0
         )
@@ -6034,7 +6518,11 @@ class HMBAgentLibrary(_BaseAgent):
         if not is_hmb:
             self._clear_hmb_runtime_policy()
             self._hide_hmb_policy_warning()
-            return (yield from self._run_native_agent_once())
+            self._set_hmb_execution_stage("native_prepare")
+            try:
+                return (yield from self._run_native_agent_once())
+            finally:
+                self._set_hmb_execution_stage("complete")
 
         if not self._hmb_lifecycle_is_live(lifecycle_generation):
             return None
@@ -6049,6 +6537,7 @@ class HMBAgentLibrary(_BaseAgent):
             # packaged Griptape engine process. Only a canonical HMB Prompt ->
             # Agent execution can initialize the protected in-memory session.
             self._set_agent_execution_phase("authorizing")
+            self._set_hmb_execution_stage("policy_verify")
             selected_project = self._hmb_selected_project()
             self._hmb_execution_project_id = selected_project["project_id"]
             self._hmb_run_project_identity = {key: selected_project[key] for key in ("project_id", "project_name")}
@@ -6061,8 +6550,10 @@ class HMBAgentLibrary(_BaseAgent):
             if readiness.get("ready") is not True:
                 raise RuntimeError("Selected project policy verification is unavailable.")
             if self._hmb_execution_project_id == "superwings12":
+                self._set_hmb_execution_stage("policy_bootstrap")
                 _hmb._bootstrap_agent_policy_session()
             else:
+                self._set_hmb_execution_stage("policy_bootstrap")
                 _hmb._bootstrap_agent_policy_session(self._hmb_execution_project_id)
         except ProjectPolicyPendingError:
             # A missing project DAT is informational. Continue with the same
@@ -6089,6 +6580,7 @@ class HMBAgentLibrary(_BaseAgent):
             self._clear_execution_shot_binding()
             return None
         self._set_agent_execution_phase("preparing")
+        self._set_hmb_execution_stage("prompt_prepare")
         if not self._hmb_policy_omitted:
             try:
                 (
@@ -6163,6 +6655,7 @@ class HMBAgentLibrary(_BaseAgent):
         self._hide_hmb_policy_warning()
         self._hmb_rules_active = True
         self._set_agent_execution_phase("running")
+        self._set_hmb_execution_stage("native_prepare")
 
         result = None
         native_failed = False
@@ -6184,6 +6677,7 @@ class HMBAgentLibrary(_BaseAgent):
             if not native_failed and self._hmb_lifecycle_is_live(
                 lifecycle_generation
             ):
+                self._set_hmb_execution_stage("finalize")
                 try:
                     self._secure_hmb_outputs()
                     sanitizer_ran = True
@@ -6261,6 +6755,7 @@ class HMBAgentLibrary(_BaseAgent):
                 self._clear_hmb_runtime_policy()
                 self._set_agent_execution_phase("")
                 self._clear_execution_shot_binding()
+                self._set_hmb_execution_stage("complete")
         try:
             self._refresh_agent_shot_route()
         except Exception:
@@ -6580,6 +7075,11 @@ class _HMBAgentShotSource:
             raise RuntimeError("Prompt Shot machine snapshot changed.")
         return copy.deepcopy(self.document.get("reference_media") or {})
 
+    def _hmb_agent_sound_snapshot(self, machine):
+        if machine != self.machine:
+            raise RuntimeError("Prompt Shot sound snapshot changed.")
+        return copy.deepcopy(self.document.get("audio_sources") or {})
+
     def _hmb_agent_generation_context(self, machine):
         if machine != self.machine:
             raise RuntimeError("Prompt Shot settings snapshot changed.")
@@ -6728,3 +7228,82 @@ class _HMBAgentShotExecution(HMBAgentLibrary):
 
     def hide_message_by_name(self, *args, **kwargs):
         return None
+
+
+def _same_shot_analysis_model_config(prompt_owner, *, channel_uuid, shot_uuid):
+    """Read the same native settings used by the exact Shot Agent."""
+    from _hmb_reference_analysis import AnalysisError
+    try:
+        from griptape_nodes_library.llm.agent_state import connected_agent_state
+        from HMBAnalysisAgent import _registered_node_class, _same_flow_nodes
+    except ImportError:
+        raise AnalysisError("ANALYSIS_AGENT_UNAVAILABLE", "Griptape Agent 분석 모델 연결을 확인하세요.") from None
+
+    flow, nodes = _same_flow_nodes(prompt_owner)
+    if not flow or prompt_owner not in nodes or not channel_uuid or not shot_uuid:
+        raise AnalysisError("ANALYSIS_AGENT_UNAVAILABLE", "현재 샷의 Prompt와 Agent 연결을 확인하세요.")
+    registered_agent = _registered_node_class("HMBAgentLibrary")
+    agents = []
+    for node in nodes:
+        if type(node) is not registered_agent or getattr(node, "_hmb_node_deleted", False):
+            continue
+        try:
+            if node._hmb_reference_analysis_owner(channel_uuid=channel_uuid, shot_uuid=shot_uuid) is prompt_owner:
+                agents.append(node)
+        except (RuntimeError, ValueError, AttributeError):
+            continue
+    if len(agents) != 1:
+        raise AnalysisError("ANALYSIS_AGENT_UNAVAILABLE", "현재 샷에 연결된 HMB Agent가 하나인지 확인하세요.")
+    agent = agents[0]
+    key = agent._hmb_slot_key(channel_uuid, shot_uuid)
+    try:
+        if agent._hmb_shot_manager_enabled() and agent._hmb_active_slot_key != key:
+            saved = agent._hmb_shot_slots.get(key) or agent._hmb_shot_slots.get("__hmb_default_settings__")
+            values = saved.get("values") if isinstance(saved, dict) else {
+                name: agent._native_parameter_value(name, None)
+                for name in ("agent", "model", "model_provider")}
+        else:
+            values = {name: agent._native_parameter_value(name, None)
+                      for name in ("agent", "model", "model_provider")}
+        if not isinstance(values, dict):
+            raise ValueError("No exact native settings")
+        connected = connected_agent_state(values.get("agent"))
+        config = (connected.model if connected is not None else
+                  agent._resolve_model_config(values.get("model"), values.get("model_provider") or "griptape_cloud"))
+        if config is None:
+            raise ValueError("No selected model")
+        config = config.model_copy(deep=True)
+    except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+        raise AnalysisError("ANALYSIS_AGENT_MODEL_UNAVAILABLE",
+                            "현재 샷 Agent의 모델 설정을 확인하세요. 모델을 자동으로 바꾸지 않았습니다.") from exc
+    return agent, config
+
+
+def get_same_shot_analysis_model_label(prompt_owner, *, channel_uuid, shot_uuid):
+    agent, config = _same_shot_analysis_model_config(
+        prompt_owner, channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+    if config.provider == "griptape_cloud" and not config.base_url:
+        from griptape_nodes.node_library.library_registry import get_declared_models
+
+        for entry in get_declared_models(agent):
+            if entry.model.provider_model_id == config.model:
+                return entry.model.display_name
+    return config.model
+
+
+def get_same_shot_analysis_model(prompt_owner, *, channel_uuid, shot_uuid, kind):
+    """Verify the exact Shot Agent model supports the requested media."""
+    from griptape_nodes_library.llm.agent_state import AgentState
+    from _hmb_agent_media import driver_accepts_audio, driver_accepts_images
+    from _hmb_reference_analysis import AnalysisError
+
+    _, config = _same_shot_analysis_model_config(
+        prompt_owner, channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+    state = AgentState(model=config)
+    supports = driver_accepts_audio(state) if kind == "audio" else driver_accepts_images(state) if kind in {"image", "video"} else False
+    if not supports:
+        model_name = str(getattr(config, "model", "") or "미선택")
+        raise AnalysisError("ANALYSIS_AGENT_MODEL_UNSUPPORTED",
+                            f"현재 샷 Agent 모델 '{model_name}'은 {kind} 참고 분석을 지원하지 않습니다. "
+                            "Analysis Agent에서 지원 모델을 직접 선택하세요.")
+    return config

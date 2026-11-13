@@ -146,6 +146,7 @@ def exercise():
             generator = object.__new__(seedance.HMBSeedanceGeneration)
             generator._hmb_seedance_execution_mode = lambda: "shot"
             generator._assert_only_mode_inputs = lambda: None
+            generator._manual_agent_prompt_source = lambda: None
             generator._reconcile_shared_shot_routing = lambda **kwargs: {"ok": True}
             generator._capture_imageasset_project_selection = lambda: {"project": {
                 "project_id": "superwings12", "project_name": "슈퍼윙즈12"}}

@@ -73,6 +73,7 @@ const IMAGE_ASSET_ECHO_EXPIRY_MS = 1500;
 // Search covers the complete in-memory catalog, but foreground DOM work stays
 // bounded for projects containing thousands of images.
 const IMAGE_ASSET_RENDER_WINDOW = 80;
+const IMAGE_ASSET_THUMBNAIL_FIRST_BATCH = 12;
 const IMAGE_ASSET_THUMBNAIL_REQUEST_BATCH = 64;
 const IMAGE_ASSET_THUMBNAIL_ERROR_RETRY_LIMIT = 1;
 const IMAGE_ASSET_THUMBNAIL_WATCHDOG_MS = 15000;
@@ -599,7 +600,7 @@ const IMAGE_ASSET_UI_TEXT = {
     select_project: "Select Project",
     select_a_project: "Select a project",
     project: "PROJECT",
-    reload_projects: "Reload projects",
+    reload_projects: "Rescan project media folders",
     project_set: "PROJECT SET",
     registered: "REG",
     unregistered: "UNREG",
@@ -661,7 +662,7 @@ const IMAGE_ASSET_UI_TEXT = {
     rename_shot: "Rename Shot",
     busy_loading: "Loading project assets…",
     transport_failed: "The change could not be saved. Please try again.",
-    refresh_review: "Refresh review",
+    refresh_review: "Project media scan review",
     refresh_files: "Image files",
     refresh_missing: "Registered paths without files",
     refresh_missing_hint: "These files may have been moved or renamed. Check the paths before removing their registrations.",
@@ -674,15 +675,15 @@ const IMAGE_ASSET_UI_TEXT = {
     refresh_cleaning: "Cleaning registrations…",
     refresh_cleaned: "Registrations cleaned",
     refresh_backup: "Backup",
-    refresh_unsafe: "Cleanup is unavailable for this review. Check the error and refresh again.",
-    refresh_close: "Close refresh review",
+    refresh_unsafe: "Cleanup is unavailable for this review. Check the error and rescan the project media folders.",
+    refresh_close: "Close project media scan review",
     close: "Close",
   },
   ko: {
     select_project: "프로젝트 선택",
     select_a_project: "프로젝트를 선택하세요",
     project: "프로젝트",
-    reload_projects: "프로젝트 새로고침",
+    reload_projects: "프로젝트 미디어 폴더 다시 읽기",
     project_set: "프로젝트 설정",
     registered: "등록",
     unregistered: "미등록",
@@ -744,7 +745,7 @@ const IMAGE_ASSET_UI_TEXT = {
     rename_shot: "Shot 이름 변경",
     busy_loading: "프로젝트 에셋 불러오는 중…",
     transport_failed: "변경 사항을 저장하지 못했습니다. 다시 시도하세요.",
-    refresh_review: "새로고침 검토",
+    refresh_review: "프로젝트 미디어 목록 검사 결과",
     refresh_files: "이미지 파일",
     refresh_missing: "파일이 없는 등록 경로",
     refresh_missing_hint: "파일이 이동되었거나 이름이 바뀌었을 수 있습니다. 등록을 정리하기 전에 경로를 확인하세요.",
@@ -757,8 +758,8 @@ const IMAGE_ASSET_UI_TEXT = {
     refresh_cleaning: "등록 정리 중…",
     refresh_cleaned: "정리한 등록",
     refresh_backup: "백업",
-    refresh_unsafe: "현재 검토 결과로는 정리할 수 없습니다. 오류를 확인하고 다시 새로고침하세요.",
-    refresh_close: "새로고침 검토 닫기",
+    refresh_unsafe: "현재 검사 결과로는 정리할 수 없습니다. 오류를 확인하고 프로젝트 미디어 폴더를 다시 읽으세요.",
+    refresh_close: "프로젝트 미디어 목록 검사 닫기",
     close: "닫기",
   },
 };
@@ -857,7 +858,7 @@ export function hmbNormalizeCgtWorkStartNotice(value) {
 
 export function hmbCgtWorkStartNoticeMessage(value, language = "ko") {
   const notice=hmbNormalizeCgtWorkStartNotice(value);
-  if(!notice.schema)return "";
+  if(!notice.schema || ["queued","running","completed"].includes(notice.status))return "";
   const english=language==="en";
   const counts=english
     ? "Work "+notice.updated_count+" · already Work "+notice.already_work_count+" · skipped "+notice.skipped_count+" · failed "+notice.failed_count
@@ -1062,10 +1063,39 @@ export function hmbValidateHierarchyRouting(binding, routing) {
   return normalized;
 }
 
-export function hmbApplyShotHierarchyEdit(state, request) {
+export function hmbShotHierarchyEditStructure(state) {
+  const routing = state.shot_routing || {};
+  const binding = hmbValidateHierarchyRouting(state.shot_hierarchy, routing);
+  delete binding.revision;
+  for (const member of binding.members || []) delete member.status;
+  return {project_identity:hierarchyProjectKey(state),channel_uuid:routing.channel_uuid,
+    publisher_instance_uuid:routing.publisher_instance_uuid,
+    shots:(routing.shots || []).map(row => Object.fromEntries(
+      ["shot_uuid","number","name","name_is_custom"].map(key => [key,row[key] ?? null]))),binding};
+}
+
+export function hmbRebaseShotHierarchyEdit(state, request) {
   const fields = ["schema", "version", "expected_generation", "expected_binding_revision", "removed_member_ids", "binding"];
-  if (!request || Object.keys(request).length !== fields.length || fields.some(key => !Object.hasOwn(request, key))
+  const allowed = new Set([...fields,"expected_structure"]);
+  if (!request || Object.keys(request).some(key => !allowed.has(key)) || fields.some(key => !Object.hasOwn(request, key))
       || request.schema !== SHOT_HIERARCHY_EDIT_SCHEMA || request.version !== 1) throw new Error("샷 구성 요청이 올바르지 않습니다.");
+  if (!Object.hasOwn(request,"expected_structure")) return request;
+  if (!Number.isSafeInteger(request.expected_generation) || request.expected_generation < 0
+      || !Number.isSafeInteger(request.expected_binding_revision) || request.expected_binding_revision < 0
+      || imageAssetScopeKey(request.expected_structure) !== imageAssetScopeKey(hmbShotHierarchyEditStructure(state))) {
+    throw new Error("샷 구성이 변경되었습니다. 현재 구성을 확인한 뒤 다시 선택하세요.");
+  }
+  const binding = hmbNormalizeShotHierarchy(request.binding), prior = state.shot_hierarchy || {};
+  if (binding.revision !== request.expected_binding_revision + 1) throw new Error("샷 구성 요청의 수정 번호가 올바르지 않습니다.");
+  const statuses = new Map((prior.members || []).map(row => [row.member_id,row.status]));
+  for (const row of binding.members || []) if (row.origin === "cgt" && statuses.has(row.member_id)) row.status = statuses.get(row.member_id);
+  binding.revision = (prior.revision || 0) + 1;
+  return {...request,expected_generation:state.shot_routing.generation,
+    expected_binding_revision:prior.revision || 0,binding};
+}
+
+export function hmbApplyShotHierarchyEdit(state, request) {
+  request = hmbRebaseShotHierarchyEdit(state, request);
   const routing = state.shot_routing;
   const prior = hmbValidateHierarchyRouting(state.shot_hierarchy, routing);
   if (!Number.isSafeInteger(request.expected_generation) || request.expected_generation !== routing.generation
@@ -1754,6 +1784,7 @@ function normalizeState(value) {
     projects,
     project_root: projectRoot,
     project_id: clean(input.project_id),
+    project_display_name: clean(input.project_display_name),
     project_uid: clean(input.project_uid),
     project_cache_uid: clean(input.project_cache_uid),
     manifest_signature: clean(input.manifest_signature).slice(0, 128),
@@ -3017,7 +3048,7 @@ function projectOptions(state) {
 }
 
 export function hmbImageAssetProjectDisplayName(state) {
-  const resolvedName = clean(state?.project_id);
+  const resolvedName = clean(state?.project_display_name) || clean(state?.project_id);
   if (resolvedName) return resolvedName;
   const selectedPath = imageAssetProjectPathKey(state?.project_root);
   if (!selectedPath) return "";
@@ -3386,6 +3417,10 @@ function imageAssetDomKey(node) {
     "data-folder-key",
     "data-registration-backdrop",
     "data-refresh-review-backdrop",
+    "data-hier-member",
+    "data-hier-cgt-task",
+    "data-hier-cgt-scroll",
+    "data-hier-selected-scroll",
     "id",
   ]) {
     if (!node.hasAttribute?.(attribute)) continue;
@@ -3444,6 +3479,9 @@ export function hmbPatchImageAssetElement(current, desired) {
   if (current.nodeType !== 1 || current.tagName !== desired.tagName) return false;
   if (current.matches?.("[data-hmb-native-identity],[data-hmb-native-actions]")
     && desired.matches?.("[data-hmb-native-identity],[data-hmb-native-actions]")) return true;
+  if (current.matches?.("[data-hier-drag-handle]") && desired.matches?.("[data-hier-drag-handle]")) return true;
+  const hierarchyPanel = "[data-hier-cgt],[data-hier-name-preview]";
+  if (current.matches?.(hierarchyPanel) && desired.matches?.(hierarchyPanel) && !desired.firstChild) return true;
   hmbSyncImageAssetAttributes(current, desired);
 
   const original = Array.from(current.childNodes || []);
@@ -3728,8 +3766,8 @@ export function hmbImageAssetThumbnailRequestIds(
     : hmbImageAssetCatalogWindow(canonical, limit, offset).rendered;
   // Hydrate the project catalog once instead of coupling thumbnail availability
   // to the currently opened folder or Shot. Selected/visible rows keep
-  // priority; the remainder drains through successive 64-item post-paint
-  // batches, so a 5,000-item catalog never blocks the initial paint.
+  // priority. The scheduler uses 12 items for its first response, then drains
+  // the remainder through 64-item post-paint batches.
   const workspaceAssets = hmbImageBashWorkspaceAssets(canonical).map(row => row.asset).filter(Boolean);
   const candidates = options.includeCatalog === false
     ? [...selectedAssets(canonical), ...workspaceAssets, ...visible]
@@ -3753,7 +3791,8 @@ export function hmbImageAssetThumbnailRequestIds(
         && seen.add(key);
     })
     .map((asset) => clean(asset.asset_library_id))
-    .slice(0, IMAGE_ASSET_THUMBNAIL_REQUEST_BATCH);
+    .slice(0, Math.min(IMAGE_ASSET_THUMBNAIL_REQUEST_BATCH,
+      Math.max(1, Number.parseInt(options.batchSize, 10) || IMAGE_ASSET_THUMBNAIL_REQUEST_BATCH)));
 }
 
 function imageAssetThumbnailRequestTracking(container, state) {
@@ -3774,6 +3813,7 @@ function imageAssetThumbnailRequestTracking(container, state) {
       }
     }
     container.__hmbImageAssetThumbnailContextKey = contextKey;
+    container.__hmbImageAssetThumbnailFirstBatchStarted = false;
     const shared = imageAssetRequestCache(state, imageAssetPresentationCacheEntry(state, true));
     // A new catalog revision may change an asset that previously failed or
     // was in flight. Valid cached URLs survive by media signature; unresolved
@@ -4331,7 +4371,9 @@ export function hmbScheduleImageAssetThumbnailRequest(
     liveState,
     options.limit ?? container.__hmbImageAssetRenderLimit ?? IMAGE_ASSET_RENDER_WINDOW,
     options.offset ?? container.__hmbImageAssetRenderOffset ?? 0,
-    { ...options, excludeIds: tracking.requested },
+    { ...options, excludeIds: tracking.requested,
+      batchSize: container.__hmbImageAssetThumbnailFirstBatchStarted
+        ? IMAGE_ASSET_THUMBNAIL_REQUEST_BATCH : IMAGE_ASSET_THUMBNAIL_FIRST_BATCH },
   );
   if (!requestIds.length) return false;
 
@@ -4356,7 +4398,9 @@ export function hmbScheduleImageAssetThumbnailRequest(
       current,
       options.limit ?? container.__hmbImageAssetRenderLimit ?? IMAGE_ASSET_RENDER_WINDOW,
       options.offset ?? container.__hmbImageAssetRenderOffset ?? 0,
-      { ...options, excludeIds: currentTracking.requested },
+      { ...options, excludeIds: currentTracking.requested,
+        batchSize: container.__hmbImageAssetThumbnailFirstBatchStarted
+          ? IMAGE_ASSET_THUMBNAIL_REQUEST_BATCH : IMAGE_ASSET_THUMBNAIL_FIRST_BATCH },
     );
     if (!currentIds.length) return;
 
@@ -4371,6 +4415,7 @@ export function hmbScheduleImageAssetThumbnailRequest(
     };
     current.thumbnail_result = {};
     current.thumbnail_busy = true;
+    container.__hmbImageAssetThumbnailFirstBatchStarted = true;
     currentIds.forEach((key) => {
       currentTracking.requested.add(key);
       currentTracking.inflight.set(key, requestId);
@@ -5526,7 +5571,7 @@ function renderRegistrationDialog(state, draft) {
   return `
     <div class="asset-registration-backdrop" data-registration-backdrop>
       <section class="asset-passport" role="dialog" aria-modal="true" aria-labelledby="asset-registration-title">
-        <header class="passport-head">
+        <header class="passport-head" data-hmb-popup-header>
           <div><small>${escapeHtml(imageAssetText(state, "hmb_project_asset"))}</small><h2 id="asset-registration-title">${escapeHtml(imageAssetText(state, "asset_passport"))}</h2></div>
           <button type="button" data-registration-cancel aria-label="${escapeHtml(imageAssetText(state, "close_registration"))}">&times;</button>
         </header>
@@ -5619,7 +5664,7 @@ export function hmbRenderImageAssetRefreshReview(state, view) {
   const canClean = hmbImageAssetRefreshCleanupEligible(state, review) && !busy && !state.scan_busy;
   return `<div class="asset-registration-backdrop asset-refresh-backdrop nodrag nopan nowheel" data-refresh-review-backdrop>
     <section class="asset-passport asset-refresh-review" role="dialog" aria-modal="true" aria-label="${label(confirming ? "refresh_confirm" : "refresh_review")}" ${busy ? 'aria-busy="true"' : ""}>
-      <header class="passport-head"><div><small>${label("project")} · ${escapeHtml(review.project_id)}</small><h2>${label(confirming ? "refresh_confirm" : "refresh_review")}</h2></div><button type="button" data-refresh-review-cancel aria-label="${label("refresh_close")}">&times;</button></header>
+      <header class="passport-head" data-hmb-popup-header><div><small>${label("project")} · ${escapeHtml(review.project_id)}</small><h2>${label(confirming ? "refresh_confirm" : "refresh_review")}</h2></div><button type="button" data-refresh-review-cancel aria-label="${label("refresh_close")}">&times;</button></header>
       <div class="refresh-review-body">
         <p class="refresh-review-root">${escapeHtml(review.project_root)}</p>
         <p>${label("registered")}: ${review.registered_count} · ${label("refresh_files")}: ${review.file_count}</p>
@@ -5668,11 +5713,17 @@ export function hmbPatchImageAssetRefreshReview(container, state, view) {
   return true;
 }
 
+function hmbStyleImageAssetPassportHeader(backdrop) {
+  const dialog = backdrop?.querySelector?.(".asset-passport");
+  if (dialog) globalThis.__hmbStylePopupHeader?.(dialog.querySelector(".passport-head"), dialog);
+}
+
 export function hmbInstallImageAssetRefreshReviewEvents(container, state, props, remount) {
   container.__hmbImageAssetRefreshReviewCleanup?.();
   delete container.__hmbImageAssetRefreshReviewCleanup;
   const backdrop = container.querySelector("[data-refresh-review-backdrop]");
   if (!backdrop) return;
+  hmbStyleImageAssetPassportHeader(backdrop);
   const listeners = [];
   const on = (target, type, handler, options) => {
     if (!target?.addEventListener) return;
@@ -6063,7 +6114,7 @@ function renderImageAssetFixedTop(state) {
         <div class="project-actions">
           <button type="button" class="project-action" data-project-set aria-label="${escapeHtml(imageAssetText(state, "project_set"))}" title="${escapeHtml(imageAssetText(state, "project_set"))}" ${state.scan_busy ? "disabled" : ""}>S</button>
           <button type="button" class="project-action" data-project-reload aria-label="${escapeHtml(imageAssetText(state, "reload_projects"))}" title="${escapeHtml(imageAssetText(state, "reload_projects"))}" ${state.scan_busy ? "disabled" : ""}>
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5"/><path d="M4 17v-5h5"/><path d="M6.1 9a7 7 0 0 1 11.8-2L20 9"/><path d="M17.9 15a7 7 0 0 1-11.8 2L4 15"/></svg>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 19V6h6l2 2h10v4M3 19h8"/><circle cx="16" cy="15" r="3"/><path d="m18.2 17.2 3 3"/></svg>
           </button>
         </div>
         <label>${escapeHtml(imageAssetText(state, "project"))}</label>
@@ -7282,10 +7333,11 @@ function hmbInstallShotHierarchyDragging(dialog, doc) {
   return dispose;
 }
 
-export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, commit, addImageBash = null) {
+export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, commit, addImageBash = null, options = {}) {
   const root = container.querySelector?.(".hmb-image-assets");
   const doc = container.ownerDocument;
   if (!root || !doc?.createElement || container.__hmbHierarchyDialog) return false;
+  const basketBinding = options.bindOnly === true;
   const prior = hmbValidateHierarchyRouting(state.shot_hierarchy, state.shot_routing);
   const draft = prior.schema ? hmbNormalizeShotHierarchy(prior) : {
     schema: SHOT_HIERARCHY_SCHEMA, version: 1, binding_id: newImageAssetUuid(), revision: 1,
@@ -7295,6 +7347,7 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
   draft.revision = (prior.revision || 0) + 1;
   draft.project_identity = hierarchyProjectKey(state);
   const initialGeneration = state.shot_routing.generation;
+  const initialStructure = hmbShotHierarchyEditStructure(state);
   const dialog = doc.createElement("dialog");
   dialog.className = "shot-hierarchy-dialog";
   dialog.setAttribute("aria-labelledby", "hmb-hierarchy-title");
@@ -7307,10 +7360,20 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
   let confirmingCgt = false;
   let hierarchyClosed = false;
   let cgtPage = 0;
-  let cgtEpisode = "";
+  const savedCgtMember = prior.members?.find(row => row.origin === "cgt");
+  let cgtEpisode = savedCgtMember ? hmbHierarchyParseName(savedCgtMember.source_name).episode || "" : "";
   let cgtProjectId = "";
   let cgtProjects = [];
   let disposePositioning = null;
+  let draftRenderEvents = null;
+  let catalogRenderEvents = null;
+  const updateMarkup = (target, markup) => {
+    const template = doc.createElement("template");
+    template.innerHTML = markup;
+    const desired = target.cloneNode(false);
+    desired.append(template.content);
+    hmbPatchImageAssetElement(target, desired);
+  };
   const sendCgt = (operation, command = null) => {
     if (operation === "cgt_confirm" && !hierarchyProjectKey(state)) return false;
     const bridge = imageAssetBridgeForNode(container, imageAssetThumbnailRuntimeId(state));
@@ -7323,26 +7386,35 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
     const selectedProject = operation === "cgt_confirm" ? command?.binding?.cgt_scope?.project_id : cgtProjectId;
     if (selectedProject) request.cgt_project_id = selectedProject;
     if (command) request.hierarchy_request = command;
+    if (basketBinding && operation === "cgt_confirm") request.bind_only = true;
     if (operation !== "cgt_cancel") {
       cgtRequest = requestId;
       if (cgtTimer !== null) clearTimeout(cgtTimer);
       cgtTimer = setTimeout(() => {
-        cgtRequest = ""; confirmingCgt = false; cgtState = { status: "TIMEOUT", tasks: [] };
-        sendCgt("cgt_cancel"); renderDraft(); notice("CGT 응답 시간이 초과됐습니다. 기존 샷은 유지됩니다. 새로고침 후 다시 확인하세요.");
-      }, 45000);
+        if (cgtRequest !== requestId) return;
+        if (!confirmingCgt) cgtState = { status: "TIMEOUT", tasks: [] };
+        cgtRequest = ""; cgtTimer = null; confirmingCgt = false;
+        sendCgt("cgt_cancel"); renderDraft();
+        notice("CGT 응답을 받지 못했습니다. 샷 선택을 유지했습니다. 새로고침 후 다시 확인하세요.");
+      }, 30000);
     }
     try {
       const delivery = bridge.dispatch(request);
       Promise.resolve(delivery).catch(() => {
         if (cgtRequest !== requestId) return;
+        if (!confirmingCgt) cgtState = { status: "SDK_UNAVAILABLE", tasks: [] };
         cgtRequest = ""; confirmingCgt = false;
         if (cgtTimer !== null) clearTimeout(cgtTimer);
-        cgtState = { status: "SDK_UNAVAILABLE", tasks: [] }; renderDraft();
+        cgtTimer = null;
+        renderDraft(); notice("CGT 연결이 끊어졌습니다. 샷 선택을 유지했습니다. 새로고침 후 다시 확인하세요.");
       });
       return true;
     } catch (error) {
-      cgtRequest = ""; confirmingCgt = false;
-      if (cgtTimer !== null) clearTimeout(cgtTimer);
+      if (operation !== "cgt_cancel") {
+        cgtRequest = ""; confirmingCgt = false;
+        if (cgtTimer !== null) clearTimeout(cgtTimer);
+        cgtTimer = null;
+      }
       return false;
     }
   };
@@ -7350,6 +7422,8 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
     if (confirmingCgt || hierarchyClosed) return;
     hierarchyClosed = true;
     if (cgtTimer !== null) clearTimeout(cgtTimer);
+    draftRenderEvents?.abort();
+    catalogRenderEvents?.abort();
     disposePositioning?.();
     sendCgt("cgt_cancel");
     delete container.__hmbHierarchyReceive;
@@ -7357,21 +7431,27 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
     dialog.close?.(); dialog.remove();
     if (container.__hmbHierarchyDialog === dialog) delete container.__hmbHierarchyDialog;
     container.querySelector?.("[data-shot-add]")?.focus?.({ preventScroll: true });
+    if (typeof options.onClose === "function") queueMicrotask(options.onClose);
   };
   const notice = message => { dialog.querySelector("[data-hier-message]").textContent = message; };
   const changed = action => {
     try { action(); renderDraft(); } catch (error) { notice(error.message); }
   };
   const makeRequest = candidate => ({ schema: SHOT_HIERARCHY_EDIT_SCHEMA, version: 1, expected_generation: initialGeneration,
+    expected_structure: initialStructure,
     expected_binding_revision: prior.revision || 0,
     removed_member_ids: (prior.members || []).filter(item => !candidate.members.some(row => row.member_id === item.member_id)).map(item => item.member_id),
     binding: hmbNormalizeShotHierarchy(candidate) });
   const renderCgt = () => {
     const panel = dialog.querySelector("[data-hier-cgt]");
     if (!panel) return;
+    catalogRenderEvents?.abort();
+    catalogRenderEvents = new AbortController();
+    const events = { signal: catalogRenderEvents.signal };
     const ready = cgtState.status === "ready";
+    const loading = cgtState.status === "loading";
     const projects = cgtProjects;
-    const project = cgtState.project || null;
+    const project = loading ? projects.find(row => row.id === cgtProjectId) || null : cgtState.project || null;
     const canBind = !!project && !!hierarchyProjectKey(state) && cgtState.can_bind !== false;
     const imageBashTarget = dialog.querySelector("[data-hier-slot]")?.value === "image_bash";
     const episodeOf = row => {
@@ -7379,43 +7459,44 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
       try { return hmbHierarchyParseName(row.source_name).episode || "__unassigned__"; }
       catch { return "__unassigned__"; }
     };
-    const episodes = ready ? [...new Set(cgtState.tasks.map(episodeOf))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })) : [];
+    const showTasks = ready || loading;
+    const episodes = showTasks ? [...new Set(cgtState.tasks.map(episodeOf))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })) : [];
     if (ready && cgtEpisode && !episodes.includes(cgtEpisode)) cgtEpisode = "";
-    const matching = ready ? cgtState.tasks.filter(row => !cgtEpisode || episodeOf(row) === cgtEpisode) : [];
+    const matching = showTasks && cgtEpisode ? cgtState.tasks.filter(row => episodeOf(row) === cgtEpisode) : [];
     cgtPage = Math.min(cgtPage, Math.max(0, Math.ceil(matching.length / 50) - 1));
     const visible = matching.slice(cgtPage * 50, (cgtPage + 1) * 50);
     const selected = new Set(draft.members.filter(row => row.origin === "cgt").map(row => row.cgt_task_id));
     const accountSummary=dialog.querySelector("[data-hier-cgt-account]");
     if(accountSummary){
-      const summary=ready && cgtState.account
+      const summary=showTasks && project && cgtState.account
         ? cgtState.account+" / "+cgtState.account_name+" · AI_Shot · "+cgtState.tasks.length+"건"+(cgtState.truncated?" (추가 작업 있음)":"") : "";
       accountSummary.textContent=summary;accountSummary.title=summary;accountSummary.hidden=!summary;
     }
-    panel.innerHTML = `<div class="hier-tools hier-project-tools"><label>프로젝트<select data-hier-cgt-project aria-label="CGT 프로젝트" ${!projects.length || cgtRequest || confirmingCgt ? "disabled" : ""}><option value="" ${!project ? "selected" : ""}>프로젝트 선택 필요</option>${projects.map(row => `<option value="${escapeHtml(row.id)}" ${row.id === project?.id ? "selected" : ""}>${escapeHtml(row.name)}</option>`).join("")}${project && !projects.some(row => row.id === project.id) ? `<option value="${escapeHtml(project.id)}" selected>${escapeHtml(project.name)}</option>` : ""}</select></label><label>에피소드<select data-hier-cgt-episode aria-label="CGT 에피소드" ${!ready || !project || !episodes.length || cgtRequest || confirmingCgt ? "disabled" : ""}><option value="">전체 에피소드</option>${episodes.map(episode => `<option value="${escapeHtml(episode)}" ${episode === cgtEpisode ? "selected" : ""}>${escapeHtml(episode === "__unassigned__" ? "에피소드 미지정" : episode)}</option>`).join("")}</select></label><button type="button" data-hier-cgt-refresh ${cgtRequest || confirmingCgt ? "disabled" : ""}>새로고침</button></div>
-      <div class="hier-cgt-scroll" data-hier-cgt-scroll><table class="hier-table"><thead><tr><th>Shot</th><th>Artist</th><th>Task status</th><th></th></tr></thead><tbody>${visible.map(row => `<tr><td>${escapeHtml(row.source_name)}</td><td>${escapeHtml(row.artist)}</td><td>${escapeHtml(row.status)}</td><td><button type="button" data-hier-cgt-add="${escapeHtml(row.task_id)}" ${selected.has(row.task_id) || confirmingCgt || !canBind || imageBashTarget ? "disabled" : ""}>${selected.has(row.task_id) ? "선택됨" : "선택 추가"}</button></td></tr>`).join("")}</tbody></table></div>
-      ${matching.length > 50 ? `<div class="hier-tools"><button type="button" data-hier-cgt-prev ${cgtPage ? "" : "disabled"}>이전</button><small>${cgtPage + 1} / ${Math.ceil(matching.length / 50)}</small><button type="button" data-hier-cgt-next ${(cgtPage + 1) * 50 < matching.length ? "" : "disabled"}>다음</button></div>` : ""}
-      <p class="hier-offline" data-hier-cgt-status>${escapeHtml(ready ? !project ? "CGT 프로젝트를 선택하세요." : !canBind ? !hierarchyProjectKey(state) ? "먼저 이미지 라이브러리의 프로젝트를 선택하세요. CGT 작업은 조회만 할 수 있습니다." : "현재 라이브러리와 다른 CGT 프로젝트입니다. 작업 조회만 가능하며 샷은 연결하지 않습니다." : cgtState.tasks.length ? "CGT 원본의 본인 배정 작업만 표시합니다." : hmbCgtStatusMessage("empty", imageAssetLanguage(state)) : hmbCgtStatusMessage(cgtState.status, imageAssetLanguage(state)))}</p>`;
+    updateMarkup(panel, `<div class="hier-tools hier-project-tools"><label>프로젝트<select data-hier-cgt-project aria-label="CGT 프로젝트" ${!projects.length || cgtRequest || confirmingCgt ? "disabled" : ""}><option value="" ${!project ? "selected" : ""}>프로젝트 선택 필요</option>${projects.map(row => `<option value="${escapeHtml(row.id)}" ${row.id === project?.id ? "selected" : ""}>${escapeHtml(row.display_name || row.entity || row.name)}</option>`).join("")}${project && !projects.some(row => row.id === project.id) ? `<option value="${escapeHtml(project.id)}" selected>${escapeHtml(project.display_name || project.entity || project.name)}</option>` : ""}</select></label><label>에피소드<select data-hier-cgt-episode aria-label="CGT 에피소드" ${!ready || !project || !episodes.length || cgtRequest || confirmingCgt ? "disabled" : ""}><option value="">에피소드 선택</option>${episodes.map(episode => `<option value="${escapeHtml(episode)}" ${episode === cgtEpisode ? "selected" : ""}>${escapeHtml(episode === "__unassigned__" ? "에피소드 미지정" : episode)}</option>`).join("")}</select></label><button type="button" data-hier-cgt-refresh ${cgtRequest || confirmingCgt ? "disabled" : ""}>새로고침</button></div>
+      <div class="hier-cgt-scroll" data-hier-cgt-scroll><table class="hier-table"><thead><tr><th>Shot</th><th>Artist</th><th>Task status</th><th></th></tr></thead><tbody>${visible.map(row => `<tr data-hier-cgt-task="${escapeHtml(row.task_id)}"><td>${escapeHtml(row.source_name)}</td><td>${escapeHtml(row.artist)}</td><td>${escapeHtml(row.status)}</td><td><button type="button" data-hier-cgt-add="${escapeHtml(row.task_id)}" ${!ready || selected.has(row.task_id) || confirmingCgt || !canBind || imageBashTarget ? "disabled" : ""}>${selected.has(row.task_id) ? "선택됨" : "선택 추가"}</button></td></tr>`).join("")}</tbody></table></div>
+      ${matching.length > 50 ? `<div class="hier-tools"><button type="button" data-hier-cgt-prev ${ready && cgtPage ? "" : "disabled"}>이전</button><small>${cgtPage + 1} / ${Math.ceil(matching.length / 50)}</small><button type="button" data-hier-cgt-next ${ready && (cgtPage + 1) * 50 < matching.length ? "" : "disabled"}>다음</button></div>` : ""}
+      <p class="hier-offline" data-hier-cgt-status>${escapeHtml(ready ? !project ? "CGT 프로젝트를 선택하세요." : !canBind ? !hierarchyProjectKey(state) ? "먼저 이미지 라이브러리의 프로젝트를 선택하세요. CGT 작업은 조회만 할 수 있습니다." : "현재 라이브러리와 다른 CGT 프로젝트입니다. 작업 조회만 가능하며 샷은 연결하지 않습니다." : cgtState.tasks.length ? cgtEpisode ? "선택한 에피소드의 본인 배정 작업만 표시합니다." : "에피소드를 선택하면 배정된 샷이 표시됩니다." : hmbCgtStatusMessage("empty", imageAssetLanguage(state)) : hmbCgtStatusMessage(cgtState.status, imageAssetLanguage(state)))}</p>`);
     const cgtStatus=panel.querySelector("[data-hier-cgt-status]");
     cgtStatus?.setAttribute("data-hier-cgt-base-status",cgtStatus.textContent);
     hmbApplyCgtWorkStartNotice(container,container.__hmbImageAssetLatestState || state);
-    const loadCatalog = () => {
-      cgtState = { ...cgtState, status: "loading", tasks: [] };
+    const loadCatalog = (keepTasks = false) => {
+      cgtState = { ...cgtState, status: "loading", tasks: keepTasks ? cgtState.tasks : [] };
       if (!sendCgt("cgt_catalog")) cgtState = { ...cgtState, status: "SDK_UNAVAILABLE", tasks: [] };
       renderCgt();
     };
-    panel.querySelector("[data-hier-cgt-refresh]").addEventListener("click", loadCatalog);
+    panel.querySelector("[data-hier-cgt-refresh]").addEventListener("click", () => loadCatalog(true), events);
     panel.querySelector("[data-hier-cgt-project]").addEventListener("change", event => {
       cgtProjectId = event.target.value;
       cgtPage = 0; cgtEpisode = "";
       loadCatalog();
-    });
+    }, events);
     panel.querySelector("[data-hier-cgt-episode]").addEventListener("change", event => {
       cgtEpisode = event.target.value; cgtPage = 0;
       renderCgt();
       panel.querySelector("[data-hier-cgt-episode]")?.focus({ preventScroll: true });
-    });
-    panel.querySelector("[data-hier-cgt-prev]")?.addEventListener("click", () => { cgtPage -= 1; renderCgt(); });
-    panel.querySelector("[data-hier-cgt-next]")?.addEventListener("click", () => { cgtPage += 1; renderCgt(); });
+    }, events);
+    panel.querySelector("[data-hier-cgt-prev]")?.addEventListener("click", () => { cgtPage -= 1; renderCgt(); }, events);
+    panel.querySelector("[data-hier-cgt-next]")?.addEventListener("click", () => { cgtPage += 1; renderCgt(); }, events);
     panel.querySelectorAll("[data-hier-cgt-add]").forEach(button => button.addEventListener("click", () => changed(() => {
       if (cgtState.status !== "ready" || confirmingCgt) throw new Error("CGT 본인 작업을 먼저 확인하세요.");
       if (!hierarchyProjectKey(state) || !cgtState.project || cgtState.can_bind === false) throw new Error("현재 라이브러리 프로젝트의 CGT 작업만 연결할 수 있습니다.");
@@ -7433,7 +7514,7 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
       const next = { ...draft, version: 2, cgt_scope: scope, cgt_account_id: cgtState.account_id,
         members: [...draft.members.map(item => ({ ...item, cgt_identity: item.cgt_identity || null })), row] };
       hmbApplyShotHierarchyEdit(state, makeRequest(next)); Object.assign(draft, next);
-    })));
+    }), events));
     disposePositioning?.reposition?.();
   };
   container.__hmbHierarchyReceive = response => {
@@ -7441,12 +7522,17 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
     if (response?.session_id !== cgtSession || response.request_id !== cgtRequest || response.project_identity !== hierarchyProjectKey(state)
         || response.runtime_instance_id !== imageAssetThumbnailRuntimeId(state)) return false;
     if (cgtTimer !== null) clearTimeout(cgtTimer);
+    cgtTimer = null;
     cgtRequest = "";
     if (response.operation === "cgt_confirm") {
       confirmingCgt = false;
       if (response.outcome === "committed") { close(); return true; }
-      cgtState = { status: response.state?.status || "SOURCE_CHANGED", tasks: [] }; renderDraft();
-      notice("CGT 검증 또는 현재 샷 구성이 변경되어 적용하지 않았습니다. 기존 샷은 유지됩니다.");
+      const status = response.state?.status || "SOURCE_CHANGED";
+      if (status !== "TIMEOUT") cgtState = { status, tasks: [] };
+      renderDraft();
+      notice(status === "TIMEOUT"
+        ? "CGT 확인 응답이 지연됐습니다. 샷 선택을 유지했습니다. 새로고침 후 다시 확인하세요."
+        : "CGT 검증 또는 현재 샷 구성이 변경되어 적용하지 않았습니다. 기존 샷은 유지됩니다.");
       return true;
     }
     cgtState = response.state || { status: "SDK_UNAVAILABLE", tasks: [] };
@@ -7465,9 +7551,12 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
     const preview = dialog.querySelector("[data-hier-name-preview]");
     if (!preview) return;
     const names = hmbHierarchyDerivedNames(draft);
-    preview.innerHTML = `<h3>예상 네이밍</h3><div class="hier-name-values" data-hier-name-values>${draft.members.map(row => `<small class="hier-output" title="${escapeHtml(names[row.gp_shot_uuid])}">${escapeHtml(names[row.gp_shot_uuid])}</small>`).join("") || "<small>샷을 선택하면 예상 실행명이 표시됩니다.</small>"}</div>`;
+    updateMarkup(preview, `<h3>예상 네이밍</h3><div class="hier-name-values" data-hier-name-values>${draft.members.map(row => `<small class="hier-output" title="${escapeHtml(names[row.gp_shot_uuid])}">${escapeHtml(names[row.gp_shot_uuid])}</small>`).join("") || "<small>샷을 선택하면 예상 실행명이 표시됩니다.</small>"}</div>`);
   };
   const renderDraft = (manualDraft = null) => {
+    draftRenderEvents?.abort();
+    draftRenderEvents = new AbortController();
+    const events = { signal: draftRenderEvents.signal };
     const scrollPositions = [".hier-body", "[data-hier-cgt-scroll]", "[data-hier-selected-scroll]"].map(selector => [selector, dialog.querySelector(selector)?.scrollTop || 0]);
     const used = new Set(draft.members.map(row => row.gp_shot_uuid));
     const roots = draft.members.filter(row => row.parent_id === null);
@@ -7498,7 +7587,7 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
         return other.member_id !== row.member_id && q.episode === p.episode && q.shot === p.shot;
       });
     };
-    dialog.innerHTML = `<style>
+    updateMarkup(dialog, `<style>
       .shot-hierarchy-dialog{box-sizing:border-box;position:fixed;inset:0;margin:auto;transform:none;translate:none;width:min(1000px,94vw);max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);display:flex;flex-direction:column;padding:0;border:1px solid #9f4a79;border-radius:12px;background:#0b1020;color:#e6edf7;font:12px/1.5 system-ui,sans-serif;box-shadow:0 16px 80px #000a;overflow:hidden}
       .shot-hierarchy-dialog::backdrop{background:#050814b8}.shot-hierarchy-dialog *{box-sizing:border-box}.shot-hierarchy-dialog header,.shot-hierarchy-dialog footer{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;background:linear-gradient(100deg,#402039,#101626 70%)}
       .shot-hierarchy-dialog h2{margin:0;font-size:15px}.shot-hierarchy-dialog h3{margin:0 0 10px;font-size:13px}.shot-hierarchy-dialog p{margin:6px 0}.shot-hierarchy-dialog small{display:block;color:#9fb0c8}.shot-hierarchy-dialog button,.shot-hierarchy-dialog input,.shot-hierarchy-dialog select{font:inherit;color:inherit;background:#090e1a;border:1px solid #40506a;border-radius:6px;padding:7px 9px;min-height:32px;max-width:100%}.shot-hierarchy-dialog button{cursor:pointer}.shot-hierarchy-dialog button:disabled{opacity:.4;cursor:default}.shot-hierarchy-dialog :focus-visible{outline:2px solid #f472b6;outline-offset:2px}.shot-hierarchy-dialog .hier-primary{background:#88305f;border-color:#f472b6}.shot-hierarchy-dialog .hier-body{padding:14px 18px;overflow:auto;min-height:0}.shot-hierarchy-dialog header,.shot-hierarchy-dialog footer{flex-shrink:0}.shot-hierarchy-dialog .hier-split{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:14px;align-items:start}.shot-hierarchy-dialog .hier-pane{min-width:0;border:1px solid #354058;border-radius:8px;padding:12px;background:#0e1525}.shot-hierarchy-dialog .hier-row{margin:9px 0;padding:10px;border:1px solid var(--shot-accent);border-radius:7px;background:linear-gradient(100deg,rgba(var(--shot-rgb),.18),#0b1020 90%)}.shot-hierarchy-dialog .hier-child{margin-left:20px}.shot-hierarchy-dialog .hier-row input{width:100%;margin:5px 0}.shot-hierarchy-dialog .hier-tools{display:flex;flex-wrap:wrap;gap:6px;align-items:center}.shot-hierarchy-dialog .hier-tools label{flex:1;min-width:130px}.shot-hierarchy-dialog .hier-tools select{width:100%}.shot-hierarchy-dialog .hier-project-tools{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end}.shot-hierarchy-dialog .hier-project-tools label{display:grid;gap:4px;min-width:0}.shot-hierarchy-dialog .hier-project-tools button{white-space:nowrap}.shot-hierarchy-dialog .hier-cgt-scroll{max-height:min(46vh,420px);overflow:auto;overscroll-behavior:contain}.shot-hierarchy-dialog .hier-cgt-scroll thead{position:sticky;top:0;background:#0e1525;z-index:1}.shot-hierarchy-dialog .hier-table td{padding:6px;vertical-align:top;overflow-wrap:anywhere}.shot-hierarchy-dialog .hier-table td:last-child{width:70px}.shot-hierarchy-dialog .hier-selection-list{max-height:min(44vh,420px);overflow:auto;overscroll-behavior:contain}.shot-hierarchy-dialog .hier-name-preview{margin:10px 0;padding:10px;border:1px solid #354058;border-radius:7px;background:#0b1020}.shot-hierarchy-dialog .hier-name-preview h3{margin-bottom:4px}.shot-hierarchy-dialog .hier-manual label{display:grid;gap:4px}.shot-hierarchy-dialog .hier-manual input,.shot-hierarchy-dialog .hier-manual select{width:100%}.shot-hierarchy-dialog .hier-manual{display:grid;gap:8px;margin-top:18px;padding-top:12px;border-top:1px solid #354058}.shot-hierarchy-dialog .hier-table{width:100%;border-collapse:collapse}.shot-hierarchy-dialog th{padding:6px;text-align:left;border-bottom:1px solid #354058}.shot-hierarchy-dialog .hier-offline{padding:12px 4px;color:#e6bd85}.shot-hierarchy-dialog [data-hier-message]{min-height:20px;color:#fda4af;white-space:pre-wrap}.shot-hierarchy-dialog .hier-output{overflow-wrap:anywhere;white-space:pre-wrap}.shot-hierarchy-dialog footer{flex-wrap:wrap}.shot-hierarchy-dialog .hier-actions{display:flex;gap:8px;margin-left:auto}@media(max-width:700px){.shot-hierarchy-dialog .hier-split{grid-template-columns:1fr}.shot-hierarchy-dialog .hier-child{margin-left:10px}}
@@ -7509,7 +7598,7 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
       .shot-hierarchy-dialog .hier-cgt-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0}.shot-hierarchy-dialog .hier-cgt-heading>span{flex:0 0 auto}.shot-hierarchy-dialog .hier-cgt-heading>[data-hier-cgt-account]{min-width:0;margin-left:auto;font-size:10px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:right}
       .shot-hierarchy-dialog .hier-split{height:100%;grid-template-rows:minmax(0,1fr)}.shot-hierarchy-dialog [data-hier-source-pane]{height:100%;min-height:0;display:flex;flex-direction:column}.shot-hierarchy-dialog [data-hier-cgt]{flex:1;min-height:0;display:flex;flex-direction:column}.shot-hierarchy-dialog [data-hier-source-pane] .hier-cgt-scroll{flex:1;min-height:0;max-height:none}.shot-hierarchy-dialog [data-hier-source-pane] .hier-tools,.shot-hierarchy-dialog [data-hier-source-pane] .hier-offline{flex-shrink:0}.shot-hierarchy-dialog .hier-table td:last-child{white-space:nowrap}.shot-hierarchy-dialog [data-hier-cgt-add]{min-width:68px;white-space:nowrap}
       @media(max-width:700px){.shot-hierarchy-dialog .hier-split{height:auto;grid-template-rows:none}.shot-hierarchy-dialog [data-hier-source-pane]{height:min(546px,calc(100dvh - 160px))}}
-    </style><header data-hier-drag-handle title="제목 표시줄을 드래그하여 창 이동"><div><h2 id="hmb-hierarchy-title">CGT 샷 선택 · 묶음 구성</h2></div><button type="button" data-hier-cancel aria-label="취소하고 닫기">×</button></header>
+    </style><header data-hier-drag-handle data-hmb-popup-header title="제목 표시줄을 드래그하여 창 이동"><div><h2 id="hmb-hierarchy-title">CGT 샷 선택 · 묶음 구성</h2></div><button type="button" data-hier-cancel aria-label="취소하고 닫기">×</button></header>
     <div class="hier-body"><p data-hier-message role="status" aria-live="polite"></p><div class="hier-split">
     <section class="hier-pane" data-hier-source-pane><h3 class="hier-cgt-heading"><span>CGT 본인 작업 목록</span><small data-hier-cgt-account hidden></small></h3><div data-hier-cgt></div></section>
     <section class="hier-pane" data-hier-selected-pane><h3>선택한 샷 · 대표 / 하위 (${draft.members.length}/5)</h3><div class="hier-name-preview" data-hier-name-preview></div><div class="hier-selection-list" data-hier-selected-scroll>${ordered.map(row => {
@@ -7522,8 +7611,8 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
       return `<article class="hier-row ${row.parent_id ? "hier-child" : ""}" data-hier-member="${row.manual_uuid}" style="--shot-accent:${palette.accent};--shot-rgb:${palette.rgb};--hier-depth:${depths.get(row.member_id) || 0}"><div class="hier-row-head"><b>${String(number).padStart(2, "0")} · ${role}</b><select data-hier-parent="${row.manual_uuid}" aria-label="${escapeHtml(row.source_name)} 대표·하위 선택" title="하위 샷도 다른 샷의 대표로 선택할 수 있습니다"><option value="" ${row.parent_id === null ? "selected" : ""}>독립 대표</option>${parentOptions.map(parent => `<option value="${escapeHtml(parent.member_id)}" ${parent.member_id === row.parent_id ? "selected" : ""}>${String(slotNumber(parent)).padStart(2, "0")} · ${escapeHtml(parent.canonical_name)}의 하위</option>`).join("")}</select></div>${parts.shot ? `<small>에피소드 ${parts.episode} · 샷 ${parts.shot} · 분리컷 ${parts.split_cut}${sameBase(row) ? " · 같은 원본 샷의 분리컷" : ""}</small>` : ""}<div class="hier-name-tools" data-hier-name-tools><label>정식 이름<input data-hier-name="${row.manual_uuid}" value="${escapeHtml(row.source_name)}" autocomplete="off" ${row.origin === "cgt" ? "readonly" : ""}></label><button type="button" data-hier-remove="${row.manual_uuid}" ${hasChildren ? "disabled title=\"하위를 먼저 선택 해제하세요\"" : ""}>선택 해제</button></div></article>`;
     }).join("")}</div>
     <div class="hier-manual"><h3 data-hier-manual-title>수동 샷 추가</h3><label data-hier-manual-name-field>샷 이름<input data-hier-manual-name placeholder="정식 샷 코드 또는 수동 이름" autocomplete="off"></label><label>연결할 슬롯<select data-hier-slot><option value="new">새 독립 샷 추가</option>${state.shot_routing.shots.map(shot => `<option value="${shot.shot_uuid}" ${used.has(shot.shot_uuid) ? "disabled" : ""}>${String(shot.number).padStart(2, "0")} · ${escapeHtml(shot.name)} (입력·연결 유지)</option>`).join("")}${typeof addImageBash === "function" ? '<option value="image_bash">HMBImageBash</option>' : ""}</select></label><small data-hier-slot-help>기존 슬롯을 선택하면 UUID·미디어·설정·결과를 보존하고 이름만 적용합니다.</small><button type="button" data-hier-add>수동 추가</button></div></section></div></div>
-    <footer><span>${representativeCount}개 대표 · ${draft.members.length - roots.length}개 하위</span><div class="hier-actions"><button type="button" data-hier-cancel>취소</button><button type="button" class="hier-primary" data-hier-confirm>선택 확정</button></div></footer>`;
-    dialog.querySelectorAll("[data-hier-cancel]").forEach(button => button.addEventListener("click", close));
+    <footer><span>${representativeCount}개 대표 · ${draft.members.length - roots.length}개 하위</span><div class="hier-actions"><button type="button" data-hier-cancel>취소</button><button type="button" class="hier-primary" data-hier-confirm>선택 확정</button></div></footer>`);
+    dialog.querySelectorAll("[data-hier-cancel]").forEach(button => button.addEventListener("click", close, events));
     const confirmImageBash = () => {
       if (confirmingCgt || hierarchyClosed || typeof addImageBash !== "function") return;
       if (JSON.stringify(draft.members) !== JSON.stringify(prior.members || [])) {
@@ -7548,14 +7637,14 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
         draft.members = next.members;
       });
     };
-    dialog.querySelector("[data-hier-add]").addEventListener("click", add);
+    if (!basketBinding) dialog.querySelector("[data-hier-add]").addEventListener("click", add, events);
     const syncManualSlot = () => {
       const imageBash = dialog.querySelector("[data-hier-slot]").value === "image_bash";
-      dialog.querySelector("[data-hier-manual-name-field]").hidden = imageBash;
-      dialog.querySelector("[data-hier-manual-name]").disabled = imageBash;
+      dialog.querySelector("[data-hier-manual-name-field]").hidden = imageBash || basketBinding;
+      dialog.querySelector("[data-hier-manual-name]").disabled = imageBash || basketBinding;
       dialog.querySelector("[data-hier-manual-title]").textContent = imageBash ? "HMBImageBash 추가" : "수동 샷 추가";
-      dialog.querySelector("[data-hier-add]").hidden = imageBash;
-      dialog.querySelector("[data-hier-add]").disabled = imageBash;
+      dialog.querySelector("[data-hier-add]").hidden = imageBash || basketBinding;
+      dialog.querySelector("[data-hier-add]").disabled = imageBash || basketBinding;
       dialog.querySelector("[data-hier-slot-help]").textContent = imageBash
         ? "Shot 1~5와 별도의 이미지 작업 공간을 추가합니다."
         : "기존 슬롯을 선택하면 UUID·미디어·설정·결과를 보존하고 이름만 적용합니다.";
@@ -7565,14 +7654,23 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
       dialog.querySelector("[data-hier-slot]").value = manualDraft.slot;
       syncManualSlot();
     }
+    if (basketBinding) {
+      const slot = dialog.querySelector("[data-hier-slot]");
+      slot.querySelector('option[value="image_bash"]')?.remove();
+      if (!manualDraft && !used.has(focusedShotUuid) && [...slot.options].some(option => option.value === focusedShotUuid)) {
+        slot.value = focusedShotUuid;
+      }
+      dialog.querySelector("[data-hier-manual-title]").hidden = true;
+      syncManualSlot();
+    }
     dialog.querySelector("[data-hier-slot]").addEventListener("change", () => {
       notice("");
       syncManualSlot();
       renderCgt();
-    });
+    }, events);
     dialog.querySelector("[data-hier-manual-name]").addEventListener("keydown", event => {
-      if (event.key === "Enter" && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); add(); }
-    });
+      if (!basketBinding && event.key === "Enter" && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); add(); }
+    }, events);
     dialog.querySelectorAll("[data-hier-name]").forEach(input => input.addEventListener("change", () => {
       try {
         const row = draft.members.find(item => item.manual_uuid === input.dataset.hierName);
@@ -7585,7 +7683,7 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
         renderNamePreview();
         notice("");
       } catch (error) { notice(error.message); }
-    }));
+    }, events));
     dialog.querySelectorAll("[data-hier-parent]").forEach(select => select.addEventListener("change", () => {
       try {
         if (confirmingCgt || container.__hmbNativeUiContract?.props?.disabled) throw new Error("Griptape에서 편집이 잠겨 있습니다.");
@@ -7601,16 +7699,18 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
         select.value = draft.members.find(row => row.manual_uuid === select.dataset.hierParent)?.parent_id || "";
         notice(error.message);
       }
-    }));
+    }, events));
     dialog.querySelectorAll("[data-hier-remove]").forEach(button => button.addEventListener("click", () => changed(() => {
       const row = draft.members.find(item => item.manual_uuid === button.dataset.hierRemove);
       if (draft.members.some(child => child.parent_id === row.member_id)) throw new Error("하위를 먼저 선택 해제하세요.");
       draft.members = draft.members.filter(item => item !== row).map((item, i) => ({ ...item, selection_order: i + 1 }));
       if (draft.version === 2 && !draft.members.some(item => item.origin === "cgt")) { draft.cgt_scope = null; draft.cgt_account_id = null; }
-    })));
+    }), events));
     dialog.querySelector("[data-hier-confirm]").addEventListener("click", () => {
       try {
+        if (confirmingCgt) return;
         if (container.__hmbNativeUiContract?.props?.disabled) throw new Error("Griptape에서 편집이 잠겨 있습니다.");
+        if (basketBinding && !draft.members.some(row => row.origin === "cgt")) throw new Error("CGT에서 본인에게 배정된 컷을 먼저 선택하세요.");
         // The selected workspace uses the same confirmation action even when
         // no Shot is selected. A pending Shot edit still retains the existing
         // CGT confirmation boundary and must be confirmed separately.
@@ -7618,11 +7718,18 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
         const names = new Map([...dialog.querySelectorAll("[data-hier-name]")].map(input => [input.dataset.hierName, hmbHierarchyParseName(input.value)]));
         const candidate = { ...draft, members: draft.members.map(row => ({ ...row,
           source_name: names.get(row.manual_uuid).source_name, canonical_name: names.get(row.manual_uuid).canonical_name })) };
-        const request = { schema: SHOT_HIERARCHY_EDIT_SCHEMA, version: 1, expected_generation: initialGeneration, expected_binding_revision: prior.revision || 0,
-          removed_member_ids: (prior.members || []).filter(item => !candidate.members.some(row => row.member_id === item.member_id)).map(item => item.member_id), binding: hmbNormalizeShotHierarchy(candidate) };
-        // Validate against current authority again; background changes cannot be
-        // overwritten by an older dialog. No render or CGT request is made.
-        hmbApplyShotHierarchyEdit(container.__hmbImageAssetLatestState || state, request);
+        const request = makeRequest(candidate);
+        const current = container.__hmbImageAssetLatestState || state;
+        if (!basketBinding
+            && JSON.stringify({ ...request.binding, revision: prior.revision }) === JSON.stringify(prior)) {
+          if (imageAssetScopeKey(hmbShotHierarchyEditStructure(current)) !== imageAssetScopeKey(initialStructure)) {
+            throw new Error("샷이 변경되었습니다. 창을 닫고 다시 열어 주세요.");
+          }
+          close();
+          return;
+        }
+        // Validate edited groups against current authority before asking CGT.
+        hmbApplyShotHierarchyEdit(current, request);
         if (candidate.members.some(row => row.origin === "cgt")) {
           confirmingCgt = true;
           if (!sendCgt("cgt_confirm", request)) { confirmingCgt = false; throw new Error("CGT 확인 연결이 준비되지 않았습니다. 새로고침하세요."); }
@@ -7631,7 +7738,8 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
         }
         close(); commit(request);
       } catch (error) { notice(error.message); }
-    });
+    }, events);
+    if (dialog.isConnected) globalThis.__hmbStylePopupHeader?.(dialog.querySelector("[data-hier-drag-handle]"), dialog);
     renderCgt();
     renderNamePreview();
     scrollPositions.forEach(([selector, top]) => { const target = dialog.querySelector(selector); if (target) target.scrollTop = top; });
@@ -7645,7 +7753,8 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
   try {
     // The modal belongs to the viewport, outside the graph node's zoom and transform.
     renderDraft(); (doc.body || root).appendChild(dialog); dialog.showModal();
-    dialog.querySelector("[data-hier-manual-name]").focus({ preventScroll: true });
+    globalThis.__hmbStylePopupHeader?.(dialog.querySelector("[data-hier-drag-handle]"), dialog);
+    dialog.querySelector(basketBinding ? "[data-hier-slot]" : "[data-hier-manual-name]").focus({ preventScroll: true });
     cgtState = { ...cgtState, status: "loading", tasks: [] };
     if (!sendCgt("cgt_catalog")) cgtState = { ...cgtState, status: "SDK_UNAVAILABLE", tasks: [] };
     renderCgt();
@@ -8031,6 +8140,13 @@ function installEvents(container, state, props, remount, listeners) {
     hmbOpenShotHierarchyDialog(container, state, state.shot_routing.active_shot_uuid, commitHierarchyRequest,
       () => commitImageBashMutation(candidate => hmbCreateImageBashWorkspace(candidate), true));
   });
+  on(container.querySelector("[data-shot-add]"), "hmb-basket-open-shot-hierarchy", (event) => {
+    if (container.__hmbNativeUiContract?.props?.disabled) return;
+    hmbFlushImageAssetSelectionCommit(container);
+    state = container.__hmbImageAssetLatestState || state;
+    if (hmbOpenShotHierarchyDialog(container, state, state.shot_routing.active_shot_uuid, commitHierarchyRequest, null,
+      { bindOnly: true, onClose: event.detail?.onClose })) event.preventDefault();
+  });
   container.querySelectorAll("[data-shot-delete]").forEach((button) => {
     const shotUuid = clean(button.getAttribute("data-shot-delete"));
     on(button, "click", (event) => {
@@ -8177,6 +8293,7 @@ function installEvents(container, state, props, remount, listeners) {
     commitSlowProjectMutation(() => {
       state.project_root = path;
       state.project_id = "";
+      state.project_display_name = "";
       state.project_uid = "";
       state.project_cache_uid = "";
       state.folder_signature = "";
@@ -8598,6 +8715,7 @@ function installEvents(container, state, props, remount, listeners) {
     });
   });
   const registrationBackdrop = container.querySelector("[data-registration-backdrop]");
+  hmbStyleImageAssetPassportHeader(registrationBackdrop);
   hmbInstallImageAssetRegistrationBackdropDismissal(
     registrationBackdrop,
     closeRegistration,
@@ -8762,6 +8880,7 @@ function installEvents(container, state, props, remount, listeners) {
       state.catalog_root = nativePath;
       state.project_root = "";
       state.project_id = "";
+      state.project_display_name = "";
       state.project_uid = "";
       state.project_cache_uid = "";
       state.folder_signature = "";
@@ -8815,6 +8934,8 @@ function hmbNativeUiImplementation(container, props) {
   let leaseTransition = null, leaseDisposed = false;
   const clearLeaseTransition = () => {
     clearTimeout(leaseTransition?.deadline);
+    clearTimeout(leaseTransition?.retryTimer);
+    leaseTransition?.retryButton?.remove();
     leaseTransition = null;
     delete container.__hmbImageAssetLeaseTransitionPending;
     delete container.__hmbImageAssetLeaseWake;
@@ -9126,43 +9247,116 @@ function hmbNativeUiImplementation(container, props) {
           if (!hmbAcceptImageAssetWidgetLease(container, rawIncoming, incomingLease)) return;
           clearLeaseTransition();
         } else {
+          if (leaseTransition?.lease === incomingLease && leaseTransition.runtime === runtime) {
+            leaseTransition.props = nextProps;
+            leaseTransition.confirm();
+            return;
+          }
           clearLeaseTransition();
           container.__hmbImageAssetLeaseTransitionPending = true;
           hmbInvalidateImageAssetPublication(container); hmbCancelImageAssetSelectionCommit(container);
           hmbCancelImageAssetThumbnailRequest(container); hmbStopImageAssetCatalogPolling(container);
           clearTimeout(container.__hmbImageAssetSearchTimer); delete container.__hmbImageAssetSearchTimer;
           delete container.__hmbImageAssetPendingSlowAction; delete container.__hmbImageAssetSlowActionToken;
-          const pending = leaseTransition = {props:nextProps, lease:incomingLease, runtime, querying:false};
-          hmbSetImageAssetBusy(container, true, imageAssetLanguage(state) === "en" ? "Checking connection…" : "연결 확인 중…");
+          delete container.__hmbImageAssetProjectAuthorityPending;
+          const owner = container.closest?.(".react-flow__node");
+          const nodeName = clean(owner?.getAttribute?.("data-id") || container.__hmbImageAssetNativeNodeName);
+          const pending = leaseTransition = {props:nextProps, lease:incomingLease, runtime, attempt:0, querying:false, failed:false};
+          const owned = () => !leaseDisposed && leaseTransition === pending && container.isConnected !== false
+            && container.closest?.(".react-flow__node") === owner
+            && clean(owner?.getAttribute?.("data-id") || container.__hmbImageAssetNativeNodeName) === nodeName;
           const root = container.querySelector?.(".hmb-image-assets");
           if (root && !root.hasAttribute("inert")) { root.setAttribute("inert", ""); root.setAttribute("data-hmb-connection-inert", ""); }
-          pending.deadline = setTimeout(() => {
-            if (!leaseDisposed && leaseTransition === pending) hmbShowImageAssetTransportError(container,
-              new Error(imageAssetLanguage(state) === "en" ? "Connection could not be confirmed. Save your work and reopen the library." : "연결을 확인하지 못했습니다. 작업을 저장한 뒤 라이브러리를 다시 열어 주세요."), state);
-          }, 10000);
-          const confirm = () => {
-            if (leaseDisposed || leaseTransition !== pending || pending.querying) return;
-            const bridge = imageAssetBridgeForNode(container, runtime);
-            if (typeof bridge?.queryWidgetLease !== "function") return;
+          const english = imageAssetLanguage(state) === "en";
+          const fail = () => {
+            if (!owned() || pending.failed) return;
+            clearTimeout(pending.deadline);
+            clearTimeout(pending.retryTimer);
+            pending.failed = true;
+            pending.querying = false;
+            hmbSetImageAssetBusy(container, false);
+            hmbApplyCgtWorkStartNotice(container, state);
+            const retry = pending.retryButton = container.ownerDocument.createElement("button");
+            retry.type = "button";
+            retry.className = "transport-status";
+            retry.setAttribute("data-asset-connection-retry", "");
+            retry.textContent = english ? "Connection check failed · Retry" : "연결 확인 실패 · 다시 연결";
+            retry.addEventListener("click", event => {
+              event.preventDefault();
+              event.stopPropagation();
+              if (owned()) begin();
+            });
+            container.appendChild(retry);
+          };
+          const applyConfirmed = (confirmed, snapshot) => {
+            const candidate = parseValue(pending.props.value);
+            const view = parseValue(snapshot?.canonical_view);
+            const verified = [view, candidate].find(value => value?.schema === "hmb-image-asset-library-state"
+              && hmbImageAssetWidgetLease(value) === confirmed && imageAssetAuthorityMatches(container,value,snapshot));
+            if (verified && hmbAcceptImageAssetWidgetLease(container, verified, confirmed)) {
+              const verifiedProps = {...pending.props,value:JSON.stringify(verified)};
+              clearLeaseTransition(); applyProps(verifiedProps, true);
+            } else if (confirmed === container.__hmbImageAssetWidgetLease
+                && imageAssetAuthorityMatches(container,state,snapshot)) {
+              clearLeaseTransition(); remount(state); hmbSetImageAssetBusy(container, false);
+            } else fail();
+          };
+          pending.confirm = () => {
+            if (!owned() || pending.failed || pending.props.disabled) return;
+            const currentBridge = imageAssetBridgeForNode(container, runtime);
+            const confirmed = currentBridge?.authoritySnapshot;
+            if (currentBridge?.widget_runtime_lease === pending.lease
+                && imageAssetAuthorityMatches(container, parseValue(pending.props.value), confirmed)) {
+              applyConfirmed(pending.lease, confirmed);
+              return;
+            }
+            if (pending.querying) return;
+            const attempt = pending.attempt;
+            const readAuthority = container.ownerDocument?.defaultView?.__hmbReadImageAssetAuthority0130;
+            const bridge = currentBridge
+              || imageAssetBridgeForNode(container,imageAssetThumbnailRuntimeId(state));
+            if (!(typeof readAuthority === "function" && owner && nodeName) && typeof bridge?.queryWidgetLease !== "function") return;
             pending.querying = true;
-            Promise.resolve(bridge.queryWidgetLease()).then(confirmed => {
-              pending.querying = false;
-              if (leaseDisposed || leaseTransition !== pending) return;
-              if (confirmed !== pending.lease) {
-                if (confirmed === container.__hmbImageAssetWidgetLease) {
-                  clearLeaseTransition(); remount(state); hmbSetImageAssetBusy(container, false);
-                } else hmbShowImageAssetTransportError(container, new Error("현재 이미지 라이브러리의 작업 정보를 다시 확인하세요."), state);
-                return;
-              }
-              if(!imageAssetAuthorityMatches(container,parseValue(pending.props.value),imageAssetBridgeForNode(container,runtime)?.authoritySnapshot))return;
-              if (!hmbAcceptImageAssetWidgetLease(container, parseValue(pending.props.value), confirmed)) return;
-              clearLeaseTransition(); applyProps(pending.props);
-            }).catch(error => {
-              pending.querying = false;
-              if (!leaseDisposed && leaseTransition === pending) hmbShowImageAssetTransportError(container, error, state);
+            const requestId = `widget-authority-recovery-${newImageAssetUuid()}`;
+            const read = typeof readAuthority === "function" && owner && nodeName
+              ? Promise.resolve().then(() => readAuthority(nodeName, {
+                schema:"hmb-image-asset-thumbnail-bridge",version:1,operation:"widget_authority",phase:"request",
+                runtime_instance_id:runtime,request_id:requestId,include_view:true,
+              }, 4000)).then(snapshot => {
+                if (snapshot?.schema !== "hmb-image-asset-thumbnail-bridge" || snapshot.version !== 1
+                    || snapshot.operation !== "widget_authority" || snapshot.phase !== "result"
+                    || snapshot.request_id !== requestId || snapshot.request_runtime_instance_id !== runtime
+                    || clean(snapshot.canonical_node_name) !== nodeName || snapshot.authority_error) throw new Error("Unconfirmed ImageAsset authority");
+                return [snapshot.widget_runtime_lease,snapshot];
+              })
+              : Promise.resolve(bridge.queryWidgetLease()).then(lease => [
+                lease, imageAssetBridgeForNode(container,runtime)?.authoritySnapshot
+                  || imageAssetBridgeForNode(container,imageAssetThumbnailRuntimeId(state))?.authoritySnapshot,
+              ]);
+            read.then(([lease,snapshot]) => {
+              if (owned() && !pending.failed && pending.attempt === attempt) applyConfirmed(lease,snapshot);
+            }).catch(() => {
+              if (!owned() || pending.failed || pending.attempt !== attempt) return;
+              if (pending.retried) return;
+              pending.retried = true;
+              pending.retryTimer = setTimeout(() => {
+                pending.querying = false;
+                pending.confirm();
+              }, 120);
             });
           };
-          container.__hmbImageAssetLeaseWake = confirm; confirm();
+          const begin = () => {
+            pending.retryButton?.remove();
+            pending.failed = false;
+            pending.querying = false;
+            pending.retried = false;
+            pending.attempt += 1;
+            hmbSetImageAssetBusy(container, true, english ? "Checking connection…" : "연결 확인 중…");
+            pending.deadline = setTimeout(fail, 10000);
+            pending.confirm();
+          };
+          container.__hmbImageAssetLeaseWake = pending.confirm;
+          begin();
           return;
         }
       }
@@ -9655,7 +9849,7 @@ function hmbAcquireNativeStockSafety(container) {
   let shared = doc[key];
   if (!shared) {
     const owners = new Set(), identities = new Map();
-    let contextNode = null, badge = null, notice = null, disposed = false;
+    let contextNode = null, notice = null, noticeTimer = null, disposed = false;
     const nativeReady = () => doc.documentElement.getAttribute("data-hmb-native-deletion-guard") === "engine-preflight"
       && doc.documentElement.getAttribute("data-hmb-native-deletion-protection-version") === "2";
     const rootOf = value => value?.closest?.(".react-flow__node[data-id]") || null;
@@ -9696,7 +9890,7 @@ function hmbAcquireNativeStockSafety(container) {
       if (!nodeMenu && !(trash && button.closest(".react-flow"))) return null;
       return { button, nodeMenu };
     };
-    const dismiss = () => { notice?.remove(); notice = null; };
+    const dismiss = () => { win.clearTimeout(noticeTimer); notice?.remove(); notice = null; };
     const show = () => {
       if (disposed || nativeReady()) return;
       if (notice?.isConnected) { notice.querySelector("button")?.focus(); return; }
@@ -9704,12 +9898,13 @@ function hmbAcquireNativeStockSafety(container) {
       notice.setAttribute("data-hmb-native-safety-notice", "required");
       notice.setAttribute("role", "alert");
       Object.assign(notice.style, { position: "fixed", zIndex: "2147483647", right: "20px", bottom: "64px", maxWidth: "420px", padding: "18px", border: "1px solid #b89458", borderRadius: "18px", background: "#151c29", color: "#f8fafc", font: "13px/1.6 system-ui,sans-serif", boxShadow: "0 8px 32px #0008" });
-      const title = doc.createElement("strong"); title.textContent = "HMB 편집기·삭제 보호 확인이 필요합니다";
+      const title = doc.createElement("strong"); title.textContent = "HMB 노드 삭제를 중단했습니다";
       const text = doc.createElement("p");
-      text.textContent = "Override 업데이트 로그에서 current/applied를 확인하세요. UI 또는 엔진 보호 상태를 확인하지 못해 감지된 HMB 노드 삭제 시도를 중단했습니다. 작업 저장 후 Griptape 완전 종료·재시작하세요. current/applied는 디스크 파일 상태이며 현재 화면의 통합 상태를 보장하지 않습니다. 실패 시 로그의 원인을 확인하세요. 이 안내만으로 다른 삭제 경로의 엔진 보호가 준비됐다고 보장할 수 없습니다.";
+      text.textContent = "현재 화면에서 연결 상태를 확인할 수 없습니다. 작업을 저장하고 Griptape를 다시 시작한 뒤 확인하세요.";
       const close = doc.createElement("button"); close.type = "button"; close.textContent = "확인";
       Object.assign(close.style, { border: "1px solid #64748b", borderRadius: "999px", background: "#243044", color: "#f8fafc", padding: "6px 18px", cursor: "pointer" });
       close.addEventListener("click", dismiss); notice.append(title, text, close); doc.body.append(notice); close.focus();
+      noticeTimer = win.setTimeout(dismiss, 8000);
     };
     const stop = event => { event.preventDefault(); event.stopPropagation(); event.stopImmediatePropagation(); show(); };
     const keydown = event => {
@@ -9721,12 +9916,12 @@ function hmbAcquireNativeStockSafety(container) {
       const action = deleteControl(event.target);
       if (action && (ownedTarget(action.button) || managed()
           || action.nodeMenu && contextNode?.isConnected && roots().has(contextNode))) stop(event);
-      else if (!event.target?.closest?.("[data-hmb-native-safety-notice],[data-hmb-native-safety-status]")) contextNode = null;
+      else if (!event.target?.closest?.("[data-hmb-native-safety-notice]")) { contextNode = null; dismiss(); }
     };
     const contextmenu = event => { contextNode = rootOf(event.target); };
     const dispose = () => {
       if (disposed) return;
-      disposed = true; observer?.disconnect(); badge?.remove(); dismiss(); contextNode = null;
+      disposed = true; observer?.disconnect(); dismiss(); contextNode = null;
       win.removeEventListener("keydown", keydown, true); win.removeEventListener("click", click, true); win.removeEventListener("contextmenu", contextmenu, true);
       if (doc[key] === shared) delete doc[key];
     };
@@ -9734,14 +9929,7 @@ function hmbAcquireNativeStockSafety(container) {
       if (disposed) return;
       const retained = roots();
       if (!owners.size && !retained.size) { dispose(); return; }
-      if (nativeReady() || !retained.size) { badge?.remove(); badge = null; dismiss(); return; }
-      if (badge?.isConnected || !doc.body) return;
-      badge = doc.createElement("button"); badge.type = "button";
-      badge.setAttribute("data-hmb-native-safety-status", "required");
-      badge.setAttribute("aria-label", "HMB Override 업데이트·재시작 및 삭제 보호 상태 확인");
-      badge.textContent = "HMB UI·삭제 보호 상태 확인";
-      Object.assign(badge.style, { position: "fixed", zIndex: "2147483646", right: "20px", bottom: "20px", border: "1px solid #b89458", borderRadius: "999px", padding: "7px 14px", background: "#151c29", color: "#f5d49a", font: "12px system-ui,sans-serif", cursor: "pointer", boxShadow: "0 4px 18px #0006" });
-      badge.addEventListener("click", show); doc.body.append(badge);
+      if (nativeReady() || !retained.size) dismiss();
     };
     const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(sync) : null;
     observer?.observe(doc.documentElement, { attributes: true, attributeFilter: ["data-hmb-native-deletion-guard", "data-hmb-native-deletion-protection-version", "data-id"], childList: true, subtree: true });

@@ -72,6 +72,7 @@ assert grouped_defaults == {
     "ratio": "16:9",
     "duration": 4,
     "generate_audio": False,
+    target.PROMPT_SOUND_AUDIO_DISPLAY_PARAMETER: None,
     "output_format": "mov",
 }
 assert node._output_file._default_filename == "volcengine_seedance_video.mov"
@@ -79,7 +80,8 @@ assert node._output_file._default_filename == "volcengine_seedance_video.mov"
 # Materialize the recorded group children as Griptape itself does before a
 # user switches models. The 2.0 compatibility route must normalize MOV→MP4.
 for name, value in grouped_defaults.items():
-    node.set_parameter_value(name, value, initial_setup=True)
+    if name != target.PROMPT_SOUND_AUDIO_DISPLAY_PARAMETER:
+        node.set_parameter_value(name, value, initial_setup=True)
 node.set_parameter_value(
     "output_file", "volcengine_seedance_video.mov", initial_setup=True
 )

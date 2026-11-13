@@ -64,7 +64,9 @@ _PROMPT_NODE_TYPE = "HMBPromptLibrary"
 _AGENT_NODE_TYPE = "HMBAgentLibrary"
 _FINISH_NODE_TYPE = "HMBFinishLookLibrary"
 _BASH_NODE_TYPE = "HMBImageBash"
-_EDITOR_NODE_TYPES = (_PROMPT_NODE_TYPE, _AGENT_NODE_TYPE, _FINISH_NODE_TYPE, _BASH_NODE_TYPE)
+_SOUND_NODE_TYPE = "HMBSoundLibrary"
+_ANALYSIS_NODE_TYPE = "HMBAnalysisAgent"
+_EDITOR_NODE_TYPES = (_PROMPT_NODE_TYPE, _AGENT_NODE_TYPE, _FINISH_NODE_TYPE, _BASH_NODE_TYPE, _SOUND_NODE_TYPE, _ANALYSIS_NODE_TYPE)
 _PROMPT_SINGLE_LOAD_MESSAGE = (
     "HMBPromptLibrary is already loaded in this flow. "
     "Use its Shot controls to manage all Shots; another Prompt was not created."
@@ -128,7 +130,7 @@ def _hmb_native_editor_plain_path(path: Path) -> Path:
 
 
 def _hmb_native_editor_sources(engine: Any, library_data: Any) -> tuple[Path, Path, dict[str, str], dict[str, Any]]:
-    """Only the registered global-workspace installation may spawn the fixed updater.
+    """Only the registered Documents installation may spawn the fixed updater.
 
     Developer checkouts and SDK fixtures exit before opening support files or
     creating a process. No caller can supply an alternative app target.
@@ -136,14 +138,11 @@ def _hmb_native_editor_sources(engine: Any, library_data: Any) -> tuple[Path, Pa
     if getattr(library_data, "name", None) != _LIBRARY_NAME:
         raise LookupError("not_hmb_library")
     root = _hmb_native_editor_plain_path(Path(__file__).parent)
-    configured_workspace = getattr(getattr(engine, "config_manager", None), "configured_global_workspace_path", None)
-    if callable(configured_workspace):
-        workspace = configured_workspace()
-    else:
-        workspace = _hmb_native_editor_documents_path() / "GriptapeNodes"
-    expected = _hmb_native_editor_plain_path(Path(workspace) / "libraries/HMB_GP_Production")
+    documents = _hmb_native_editor_documents_path()
+    expected = Path(os.path.abspath(documents / "GriptapeNodes/libraries/HMB_GP_Production"))
     if os.path.normcase(str(root)) != os.path.normcase(str(expected)):
         raise LookupError("not_installed_library")
+    _hmb_native_editor_plain_path(expected)
     manager = getattr(engine, "library_manager", None)
     lookup = getattr(manager, "get_library_info_by_library_name", None)
     if getattr(manager, "is_worker", None) is not False or not callable(lookup):
@@ -185,7 +184,7 @@ def _hmb_native_editor_sources(engine: Any, library_data: Any) -> tuple[Path, Pa
         required = {"source_sha256", "candidate_sha256", "adapter_path", "adapter_sha256", "structural_fallback"}
         if (not isinstance(profile, dict) or not required.issubset(profile)
                 or set(profile) - required - {"previous_candidate_sha256"}
-                or profile.get("adapter_path") not in {"tools/hmb_native_semantic_adapter.py", "tools/hmb_team_editor_0130_connections.py"}
+                or profile.get("adapter_path") != "tools/hmb_native_semantic_adapter.py"
                 or type(profile.get("structural_fallback")) is not bool):
             raise ValueError("native_support_profile_invalid")
         for key in ("source_sha256", "candidate_sha256", "adapter_sha256"):
@@ -215,8 +214,8 @@ def _hmb_native_editor_sources(engine: Any, library_data: Any) -> tuple[Path, Pa
     return root, python, hashes, descriptor
 
 
-_HMB_TEAM_0130_STOCK_ENTRY_SHA256 = "561a68840af19500274dbbb8ef2c46e9ac8a619564e246b8b285137e63569a82"
-_HMB_TEAM_0130_CANDIDATE_ENTRY_SHA256 = "8696c149551a9326b9457c2ed353f0cef8e5aa3054e1656e8842ecc42803bbe5"
+_HMB_EDITOR_0130_OVERLAY_SHA256 = "355e3f9500e457ae6834c0b92b89a6dadb8724d05366299a84522399507a25d9"
+_HMB_EDITOR_0130_ENTRY_SHA256 = "f5db8ec1ef090bcc026ca2a2e062a557bc6a43c8bf042d37d3535c4de346515f"
 
 
 def _hmb_native_editor_runtime_fingerprint() -> tuple[str, str, str]:
@@ -230,7 +229,10 @@ def _hmb_native_editor_runtime_fingerprint() -> tuple[str, str, str]:
     local = os.environ.get("LOCALAPPDATA")
     if not local:
         raise ValueError("native_editor_local_appdata_missing")
-    root = _hmb_native_editor_plain_path(Path(local) / "ai.griptape.nodes.desktop/current/resources/editor-bundle")
+    resources = Path(local) / "ai.griptape.nodes.desktop/current/resources"
+    embedded = _hmb_native_editor_plain_path(resources /
+        "engine-bundle/python/Lib/site-packages/griptape_nodes_editor_dist/editor")
+    root = embedded if (embedded / "index-editor.html").is_file() else _hmb_native_editor_plain_path(resources / "editor-bundle")
     entry = _hmb_native_editor_plain_path(root / "index-editor.html")
 
     def read_stable(path: Path, limit: int) -> bytes:
@@ -243,14 +245,6 @@ def _hmb_native_editor_runtime_fingerprint() -> tuple[str, str, str]:
             raise ValueError("native_editor_file_changed_during_read")
         return encoded
 
-    embedded = _hmb_native_editor_plain_path(Path(local) /
-        "ai.griptape.nodes.desktop/current/resources/engine-bundle/python/Lib/site-packages/griptape_nodes_editor_dist/editor/index-editor.html")
-    if embedded.is_file():
-        embedded_html = read_stable(embedded, 1024 * 1024)
-        if hashlib.sha256(embedded_html).hexdigest() not in {
-                _HMB_TEAM_0130_STOCK_ENTRY_SHA256, _HMB_TEAM_0130_CANDIDATE_ENTRY_SHA256}:
-            raise LookupError("native_editor_layout_unsupported")
-        entry, root = embedded, embedded.parent
     if not entry.is_file():
         raise LookupError("native_editor_layout_unsupported")
     html = read_stable(entry, 1024 * 1024)
@@ -305,7 +299,7 @@ def _hmb_native_editor_child(root: Path, python: Path, descriptor: dict[str, Any
                 or len(value["reason"]) > 4096 or any(ord(c) < 32 for c in value["reason"])):
             raise ValueError("native_update_response_invalid")
         success = value["status"] in {"current", "applied"}
-        candidates = {descriptor["candidate_sha256"]}
+        candidates = {descriptor["candidate_sha256"], _HMB_EDITOR_0130_OVERLAY_SHA256}
         candidates.update(p["candidate_sha256"] for p in descriptor.get("additional_profiles", []))
         candidate = value.get("candidate_sha256")
         if success and (process.returncode != 0 or value["disk_ready"] is not True
@@ -375,13 +369,14 @@ def _hmb_coordinate_native_editor_update(owner: Any, engine: Any, library_data: 
         try:
             result = _hmb_native_editor_child(root, python, descriptor)
             final_runtime = _hmb_native_editor_runtime_fingerprint()
-            team_entry_applied = (
-                result.get("status") == "applied" and final_runtime[0] == runtime[0]
-                and runtime[1] == _HMB_TEAM_0130_STOCK_ENTRY_SHA256
-                and final_runtime[1] == _HMB_TEAM_0130_CANDIDATE_ENTRY_SHA256
-                and result.get("entry_candidate_sha256") == final_runtime[1]
+            activated_embedded_overlay = (
+                result.get("status") == "applied"
+                and final_runtime[0] == result.get("target")
+                and "griptape_nodes_editor_dist" in Path(final_runtime[0]).parts
+                and final_runtime[1:] == (_HMB_EDITOR_0130_ENTRY_SHA256, _HMB_EDITOR_0130_OVERLAY_SHA256)
+                and final_runtime[1] == result.get("entry_candidate_sha256")
             )
-            if ((final_runtime[:2] != runtime[:2] and not team_entry_applied)
+            if ((final_runtime[:2] != runtime[:2] and not activated_embedded_overlay)
                     or (result.get("status") in {"current", "applied"}
                         and final_runtime[2] != result.get("candidate_sha256"))
                     or (result.get("status") not in {"current", "applied"}
@@ -951,8 +946,8 @@ if __name__ == '__main__':
 
 _HMB_ENV_STATE_MODULE = "_hmb_gp_production_environment_state_v1"
 _HMB_ENV_RESPONSE_LIMIT = 1024 * 1024
-_HMB_ENV_NODE_FILES = frozenset({"HMBAgentLibrary.py", "HMBImageAssetLibrary.py", "HMBVideoPickerLibrary.py",
-    "HMBPromptLibrary.py", "HMBFinishLookLibrary.py", "HMBColorLUTLibrary.py", "HMBSeedanceGeneration.py"})
+_HMB_ENV_NODE_FILES = frozenset({"HMBAgentLibrary.py", "HMBAnalysisAgent.py", "HMBImageAssetLibrary.py", "HMBVideoPickerLibrary.py",
+    "HMBPromptLibrary.py", "HMBSoundLibrary.py", "HMBFinishLookLibrary.py", "HMBColorLUTLibrary.py", "HMBSeedanceGeneration.py"})
 
 
 def _hmb_environment_state() -> Any:
@@ -1588,7 +1583,7 @@ def _registered_unsaved_workflow(name: Any) -> bool:
         return False
     try:
         identity = UUID(name[len("unsaved:"):])
-        if name != "unsaved:" + str(identity):
+        if name not in {f"unsaved:{identity}", f"unsaved:{identity.hex}"}:
             return False
         if WorkflowRegistry.has_workflow_with_name(name) is not True:
             return False
@@ -1745,6 +1740,7 @@ class _Registration:
         self.deletion_handlers = None
         self.deletion_protection = None
         self.connection_handlers = None
+        self.shot_basket_handlers = None
 
     def start_web_worker(self) -> None:
         engine = self.engine()
@@ -1957,18 +1953,19 @@ class _Registration:
         return context.get_current_flow() if context.has_current_flow() else None
 
     @staticmethod
-    def _flow_has_prompt(flow: Any, node_type: str = _PROMPT_NODE_TYPE) -> bool:
+    def _flow_prompt_count(flow: Any, node_type: str) -> int:
         nodes = getattr(flow, "nodes", None)
         if not isinstance(nodes, dict):
-            return False
+            return 0
+        count = 0
         for node in nodes.values():
             metadata = getattr(node, "metadata", None)
             if (isinstance(metadata, dict)
                     and metadata.get("library") == _LIBRARY_NAME
                     and metadata.get("node_type") == node_type
                     and not bool(getattr(node, "_hmb_node_deleted", False))):
-                return True
-        return False
+                count += 1
+        return count
 
     def _guard_prompt_creation(self, request: Any) -> Any:
         is_create = type(request) is CreateNodeRequest
@@ -2028,12 +2025,20 @@ class _Registration:
                 if pending is not None and (pending[0]() is not flow or pending[1]() is None):
                     self.prompt_pending.pop(key, None)
                     pending = None
-                if count > 1 or self._flow_has_prompt(flow, key[1]) or (pending is not None and pending[1]() is not request):
+                node_type = key[1]
+                # Palette creates can pick the vacant Analysis role. Clipboard
+                # operations restore authored roles and retain the single-entry
+                # guard rather than changing copied state to resolve a conflict.
+                limit = 2 if is_create and node_type == _ANALYSIS_NODE_TYPE else 1
+                if (count + self._flow_prompt_count(flow, node_type) > limit
+                        or (pending is not None and pending[1]() is not request)):
                     failure = (CreateNodeResultFailure if is_create else
                         DuplicateSelectedNodesResultFailure if is_duplicate else
                         DeserializeSelectedNodesFromCommandsResultFailure)
                     message = ((key[1] + " is already loaded in this flow. Use the existing Image Bash workspace; "
                         "another editor was not created.") if key[1] == _BASH_NODE_TYPE else
+                        ("Analysis allows one Prompt-before and one Prompt-after node. "
+                        "Add the other role from the node palette.") if node_type == _ANALYSIS_NODE_TYPE else
                         (key[1] + " is already loaded in this flow. Use its Shot controls to manage all Shots; "
                         "another editor was not created."))
                     # This is an expected admission decision, not a broken
@@ -2193,16 +2198,18 @@ class _Registration:
             return None
         flows = {getattr(request, key, None) for key in ("flow_name", "override_parent_flow_name", "parent_flow_name")}
         flows.discard(None)
+        from _hmb_deletion_guard import _node_inventory
+        node_parents = _node_inventory(engine)
         for key in ("node_name", "source_node_name", "target_node_name"):
             node_name = getattr(request, key, None)
-            parent = engine.node_manager._name_to_parent_flow_name.get(node_name)
+            parent = node_parents.get(node_name)
             if parent is not None:
                 flows.add(parent)
         for key in ("node_names", "nodes_to_delete", "nodes_to_duplicate"):
             for item in getattr(request, key, ()) or ():
                 node_name = item[0] if isinstance(item, (list, tuple)) and item else item
                 if isinstance(node_name, str):
-                    parent = engine.node_manager._name_to_parent_flow_name.get(node_name)
+                    parent = node_parents.get(node_name)
                     if parent is not None:
                         flows.add(parent)
         if not flows and engine.context_manager.has_current_flow():
@@ -2319,6 +2326,9 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
                     if registration.connection_handlers is None:
                         from _hmb_connection_management import install_request_handlers
                         registration.connection_handlers = install_request_handlers(engine, registration)
+                    if registration.shot_basket_handlers is None:
+                        from _hmb_shot_basket import install_request_handlers as install_shot_basket_handlers
+                        registration.shot_basket_handlers = install_shot_basket_handlers(engine, registration)
                     _acquire_windows_transport_close_guard(registration)
                     try:
                         from _hmb_workflow_serialization_compat import acquire as acquire_save_identity_guard

@@ -115,10 +115,17 @@ class Graph:
 
     def context(self):
         stack = ExitStack()
+        from griptape_nodes.retained_mode.retained_mode import RetainedMode
         manager = SimpleNamespace(get_node_by_name=lambda name: self.nodes.get(name),
             get_node_parent_flow_by_name=lambda name: self.flows.get(name))
         stack.enter_context(mock.patch.object(t.GriptapeNodes, 'NodeManager', return_value=manager))
         stack.enter_context(mock.patch.object(t.GriptapeNodes, 'handle_request', side_effect=self.read))
+        # Current host inspects optional Shot sound via RetainedMode directly.
+        # Return this fixture's real edges, not an unconfigured SDK Mock.
+        stack.enter_context(mock.patch.object(RetainedMode, 'get_connections_for_parameter',
+            side_effect=lambda parameter, node: ListConnectionsForNodeResultSuccess(
+                result_details='fixture', incoming_connections=[edge for edge in self.edges.get(node, [])
+                    if edge.target_parameter_name == parameter], outgoing_connections=[])))
         stack.enter_context(mock.patch.object(LibraryRegistry, 'get_library',
             return_value=SimpleNamespace(get_node_class=lambda name: self.classes[name])))
         return stack

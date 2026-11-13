@@ -133,7 +133,8 @@ try{
  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
  assert.equal(await page.locator('.source-row.image [data-field="color_picks"]').first().inputValue(),'Green','A newer local Color Pick wins a crossed older restoration ACK.');
  // All semantic updates retain one body and one instance of each section.
- assert.equal(await page.locator('.center').count(),1);assert.equal(await page.locator('[data-group-id]').count(),4);
+ assert.equal(await page.locator('.center').count(),1);
+ assert.deepEqual(await page.locator('[data-group-id]').evaluateAll(groups=>groups.map(group=>group.dataset.groupId)),['imageSources','imageText','videoSources','soundSources','videoText']);
  assert.equal(external,0);assert.deepEqual(failures,[]);
  console.log('HMB Prompt Asset selection lifecycle: PASS (same UUID add/remove/reorder, UID/Main/Sub/Color and five documents repaint; unrelated renumber retains UUID/body; one retained editor; Korean draft/caret and stale-echo guard; external0)');
 }finally{await browser.close();await new Promise(resolve=>server.close(resolve));}

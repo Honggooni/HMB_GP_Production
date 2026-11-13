@@ -208,7 +208,7 @@ try {
     for(const n of [5,4,3,2,1]){
       const previous=window.agentVisible().selected[0];const before=window.agentCommands.length;
       window.agentClick(n);window.agentClick(n);record('pending-'+n);
-      if(window.agentCommands.length!==before)throw Error('Agent command did not yield before dispatch for Shot '+n);
+      if(window.agentCommands.length!==before+1)throw Error('Agent select must dispatch immediately and only once for Shot '+n);
       await dispatched(before+1);
       if(window.agentCommands.length!==before+1)throw Error('Agent pending duplicate command for Shot '+n);
       window.agentEcho(previous);record('pending-stale-'+n);
@@ -217,9 +217,9 @@ try {
     }
     const originalId=window.agentCommands[0].shot.shot_uuid;
     if(!originalId||new Set(window.agentCommands.map(command=>command.action.request_id)).size!==5)throw Error('Agent request identity was reused.');
-    window.agentClick(1);await dispatched(window.agentCommands.length+1);window.agentAck();record('collapsed');
+    let expected=window.agentCommands.length+1;window.agentClick(1);await dispatched(expected);window.agentAck();record('collapsed');
     window.agentEcho(1,1,5,false,true);record('collapse-stale-expanded');
-    window.agentClick(4);await dispatched(window.agentCommands.length+1);window.agentAck();record('reopened-4');
+    expected=window.agentCommands.length+1;window.agentClick(4);await dispatched(expected);window.agentAck();record('reopened-4');
     window.agentRename(4,'Authoritative renamed asset');
     window.agentEcho(1,1,4,true);record('older-catalog');
     const renamed=document.querySelector('#agent [data-agent-sdk-row="4"] b').textContent;
@@ -228,8 +228,8 @@ try {
     await new Promise(resolve=>setTimeout(resolve,0));record('late-rejection');
     const beforeRemoved=window.agentCommands.length;window.agentClick(4);
     if(window.agentCommands.length!==beforeRemoved)throw Error('Deleted Agent Shot published a command.');
-    window.agentEcho(5,1,5,true);window.agentClick(3);record('pending-failure');
-    await dispatched(window.agentCommands.length+1);
+    window.agentEcho(5,1,5,true);expected=window.agentCommands.length+1;window.agentClick(3);record('pending-failure');
+    await dispatched(expected);
     const failed=window.agentCommands.at(-1);
     window.agentRequests.at(-1).reject(new Error('mock Agent row save failed'));
     await new Promise(resolve=>setTimeout(resolve,0));record('failed-request');

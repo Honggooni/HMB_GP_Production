@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import HMBVideoPickerLibrary as picker
+from _hmb_maya_smoke_fixture import isolated_maya_environment
 
 
 MAYA_RUNNER = ROOT / "resources" / "maya" / "HMB_Maya_Background_Preview.py"
@@ -173,7 +174,7 @@ def _run_case(
             command.extend(["-proj", str(maya_project)])
         command.extend(["-command", MAYA_COMMAND])
 
-        env = picker._maya_subprocess_environment(job_path)
+        env = isolated_maya_environment(case_root, picker._maya_subprocess_environment(job_path))
         creationflags = picker._creation_flags()
         with log_path.open("wb") as log_handle:
             completed = subprocess.run(
@@ -189,8 +190,9 @@ def _run_case(
         record["return_code"] = completed.returncode
 
         if not result_path.is_file():
+            detail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
             raise RuntimeError(
-                f"mayabatch exited with code {completed.returncode} without a result JSON."
+                f"mayabatch exited with code {completed.returncode} without a result JSON. {detail}"
             )
         payload = _read_json(result_path)
         record["warnings"] = _normalise_warnings(payload)
@@ -315,7 +317,9 @@ def main() -> int:
     maya_version = picker._maya_display_version(mayabatch) if mayabatch else ""
     matrix_started = time.perf_counter()
 
-    with tempfile.TemporaryDirectory(prefix="HMB_VideoPicker_Fast_Read_") as temp_text:
+    private_parent = ROOT / ".tmp"
+    private_parent.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="hmb-fast-read-", dir=private_parent) as temp_text:
         matrix_root = Path(temp_text)
         results = [
             _run_case(

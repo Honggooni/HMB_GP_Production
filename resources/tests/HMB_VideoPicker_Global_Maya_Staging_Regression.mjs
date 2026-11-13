@@ -45,16 +45,16 @@ assert.ok(navigated.picker_shots.every((row) => !Object.hasOwn(row, "authoring_c
 
 // Reading a different source replaces the single input. Returning to A cannot
 // resurrect A's previous scene or infer old color bindings from A's media.
-navigated = { ...navigated, scene_path: "C:/maya/replacement.mb", scene_request_path: "C:/maya/replacement.mb", scene_draft_path: "C:/maya/replacement.mb", slot_assignments: [{ video_slot: 1, bindings: [] }], selected_color: "", slot_visibility: [{ video_slot: 1, hidden_paths: [] }] };
+navigated = { ...navigated, scene_path: "C:/maya/replacement.ma", scene_request_path: "C:/maya/replacement.ma", scene_draft_path: "C:/maya/replacement.ma", slot_assignments: [{ video_slot: 1, bindings: [] }], selected_color: "", slot_visibility: [{ video_slot: 1, hidden_paths: [] }] };
 const replaced = picker.hmbSwitchLocalPickerShot(navigated, shotA);
-assert.equal(replaced.scene_path, "C:/maya/replacement.mb");
+assert.equal(replaced.scene_path, "C:/maya/replacement.ma");
 assert.deepEqual(replaced.slot_assignments, [{ video_slot: 1, bindings: [] }]);
 assert.deepEqual(replaced.slot_visibility, [{ video_slot: 1, hidden_paths: [] }]);
 assert.equal(replaced.selected_color, "");
 assert.equal(replaced.current_frame, 1024);
 assert.equal(replaced.preview_frame, 5);
 assert.deepEqual(replaced.videos.map((v) => v.video_uid), ["old-a", "old-b"]);
-assert.match(picker.hmbPickerGenerateCaption(replaced), /replacement\.mb → Shot 1/);
+assert.match(picker.hmbPickerGenerateCaption(replaced), /replacement\.ma → Shot 1/);
 const mayaLabels = new Map(["[data-picker-maya-frame-start]", "[data-picker-maya-frame-end]", "[data-picker-maya-fps]"].map((selector) => [selector, {}]));
 picker.hmbPatchPickerMayaSettingsMetadata({ querySelector(selector) { return mayaLabels.get(selector); } }, replaced);
 assert.equal(mayaLabels.get("[data-picker-maya-frame-start]").textContent, "1001");
@@ -67,10 +67,43 @@ const draftContainer = {};
 picker.hmbRememberMayaSceneDraft(draftContainer, ready, "C:/maya/draft.ma");
 assert.equal(picker.hmbResolveMayaSceneDraftPath(draftContainer, ready), "C:/maya/draft.ma");
 assert.equal(picker.hmbResolveMayaSceneDraftPath(draftContainer, { ...ready, active_picker_shot_uuid: shotB }), "C:/maya/draft.ma");
-assert.equal(picker.hmbResolveMayaSceneDraftPath(draftContainer, replaced), "C:/maya/replacement.mb");
+assert.equal(picker.hmbResolveMayaSceneDraftPath(draftContainer, replaced), "C:/maya/replacement.ma");
 assert.equal(draftContainer.__hmbMayaSceneDraftPath, undefined);
 draftContainer.__hmbMayaSceneDraftPath = "C:/maya/old.ma";
-assert.equal(picker.hmbResolveMayaSceneDraftPath(draftContainer, replaced), "C:/maya/replacement.mb");
+assert.equal(picker.hmbResolveMayaSceneDraftPath(draftContainer, replaced), "C:/maya/replacement.ma");
+
+// A legacy binary Maya scene belongs to the current Shot only. Existing
+// generated videos and preview cursors still belong to their own Shot rows.
+const binaryA = "C:/maya/a.mb";
+const binaryB = "C:/maya/b.mb";
+const binary = { ...ready, scene_path: binaryA, scene_request_path: binaryA, scene_draft_path: binaryA };
+const blankB = picker.hmbSwitchLocalPickerShot(binary, shotB);
+assert.equal(blankB.picker_scene_owner_uuid, shotB);
+assert.equal(blankB.picker_scene_states[shotA].scene_path, binaryA);
+assert.equal(blankB.scene_path, "");
+assert.equal(blankB.scene_draft_path, "");
+assert.equal(blankB.native_read_ready, false);
+assert.deepEqual(blankB.outliner_nodes, []);
+assert.equal(blankB.preview_video_uid, "old-b");
+assert.deepEqual(blankB.videos.map((video) => video.video_uid), ["old-a", "old-b"]);
+const authoredB = { ...blankB, scene_path: binaryB, scene_request_path: binaryB, scene_draft_path: binaryB };
+const restoredA = picker.hmbSwitchLocalPickerShot(authoredB, shotA);
+assert.equal(restoredA.scene_path, binaryA);
+assert.equal(restoredA.picker_scene_states[shotB].scene_path, binaryB);
+assert.equal(restoredA.selected_camera, ready.selected_camera);
+assert.equal(restoredA.slot_assignments[0].bindings[0].color, "Green");
+assert.equal(restoredA.preview_video_uid, "old-a");
+assert.equal(picker.pickerButtonAvailability(restoredA).reload, true);
+assert.equal(picker.pickerButtonAvailability(restoredA).readEnabled, true);
+assert.equal(picker.pickerButtonAvailability(restoredA, binaryA, true).readEnabled, false);
+assert.equal(picker.hmbSwitchLocalPickerShot(restoredA, shotB).scene_path, binaryB);
+
+// Two Shots may point at the same binary, but typed drafts from one Shot
+// cannot become a second Shot's input merely because the base paths match.
+const sameFileB = { ...authoredB, scene_path: binaryA, scene_request_path: binaryA, scene_draft_path: binaryA };
+picker.hmbRememberMayaSceneDraft(draftContainer, restoredA, "C:/maya/a-draft.mb");
+assert.equal(picker.hmbResolveMayaSceneDraftPath(draftContainer, restoredA), "C:/maya/a-draft.mb");
+assert.equal(picker.hmbResolveMayaSceneDraftPath(draftContainer, sameFileB), binaryA);
 
 // Navigation does not end an in-flight operation or change its captured
 // destination. Real Maya edits and READ remain locked until it finishes.
@@ -132,4 +165,4 @@ assert.equal(anotherSnapshotShot.current_frame, ready.current_frame);
 assert.deepEqual(anotherSnapshotShot.snapshots.map((item) => [item.snapshot_uid, item.path]), [["snapshot-a", snapshotA.path], ["snapshot-b", snapshotB.path]]);
 const pendingSnapshot = picker.hmbSwitchLocalPickerShot({ ...withSnapshot, operation_kind: "render_snapshot", snapshot_request_frame: 1024 }, shotB);
 assert.equal(pendingSnapshot.snapshot_request_frame, 1024, "The captured render frame is independent of the displayed Snapshot frame.");
-console.log("PASS: shared Maya staging, Shot preview/destination, scene replacement, stale drafts, in-flight navigation, and isolated Snapshot projection.");
+console.log("PASS: legacy Maya staging, shot-owned binary scenes/reload, media ownership, stale drafts, in-flight navigation, and Snapshot projection.");

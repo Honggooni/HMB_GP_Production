@@ -87,9 +87,9 @@ async def exercise(engine, directory, extension=None):
     set_value("IMAGE_BASH_IMAGES_OUT", [str(source_path)], target=source)
     set_value("IMAGE_BASH_CONTEXT_OUT", context, target=source)
     for key, value in (("canvas_size", "custom"), ("width", 4), ("height", 2), ("output_file", str(directory / "output.png"))): set_value(key, value)
-    children = list(node.get_parameter_by_name("input_images").get_child_parameters())
-    child = children[0] if children else node.get_parameter_by_name("input_images").append_child_parameter()
-    set_value(child.name, {"value": str(source_path), "type": "ImageUrlArtifact"})
+    # The current SDK already propagates the connected list. Appending another
+    # standalone child duplicates the same image and correctly fails readiness.
+    set_value("input_images", [{"value": str(source_path), "type": "ImageUrlArtifact"}])
     set_value("image_bash_context", context)
     async def settled():
         await asyncio.sleep(.005)  # Include original sync-fallback host completion tick.
@@ -234,10 +234,6 @@ async def exercise(engine, directory, extension=None):
         second_path = directory / "second.png"; second_path.write_bytes(png("purple"))
         records2 = records + [{"source_uid": "second-source", "url": str(second_path), "name": "Second"}]
         set_value("IMAGE_BASH_IMAGES_OUT", [row["url"] for row in records2], target=source, initial=True)
-        parent = node.get_parameter_by_name("input_images")
-        children = list(parent.get_child_parameters())
-        second = parent.append_child_parameter() if len(children) < 2 else children[1]
-        set_value(second.name, {"value": str(second_path), "type": "ImageUrlArtifact"})
         set_value("input_images", [row["url"] for row in records2])
         context2 = {**context, "revision": 2, "records": records2}
         entered, release = threading.Event(), threading.Event()

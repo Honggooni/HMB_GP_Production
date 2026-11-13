@@ -20,7 +20,7 @@ from _hmb_my_box import MY_BOX_LABEL
 
 t, Graph, Node = fixture.t, fixture.Graph, fixture.Node
 ACTIVE = ("superwings12", "katuri8")
-EXPECTED_CHOICES = [t.ONLY_PROJECT_UNSELECTED, *(PROJECTS[key]["project_name"] for key in ACTIVE), MY_BOX_LABEL]
+EXPECTED_CHOICES = [t.ONLY_PROJECT_UNSELECTED, "superwings12", "Katuri8", MY_BOX_LABEL]
 
 
 class OnlyActiveProjects(unittest.TestCase):
@@ -55,10 +55,13 @@ class OnlyActiveProjects(unittest.TestCase):
         self.assertEqual(len(traits), 1)
         self.assertEqual(list(traits[0].choices), EXPECTED_CHOICES)
         self.assertEqual(node.get_parameter_value(t.ONLY_PROJECT_PARAMETER), t.ONLY_PROJECT_UNSELECTED)
-        self.assertEqual(EXPECTED_CHOICES, ["Select Project", "슈퍼윙즈12", "까투리8", "My Box"])
+        self.assertEqual(EXPECTED_CHOICES, ["Select Project", "superwings12", "Katuri8", "My Box"])
         self.assertEqual(EXPECTED_CHOICES.count(MY_BOX_LABEL), 1)
         self.assertNotIn(MY_BOX_LABEL, PROJECTS)
         self.assertFalse(any(row["project_name"] == MY_BOX_LABEL for row in PROJECTS.values()))
+        node.set_parameter_value(t.ONLY_PROJECT_PARAMETER, "까투리8", initial_setup=True)
+        self.assertEqual(node.get_parameter_value(t.ONLY_PROJECT_PARAMETER), "Katuri8")
+        self.assertEqual(node._selected_only_project()["project_name"], PROJECTS["katuri8"]["project_name"])
 
     def test_saved_active_ids_names_and_supported_aliases_resolve_without_network(self):
         aliases = {"superwings12": ("superwings12", "슈퍼윙즈12", "슈퍼윙스12", "Super Wings 12"),

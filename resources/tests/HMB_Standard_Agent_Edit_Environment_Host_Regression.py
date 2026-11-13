@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
-STANDARD = Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard"
+STANDARD = Path(os.environ.get("HMB_GRIPTAPE_STANDARD_LIBRARY_PATH") or Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard")
 SITE = STANDARD / ".venv/Lib/site-packages"
 assert str(SITE) not in sys.path, "Cold regression must not externally append Standard dependencies"
 os.environ.pop("HMB_GRIPTAPE_STANDARD_LIBRARY_PATH", None)

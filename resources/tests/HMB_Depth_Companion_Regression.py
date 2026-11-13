@@ -3288,7 +3288,7 @@ assert "FileDestination.write_bytes(" in project_copy_source
 assert project_copy_source.index(
     "_created_publish_target_record("
 ) < project_copy_source.index(
-    "_call_picker_sidecar_api(_resolve_sidecar_path, actual_target)"
+    "_call_picker_sidecar_api(_resolve_sidecar_path, actual_target, workflow=workflow)"
 )
 
 for artifact_records in (

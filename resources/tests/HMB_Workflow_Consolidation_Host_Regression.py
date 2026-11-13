@@ -275,7 +275,7 @@ async def canonical_case(engine, directory):
             ]
             for request in blocked_requests:
                 response = engine.handle_request(request)
-                assert not response.succeeded() and "consolidation" in str(response.result_details), type(request).__name__
+                assert not response.succeeded() and "consolidation" in str(response.result_details), (type(request).__name__, str(response.result_details))
             assert migration._stamp(engine, flow) == before_guard
         finally:
             with migration._LOCK:
@@ -484,7 +484,36 @@ async def actual_saved_file_case(engine, directory, *, complete_manual_rebind=Fa
         assert len(unbound) == 2, unbound
         for name, saved in backup["nodes"].items():
             if saved["raw"]["metadata"].get("node_type") == "HMBSeedanceGeneration":
-                assert migration._raw_node_state(flow.nodes[name]) == saved["raw"], name
+                actual = migration._raw_node_state(flow.nodes[name])
+                expected_raw = deepcopy(saved["raw"])
+                before_signal = expected_raw["parameter_values"].get("SHOT_ASSET_IN")
+                after_signal = actual["parameter_values"].get("SHOT_ASSET_IN")
+                if before_signal != after_signal:
+                    # A native post-hydration media scan can finish after the
+                    # migration backup. This input is a publisher notification,
+                    # not authored Generator state. Require the live publisher
+                    # signal, and permit only its resolved-media digest to advance.
+                    before_token, after_token = json.loads(before_signal), json.loads(after_signal)
+                    publisher = next(node for node in flow.nodes.values()
+                        if node.metadata.get("node_type") == "HMBImageAssetLibrary")
+                    live_token = json.loads(publisher.parameter_output_values["SHOT_ASSET_OUT"])
+                    assert after_token == live_token
+                    assert {k: v for k, v in before_token.items() if k != "media_sha256"} == {
+                        k: v for k, v in after_token.items() if k != "media_sha256"}
+                    expected_raw["parameter_values"]["SHOT_ASSET_IN"] = after_signal
+                def differences(left, right, path=""):
+                    if isinstance(left, str) and isinstance(right, str):
+                        try:
+                            decoded_left, decoded_right = json.loads(left), json.loads(right)
+                            if isinstance(decoded_left, dict) and isinstance(decoded_right, dict):
+                                return differences(decoded_left, decoded_right, path + "/json")
+                        except (ValueError, TypeError):
+                            pass
+                    if isinstance(left, dict) and isinstance(right, dict):
+                        return [item for key in left.keys() | right.keys()
+                            for item in differences(left.get(key), right.get(key), path + "/" + str(key))]
+                    return [] if left == right else [(path, repr(left)[:180], repr(right)[:180])]
+                assert actual == expected_raw, (name, differences(expected_raw, actual)[:15])
         assert source.read_bytes() == original_bytes
         print("PASS original saved file Prompt5/Agent5/Gen5+Picker+Image -> one Prompt/Agent; legacy unbound4/5 archived without guessed Shot; exact Generator Resume/Draft/results retained")
         # Re-open a real SDK serialization of that now-single graph. The load
@@ -493,7 +522,15 @@ async def actual_saved_file_case(engine, directory, *, complete_manual_rebind=Fa
         import _hmb_shot_routing as routing
         from griptape_nodes.retained_mode.events.flow_events import (
             SerializeFlowToCommandsRequest, DeleteFlowRequest, DeserializeFlowFromCommandsRequest)
-        serialized = send(engine, SerializeFlowToCommandsRequest(flow_name=flow.name)).serialized_flow_commands
+        for _ in range(100):
+            serialization = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow.name))
+            if serialization.succeeded():
+                break
+            await asyncio.sleep(.02)
+        assert serialization.succeeded(), (str(serialization.result_details),
+            [(len(r.load_requests), len(r.snapshot_requests)) for r in advanced._registrations],
+            migration.flow_migration_inflight(engine))
+        serialized = serialization.serialized_flow_commands
         old_name = flow.name
         disconnect_fixture_nodes(engine, flow, tuple(flow.nodes))
         send(engine, DeleteFlowRequest(flow_name=old_name))

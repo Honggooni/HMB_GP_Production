@@ -7,6 +7,7 @@ the historical Super Wings 12 assignment.
 from __future__ import annotations
 
 import json
+import re
 import unicodedata
 from typing import Any
 
@@ -24,6 +25,38 @@ _ALIASES = {
     "슈퍼윙즈12": "superwings12", "슈퍼윙즈 12": "superwings12",
     "슈퍼윙스12": "superwings12", "슈퍼윙스 12": "superwings12",
 }
+
+# Case and season numbers match the project codes used by CGT. These are
+# display names, independent of signed policy and broker project identities.
+_CGT_PROJECT_NAMES = (
+    "Dinoster4", "Katuri7", "Katuri8", "KaturiSP",
+    "superwings10", "superwings11", "superwings12",
+)
+_PROJECT_DISPLAY_NAMES = {name.casefold(): name for name in _CGT_PROJECT_NAMES}
+_PROJECT_DISPLAY_NAMES.update({key: project["project_folder"] for key, project in PROJECTS.items()})
+_HANGUL = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3]")
+_PROJECT_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def project_display_name(identifier: Any, name: Any = "") -> str:
+    """Display a CGT project code while keeping original IDs and labels intact."""
+    identifier = unicodedata.normalize("NFC", identifier).strip() if isinstance(identifier, str) else ""
+    name = unicodedata.normalize("NFC", name).strip() if isinstance(name, str) else ""
+    # Prefer a recognized code from either authoritative record field before
+    # interpreting a legacy localized name that may omit a season number.
+    for value in (identifier, name):
+        canonical = _PROJECT_DISPLAY_NAMES.get(value.casefold())
+        if canonical:
+            return canonical
+    legacy = _ALIASES.get(identifier.casefold())
+    name_key = name.casefold()
+    if not legacy and (not identifier or name_key not in {"dinoster", "다이노스터"}):
+        legacy = _ALIASES.get(name_key)
+    if legacy:
+        return _PROJECT_DISPLAY_NAMES[legacy]
+    if _HANGUL.search(name) and _PROJECT_CODE.fullmatch(identifier):
+        return identifier
+    return name or identifier
 
 
 class ProjectPolicyPendingError(RuntimeError):

@@ -189,8 +189,16 @@ catalog_model_ids = {
     for provider in model_catalog["providers"].values()
     for model_id in provider["models"]
 }
-assert len(catalog_model_ids) == len(model_usage["model_ids"])
-assert catalog_model_ids == set(model_usage["model_ids"])
+# The library also registers Analysis-only Argon. The native Agent still
+# exactly matches Standard; do not mistake this separate node declaration for
+# an extra native Agent choice or silently allow arbitrary catalog entries.
+analysis_manifest = next(item for item in manifest["nodes"] if item["class_name"] == "HMBAnalysisAgent")
+analysis_model_usage = next(item for item in analysis_manifest["metadata"]["declarations"]
+                            if item.get("type") == "model_usage")
+assert analysis_model_usage["model_ids"] == ["gtc_gemini_4_argon"]
+assert "gtc_gemini_4_argon" not in model_usage["model_ids"]
+assert len(catalog_model_ids) == len(model_usage["model_ids"]) + 1
+assert catalog_model_ids == set(model_usage["model_ids"]) | {"gtc_gemini_4_argon"}
 
 # Direct server-policy disclosure is the only text-content guard retained.
 # It is exact and in-memory only: no semantic, translated, encoded, or fuzzy

@@ -37,12 +37,17 @@ def main():
                 ensured = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="LUT archive", flow_name="LUTArchive"))
                 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
                 workflow = WorkflowRegistry.get_workflow_by_name(GriptapeNodes.ContextManager().get_current_workflow_name())
-                workflow.file_path = "shots/example.py"
-                assert lut._workflow_data_directory() == root / "shots" / "data"
-                workflow.file_path = str(root / "moved" / "example.py")
-                assert lut._workflow_data_directory() == root / "moved" / "data"
-                workflow.file_path = None
                 assert lut._workflow_data_directory() == root / "data"
+                first_path = root / "shots" / "example.py"
+                first_path.parent.mkdir()
+                first_path.touch()
+                engine.workflow_registry.set_file_path(workflow, first_path)
+                assert lut._workflow_data_directory() == root / "shots" / "data"
+                moved_path = root / "moved" / "example.py"
+                moved_path.parent.mkdir()
+                moved_path.touch()
+                engine.workflow_registry.set_file_path(workflow, moved_path)
+                assert lut._workflow_data_directory() == root / "moved" / "data"
                 with mock.patch.object(routing, "schedule_post_registration_reconcile"), mock.patch.object(routing, "reconcile_shot_routing"):
                     node = lut.HMBColorLUTLibrary(name="Color LUT Host")
                     assert isinstance(node, DataNode), type(node).__mro__
@@ -112,7 +117,7 @@ def main():
                     assert Path(node._hmb_color_lut_state["result"]["path"]).name == "final.mov"
                     assert not (root / "final.mp4").exists()
                     assert node._hmb_color_lut_state["result"]["shot"]["shot_uuid"] == shot["shot_uuid"]
-                    assert Path(node._hmb_color_lut_state["result"]["lut_path"]).parent == root / "data"
+                    assert Path(node._hmb_color_lut_state["result"]["lut_path"]).parent == moved_path.parent / "data"
                     assert Path(node._hmb_color_lut_state["result"]["metadata_path"]).is_file()
                     archive = json.loads(Path(node._hmb_color_lut_state["result"]["metadata_path"]).read_text(encoding="utf-8"))
                     assert archive["settings"] == fine_settings

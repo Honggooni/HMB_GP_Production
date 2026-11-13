@@ -25,10 +25,13 @@ import HMB_Seedance_Execution_Mode_Host_Regression as harness
 
 def snapshot(engine):
     context=engine.context_manager
+    workflow = engine.current_workflow_or_none() if hasattr(engine, "current_workflow_or_none") else None
+    stack = workflow.context if workflow is not None else (context._workflow_stack[-1] if context.has_current_workflow() else None)
+    parents = workflow.nodes.name_to_parent_flow_name if workflow is not None else getattr(engine.node_manager, "_name_to_parent_flow_name", {})
     return {"workflow":context.get_current_workflow_name() if context.has_current_workflow() else None,
         "flow":context.get_current_flow().name if context.has_current_flow() else None,
-        "flows":len(context._workflow_stack[-1]._flow_stack) if context.has_current_workflow() else 0,
-        "nodes":tuple(sorted(engine.node_manager._name_to_parent_flow_name))}
+        "flows":len(stack._flow_stack) if stack is not None else 0,
+        "nodes":tuple(sorted(parents))}
 
 
 async def settle():
@@ -58,6 +61,13 @@ async def exercise(engine,_phase,out):
     class Owner:pass
     owner=Owner();registration.owners[owner]=weakref.ref(library)
     manager=engine.event_manager
+    gate, deletion = bootstrap._install_deletion_lifetime_gate(engine, manager)
+    deletion.install_reentrant_barrier(engine)
+    deletion.install_handler_barrier(engine)
+    registration.deletion_protection = gate
+    registration.deletion_handlers = deletion.install_request_handlers(engine, registration)
+    gate.callback = deletion.guard_request
+    gate.ready = True
     manager.add_pre_dispatch_hook(registration.hook)
     for kind in bootstrap._LOAD_TYPES:
         manager.add_post_dispatch_hook(kind,registration.load_post_hook);registration.load_post_types.append(kind)
@@ -82,7 +92,10 @@ async def exercise(engine,_phase,out):
                 file_name=original.stem,file_path=str(original),display_name="Private snapshot guard fixture"))
             await settle()
             assert not registration.snapshot_requests
-            await harness.asend(engine,ClearAllObjectStateRequest(i_know_what_im_doing=True))
+            if hasattr(engine, "close_workflow"):
+                engine.close_workflow(engine.current_workflow())
+            else:
+                await harness.asend(engine,ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
             # Reproduce the saved-file Node scope where an external snapshot
             # previously could enter and steal the loader's shared Flow scope.
@@ -157,7 +170,10 @@ async def exercise(engine,_phase,out):
             await harness.asend(engine,SaveWorkflowFileFromSerializedFlowRequest(serialized_flow_commands=final_commands,
                 file_name=new_saved.stem,file_path=str(new_saved),display_name="Save after refusal"))
             await settle()
-            await harness.asend(engine,ClearAllObjectStateRequest(i_know_what_im_doing=True))
+            if hasattr(engine, "close_workflow"):
+                engine.close_workflow(engine.current_workflow())
+            else:
+                await harness.asend(engine,ClearAllObjectStateRequest(i_know_what_im_doing=True))
             reopened=await engine.ahandle_request(RunWorkflowWithCurrentStateRequest(file_path=str(new_saved),broadcast_result=False))
             assert reopened.succeeded(),str(reopened.result_details)
             await settle()

@@ -19,8 +19,8 @@ from unittest import mock
 import weakref
 
 ROOT = Path(__file__).resolve().parents[2]
-STANDARD = Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard"
-EDITOR = Path(os.environ["LOCALAPPDATA"]) / "ai.griptape.nodes.desktop/current/resources/editor-bundle"
+STANDARD = Path(os.environ.get("HMB_GRIPTAPE_STANDARD_LIBRARY_PATH", str(Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard")))
+EDITOR = Path(os.environ.get("HMB_IMAGE_BASH_EDITOR_BUNDLE_PATH", str(Path(os.environ["LOCALAPPDATA"]) / "ai.griptape.nodes.desktop/current/resources/editor-bundle")))
 sys.path.insert(0, str(ROOT))
 sys.dont_write_bytecode = True
 private = tempfile.TemporaryDirectory(prefix="hmb-bash-load-transport-")

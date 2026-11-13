@@ -111,12 +111,14 @@ class CaptureHost:
     _register_active_process = picker.HMBVideoPickerLibrary._register_active_process
     _clear_active_process = picker.HMBVideoPickerLibrary._clear_active_process
     _set_failed_state = picker.HMBVideoPickerLibrary._set_failed_state
+    _picker_state_for_operation = picker.HMBVideoPickerLibrary._picker_state_for_operation
     _mark_operation_finished = picker.HMBVideoPickerLibrary._mark_operation_finished
     _operation_elapsed_seconds = staticmethod(picker.HMBVideoPickerLibrary._operation_elapsed_seconds)
 
     def __init__(self, kind, log):
         self._hmb_cancel_requested = threading.Event()
         self._hmb_active_process = None
+        self._hmb_active_operation = None
         self.state = {"operation_kind": kind, "native_read_ready": True,
                       "native_metadata": {"quality": "authored high detail"},
                       "snapshots": [{"snapshot_uid": "existing-result"}],

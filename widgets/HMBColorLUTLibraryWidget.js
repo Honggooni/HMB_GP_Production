@@ -43,8 +43,24 @@ export function hmbColorLUTShotCatalog(value) {
 const onlyShot = () => ({ channel_uuid: "", shot_uuid: "", number: 1, name: "Only" });
 const uploadProject = (value) => {
   const p = record(value), id = clean(p.id, 128), name = clean(p.name, 256);
-  return /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(id) && name ? { id, name } : null;
+  const displayName = clean(p.display_name, 256);
+  return /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(id) && name
+    ? { id, name, ...(displayName ? { display_name: displayName } : {}) } : null;
 };
+function projectOptions(state) {
+  if (state.shot.shot_uuid) {
+    return `<option value="${escape(state.project_id)}">${escape(state.project_display_name || state.project.name || "—")}</option>`;
+  }
+  const manual = state.manual_project;
+  const option = (id, label, disabled = false) =>
+    `<option value="${escape(id)}"${disabled ? " disabled" : ""}>${escape(label)}</option>`;
+  const options = [option("", "—")];
+  if (manual.id && !state.upload_projects.some(project => project.id === manual.id)) {
+    options.push(option(manual.id, state.manual_project_display_name || manual.name, true));
+  }
+  for (const project of state.upload_projects) options.push(option(project.id, project.display_name || project.name));
+  return options.join("");
+}
 export function hmbColorLUTShotOptions(value) {
   const state = record(value), catalog = hmbColorLUTShotCatalog(state.shot_catalog);
   const selected = catalog.channel_uuid === state.shot?.channel_uuid && catalog.shots?.find((s) => s.shot_uuid === state.shot?.shot_uuid);
@@ -75,10 +91,14 @@ export function hmbColorLUTState(input = {}) {
   const manualReady = manualProject.id && projects.some(p => p.id === manualProject.id && p.name === manualProject.name) && source.path;
   return { schema_version: 1, revision: Math.max(0, Math.trunc(finite(s.revision))), language: s.language === "en" ? "en" : "ko",
     shot, shot_catalog: catalog, project_id: clean(s.project_id), project: record(s.project), preset_name: clean(s.preset_name, 80), preset_id: clean(s.preset_id, 128), profiles,
+    project_display_name: clean(s.project_display_name, 256),
+    manual_project_display_name: clean(s.manual_project_display_name, 256),
     manual_project: manualProject, upload_projects: projects,
     settings: hmbColorLUTSettings(s.settings), source: sourceMatches ? { path: clean(source.path), url: clean(source.url), name: clean(source.name, 256),
       revision: clean(source.revision, 128), shot_uuid: clean(source.shot_uuid, 128), channel_uuid: clean(source.channel_uuid, 128),
       width: Math.max(0, finite(source.width)), height: Math.max(0, finite(source.height)), fps: Math.max(0, finite(source.fps)), duration: Math.max(0, finite(source.duration)) } : {},
+    audio_mix: { enabled: record(s.audio_mix).enabled === true, original_audio: record(s.audio_mix).original_audio === "mute" ? "mute" : "preserve", source: record(s.audio_mix).source === "rendered" ? "rendered" : "current" },
+    sound: { connected: record(s.sound).connected === true, revision: clean(record(s.sound).revision, 128) },
     output: { codec: ["hevc10", "prores", "ffv1"].includes(output.codec) ? output.codec : "hevc10", manual_output_enabled: output.manual_output_enabled === true, path: clean(output.path) },
     status: { phase: clean(status.phase, 40) || "idle", message: clean(status.message), progress: clamp(finite(status.progress)) },
     web_upload: { enabled: upload.enabled === true && Boolean(shot.shot_uuid || manualReady), phase: clean(upload.phase, 32), reason: clean(upload.reason, 512) },
@@ -223,12 +243,16 @@ const TEXT = {
     exposure: "Exposure", temperature: "Temperature", contrast: "Contrast", saturation: "Saturation", shadows: "Shadows", highlights: "Highlights", low: ["Darker", "Cooler", "Softer", "Lower", "Deeper", "Suppress"], high: ["Brighter", "Warmer", "Sharper", "Higher", "Brighter", "Emphasize"],
     enabled: "Shot grade enabled", disabled: "Original · Grading disabled", live: "Live preview while adjusting", output: "Export final video", outputUpload: "Final export & web upload", outputSource: "Connect or import a video before exporting.", outputUploadProject: "Select an upload project or My Box.", outputLocalFormat: "FFV1 exports lossless video locally without web upload.", outputNote: "Original resolution · FPS / Encode once from source", manual: "Set output path", path: "Output path", autoPath: "Automatic · Source folder / New version file", customPath: "Full output file path", codec: "Output format", hevc: "HEVC 10-bit · High quality", prores: "ProRes 422 HQ · Master", ffv1: "FFV1 · Lossless", cancel: "Cancel export", result: "Open output video", pending: "Processing request", bound: "Shot linked", unbound: "No shot binding" },
 };
+Object.assign(TEXT.ko, { audioSource: "사운드 소스", currentSound: "현재 샷 사운드", renderedSound: "생성 당시 사운드", audioMix: "Audio Mix", soundConnected: "Sound Library 연결됨", soundMissing: "Sound Library를 연결하세요", originalAudio: "원본 오디오", preserveAudio: "유지하며 믹스", muteAudio: "음소거 / 선택 음원만", soundNote: "선택 음원은 새 영상 저장 · 최종출력 & 웹 업로드에 적용됩니다. 색상 보정 OFF 시 가능한 원본 영상은 재인코딩 없이 저장합니다.", saveLocal: "새 영상 저장", uploadSource: "원본 웹 업로드" });
+Object.assign(TEXT.en, { audioSource: "Sound source", currentSound: "Current Shot sound", renderedSound: "Sound captured at generation", audioMix: "Audio Mix", soundConnected: "Sound Library connected", soundMissing: "Connect a Sound Library", originalAudio: "Original audio", preserveAudio: "Preserve in mix", muteAudio: "Mute / Selected sounds only", soundNote: "Selected sounds apply to Save new video and Final export & web upload. With grading off, compatible video is copied without re-encoding.", saveLocal: "Save new video", uploadSource: "Upload original" });
 const textFor = (s) => TEXT[s.language] || TEXT.ko;
 const exportAction = (state) => {
   const text = textFor(state);
   const local = state.output.codec === "ffv1";
   const label = local ? text.output : text.outputUpload;
   let reason = !state.source.path && !state.source.url ? text.outputSource : "";
+  if (!reason && state.audio_mix.enabled && !state.sound.connected) reason = text.soundMissing;
+  if (!reason && !local && state.web_upload.phase === "offline") reason = state.web_upload.reason || text.transportError;
   if (!reason && !local && !state.shot.shot_uuid && !state.upload_projects.some(project => project.id === state.manual_project.id
     && project.name === state.manual_project.name)) reason = text.outputUploadProject;
   return { action: local ? "export" : "export_upload", label, reason,
@@ -244,6 +268,12 @@ const shotMarkup = (s) => hmbColorLUTShotOptions(s).map((option) => `<option val
 export function hmbRenderColorLUTWidget(input = {}) {
   const s = hmbColorLUTState(input), t = textFor(s), accent = hmbColorLUTShotAccent(s);
   const label = (key) => `<span data-text="${key}">${escape(t[key])}</span>`;
+  const audioDetails = `<div class="cl-audio-mix" data-audio-details${s.audio_mix.enabled ? "" : " hidden"}>
+    <label>${label("audioSource")}<select data-audio-source aria-label="${t.audioSource}"><option value="current" data-text="currentSound"${s.audio_mix.source === "current" ? " selected" : ""}>${t.currentSound}</option><option value="rendered" data-text="renderedSound"${s.audio_mix.source === "rendered" ? " selected" : ""}${s.shot.shot_uuid ? "" : " disabled"}>${t.renderedSound}</option></select></label>
+    <label>${label("originalAudio")}<select data-original-audio aria-label="${t.originalAudio}"><option value="preserve" data-text="preserveAudio"${s.audio_mix.original_audio === "preserve" ? " selected" : ""}>${t.preserveAudio}</option><option value="mute" data-text="muteAudio"${s.audio_mix.original_audio === "mute" ? " selected" : ""}>${t.muteAudio}</option></select></label>
+    <small data-sound-status>${s.sound.connected ? t.soundConnected : t.soundMissing}</small>
+    <small data-text="soundNote">${t.soundNote}</small>
+  </div>`;
   return `<style>
 .hmb-color-lut{--cl-accent:${accent};--cl-rgb:${accent.slice(1).match(/../g).map((x) => parseInt(x, 16)).join(",")};--cl-bg:#090c16;--cl-panel:#0f1726;--cl-line:#283347;--cl-muted:#a7b3c6;color:#e8eef7;font-family:"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif;font-size:12px;line-height:1.45;background:var(--cl-bg);border:1px solid rgba(var(--cl-rgb),.5);border-radius:11px;overflow:auto;width:100%;height:100%;min-height:640px;container-type:inline-size;color-scheme:dark;box-shadow:0 8px 24px #0004}
 .hmb-color-lut *{box-sizing:border-box}.hmb-color-lut [hidden]{display:none!important}.hmb-color-lut :is(button,input,select):not([data-hmb-native-identity] *,[data-hmb-native-actions] *){font:inherit}.hmb-color-lut :is(button,select,input[type=text]):not([data-hmb-native-identity] *,[data-hmb-native-actions] *){min-height:32px;border:1px solid #344057;border-radius:6px;background:#0b111d;color:#edf2fa;padding:5px 9px}.hmb-color-lut button:not([data-hmb-native-identity] *,[data-hmb-native-actions] *){cursor:pointer}.hmb-color-lut :disabled:not([data-hmb-native-identity] *,[data-hmb-native-actions] *){opacity:.5;cursor:default}.hmb-color-lut :focus-visible:not([data-hmb-native-identity] *,[data-hmb-native-actions] *){outline:2px solid var(--cl-accent);outline-offset:2px}.hmb-color-lut button:not([data-hmb-native-identity] *,[data-hmb-native-actions] *)[aria-pressed=true]{border-color:var(--cl-accent);background:rgba(var(--cl-rgb),.19)}.hmb-color-lut label{min-width:0}
@@ -278,13 +308,15 @@ export function hmbRenderColorLUTWidget(input = {}) {
 .hmb-color-lut[data-hmb-native-header=active] .cl-native-identity{display:flex;align-items:center;flex:1;min-width:0}
 .hmb-color-lut[data-hmb-native-header=active] .cl-native-actions{display:flex;align-items:center;flex:0 0 auto}
 .hmb-color-lut .cl-native-identity>div{min-width:0;max-width:100%}.hmb-color-lut .cl-native-actions svg{flex-shrink:0}
+.hmb-color-lut .cl-audio-toggle,.hmb-color-lut .cl-audio-mix label{display:flex;align-items:center;gap:6px;font-size:11px}.hmb-color-lut .cl-audio-toggle{white-space:nowrap}
+.hmb-color-lut .cl-audio-mix{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;margin-top:8px;max-height:112px;overflow:auto}.hmb-color-lut .cl-audio-mix select{min-width:0;max-width:100%;font-size:11px}.hmb-color-lut .cl-audio-mix small{color:var(--cl-muted);font-size:10px;line-height:1.4}.hmb-color-lut .cl-audio-mix [data-text="soundNote"]{flex-basis:100%}
 .hmb-color-lut[data-hmb-native-header=active] .cl-head{cursor:grab}.hmb-color-lut[data-hmb-native-header=active] .cl-head:active{cursor:grabbing}
 </style><div class="hmb-color-lut nodrag nowheel" data-language="${s.language}" data-shot-number="${hmbColorLUTShotOptions(s).find((x) => x.selected)?.number || 0}" tabindex="0">
 <header class="cl-head group"><div class="cl-mark" aria-hidden="true">CL</div><div class="cl-brand"><strong>HMB Color LUT</strong><small data-text="subtitle">${t.subtitle}</small></div><div class="cl-native-identity" data-hmb-native-identity></div><div class="cl-native-actions nodrag" data-hmb-native-actions></div><label class="cl-shot-shell nodrag"><span>SHOT</span><select data-shot-selector aria-label="${t.shot}">${shotMarkup(s)}</select></label><button class="cl-lang nodrag" data-language-toggle type="button" aria-label="${t.language}">${s.language === "ko" ? "한국어" : "EN"}</button></header>
 <div class="cl-input nodrag"><span class="cl-dot"></span><span class="cl-source" data-source></span><small data-source-revision></small><button data-action="browse_video" type="button">${label("browse")}</button></div>
 <main class="cl-work nodrag"><section class="cl-preview"><div class="cl-panel-head">${label("preview")}<div class="cl-mode">${["original", "compare", "graded"].map((view) => `<button type="button" data-view="${view}" aria-pressed="${view === "compare"}">${label(view)}</button>`).join("")}</div></div><div class="cl-screen"><canvas data-preview width="960" height="540" role="img" aria-label="${t.preview}"></canvas><span class="cl-label cl-before" data-text="original">${t.original}</span><span class="cl-label cl-after" data-text="graded">${t.graded}</span><div class="cl-seam"><button type="button" data-wipe-handle role="slider" aria-label="${t.wipe}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50">↔</button></div><div class="cl-empty" data-empty>${t.empty}</div></div><div class="cl-transport"><input data-seek type="range" min="0" max="0" value="0" step="1" aria-label="${t.seek}" disabled><div class="cl-player-row"><button data-play type="button" disabled>${t.play}</button><button data-step type="button" disabled>${label("step")}</button><small data-frame></small></div></div><div class="cl-note"><span data-preview-note></span>${label("live")}</div></section>
-<section class="cl-grade"><div class="cl-panel-head">${label("grade")}<label class="cl-enable"><input data-enable type="checkbox"${s.settings.enabled ? " checked" : ""}>${label("enable")}</label></div><div class="cl-grade-body"><div class="cl-project"><label>${label("project")}<select data-project disabled><option value="${escape(s.project_id)}">${escape(s.project.name || "—")}</option></select></label><label>${label("profileName")}<input type="text" data-profile-name maxlength="80" list="cl-presets" value="${escape(s.preset_name)}"><datalist data-presets id="cl-presets"></datalist></label><div class="cl-profile-actions"><button type="button" data-apply-profile>${label("apply")}</button><button type="button" data-action="delete_profile" title="${escape(t.deleteProfileHint)}" disabled>${label("deleteProfile")}</button></div></div><div class="cl-control-grid">${HMB_COLOR_LUT_CONTROLS.map((key, i) => `<div class="cl-control"><label><span>${label(key)}<output class="cl-value" data-value="${key}">${escape(stageLabel(s, key))}</output></span><input data-adjust="${key}" type="range" min="-${HMB_COLOR_LUT_MAX_STEP}" max="${HMB_COLOR_LUT_MAX_STEP}" step="1" value="${sliderStep(s.settings[key])}" aria-label="${t[key]}" aria-valuetext="${escape(stageLabel(s, key))}"><span class="cl-endpoints"><span data-low="${i}">${t.low[i]}</span><span data-high="${i}">${t.high[i]}</span></span></label></div>`).join("")}</div><div class="cl-grade-actions"><button data-reset type="button">${label("reset")}</button><button data-action="save_profile" type="button">${label("save")}</button></div><div class="cl-web-upload"><button data-action="upload_web" type="button" disabled>${label("upload")}</button><small data-upload-reason aria-live="polite"></small></div></div></section></main>
-<section class="cl-output nodrag"><div class="cl-output-top">${label("output")}<small data-text="outputNote">${t.outputNote}</small></div><div class="cl-output-controls"><label><input data-manual-output type="checkbox"${s.output.manual_output_enabled ? " checked" : ""}>${label("manual")}</label><input data-output-path type="text" value="${escape(s.output.path)}" aria-label="${t.path}" placeholder="${s.output.manual_output_enabled ? t.customPath : t.autoPath}"${s.output.manual_output_enabled ? "" : " disabled"}><select data-codec aria-label="${t.codec}">${[["hevc10", "hevc"], ["prores", "prores"], ["ffv1", "ffv1"]].map(([v, k]) => `<option value="${v}" data-text="${k}"${s.output.codec === v ? " selected" : ""}>${t[k]}</option>`).join("")}</select><button class="cl-export" data-action="export" type="button" ${exportAction(s).reason ? "disabled" : ""} title="${escape(exportAction(s).title)}" aria-label="${escape(exportAction(s).label)}">${escape(exportAction(s).label)}</button><button data-action="cancel" type="button" hidden>${label("cancel")}</button></div></section><div class="cl-status nodrag" role="status" aria-live="polite"><span data-status>${t.ready}</span><progress data-progress max="1" value="0" hidden></progress><a data-result target="_blank" rel="noopener noreferrer" hidden>${t.result}</a></div></div>`;
+<section class="cl-grade"><div class="cl-panel-head">${label("grade")}<label class="cl-enable"><input data-enable type="checkbox"${s.settings.enabled ? " checked" : ""}>${label("enable")}</label></div><div class="cl-grade-body"><div class="cl-project"><label>${label("project")}<select data-project disabled>${projectOptions(s)}</select></label><label>${label("profileName")}<input type="text" data-profile-name maxlength="80" list="cl-presets" value="${escape(s.preset_name)}"><datalist data-presets id="cl-presets"></datalist></label><div class="cl-profile-actions"><button type="button" data-apply-profile>${label("apply")}</button><button type="button" data-action="delete_profile" title="${escape(t.deleteProfileHint)}" disabled>${label("deleteProfile")}</button></div></div><div class="cl-control-grid">${HMB_COLOR_LUT_CONTROLS.map((key, i) => `<div class="cl-control"><label><span>${label(key)}<output class="cl-value" data-value="${key}">${escape(stageLabel(s, key))}</output></span><input data-adjust="${key}" type="range" min="-${HMB_COLOR_LUT_MAX_STEP}" max="${HMB_COLOR_LUT_MAX_STEP}" step="1" value="${sliderStep(s.settings[key])}" aria-label="${t[key]}" aria-valuetext="${escape(stageLabel(s, key))}"><span class="cl-endpoints"><span data-low="${i}">${t.low[i]}</span><span data-high="${i}">${t.high[i]}</span></span></label></div>`).join("")}</div><div class="cl-grade-actions"><button data-reset type="button">${label("reset")}</button><button data-action="save_profile" type="button">${label("save")}</button></div><div class="cl-web-upload"><button data-action="upload_web" type="button" disabled>${label("upload")}</button><small data-upload-reason aria-live="polite"></small></div></div></section></main>
+<section class="cl-output nodrag"><div class="cl-output-top">${label("output")}<label class="cl-audio-toggle"><input data-audio-enable type="checkbox"${s.audio_mix.enabled ? " checked" : ""}>${label("audioMix")}</label><small data-text="outputNote">${t.outputNote}</small></div><div class="cl-output-controls"><label><input data-manual-output type="checkbox"${s.output.manual_output_enabled ? " checked" : ""}>${label("manual")}</label><input data-output-path type="text" value="${escape(s.output.path)}" aria-label="${t.path}" placeholder="${s.output.manual_output_enabled ? t.customPath : t.autoPath}"${s.output.manual_output_enabled ? "" : " disabled"}><select data-codec aria-label="${t.codec}">${[["hevc10", "hevc"], ["prores", "prores"], ["ffv1", "ffv1"]].map(([v, k]) => `<option value="${v}" data-text="${k}"${s.output.codec === v ? " selected" : ""}>${t[k]}</option>`).join("")}</select><button data-export-local type="button">${label("saveLocal")}</button><button class="cl-export" data-action="export" type="button" ${exportAction(s).reason ? "disabled" : ""} title="${escape(exportAction(s).title)}" aria-label="${escape(exportAction(s).label)}">${escape(exportAction(s).label)}</button><button data-action="cancel" type="button" hidden>${label("cancel")}</button></div>${audioDetails}</section><div class="cl-status nodrag" role="status" aria-live="polite"><span data-status>${t.ready}</span><progress data-progress max="1" value="0" hidden></progress><a data-result target="_blank" rel="noopener noreferrer" hidden>${t.result}</a></div></div>`;
 }
 
 // Manual texel fetch provides trilinear RGB32F on WebGL2 even without the float
@@ -360,7 +392,7 @@ function hmbNativeUiImplementation(container, props = {}) {
   const fallbackBudget = hmbColorLUTFallbackBudget();
   let previewSettleTimer = 0, interactiveUntil = 0;
   let lastHostRevision = state.revision;
-  const cleanups = [], videoCleanups = [], settingsCache = new Map(), cubeCache = new Map();
+  const cleanups = [], videoCleanups = [], settingsCache = new Map(), audioMixCache = new Map(), cubeCache = new Map();
   const doc = container.ownerDocument || globalThis.document, win = doc?.defaultView || globalThis;
   const raf = (fn) => win.requestAnimationFrame(fn), caf = (id) => { if (id) win.cancelAnimationFrame(id); };
   const bind = (target, type, fn, options, list = cleanups) => { target?.addEventListener?.(type, fn, options); list.push(() => target?.removeEventListener?.(type, fn, options)); };
@@ -369,7 +401,7 @@ function hmbNativeUiImplementation(container, props = {}) {
     ? `${s.shot.channel_uuid}\u001f${s.shot.shot_uuid}` : HMB_COLOR_LUT_ONLY_SHOT_VALUE;
   // Transport completions belong to the intent that created them, not merely
   // to a matching Project/Shot (which can leave and return before completion).
-  const responseStateKey = () => JSON.stringify([state.revision, cacheKey(), state.settings, state.source, state.output, state.preset_name, state.preset_id, state.profiles, state.status, state.result, state.web_upload]);
+  const responseStateKey = () => JSON.stringify([state.revision, cacheKey(), state.settings, state.audio_mix, state.sound, state.source, state.output, state.preset_name, state.preset_id, state.profiles, state.status, state.result, state.web_upload]);
   const acceptResponseState = (previousKey) => { if (responseStateKey() !== previousKey) responseRevision++; };
   const q = (selector) => container.querySelector?.(selector), all = (selector) => Array.from(container.querySelectorAll?.(selector) || []);
   const hadContainerNoDrag = container.classList?.contains?.("nodrag");
@@ -486,6 +518,7 @@ function hmbNativeUiImplementation(container, props = {}) {
   };
   const sync = () => {
     if (disposed) return;
+    audioMixCache.set(cacheKey(), copy(state.audio_mix));
     const t = textFor(state), accent = hmbColorLUTShotAccent(state), busy = state.web_upload.phase === "uploading" || ["working", "busy", "exporting", "running", "probing", "encoding", "cancelling"].includes(state.status.phase);
     root.style.setProperty("--cl-accent", accent); root.style.setProperty("--cl-rgb", accent.slice(1).match(/../g).map((x) => parseInt(x, 16)).join(","));
     root.setAttribute("data-language", state.language); root.setAttribute("data-shot-number", String(hmbColorLUTShotOptions(state).find((s) => s.selected)?.number || 0));
@@ -499,12 +532,20 @@ function hmbNativeUiImplementation(container, props = {}) {
     q("[data-source-revision]").textContent = `${state.source.revision ? `r${state.source.revision} · ` : ""}${state.shot.shot_uuid ? t.bound : t.unbound}`;
     q('[data-action="browse_video"]').hidden = Boolean(state.shot.shot_uuid);
     q("[data-enable]").checked = state.settings.enabled;
+    q("[data-audio-enable]").checked = state.audio_mix.enabled; q("[data-audio-enable]").disabled = busy;
+    q("[data-audio-details]").hidden = !state.audio_mix.enabled;
+    q("[data-original-audio]").value = state.audio_mix.original_audio; q("[data-original-audio]").disabled = busy || !state.audio_mix.enabled;
+    q("[data-original-audio]").setAttribute("aria-label", t.originalAudio);
+    q("[data-audio-source]").value = state.audio_mix.source; q("[data-audio-source]").disabled = busy || !state.audio_mix.enabled;
+    q("[data-audio-source]").setAttribute("aria-label", t.audioSource); const renderedAudioOption = q("[data-audio-source] option[value=rendered]"); if (renderedAudioOption) renderedAudioOption.disabled = !state.shot.shot_uuid;
+    q("[data-sound-status]").textContent = state.sound.connected ? t.soundConnected : t.soundMissing;
+    q("[data-export-local]").disabled = busy || !state.source.path || (state.audio_mix.enabled && !state.sound.connected);
+    q("[data-export-local]").hidden = state.output.codec === "ffv1";
     for (const key of HMB_COLOR_LUT_CONTROLS) { const el = q(`[data-adjust="${key}"]`); el.value = String(sliderStep(state.settings[key])); el.setAttribute("aria-valuetext", stageLabel(state, key)); el.setAttribute("aria-label", t[key]); q(`[data-value="${key}"]`).textContent = stageLabel(state, key); }
     const project = q("[data-project]");
     const boundProject = Boolean(state.shot.shot_uuid);
     const manual = state.manual_project;
-    const projectMarkup = boundProject ? `<option value="${escape(state.project_id)}">${escape(state.project.name || "—")}</option>`
-      : `<option value="">—</option>${manual.id && !state.upload_projects.some(p => p.id === manual.id) ? `<option value="${escape(manual.id)}" disabled>${escape(manual.name)}</option>` : ""}${state.upload_projects.map(p => `<option value="${escape(p.id)}">${escape(p.name)}</option>`).join("")}`;
+    const projectMarkup = projectOptions(state);
     if (project.innerHTML !== projectMarkup) project.innerHTML = projectMarkup;
     project.value = boundProject ? state.project_id : manual.id || "";
     project.disabled = boundProject || busy || state.web_upload.phase === "uploading";
@@ -521,7 +562,7 @@ function hmbNativeUiImplementation(container, props = {}) {
     const exportButton = q('[data-action="export"]'); exportButton.disabled = busy || Boolean(exportMode.reason);
     exportButton.textContent = exportMode.label;
     exportButton.title = exportMode.title; exportButton.setAttribute("aria-label", exportMode.label); q('[data-action="cancel"]').hidden = !busy;
-    const upload = q('[data-action="upload_web"]'); upload.disabled = busy || !state.web_upload.enabled; upload.title = state.web_upload.reason; upload.textContent = state.web_upload.phase === "uploading" ? t.uploading : state.web_upload.phase === "complete" ? t.uploaded : state.web_upload.phase === "unknown" ? t.uploadCheck : t.upload; q("[data-upload-reason]").textContent = state.web_upload.reason;
+    const upload = q('[data-action="upload_web"]'); upload.disabled = busy || !state.web_upload.enabled; upload.title = state.web_upload.reason; upload.textContent = state.web_upload.phase === "uploading" ? t.uploading : state.web_upload.phase === "complete" ? t.uploaded : state.web_upload.phase === "unknown" ? t.uploadCheck : state.audio_mix.enabled ? t.uploadSource : t.upload; q("[data-upload-reason]").textContent = state.web_upload.reason;
     q("[data-progress]").hidden = !busy; q("[data-progress]").value = state.status.progress;
     q("[data-status]").textContent = localMessage || state.status.message || t.ready;
     const result = q("[data-result]"); result.textContent = t.result; result.hidden = !state.result.url; if (state.result.url && /^(https?:|blob:|\/)/i.test(state.result.url)) result.href = state.result.url; else { result.removeAttribute("href"); result.hidden = true; }
@@ -548,11 +589,12 @@ function hmbNativeUiImplementation(container, props = {}) {
   const invalidateUpload = () => { state.web_upload.enabled = false; const button = q('[data-action="upload_web"]'); if (button) button.disabled = true; };
   const scheduleCommit = () => { invalidateUpload(); responseRevision++; pendingEdit = true; if (commitTimer) win.clearTimeout(commitTimer); commitTimer = win.setTimeout(publish, 180); };
   const command = (action, extra = {}) => {
-    if (action === "export") {
+    if (action === "export" && !extra.local_only) {
       const mode = exportAction(state);
       if (mode.reason) { say(mode.reason); return; }
       action = mode.action;
     }
+    if (action === "export" && extra.local_only && (!state.source.path || (state.audio_mix.enabled && !state.sound.connected))) { say(state.source.path ? textFor(state).soundMissing : textFor(state).outputSource); return; }
     if (action === "delete_profile" && !hmbColorLUTCanDeleteProfile(state)) return;
     if (action === "upload_web" && !state.web_upload.enabled) return;
     if (action === "upload_web") { state.web_upload.enabled = false; state.web_upload.phase = "uploading"; }
@@ -581,7 +623,7 @@ function hmbNativeUiImplementation(container, props = {}) {
     const blockedKeys = new Set(pendingShot?.blockedKeys || []);
     blockedKeys.add(previousKey);
     pendingShot = { targetKey: shotKey(state), blockedKeys };
-    state.settings = copy(settingsCache.get(cacheKey()) || hmbColorLUTSettings()); state.source = {}; state.result = {}; state.web_upload = { enabled: false, phase: "unavailable", reason: "" }; localMessage = ""; publish(true); sync();
+    state.settings = copy(settingsCache.get(cacheKey()) || hmbColorLUTSettings()); state.audio_mix = copy(audioMixCache.get(cacheKey()) || {enabled:false,original_audio:"preserve",source:"current"}); state.source = {}; state.result = {}; state.web_upload = { enabled: false, phase: "unavailable", reason: "" }; localMessage = ""; publish(true); sync();
   };
   bind(q("[data-shot-selector]"), "change", (event) => { const option = hmbColorLUTShotOptions(state).find((s) => s.key === event.target.value); if (option) switchContext(() => { state.shot = option.only ? onlyShot() : { channel_uuid: option.channel_uuid, shot_uuid: option.shot_uuid, number: option.number, name: option.name }; }); });
   bind(q("[data-project]"), "change", (event) => { if (!state.shot.shot_uuid && event.target.value !== (state.manual_project.id || "")) { invalidateUpload(); command("select_upload_project", { project_id: clean(event.target.value, 128) }); } });
@@ -589,6 +631,10 @@ function hmbNativeUiImplementation(container, props = {}) {
   bind(q("[data-profile-name]"), "change", (event) => { state.preset_name = clean(event.target.value, 80); const matches = state.profiles.filter((profile) => profile.project_id === state.project_id && profile.name === state.preset_name); state.preset_id = matches.length === 1 ? matches[0].id : ""; publish(); sync(); });
   bind(q("[data-language-toggle]"), "click", () => { state.language = state.language === "ko" ? "en" : "ko"; localMessage = ""; publish(); sync(); });
   bind(q("[data-enable]"), "change", (event) => { state.settings.enabled = event.target.checked; publish(); sync(); });
+  bind(q("[data-audio-enable]"), "change", (event) => { state.audio_mix.enabled = event.target.checked; publish(); sync(); });
+  bind(q("[data-original-audio]"), "change", (event) => { state.audio_mix.original_audio = event.target.value === "mute" ? "mute" : "preserve"; publish(); sync(); });
+  bind(q("[data-audio-source]"), "change", (event) => { state.audio_mix.source = event.target.value === "rendered" ? "rendered" : "current"; publish(); sync(); });
+  bind(q("[data-export-local]"), "click", () => command("export", {local_only:true}));
   for (const el of all("[data-adjust]")) {
     bind(el, "input", () => { const key = el.getAttribute("data-adjust"); state.settings[key] = hmbColorLUTStrengthFromStep(el.value); el.value = String(sliderStep(state.settings[key])); state.settings.enabled = true; q("[data-enable]").checked = true; el.setAttribute("aria-valuetext", stageLabel(state, key)); q(`[data-value="${key}"]`).textContent = stageLabel(state, key); q("[data-preview-note]").textContent = textFor(state).enabled; queueDraw(true, false); scheduleCommit(); });
     bind(el, "change", () => { if (pendingEdit) publish(); });
@@ -678,7 +724,7 @@ function hmbNativeUiImplementation(container, props = {}) {
       }
       if (incoming.revision < state.revision || pendingEdit) {
         // Host echoes can arrive after a newer local drag/shot selection. Preserve authored data.
-        if (sameShot && incoming.revision >= state.revision) { state.source = incoming.source; state.status = incoming.status; state.result = incoming.result; state.revision = incoming.revision; }
+        if (sameShot && incoming.revision >= state.revision) { state.source = incoming.source; state.sound = incoming.sound; state.status = incoming.status; state.result = incoming.result; state.revision = incoming.revision; }
         if (incoming.shot_catalog.generation >= (state.shot_catalog.generation || 0)) state.shot_catalog = incoming.shot_catalog;
       } else { settingsCache.set(cacheKey(), copy(state.settings)); state = incoming; settingsCache.set(cacheKey(), copy(state.settings)); }
       acceptResponseState(previousResponseState);
@@ -691,7 +737,7 @@ function hmbNativeUiImplementation(container, props = {}) {
       if (pendingEdit) publish(); disposed = true; responseRevision++;
       pendingShot = null;
       if (commitTimer) win.clearTimeout(commitTimer); clearVideo(); observer?.disconnect();
-      cancelPendingCube(); for (const cleanup of cleanups.splice(0)) cleanup(); renderer?.dispose(); renderer = null; settingsCache.clear(); cubeCache.clear();
+      cancelPendingCube(); for (const cleanup of cleanups.splice(0)) cleanup(); renderer?.dispose(); renderer = null; settingsCache.clear(); audioMixCache.clear(); cubeCache.clear();
       container.innerHTML = "";
       if (hadContainerNoDrag) container.classList?.add("nodrag"); else container.classList?.remove("nodrag");
       container.removeAttribute?.("data-hmb-node-delete-protected");
@@ -859,7 +905,7 @@ function hmbAcquireNativeStockSafety(container) {
   let shared = doc[key];
   if (!shared) {
     const owners = new Set(), identities = new Map();
-    let contextNode = null, badge = null, notice = null, disposed = false;
+    let contextNode = null, notice = null, noticeTimer = null, disposed = false;
     const nativeReady = () => doc.documentElement.getAttribute("data-hmb-native-deletion-guard") === "engine-preflight"
       && doc.documentElement.getAttribute("data-hmb-native-deletion-protection-version") === "2";
     const rootOf = value => value?.closest?.(".react-flow__node[data-id]") || null;
@@ -900,7 +946,7 @@ function hmbAcquireNativeStockSafety(container) {
       if (!nodeMenu && !(trash && button.closest(".react-flow"))) return null;
       return { button, nodeMenu };
     };
-    const dismiss = () => { notice?.remove(); notice = null; };
+    const dismiss = () => { win.clearTimeout(noticeTimer); notice?.remove(); notice = null; };
     const show = () => {
       if (disposed || nativeReady()) return;
       if (notice?.isConnected) { notice.querySelector("button")?.focus(); return; }
@@ -908,12 +954,13 @@ function hmbAcquireNativeStockSafety(container) {
       notice.setAttribute("data-hmb-native-safety-notice", "required");
       notice.setAttribute("role", "alert");
       Object.assign(notice.style, { position: "fixed", zIndex: "2147483647", right: "20px", bottom: "64px", maxWidth: "420px", padding: "18px", border: "1px solid #b89458", borderRadius: "18px", background: "#151c29", color: "#f8fafc", font: "13px/1.6 system-ui,sans-serif", boxShadow: "0 8px 32px #0008" });
-      const title = doc.createElement("strong"); title.textContent = "HMB 편집기·삭제 보호 확인이 필요합니다";
+      const title = doc.createElement("strong"); title.textContent = "HMB 노드 삭제를 중단했습니다";
       const text = doc.createElement("p");
-      text.textContent = "Override 업데이트 로그에서 current/applied를 확인하세요. UI 또는 엔진 보호 상태를 확인하지 못해 감지된 HMB 노드 삭제 시도를 중단했습니다. 작업 저장 후 Griptape 완전 종료·재시작하세요. current/applied는 디스크 파일 상태이며 현재 화면의 통합 상태를 보장하지 않습니다. 실패 시 로그의 원인을 확인하세요. 이 안내만으로 다른 삭제 경로의 엔진 보호가 준비됐다고 보장할 수 없습니다.";
+      text.textContent = "현재 화면에서 연결 상태를 확인할 수 없습니다. 작업을 저장하고 Griptape를 다시 시작한 뒤 확인하세요.";
       const close = doc.createElement("button"); close.type = "button"; close.textContent = "확인";
       Object.assign(close.style, { border: "1px solid #64748b", borderRadius: "999px", background: "#243044", color: "#f8fafc", padding: "6px 18px", cursor: "pointer" });
       close.addEventListener("click", dismiss); notice.append(title, text, close); doc.body.append(notice); close.focus();
+      noticeTimer = win.setTimeout(dismiss, 8000);
     };
     const stop = event => { event.preventDefault(); event.stopPropagation(); event.stopImmediatePropagation(); show(); };
     const keydown = event => {
@@ -925,12 +972,12 @@ function hmbAcquireNativeStockSafety(container) {
       const action = deleteControl(event.target);
       if (action && (ownedTarget(action.button) || managed()
           || action.nodeMenu && contextNode?.isConnected && roots().has(contextNode))) stop(event);
-      else if (!event.target?.closest?.("[data-hmb-native-safety-notice],[data-hmb-native-safety-status]")) contextNode = null;
+      else if (!event.target?.closest?.("[data-hmb-native-safety-notice]")) { contextNode = null; dismiss(); }
     };
     const contextmenu = event => { contextNode = rootOf(event.target); };
     const dispose = () => {
       if (disposed) return;
-      disposed = true; observer?.disconnect(); badge?.remove(); dismiss(); contextNode = null;
+      disposed = true; observer?.disconnect(); dismiss(); contextNode = null;
       win.removeEventListener("keydown", keydown, true); win.removeEventListener("click", click, true); win.removeEventListener("contextmenu", contextmenu, true);
       if (doc[key] === shared) delete doc[key];
     };
@@ -938,14 +985,7 @@ function hmbAcquireNativeStockSafety(container) {
       if (disposed) return;
       const retained = roots();
       if (!owners.size && !retained.size) { dispose(); return; }
-      if (nativeReady() || !retained.size) { badge?.remove(); badge = null; dismiss(); return; }
-      if (badge?.isConnected || !doc.body) return;
-      badge = doc.createElement("button"); badge.type = "button";
-      badge.setAttribute("data-hmb-native-safety-status", "required");
-      badge.setAttribute("aria-label", "HMB Override 업데이트·재시작 및 삭제 보호 상태 확인");
-      badge.textContent = "HMB UI·삭제 보호 상태 확인";
-      Object.assign(badge.style, { position: "fixed", zIndex: "2147483646", right: "20px", bottom: "20px", border: "1px solid #b89458", borderRadius: "999px", padding: "7px 14px", background: "#151c29", color: "#f5d49a", font: "12px system-ui,sans-serif", cursor: "pointer", boxShadow: "0 4px 18px #0006" });
-      badge.addEventListener("click", show); doc.body.append(badge);
+      if (nativeReady() || !retained.size) dismiss();
     };
     const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(sync) : null;
     observer?.observe(doc.documentElement, { attributes: true, attributeFilter: ["data-hmb-native-deletion-guard", "data-hmb-native-deletion-protection-version", "data-id"], childList: true, subtree: true });

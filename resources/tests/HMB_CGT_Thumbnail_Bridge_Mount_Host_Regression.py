@@ -76,7 +76,7 @@ async def exercise(engine):
             parameter_name=source.WIDGET_STATE_PARAMETER, value=source._json_text(state), initial_setup=True))
         assert accepted.succeeded(), accepted.result_details
         state_before = deepcopy(node._current_state()["shot_routing"])
-        bridge_before = deepcopy(node.get_parameter_value(source.THUMBNAIL_PATCH_PARAMETER))
+        lease_before = node._hmb_widget_runtime_lease
         # Model an old native save's hidden transport, including the authored
         # detail overrides that execute after a new constructor on reopening.
         parameter.hide = True
@@ -109,7 +109,10 @@ async def exercise(engine):
                 assert applied.succeeded(), applied.result_details
             bridge_contract(restored)
             assert restored._current_state()["shot_routing"] == state_before
-            assert restored.get_parameter_value(source.THUMBNAIL_PATCH_PARAMETER) == bridge_before
+            restored_bridge = restored.get_parameter_value(source.THUMBNAIL_PATCH_PARAMETER)
+            assert restored_bridge["runtime_instance_id"] == restored._thumbnail_runtime_id(restored._current_state())
+            assert restored_bridge[source.WIDGET_RUNTIME_LEASE_KEY] == restored._hmb_widget_runtime_lease
+            assert restored_bridge[source.WIDGET_RUNTIME_LEASE_KEY] != lease_before
             restored.after_deserialize()
             bridge_contract(restored)
             assert restored._current_state()["shot_routing"] == state_before
@@ -147,10 +150,11 @@ async def exercise(engine):
                     saved = {**source._default_thumbnail_bridge("fixture-runtime"), "operation": operation,
                         "phase": "result", "request_id": "saved-result", "session_id": "saved-session",
                         "outcome": "ready", "state": {"fixture": True}}
-                    expected = source._normalize_thumbnail_bridge(saved)
                     hydrated = restore_saved_bridge(saved)
                     assert hydrated.succeeded(), hydrated.result_details
-                    assert restored.get_parameter_value(source.THUMBNAIL_PATCH_PARAMETER) == expected
+                    actual = restored.get_parameter_value(source.THUMBNAIL_PATCH_PARAMETER)
+                    assert actual["operation"] == actual["phase"] == "idle", actual
+                    assert actual[source.WIDGET_RUNTIME_LEASE_KEY] == restored._hmb_widget_runtime_lease
                 assert not cgt_read.called and not cgt_write.called and not dispatch.called
                 assert restored._current_state()["shot_routing"] == state_before
             resaved = engine.handle_request(SerializeNodeToCommandsRequest(node_name=restored.name,
@@ -162,8 +166,8 @@ async def exercise(engine):
             assert len(engine.flow_manager.get_flow_by_name(cold_flow.flow_name).nodes) == 1
     print(json.dumps({"test": "HMB_CGT_Thumbnail_Bridge_Mount_Host_Regression", "status": "PASS",
         "actual_sdk": True, "fresh_bridge_property_mountable": True, "legacy_native_hide_override_repaired": True,
-        "five_shots_preserved": True, "bridge_identity_preserved": True,
-        "saved_cgt_requests_inert": True, "saved_results_preserved": True, "cgt_calls": 0, "paid_calls": 0}))
+        "five_shots_preserved": True, "fresh_bridge_lease": True,
+        "saved_cgt_requests_inert": True, "saved_results_inert": True, "cgt_calls": 0, "paid_calls": 0}))
 
 
 def main():

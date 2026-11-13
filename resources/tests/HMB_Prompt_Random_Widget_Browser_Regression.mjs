@@ -56,7 +56,8 @@ try{
    const inspect=()=>{
     const rows=[...host.querySelectorAll('.source-row.image .source-label-input')].map(input=>input.value);
     if(JSON.stringify(rows)!==JSON.stringify(latest.images.map(image=>image.label)))throw Error('Source rows do not match selected UUID');
-    if(host.querySelectorAll('.center').length!==1||host.querySelectorAll('[data-group-id]').length!==4)throw Error('Duplicate or missing editor sections');
+    const groupIds=[...host.querySelectorAll('[data-group-id]')].map(group=>group.dataset.groupId);
+    if(host.querySelectorAll('.center').length!==1||JSON.stringify(groupIds)!==JSON.stringify(['imageSources','imageText','videoSources','soundSources','videoText']))throw Error(`Duplicate or missing editor sections: ${JSON.stringify(groupIds)}`);
     if(host.querySelector('[data-text-key="'+textKey+'"]')?.value!==latest.text[textKey])throw Error('Literal text/cross-shot ownership lost');
    };
    inspect();

@@ -18,8 +18,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.8.65"
-RELEASE_VERSION = "0.8.65"
+RELEASE_LABEL = "v0.8.71"
+RELEASE_VERSION = "0.8.71"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -42,15 +42,21 @@ RUNTIME_INSTALL_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
     "HMBAgentLibrary.py",
+    "HMBAnalysisAgent.py",
     "HMBColorLUTLibrary.py",
     "HMBFinishLookLibrary.py",
     "HMBImageAssetLibrary.py",
     "HMBImageBash.py",
     "HMBImageGeneration.py",
     "HMBPromptLibrary.py",
+    "HMBSoundLibrary.py",
     "HMBSeedanceGeneration.py",
     "HMBVideoPickerLibrary.py",
     "_hmb_agent_media.py",
+    "_hmb_analysis_delivery.py",
+    "_hmb_reference_analysis.py",
+    "_hmb_analysis_broker.py",
+    "_hmb_sound.py",
     "_hmb_agent_session.py",
     "_hmb_broker_config.py",
     "_hmb_build_diagnostics.py",
@@ -72,6 +78,7 @@ RUNTIME_INSTALL_FILES = (
     "_hmb_review.py",
     "_hmb_web_rerender.py",
     "_hmb_shot_routing.py",
+    "_hmb_shot_basket.py",
     "_hmb_cgt.py",
     "_hmb_mp4_verify.py",
     "_hmb_common.py",
@@ -80,6 +87,7 @@ RUNTIME_INSTALL_FILES = (
     "_hmb_screen_space.py",
     "_hmb_video_tools.py",
     "widgets/HMBAgentLibraryWidget.js",
+    "widgets/HMBAnalysisAgentWidget.js",
     "widgets/HMBColorLUTLibraryWidget.js",
     "widgets/HMBFinishLookLibraryWidget.js",
     "widgets/HMBImageAssetLibraryWidget.js",
@@ -87,6 +95,7 @@ RUNTIME_INSTALL_FILES = (
     "widgets/HMBImageGenerationWidget.js",
     "widgets/HMBImageBashWidget.js",
     "widgets/HMBPromptLibraryScopedBindingWidget.js",
+    "widgets/HMBSoundLibraryWidget.js",
     "widgets/HMBSeedanceGenerationWidget.js",
     "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
     "widgets/HMBVideoPickerLibraryWidget_v032.js",
@@ -100,6 +109,18 @@ RUNTIME_INSTALL_FILES = (
     "resources/agent/Katuri8/project.json",
     "resources/agent/superwings12/project.json",
 )
+EDITOR_0130_OVERLAY_FILES = (
+    "tools/hmb_editor_0130_header.py",
+    "tools/restore_rodong_local_editor.py",
+    "tools/hmb_rodong_editor_0130.py",
+    "tools/hmb_editor_0130_override.py",
+    "resources/editor/hmb-header-0130.js",
+    "resources/editor/hmb-rodong-editor-0130.js",
+    "resources/editor/hmb-continue-work-art.js",
+    "resources/editor/hmb-continue-work-01-10.webp",
+    "resources/editor/hmb-continue-work-11-20.webp",
+    "resources/editor/hmb-continue-work-21-30.webp",
+)
 DISTRIBUTION_ONLY_FILES = (
     "Install_HMB_GP_Production.ps1",
     "LICENSE",
@@ -107,11 +128,13 @@ DISTRIBUTION_ONLY_FILES = (
     "SBOM.spdx.json",
     "tools/hmb_color_lut_native_header_patch.py",
     "tools/hmb_native_semantic_adapter.py",
-    "tools/hmb_team_editor_0130_connections.py",
-    "tools/hmb_editor_0130_header.py",
-    "resources/editor/hmb-header-0130.js",
     "resources/editor/hmb-color-lut-native-header.js",
+    "resources/editor/hmb-shot-basket.js",
+    "resources/editor/hmb-rodong-mart-launcher.webp",
+    "resources/editor/hmb-rodong-mart-launcher-extra.webp",
+    "resources/editor/hmb-rodong-mart-header.webp",
     "resources/editor/native-editor-patch.json",
+    *EDITOR_0130_OVERLAY_FILES,
 )
 SOURCE_FILES = (*RUNTIME_INSTALL_FILES, *DISTRIBUTION_ONLY_FILES)
 CANONICAL_CRLF_SOURCE_FILES = {
@@ -123,7 +146,7 @@ CANONICAL_LF_SOURCE_FILES = {
     if PurePosixPath(relative).suffix.casefold() in {".py", ".js", ".json", ".md"}
     or relative == "LICENSE"
 }
-if len(RUNTIME_INSTALL_FILES) != 60 or len(DISTRIBUTION_ONLY_FILES) != 11:
+if len(RUNTIME_INSTALL_FILES) != 69 or len(DISTRIBUTION_ONLY_FILES) != 22:
     raise RuntimeError("Runtime/distribution release boundary count mismatch.")
 if set(RUNTIME_INSTALL_FILES) & set(DISTRIBUTION_ONLY_FILES):
     raise RuntimeError("Runtime and distribution-only release files overlap.")
@@ -180,7 +203,7 @@ COMMON_TOKEN_PATTERNS = (
 STANDARD_AGENT_LIBRARY_ENV = "HMB_GRIPTAPE_STANDARD_LIBRARY_PATH"
 STANDARD_AGENT_MANIFEST_NAME = "griptape_nodes_library.json"
 STANDARD_AGENT_MODEL_CATALOG_SHA256 = (
-    "716609b618b90ffe90f7f7fa71ec68a41402b0d918700a5a50e72a9faff086fc"
+    "c4d6afd6633ff27fa30557b2b9be281c4c89fb9c6b41f376aa3cc572823e63a2"
 )
 EXPECTED_EDITOR_DEPENDENCIES = frozenset((
     "httpx==0.28.1", "imageio-ffmpeg==0.6.0", "Pillow>=12.3.0,<14",
@@ -239,6 +262,14 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
         raise RuntimeError("Native editor previous candidate is not the reviewed patch.")
     reviewed_previous = [
         {
+            "bundle_sha256": "dd88eb46ec485a38078eb7f14b06a0ca980f6b0335e230dba3ac9b8b1ba2985d",
+            "helper_sha256": "7233a7233759051e381563d3c76ec5a1df9703934264897f9815b64314ae1bd1",
+        },
+        {
+            "bundle_sha256": "44b61f6d65543a34bcf94a0ed702f84ae55045653b3036ec9c73c224840038bf",
+            "helper_sha256": "fd8523a5bf575cb26fe275da97dde0481829ec024ba5a97820f5eecd897f90bb",
+        },
+        {
             "bundle_sha256": "984a974edb6b7218b2ff5deb35eaffcf2979fcf6d8ccd5d5c2ca5fbb1fc15552",
             "helper_sha256": "e5b515d5cbd1652c1bcb66f7ffa411e6cb86e173163f93f9abee2082a66e74fc",
         },
@@ -263,8 +294,8 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
             "helper_sha256": "39e5901cc8aa37d1d11850a255bcc209ab4724afe488817fc3f684a72ab01b63",
         },
     ]
-    if "previous_candidates" in payload and payload["previous_candidates"] not in (
-        reviewed_previous, reviewed_previous[1:], reviewed_previous[2:], reviewed_previous[3:], reviewed_previous[4:]
+    if "previous_candidates" in payload and not any(
+        payload["previous_candidates"] == reviewed_previous[start:] for start in range(len(reviewed_previous) - 1)
     ):
         raise RuntimeError("Native editor previous candidates are not the reviewed patches.")
     for kind in ("patcher", "helper"):
@@ -276,6 +307,18 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
         if digest(encoded) != payload[kind + "_sha256"]:
             raise RuntimeError("Native editor patch descriptor hash mismatch: " + relative)
     patcher = ROOT / payload["patcher_path"]
+    overlay_pins = next((ast.literal_eval(node.value) for node in ast.parse(patcher.read_bytes()).body
+                         if isinstance(node, ast.Assign) and any(
+                             isinstance(target, ast.Name) and target.id == "EDITOR_0130_OVERLAY_INPUTS"
+                             for target in node.targets)), None)
+    if not isinstance(overlay_pins, dict) or set(overlay_pins) != set(EDITOR_0130_OVERLAY_FILES):
+        raise RuntimeError("Editor 0.130 overlay inputs are incomplete.")
+    for relative, expected in overlay_pins.items():
+        path = ROOT / relative
+        if not path.is_file() or path.is_symlink() or path.stat().st_size > 1024 * 1024:
+            raise RuntimeError("Editor 0.130 overlay input is missing or linked: " + relative)
+        if digest(canonical_release_source_data(PurePosixPath(relative), path.read_bytes())) != expected:
+            raise RuntimeError("Editor 0.130 overlay input hash mismatch: " + relative)
     for constant, key in (
         ("EXPECTED_SOURCE_SHA256", "source_sha256"),
         ("SOURCE_PROFILE", "source_profile"),
@@ -291,7 +334,7 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
             if module_string_constant(patcher, constant) != payload["previous_candidate"][key]:
                 raise RuntimeError("Native editor patcher and previous candidate differ.")
     if "previous_candidates" in payload:
-        prefixes = ("SUPPORTED_CONNECTION_PREVIOUS", "SUPPORTED_CAPSULE_PREVIOUS", "SUPPORTED_LATEST", "SUPPORTED_RECENT",
+        prefixes = ("SUPPORTED_SOUND_READ_PREVIOUS", "SUPPORTED_REBIND_PREVIOUS", "SUPPORTED_CONNECTION_PREVIOUS", "SUPPORTED_CAPSULE_PREVIOUS", "SUPPORTED_LATEST", "SUPPORTED_RECENT",
                     "SUPPORTED_CURRENT", "SUPPORTED_PREVIOUS")
         prefixes = prefixes[len(prefixes) - len(payload["previous_candidates"]):]
         for row, prefix in zip(payload["previous_candidates"], prefixes, strict=True):
@@ -313,7 +356,7 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
         }
         if (not isinstance(profile, dict) or not required.issubset(profile)
             or set(profile) - required - {"previous_candidate_sha256"}
-            or profile["adapter_path"] not in {"tools/hmb_native_semantic_adapter.py", "tools/hmb_team_editor_0130_connections.py"}
+            or profile["adapter_path"] != "tools/hmb_native_semantic_adapter.py"
             or profile["structural_fallback"] is not False):
             raise RuntimeError("Native editor adapter profile is invalid.")
         for field in ("source_sha256", "candidate_sha256", "adapter_sha256"):
@@ -334,6 +377,21 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
         encoded = canonical_release_source_data(PurePosixPath(profile["adapter_path"]), adapter.read_bytes())
         if digest(encoded) != profile["adapter_sha256"]:
             raise RuntimeError("Native editor adapter profile hash mismatch.")
+        basket_ui = ROOT / "resources/editor/hmb-shot-basket.js"
+        if not basket_ui.is_file() or basket_ui.is_symlink() or basket_ui.stat().st_size > 256 * 1024:
+            raise RuntimeError("HMB Shot Basket UI is missing, linked or oversized.")
+        basket_digest = digest(canonical_release_source_data(PurePosixPath("resources/editor/hmb-shot-basket.js"), basket_ui.read_bytes()))
+        if basket_digest != module_string_constant(adapter, "_SHOT_BASKET_UI_SHA256"):
+            raise RuntimeError("HMB Shot Basket UI hash mismatch.")
+        for name, constant in (
+            ("hmb-rodong-mart-launcher.webp", "_SHOT_BASKET_ARTWORK_SHA256"),
+            ("hmb-rodong-mart-launcher-extra.webp", "_SHOT_BASKET_EXTRA_ARTWORK_SHA256"),
+            ("hmb-rodong-mart-header.webp", "_SHOT_BASKET_HEADER_ARTWORK_SHA256"),
+        ):
+            artwork = basket_ui.with_name(name)
+            if (not artwork.is_file() or artwork.is_symlink() or artwork.stat().st_size > 512 * 1024
+                    or digest(artwork.read_bytes()) != module_string_constant(adapter, constant)):
+                raise RuntimeError("HMB Rodong Mart launcher artwork is missing or differs from the approved asset.")
         seen.update((source_hash, candidate_hash))
         seen.update(previous)
     return payload
@@ -548,10 +606,20 @@ def library_model_catalog_ids(
 
 def library_model_catalog_contract_sha256(
     library_manifest: dict[str, Any],
+    *,
+    exclude_model_id: str | None = None,
 ) -> str:
     """Hash every provider and model field in the pinned Agent catalog subset."""
 
     providers = library_model_catalog_providers(library_manifest)
+    if exclude_model_id:
+        providers = {
+            key: {**provider, "models": {
+                model_id: model for model_id, model in provider["models"].items()
+                if model_id != exclude_model_id
+            }}
+            for key, provider in providers.items()
+        }
     canonical = json.dumps(
         providers,
         ensure_ascii=False,
@@ -607,8 +675,18 @@ def validate_standard_agent_model_parity(
     """
 
     hmb_ids = node_model_usage_ids(library_manifest, "HMBAgentLibrary")
-    catalog_ids = library_model_catalog_ids(library_manifest)
-    catalog_contract_sha256 = library_model_catalog_contract_sha256(library_manifest)
+    catalog_ids = set(library_model_catalog_ids(library_manifest))
+    providers = library_model_catalog_providers(library_manifest)
+    analysis_id = "gtc_gemini_4_argon"
+    if (node_model_usage_ids(library_manifest, "HMBAnalysisAgent") != (analysis_id,)
+            or providers.get("google", {}).get("models", {}).get(analysis_id) != {
+                "display_name": "Gemini 4 Argon", "family": "Gemini",
+                "provider_model_id": "gemini-4-argon", "key_support": "REQUIRES_GRIPTAPE_KEY",
+            } or analysis_id in hmb_ids):
+        raise RuntimeError("HMBAnalysisAgent Argon catalog declaration is invalid.")
+    catalog_ids.remove(analysis_id)
+    catalog_contract_sha256 = library_model_catalog_contract_sha256(
+        library_manifest, exclude_model_id=analysis_id)
     if catalog_contract_sha256 != STANDARD_AGENT_MODEL_CATALOG_SHA256:
         raise RuntimeError(
             "HMBAgentLibrary pinned Standard Agent model catalog contract changed "
@@ -663,6 +741,8 @@ def validate_standard_agent_model_parity(
                     f"Standard Agent model provider payload mismatch: {provider_id}."
                 )
             for model_id, hmb_model in hmb_models.items():
+                if model_id == analysis_id:
+                    continue
                 if standard_models.get(model_id) != hmb_model:
                     raise RuntimeError(
                         "Standard Agent model catalog field mismatch: "

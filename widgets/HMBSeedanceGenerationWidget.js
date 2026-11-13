@@ -698,11 +698,15 @@ function compactHost(container) {
 }
 
 function hmbSeedanceNodeRoot(container) {
+  // Editor parameter wrappers are not a stable, fixed-depth API.
+  if (typeof container?.closest === "function") {
+    return container.closest('.react-flow__node,[data-testid="node"]');
+  }
   let current = container?.parentElement || null;
-  for (let depth = 0; current && depth < 16; depth += 1, current = current.parentElement) {
+  for (; current; current = current.parentElement) {
     const className = String(current.className || "").toLowerCase();
     const testId = String(current.getAttribute?.("data-testid") || "").toLowerCase();
-    if (className.includes("react-flow__node") || testId === "node") return current;
+    if (className.split(/\s+/).includes("react-flow__node") || testId === "node") return current;
     if (className.includes("react-flow__pane") || className.includes("react-flow__viewport")) return null;
   }
   return null;
@@ -718,10 +722,14 @@ export function hmbSeedanceRemotePromptEdgeMatches(element, value) {
   const targetAliases = [route.target_node_name, route.previous_target_node_name]
     .filter(Boolean);
   const idMatches = sourceAliases.some((sourceNodeName) => (
-    targetAliases.some((targetNodeName) => edgeId.startsWith(
-      `${sourceNodeName}-${route.source_parameter}-`
-      + `${targetNodeName}-${route.target_parameter}-`,
-    ))
+    targetAliases.some((targetNodeName) => {
+      const exactPrefix = `${sourceNodeName}-${route.source_parameter}-`
+        + `${targetNodeName}-${route.target_parameter}-`;
+      // Native Editor uses temp- while its retained connection is settling.
+      // Match both public endpoints and handles; never hide arbitrary wires.
+      return edgeId.startsWith(exactPrefix) || edgeId.startsWith(`temp-${exactPrefix}`)
+        || edgeId === `xy-edge__${sourceNodeName}${route.source_parameter}-${targetNodeName}${route.target_parameter}`;
+    })
   ));
   const labelMatches = sourceAliases.some((sourceNodeName) => (
     targetAliases.some((targetNodeName) => (
@@ -746,6 +754,10 @@ function hmbSeedancePromptEdgeRegistry() {
 
 function hmbSeedanceEdgeLayer(container) {
   const nodeRoot = hmbSeedanceNodeRoot(container);
+  // The viewport survives a late/replaced edge layer during cold workflow
+  // hydration. Watching only the first .react-flow__edges misses that change.
+  const viewport = nodeRoot?.closest?.(".react-flow__viewport");
+  if (viewport) return viewport;
   let current = nodeRoot?.parentElement || null;
   for (let depth = 0; current && depth < 16; depth += 1, current = current.parentElement) {
     const layer = current.querySelector?.(".react-flow__edges");
@@ -756,20 +768,22 @@ function hmbSeedanceEdgeLayer(container) {
 
 function hmbSeedanceScanPromptEdges(controller) {
   if (!controller?.layer) return;
-  for (const edge of controller.markedEdges) {
-    edge?.removeAttribute?.(HMB_SEEDANCE_PROMPT_EDGE_ATTRIBUTE);
-  }
-  controller.markedEdges.clear();
   const routes = Array.from(controller.entries.values()).filter((route) => route.connected);
-  if (!routes.length) return;
+  const nextMarked = new Set();
   const edges = controller.layer.querySelectorAll?.(
     ".react-flow__edge[data-id][aria-label]",
   ) || [];
   for (const edge of edges) {
     if (!routes.some((route) => hmbSeedanceRemotePromptEdgeMatches(edge, route))) continue;
-    edge.setAttribute?.(HMB_SEEDANCE_PROMPT_EDGE_ATTRIBUTE, "true");
-    controller.markedEdges.add(edge);
+    if (edge.getAttribute?.(HMB_SEEDANCE_PROMPT_EDGE_ATTRIBUTE) !== "true") {
+      edge.setAttribute?.(HMB_SEEDANCE_PROMPT_EDGE_ATTRIBUTE, "true");
+    }
+    nextMarked.add(edge);
   }
+  for (const edge of controller.markedEdges) {
+    if (!nextMarked.has(edge)) edge?.removeAttribute?.(HMB_SEEDANCE_PROMPT_EDGE_ATTRIBUTE);
+  }
+  controller.markedEdges = nextMarked;
 }
 
 function hmbSeedanceSchedulePromptEdgeScan(controller) {
@@ -839,10 +853,18 @@ function hmbSeedanceSyncRemotePromptEdge(container, state) {
       scheduled: null,
     };
     if (typeof MutationObserver === "function") {
-      controller.observer = new MutationObserver(() => {
-        hmbSeedanceSchedulePromptEdgeScan(controller);
+      controller.observer = new MutationObserver((records) => {
+        const relevant = records.some((record) => {
+          if (record.type === "attributes") return record.target?.matches?.(".react-flow__edge");
+          if (record.target?.closest?.(".react-flow__edges")) return true;
+          return [...Array.from(record.addedNodes || []), ...Array.from(record.removedNodes || [])]
+            .some((node) => node.matches?.(".react-flow__edges") || node.querySelector?.(".react-flow__edges"));
+        });
+        // MutationObserver runs before paint. Deferring another rAF can expose
+        // one frame of the managed cable when the Editor replaces its layer.
+        if (relevant) hmbSeedanceScanPromptEdges(controller);
       });
-      // Five generators share this one edge-layer observer. Reset Node may
+      // Five generators share this one viewport observer. Reset Node may
       // rename the retained edge in place, so watch only the two host-owned
       // endpoint attributes. Our own hiding marker is intentionally outside
       // this filter and therefore cannot retrigger the observer.
@@ -972,6 +994,13 @@ export function hmbSeedanceNormalizeBrokerUrl(raw) {
   return { ok: true, value: `${parsed.origin}${rawPath.replace(/\/$/, "")}`, error: "" };
 }
 
+const HMB_SEEDANCE_POPUP_HEADER_STYLE = `
+  .hmb-seedance-popup-header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
+  .hmb-seedance-popup-header h2{margin:0}
+  .hmb-seedance-popup-header>button{width:30px;height:30px;padding:0;border:1px solid #52617a;border-radius:7px;background:#182338;color:#e7edf7;font:18px/1 system-ui;cursor:pointer}
+  .hmb-seedance-popup-header>button:disabled{opacity:.55;cursor:wait}
+`;
+
 function hmbSeedanceInstallBrokerStyles(ownerDocument) {
   if (!ownerDocument?.head || ownerDocument.getElementById?.("hmb-seedance-broker-settings-style")) return;
   const style = ownerDocument.createElement("style");
@@ -987,6 +1016,7 @@ function hmbSeedanceInstallBrokerStyles(ownerDocument) {
     .hmb-seedance-broker-dialog input:focus{border-color:#f472b6;box-shadow:0 0 0 2px rgba(244,114,182,.2)}.hmb-seedance-broker-error{min-height:18px;margin:8px 0;color:#fb7185;font-size:12px}
     .hmb-seedance-broker-actions{display:flex;justify-content:flex-end;gap:9px}.hmb-seedance-broker-actions button{min-width:78px;padding:8px 12px;border:1px solid #52617a;border-radius:7px;background:#182338;color:#e7edf7;font:12px system-ui;cursor:pointer}
     .hmb-seedance-broker-actions button[data-broker-save]{border-color:#f472b6;background:#9d326d;color:#fff}.hmb-seedance-broker-actions button:disabled{opacity:.55;cursor:wait}
+    ${HMB_SEEDANCE_POPUP_HEADER_STYLE}
   `;
   ownerDocument.head.appendChild(style);
 }
@@ -1036,7 +1066,7 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
     backdrop.className = "hmb-seedance-broker-backdrop";
     backdrop.innerHTML = `
       <form class="hmb-seedance-broker-dialog" role="dialog" aria-modal="true" aria-labelledby="hmb-seedance-broker-title" aria-describedby="hmb-seedance-broker-help">
-        <h2 id="hmb-seedance-broker-title">FN AI Broker 주소</h2>
+        <header class="hmb-seedance-popup-header" data-hmb-popup-header><h2 id="hmb-seedance-broker-title">FN AI Broker 주소</h2><button type="button" data-broker-close tabindex="-1" aria-label="브로커 주소 창 닫기">×</button></header>
         <p id="hmb-seedance-broker-help">HTTPS 서버 주소를 입력하세요. 모든 제네레이터에 공통 적용되며, 재시작 후에도 직접 바꾸기 전까지 유지됩니다. 비워서 저장하면 미설정 상태로 연결하지 않습니다. 저장만으로 렌더를 시작하지 않습니다.</p>
         <label for="hmb-seedance-broker-url">서버 주소</label>
         <input id="hmb-seedance-broker-url" data-broker-url type="url" inputmode="url" autocomplete="off" spellcheck="false" maxlength="2048" placeholder="https://broker.example.com:8080" value="${escapeHtml(latestProps?.value ?? latestProps?.parameterValue ?? latestProps?.defaultValue ?? "")}">
@@ -1048,6 +1078,7 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
     const error = backdrop.querySelector("[data-broker-error]");
     const save = backdrop.querySelector("[data-broker-save]");
     const cancel = backdrop.querySelector("[data-broker-cancel]");
+    const headerClose = backdrop.querySelector("[data-broker-close]");
     let pending = false;
     let closed = false;
     const close = () => {
@@ -1095,7 +1126,9 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
       event.stopPropagation?.();
       if (event.target === backdrop && !pending) close();
     });
-    cancel.addEventListener("click", () => { if (!pending) close(); });
+    const dismiss = () => { if (!pending) close(); };
+    cancel.addEventListener("click", dismiss);
+    headerClose.addEventListener("click", dismiss);
     form.addEventListener("submit", async (event) => {
       event.preventDefault?.();
       event.stopPropagation?.();
@@ -1109,6 +1142,7 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
       pending = true;
       save.disabled = true;
       cancel.disabled = true;
+      headerClose.disabled = true;
       error.textContent = "";
       try {
         await latestProps.onChange(parsed.value);
@@ -1119,9 +1153,11 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
         pending = false;
         save.disabled = Boolean(latestProps?.disabled);
         cancel.disabled = false;
+        headerClose.disabled = false;
       }
     });
     ownerDocument.body.appendChild(backdrop);
+    globalThis.__hmbStylePopupHeader?.(form.querySelector("[data-hmb-popup-header]"), form);
     input.focus?.();
     input.select?.();
   };
@@ -2506,7 +2542,10 @@ function hmbSeedancePreflightWidget(container,initialProps) {
       .hmb-preflight-backdrop{position:fixed;inset:0;z-index:2147483001;display:grid;place-items:center;padding:20px;background:rgba(1,5,14,.78);font-family:Inter,"Noto Sans KR",system-ui,sans-serif;color:#e7edf7}
       .hmb-preflight-dialog{box-sizing:border-box;width:min(1160px,100%);min-width:0;max-height:88vh;display:flex;flex-direction:column;padding:20px;border:1px solid #9b4d7d;border-radius:13px;background:#0b1120;box-shadow:0 20px 50px rgba(0,0,0,.55)}
       .hmb-preflight-dialog h2{margin:0 0 10px;font-size:18px}.hmb-preflight-dialog p{margin:0 0 12px;color:#b5c2d5;font-size:12px;line-height:1.5}.hmb-preflight-scroll{overflow:auto;min-height:0}.hmb-preflight-dialog table{width:100%;border-collapse:collapse;font-size:11px;text-align:left}.hmb-preflight-dialog th,.hmb-preflight-dialog td{padding:10px;border-bottom:1px solid #27324a;vertical-align:top;max-width:290px;overflow-wrap:anywhere}.hmb-preflight-dialog tbody th{border-left:3px solid var(--preflight-accent);color:var(--preflight-accent);min-width:140px}.hmb-preflight-dialog small{display:block;margin-top:5px;font-weight:400;color:#aeb9c9;font-size:10px}.hmb-preflight-dialog [data-preflight-status="error"]>b{color:#fb7185}.hmb-preflight-dialog [data-preflight-status="warning"]>b{color:#eab308}.hmb-preflight-dialog [data-preflight-status="ready"]>b{color:#10b981}.hmb-preflight-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:15px}.hmb-preflight-actions button{padding:8px 12px;border:1px solid #52617a;border-radius:7px;background:#182338;color:#e7edf7;font:12px system-ui;cursor:pointer}.hmb-preflight-actions button[data-preflight-recheck]{border-color:#f472b6;background:#9d326d;color:#fff}.hmb-preflight-busy{padding:25px;color:#dbeafe}
-    </style><section class="hmb-preflight-dialog" role="dialog" aria-modal="true" aria-labelledby="hmb-preflight-title"><h2 id="hmb-preflight-title">렌더 전 일괄 점검</h2><p>${escapeHtml(report.notice)}</p><div class="hmb-preflight-scroll">${pending?'<div class="hmb-preflight-busy" role="status">연결·미디어 수량·모델·설정·출력 경로를 확인 중입니다…</div>':`${report.issues.map(item=>`<p role="status">${escapeHtml(item.message)}</p>`).join("")}<table><thead><tr><th>ImageAsset Shot</th><th>모델 / 작업</th><th>입력 / 연결</th><th>출력 파일</th><th>점검 결과</th></tr></thead><tbody>${rows}</tbody></table>${report.checked_at_ms?`<p style="margin-top:12px">점검 시각 ${escapeHtml(new Date(report.checked_at_ms).toLocaleTimeString())} · 설정을 바꾼 후에는 다시 점검하세요.</p>`:""}`}</div><div class="hmb-preflight-actions">${pending?'<button type="button" data-preflight-cancel>점검 취소</button>':'<button type="button" data-preflight-recheck>다시 점검</button>'}<button type="button" data-preflight-close>닫기</button></div></section>`;
+      ${HMB_SEEDANCE_POPUP_HEADER_STYLE}
+    </style><section class="hmb-preflight-dialog" role="dialog" aria-modal="true" aria-labelledby="hmb-preflight-title"><header class="hmb-seedance-popup-header" data-hmb-popup-header><h2 id="hmb-preflight-title">렌더 전 일괄 점검</h2><button type="button" data-preflight-header-close tabindex="-1" aria-label="렌더 전 점검 창 닫기">×</button></header><p>${escapeHtml(report.notice)}</p><div class="hmb-preflight-scroll">${pending?'<div class="hmb-preflight-busy" role="status">연결·미디어 수량·모델·설정·출력 경로를 확인 중입니다…</div>':`${report.issues.map(item=>`<p role="status">${escapeHtml(item.message)}</p>`).join("")}<table><thead><tr><th>ImageAsset Shot</th><th>모델 / 작업</th><th>입력 / 연결</th><th>출력 파일</th><th>점검 결과</th></tr></thead><tbody>${rows}</tbody></table>${report.checked_at_ms?`<p style="margin-top:12px">점검 시각 ${escapeHtml(new Date(report.checked_at_ms).toLocaleTimeString())} · 설정을 바꾼 후에는 다시 점검하세요.</p>`:""}`}</div><div class="hmb-preflight-actions">${pending?'<button type="button" data-preflight-cancel>점검 취소</button>':'<button type="button" data-preflight-recheck>다시 점검</button>'}<button type="button" data-preflight-close>닫기</button></div></section>`;
+    globalThis.__hmbStylePopupHeader?.(dialog.querySelector("[data-hmb-popup-header]"), dialog);
+    dialog.querySelector("[data-preflight-header-close]")?.addEventListener("click",close);
     dialog.querySelector("[data-preflight-close]")?.addEventListener("click",close);
     dialog.querySelector("[data-preflight-recheck]")?.addEventListener("click",inspect);
     dialog.querySelector("[data-preflight-cancel]")?.addEventListener("click",()=>{
@@ -2525,7 +2564,8 @@ function hmbSeedancePreflightWidget(container,initialProps) {
   };
   const open=()=>{
     if(disposed)return;
-    if(!dialog){
+    const opening=!dialog;
+    if(opening){
       const previous=HMB_SEEDANCE_PREFLIGHT_DIALOGS.get(doc);if(previous && previous!==close)previous({restoreFocus:false});
       dialog=doc.createElement("div");dialog.className="hmb-preflight-backdrop nodrag";doc.body.appendChild(dialog);
       HMB_SEEDANCE_PREFLIGHT_DIALOGS.set(doc,close);
@@ -2535,7 +2575,7 @@ function hmbSeedancePreflightWidget(container,initialProps) {
         event.stopPropagation?.();
         if(event.key==="Escape"){event.preventDefault?.();close();return;}
         if(event.key!=="Tab")return;
-        const controls=Array.from(dialog.querySelectorAll("button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex='-1'])"));
+        const controls=Array.from(dialog.querySelectorAll("button:not([disabled]):not([tabindex='-1']),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex='-1'])"));
         if(!controls.length)return;
         const index=controls.indexOf(doc.activeElement);
         if(event.shiftKey && index<=0){event.preventDefault?.();controls.at(-1).focus?.({preventScroll:true});}
@@ -2543,7 +2583,7 @@ function hmbSeedancePreflightWidget(container,initialProps) {
       });
       doc.addEventListener("focusin",containFocus,true);
     }
-    renderDialog();if(!report.rows.length)inspect();focusDialog();
+    if(opening)inspect();else renderDialog();focusDialog();
   };
   const isolate=event=>{if(Number(event.button)!==1)event.stopPropagation?.();};
   openButton.addEventListener("click",open);container.addEventListener?.("pointerdown",isolate);
@@ -2936,7 +2976,7 @@ function hmbAcquireNativeStockSafety(container) {
   let shared = doc[key];
   if (!shared) {
     const owners = new Set(), identities = new Map();
-    let contextNode = null, badge = null, notice = null, disposed = false;
+    let contextNode = null, notice = null, noticeTimer = null, disposed = false;
     const nativeReady = () => doc.documentElement.getAttribute("data-hmb-native-deletion-guard") === "engine-preflight"
       && doc.documentElement.getAttribute("data-hmb-native-deletion-protection-version") === "2";
     const rootOf = value => value?.closest?.(".react-flow__node[data-id]") || null;
@@ -2977,7 +3017,7 @@ function hmbAcquireNativeStockSafety(container) {
       if (!nodeMenu && !(trash && button.closest(".react-flow"))) return null;
       return { button, nodeMenu };
     };
-    const dismiss = () => { notice?.remove(); notice = null; };
+    const dismiss = () => { win.clearTimeout(noticeTimer); notice?.remove(); notice = null; };
     const show = () => {
       if (disposed || nativeReady()) return;
       if (notice?.isConnected) { notice.querySelector("button")?.focus(); return; }
@@ -2985,12 +3025,13 @@ function hmbAcquireNativeStockSafety(container) {
       notice.setAttribute("data-hmb-native-safety-notice", "required");
       notice.setAttribute("role", "alert");
       Object.assign(notice.style, { position: "fixed", zIndex: "2147483647", right: "20px", bottom: "64px", maxWidth: "420px", padding: "18px", border: "1px solid #b89458", borderRadius: "18px", background: "#151c29", color: "#f8fafc", font: "13px/1.6 system-ui,sans-serif", boxShadow: "0 8px 32px #0008" });
-      const title = doc.createElement("strong"); title.textContent = "HMB 편집기·삭제 보호 확인이 필요합니다";
+      const title = doc.createElement("strong"); title.textContent = "HMB 노드 삭제를 중단했습니다";
       const text = doc.createElement("p");
-      text.textContent = "Override 업데이트 로그에서 current/applied를 확인하세요. UI 또는 엔진 보호 상태를 확인하지 못해 감지된 HMB 노드 삭제 시도를 중단했습니다. 작업 저장 후 Griptape 완전 종료·재시작하세요. current/applied는 디스크 파일 상태이며 현재 화면의 통합 상태를 보장하지 않습니다. 실패 시 로그의 원인을 확인하세요. 이 안내만으로 다른 삭제 경로의 엔진 보호가 준비됐다고 보장할 수 없습니다.";
+      text.textContent = "현재 화면에서 연결 상태를 확인할 수 없습니다. 작업을 저장하고 Griptape를 다시 시작한 뒤 확인하세요.";
       const close = doc.createElement("button"); close.type = "button"; close.textContent = "확인";
       Object.assign(close.style, { border: "1px solid #64748b", borderRadius: "999px", background: "#243044", color: "#f8fafc", padding: "6px 18px", cursor: "pointer" });
       close.addEventListener("click", dismiss); notice.append(title, text, close); doc.body.append(notice); close.focus();
+      noticeTimer = win.setTimeout(dismiss, 8000);
     };
     const stop = event => { event.preventDefault(); event.stopPropagation(); event.stopImmediatePropagation(); show(); };
     const keydown = event => {
@@ -3002,12 +3043,12 @@ function hmbAcquireNativeStockSafety(container) {
       const action = deleteControl(event.target);
       if (action && (ownedTarget(action.button) || managed()
           || action.nodeMenu && contextNode?.isConnected && roots().has(contextNode))) stop(event);
-      else if (!event.target?.closest?.("[data-hmb-native-safety-notice],[data-hmb-native-safety-status]")) contextNode = null;
+      else if (!event.target?.closest?.("[data-hmb-native-safety-notice]")) { contextNode = null; dismiss(); }
     };
     const contextmenu = event => { contextNode = rootOf(event.target); };
     const dispose = () => {
       if (disposed) return;
-      disposed = true; observer?.disconnect(); badge?.remove(); dismiss(); contextNode = null;
+      disposed = true; observer?.disconnect(); dismiss(); contextNode = null;
       win.removeEventListener("keydown", keydown, true); win.removeEventListener("click", click, true); win.removeEventListener("contextmenu", contextmenu, true);
       if (doc[key] === shared) delete doc[key];
     };
@@ -3015,14 +3056,7 @@ function hmbAcquireNativeStockSafety(container) {
       if (disposed) return;
       const retained = roots();
       if (!owners.size && !retained.size) { dispose(); return; }
-      if (nativeReady() || !retained.size) { badge?.remove(); badge = null; dismiss(); return; }
-      if (badge?.isConnected || !doc.body) return;
-      badge = doc.createElement("button"); badge.type = "button";
-      badge.setAttribute("data-hmb-native-safety-status", "required");
-      badge.setAttribute("aria-label", "HMB Override 업데이트·재시작 및 삭제 보호 상태 확인");
-      badge.textContent = "HMB UI·삭제 보호 상태 확인";
-      Object.assign(badge.style, { position: "fixed", zIndex: "2147483646", right: "20px", bottom: "20px", border: "1px solid #b89458", borderRadius: "999px", padding: "7px 14px", background: "#151c29", color: "#f5d49a", font: "12px system-ui,sans-serif", cursor: "pointer", boxShadow: "0 4px 18px #0006" });
-      badge.addEventListener("click", show); doc.body.append(badge);
+      if (nativeReady() || !retained.size) dismiss();
     };
     const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(sync) : null;
     observer?.observe(doc.documentElement, { attributes: true, attributeFilter: ["data-hmb-native-deletion-guard", "data-hmb-native-deletion-protection-version", "data-id"], childList: true, subtree: true });

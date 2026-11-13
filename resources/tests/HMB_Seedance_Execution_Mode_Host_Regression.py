@@ -21,8 +21,9 @@ import subprocess
 import sys
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[2]
-STANDARD = Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard"
+ROOT = Path(os.environ.get("HMB_MODE_TEST_LIBRARY_ROOT", Path(__file__).resolve().parents[2])).resolve()
+STANDARD = Path(os.environ.get("HMB_GRIPTAPE_STANDARD_LIBRARY_PATH",
+    Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard"))
 CHANNEL = "11111111-1111-4111-8111-111111111111"
 PUBLISHER = "22222222-2222-4222-8222-222222222222"
 SHOTS = [dict(shot_uuid=f"33333333-3333-4333-8333-{n:012d}", number=n,
@@ -107,8 +108,18 @@ def select(engine, t, node, shot=""):
     value["selection_request"] = dict(schema=t.SEEDANCE_MODE_SELECTION_SCHEMA, version=1,
         mode="shot" if shot else "only", expected_revision=fields["execution_mode_revision"],
         expected_instance=fields["execution_mode_instance"])
-    send(engine, SetParameterValueRequest(node_name=node.name, parameter_name=t.SEEDANCE_SHOT_WIDGET_PARAMETER,
-                                        value=value, initial_setup=False))
+    with mock.patch.object(node, "publish_update_to_parameter", wraps=node.publish_update_to_parameter) as published:
+        send(engine, SetParameterValueRequest(node_name=node.name, parameter_name=t.SEEDANCE_SHOT_WIDGET_PARAMETER,
+                                            value=value, initial_setup=False))
+    snapshots = [deepcopy(call.args[1]) for call in published.call_args_list
+                 if call.args and call.args[0] == t.SEEDANCE_SHOT_WIDGET_PARAMETER]
+    final = deepcopy(node.get_parameter_value(t.SEEDANCE_SHOT_WIDGET_PARAMETER))
+    assert snapshots and snapshots[-1] == final, (node.name, "Missing or stale final selection acknowledgement", snapshots, final)
+    assert final["draft"] == node._draft_ui_state(), (node.name, "Draft controls lost during normalization")
+    assert final["execution_mode"] == ("shot" if shot else "only"), final
+    assert node.get_parameter_by_name("only_project").hide is bool(shot)
+    record("one_selection_publishes_complete_final_state", node=node.name,
+           mode=final["execution_mode"], publications=len(snapshots), controls_visible_immediately=True)
     return value
 
 
@@ -209,10 +220,10 @@ async def exercise(engine, phase, out):
         state = images._default_state()
         state["shot_routing"].update(channel_uuid=CHANNEL, publisher_instance_uuid=PUBLISHER,
             generation=1, shots=[dict(row, selected_source_uids=[]) for row in SHOTS], active_shot_uuid=SHOTS[0]["shot_uuid"])
+        from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
+        send(engine, SetParameterValueRequest(node_name=source.name, parameter_name=images.WIDGET_STATE_PARAMETER,
+            value=json.dumps(state, ensure_ascii=False), initial_setup=True))
         source._hmb_initial_catalog_scan_pending = False
-        source._resolution_cache_for_state(state)
-        source._cache_shot_routing_snapshot(state, force=True)
-        source._publish_state(state)
         assert source._hmb_shot_channel_subscription()["channel_uuid"] == CHANNEL
         def create(name, mode="only", shot=None):
             value = {t.SEEDANCE_EXECUTION_MODE_METADATA: intent(t, mode, shot), "preserved_literal": {"OFF": False, "zero": 0, "text": "한글 {literal}"}}
@@ -221,6 +232,10 @@ async def exercise(engine, phase, out):
             return engine.node_manager.get_node_by_name(result.node_name)
         only = create("Mode Only")
         configure(t, only, 6)
+        only._hmb_clear_shot_routing_catalog()
+        select(engine, t, only)
+        assert only.get_parameter_value(t.SEEDANCE_SHOT_WIDGET_PARAMETER)["draft"]["preview_available"]
+        record("cold_only_without_catalog_has_draft_controls_on_first_selection")
         # A late serialized quartet must not become authority over explicit Only.
         for key, value in ((t.SHOT_CHANNEL_UUID_PARAMETER, CHANNEL), (t.SHOT_UUID_PARAMETER, SHOTS[0]["shot_uuid"]),
                            (t.SHOT_NUMBER_PARAMETER, 1), (t.SHOT_NAME_PARAMETER, "Late obsolete Shot")):
@@ -358,14 +373,9 @@ async def exercise(engine, phase, out):
         for source, port in ((standard, "output"), (plain, "text")):
             source.metadata.update(library=schema.name, node_type=type(source).__name__)
             blocked_flow.add_node(source)
-            current = getattr(engine, "current_workflow_or_none", None)
-            if callable(current):
-                workflow = current()
-                engine.object_manager.add_object_by_name_in(workflow, source.name, source)
-                workflow.nodes.name_to_parent_flow_name[source.name] = blocked_flow.name
-            else:
-                engine.object_manager.add_object_by_name(source.name, source)
-                engine.node_manager._name_to_parent_flow_name[source.name] = blocked_flow.name
+            workflow = engine.current_workflow()
+            engine.object_manager.add_object_by_name_in(workflow, source.name, source)
+            workflow.nodes.name_to_parent_flow_name[source.name] = blocked_flow.name
             source.parameter_output_values[port] = "Native retained input without model execution"
             edge = dict(source_node_name=source.name, source_parameter_name=port, target_node_name=gen.name, target_parameter_name="prompt")
             send(engine, CreateConnectionRequest(**edge, initial_setup=True))

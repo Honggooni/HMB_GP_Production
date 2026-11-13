@@ -40,15 +40,16 @@ class ImageSink(asset.DataNode):
 
 
 def register(flow, node):
-    flow.add_node(node)
-    GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
-    GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = flow.name
+    from _hmb_fixture_sdk import register_fixture_node
+    register_fixture_node(GriptapeNodes, flow, node)
 
 
 async def main():
     GriptapeNodes.EventManager().initialize_queue()
     flow = ControlFlow(name="ImageAssetSelectionOfflineFlow", engine=current_engine())
-    GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
+
+    from _hmb_fixture_sdk import ensure_fixture_flow
+    flow = ensure_fixture_flow(GriptapeNodes, flow.name)
     source = asset.HMBImageAssetLibrary(name="ImageAssetSelectionOfflineSource")
     sink = ImageSink("ImageAssetSelectionOfflineSink")
     register(flow, source)
@@ -118,6 +119,7 @@ async def main():
         sink.state = NodeResolutionState.RESOLVED
         new = selected_state("new")
         new["catalog_root"] = old["catalog_root"]
+        new[asset.WIDGET_RUNTIME_LEASE_KEY] = source._hmb_widget_runtime_lease
         new[asset.UI_EDIT_REVISION_KEY] = old[asset.UI_EDIT_REVISION_KEY] + 1
         heartbeat = asyncio.Event()
         asyncio.get_running_loop().call_later(0.01, heartbeat.set)
@@ -196,6 +198,7 @@ async def main():
         await wait_until(force_entered.is_set)
         latest = selected_state("latest", "ProjectB")
         latest["catalog_root"] = old["catalog_root"]
+        latest[asset.WIDGET_RUNTIME_LEASE_KEY] = source._hmb_widget_runtime_lease
         latest[asset.UI_EDIT_REVISION_KEY] = new[asset.UI_EDIT_REVISION_KEY] + 1
         result = await GriptapeNodes.ahandle_request(SetParameterValueRequest(
             node_name=source.name, parameter_name=asset.WIDGET_STATE_PARAMETER,

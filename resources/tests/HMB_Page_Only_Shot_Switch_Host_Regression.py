@@ -214,8 +214,11 @@ async def prompt_views(engine):
     prompt = engine.node_manager.get_node_by_name("Real scoped Prompt")
     image = engine.node_manager.get_node_by_name("Real scoped Image")
     picker = engine.node_manager.get_node_by_name("Real scoped Picker")
-    owner_flow = engine.flow_manager.get_flow_by_name(
-        engine.node_manager._name_to_parent_flow_name[prompt.name])
+    if callable(getattr(engine, "current_workflow", None)):
+        flow_name = engine.current_workflow().nodes.name_to_parent_flow_name[prompt.name]
+    else:
+        flow_name = engine.node_manager._name_to_parent_flow_name[prompt.name]
+    owner_flow = engine.flow_manager.get_flow_by_name(flow_name)
     if not engine.context_manager.has_current_flow():
         engine.context_manager.push_flow(owner_flow)
     assert callable(getattr(prompt, "_hmb_prompt_shot_view", None)), "Presentation-only Prompt API is required"
@@ -369,7 +372,8 @@ def main():
         folder = private / leaf
         folder.mkdir(parents=True, exist_ok=True)
         os.environ[key] = str(folder)
-    standard = Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard"
+    standard = Path(os.environ.get("HMB_GRIPTAPE_STANDARD_LIBRARY_PATH",
+        Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard"))
     os.environ["HMB_GRIPTAPE_STANDARD_LIBRARY_PATH"] = str(standard)
     for key in tuple(os.environ):
         if any(token in key.upper() for token in ("API_KEY", "ACCESS_TOKEN", "SECRET", "PASSWORD")):

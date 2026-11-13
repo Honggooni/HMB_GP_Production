@@ -383,17 +383,32 @@ async def scenario(engine, modules, state, order, label, replacement=None):
         if label == "LifecycleOrder0":
             # A same-UUID source selection updates only its image ordering.
             # It does not switch Prompt to the ImageAsset's active Shot.
+            selected_prompt_uuid=prompt._current_state()["shot"]["shot_uuid"]
+            selected_shot=next(shot for shot in shots if shot["shot_uuid"]==selected_prompt_uuid)
+            send(engine,SetParameterValueRequest(node_name=agent.name,parameter_name=agents._AGENT_WIDGET_PARAMETER,
+                value=agent._hmb_widget_value(dict(selected_shot,channel_uuid=CHANNEL),catalog,shot_manager=True)))
+            await settle(lambda: bool(prompt._hmb_prompt_shot_view(channel_uuid=CHANNEL,shot_uuid=selected_prompt_uuid)))
+            before_prompt=prompt._hmb_prompt_shot_view(channel_uuid=CHANNEL,shot_uuid=selected_prompt_uuid)["visible_prompt"]
             source_state=source._current_state();route=deepcopy(source_state["shot_routing"])
-            route["shots"][4]["selected_source_uids"].reverse();route["shots"][4]["revision"]+=1;route["generation"]+=1
+            edited_shot=next(shot for shot in route["shots"] if shot["shot_uuid"]==selected_prompt_uuid)
+            edited_shot["selected_source_uids"].reverse();edited_shot["revision"]+=1;route["generation"]+=1
             edit=dict(schema=images.IMAGE_ASSET_EDIT_SCHEMA,version=1,scan_revision=source_state["scan_revision"],
                 ui_edit_revision=source_state[images.UI_EDIT_REVISION_KEY]+1,
+                widget_runtime_lease=source_state[images.WIDGET_RUNTIME_LEASE_KEY],
                 catalog_identity={key:source_state[key] for key in ("catalog_root","project_root","project_uid","project_cache_uid","manifest_signature","folder_signature","scan_revision")},
                 selected_source_uids=[row["source_uid"] for row in sorted(source_state["assets"],key=lambda row:row["selection_order"]) if row["selected"]],
                 edits={"shot_routing":route})
-            selected_prompt_uuid=prompt._current_state()["shot"]["shot_uuid"]
             send(engine,SetParameterValueRequest(node_name=source.name,parameter_name=images.WIDGET_STATE_PARAMETER,value=json.dumps(edit)))
             shots=source._hmb_shot_routing_snapshot(cached_only=True)["shots"]
-            await settle(lambda:prompt._current_state()["image_asset"]["shot_catalog_routing"]["generation"]>=route["generation"])
+            def selection_published():
+                rows=prompt._current_state()["images"]
+                view=prompt._hmb_prompt_shot_view(channel_uuid=CHANNEL,shot_uuid=selected_prompt_uuid)
+                visible=view.get("visible_prompt")
+                return ([row["asset_source_uid"] for row in rows if row.get("asset_source_uid")]
+                        == edited_shot["selected_source_uids"]
+                        and visible and visible != before_prompt
+                        and agent.get_parameter_value(agents._AGENT_SHOT_PROMPT_INPUT_PARAMETER)==visible)
+            await settle(selection_published)
             assert prompt._current_state()["shot"]["shot_uuid"]==selected_prompt_uuid
             await verify_documents()
             # Other Shots may rename or exchange their display number. This

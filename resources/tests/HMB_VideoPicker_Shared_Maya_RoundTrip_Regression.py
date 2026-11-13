@@ -188,12 +188,13 @@ for source in workspaces:
         assert reloaded["active_snapshot_uid"] == expected_snapshot_pointers[target]
         snapshot_transitions += 1
 
-# Two more complete rounds of .mb replacement, including all four outputs.
-# Navigate away after the command destination has been captured, then finish
-# into that captured UUID. No existing Shot media/snapshots may be displaced.
+# Two complete rounds of per-Shot .mb replacement, including all four outputs.
+# Author the scene on its owner, navigate away, then publish media to the
+# captured UUID. The visible Shot's scene and existing histories remain intact.
 late_completions = 0
 for round_number in (2, 3):
     for index, workspace in enumerate(workspaces, 1):
+        state = switch_through_widget(state, workspace)
         scene = f"C:/shared-maya-contract/round-{round_number}-scene-{index}.mb"
         actor = f"Round{round_number}Actor{index}"
         state.update({
@@ -214,6 +215,8 @@ for round_number in (2, 3):
         previous_media = {row["workspace_uuid"]: list(row["video_asset_uids"]) for row in state["picker_shots"]}
         browsed_workspace = workspaces[index % len(workspaces)]
         state = switch_through_widget(state, browsed_workspace)
+        browsed_maya = current_maya_fields(state)
+        assert browsed_maya["scene_path"] != captured_maya["scene_path"]
         added = []
         for role in ("original", "mask", "depth", "motion_guide"):
             uid = f"round-{round_number}-shot-{index}-{role}"
@@ -224,14 +227,15 @@ for round_number in (2, 3):
                 "label": uid, "generation_role": role,
             }, picker_shot_uuid=captured_destination)
             assert state["active_picker_shot_uuid"] == browsed_workspace
-            assert current_maya_fields(state) == captured_maya
+            assert current_maya_fields(state) == browsed_maya
             assert snapshot_semantics(state) == expected_snapshots
             expected_media = copy.deepcopy(previous_media)
             expected_media[captured_destination] += added
             assert {row["workspace_uuid"]: list(row["video_asset_uids"]) for row in state["picker_shots"]} == expected_media
             late_completions += 1
         state = picker._parse_state(json.dumps(state))
-        assert current_maya_fields(state) == captured_maya
+        assert current_maya_fields(state) == browsed_maya
+        assert current_maya_fields(switch_through_widget(state, captured_destination)) == captured_maya
 
 print(json.dumps({"result": "PASS", "maya_replacements": 15, "shot_transitions": transitions,
                   "shot_owned_results": 45, "late_output_completions": late_completions,

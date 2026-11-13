@@ -9,7 +9,7 @@ const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..');
 const source=fs.readFileSync(path.join(root,'widgets/HMBSeedanceGenerationWidget.js'),'utf8');
 const require=createRequire(import.meta.url);let playwright;
 try{playwright=require('playwright');}catch{playwright=require(path.join(os.homedir(),'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'));}
-const out=path.join(root,'reports/feature123-local804-20261016/preflight');fs.mkdirSync(out,{recursive:true});
+const out=process.env.HMB_PREFLIGHT_REPORT_DIR||path.join(root,'reports/feature123-local804-20261016/preflight');fs.mkdirSync(out,{recursive:true});
 const receipt={schema:'hmb-seedance-render-preflight-browser',source_sha256:crypto.createHash('sha256').update(source).digest('hex'),cases:[],external_requests:0,render_calls:0,upload_calls:0,agent_calls:0};
 const browser=await playwright.chromium.launch({headless:true,executablePath:process.env.HMB_WIDGET_TEST_BROWSER||'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'});
 try{
@@ -48,7 +48,10 @@ try{
  await page.locator('.hmb-preflight-backdrop').screenshot({path:path.join(out,'preflight-narrow-report.png')});
  receipt.cases.push('330 by 300 viewport contains the complete dialog and fixed close/recheck controls while only table contents scroll');
  await page.setViewportSize({width:1360,height:860});
- await page.locator('[data-preflight-recheck]').click();await page.waitForFunction(()=>calls.length===2);
+ await page.locator('[data-preflight-close]').click();
+ await page.locator('[data-preflight-open]').click();await page.waitForFunction(()=>calls.length===2);
+ assert.equal(await page.locator('[data-preflight-row]').count(),0);
+ receipt.cases.push('Reopening a completed diagnostic requests fresh counts before displaying any old rows');
  const second=await page.evaluate(()=>calls.at(-1).request_id);await page.evaluate(()=>handle.update({value:result(calls[0].request_id),onChange}));
  assert.equal(await page.locator('.hmb-preflight-busy').count(),1);
  await page.locator('[data-preflight-cancel]').click();await page.waitForFunction(()=>calls.length===3);

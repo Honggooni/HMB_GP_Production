@@ -34,6 +34,7 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 from _hmb_deletion_guard import hmb_binding_mutation
+from _hmb_project import project_display_name
 
 
 def _load_hmb_common():
@@ -126,6 +127,7 @@ IMAGE_BASH_WORKSPACE_EDIT_SCHEMA = "hmb-image-bash-workspace-mutation-v1"
 IMAGE_BASH_WORKSPACE_EDIT_KEY = "image_bash_workspace_edit"
 MAX_IMAGE_BASH_MUTATION_RECEIPTS = 128
 MAX_IMAGE_BASH_AUTHORITY_VIEW_BYTES = 512 * 1024
+_WIDGET_AUTHORITY_ERRORS = {"state_changed", "view_too_large", "unavailable"}
 OUTPUT_DISPLAY_NAME = "ASSET_OUT"
 MEDIA_OUTPUT_DISPLAY_NAME = "Video Generation Out"
 STATE_SCHEMA = "hmb-image-asset-library-state"
@@ -242,6 +244,7 @@ _ASSET_MANIFEST_CACHE_LIMIT = 32
 _ASSET_RESOLUTION_CACHE_LIMIT = 256
 _ASSET_THUMBNAIL_LOCK = threading.Lock()
 _ASSET_THUMBNAIL_URLS: "OrderedDict[str, str]" = OrderedDict()
+_ASSET_THUMBNAIL_FLIGHTS: Dict[str, tuple[threading.Lock, int]] = {}
 try:
     _ASSET_THUMBNAIL_CACHE_MAX_ENTRIES = max(
         64,
@@ -466,14 +469,26 @@ def _normalize_thumbnail_bridge(value: Any) -> Dict[str, Any]:
     if operation == "widget_authority" and phase in {"request", "result"}:
         bridge.update(operation=operation, phase=phase,
             request_id=_clean(raw.get("request_id"))[:128])
+        if phase == "request" and raw.get("include_view") is True:
+            bridge["include_view"] = True
         if phase == "result":
+            bridge["canonical_node_name"] = _clean(raw.get("canonical_node_name"))[:512]
+            request_runtime = _uuid_text(raw.get("request_runtime_instance_id"))
+            if request_runtime:
+                bridge["request_runtime_instance_id"] = request_runtime
+            error = _clean(raw.get("authority_error"))
+            if error in _WIDGET_AUTHORITY_ERRORS:
+                bridge["authority_error"] = error
+                return bridge
             scope = raw.get("canonical_scope")
             if isinstance(scope, dict) and scope.get("schema") == "hmb-image-bash-widget-authority-v1":
                 wire = _json_text(scope)
                 if len(wire.encode("utf-8")) <= 65536:
                     bridge["canonical_scope"] = copy.deepcopy(scope)
                     bridge["canonical_scope_sha256"] = hashlib.sha256(wire.encode("utf-8")).hexdigest()
-                    bridge["canonical_node_name"] = _clean(raw.get("canonical_node_name"))[:512]
+                    view = raw.get("canonical_view")
+                    if isinstance(view, str) and len(view.encode("utf-8")) <= MAX_IMAGE_BASH_AUTHORITY_VIEW_BYTES:
+                        bridge["canonical_view"] = view
         return bridge
     if operation in {"cgt_catalog", "cgt_confirm", "cgt_cancel"} and phase in {"request", "result"}:
         bridge.update(operation=operation, phase=phase)
@@ -484,6 +499,8 @@ def _normalize_thumbnail_bridge(value: Any) -> Dict[str, Any]:
             command = raw.get("hierarchy_request")
             if isinstance(command, dict) and len(_json_text(command)) <= 32768:
                 bridge["hierarchy_request"] = command
+            if raw.get("bind_only") is True:
+                bridge["bind_only"] = True
         if phase == "result":
             bridge["outcome"] = _clean(raw.get("outcome"))[:40]
             bridge["state"] = raw.get("state") if isinstance(raw.get("state"), dict) else {}
@@ -848,7 +865,7 @@ def _discover_project_catalog(projects_root: Any) -> Dict[str, Any]:
         {
             "project_id": _project_id(path),
             "project_uid": _project_uid(path),
-            "name": _project_id(path),
+            "name": project_display_name(_project_id(path)),
             "path": str(path).replace("\\", "/"),
         }
         for path in project_paths
@@ -1231,10 +1248,13 @@ def _write_persistent_thumbnail_cache(
             if prune:
                 _prune_persistent_thumbnail_cache(cache_root)
             else:
-                _ASSET_THUMBNAIL_CACHE_PRUNE_PENDING = True
+                with _ASSET_THUMBNAIL_LOCK:
+                    _ASSET_THUMBNAIL_CACHE_PRUNE_PENDING = True
     except Exception as exc:
-        if not _ASSET_THUMBNAIL_CACHE_WARNING_EMITTED:
+        with _ASSET_THUMBNAIL_LOCK:
+            warn = not _ASSET_THUMBNAIL_CACHE_WARNING_EMITTED
             _ASSET_THUMBNAIL_CACHE_WARNING_EMITTED = True
+        if warn:
             _diagnostic_warning("Persistent thumbnail cache write failed", exc)
 
 
@@ -1291,24 +1311,52 @@ def _flush_persistent_thumbnail_cache_prune() -> None:
             return
         _ASSET_THUMBNAIL_CACHE_PRUNE_PENDING = False
         cache_root = Path(_ASSET_THUMBNAIL_CACHE_ROOT)
-        try:
-            with _thumbnail_cache_process_lock(cache_root):
-                _prune_persistent_thumbnail_cache(cache_root)
-        except Exception as exc:
+    try:
+        with _thumbnail_cache_process_lock(cache_root):
+            _prune_persistent_thumbnail_cache(cache_root)
+    except Exception as exc:
+        with _ASSET_THUMBNAIL_LOCK:
             # Cache maintenance is fail-open; the next batch can retry it.
             _ASSET_THUMBNAIL_CACHE_PRUNE_PENDING = True
-            _diagnostic_warning("Thumbnail cache prune deferred", exc)
+        _diagnostic_warning("Thumbnail cache prune deferred", exc)
+
+
+@contextmanager
+def _thumbnail_signature_flight(signature: str):
+    """Coalesce one media signature without blocking unrelated image decoders."""
+
+    with _ASSET_THUMBNAIL_LOCK:
+        lock, users = _ASSET_THUMBNAIL_FLIGHTS.get(signature, (threading.Lock(), 0))
+        _ASSET_THUMBNAIL_FLIGHTS[signature] = (lock, users + 1)
+    try:
+        with lock:
+            yield
+    finally:
+        with _ASSET_THUMBNAIL_LOCK:
+            _lock, users = _ASSET_THUMBNAIL_FLIGHTS[signature]
+            if users == 1:
+                del _ASSET_THUMBNAIL_FLIGHTS[signature]
+            else:
+                _ASSET_THUMBNAIL_FLIGHTS[signature] = (lock, users - 1)
 
 
 def _asset_thumbnail_url(
     path: Path,
     asset_library_id: str,
     media_signature: Any = "",
+    *,
+    verified_file_facts: tuple[Path, int, int, str] | None = None,
 ) -> str:
     """Hydrate one browser thumbnail through a bounded persistent local cache."""
 
     try:
-        resolved, _size, _mtime_ns, path_signature = _asset_file_facts(path)
+        # Only the current hydration request supplies these facts, immediately
+        # after exact project/path validation. Its post-decode content check is
+        # still required; this does not make cached metadata source authority.
+        facts = verified_file_facts
+        if not facts or facts[0] != path or facts[3] != _clean(media_signature):
+            facts = _asset_file_facts(path)
+        resolved, _size, _mtime_ns, path_signature = facts
         signature = _clean(media_signature) or path_signature
     except Exception:
         return ""
@@ -1318,6 +1366,13 @@ def _asset_thumbnail_url(
         if cached_url:
             _ASSET_THUMBNAIL_URLS.move_to_end(signature)
             return cached_url
+    with _thumbnail_signature_flight(signature):
+        # Another owner may have completed this signature while we waited.
+        with _ASSET_THUMBNAIL_LOCK:
+            cached_url = _ASSET_THUMBNAIL_URLS.get(signature)
+            if cached_url:
+                _ASSET_THUMBNAIL_URLS.move_to_end(signature)
+                return cached_url
         cached = _read_persistent_thumbnail_cache(signature)
         if cached is None:
             try:
@@ -1326,13 +1381,15 @@ def _asset_thumbnail_url(
                 )
             except Exception:
                 return ""
+            with _ASSET_THUMBNAIL_LOCK:
+                prune = _ASSET_THUMBNAIL_CACHE_DEFER_COUNT <= 0
             _write_persistent_thumbnail_cache(
                 signature,
                 payload,
                 extension,
                 width,
                 height,
-                prune=_ASSET_THUMBNAIL_CACHE_DEFER_COUNT <= 0,
+                prune=prune,
             )
         else:
             payload, extension, _width, _height = cached
@@ -1346,15 +1403,16 @@ def _asset_thumbnail_url(
         except Exception:
             return ""
         if url:
-            while (
-                len(_ASSET_THUMBNAIL_URLS)
-                >= _ASSET_THUMBNAIL_CACHE_MAX_ENTRIES
-            ):
-                try:
-                    _ASSET_THUMBNAIL_URLS.popitem(last=False)
-                except KeyError:
-                    break
-            _ASSET_THUMBNAIL_URLS[signature] = url
+            with _ASSET_THUMBNAIL_LOCK:
+                while (
+                    len(_ASSET_THUMBNAIL_URLS)
+                    >= _ASSET_THUMBNAIL_CACHE_MAX_ENTRIES
+                ):
+                    try:
+                        _ASSET_THUMBNAIL_URLS.popitem(last=False)
+                    except KeyError:
+                        break
+                _ASSET_THUMBNAIL_URLS[signature] = url
         return url
 
 
@@ -1362,10 +1420,19 @@ def _asset_thumbnail_url_for_media(
     path: Path,
     asset_library_id: str,
     media_signature: str,
+    *,
+    verified_file_facts: tuple[Path, int, int, str] | None = None,
 ) -> str:
     """Keep legacy two-argument test/host overrides source-compatible."""
 
     try:
+        if verified_file_facts is not None:
+            try:
+                return _asset_thumbnail_url(path, asset_library_id, media_signature,
+                                            verified_file_facts=verified_file_facts)
+            except TypeError:
+                # Existing host overrides may accept only two/three arguments.
+                pass
         return _asset_thumbnail_url(path, asset_library_id, media_signature)
     except TypeError as exc:
         try:
@@ -3371,7 +3438,7 @@ def _normalize_project_catalog(value: Any) -> List[Dict[str, str]]:
             {
                 "project_id": project_id,
                 "project_uid": project_uid,
-                "name": name,
+                "name": project_display_name(project_id, name),
                 "path": path,
             }
         )
@@ -3972,6 +4039,7 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
             "projects": projects,
             "project_root": project_root,
             "project_id": project_id,
+            "project_display_name": project_display_name(project_id),
             "project_uid": project_uid,
             "project_cache_uid": project_cache_uid,
             "manifest_signature": _clean(source.get("manifest_signature"))[:128],
@@ -5091,6 +5159,11 @@ def _select_catalog_project(
     }
     merged = _adopt_shared_catalog_snapshot(catalog, selected, normalized)
     if merged is None:
+        # Reopening the application loses the process snapshot, but not the
+        # local index. This read independently verifies the actual project UID,
+        # manifest, folder fingerprint and all contained row paths before use.
+        merged = _read_catalog_index(selected["path"], normalized)
+    if merged is None:
         merged = _merge_scan_with_state(
             _scan_project_assets(selected["path"]),
             normalized,
@@ -5367,6 +5440,7 @@ def _resolve_project_asset_file(
     expected_library_id: Any = "",
     *,
     allow_user_import_path: bool = True,
+    verified_file_facts: Dict[str, tuple[Path, int, int, str]] | None = None,
 ) -> tuple[Path, str, str]:
     """Resolve one exact image row without walking the surrounding project."""
 
@@ -5403,11 +5477,14 @@ def _resolve_project_asset_file(
     expected_id = _clean(expected_library_id)
     if expected_id and library_id != expected_id:
         raise ValueError("The image identity changed while the operation was pending.")
-    _resolved, _size, _mtime_ns, media_signature = _asset_file_facts(
+    facts = _asset_file_facts(
         resolved,
         project_uid=_project_cache_uid(resolved_root),
         relative_path=canonical_relative,
     )
+    if verified_file_facts is not None:
+        verified_file_facts[library_id] = facts
+    _resolved, _size, _mtime_ns, media_signature = facts
     return resolved, canonical_relative, media_signature
 
 
@@ -5892,6 +5969,9 @@ def _hydrate_asset_thumbnails(
 
     if context_matches:
         project_root = Path(project_root_text)
+        # Lifetime is one bounded request; never reuse these facts across
+        # edits, catalog revisions or source selection/generation requests.
+        verified_file_facts: Dict[str, tuple[Path, int, int, str]] = {}
         global _ASSET_THUMBNAIL_CACHE_DEFER_COUNT
         with _ASSET_THUMBNAIL_LOCK:
             _ASSET_THUMBNAIL_CACHE_DEFER_COUNT += 1
@@ -5915,6 +5995,7 @@ def _hydrate_asset_thumbnails(
                         asset.get("relative_path"),
                         library_id,
                         allow_user_import_path=True,
+                        verified_file_facts=verified_file_facts,
                     )
                     expected_signature = _clean(asset.get("media_signature"))
                     if expected_signature and media_signature != expected_signature:
@@ -5924,6 +6005,7 @@ def _hydrate_asset_thumbnails(
                         path,
                         library_id,
                         media_signature,
+                        verified_file_facts=verified_file_facts.get(library_id),
                     )
                     if not thumbnail_url:
                         failed.append(library_id)
@@ -9038,7 +9120,7 @@ class HMBImageAssetLibrary(DataNode):
             return raw
         if raw.get("operation") == "widget_authority":
             allowed = {"schema", "version", "operation", "phase", "request_id",
-                "runtime_instance_id", WIDGET_RUNTIME_LEASE_KEY, "catalog_page_version"}
+                "runtime_instance_id", WIDGET_RUNTIME_LEASE_KEY, "catalog_page_version", "include_view"}
             if (set(raw) - allowed or raw.get("schema") != THUMBNAIL_BRIDGE_SCHEMA
                     or type(raw.get("version")) is not int or raw["version"] != THUMBNAIL_BRIDGE_VERSION
                     or raw.get("phase") != "request" or not _clean(raw.get("request_id"))
@@ -9357,6 +9439,41 @@ class HMBImageAssetLibrary(DataNode):
         previous_identity = _clean(
             getattr(self, "_hmb_shot_routing_identity", "")
         )
+        # A saved output token is the durable identity of the last published
+        # catalog. After a cold reopen the private in-memory identity is empty;
+        # changing project or Shot before the first rich snapshot would
+        # otherwise reuse the saved generation for different content. Picker
+        # correctly rejects that same-generation hash conflict and never
+        # reconstructs its transient validated catalog. Compare the current
+        # source-owned content with the saved token before allocating the first
+        # generation. This does not accept a recipient's stale catalog or
+        # weaken its generation/hash check.
+        if not previous_identity and configured_generation:
+            output_values = getattr(self, "parameter_output_values", None)
+            saved_token = _parse_mapping(
+                output_values.get(SHOT_ASSET_OUTPUT_PARAMETER)
+                if isinstance(output_values, dict) else None
+            )
+            if (saved_token.get("schema") == "hmb-shot-asset-dependency"
+                    and saved_token.get("publisher_instance_uuid") == routing["publisher_instance_uuid"]
+                    and saved_token.get("channel_uuid") == routing["channel_uuid"]):
+                token_generation = _non_negative_int(saved_token.get("generation"))
+                current_at_token_generation = _sha256_canonical({
+                    "channel_uuid": routing["channel_uuid"],
+                    "generation": max(1, token_generation),
+                    "project_id": _clean(normalized_state.get("project_id")),
+                    "shots": probe["shots"],
+                    "ordered_assets": probe["ordered_assets"],
+                })
+                if token_generation >= configured_generation:
+                    if token_generation >= 9007199254740991:
+                        raise ValueError("ImageAsset Shot generation exceeds the safe publication range.")
+                    # The output token can be newer than the property state
+                    # when a prior publication was saved mid-sync. Never
+                    # replay below its source-owned cursor.
+                    configured_generation = token_generation
+                    if current_at_token_generation != saved_token.get("metadata_sha256"):
+                        configured_generation += 1
         if previous_identity and identity != previous_identity:
             generation = max(1, configured_generation, previous_generation + 1)
         else:
@@ -10736,7 +10853,12 @@ class HMBImageAssetLibrary(DataNode):
                 if occupied or any(edge.target_node_name in names and (edge.source_parameter_name, edge.target_parameter_name) in ports
                                    for edge in outgoing):
                     raise ValueError("이 Image Bash 작업 공간은 다른 노드에 연결되어 있습니다. 먼저 연결을 해제하세요.")
-            old_values = {name: copy.deepcopy(target.get_parameter_value(name)) for _, name in ports}
+            # The SDK's public list getter merges the connected payload with local
+            # rows. Snapshot the payload and rows independently for rollback.
+            old_values = {
+                "input_images": copy.deepcopy(target.parameter_values.get("input_images", [])),
+                "image_bash_context": copy.deepcopy(target.get_parameter_value("image_bash_context")),
+            }
             input_list = target.get_parameter_by_name("input_images")
             old_children = {child.name: child for child in input_list.get_child_parameters()}
             old_child_values = {name: copy.deepcopy(target.get_parameter_value(name)) for name in old_children}
@@ -11449,6 +11571,7 @@ class HMBImageAssetLibrary(DataNode):
         state["image_bash_workspace_request"] = {}
         normalized_state = state if normalized else _normalize_state(state)
         normalized = normalized_state
+        normalized["project_display_name"] = project_display_name(normalized.get("project_id"))
         pending_only = preserve_outputs or bool(
             normalized.get("scan_busy") or normalized.get("thumbnail_busy")
         )
@@ -13606,25 +13729,64 @@ class HMBImageAssetLibrary(DataNode):
             self._hmb_cgt_pending = None
             self._hmb_cgt_ready = None
             self._hmb_cgt_thread = None
+            self._hmb_cgt_session = None
+            self._hmb_cgt_cancel = threading.Event()
         with self._hmb_cgt_lock:
-            self._hmb_cgt_generation += 1
-            generation = self._hmb_cgt_generation
             if request["operation"] == "cgt_cancel":
+                if request["session_id"] != self._hmb_cgt_session:
+                    return
+                self._hmb_cgt_cancel.set()
+                self._hmb_cgt_generation += 1
+                self._hmb_cgt_session = None
                 self._hmb_cgt_pending = None
                 self._hmb_cgt_ready = None
                 return
             command = request.get("hierarchy_request")
             if request["operation"] == "cgt_confirm":
-                if bool(getattr(self, "lock", False)) or str(getattr(self, "state", "")).casefold() == "resolving":
+                try:
+                    if bool(getattr(self, "lock", False)) or str(getattr(self, "state", "")).casefold() == "resolving":
+                        raise ValueError("Griptape 편집 잠금")
+                    if request.get("bind_only"):
+                        basket = (getattr(self, "metadata", {}) or {}).get("hmb_shot_basket_v1")
+                        if (not isinstance(basket, dict) or basket.get("kind") != "image"
+                                or basket.get("cgt_required") is not True
+                                or basket.get("project_id") != current.get("project_id")):
+                            raise ValueError("현재 로동마트 프로젝트에서 CGT 샷을 선택하세요.")
+                    # A media/status refresh is not an edit of the Shot forest.
+                    command = _hmb_shot_routing.rebase_shot_hierarchy_edit(current, command)
+                    _hmb_shot_routing.apply_shot_hierarchy_edit(current, command)
+                    scope_id = ((command.get("binding") or {}).get("cgt_scope") or {}).get("project_id")
+                    if (request.get("cgt_project_id") and scope_id
+                            and request["cgt_project_id"].lower() != scope_id.lower()):
+                        raise ValueError("확정할 CGT 프로젝트가 선택한 샷 범위와 다릅니다.")
+                    request = dict(request, hierarchy_request=command,
+                                   cgt_project_id=scope_id or request.get("cgt_project_id", ""))
+                except (ValueError, TypeError, KeyError):
+                    # The editor must receive a terminal response, not a native
+                    # SetParameterValue failure followed by a 30-second wait.
+                    self._hmb_cgt_cancel.set()
+                    self._hmb_cgt_generation += 1
+                    self._hmb_cgt_pending = None
+                    self._hmb_cgt_ready = None
+                    response = {key: request[key] for key in ("schema", "version", "runtime_instance_id",
+                        "session_id", "request_id", "project_identity", "operation")}
+                    response.update(phase="result", outcome="rejected",
+                                    state={"status": "SOURCE_CHANGED", "tasks": [], "projects": []})
+                    self._set_thumbnail_bridge_value(response)
                     return
-                # Validate the complete transaction before any network request.
-                _hmb_shot_routing.apply_shot_hierarchy_edit(current, command)
-                scope_id = ((command.get("binding") or {}).get("cgt_scope") or {}).get("project_id")
-                if (request.get("cgt_project_id") and scope_id
-                        and request["cgt_project_id"].lower() != scope_id.lower()):
-                    raise ValueError("확정할 CGT 프로젝트가 선택한 샷 범위와 다릅니다.")
-                request = dict(request, cgt_project_id=scope_id or request.get("cgt_project_id", ""))
-            self._hmb_cgt_pending = (generation, copy.deepcopy(request), _clean(current.get("project_id")))
+            self._hmb_cgt_cancel.set()
+            self._hmb_cgt_cancel = threading.Event()
+            self._hmb_cgt_generation += 1
+            self._hmb_cgt_session = request["session_id"]
+            request = dict(request, _deadline=time.monotonic() + 27)
+            if request["operation"] == "cgt_catalog" and not request.get("cgt_project_id"):
+                try:
+                    from _hmb_shot_basket import prepared_cgt_reader
+                    request["_prepared_reader"] = prepared_cgt_reader(self.engine, _clean(current.get("project_id")))
+                except (AttributeError, RuntimeError):
+                    pass
+            self._hmb_cgt_pending = (self._hmb_cgt_generation, copy.deepcopy(request),
+                                     _clean(current.get("project_id")), self._hmb_cgt_cancel)
             if self._hmb_cgt_thread is not None:
                 return
             host_context = contextvars.copy_context()
@@ -13654,12 +13816,14 @@ class HMBImageAssetLibrary(DataNode):
                         if job is None:
                             owner._hmb_cgt_thread = None
                             return
-                    serial, intent, project_id = job
+                    serial, intent, project_id, cancel = job
                     command = intent.get("hierarchy_request") or {}
                     binding = command.get("binding") if intent["operation"] == "cgt_confirm" else None
                     try:
-                        result = _hmb_cgt.catalog(project_id, binding=binding,
-                            cgt_project_id=intent.get("cgt_project_id") or None)
+                        prepared_reader = intent.get("_prepared_reader")
+                        result = (prepared_reader(cancel) if callable(prepared_reader) and binding is None
+                            else _hmb_cgt.catalog(project_id, binding=binding,
+                                cgt_project_id=intent.get("cgt_project_id") or None, cancel=cancel))
                     except Exception:
                         result = {"status": "SDK_UNAVAILABLE", "tasks": [], "projects": []}
                     with owner._hmb_cgt_lock:
@@ -13687,11 +13851,13 @@ class HMBImageAssetLibrary(DataNode):
                 or request["project_identity"] != _hmb_shot_routing.hierarchy_project_key(current)
                 or project_id != _clean(current.get("project_id"))):
             result = {"status": "SOURCE_CHANGED", "tasks": [], "projects": []}
+        elif time.monotonic() >= request["_deadline"]:
+            result = {"status": "TIMEOUT", "tasks": [], "projects": []}
         outcome = "ready" if result.get("status") == "ready" else "rejected"
         if request["operation"] == "cgt_confirm" and outcome == "ready":
             try:
                 import _hmb_cgt
-                command = request["hierarchy_request"]
+                command = _hmb_shot_routing.rebase_shot_hierarchy_edit(current, request["hierarchy_request"])
                 if bool(getattr(self, "lock", False)) or str(getattr(self, "state", "")).casefold() == "resolving":
                     raise ValueError("Griptape 편집 잠금")
                 _hmb_cgt.verify_binding(command["binding"], project_id, result)
@@ -13705,7 +13871,8 @@ class HMBImageAssetLibrary(DataNode):
                     raise
                 outcome = "committed"
                 try:
-                    self._queue_cgt_work_start(request, current, prepared)
+                    if not request.get("bind_only"):
+                        self._queue_cgt_work_start(request, current, prepared)
                 except Exception:
                     # The accepted Shot commit is not rolled back because its
                     # optional CGT start notification could not be queued.
@@ -13718,16 +13885,32 @@ class HMBImageAssetLibrary(DataNode):
                         _LOGGER.warning("CGT start notice could not be published; the accepted Shot commit is retained.")
                 # The live list belongs to this dialog, not to persistent native
                 # media/Prompt/Agent state. Save only the confirmed binding.
+                # SDK 0.104's property lifecycle event updates retained storage,
+                # but Editor 0.130 does not deliver that event as a widget value.
+                # Publish the bounded canonical view before acknowledging the
+                # commit, without writing a presentation page into saved state.
+                try:
+                    self._publish_widget_authority_view(self._current_state())
+                except Exception:
+                    _LOGGER.exception("CGT Shot commit was saved but its widget view could not be published.")
                 result = {"status": "committed"}
             except Exception:
                 outcome = "rejected"
                 result = {"status": "SOURCE_CHANGED", "tasks": [], "projects": []}
         response = {key: request[key] for key in ("schema", "version", "runtime_instance_id", "session_id", "request_id", "project_identity", "operation")}
         response["cgt_project_id"] = request.get("cgt_project_id", "")
+        if outcome == "ready":
+            # CGT's project code is authoritative for display. Keep the
+            # original entity, GUID, name and database for matching and commits.
+            def display_row(row):
+                return {**row, "display_name": project_display_name(row.get("entity") or row.get("name"))}
+            result = {**result, "projects": [display_row(row) for row in result.get("projects", [])]}
+            if isinstance(result.get("project"), dict):
+                result["project"] = display_row(result["project"])
         response.update(phase="result", outcome=outcome, state=result)
         self._set_thumbnail_bridge_value(response)
 
-    def _publish_widget_authority_view(self, state: Dict[str, Any]) -> None:
+    def _publish_widget_authority_view(self, state: Dict[str, Any]) -> str:
         """Public view event only; never write a property/output storage slot."""
         from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
         from griptape_nodes.retained_mode.events.execution_events import ParameterValueUpdateEvent
@@ -13737,33 +13920,62 @@ class HMBImageAssetLibrary(DataNode):
         dto = self._catalog_page_projection(state)
         wire = _json_text(dto)
         if len(wire.encode("utf-8")) > MAX_IMAGE_BASH_AUTHORITY_VIEW_BYTES:
-            raise ValueError("이미지 라이브러리 화면 데이터가 큽니다. 현재 작업을 저장하고 새 화면에서 다시 확인하세요.")
+            return ""
         payload = ParameterValueUpdateEvent(node_name=self.name, parameter_name=WIDGET_STATE_PARAMETER,
             data_type=parameter.type, value=wire)
-        self.engine.event_manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload)))
+        scoped_event = getattr(self, "execution_event", None)
+        event = (scoped_event(payload) if callable(scoped_event)
+                 else ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload)))
+        self.engine.event_manager.put_event(event)
+        return wire
+
+    def _reply_to_widget_authority(self, request: Dict[str, Any]) -> None:
+        # The editor's retained setter callback returns void. Report safe
+        # failures over the same scoped carrier instead of making them look
+        # like a dropped response. A retired node cannot acknowledge anything.
+        if not self._scan_owner_is_current():
+            return
+        scope = None
+        error = ""
+        view = ""
+        runtime_id = _uuid_text(request.get("runtime_instance_id"))
+        try:
+            current = _parse_mapping(getattr(self, "_hmb_last_accepted_widget_state", ""))
+            scope = _image_bash_widget_authority_scope(current)
+            live_scope = _image_bash_widget_authority_scope(self._current_state())
+            runtime_id = live_scope["publisher_instance_uuid"]
+            if (current.get("schema") != STATE_SCHEMA
+                    or scope != live_scope):
+                error = "state_changed"
+            elif len(_json_text(scope).encode("utf-8")) > 65536 or not (view := self._publish_widget_authority_view(current)):
+                error = "view_too_large"
+            elif (_image_bash_widget_authority_scope(_parse_mapping(self._hmb_last_accepted_widget_state)) != scope
+                    or _image_bash_widget_authority_scope(self._current_state()) != scope):
+                error = "state_changed"
+        except Exception:
+            error = "unavailable"
+        if not self._scan_owner_is_current():
+            return
+        response = {
+            "schema": THUMBNAIL_BRIDGE_SCHEMA, "version": THUMBNAIL_BRIDGE_VERSION,
+            "operation": "widget_authority", "phase": "result", "request_id": request["request_id"],
+            "runtime_instance_id": runtime_id,
+            "request_runtime_instance_id": request.get("runtime_instance_id", ""),
+            WIDGET_RUNTIME_LEASE_KEY: self._hmb_widget_runtime_lease,
+            "canonical_node_name": self.name,
+        }
+        if error:
+            response["authority_error"] = error
+        else:
+            response["canonical_scope"] = scope
+            if request.get("include_view") is True:
+                response["canonical_view"] = view
+        self._set_thumbnail_bridge_value(response)
 
     def _apply_thumbnail_bridge_request(self, value: Any) -> None:
         early = self._admit_thumbnail_bridge(value)
         if early.get("operation") == "widget_authority" and early.get("phase") == "request":
-            current = _parse_mapping(getattr(self, "_hmb_last_accepted_widget_state", ""))
-            if (current.get("schema") != STATE_SCHEMA
-                    or _image_bash_widget_authority_scope(current) != _image_bash_widget_authority_scope(self._current_state())):
-                raise ValueError("이미지 라이브러리 변경을 적용 중입니다. 현재 화면을 다시 확인하세요.")
-            scope = _image_bash_widget_authority_scope(current)
-            if len(_json_text(scope).encode("utf-8")) > 65536:
-                raise ValueError("이미지 라이브러리 작업 범위가 큽니다. 현재 입력과 프로젝트 경로를 확인하세요.")
-            self._publish_widget_authority_view(current)
-            if (not self._scan_owner_is_current()
-                    or _image_bash_widget_authority_scope(_parse_mapping(self._hmb_last_accepted_widget_state)) != scope
-                    or _image_bash_widget_authority_scope(self._current_state()) != scope):
-                raise ValueError("이미지 라이브러리 상태가 갱신되었습니다. 현재 화면에서 다시 확인하세요.")
-            self._set_thumbnail_bridge_value({
-                "schema": THUMBNAIL_BRIDGE_SCHEMA, "version": THUMBNAIL_BRIDGE_VERSION,
-                "operation": "widget_authority", "phase": "result",
-                "request_id": early["request_id"],
-                "runtime_instance_id": self._thumbnail_runtime_id(current),
-                WIDGET_RUNTIME_LEASE_KEY: self._hmb_widget_runtime_lease,
-                "canonical_node_name": self.name, "canonical_scope": scope})
+            self._reply_to_widget_authority(early)
             return
         self._consume_cgt_work_results()
         if early.get("operation") == "cgt_cancel" and early.get("phase") == "request":

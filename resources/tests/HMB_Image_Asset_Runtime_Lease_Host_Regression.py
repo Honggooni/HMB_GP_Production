@@ -233,15 +233,67 @@ async def exercise(engine):
 
                 setattr(node,method,lambda:(_ for _ in ()).throw(AssertionError('Authority must not consume')))
 
-            send(SetParameterValueRequest(node_name=node.name,parameter_name=product.THUMBNAIL_PATCH_PARAMETER,value=req))
+            with mock.patch.object(engine.event_manager, "put_event", wraps=engine.event_manager.put_event) as publish:
+                setter_result=send(SetParameterValueRequest(node_name=node.name,parameter_name=product.THUMBNAIL_PATCH_PARAMETER,value=req))
 
             result=node.get_parameter_value(product.THUMBNAIL_PATCH_PARAMETER)
 
             assert result['phase']=='result' and result['request_id']=='authority-1' and result['widget_runtime_lease']==lease
+            assert setter_result.finalized_value == result
+            views=[call.args[0].wrapped_event for call in publish.call_args_list
+                   if getattr(getattr(getattr(call.args[0], "wrapped_event", None), "payload", None), "parameter_name", None)
+                   == product.WIDGET_STATE_PARAMETER]
+            assert any(view.workflow_id == node._event_workflow_id() and view.workflow_id for view in views)
+            recovery = send(SetParameterValueRequest(node_name=node.name,
+                parameter_name=product.THUMBNAIL_PATCH_PARAMETER,
+                value=dict(req, request_id="authority-recovery", include_view=True))).finalized_value
+            assert recovery["request_id"] == "authority-recovery"
+            view = json.loads(recovery["canonical_view"])
+            assert product._image_bash_widget_authority_scope(view) == recovery["canonical_scope"]
 
             assert current(node)['image_bash_workspace']==live3['image_bash_workspace']
 
             cases.append('readonly_authority_no_consumes_or_semantic_edit')
+
+            def check_authority_failure(request_id, error):
+                runtime = before["shot_routing"]["publisher_instance_uuid"]
+                send(SetParameterValueRequest(
+                    node_name=node.name, parameter_name=product.THUMBNAIL_PATCH_PARAMETER,
+                    value=dict(req, request_id=request_id, runtime_instance_id=runtime),
+                ))
+                response = node.get_parameter_value(product.THUMBNAIL_PATCH_PARAMETER)
+                assert response["authority_error"] == error
+                assert response["request_id"] == request_id
+                assert response["request_runtime_instance_id"] == runtime
+                assert response["canonical_node_name"] == node.name
+                assert "canonical_scope" not in response
+
+            accepted = current(node)
+            with mock.patch.object(node, "_current_state", return_value=dict(
+                accepted, scan_revision=accepted["scan_revision"] + 1
+            )):
+                check_authority_failure("authority-scope-changing", "state_changed")
+            with mock.patch.object(node, "_catalog_page_projection", return_value={
+                "synthetic": "x" * product.MAX_IMAGE_BASH_AUTHORITY_VIEW_BYTES
+            }):
+                check_authority_failure("authority-oversized-view", "view_too_large")
+            with mock.patch.object(node, "_catalog_page_projection", side_effect=RuntimeError("private fixture failure")):
+                check_authority_failure("authority-view-unavailable", "unavailable")
+                assert "private fixture failure" not in json.dumps(node.get_parameter_value(product.THUMBNAIL_PATCH_PARAMETER))
+            assert current(node) == accepted
+            cases.append("readonly_authority_safe_scoped_failure_ack")
+
+            node.lock = True
+            try:
+                result = send(SetParameterValueRequest(
+                    node_name=node.name, parameter_name=product.THUMBNAIL_PATCH_PARAMETER,
+                    value=dict(req, request_id="authority-locked"),
+                ), False)
+                assert "locked" in str(result.result_details).lower()
+            finally:
+                node.lock = False
+            assert current(node) == accepted
+            cases.append("sdk_locked_authority_does_not_reach_product")
 
             for injected in ('state','edits','asset_library_ids'):
 

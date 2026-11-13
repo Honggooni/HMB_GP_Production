@@ -58,10 +58,12 @@ const state=w.hmbNormalizeImageAssetState(initial);
 w.hmbCreateImageBashWorkspace(state);assertShotsUntouched(state,'Creating Image Bash keeps all five shot records and selections');
 const workspaceId=state.image_bash_workspace.workspace_id;
 assert.match(workspaceId,/^[0-9a-f-]{36}$/i);checks++;
-for(const source of ['source-6','source-7','source-6'])w.hmbAddImageBashSource(state,source);
+for(const source of ['source-6','source-7'])assert.equal(w.hmbAddImageBashSource(state,source),true);
+assert.equal(w.hmbAddImageBashSource(state,'source-6'),false);
+assert.equal(w.hmbDuplicateImageBashInstance(state,state.image_bash_workspace.instances[0].instance_id),true);
 assertShotsUntouched(state,'Workspace sources do not join or deselect any shot');
 assert.equal(state.shot_routing.shots.length,5,'Image Bash is not a sixth shot');
-assert.deepEqual(state.image_bash_workspace.instances.map(row=>row.source_uid),['source-6','source-7','source-6']);
+assert.deepEqual(state.image_bash_workspace.instances.map(row=>row.source_uid),['source-6','source-6','source-7']);
 const instances=structuredClone(state.image_bash_workspace.instances),revision=state.image_bash_workspace.revision;
 assert.equal(new Set(instances.map(row=>row.instance_id)).size,3,'The same source can have independent stable occurrences');checks+=3;
 w.hmbReorderImageBashInstance(state,instances[2].instance_id,instances[0].instance_id);
@@ -116,15 +118,25 @@ assert.equal(pair.context.workspace_id,workspaceId);checks+=6;
 const require=createRequire(import.meta.url);
 const playwright=require(path.join(os.homedir(),'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'));
 const widgetSource=fs.readFileSync(new URL('widgets/HMBImageAssetLibraryWidget.js',root),'utf8');
+const bridgeSource=fs.readFileSync(new URL('widgets/HMBImageAssetThumbnailPatchBridgeWidget.js',root),'utf8');
 const html=`<!doctype html><meta charset="utf-8"><title>Offline Image Bash workspace product fixture</title>
-<style>body{margin:0;background:#101420;color:white}#widget{width:1100px;height:900px}</style><div id="widget"></div>
+<style>body{margin:0;background:#101420;color:white}#widget{width:1100px;height:900px}</style><article class="react-flow__node" data-id="Workspace Fixture"><div id="widget"></div><div id="bridge"></div></article>
 <script type="module">
-import mount,*as w from '/widget.js';window.w=w;window.initial=${JSON.stringify(initial)};window.host=null;
+import mount,*as w from '/widget.js';
+import mountBridge from '/bridge.js';
+window.w=w;window.initial=${JSON.stringify(initial)};window.host=null;
+const nodeName='Workspace Fixture', lease='12345678-0000-4000-8000-123456789012';
+const bridgeProps=value=>({value,nodeName,parameterName:'HMB_IMAGE_ASSET_THUMBNAIL_PATCH',onChange:request=>{
+ if(request.operation==='widget_authority')queueMicrotask(()=>window.bridgeHandle.update(bridgeProps({
+  ...request,phase:'result',widget_runtime_lease:lease,canonical_node_name:nodeName,
+  canonical_scope:w.hmbImageAssetAuthorityScope(window.host),catalog_page_version:1})));
+}});
 window.writes=[];window.createRequests=[];window.routingCatalogs=[];window.syncEcho=false;window.disabled=false;window.deferNext=false;window.pendingPublication=null;
 addEventListener('hmb-shot-routing-catalog-v1',event=>window.routingCatalogs.push(structuredClone(event.detail)));
 window.acceptRaw=raw=>{
  const edit=raw.edits||raw;
  const next={...window.host,...edit};
+ next.image_bash_workspace_edit={};
  const request=edit.image_bash_workspace_request;
  if(request?.schema){window.createRequests.push(structuredClone(request));next.image_bash_workspace_request={};}
  window.host=w.hmbNormalizeImageAssetState(next);window.host.ui_edit_revision=raw.ui_edit_revision;
@@ -132,23 +144,33 @@ window.acceptRaw=raw=>{
 };
 window.finishPublication=accepted=>{const pending=window.pendingPublication;if(!pending)return;window.pendingPublication=null;
  if(accepted){window.acceptRaw(pending.raw);pending.resolve();}else pending.reject(new Error('Synthetic Bash selection rejection'));};
-window.props=()=>({value:JSON.stringify(window.host),disabled:window.disabled,onChange:value=>{
+window.props=()=>({value:JSON.stringify(window.host),nodeName,parameterName:'HMB_IMAGE_ASSET_STATE',disabled:window.disabled,onChange:value=>{
  const raw=JSON.parse(value);if(raw.__hmb_manifest_poll_nonce)return;
  window.writes.push(structuredClone(raw));
  if(window.deferNext){window.deferNext=false;return new Promise((resolve,reject)=>{window.pendingPublication={raw,resolve,reject};});}
  window.acceptRaw(raw);
 }});
-window.openGraph=value=>{window.controller?.cleanup();window.host=w.hmbNormalizeImageAssetState(value);
- window.controller=mount(document.getElementById('widget'),window.props());};
+window.openGraph=value=>{window.controller?.cleanup();window.bridgeHandle?.cleanup();
+ window.host=w.hmbNormalizeImageAssetState({...value,widget_runtime_lease:lease});
+ window.controller=mount(document.getElementById('widget'),window.props());
+ window.bridgeHandle=mountBridge(document.getElementById('bridge'),bridgeProps({schema:'hmb-image-asset-thumbnail-bridge',version:1,
+  phase:'idle',runtime_instance_id:window.host.shot_routing.publisher_instance_uuid,widget_runtime_lease:lease,catalog_page_version:1}));};
 window.openGraph(window.initial);window.ready=true;
 </script>`;
-const server=http.createServer((request,response)=>{response.setHeader('Content-Type',request.url==='/widget.js'?'text/javascript; charset=utf-8':'text/html; charset=utf-8');response.end(request.url==='/widget.js'?widgetSource:html);});
+const server=http.createServer((request,response)=>{
+ const source=request.url==='/widget.js'?widgetSource:request.url==='/bridge.js'?bridgeSource:null;
+ response.setHeader('Content-Type',source?'text/javascript; charset=utf-8':'text/html; charset=utf-8');
+ response.end(source||html);
+});
 await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
 let browser;
 try{
  browser=await playwright.chromium.launch({executablePath:process.env.HMB_IMAGE_ASSET_TEST_BROWSER||'C:/Program Files/Google/Chrome/Application/chrome.exe',headless:true});
  const page=await browser.newPage({viewport:{width:1250,height:1100}}),errors=[];page.setDefaultTimeout(7000);
- page.on('pageerror',error=>errors.push(error.message));await page.goto(`http://127.0.0.1:${server.address().port}`);await page.waitForFunction(()=>window.ready);
+ page.on('pageerror',error=>errors.push(error.message));
+ await page.route('**/*',route=>route.request().url().startsWith('http://127.0.0.1:')?route.continue():route.abort());
+ await page.goto(`http://127.0.0.1:${server.address().port}`);
+ try {await page.waitForFunction(()=>window.ready);} catch(error) {throw Error(JSON.stringify(errors),{cause:error});}
  const expanded=page.locator('[data-library-expanded]');
  const workspace=()=>expanded.locator('[data-image-bash-panel]');
  const browserSnapshot=()=>page.evaluate(()=>structuredClone(window.host));
@@ -216,6 +238,8 @@ try{
  await page.waitForFunction(()=>!document.querySelector('[data-registration-bash-add]').disabled);
  assert.equal(await page.locator('[data-registration-field="image_name"]').inputValue(),'Keep my registration draft');
  assert.equal(await page.evaluate(()=>document.getElementById('widget').__hmbImageAssetLatestState.image_bash_workspace.instances.length),0,'Rejected selection restores the previous workspace');checks+=2;
+ const recheckQueue=()=>page.evaluate(()=>document.getElementById('widget').__hmbImageAssetBashEditQueue.recover());
+ await recheckQueue();
  // A late failure belongs to its old operation. Cancelling and opening a
  // different passport must never resurrect or overwrite the old draft.
  await page.evaluate(()=>{window.deferNext=true;});await page.locator('[data-registration-bash-add]').click();
@@ -227,19 +251,20 @@ try{
  assert.equal(await page.evaluate(()=>document.getElementById('widget').__hmbImageAssetRegistrationDraft.source_uid),'source-7');
  assert.equal(await page.evaluate(()=>document.getElementById('widget').__hmbImageAssetLatestState.image_bash_workspace.instances.length),0,'Late failure rolls back only its workspace selection after a view-only remount');checks+=3;
  await page.locator('[data-registration-cancel]').first().click();
+ await recheckQueue();
  await expanded.locator('[data-asset-key="catalog-6"] [data-asset-add]').click();await page.locator('[data-registration-bash-add]').click();
  await page.waitForFunction(()=>window.host.image_bash_workspace.instances.length===1&&!document.querySelector('[data-registration-backdrop]'));
  assert.equal(await page.evaluate(()=>window.host.assets.find(asset=>asset.source_uid==='source-6').registered),false);
  assert.equal(await page.evaluate(()=>window.host.assets.find(asset=>asset.source_uid==='source-6').selected),false);
  assert.equal(await page.evaluate(()=>window.writes.some(raw=>Boolean((raw.edits||raw).asset_registration_request?.request_id))),false,'Bash selection never publishes a registration or JSON-write command');checks+=3;
  await assertBrowserShots('Pre-registration user import enters Bash without changing any Shot or asset registration');
- for(const source of ['catalog-7','catalog-6']){
-  const before=await page.evaluate(()=>window.host.image_bash_workspace.instances.length);
-  await expanded.locator(`[data-asset-key="${source}"]`).press('Enter');
-  await page.waitForFunction(count=>window.host.image_bash_workspace.instances.length===count,before+1);
- }
+ await expanded.locator('[data-asset-key="catalog-7"]').press('Enter');
+ await page.waitForFunction(()=>window.host.image_bash_workspace.instances.length===2);
+ const firstId=await page.evaluate(()=>window.host.image_bash_workspace.instances[0].instance_id);
+ await workspace().locator(`[data-image-bash-duplicate="${firstId}"]`).click();
+ await page.waitForFunction(()=>window.host.image_bash_workspace.instances.length===3);
  const uiInstances=await page.evaluate(()=>structuredClone(window.host.image_bash_workspace.instances));
- assert.deepEqual(uiInstances.map(row=>row.source_uid),['source-6','source-7','source-6']);
+ assert.deepEqual(uiInstances.map(row=>row.source_uid),['source-6','source-6','source-7']);
  assert.equal(new Set(uiInstances.map(row=>row.instance_id)).size,3);
  assert.equal(await workspace().locator('[data-image-bash-instance]').count(),3);checks+=4;
  await assertBrowserShots('Repeated library clicks add independent Bash instances without toggling shot selections');
@@ -310,12 +335,12 @@ try{
  await expanded.locator(`[data-shot-tab="${initial.shot_routing.active_shot_uuid}"]`).click();
  await expanded.locator('[data-image-bash-tab]').click();
  assert.equal(await page.evaluate(()=>window.createRequests.length),1,'A historical create command in a saved workflow is discarded before normal page changes');
- assert.deepEqual(await page.evaluate(()=>window.host.image_bash_workspace_request),{});
+ assert.deepEqual(await page.evaluate(()=>document.getElementById('widget').__hmbImageAssetLatestState.image_bash_workspace_request),{});
  assert.deepEqual(await page.evaluate(()=>window.host.image_bash_workspace),workspaceBeforePages);checks+=3;
  await page.evaluate(command=>{window.host.image_bash_workspace_request=command;window.controller.update(window.props());},staleSaved.image_bash_workspace_request);
  await page.locator('[data-language-toggle]').click();await page.locator('[data-language-toggle]').click();
  assert.equal(await page.evaluate(()=>window.createRequests.length),1,'A stale command arriving in a later props update cannot replay during an unrelated language change');
- assert.deepEqual(await page.evaluate(()=>window.host.image_bash_workspace_request),{});checks+=2;
+ assert.deepEqual(await page.evaluate(()=>document.getElementById('widget').__hmbImageAssetLatestState.image_bash_workspace_request),{});checks+=2;
  await assertBrowserShots('Discarding stale creation commands preserves every existing shot and media receipt');
  // A synchronous canonical echo must also preserve the workspace and clear
  // its one-shot create command before unrelated later publications.
@@ -330,7 +355,8 @@ try{
  const finalWorkspaceSaved=await browserSnapshot();
  // The shared card coordinator has the same async/view-only remount boundary
  // as the passport action and must restore just the rejected workspace edit.
- await page.evaluate(()=>{window.deferNext=true;});await expanded.locator('[data-asset-key="catalog-6"]').press('Enter');
+ const duplicateInstance=id=>workspace().locator(`[data-image-bash-duplicate="${id}"]`).click();
+ await page.evaluate(()=>{window.deferNext=true;});await duplicateInstance(finalWorkspaceSaved.image_bash_workspace.instances[0].instance_id);
  await page.waitForFunction(()=>Boolean(window.pendingPublication));
  await expanded.locator('[data-asset-key="catalog-7"] [data-asset-add]').click();
  await page.locator('[data-registration-field="image_name"]').fill('Card failure keeps this draft');
@@ -338,9 +364,10 @@ try{
  assert.equal(await page.locator('[data-registration-field="image_name"]').inputValue(),'Card failure keeps this draft');
  assert.deepEqual(await page.evaluate(()=>document.getElementById('widget').__hmbImageAssetLatestState.image_bash_workspace),finalWorkspaceSaved.image_bash_workspace);
  await page.locator('[data-registration-cancel]').first().click();checks+=2;
- await page.evaluate(()=>{window.deferNext=true;});await expanded.locator('[data-asset-key="catalog-6"]').press('Enter');
+ await recheckQueue();
+ await page.evaluate(()=>{window.deferNext=true;});await duplicateInstance(finalWorkspaceSaved.image_bash_workspace.instances[0].instance_id);
  await page.waitForFunction(()=>Boolean(window.pendingPublication));
- await expanded.locator('[data-asset-key="catalog-7"]').press('Enter');
+ await duplicateInstance(finalWorkspaceSaved.image_bash_workspace.instances.at(-1).instance_id);
  const newerWorkspace=await page.evaluate(()=>structuredClone(window.host.image_bash_workspace));
  await page.evaluate(()=>window.finishPublication(false));
  assert.deepEqual(await page.evaluate(()=>window.host.image_bash_workspace),newerWorkspace);

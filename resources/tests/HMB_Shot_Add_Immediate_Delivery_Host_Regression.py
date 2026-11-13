@@ -101,6 +101,7 @@ async def exercise(engine, modules, project_state, order, label, replacement=Non
             selected_source_uids=[row["source_uid"] for row in sorted(state["assets"],
                 key=lambda row:row["selection_order"]) if row["selected"]],
             edits={"shot_routing":route})
+        value[images.WIDGET_RUNTIME_LEASE_KEY] = state[images.WIDGET_RUNTIME_LEASE_KEY]
         base.send(engine, SetParameterValueRequest(node_name=source.name,
             parameter_name=images.WIDGET_STATE_PARAMETER, value=json.dumps(value)))
     try:

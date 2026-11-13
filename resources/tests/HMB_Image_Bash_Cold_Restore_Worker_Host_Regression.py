@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 import hashlib
-import inspect
 import json
 import logging
 import os
@@ -277,11 +276,7 @@ async def check(engine,node,producer,set_value,candidate,png,directory,context,r
     RESULT.update(status='PASS',product_path=product.__file__,product_sha256=hashlib.sha256(Path(product.__file__).read_bytes()).hexdigest(),
         synthetic_local_only=True,actual_desktop=False,actual_live_engine_requests=False,paid_calls=0,network_calls=0,
         caveat='Worker final fresh SHA plus host identity/scene/receipt/connection/driver CAS. External unnotified file changes after final worker read remain a sequential-snapshot window; no atomic file lock claimed.')
-    manifest=json.loads((fixture.STANDARD/'griptape_nodes_library.json').read_text('utf8'))
-    standard_file=Path(inspect.getfile(product._StockImageBash))
-    RESULT['standard_pin']={'library_version':manifest.get('metadata',{}).get('library_version'),
-        'declared_engine_version':manifest.get('metadata',{}).get('engine_version'),
-        'image_bash_file':str(standard_file),'image_bash_sha256':hashlib.sha256(standard_file.read_bytes()).hexdigest()}
+    RESULT['stock_image_bash_required']=False
 
 if __name__=='__main__':
     previous=Path.cwd()

@@ -49,9 +49,8 @@ class ImageSource(asset_library.DataNode):
 
 
 def register(flow: ControlFlow, node: object) -> None:
-    flow.add_node(node)
-    GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
-    GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = flow.name
+    from _hmb_fixture_sdk import register_fixture_node
+    register_fixture_node(GriptapeNodes, flow, node)
 
 
 def add_import_slot(target: asset_library.HMBImageAssetLibrary) -> str:
@@ -110,7 +109,9 @@ if current_engine is None:
     flow = ControlFlow(name=f"HMBImageDisconnectFlow_{stamp}")
 else:
     flow = ControlFlow(name=f"HMBImageDisconnectFlow_{stamp}", engine=current_engine())
-GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
+
+from _hmb_fixture_sdk import ensure_fixture_flow
+flow = ensure_fixture_flow(GriptapeNodes, flow.name)
 
 image_a = "https://example.test/host-disconnect-a.png"
 image_b = "https://example.test/host-disconnect-b.png"

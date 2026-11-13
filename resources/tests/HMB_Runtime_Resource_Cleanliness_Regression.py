@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -24,7 +28,21 @@ DISTRIBUTION_ONLY_FILES = (
     "tools/hmb_color_lut_native_header_patch.py",
     "tools/hmb_native_semantic_adapter.py",
     "resources/editor/hmb-color-lut-native-header.js",
+    "resources/editor/hmb-shot-basket.js",
+    "resources/editor/hmb-rodong-mart-launcher.webp",
+    "resources/editor/hmb-rodong-mart-launcher-extra.webp",
+    "resources/editor/hmb-rodong-mart-header.webp",
     "resources/editor/native-editor-patch.json",
+    "tools/hmb_editor_0130_header.py",
+    "tools/restore_rodong_local_editor.py",
+    "tools/hmb_rodong_editor_0130.py",
+    "tools/hmb_editor_0130_override.py",
+    "resources/editor/hmb-header-0130.js",
+    "resources/editor/hmb-rodong-editor-0130.js",
+    "resources/editor/hmb-continue-work-art.js",
+    "resources/editor/hmb-continue-work-01-10.webp",
+    "resources/editor/hmb-continue-work-11-20.webp",
+    "resources/editor/hmb-continue-work-21-30.webp",
 )
 EXCLUDED_PACKAGE_FILES = {
     "README.md",
@@ -55,13 +73,13 @@ diagnostics = importlib.util.module_from_spec(diagnostics_spec)
 diagnostics_spec.loader.exec_module(diagnostics)
 # The diagnostic receipt reader must recognize the same independently packaged
 # members. A valid installer receipt must not be rejected as an extra-file list.
-assert len(diagnostics.RUNTIME_FILE_PATHS) == len(set(diagnostics.RUNTIME_FILE_PATHS)) == 60
+assert len(diagnostics.RUNTIME_FILE_PATHS) == len(set(diagnostics.RUNTIME_FILE_PATHS)) == 69
 assert set(diagnostics.RUNTIME_FILE_PATHS) == set(runtime_install_files)
 distribution_only_files = tuple(packager.DISTRIBUTION_ONLY_FILES)
-assert len(runtime_install_files) == 60
+assert len(runtime_install_files) == 69
 assert distribution_only_files == DISTRIBUTION_ONLY_FILES
 assert source_files == (*runtime_install_files, *distribution_only_files)
-assert len(source_files) == 68
+assert len(source_files) == 91
 assert not EXCLUDED_PACKAGE_FILES.intersection(source_files)
 assert not set(runtime_install_files).intersection(distribution_only_files)
 assert {
@@ -86,8 +104,8 @@ assert "release-manifest.json" in installer
 assert "SHA256SUMS" in installer
 assert "Get-FileHash -Algorithm SHA256" in installer
 assert "$installProperty.Value" in installer
-assert "foreach ($relative in $installMembers)" in installer
-assert "foreach ($record in $installRecords)" in installer
+assert "foreach ($relative in $retainedMembers)" in installer
+assert "foreach ($record in $retainedRecords)" in installer
 assert "Compare-Object $expectedDistributionOnlyMembers $distributionOnlyMembers" in installer
 assert "$null = $allowed.Add('release-manifest.json')" not in installer
 assert "$null = $allowed.Add('SHA256SUMS')" not in installer
@@ -99,8 +117,53 @@ assert "LocalApplicationData" in installer
 assert "Rollback data must be stored outside the Griptape libraries folder" in installer
 assert "MyInvocation.MyCommand.Path" in installer
 assert "Could not resolve the extracted HMB package directory" in installer
-assert "[int]$manifest.install_file_count -ne 60" in installer
-assert "$records.Count -ne 68" in installer
+# Execute only the installer's manifest-count gate, never its install actions.
+# Use the actual current package closure so a stale, hard-coded installer count
+# cannot pass by sharing that same stale expectation in this regression.
+release_version, package_sources = packager.validate_sources()
+package_records = packager.make_release_records(release_version, package_sources)
+package_manifest = json.loads(next(
+    record["data"] for record in package_records
+    if record["path"] == packager.RELEASE_MANIFEST_PATH
+))
+count_gate = installer.split("$records = @($manifest.files)", 1)[1].split(
+    "$verifiedMembers =", 1
+)[0]
+assert "HMB release manifest install/distribution boundary mismatch." in count_gate
+shell = shutil.which("pwsh") or shutil.which("powershell")
+assert shell, "PowerShell is required to verify the real installer boundary."
+fixtures = [{"name": "current_package", "accepted": True, "manifest": package_manifest}]
+for key in ("file_count", "install_file_count", "distribution_file_count"):
+    for offset in (-1, 1):
+        changed = dict(package_manifest, **{key: package_manifest[key] + offset})
+        fixtures.append({"name": f"{key}_{offset}", "accepted": False, "manifest": changed})
+for label, files in (("missing_member", package_manifest["files"][:-1]),
+                     ("extra_member", package_manifest["files"] + [package_manifest["files"][0]])):
+    fixtures.append({"name": label, "accepted": False,
+                     "manifest": dict(package_manifest, files=files, file_count=len(files))})
+with tempfile.TemporaryDirectory(prefix="hmb-installer-count-gate-") as temporary:
+    root = Path(temporary)
+    (root / "fixtures.json").write_text(json.dumps(fixtures), encoding="utf-8")
+    script = (
+        "$ErrorActionPreference = 'Stop'\n"
+        "function Test-ManifestBoundary { param($manifest)\n"
+        "$records = @($manifest.files)\n" + count_gate + "}\n"
+        "$fixtures = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'fixtures.json') | ConvertFrom-Json\n"
+        "foreach ($fixture in $fixtures) {\n"
+        "  $accepted = $true\n"
+        "  try { Test-ManifestBoundary $fixture.manifest }\n"
+        "  catch { if ($_.Exception.Message -notlike 'HMB release manifest*') { throw }; $accepted = $false }\n"
+        "  if ($accepted -ne $fixture.accepted) { throw ('Unexpected package admission: ' + $fixture.name) }\n"
+        "}\n"
+        "Write-Output ('INSTALLER_COUNT_GATE_PASS cases=' + $fixtures.Count)\n"
+    )
+    script_path = root / "gate.ps1"
+    script_path.write_text(script, encoding="utf-8-sig")
+    checked = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-File", str(script_path)],
+                             cwd=root, capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=30)
+assert checked.returncode == 0, checked.stdout + checked.stderr
+assert "INSTALLER_COUNT_GATE_PASS cases=9" in checked.stdout
 assert "_hmb_reference_leases.py" in runtime_install_files
 assert "HMBImageGeneration.py" in runtime_install_files
 assert "_hmb_image_generation.py" in runtime_install_files

@@ -47,11 +47,11 @@ try {
   // A short video is recorded entirely in memory. This test does not convert,
   // copy or write any user's media, and needs no FFmpeg/provider connection.
   fixtureBytes=Buffer.from(await page.evaluate(async()=>{
-    const canvas=document.createElement('canvas');canvas.width=160;canvas.height=90;const ctx=canvas.getContext('2d'),stream=canvas.captureStream(12),chunks=[];
+    const canvas=document.createElement('canvas');canvas.width=160;canvas.height=90;const ctx=canvas.getContext('2d'),stream=canvas.captureStream(0),chunks=[];
     const recorder=new MediaRecorder(stream,{mimeType:'video/webm;codecs=vp8'});recorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data);};
     const complete=new Promise(resolve=>recorder.onstop=async()=>resolve(Array.from(new Uint8Array(await new Blob(chunks,{type:'video/webm'}).arrayBuffer()))));
-    recorder.start();let frame=0;const timer=setInterval(()=>{ctx.fillStyle=frame++%2?'#f36':'#3c8';ctx.fillRect(0,0,160,90);},50);
-    await new Promise(resolve=>setTimeout(resolve,550));clearInterval(timer);recorder.stop();stream.getTracks().forEach(t=>t.stop());return complete;
+    recorder.start();let frame=0;const timer=setInterval(()=>{ctx.fillStyle=frame++%2?'#f36':'#3c8';ctx.fillRect(0,0,160,90);stream.getVideoTracks()[0].requestFrame();},50);
+    await new Promise(resolve=>setTimeout(resolve,800));clearInterval(timer);recorder.stop();stream.getTracks().forEach(t=>t.stop());return complete;
   }));assert.ok(fixtureBytes.length>100);
   await page.evaluate(async origin=>{const video=document.createElement('video');video.muted=true;document.body.append(video);try{await new Promise((resolve,reject)=>{video.addEventListener('loadeddata',resolve,{once:true});video.addEventListener('error',()=>reject(new Error('Memory-only fixture failed to decode: '+video.error?.message)),{once:true});video.src=origin+'/c.webm';video.load();});}finally{video.pause();video.removeAttribute('src');video.load();video.remove();}},origin);
   const shot='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';

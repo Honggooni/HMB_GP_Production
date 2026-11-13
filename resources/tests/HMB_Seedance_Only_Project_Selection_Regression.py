@@ -245,6 +245,35 @@ class OnlyProjectSelectionTests(unittest.TestCase):
                     self.assertEqual(node.transport.project_capability_calls, 2)
                     self.assertGreaterEqual(node.bridge._load_access_token.call_count, 3)
 
+    def test_current_15_30_review_page_sizes_allow_only_project_preflight(self):
+        for page_size in (15, 30):
+            with self.subTest(page_size=page_size):
+                opener = OnlyProjectOpener(); bridge = authenticated_bridge(opener)
+                opener.project_transform = lambda document, occurrence: {
+                    **document, "page_size": page_size, "review_page_sizes": [15, 30]}
+                bridge.require_generation_project_selection(ONLY_PROJECT_SELECTION_SCHEMA)
+                self.assertEqual([call["path"] for call in opener.calls],
+                    ["/api/v1/maintenance-intake/capabilities", REVIEW_CAPABILITIES_PATH])
+                self.assertTrue(all(call["method"] == "GET" for call in opener.calls))
+                self.assertEqual(opener.published_payloads, [])
+                bridge._clear_access_token.assert_not_called()
+
+    def test_only_editing_extension_with_current_page_sizes_preserve_inputs(self):
+        for size in (15, 30):
+            for task in (t.TASK_VIDEO_EDITING, t.TASK_VIDEO_EXTENSION):
+                with self.subTest(page_size=size, task=task):
+                    authored = values_for(task); before = deepcopy(authored)
+                    node = Node(authored); graph = Graph(node); node.select("superwings12")
+                    node.transport.project_transform = lambda doc, occurrence: {
+                        **doc, "page_size": size, "review_page_sizes": [15, 30]}
+                    with graph.context(), run_boundaries():
+                        asyncio.run(node._process_generation_impl())
+                    self.assertEqual(len(node.bridge.posts), 1)  # Synthetic wire only.
+                    self.assertEqual(node.upload_calls, 1)
+                    self.assertEqual(node.bridge.posts[0]["project_selection_schema"], ONLY_PROJECT_SELECTION_SCHEMA)
+                    self.assertEqual(node.bridge.posts[0]["prompt"], before["prompt"])
+                    self.assertEqual(authored, before)
+
     def test_invalid_manual_editing_extension_is_rejected_before_broker_or_upload(self):
         for task in (t.TASK_VIDEO_EDITING, t.TASK_VIDEO_EXTENSION):
             for problem in ("missing-video", "wrong-ratio", "model-2.0", "model-2.0-fast"):

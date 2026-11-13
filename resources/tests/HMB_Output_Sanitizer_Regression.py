@@ -472,11 +472,11 @@ empty_output.set_parameter_value("prompt", visible_prompt)
 try:
     list(empty_output.process())
 except RuntimeError as exc:
-    assert str(exc) == module._hmb_execution_failure_message("EMPTY_OUTPUT")
+    assert str(exc) == module._hmb_execution_failure_message("EMPTY_OUTPUT", stage="capture_output")
 else:
     raise AssertionError("An empty native Agent result was accepted.")
 assert empty_output.parameter_output_values["output"] == (
-    module._hmb_execution_failure_message("EMPTY_OUTPUT")
+    module._hmb_execution_failure_message("EMPTY_OUTPUT", stage="capture_output")
 )
 assert module._HMB_POLICY_WARNING_NAME not in empty_output.shown_messages
 
@@ -589,7 +589,7 @@ sanitizer_failure_after_native_error._secure_hmb_outputs = types.MethodType(
 try:
     list(sanitizer_failure_after_native_error.process())
 except RuntimeError as exc:
-    assert str(exc) == module._hmb_execution_failure_message("MODEL_PROVIDER")
+    assert str(exc) == module._hmb_execution_failure_message("MODEL_PROVIDER", stage="native_process")
 else:
     raise AssertionError("The protected native failure did not fail closed.")
 assert sanitizer_failure_after_native_error._hmb_policy == ""
@@ -603,13 +603,13 @@ exceptional.set_parameter_value("prompt", visible_prompt)
 try:
     list(exceptional.process())
 except RuntimeError as exc:
-    assert str(exc) == module._hmb_execution_failure_message("MODEL_PROVIDER")
+    assert str(exc) == module._hmb_execution_failure_message("MODEL_PROVIDER", stage="native_process")
 else:
     raise AssertionError("The protected native failure did not fail closed.")
 assert exceptional.native_calls == 1
 assert exceptional._hmb_rules_active is False
 assert exceptional.parameter_output_values["output"] == (
-    module._hmb_execution_failure_message("MODEL_PROVIDER")
+    module._hmb_execution_failure_message("MODEL_PROVIDER", stage="native_process")
 )
 assert module._HMB_POLICY_WARNING_NAME not in exceptional.shown_messages
 assert exceptional.parameter_output_values["agent"] == {}
@@ -624,12 +624,12 @@ timed_out.set_parameter_value("prompt", visible_prompt)
 try:
     list(timed_out.process())
 except RuntimeError as exc:
-    assert str(exc) == module._hmb_execution_failure_message("MODEL_TIMEOUT")
+    assert str(exc) == module._hmb_execution_failure_message("MODEL_TIMEOUT", stage="native_process")
     assert "private Cloud request" not in str(exc)
 else:
     raise AssertionError("A native model timeout was accepted")
 assert timed_out.native_calls == 1
-assert timed_out.parameter_output_values["output"] == module._hmb_execution_failure_message("MODEL_TIMEOUT")
+assert timed_out.parameter_output_values["output"] == module._hmb_execution_failure_message("MODEL_TIMEOUT", stage="native_process")
 assert timed_out.parameter_output_values["agent"] == {}
 assert module._HMB_POLICY_WARNING_NAME not in timed_out.shown_messages
 timed_out.raise_after_publish = False

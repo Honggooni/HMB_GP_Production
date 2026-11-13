@@ -79,9 +79,12 @@ async def exercise_live_sync(engine, node, target, source, schema, original_shot
         project["image_bash_active"] = True
         project[source.UI_EDIT_REVISION_KEY] = 100
         project = source._normalize_state(project)
+        project[source.WIDGET_RUNTIME_LEASE_KEY] = node._hmb_widget_runtime_lease
         node.set_parameter_value(source.PROJECT_ROOT_PARAMETER, project["catalog_root"], initial_setup=True)
-        node.set_parameter_value(source.WIDGET_STATE_PARAMETER, source._json_text(project), initial_setup=True)
+        node._publish_state(deepcopy(project))
         await asyncio.sleep(.1)
+        await await_bash_settled(engine)
+        scene = deepcopy(target.get_parameter_value("bash_image"))
         current = node._current_state()
         node._hmb_resolution_cache.clear()
         selected = deepcopy(current["image_bash_workspace"])
@@ -89,11 +92,16 @@ async def exercise_live_sync(engine, node, target, source, schema, original_shot
         selected["instances"] = [item]
         selected["revision"] += 1
         edit = dict(schema=source.IMAGE_ASSET_EDIT_SCHEMA, version=1,
+            widget_runtime_lease=node._hmb_widget_runtime_lease,
             ui_edit_revision=current[source.UI_EDIT_REVISION_KEY] + 1,
             catalog_identity={key: current.get(key) for key in ("catalog_root", "project_root", "project_uid",
                 "project_cache_uid", "manifest_signature", "folder_signature", "scan_revision")},
             selected_source_uids=[], edits=dict(shot_routing=deepcopy(current["shot_routing"]),
                 image_bash_workspace=selected, image_bash_active=True))
+        edit["edits"][source.IMAGE_BASH_WORKSPACE_EDIT_KEY] = dict(
+            schema=source.IMAGE_BASH_WORKSPACE_EDIT_SCHEMA, version=1, operation_id=str(uuid4()), operation="add",
+            workspace_id=selected["workspace_id"], expected_revision=current["image_bash_workspace"]["revision"],
+            source_uid=item["source_uid"], new_instance_id=item["instance_id"])
         host_thread = threading.get_ident()
         assert node._sync_output.__func__.__globals__ is source.__dict__
         original_resolve = source._resolve_selected_assets
@@ -224,6 +232,6 @@ if __name__ == "__main__":
         raise AssertionError("External network forbidden")
     with mock.patch.object(socket.socket, "connect", local_connect), \
          mock.patch.object(_hmb_cgt, "start_own_wait_after_commit", side_effect=AssertionError("CGT write forbidden")), \
-         mock.patch.object(OSManager, "_is_cuda_available", return_value=False), \
+         mock.patch("griptape_nodes.retained_mode.managers.resource_types.compute_resource.detect_compute_backends", return_value=[]), \
          mock.patch.object(subprocess, "Popen", side_effect=AssertionError("Subprocess forbidden")):
         host.main()

@@ -5,11 +5,18 @@ import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
 
 const argument = (name) => { const index = process.argv.indexOf(name); return index < 0 ? "" : process.argv[index + 1] || ""; };
 const root = path.resolve(argument("--library-root") || fileURLToPath(new URL("../..", import.meta.url)));
 const sourcePath = path.join(root, "widgets/HMBSeedanceGenerationWidget.js");
 const source = fs.readFileSync(sourcePath, "utf8");
+// Encode a tiny local fixture independently of the widget's mocked RAF queue.
+// Static canvas capture can yield an empty WebM on headless Chromium.
+const playableVideo = execFileSync(process.env.HMB_COLOR_LUT_TEST_FFMPEG || "ffmpeg", [
+  "-nostdin", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+  "color=c=green:s=32x24:r=8:d=0.5", "-an", "-c:v", "libvpx", "-f", "webm", "pipe:1",
+], { timeout: 15000, maxBuffer: 1024 * 1024 }).toString("base64");
 const require = createRequire(import.meta.url);
 let playwright;
 try { playwright = require("playwright"); }
@@ -27,7 +34,7 @@ try {
   page.on("pageerror", (error) => errors.push(error.message));
   await page.route("**/*", (route) => { receipt.external_requests += 1; return route.abort(); });
   await page.setContent('<!doctype html><meta charset="utf-8"><style>body{background:#080c14;color:white}.react-flow__node{width:680px;margin:8px}</style><main></main>');
-  await page.evaluate(async (code) => {
+  await page.evaluate(async ({code, playableVideo}) => {
     window.widget = await import(`data:text/javascript;base64,${btoa(unescape(encodeURIComponent(code)))}`);
     const ids = [1, 2, 3, 4].map((n) => `20000000-0000-4000-8000-${String(n).padStart(12, "0")}`);
     const catalog = { schema: "hmb-shot-routing-catalog", version: 1, publisher_instance_uuid: ids[0],
@@ -68,21 +75,14 @@ try {
       resolution: f.node.querySelector('[data-parameter-name="resolution"]').value,
       action: f.node.querySelector('[data-parameter-name="draft_action"]').value });
     window.addPlayablePreview = async (f) => {
-      const canvas = document.createElement("canvas"); canvas.width = 32; canvas.height = 24;
-      canvas.getContext("2d").fillRect(0, 0, 32, 24);
-      const stream = canvas.captureStream(8), chunks = [];
-      const recorder = new MediaRecorder(stream, { mimeType: "video/webm;codecs=vp8" });
-      recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
-      const stopped = new Promise((resolve) => recorder.addEventListener("stop", resolve, { once: true }));
-      recorder.start(); await new Promise((resolve) => setTimeout(resolve, 180)); recorder.stop(); await stopped;
-      stream.getTracks().forEach((track) => track.stop());
+      const bytes = Uint8Array.from(atob(playableVideo), char => char.charCodeAt(0));
       const video = document.createElement("video"); video.muted = true; video.width = 600; video.height = 220;
       video.dataset.rawVideoValue = "https://fixture.invalid/retained-original.mov";
       const ready = new Promise((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error("Isolated video did not become playable")), 3000);
         video.addEventListener("canplay", () => { clearTimeout(timeout); resolve(); }, { once: true });
       });
-      const url = URL.createObjectURL(new Blob(chunks, { type: "video/webm" })); video.src = url; await ready;
+      const url = URL.createObjectURL(new Blob([bytes], { type: "video/webm" })); video.src = url; await ready;
       const parameter = document.createElement("div"); parameter.dataset.parameterName = "video_url";
       parameter.innerHTML = '<div data-vp-video-area style="width:600px;height:220px"><div data-native-player></div></div>';
       parameter.firstElementChild.firstElementChild.append(video); f.node.append(parameter);
@@ -92,7 +92,7 @@ try {
       const cleanup = f.cleanup; f.cleanup = () => { cleanup(); URL.revokeObjectURL(url); };
       return f;
     };
-  }, source);
+  }, {code: source, playableVideo});
   const check = async (name, callback) => {
     await callback(); receipt.cases.push({ name, passed: true });
     await page.evaluate(() => { fixtures.splice(0).forEach((fixture) => fixture.cleanup()); });

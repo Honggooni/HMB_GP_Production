@@ -6,6 +6,11 @@ except Exception:
     HMBAgentLibrary = None  # type: ignore
 
 try:
+    from .HMBAnalysisAgent import HMBAnalysisAgent
+except Exception:
+    HMBAnalysisAgent = None  # type: ignore
+
+try:
     from .HMBImageAssetLibrary import HMBImageAssetLibrary
 except Exception:
     HMBImageAssetLibrary = None  # type: ignore
@@ -45,8 +50,15 @@ try:
 except Exception:
     HMBVideoPickerLibrary = None  # type: ignore
 
+try:
+    from .HMBSoundLibrary import HMBSoundLibrary
+except Exception:
+    HMBSoundLibrary = None  # type: ignore
+
 __all__ = [
+    "HMBSoundLibrary",
     "HMBAgentLibrary",
+    "HMBAnalysisAgent",
     "HMBFinishLookLibrary",
     "HMBColorLUTLibrary",
     "HMBImageAssetLibrary",

@@ -27,7 +27,8 @@ from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.dont_write_bytecode = True
-STANDARD = Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard"
+STANDARD = Path(os.environ.get("HMB_IMAGE_BASH_STANDARD_LIBRARY_PATH") or (
+    Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard"))
 EDITOR = Path(os.environ.get("HMB_IMAGE_BASH_EDITOR_BUNDLE_PATH") or (
     Path(os.environ.get("LOCALAPPDATA", "")) / "ai.griptape.nodes.desktop/current/resources/editor-bundle"))
 ATTEMPTS = []
@@ -57,8 +58,13 @@ async def await_bash_settled(engine, timeout=8):
     deadline = loop.time() + timeout
     while True:
         await asyncio.sleep(.005)
-        nodes = [engine.node_manager.get_node_by_name(name)
-                 for name in list(engine.node_manager._name_to_parent_flow_name)]
+        get_workflow = getattr(engine, "current_workflow_or_none", None)
+        if callable(get_workflow):
+            workflow = get_workflow()
+            names = tuple(workflow.nodes.name_to_parent_flow_name) if workflow is not None else ()
+        else:
+            names = tuple(engine.node_manager._name_to_parent_flow_name)
+        nodes = [engine.node_manager.get_node_by_name(name) for name in names]
         pending = [node for node in nodes
                    if getattr(node, "_hmb_apply_pending", None) is not None
                    or getattr(node, "_hmb_prepare_pending", None) is not None
@@ -164,8 +170,9 @@ async def exercise(engine, directory):
     try:
         assert node.get_parameter_value("comp_on_run") is False
         editor_options = node.get_parameter_by_name("bash_image").ui_options
-        assert editor_options["modal"] == "ImageBashModal"
-        assert editor_options["button_label"] == "Open HMBImageBash Editor"
+        assert "modal" not in editor_options
+        assert editor_options["widget"] == "HMBImageBashWidget"
+        assert editor_options["synced_parameters"] == [target.HEADER_PARAMETER]
         # ParameterList.ui_options returns a copy. Verify the constructor used
         # its setter rather than mutating a discarded getter dictionary.
         images_options = node.get_parameter_by_name("input_images").ui_options
@@ -757,20 +764,14 @@ async def exercise(engine, directory):
         node.process()
         print("PASS retained Apply receipt cannot authorize tampered exported PNG pixels", flush=True)
 
-        # Neither a host compatibility refusal nor a denied local write may
-        # claim success, erase the authored receipt, or replace an older file.
+        # A stock modal compatibility failure no longer affects HMB-owned Run.
         scene_before_failure = deepcopy(node.get_parameter_value("bash_image"))
         output_before_failure = node.parameter_output_values.get("output_image")
         proof_before_failure = deepcopy(node.get_parameter_value("HMB_BASH_VERIFICATION"))
-        with mock.patch.object(target, "require_standard_compatibility",
+        import _hmb_image_bash_compat as stock_compat
+        with mock.patch.object(stock_compat, "require_standard_compatibility",
                                side_effect=ValueError("Synthetic editor compatibility check failed")):
-            try:
-                node.process()
-            except ValueError as exc:
-                assert "compatibility" in str(exc)
-            else:
-                raise AssertionError("An incompatible editor was allowed to Run")
-        assert "compatibility" in node.get_parameter_value("HMB_BASH_STATUS")
+            node.process()
         assert node.parameter_output_values.get("output_image") == output_before_failure
         assert node.get_parameter_value("HMB_BASH_VERIFICATION") == proof_before_failure
         assert node.get_parameter_value("bash_image") == scene_before_failure
@@ -800,7 +801,7 @@ async def exercise(engine, directory):
         assert output_path.read_bytes() == original_output
         node.process()
         assert File(node.parameter_output_values["output_image"].value).read_bytes() == applied_png
-        print("PASS incompatible host and denied local save show distinct Run errors; receipt/previous PNG survive and retry saves exact Apply", flush=True)
+        print("PASS stock modal is unnecessary; denied local save preserves the receipt and previous PNG; retry saves exact Apply", flush=True)
         source_a.write_bytes(png_bytes(Image.new("RGBA", (2, 2), (1, 2, 3, 255))))
         try:
             node.process()
@@ -845,7 +846,7 @@ async def exercise(engine, directory):
             "native_resolve_node_validation_scheduling": True,
             "native_file_uri_raster_alias_single_apply": True, "painted_brush_new_raster_single_apply": True,
             "editor_initial_original_http_input_contract_preserved": True,
-            "native_hidden_ui_options_and_editor_label": True,
+            "native_hidden_ui_options_and_owned_editor": True,
             "resolver_media_signature_only_refresh_native_resolve": True,
             "sdk_root_envelope_identity_preserves_apply": True,
             "duplicate_layers_and_brush": True, "stable_source_reorder": True,
@@ -854,7 +855,7 @@ async def exercise(engine, directory):
             "stale_modal_source_replacement_rejected_then_reapplied": True,
             "unready_context_blocks_previous_images": True, "workspace_apply_isolation": True,
             "source_content_change_blocked": True, "failed_load_no_partial_output": True,
-            "incompatible_host_error_preserves_scene": True,
+            "stock_modal_incompatibility_does_not_block_owned_run": True,
             "local_save_denied_error_preserves_previous_png": True,
             "live_browser_ui_verified": False, "network_calls": 0}, sort_keys=True), flush=True)
     finally:

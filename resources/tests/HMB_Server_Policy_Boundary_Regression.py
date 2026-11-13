@@ -33,7 +33,9 @@ encoded = common._read_agent_policy_envelope()
 validated = common._validate_agent_policy_payload(
     common._decode_signed_agent_policy_envelope(encoded)
 )
-identity = packager.synchronize_bundled_agent_policy()
+# Validation must not mirror a different external Manager build into the
+# working checkout. Verify the bundled artifact exactly as release checks do.
+identity = packager.verify_signed_agent_policy_bytes(DAT_PATH.read_bytes())
 assert identity == {
     "envelope_sha256": hashlib.sha256(encoded).hexdigest(),
     "final_policy_version": validated["final_policy_version"],

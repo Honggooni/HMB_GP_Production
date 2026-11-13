@@ -2168,6 +2168,166 @@ try:
 finally:
     target._shot_routing._same_flow_nodes = original_same_flow
 
+analysis = {"source_kind": "video", "items": [
+    {"category": "effect_timing", "observation": "Synthetic pulse at source 0.25 seconds"},
+]}
+analysis_lookups = []
+
+
+def get_analysis(**scope):
+    analysis_lookups.append(scope)
+    return deepcopy(analysis)
+
+
+analysis_agent = type("AnalysisAgentFixture", (), {})()
+analysis_agent._hmb_reference_analysis_for = get_analysis
+analysis_node = generator(image, picker, agent_source=analysis_agent)
+analysis_node._hmb_preflight_kind = lambda node: "HMBAgentLibrary" if node is analysis_agent else ""
+analysis_input = analysis_node._resolve_exact_shot_generation_inputs({
+    **valid_params(prompt="Keep original directions"), "_hmb_reference_analysis": analysis})
+assert analysis_lookups == []
+assert analysis_input["prompt"] == "Keep original directions"
+assert "_hmb_reference_analysis" not in analysis_input
+analysis_input["reference_images"] = ["https://media.example/image-2.png", "https://media.example/image-1.png"]
+analysis_input["video_references"] = ["https://media.example/motion.mp4"]
+stale_analysis = {**analysis_input, "_hmb_reference_analysis": analysis}
+assert (analysis_node._managed_agent_input_fingerprint(analysis_input)
+        == analysis_node._managed_agent_input_fingerprint(stale_analysis))
+assert "Synthetic pulse" not in analysis_node._build_broker_payload(stale_analysis)["prompt"]
+
+analysis_image = "https://media.example/image-2.png"
+analysis_image_source = Source("image_asset", snapshot(kind="image_asset", selected=["image-b", "image-a"],
+    media={"image-a": "https://media.example/image-1.png", "image-b": analysis_image}))
+analysis_node = generator(analysis_image_source, None, agent_source=analysis_agent)
+analysis_node._hmb_preflight_kind = lambda node: "HMBAgentLibrary" if node is analysis_agent else ""
+analysis_agent._hmb_reference_analysis_owner = lambda **scope: types.SimpleNamespace(
+    _hmb_analysis_excluded_media_for=lambda **exact: {
+        "images": [analysis_image], "videos": []} if exact == scope else {})
+analysis_agent._hmb_reference_analysis_originals_for = lambda **_scope: []
+filtered = analysis_node._resolve_exact_shot_generation_inputs(valid_params(prompt="Keep @image2"))
+assert filtered["reference_images"] == ["https://media.example/image-1.png"]
+assert filtered["_hmb_analysis_media_bindings"] == [
+    {"shot_reference": "@image1", "provider_reference": None},
+    {"shot_reference": "@image2", "provider_reference": "@image1"},
+]
+assert "Keep @image2" in analysis_node._build_broker_payload(filtered)["prompt"]
+analysis_agent._hmb_reference_analysis_originals_for = lambda **_scope: [{
+    "kind": "image", "path": analysis_image, "shot_reference": "@image1"}]
+with_original = analysis_node._resolve_exact_shot_generation_inputs(filtered)
+assert with_original["reference_images"] == [analysis_image, "https://media.example/image-1.png"]
+assert "_hmb_analysis_media_bindings" not in with_original
+assert "_hmb_reference_analysis" not in with_original
+analysis_agent._hmb_reference_analysis_originals_for = lambda **_scope: [{
+    "kind": "image", "path": "https://media.example/direct.png", "shot_reference": "@analysis_original"}]
+with_direct = analysis_node._resolve_exact_shot_generation_inputs(filtered)
+assert with_direct["reference_images"] == ["https://media.example/image-1.png", "https://media.example/direct.png"]
+assert {"shot_reference": "@analysis_original", "provider_reference": "@image2"} in with_direct["_hmb_analysis_media_bindings"]
+analysis_agent._hmb_reference_analysis_originals_for = lambda **_scope: []
+analysis_agent._hmb_reference_analysis_owner = lambda **_scope: types.SimpleNamespace(
+    _hmb_analysis_excluded_media_for=lambda **_exact: {"images": [analysis_image, "https://media.example/image-1.png"]})
+text_only = analysis_node._resolve_exact_shot_generation_inputs(valid_params(prompt="Text direction"))
+assert text_only["task"] == TASK_TEXT_ONLY and text_only["reference_images"] == []
+
+# Results Only withholds every Analysis-typed original. By default all of
+# them can accompany the exact Shot, with ordinary sound positions preserved.
+analysis_video = "https://media.example/analysis.mp4"
+ordinary_video = "https://media.example/ordinary.mp4"
+analysis_video_source = Source("video_picker", snapshot(kind="video_picker",
+    selected=["analysis-video", "ordinary-video"], media={"analysis-video": analysis_video, "ordinary-video": ordinary_video}))
+mixed_analysis_node = generator(analysis_image_source, analysis_video_source, agent_source=analysis_agent)
+mixed_analysis_node._hmb_preflight_kind = analysis_node._hmb_preflight_kind
+analysis_agent._hmb_reference_analysis_owner = lambda **scope: types.SimpleNamespace(
+    _hmb_analysis_excluded_media_for=lambda **exact: {"images": [analysis_image], "videos": [analysis_video]}
+    if exact == scope else {})
+ordinary_audio = "https://media.example/ordinary.wav"
+analysis_audio = ["https://media.example/analysis-a.wav", "https://media.example/analysis-b.mp3"]
+ordinary_sound_tracks = [{"path": ordinary_audio, "purpose": "both"},
+    {"path": "https://media.example/mix-only.wav", "purpose": "mix"}]
+mixed_analysis_node._resolve_exact_shot_sound = lambda _scope, _params: (
+    {"captured": True}, deepcopy(ordinary_sound_tracks), {"kind": "exact_prompt_document"})
+originals = [
+    {"kind": "image", "path": analysis_image, "shot_reference": "@image1"},
+    {"kind": "video", "path": analysis_video, "shot_reference": "@video1"},
+    *[{"kind": "audio", "path": path, "shot_reference": f"@analysis_original_audio_{index}"}
+      for index, path in enumerate([ordinary_audio, *analysis_audio, analysis_audio[0]], 1)],
+]
+original_lookups = []
+
+
+def read_originals(**scope):
+    original_lookups.append(scope)
+    return deepcopy(originals)
+
+
+analysis_agent._hmb_reference_analysis_originals_for = read_originals
+mixed_params = valid_params(prompt="Keep @image2, @video2 and the recorded audio direction")
+all_media = mixed_analysis_node._resolve_exact_shot_generation_inputs(mixed_params)
+assert original_lookups == [{"channel_uuid": CHANNEL, "shot_uuid": SHOT}]
+assert all_media["reference_images"] == [analysis_image, "https://media.example/image-1.png"]
+assert all_media["video_references"] == [analysis_video, ordinary_video]
+assert all_media["reference_audio"] == [ordinary_audio, *analysis_audio]
+assert all_media["_hmb_sound_tracks"] == ordinary_sound_tracks
+assert all_media["_hmb_analysis_media_bindings"] == [
+    {"shot_reference": f"@analysis_original_audio_{index}", "provider_reference": f"@audio{slot}"}
+    for index, slot in enumerate((1, 2, 3, 2), 1)
+]
+mixed_payload = mixed_analysis_node._build_broker_payload(all_media)
+assert mixed_payload["audio_urls"] == [ordinary_audio, *analysis_audio]
+assert mixed_payload["video_urls"] == [analysis_video, ordinary_video]
+assert all_media["_hmb_analysis_video_references"] == [
+    {"shot_reference": "@video1", "provider_reference": "@video1", "usage": "analysis_reference"}]
+assert "HMB ANALYSIS VIDEO REFERENCES" in mixed_payload["prompt"]
+assert '"usage":"analysis_reference"' in mixed_payload["prompt"]
+assert mixed_payload["prompt"].startswith(mixed_params["prompt"])
+assert "@analysis_original_audio_4" in mixed_payload["prompt"]
+
+originals.append({"kind": "audio", "path": "https://media.example/over-limit.wav",
+    "shot_reference": "@analysis_original_audio_5"})
+try:
+    mixed_analysis_node._resolve_exact_shot_generation_inputs(mixed_params)
+    raise AssertionError("all Analysis originals must be counted against the model's audio limit")
+except ValueError as exc:
+    assert "4 reference audio tracks" in str(exc) and "at most 3" in str(exc)
+
+def forbidden_original_read(**_scope):
+    raise AssertionError("Results Only should not load analysis originals")
+
+
+analysis_agent._hmb_reference_analysis_originals_for = forbidden_original_read
+analysis_agent._hmb_reference_analysis_results_only_for = lambda **scope: scope == {
+    "channel_uuid": CHANNEL, "shot_uuid": SHOT}
+results_only = mixed_analysis_node._resolve_exact_shot_generation_inputs(mixed_params)
+assert "_hmb_analysis_video_references" not in results_only
+assert results_only["reference_images"] == ["https://media.example/image-1.png"]
+assert results_only["video_references"] == [ordinary_video]
+assert results_only["reference_audio"] == [ordinary_audio]
+assert results_only["_hmb_sound_tracks"] == ordinary_sound_tracks
+assert all(row["provider_reference"] is None or row["shot_reference"] in {"@image2", "@video2"}
+    for row in results_only["_hmb_analysis_media_bindings"])
+assert mixed_analysis_node._managed_agent_input_fingerprint(results_only) != mixed_analysis_node._managed_agent_input_fingerprint(all_media)
+
+# An explicitly omitted Analysis-only audio source allows text-only input.
+# An ordinary empty 2.5 reference task still requires reference media.
+empty_image_source = Source("image_asset", snapshot(kind="image_asset", selected=[], media={}))
+audio_results_node = generator(empty_image_source, None, agent_source=analysis_agent)
+audio_results_node._hmb_preflight_kind = mixed_analysis_node._hmb_preflight_kind
+analysis_agent._hmb_reference_analysis_owner = lambda **scope: types.SimpleNamespace(
+    _hmb_analysis_excluded_media_for=lambda **exact: {"audio": analysis_audio} if exact == scope else {})
+audio_results_params = {**valid_params(prompt="Describe the observed audio timing"),
+    "model_id": target.SEEDANCE_2_5_MODEL_ID, "output_format": "mov"}
+audio_results = audio_results_node._resolve_exact_shot_generation_inputs(audio_results_params)
+assert audio_results["task"] == TASK_TEXT_ONLY and audio_results["reference_audio"] == []
+audio_results_node._validate_parameters(audio_results)
+analysis_agent._hmb_reference_analysis_owner = lambda **_scope: types.SimpleNamespace(
+    _hmb_analysis_excluded_media_for=lambda **_exact: {"audio": []})
+empty_ordinary = audio_results_node._resolve_exact_shot_generation_inputs(audio_results_params)
+assert empty_ordinary["task"] == TASK_REFERENCE_TO_VIDEO
+try:
+    audio_results_node._validate_parameters(empty_ordinary)
+    raise AssertionError("Results Only must not authorize unrelated empty reference tasks")
+except ValueError as exc:
+    assert "requires at least one reference" in str(exc)
+
 print(
     "HMB Seedance direct Shot source regression: PASS "
     "(Only, image-only, video-only, combined, exact direct Shot media)"

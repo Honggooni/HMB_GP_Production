@@ -26,6 +26,7 @@ async def scenario(engine, folder):
     import HMBVideoPickerLibrary as picker
     from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
     from griptape_nodes.retained_mode.events.node_events import DeleteNodeRequest
+    from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest
 
     engine.event_manager.initialize_queue()
     flow = None
@@ -39,11 +40,14 @@ async def scenario(engine, folder):
         nonlocal flow
         result = engine.handle_request(EnsureWorkflowAndFlowRequest(flow_name=f'PickerSnapshotPolling{len(created) + 1}'))
         assert result.succeeded(), str(result.result_details)
-        flow = engine.flow_manager.get_flow_by_name(result.flow_name)
+        workflow = engine.open_workflows.get(result.workflow_id)
+        created_flow = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name=f'PollingCase{len(created) + 1}'))
+        assert created_flow.succeeded(), str(created_flow.result_details)
+        flow = engine.flow_manager.get_flow_by_name_in(workflow, created_flow.flow_name)
         instance = picker.HMBVideoPickerLibrary(name=f'PollingPicker{len(created) + 1}')
         flow.add_node(instance)
-        engine.object_manager.add_object_by_name(instance.name, instance)
-        engine.node_manager._name_to_parent_flow_name[instance.name] = flow.name
+        engine.object_manager.add_object_by_name_in(workflow, instance.name, instance)
+        workflow.nodes.name_to_parent_flow_name[instance.name] = flow.name
         created.append(instance)
         await asyncio.sleep(.08)
         state = picker._append_video_asset(instance._picker_state(), {

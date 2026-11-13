@@ -46,9 +46,11 @@ def main() -> None:
                 from _hmb_video_tools import _find_ffmpeg
 
                 GriptapeNodes.StaticFilesManager()._static_server_base_url = "http://127.0.0.1:43219"
-                engine.handle_request(EnsureWorkflowAndFlowRequest(
+                ensured = engine.handle_request(EnsureWorkflowAndFlowRequest(
                     display_name="Picker publication", flow_name="PickerPublication"
                 ))
+                assert ensured.succeeded(), ensured.result_details
+                workflow = engine.open_workflows.get(ensured.workflow_id)
                 source = root / "external-depth.mp4"
                 subprocess.run([
                     _find_ffmpeg(), "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=96x64:r=24",
@@ -59,14 +61,14 @@ def main() -> None:
                 for slot, role in enumerate(("Original", "Mask", "Depth", "MotionGuide"), 1):
                     records = []
                     artifact, macro = picker._copy_video_to_griptape_project(
-                        SimpleNamespace(name=f"Picker_{role}"), source, slot,
+                        SimpleNamespace(name=f"Picker_{role}", workflow=workflow), source, slot,
                         transaction_records=records, backup_folder=root / f"backup-{slot}",
                     )
                     target = Path(File(macro).resolve()).resolve()
                     assert target.is_relative_to(workspace.resolve()), target
                     assert target.read_bytes() == source.read_bytes()
                     assert not resolve_to_macro_path(str(target)).is_external
-                    metadata = _resolve_sidecar_path(target, engine)
+                    metadata = _resolve_sidecar_path(target, engine, workflow)
                     assert metadata.is_relative_to(workspace.resolve()), metadata
                     document = json.loads(metadata.read_text(encoding="utf-8"))
                     assert document["schema_version"] and document["situation"]

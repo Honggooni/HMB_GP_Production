@@ -460,11 +460,14 @@ try {
   },true);
   await check('Generate captures every selected Shot and current Maya file before state ACK',async()=>{
     for(const replaceFile of [false,true])for(const [index,shot] of shots.entries()) {
-      const scene=replaceFile?`C:/replacement-${index+1}.mb`:'C:/loaded-on-shot-1.mb';
-      const value={...fixture(),active_picker_shot_uuid:shots[0],scene_path:scene,scene_request_path:scene,
-        scene_draft_path:scene,camera:'camera1',selected_camera:'camera1',cameras:[{name:'camera1',full_path:'camera1'}],
+      const sceneFor=(i)=>replaceFile?`C:/replacement-${i+1}.mb`:`C:/loaded-on-shot-${i+1}.mb`;
+      const authored=(i)=>({scene_path:sceneFor(i),scene_request_path:sceneFor(i),scene_draft_path:sceneFor(i),
+        scene_stage:'OUTLINER_READY',native_read_ready:true,camera:'camera1',selected_camera:'camera1',
+        cameras:[{name:'camera1',full_path:'camera1'}],
         start_frame:101,end_frame:148,source_fps:24,output_fps:24,output_width:1280,output_height:720,
-        mask_enabled:true,slot_assignments:[{video_slot:1,bindings:[{full_dag_path:'|Actor',maya_uuid:'root',color:'Red'}]}]};
+        mask_enabled:true,slot_assignments:[{video_slot:1,bindings:[{full_dag_path:'|Actor',maya_uuid:'root',color:'Red'}]}]});
+      const value={...fixture(),...authored(0),active_picker_shot_uuid:shots[0],picker_scene_owner_uuid:shots[0],
+        picker_scene_states:Object.fromEntries(shots.map((uid,i)=>[uid,authored(i)]))};
       await page.evaluate(value=>window.start(value),value);
       if(await page.locator('.hmbvp').getAttribute('data-picker-view')!=='expanded') {
         await page.locator('[data-picker-toggle-surface="header"]').dispatchEvent('dblclick');
@@ -483,7 +486,7 @@ try {
       },shot);
       assert.equal(command?.action,'run_video');
       assert.equal(command.payload.picker_shot_uuid,shot);
-      assert.equal(command.payload.scene_path,scene);
+      assert.equal(command.payload.scene_path,sceneFor(index));
       assert.equal(command.payload.authoring_state.selected_camera,'camera1');
       assert.equal(command.payload.authoring_state.slot_assignments[0].bindings[0].color,'Red');
       assert.equal(await page.evaluate(()=>window.active()),shot);

@@ -275,10 +275,9 @@ class BlenderScissorsPickerIntegration(unittest.TestCase):
                     if "engine" in inspect.signature(ControlFlow).parameters:
                         options["engine"] = manager.engine
                     flow = ControlFlow(**options)
-                    flow.add_node(node)
-                    GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
-                    GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
-                    GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = flow.name
+                    from _hmb_fixture_sdk import ensure_fixture_flow, register_fixture_node
+                    flow = ensure_fixture_flow(GriptapeNodes, flow.name)
+                    register_fixture_node(GriptapeNodes, flow, node)
                 node._hmb_shot_catalog_snapshot = copy.deepcopy(catalog)
                 node._hmb_shot_route_status = {"ok": True, "code": "ready"}
                 node._write_state(state)

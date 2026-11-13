@@ -13,6 +13,8 @@ import json
 import logging
 import os
 from pathlib import Path
+from _hmb_fixture_sdk import fixture_flow_connections
+from types import SimpleNamespace
 import socket
 import sys
 import tempfile
@@ -60,13 +62,18 @@ def digest(value):
 def edges(engine, flow):
     return sorted((item.source_node.name, item.source_parameter.name,
         item.target_node.name, item.target_parameter.name)
-        for item in engine.flow_manager._get_connections_for_flow(flow))
+        for item in fixture_flow_connections(engine, flow))
 
 
-def expect_start(node, original):
-    assert type(node).__name__ == "HMBPromptLibrary", type(node).__name__
-    assert node.metadata["size"]["width"] == 1800
-    assert node.metadata["size"]["height"] == 1350
+def expect_start(node, original, check_type=True):
+    if check_type:
+        assert type(node).__name__ == "HMBPromptLibrary", type(node).__name__
+    saved = (original or {}).get("size")
+    saved = saved if isinstance(saved, dict) else {}
+    for key, default in (("width", 1490), ("height", 1480)):
+        authored = saved.get(key)
+        expected = authored if type(authored) in {int, float} and authored > 0 else default
+        assert node.metadata["size"][key] == expected, (key, node.metadata["size"], expected)
     for key, value in (original or {}).items():
         if key != "size":
             assert node.metadata[key] == value, key
@@ -90,7 +97,7 @@ async def exercise(engine, selected_case=None):
         AlterParameterDetailsRequest, SetParameterValueRequest)
     from griptape_nodes.serialization.values import encode_value
 
-    assert (prompts.PROMPT_START_WIDTH, prompts.PROMPT_START_HEIGHT) == (1800, 1350)
+    assert (prompts.PROMPT_START_WIDTH, prompts.PROMPT_START_HEIGHT) == (1490, 1480)
     schema = LibrarySchema.model_validate_json((ROOT / "griptape-nodes-library.json").read_text("utf-8-sig"))
     library = LibraryRegistry.generate_new_library(schema)
     classes = {cls.__name__: cls for cls in (prompts.HMBPromptLibrary, generators.HMBSeedanceGeneration)}
@@ -112,7 +119,7 @@ async def exercise(engine, selected_case=None):
             original = deepcopy(metadata)
             prepared = prompts._prompt_start_metadata(metadata)
             assert metadata == original, "Startup helper mutated input metadata"
-            assert prepared["size"]["width"] == 1800 and prepared["size"]["height"] == 1350
+            expect_start(SimpleNamespace(metadata=prepared), original, check_type=False)
             result = send(engine, CreateNodeRequest(node_type="HMBPromptLibrary", node_name="Synthetic Prompt",
                 specific_library_name=schema.name, metadata=metadata, initial_setup=True,
                 create_error_proxy_on_failure=False))
@@ -127,8 +134,8 @@ async def exercise(engine, selected_case=None):
             runtime_size = dict(width=2000 + case_number, height=1500 + case_number, runtime_note="retain")
             send(engine, SetNodeMetadataRequest(node_name=prompt.name, metadata={"size": runtime_size}))
             assert prompt.metadata["size"] == runtime_size
-            # Native serialization must capture that current size honestly; only
-            # the next construction normalizes it to the approved startup size.
+            # Native serialization and the next construction preserve a saved
+            # positive shell honestly; only missing/invalid values use defaults.
             serialized = send(engine, SerializeFlowToCommandsRequest(flow_name=flow.name,
                 include_create_flow_command=True)).serialized_flow_commands
             assert len(serialized.serialized_node_commands) == 1
@@ -226,7 +233,7 @@ async def exercise(engine, selected_case=None):
         restored_flow = engine.flow_manager.get_flow_by_name(loaded.flow_name)
         restored_prompt = restored_flow.nodes[prompt.name]
         assert len(restored_flow.nodes) == 6
-        expect_start(restored_prompt, metadata_before)
+        expect_start(restored_prompt, {**metadata_before, "size": {"width": 1100, "height": 1329}})
         assert edges(engine, restored_flow) == edges_before
         assert restored_prompt._get_raw_parameter_value(prompts.WIDGET_PARAMETER_NAME) == raw_before
         assert restored_prompt._current_state() == before
@@ -235,7 +242,7 @@ async def exercise(engine, selected_case=None):
             generator = restored_flow.nodes[name]
             assert {key: encode_value(generator._get_raw_parameter_value(key)) for key in values} == values
         assert not ATTEMPTS, ATTEMPTS
-        print("HMB_PROMPT_START_SIZE_HOST=PASS " + json.dumps({"size": [1800, 1350],
+        print("HMB_PROMPT_START_SIZE_HOST=PASS " + json.dumps({"new_default_size": [1490, 1480],
             "saved_size_cases": CASE_RESULTS, "runtime_resize_preserved": True,
             "position_and_custom_metadata_preserved": True, "authored_request_metadata_unmodified": True,
             "sdk_registration_keys_added": ["library_node_metadata", "library", "node_type"],

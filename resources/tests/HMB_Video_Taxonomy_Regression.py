@@ -245,6 +245,49 @@ def layout_picker_payload(uids):
     }
 
 
+# An imported reference has explicit Picker provenance. It must not acquire
+# Maya/Blender primary-control authority merely by travelling through Picker.
+for mode in ("maya", "blender"):
+    imported = layout_picker_payload(("reference", "preview"))
+    imported["mode"] = mode
+    imported["videos"][0].update(generation_role="imported",
+        media_kind="imported_mp4_reference", video_role="user_imported_reference")
+    imported["videos"][1].update(generation_role="original",
+        media_kind="blender_original_render" if mode == "blender" else "maya_original_playblast",
+        video_role="blender_original_render" if mode == "blender" else "maya_original_playblast")
+    restored = prompt._apply_picker_payload(prompt._default_widget_state(), imported, connected=True)
+    row = restored["videos"][0]
+    assert (row["video_main_type"], row["video_sub_type"]) == ("Custom / Context", "Context")
+    assert row["control_role"] == "Context Only"
+    assert restored["videos"][1]["control_role"] == "Primary Unified Shot Control"
+    prompt._merge_analysis_generated_text(restored, {"VIDEO_VFX": "Observed reference camera movement"})
+    analysis_machine = prompt._build_data_only_prompt_package(restored)
+    assert "Observed reference camera movement" in analysis_machine
+    assert prompt_records(analysis_machine)[0]["videos"][0]["control_role"] == "Context Only"
+    # A previously saved automatically assigned Playblast is corrected by UID.
+    row.update(video_main_type="Maya Preview / Playblast", video_sub_type="Original Preview",
+        picker_auto_video_main_type="Maya Preview / Playblast", picker_auto_video_sub_type="Original Preview")
+    restored = prompt._apply_picker_payload(prompt._normalize_state(restored), imported, connected=True)
+    assert restored["videos"][0]["control_role"] == "Context Only"
+    for pair in (("Motion Reference", "Local Motion"), ("FX Reference", "FX Effect Only"),
+                 ("Maya Preview / Playblast", "Original Preview"), ("Custom / Context", "Analysis")):
+        authored = copy.deepcopy(restored)
+        authored["videos"][0].update(video_main_type=pair[0], video_sub_type=pair[1], keep_out="  keep this  ")
+        changed = prompt._apply_picker_payload(authored, imported, connected=True)
+        assert (changed["videos"][0]["video_main_type"], changed["videos"][0]["video_sub_type"]) == pair
+        assert changed["videos"][0]["keep_out"] == "  keep this  "
+    imported["videos"].reverse()
+    imported["ordered_video_uids"].reverse()
+    for slot, video in enumerate(imported["videos"], 1):
+        video.update(video_slot=slot, selection_order=slot)
+    restored = prompt._apply_picker_payload(restored, imported, connected=True)
+    restored = prompt._normalize_state(json.loads(json.dumps(restored)))
+    job, _ = prompt_records(prompt._build_data_only_prompt_package(restored))
+    assert job["videos"][1]["video"] == "@video2"
+    assert job["videos"][1]["control_role"] == "Context Only"
+    assert job["videos"][0]["control_role"] == "Primary Unified Shot Control"
+    assert restored["text"]["VIDEO_VFX"] == "Observed reference camera movement"
+
 picker_state = prompt._apply_picker_payload(
     prompt._default_widget_state(), layout_picker_payload(("blocking", "other")), connected=True,
 )

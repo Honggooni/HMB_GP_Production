@@ -86,6 +86,8 @@ async def exercise(engine, phase, out):
         bindings = base.assert_graph(engine, flow, nodes, shots)
         generators = [bindings[shot["shot_uuid"]] for shot in shots]
         text_key = next(iter(prompts.TEXT_FIELD_DEFAULTS))
+        widget_state = prompt.get_parameter_by_name(prompts.WIDGET_PARAMETER_NAME)
+        assert widget_state.allow_variable_substitution is False
         prompt_state = prompt._current_state()
         for shot in shots:
             prompt_state = prompts._select_prompt_shot_document(prompt_state, dict(shot, channel_uuid=base.CHANNEL))
@@ -94,6 +96,15 @@ async def exercise(engine, phase, out):
             prompt_state = prompts._store_prompt_shot_document(prompt_state)
         host.send(engine, SetParameterValueRequest(node_name=prompt.name, parameter_name=prompts.WIDGET_PARAMETER_NAME,
             value=prompts._json_dumps(prompt_state), initial_setup=True))
+        saved_state = prompt.get_parameter_value(prompts.WIDGET_PARAMETER_NAME)
+        output_parameter = prompt.get_parameter_by_name("PROMPT_OUT")
+        output_substitution = output_parameter.allow_variable_substitution
+        widget_state.allow_variable_substitution = True  # Existing pre-update property.
+        prompts._add_widget_state_parameter(prompt)
+        assert prompt.get_parameter_by_name(prompts.WIDGET_PARAMETER_NAME) is widget_state
+        assert widget_state.allow_variable_substitution is False
+        assert prompt.get_parameter_value(prompts.WIDGET_PARAMETER_NAME) == saved_state
+        assert output_parameter.allow_variable_substitution == output_substitution
         prompt._sync_prompt_output_now()
         for node, shot in zip(generators, shots):
             for key, value in dict(model_id=t.MODEL_NAME_SEEDANCE_2_5, task=t.TASK_REFERENCE_TO_VIDEO,
@@ -123,6 +134,7 @@ async def exercise(engine, phase, out):
             assert manager._hmb_manager_prompt_owner(channel_uuid=channel_uuid, shot_uuid=shot_uuid) is prompt_owner is prompt
             document = prompt_owner._hmb_prompt_shot_document(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
             assert isinstance(document, dict)
+            assert f"Offline authored {shot_uuid} {{literal}} OFF 0" in document["machine_prompt"]
             subscription = generator._hmb_shot_channel_subscription()
             assert subscription["enabled"] and subscription["shot_uuid"] == shot_uuid
             counters["compile"][generator.name] += 1

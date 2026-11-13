@@ -41,7 +41,7 @@ try:
         DeserializeSelectedNodesFromCommandsResultSuccess,
         SerializeSelectedNodesToCommandsRequest, SerializeSelectedNodesToCommandsResultSuccess,
         DuplicateSelectedNodesRequest, DuplicateSelectedNodesResultFailure,
-        ResetNodeToDefaultsRequest, ResetNodeToDefaultsResultSuccess,
+        ResetNodeToDefaultsRequest,
     )
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 except ImportError:
@@ -69,14 +69,18 @@ def create(engine, name, **kwargs):
 
 def inventory(engine):
     states = {}
-    for name in engine.node_manager._name_to_parent_flow_name:
+    from _hmb_deletion_guard import _node_inventory
+    parents = _node_inventory(engine)
+    workflow = engine.current_workflow_or_none() if hasattr(engine, "current_workflow_or_none") else None
+    objects = workflow.objects if workflow is not None else engine.object_manager
+    for name in parents:
         node = engine.node_manager.get_node_by_name(name)
         states[name] = (copy.deepcopy(node.metadata), copy.deepcopy(dict(node.parameter_values)),
             copy.deepcopy(dict(node.parameter_output_values)))
     edges = sorted((item.source_node.name, item.source_parameter.name,
         item.target_node.name, item.target_parameter.name)
         for item in engine.flow_manager.get_connections().connections.values())
-    return (dict(engine.node_manager._name_to_parent_flow_name), dict(engine.object_manager._name_to_objects),
+    return (dict(parents), dict(objects._name_to_objects),
         engine.context_manager.get_current_flow().name,
         engine.context_manager.get_current_node() if engine.context_manager.has_current_node() else None,
         states, edges)
@@ -410,7 +414,8 @@ async def main():
             engine.event_manager.remove_pre_dispatch_hook(unrelated_hook)
             assert engine.event_manager._pre_dispatch_hooks == [gate.hook]
 
-        # Reset establishes an engine-lifetime detached-port gate. Exercise it
+        # Raw stock Reset is guarded because it would replace a live HMB node.
+        # Exercise it
         # in a distinct engine so the existing admission/unload leak assertion
         # above remains exact and does not mistake that separate gate for a leak.
         with engine_scope() as reset_engine:
@@ -424,16 +429,16 @@ async def main():
                 old = reset_engine.node_manager.get_node_by_name(created.node_name)
                 old.set_parameter_value("authored", "Explicitly reset this fixture", initial_setup=True)
                 reset = await reset_engine.ahandle_request(ResetNodeToDefaultsRequest(node_name=old.name, broadcast_result=False))
-                assert isinstance(reset, ResetNodeToDefaultsResultSuccess), str(reset.result_details)
+                assert reset.failed(), str(reset.result_details)
                 current = reset_engine.node_manager.get_node_by_name(created.node_name)
-                assert current is not old and current.get_parameter_value("authored") == "default"
+                assert current is old and current.get_parameter_value("authored") == "Explicitly reset this fixture"
                 assert current.metadata["size"] == {"width": 800, "height": 680}
                 assert len(reset_engine.flow_manager.get_flow_by_name("BashResetFlow").nodes) == 1
                 after_reset = inventory(reset_engine)
                 quiet(send(reset_engine, CreateNodeRequest(node_type="HMBImageBash", specific_library_name="HMB_GP_Production",
                     node_name="BashAfterReset", create_error_proxy_on_failure=False)), CreateNodeResultFailure)
                 assert inventory(reset_engine) == after_reset
-                print("PASS official SDK Reset keeps one Bash and its geometry; subsequent palette admission remains guarded")
+                print("PASS official SDK rejects raw Reset without replacing Bash; subsequent palette admission remains guarded")
             finally:
                 LibraryRegistry.unregister_library("HMB_GP_Production", event_manager=reset_engine.event_manager)
         assert NETWORK_ATTEMPTS == []

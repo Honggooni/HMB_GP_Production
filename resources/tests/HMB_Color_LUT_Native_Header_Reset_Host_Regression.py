@@ -1,7 +1,7 @@
-"""Actual installed SDK native Reset contract in an isolated synthetic flow.
+"""Actual installed SDK raw Reset guard and approved refresh in a synthetic flow.
 
 Only media probing and optional HMB routing are deferred. Native construction,
-connections, locking, Reset/delete/rename and default Color LUT state stay real.
+connections, locking, Reset refusal, refresh and Color LUT state stay real.
 Two tiny local FFmpeg fixtures are preservation witnesses; no paid generation,
 network, live application, user workflow or installed product is accessed.
 """
@@ -30,7 +30,7 @@ NETWORK_ATTEMPTS = 0
 def no_network(*_args, **_kwargs):
     global NETWORK_ATTEMPTS
     NETWORK_ATTEMPTS += 1
-    raise AssertionError("Native header Reset must not access network/provider/Broker")
+    raise AssertionError("Native header reset/refresh must not access network/provider/Broker")
 
 
 async def exercise(engine, folder: Path) -> dict:
@@ -40,10 +40,12 @@ async def exercise(engine, folder: Path) -> dict:
     from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, ListConnectionsForNodeRequest
     from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
     from griptape_nodes.retained_mode.events.node_events import (
-        CanResetNodeToDefaultsRequest, CreateNodeRequest, ResetNodeToDefaultsRequest, SetLockNodeStateRequest,
+        CreateNodeRequest, ResetNodeToDefaultsRequest, SetLockNodeStateRequest,
     )
     from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
     import HMBColorLUTLibrary as lut
+    import _hmb_library_bootstrap as bootstrap
+    import _hmb_connection_management as connection_api
     import _hmb_shot_routing as routing
     from _hmb_video_tools import _find_ffmpeg
 
@@ -64,9 +66,8 @@ async def exercise(engine, folder: Path) -> dict:
     flow = engine.flow_manager.get_flow_by_name(ensured.flow_name)
 
     def register(node):
-        flow.add_node(node)
-        engine.object_manager.add_object_by_name(node.name, node)
-        engine.node_manager._name_to_parent_flow_name[node.name] = flow.name
+        from _hmb_fixture_sdk import register_fixture_node
+        register_fixture_node(engine, flow, node)
 
     source = DataNode(name="SyntheticNativeSource")
     source.add_parameter(Parameter(name="source", type="dict", output_type="dict", default_value={},
@@ -89,10 +90,15 @@ async def exercise(engine, folder: Path) -> dict:
     # of scope. All reset connection/lifecycle handlers run through the SDK.
     with ExitStack() as patches:
         patches.enter_context(mock.patch.object(lut, "_usage_bridge", side_effect=no_network))
+        patches.enter_context(mock.patch.object(bootstrap._Registration, "start_web_worker", return_value=None))
+        patches.enter_context(mock.patch.object(bootstrap, "_hmb_coordinate_native_editor_update", return_value={"status": "unsupported"}))
         for name in ("schedule_post_registration_reconcile", "schedule_post_hydration_reconcile",
                      "schedule_post_deletion_reconcile", "reconcile_shot_routing"):
             patches.enter_context(mock.patch.object(routing, name))
         queue_source = patches.enter_context(mock.patch.object(lut.HMBColorLUTLibrary, "_queue_source"))
+        owner = bootstrap.HMBProductionLibrary.__new__(bootstrap.HMBProductionLibrary)
+        owner._registrations = set()
+        owner.before_library_nodes_loaded(schema, library)
         created = engine.handle_request(CreateNodeRequest(node_type="HMBColorLUTLibrary", specific_library_name=schema.name,
             node_name="SyntheticNativeColorLUT", override_parent_flow_name=flow.name,
             create_error_proxy_on_failure=False))
@@ -116,23 +122,25 @@ async def exercise(engine, folder: Path) -> dict:
             assert result.succeeded(), result.result_details
         assert old._hmb_color_lut_state["settings"]["exposure"] == 1.25
         assert old._hmb_color_lut_state["source"]["path"] == str(source_file)
-        eligibility = engine.handle_request(CanResetNodeToDefaultsRequest(node_name=old.name))
-        assert eligibility.succeeded() and eligibility.can_reset
-
+        before_metadata = deepcopy(old.metadata)
+        before_state = deepcopy(old._hmb_color_lut_state)
+        before_outputs = deepcopy(dict(old.parameter_output_values))
         reset = await engine.ahandle_request(ResetNodeToDefaultsRequest(node_name=old.name))
-        assert reset.succeeded(), reset.result_details
-        assert not reset.failed_incoming_connections and not reset.failed_outgoing_connections
-        fresh = engine.node_manager.get_node_by_name(reset.node_name)
-        assert fresh is not old and fresh.name == old.name and old._hmb_node_deleted
-        assert fresh.metadata["position"] == {"x": 123, "y": 456}
-        assert fresh.metadata["size"] == {"width": 1370, "height": 1175}
-        assert "synthetic_instance_note" not in fresh.metadata
-        assert fresh.get_parameter_by_name(lut.UI).ui_options["height"] == lut.COLOR_LUT_WIDGET_HEIGHT
-        fresh_state = fresh._hmb_color_lut_state
-        defaults = lut.default_state()
-        for key in ("settings", "output", "source", "result", "preset_name", "shot_states"):
-            assert fresh_state[key] == defaults[key], (key, fresh_state[key])
-        connections = engine.handle_request(ListConnectionsForNodeRequest(node_name=fresh.name))
+        assert reset.failed(), reset.result_details
+        assert engine.node_manager.get_node_by_name(old.name) is old and not old._hmb_node_deleted
+        assert old.metadata == before_metadata and old._hmb_color_lut_state == before_state
+        assert dict(old.parameter_output_values) == before_outputs
+
+        view = engine.handle_request(connection_api.HMBGetNodeConnectionsRequest(node_name=old.name))
+        assert view.succeeded() and view.can_refresh, view.result_details
+        refreshed = await engine.ahandle_request(connection_api.HMBManageNodeConnectionsRequest(
+            node_name=old.name, operation="refresh", expected_state_token=view.state_token,
+            broadcast_result=False))
+        assert refreshed.succeeded(), refreshed.result_details
+        assert engine.node_manager.get_node_by_name(old.name) is old and not old._hmb_node_deleted
+        assert old.metadata == before_metadata and old._hmb_color_lut_state == before_state
+        assert dict(old.parameter_output_values) == before_outputs
+        connections = engine.handle_request(ListConnectionsForNodeRequest(node_name=old.name))
         assert connections.succeeded(), connections.result_details
         assert [(edge.source_node_name, edge.source_parameter_name, edge.target_parameter_name)
                 for edge in connections.incoming_connections] == [(source.name, "source", lut.SOURCE)]
@@ -144,19 +152,22 @@ async def exercise(engine, folder: Path) -> dict:
         assert all(path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == digest for path, digest in file_hashes.items())
 
         # The native lock icon contract must prevent a destructive Reset.
-        lock = engine.handle_request(SetLockNodeStateRequest(node_name=fresh.name, lock=True))
+        lock = engine.handle_request(SetLockNodeStateRequest(node_name=old.name, lock=True))
         assert lock.succeeded(), lock.result_details
-        eligibility = engine.handle_request(CanResetNodeToDefaultsRequest(node_name=fresh.name))
-        assert eligibility.succeeded() and eligibility.can_reset is False
-        rejected = await engine.ahandle_request(ResetNodeToDefaultsRequest(node_name=fresh.name))
-        assert rejected.failed() and engine.node_manager.get_node_by_name(fresh.name) is fresh
-        assert not fresh._hmb_node_deleted
+        locked_view = engine.handle_request(connection_api.HMBGetNodeConnectionsRequest(node_name=old.name))
+        assert locked_view.succeeded() and locked_view.can_refresh is False
+        rejected = await engine.ahandle_request(connection_api.HMBManageNodeConnectionsRequest(
+            node_name=old.name, operation="refresh", expected_state_token=locked_view.state_token,
+            broadcast_result=False))
+        assert rejected.failed() and engine.node_manager.get_node_by_name(old.name) is old
+        assert not old._hmb_node_deleted
+        assert old._hmb_color_lut_state == before_state and dict(old.parameter_output_values) == before_outputs
         assert all(hashlib.sha256(path.read_bytes()).hexdigest() == digest for path, digest in file_hashes.items())
         assert NETWORK_ATTEMPTS == 0, "Optional exception handling hid a forbidden transport attempt"
-        return {"status": "PASS", "native_reset": "fresh instance with same name; defaults restored",
+        return {"status": "PASS", "native_reset": "rejected without mutation", "approved_refresh": "state and wires preserved",
                 "compatible_incoming_wires": 1, "compatible_outgoing_wires": 1,
                 "custom_position_and_size": "preserved", "other_node_and_two_local_videos": "preserved",
-                "locked_reset": "rejected", "preview_worker_calls": queue_source.call_count,
+                "locked_refresh": "rejected", "preview_worker_calls": queue_source.call_count,
                 "network_calls": NETWORK_ATTEMPTS, "paid_requests": 0, "user_workflow_changes": 0}
 
 

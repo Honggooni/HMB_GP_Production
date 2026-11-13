@@ -10,6 +10,7 @@ original compressed source or the preceding color conversion/quantization.
 """
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -19,7 +20,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from _hmb_video_tools import VideoMediaService, VideoToolError, _find_ffmpeg, _find_ffprobe
 
@@ -212,6 +213,22 @@ def _color_details(source: Path) -> dict[str, Any]:
     return details
 
 
+def _stream_duration(details: Mapping[str, Any]) -> float:
+    try:
+        duration = float(details.get("duration") or 0)
+    except (ValueError, TypeError, OverflowError):
+        duration = 0
+    if math.isfinite(duration) and duration > 0:
+        return duration
+    # Matroska's DURATION tag is an end timestamp, including a nonzero
+    # stream start. Container duration may instead include AAC encoder padding.
+    tags = details.get("tags") if isinstance(details.get("tags"), Mapping) else {}
+    match = re.fullmatch(r"(\d+):(\d+):(\d+(?:\.\d+)?)", str(tags.get("DURATION") or tags.get("duration") or ""))
+    if match:
+        return max(0.0, int(match[1]) * 3600 + int(match[2]) * 60 + float(match[3]) - float(details.get("start_time") or 0))
+    return float(details.get("format_duration") or 0)
+
+
 def _basic_probe(source: Path, details: Mapping[str, Any]) -> dict[str, Any]:
     """UTF-8-safe counterpart to the shared probe's public geometry/audio shape."""
     try:
@@ -232,7 +249,7 @@ def _basic_probe(source: Path, details: Mapping[str, Any]) -> dict[str, Any]:
     audio = (details.get("audio_streams") or [{}])[0]
     return {"path": str(source), "probe_backend": details.get("probe_backend"),
             "width": width, "height": height,
-            "frame_rate": frame_rate, "duration": float(details.get("duration") or details.get("format_duration") or 0),
+            "frame_rate": frame_rate, "duration": _stream_duration(details),
             "has_audio": bool(details.get("audio_streams")), "video_codec": str(details.get("codec_name") or ""),
             "pixel_format": str(details.get("pix_fmt") or ""), "video_profile": str(details.get("profile") or ""),
             "video_time_base": str(details.get("time_base") or ""), "audio_codec": str(audio.get("codec_name") or ""),
@@ -335,6 +352,114 @@ def _audio_options(probe: Mapping[str, Any], codec: str) -> tuple[list[str], str
     return [*options, "-c:a", "aac", "-b:a", "320k"], "aac_320k"
 
 
+def normalize_audio_mix(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, Mapping) else {}
+    return {"enabled": raw.get("enabled") is True,
+            "original_audio": "mute" if raw.get("original_audio") == "mute" else "preserve",
+            "source": "rendered" if raw.get("source") == "rendered" else "current"}
+
+
+def _sound_duration(path: Path) -> float:
+    """Probe local sound independently of its extension and catalog metadata."""
+    ffmpeg = _find_ffmpeg()
+    try:
+        probe = _find_ffprobe(ffmpeg)
+    except (OSError, ValueError):
+        probe = None
+    if probe:
+        result = subprocess.run([probe, "-v", "error", "-protocol_whitelist", "file,pipe", "-select_streams", "a:0",
+                                 "-show_entries", "stream=duration:format=duration", "-of", "json", str(path)],
+                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        try:
+            data = json.loads(result.stdout)
+            streams = data.get("streams", [])
+            duration = float(streams[0].get("duration") or data.get("format", {}).get("duration") or 0) if streams else 0
+        except (ValueError, TypeError, IndexError):
+            duration = 0
+        if result.returncode or not math.isfinite(duration) or duration <= 0:
+            raise ColorLUTError("Could not verify the selected sound's audio stream and duration.")
+        return duration
+    result = subprocess.run([ffmpeg, "-hide_banner", "-protocol_whitelist", "file,pipe", "-i", str(path)],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+    log = result.stderr or result.stdout
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", log)
+    if "Audio:" not in log or not match:
+        raise ColorLUTError("Could not verify the selected sound's audio stream and duration.")
+    return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+
+
+def _prepare_sound_tracks(tracks: Any, video_duration: float) -> list[dict[str, Any]]:
+    if not isinstance(tracks, (list, tuple)) or len(tracks) > 64:
+        raise ColorLUTError("Audio Mix accepts at most 64 selected sound tracks.")
+    prepared = []
+    for raw in tracks:
+        if not isinstance(raw, Mapping):
+            raise ColorLUTError("A selected sound track is invalid.")
+        if raw.get("enabled", True) is False:
+            continue
+        source = resolve_source(raw.get("path"))
+        before = source.stat()
+        duration = _sound_duration(source)
+        values = {}
+        for key, default in (("in_seconds", 0), ("out_seconds", duration), ("start_seconds", 0), ("gain_db", 0)):
+            value = raw.get(key, default)
+            if key == "out_seconds" and value is None:
+                value = duration
+            if isinstance(value, bool):
+                raise ColorLUTError("Audio Mix timing and gain must be finite numbers.")
+            try:
+                number = float(value)
+            except (ValueError, TypeError, OverflowError) as exc:
+                raise ColorLUTError("Audio Mix timing and gain must be finite numbers.") from exc
+            if not math.isfinite(number):
+                raise ColorLUTError("Audio Mix timing and gain must be finite numbers.")
+            values[key] = number
+        if (values["in_seconds"] < 0 or values["out_seconds"] <= values["in_seconds"]
+                or values["out_seconds"] > duration + .025 or values["start_seconds"] < 0
+                or values["start_seconds"] >= video_duration or not -60 <= values["gain_db"] <= 24):
+            raise ColorLUTError("Audio Mix requires a valid sound trim, a start inside the video, and gain between -60 and 24 dB.")
+        if "loop" in raw and not isinstance(raw["loop"], bool):
+            raise ColorLUTError("Audio Mix loop must be a boolean.")
+        current = source.stat()
+        if (before.st_size, before.st_mtime_ns, before.st_ino, before.st_dev) != (current.st_size, current.st_mtime_ns, current.st_ino, current.st_dev):
+            raise ColorLUTError("A sound source changed while preparing Audio Mix.")
+        prepared.append({**raw, **values, "path": str(source), "loop": raw.get("loop") is True,
+                         "out_seconds": min(values["out_seconds"], duration), "_stat": before})
+    return prepared
+
+
+def _mix_audio_filter(probe: Mapping[str, Any], tracks: Sequence[Mapping[str, Any]], original_audio: str) -> str:
+    """A finite stereo mix on the video's clock; it never controls video EOF."""
+    duration = float(probe["duration"])
+    start = float(probe.get("start_time") or 0)
+    samples = max(1, math.ceil(duration * 48000))
+    graph, labels = [], []
+    if original_audio == "preserve":
+        for index, stream in enumerate(probe.get("audio_streams") or []):
+            label = f"original{index}"
+            graph.append(f"[0:a:{index}]aresample=48000:async=1:first_pts={round(start * 48000)},"
+                         f"asetpts=N/SR/TB,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                         f"apad=whole_len={samples},atrim=duration={duration:.9f}[{label}]")
+            labels.append(f"[{label}]")
+    for index, track in enumerate(tracks, 1):
+        label = f"sound{index}"
+        trim_duration = track["out_seconds"] - track["in_seconds"]
+        filters = ["asetpts=N/SR/TB", f"atrim=start={track['in_seconds']:.9f}:end={track['out_seconds']:.9f}", "asetpts=N/SR/TB",
+                   "aresample=48000", "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"]
+        if track["loop"]:
+            filters.append(f"aloop=loop=-1:size={max(1, round(trim_duration * 48000))}")
+        filters += ["asetpts=N/SR/TB", f"atrim=duration={duration - track['start_seconds']:.9f}", f"volume={track['gain_db']:.6f}dB",
+                    f"adelay={round(track['start_seconds'] * 48000)}S:all=1", "asetpts=N/SR/TB", f"apad=whole_len={samples}",
+                    f"atrim=duration={duration:.9f}"]
+        graph.append(f"[{index}:a:0]" + ",".join(filters) + f"[{label}]")
+        labels.append(f"[{label}]")
+    if not labels:
+        return ""
+    graph.append("".join(labels) + f"amix=inputs={len(labels)}:duration=longest:dropout_transition=0:normalize=0,"
+                 f"atrim=duration={duration:.9f},asetpts=N/SR/TB+({start:.9f})/TB[mixed_audio]")
+    return ";".join(graph)
+
+
 def _notify(progress: Callable[[float], None] | None, value: float) -> None:
     if progress is not None:
         try:
@@ -397,7 +522,8 @@ def _run_export(command: list[str], cwd: Path, cancel_event: threading.Event | N
 
 
 def export_video(source_path: Any, output_path: str | Path, settings: Any, codec: str = "hevc10",
-                 cancel_event: threading.Event | None = None, progress: Callable[[float], None] | None = None) -> dict[str, Any]:
+                 cancel_event: threading.Event | None = None, progress: Callable[[float], None] | None = None,
+                 *, sound_tracks: Sequence[Mapping[str, Any]] = (), original_audio: str = "preserve") -> dict[str, Any]:
     """Grade the original video in one encode, verify, then publish without overwrite."""
     if codec not in CODEC_EXTENSIONS:
         raise ColorLUTError("Export codec must be hevc10, prores or ffv1.")
@@ -412,33 +538,56 @@ def export_video(source_path: Any, output_path: str | Path, settings: Any, codec
     if not output.parent.is_dir():
         raise ColorLUTError("Output directory does not exist.")
     source_probe = probe_source(source)
+    if original_audio not in {"preserve", "mute"}:
+        raise ColorLUTError("Original audio must be preserve or mute.")
+    mixing = bool(sound_tracks) or original_audio == "mute"
+    if mixing and (not math.isfinite(source_probe["duration"]) or source_probe["duration"] <= 0):
+        raise ColorLUTError("Audio Mix requires a verified positive video duration.")
+    tracks = _prepare_sound_tracks(sound_tracks, source_probe["duration"]) if mixing else []
+    normalized = normalize_settings(settings)
+    video_copy = bool(mixing and not normalized["enabled"] and codec != "ffv1" and source_probe["video_codec"] in {
+        "h264", "hevc", "prores", "mpeg4", "mjpeg", "dnxhd", "qtrle", "png"})
     width, height = int(source_probe["width"]), int(source_probe["height"])
-    if (codec == "hevc10" and (width % 2 or height % 2)) or (codec == "prores" and width % 2):
+    if not video_copy and ((codec == "hevc10" and (width % 2 or height % 2)) or (codec == "prores" and width % 2)):
         requirement = "HEVC10 (4:2:0) requires even width and height" if codec == "hevc10" else "ProRes (4:2:2) requires an even width"
         raise ColorLUTError(f"Source dimensions are {width}x{height}; {requirement}. "
                             "FFV1 is already available and preserves the original dimensions; no resizing or padding was applied.")
-    normalized = normalize_settings(settings)
     staging = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.part{output.suffix}")
     source_stat = source.stat()
     _notify(progress, 0.0)
     try:
         with tempfile.TemporaryDirectory(prefix="hmb_color_lut_") as temp_dir:
             work = Path(temp_dir)
-            write_cube(work / "grade.cube", normalized)
-            audio, audio_mode = _audio_options(source_probe, codec)
+            if not video_copy:
+                write_cube(work / "grade.cube", normalized)
+            audio, audio_mode = _audio_options(source_probe, codec) if not mixing else (["-an"], "none")
             command = [_find_ffmpeg(), "-hide_banner", "-v", "error", "-xerror", "-nostdin", "-nostats", "-n", "-copyts",
-                       "-protocol_whitelist", "file,pipe", "-noautorotate", "-i", str(source), "-map", f"0:{source_probe['video_stream_index']}",
-                       *audio, "-map_metadata", "0", "-map_chapters", "0", "-vf", build_color_filter(source_probe, codec),
-                       "-fps_mode", "passthrough", "-enc_time_base", "filter", "-avoid_negative_ts", "disabled"]
-            if codec == "hevc10":
+                       "-protocol_whitelist", "file,pipe", "-noautorotate", "-i", str(source)]
+            for track in tracks:
+                command += ["-protocol_whitelist", "file,pipe", "-i", track["path"]]
+            if mixing:
+                graph = _mix_audio_filter(source_probe, tracks, original_audio)
+                if graph:
+                    command += ["-filter_complex", graph]
+                    audio, audio_mode = ["-map", "[mixed_audio]", "-c:a", "aac", "-b:a", "320k", "-ar", "48000", "-ac", "2"], "mix_aac_320k"
+            command += ["-map", f"0:{source_probe['video_stream_index']}", *audio, "-map_metadata", "0", "-map_chapters", "0",
+                        "-fps_mode", "passthrough", "-avoid_negative_ts", "disabled"]
+            if video_copy:
+                command += ["-c:v", "copy"]
+            else:
+                command += ["-vf", build_color_filter(source_probe, codec), "-enc_time_base", "filter"]
+            if video_copy:
+                pass
+            elif codec == "hevc10":
                 command += ["-c:v", "libx265", "-preset", "slow", "-crf", "16", "-pix_fmt", "yuv420p10le", "-tag:v", "hvc1",
                             "-x265-params", "log-level=error"]
             elif codec == "prores":
                 command += ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"]
             else:
                 command += ["-c:v", "ffv1", "-level", "3", "-coder", "1", "-context", "1", "-slicecrc", "1", "-pix_fmt", "gbrp16le"]
-            command += ["-color_primaries", "bt709", "-color_trc", "iec61966-2-1" if codec == "ffv1" else "bt709",
-                        "-colorspace", "rgb" if codec == "ffv1" else "bt709", "-color_range", "pc" if codec == "ffv1" else "tv"]
+            if not video_copy:
+                command += ["-color_primaries", "bt709", "-color_trc", "iec61966-2-1" if codec == "ffv1" else "bt709",
+                            "-colorspace", "rgb" if codec == "ffv1" else "bt709", "-color_range", "pc" if codec == "ffv1" else "tv"]
             if codec != "ffv1":
                 command += ["-movflags", "+faststart", "-f", "mov"]
             command += ["-progress", "pipe:1", str(staging)]
@@ -452,28 +601,58 @@ def export_video(source_path: Any, output_path: str | Path, settings: Any, codec
         result_probe = _basic_probe(staging, result_details)
         if (result_probe["width"], result_probe["height"]) != (width, height):
             raise ColorLUTError("Color LUT output resolution changed unexpectedly.")
-        if result_probe["has_audio"] != source_probe["has_audio"]:
+        expected_audio_count = int(bool(tracks or (original_audio == "preserve" and source_probe["has_audio"]))) if mixing else len(source_probe.get("audio_streams", []))
+        if result_probe["has_audio"] != bool(expected_audio_count):
             raise ColorLUTError("Color LUT output did not preserve the source audio presence.")
-        if len(result_details.get("audio_streams", [])) != len(source_probe.get("audio_streams", [])):
+        if len(result_details.get("audio_streams", [])) != expected_audio_count:
             raise ColorLUTError("Color LUT output did not preserve all source audio streams.")
         result_count = str(result_details.get("nb_frames") or "")
         if source_probe["frame_count"] and result_count.isdigit() and int(result_count) != source_probe["frame_count"]:
             raise ColorLUTError("Color LUT output frame count changed unexpectedly.")
-        expected_codec = {"hevc10": "hevc", "prores": "prores", "ffv1": "ffv1"}[codec]
+        if mixing:
+            tolerance = max(.01, 1 / max(float(source_probe["frame_rate"]), 1))
+            if abs(result_probe["duration"] - source_probe["duration"]) > tolerance:
+                raise ColorLUTError("Audio Mix changed the source video duration.")
+            if expected_audio_count:
+                stream = result_details["audio_streams"][0]
+                if stream.get("codec_name") != "aac":
+                    raise ColorLUTError("Audio Mix did not produce MOV-compatible AAC audio.")
+                if result_details.get("probe_backend") == "ffprobe":
+                    audio_duration = _stream_duration(stream)
+                    if not math.isfinite(audio_duration) or abs(audio_duration - source_probe["duration"]) > .05:
+                        raise ColorLUTError("Audio Mix did not cover the complete video duration.")
+        expected_codec = source_probe["video_codec"] if video_copy else {"hevc10": "hevc", "prores": "prores", "ffv1": "ffv1"}[codec]
         if result_probe.get("video_codec") != expected_codec:
             raise ColorLUTError("Color LUT output codec does not match the selected export mode.")
         current_stat = source.stat()
         if (current_stat.st_size, current_stat.st_mtime_ns) != (source_stat.st_size, source_stat.st_mtime_ns):
             raise ColorLUTError("The source changed during export; the result was not published.")
+        for track in tracks:
+            current, captured = Path(track["path"]).stat(), track["_stat"]
+            if (current.st_size, current.st_mtime_ns, current.st_ino, current.st_dev) != (captured.st_size, captured.st_mtime_ns, captured.st_ino, captured.st_dev):
+                raise ColorLUTError("A sound source changed during export; the result was not published.")
+            if track.get("media_signature"):
+                digest = hashlib.sha256()
+                with Path(track["path"]).open("rb") as audio_file:
+                    for chunk in iter(lambda: audio_file.read(1024 * 1024), b""):
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise ColorLUTError("Color LUT export was cancelled.")
+                        digest.update(chunk)
+                if digest.hexdigest() != track["media_signature"]:
+                    raise ColorLUTError("A sound source no longer matches its selected bytes; the result was not published.")
         if cancel_event is not None and cancel_event.is_set():
             raise ColorLUTError("Color LUT export was cancelled.")
         _publish_exclusive(staging, output)
         _notify(progress, 1.0)
-        return {**result_probe, "path": str(output), "source_path": str(source), "operation": "color_lut", "codec": codec,
+        return {**result_probe, "path": str(output), "source_path": str(source),
+                "operation": "audio_mix" if video_copy else "color_lut_audio_mix" if mixing else "color_lut", "codec": codec,
                 "settings": normalized, "cube_size": CUBE_SIZE, "interpolation": "trilinear", "audio_mode": audio_mode,
-                "encoding_lossless": codec == "ffv1", "working_space": "sRGB", "color_assumptions": source_probe["color_assumptions"],
-                "quality_note": "Lossless encoding of graded 16-bit RGB pixels; source decoding and color conversion are not reversible."
-                if codec == "ffv1" else "High-quality 10-bit export with lossy video compression.",
+                "encoding_lossless": video_copy or codec == "ffv1", "working_space": "source" if video_copy else "sRGB", "color_assumptions": source_probe["color_assumptions"],
+                **({"video_mode": "copy" if video_copy else "encode", "original_audio": original_audio,
+                    "sound_tracks": [{key: track.get(key) for key in ("source_uid", "instance_id", "media_signature", "path", "role", "purpose", "transcript", "in_seconds", "out_seconds", "start_seconds", "gain_db", "loop")} for track in tracks]} if mixing else {}),
+                "quality_note": "Original video stream copied without re-encoding; supplied audio mixed to AAC." if video_copy else
+                    "Lossless encoding of graded 16-bit RGB pixels; source decoding and color conversion are not reversible."
+                    if codec == "ffv1" else "High-quality 10-bit export with lossy video compression.",
                 "timestamp_policy": "Original timestamps passed through; container time-base precision may differ."}
     finally:
         staging.unlink(missing_ok=True)

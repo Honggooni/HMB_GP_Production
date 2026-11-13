@@ -63,10 +63,10 @@ assert output_kwargs["ui_options"]["hide_handles"] is True
 
 
 node = prompt.HMBPromptLibrary(name="prompt_output_coalescing")
-assert node.width == 1800
+assert node.width == 1490
 assert node.height == prompt.PROMPT_START_HEIGHT
 assert node.ui_options["node_size"] == {
-    "width": 1800,
+    "width": 1490,
     "height": prompt.PROMPT_START_HEIGHT,
 }
 assert node.ui_options["min_width"] == 760
@@ -400,7 +400,7 @@ if not hasattr(prompt.DataNode, "after_incoming_connection"):
 sync_node = prompt.HMBPromptLibrary(name="prompt_connection_sync_coalescing")
 sync_calls = []
 sync_node._sync_prompt_output_from_state = MethodType(
-    lambda self: (sync_calls.append(self._hmb_sync_generation) or {}),
+    lambda self, **_kwargs: (sync_calls.append(self._hmb_sync_generation) or {}),
     sync_node,
 )
 # A real Griptape DataNode may queue constructor/lifecycle callbacks through
@@ -456,7 +456,7 @@ try:
     sync_calls.clear()
     latest_shot_seen = []
     sync_node._sync_prompt_output_from_state = MethodType(
-        lambda self: (
+        lambda self, **_kwargs: (
             latest_shot_seen.append(self._regression_latest_shot_uuid) or {}
         ),
         sync_node,
@@ -481,7 +481,7 @@ try:
     delayed_callbacks.clear()
     sync_calls.clear()
     sync_node._sync_prompt_output_from_state = MethodType(
-        lambda self: (sync_calls.append(self._hmb_sync_generation) or {}),
+        lambda self, **_kwargs: (sync_calls.append(self._hmb_sync_generation) or {}),
         sync_node,
     )
     sync_node._schedule_prompt_sync(source_burst=True)

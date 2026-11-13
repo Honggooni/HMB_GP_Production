@@ -59,20 +59,20 @@ try{
  for(const key of ['sameBody','sameFields','sameRows','sameHeader','focused'])assert.equal(stable[key],true,key);
  assert.deepEqual(stable.mutations,[]);assert.equal(stable.calls,2);
  receipt.catalog_update_100_ms=Number(stable.ms.toFixed(3));receipt.cases.push('100 watermark/sibling metadata updates preserve form DOM, current text, caret, field scroll, native provider/model/tools/ruleset/schema and literal 0/OFF');
- // Delete/recreate during a queued selection: retire the old row's lease and
- // keep the new UUID responsive. No queued old action may reach onChange.
+ // Delete/recreate after immediate dispatch: retire the old row's lease and
+ // keep the new UUID responsive without replaying the old action.
  const retired=await page.evaluate(async()=>{
   const beforeCalls=calls.length;handles[3].update({value:rowValue(4),onChange:onRow});rows[3].querySelector('.agent-shot-tab').click();
   catalog.shots.find(item=>item.number===4).shot_uuid='replacement-shot-4';catalog.shots.find(item=>item.number===4).name='Recreated asset 4';catalog.generation++;sync();
   await new Promise(resolve=>setTimeout(resolve,180));return {newCalls:calls.length-beforeCalls,label:rows[3].querySelector('.agent-shot-tab b').textContent,blocked:rows.some(row=>row.querySelector('.agent-shot-run').disabled),uuid:rows[3].querySelector('.agent-shot-row').dataset.shotUuid};
  });
- assert.equal(retired.newCalls,0);assert.equal(retired.label,'Recreated asset 4');assert.equal(retired.uuid,'replacement-shot-4');assert.equal(retired.blocked,false);
- receipt.cases.push('UUID deletion/recreation before dispatch cancels the old selection and releases the shared lease');
+ assert.equal(retired.newCalls,1);assert.equal(retired.label,'Recreated asset 4');assert.equal(retired.uuid,'replacement-shot-4');assert.equal(retired.blocked,false);
+ receipt.cases.push('UUID deletion/recreation retires the dispatched selection and releases the shared lease without replay');
  // A dispatched callback can also settle after cleanup/remount.
- await page.evaluate(()=>rows[4].querySelector('.agent-shot-tab').click());await page.waitForFunction(()=>calls.length===3);
+ await page.evaluate(()=>rows[4].querySelector('.agent-shot-tab').click());await page.waitForFunction(()=>calls.length===4);
  const cleanup=await page.evaluate(async()=>{
   const old=handles[4];old.cleanup();catalog.shots.find(item=>item.number===5).shot_uuid='replacement-shot-5';catalog.shots.find(item=>item.number===5).name='Recreated asset 5';
-  handles[4]=widget.default(rows[4],{value:rowValue(5),onChange:onRow});const current=rows[4].querySelector('.agent-shot-row');requests[2].reject(new Error('Old mount rejection'));old.update({value:{...rowValue(5),selected:true},onChange:onRow});await new Promise(resolve=>setTimeout(resolve,0));
+  handles[4]=widget.default(rows[4],{value:rowValue(5),onChange:onRow});const current=rows[4].querySelector('.agent-shot-row');requests[3].reject(new Error('Old mount rejection'));old.update({value:{...rowValue(5),selected:true},onChange:onRow});await new Promise(resolve=>setTimeout(resolve,0));
   return {same:rows[4].querySelector('.agent-shot-row')===current,status:rows[4].querySelector('.agent-row-status').textContent,selected:current.dataset.active,blocked:rows.some(row=>row.querySelector('.agent-shot-run').disabled)};
  });
  assert.equal(cleanup.same,true);assert.equal(cleanup.status,'');assert.equal(cleanup.selected,'false');assert.equal(cleanup.blocked,false);

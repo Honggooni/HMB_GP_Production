@@ -27,13 +27,19 @@ async def check(engine,node,source,set_value,candidate,png,directory,context,rec
     import HMBImageBash as product
     from _hmb_image_bash_state import scene_fingerprint
     from griptape_nodes.files.file import File
-    from griptape_nodes.retained_mode.events.flow_events import SerializeFlowToCommandsRequest
-    from griptape_nodes.retained_mode.events.parameter_events import GetParameterValueRequest
+    from griptape_nodes.retained_mode.events.connection_events import ListConnectionsForNodeRequest
+    from griptape_nodes.retained_mode.events.flow_events import DeleteFlowRequest, DeserializeFlowFromCommandsRequest, SerializeFlowToCommandsRequest
+    from griptape_nodes.retained_mode.events.parameter_events import GetParameterValueRequest, SetParameterValueRequest
+    from griptape_nodes.retained_mode.events.workflow_events import SaveWorkflowFileFromSerializedFlowRequest
     second=directory/'second.png';second.write_bytes(png('purple'))
     records=records+[{'source_uid':'second-source','url':str(second),'name':'Second'}]
     context={**context,'revision':2,'records':records}
     set_value('IMAGE_BASH_IMAGES_OUT',[row['url'] for row in records],target=source,initial=True)
     set_value('IMAGE_BASH_CONTEXT_OUT',context,target=source,initial=True)
+    # The shared fixture seeds a standalone list child. Clear that seed so the
+    # connected whole-list value does not include a duplicate on newer SDKs.
+    for child in node.get_parameter_by_name('input_images').get_child_parameters():
+        set_value(child.name, None, initial=True)
     set_value('input_images',[row['url'] for row in records]);set_value('image_bash_context',context)
     await settled()
     def header():
@@ -225,20 +231,64 @@ async def check(engine,node,source,set_value,candidate,png,directory,context,rec
     assert node._hmb_prepare_phase=='ready' and header()['ready']
     assert document()['value']==bad['value'] and old_file.read_bytes()==old_bytes
     RESULT['known_ready_inputs_keep_failed_draft_openable']=True
-    saved=send(SerializeFlowToCommandsRequest(flow_name=engine.node_manager.get_node_parent_flow_by_name(node.name),include_create_flow_command=True))
-    assert saved.succeeded()
+    editor = node.get_parameter_by_name('bash_image')
+    assert 'modal' not in editor.ui_options and editor.ui_options.get('widget') == 'HMBImageBashWidget'
+    owned = candidate('hmb-owned-editor', 'purple')
+    owned['meta']['hmb_editor'] = product.EDITOR_SCHEMA
+    owned['meta']['konva_json']['images'][0]['opacity'] = 0.5
+    stale = deepcopy(owned)
+    stale['meta']['hmb_image_bash']['editor_snapshot_id'] = 'another-workspace'
+    rejected = engine.handle_request(SetParameterValueRequest(node_name=node.name, parameter_name='bash_image', value=stale, broadcast_result=False))
+    assert not rejected.succeeded() and old_file.read_bytes() == old_bytes
+    assert document() != stale
+    set_value('bash_image', owned); await settled()
+    owned_saved = document()
+    receipt = owned_saved['meta']['hmb_image_bash']['apply']
+    assert receipt['editor_commit'] == 'hmb-owned-editor'
+    assert File(receipt['output_path']).read_bytes() == png('purple')
+    assert owned_saved['meta']['konva_json'] == owned['meta']['konva_json']
+    assert owned_saved['meta']['hmb_image_bash']['source_bindings'] == owned['meta']['hmb_image_bash']['source_bindings']
+    legacy = deepcopy(owned_saved)
+    legacy['meta'].pop('hmb_canvas')
+    assert scene_fingerprint(legacy, records, node._canvas()) == receipt['scene_sha256']
+    RESULT.update(owned_editor_no_stock_modal=True, owned_editor_scope_rejects_stale_apply=True,
+        owned_editor_png_and_layers_preserved=True, legacy_canvas_projection_preserves_receipt=True)
+    flow = engine.node_manager.get_node_parent_flow_by_name(node.name)
+    serialized = send(SerializeFlowToCommandsRequest(flow_name=flow, include_create_flow_command=True))
+    save_path = directory / 'owned-bash-reopen.py'
+    saved = await engine.ahandle_request(SaveWorkflowFileFromSerializedFlowRequest(
+        serialized_flow_commands=serialized.serialized_flow_commands, file_name=save_path.stem,
+        file_path=str(save_path), display_name='HMB Bash preservation fixture', broadcast_result=False))
+    assert saved.succeeded() and save_path.is_file(), saved.result_details
+    send(DeleteFlowRequest(flow_name=flow))
+    reopened = await engine.ahandle_request(DeserializeFlowFromCommandsRequest(
+        serialized_flow_commands=deepcopy(serialized.serialized_flow_commands), broadcast_result=False))
+    assert reopened.succeeded(), reopened.result_details
+    restored_node = engine.node_manager.get_node_by_name(node.name)
+    assert restored_node is not node
+    restored = product._document(restored_node.get_parameter_value('bash_image'))
+    restored_metadata = restored['meta']['hmb_image_bash']
+    assert restored['meta']['konva_json'] == owned_saved['meta']['konva_json']
+    assert restored_metadata['source_bindings'] == owned_saved['meta']['hmb_image_bash']['source_bindings']
+    assert restored_metadata['apply'] == receipt and File(receipt['output_path']).read_bytes() == png('purple')
+    edges = send(ListConnectionsForNodeRequest(node_name=restored_node.name)).incoming_connections
+    assert {edge.target_parameter_name for edge in edges} == {'input_images', 'image_bash_context'}
+    RESULT['native_sdk_save_reopen_preserves_owned_scene_and_two_wires'] = True
     assert {r['source_uid']:Path(r['url']).read_bytes() for r in records}==original_bytes
     RESULT.update(status='PASS',product_path=product.__file__,paid_calls=0,network_calls=0,Run_calls=0,
         serializer_success=True,actual_desktop=False)
 
 if __name__=='__main__':
+    from _hmb_image_bash_compat import resolve_editor_root
+    editor_root = resolve_editor_root()
+    assert editor_root is not None, 'An installed Editor bundle is required'
     previous=Path.cwd()
     with tempfile.TemporaryDirectory(prefix='bash-apply-reopen-',dir=OUT) as temp:
         directory=Path(temp)
         keys=('APPDATA','LOCALAPPDATA','XDG_CONFIG_HOME','XDG_DATA_HOME','XDG_CACHE_HOME','XDG_STATE_HOME','GTN_ENGINE_CONFIG_DIR','GTN_ENGINE_DATA_DIR','GTN_ENGINE_STATE_DIR','GTN_CONFIG_WORKSPACE_DIRECTORY')
         env={key:str(directory/key) for key in keys}
         for value in env.values():Path(value).mkdir()
-        env.update(HMB_IMAGE_BASH_STANDARD_LIBRARY_PATH=str(fixture.STANDARD),HMB_IMAGE_BASH_EDITOR_BUNDLE_PATH=str(fixture.EDITOR))
+        env.update(HMB_IMAGE_BASH_STANDARD_LIBRARY_PATH=os.environ.get('HMB_IMAGE_BASH_STANDARD_LIBRARY_PATH',str(fixture.STANDARD)),HMB_IMAGE_BASH_EDITOR_BUNDLE_PATH=str(editor_root))
         with mock.patch.dict(os.environ,env),mock.patch.object(socket,'create_connection',side_effect=fixture.deny):
             os.chdir(directory);logging.disable(logging.CRITICAL)
             try:

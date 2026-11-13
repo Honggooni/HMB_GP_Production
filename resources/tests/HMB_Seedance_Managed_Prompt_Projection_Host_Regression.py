@@ -84,7 +84,7 @@ async def exercise(engine, _phase, out):
         state["shot_routing"].update(channel_uuid=harness.CHANNEL, publisher_instance_uuid=harness.PUBLISHER,
             generation=1, shots=[dict(row, selected_source_uids=[]) for row in harness.SHOTS],
             active_shot_uuid=harness.SHOTS[0]["shot_uuid"])
-        publisher.set_parameter_value(images.WIDGET_STATE_PARAMETER, json.dumps(state), initial_setup=True)
+        publisher._publish_state(state)
         publisher._hmb_initial_catalog_scan_pending = False
         prompt_created = harness.send(engine, CreateNodeRequest(node_type="HMBPromptLibrary", specific_library_name=schema.name,
             node_name="Projection Prompt manager", initial_setup=True, create_error_proxy_on_failure=False))

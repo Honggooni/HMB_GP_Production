@@ -20,21 +20,21 @@ from typing import Any
 SCHEMA = "hmb-build-diagnostics"
 RECEIPT_NAME = ".hmb-install-receipt.json"
 RUNTIME_FILE_PATHS = (
-    "__init__.py", "griptape-nodes-library.json", "HMBAgentLibrary.py",
+    "__init__.py", "griptape-nodes-library.json", "HMBAgentLibrary.py", "HMBAnalysisAgent.py",
     "HMBColorLUTLibrary.py", "HMBFinishLookLibrary.py", "HMBImageAssetLibrary.py", "HMBImageBash.py", "HMBImageGeneration.py",
-    "HMBPromptLibrary.py", "HMBSeedanceGeneration.py", "HMBVideoPickerLibrary.py",
-    "_hmb_agent_media.py", "_hmb_agent_session.py", "_hmb_broker_config.py", "_hmb_build_diagnostics.py", "_hmb_image_limits.py", "_hmb_image_generation.py",
+    "HMBPromptLibrary.py", "HMBSoundLibrary.py", "HMBSeedanceGeneration.py", "HMBVideoPickerLibrary.py",
+    "_hmb_agent_media.py", "_hmb_analysis_delivery.py", "_hmb_reference_analysis.py", "_hmb_analysis_broker.py", "_hmb_sound.py", "_hmb_agent_session.py", "_hmb_broker_config.py", "_hmb_build_diagnostics.py", "_hmb_image_limits.py", "_hmb_image_generation.py",
     "_hmb_my_box.py", "_hmb_my_box_node.py", "_hmb_reference_leases.py", "_hmb_queue_admission.py",
     "_hmb_library_bootstrap.py", "_hmb_deletion_guard.py", "_hmb_connection_management.py", "_hmb_workflow_migration.py", "_hmb_workflow_serialization_compat.py", "_hmb_project.py", "_hmb_review.py", "_hmb_web_rerender.py", "_hmb_shot_routing.py", "_hmb_mp4_verify.py", "_hmb_common.py",
     "_hmb_color_lut.py", "_hmb_color_lut_usage.py", "_hmb_screen_space.py", "_hmb_video_tools.py",
-    "_hmb_cgt.py",
+    "_hmb_cgt.py", "_hmb_shot_basket.py",
     "_hmb_image_bash_compat.py", "_hmb_image_bash_render.py", "_hmb_image_bash_state.py",
-    "widgets/HMBAgentLibraryWidget.js", "widgets/HMBColorLUTLibraryWidget.js",
+    "widgets/HMBAgentLibraryWidget.js", "widgets/HMBAnalysisAgentWidget.js", "widgets/HMBColorLUTLibraryWidget.js",
     "widgets/HMBFinishLookLibraryWidget.js", "widgets/HMBImageAssetLibraryWidget.js",
     "widgets/HMBImageAssetThumbnailPatchBridgeWidget.js",
     "widgets/HMBImageGenerationWidget.js",
     "widgets/HMBImageBashWidget.js",
-    "widgets/HMBPromptLibraryScopedBindingWidget.js", "widgets/HMBSeedanceGenerationWidget.js",
+    "widgets/HMBPromptLibraryScopedBindingWidget.js", "widgets/HMBSoundLibraryWidget.js", "widgets/HMBSeedanceGenerationWidget.js",
     "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
     "widgets/HMBVideoPickerLibraryWidget_v032.js",
     "resources/maya/HMB_Maya_Background_Preview.py",
@@ -92,7 +92,7 @@ def _sha(value: Any) -> str:
     return value if _HEX.fullmatch(value) else ""
 
 
-def _expected_records(value: Any) -> list[dict[str, Any]]:
+def _expected_records(value: Any, *, historical: bool = False) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise ValueError("invalid_inventory")
     rows, seen = [], set()
@@ -108,7 +108,9 @@ def _expected_records(value: Any) -> list[dict[str, Any]]:
             raise ValueError("invalid_record")
         seen.add(name)
         rows.append({"path": name, "bytes": row["bytes"], "sha256": _sha(row["sha256"])})
-    if seen != set(RUNTIME_FILE_PATHS):
+    current_paths = set(RUNTIME_FILE_PATHS)
+    pre_basket_paths = current_paths - {"_hmb_shot_basket.py"}
+    if seen != current_paths and not (historical and seen == pre_basket_paths):
         raise ValueError("incomplete_inventory")
     return rows
 
@@ -231,30 +233,36 @@ def get_build_diagnostics(root: str | Path | None = None, *, verify_policy: bool
                 package["manifest_status"] = "invalid"
             continue
         try:
+            recorded_version = str(document.get("release_version") or "")
+            semver = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+            historical = (
+                re.fullmatch(semver, recorded_version) is not None
+                and re.fullmatch(semver, version) is not None
+                and tuple(map(int, recorded_version.split("."))) < tuple(map(int, version.split(".")))
+            )
             if kind == "receipt":
                 if document.get("schema") != "hmb-install-receipt" or document.get("version") != 1:
                     raise ValueError("invalid_receipt")
-                rows = _expected_records(document.get("runtime_files"))
+                rows = _expected_records(document.get("runtime_files"), historical=historical)
                 install.update(receipt_status="observed", installed_at=str(document.get("installed_at") or "")[:80],
                                source_manifest_sha256=_sha(document.get("source_manifest_sha256")))
             else:
                 if document.get("schema") != "hmb-release-closure" or document.get("version") != 1:
                     raise ValueError("invalid_manifest")
-                rows = _expected_records([r for r in document.get("files", []) if isinstance(r, dict) and r.get("install") is True])
+                rows = _expected_records(
+                    [r for r in document.get("files", []) if isinstance(r, dict) and r.get("install") is True],
+                    historical=historical,
+                )
                 package["manifest_status"] = "observed"
             declared = _sha(document.get("runtime_fingerprint_sha256"))
             if declared != inventory_fingerprint(rows):
                 raise ValueError("identity_mismatch")
-            recorded_version = str(document.get("release_version") or "")
             if recorded_version != version:
                 # A Git Override preserves the prior installer observation.
                 # Keep that historical file intact without presenting it as
                 # verification of the newly observed runtime. Same-version
                 # drift and malformed/future identities still fail below.
-                parts = lambda value: tuple(int(part) for part in value.split("."))
-                semver = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
-                if (re.fullmatch(semver, recorded_version) and re.fullmatch(semver, version)
-                        and parts(recorded_version) < parts(version)):
+                if historical:
                     if kind == "receipt":
                         install.update(receipt_status="historical_record", recorded_library_version=recorded_version)
                     else:
@@ -262,6 +270,11 @@ def get_build_diagnostics(root: str | Path | None = None, *, verify_policy: bool
                     continue
                 raise ValueError("identity_mismatch")
             differences = sorted(r["path"] for r in rows if hashes.get(r["path"]) != r["sha256"])
+            descriptor_path = "griptape-nodes-library.json"
+            if (kind == "receipt" and "library_descriptor_sha256" in document
+                    and _sha(document["library_descriptor_sha256"]) != hashes.get(descriptor_path)
+                    and descriptor_path not in differences):
+                differences = sorted([*differences, descriptor_path])
             package.update(declared_fingerprint_sha256=declared,
                            build_fingerprint_sha256=_sha(document.get("build_fingerprint_sha256")),
                            mismatch_paths=differences,

@@ -7,6 +7,7 @@ from copy import deepcopy
 import logging
 import os
 from pathlib import Path
+from _hmb_fixture_sdk import fixture_flow_connections
 import socket
 import sys
 import tempfile
@@ -95,7 +96,7 @@ async def exercise(engine):
         def edges():
             flow = engine.flow_manager.get_flow_by_name(flow_name)
             return {(edge.source_node.name, edge.source_parameter.name, edge.target_node.name, edge.target_parameter.name)
-                for edge in engine.flow_manager._get_connections_for_flow(flow)}
+                for edge in fixture_flow_connections(engine, flow)}
         expected_edges = edges()
         assert len(expected_edges) == 1
         # Actual SDK command serialization/deserialization replays both the

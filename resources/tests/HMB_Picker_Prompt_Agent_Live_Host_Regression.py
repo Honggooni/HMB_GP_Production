@@ -28,6 +28,7 @@ if (DEFAULT_STANDARD_ROOT / "griptape_nodes_library" / "agents" / "agent.py").is
 
 try:
     from griptape_nodes.exe_types.flow import ControlFlow
+    from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
     from griptape_nodes.retained_mode.events.connection_events import (
         CreateConnectionRequest,
         CreateConnectionResultSuccess,
@@ -43,35 +44,17 @@ except Exception:
     print("HMB Picker -> Prompt -> Agent live host regression: SKIP (host unavailable)")
     raise SystemExit(0)
 
-try:
-    from griptape_nodes.retained_mode.engine import current_engine
-except (AttributeError, ImportError):
-    current_engine = None
-
 import HMBAgentLibrary as agent_library
 import HMBPromptLibrary as prompt_library
 import HMBVideoPickerLibrary as picker_library
 
 
-def create_control_flow(name: str) -> ControlFlow:
-    """Bind modern ControlFlow instances to the active host engine."""
-    if current_engine is not None:
-        engine = current_engine()
-        try:
-            return ControlFlow(name=name, engine=engine)
-        except TypeError as modern_error:
-            # Older hosts own the engine implicitly and reject this keyword.
-            try:
-                return ControlFlow(name=name)
-            except TypeError:
-                raise modern_error
-    return ControlFlow(name=name)
-
-
 def register(flow: ControlFlow, node: Any) -> None:
+    engine = GriptapeNodes.get_instance()
+    workflow = engine.current_workflow()
     flow.add_node(node)
-    GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
-    GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = flow.name
+    engine.object_manager.add_object_by_name_in(workflow, node.name, node)
+    workflow.nodes.name_to_parent_flow_name[node.name] = flow.name
 
 
 def set_value(
@@ -220,8 +203,9 @@ def manual_surface(state: dict[str, Any]) -> dict[str, Any]:
 
 GriptapeNodes.EventManager().initialize_queue()
 stamp = time.time_ns()
-flow = create_control_flow(name=f"HMBPickerPromptAgentLive_{stamp}")
-GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
+ensured = GriptapeNodes.handle_request(EnsureWorkflowAndFlowRequest(flow_name=f"HMBPickerPromptAgentLive_{stamp}"))
+assert ensured.succeeded(), ensured.result_details
+flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
 
 
 # Saved-workflow hydration: the edge exists first, then the source output and

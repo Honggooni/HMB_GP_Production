@@ -155,7 +155,7 @@ class PromptPageViewRollback(unittest.TestCase):
         incoming[prompt.UI_EDIT_REVISION_KEY] += 1
         with mock.patch.object(node, "_schedule_prompt_sync") as schedule:
             node.set_parameter_value(prompt.WIDGET_PARAMETER_NAME, prompt._json_dumps(incoming))
-        schedule.assert_called_once_with(source_burst=False)
+        schedule.assert_called_once_with(source_burst=False, publish_shot_media=False)
         self.assertEqual(prompt._parse_state(node._current_state()["shot_documents"][key])["text"][field],
             "New inactive literal from merged pending UI edit")
 

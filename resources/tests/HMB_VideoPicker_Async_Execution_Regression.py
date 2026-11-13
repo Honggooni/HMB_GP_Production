@@ -31,7 +31,8 @@ def main():
             try:
                 from griptape_nodes.retained_mode.engine import current_engine
                 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes as G
-                from griptape_nodes.exe_types.flow import ControlFlow
+                from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
+                from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest
             except ImportError:
                 G = None
             counts = []
@@ -47,13 +48,18 @@ def main():
                     nonlocal sequence
                     sequence += 1
                     if G is not None:
-                        flow = ControlFlow(name=f"PickerAsyncRegressionFlow{sequence}", engine=current_engine())
-                        G.ObjectManager().add_object_by_name(flow.name, flow)
+                        engine = current_engine()
+                        ensured = engine.handle_request(EnsureWorkflowAndFlowRequest(flow_name=f"PickerAsyncRegressionFlow{sequence}"))
+                        assert ensured.succeeded(), ensured.result_details
+                        workflow = engine.open_workflows.get(ensured.workflow_id)
+                        created = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name=f"AsyncCase{sequence}"))
+                        assert created.succeeded(), created.result_details
+                        flow = engine.flow_manager.get_flow_by_name_in(workflow, created.flow_name)
                     result = picker.HMBVideoPickerLibrary(name=f"PickerAsync{sequence}")
                     if G is not None:
                         flow.add_node(result)
-                        G.ObjectManager().add_object_by_name(result.name, result)
-                        G.NodeManager()._name_to_parent_flow_name[result.name] = flow.name
+                        engine.object_manager.add_object_by_name_in(workflow, result.name, result)
+                        workflow.nodes.name_to_parent_flow_name[result.name] = flow.name
                     state = picker._append_video_asset(result._picker_state(), {
                         "video_uid": f"asset-{sequence}", "video_path": path,
                         "video_url": "http://127.0.0.1:8123/external/stale-preview.mp4",

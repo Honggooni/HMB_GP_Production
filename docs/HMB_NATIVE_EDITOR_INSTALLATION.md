@@ -18,6 +18,7 @@ Git 라이브러리의 **Update Override**와 라이브러리 **Download의 덮�
 - 적용 여부는 Griptape 릴리스 번호가 아니라 실제 편집기 구조·소스 무결성과 네이티브·SDK API 계약으로 판단한다. 정확한 원본·현재 패치·기본 프로파일의 검토된 이전 패치 5개의 SHA256을 허용 목록으로 검사하며, 추가 프로파일도 descriptor에 명시된 소스·어댑터 무결성을 검증한다. 알 수 없는 계약은 원본과 데이터를 보존하고 `unsupported`로 보고한다. Griptape 원본 번들은 배포하지 않는다.
 - SDK는 `griptape-nodes 0.101.3` 이상이어야 한다. SDK를 실행하거나 import하지 않고 metadata와 AST에서 `current_engine`, `EventManager.add_pre_dispatch_hook`, `EventManager.remove_pre_dispatch_hook`, `EventManager.register_request_handlers`를 확인한다.
 - Git 등록 경로의 지원 파일과 고정된 앱 편집기 위치만 사용한다. 캐시된 Python helper를 다시 import하는 대신 별도 격리 프로세스에서 현재 Git 파일을 읽는다.
+- Editor 0.130에서는 검증된 원본에서 Local과 같은 통합 헤더, 연결 관리, 로동마트 화면을 생성한다. 원본 번들을 보존하고 새 모듈을 검증한 뒤 HTML 진입점만 원자적으로 전환한다. 이전 팀원 패치가 원본을 교체했던 설치는 기존 트랜잭션에 저장된 원본의 해시를 확인해 복구에 사용한다.
 - 복구 원본·후보·영수증은 Git 체크아웃 밖 `%LOCALAPPDATA%\HMB_GP_Production\native-editor-installs`에 보관한다. Git reset으로 복구 자료가 지워지지 않는다.
 - 공유 잠금을 사용하고 교체 직전에 SDK·소스·편집기 해시를 다시 확인한다. 같은 패치면 다시 쓰지 않는다. 실패하면 이 작업이 쓴 후보에 대해서만 원본을 복구한다.
 - 파일이 잠겼으면 원본을 유지하고 `pending` 상태를 반환한다. 지원하지 않는 편집기·알 수 없는 해시·손상된 지원 파일은 `unsupported` 또는 `error`로 표시하며 성공으로 간주하지 않는다.

@@ -28,8 +28,8 @@ async def scenario(engine):
     assert result.succeeded(),str(result.result_details)
     flow=engine.flow_manager.get_flow_by_name(result.flow_name)
     node=finish.HMBFinishLookLibrary(name='Saved Finish Partial Hydration')
-    flow.add_node(node);engine.object_manager.add_object_by_name(node.name,node)
-    engine.node_manager._name_to_parent_flow_name[node.name]=flow.name
+    from _hmb_fixture_sdk import register_fixture_node
+    register_fixture_node(engine, flow, node)
     await asyncio.sleep(.1)
     assert node not in routing._POST_REGISTRATION_PENDING
     standalone=copy.deepcopy(node._hmb_finish_current_document())

@@ -1021,10 +1021,14 @@ async def exercise(engine, _phase, out):
             await blocked(DeleteWorkflowRequest(name=current_workflow), "active_DeleteWorkflow_blocked_before_registry_or_context_change")
             await harness.asend(engine, DeleteNodeRequest(node_name=clean.name))
             unconnected = create("unconnected reset")
-            original_id = id(unconnected)
-            await harness.asend(engine, ResetNodeToDefaultsRequest(node_name=unconnected.name))
-            assert id(engine.node_manager.get_node_by_name(unconnected.name)) != original_id
-            harness.record("unconnected_delete_and_native_reset_remain_available")
+            before_reset = snapshot(engine)
+            reset = await engine.ahandle_request(ResetNodeToDefaultsRequest(node_name=unconnected.name, broadcast_result=False))
+            assert not reset.succeeded() and "HMB_RESET_REBIND_REQUIRED" in str(reset.result_details)
+            assert snapshot(engine) == before_reset
+            assert engine.node_manager.get_node_by_name(unconnected.name) is unconnected
+            await harness.asend(engine, DeleteNodeRequest(node_name=unconnected.name))
+            assert create(unconnected.name) is not unconnected
+            harness.record("unconnected_HMB_reset_preserves_instance_and_delete_then_create_remains_available")
 
             # Normal New/Close releases loaded view without deleting a saved
             # file. Its permission must not leak to a subsequent direct clear.

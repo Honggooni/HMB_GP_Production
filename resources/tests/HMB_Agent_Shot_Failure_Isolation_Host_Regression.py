@@ -173,9 +173,8 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
             generator = seedance_module.HMBSeedanceGeneration(name=f"offline_shot_{number}_generator")
             for node in (agent, generator):
                 node._regression_shot_number = number
-                flow.add_node(node)
-                engine.object_manager.add_object_by_name(node.name, node)
-                engine.node_manager._name_to_parent_flow_name[node.name] = flow.name
+                from _hmb_fixture_sdk import register_fixture_node
+                register_fixture_node(engine, flow, node)
             agent.set_parameter_value("prompt", f"Author shot {number}.")
             # Prove a previous good value cannot leak from the failed branch.
             agent.set_parameter_value("output", "STALE_SUCCESS_MUST_NOT_RENDER")
@@ -184,7 +183,7 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
             # Current Only execution requires an explicit project even when
             # the billable generation boundary is replaced by this fixture.
             generator._hmb_commit_seedance_mode()
-            generator.set_parameter_value("only_project", seedance_module.PROJECTS["katuri8"]["project_name"])
+            generator.set_parameter_value("only_project", "Katuri8")
             generator.set_parameter_value(seedance_module.TASK_PARAMETER, seedance_module.TASK_TEXT_ONLY)
             assert generator._selected_only_project()["project_id"] == "katuri8"
             assert flow.add_connection(
@@ -194,12 +193,14 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
             agents.append(agent)
             generators.append(generator)
 
-        dag = DagBuilder(engine=engine)
+        workflow = engine.current_workflow() if hasattr(engine, "current_workflow") else None
+        runtime_kwargs = {"workflow": workflow} if workflow is not None else {}
+        dag = DagBuilder(workflow.flows.connections) if workflow is not None else DagBuilder(engine=engine)
         for generator in generators:
             dag.add_node_with_dependencies(generator, generator.name)
         assert len(dag.node_to_reference) == 10, sorted(dag.node_to_reference)
         machine = ParallelResolutionMachine(
-            flow.name, max_nodes_in_parallel=2, dag_builder=dag, engine=engine,
+            flow.name, max_nodes_in_parallel=2, dag_builder=dag, engine=engine, **runtime_kwargs,
         )
         await asyncio.wait_for(machine.resolve_node(), timeout=15.0)
 
@@ -243,7 +244,7 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
         assert len(single_dag.node_to_reference) == 1
         engine.flow_manager._global_single_node_resolution = True
         single_machine = ParallelResolutionMachine(
-            flow.name, max_nodes_in_parallel=2, dag_builder=single_dag, engine=engine,
+            flow.name, max_nodes_in_parallel=2, dag_builder=single_dag, engine=engine, **runtime_kwargs,
         )
         await asyncio.wait_for(single_machine.resolve_node(), timeout=10.0)
         assert single_machine.is_complete() and not single_machine.is_errored()
@@ -255,7 +256,7 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
             single_dag.clear()
             single_dag.add_node_with_dependencies(node, node.name)
             current = ParallelResolutionMachine(
-                flow.name, max_nodes_in_parallel=2, dag_builder=single_dag, engine=engine,
+                flow.name, max_nodes_in_parallel=2, dag_builder=single_dag, engine=engine, **runtime_kwargs,
             )
             await asyncio.wait_for(current.resolve_node(), timeout=10.0)
             assert current.is_complete() and not current.is_errored()

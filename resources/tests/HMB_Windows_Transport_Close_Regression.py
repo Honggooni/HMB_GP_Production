@@ -221,6 +221,11 @@ with patch.dict(sys.modules,{'asyncio.proactor_events':private}),patch.object(sy
                     return barrier
                 stub.install_reentrant_barrier=install_barrier
                 stub.install_handler_barrier=install_barrier
+        # Local's basket registration requires the SDK payload registry too;
+        # keep that unrelated optional seam outside this stdlib-only fixture.
+        basket=ModuleType('_hmb_shot_basket')
+        basket.install_request_handlers=lambda _engine,registration:Dummy()
+        optional['_hmb_shot_basket']=basket
         with patch.dict(sys.modules,optional):
             a,b=namespace['HMBProductionLibrary'](),namespace['HMBProductionLibrary']()
             a.before_library_nodes_loaded(data,library);a.before_library_nodes_loaded(data,library)

@@ -12,6 +12,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 import requests
 from unittest import mock
@@ -22,6 +24,10 @@ sys.path.insert(0, str(ROOT))
 import _hmb_cgt as cgt
 import _hmb_shot_routing as routing
 import HMBImageAssetLibrary as image
+
+
+class DetachedImageAsset(image.HMBImageAssetLibrary):
+    engine = None
 
 
 def initialize_widget_fixture(node, value):
@@ -152,6 +158,10 @@ command = dict(schema=routing.SHOT_HIERARCHY_REQUEST_SCHEMA, version=1, expected
     expected_binding_revision=0, removed_member_ids=[], binding=binding)
 before = deepcopy(state)
 cgt.verify_binding(binding, 'superwings12', query(binding))
+confirm_start = len(calls)
+cgt.verify_binding(binding, 'superwings12', query(binding, cgt_project_id=project_id))
+assert [(entry['controller'], entry['method']) for entry in calls[confirm_start:]] == [
+    ('account', 'get'), ('project', 'get'), ('task', 'get_id'), ('task', 'get')]
 committed = routing.apply_shot_hierarchy_edit(state, command)
 assert state == before and len(committed['shot_routing']['shots']) == 5
 assert committed['shot_routing']['shots'][0]['name'] == 'e201_s001c001-s002c001__'
@@ -223,7 +233,7 @@ manual_rename = dict(schema=routing.SHOT_HIERARCHY_REQUEST_SCHEMA, version=1,
     binding=deepcopy(mixed['shot_hierarchy']))
 manual_rename['binding']['revision'] += 1
 manual_rename['binding']['members'][-1].update(source_name='renamed_reference', canonical_name='renamed_reference')
-local_host = object.__new__(image.HMBImageAssetLibrary)
+local_host = object.__new__(DetachedImageAsset)
 local_host_state = initialize_widget_fixture(local_host, mixed)
 local_host._hmb_last_accepted_widget_state = json.dumps(local_host_state)
 local_host._widget_state_is_stale = lambda value: False
@@ -334,7 +344,7 @@ for exc, code in errors:
     checks += 1
 
 def make_node():
-    node = object.__new__(image.HMBImageAssetLibrary)
+    node = object.__new__(DetachedImageAsset)
     holder = {'state': initialize_widget_fixture(node, state), 'published': [], 'responses': []}
     node._hmb_node_deleted = False
     node.lock = False
@@ -352,7 +362,7 @@ def make_node():
         project_identity=routing.hierarchy_project_key(state), hierarchy_request=deepcopy(command))
     return node, holder, intent
 
-for case in ['success', 'cancel', 'deleted', 'locked', 'resolving', 'stale', 'account_changed', 'timeout', 'publish_failure']:
+for case in ['success', 'cancel', 'deleted', 'locked', 'resolving', 'stale', 'account_changed', 'timeout', 'expired', 'publish_failure']:
     node, holder, intent = make_node()
     result = deepcopy(snapshot)
     if case == 'account_changed': result['account_id'] = guid()
@@ -375,6 +385,7 @@ for case in ['success', 'cancel', 'deleted', 'locked', 'resolving', 'stale', 'ac
         if case == 'locked': node.lock = True
         if case == 'resolving': node.state = 'resolving'
         if case == 'stale': holder['state']['shot_routing']['generation'] += 1
+        if case == 'expired': node._hmb_cgt_ready[1]['_deadline'] = 0
         node._consume_cgt_result()
     if case == 'success':
         assert len(holder['published']) == 1 and holder['state']['shot_hierarchy'] == binding
@@ -384,6 +395,7 @@ for case in ['success', 'cancel', 'deleted', 'locked', 'resolving', 'stale', 'ac
         assert holder['responses'][-1]['outcome'] == 'rejected'
     else:
         assert not holder['published'] and holder['state'].get('shot_hierarchy', {}) == {}
+        if case == 'expired': assert holder['responses'][-1]['state']['status'] == 'TIMEOUT'
     checks += 3
 
 # Browsing an authenticated CGT project never changes the current GP project,
@@ -405,17 +417,62 @@ with mock.patch.object(cgt, 'catalog', return_value=other_browse) as read_catalo
     if worker: worker.join(3)
     node._consume_cgt_result()
     assert read_catalog.call_args.args == ('',)
-    assert read_catalog.call_args.kwargs == {'binding': None, 'cgt_project_id': other_project_id}
+    assert read_catalog.call_args.kwargs['binding'] is None
+    assert read_catalog.call_args.kwargs['cgt_project_id'] == other_project_id
+    assert not read_catalog.call_args.kwargs['cancel'].is_set()
 assert holder['state'] == projectless_before and not holder['published']
-assert holder['responses'][-1]['state']['projects'] == other_browse['projects']
+displayed_projects = holder['responses'][-1]['state']['projects']
+assert [row['display_name'] for row in displayed_projects] == ['superwings12', 'Other_Show']
+assert [{key: value for key, value in row.items() if key != 'display_name'}
+        for row in displayed_projects] == other_browse['projects']
 assert holder['responses'][-1]['cgt_project_id'] == other_project_id
 checks += 6
 node, holder, intent = make_node()
 intent['cgt_project_id'] = other_project_id
 with mock.patch.object(cgt, 'catalog') as read_catalog:
-    rejected(lambda: node._request_cgt_read(intent))
+    node._request_cgt_read(intent)
+    assert holder['responses'][-1]['outcome'] == 'rejected'
+    assert holder['responses'][-1]['state']['status'] == 'SOURCE_CHANGED'
     assert not read_catalog.called and not holder['published']
 checks += 1
+
+# The retired child cannot use the rest of its budget or publish into the
+# reopened dialog. Exercise an actual local subprocess without a CGT session.
+cancel = threading.Event()
+trigger = threading.Timer(0.4, cancel.set)
+started = time.monotonic()
+trigger.start()
+try:
+    try:
+        cgt._run_catalog_child([sys.executable, '-c', 'import time; time.sleep(20)'], b'{}', dict(os.environ), {}, cancel)
+    except subprocess.TimeoutExpired:
+        assert cancel.is_set() and time.monotonic() - started < 4
+    else:
+        raise AssertionError('Retired CGT child was not stopped')
+finally:
+    trigger.cancel()
+    trigger.join()
+
+node, holder, intent = make_node()
+entered = threading.Event()
+next_intent = dict(intent, session_id=str(uuid4()), request_id=str(uuid4()))
+def slow_then_ready(*args, cancel, **kwargs):
+    if not entered.is_set():
+        entered.set()
+        assert cancel.wait(2)
+    return deepcopy(snapshot)
+
+with mock.patch.object(cgt, 'catalog', side_effect=slow_then_ready):
+    node._request_cgt_read(intent)
+    assert entered.wait(2)
+    worker = node._hmb_cgt_thread
+    node._request_cgt_read(next_intent)
+    node._request_cgt_read(dict(intent, operation='cgt_cancel'))
+    worker.join(3)
+    assert not worker.is_alive()
+    node._consume_cgt_result()
+assert len(holder['published']) == 1 and holder['responses'][-1]['request_id'] == next_intent['request_id']
+checks += 5
 
 print(json.dumps({'status': 'PASS', 'checks': checks, 'synthetic_cgt_tasks': 5,
     'independent_native_slots': 5, 'live_cgt_calls': 0, 'cgt_writes': 0, 'paid_requests': 0}))

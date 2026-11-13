@@ -55,9 +55,10 @@ def send(engine, request):
 
 
 def edges(engine, flow):
+    from _hmb_fixture_sdk import fixture_flow_connections
     return sorted((edge.source_node.name, edge.source_parameter.name,
         edge.target_node.name, edge.target_parameter.name)
-        for edge in engine.flow_manager._get_connections_for_flow(flow))
+        for edge in fixture_flow_connections(engine, flow))
 
 
 def register(engine, package, modules):

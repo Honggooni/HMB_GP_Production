@@ -58,8 +58,8 @@ class ColorLUTHydrationLifecycle(unittest.TestCase):
         for name in ('schedule_post_registration_reconcile','schedule_post_hydration_reconcile','reconcile_shot_routing'):
             patch=mock.patch.object(routing,name);patch.start();self.addCleanup(patch.stop)
         self.node=target.HMBColorLUTLibrary(name='Saved Color LUT')
-        self.flow.add_node(self.node);self.engine.object_manager.add_object_by_name(self.node.name,self.node)
-        self.engine.node_manager._name_to_parent_flow_name[self.node.name]=self.flow.name
+        from _hmb_fixture_sdk import register_fixture_node
+        register_fixture_node(self.engine, self.flow, self.node)
         self.publish=mock.patch.object(self.node,'publish_update_to_parameter');self.publisher=self.publish.start();self.addCleanup(self.publish.stop)
         self.queue=mock.patch.object(self.node,'_queue_source');self.queued=self.queue.start();self.addCleanup(self.queue.stop)
         self.command=mock.patch.object(self.node,'_command');self.commands=self.command.start();self.addCleanup(self.command.stop)

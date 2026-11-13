@@ -18,7 +18,7 @@ const html=`<!doctype html><meta charset="utf-8"><style>body{background:#101420}
 import asset,* as api from '/asset.js';import bridge,{hmbImageAssetThumbnailPatchBridgeRegistry as registry} from '/bridge.js';
 window.registry=registry;window.handles={};window.requests=[];window.host=api.hmbNormalizeImageAssetState({});window.runtime=host.shot_routing.publisher_instance_uuid;
 window.value=id=>({schema:'hmb-image-asset-thumbnail-bridge',version:1,runtime_instance_id:id||runtime,catalog_page_version:1});
-const catalog={schema:'hmb-cgt-own-tasks',version:1,status:'ready',projects:[{id:'11111111-1111-4111-8111-111111111111',entity:'fixture',name:'Synthetic CGT project',database:'proj_fixture',status:'Active'}],project:null,tasks:[],can_bind:false};
+const catalog={schema:'hmb-cgt-own-tasks',version:1,status:'ready',projects:[{id:'11111111-1111-4111-8111-111111111111',entity:'katuri8',name:'까투리8',display_name:'Katuri8',database:'proj_fixture',status:'Active'}],project:null,tasks:[],can_bind:false};
 window.callback=owner=>request=>{requests.push({owner,operation:request.operation,runtime:request.runtime_instance_id});if(request.operation==='cgt_catalog'){
  handles[owner.startsWith('visible')?'a':owner==='measurement'?'b':'c']?.update({value:{...request,phase:'result',state:catalog,outcome:'ready'},onChange:callback(owner)});
 }};
@@ -39,7 +39,8 @@ try{
  assert.equal(await page.evaluate(()=>['a','b','c'].some(id=>document.getElementById(id).querySelector('button,input,select,textarea,.react-flow__handle'))),false,'Transport exposes no authoring controls or connection handles');checks++;
  assert.equal(await page.evaluate(()=>registry().get(runtime).bridgeOwners.size),3);checks++;
  await page.locator('[data-shot-add]').click();await page.waitForFunction(()=>document.querySelector('[data-hier-cgt-project] option')?.textContent==='프로젝트 선택 필요');
- await page.waitForFunction(()=>document.querySelector('[data-hier-cgt-project]')?.textContent.includes('Synthetic CGT project'));
+ await page.waitForFunction(()=>document.querySelector('[data-hier-cgt-project]')?.textContent.includes('Katuri8'));
+ assert.equal(await page.locator('[data-hier-cgt-project] option').last().getAttribute('value'),'11111111-1111-4111-8111-111111111111');checks++;
  assert.equal(await page.evaluate(()=>requests.filter(row=>row.operation==='cgt_catalog').at(-1).owner),'visible');checks++;
  const beforeCleanup=await page.evaluate(()=>requests.length);
  await page.evaluate(()=>{handles.c.cleanup();handles.b.cleanup();});
@@ -62,7 +63,7 @@ try{
  assert.equal(stale,true);checks++;
  const remount=await page.evaluate(()=>{mountBridge('a','visible');try{retired({});return false;}catch{return true;}});
  assert.equal(remount,true,'A retired group cannot route commands into a replacement group');checks++;
- const moved=await page.evaluate(()=>{window.old=registry().get(runtime).dispatch;handles.a.update({value:value('SYNTHETIC-NEW-RUNTIME'),onChange:callback('visible-latest')});let blocked=false;try{old({});}catch{blocked=true;}return {blocked,oldDispatch:typeof registry().get(runtime)?.dispatch,newDispatch:typeof registry().get('SYNTHETIC-NEW-RUNTIME')?.dispatch};});
+ const moved=await page.evaluate(()=>{window.old=registry().get(runtime).dispatch;handles.a.update({value:{...value('SYNTHETIC-NEW-RUNTIME'),phase:'idle'},onChange:callback('visible-latest')});let blocked=false;try{old({});}catch{blocked=true;}return {blocked,oldDispatch:typeof registry().get(runtime)?.dispatch,newDispatch:typeof registry().get('SYNTHETIC-NEW-RUNTIME')?.dispatch};});
  assert.deepEqual(moved,{blocked:true,oldDispatch:'undefined',newDispatch:'function'});checks+=3;
  const mismatch=await page.evaluate(()=>{const before=requests.length;try{send(runtime);}catch{};const wrong={operation:'cgt_catalog',runtime_instance_id:runtime,request_id:crypto.randomUUID(),session_id:crypto.randomUUID()};let blocked=false;try{registry().get('SYNTHETIC-NEW-RUNTIME').dispatch(wrong);}catch{blocked=true;}return {blocked,noCallback:requests.length===before};});
  assert.deepEqual(mismatch,{blocked:true,noCallback:true});checks+=2;
