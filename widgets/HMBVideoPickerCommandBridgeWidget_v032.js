@@ -49,8 +49,11 @@ function makeContainerInert(container) {
 }
 
 function bridgeValue(props) {
-  const value = props?.value;
-  return value && typeof value === "object" ? value : {};
+  let value = props?.value ?? props?.parameterValue ?? props?.defaultValue;
+  if (typeof value === "string") {
+    try { value = JSON.parse(value); } catch (_error) { return {}; }
+  }
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
 function hmbNativeUiImplementation(container, props) {

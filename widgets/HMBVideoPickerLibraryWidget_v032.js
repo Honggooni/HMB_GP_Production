@@ -5461,9 +5461,24 @@ export function pickerButtonAvailability(
   localOriginalPending = false,
 ) {
   const state = rawState && typeof rawState === "object" ? rawState : {};
-  const status = clean(state.status).toUpperCase();
-  const sceneStage = clean(state.scene_stage).toUpperCase();
-  const operationKind = clean(state.operation_kind);
+  let status = clean(state.status).toUpperCase();
+  let sceneStage = clean(state.scene_stage).toUpperCase();
+  let operationKind = clean(state.operation_kind);
+  const activeShot = clean(state.active_picker_shot_uuid);
+  const readRequests = state.read_requests_by_shot && typeof state.read_requests_by_shot === "object"
+    ? state.read_requests_by_shot : {};
+  const ownRead = readRequests[activeShot];
+  const ownReadBusy = ["queued", "running"].includes(clean(ownRead?.status));
+  const readOwner = clean(state.operation_picker_shot_uuid)
+    || Object.keys(readRequests).find(key => clean(readRequests[key]?.status) === "running") || "";
+  const anotherShotReading = operationKind === "read_scene" && !!readOwner && readOwner !== activeShot;
+  if (anotherShotReading) {
+    operationKind = "";
+    if (["READING_SCENE", "CANCELLING"].includes(status)) status = "READY";
+    if (["MAYA_READING", "BLENDER_READING", "PYTHON_COMMAND_RECEIVED", "CANCELLING"].includes(sceneStage)) {
+      sceneStage = state.native_read_ready ? "OUTLINER_READY" : "EMPTY";
+    }
+  }
   const draftPath = clean(
     draftPathValue
     || state.scene_draft_path
@@ -5475,8 +5490,8 @@ export function pickerButtonAvailability(
   const engineAvailable = blenderScene
     ? Boolean(state.blender_available && clean(state.blender_executable))
     : Boolean(state.maya_available && clean(state.maya_executable));
-  const terminalFailure = ["FAILED", "CANCELLED"].includes(status)
-    || ["FAILED", "LOAD_FAILED", "CANCELLED", "STALE_RESULT_DISCARDED"].includes(sceneStage);
+  const terminalFailure = !ownReadBusy && (["FAILED", "CANCELLED"].includes(status)
+    || ["FAILED", "LOAD_FAILED", "CANCELLED", "STALE_RESULT_DISCARDED"].includes(sceneStage));
   const stopping = status === "CANCELLING" || sceneStage === "CANCELLING";
   const operationStartedAt = Math.max(0, Number(state.operation_started_at_ms || 0));
   const operationFinishedAt = Math.max(0, Number(state.operation_finished_at_ms || 0));
@@ -5488,6 +5503,7 @@ export function pickerButtonAvailability(
     );
   const operationBusy = !terminalFailure && (
     stopping
+    || ownReadBusy
     || !!localReadPending
     || !!localOriginalPending
     || ["READING_SCENE", "RUNNING", "GENERATING_VIDEO", "GENERATING_ORIGINAL", "SNAPSHOT_RENDERING"].includes(status)
@@ -5543,19 +5559,19 @@ export function pickerButtonAvailability(
       && (reload || terminalFailure || !readSnapshotReady),
     reload,
     stopEnabled: (operationBusy || !!localReadPending || !!localOriginalPending) && !stopping,
-    playblastEnabled: !operationBusy
+    playblastEnabled: !operationBusy && !anotherShotReading
       && !terminalFailure
       && readSnapshotReady
       && cameraReady
       && outputReady
       && generationOutputSelected,
-    originalPreviewToggleEnabled: !operationBusy
+    originalPreviewToggleEnabled: !operationBusy && !anotherShotReading
       && !terminalFailure
       && readSnapshotReady
       && outlinerReady
       && cameraReady
       && frameRangeReady,
-    snapshotEnabled: !operationBusy
+    snapshotEnabled: !operationBusy && !anotherShotReading
       && snapshotReadReady
       && cameraReady
       && outputReady
@@ -5625,6 +5641,53 @@ export function hmbClearPickerCommandSubmission(container, actionId) {
   return true;
 }
 
+function hmbPickerReadRequestKey(runtime, shot) {
+  return `${clean(runtime)}:${clean(shot)}`;
+}
+
+export function hmbProjectPickerReadRequest(container, state) {
+  const requests = container?.__hmbPickerReadRequests;
+  if (!(requests instanceof Map)) return null;
+  const request = requests.get(hmbPickerReadRequestKey(state?.runtime_instance_id, state?.active_picker_shot_uuid));
+  container.__hmbReadCommandPending = !!request;
+  container.__hmbReadActionId = request?.actionId || "";
+  container.__hmbReadAckTimer = request?.timer || null;
+  return request || null;
+}
+
+export function hmbClaimPickerReadRequest(container, state, actionId, scenePath) {
+  const runtime = clean(state?.runtime_instance_id), shot = clean(state?.active_picker_shot_uuid);
+  if (!container || !runtime || !shot || !clean(actionId)) return null;
+  const requests = container.__hmbPickerReadRequests instanceof Map
+    ? container.__hmbPickerReadRequests : new Map();
+  container.__hmbPickerReadRequests = requests;
+  const key = hmbPickerReadRequestKey(runtime, shot);
+  if (requests.has(key)) return null;
+  const request = { key, runtime, shot, actionId: clean(actionId), scenePath: clean(scenePath), timer: null };
+  requests.set(key, request);
+  hmbProjectPickerReadRequest(container, state);
+  return request;
+}
+
+export function hmbReleasePickerReadRequest(container, request) {
+  const requests = container?.__hmbPickerReadRequests;
+  if (!(requests instanceof Map) || requests.get(request?.key) !== request) return false;
+  if (request.timer) { try { clearTimeout(request.timer); } catch (_error) {} }
+  requests.delete(request.key);
+  if (clean(container.__hmbReadActionId) === request.actionId) {
+    container.__hmbReadCommandPending = false;
+    container.__hmbReadActionId = "";
+    delete container.__hmbReadAckTimer;
+  }
+  return true;
+}
+
+export function hmbClearPickerReadRequests(container) {
+  for (const request of container?.__hmbPickerReadRequests?.values?.() || []) hmbReleasePickerReadRequest(container, request);
+  delete container.__hmbPickerReadRequests;
+  delete container.__hmbPickerReadErrors;
+}
+
 export function hmbReconcilePickerCommandAcknowledgements(container, rawState) {
   const state = rawState && typeof rawState === "object" ? rawState : {};
   const result = {
@@ -5634,6 +5697,34 @@ export function hmbReconcilePickerCommandAcknowledgements(container, rawState) {
   };
   if (!container || clean(state.state_writer) !== "python") return result;
   const acknowledgementId = clean(state.backend_ack_action_id);
+  const requests = container.__hmbPickerReadRequests;
+  if (requests instanceof Map) {
+    for (const request of [...requests.values()]) {
+      if (request.runtime !== clean(state.runtime_instance_id)) continue;
+      const receipt = state.read_requests_by_shot?.[request.shot];
+      const shotAcknowledged = clean(receipt?.action_id) === request.actionId
+        && ["queued", "running", "complete", "failed", "cancelled"].includes(clean(receipt?.status));
+      if (shotAcknowledged || acknowledgementId === request.actionId) {
+        result.readReleased = hmbReleasePickerReadRequest(container, request) || result.readReleased;
+      }
+    }
+  }
+  // Delivery may finish after the watchdog released its local pending entry.
+  // Retire only that exact Shot/action error; a stale receipt cannot clear a
+  // later retry's timeout or an error belonging to a different runtime.
+  const errors = container.__hmbPickerReadErrors;
+  if (errors instanceof Map) {
+    for (const [key, error] of errors) {
+      if (error.runtime !== clean(state.runtime_instance_id)) continue;
+      const receipt = state.read_requests_by_shot?.[error.shot];
+      const shotAcknowledged = clean(receipt?.action_id) === error.actionId
+        && ["queued", "running", "complete", "failed", "cancelled"].includes(clean(receipt?.status));
+      if (shotAcknowledged || acknowledgementId === error.actionId) {
+        errors.delete(key);
+        result.readReleased = true;
+      }
+    }
+  }
   if (!acknowledgementId) return result;
 
   const operationActionId = clean(container.__hmbPickerOperationActionId);
@@ -5646,7 +5737,7 @@ export function hmbReconcilePickerCommandAcknowledgements(container, rawState) {
   }
 
   const readActionId = clean(container.__hmbReadActionId);
-  if (readActionId && acknowledgementId === readActionId) {
+  if (!(requests instanceof Map) && readActionId && acknowledgementId === readActionId) {
     container.__hmbReadCommandPending = false;
     container.__hmbReadActionId = "";
     if (container.__hmbReadAckTimer) {
@@ -6082,6 +6173,7 @@ export function hmbBindVideoPickerRuntimeIdentity(container, runtimeInstanceId) 
 
   container.__hmbVideoPickerRuntimeInstanceId = nextRuntimeId;
   if (hydrationReset) {
+    hmbClearPickerReadRequests(container);
     // React Flow may reuse the same data-id for a newly hydrated Python node.
     // That is a new workflow-load boundary: never copy view/geometry from the
     // previous runtime into its registry identity.
@@ -12324,6 +12416,7 @@ function hmbNativeUiImplementation(container, props) {
       delete container.__hmbLastPickerStateRollback;
       delete container.__hmbLatestPickerStatePublicationIdentity;
       delete container.__hmbVisiblePickerStatePublicationError;
+      hmbClearPickerReadRequests(container);
       const ackTimer = container.__hmbReadAckTimer;
       if (ackTimer) {
         try { clearTimeout(ackTimer); } catch (_error) {}
@@ -12388,6 +12481,7 @@ function hmbNativeUiImplementation(container, props) {
   ));
   hmbBindVideoPickerRuntimeIdentity(container, engineState.runtime_instance_id);
   hmbReconcilePickerCommandAcknowledgements(container, engineState);
+  hmbProjectPickerReadRequest(container, engineState);
   if (typeof container.__hmbVideoPickerExpanded !== "boolean") {
     const storedViewMode = hmbVideoPickerStoredViewMode(container);
     // A workflow load starts in the compact Loader. An explicit expanded
@@ -13299,6 +13393,13 @@ function hmbNativeUiImplementation(container, props) {
   }
 
   const applyImmediateCommandUi = (next) => {
+    hmbProjectPickerReadRequest(container, next);
+    const readError = container.__hmbPickerReadErrors?.get(hmbPickerReadRequestKey(next?.runtime_instance_id, next?.active_picker_shot_uuid));
+    const readStatus = next?.read_requests_by_shot?.[clean(next?.active_picker_shot_uuid)];
+    if (readError) next = { ...next, message: readError.message };
+    else if (["queued", "failed", "cancelled"].includes(clean(readStatus?.status)) && clean(readStatus.message)) {
+      next = { ...next, message: readStatus.message };
+    }
     const readButton = container.querySelector("#read-scene");
     const stopButton = container.querySelector("#stop-read");
     const playblastButton = container.querySelector("#run-video");
@@ -13548,6 +13649,7 @@ function hmbNativeUiImplementation(container, props) {
     // Local outliner input starts from the already-normalized live state.
     // Full media/catalog normalization belongs to the post-paint publisher.
     const current = normalizeState ? normalize(source) : { ...source };
+    hmbProjectPickerReadRequest(container, current);
     const draft = container.__hmbOutlinerSearchDraft;
     if (draft && Number(draft.expiresAtMs || 0) > Date.now()) {
       current.outliner_search = clean(draft.value);
@@ -13761,21 +13863,25 @@ function hmbNativeUiImplementation(container, props) {
     }
     return { command, delivered, deliveryPromise };
   };
-  const scheduleReadAckTimeout = (actionId) => {
-    if (container.__hmbReadAckTimer) {
-      try { clearTimeout(container.__hmbReadAckTimer); } catch (_error) {}
-    }
-    container.__hmbReadAckTimer = setTimeout(() => {
-      delete container.__hmbReadAckTimer;
+  const scheduleReadAckTimeout = (request) => {
+    if (!request || container.__hmbPickerReadRequests?.get(request.key) !== request) return;
+    if (request.timer) { try { clearTimeout(request.timer); } catch (_error) {} }
+    request.timer = setTimeout(() => {
       const latest = currentWidgetState();
-      const acknowledgement = hmbReconcilePickerCommandAcknowledgements(container, latest);
-      if (acknowledgement.readReleased) {
+      hmbReconcilePickerCommandAcknowledgements(container, latest);
+      if (container.__hmbPickerReadRequests?.get(request.key) !== request) {
         applyImmediateCommandUi(latest);
         return;
       }
-      if (clean(container.__hmbReadActionId) !== actionId) return;
-      container.__hmbReadCommandPending = false;
-      container.__hmbReadActionId = "";
+      if (!hmbReleasePickerReadRequest(container, request)) return;
+      const errors = container.__hmbPickerReadErrors instanceof Map ? container.__hmbPickerReadErrors : new Map();
+      container.__hmbPickerReadErrors = errors;
+      errors.set(request.key, {
+        runtime: request.runtime, shot: request.shot, actionId: request.actionId,
+        message: (TEXT[latest.language] || TEXT.ko).readAckTimeoutMessage,
+      });
+      // A delayed request from Shot 1 cannot paint an error over Shot 2.
+      if (clean(latest.runtime_instance_id) !== request.runtime || clean(latest.active_picker_shot_uuid) !== request.shot) return;
       const failed = normalize({
         ...latest,
         message: (TEXT[latest.language] || TEXT.ko).readAckTimeoutMessage,
@@ -13783,6 +13889,7 @@ function hmbNativeUiImplementation(container, props) {
       reportTransportError("READ transport timed out before Python acknowledgement (20 seconds).");
       applyImmediateCommandUi(failed);
     }, 20000);
+    hmbProjectPickerReadRequest(container, currentWidgetState(false));
   };
   const scheduleOriginalAckTimeout = (actionId, previousEnabled) => {
     if (container.__hmbOriginalAckTimer) {
@@ -15045,8 +15152,9 @@ function hmbNativeUiImplementation(container, props) {
       fields?.delete("active_snapshot_uid");
       fields?.delete("viewport_mode");
     }
-    container.__hmbReadCommandPending = true;
-    container.__hmbReadActionId = actionId;
+    const readRequest = hmbClaimPickerReadRequest(container, currentLocal, actionId, liveScenePath);
+    if (!readRequest) return false;
+    container.__hmbPickerReadErrors?.delete(readRequest.key);
     const pendingDisplay = appendActivityLog({
       ...currentLocal,
       scene_draft_path: liveScenePath,
@@ -15061,8 +15169,7 @@ function hmbNativeUiImplementation(container, props) {
       output_height: Number(currentLocal.output_height || 720),
     }, actionId);
     if (!result.delivered) {
-      container.__hmbReadCommandPending = false;
-      container.__hmbReadActionId = "";
+      hmbReleasePickerReadRequest(container, readRequest);
       applyImmediateCommandUi({
         ...currentLocal,
         message: "READ was not submitted because HMB_PICKER_COMMAND is unavailable.",
@@ -15070,15 +15177,14 @@ function hmbNativeUiImplementation(container, props) {
       return false;
     }
     appendImmediateLogLine("INFO", "READ request submitted through HMB_PICKER_COMMAND. Waiting for Python acknowledgement.");
-    scheduleReadAckTimeout(actionId);
+    scheduleReadAckTimeout(readRequest);
     if (result.deliveryPromise) {
       result.deliveryPromise.then((outcome) => {
         if (outcome?.ok) return;
         const latest = currentWidgetState();
         if (clean(latest.backend_ack_action_id) === actionId) return;
-        if (clean(container.__hmbReadActionId) !== actionId) return;
-        container.__hmbReadCommandPending = false;
-        container.__hmbReadActionId = "";
+        if (!hmbReleasePickerReadRequest(container, readRequest)) return;
+        if (clean(latest.runtime_instance_id) !== readRequest.runtime || clean(latest.active_picker_shot_uuid) !== readRequest.shot) return;
         applyImmediateCommandUi({
           ...latest,
           message: "READ transport was rejected before Python could acknowledge it.",
@@ -15159,11 +15265,9 @@ function hmbNativeUiImplementation(container, props) {
     const currentLocal = currentWidgetState();
     const localReadPending = !!container.__hmbReadCommandPending;
     const localOriginalPending = !!container.__hmbOriginalCommandPending;
-    const localPending = localReadPending || localOriginalPending;
-    const processPid = Math.max(0, Number(currentLocal.active_process_pid || 0));
-    const activeNow = localPending
-      || ["READING_SCENE", "RUNNING", "GENERATING_VIDEO", "GENERATING_ORIGINAL", "SNAPSHOT_RENDERING", "CANCELLING"].includes(clean(currentLocal.status).toUpperCase())
-      || ["read_scene", "render_original_preview", "run_video", "render_snapshot"].includes(clean(currentLocal.operation_kind));
+    const shotRead = currentLocal.read_requests_by_shot?.[clean(currentLocal.active_picker_shot_uuid)];
+    const processPid = clean(shotRead?.status) === "queued" ? 0 : Math.max(0, Number(currentLocal.active_process_pid || 0));
+    const activeNow = pickerButtonAvailability(currentLocal, "", localReadPending, localOriginalPending).stopEnabled;
     if (!activeNow) {
       appendImmediateLogLine("INFO", "STOP ignored because no active or pending operation is visible.");
       return;
@@ -15180,6 +15284,8 @@ function hmbNativeUiImplementation(container, props) {
     const readActionId = clean(container.__hmbReadActionId);
     const originalActionId = clean(container.__hmbOriginalActionId);
     const targetActionId = clean(
+      (["queued", "running"].includes(clean(shotRead?.status)) ? shotRead.action_id : "")
+      ||
       (targetOriginal ? originalActionId : readActionId)
       || (targetOriginal ? readActionId : originalActionId)
       || currentLocal.backend_ack_action_id,
@@ -15194,11 +15300,18 @@ function hmbNativeUiImplementation(container, props) {
     }
     const clearStoppedLocalPending = () => {
       if (targetActionId && targetActionId === readActionId) {
-        container.__hmbReadCommandPending = false;
-        container.__hmbReadActionId = "";
-        if (container.__hmbReadAckTimer) {
-          try { clearTimeout(container.__hmbReadAckTimer); } catch (_error) {}
-          delete container.__hmbReadAckTimer;
+        const requests = container.__hmbPickerReadRequests;
+        const ownedRead = requests?.get(hmbPickerReadRequestKey(currentLocal.runtime_instance_id, currentLocal.active_picker_shot_uuid));
+        if (ownedRead?.actionId === targetActionId) hmbReleasePickerReadRequest(container, ownedRead);
+        if (requests instanceof Map) {
+          hmbProjectPickerReadRequest(container, currentWidgetState(false));
+        } else if (clean(container.__hmbReadActionId) === targetActionId) {
+          container.__hmbReadCommandPending = false;
+          container.__hmbReadActionId = "";
+          if (container.__hmbReadAckTimer) {
+            try { clearTimeout(container.__hmbReadAckTimer); } catch (_error) {}
+            delete container.__hmbReadAckTimer;
+          }
         }
       }
       if (targetActionId && targetActionId === originalActionId) {

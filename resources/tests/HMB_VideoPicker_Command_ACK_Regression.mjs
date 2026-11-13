@@ -132,7 +132,7 @@ const regionalLock = widgetSource.indexOf("const immediateMediaLocked = pickerLo
 assert.ok(patchMountedStart >= 0 && regionalAck > patchMountedStart && regionalAck < regionalLock);
 assert.match(
   widgetSource,
-  /const acknowledgement = hmbReconcilePickerCommandAcknowledgements\(container, latest\);\s*if \(acknowledgement\.readReleased\)/,
+  /hmbReconcilePickerCommandAcknowledgements\(container, latest\);\s*if \(container\.__hmbPickerReadRequests\?\.get\(request\.key\) !== request\)/,
 );
 
 console.log("HMB VideoPicker command acknowledgement regression: PASS");

@@ -29,6 +29,9 @@ def diagnostic_node(scene):
     """
     node = object.__new__(picker.HMBVideoPickerLibrary)
     node._hmb_state_write_lock = threading.RLock()
+    # This fixture deliberately skips __init__; mirror its empty live READ
+    # receipt store while preserving the real publication/diagnostic methods.
+    node._hmb_read_requests = {}
     node._hmb_runtime_instance_id = "diagnostic-regression"
     node._hmb_lifecycle_generation = 1
     node._hmb_state_revision = 0

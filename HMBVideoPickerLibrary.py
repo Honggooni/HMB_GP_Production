@@ -23,6 +23,7 @@ import uuid
 import zlib
 from dataclasses import dataclass
 from contextlib import contextmanager, nullcontext, suppress
+from contextvars import copy_context
 from fractions import Fraction
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence
@@ -9169,6 +9170,9 @@ def _parse_state(value: Any) -> Dict[str, Any]:
     state = _default_widget_state()
     if isinstance(source, dict):
         state.update(source)
+    # The bridge extracts this before normalization. Never serialize or echo a
+    # one-shot action back into another host value-set callback.
+    state.pop(WIDGET_STATE_EMBEDDED_COMMAND_FIELD, None)
     _project_picker_scene(state, state.get("active_picker_shot_uuid"))
     _normalize_shot_selection_fields(state)
     _normalize_shot_catalog_watermark_fields(state)
@@ -10257,6 +10261,7 @@ def _build_synchronized_video_outputs(
 def _recover_orphaned_runtime_state(value: Any) -> tuple[Dict[str, Any], bool]:
     """Remove one-shot commands and impossible busy states from an old runtime."""
     state = _parse_state(value)
+    had_read_receipts = bool(state.pop("read_requests_by_shot", None))
     pending_action = _clean(state.get("pending_action"))
     pending_action_id = _clean(state.get("pending_action_id"))
     status = _clean(state.get("status")).upper()
@@ -10280,7 +10285,7 @@ def _recover_orphaned_runtime_state(value: Any) -> tuple[Dict[str, Any], bool]:
         }
     )
     if not pending_action and not orphaned_busy:
-        return state, False
+        return state, had_read_receipts
 
     state["pending_action"] = ""
     state["pending_action_id"] = ""
@@ -14473,6 +14478,11 @@ class HMBVideoPickerLibrary(DataNode):
         self._hmb_state_write_lock = threading.RLock()
         self._hmb_command_lock = threading.RLock()
         self._hmb_embedded_command_queue: List[Dict[str, Any]] = []
+        self._hmb_read_queue_lock = threading.RLock()
+        self._hmb_read_queue: List[Dict[str, Any]] = []
+        self._hmb_read_queue_running = False
+        self._hmb_read_queue_owner = None
+        self._hmb_read_requests: Dict[str, Dict[str, Any]] = {}
         # Serializes catalog authority changes and MP4 import commits. File
         # browsers may run concurrently, but no stale whole-state import may
         # overwrite another import or resurrect an ImageAsset-deleted Shot.
@@ -14845,6 +14855,12 @@ class HMBVideoPickerLibrary(DataNode):
                 getattr(self, "_hmb_lifecycle_generation", 0) or 0
             )
             normalized = _parse_state(state)
+            # READ receipts are live Python-owned state, separate for each
+            # Shot. An older progress snapshot must not erase another Shot's
+            # newly accepted request; saved receipts never replay work.
+            normalized["read_requests_by_shot"] = copy.deepcopy(
+                getattr(self, "_hmb_read_requests", {})
+            )
             authoritative = getattr(self, "_hmb_authoritative_state", None)
             if (
                 getattr(self, "_hmb_active_operation", None) is not None
@@ -14894,6 +14910,16 @@ class HMBVideoPickerLibrary(DataNode):
                         "viewport_mode", "active_snapshot_uid", "selected_video_slot", "revision",
                     ):
                         row[key] = copy.deepcopy(current_row.get(key))
+                if self._hmb_active_operation.kind == "read_scene":
+                    # READ changes a private scene snapshot, never the public
+                    # video catalog or Shot binding authority. Preserve edits
+                    # made while filesystem preflight/Maya was running,
+                    # including deletion/rebinding of another queued Shot.
+                    for key in ("picker_shots", "videos", "shot_selections"):
+                        normalized[key] = copy.deepcopy(live.get(key, []))
+                    for key in live:
+                        if key.startswith("accepted_shot_catalog_"):
+                            normalized[key] = copy.deepcopy(live[key])
                 normalized = _activate_picker_workspace_projection(
                     normalized, live.get("active_picker_shot_uuid")
                 )
@@ -14953,6 +14979,7 @@ class HMBVideoPickerLibrary(DataNode):
                         compact_warning,
                     )
                     logged_messages.add(compact_warning)
+            normalized["read_requests_by_shot"] = copy.deepcopy(self._hmb_read_requests)
             current_revision = max(
                 int(getattr(self, "_hmb_state_revision", 0) or 0),
                 int(normalized.get("state_revision") or 0),
@@ -18365,13 +18392,19 @@ class HMBVideoPickerLibrary(DataNode):
         replace backend-owned Maya results.
         """
         name = _parameter_name(parameter)
+        embedded_source = value
+        if name == WIDGET_STATE_PARAMETER and not isinstance(embedded_source, dict):
+            try:
+                embedded_source = json.loads(str(embedded_source or ""))
+            except (TypeError, ValueError):
+                embedded_source = None
         if (
             name == WIDGET_STATE_PARAMETER
-            and isinstance(value, dict)
-            and isinstance(value.get(WIDGET_STATE_EMBEDDED_COMMAND_FIELD), dict)
+            and isinstance(embedded_source, dict)
+            and isinstance(embedded_source.get(WIDGET_STATE_EMBEDDED_COMMAND_FIELD), dict)
         ):
             command = _parse_picker_command(
-                value.get(WIDGET_STATE_EMBEDDED_COMMAND_FIELD)
+                embedded_source.get(WIDGET_STATE_EMBEDDED_COMMAND_FIELD)
             )
             if (
                 _clean(command.get("runtime_instance_id"))
@@ -18558,12 +18591,15 @@ class HMBVideoPickerLibrary(DataNode):
         target: Any,
     ) -> None:
         """Start one worker after the current retained-mode request has completed."""
+        # SDK workflow/engine scope belongs to the request that scheduled the
+        # action. A bare thread loses those ContextVars before publishing ACKs.
+        action_context = copy_context()
 
         def launch() -> None:
             if getattr(self, "_hmb_node_deleted", False):
                 return
             thread = threading.Thread(
-                target=target,
+                target=lambda: action_context.run(target),
                 name=f"HMBVideoPicker-{action}",
                 daemon=True,
             )
@@ -18623,6 +18659,9 @@ class HMBVideoPickerLibrary(DataNode):
                     exc,
                 )
         self._hmb_cancel_requested.set()
+        with self._hmb_read_queue_lock:
+            self._hmb_read_queue.clear()
+            self._hmb_read_requests = {}
         with self._hmb_operation_control_lock:
             self._hmb_pending_operation_id = ""
             self._hmb_active_operation = None
@@ -19794,7 +19833,155 @@ class HMBVideoPickerLibrary(DataNode):
                             operation=operation, status="failed", error=_compact_ui_diagnostic(str(exc), 1000))
                 self._write_state(state)
 
-    def _handle_picker_command(self, command: Dict[str, Any]) -> None:
+    def _publish_picker_read_receipt(
+        self, job: Dict[str, Any], status: str, message: str, *, acknowledge: bool = False,
+    ) -> None:
+        """Publish only this workspace's live receipt, preserving the visible Shot."""
+        workspace_uuid = job["workspace_uuid"]
+        action_id = job["command"]["action_id"]
+        with self._hmb_read_queue_lock:
+            previous = self._hmb_read_requests.get(workspace_uuid, {})
+            if (not acknowledge and previous.get("operation_action_id") != action_id):
+                return
+            entry = dict(previous)
+            entry.update({"action_id": action_id if acknowledge else previous.get("action_id", action_id),
+                          "operation_action_id": action_id, "status": status,
+                          "scene_path": job["scene_path"], "message": message,
+                          "runtime_instance_id": self._hmb_runtime_instance_id})
+            self._hmb_read_requests = {**self._hmb_read_requests, workspace_uuid: entry}
+            with self._hmb_catalog_state_commit():
+                state = self._picker_state()
+                if acknowledge:
+                    state["backend_ack_action_id"] = action_id
+                    state["pending_action"] = ""
+                    state["pending_action_id"] = ""
+                self._write_state(state)
+
+    def _queue_picker_read(self, command: Dict[str, Any]) -> None:
+        """Accept Shot-local READs before I/O; one existing worker drains the FIFO."""
+        payload = dict(command.get("payload") or {})
+        with self._hmb_read_queue_lock:
+            state = self._picker_state()
+            workspace_uuid = _uuid_text(payload.get("picker_shot_uuid") or payload.get("workspace_uuid")
+                                        or state.get("active_picker_shot_uuid"))
+            projected = _activate_picker_workspace_projection(state, workspace_uuid)
+            if projected is None:
+                state["backend_ack_action_id"] = command["action_id"]
+                state["message"] = "The captured Picker Shot no longer exists. READ was cancelled."
+                self._write_state(state)
+                return
+            scene_path = _maya_scene_path_text(payload.get("scene_path") or payload.get("scene_request_path")
+                or payload.get("scene_draft_path") or projected.get("scene_draft_path")
+                or projected.get("scene_request_path") or projected.get("scene_path"))
+            row = next(item for item in projected["picker_shots"] if item["workspace_uuid"] == workspace_uuid)
+            captured_command = copy.deepcopy(command)
+            captured_command["payload"].update(picker_shot_uuid=workspace_uuid, scene_path=scene_path)
+            job = {"workspace_uuid": workspace_uuid, "scene_path": scene_path, "command": captured_command,
+                   "channel_uuid": _uuid_text(state.get("channel_uuid")),
+                   "bound_shot_uuid": _uuid_text(row.get("bound_shot_uuid")),
+                   "lifecycle_generation": int(getattr(self, "_hmb_lifecycle_generation", 0) or 0)}
+            previous = self._hmb_read_requests.get(workspace_uuid, {})
+            if previous.get("status") in {"queued", "running"}:
+                # A repeated click acknowledges the existing job, never starts
+                # a second mutable scene session for the same Shot.
+                self._hmb_read_requests = {**self._hmb_read_requests, workspace_uuid:
+                    {**previous, "action_id": command["action_id"]}}
+                state["backend_ack_action_id"] = command["action_id"]
+                self._write_state(state)
+                return
+            if (self._hmb_process_lock.locked() or self._hmb_pending_operation_id) and not self._hmb_read_queue_running:
+                self._publish_picker_read_receipt(job, "rejected", "A render is running. READ was not started.", acknowledge=True)
+                return
+            self._hmb_read_queue.append(job)
+            owner = not self._hmb_read_queue_running
+            owner_token = object() if owner else None
+            if owner:
+                self._hmb_read_queue_owner = owner_token
+            self._hmb_read_queue_running = True
+            try:
+                self._publish_picker_read_receipt(job, "queued", "READ accepted for this Shot; waiting for the background reader.", acknowledge=True)
+            except BaseException:
+                self._hmb_read_queue.remove(job)
+                previous = self._hmb_read_requests.get(workspace_uuid, {})
+                self._hmb_read_requests = {**self._hmb_read_requests, workspace_uuid:
+                    {**previous, "status": "failed", "message": "READ receipt publication failed; no scene was read."}}
+                if owner:
+                    self._hmb_read_queue_running = False
+                    self._hmb_read_queue_owner = None
+                raise
+        if not owner:
+            return
+        current_job = None
+        try:
+            while True:
+                with self._hmb_read_queue_lock:
+                    if not self._hmb_read_queue or getattr(self, "_hmb_node_deleted", False):
+                        self._hmb_read_queue_running = False
+                        self._hmb_read_queue_owner = None
+                        return
+                    current_job = self._hmb_read_queue.pop(0)
+                current = self._picker_state()
+                target = next((item for item in current["picker_shots"]
+                               if item["workspace_uuid"] == current_job["workspace_uuid"]), None)
+                if (target is None or current_job["lifecycle_generation"] != int(getattr(self, "_hmb_lifecycle_generation", 0) or 0)
+                        or _uuid_text(current.get("channel_uuid")) != current_job["channel_uuid"]
+                        or _uuid_text(target.get("bound_shot_uuid")) != current_job["bound_shot_uuid"]):
+                    self._publish_picker_read_receipt(current_job, "cancelled", "Shot binding changed before READ started; files and outputs were preserved.")
+                    continue
+                self._publish_picker_read_receipt(current_job, "running", "Checking this Shot's scene before the background scan.")
+                try:
+                    self._handle_picker_command(current_job["command"], _read_dispatched=True)
+                    completed = _activate_picker_workspace_projection(self._picker_state(), current_job["workspace_uuid"]) or {}
+                    stage = _clean(completed.get("scene_stage") or completed.get("status")).upper()
+                    status = "cancelled" if stage in {"CANCELLED", "CANCELLING", "STALE_RESULT_DISCARD"} else (
+                        "complete" if completed.get("native_read_ready") and stage not in {"FAILED", "LOAD_FAILED"} else "failed")
+                    self._publish_picker_read_receipt(current_job, status, _clean(completed.get("message")) or f"READ {status}.")
+                except Exception as exc:
+                    _diagnostic_exception("Shot-local READ failed", exc)
+                    self._publish_picker_read_receipt(current_job, "failed", _clean(exc) or type(exc).__name__)
+        finally:
+            with self._hmb_read_queue_lock:
+                if self._hmb_read_queue_owner is owner_token:
+                    self._hmb_read_queue_running = False
+                    self._hmb_read_queue_owner = None
+                    abandoned = self._hmb_read_queue
+                    self._hmb_read_queue = []
+                    if current_job is not None:
+                        receipt = self._hmb_read_requests.get(current_job["workspace_uuid"], {})
+                        if receipt.get("status") in {"queued", "running"}:
+                            abandoned = [current_job, *abandoned]
+                    for pending in abandoned:
+                        record = self._hmb_read_requests.get(pending["workspace_uuid"], {})
+                        self._hmb_read_requests = {**self._hmb_read_requests, pending["workspace_uuid"]:
+                            {**record, "status": "failed", "message": "The background reader stopped before this Shot started; retry READ."}}
+
+    def _cancel_queued_picker_read(self, payload: Dict[str, Any], action_id: str) -> bool:
+        workspace_uuid = _uuid_text(payload.get("picker_shot_uuid") or payload.get("workspace_uuid"))
+        if not workspace_uuid:
+            return False
+        with self._hmb_read_queue_lock:
+            target_action = _clean(payload.get("target_action_id"))
+            own_receipt = self._hmb_read_requests.get(workspace_uuid, {})
+            wrong_action = bool(target_action and target_action not in {
+                _clean(own_receipt.get("action_id")), _clean(own_receipt.get("operation_action_id"))})
+            queued = next((job for job in self._hmb_read_queue if job["workspace_uuid"] == workspace_uuid), None)
+            running_workspace = next((key for key, entry in self._hmb_read_requests.items()
+                                      if entry.get("status") == "running"), "")
+            if wrong_action or (queued is None and running_workspace and running_workspace != workspace_uuid):
+                state = self._picker_state()
+                state["backend_ack_action_id"] = action_id
+                self._write_state(state)
+                return True
+            if queued is None:
+                return False
+            self._hmb_read_queue.remove(queued)
+            self._publish_picker_read_receipt(queued, "cancelled", "This Shot's queued READ was cancelled; existing outputs were preserved.")
+            state = self._picker_state()
+            state["backend_ack_action_id"] = action_id
+            self._write_state(state)
+            return True
+
+    def _handle_picker_command(self, command: Dict[str, Any], *, _read_dispatched: bool = False) -> None:
         command = _parse_picker_command(command)
         action = _clean(command.get("action"))
         action_id = _clean(command.get("action_id"))
@@ -19818,10 +20005,15 @@ class HMBVideoPickerLibrary(DataNode):
                     self._hmb_processed_action_ids = set(
                         list(self._hmb_processed_action_ids)[-128:]
                     )
-        if duplicate_action:
+        if duplicate_action and not _read_dispatched:
             duplicate_state = self._picker_state()
             duplicate_state["backend_ack_action_id"] = action_id
             self._write_state(duplicate_state)
+            return
+        if action == "read_scene" and not _read_dispatched:
+            self._queue_picker_read(command)
+            return
+        if action in {"cancel_pending", "cancel_operation", "stop_read"} and self._cancel_queued_picker_read(payload, action_id):
             return
         if action == "video_tools":
             self._handle_video_tools_command(payload, action_id)
@@ -19831,6 +20023,7 @@ class HMBVideoPickerLibrary(DataNode):
         browse_scene_hint = state.get("scene_request_path") or state.get("scene_path")
         if action in operation_actions and (
             self._hmb_active_operation is not None or self._hmb_process_lock.locked()
+            or (action != "read_scene" and self._hmb_read_queue_running)
         ):
             state["backend_ack_action_id"] = action_id
             _append_activity_log(state, "WARNING", "A Maya operation is already running. Wait for it to finish or press STOP before READ or Generate.")
@@ -21437,7 +21630,10 @@ class HMBVideoPickerLibrary(DataNode):
         # The accepted READ state was already published by _start_ui_operation.
 
         output_folder = _ensure_scene_output_folder(scene_path)
-        token = hashlib.sha1(f"scan|{scene_path}|{time.time_ns()}".encode("utf-8")).hexdigest()[:12]
+        read_workspace = context.picker_shot_uuid if context is not None else _uuid_text(state.get("active_picker_shot_uuid"))
+        read_action = _clean(self._hmb_read_requests.get(read_workspace, {}).get("operation_action_id")
+                             or state.get("backend_ack_action_id"))
+        token = hashlib.sha1(f"scan|{read_workspace}|{read_action}|{scene_path}|{time.time_ns()}".encode("utf-8")).hexdigest()[:12]
         job_folder = output_folder / ".hmb_video_picker" / f"read_{token}"
         job_path = job_folder / "read.job.json"
         result_path = job_folder / "read.result.json"
@@ -21451,6 +21647,8 @@ class HMBVideoPickerLibrary(DataNode):
         _ensure_private_job_folder(job_folder, output_folder)
         _write_json(job_path, {
             "operation": "scan",
+            "picker_shot_uuid": read_workspace,
+            "action_id": read_action,
             "scene_path": str(scene_path),
             "result_path": str(result_path),
             "progress_path": str(progress_path),
@@ -24997,7 +25195,7 @@ class HMBVideoPickerLibrary(DataNode):
             raise FileNotFoundError(f"Blender support is not packaged: {BLENDER_RUNNER}")
         output_folder = _ensure_scene_output_folder(scene_path)
         token = hashlib.sha1(
-            f"blender|{operation}|{scene_path}|{time.time_ns()}".encode("utf-8")
+            f"blender|{operation}|{context.picker_shot_uuid if context else ''}|{context.operation_id if context else ''}|{scene_path}|{time.time_ns()}".encode("utf-8")
         ).hexdigest()[:12]
         job_folder = output_folder / ".hmb_video_picker" / f"blender_{operation}_{token}"
         _ensure_private_job_folder(job_folder, output_folder)
@@ -25009,6 +25207,10 @@ class HMBVideoPickerLibrary(DataNode):
         options = dict(options)
         job: Dict[str, Any] = {
             "operation": operation,
+            "picker_shot_uuid": context.picker_shot_uuid if context is not None else "",
+            "operation_id": context.operation_id if context is not None else "",
+            "action_id": _clean(self._hmb_read_requests.get(context.picker_shot_uuid, {}).get("operation_action_id"))
+                if context is not None and operation == "scan" else "",
             "scene_path": str(scene_path),
             "result_path": str(result_path),
             "progress_path": str(progress_path),

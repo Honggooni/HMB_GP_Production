@@ -306,6 +306,7 @@ jobs:
             "",
             "- Publishes the full Team feature set shared with the verified Local build, including Analysis Agent, Sound Library, Rodong Mart, 13 widgets and all six UI image sheets.",
             "- Fixes Picker READ completion after another Shot was rendered: reconciles captured Shot drafts before execution, accepts runtime-scoped completion acknowledgements independently of optimistic media selection, and bounds completed Maya worker/console shutdown without changing existing outputs or bindings.",
+            "- Separates READ admission and receipts for all five Shot workspaces. Object and JSON-string widget requests receive an acknowledgement before network-file inspection; queued reads, cancellation and late results retain their exact Shot and workflow ownership.",
             "- Preserves the v0.8.65 saved-shot restoration hotfix, per-Shot Picker scene state, cross-Shot video concatenation, authored bindings and existing outputs.",
             "- Distinguishes imported reference videos from generated Playblasts and carries verified analysis provenance and current source references through Agent and Generator request payloads.",
             "- Verifies Korean Prompt fields, analysis observations, exact quoted text and five-Shot save restoration with current-SDK transport and browser tests. Controlled responses do not establish live model translation quality.",

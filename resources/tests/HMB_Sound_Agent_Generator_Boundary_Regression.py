@@ -31,7 +31,8 @@ import _hmb_sound as sound
 class GeneratorSoundBoundary(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="hmb-sound-boundary-")
-        self.root = Path(self.temp.name) / "superwings12" / "Ai_Ct_audio"
+        # Catalog snapshots use canonical roots; Windows TEMP may be an 8.3 alias.
+        self.root = Path(self.temp.name).resolve() / "superwings12" / "Ai_Ct_audio"
         self.root.mkdir(parents=True)
         self.path = self.root / "dialogue.wav"
         self.path.write_bytes(b"offline immutable sound fixture; never decoded")
