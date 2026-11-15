@@ -45,7 +45,7 @@ const server=http.createServer((req,res)=>{res.setHeader('Content-Type',req.url=
 await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
 let browser;
 try{
-  browser=await playwright.chromium.launch({executablePath,headless:true});
+  browser=await playwright.chromium.launch({executablePath,headless:true,args:[`--explicitly-allowed-ports=${server.address().port}`]});
   const page=await browser.newPage({viewport:{width:1700,height:1300}});page.setDefaultTimeout(10000);
   const origin=`http://127.0.0.1:${server.address().port}`;
   await page.route('**/*',route=>route.request().url().startsWith(origin)?route.continue():route.abort());

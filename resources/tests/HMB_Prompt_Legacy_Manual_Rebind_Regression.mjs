@@ -24,7 +24,7 @@ window.sent=[];window.install=number=>{
 </script>`;
 const server=http.createServer((req,res)=>{res.setHeader('Content-Type',req.url==='/widget.js'?'text/javascript; charset=utf-8':'text/html; charset=utf-8');res.end(req.url==='/widget.js'?source:html);});
 await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
-const browser=await playwright.chromium.launch({headless:true,executablePath:process.env.HMB_WIDGET_TEST_BROWSER||'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'});
+const browser=await playwright.chromium.launch({headless:true,args:[`--explicitly-allowed-ports=${server.address().port}`],executablePath:process.env.HMB_WIDGET_TEST_BROWSER||'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'});
 let external=0;
 try{
  const page=await browser.newPage({viewport:{width:1900,height:1500}}),errors=[];

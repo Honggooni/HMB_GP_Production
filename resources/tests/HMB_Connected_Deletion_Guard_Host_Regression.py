@@ -1042,7 +1042,25 @@ async def exercise(engine, _phase, out):
             saved_result = await harness.asend(engine, SaveWorkflowFileFromSerializedFlowRequest(
                 serialized_flow_commands=commands, file_name=saved.stem, file_path=str(saved), display_name="Private deletion fixture"))
             digest = saved.read_bytes()
+            current_runtime = getattr(engine, "current_workflow_or_none", lambda: None)()
             loaded = await harness.asend(engine, RunWorkflowFromScratchRequest(file_path=str(saved)))
+            new_id = getattr(loaded, "workflow_id", None)
+            active = getattr(engine, "open_workflows", None)
+            if new_id and current_runtime is not None and current_runtime.workflow_id != new_id and active is not None:
+                reopened_runtime = active.get(new_id)
+                if active.find(current_runtime.workflow_id) is current_runtime:
+                    # On multi-workflow SDKs, confirm the saved reload did not
+                    # consume or replace the sibling before closing its view.
+                    with engine.bind_workflow(current_runtime):
+                        assert engine.node_manager.get_node_by_name(source.name) is source
+                        await blocked(DeleteNodeRequest(node_name=source.name), "sibling_original_connection_remains_protected")
+                    with engine.bind_workflow(reopened_runtime):
+                        assert engine.node_manager.get_node_by_name(source.name) is not source
+                        await blocked(DeleteNodeRequest(node_name=source.name), "reopened_workflow_connection_protected_by_id")
+                    from griptape_nodes.retained_mode.events.context_events import CloseWorkflowRequest
+                    await harness.asend(engine, CloseWorkflowRequest(workflow_id=current_runtime.workflow_id))
+                    assert active.find(current_runtime.workflow_id) is None
+                    assert active.get(new_id) is reopened_runtime
             assert engine.node_manager.get_node_by_name(source.name) is not source
             assert saved.read_bytes() == digest
             await blocked(ClearAllObjectStateRequest(i_know_what_im_doing=True), "direct_force_clear_after_scratch_load_is_not_authorized")

@@ -147,6 +147,9 @@ def inspect_candidate(candidate: Path, *, header_source: Path = HEADER_SOURCE) -
     editor_version = version(site, "griptape_nodes_editor_dist")
     if (sdk, editor_version) != ("0.104.0", "0.130.0"):
         raise ValueError(f"Unreviewed SDK/Editor pair: {sdk}/{editor_version}")
+    engine = version(site, "griptape_nodes_engine")
+    if engine != "0.108.0":
+        raise ValueError(f"Unreviewed Griptape Nodes engine: {engine}; expected 0.108.0")
     editor = site / "griptape_nodes_editor_dist/editor"
     entry = editor / "index-editor.html"
     fixture_sha = inspect_editor_fixtures(editor / "assets")
@@ -165,7 +168,7 @@ def inspect_candidate(candidate: Path, *, header_source: Path = HEADER_SOURCE) -
         raise ValueError("Editor entry does not reference a reviewed asset")
     files = [candidate / "griptape-nodes-desktop.exe", candidate / "resources/app.asar",
              candidate / PYTHON_ROOT / "python.exe", entry, active]
-    return {"sdk": sdk, "editor": editor_version, "editor_overlay": active == patched,
+    return {"sdk": sdk, "engine": engine, "editor": editor_version, "editor_overlay": active == patched,
             "editor_fixture_sha256": fixture_sha, "compiled_overlay_sha256": patched_sha,
             "sdk_source_sha256": source_tree_digest(site / "griptape_nodes"),
             "files_sha256": {path.relative_to(candidate).as_posix(): digest(path) for path in files}}

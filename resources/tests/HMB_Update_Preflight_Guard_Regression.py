@@ -52,6 +52,19 @@ class PreflightGuardTests(unittest.TestCase):
             self.assertIn(preflight.HEADER_CHECK, result["mandatory_checks"])
             self.assertIn("0.105.0/0.130.0", result["error"])
 
+    def test_same_desktop_versions_cannot_hide_an_unreviewed_engine(self):
+        with tempfile.TemporaryDirectory(prefix="hmb-update-engine-") as temporary:
+            output = Path(temporary)
+            with (mock.patch.object(preflight, "version", side_effect=["0.104.0", "0.130.0", "0.110.0"]),
+                  mock.patch.object(preflight, "inspect_editor_fixtures", side_effect=AssertionError("Wrong engine")),
+                  mock.patch.object(preflight.subprocess, "run", side_effect=AssertionError("Must not execute"))):
+                self.assertEqual(preflight.run(output / "candidate", output / "standard", output, "node"), 1)
+            result = json.loads((output / "upgrade-check.json").read_bytes())
+            self.assertEqual(result["status"], "BLOCKED")
+            self.assertEqual(result["checks"], {})
+            self.assertFalse(result["activation_approved"])
+            self.assertIn("Unreviewed Griptape Nodes engine: 0.110.0", result["error"])
+
     def test_same_entry_bundle_cannot_hide_a_changed_editor_dependency(self):
         with tempfile.TemporaryDirectory(prefix="hmb-editor-fixture-") as temporary:
             assets = Path(temporary)

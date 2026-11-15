@@ -10,7 +10,7 @@ try{playwright=require('playwright');}catch{playwright=require(path.join(os.home
 const out=process.env.HMB_SWITCH_REPORT_DIR;
 const before=process.env.HMB_SWITCH_BASELINE_DIR;
 const results={schema:'hmb-prepared-library-switch-v1',environment:'isolated Chromium widget callbacks; not Desktop',
- metrics:{paint_ms:'First animation-frame callback observing the target selection; not compositor capture',editable_ms:'First frame observing authoring unlocked after canonical ACK',dispatch_ms:'Click to onChange callback entry'},
+ metrics:{paint_ms:'First animation-frame callback observing the target selection; not compositor capture',editable_ms:'First frame observing authoring unlocked after canonical ACK',dispatch_ms:'Click to onChange callback entry',ack_ms:'Click to actual delayed authority response entry'},
  synthetic_ack_ms:180,paid_calls:0,external_requests:0,runs:{}};
 const browser=await playwright.chromium.launch({headless:true,executablePath:process.env.HMB_WIDGET_TEST_BROWSER||'C:/Program Files/Google/Chrome/Application/chrome.exe'});
 try{
@@ -27,20 +27,23 @@ try{
     tracks:shots.map((s,i)=>({...s,source_uid:'source-'+i,instance_id:'track-'+i,name:'Sound '+i,role:'Dialogue',duration_seconds:10,in_seconds:0,out_seconds:null,gain_db:0,enabled:true}))};
    window.calls=[];window.timers=[];window.root=document.querySelector('#sound');window.mode='ack';
    window.props=()=>({value:state,onChange:value=>{
-    const command=value.__hmb_sound_command;calls.push({command,at:performance.now()});
+    const command=value.__hmb_sound_command;const call={command,at:performance.now()};calls.push(call);
     if(mode==='reject')return Promise.reject(Error('fixture rejection'));
     if(mode==='hold')return new Promise(()=>{});
-    timers.push(setTimeout(()=>{state={...state,shot:shots.find(s=>s.shot_uuid===command.shot_uuid),revision:state.revision+1,ack_command_id:command.id};controller.update(props());},180));
+    timers.push(setTimeout(()=>{call.ackedAt=performance.now();state={...state,shot:shots.find(s=>s.shot_uuid===command.shot_uuid),revision:state.revision+1,ack_command_id:command.id};controller.update(props());},180));
    }});
    window.controller=m.default(root,props());
    window.step=async id=>{
     const card=root.querySelector('[data-asset]'),audio=root.querySelector('audio'),before=calls.length,t0=performance.now();
     root.querySelector('[data-shot="'+id+'"]').click();const clickMs=performance.now()-t0;
     const painted=()=>root.querySelector('[data-shot="'+id+'"]').getAttribute('aria-pressed')==='true';
+    const selectionBeforeAck=painted() && !Number.isFinite(calls[before]?.ackedAt);
+    const authoringLockedOnClickReturn=root.querySelector('[data-add="source-10"]').disabled;
     let first=null;
     await new Promise(resolve=>{const frame=()=>{if(painted()&&first===null)first=performance.now()-t0;
-      if(first!==null&&!root.querySelector('[data-shot="'+id+'"]').disabled)return resolve();requestAnimationFrame(frame);};requestAnimationFrame(frame);});
-    return {click_ms:clickMs,paint_ms:first,editable_ms:performance.now()-t0,dispatch_ms:calls[before].at-t0,commands:calls.length-before,
+      if(first!==null&&Number.isFinite(calls[before]?.ackedAt)&&!root.querySelector('[data-add="source-10"]').disabled)return resolve();
+      requestAnimationFrame(frame);};requestAnimationFrame(frame);});
+    return {click_ms:clickMs,paint_ms:first,editable_ms:performance.now()-t0,dispatch_ms:calls[before].at-t0,ack_ms:calls[before].ackedAt-t0,selectionBeforeAck,authoringLockedOnClickReturn,commands:calls.length-before,
       sameCard:card===root.querySelector('[data-asset]'),sameAudio:audio===root.querySelector('audio')};
    };
   },fs.readFileSync(path.join(dir,'HMBSoundLibraryWidget.js'),'utf8'));
@@ -49,7 +52,8 @@ try{
   assert.ok(samples.every(s=>s.commands===1&&s.sameAudio));
   if(variant==='after'){
    assert.ok(samples.every(s=>s.sameCard),'Shot switching must retain the prepared catalog cards');
-   assert.ok(samples.every(s=>s.paint_ms<150),'Prepared page must paint before the delayed authority response');
+   assert.ok(samples.every(s=>s.selectionBeforeAck && s.authoringLockedOnClickReturn && s.editable_ms>=s.ack_ms),
+    'Selection must update and authoring must stay locked until the authority response: '+JSON.stringify(samples));
    await page.evaluate(()=>{mode='hold';root.querySelector('[data-shot="shot-2"]').click();controller.update(props());});
    assert.equal(await page.locator('[data-shot="shot-2"]').getAttribute('aria-pressed'),'true','Old echo cannot rewind the pending view');
    assert.equal(await page.locator('[data-add="source-3"]').isDisabled(),true,'Prepared presentation cannot authorize an edit on an unacknowledged shot');

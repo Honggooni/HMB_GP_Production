@@ -156,7 +156,7 @@ try{
  });
  const event=phase=>performanceResult.events.find(value=>value.phase===phase);
  assert.equal(event('click_return').pressed,'uuid-4');assert.ok(event('click_return').elapsed_ms<40,JSON.stringify(performanceResult));
- assert.equal(event('first_animation_frame').pressed,'uuid-4');assert.ok(event('first_animation_frame').elapsed_ms<event('host_callback_entry').elapsed_ms,JSON.stringify(performanceResult));
+ assert.equal(event('first_animation_frame').pressed,'uuid-4');assert.ok(performanceResult.events.indexOf(event('first_animation_frame'))<performanceResult.events.indexOf(event('host_callback_entry')),JSON.stringify(performanceResult));
  assert.equal(event('host_callback_entry').pressed,'uuid-4');
  assert.equal(performanceResult.contrast.selectedBorder,'rgb(139, 92, 246)');assert.match(performanceResult.contrast.selectedShadow,/inset/);assert.notEqual(performanceResult.contrast.selectedBorder,performanceResult.contrast.unselectedBorder);
  assert.equal(performanceResult.contrast.headerRgb,'139,92,246');

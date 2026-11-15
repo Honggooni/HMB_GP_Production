@@ -273,10 +273,14 @@ function setupWidget(mode) {
       return { saved_shot_checks: 4, target_option_count: targetValues.length, standalone_rows: 50, standalone_edit: true, standalone_target_reopen: true, rapid_cold_switch: true, cleanup: true };
     };
     const keyboardRow = 12;
+    const keyboardShot = structuredClone(base);
+    widget.hmbSwitchPromptShot(keyboardShot, target);
     const beginKeyboardTarget = async () => {
+      trustedKeyboardChange = false;
       await cold();
       startTab(target).click();
-      await waitFor(() => rows().length === 50, 'Keyboard fixture could not reach source row');
+      await waitFor(() => host.querySelector(`[data-shot-editor="${target}"]`) && rows().length === 50,
+        'Keyboard fixture could not reach the selected shot source row');
       const row = rows()[keyboardRow];
       const focusable = [...row.querySelectorAll('input, select, textarea, button, [tabindex]')].filter(element =>
         element.tabIndex >= 0 && !element.disabled && element.offsetWidth > 0 && element.offsetHeight > 0
@@ -290,17 +294,25 @@ function setupWidget(mode) {
     const checkKeyboardFocus = () => {
       const select = rows()[keyboardRow].querySelector('select[data-field="owner"]');
       const options = [...select.options].map(option => option.value);
-      const expected = widget.imageTargetChoicesForRow(latest.images[keyboardRow], latest.images, latest);
+      // The visible shot is deliberately ready before the async publication.
+      // Compare to its saved document, even while latest still refers to Shot 1.
+      const expected = widget.imageTargetChoicesForRow(keyboardShot.images[keyboardRow], keyboardShot.images, keyboardShot);
       if (document.activeElement !== select || JSON.stringify(options) !== JSON.stringify(expected)
-        || select.value !== latest.images[keyboardRow].owner || select.value === options.at(-1)) {
+        || select.value !== owner(2, keyboardRow + 1) || select.value === options.at(-1)) {
         throw Error('Keyboard Tab did not populate and focus the exact Target menu');
       }
       expectedKeyboardTarget = options.at(-1);
       select.addEventListener('change', event => { trustedKeyboardChange = event.isTrusted; }, { capture: true, once: true });
     };
     const checkKeyboardSelection = async () => {
-      await waitFor(() => trustedKeyboardChange && latest.images[keyboardRow].owner === expectedKeyboardTarget, 'Keyboard End did not publish its trusted Target change');
+      await waitFor(() => trustedKeyboardChange && latest.shot.shot_uuid === target
+        && latest.images[keyboardRow].owner === expectedKeyboardTarget, 'Keyboard End did not publish its trusted Target change');
       if (latest.images[keyboardRow].token !== '@image13') throw Error('Keyboard Target edit changed the source slot');
+      const originalShot = structuredClone(latest);
+      widget.hmbSwitchPromptShot(originalShot, shots[0].shot_uuid);
+      if (originalShot.images[keyboardRow].owner !== owner(1, keyboardRow + 1)) {
+        throw Error('Keyboard Target edit modified the previous shot');
+      }
       controller.cleanup();
       return true;
     };

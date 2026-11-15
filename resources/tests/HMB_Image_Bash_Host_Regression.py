@@ -837,7 +837,11 @@ async def exercise(engine, directory):
         pending_apply["meta"]["hmb_image_bash"]["prepared_source_hashes"] = node._source_hashes(pending_apply)
         pending_apply["meta"]["created_at"] = "2026-10-23T01:06:06.006Z-delete"
         set_value("bash_image", pending_apply)
-        send(engine, DeleteNodeRequest(node_name=node.name))
+        # Deserializing registers the flow but does not select it as active.
+        # Enter the rebuilt node's flow before the native deletion request.
+        with engine.context_manager.flow(flow):
+            assert engine.context_manager.get_current_flow() is flow
+            send(engine, DeleteNodeRequest(node_name=node.name))
         await await_bash_settled(engine)
         assert not cancelled_path.exists()
         assert not ATTEMPTS, ATTEMPTS
