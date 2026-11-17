@@ -508,9 +508,12 @@ def _playblast_resolution(value: Any) -> tuple[int, int]:
         )
     except Exception:
         selected = (OUTPUT_WIDTH, OUTPUT_HEIGHT)
-    if selected not in PLAYBLAST_RESOLUTIONS:
-        return OUTPUT_WIDTH, OUTPUT_HEIGHT
-    return selected
+    width, height = selected
+    if min(width, height) < 2:
+        return PLAYBLAST_RESOLUTIONS[0]
+    # The H.264 playblast encoder needs even dimensions. Keep the requested
+    # size without a preset allowlist, rounding an odd edge up by one pixel.
+    return width + width % 2, height + height % 2
 
 
 def _validate_full_smooth_confirmation(

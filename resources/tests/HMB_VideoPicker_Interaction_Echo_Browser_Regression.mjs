@@ -419,6 +419,13 @@ try {
     await page.waitForFunction(()=>!window.host.__hmbPickerPaintFirstState);
     await page.evaluate(()=>window.oldEcho(window.baseline));
     assert.equal(await page.locator('#playblast-resolution').inputValue(),'1920x1080');
+    await page.locator('#playblast-resolution').selectOption('custom');
+    await page.locator('#playblast-custom-resolution').fill('3840x2160');
+    await page.locator('#playblast-custom-resolution').press('Enter');
+    await page.waitForFunction(()=>window.live()?.output_width === 3840 && !window.host.__hmbPickerPaintFirstState);
+    await page.evaluate(()=>window.oldEcho(window.baseline));
+    assert.equal(await page.locator('#playblast-resolution').inputValue(),'custom');
+    assert.equal(await page.locator('#playblast-custom-resolution').inputValue(),'3840×2160');
   });
   await check('Rejected older Shot change cannot overwrite a newer pending choice',async()=>{
     await page.evaluate(()=>{window.hold=true;window.heldReject=null;});

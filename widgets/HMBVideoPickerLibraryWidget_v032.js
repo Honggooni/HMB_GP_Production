@@ -63,6 +63,11 @@ const HMB_PLAYBLAST_RESOLUTIONS = [
   { value: "1280x720", width: 1280, height: 720, label: "1280 × 720" },
   { value: "1920x1080", width: 1920, height: 1080, label: "1920 × 1080" },
 ];
+function hmbPlayblastDimensions(width, height) {
+  const dimensions = [Number(width), Number(height)];
+  if (!dimensions.every((value) => Number.isSafeInteger(value) && value >= 2 && Number.isSafeInteger(value + value % 2))) return null;
+  return dimensions.map((value) => value + value % 2);
+}
 const HMB_RIGHT_SECTION_DEFAULT_HEIGHTS = { settings: 217, color: 628, log: 208 };
 const HMB_ACTIVITY_LOG_MAX_ROWS = 80;
 const HMB_ACTIVITY_LOG_MESSAGE_MAX_CHARS = 260;
@@ -4597,11 +4602,7 @@ function normalize(value) {
   state.scene_engine = /\.blend$/i.test(clean(state.scene_path || state.scene_draft_path)) ? "blender" : "maya";
   state.active_process_pid = Math.max(0, Math.floor(Number(state.active_process_pid || 0)));
   state.active_process_kind = clean(state.active_process_kind);
-  const requestedResolution = HMB_PLAYBLAST_RESOLUTIONS.find(
-    (item) => item.width === Number(state.output_width) && item.height === Number(state.output_height),
-  ) || HMB_PLAYBLAST_RESOLUTIONS[0];
-  state.output_width = requestedResolution.width;
-  state.output_height = requestedResolution.height;
+  [state.output_width, state.output_height] = hmbPlayblastDimensions(state.output_width, state.output_height) || [1280, 720];
   state.node_width = Number(state.node_width || 0) > 0 ? clamp(Math.round(Number(state.node_width)), HMB_MIN_NODE_WIDTH, 6000) : 0;
   state.node_height = Number(state.node_height || 0) > 0 ? clamp(Math.round(Number(state.node_height)), HMB_MIN_NODE_HEIGHT, 6000) : 0;
   const rawExpandedNodeSize = state.expanded_node_size && typeof state.expanded_node_size === "object"
@@ -5850,6 +5851,7 @@ export function hmbApplyPickerCommandGuardToDom(container, busy, action = "") {
     "#browse-maya-scene",
     "#maya-scene-path",
     "#playblast-resolution",
+    "#playblast-custom-resolution",
     "#original-preview-toggle",
     "#mask-playblast-toggle",
     "#depth-playblast-toggle",
@@ -11486,10 +11488,14 @@ export function hmbApplyPickerCameraSelectionToDom(container, state) {
 export function hmbApplyPickerResolutionToDom(container, width, height) {
   const select = container?.querySelector?.("#playblast-resolution");
   if (!select) return false;
-  const requested = `${Math.max(1, Number(width || 0))}x${Math.max(1, Number(height || 0))}`;
-  const matched = Array.from(select.options || []).some((option) => option.value === requested);
-  if (!matched) return false;
-  select.value = requested;
+  const dimensions = hmbPlayblastDimensions(width, height);
+  if (!dimensions) return false;
+  const requested = dimensions.join("x");
+  const preset = HMB_PLAYBLAST_RESOLUTIONS.some((item) => item.value === requested);
+  const custom = container?.querySelector?.("#playblast-custom-resolution");
+  if (custom && custom.ownerDocument?.activeElement !== custom) custom.value = dimensions.join("×");
+  if (custom) custom.hidden = preset;
+  select.value = preset ? requested : "custom";
   return true;
 }
 
@@ -13059,7 +13065,7 @@ function hmbNativeUiImplementation(container, props) {
           <div class="generate-playblast-toolbar" role="group" aria-label="${escapeHtml(tr.generate)}"><button type="button" class="generate-button" id="run-video" aria-label="${escapeHtml(hmbPickerGenerateCaption(state, container))}" title="${escapeHtml(state.scene_path)}" ${!buttonAvailability.playblastEnabled ? "disabled" : ""}>▶&nbsp; ${escapeHtml(hmbPickerGenerateCaption(state, container))}</button></div>
           <div class="playblast-settings-toolbar">
             <div class="settings-grid settings-grid-inline">
-              <label class="settings-primary-item"><span class="settings-primary-label">${escapeHtml(tr.resolution)}</span><select id="playblast-resolution" class="setting-select" ${runningOperation ? "disabled" : ""}>${HMB_PLAYBLAST_RESOLUTIONS.map((item) => `<option value="${item.value}" ${item.width === Number(state.output_width) && item.height === Number(state.output_height) ? "selected" : ""}>${item.label}</option>`).join("")}</select></label>
+              <div class="settings-primary-item"><label for="playblast-resolution" class="settings-primary-label">${escapeHtml(tr.resolution)}</label><div style="display:flex;gap:4px;min-width:0"><select id="playblast-resolution" class="setting-select" ${runningOperation ? "disabled" : ""}>${HMB_PLAYBLAST_RESOLUTIONS.map((item) => `<option value="${item.value}" ${item.width === Number(state.output_width) && item.height === Number(state.output_height) ? "selected" : ""}>${item.label}</option>`).join("")}<option value="custom" ${HMB_PLAYBLAST_RESOLUTIONS.some((item) => item.width === state.output_width && item.height === state.output_height) ? "" : "selected"}>${state.language === "en" ? "Custom" : "직접 입력"}</option></select><input type="text" id="playblast-custom-resolution" class="setting-select nodrag nopan" style="min-width:0;cursor:text" aria-label="${state.language === "en" ? "Width × height" : "너비 × 높이"}" value="${state.output_width}×${state.output_height}" ${HMB_PLAYBLAST_RESOLUTIONS.some((item) => item.width === state.output_width && item.height === state.output_height) ? "hidden" : ""} ${runningOperation ? "disabled" : ""}/></div></div>
               <div class="settings-primary-item"><span class="settings-primary-label">${escapeHtml(tr.frameRange)}</span><span class="setting-value split"><b data-picker-maya-frame-start>${escapeHtml(frameStartText)}</b><span>–</span><b data-picker-maya-frame-end>${escapeHtml(frameEndText)}</b></span></div>
               <div class="settings-compact-row"><span class="settings-compact-item"><b>${escapeHtml(tr.fps)}</b><span data-picker-maya-fps>${escapeHtml(fpsText)}</span></span><span class="settings-compact-item" title="${escapeHtml(`${tr.format}: MPEG-4 / H.264`)}"><b>${escapeHtml(tr.format)}</b><span>H.264</span></span><span class="settings-compact-item" data-picker-engine-metadata title="${escapeHtml(/\.blend$/i.test(mayaSceneDraftPath) ? `Blender: ${state.blender_version || tr.autoDetect}` : `${tr.mayaVersion}: ${state.maya_version ? `Maya ${state.maya_version}` : tr.autoDetect}`)}"><b data-picker-engine-label>${/\.blend$/i.test(mayaSceneDraftPath) ? "Blender" : escapeHtml(tr.mayaVersion)}</b><span data-picker-engine-version>${escapeHtml((/\.blend$/i.test(mayaSceneDraftPath) ? state.blender_version : state.maya_version) || tr.autoDetect)}</span></span></div>
             </div>
@@ -13480,6 +13486,7 @@ function hmbNativeUiImplementation(container, props) {
     const draftInput = container.querySelector("#maya-scene-path");
     const browseButton = container.querySelector("#browse-maya-scene");
     const resolutionSelect = container.querySelector("#playblast-resolution");
+    const resolutionInput = container.querySelector("#playblast-custom-resolution");
     const shotSelector = container.querySelector("#shot-selector");
     const submissionPending = !!container.__hmbPickerOperationSubmissionPending;
     const submissionAction = clean(container.__hmbPickerOperationAction);
@@ -13519,6 +13526,7 @@ function hmbNativeUiImplementation(container, props) {
     if (draftInput) draftInput.disabled = submissionPending || availability.operationBusy;
     if (browseButton) browseButton.disabled = submissionPending || availability.operationBusy;
     if (resolutionSelect) resolutionSelect.disabled = submissionPending || availability.operationBusy;
+    if (resolutionInput) resolutionInput.disabled = submissionPending || availability.operationBusy;
     if (shotSelector) shotSelector.disabled = submissionPending || availability.operationBusy;
     for (const control of container.querySelectorAll?.("[data-camera-path]") || []) {
       control.disabled = submissionPending || availability.operationBusy;
@@ -14048,8 +14056,10 @@ function hmbNativeUiImplementation(container, props) {
     if (input && (changed || force || input.ownerDocument?.activeElement !== input)) {
       input.value = hmbResolveMayaSceneDraftPath(container, nextState);
     }
-    const resolution = container.querySelector?.("#playblast-resolution");
-    if (resolution) resolution.value = `${Number(nextState.output_width)}x${Number(nextState.output_height)}`;
+    const resolutionInput = container.querySelector?.("#playblast-custom-resolution");
+    if (changed || !resolutionInput || resolutionInput.ownerDocument?.activeElement !== resolutionInput) {
+      hmbApplyPickerResolutionToDom(container, nextState.output_width, nextState.output_height);
+    }
     if (changed) {
       const search = container.querySelector?.("#outliner-search");
       if (search) search.value = clean(nextState.outliner_search);
@@ -15593,19 +15603,45 @@ function hmbNativeUiImplementation(container, props) {
       );
     }
   });
-  on(container.querySelector("#playblast-resolution"), "change", (event) => {
-    const selected = HMB_PLAYBLAST_RESOLUTIONS.find(
-      (item) => item.value === clean(event?.target?.value),
-    ) || HMB_PLAYBLAST_RESOLUTIONS[0];
+  const applyPlayblastSize = (width, height) => {
     const liveState = currentWidgetState();
+    const label = `${width} × ${height}`;
     const next = appendActivityLog({
       ...liveState,
-      output_width: selected.width,
-      output_height: selected.height,
-      message: `Playblast resolution set to ${selected.label}.`,
-    }, "INFO", `Playblast resolution set to ${selected.label}.`);
-    hmbApplyPickerResolutionToDom(container, selected.width, selected.height);
+      output_width: width,
+      output_height: height,
+      message: `Playblast resolution set to ${label}.`,
+    }, "INFO", `Playblast resolution set to ${label}.`);
+    hmbApplyPickerResolutionToDom(container, width, height);
     schedulePickerStatePublicationAfterPaint(next, { commitOptions: {} });
+  };
+  const customPlayblastSize = container.querySelector("#playblast-custom-resolution");
+  on(container.querySelector("#playblast-resolution"), "change", (event) => {
+    const selected = HMB_PLAYBLAST_RESOLUTIONS.find((item) => item.value === event.target.value);
+    if (selected) {
+      applyPlayblastSize(selected.width, selected.height);
+    } else if (customPlayblastSize) {
+      customPlayblastSize.hidden = false;
+      customPlayblastSize.focus();
+      customPlayblastSize.select();
+    }
+  });
+  on(customPlayblastSize, "change", () => {
+    const match = /^(\d+)\s*[x×]\s*(\d+)$/i.exec(customPlayblastSize.value.trim());
+    const dimensions = match && hmbPlayblastDimensions(match[1], match[2]);
+    if (dimensions) {
+      customPlayblastSize.value = dimensions.join("×");
+      applyPlayblastSize(...dimensions);
+    } else {
+      const current = currentWidgetState();
+      customPlayblastSize.value = `${current.output_width}×${current.output_height}`;
+    }
+  });
+  on(customPlayblastSize, "keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      customPlayblastSize.blur();
+    }
   });
   on(container.querySelector("#clear-activity-log"), "click", () => {
     commit({

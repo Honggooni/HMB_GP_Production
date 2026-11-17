@@ -1172,7 +1172,9 @@ assert command_parameter.ui_options["hide_handles"] is True
 assert state_parameter.ui_options["expandable"] is True
 assert picker._playblast_resolution({}) == (1280, 720)
 assert picker._playblast_resolution({"output_width": 1920, "output_height": 1080}) == (1920, 1080)
-assert picker._playblast_resolution({"output_width": 1600, "output_height": 900}) == (1280, 720)
+assert picker._playblast_resolution({"output_width": 1600, "output_height": 900}) == (1600, 900)
+assert picker._playblast_resolution({"output_width": 3840, "output_height": 2160}) == (3840, 2160)
+assert picker._playblast_resolution({"output_width": 901, "output_height": 1601}) == (902, 1602)
 assert picker._parse_state({"output_width": 1920, "output_height": 1080})["output_width"] == 1920
 assert picker._parse_state({"output_width": 1920, "output_height": 1080})["output_height"] == 1080
 assert isinstance(node.get_parameter_value(picker.WIDGET_STATE_PARAMETER), dict)

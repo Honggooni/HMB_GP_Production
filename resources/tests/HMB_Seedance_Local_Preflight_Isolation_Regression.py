@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 import unittest
 
@@ -54,6 +55,26 @@ class LocalPreflightTests(unittest.TestCase):
             with mock.patch.object(t.SuccessFailureNode, hook, return_value=[native_error], create=True):
                 self.assertEqual(getattr(value, hook)(), [native_error])
         self.assertEqual(value._hmb_local_preflight_failure, 'HMB local admission')
+
+    def test_sdk_validation_worker_leaves_routing_to_the_engine_loop(self):
+        value = node(ValueError('Selected Shot is waiting'))
+        engine = SimpleNamespace(event_manager=SimpleNamespace(event_loop=None))
+
+        async def run():
+            engine.event_manager.event_loop = asyncio.get_running_loop()
+            native_error = TypeError('Native structural contract')
+            with mock.patch.object(t.HMBSeedanceGeneration, 'engine', new=engine, create=True):
+                for hook in ('validate_before_workflow_run', 'validate_before_node_run'):
+                    with mock.patch.object(t.SuccessFailureNode, hook, return_value=[native_error], create=True):
+                        self.assertEqual(await asyncio.to_thread(getattr(value, hook)), [native_error])
+                value._get_parameters_for_start_validation.assert_not_called()
+                value._process_generation.assert_not_called()
+                await value._aprocess_impl()
+                value._get_parameters_for_start_validation.assert_called_once()
+                self.assertIn('Selected Shot is waiting', value._set_status_results.call_args.kwargs['result_details'])
+                value._process_generation.assert_not_called()
+
+        asyncio.run(run())
 
     def test_each_invalid_shot_is_skipped_before_agent_or_provider(self):
         for error in (ValueError('waiting for original library binding'),

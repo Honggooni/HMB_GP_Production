@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 from io import BytesIO
@@ -30,6 +31,30 @@ if SPEC is None or SPEC.loader is None:
 seedance = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = seedance
 SPEC.loader.exec_module(seedance)
+
+
+def check_seedance_reference_upload_copy():
+    from _hmb_video_tools import _find_ffmpeg, probe_video
+
+    with tempfile.TemporaryDirectory() as directory:
+        original = Path(directory) / 'source.mp4'
+        subprocess.run([_find_ffmpeg(), '-nostdin', '-v', 'error', '-f', 'lavfi', '-i',
+                        'color=c=blue:s=640x360:r=24:d=2', '-c:v', 'libx264', '-pix_fmt',
+                        'yuv420p', str(original)], check=True, timeout=20)
+        original_bytes = original.read_bytes()
+        upload_path = seedance.HMBSeedanceGeneration._reference_video_upload_path
+        with upload_path(original, seedance.SEEDANCE_2_5_MODEL_ID) as copy:
+            assert copy != original and copy.name == original.name
+            probed = probe_video(copy)
+            assert (probed['width'], probed['height'], probed['frame_rate'], probed['duration']) == (854, 480, 24.0, 2.0)
+            with upload_path(copy, seedance.SEEDANCE_2_5_MODEL_ID) as existing:
+                assert existing == copy
+        assert not copy.exists() and original.read_bytes() == original_bytes
+        with upload_path(original, seedance.SEEDANCE_2_0_MODEL_ID) as unchanged:
+            assert unchanged == original
+
+
+check_seedance_reference_upload_copy()
 
 assert callable(
     getattr(seedance.GriptapeCloudStorageDriver, "create_signed_upload_url", None)

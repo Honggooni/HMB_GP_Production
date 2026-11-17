@@ -11,6 +11,7 @@ import ipaddress
 import io
 import json
 import logging
+from math import ceil, sqrt
 import mimetypes
 import os
 import re
@@ -30,6 +31,7 @@ from copy import copy, deepcopy
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Mapping
 from urllib.parse import quote, urlencode, urljoin, urlparse
 from uuid import UUID, uuid4
@@ -11813,6 +11815,18 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # Shots. Keep native structural errors global, but recheck HMB render
         # admission at execution and publish this Shot's explicit Skipped result.
         # This record is diagnostic only: a later repaired binding must recover.
+        # SDK node validation can run in an executor. Never reconcile the graph
+        # there: its routing callbacks can wait for Prompt's lock while the
+        # engine loop holds that lock and is waiting to reconcile the same flow.
+        event_manager = getattr(getattr(self, "engine", None), "event_manager", None)
+        host_loop = getattr(event_manager, "event_loop", None)
+        if host_loop is not None and host_loop.is_running():
+            try:
+                caller_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                caller_loop = None
+            if caller_loop is not host_loop:
+                return
         if _my_box_node.is_selected(self):
             # Private selection is validated without production project/Agent IO.
             try:
@@ -12695,27 +12709,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     ) -> dict[str, Any]:
         """Prepare image/video transport without changing selected media order."""
         self._assert_operation_project_selection()
+        references = self._generation_video_reference_values(params)
         params, cloud_driver = self._prepare_image_references_for_run(
             params,
             cloud_driver,
         )
-        video_slots = params.get("video_reference_slots") or []
-        if any(self._has_reference_value(value) for value in video_slots):
-            references = [
-                (f"reference_video_{index}", value, False)
-                for index, value in enumerate(video_slots, start=1)
-                if self._has_reference_value(value)
-            ]
-        else:
-            references = [
-                (VIDEO_REFERENCES_PARAMETER, value, True)
-                for value in params.get("video_references") or []
-                if self._has_reference_value(value)
-            ]
 
         prepared: list[str] = []
         tos_context: tuple[Any, Any, str] | None = None
-        for _parameter_name, value, _scratch_parameter in references:
+        for value in references:
             reference = self._coerce_reference_value(value)
             text = str(reference).strip()
             if text.startswith(("http://", "https://", "asset://", "data:")):
@@ -12732,33 +12734,22 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 )
                 if cloud_driver is _CLOUD_DRIVER_UNSET:
                     cloud_driver = self._try_create_gt_cloud_storage_driver()
-                if cloud_driver is not None:
-                    remote_path = (
-                        Path("artifact_url_storage")
-                        / uuid4().hex
-                        / local_path.name
-                    )
-                    self._temporary_video_uploads.append(
-                        (cloud_driver, remote_path)
-                    )
-                    public_url = self._upload_local_video_to_griptape_cloud(
-                        cloud_driver,
-                        local_path,
-                        remote_path,
-                    )
-                elif upload_service == LOCAL_VIDEO_UPLOAD_TOS:
-                    if tos_context is None:
-                        tos_context = self._create_tos_storage_context(params)
-                    public_url = self._upload_local_video_to_tos(
-                        local_path, params, tos_context
-                    )
-                else:
+                if cloud_driver is None and upload_service != LOCAL_VIDEO_UPLOAD_TOS:
                     raise RuntimeError(
                         "Griptape Cloud authentication or bucket access is not "
                         "available for this local video. Use a public HTTPS URL, "
                         "a Volcengine asset:// reference, or select a configured "
                         "Volcengine TOS transport."
                     )
+                with self._reference_video_upload_path(local_path, params.get("model_id")) as upload_path:
+                    if cloud_driver is not None:
+                        remote_path = Path("artifact_url_storage") / uuid4().hex / upload_path.name
+                        self._temporary_video_uploads.append((cloud_driver, remote_path))
+                        public_url = self._upload_local_video_to_griptape_cloud(cloud_driver, upload_path, remote_path)
+                    else:
+                        if tos_context is None:
+                            tos_context = self._create_tos_storage_context(params)
+                        public_url = self._upload_local_video_to_tos(upload_path, params, tos_context)
             except LocalReferenceVideoError:
                 # Preserve the actionable local/project-path diagnosis. The
                 # generic upload-service hint is only appropriate after a
@@ -12776,6 +12767,57 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         updated = dict(params)
         updated["video_references"] = prepared
         return updated
+
+    def _generation_video_reference_values(self, params: dict[str, Any]) -> list[Any]:
+        slots = [value for value in params.get("video_reference_slots") or [] if self._has_reference_value(value)]
+        return slots or [value for value in params.get("video_references") or [] if self._has_reference_value(value)]
+
+    @staticmethod
+    @contextmanager
+    def _reference_video_upload_path(path: Path, model_id: Any) -> Iterator[Path]:
+        """Prepare out-of-range geometry for Ark without changing the selected file."""
+        if model_id != SEEDANCE_2_5_MODEL_ID:
+            yield path
+            return
+        from _hmb_video_tools import _find_ffmpeg, probe_video
+
+        try:
+            metadata = probe_video(path)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            logger.info("Could not inspect reference video geometry (%s); keeping the original.", type(exc).__name__)
+            yield path
+            return
+        width, height = metadata["width"], metadata["height"]
+        area = width * height
+        ratio = width / height
+        # Ark's input geometry is independent of the user's selected output resolution.
+        if 300 <= min(width, height) <= max(width, height) <= 6000 and 407_696 <= area <= 8_295_044 and .4 <= ratio <= 2.5:
+            yield path
+            return
+
+        canvas_area = min(8_250_000, max(410_000, area))
+        canvas_ratio = min(2.5, max(.4, ratio))
+        target_width = 2 * round(sqrt(canvas_area * canvas_ratio) / 2)
+        target_height = 2 * round(sqrt(canvas_area / canvas_ratio) / 2)
+        # Even-pixel rounding can push extreme ratios past Ark's edge.
+        target_width = max(target_width, 2 * ceil(target_height / 5))
+        target_height = max(target_height, 2 * ceil(target_width / 5))
+        frame = (
+            f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            f"setsar=1,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2"
+        )
+        with TemporaryDirectory(prefix="hmb-seedance-reference-") as directory:
+            prepared = Path(directory) / (path.stem + ".mp4")
+            try:
+                subprocess.run([_find_ffmpeg(), "-nostdin", "-v", "error", "-i", str(path),
+                                "-map", f"0:{metadata['video_stream_index']}", "-map", "0:a?", "-vf", frame,
+                                "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+                                "-c:a", "aac", "-movflags", "+faststart", str(prepared)],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=True, timeout=180)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                raise LocalReferenceVideoError(f"Could not prepare the Seedance upload copy of {path.name}.") from exc
+            yield prepared
 
     @staticmethod
     def _delete_temporary_video_uploads(
