@@ -141,6 +141,10 @@ RESET_HANDOFF_IDENTITY_CONTRACT = (
 UI_EDIT_REVISION_KEY = "ui_edit_revision"
 IMAGE_ASSET_EDIT_SCHEMA = "hmb-image-asset-edit-v1"
 WIDGET_RUNTIME_LEASE_KEY = "widget_runtime_lease"
+IMAGE_ASSET_EDIT_CATALOG_FIELDS = (
+    "catalog_root", "project_root", "project_uid", "project_cache_uid",
+    "manifest_signature", "folder_signature", "scan_revision",
+)
 IMAGE_ASSET_EDIT_FIELDS = (
     "root_edit_enabled", "selected_folder_path", "expanded_folders",
     "selected_main_type", "selected_sub_type", "selected_source_view",
@@ -10061,8 +10065,7 @@ class HMBImageAssetLibrary(DataNode):
         identity = raw.get("catalog_identity")
         if not isinstance(identity, dict):
             raise ValueError("Image asset edit is missing its catalog identity.")
-        for field in ("catalog_root", "project_root", "project_uid", "project_cache_uid",
-                      "manifest_signature", "folder_signature", "scan_revision"):
+        for field in IMAGE_ASSET_EDIT_CATALOG_FIELDS:
             supplied, current = identity.get(field), base.get(field)
             if field == "scan_revision":
                 matches = isinstance(supplied, int) and not isinstance(supplied, bool) and supplied == _non_negative_int(current)
@@ -10144,6 +10147,37 @@ class HMBImageAssetLibrary(DataNode):
                                selection_order=order.get(_clean(item.get("source_uid")), 0))
                           for item in base.get("assets", [])]
         return base
+
+    @staticmethod
+    def _rebase_compact_edit_after_catalog_completion(
+        request: Dict[str, Any], before: Dict[str, Any], after: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Keep in-flight selection/presentation edits across a same-project refresh."""
+        identity = request.get("catalog_identity")
+        expected = {field: before.get(field) for field in IMAGE_ASSET_EDIT_CATALOG_FIELDS}
+        updates = {field: after.get(field) for field in IMAGE_ASSET_EDIT_CATALOG_FIELDS}
+        if (not isinstance(identity, dict) or type(identity.get("scan_revision")) is not int
+                or type(updates["scan_revision"]) is not int or identity != expected or updates == expected):
+            return request
+        if any(before.get(field) != after.get(field) for field in (
+            "catalog_root", "project_root", "project_id", "project_uid", "project_cache_uid",
+            UI_EDIT_REVISION_KEY, "shot_routing", "image_bash_workspace",
+        )):
+            return request
+        edits = request.get("edits")
+        if not isinstance(edits, dict) or any(edits.get(field) for field in (
+            "thumbnail_request", "asset_registration_request", "asset_cleanup_request",
+            "disconnect_import_uid", "shot_hierarchy_request", "image_bash_workspace_request",
+            IMAGE_BASH_WORKSPACE_EDIT_KEY,
+        )):
+            return request
+        # Only identities already known to the page's accepted catalog may be
+        # carried across the refresh. Normal admission also checks the new catalog.
+        selected = request.get("selected_source_uids")
+        before_uids = {_clean(asset.get("source_uid")) for asset in before.get("assets", [])}
+        if not isinstance(selected, list) or any(not isinstance(uid, str) or uid not in before_uids for uid in selected):
+            return request
+        return dict(request, catalog_identity=updates, scan_revision=updates["scan_revision"])
 
     def _prepare_shot_hierarchy_edit(self, raw: Dict[str, Any], request: Any) -> Dict[str, Any]:
         base = dict(_parse_mapping(getattr(self, "_hmb_last_accepted_widget_state", "")))
@@ -14102,12 +14136,15 @@ class HMBImageAssetLibrary(DataNode):
         elif name == THUMBNAIL_PATCH_PARAMETER:
             return self._admit_thumbnail_bridge(value)
         previous: Dict[str, Any] = {}
+        compact_before: str | None = None
         external_state = name == WIDGET_STATE_PARAMETER and not (
             bool(getattr(self, "_hmb_state_syncing", False)) or bool(getattr(self, "_hmb_restoring_widget_state", False))
         )
         if external_state:
             value = dict(_parse_mapping(value))
-            if (value.get("schema") == STATE_SCHEMA and _clean(value.get("project_root"))
+            if value.get("schema") == IMAGE_ASSET_EDIT_SCHEMA:
+                compact_before = getattr(self, "_hmb_last_accepted_widget_state", None)
+            elif (value.get("schema") == STATE_SCHEMA and _clean(value.get("project_root"))
                     and not any(_clean(value.get(key)) for key in ("project_id", "project_uid", "project_cache_uid"))):
                 previous = dict(_parse_mapping(getattr(self, "_hmb_last_accepted_widget_state", None)))
         original_value = value
@@ -14123,6 +14160,10 @@ class HMBImageAssetLibrary(DataNode):
             self._consume_pending_catalog_scan_result()
             self._consume_pending_thumbnail_result()
             self._consume_pending_catalog_probe_result()
+            if compact_before and compact_before != self._hmb_last_accepted_widget_state:
+                value = self._rebase_compact_edit_after_catalog_completion(
+                    value, _parse_mapping(compact_before), _parse_mapping(self._hmb_last_accepted_widget_state),
+                )
             if taken_selection is not None:
                 latest = dict(_parse_mapping(self._hmb_last_accepted_widget_state))
                 if latest != previous:

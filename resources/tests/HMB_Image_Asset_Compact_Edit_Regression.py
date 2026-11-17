@@ -80,6 +80,36 @@ assert json.loads(canonical)['schema'] == image.STATE_SCHEMA
 assert len(json.loads(canonical)['assets']) == 1000
 assert node._expand_widget_edit(state)['assets'] == state['assets']
 
+# A ready background probe can advance the accepted catalog inside the native
+# before-set callback. Keep the clicked selection and the refreshed catalog.
+accepted = json.loads(node._hmb_last_accepted_widget_state)
+race_edit = copy.deepcopy(next_edit)
+race_edit['ui_edit_revision'] += 1
+race_row = race_edit['edits']['shot_routing']['shots'][0]
+race_row['revision'] += 1
+race_row['selected_source_uids'] = [source1]
+race_edit['selected_source_uids'] = [source1]
+refreshed = copy.deepcopy(accepted)
+refreshed.update(scan_revision=8, folder_signature='now-ready')
+refreshed['assets'][1]['image_name'] = 'From refreshed catalog'
+node._consume_pending_catalog_probe_result = lambda: node._accept_widget_state_baseline(refreshed)
+canonical = json.loads(node.before_value_set(SimpleNamespace(name=image.WIDGET_STATE_PARAMETER), race_edit))
+assert canonical['scan_revision'] == 8 and canonical['folder_signature'] == 'now-ready'
+assert canonical['assets'][1]['image_name'] == 'From refreshed catalog'
+assert canonical['shot_routing']['shots'][0]['selected_source_uids'] == [source1]
+assert canonical['ui_edit_revision'] == 3
+
+rebase_compact = image.HMBImageAssetLibrary._rebase_compact_edit_after_catalog_completion
+invalid_edits = [copy.deepcopy(race_edit) for _ in range(4)]
+invalid_edits[0]['catalog_identity']['folder_signature'] = 'already-stale'
+invalid_edits[1]['catalog_identity']['scan_revision'] = True
+invalid_edits[2]['edits']['asset_cleanup_request'] = {'request_id': 'explicit-command'}
+invalid_edits[3]['selected_source_uids'] = ['unknown-at-click']
+for invalid in invalid_edits:
+    assert rebase_compact(invalid, accepted, refreshed) == invalid
+for key, changed in [('project_uid', 'different-project'), ('ui_edit_revision', 3), ('shot_routing', {})]:
+    assert rebase_compact(race_edit, accepted, dict(refreshed, **{key: changed})) == race_edit
+
 # An older ready scan may advance the scan clock during the exact value-set
 # that selects a project. Rebase only that fresh path, never the client's old
 # catalog, Shot routing, identities or commands.
