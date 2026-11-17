@@ -38,6 +38,7 @@ def main() -> None:
     parser.add_argument("--manager", type=Path)
     parser.add_argument("--expected-version-suffix", default="")
     parser.add_argument("--require-native", action="store_true")
+    parser.add_argument("--project", choices=("superwings12", "katuri8"), default="superwings12")
     args = parser.parse_args()
     agent = load("HMBAgentLibrary")
     prompt = load("HMBPromptLibrary")
@@ -62,8 +63,13 @@ def main() -> None:
         )
         mode = "compiled candidate (signature not tested)"
     else:
-        install_bundled_policy_session(agent._hmb)
-        payload = agent._hmb._load_agent_rule_payload()
+        if args.project == "superwings12":
+            install_bundled_policy_session(agent._hmb)
+            payload = agent._hmb._load_agent_rule_payload()
+        else:
+            payload = agent._hmb._load_verified_agent_rule_payload(args.project)
+            agent._hmb._agent_process_session.bootstrap_once_authorized(lambda:True,lambda:payload,project_id=args.project)
+            payload = agent._hmb._load_agent_rule_payload(args.project)
         mode = "verified bundled DAT"
     version = payload["final_policy_version"]
     assert not args.expected_version_suffix or version.endswith(
@@ -71,6 +77,7 @@ def main() -> None:
     ), "Unexpected policy version"
 
     node = object.__new__(agent.HMBAgentLibrary)
+    node._hmb_execution_project_id = args.project
     with patch.object(agent._hmb, "_load_agent_rule_payload", return_value=payload):
         policy, binding, projects, shots = node._load_hmb_rules()
     assert [policy, binding] == [payload["policy"], payload["binding"]]

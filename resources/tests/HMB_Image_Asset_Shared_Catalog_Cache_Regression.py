@@ -499,4 +499,147 @@ async def completed_probe_ack():
         assert node._current_state() == state
 
 asyncio.run(completed_probe_ack())
+
+# Several libraries may observe one catalog, but never own one another's
+# selections, Shot UUIDs, binding channels or changes made while IO is pending.
+from concurrent.futures import ThreadPoolExecutor
+import json
+import uuid
+
+def parallel_probe(states, kind):
+    barrier = threading.Barrier(len(states))
+    def run(state):
+        node = object.__new__(asset_library.HMBImageAssetLibrary)
+        node._ensure_catalog_probe_runtime_state()
+        barrier.wait(timeout=5)
+        return node._compute_catalog_probe(state, {"probe_kind": kind})
+    with ThreadPoolExecutor(max_workers=len(states)) as pool:
+        return list(pool.map(run, states))
+
+with tempfile.TemporaryDirectory(prefix="hmb_probe_coalescing_") as temporary:
+    catalog = Path(temporary).resolve()
+    project = catalog / "Show"
+    project.mkdir()
+    asset_library._ASSET_CATALOG_INDEX_ROOT = catalog / "cache"
+    for number in range(3):
+        (project / f"Hero{number}.png").write_bytes(png_bytes((number, 30, 70)))
+        asset_library._write_asset_manifest_record(project, {
+            "path": f"Hero{number}.png", "asset_id": f"Hero{number}",
+            "image_name": f"Hero {number}", "image_main_type": "Character",
+        })
+    initial = {**asset_library._default_state(), "catalog_root": str(catalog),
+               "project_root": str(project), "project_id": "Show",
+               "project_uid": asset_library._project_uid(project)}
+    current = asset_library._load_project_catalog(catalog, initial, use_shared_cache=False)
+    states = []
+    for number in range(5):
+        state = deepcopy(current)
+        route = asset_library._default_state()["shot_routing"]
+        uids = [a["source_uid"] for a in state["assets"]]
+        order = uids[number % 3:] + uids[:number % 3]
+        route["shots"] = [{**deepcopy(route["shots"][0]), "shot_uuid": str(uuid.uuid4()),
+                           "number": i + 1, "name": f"Node {number} Shot {i + 1}",
+                           "name_is_custom": True, "selected_source_uids": order[:2]}
+                          for i in range(5)]
+        route["active_shot_uuid"] = route["shots"][number]["shot_uuid"]
+        state["shot_routing"] = route
+        for asset in state["assets"]:
+            asset["selected"] = asset["source_uid"] in order[:2]
+            asset["selection_order"] = order.index(asset["source_uid"]) + 1 if asset["selected"] else 0
+        states.append(asset_library._normalize_state(state))
+    originals = deepcopy(states)
+    # Comparison control: the previous behavior executes every node's reader.
+    with patch.object(asset_library, "_shared_project_probe_value", side_effect=lambda state, kind, read, **kw: read()), \
+         patch.object(asset_library, "_asset_manifest_signature", wraps=asset_library._asset_manifest_signature) as manifests, \
+         patch.object(asset_library, "_project_folder_metadata_signature", wraps=asset_library._project_folder_metadata_signature) as folders:
+        parallel_probe(states, "manifest")
+        parallel_probe(states, "folder")
+        assert manifests.call_count == folders.call_count == 5
+    # Unchanged five-node polls perform exactly one manifest read and one
+    # metadata inventory; no image decode or content sampling is permitted.
+    asset_library._SHARED_PROBE_RESULTS.clear()
+    with patch.object(asset_library, "_asset_manifest_signature", wraps=asset_library._asset_manifest_signature) as manifests, \
+         patch.object(asset_library, "_project_folder_metadata_signature", wraps=asset_library._project_folder_metadata_signature) as folders, \
+         patch.object(asset_library, "_asset_dimensions", side_effect=AssertionError("probe decoded an image")), \
+         patch.object(asset_library, "_asset_content_probe", side_effect=AssertionError("probe opened image bytes")):
+        assert all(result == ("no_change", None) for result in parallel_probe(states, "manifest"))
+        assert all(result == ("no_change", None) for result in parallel_probe(states, "folder"))
+        assert manifests.call_count == folders.call_count == 1
+    assert states == originals
+
+    # A manifest change is rebuilt once. Each consumer then merges its own
+    # current edit, even when a user deselects/reorders during the shared read.
+    manifest_path = asset_library._existing_asset_manifest_path(project)
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest["assets"][0]["image_name"] = "변경된 등록 이름"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    asset_library._SHARED_PROBE_RESULTS.clear()
+    with patch.object(asset_library, "_rebind_shared_catalog_snapshot", wraps=asset_library._rebind_shared_catalog_snapshot) as rebuilds:
+        results = parallel_probe(states, "manifest")
+        assert rebuilds.call_count == 1, rebuilds.call_count
+    for state, (outcome, result) in zip(states, results):
+        assert outcome == "changed"
+        assert result["shot_routing"] == state["shot_routing"]
+        assert [(a["selected"], a["selection_order"]) for a in result["assets"]] == [
+            (a["selected"], a["selection_order"]) for a in state["assets"]]
+        live = deepcopy(state)
+        live["shot_routing"]["shots"][0]["selected_source_uids"].reverse()
+        live["assets"][0]["selected"] = False
+        live["assets"][0]["selection_order"] = 0
+        live = asset_library._normalize_state(live)
+        merged = asset_library._merge_async_scan_result_with_live_state(result, state, live)
+        assert merged["shot_routing"] == live["shot_routing"]
+        assert not merged["assets"][0]["selected"]
+        restored = asset_library._normalize_state(json.loads(json.dumps(merged)))
+        assert restored["shot_routing"] == merged["shot_routing"]
+        assert restored["assets"] == merged["assets"]
+    # Neither returned data nor later edits can mutate the shared snapshot.
+    results[0][1]["assets"][0]["image_name"] = "private edit"
+    assert results[1][1]["assets"][0]["image_name"] != "private edit"
+    assert states == originals
+
+    # Key isolation, completion TTL, retries and cache bound are independent
+    # of per-node request timeouts. Offline failures must never become cache.
+    base = states[0]
+    asset_library._SHARED_PROBE_RESULTS.clear()
+    reader = lambda: {"rows": ["fresh"]}
+    with patch.object(asset_library.time, "monotonic", return_value=100):
+        result = asset_library._shared_project_probe_value(base, "test", reader, ttl=3)
+    result["rows"].clear()
+    with patch.object(asset_library.time, "monotonic", return_value=102):
+        assert asset_library._shared_project_probe_value(base, "test", lambda: 0, ttl=3) == {"rows": ["fresh"]}
+    with patch.object(asset_library.time, "monotonic", return_value=104):
+        assert asset_library._shared_project_probe_value(base, "test", lambda: "expired", ttl=3) == "expired"
+    for field in ("catalog_root", "project_root", "project_uid", "project_cache_uid", "manifest_signature", "folder_signature"):
+        other = {**base, field: str(base[field]) + "different"}
+        assert asset_library._shared_project_probe_value(other, "test", lambda: field, ttl=3) == field
+    for _ in range(2):
+        try:
+            asset_library._shared_project_probe_value(base, "offline", lambda: (_ for _ in ()).throw(PermissionError("offline")), ttl=3)
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("offline probe was silently accepted")
+        assert not asset_library._SHARED_PROBE_FLIGHTS
+    barrier = threading.Barrier(5)
+    failed_reads = []
+    def shared_failure():
+        barrier.wait(timeout=5)
+        def read():
+            failed_reads.append(1)
+            time.sleep(.1)
+            raise PermissionError("shared offline")
+        try:
+            asset_library._shared_project_probe_value(base, "concurrent_offline", read, ttl=3)
+        except PermissionError:
+            return True
+        return False
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        assert all(pool.map(lambda _: shared_failure(), range(5)))
+    assert len(failed_reads) == 1 and not asset_library._SHARED_PROBE_FLIGHTS
+    assert asset_library._shared_project_probe_value(base, "offline", lambda: "reconnected", ttl=3) == "reconnected"
+    for number in range(120):
+        asset_library._shared_project_probe_value(base, ("bound", number), reader, ttl=3)
+    assert len(asset_library._SHARED_PROBE_RESULTS) == asset_library._SHARED_PROBE_LIMIT
+print("Shared probes: 5 nodes / 25 shot UUIDs; manifest 5->1, folder 5->1, rebuild 5->1; live edits, reopen, identity, TTL, retry: PASS")
 print("HMB shared catalog/cache/probe/portable media identity and incremental reuse regression: PASS")

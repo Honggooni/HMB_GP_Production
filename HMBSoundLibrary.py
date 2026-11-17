@@ -6,6 +6,7 @@ Sound selection never runs an upstream node, model or renderer. Original audio
 is read in place and only explicit finishing creates a new video in Color LUT.
 """
 import copy
+import asyncio
 import contextvars
 import hashlib
 import json
@@ -149,7 +150,7 @@ def default_state() -> dict[str, Any]:
     return {"schema": "hmb-sound-library-ui", "version": 1, "revision": 0,
         "project_id": "", "project_root": "", "project_uid": "", "channel_uuid": "",
         "shot": {"channel_uuid": "", "shot_uuid": "", "number": 0, "name": "Only"},
-        "shot_catalog": {}, "projects": [], "project_states": {}, "assets": [], "tracks": [], "status": "ImageAsset의 샷 연결을 기다리는 중",
+        "shot_catalog": {}, "projects": [], "project_states": {}, "assets": [], "folders": [], "tracks": [], "status": "ImageAsset의 샷 연결을 기다리는 중",
         "busy": False, "error_code": "", "ack_command_id": "", "ui": {"search": "", "role": ""}}
 
 
@@ -260,6 +261,9 @@ class HMBSoundLibrary(DataNode):
             and isinstance(p.get("project_id"), str) and isinstance(p.get("project_root"), str)]
         saved["assets"] = [p for p in saved["assets"][:20000] if isinstance(p, dict)
             and isinstance(p.get("relative_path"), str) and isinstance(p.get("name"), str)]
+        saved["folders"] = [p for p in saved.get("folders", []) if isinstance(p, str)
+            and p and len(p) <= 4096 and not p.startswith(("/", "\\")) and ".." not in p.replace("\\", "/").split("/")
+            and ":" not in p and "\x00" not in p] if isinstance(saved.get("folders"), list) else []
         histories = saved.get("project_states")
         if not isinstance(histories, dict) or len(histories) > 64:
             raise SoundError("SOUND_SNAPSHOT_INVALID", "저장된 프로젝트 사운드 기록을 확인하세요.")
@@ -547,6 +551,7 @@ class HMBSoundLibrary(DataNode):
                     tracks=copy.deepcopy(saved.get("tracks", [])), shot=copy.deepcopy(saved.get("shot", default_state()["shot"])))
                 if old_root != str(root):
                     state["assets"] = []
+                    state["folders"] = []
             self._image_project_source = context.get("source")
             self._catalog_available = bool(catalog)
             if state["shot_catalog"] != catalog or changed:
@@ -574,8 +579,9 @@ class HMBSoundLibrary(DataNode):
                 return
             self._scan_requested_root = uid
             restoring_tracks = bool(state["tracks"] and self._scan_finished_root != uid)
+            previous_assets = copy.deepcopy(state["assets"])
             def work():
-                assets = scan_sound_project(root)
+                assets = scan_sound_project(root, previous_assets=previous_assets)
                 canonical_root = Path(root).resolve()
                 canonical_uid = project_uid(canonical_root)
                 def commit():
@@ -595,6 +601,7 @@ class HMBSoundLibrary(DataNode):
                         self._context_epoch += 1
                         self._root_aliases[str(absolute_path(root)).casefold()] = str(canonical_root)
                     self._state_sound["assets"] = assets
+                    self._state_sound["folders"] = list(getattr(assets, "folders", []))
                     self._scan_requested_root = canonical_uid
                     self._scan_finished_root = canonical_uid
                 return commit
@@ -640,7 +647,7 @@ class HMBSoundLibrary(DataNode):
 
     def _start_job(self, operation, message: str, *, replace: bool = False, preparing: bool = False, scope: tuple[str, str] | None = ("", "")) -> None:
         with self._lock:
-            if self._worker is not None and self._worker.is_alive():
+            if self._worker is not None:
                 if not replace:
                     raise SoundError("SOUND_BUSY", "사운드 준비가 끝난 뒤 다시 선택하세요.")
                 self._generation += 1
@@ -658,13 +665,27 @@ class HMBSoundLibrary(DataNode):
             generation = self._generation
             self._state_sound.update(busy=True, status=message, error_code="")
             context = contextvars.copy_context()
-            def run():
-                active_operation, active_generation = operation, generation
-                while True:
-                    try:
-                        result = active_operation()
-                        with self._lock:
+            try:
+                completion_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                completion_loop = None
+                try:
+                    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+                    candidate = GriptapeNodes.EventManager().event_loop
+                    if candidate.is_running() and not candidate.is_closed():
+                        completion_loop = candidate
+                except Exception:
+                    pass
+
+            def launch(active_operation, active_generation):
+                def finish(result, failure):
+                    with self._lock:
+                        if self._worker is not worker:
+                            return
+                        try:
                             if not self._hmb_node_deleted and active_generation == self._generation:
+                                if failure is not None:
+                                    raise failure
                                 outcome = result()
                                 if active_generation == self._generation:
                                     self._sound_preparing = False
@@ -672,32 +693,46 @@ class HMBSoundLibrary(DataNode):
                                     self._state_sound["busy"] = False
                                     if outcome is not False:
                                         self._state_sound.update(status="사운드 준비 완료", error_code="")
-                    except Exception as exc:
-                        with self._lock:
+                        except Exception as exc:
                             if not self._hmb_node_deleted and active_generation == self._generation:
                                 if self._sound_preparing:
                                     self._sound_preparation_error = "SOUND_PREPARATION_FAILED"
                                 self._sound_preparing = False
                                 self._state_sound["revision"] += 1
                                 self._state_sound.update(busy=False, status=str(exc) if isinstance(exc, SoundError) else "사운드 준비에 실패했습니다. 연결과 음원 형식을 확인하세요.", error_code=getattr(exc, "code", "SOUND_PREPARATION_FAILED"))
-                    with self._lock:
-                        if self._hmb_node_deleted:
-                            self._pending_job = None
-                            return
                         pending, self._pending_job = self._pending_job, None
-                        if pending is None:
-                            self._worker = None
-                    if active_generation == self._generation:
+                        self._worker = None
+                        if self._hmb_node_deleted:
+                            return
+                        if active_generation == self._generation:
+                            try:
+                                self._publish()
+                            except Exception:
+                                pass  # Accepted data is retained for read-only UI recovery.
+                        if pending is not None:
+                            launch(*pending)
+
+                def run():
+                    result, failure = None, None
+                    try:
+                        result = active_operation()
+                    except Exception as exc:
+                        failure = exc
+                    if completion_loop is not None and completion_loop.is_running() and not completion_loop.is_closed():
                         try:
-                            self._publish()
-                        except Exception:
-                            pass  # A UI notification cannot undo accepted edits.
-                    if pending is None:
-                        return
-                    active_operation, active_generation = pending
-            self._worker = threading.Thread(target=lambda: context.run(run), daemon=True, name="HMB-Sound-Prepare")
+                            completion_loop.call_soon_threadsafe(context.copy().run, finish, result, failure)
+                            return
+                        except RuntimeError:
+                            pass
+                    # Synchronous SDK/CLI hosts have no running event loop.
+                    finish(result, failure)
+
+                worker = threading.Thread(target=lambda: context.copy().run(run), daemon=True, name="HMB-Sound-Prepare")
+                self._worker = worker
+                worker.start()
+
             self._publish(notify=False)
-            self._worker.start()
+            launch(operation, generation)
 
     @hmb_binding_mutation
     def _command(self, value: Any) -> None:
@@ -759,12 +794,14 @@ class HMBSoundLibrary(DataNode):
                 if state["project_root"] != selected["project_root"] and state["tracks"]:
                     raise SoundError("SOUND_PROJECT_IN_USE", "기존 사운드는 보존했습니다. 현재 샷의 사운드 폴더 연결을 확인하세요.")
                 self._desired_project_root = selected["project_root"]
+                previous_assets = copy.deepcopy(state["assets"]) if state["project_root"] == selected["project_root"] else []
                 def work():
-                    assets = scan_sound_project(selected["project_root"])
+                    assets = scan_sound_project(selected["project_root"], previous_assets=previous_assets)
                     def commit():
                         if state["project_root"] != selected["project_root"] and state["tracks"]:
                             raise SoundError("SOUND_PROJECT_IN_USE", "기존 사운드는 보존했습니다. 현재 샷의 사운드 폴더 연결을 확인하세요.")
-                        state.update(**selected, project_uid=project_uid(Path(selected["project_root"])), assets=assets)
+                        state.update(**selected, project_uid=project_uid(Path(selected["project_root"])), assets=assets,
+                                     folders=list(getattr(assets, "folders", [])))
                         self._scan_requested_root = state["project_uid"]
                         self._scan_finished_root = state["project_uid"]
                         self._desired_project_root = ""

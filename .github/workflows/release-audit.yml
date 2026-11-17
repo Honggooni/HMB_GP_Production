@@ -89,6 +89,7 @@ jobs:
           $tracked = @(git ls-files)
           $approvedAgentRuntimeMembers = @(
             'resources/agent/superwings12/hmb_agent_core.dat',
+            'resources/agent/Katuri8/hmb_agent_core.dat',
             'resources/agent/Dinoster5/project.json',
             'resources/agent/Katuri8/project.json',
             'resources/agent/superwings12/project.json'

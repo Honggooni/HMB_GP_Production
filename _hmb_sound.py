@@ -15,6 +15,8 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import threading
+from collections import OrderedDict
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -28,6 +30,11 @@ MAX_TRACKS = 64
 MAX_CATALOG_FILES = 20000
 MAX_SOURCE_BYTES = 1024 * 1024 * 1024
 DEFAULT_PROJECTS_ROOT = "//192.168.200.19/v/projects"
+_CATALOG_LOCK = threading.RLock()
+_CATALOG_FLIGHTS: dict[str, dict] = {}
+_PROBE_LOCK = threading.RLock()
+_PREPARED_INFO: OrderedDict[tuple, dict] = OrderedDict()
+_PROBE_FLIGHTS: dict[tuple, dict] = {}
 
 
 class SoundError(ValueError):
@@ -41,6 +48,11 @@ class SoundPreparingError(SoundError):
 
     def __init__(self):
         super().__init__("SOUND_PREPARING", "선택한 사운드 원본을 준비 중입니다. 준비가 끝난 뒤 실행합니다.")
+
+
+class SoundCatalog(list):
+    """List-compatible media inventory with the directories seen in that scan."""
+    folders: list[str]
 
 
 def _text(value: Any, maximum: int = 4096, *, literal: bool = False) -> str:
@@ -182,30 +194,122 @@ def discover_sound_projects(projects_root: str | Path = DEFAULT_PROJECTS_ROOT) -
         raise SoundError("SOUND_PROJECT_ROOT_UNAVAILABLE", "프로젝트 공유 경로에 연결할 수 없습니다. 사운드 폴더와 네트워크 연결을 확인하세요.") from None
 
 
-def scan_sound_project(project_root: str | Path) -> list[dict[str, Any]]:
+def scan_sound_project(project_root: str | Path, *, previous_assets: list[dict] | None = None) -> list[dict[str, Any]]:
     _reject_reparse_path(Path(project_root))
     root = Path(project_root).resolve()
     if root.name.casefold() != "ai_ct_audio" or not root.is_dir():
         raise SoundError("SOUND_PROJECT_ROOT_UNAVAILABLE", "선택한 프로젝트의 Ai_Ct_audio 폴더를 확인하세요.")
-    assets = []
+    key = str(root).casefold()
+    with _CATALOG_LOCK:
+        job = _CATALOG_FLIGHTS.get(key)
+        owner = job is None
+        if owner:
+            job = {"done": threading.Event(), "result": None, "error": None}
+            _CATALOG_FLIGHTS[key] = job
+    if not owner:
+        if not job["done"].wait(30):
+            raise SoundError("SOUND_SCAN_INCOMPLETE", "사운드 목록 확인이 지연되고 있습니다. 기존 목록을 보존했습니다.")
+        if job["error"] is not None:
+            raise job["error"]
+        return copy.deepcopy(job["result"])
     try:
-        for directory, children, files in os.walk(root, followlinks=False):
-            children[:] = sorted([v for v in children if not Path(directory, v).is_symlink()], key=str.casefold)
-            for name in sorted(files, key=str.casefold):
-                candidate = Path(directory, name)
-                if candidate.suffix.casefold() not in EXTENSIONS or candidate.is_symlink():
-                    continue
-                relative = candidate.relative_to(root).as_posix()
-                path = _source_path(root, relative)
-                stat = path.stat()
-                role = next((r for r in ROLES if r.casefold() in [p.casefold() for p in candidate.relative_to(root).parts[:-1]]), "SFX")
-                assets.append({"source_uid": source_uid(root, relative), "relative_path": relative, "name": candidate.stem,
-                    "role": role, "extension": candidate.suffix.casefold(), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
-                if len(assets) > MAX_CATALOG_FILES:
-                    raise SoundError("SOUND_CATALOG_LIMIT", "사운드 파일이 너무 많습니다. 프로젝트 폴더를 나누세요.")
+        result = _scan_sound_inventory(root, previous_assets or [])
+        job["result"] = result
+        return copy.deepcopy(result)
+    except BaseException as exc:
+        job["error"] = exc
+        raise
+    finally:
+        with _CATALOG_LOCK:
+            _CATALOG_FLIGHTS.pop(key, None)
+            job["done"].set()
+
+
+def _scan_sound_inventory(root: Path, previous_assets: list[dict]) -> list[dict[str, Any]]:
+    """Presentation inventory only; execution still validates every original.
+
+    Reuse the saved catalog rows while collecting each directory entry once.
+    Never turn an inaccessible subtree into a successful partial catalog.
+    """
+    prior = {row.get("relative_path"): row for row in previous_assets if isinstance(row, dict)}
+    assets, pending, folders = [], [root], []
+    uid = project_uid(root)
+    try:
+        while pending:
+            directory = pending.pop()
+            before = directory.lstat()
+            if stat.S_ISLNK(before.st_mode) or getattr(before, "st_file_attributes", 0) & 0x400:
+                raise SoundError("SOUND_SOURCE_OUTSIDE_PROJECT", "사운드 폴더가 링크·정션으로 변경되었습니다.")
+            children = []
+            with os.scandir(directory) as entries:
+                for entry in sorted(entries, key=lambda value: value.name.casefold()):
+                    facts = entry.stat(follow_symlinks=False)
+                    if stat.S_ISLNK(facts.st_mode) or getattr(facts, "st_file_attributes", 0) & 0x400:
+                        continue
+                    path = Path(entry.path)
+                    if stat.S_ISDIR(facts.st_mode):
+                        children.append(path)
+                        folders.append(path.relative_to(root).as_posix())
+                        continue
+                    if not stat.S_ISREG(facts.st_mode) or path.suffix.casefold() not in EXTENSIONS:
+                        continue
+                    relative = path.relative_to(root).as_posix()
+                    role = next((r for r in ROLES if r.casefold() in [p.casefold() for p in Path(relative).parts[:-1]]), "SFX")
+                    row = {"source_uid": "sound:" + hashlib.sha256((uid + "\n" + relative.casefold()).encode()).hexdigest(),
+                           "relative_path": relative, "name": path.stem, "role": role,
+                           "extension": path.suffix.casefold(), "size": facts.st_size, "mtime_ns": facts.st_mtime_ns}
+                    assets.append(dict(prior[relative]) if prior.get(relative) == row else row)
+                    if len(assets) > MAX_CATALOG_FILES:
+                        raise SoundError("SOUND_CATALOG_LIMIT", "사운드 파일이 너무 많습니다. 프로젝트 폴더를 나누세요.")
+            after = directory.lstat()
+            if (before.st_dev, before.st_ino, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_mtime_ns):
+                raise OSError("Sound directory changed during discovery")
+            pending.extend(reversed(children))
     except OSError:
         raise SoundError("SOUND_SCAN_INCOMPLETE", "사운드 폴더 확인이 끝나지 않았습니다. 연결을 확인하고 새로고침하세요.") from None
-    return assets
+    catalog = SoundCatalog(assets)
+    catalog.folders = sorted(folders, key=str.casefold)
+    return catalog
+
+
+def _prepared_sound_info(path: Path, identity: str) -> dict[str, Any]:
+    # A current full-content hash is mandatory before every cache lookup.
+    # No path/mtime-only cache can authorize media or cross shot boundaries.
+    key = (str(path).casefold(), identity, id(probe_sound))
+    with _PROBE_LOCK:
+        if key in _PREPARED_INFO:
+            _PREPARED_INFO.move_to_end(key)
+            return dict(_PREPARED_INFO[key])
+        job = _PROBE_FLIGHTS.get(key)
+        owner = job is None
+        if owner:
+            job = {"done": threading.Event(), "result": None, "error": None}
+            _PROBE_FLIGHTS[key] = job
+    if not owner:
+        if not job["done"].wait(25):
+            raise SoundError("SOUND_DECODE_UNAVAILABLE", "음원 정보 준비가 지연되고 있습니다. 다시 확인하세요.")
+        if job["error"] is not None:
+            raise job["error"]
+        return dict(job["result"])
+    try:
+        info = probe_sound(path)
+        # Publish only a result whose original is still exactly the same.
+        if media_signature(path) != identity:
+            raise SoundError("SOUND_SOURCE_CHANGED", "음원이 준비 중 변경되었습니다. 다시 선택하세요.")
+        with _PROBE_LOCK:
+            _PREPARED_INFO[key] = dict(info)
+            _PREPARED_INFO.move_to_end(key)
+            while len(_PREPARED_INFO) > 256:
+                _PREPARED_INFO.popitem(last=False)
+        job["result"] = info
+        return dict(info)
+    except BaseException as exc:
+        job["error"] = exc
+        raise
+    finally:
+        with _PROBE_LOCK:
+            _PROBE_FLIGHTS.pop(key, None)
+            job["done"].set()
 
 
 def make_sound_track(root: str | Path, relative: str, *, channel_uuid: str = "", shot_uuid: str = "") -> dict[str, Any]:
@@ -213,9 +317,7 @@ def make_sound_track(root: str | Path, relative: str, *, channel_uuid: str = "",
     root = Path(root).resolve()
     path = _source_path(root, relative)
     identity = media_signature(path)
-    info = probe_sound(path)
-    if media_signature(path) != identity:
-        raise SoundError("SOUND_SOURCE_CHANGED", "음원이 준비 중 변경되었습니다. 다시 선택하세요.")
+    info = _prepared_sound_info(path, identity)
     role = next((r for r in ROLES if r.casefold() in [p.casefold() for p in Path(relative).parts[:-1]]), "SFX")
     return {"instance_id": str(uuid5(NAMESPACE_URL, source_uid(root, relative) + "\n" + channel_uuid + "\n" + shot_uuid)),
         "source_uid": source_uid(root, relative), "relative_path": relative, "path": str(path), "media_signature": identity,

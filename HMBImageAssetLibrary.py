@@ -307,6 +307,60 @@ CATALOG_PROBE_OPERATION = "catalog_probe"
 CATALOG_PROBE_MANIFEST_SECONDS = 3.0
 CATALOG_PROBE_FOLDER_SECONDS = 10.0
 CATALOG_PROBE_STABLE_WRITE_SECONDS = 1.0
+_SHARED_PROBE_LOCK = threading.RLock()
+_SHARED_PROBE_FLIGHTS: Dict[tuple, Dict[str, Any]] = {}
+_SHARED_PROBE_RESULTS: OrderedDict = OrderedDict()
+_SHARED_PROBE_LIMIT = 96
+
+
+def _shared_project_probe_value(state, kind, read, *, ttl=0.0):
+    """Share read-only catalog work, never a node's authoring state.
+
+    Baseline signatures isolate a refreshed/rebound node from older work.
+    Manual refresh bypasses this helper. Each recipient owns its completion
+    generation and merges with its live selections on its own host loop.
+    """
+    fields = ("catalog_root", "project_root", "project_id", "project_uid",
+              "project_cache_uid", "manifest_signature", "folder_signature")
+    identity = tuple(str(state.get(field) or "").replace("\\", "/") for field in fields)
+    if not all(identity):
+        return read()
+    key = (*identity, kind)
+    with _SHARED_PROBE_LOCK:
+        cached = _SHARED_PROBE_RESULTS.get(key)
+        if cached is not None:
+            if time.monotonic() < cached[0]:
+                _SHARED_PROBE_RESULTS.move_to_end(key)
+                return copy.deepcopy(cached[1])
+            _SHARED_PROBE_RESULTS.pop(key, None)
+        job = _SHARED_PROBE_FLIGHTS.get(key)
+        owner = job is None
+        if owner:
+            job = {"done": threading.Event(), "result": None, "error": None}
+            _SHARED_PROBE_FLIGHTS[key] = job
+    if not owner:
+        if not job["done"].wait(30):
+            raise TimeoutError("Shared ImageAsset catalog probe is still pending")
+        if job["error"] is not None:
+            raise job["error"]
+        return copy.deepcopy(job["result"])
+    try:
+        result = read()
+        job["result"] = copy.deepcopy(result)
+        if ttl > 0:
+            with _SHARED_PROBE_LOCK:
+                _SHARED_PROBE_RESULTS[key] = (time.monotonic() + ttl, job["result"])
+                _SHARED_PROBE_RESULTS.move_to_end(key)
+                while len(_SHARED_PROBE_RESULTS) > _SHARED_PROBE_LIMIT:
+                    _SHARED_PROBE_RESULTS.popitem(last=False)
+        return result
+    except BaseException as exc:
+        job["error"] = exc
+        raise
+    finally:
+        with _SHARED_PROBE_LOCK:
+            _SHARED_PROBE_FLIGHTS.pop(key, None)
+            job["done"].set()
 
 
 def _diagnostic_exception(context: str, exc: BaseException) -> None:
@@ -11852,7 +11906,8 @@ class HMBImageAssetLibrary(DataNode):
                 < CATALOG_PROBE_FOLDER_SECONDS
             ):
                 return "deferred", None
-            signature = _project_folder_metadata_signature(project_root_text)
+            signature = _shared_project_probe_value(state, "folder", lambda:
+                _project_folder_metadata_signature(project_root_text), ttl=CATALOG_PROBE_FOLDER_SECONDS)
             self._hmb_catalog_probe_last_folder_at = now
             current_signature = _clean(state.get("folder_signature"))
             if not current_signature:
@@ -11870,9 +11925,8 @@ class HMBImageAssetLibrary(DataNode):
                 # This preserves the one-second stable-write guard without
                 # making the browser wait for the next 10-second folder poll.
                 time.sleep(CATALOG_PROBE_STABLE_WRITE_SECONDS + 0.05)
-                confirmed_signature = _project_folder_metadata_signature(
-                    project_root_text
-                )
+                confirmed_signature = _shared_project_probe_value(state, ("folder_confirm", signature), lambda:
+                    _project_folder_metadata_signature(project_root_text), ttl=0.05)
                 confirmed_at = time.monotonic()
                 self._hmb_catalog_probe_last_folder_at = confirmed_at
                 if confirmed_signature != signature:
@@ -11895,18 +11949,24 @@ class HMBImageAssetLibrary(DataNode):
             ):
                 return "deferred", None
             self._hmb_catalog_probe_last_manifest_at = now
-            signature = _asset_manifest_signature(Path(project_root_text))
+            signature = _shared_project_probe_value(state, "manifest", lambda:
+                _asset_manifest_signature(Path(project_root_text)), ttl=CATALOG_PROBE_MANIFEST_SECONDS)
             if signature == _clean(state.get("manifest_signature")):
                 return "no_change", None
 
         project_record = {"path": project_root_text, **{
             key: state.get(key, "") for key in ("project_id", "project_uid", "project_cache_uid")
         }}
-        refreshed_scan = _rebind_shared_catalog_snapshot(
-            _shared_catalog_snapshot(state), project_record,
-            {"catalog_root": state["catalog_root"], "projects": state["projects"]},
-            refresh_manifest=True,
-        ) or _scan_project_assets(project_root_text, previous_scan=state)
+        def read_catalog():
+            scan = _rebind_shared_catalog_snapshot(
+                _shared_catalog_snapshot(state), project_record,
+                {"catalog_root": state["catalog_root"], "projects": state["projects"]},
+                refresh_manifest=True,
+            ) or _scan_project_assets(project_root_text, previous_scan=state)
+            return _shared_catalog_snapshot(scan)
+        refreshed_scan = _shared_project_probe_value(
+            state, ("catalog", probe_kind, signature), read_catalog, ttl=1.0,
+        )
         refreshed = _merge_scan_with_state(refreshed_scan, state)
         refreshed["catalog_root"] = state["catalog_root"]
         refreshed["projects"] = state["projects"]

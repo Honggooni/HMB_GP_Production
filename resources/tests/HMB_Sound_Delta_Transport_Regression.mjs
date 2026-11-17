@@ -101,6 +101,17 @@ try{
  await page.evaluate(()=>{const id=window.requests.at(-1).value.__hmb_sound_command.id;window.delta({revision:2,ack_command_id:id,tracks:[...window.state.tracks,{...window.state.tracks[0],instance_id:'copy'}]});for(const [key,owner]of Object.entries(window.owners))owner.update(window.props(key,structuredClone(window.state)));});
  assert.equal(await page.locator('#a [data-instance]').count(),2);assert.equal(await page.locator('#b [data-instance]').count(),2);
  assert.equal(await page.locator('#a [data-duplicate="clip"]').isDisabled(),false);
+ // The SDK can echo retained full state before the ordered delta arrives.
+ // Once that delta is applied, a failed read must not keep authoring locked.
+ await page.evaluate(()=>{
+   window.rejectSync=true;
+   window.owners.a.update(window.props('a',{...window.state,status:'plain echo from different delivery order'}));
+ });
+ await page.waitForFunction(()=>document.querySelector('#a [role=status]').textContent.includes('다시 연결하는 중'));
+ await page.evaluate(()=>window.delta({status:'ordered update received'}));
+ assert.equal(await page.locator('#a [role=status]').textContent(),'ordered update received');
+ assert.equal(await page.locator('#a [data-duplicate="clip"]').isDisabled(),false);
+ await page.evaluate(()=>{window.rejectSync=false;});
  // A locked widget can recover through the same read-only path.
  await page.evaluate(()=>{window.disabled=true;window.delta({status:'locked gap'},['a']);window.delta({status:'locked read succeeded'});});
  await page.waitForFunction(()=>document.querySelector('#a [role=status]').textContent==='locked read succeeded');

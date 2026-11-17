@@ -92,6 +92,7 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "resources/cgt/server-trust.json",
     "resources/image_bash/compatibility.json",
     "resources/agent/superwings12/hmb_agent_core.dat",
+    "resources/agent/Katuri8/hmb_agent_core.dat",
     "resources/agent/Dinoster5/project.json",
     "resources/agent/Katuri8/project.json",
     "resources/agent/superwings12/project.json",
@@ -477,18 +478,18 @@ assert tracked_gate_match is not None, "CI tracked-content gate is missing."
 tracked_gate = textwrap.dedent(tracked_gate_match.group("body"))
 approved_agent_members = [
     "resources/agent/superwings12/hmb_agent_core.dat",
+    "resources/agent/Katuri8/hmb_agent_core.dat",
     "resources/agent/Dinoster5/project.json",
     "resources/agent/Katuri8/project.json",
     "resources/agent/superwings12/project.json",
 ]
 assert set(approved_agent_members) == {
-    builder.BUNDLED_AGENT_POLICY_MEMBER.as_posix(),
+    *(member.as_posix() for member in builder.BUNDLED_PROJECT_POLICIES),
     *(member.as_posix() for member in builder.PROJECT_METADATA),
 }
 forbidden_tracked_members = [
     "resources/agent/hmb_agent_core.dat",
     "resources/agent/Dinoster5/hmb_agent_core.dat",
-    "resources/agent/Katuri8/hmb_agent_core.dat",
     "resources/agent/superwings12/backup/hmb_agent_core.dat",
     "resources/agent/superwings12/HMB_AGENT_CORE.DAT",
     "resources/agent/dinoster5/project.json",
@@ -552,7 +553,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-ci-tracked-content-") as temporary:
         errors="replace", timeout=60,
     )
 assert gate_result.returncode == 0, gate_result.stdout + gate_result.stderr
-assert "HMB_CI_TRACKED_GATE_PASS allowed=5 rejected=23" in gate_result.stdout
+assert f"HMB_CI_TRACKED_GATE_PASS allowed={len(approved_agent_members)+1} rejected={len(forbidden_tracked_members)}" in gate_result.stdout
 
 # The editor adapter is distribution-only, but still belongs to the signed-off
 # release surface. No upstream editor bundle or private prototype receipt is
@@ -1133,10 +1134,8 @@ with zipfile.ZipFile(io.BytesIO(first_archive), "r") as archive:
         info for info in infos
         if PurePosixPath(info.filename).suffix.casefold() == ".dat"
     ]
-    assert len(dat_members) == 1
-    assert PurePosixPath(dat_members[0].filename).parts[-4:] == (
-        "resources", "agent", "superwings12", "hmb_agent_core.dat"
-    )
+    assert len(dat_members) == len(builder.BUNDLED_PROJECT_POLICIES)
+    assert {PurePosixPath(*PurePosixPath(info.filename).parts[-4:]) for info in dat_members} == set(builder.BUNDLED_PROJECT_POLICIES)
 
     for info in infos:
         member = PurePosixPath(info.filename)
@@ -1145,13 +1144,13 @@ with zipfile.ZipFile(io.BytesIO(first_archive), "r") as archive:
         # The signed Agent DAT is the sole permitted policy artifact. Private
         # keys, PEM files, other DAT files and review/source documents remain
         # forbidden, including look-alike paths.
-        if relative == builder.BUNDLED_AGENT_POLICY_MEMBER.as_posix():
+        if PurePosixPath(relative) in builder.BUNDLED_PROJECT_POLICIES:
             assert member.suffix.casefold() == ".dat"
-            builder.verify_signed_agent_policy_bytes(archive.read(info))
+            builder.verify_signed_agent_policy_bytes(archive.read(info), builder.BUNDLED_PROJECT_POLICIES[PurePosixPath(relative)])
         else:
             assert member.suffix.casefold() not in FORBIDDEN_SUFFIXES
         if "/resources/agent/" in f"/{lowered}":
-            assert (relative == builder.BUNDLED_AGENT_POLICY_MEMBER.as_posix()
+            assert (PurePosixPath(relative) in builder.BUNDLED_PROJECT_POLICIES
                     or PurePosixPath(relative) in builder.PROJECT_METADATA)
         assert "/resources/policy/" not in f"/{lowered}"
         assert "/policies/" not in f"/{lowered}"
@@ -1179,6 +1178,13 @@ builder.validate_no_policy_artifacts_in_zip(
 assert_forbidden_archive(zip_bytes({"package/hmb_agent_core.dat": b"sealed"}))
 signed_dat = (ROOT / "resources" / "agent" / "superwings12" / "hmb_agent_core.dat").read_bytes()
 builder.verify_signed_agent_policy_bytes(signed_dat)
+for member, project_id in builder.BUNDLED_PROJECT_POLICIES.items():
+    encoded = (ROOT / Path(member)).read_bytes()
+    builder.verify_signed_agent_policy_bytes(encoded, project_id)
+    builder.validate_no_policy_artifacts_in_zip(zip_bytes({str(member): encoded}))
+    for other, other_id in builder.BUNDLED_PROJECT_POLICIES.items():
+        if other_id != project_id:
+            assert_forbidden_archive(zip_bytes({str(other): encoded}))
 for member, expected in builder.PROJECT_METADATA.items():
     descriptor = (ROOT / Path(member)).read_bytes()
     assert json.loads(descriptor) == expected

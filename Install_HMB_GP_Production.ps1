@@ -229,9 +229,9 @@ if ($records.Count -ne [int]$manifest.file_count) {
     throw 'HMB release manifest file_count does not match its file list.'
 }
 if (
-    [int]$manifest.install_file_count -ne 69 -or
+    [int]$manifest.install_file_count -ne 70 -or
     [int]$manifest.distribution_file_count -ne 22 -or
-    $records.Count -ne 91
+    $records.Count -ne 92
 ) {
     throw 'HMB release manifest install/distribution boundary mismatch.'
 }
@@ -311,6 +311,7 @@ if (
 $expectedAgentMembers = @(
     'resources\agent\Dinoster5\project.json',
     'resources\agent\Katuri8\project.json',
+    'resources\agent\Katuri8\hmb_agent_core.dat',
     'resources\agent\superwings12\project.json',
     'resources\agent\superwings12\hmb_agent_core.dat'
 )

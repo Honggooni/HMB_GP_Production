@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import importlib.util
 import json
 import os
@@ -105,7 +106,7 @@ class SignedProjectArtifact(unittest.TestCase):
         encoded = (ROOT / "resources/agent/superwings12/hmb_agent_core.dat").read_bytes()
         self.assertEqual(common._read_agent_policy_envelope(), encoded)
         self.assertEqual(common._load_verified_agent_rule_payload()["project_id"], "superwings12")
-        for project in ("dinoster5", "katuri8"):
+        for project in ("dinoster5",):
             with self.assertRaises(ProjectPolicyPendingError):
                 common._read_agent_policy_envelope(project)
             status = bare_agent()._hmb_web_rerender_policy_status(project)
@@ -114,6 +115,37 @@ class SignedProjectArtifact(unittest.TestCase):
             self.assertFalse(status["policy_verified"])
             self.assertEqual(status["policy_status"], "absent")
             self.assertEqual((status["version"], status["sha256"]), ("", ""))
+
+    def test_katuri_signed_policy_is_ready_and_never_reuses_sw_documents(self):
+        sw=common._load_verified_agent_rule_payload('superwings12')
+        ka=common._load_verified_agent_rule_payload('katuri8')
+        self.assertEqual(ka['project_id'],'katuri8')
+        self.assertNotEqual(ka['policy_sha256'],sw['policy_sha256'])
+        self.assertNotEqual(ka['binding_sha256'],sw['binding_sha256'])
+        self.assertNotEqual(ka['envelope_sha256'],sw['envelope_sha256'])
+        status=bare_agent()._hmb_web_rerender_policy_status('Katuri8')
+        self.assertTrue(status['ready'] and status['policy_verified'])
+        self.assertEqual(status['policy_status'],'available')
+        self.assertEqual(status['sha256'],ka['envelope_sha256'])
+        session=fresh_session()
+        with patch.object(common,'_agent_process_session',session), patch.object(common,'_agent_policy_process_provenance_valid',return_value=True):
+            for project in ('superwings12','katuri8','superwings12','katuri8'):
+                common._bootstrap_agent_policy_session(project)
+                value=common._load_agent_rule_payload(project)
+                self.assertEqual(value['project_id'],project)
+                expected=ka if project=='katuri8' else sw
+                self.assertEqual(value['policy_sha256'],expected['policy_sha256'])
+                self.assertEqual(value['binding_sha256'],expected['binding_sha256'])
+
+    def test_cross_project_signed_dat_is_rejected_in_both_directions(self):
+        for source,target in (('superwings12','Katuri8'),('Katuri8','superwings12')):
+            with tempfile.TemporaryDirectory() as temp:
+                root=Path(temp)
+                destination=root/'resources/agent'/target/'hmb_agent_core.dat'
+                destination.parent.mkdir(parents=True)
+                shutil.copyfile(ROOT/'resources/agent'/source/'hmb_agent_core.dat',destination)
+                with patch.object(common,'ROOT',root),patch.object(common,'_AGENT_POLICY_FILE',root/'resources/agent/superwings12/hmb_agent_core.dat'):
+                    with self.assertRaises(RuntimeError):common._load_verified_agent_rule_payload(target)
 
     def test_copied_sw_dat_cannot_become_another_project_policy(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -153,10 +185,10 @@ class SignedProjectArtifact(unittest.TestCase):
     def test_absent_policy_readiness_never_initializes_the_project_session(self):
         session = fresh_session()
         with patch.object(common, "_agent_process_session", session):
-            status = bare_agent()._hmb_web_rerender_policy_status("katuri8")
+            status = bare_agent()._hmb_web_rerender_policy_status("dinoster5")
             self.assertTrue(status["ready"])
             self.assertFalse(status["policy_verified"])
-            self.assertEqual(session._status_for_regression(project_id="katuri8"), ("empty", 0))
+            self.assertEqual(session._status_for_regression(project_id="dinoster5"), ("empty", 0))
 
     def test_invalid_present_policy_readiness_stays_unusable(self):
         with patch.object(common, "_agent_policy_session_state", return_value="EMPTY"), \
@@ -200,8 +232,11 @@ class SignedProjectArtifact(unittest.TestCase):
         node.get_parameter_value = lambda name: node.parameter_values.get(name)
         node._secure_hmb_outputs = lambda: None
         native_calls = []
+        native_policy_hashes = []
         def native():
             native_calls.append((node._hmb_execution_project_id, not node._hmb_policy_omitted))
+            if not node._hmb_policy_omitted:
+                native_policy_hashes.append(hashlib.sha256(node._hmb_policy.encode('utf-8')).hexdigest())
             node.parameter_output_values["output"] = "Completed offline check"
             if False:
                 yield None
@@ -216,6 +251,14 @@ class SignedProjectArtifact(unittest.TestCase):
             current["project_id"] = "superwings12"
             list(node.process())
             self.assertEqual(native_calls, [("dinoster5", False), ("superwings12", True)])
+            current['project_id']='katuri8'
+            list(node.process())
+            current['project_id']='superwings12'
+            list(node.process())
+            self.assertEqual(native_calls,[('dinoster5',False),('superwings12',True),('katuri8',True),('superwings12',True)])
+            sw=common._load_verified_agent_rule_payload('superwings12')['policy_sha256']
+            ka=common._load_verified_agent_rule_payload('katuri8')['policy_sha256']
+            self.assertEqual(native_policy_hashes,[sw,ka,sw])
             self.assertEqual(node.parameter_values, before)
 
 

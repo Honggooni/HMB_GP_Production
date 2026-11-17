@@ -18,8 +18,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.8.93"
-RELEASE_VERSION = "0.8.93"
+RELEASE_LABEL = "v0.8.95"
+RELEASE_VERSION = "0.8.95"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -105,6 +105,7 @@ RUNTIME_INSTALL_FILES = (
     "resources/cgt/server-trust.json",
     "resources/image_bash/compatibility.json",
     "resources/agent/superwings12/hmb_agent_core.dat",
+    "resources/agent/Katuri8/hmb_agent_core.dat",
     "resources/agent/Dinoster5/project.json",
     "resources/agent/Katuri8/project.json",
     "resources/agent/superwings12/project.json",
@@ -146,7 +147,7 @@ CANONICAL_LF_SOURCE_FILES = {
     if PurePosixPath(relative).suffix.casefold() in {".py", ".js", ".json", ".md"}
     or relative == "LICENSE"
 }
-if len(RUNTIME_INSTALL_FILES) != 69 or len(DISTRIBUTION_ONLY_FILES) != 22:
+if len(RUNTIME_INSTALL_FILES) != 70 or len(DISTRIBUTION_ONLY_FILES) != 22:
     raise RuntimeError("Runtime/distribution release boundary count mismatch.")
 if set(RUNTIME_INSTALL_FILES) & set(DISTRIBUTION_ONLY_FILES):
     raise RuntimeError("Runtime and distribution-only release files overlap.")
@@ -179,12 +180,16 @@ PRIVATE_KEY_HEADER = re.compile(
     rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
 )
 BUNDLED_AGENT_POLICY_MEMBER = PurePosixPath("resources/agent/superwings12/hmb_agent_core.dat")
+BUNDLED_PROJECT_POLICIES = {
+    BUNDLED_AGENT_POLICY_MEMBER: "superwings12",
+    PurePosixPath("resources/agent/Katuri8/hmb_agent_core.dat"): "katuri8",
+}
 PROJECT_METADATA = {
     PurePosixPath("resources/agent/Dinoster5/project.json"): {
         "project_id": "dinoster5", "project_name": "다이노스터", "status": "pending",
     },
     PurePosixPath("resources/agent/Katuri8/project.json"): {
-        "project_id": "katuri8", "project_name": "까투리8", "status": "pending",
+        "project_id": "katuri8", "project_name": "까투리8", "status": "ready",
     },
     PurePosixPath("resources/agent/superwings12/project.json"): {
         "project_id": "superwings12", "project_name": "슈퍼윙즈12", "status": "ready",
@@ -397,7 +402,7 @@ def validate_native_editor_patch_sources() -> dict[str, Any]:
     return payload
 
 
-def verify_signed_agent_policy_bytes(encoded: bytes) -> dict[str, str]:
+def verify_signed_agent_policy_bytes(encoded: bytes, project_id: str = "superwings12") -> dict[str, str]:
     """Verify the bundled policy with the same production trust implementation."""
 
     module_path = ROOT / "_hmb_common.py"
@@ -409,7 +414,10 @@ def verify_signed_agent_policy_bytes(encoded: bytes) -> dict[str, str]:
     common = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(common)
     decoded = common._decode_signed_agent_policy_envelope(encoded)
-    if decoded.get("project_id") not in (None, "", "superwings12"):
+    if project_id not in BUNDLED_PROJECT_POLICIES.values():
+        raise RuntimeError("Unregistered bundled Agent policy project.")
+    allowed = (None, "", "superwings12") if project_id == "superwings12" else (project_id,)
+    if decoded.get("project_id") not in allowed:
         raise RuntimeError("Bundled Agent policy project identity mismatch.")
     payload = common._validate_agent_policy_payload(decoded)
     return {
@@ -755,7 +763,7 @@ def validate_standard_agent_model_parity(
 def _agent_release_member(member: PurePosixPath) -> PurePosixPath | None:
     """Recognize only the exact project files within an optional archive wrapper."""
     suffix = PurePosixPath(*member.parts[-4:])
-    return suffix if suffix == BUNDLED_AGENT_POLICY_MEMBER or suffix in PROJECT_METADATA else None
+    return suffix if suffix in BUNDLED_PROJECT_POLICIES or suffix in PROJECT_METADATA else None
 
 
 def verify_project_metadata_bytes(member: PurePosixPath, encoded: bytes) -> None:
@@ -780,7 +788,7 @@ def verify_project_metadata_bytes(member: PurePosixPath, encoded: bytes) -> None
 
 
 def assert_release_member_allowed(member: PurePosixPath) -> None:
-    """Allow the SW signed DAT and three descriptive project records only."""
+    """Allow exact project-bound signed DATs and descriptive records only."""
 
     relative = member.as_posix()
     lowered_parts = tuple(part.casefold() for part in member.parts)
@@ -788,7 +796,7 @@ def assert_release_member_allowed(member: PurePosixPath) -> None:
     if member.is_absolute() or ".." in member.parts or "\\" in relative or ":" in relative:
         raise RuntimeError(f"Unsafe runtime release path: {relative}")
     agent_member = _agent_release_member(member)
-    is_bundled_agent_policy = agent_member == BUNDLED_AGENT_POLICY_MEMBER
+    is_bundled_agent_policy = agent_member in BUNDLED_PROJECT_POLICIES
     if (
         member.suffix.casefold() in FORBIDDEN_SUFFIXES
         and not is_bundled_agent_policy
@@ -831,9 +839,9 @@ def validate_no_policy_artifacts_in_zip(
                 if info.file_size > MAX_NESTED_ARCHIVE_BYTES:
                     raise RuntimeError(f"{label} member is too large: {info.filename}")
                 agent_member = _agent_release_member(member)
-                is_bundled_agent_policy = agent_member == BUNDLED_AGENT_POLICY_MEMBER
+                is_bundled_agent_policy = agent_member in BUNDLED_PROJECT_POLICIES
                 if is_bundled_agent_policy:
-                    verify_signed_agent_policy_bytes(archive.read(info))
+                    verify_signed_agent_policy_bytes(archive.read(info), BUNDLED_PROJECT_POLICIES[agent_member])
                     continue
                 if agent_member in PROJECT_METADATA:
                     verify_project_metadata_bytes(member, archive.read(info))
@@ -977,9 +985,9 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
         if not path.is_file() or path.is_symlink():
             raise RuntimeError(f"Missing or linked runtime release member: {relative}")
         data = canonical_release_source_data(member, path.read_bytes())
-        if member == BUNDLED_AGENT_POLICY_MEMBER:
-            verified = verify_signed_agent_policy_bytes(data)
-            if verified != policy_identity:
+        if member in BUNDLED_PROJECT_POLICIES:
+            verified = verify_signed_agent_policy_bytes(data, BUNDLED_PROJECT_POLICIES[member])
+            if member == BUNDLED_AGENT_POLICY_MEMBER and verified != policy_identity:
                 raise RuntimeError("Bundled Agent policy identity mismatch.")
         if member in PROJECT_METADATA:
             verify_project_metadata_bytes(member, data)
@@ -1592,8 +1600,8 @@ def make_archive(
                 raise RuntimeError(
                     f"Package-local or private policy reference remains in {relative}"
                 )
-            if member == BUNDLED_AGENT_POLICY_MEMBER:
-                verify_signed_agent_policy_bytes(data)
+            if member in BUNDLED_PROJECT_POLICIES:
+                verify_signed_agent_policy_bytes(data, BUNDLED_PROJECT_POLICIES[member])
             if member in PROJECT_METADATA:
                 verify_project_metadata_bytes(member, data)
             if member.suffix.casefold() == ".zip":

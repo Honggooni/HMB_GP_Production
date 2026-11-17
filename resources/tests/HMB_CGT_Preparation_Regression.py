@@ -42,12 +42,15 @@ class PreparationTests(unittest.TestCase):
             self.assertTrue(entered.wait(2))
             preparation.prepare("superwings12")
             getter = preparation.reader("superwings12")
-            self.assertIsNone(preparation.reader("superwings12"))
+            second = preparation.reader("superwings12")
+            self.assertTrue(callable(second))
             self.assertIsNone(preparation.reader("Katuri8"))
             release.set()
             value = getter(threading.Event())
             self.assertEqual(value, result)
             value["tasks"].clear()
+            self.assertEqual(second(threading.Event()), result)
+            self.assertIsNone(preparation.reader("superwings12"))
             self.assertEqual(len(result["tasks"]), 1)
             self.assertEqual(read.call_count, 1)
 
@@ -78,6 +81,42 @@ class PreparationTests(unittest.TestCase):
             self.assertIsNone(preparation.reader("Katuri8"))
             preparation.prepare("invalid/project")
             self.assertEqual(preparation.job["project"], "Katuri8")
+
+    def test_slow_inflight_is_reused_without_extending_original_deadline(self):
+        preparation = cgt.CatalogPreparation()
+        job = dict(project="show", started=0, deadline=24, completed=None,
+                   cancel=threading.Event(), done=threading.Event(), result=None)
+        preparation.job = job
+        with patch.object(cgt, "monotonic", return_value=16), patch.object(cgt, "Thread") as spawn:
+            preparation.prepare("show")
+            first = preparation.reader("show")
+            second = preparation.reader("show")
+            self.assertTrue(callable(first) and callable(second))
+            spawn.assert_not_called()
+            self.assertEqual(job["deadline"], 24)
+        with patch.object(cgt, "monotonic", return_value=24.1):
+            self.assertEqual(first(threading.Event())["status"], "TIMEOUT")
+            self.assertIsNone(preparation.reader("show"))
+
+    def test_completed_ttl_starts_at_completion_and_reader_cancel_is_independent(self):
+        preparation = cgt.CatalogPreparation()
+        job = dict(project="show", started=0, deadline=24, completed=None,
+                   cancel=threading.Event(), done=threading.Event(), result=None)
+        preparation.job = job
+        with patch.object(cgt, "monotonic", return_value=16):
+            abandoned, live = preparation.reader("show"), preparation.reader("show")
+        job.update(completed=23, result={"status":"ready", "tasks":[{"task_id":"a"}]})
+        job["done"].set()
+        cancel = threading.Event(); cancel.set()
+        self.assertEqual(abandoned(cancel)["status"], "TIMEOUT")
+        self.assertFalse(job["cancel"].is_set())
+        self.assertEqual(live(threading.Event())["status"], "ready")
+        job.pop("taken")
+        with patch.object(cgt, "monotonic", return_value=30):
+            self.assertTrue(callable(preparation.reader("show")))
+        job.pop("taken")
+        with patch.object(cgt, "monotonic", return_value=38):
+            self.assertIsNone(preparation.reader("show"))
 
 
 if __name__ == "__main__":

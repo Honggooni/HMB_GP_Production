@@ -41,7 +41,7 @@ RUNTIME_FILE_PATHS = (
     "resources/blender/HMB_Blender_Background_Preview.py",
     "resources/picker/HMB_Marker_Catalog.json",
     "resources/cgt/server-trust.json", "resources/image_bash/compatibility.json", "resources/agent/superwings12/hmb_agent_core.dat",
-    "resources/agent/Dinoster5/project.json", "resources/agent/Katuri8/project.json",
+    "resources/agent/Dinoster5/project.json", "resources/agent/Katuri8/project.json", "resources/agent/Katuri8/hmb_agent_core.dat",
     "resources/agent/superwings12/project.json",
 )
 _MAX_FILE_BYTES = 16 * 1024 * 1024

@@ -30,6 +30,7 @@ WORK_START_RESULT_SCHEMA = "hmb-cgt-work-start-result-v1"
 TRUST_ROOT_SHA256 = "1576e52257f9880faf65020926bcd6f77d57dbaed3dd88243e9dd3987fc006b1"
 MAX_TASKS = 2000
 CATALOG_TIMEOUT_SECONDS = 24
+CATALOG_PREPARED_TTL_SECONDS = 15
 _GUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 
 
@@ -48,11 +49,14 @@ class CatalogPreparation:
         if not isinstance(project_id, str) or (project_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", project_id)):
             return
         with self.lock:
-            if self.job and self.job["project"] == project_id and monotonic() - self.job["started"] < 15:
+            if (self.job and self.job["project"] == project_id and not self.job["cancel"].is_set()
+                    and self._fresh(self.job)):
                 return
             if self.job:
                 self.job["cancel"].set()
-            self.job = {"project": project_id, "started": monotonic(), "cancel": Event(), "done": Event(), "result": None}
+            started = monotonic()
+            self.job = {"project": project_id, "started": started, "deadline": started + CATALOG_TIMEOUT_SECONDS,
+                        "completed": None, "cancel": Event(), "done": Event(), "result": None}
             if self.thread is not None:
                 return
             self.thread = Thread(target=self._worker, name="HMB-CGT-prepare", daemon=True)
@@ -67,26 +71,36 @@ class CatalogPreparation:
             except Exception:
                 result = _failure("SDK_UNAVAILABLE")
             with self.lock:
+                if monotonic() >= job["deadline"]:
+                    result = _failure("TIMEOUT")
                 job["result"] = result
+                job["completed"] = monotonic()
                 job["done"].set()
                 if self.job is job:
                     self.thread = None
                     return
 
+    @staticmethod
+    def _fresh(job):
+        if not job["done"].is_set():
+            return monotonic() < job["deadline"]
+        return monotonic() - job["completed"] < CATALOG_PREPARED_TTL_SECONDS
+
     def reader(self, project_id):
         with self.lock:
             job = self.job
             if (not job or job["project"] != project_id or job["cancel"].is_set()
-                    or monotonic() - job["started"] >= 15):
+                    or not self._fresh(job)):
                 return None
-            # Take once: a deliberate refresh must perform a new authenticated
-            # read, and an old dialog must not consume another project's result.
-            if job.get("taken"):
+            # Pending readers share the existing operation and its deadline.
+            # Once completed, keep the one-use display cache: a deliberate
+            # refresh still performs a new authenticated read.
+            if job["done"].is_set() and job.get("taken"):
                 return None
             job["taken"] = True
 
         def read(cancel):
-            deadline = monotonic() + CATALOG_TIMEOUT_SECONDS
+            deadline = job["deadline"]
             while not job["done"].wait(.05):
                 if cancel.is_set() or job["cancel"].is_set() or monotonic() >= deadline:
                     return _failure("TIMEOUT")

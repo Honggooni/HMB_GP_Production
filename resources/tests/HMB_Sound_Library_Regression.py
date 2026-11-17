@@ -5,6 +5,7 @@ from __future__ import annotations
 All audio and SDK settings are disposable; no model, server or user folder write.
 """
 import copy
+import asyncio
 import hashlib
 import json
 import logging
@@ -82,6 +83,97 @@ class SoundLibraryRegression(unittest.TestCase):
         with self.assertRaises(helper.SoundError): helper.scan_sound_project(missing)
         self.assertFalse(missing.exists())
         self.assertEqual(self.path.read_bytes(), before)
+
+    def test_real_folder_names_empty_nested_add_and_remove(self):
+        empty = self.audio / "새 폴더" / "비어 있음"
+        empty.mkdir(parents=True)
+        before = helper.scan_sound_project(self.audio)
+        self.assertIn("새 폴더/비어 있음", before.folders)
+        self.assertIn("새 폴더", before.folders)
+        self.assertEqual(copy.deepcopy(before).folders, before.folders)
+        make_wave(empty / "추가한 소리.wav")
+        after = helper.scan_sound_project(self.audio, previous_assets=before)
+        self.assertEqual(len(after), len(before) + 1)
+        self.assertEqual(next(a for a in after if a["name"] == "추가한 소리")["relative_path"], "새 폴더/비어 있음/추가한 소리.wav")
+        (empty / "추가한 소리.wav").unlink()
+        empty.rmdir()
+        refreshed = helper.scan_sound_project(self.audio, previous_assets=after)
+        self.assertNotIn("새 폴더/비어 있음", refreshed.folders)
+        self.assertIn("새 폴더", refreshed.folders)
+        self.assertEqual(refreshed, before)
+        saved = {**target.default_state(), "folders": ["빈 폴더", "../escape", "/outside", "C:/outside"]}
+        self.assertEqual(target.HMBSoundLibrary._normalize_saved_state(saved)["folders"], ["빈 폴더"])
+
+    def test_catalog_failure_never_returns_partial_inventory_and_unchanged_scan_reads_no_audio(self):
+        assets = helper.scan_sound_project(self.audio)
+        real_scan = os.scandir
+        def denied(path):
+            if Path(path) == self.audio / 'Dialogue':
+                raise PermissionError('injected inaccessible subtree')
+            return real_scan(path)
+        with mock.patch.object(os, 'scandir', side_effect=denied), self.assertRaises(helper.SoundError) as error:
+            helper.scan_sound_project(self.audio, previous_assets=assets)
+        self.assertEqual(error.exception.code, 'SOUND_SCAN_INCOMPLETE')
+        self.assertEqual(len(assets), 1)
+        with mock.patch.object(Path, 'open', side_effect=AssertionError('catalog must not open media')):
+            self.assertEqual(helper.scan_sound_project(self.audio, previous_assets=assets), assets)
+        fresh = self.audio / 'new.wav'; fresh.write_bytes(self.path.read_bytes())
+        added = helper.scan_sound_project(self.audio, previous_assets=assets)
+        self.assertEqual(len(added), 2)
+        fresh.unlink()
+        self.assertEqual(helper.scan_sound_project(self.audio, previous_assets=added), assets)
+
+    def test_five_shots_reuse_probe_but_check_exact_current_bytes(self):
+        info = {'duration_seconds':.25, 'sample_rate':48000, 'channels':1}
+        with mock.patch.object(helper, 'probe_sound', return_value=info) as probe, \
+             mock.patch.object(helper, 'media_signature', wraps=helper.media_signature) as read:
+            tracks = [helper.make_sound_track(self.audio, 'Dialogue/voice.wav', channel_uuid=CHANNEL,
+                      shot_uuid=f'33333333-3333-4333-8333-{n:012d}') for n in range(1,6)]
+            self.assertEqual(probe.call_count, 1)
+            self.assertEqual(read.call_count, 6)
+            self.assertEqual(len({track['instance_id'] for track in tracks}), 5)
+            self.assertEqual(len({track['shot_uuid'] for track in tracks}), 5)
+            before = self.path.stat()
+            changed = bytearray(self.path.read_bytes()); changed[-1] ^= 1
+            self.path.write_bytes(changed)
+            os.utime(self.path, ns=(before.st_atime_ns,before.st_mtime_ns))
+            changed_track = helper.make_sound_track(self.audio,'Dialogue/voice.wav')
+            self.assertEqual(probe.call_count, 2)
+            self.assertNotEqual(changed_track['media_signature'], tracks[0]['media_signature'])
+        self.assertEqual(tracks[0]['start_seconds'],0)
+        self.assertEqual(tracks[0]['gain_db'],0)
+
+    def test_simultaneous_catalog_and_probe_share_work_without_sharing_mutable_results(self):
+        from concurrent.futures import ThreadPoolExecutor
+        entered, release = threading.Event(), threading.Event()
+        real_scan = helper._scan_sound_inventory
+        def delayed(*args):
+            entered.set(); self.assertTrue(release.wait(3)); return real_scan(*args)
+        with mock.patch.object(helper, '_scan_sound_inventory', side_effect=delayed) as scan, ThreadPoolExecutor(2) as pool:
+            first=pool.submit(helper.scan_sound_project,self.audio)
+            self.assertTrue(entered.wait(2))
+            second=pool.submit(helper.scan_sound_project,self.audio)
+            # Prove the second reader has joined the in-flight Event before releasing.
+            time_limit=__import__('time').monotonic()+2
+            while __import__('time').monotonic()<time_limit:
+                if len(helper._CATALOG_FLIGHTS) == 1 and second.running(): break
+            __import__('time').sleep(.03)
+            release.set()
+            left,right=first.result(3),second.result(3)
+            self.assertEqual(scan.call_count,1)
+            left[0]['name']='changed'
+            self.assertNotEqual(left,right)
+        entered.clear();release.clear()
+        def probe(path):
+            entered.set();self.assertTrue(release.wait(3));return {'duration_seconds':.25,'sample_rate':48000,'channels':1}
+        with mock.patch.object(helper,'probe_sound',side_effect=probe) as decode,ThreadPoolExecutor(2) as pool:
+            first=pool.submit(helper.make_sound_track,self.audio,'Dialogue/voice.wav',channel_uuid=CHANNEL,shot_uuid=SHOTS[0]['shot_uuid'])
+            self.assertTrue(entered.wait(2))
+            second=pool.submit(helper.make_sound_track,self.audio,'Dialogue/voice.wav',channel_uuid=CHANNEL,shot_uuid=SHOTS[1]['shot_uuid'])
+            __import__('time').sleep(.03);release.set()
+            left,right=first.result(3),second.result(3)
+            self.assertEqual(decode.call_count,1)
+            self.assertNotEqual(left['instance_id'],right['instance_id'])
 
     def test_escape_absolute_alias_and_unsupported_source_are_rejected(self):
         for relative in ("../voice.wav", "/voice.wav", "C:/voice.wav", "Dialogue/../voice.wav", "./Dialogue/voice.wav", "Dialogue//voice.wav", "Dialogue/voice.json"):
@@ -217,6 +309,58 @@ class SoundNodeRegression(SoundLibraryRegression):
     def command(self, action, **changes): self.node._command({"id":str(uuid4()),"action":action,**changes})
     def drain(self):
         while ControlledThread.pending: ControlledThread.pending[0].run()
+
+    def test_folder_refresh_keeps_tracks_shot_and_saved_directory_names(self):
+        preserved = copy.deepcopy({k: self.node._state_sound[k] for k in ('tracks','shot','shot_catalog','channel_uuid')})
+        (self.audio/'자유 폴더'/'빈 폴더').mkdir(parents=True)
+        self.command('refresh'); self.drain()
+        self.assertIn('자유 폴더/빈 폴더', self.node._state_sound['folders'])
+        self.assertEqual({k: self.node._state_sound[k] for k in preserved}, preserved)
+        restored = target.HMBSoundLibrary._normalize_saved_state(json.loads(json.dumps(self.node._state_sound)))
+        self.assertEqual(restored['folders'], self.node._state_sound['folders'])
+        self.assertEqual(restored['tracks'], preserved['tracks'])
+
+    def test_failed_refresh_keeps_catalog_tracks_order_and_binding(self):
+        shots=[dict(SHOTS[0],shot_uuid=f'33333333-3333-4333-8333-{n:012d}',number=n,name=f'Shot {n}') for n in range(1,6)]
+        catalog=copy.deepcopy(CATALOG)
+        catalog['shots']=shots
+        document={key:catalog[key] for key in ('channel_uuid','generation','shots')}
+        catalog['metadata_sha256']=hashlib.sha256(json.dumps(document,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        tracks=[]
+        for n in (3,1,5,2,4):
+            row=copy.deepcopy(self.track)
+            row.update(instance_id=str(uuid4()),channel_uuid=CHANNEL,shot_uuid=shots[n-1]['shot_uuid'],enabled=n!=2)
+            tracks.append(row)
+        self.node._state_sound.update(tracks=tracks,channel_uuid=CHANNEL,shot_catalog=catalog,
+                                      shot={'channel_uuid':CHANNEL,**shots[2]})
+        before=copy.deepcopy(self.node._state_sound)
+        self.command('refresh');self.drain()
+        for key in ('assets','tracks','shot','shot_catalog','channel_uuid','project_uid'):
+            self.assertEqual(self.node._state_sound[key],before[key],key)
+        with mock.patch.object(target,'scan_sound_project',side_effect=helper.SoundError('SOUND_SCAN_INCOMPLETE','injected')):
+            self.command('refresh');self.drain()
+        for key in ('assets','tracks','shot','shot_catalog','channel_uuid','project_uid'):
+            self.assertEqual(self.node._state_sound[key],before[key],key)
+        self.assertFalse(self.node._state_sound['busy'])
+        self.assertEqual(self.node._state_sound['error_code'],'SOUND_SCAN_INCOMPLETE')
+
+    def test_actual_running_host_loop_receives_worker_completion(self):
+        async def exercise():
+            seen={};host_thread=threading.get_ident()
+            def operation():
+                seen['work']=threading.get_ident()
+                return lambda:seen.update(commit=threading.get_ident())
+            with mock.patch.object(target,'threading',threading),mock.patch.object(self.node,'_publish') as publish:
+                self.node._start_job(operation,'fixture')
+                deadline=asyncio.get_running_loop().time()+3
+                while self.node._worker is not None and asyncio.get_running_loop().time()<deadline:
+                    await asyncio.sleep(.01)
+                self.assertIsNone(self.node._worker)
+                self.assertNotEqual(seen['work'],host_thread)
+                self.assertEqual(seen['commit'],host_thread)
+                self.assertFalse(self.node._state_sound['busy'])
+                self.assertEqual(publish.call_count,2)
+        asyncio.run(exercise())
 
     def test_native_initial_setup_restores_without_hook_or_command_replay(self):
         state = copy.deepcopy(self.node._state_sound);state["__hmb_sound_command"]={"id":"saved","action":"remove","instance_id":self.track["instance_id"]}

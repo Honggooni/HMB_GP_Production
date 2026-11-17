@@ -291,10 +291,10 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.8.93",
+    "library_version": "0.8.95",
     "engine_version": "",
     "agent_policy_delivery": {
-      "archive_source_count": 91,
+      "archive_source_count": 92,
       "mode": "bundled_signed_dat",
       "runtime_path": "resources/agent/superwings12/hmb_agent_core.dat",
       "policy_version": "2026-11-05.agent-shot-quality.v7.2",
@@ -312,7 +312,7 @@
         {
           "project_id": "katuri8",
           "project_name": "까투리8",
-          "status": "pending",
+          "status": "ready",
           "folder": "Katuri8"
         },
         {

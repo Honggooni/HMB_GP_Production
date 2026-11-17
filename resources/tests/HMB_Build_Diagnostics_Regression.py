@@ -92,7 +92,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-build-diag-") as directory:
     projects = {row["project_id"]: row for row in diag.get_build_diagnostics(root)["projects"]}
     assert projects["katuri8"]["signature_status"] == "invalid_or_verifier_unavailable"
     assert projects["katuri8"]["policy_version"] == ""
-    wrong_project.unlink()
+    wrong_project.write_bytes(untouched[wrong_project])
     (root/"_hmb_common.py").write_text("raise AssertionError('candidate trust code must never execute')", encoding="utf-8")
     assert diag.get_build_diagnostics(root)["policy"]["signature_status"] == "verified"
     for relative in ("_hmb_common.py", "resources/agent/superwings12/hmb_agent_core.dat"):
@@ -155,7 +155,10 @@ actual = diag.get_build_diagnostics(ROOT)
 assert actual["policy"]["signature_status"] == "verified", actual["policy"]
 project_status = {row["project_id"]: row for row in actual["projects"]}
 assert project_status["superwings12"]["signature_status"] == "verified"
-for project_id in ("dinoster5", "katuri8"):
+assert project_status["katuri8"]["signature_status"] == "verified"
+assert project_status["katuri8"]["policy_version"] == "2026-11-17.katuri-project.v1"
+assert project_status["katuri8"]["envelope_sha256"] != project_status["superwings12"]["envelope_sha256"]
+for project_id in ("dinoster5",):
     assert project_status[project_id]["status"] == "pending"
     assert project_status[project_id]["signature_status"] == "unavailable"
     assert project_status[project_id]["policy_version"] == ""
