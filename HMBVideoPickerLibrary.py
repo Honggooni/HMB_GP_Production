@@ -537,8 +537,8 @@ def _validate_full_smooth_confirmation(
         errors.append("quality report profile")
     if int(report.get("smooth_mesh_preview_mode") or 0) != 3:
         errors.append("Smooth Preview 3 mode")
-    if int(report.get("smooth_mesh_shape_count") or 0) <= 0:
-        errors.append("smoothed polygon mesh count")
+    if int(report.get("smooth_mesh_shape_count") or 0) + int(report.get("smooth_preview_disabled_shape_count") or 0) <= 0:
+        errors.append("verified polygon mesh count")
     if int(report.get("remaining_bounding_box_count") or 0) != 0:
         errors.append("remaining Bounding Box")
     if list(report.get("unsupported_proxy_shapes") or []):
@@ -4440,6 +4440,12 @@ def _normalize_depth_settings(value: Any, nodes: Any = None) -> Dict[str, Any]:
             "expanded_roots": expanded}
 
 
+def _normalize_smooth_preview_overrides(value: Any) -> Dict[str, bool]:
+    source = value if isinstance(value, dict) else {}
+    return {path: enabled for path, enabled in source.items()
+            if isinstance(path, str) and path.startswith("|") and isinstance(enabled, bool)}
+
+
 def _all_picker_outliner_nodes(nodes: Any) -> List[Dict[str, Any]]:
     roots = [row for row in nodes if isinstance(row, dict)] if isinstance(nodes, list) else []
     return [row for root in roots for row in [root, *[
@@ -4510,6 +4516,11 @@ def _reconcile_picker_mesh_authoring(state: Dict[str, Any], nodes: Any) -> Dict[
         resolved[path]["full_path"] if path in resolved else path
         for path in entry.get("hidden_paths", []) if path not in resolved or resolved[path]
     ))} for entry in state.get("slot_visibility", [])]
+    result["smooth_preview_overrides"] = {
+        resolved[path]["full_path"] if path in resolved else path: enabled
+        for path, enabled in state.get("smooth_preview_overrides", {}).items()
+        if path not in resolved or resolved[path]
+    }
     assignments = []
     for entry in state.get("slot_assignments", []):
         bindings = []
@@ -4692,6 +4703,7 @@ def _default_widget_state() -> Dict[str, Any]:
         "videos": [],
         "slot_assignments": [{"video_slot": 1, "bindings": []}],
         "slot_visibility": [{"video_slot": 1, "hidden_paths": []}],
+        "smooth_preview_overrides": {},
         "slot_recovery_fallbacks": [],
         "shot_publisher_instance_uuid": "",
         "channel_uuid": "",
@@ -4985,7 +4997,7 @@ _PICKER_SCENE_FIELDS = (
     "outliner_expanded", "selected_outliner_path", "selected_outliner_name",
     "selected_outliner_uuid", "selected_outliner_paths", "outliner_selection_anchor",
     "outliner_selection_scope", "selected_color", "outliner_search", "slot_assignments",
-    "slot_visibility", "depth_settings", "original_enabled", "mask_enabled",
+    "slot_visibility", "smooth_preview_overrides", "depth_settings", "original_enabled", "mask_enabled",
     "depth_enabled", "motion_guide_enabled", "original_video_path", "original_video_url",
     "original_metadata", "original_preview_enabled", "snapshot_frame",
     "snapshot_request_video_uid", "static_frame_range_valid", "static_camera_metadata_valid",
@@ -5025,6 +5037,7 @@ def _project_picker_scene(state: Dict[str, Any], workspace_uuid: Any) -> None:
 
 def _reset_picker_binary_scene_work(state: Dict[str, Any], scene_path: Any) -> Dict[str, Any]:
     state = _parse_state(state)
+    smooth_preview_overrides = state["smooth_preview_overrides"]
     owner = _uuid_text(state.get("active_picker_shot_uuid")) or PICKER_DEFAULT_WORKSPACE_UUID
     owned_snapshot_uids = set()
     owned_video_uids = set()
@@ -5043,6 +5056,7 @@ def _reset_picker_binary_scene_work(state: Dict[str, Any], scene_path: Any) -> D
     path = _maya_scene_path_text(scene_path)
     state.update({
         "scene_path": path, "scene_draft_path": path, "scene_request_path": path,
+        "smooth_preview_overrides": smooth_preview_overrides,
         "snapshot_active": False, "snapshot_video_slot": 0, "snapshot_data_uri": "",
         "snapshot_path": "", "snapshot_url": "", "snapshot_sha256": "",
         "active_snapshot_uid": "", "viewport_mode": "video", "workspace_view": "outliner",
@@ -9562,6 +9576,7 @@ def _parse_state(value: Any) -> Dict[str, Any]:
         {"video_slot": slot, "hidden_paths": visibility_by_slot.get(slot, [])}
         for slot in range(1, 2)
     ]
+    state["smooth_preview_overrides"] = _normalize_smooth_preview_overrides(state.get("smooth_preview_overrides"))
     state["workspace_view"] = "playblast" if _clean(state.get("workspace_view")).lower() == "playblast" else "outliner"
     state["selected_outliner_path"] = _clean(state.get("selected_outliner_path"))
     state["selected_outliner_name"] = _clean(state.get("selected_outliner_name"))
@@ -13104,6 +13119,7 @@ def _original_preview_cache_fields(scene_path: Path, state: Dict[str, Any]) -> D
         "resolution": {"width": output_width, "height": output_height},
         "encoding_profile": PROXY_ENCODING_PROFILE,
         "viewport_quality_profile": ORIGINAL_VIEWPORT_QUALITY_PROFILE,
+        "smooth_preview_overrides": _normalize_smooth_preview_overrides(state.get("smooth_preview_overrides")),
         "original_material_override_profile": ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
         "original_material_pass_source": "|".join(ORIGINAL_MATERIAL_PASS_SOURCES),
         "original_material_pass_sources": list(ORIGINAL_MATERIAL_PASS_SOURCES),
@@ -13446,6 +13462,8 @@ def _original_preview_cache_is_valid(
             return False
         if _clean(metadata.get("viewport_quality_profile")) != expected["viewport_quality_profile"]:
             return False
+        if _normalize_smooth_preview_overrides(metadata.get("smooth_preview_overrides")) != expected["smooth_preview_overrides"]:
+            return False
         if (
             _clean(metadata.get("original_material_override_profile"))
             != expected["original_material_override_profile"]
@@ -13553,7 +13571,7 @@ _MAYA_OPERATION_AUTHORING_FIELDS = (
     "camera", "selected_camera", "cameras", "start_frame", "end_frame", "current_frame",
     "source_fps", "output_fps", "output_width", "output_height", "has_maya_frame_range",
     "source_frame_count", "source_duration_seconds", "outliner_nodes",
-    "slot_assignments", "slot_visibility", "depth_settings", "original_enabled", "mask_enabled",
+    "slot_assignments", "slot_visibility", "smooth_preview_overrides", "depth_settings", "original_enabled", "mask_enabled",
     "depth_enabled", "motion_guide_enabled", "snapshot_frame", "snapshot_request_frame", "snapshot_request_video_uid",
 )
 
@@ -13734,6 +13752,9 @@ def _operation_input_digest(kind: str, scene_text: Any, state: Dict[str, Any], s
             payload["original_material_pass_sources"] = list(ORIGINAL_MATERIAL_PASS_SOURCES)
         if normalized.get("mask_enabled"):
             payload.update(_mask_material_pass_job_fields())
+    if kind_text in {"render_original_preview", "run_video", "render_snapshot"} and _picker_scene_engine(scene_text) == "maya":
+        if normalized["smooth_preview_overrides"]:
+            payload["smooth_preview_overrides"] = normalized["smooth_preview_overrides"]
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -15097,7 +15118,7 @@ class HMBVideoPickerLibrary(DataNode):
             "workspace_view", "selected_outliner_path", "selected_outliner_name", "selected_outliner_uuid",
             "selected_outliner_paths", "outliner_selection_anchor", "outliner_selection_scope",
             "selected_color", "outliner_expanded", "outliner_search", "selected_camera",
-            "slot_assignments", "slot_visibility", "snapshot_frame", "snapshot_video_slot",
+            "slot_assignments", "slot_visibility", "smooth_preview_overrides", "snapshot_frame", "snapshot_video_slot",
             "depth_settings",
             "scene_draft_path", "scene_request_path",
             "output_width", "output_height",
@@ -18095,7 +18116,7 @@ class HMBVideoPickerLibrary(DataNode):
                 "snapshot_video_slot", "snapshot_data_uri", "snapshot_path",
                 "snapshot_url", "snapshot_sha256",
                 "active_snapshot_uid", "viewport_mode", "snapshots",
-                "markers", "workspace_view", "videos", "slot_assignments",
+                "markers", "workspace_view", "videos", "slot_assignments", "smooth_preview_overrides",
                 "outliner_search",
                 "static_frame_range_valid", "static_camera_metadata_valid", "static_metadata_complete",
             ):
@@ -20128,6 +20149,7 @@ class HMBVideoPickerLibrary(DataNode):
                 "selected_camera",
                 "slot_assignments",
                 "slot_visibility",
+                "smooth_preview_overrides",
                 "depth_settings",
                 "original_enabled",
                 "mask_enabled",
@@ -20149,7 +20171,7 @@ class HMBVideoPickerLibrary(DataNode):
                 and any(
                     state.get(field) != current_authoring_state.get(field)
                     for field in (
-                        "selected_camera", "slot_assignments", "slot_visibility",
+                        "selected_camera", "slot_assignments", "slot_visibility", "smooth_preview_overrides",
                         "depth_settings", "output_width", "output_height",
                     )
                 )
@@ -20193,6 +20215,10 @@ class HMBVideoPickerLibrary(DataNode):
                 "",
             )
         if scene_path:
+            if action == "read_scene":
+                current_scene = state.get("native_metadata", {}).get("scene_path") or state.get("scene_path")
+                if _scene_path_key(current_scene) != _scene_path_key(scene_path):
+                    state["smooth_preview_overrides"] = {}
             state["scene_draft_path"] = scene_path
             state["scene_request_path"] = scene_path
             state["scene_path"] = scene_path
@@ -21949,6 +21975,10 @@ class HMBVideoPickerLibrary(DataNode):
             "source_frame_count": source_frame_count,
             "source_duration_seconds": source_duration,
             "outliner_nodes": outliner_nodes,
+            "smooth_preview_overrides": {
+                path: enabled for path, enabled in previous_state["smooth_preview_overrides"].items()
+                if path in valid_paths
+            },
             "depth_settings": _normalize_depth_settings(previous_state.get("depth_settings"), outliner_nodes),
             "outliner_expanded": root_paths,
             "selected_outliner_path": outliner_selection["path"],
@@ -22320,6 +22350,7 @@ class HMBVideoPickerLibrary(DataNode):
             ),
             "force_high_quality_viewport": True,
             "viewport_quality_profile": ORIGINAL_VIEWPORT_QUALITY_PROFILE,
+            "smooth_preview_overrides": state["smooth_preview_overrides"],
             "mouth_card_inner_patch_policy": MOUTH_CARD_INNER_PATCH_POLICY,
             "require_full_smooth_geometry": True,
             "expected_maya_major": maya_version if maya_version.isdigit() else "",
@@ -23142,6 +23173,7 @@ class HMBVideoPickerLibrary(DataNode):
             "character_outline_mode": "native_lambert",
             "force_high_quality_viewport": True,
             "viewport_quality_profile": FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE,
+            "smooth_preview_overrides": state["smooth_preview_overrides"],
             "mouth_card_inner_patch_policy": MOUTH_CARD_INNER_PATCH_POLICY,
             "require_full_smooth_geometry": True,
             "world_space_patterns": role == "mask",
@@ -23934,6 +23966,7 @@ class HMBVideoPickerLibrary(DataNode):
             "character_outline_mode": "native_lambert",
             "force_high_quality_viewport": True,
             "viewport_quality_profile": FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE,
+            "smooth_preview_overrides": state["smooth_preview_overrides"],
             "mouth_card_inner_patch_policy": MOUTH_CARD_INNER_PATCH_POLICY,
             "require_full_smooth_geometry": True,
             "world_space_patterns": True,

@@ -74,7 +74,41 @@ try {
   await page.waitForSelector('.outliner-row', {timeout:5000});
   const reopened=await page.locator('.outliner-row').evaluateAll(els=>els.map(el=>el.querySelector('.assigned-chip')?.title||''));
   assert.deepEqual(reopened,state.afterClear);
+  const grouped = await page.evaluate(() => {
+    const rows = [...document.querySelectorAll('.outliner-row')];
+    const select = (index, ctrlKey = false) => rows[index].dispatchEvent(new MouseEvent('click', { bubbles:true, ctrlKey }));
+    const values = (selector, attribute) => rows.map(row => row.querySelector(selector).getAttribute(attribute));
+    const toggle = (index, selector) => rows[index].querySelector(selector).click();
+    const smooth = '[data-smooth-path]';
+    const eye = '[data-visibility-path]';
+    const clear = '[data-clear-color-path]';
+    select(0);
+    const singleSelection = rows.map(row => row.getAttribute('aria-selected'));
+    select(1, true);
+    select(2, true);
+    const order = [...rows[0].querySelectorAll(`${eye}, ${smooth}, ${clear}`)].map(el => Object.keys(el.dataset)[0]);
+    toggle(0, smooth);
+    const smoothOff = values(smooth, 'aria-pressed');
+    toggle(0, smooth);
+    const smoothOn = values(smooth, 'aria-pressed');
+    toggle(1, eye);
+    const eyeOff = values(eye, 'aria-pressed');
+    toggle(1, eye);
+    const eyeOn = values(eye, 'aria-pressed');
+    toggle(2, clear);
+    return { order, singleSelection, smoothOff, smoothOn, eyeOff, eyeOn,
+      colors:rows.map(row => row.querySelector('.assigned-chip')?.title || '') };
+  });
+  const firstThreeOff = ['false','false','false','true'];
+  const allOn = ['true','true','true','true'];
+  assert.deepEqual(grouped.order, ['visibilityPath','smoothPath','clearColorPath']);
+  assert.deepEqual(grouped.singleSelection, ['true','false','false','false']);
+  assert.deepEqual(grouped.smoothOff, firstThreeOff);
+  assert.deepEqual(grouped.smoothOn, allOn);
+  assert.deepEqual(grouped.eyeOff, firstThreeOff);
+  assert.deepEqual(grouped.eyeOn, allOn);
+  assert.deepEqual(grouped.colors, ['','','',palettes.at(-1)]);
   if(process.env.HMB_PICKER_COLOR_SCREENSHOT) await page.screenshot({path:process.env.HMB_PICKER_COLOR_SCREENSHOT});
   assert.deepEqual(errors,[]);
-  console.log('Repeated reference browser: PASS (16 repeated colors, independent recolor/clear, reload, no page errors)');
+  console.log('Repeated reference browser: PASS (16 repeated colors, reload, single selection, bulk Eye/S/X, no page errors)');
 } finally {await browser?.close();await new Promise(resolve=>server.close(resolve));}

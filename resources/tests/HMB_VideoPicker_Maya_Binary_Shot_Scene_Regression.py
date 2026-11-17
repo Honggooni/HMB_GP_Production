@@ -35,6 +35,7 @@ def set_scene(state: dict, scene: Path, label: str) -> dict:
             {"full_dag_path": f"|{label}", "maya_uuid": f"{label}-root", "color": "Red"},
         ]}],
         "slot_visibility": [{"video_slot": 1, "hidden_paths": [f"|{label}Hidden"]}],
+        "smooth_preview_overrides": {f"|{label}": False},
         "start_frame": 101, "end_frame": 124, "current_frame": 105, "source_fps": 24,
         "has_maya_frame_range": True,
     })
@@ -52,6 +53,7 @@ def authored_scene(state: dict) -> dict:
     return {key: copy.deepcopy(state.get(key)) for key in (
         "scene_path", "scene_request_path", "native_read_ready", "native_metadata", "selected_camera",
         "outliner_nodes", "selected_outliner_path", "selected_color", "slot_assignments", "slot_visibility",
+        "smooth_preview_overrides",
     )}
 
 
@@ -113,6 +115,9 @@ def run() -> None:
         state.pop("picker_scene_owner_uuid", None)
         state = set_scene(state, scene_a, "ActorA")
         expected_a = authored_scene(state)
+        smooth_on = {**state, "smooth_preview_overrides": {}}
+        for operation in ("run_video", "render_snapshot", "render_original_preview"):
+            assert picker._operation_input_digest(operation, scene_a, state) != picker._operation_input_digest(operation, scene_a, smooth_on)
         expected_media = rendered_media(state)
         blank_b = switch(state, SHOTS[1])
         assert not blank_b["scene_path"] and not blank_b["native_read_ready"]
@@ -159,6 +164,7 @@ def run() -> None:
                     assert not accepted["outliner_nodes"] and not accepted["selected_camera"]
                     assert not any(row["bindings"] for row in accepted["slot_assignments"])
                     assert not any(row["hidden_paths"] for row in accepted["slot_visibility"])
+                    assert accepted["smooth_preview_overrides"] == ({"|ActorA": False} if scene == scene_a else {})
                     assert rendered_media(accepted) == expected_media
                     assert authored_scene(switch(node._picker_state(), SHOTS[1])) == expected_b
 

@@ -9725,9 +9725,22 @@ def _smooth_preview_mesh_face_counts(shape, mesh=None):
     return tuple(values)
 
 
+def _picker_smooth_preview_mode(overrides, shape, default=3):
+    """Resolve an exact Maya DAG path, inheriting the closest ancestor control."""
+    path = shape
+    while path:
+        enabled = overrides.get(path)
+        if isinstance(enabled, bool):
+            return 3 if enabled else 1
+        path = path.rpartition("|")[0]
+    return default
+
+
 def _preflight_smooth_geometry_budget(job, actual_frame=False, maya_frame=None):
     """Estimate polygon growth; this operational budget is not a Maya limit."""
     budget = (job or {}).get("smooth_preview_geometry_budget_faces", SMOOTH_PREVIEW_GEOMETRY_BUDGET_FACES)
+    overrides = (job or {}).get("smooth_preview_overrides")
+    overrides = overrides if isinstance(overrides, dict) else {}
     if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
         raise ValueError("Smooth Preview geometry budget must be a positive integer.")
     if _clean((job or {}).get("capture_pass")) == "motion_guide":
@@ -9799,8 +9812,8 @@ def _preflight_smooth_geometry_budget(job, actual_frame=False, maya_frame=None):
                 _mouth_semantic_cutout_candidate(shape, record)
                 and (record.get("unsupported") or record.get("ambiguous"))
             )
-            mode = 3
-            if preserved or actual_frame:
+            mode = _picker_smooth_preview_mode(overrides, shape)
+            if (preserved and mode != 1) or actual_frame:
                 if preserved:
                     report["preserved_cutout_count"] += 1
                 mode = _first_display_smoothness_value(cmds.displaySmoothness(shape, query=True, polygonObject=True))
@@ -9875,6 +9888,7 @@ def _apply_full_smooth_viewport(job):
         "proxy_preview_percent_count": 0,
         "smooth_mesh_preview_mode": 3,
         "smooth_mesh_shape_count": 0,
+        "smooth_preview_disabled_shape_count": 0,
         "alpha_cutout_smooth_preserved_count": 0,
         "cutout_transparency": {},
         "smooth_nurbs_shape_count": 0,
@@ -10087,24 +10101,35 @@ def _apply_full_smooth_viewport(job):
     report["cutout_transparency"] = dict(
         (job or {}).get("_authored_cutout_report") or {}
     )
+    overrides = (job or {}).get("smooth_preview_overrides")
+    overrides = overrides if isinstance(overrides, dict) else {}
+    instance_modes = {}
     for shape in sorted(set(mesh_shapes)):
         if _is_intermediate_shape(shape):
             continue
         long_names = _long_names([shape])
         snapshot_key = long_names[0] if long_names else shape
         cutout_record = cutout_snapshot.get(snapshot_key) or {}
-        if bool(cutout_record.get("alpha_driven")) or (
+        mode = _picker_smooth_preview_mode(overrides, snapshot_key)
+        is_cutout = bool(cutout_record.get("alpha_driven")) or (
             _mouth_semantic_cutout_candidate(snapshot_key, cutout_record)
             and (
                 cutout_record.get("unsupported")
                 or cutout_record.get("ambiguous")
             )
-        ):
+        )
+        if is_cutout and mode != 1:
             # Polygon Smooth Preview can introduce interpolation/edge artifacts
             # on texture-alpha cards.  Preserve their authored display mode;
             # every solid mesh still takes the shared Smooth Preview 3 path.
             report["alpha_cutout_smooth_preserved_count"] += 1
             continue
+        if overrides:
+            identity = _dag_object_identity(shape)
+            previous_mode = instance_modes.setdefault(identity, mode)
+            if previous_mode != mode:
+                failures.append("{0} shares an instanced mesh with a different Smooth Preview setting.".format(shape))
+                continue
         try:
             original_mode = _first_display_smoothness_value(
                 cmds.displaySmoothness(
@@ -10124,7 +10149,7 @@ def _apply_full_smooth_viewport(job):
                 divisionsV=3,
                 pointsWire=16,
                 pointsShaded=4,
-                polygonObject=3,
+                polygonObject=mode,
             )
             actual_mode = _first_display_smoothness_value(
                 cmds.displaySmoothness(
@@ -10133,17 +10158,21 @@ def _apply_full_smooth_viewport(job):
                     polygonObject=True,
                 )
             )
-            if int(actual_mode) != 3:
+            if int(actual_mode) != mode:
                 raise RuntimeError(
                     "verification returned polygonObject={0!r}".format(
                         actual_mode
                     )
                 )
-            report["smooth_mesh_shape_count"] += 1
+            if mode == 1:
+                report["smooth_preview_disabled_shape_count"] += 1
+            else:
+                report["smooth_mesh_shape_count"] += 1
         except Exception as exc:
             failures.append(
-                "{0} could not enter Maya Smooth Preview 3 ({1})".format(
+                "{0} could not enter Maya Smooth Preview mode {1} ({2})".format(
                     shape,
+                    mode,
                     exc,
                 )
             )
@@ -10213,6 +10242,7 @@ def _apply_full_smooth_viewport(job):
     if bool((job or {}).get("require_full_smooth_geometry")):
         if (
             not report["smooth_mesh_shape_count"]
+            and not report["smooth_preview_disabled_shape_count"]
             and not report["alpha_cutout_smooth_preserved_count"]
         ):
             failures.append(
@@ -17129,6 +17159,17 @@ def run(job_path):
                 bindings,
                 job,
             )
+            smooth_overrides = job.get("smooth_preview_overrides")
+            if capture_pass == "depth" and isinstance(smooth_overrides, dict) and smooth_overrides:
+                # Depth includes visible uncolored geometry too. Honor its
+                # explicit Picker settings without forcing the other meshes.
+                quality_shapes = set(job["_viewport_quality_scope_shapes"])
+                quality_shapes.update(
+                    shape for shape in job["_auxiliary_fallback_shapes"]
+                    if _picker_smooth_preview_mode(smooth_overrides, shape, default=None) is not None
+                    and cmds.nodeType(shape) == "mesh"
+                )
+                job["_viewport_quality_scope_shapes"] = sorted(quality_shapes)
             _write_progress(
                 job,
                 "render_scope_ready",
@@ -17181,7 +17222,7 @@ def run(job_path):
             _write_progress(
                 job,
                 "preparing_full_smooth_geometry",
-                "Preparing Smooth Preview 3 only for authored-visible assigned Maya meshes.",
+                "Preparing Smooth Preview for authored-visible Maya meshes using the Picker settings.",
             )
             quality_restore, quality_report = _apply_full_smooth_viewport(job)
             job["_proxy_preview_recovery"] = dict(
@@ -17191,7 +17232,7 @@ def run(job_path):
             quality_warnings = list(quality_report.get("warnings") or [])
             warnings.extend(quality_warnings)
             quality_ready_message = (
-                "Full-detail Maya Smooth Preview 3 viewport profile is active."
+                "Maya capture is using the Picker's Smooth Preview settings."
             )
             _write_progress(
                 job,
@@ -17207,6 +17248,9 @@ def run(job_path):
                 ),
                 smooth_mesh_shape_count=int(
                     quality_report.get("smooth_mesh_shape_count") or 0
+                ),
+                smooth_preview_disabled_shape_count=int(
+                    quality_report.get("smooth_preview_disabled_shape_count") or 0
                 ),
                 unresolved_proxy_plugin_count=len(
                     quality_report.get("unresolved_proxy_nodes") or []

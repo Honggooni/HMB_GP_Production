@@ -210,6 +210,16 @@ class GeometryBudgetTests(unittest.TestCase):
         fallback = self.preflight(scene, {"_render_scope_shapes": ["|One|sharedShape"]})
         self.assertEqual(fallback["estimated_faces"], 40)
 
+    def test_smooth_override_budget_uses_base_mesh_with_child_override(self):
+        scene = GeometryScene({
+            "|Actor|Off|shape": {"faces": 625001, "face_vertices": 2500004, "level": 2},
+            "|Actor|On|shape": {"faces": 2, "face_vertices": 8, "level": 2},
+            "|Actor|Card|shape": {"faces": 1, "face_vertices": 4, "level": 3, "mode": 3, "alpha": True},
+        })
+        report = self.preflight(scene, {"smooth_preview_overrides": {"|Actor": False, "|Actor|On": True}})
+        self.assertEqual(report["estimated_faces"], 625001 + 32 + 1)
+        self.assertEqual(scene.writes, [])
+
     def test_unknown_topology_never_claims_verified_budget_and_known_excess_still_stops(self):
         for invalid in (float("nan"), float("inf"), -1):
             with self.subTest(invalid=invalid):
