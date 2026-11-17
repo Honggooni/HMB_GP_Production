@@ -148,7 +148,9 @@ assert.doesNotMatch(main, /on\(row, "click"/);
 assert.match(main, /availability\.operationBusy \|\| container\.__hmbPickerOperationSubmissionPending/);
 assert.match(main, /hmbSetPickerVisibilityBusy\(container, true\)/);
 assert.match(main, /hmbApplyPickerCameraSelectionToDom\(container, next\);\s*schedulePickerStatePublicationAfterPaint\(next\);/);
-assert.match(main, /hmbApplyPickerResolutionToDom\(container, selected\.width, selected\.height\);\s*schedulePickerStatePublicationAfterPaint\(next, \{ commitOptions: \{\} \}\);/);
+assert.match(main, /const applyPlayblastSize = \(width, height\) => \{[\s\S]*?hmbApplyPickerResolutionToDom\(container, width, height\);\s*schedulePickerStatePublicationAfterPaint\(next, \{ commitOptions: \{\} \}\);/);
+assert.match(main, /applyPlayblastSize\(selected\.width, selected\.height\);/);
+assert.match(main, /applyPlayblastSize\(\.\.\.dimensions\);/);
 assert.match(
   main,
   /hmbApplySelectedVideoAssetOrderToDom\(\s*container,\s*nextState,\s*liveTr,\s*pickerLocalInteractionLocked\(nextState\),?\s*\);[\s\S]*?schedulePickerStatePublicationAfterPaint\(/,
