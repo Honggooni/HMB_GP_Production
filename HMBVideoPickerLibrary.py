@@ -87,8 +87,8 @@ MAYA_RUNNER = _THIS_DIR / "resources" / "maya" / "HMB_Maya_Background_Preview.py
 BLENDER_RUNNER = _THIS_DIR / "resources" / "blender" / "HMB_Blender_Background_Preview.py"
 MARKER_CATALOG_PATH = _THIS_DIR / "resources" / "picker" / "HMB_Marker_Catalog.json"
 ORIGINAL_MATERIAL_PASS_SOURCES = ("AIPicker_SET", "AIPickerM_SET")
-MASK_MATERIAL_PASS_SOURCES = ("AIPickerM_SET",)
-MASK_MATERIAL_PASS_PROFILE = "mask_authored_set_material_pass_v1"
+MASK_MATERIAL_PASS_SOURCES = ("AIPicker_SET", "AIPickerM_SET")
+MASK_MATERIAL_PASS_PROFILE = "mask_authored_set_material_pass_v2"
 WIDGET_NAME = "HMBVideoPickerLibraryWidget"
 WIDGET_LIBRARY_NAME = "HMB_GP_Production"
 
@@ -13411,7 +13411,7 @@ def _validate_mask_material_pass_confirmation(result: Any, sidecar: Any) -> Dict
     report = result.get("mask_material_pass_report")
     if (not _mask_material_report_is_valid(report)
             or sidecar.get("mask_material_pass_report") != report):
-        raise RuntimeError("Mask did not verify exact AIPickerM_SET authored materials and shader restoration.")
+        raise RuntimeError("Mask did not verify AIPicker_SET and AIPickerM_SET authored materials and shader restoration.")
     return copy.deepcopy(report)
 
 

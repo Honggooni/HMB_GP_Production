@@ -51,8 +51,8 @@ ORIGINAL_LAMBERT_ASSIGNMENT_MODE = (
     "original_midgray_body_authored_eyes"
 )
 ORIGINAL_MATERIAL_PASS_SETS = ("AIPicker_SET", "AIPickerM_SET")
-MASK_MATERIAL_PASS_SETS = ("AIPickerM_SET",)
-MASK_MATERIAL_PASS_PROFILE = "mask_authored_set_material_pass_v1"
+MASK_MATERIAL_PASS_SETS = ("AIPicker_SET", "AIPickerM_SET")
+MASK_MATERIAL_PASS_PROFILE = "mask_authored_set_material_pass_v2"
 SCREEN_SPACE_PATTERN_PROFILE = "hmb_screen_space_pattern_post_v2"
 SCREEN_SPACE_PATTERN_LINEAR_SCALE_DIVISOR = 3
 SCREEN_SPACE_PATTERN_BASE_CELL_DIVISOR = 8

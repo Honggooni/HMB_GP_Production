@@ -27,8 +27,8 @@ def empty_mask_material_report():
         "marker_assignment_eligible_shape_count",
     )
     return dict.fromkeys(counts, 0) | {
-        "profile": picker.MASK_MATERIAL_PASS_PROFILE, "material_pass_source": "AIPickerM_SET",
-        "material_pass_sources": ["AIPickerM_SET"], "requested": True, "status": "restored", "restore_ok": True,
+        "profile": picker.MASK_MATERIAL_PASS_PROFILE, "material_pass_source": "AIPicker_SET|AIPickerM_SET",
+        "material_pass_sources": ["AIPicker_SET", "AIPickerM_SET"], "requested": True, "status": "restored", "restore_ok": True,
         "shading_group_membership_preserved": True, "default_lighting_verified": True,
         "solid_render_mode_verified": False, "textured_render_mode_verified": True,
         "eye_textures_enabled": False, "eye_materials_preserved": True, "eye_assignments_preserved": True,
@@ -51,8 +51,9 @@ def main():
     assert not picker._original_material_report_is_valid(nonempty)
     for key, value in (
         ("material_pass_source", "AIPicker_SET"), ("material_pass_source", "AIPickerM_SET_extra"),
-        ("material_pass_sources", ["AIPicker_SET", "AIPickerM_SET"]),
+        ("material_pass_sources", ["AIPickerM_SET"]), ("material_pass_sources", ["AIPicker_SET"]),
         ("material_pass_sources", ["studio:AIPickerM_SET"]), ("profile", picker.ORIGINAL_MATERIAL_OVERRIDE_PROFILE),
+        ("profile", "mask_authored_set_material_pass_v1"),
         ("restore_ok", False), ("eye_materials_preserved", False), ("eye_assignments_preserved", False),
         ("shading_group_membership_preserved", False), ("eye_dependency_preflight_passed", False),
         ("eye_missing_texture_dependency_count", 1), ("eye_unavailable_plugin_dependency_count", 1),
@@ -100,7 +101,8 @@ def main():
                     "source_fps": 24, "native_read_ready": True,
                     **{name + "_enabled": name == role for name in ("mask", "original", "depth", "motion_guide")}})
                 baseline = picker._operation_input_digest(kind, scene, state)
-                with mock.patch.object(picker, "MASK_MATERIAL_PASS_PROFILE", "historical-no-material-pass"):
+                with (mock.patch.object(picker, "MASK_MATERIAL_PASS_PROFILE", "mask_authored_set_material_pass_v1"),
+                      mock.patch.object(picker, "MASK_MATERIAL_PASS_SOURCES", ("AIPickerM_SET",))):
                     changed = picker._operation_input_digest(kind, scene, state)
                 assert (changed != baseline) is (role == "mask"), (kind, role, "Mask cache isolation")
                 with mock.patch.object(picker, "ORIGINAL_MATERIAL_PASS_SOURCES", ("AIPicker_SET",)):
@@ -118,7 +120,7 @@ def main():
         method = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == name)
         assert any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
                    and n.func.id == "_validate_mask_material_pass_confirmation" for n in ast.walk(method)), name
-    print("HMB_MATERIAL_PASS_HOST=PASS (Original exact2+legacy reader; Mask exact1+independent visuals/restore; mismatched proof rejected; per-role cache isolation)")
+    print("HMB_MATERIAL_PASS_HOST=PASS (Original and Mask exact2; old Mask proof rejected; per-role cache isolation)")
 
 
 if __name__ == "__main__":

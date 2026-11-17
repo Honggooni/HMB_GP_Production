@@ -1,4 +1,4 @@
-"""Mask exact-M SET material preservation; no Maya process or user scene."""
+"""Mask material preservation for both exact picker sets."""
 from __future__ import annotations
 import ast
 import copy
@@ -88,7 +88,7 @@ def mark(fake, job, shapes):
 with tempfile.TemporaryDirectory(prefix="hmb-mask-material-pass-") as temporary:
     folder = Path(temporary)
     # Exact names, namespace leaves, group descendants/nested sets and component
-    # owners share Original's resolution rules, but Mask selects only M.
+    # owners share Original's exact two-set resolution rules.
     for prefix in ("", "studio:hero:"):
         fake = MaskCmds(folder)
         configure(fake, {prefix + "AIPicker_SET": [fake.EYE_LEFT_OWNER],
@@ -98,32 +98,35 @@ with tempfile.TemporaryDirectory(prefix="hmb-mask-material-pass-") as temporary:
             prefix + "aipickerm_set": [fake.BROW_OWNER]})
         runner.cmds = fake
         assert runner._original_pass_set_shapes() == {fake.EYE_LEFT, fake.EYE_RIGHT}
-        assert runner._mask_pass_set_shapes() == {fake.EYE_RIGHT}
+        assert runner._mask_pass_set_shapes() == {fake.EYE_LEFT, fake.EYE_RIGHT}
         shapes = [fake.EYE_LEFT, fake.EYE_RIGHT, fake.BODY, fake.BROW]
         job = job_for(fake, shapes)
         pass_members = list(fake.members["sharedEyeBodySG"][:1])
         pass_graph = fake.authored_eye_snapshot()
         assert not mark(fake, job, shapes)
-        assert job["_mask_material_pass_shapes"] == [fake.EYE_RIGHT]
-        assert job["_mask_marker_assignment_eligible_shape_count"] == 3
+        assert set(job["_mask_material_pass_shapes"]) == {fake.EYE_LEFT, fake.EYE_RIGHT}
+        assert job["_mask_marker_assignment_eligible_shape_count"] == 2
         assert fake.members["sharedEyeBodySG"] == pass_members
-        assert set(fake.members["MaskMarkerSG"]) == {fake.EYE_LEFT, fake.BODY, fake.BROW}
-        assert all(fake.EYE_RIGHT not in members for _group, members in fake.assignment_calls)
+        assert fake.members["eyeOnlySG"] == [fake.EYE_LEFT_OWNER]
+        assert set(fake.members["MaskMarkerSG"]) == {fake.BODY, fake.BROW}
+        assert all(not {fake.EYE_LEFT, fake.EYE_RIGHT}.intersection(members) for _group, members in fake.assignment_calls)
         before_controller = fake.snapshot()
         controller = runner._OriginalLambertOverrideController(job, material_pass_only=True)
         report = controller.apply()
         assert report["profile"] == runner.MASK_MATERIAL_PASS_PROFILE
-        assert report["material_pass_source"] == "AIPickerM_SET"
-        assert report["material_pass_sources"] == ["AIPickerM_SET"]
-        assert report["material_pass_shape_count"] == report["preserved_eye_shape_count"] == 1
+        assert report["material_pass_source"] == "AIPicker_SET|AIPickerM_SET"
+        assert report["material_pass_sources"] == ["AIPicker_SET", "AIPickerM_SET"]
+        assert report["material_pass_shape_count"] == report["preserved_eye_shape_count"] == 2
         assert report["temporary_lambert_count"] == 0
         assert report["authored_materials_ignored"] is False and report["opaque_surface_verified"] is False
         assert not any(key in report for key in ("base_color", "diffuse", "fill_color"))
         assert fake.snapshot() == before_controller
         assert controller.finish()["restore_ok"] and fake.snapshot() == before_controller
         assert fake.authored_eye_snapshot() == pass_graph
-    # AIPicker_SET alone never grants a Mask exception, nor do legacy names.
+    # Similar names cannot grant a material exception.
     fake = MaskCmds(folder)
+    configure(fake, {"AIPicker_SET_extra": [fake.EYE_LEFT_OWNER],
+                     "aipickerm_set": [fake.EYE_RIGHT_OWNER]})
     runner.cmds = fake
     assert not runner._mask_pass_set_shapes()
     job = job_for(fake, [fake.EYE_LEFT, fake.EYE_RIGHT])
@@ -132,23 +135,24 @@ with tempfile.TemporaryDirectory(prefix="hmb-mask-material-pass-") as temporary:
     controller = runner._OriginalLambertOverrideController(job, material_pass_only=True)
     assert controller.apply()["material_pass_shape_count"] == 0
     assert controller.finish()["restore_ok"]
-    # All-pass bindings are valid, with zero fake semantic marker assignments.
-    fake = MaskCmds(folder)
-    configure(fake, {"AIPickerM_SET": [fake.EYE_RIGHT_OWNER]})
-    job = job_for(fake, [fake.EYE_RIGHT])
-    before = fake.snapshot()
-    assert not mark(fake, job, [fake.EYE_RIGHT])
-    assert fake.snapshot() == before and not fake.assignment_calls
-    assert job["_mask_marker_assignment_eligible_shape_count"] == 0
+    # Either exact set works independently, including all-pass bindings.
+    for set_name in ("AIPicker_SET", "AIPickerM_SET"):
+        fake = MaskCmds(folder)
+        configure(fake, {set_name: [fake.EYE_RIGHT_OWNER]})
+        job = job_for(fake, [fake.EYE_RIGHT])
+        before = fake.snapshot()
+        assert not mark(fake, job, [fake.EYE_RIGHT])
+        assert fake.snapshot() == before and not fake.assignment_calls
+        assert job["_mask_marker_assignment_eligible_shape_count"] == 0
+        controller = runner._OriginalLambertOverrideController(job, material_pass_only=True)
+        assert controller.apply()["material_pass_shape_count"] == 1
+        assert controller.finish()["restore_ok"] and fake.snapshot() == before
     all_pass_binding = {"color": "Red", "asset_id": "all-pass-fixture", "subject_root": "|hero:ROOT"}
     with mock.patch.object(runner, "MARKER_COLORS", {"Red": (1.0, 0.0, 0.0)}):
         metadata = runner._marker_payload([all_pass_binding])
     assert len(metadata) == 1 and metadata[0]["color"] == all_pass_binding["color"]
     assert metadata[0]["asset_id"] == all_pass_binding["asset_id"]
     assert metadata[0]["subject_root"] == all_pass_binding["subject_root"]
-    controller = runner._OriginalLambertOverrideController(job, material_pass_only=True)
-    assert controller.apply()["material_pass_shape_count"] == 1
-    assert controller.finish()["restore_ok"] and fake.snapshot() == before
     # Missing provider fallback uses Original's native input/cache transfer,
     # while unselected non-pass members of a shared SG keep the authored graph.
     for fail in (False, True):
@@ -255,4 +259,4 @@ with tempfile.TemporaryDirectory(prefix="hmb-mask-host-proof-") as temporary:
         accepted = host._validate_mask_material_pass_confirmation(
             {"mask_material_pass_report": proof}, {"mask_material_pass_report": copy.deepcopy(proof)})
         assert accepted == proof and accepted is not proof
-print("HMB_MASK_MATERIAL_PASS=PASS (Original exact2/Mask exact1; namespaces/nested/component; marker exclusion; all/zero pass; shared-SG native fallback+partial failure exact restore; color-finally before Depth/Motion; no scene/render/Maya process)")
+print("HMB_MASK_MATERIAL_PASS=PASS (Original and Mask exact2; namespaces/nested/component; marker exclusion; all/zero pass; shared-SG native fallback+partial failure exact restore; color-finally before Depth/Motion)")

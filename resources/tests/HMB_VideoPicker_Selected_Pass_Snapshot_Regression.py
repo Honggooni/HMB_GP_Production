@@ -117,7 +117,7 @@ def _run_regression():
                     assert "depth_range_bindings" not in job
                 if role == "mask":
                     assert job["apply_marker_shaders"] is True and job["capture_pass"] == "color"
-                    assert job["mask_material_pass_sources"] == ["AIPickerM_SET"]
+                    assert job["mask_material_pass_sources"] == ["AIPicker_SET", "AIPickerM_SET"]
                     assert job["mask_material_pass_profile"] == picker.MASK_MATERIAL_PASS_PROFILE
                     assert len(job["bindings"]) == 6
                     assert [item["full_dag_path"] for item in job["bindings"]] == [item["full_dag_path"] for item in bindings]

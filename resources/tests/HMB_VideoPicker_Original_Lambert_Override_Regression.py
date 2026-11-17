@@ -806,7 +806,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-authored-eye-") as texture_root:
     assert runner._original_pass_set_shapes() == set(), "A same-name DAG group is not an objectSet."
 
     # The new M set contributes to Original independently, and both exact
-    # names union their memberships. The M-only Mask policy is separate.
+    # names union their memberships.
     for prefix in ("", "studio:hero:"):
         pair = EyeMidgrayCmds(texture_directory)
         configure_pass_sets(pair, {
@@ -816,7 +816,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-authored-eye-") as texture_root:
         })
         runner.cmds = pair
         assert runner._original_pass_set_shapes() == {pair.EYE_LEFT, pair.EYE_RIGHT}
-        assert runner._mask_pass_set_shapes() == {pair.EYE_RIGHT}
+        assert runner._mask_pass_set_shapes() == {pair.EYE_LEFT, pair.EYE_RIGHT}
         pair_before = pair.snapshot()
         pair_controller = controller_for(pair, [pair.EYE_LEFT, pair.EYE_RIGHT])
         pair_report = pair_controller.apply()
