@@ -14,18 +14,18 @@ import _hmb_cgt as cgt
 class PreparationTests(unittest.TestCase):
     def test_assignment_does_not_wait_for_unrelated_media_scan(self):
         import _hmb_shot_basket as basket
-        state = dict(project_id="superwings12", scan_busy=True, error="")
-        node = SimpleNamespace(metadata={basket._MARKER: dict(project_id="superwings12", cgt_required=True)})
-        with patch.object(basket, "_shot_state", return_value=(state, None)), patch.object(basket, "_basket_shots", return_value=[]):
-            node.name = "Fixture Image"
-            kinds = dict(image=node)
-            result = basket._status(SimpleNamespace(name="Fixture"), kinds, [], False)
-            self.assertEqual(result["status"], "ready")
-            self.assertTrue(result["media_preparing"])
-            state["project_id"] = "Katuri8"
-            self.assertEqual(basket._status(None, kinds, [], False)["status"], "preparing")
-            state.update(project_id="superwings12", scan_busy=False, error="offline")
-            self.assertEqual(basket._status(None, kinds, [], False)["status"], "unavailable")
+        state = dict(project_id="superwings12", scan_busy=True, error="",
+                     shot_routing={"active_shot_uuid": "", "shots": []})
+        node = SimpleNamespace(name="Fixture Image", _current_state=lambda: state,
+                               metadata={basket._MARKER: dict(project_id="superwings12", cgt_required=True)})
+        kinds = dict(image=node)
+        result = basket._status(SimpleNamespace(name="Fixture"), kinds, [], False)
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(result["media_preparing"])
+        state["project_id"] = "Katuri8"
+        self.assertEqual(basket._status(None, kinds, [], False)["status"], "preparing")
+        state.update(project_id="superwings12", scan_busy=False, error="offline")
+        self.assertEqual(basket._status(None, kinds, [], False)["status"], "unavailable")
 
     def test_pending_read_is_shared_and_used_once_without_blocking_entry(self):
         entered, release = threading.Event(), threading.Event()
