@@ -14,6 +14,7 @@ from weakref import WeakKeyDictionary, ref
 
 _LIBRARY = "HMB_GP_Production"
 _MARKER = "hmb_shot_basket_v1"
+SEEDANCE_SETUP_PENDING = "hmb_shot_basket_seedance_pending"
 _NODES = {
     "sound": ("HMBSoundLibrary", "HMB Sound Library", 0, -760),
     "image": ("HMBImageAssetLibrary", "HMB ImageAsset Library", 0, 0),
@@ -311,12 +312,15 @@ def _create(engine: Any, flow: Any, project: dict | None, projects: list[dict], 
             if (_active_flow(engine, flow.name, exact=True) is not flow
                     or _nodes(engine, flow) != created):
                 raise BasketError("작업공간이 변경되어 노드 생성을 멈췄습니다.")
+            metadata = {"position": {"x": x, "y": y}, _MARKER: {**marker, "kind": kind}}
+            if kind == "generator":
+                metadata[SEEDANCE_SETUP_PENDING] = True
             with engine.context_manager.flow(flow=flow):
                 result = engine.handle_request(CreateNodeRequest(
                     node_type=node_type, specific_library_name=_LIBRARY, node_name=name,
                     override_parent_flow_name=flow.name, create_error_proxy_on_failure=False,
                     set_as_new_context=False, broadcast_result=True,
-                    metadata={"position": {"x": x, "y": y}, _MARKER: {**marker, "kind": kind}},
+                    metadata=metadata,
                 ))
             if not result.succeeded():
                 raise BasketError("필요한 HMB 노드를 만들 수 없습니다.")
@@ -408,6 +412,29 @@ def _basket_shots(state: dict, marker: dict) -> list[dict]:
     return [row for row in routing["shots"] if row["shot_uuid"] in slots]
 
 
+def _active_basket_shot(state: dict, shots: list[dict]) -> dict | None:
+    active = state["shot_routing"]["active_shot_uuid"]
+    return next((row for row in shots if row["shot_uuid"] == active), next(iter(shots), None))
+
+
+def initial_seedance_shot(generator: Any, image: Any) -> str:
+    """Choose the launcher's exact shot from its own committed ImageAsset."""
+    target = (getattr(generator, "metadata", {}) or {}).get(_MARKER)
+    source = (getattr(image, "metadata", {}) or {}).get(_MARKER)
+    if (not isinstance(target, dict) or not isinstance(source, dict)
+            or target.get("kind") != "generator" or source.get("kind") != "image"
+            or not _uuid(target.get("workspace_id"))
+            or target["workspace_id"] != source.get("workspace_id")
+            or target.get("reserved") or source.get("reserved")
+            or target.get("project_id") != source.get("project_id")):
+        return ""
+    state = image._current_state()
+    if not source.get("project_id") or source["project_id"] != state.get("project_id") or state.get("error"):
+        return ""
+    shot = _active_basket_shot(state, _basket_shots(state, source))
+    return shot["shot_uuid"] if shot else ""
+
+
 def _status(flow: Any, kinds: dict, projects: list[dict], discovering: bool) -> dict:
     result = {
         "ok": True, "flow_name": getattr(flow, "name", ""), "project_id": "",
@@ -422,13 +449,12 @@ def _status(flow: Any, kinds: dict, projects: list[dict], discovering: bool) -> 
         elif flow is not None and flow.nodes:
             result["status"] = "occupied"
         return result
-    state, shot = _shot_state(kinds)
+    state = kinds["image"]._current_state()
     target = marker["project_id"]
     shots = _basket_shots(state, marker)
+    shot = _active_basket_shot(state, shots)
     if marker.get("cgt_required") is True:
         result.update(cgt_required=True, cgt_bound=bool(shots))
-        if shot not in shots:
-            shot = next(iter(shots), None)
     result["project_id"] = state.get("project_id") or target
     result["shot_uuid"] = shot["shot_uuid"] if shot else ""
     result["shots"] = [{key: row[key] for key in ("shot_uuid", "name", "number")} for row in shots]

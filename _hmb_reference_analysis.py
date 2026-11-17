@@ -19,6 +19,7 @@ import time
 from typing import Any, Callable
 
 from _hmb_agent_media import _PNG_BUDGET_DECODER, _binaries, _decode, _run, _video_info
+from _hmb_video_tools import VideoToolError, _find_ffmpeg, _find_ffprobe
 
 
 ANALYSIS_CATEGORIES = {
@@ -301,12 +302,18 @@ def analysis_video_frame_info(source: str, *, legacy_start: Any = None, legacy_e
         if not 0 < path.stat().st_size <= _MAX_SOURCE_BYTES:
             raise ValueError
         _validate_header(path, "video")
-        _ffmpeg, probe = _binaries()
-        if probe is None:
+        ffmpeg, probe = _analysis_binaries()
+        if probe:
+            info = _video_info(path, probe, time.monotonic() + 5)
+            times, rate, last_duration = _video_frame_manifest(path, probe, start_pts=info.get("start_pts") or 0.0)
+            duration = info.get("duration") or _frame_end_time(times, len(times) - 1, None, last_duration)
+        elif ffmpeg:
+            times, duration, _last_duration = _ffmpeg_video_frame_timing(path, ffmpeg)
+            rate = len(times) / duration if duration else None
+            if duration is None:
+                raise ValueError
+        else:
             raise ValueError
-        info = _video_info(path, probe, time.monotonic() + 5)
-        times, rate, last_duration = _video_frame_manifest(path, probe, start_pts=info.get("start_pts") or 0.0)
-        duration = info.get("duration") or _frame_end_time(times, len(times) - 1, None, last_duration)
         legacy = []
         if legacy_start is not None or legacy_end is not None:
             try:
@@ -331,8 +338,12 @@ def analysis_audio_duration(source: str) -> float:
         if not 0 < path.stat().st_size <= _MAX_SOURCE_BYTES:
             raise ValueError
         _validate_header(path, "audio")
-        _ffmpeg, probe = _binaries()
-        duration = _audio_duration(path, probe) if probe else None
+        ffmpeg, probe = _analysis_binaries()
+        duration = None
+        if probe:
+            duration = _audio_duration(path, probe)
+        elif ffmpeg:
+            duration, _start = _ffmpeg_stream_timing(path, ffmpeg, "audio")
         if duration is None:
             raise ValueError
         return duration
@@ -343,6 +354,74 @@ def analysis_audio_duration(source: str) -> float:
 def _local_command(args: list[str], timeout: float) -> subprocess.CompletedProcess:
     return subprocess.run(args, capture_output=True, timeout=timeout, check=True,
                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def _analysis_binaries() -> tuple[Path | None, Path | None]:
+    ffmpeg, probe = _binaries()  # Retain explicit and adjacent package overrides.
+    if ffmpeg is None:
+        try:
+            ffmpeg = Path(_find_ffmpeg())
+        except VideoToolError:
+            return None, probe
+    if probe is None and (resolved := _find_ffprobe(str(ffmpeg))):
+        probe = Path(resolved)
+    return ffmpeg, probe
+
+
+def _ffmpeg_stream_timing(path: Path, ffmpeg: Path, kind: str) -> tuple[float | None, float]:
+    """Read the bundled FFmpeg input header when FFprobe is unavailable."""
+    try:
+        result = subprocess.run([str(ffmpeg), "-nostdin", "-hide_banner", "-protocol_whitelist", "file,pipe",
+            "-i", str(path)], capture_output=True, timeout=8, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except OSError:
+        raise AnalysisError("ANALYSIS_DECODER_UNAVAILABLE", "FFmpeg 실행 파일을 시작할 수 없습니다.") from None
+    except subprocess.SubprocessError:
+        return None, 0.0
+    header = result.stderr
+    label = b"Video:" if kind == "video" else b"Audio:"
+    if not any(line.lstrip().startswith(b"Stream #0:") and label in line
+               and b"attached pic" not in line.lower() for line in header.splitlines()):
+        return None, 0.0
+    match = re.search(rb"^\s*Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)(?:,\s+start:\s*(-?\d+(?:\.\d+)?))?", header, re.M)
+    if not match:
+        return None, 0.0
+    hours, minutes, seconds = (float(value) for value in match.groups()[:3])
+    return hours * 3600 + minutes * 60 + seconds, float(match[4] or 0)
+
+
+def _ffmpeg_frame_manifest(path: Path, ffmpeg: Path) -> tuple[list[float], float | None]:
+    """Keep actual presentation timestamps, including variable frame rate."""
+    try:
+        result = _local_command([str(ffmpeg), "-nostdin", "-hide_banner", "-loglevel", "info", "-threads", "1",
+            "-protocol_whitelist", "file,pipe", "-copyts", "-i", str(path), "-map", "0:V:0",
+            "-an", "-sn", "-dn", "-vf", "showinfo=checksum=0", "-fps_mode", "passthrough", "-f", "null", "-"], 20)
+        if len(result.stderr) > 32 * 1024 * 1024:
+            raise ValueError("frame manifest too large")
+        bases = set(re.findall(rb"config in time_base:\s*(\d+)/(\d+)", result.stderr))
+        lines = [line for line in result.stderr.splitlines() if b"Parsed_showinfo_" in line and re.search(rb"\bn:\s*\d+", line)]
+        frame_pattern = re.compile(rb"\bn:\s*(\d+)\s+pts:\s*(-?\d+)\s+pts_time:\s*\S+(?:\s+duration:\s*(\d+))?")
+        rows = [frame_pattern.search(line) for line in lines]
+        if len(bases) != 1 or not rows or any(row is None or int(row[1]) != index for index, row in enumerate(rows)):
+            raise ValueError("missing frame timestamps")
+        numerator, denominator = (int(value) for value in next(iter(bases)))
+        scale = numerator / denominator
+        first = int(rows[0][2])
+        times = [round((int(row[2]) - first) * scale, 6) for row in rows]
+        if not scale > 0 or any(right < left for left, right in zip(times, times[1:])):
+            raise ValueError("invalid frame timestamps")
+        return times, int(rows[-1][3]) * scale if rows[-1][3] else None
+    except (OSError, ValueError, ZeroDivisionError, OverflowError, subprocess.SubprocessError):
+        raise AnalysisError("ANALYSIS_FRAME_METADATA_UNAVAILABLE", "영상의 실제 프레임 번호와 타임코드를 읽지 못했습니다.") from None
+
+
+def _ffmpeg_video_frame_timing(path: Path, ffmpeg: Path) -> tuple[list[float], float | None, float | None]:
+    times, last_duration = _ffmpeg_frame_manifest(path, ffmpeg)
+    if last_duration:
+        duration = _frame_end_time(times, len(times) - 1, None, last_duration)
+    else:
+        duration, _start = _ffmpeg_stream_timing(path, ffmpeg, "video")
+    return times, duration, last_duration
 
 
 def _audio_duration(path: Path, probe: Path) -> float | None:
@@ -868,21 +947,25 @@ def analyze_reference(node: Any, *, source: str, kind: str, start: Any = None, e
             staged = Path(working) / ("reference" + source_suffix)
             source_digest = _read_source(source, kind, stage=staged, is_live=is_live)
             _validate_header(staged, kind)
-            ffmpeg, probe = _binaries()
+            ffmpeg, probe = _analysis_binaries()
             duration = None
             start_pts = 0.0
             frame_times = None
-            frame_rate = None
             last_frame_duration = None
             if kind != "image":
-                if not ffmpeg or not probe:
-                    raise AnalysisError("ANALYSIS_DECODER_UNAVAILABLE", "영상·음원 분석에 필요한 FFmpeg와 FFprobe를 확인하세요.")
-                if kind == "video":
+                if not ffmpeg:
+                    raise AnalysisError("ANALYSIS_DECODER_UNAVAILABLE", "영상·음원 분석에 필요한 FFmpeg 실행 파일을 찾을 수 없습니다.")
+                if not probe:
+                    if selected_frames is not None:
+                        frame_times, duration, last_frame_duration = _ffmpeg_video_frame_timing(staged, ffmpeg)
+                    else:
+                        duration, start_pts = _ffmpeg_stream_timing(staged, ffmpeg, kind)
+                elif kind == "video":
                     video_info = _video_info(staged, probe, time.monotonic() + 5)
                     duration = video_info.get("duration")
                     start_pts = video_info.get("start_pts") or 0.0
                     if selected_frames is not None:
-                        frame_times, frame_rate, last_frame_duration = _video_frame_manifest(staged, probe, start_pts=start_pts)
+                        frame_times, _rate, last_frame_duration = _video_frame_manifest(staged, probe, start_pts=start_pts)
                         duration = duration or _frame_end_time(frame_times, len(frame_times) - 1, None, last_frame_duration)
                 else:
                     try:

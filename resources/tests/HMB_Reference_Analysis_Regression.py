@@ -157,6 +157,56 @@ class ReferenceAnalysisTest(unittest.TestCase):
             analysis._video_frame_scope([{"start": 3, "end": 3}], times, duration=None, last_duration=None)
         self.assertEqual(failure.exception.code, "ANALYSIS_FRAME_METADATA_UNAVAILABLE")
 
+    def test_lut_binary_and_no_ffprobe_support_video_frames_and_audio(self):
+        from _hmb_video_tools import _find_ffmpeg
+
+        ffmpeg = Path(_find_ffmpeg())
+        variable = self.root / "fallback-variable.mkv"
+        self.media("-f", "lavfi", "-i", "testsrc2=size=80x48:rate=10:duration=1",
+                   "-vf", r"select=eq(n\,0)+eq(n\,1)+eq(n\,4)+eq(n\,6)",
+                   "-fps_mode", "passthrough", "-c:v", "libx264", "-bf", "0", str(variable))
+        source_info = analysis._video_info(variable, self.probe, analysis.time.monotonic() + 5)
+        expected, _, _ = analysis._video_frame_manifest(variable, self.probe, start_pts=source_info["start_pts"] or 0.0)
+        self.assertEqual(expected, [0.0, 0.1, 0.4, 0.6])
+
+        def finish(_node, _model, _prompt, attachments, _live, mark_submitted):
+            mark_submitted()
+            kind = "video" if attachments[0][2] == "image/png" else "audio"
+            self.assertTrue(all(blob.startswith(b"\x89PNG" if kind == "video" else b"RIFF")
+                                for _, blob, _ in attachments))
+            return observations(kind)
+
+        with patch.object(analysis, "_binaries", return_value=(None, None)), \
+                patch.object(analysis, "_find_ffprobe", return_value=""):
+            self.assertEqual(analysis._analysis_binaries(), (ffmpeg, None))
+            info = analysis.analysis_video_frame_info(str(variable))
+            self.assertEqual(info["frame_count"], len(expected))
+            self.assertAlmostEqual(analysis.analysis_audio_duration(str(self.audio)), 2.0)
+            for kind, path, options in (
+                ("video", self.video, {}),
+                ("video", variable, {"frame_ranges": [{"start": 0, "end": 3}]}),
+                ("audio", self.audio, {"time_ranges": [{"start": 0.1, "end": 0.4}]}),
+            ):
+                result = analysis.analyze_reference(None, source=str(path), kind=kind, invoke=finish,
+                    cache_dir=self.root / "fallback-cache", **options)
+                if "frame_ranges" in options:
+                    self.assertEqual(result["evidence"]["frame_times"], expected)
+
+    def test_decoder_absence_and_broken_media_report_different_errors(self):
+        corrupt = self.root / "broken-container.mp4"
+        corrupt.write_bytes(self.video.read_bytes()[:20])
+        callback = unittest.mock.Mock(side_effect=AssertionError("invalid input reached analysis submission"))
+        for path, tools, code in (
+            (self.video, (None, None), "ANALYSIS_DECODER_UNAVAILABLE"),
+            (corrupt, (self.ffmpeg, None), "ANALYSIS_DECODE_FAILED"),
+        ):
+            with (self.subTest(code=code), patch.object(analysis, "_analysis_binaries", return_value=tools),
+                    self.assertRaises(analysis.AnalysisError) as failure):
+                analysis.analyze_reference(None, source=str(path), kind="video", invoke=callback,
+                                           cache_dir=self.root / "fallback-invalid-cache")
+            self.assertEqual(failure.exception.code, code)
+        callback.assert_not_called()
+
     def test_image_and_video_attach_real_bytes_and_reuse_result(self):
         calls = []
 

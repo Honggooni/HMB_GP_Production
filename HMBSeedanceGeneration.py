@@ -125,6 +125,7 @@ from _hmb_mp4_verify import (
     validate_decodable_mp4_file as _validate_decodable_mp4_file,
 )
 import _hmb_shot_routing as _shot_routing
+from _hmb_shot_basket import SEEDANCE_SETUP_PENDING, initial_seedance_shot
 import _hmb_review as _review
 import _hmb_broker_config as _broker_config
 import _hmb_my_box_node as _my_box_node
@@ -7123,6 +7124,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             value.update(channel_uuid=catalog["channel_uuid"], shot_uuid=selected["shot_uuid"],
                          shot_number=selected["number"], shot_name=selected["name"])
         self.metadata = {**dict(getattr(self, "metadata", {}) or {}), SEEDANCE_EXECUTION_MODE_METADATA: value}
+        self.metadata.pop(SEEDANCE_SETUP_PENDING, None)
         controller = getattr(self, "_hmb_my_box_controller_instance", None)
         if controller is not None:
             controller.invalidate()
@@ -7507,8 +7509,16 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             }
         )
 
+    def _hmb_reconcile_basket_shot_routing(self, image: Any, routing_snapshot: Any) -> bool:
+        if (getattr(self, "metadata", {}) or {}).get(SEEDANCE_SETUP_PENDING) is not True:
+            return False
+        self._hmb_reconcile_shot_routing(
+            routing_snapshot, basket_shot_uuid=initial_seedance_shot(self, image),
+        )
+        return True
+
     @hmb_binding_mutation
-    def _hmb_reconcile_shot_routing(self, routing_snapshot: Any) -> None:
+    def _hmb_reconcile_shot_routing(self, routing_snapshot: Any, *, basket_shot_uuid: str = "") -> None:
         snapshot = self._validate_shot_catalog_snapshot(routing_snapshot)
         identity = self._shot_identity()
         suspended = getattr(self, "_hmb_suspended_shot_identity", None)
@@ -7582,7 +7592,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             selector_map[label] = item
         self._set_seedance_shot_choices(labels)
         self._hmb_shot_selector_map = selector_map
-        # A fresh node auto-adopts Shot 1.  Once the user explicitly chooses
+        basket_pending = (getattr(self, "metadata", {}) or {}).get(SEEDANCE_SETUP_PENDING) is True
+        if basket_pending and not intent and not identity.get("shot_uuid") and basket_shot_uuid:
+            selected = next((row for row in available_shots if row["shot_uuid"] == basket_shot_uuid), None)
+            if selected is not None:
+                self._hmb_commit_seedance_mode(basket_shot_uuid)
+        # A manually added node can auto-adopt the first available Shot.
+        # Rodong Mart waits for its own project and, when required, CGT.
+        # Once the user explicitly chooses
         # Only, later catalog refreshes must preserve that independent mode.
         # Existing UUIDs retain authority across rename/renumber.  A deleted
         # UUID must never silently become another Shot merely because that Shot
@@ -7590,6 +7607,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # may adopt the first available UUID.
         fallback_to_available = bool(
             not intent
+            and not basket_pending
             and not identity.get("shot_uuid")
             and not isinstance(suspended, dict)
             and self.get_parameter_value(SHOT_AUTOCLAIM_ENABLED_PARAMETER)
@@ -9994,6 +10012,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         mode_getter = getattr(self, "_hmb_seedance_execution_mode", None)
         if not callable(mode_getter) or mode_getter() != "only":
             self._reconcile_shared_shot_routing(strict=True)
+        if (getattr(self, "metadata", {}) or {}).get(SEEDANCE_SETUP_PENDING) is True:
+            raise ValueError("로동마트의 샷 선택을 완료해 주세요.")
         if callable(mode_getter) and mode_getter() == "waiting":
             raise ValueError("The selected Shot is waiting for its original library binding. Restore that Shot, or explicitly select Only.")
         only_guard = getattr(self, "_assert_only_mode_inputs", None)

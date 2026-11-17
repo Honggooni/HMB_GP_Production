@@ -19,7 +19,7 @@ import subprocess
 import sys
 import traceback
 from unittest import mock
-from uuid import UUID
+from uuid import UUID, uuid4
 import wave
 
 TESTS = Path(__file__).resolve().parent
@@ -38,6 +38,48 @@ NODE_MODULES = {
 }
 PROJECT_ID = "katuri8"
 SHOT_NAME = "로동마트 Offline Reference Shot"
+CGT_SHOT_NAME = "e203s002c001__"
+
+
+async def confirm_new_cgt_shot(image, image_module, read_status):
+    import _hmb_cgt
+    import _hmb_shot_routing as routing
+
+    def new_uuid():
+        return str(uuid4())
+
+    previous = image._current_state()
+    shot_routing = previous["shot_routing"]
+    original_shot = shot_routing["active_shot_uuid"]
+    account, project, pipeline, task, entity, shot = (new_uuid() for _ in range(6))
+    project_identity = routing.hierarchy_project_key(previous)
+    origin = "https://fixture.invalid"
+    scope = dict(origin=origin, project_id=project, project_db="fixture_db", module="shot",
+                 module_type="task", pipeline_id=pipeline, account_id=account)
+    identity = dict(task_id=task, entity_id=entity, pipeline_id=pipeline)
+    member = dict(member_id=f"cgt:{task}", origin="cgt", manual_uuid=new_uuid(), source_name=CGT_SHOT_NAME,
+                  canonical_name=CGT_SHOT_NAME, gp_shot_uuid=shot, parent_id=None, selection_order=1,
+                  cgt_task_id=task, artist="Fixture", status="Work", cgt_identity=identity)
+    binding = dict(schema=routing.SHOT_HIERARCHY_SCHEMA, version=2, binding_id=new_uuid(), revision=1,
+                   project_identity=project_identity, channel_uuid=shot_routing["channel_uuid"],
+                   cgt_account_id=account, cgt_scope=scope, members=[member])
+    command = dict(schema=routing.SHOT_HIERARCHY_REQUEST_SCHEMA, version=1,
+                   expected_generation=shot_routing["generation"], expected_binding_revision=0,
+                   removed_member_ids=[], binding=binding)
+    snapshot = dict(status="ready", account_id=account, origin=origin,
+                    project=dict(id=project, database="fixture_db", entity=PROJECT_ID),
+                    tasks=[dict(task_id=task, identity=identity, source_name=CGT_SHOT_NAME,
+                                pipeline_id=pipeline, artist="Fixture", status="Work")])
+    with mock.patch.object(_hmb_cgt, "catalog", return_value=snapshot) as verify:
+        image._request_cgt_read(dict(schema=image_module.THUMBNAIL_BRIDGE_SCHEMA, version=1,
+            operation="cgt_confirm", phase="request", request_id=new_uuid(), session_id=new_uuid(),
+            runtime_instance_id=image._thumbnail_runtime_id(previous), project_identity=project_identity,
+            hierarchy_request=command, bind_only=True))
+        status = await wait_for(read_status, lambda data: data.get("cgt_bound") is True)
+        verify.assert_called_once()
+    assert status["shot_uuid"] == shot and status["shot_uuid"] != original_shot, status
+    assert status["shots"] == [dict(shot_uuid=shot, name=CGT_SHOT_NAME, number=2)], status
+    return status
 
 
 def media_files(out):
@@ -147,9 +189,19 @@ async def exercise(engine, phase, out):
 
     def verify_routes(nodes, shot_id):
         image, video, sound, prompt, agent, generator = (nodes[kind] for kind in NODE_MODULES)
-        for node in (video, prompt, agent, generator):
-            subscription = node._hmb_shot_channel_subscription()
-            assert subscription["shot_uuid"] == shot_id and subscription["channel_uuid"], (node.name, subscription)
+        channel_uuid = image._current_state()["shot_routing"]["channel_uuid"]
+        if os.environ.get("HMB_SHOT_BASKET_TEST_CGT"):
+            assert agent._hmb_manager_prompt_owner(channel_uuid=channel_uuid, shot_uuid=shot_id) is prompt
+        else:
+            for node in (video, prompt, agent):
+                subscription = node._hmb_shot_channel_subscription()
+                assert subscription["shot_uuid"] == shot_id and subscription["channel_uuid"] == channel_uuid, (node.name, subscription)
+        assert generator._hmb_seedance_execution_mode() == "shot"
+        assert generator._hmb_shot_channel_subscription()["shot_uuid"] == shot_id
+        route = generator._current_remote_prompt_route()
+        assert route["connected"] and route["source_node_name"] == agent.name, route
+        widget = generator.get_parameter_value(modules["generator"].SEEDANCE_SHOT_WIDGET_PARAMETER)
+        assert widget["remote_prompt_route"]["connected"], widget
         assert sound._hmb_shot_channel_subscription()["channel_uuid"] == image._current_state()["shot_routing"]["channel_uuid"]
         edges = retained_edges(engine)
         expected = {
@@ -225,6 +277,8 @@ async def exercise(engine, phase, out):
             nodes = active_nodes()
             assert {kind: node.name for kind, node in nodes.items()} == expected["nodes"]
             await verify_selection(nodes, flow_name, expected["shot_id"], expected["selection"])
+            await wait_for(lambda: request("status", flow_name=flow_name),
+                           lambda _: nodes["generator"]._current_remote_prompt_route()["connected"])
             assert verify_routes(nodes, expected["shot_id"]) == [tuple(edge) for edge in expected["edges"]]
             await verify_delivery(nodes, expected["shot_id"], expected["selection"]["sound"][0])
             harness.record("cold_native_open_retains_shot_media_order_nodes_and_routes", shot_id=expected["shot_id"],
@@ -239,14 +293,29 @@ async def exercise(engine, phase, out):
         flow_name, workflow_name = ensured.flow_name, ensured.workflow_name
         prepared = await request("prepare", flow_name=flow_name, workflow_name=workflow_name)
         assert prepared["prepared"] and prepared["created"]
+        cgt = bool(os.environ.get("HMB_SHOT_BASKET_TEST_CGT"))
         created = await request("create", flow_name=flow_name, workflow_name=workflow_name,
-                                project_id=project_id, shot_name=SHOT_NAME)
+                                project_id=project_id, shot_name="" if cgt else SHOT_NAME, cgt_setup=cgt)
         assert created["bound"] and created["flow_name"] == flow_name
-        status = await wait_for(lambda: request("status", flow_name=flow_name),
-                                lambda data: data["status"] == "ready" and data["shot_uuid"])
+        async def read_status():
+            return await request("status", flow_name=flow_name)
+
+        if cgt:
+            await wait_for(read_status, lambda data: data["status"] == "ready" and data.get("cgt_bound") is False)
+            nodes = active_nodes()
+            generator = nodes["generator"]
+            generator._reconcile_shared_shot_routing()
+            assert generator._hmb_seedance_execution_mode() == "auto", generator._shot_identity()
+            assert not generator._hmb_shot_channel_subscription()["enabled"]
+            assert not any(edge[2] == generator.name and edge[3] == "prompt" for edge in retained_edges(engine))
+            status = await confirm_new_cgt_shot(nodes["image"], modules["image"], read_status)
+            await wait_for(read_status, lambda _: generator._current_remote_prompt_route()["connected"])
+            harness.record("cgt_bind_only_selects_exact_second_shot_and_managed_remote", shot_id=status["shot_uuid"])
+        else:
+            status = await wait_for(read_status, lambda data: data["status"] == "ready" and data["shot_uuid"])
         shot_id = str(UUID(status["shot_uuid"]))
         assert status["project_id"].casefold() == PROJECT_ID
-        assert [row["name"] for row in status["shots"]] == [SHOT_NAME], status
+        assert [row["name"] for row in status["shots"]] == [CGT_SHOT_NAME if cgt else SHOT_NAME], status
         nodes = active_nodes()
         harness.record("native_empty_launcher_discovers_project_and_creates_six_nodes", flow=flow_name, shot_id=shot_id)
 
@@ -325,7 +394,8 @@ def main():
         harness.ROOT = ROOT
         harness.exercise = exercise
         harness.PRODUCTS = (*[f"{name}.py" for name in NODE_MODULES.values()],
-                            "_hmb_shot_basket.py", "_hmb_library_bootstrap.py", "_hmb_workflow_migration.py")
+                            "_hmb_shot_basket.py", "_hmb_shot_routing.py", "_hmb_library_bootstrap.py",
+                            "_hmb_workflow_migration.py")
         harness.run_phase(args.phase, out)
         return
     out.mkdir(parents=True, exist_ok=False)

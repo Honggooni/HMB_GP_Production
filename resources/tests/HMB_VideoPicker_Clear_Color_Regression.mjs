@@ -19,8 +19,7 @@ const initial = {
   videos: [{ video_uid: "keep", video_path: "C:/saved.mp4", markers: [binding("|A", "Red")] }],
   snapshots: [{ file_path: "C:/saved.png", frame: 101 }],
 };
-let state = picker.hmbPickerSelectOutlinerPath(initial, "|B");
-state = picker.hmbPickerSelectOutlinerPath(state, "|A", { ctrlKey: true });
+const state = picker.hmbPickerSelectOutlinerPath(initial, "|A");
 const before = structuredClone(state);
 const cleared = picker.hmbPickerClearOutlinerColor(state, "|A");
 assert.deepEqual(state, before, "Clear must not mutate its input snapshot");
@@ -32,6 +31,12 @@ for (const key of ["outliner_nodes", "slot_visibility", "depth_settings", "picke
   assert.deepEqual(cleared[key], before[key], key);
 }
 assert.deepEqual(cleared.slot_assignments[1], before.slot_assignments[1]);
+
+const multi = picker.hmbPickerSelectOutlinerPath(state, "|B", { ctrlKey: true });
+const multiCleared = picker.hmbPickerClearOutlinerColor(multi, "|A");
+assert.deepEqual(multiCleared.slot_assignments[0].bindings.map(b => b.full_dag_path), ["|A|Mesh"]);
+assert.deepEqual(multiCleared.selected_outliner_paths, multi.selected_outliner_paths);
+assert.deepEqual(multiCleared.slot_assignments[1], multi.slot_assignments[1]);
 assert.equal(picker.hmbPickerClearOutlinerColor(cleared, "|A"), cleared, "Repeated clear is a no-op");
 assert.equal(picker.hmbPickerClearOutlinerColor(cleared, "|unknown"), cleared);
 assert.equal(picker.hmbPickerClearOutlinerColor(cleared, "|C"), cleared);
@@ -92,4 +97,4 @@ const event = { preventDefault() {}, stopPropagation() {}, target: { closest: se
   ["[data-clear-color-path]", "[data-group-path]"].includes(selector) ? button : null } };
 click(event); assert.equal(count, 1); assert.equal(selections, 0);
 button.disabled = true; click(event); assert.equal(count, 1); assert.equal(selections, 0);
-console.log("HMB Picker color clear: PASS (row-only, duplicate colors, child/root, busy, paint-first, saved media preserved)");
+console.log("HMB Picker color clear: PASS (single and multi selection, duplicate colors, child/root, busy, paint-first, saved media preserved)");

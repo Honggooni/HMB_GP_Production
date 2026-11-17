@@ -2931,7 +2931,12 @@ def reconcile_shot_routing(
                     )
                     if callable(callback):
                         try:
-                            callback(snapshot)
+                            basket_callback = (
+                                getattr(recipient.node, "_hmb_reconcile_basket_shot_routing", None)
+                                if recipient.kind == KIND_SEEDANCE and not orphan_replacement else None
+                            )
+                            if not callable(basket_callback) or not basket_callback(source.node, snapshot):
+                                callback(snapshot)
                             _mark_authoritative(recipient.node)
                         except Exception as exc:
                             # Stale generations and same-generation hash
