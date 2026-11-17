@@ -842,18 +842,22 @@ function hmbAgentShotRowWidget(container, initialProps) {
     const own=ticket?.owner===container;
     const current=switching ? {...canonical,selected:own,expanded:own && ticket.expanded} : canonical;
     const recovering=own && ticket?.recovering;
-    const text=canonical.routing_pending ? "샷 연결 확인 중…" : own ? (recovering ? "응답 확인 필요" : switching ? "전환 중…" : "전달 중…") : lastError ? (lastRejected ? "요청 거절됨" : "응답 확인 필요") : hmbAgentProgressLabel(current, ({preparing:"소스 준비 중…",running:"Agent 실행 중…",succeeded:"완료",failed:"실패",cancelled:"취소"})[current.status] || "");
+    const savedResult=typeof current.display_page?.output==="string" ? current.display_page.output : "";
+    const resultAvailable=current.status==="succeeded" && Boolean(savedResult.trim()) && !current.expanded;
+    const text=canonical.routing_pending ? "샷 연결 확인 중…" : own ? (recovering ? "응답 확인 필요" : switching ? "전환 중…" : "전달 중…") : lastError ? (lastRejected ? "요청 거절됨" : "응답 확인 필요") : hmbAgentProgressLabel(current, ({preparing:"소스 준비 중…",running:"Agent 실행 중…",succeeded:resultAvailable?"완료 · 결과 보기":"완료",failed:"실패",cancelled:"취소"})[current.status] || "");
     const running=["preparing","running"].includes(current.status),runText=recovering ? "↻" : running ? "■" : "▷";
     const title=recovering?"현재 상태만 확인합니다. Agent/Run은 다시 실행하지 않습니다.":lastError || (running?"이 샷 Agent만 취소":"이 샷 Agent만 실행");
     const disabled=Boolean(ticket) || Boolean(canonical.routing_pending) || !shot.shot_uuid,runDisabled=disabled && (!recovering || Boolean(canonical.routing_pending));
     // The host may update geometry independently of the authored value.
     for(const [key,value] of [["height","42px"],["min-height","42px"],["max-height","42px"],["flex","0 0 42px"],["overflow","hidden"]])if(container.style?.getPropertyValue?.(key)!==value)container.style?.setProperty?.(key,value,"important");
-    const signature=JSON.stringify([shot,current.selected,current.expanded,text,runText,title,Boolean(ticket),disabled,runDisabled,Boolean(props.disabled)]);
+    const resultTitle=resultAvailable ? "클릭하여 저장된 FINAL TEXT를 확인합니다.\n"+savedResult.slice(0,600) : "클릭하여 이 샷을 펼치거나 접습니다.";
+    const signature=JSON.stringify([shot,current.selected,current.expanded,text,runText,title,resultTitle,Boolean(ticket),disabled,runDisabled,Boolean(props.disabled)]);
     if(signature===presentationSignature)return;
     presentationSignature=signature;
     hmbAgentSetAttribute(root,"data-shot-number",String(shot.number || 1));hmbAgentSetAttribute(row,"data-shot-number",String(shot.number || 1));
     hmbAgentSetAttribute(row,"data-active",String(current.selected));hmbAgentSetAttribute(row,"data-shot-uuid",shot.shot_uuid || "");
     hmbAgentSetAttribute(select,"data-agent-shot",shot.shot_uuid || "");hmbAgentSetAttribute(select,"aria-expanded",String(current.expanded));hmbAgentSetAttribute(select,"aria-pressed",String(current.selected));
+    hmbAgentSetAttribute(select,"title",resultTitle);
     if(number.textContent!==String(shot.number||0).padStart(2,"0"))number.textContent=String(shot.number||0).padStart(2,"0");
     if(label.textContent!==(shot.name||""))label.textContent=shot.name||"";
     if(status.textContent!==text)status.textContent=text;

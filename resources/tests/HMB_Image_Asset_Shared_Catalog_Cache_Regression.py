@@ -296,6 +296,13 @@ with tempfile.TemporaryDirectory(prefix="hmb_shared_catalog_") as temporary:
         assert terminal["assets"] == [] and terminal["error"] == result["error"]
     # Loading/reloading from either local index or shared cache keeps the source
     # clock; the terminal publisher advances only the actual selected operation.
+    # The synthetic empty completion above must not be accepted as a complete
+    # catalog for three real files. Restore the actual verified snapshot.
+    assert asset_library._adopt_shared_catalog_snapshot(
+        {"catalog_root": str(catalog_a), "projects": cache_state["projects"]},
+        cache_state["projects"][0], completed_selection,
+    ) is None
+    asset_library._store_shared_catalog_snapshot(cache_state)
     reopened = asset_library._select_catalog_project(completed_selection, str(project_a))
     assert reopened["scan_revision"] == completed_selection["scan_revision"]
     assert reopened["project_cache_uid"] == completed_selection["project_cache_uid"]
@@ -409,4 +416,87 @@ with tempfile.TemporaryDirectory(prefix="hmb_shared_catalog_") as temporary:
     assert asset_library._read_catalog_index(project_a, cache_state) is None
 
 
-print("HMB shared catalog/cache/probe/portable media identity regression: PASS")
+from unittest.mock import patch
+
+with tempfile.TemporaryDirectory(prefix="hmb_incremental_catalog_") as temporary:
+    catalog = Path(temporary).resolve()
+    project = catalog / "Show"
+    project.mkdir()
+    asset_library._ASSET_CATALOG_INDEX_ROOT = catalog / "cache"
+    for number in range(5):
+        (project / f"Hero{number}.png").write_bytes(png_bytes((number, 20, 40)))
+    initial = {**asset_library._default_state(), "catalog_root": str(catalog),
+               "project_root": str(project), "project_id": "Show",
+               "project_uid": asset_library._project_uid(project)}
+    current = asset_library._load_project_catalog(catalog, initial, use_shared_cache=False)
+    routes = deepcopy(current["shot_routing"])
+    original_dimensions = asset_library._asset_dimensions
+
+    # Saved state, explicit Refresh and cold persistent index must not reopen
+    # any unchanged image. A metadata check remains required in each case.
+    with patch.object(asset_library, "_asset_dimensions", side_effect=AssertionError("unchanged image decoded")), \
+         patch.object(asset_library, "_asset_content_probe", side_effect=AssertionError("unchanged image sampled")):
+        for _ in range(3):
+            current = asset_library._load_project_catalog(catalog, current, use_shared_cache=False)
+            assert len(current["assets"]) == 5 and current["shot_routing"] == routes
+        asset_library._write_catalog_index(current)
+        restored = asset_library._load_project_catalog(catalog, initial, use_shared_cache=False)
+        assert len(restored["assets"]) == 5
+
+    # File-by-file cache survives normalization/serialization and a new file,
+    # replacement, removal or registration change cannot trigger full decode.
+    (project / "New.png").write_bytes(png_bytes((90, 40, 10)))
+    with patch.object(asset_library, "_asset_dimensions", wraps=original_dimensions) as reads:
+        current = asset_library._load_project_catalog(catalog, current, use_shared_cache=False)
+        assert [call.args[0].name for call in reads.call_args_list] == ["New.png"]
+    (project / "Hero1.png").write_bytes(png_bytes((210, 50, 10)))
+    with patch.object(asset_library, "_asset_dimensions", wraps=original_dimensions) as reads:
+        current = asset_library._load_project_catalog(catalog, current, use_shared_cache=False)
+        assert [call.args[0].name for call in reads.call_args_list] == ["Hero1.png"]
+    (project / "Hero2.png").unlink()
+    with patch.object(asset_library, "_asset_dimensions", side_effect=AssertionError("removed file caused re-read")):
+        current = asset_library._load_project_catalog(catalog, current, use_shared_cache=False)
+        assert len(current["assets"]) == 5
+        asset_library._write_asset_manifest_record(project, {
+            "path": "Hero0.png", "asset_id": "Renamed", "image_name": "한글 이름",
+            "image_main_type": "Character", "image_sub_type": "",
+        })
+        current = asset_library._load_project_catalog(catalog, current, use_shared_cache=False)
+        assert next(item for item in current["assets"] if item["relative_path"] == "Hero0.png")["image_name"] == "한글 이름"
+        assert current["shot_routing"] == routes
+    with patch.object(asset_library.os, "scandir", side_effect=PermissionError("offline")):
+        try:
+            asset_library._project_folder_metadata_signature(project)
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("An unavailable share was accepted as an empty inventory")
+
+import asyncio
+
+async def completed_probe_ack():
+    for outcome in ("no_change", "deferred", "offline"):
+        node = object.__new__(asset_library.HMBImageAssetLibrary)
+        node._ensure_catalog_probe_runtime_state()
+        state = asset_library._default_state()
+        node._current_state = lambda: deepcopy(state)
+        node._scan_owner_is_current = lambda: True
+        node._compute_catalog_probe = lambda *_: (outcome, None)
+        replies = []
+        host = threading.get_ident()
+        def reply(value):
+            assert threading.get_ident() == host, "Probe published from its IO thread"
+            replies.append(value)
+        node._set_thumbnail_bridge_value = reply
+        request = {"request_id": "single-request-" + outcome}
+        node._schedule_catalog_probe(request, state)
+        deadline = time.monotonic() + 3
+        while not replies and time.monotonic() < deadline:
+            await asyncio.sleep(.005)
+        assert len(replies) == 1 and replies[0]["request_id"] == request["request_id"]
+        assert replies[0]["outcome"] == outcome
+        assert not node._hmb_catalog_probe_pending_key
+        assert node._current_state() == state
+
+asyncio.run(completed_probe_ack())
+print("HMB shared catalog/cache/probe/portable media identity and incremental reuse regression: PASS")

@@ -91,8 +91,10 @@ class FirstPaintRegression(unittest.TestCase):
     def test_replaced_project_cannot_adopt_previous_index(self):
         library._write_catalog_index(self.state)
         document = json.loads(self.manifest.read_text(encoding="utf-8"))
+        before = self.manifest.stat()
         document["project_cache_uid"] = "hmbpc1:" + "2" * 32
         self.manifest.write_text(json.dumps(document), encoding="utf-8")
+        os.utime(self.manifest, ns=(before.st_atime_ns, before.st_mtime_ns))
         with patch.object(library, "_adopt_shared_catalog_snapshot", return_value=None), \
              patch.object(library, "_scan_project_assets", wraps=library._scan_project_assets) as scanner:
             selected = library._select_catalog_project(self.state, self.project)

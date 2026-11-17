@@ -989,10 +989,19 @@ def _asset_file_facts(
     *,
     project_uid: Any = "",
     relative_path: Any = "",
+    inventory_root: Path | None = None,
 ) -> tuple[Path, int, int, str]:
     """Return the stable path+size+mtime identity used by staged media work."""
 
-    resolved = path.resolve()
+    # Catalog-only discovery has already walked each directory without links.
+    # Avoid repeatedly resolving every UNC ancestor for every image. Media
+    # admission/thumbnail callers omit this and retain exact path resolution.
+    if inventory_root is not None:
+        if not path.is_absolute() or not path.is_relative_to(inventory_root) or ".." in path.parts:
+            raise ValueError("Catalog image is outside the verified inventory.")
+        resolved = path
+    else:
+        resolved = path.resolve()
     details = resolved.stat()
     if not resolved.is_file() or _is_reparse_point(resolved):
         raise ValueError("Image asset is not a regular file.")
@@ -2396,6 +2405,15 @@ def _asset_manifest_signature(root: Path) -> str:
                 "Image asset manifest must not be a symlink or reparse point."
             )
         manifest_stat = manifest_path.stat()
+        if manifest_stat.st_size > 2 * 1024 * 1024:
+            raise ValueError("Image asset manifest exceeds 2 MiB.")
+        # Fast atomic replacement (and some SMB clients) can preserve every
+        # stat field. Registration/project identity must still change then.
+        # Only this bounded JSON is read; image contents are not polled.
+        with manifest_path.open("rb") as stream:
+            manifest_bytes = stream.read(2 * 1024 * 1024 + 1)
+        if len(manifest_bytes) > 2 * 1024 * 1024:
+            raise ValueError("Image asset manifest exceeds 2 MiB.")
         payload = "|".join(
             (
                 # An old registration file is a read-only source during a
@@ -2408,6 +2426,7 @@ def _asset_manifest_signature(root: Path) -> str:
                 str(manifest_stat.st_ctime_ns),
                 str(manifest_stat.st_dev),
                 str(manifest_stat.st_ino),
+                hashlib.sha256(manifest_bytes).hexdigest(),
             )
         )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
@@ -2417,13 +2436,16 @@ def _folder_metadata_signature_from_inventory(
     root: Path,
     folder_paths: Sequence[str],
     image_paths: Sequence[Path],
+    *,
+    metadata: Dict[Path, os.stat_result] | None = None,
 ) -> str:
     digest = hashlib.sha256()
     directory_count = 0
     image_count = 0
     for relative in sorted(set(folder_paths), key=_natural_key)[:MAX_FOLDERS]:
         try:
-            stat_result = (root / Path(relative)).stat()
+            path = root / Path(relative)
+            stat_result = metadata[path] if metadata is not None else path.stat()
         except Exception:
             continue
         directory_count += 1
@@ -2439,7 +2461,7 @@ def _folder_metadata_signature_from_inventory(
     )[:MAX_ASSETS]:
         try:
             relative = candidate.relative_to(root).as_posix()
-            stat_result = candidate.stat()
+            stat_result = metadata[candidate] if metadata is not None else candidate.stat()
         except Exception:
             continue
         image_count += 1
@@ -2452,6 +2474,45 @@ def _folder_metadata_signature_from_inventory(
         )
     digest.update(f"counts|{directory_count}|{image_count}".encode("utf-8"))
     return digest.hexdigest()[:24]
+
+
+def _catalog_file_inventory(root: Path) -> tuple[List[str], List[Path], Dict[Path, os.stat_result]]:
+    """Enumerate once, retaining directory-entry metadata on network shares.
+
+    No image bytes are read. Reparse points are excluded at every boundary;
+    an unreadable directory fails the check rather than accepting a partial
+    inventory as evidence that an old catalog is still current.
+    """
+    folders: List[str] = []
+    images: List[Path] = []
+    metadata: Dict[Path, os.stat_result] = {}
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        if _is_reparse_point(current):
+            raise ValueError("Catalog directory changed to a reparse point.")
+        with os.scandir(current) as entries:
+            for entry in sorted(entries, key=lambda item: _natural_key(item.name)):
+                if entry.name.startswith("."):
+                    continue
+                if (current == root and root.name.casefold() == "ai_ct_image"
+                        and entry.name.casefold() == root.parent.name.casefold()):
+                    continue
+                facts = entry.stat(follow_symlinks=False)
+                if (stat.S_ISLNK(facts.st_mode)
+                        or getattr(facts, "st_file_attributes", 0) & 0x400):
+                    continue
+                path = Path(entry.path)
+                relative = path.relative_to(root).as_posix()
+                if stat.S_ISDIR(facts.st_mode) and len(folders) < MAX_FOLDERS:
+                    folders.append(relative)
+                    metadata[path] = facts
+                    pending.append(path)
+                elif (stat.S_ISREG(facts.st_mode) and path.suffix.casefold() in IMAGE_EXTENSIONS
+                        and len(images) < MAX_ASSETS):
+                    images.append(path)
+                    metadata[path] = facts
+    return sorted(folders, key=_natural_key), sorted(images, key=lambda path: str(path).casefold()), metadata
 
 
 def _project_folder_metadata_signature(project_root: Any) -> str:
@@ -2469,46 +2530,8 @@ def _project_folder_metadata_signature(project_root: Any) -> str:
     root = Path(root_text).expanduser().resolve()
     if not root.is_dir() or _is_reparse_point(root):
         raise ValueError(f"Project root is unavailable: {root}")
-    folder_paths: List[str] = []
-    image_paths: List[Path] = []
-    for current_text, directory_names, file_names in os.walk(
-        root,
-        topdown=True,
-        followlinks=False,
-    ):
-        current = Path(current_text)
-        safe_directories: List[str] = []
-        for name in sorted(directory_names, key=_natural_key):
-            if name.startswith(".") or len(folder_paths) >= MAX_FOLDERS:
-                continue
-            if current == root and root.name.casefold() == "ai_ct_image" and name.casefold() == root.parent.name.casefold():
-                continue
-            candidate = current / name
-            try:
-                relative = candidate.relative_to(root).as_posix()
-                if _is_reparse_point(candidate):
-                    continue
-            except Exception:
-                continue
-            safe_directories.append(name)
-            folder_paths.append(relative)
-        directory_names[:] = safe_directories
-        for name in sorted(file_names, key=_natural_key):
-            if len(image_paths) >= MAX_ASSETS:
-                break
-            candidate = current / name
-            if candidate.suffix.casefold() not in IMAGE_EXTENSIONS:
-                continue
-            try:
-                relative = candidate.relative_to(root)
-                if any(part.startswith(".") for part in relative.parts):
-                    continue
-                if _is_reparse_point(candidate):
-                    continue
-            except Exception:
-                continue
-            image_paths.append(candidate)
-    return _folder_metadata_signature_from_inventory(root, folder_paths, image_paths)
+    folders, images, metadata = _catalog_file_inventory(root)
+    return _folder_metadata_signature_from_inventory(root, folders, images, metadata=metadata)
 
 
 def _asset_manifest_cache_root_key(root: Path) -> str:
@@ -3075,7 +3098,7 @@ def _clean_project_manifest_refresh(
             return result
 
 
-def _scan_project_assets(project_root: Any) -> Dict[str, Any]:
+def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Scan one selected project and classify image files with common taxonomy."""
     root_text = _project_root_text(project_root)
     if not root_text:
@@ -3103,61 +3126,14 @@ def _scan_project_assets(project_root: Any) -> Dict[str, Any]:
     project_cache_uid = _project_cache_uid(root)
     manifest_signature = _asset_manifest_signature(root)
     manifest_overrides = _read_asset_manifest(root)
-    paths: List[Path] = []
-    folders: List[str] = []
+    folders, paths, metadata = _catalog_file_inventory(root)
     warnings: List[str] = []
-    for current_text, directory_names, file_names in os.walk(
-        root,
-        topdown=True,
-        followlinks=False,
-    ):
-        current = Path(current_text)
-        safe_directories: List[str] = []
-        for name in directory_names:
-            if name.startswith(".") or len(folders) >= MAX_FOLDERS:
-                continue
-            if current == root and root.name.casefold() == "ai_ct_image" and name.casefold() == root.parent.name.casefold():
-                continue
-            candidate = current / name
-            try:
-                relative = candidate.relative_to(root)
-                if _is_reparse_point(candidate):
-                    continue
-                candidate.resolve().relative_to(root)
-            except Exception:
-                continue
-            safe_directories.append(name)
-            folders.append(relative.as_posix())
-        directory_names[:] = safe_directories
-        if len(paths) >= MAX_ASSETS:
-            continue
-        for name in file_names:
-            if len(paths) >= MAX_ASSETS:
-                break
-            path = current / name
-            if path.suffix.casefold() not in IMAGE_EXTENSIONS:
-                continue
-            try:
-                relative = path.relative_to(root)
-                if any(part.startswith(".") for part in relative.parts):
-                    continue
-                if _is_reparse_point(path):
-                    continue
-                path.resolve().relative_to(root)
-            except Exception:
-                warnings.append(
-                    f"{name}: skipped because it resolves outside "
-                    "the selected Project Root."
-                )
-                continue
-            paths.append(path)
-    paths.sort(key=lambda value: str(value.relative_to(root)).casefold())
-    folders = sorted(set(folders), key=_natural_key)
-    folder_signature = _folder_metadata_signature_from_inventory(
-        root,
-        folders,
-        paths,
-    )
+    folder_signature = _folder_metadata_signature_from_inventory(root, folders, paths, metadata=metadata)
+    previous = previous_scan or {}
+    reusable = {
+        _clean(item.get("relative_path")).casefold(): item for item in previous.get("assets", [])
+        if isinstance(item, dict)
+    } if _clean(previous.get("project_cache_uid")) == project_cache_uid else {}
 
     stem_counts: Dict[str, int] = {}
     for path in paths:
@@ -3189,15 +3165,28 @@ def _scan_project_assets(project_root: Any) -> Dict[str, Any]:
             or path.stem
         )
         library_id = _asset_library_id(project_id, relative_text)
-        width, height = _asset_dimensions(path)
-        try:
-            _resolved, _size, _mtime_ns, media_signature = _asset_file_facts(
-                path,
-                project_uid=project_cache_uid,
-                relative_path=relative_text,
-            )
-        except Exception:
-            media_signature = ""
+        facts = metadata[path]
+        file_stamp = hashlib.sha256((str(root).casefold() + "|" + relative_text.casefold() + "|" +
+            str((facts.st_size, facts.st_mtime_ns, facts.st_ctime_ns))).encode("utf-8")).hexdigest()
+        prior = reusable.get(relative_text.casefold(), {})
+        if prior.get("catalog_file_stamp") == file_stamp and _clean(prior.get("media_signature")):
+            width, height = _non_negative_int(prior.get("width")), _non_negative_int(prior.get("height"))
+            media_signature = _clean(prior["media_signature"])
+        else:
+            width, height = _asset_dimensions(path)
+            try:
+                _resolved, _size, _mtime_ns, media_signature = _asset_file_facts(
+                    path, project_uid=project_cache_uid, relative_path=relative_text, inventory_root=root,
+                )
+                # Reuse is presentation-only, never media/cleanup authority.
+                # Do not stamp a file that changed while it was being read.
+                after = path.stat()
+                if (after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (
+                        facts.st_size, facts.st_mtime_ns, facts.st_ctime_ns):
+                    file_stamp = ""
+            except Exception:
+                media_signature = ""
+                file_stamp = ""
         color_candidates = taxonomy["color_pick_candidates"]
         is_user_import = _is_user_import_relative_path(relative_text)
         assets.append(
@@ -3214,6 +3203,7 @@ def _scan_project_assets(project_root: Any) -> Dict[str, Any]:
                 # are hydrated later for the selected/visible bounded window.
                 "thumbnail_url": "",
                 "media_signature": media_signature,
+                "catalog_file_stamp": file_stamp,
                 "relative_path": relative_text,
                 "extension": path.suffix.casefold(),
                 "width": width,
@@ -3303,6 +3293,7 @@ def _normalize_asset(raw: Any) -> Dict[str, Any] | None:
         "path": path,
         "thumbnail_url": _relocate_image_project_path(raw.get("thumbnail_url")),
         "media_signature": _clean(raw.get("media_signature"))[:64],
+        "catalog_file_stamp": _clean(raw.get("catalog_file_stamp"))[:64],
         "relative_path": _clean(raw.get("relative_path")).replace("\\", "/"),
         "extension": _clean(raw.get("extension")).casefold(),
         "width": width,
@@ -4618,7 +4609,9 @@ def _shared_catalog_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
     normalized = _normalize_state(state)
     assets: List[Dict[str, Any]] = []
     for raw_asset in normalized["assets"]:
-        if _clean(raw_asset.get("source_kind")).casefold() != "project":
+        if (_clean(raw_asset.get("source_kind")).casefold() != "project"
+                and not (_clean(raw_asset.get("relative_path"))
+                         and _non_negative_int(raw_asset.get("import_index")) == 0)):
             continue
         asset = dict(raw_asset)
         asset["selected"] = False
@@ -4677,6 +4670,8 @@ def _rebind_shared_catalog_snapshot(
     snapshot: Dict[str, Any],
     project_record: Dict[str, Any],
     catalog: Dict[str, Any],
+    *,
+    refresh_manifest: bool = False,
 ) -> Dict[str, Any] | None:
     """Bind cached relative identities to the currently selected drive alias."""
 
@@ -4695,14 +4690,26 @@ def _rebind_shared_catalog_snapshot(
         root = Path(project_root_text).resolve()
         if not root.is_dir() or _is_reparse_point(root):
             return None
+        if project_uid != _project_uid(root) or project_cache_uid != _project_cache_uid(root):
+            return None
         if _clean(snapshot.get("project_uid")) != project_uid:
             return None
         if _clean(snapshot.get("project_cache_uid")) != project_cache_uid:
             return None
-        if _clean(snapshot.get("manifest_signature")) != _asset_manifest_signature(root):
+        manifest_signature = _asset_manifest_signature(root)
+        manifest_changed = _clean(snapshot.get("manifest_signature")) != manifest_signature
+        if manifest_changed and not refresh_manifest:
             return None
-        if _clean(snapshot.get("folder_signature")) != _project_folder_metadata_signature(root):
+        folders, paths, metadata = _catalog_file_inventory(root)
+        if _clean(snapshot.get("folder_signature")) != _folder_metadata_signature_from_inventory(
+            root, folders, paths, metadata=metadata
+        ):
             return None
+        verified_paths = set(paths)
+        overrides = _read_asset_manifest(root) if manifest_changed else None
+        stems: Dict[str, int] = {}
+        for path in paths:
+            stems[path.stem.casefold()] = stems.get(path.stem.casefold(), 0) + 1
         assets: List[Dict[str, Any]] = []
         for raw_asset in snapshot.get("assets", []):
             if not isinstance(raw_asset, dict):
@@ -4719,15 +4726,28 @@ def _rebind_shared_catalog_snapshot(
                 != _asset_library_id(project_id, relative.as_posix())
             ):
                 return None
-            rebound = (root / relative).resolve()
-            rebound.relative_to(root)
+            rebound = root / relative
+            if rebound not in verified_paths:
+                return None
             asset["path"] = str(rebound).replace("\\", "/")
             asset["asset_project_uid"] = project_uid
+            if overrides is not None:
+                override = overrides.get(relative.as_posix().casefold())
+                values = override or {}
+                asset.update(_normalize_image_taxonomy_fields(values))
+                asset["asset_id"] = _clean(values.get("asset_id")) or (
+                    relative.with_suffix("").as_posix() if stems.get(relative.stem.casefold(), 0) > 1 else relative.stem
+                )
+                asset["image_name"] = _clean(values.get("image_name") or values.get("name")) or relative.stem
+                asset["registered"] = override is not None
+                asset["import_source_uid"] = _clean(values.get("import_source_uid"))
             if not _thumbnail_url_is_live(
                 asset.get("media_signature"), asset.get("thumbnail_url")
             ):
                 asset["thumbnail_url"] = ""
             assets.append(asset)
+        if {Path(asset["path"]) for asset in assets} != verified_paths:
+            return None
         rebound_snapshot = dict(snapshot)
         rebound_snapshot.update(
             {
@@ -4737,6 +4757,7 @@ def _rebind_shared_catalog_snapshot(
                 "project_id": project_id,
                 "project_uid": project_uid,
                 "project_cache_uid": project_cache_uid,
+                "manifest_signature": manifest_signature,
                 "assets": assets,
             }
         )
@@ -4848,8 +4869,24 @@ def _load_project_catalog(
             if use_shared_cache and selected is not None
             else None
         )
+        if cached is None:
+            # A saved workflow is also a reusable catalog, after validating its
+            # complete file inventory. A registration-only change refreshes
+            # taxonomy without decoding unchanged images again.
+            snapshot = _rebind_shared_catalog_snapshot(
+                _shared_catalog_snapshot(state), selected, catalog, refresh_manifest=True
+            ) if selected is not None else None
+            if snapshot is not None:
+                cached = _merge_scan_with_state(snapshot, state)
+                if snapshot.get("manifest_signature") == state.get("manifest_signature"):
+                    cached["scan_revision"] = _non_negative_int(state.get("scan_revision"))
+        if cached is None:
+            # Explicit refresh still audits registrations, but unchanged files
+            # reuse the durable catalog after fresh identity/metadata checks.
+            # The same path is used on cold restore and project re-selection.
+            cached = _read_catalog_index(selected_path, state)
         state = cached or _merge_scan_with_state(
-            _scan_project_assets(selected_path), state
+            _scan_project_assets(selected_path, previous_scan=state), state
         )
         state["catalog_root"] = catalog["catalog_root"]
         state["projects"] = catalog["projects"]
@@ -4911,7 +4948,9 @@ def _catalog_index_projection(
     normalized_state = state if normalized else _normalize_state(state)
     assets: List[Dict[str, Any]] = []
     for raw_asset in normalized_state["assets"]:
-        if _clean(raw_asset.get("source_kind")).casefold() != "project":
+        if (_clean(raw_asset.get("source_kind")).casefold() != "project"
+                and not (_clean(raw_asset.get("relative_path"))
+                         and _non_negative_int(raw_asset.get("import_index")) == 0)):
             continue
         asset = dict(raw_asset)
         asset["selected"] = False
@@ -5045,10 +5084,12 @@ def _read_catalog_index(
             != _asset_manifest_signature(resolved_root)
         ):
             return None
-        if _clean(raw.get("folder_signature")) != _project_folder_metadata_signature(
-            resolved_root
+        folders, paths, metadata = _catalog_file_inventory(resolved_root)
+        if _clean(raw.get("folder_signature")) != _folder_metadata_signature_from_inventory(
+            resolved_root, folders, paths, metadata=metadata
         ):
             return None
+        verified_paths = set(paths)
         assets = raw.get("assets")
         if not isinstance(assets, list) or len(assets) > MAX_ASSETS:
             return None
@@ -5067,13 +5108,13 @@ def _read_catalog_index(
                 != _asset_library_id(_project_id(resolved_root), relative.as_posix())
             ):
                 return None
-            resolved_asset = (resolved_root / relative).resolve()
-            try:
-                resolved_asset.relative_to(resolved_root)
-            except Exception:
+            resolved_asset = resolved_root / relative
+            if resolved_asset not in verified_paths:
                 return None
             asset["path"] = str(resolved_asset).replace("\\", "/")
             asset["thumbnail_url"] = ""
+        if {Path(asset["path"]) for asset in assets} != verified_paths:
+            return None
         indexed = dict(previous_state)
         indexed.update(raw)
         indexed["catalog_root"] = catalog["catalog_root"]
@@ -5169,7 +5210,7 @@ def _select_catalog_project(
         merged = _read_catalog_index(selected["path"], normalized)
     if merged is None:
         merged = _merge_scan_with_state(
-            _scan_project_assets(selected["path"]),
+            _scan_project_assets(selected["path"], previous_scan=normalized),
             normalized,
         )
     merged["catalog_root"] = normalized["catalog_root"]
@@ -11858,7 +11899,14 @@ class HMBImageAssetLibrary(DataNode):
             if signature == _clean(state.get("manifest_signature")):
                 return "no_change", None
 
-        refreshed_scan = _scan_project_assets(project_root_text)
+        project_record = {"path": project_root_text, **{
+            key: state.get(key, "") for key in ("project_id", "project_uid", "project_cache_uid")
+        }}
+        refreshed_scan = _rebind_shared_catalog_snapshot(
+            _shared_catalog_snapshot(state), project_record,
+            {"catalog_root": state["catalog_root"], "projects": state["projects"]},
+            refresh_manifest=True,
+        ) or _scan_project_assets(project_root_text, previous_scan=state)
         refreshed = _merge_scan_with_state(refreshed_scan, state)
         refreshed["catalog_root"] = state["catalog_root"]
         refreshed["projects"] = state["projects"]
@@ -11942,6 +11990,19 @@ class HMBImageAssetLibrary(DataNode):
             self._hmb_catalog_probe_pending_result = None
         base = _normalize_state(state)
         node_ref = weakref.ref(self)
+        host_context = contextvars.copy_context()
+        try:
+            completion_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            completion_loop = None
+        if completion_loop is None:
+            try:
+                from griptape_nodes.retained_mode.engine import has_current_engine
+                from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+                if has_current_engine():
+                    completion_loop = GriptapeNodes.EventManager().event_loop
+            except Exception:
+                pass
 
         def worker() -> None:
             owner = node_ref()
@@ -11986,6 +12047,17 @@ class HMBImageAssetLibrary(DataNode):
                         "base": base,
                     },
                 )
+            # A completed probe must ACK this request now, not wait for the
+            # next browser poll to drain the previous result. Retained-mode
+            # publication stays on the host loop with the captured context.
+            if completion_loop is not None:
+                try:
+                    if completion_loop.is_running() and not completion_loop.is_closed():
+                        completion_loop.call_soon_threadsafe(
+                            host_context.copy().run, owner._consume_pending_catalog_probe_result
+                        )
+                except RuntimeError:
+                    pass  # Pending result remains available after a loop stop.
 
         thread = threading.Thread(
             target=worker,
@@ -13148,7 +13220,7 @@ class HMBImageAssetLibrary(DataNode):
             self._hmb_last_manifest_poll_error = ""
             return normalized, None
 
-        refreshed_scan = _scan_project_assets(selected["path"])
+        refreshed_scan = _scan_project_assets(selected["path"], previous_scan=state)
         refreshed = _merge_scan_with_state(refreshed_scan, normalized)
         refreshed["catalog_root"] = catalog["catalog_root"]
         refreshed["projects"] = catalog["projects"]

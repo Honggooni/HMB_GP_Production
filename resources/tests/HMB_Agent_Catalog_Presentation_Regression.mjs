@@ -77,6 +77,21 @@ try{
  });
  assert.equal(cleanup.same,true);assert.equal(cleanup.status,'');assert.equal(cleanup.selected,'false');assert.equal(cleanup.blocked,false);
  receipt.cases.push('Late rejection/update from a disposed row cannot affect its new same-container instance');
+ const result=await page.evaluate(()=>{
+  const completed={...rowValue(1),status:'succeeded',selected:true,expanded:false,
+    display_page:{prompt:'한글 입력',output:'한글 FINAL TEXT 결과',additional_context:''}};
+  handles[0].update({value:completed,onChange:onRow});
+  const status=rows[0].querySelector('.agent-row-status').textContent;
+  const title=rows[0].querySelector('.agent-shot-tab').title;
+  const beforeCalls=calls.length;rows[0].querySelector('.agent-shot-tab').click();
+  return {status,title,beforeCalls};
+ });
+ assert.equal(result.status,'완료 · 결과 보기');assert.ok(result.title.includes('한글 FINAL TEXT 결과'));
+ await page.waitForFunction(count=>calls.length===count+1,result.beforeCalls);
+ const action=await page.evaluate(()=>calls.at(-1).action);
+ assert.equal(action.kind,'select');assert.equal(action.expanded,true);
+ await page.evaluate(()=>ack(requests.length-1));
+ receipt.cases.push('Completed folded Shot exposes saved FINAL TEXT and opens by selection without Agent/model rerun');
  await page.screenshot({path:path.join(out,label+'-catalog-stable.png')});
  await page.evaluate(()=>{bodyObserver.disconnect();handles.forEach(handle=>handle.cleanup());header.cleanup();});
  assert.deepEqual(errors,[]);assert.equal(receipt.external_requests,0);receipt.passed=true;

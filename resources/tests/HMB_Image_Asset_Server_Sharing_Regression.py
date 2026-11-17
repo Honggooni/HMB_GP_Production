@@ -113,10 +113,10 @@ with tempfile.TemporaryDirectory(prefix="hmb_asset_share_", dir=TEMP_ROOT) as te
     original_scan = asset_library._scan_project_assets
     scan_count = 0
 
-    def counted_scan(project_root_value):
+    def counted_scan(project_root_value, **kwargs):
         global scan_count
         scan_count += 1
-        return original_scan(project_root_value)
+        return original_scan(project_root_value, **kwargs)
 
     asset_library._scan_project_assets = counted_scan
     try:
@@ -202,9 +202,9 @@ with tempfile.TemporaryDirectory(prefix="hmb_asset_share_", dir=TEMP_ROOT) as te
     no_op_scan_count = [0]
     original_scan = asset_library._scan_project_assets
 
-    def no_op_counted_scan(project_root_value):
+    def no_op_counted_scan(project_root_value, **kwargs):
         no_op_scan_count[0] += 1
-        return original_scan(project_root_value)
+        return original_scan(project_root_value, **kwargs)
 
     asset_library._scan_project_assets = no_op_counted_scan
     try:
