@@ -51,7 +51,7 @@ class OnlyActiveProjects(unittest.TestCase):
         parameter = node.get_parameter_by_name(t.ONLY_PROJECT_PARAMETER)
         self.assertEqual(parameter.ui_options["simple_dropdown"], EXPECTED_CHOICES)
         find_traits = getattr(parameter, "find_elements_by_type", None)
-        traits = find_traits(t.Options) if callable(find_traits) else list(parameter.traits)
+        traits = find_traits(t.Options) if callable(find_traits) else list(getattr(parameter, "traits", ()))
         self.assertFalse(traits, "Stored labels must survive reopening verbatim")
         self.assertEqual(node.get_parameter_value(t.ONLY_PROJECT_PARAMETER), t.ONLY_PROJECT_UNSELECTED)
         self.assertEqual(EXPECTED_CHOICES, ["Select Project", "superwings12", "Katuri8", "My Box"])
