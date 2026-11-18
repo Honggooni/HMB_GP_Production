@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.12"
       - working-directory: resources/tests
-        run: python -m unittest -v HMB_Sound_Library_Regression.SoundLibraryRegression.test_actual_symlink_escape_if_supported
+        run: python -m unittest -v HMB_Sound_Library_Regression.SoundLinkRegression.test_actual_symlink_escape_if_supported
         env:
           HMB_REQUIRE_SOUND_SYMLINK: "1"
   windows-release-audit:

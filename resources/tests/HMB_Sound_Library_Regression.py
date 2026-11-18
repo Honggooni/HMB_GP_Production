@@ -62,6 +62,22 @@ class ControlledThread:
         finally: self.running = False
 
 
+class SoundLinkRegression(unittest.TestCase):
+    def test_actual_symlink_escape_if_supported(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name).resolve()
+        audio = root / "audio"; audio.mkdir()
+        outside = root / "outside.wav"; outside.write_bytes(b"outside")
+        linked = audio / "linked.wav"
+        try: linked.symlink_to(outside)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) != 1314 or os.environ.get("HMB_REQUIRE_SOUND_SYMLINK") == "1":
+                raise
+            self.skipTest("Windows symlink privilege unavailable")
+        with self.assertRaises(helper.SoundError): helper._source_path(audio, "linked.wav")
+
+
 class SoundLibraryRegression(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="hmb_sound_library_")
@@ -189,16 +205,6 @@ class SoundLibraryRegression(unittest.TestCase):
             return original(path, *args, **kwargs)
         with mock.patch.object(Path, "lstat", autospec=True, side_effect=fake_lstat), self.assertRaises(helper.SoundError):
             helper.resolve_sound_tracks(self.snapshot)
-
-    def test_actual_symlink_escape_if_supported(self):
-        outside = self.root / "outside.wav"; outside.write_bytes(self.path.read_bytes())
-        linked = self.audio / "linked.wav"
-        try: linked.symlink_to(outside)
-        except OSError as exc:
-            if getattr(exc, "winerror", None) != 1314 or os.environ.get("HMB_REQUIRE_SOUND_SYMLINK") == "1":
-                raise
-            self.skipTest("Windows symlink privilege unavailable")
-        with self.assertRaises(helper.SoundError): helper._source_path(self.audio, "linked.wav")
 
     def test_size_and_exact_bytes_are_verified_at_execution(self):
         with mock.patch.object(helper, "MAX_SOURCE_BYTES", 16), self.assertRaises(helper.SoundError): helper.media_signature(self.path)
@@ -615,7 +621,7 @@ if __name__ == "__main__":
     logging.disable(logging.CRITICAL)
     # Do not run the base helper test methods twice through fixture inheritance.
     suite=unittest.TestSuite()
-    for cls in (SoundLibraryRegression,SoundNodeRegression):
+    for cls in (SoundLinkRegression,SoundLibraryRegression,SoundNodeRegression):
         for name in cls.__dict__:
             if name.startswith("test_"):suite.addTest(cls(name))
     result=unittest.TextTestRunner(verbosity=2).run(suite)
