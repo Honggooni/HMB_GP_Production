@@ -859,6 +859,7 @@ assert target.MODEL_RESOLUTIONS[SEEDANCE_2_5_MODEL_ID] == (
     "480p",
     "720p",
     "1080p",
+    "4k",
 )
 assert target.MODEL_DEFAULT_RESOLUTIONS[SEEDANCE_2_5_MODEL_ID] == "480p"
 assert target.DURATION_STORAGE_CHOICES == (-1, *range(4, 31))
@@ -994,7 +995,8 @@ try:
             SEEDANCE_2_5_MODEL_ID
         )
         assert saved_model_state["model_id"] == target.MODEL_NAME_SEEDANCE_2_5
-        assert saved_model_state["resolution"] == "480p"
+        # The saved non-default 4K choice is now valid on both models.
+        assert saved_model_state["resolution"] == "4k"
         assert saved_model_state["duration"] == 30
         assert saved_parameters["duration"].ui_options["simple_dropdown"] == (
             duration_2_5_choices

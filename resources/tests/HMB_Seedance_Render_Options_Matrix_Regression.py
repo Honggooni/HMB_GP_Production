@@ -356,7 +356,16 @@ class RenderOptionMatrix(unittest.TestCase):
                        and task in (t.TASK_FIRST_LAST_FRAME, t.TASK_VIDEO_EDITING, t.TASK_VIDEO_EXTENSION)
                        and ratio != "adaptive"))
             with self.subTest(model=model, task=task, resolution=resolution, ratio=ratio):
-                if allowed:
+                if allowed and model == t.SEEDANCE_2_5_MODEL_ID and resolution == "4k":
+                    node = base.Node(values)
+                    node._validate_parameters(deepcopy(values))
+                    node._prepare_media_reference = lambda kind, value: value
+                    payload = node._build_broker_payload(deepcopy(values))
+                    opener = route.RouteOpener()
+                    with self.assertRaisesRegex(t._BrokerProtocolError, "4K"):
+                        route.bridge_for(opener).generate_seedance(payload, timeout=1)
+                    self.assertFalse(opener.posts)
+                elif allowed:
                     wire, provider = prepared_wire(values)
                     self.assertEqual(provider["resolution"], resolution)
                     self.assertEqual(provider["ratio"], ratio)

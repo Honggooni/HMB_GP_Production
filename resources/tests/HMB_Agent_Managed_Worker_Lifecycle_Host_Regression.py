@@ -371,10 +371,12 @@ async def exercise(engine, _phase, out):
                     changes = (
                         {"reference_images": ["file:///synthetic-new-image.png"]},
                         {"video_references": ["file:///synthetic-new-video.mov"]},
-                        {"resolution": "480p"},
+                        {"resolution": "720p"},
                         {"video_reference_slots": [{"video": "first"}, {"video": "second"}]},
                         {"duration": 9, "reference_audio": ["file:///synthetic-new-audio.wav"]},
                     )
+                    if row["number"] == 3:
+                        assert node._get_parameters()["resolution"] == "480p"
                     node._hmb_test_input_changes.update(changes[row["number"]-1])
                 elif kind == "removed_shot":
                     owner._hmb_shot_catalog_snapshot["shots"] = [item for item in owner._hmb_shot_catalog_snapshot["shots"]

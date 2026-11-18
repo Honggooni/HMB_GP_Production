@@ -61,7 +61,7 @@ cases = [
     ({generator.TASK_PARAMETER: generator.TASK_VIDEO_EXTENSION, "duration": -1}, (5, "explicit", "16:9", "1080p")),
     ({"model_id": generator.MODEL_NAME_SEEDANCE_2_0, "duration": -1}, (None, "provider_smart", "16:9", "1080p")),
     ({"model_id": generator.MODEL_NAME_SEEDANCE_2_0_FAST, "resolution": "1080p"}, (8, "explicit", "16:9", "720p")),
-    ({"duration": True, "ratio": "invalid", "resolution": "invalid"}, (5, "explicit", "adaptive", "720p")),
+    ({"duration": True, "ratio": "invalid", "resolution": "invalid"}, (5, "explicit", "adaptive", "480p")),
 ]
 for overrides, expected in cases:
     node = make_generator(**overrides)

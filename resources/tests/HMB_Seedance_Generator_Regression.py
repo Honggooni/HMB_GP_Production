@@ -460,6 +460,7 @@ def assert_constructor_and_public_contract() -> None:
         "480p",
         "720p",
         "1080p",
+        "4k",
     )
     assert target.MODEL_DEFAULT_RESOLUTIONS == {
         target.SEEDANCE_2_0_MODEL_ID: "1080p",
@@ -735,6 +736,7 @@ def assert_constructor_and_public_contract() -> None:
         "480p",
         "720p",
         "1080p",
+        "4k",
     ]
     assert node.get_parameter_by_name("duration").ui_options["simple_dropdown"] == [
         *range(4, 31),
@@ -749,6 +751,7 @@ def assert_constructor_and_public_contract() -> None:
         "480p",
         "720p",
         "1080p",
+        "4k",
     ]
     assert node.get_parameter_value("duration") == -1
     assert node.get_parameter_by_name("duration").ui_options["simple_dropdown"] == [
@@ -1202,6 +1205,8 @@ def assert_seedance_25_output_format_and_last_frame_ui_contract() -> None:
     bridge.queue_admission = mock.Mock(return_value=None)
     bridge._load_access_token = mock.Mock(side_effect=AssertionError("Wire-format fixture read credentials"))
 
+    advertised_resolutions = ["480p", "720p", "1080p"]
+
     def capture_request(method, path, *, payload, timeout, **kwargs):
         if method == "GET":
             assert path == target.BROKER_SEEDANCE_CAPABILITIES_PATH
@@ -1215,6 +1220,7 @@ def assert_seedance_25_output_format_and_last_frame_ui_contract() -> None:
                         "tasks": list(target.TASK_BROKER_SLUGS.values()),
                         "output_formats": ["mp4", "mov"],
                         "return_last_frame": True,
+                        "resolutions": list(advertised_resolutions),
                     }
                 },
             }
@@ -1257,6 +1263,24 @@ def assert_seedance_25_output_format_and_last_frame_ui_contract() -> None:
     assert posted[-1]["return_last_frame"] is True
     assert "task" not in posted[-1]
     assert posted[-1]["omni_reference_task_type"] == "reference"
+
+    request_4k = {"provider": "volcengine_ark", "model": target.SEEDANCE_2_5_MODEL_ID,
+                  "prompt": "4k reference", "quality": "4k", "output_format": "mov"}
+    count = len(posted)
+    try:
+        bridge.generate_seedance(request_4k, timeout=1)
+    except target._BrokerProtocolError as exc:
+        assert "4K" in str(exc)
+    else:
+        raise AssertionError("4K was accepted without an advertised capability")
+    assert len(posted) == count
+    advertised_resolutions.append("4k")
+    fresh_bridge = target._HMBAIBrokerBridge(opener=object())
+    fresh_bridge.queue_admission = bridge.queue_admission
+    fresh_bridge._load_access_token = bridge._load_access_token
+    fresh_bridge._request_json = capture_request
+    fresh_bridge.generate_seedance(request_4k, timeout=1)
+    assert len(posted) == count + 1 and posted[-1]["quality"] == "4k"
 
     # Ordinary 2.5 Reference-to-Video is also an explicit provider subtask;
     # MP4/no-last-frame must not fall back to the generic 2.0 multimodal wire.
@@ -2728,10 +2752,7 @@ def assert_payload_and_media_contract() -> None:
     assert standard_4k_payload["model"] == target.SEEDANCE_2_0_MODEL_ID
     assert standard_4k_payload["quality"] == "4k"
 
-    for restricted_model in (
-        target.SEEDANCE_2_0_FAST_MODEL_ID,
-        target.SEEDANCE_2_5_MODEL_ID,
-    ):
+    for restricted_model in (target.SEEDANCE_2_0_FAST_MODEL_ID,):
         params = node._get_parameters()
         params.update(
             {
@@ -2838,6 +2859,7 @@ def assert_seedance_25_model_contract() -> None:
         "480p",
         "720p",
         "1080p",
+        "4k",
     ]
     assert node.get_parameter_by_name("duration").ui_options["simple_dropdown"] == [
         *range(4, 31),
@@ -2912,14 +2934,16 @@ def assert_seedance_25_model_contract() -> None:
     assert low_definition_payload["resolution"] == "480p"
     assert "draft" not in low_definition_payload
 
-    unsupported_resolution = dict(params)
-    unsupported_resolution["resolution"] = "4k"
+    local_4k = dict(params, resolution="4k")
+    node._validate_parameters(local_4k)
+    assert node._build_broker_payload(local_4k)["resolution"] == "4k"
+    unsupported_resolution = dict(params, resolution="8k")
     try:
         node._validate_parameters(unsupported_resolution)
     except ValueError as exc:
-        assert "does not support 4k" in str(exc)
+        assert "does not support 8k" in str(exc)
     else:
-        raise AssertionError("Seedance 2.5 accepted 4k")
+        raise AssertionError("Seedance 2.5 accepted 8k")
 
     editing = dict(params)
     editing.update(

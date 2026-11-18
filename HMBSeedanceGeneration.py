@@ -133,7 +133,7 @@ import _hmb_broker_config as _broker_config
 import _hmb_my_box_node as _my_box_node
 import _hmb_reference_leases as _reference_leases
 from _hmb_image_limits import inspect_seedance_image_payload
-from _hmb_project import project_display_name, resolve_project
+from _hmb_project import project_display_name, resolve_routing_project as resolve_project
 from _hmb_build_diagnostics import get_build_diagnostics as _get_build_diagnostics
 from _hmb_common import (
     _broker_load_bearer_token_readonly,
@@ -467,7 +467,7 @@ MODEL_RESOLUTIONS = {
     SEEDANCE_2_0_MODEL_ID: ("4k", "1080p", "720p", "480p"),
     SEEDANCE_2_0_FAST_MODEL_ID: ("720p", "480p"),
     # Ordinary 480p is independent from the explicit, separately billed Draft flow.
-    SEEDANCE_2_5_MODEL_ID: ("480p", "720p", "1080p"),
+    SEEDANCE_2_5_MODEL_ID: ("480p", "720p", "1080p", "4k"),
 }
 
 MODEL_DEFAULT_RESOLUTIONS = {
@@ -3288,6 +3288,7 @@ class _HMBAIBrokerBridge:
         task: str,
         output_format: str,
         return_last_frame: bool,
+        resolution: str = "",
     ) -> bool:
         return bool(
             task
@@ -3297,6 +3298,7 @@ class _HMBAIBrokerBridge:
                 TASK_VIDEO_EXTENSION,
             }
             or output_format == "mov"
+            or resolution == "4k"
             or return_last_frame
         )
 
@@ -3400,6 +3402,7 @@ class _HMBAIBrokerBridge:
         allow_output_fallback: bool = False,
         refresh: bool = False,
         draft: bool = False,
+        resolution: str = "",
     ) -> str:
         """Prove advanced 2.5 support before upload or billable submission.
 
@@ -3420,6 +3423,7 @@ class _HMBAIBrokerBridge:
             task=authored_task,
             output_format=requested_format,
             return_last_frame=bool(return_last_frame),
+            resolution=resolution,
         ) and not (refresh and model == SEEDANCE_2_5_MODEL_ID and self._seedance_capabilities is not None):
             return requested_format
         if model != SEEDANCE_2_5_MODEL_ID:
@@ -3487,12 +3491,15 @@ class _HMBAIBrokerBridge:
                     str(value).strip().lower() for value in formats
                 ),
                 "return_last_frame": profile["return_last_frame"],
+                "supports_4k": isinstance(profile.get("resolutions"), list) and "4k" in profile["resolutions"],
             }
             if draft:
                 self._seedance_draft_task_capabilities = capability
             else:
                 self._seedance_capabilities = capability
 
+        if resolution == "4k" and not capability.get("supports_4k"):
+            raise _BrokerProtocolError("현재 브로커에서 Seedance 2.5 일반 생성의 4K 지원을 확인할 수 없습니다. 렌더를 제출하지 않았습니다.")
         task_slug = TASK_BROKER_SLUGS[authored_task]
         if task_slug not in capability["tasks"]:
             raise _BrokerProtocolError(
@@ -3679,6 +3686,7 @@ class _HMBAIBrokerBridge:
                 task=task,
                 output_format=requested_format,
                 return_last_frame=requested_last_frame,
+                resolution=request_payload.get("quality") or request_payload.get("resolution"),
             )
             if advanced_v2 or self._seedance_capabilities is not None:
                 self.require_seedance_features(
@@ -3686,6 +3694,7 @@ class _HMBAIBrokerBridge:
                     task=task,
                     output_format=requested_format,
                     return_last_frame=requested_last_frame,
+                    resolution=request_payload.get("quality") or request_payload.get("resolution"),
                     timeout=min(float(timeout), 30.0),
                     refresh=True,
                     draft=bool(draft),
@@ -4392,7 +4401,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "authoritative; a different manual selection is rejected."
                 ),
                 allowed_modes={ParameterMode.PROPERTY},
-                traits={Options(choices=list(ONLY_PROJECT_CHOICES))},
+                # The dropdown lists submission destinations. It must not coerce
+                # a saved label to its first choice when an old Scene is opened.
                 ui_options={"display_name": "Project (Only)", "simple_dropdown": list(ONLY_PROJECT_CHOICES)},
             )
         )
@@ -4639,7 +4649,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 default_value=MODEL_DEFAULT_RESOLUTIONS[SEEDANCE_2_5_MODEL_ID],
                 tooltip=(
                     "Seedance 2.0 defaults to 1080p. Fast defaults to 720p. "
-                    "Seedance 2.5 starts with a 480p Draft in MOV."
+                    "Seedance 2.5 starts with a 480p Draft in MOV. "
+                    "Seedance 2.5 일반 생성 4K · 10-bit HEVC. Volcengine 공식 단가(100만 토큰당) "
+                    "입력 영상 없음 31 CNY, 입력 영상 포함 19 CNY. "
+                    "16:9 5초, 입력 영상 없음 기준 약 30.13 CNY."
                 ),
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
                 traits={Options(choices=list(MODEL_RESOLUTIONS[SEEDANCE_2_5_MODEL_ID]))},
@@ -7895,10 +7908,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             _broker_config.save_broker_base_url(selected)
             self._on_shared_broker_address_changed(selected)
             return
-        if param_name == ONLY_PROJECT_PARAMETER and isinstance(value, str) and value not in ONLY_PROJECT_CHOICES:
-            label = project_display_name(value)
-            if label in ONLY_PROJECT_CHOICES:
-                value = label
         if param_name == SEEDANCE_RECOVERY_PARAMETER:
             value = _seedance_recovery_value(value)
             if not value["journal_id"]:
@@ -13048,7 +13057,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # the legacy 720-pixel dimensions here produced contradictory requests
         # such as ``quality=1080p`` beside ``resolution=1280x720``.  Aspect
         # ratio is transported independently, so 2.5 must publish the exact
-        # validated 720p/1080p choice for every orientation.  Preserve the
+        # validated resolution choice for every orientation. Preserve the
         # established pixel-shaped Broker compatibility field for 2.0.
         broker_resolution = (
             params["resolution"]
@@ -15302,6 +15311,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     params.get("output_format") or DEFAULT_OUTPUT_FORMAT
                 ),
                 return_last_frame=bool(params.get("return_last_frame")),
+                resolution=params.get("resolution"),
             )
         )
         if not resume_generation_id:
@@ -15388,6 +15398,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 allow_output_fallback=draft_action == DRAFT_ACTION_OFF,
                 refresh=True,
                 draft=draft_action != DRAFT_ACTION_OFF,
+                resolution=params.get("resolution"),
             )
             if not self._runtime_node_is_live(require_registered=True):
                 return

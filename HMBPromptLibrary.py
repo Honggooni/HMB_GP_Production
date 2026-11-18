@@ -11884,7 +11884,7 @@ class HMBPromptLibrary(DataNode):
             if not image_exact or _prompt_document_key(state.get("shot")) != _prompt_document_key(selected):
                 raise RuntimeError("Requested Prompt Shot has no exact ImageAsset publisher.")
             asset = state.get("image_asset", {})
-            from _hmb_project import resolve_project
+            from _hmb_project import resolve_routing_project as resolve_project
             source_nodes = getattr(self, "_hmb_connected_source_nodes", {})
             asset_owner = source_nodes.get(SHOT_ASSET_INPUT_PARAMETER_NAME) or source_nodes.get(IMAGE_ASSET_INPUT_PARAMETER_NAME)
             identity_getter = getattr(asset_owner, "_hmb_project_identity", None)

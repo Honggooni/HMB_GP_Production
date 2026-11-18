@@ -23,7 +23,7 @@ import weakref
 
 import _hmb_review as _review
 from _hmb_broker_config import join_broker_url, normalize_broker_base_url
-from _hmb_project import resolve_project
+from _hmb_project import resolve_routing_project as resolve_project
 
 logger = logging.getLogger(__name__)
 PROTOCOL = "hmb-web-rerender-v1"

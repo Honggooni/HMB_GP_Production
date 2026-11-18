@@ -96,6 +96,25 @@ def _resolve_candidates(candidates: list[str], default_legacy: bool) -> dict[str
 
 
 def resolve_project(value: Any = None, *, default_legacy: bool = True) -> dict[str, str]:
+    """Compatibility entry point embedded in previously exported Scene builders."""
+    try:
+        return resolve_routing_project(value, default_legacy=default_legacy)
+    except ValueError:
+        if default_legacy or not (value is None or isinstance(value, str)):
+            raise
+        try:
+            from griptape_nodes.retained_mode.managers.workflow.loading import is_loading_workflow
+        except ImportError:
+            is_loading_workflow = lambda: False
+        if not is_loading_workflow():
+            raise
+        # Old exporters ask for a routing record just to populate ImageAsset.
+        # Preserve the original label; an unresolved label confers no folder
+        # or render destination. The Generator keeps its verbatim Only value.
+        return {"project_id": "", "project_name": value or "", "project_folder": ""}
+
+
+def resolve_routing_project(value: Any = None, *, default_legacy: bool = True) -> dict[str, str]:
     """Resolve a canonical ID, approved display name, or explicit record."""
     if value is None or value == "":
         return _resolve_candidates([], default_legacy)

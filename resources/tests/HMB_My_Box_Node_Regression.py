@@ -259,6 +259,7 @@ class MyBoxNodeTests(unittest.TestCase):
             self.node.set_parameter_value('only_project',selected,initial_setup=True)
             self.assertFalse(controller_module.is_selected(self.node),selected)
         self.node.set_parameter_value("only_project", " My Box ", initial_setup=True)
+        self.assertEqual(self.node.get_parameter_value("only_project"), " My Box ")
         self.assertTrue(controller_module.is_selected(self.node))
         self.assertFalse(self.backend.calls)
     def test_preflight_has_no_auth_workspace_upload_or_post(self):

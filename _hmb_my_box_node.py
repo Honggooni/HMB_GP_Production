@@ -45,7 +45,8 @@ def _host(node: Any) -> Any:
 def is_selected(node: Any) -> bool:
     """Pure selection predicate: an unavailable Shot is never an Only fallback."""
     try:
-        return bool(node.get_parameter_value("only_project") == protocol.MY_BOX_LABEL
+        project = node.get_parameter_value("only_project")
+        return bool(isinstance(project, str) and project.strip() == protocol.MY_BOX_LABEL
                     and node._hmb_seedance_execution_mode() == "only")
     except (AttributeError, KeyError, TypeError, ValueError):
         return False  # Partial native construction is never private authority.

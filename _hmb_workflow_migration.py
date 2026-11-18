@@ -517,7 +517,7 @@ def _validate_source_identity(engine: Any, flow: Any, groups: dict[str, list[Any
         _require(_digest(document) == catalog.get("metadata_sha256"), "ImageAsset catalog fingerprint changed")
         _require(catalog["channel_uuid"] not in catalogs, "Several ImageAsset publishers claim the same channel")
         catalogs[catalog["channel_uuid"]] = (node, catalog, node._hmb_project_identity())
-    from _hmb_project import resolve_project
+    from _hmb_project import resolve_routing_project as resolve_project
     for kind, nodes in groups.items():
         for node in nodes:
             subscription = _subscription(node, exports[node.name])

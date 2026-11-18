@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from _hmb_broker_config import normalize_broker_base_url
-from _hmb_project import resolve_project
+from _hmb_project import resolve_routing_project as resolve_project
 
 SCHEMA = "hmb-generation-casecard"
 VERSION = 1

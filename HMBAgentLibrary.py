@@ -40,7 +40,7 @@ def _load_hmb_common():
 
 
 _hmb = _load_hmb_common()
-from _hmb_project import ProjectPolicyPendingError, project_from_asset_payload, resolve_project
+from _hmb_project import ProjectPolicyPendingError, project_from_asset_payload, resolve_routing_project as resolve_project
 DataNode = _hmb.DataNode
 Parameter = _hmb.Parameter
 ParameterMode = _hmb.ParameterMode

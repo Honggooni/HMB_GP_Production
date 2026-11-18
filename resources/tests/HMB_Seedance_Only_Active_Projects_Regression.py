@@ -52,15 +52,14 @@ class OnlyActiveProjects(unittest.TestCase):
         self.assertEqual(parameter.ui_options["simple_dropdown"], EXPECTED_CHOICES)
         find_traits = getattr(parameter, "find_elements_by_type", None)
         traits = find_traits(t.Options) if callable(find_traits) else list(parameter.traits)
-        self.assertEqual(len(traits), 1)
-        self.assertEqual(list(traits[0].choices), EXPECTED_CHOICES)
+        self.assertFalse(traits, "Stored labels must survive reopening verbatim")
         self.assertEqual(node.get_parameter_value(t.ONLY_PROJECT_PARAMETER), t.ONLY_PROJECT_UNSELECTED)
         self.assertEqual(EXPECTED_CHOICES, ["Select Project", "superwings12", "Katuri8", "My Box"])
         self.assertEqual(EXPECTED_CHOICES.count(MY_BOX_LABEL), 1)
         self.assertNotIn(MY_BOX_LABEL, PROJECTS)
         self.assertFalse(any(row["project_name"] == MY_BOX_LABEL for row in PROJECTS.values()))
         node.set_parameter_value(t.ONLY_PROJECT_PARAMETER, "까투리8", initial_setup=True)
-        self.assertEqual(node.get_parameter_value(t.ONLY_PROJECT_PARAMETER), "Katuri8")
+        self.assertEqual(node.get_parameter_value(t.ONLY_PROJECT_PARAMETER), "까투리8")
         self.assertEqual(node._selected_only_project()["project_name"], PROJECTS["katuri8"]["project_name"])
 
     def test_saved_active_ids_names_and_supported_aliases_resolve_without_network(self):
