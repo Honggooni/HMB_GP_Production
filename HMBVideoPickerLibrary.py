@@ -16732,6 +16732,16 @@ class HMBVideoPickerLibrary(DataNode):
                 self._hmb_output_owner_loop = loop
                 self._schedule_video_removal_output_sync()
                 return ""
+            owner_loop = getattr(self, "_hmb_output_owner_loop", None)
+            if owner_loop is not None and owner_loop.is_running() and propagate_connections is None:
+                # Maya completion can hold the catalog lock here. Notify connected
+                # nodes on the owner loop after the worker releases that lock.
+                try:
+                    owner_loop.call_soon_threadsafe(self._schedule_video_removal_output_sync)
+                except RuntimeError:
+                    if not owner_loop.is_closed():
+                        raise
+                return ""
         # Serialize sibling output staging/notification. Lifecycle invalidation
         # never waits for this lock; generation checks make deletion win.
         with self._hmb_state_write_lock:

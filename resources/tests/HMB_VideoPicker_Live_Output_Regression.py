@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import importlib.util
 import json
@@ -57,6 +58,20 @@ class PublishProbe:
 # The common helper must both update the node's output cache and notify the
 # connected Griptape parameter. A plain set_output() is insufficient for a
 # live Picker -> Prompt edge.
+async def verify_worker_defers_to_owner():
+    node = PublishProbe()
+    loop = asyncio.get_running_loop()
+    node._hmb_output_owner_loop = loop
+    notified = loop.create_future()
+    node._schedule_video_removal_output_sync = lambda: notified.set_result(threading.get_ident())
+    await asyncio.to_thread(picker.HMBVideoPickerLibrary._sync_outputs_from_state, node, {})
+    assert await asyncio.wait_for(notified, 2) == threading.get_ident()
+    assert node.published == []
+
+
+asyncio.run(verify_worker_defers_to_owner())
+
+
 probe = PublishProbe()
 picker._publish_parameter_update(probe, "PICKER_OUT", "live-payload")
 assert probe.parameter_output_values["PICKER_OUT"] == "live-payload"

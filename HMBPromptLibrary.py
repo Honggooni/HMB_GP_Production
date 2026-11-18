@@ -10840,10 +10840,14 @@ class HMBPromptLibrary(DataNode):
         with self._hmb_sync_lock:
             state = _normalize_state(self._current_state())
             if channel_uuid or shot_uuid:
+                if self._hmb_node_deleted or self._hmb_manual_rebind_pending():
+                    raise RuntimeError("The requested Prompt Shot is no longer bound.")
                 selected = next((row for row in _verified_prompt_shot_catalog(state)
                     if row["channel_uuid"] == channel_uuid and row["shot_uuid"] == shot_uuid), None)
                 if selected is None:
                     raise _hmb_sound.SoundError("SOUND_SHOT_MISMATCH", "현재 Prompt에 존재하는 샷의 사운드를 요청하세요.")
+                if not state.get("multi_shot_enabled") and _prompt_document_key(state.get("shot")) != _prompt_document_key(selected):
+                    raise RuntimeError("Legacy Prompt owns a different Shot.")
                 state = _select_prompt_shot_document(state, selected)
             return copy.deepcopy(self._sound_snapshot_for_state(state))
 

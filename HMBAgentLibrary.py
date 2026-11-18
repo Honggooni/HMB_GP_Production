@@ -2415,11 +2415,7 @@ class HMBAgentLibrary(_BaseAgent):
         """Read sound only through the exact retained Prompt owner, never UI JSON."""
         if self._hmb_shot_manager_enabled():
             owner = self._hmb_manager_prompt_owner(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
-            document = owner._hmb_prompt_shot_document(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
-            supplied = document.get("subscription") if isinstance(document, dict) else None
-            if not isinstance(supplied, dict) or supplied.get("channel_uuid") != channel_uuid or supplied.get("shot_uuid") != shot_uuid:
-                raise RuntimeError("Prompt sound document belongs to another Shot.")
-            return copy.deepcopy(document.get("audio_sources") or {})
+            return owner._hmb_sound_snapshot_for(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
         if not _is_direct_hmb_prompt_library_connection(self):
             return {}
         source = getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)

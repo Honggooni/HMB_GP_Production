@@ -110,6 +110,45 @@ class LocalPreflightTests(unittest.TestCase):
         value._prepare_managed_agent_shot.assert_awaited_once()
         value._process_generation.assert_awaited_once()
 
+    def test_preparing_media_waits_before_agent_and_submission(self):
+        for flag in ('hmb_picker_media_preparing', 'hmb_image_asset_selection_preparing'):
+            with self.subTest(flag=flag):
+                value = node()
+                pending = ValueError('pending media')
+                setattr(pending, flag, True)
+                value._validate_parameters.side_effect = [pending, None]
+                value._capture_imageasset_project_selection = mock.Mock(return_value={'owner': 'A'})
+                value._assert_imageasset_project_selection = mock.Mock()
+                with mock.patch.object(type(value), 'is_cancellation_requested', False, create=True):
+                    asyncio.run(value._aprocess_impl())
+                value._assert_imageasset_project_selection.assert_called_once_with({'owner': 'A'})
+                value._prepare_managed_agent_shot.assert_awaited_once()
+                value._process_generation.assert_awaited_once()
+
+    def test_changed_binding_while_preparing_cannot_submit(self):
+        value = node()
+        pending = ValueError('pending media')
+        pending.hmb_picker_media_preparing = True
+        value._validate_parameters.side_effect = pending
+        value._capture_imageasset_project_selection = lambda: {'owner': 'A'}
+        value._assert_imageasset_project_selection = mock.Mock(side_effect=ValueError('binding changed'))
+        with mock.patch.object(type(value), 'is_cancellation_requested', False, create=True):
+            asyncio.run(value._aprocess_impl())
+        value._prepare_managed_agent_shot.assert_not_awaited()
+        value._process_generation.assert_not_awaited()
+
+    def test_sound_ticket_scope_preserves_order_and_ignores_other_shot(self):
+        scope = dict(channel_uuid='channel', shot_uuid='A')
+        rows = [{**scope, 'instance_id': i, 'gain_db': 0} for i in (1, 2)]
+        before = dict(project_uid='project', tracks=rows, revision=1)
+        view = t.HMBSeedanceGeneration._shot_sound_controls
+        expected = view(before, scope)
+        self.assertEqual(expected, view(dict(before, tracks=[*rows, {**rows[0], 'shot_uuid': 'B'}], revision=2), scope))
+        for changed in (dict(before, tracks=list(reversed(rows))), dict(before, tracks=rows[:1]),
+                        dict(before, tracks=[dict(rows[0], gain_db=-3), rows[1]]),
+                        dict(before, project_uid='other'), dict(before, preparing=True)):
+            self.assertNotEqual(expected, view(changed, scope))
+
     def test_existing_video_and_task_are_preserved_when_a_new_render_is_skipped(self):
         value = node(ValueError('Current binding unavailable'), existing=True)
         before = dict(value.parameter_output_values)

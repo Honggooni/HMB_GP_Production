@@ -10432,9 +10432,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                                 or not result.get("run_id") or trusted.get("result", {}).get("run_id") != result["run_id"]):
                             raise RuntimeError("The immutable Agent Sound result ticket is unavailable. No request was submitted.")
                         recorded = normalize_sound_snapshot(trusted.get("audio_sources") or {})
-                        if recorded != effective:
+                        if self._shot_sound_controls(recorded, subscription) != self._shot_sound_controls(effective, subscription):
                             raise RuntimeError("The Prompt sound controls changed after Agent execution. Run this Shot again; no request was submitted.")
-                        effective = recorded
                     if effective:
                         if base_snapshot:
                             self._validate_prompt_sound_originals(effective, base_snapshot, subscription)
@@ -10448,6 +10447,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             provenance.update(channel_uuid=subscription["channel_uuid"], shot_uuid=subscription["shot_uuid"],
                 project_id=normalized["project_id"], reference_semantics="model_reference_only", audio_observation="not_performed")
         return normalized, tracks, provenance
+
+    @staticmethod
+    def _shot_sound_controls(snapshot: Mapping[str, Any], subscription: Mapping[str, Any]) -> dict:
+        """Compare the ordered controls captured for this render, independent of other Shots' edits."""
+        if not snapshot:
+            return {}
+        return {
+            **{key: value for key, value in snapshot.items() if key not in {"tracks", "revision"}},
+            "tracks": [row for row in snapshot["tracks"]
+                       if row["channel_uuid"] == subscription["channel_uuid"] and row["shot_uuid"] == subscription["shot_uuid"]],
+        }
 
     @staticmethod
     def _validate_prompt_sound_originals(effective: Mapping[str, Any], base: Mapping[str, Any], subscription: Mapping[str, Any]) -> None:
@@ -11875,6 +11885,32 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if not params.get("resume_generation_id"):
             self._validate_broker_model(params.get("model_id"))
         return params
+
+    async def _await_local_render_preflight(self) -> None:
+        """Allow the existing media worker to finish before starting the Agent."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 30.0
+        delay = 0.05
+        selection = None
+        while True:
+            if selection is not None:
+                if self.is_cancellation_requested or not self._runtime_node_is_live(require_registered=True):
+                    raise asyncio.CancelledError()
+                self._assert_imageasset_project_selection(selection)
+            try:
+                self._validate_local_render_preflight()
+                return
+            except ValueError as exc:
+                if not (getattr(exc, "hmb_picker_media_preparing", False)
+                        or getattr(exc, "hmb_image_asset_selection_preparing", False)):
+                    raise
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise
+                if selection is None:
+                    selection = self._capture_imageasset_project_selection()
+            await asyncio.sleep(min(remaining, delay))
+            delay = min(0.5, delay * 2)
 
     def _record_local_render_preflight(self) -> None:
         # SDK validation exceptions reject the entire Flow, including unrelated
@@ -16204,7 +16240,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._hmb_managed_agent_request = None
         try:
             try:
-                self._validate_local_render_preflight()
+                await self._await_local_render_preflight()
             except Exception as exc:
                 self._hmb_local_preflight_failure = self._safe_exception_message(exc)
                 self._publish_agent_result_skipped(
