@@ -168,7 +168,9 @@ def isolated_bridge_methods():
     assert len(selected) == len(names)
     bridge = ast.ClassDef(name="ActualAuthBridge", bases=[], keywords=[], body=selected, decorator_list=[])
     helpers = [deepcopy(node) for node in tree.body if
-        isinstance(node, ast.FunctionDef) and node.name in {"_broker_read_json", "_broker_require_exact_response_url"}
+        isinstance(node, ast.FunctionDef) and node.name in {"_broker_read_json", "_broker_require_exact_response_url", "_volc_failure_reason"}
+        or isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and
+            target.id in {"_VOLC_REASON", "_VOLC_PARAMS", "_VOLC_SUFFIX"} for target in node.targets)
         or isinstance(node, ast.ClassDef) and node.name in {"_BrokerError", "_BrokerUnavailableError", "_BrokerAuthenticationError", "_BrokerProtocolError"}]
     namespace = dict(hashlib=hashlib, threading=threading, contextmanager=contextmanager, suppress=suppress,
         json=json, re=re, urllib=urllib, _reference_leases=leases, _broker_config=broker_config,
