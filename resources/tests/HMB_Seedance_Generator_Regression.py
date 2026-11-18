@@ -464,7 +464,7 @@ def assert_constructor_and_public_contract() -> None:
     assert target.MODEL_DEFAULT_RESOLUTIONS == {
         target.SEEDANCE_2_0_MODEL_ID: "1080p",
         target.SEEDANCE_2_0_FAST_MODEL_ID: "720p",
-        target.SEEDANCE_2_5_MODEL_ID: "720p",
+        target.SEEDANCE_2_5_MODEL_ID: "480p",
     }
     assert target.MODEL_DURATION_CHOICES == {
         target.SEEDANCE_2_0_MODEL_ID: (-1, *range(4, 16)),
@@ -615,7 +615,7 @@ def assert_constructor_and_public_contract() -> None:
     # A newly created node follows the user-facing Seedance 2.5 preset.
     # Explicit 2.0/2.0 Fast selection below must retain the legacy contract.
     assert node.get_parameter_value("model_id") == target.MODEL_NAME_SEEDANCE_2_5
-    assert node.get_parameter_value("resolution") == "720p"
+    assert node.get_parameter_value("resolution") == "480p"
     assert node.get_parameter_value("ratio") == "16:9"
     assert node.get_parameter_value("duration") == 4
     assert node.get_parameter_value("generate_audio") is False
@@ -631,8 +631,8 @@ def assert_constructor_and_public_contract() -> None:
     )
     fresh_payload = node._build_broker_payload(fresh_params)
     assert fresh_payload["model"] == target.SEEDANCE_2_5_MODEL_ID
-    assert fresh_payload["quality"] == "720p"
-    assert fresh_payload["resolution"] == "720p"
+    assert fresh_payload["quality"] == "480p"
+    assert fresh_payload["resolution"] == "480p"
     assert fresh_payload["aspect_ratio"] == "16:9"
     assert fresh_payload["duration_seconds"] == 4
     assert fresh_payload["generate_audio"] is False
@@ -730,7 +730,7 @@ def assert_constructor_and_public_contract() -> None:
     assert input_mode_parameter.hide is True
     assert input_mode_parameter.hide_property is True
     assert input_mode_parameter.ui_options["display_name"] == ""
-    assert node.get_parameter_value("resolution") == "720p"
+    assert node.get_parameter_value("resolution") == "480p"
     assert node.get_parameter_by_name("resolution").ui_options["simple_dropdown"] == [
         "480p",
         "720p",
@@ -744,7 +744,7 @@ def assert_constructor_and_public_contract() -> None:
     )
     node.set_parameter_value("task", target.TASK_VIDEO_EDITING)
     assert node.get_parameter_value("task") == target.TASK_VIDEO_EDITING
-    assert node.get_parameter_value("resolution") == "720p"
+    assert node.get_parameter_value("resolution") == "480p"
     assert node.get_parameter_by_name("resolution").ui_options["simple_dropdown"] == [
         "480p",
         "720p",
@@ -988,6 +988,7 @@ def assert_draft_hides_inapplicable_output_controls_without_losing_authorship() 
     """Draft's fixed outputs must not look like editable ordinary-render fields."""
 
     node = target.HMBSeedanceGeneration(name="Draft Output Controls Regression")
+    node.set_parameter_value("draft_action", target.DRAFT_ACTION_OFF)
     node.set_parameter_value("resolution", "480p")
     node.set_parameter_value("output_format", "mp4")
     node.set_parameter_value("return_last_frame", True)
@@ -1033,6 +1034,7 @@ def assert_seedance_25_output_format_and_last_frame_ui_contract() -> None:
     assert target.DEFAULT_OUTPUT_FORMAT == "mp4"
 
     node = target.HMBSeedanceGeneration(name="Seedance 2.5 Format UI Regression")
+    node.set_parameter_value("draft_action", target.DRAFT_ACTION_OFF)
     names = [parameter.name for parameter in node.parameters]
     for required in (
         "output_format",
@@ -2827,10 +2829,11 @@ def assert_payload_and_media_contract() -> None:
 
 def assert_seedance_25_model_contract() -> None:
     node = target.HMBSeedanceGeneration(name="Seedance 2.5 Contract Regression")
+    node.set_parameter_value("draft_action", target.DRAFT_ACTION_OFF)
     node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_5)
 
     assert node._get_parameters()["model_id"] == target.SEEDANCE_2_5_MODEL_ID
-    assert node.get_parameter_value("resolution") == "720p"
+    assert node.get_parameter_value("resolution") == "480p"
     assert node.get_parameter_by_name("resolution").ui_options["simple_dropdown"] == [
         "480p",
         "720p",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -67,7 +68,7 @@ def main() -> int:
         raise FileNotFoundError(reference)
     frame_limit = max(2, int(args.frames))
     ffmpeg = (args.ffmpeg or _static_tool("ffmpeg") or picker._find_ffmpeg()).resolve()
-    ffprobe = (args.ffprobe or _static_tool("ffprobe")).resolve()
+    ffprobe = Path(args.ffprobe or _static_tool("ffprobe") or shutil.which("ffprobe") or "ffprobe").resolve()
     if not ffmpeg.is_file() or not ffprobe.is_file():
         raise FileNotFoundError("Both FFmpeg and FFprobe are required for proxy validation.")
 
@@ -199,6 +200,10 @@ def main() -> int:
             "-frames:v",
             str(frame_count),
         ]
+        # Compare encoder output against its actual BT.709 limited 8-bit input.
+        # FFmpeg otherwise negotiates a different RGB matrix/depth for PNG.
+        reference_filter = encode_command[encode_command.index("-vf") + 1]
+        metric_inputs = f"[0:v]{reference_filter}[ref];[ref][1:v]"
         psnr_result = _run(
             [
                 str(ffmpeg),
@@ -206,7 +211,7 @@ def main() -> int:
                 "info",
                 *source_input,
                 "-lavfi",
-                "psnr",
+                metric_inputs + "psnr",
                 "-f",
                 "null",
                 "NUL" if sys.platform.startswith("win") else "/dev/null",
@@ -220,7 +225,7 @@ def main() -> int:
                 "info",
                 *source_input,
                 "-lavfi",
-                "ssim",
+                metric_inputs + "ssim",
                 "-f",
                 "null",
                 "NUL" if sys.platform.startswith("win") else "/dev/null",

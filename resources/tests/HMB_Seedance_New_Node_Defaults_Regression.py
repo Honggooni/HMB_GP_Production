@@ -67,8 +67,8 @@ with (
 
 assert node.get_parameter_value("model_id") == target.MODEL_NAME_SEEDANCE_2_5
 assert grouped_defaults == {
-    "resolution": "720p",
-    "draft_action": target.DRAFT_ACTION_OFF,
+    "resolution": "480p",
+    "draft_action": target.DRAFT_ACTION_PREVIEW,
     "ratio": "16:9",
     "duration": 4,
     "generate_audio": False,

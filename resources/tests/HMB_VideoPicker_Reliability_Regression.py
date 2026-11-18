@@ -2172,7 +2172,7 @@ assert "-r" not in ffmpeg_command
 assert ffmpeg_command[ffmpeg_command.index("-frames:v") + 1] == "100"
 assert ffmpeg_command[ffmpeg_command.index("-fps_mode") + 1] == "passthrough"
 assert ffmpeg_command[ffmpeg_command.index("-preset") + 1] == "slow"
-assert ffmpeg_command[ffmpeg_command.index("-crf") + 1] == "6"
+assert ffmpeg_command[ffmpeg_command.index("-crf") + 1] == "2"
 assert ffmpeg_command[ffmpeg_command.index("-profile:v") + 1] == "high"
 assert ffmpeg_command[ffmpeg_command.index("-level:v") + 1] == "4.2"
 assert ffmpeg_command[ffmpeg_command.index("-g") + 1] == "25"

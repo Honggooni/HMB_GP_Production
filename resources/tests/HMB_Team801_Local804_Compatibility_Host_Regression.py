@@ -24,7 +24,7 @@ import zipfile
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
-ARCHIVE = ROOT / ".test-cache/release-v801-local-v802-20261015/published/HMB_GP_Production_v0.8.01_Runtime.zip"
+ARCHIVE = Path(os.environ.get("HMB_LEGACY_TEAM801_ARCHIVE") or ROOT / ".test-cache/release-v801-local-v802-20261015/published/HMB_GP_Production_v0.8.01_Runtime.zip")
 ARCHIVE_SHA = "c48448f86090eabfbdab909c16b3f63a3e2c612246bcf1ae7994927e114f5b46"
 OUT = ROOT / "reports/release-readiness-local804-20261016/team-compatibility"
 KINDS = ("HMBImageAssetLibrary", "HMBVideoPickerLibrary", "HMBPromptLibrary",
@@ -360,9 +360,9 @@ def main():
             target = (OUT / "team-package" / member.filename).resolve()
             assert target.is_relative_to((OUT / "team-package").resolve())
             archive.extract(member, OUT / "team-package")
-    sdk = Path.home() / "AppData/Local/ai.griptape.nodes.desktop/current/resources/engine-bundle/python/python.exe"
-    wrapper = ROOT / "reports/release-v95-local-v96-20261015/even94-guarded-child.py"
-    offline = ROOT / ".test-cache/full-library-audit-v90-20261013/sdk-offline-child.py"
+    sdk = Path(os.environ.get("HMB_TEST_SDK_PYTHON") or Path.home() / "AppData/Local/ai.griptape.nodes.desktop/current/resources/engine-bundle/python/python.exe")
+    wrapper = Path(__file__).with_name("_hmb_legacy_log_wrapper.py")
+    offline = Path(__file__).with_name("_hmb_legacy_offline_guard.py")
     pinned_files = [*map(lambda kind: ROOT / f"{kind}.py", KINDS), ROOT / "_hmb_common.py",
         ROOT / "_hmb_library_bootstrap.py", ROOT / "_hmb_shot_routing.py", ROOT / "_hmb_workflow_migration.py",
         ROOT / "griptape-nodes-library.json", Path(__file__).resolve()]

@@ -860,7 +860,7 @@ assert target.MODEL_RESOLUTIONS[SEEDANCE_2_5_MODEL_ID] == (
     "720p",
     "1080p",
 )
-assert target.MODEL_DEFAULT_RESOLUTIONS[SEEDANCE_2_5_MODEL_ID] == "720p"
+assert target.MODEL_DEFAULT_RESOLUTIONS[SEEDANCE_2_5_MODEL_ID] == "480p"
 assert target.DURATION_STORAGE_CHOICES == (-1, *range(4, 31))
 assert SEEDANCE_2_5_MODEL_ID in target.BROKER_SUPPORTED_MODEL_IDS
 assert SEEDANCE_2_5_BYTEPLUS_ALIAS not in target.BROKER_SUPPORTED_MODEL_IDS
@@ -994,13 +994,13 @@ try:
             SEEDANCE_2_5_MODEL_ID
         )
         assert saved_model_state["model_id"] == target.MODEL_NAME_SEEDANCE_2_5
-        assert saved_model_state["resolution"] == "720p"
+        assert saved_model_state["resolution"] == "480p"
         assert saved_model_state["duration"] == 30
         assert saved_parameters["duration"].ui_options["simple_dropdown"] == (
             duration_2_5_choices
         )
 
-    # A newly selected/restored 2.5 model inherits 720p when no serialized
+    # A newly selected/restored 2.5 model inherits 480p when no serialized
     # resolution was supplied. An explicitly serialized 1080p selection must
     # still survive when it arrives before the model field.
     default_resolution_probe, default_resolution_state, _ = hydration_probe()
@@ -1010,7 +1010,7 @@ try:
         SEEDANCE_2_5_BYTEPLUS_ALIAS,
         initial_setup=True,
     )
-    assert default_resolution_state["resolution"] == "720p"
+    assert default_resolution_state["resolution"] == "480p"
 
     explicit_resolution_probe, explicit_resolution_state, _ = hydration_probe()
     explicit_resolution_state["resolution"] = "720p"
@@ -1153,7 +1153,7 @@ try:
     )
     switch_probe._hmb_model_switch_previous_id = target.SEEDANCE_2_0_MODEL_ID
     assert switch_probe._synchronize_model_resolution() == SEEDANCE_2_5_MODEL_ID
-    assert switch_state["resolution"] == "720p"
+    assert switch_state["resolution"] == "480p"
     assert switch_state["duration"] == 30
     switch_state["model_id"] = target.MODEL_NAME_SEEDANCE_2_0
     switch_probe._hmb_model_switch_previous_id = SEEDANCE_2_5_MODEL_ID
@@ -1546,8 +1546,8 @@ seedance_2_5_payload = validation_probe._build_broker_payload(
 assert seedance_2_5_payload["model"] == SEEDANCE_2_5_MODEL_ID
 assert seedance_2_5_payload["task"] == TASK_VIDEO_EDITING
 assert seedance_2_5_payload["duration_seconds"] == -1
-assert seedance_2_5_payload["quality"] == "720p"
-assert seedance_2_5_payload["resolution"] == "720p"
+assert seedance_2_5_payload["quality"] == "480p"
+assert seedance_2_5_payload["resolution"] == "480p"
 assert "priority" not in seedance_2_5_payload
 
 # Exercise the final client-side bridge boundary, not just its field map.  The

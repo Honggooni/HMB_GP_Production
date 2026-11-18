@@ -109,6 +109,7 @@ def run_registered(root: Path, rows: list[dict[str, Any]], language: str,
             # The machine-readable receipt contains only bounded status data.
             print(output, end="" if output.endswith("\n") else "\n", flush=True)
             status, reason = classify_result(row, completed.returncode, output)
+            results[index]["unittest_skipped"] = sum(int(n) for n in re.findall(r"(?m)^OK \(skipped=(\d+)\)\s*$", output))
             code = completed.returncode
         except (OSError, subprocess.TimeoutExpired) as error:
             status, reason, code = "failed", type(error).__name__, -1

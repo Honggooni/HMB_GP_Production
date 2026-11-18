@@ -9,7 +9,19 @@ permissions:
   contents: read
 
 jobs:
+  sound-link:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - working-directory: resources/tests
+        run: python -m unittest -v HMB_Sound_Library_Regression.SoundLibraryRegression.test_actual_symlink_escape_if_supported
+        env:
+          HMB_REQUIRE_SOUND_SYMLINK: "1"
   windows-release-audit:
+    needs: sound-link
     runs-on: windows-latest
     timeout-minutes: 30
     outputs:
@@ -138,6 +150,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "FFprobe is unavailable in the CI PATH." }
           $ffmpeg = (Get-Command ffmpeg -ErrorAction Stop).Source
           Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_COLOR_LUT_TEST_FFMPEG=$ffmpeg"
+      - name: Check 10-bit HEVC to Picker proxy quality
+        shell: pwsh
+        run: |
+          $ref = Join-Path $env:RUNNER_TEMP "reference10.mov"
+          ffmpeg -v error -f lavfi -i testsrc2=size=320x180:rate=24 -frames:v 8 -pix_fmt yuv420p10le -c:v libx265 -colorspace bt709 -color_primaries bt709 -color_trc bt709 -y $ref
+          if ($LASTEXITCODE) { throw "HEVC fixture generation failed" }
+          python resources/tests/HMB_VideoPicker_Proxy_Encoding_Regression.py $ref --ffmpeg (Get-Command ffmpeg).Source --ffprobe (Get-Command ffprobe).Source
       - name: Require complete regression registration
         shell: pwsh
         run: python tools/audit_regression_coverage.py --check

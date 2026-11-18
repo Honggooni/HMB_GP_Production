@@ -473,7 +473,7 @@ MODEL_RESOLUTIONS = {
 MODEL_DEFAULT_RESOLUTIONS = {
     SEEDANCE_2_0_MODEL_ID: "1080p",
     SEEDANCE_2_0_FAST_MODEL_ID: "720p",
-    SEEDANCE_2_5_MODEL_ID: "720p",
+    SEEDANCE_2_5_MODEL_ID: "480p",
 }
 
 MODEL_DURATION_CHOICES = {
@@ -4570,14 +4570,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 name="resolution",
                 default_value=MODEL_DEFAULT_RESOLUTIONS[SEEDANCE_2_5_MODEL_ID],
                 tooltip=(
-                    "Seedance 2.0 defaults to 1080p. Seedance 2.5 and Fast "
-                    "default to 720p; 2.5 also offers 480p and 1080p."
+                    "Seedance 2.0 defaults to 1080p. Fast defaults to 720p. "
+                    "Seedance 2.5 starts with a 480p Draft in MOV."
                 ),
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
                 traits={Options(choices=list(MODEL_RESOLUTIONS[SEEDANCE_2_5_MODEL_ID]))},
             )
             ParameterString(
-                name="draft_action", default_value=DRAFT_ACTION_OFF,
+                name="draft_action", default_value=DRAFT_ACTION_PREVIEW,
                 tooltip=("Seedance 2.5 Only or Shot at 480p. MOV is the default; an explicit MP4-only provider support list uses MP4. "
                          "After reviewing the Draft, use the dedicated Draft final button once to run only this Generator at 1080p. "
                          "Both stages are separate paid renders. No automatic final render is submitted."),

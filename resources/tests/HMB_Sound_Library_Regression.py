@@ -194,7 +194,10 @@ class SoundLibraryRegression(unittest.TestCase):
         outside = self.root / "outside.wav"; outside.write_bytes(self.path.read_bytes())
         linked = self.audio / "linked.wav"
         try: linked.symlink_to(outside)
-        except OSError: self.skipTest("Windows symlink privilege unavailable; reparse-component test still runs")
+        except OSError as exc:
+            if getattr(exc, "winerror", None) != 1314 or os.environ.get("HMB_REQUIRE_SOUND_SYMLINK") == "1":
+                raise
+            self.skipTest("Windows symlink privilege unavailable")
         with self.assertRaises(helper.SoundError): helper._source_path(self.audio, "linked.wav")
 
     def test_size_and_exact_bytes_are_verified_at_execution(self):
