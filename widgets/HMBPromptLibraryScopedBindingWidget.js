@@ -9312,6 +9312,7 @@ function hmbNativeUiImplementation(container, props) {
         const timeAt = pixel => Math.max(0, Math.min(span, Math.round((pixel - trackBox.left) / trackBox.width * span * 100) / 100));
         const anchor = timeAt(x);
         const bounds = button?.getBoundingClientRect();
+        const initialBar = button && {left:button.style.left, width:button.style.width, label:button.textContent};
         const edge = bounds ? Math.min(8, bounds.width / 4) : 0;
         const left = bounds && x - bounds.left <= edge;
         const right = bounds && bounds.right - x <= edge;
@@ -9371,7 +9372,11 @@ function hmbNativeUiImplementation(container, props) {
             const updated = clips.slice();
             updated[index] = nextClip;
             save(updated);
-          } else if (dragged && button) remount();
+          } else if (dragged && initialBar) {
+            button.style.left = initialBar.left;
+            button.style.width = initialBar.width;
+            button.textContent = initialBar.label;
+          }
         };
         capture.addEventListener("pointermove", move);
         capture.addEventListener("pointerup", finish);

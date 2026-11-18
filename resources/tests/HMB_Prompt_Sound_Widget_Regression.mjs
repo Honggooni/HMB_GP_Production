@@ -126,6 +126,21 @@ try {
   await dialog.locator('[name="out_seconds"]').fill("3.4");
   await dialog.locator('[type="submit"]').click();
   assert.match(await card.locator('[data-sound-clip="1"]').innerText(), /1\.7–3\.9/);
+  const second = card.locator('[data-sound-clip="1"]');
+  await second.scrollIntoViewIfNeeded();
+  const initialBar = await second.evaluate(button => {
+    window.savedSoundButton = button;
+    button.addEventListener("pointerdown", event => { window.soundPointer = event.pointerId; }, {once:true});
+    return [button.style.left, button.style.width, button.textContent];
+  });
+  const bounds = await second.boundingBox();
+  const cx = bounds.x + bounds.width / 2, cy = bounds.y + bounds.height / 2;
+  await page.mouse.move(cx, cy);
+  await page.mouse.down();
+  await page.mouse.move(cx + 21, cy, {steps:3});
+  await second.evaluate(button => button.dispatchEvent(new PointerEvent("pointercancel", {pointerId:window.soundPointer, bubbles:true})));
+  await page.mouse.up();
+  assert.deepEqual(await second.evaluate(button => [button === window.savedSoundButton, button.style.left, button.style.width, button.textContent]), [true, ...initialBar]);
   const dims = await card.evaluate(node => {
     const box = selector => node.querySelector(selector).getBoundingClientRect();
     return {role:box('[data-sound-field="role"]').top, speaker:box('[data-sound-speaker="source"]').top,
