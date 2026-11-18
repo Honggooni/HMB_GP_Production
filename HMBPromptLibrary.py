@@ -4540,8 +4540,44 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 _PROMPT_SOUND_FIELDS = ("role", "purpose", "transcript", "target", "in_seconds", "out_seconds",
-                       "start_seconds", "gain_db", "enabled", "loop", "lipsync")
+                       "start_seconds", "gain_db", "enabled", "loop", "lipsync", "ranges")
 _PROMPT_AUDIO_SUB_TYPES = ("Apply", "Ignore", "Analysis")
+
+# A standalone cue edits the authored placement once per fresh snapshot.
+# Ordinary dialogue and descriptive prose remain verbatim model directions.
+_SOUND_RANGE_CUE = re.compile(
+    r"(?:(@(?:audio|sound|mix)\d+)\s*[:,·]?\s*)?"
+    r"(?:(\d+)\s*번(?:째)?|(첫|두|세|네|다섯)\s*번째)\s*(?:구간|레인지)(?:\s*선택)?[을를은는]?\s*"
+    r"(\d+(?:\.\d+)?)\s*초?\s*(늦게|빠르게|일찍)\s*시작(?:하라|해\s*줘|하세요|한다)?[.!]?",
+    re.IGNORECASE,
+)
+
+
+def _apply_sound_range_cues(snapshot, shot, direction):
+    if not direction or not any(row.get("ranges") for row in snapshot["tracks"]):
+        return
+    tracks = [row for row in snapshot["tracks"] if row["enabled"] and
+              (row["channel_uuid"], row["shot_uuid"]) == (shot["channel_uuid"], shot["shot_uuid"])]
+    tokens = _hmb_sound.public_sound_directions(snapshot, channel_uuid=shot["channel_uuid"], shot_uuid=shot["shot_uuid"])
+    by_token = {token["audio"]: row for token, row in zip(tokens, tracks)}
+    for line in direction.splitlines():
+        match = _SOUND_RANGE_CUE.fullmatch(line.strip())
+        if not match:
+            continue
+        token, number, word, seconds, shift = match.groups()
+        row = by_token.get(token.lower()) if token else (tracks[0] if len(tracks) == 1 else None)
+        if row is None:
+            raise _hmb_sound.SoundError("SOUND_RANGE_TARGET", "구간 지시 앞에 현재 샷의 음원 번호를 입력하세요. 예: @audio1 2번 구간을 0.5초 늦게 시작")
+        if not row.get("ranges"):
+            continue
+        index = int(number) if number else ("첫", "두", "세", "네", "다섯").index(word) + 1
+        if not 1 <= index <= len(row.get("ranges", [])):
+            raise _hmb_sound.SoundError("SOUND_RANGE_TARGET", "구간 지시가 가리키는 음원과 활성 구간 번호를 확인하세요.")
+        clip = row["ranges"][index - 1]
+        start = clip["start_seconds"] + float(seconds) * (1 if shift == "늦게" else -1)
+        if not 0 <= start <= 86400:
+            raise _hmb_sound.SoundError("SOUND_INVALID_TIMING", "지시를 적용한 구간 시작 위치가 샷 타이밍 범위를 벗어났습니다.")
+        clip["start_seconds"] = round(start, 9)
 
 
 def _normalize_sound_speaker_binding(value: Any) -> Dict[str, str] | None:
@@ -4629,11 +4665,15 @@ def _normalize_sound_overlays(value: Any) -> Dict[str, Any]:
         if not isinstance(instance, str) or not instance or len(instance) > 128 or not isinstance(raw, dict):
             continue
         row = {}
+        if type(raw.get("range_enabled")) is bool:
+            row["range_enabled"] = raw["range_enabled"]
         for field in _PROMPT_SOUND_FIELDS:
             if field not in raw:
                 continue
             item = raw[field]
-            if field in {"enabled", "loop", "lipsync"}:
+            if field == "ranges":
+                row[field] = [] if item == [] else _hmb_sound.normalize_sound_ranges(item)
+            elif field in {"enabled", "loop", "lipsync"}:
                 if type(item) is bool:
                     row[field] = item
             elif field in {"in_seconds", "out_seconds", "start_seconds", "gain_db"}:
@@ -10761,7 +10801,11 @@ class HMBPromptLibrary(DataNode):
         for row in snapshot["tracks"]:
             if row["channel_uuid"] == shot["channel_uuid"] and row["shot_uuid"] == shot["shot_uuid"]:
                 row.update(copy.deepcopy(overlays.get(row["instance_id"], {})))
+                if row.pop("range_enabled", None) is False or row.get("ranges") == []:
+                    row.pop("ranges", None)
+                    row.update(start_seconds=0, in_seconds=0, out_seconds=None)
                 row["enabled"] = _prompt_audio_sub_type(row) == "Apply"
+        _apply_sound_range_cues(snapshot, shot, state.get("sound_direction"))
         return _hmb_sound.normalize_sound_snapshot(snapshot)
 
     def _apply_sound_source(self, state: Dict[str, Any]) -> Dict[str, Any]:

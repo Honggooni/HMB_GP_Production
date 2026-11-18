@@ -980,9 +980,19 @@ function defaultState() {
 }
 
 const HMB_SOUND_SUBTYPES = ["Apply", "Ignore", "Analysis"];
-const HMB_SOUND_FIELDS = ["role", "purpose", "audio_sub_type", "transcript", "target", "in_seconds", "out_seconds", "start_seconds", "gain_db", "enabled", "loop", "lipsync", "speaker_binding"];
+const HMB_SOUND_FIELDS = ["role", "purpose", "audio_sub_type", "transcript", "target", "in_seconds", "out_seconds", "start_seconds", "gain_db", "enabled", "loop", "lipsync", "speaker_binding", "ranges", "range_enabled"];
 const HMB_SOUND_NUMBERS = new Set(["in_seconds", "out_seconds", "start_seconds", "gain_db"]);
-const HMB_SOUND_BOOLEANS = new Set(["enabled", "loop", "lipsync"]);
+const HMB_SOUND_BOOLEANS = new Set(["enabled", "loop", "lipsync", "range_enabled"]);
+
+function hmbSoundClips(row) {
+  if (Array.isArray(row.ranges)) return row.ranges.map(({start_seconds, in_seconds, out_seconds}) => ({start_seconds, in_seconds, out_seconds}));
+  if (!row.start_seconds && !row.in_seconds && row.out_seconds == null) return [];
+  return [{start_seconds: row.start_seconds ?? 0, in_seconds: row.in_seconds ?? 0, out_seconds: row.out_seconds ?? row.duration_seconds ?? 0}];
+}
+
+function hmbSoundRangeEnabled(row) {
+  return row.range_enabled ?? Boolean(row.ranges?.length || row.start_seconds || row.in_seconds || row.out_seconds != null);
+}
 
 function hmbNormalizeSoundSpeakerBinding(value) {
   if (!value || !["image", "video"].includes(value.kind) || typeof value.source_id !== "string") return null;
@@ -1032,6 +1042,11 @@ export function hmbNormalizePromptSoundOverlays(value) {
       if (!Object.prototype.hasOwnProperty.call(raw, field)) continue;
       const item = raw[field];
       if (field === "audio_sub_type") { if (HMB_SOUND_SUBTYPES.includes(item)) row[field] = item; }
+      else if (field === "ranges") {
+        if (Array.isArray(item) && item.length <= 64 && item.every(clip => clip &&
+          [clip.start_seconds, clip.in_seconds, clip.out_seconds].every(v => Number.isFinite(v) && v >= 0 && v <= 86400) &&
+          clip.out_seconds > clip.in_seconds)) row.ranges = hmbSoundClips({ranges: item});
+      }
       else if (field === "speaker_binding") {
         const binding = hmbNormalizeSoundSpeakerBinding(item);
         if (item === null || binding) row[field] = binding;
@@ -1063,6 +1078,9 @@ export function hmbSetPromptSoundField(state, instance, field, value, allowDorma
   let item = value;
   if (field === "audio_sub_type") {
     if (!HMB_SOUND_SUBTYPES.includes(value)) return false;
+  } else if (field === "ranges") {
+    item = hmbNormalizePromptSoundOverlays({track: {ranges: value}}).track?.ranges;
+    if (!item) return false;
   } else if (field === "speaker_binding") {
     item = hmbNormalizeSoundSpeakerBinding(value);
     if (value !== null && !item) return false;
@@ -6526,6 +6544,56 @@ function renderPromptShotRows(state, editorMarkup = "") {
   }).join("")}${fallback}</div>`;
 }
 
+function hmbSoundTimeline(row, ko) {
+  const enabled = hmbSoundRangeEnabled(row);
+  const clips = hmbSoundClips(row);
+  const seconds = ko ? "초" : "s";
+  const format = value => Number(value.toFixed(3));
+  const end = clip => clip.start_seconds + clip.out_seconds - clip.in_seconds;
+  const span = Math.max(.01, row.duration_seconds || 0, ...clips.map(end));
+  const buttons = enabled ? clips.map((clip, index) => {
+    const text = `${index + 1}${ko ? "번" : ""} · ${format(clip.start_seconds)}–${format(end(clip))}${seconds}`;
+    return `<button type="button" class="clip" data-sound-clip="${index}" title="${text}" style="left:${100 * clip.start_seconds / span}%;width:${100 * (clip.out_seconds - clip.in_seconds) / span}%">${text}</button>`;
+  }).join("") : "";
+  return `<label class="range-check"><input type="checkbox" data-sound-range-toggle ${enabled ? "checked" : ""} ${row.duration_seconds > 0 ? "" : "disabled"}>${ko ? "샷 구간" : "Shot range"}</label>
+    <div class="shot-time"><span class="time-mark">0${seconds}</span><div class="ruler" data-span="${span}" data-editable="${enabled}" title="${ko ? "빈 곳을 드래그해 구간 추가 · 구간 클릭으로 시간 편집" : "Drag empty space to add a range. Click a range to edit its timing."}">${buttons}</div><span class="time-mark">${format(span)}${seconds}</span></div>`;
+}
+
+function hmbEditSoundClip(host, row, index, ko, commit) {
+  const clips = hmbSoundClips(row);
+  const duration = row.duration_seconds;
+  const initial = clips[index];
+  const dialog = document.createElement("dialog");
+  dialog.className = "sound-range-editor nodrag nopan";
+  const input = (key, label, max) => `<label>${label}<input name="${key}" type="number" required min="0" max="${max}" step="any" value="${initial[key]}"></label>`;
+  dialog.innerHTML = `<form><b>${ko ? "샷 구간" : "Shot range"} ${index + 1}</b>
+    ${input("start_seconds", ko ? "샷에서 시작할 위치 (초)" : "Start in shot (s)", 86400)}
+    ${input("in_seconds", ko ? "원본 시작 (초)" : "Source in (s)", duration)}
+    ${input("out_seconds", ko ? "원본 끝 (초)" : "Source out (s)", duration)}
+    <footer><button type="button" data-remove>${ko ? "구간 삭제" : "Delete range"}</button>
+    <button type="button" data-cancel>${ko ? "취소" : "Cancel"}</button><button type="submit">${ko ? "적용" : "Apply"}</button></footer></form>`;
+  host.append(dialog);
+  const form = dialog.querySelector("form");
+  dialog.addEventListener("close", () => dialog.remove(), {once:true});
+  dialog.querySelector("[data-cancel]").onclick = () => dialog.close();
+  const finish = () => { dialog.close(); dialog.remove(); commit(clips); };
+  const remove = dialog.querySelector("[data-remove]");
+  if (remove) remove.onclick = () => {clips.splice(index, 1); finish();};
+  form.oninput = () => form.elements.out_seconds.setCustomValidity("");
+  form.onsubmit = event => {
+    event.preventDefault();
+    const clip = Object.fromEntries(Object.keys(initial).map(key => [key, form.elements[key].valueAsNumber]));
+    if (clip.out_seconds <= clip.in_seconds) {
+      form.elements.out_seconds.setCustomValidity(ko ? "원본 끝은 시작보다 뒤여야 합니다." : "Source out must follow source in.");
+      form.reportValidity();
+      return;
+    }
+    clips[index] = clip;
+    finish();
+  };
+  dialog.showModal();
+}
+
 export function hmbRenderPromptSoundSources(state) {
   const korean = uiLanguage(state) === "ko";
   const rows = normalizePromptSoundSources(state.sound_sources);
@@ -6569,12 +6637,7 @@ export function hmbRenderPromptSoundSources(state) {
     return `<div class="sound-binding-row" data-sound-row="${escapeHtml(row.instance_id)}">
       <div class="sound-binding-main">
         <b>${String(index + 1).padStart(2, "0")} · <span data-sound-token>${escapeHtml(applies && row.audio || "OFF")}</span> ${escapeHtml(row.name || "")}</b>
-        <label>${korean ? "역할" : "Role"}<select ${attrs("role")}>${optionList(["Dialogue", "SFX", "Ambience", "Music"], row.role)}</select></label>
-        <label>${korean ? "세부 유형" : "Subtype"}<select ${attrs("audio_sub_type")}>${optionList(HMB_SOUND_SUBTYPES, subtype, subtypeLabels)}</select></label>
-        <label>${korean ? "사용" : "Purpose"}<select ${attrs("purpose")}${applies ? "" : " disabled"}>${optionList(["reference", "mix", "both"], row.purpose)}</select></label>
-        <label>${korean ? "대상 / 화자" : "Target / speaker"}<input type="text" maxlength="512" ${attrs("target")} value="${escapeHtml(row.target || "")}"/></label>
-        ${toggle("lipsync", korean ? "립싱크" : "Lip-sync")}
-      </div>
+        <label>${korean ? "역할" : "Role"}<select ${attrs("role")}>${optionList(["Dialogue", "SFX", "Ambience", "Music"], row.role, korean && {Dialogue:"대사", SFX:"효과음", Ambience:"환경음", Music:"음악"})}</select></label>
       <div class="sound-speaker-reference">
         <label>${korean ? "화자 참조" : "Speaker reference"}<select ${speakerAttrs("source", !speakerSources.length && !binding)}>
           <option value="">${speakerPlaceholder}</option>
@@ -6585,9 +6648,15 @@ export function hmbRenderPromptSoundSources(state) {
           <option value=""${!color || missingColor ? " selected" : ""}>${colorPlaceholder}</option>${optionList(colors, color)}
         </select></label>` : ""}
       </div>
+        <label>${korean ? "세부 유형" : "Subtype"}<select ${attrs("audio_sub_type")}>${optionList(HMB_SOUND_SUBTYPES, subtype, subtypeLabels)}</select></label>
+        <label>${korean ? "사용" : "Purpose"}<select ${attrs("purpose")}${applies ? "" : " disabled"}>${optionList(["reference", "mix", "both"], row.purpose, korean && {reference:"영상 생성에 참고", both:"생성 참고 + 최종 소리", mix:"최종 소리에만 사용"})}</select></label>
+        <label>${korean ? "대상 / 화자" : "Target / speaker"}<input type="text" maxlength="512" ${attrs("target")} value="${escapeHtml(row.target || "")}"/></label>
+        ${toggle("lipsync", korean ? "립싱크" : "Lip-sync")}
+      </div>
       <div class="sound-binding-detail">
+        <div class="range-line">${hmbSoundTimeline(row, korean)}<div class="gain">${numeric("gain_db", "dB", -60, 12)}</div>${toggle("loop", korean ? "반복" : "Loop")}</div>
         <label class="sound-transcript">${korean ? "대사 / 발화문 (입력한 그대로)" : "Dialogue / transcript (exact words)"}<textarea rows="2" maxlength="20000" ${attrs("transcript")}>${escapeHtml(row.transcript || "")}</textarea></label>
-        <div class="sound-timing">${numeric("start_seconds", korean ? "샷 시작(초)" : "Shot start (s)")}${numeric("in_seconds", "IN (s)")}${numeric("out_seconds", "OUT (s)")}${numeric("gain_db", "dB", -60, 12)}${toggle("loop", korean ? "반복" : "Loop")}</div>
+
       </div>
     </div>`;
   }).join("");
@@ -6622,6 +6691,34 @@ function render(state, includeStyle = true) {
       .sound-speaker-reference{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
       .sound-speaker-reference label{flex:1 1 150px;min-width:0}
       .sound-speaker-reference label:first-child{flex:2 1 220px}
+
+      .sound-card .sound-binding-main{grid-template-columns:minmax(110px,1.1fr) minmax(55px,.55fr) minmax(140px,1.4fr) minmax(64px,.55fr) minmax(138px,1.15fr) minmax(68px,.65fr) auto;align-items:end}
+      .sound-card .sound-binding-main>b{align-self:center}
+      .sound-card .sound-binding-main select,.sound-card .sound-binding-main input:not([type=checkbox]){height:26px}
+      .sound-card .sound-binding-detail{display:grid;grid-template-columns:minmax(0,1fr);gap:6px;margin-top:8px}
+      .sound-card .sound-transcript textarea{width:100%;height:39px;line-height:14px}
+      .sound-card .range-line{display:flex;align-items:center;gap:7px;min-height:30px}
+      .sound-card .range-line label{flex-direction:row;align-items:center;white-space:nowrap}
+      .sound-card .range-check{display:inline-flex;align-items:center;gap:6px;border:1px solid #20768a;background:#102d37;border-radius:5px;color:#bbf6fa;padding:5px 7px;font-weight:700}
+      .sound-card .range-check input{width:13px;height:13px;accent-color:#1694a7;margin:0}
+      .sound-card .shot-time{flex:1;min-width:0;display:flex;align-items:center;gap:7px}
+      .sound-card .ruler{position:relative;height:29px;flex:1;border:1px solid #245969;border-radius:5px;background:repeating-linear-gradient(90deg,#0b131e 0 calc(12.5% - 1px),#203441 calc(12.5% - 1px) 12.5%);overflow:hidden}
+      .sound-card .clip{position:absolute;top:3px;height:21px;background:linear-gradient(#147483,#125366);border:1px solid #39a6b4;border-radius:5px;color:#f0fdff;font-size:10px;font-weight:650}
+      .sound-card .clip[aria-pressed=true]{border-color:#8fe3e9;box-shadow:inset 0 0 0 1px #68b8c3}
+      .sound-card .clip:before,.sound-card .clip:after{content:"";position:absolute;top:4px;bottom:4px;width:2px;background:#8bd2d9}.sound-card .clip:before{left:4px}.sound-card .clip:after{right:4px}
+      .sound-card .time-mark{color:#acbfce;font:10px monospace}
+      .sound-card .ruler[data-editable=true]{cursor:crosshair;touch-action:none}
+      .sound-card .gain input{width:39px;height:25px}
+
+      .sound-card .sound-speaker-reference{display:flex;min-width:0;gap:4px;margin:0;flex-wrap:nowrap}
+      .sound-card .sound-speaker-reference label{min-width:0;flex:1}
+      .sound-card .clip{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;min-width:3px;padding:0;touch-action:none;cursor:grab}
+      .sound-range-editor{width:300px;background:#101827;color:#e2e8f0;border:1px solid #377080;border-radius:8px;padding:14px}
+      .sound-range-editor form{display:grid;gap:10px}
+      .sound-range-editor footer{display:flex;justify-content:flex-end;gap:6px}
+      .sound-range-editor::backdrop{background:#07102077}
+      @container (max-width:850px){.sound-card .sound-binding-main{grid-template-columns:repeat(4,minmax(0,1fr))}}
+      @container (max-width:600px){.sound-card .sound-binding-main{grid-template-columns:repeat(3,minmax(0,1fr))}.sound-card .range-line{gap:3px}.sound-card .time-mark{display:none}}
       .hmb-dashboard :is(button,input,select,textarea):not([data-hmb-native-identity] *):not([data-hmb-native-actions] *){font-family:inherit}
       .image-video-surface-columns{display:grid;grid-template-columns:minmax(0,1fr) 4.5rem;gap:8px;align-items:start;min-width:0}
       .image-surface-heading{text-align:center;white-space:nowrap}
@@ -9177,6 +9274,120 @@ function hmbNativeUiImplementation(container, props) {
       };
       button.addEventListener("click", handler);
       listeners.push([button, "click", handler]);
+    });
+
+    container.querySelectorAll("[data-sound-row]").forEach(card => {
+      const instance = card.dataset.soundRow;
+      const source = state.sound_sources.find(row => row.instance_id === instance);
+      if (!source) return;
+      const row = {...source, ...state.sound_overlays?.[instance]};
+      const toggle = card.querySelector("[data-sound-range-toggle]");
+      const toggleRange = () => {
+        if (state.disabled) return;
+        // Capture inherited or legacy trim before switching it off.
+        if (!hmbSetPromptSoundField(state, instance, "ranges", hmbSoundClips(row))) return;
+        hmbSetPromptSoundField(state, instance, "range_enabled", toggle.checked);
+        hmbCommitLocalPromptStructure(container, props, state, remount);
+      };
+      toggle.addEventListener("change", toggleRange);
+      listeners.push([toggle, "change", toggleRange]);
+      const clips = hmbSoundClips(row);
+      const ruler = card.querySelector(".ruler");
+      const save = updated => {
+        if (!hmbSetPromptSoundField(state, instance, "ranges", updated)) return;
+        hmbSetPromptSoundField(state, instance, "range_enabled", true);
+        hmbCommitLocalPromptStructure(container, props, state, remount);
+      };
+      let dragged = false;
+      const beginDrag = event => {
+        if (state.disabled || !toggle.checked || event.button !== 0 || !event.isPrimary) return;
+        const button = event.target.closest("[data-sound-clip]");
+        const creating = !button;
+        if (creating && clips.length >= 64) return;
+        const index = creating ? clips.length : Number(button.dataset.soundClip);
+        const original = clips[index];
+        const trackBox = ruler.getBoundingClientRect();
+        const span = Number(ruler.dataset.span);
+        const x = event.clientX;
+        const timeAt = pixel => Math.max(0, Math.min(span, Math.round((pixel - trackBox.left) / trackBox.width * span * 100) / 100));
+        const anchor = timeAt(x);
+        const bounds = button?.getBoundingClientRect();
+        const edge = bounds ? Math.min(8, bounds.width / 4) : 0;
+        const left = bounds && x - bounds.left <= edge;
+        const right = bounds && bounds.right - x <= edge;
+        const capture = button || ruler;
+        let preview = null, nextClip = null;
+        dragged = false;
+        event.stopPropagation();
+        capture.setPointerCapture(event.pointerId);
+        const move = next => {
+          if (next.pointerId !== event.pointerId || (!dragged && Math.abs(next.clientX - x) < 3)) return;
+          dragged = true;
+          const time = timeAt(next.clientX);
+          if (creating) {
+            let start = Math.min(anchor, time), end = Math.max(anchor, time);
+            // Stop at an occupied interval when drawing through it.
+            for (const existing of clips) {
+              const finish = existing.start_seconds + existing.out_seconds - existing.in_seconds;
+              if (finish <= anchor) start = Math.max(start, finish);
+              if (existing.start_seconds >= anchor) end = Math.min(end, existing.start_seconds);
+            }
+            const length = Math.min(end - start, row.duration_seconds);
+            if (length <= 0) {nextClip = null; preview?.remove(); preview = null; return;}
+            const sourceIn = Math.min(start, row.duration_seconds - length);
+            nextClip = {start_seconds:start, in_seconds:sourceIn, out_seconds:sourceIn + length};
+            if (!preview) {
+              preview = document.createElement("span");
+              preview.className = "clip";
+              ruler.append(preview);
+            }
+          } else {
+            const delta = time - anchor;
+            const length = original.out_seconds - original.in_seconds;
+            const step = Math.min(.01, length);
+            nextClip = {...original};
+            if (left) {
+              const amount = Math.min(length - step, Math.max(-original.start_seconds, -original.in_seconds, delta));
+              nextClip.in_seconds += amount;
+              nextClip.start_seconds += amount;
+            } else if (right) {
+              nextClip.out_seconds = Math.min(row.duration_seconds, Math.max(original.in_seconds + step, original.out_seconds + delta));
+            } else nextClip.start_seconds = Math.max(0, Math.min(86400, original.start_seconds + delta));
+          }
+          const bar = preview || button;
+          const length = nextClip.out_seconds - nextClip.in_seconds;
+          bar.style.left = (nextClip.start_seconds / span * 100) + "%";
+          bar.style.width = (length / span * 100) + "%";
+          bar.textContent = (index + 1) + " · " + Number(nextClip.start_seconds.toFixed(3)) + "–" + Number((nextClip.start_seconds + length).toFixed(3));
+        };
+        const finish = next => {
+          if (next.pointerId !== event.pointerId) return;
+          capture.removeEventListener("pointermove", move);
+          capture.removeEventListener("pointerup", finish);
+          capture.removeEventListener("lostpointercapture", finish);
+          capture.removeEventListener("pointercancel", finish);
+          preview?.remove();
+          if (next.type === "pointerup" && dragged && nextClip) {
+            const updated = clips.slice();
+            updated[index] = nextClip;
+            save(updated);
+          } else if (dragged && button) remount();
+        };
+        capture.addEventListener("pointermove", move);
+        capture.addEventListener("pointerup", finish);
+        capture.addEventListener("pointercancel", finish);
+        capture.addEventListener("lostpointercapture", finish);
+      };
+      ruler.addEventListener("pointerdown", beginDrag);
+      listeners.push([ruler, "pointerdown", beginDrag]);
+      ruler.querySelectorAll("[data-sound-clip]").forEach(button => {
+        const edit = () => {
+          if (state.disabled || dragged) { dragged = false; return; }
+          hmbEditSoundClip(card, row, Number(button.dataset.soundClip), uiLanguage(state) === "ko", save);
+        };
+        button.addEventListener("click", edit);
+        listeners.push([button, "click", edit]);
+      });
     });
 
     container.querySelectorAll("[data-sound-field]").forEach((field) => {

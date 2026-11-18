@@ -83,6 +83,16 @@ class SoundLUTEngineRegression(unittest.TestCase):
         ratio = self.rms(quiet["path"], .46, .54) / self.rms(muted["path"], .46, .54)
         self.assertAlmostEqual(ratio, 10 ** (-12 / 20), delta=.035)
 
+    def test_two_clips_from_one_source_leave_half_second_silent(self):
+        clips = [dict(in_seconds=0, out_seconds=.2, start_seconds=0),
+                 dict(in_seconds=.2, out_seconds=.4, start_seconds=.7)]
+        result = self.export("range-gap.mov", source=self.silent, sound_tracks=[self.track(ranges=clips)])
+        self.assertEqual(len(result["sound_tracks"]), 1)
+        self.assertEqual(result["sound_tracks"][0]["ranges"], clips)
+        self.assertGreater(self.rms(result["path"], .02, .18), .03)
+        self.assertLess(self.rms(result["path"], .21, .69), .001)
+        self.assertGreater(self.rms(result["path"], .72, .88), .03)
+
     def test_preserve_source_audio_and_mix_silent_video(self):
         preserved = self.export("preserved.mov", sound_tracks=[self.track()], original_audio="preserve")
         self.assertGreater(self.rms(preserved["path"], .06, .18), .04)

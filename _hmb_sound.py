@@ -327,6 +327,20 @@ def make_sound_track(root: str | Path, relative: str, *, channel_uuid: str = "",
         "channel_uuid": channel_uuid, "shot_uuid": shot_uuid}
 
 
+def normalize_sound_ranges(value: Any, duration: float = 86400) -> list[dict[str, float]]:
+    if not isinstance(value, list) or not 1 <= len(value) <= 64:
+        raise SoundError("SOUND_INVALID_TIMING", "음원 한 개에 1~64개 구간을 지정하세요.")
+    result = []
+    for item in value:
+        if not isinstance(item, dict) or any(key not in item or item[key] is None for key in ("start_seconds", "in_seconds", "out_seconds")):
+            raise SoundError("SOUND_INVALID_TIMING", "샷 시작과 원본 시작·끝을 입력하세요.")
+        clip = {key: _number(item[key]) for key in ("start_seconds", "in_seconds", "out_seconds")}
+        if not clip["in_seconds"] < clip["out_seconds"] <= duration + 1e-6:
+            raise SoundError("SOUND_INVALID_TIMING", "음원 구간의 시작과 끝이 원본 길이 안에 있어야 합니다.")
+        result.append(clip)
+    return result
+
+
 def normalize_sound_snapshot(value: Any) -> dict[str, Any]:
     if value is None or value == {} or value == "":
         return {}
@@ -385,6 +399,8 @@ def normalize_sound_snapshot(value: Any) -> dict[str, Any]:
             "gain_db": _number(row.get("gain_db"), low=-60, high=12), "enabled": _boolean(row.get("enabled"), True),
             "loop": _boolean(row.get("loop"), False), "lipsync": _boolean(row.get("lipsync"), False), "duration_seconds": duration,
             "channel_uuid": row_channel, "shot_uuid": shot})
+        if "ranges" in row:
+            output[-1]["ranges"] = normalize_sound_ranges(row["ranges"], duration)
     preparation_error = value.get("preparation_error", "")
     if preparation_error not in ("", "SOUND_PREPARATION_FAILED"):
         raise SoundError("SOUND_SNAPSHOT_INVALID", "사운드 준비 상태가 올바르지 않습니다.")
@@ -436,4 +452,6 @@ def public_sound_directions(snapshot: Any, *, channel_uuid: str = "", shot_uuid:
             mix_index += 1
             token = "@mix" + str(mix_index)
         result.append({"audio": token, **{key: row[key] for key in ("name", "role", "purpose", "transcript", "target", "in_seconds", "out_seconds", "start_seconds", "gain_db", "loop", "lipsync")}})
+        if "ranges" in row:
+            result[-1]["ranges"] = [dict(range_number=i, **clip) for i, clip in enumerate(row["ranges"], 1)]
     return result

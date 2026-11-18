@@ -94,7 +94,48 @@ try {
   const literal = "  안녕 {0}\nOFF 정확한 대사  ";
   await field("track-1", "transcript").fill(literal);
   await field("track-1", "lipsync").check();
-  await field("track-1", "start_seconds").fill("0");
+  const card = page.locator('[data-sound-row="track-1"]');
+  assert.equal(await field("track-1", "purpose").locator("option:checked").innerText(), "생성 참고 + 최종 소리");
+  const ranges = card.locator("[data-sound-range-toggle]");
+  const ruler = card.locator(".ruler");
+  const drag = async (from, to) => {
+    await ruler.scrollIntoViewIfNeeded();
+    const box = await ruler.boundingBox();
+    const y = box.y + box.height / 2;
+    await page.mouse.move(box.x + box.width * from, y);
+    await page.mouse.down();
+    await page.mouse.move(box.x + box.width * to, y, {steps:8});
+    await page.mouse.up();
+  };
+  await drag(.1, .2);
+  assert.equal(await ruler.locator("button").count(), 0);
+  await ranges.check();
+  assert.equal(await ruler.locator("button").count(), 0);
+  assert.equal(await card.getByRole("button", {name:"＋ 구간"}).count(), 0);
+  await drag(.02, .13);
+  await card.locator('[data-sound-clip="0"]').click();
+  const dialog = page.locator("dialog[open]");
+  await dialog.locator('[name="start_seconds"]').fill("0");
+  await dialog.locator('[name="in_seconds"]').fill("0");
+  await dialog.locator('[name="out_seconds"]').fill("1.2");
+  await dialog.locator('[type="submit"]').click();
+  await drag(.48, .26);
+  await card.locator('[data-sound-clip="1"]').click();
+  await dialog.locator('[name="start_seconds"]').fill("1.7");
+  await dialog.locator('[name="in_seconds"]').fill("1.2");
+  await dialog.locator('[name="out_seconds"]').fill("3.4");
+  await dialog.locator('[type="submit"]').click();
+  assert.match(await card.locator('[data-sound-clip="1"]').innerText(), /1\.7–3\.9/);
+  const dims = await card.evaluate(node => {
+    const box = selector => node.querySelector(selector).getBoundingClientRect();
+    return {role:box('[data-sound-field="role"]').top, speaker:box('[data-sound-speaker="source"]').top,
+      timelineBottom:box('.range-line').bottom, transcriptTop:box('textarea').top,
+      width:node.clientWidth, transcriptWidth:box('textarea').width};
+  });
+  assert.ok(Math.abs(dims.role - dims.speaker) < 1 && dims.transcriptTop >= dims.timelineBottom && dims.transcriptWidth >= dims.width * .95);
+  await ranges.uncheck();
+  assert.equal(await card.locator('[data-sound-clip="1"]').count(), 0);
+  await ranges.check();
   await field("track-1", "gain_db").fill("0");
   await page.locator('[data-sound-field="sound_direction"]').fill("  대상 Hero\n0 OFF  ");
   await page.locator('[data-group-id="soundSources"] h3').click();
@@ -102,7 +143,8 @@ try {
   const edited = await page.evaluate(() => window.latest);
   assert.equal(edited.sound_overlays["track-1"].transcript, literal);
   assert.equal(edited.sound_overlays["track-1"].lipsync, true);
-  assert.equal(edited.sound_overlays["track-1"].start_seconds, 0);
+  assert.deepEqual(edited.sound_overlays["track-1"].ranges, [
+    {start_seconds:0, in_seconds:0, out_seconds:1.2}, {start_seconds:1.7, in_seconds:1.2, out_seconds:3.4}]);
   assert.equal(edited.sound_overlays["track-1"].gain_db, 0);
   assert.deepEqual(edited.sound_overlays["track-1"].speaker_binding, {kind: "video", source_id: "shot-mask", color: "Red"});
   assert.equal(await field("track-1", "target").inputValue(), "Hero");
@@ -130,6 +172,7 @@ try {
   assert.equal(await field("track-1", "purpose").inputValue(), "mix");
   assert.equal(await speaker("track-1", "source").inputValue(), "video:shot-mask");
   assert.equal(await speaker("track-1", "color").inputValue(), "Red");
+  assert.match(await card.locator('[data-sound-clip="1"]').innerText(), /1\.7–3\.9/);
   assert.deepEqual(await page.locator('[data-group-id="soundSources"]').evaluate(node => ({ minHeight: node.style.minHeight, flexBasis: node.style.flexBasis })),
     { minHeight: "150px", flexBasis: "200px" });
   assert.equal(await page.evaluate(() => window.latest.ui.group_heights.soundSources), 200, "Saved custom Sound group height survives editing and shot switches");

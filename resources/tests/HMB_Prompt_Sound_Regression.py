@@ -145,6 +145,25 @@ class PromptSoundRegression(unittest.TestCase):
         self.assertIs(getattr(result.exception, "hmb_sound_preparing", False), True)
         self.assertEqual(result.exception.code, "SOUND_PREPARING")
 
+    def test_range_cue_moves_only_numbered_clip_and_keeps_one_reference(self):
+        clips = [dict(in_seconds=0, out_seconds=1.2, start_seconds=0),
+                 dict(in_seconds=1.2, out_seconds=3.4, start_seconds=1.2)]
+        self.state["sound_overlays"] = {"track-1": {"range_enabled": True, "ranges": clips}, "track-2": {"enabled": False}}
+        self.state["sound_direction"] = "@audio1 2번 구간을 0.5초 늦게 시작"
+        with patch.object(self.node, "_registered_sound_source", return_value=self.source):
+            for _ in range(2):
+                projected = self.node._apply_sound_source(deepcopy(self.state))
+                snapshot = self.node._hmb_current_sound_snapshot
+                self.assertEqual(snapshot["tracks"][0]["ranges"][1], dict(clips[1], start_seconds=1.7))
+                self.assertNotIn("ranges", snapshot["tracks"][2])
+                job = json.loads(prompt._build_data_only_prompt_package(projected).split(prompt.PUBLIC_JOB_CONTRACT_HEADER + "\n")[1].splitlines()[0])
+                self.assertEqual(len(job["audios"]), 1)
+                self.assertEqual(job["audios"][0]["ranges"][1], dict(clips[1], range_number=2, start_seconds=1.7))
+            self.state["sound_overlays"]["track-1"]["range_enabled"] = False
+            snapshot = self.node._sound_snapshot_for_state(self.state)
+            self.assertNotIn("ranges", snapshot["tracks"][0])
+            self.assertEqual(clips[1]["start_seconds"], 1.2)
+
     def test_mix_first_does_not_consume_dialogue_provider_audio_slot(self):
         self.snapshot["tracks"][0].update(purpose="mix", role="Music", name="BGM")
         self.snapshot["tracks"][1].update(purpose="both", role="Dialogue", name="Dialogue")

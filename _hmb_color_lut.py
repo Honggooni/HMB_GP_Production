@@ -425,6 +425,15 @@ def _prepare_sound_tracks(tracks: Any, video_duration: float) -> list[dict[str, 
             raise ColorLUTError("A sound source changed while preparing Audio Mix.")
         prepared.append({**raw, **values, "path": str(source), "loop": raw.get("loop") is True,
                          "out_seconds": min(values["out_seconds"], duration), "_stat": before})
+        if "ranges" in raw:
+            from _hmb_sound import normalize_sound_ranges, SoundError
+            try:
+                clips = normalize_sound_ranges(raw["ranges"], duration)
+            except SoundError as exc:
+                raise ColorLUTError(str(exc)) from exc
+            if any(clip["start_seconds"] >= video_duration for clip in clips):
+                raise ColorLUTError("음원 구간의 샷 시작 위치가 영상 길이를 벗어났습니다.")
+            prepared[-1]["ranges"] = clips
     return prepared
 
 
@@ -443,15 +452,25 @@ def _mix_audio_filter(probe: Mapping[str, Any], tracks: Sequence[Mapping[str, An
             labels.append(f"[{label}]")
     for index, track in enumerate(tracks, 1):
         label = f"sound{index}"
-        trim_duration = track["out_seconds"] - track["in_seconds"]
-        filters = ["asetpts=N/SR/TB", f"atrim=start={track['in_seconds']:.9f}:end={track['out_seconds']:.9f}", "asetpts=N/SR/TB",
-                   "aresample=48000", "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"]
+        clips = track.get("ranges") or [track]
+        origin = min(clip["start_seconds"] for clip in clips)
+        clip_labels = []
+        trim_duration = 0.0
+        for number, clip in enumerate(clips, 1):
+            offset = clip["start_seconds"] - origin
+            trim_duration = max(trim_duration, offset + clip["out_seconds"] - clip["in_seconds"])
+            clip_label = f"clip{index}_{number}"
+            graph.append(f"[{index}:a:0]asetpts=N/SR/TB,atrim=start={clip['in_seconds']:.9f}:end={clip['out_seconds']:.9f},"
+                         f"asetpts=N/SR/TB,aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                         f"adelay={round(offset * 48000)}S:all=1[{clip_label}]")
+            clip_labels.append(f"[{clip_label}]")
+        filters = [f"amix=inputs={len(clips)}:duration=longest:dropout_transition=0:normalize=0"] if len(clips) > 1 else []
         if track["loop"]:
             filters.append(f"aloop=loop=-1:size={max(1, round(trim_duration * 48000))}")
-        filters += ["asetpts=N/SR/TB", f"atrim=duration={duration - track['start_seconds']:.9f}", f"volume={track['gain_db']:.6f}dB",
-                    f"adelay={round(track['start_seconds'] * 48000)}S:all=1", "asetpts=N/SR/TB", f"apad=whole_len={samples}",
+        filters += ["asetpts=N/SR/TB", f"atrim=duration={duration - origin:.9f}", f"volume={track['gain_db']:.6f}dB",
+                    f"adelay={round(origin * 48000)}S:all=1", "asetpts=N/SR/TB", f"apad=whole_len={samples}",
                     f"atrim=duration={duration:.9f}"]
-        graph.append(f"[{index}:a:0]" + ",".join(filters) + f"[{label}]")
+        graph.append("".join(clip_labels) + ",".join(filters) + f"[{label}]")
         labels.append(f"[{label}]")
     if not labels:
         return ""
@@ -649,7 +668,8 @@ def export_video(source_path: Any, output_path: str | Path, settings: Any, codec
                 "settings": normalized, "cube_size": CUBE_SIZE, "interpolation": "trilinear", "audio_mode": audio_mode,
                 "encoding_lossless": video_copy or codec == "ffv1", "working_space": "source" if video_copy else "sRGB", "color_assumptions": source_probe["color_assumptions"],
                 **({"video_mode": "copy" if video_copy else "encode", "original_audio": original_audio,
-                    "sound_tracks": [{key: track.get(key) for key in ("source_uid", "instance_id", "media_signature", "path", "role", "purpose", "transcript", "in_seconds", "out_seconds", "start_seconds", "gain_db", "loop")} for track in tracks]} if mixing else {}),
+                    "sound_tracks": [{**{key: track.get(key) for key in ("source_uid", "instance_id", "media_signature", "path", "role", "purpose", "transcript", "in_seconds", "out_seconds", "start_seconds", "gain_db", "loop")},
+                                      **({"ranges": track["ranges"]} if "ranges" in track else {})} for track in tracks]} if mixing else {}),
                 "quality_note": "Original video stream copied without re-encoding; supplied audio mixed to AAC." if video_copy else
                     "Lossless encoding of graded 16-bit RGB pixels; source decoding and color conversion are not reversible."
                     if codec == "ffv1" else "High-quality 10-bit export with lossy video compression.",
