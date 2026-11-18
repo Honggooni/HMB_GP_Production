@@ -12,6 +12,21 @@ import _hmb_cgt as cgt
 
 
 class PreparationTests(unittest.TestCase):
+    def test_generator_uses_active_local_shot_without_assignment_state(self):
+        import _hmb_shot_basket as basket
+        from uuid import uuid4
+
+        workspace, first, second = (str(uuid4()) for _ in range(3))
+        marker = dict(project_id="superwings12", workspace_id=workspace, cgt_required=True)
+        state = dict(project_id=marker["project_id"], error="CGT offline",
+                     shot_routing=dict(active_shot_uuid=second, shots=[{"shot_uuid": first}, {"shot_uuid": second}]))
+        image = SimpleNamespace(metadata={basket._MARKER: dict(marker, kind="image")}, _current_state=lambda: state)
+        generator = SimpleNamespace(metadata={basket._MARKER: dict(marker, kind="generator")})
+        with patch.object(basket, "_basket_shots", side_effect=AssertionError("unexpected CGT lookup")):
+            self.assertEqual(basket.initial_seedance_shot(generator, image), second)
+            state["project_id"] = "Katuri8"
+            self.assertEqual(basket.initial_seedance_shot(generator, image), "")
+
     def test_assignment_does_not_wait_for_unrelated_media_scan(self):
         import _hmb_shot_basket as basket
         state = dict(project_id="superwings12", scan_busy=True, error="",

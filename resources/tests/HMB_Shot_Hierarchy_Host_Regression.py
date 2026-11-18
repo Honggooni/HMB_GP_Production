@@ -68,9 +68,19 @@ async def exercise(engine):
             assert normalized['shot_routing']['shots'][0]['name'] == 'e201_s001c001-s001c002__'
             observations.append(True)
         return publish(self, state, *args, **kwargs)
-    with mock.patch.object(image.HMBImageAssetLibrary, '_publish_state', fixture_publish):
+    resolve = seedance.HMBSeedanceGeneration._resolve_exact_shot_generation_inputs
+    resolved = set()
+    def resolve_saved(self, params):
+        subscription = self._hmb_shot_channel_subscription()
+        if subscription.get("enabled"):
+            self.metadata[seedance.SEEDANCE_SETUP_PENDING] = True
+            resolved.add(subscription["shot_uuid"])
+        return resolve(self, params)
+    with mock.patch.object(image.HMBImageAssetLibrary, '_publish_state', fixture_publish), \
+            mock.patch.object(seedance.HMBSeedanceGeneration, '_resolve_exact_shot_generation_inputs', resolve_saved):
         await exercise_native(engine)
     assert observations
+    assert resolved == {shot['shot_uuid'] for shot in native.SHOTS}
     source = engine.node_manager.get_node_by_name('offline_manager_image')
     from griptape_nodes.retained_mode.events.node_events import SerializeNodeToCommandsRequest
     from griptape_nodes.serialization.values import decode_value

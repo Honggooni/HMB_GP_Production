@@ -1747,6 +1747,71 @@ def _broker_safe_error_text(value: Any, *, secret: str = "") -> str:
     return text
 
 
+# Volcengine Ark error-codes: only documented categories, never input echoes.
+_VOLC_REASON = {
+    "InputTextSensitiveContentDetected": "입력 프롬프트 심사 거절",
+    "InputImageSensitiveContentDetected": "입력 이미지 심사 거절",
+    "InputVideoSensitiveContentDetected": "입력 영상 심사 거절",
+    "InputAudioSensitiveContentDetected": "입력 음원 심사 거절",
+    "OutputTextSensitiveContentDetected": "생성 텍스트 심사 거절",
+    "OutputImageSensitiveContentDetected": "생성 이미지 심사 거절",
+    "OutputVideoSensitiveContentDetected": "생성 영상 심사 거절",
+    "OutputAudioSensitiveContentDetected": "생성 음원 심사 거절",
+    "SensitiveContentDetected": "콘텐츠 심사 거절 · 대상 미확인",
+    "InvalidParameter": "요청 파라미터 오류",
+    "InvalidParameterValue": "요청 파라미터 값 오류",
+    "MissingParameter": "필수 파라미터 누락",
+    "UnsupportedParameter": "지원하지 않는 파라미터",
+    "InvalidRequest": "잘못된 요청", "InvalidImage": "입력 이미지 형식 오류",
+    "InvalidVideo": "입력 영상 형식 오류", "InvalidAudio": "입력 음원 형식 오류",
+    "Unauthorized": "공급자 인증 오류", "AuthenticationError": "공급자 인증 오류",
+    "AccessDenied": "공급자 접근 권한 오류", "Forbidden": "공급자 접근 권한 오류",
+    "QuotaExceeded": "공급자 할당량 초과", "InsufficientBalance": "공급자 잔액 부족",
+    "RateLimitExceeded": "공급자 요청 한도 초과", "TooManyRequests": "공급자 요청 한도 초과",
+    "ServiceUnavailable": "공급자 서비스 이용 불가", "InternalServerError": "공급자 내부 오류",
+}
+_VOLC_PARAMS = frozenset("model resolution duration duration_seconds ratio aspect_ratio output_format draft draft_job_id generate_audio seed watermark camera_fixed content prompt image_url video_url audio_url return_last_frame".split())
+_VOLC_SUFFIX = {"PolicyViolation": "저작권 제한 가능성", "PrivacyInformation": "실존 인물 관련 가능성",
+                "TaskTypeMismatch": "요청한 작업 유형 불일치", "TaskTypeConstraint": "작업 유형별 조건 불충족"}
+
+
+def _volc_failure_reason(response: Any) -> str:
+    """Present structured evidence; never infer moderation from HTTP status or message text."""
+    if not isinstance(response, dict):
+        return ""
+    result = response.get("result")
+    diagnostic = response.get("provider_failure_diagnostics")
+    if diagnostic is None and isinstance(result, dict):
+        diagnostic = result.get("provider_failure_diagnostics")
+    projected = isinstance(diagnostic, dict) and diagnostic.get("schema") == "hmb-provider-failure-diagnostics-v1"
+    error = diagnostic if projected else response.get("error")
+    if isinstance(error, dict):
+        code = error.get("code")
+        if isinstance(code, str) and 0 < len(code) <= 128:
+            family, _, suffix = code.partition(".")
+            label = _VOLC_REASON.get(family)
+            if label:
+                moderation = "SensitiveContentDetected" in family
+                if ((moderation and suffix == "PolicyViolation")
+                        or (family in {"InputImageSensitiveContentDetected", "InputVideoSensitiveContentDetected"}
+                            and suffix == "PrivacyInformation")
+                        or (family == "InvalidParameter" and suffix in {"TaskTypeMismatch", "TaskTypeConstraint"})):
+                    label += " · " + _VOLC_SUFFIX[suffix]
+                elif suffix and (moderation or suffix.lower() not in _VOLC_PARAMS):
+                    code = family
+                params = error.get("parameters") if projected else [error.get("param")]
+                fields = [p for p in params[:16] if isinstance(p, str) and p in _VOLC_PARAMS] if isinstance(params, list) else []
+                return f"{label} ({code})" + (" · 관련 필드: " + ", ".join(dict.fromkeys(fields)) if fields else "")
+    if projected:
+        status = diagnostic.get("http_status")
+        http = f" · HTTP {status}" if type(status) is int and 400 <= status <= 599 else ""
+        return "Volcengine 오류 · 상세 사유 미확인" + http
+    if any(response.get(key) == "Volcengine create rejected the request (HTTP 400)." for key in ("error", "detail", "message")):
+        return "Volcengine 생성 요청 거절 (HTTP 400) · 공급자 상세 코드가 없어 사유를 확인할 수 없습니다."
+    return ""
+
+
+
 def _broker_error_details(response: Any, *, secret: str = "") -> str:
     """Keep failure reasons/field paths, excluding credentials and input echoes."""
 
@@ -2915,6 +2980,9 @@ class _HMBAIBrokerBridge:
             if isinstance(detail, dict)
             else ""
         )
+        provider_reason = _volc_failure_reason(detail)
+        if provider_reason:
+            return provider_reason + f" [Broker HTTP {status_code}]"
         lowered = body.decode("utf-8", "replace").casefold()
         summary = cls._http_error_summary(status_code, error_code, lowered)
         safe_detail = _broker_error_details(detail, secret=secret)
@@ -7600,7 +7668,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if selected is not None:
                 self._hmb_commit_seedance_mode(basket_shot_uuid)
         # A manually added node can auto-adopt the first available Shot.
-        # Rodong Mart waits for its own project and, when required, CGT.
+        # Rodong Mart initializes from the active shot of its own ImageAsset.
         # Once the user explicitly chooses
         # Only, later catalog refreshes must preserve that independent mode.
         # Existing UUIDs retain authority across rename/renumber.  A deleted
@@ -10014,8 +10082,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         mode_getter = getattr(self, "_hmb_seedance_execution_mode", None)
         if not callable(mode_getter) or mode_getter() != "only":
             self._reconcile_shared_shot_routing(strict=True)
-        if (getattr(self, "metadata", {}) or {}).get(SEEDANCE_SETUP_PENDING) is True:
-            raise ValueError("로동마트의 샷 선택을 완료해 주세요.")
         if callable(mode_getter) and mode_getter() == "waiting":
             raise ValueError("The selected Shot is waiting for its original library binding. Restore that Shot, or explicitly select Only.")
         only_guard = getattr(self, "_assert_only_mode_inputs", None)
@@ -13214,7 +13280,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 str(response.get("provider_job_id") or "").strip()
             )
         if status in TERMINAL_FAILURE_STATUSES or response.get("error") or response.get("detail"):
-            safe_detail = _broker_error_details(response)
+            safe_detail = _volc_failure_reason(response) or _broker_error_details(response)
             if safe_detail:
                 task["error_details"] = safe_detail
         if video_url or last_frame_url:

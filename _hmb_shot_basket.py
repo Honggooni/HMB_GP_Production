@@ -429,9 +429,9 @@ def initial_seedance_shot(generator: Any, image: Any) -> str:
             or target.get("project_id") != source.get("project_id")):
         return ""
     state = image._current_state()
-    if not source.get("project_id") or source["project_id"] != state.get("project_id") or state.get("error"):
+    if not source.get("project_id") or source["project_id"] != state.get("project_id"):
         return ""
-    shot = _active_basket_shot(state, _basket_shots(state, source))
+    shot = _active_basket_shot(state, state["shot_routing"]["shots"])
     return shot["shot_uuid"] if shot else ""
 
 
@@ -451,10 +451,10 @@ def _status(flow: Any, kinds: dict, projects: list[dict], discovering: bool) -> 
         return result
     state = kinds["image"]._current_state()
     target = marker["project_id"]
-    shots = _basket_shots(state, marker)
+    shots = state["shot_routing"]["shots"]
     shot = _active_basket_shot(state, shots)
     if marker.get("cgt_required") is True:
-        result.update(cgt_required=True, cgt_bound=bool(shots))
+        result.update(cgt_required=True, cgt_bound=bool(_basket_shots(state, marker)))
     result["project_id"] = state.get("project_id") or target
     result["shot_uuid"] = shot["shot_uuid"] if shot else ""
     result["shots"] = [{key: row[key] for key in ("shot_uuid", "name", "number")} for row in shots]
@@ -942,8 +942,6 @@ def handle_workspace_request(engine: Any, request: dict) -> dict:
         if response["status"] != "ready":
             return {**response, "items": [], "next_offset": None}
         state, shot = _shot_state(kinds, shot_uuid)
-        if shot not in _basket_shots(state, kinds["image"].metadata[_MARKER]):
-            raise BasketError("ImageAsset의 샷 추가에서 CGT 컷을 연결한 뒤 소스를 담으세요.")
         response["shot_uuid"] = shot_uuid
         request_id = _text(request.get("request_id", ""), 128)
         workspace_id = kinds["image"].metadata[_MARKER]["workspace_id"]

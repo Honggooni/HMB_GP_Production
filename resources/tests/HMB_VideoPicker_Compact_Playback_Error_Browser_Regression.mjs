@@ -58,8 +58,15 @@ try {
   const value={runtime_instance_id:'compact-error-browser',language:'en',state_revision:1,state_writer:'python',active_picker_shot_uuid:shot,shot_uuid:shot,preview_video_uid:'a',selected_video_uid:'a',viewport_mode:'video',
     picker_shots:[{workspace_uuid:shot,name:'Error retry',number:1,video_asset_uids:['a','b','c'],selected_video_uids:['a'],preview_video_uid:'a'}],
     videos:['a','b','c'].map(id=>({video_uid:id,source_uid:id,video_path:`C:/fixture/${id}.webm`,video_url:origin+`/${id}.webm`,label:id,picker_shot_uuid:shot,frame_count:8,source_fps:12}))};
+  value.videos[1].thumbnail_url = await page.evaluate(() => document.createElement("canvas").toDataURL());
   await page.evaluate(value=>window.mountState(value),value);await page.waitForFunction(()=>window.root.querySelector('.hmbvp'));
   if(await page.evaluate(()=>window.root.__hmbVideoPickerExpanded===true))await page.locator('[data-picker-toggle-surface="header"]').dispatchEvent('dblclick');
+  // A supplied still and a frame captured from video must paint before any playback.
+  await page.waitForFunction(() => ['b','c'].every(uid => {
+    const poster = window.root.querySelector('[data-video-uid="' + uid + '"] .compact-video-poster');
+    return poster && !poster.hidden && poster.naturalWidth > 0;
+  }));
+  assert.equal(await page.evaluate(() => window.events.some(e => e.name === 'play')), false);
   const geometry=await page.locator('[data-video-uid="a"]').first().evaluate(el=>({width:el.offsetWidth,height:el.offsetHeight,border:getComputedStyle(el).borderColor,background:getComputedStyle(el).backgroundColor}));
   await page.locator('[data-play-video-uid="a"]').click();
   await page.waitForFunction(()=>window.root.__hmbCompactSharedVideoPlayer?.error?.code===4);
@@ -100,6 +107,23 @@ try {
   assert.equal(await page.evaluate(origin=>window.api.hmbShowVideoPickerCompactPlaybackFailure(window.root,window.ownedMedia,{uid:'b',url:origin+'/b.webm'},'Previous runtime'),origin),false);
   await page.locator('[data-play-video-uid="a"]').click();await page.waitForFunction(()=>{const v=window.root.__hmbCompactSharedVideoPlayer;return v&&!v.error&&!v.paused&&v.currentTime>.1;});
   assert.equal(await page.locator('[data-compact-preview-load-status]').count(),0);assert.deepEqual(errors,[]);assert.deepEqual(external,[]);
+  // A second compact inspector mounting last used to turn the expanded card horizontal.
+  await page.evaluate(() => {
+    window.inspectorStyle = window.root.querySelector('style[data-picker-compact-style]').cloneNode(true);
+  });
+  await page.locator('[data-picker-toggle-surface="header"]').dispatchEvent('dblclick');
+  const originalCard = page.locator('.video-asset-card[data-video-uid="a"]');
+  const appearance = el => [getComputedStyle(el).display, getComputedStyle(el.parentNode).display,
+    el.querySelector('.video-asset-delete').offsetWidth, el.querySelector('.video-asset-copy').offsetTop,
+    getComputedStyle(el.querySelector('.video-asset-play')).width];
+  const baseline = await originalCard.evaluate(appearance);
+  assert.ok(baseline[2] > 0 && baseline[3] > 0);
+  for (let i = 0; i < 2; i++) {
+    await page.evaluate(() => document.body.append(window.inspectorStyle));
+    assert.deepEqual(await originalCard.evaluate(appearance), baseline);
+    await page.evaluate(() => window.inspectorStyle.remove());
+  }
+  await page.locator('[data-picker-toggle-surface="header"]').dispatchEvent('dblclick');
   await page.evaluate(()=>window.controller.cleanup());
   console.log('Picker compact playback error: PASS (native media-error feedback, same-source retry, exact owner, source/selection switch, cleanup/remount; memory-only fixture)');
 } catch(error) {

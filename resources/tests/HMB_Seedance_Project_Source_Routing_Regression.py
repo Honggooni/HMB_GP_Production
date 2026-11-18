@@ -246,6 +246,7 @@ class ProjectSourceTests(unittest.TestCase):
             values = base.params(action)
             values.update(prompt='한국어 {{SIGN}} {% raw %} 🙂', resolution='480p', seed=0, generate_audio=False)
             original = deepcopy(values)
+            node.metadata = {**getattr(node, 'metadata', {}), t.SEEDANCE_SETUP_PENDING: True}
             with graph.context():
                 resolved = node._resolve_exact_shot_generation_inputs(values)
                 wire = node._build_broker_payload(resolved)

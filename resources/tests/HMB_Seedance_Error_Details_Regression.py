@@ -68,11 +68,40 @@ class ErrorDetailTests(unittest.TestCase):
         self.assertIn("req-001", after["error_details"])
         self.assertIn("model is not enabled", target.HMBSeedanceGeneration._broker_terminal_failure_message(after, "job-diag"))
 
-    def test_nested_provider_error_keeps_code_message_parameter(self):
+    def test_nested_provider_error_keeps_code_parameter_without_raw_echo(self):
         task = self.task(error={"code": "InvalidParameter.Model", "message": "모델 권한 확인", "param": "model"})
-        for value in ("InvalidParameter.Model", "모델 권한 확인", "param: model"):
+        self.assertNotIn("모델 권한 확인", task["error_details"])
+        for value in ("InvalidParameter.Model", "요청 파라미터 오류", "관련 필드: model"):
             self.assertIn(value, task["error_details"])
         self.assertNotIn("error_code", task)  # Provider text cannot change Broker control codes.
+
+    def test_projected_create_and_poll_reasons_match(self):
+        for code, label in (
+            ("InputTextSensitiveContentDetected", "프롬프트"), ("InputImageSensitiveContentDetected", "입력 이미지"),
+            ("InputVideoSensitiveContentDetected", "입력 영상"), ("OutputVideoSensitiveContentDetected", "생성 영상"),
+            ("InputImageSensitiveContentDetected.PrivacyInformation", "실존 인물"),
+            ("InvalidParameter.TaskTypeMismatch", "작업 유형 불일치"),
+        ):
+            with self.subTest(code=code):
+                diagnostic = {"schema": "hmb-provider-failure-diagnostics-v1", "code": code, "http_status": 400,
+                              "parameters": ["duration", "private-canary"], "message": "private-canary"}
+                exc = target.urllib.error.HTTPError("https://broker.invalid", 502, "error", {}, None)
+                create = target._HMBAIBrokerBridge._safe_http_error_message(exc, body=json.dumps(
+                    {"provider_failure_diagnostics": diagnostic, "detail": "private-canary"}).encode())
+                task = self.task(result={"provider_failure_diagnostics": diagnostic}, error="private-canary")
+                for value in (create, task["error_details"]):
+                    self.assertIn(code, value)
+                    self.assertIn(label, value)
+                    self.assertNotIn("private-canary", value)
+                self.assertNotIn("error_code", task)
+
+    def test_no_provider_code_does_not_invent_moderation(self):
+        task = self.task(error="Volcengine create rejected the request (HTTP 400).")
+        self.assertIn("상세 코드가 없어", task["error_details"])
+        self.assertNotIn("심사 거절", task["error_details"])
+        task = self.task(provider_failure_diagnostics={"schema": "hmb-provider-failure-diagnostics-v1",
+                         "code": "", "http_status": 400, "hint": "provider_content_rejected"})
+        self.assertIn("사유 미확인", task["error_details"])
 
     def test_validation_detail_preserves_field_not_input_or_context(self):
         task = self.task(detail=[{"loc": ["body", "resolution"], "msg": "Unsupported 1080p", "type": "value_error",
@@ -205,6 +234,7 @@ class ErrorDetailTests(unittest.TestCase):
             }
             # Transport/retry fixture: retained graph provenance is covered by
             # the project-source suite; keep operation snapshot guards active.
+            node._manual_agent_prompt_source = lambda: None
             selection = {"schema": target.PROJECT_SELECTION_SCHEMA,
                          "project": {"project_id": "superwings12", "project_name": "슈퍼윙즈12"}}
             node._capture_imageasset_project_selection = lambda: deepcopy(selection)
