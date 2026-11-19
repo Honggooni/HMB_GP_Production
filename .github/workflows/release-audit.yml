@@ -2,6 +2,8 @@ name: release-audit
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "17 22 * * *"
   push:
   pull_request:
 
@@ -16,11 +18,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Compare Windows Desktop Stable with the tested distribution
+        run: python .github/scripts/check_desktop_stable.py
       - working-directory: resources/tests
         run: python -m unittest -v HMB_Sound_Library_Regression.SoundLinkRegression.test_actual_symlink_escape_if_supported
         env:
           HMB_REQUIRE_SOUND_SYMLINK: "1"
   windows-release-audit:
+    if: github.event_name != 'schedule'
     needs: sound-link
     runs-on: windows-latest
     timeout-minutes: 30
@@ -338,6 +343,8 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Supports Desktop 0.30.3 and Editor 0.130.2. Restores the Rodong Mart startup screen, reloads saved Image Generation options and keeps CGT Shot selection through local edit conflicts and task-status changes.",
+            "- Checks the official Windows stable package identity daily and before Team distribution. A new or republished build requires compatibility verification.",
             "- Continue editing another Shot while generators are busy. Maya Mask and Depth output publishes on the editor event loop, pending media checks wait before Agent execution, and sound validation follows the bound Shot.",
             "- In HMBPrompt, enable the sound range bar and drag empty space to cut multiple cues from one sound. Click a cue for source trim and shot placement. Korean sound usage labels, speaker reference and the full-width dialogue field are included.",
             "- Seedance 2.5 supports 4K in Team and Local when the broker advertises 4K. The default remains 480p Draft in MOV.",
