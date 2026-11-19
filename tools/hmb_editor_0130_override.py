@@ -5,7 +5,7 @@ import uuid
 from .hmb_rodong_editor_0130 import build
 from .restore_rodong_local_editor import (
     OVERLAY, OVERLAY_DIGEST, STOCK_BUNDLE, STOCK_DIGEST,
-    entry_for_overlay, stock_entry_from_active,
+    editor_profile, entry_for_overlay, stock_entry_from_active,
 )
 
 
@@ -20,13 +20,13 @@ def _stock_entry(entry: bytes, digest) -> bytes:
         versioned = ref + b"?hmb-team=" + LEGACY_CANDIDATE[:16].encode("ascii")
         mapping = b'<script type="importmap">{"imports":{"' + ref + b'":"' + versioned + b'"}}</script>\n    '
         entry = entry.replace(mapping, b"", 1).replace(b'src="' + versioned + b'"', b'src="' + ref + b'"', 1)
-    return stock_entry_from_active(entry, OVERLAY)
+    return stock_entry_from_active(entry, editor_profile(entry).overlay)
 
 
-def _stock_source(source: bytes, state: Path, io) -> bytes:
-    if io.sha256(source) == STOCK_DIGEST:
+def _stock_source(source: bytes, state: Path, io, expected=STOCK_DIGEST) -> bytes:
+    if io.sha256(source) == expected:
         return source
-    if io.sha256(source) != LEGACY_CANDIDATE:
+    if expected != STOCK_DIGEST or io.sha256(source) != LEGACY_CANDIDATE:
         raise ValueError("Unknown Editor 0.130 source; existing files preserved.")
     # The previous updater edited the original bundle in place. Recover the
     # exact original from its bounded backup inventory.
@@ -48,21 +48,24 @@ def _stock_source(source: bytes, state: Path, io) -> bytes:
 
 def _inputs(editor: Path, io, descriptor_sha: str):
     entry = io._release_plain_path(editor / "index-editor.html")
-    stock = io._release_plain_path(editor / "assets" / STOCK_BUNDLE)
-    target = io._release_plain_path(editor / "assets" / OVERLAY)
-    if entry.stat().st_size > 1024 * 1024 or stock.stat().st_size > 64 * 1024 * 1024:
-        raise ValueError("Editor 0.130 source is oversized.")
+    if entry.stat().st_size > 1024 * 1024:
+        raise ValueError("Editor entry is oversized")
     before = entry.read_bytes()
+    profile = editor_profile(before)
+    stock = io._release_plain_path(editor / "assets" / profile.bundle)
+    target = io._release_plain_path(editor / "assets" / profile.overlay)
+    if stock.stat().st_size > 64 * 1024 * 1024:
+        raise ValueError("Editor 0.130 source is oversized.")
     original = stock.read_bytes()
-    after = entry_for_overlay(_stock_entry(before, io.sha256), OVERLAY)
+    after = entry_for_overlay(_stock_entry(before, io.sha256), profile.overlay)
     state = io._release_plain_path(io.RELEASE_STATE_ROOT)
-    candidate = build(_stock_source(original, state, io))
-    if io.sha256(candidate) != OVERLAY_DIGEST:
+    candidate = build(_stock_source(original, state, io, profile.stock_digest))
+    if io.sha256(candidate) != profile.overlay_digest:
         raise ValueError("Editor 0.130 candidate differs from the verified Local build.")
     if target.exists() and (target.stat().st_size != len(candidate) or target.read_bytes() != candidate):
         raise ValueError("Editor 0.130 overlay path contains unreviewed bytes.")
     plan = {"schema": PLAN_SCHEMA, "version": 1, "status": "prepared",
-            "target": str(target), "source_profile": "reviewed-adapter", "candidate_sha256": OVERLAY_DIGEST,
+            "target": str(target), "source_profile": "reviewed-adapter", "candidate_sha256": profile.overlay_digest,
             "descriptor_sha256": descriptor_sha, "original_sha256": io.sha256(original),
             "entry_target": str(entry), "entry_original_sha256": io.sha256(before), "entry_candidate_sha256": io.sha256(after),
             "app_identity": io._git_override_app_identity(), "sdk_preflight": io._release_sdk_preflight(),
@@ -102,7 +105,7 @@ def _rollback(editor: Path, io, descriptor_sha: str, path: Path) -> dict:
     backup = io._release_plain_path(path.parent / "before.html").read_bytes()
     if io.sha256(backup) != plan["entry_original_sha256"]:
         raise ValueError("Editor 0.130 backup changed; rollback refused.")
-    reviewed = entry_for_overlay(_stock_entry(backup, io.sha256), OVERLAY)
+    reviewed = entry_for_overlay(_stock_entry(backup, io.sha256), editor_profile(backup).overlay)
     current = entry.read_bytes()
     if io._git_override_app_identity() != plan["app_identity"] or current not in (backup, reviewed):
         raise ValueError("Editor changed outside this installation; rollback refused.")

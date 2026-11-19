@@ -196,6 +196,20 @@ jobs:
           python -c "import pathlib,sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); pathlib.Path(sys.argv[2]).write_bytes(z.read('griptape_nodes_editor_dist/editor/assets/index-B4peacnU.js'))" $wheel $env:HMB_STOCK_EDITOR_0130_SOURCE
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node resources/tests/HMB_Native_Stock_Deletion_Safety_Browser_Regression.mjs --evidence-path "${{ runner.temp }}/hmb-coverage/stock-editor/stock-editor-0130.json"
+      - name: Check the Desktop 0.30.3 Editor overlay and integrated headers
+        shell: pwsh
+        run: |
+          $wheel = Join-Path $env:RUNNER_TEMP 'editor-01302.whl'
+          Invoke-WebRequest -Uri 'https://files.pythonhosted.org/packages/41/9f/45869a2dfd7bc9d7155b148c37590f5790932ea7cb04b5692d814854b5f9/griptape_nodes_editor_dist-0.130.2-py3-none-any.whl' -OutFile $wheel
+          if ((Get-FileHash $wheel -Algorithm SHA256).Hash -ine 'e54afb87d9c294ff7ca5d6a2f6b1297ffda7ca08fb3270252d93afd90a703233') { throw 'Editor 0.130.2 wheel hash mismatch' }
+          $fixtures = Join-Path $env:RUNNER_TEMP 'editor-01302'
+          $env:HMB_STOCK_EDITOR_0130_SOURCE = Join-Path $fixtures 'index-DW0x78hS.js'
+          $env:HMB_HEADER_0130_CANDIDATE = Join-Path $fixtures 'overlay.js'
+          python -c "import pathlib,sys,zipfile; sys.path.insert(0,'tools'); from hmb_griptape_update_preflight import EDITOR_1302_FIXTURES,build,EDITOR_1302; z=zipfile.ZipFile(sys.argv[1]); d=pathlib.Path(sys.argv[2]); d.mkdir(); [d.joinpath(n).write_bytes(z.read('griptape_nodes_editor_dist/editor/assets/'+n)) for n in EDITOR_1302_FIXTURES]; d.joinpath('overlay.js').write_bytes(build(d.joinpath(EDITOR_1302.bundle).read_bytes()))" $wheel $fixtures
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node resources/tests/HMB_Editor_0130_Integrated_Header_Regression.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node resources/tests/HMB_Native_Stock_Deletion_Safety_Browser_Regression.mjs --evidence-path "${{ runner.temp }}/hmb-coverage/stock-editor/stock-editor-01302.json"
       - name: JavaScript widget regressions with required browser coverage
         shell: pwsh
         run: python tools/audit_regression_coverage.py --run javascript --report "${{ runner.temp }}/hmb-coverage/javascript.json"

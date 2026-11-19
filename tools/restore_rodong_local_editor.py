@@ -8,6 +8,7 @@ from pathlib import Path
 import os
 import subprocess
 import tempfile
+from typing import NamedTuple
 
 
 STOCK_BUNDLE = "index-B4peacnU.js"
@@ -21,24 +22,54 @@ PREVIOUS_OVERLAYS = ("index-hmb-rodong-bab22aebf56f9e49.js", "index-hmb-rodong-1
                      "index-hmb-rodong-2bcf846ae6211a01.js")
 
 
+class EditorProfile(NamedTuple):
+    bundle: str
+    stock_digest: str
+    entry_digest: str
+    overlay_digest: str
+
+    @property
+    def overlay(self):
+        return f"index-hmb-rodong-{self.overlay_digest[:16]}.js"
+
+    @property
+    def ref(self):
+        return f"./assets/{self.bundle}".encode("ascii")
+
+
+EDITOR_1300 = EditorProfile(STOCK_BUNDLE, STOCK_DIGEST, STOCK_ENTRY_DIGEST, OVERLAY_DIGEST)
+EDITOR_1302 = EditorProfile("index-DW0x78hS.js",
+    "8433f4e108e2416707c6877354234607aaa2cb8b4e15fe080856fdd656771d17",
+    "17312cf62335309843550d34f0b7eedd2ddd8dce0584eb9c116448e202abebc3",
+    "ba1b96f56bc3c4651733677cc469c152d98d3cf47b8dd85f8693f4fe897c7b39")
+
+
+def editor_profile(entry: bytes) -> EditorProfile:
+    return EDITOR_1302 if EDITOR_1302.ref in entry else EDITOR_1300
+
+
 def entry_for_overlay(stock_entry: bytes, overlay_name: str) -> bytes:
-    if sha256(stock_entry).hexdigest() != STOCK_ENTRY_DIGEST or stock_entry.count(STOCK_SCRIPT) != 1:
+    profile = editor_profile(stock_entry)
+    ref = profile.ref
+    script = b'<script type="module" crossorigin src="' + ref + b'"></script>'
+    if sha256(stock_entry).hexdigest() != profile.entry_digest or stock_entry.count(script) != 1:
         raise ValueError("Editor entry is outside the reviewed profile")
     overlay_ref = f"./assets/{overlay_name}".encode("ascii")
-    # The Editor's lazy chunks import the stock entry by name. Resolve that
-    # import to the active overlay so all chunks share one set of stores.
-    mapping = b'<script type="importmap">{"imports":{"' + STOCK_REF + b'":"' + overlay_ref + b'"}}</script>'
-    return stock_entry.replace(STOCK_SCRIPT, mapping + b"\n    " + STOCK_SCRIPT.replace(STOCK_REF, overlay_ref))
+    mapping = b'<script type="importmap">{"imports":{"' + ref + b'":"' + overlay_ref + b'"}}</script>'
+    return stock_entry.replace(script, mapping + b"\n    " + script.replace(ref, overlay_ref))
 
 
 def stock_entry_from_active(entry: bytes, overlay_name: str) -> bytes:
-    if sha256(entry).hexdigest() == STOCK_ENTRY_DIGEST:
+    profile = editor_profile(entry)
+    if sha256(entry).hexdigest() == profile.entry_digest:
         return entry
-    for name in (overlay_name, *PREVIOUS_OVERLAYS):
+    previous = PREVIOUS_OVERLAYS if profile == EDITOR_1300 else ()
+    for name in (overlay_name, *previous):
         overlay_ref = f"./assets/{name}".encode("ascii")
-        mapping = b'<script type="importmap">{"imports":{"' + STOCK_REF + b'":"' + overlay_ref + b'"}}</script>\n    '
-        stock = entry.replace(mapping, b"", 1).replace(STOCK_SCRIPT.replace(STOCK_REF, overlay_ref), STOCK_SCRIPT, 1)
-        if sha256(stock).hexdigest() == STOCK_ENTRY_DIGEST:
+        ref = profile.ref
+        mapping = b'<script type="importmap">{"imports":{"' + ref + b'":"' + overlay_ref + b'"}}</script>\n    '
+        stock = entry.replace(mapping, b"", 1).replace(b'src="' + overlay_ref + b'"', b'src="' + ref + b'"', 1)
+        if sha256(stock).hexdigest() == profile.entry_digest:
             return stock
     raise ValueError("Editor entry is outside the reviewed profile")
 
@@ -80,13 +111,14 @@ if ($active) { [Console]::Write('active') }
 
 def restore(editor: Path) -> str:
     entry = editor / "index-editor.html"
-    stock = editor / "assets" / STOCK_BUNDLE
-    active = editor / "assets" / OVERLAY
     original = entry.read_bytes()
-    updated = entry_for_overlay(stock_entry_from_active(original, OVERLAY), OVERLAY)
-    if sha256(stock.read_bytes()).hexdigest() != STOCK_DIGEST:
+    profile = editor_profile(original)
+    stock = editor / "assets" / profile.bundle
+    active = editor / "assets" / profile.overlay
+    updated = entry_for_overlay(stock_entry_from_active(original, profile.overlay), profile.overlay)
+    if sha256(stock.read_bytes()).hexdigest() != profile.stock_digest:
         raise ValueError("Stock Editor bundle is outside the reviewed profile")
-    if updated == original and active.is_file() and sha256(active.read_bytes()).hexdigest() == OVERLAY_DIGEST:
+    if updated == original and active.is_file() and sha256(active.read_bytes()).hexdigest() == profile.overlay_digest:
         return "already active"
     if griptape_running():
         return "Desktop or engine already running"
@@ -94,9 +126,9 @@ def restore(editor: Path) -> str:
     # patched file surviving a Desktop repair.
     from hmb_rodong_editor_0130 import build
     overlay = build(stock.read_bytes())
-    if sha256(overlay).hexdigest() != OVERLAY_DIGEST:
+    if sha256(overlay).hexdigest() != profile.overlay_digest:
         raise ValueError("HMB overlay sources differ from the reviewed build")
-    if not active.is_file() or sha256(active.read_bytes()).hexdigest() != OVERLAY_DIGEST:
+    if not active.is_file() or sha256(active.read_bytes()).hexdigest() != profile.overlay_digest:
         atomic_write(active, overlay)
     if griptape_running():
         return "Desktop or engine already running"
@@ -112,7 +144,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         editor_package = distribution("griptape-nodes-editor-dist")
-        if (version("griptape-nodes"), editor_package.version) != ("0.104.0", "0.130.0"):
+        if (version("griptape-nodes"), editor_package.version) not in (("0.104.0", "0.130.0"), ("0.104.2", "0.130.2")):
             raise ValueError("SDK and Editor versions need isolated preflight")
         bundled_editor = Path(editor_package.locate_file("griptape_nodes_editor_dist/editor")).resolve()
         if args.editor.resolve() != bundled_editor:

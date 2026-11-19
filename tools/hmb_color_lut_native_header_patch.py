@@ -1196,9 +1196,9 @@ def _git_override_apply_active_unlocked() -> dict:
 
 EDITOR_0130_OVERLAY_INPUTS = {
     "tools/hmb_editor_0130_header.py": "6a19194fb495494e05e3b41aea717a337c40a729713d6d90db13306a168c684d",
-    "tools/restore_rodong_local_editor.py": "19b72031e21044fa4320d866ecaf504da9e5c7ffc7e3d8a8308880829b3fbd63",
-    "tools/hmb_rodong_editor_0130.py": "12f717c2275cc2147ac255248a9f16618a63189b0414efc0ebadc08f560ee5b9",
-    "tools/hmb_editor_0130_override.py": "90edf0cb9bfc9fdc1c1fdd2678f67b3d01bbf07e259272f0b855751993dac189",
+    "tools/restore_rodong_local_editor.py": "37a387de5b17c16f7a72d007d20d995b23823ecdbf74fae658f6df3f20077255",
+    "tools/hmb_rodong_editor_0130.py": "e0385c2eb552764c5d9dab0957d58852c735cc5c60f8afe7a3f0d1ce50227483",
+    "tools/hmb_editor_0130_override.py": "9d9cc2d4004ad8bb2b8322036fbb700c72e5d035f158f23e7aa7303bb3f72058",
     "resources/editor/hmb-header-0130.js": "488c40fdb65327be7f30c74a2e33203aa2e29948ad66b6c2c894fd5a35c54a04",
     "resources/editor/hmb-rodong-editor-0130.js": "87a8b9b8deeb6410c43198c48c24bb69e08285a3c0efce858545bbf492d07354",
     "resources/editor/hmb-continue-work-art.js": "419ba13a410851923241a8ec8bafa5f17c0d4cbf22162ca5b21216f05514c411",

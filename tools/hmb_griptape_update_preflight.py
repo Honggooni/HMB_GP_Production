@@ -15,7 +15,7 @@ from tempfile import TemporaryDirectory
 
 from hmb_editor_0130_header import HEADER_SOURCE
 from hmb_rodong_editor_0130 import STOCK_SHA256, build
-from restore_rodong_local_editor import entry_for_overlay, stock_entry_from_active
+from restore_rodong_local_editor import EDITOR_1302, editor_profile, entry_for_overlay, stock_entry_from_active
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +29,13 @@ EDITOR_0130_FIXTURES = {
     "rolldown-runtime-DSDNlrLa.js": "9642411c8411b70e62cea3e38c4093f5fcd4419ec151356d87dc835062db7b69",
     "index-CU0rDeoz.css": "0b9f857574a87b404d107677bd21a5d5cd1fb28f130385d62300e3055017fda9",
 }
+EDITOR_1302_FIXTURES = {
+    EDITOR_1302.bundle: EDITOR_1302.stock_digest,
+    "EngineContext-B0JaCG1N.js": "6ea1e20cb6cb2c728f44bf8bb50253bd55e5f99a68ea5b805b2b474d9b647d06",
+    "react-Cwox1F5v.js": "aae8144f8b0ba979cc255ad06f3b408c81bab69bf96667fedeeb15f81ace14af",
+    "rolldown-runtime-DSDNlrLa.js": "9642411c8411b70e62cea3e38c4093f5fcd4419ec151356d87dc835062db7b69",
+    "index-CAsWDvO5.css": "55da1d3d58b3e0cd274255adbe4981a82af11960de6cf441283f00dbb63aafac",
+}
 HEADER_CHECK = "HMB_Editor_0130_Integrated_Header_Regression.mjs"
 DELETION_CHECK = "HMB_Native_Stock_Deletion_Safety_Browser_Regression.mjs"
 CHECKS = (
@@ -36,6 +43,8 @@ CHECKS = (
     ("HMB_CGT_Own_Task_Regression.py", {}),
     ("HMB_CGT_Thumbnail_Bridge_Mount_Host_Regression.py", {}),
     ("HMB_Image_Generation_Protocol_Regression.py", {}),
+    ("HMB_Image_Generation_Host_Regression.py", {}),
+    ("HMB_CGT_Work_Start_Node_Regression.py", {}),
     ("HMB_Common_Connection_Management_Host_Regression.py", {}),
     ("HMB_Connected_Deletion_Guard_Host_Regression.py", {}),
     ("HMB_Prompt_Save_Roundtrip_Host_Regression.py", {}),
@@ -115,11 +124,12 @@ def digest(path: Path) -> str:
         return file_digest(stream, "sha256").hexdigest()
 
 
-def inspect_editor_fixtures(assets: Path) -> dict[str, str]:
-    for name, expected_sha in EDITOR_0130_FIXTURES.items():
+def inspect_editor_fixtures(assets: Path, fixtures=None) -> dict[str, str]:
+    fixtures = EDITOR_0130_FIXTURES if fixtures is None else fixtures
+    for name, expected_sha in fixtures.items():
         if digest(assets / name) != expected_sha:
             raise ValueError(f"Editor asset does not match the reviewed 0.130 distribution: {name}")
-    return dict(EDITOR_0130_FIXTURES)
+    return dict(fixtures)
 
 
 def version(site: Path, package: str) -> str:
@@ -145,15 +155,16 @@ def inspect_candidate(candidate: Path, *, header_source: Path = HEADER_SOURCE) -
     site = candidate / PYTHON_ROOT / "Lib/site-packages"
     sdk = version(site, "griptape_nodes")
     editor_version = version(site, "griptape_nodes_editor_dist")
-    if (sdk, editor_version) != ("0.104.0", "0.130.0"):
+    expected_engine = {("0.104.0", "0.130.0"): "0.108.0", ("0.104.2", "0.130.2"): "0.108.1"}.get((sdk, editor_version))
+    if expected_engine is None:
         raise ValueError(f"Unreviewed SDK/Editor pair: {sdk}/{editor_version}")
     engine = version(site, "griptape_nodes_engine")
-    if engine != "0.108.0":
-        raise ValueError(f"Unreviewed Griptape Nodes engine: {engine}; expected 0.108.0")
+    if engine != expected_engine:
+        raise ValueError(f"Unreviewed Griptape Nodes engine: {engine}; expected {expected_engine}")
     editor = site / "griptape_nodes_editor_dist/editor"
     entry = editor / "index-editor.html"
-    fixture_sha = inspect_editor_fixtures(editor / "assets")
-    stock = editor / "assets" / STOCK_EDITOR_ASSET
+    fixture_sha = inspect_editor_fixtures(editor / "assets", EDITOR_1302_FIXTURES if editor_version == "0.130.2" else None)
+    stock = editor / "assets" / editor_profile((editor / "index-editor.html").read_bytes()).bundle
     patched_sha = sha256(build(stock.read_bytes(), header_source=header_source)).hexdigest()
     patched = stock.with_name(f"index-hmb-rodong-{patched_sha[:16]}.js")
     html = entry.read_bytes()
@@ -186,7 +197,7 @@ def isolated_environment(folder: Path, standard: Path, editor: Path) -> dict[str
     home = folder / "home"
     home.mkdir()
     env.update(USERPROFILE=str(home), HOME=str(home), PYTHONUTF8="1",
-               PYTHONIOENCODING="utf-8", GTN_DESKTOP_DISABLE_UPDATES="1",
+               PYTHONIOENCODING="utf-8",
                HMB_GRIPTAPE_STANDARD_LIBRARY_PATH=str(standard), HMB_IMAGE_BASH_STANDARD_LIBRARY_PATH=str(standard),
                HMB_IMAGE_BASH_EDITOR_BUNDLE_PATH=str(editor))
     return env
@@ -205,12 +216,12 @@ def product_digest() -> str:
     return sha256(json.dumps(inventory, sort_keys=True).encode()).hexdigest()
 
 
-def validate_deletion_evidence(proof: Path) -> None:
+def validate_deletion_evidence(proof: Path, stock_sha: str = STOCK_SHA256) -> None:
     report = json.loads(proof.read_bytes())
     if (not isinstance(report, dict)
             or report.get("schema") != "hmb-native-stock-deletion-safety/v1"
             or report.get("passed") is not True
-            or report.get("editor_source_sha256") != STOCK_SHA256
+            or report.get("editor_source_sha256") != stock_sha
             or not isinstance(report.get("cases"), list)
             or "editor_0130_link_identity_and_checked_deletion" not in report["cases"]
             or report.get("paid_calls") != 0
@@ -219,11 +230,11 @@ def validate_deletion_evidence(proof: Path) -> None:
         raise ValueError("Editor 0.130 deletion safety evidence is incomplete")
 
 
-def validate_header_evidence(proof: Path, header_sha: str) -> None:
+def validate_header_evidence(proof: Path, header_sha: str, stock_sha: str = STOCK_SHA256) -> None:
     report = json.loads(proof.read_bytes())
     if (not isinstance(report, dict)
             or report.get("passed") is not True
-            or report.get("editor_source_sha256") != STOCK_SHA256
+            or report.get("editor_source_sha256") != stock_sha
             or report.get("header_sha256") != header_sha
             or report.get("integrated_headers") != len(LIBRARY_CHECKS)):
         raise ValueError("Editor 0.130 integrated header evidence is incomplete")
@@ -247,7 +258,7 @@ def run(candidate: Path, standard: Path, output: Path, node: str, legacy_editor_
         editor = python.parent / "Lib/site-packages/griptape_nodes_editor_dist/editor"
         # Compile into evidence only. Never modify a staged or active Desktop to run a test.
         reviewed_header = output / "reviewed-header.js"
-        stock = editor / "assets" / STOCK_EDITOR_ASSET
+        stock = editor / "assets" / editor_profile((editor / "index-editor.html").read_bytes()).bundle
         reviewed_header.write_bytes(build(stock.read_bytes(), header_source=header_source))
         result["tested_header_sha256"] = digest(reviewed_header)
         if result["tested_header_sha256"] != result["identity"]["compiled_overlay_sha256"]:
@@ -312,9 +323,10 @@ def run(candidate: Path, standard: Path, output: Path, node: str, legacy_editor_
                     or report.get("paid_calls") != 0):
                 raise ValueError("Bash readiness evidence is incomplete")
             header_proof = output / Path(HEADER_CHECK).stem / "header-0130.json"
-            validate_header_evidence(header_proof, result["tested_header_sha256"])
+            stock_sha = result["identity"]["editor_fixture_sha256"][stock.name]
+            validate_header_evidence(header_proof, result["tested_header_sha256"], stock_sha)
             deletion_proof = output / Path(DELETION_CHECK).stem / "native-safety.json"
-            validate_deletion_evidence(deletion_proof)
+            validate_deletion_evidence(deletion_proof, stock_sha)
             result["evidence_sha256"] = {
                 path.relative_to(output).as_posix(): digest(path) for path in (proof, header_proof, deletion_proof)
             }

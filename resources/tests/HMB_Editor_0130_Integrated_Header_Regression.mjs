@@ -6,29 +6,30 @@ import {nativeTestBrowserPath, nativeTestPlaywright} from './_hmb_native_editor_
 
 const sha = value => createHash('sha256').update(value).digest('hex');
 const candidateBytes = fs.readFileSync(process.env.HMB_HEADER_0130_CANDIDATE);
+const stockPath = process.env.HMB_STOCK_EDITOR_0130_SOURCE;
+const stockBytes = fs.readFileSync(stockPath);
+const editorSourceHash = sha(stockBytes);
+const patch2 = editorSourceHash === '8433f4e108e2416707c6877354234607aaa2cb8b4e15fe080856fdd656771d17';
+assert.ok(patch2 || editorSourceHash === '841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e');
 const candidate = candidateBytes.toString('utf8');
 assert.ok(candidate.includes('return hmb130IntegratedHeader(hmbHeaderSlots,(0,Z.jsxs)'));
 assert.ok(candidate.includes('hmb130ConnectionIcon(e,hmbLibrary),he.map'));
 assert.equal((candidate.match(/await hmb130PrepareNewWorkflow\(\);/g)||[]).length,3, 'File New, Workflows New and Mart startup use checked transition');
 assert.ok(!candidate.includes('await kt();'));
-const transition = candidate.match(/async function hmb130PrepareNewWorkflow\(\)\{(.*?)\}function hFn/)[1];
+const transition = candidate.match(/async function hmb130PrepareNewWorkflow\(\)\{(.*?)\}function (?:hFn|CFn)/)[1];
 for (const workflowName of ['', 'saved-fixture']) {
   const calls=[];
-  await new Function('fO','hmb130ConnectionRequest','kt',`return (async()=>{${transition};})()`)(
+  await new Function(patch2 ? 'NE' : 'fO','hmb130ConnectionRequest','kt',`return (async()=>{${transition};})()`)(
     {getState:()=>({workflowName})}, async (...args)=>calls.push(args),async()=>calls.push(['empty-stock-clear']));
   assert.deepEqual(calls, workflowName ? [['HMBPrepareWorkflowTransitionRequest',{}]] : [['empty-stock-clear']]);
 }
 const helperStart = candidate.indexOf('function hmbNativeOpenConnections(');
-const helperEnd = candidate.indexOf('function hFn(){', helperStart);
+const helperEnd = candidate.indexOf(patch2 ? 'function CFn(){' : 'function hFn(){', helperStart);
 assert.ok(helperStart > 0 && helperEnd > helperStart);
-const stockPath = process.env.HMB_STOCK_EDITOR_0130_SOURCE;
-const stockBytes = fs.readFileSync(stockPath);
-const editorSourceHash = sha(stockBytes);
-assert.equal(editorSourceHash,'841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e');
 const dependencies = new Map(Object.entries({
-  'react-Cwox1F5v.js':'0922625a90900001152ac5899de0daf62230d0c18bc54979e9cccb50dad13750',
+  'react-Cwox1F5v.js':patch2 ? 'aae8144f8b0ba979cc255ad06f3b408c81bab69bf96667fedeeb15f81ace14af' : '0922625a90900001152ac5899de0daf62230d0c18bc54979e9cccb50dad13750',
   'rolldown-runtime-DSDNlrLa.js':'9642411c8411b70e62cea3e38c4093f5fcd4419ec151356d87dc835062db7b69',
-  'EngineContext-B0JaCG1N.js':'0eac023d9df0796c79a038ea8c37415fc7c97afb979bc7aa58bc730d1672e5e6',
+  'EngineContext-B0JaCG1N.js':patch2 ? '6ea1e20cb6cb2c728f44bf8bb50253bd55e5f99a68ea5b805b2b474d9b647d06' : '0eac023d9df0796c79a038ea8c37415fc7c97afb979bc7aa58bc730d1672e5e6',
 }).map(([name,hash])=>{
   const bytes=fs.readFileSync(path.join(path.dirname(stockPath),name));
   assert.equal(sha(bytes),hash,`Unexpected Editor 0.130 dependency: ${name}`);
@@ -41,7 +42,7 @@ const runtime = [
   'import {a as e,t as i} from "./rolldown-runtime-DSDNlrLa.js";',
   'import {t as a} from "./react-Cwox1F5v.js";',
   'import {oi as wn,si as Hn,ci as Et} from "./EngineContext-B0JaCG1N.js";',
-  stock.slice(reactStart,reactEnd)+'; const Z=wn(),Cm=e(Hn()),w=Ra;',
+  stock.slice(reactStart,reactEnd)+'; const Z=wn(),Cm=e(Hn()),Pm=Cm,w=Ra;',
 ].join('\n');
 const fixture = `
 let hmbNativeStudioFlowEpoch=0;
@@ -49,7 +50,7 @@ window.requests=[]; let detached=false, token=0;
 window.soundSession='fixture-session'; window.soundReads=[]; window.soundScope=null;
 function hmb130SessionId(){return window.soundSession;}
 function hmb130SoundScope(){return window.soundScope;}
-const fO={getState:()=>({setIsSaved(){}})}, z={success(){},error(){}};
+const fO={getState:()=>({setIsSaved(){}})}, NE=fO, z={success(){},error(){}};
 function hmb130ConnectionError(error){return error.message;}
 async function hmb130ConnectionRequest(type, payload){
   requests.push({type,payload});

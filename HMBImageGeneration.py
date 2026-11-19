@@ -482,6 +482,29 @@ class HMBImageGeneration(SuccessFailureNode):
         identity = json.dumps([model_key, spec.name, descriptor], sort_keys=True, separators=(",", ":"))
         return "model_option__" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
+    def get_parameter_by_name(self, param_name: str) -> Parameter | None:
+        parameter = super().get_parameter_by_name(param_name)
+        if (parameter is not None or not isinstance(param_name, str)
+                or not param_name.startswith("model_option__")
+                or not getattr(self, "_model_settings_ready", False)
+                or self._restoring_model_settings or getattr(self, "_restoring_saved_port", False)):
+            return parameter
+        # The SDK resolves the port before dispatching a saved value or edge.
+        # Recreate only exact descriptors belonging to a known model.
+        for key, profile in (*self._cached_profiles.items(), *_BUILTIN_PROFILES.items()):
+            for spec in self._ui_option_specs(key, profile):
+                if param_name != self._option_parameter_name(key, spec):
+                    continue
+                self._restoring_saved_port = True
+                try:
+                    self._ensure_option_parameter(key, spec)
+                    if param_name not in self._active_option_parameters.values():
+                        self.hide_parameter_by_name(param_name)
+                    return super().get_parameter_by_name(param_name)
+                finally:
+                    self._restoring_saved_port = False
+        return None
+
     def _ensure_option_parameter(self, model_key: str, spec: Any) -> str:
         name = self._option_parameter_name(model_key, spec)
         cls = {"boolean": ParameterBool, "number": ParameterFloat, "integer": ParameterInt,
@@ -647,6 +670,12 @@ class HMBImageGeneration(SuccessFailureNode):
             # provider has since changed number -> integer (or boolean). They
             # are revalidated before a new create, never silently truncated.
             self.parameter_values[param_name] = deepcopy(value)
+            binding = self._option_bindings.get(param_name)
+            if binding:
+                key, option = binding
+                view = self._model_views.setdefault(key, {"core": {}, "options": {}, "auto_image_resize": True})
+                view["options"][option] = deepcopy(value)
+                self._store_model_settings()
             if emit_change:
                 self.publish_update_to_parameter(param_name, deepcopy(value))
             return

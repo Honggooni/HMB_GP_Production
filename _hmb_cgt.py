@@ -196,7 +196,8 @@ def catalog(project_id: str = "", *, binding: dict[str, Any] | None = None,
         return _failure("SDK_UNAVAILABLE")
 
 
-def verify_binding(binding: dict[str, Any], project_id: str, snapshot: dict[str, Any]) -> None:
+def verify_binding(binding: dict[str, Any], project_id: str, snapshot: dict[str, Any],
+                   *, refresh_status: bool = False) -> None:
     """Compare saved source identities with a newly authenticated own-task read."""
     if snapshot.get("status") != "ready":
         raise ValueError("CGT 본인 작업을 다시 확인할 수 없습니다. 새로고침 후 확정하세요.")
@@ -215,7 +216,8 @@ def verify_binding(binding: dict[str, Any], project_id: str, snapshot: dict[str,
         task = tasks.get(member.get("cgt_task_id"))
         if (not task or member.get("cgt_identity") != task.get("identity")
                 or member.get("source_name") != task.get("source_name")
-                or member.get("artist") != task.get("artist") or member.get("status") != task.get("status")
+                or member.get("artist") != task.get("artist")
+                or (not refresh_status and member.get("status") != task.get("status"))
                 or scope.get("pipeline_id") != task.get("pipeline_id")):
             raise ValueError("CGT 샷 이름·배정·상태가 변경되었습니다. 새로고침 후 다시 선택하세요.")
 
@@ -725,7 +727,7 @@ def _read_own(request: dict[str, Any], *, _after_read=None) -> dict[str, Any]:
     tasks.sort(key=lambda row: (row["episode"], row["source_name"], row["task_id"]))
     result.update(tasks=tasks, truncated=truncated)
     if binding is not None:
-        verify_binding(binding, project_key, result)
+        verify_binding(binding, project_key, result, refresh_status=_after_read is None)
     if _after_read is not None:
         def start_one(task_id: str) -> Any:
             nonlocal active_write

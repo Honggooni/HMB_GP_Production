@@ -220,6 +220,14 @@ class CGTWorkNode(unittest.TestCase):
   self.assertEqual([r['shot_uuid'] for r in saved['shot_routing']['shots']],
    [r['shot_uuid'] for r in opened['shot_routing']['shots']])
 
+ def test_authenticated_status_change_between_selection_and_confirm(self):
+  self.catalogmock.return_value['tasks'][0]['status']='Work'
+  self.commit()
+  self.assertEqual(self.holder['responses'][-1]['outcome'],'committed')
+  saved=self.holder['state']['shot_hierarchy']['members']
+  self.assertEqual([m['gp_shot_uuid'] for m in saved],[m['gp_shot_uuid'] for m in self.members])
+  self.assertEqual(saved[0]['status'],'Work')
+
  def test_stale_structural_confirm_returns_result_without_native_parameter_exception(self):
   self.command['expected_structure']=routing.shot_hierarchy_edit_structure(self.state)
   self.holder['state']['shot_routing']['generation']+=1
@@ -227,7 +235,7 @@ class CGTWorkNode(unittest.TestCase):
   before=copy.deepcopy(self.holder['state'])
   self.commit()
   self.assertEqual(self.holder['responses'][-1]['outcome'],'rejected')
-  self.assertEqual(self.holder['responses'][-1]['state']['status'],'SOURCE_CHANGED')
+  self.assertEqual(self.holder['responses'][-1]['state']['status'],'SHOT_STRUCTURE_CHANGED')
   self.assertEqual(self.holder['state'],before)
   self.catalogmock.assert_not_called();self.startmock.assert_not_called()
 

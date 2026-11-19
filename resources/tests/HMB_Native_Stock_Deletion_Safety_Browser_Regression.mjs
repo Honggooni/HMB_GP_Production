@@ -19,7 +19,8 @@ const newEditorPath=process.env.HMB_STOCK_EDITOR_0130_SOURCE;
 const newEditor=Boolean(newEditorPath);
 const bytes=newEditor?fs.readFileSync(newEditorPath):Buffer.from(readNativeEditorSource(root),'utf8');
 report.editor_source_sha256=createHash('sha256').update(bytes).digest('hex');
-if(newEditor)assert.equal(report.editor_source_sha256,'841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e');
+const patch2=report.editor_source_sha256==='8433f4e108e2416707c6877354234607aaa2cb8b4e15fe080856fdd656771d17';
+if(newEditor&&!patch2)assert.equal(report.editor_source_sha256,'841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e');
 const stock=bytes.toString('utf8');
 const startAnchor=newEditor?'(S=e=>{let t=c.current,a=t?e.map':'bn=(0,S.useCallback)(e=>{let t=E.current,r=t?e.map';
 const endAnchor=newEditor?',t[0]=g,t[1]=h,t[2]=v,t[3]=_':',xn=(0,S.useCallback)';
@@ -85,7 +86,7 @@ try{
  await check('native_rename_while_widget_unmounted_preserves_same_outer_identity_protection',async()=>{await page.evaluate(()=>node.setAttribute('data-id','Renamed_HMB'));await page.locator('[data-trash]').click();assert.equal(await page.evaluate(()=>counts.native),2);await page.getByRole('button',{name:'확인',exact:true}).click();});
  await check('actual_outer_node_removed_releases_last_capture_observer_and_status',async()=>{await page.evaluate(()=>node.remove());await page.waitForFunction(()=>document.__HMB_NATIVE_STOCK_SAFETY_V1__===undefined);assert.equal(await page.locator('[data-hmb-native-safety-status]').count(),0);assert.deepEqual(await page.evaluate(()=>guardListeners.remove.slice().sort()),['click','contextmenu','keydown']);await page.locator('[data-standard-trash]').click();assert.equal(await page.evaluate(()=>counts.native),3);});
  await check('exact_pristine_stock_callback_reproduces_optimistic_remove_before_failure',async()=>{
-  const actual=await page.evaluate(({callback,failure,newEditor})=>{
+  const actual=await page.evaluate(({callback,failure,newEditor,patch2})=>{
    window.makeStock=()=>{
     const nodes=[{id:'ExactHMB',type:'CustomNode',data:{metadata:{library:'HMB_GP_Production'}}}],calls=[],clears=[];
     const env={console:{error(){}},S:{useCallback:fn=>fn},E:{current:null},w:{current:nodes},b:nodes,N:{showHelperLines:false},Ct:{current:{}},
@@ -98,11 +99,12 @@ try{
      DUt:row=>row.type==='position',EUt:row=>row.type==='dimensions',
      TUt:row=>row.id,nO:()=>false,$D:()=>false,yn:env.Xd,g:env.Dt,h:env.Et,l:env.C,
     });
+    if(patch2)Object.assign(env,{FGt:env.OUt,PGt:env.DUt,NGt:env.EUt,MGt:env.TUt,gE:env.nO,pE:env.$D,IGt:env.kUt});
     return{nodes,calls,clears,handler:Function('env',`with(env){return (${callback});}`)(env),failure:Function('env',`with(env){return (${failure});}`)(env)};
    };
    const f=makeStock();f.handler([{type:'remove',id:'ExactHMB'}]);f.failure({result_details:'HMB_DELETE_CONNECTED'},{node_name:'ExactHMB'});
    return{removed:f.nodes.length===0,sent:f.calls[0][0],clears:f.clears};
-  },{callback,failure,newEditor});
+  },{callback,failure,newEditor,patch2});
   assert.deepEqual(actual,{removed:true,sent:'DeleteNodeRequest',clears:['ExactHMB','pending-edits']});
  });
  await check('capture_prevents_exact_stock_callback_and_cache_mutation_before_request',async()=>{

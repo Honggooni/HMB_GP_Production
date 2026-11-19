@@ -218,6 +218,13 @@ _HMB_EDITOR_0130_OVERLAY_SHA256 = "355e3f9500e457ae6834c0b92b89a6dadb8724d053662
 _HMB_EDITOR_0130_ENTRY_SHA256 = "f5db8ec1ef090bcc026ca2a2e062a557bc6a43c8bf042d37d3535c4de346515f"
 
 
+_HMB_EDITOR_0130_OUTPUTS = {
+    (_HMB_EDITOR_0130_ENTRY_SHA256, _HMB_EDITOR_0130_OVERLAY_SHA256),
+    ("e2303178d85f8a8447cf38af3848c2234e32d74e2c8b34794a17ededb7e16221",
+     "ba1b96f56bc3c4651733677cc469c152d98d3cf47b8dd85f8693f4fe897c7b39"),
+}
+
+
 def _hmb_native_editor_runtime_fingerprint() -> tuple[str, str, str]:
     """Fingerprint the *active* editor, so vendor updates invalidate a cache.
 
@@ -299,7 +306,8 @@ def _hmb_native_editor_child(root: Path, python: Path, descriptor: dict[str, Any
                 or len(value["reason"]) > 4096 or any(ord(c) < 32 for c in value["reason"])):
             raise ValueError("native_update_response_invalid")
         success = value["status"] in {"current", "applied"}
-        candidates = {descriptor["candidate_sha256"], _HMB_EDITOR_0130_OVERLAY_SHA256}
+        candidates = {descriptor["candidate_sha256"]}
+        candidates.update(overlay for _, overlay in _HMB_EDITOR_0130_OUTPUTS)
         candidates.update(p["candidate_sha256"] for p in descriptor.get("additional_profiles", []))
         candidate = value.get("candidate_sha256")
         if success and (process.returncode != 0 or value["disk_ready"] is not True
@@ -373,7 +381,7 @@ def _hmb_coordinate_native_editor_update(owner: Any, engine: Any, library_data: 
                 result.get("status") == "applied"
                 and final_runtime[0] == result.get("target")
                 and "griptape_nodes_editor_dist" in Path(final_runtime[0]).parts
-                and final_runtime[1:] == (_HMB_EDITOR_0130_ENTRY_SHA256, _HMB_EDITOR_0130_OVERLAY_SHA256)
+                and final_runtime[1:] in _HMB_EDITOR_0130_OUTPUTS
                 and final_runtime[1] == result.get("entry_candidate_sha256")
             )
             if ((final_runtime[:2] != runtime[:2] and not activated_embedded_overlay)

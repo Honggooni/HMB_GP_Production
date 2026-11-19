@@ -13909,18 +13909,22 @@ class HMBImageAssetLibrary(DataNode):
                 return
             command = request.get("hierarchy_request")
             if request["operation"] == "cgt_confirm":
+                failure = "EDIT_LOCKED"
                 try:
                     if bool(getattr(self, "lock", False)) or str(getattr(self, "state", "")).casefold() == "resolving":
                         raise ValueError("Griptape 편집 잠금")
+                    failure = "SOURCE_CHANGED"
                     if request.get("bind_only"):
                         basket = (getattr(self, "metadata", {}) or {}).get("hmb_shot_basket_v1")
                         if (not isinstance(basket, dict) or basket.get("kind") != "image"
                                 or basket.get("cgt_required") is not True
                                 or basket.get("project_id") != current.get("project_id")):
                             raise ValueError("현재 로동마트 프로젝트에서 CGT 샷을 선택하세요.")
+                    failure = "SHOT_STRUCTURE_CHANGED"
                     # A media/status refresh is not an edit of the Shot forest.
                     command = _hmb_shot_routing.rebase_shot_hierarchy_edit(current, command)
                     _hmb_shot_routing.apply_shot_hierarchy_edit(current, command)
+                    failure = "SOURCE_CHANGED"
                     scope_id = ((command.get("binding") or {}).get("cgt_scope") or {}).get("project_id")
                     if (request.get("cgt_project_id") and scope_id
                             and request["cgt_project_id"].lower() != scope_id.lower()):
@@ -13937,7 +13941,7 @@ class HMBImageAssetLibrary(DataNode):
                     response = {key: request[key] for key in ("schema", "version", "runtime_instance_id",
                         "session_id", "request_id", "project_identity", "operation")}
                     response.update(phase="result", outcome="rejected",
-                                    state={"status": "SOURCE_CHANGED", "tasks": [], "projects": []})
+                                    state={"status": failure, "tasks": [], "projects": []})
                     self._set_thumbnail_bridge_value(response)
                     return
             self._hmb_cgt_cancel.set()
@@ -14021,13 +14025,24 @@ class HMBImageAssetLibrary(DataNode):
             result = {"status": "TIMEOUT", "tasks": [], "projects": []}
         outcome = "ready" if result.get("status") == "ready" else "rejected"
         if request["operation"] == "cgt_confirm" and outcome == "ready":
+            failure = "SHOT_STRUCTURE_CHANGED"
             try:
                 import _hmb_cgt
                 command = _hmb_shot_routing.rebase_shot_hierarchy_edit(current, request["hierarchy_request"])
+                failure = "EDIT_LOCKED"
                 if bool(getattr(self, "lock", False)) or str(getattr(self, "state", "")).casefold() == "resolving":
                     raise ValueError("Griptape 편집 잠금")
-                _hmb_cgt.verify_binding(command["binding"], project_id, result)
+                failure = "SOURCE_CHANGED"
+                _hmb_cgt.verify_binding(command["binding"], project_id, result, refresh_status=True)
+                failure = "SHOT_STRUCTURE_CHANGED"
                 prepared = _hmb_shot_routing.apply_shot_hierarchy_edit(current, command)
+                # Status belongs to the authenticated read. The local structural
+                # rebase above may carry the previous Wait/Work value forward.
+                statuses = {task["task_id"]: task["status"] for task in result["tasks"]}
+                for member in prepared["shot_hierarchy"]["members"]:
+                    if member["origin"] == "cgt":
+                        member["status"] = statuses[member["cgt_task_id"]]
+                failure = "APPLY_FAILED"
                 try:
                     self._publish_state(prepared)
                 except Exception:
@@ -14062,7 +14077,9 @@ class HMBImageAssetLibrary(DataNode):
                 result = {"status": "committed"}
             except Exception:
                 outcome = "rejected"
-                result = {"status": "SOURCE_CHANGED", "tasks": [], "projects": []}
+                if failure == "APPLY_FAILED":
+                    _LOGGER.exception("Could not publish the confirmed CGT shot selection.")
+                result = {"status": failure, "tasks": [], "projects": []}
         response = {key: request[key] for key in ("schema", "version", "runtime_instance_id", "session_id", "request_id", "project_identity", "operation")}
         response["cgt_project_id"] = request.get("cgt_project_id", "")
         if outcome == "ready":

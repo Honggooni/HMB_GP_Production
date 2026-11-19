@@ -59,7 +59,7 @@ async def exercise(engine, directory):
         DeleteFlowRequest, DeserializeFlowFromCommandsRequest, SerializeFlowToCommandsRequest,
     )
     from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, GetAllNodeInfoRequest
-    from griptape_nodes.retained_mode.events.parameter_events import GetNodeElementDetailsRequest
+    from griptape_nodes.retained_mode.events.parameter_events import GetNodeElementDetailsRequest, SetParameterValueRequest
 
     buffer = io.BytesIO()
     Image.new("RGB", (17, 9), (40, 110, 180)).save(buffer, "PNG")
@@ -198,6 +198,12 @@ async def exercise(engine, directory):
                 node_name=f"Personal Image {slot}", specific_library_name=schema.name, initial_setup=True))
             node = engine.node_manager.get_node_by_name(created.node_name)
             if slot == 1:
+                saved_port = "model_option__ef0464c2349976ded3615dc4"
+                assert all(parameter.name != saved_port for parameter in node.parameters)
+                send(engine, SetParameterValueRequest(node_name=node.name, parameter_name=saved_port,
+                                                     value=True, initial_setup=True))
+                assert node.get_parameter_value(saved_port) is True
+                assert node._model_views["google/gemini-3.1-flash-image"]["options"]["use_google_image_search"] is True
                 assert not creates and not downloads, "Construction performed an image operation"
             assert not any("project" in name.lower() or "shot" in name.lower()
                            for name in node.parameter_values)

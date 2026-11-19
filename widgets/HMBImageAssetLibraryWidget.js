@@ -780,6 +780,9 @@ export function hmbCgtStatusMessage(status, language = "ko") {
       OWNERSHIP_CHANGED: "조회된 작업의 담당자가 현재 CGT 계정과 일치하지 않습니다. 새로고침 후 다시 확인하세요.",
       INVALID_BINDING: "CGT 샷 연결 정보가 올바르지 않습니다. 현재 샷을 다시 선택하세요.",
       SELECT_GP_PROJECT: "먼저 이미지 라이브러리의 프로젝트를 선택하세요.", PROJECT_UNAVAILABLE: "선택한 GP 프로젝트의 CGT 접근 권한을 확인하세요.",
+      EDIT_LOCKED: "편집 잠금을 해제한 뒤 선택을 확정하세요.",
+      SHOT_STRUCTURE_CHANGED: "샷 구성이 변경되었습니다. 창을 다시 열어 현재 구성을 확인하세요.",
+      APPLY_FAILED: "선택한 샷을 저장하지 못했습니다. 현재 샷 구성을 확인하세요.",
       SOURCE_CHANGED: "CGT 계정·프로젝트·작업이 변경되었습니다. 새로고침 후 다시 선택하세요.",
       ACCOUNT_CHANGED: "CGT 로그인 계정이 기존 연결과 다릅니다. 기존 연결은 유지됩니다. 올바른 계정으로 로그인 후 다시 확인하세요.",
       SDK_UNAVAILABLE: "CGT 앱과 설치된 Python SDK 연결을 확인한 뒤 새로고침하세요.", TIMEOUT: "CGT 응답 시간 초과 · 새로고침 후 다시 확인하세요.",
@@ -799,6 +802,9 @@ export function hmbCgtStatusMessage(status, language = "ko") {
       OWNERSHIP_CHANGED: "A returned task is not assigned to the current CGT account. Refresh and check again.",
       INVALID_BINDING: "The CGT shot binding is invalid. Select the current shots again.",
       SELECT_GP_PROJECT: "Select a project in the image library first.", PROJECT_UNAVAILABLE: "Check your CGT access to the selected GP project.",
+      EDIT_LOCKED: "Unlock editing before confirming the selection.",
+      SHOT_STRUCTURE_CHANGED: "The Shot layout changed. Reopen the dialog to review it.",
+      APPLY_FAILED: "The selected Shots could not be saved. Review the current Shot layout.",
       SOURCE_CHANGED: "The CGT account, project, or task changed. Refresh and select again.",
       ACCOUNT_CHANGED: "The CGT account differs from the existing binding. The binding is retained; sign in with the correct account and check again.",
       SDK_UNAVAILABLE: "Check the CGT app and installed Python SDK connection, then refresh.", TIMEOUT: "CGT did not respond in time. Refresh and try again.",
@@ -7528,11 +7534,15 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
       confirmingCgt = false;
       if (response.outcome === "committed") { close(); return true; }
       const status = response.state?.status || "SOURCE_CHANGED";
-      if (status !== "TIMEOUT") cgtState = { status, tasks: [] };
+      // A local edit conflict does not invalidate the authenticated catalog.
+      if (!["TIMEOUT", "EDIT_LOCKED", "SHOT_STRUCTURE_CHANGED", "APPLY_FAILED"].includes(status)) {
+        cgtState = { status, tasks: [] };
+        cgtProjects = []; cgtProjectId = ""; cgtEpisode = "";
+      }
       renderDraft();
       notice(status === "TIMEOUT"
         ? "CGT 확인 응답이 지연됐습니다. 샷 선택을 유지했습니다. 새로고침 후 다시 확인하세요."
-        : "CGT 검증 또는 현재 샷 구성이 변경되어 적용하지 않았습니다. 기존 샷은 유지됩니다.");
+        : hmbCgtStatusMessage(status, imageAssetLanguage(state)));
       return true;
     }
     cgtState = response.state || { status: "SDK_UNAVAILABLE", tasks: [] };

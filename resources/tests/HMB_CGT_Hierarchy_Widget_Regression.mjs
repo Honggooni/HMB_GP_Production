@@ -53,7 +53,7 @@ window.finish=()=>{const req=window.pending;if(!req)return;window.pending=null;l
     if(!state.can_bind)state.tasks=[{...state.tasks[0],source_name:'e301s001c001__'}].filter(item=>item.task_id);}}
   else if(!req.project_identity){state.project=null;state.tasks=[];state.can_bind=false;}}
  if(req.operation==='cgt_confirm'){
-  if(window.rejected){state={status:'SOURCE_CHANGED'};outcome='rejected';}
+  if(window.rejected){state={status:window.rejected};outcome='rejected';}
   else{window.host=w.hmbNormalizeImageAssetState(w.hmbApplyShotHierarchyEdit(window.host,req.hierarchy_request));
    window.commits.push(structuredClone(req.hierarchy_request));outcome='committed';state={status:'committed'};window.controller.update(window.props());}}
  window.bridgeController.update(window.bridgeProps({...req,phase:'result',state,outcome}));};
@@ -504,10 +504,12 @@ try{
  assert.equal(await page.locator('[data-hier-member]').count(),5);
  await page.keyboard.press('Escape');
  assert.equal(await page.evaluate(()=>JSON.stringify(window.host)),saved);checks+=3;
- await page.evaluate(value=>{window.catalog.account_id=value;window.rejected=true;},account);
+ await page.evaluate(value=>{window.catalog.account_id=value;window.rejected='SHOT_STRUCTURE_CHANGED';},account);
  await openShots();await page.evaluate(()=>window.finish());
  await page.locator(`[data-hier-remove="${keys[2]}"]`).click();await page.locator('[data-hier-confirm]').click();
- await page.evaluate(()=>window.finish());assert.match(await page.locator('[data-hier-message]').innerText(),/적용하지 않았습니다/);
+ await page.evaluate(()=>window.finish());assert.match(await page.locator('[data-hier-message]').innerText(),/샷 구성이 변경/);
+ assert.ok(await page.locator('[data-hier-cgt-project]').inputValue());
+ assert.equal(await page.locator('[data-hier-member]').count(),4);
  assert.equal(await page.evaluate(()=>JSON.stringify(window.host)),saved);
  assert.equal(await page.evaluate(()=>window.commits.length),1);await page.keyboard.press('Escape');checks+=3;
  // Real empty list is visible as empty; TLS/auth failure cannot preserve a
