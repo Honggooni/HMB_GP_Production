@@ -45,7 +45,13 @@ try{
   page.on('pageerror',e=>errors.push(e.message));
   await page.route('**/*',route=>new URL(route.request().url()).hostname==='127.0.0.1'?route.continue():route.abort());
   await page.goto(`http://127.0.0.1:${server.address().port}`);await page.waitForFunction(()=>window.ready);
-  await page.evaluate(state=>window.boot(state),state);await page.waitForFunction(()=>window.requests.length===1);
+  await page.evaluate(state=>window.boot(state),state);
+  assert.equal(await page.locator('[data-asset-key]').count(),0);
+  assert.equal(await page.locator('[data-folder-prompt]').count(),1);
+  assert.equal(await page.evaluate(()=>window.root.__hmbImageAssetLatestState.assets.length),5000);
+  assert.equal(await page.locator('[data-selected-key]').count(),2);
+  const openRoot = () => page.locator('[data-folder-key][data-source-view="project"][data-folder-path=""]').first().click();
+  await openRoot();await page.waitForFunction(()=>window.requests.length===1);
   assert.equal(await page.locator('[data-asset-key]').count(),80);
   await page.evaluate(()=>window.answer(window.requests[0]));
   await page.waitForFunction(()=>window.root.__hmbImageAssetLatestState.catalog_page);
@@ -65,12 +71,29 @@ try{
   await page.locator('[data-asset-key="asset-95"] [data-asset-add]').click();
   assert.equal(await page.locator('[data-registration-field="image_name"]').inputValue(),'Background 95');
   await page.locator('[data-registration-field="image_name"]').fill('Classified page asset');
+  await page.evaluate(()=>{
+    window.wc.update({value:JSON.stringify(window.full),onChange(value){
+      if(JSON.parse(value).edits?.asset_registration_request?.request_id) throw Error('Registration transport unavailable');
+    }});
+  });
+  await page.locator('[data-registration-submit]').click();
+  await page.waitForFunction(()=>document.querySelector('[data-registration-status]')?.textContent.includes('unavailable'));
+  assert.equal(await page.locator('[data-registration-field="image_name"]').inputValue(),'Classified page asset');
+  await page.evaluate(()=>window.updateFull(window.full));
   const registrationWrites=await page.evaluate(()=>window.writes.length);
   await page.locator('[data-registration-submit]').click();
   await page.waitForFunction(n=>window.writes.length===n+1,registrationWrites);
   assert.equal(await page.evaluate(()=>window.writes.at(-1).edits.asset_registration_request.asset_library_id),'asset-95');
   assert.equal(await page.evaluate(()=>window.writes.at(-1).edits.asset_registration_request.image_name),'Classified page asset');
   assert.equal(await page.evaluate(()=>window.root.__hmbImageAssetLatestState.assets.find(a=>a.asset_library_id==='asset-95').registered),false,'Registration request does not invent backend approval');
+  assert.ok(await page.locator('[data-registration-submit]').isDisabled());
+  await page.evaluate(()=>{
+    const full=structuredClone(window.full),edit=window.writes.at(-1);
+    full.ui_edit_revision=edit.ui_edit_revision;
+    full.asset_registration_result={request_id:edit.edits.asset_registration_request.request_id,ok:true,asset_library_id:'asset-95',message:'Registered'};
+    window.updateFull(full);
+  });
+  await page.waitForFunction(()=>!document.querySelector('[data-registration-submit]'));
   await clickSelection('asset-100',true);await clickSelection('asset-100',false);
   const trayWrites=await page.evaluate(()=>window.writes.length);
   await page.locator('[data-selected-key="asset-1"] [data-remove-selected]').click();
@@ -148,6 +171,7 @@ try{
     await page.goto(`http://127.0.0.1:${server.address().port}`);await page.waitForFunction(()=>window.ready);
     if(mode==='timeout')await page.evaluate(()=>{const native=window.setTimeout;window.restoreFixtureTimeout=()=>{window.setTimeout=native;delete window.restoreFixtureTimeout;};window.setTimeout=(fn,ms,...args)=>native(fn,ms===15000?40:ms,...args);});
     await page.evaluate(({state,mode})=>window.boot(state,1,mode),{state,mode});
+    await openRoot();
     if(mode==='rejected-result')await page.evaluate(()=>window.bc.update({value:{...window.requests[0],phase:'result',outcome:'rejected'},onChange:()=>{}}));
     await page.waitForFunction(()=>window.root.__hmbImageAssetPageControl.disabledContext);
     if(mode==='timeout')await page.evaluate(()=>window.restoreFixtureTimeout());
@@ -157,6 +181,7 @@ try{
     assert.equal(await page.evaluate(()=>window.requests.length),1,`${mode} never loops automatic page retries`);
     await page.evaluate(()=>{window.bc.update({value:window.idle,onChange:value=>{if(value.operation==='catalog_page')window.requests.push(value);}});
       const full=structuredClone(window.full);full.project_root='C:/fixture/next-project';full.project_uid='next-project';full.project_cache_uid='next-cache';full.project_id='Next';full.ui_edit_revision=200;window.updateFull(full);});
+    await openRoot();
     await page.waitForFunction(()=>window.requests.length===2);
     // The later valid request uses the product's 15-second deadline, even when
     // its response arrives after the earlier negative fixture's 40-ms deadline.

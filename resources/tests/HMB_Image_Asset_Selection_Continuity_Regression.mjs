@@ -26,7 +26,7 @@ try {
       canvas.getContext("2d").fillRect(0, 0, 12, 12);
       const png = canvas.toDataURL("image/png");
       const state = widget.hmbNormalizeImageAssetState({
-        edit_transport_schema: "hmb-image-asset-edit-v1", scan_revision: 7, ui_edit_revision: 4,
+        search: "Hero", edit_transport_schema: "hmb-image-asset-edit-v1", scan_revision: 7, ui_edit_revision: 4,
         catalog_root: "C:/fixture", project_root: "C:/fixture/Project", project_id: "Project",
         project_uid: `project-${format}`, project_cache_uid: `cache-${format}`,
         manifest_signature: "manifest-one", folder_signature: "folder-one",

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from array import array
 from contextlib import contextmanager
 from pathlib import Path
@@ -2260,7 +2260,7 @@ def _verified_project_relative_path(
         records = (
             manifest_records
             if isinstance(manifest_records, dict)
-            else _read_asset_manifest(resolved_root)
+            else _manifest_for_selection(resolved_root, [asset])
         )
         manifest_record = records.get(relative_text.casefold())
     except Exception:
@@ -2483,7 +2483,8 @@ def _asset_manifest_signature(root: Path) -> str:
                 hashlib.sha256(manifest_bytes).hexdigest(),
             )
         )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+    # Revalidate pre-folder-move caches and saved views once after upgrade.
+    return hashlib.sha256(("folder-registration-v2|" + payload).encode("utf-8")).hexdigest()[:24]
 
 
 def _folder_metadata_signature_from_inventory(
@@ -2676,6 +2677,15 @@ def _write_asset_manifest_record_locked(
         raise ValueError(
             f"{manifest_path.name} contains duplicate records for {relative_text}."
         )
+    if not matching_indices:
+        # An old client can still post Add against a moved row using a new
+        # display name. Recheck that exceptional case under the shared lock.
+        by_path = {_manifest_asset_relative_path(root, row).casefold(): row for row in records if isinstance(row, dict)}
+        parts = relative_key.split("/")
+        if any("/".join([*parts[:depth], parts[-1]]) in by_path for depth in range(1, len(parts) - 1)):
+            folders, files, _ = _catalog_file_inventory(root)
+            if relative_key in _manifest_at_current_paths(by_path, root, folders, files):
+                raise ValueError("This image asset is already registered and cannot be edited.")
     if not matching_indices and len(records) >= MAX_ASSETS:
         raise ValueError(
             f"{manifest_path.name} reached the {MAX_ASSETS}-asset safety limit."
@@ -2977,8 +2987,9 @@ def _audit_project_manifest_refresh(root: Path) -> Dict[str, Any]:
         review["file_count"] = len(inventory)
         missing_records: List[Dict[str, Any]] = []
         missing_paths: List[str] = []
+        moves, possible_moves = _manifest_folder_moves(registered, inventory)
         for key, (relative, record) in registered.items():
-            if key in inventory:
+            if key in inventory or key in possible_moves:
                 continue
             # A full successful walk must agree with a direct lookup. A
             # permission/network error, changed folder, or restored file aborts.
@@ -3001,8 +3012,9 @@ def _audit_project_manifest_refresh(root: Path) -> Dict[str, Any]:
         with os.scandir(root) as entries:
             for _entry in entries:
                 pass
+        moved_paths = set(moves.values())
         unregistered = sorted(
-            (row[0] for key, row in inventory.items() if key not in registered),
+            (row[0] for key, row in inventory.items() if key not in registered and key not in moved_paths),
             key=str.casefold,
         )
         inventory_payload = {
@@ -3152,6 +3164,54 @@ def _clean_project_manifest_refresh(
             return result
 
 
+def _manifest_folder_moves(records, inventory):
+    """Match a missing server path only to one namesake in a descendant folder."""
+    present = set(inventory)
+    missing = records.keys() - present
+    candidates = {}
+    for path in present:
+        parts = path.split("/")
+        for depth in range(1, len(parts) - 1):
+            old = "/".join([*parts[:depth], parts[-1]])
+            if old in missing:
+                candidates.setdefault(old, []).append(path)
+    claims = {}
+    for paths in candidates.values():
+        for path in paths:
+            claims[path] = claims.get(path, 0) + 1
+    moves = {old: paths[0] for old, paths in candidates.items()
+             if len(paths) == 1 and paths[0] not in records and claims[paths[0]] == 1}
+    return moves, candidates.keys()
+
+
+def _manifest_at_current_paths(records, root, folders, paths):
+    if len(folders) >= MAX_FOLDERS or len(paths) >= MAX_ASSETS:
+        return records
+    moves, _ = _manifest_folder_moves(records, (path.relative_to(root).as_posix().casefold() for path in paths))
+    return {moves.get(key, key): record for key, record in records.items()}
+
+
+def _restore_manifest_registration(asset, relative, overrides, stems):
+    override = overrides.get(relative.as_posix().casefold())
+    values = override or {}
+    asset.update(_normalize_image_taxonomy_fields(values))
+    asset["asset_id"] = _clean(values.get("asset_id")) or (
+        relative.with_suffix("").as_posix() if stems.get(relative.stem.casefold(), 0) > 1 else relative.stem
+    )
+    asset["image_name"] = _clean(values.get("image_name") or values.get("name")) or relative.stem
+    asset["registered"] = override is not None
+    asset["import_source_uid"] = _clean(values.get("import_source_uid"))
+
+
+def _manifest_for_selection(root, selected):
+    records = _read_asset_manifest(root)
+    if any(row.get("registered") and row.get("source_kind") == "project"
+           and _clean(row.get("relative_path")).casefold() not in records for row in selected):
+        folders, paths, _ = _catalog_file_inventory(root)
+        return _manifest_at_current_paths(records, root, folders, paths)
+    return records
+
+
 def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Scan one selected project and classify image files with common taxonomy."""
     root_text = _project_root_text(project_root)
@@ -3181,6 +3241,7 @@ def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | N
     manifest_signature = _asset_manifest_signature(root)
     manifest_overrides = _read_asset_manifest(root)
     folders, paths, metadata = _catalog_file_inventory(root)
+    manifest_overrides = _manifest_at_current_paths(manifest_overrides, root, folders, paths)
     warnings: List[str] = []
     folder_signature = _folder_metadata_signature_from_inventory(root, folders, paths, metadata=metadata)
     previous = previous_scan or {}
@@ -4760,10 +4821,8 @@ def _rebind_shared_catalog_snapshot(
         ):
             return None
         verified_paths = set(paths)
-        overrides = _read_asset_manifest(root) if manifest_changed else None
-        stems: Dict[str, int] = {}
-        for path in paths:
-            stems[path.stem.casefold()] = stems.get(path.stem.casefold(), 0) + 1
+        overrides = _manifest_at_current_paths(_read_asset_manifest(root), root, folders, paths)
+        stems = Counter(path.stem.casefold() for path in paths)
         assets: List[Dict[str, Any]] = []
         for raw_asset in snapshot.get("assets", []):
             if not isinstance(raw_asset, dict):
@@ -4785,16 +4844,7 @@ def _rebind_shared_catalog_snapshot(
                 return None
             asset["path"] = str(rebound).replace("\\", "/")
             asset["asset_project_uid"] = project_uid
-            if overrides is not None:
-                override = overrides.get(relative.as_posix().casefold())
-                values = override or {}
-                asset.update(_normalize_image_taxonomy_fields(values))
-                asset["asset_id"] = _clean(values.get("asset_id")) or (
-                    relative.with_suffix("").as_posix() if stems.get(relative.stem.casefold(), 0) > 1 else relative.stem
-                )
-                asset["image_name"] = _clean(values.get("image_name") or values.get("name")) or relative.stem
-                asset["registered"] = override is not None
-                asset["import_source_uid"] = _clean(values.get("import_source_uid"))
+            _restore_manifest_registration(asset, relative, overrides, stems)
             if not _thumbnail_url_is_live(
                 asset.get("media_signature"), asset.get("thumbnail_url")
             ):
@@ -5144,6 +5194,8 @@ def _read_catalog_index(
         ):
             return None
         verified_paths = set(paths)
+        overrides = _manifest_at_current_paths(_read_asset_manifest(resolved_root), resolved_root, folders, paths)
+        stems = Counter(path.stem.casefold() for path in paths)
         assets = raw.get("assets")
         if not isinstance(assets, list) or len(assets) > MAX_ASSETS:
             return None
@@ -5166,6 +5218,7 @@ def _read_catalog_index(
             if resolved_asset not in verified_paths:
                 return None
             asset["path"] = str(resolved_asset).replace("\\", "/")
+            _restore_manifest_registration(asset, relative, overrides, stems)
             asset["thumbnail_url"] = ""
         if {Path(asset["path"]) for asset in assets} != verified_paths:
             return None
@@ -7199,7 +7252,7 @@ def _resolve_selected_assets(
                     try:
                         project_root = _clean(normalized.get("project_root"))
                         manifest_records = (
-                            _read_asset_manifest(Path(project_root))
+                            _manifest_for_selection(Path(project_root), ordered)
                             if project_root
                             else {}
                         )
@@ -7311,7 +7364,7 @@ def _selection_id(
             try:
                 project_root = _clean(state.get("project_root"))
                 manifest_records = (
-                    _read_asset_manifest(Path(project_root)) if project_root else {}
+                    _manifest_for_selection(Path(project_root), ordered_assets) if project_root else {}
                 )
             except Exception:
                 manifest_records = {}
@@ -11448,8 +11501,11 @@ class HMBImageAssetLibrary(DataNode):
         if lock is None:
             return False
         with lock:
-            ready = list(getattr(self, "_hmb_catalog_search_results", {}).values())
-            self._hmb_catalog_search_results = OrderedDict()
+            pending = getattr(self, "_hmb_catalog_search_results", {})
+            if not pending:
+                return False
+            ready = list(pending.values())
+            pending.clear()
         if not ready or not self._scan_owner_is_current():
             return False
         for generation, request, page in ready:
@@ -11467,10 +11523,12 @@ class HMBImageAssetLibrary(DataNode):
         if not isinstance(state, dict):
             state = self._current_state()
         if (request.get("runtime_instance_id") != self._thumbnail_runtime_id(state)
-                or not request.get("session_id") or not request.get("request_id")
-                or any(_clean(request.get(key)) != _clean(state.get(key)) for key in
+                or not request.get("session_id") or not request.get("request_id")):
+            return
+        if (any(_clean(request.get(key)) != _clean(state.get(key)) for key in
                     ("project_uid", "project_cache_uid", "manifest_signature", "folder_signature"))
                 or _non_negative_int(request.get("scan_revision")) != _non_negative_int(state.get("scan_revision"))):
+            self._set_thumbnail_bridge_value({**request, "phase": "result", "outcome": "stale"})
             return
         if not hasattr(self, "_hmb_catalog_search_lock"):
             self._hmb_catalog_search_lock = threading.RLock()

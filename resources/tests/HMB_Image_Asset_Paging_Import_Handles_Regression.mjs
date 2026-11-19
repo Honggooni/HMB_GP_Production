@@ -8,7 +8,7 @@ import * as widget from "../../widgets/HMBImageAssetLibraryWidget.js";
 
 const pixel = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j14sAAAAASUVORK5CYII=";
 const state = widget.hmbNormalizeImageAssetState({
-  language: "en",
+  language: "en", selected_folder_path: "Images",
   assets: Array.from({ length: 165 }, (_, index) => ({
     asset_library_id: `page-${index}`,
     source_uid: `project:page-${index}`,

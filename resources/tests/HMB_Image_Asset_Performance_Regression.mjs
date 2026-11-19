@@ -2529,7 +2529,7 @@ if (!dualPlaywright || !fs.existsSync(dualBrowserPath)) {
         const image = canvas.toDataURL("image/png");
         const base = main.hmbNormalizeImageAssetState({ catalog_root: "C:/fixture", project_root: "C:/fixture/ProjectB",
           project_id: "Project B", project_uid: `project-${mode}`, project_cache_uid: `cache-${mode}`,
-          manifest_signature: "fixture-manifest", scan_revision: 7, ui_edit_revision: 9,
+          search: "Hero", manifest_signature: "fixture-manifest", scan_revision: 7, ui_edit_revision: 9,
           projects: [{ path: "C:/fixture/ProjectB", name: "Project B", project_id: "Project B" }],
           assets: Array.from({ length: 3 }, (_, i) => ({ asset_library_id: `dual-${i}`, asset_id: `Hero${i}`, image_name: `Hero ${i}`,
             source_uid: `source-${i}`, source_kind: "project", registered: true, relative_path: `Hero${i}.png`,

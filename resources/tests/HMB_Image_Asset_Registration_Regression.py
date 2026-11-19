@@ -166,6 +166,18 @@ try:
     }
     assert not list((project_root / ".json").glob(".hmb_image_assets.json.*.tmp"))
 
+    # Independent client with an incorrect local registration bit still reads the shared record.
+    second = load_module()
+    second._ASSET_CATALOG_INDEX_ROOT = test_root / "second-workstation"
+    cached = deepcopy(registered_state)
+    for row in cached["assets"]:
+        row["registered"] = False
+        row["image_name"] = "Local stale name"
+    second._write_catalog_index(cached)
+    reopened = second._read_catalog_index(project_root, registered_state)
+    assert reopened is not None
+    restored_by_id = {a["asset_id"]: a for a in reopened["assets"]}
+    assert restored_by_id["HeroRig"]["registered"] and restored_by_id["HeroRig"]["image_name"] == "Hero Final"
     selected_state = deepcopy(registered_state)
     selected_candidate = next(
         item
@@ -644,6 +656,31 @@ try:
     else:
         raise AssertionError("The locked manifest writer must reject existing paths.")
     assert manifest_path.read_bytes() == manifest_before_registered_edit
+    # Another workstation starts after the team reorganizes files into episodes.
+    moved = existing_path.parent / "e202" / existing_path.name
+    moved.parent.mkdir()
+    existing_path.rename(moved)
+    data = asset_library._scan_project_assets(project_root)
+    restored = next(a for a in data["assets"] if a["relative_path"] == moved.relative_to(project_root).as_posix())
+    assert restored["registered"] and restored["asset_id"] == existing["asset_id"]
+    assert asset_library._verified_project_relative_path(restored, data) == restored["relative_path"]
+    review = asset_library._audit_project_manifest_refresh(project_root)
+    assert not review["error"] and existing["relative_path"] not in review["missing_paths"]
+    assert restored["relative_path"] not in review["unregistered_paths"]
+    try:
+        asset_library._write_asset_manifest_record(project_root, {
+            "path": restored["relative_path"], "asset_id": "stale-client", "image_name": "duplicate Add",
+        })
+    except ValueError as exc:
+        assert "already registered" in str(exc)
+    else:
+        raise AssertionError("A stale workstation must not register a moved server asset twice.")
+    duplicate = existing_path.parent / "e203" / existing_path.name
+    duplicate.parent.mkdir()
+    duplicate.write_bytes(PNG_1X1)
+    ambiguous = asset_library._scan_project_assets(project_root)
+    assert not any(a["registered"] for a in ambiguous["assets"] if a["path"] in (moved.as_posix(), duplicate.as_posix()))
+    assert existing["relative_path"] not in asset_library._audit_project_manifest_refresh(project_root)["missing_paths"]
 finally:
     shutil.rmtree(test_root, ignore_errors=True)
 

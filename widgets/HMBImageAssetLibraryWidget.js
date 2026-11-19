@@ -609,6 +609,7 @@ const IMAGE_ASSET_UI_TEXT = {
     project_folders: "PROJECT FOLDERS",
     ready: "READY",
     search_placeholder: "Search Image Name, Asset ID, path, Main Type, or Sub Type",
+    choose_folder: "Select a folder or enter a search term.",
     no_match: "No image asset matches this project folder or search.",
     selected_images: "SELECTED IMAGES / GENERATOR ORDER",
     drag_hint: "Drag cards; Prompt image order updates automatically.",
@@ -692,6 +693,7 @@ const IMAGE_ASSET_UI_TEXT = {
     project_folders: "프로젝트 폴더",
     ready: "준비됨",
     search_placeholder: "이미지 이름, 에셋 ID, 경로, 주요 유형 또는 세부 유형 검색",
+    choose_folder: "폴더를 선택하거나 검색어를 입력하세요.",
     no_match: "이 프로젝트 폴더 또는 검색 조건에 맞는 이미지 에셋이 없습니다.",
     selected_images: "선택 이미지 / 생성기 순서",
     drag_hint: "카드를 드래그하면 프롬프트 이미지 순서가 자동으로 갱신됩니다.",
@@ -3201,10 +3203,10 @@ function hmbImageAssetLocalPageProjection(value,current,container) {
 export function hmbRequestImageAssetCatalogPage(container,state,offset=0) {
   const control=container?.__hmbImageAssetPageControl;
   const context=hmbCatalogPageContext(state),entry=imageAssetBridgeForNode(container,context.runtime_instance_id);
-  if(!control || control.disabledContext===hmbCatalogPageContextKey(state)
+  if(!control || !imageAssetGridVisible(container, state) || control.disabledContext===hmbCatalogPageContextKey(state)
     || entry?.catalogPageVersion!==1 || !context.project_uid || !entry.dispatch)return false;
   const request={schema:"hmb-image-asset-thumbnail-bridge",version:1,operation:"catalog_page",phase:"request",...context,
-    session_id:control.session,query:String(state.search||"").slice(0,256),folder:normalizeRelativeFolder(state.selected_folder_path),
+    session_id:control.session,query:String(state.search||"").slice(0,256).trim(),folder:normalizeRelativeFolder(state.selected_folder_path),
     source_view:state.selected_source_view==="user"?"user":"project",offset:Math.max(0,Number(offset)||0),limit:80};
   const key=JSON.stringify(request);
   if(control.key===key && control.pending)return true;
@@ -3252,7 +3254,7 @@ function hmbInstallImageAssetCatalogPages(container,getState,accept,acceptFallba
     if(JSON.stringify(hmbCatalogPageContext(result.state))!==JSON.stringify(hmbCatalogPageContext(state)))return false;
     const page=hmbCatalogPage(result.state?.catalog_page);if(!page || page.session_id!==control.session || page.sequence!==request.sequence)return false;
     if(page.query!==request.query || page.folder!==request.folder || page.source_view!==request.source_view)return false;
-    if(String(state.search||"")!==request.query || normalizeRelativeFolder(state.selected_folder_path)!==request.folder
+    if(String(state.search||"").slice(0,256).trim()!==request.query || normalizeRelativeFolder(state.selected_folder_path)!==request.folder
       || state.selected_source_view!==request.source_view)return false;
     clearTimeout(control.timer);control.pending=null;control.key="";control.acceptedContext=hmbCatalogPageContextKey(state);
     accept(result.state);return true;
@@ -4674,11 +4676,22 @@ export function hmbStartImageAssetCatalogPolling(container, state) {
   return true;
 }
 
+function imageAssetBrowseKey(state) {
+  return JSON.stringify([imageAssetThumbnailRuntimeId(state), state.project_uid, state.project_root]);
+}
+
+function imageAssetGridVisible(container, state) {
+  return Boolean(clean(state.search) || state.selected_folder_path || state.selected_source_view === "user"
+    || container?.__hmbImageAssetBrowseKey === imageAssetBrowseKey(state));
+}
+
 export function hmbRenderImageAssetGrid(
   state,
   limit = IMAGE_ASSET_RENDER_WINDOW,
   offset = 0,
+  visible = true,
 ) {
+  if (!visible) return { markup: `<div class="asset-grid"><div class="empty" data-folder-prompt>${escapeHtml(imageAssetText(state, "choose_folder"))}</div></div>`, matches: [], rendered: [], offset: 0, limit };
   const windowed = hmbImageAssetCatalogWindow(state, limit, offset);
   const shot = activeImageAssetShot(state);
   const selectedCount = imageAssetShotAssets(state, shot).length;
@@ -4720,7 +4733,7 @@ export function hmbReconcileImageAssetCatalog(container, state, options = {}) {
     Math.floor(Number(options.offset ?? container.__hmbImageAssetRenderOffset) || 0),
   );
   container.__hmbImageAssetRenderLimit = limit;
-  const rendered = hmbRenderImageAssetGrid(state, limit, offset);
+  const rendered = hmbRenderImageAssetGrid(state, limit, offset, imageAssetGridVisible(container, state));
   container.__hmbImageAssetRenderOffset = rendered.offset;
   const template = ownerDocument.createElement("template");
   template.innerHTML = rendered.markup;
@@ -5592,10 +5605,11 @@ function renderRegistrationDialog(state, draft) {
            <label><span>${escapeHtml(imageAssetText(state, "sub_type_label"))}</span><select data-registration-sub ${draft.image_main_type ? "" : "disabled"}>${registrationOptions(state, subTypes, draft.image_sub_type, imageAssetText(state, "select_sub_type"))}</select></label>
           <div class="passport-taxonomy-contract" ${taxonomyMeaning ? "" : "hidden"}><small>${escapeHtml(imageAssetText(state, "taxonomy_contract"))}</small><span>${escapeHtml(taxonomyMeaning)}</span></div>
          </div>
+        <div role="status" data-registration-status>${escapeHtml(draft.save_message || "")}</div>
         <footer class="passport-actions">
           <button type="button" data-registration-cancel>${escapeHtml(imageAssetText(state, "cancel"))}</button>
           ${externalImport && state.image_bash_active && state.image_bash_workspace?.workspace_id ? `<button type="button" data-registration-bash-add ${draft.bash_pending || state.image_bash_workspace.instances.length >= MAX_SELECTED_IMAGES ? "disabled" : ""}>HMBImageBash에 추가</button>` : ""}
-          <button type="button" class="passport-register" data-registration-submit ${registrationDraftIsComplete(draft) && !draft.bash_pending ? "" : "disabled"}>${escapeHtml(imageAssetText(state, "register_asset"))}</button>
+          <button type="button" class="passport-register" data-registration-submit ${registrationDraftIsComplete(draft) && !draft.bash_pending && !draft.saving ? "" : "disabled"}>${escapeHtml(imageAssetText(state, "register_asset"))}</button>
         </footer>
       </section>
     </div>
@@ -6183,8 +6197,9 @@ function render(
   renderLimit = IMAGE_ASSET_RENDER_WINDOW,
   renderOffset = 0,
   refreshReview = null,
+  gridVisible = true,
 ) {
-  const catalog = hmbRenderImageAssetGrid(state, renderLimit, renderOffset);
+  const catalog = hmbRenderImageAssetGrid(state, renderLimit, renderOffset, gridVisible);
   const activeShot = activeImageAssetShot(state);
   const activePalette = hmbImageAssetShotPalette(activeShot?.number || 1);
   const statusText = hmbImageAssetDisplayStatus(state);
@@ -8352,6 +8367,7 @@ function installEvents(container, state, props, remount, listeners) {
     if (!row || !container.contains(row)) return;
     const key = clean(row.getAttribute("data-folder-key"));
     const path = normalizeRelativeFolder(row.getAttribute("data-folder-path"));
+    container.__hmbImageAssetBrowseKey = imageAssetBrowseKey(state);
     state.selected_source_view = row.getAttribute("data-source-view") === "user"
       ? "user"
       : "project";
@@ -8690,6 +8706,7 @@ function installEvents(container, state, props, remount, listeners) {
   const closeRegistration = () => {
     const returnFocus = container.__hmbImageAssetRegistrationReturnFocus;
     const deferredProps = hmbTakeDeferredImageAssetProps(container);
+    clearTimeout(container.__hmbImageAssetRegistrationDraft?.save_timer);
     delete container.__hmbImageAssetRegistrationDraft;
     delete container.__hmbImageAssetRegistrationReturnFocus;
     remount(deferredProps ? normalizeState(deferredProps?.value) : state);
@@ -8737,7 +8754,7 @@ function installEvents(container, state, props, remount, listeners) {
     if (submit) {
       submit.disabled = !registrationDraftIsComplete(
         container.__hmbImageAssetRegistrationDraft,
-      ) || Boolean(container.__hmbImageAssetRegistrationDraft?.bash_pending);
+      ) || Boolean(container.__hmbImageAssetRegistrationDraft?.bash_pending || container.__hmbImageAssetRegistrationDraft?.saving);
     }
   };
   container.querySelectorAll("[data-registration-field]").forEach((input) => {
@@ -8775,30 +8792,69 @@ function installEvents(container, state, props, remount, listeners) {
     event.preventDefault();
     event.stopPropagation();
     const draft = container.__hmbImageAssetRegistrationDraft;
-    if (!registrationDraftIsComplete(draft)) return;
-    const deferredProps = hmbTakeDeferredImageAssetProps(container);
-    if (deferredProps) state = normalizeState(deferredProps?.value);
-    state.asset_registration_request = {
-      request_id: `asset-registration-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-      project_uid: state.project_uid,
-      asset_library_id: draft.asset_library_id,
-      source_kind: draft.source_kind,
-      source_uid: draft.source_uid,
-      relative_path: draft.relative_path,
-      target_folder: clean(draft.target_folder),
-      image_name: clean(draft.image_name),
-      asset_id: clean(draft.asset_id),
-      image_main_type: clean(draft.image_main_type),
-      image_sub_type: clean(draft.image_sub_type),
-      custom_source_type: clean(draft.custom_source_type),
+    if (!registrationDraftIsComplete(draft) || draft.saving || draft.bash_pending) return;
+    const projectKey = imageAssetBrowseKey(state);
+    const widgetLease = hmbImageAssetWidgetLease(state);
+    draft.saving = true;
+    updateRegistrationSubmit();
+    const failed = (error) => {
+      if (container.__hmbImageAssetRegistrationDraft !== draft) return;
+      clearTimeout(draft.save_timer);
+      delete draft.saving;
+      delete draft.request_id;
+      draft.save_message = String(error?.message || error);
+      const status = container.querySelector("[data-registration-status]");
+      if (status) status.textContent = draft.save_message;
+      updateRegistrationSubmit();
+      hmbShowImageAssetTransportError(container, error, state);
     };
-    state.asset_registration_result = {};
-    const returnFocus = container.__hmbImageAssetRegistrationReturnFocus;
-    delete container.__hmbImageAssetRegistrationDraft;
-    delete container.__hmbImageAssetRegistrationReturnFocus;
-    state = emit(deferredProps || props, state, container);
-    remount(state);
-    restoreRegistrationOpener(returnFocus);
+    hmbFlushImageAssetSelectionCommit(container);
+    const publishRegistration = () => {
+      if (container.__hmbImageAssetRegistrationDraft !== draft) return;
+      const deferred = container.__hmbImageAssetDeferredProps;
+      const base = deferred ? normalizeState(deferred.value) : container.__hmbImageAssetLatestState || state;
+      if (projectKey !== imageAssetBrowseKey(base) || widgetLease !== hmbImageAssetWidgetLease(base)) {
+        failed(new Error("프로젝트 연결이 변경되었습니다. 현재 프로젝트에서 등록 창을 다시 여세요."));
+        return;
+      }
+      const request = {
+        request_id: `asset-registration-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+        project_uid: base.project_uid,
+        asset_library_id: draft.asset_library_id,
+        source_kind: draft.source_kind,
+        source_uid: draft.source_uid,
+        relative_path: draft.relative_path,
+        target_folder: clean(draft.target_folder),
+        image_name: clean(draft.image_name),
+        asset_id: clean(draft.asset_id),
+        image_main_type: clean(draft.image_main_type),
+        image_sub_type: clean(draft.image_sub_type),
+        custom_source_type: clean(draft.custom_source_type),
+      };
+      const transport = deferred || props;
+      if (typeof transport.onChange !== "function") {
+        failed(new Error("이미지 라이브러리 연결을 확인한 뒤 다시 저장하세요."));
+        return;
+      }
+      // Publish a separate command value. Later view edits must never resend this Add.
+      draft.request_id = request.request_id;
+      draft.project_key = projectKey;
+      const status = container.querySelector("[data-registration-status]");
+      const english = imageAssetLanguage(state) === "en";
+      draft.save_message = english ? "Waiting for project registration…" : "프로젝트 등록 결과를 기다리는 중…";
+      if (status) status.textContent = draft.save_message;
+      draft.save_timer = setTimeout(() => {
+        if (container.__hmbImageAssetRegistrationDraft !== draft || draft.request_id !== request.request_id) return;
+        draft.save_message = english ? "No registration receipt yet. Close this window and refresh the project to check."
+          : "아직 등록 결과를 받지 못했습니다. 창을 닫고 프로젝트를 새로고침해 등록 여부를 확인하세요.";
+        const notice = container.querySelector("[data-registration-status]");
+        if (notice) notice.textContent = draft.save_message;
+      }, 15000);
+      const command = {...base, asset_registration_request: request, asset_registration_result: {}};
+      emit(transport, command, container, failed);
+    };
+    if (widgetLease) hmbWaitForImageAssetAuthority(container, state).then(publishRegistration).catch(failed);
+    else publishRegistration();
   });
   on(container, "keydown", (event) => {
     if (!container.__hmbImageAssetRegistrationDraft) return;
@@ -9131,6 +9187,7 @@ function hmbNativeUiImplementation(container, props) {
       container.__hmbImageAssetRenderLimit || IMAGE_ASSET_RENDER_WINDOW,
       container.__hmbImageAssetRenderOffset || 0,
       refreshReview,
+      imageAssetGridVisible(container, state),
     ), ".hmb-image-assets");
     hmbPatchImageAssetMarkup(container, markup);
     hmbApplyCgtWorkStartNotice(container,state);
@@ -9380,6 +9437,26 @@ function hmbNativeUiImplementation(container, props) {
     const incomingState = normalizeState(hmbImageAssetLocalPageProjection(rawIncoming,state,container));
     incomingState.image_bash_workspace_request = {};
     incomingState.image_bash_workspace_edit = {};
+    const draft = container.__hmbImageAssetRegistrationDraft;
+    const receipt = incomingState.asset_registration_result;
+    if (draft?.request_id && receipt?.request_id === draft.request_id
+        && draft.project_key === imageAssetBrowseKey(incomingState)
+        && hmbImageAssetRevisionDisposition(container, incomingState) !== "stale") {
+      clearTimeout(draft.save_timer);
+      if (receipt.ok) {
+        delete container.__hmbImageAssetRegistrationDraft;
+        delete container.__hmbImageAssetRegistrationReturnFocus;
+        hmbTakeDeferredImageAssetProps(container);
+      } else {
+        delete draft.request_id;
+        delete draft.saving;
+        const status = container.querySelector("[data-registration-status]");
+        draft.save_message = receipt.message || incomingState.error;
+        if (status) status.textContent = draft.save_message;
+        const submit = container.querySelector("[data-registration-submit]");
+        if (submit) submit.disabled = !registrationDraftIsComplete(draft);
+      }
+    }
     const workspaceHold = container.__hmbImageAssetWorkspaceAuthorityUnknown;
     if (rawIncoming?.schema === "hmb-image-asset-library-state" && !rawIncoming.image_bash_workspace_edit?.operation_id
       && !rawIncoming.image_bash_workspace_request?.request_id && imageAssetWorkspaceHoldOwned(container, workspaceHold)
@@ -9590,6 +9667,7 @@ function hmbNativeUiImplementation(container, props) {
   };
 
   const cleanup = () => {
+    clearTimeout(container.__hmbImageAssetRegistrationDraft?.save_timer);
     container.__hmbImageAssetBashEditQueue?.dispose();delete container.__hmbImageAssetBashEditQueue;delete container.__hmbImageAssetBashQueueExecute;
     hmbCancelImageAssetAuthorityWait(container);
     delete container.__hmbImageAssetProjectAuthorityPending;

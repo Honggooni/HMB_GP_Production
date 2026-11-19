@@ -103,6 +103,11 @@ async def main():
         assert source._hmb_catalog_search_builds == 1
         assert all(thread != owner_thread for thread in worker_threads)
         assert all(thread == owner_thread for thread in threads)
+    last_ready = events[-1]["state"]
+    stale = dict(request(4), manifest_signature="replaced")
+    await GriptapeNodes.ahandle_request(SetParameterValueRequest(
+        node_name=source.name, parameter_name=image.THUMBNAIL_PATCH_PARAMETER, value=stale, data_type="dict"))
+    assert events[-1]["request_id"] == stale["request_id"] and events[-1]["outcome"] == "stale"
     assert image._get_parameter_raw(source,image.WIDGET_STATE_PARAMETER) == raw_before
     assert source._hmb_last_accepted_widget_state == saved_before
     assert len(json.loads(raw_before)["assets"]) == 5000
@@ -113,8 +118,8 @@ async def main():
     output_before.pop(image.THUMBNAIL_PATCH_PARAMETER, None)
     assert actual_outputs == output_before, [key for key in set(actual_outputs)|set(output_before)
         if actual_outputs.get(key) != output_before.get(key)]
-    assert events[-1]["state"]["shot_routing"] == state["shot_routing"]
-    assert "tree" not in events[-1]["state"]
+    assert last_ready["shot_routing"] == state["shot_routing"]
+    assert "tree" not in last_ready
     # Previous clients still receive the same complete canonical parameter.
     assert json.loads(image._get_parameter_raw(source,image.WIDGET_STATE_PARAMETER))["assets"] == state["assets"]
     result = {"sdk":"official installed SDK","records":5000,"sdk_dispatch_ms":round(dispatch_ms,3),
