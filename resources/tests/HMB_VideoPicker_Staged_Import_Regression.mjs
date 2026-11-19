@@ -35,7 +35,7 @@ assert.match(failed, /Import failed/);
 assert.doesNotMatch(failed, /<progress/);
 const compact = picker.hmbRenderVideoPickerShotWorkspace(state).tabs;
 assert.equal((compact.match(/data-picker-import-id=/g) || []).length, 2);
-assert.doesNotMatch(compact, /class="compact-shot-assets empty"/, "Loading-only rows must use the card strip, not the centered empty layout.");
+assert.doesNotMatch(compact, /class="compact-shot-assets\b[^"]*\bempty\b/, "Loading-only rows must use the card strip, not the centered empty layout.");
 assert.equal(picker.hmbSelectedVideoAssets(state).length, 0, "Loading cards are not Generator inputs.");
 assert.equal(picker.hmbPickerOutputLength(state).count, 0);
 assert.match(source, /hmbPatchPickerImportCards\(container, authoredState\)/);

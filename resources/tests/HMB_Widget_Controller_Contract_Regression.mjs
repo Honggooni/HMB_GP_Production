@@ -392,7 +392,7 @@ assert.match(assetSource, /if \(!hmbImageAssetCanSelect\(asset\)\) return;/, "Un
 assert.match(assetSource, /IMAGE_ASSET_SEARCH_DEBOUNCE_MS[\s\S]*?hmbReconcileImageAssetCatalog\(container, state\)/, "Search must debounce and reconcile a bounded catalog window without remounting on every character.");
 assert.match(assetSource, /class="hmb-image-assets nodrag"/, "Asset interior gestures must not drag the node.");
 assert.doesNotMatch(assetSource, /class="hmb-image-assets nodrag nowheel"/, "Asset must not broadly disable Griptape wheel zoom.");
-assert.doesNotMatch(assetSource, /on\(container, "wheel",|addEventListener\?\.\("wheel",/, "Asset must pass wheel input from its entire surface to Griptape zoom.");
+assert.match(assetSource, /const strip = event\.target\?\.closest\?\.\("\.tray-scroll,\[data-compact-shot-assets\]"\);\s*if \(!strip \|\|/, "Asset horizontal scrolling is limited to card strips.");
 assert.match(assetSource, /export function hmbPrepareImageAssetCanvasGestures\(container\)/, "Asset must expose Prompt-style persistent-host wheel cleanup.");
 assert.match(assetSource, /canvasPanRoots\.forEach\(\(element\) => \{\s*element\.classList\?\.remove\("nopan", "nowheel"\);\s*element\.classList\?\.add\("nodrag"\);/, "Asset remounts must clear stale pan/wheel blockers from both host and dashboard.");
 assert.match(assetSource, /const markup = hmbScopeWidgetStyleMarkup\(render\([\s\S]*?container\.__hmbImageAssetRegistrationDraft \|\| null,[\s\S]*?\), "\.hmb-image-assets"\);[\s\S]*?hmbPatchImageAssetMarkup\(container, markup\);[\s\S]*?hmbPrepareImageAssetCanvasGestures\(container\);/, "Every Asset structural update must retain-patch scoped local registration state, apply modal isolation when needed, and restore canvas wheel behavior.");
@@ -1581,13 +1581,13 @@ assert.match(
 );
 assert.match(
   pickerModule.hmbInstallPickerInteractionIsolation.toString(),
-  /element\.classList\?\.add\("nodrag", "nopan", "nowheel"\);/,
+  /element\.classList\?\.add\("nodrag", "nopan"\);/,
   "Picker concrete controls retain their native pointer and wheel behavior.",
 );
 assert.match(
   promptModule.hmbInstallPromptInteractionIsolation.toString(),
-  /const missing = \["nodrag", "nopan", "nowheel"\]\.filter\(name => !element\.classList\?\.contains\?\.\(name\)\);\s*if \(missing\.length\) element\.classList\?\.add\(\.\.\.missing\);/,
-  "Prompt preserves all three native gesture classes without rewriting classes already present.",
+  /const missing = \["nodrag", "nopan"\]\.filter\(name => !element\.classList\?\.contains\?\.\(name\)\);\s*if \(missing\.length\) element\.classList\?\.add\(\.\.\.missing\);/,
+  "Prompt preserves native click and drag isolation without rewriting classes already present.",
 );
 const promptIsolationClasses = new Set(["nodrag"]);
 const promptIsolationClassWrites = [];
@@ -1606,8 +1606,8 @@ const promptIsolationContainer = {
 const promptIsolationListeners = [];
 promptModule.hmbInstallPromptInteractionIsolation(promptIsolationContainer, promptIsolationListeners, false);
 promptModule.hmbInstallPromptInteractionIsolation(promptIsolationContainer, promptIsolationListeners, false);
-assert.deepEqual([...promptIsolationClasses].sort(), ["nodrag", "nopan", "nowheel"].sort());
-assert.deepEqual(promptIsolationClassWrites, [["nopan", "nowheel"]], "Only the missing gesture classes are written once.");
+assert.deepEqual([...promptIsolationClasses].sort(), ["nodrag", "nopan"].sort());
+assert.deepEqual(promptIsolationClassWrites, [["nopan"]], "Only the missing gesture classes are written once.");
 assert.equal(promptIsolationListeners.length, 0, "Refreshing controls must not add delegated listeners.");
 assert.match(videoSource, /class="hmbvp-clip nodrag"/);
 assert.ok(

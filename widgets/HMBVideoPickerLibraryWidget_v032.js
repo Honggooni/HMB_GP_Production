@@ -10285,7 +10285,7 @@ function hmbVideoPickerCompactShotPanelHtml(state, row, tr, locked = false) {
   const selectedCount = Math.min(row.selected_video_uids.length, HMB_PICKER_MAX_REPRESENTATIVE_VIDEOS);
   return `<article class="compact-shot-row ${active ? "active" : ""} ${hasCards ? "" : "empty"}" data-picker-shot-row="${escapeHtml(row.workspace_uuid)}" data-shot-number="${row.number}" data-picker-shot-layout="compact" aria-current="${active ? "true" : "false"}" style="--local-shot-accent:${palette.accent};--local-shot-deep:${palette.deep};--shot-accent:${palette.accent};--shot-rgb:${palette.rgb.join(",")}">
       <header class="compact-shot-head"><button type="button" class="picker-shot-number" data-picker-shot-activate="${escapeHtml(row.workspace_uuid)}" aria-label="${escapeHtml(row.name)}" aria-pressed="${active ? "true" : "false"}" >${String(row.number).padStart(2, "0")}</button><b class="picker-shot-name-label" data-picker-shot-name>${escapeHtml(row.name)}</b><span class="compact-shot-status">VIDEOS ${assetCount}/10 · USE ${selectedCount}</span><em class="picker-shot-video-count">${assetCount}/${HMB_PICKER_MAX_ASSETS_PER_SHOT}</em><button type="button" class="picker-shot-rename compact-shot-rename" data-picker-shot-rename="${escapeHtml(row.workspace_uuid)}" aria-label="${escapeHtml(`Rename ${row.name}`)}" ${locked ? "disabled" : ""}>✎</button><button type="button" class="compact-shot-load import-video-button" data-picker-shot-load="${escapeHtml(row.workspace_uuid)}" ${locked || reservedCount >= HMB_PICKER_MAX_ASSETS_PER_SHOT ? "disabled" : ""}>${escapeHtml(tr.load || tr.importVideoAsset || "LOAD")}</button></header>
-      <div class="compact-shot-assets ${hasCards ? "" : "empty"}" data-compact-shot-assets="${escapeHtml(row.workspace_uuid)}">${hmbVideoPickerCompactVideosHtml(state, row, tr, locked)}</div>
+      <div class="compact-shot-assets nowheel ${hasCards ? "" : "empty"}" data-compact-shot-assets="${escapeHtml(row.workspace_uuid)}">${hmbVideoPickerCompactVideosHtml(state, row, tr, locked)}</div>
     </article>`;
 }
 
@@ -11189,12 +11189,10 @@ export function hmbInstallPickerInteractionIsolation(container, cleanupList) {
   clip?.classList?.add("nodrag");
   picker?.classList?.remove("nodrag", "nopan", "nowheel");
   [
-    ".outliner-scroll",
     ".camera-menu",
     ".snapshot-toolbar",
     ".right-stack",
     ".side-section > .section-body",
-    ".video-assets-body",
     ".activity-body"
   ].forEach((selector) => {
     container.querySelectorAll(selector).forEach((element) => {
@@ -11219,10 +11217,11 @@ export function hmbInstallPickerInteractionIsolation(container, cleanupList) {
   // four delegated listeners replace four listeners on every row/control.
   // This keeps a 1,000-row Outliner at O(1) event-listener installation cost.
   container.querySelectorAll(interactionSelector).forEach((element) => {
-    if (!element.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]")) element.classList?.add("nodrag", "nopan", "nowheel");
+    if (!element.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]")) element.classList?.add("nodrag", "nopan");
   });
   hmbInstallVideoPickerNativeHeader(container)?.sync();
   const stopDelegatedInteraction = (event) => {
+    if (event.button === 1) return;
     if (event?.target?.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]")) return;
     let interaction = null;
     try { interaction = event?.target?.closest?.(interactionSelector) || null; } catch (_error) {}
@@ -11230,6 +11229,16 @@ export function hmbInstallPickerInteractionIsolation(container, cleanupList) {
     if (typeof container.contains === "function" && !container.contains(interaction)) return;
     event.stopPropagation?.();
   };
+  const scrollCardStrip = event => {
+    const strip = event.target?.closest?.(".compact-shot-assets,.video-assets-body,.picker-shot-tabs");
+    if (!strip || !event.deltaY || event.deltaX || event.ctrlKey || strip.scrollWidth <= strip.clientWidth
+        || strip.scrollHeight > strip.clientHeight + 1) return;
+    const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? strip.clientWidth : 1;
+    strip.scrollLeft += event.deltaY * unit;
+    event.preventDefault();
+    event.stopPropagation();
+  };
+  container.addEventListener?.("wheel", scrollCardStrip, {passive:false});
   const delegatedEvents = ["pointerdown", "mousedown", "click", "dblclick"];
   delegatedEvents.forEach((eventName) => {
     container.addEventListener?.(eventName, stopDelegatedInteraction);
@@ -11244,6 +11253,7 @@ export function hmbInstallPickerInteractionIsolation(container, cleanupList) {
     window.addEventListener("keydown", stopSelectedNodeDeleteShortcut, true);
   }
   cleanupList.push(() => {
+    container.removeEventListener?.("wheel", scrollCardStrip);
     delegatedEvents.forEach((eventName) => {
       container.removeEventListener?.(eventName, stopDelegatedInteraction);
     });
@@ -11373,7 +11383,7 @@ function hmbMarkPickerDynamicControls(root) {
   for (const element of root.querySelectorAll(
     "button, input, select, textarea, [role='button'], [role='treeitem']",
   )) {
-    element.classList?.add?.("nodrag", "nopan", "nowheel");
+    element.classList?.add?.("nodrag", "nopan");
   }
 }
 
@@ -13055,7 +13065,7 @@ function hmbNativeUiImplementation(container, props) {
           <div class="outliner-toolbar"><input id="outliner-search" class="search-input" value="${escapeHtml(state.outliner_search)}" placeholder="${escapeHtml(tr.search)}" aria-label="${escapeHtml(tr.search)}"/></div>
           <style>.hmbvp .depth-range-settings{display:flex;flex-direction:column;gap:6px;padding:9px;border-top:1px solid var(--hmb-line-soft,#303947);font-size:11px;flex-shrink:0}.hmbvp .depth-range-settings[hidden]{display:none}.hmbvp .depth-range-settings select{min-height:30px;background:#0d1420;color:inherit;border:1px solid var(--hmb-line-soft,#303947);border-radius:4px;padding:4px}</style>
           <div class="column-head"><span>${escapeHtml(tr.name)}</span></div>
-          <div class="outliner-scroll">${outlinerHtml(state, bindings, tr, initialLocked, outlinerRenderOptions)}</div>
+          <div class="outliner-scroll nowheel">${outlinerHtml(state, bindings, tr, initialLocked, outlinerRenderOptions)}</div>
           <div class="depth-range-settings" ${depthChecked ? "" : "hidden"}><label for="depth-distance-range">${escapeHtml(tr.depthRange)}</label><select id="depth-distance-range" ${initialLocked ? "disabled" : ""}>${[["close", tr.depthClose], ["middle", tr.depthMiddle], ["far", tr.depthFar]].map(([value, label]) => `<option value="${value}" ${state.depth_settings.range === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></div>
         </section>
         <div class="center-stack">
@@ -13074,7 +13084,7 @@ function hmbNativeUiImplementation(container, props) {
               <div class="settings-compact-row"><span class="settings-compact-item"><b>${escapeHtml(tr.fps)}</b><span data-picker-maya-fps>${escapeHtml(fpsText)}</span></span><span class="settings-compact-item" title="${escapeHtml(`${tr.format}: MPEG-4 / H.264`)}"><b>${escapeHtml(tr.format)}</b><span>H.264</span></span><span class="settings-compact-item" data-picker-engine-metadata title="${escapeHtml(/\.blend$/i.test(mayaSceneDraftPath) ? `Blender: ${state.blender_version || tr.autoDetect}` : `${tr.mayaVersion}: ${state.maya_version ? `Maya ${state.maya_version}` : tr.autoDetect}`)}"><b data-picker-engine-label>${/\.blend$/i.test(mayaSceneDraftPath) ? "Blender" : escapeHtml(tr.mayaVersion)}</b><span data-picker-engine-version>${escapeHtml((/\.blend$/i.test(mayaSceneDraftPath) ? state.blender_version : state.maya_version) || tr.autoDetect)}</span></span></div>
             </div>
           </div>
-          <div class="picker-tools-resize nodrag nopan nowheel" data-picker-tools-resize role="separator" aria-orientation="horizontal" tabindex="0" hidden></div>
+          <div class="picker-tools-resize nodrag nopan" data-picker-tools-resize role="separator" aria-orientation="horizontal" tabindex="0" hidden></div>
           <section class="picker-tools-panel nodrag nopan nowheel" data-picker-tools-panel hidden></section>
           <div class="picker-tools-status" data-picker-tools-status hidden><span data-picker-tool-message role="status" aria-live="polite"></span><progress max="1" value="0" hidden></progress><button type="button" data-picker-tool-action="cancel" hidden></button><button type="button" data-picker-tool-action="result" hidden></button><button type="button" data-picker-tool-action="add_result" hidden></button></div>
         </section>
@@ -13088,7 +13098,7 @@ function hmbNativeUiImplementation(container, props) {
               <span class="video-selected-count">${fixedTopSelectedCount}/${HMB_PICKER_MAX_REPRESENTATIVE_VIDEOS}</span>
               <button type="button" class="import-video-button" id="import-video-button" data-picker-shot-load="${escapeHtml(fixedTopActiveShot?.workspace_uuid || "")}" ${initialLocked || fixedTopAssetCount >= HMB_PICKER_MAX_ASSETS_PER_SHOT ? "disabled" : ""}><svg class="import-video-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m16 16 4 4"></path></svg><span>${escapeHtml(tr.load || tr.importVideoAsset || "LOAD")}</span></button>
             </div>
-            <div class="video-assets-body"><div class="video-asset-grid">${videoAssetMarkup}</div></div>
+            <div class="video-assets-body nowheel"><div class="video-asset-grid">${videoAssetMarkup}</div></div>
             <div class="video-order-hint">${escapeHtml(tr.dragVideoOrder)}</div>
             <div class="section-resize-handle nodrag" data-resize-section="color" title="${escapeHtml(tr.resizeSection)}"></div>
           </section>
@@ -14873,7 +14883,7 @@ function hmbNativeUiImplementation(container, props) {
     }));
     container.querySelectorAll?.(
       "[data-picker-compact-summary] button,[data-picker-compact-summary] input,[data-picker-compact-summary] [data-video-uid]",
-    )?.forEach?.((element) => element.classList?.add?.("nodrag", "nopan", "nowheel"));
+    )?.forEach?.((element) => element.classList?.add?.("nodrag", "nopan"));
     hmbSyncVideoPickerCompactThumbnails(container);
     return true;
   };

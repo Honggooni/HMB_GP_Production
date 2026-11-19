@@ -7,6 +7,26 @@ import HMB_Color_LUT_Manual_Upload_Regression as fixture
 import HMBColorLUTLibrary as target
 
 class DirectUploadRegression(fixture.ManualLUTRegression):
+    def test_original_alpha_mov_upload_after_native_import_uses_original_hash(self):
+        import subprocess
+        import _hmb_color_lut as media
+        path = self.root / "한글 원본.MOV"
+        subprocess.run([media._find_ffmpeg(), "-nostdin", "-v", "error", "-f", "lavfi", "-i",
+                        "color=blue:s=96x64:d=0.2", "-c:v", "qtrle", "-pix_fmt", "argb", str(path)], check=True)
+        expected = hashlib.sha256(path.read_bytes()).hexdigest()
+        with mock.patch.object(target, "probe_source", side_effect=media.probe_source):
+            self.node._queue_source({"path": str(path)})
+            self.fixture.drain()
+        source = self.node._hmb_color_lut_state["source"]
+        self.assertEqual(Path(source["path"]), path)
+        self.assertIn("ALPHA_UNSUPPORTED", source["grade_unavailable"])
+        self.assertIn("preview.mp4", source["url"])
+        with mock.patch.object(self.node, "_upload_request", side_effect=lambda ctx, **kw: self.ack(ctx)) as sent:
+            self.ready()
+            self.upload()
+        ctx = sent.call_args.args[0]
+        self.assertEqual((Path(ctx["path"]),ctx["file_name"],ctx["sha256"]), (path,path.name,expected))
+
     def test_authored_edit_arriving_with_original_upload_recovers_readiness_without_sending(self):
         self.ready()
         state = copy.deepcopy(self.node._hmb_color_lut_state)

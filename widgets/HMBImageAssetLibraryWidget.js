@@ -7065,6 +7065,7 @@ function hmbSetImageAssetLibraryCompactGroup(container, compactMode) {
 
 export function hmbPrepareImageAssetCanvasGestures(container) {
   if (!container) return;
+  container.querySelectorAll?.(".tree,.shot-stack,.tray-scroll,[data-compact-shot-assets]")?.forEach(element => element.classList?.add("nowheel"));
   const canvasPanRoots = [
     container,
     container.querySelector?.(".hmb-image-assets"),
@@ -7836,6 +7837,16 @@ function installEvents(container, state, props, remount, listeners) {
   const assetsBySourceUid = new Map(
     state.assets.map((asset) => [clean(asset.source_uid), asset]),
   );
+  const scrollCardStrip = event => {
+    const strip = event.target?.closest?.(".tray-scroll,[data-compact-shot-assets]");
+    if (!strip || !event.deltaY || event.deltaX || event.ctrlKey || strip.scrollWidth <= strip.clientWidth
+        || strip.scrollHeight > strip.clientHeight + 1) return;
+    const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? strip.clientWidth : 1;
+    strip.scrollLeft += event.deltaY * unit;
+    event.preventDefault();
+    event.stopPropagation();
+  };
+  on(container, "wheel", scrollCardStrip, {passive:false});
   hmbInstallImageAssetScrollGestures(container, on);
 
   const commitShotMutation = (mutate, paint = null) => {

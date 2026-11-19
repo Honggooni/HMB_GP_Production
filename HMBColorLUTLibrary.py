@@ -29,6 +29,7 @@ from HMBFinishLookLibrary import (
     _shot_only, set_output,
 )
 from _hmb_color_lut import CODEC_EXTENSIONS, default_settings, normalize_settings, normalize_audio_mix, probe_source, export_video, write_cube
+from _hmb_color_lut import UnsupportedGrade, make_mov_preview
 from _hmb_deletion_guard import hmb_binding_mutation
 from _hmb_project import project_display_name
 
@@ -1624,6 +1625,8 @@ class HMBColorLUTLibrary(DataNode):
             if key == self._pending_source_key:
                 return
             self._pending_source_key = key
+            if getattr(self, "_mov_preview_cancel", None) is not None:
+                self._mov_preview_cancel.set()
             self._source_token += 1
             self._web_upload_wake.set()
             token = self._source_token
@@ -1654,7 +1657,12 @@ class HMBColorLUTLibrary(DataNode):
                         return
                 token, snap, path, warnings = pending
                 try:
-                    info = probe_source(path)
+                    try:
+                        info = probe_source(path)
+                    except UnsupportedGrade as exc:
+                        if Path(path).suffix.lower() != ".mov":
+                            raise
+                        info = exc.media
                     media = Path(str(info.get("path") or path)).resolve()
                     source = {**snap, **info, "_reference_path": str(snap.get("_reference_path") or path),
                               "path": str(media), "url": "", "name": media.name,
@@ -1740,6 +1748,30 @@ class HMBColorLUTLibrary(DataNode):
                         # earlier optional cache or native notification failed.
                         self._hmb_color_lut_state["shot_states"][_selection_key(self._hmb_color_lut_state)] = copy.deepcopy({
                             key: self._hmb_color_lut_state[key] for key in ("settings", "output", "source", "result", "preset_name", "preset_id")})
+                if (media.suffix.lower() == ".mov" and info.get("video_codec")
+                        and (info["video_codec"] != "h264" or info.get("pixel_format") not in ("yuv420p", "yuvj420p")
+                             or info.get("audio_codec") not in ("", "aac", "mp3"))):
+                    # The original is already available for upload while this preview is built.
+                    with self._lock:
+                        if self._hmb_node_deleted or token != self._source_token:
+                            continue
+                        cancel = self._mov_preview_cancel = threading.Event()
+                    preview_dir = tempfile.TemporaryDirectory(prefix="hmb-lut-preview-", ignore_cleanup_errors=True)
+                    try:
+                        preview = make_mov_preview(media, info, Path(preview_dir.name), cancel)
+                        url = _media_url(preview)
+                        with self._lock:
+                            if self._hmb_node_deleted or token != self._source_token:
+                                continue
+                            self._mov_preview_dir = preview_dir
+                            source["url"] = url
+                            self._publish()
+                    except Exception as exc:
+                        if not cancel.is_set():
+                            LOGGER.warning("MOV preview unavailable for %s: %s", media.name, exc)
+                    finally:
+                        if getattr(self, "_mov_preview_dir", None) is not preview_dir:
+                            preview_dir.cleanup()
         with self._lock:
             self._source_worker = threading.Thread(target=contextvars.copy_context().run, args=(load,), name="HMB LUT source", daemon=True)
             self._source_worker.start()
@@ -2408,6 +2440,8 @@ class HMBColorLUTLibrary(DataNode):
             if self._hmb_node_deleted:
                 return None
             self._hmb_node_deleted = True
+            if getattr(self, "_mov_preview_cancel", None) is not None:
+                self._mov_preview_cancel.set()
             self._source_token += 1
             self._cancel.set()
             self._web_upload_wake.set()

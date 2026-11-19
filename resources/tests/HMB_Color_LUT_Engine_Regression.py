@@ -26,6 +26,22 @@ def digest(path: Path) -> str:
 
 
 class ColorLUTRegression(unittest.TestCase):
+    def test_uppercase_alpha_mov_remains_readable_and_preview_uses_separate_file(self):
+        with tempfile.TemporaryDirectory(dir=self.root) as work:
+            directory = Path(work)
+            original = directory / "원본.MOV"
+            self.run_ffmpeg("-f", "lavfi", "-i", "color=red:s=96x64:d=0.25", "-c:v", "qtrle",
+                            "-pix_fmt", "argb", str(original))
+            before = digest(original)
+            with self.assertRaises(target.UnsupportedGrade) as rejected:
+                target.probe_source(original)
+            media = rejected.exception.media
+            self.assertEqual(Path(media["path"]), original)
+            self.assertIn("ALPHA_UNSUPPORTED", media["grade_unavailable"])
+            preview = target.make_mov_preview(original, media, directory, threading.Event())
+            self.assertEqual(target.probe_source(preview)["video_codec"], "h264")
+            self.assertEqual(digest(original), before)
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.workspace = tempfile.TemporaryDirectory(prefix="hmb_lut_regression_")

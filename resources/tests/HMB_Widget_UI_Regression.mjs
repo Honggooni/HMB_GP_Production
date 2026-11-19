@@ -419,7 +419,13 @@ pickerGuardContainer.handler("click")({
   stopPropagation() { pickerBackgroundStops += 1; },
 });
 assert.equal(pickerBackgroundStops, 0, "Picker background clicks still reach the canvas.");
-assert.equal(pickerGuardContainer.handler("wheel"), undefined);
+const wheelOnPicker = pickerGuardContainer.handler("wheel");
+wheelOnPicker({target:{closest:() => null},deltaY:100,preventDefault:assert.fail,stopPropagation:assert.fail});
+const cardStrip = {scrollLeft:0,scrollWidth:600,clientWidth:120,scrollHeight:80,clientHeight:80};
+let consumed = 0;
+wheelOnPicker({target:{closest:() => cardStrip},deltaY:90,preventDefault(){consumed++;},stopPropagation(){consumed++;}});
+assert.equal(cardStrip.scrollLeft,90);
+assert.equal(consumed,2);
 assert.equal(pickerBroadPanel.classList.contains("nopan"), false);
 assert.equal(pickerBroadPanel.classList.contains("nowheel"), false);
 assert.equal(
@@ -427,7 +433,8 @@ assert.equal(
   undefined,
   "Picker broad panels pass wheel zoom through after stale guards are cleared.",
 );
-for (const className of ["nodrag", "nopan", "nowheel"]) {
+assert.equal(pickerGuardControl.classList.contains("nowheel"), false);
+for (const className of ["nodrag", "nopan"]) {
   assert.ok(
     pickerGuardControl.classList.contains(className),
     `Picker controls retain ${className} isolation.`,
@@ -1007,7 +1014,7 @@ assert.equal(stopped, 2, "Delete is isolated from React Flow.");
 assert.equal(prevented, 0, "Delete keeps its native text editing action.");
 assert.ok(textInput.classList.contains("nodrag"));
 assert.ok(textInput.classList.contains("nopan"));
-assert.ok(textInput.classList.contains("nowheel"));
+assert.equal(textInput.classList.contains("nowheel"), false);
 promptContainer.handler("mousedown")({
   target: { closest: () => textInput },
   stopPropagation() { stopped += 1; },

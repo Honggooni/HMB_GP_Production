@@ -26,6 +26,14 @@ from _hmb_video_tools import VideoMediaService, VideoToolError, _find_ffmpeg, _f
 
 
 ColorLUTError = VideoToolError
+
+
+class UnsupportedGrade(ColorLUTError):
+    """The file is readable and can be uploaded unchanged."""
+
+    def __init__(self, message, media):
+        super().__init__(message)
+        self.media = {**media, "grade_unavailable": message}
 STEP_KEYS = ("exposure", "temperature", "contrast", "saturation", "shadows", "highlights")
 SETTINGS_PRECISION_VERSION = 2
 STEP_SUBDIVISIONS = 4
@@ -296,19 +304,35 @@ def probe_source(reference: Any, *, remote: bool = False) -> dict[str, Any]:
     source = resolve_source(reference, remote=remote)
     details = _color_details(source)
     basic = _basic_probe(source, details)
-    contract = _color_contract(basic, details)
     rotation = next((item.get("rotation", 0) for item in details.get("side_data_list", []) if "rotation" in item), 0)
     try:
         rotation = float(rotation or details.get("tags", {}).get("rotate") or 0)
     except (TypeError, ValueError):
         rotation = 0
-    if rotation % 360:
-        raise ColorLUTError("ROTATED_VIDEO_UNSUPPORTED: normalize the source display rotation before Color LUT export.")
-    return {**basic, **contract, "audio_streams": details.get("audio_streams", []),
+    media = {**basic, "audio_streams": details.get("audio_streams", []),
             "video_stream_index": int(details.get("index", 0)), "start_time": details.get("start_time", "0"),
             "format_start_time": details.get("format_start_time", "0"),
             "sample_aspect_ratio": str(details.get("sample_aspect_ratio") or ""),
             "frame_count": int(details.get("nb_frames") or 0) if str(details.get("nb_frames") or "0").isdigit() else 0}
+    try:
+        contract = _color_contract(basic, details)
+        if rotation % 360:
+            raise ColorLUTError("ROTATED_VIDEO_UNSUPPORTED: normalize the source display rotation before Color LUT export.")
+    except ColorLUTError as exc:
+        raise UnsupportedGrade(str(exc), media) from exc
+    return {**media, **contract}
+
+
+def make_mov_preview(source: Path, info: Mapping[str, Any], directory: Path, cancel: threading.Event) -> Path:
+    """Decode the selected stream to a local browser preview, never an upload artifact."""
+    preview = directory / "preview.mp4"
+    command = [_find_ffmpeg(), "-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe",
+               "-i", str(source), "-map", f"0:{int(info['video_stream_index'])}", "-map", "0:a:0?",
+               "-vf", "scale=w='min(1280,iw)':h=-2:force_divisible_by=2,pad=ceil(iw/2)*2:ceil(ih/2)*2",
+               "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac",
+               "-movflags", "+faststart", "-map_metadata", "-1", "-f", "mp4", str(preview)]
+    _run_export(command, directory, cancel, None, float(info.get("duration") or 0), 0)
+    return preview
 
 
 def build_color_filter(source_probe: Mapping[str, Any], codec: str, *, cube_name: str = "grade.cube") -> str:

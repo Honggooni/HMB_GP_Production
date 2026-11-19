@@ -4027,7 +4027,7 @@ export function hmbInstallPromptInteractionIsolation(container, listeners, insta
     if (hmbPromptNativeHeaderTarget(element)) return;
     // A concrete control keeps its native pointer and wheel behavior. The
     // surrounding open-hand background remains free for Griptape pan/zoom.
-    const missing = ["nodrag", "nopan", "nowheel"].filter(name => !element.classList?.contains?.(name));
+    const missing = ["nodrag", "nopan"].filter(name => !element.classList?.contains?.(name));
     if (missing.length) element.classList?.add(...missing);
   };
 
@@ -4036,11 +4036,13 @@ export function hmbInstallPromptInteractionIsolation(container, listeners, insta
   const imageSourceBinding = container.querySelector?.(".image-card");
   imageSourceBinding?.classList?.remove("nodrag", "nopan", "nowheel");
   container.querySelectorAll(interactionSelector).forEach(isolatePointer);
+  container.querySelectorAll("textarea,[contenteditable=true],.source-scrollbox").forEach(element => element.classList?.add("nowheel"));
   if (!installGlobal) return;
   // A control's own handler and native browser behavior run before the event
   // reaches the widget boundary. One guard per event keeps it off the canvas
   // without installing and wrapping listeners on every heavy source row.
   const stopControlPointer = (event) => {
+    if (event.button === 1) return;
     const control = event.target?.closest?.(interactionSelector);
     if (control && container.contains(control) && !hmbPromptNativeHeaderTarget(control)) {
       event.stopPropagation();
@@ -6540,7 +6542,7 @@ function renderPromptShotRows(state, editorMarkup = "") {
   return `<div class="prompt-shot-list nodrag"${catalog.length ? ' role="tablist" aria-label="Prompt Shots"' : ""}>${catalog.map((shot) => {
     const active = hasActiveShot && shot.shot_uuid === selected.shot_uuid;
     const expanded = active;
-    return `<section class="prompt-shot-section" data-shot-uuid="${escapeHtml(shot.shot_uuid)}"><button type="button" role="tab" title="${escapeHtml(hmbPromptShotOptionLabel(shot))}" class="prompt-shot-row nodrag nopan nowheel${active ? " active" : ""}" data-prompt-shot="${escapeHtml(shot.shot_uuid)}" data-prompt-shot-number="${shot.number}" aria-expanded="${expanded}" aria-selected="${active}"${state.disabled ? " disabled" : ""}><span class="prompt-shot-number">${String(shot.number).padStart(2, "0")}</span><b>${escapeHtml(shot.name)}</b></button>${expanded && editorMarkup ? `<div role="tabpanel" class="prompt-shot-content" data-shot-editor="${escapeHtml(shot.shot_uuid)}">${editorMarkup}</div>` : ""}</section>`;
+    return `<section class="prompt-shot-section" data-shot-uuid="${escapeHtml(shot.shot_uuid)}"><button type="button" role="tab" title="${escapeHtml(hmbPromptShotOptionLabel(shot))}" class="prompt-shot-row nodrag nopan${active ? " active" : ""}" data-prompt-shot="${escapeHtml(shot.shot_uuid)}" data-prompt-shot-number="${shot.number}" aria-expanded="${expanded}" aria-selected="${active}"${state.disabled ? " disabled" : ""}><span class="prompt-shot-number">${String(shot.number).padStart(2, "0")}</span><b>${escapeHtml(shot.name)}</b></button>${expanded && editorMarkup ? `<div role="tabpanel" class="prompt-shot-content" data-shot-editor="${escapeHtml(shot.shot_uuid)}">${editorMarkup}</div>` : ""}</section>`;
   }).join("")}${fallback}</div>`;
 }
 

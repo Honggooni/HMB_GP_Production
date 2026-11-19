@@ -95,7 +95,7 @@ export function hmbColorLUTState(input = {}) {
     manual_project_display_name: clean(s.manual_project_display_name, 256),
     manual_project: manualProject, upload_projects: projects,
     settings: hmbColorLUTSettings(s.settings), source: sourceMatches ? { path: clean(source.path), url: clean(source.url), name: clean(source.name, 256),
-      revision: clean(source.revision, 128), shot_uuid: clean(source.shot_uuid, 128), channel_uuid: clean(source.channel_uuid, 128),
+      revision: clean(source.revision, 128), grade_unavailable: clean(source.grade_unavailable, 512), shot_uuid: clean(source.shot_uuid, 128), channel_uuid: clean(source.channel_uuid, 128),
       width: Math.max(0, finite(source.width)), height: Math.max(0, finite(source.height)), fps: Math.max(0, finite(source.fps)), duration: Math.max(0, finite(source.duration)) } : {},
     audio_mix: { enabled: record(s.audio_mix).enabled === true, original_audio: record(s.audio_mix).original_audio === "mute" ? "mute" : "preserve", source: record(s.audio_mix).source === "rendered" ? "rendered" : "current" },
     sound: { connected: record(s.sound).connected === true, revision: clean(record(s.sound).revision, 128) },
@@ -251,6 +251,7 @@ const exportAction = (state) => {
   const local = state.output.codec === "ffv1";
   const label = local ? text.output : text.outputUpload;
   let reason = !state.source.path && !state.source.url ? text.outputSource : "";
+  if (!reason && state.source.grade_unavailable) reason = state.source.grade_unavailable;
   if (!reason && state.audio_mix.enabled && !state.sound.connected) reason = text.soundMissing;
   if (!reason && !local && state.web_upload.phase === "offline") reason = state.web_upload.reason || text.transportError;
   if (!reason && !local && !state.shot.shot_uuid && !state.upload_projects.some(project => project.id === state.manual_project.id
@@ -311,7 +312,7 @@ export function hmbRenderColorLUTWidget(input = {}) {
 .hmb-color-lut .cl-audio-toggle,.hmb-color-lut .cl-audio-mix label{display:flex;align-items:center;gap:6px;font-size:11px}.hmb-color-lut .cl-audio-toggle{white-space:nowrap}
 .hmb-color-lut .cl-audio-mix{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;margin-top:8px;max-height:112px;overflow:auto}.hmb-color-lut .cl-audio-mix select{min-width:0;max-width:100%;font-size:11px}.hmb-color-lut .cl-audio-mix small{color:var(--cl-muted);font-size:10px;line-height:1.4}.hmb-color-lut .cl-audio-mix [data-text="soundNote"]{flex-basis:100%}
 .hmb-color-lut[data-hmb-native-header=active] .cl-head{cursor:grab}.hmb-color-lut[data-hmb-native-header=active] .cl-head:active{cursor:grabbing}
-</style><div class="hmb-color-lut nodrag nowheel" data-language="${s.language}" data-shot-number="${hmbColorLUTShotOptions(s).find((x) => x.selected)?.number || 0}" tabindex="0">
+</style><div class="hmb-color-lut nodrag" data-language="${s.language}" data-shot-number="${hmbColorLUTShotOptions(s).find((x) => x.selected)?.number || 0}" tabindex="0">
 <header class="cl-head group"><div class="cl-mark" aria-hidden="true">CL</div><div class="cl-brand"><strong>HMB Color LUT</strong><small data-text="subtitle">${t.subtitle}</small></div><div class="cl-native-identity" data-hmb-native-identity></div><div class="cl-native-actions nodrag" data-hmb-native-actions></div><label class="cl-shot-shell nodrag"><span>SHOT</span><select data-shot-selector aria-label="${t.shot}">${shotMarkup(s)}</select></label><button class="cl-lang nodrag" data-language-toggle type="button" aria-label="${t.language}">${s.language === "ko" ? "한국어" : "EN"}</button></header>
 <div class="cl-input nodrag"><span class="cl-dot"></span><span class="cl-source" data-source></span><small data-source-revision></small><button data-action="browse_video" type="button">${label("browse")}</button></div>
 <main class="cl-work nodrag"><section class="cl-preview"><div class="cl-panel-head">${label("preview")}<div class="cl-mode">${["original", "compare", "graded"].map((view) => `<button type="button" data-view="${view}" aria-pressed="${view === "compare"}">${label(view)}</button>`).join("")}</div></div><div class="cl-screen"><canvas data-preview width="960" height="540" role="img" aria-label="${t.preview}"></canvas><span class="cl-label cl-before" data-text="original">${t.original}</span><span class="cl-label cl-after" data-text="graded">${t.graded}</span><div class="cl-seam"><button type="button" data-wipe-handle role="slider" aria-label="${t.wipe}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50">↔</button></div><div class="cl-empty" data-empty>${t.empty}</div></div><div class="cl-transport"><input data-seek type="range" min="0" max="0" value="0" step="1" aria-label="${t.seek}" disabled><div class="cl-player-row"><button data-play type="button" disabled>${t.play}</button><button data-step type="button" disabled>${label("step")}</button><small data-frame></small></div></div><div class="cl-note"><span data-preview-note></span>${label("live")}</div></section>

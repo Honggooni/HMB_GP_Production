@@ -377,18 +377,18 @@ function render(state, view, locked, pending, notice) {
   const review = role === "before" ? `<fieldset class="ha-review" data-ha-key="review"><legend>Prompt 입력 미리보기</legend>
     <div class="ha-field-tabs" role="tablist" aria-label="Prompt 입력 항목">${fieldTabs}</div>
     <label class="ha-field-editor" role="tabpanel"><b>${promptFields[field][1]}</b>
-      <textarea data-field-text="${field}" maxlength="${field === "VIDEO_VFX" ? 20000 : 6000}" aria-label="${promptFields[field][1]}" placeholder="분석이 완료되면 입력 문구가 표시됩니다."${disabled(editDisabled || !details)}>
+      <textarea class="nowheel" data-field-text="${field}" maxlength="${field === "VIDEO_VFX" ? 20000 : 6000}" aria-label="${promptFields[field][1]}" placeholder="분석이 완료되면 입력 문구가 표시됩니다."${disabled(editDisabled || !details)}>
 ${escape(fieldText)}</textarea></label>
     <small class="ha-result-help">선택된 샷의 Prompt에 반영됩니다. 정확한 문자열은 확인된 원문만 입력하세요.</small>
     ${categoryGroup}</fieldset>` : `<fieldset class="ha-review" data-ha-key="review"><legend>이 샷에 가져올 결과</legend>${categoryGroup}
     ${usable && !details ? '<div class="ha-subtle" data-analysis-result-hint>분석이 완료되면 결과가 있는 항목을 선택할 수 있습니다.</div>' : ""}
     <small class="ha-result-help">선택 항목이 없으면 분석 결과 전체를 사용합니다. 아래 내용을 수정하면 해당 샷에 저장됩니다. 내용을 비우면 자동 생성 문구로 복원됩니다.</small>
-    <textarea class="ha-result-text" data-result-text maxlength="26000" aria-label="분석 결과 편집" placeholder="분석이 완료되면 결과가 표시됩니다."${disabled(editDisabled || !details)}>${escape(resultText)}</textarea>
+    <textarea class="nowheel ha-result-text" data-result-text maxlength="26000" aria-label="분석 결과 편집" placeholder="분석이 완료되면 결과가 표시됩니다."${disabled(editDisabled || !details)}>${escape(resultText)}</textarea>
   </fieldset>`;
   const actions = `<div class="ha-bottom" data-ha-key="actions"><span class="ha-status" role="status" data-error="${Boolean(notice || state.error)}">${escape(notice || state.status || (result.cache_hit ? "저장 결과 재사용" : ""))}</span>
     ${busy ? `<button type="button" data-action="cancel"${disabled(locked || pending)}>분석 취소</button>` : ""}
     <button type="button" data-action="analyze" data-primary${disabled(!canAnalyze(state, locked, pending, spec, intervals))}>${role === "before" ? "To Prompt 실행" : "To Agent 실행"}</button></div>`;
-  return `<style>${style}</style><div class="hmb-analysis nodrag nowheel nopan" data-hmb-analysis-widget data-hmb-color-lut-widget
+  return `<style>${style}</style><div class="hmb-analysis nodrag nopan" data-hmb-analysis-widget data-hmb-color-lut-widget
     data-hmb-node-type="HMBAnalysisAgent" data-hmb-native-node-type="HMBAnalysisAgent"${view.nativeHeader ? ' data-hmb-native-header="active"' : ""}>
     <header class="ha-header group"><span class="ha-mark ha-brand">◈</span><b class="ha-brand">HMB Analysis Agent</b>
       <div data-hmb-native-identity></div><div class="ha-role" role="group" aria-label="Analysis Agent 위치">${roles}</div><div data-hmb-native-actions></div>
@@ -406,7 +406,7 @@ ${escape(fieldText)}</textarea></label>
       </div>
       <div class="ha-workspace" data-ha-key="workspace">
         <div class="ha-preview">${renderPreview(source, slot)}</div>
-        <div class="ha-guidance"><textarea data-guidance maxlength="500" aria-label="참고 지시 (선택)"${disabled(editDisabled || !usable)}
+        <div class="ha-guidance"><textarea class="nowheel" data-guidance maxlength="500" aria-label="참고 지시 (선택)"${disabled(editDisabled || !usable)}
           placeholder="참고 지시 (선택) · 예시 이펙트의 모양과 시작 시점을 봐 주세요.">${escape(slot.guidance)}</textarea></div>
       </div>
       <div data-ha-key="range">${range}</div>
@@ -926,6 +926,7 @@ function hmbNativeStockSafetyImplementation(container, props = {}) {
   }
 
   function holdCanvasInput(event) {
+    if (event.button === 1) return;
     const target = event.target;
     if (target.closest?.("button,input,select,textarea,video,audio") &&
         !target.closest("[data-hmb-native-actions],[data-hmb-native-identity]")) event.stopPropagation();
