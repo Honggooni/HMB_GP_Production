@@ -286,6 +286,14 @@ async def exercise(engine, phase, out):
             return
 
         assert not engine.context_manager.has_current_flow()
+        with mock.patch.object(modules["image"], "_discover_project_catalog", side_effect=PermissionError("fixture share offline")) as discover:
+            unavailable = await wait_for(lambda: request("status"), lambda data: data["status"] == "unavailable")
+            assert "읽기 권한" in unavailable["message"] and not unavailable["projects"]
+            assert discover.call_count == 1 and not engine.context_manager.has_current_flow()
+        # The next foreground status (the dialog's Retry button) must bypass the
+        # negative cache, without waiting ten seconds or constructing any nodes.
+        retry = await request("status")
+        assert retry["status"] in {"discovering", "empty"}, retry
         before = await wait_for(lambda: request("status"), project_available)
         assert before["status"] == "empty" and not before["shot_uuid"] and not engine.context_manager.has_current_flow()
         project_id = next(row["project_id"] for row in before["projects"] if row["project_id"].casefold() == PROJECT_ID)

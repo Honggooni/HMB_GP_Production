@@ -73,7 +73,7 @@ assert.equal(cleanup.length, 1, "One cleanup owns all delegated interaction list
 for (const control of controls) {
   assert.ok(control.classList.contains("nodrag"));
   assert.ok(control.classList.contains("nopan"));
-  assert.ok(control.classList.contains("nowheel"));
+  assert.equal(control.classList.contains("nowheel"), false, "Ordinary controls pass wheel zoom to the canvas.");
   assert.equal(
     Array.from(control.listeners.values()).flat().length,
     0,

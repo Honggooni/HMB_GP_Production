@@ -26,6 +26,7 @@ try {
     window.operations = [];
     window.cgtPickerOpened = false;
     let bound = false;
+    let shareRecovered = false;
     const context = {ready:true, empty:true, flowName:'Fixture flow', workflowName:'Fixture workflow'};
     const projects = [{project_id:'superwings12', name:'superwings12'}];
     const empty = {ok:true, status:'empty', projects, shots:[], flow_name:context.flowName};
@@ -57,6 +58,10 @@ try {
           return created;
         }
         if (action === 'status') {
+          if (!shareRecovered) {
+            shareRecovered = true;
+            return {...empty, status:'unavailable', projects:[], message:'공유 프로젝트 목록을 읽지 못했습니다. 읽기 권한을 확인하세요.'};
+          }
           return bound ? {...created, cgt_bound:true, status:'preparing', shots} : empty;
         }
         throw new Error(`Unexpected action ${action}`);
@@ -65,6 +70,8 @@ try {
     basket.open();
   });
   const dialog = page.getByRole('dialog', {name:'샷 바구니'});
+  await dialog.getByText('공유 프로젝트 목록을 읽지 못했습니다. 읽기 권한을 확인하세요.').waitFor();
+  await dialog.getByRole('button', {name:'다시 확인'}).click();
   await dialog.getByRole('combobox', {name:'프로젝트'}).selectOption('superwings12');
   await dialog.getByRole('button', {name:'샷 바구니 들기'}).click();
   await page.waitForFunction(() => window.cgtPickerOpened);
@@ -73,10 +80,10 @@ try {
   assert.equal(await page.locator('[data-basket-view="sources"]').count(),0);
   assert.equal(await page.locator('[data-shot-add]').count(),1);
   const operations = await page.evaluate(() => window.operations);
-  assert.deepEqual(operations.map(entry => entry.action), prefetch ? ['status','status','create','status'] : ['status','create','status']);
+  assert.deepEqual(operations.map(entry => entry.action), prefetch ? ['status','status','status','create','status'] : ['status','status','create','status']);
   if(prefetch){
-    assert.equal(operations[1].payload.prewarm,true);
-    assert.equal(operations[1].payload.project_id,'superwings12');
+    assert.equal(operations[2].payload.prewarm,true);
+    assert.equal(operations[2].payload.project_id,'superwings12');
   }
   const creation=operations.find(entry=>entry.action==='create');
   assert.equal(creation.payload.cgt_setup,true);

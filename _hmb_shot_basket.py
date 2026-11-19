@@ -43,6 +43,8 @@ class _Session:
     discovery_lock: Any = field(default_factory=RLock)
     discovery_busy: bool = False
     discovery_at: float = 0
+    discovery_notice: str = ""
+    retry_empty_on_status: bool = False
     projects: list[dict] = field(default_factory=list)
     prewarm_library: Any = None
     prewarm_pending: bool = False
@@ -97,26 +99,36 @@ def _uuid(value: Any) -> str:
         return ""
 
 
-def _project_options(session: _Session) -> tuple[list[dict], bool]:
+def _project_options(session: _Session, *, foreground_status: bool = False) -> tuple[list[dict], bool, str]:
     def discover() -> None:
-        from HMBImageAssetLibrary import DEFAULT_PROJECTS_ROOT, _discover_project_catalog
-
+        projects = []
+        notice = ""
         try:
+            from HMBImageAssetLibrary import DEFAULT_PROJECTS_ROOT, _discover_project_catalog
             projects = _discover_project_catalog(DEFAULT_PROJECTS_ROOT)["projects"]
+            if not projects:
+                notice = "선택 가능한 프로젝트가 없습니다. 공유 폴더에서 프로젝트의 Ai_Ct_image 폴더와 읽기 권한을 확인한 뒤 다시 확인하세요."
         except Exception:
             _LOG.debug("HMB shot basket project discovery failed", exc_info=True)
-            projects = []
+            notice = "공유 프로젝트 목록을 읽지 못했습니다. 네트워크 연결과 프로젝트 폴더의 읽기 권한을 확인한 뒤 다시 확인하세요."
         with session.discovery_lock:
             session.projects = projects
+            session.discovery_notice = notice
             session.discovery_at = monotonic()
             session.discovery_busy = False
 
     with session.discovery_lock:
         expiry = 60 if session.projects else 10
-        if not session.discovery_busy and (not session.discovery_at or monotonic() - session.discovery_at > expiry):
+        # Once the dialog has displayed an empty/error result, its next status
+        # request is the user's retry. Background prewarming keeps the cache TTL.
+        retry = foreground_status and session.retry_empty_on_status and not session.projects
+        if not session.discovery_busy and (retry or not session.discovery_at or monotonic() - session.discovery_at > expiry):
+            session.retry_empty_on_status = False
             session.discovery_busy = True
             Thread(target=discover, daemon=True, name="HMB-Basket-Projects").start()
-        return list(session.projects), session.discovery_busy
+        if foreground_status and not session.discovery_busy and not session.projects:
+            session.retry_empty_on_status = True
+        return list(session.projects), session.discovery_busy, session.discovery_notice
 
 
 def _active_flow(engine: Any, expected: str, *, exact: bool = False) -> Any:
@@ -891,8 +903,12 @@ def handle_workspace_request(engine: Any, request: dict) -> dict:
             raise BasketError("작업공간이 바뀌었습니다. 로동마트를 다시 여세요.")
         flow = _active_flow(engine, expected, exact=action != "status")
         kinds = _owned_nodes(engine, flow) if flow is not None else {}
-        projects, discovering = _project_options(session) if action in {"status", "prepare", "create"} else ([], False)
+        projects, discovering, notice = _project_options(
+            session, foreground_status=action == "status" and request.get("prewarm") is not True
+        ) if action in {"status", "prepare", "create"} else ([], False, "")
         response = _status(flow, kinds, projects, discovering)
+        if response["status"] == "unavailable" and not response.get("message") and notice:
+            response["message"] = notice
         if action == "status":
             if request.get("prewarm") is True:
                 _prewarm_library(engine, session)

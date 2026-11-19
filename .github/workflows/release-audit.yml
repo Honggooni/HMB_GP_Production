@@ -28,7 +28,7 @@ jobs:
     if: github.event_name != 'schedule'
     needs: sound-link
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     outputs:
       package_version: ${{ steps.release_metadata.outputs.version }}
       release_label: ${{ steps.release_metadata.outputs.release_label }}

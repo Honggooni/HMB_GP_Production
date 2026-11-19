@@ -373,7 +373,7 @@ def _read_profiles() -> list[dict[str, Any]]:
 
 def default_state() -> dict[str, Any]:
     return {"schema_version": 1, "revision": 0, "language": "ko", "shot": _shot_only(),
-            "shot_catalog": {}, "project_id": "", "project": {}, "manual_project": {}, "preset_name": "", "preset_id": "", "profiles": _read_profiles(),
+            "shot_catalog": {}, "project_id": "", "project": {}, "manual_project": {}, "manual_episode": "", "preset_name": "", "preset_id": "", "profiles": _read_profiles(),
             "settings": default_settings(), "audio_mix": normalize_audio_mix({}), "sound": {"connected": False, "revision": ""}, "source": {}, "output": {
                 "codec": "hevc10", "manual_output_enabled": False, "path": ""},
             "status": {"phase": "idle", "message": "", "progress": 0}, "result": {}, "shot_states": {}}
@@ -392,6 +392,21 @@ def _export_selection(state: Mapping[str, Any]) -> str:
 def _audio_mix_identity(state: Mapping[str, Any]) -> dict[str, Any]:
     settings = normalize_audio_mix(state.get("audio_mix"))
     return {**settings, "sound_revision": str(state.get("sound", {}).get("revision") or "")} if settings["enabled"] else settings
+
+
+def _episode_code(value: Any) -> str:
+    code = str(value or "").strip().lower()
+    return code if re.fullmatch(r"e[0-9]{3}", code) and code != "e000" else ""
+
+
+def _episode_filename(name: str, episode: str) -> str:
+    if not episode:
+        return name
+    if re.match(r"^e[0-9]{3}(?![0-9])", name, re.IGNORECASE):
+        return episode + name[4:]
+    suffix = Path(name).suffix
+    prefix = episode + "_"
+    return prefix + name[:-len(suffix)][:128 - len(prefix) - len(suffix)] + suffix
 
 
 def _upload_project(value: Any) -> dict[str, str]:
@@ -499,6 +514,11 @@ class HMBColorLUTLibrary(DataNode):
         self._manual_projects_origin = ""
         self._manual_projects_worker: threading.Thread | None = None
         self._manual_projects_checked = 0.0
+        self._projects_notice = ""
+        self._episode_worker: threading.Thread | None = None
+        self._episode_key: tuple[str, str] | None = None
+        self._episode_codes: list[str] = []
+        self._episodes_checked = 0.0
         self._hmb_node_deleted = False
         self._hmb_initial_shot_autoclaim_pending = True
         self._hmb_initial_shot_preferred_uuid = ""
@@ -558,6 +578,8 @@ class HMBColorLUTLibrary(DataNode):
                 project = state["project"]
                 state["project_display_name"] = project_display_name(project.get("id"), project.get("name"))
                 manual = state["manual_project"]
+                state["upload_projects_notice"] = self._projects_notice
+                state["upload_episodes"] = list(self._episode_codes) if self._episode_key == (self._manual_projects_origin, manual.get("id")) else []
                 state["manual_project_display_name"] = project_display_name(manual.get("id"), manual.get("name"))
                 state["upload_projects"] = [
                     {**row, "display_name": project_display_name(row["id"], row["name"])}
@@ -575,7 +597,8 @@ class HMBColorLUTLibrary(DataNode):
         """Small local invalidation key; no graph/network/hash work on a UI edit."""
         result = state.get("result") if isinstance(state.get("result"), Mapping) else {}
         return _digest([_selection_key(state), _source_identity(state.get("source")),
-                        normalize_settings(state.get("settings")), _audio_mix_identity(state), result.get("path"), result.get("job_id")])
+                        normalize_settings(state.get("settings")), _audio_mix_identity(state), result.get("path"), result.get("job_id"),
+                        state.get("manual_episode") if not state["shot"].get("shot_uuid") else ""])
 
     def _receive_sound(self, value: Any, *, publish: bool = True) -> None:
         # The published digest is UI/proof invalidation only. Execution reads the
@@ -754,16 +777,17 @@ class HMBColorLUTLibrary(DataNode):
         with self._lock:
             if self._hmb_node_deleted or self._manual_projects_worker is not None and self._manual_projects_worker.is_alive():
                 return
-            if not force and time.monotonic() - self._manual_projects_checked < 30:
+            if not force and time.monotonic() - self._manual_projects_checked < (30 if self._manual_projects else 2):
                 return
             self._manual_projects_checked = time.monotonic()
         def load() -> None:
-            origin, projects = "", []
+            origin, projects, notice = "", [], "unavailable"
             try:
                 from _hmb_broker_config import load_broker_base_url
                 origin = load_broker_base_url()
                 bridge = _usage_bridge(origin)  # Existing protected login only.
                 if bridge is None:
+                    notice = "login"
                     raise ValueError("브로커 로그인이 필요합니다.")
                 cap = bridge.review_capabilities().get("color_lut_manual_upload", {})
                 if (not isinstance(cap, dict) or cap.get("schema") != COLOR_LUT_MANUAL_UPLOAD_SCHEMA
@@ -771,18 +795,84 @@ class HMBColorLUTLibrary(DataNode):
                         or not _advertised_api_path_matches(cap.get("projects_path"), COLOR_LUT_MANUAL_UPLOAD_PATH + "/projects", origin)):
                     raise ValueError("서버 업데이트 후 프로젝트를 선택할 수 있습니다.")
                 projects = self._manual_project_rows(bridge)
+                notice = "" if projects else "empty"
             except Exception:
                 LOGGER.debug("Color LUT manual projects unavailable")
             with self._lock:
                 if self._hmb_node_deleted:
                     return
                 self._manual_projects, self._manual_projects_origin = projects, origin
+                self._projects_notice = notice
                 self._hmb_color_lut_state["revision"] += 1
                 self._web_upload_probe_key = ""
             self._publish()
             self._schedule_upload_probe()
         self._manual_projects_worker = threading.Thread(target=contextvars.copy_context().run, args=(load,), name="HMB LUT projects", daemon=True)
         self._manual_projects_worker.start()
+
+    def _schedule_episodes(self) -> None:
+        with self._lock:
+            state = self._hmb_color_lut_state
+            project_id = state["manual_project"].get("id")
+            if self._hmb_node_deleted or state["shot"].get("shot_uuid") or not project_id or project_id == "my-box":
+                return
+            key = (self._manual_projects_origin, project_id)
+            if not key[0] or not any(row["id"] == project_id for row in self._manual_projects):
+                return
+            if key != self._episode_key:
+                self._episode_key, self._episode_codes, self._episodes_checked = key, [], 0.0
+            if self._episode_worker is not None or time.monotonic() - self._episodes_checked < 30:
+                return
+
+            def load() -> None:
+                codes: set[str] = set()
+                complete = False
+                try:
+                    bridge = _usage_bridge(key[0])
+                    if bridge is None:
+                        return
+                    query = "/api/v1/reviews/episodes?paged=true&project_id=" + quote(project_id, safe="")
+                    path, cursors = query, set()
+                    while path:
+                        with self._lock:
+                            if self._episode_key != key or self._hmb_node_deleted:
+                                return
+                        page = bridge._request_json("GET", path, payload=None, timeout=5)
+                        if page.get("schema") != "hmb-review-episodes-v1" or not isinstance(page.get("items"), list):
+                            return
+                        previous_count = len(codes)
+                        codes.update(code for row in page["items"] if isinstance(row, dict) and (code := _episode_code(row.get("episode"))))
+                        if len(codes) != previous_count:
+                            with self._lock:
+                                if self._episode_key != key or self._hmb_node_deleted:
+                                    return
+                                self._episode_codes = sorted(codes)
+                                self._hmb_color_lut_state["revision"] += 1
+                                self._publish()
+                        if not page.get("has_more"):
+                            complete = True
+                            break
+                        cursor = page.get("next_cursor")
+                        if not isinstance(cursor, str) or not cursor or len(cursor) > 2048 or cursor in cursors:
+                            return
+                        cursors.add(cursor)
+                        path = query + "&scan_cursor=" + quote(cursor, safe="")
+                except Exception:
+                    LOGGER.debug("Color LUT episode suggestions unavailable")
+                finally:
+                    with self._lock:
+                        self._episode_worker = None
+                        current = self._episode_key == key and not self._hmb_node_deleted
+                        if current and complete:
+                            self._episodes_checked = time.monotonic()
+                            if self._episode_codes != sorted(codes):
+                                self._episode_codes = sorted(codes)
+                                self._hmb_color_lut_state["revision"] += 1
+                                self._publish()
+                        elif not current:
+                            self._schedule_episodes()
+            self._episode_worker = threading.Thread(target=contextvars.copy_context().run, args=(load,), name="HMB LUT episodes", daemon=True)
+            self._episode_worker.start()
 
     @staticmethod
     def _manual_project_rows(bridge: Any) -> list[dict[str, str]]:
@@ -816,7 +906,8 @@ class HMBColorLUTLibrary(DataNode):
                        {"LRE", "RLE", "LRO", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI"} for c in name)):
             raise ValueError("업로드할 원본 파일명을 확인하세요. (최대 128자)")
         return {"manual": True, "flow": flow, "server_url": load_broker_base_url(),
-                "project_id": project["id"], "project_name": project["name"], "file_name": name,
+                "project_id": project["id"], "project_name": project["name"],
+                "file_name": _episode_filename(name, _episode_code(state.get("manual_episode")) if project["id"] != "my-box" else ""),
                 "source_identity": list(_source_identity(state["source"])),
                 "source_token": self._source_token, "route_epoch": self._web_upload_epoch}
 
@@ -1557,6 +1648,7 @@ class HMBColorLUTLibrary(DataNode):
                     self._hmb_color_lut_state["project_id"] = str(value.get("project_id") or "")
                     self._hmb_color_lut_state["project"] = dict(value.get("project") or {}) if isinstance(value.get("project"), Mapping) else {}
                 self._hmb_color_lut_state["manual_project"] = _upload_project(value.get("manual_project"))
+                self._hmb_color_lut_state["manual_episode"] = _episode_code(value.get("manual_episode"))
                 if initial_manual:
                     manual = self._hmb_color_lut_state["manual_project"]
                     self._hmb_color_lut_state.update(project_id=manual["id"], project=copy.deepcopy(manual))
@@ -1797,6 +1889,9 @@ class HMBColorLUTLibrary(DataNode):
             if action == "refresh_upload_projects":
                 self._schedule_manual_projects()
                 return
+            if action == "refresh_upload_episodes":
+                self._schedule_episodes()
+                return
             if action in {"export", "export_upload", "browse_video", "upload_web"} and self._worker is not None and self._worker.is_alive():
                 self._status("busy", "A local operation is already running.")
                 return
@@ -1814,6 +1909,24 @@ class HMBColorLUTLibrary(DataNode):
                 # Delayed buttons belong to their original Project/Shot.
                 # Cancellation was handled above and may still stop that job.
                 return
+            if action == "select_upload_episode":
+                project_id = captured["manual_project"].get("id")
+                if (captured["shot"].get("shot_uuid") or not project_id or project_id == "my-box"
+                        or value.get("project_id") != project_id):
+                    return
+                raw = value.get("episode")
+                episode = _episode_code(raw)
+                if raw != "" and not episode:
+                    self._status("error", "에피소드는 e001부터 e999까지 선택하세요.")
+                    return
+                self._hmb_color_lut_state["manual_episode"] = episode
+                self._hmb_color_lut_state["revision"] += 1
+                self._web_upload_epoch += 1
+                self._web_upload_context = {}
+                self._web_upload_probe_key = ""
+                self._publish()
+                self._schedule_upload_probe()
+                return
             if action == "select_upload_project":
                 if captured["shot"].get("shot_uuid"):
                     return
@@ -1826,6 +1939,9 @@ class HMBColorLUTLibrary(DataNode):
                     self._schedule_manual_projects()
                     return
                 self._remember_selection()
+                if project != captured["manual_project"]:
+                    self._hmb_color_lut_state["manual_episode"] = ""
+                    self._episode_key, self._episode_codes = None, []
                 self._hmb_color_lut_state.update(manual_project=copy.deepcopy(project), project=copy.deepcopy(project), project_id=project.get("id", ""))
                 self._hmb_color_lut_state["preset_id"] = ""
                 try:
@@ -1839,6 +1955,7 @@ class HMBColorLUTLibrary(DataNode):
                 self._remember_selection()
                 self._publish()
                 self._schedule_upload_probe()
+                self._schedule_episodes()
                 return
             if action == "delete_profile":
                 # Deletion never reapplies authored grading/media/output fields.
@@ -2265,7 +2382,7 @@ class HMBColorLUTLibrary(DataNode):
     def _export_operation_stamp(self, state: Mapping[str, Any]) -> str:
         return _digest([_selection_key(state), _source_identity(state.get("source")),
                         normalize_settings(state.get("settings")), _audio_mix_identity(state), _output(state.get("output")),
-                        state.get("manual_project")])
+                        state.get("manual_project"), state.get("manual_episode") if not state["shot"].get("shot_uuid") else ""])
 
     def _continue_export_upload(self, state: dict[str, Any], cancel: threading.Event) -> None:
         chain = state.get("_upload_chain", {})

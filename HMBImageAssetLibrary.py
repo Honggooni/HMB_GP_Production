@@ -895,9 +895,11 @@ def _discover_project_catalog(projects_root: Any) -> Dict[str, Any]:
                     continue
                 resolved = candidate.resolve()
                 resolved.relative_to(root)
-            except (FileNotFoundError, NotADirectoryError, ValueError):
+                nested = _nested_image_project_root(resolved)
+            except (OSError, ValueError):
+                # Show ACLs vary by artist. One unreadable sibling must not
+                # prevent discovery of the projects the artist can open.
                 continue
-            nested = _nested_image_project_root(resolved)
             if nested is not None:
                 nested_paths[_project_identity_key(_project_id(nested))] = nested
         project_paths.extend(nested_paths.values())
@@ -913,7 +915,7 @@ def _discover_project_catalog(projects_root: Any) -> Dict[str, Any]:
                     continue
                 resolved = candidate.resolve()
                 resolved.relative_to(root)
-            except (FileNotFoundError, NotADirectoryError, ValueError):
+            except (OSError, ValueError):
                 continue
             if _project_identity_key(_project_id(resolved)) not in nested_paths:
                 project_paths.append(resolved)

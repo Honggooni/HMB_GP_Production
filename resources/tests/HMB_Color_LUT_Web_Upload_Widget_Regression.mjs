@@ -134,12 +134,29 @@ try {
   assert.equal(await button.isEnabled(), true);
   await button.click();
   assert.equal(await page.evaluate(() => window.commands.filter(c => c.action === 'upload_web').length), 2);
+  await page.evaluate(() => {
+    window.state = { ...window.state, revision: 126, upload_episodes: ['e201', 'e203'] };
+    window.controller.update(window.props());
+  });
+  const episode = page.locator('[data-episode]');
+  assert.equal(await episode.isEnabled(), true);
+  assert.deepEqual(await page.locator('[data-episodes] option').evaluateAll(rows => rows.map(row => row.value)), ['e201','e203']);
+  const widths = await page.locator('.cl-project > label').evaluateAll(rows => rows.map(row => row.getBoundingClientRect().width));
+  assert.ok(Math.abs(widths[1] - widths[2]) < 2 && Math.abs(widths[0] - 2 * widths[1]) < 2);
+  await episode.fill('E204');
+  await episode.press('Tab');
+  assert.deepEqual(await page.evaluate(() => {
+    const {action, project_id, episode} = window.commands.findLast(c => c.action === 'select_upload_episode');
+    return {action, project_id, episode};
+  }), {action:'select_upload_episode', project_id:'katuri8', episode:'e204'});
   await page.evaluate((mybox) => { window.state = { ...mybox, revision: 130 }; window.controller.update(window.props()); }, mybox);
   assert.equal(await page.locator('[data-project]').inputValue(), 'my-box');
+  assert.equal(await episode.isDisabled(), true);
   assert.equal(await page.locator('[data-project] option').allTextContents().then(rows => rows.includes('My Box')), true);
   assert.equal(await button.isEnabled(), true);
   await page.evaluate((value) => { window.state = { ...value, revision: 150 }; window.controller.update(window.props()); }, value);
   assert.equal(await page.locator('[data-project]').isDisabled(), true, "Bound destination remains automatic");
+  assert.equal(await episode.isDisabled(), true);
   // Native select changes must repaint the action before any host echo.
   await page.evaluate(local=>{window.state={...local,output:{...local.output,codec:'hevc10'},revision:200};window.controller.update(window.props());},localFFV1);
   assert.equal(await outputButton.isDisabled(),true);

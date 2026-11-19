@@ -223,6 +223,23 @@ class ManualLUTRegression(unittest.TestCase):
         Path(self.node._hmb_color_lut_state["result"]["path"]).write_bytes(b"replaced export")
         with self.assertRaises(ValueError): self.ready("export")
 
+    def test_only_episode_updates_upload_identity_and_preserves_source(self):
+        original = Path(self.fixture.media("e201s001c001__.MOV"))
+        self.node._queue_source({"path": str(original)})
+        self.fixture.drain()
+        initial = self.ready()
+        self.node._command({"id": "episode-e203", "action": "select_upload_episode",
+                            "project_id": "superwings12", "episode": "e203",
+                            "state": copy.deepcopy(self.node._hmb_color_lut_state)})
+        self.fixture.drain()
+        selected = self.ready()
+        self.assertEqual(self.node._upload_metadata(selected)["file_name"], "e203s001c001__.MOV")
+        self.assertEqual(Path(selected["path"]), original)
+        self.assertEqual(selected["sha256"], hashlib.sha256(original.read_bytes()).hexdigest())
+        self.assertNotEqual(initial["upload_id"], selected["upload_id"])
+        self.choose("katuri8")
+        self.assertEqual(self.ready()["file_name"], original.name)
+
     def test_manual_wire_contract_uses_filename_metadata_and_exact_gateway(self):
         self.assert_manual_wire_contract("source")
 

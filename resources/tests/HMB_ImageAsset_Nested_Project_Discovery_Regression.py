@@ -82,6 +82,13 @@ with tempfile.TemporaryDirectory(prefix="hmb-direct-image-projects-") as tempora
         stack.enter_context(patch.object(module, "_ASSET_CATALOG_INDEX_ROOT", base / "catalog-cache"))
         catalog = module._load_project_catalog(projects, module._default_state(), use_shared_cache=False)
         assert [row["name"] for row in catalog["projects"]] == ["Katuri8", "superwings12"]
+        original_child_lookup = module._nested_image_project_root
+        def inaccessible_sibling(show):
+            if show.name == "Unrelated_Show":
+                raise PermissionError("artist has no access to this show")
+            return original_child_lookup(show)
+        with patch.object(module, "_nested_image_project_root", side_effect=inaccessible_sibling):
+            assert [row["name"] for row in module._discover_project_catalog(projects)["projects"]] == ["Katuri8", "superwings12"]
         selected = module._select_catalog_project(catalog, sw)
         selected["shot_routing"]["shots"] = [
             {"shot_uuid": str(uuid.uuid4()), "number": number, "name": f"e201s00{number}c001__",
