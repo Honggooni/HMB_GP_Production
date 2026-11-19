@@ -18,14 +18,15 @@ class DirectUploadRegression(fixture.ManualLUTRegression):
             self.node._queue_source({"path": str(path)})
             self.fixture.drain()
         source = self.node._hmb_color_lut_state["source"]
-        self.assertEqual(Path(source["path"]), path)
+        self.assertTrue(path.samefile(source["path"]))
         self.assertIn("ALPHA_UNSUPPORTED", source["grade_unavailable"])
         self.assertIn("preview.mp4", source["url"])
         with mock.patch.object(self.node, "_upload_request", side_effect=lambda ctx, **kw: self.ack(ctx)) as sent:
             self.ready()
             self.upload()
         ctx = sent.call_args.args[0]
-        self.assertEqual((Path(ctx["path"]),ctx["file_name"],ctx["sha256"]), (path,path.name,expected))
+        self.assertTrue(path.samefile(ctx["path"]))
+        self.assertEqual((ctx["file_name"], ctx["sha256"]), (path.name, expected))
 
     def test_authored_edit_arriving_with_original_upload_recovers_readiness_without_sending(self):
         self.ready()

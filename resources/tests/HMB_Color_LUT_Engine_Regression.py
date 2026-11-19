@@ -36,9 +36,10 @@ class ColorLUTRegression(unittest.TestCase):
             with self.assertRaises(target.UnsupportedGrade) as rejected:
                 target.probe_source(original)
             media = rejected.exception.media
-            self.assertEqual(Path(media["path"]), original)
+            self.assertTrue(original.samefile(media["path"]))
             self.assertIn("ALPHA_UNSUPPORTED", media["grade_unavailable"])
             preview = target.make_mov_preview(original, media, directory, threading.Event())
+            self.assertFalse(original.samefile(preview))
             self.assertEqual(target.probe_source(preview)["video_codec"], "h264")
             self.assertEqual(digest(original), before)
 

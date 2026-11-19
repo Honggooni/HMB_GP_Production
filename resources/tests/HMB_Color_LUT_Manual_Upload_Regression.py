@@ -234,7 +234,7 @@ class ManualLUTRegression(unittest.TestCase):
         self.fixture.drain()
         selected = self.ready()
         self.assertEqual(self.node._upload_metadata(selected)["file_name"], "e203s001c001__.MOV")
-        self.assertEqual(Path(selected["path"]), original)
+        self.assertTrue(original.samefile(selected["path"]))
         self.assertEqual(selected["sha256"], hashlib.sha256(original.read_bytes()).hexdigest())
         self.assertNotEqual(initial["upload_id"], selected["upload_id"])
         self.choose("katuri8")
