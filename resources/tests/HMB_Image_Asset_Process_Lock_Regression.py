@@ -37,6 +37,7 @@ if len(sys.argv) > 1 and sys.argv[1] == "--child":
 
 
 asset_library = load_asset_library()
+(ROOT / ".tmp").mkdir(exist_ok=True)
 test_root = Path(tempfile.mkdtemp(prefix="hmb_asset_process_lock_", dir=ROOT / ".tmp"))
 try:
     project_root = test_root / "Project"

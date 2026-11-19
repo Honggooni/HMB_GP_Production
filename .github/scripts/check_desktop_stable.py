@@ -4,8 +4,8 @@ import re
 from urllib.request import urlopen
 
 FEED = "https://downloads.griptapenodes.com/stable/releases.win-x64-stable.json"
-REVIEWED_VERSION = "0.30.3"
-REVIEWED_SHA256 = "b41d04bb7a54fe4981254b07f77d9308180428df0fabfb8465637f184d502964"
+REVIEWED_VERSION = "0.30.4"
+REVIEWED_SHA256 = "3f9ec92e46a29e78aa68d792e931874487bfc5d1c4956f8911a81a80a63093ae"
 
 
 def check(assets):

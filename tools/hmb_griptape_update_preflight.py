@@ -15,7 +15,7 @@ from tempfile import TemporaryDirectory
 
 from hmb_editor_0130_header import HEADER_SOURCE
 from hmb_rodong_editor_0130 import STOCK_SHA256, build
-from restore_rodong_local_editor import EDITOR_1302, editor_profile, entry_for_overlay, stock_entry_from_active
+from restore_rodong_local_editor import EDITOR_1302, EDITOR_1303, editor_profile, entry_for_overlay, stock_entry_from_active
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +35,18 @@ EDITOR_1302_FIXTURES = {
     "react-Cwox1F5v.js": "aae8144f8b0ba979cc255ad06f3b408c81bab69bf96667fedeeb15f81ace14af",
     "rolldown-runtime-DSDNlrLa.js": "9642411c8411b70e62cea3e38c4093f5fcd4419ec151356d87dc835062db7b69",
     "index-CAsWDvO5.css": "55da1d3d58b3e0cd274255adbe4981a82af11960de6cf441283f00dbb63aafac",
+}
+EDITOR_1303_FIXTURES = {
+    EDITOR_1303.bundle: EDITOR_1303.stock_digest,
+    "EngineContext-Dn3QR2Uz.js": "23363c57131e015d00833ea9f86f2c1995cc714f56994fb899ceacdb57899a17",
+    "react-Cwox1F5v.js": "fda3fe1ed97f70bc23018eac1c326c8a9f77ebaba073d2202928751b92d76d16",
+    "rolldown-runtime-DSDNlrLa.js": "9642411c8411b70e62cea3e38c4093f5fcd4419ec151356d87dc835062db7b69",
+    "index-B032WlhJ.css": "bd05e77301d87bf2bc9c688bbc0f94a8db46675b4c94e275c06fe4faf9752444",
+}
+REVIEWED_HOSTS = {
+    ("0.104.0", "0.130.0"): ("0.108.0", EDITOR_0130_FIXTURES),
+    ("0.104.2", "0.130.2"): ("0.108.1", EDITOR_1302_FIXTURES),
+    ("0.104.3", "0.130.3"): ("0.108.1", EDITOR_1303_FIXTURES),
 }
 HEADER_CHECK = "HMB_Editor_0130_Integrated_Header_Regression.mjs"
 DELETION_CHECK = "HMB_Native_Stock_Deletion_Safety_Browser_Regression.mjs"
@@ -155,15 +167,15 @@ def inspect_candidate(candidate: Path, *, header_source: Path = HEADER_SOURCE) -
     site = candidate / PYTHON_ROOT / "Lib/site-packages"
     sdk = version(site, "griptape_nodes")
     editor_version = version(site, "griptape_nodes_editor_dist")
-    expected_engine = {("0.104.0", "0.130.0"): "0.108.0", ("0.104.2", "0.130.2"): "0.108.1"}.get((sdk, editor_version))
-    if expected_engine is None:
+    if (sdk, editor_version) not in REVIEWED_HOSTS:
         raise ValueError(f"Unreviewed SDK/Editor pair: {sdk}/{editor_version}")
+    expected_engine, fixtures = REVIEWED_HOSTS[sdk, editor_version]
     engine = version(site, "griptape_nodes_engine")
     if engine != expected_engine:
         raise ValueError(f"Unreviewed Griptape Nodes engine: {engine}; expected {expected_engine}")
     editor = site / "griptape_nodes_editor_dist/editor"
     entry = editor / "index-editor.html"
-    fixture_sha = inspect_editor_fixtures(editor / "assets", EDITOR_1302_FIXTURES if editor_version == "0.130.2" else None)
+    fixture_sha = inspect_editor_fixtures(editor / "assets", fixtures)
     stock = editor / "assets" / editor_profile((editor / "index-editor.html").read_bytes()).bundle
     patched_sha = sha256(build(stock.read_bytes(), header_source=header_source)).hexdigest()
     patched = stock.with_name(f"index-hmb-rodong-{patched_sha[:16]}.js")

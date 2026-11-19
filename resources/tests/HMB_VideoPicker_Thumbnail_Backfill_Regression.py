@@ -146,6 +146,7 @@ try:
         lambda path: f"http://127.0.0.1:9888/external/{Path(path).name}"
     )
 
+    (ROOT / ".tmp").mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(
         prefix="hmb-video-thumbnail-",
         dir=ROOT / ".tmp",

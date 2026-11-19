@@ -505,6 +505,16 @@ class HMBImageGeneration(SuccessFailureNode):
                     self._restoring_saved_port = False
         return None
 
+    def get_element_by_name_and_type(self, elem_name: str, element_type=None):
+        element = super().get_element_by_name_and_type(elem_name, element_type)
+        if element is None and isinstance(elem_name, str) and elem_name.startswith("model_option__"):
+            # Desktop replays saved UI details before setting values or edges.
+            # Resolve the same exact model descriptor for both SDK lookup paths.
+            port = self.get_parameter_by_name(elem_name)
+            if element_type is None or isinstance(port, element_type):
+                return port
+        return element
+
     def _ensure_option_parameter(self, model_key: str, spec: Any) -> str:
         name = self._option_parameter_name(model_key, spec)
         cls = {"boolean": ParameterBool, "number": ParameterFloat, "integer": ParameterInt,

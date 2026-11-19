@@ -8,10 +8,10 @@ from pathlib import Path
 
 if __package__:
     from .hmb_editor_0130_header import HEADER_SOURCE, integrate_header
-    from .restore_rodong_local_editor import EDITOR_1302, editor_profile, entry_for_overlay, stock_entry_from_active
+    from .restore_rodong_local_editor import EDITOR_1302, EDITOR_1303, editor_profile, entry_for_overlay, stock_entry_from_active
 else:
     from hmb_editor_0130_header import HEADER_SOURCE, integrate_header
-    from restore_rodong_local_editor import EDITOR_1302, editor_profile, entry_for_overlay, stock_entry_from_active
+    from restore_rodong_local_editor import EDITOR_1302, EDITOR_1303, editor_profile, entry_for_overlay, stock_entry_from_active
 EDITOR = Path(__file__).resolve().parents[1] / "resources/editor"
 STOCK_SHA256 = "841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e"
 
@@ -51,7 +51,7 @@ def continue_artwork() -> str:
     return source
 
 
-# The vendor compiler renamed these bindings between the two reviewed bundles.
+# The vendor compiler renamed these bindings between the reviewed bundles.
 # Adapt only our insertion points and references, never the vendor source itself.
 EDITOR_1302_BINDINGS = {
     "hFn":"CFn", "fO":"NE", "T1":"kQ", "ajn":"pjn", "R$t":"SX",
@@ -60,18 +60,43 @@ EDITOR_1302_BINDINGS = {
     "xIe":"yLe", "$D":"pE", "Cm":"Pm",
 }
 EDITOR_1302_STOCK = EDITOR_1302.stock_digest
+EDITOR_1303_BINDINGS = {
+    "hFn":"EFn", "fO":"rD", "T1":"kQ", "ajn":"gjn", "R$t":"SX",
+    "THt":"NWt", "VMn":"QMn", "gFn":"DFn", "ijn":"hjn", "QWt":"$Kt",
+    "bIe":"NIe", "fIe":"TIe", "UT":"Dw", "mIe":"DIe", "tO":"BE",
+    "xIe":"PIe", "$D":"RE", "Cm":"Tm", "yn":"Kn",
+}
 
 
-def editor_1302_fragment(fragment):
-    fragment = fragment.replace("[_,G,te,u,", "[_,G,ne,u,").replace("he.map(e=>_e(e)),te?", "he.map(e=>_e(e)),ne?")
-    pattern = r"(?<![\w$])(" + "|".join(map(re.escape, EDITOR_1302_BINDINGS)) + r")(?![\w$])"
-    return re.sub(pattern, lambda match: EDITOR_1302_BINDINGS[match.group()], fragment)
+def editor_patch_fragment(fragment, bindings):
+    if bindings is EDITOR_1303_BINDINGS:
+        for old, new in (
+            ("z.warning(", "Rn.warning("), ("z.error(", "Rn.error("), ("z.success(", "Rn.success("),
+            ("_e=(0,Y.useCallback)(async", "ge=(0,Y.useCallback)(async"),
+            ("hmbMart.enter(_e)", "hmbMart.enter(ge)"),
+            ("[C.nodeHeaderItems,W", "[C.nodeHeaderItems,ee"),
+            ("]),ge=", "]),he="),
+            ("style:U,type:", "style:H,type:"),
+            ("[_,G,te,u,c,l,d,f,p,m,h,H,U,ee,pe,ue,de,fe,me,ge",
+             "[_,W,K,u,c,l,d,f,p,m,h,V,H,U,fe,le,ue,de,pe,he"),
+            ("ye=mIe(t,!!ve.backgroundColor,N)", "ve=mIe(t,!!_e.backgroundColor,N)"),
+            ("onDoubleClick:ce,", "onDoubleClick:se,"),
+            ("style:tO(t)?ve:R", "style:tO(t)?_e:R"),
+            ("he.map(e=>_e(e)),te?", "me.map(e=>ge(e)),K?"),
+        ):
+            fragment = fragment.replace(old, new)
+    else:
+        fragment = fragment.replace("[_,G,te,u,", "[_,G,ne,u,").replace("he.map(e=>_e(e)),te?", "he.map(e=>_e(e)),ne?")
+    pattern = r"(?<![\w$])(" + "|".join(map(re.escape, bindings)) + r")(?![\w$])"
+    return re.sub(pattern, lambda match: bindings[match.group()], fragment)
 
 
 def build(stock: bytes, *, header_source: Path = HEADER_SOURCE) -> bytes:
     digest = sha256(stock).hexdigest()
-    if digest not in (STOCK_SHA256, EDITOR_1302_STOCK):
+    if digest not in (STOCK_SHA256, EDITOR_1302_STOCK, EDITOR_1303.stock_digest):
         raise ValueError("Unsupported stock Editor 0.130 bundle")
+    bindings = {EDITOR_1302_STOCK: EDITOR_1302_BINDINGS,
+                EDITOR_1303.stock_digest: EDITOR_1303_BINDINGS}.get(digest, {})
     source = stock.decode("utf-8")
     basket = (EDITOR / "hmb-shot-basket.js").read_text(encoding="utf-8")
     basket = replace_once(basket, 'close.textContent = "로동 작업 계속";',
@@ -94,15 +119,15 @@ def build(stock: bytes, *, header_source: Path = HEADER_SOURCE) -> bytes:
         basket = replace_once(basket, placeholder, "data:image/webp;base64," + base64.b64encode(artwork).decode("ascii"))
     adapter = (EDITOR / "hmb-rodong-editor-0130.js").read_text(encoding="utf-8")
     def patch(content, old, new):
-        if digest == EDITOR_1302_STOCK:
-            old, new = editor_1302_fragment(old), editor_1302_fragment(new)
+        if bindings:
+            old, new = editor_patch_fragment(old, bindings), editor_patch_fragment(new, bindings)
         return replace_once(content, old, new)
 
-    entry = "CFn" if digest == EDITOR_1302_STOCK else "hFn"
+    entry = bindings.get("hFn", "hFn")
     opening = f"function {entry}(){{"
     components = "\n".join((adapter, connection_ui(), header_source.read_text(encoding="utf-8")))
-    if digest == EDITOR_1302_STOCK:
-        components = editor_1302_fragment(components)
+    if bindings:
+        components = editor_patch_fragment(components, bindings)
     source = replace_once(source, opening, f"{continue_artwork()}\n{basket}\n{components}\n{opening}")
     source = patch(
         source, "(S=e=>{let t=c.current,a=t?e.map",
@@ -194,7 +219,7 @@ if __name__ == "__main__":
     editor = args.editor_dir
     if editor is None:
         package = distribution("griptape-nodes-editor-dist")
-        if package.version not in ("0.130.0", "0.130.2"):
+        if package.version not in ("0.130.0", "0.130.2", "0.130.3"):
             parser.exit(1, f"Editor {package.version} needs a compatibility check before local rollout.\n")
         editor = package.locate_file("griptape_nodes_editor_dist/editor")
     try:

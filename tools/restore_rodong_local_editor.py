@@ -44,8 +44,15 @@ EDITOR_1302 = EditorProfile("index-DW0x78hS.js",
     "ba1b96f56bc3c4651733677cc469c152d98d3cf47b8dd85f8693f4fe897c7b39")
 
 
+EDITOR_1303 = EditorProfile("index-Dq4UDcw5.js",
+    "b0c4f9d4c8d78243b5f1d505187d1c5e49119854912a2e516be03170590fc4fc",
+    "c6e7a5b5b5604ae3fd0330c90570ab4e203884e67d187712bc360538065ef582",
+    "38cbcd43a1959b4ff0642f346f9f0dba5108b84db807c37e241170de09491152")
+
+
 def editor_profile(entry: bytes) -> EditorProfile:
-    return EDITOR_1302 if EDITOR_1302.ref in entry else EDITOR_1300
+    return next((profile for profile in (EDITOR_1303, EDITOR_1302)
+                 if profile.ref in entry), EDITOR_1300)
 
 
 def entry_for_overlay(stock_entry: bytes, overlay_name: str) -> bytes:
@@ -144,7 +151,9 @@ def main() -> int:
     args = parser.parse_args()
     try:
         editor_package = distribution("griptape-nodes-editor-dist")
-        if (version("griptape-nodes"), editor_package.version) not in (("0.104.0", "0.130.0"), ("0.104.2", "0.130.2")):
+        if (version("griptape-nodes"), editor_package.version) not in (
+            ("0.104.0", "0.130.0"), ("0.104.2", "0.130.2"), ("0.104.3", "0.130.3")
+        ):
             raise ValueError("SDK and Editor versions need isolated preflight")
         bundled_editor = Path(editor_package.locate_file("griptape_nodes_editor_dist/editor")).resolve()
         if args.editor.resolve() != bundled_editor:

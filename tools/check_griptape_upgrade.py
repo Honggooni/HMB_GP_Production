@@ -62,8 +62,34 @@ def main() -> int:
         editor = importlib.metadata.distribution("griptape-nodes-editor-dist")
     except importlib.metadata.PackageNotFoundError:
         editor = None
-    if editor is not None and editor.version == "0.130.0":
-        source = editor.locate_file("griptape_nodes_editor_dist/editor/assets/index-B4peacnU.js")
+    source = None
+    if editor is not None:
+        from hmb_griptape_update_preflight import REVIEWED_HOSTS, inspect_editor_fixtures
+        from hmb_rodong_editor_0130 import verify_installed
+        from restore_rodong_local_editor import editor_profile
+
+        directory = Path(editor.locate_file("griptape_nodes_editor_dist/editor"))
+        entry = directory / "index-editor.html"
+        host = REVIEWED_HOSTS.get((sdk, editor.version))
+        if host is not None:
+            editor_reviewed = False
+            try:
+                data = entry.read_bytes()
+                profile = editor_profile(data)
+                fixtures = host[1]
+                inspect_editor_fixtures(directory / "assets", fixtures)
+                if fixtures.get(profile.bundle) != profile.stock_digest:
+                    raise ValueError("Editor entry and package identify different builds")
+                if sha256(data).hexdigest() != profile.entry_digest:
+                    verify_installed(directory)
+                source = directory / "assets" / profile.bundle
+                editor_reviewed = True
+            except (OSError, ValueError):
+                pass
+        elif entry.is_file():
+            editor_reviewed = False
+
+    if source is not None:
         test = ROOT / "resources/tests/HMB_Native_Stock_Deletion_Safety_Browser_Regression.mjs"
         evidence = report_dir / "stock-editor-deletion.json"
         try:

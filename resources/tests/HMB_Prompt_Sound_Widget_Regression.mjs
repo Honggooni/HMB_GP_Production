@@ -20,10 +20,10 @@ const state = api.normalizeState({ multi_shot_enabled: true, shot: shots[0],
   text: { EMOTION_INTENT: "Keep performance 0 OFF", VIDEO_VFX: "Keep VFX {literal}" },
   sound_sources: [row("track-1", "Original 1"), row("track-2", "Original duplicate")],
   speaker_sources: [
-    {kind: "image", source_id: "sheet-hero", label: "Hero sheet"},
+    {kind: "image", source_id: "sheet-hero", label: "@image1 · Hero sheet"},
     {kind: "image", source_id: "sheet-friend", label: "Friend sheet"},
     {kind: "video", source_id: "shot-mask", label: "Picker mask", is_mask: true, colors: ["Red", "Blue"]},
-    {kind: "video", source_id: "shot-playblast", label: "Playblast", is_mask: false, colors: ["Green"]},
+    {kind: "video", source_id: "shot-playblast", label: "@video2 · Playblast", is_mask: false, colors: ["Green"]},
   ],
   sound_connection: { enabled: true, project_id: "Show", revision: 1 },
   image_asset: { project_id: "Show", shot_catalog: shots, shot_catalog_routing: {
@@ -79,6 +79,7 @@ try {
   assert.deepEqual(await speakerGroups("track-1"), ["캐릭터 시트", "일반 영상", "마스크 영상"]);
   assert.deepEqual(await speakerValues("track-1", "source"), ["", "image:sheet-hero", "image:sheet-friend", "video:shot-playblast", "video:shot-mask"]);
   await speaker("track-1", "source").selectOption("image:sheet-hero");
+  assert.equal(await speaker("track-1", "source").locator("option:checked").textContent(), "Hero sheet");
   await page.waitForFunction(() => window.latest.sound_overlays?.["track-1"]?.speaker_binding?.source_id === "sheet-hero");
   assert.equal(await speaker("track-1", "color").count(), 0);
   await speaker("track-1", "source").selectOption("video:shot-mask");
@@ -87,6 +88,7 @@ try {
   await speaker("track-1", "color").selectOption("Red");
   await page.waitForFunction(() => window.latest.sound_overlays?.["track-1"]?.speaker_binding?.color === "Red");
   await speaker("track-2", "source").selectOption("video:shot-playblast");
+  assert.equal(await speaker("track-2", "source").locator("option:checked").textContent(), "Playblast");
   await page.waitForFunction(() => window.latest.sound_overlays?.["track-2"]?.speaker_binding?.source_id === "shot-playblast");
   assert.equal(await speaker("track-2", "color").count(), 0);
   await speaker("track-2", "source").selectOption("");

@@ -201,20 +201,27 @@ jobs:
           python -c "import pathlib,sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); pathlib.Path(sys.argv[2]).write_bytes(z.read('griptape_nodes_editor_dist/editor/assets/index-B4peacnU.js'))" $wheel $env:HMB_STOCK_EDITOR_0130_SOURCE
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node resources/tests/HMB_Native_Stock_Deletion_Safety_Browser_Regression.mjs --evidence-path "${{ runner.temp }}/hmb-coverage/stock-editor/stock-editor-0130.json"
-      - name: Check the Desktop 0.30.3 Editor overlay and integrated headers
+      - name: Check the reviewed Desktop 0.30.3 and 0.30.4 Editor overlays and integrated headers
         shell: pwsh
         run: |
-          $wheel = Join-Path $env:RUNNER_TEMP 'editor-01302.whl'
-          Invoke-WebRequest -Uri 'https://files.pythonhosted.org/packages/41/9f/45869a2dfd7bc9d7155b148c37590f5790932ea7cb04b5692d814854b5f9/griptape_nodes_editor_dist-0.130.2-py3-none-any.whl' -OutFile $wheel
-          if ((Get-FileHash $wheel -Algorithm SHA256).Hash -ine 'e54afb87d9c294ff7ca5d6a2f6b1297ffda7ca08fb3270252d93afd90a703233') { throw 'Editor 0.130.2 wheel hash mismatch' }
-          $fixtures = Join-Path $env:RUNNER_TEMP 'editor-01302'
-          $env:HMB_STOCK_EDITOR_0130_SOURCE = Join-Path $fixtures 'index-DW0x78hS.js'
-          $env:HMB_HEADER_0130_CANDIDATE = Join-Path $fixtures 'overlay.js'
-          python -c "import pathlib,sys,zipfile; sys.path.insert(0,'tools'); from hmb_griptape_update_preflight import EDITOR_1302_FIXTURES,build,EDITOR_1302; z=zipfile.ZipFile(sys.argv[1]); d=pathlib.Path(sys.argv[2]); d.mkdir(); [d.joinpath(n).write_bytes(z.read('griptape_nodes_editor_dist/editor/assets/'+n)) for n in EDITOR_1302_FIXTURES]; d.joinpath('overlay.js').write_bytes(build(d.joinpath(EDITOR_1302.bundle).read_bytes()))" $wheel $fixtures
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          node resources/tests/HMB_Editor_0130_Integrated_Header_Regression.mjs
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          node resources/tests/HMB_Native_Stock_Deletion_Safety_Browser_Regression.mjs --evidence-path "${{ runner.temp }}/hmb-coverage/stock-editor/stock-editor-01302.json"
+          $editors = @(
+            @{ version='0.130.2'; wheel='https://files.pythonhosted.org/packages/41/9f/45869a2dfd7bc9d7155b148c37590f5790932ea7cb04b5692d814854b5f9/griptape_nodes_editor_dist-0.130.2-py3-none-any.whl'; sha='e54afb87d9c294ff7ca5d6a2f6b1297ffda7ca08fb3270252d93afd90a703233'; bundle='index-DW0x78hS.js' }
+            @{ version='0.130.3'; wheel='https://files.pythonhosted.org/packages/a1/e9/39d33e2f066239cfb9233c93c5db081786d4a82a43dbec5c7c680b43897f/griptape_nodes_editor_dist-0.130.3-py3-none-any.whl'; sha='9cd7f089f42a174b8650de6e2262a5ac1f42e9e33d39d7dd694bcb5ffecc546d'; bundle='index-Dq4UDcw5.js' }
+          )
+          foreach ($editor in $editors) {
+            $fixtures = Join-Path $env:RUNNER_TEMP "editor-$($editor.version)"
+            $wheel = "$fixtures.whl"
+            Invoke-WebRequest -Uri $editor.wheel -OutFile $wheel -MaximumRetryCount 2 -RetryIntervalSec 3
+            if ((Get-FileHash $wheel -Algorithm SHA256).Hash -ine $editor.sha) { throw "Editor $($editor.version) wheel hash mismatch" }
+            $env:HMB_STOCK_EDITOR_0130_SOURCE = Join-Path $fixtures $editor.bundle
+            $env:HMB_HEADER_0130_CANDIDATE = Join-Path $fixtures 'overlay.js'
+            python -c "import pathlib,sys,zipfile; sys.path.insert(0,'tools'); from hmb_griptape_update_preflight import EDITOR_1302_FIXTURES,EDITOR_1303_FIXTURES,build,inspect_editor_fixtures; z=zipfile.ZipFile(sys.argv[1]); d=pathlib.Path(sys.argv[2]); d.mkdir(); files={'0.130.2':EDITOR_1302_FIXTURES,'0.130.3':EDITOR_1303_FIXTURES}[sys.argv[3]]; [d.joinpath(n).write_bytes(z.read('griptape_nodes_editor_dist/editor/assets/'+n)) for n in files]; inspect_editor_fixtures(d,files); d.joinpath('overlay.js').write_bytes(build(d.joinpath(sys.argv[4]).read_bytes()))" $wheel $fixtures $editor.version $editor.bundle
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            node resources/tests/HMB_Editor_0130_Integrated_Header_Regression.mjs
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            node resources/tests/HMB_Native_Stock_Deletion_Safety_Browser_Regression.mjs --evidence-path "${{ runner.temp }}/hmb-coverage/stock-editor/stock-editor-$($editor.version).json"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       - name: JavaScript widget regressions with required browser coverage
         shell: pwsh
         run: python tools/audit_regression_coverage.py --run javascript --report "${{ runner.temp }}/hmb-coverage/javascript.json"
@@ -343,7 +350,9 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
-            "- Supports Desktop 0.30.3 and Editor 0.130.2. Restores the Rodong Mart startup screen, reloads saved Image Generation options and keeps CGT Shot selection through local edit conflicts and task-status changes.",
+            "- Restores saved Image Generation model option controls and their values when switching models and reopening an existing workflow.",
+            "- Displays asset names in the HMBPrompt sound target picker while preserving saved source identities and shot bindings.",
+            "- Supports Desktop 0.30.3 and 0.30.4 with Editor 0.130.2 and 0.130.3. Restores the Rodong Mart startup screen, reloads saved Image Generation options and keeps CGT Shot selection through local edit conflicts and task-status changes.",
             "- Checks the official Windows stable package identity daily and before Team distribution. A new or republished build requires compatibility verification.",
             "- Continue editing another Shot while generators are busy. Maya Mask and Depth output publishes on the editor event loop, pending media checks wait before Agent execution, and sound validation follows the bound Shot.",
             "- In HMBPrompt, enable the sound range bar and drag empty space to cut multiple cues from one sound. Click a cue for source trim and shot placement. Korean sound usage labels, speaker reference and the full-width dialogue field are included.",

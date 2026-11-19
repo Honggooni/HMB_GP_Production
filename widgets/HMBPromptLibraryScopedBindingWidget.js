@@ -6620,7 +6620,8 @@ export function hmbRenderPromptSoundSources(state) {
     const speakerOptions = speakerGroups.map(([label, candidates]) => {
       const options = candidates.map(candidate => {
         const key = hmbSoundSpeakerSourceKey(candidate);
-        return `<option value="${escapeHtml(key)}"${key === speakerKey ? " selected" : ""}>${escapeHtml(candidate.label || label)}</option>`;
+        const displayName = candidate.label.replace(/^@(?:image|video)\d+\s*·\s*/i, "");
+        return `<option value="${escapeHtml(key)}"${key === speakerKey ? " selected" : ""}>${escapeHtml(displayName || label)}</option>`;
       }).join("");
       return `<optgroup label="${label}">${options || `<option disabled>${korean ? "선택 가능한 소스 없음" : "No available sources"}</option>`}</optgroup>`;
     }).join("");

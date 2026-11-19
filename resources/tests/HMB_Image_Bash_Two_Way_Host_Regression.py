@@ -133,7 +133,12 @@ async def exercise(engine):
         detached_reopen = await engine.ahandle_request(DeserializeFlowFromCommandsRequest(
             serialized_flow_commands=deepcopy(detached_commands.serialized_flow_commands), broadcast_result=False))
         assert detached_reopen.succeeded(), detached_reopen.result_details
-        reopened_nodes = engine.flow_manager.get_flow_by_name(detached_reopen.flow_name).nodes
+        # Deserializing a flow no longer makes it the active editor context.
+        restored_flow = engine.flow_manager.get_flow_by_name(detached_reopen.flow_name)
+        if not engine.context_manager.has_current_flow():
+            engine.context_manager.push_flow(restored_flow)
+        assert engine.context_manager.get_current_flow() is restored_flow
+        reopened_nodes = restored_flow.nodes
         first, fresh = reopened_nodes[first.name], reopened_nodes[fresh.name]
         retained = engine.handle_request(RemoveParameterFromNodeRequest(node_name=first.name, parameter_name=child))
         assert not retained.succeeded() and "[HMB_CONNECTION_PORT_RETAINED]" in str(retained.result_details)
