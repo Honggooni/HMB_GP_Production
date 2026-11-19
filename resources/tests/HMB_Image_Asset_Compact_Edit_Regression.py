@@ -114,7 +114,7 @@ for key, changed in [('project_uid', 'different-project'), ('ui_edit_revision', 
 # that selects a project. Rebase only that fresh path, never the client's old
 # catalog, Shot routing, identities or commands.
 prior = image._normalize_state(state)
-root = '//192.168.200.19/v/projects'
+root = 'P:/projects'
 target = root + '/Dinoster5/Ai_Ct_image'
 prior.update(catalog_root=root, project_root='', project_id='', project_uid='', project_cache_uid='',
              projects=[dict(path=target, project_id='Dinoster5', project_uid='server-project', name='Dinoster5')],

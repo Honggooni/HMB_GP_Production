@@ -187,7 +187,8 @@ ASSET_MANIFEST_SCHEMA = "hmb-image-assets"
 ASSET_MANIFEST_VERSION = 1
 ASSET_MANIFEST_LOCK_NAME = ".hmb_image_assets.lock"
 ASSET_MANIFEST_LOCK_TIMEOUT_SECONDS = 10.0
-PRODUCTION_PROJECTS_ROOT = "//192.168.200.19/v/projects"
+PRODUCTION_PROJECTS_ROOT = "P:/projects"
+_PREVIOUS_PROJECTS_ROOT = "//192.168.200.19/v/projects"
 _RETIRED_PROJECTS_ROOT = "//fin-rcomp1/Composite_Team/projects_AI"
 
 
@@ -205,6 +206,12 @@ def _relocate_image_project_path(value: Any) -> str:
         return "/".join((PRODUCTION_PROJECTS_ROOT, parts[0], "Ai_Ct_image", *parts[1:]))
     if "://" in path or any(part in (".", "..") for part in path.split("/")):
         return text
+    for alias in (_PREVIOUS_PROJECTS_ROOT, PRODUCTION_PROJECTS_ROOT):
+        if path.casefold() == alias.casefold() or path.casefold().startswith(alias.casefold() + "/"):
+            path = PRODUCTION_PROJECTS_ROOT + path[len(alias):]
+            break
+    else:
+        return text
     flat = re.fullmatch(r"(.*?/projects)/ai_ct_image(?:/([^/]+)(/.*)?)?/?", path, re.IGNORECASE)
     if flat:
         base, show, suffix = flat.groups()
@@ -212,7 +219,22 @@ def _relocate_image_project_path(value: Any) -> str:
     nested = re.fullmatch(r"(.*?/projects/([^/]+)/ai_ct_image)/([^/]+)(/.*)?", path, re.IGNORECASE)
     if nested and nested[2].casefold() == nested[3].casefold():
         return nested[1] + (nested[4] or "")
-    return text
+    return path
+
+
+def _resolve_image_path(path: Path, *, strict: bool = False) -> Path:
+    """Resolve links, but address a mapped project through its requested drive."""
+    resolved = path.resolve(strict=strict)
+    if os.name == "nt" and path.is_relative_to(Path("P:/projects")):
+        drive = Path(path.anchor)
+        try:
+            relative = resolved.relative_to(drive.resolve(strict=True))
+        except ValueError:
+            # A link left this drive. Keep its real destination for the caller's
+            # containment check; never give it a fabricated in-project address.
+            return resolved
+        return drive / relative
+    return resolved
 
 
 DEFAULT_PROJECTS_ROOT = Path(
@@ -839,16 +861,18 @@ def _image_project_child(root: Path, name: str) -> Path | None:
     candidate = root / name
     try:
         if candidate.is_dir() and not _is_reparse_point(candidate):
-            candidate.resolve().relative_to(root.resolve())
-            return candidate.resolve()
+            resolved = _resolve_image_path(candidate)
+            resolved.relative_to(_resolve_image_path(root))
+            return resolved
         # Windows shares are case insensitive. Keep that contract in portable
         # tests and on case-sensitive project mounts as well.
         for child in root.iterdir():
             if child.name.casefold() != name.casefold():
                 continue
             if child.is_dir() and not _is_reparse_point(child):
-                child.resolve().relative_to(root.resolve())
-                return child.resolve()
+                resolved = _resolve_image_path(child)
+                resolved.relative_to(_resolve_image_path(root))
+                return resolved
     except (FileNotFoundError, NotADirectoryError, ValueError):
         return None
     return None
@@ -863,7 +887,7 @@ def _discover_project_catalog(projects_root: Any) -> Dict[str, Any]:
     root_text = _project_root_text(projects_root) or str(DEFAULT_PROJECTS_ROOT)
     root = Path(root_text).expanduser()
     try:
-        root = root.resolve()
+        root = _resolve_image_path(root)
     except Exception:
         root = Path(root_text)
     if not root.is_dir():
@@ -893,7 +917,7 @@ def _discover_project_catalog(projects_root: Any) -> Dict[str, Any]:
             try:
                 if not candidate.is_dir() or _is_reparse_point(candidate):
                     continue
-                resolved = candidate.resolve()
+                resolved = _resolve_image_path(candidate)
                 resolved.relative_to(root)
                 nested = _nested_image_project_root(resolved)
             except (OSError, ValueError):
@@ -913,7 +937,7 @@ def _discover_project_catalog(projects_root: Any) -> Dict[str, Any]:
                 if (not candidate.is_dir() or candidate.name.startswith(".")
                         or _is_reparse_point(candidate)):
                     continue
-                resolved = candidate.resolve()
+                resolved = _resolve_image_path(candidate)
                 resolved.relative_to(root)
             except (OSError, ValueError):
                 continue
@@ -1057,7 +1081,7 @@ def _asset_file_facts(
             raise ValueError("Catalog image is outside the verified inventory.")
         resolved = path
     else:
-        resolved = path.resolve()
+        resolved = _resolve_image_path(path)
     details = resolved.stat()
     if not resolved.is_file() or _is_reparse_point(resolved):
         raise ValueError("Image asset is not a regular file.")
@@ -1697,7 +1721,7 @@ def _import_payload_size(
         text = _clean(reference)
         if text and not text.startswith(("http://", "https://", "blob:", "data:")):
             try:
-                candidate = Path(_decode_file_uri(text)).expanduser().resolve()
+                candidate = _resolve_image_path(Path(_decode_file_uri(text)).expanduser())
                 if candidate.is_file():
                     return max(0, int(candidate.stat().st_size))
             except Exception:
@@ -1855,7 +1879,7 @@ def _import_record(
         path_text = _decode_file_uri(reference)
         path = Path(path_text).expanduser()
         try:
-            resolved = path.resolve()
+            resolved = _resolve_image_path(path)
         except Exception:
             resolved = path
         # File identity must not depend on a transient SMB/mapped-drive outage.
@@ -2074,7 +2098,7 @@ def _valid_project_cache_uid(value: Any) -> str:
 
 def _invalidate_project_cache_uid(root: Path) -> None:
     try:
-        root_key = os.path.normcase(str(root.resolve()))
+        root_key = _asset_manifest_cache_root_key(root)
     except Exception:
         return
     with _ASSET_PROJECT_CACHE_UID_LOCK:
@@ -2091,8 +2115,8 @@ def _project_cache_uid(root: Path) -> str:
     file identity, which is still safe for independent same-named projects.
     """
 
-    resolved = root.resolve()
-    root_key = os.path.normcase(str(resolved))
+    resolved = _resolve_image_path(root)
+    root_key = _asset_manifest_cache_root_key(root)
     try:
         manifest_signature = _asset_manifest_signature(resolved)
     except Exception:
@@ -2240,8 +2264,8 @@ def _verified_project_relative_path(
     root = Path(project_root)
     path = Path(_clean(asset.get("path")))
     try:
-        resolved_root = root.resolve()
-        resolved_path = path.resolve()
+        resolved_root = _resolve_image_path(root)
+        resolved_path = _resolve_image_path(path)
         relative = resolved_path.relative_to(resolved_root)
     except Exception:
         return ""
@@ -2295,7 +2319,7 @@ def _verified_project_relative_path(
 
 def _asset_metadata_directory(root: Path, *, create: bool = False) -> Path:
     """Return the hidden project-management directory without following redirects."""
-    resolved_root = root.resolve()
+    resolved_root = _resolve_image_path(root)
     metadata_root = resolved_root / ASSET_METADATA_DIRECTORY_NAME
     if create:
         metadata_root.mkdir(exist_ok=True)
@@ -2305,7 +2329,7 @@ def _asset_metadata_directory(root: Path, *, create: bool = False) -> Path:
                 f"{ASSET_METADATA_DIRECTORY_NAME} must be a regular project directory."
             )
         try:
-            metadata_root.resolve().relative_to(resolved_root)
+            _resolve_image_path(metadata_root).relative_to(resolved_root)
         except Exception as exc:
             raise ValueError(
                 f"{ASSET_METADATA_DIRECTORY_NAME} resolves outside the project."
@@ -2318,7 +2342,7 @@ def _existing_asset_manifest_path(root: Path) -> Path | None:
     metadata_root = _asset_metadata_directory(root)
     candidates = [
         *(metadata_root / name for name in MANIFEST_NAMES),
-        *(root.resolve() / name for name in MANIFEST_NAMES),
+        *(_resolve_image_path(root) / name for name in MANIFEST_NAMES),
     ]
     return next((candidate for candidate in candidates if candidate.is_file()), None)
 
@@ -2359,7 +2383,7 @@ def _asset_manifest_path(root: Path) -> Path:
 
 def _cleanup_legacy_asset_metadata(root: Path) -> None:
     """Best-effort cleanup after the canonical .json manifest is durable."""
-    resolved_root = root.resolve()
+    resolved_root = _resolve_image_path(root)
     metadata_root = _asset_metadata_directory(resolved_root)
     obsolete_paths = [
         *(resolved_root / name for name in MANIFEST_NAMES),
@@ -2382,7 +2406,7 @@ def _cleanup_legacy_asset_metadata(root: Path) -> None:
 
 def _asset_manifest_lock(root: Path) -> threading.Lock:
     try:
-        key = str(root.resolve()).casefold()
+        key = _asset_manifest_cache_root_key(root)
     except Exception:
         key = str(root).casefold()
     with _ASSET_MANIFEST_LOCK_GUARD:
@@ -2448,7 +2472,7 @@ def _asset_manifest_process_lock(root: Path):
 
 def _asset_manifest_signature(root: Path) -> str:
     """Return a low-cost signature that changes after an atomic manifest edit."""
-    root = root.resolve()
+    root = _resolve_image_path(root)
     root_stat = root.stat()
     if not root.is_dir():
         raise ValueError(f"Project root is not a directory: {root}")
@@ -2584,7 +2608,7 @@ def _project_folder_metadata_signature(project_root: Any) -> str:
     root_text = _project_root_text(project_root)
     if not root_text:
         return ""
-    root = Path(root_text).expanduser().resolve()
+    root = _resolve_image_path(Path(root_text).expanduser())
     if not root.is_dir() or _is_reparse_point(root):
         raise ValueError(f"Project root is unavailable: {root}")
     folders, images, metadata = _catalog_file_inventory(root)
@@ -2592,6 +2616,8 @@ def _project_folder_metadata_signature(project_root: Any) -> str:
 
 
 def _asset_manifest_cache_root_key(root: Path) -> str:
+    # Keep memoization and invalidation tied to physical storage if P: is remapped.
+    # This key is never used to open a file.
     return os.path.normcase(str(root.resolve()))
 
 
@@ -2640,10 +2666,11 @@ def _load_asset_manifest_document(
     # A subsequent explicit Add writes only the new project's canonical JSON.
     # Carry old absolute-path registrations as project-relative copies so the
     # old read-only file is neither changed nor duplicated as unregistered media.
+    resolved_root = _resolve_image_path(root)
     records = [
         {**record, "path": relative}
         if isinstance(record, dict)
-        and (relative := _manifest_asset_relative_path(root.resolve(), record))
+        and (relative := _manifest_asset_relative_path(resolved_root, record))
         else record
         for record in records
     ]
@@ -2778,7 +2805,7 @@ def _write_asset_manifest_record_locked(
 
 
 def _read_asset_manifest(root: Path) -> Dict[str, Dict[str, Any]]:
-    resolved_root = root.resolve()
+    resolved_root = _resolve_image_path(root)
     signature = _asset_manifest_signature(resolved_root)
     root_key = _asset_manifest_cache_root_key(resolved_root)
     cache_key = (root_key, signature)
@@ -2928,7 +2955,7 @@ def _audit_project_manifest_refresh(root: Path) -> Dict[str, Any]:
         root_facts = _refresh_manifest_regular_stat(root)
         if not stat.S_ISDIR(root_facts.st_mode):
             raise ValueError("Refresh project root is not a regular directory.")
-        root = root.resolve(strict=True)
+        root = _resolve_image_path(root, strict=True)
         review["project_root"] = root.as_posix()
         source_path, original, _payload, records = _refresh_manifest_document(root)
         review["manifest_path"] = source_path.as_posix() if source_path else ""
@@ -3231,7 +3258,7 @@ def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | N
         }
     root = Path(root_text).expanduser()
     try:
-        root = root.resolve()
+        root = _resolve_image_path(root)
     except Exception:
         root = Path(root_text)
     if not root.is_dir():
@@ -4804,7 +4831,7 @@ def _rebind_shared_catalog_snapshot(
     if not project_root_text or not project_id or not project_uid or not project_cache_uid:
         return None
     try:
-        root = Path(project_root_text).resolve()
+        root = _resolve_image_path(Path(project_root_text))
         if not root.is_dir() or _is_reparse_point(root):
             return None
         if project_uid != _project_uid(root) or project_cache_uid != _project_cache_uid(root):
@@ -5180,7 +5207,7 @@ def _read_catalog_index(
         )
         if selected is None:
             return None
-        resolved_root = Path(_clean(selected.get("path"))).resolve()
+        resolved_root = _resolve_image_path(Path(_clean(selected.get("path"))))
         if (
             _clean(raw.get("project_id")) != _project_id(resolved_root)
             or _clean(raw.get("project_uid")) != _project_uid(resolved_root)
@@ -5247,7 +5274,7 @@ def _state_catalog_is_current(state: Dict[str, Any]) -> bool:
     if not project_root or not signature:
         return False
     try:
-        root = Path(project_root).resolve()
+        root = _resolve_image_path(Path(project_root))
         return (
             root.is_dir()
             and not _is_reparse_point(root)
@@ -5271,8 +5298,8 @@ def _state_project_belongs_to_catalog(
     if not project_text or not catalog_text:
         return False
     try:
-        project = Path(_project_root_text(project_text)).resolve()
-        catalog = Path(catalog_text).resolve()
+        project = _resolve_image_path(Path(_project_root_text(project_text)))
+        catalog = _resolve_image_path(Path(catalog_text))
         if project == catalog or project.parent == catalog:
             return True
         try:
@@ -5389,10 +5416,10 @@ def _registration_folder_path(project_root: Path, folder_value: Any) -> Path:
         raise ValueError("Project Folder contains an unsafe path segment.")
     if Path(folder_text).is_absolute() or re.match(r"^[A-Za-z]:", folder_text):
         raise ValueError("Project Folder must be relative to the selected project.")
-    resolved_root = project_root.resolve()
+    resolved_root = _resolve_image_path(project_root)
     destination = resolved_root.joinpath(*parts)
     try:
-        resolved_destination = destination.resolve()
+        resolved_destination = _resolve_image_path(destination)
         resolved_destination.relative_to(resolved_root)
     except Exception as exc:
         raise ValueError("Project Folder resolves outside the selected project.") from exc
@@ -5417,7 +5444,7 @@ def _resolve_import_file_reference(value: str) -> Path | None:
         except Exception:
             return None
     try:
-        return Path(text).expanduser().resolve()
+        return _resolve_image_path(Path(text).expanduser())
     except Exception:
         return None
 
@@ -5544,8 +5571,8 @@ def _copy_import_to_project(
     else:
         _verified_image_dimensions(BytesIO(payload or b""))
     try:
-        resolved_root = project_root.resolve()
-        resolved_folder = target_parent.resolve()
+        resolved_root = _resolve_image_path(project_root)
+        resolved_folder = _resolve_image_path(target_parent)
         resolved_folder.relative_to(resolved_root)
     except Exception as exc:
         raise ValueError("Selected Asset Folder resolves outside the project.") from exc
@@ -5612,9 +5639,9 @@ def _resolve_project_asset_file(
         raise ValueError("The selected project file is not a supported image.")
     if not allow_user_import_path and _is_user_import_relative_path(relative_text):
         raise ValueError("External or User Import images cannot be registered in place.")
-    resolved_root = project_root.resolve()
+    resolved_root = _resolve_image_path(project_root)
     try:
-        resolved = resolved_root.joinpath(*parts).resolve()
+        resolved = _resolve_image_path(resolved_root.joinpath(*parts))
         canonical_relative = resolved.relative_to(resolved_root).as_posix()
     except Exception as exc:
         raise ValueError("The image resolves outside the selected project.") from exc
@@ -5829,7 +5856,7 @@ def _apply_asset_registration(
         raise ValueError("The selected project is outside the active project catalog.")
 
     request_source_kind = request.get("source_kind", "project")
-    selected_root = Path(selected_project["path"]).resolve()
+    selected_root = _resolve_image_path(Path(selected_project["path"]))
     registered_library_id = request["asset_library_id"]
     registration_message = ""
     source_selection = False

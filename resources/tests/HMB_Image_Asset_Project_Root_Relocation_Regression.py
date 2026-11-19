@@ -17,20 +17,21 @@ module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 old = "//fin-rcomp1/Composite_Team/projects_AI"
-new = "//192.168.200.19/v/projects"
+previous = "//192.168.200.19/v/projects"
+new = "P:/projects"
 show = new + "/superwings12/Ai_Ct_image"
 for prefix in (old, old.upper(), old.replace("/", "\\")):
     for suffix, expected in (("", new), ("/superwings12", show), ("/superwings12/캐릭터/Hero.png", show + "/캐릭터/Hero.png")):
         assert module._relocate_image_project_path(prefix + suffix) == expected
         assert module._project_root_text({"path": prefix + suffix}) == expected
-for base in ("P:/projects", new):
+for base in (previous, new):
     for suffix in ("", "/CH/Hero.png"):
-        expected = base + "/superwings12/Ai_Ct_image" + suffix
+        expected = new + "/superwings12/Ai_Ct_image" + suffix
         assert module._relocate_image_project_path(base + "/Ai_Ct_image/superwings12" + suffix) == expected
         assert module._relocate_image_project_path(base + "/superwings12/Ai_Ct_image/superwings12" + suffix) == expected
         assert module._relocate_image_project_path(expected) == expected
-    assert module._relocate_image_project_path(base + "/Ai_Ct_image") == base
-for path in (old + "_archive/Hero.png", "//artist-server/custom-projects", r"D:\MyProject", "https://example.com/hero.png"):
+    assert module._relocate_image_project_path(base + "/Ai_Ct_image") == new
+for path in (old + "_archive/Hero.png", "//artist-server/custom-projects", "//artist-server/v/projects/Ai_Ct_image/Other_Show", previous + "_archive/Other", r"D:\MyProject", "https://example.com/hero.png"):
     assert module._relocate_image_project_path(path) == path
 assert module._project_root_text(Path(old + "/superwings12")) == show
 assert module._project_root_text(json.dumps({"path": old})) == new
@@ -140,7 +141,7 @@ for previous_root in (old + "/superwings12", new + "/Ai_Ct_image/superwings12",
 print(f"ImageAsset CGT v2 hierarchy relocation/5-slot snapshots/reopen/no IO/foreign scope: PASS ({hierarchy_cases} cases)")
 
 # Defaults and stale environment overrides must resolve identically on startup.
-for configured, expected in ((None, new), (old, new), ("//artist-server/custom-projects", "//artist-server/custom-projects")):
+for configured, expected in ((None, new), (old, new), (previous, new), ("//artist-server/custom-projects", "//artist-server/custom-projects")):
     env = dict(os.environ)
     env.pop("HMB_IMAGE_PROJECTS_ROOT", None)
     if configured is not None:
@@ -148,3 +149,37 @@ for configured, expected in ((None, new), (old, new), ("//artist-server/custom-p
     code = "import HMBImageAssetLibrary as m; assert m._default_state()['catalog_root'].rstrip('/')==" + repr(expected)
     subprocess.run([sys.executable, "-B", "-c", code], cwd=ROOT, env=env, check=True)
 print("ImageAsset retired share relocation, native inputs, saved identity and custom paths: PASS")
+
+if os.name == "nt":
+    from unittest.mock import patch
+    drive = Path("P:/")
+    asset = drive / "projects/Vendor/Ai_Ct_image"
+    for target in (Path("//192.168.200.19/v"), Path("//external-artist/art")):
+        def mapped(path, *, strict=False):
+            if path == drive:
+                return target
+            if path == asset:
+                return target / asset.relative_to(drive)
+            raise AssertionError(path)
+        with patch.object(Path, "resolve", mapped):
+            assert module._resolve_image_path(asset) == asset
+            key = module._asset_manifest_cache_root_key(asset)
+            assert key == os.path.normcase(str(target / asset.relative_to(drive)))
+            module._ASSET_PROJECT_CACHE_UIDS[(key, "sample-signature")] = "test"
+            module._invalidate_project_cache_uid(asset)
+            assert (key, "sample-signature") not in module._ASSET_PROJECT_CACHE_UIDS
+        escaped = Path("//different-mount/private/hidden.png")
+        with patch.object(Path, "resolve", lambda path, **kw: target if path == drive else escaped):
+            assert module._resolve_image_path(asset / "redirect") == escaped
+    attempted = []
+    def unmapped(path, *, strict=False):
+        attempted.append(path)
+        raise FileNotFoundError(path)
+    with patch.object(Path, "resolve", unmapped), patch.object(Path, "is_dir", return_value=False):
+        try:
+            module._discover_project_catalog(previous)
+        except ValueError as exc:
+            assert "P:" in str(exc) and attempted == [Path("P:/projects")]
+        else:
+            raise AssertionError("An unmapped drive must not read the retired server")
+    print("Mapped storage I/O, remap cache isolation, containment and unavailable drive: PASS")

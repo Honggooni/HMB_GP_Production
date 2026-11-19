@@ -78,6 +78,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-direct-image-projects-") as tempora
     (projects / "Unrelated_Show" / "pipelines").mkdir(parents=True)
     registration_before = {str(p): (p.read_bytes(), p.stat().st_mtime_ns) for p in (sw_manifest, ka_manifest)}
     with ExitStack() as stack:
+        stack.enter_context(patch.object(module, "PRODUCTION_PROJECTS_ROOT", projects.as_posix()))
         guard_old_io(stack, [old_catalog, retired_nested])
         stack.enter_context(patch.object(module, "_ASSET_CATALOG_INDEX_ROOT", base / "catalog-cache"))
         catalog = module._load_project_catalog(projects, module._default_state(), use_shared_cache=False)

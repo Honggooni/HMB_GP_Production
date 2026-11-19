@@ -103,14 +103,17 @@ def _project_options(session: _Session, *, foreground_status: bool = False) -> t
     def discover() -> None:
         projects = []
         notice = ""
+        mapped_root = False
         try:
             from HMBImageAssetLibrary import DEFAULT_PROJECTS_ROOT, _discover_project_catalog
+            mapped_root = DEFAULT_PROJECTS_ROOT.as_posix().casefold() == "p:/projects"
             projects = _discover_project_catalog(DEFAULT_PROJECTS_ROOT)["projects"]
             if not projects:
                 notice = "선택 가능한 프로젝트가 없습니다. 공유 폴더에서 프로젝트의 Ai_Ct_image 폴더와 읽기 권한을 확인한 뒤 다시 확인하세요."
         except Exception:
             _LOG.debug("HMB shot basket project discovery failed", exc_info=True)
-            notice = "공유 프로젝트 목록을 읽지 못했습니다. 네트워크 연결과 프로젝트 폴더의 읽기 권한을 확인한 뒤 다시 확인하세요."
+            notice = ("P:/projects를 읽지 못했습니다. P: 드라이브 연결과 폴더의 읽기 권한을 확인한 뒤 다시 확인하세요."
+                      if mapped_root else "공유 프로젝트 목록을 읽지 못했습니다. 네트워크 연결과 프로젝트 폴더의 읽기 권한을 확인한 뒤 다시 확인하세요.")
         with session.discovery_lock:
             session.projects = projects
             session.discovery_notice = notice

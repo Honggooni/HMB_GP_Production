@@ -1055,12 +1055,11 @@ try:
     assert not asset_library.parameter_exists(node, "IMAGE_MEDIA_OUT")
     expected_projects_root = os.environ.get(
         "HMB_IMAGE_PROJECTS_ROOT",
-        r"\\192.168.200.19\v\projects",
+        "P:/projects",
     )
-    assert str(asset_library.DEFAULT_PROJECTS_ROOT) == expected_projects_root
-    assert asset_library._default_state()["catalog_root"] == expected_projects_root.replace(
-        "\\", "/"
-    )
+    expected_projects_root = asset_library._relocate_image_project_path(expected_projects_root).replace("\\", "/")
+    assert asset_library.DEFAULT_PROJECTS_ROOT.as_posix() == expected_projects_root
+    assert asset_library._default_state()["catalog_root"] == expected_projects_root
     custom_catalog_root = "//artist-server/custom-projects"
     assert (
         asset_library._normalize_state({"catalog_root": custom_catalog_root})[

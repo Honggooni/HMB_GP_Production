@@ -1185,12 +1185,13 @@ function normalizeRelativeFolder(value) {
   return parts.some((part) => part === "..") ? "" : parts.join("/");
 }
 
-const PRODUCTION_PROJECTS_ROOT = "//192.168.200.19/v/projects";
+const PRODUCTION_PROJECTS_ROOT = "P:/projects";
+const PREVIOUS_PROJECTS_ROOT = "//192.168.200.19/v/projects";
 const RETIRED_PROJECTS_ROOT = "//fin-rcomp1/Composite_Team/projects_AI";
 
 export function hmbRelocateImageProjectPath(value) {
   const text = clean(value);
-  const path = text.replaceAll("\\", "/");
+  let path = text.replaceAll("\\", "/");
   const prefix = RETIRED_PROJECTS_ROOT;
   if (path.toLowerCase() === prefix.toLowerCase() || path.toLowerCase().startsWith(prefix.toLowerCase() + "/")) {
     const parts = path.slice(prefix.length).replace(/^\/+|\/+$/g, "").split("/");
@@ -1199,11 +1200,15 @@ export function hmbRelocateImageProjectPath(value) {
     return [PRODUCTION_PROJECTS_ROOT, parts[0], "Ai_Ct_image", ...parts.slice(1)].join("/");
   }
   if (path.includes("://") || path.split("/").some((part) => part === "." || part === "..")) return text;
+  const alias = [PREVIOUS_PROJECTS_ROOT, PRODUCTION_PROJECTS_ROOT].find(root =>
+    path.toLowerCase() === root.toLowerCase() || path.toLowerCase().startsWith(root.toLowerCase() + "/"));
+  if (!alias) return text;
+  path = PRODUCTION_PROJECTS_ROOT + path.slice(alias.length);
   const flat = path.match(/^(.*?\/projects)\/ai_ct_image(?:\/([^/]+)(\/.*)?)?\/?$/i);
   if (flat) return flat[2] ? `${flat[1]}/${flat[2]}/Ai_Ct_image${flat[3] || ""}` : flat[1];
   const nested = path.match(/^(.*?\/projects\/([^/]+)\/ai_ct_image)\/([^/]+)(\/.*)?$/i);
   if (nested && nested[2].toLowerCase() === nested[3].toLowerCase()) return nested[1] + (nested[4] || "");
-  return text;
+  return path;
 }
 
 function normalizeProject(raw) {
