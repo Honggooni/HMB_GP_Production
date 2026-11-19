@@ -90,9 +90,11 @@ class DirectUploadRegression(fixture.ManualLUTRegression):
         original=Path(state['source']['path']).read_bytes();state['result']={}
         state['settings'].update(enabled=True,exposure=.5)
         with mock.patch.object(target,'export_video',side_effect=self.fixture.successful_export) as encoded, \
-             mock.patch.object(self.node,'_upload_request',side_effect=lambda c,**kw:self.ack(c)) as sent:
+             mock.patch.object(self.node,'_upload_request',side_effect=lambda c,**kw:self.ack(c)) as sent, \
+             mock.patch.object(self.node,'_capture_usage_operation') as usage:
             self.chain('grade-and-upload')
             self.chain('repeat-frozen-export')
+            usage.assert_not_called()
         self.assertEqual(encoded.call_count,1)
         self.assertEqual(sent.call_count,1)
         self.assertEqual(sent.call_args.args[0]['artifact'],'export')

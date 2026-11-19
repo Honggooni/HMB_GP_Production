@@ -9,6 +9,7 @@ import threading
 import types
 import unittest
 from unittest import mock
+from urllib.error import HTTPError
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[2]), str(Path(__file__).parent)]
 import HMB_Color_LUT_Node_Regression as fixture
@@ -317,6 +318,95 @@ class ManualLUTRegression(unittest.TestCase):
         self.node._hmb_node_deleted = True
         with mock.patch.object(self.node, "_upload_request") as request:
             self.upload("deleted"); request.assert_not_called()
+
+    def test_status_check_stays_read_only_after_absence_and_reprobe(self):
+        context = self.ready()
+        calls = []
+
+        def transport(captured, *, retrieve, cancel):
+            calls.append((captured["upload_id"], retrieve))
+            if retrieve:
+                raise HTTPError("https://broker.test", 404, "Not found", {}, None)
+            raise HTTPError("https://broker.test", 503, "Unavailable", {}, None)
+
+        def reprobe():
+            self.node._web_upload_probe_key = ""
+            self.node._schedule_upload_probe()
+            self.fixture.drain()
+
+        with mock.patch.object(self.node, "_upload_request", side_effect=transport):
+            self.upload("submit")
+            reprobe()
+            self.assertEqual(self.node._web_upload["phase"], "unknown")
+            self.assertIn("HTTP 503", self.node._web_upload["reason"])
+            self.upload("lookup")
+            reprobe()
+            self.assertEqual(self.node._web_upload["phase"], "absent")
+            self.assertIn("완료된 업로드 기록을 찾지 못했습니다", self.node._web_upload["reason"])
+            self.node._command({"id": "stale-check-button", "action": "upload_web", "check_only": True,
+                                "state": copy.deepcopy(self.node._hmb_color_lut_state)})
+            self.fixture.drain()
+            self.assertEqual(calls, [(context["upload_id"], False), (context["upload_id"], True),
+                                     (context["upload_id"], True), (context["upload_id"], True)])
+
+    def test_http_503_after_commit_recovers_receipt_without_second_post(self):
+        context = self.ready()
+        calls = []
+
+        def transport(captured, *, retrieve, cancel):
+            calls.append((captured["upload_id"], retrieve))
+            if not retrieve:
+                raise HTTPError("https://broker.test", 503, "Unavailable", {}, None)
+            return self.ack(captured)
+
+        with mock.patch.object(self.node, "_upload_request", side_effect=transport):
+            self.upload()
+        self.assertEqual(calls, [(context["upload_id"], False), (context["upload_id"], True)])
+        self.assertEqual(self.node._web_upload["phase"], "complete")
+
+    def test_project_list_preloads_episodes_without_a_project_selection(self):
+        self.choose("")
+        requested = []
+
+        def page(method, path, **kwargs):
+            if "/episodes?" not in path:
+                return self.request(method, path, **kwargs)
+            project = path.split("project_id=")[1]
+            requested.append(project)
+            return {"schema": "hmb-review-episodes-v1", "items": [{"episode": {
+                "superwings12": "e202", "katuri8": "e007",
+            }[project]}], "has_more": False}
+
+        self.bridge._request_json = page
+        self.node._schedule_manual_projects(force=True)
+        self.fixture.drain()
+        self.assertEqual(requested, ["superwings12", "katuri8"])
+        self.choose("katuri8")
+        self.assertEqual(self.node._episode_codes, ["e007"])
+        self.assertEqual(requested, ["superwings12", "katuri8"])
+        self.assertEqual(self.node._hmb_color_lut_state["manual_episode"], "")
+
+    def test_episode_scan_retries_same_cursor_and_returns_all_labels(self):
+        calls = []
+
+        def page(method, path, **kwargs):
+            if "/episodes?" not in path:
+                return self.request(method, path, **kwargs)
+            calls.append(path)
+            if len(calls) == 2:
+                raise HTTPError("https://broker.test", 503, "Busy", {}, None)
+            return {"schema": "hmb-review-episodes-v1",
+                    "items": [{"episode": "e202" if len(calls) == 1 else "e203"}],
+                    "has_more": len(calls) == 1, "next_cursor": "later" if len(calls) == 1 else None}
+
+        self.bridge._request_json = page
+        self.node._episodes_checked = 0
+        with mock.patch.object(target.time, "sleep"):
+            self.node._schedule_episodes()
+            self.fixture.drain()
+        self.assertEqual(calls[1], calls[2])
+        self.assertEqual(self.node._episode_codes, ["e202", "e203"])
+        self.assertEqual(self.node._episodes_status, "complete")
 
     def test_late_success_after_leaving_and_returning_does_not_repaint_current_operation(self):
         context = self.ready()

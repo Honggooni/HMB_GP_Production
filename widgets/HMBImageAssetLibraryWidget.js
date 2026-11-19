@@ -77,6 +77,7 @@ const IMAGE_ASSET_THUMBNAIL_FIRST_BATCH = 12;
 const IMAGE_ASSET_THUMBNAIL_REQUEST_BATCH = 64;
 const IMAGE_ASSET_THUMBNAIL_ERROR_RETRY_LIMIT = 1;
 const IMAGE_ASSET_THUMBNAIL_WATCHDOG_MS = 15000;
+const IMAGE_ASSET_REFRESH_RESPONSE_TIMEOUT_MS = 40000;
 const IMAGE_ASSET_THUMBNAIL_WATCHDOG_RETRIES = 1;
 const IMAGE_ASSET_SEARCH_DEBOUNCE_MS = 72;
 const HMB_IMAGE_ASSET_THUMBNAIL_BRIDGE_REGISTRY_KEY =
@@ -910,6 +911,19 @@ export function hmbApplyCgtWorkStartNotice(container, state) {
   }
 }
 
+function hmbClearImageAssetRefreshWait(container) {
+  clearTimeout(container.__hmbImageAssetRefreshWait?.timer);
+  delete container.__hmbImageAssetRefreshWait;
+}
+
+function hmbImageAssetRefreshScope(state) {
+  return JSON.stringify([
+    hmbImageAssetWidgetLease(state), imageAssetThumbnailRuntimeId(state),
+    state?.shot_routing?.channel_uuid, imageAssetProjectPathKey(state?.catalog_root),
+    imageAssetProjectPathKey(state?.project_root),
+  ]);
+}
+
 export function hmbSetImageAssetBusy(container, busy, message = "") {
   if (!container) return false;
   const root = container.querySelector?.(".hmb-image-assets");
@@ -920,9 +934,10 @@ export function hmbSetImageAssetBusy(container, busy, message = "") {
     "[data-project-set],[data-project-reload],[data-project-select]",
   ) || []);
   if (busy) {
+    const previous = new Map((container.__hmbImageAssetBusyControls || []).map(({control, disabled}) => [control, disabled]));
     container.__hmbImageAssetBusyControls = controls.map((control) => ({
       control,
-      disabled: Boolean(control.disabled),
+      disabled: previous.get(control) ?? Boolean(control.disabled),
     }));
     controls.forEach((control) => { control.disabled = true; });
   } else {
@@ -1648,6 +1663,8 @@ export function hmbAcceptImageAssetWidgetLease(container, state, confirmedLease)
   return true;
 }
 function hmbResetImageAssetRuntimeState(container,state) {
+    hmbClearImageAssetRefreshWait(container);
+    delete container.__hmbImageAssetSettledRefresh;
     const workspaceHold = container.__hmbImageAssetWorkspaceAuthorityUnknown;
     if (workspaceHold && (workspaceHold.lease !== hmbImageAssetWidgetLease(state)
       || workspaceHold.runtime !== imageAssetThumbnailRuntimeId(state))) delete container.__hmbImageAssetWorkspaceAuthorityUnknown;
@@ -8020,12 +8037,31 @@ function installEvents(container, state, props, remount, listeners) {
       };
       delete container.__hmbImageAssetPendingSlowAction;
       mutate();
+      if (action.refresh) {
+        hmbClearImageAssetRefreshWait(container);
+        const wait = { scope: hmbImageAssetRefreshScope(state), revision: state.refresh_revision, previousRequestId: state.scan_request_id };
+        container.__hmbImageAssetRefreshWait = wait;
+        wait.timer = setTimeout(() => {
+          if (container.__hmbImageAssetRefreshWait !== wait) return;
+          hmbClearImageAssetRefreshWait(container);
+          const current = container.__hmbImageAssetLatestState || state;
+          if (hmbImageAssetRefreshScope(current) !== wait.scope || container.__hmbImageAssetSlowActionToken !== token) return;
+          container.__hmbImageAssetSettledRefresh = wait;
+          delete container.__hmbImageAssetSlowActionToken;
+          hmbSetImageAssetBusy(container, false);
+          state = remount({ ...current, scan_busy: false });
+          hmbShowImageAssetTransportError(container, imageAssetLanguage(state) === "en"
+            ? "Refresh did not return a result. The current catalog is still available. Try refresh again."
+            : "새로고침 결과를 받지 못했습니다. 현재 목록을 유지했습니다. 다시 시도하세요.", state);
+        }, IMAGE_ASSET_REFRESH_RESPONSE_TIMEOUT_MS);
+      }
       container.__hmbImageAssetRenderLimit = IMAGE_ASSET_RENDER_WINDOW;
       container.__hmbImageAssetRenderOffset = 0;
       let failedSynchronously = false;
       const published = emit(props, state, container, (error) => {
         failedSynchronously = true;
         if (container.__hmbImageAssetSlowActionToken !== token) return;
+        if (action.refresh) hmbClearImageAssetRefreshWait(container);
         Object.assign(state, previous);
         delete container.__hmbImageAssetSlowActionToken;
         hmbSetImageAssetBusy(container, false);
@@ -8038,6 +8074,7 @@ function installEvents(container, state, props, remount, listeners) {
           // the generation-owned result. Keep feedback/duplicate prevention
           // active until that authoritative completion arrives.
           if (typeof props?.onChange !== "function") {
+            if (action.refresh) hmbClearImageAssetRefreshWait(container);
             delete container.__hmbImageAssetSlowActionToken;
             hmbSetImageAssetBusy(container, false);
           }
@@ -8375,7 +8412,7 @@ function installEvents(container, state, props, remount, listeners) {
     hmbResetImageAssetThumbnailRetryState(container, state);
     commitSlowProjectMutation(() => {
       state.refresh_revision = Math.max(0, Number(state.refresh_revision) || 0) + 1;
-    });
+    }, { refresh: true });
   });
 
   const onTreeClick = (event) => {
@@ -9451,6 +9488,10 @@ function hmbNativeUiImplementation(container, props) {
       return;
     }
     const incomingState = normalizeState(hmbImageAssetLocalPageProjection(rawIncoming,state,container));
+    const incomingRefreshScope = hmbImageAssetRefreshScope(incomingState);
+    if (container.__hmbImageAssetSettledRefresh?.scope === incomingRefreshScope && incomingState.scan_busy
+        && incomingState.refresh_revision <= container.__hmbImageAssetSettledRefresh.revision
+        && (!container.__hmbImageAssetSettledRefresh.requestId || incomingState.scan_request_id === container.__hmbImageAssetSettledRefresh.requestId)) return;
     incomingState.image_bash_workspace_request = {};
     incomingState.image_bash_workspace_edit = {};
     const draft = container.__hmbImageAssetRegistrationDraft;
@@ -9660,9 +9701,19 @@ function hmbNativeUiImplementation(container, props) {
       : JSON.stringify(nextState);
     if (currentValue === nextValue) return;
     if (hmbDeferImageAssetPropsDuringRegistration(container, props)) return;
+    if (container.__hmbImageAssetRefreshWait && (container.__hmbImageAssetRefreshWait.scope !== incomingRefreshScope
+      || (!nextState.scan_busy && nextState.refresh_revision >= container.__hmbImageAssetRefreshWait.revision
+        && nextState.scan_request_id && nextState.scan_request_id !== container.__hmbImageAssetRefreshWait.previousRequestId))) {
+      if (container.__hmbImageAssetRefreshWait.scope === incomingRefreshScope) {
+        container.__hmbImageAssetSettledRefresh = { scope: container.__hmbImageAssetRefreshWait.scope, revision: nextState.refresh_revision, requestId: nextState.scan_request_id };
+      }
+      hmbClearImageAssetRefreshWait(container);
+    }
     remount(nextState);
     if (nextState.scan_busy) {
       container.__hmbImageAssetBusy = true;
+    } else if (container.__hmbImageAssetRefreshWait) {
+      hmbSetImageAssetBusy(container, true, imageAssetText(nextState, "busy_loading"));
     } else {
       delete container.__hmbImageAssetSlowActionToken;
       hmbSetImageAssetBusy(container, false);
@@ -9683,6 +9734,8 @@ function hmbNativeUiImplementation(container, props) {
   };
 
   const cleanup = () => {
+    hmbClearImageAssetRefreshWait(container);
+    delete container.__hmbImageAssetSettledRefresh;
     clearTimeout(container.__hmbImageAssetRegistrationDraft?.save_timer);
     container.__hmbImageAssetBashEditQueue?.dispose();delete container.__hmbImageAssetBashEditQueue;delete container.__hmbImageAssetBashQueueExecute;
     hmbCancelImageAssetAuthorityWait(container);

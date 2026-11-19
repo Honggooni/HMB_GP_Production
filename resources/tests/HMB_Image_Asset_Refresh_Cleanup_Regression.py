@@ -397,6 +397,54 @@ class RefreshCleanupRegression(unittest.TestCase):
         self.assertNotIn("manifest_digest", review)
         self.assertNotIn("missing_records", review)
 
+    def test_stalled_share_ends_refresh_and_late_result_cannot_replace_catalog(self):
+        node, live, published = fake_node(self.state())
+        started, release = threading.Event(), threading.Event()
+        audit = library._audit_project_manifest_refresh
+
+        def blocked_audit(root):
+            started.set()
+            release.wait(3)
+            return audit(root)
+
+        def refresh():
+            return node._schedule_project_manifest_refresh(
+                live["state"], self.root.parent.as_posix(), []
+            )
+
+        before = deepcopy(live["state"])
+        with patch.object(library, "PROJECT_REFRESH_TIMEOUT_SECONDS", 0.15, create=True), patch.object(
+            library, "_audit_project_manifest_refresh", side_effect=blocked_audit
+        ) as audit_call, patch.object(
+            library, "_load_project_catalog", side_effect=lambda _root, state, **_kw: deepcopy(state)
+        ):
+            try:
+                self.assertTrue(refresh()["scan_busy"])
+                self.assertTrue(started.wait(1))
+                worker = node._hmb_scan_thread
+                deadline = time.monotonic() + 1
+                while time.monotonic() < deadline and not node._consume_pending_catalog_scan_result():
+                    time.sleep(0.01)
+                completed = live["state"]
+                self.assertFalse(completed["scan_busy"])
+                self.assertEqual(completed["asset_refresh_review"]["status"], "error")
+                self.assertEqual(completed["assets"], before["assets"])
+                self.assertEqual(completed["shot_routing"], before["shot_routing"])
+                self.assertIsNone(node._hmb_refresh_authority)
+                self.assertTrue(refresh()["scan_busy"])
+                self.assertFalse(finish_worker(node, live)["scan_busy"])
+                self.assertEqual(audit_call.call_count, 1)
+                publication_count = len(published)
+                release.set()
+                worker.join(1)
+                self.assertFalse(worker.is_alive())
+                self.assertFalse(node._consume_pending_catalog_scan_result())
+                self.assertEqual(len(published), publication_count)
+                self.assertTrue(refresh()["scan_busy"])
+                self.assertEqual(finish_worker(node, live)["asset_refresh_review"]["status"], "review")
+            finally:
+                release.set()
+
     def test_forged_widget_review_has_no_cleanup_authority(self):
         state = self.state()
         state["asset_refresh_review"] = {**self.audit(), "request_id": "forged", "status": "review"}

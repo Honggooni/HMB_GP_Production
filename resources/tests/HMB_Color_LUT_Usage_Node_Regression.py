@@ -123,16 +123,7 @@ class UsageNodeRegression(unittest.TestCase):
         proof = target._read_upload_receipt(result["web_export_proof"])
         local = self.posts()[0]
         self.assertEqual(proof["usage_event"], local)
-        context = {"usage_event": proof["usage_event"], "sha256": proof["sha256"],
-                   "settings_sha256": local["settings_sha256"], "source_task_id": "job-" + "b" * 32,
-                   "upload_id": "c" * 64, "server_url": self.bridge.server_url, "owner_id": "42"}
-        self.node._queue_web_usage(context)
-        self.fixture.drain()
-        self.node._queue_web_usage(context)
-        self.fixture.drain()
-        self.assertEqual(len(self.posts()), 2)
-        self.assertEqual({row["stage"] for row in self.posts()}, {"local_export", "web_upload"})
-        self.assertEqual(len({row["export_operation_id"] for row in self.posts()}), 1)
+        self.assertEqual([row["stage"] for row in self.posts()], ["local_export"])
         self.assertEqual(self.node._hmb_color_lut_state["status"]["phase"], "complete")
 
     def test_pending_or_reopened_record_only_looks_up_same_operation(self):

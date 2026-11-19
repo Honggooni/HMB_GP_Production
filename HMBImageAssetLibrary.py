@@ -72,6 +72,7 @@ parameter_exists = getattr(
 )
 
 IMAGE_SOURCE_TYPE_CHOICES = _hmb.IMAGE_SOURCE_TYPE_CHOICES
+PROJECT_REFRESH_TIMEOUT_SECONDS = 30
 IMAGE_MAIN_TYPE_UNCLASSIFIED = _hmb.IMAGE_MAIN_TYPE_UNCLASSIFIED
 IMAGE_MAIN_TYPE_CHOICES = _hmb.IMAGE_MAIN_TYPE_CHOICES
 IMAGE_SUB_TYPE_CHOICES = _hmb.IMAGE_SUB_TYPE_CHOICES
@@ -10153,7 +10154,7 @@ class HMBImageAssetLibrary(DataNode):
         if fresh_registration:
             self._hmb_hydration_adopted = True
         normalized_state = _normalize_state(state)
-        if key.startswith("project:") and not normalized_state.get("scan_busy"):
+        if key.startswith(("project:", "refresh:")) and not normalized_state.get("scan_busy"):
             live = self._current_state()
             if (live.get("scan_busy")
                 and _project_root_text(live.get("project_root")).casefold()
@@ -11878,6 +11879,8 @@ class HMBImageAssetLibrary(DataNode):
     def _ensure_scan_runtime_state(self) -> None:
         if not hasattr(self, "_hmb_scan_lock"):
             self._hmb_scan_lock = threading.RLock()
+        if not hasattr(self, "_hmb_project_refresh_io_lock"):
+            self._hmb_project_refresh_io_lock = threading.Lock()
         if not hasattr(self, "_hmb_scan_generation"):
             self._hmb_scan_generation = 0
         if not hasattr(self, "_hmb_scan_pending_key"):
@@ -12617,6 +12620,8 @@ class HMBImageAssetLibrary(DataNode):
         ]
         | None = None,
         on_published: Callable[[Dict[str, Any]], None] | None = None,
+        *,
+        timeout_seconds: float | None = None,
     ) -> Dict[str, Any]:
         """Publish a busy snapshot and run filesystem work off the UI thread.
 
@@ -12793,6 +12798,14 @@ class HMBImageAssetLibrary(DataNode):
                 owner._hmb_scan_thread = None
                 owner._hmb_scan_pending_result = None
 
+        completion_claimed = False
+        watchdog: threading.Timer | None = None
+
+        def scan_failure(exc: Exception) -> Dict[str, Any]:
+            result = _normalize_state(failure_state or candidate_state)
+            result["error"] = str(exc)
+            return result
+
         def worker() -> None:
             owner = node_ref()
             if owner is None:
@@ -12816,9 +12829,8 @@ class HMBImageAssetLibrary(DataNode):
                 result = _normalize_state(scanned_state)
                 result["error"] = ""
             except Exception as exc:
-                result = _normalize_state(failure_state or candidate_state)
+                result = scan_failure(exc)
                 media_by_uid = None
-                result["error"] = str(exc)
                 _diagnostic_exception("Background project scan failed", exc)
             owner = node_ref()
             if owner is None:
@@ -12831,14 +12843,30 @@ class HMBImageAssetLibrary(DataNode):
                 )
                 if not is_current:
                     return
-            _prepare_catalog_scan_index(result, normalized=True)
+            try:
+                _prepare_catalog_scan_index(result, normalized=True)
+            except Exception as exc:
+                _diagnostic_exception("Background project index failed", exc)
+                result = scan_failure(exc)
+                media_by_uid = None
+            complete(result, media_by_uid)
+
+        def complete(result: Dict[str, Any], media_by_uid: Dict[str, Any] | None) -> None:
+            nonlocal completion_claimed
+            owner = node_ref()
+            if owner is None:
+                return
             with owner._hmb_scan_lock:
                 if (
-                    generation != owner._hmb_scan_generation
+                    completion_claimed
+                    or generation != owner._hmb_scan_generation
                     or key != owner._hmb_scan_pending_key
                     or bool(getattr(owner, "_hmb_node_deleted", False))
                 ):
                     return
+                completion_claimed = True
+                if watchdog is not None:
+                    watchdog.cancel()
                 # Retain before enqueue for the same loop-stop race handled by
                 # thumbnail hydration. A later retained callback and the
                 # scheduled callback race on generation/key; only one can win.
@@ -12916,6 +12944,18 @@ class HMBImageAssetLibrary(DataNode):
         # Starting a daemon thread is bounded and does not require any retained-
         # mode manager.  Only the completed result is marshalled back to the
         # captured UI loop.
+        if timeout_seconds is not None:
+            def expire() -> None:
+                message = (
+                    "프로젝트 폴더 읽기가 지연되어 새로고침을 종료했습니다. 드라이브 연결을 확인한 뒤 다시 시도하세요."
+                    if scan_base.get("language") != "en"
+                    else "Project folder read timed out. Check the drive connection and try again."
+                )
+                complete(scan_failure(TimeoutError(message)), None)
+
+            watchdog = threading.Timer(timeout_seconds, expire)
+            watchdog.daemon = True
+            watchdog.start()
         launch()
         return busy
 
@@ -13407,19 +13447,17 @@ class HMBImageAssetLibrary(DataNode):
         self, state: Dict[str, Any], catalog_root: str, import_value: Any
     ) -> Dict[str, Any]:
         """Explicit Refresh only: audit in the worker, never prune implicitly."""
+        self._ensure_scan_runtime_state()
         self._hmb_refresh_authority = None
         state = dict(state)
         state["asset_refresh_review"] = {}
         token = uuid.uuid4().hex
         project_root = _project_root_text(state.get("project_root"))
-        effective_project_root = project_root
         report: Dict[str, Any] = {}
 
-        def refresh() -> Any:
-            nonlocal effective_project_root
+        def read_project() -> Any:
             if project_root:
-                effective_project_root = _project_root_text(project_root)
-                audit = _audit_project_manifest_refresh(Path(effective_project_root))
+                audit = _audit_project_manifest_refresh(Path(project_root))
                 report.update(audit)
                 report.update({
                     "request_id": token,
@@ -13432,36 +13470,52 @@ class HMBImageAssetLibrary(DataNode):
                     return state
             loaded = _load_project_catalog(catalog_root, state, use_shared_cache=False)
             if project_root and (
-                _project_root_text(loaded.get("project_root")).casefold() != effective_project_root.casefold()
+                _project_root_text(loaded.get("project_root")).casefold() != project_root.casefold()
                 or _clean(loaded.get("project_uid")) != _clean(state.get("project_uid"))
             ):
                 raise ValueError("The selected project is no longer available; the previous catalog was retained.")
             return self._merge_captured_imports_into_scan(loaded, import_value)
 
+        def refresh() -> Any:
+            # An SMB read can outlive its UI deadline. Keep at most one such
+            # explicit refresh active per node until the filesystem returns.
+            if not self._hmb_project_refresh_io_lock.acquire(blocking=False):
+                raise TimeoutError(
+                    "이전 프로젝트 폴더 읽기가 아직 응답하지 않습니다. 드라이브 연결을 확인한 뒤 다시 시도하세요."
+                    if state.get("language") != "en"
+                    else "A previous project folder read is still pending. Check the drive connection and try again."
+                )
+            try:
+                return read_project()
+            finally:
+                self._hmb_project_refresh_io_lock.release()
+
         def merge(result: Dict[str, Any], base: Dict[str, Any], live: Dict[str, Any]) -> Dict[str, Any]:
             merged = _merge_async_scan_result_with_live_state(result, base, live)
             if not project_root:
                 return merged
+            refresh_report = report
             if result.get("error"):
-                report.update({"request_id": token, "project_root": effective_project_root,
+                refresh_report = {"request_id": token, "project_root": project_root,
                                "status": "error", "safe_to_clean": False,
-                               "error": _clean(result.get("error"))})
+                               "error": _clean(result.get("error"))}
             same_project = (
-                _project_root_text(merged.get("project_root")).casefold() == effective_project_root.casefold()
+                _project_root_text(merged.get("project_root")).casefold() == project_root.casefold()
                 and _clean(merged.get("project_uid")) == _clean(state.get("project_uid"))
             )
             if same_project:
-                merged["asset_refresh_review"] = _normalize_asset_refresh_review(report)
-                if report.get("error"):
-                    merged["error"] = _clean(report["error"])
-                if report.get("safe_to_clean") and not report.get("error"):
+                merged["asset_refresh_review"] = _normalize_asset_refresh_review(refresh_report)
+                if refresh_report.get("error"):
+                    merged["error"] = _clean(refresh_report["error"])
+                if refresh_report.get("safe_to_clean") and not refresh_report.get("error"):
                     # Assigned only after the scheduler's owner/generation guard.
-                    self._hmb_refresh_authority = copy.deepcopy(report)
+                    self._hmb_refresh_authority = copy.deepcopy(refresh_report)
             return _normalize_state(merged)
 
         return self._schedule_catalog_scan(
             f"refresh:{catalog_root.casefold()}:{_non_negative_int(state.get('refresh_revision'))}",
             state, refresh, failure_state=state, result_merger=merge,
+            timeout_seconds=PROJECT_REFRESH_TIMEOUT_SECONDS,
         )
 
     def _schedule_project_manifest_cleanup(

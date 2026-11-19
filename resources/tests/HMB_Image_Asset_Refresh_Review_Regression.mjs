@@ -209,6 +209,29 @@ if (playwright && fs.existsSync(executablePath)) {
     page.on("pageerror", (error) => errors.push(error.message));
     await page.goto(`http://127.0.0.1:${server.address().port}`);
     await page.waitForFunction(() => window.ready);
+    await page.clock.install();
+    await page.evaluate(value => window.mountReview(value, false), { ...initial, asset_refresh_review: {} });
+    const reload = page.locator("[data-project-reload]");
+    await reload.click();
+    await page.waitForFunction(() => window.writes.some(value => (value.edits || value).refresh_revision === 1));
+    assert.equal(await reload.isDisabled(), true);
+    await page.evaluate(() => {
+      window.ack = { ...window.container.__hmbImageAssetLatestState, scan_busy: true, scan_request_id: "lost-ack", refresh_revision: 1 };
+      window.controller.update(window.props(window.ack));
+    });
+    await page.clock.fastForward(41000);
+    assert.equal(await reload.isEnabled(), true, "A missing completion frees the Refresh button");
+    assert.match(await page.locator("[data-transport-status]").textContent(), /새로고침 결과를 받지 못했습니다/);
+    await page.evaluate(() => window.controller.update(window.props({ ...window.ack })));
+    assert.equal(await reload.isEnabled(), true, "A late busy frame cannot re-lock Refresh");
+    await reload.click();
+    await page.waitForFunction(() => window.writes.some(value => (value.edits || value).refresh_revision === 2));
+    await page.evaluate(() => {
+      const result = { ...window.container.__hmbImageAssetLatestState, scan_busy: false, scan_request_id: "refresh-two", refresh_revision: 2 };
+      window.controller.update(window.props(result));
+      window.controller.update(window.props({ ...result, scan_busy: true }));
+    });
+    assert.equal(await reload.isEnabled(), true, "A successful retry stays idle after an out-of-order busy frame");
     for (const compact of [false, true]) {
       await page.evaluate(({ value, compact }) => window.mountReview(value, compact), { value: { ...initial, asset_refresh_review: {} }, compact });
       const sizeBefore = await page.locator(".hmb-image-assets").boundingBox();

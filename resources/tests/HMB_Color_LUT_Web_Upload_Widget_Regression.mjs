@@ -16,6 +16,7 @@ const value = { shot_catalog: catalog, shot: { channel_uuid: "channel-one", shot
 assert.equal(hmbColorLUTState(value).web_upload.enabled, true);
 assert.equal(hmbColorLUTState({ ...value, shot: {} }).web_upload.enabled, false, "Only cannot enable a web upload");
 const manual = { ...value, shot: {}, project_id: "superwings12", manual_project: { id: "superwings12", name: "슈퍼윙즈12" },
+  manual_episode: "e202",
   manual_project_display_name: "superwings12",
   upload_projects: [{ id: "superwings12", name: "슈퍼윙즈12", display_name: "superwings12" },
     { id: "katuri8", name: "까투리8", display_name: "Katuri8" }],
@@ -25,11 +26,12 @@ assert.match(hmbRenderColorLUTWidget(manual), /<option value="katuri8">Katuri8<\
 assert.match(hmbRenderColorLUTWidget({ ...value, project: { name: "까투리8" }, project_id: "bound-uid",
   project_display_name: "Katuri8" }), /<option value="bound-uid">Katuri8<\/option>/);
 const mybox = { ...manual, project_id: "my-box", manual_project: { id: "my-box", name: "My Box" },
+  manual_episode: "",
   upload_projects: [...manual.upload_projects, { id: "my-box", name: "My Box" }] };
 assert.equal(hmbColorLUTState(mybox).web_upload.enabled, true);
 assert.equal(hmbColorLUTState({ ...manual, upload_projects: [] }).web_upload.enabled, false);
 assert.equal(hmbColorLUTCommand("upload_web", value).action, "upload_web");
-assert.match(hmbRenderColorLUTWidget(value), /data-action="save_profile"[\s\S]*cl-web-upload[\s\S]*data-action="upload_web"/);
+assert.match(hmbRenderColorLUTWidget(value), /data-reset[\s\S]*cl-web-upload[\s\S]*data-action="upload_web"/);
 assert.match(hmbRenderColorLUTWidget(value), /data-action="upload_web" type="button" disabled/);
 const localFFV1 = { ...manual, manual_project: {}, upload_projects: [],
   output: { codec: 'ffv1', manual_output_enabled: true, path: 'C:/synthetic/local-final.mkv' } };
@@ -66,6 +68,12 @@ try {
   assert.equal(await button.isDisabled(),true);
   assert.equal(await page.evaluate(()=>window.commands.length),1);
   assert.equal(await page.evaluate(()=>window.commands[0].action),"upload_web");
+  await page.evaluate(()=>{window.state={...window.state,revision:48,web_upload:{enabled:true,phase:'unknown',reason:'상태 확인 필요'}};window.controller.update(window.props());});
+  assert.equal(await button.textContent(), "업로드 상태 확인");
+  await button.click();
+  assert.equal(await page.evaluate(()=>window.commands.at(-1).check_only), true);
+  await page.evaluate(()=>{window.state={...window.state,revision:49,web_upload:{enabled:true,phase:'absent',reason:'완료된 업로드 기록을 찾지 못했습니다.'}};window.controller.update(window.props());});
+  assert.equal(await button.textContent(), "다시 업로드");
   await page.evaluate(()=>{window.state={...window.state,revision:50,web_upload:{enabled:false,phase:'complete',reason:'웹 업로드 완료'}};window.controller.update(window.props());});
   assert.equal(await button.isDisabled(),true);
   assert.match(await button.textContent(),/완료/);
@@ -130,25 +138,46 @@ try {
   assert.equal(selection.project_id, "katuri8");
   assert.equal(selection.state.source.path, manual.source.path);
   assert.equal(await button.isDisabled(), true, "Destination change requires fresh server readiness");
-  await page.evaluate((manual) => { window.state = { ...manual, revision: 120, project_id: 'katuri8', manual_project: { id: 'katuri8', name: '까투리8' } }; window.controller.update(window.props()); }, manual);
-  assert.equal(await button.isEnabled(), true);
-  await button.click();
-  assert.equal(await page.evaluate(() => window.commands.filter(c => c.action === 'upload_web').length), 2);
+  await page.evaluate((manual) => { window.state = { ...manual, revision: 120, project_id: 'katuri8', manual_project: { id: 'katuri8', name: '까투리8' }, manual_episode: '' }; window.controller.update(window.props()); }, manual);
+  assert.equal(await button.isVisible(), false);
+  assert.equal(await outputButton.isVisible(), false);
   await page.evaluate(() => {
     window.state = { ...window.state, revision: 126, upload_episodes: ['e201', 'e203'] };
     window.controller.update(window.props());
   });
   const episode = page.locator('[data-episode]');
   assert.equal(await episode.isEnabled(), true);
-  assert.deepEqual(await page.locator('[data-episodes] option').evaluateAll(rows => rows.map(row => row.value)), ['e201','e203']);
-  const widths = await page.locator('.cl-project > label').evaluateAll(rows => rows.map(row => row.getBoundingClientRect().width));
-  assert.ok(Math.abs(widths[1] - widths[2]) < 2 && Math.abs(widths[0] - 2 * widths[1]) < 2);
-  await episode.fill('E204');
-  await episode.press('Tab');
+  assert.deepEqual(await episode.locator('option').evaluateAll(rows => rows.slice(1).map(row => row.value)), ['e201','e203']);
+  await episode.selectOption('e203');
+  assert.equal(await page.evaluate(() => window.commands.findLast(c => c.action === 'select_upload_episode')?.episode), 'e203');
+  await page.evaluate(() => {
+    window.state = { ...window.state, revision: 128, manual_episode: 'e203' };
+    window.controller.update(window.props());
+  });
+  assert.equal(await episode.inputValue(), 'e203');
+  assert.equal(await button.isVisible(), true);
+  assert.equal(await outputButton.isVisible(), true);
+  await button.click();
+  assert.equal(await page.evaluate(() => window.commands.filter(c => c.action === 'upload_web' && !c.check_only).length), 2);
+  assert.equal(await episode.evaluate(el => el.tagName), 'SELECT');
+  assert.equal(await page.locator('[data-episode-choice], [data-profile-name], [data-apply-profile], [data-action="save_profile"], [data-action="delete_profile"]').count(), 0);
+  const layout = await page.locator('.cl-project').evaluate(panel => {
+    const project = panel.querySelector('[data-project]').getBoundingClientRect();
+    const episode = panel.querySelector('[data-episode]').getBoundingClientRect();
+    return { projectWidth: project.width, episodeWidth: episode.width, sameRow: Math.abs(project.top - episode.top) < 2 && project.right < episode.left };
+  });
+  assert.ok(Math.abs(layout.projectWidth - layout.episodeWidth) < 2 && layout.sameRow);
+  assert.ok(layout.episodeWidth >= 110);
+  await page.evaluate(() => {
+    window.state = { ...window.state, revision: 129, upload_episodes: ['e201'], upload_episodes_status: 'partial' };
+    window.controller.update(window.props());
+  });
+  assert.equal(await episode.inputValue(), 'e203', "An incomplete list preserves a saved episode");
+  await episode.selectOption('e201');
   assert.deepEqual(await page.evaluate(() => {
     const {action, project_id, episode} = window.commands.findLast(c => c.action === 'select_upload_episode');
     return {action, project_id, episode};
-  }), {action:'select_upload_episode', project_id:'katuri8', episode:'e204'});
+  }), {action:'select_upload_episode', project_id:'katuri8', episode:'e201'});
   await page.evaluate((mybox) => { window.state = { ...mybox, revision: 130 }; window.controller.update(window.props()); }, mybox);
   assert.equal(await page.locator('[data-project]').inputValue(), 'my-box');
   assert.equal(await episode.isDisabled(), true);

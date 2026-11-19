@@ -140,7 +140,8 @@ with tempfile.TemporaryDirectory(prefix='hmb-native-geometry-') as folder:
     fresh=engine.node_manager.get_node_by_name(created.node_name)
     assert fresh.metadata[key]['status']=='pending' and fresh.metadata[key]['width']==1225 and fresh.metadata[key]['height']==1057
     assert 'hmb_color_lut_native_factory_request' not in fresh.metadata
-    assert fresh.get_parameter_by_name(lut.UI).ui_options['height']==1000
+    assert fresh.get_parameter_by_name(lut.UI).ui_options['width']==1120
+    assert fresh.get_parameter_by_name(lut.UI).ui_options['height']==900
     custom={'size':{'width':1370,'height':1175},'position':{'x':12,'y':34}}
     restored=lut.HMBColorLUTLibrary(name='Custom',metadata=copy.deepcopy(custom))
     assert restored.metadata==custom
@@ -153,7 +154,7 @@ with tempfile.TemporaryDirectory(prefix='hmb-native-geometry-') as folder:
     kept=lut.HMBColorLUTLibrary(name='Applied',metadata=copy.deepcopy(applied))
     assert kept.metadata==applied
     for node in (stock,fresh,restored,reopened,kept):node.after_node_deleted()
-    print(json.dumps({'sdk':'PASS','checks':13,'native_CreateNodeRequest':True,'stock_default':[1220,1160],'stock_widget':[1180,1000],'target':[1225,1057]}))
+    print(json.dumps({'sdk':'PASS','checks':14,'native_CreateNodeRequest':True,'stock_default':[1220,1160],'stock_widget':[1120,900],'target':[1225,1057]}))
 `;
 const child=spawnSync(sdk,['-B','-c',python,root],{cwd:root,encoding:'utf8',timeout:60000,maxBuffer:1024*1024});
 assert.equal(child.status,0,child.stderr||child.stdout);

@@ -110,12 +110,12 @@ function harness(kind = "publication", initial = state()) {
   const issue = () => {
     const before = requests.length;
     if (kind === "publication") input(4, true);
-    else q('[data-action="save_profile"]').dispatch("click");
+    else q('[data-action="browse_video"]').dispatch("click");
     assert.equal(requests.length, before + 1, "Each input release/command must capture one request.");
     const request = requests.at(-1);
     assert.equal(Boolean(request.command), kind !== "publication");
     if (request.command) {
-      assert.equal(request.command.action, "save_profile");
+      assert.equal(request.command.action, "browse_video");
       assert.equal(request.command.state.project_id, request.captured.project_id);
     }
     return request;
@@ -229,7 +229,7 @@ for (const kind of ["publication", "command", "command-fallback"]) {
   });
   await check(`${kind}: newer command owns pending/error status`, async () => {
     const ui = harness(kind), old = ui.issue();
-    ui.q('[data-action="save_profile"]').dispatch("click");
+    ui.q('[data-action="browse_video"]').dispatch("click");
     const newer = ui.requests.at(-1); assert.notEqual(newer, old); assert.ok(newer.command);
     newer.reject(new Error("current newer command failed")); await settle();
     assert.match(ui.snapshot().status, /current newer command failed/);
@@ -278,21 +278,21 @@ for (const kind of ["publication", "command", "command-fallback"]) {
     const ui = harness(kind), accepted = state({ revision: 100, status: { phase: "idle", message: "Reentrant callback accepted current context" } });
     const reentrant = () => { ui.update(accepted); return Promise.resolve(); };
     ui.controller.update({ value: state(), onChange: reentrant, ...(kind === "command" ? { onCommand: reentrant } : {}) });
-    if (kind === "publication") ui.input(4, true); else ui.q('[data-action="save_profile"]').dispatch("click");
+    if (kind === "publication") ui.input(4, true); else ui.q('[data-action="browse_video"]').dispatch("click");
     await settle(); assert.equal(ui.snapshot().status, accepted.status.message); ui.controller.cleanup();
   });
   await check(`${kind}: synchronous current exception remains visible`, async () => {
     const ui = harness(kind);
     const onFailure = () => { throw new Error(`current synchronous ${kind} failure`); };
     ui.controller.update({ value: state(), onChange: onFailure, ...(kind === "command" ? { onCommand: onFailure } : {}) });
-    if (kind === "publication") ui.input(4, true); else ui.q('[data-action="save_profile"]').dispatch("click");
+    if (kind === "publication") ui.input(4, true); else ui.q('[data-action="browse_video"]').dispatch("click");
     assert.match(ui.snapshot().status, new RegExp(`current synchronous ${kind} failure`)); ui.controller.cleanup();
   });
   await check(`${kind}: synchronous reentrant authoritative update owns status`, async () => {
     const ui = harness(kind), accepted = state({ revision: 100, status: { phase: "idle", message: "Reentrant accepted host state" } });
     const reentrant = () => { ui.update(accepted); throw new Error(`obsolete synchronous ${kind} failure`); };
     ui.controller.update({ value: state(), onChange: reentrant, ...(kind === "command" ? { onCommand: reentrant } : {}) });
-    if (kind === "publication") ui.input(4, true); else ui.q('[data-action="save_profile"]').dispatch("click");
+    if (kind === "publication") ui.input(4, true); else ui.q('[data-action="browse_video"]').dispatch("click");
     assert.equal(ui.snapshot().status, accepted.status.message); ui.controller.cleanup();
   });
 }

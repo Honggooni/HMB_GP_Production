@@ -323,7 +323,7 @@ class ColorLUTUploadRegression(unittest.TestCase):
                 with self.subTest(error=type(error).__name__, code=getattr(error, "code", None)):
                     reason = target._unknown_upload_reason(error)
                     self.assertIn(expected, reason)
-                    self.assertIn("새 업로드 없이 조회", reason)
+                    self.assertIn("상태 확인은 파일을 전송하지 않습니다", reason)
                     self.assertNotIn("secret", reason)
 
     def test_confirmed_absent_allows_only_next_click_retry_with_frozen_metadata(self):
@@ -340,7 +340,7 @@ class ColorLUTUploadRegression(unittest.TestCase):
         with mock.patch.object(self.node, "_upload_request", side_effect=Absent()) as request:
             click("check-existing")
             self.assertTrue(request.call_args.kwargs["retrieve"])
-        self.assertEqual(self.node._web_upload["phase"], "ready")
+        self.assertEqual(self.node._web_upload["phase"], "absent")
         with mock.patch.object(self.node, "_upload_request", side_effect=lambda context, **_kw: self.acknowledgement(context)) as request:
             click("explicit-retry")
             self.assertFalse(request.call_args.kwargs["retrieve"])
