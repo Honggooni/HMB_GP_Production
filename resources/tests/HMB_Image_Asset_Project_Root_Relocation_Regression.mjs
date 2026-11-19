@@ -541,13 +541,16 @@ if (!playwright || !fs.existsSync(executablePath)) {
       }, native);
       const caseName = `cached-completion-before-old-ack-${native.label}`;
       const failedViews = timeline.filter((view) => view.canonical_asset_count !== native.final.assets.length
-        || view.grid_card_count !== native.final.assets.length || !view.root_retained);
+        || view.grid_card_count !== 0 || !view.root_retained);
       if (failedViews.length) dropdownFailures.push({ case: caseName, failures: failedViews });
       if (!(native.final.scan_revision > native.ack.scan_revision)) dropdownFailures.push({
         case: `${caseName}-completion-clock`, failures: [{ ack_scan_revision: native.ack.scan_revision, final_scan_revision: native.final.scan_revision }],
       });
       checkDropdown(caseName, timeline, native.final.project_root, native.final.project_id);
       assert.equal(new Set(timeline.map((view) => view.mount_token)).size, 1, 'Late ACK must not replace the widget mount.');
+      await page.locator('#widget [data-folder-key][data-source-view="project"][data-folder-path=""]').first().click();
+      assert.equal(await page.locator('#widget .asset-card').count(), Math.min(80, native.final.assets.length),
+        'Explicitly opening the root must display the completed project catalog after a late ACK.');
       evidence.cases.push({ case: caseName, timeline, completion_clock_advanced: native.final.scan_revision > native.ack.scan_revision });
     }
 
