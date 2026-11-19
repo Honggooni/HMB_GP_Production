@@ -33,6 +33,10 @@ class FirstPaintRegression(unittest.TestCase):
         # Catalog scanning permits unsupported image bytes but never claims
         # them as decoded. The thumbnail decoder is supplied below explicitly.
         self.image.write_bytes(b"original bounded image fixture")
+        # NTFS directory enumeration can briefly report the parent timestamp
+        # from before Hero.png was created. Establish the fixture's final
+        # directory write time before capturing the baseline scan.
+        os.utime(self.image.parent, (1_700_000_000, 1_700_000_000))
         metadata = self.project / ".json"
         metadata.mkdir()
         self.manifest = metadata / "hmb_image_assets.json"
