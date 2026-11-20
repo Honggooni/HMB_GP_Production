@@ -355,8 +355,15 @@ def _scan(job, scene_path):
 
 
 def _catalog(job):
-    path = Path(_clean(job.get("marker_catalog_path"))) if job.get("marker_catalog_path") else Path(__file__).resolve().parents[1] / "picker" / "HMB_Marker_Catalog.json"
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    if "marker_catalog_snapshot" in job:
+        payload = job["marker_catalog_snapshot"]
+        if (not isinstance(payload, dict) or payload.get("schema") != "hmb-marker-catalog"
+                or payload.get("version") != job.get("marker_catalog_version")
+                or not isinstance(payload.get("character"), list) or not isinstance(payload.get("background"), list)):
+            raise ValueError("Invalid Blender job marker catalog snapshot.")
+    else:
+        path = Path(_clean(job.get("marker_catalog_path"))) if job.get("marker_catalog_path") else Path(__file__).resolve().parents[1] / "picker" / "HMB_Marker_Catalog.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
     markers = {}
     for row in list(payload.get("character", [])) + list(payload.get("background", [])):
         if isinstance(row, dict) and row.get("name"):

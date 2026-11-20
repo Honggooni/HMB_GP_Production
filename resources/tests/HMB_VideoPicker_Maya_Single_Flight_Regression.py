@@ -75,6 +75,8 @@ with tempfile.TemporaryDirectory(prefix='hmb_maya_single_flight_') as temporary:
     class Process:
         def __init__(self, _command, *, env, **_kwargs):
             self.job = picker._read_json(Path(env['HMB_VIDEO_PICKER_JOB']))
+            assert self.job["marker_catalog_snapshot"]["version"] == self.job["marker_catalog_version"]
+            assert self.job["marker_catalog_snapshot"]["character"] == picker.MARKER_CATALOG["character"]
             self.pid = 4000000 + len(processes)
             self.release, self.killed = release, False
             self.return_code = None
@@ -101,6 +103,9 @@ with tempfile.TemporaryDirectory(prefix='hmb_maya_single_flight_') as temporary:
             result_path=str(folder/'capture.result.json'), progress_path=str(folder/'capture.progress.json'),
             bindings=[{'root':'|Hero', 'marker_name':'Yellow'}], depth_range_bindings=[{'root':'|Hero'}],
             hidden_paths=['|Hidden'], depth_range_mode='close', depth_profile=picker.DEPTH_PLAYBLAST_PROFILE)
+        # A captured job survives a library update even if the shared palette path disappears.
+        job.update(picker._job_marker_catalog_fields())
+        job["marker_catalog_path"] = str(root / "removed-install" / "markers.json")
         return job, folder
 
     errors, values = {}, {}
@@ -122,6 +127,11 @@ with tempfile.TemporaryDirectory(prefix='hmb_maya_single_flight_') as temporary:
         key_a, proof = picker._maya_capture_identity(job_a, ['fixture-mayabatch'], folder_a, state)
         key_b, _ = picker._maya_capture_identity(job_b, ['fixture-mayabatch'], folder_b, state)
         assert proof['complete'] and key_a == key_b
+        recolored = copy.deepcopy(job_a)
+        recolored["marker_catalog_snapshot"]["character"][0]["rgb"] = [0.7, 0.2, 0.1]
+        different_key, different_proof = picker._maya_capture_identity(recolored, ['fixture-mayabatch'], folder_a, state)
+        assert different_key != key_a and different_proof["markers"] != proof["markers"]
+        assert picker._job_marker_catalog_fields()["marker_catalog_snapshot"] == job_b["marker_catalog_snapshot"]
         # Every capture-affecting pass/binding/depth/visibility setting changes
         # identity; different owner output folders do not.
         for field, value in [('capture_pass','depth'),('camera','|other'),('start_frame',102),

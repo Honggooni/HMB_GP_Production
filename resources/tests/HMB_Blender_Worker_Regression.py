@@ -16,6 +16,8 @@ from PIL import Image, ImageStat
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = ROOT / "resources" / "blender" / "HMB_Blender_Background_Preview.py"
+CATALOG = ROOT / "resources" / "picker" / "HMB_Marker_Catalog.json"
+V5_CATALOG = Path(__file__).parent / "fixtures" / "marker_catalog_v5.json"
 DEFAULT_BLENDER = Path(r"C:\Program Files\Blender Foundation\Blender 5.2\blender.exe")
 
 
@@ -351,7 +353,9 @@ class BlenderWorkerRegression(unittest.TestCase):
             job, result, process = self._run_job(
                 directory, scene, "render", width=384, height=240,
                 apply_marker_shaders=True,
-                marker_catalog_path=str(ROOT / "resources" / "picker" / "HMB_Marker_Catalog.json"),
+                marker_catalog_version=6,
+                marker_catalog_snapshot=json.loads(CATALOG.read_text(encoding="utf-8")),
+                marker_catalog_path=str(V5_CATALOG),
                 bindings=[
                     {"full_dag_path": "|Cube", "color": "Cyan", "enabled": True},
                     {"full_dag_path": "|PatternSky", "color": "Lavender", "enabled": True},
@@ -436,6 +440,36 @@ class BlenderWorkerRegression(unittest.TestCase):
                 # cyan Pattern ID and from one another in the mixed pass.
                 self.assertGreater(sum(max(abs(channel - expected) for channel, expected in zip(pixel, (0, 217, 217))) <= 2 for pixel in pixels), 100)
                 self.assertGreater(sum(max(abs(channel - expected) for channel, expected in zip(pixel, (184, 166, 217))) <= 2 for pixel in pixels), 100)
+
+    def test_job_palette_snapshot_survives_missing_file_and_rejects_mismatch(self):
+        with tempfile.TemporaryDirectory(prefix="hmb-blender-job-palette-") as temporary:
+            directory = Path(temporary)
+            scene = self._make_scene(directory)
+            snapshot = json.loads(CATALOG.read_text(encoding="utf-8"))
+            fields = {
+                "marker_catalog_snapshot": snapshot, "apply_marker_shaders": True,
+                "bindings": [{"full_dag_path": "|Cube", "color": "Teal"}], "end_frame": 1,
+            }
+            job, result, process = self._run_job(
+                directory, scene, "snapshot", marker_catalog_version=6,
+                marker_catalog_path=str(directory / "removed.json"), **fields,
+            )
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            self.assertTrue(result["ok"], result.get("error"))
+            sidecar = json.loads(Path(job["sidecar_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(sidecar["marker_catalog_version"], 6)
+            self.assertEqual(sidecar["markers"][0]["rgb"], [0, 128 / 255, 128 / 255])
+            self.assertEqual(len(list(Path(job["frames_folder"]).glob("*.png"))), 1)
+
+            job, result, process = self._run_job(
+                directory, scene, "render", marker_catalog_version=5,
+                marker_catalog_path=str(V5_CATALOG), **fields,
+            )
+            self.assertNotEqual(process.returncode, 0)
+            self.assertFalse(result["ok"])
+            self.assertIn("marker catalog snapshot", result["error"])
+            self.assertFalse(Path(job["sidecar_path"]).exists())
+            self.assertFalse(list(Path(job["frames_folder"]).glob("*.png")))
 
     def test_scripted_driver_is_reported_and_render_fails_closed(self):
         with tempfile.TemporaryDirectory(prefix="hmb-blender-driver-") as temporary:

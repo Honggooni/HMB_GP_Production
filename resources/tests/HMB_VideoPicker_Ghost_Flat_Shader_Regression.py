@@ -7,6 +7,9 @@ import json
 import sys
 import types
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import TestCase
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -201,4 +204,55 @@ for version, historical_size in ((4, 7), (5, 8)):
         if row["kind"] == "solid":
             assert runner.MARKER_COLORS[row["name"]] == tuple(row["rgb"])
 
-print("HMB VideoPicker Ghost flat shader: PASS (5 exact Ghost colors, 10 Actors, archived v4/v5 jobs, Pattern ID separation, alpha cutout, repeat color, recolor and hidden-object isolation)")
+# Older retained engines wrote the then-current version into the job but used
+# the mutable installed palette path. Exercise those actual version pairs.
+paths = {version: Path(__file__).with_name('fixtures') / f'marker_catalog_v{version}.json'
+         for version in (4, 5)}
+paths[6] = catalog_path
+for expected, installed in ((4, 5), (4, 6), (5, 6)):
+    original = json.loads(paths[expected].read_text(encoding='utf-8'))
+    active = runner._load_marker_catalog({'marker_catalog_version': expected, 'marker_catalog_path': str(paths[installed])})
+    for group in ('character', 'background'):
+        definitions = {row['name']: row for row in active[group]}
+        for row in original[group]:
+            assert definitions[row['name']] == row
+            if row['kind'] == 'solid':
+                assert runner.MARKER_COLORS[row['name']] == tuple(row['rgb'])
+            else:
+                assert runner.MARKER_PATTERNS[row['name']] == row['pattern']
+                assert runner.MARKER_PATTERN_IDS[row['name']] == tuple(row['screen_space_id_rgb'])
+    assert active['version'] == installed
+    if installed == 6:
+        assert {'Teal','Brown','Olive'}.issubset(runner.MARKER_COLORS)
+
+with TemporaryDirectory() as scratch:
+    tested = TestCase()
+    for expected, installed in ((6, 5), (5, 4), (7, 6)):
+        with tested.assertRaisesRegex(RuntimeError, f'expected {expected}, got {installed}'):
+            runner._load_marker_catalog({'marker_catalog_version': expected, 'marker_catalog_path': str(paths[installed])})
+    for group, name, field, replacement in (
+        ('character', 'Red', 'rgb', [0.5, 0.1, 0.0]),
+        ('background', 'Sky Grid', 'screen_space_id_rgb', [0, 254, 255]),
+    ):
+        changed = copy.deepcopy(catalog)
+        next(row for row in changed[group] if row['name'] == name)[field] = replacement
+        changed_path = Path(scratch) / 'changed.json'
+        changed_path.write_text(json.dumps(changed), encoding='utf-8')
+        with tested.assertRaisesRegex(RuntimeError, 'expected 5, got 6'):
+            runner._load_marker_catalog({'marker_catalog_version': 5, 'marker_catalog_path': str(changed_path)})
+
+    pinned_job = {'marker_catalog_version': 5, 'marker_catalog_snapshot': json.loads(paths[5].read_text(encoding='utf-8'))}
+    with patch.object(runner, '_read_json', side_effect=AssertionError('Pinned jobs must not open the live palette')):
+        for disk_path in (str(changed_path), str(Path(scratch) / 'missing.json')):
+            loaded = runner._load_marker_catalog(dict(pinned_job, marker_catalog_path=disk_path))
+            assert loaded['version'] == 5 and 'Teal' not in runner.MARKER_COLORS
+        for invalid in (None, [], {}, dict(pinned_job['marker_catalog_snapshot'], version=6),
+                        dict(pinned_job['marker_catalog_snapshot'], version=5.1)):
+            with tested.assertRaises(RuntimeError):
+                runner._load_marker_catalog(dict(pinned_job, marker_catalog_snapshot=invalid, marker_catalog_path=str(paths[5])))
+        invalid_rgb = copy.deepcopy(pinned_job)
+        invalid_rgb['marker_catalog_snapshot']['character'][0]['rgb'] = [1, 0, 1.5]
+        with tested.assertRaisesRegex(RuntimeError, 'invalid RGB'):
+            runner._load_marker_catalog(invalid_rgb)
+
+print("HMB VideoPicker Ghost flat shader: PASS (exact colors and shader assignment, archived and mixed v4/v5/v6 jobs, changed RGB/IDs and downgrades rejected)")

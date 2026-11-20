@@ -220,26 +220,65 @@ def _validate_job_write_paths(job_path, job):
             _assert_private_job_path(job_root, value, field)
 
 
+# Jobs created before catalogs were embedded in the job payload refer to the
+# installed catalog by path. These releases only added markers. Pin the actual
+# published definitions (names, categories, RGB and pattern IDs) before using a
+# newer file for such a job; a version number alone cannot prove compatibility.
+_ADDITIVE_MARKER_CATALOGS = {
+    5: ((4,), "1662a64f8bcbdc227cf36cdd9e482d552cb00a4ad6504f93253708b85e1ec9d0"),
+    6: ((4, 5), "e082360224b0a9c8175e7dcdbfc72db2285cd6d0cd48890e0bd770e26da97aa5"),
+}
+
+
+def _marker_catalog_compatible_with_job(expected_version, payload):
+    actual_version = int(payload.get("version") or 0)
+    if not expected_version or actual_version == expected_version:
+        return True
+    supported, fingerprint = _ADDITIVE_MARKER_CATALOGS.get(actual_version, ((), ""))
+    if expected_version not in supported:
+        return False
+    definitions = {}
+    for group in ("character", "background"):
+        rows = payload.get(group)
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            return False
+        definitions[group] = sorted(rows, key=lambda row: _clean(row.get("name")))
+    encoded = json.dumps(definitions, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest() == fingerprint
+
+
 def _load_marker_catalog(job):
     global MARKER_CATALOG, MARKER_COLORS, MARKER_PATTERNS, MARKER_OPTIONS
     global MARKER_PATTERN_IDS
     global CHARACTER_MARKERS, BACKGROUND_MARKERS, REPEATABLE_MARKERS
-    path = os.path.abspath(_clean((job or {}).get("marker_catalog_path")))
-    if not path or not os.path.isfile(path):
-        raise RuntimeError("HMB marker catalog was not found: {0}".format(path or "<empty>"))
-    payload = _read_json(path)
+    job = job or {}
+    pinned = "marker_catalog_snapshot" in job
+    if pinned:
+        payload = job["marker_catalog_snapshot"]
+        if (not isinstance(payload, dict) or type(payload.get("version")) is not int
+                or type(job.get("marker_catalog_version")) is not int):
+            raise RuntimeError("Invalid HMB marker catalog snapshot.")
+    else:
+        path = os.path.abspath(_clean(job.get("marker_catalog_path")))
+        if not path or not os.path.isfile(path):
+            raise RuntimeError("HMB marker catalog was not found: {0}".format(path or "<empty>"))
+        payload = _read_json(path)
     if payload.get("schema") != "hmb-marker-catalog":
         raise RuntimeError("Invalid HMB marker catalog schema.")
-    expected_version = int((job or {}).get("marker_catalog_version") or 0)
+    expected_version = int(job.get("marker_catalog_version") or 0)
     actual_version = int(payload.get("version") or 0)
-    if expected_version and actual_version != expected_version:
+    if ((pinned and (actual_version <= 0 or expected_version != actual_version))
+            or (not pinned and not _marker_catalog_compatible_with_job(expected_version, payload))):
         raise RuntimeError(
             "HMB marker catalog version mismatch: expected {0}, got {1}.".format(
                 expected_version, actual_version
             )
         )
-    character_rows = [dict(item) for item in payload.get("character", []) if isinstance(item, dict)]
-    background_rows = [dict(item) for item in payload.get("background", []) if isinstance(item, dict)]
+    character_rows = payload.get("character")
+    background_rows = payload.get("background")
+    if not all(isinstance(group, list) and all(isinstance(row, dict) for row in group)
+               for group in (character_rows, background_rows)):
+        raise RuntimeError("Invalid HMB marker catalog palette rows.")
     rows = character_rows + background_rows
     actor_count = len(character_rows)
     object_count = len(background_rows)
@@ -256,7 +295,9 @@ def _load_marker_catalog(job):
         kind = _clean(item.get("kind")).lower()
         if kind == "solid":
             rgb = item.get("rgb")
-            if not isinstance(rgb, list) or len(rgb) != 3:
+            if (not isinstance(rgb, list) or len(rgb) != 3 or any(
+                    isinstance(channel, bool) or not isinstance(channel, (int, float))
+                    or not 0.0 <= channel <= 1.0 for channel in rgb)):
                 raise RuntimeError("Solid marker has invalid RGB data: {0}".format(name))
             colors[name] = tuple(float(channel) for channel in rgb)
         elif kind == "pattern":
@@ -289,6 +330,8 @@ def _load_marker_catalog(job):
             pattern_ids[name] = id_rgb
         else:
             raise RuntimeError("Marker has unsupported kind: {0}".format(name))
+    if any(_clean(item.get("name")) not in colors for item in character_rows):
+        raise RuntimeError("All Actor markers must be solid Lambert colors.")
     MARKER_CATALOG = payload
     MARKER_COLORS = colors
     MARKER_PATTERNS = patterns
@@ -299,8 +342,6 @@ def _load_marker_catalog(job):
     # A marker describes appearance, not object identity. Separate objects may
     # intentionally share one color; their DAG paths/asset IDs stay distinct.
     REPEATABLE_MARKERS = set(MARKER_OPTIONS)
-    if any(name not in MARKER_COLORS for name in CHARACTER_MARKERS):
-        raise RuntimeError("All Actor markers must be solid Lambert colors.")
     return payload
 
 

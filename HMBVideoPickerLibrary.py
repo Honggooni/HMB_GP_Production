@@ -810,6 +810,16 @@ def _clean_catalog_name(value: Any) -> str:
 
 
 MARKER_CATALOG = _load_marker_catalog()
+
+
+def _job_marker_catalog_fields() -> Dict[str, Any]:
+    """Freeze the palette used to author this job before handing it to a DCC."""
+    snapshot = {key: copy.deepcopy(MARKER_CATALOG[key])
+                for key in ("schema", "version", "character", "background")}
+    return {"marker_catalog_snapshot": snapshot, "marker_catalog_version": snapshot["version"],
+            "marker_catalog_path": str(MARKER_CATALOG_PATH)}
+
+
 MARKER_ORDER = list(MARKER_CATALOG["options"])
 ACTOR_MARKERS = frozenset(
     _clean_catalog_name(item.get("name"))
@@ -12455,10 +12465,13 @@ def _maya_capture_identity(job: Dict[str, Any], command: Sequence[str],
     environment = {key: os.environ.get(key, "") for key in (
         "MAYA_VP2_DEVICE_OVERRIDE", "HMB_MAYA_VP2_DEVICE_OVERRIDE", "MAYA_MODULE_PATH",
         "MAYA_PLUG_IN_PATH", "MAYA_SCRIPT_PATH", "OCIO", "MAYA_LOCATION")}
+    snapshot = job.get("marker_catalog_snapshot")
+    marker_bytes = (json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+                    if snapshot is not None else Path(job.get("marker_catalog_path") or MARKER_CATALOG_PATH).read_bytes())
     proof = {"scene": scene_fingerprint, "dependencies": dependencies.get("fingerprint", ""),
              "complete": bool(dependencies.get("complete")) and current_manifest and not dependencies.get("scan_truncated", False),
              "runner": hashlib.sha256(MAYA_RUNNER.read_bytes()).hexdigest(),
-             "markers": hashlib.sha256(MARKER_CATALOG_PATH.read_bytes()).hexdigest(),
+             "markers": hashlib.sha256(marker_bytes).hexdigest(),
              "executable": _scene_fingerprint(command[0]), "environment": environment}
     payload = {
         "schema": "hmb-maya-capture-flight-v1",
@@ -23345,8 +23358,7 @@ class HMBVideoPickerLibrary(DataNode):
             "world_pattern_density_multiplier": WORLD_PATTERN_DENSITY_MULTIPLIER,
             "screen_space_patterns": False,
             "expected_maya_major": maya_version if maya_version.isdigit() else "",
-            "marker_catalog_path": str(MARKER_CATALOG_PATH),
-            "marker_catalog_version": int(MARKER_CATALOG["version"]),
+            **_job_marker_catalog_fields(),
             "video_slot": binding_slot, "bindings": bindings,
             "hidden_paths": self._selected_slot_hidden_paths(state, binding_slot) if role != "original" else [],
             "hidden_mesh_identities": _picker_hidden_mesh_identities(state) if role != "original" else [],
@@ -24203,8 +24215,7 @@ class HMBVideoPickerLibrary(DataNode):
             "video_codec": "H.264",
             "ffmpeg_encoder": "libx264",
             "output_fps": OUTPUT_FPS,
-            "marker_catalog_path": str(MARKER_CATALOG_PATH),
-            "marker_catalog_version": int(MARKER_CATALOG["version"]),
+            **_job_marker_catalog_fields(),
             "video_slot": video_slot,
             "bindings": job_bindings,
             "hidden_paths": self._selected_slot_hidden_paths(
@@ -25760,7 +25771,7 @@ class HMBVideoPickerLibrary(DataNode):
         result, job, folder, log_path = self._blender_execute_job(scene_path, "snapshot", {
             "camera": camera, "width": width, "height": height,
             "start_frame": frame, "end_frame": frame, "fps": fps,
-            "apply_marker_shaders": True, "marker_catalog_path": str(MARKER_CATALOG_PATH),
+            "apply_marker_shaders": True, **_job_marker_catalog_fields(),
             "bindings": bindings, "hidden_paths": self._selected_slot_hidden_paths(state, PRIMARY_COLOR_VIDEO_SLOT),
             "video_slot": PRIMARY_COLOR_VIDEO_SLOT,
         }, context)
@@ -25855,7 +25866,7 @@ class HMBVideoPickerLibrary(DataNode):
             "camera": camera, "width": width, "height": height,
             "start_frame": first, "end_frame": last, "fps": fps,
             "apply_marker_shaders": False,
-            "marker_catalog_path": str(MARKER_CATALOG_PATH),
+            **_job_marker_catalog_fields(),
             "generate_depth_playblast": False, "generate_motion_guide": False,
         }, context)
         pattern, sidecar, _ = self._blender_validate_sequence(
@@ -25954,7 +25965,7 @@ class HMBVideoPickerLibrary(DataNode):
             "capture_pass": ("color" if selected_role == "mask" else selected_role) or "",
             "camera": camera, "width": width, "height": height,
             "start_frame": first, "end_frame": last, "fps": fps,
-            "apply_marker_shaders": True, "marker_catalog_path": str(MARKER_CATALOG_PATH),
+            "apply_marker_shaders": True, **_job_marker_catalog_fields(),
             "bindings": bindings, "hidden_paths": self._selected_slot_hidden_paths(state, mask_slot),
             "video_slot": mask_slot,
             "generate_depth_playblast": depth_requested,
