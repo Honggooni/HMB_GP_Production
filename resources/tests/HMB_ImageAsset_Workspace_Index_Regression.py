@@ -31,9 +31,11 @@ class WorkspaceIndex(unittest.TestCase):
             setting = patch.object(image, key, value)
             setting.start()
             self.addCleanup(setting.stop)
+        catalog = image._discover_shared_image_projects(self.catalog)
+        self.catalog = Path(catalog["catalog_root"])
+        self.project = Path(catalog["projects"][0]["path"])
         state = image._merge_scan_with_state(image._scan_project_assets(self.project), image._default_state())
-        state["catalog_root"] = self.catalog.as_posix()
-        state["projects"] = image._discover_project_catalog(self.catalog)["projects"]
+        state.update(catalog_root=catalog["catalog_root"], projects=catalog["projects"])
         self.state = image._normalize_state(state)
 
     def test_workspace_and_offline_lookup_without_saved_identity(self):
@@ -51,6 +53,7 @@ class WorkspaceIndex(unittest.TestCase):
 
         with patch.object(Path, "stat", reject_share_access), patch.object(image, "_read_asset_manifest", side_effect=AssertionError):
             restored = image._read_local_catalog_snapshot(self.project, source)
+            self.assertIsNotNone(restored)
             self.assertEqual([a["path"] for a in restored["assets"]], [a["path"] for a in self.state["assets"]])
             self.assertEqual(restored["shot_routing"], source["shot_routing"])
             self.assertEqual(image._read_local_project_list(self.catalog), self.state["projects"])
@@ -58,6 +61,38 @@ class WorkspaceIndex(unittest.TestCase):
             self.assertIsNone(image._read_local_catalog_snapshot(other_root, source))
             wrong_id = dict(source, project_cache_uid="hmbpc1:" + "b" * 32)
             self.assertIsNone(image._read_local_catalog_snapshot(self.project, wrong_id))
+
+    @unittest.skipUnless(os.name == "nt", "Windows DOS path spelling")
+    def test_short_catalog_path_reopens_offline_after_verified_discovery(self):
+        # A new node can receive a configured 8.3 path even though discovery
+        # published the long path in the saved project list.
+        import ctypes
+        expanded = self.catalog.parent / "Long project directory name" / "Projects"
+        project = expanded / "Example" / "Ai_Ct_image"
+        project.mkdir(parents=True)
+        (project / "one.png").write_bytes(b"")
+        short = ctypes.create_unicode_buffer(32768)
+        size = ctypes.windll.kernel32.GetShortPathNameW(str(expanded), short, len(short))
+        if not size or size >= len(short) or not image._windows_short_catalog_path(Path(short.value)):
+            self.skipTest("Volume has no 8.3 aliases")
+        requested = Path(short.value)
+        catalog = image._discover_shared_image_projects(requested)
+        state = image._read_selected_image_catalog(catalog, catalog["projects"][0], image._default_state())
+        self.assertEqual(Path(state["catalog_root"]), expanded)
+        original_stat = Path.stat
+        def offline(path, *args, **kwargs):
+            if path.is_relative_to(requested) or path.is_relative_to(expanded):
+                self.fail(f"Offline lookup tried the shared drive: {path}")
+            return original_stat(path, *args, **kwargs)
+        with patch.object(image, "_discover_shared_image_projects", side_effect=OSError("offline")), patch.object(Path, "stat", offline):
+            reopened = image._load_project_catalog(requested, state)
+            self.assertEqual(reopened["assets"], state["assets"])
+            self.assertEqual(reopened["shot_routing"], state["shot_routing"])
+            self.assertEqual(image._read_local_project_list(requested), state["projects"])
+            # An incorrect or corrupted lookup must not leave its drive/path boundary.
+            alias_file = image._catalog_lookup_path("spelling", requested)
+            alias_file.write_text(json.dumps("Z:/another/catalog"), encoding="utf-8")
+            self.assertEqual(image._read_local_project_list(requested), [])
 
     def test_verified_legacy_snapshot_migrates_and_corruption_stays_local(self):
         with patch.object(image, "_ASSET_CATALOG_INDEX_ROOT", self.legacy):

@@ -251,13 +251,25 @@ try:
             def _reconcile_hmb_shot_routing(self, _catalog_identity=""):
                 return None
 
-        selected_root = catalog_root
+        verified_roots = [catalog_root]
+        if os.name == "nt":
+            import ctypes
+
+            short_path = ctypes.create_unicode_buffer(32768)
+            size = ctypes.windll.kernel32.GetShortPathNameW(str(catalog_root), short_path, len(short_path))
+            if 0 < size < len(short_path) and Path(short_path.value) != catalog_root:
+                short_root = Path(short_path.value)
+                assert short_root.samefile(catalog_root)
+                roster = asset_library._discover_shared_image_projects(short_root)
+                assert Path(roster["catalog_root"]) == Path(process_current["catalog_root"])
+                verified_roots.append(short_root)
         with patch.object(asset_library, "_get_parameter_raw", side_effect=lambda _node, name:
                 selected_root if name == asset_library.PROJECT_ROOT_PARAMETER else None), \
                 patch.object(asset_library, "_read_catalog_index", side_effect=AssertionError("Unexpected disk lookup")), \
                 patch.object(asset_library, "_read_asset_manifest", side_effect=AssertionError("Unexpected share read")):
-            asset_library.HMBImageAssetLibrary.process(ProcessRootProbe())
-            assert not process_loads, "Run reloaded a verified session catalog"
+            for selected_root in verified_roots:
+                asset_library.HMBImageAssetLibrary.process(ProcessRootProbe())
+                assert not process_loads, "Run reloaded a verified session catalog"
             # Async root change: the widget carries the new root but still
             # displays the last project's data until the new load completes.
             selected_root = requested_process_root

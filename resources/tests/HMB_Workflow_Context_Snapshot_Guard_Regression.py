@@ -46,6 +46,7 @@ class SnapshotGuardTests(unittest.TestCase):
         self.owner.engine=lambda:self.engine;self.owner.manager=lambda:self.manager
         self.owner._prompt_owner=lambda engine,manager:True
         self.owner.load_requests={};self.owner.snapshot_requests={};self.owner.snapshot_refused_loads={}
+        self.owner.loaded_image_nodes = weakref.WeakSet()
         self.owner.snapshot_post_types=list(serial)
 
     def tearDown(self):
@@ -162,6 +163,23 @@ class SnapshotGuardTests(unittest.TestCase):
         asyncio.run(self.owner.after_workflow_load(request,SimpleNamespace(succeeded=lambda:True)))
         self.assertEqual(self.owner.load_requests,{})
         self.assertEqual(self.migration_calls,["schedule"])
+
+    def test_last_load_restores_only_images_still_registered_to_this_engine(self):
+        restored = []
+        class ImageNode:
+            name = "ImageAsset"
+            def after_deserialize(self):
+                restored.append(self)
+        current, replaced = ImageNode(), ImageNode()
+        self.engine = SimpleNamespace(node_manager=SimpleNamespace(get_node_by_name=lambda name: current))
+        self.owner.loaded_image_nodes.update((current, replaced))
+        first, last = self.tracked_load(), self.tracked_load()
+        success = SimpleNamespace(succeeded=lambda: True)
+        asyncio.run(self.owner.after_workflow_load(first, success))
+        self.assertEqual(restored, [])
+        asyncio.run(self.owner.after_workflow_load(last, success))
+        self.assertEqual(restored, [current])
+        self.assertFalse(self.owner.loaded_image_nodes)
 
 
 if __name__=="__main__":unittest.main(verbosity=2)

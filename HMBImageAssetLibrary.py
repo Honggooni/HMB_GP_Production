@@ -5325,8 +5325,24 @@ def _catalog_read_once(key: tuple, read: Callable[[], Any], *, refresh: bool = F
 
 
 def _discover_shared_image_projects(root: Any, *, refresh: bool = False) -> Dict[str, Any]:
-    return _catalog_read_once(_session_catalog_key("projects", root),
-                              lambda: _discover_project_catalog(root), refresh=refresh)
+    def discover():
+        catalog = _discover_project_catalog(root)
+        requested = Path(_project_root_text(root))
+        if _windows_short_catalog_path(requested):
+            # Remember the spelling actually resolved during the online check.
+            # Offline lookup must not ask the mapped drive to expand an 8.3 name.
+            canonical = Path(catalog["catalog_root"])
+            if not _compatible_catalog_spelling(requested, canonical):
+                canonical = requested
+            try:
+                path = _catalog_lookup_path("spelling", requested)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_local_index_write(path, _json_text(canonical.as_posix()).encode("utf-8"))
+            except OSError as exc:
+                _diagnostic_warning("Local catalog spelling write failed", exc)
+        return catalog
+
+    return _catalog_read_once(_session_catalog_key("projects", root), discover, refresh=refresh)
 
 
 def _read_selected_image_catalog(
@@ -5499,6 +5515,34 @@ def _catalog_lookup_path(kind: str, root: Path) -> Path:
     return Path(_ASSET_CATALOG_INDEX_ROOT) / f"{kind}-{hashlib.sha256(key).hexdigest()}.json"
 
 
+_DOS_SHORT_COMPONENT = re.compile(r"[^.\\/~]{1,6}~[1-9][0-9]*(?:\.[^./\\]{1,3})?", re.IGNORECASE)
+
+
+def _windows_short_catalog_path(path: Path) -> bool:
+    return (os.name == "nt" and "~" in str(path) and path.is_absolute()
+            and any(_DOS_SHORT_COMPONENT.fullmatch(part) for part in path.parts[1:]))
+
+
+def _compatible_catalog_spelling(requested: Path, canonical: Path) -> bool:
+    """Only previously verified component expansions on the same absolute volume."""
+    return (requested.anchor.casefold() == canonical.anchor.casefold()
+            and len(requested.parts) == len(canonical.parts)
+            and ".." not in (*requested.parts, *canonical.parts)
+            and all(a.casefold() == b.casefold() or _DOS_SHORT_COMPONENT.fullmatch(a)
+                    for a, b in zip(requested.parts[1:], canonical.parts[1:])))
+
+
+def _cached_catalog_spelling(requested: Path) -> Path:
+    if _windows_short_catalog_path(requested):
+        try:
+            value = _read_local_index_json(_catalog_lookup_path("spelling", requested), limit=32768)
+            if isinstance(value, str) and _compatible_catalog_spelling(requested, Path(value)):
+                return Path(value)
+        except (OSError, TypeError, ValueError):
+            pass
+    return requested
+
+
 def _read_local_index_json(path: Path, *, limit: int = _ASSET_CATALOG_INDEX_MAX_BYTES) -> Any:
     if _is_reparse_point(path) or path.stat().st_size > limit:
         raise ValueError("Unsafe or oversized local catalog index")
@@ -5529,7 +5573,7 @@ def _atomic_local_index_write(path: Path, payload: bytes) -> None:
 
 
 def _read_local_project_list(catalog_root: Any) -> List[Dict[str, str]]:
-    catalog = Path(_project_root_text(catalog_root))
+    catalog = _cached_catalog_spelling(Path(_project_root_text(catalog_root)))
     if not catalog.is_absolute():
         return []
     try:
@@ -5550,7 +5594,15 @@ def _read_local_project_list(catalog_root: Any) -> List[Dict[str, str]]:
 def _read_local_catalog_snapshot(project_root: Any, previous_state: Dict[str, Any]) -> Dict[str, Any] | None:
     """Show the last verified workstation catalog without touching the shared drive."""
     root = Path(_project_root_text(project_root))
-    catalog = Path(_project_root_text(previous_state.get("catalog_root")))
+    requested = Path(_project_root_text(previous_state.get("catalog_root")))
+    catalog = _cached_catalog_spelling(requested)
+    if requested != catalog:
+        if root.is_relative_to(requested):
+            root = catalog / root.relative_to(requested)
+        saved = Path(_project_root_text(previous_state.get("project_root")))
+        previous_state = {**previous_state, "catalog_root": catalog.as_posix()}
+        if saved.is_relative_to(requested):
+            previous_state["project_root"] = (catalog / saved.relative_to(requested)).as_posix()
     if not root.is_absolute() or not catalog.is_absolute() or not root.is_relative_to(catalog):
         return None
     try:
@@ -5801,15 +5853,23 @@ def _read_catalog_index(
 def _state_catalog_is_current(state: Dict[str, Any], catalog_root: Any = None) -> bool:
     """Compare with the verified session in memory, including its catalog boundary."""
     key = _session_catalog_key("catalog", state.get("project_root"))
+    requested = _session_catalog_key("projects", catalog_root or state.get("catalog_root"))
     with _SHARED_CATALOG_CACHE_LOCK:
         pinned = _CATALOG_READS.get(key)
+        roster = _CATALOG_READS.get(requested)
     if pinned is None or pinned.exception() is not None:
         return False
     facts = pinned.result()
-    return (_session_catalog_key("projects", catalog_root or state.get("catalog_root"))
-            == _session_catalog_key("projects", facts["catalog_root"])
-            and all(state.get(field) == facts.get(field) for field in
-                    ("project_uid", "project_cache_uid", "manifest_signature", "folder_signature")))
+    canonical = _session_catalog_key("projects", facts["catalog_root"])
+    if requested != canonical:
+        # A Windows short path can be expanded during discovery. Only accept
+        # this spelling if discovery already verified its destination in this session.
+        if roster is None or roster.exception() is not None:
+            return False
+        if _session_catalog_key("projects", roster.result()["catalog_root"]) != canonical:
+            return False
+    return all(state.get(field) == facts.get(field) for field in
+               ("project_uid", "project_cache_uid", "manifest_signature", "folder_signature"))
 
 
 def _state_project_belongs_to_catalog(
