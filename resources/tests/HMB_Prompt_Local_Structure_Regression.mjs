@@ -467,6 +467,32 @@ assert.deepEqual(
   "A Picker burst must apply only its newest order after paint.",
 );
 
+const authorEdit = JSON.stringify(widget.normalizeState({
+  source_sync_revision: 8, ui_edit_revision: 12, text: { SCENE_CONTEXT: "newer author edit" },
+}));
+for (const burst of [
+  [sourceGeneration9, sourceGeneration8],
+  [sourceGeneration9, authorEdit, sourceGeneration8],
+  [authorEdit, sourceGeneration8, sourceGeneration9],
+]) {
+  const calls = [];
+  for (const [index,value] of burst.entries()) {
+    widget.hmbSchedulePromptSourcePropsApply(sourcePropsContainer, { value, envelope: index }, props=>calls.push(props));
+    if (index===0) sourceFrames.shift()();
+  }
+  assert.equal(calls.length,0);
+  sourceFrames.shift()();
+  assert.equal(calls.length,1);
+  const result=JSON.parse(calls[0].value);
+  assert.equal(result.source_sync_revision,9);
+  assert.deepEqual(result.picker.ordered_video_uids,JSON.parse(sourceGeneration9).picker.ordered_video_uids);
+  assert.equal(calls[0].envelope,burst.length-1);
+  if (burst.includes(authorEdit)) {
+    assert.equal(result.ui_edit_revision,12);
+    assert.equal(result.text.SCENE_CONTEXT,"newer author edit");
+  }
+}
+
 const crossedDirectContainer = fakeContainer();
 const crossedDirectFrames = [];
 crossedDirectContainer.__hmbPromptLibraryScheduleFrame = (callback) => {
@@ -576,8 +602,8 @@ try {
 }
 assert.match(
   source,
-  /const remount = \(nextState = null, stateIsNormalized = false\) => \{[\s\S]*?hmbCapturePromptControlFocus\(container\);[\s\S]*?hmbRestoreSourceScroll\(container\);[\s\S]*?hmbRestorePromptControlFocus\(container\);/,
-  "Immediate structural remounts must preserve source scrolling and keyboard focus.",
+  /const remount = \(nextState = null, stateIsNormalized = false, replaceEditor = false\) => \{[\s\S]*?if \(!replaceEditor && !container\.__hmbPromptShotSwitchInProgress\) \{[\s\S]*?hmbCapturePromptControlFocus\(container\);[\s\S]*?hmbRestoreSourceScroll\(container, Boolean\(container\.__hmbPromptShotSwitchInProgress\)\);\s*hmbRestorePromptControlFocus\(container\);/,
+  "Local remounts must preserve source scrolling and keyboard focus without capturing focus from a previous publisher.",
 );
 assert.match(
   source,

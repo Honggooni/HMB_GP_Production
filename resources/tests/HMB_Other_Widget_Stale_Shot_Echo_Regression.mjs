@@ -1,3 +1,4 @@
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
@@ -151,7 +152,7 @@ const server = http.createServer((req, res) => {
     res.end(html);
   }
 });
-await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+await listenBrowserSafeLoopback(server);
 let browser;
 try {
   browser = await playwright.chromium.launch({executablePath, headless:true, args:["--use-gl=angle","--use-angle=swiftshader","--enable-unsafe-swiftshader"]});

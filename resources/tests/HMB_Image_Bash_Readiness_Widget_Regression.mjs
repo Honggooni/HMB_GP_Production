@@ -1,4 +1,5 @@
 // Real product header in isolated headless Chromium; no Desktop or live sources.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -25,7 +26,7 @@ window.props=()=>({value:window.state,onChange:value=>window.writes.push(structu
 window.controller=mount(document.getElementById('widget'),window.props());window.header=document.querySelector('[data-hmb-image-bash-header]');
 window.update=patch=>{window.state={...window.state,...patch};window.controller.update(window.props())};window.ready=true;</script>`;
 const server=http.createServer((request,response)=>{response.setHeader('Content-Type',request.url==='/widget.js'?'text/javascript':'text/html');response.end(request.url==='/widget.js'?source:html);});
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+await listenBrowserSafeLoopback(server);
 let browser;
 try{
  browser=await nativeTestPlaywright().chromium.launch({executablePath:nativeTestBrowserPath(),headless:true});

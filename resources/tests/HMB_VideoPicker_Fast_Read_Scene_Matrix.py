@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 
 import HMBVideoPickerLibrary as picker
 from _hmb_maya_smoke_fixture import isolated_maya_environment
+from _hmb_native_test_job import run_native_test
 
 
 MAYA_RUNNER = ROOT / "resources" / "maya" / "HMB_Maya_Background_Preview.py"
@@ -177,7 +178,7 @@ def _run_case(
         env = isolated_maya_environment(case_root, picker._maya_subprocess_environment(job_path))
         creationflags = picker._creation_flags()
         with log_path.open("wb") as log_handle:
-            completed = subprocess.run(
+            completed = run_native_test(
                 command,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
@@ -333,26 +334,27 @@ def main() -> int:
             for index, scene in enumerate(args.scenes, start=1)
         ]
 
-        passed = sum(1 for item in results if item.get("status") == "PASS")
-        failed = len(results) - passed
-        summary = {
-            "schema": "hmb-video-picker-fast-read-scene-matrix",
-            "ok": failed == 0,
-            "mayabatch": str(mayabatch or ""),
-            "maya_version": maya_version,
-            "runner": str(MAYA_RUNNER),
-            "scene_count": len(results),
-            "passed": passed,
-            "failed": failed,
-            "elapsed_seconds": round(time.perf_counter() - matrix_started, 3),
-            "temp_only": True,
-            "results": results,
-        }
-
-        print(_table_text(results))
-        print("\nHMB_FAST_READ_SUMMARY_JSON")
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
-
+    # Publish PASS only after the full test lifecycle, including directory removal.
+    passed = sum(1 for item in results if item.get("status") == "PASS")
+    failed = len(results) - passed
+    temp_removed = not matrix_root.exists()
+    summary = {
+        "schema": "hmb-video-picker-fast-read-scene-matrix",
+        "ok": failed == 0 and temp_removed,
+        "mayabatch": str(mayabatch or ""),
+        "maya_version": maya_version,
+        "runner": str(MAYA_RUNNER),
+        "scene_count": len(results),
+        "passed": passed,
+        "failed": failed,
+        "elapsed_seconds": round(time.perf_counter() - matrix_started, 3),
+        "temp_only": True,
+        "temp_directory_removed": temp_removed,
+        "results": results,
+    }
+    print(_table_text(results))
+    print("\nHMB_FAST_READ_SUMMARY_JSON")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if summary["ok"] else 1
 
 

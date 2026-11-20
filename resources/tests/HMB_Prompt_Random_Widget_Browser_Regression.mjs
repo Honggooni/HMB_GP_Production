@@ -1,4 +1,5 @@
 // Seeded real-Chromium UI diagnostic. No desktop graph, SDK engine or provider.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -19,7 +20,7 @@ const server=http.createServer((req,res)=>{
   if(req.url==='/widget.js'){res.setHeader('Content-Type','text/javascript; charset=utf-8');res.end(source);}
   else{res.setHeader('Content-Type','text/html; charset=utf-8');res.end('<!doctype html><meta charset="utf-8"><div class="react-flow__node" id="shell" style="height:1350px;width:1800px"><div style="height:96px">Synthetic SDK header</div><div id="host"></div></div>');}
 });
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+await listenBrowserSafeLoopback(server);
 const browser=await playwright.chromium.launch({headless:true,executablePath:process.env.HMB_WIDGET_TEST_BROWSER||'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'});
 const receipt={schema:'hmb-prompt-seeded-widget-stress-v1',source_sha256:crypto.createHash('sha256').update(source).digest('hex'),profiles:[],external_requests:0,live_graph_requests:0,paid_submissions:0};
 let failure;

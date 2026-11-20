@@ -355,6 +355,9 @@ def make_node():
         holder['published'].append(deepcopy(holder['state']))
         return holder['state']
     node._publish_state = publish
+    # This fixture has no SDK parameter tree. Capture the committed view at
+    # the widget transport boundary, as we do for the thumbnail bridge below.
+    node._publish_widget_authority_view = mock.Mock()
     node._set_thumbnail_bridge_value = lambda value: holder['responses'].append(deepcopy(value))
     intent = dict(schema=image.THUMBNAIL_BRIDGE_SCHEMA, version=1, operation='cgt_confirm', phase='request',
         request_id=str(uuid4()), session_id=str(uuid4()), runtime_instance_id=node._thumbnail_runtime_id(state),
@@ -389,6 +392,7 @@ for case in ['success', 'cancel', 'deleted', 'locked', 'resolving', 'stale', 'ac
         node._consume_cgt_result()
     if case == 'success':
         assert len(holder['published']) == 1 and holder['state']['shot_hierarchy'] == binding
+        node._publish_widget_authority_view.assert_called_once_with(holder['state'])
         assert holder['responses'][-1]['outcome'] == 'committed'
     elif case == 'publish_failure':
         assert len(holder['published']) == 2 and holder['state'].get('shot_hierarchy', {}) == {}

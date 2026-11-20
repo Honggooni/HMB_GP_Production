@@ -1,5 +1,6 @@
 // Installed React/ReactDOM and product helper; a local synthetic SDK owns all
 // topology and callbacks. No running editor, account, media or provider access.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -78,7 +79,7 @@ const module = runtime + "\n" + jsx + "\n" + (currentHelper
   : helper + "\n" + app);
 const html = '<!doctype html><meta charset="utf-8"><title>Isolated HMB connection manager</title><style>body{background:#172031;color:#eee;font:14px sans-serif}button{cursor:pointer}button:disabled{opacity:.45;cursor:default}.native-menu-item{display:flex;gap:12;padding:9px}.hmb-native-capsule{margin:15px}</style><div id="app"></div><script type="module" src="/fixture.js"></script>';
 const server = http.createServer((req, res) => { res.setHeader("Content-Type", req.url === "/fixture.js" ? "text/javascript" : "text/html"); res.end(req.url === "/fixture.js" ? module : html); });
-await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+await listenBrowserSafeLoopback(server);
 const { chromium } = nativeTestPlaywright();
 let browser, checks = current ? 11 : 5;
 try {

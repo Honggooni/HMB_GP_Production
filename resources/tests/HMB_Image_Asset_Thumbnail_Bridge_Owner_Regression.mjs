@@ -1,13 +1,14 @@
 // Actual Asset/bridge modules; synthetic CGT replies; no SDK, account or live graph calls.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
-import os from 'node:os';
-import path from 'node:path';
-import {createRequire} from 'node:module';
 
-const root=new URL('../../',import.meta.url),require=createRequire(import.meta.url);
-const playwright=require(path.join(os.homedir(),'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'));
+
+import { nativeTestBrowserPath, nativeTestPlaywright } from './_hmb_native_editor_fixture.mjs';
+
+const root=new URL('../../',import.meta.url);
+const playwright=nativeTestPlaywright();
 const sources={
  '/asset.js':fs.readFileSync(new URL('widgets/HMBImageAssetLibraryWidget.js',root),'utf8'),
  '/bridge.js':fs.readFileSync(new URL('widgets/HMBImageAssetThumbnailPatchBridgeWidget.js',root),'utf8'),
@@ -29,9 +30,9 @@ window.send=id=>registry().get(id||runtime).dispatch({schema:'hmb-image-asset-th
 window.ready=true;
 </script>`;
 const server=http.createServer((req,res)=>{res.setHeader('Content-Type',sources[req.url]?'text/javascript':'text/html');res.end(sources[req.url]||html);});
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));let browser,checks=0;
+await listenBrowserSafeLoopback(server);let browser,checks=0;
 try{
- browser=await playwright.chromium.launch({executablePath:'C:/Program Files/Google/Chrome/Application/chrome.exe',headless:true});
+ browser=await playwright.chromium.launch({executablePath:nativeTestBrowserPath(),headless:true});
  const page=await browser.newPage({viewport:{width:1500,height:1100}}),errors=[];page.on('pageerror',error=>errors.push(error.message));
  await page.route('**/*',route=>route.request().url().startsWith('http://127.0.0.1:')?route.continue():route.abort());
  await page.goto('http://127.0.0.1:'+server.address().port);await page.waitForFunction(()=>window.ready);

@@ -791,7 +791,7 @@ assert "emit(props, state);\n          remount();" not in prompt_widget_source
 assert "emit(props, state, container);\n        remount();" not in prompt_widget_source
 assert 'state.ui.language = uiLanguage(state) === "ko" ? "en" : "ko";' in prompt_widget_source
 assert prompt_widget_source.count("remount();") == 1  # Initial mount only.
-assert prompt_widget_source.count("remount(null, !hadUncommittedText);") == 1
+assert prompt_widget_source.count("remount(null, !hadUncommittedText, publisherChanged);") == 1
 assert "hmbCommitLocalPromptStructure(container, props, state, remount)" in prompt_widget_source
 assert "if (currentValue === nextValue && !disabledChanged) {" in prompt_widget_source
 assert "if (dirtyText.length || shouldRepublishRevisionMerge) {" in prompt_widget_source

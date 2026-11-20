@@ -19,6 +19,7 @@ import unittest
 from unittest.mock import patch
 import uuid
 
+from PIL import Image, ImageStat
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -313,14 +314,66 @@ class BlenderScissorsPickerIntegration(unittest.TestCase):
                 })
                 node._write_state(read)
 
-                snapshot = self._call(node, "render_snapshot")
-                self.assertTrue(snapshot["snapshots"])
-                snapshot_item = snapshot["snapshots"][-1]
-                snapshot_path = Path(snapshot_item["path"])
-                self.assertTrue(snapshot_path.is_file())
-                self.assertTrue(snapshot_path.is_relative_to(output_root))
-                self.assertEqual(snapshot_item["sha256"], _sha256(snapshot_path))
-                self.assertEqual(_workspace(snapshot, 1)["active_snapshot_uid"], snapshot_item["snapshot_uid"])
+                # Check the delivered pixels as well as labels. An older widget
+                # path returned the same Mask for every enabled still role.
+                pixel_hashes = {}
+                for bits in range(16):
+                    roles = [r for i, r in enumerate(EXPECTED_ROLES[:3]) if bits & (1 << i)]
+                    with self.subTest(snapshot_roles=roles, motion_guide=bool(bits & 8)):
+                        choices = node._picker_state()
+                        before = {row["snapshot_uid"] for row in choices["snapshots"]}
+                        for i, role in enumerate(EXPECTED_ROLES):
+                            choices[role + "_enabled"] = bool(bits & (1 << i))
+                        node._write_state(choices)
+                        if not roles:
+                            with patch.object(node, "_blender_execute_job") as worker:
+                                with self.assertRaisesRegex((AssertionError, ValueError), "Snapshot requires"):
+                                    self._call(node, "render_snapshot")
+                                worker.assert_not_called()
+                            self.assertEqual({r["snapshot_uid"] for r in node._picker_state()["snapshots"]}, before)
+                            continue
+                        snapshot = self._call(node, "render_snapshot")
+                        rows = [row for row in snapshot["snapshots"] if row["snapshot_uid"] not in before]
+                        self.assertEqual([row["artifact_type"] for row in rows], roles)
+                        self.assertEqual(len({row["snapshot_batch_uid"] for row in rows}), 1)
+                        self.assertEqual(_workspace(snapshot, 1)["active_snapshot_uid"], rows[-1]["snapshot_uid"])
+                        for role, row in zip(roles, rows):
+                            path = Path(row["path"])
+                            self.assertTrue(path.is_relative_to(output_root))
+                            self.assertEqual(row["sha256"], _sha256(path))
+                            with Image.open(path) as frame:
+                                rgb = frame.convert("RGB")
+                                self.assertEqual(rgb.size, (320, 180))
+                                self.assertTrue(any(lo < hi for lo, hi in rgb.getextrema()))
+                                colors = rgb.getcolors(rgb.width * rgb.height)
+                                red_pixels = sum(n for n, (r, g, b) in colors if r - max(g, b) > 35)
+                                if role == "mask":
+                                    self.assertGreater(red_pixels, 100, "Expected a red Scissors_ROOT mask")
+                                elif role == "depth":
+                                    self.assertFalse(any(max(c) - min(c) > 3 for _, c in colors),
+                                                     "Camera-space Depth should be grayscale")
+                                else:
+                                    self.assertEqual(red_pixels, 0, "Original should have neutral shaded geometry")
+                                    self.assertGreater(ImageStat.Stat(rgb.convert("L")).stddev[0], 10)
+                                digest = hashlib.sha256(rgb.tobytes()).digest()
+                            self.assertEqual(pixel_hashes.setdefault(role, digest), digest)
+                self.assertEqual(len(set(pixel_hashes.values())), 3)
+                choices = node._picker_state()
+                existing = {row["snapshot_uid"] for row in choices["snapshots"]}
+                choices.update(slot_assignments=[], original_enabled=True, mask_enabled=True, depth_enabled=False)
+                node._write_state(choices)
+                with self.assertRaisesRegex(AssertionError, "Assign at least one Blender object"):
+                    self._call(node, "render_snapshot")
+                self.assertEqual({r["snapshot_uid"] for r in node._picker_state()["snapshots"]}, existing)
+                choices = node._picker_state()
+                choices.update(original_enabled=True, mask_enabled=False, depth_enabled=True)
+                node._write_state(choices)
+                unbound = self._call(node, "render_snapshot")
+                rows = [r for r in unbound["snapshots"] if r["snapshot_uid"] not in existing]
+                self.assertEqual([r["artifact_type"] for r in rows], ["original", "depth"])
+                with Image.open(rows[0]["path"]) as first, Image.open(rows[1]["path"]) as second:
+                    self.assertEqual(hashlib.sha256(first.convert("RGB").tobytes()).digest(), pixel_hashes["original"])
+                    self.assertNotEqual(first.convert("RGB").tobytes(), second.convert("RGB").tobytes())
 
                 original = self._call(node, "render_original_preview")
                 original_path = Path(original["original_video_path"])

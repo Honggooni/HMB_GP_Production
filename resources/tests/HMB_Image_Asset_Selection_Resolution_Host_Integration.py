@@ -25,7 +25,7 @@ except ImportError:
     raise SystemExit(0)
 
 import HMBImageAssetLibrary as asset
-from HMB_Image_Asset_Selection_Resolution_Async_Regression import selected_state
+from HMB_Image_Asset_Selection_Resolution_Async_Regression import fixture_manifest, selected_state
 
 
 class ImageSink(asset.DataNode):
@@ -84,7 +84,7 @@ async def main():
         publication_threads.append(threading.get_ident())
         return original_publish(*args, **kwargs)
 
-    def manifest(_path):
+    def manifest(path):
         read_threads.append(threading.current_thread().name)
         if threading.current_thread().name == "HMBImageAssetSelection":
             entered.set()
@@ -95,7 +95,7 @@ async def main():
                 assert force_release.wait(4), "Force verification fixture was not released"
             else:
                 time.sleep(0.25)
-        return {}
+        return fixture_manifest(path)
 
     async def wait_until(predicate):
         deadline = time.monotonic() + 3
@@ -104,7 +104,8 @@ async def main():
         assert predicate(), "Native fixture completion timed out"
 
     with patch.object(asset, "_read_asset_manifest", manifest), \
-         patch.object(asset, "_verified_project_relative_path", lambda row, *_: row["relative_path"]), \
+         patch.object(asset, "_verified_project_relative_path",
+                      lambda row, state, records: row["relative_path"] if row["relative_path"].casefold() in records else ""), \
          patch.object(asset, "_state_catalog_is_current", return_value=True), \
          patch.object(asset, "_state_project_belongs_to_catalog", return_value=True), \
          patch.object(asset, "_stage_and_notify_image_output_pair", publish):

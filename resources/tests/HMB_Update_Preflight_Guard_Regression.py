@@ -159,6 +159,7 @@ class PreflightGuardTests(unittest.TestCase):
                 env = preflight.isolated_environment(root, root / "standard", root / "editor")
             self.assertNotIn("OPENAI_API_KEY", env)
             self.assertNotIn("HMB_BROKER_TOKEN", env)
+            self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")
             for key in ("APPDATA", "LOCALAPPDATA", "HOME", "GTN_CONFIG_WORKSPACE_DIRECTORY"):
                 self.assertTrue(Path(env[key]).is_relative_to(root))
 

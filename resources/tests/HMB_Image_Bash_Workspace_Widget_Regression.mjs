@@ -1,11 +1,12 @@
 // Actual ImageAsset product widget; synthetic offline host/creation boundary.
 // No engine, app, provider, server, installation or paid-generation calls.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
-import os from 'node:os';
+
 import path from 'node:path';
-import {createRequire} from 'node:module';
+import { nativeTestBrowserPath, nativeTestPlaywright } from './_hmb_native_editor_fixture.mjs';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {randomUUID} from 'node:crypto';
@@ -104,7 +105,7 @@ exec(compile(ast.Module(body=nodes,type_ignores=[]),'<actual HMBImageAsset outpu
 images,context=scope['_build_image_bash_outputs'](state)
 print(json.dumps({'images':[{'url':image.value,'name':image.name} for image in images],'context':context,'state':state}))`;
 const installedPython=path.join(process.env.LOCALAPPDATA||'', 'ai.griptape.nodes.desktop/current/resources/engine-bundle/python/python.exe');
-const python=spawnSync(process.env.HMB_IMAGE_BASH_WORKSPACE_PYTHON||(fs.existsSync(installedPython)?installedPython:fileURLToPath(new URL('.venv/Scripts/python.exe',root))),
+const python=spawnSync(process.env.HMB_IMAGE_BASH_WORKSPACE_PYTHON||process.env.HMB_REGRESSION_PYTHON||(fs.existsSync(installedPython)?installedPython:fileURLToPath(new URL('.venv/Scripts/python.exe',root))),
  ['-B','-c',outputCode,fileURLToPath(new URL('HMBImageAssetLibrary.py',root))],
  {input:JSON.stringify(saved),encoding:'utf8',timeout:30000,maxBuffer:1024*1024});
 assert.equal(python.status,0,python.stderr||python.stdout);
@@ -115,8 +116,7 @@ assert.deepEqual(pair.context.records.map(row=>row.catalog_uid),saved.image_bash
 assert.deepEqual(pair.images.map(row=>row.url),pair.context.records.map(row=>row.url),'Typed image and context outputs have exactly the same instance order');
 assert.equal(pair.context.workspace_id,workspaceId);checks+=6;
 
-const require=createRequire(import.meta.url);
-const playwright=require(path.join(os.homedir(),'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'));
+const playwright=nativeTestPlaywright();
 const widgetSource=fs.readFileSync(new URL('widgets/HMBImageAssetLibraryWidget.js',root),'utf8');
 const bridgeSource=fs.readFileSync(new URL('widgets/HMBImageAssetThumbnailPatchBridgeWidget.js',root),'utf8');
 const html=`<!doctype html><meta charset="utf-8"><title>Offline Image Bash workspace product fixture</title>
@@ -162,10 +162,10 @@ const server=http.createServer((request,response)=>{
  response.setHeader('Content-Type',source?'text/javascript; charset=utf-8':'text/html; charset=utf-8');
  response.end(source||html);
 });
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+await listenBrowserSafeLoopback(server);
 let browser;
 try{
- browser=await playwright.chromium.launch({executablePath:process.env.HMB_IMAGE_ASSET_TEST_BROWSER||'C:/Program Files/Google/Chrome/Application/chrome.exe',headless:true});
+ browser=await playwright.chromium.launch({executablePath:nativeTestBrowserPath(),headless:true});
  const page=await browser.newPage({viewport:{width:1250,height:1100}}),errors=[];page.setDefaultTimeout(7000);
  page.on('pageerror',error=>errors.push(error.message));
  await page.route('**/*',route=>route.request().url().startsWith('http://127.0.0.1:')?route.continue():route.abort());

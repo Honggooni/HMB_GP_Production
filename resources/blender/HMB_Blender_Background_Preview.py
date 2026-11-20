@@ -439,7 +439,7 @@ def _set_frame(scene, value):
     scene.frame_set(integer, subframe=value - integer)
 
 
-def _visible_scope(job, bindings, objects):
+def _visible_scope(job, bindings, objects, *, whole_scene=False):
     hidden = set(_clean(path) for path in job.get("hidden_paths", []) if _clean(path))
     marker_by_path = {row["full_dag_path"]: row for row in bindings}
     active = {}
@@ -457,7 +457,11 @@ def _visible_scope(job, bindings, objects):
                     choice = root_path
         if choice:
             active[path] = marker_by_path[choice]
+        elif whole_scene:
+            active[path] = {}
     if not active:
+        if whole_scene:
+            raise RuntimeError("No visible Blender geometry remains for the Depth snapshot.")
         raise RuntimeError("No visible Blender geometry belongs to the selected solid marker bindings.")
     for path, obj in objects.items():
         if obj.type in RENDER_TYPES:
@@ -826,6 +830,7 @@ def _render(job, scene_path):
     catalog, markers = _catalog(job)
     bindings = _bindings(job, objects, markers) if marker_mode else []
     uses_patterns = False
+    scene_depth = job.get("operation") == "snapshot" and capture_pass == "depth" and not marker_mode
     if marker_mode:
         active, hidden = _visible_scope(job, bindings, objects)
         uses_patterns = any(row["kind"] == "pattern" for row in active.values())
@@ -833,13 +838,15 @@ def _render(job, scene_path):
             _configure_pattern_eevee(scene, active, objects)
         elif not auxiliary_only:
             _configure_workbench(scene, True, active)
+    elif scene_depth:
+        active, hidden = _visible_scope(job, [], objects, whole_scene=True)
     else:
         hidden = []
         active = {path: {"rgb": (0.5, 0.5, 0.5)} for path, obj in objects.items() if obj.type in RENDER_TYPES and _visible(obj)}
         if not active:
             raise RuntimeError("Blender scene has no visible renderable geometry.")
         _configure_workbench(scene, False, active)
-    if depth_requested and not marker_mode:
+    if depth_requested and not (marker_mode or scene_depth):
         raise RuntimeError("Blender Depth must accompany an assigned Mask render.")
     if motion_requested and not marker_mode:
         raise RuntimeError("Blender Motion Guide must accompany an assigned Mask render.")

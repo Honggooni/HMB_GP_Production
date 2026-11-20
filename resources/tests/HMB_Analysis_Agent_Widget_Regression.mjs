@@ -1,3 +1,4 @@
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
@@ -44,7 +45,7 @@ const server = http.createServer((request, response) => {
   response.setHeader("Content-Type", request.url === "/widget.js" ? "text/javascript; charset=utf-8" : "text/html; charset=utf-8");
   response.end(request.url === "/widget.js" ? source : html);
 });
-await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+await listenBrowserSafeLoopback(server);
 
 async function assertCategoryRow(page, labels) {
   const row = page.locator(".ha-categories");

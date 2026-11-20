@@ -423,9 +423,13 @@ async def run_full_lifecycle() -> tuple[list[FullLifecycleNode], FullLifecycleCo
             assert node.bridge.refresh_count == 2
             assert node.parameter_output_values["generation_id"] == expected_job_id
             assert node.parameter_output_values["generation_status"] == "succeeded"
-            assert node.parameter_output_values["video_url"].value == (
-                str(output_root / f"five-node-shot-{number:02d}.mp4")
-            )
+            expected_video = output_root / f"five-node-shot-{number:02d}.mp4"
+            original = node.parameter_output_values["VIDEO_OUT"].value
+            assert Path(original).samefile(expected_video), (original, expected_video)
+            video_value = node.parameter_output_values["video_url"].value
+            if video_value != original:
+                driver = node.engine.static_files_manager.storage_driver
+                assert video_value == driver.create_signed_download_url(expected_video), video_value
             assert Path(node.destination.location).read_bytes() == VALID_MP4_BYTES
             assert node.status_results[-1]["was_successful"] is True
             assert not node._generation_run_active.is_set()

@@ -1,5 +1,6 @@
 // Actual installed React, JSX runtime, native header, and native action code.
 // Only the SDK transport/store boundary is synthetic. Never loads the live app.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -149,7 +150,7 @@ ${nativeResizeCSS}
 </style><div id="app" class="react-flow"></div><script type="module" src="/fixture.js"></script>`;
 const widgetSource=fs.readFileSync(path.join(root,'widgets/HMBColorLUTLibraryWidget.js'),'utf8');
 const server=http.createServer((req,res)=>{res.setHeader('Content-Type',req.url.endsWith('.js')?'text/javascript':'text/html');res.end(req.url==='/fixture.js'?moduleSource:req.url==='/widget.js'?widgetSource:html);});
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+await listenBrowserSafeLoopback(server);
 const playwright=nativeTestPlaywright();
 let browser,checks=0;
 try{

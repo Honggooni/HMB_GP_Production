@@ -26,6 +26,11 @@ sys.modules[SPEC.name] = asset
 SPEC.loader.exec_module(asset)
 
 
+def fixture_manifest(root):
+    registered = {"ProjectA": ("A", "B", "C", "old", "new"), "ProjectB": ("B", "latest")}
+    return {f"{name.casefold()}.png": {"asset_id": name} for name in registered[Path(root).name]}
+
+
 def selected_state(name="A", project="ProjectA"):
     state = asset._default_state()
     state.update({
@@ -90,12 +95,12 @@ class SelectionResolutionTests(unittest.IsolatedAsyncioTestCase):
             else:
                 # Old implementation stalls the host callback before returning.
                 time.sleep(0.12)
-            return {}
+            return fixture_manifest(path)
 
         self.patchers = [
             patch.object(asset, "_read_asset_manifest", read_manifest),
             patch.object(asset, "_verified_project_relative_path",
-                         lambda row, state, records: row["relative_path"]),
+                         lambda row, state, records: row["relative_path"] if row["relative_path"].casefold() in records else ""),
             patch.object(asset, "_stage_and_notify_image_output_pair",
                          lambda node, payload, media, token, **kwargs:
                          self.published.append((json.loads(payload), list(media)))),

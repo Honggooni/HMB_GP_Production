@@ -1,5 +1,6 @@
 // Product widget in offline Chromium. Host callbacks/routes are synthetic;
 // this never opens or changes the running Griptape application/workflow.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -64,7 +65,7 @@ const server=http.createServer((request,response)=>{
  response.setHeader('Content-Type',request.url==='/widget.js'?'text/javascript; charset=utf-8':'text/html; charset=utf-8');
  response.end(request.url==='/widget.js'?widgetSource:html);
 });
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+await listenBrowserSafeLoopback(server);
 let browser;
 try {
  browser=await playwright.chromium.launch({executablePath:process.env.HMB_IMAGE_BASH_TEST_BROWSER||'C:/Program Files/Google/Chrome/Application/chrome.exe',headless:true});

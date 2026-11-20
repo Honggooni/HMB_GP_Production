@@ -3340,7 +3340,8 @@ export function hmbShouldDeferPromptSourceProps(container, nextProps, state) {
     normalizeSourceSyncRevision(state?.source_sync_revision),
     normalizeSourceSyncRevision(container.__hmbPromptCurrentSourceSyncRevision),
   );
-  return incomingSourceRevision > currentSourceRevision;
+  return incomingSourceRevision > currentSourceRevision
+    || hmbPromptPublisherChanged(container.__hmbPromptCurrentShotCatalogRouting, hmbPromptPropsRouting(nextProps.value));
 }
 
 export function hmbClearPromptSourcePropsApply(container) {
@@ -3352,6 +3353,69 @@ export function hmbClearPromptSourcePropsApply(container) {
     container.__hmbPromptLibrarySourcePropsApply = null;
   }
   return true;
+}
+
+function hmbPromptPropsRouting(value) {
+  if (typeof value !== "string") return value?.image_asset?.shot_catalog_routing;
+  // Canonical catalog routing contains only scalar fields. Avoid parsing all
+  // image rows and archived Shot documents in the source widget's input task.
+  const key = '"shot_catalog_routing"';
+  const index = value.lastIndexOf(key);
+  if (index < 0) return null;
+  const routing = /^\s*:\s*(\{[^{}]*\})/.exec(value.slice(index + key.length, index + key.length + 1024));
+  try { return routing ? JSON.parse(routing[1]) : null; } catch { return null; }
+}
+
+function hmbPromptPublisherChanged(previous, incoming) {
+  return Boolean(previous?.channel_uuid && previous.publisher_instance_uuid
+    && incoming?.channel_uuid && incoming.publisher_instance_uuid
+    && (previous.channel_uuid !== incoming.channel_uuid
+      || previous.publisher_instance_uuid !== incoming.publisher_instance_uuid));
+}
+
+function hmbCoalescePromptProps(job, nextProps, currentRouting) {
+  const previous = job.nextProps.value;
+  const incoming = nextProps.value;
+  const priorRouting = hmbPromptPropsRouting(previous);
+  const nextRouting = hmbPromptPropsRouting(incoming);
+  if (hmbPromptPublisherChanged(priorRouting, nextRouting)) {
+    // A late echo from the workflow being replaced owns neither the incoming
+    // workflow's source nor its callback.
+    if (!hmbPromptPublisherChanged(currentRouting, priorRouting)
+      || hmbPromptPublisherChanged(currentRouting, nextRouting)) {
+      job.nextProps = nextProps;
+      job.uiValue = undefined;
+    }
+    return;
+  }
+  const newestSource = hmbPromptSerializedRevisionHint(previous, "source_sync_revision")
+    > hmbPromptSerializedRevisionHint(incoming, "source_sync_revision") ? previous : incoming;
+  const priorUi = job.uiValue ?? previous;
+  const priorUiRevision = hmbPromptSerializedRevisionHint(priorUi, UI_EDIT_REVISION_KEY);
+  const incomingUiRevision = hmbPromptSerializedRevisionHint(incoming, UI_EDIT_REVISION_KEY);
+  const sourceUiRevision = newestSource === incoming ? incomingUiRevision
+    : hmbPromptSerializedRevisionHint(previous, UI_EDIT_REVISION_KEY);
+  job.uiValue = undefined;
+  if (Math.max(priorUiRevision, incomingUiRevision) > sourceUiRevision) {
+    job.uiValue = priorUiRevision > incomingUiRevision ? priorUi : incoming;
+  }
+  // The host's last envelope owns the current callback and disabled flag.
+  job.nextProps = newestSource === incoming ? nextProps : { ...nextProps, value: newestSource };
+}
+
+function hmbPendingPromptProps(job) {
+  if (!job.uiValue) return job.nextProps;
+  // A new source order and an independent, newer author edit can arrive in
+  // opposite orders. Reuse the normal revision merge after the paint boundary.
+  const source = parseValue(job.nextProps.value);
+  const ui = parseValue(job.uiValue);
+  const sourceRouting = source.image_asset.shot_catalog_routing;
+  const uiRouting = ui.image_asset.shot_catalog_routing;
+  if (sourceRouting.channel_uuid !== uiRouting.channel_uuid
+    || sourceRouting.publisher_instance_uuid !== uiRouting.publisher_instance_uuid
+    || hmbPromptShotCatalogRoutingIsStale(sourceRouting, uiRouting)) return job.nextProps;
+  const value = hmbMergePromptRevisionAxes(source, ui);
+  return { ...job.nextProps, value: typeof job.nextProps.value === "string" ? JSON.stringify(value) : value };
 }
 
 // Upstream Picker/ImageAsset generations are authoritative, but their full
@@ -3372,7 +3436,7 @@ export function hmbSchedulePromptSourcePropsApply(
   }
   const pending = container.__hmbPromptLibrarySourcePropsApply;
   if (pending && !pending.cancelled) {
-    pending.nextProps = nextProps || {};
+    hmbCoalescePromptProps(pending, nextProps || {}, container.__hmbPromptCurrentShotCatalogRouting);
     pending.applyNow = applyNow;
     return false;
   }
@@ -3394,13 +3458,13 @@ export function hmbSchedulePromptSourcePropsApply(
       return;
     }
     delete container.__hmbPromptLibrarySourcePropsApply;
-    job.applyNow(job.nextProps);
+    job.applyNow(hmbPendingPromptProps(job));
   };
   schedule(advance);
   return true;
 }
 
-export function hmbPreparePromptDirectPropsApply(container, nextProps) {
+export function hmbPreparePromptDirectPropsApply(container, nextProps, applyNow) {
   if (!container) return false;
   const pending = container.__hmbPromptLibrarySourcePropsApply;
   if (!pending || pending.cancelled) return false;
@@ -3412,10 +3476,17 @@ export function hmbPreparePromptDirectPropsApply(container, nextProps) {
     nextProps?.value,
     "source_sync_revision",
   );
-  if (directSourceRevision >= pendingSourceRevision) {
+  const publisherChanged = hmbPromptPublisherChanged(
+    hmbPromptPropsRouting(pending.nextProps?.value), hmbPromptPropsRouting(nextProps?.value),
+  );
+  if (publisherChanged || directSourceRevision >= pendingSourceRevision) {
     // The direct payload already owns an equal/newer source generation.
     // Cancel the delayed owner so it cannot repaint an older envelope later.
     hmbClearPromptSourcePropsApply(container);
+    if (applyNow) {
+      hmbCoalescePromptProps(pending, nextProps, container.__hmbPromptCurrentShotCatalogRouting);
+      applyNow(hmbPendingPromptProps(pending));
+    }
     return true;
   }
   // A local echo/disabled update may need immediate handling while a newer
@@ -4144,32 +4215,19 @@ export function hmbSyncSelectOptions(select, list, value, blankLabel, state) {
 }
 
 
-function colorPickChoices(images, rowIndex, pickIndex, videoCount) {
-  const row = (images || [])[rowIndex] || {};
-  normalizeImageBindingFields(row, MAX_VIDEOS);
-  const current = clean(row.color_picks[pickIndex]);
-  void videoCount;
-  return uniqueList([
-    "",
-    current,
-    ...COLOR_PICK_CHOICES,
-  ]);
+function colorPickChoices(current) {
+  return uniqueList(["", current, ...COLOR_PICK_CHOICES]);
 }
 
-function colorPickOptions(images, rowIndex, pickIndex, videoCount, state) {
-  const row = (images || [])[rowIndex] || {};
-  normalizeImageBindingFields(row, MAX_VIDEOS);
-  const current = clean(row.color_picks[pickIndex]);
-  return options(
-    colorPickChoices(images, rowIndex, pickIndex, videoCount),
-    current,
-    "—",
-    state,
-  );
+function hmbRenderColorPickOptions(state) {
+  const markup = new Map();
+  return current => {
+    if (!markup.has(current)) markup.set(current, options(colorPickChoices(current), current, "—", state));
+    return markup.get(current);
+  };
 }
 
 function renderSubtypeControls(item, state) {
-  normalizeImageBindingFields(item, videoSlotCount(state));
   const subType = clean(item.image_sub_type);
   const knownChoices = Array.isArray(IMAGE_SUB_TYPES[clean(item.image_main_type)])
     ? IMAGE_SUB_TYPES[clean(item.image_main_type)]
@@ -4206,7 +4264,6 @@ export function frameDomainInputValue(value) {
 }
 
 function renderFrameRangeRow(item, index, state) {
-  normalizeImageBindingFields(item, videoSlotCount(state));
   const frameStatus = frameRangeUiStatus(state, item);
   const enabled = Boolean(frameStatus.intent.enabled);
   const editable = enabled;
@@ -4793,6 +4850,18 @@ export function hmbMergePromptRevisionAxes(sourceState, uiState) {
 
 function hmbPromptRevisionDisposition(container, nextProps, incomingState) {
   if (!container || !incomingState) return "unknown";
+  const currentRouting = container.__hmbPromptCurrentShotCatalogRouting;
+  const incomingRouting = incomingState?.image_asset?.shot_catalog_routing;
+  if (hmbPromptPublisherChanged(currentRouting, incomingRouting)) {
+    // Native props identified a different publisher. Its source/UI revisions
+    // restart independently. An echo from the just-replaced owner can arrive
+    // in the same browser turn before its old host callbacks have drained.
+    container.__hmbPromptPreviousPublisher = currentRouting;
+    hmbPromptLifecycleFrame(container, () => {
+      if (container.__hmbPromptPreviousPublisher === currentRouting) delete container.__hmbPromptPreviousPublisher;
+    });
+    return "authoritative";
+  }
   if (hmbPromptShotCatalogRoutingIsStale(
     container.__hmbPromptCurrentShotCatalogRouting,
     incomingState?.image_asset?.shot_catalog_routing,
@@ -5691,11 +5760,9 @@ function hmbInstallFrameRangeInteractions(container, state, props, listeners) {
   });
 }
 
-function renderColorPickControls(item, rowIndex, images, state) {
-  const count = MAX_VIDEOS;
-  normalizeImageBindingFields(item, count);
+function renderColorPickControls(item, state, renderColorOptions) {
   const title = escapeHtml(uiText(state, "video_marker_source", "video marker source"));
-  return `<div class="video-color-pick-wrap"><div class="color-pick-stack">${item.color_picks.map((pick, pickIndex) => `<div class="color-binding-entry"><select class="source-select image-video-index binding-video-index" data-field="binding_video_slots" data-binding-index="${pickIndex}" title="${title}" aria-label="${title}">${videoNumberOptions(state, item.binding_video_slots[pickIndex])}</select><select class="source-select color-pick-select" data-field="color_picks" data-color-index="${pickIndex}" aria-label="${escapeHtml(uiText(state, "video_color_pick", "Video / Color Pick"))}">${colorPickOptions(images, rowIndex, pickIndex, count, state)}</select></div>`).join("")}</div></div>`;
+  return `<div class="video-color-pick-wrap"><div class="color-pick-stack">${item.color_picks.map((pick, pickIndex) => `<div class="color-binding-entry"><select class="source-select image-video-index binding-video-index" data-field="binding_video_slots" data-binding-index="${pickIndex}" title="${title}" aria-label="${title}">${videoNumberOptions(state, item.binding_video_slots[pickIndex])}</select><select class="source-select color-pick-select" data-field="color_picks" data-color-index="${pickIndex}" aria-label="${escapeHtml(uiText(state, "video_color_pick", "Video / Color Pick"))}">${renderColorOptions(pick)}</select></div>`).join("")}</div></div>`;
 }
 
 function videoNumberOptions(state, current) {
@@ -6169,7 +6236,7 @@ function hmbRefreshImageColorControls(container, state) {
       const pick = clean(item.color_picks[pickIndex]);
       hmbSyncSelectOptions(
         select,
-        colorPickChoices(images, rowIndex, pickIndex, count),
+        colorPickChoices(pick),
         pick,
         "—",
         state,
@@ -6258,7 +6325,8 @@ function hmbRefreshImageSurfaceControl(row, item) {
   checkbox.setAttribute?.("data-hmb-base-disabled", checkbox.disabled ? "1" : "0");
 }
 
-function renderImageRow(item, index, images, state, renderTargetOptions, deferredTargets) {
+function renderImageRow(item, index, images, state, renderTargetOptions, deferredTargets, renderColorOptions) {
+  // All child controls consume this one normalized binding, including legacy rows.
   normalizeImageBindingFields(item, videoSlotCount(state));
   const sourceTypeChoices = uniqueList([...IMAGE_MAIN_TYPES, clean(item.image_main_type)].filter(Boolean));
   const orderManaged = Boolean(state?.image_asset?.enabled && state?.image_asset?.order_managed);
@@ -6281,7 +6349,7 @@ function renderImageRow(item, index, images, state, renderTargetOptions, deferre
     <div class="source-role image-main-type-cell"><select class="source-select" data-field="image_main_type" ${verifiedAsset ? "disabled" : ""}>${options(sourceTypeChoices, item.image_main_type, "", state)}</select></div>
     <div class="source-role binding-scope-cell">${renderSubtypeControls(item, state)}</div>
     <div class="source-role image-target-cell">${renderImageTargetControls(item, renderTargetOptions, state, deferredTargets)}</div>
-    <div class="source-role color-pick-cell image-video-surface-columns"><div class="image-video-color-controls">${renderColorPickControls(item, index, images, state)}</div>${renderImageSurfaceControl(item, state)}</div>
+    <div class="source-role color-pick-cell image-video-surface-columns"><div class="image-video-color-controls">${renderColorPickControls(item, state, renderColorOptions)}</div>${renderImageSurfaceControl(item, state)}</div>
     <div class="source-status image-actions-cell">${renderImageActions(item, state, index, images.length)}</div>
     ${renderFrameRangeRow(item, index, state)}
     ${renderImageCustomPanel(item, state)}
@@ -6682,6 +6750,7 @@ function render(state, includeStyle = true) {
   const images = state.images || [];
   const deferredTargets = images.length >= HMB_EAGER_PROMPT_TARGET_OPTIONS_LIMIT;
   const renderTargetOptions = hmbRenderImageTargetOptions(images, state, deferredTargets);
+  const renderColorOptions = hmbRenderColorPickOptions(state);
   const videos = state.videos || [];
   const groupBFields = TEXT_FIELDS.filter((x) => x[3] === "image").map(([key, label, ph]) => textField(key, label, state.text[key], ph, state)).join("");
   const groupDFields = TEXT_FIELDS.filter((x) => x[3] === "video").map(([key, label, ph]) => textField(key, label, state.text[key], ph, state)).join("");
@@ -6692,7 +6761,7 @@ function render(state, includeStyle = true) {
   const hVideoText = groupHeightStyle(state, "videoText");
   const editorMarkup = `<div class="layout nodrag"${state.manual_rebind?.required ? ' inert aria-disabled="true"' : ""}>
       <main class="center">
-        <section class="group-card image-card" data-group-id="imageSources" ${hImageSources}><h3>${escapeHtml(uiText(state, "image_source_binding", "IMAGE SOURCE BINDING"))} <b>${state.status.active_images} / ${state.status.max_images}</b></h3><div class="group-body source-scrollbox" data-scroll-id="imageSources" data-hmb-scroll-viewport ${state.shot?.shot_uuid ? `data-hmb-wheel-key="${escapeHtml(JSON.stringify(["prompt-images", state.shot.channel_uuid, state.shot.shot_uuid]))}"` : ""}><div class="source-header image-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "target", "TARGET"))}</span><span class="image-video-surface-columns"><span>${escapeHtml(uiText(state, "video_color_pick", "VIDEO / COLOR PICK"))}</span><span class="image-surface-heading">${escapeHtml(uiText(state, "surface_2d", "2DSurface"))}</span></span><span></span></div>${images.map((item, idx) => renderImageRow(item, idx, images, state, renderTargetOptions, deferredTargets)).join("")}${renderImageAddRow(images, state)}</div><div class="group-resize-bar nodrag" data-resize-group="imageSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
+        <section class="group-card image-card" data-group-id="imageSources" ${hImageSources}><h3>${escapeHtml(uiText(state, "image_source_binding", "IMAGE SOURCE BINDING"))} <b>${state.status.active_images} / ${state.status.max_images}</b></h3><div class="group-body source-scrollbox" data-scroll-id="imageSources" data-hmb-scroll-viewport ${state.shot?.shot_uuid ? `data-hmb-wheel-key="${escapeHtml(JSON.stringify(["prompt-images", state.shot.channel_uuid, state.shot.shot_uuid]))}"` : ""}><div class="source-header image-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "target", "TARGET"))}</span><span class="image-video-surface-columns"><span>${escapeHtml(uiText(state, "video_color_pick", "VIDEO / COLOR PICK"))}</span><span class="image-surface-heading">${escapeHtml(uiText(state, "surface_2d", "2DSurface"))}</span></span><span></span></div>${images.map((item, idx) => renderImageRow(item, idx, images, state, renderTargetOptions, deferredTargets, renderColorOptions)).join("")}${renderImageAddRow(images, state)}</div><div class="group-resize-bar nodrag" data-resize-group="imageSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card imgtext" data-group-id="imageText" ${hImageText}><h3>${escapeHtml(uiText(state, "image_text_context", "SHOT TEXT DIRECTION / EXACT LITERALS"))} <b>${escapeHtml(uiText(state, "scene_level_notes", "scene-level notes"))}</b></h3><div class="group-body"><div class="text-grid">${groupBFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="imageText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card video-card" data-group-id="videoSources" ${hVideoSources}><h3>${escapeHtml(uiText(state, "video_source_binding", "VIDEO SOURCE BINDING"))} <b>${state.status.active_videos} / ${state.status.max_videos}</b></h3><div class="group-body source-scrollbox" data-scroll-id="videoSources"><div class="source-header video-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "keep_out", "KEEP OUT"))}</span><span></span></div>${videos.map((item, idx) => renderVideoRow(item, idx, images, state)).join("")}${renderVideoAddRow(videos, state)}</div><div class="group-resize-bar nodrag" data-resize-group="videoSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card sound-card" data-group-id="soundSources" ${hSoundSources}><h3>${escapeHtml(uiLanguage(state) === "ko" ? "사운드 / 발화 / 립싱크 바인딩" : "SOUND / SPEECH / LIP-SYNC BINDING")} <b>${state.sound_sources?.length || 0} / 64</b></h3><div class="group-body source-scrollbox" data-scroll-id="soundSources">${hmbRenderPromptSoundSources(state)}</div><div class="group-resize-bar nodrag" data-resize-group="soundSources" title="Resize sound binding"></div></section>
@@ -8293,7 +8362,7 @@ function hmbPromptFullDashboardMarkup(state) {
 // Retained-mode structural paint.  The dashboard and stable source-row nodes
 // survive add/remove/reorder/language/authority updates, so there is no blank
 // frame and the browser can restore focus to the same source identity.
-export function hmbPatchPromptDashboard(container, markup) {
+export function hmbPatchPromptDashboard(container, markup, replaceEditor = false) {
   const currentClip = container?.querySelector?.(".hmb-dashboard-clip");
   const currentRoot = currentClip?.querySelector?.(".hmb-dashboard")
     || container?.querySelector?.(".hmb-dashboard");
@@ -8342,9 +8411,15 @@ export function hmbPatchPromptDashboard(container, markup) {
   const nextSections = Array.from(nextRoot.querySelectorAll?.("[data-group-id]") || []);
   const currentShots = currentRoot.querySelector?.(".prompt-shot-list");
   const nextShots = nextRoot.querySelector?.(".prompt-shot-list");
-  if (currentShots && nextShots) hmbPatchPromptShotSections(currentShots, nextShots);
-  else if (!currentShots && nextShots) currentTopbar?.after?.(nextShots);
-  else if (currentShots && !nextShots) currentShots.remove?.();
+  if (replaceEditor || Boolean(currentShots) !== Boolean(nextShots)) {
+    // Two workflows may use the same Shot UUID. Keep the native header, but
+    // install the incoming document's controls and values as a single unit.
+    const currentEditor = currentShots || currentRoot.querySelector(":scope > .layout");
+    const nextEditor = nextShots || nextRoot.querySelector(":scope > .layout");
+    if (!nextEditor) return false;
+    if (currentEditor) currentEditor.replaceWith(nextEditor);
+    else currentTopbar?.after?.(nextEditor);
+  } else if (currentShots && nextShots) hmbPatchPromptShotSections(currentShots, nextShots);
 
   const currentSections = new Map(
     Array.from(currentRoot.querySelectorAll?.("[data-group-id]") || []).map((section) => (
@@ -8600,7 +8675,7 @@ function hmbNativeUiImplementation(container, props) {
   let discoveryRequested = false;
   let renderRevision = 0;
   let identicalPropsEcho = null;
-  const remount = (nextState = null, stateIsNormalized = false) => {
+  const remount = (nextState = null, stateIsNormalized = false, replaceEditor = false) => {
     const ownRenderRevision = ++renderRevision;
     if (nextState && typeof nextState === "object") {
       const normalizedNextState = hmbMergeStoredGroupHeights(container, normalizeState(nextState));
@@ -8624,7 +8699,7 @@ function hmbNativeUiImplementation(container, props) {
       hmbRememberPromptDirtyTextControl(container, activeText, state);
     }
     const compositionWasActive = Boolean(container.__hmbPromptLibraryCompositionActive);
-    if (!container.__hmbPromptShotSwitchInProgress) {
+    if (!replaceEditor && !container.__hmbPromptShotSwitchInProgress) {
       hmbCaptureTextEditingState(container);
       hmbCapturePromptControlFocus(container);
       hmbCaptureUiBeforeStateEmit(container, state);
@@ -8648,7 +8723,7 @@ function hmbNativeUiImplementation(container, props) {
     );
     if (dashboardMounted) {
       const dynamicMarkup = render(state, false);
-      if (!hmbPatchPromptDashboard(container, dynamicMarkup)) {
+      if (!hmbPatchPromptDashboard(container, dynamicMarkup, replaceEditor)) {
         hmbReplacePromptDashboardMarkup(container, hmbPromptFullDashboardMarkup(state));
       }
     } else {
@@ -8698,6 +8773,11 @@ function hmbNativeUiImplementation(container, props) {
     listeners.push([container, "pointerdown", clearTextFocusOnPointerDown, true]);
     const clearPendingTextTargetOnFocusIn = (event) => {
       if (!hmbIsEditableTextControl(event && event.target)) return;
+      const remembered = container.__hmbPromptLibraryTextFocus;
+      if (remembered && hmbTextControlIdentity(event.target) !== remembered.key) {
+        hmbClearTextEditingState(container);
+      }
+      container.__hmbPromptLibraryControlFocus = null;
       try { container.__hmbPromptLibraryPointerTextTarget = null; } catch (_e) {}
     };
     container.addEventListener("focusin", clearPendingTextTargetOnFocusIn);
@@ -9614,6 +9694,22 @@ function hmbNativeUiImplementation(container, props) {
     delete container.__hmbPromptPendingRevisionMergeNeedsPublication;
     hmbInvalidatePromptPublication(container);
     if (container.__hmbPromptLibraryCommitIsReconciliation) hmbClearImmediateStateCommit(container);
+    const publisherChanged = hmbPromptPublisherChanged(state.image_asset.shot_catalog_routing,
+      parsedIncoming.state?.image_asset?.shot_catalog_routing);
+    if (publisherChanged) {
+      // Finish any draft through its original callback before adopting the
+      // replacement workflow. Never archive that draft in the incoming file.
+      hmbReleasePromptCompositionLatch(container);
+      hmbFlushPromptInteractionCommit(container);
+      hmbFlushImmediateStateCommit(container, props, state);
+      hmbClearPromptDirtyText(container);
+      hmbClearTextEditingState(container);
+      container.__hmbPromptLibraryControlFocus = null;
+      delete container.__hmbPromptShotPointerFocus;
+      delete container.__hmbPromptShotInteractionStates;
+      clearPreparedViews();
+      delete container.__hmbPromptLatestLocalUiEditRevision;
+    }
     const hadUncommittedText = Boolean(
       container.__hmbPromptLibraryCommitPending
       || container.__hmbPromptLibraryCompositionActive
@@ -9641,7 +9737,7 @@ function hmbNativeUiImplementation(container, props) {
     }
     nextState.disabled = Boolean(nextProps?.disabled);
     nextState.ui = nextState.ui && typeof nextState.ui === "object" ? nextState.ui : defaultUi();
-    hmbReconcilePromptSourceIdentities(state, nextState);
+    if (!publisherChanged) hmbReconcilePromptSourceIdentities(state, nextState);
     // parseValue, revision merging, and dirty-text merging each return a
     // canonical state; the two UI helpers above only adjust normalized UI
     // heights and non-serializable row identities. Reuse that state for both
@@ -9653,7 +9749,7 @@ function hmbNativeUiImplementation(container, props) {
     const nextValue = JSON.stringify(canonicalNextState);
     const disabledChanged = Boolean(state.disabled) !== Boolean(nextState.disabled);
     const shotRegionOnly = Boolean(
-      !disabledChanged
+      !publisherChanged && !disabledChanged
       && (!state.multi_shot_enabled || hmbPromptDocumentKey(state.shot) === hmbPromptDocumentKey(nextState.shot))
       && hmbPromptNonShotNormalizedFingerprint(normalizedCurrentState)
         === hmbPromptNonShotNormalizedFingerprint(normalizedNextState)
@@ -9698,7 +9794,7 @@ function hmbNativeUiImplementation(container, props) {
       hmbApplyPromptDisabledFeedback(container, state.disabled);
       try { container.__hmbPromptLastPaintedValue = JSON.stringify(state); } catch (_e) {}
     } else {
-      remount(null, !hadUncommittedText);
+      remount(null, !hadUncommittedText, publisherChanged);
     }
     if (!shotRegionOnly) warmPreparedViews();
     if (dirtyText.length || shouldRepublishRevisionMerge) {
@@ -9707,6 +9803,11 @@ function hmbNativeUiImplementation(container, props) {
     }
   };
   const applyProps = (nextProps = {}) => {
+    if (container.__hmbPromptPreviousPublisher) {
+      const routing = hmbPromptPropsRouting(nextProps.value);
+      if (routing?.channel_uuid && routing.publisher_instance_uuid
+        && !hmbPromptPublisherChanged(container.__hmbPromptPreviousPublisher, routing)) return;
+    }
     if (identicalPropsEcho && typeof nextProps.value === "string"
       && nextProps.value === identicalPropsEcho.value
       && Boolean(nextProps.disabled) === identicalPropsEcho.disabled
@@ -9725,11 +9826,18 @@ function hmbNativeUiImplementation(container, props) {
     }
     identicalPropsEcho = null;
     if (hmbShouldDeferPromptSourceProps(container, nextProps, state)) {
+      // A passive acknowledgement may still be waiting on its 260 ms timer.
+      // Once a newer catalog owns the next paint, publishing the old rows
+      // can rewind the host and make the next deselection appear stale.
+      if (container.__hmbPromptLibraryCommitIsReconciliation
+        && !hmbPromptShotCatalogRoutingIsStale(container.__hmbPromptCurrentShotCatalogRouting,
+          hmbPromptPropsRouting(nextProps.value))) {
+        hmbClearImmediateStateCommit(container);
+      }
       hmbSchedulePromptSourcePropsApply(container, nextProps, applyPropsNow);
       return;
     }
-    hmbPreparePromptDirectPropsApply(container, nextProps);
-    applyPropsNow(nextProps);
+    if (!hmbPreparePromptDirectPropsApply(container, nextProps, applyPropsNow)) applyPropsNow(nextProps);
   };
   container.__hmbPromptLibraryApplyProps = applyProps;
   const stopExternalCommitBoundary = hmbInstallPromptExternalCommitBoundary(
@@ -9791,6 +9899,7 @@ function hmbNativeUiImplementation(container, props) {
       delete container.__hmbPromptCurrentSourceSyncRevision;
       delete container.__hmbPromptCurrentDisabled;
       delete container.__hmbPromptCurrentShotCatalogRouting;
+      delete container.__hmbPromptPreviousPublisher;
       delete container.__hmbPromptLastPaintedValue;
       delete container.__hmbPromptLatestLocalStateValue;
       delete container.__hmbPromptPendingRevisionMerge;

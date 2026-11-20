@@ -9899,6 +9899,26 @@ def _is_remote_video_reference(value: Any) -> bool:
     return False
 
 
+def _open_video_for_inspection(path: Path):
+    """Read-only probes must allow an editor to rename or remove its MP4."""
+    if os.name != "nt":
+        return path.open("rb")
+    import _winapi
+    import msvcrt
+
+    def open_shared(name, _flags):
+        # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE. This grants
+        # sharing to other handles; our own handle has read access only.
+        handle = _winapi.CreateFile(name, _winapi.GENERIC_READ, 0x7, 0, _winapi.OPEN_EXISTING, 0, 0)
+        try:
+            return msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+        except BaseException:
+            _winapi.CloseHandle(handle)
+            raise
+
+    return open(path, "rb", opener=open_shared)
+
+
 def _probe_readable_video_reference(value: Any) -> Optional[Path]:
     """Resolve and probe one reference without transaction-level caching."""
 
@@ -9930,9 +9950,9 @@ def _probe_readable_video_reference(value: Any) -> Optional[Path]:
             # directory. Griptape's File resolver is the active-project authority.
             return None
     try:
-        if not resolved.is_file() or resolved.stat().st_size <= 0:
+        if not resolved.is_file():
             return None
-        with resolved.open("rb") as handle:
+        with _open_video_for_inspection(resolved) as handle:
             if not handle.read(1):
                 return None
     except OSError:
@@ -11187,7 +11207,7 @@ def _video_thumbnail_signature(path: Path) -> str:
         resolved = path.resolve()
         details = resolved.stat()
         size = int(details.st_size)
-        with resolved.open("rb") as handle:
+        with _open_video_for_inspection(resolved) as handle:
             if size <= VIDEO_MEDIA_SOURCE_SAMPLE_BYTES * 2:
                 sample = b"full|" + handle.read(VIDEO_MEDIA_SOURCE_SAMPLE_BYTES * 2)
             else:
@@ -12833,7 +12853,7 @@ def _is_structurally_valid_mp4(path: Path) -> bool:
             return False
         box_types = set()
         position = 0
-        with path.open("rb") as handle:
+        with _open_video_for_inspection(path) as handle:
             while position + 8 <= file_size:
                 handle.seek(position)
                 header = handle.read(8)
@@ -17836,15 +17856,7 @@ class HMBVideoPickerLibrary(DataNode):
                 else:
                     self._read_scene_mode(scene_text, context=context)
             elif action == "render_snapshot":
-                if blender_scene:
-                    self._blender_snapshot_mode(scene_text, context=context, video_uid=context.snapshot_video_uid)
-                else:
-                    self._snapshot_mode(
-                        scene_text,
-                        context.video_slot,
-                        context=context,
-                        video_uid=context.snapshot_video_uid,
-                    )
+                self._snapshot_mode(scene_text, context.video_slot, context=context, video_uid=context.snapshot_video_uid)
             elif action == "render_original_preview":
                 if blender_scene:
                     self._blender_render_original_preview_mode(scene_text, context=context)
@@ -23461,15 +23473,18 @@ class HMBVideoPickerLibrary(DataNode):
         self._assert_operation_current(context, "SNAPSHOT preflight")
         strict_scene_text = _maya_scene_path_text(scene_text)
         if not strict_scene_text:
-            raise ValueError("A single absolute Maya .mb or .ma scene is required before SNAPSHOT.")
+            raise ValueError("Select a Maya .mb/.ma or Blender .blend scene before SNAPSHOT.")
         scene_path = _norm_path(strict_scene_text)
-        if not scene_path.is_file() or scene_path.suffix.lower() not in {".ma", ".mb"}:
-            raise FileNotFoundError(f"Select an existing Maya .mb or .ma scene before SNAPSHOT: {scene_path}")
-        if not MAYA_RUNNER.is_file():
-            raise FileNotFoundError(f"Maya runner not found: {MAYA_RUNNER}")
-        mayabatch = _find_mayabatch()
-        if mayabatch is None:
-            raise FileNotFoundError("No mayabatch installation was found.")
+        if not scene_path.is_file() or scene_path.suffix.lower() not in {".ma", ".mb", ".blend"}:
+            raise FileNotFoundError(f"Select an existing Maya or Blender scene before SNAPSHOT: {scene_path}")
+        blender_scene = _picker_scene_engine(scene_path) == "blender"
+        engine = "Blender" if blender_scene else "Maya"
+        if not blender_scene:
+            if not MAYA_RUNNER.is_file():
+                raise FileNotFoundError(f"Maya runner not found: {MAYA_RUNNER}")
+            mayabatch = _find_mayabatch()
+            if mayabatch is None:
+                raise FileNotFoundError("No mayabatch installation was found.")
         state = self._operation_stage_state(context)
         roles = tuple(context.selected_roles) if context is not None else tuple(_snapshot_choice_roles(state))
         if not roles:
@@ -23479,6 +23494,8 @@ class HMBVideoPickerLibrary(DataNode):
         binding_slot = context.mask_authoring_slot if context is not None else _mask_authoring_slot(state)
         start_frame = float(state.get("start_frame") or 0.0)
         end_frame = float(state.get("end_frame") or start_frame)
+        if blender_scene:
+            camera, start_frame, end_frame, fps, width, height = self._blender_render_inputs(scene_path, state)
         requested_frame = state.get("snapshot_request_frame")
         frame = max(start_frame, min(end_frame, float(
             requested_frame if requested_frame is not None else state.get("snapshot_frame") or start_frame)))
@@ -23490,20 +23507,24 @@ class HMBVideoPickerLibrary(DataNode):
         job_folder = output_folder / ".hmb_video_picker" / batch_uid
         self._register_cleanup_dir(job_folder)
         _ensure_private_job_folder(job_folder, output_folder)
-        log_path = _picker_diagnostic_path(scene_path, "maya_snapshot", batch_uid)
-        log_path.write_text("MAYA SELECTED SNAPSHOT OUTPUTS: " + ", ".join(roles) + "\n", encoding="utf-8")
+        log_path = _picker_diagnostic_path(scene_path, f"{engine.lower()}_snapshot", batch_uid)
+        log_path.write_text(f"{engine.upper()} SELECTED SNAPSHOT OUTPUTS: " + ", ".join(roles) + "\n", encoding="utf-8")
         state.update(status="SNAPSHOT_RENDERING", scene_stage="SNAPSHOT_RENDERING",
-                     message=f"Rendering {', '.join(role.title() for role in roles)} snapshots at Maya frame {frame:g}.",
+                     message=f"Rendering {', '.join(role.title() for role in roles)} snapshots at {engine} frame {frame:g}.",
                      snapshot_frame=frame, snapshot_video_slot=PRIMARY_COLOR_VIDEO_SLOT,
                      last_log_path=str(log_path).replace("\\", "/"), log_folder=str(log_path.parent).replace("\\", "/"))
         self._write_state(state)
         staged = []
         warnings = []
         for role in roles:
-            rendered, metadata = self._capture_maya_snapshot_role(
-                role=role, scene_path=scene_path, state=state, frame=frame,
-                binding_slot=binding_slot, job_folder=job_folder / role,
-                log_path=log_path, mayabatch=mayabatch, context=context)
+            if blender_scene:
+                rendered, metadata = self._capture_blender_snapshot_role(
+                    role, scene_path, state, frame, binding_slot, camera, fps, width, height, context)
+            else:
+                rendered, metadata = self._capture_maya_snapshot_role(
+                    role=role, scene_path=scene_path, state=state, frame=frame,
+                    binding_slot=binding_slot, job_folder=job_folder / role,
+                    log_path=log_path, mayabatch=mayabatch, context=context)
             snapshot_uid = f"snapshot-{uuid.uuid4().hex}"
             target = self._snapshot_cache_path(scene_path, snapshot_uid)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -23542,7 +23563,7 @@ class HMBVideoPickerLibrary(DataNode):
             ready_stage = "VIDEO_READY" if completed.get("videos") else "OUTLINER_READY"
             self._finish_snapshot_view(completed, context, ready_stage)
             completed.update(status=ready_stage,
-                             message=f"{', '.join(role.title() for role in roles)} snapshots ready at Maya frame {frame:g}.",
+                             message=f"{', '.join(role.title() for role in roles)} snapshots ready at {engine} frame {frame:g}.",
                              warnings=warnings)
             completed = self._mark_operation_finished(completed)
             _append_activity_log(completed, "SUCCESS", completed["message"])
@@ -23559,7 +23580,7 @@ class HMBVideoPickerLibrary(DataNode):
             except Exception as exc:
                 _diagnostic_exception("Snapshot history cache cleanup failed", exc)
         active = staged[-1][2]
-        return {"mode": "snapshot", "snapshot_batch_uid": batch_uid,
+        return {"mode": "blender_snapshot" if blender_scene else "snapshot", "snapshot_batch_uid": batch_uid,
                 "snapshots": [dict(record) for _partial, _target, record in staged],
                 "snapshot_uid": active["snapshot_uid"], "video_uid": associated_video_uid,
                 "video_slot": PRIMARY_COLOR_VIDEO_SLOT, "frame": frame, "snapshot": active["path"]}
@@ -25758,48 +25779,29 @@ class HMBVideoPickerLibrary(DataNode):
                 raise RuntimeError(f"Blender {prefix or 'color'} frame {index} is not the requested PNG size.")
         return pattern, sidecar, sidecar_path
 
-    def _blender_snapshot_mode(
-        self, scene_text: str, context: Optional[_OperationContext] = None, *, video_uid: Any = "",
-    ) -> Dict[str, Any]:
-        scene_path = _norm_path(_maya_scene_path_text(scene_text))
-        state = self._operation_stage_state(context)
-        camera, first, last, fps, width, height = self._blender_render_inputs(scene_path, state)
-        bindings = self._selected_slot_job_bindings(state, PRIMARY_COLOR_VIDEO_SLOT)
-        _validate_blender_marker_bindings(bindings)
-        requested = state.get("snapshot_request_frame")
-        frame = max(first, min(last, float(requested if requested is not None else state.get("snapshot_frame") or first)))
-        result, job, folder, log_path = self._blender_execute_job(scene_path, "snapshot", {
+    def _capture_blender_snapshot_role(
+        self, role: str, scene_path: Path, state: Dict[str, Any], frame: float, binding_slot: int,
+        camera: str, fps: float, width: int, height: int, context: Optional[_OperationContext],
+    ) -> tuple[Path, Dict[str, Any]]:
+        bindings = self._selected_slot_job_bindings(state, binding_slot) if role != "original" else []
+        if bindings:
+            _validate_blender_marker_bindings(bindings)
+        marker_mode = role == "mask" or bool(bindings)
+        depth = role == "depth"
+        result, job, _, _ = self._blender_execute_job(scene_path, "snapshot", {
             "camera": camera, "width": width, "height": height,
             "start_frame": frame, "end_frame": frame, "fps": fps,
-            "apply_marker_shaders": True, **_job_marker_catalog_fields(),
-            "bindings": bindings, "hidden_paths": self._selected_slot_hidden_paths(state, PRIMARY_COLOR_VIDEO_SLOT),
-            "video_slot": PRIMARY_COLOR_VIDEO_SLOT,
+            "capture_pass": "depth" if depth else "color", "generate_depth_playblast": depth,
+            "apply_marker_shaders": marker_mode, **_job_marker_catalog_fields(),
+            "bindings": bindings, "video_slot": binding_slot,
+            "hidden_paths": self._selected_slot_hidden_paths(state, binding_slot) if role != "original" else [],
         }, context)
-        self._blender_validate_sequence(result, job, scene_path, prefix="", expected_frames=1,
-                                        expected_fps=fps, width=width, height=height, camera=camera, marker_mode=True)
-        snapshot_uid = f"snapshot-{uuid.uuid4().hex}"
-        cache_path = self._snapshot_cache_path(scene_path, snapshot_uid)
-        staged = folder / "snapshot.partial.png"
-        shutil.copy2(Path(job["frames_folder"]) / f"{job['output_name']}.000000.png", staged)
-        self._assert_operation_current(context, "Blender Snapshot atomic publish")
-        os.replace(staged, cache_path)
-        associated_uid = _clean(video_uid or state.get("snapshot_request_video_uid") or state.get("preview_video_uid"))
-        current = _append_snapshot_history_record(self._picker_state(), {
-            "snapshot_uid": snapshot_uid, "video_uid": associated_uid,
-            "render_video_slot": PRIMARY_COLOR_VIDEO_SLOT, "video_slot": PRIMARY_COLOR_VIDEO_SLOT,
-            "frame": frame, "path": str(cache_path).replace("\\", "/"),
-            "url": _external_media_url(cache_path), "sha256": _sha256_file(cache_path),
-            "created_at_ms": int(time.time() * 1000),
-        }, scene_path=scene_path, picker_shot_uuid=context.picker_shot_uuid if context else "")
-        ready = "VIDEO_READY" if current.get("videos") else "OUTLINER_READY"
-        self._finish_snapshot_view(current, context, ready)
-        current.update({"status": ready,
-                        "message": f"Blender Snapshot ready at frame {frame:g}.",
-                        "warnings": [_clean(item) for item in result.get("warnings", []) if _clean(item)]})
-        current = self._mark_operation_finished(current)
-        _append_activity_log(current, "SUCCESS", f"Blender Snapshot ready: {cache_path}; log {log_path}")
-        self._write_state(current)
-        return {"mode": "blender_snapshot", "snapshot_uid": snapshot_uid, "snapshot": str(cache_path)}
+        pattern, metadata, _ = self._blender_validate_sequence(
+            result, job, scene_path, prefix="depth" if depth else "", expected_frames=1,
+            expected_fps=fps, width=width, height=height, camera=camera, marker_mode=marker_mode)
+        if metadata.get("start_frame") != frame or metadata.get("end_frame") != frame:
+            raise RuntimeError(f"Blender {role.title()} Snapshot does not match the requested frame {frame:g}.")
+        return pattern.with_name(pattern.name % 0), metadata
 
     def _blender_render_original_preview_mode(
         self, scene_text: str, context: Optional[_OperationContext] = None,

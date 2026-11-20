@@ -13,6 +13,15 @@ const patch2 = editorSourceHash === '8433f4e108e2416707c6877354234607aaa2cb8b4e1
 const patch3 = editorSourceHash === 'b0c4f9d4c8d78243b5f1d505187d1c5e49119854912a2e516be03170590fc4fc';
 assert.ok(patch3 || patch2 || editorSourceHash === '841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e');
 const candidate = candidateBytes.toString('utf8');
+// Run the bundled click handler with the same outer node and inner action
+// scopes as the native toolbar. Using the fixture's node directly hides shadowing.
+const headerScope = candidate.match(/hmbLibrary\}\)=>\{const ([^;]*?)hmbHeaderHost=Y\.useRef/);
+const resetBranch = candidate.match(/(\w+)===`reset`&&m\?[^;]*?onClick:(hmbEvent=>\{[^}]+\})/);
+assert.ok(headerScope && resetBranch, 'Missing production header or reset handler');
+const resetFactory = `function bundledClick(e,hmbLibrary,m,action){
+  ${headerScope[1] ? 'const '+headerScope[1].replace(/,$/,'')+';' : ''}
+  return (${resetBranch[1]}=>${resetBranch[1]}==='reset' ? (${resetBranch[2]}) : undefined)(action);
+}`;
 assert.ok(candidate.includes('return hmb130IntegratedHeader(hmbHeaderSlots,(0,Z.jsxs)'));
 assert.ok(candidate.includes(patch3 ? 'hmb130ConnectionIcon(e,hmbLibrary),me.map' : 'hmb130ConnectionIcon(e,hmbLibrary),he.map'));
 assert.equal((candidate.match(/await hmb130PrepareNewWorkflow\(\);/g)||[]).length,3, 'File New, Workflows New and Mart startup use checked transition');
@@ -47,8 +56,9 @@ const runtime = [
   stock.slice(reactStart,reactEnd) + (patch3 ? '; const Z=jt(),Tm=e(Bt()),w=Ga;' : '; const Z=wn(),Cm=e(Hn()),Pm=Cm,w=Ra;'),
 ].join('\n');
 const fixture = `
+${resetFactory}
 let hmbNativeStudioFlowEpoch=0;
-window.requests=[]; let detached=false, token=0;
+window.requests=[]; const nodes=new Map();
 window.soundSession='fixture-session'; window.soundReads=[]; window.soundScope=null;
 function hmb130SessionId(){return window.soundSession;}
 function hmb130SoundScope(){return window.soundScope;}
@@ -56,16 +66,19 @@ const fO={getState:()=>({setIsSaved(){}})}, NE=fO, rD=fO, z={success(){},error()
 function hmb130ConnectionError(error){return error.message;}
 async function hmb130ConnectionRequest(type, payload){
   requests.push({type,payload});
+  const node=nodes.get(payload.node_name)??{token:0,detached:false};
+  nodes.set(payload.node_name,node);
   if(type==='HMBGetSoundUISnapshotRequest'){
     return new Promise(resolve=>soundReads.push(pending=>resolve({node_name:payload.node_name,
       altered_workflow_state:false,snapshot:pending?{}:{__hmb_sound_transport:{stream_id:'sound-fixture-stream'}}})));
   }
   if(type==='HMBManageNodeConnectionsRequest'){
-    if(payload.expected_state_token!=='t'+token)throw Error('Unexpected token');
-    token+=1;
-    if(payload.operation==='disconnect') detached=true;
-    if(payload.operation==='reconnect') detached=false;
+    if(payload.expected_state_token!=='t'+node.token)throw Error('Unexpected token');
+    node.token+=1;
+    if(payload.operation==='disconnect') node.detached=true;
+    if(payload.operation==='reconnect') node.detached=false;
   }else if(type!=='HMBGetNodeConnectionsRequest')throw Error('Unexpected request');
+  const {detached,token}=node;
   return {node_name:payload.node_name,state_token:'t'+token,detached,can_disconnect:!detached,can_reconnect:detached,
     can_refresh:!detached,refresh_confirmed:payload.operation==='refresh',details:'',
     connections:[{kind:'wire',peer_name:'Fixture video',source_node_name:'Fixture video',target_node_name:payload.node_name,
@@ -89,17 +102,17 @@ function Widget({type,kind}){
     h('header',null,h('span',{'data-hmb-native-identity':''}),h('span',{'data-hmb-native-actions':''}),
       h('span',{'data-widget-tools':''},'Source controls')));
 }
-function Header({type,library,collapsed}){
-  const ref=Y.useRef(null), slots=hmbUse130IntegratedHeader(ref,type,type,library,collapsed);
+function Header({type,name=type,library,collapsed}){
+  const ref=Y.useRef(null), slots=hmbUse130IntegratedHeader(ref,name,type,library,collapsed);
   return hmb130IntegratedHeader(slots,h('div',{ref,'data-stock-header':''},
-    h('b',null,type),h('div',null,hmb130ConnectionIcon(type,library),...hmb130HeaderItems(type,library).map(action=>
-      h('button',{key:action,onClick:()=>action==='reset'&&hmb130RefreshConnections(type)},action)))));
+    h('b',null,type),h('div',null,hmb130ConnectionIcon(name,library),...hmb130HeaderItems(type,library,['reset']).map(action=>
+      h('button',{key:action,onClick:bundledClick(name,library,()=>window.stockResets++,action)},action)))));
 }
 function App(){
   const [folded,setFolded]=Y.useState(false),[generation,setGeneration]=Y.useState(0);
   window.setFolded=setFolded;window.remount=()=>setGeneration(value=>value+1);
   return h(Y.Fragment,null,hmbUseNativeConnectionManager(),...types.map(type=>
-    h('div',{key:type,className:'react-flow__node','data-id':type},h(Header,{type,library:'HMB_GP_Production',collapsed:folded}),
+    h('div',{key:type,className:'react-flow__node','data-id':type==='HMBImageBash'?'reset':type},h(Header,{type,name:type==='HMBImageBash'?'reset':type,library:'HMB_GP_Production',collapsed:folded}),
       h(Widget,{type,kind:'measurement'}),!folded&&h('div',{key:generation,'data-visible-wrapper':'',
         style:type==='HMBPromptLibrary'&&generation===0?{opacity:0}:{}},h(Widget,{type,kind:'visible'})))),
     h('div',{className:'react-flow__node','data-id':'Standard'},h(Header,{type:'Standard',library:'Elsewhere'})));
@@ -158,6 +171,31 @@ try {
   await page.waitForFunction(()=>requests.some(row=>row.payload.operation==='refresh'));
   const ops=await page.evaluate(()=>requests.filter(row=>row.type==='HMBManageNodeConnectionsRequest').map(row=>row.payload.operation));
   assert.deepEqual(ops,['disconnect','reconnect','refresh']);
+  assert.equal(await page.evaluate(()=>requests.find(row=>row.payload.operation==='refresh').payload.node_name),'HMBAgentLibrary');
+  await page.evaluate(()=>{
+    for(const id of ['HMBPromptLibrary','reset']){
+      [...document.querySelectorAll('[data-id="'+id+'"] [data-kind="visible"] button')].find(button=>button.textContent==='reset').click();
+    }
+    window.stockResets=0;
+  });
+  await page.waitForFunction(()=>requests.filter(row=>row.payload.operation==='refresh').length===3);
+  assert.deepEqual((await page.evaluate(()=>requests.filter(row=>row.payload.operation==='refresh').map(row=>row.payload.node_name))).sort(),
+    ['HMBAgentLibrary','HMBPromptLibrary','reset']);
+  const otherOwners=await page.evaluate(()=>{
+    const owners=[];
+    for(const node of document.querySelectorAll('.react-flow__node[data-id]')){
+      if(['HMBAgentLibrary','HMBPromptLibrary','reset','Standard'].includes(node.dataset.id))continue;
+      [...node.querySelectorAll('[data-kind="visible"] button')].find(button=>button.textContent==='reset').click();
+      owners.push(node.dataset.id);
+    }
+    return owners;
+  });
+  assert.equal(otherOwners.length,8);
+  await page.waitForFunction(()=>requests.filter(row=>row.payload.operation==='refresh').length===11);
+  assert.deepEqual((await page.evaluate(()=>requests.filter(row=>row.payload.operation==='refresh').slice(3).map(row=>row.payload.node_name))).sort(),
+    otherOwners.sort());
+  await page.locator('[data-id="Standard"]').getByRole('button',{name:'reset',exact:true}).click();
+  assert.equal(await page.evaluate(()=>stockResets),1);
   const sound=page.locator('[data-id="HMBSoundLibrary"] [data-kind="visible"]');
   const requestSound=()=>sound.evaluate(container=>{
     window.soundReplies??=0;

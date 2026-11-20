@@ -1,3 +1,4 @@
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -67,7 +68,7 @@ window.observeViewport=()=>{
 window.ready=true;
 </script>`;
 const server = http.createServer((req,res)=>{res.setHeader('Content-Type',req.url==='/widget.js'?'text/javascript; charset=utf-8':'text/html; charset=utf-8');res.end(req.url==='/widget.js'?source:html);});
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+await listenBrowserSafeLoopback(server);
 const shots = ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb','cccccccc-cccc-4ccc-8ccc-cccccccccccc','dddddddd-dddd-4ddd-8ddd-dddddddddddd','eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'];
 const fixture = (media=false) => ({
   runtime_instance_id:'echo-browser-runtime',state_revision:10,state_writer:'python',language:'ko',
@@ -100,8 +101,7 @@ try {
   // Windows may allocate an otherwise valid ephemeral port that Chromium
   // blocks (for example 6697). Allow this fixture's exact loopback port only;
   // the request route below still rejects every non-fixture destination.
-  browser=await playwright.chromium.launch({executablePath,headless:true,
-    args:[`--explicitly-allowed-ports=${server.address().port}`]});
+  browser=await playwright.chromium.launch({executablePath,headless:true});
   const page=await browser.newPage({viewport:{width:1700,height:1300}});
   const origin=`http://127.0.0.1:${server.address().port}`;
   await page.route('**/*',route=>route.request().url().startsWith(origin)?route.continue():route.abort());

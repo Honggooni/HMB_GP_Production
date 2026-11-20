@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from copy import deepcopy
 from io import BytesIO
 import importlib.util
@@ -1623,10 +1624,30 @@ try:
 
     with patch.object(asset_library, "DEFAULT_PROJECTS_ROOT", projects), patch.object(
         asset_library, "_scan_project_assets", side_effect=held_project_scan
-    ), patch.object(asset_library, "_catalog_read_once", observed_read), ThreadPoolExecutor(max_workers=2) as executor:
+    ), patch.object(asset_library, "_catalog_read_once", observed_read), ThreadPoolExecutor(max_workers=3) as executor:
         worker = asset_library.HMBImageAssetLibrary.start_catalog_warmup(threading.Event())
         try:
             assert started.wait(5)
+            cache = OrderedDict()
+            saved_a = saved_workflows[0]
+            requested = saved_a["shot_routing"]["shots"][0]["selected_source_uids"]
+            def resolve_a(wait_for_catalog):
+                return asset_library._resolve_selected_assets(
+                    saved_a, normalized=True, resolution_cache=cache, wait_for_catalog=wait_for_catalog,
+                )
+            with patch.object(asset_library, "_verified_project_relative_path",
+                              side_effect=AssertionError("Pending registration probed the media share.")):
+                preview = resolve_a(False)
+            assert [row["reason"] for row in preview["unresolved"]] == ["project_catalog_preparing"]
+            assert not preview["resolved"] and not cache, "A saved selection cannot authorize or poison the cold catalog."
+            with patch.object(asset_library, "PROJECT_REFRESH_TIMEOUT_SECONDS", 0.02):
+                timed_out = resolve_a(True)
+            assert [row["reason"] for row in timed_out["unresolved"]] == ["project_catalog_preparing"]
+            assert not cache
+            joined.clear()
+            selection = executor.submit(resolve_a, True)
+            assert joined.wait(5), "The selection worker did not join the existing project read."
+            joined.clear()
             a = executor.submit(asset_library._load_project_catalog, projects, saved_workflows[0])
             assert joined.wait(5), "Opening A started a second source read during startup"
             b = executor.submit(asset_library._load_project_catalog, projects, saved_workflows[1]).result(timeout=5)
@@ -1636,6 +1657,11 @@ try:
             worker.join(10)
         assert not worker.is_alive()
         assert a.result(timeout=5)["shot_routing"] == saved_workflows[0]["shot_routing"]
+        ready = selection.result(timeout=5)
+        assert [row["source_uid"] for row in ready["resolved"]] == requested
+        assert Path(ready["resolved"][0]["media"]).samefile(projects / "A" / "Ai_Ct_image" / "Hero.png")
+        assert not ready["unresolved"] and len(cache) == 1
+        assert resolve_a(False)["resolved"] == ready["resolved"]
         assert scans.count("A") == 1, scans
         with patch.object(asset_library, "_scan_project_assets", side_effect=AssertionError("warm project walked again")):
             for saved in reversed(saved_workflows):

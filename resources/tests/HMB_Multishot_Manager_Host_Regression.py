@@ -568,8 +568,10 @@ async def exercise(engine):
         (project_root / "hmb_image_assets.json").write_text('{"assets": []}', encoding="utf-8")
         authored_routing = deepcopy(source._current_state()["shot_routing"])
         authored_images = deepcopy(source._current_state()["assets"])
+        # This project was created after the session's first catalog read.
+        # Discover it through the same explicit refresh used by the widget.
         source_state = image_module._select_catalog_project(
-            image_module._load_project_catalog(project_root.parent, source._current_state()), project_root)
+            image_module._load_project_catalog(project_root.parent, source._current_state(), use_shared_cache=False), project_root)
         source_state["assets"] = authored_images
         source_state["shot_routing"] = dict(authored_routing, generation=2)
         source._publish_state(source_state)

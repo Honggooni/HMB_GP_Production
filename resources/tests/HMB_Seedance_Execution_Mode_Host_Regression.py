@@ -99,10 +99,10 @@ def configure(t, node, number):
     node.set_parameter_value("resume_generation_id", "job-" + str(number) * 32, initial_setup=True)
 
 
-def select(engine, t, node, shot=""):
+def select(engine, t, node, shot="", *, channel=CHANNEL):
     from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
     fields = node._hmb_seedance_mode_widget_fields()
-    value = t._seedance_widget_value(dict(channel_uuid=CHANNEL if shot else "", shot_uuid=shot),
+    value = t._seedance_widget_value(dict(channel_uuid=channel if shot else "", shot_uuid=shot),
                                       node._hmb_shot_catalog_snapshot)
     value.update(fields)
     value["selection_request"] = dict(schema=t.SEEDANCE_MODE_SELECTION_SCHEMA, version=1,

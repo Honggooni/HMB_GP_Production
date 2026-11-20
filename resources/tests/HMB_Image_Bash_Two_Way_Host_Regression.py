@@ -133,9 +133,9 @@ async def exercise(engine):
         detached_reopen = await engine.ahandle_request(DeserializeFlowFromCommandsRequest(
             serialized_flow_commands=deepcopy(detached_commands.serialized_flow_commands), broadcast_result=False))
         assert detached_reopen.succeeded(), detached_reopen.result_details
-        # Deserializing a flow no longer makes it the active editor context.
+        # Deserialization may leave the old flow current or leave no flow current.
         restored_flow = engine.flow_manager.get_flow_by_name(detached_reopen.flow_name)
-        if not engine.context_manager.has_current_flow():
+        if not engine.context_manager.has_current_flow() or engine.context_manager.get_current_flow() is not restored_flow:
             engine.context_manager.push_flow(restored_flow)
         assert engine.context_manager.get_current_flow() is restored_flow
         reopened_nodes = restored_flow.nodes

@@ -217,7 +217,7 @@ def isolated_environment(folder: Path, standard: Path, editor: Path) -> dict[str
     home = folder / "home"
     home.mkdir()
     env.update(USERPROFILE=str(home), HOME=str(home), PYTHONUTF8="1",
-               PYTHONIOENCODING="utf-8",
+               PYTHONIOENCODING="utf-8", PYTHONDONTWRITEBYTECODE="1",
                HMB_GRIPTAPE_STANDARD_LIBRARY_PATH=str(standard), HMB_IMAGE_BASH_STANDARD_LIBRARY_PATH=str(standard),
                HMB_IMAGE_BASH_EDITOR_BUNDLE_PATH=str(editor))
     return env

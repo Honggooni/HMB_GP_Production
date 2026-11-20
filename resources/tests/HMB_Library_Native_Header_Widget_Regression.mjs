@@ -2,6 +2,7 @@
 // Header discovery/actions and SDK callbacks are synthetic; the actual native
 // callbacks/hidden-measurement allocator are covered by the companion host test.
 // No live editor, installation, server, model or paid generation is contacted.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -25,7 +26,7 @@ const server=http.createServer((req,res)=>{
  res.setHeader('Content-Type',req.url==='/runtime.js'?'text/javascript':'text/html');
  res.end(req.url==='/runtime.js'?runtimeModule:'<!doctype html><meta charset="utf-8"><style>body{margin:10px;background:#111725}.react-flow__node{position:relative;width:1800px;min-height:700px}.native-probe-button{font:italic 11px Georgia;color:rgb(1,2,3);background:rgb(231,232,233);border:1px solid rgb(21,22,23);border-radius:3px;box-shadow:none;padding:2px;min-height:18px}.native-probe-title{font:13px Arial;color:#fff;white-space:nowrap}[data-hmb-native-actions]>div{display:flex;gap:4px}</style><main></main><div id="react"></div><script type="module" src="/runtime.js"></script>');
 });
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+await listenBrowserSafeLoopback(server);
 const playwright=nativeTestPlaywright();
 const report={schema:'hmb-library-native-header-widget-v1',scope:'Actual product widgets and installed React; synthetic header discovery/action/SDK boundary',
  checks:0,cases:[],sources:files.map((file,index)=>({file,sha256:createHash('sha256').update(sources[index]).digest('hex')})),

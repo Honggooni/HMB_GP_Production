@@ -1,5 +1,6 @@
 // Actual widget with synthetic delayed source ACKs in isolated Chromium.
 // No live editor, engine, source media, provider or paid generation is used.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -17,7 +18,7 @@ const server=http.createServer((req,res)=>{
   res.end(req.url==='/widget.js'?source+'\nexport { hmbCopyPromptElementAttributes };':
     '<style>body{margin:0}.react-flow__node{width:1600px;height:1450px;position:relative}#host{height:1300px}</style><div class="react-flow__node" data-id="Synthetic Prompt"><div id="host"></div></div>');
 });
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+await listenBrowserSafeLoopback(server);
 const browser=await chromium.launch({headless:true,executablePath:process.env.HMB_PROMPT_TEST_BROWSER||'C:/Program Files/Google/Chrome/Application/chrome.exe'});
 try {
   const page=await browser.newPage({viewport:{width:1800,height:1700}});

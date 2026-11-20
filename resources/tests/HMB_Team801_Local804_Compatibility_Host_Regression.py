@@ -313,8 +313,8 @@ def phase(which):
     # The fixture compares authored state, not dependency discovery. Use the
     # installed Standard edit dependencies append-only; its separate cold-load
     # and cross-library discovery regressions cover that platform contract.
-    standard = Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard"
-    os.environ.setdefault("HMB_GRIPTAPE_STANDARD_LIBRARY_PATH", str(standard))
+    default_standard = Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard"
+    standard = Path(os.environ.setdefault("HMB_GRIPTAPE_STANDARD_LIBRARY_PATH", str(default_standard)))
     standard_site = standard / ".venv/Lib/site-packages"
     if str(standard_site) not in sys.path:
         sys.path.append(str(standard_site))

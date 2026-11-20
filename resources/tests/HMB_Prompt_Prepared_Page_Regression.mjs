@@ -1,5 +1,6 @@
 // Actual Chromium widget regression. Local synthetic callbacks only; no engine,
 // provider, workflow file or billable generation endpoint is contacted.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -17,13 +18,14 @@ const imageRows = Number(process.env.HMB_PROMPT_PREPARED_IMAGES || 4);
 const baseline = process.env.HMB_PROMPT_MEASURE_BASELINE === '1';
 assert.ok([4, 50].includes(imageRows));
 let source = original;
-for (const [name, declaration] of [
+for (const [name, probe] of [
   ['normalize', 'export function normalizeState(input) {'],
   ['render', 'function render(state, includeStyle = true) {'],
-  ['tree_patch', 'export function hmbPatchPromptDashboard(container, markup) {'],
+  ['tree_patch', /export function hmbPatchPromptDashboard\([^)]*\) \{/u],
   ['fit', 'function hmbFitGroupHeightsToCenter(container, state, measuredHosts = null) {'],
 ]) {
-  assert.ok(source.includes(declaration), declaration);
+  const declaration = typeof probe === 'string' ? probe : source.match(probe)?.[0];
+  assert.ok(declaration && source.includes(declaration), String(probe));
   source = source.replace(declaration, `${declaration}\nif (globalThis.__pageProbe) { globalThis.__pageProbe.${name}++; ${name === 'normalize' ? 'globalThis.__pageStacks.push(new Error().stack);' : ''} }`);
 }
 source += '\nexport {hmbReadStoredSourceScroll};';
@@ -31,7 +33,7 @@ const server = http.createServer((request, response) => {
   response.setHeader('Content-Type', request.url === '/widget.js' ? 'text/javascript; charset=utf-8' : 'text/html; charset=utf-8');
   response.end(request.url === '/widget.js' ? source : '<!doctype html><meta charset="utf-8"><div class="react-flow__node" id="shell" style="height:1350px;width:1800px"><div style="height:96px">Synthetic native header</div><div id="host"></div></div>');
 });
-await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+await listenBrowserSafeLoopback(server);
 const browser = await playwright.chromium.launch({headless: true, executablePath: process.env.HMB_PROMPT_TEST_BROWSER || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'});
 const receipt = {schema: 'hmb-prompt-prepared-pages-v1', source_sha256: crypto.createHash('sha256').update(original).digest('hex'), external_requests: 0, paid_submissions: 0};
 try {

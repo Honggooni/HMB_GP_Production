@@ -3529,29 +3529,45 @@ def _restore_manifest_registration(asset, relative, overrides, stems):
     asset["import_source_uid"] = _clean(values.get("import_source_uid"))
 
 
-def _manifest_for_selection(root, selected, *, catalog_root=None):
+def _manifest_for_selection(root, selected, *, catalog_root=None, wait_for_catalog=False):
     # Only rows obtained from a verified project read or a successful local Add
     # can authorize a handover. Workflow/preview metadata is never authority.
     key = _session_catalog_key("catalog", root)
+    roster_key = _session_catalog_key("projects", catalog_root) if catalog_root else None
     with _SHARED_CATALOG_CACHE_LOCK:
         pinned = _CATALOG_READS.get(key)
-        session_started = bool(catalog_root and _session_catalog_key("projects", catalog_root) in _CATALOG_SESSION_LOCKS)
+        session_started = roster_key in _CATALOG_SESSION_LOCKS
+        roster = _CATALOG_READS.get(roster_key)
     if pinned is not None:
         if pinned.exception() is not None:
             return {}
-        requested = {_clean(row.get("relative_path")).casefold() for row in selected}
-        return {row["relative_path"].casefold(): row for row in pinned.result()["assets"]
-                if row.get("registered") and row["relative_path"].casefold() in requested}
-    if session_started:
-        # An offline or still-loading catalog has no verified session rows.
-        # A preview cannot launch a parallel read or authorize saved metadata.
-        return {}
-    records = _read_asset_manifest(root)
-    if any(row.get("registered") and row.get("source_kind") == "project"
-           and _clean(row.get("relative_path")).casefold() not in records for row in selected):
-        folders, paths, _ = _catalog_file_inventory(root)
-        return _manifest_at_current_paths(records, root, folders, paths)
-    return records
+        facts = pinned.result()
+    elif session_started:
+        if roster is None and not wait_for_catalog:
+            raise _ImageAssetSelectionPreparing("ImageAsset project registrations are still preparing.")
+        try:
+            catalog = roster.result() if roster is not None else _discover_shared_image_projects(catalog_root)
+            project = next((row for row in catalog["projects"]
+                            if _session_catalog_key("catalog", row["path"]) == key), None)
+            if project is None:
+                return {}
+            if not wait_for_catalog:
+                raise _ImageAssetSelectionPreparing("ImageAsset project registrations are still preparing.")
+            # Only the worker may join (or start) this roster member's single
+            # session read. Neither a saved row nor an offline index grants access.
+            facts = _read_verified_image_catalog(catalog, project, {})
+        except TimeoutError as exc:
+            raise _ImageAssetSelectionPreparing("ImageAsset project registrations are still preparing.") from exc
+    else:
+        records = _read_asset_manifest(root)
+        if any(row.get("registered") and row.get("source_kind") == "project"
+               and _clean(row.get("relative_path")).casefold() not in records for row in selected):
+            folders, paths, _ = _catalog_file_inventory(root)
+            return _manifest_at_current_paths(records, root, folders, paths)
+        return records
+    requested = {_clean(row.get("relative_path")).casefold() for row in selected}
+    return {row["relative_path"].casefold(): row for row in facts["assets"]
+            if row.get("registered") and row["relative_path"].casefold() in requested}
 
 
 def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -5345,7 +5361,7 @@ def _discover_shared_image_projects(root: Any, *, refresh: bool = False) -> Dict
     return _catalog_read_once(_session_catalog_key("projects", root), discover, refresh=refresh)
 
 
-def _read_selected_image_catalog(
+def _read_verified_image_catalog(
     catalog: Dict[str, Any], selected: Dict[str, Any], state: Dict[str, Any], *,
     use_shared_cache: bool = True, reuse_saved: bool = False,
 ) -> Dict[str, Any]:
@@ -5370,11 +5386,21 @@ def _read_selected_image_catalog(
         _prepare_catalog_scan_index(facts, normalized=True)
         return facts
 
+    return _catalog_read_once(_session_catalog_key("catalog", project), read, refresh=not use_shared_cache)
+
+
+def _read_selected_image_catalog(
+    catalog: Dict[str, Any], selected: Dict[str, Any], state: Dict[str, Any], *,
+    use_shared_cache: bool = True, reuse_saved: bool = False,
+) -> Dict[str, Any]:
+    project = Path(selected["path"])
     key = _session_catalog_key("catalog", project)
     with _SHARED_CATALOG_CACHE_LOCK:
         had_snapshot = key in _CATALOG_READS
     try:
-        facts = _catalog_read_once(key, read, refresh=not use_shared_cache)
+        facts = _read_verified_image_catalog(
+            catalog, selected, state, use_shared_cache=use_shared_cache, reuse_saved=reuse_saved,
+        )
     except (OSError, ValueError):
         if not use_shared_cache:
             raise
@@ -7834,6 +7860,7 @@ def _resolve_selected_assets(
     import_revision: int = 0,
     force: bool = False,
     normalized: bool = False,
+    wait_for_catalog: bool = False,
 ) -> Dict[str, Any]:
     """Resolve one authoritative selection for metadata and generator media.
 
@@ -7855,6 +7882,7 @@ def _resolve_selected_assets(
     )[:MAX_SELECTED_IMAGES]
     manifest_records: Dict[str, Dict[str, Any]] | None = None
     manifest_loaded = False
+    manifest_pending = False
     resolved: List[Dict[str, Any]] = []
     unresolved: List[Dict[str, Any]] = []
     for asset in ordered:
@@ -7882,23 +7910,26 @@ def _resolve_selected_assets(
                     try:
                         project_root = _clean(normalized.get("project_root"))
                         manifest_records = (
-                            _manifest_for_selection(Path(project_root), ordered, catalog_root=normalized["catalog_root"])
+                            _manifest_for_selection(
+                                Path(project_root), ordered, catalog_root=normalized["catalog_root"],
+                                wait_for_catalog=wait_for_catalog,
+                            )
                             if project_root
                             else {}
                         )
+                    except _ImageAssetSelectionPreparing:
+                        manifest_pending = True
+                        manifest_records = {}
                     except Exception:
                         # One failed shared-manifest read invalidates all project
                         # selections in this immutable resolution snapshot.
                         manifest_records = {}
-                relative_path = _verified_project_relative_path(
-                    asset,
-                    normalized,
-                    manifest_records,
-                )
+                if manifest_records:
+                    relative_path = _verified_project_relative_path(asset, normalized, manifest_records)
                 if relative_path:
                     media_value = _resolved_media_value(asset.get("path"))
                 else:
-                    reason = "project_asset_verification_failed"
+                    reason = "project_catalog_preparing" if manifest_pending else "project_asset_verification_failed"
             else:
                 media_value = _resolved_media_value(asset.get("path"))
                 if not media_value:
@@ -7915,7 +7946,8 @@ def _resolve_selected_assets(
                     (manifest_records or {}).get(relative_path.casefold(), {}).get("import_source_uid")
                 ) if relative_path else "",
             }
-            _resolution_cache_put(resolution_cache, cache_key, cached)
+            if reason != "project_catalog_preparing":
+                _resolution_cache_put(resolution_cache, cache_key, cached)
         relative_path = _clean(cached.get("relative_path"))
         media_value = _clean(cached.get("media"))
         reason = _clean(cached.get("reason"))
@@ -10473,6 +10505,8 @@ class HMBImageAssetLibrary(DataNode):
         actual = snapshot["shots"][0]["selected_source_uids"]
         if actual != requested:
             missing = [uid for uid in requested if uid not in snapshot["media_by_source_uid"]]
+            if any(_asset_resolution_cache_key(by_uid[uid], scoped, revision) not in cache for uid in missing):
+                raise _ImageAssetSelectionPreparing("ImageAsset exact Shot media is still preparing.")
             raise ValueError("ImageAsset exact Shot selected image media is unavailable: " + ", ".join(missing))
         return self._hmb_image_shot_snapshot_view(snapshot, scoped=True)
 
@@ -11384,7 +11418,7 @@ class HMBImageAssetLibrary(DataNode):
                         for snapshot in snapshots:
                             _resolve_selected_assets(
                                 snapshot, imports, resolution_cache=resolved_cache,
-                                import_revision=import_revision, normalized=True,
+                                import_revision=import_revision, normalized=True, wait_for_catalog=True,
                             )
                     except Exception as exc:
                         # A failed task must release its slot and still drain a

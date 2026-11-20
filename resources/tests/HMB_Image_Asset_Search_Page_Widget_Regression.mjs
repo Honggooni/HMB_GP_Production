@@ -1,3 +1,4 @@
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -36,7 +37,7 @@ window.answer=(request,overrides={})=>{const value=window.response(request,overr
 window.updateFull=full=>{window.full=full;window.wc.update({value:JSON.stringify(full),onChange:value=>window.writes.push(JSON.parse(value))});};window.ready=true;
 </script>`;
 const server=http.createServer((req,res)=>{res.setHeader('Content-Type',req.url.endsWith('.js')?'text/javascript; charset=utf-8':'text/html; charset=utf-8');res.end(req.url==='/widget.js'?widget:req.url==='/bridge.js'?bridge:html);});
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+await listenBrowserSafeLoopback(server);
 let browser;
 const output=path.resolve('reports/feature123-local804-20261016/search');fs.mkdirSync(output,{recursive:true});
 try{

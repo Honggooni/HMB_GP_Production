@@ -1,9 +1,9 @@
 // Product widget/PROJECT_ROOT helper in a native allocator-like Chrome tree.
-import assert from 'node:assert/strict';import crypto from 'node:crypto';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {createRequire} from 'node:module';
-const root=path.resolve(import.meta.dirname,'../..'),require=createRequire(import.meta.url),{chromium}=require(path.join(os.homedir(),'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'));
+import assert from 'node:assert/strict';import crypto from 'node:crypto';import fs from 'node:fs';import path from 'node:path';import { nativeTestBrowserPath, nativeTestPlaywright } from './_hmb_native_editor_fixture.mjs';
+const root=path.resolve(import.meta.dirname,'../..'),{chromium}=nativeTestPlaywright();
 const source=fs.readFileSync(path.join(root,'widgets/HMBImageAssetLibraryWidget.js'),'utf8');
 const receipt={scope:'Actual product widget in isolated Chromium native allocator/footer clone fixture; no live editor or provider',source_sha256:crypto.createHash('sha256').update(source).digest('hex'),external_requests:0,paid_calls:0,cases:[]};
-const browser=await chromium.launch({headless:true,executablePath:process.env.HMB_IMAGE_ASSET_TEST_BROWSER||'C:/Program Files/Google/Chrome/Application/chrome.exe'});
+const browser=await chromium.launch({headless:true,executablePath:nativeTestBrowserPath()});
 try{
  const page=await browser.newPage(),errors=[];page.on('pageerror',e=>errors.push(e.message));await page.route('**/*',route=>{receipt.external_requests++;return route.abort();});
  await page.setContent(`<style>.opacity-0{opacity:0}.pointer-events-none{pointer-events:none}.hidden-measure{visibility:hidden}.live-column{height:1000px;min-height:30px;max-height:1100px;flex:1 1 auto;overflow:auto}</style>

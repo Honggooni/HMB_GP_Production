@@ -1,10 +1,10 @@
 // Delayed native file-input selection. Product functions, no engine/media decode.
-import assert from 'node:assert/strict';import crypto from 'node:crypto';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {createRequire} from 'node:module';
-const root=path.resolve(import.meta.dirname,'../..'),require=createRequire(import.meta.url);
-const {chromium}=require(path.join(os.homedir(),'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'));
+import assert from 'node:assert/strict';import crypto from 'node:crypto';import fs from 'node:fs';import path from 'node:path';import { nativeTestBrowserPath, nativeTestPlaywright } from './_hmb_native_editor_fixture.mjs';
+const root=path.resolve(import.meta.dirname,'../..');
+const {chromium}=nativeTestPlaywright();
 const source=fs.readFileSync(path.join(root,'widgets/HMBVideoPickerLibraryWidget_v032.js'),'utf8');
 const receipt={scope:'Actual product file-input functions in isolated Chrome; native Electron OS picker not exercised',source_sha256:crypto.createHash('sha256').update(source).digest('hex'),network:0,paid:0,cases:[]};
-const browser=await chromium.launch({headless:true,executablePath:process.env.HMB_WIDGET_TEST_BROWSER||'C:/Program Files/Google/Chrome/Application/chrome.exe'});
+const browser=await chromium.launch({headless:true,executablePath:nativeTestBrowserPath()});
 try{
  const page=await browser.newPage();const errors=[];page.on('pageerror',e=>errors.push(e.message));await page.route('**/*',route=>{receipt.network++;return route.abort();});
  await page.setContent('<div id="mount"><input type="file" id="import-video-asset" hidden><button id="open">open</button></div>');

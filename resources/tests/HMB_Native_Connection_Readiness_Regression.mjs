@@ -1,5 +1,6 @@
 // Exact supported React/ReactDOM plus the current connection-manager helper.
 // All graph/transport state is synthetic; no live editor or provider is used.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -48,7 +49,7 @@ window.testReady=true;
 const module=runtime+'\n'+original.slice(jsxStart,jsxEnd)+'\n'+helper+'\n'+app;
 const html='<!doctype html><meta charset="utf-8"><title>Private connection readiness</title><div id="app"></div><script type="module" src="/fixture.js"></script>';
 const server=http.createServer((req,res)=>{res.setHeader('Content-Type',req.url==='/fixture.js'?'text/javascript':'text/html');res.end(req.url==='/fixture.js'?module:html)});
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+await listenBrowserSafeLoopback(server);
 let browser,checks=0;
 try{
  const {chromium}=nativeTestPlaywright();

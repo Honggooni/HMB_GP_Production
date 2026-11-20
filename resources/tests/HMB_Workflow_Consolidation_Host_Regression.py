@@ -311,6 +311,11 @@ async def canonical_case(engine, directory):
         LibraryRegistry.unregister_library("HMB_GP_Production", event_manager=engine.event_manager)
 
 
+def legacy_workflow_path():
+    fixture = ROOT / "reports/finish-look-manager-20261015/preupdate-workflows/hmb_draft_shot_live_test_20261013_v002.py"
+    return Path(os.environ.get("HMB_LEGACY_MIGRATION_WORKFLOW", str(fixture)))
+
+
 async def actual_saved_file_case(engine, directory, *, complete_manual_rebind=False):
     """Replay the untouched user document in an isolated engine from a copy.
 
@@ -323,8 +328,7 @@ async def actual_saved_file_case(engine, directory, *, complete_manual_rebind=Fa
     from griptape_nodes.retained_mode.events.workflow_events import RunWorkflowWithCurrentStateRequest
     # The working document changes as its owner saves the upgraded graph. Use
     # the immutable pre-update capture for this legacy5+5 migration contract.
-    fixture = ROOT / "reports/finish-look-manager-20261015/preupdate-workflows/hmb_draft_shot_live_test_20261013_v002.py"
-    source = Path(os.environ.get("HMB_LEGACY_MIGRATION_WORKFLOW", str(fixture)))
+    source = legacy_workflow_path()
     if not source.is_file():
         print("SKIP real saved document case (host-specific fixture absent)")
         return

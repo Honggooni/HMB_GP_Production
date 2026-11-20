@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import contextmanager
 import importlib.util
 from pathlib import Path
 import sys
 import tempfile
+import threading
 from unittest.mock import patch
 
 
@@ -38,7 +40,7 @@ def asset(uid: str, order: int) -> dict:
     }
 
 
-def command(node, action: str, action_id: str, payload: dict | None = None) -> None:
+def command(node, action: str, action_id: str, payload: dict | None = None, *, settle=True) -> None:
     request = {
         "schema": picker.COMMAND_SCHEMA,
         "version": picker.COMMAND_VERSION,
@@ -57,7 +59,7 @@ def command(node, action: str, action_id: str, payload: dict | None = None) -> N
         scheduled[0][2]()
     else:
         node._handle_picker_command(request)
-    if action == "delete_video_asset":
+    if settle and action == "delete_video_asset":
         worker = getattr(node, "_hmb_video_removal_sync_thread", None)
         if worker is not None:
             worker.join(10)
@@ -146,17 +148,51 @@ with tempfile.TemporaryDirectory(
         b"\x00\x00\x00\x08mdat"
         b"\x00\x00\x00\x08moov"
     )
-    command(
-        node,
-        "import_video_asset",
-        "import-stable",
-        {"source_path": str(source_mp4), "label": "Imported after delete"},
-    )
-    imported_state = state_store["value"]
-    assert imported_state["backend_ack_action_id"] == "import-stable"
-    assert imported_state["status"] == "VIDEO_READY"
-    assert imported_state["scene_stage"] == "VIDEO_READY"
-    assert len(imported_state["videos"]) == 2
+    original_bytes = source_mp4.read_bytes()
+    open_reader = picker._open_video_for_inspection
+    readers = {name: threading.Event() for name in ("HMBPicker-ImportPosters", "HMBPicker-RemovalOutputs")}
+    resume = threading.Event()
+
+    @contextmanager
+    def hold_reader(path):
+        with open_reader(path) as handle:
+            entered = readers.get(threading.current_thread().name)
+            if path == source_mp4 and entered is not None:
+                entered.set()
+                assert resume.wait(15), "Worker did not leave the overlap test"
+            yield handle
+
+    # No active Griptape project: the workers must inspect the source itself.
+    # Move only our own fixture, while BOTH workers own real read handles.
+    with patch.object(picker, "_copy_video_to_griptape_project", side_effect=RuntimeError("No active project")), \
+            patch.object(picker, "_open_video_for_inspection", hold_reader):
+        try:
+            command(node, "import_video_asset", "import-stable",
+                    {"source_path": str(source_mp4), "label": "Imported after delete"})
+            imported_state = state_store["value"]
+            assert imported_state["backend_ack_action_id"] == "import-stable"
+            assert imported_state["status"] == imported_state["scene_stage"] == "VIDEO_READY"
+            assert len(imported_state["videos"]) == 2
+            for name, entered in readers.items():
+                assert entered.wait(10), f"{name} did not open the imported reference"
+            imported = imported_state["videos"][-1]["video_uid"]
+            command(node, "delete_video_asset", "delete-overlapping-readers", {"video_uid": imported}, settle=False)
+            assert [card["video_uid"] for card in state_store["value"]["videos"]] == ["preview-b"]
+            assert source_mp4.read_bytes() == original_bytes
+            moved = source_mp4.rename(source_mp4.with_name("editor_renamed.mp4"))
+            assert moved.read_bytes() == original_bytes
+        finally:
+            resume.set()
+            # A poster can enqueue output publication. Drain in producer order
+            # before the test frees the file or installs a different node state.
+            for attribute in ("_hmb_video_import_poster_worker", "_hmb_video_removal_sync_thread"):
+                worker = getattr(node, attribute, None)
+                if worker is not None:
+                    worker.join(10)
+                    assert not worker.is_alive(), f"{worker.name} failed to settle"
+    assert [card["video_uid"] for card in published_outputs[-1]["videos"]] == ["preview-b"]
+    assert [card["video_uid"] for card in state_store["value"]["videos"]] == ["preview-b"]
+    assert moved.read_bytes() == original_bytes
 
 
 # A delayed delete command received while an operation is genuinely reserved

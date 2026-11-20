@@ -122,6 +122,23 @@ with tempfile.TemporaryDirectory(prefix="hmb-broker-origin-regression-") as temp
         )
         assert default_path != legacy_path
         assert path_a != path_b, "Separate gateways on the same host require separate tokens."
+        assert not path_a.parent.exists()
+        for origin in (DEFAULT_URL, SERVER_A, SERVER_B, LEGACY_URL):
+            try:
+                target._broker_load_token(server_url=origin)
+            except target._BrokerAuthenticationError:
+                pass
+            else:
+                raise AssertionError("An empty test profile unexpectedly reported a saved login")
+            assert not path_a.parent.exists(), "Checking for a login must not create the credential directory"
+        with mock.patch.dict(os.environ, {"APPDATA": str(Path(temporary) / "new-roaming-profile")}):
+            target._broker_clear_token(server_url=DEFAULT_URL)
+            marker = target._broker_legacy_migration_block_path(DEFAULT_URL)
+            assert marker.is_file(), "Sign-out on a fresh profile must persist the legacy migration block"
+            with mock.patch.object(target, "_broker_dpapi", side_effect=fake_dpapi):
+                target._broker_save_token("fixture-login-after-signout", server_url=DEFAULT_URL)
+            assert not marker.exists()
+            assert fake_bounded_token_load(target._broker_token_path(server_url=DEFAULT_URL)) == "fixture-login-after-signout"
 
         with (
             mock.patch.object(target, "_broker_dpapi", side_effect=fake_dpapi),

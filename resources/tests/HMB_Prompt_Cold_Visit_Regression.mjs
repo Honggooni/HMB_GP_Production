@@ -1,5 +1,6 @@
 // Measure a previously unopened 50-image Shot in the real widget and Chromium.
 // Screen paint comes from compositor frames; edit uses a browser-generated input event.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -61,7 +62,7 @@ const server = http.createServer((request, response) => {
     response.end('<!doctype html><meta charset="utf-8"><style>html,body{margin:0;overflow:hidden;background:#101522}#shell{width:1760px;height:1390px}#native-header{height:52px}</style><div class="react-flow__node" id="shell"><div id="native-header">Synthetic native header</div><div id="host"></div></div>');
   }
 });
-await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+await listenBrowserSafeLoopback(server);
 
 function markerPainted(data, target) {
   const pixels = decode(Buffer.from(data, 'base64'), { useTArray: true }).data;
@@ -84,6 +85,40 @@ function stats(values) {
     min_ms: sorted[0],
     max_ms: sorted.at(-1),
   };
+}
+
+function targetOptionPreparation(measurement, fullOptionCount) {
+  const counts = measurement.paint_samples.map(sample => sample.first_target_options_after_handler);
+  assert.ok(fullOptionCount > 1 && counts.length > 0, 'Missing cold Target menu samples');
+  if (counts.every(count => count === 1)) return 'selected_value_only';
+  if (counts.every(count => count === fullOptionCount)) return 'all_options';
+  assert.fail(`Unexpected cold Target menu contents (full menu ${fullOptionCount}): ${counts.join(', ')}`);
+}
+
+// AB/BA observations are paired by cold visit. A one-sided exact sign test
+// checks consistent slowdowns without treating ordinary timing variation as
+// a promised improvement. Zero differences carry no direction.
+function pairedTiming(before, after) {
+  assert.equal(before.length, after.length);
+  const differences = after.map((value, index) => value - before[index]);
+  const slower = differences.filter(delta => delta > 0).length;
+  const faster = differences.filter(delta => delta < 0).length;
+  const count = slower + faster;
+  const middle = Math.floor(count / 2);
+  let total = 1, slowerTail = middle >= slower ? 1 : 0, weight = 1;
+  for (let n = middle; n > 0; n--) {
+    weight *= n / (count - n + 1);
+    total += weight;
+    if (n - 1 >= slower) slowerTail += weight;
+  }
+  weight = 1;
+  for (let n = middle; n < count; n++) {
+    weight *= (count - n) / (n + 1);
+    total += weight;
+    if (n + 1 >= slower) slowerTail += weight;
+  }
+  return { slower_pairs: slower, faster_pairs: faster, tied_pairs: differences.length - count,
+    median_paired_difference_ms: stats(differences).median_ms, one_sided_sign_p: slowerTail / total };
 }
 
 function setupWidget(mode) {
@@ -156,10 +191,12 @@ function setupWidget(mode) {
         throw Error('Shot text binding changed');
       }
     };
+    let mountEpoch;
     const mount = async value => {
       controller?.cleanup();
       latest = structuredClone(value);
       publications = 0;
+      mountEpoch = performance.timeOrigin + performance.now();
       controller = widget.default(host, props(latest));
       await waitFor(() => rows().length === 50, 'Initial rows did not become available');
       await paintBoundary();
@@ -171,10 +208,33 @@ function setupWidget(mode) {
         throw Error('Expected a cold target tab and an untouched saved baseline');
       }
     };
+    const preparationAtMount = async () => {
+      // A detached target can already be warm. Observe a separate mount so
+      // traversing its transient editors adds no work to the timed samples.
+      const seen = new Set();
+      const inspect = records => {
+        for (const record of records) for (const node of [...record.addedNodes, ...record.removedNodes]) {
+          if (!(node instanceof Element)) continue;
+          const uuid = node.getAttribute('data-shot-editor');
+          if (uuid) seen.add(uuid);
+          for (const editor of node.querySelectorAll('[data-shot-editor]')) seen.add(editor.dataset.shotEditor);
+        }
+      };
+      const observer = new MutationObserver(inspect);
+      observer.observe(host, { childList: true, subtree: true });
+      try {
+        await cold();
+        inspect(observer.takeRecords());
+        if (!seen.has(shots[0].shot_uuid)) throw Error('Initial Shot editor construction was not observed');
+        return { target_built: seen.has(target), shot_editors_built: [...seen] };
+      } finally {
+        observer.disconnect();
+      }
+    };
     const click = () => {
       const before = performance.now();
       startTab(target).click();
-      return { click_epoch_ms: performance.timeOrigin + before, sync_ms: performance.now() - before,
+      return { mount_epoch_ms: mountEpoch, click_epoch_ms: performance.timeOrigin + before, sync_ms: performance.now() - before,
         rows_after_handler: rows().length,
         first_target_options_after_handler: host.querySelector('[data-kind="image"][data-index="0"] select[data-field="owner"]')?.options.length ?? null };
     };
@@ -207,7 +267,8 @@ function setupWidget(mode) {
       field.blur();
       await waitFor(() => rows().length === 50 && latest.images[0]?.label === edit, 'First edit did not publish or rows did not complete');
       expectShot(2, edit);
-      return { ...timing, click_to_editable_control_ms: editableAt - timing.click_epoch_ms,
+      return { ...timing, mount_to_working_edit_ms: inputAt - timing.mount_epoch_ms,
+        click_to_editable_control_ms: editableAt - timing.click_epoch_ms,
         click_to_working_edit_ms: inputAt - timing.click_epoch_ms,
         click_to_input_handlers_complete_ms: inputHandlerDoneAt - timing.click_epoch_ms,
         mounted_rows_when_editing: mountedWhenEditing };
@@ -316,7 +377,7 @@ function setupWidget(mode) {
       controller.cleanup();
       return true;
     };
-    window.coldPromptTest = { cold, click, earlyEdit, compatibility, beginKeyboardTarget, checkKeyboardFocus, checkKeyboardSelection };
+    window.coldPromptTest = { cold, click, earlyEdit, compatibility, preparationAtMount, beginKeyboardTarget, checkKeyboardFocus, checkKeyboardSelection };
   });
 }
 
@@ -340,7 +401,8 @@ try {
     await page.evaluate(setupWidget, mode);
     const session = await page.context().newCDPSession(page);
     contexts[mode] = { page, session };
-    report.measurements[mode] = { paint_samples: [], edit_samples: [] };
+    report.measurements[mode] = { paint_samples: [], edit_samples: [],
+      mount_preparation: await page.evaluate(() => window.coldPromptTest.preparationAtMount()) };
   }
 
   for (let index = 0; index < sampleCount; index++) {
@@ -392,6 +454,7 @@ try {
         assert.ok(painted, 'No compositor frame displayed the new Shot image row');
         report.measurements[mode].paint_samples.push({ ...click,
           click_to_first_painted_row_ms: painted.time_ms - click.click_epoch_ms,
+          mount_to_first_painted_row_ms: painted.time_ms - click.mount_epoch_ms,
           previous_unpainted_after_click_ms: lastUnpainted ? lastUnpainted.time_ms - click.click_epoch_ms : null,
         });
       } finally {
@@ -407,6 +470,8 @@ try {
     const measurement = report.measurements[mode];
     measurement.first_painted_row = stats(measurement.paint_samples.map(sample => sample.click_to_first_painted_row_ms));
     measurement.first_working_edit = stats(measurement.edit_samples.map(sample => sample.click_to_working_edit_ms));
+    measurement.mount_to_first_painted_row = stats(measurement.paint_samples.map(sample => sample.mount_to_first_painted_row_ms));
+    measurement.mount_to_first_working_edit = stats(measurement.edit_samples.map(sample => sample.mount_to_working_edit_ms));
     measurement.first_editable_control = stats(measurement.edit_samples.map(sample => sample.click_to_editable_control_ms));
     measurement.first_edit_handlers_complete = stats(measurement.edit_samples.map(sample => sample.click_to_input_handlers_complete_ms));
     measurement.click_handler = stats(measurement.paint_samples.map(sample => sample.sync_ms));
@@ -421,11 +486,39 @@ try {
   }
   assert.deepEqual(errors, []);
   assert.equal(report.external_requests, 0);
-  // An already-installed candidate is an A/A functional check, not evidence
-  // of a new speedup. Timing noise must not fabricate an improvement claim.
-  if (modes.length === 2 && report.source_sha256.before !== report.source_sha256.after) {
-    for (const key of ['first_painted_row', 'first_working_edit']) {
-      assert.ok(report.measurements.after[key].median_ms < report.measurements.before[key].median_ms, `${key} median did not improve`);
+  const preparation = Object.fromEntries(modes.map(mode => [mode,
+    targetOptionPreparation(report.measurements[mode], report.compatibility[mode].target_option_count)]));
+  report.performance_check = { target_option_preparation: preparation, comparison: 'single_variant', paired: {} };
+  if (modes.includes('after')) {
+    assert.equal(preparation.after, 'selected_value_only', 'Cold shots must defer full Target menus until needed');
+    assert.equal(report.measurements.after.mount_preparation.target_built, false, 'Heavy catalogs must not build unopened Shot editors at mount');
+  }
+  if (modes.length === 2) {
+    const before = report.measurements.before, after = report.measurements.after;
+    const comparison = report.source_sha256.before === report.source_sha256.after ? 'identical_source'
+      : before.mount_preparation.target_built ? 'legacy_prebuilt_to_cold'
+      : preparation.before === 'all_options' ? 'legacy_eager_to_deferred' : 'both_deferred';
+    report.performance_check.comparison = comparison;
+    // A legacy prebuilt page paid its preparation cost before the click.
+    // Compare real mount-to-interaction there; retain click-only evidence
+    // and compare click-to-interaction when both targets were truly cold.
+    const metrics = comparison === 'legacy_prebuilt_to_cold' ? [
+      ['mount_to_first_painted_row', 'paint_samples', 'mount_to_first_painted_row_ms'],
+      ['mount_to_first_working_edit', 'edit_samples', 'mount_to_working_edit_ms'],
+    ] : [
+      ['first_painted_row', 'paint_samples', 'click_to_first_painted_row_ms'],
+      ['first_working_edit', 'edit_samples', 'click_to_working_edit_ms'],
+    ];
+    for (const [metric, samples, field] of metrics) {
+      const paired = pairedTiming(before[samples].map(sample => sample[field]), after[samples].map(sample => sample[field]));
+      report.performance_check.paired[metric] = paired;
+      if (comparison === 'legacy_eager_to_deferred' || comparison === 'legacy_prebuilt_to_cold') {
+        assert.ok(after[metric].median_ms < before[metric].median_ms, `${metric} median did not improve over eager Target menus`);
+      } else if (comparison === 'both_deferred') {
+        // Two timing endpoints share a 1% false alarm budget. No minimum
+        // delay is exempt: a consistently slower candidate fails the check.
+        assert.ok(paired.one_sided_sign_p > 0.005, `${metric} consistently slower across paired cold visits (${JSON.stringify(paired)})`);
+      }
     }
   }
   report.passed = true;

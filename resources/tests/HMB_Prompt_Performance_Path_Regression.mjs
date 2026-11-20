@@ -158,7 +158,10 @@ const source = fs.readFileSync(
 const instrumentedSource = source.replace(
   "export function normalizeState(input) {",
   "export function normalizeState(input) { globalThis.__hmbPromptNormalizeCalls += 1;",
-);
+).replace(
+  "function normalizeImageBindingFields(item, videoCount = MAX_VIDEOS) {",
+  "function normalizeImageBindingFields(item, videoCount = MAX_VIDEOS) { globalThis.__hmbPromptBindingVisits++;",
+) + "\nexport {render as renderForTest};";
 assert.notEqual(instrumentedSource, source);
 const instrumentedWidget = await import(
   `data:text/javascript;base64,${Buffer.from(instrumentedSource).toString("base64")}`
@@ -168,6 +171,7 @@ const largePropsValue = JSON.stringify({
     slot: index + 1,
     label: `Image ${index + 1}`,
     present: true,
+    color_picks: ["Red", "Blue", "Green"],
   })),
   videos: Array.from({ length: 10 }, (_unused, index) => ({
     slot: index + 1,
@@ -187,6 +191,12 @@ assert.equal(
   1,
   "One retained-mode echo must normalize a 50-image/10-video payload once.",
 );
+const largeState = instrumentedWidget.normalizeState(JSON.parse(largePropsValue));
+globalThis.__hmbPromptBindingVisits = 0;
+const largeMarkup = instrumentedWidget.renderForTest(largeState, false);
+assert.equal(globalThis.__hmbPromptBindingVisits, 50, "A render must normalize each image binding once.");
+assert.equal((largeMarkup.match(/data-field="color_picks"/g) || []).length, 150);
+delete globalThis.__hmbPromptBindingVisits;
 delete globalThis.__hmbPromptNormalizeCalls;
 const cssMatch = source.replace(/\r\n/g, "\n").match(/includeStyle \? `<style>\n([\s\S]*?)<\/style>` : ""/);
 assert.ok(cssMatch, "The Prompt stylesheet must remain behind the full-mount guard.");
@@ -215,7 +225,7 @@ assert.match(
 );
 assert.match(
   source,
-  /const dynamicMarkup = render\(state, false\);[\s\S]*hmbPatchPromptDashboard\(container, dynamicMarkup\)/,
+  /const dynamicMarkup = render\(state, false\);[\s\S]*hmbPatchPromptDashboard\(container, dynamicMarkup, replaceEditor\)/,
   "Retained remounts must render and parse only dynamic dashboard markup.",
 );
 assert.doesNotMatch(

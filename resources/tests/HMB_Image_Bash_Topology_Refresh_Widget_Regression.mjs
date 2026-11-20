@@ -1,14 +1,14 @@
 // Actual product widget in isolated Chromium; topology and host replies are
 // synthetic. No running Griptape app, Engine, file, provider, or install changes.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
-import os from 'node:os';
-import path from 'node:path';
-import {createRequire} from 'node:module';
 
-const require=createRequire(import.meta.url);
-const {chromium}=require(path.join(os.homedir(),'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'));
+
+import { nativeTestBrowserPath, nativeTestPlaywright } from './_hmb_native_editor_fixture.mjs';
+
+const {chromium}=nativeTestPlaywright();
 const source=fs.readFileSync(new URL('../../widgets/HMBImageBashWidget.js',import.meta.url),'utf8');
 const html=`<!doctype html><meta charset=utf-8><style>body{background:#101420;color:white}.react-flow__node{width:800px;min-height:80px}#measurement{visibility:hidden}#opacity-parent{opacity:0}</style>
 <div class=react-flow__nodes><div class=react-flow__node data-id="Library A"><div data-hmb-native-node-type=HMBImageAssetLibrary></div><section data-image-bash-panel=workspace-a></section></div>
@@ -30,10 +30,10 @@ window.pause=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimation
 window.addCarrier('main');window.addCarrier('measurement');window.addCarrier('opacity-clone');window.ready=true;
 </script>`;
 const server=http.createServer((request,response)=>{response.setHeader('Content-Type',request.url==='/widget.js'?'text/javascript':'text/html');response.end(request.url==='/widget.js'?source:html);});
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+await listenBrowserSafeLoopback(server);
 let browser;
 try{
- browser=await chromium.launch({executablePath:'C:/Program Files/Google/Chrome/Application/chrome.exe',headless:true});
+ browser=await chromium.launch({executablePath:nativeTestBrowserPath(),headless:true});
  const page=await browser.newPage();const errors=[];page.on('pageerror',e=>errors.push(e.message));
  await page.goto('http://127.0.0.1:'+server.address().port);await page.waitForFunction(()=>window.ready);await page.evaluate(()=>window.pause());
  assert.deepEqual(await page.evaluate(()=>window.writes.map(v=>[v.id,v.payload.hmb_image_bash_command.operation])),[['main','refresh']]);

@@ -41,9 +41,9 @@ def load_helpers():
     return module
 
 
-def snapshots(images, picker, source, catalog):
+def snapshots(images, picker, source, picker_node, catalog):
     rows = [{**row, "selected_source_uids": []} for row in catalog["shots"]]
-    document = {"channel_uuid": catalog["channel_uuid"], "generation": 1,
+    document = {"channel_uuid": catalog["channel_uuid"], "generation": catalog["generation"],
         "project_id": source._hmb_project_identity()["project_id"], "shots": rows, "ordered_assets": []}
     image = {"schema": images.SHOT_ROUTING_SNAPSHOT_SCHEMA, "version": 1,
         "publisher_instance_uuid": catalog["publisher_instance_uuid"], **document,
@@ -51,13 +51,16 @@ def snapshots(images, picker, source, catalog):
         "media_sha256": digest({"media_descriptors": []}), "media_by_source_uid": {}}
     payload, _media = picker._build_synchronized_video_outputs(picker._default_widget_state())
     picker_rows = [{**row, "picker_payload": deepcopy(payload)} for row in rows]
-    video_document = {"channel_uuid": catalog["channel_uuid"], "generation": 1,
+    video_document = {"channel_uuid": catalog["channel_uuid"],
+        "generation": picker_node._hmb_allocate_shot_snapshot_generation("offline-empty-video"),
         "shots": picker_rows, "ordered_videos": []}
     video = {"schema": "hmb-picker-shot-routing-snapshot", "version": 1,
-        "publisher_instance_uuid": "77777777-7777-4777-8777-777777777777", **video_document,
+        "publisher_instance_uuid": picker_node._hmb_picker_publisher_uuid, **video_document,
         "metadata_sha256": digest(video_document),
         "media_sha256": digest({"media_descriptors": []}), "media_by_source_uid": {}}
-    return image, video
+    # A real reopen may already have published a scoped Shot view. Use each
+    # physical publisher's clock for the new fixture metadata.
+    return source._hmb_image_shot_snapshot_view(image), video
 
 
 async def exercise(engine, directory, helpers, native_hydration, native_schedule):
@@ -83,7 +86,7 @@ async def exercise(engine, directory, helpers, native_hydration, native_schedule
         picker_node = next(node for node in flow.nodes.values() if node.metadata.get("node_type") == "HMBVideoPickerLibrary")
         catalog = source._hmb_shot_routing_catalog()
         assert len(catalog["shots"]) == 5
-        image_snapshot, picker_snapshot = snapshots(images, picker, source, catalog)
+        image_snapshot, picker_snapshot = snapshots(images, picker, source, picker_node, catalog)
         prompts._validate_shot_routing_snapshot(image_snapshot)
         prompts._validate_picker_shot_routing_snapshot(picker_snapshot, expected_channel_uuid=catalog["channel_uuid"])
         source._hmb_shot_routing_snapshot = lambda **kwargs: deepcopy(image_snapshot)
@@ -201,6 +204,10 @@ async def exercise(engine, directory, helpers, native_hydration, native_schedule
 
 
 def main():
+    helpers = load_helpers()
+    if not helpers.legacy_workflow_path().is_file():
+        print(f"HMB_PROMPT_HYDRATION_REBASE_HOST=SKIP (saved workflow fixture absent: {helpers.legacy_workflow_path()})")
+        return
     with tempfile.TemporaryDirectory(prefix="hmb-prompt-rebase-") as directory, ExitStack() as stack:
         root = Path(directory)
         for name in ("APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "GTN_CONFIG_WORKSPACE_DIRECTORY", "HMB_IMAGE_PROJECTS_ROOT"):
@@ -229,7 +236,6 @@ def main():
         stack.enter_context(mock.patch.object(agents.HMBAgentLibrary, "process", deny_external))
         stack.enter_context(mock.patch.object(generators.HMBSeedanceGeneration, "_process_generation", deny_external))
         logging.disable(logging.CRITICAL)
-        helpers = load_helpers()
         with engine_scope() as engine:
             asyncio.run(exercise(engine, root, helpers, native_hydration, native_schedule))
         assert ATTEMPTS == []

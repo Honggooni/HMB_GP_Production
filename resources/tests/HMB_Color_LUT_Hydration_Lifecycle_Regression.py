@@ -55,7 +55,7 @@ class ColorLUTHydrationLifecycle(unittest.TestCase):
         ensured=self.engine.handle_request(EnsureWorkflowAndFlowRequest(flow_name='ColorLUTHydration'))
         self.assertTrue(ensured.succeeded(),str(ensured.result_details))
         self.flow=self.engine.flow_manager.get_flow_by_name(ensured.flow_name)
-        for name in ('schedule_post_registration_reconcile','schedule_post_hydration_reconcile','reconcile_shot_routing'):
+        for name in ('schedule_post_registration_reconcile','schedule_post_hydration_reconcile','schedule_post_deletion_reconcile','reconcile_shot_routing'):
             patch=mock.patch.object(routing,name);patch.start();self.addCleanup(patch.stop)
         self.node=target.HMBColorLUTLibrary(name='Saved Color LUT')
         from _hmb_fixture_sdk import register_fixture_node
@@ -63,6 +63,35 @@ class ColorLUTHydrationLifecycle(unittest.TestCase):
         self.publish=mock.patch.object(self.node,'publish_update_to_parameter');self.publisher=self.publish.start();self.addCleanup(self.publish.stop)
         self.queue=mock.patch.object(self.node,'_queue_source');self.queued=self.queue.start();self.addCleanup(self.queue.stop)
         self.command=mock.patch.object(self.node,'_command');self.commands=self.command.start();self.addCleanup(self.command.stop)
+        self.addCleanup(self.close_node)
+
+    def close_node(self):
+        self.node.after_node_deleted()
+        for worker in (self.node._manual_projects_worker,self.node._episode_worker,self.node._source_worker,self.node._web_upload_probe):
+            if worker is not None:
+                worker.join(5)
+                self.assertFalse(worker.is_alive(),worker.name)
+
+    def test_deleted_node_ignores_late_project_read(self):
+        entered, release = threading.Event(), threading.Event()
+        def deferred_bridge(_origin):
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("Test did not release the local project lookup")
+            return None
+
+        with mock.patch.object(target,'_usage_bridge',side_effect=deferred_bridge), mock.patch.object(self.node,'_publish') as publish:
+            self.node._schedule_manual_projects(force=True)
+            try:
+                self.assertTrue(entered.wait(3))
+                self.node.after_node_deleted()
+                before=copy.deepcopy(self.node._hmb_color_lut_state)
+            finally:
+                release.set()
+                self.node._manual_projects_worker.join(5)
+            self.assertFalse(self.node._manual_projects_worker.is_alive())
+            self.assertEqual(self.node._hmb_color_lut_state,before)
+            publish.assert_not_called()
 
     def send(self,value,*,initial=True,parameter=target.UI):
         result=self.engine.handle_request(SetParameterValueRequest(node_name=self.node.name,parameter_name=parameter,value=copy.deepcopy(value),initial_setup=initial,broadcast_result=False))
@@ -213,5 +242,5 @@ class ColorLUTHydrationLifecycle(unittest.TestCase):
 if __name__=='__main__':
     suite=unittest.defaultTestLoader.loadTestsFromTestCase(ColorLUTHydrationLifecycle)
     result=unittest.TextTestRunner(verbosity=2).run(suite)
-    if result.wasSuccessful() and not result.skipped:print('HMB_COLOR_LUT_HYDRATION_LIFECYCLE=PASS (12 real native initial_setup regressions, synthetic blocked-probe boundary, no export/model execution)')
+    if result.wasSuccessful() and not result.skipped:print(f'HMB_COLOR_LUT_HYDRATION_LIFECYCLE=PASS ({result.testsRun} native regressions including late project lookup after deletion, no export/model execution)')
     raise SystemExit(0 if result.wasSuccessful() and not result.skipped else 1)

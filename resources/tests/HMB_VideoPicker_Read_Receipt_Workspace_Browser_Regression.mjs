@@ -1,5 +1,6 @@
 // A crossed Shot-row echo must protect media order without hiding a READ ACK
 // or retaining the old EMPTY/READING_SCENE state behind completed controls.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -42,10 +43,10 @@ import mount,* as helpers from '/widget.js';window.mountWidget=mount;window.help
 window.props=value=>({value,onChange:next=>window.publications.push(structuredClone(next))});window.ready=true;
 </script>`;
 const server=http.createServer((req,res)=>{res.setHeader('Content-Type',req.url==='/widget.js'?'text/javascript; charset=utf-8':'text/html; charset=utf-8');res.end(req.url==='/widget.js'?source:html);});
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+await listenBrowserSafeLoopback(server);
 let browser;
 try{
-  browser=await playwright.chromium.launch({executablePath,headless:true,args:[`--explicitly-allowed-ports=${server.address().port}`]});
+  browser=await playwright.chromium.launch({executablePath,headless:true});
   const page=await browser.newPage({viewport:{width:1700,height:1300}});page.setDefaultTimeout(10000);
   const origin=`http://127.0.0.1:${server.address().port}`;
   await page.route('**/*',route=>route.request().url().startsWith(origin)?route.continue():route.abort());

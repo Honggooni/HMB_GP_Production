@@ -1,4 +1,5 @@
 // Actual Chrome: transport races, original-audio preview ownership and native disabled state.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -38,7 +39,7 @@ const server=http.createServer((req,res)=>{if(/^\/tone(?:[23])?\.wav/.test(req.u
  if(range){const start=Number(range[1]),end=Math.min(wav.length-1,range[2]?Number(range[2]):wav.length-1);res.writeHead(206,{'Content-Range':`bytes ${start}-${end}/${wav.length}`,'Content-Length':end-start+1});res.end(wav.subarray(start,end+1));}
  else{res.setHeader('Content-Length',wav.length);res.end(wav);}
  }else{res.setHeader('Content-Type',req.url==='/widget.js'?'text/javascript; charset=utf-8':'text/html; charset=utf-8');res.end(req.url==='/widget.js'?source:html);}});
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+await listenBrowserSafeLoopback(server);
 let browser;
 try{
  browser=await playwright.chromium.launch({executablePath,headless:true,args:['--autoplay-policy=no-user-gesture-required']});

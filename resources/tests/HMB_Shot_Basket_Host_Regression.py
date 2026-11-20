@@ -77,9 +77,12 @@ async def confirm_new_cgt_shot(image, image_module, read_status):
             hierarchy_request=command, bind_only=True))
         status = await wait_for(read_status, lambda data: data.get("cgt_bound") is True)
         verify.assert_called_once()
-    assert status["shot_uuid"] == shot and status["shot_uuid"] != original_shot, status
-    assert status["shots"] == [dict(shot_uuid=shot, name=CGT_SHOT_NAME, number=2)], status
-    return status
+    assert status["shot_uuid"] == original_shot, status
+    assert status["shots"] == [
+        dict(shot_uuid=original_shot, name=shot_routing["shots"][0]["name"], number=1),
+        dict(shot_uuid=shot, name=CGT_SHOT_NAME, number=2),
+    ], status
+    return status, shot
 
 
 def media_files(out):
@@ -169,12 +172,14 @@ async def exercise(engine, phase, out):
     request_type = PayloadRegistry.get_type("HMBShotBasketRequest")
     assert request_type is not None, "HMB library bootstrap did not register the native basket event"
 
-    async def request(action, *, flow_name="", success=True, **payload):
+    async def request(action, *, flow_name="", success=True, expected_error=None, **payload):
         harness.REQUESTS += 1
         event = request_type(action=action, payload={"flow_name": flow_name, **payload}, broadcast_result=False)
         result = await engine.ahandle_request(event)
         data = getattr(result, "data", {})
         assert result.succeeded() is success, (result.result_details, data)
+        if expected_error:
+            assert expected_error in str(result.result_details), result.result_details
         return data
 
     async def catalog(flow_name, shot_id, kind, name):
@@ -272,7 +277,7 @@ async def exercise(engine, phase, out):
             assert reopened.status.name == "GOOD", reopened.status
             flow_name = engine.context_manager.get_current_flow().name
             status = await wait_for(lambda: request("status", flow_name=flow_name),
-                                    lambda data: data["status"] == "ready" and data["shot_uuid"] == expected["shot_id"])
+                                    lambda data: data["status"] == "ready" and data["shot_uuid"] == expected["active_shot_id"])
             assert status["shots"] == expected["shots"]
             nodes = active_nodes()
             assert {kind: node.name for kind, node in nodes.items()} == expected["nodes"]
@@ -313,17 +318,22 @@ async def exercise(engine, phase, out):
             nodes = active_nodes()
             generator = nodes["generator"]
             generator._reconcile_shared_shot_routing()
-            assert generator._hmb_seedance_execution_mode() == "auto", generator._shot_identity()
-            assert not generator._hmb_shot_channel_subscription()["enabled"]
-            assert not any(edge[2] == generator.name and edge[3] == "prompt" for edge in retained_edges(engine))
-            status = await confirm_new_cgt_shot(nodes["image"], modules["image"], read_status)
+            local = nodes["image"]._current_state()["shot_routing"]
+            first = local["active_shot_uuid"]
+            assert generator._hmb_shot_channel_subscription()["shot_uuid"] == first
+            assert generator._hmb_seedance_execution_mode() == "shot"
+            harness.select(engine, modules["generator"], generator, first, channel=local["channel_uuid"])
+            status, target = await confirm_new_cgt_shot(nodes["image"], modules["image"], read_status)
+            assert generator._hmb_shot_channel_subscription()["shot_uuid"] == first
+            harness.select(engine, modules["generator"], generator, target, channel=local["channel_uuid"])
             await wait_for(read_status, lambda _: generator._current_remote_prompt_route()["connected"])
-            harness.record("cgt_bind_only_selects_exact_second_shot_and_managed_remote", shot_id=status["shot_uuid"])
+            harness.record("cgt_add_preserves_generator_until_explicit_second_shot_selection", shot_id=target)
         else:
             status = await wait_for(read_status, lambda data: data["status"] == "ready" and data["shot_uuid"])
-        shot_id = str(UUID(status["shot_uuid"]))
+            assert [row["name"] for row in status["shots"]] == [SHOT_NAME], status
+            target = status["shot_uuid"]
+        shot_id = str(UUID(target))
         assert status["project_id"].casefold() == PROJECT_ID
-        assert [row["name"] for row in status["shots"]] == [CGT_SHOT_NAME if cgt else SHOT_NAME], status
         nodes = active_nodes()
         harness.record("native_empty_launcher_discovers_project_and_creates_six_nodes", flow=flow_name, shot_id=shot_id)
 
@@ -341,9 +351,19 @@ async def exercise(engine, phase, out):
         subprocess.run([_find_ffmpeg(), "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=96x64:r=24",
                         "-t", "0.25", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(clip)], check=True)
         with mock.patch.object(modules["video"], "_choose_video_asset_files", return_value=[str(clip)]) as choose:
+            video_target = {"flow_name": flow_name, "shot_uuid": shot_id, "kind": "video"}
+            basket_module = importlib.import_module("_hmb_shot_basket")
+            with mock.patch.object(basket_module, "_picker_shot", return_value=None):
+                before_video_route = await request("catalog", **video_target)
+                assert before_video_route["status"] == "preparing" and not before_video_route["items"]
+                await request("browse", **video_target, request_id="native-browse", success=False,
+                              expected_error="VideoPicker의 샷 연결을 준비 중입니다.")
+                choose.assert_not_called()
+            await wait_for(lambda: request("catalog", **video_target), lambda value: value["status"] == "ready")
             await request("browse", flow_name=flow_name, shot_uuid=shot_id, kind="video", request_id="native-browse")
             staged_rows = await catalog(flow_name, shot_id, "video", "basket-clip")
             choose.assert_called_once()
+        harness.record("unready_video_route_rejects_without_opening_and_same_request_retries", shot_id=shot_id)
         staged = media_id(staged_rows, "basket-clip")
         assert staged_rows["items"][0].get("staged") is True and staged_rows["items"][0]["selected"] is False
         selection = {"image": [second, first], "video": [staged], "sound": [sound]}
@@ -387,7 +407,8 @@ async def exercise(engine, phase, out):
         serialized = harness.send(engine, SerializeFlowToCommandsRequest(flow_name=flow_name)).serialized_flow_commands
         await harness.asend(engine, SaveWorkflowFileFromSerializedFlowRequest(file_name=saved.stem,
             file_path=str(saved), display_name=SHOT_NAME, serialized_flow_commands=serialized))
-        identity.write_text(json.dumps({"shot_id": shot_id, "shots": status["shots"], "selection": selection,
+        identity.write_text(json.dumps({"shot_id": shot_id, "active_shot_id": status["shot_uuid"],
+            "shots": status["shots"], "selection": selection,
             "nodes": {kind: node.name for kind, node in nodes.items()}, "edges": edges}, ensure_ascii=False), "utf-8")
         harness.record("native_workflow_saved_without_executing_the_graph", workflow_sha256=hashlib.sha256(saved.read_bytes()).hexdigest())
 

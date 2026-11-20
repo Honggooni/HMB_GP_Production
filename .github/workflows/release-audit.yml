@@ -357,6 +357,13 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Seedance writes SDK-readable output metadata for MOV, MP4 and last-frame PNG files. Indexed PNG destinations now allocate the next available name, including concurrent saves.",
+            "- Seedance resolves output names in the workflow that owns the destination and reuses the filename search when publishing a completed video.",
+            "- Color LUT and other Broker clients can check sign-in status without creating a credentials directory on first use.",
+            "- ImageAsset checks the local catalog again when a restored project finishes loading. Saved Shot selections can resolve their images after an empty first lookup.",
+            "- HMBPrompt preserves authored edits on publisher changes and prevents a delayed acknowledgement from restoring a deselected image.",
+            "- Opening a different workflow with the same Shot UUID loads its own Prompt fields. Pending caret restoration respects the field selected by the user.",
+            "- Native Reset follows the selected HMB node on supported Griptape editors. Blender snapshots honor the selected Original, Mask, Depth and Motion Guide passes.",
             "- ImageAsset reuses a project catalog in the local Griptape workspace. Startup and manual refresh check the shared registry. Concurrent Add operations take turns writing to the registry.",
             "- HMB nodes zoom on hover and scroll inside a selected scroll area. Its outline marks the active area. HMBPrompt opens with more room for video and sound controls.",
             "- VideoPicker adds Teal and Brown actor colors and an Olive ghost color. Saved jobs can still use their original palettes.",

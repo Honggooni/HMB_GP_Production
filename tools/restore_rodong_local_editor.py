@@ -14,7 +14,7 @@ from typing import NamedTuple
 STOCK_BUNDLE = "index-B4peacnU.js"
 STOCK_DIGEST = "841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e"
 STOCK_ENTRY_DIGEST = "561a68840af19500274dbbb8ef2c46e9ac8a619564e246b8b285137e63569a82"
-OVERLAY_DIGEST = "355e3f9500e457ae6834c0b92b89a6dadb8724d05366299a84522399507a25d9"
+OVERLAY_DIGEST = "6520db2fe138c84b694edd0cc58d7c652b3080e614a6eed515dcef633b52732f"
 OVERLAY = f"index-hmb-rodong-{OVERLAY_DIGEST[:16]}.js"
 STOCK_REF = f"./assets/{STOCK_BUNDLE}".encode("ascii")
 STOCK_SCRIPT = b'<script type="module" crossorigin src="' + STOCK_REF + b'"></script>'
@@ -41,13 +41,13 @@ EDITOR_1300 = EditorProfile(STOCK_BUNDLE, STOCK_DIGEST, STOCK_ENTRY_DIGEST, OVER
 EDITOR_1302 = EditorProfile("index-DW0x78hS.js",
     "8433f4e108e2416707c6877354234607aaa2cb8b4e15fe080856fdd656771d17",
     "17312cf62335309843550d34f0b7eedd2ddd8dce0584eb9c116448e202abebc3",
-    "ba1b96f56bc3c4651733677cc469c152d98d3cf47b8dd85f8693f4fe897c7b39")
+    "a66b4418781b1f850b93011cd2868a0cb5bb0cb5329546d9016f31b9542c255a")
 
 
 EDITOR_1303 = EditorProfile("index-Dq4UDcw5.js",
     "b0c4f9d4c8d78243b5f1d505187d1c5e49119854912a2e516be03170590fc4fc",
     "c6e7a5b5b5604ae3fd0330c90570ab4e203884e67d187712bc360538065ef582",
-    "38cbcd43a1959b4ff0642f346f9f0dba5108b84db807c37e241170de09491152")
+    "19ffa1631d33cc31ab62724563b25355202a99924461be936fec9fd44a5f372b")
 
 
 def editor_profile(entry: bytes) -> EditorProfile:
@@ -70,7 +70,11 @@ def stock_entry_from_active(entry: bytes, overlay_name: str) -> bytes:
     profile = editor_profile(entry)
     if sha256(entry).hexdigest() == profile.entry_digest:
         return entry
-    previous = PREVIOUS_OVERLAYS if profile == EDITOR_1300 else ()
+    previous = {
+        EDITOR_1300: (*PREVIOUS_OVERLAYS, "index-hmb-rodong-355e3f9500e457ae.js"),
+        EDITOR_1302: ("index-hmb-rodong-ba1b96f56bc3c465.js",),
+        EDITOR_1303: ("index-hmb-rodong-38cbcd43a1959b4f.js",),
+    }[profile]
     for name in (overlay_name, *previous):
         overlay_ref = f"./assets/{name}".encode("ascii")
         ref = profile.ref

@@ -1,3 +1,4 @@
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -19,7 +20,7 @@ import mount,* as picker from '/widget.js';import bridge from '/bridge.js';
 window.mountWidget=mount;window.mountBridge=bridge;window.picker=picker;window.publications=[];window.ready=true;
 </script>`;
 const server=http.createServer((req,res)=>{const js=req.url==='/widget.js'||req.url==='/bridge.js';res.setHeader('Content-Type',js?'text/javascript; charset=utf-8':'text/html; charset=utf-8');res.end(req.url==='/widget.js'?source:req.url==='/bridge.js'?bridgeSource:html);});
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+await listenBrowserSafeLoopback(server);
 let browser;
 try{
   browser=await playwright.chromium.launch({executablePath,headless:true});

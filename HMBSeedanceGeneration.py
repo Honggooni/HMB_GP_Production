@@ -106,6 +106,31 @@ def _write_generation_sidecar(file_path: Path, metadata: Any, *, workflow: Any =
     write_sidecar(*positional, **keyword)
 
 
+def _generation_file(path: str | MacroPath, workflow: Any) -> File:
+    return File(path, workflow=workflow) if workflow is not None else File(path)
+
+
+async def _write_generation_png_stage(path: Path, content: bytes, workflow: Any = None) -> Path:
+    from griptape_nodes.retained_mode.events import os_events
+
+    # In current SDKs File.awrite_bytes does not expose the image embedding
+    # option. Its underlying WriteFileRequest does. Keep this local to the
+    # staging write so unrelated nodes retain their own embedding settings.
+    options = dict(existing_file_policy=ExistingFilePolicy.FAIL, append=False,
+                   create_parents=False, coerce_extension_to_match_bytes=False)
+    request_type = getattr(os_events, "WriteFileRequest", None)
+    handler = getattr(workflow, "ahandle_request", None) or getattr(GriptapeNodes, "ahandle_request", None)
+    if handler and request_type and "skip_metadata_injection" in inspect.signature(request_type).parameters:
+        written = await handler(request_type(file_path=str(path), content=content, skip_metadata_injection=True, **options))
+        if not written.succeeded():
+            raise OSError(f"Generated last-frame staging write failed: {written.result_details}")
+        return Path(written.final_file_path)
+    writer = _generation_file(str(path), workflow).awrite_bytes
+    if "skip_metadata_injection" in inspect.signature(writer).parameters:
+        options["skip_metadata_injection"] = True
+    return Path(await writer(content, **options))
+
+
 try:
     from griptape_nodes.traits.widget import Widget
 except Exception:  # Older Griptape Nodes builds keep the legacy selector alive.
@@ -2061,13 +2086,13 @@ def _broker_token_path(*, server_url: str | None = None) -> Path:
     shared_origin = AI_BROKER_INTERNAL_ORIGIN
     root = Path(os.environ.get("APPDATA") or Path.home())
     directory = root / "FNAIBroker"
-    directory.mkdir(parents=True, exist_ok=True)
     if selected_origin != shared_origin:
         digest = hashlib.sha256(selected_origin.encode("ascii")).hexdigest()
         return directory / f"access_token_v2_{digest}.dpapi"
     current = directory / "access_token_v2.dpapi"
     legacy = root / "CompanyAIBroker" / "access_token_v2.dpapi"
     if not current.is_file() and legacy.is_file():
+        directory.mkdir(parents=True, exist_ok=True)
         shutil.copy2(legacy, current)
     return current
 
@@ -2115,6 +2140,7 @@ def _broker_save_token(
                 and _broker_legacy_migration_block_path(selected).exists()):
             raise _BrokerAuthenticationError("FN AI Broker login is required.")
         destination = _broker_token_path(server_url=selected)
+        destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_name(f".{destination.stem}.{uuid4().hex}.tmp")
         try:
             with temporary.open("xb") as stream:
@@ -2149,6 +2175,7 @@ def _broker_clear_token(*, server_url: str | None = None) -> None:
                 # A rejected/cleared scoped login must not silently switch back
                 # to an old account, including after restarting the editor.
                 marker = _broker_legacy_migration_block_path(selected_origin)
+                marker.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     with marker.open("xb") as stream:
                         stream.write(b"Scoped login cleared; explicit authentication required.\n")
@@ -13904,8 +13931,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     ) -> Iterator[tuple[Path, int | None]]:
         """Yield collision candidates and any project-macro index they bind."""
 
+        def output_path(value: str | Path) -> Path:
+            if output_format == "png":
+                path = Path(value)
+                return path if path.suffix.lower() == ".png" else path.with_suffix(".png")
+            return cls._normalized_video_output_path(value, output_format)
+
         destination_file = getattr(destination, "_file", None)
         file_path = getattr(destination_file, "_file_path", None)
+        workflow = getattr(destination_file, "workflow", None)
         if isinstance(file_path, MacroPath):
             index_segment = next(
                 (
@@ -13924,12 +13958,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 elif bool(getattr(index_segment.info, "is_required", False)):
                     start_index = 1
                 else:
-                    yield (
-                        cls._normalized_video_output_path(
-                            destination.resolve(), output_format
-                        ),
-                        None,
-                    )
+                    yield output_path(destination.resolve()), None
                     start_index = 1
                 for index in range(
                     start_index,
@@ -13939,17 +13968,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         parsed_macro=file_path.parsed_macro,
                         variables={**variables, "_index": index},
                     )
-                    yield (
-                        cls._normalized_video_output_path(
-                            File(indexed_path).resolve(), output_format
-                        ),
-                        index,
-                    )
+                    yield output_path(_generation_file(indexed_path, workflow).resolve()), index
                 return
 
-        base_path = cls._normalized_video_output_path(
-            destination.resolve(), output_format
-        )
+        base_path = output_path(destination.resolve())
         yield base_path, None
         for index in range(1, MAX_ATOMIC_OUTPUT_CANDIDATES + 1):
             yield (
@@ -13979,6 +14001,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     ) -> Path:
         """Resolve and write-probe the local target before any billable POST."""
 
+        candidate, _ = next(cls._writable_output_candidates(destination, output_format))
+        return candidate
+
+    @classmethod
+    def _writable_output_candidates(
+        cls,
+        destination: Any,
+        output_format: str,
+    ) -> Iterator[tuple[Path, int | None]]:
+        """Probe the first available SDK path and retain later candidates for races."""
+
         if bool(getattr(destination, "_append", False)):
             raise ValueError("Generated video output does not support append mode.")
         policy = cls._output_destination_policy(destination)
@@ -13986,12 +14019,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             destination,
             output_format,
         )
-        selected: Path | None = None
-        for candidate, _macro_index in candidates:
-            if policy is not ExistingFilePolicy.CREATE_NEW or not candidate.exists():
-                selected = candidate
+        for selected, macro_index in candidates:
+            if policy is not ExistingFilePolicy.CREATE_NEW or not selected.exists():
                 break
-        if selected is None:
+        else:
             raise FileExistsError(
                 "No unused generated-video output filename is available."
             )
@@ -14012,7 +14043,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 f"Generated-video output parent is not a directory: {selected.parent}"
             )
         cls._probe_output_parent_writable(selected.parent)
-        return selected
+        yield selected, macro_index
+        yield from candidates
 
     @staticmethod
     def _probe_output_parent_writable(parent: Path) -> None:
@@ -14203,12 +14235,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise RuntimeError(
                 f"Generated result is not a valid {requested.upper()} container."
             )
-        cls._preflight_output_destination(destination, requested)
         policy = cls._output_destination_policy(destination)
-        candidates = cls._output_destination_candidate_records(
-            destination,
-            requested,
-        )
+        candidates = cls._writable_output_candidates(destination, requested)
+        workflow = getattr(getattr(destination, "_file", None), "workflow", None)
         published: Path | None = None
         published_macro_index: int | None = None
         for candidate, macro_index in candidates:
@@ -14226,7 +14255,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 f".{candidate.stem}.{uuid4().hex}.partial{candidate.suffix}"
             )
             try:
-                written_stage = await File(str(stage)).awrite_bytes(
+                written_stage = await _generation_file(str(stage), workflow).awrite_bytes(
                     content,
                     existing_file_policy=ExistingFilePolicy.FAIL,
                     append=False,
@@ -14272,12 +14301,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise FileExistsError(
                 "No unused generated-video output filename is available."
             )
+        return cls._published_generation_file(destination, published, published_macro_index)
 
-        metadata = getattr(
-            getattr(destination, "_file", None),
-            "_file_metadata",
-            None,
-        )
+    @staticmethod
+    def _published_generation_file(destination: Any, published: Path, macro_index: int | None) -> File:
+        destination_file = getattr(destination, "_file", None)
+        metadata = getattr(destination_file, "_file_metadata", None)
         if metadata is not None:
             metadata = deepcopy(metadata)
             situation = getattr(metadata, "situation", None)
@@ -14285,27 +14314,28 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if isinstance(variables, dict):
                 if "file_extension" in variables:
                     variables["file_extension"] = published.suffix.lstrip(".")
-                if published_macro_index is not None:
-                    variables["_index"] = published_macro_index
+                if macro_index is not None:
+                    # The macro resolver uses an integer, but SDK sidecar variables are strings.
+                    variables["_index"] = str(macro_index)
             try:
                 _write_generation_sidecar(
                     published, metadata,
-                    workflow=getattr(getattr(destination, "_file", None), "workflow", None),
+                    workflow=getattr(destination_file, "workflow", None),
                 )
             except Exception as exc:
                 logger.warning(
-                    "Generated video was saved, but its metadata sidecar could not "
+                    "Generated file was saved, but its metadata sidecar could not "
                     "be written: %s",
                     type(exc).__name__,
                 )
-        saved = File(str(published))
+        saved = _generation_file(str(published), getattr(destination_file, "workflow", None))
         mapper = getattr(destination, "_map_to_macro_file", None)
         if callable(mapper):
             try:
                 saved = mapper(saved)
             except Exception as exc:
                 logger.warning(
-                    "Could not map generated video to a project macro: %s",
+                    "Could not map generated file to a project macro: %s",
                     type(exc).__name__,
                 )
         return saved
@@ -14338,18 +14368,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise RuntimeError("Generated last frame is not a valid PNG image.")
         if bool(getattr(destination, "_append", False)):
             raise ValueError("Generated last-frame output does not support append mode.")
-        base_path = Path(destination.resolve())
-        if base_path.suffix.lower() != ".png":
-            base_path = base_path.with_suffix(".png")
+        workflow = getattr(getattr(destination, "_file", None), "workflow", None)
         policy = cls._output_destination_policy(destination)
-        candidates = [base_path]
-        if policy is ExistingFilePolicy.CREATE_NEW:
-            candidates.extend(
-                base_path.with_name(f"{base_path.stem}_{index}.png")
-                for index in range(1, MAX_ATOMIC_OUTPUT_CANDIDATES + 1)
-            )
-        published: Path | None = None
-        for candidate in candidates:
+        for candidate, macro_index in cls._output_destination_candidate_records(destination, "png"):
             if policy is ExistingFilePolicy.CREATE_NEW and candidate.exists():
                 continue
             if policy is ExistingFilePolicy.FAIL and candidate.exists():
@@ -14373,20 +14394,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 f".{candidate.stem}.{uuid4().hex}.partial.png"
             )
             try:
-                written = await File(str(stage)).awrite_bytes(
-                    content,
-                    existing_file_policy=ExistingFilePolicy.FAIL,
-                    append=False,
-                    create_parents=False,
-                    coerce_extension_to_match_bytes=False,
-                )
-                if Path(written) != stage or stage.stat().st_size != len(content):
+                written = await _write_generation_png_stage(stage, content, workflow)
+                if written != stage or stage.stat().st_size != len(content):
                     raise OSError(
                         "Generated last-frame staging file was not written completely."
                     )
-                if not _is_valid_png(stage.read_bytes()):
+                if stage.read_bytes() != content:
                     raise RuntimeError(
-                        "Generated last-frame staging file failed PNG verification."
+                        "Generated last-frame staging file differs from the validated PNG."
                     )
                 if policy is ExistingFilePolicy.OVERWRITE:
                     await cls._await_filesystem_commit(os.replace, stage, candidate)
@@ -14398,26 +14413,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         candidate,
                     )
                 if claimed:
-                    published = candidate
-                    break
+                    return cls._published_generation_file(destination, candidate, macro_index)
+                if policy is ExistingFilePolicy.FAIL:
+                    raise FileExistsError(f"Generated last-frame output already exists: {candidate}")
             finally:
                 with suppress(OSError):
                     stage.unlink()
-        if published is None:
-            raise FileExistsError(
-                "No unused generated last-frame output filename is available."
-            )
-        saved = File(str(published))
-        mapper = getattr(destination, "_map_to_macro_file", None)
-        if callable(mapper):
-            try:
-                saved = mapper(saved)
-            except Exception as exc:
-                logger.warning(
-                    "Could not map generated last frame to a project macro: %s",
-                    type(exc).__name__,
-                )
-        return saved
+        raise FileExistsError("No unused generated last-frame output filename is available.")
 
     async def _save_completed_task(
         self,

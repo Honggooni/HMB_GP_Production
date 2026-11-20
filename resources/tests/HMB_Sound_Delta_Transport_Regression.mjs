@@ -1,4 +1,5 @@
 // UI-only full/delta transport: ordered replay, lost replies, two mounts and real audio.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -72,7 +73,7 @@ window.delta=(values={},skip=[])=>{const base=window.seq++;window.state={...wind
 for(const id of ['a','b']){window.owners[id]=mount(document.getElementById(id),window.props(id,window.full()));window.bindRead(id);}
 window.ready=true;</script></body></html>`;
 const server=http.createServer((req,res)=>{if(req.url==='/tone.wav'){res.setHeader('Content-Type','audio/wav');res.setHeader('Content-Length',wav.length);res.end(wav);}else{res.setHeader('Content-Type',req.url==='/widget.js'?'text/javascript':'text/html');res.end(req.url==='/widget.js'?source:html);}});
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+await listenBrowserSafeLoopback(server);
 let browser;
 try{
  browser=await playwright.chromium.launch({executablePath,headless:true,args:['--autoplay-policy=no-user-gesture-required']});

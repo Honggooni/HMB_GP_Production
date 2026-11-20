@@ -1,4 +1,5 @@
 // Actual product widgets with a synthetic CGT read/confirmation boundary.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -91,10 +92,10 @@ window.openGraph=value=>{window.controller?.cleanup();window.bridgeController?.c
 const source=fs.readFileSync(new URL('../../widgets/HMBImageAssetLibraryWidget.js',import.meta.url),'utf8');
 const bridge=fs.readFileSync(new URL('../../widgets/HMBImageAssetThumbnailPatchBridgeWidget.js',import.meta.url),'utf8');
 const server=http.createServer((req,res)=>{res.setHeader('Content-Type',req.url.endsWith('.js')?'text/javascript; charset=utf-8':'text/html; charset=utf-8');res.end(req.url==='/widget.js'?source:req.url==='/bridge.js'?bridge:html);});
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));let browser,checks=0,authorityReplyCount=0;
+await listenBrowserSafeLoopback(server);let browser,checks=0,authorityReplyCount=0;
 const fixtureOrigin=`http://127.0.0.1:${server.address().port}`,externalRequests=[];
 try{
- browser=await playwright.chromium.launch({executablePath:browserPath,headless:true,args:[`--explicitly-allowed-ports=${server.address().port}`]});
+ browser=await playwright.chromium.launch({executablePath:browserPath,headless:true});
  const page=await browser.newPage({viewport:{width:1250,height:1000}}),errors=[];page.setDefaultTimeout(5000);page.on('pageerror',error=>errors.push(error.message));
  await page.route('**/*',route=>{const url=new URL(route.request().url());
   if(url.origin===fixtureOrigin)return route.continue();

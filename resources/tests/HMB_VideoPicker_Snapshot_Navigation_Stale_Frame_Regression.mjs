@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
-import { randomInt } from "node:crypto";
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import os from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
@@ -102,30 +102,27 @@ const server = http.createServer(async (req, res) => {
   }
   res.setHeader("Content-Type", "text/html; charset=utf-8"); res.end(html);
 });
-// OS-assigned ports can land on Chromium's blocked low-port list (e.g. 3659).
-// Keep the browser security defaults and retry only recoverable bind failures.
-async function listenBrowserSafeLoopback(server, maxAttempts = 16) {
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const port = randomInt(20001, 60000);
-    try {
-      await new Promise((resolve, reject) => {
-        const cleanup = () => { server.off("error", onError); server.off("listening", onListening); };
-        const onError = error => { cleanup(); reject(error); };
-        const onListening = () => { cleanup(); resolve(); };
-        server.once("error", onError);
-        server.once("listening", onListening);
-        try { server.listen(port, "127.0.0.1"); }
-        catch (error) { cleanup(); reject(error); }
-      });
-      return { port: server.address().port, attempts: attempt };
-    } catch (error) {
-      if (!["EADDRINUSE", "EACCES", "EPERM"].includes(error.code) || attempt === maxAttempts) throw error;
-    }
-  }
-  throw new Error("No safe loopback port available for Snapshot navigation verification.");
-}
 const loopback = await listenBrowserSafeLoopback(server);
 assert.ok(loopback.port > 20000 && loopback.port < 60000);
+// Force an actual bind collision on the first attempt while the main fixture
+// owns its port. The replacement must still serve on a browser-safe loopback.
+const contender = http.createServer();
+const bind = contender.listen.bind(contender);
+let firstBind = true;
+contender.listen = (port, host) => {
+  assert.ok(port > 20000 && port < 60000);
+  assert.equal(host, "127.0.0.1");
+  const target = firstBind ? loopback.port : port;
+  firstBind = false;
+  return bind(target, host);
+};
+try {
+  const recovered = await listenBrowserSafeLoopback(contender);
+  assert.ok(recovered.attempts >= 2);
+  assert.notEqual(recovered.port, loopback.port);
+} finally {
+  if (contender.listening) await new Promise(resolve => contender.close(resolve));
+}
 const origin = `http://127.0.0.1:${loopback.port}`;
 function state(active, revision = 1, aliases = active) {
   const snapshots = ["original", "mask", "depth", "slow", "fast"].map((name, i) => ({

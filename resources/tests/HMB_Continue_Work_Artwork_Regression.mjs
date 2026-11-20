@@ -34,7 +34,7 @@ async function fixture({decorated=true,index=0,viewport={width:1280,height:800},
 try{
  const previews=[];
  for(let index=0;index<selected.length;index++){
-  const f=await fixture({index});const button=f.page.getByRole('button',{name:'기존 작업 계속',exact:true});
+  const f=await fixture({index});const button=f.page.getByRole('button',{name:'로동 작업 계속',exact:true});
   assert.equal(await button.getAttribute('data-hmb-continue-artwork'),String(selected[index]));
   assert.equal(await button.locator('svg').getAttribute('preserveAspectRatio'),'xMidYMid slice');
   assert.equal(await button.locator('.hmb-continue-label').evaluate(el=>getComputedStyle(el).opacity),'0');
@@ -47,14 +47,18 @@ try{
   await button.hover();await f.page.waitForTimeout(150);
   const png=await button.screenshot();previews.push({id:selected[index],data:png.toString('base64')});
   if(index===0)await f.page.screenshot({path:path.join(dir,'startup-preview.png')});
-  await button.click({position:{x:4,y:4}});assert.equal(await f.page.evaluate(()=>window.dismissed),1);
+  const {width,height}=await button.boundingBox();
+  const positions=[{x:width/2,y:height/2},{x:6,y:height/2},{x:width-6,y:height/2},
+   {x:width/2,y:6},{x:width/2,y:height-6}];
+  await button.click({position:positions[index%positions.length]});
+  assert.equal(await f.page.evaluate(()=>window.dismissed),1);
   assert.deepEqual(f.errors,[]);results.timings.decorated.push(f.time);await f.page.close();
  }
- results.checks.push('exact 10 selections, full-bleed art, hover label, single-art remount, full-button pointer click');
+ results.checks.push('exact 10 selections, full-bleed art, hover label, single-art remount, pointer clicks at center and all four edges');
  for(const viewport of [{width:1920,height:1080},{width:1280,height:800},{width:800,height:600},{width:390,height:700}]){
   const b=await fixture({decorated:false,viewport});const f=await fixture({viewport});
   assert.deepEqual(f.bounds,b.bounds,'Original continue-button dimensions and position');
-  await f.page.getByRole('button',{name:'기존 작업 계속',exact:true}).focus();await f.page.keyboard.press('Enter');
+  await f.page.getByRole('button',{name:'로동 작업 계속',exact:true}).focus();await f.page.keyboard.press('Enter');
   assert.equal(await f.page.evaluate(()=>window.dismissed),1);assert.deepEqual(f.errors,[]);
   await b.page.close();await f.page.close();
  }

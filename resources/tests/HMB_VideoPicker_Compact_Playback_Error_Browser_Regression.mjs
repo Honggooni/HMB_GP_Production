@@ -1,3 +1,4 @@
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -36,7 +37,7 @@ const server=http.createServer((request,response)=>{
   }
   response.setHeader('Content-Type','text/html; charset=utf-8');response.end(html);
 });
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+await listenBrowserSafeLoopback(server);
 let browser,page;
 try {
   browser=await playwright.chromium.launch({executablePath,headless:true});

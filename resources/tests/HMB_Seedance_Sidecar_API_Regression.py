@@ -1,5 +1,6 @@
 """No-network adapter coverage for old and current Griptape sidecar APIs."""
 
+import asyncio
 import importlib.util
 from pathlib import Path
 import sys
@@ -77,4 +78,30 @@ with patch.dict(sys.modules, {engine_module.__name__: engine_module}):
             target._write_generation_sidecar(path, metadata, workflow=workflow)
         assert calls == [(path, metadata, owner_engine, workflow)]
 
-print("HMB Seedance sidecar API: PASS (legacy/current/keyword/positional, owner workflow and engine, exactly one write, no network)")
+def check_png_stage_signatures() -> None:
+    from griptape_nodes.retained_mode.events import os_events
+
+    stage = Path("isolated-stage.png")
+    png = b"verified PNG bytes"
+    calls = []
+
+    # Older File.awrite_bytes does not accept skip_metadata_injection.
+    async def legacy_writer(content, *, existing_file_policy, append, create_parents, coerce_extension_to_match_bytes):
+        assert existing_file_policy is target.ExistingFilePolicy.FAIL
+        assert (append, create_parents, coerce_extension_to_match_bytes) == (False, False, False)
+        calls.append(content)
+        return stage
+
+    async def explicit_writer(content, *, skip_metadata_injection, **options):
+        assert skip_metadata_injection is True
+        return await legacy_writer(content, **options)
+
+    for writer in (legacy_writer, explicit_writer):
+        with patch.object(os_events, "WriteFileRequest", None, create=True), \
+             patch.object(target, "File", return_value=SimpleNamespace(awrite_bytes=writer)):
+            assert asyncio.run(target._write_generation_png_stage(stage, png)) == stage
+    assert calls == [png, png]
+
+
+check_png_stage_signatures()
+print("HMB Seedance sidecar API: PASS (legacy/current signatures, owner workflow, single write, PNG staging, no network)")

@@ -1,5 +1,6 @@
 // Production-controller upload gating, immediate invalidation and persistent UI.
 // Loopback fixture only: no Broker request, provider render or media upload.
+import { listenBrowserSafeLoopback } from "./_hmb_browser_loopback.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
@@ -53,7 +54,7 @@ import mount from '/widget.js';window.publications=[];window.commands=[];window.
 window.props=()=>({value:window.state,onChange:v=>window.publications.push(v),onCommand:v=>window.commands.push(JSON.parse(v))});
 window.controller=mount(document.getElementById('widget'),window.props());window.ready=true;</script>`;
 const server = http.createServer((req,res) => { res.setHeader("Content-Type", req.url === "/widget.js" ? "text/javascript; charset=utf-8" : "text/html; charset=utf-8");res.end(req.url === "/widget.js" ? source : html); });
-await new Promise(resolve => server.listen(0,"127.0.0.1",resolve));
+await listenBrowserSafeLoopback(server);
 let browser;
 try {
   browser = await playwright.chromium.launch({ executablePath, headless:true, args:["--use-gl=angle","--use-angle=swiftshader","--enable-unsafe-swiftshader"] });

@@ -4909,7 +4909,7 @@ def assert_atomic_final_output_publication() -> None:
         assert second_macro_path.read_bytes() == video_bytes
         assert Path(macro_saved.resolve()) == second_macro_path
         assert sidecars[0][0] == second_macro_path
-        assert sidecars[0][1].situation.variables["_index"] == 2
+        assert sidecars[0][1].situation.variables["_index"] == "2"
         assert "_index" not in metadata.situation.variables
         assert not list(root.rglob(".*.partial.mp4"))
         assert not list(root.rglob(".*.output-probe"))

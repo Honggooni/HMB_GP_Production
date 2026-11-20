@@ -1,16 +1,15 @@
 /** Actual widget in isolated Chromium. No live graph, media, network or inference. */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
+
 import path from 'node:path';
-import {createRequire} from 'node:module';
+import { nativeTestBrowserPath, nativeTestPlaywright } from './_hmb_native_editor_fixture.mjs';
 import {fileURLToPath} from 'node:url';
 const arg = key => { const i=process.argv.indexOf(key); return i<0?'':process.argv[i+1]; };
 const root=path.resolve(arg('--library-root') || fileURLToPath(new URL('../..',import.meta.url)));
-const require=createRequire(import.meta.url);
-let pw;try{pw=require('playwright');}catch{pw=require(path.join(os.homedir(),'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'));}
+const pw=nativeTestPlaywright();
 const report={schema:'hmb-seedance-cold-surface/v1',scope:'Isolated actual widget; not Desktop',cases:[],external_requests:0,paid_calls:0};
-const browser=await pw.chromium.launch({headless:true,executablePath:'C:/Program Files/Google/Chrome/Application/chrome.exe'});
+const browser=await pw.chromium.launch({headless:true,executablePath:nativeTestBrowserPath()});
 try{
  const page=await browser.newPage();const errors=[];page.on('pageerror',e=>errors.push(e.message));
  await page.route('**/*',r=>{report.external_requests++;return r.abort();});
