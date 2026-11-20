@@ -24,6 +24,16 @@ class PreflightGuardTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "coverage differs"):
                 preflight.check_inventory()
 
+    def test_missing_duplicate_or_swapped_widget_declarations_block(self):
+        descriptor = json.loads((ROOT / "griptape-nodes-library.json").read_bytes())
+        widget = next(row for row in descriptor["widgets"] if row["name"] == "HMBVideoPickerCommandBridgeWidget")
+        others = [row for row in descriptor["widgets"] if row != widget]
+        for broken in (others, [*others, widget, widget], [*others, {**widget, "path": others[0]["path"]}]):
+            with self.subTest(entries=len(broken)), mock.patch.object(
+                    preflight.json, "loads", return_value={**descriptor, "widgets": broken}):
+                with self.assertRaisesRegex(RuntimeError, "widget"):
+                    preflight.check_inventory()
+
     def test_missing_required_check_blocks(self):
         with mock.patch.object(preflight, "BROWSER_CHECKS", (*preflight.BROWSER_CHECKS, "Missing.mjs")):
             with self.assertRaisesRegex(ValueError, "Missing mandatory"):
@@ -101,6 +111,33 @@ class PreflightGuardTests(unittest.TestCase):
             report["editor_source_sha256"] = preflight.STOCK_SHA256
             proof.write_text(json.dumps(report), encoding="utf-8")
             preflight.validate_deletion_evidence(proof)
+
+    def test_wheel_receipt_must_cover_current_widgets_and_behaviors(self):
+        with tempfile.TemporaryDirectory(prefix="hmb-wheel-proof-") as temporary:
+            proof = Path(temporary) / "wheel.json"
+            fields = {"only_selected": True, "middle_pan": True, "selected_viewport_outline_without_reflow": True,
+                      "unmount_releases_outline": True, "four_edges_visible_in_pixels": True}
+            names = {name: path for name, path in preflight.WIDGET_FILES.items() if "BridgeWidget" not in name}
+            self.assertEqual(len(names), len(preflight.LIBRARY_CHECKS))
+            hashes = {path: preflight.digest(ROOT / path) for path in names.values()}
+            cases = {name: dict(fields) for name in names}
+            cases["HMBImageAssetLibraryWidget"]["refresh_keeps_same_grid_only"] = True
+            cases["HMBPromptLibraryScopedBindingWidget"]["prompt_wheel_over_select_scrolls_table_with_value_preserved"] = True
+            report = {"passed": True, "editor_sha256": "stock", "widget_sha256": hashes, "cases": cases,
+                      "errors": [], "paid_calls": 0, "external_requests": 0}
+            proof.write_text(json.dumps(report))
+            preflight.validate_wheel_evidence(proof, "stock")
+            name, path = next(iter(names.items()))
+            for overrides in (
+                {"cases": {key: value for key, value in cases.items() if key != name}},
+                {"cases": {**cases, name: {**fields, "middle_pan": False}}},
+                {"widget_sha256": {**hashes, path: "prior build"}},
+                {"external_requests": 1},
+            ):
+                with self.subTest(fields=list(overrides)):
+                    proof.write_text(json.dumps({**report, **overrides}))
+                    with self.assertRaisesRegex(ValueError, "Wheel evidence"):
+                        preflight.validate_wheel_evidence(proof, "stock")
 
     def test_same_version_source_change_is_detected(self):
         with tempfile.TemporaryDirectory(prefix="hmb-update-source-") as temporary:

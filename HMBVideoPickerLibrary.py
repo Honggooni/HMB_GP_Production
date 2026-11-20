@@ -769,8 +769,8 @@ def _load_marker_catalog() -> Dict[str, Any]:
     actor = [dict(item) for item in payload.get("character", []) if isinstance(item, dict)]
     object_items = [dict(item) for item in payload.get("background", []) if isinstance(item, dict)]
     names = [_clean_catalog_name(item.get("name")) for item in actor + object_items]
-    if (len(actor), len(object_items)) not in {(7, 7), (8, 8)} or len(names) != len(set(names)) or any(not name for name in names):
-        raise RuntimeError("HMB marker catalog must contain the legacy 7/7 or extended 8/8 unique Actor/Object choices.")
+    if (len(actor), len(object_items)) not in {(7, 7), (8, 8), (10, 9)} or len(names) != len(set(names)) or any(not name for name in names):
+        raise RuntimeError("Invalid HMB Actor/Object palette size or duplicate or empty marker name.")
     pattern_ids = []
     for item in object_items:
         if _clean_catalog_name(item.get("kind")).lower() != "pattern":
@@ -4641,6 +4641,7 @@ def _default_widget_state() -> Dict[str, Any]:
         "last_log_path": "",
         "log_folder": "",
         "operation_kind": "",
+        "operation_progress": {},
         "operation_video_slot": 0,
         "operation_started_at_ms": 0,
         "operation_finished_at_ms": 0,
@@ -7297,11 +7298,16 @@ def _normalize_activity_log(value: Any) -> List[Dict[str, str]]:
         )
         if not message:
             continue
-        entries.append({
+        entry = {
             "time": _clean(raw.get("time")),
             "level": (_clean(raw.get("level")) or "INFO").upper(),
             "message": message,
-        })
+        }
+        if raw.get("generation_event") in ("start", "detail", "complete", "failed", "cancelled"):
+            entry.update({key: _clean(raw.get(key)) for key in (
+                "generation_event", "operation_id", "picker_shot_uuid",
+            )})
+        entries.append(entry)
     return entries[-80:]
 
 
@@ -7327,7 +7333,15 @@ def _editable_activity_log_text(state: Dict[str, Any]) -> str:
     return _structured_activity_log_text(state.get("activity_log"))
 
 
-def _append_activity_log(state: Dict[str, Any], level: str, message: str) -> Dict[str, Any]:
+def _append_activity_log(
+    state: Dict[str, Any], level: str, message: str, *,
+    generation_event: str = "", generation_context: Optional["_OperationContext"] = None,
+) -> Dict[str, Any]:
+    if generation_event == "detail" or (not generation_event and state.get("operation_kind") == "run_video"):
+        # Worker stdout/stderr retains its own full log. Route additional Python
+        # notices through the engine logger without evicting the user's history.
+        _diagnostic(f"Generate {state.get('operation_id', '')} [{level}] {message}")
+        return state
     text = _compact_ui_diagnostic(message, _UI_ACTIVITY_MESSAGE_LIMIT)
     if not text:
         return state
@@ -7336,6 +7350,12 @@ def _append_activity_log(state: Dict[str, Any], level: str, message: str) -> Dic
         "level": (_clean(level) or "INFO").upper(),
         "message": text,
     }
+    if generation_event:
+        entry.update({
+            "generation_event": generation_event,
+            "operation_id": _clean(generation_context.operation_id if generation_context else state.get("operation_id")),
+            "picker_shot_uuid": _clean(generation_context.picker_shot_uuid if generation_context else state.get("operation_picker_shot_uuid")),
+        })
     existing_text = _editable_activity_log_text(state).rstrip()
     entries = _normalize_activity_log(state.get("activity_log"))
     entries.append(entry)
@@ -7352,7 +7372,8 @@ def _merge_activity_logs(primary: Any, secondary: Any) -> List[Dict[str, str]]:
     merged: List[Dict[str, str]] = []
     seen = set()
     for entry in _normalize_activity_log(primary) + _normalize_activity_log(secondary):
-        key = (_clean(entry.get("time")), _clean(entry.get("level")), _clean(entry.get("message")))
+        key = (_clean(entry.get("time")), _clean(entry.get("level")), _clean(entry.get("message")),
+               _clean(entry.get("generation_event")), _clean(entry.get("operation_id")))
         if not key[2] or key in seen:
             continue
         seen.add(key)
@@ -10312,7 +10333,6 @@ def _recover_orphaned_runtime_state(value: Any) -> tuple[Dict[str, Any], bool]:
 
     if orphaned_busy:
         state["operation_kind"] = ""
-        state["operation_id"] = ""
         state["operation_started_at_ms"] = 0
         state["operation_finished_at_ms"] = int(time.time() * 1000)
         state["last_operation_seconds"] = 0.0
@@ -10356,7 +10376,9 @@ def _recover_orphaned_runtime_state(value: Any) -> tuple[Dict[str, Any], bool]:
             state,
             "WARNING",
             "Recovered an unfinished command from a previous Python runtime; no stale action was replayed.",
+            generation_event="cancelled" if operation_kind == "run_video" else "",
         )
+        state["operation_id"] = ""
     return _parse_state(state), True
 
 
@@ -12255,6 +12277,7 @@ class _MayaCaptureFlight:
         self.return_code: Optional[int] = None
         self.error: Optional[BaseException] = None
         self.message = "Waiting for an available Maya capture worker."
+        self.progress = {"stage": "waiting_for_capture", "percent": None}
 
 
 class _MayaCaptureSubscription:
@@ -12456,6 +12479,24 @@ def _progress_signature(payload: Dict[str, Any]) -> str:
         return json.dumps(payload, sort_keys=True, ensure_ascii=False)
     except Exception:
         return repr(payload)
+
+
+def _worker_stage_progress(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Report completed units in this stage. Console activity is only liveness."""
+    stage = _clean(payload.get("stage"))
+    if stage == "rendering_frames":
+        role = payload.get("capture_role")
+        if role in ("original", "mask", "depth", "motion_guide"):
+            stage = f"rendering_{role}_frames"
+    completed = payload.get("completed_frames", payload.get("completed_units"))
+    total = payload.get("frame_count", payload.get("total_units"))
+    percent = None
+    if type(completed) is int and type(total) is int and total > 0 and 0 <= completed <= total:
+        if completed < total:
+            percent = completed * 100 // total
+        else:
+            stage = "finishing_stage"
+    return {"stage": stage, "percent": percent}
 
 
 @lru_cache(maxsize=1)
@@ -13823,7 +13864,7 @@ def _build_ffmpeg_encode_command(
         "setsar=1,format=yuv420p"
     )
     return [
-        str(ffmpeg), "-y",
+        str(ffmpeg), "-y", "-nostats", "-progress", "pipe:1",
         "-framerate", source_rate,
         "-start_number", "0",
         "-i", str(frame_pattern),
@@ -14991,7 +15032,18 @@ class HMBVideoPickerLibrary(DataNode):
             # notice is also represented in the sole visible notification
             # surface: the activity log. Existing ERROR entries keep their red
             # severity; ordinary notices migrate as WARNING without duplicates.
+            # Generate publishes one named outcome for its selected outputs. Its
+            # individual warnings remain in the native state and diagnostic log.
+            generation_warnings = (
+                normalized.get("operation_kind") == "run_video"
+                or getattr(active_context, "kind", "") == "run_video"
+            )
+            recent_entries = normalized.get("activity_log") or []
+            terminal_generation = bool(recent_entries and recent_entries[-1].get("generation_event") in
+                                       ("complete", "failed", "cancelled"))
             for warning in normalized.get("warnings", []):
+                if generation_warnings or (terminal_generation and warning in str(normalized.get("message") or "")):
+                    continue
                 compact_warning = _compact_ui_diagnostic(
                     warning,
                     _UI_WARNING_MESSAGE_LIMIT,
@@ -15115,7 +15167,6 @@ class HMBVideoPickerLibrary(DataNode):
             "lower_panel_ratio", "main_split_ratio", "right_split_ratio", "node_width", "node_height",
             "outliner_panel_height", "viewport_panel_height", "right_section_heights",
             "ui_layout_version", "ui_theme",
-            "activity_log_text", "activity_log_text_user_edited", "activity_log_cleared",
         }
         widget_authoring_fields = {
             "workspace_view", "selected_outliner_path", "selected_outliner_name", "selected_outliner_uuid",
@@ -15133,6 +15184,9 @@ class HMBVideoPickerLibrary(DataNode):
             if key in incoming:
                 merged[key] = incoming[key]
         if not stale_picker_echo:
+            for key in ("activity_log_text", "activity_log_text_user_edited", "activity_log_cleared"):
+                if key in raw_incoming:
+                    merged[key] = incoming[key]
             # Native resize finalization is a widget-owned layout transaction.
             # Accept only a complete, finite expanded geometry from a current
             # revision; parsing an absent/malformed field to the default must
@@ -15388,7 +15442,11 @@ class HMBVideoPickerLibrary(DataNode):
                     row["active_snapshot_uid"] = merged["active_snapshot_uid"]
                     row["viewport_mode"] = merged["viewport_mode"]
                     row["revision"] = int(row.get("revision") or 0) + 1
-        merged["activity_log"] = _merge_activity_logs(merged.get("activity_log"), incoming.get("activity_log"))
+        if not stale_picker_echo:
+            if incoming.get("activity_log_cleared") and not incoming.get("activity_log"):
+                merged["activity_log"] = []
+            else:
+                merged["activity_log"] = _merge_activity_logs(merged.get("activity_log"), incoming.get("activity_log"))
         merged["state_revision"] = max(
             int(merged.get("state_revision") or 0),
             int(incoming.get("state_revision") or 0),
@@ -16893,6 +16951,7 @@ class HMBVideoPickerLibrary(DataNode):
 
     def _mark_operation_started(self, state: Dict[str, Any], kind: str) -> Dict[str, Any]:
         state["operation_kind"] = _clean(kind)
+        state["operation_progress"] = {}
         state["operation_video_slot"] = max(
             0,
             min(MAX_VIDEO_SLOTS, int(state.get("selected_video_slot") or 0)),
@@ -16906,6 +16965,7 @@ class HMBVideoPickerLibrary(DataNode):
 
     def _mark_operation_finished(self, state: Dict[str, Any]) -> Dict[str, Any]:
         elapsed = self._operation_elapsed_seconds(state)
+        state["operation_progress"] = {}
         state["operation_finished_at_ms"] = int(time.time() * 1000)
         state["last_operation_seconds"] = round(elapsed, 3)
         state["operation_kind"] = ""
@@ -17128,6 +17188,7 @@ class HMBVideoPickerLibrary(DataNode):
 
     def _set_cancelled_state(self) -> None:
         state = self._picker_state_for_operation(self._hmb_active_operation)
+        context = self._hmb_active_operation
         operation_kind = _clean(state.get("operation_kind"))
         korean = _clean(state.get("language")).lower() == "ko"
         state = self._mark_operation_finished(state)
@@ -17174,6 +17235,8 @@ class HMBVideoPickerLibrary(DataNode):
                 state,
                 "WARNING",
                 f"Generation stopped after {state.get('last_operation_seconds', 0.0):.1f} seconds; authoring state remains ready for retry.",
+                generation_event="cancelled" if operation_kind == "run_video" else "",
+                generation_context=context,
             )
             self._write_state(state)
             self._sync_outputs_from_state(state)
@@ -17202,7 +17265,9 @@ class HMBVideoPickerLibrary(DataNode):
             "active_process_pid": 0,
             "active_process_kind": "",
         })
-        _append_activity_log(state, "WARNING", log_message)
+        _append_activity_log(state, "WARNING", log_message,
+                             generation_event="cancelled" if operation_kind == "run_video" else "",
+                             generation_context=context)
         self._write_state(state)
         self._sync_outputs_from_state(state)
 
@@ -17259,7 +17324,9 @@ class HMBVideoPickerLibrary(DataNode):
             _append_activity_log(
                 state,
                 "WARNING",
-                "Stale generation result discarded; existing Color Pick assignments and outputs remain ready for retry.",
+                state["message"] if context.kind == "run_video" else "Stale generation result discarded; existing Color Pick assignments and outputs remain ready for retry.",
+                generation_event="cancelled" if context.kind == "run_video" else "",
+                generation_context=context,
             )
             self._write_state(state)
             self._sync_outputs_from_state(state)
@@ -17277,6 +17344,8 @@ class HMBVideoPickerLibrary(DataNode):
             state,
             "WARNING",
             f"Stale result discarded for {context.operation_id}. Existing successful VIDEO output and PICKER_OUT were preserved.",
+            generation_event="cancelled" if context.kind == "run_video" else "",
+            generation_context=context,
         )
         self._write_state(state)
         self._sync_outputs_from_state(state)
@@ -17338,6 +17407,10 @@ class HMBVideoPickerLibrary(DataNode):
             # Retain terminal Maya/backend fields and the newest harmless
             # widget edits, then explicitly restore newest catalog authority.
             rebased = self._merge_widget_state(terminal_state, cleaned_latest)
+            # The worker's snapshot may predate a user clearing the visible
+            # log during a long capture. Only the current log is authoritative.
+            for field in ("activity_log", "activity_log_text", "activity_log_text_user_edited", "activity_log_cleared"):
+                rebased[field] = copy.deepcopy(latest[field])
             catalog_fields = (
                 "videos",
                 "picker_shots",
@@ -17589,6 +17662,7 @@ class HMBVideoPickerLibrary(DataNode):
                 state,
                 "WARNING",
                 "STOP completed before the pending Maya worker started.",
+                generation_event="cancelled" if action == "run_video" else "",
             )
             self._write_state(state)
             self._sync_outputs_from_state(state)
@@ -17730,7 +17804,7 @@ class HMBVideoPickerLibrary(DataNode):
                 + "."
             )
             incoming.update({"status": "RUNNING", "message": message})
-            _append_activity_log(incoming, "INFO", log_message)
+            _append_activity_log(incoming, "INFO", log_message, generation_event="start", generation_context=context)
         worker_name = threading.current_thread().name
         _append_activity_log(incoming, "INFO", f"Background worker thread started: {worker_name}.")
         terminal_success_state: Optional[Dict[str, Any]] = None
@@ -17932,6 +18006,14 @@ class HMBVideoPickerLibrary(DataNode):
                             terminal_generation_records,
                             terminal_provisional_uids,
                         )
+                    except _StaleOperationError as exc:
+                        if self._hmb_cancel_requested.is_set() and self._hmb_active_operation is context:
+                            if self._picker_state().get("operation_invalidated"):
+                                self._set_stale_discarded_state(context, str(exc))
+                            else:
+                                self._set_cancelled_state()
+                        else:
+                            terminal_publication_error = exc
                     except Exception as exc:
                         terminal_publication_error = exc
                 if self._hmb_active_operation and self._hmb_active_operation.operation_id == context.operation_id:
@@ -17939,11 +18021,26 @@ class HMBVideoPickerLibrary(DataNode):
                 try:
                     if terminal_committed_state is not None:
                         self._sync_outputs_from_state(terminal_committed_state)
+                        # Output publication can still fail after the catalog
+                        # commit. Record completion only once it has returned.
+                        terminal_log = self._picker_state()
+                        all_delivered = bool(completed_roles) and not generation_warnings
+                        _append_activity_log(
+                            terminal_log, "SUCCESS" if all_delivered else "ERROR",
+                            terminal_committed_state["message"],
+                            generation_event="complete" if all_delivered else "failed",
+                            generation_context=context,
+                        )
+                        try:
+                            self._write_state(terminal_log)
+                        except Exception as receipt_error:
+                            # A log-only UI update cannot reverse valid output delivery.
+                            _diagnostic_exception("Generate outcome log publication failed", receipt_error)
                 except Exception as exc:
                     if terminal_publication_error is None:
                         terminal_publication_error = exc
         if terminal_publication_error is not None:
-            self._set_failed_state(terminal_publication_error)
+            self._set_failed_state(terminal_publication_error, generation_context=context)
 
     def _prepare_run_state(
         self,
@@ -18290,10 +18387,22 @@ class HMBVideoPickerLibrary(DataNode):
                 daemon=True,
             ).start()
             raise RuntimeError("VideoPicker node was deleted before process registration.")
-        self._hmb_active_process = process
+        with getattr(self, "_hmb_operation_control_lock", nullcontext()):
+            self._hmb_active_process = process
+            cancelled_on_arrival = (getattr(getattr(self, "_hmb_active_operation", None), "kind", "") == "run_video"
+                                    and self._hmb_cancel_requested.is_set())
+        # A scoped Stop can arrive between launching a process and registering
+        # its handle. Never leave a newly started encoder running in that gap.
+        if cancelled_on_arrival:
+            _terminate_process(process)
+            raise RuntimeError("Playblast generation cancelled before process registration.")
         state = self._picker_state()
         state["active_process_pid"] = max(0, int(getattr(process, "pid", 0) or 0))
         state["active_process_kind"] = _clean(kind)
+        state["operation_progress"] = {
+            "stage": "encoding" if "ffmpeg" in state["active_process_kind"].lower() else "starting_worker",
+            "percent": None,
+        }
         pid = state["active_process_pid"]
         subscription = callable(getattr(process, "_hmb_cancel_subscription", None))
         if subscription and not pid:
@@ -18331,7 +18440,32 @@ class HMBVideoPickerLibrary(DataNode):
         if int(state.get("active_process_pid") or 0) or _clean(state.get("active_process_kind")):
             state["active_process_pid"] = 0
             state["active_process_kind"] = ""
+            state["operation_progress"] = {"stage": "checking_output", "percent": None}
             self._write_state(state)
+
+    def _cancel_picker_generation(self, payload: Dict[str, Any], action_id: str, *, duplicate: bool) -> None:
+        operation_id = _clean(payload.get("operation_id"))
+        workspace = _uuid_text(payload.get("picker_shot_uuid"))
+        process = None
+        try:
+            with self._hmb_catalog_state_commit():
+                state = self._picker_state()
+                with self._hmb_operation_control_lock:
+                    context = self._hmb_active_operation
+                    if (not duplicate and context is not None and context.kind == "run_video" and workspace
+                            and context.picker_shot_uuid == workspace and context.operation_id == operation_id
+                            and state.get("operation_kind") == "run_video" and state.get("operation_id") == operation_id
+                            and not self._hmb_cancel_requested.is_set()):
+                        self._hmb_cancel_requested.set()
+                        process = self._hmb_active_process
+                        state["status"] = "CANCELLING"
+                state["backend_ack_action_id"] = action_id
+                self._write_state(state)
+        finally:
+            if process is not None:
+                # A shared capture handle releases only this subscriber. An ACK
+                # delivery error must not strand an already cancelled encoder.
+                _terminate_process(process)
 
     def _handle_cancel_action(self, incoming: Dict[str, Any]) -> None:
         state = _parse_state(incoming)
@@ -18644,7 +18778,7 @@ class HMBVideoPickerLibrary(DataNode):
             _diagnostic(f"starting widget action worker: {thread.name} {action_id}")
             thread.start()
 
-        if action in {"cancel_pending", "cancel_operation", "stop_read"}:
+        if action in {"cancel_pending", "cancel_operation", "stop_read", "cancel_generate"}:
             launch()
             return
 
@@ -20039,6 +20173,9 @@ class HMBVideoPickerLibrary(DataNode):
                     self._hmb_processed_action_ids = set(
                         list(self._hmb_processed_action_ids)[-128:]
                     )
+        if action == "cancel_generate":
+            self._cancel_picker_generation(payload, action_id, duplicate=duplicate_action)
+            return
         if duplicate_action and not _read_dispatched:
             duplicate_state = self._picker_state()
             duplicate_state["backend_ack_action_id"] = action_id
@@ -20837,9 +20974,10 @@ class HMBVideoPickerLibrary(DataNode):
             except Exception as parent_exc:
                 _diagnostic_exception("parent after_value_set failed", parent_exc)
 
-    def _set_failed_state(self, exc: Exception) -> None:
+    def _set_failed_state(self, exc: Exception, *, generation_context: Optional[_OperationContext] = None) -> None:
         state = self._picker_state_for_operation(self._hmb_active_operation)
-        operation_kind = _clean(state.get("operation_kind"))
+        context = generation_context or self._hmb_active_operation
+        operation_kind = _clean(state.get("operation_kind") or getattr(context, "kind", ""))
         message = _clean(exc) or exc.__class__.__name__
         if isinstance(exc, _MayaNativeCaptureError):
             state["native_error_code"] = exc.error_code
@@ -20908,18 +21046,21 @@ class HMBVideoPickerLibrary(DataNode):
         if message and message not in warnings:
             warnings.append(message)
         state["warnings"] = warnings[-20:]
-        _append_activity_log(state, "ERROR", message)
+        _append_activity_log(state, "ERROR", message,
+                             generation_event="failed" if operation_kind == "run_video" else "",
+                             generation_context=context)
         operation_label = {
             "read_scene": "Maya scene READ",
             "render_snapshot": "Maya snapshot",
             "render_original_preview": "original preview",
             "run_video": "Maya playblast",
         }.get(operation_kind, "Maya/FFmpeg")
-        _append_activity_log(
-            state,
-            "INFO",
-            f"The {operation_label} operation stopped after an error. Review the diagnostic log and retry.",
-        )
+        if operation_kind != "run_video":
+            _append_activity_log(
+                state,
+                "INFO",
+                f"The {operation_label} operation stopped after an error. Review the diagnostic log and retry.",
+            )
         self._write_state(state)
 
     def _recover_missing_video_thumbnails(
@@ -21420,6 +21561,7 @@ class HMBVideoPickerLibrary(DataNode):
         read_completed_at: Optional[float] = None
         read_completion_verified = False
         pending_ui_lines: List[tuple[str, str]] = []
+        stage_progress: Dict[str, Any] = {}
         watched_activity_paths = tuple(Path(path) for path in (activity_paths or ()))
         activity_signature, _activity_count, _activity_size = _filesystem_activity_snapshot(
             watched_activity_paths
@@ -21445,6 +21587,8 @@ class HMBVideoPickerLibrary(DataNode):
             state = self._picker_state()
             if message:
                 state["message"] = message
+            if stage_progress:
+                state["operation_progress"] = stage_progress
             for level, text in pending_ui_lines[-24:]:
                 _append_activity_log(state, level, text)
             pending_ui_lines = []
@@ -21527,6 +21671,7 @@ class HMBVideoPickerLibrary(DataNode):
                     last_primary_progress_at = now
                     last_cpu_seconds = None
                     stage = _clean(payload.get("stage")) or "external_progress"
+                    stage_progress = _worker_stage_progress(payload)
                     message = _clean(payload.get("message")) or stage
                     last_stage = message
                     pending_ui_lines.append((
@@ -22574,7 +22719,9 @@ class HMBVideoPickerLibrary(DataNode):
             )
             self._register_active_process(ffmpeg_process, "FFmpeg")
             try:
-                ffmpeg_return_code = ffmpeg_process.wait(timeout=PLAYBLAST_OVERALL_TIMEOUT_SECONDS)
+                ffmpeg_return_code = self._wait_for_ffmpeg_encode(
+                    ffmpeg_process, log_path, frame_count, PLAYBLAST_OVERALL_TIMEOUT_SECONDS,
+                )
             except subprocess.TimeoutExpired:
                 _terminate_process(ffmpeg_process)
                 raise TimeoutError(f"Original preview FFmpeg encoding exceeded {PLAYBLAST_OVERALL_TIMEOUT_SECONDS} seconds. See {log_path}")
@@ -23026,6 +23173,8 @@ class HMBVideoPickerLibrary(DataNode):
                 watchdog_state.clear()
                 watchdog_state.update(next_state)
                 flight.message = _clean(next_state.get("message")) or flight.message
+                if next_state.get("operation_progress"):
+                    flight.progress = next_state["operation_progress"]
                 return next_state
             watchdog._write_state = retain_progress
             if flight.abort.is_set():
@@ -23094,6 +23243,7 @@ class HMBVideoPickerLibrary(DataNode):
                 if now - last_ui_at >= 4.0:
                     latest = self._picker_state()
                     latest.update(message=flight.message, active_process_pid=subscription.pid)
+                    latest["operation_progress"] = dict(flight.progress)
                     self._write_state(latest)
                     last_ui_at = now
             assert_subscriber(f"{operation_label} shared capture completion", subscription)
@@ -23402,6 +23552,67 @@ class HMBVideoPickerLibrary(DataNode):
                 "snapshot_uid": active["snapshot_uid"], "video_uid": associated_video_uid,
                 "video_slot": PRIMARY_COLOR_VIDEO_SLOT, "frame": frame, "snapshot": active["path"]}
 
+    def _wait_for_ffmpeg_encode(
+        self, process: subprocess.Popen[Any], log_path: Path, frame_count: int, timeout: float,
+    ) -> int:
+        """Read this encode's measured frame count while waiting on the original deadline."""
+        deadline = time.monotonic() + timeout
+        try:
+            reader = log_path.open("rb")
+        except OSError:
+            return process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        with reader:
+            try:
+                # Each pass appends to the same diagnostic log. Samples already
+                # present may belong to another encode and must never be shown.
+                start = reader.seek(0, os.SEEK_END)
+            except OSError:
+                return process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            last_end = start
+            last_percent = -1
+            last_publish_at = float("-inf")
+            while True:
+                remaining = max(0.0, deadline - time.monotonic())
+                try:
+                    return process.wait(timeout=min(1.0, remaining))
+                except subprocess.TimeoutExpired:
+                    if remaining <= 1.0:
+                        raise
+                try:
+                    end = reader.seek(0, os.SEEK_END)
+                    if end <= last_end:
+                        continue
+                    last_end = end
+                    offset = max(start, end - 8192)
+                    reader.seek(offset)
+                    chunk = reader.read(end - offset)
+                    if offset > start:
+                        chunk = chunk.partition(b"\n")[2]
+                    frames = re.findall(rb"(?m)^frame=([0-9]{1,10})\r?\n", chunk)
+                    if not frames:
+                        continue
+                    completed = int(frames[-1])
+                    percent = completed * 100 // frame_count
+                    if completed > frame_count or percent <= last_percent:
+                        continue
+                    now = time.monotonic()
+                    if completed < frame_count and now - last_publish_at < 4.0:
+                        continue
+                    last_percent, last_publish_at = percent, now
+                    progress = {"stage": "encoding", "percent": percent}
+                    if completed == frame_count:
+                        progress = {"stage": "finishing_stage", "percent": None}
+                    with self._hmb_state_write_lock:
+                        if self._hmb_active_process is process and not self._hmb_cancel_requested.is_set():
+                            state = self._picker_state()
+                            state["operation_progress"] = progress
+                            self._write_state(state)
+                except Exception as exc:
+                    # Progress is optional. Preserve timeout, cancellation,
+                    # exit code, and the existing artifact verification path.
+                    _diagnostic_exception("FFmpeg progress unavailable", exc)
+                    return process.wait(timeout=max(0.0, deadline - time.monotonic()))
+
     def _encode_playblast_sequence(
         self,
         *,
@@ -23451,7 +23662,7 @@ class HMBVideoPickerLibrary(DataNode):
             )
             self._register_active_process(process, "FFmpeg")
             try:
-                return_code = process.wait(timeout=7200)
+                return_code = self._wait_for_ffmpeg_encode(process, log_path, frame_count, 7200)
             except subprocess.TimeoutExpired:
                 _terminate_process(process)
                 raise TimeoutError(

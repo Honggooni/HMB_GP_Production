@@ -8,16 +8,25 @@ const COLOR_RGB = {
   Purple: [145, 71, 255],
   Pink: [232, 77, 145],
   Cyan: [0, 217, 217],
+  Teal: [0, 128, 128],
+  Brown: [139, 69, 19],
   "Sky Blue": [92, 184, 255],
   Mint: [102, 235, 186],
   Beige: [219, 199, 163],
   Lavender: [184, 166, 217],
+  Olive: [128, 128, 0],
 };
 
 const FALLBACK_ACTOR_MARKER_OPTIONS = [
-  "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink", "Cyan",
+  "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink", "Cyan", "Teal", "Brown",
 ];
-const FALLBACK_GHOST_MARKER_OPTIONS = ["Sky Blue", "Mint", "Beige", "Lavender"];
+const FALLBACK_GHOST_MARKER_OPTIONS = ["Sky Blue", "Mint", "Beige", "Lavender", "Olive"];
+const MARKER_CATALOG_VERSION = 6;
+const MARKER_LABELS_KO = { Teal: "틸", Brown: "브라운", Olive: "올리브" };
+
+function markerDisplayName(name, language) {
+  return language === "ko" && Object.hasOwn(MARKER_LABELS_KO, name) ? MARKER_LABELS_KO[name] : name;
+}
 const FALLBACK_PATTERN_MARKER_OPTIONS = [
   "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern",
 ];
@@ -371,6 +380,7 @@ const TEXT = {
     videoReady: "VIDEO READY",
     failed: "FAILED",
     activityLog: "ACTIVITY LOG",
+    progressOverlay: "Show on video",
     clearLog: "Clear",
     noActivity: "No activity yet.",
     elapsed: "Elapsed",
@@ -493,6 +503,7 @@ const TEXT = {
     videoReady: "비디오 준비",
     failed: "실패",
     activityLog: "작업 로그",
+    progressOverlay: "영상 위 표시",
     clearLog: "지우기",
     noActivity: "아직 작업 기록이 없습니다.",
     elapsed: "경과",
@@ -1663,7 +1674,13 @@ function normalizeActivityLog(value) {
     const level = clean(item.level)
       ? hmbNormalizeActivityLevel(item.level)
       : hmbActivityLevelFromStatus("", message);
-    return { time: clean(item.time), level, message };
+    const row = { time: clean(item.time), level, message };
+    if (["start", "complete", "failed", "cancelled"].includes(item.generation_event)) {
+      row.generation_event = item.generation_event;
+      row.picker_shot_uuid = clean(item.picker_shot_uuid);
+      row.operation_id = clean(item.operation_id);
+    }
+    return row;
   }).filter(Boolean).slice(-HMB_ACTIVITY_LOG_MAX_ROWS);
 }
 
@@ -1747,10 +1764,13 @@ export function hmbActivityLogRowsForDisplay(state) {
   const source = state && typeof state === "object" ? state : {};
   const explicitText = String(source.activity_log_text == null ? "" : source.activity_log_text);
   let rows = [];
-  if (explicitText || source.activity_log_text_user_edited || source.activity_log_cleared) {
+  const generationRows = source.activity_log?.some?.(row => row?.generation_event);
+  if (!generationRows && (explicitText || source.activity_log_text_user_edited || source.activity_log_cleared)) {
     rows = explicitText.split(/\r?\n/).map(hmbActivityLogRowFromText).filter(Boolean);
   } else {
-    rows = activityLogForDisplay(source).map((entry) => ({
+    rows = activityLogForDisplay(source).filter(entry => !entry.picker_shot_uuid
+      || entry.picker_shot_uuid === clean(source.active_picker_shot_uuid)).map((entry) => ({
+      ...entry,
       time: clean(entry.time),
       level: hmbNormalizeActivityLevel(entry.level),
       message: hmbSummarizeActivityMessage(entry.message),
@@ -1759,7 +1779,8 @@ export function hmbActivityLogRowsForDisplay(state) {
   const compactRows = [];
   const compactIndex = new Map();
   rows.forEach((entry) => {
-    const signature = clean(entry.message).toLowerCase();
+    const signature = entry.operation_id && entry.generation_event
+      ? entry.operation_id + ":" + entry.generation_event : clean(entry.message).toLowerCase();
     if (!signature) return;
     if (!compactIndex.has(signature)) {
       compactIndex.set(signature, compactRows.length);
@@ -1774,6 +1795,7 @@ export function hmbActivityLogRowsForDisplay(state) {
     compactRows[index] = { ...existing, time: clean(entry.time) || clean(existing.time), level: strongestLevel };
   });
   rows = compactRows;
+  if (hmbPickerGenerationOwnsLog(source)) return rows.slice(-HMB_ACTIVITY_LOG_MAX_ROWS);
   const represented = new Map();
   rows.forEach((entry, index) => {
     const signature = clean(entry.message).toLowerCase();
@@ -1820,6 +1842,7 @@ export function hmbActivityLogRowsForDisplay(state) {
 
 export function hmbStateWithNotificationsLogged(next, previous = {}) {
   let state = next && typeof next === "object" ? { ...next } : {};
+  if (hmbPickerGenerationOwnsLog(state)) return state;
   const priorMessage = clean(previous?.message);
   const nextMessage = clean(state.message);
   const priorWarnings = new Set((Array.isArray(previous?.warnings) ? previous.warnings : []).map(clean).filter(Boolean));
@@ -1926,6 +1949,96 @@ function hmbActivityLogHtml(state, tr) {
   const rows = hmbActivityLogRowsForDisplay(state);
   if (!rows.length) return `<div class="activity-log-empty">${escapeHtml(tr?.noActivity || "No activity yet.")}</div>`;
   return rows.map(hmbActivityLogRowHtml).filter(Boolean).join("");
+}
+
+const HMB_PICKER_STAGE_LABELS = {
+  queued: ["대기 중", "Queued"],
+  starting: ["작업 시작", "Starting"],
+  starting_worker: ["작업 시작", "Starting worker"],
+  read_scene: ["씬 읽는 중", "Reading scene"],
+  run_video: ["영상 생성 중", "Generating video"],
+  render_original_preview: ["원본 영상 생성 중", "Generating original video"],
+  render_snapshot: ["스냅샷 생성 중", "Capturing snapshot"],
+  opening_scene: ["씬 여는 중", "Opening scene"],
+  loading_reference: ["참조 불러오는 중", "Loading references"],
+  collecting_meshes: ["메시 수집 중", "Collecting meshes"],
+  building_outliner: ["아웃라이너 구성 중", "Building outliner"],
+  checking_visibility: ["가시성 확인 중", "Checking visibility"],
+  scanning_cameras: ["카메라 확인 중", "Scanning cameras"],
+  reading_timeline: ["타임라인 읽는 중", "Reading timeline"],
+  validating_bindings: ["바인딩 확인 중", "Checking bindings"],
+  applying_render_scope: ["출력 대상 적용 중", "Applying render scope"],
+  preparing_scene: ["씬 준비 중", "Preparing scene"],
+  preparing_full_smooth_geometry: ["스무스 메시 준비 중", "Preparing smooth meshes"],
+  preparing_original_lambert_materials: ["원본 재질 준비 중", "Preparing materials"],
+  preparing_depth: ["뎁스 준비 중", "Preparing depth"],
+  analyzing_depth_range: ["뎁스 범위 계산 중", "Measuring depth range"],
+  preparing_motion_guide: ["모션 가이드 준비 중", "Preparing motion guide"],
+  rendering_frames: ["프레임 출력 중", "Rendering frames"],
+  rendering_mask_frames: ["마스크 출력 중", "Rendering mask frames"],
+  rendering_original_frames: ["원본 프레임 출력 중", "Rendering original frames"],
+  rendering_depth: ["뎁스 프레임 출력 중", "Rendering depth frames"],
+  rendering_depth_frames: ["뎁스 프레임 출력 중", "Rendering depth frames"],
+  rendering_motion_guide: ["모션 가이드 출력 중", "Rendering motion guide"],
+  rendering_motion_guide_frames: ["모션 가이드 출력 중", "Rendering motion guide"],
+  encoding: ["영상 인코딩 중", "Encoding video"],
+  checking_output: ["출력 파일 확인 중", "Checking output"],
+  waiting_for_capture: ["캡처 대기 중", "Waiting for capture"],
+  finishing_stage: ["단계 마무리 중", "Finishing stage"],
+  finishing: ["단계 마무리 중", "Finishing stage"],
+  completed: ["작업 완료", "Complete"],
+  failed: ["작업 실패", "Failed"],
+  cancelled: ["작업 취소", "Cancelled"],
+};
+
+function hmbPickerGenerationOwnsLog(state) {
+  if (state?.operation_kind === "run_video") return true;
+  const last = state?.activity_log?.at?.(-1);
+  return !state?.operation_kind && Number(state?.operation_finished_at_ms) > 0
+    && ["complete", "failed", "cancelled"].includes(last?.generation_event);
+}
+
+export function hmbPickerOperationHeadline(state) {
+  const active = clean(state?.active_picker_shot_uuid);
+  const progress = state?.operation_progress || {};
+  const owner = clean(progress.shot_uuid || state?.operation_picker_shot_uuid);
+  const receipt = state?.read_requests_by_shot?.[active];
+  const language = state?.language === "en" ? 1 : 0;
+  const label = key => HMB_PICKER_STAGE_LABELS[key]?.[language];
+  if (active && owner === active && state?.operation_kind && !state.operation_finished_at_ms) {
+    const stage = clean(progress.stage).toLowerCase();
+    const kind = clean(state?.operation_kind);
+    const measured = progress.percent;
+    if (stage === "render_complete" || stage === "scan_complete" || measured === 100) return label("finishing");
+    const text = label(stage) || label(kind);
+    if (text) return Number.isFinite(measured) && measured >= 0 && measured < 100
+      ? `${text} · ${Math.floor(measured)}%` : text;
+  }
+  if (receipt?.status === "queued") return label("queued");
+  if (receipt?.status === "running") return label("read_scene");
+  const last = state?.activity_log?.at?.(-1);
+  if (!state?.operation_kind && last?.picker_shot_uuid === active && hmbPickerGenerationOwnsLog(state)) {
+    if (last.generation_event === "complete") return label("completed");
+    if (["failed", "cancelled"].includes(last.generation_event)) return label(last.generation_event);
+  }
+  return "";
+}
+
+function hmbPickerElapsedClock(state) {
+  const owner = clean(state?.operation_picker_shot_uuid || state?.activity_log?.at?.(-1)?.picker_shot_uuid);
+  const active = clean(state?.active_picker_shot_uuid);
+  if ((owner && active !== owner) || (!owner && state?.picker_shots?.length > 1)) {
+    return { start: 0, seconds: 0 };
+  }
+  const start = Number(state?.operation_started_at_ms || 0);
+  if (start > 0 && state?.operation_kind && Number(state.operation_finished_at_ms || 0) < start) {
+    return { start, seconds: Math.max(0, (Date.now() - start) / 1000) };
+  }
+  return { start: 0, seconds: Math.max(0, Number(state?.last_operation_seconds || 0)) };
+}
+
+function hmbPickerElapsedText(seconds) {
+  return `${Math.floor(seconds / 60).toString().padStart(2, "0")}:${Math.floor(seconds % 60).toString().padStart(2, "0")}`;
 }
 
 function clamp(value, minimum, maximum) {
@@ -2408,11 +2521,6 @@ function hmbApplySelectedVideoAssetOrderToDomNormalized(container, normalized, t
           );
         }
       }
-      const playButton = card.querySelector?.("[data-play-video-uid]");
-      if (playButton) {
-        playButton.disabled = !!locked;
-        playButton.setAttribute?.("aria-disabled", locked ? "true" : "false");
-      }
       const deleteButton = card.querySelector?.("[data-delete-video-uid]");
       if (deleteButton) {
         deleteButton.disabled = !!locked;
@@ -2496,11 +2604,6 @@ function hmbApplySelectedVideoAssetOrderToDomNormalized(container, normalized, t
           `${title}: ${selectedAsset ? tr.deselectVideoAsset : tr.selectVideoAsset}`,
         );
       }
-    }
-    const playButton = card.querySelector?.("[data-play-video-uid]");
-    if (playButton) {
-      playButton.disabled = !!locked;
-      playButton.setAttribute?.("aria-disabled", locked ? "true" : "false");
     }
     const deleteButton = card.querySelector?.("[data-delete-video-uid]");
     if (deleteButton) {
@@ -3024,7 +3127,7 @@ function defaultState() {
     scene_stage: "EMPTY",
     scene_draft_path: "",
     marker_catalog: hmbNormalizePickerMarkerCatalog(null),
-    marker_catalog_version: 5,
+    marker_catalog_version: MARKER_CATALOG_VERSION,
     scene_request_path: "",
     mode: "maya",
     status: "READY",
@@ -5622,6 +5725,8 @@ export function pickerButtonAvailability(
       && (reload || terminalFailure || !readSnapshotReady),
     reload,
     stopEnabled: (operationBusy || !!localReadPending || !!localOriginalPending) && !stopping,
+    stopPlayblastEnabled: operationKind === "run_video" && operationBusy && !stopping
+      && !!clean(state.operation_id) && !!activeShot && activeShot === clean(state.operation_picker_shot_uuid),
     playblastEnabled: !operationBusy && !anotherShotReading
       && !terminalFailure
       && readSnapshotReady
@@ -5952,25 +6057,28 @@ export function hmbNormalizePickerMarkerCatalog(markerCatalog) {
   const background = rows(raw.background);
   let ghost = background.filter((item) => item.kind === "solid");
   let object = background.filter((item) => item.kind === "pattern");
-  const legacy = actor.length === 7 && ghost.length === 3 && object.length === 4;
-  const current = actor.length === FALLBACK_ACTOR_MARKER_OPTIONS.length
-    && ghost.length === FALLBACK_GHOST_MARKER_OPTIONS.length
-    && object.length === FALLBACK_PATTERN_MARKER_OPTIONS.length;
+  const supported = object.length === FALLBACK_PATTERN_MARKER_OPTIONS.length && (
+    (actor.length === 7 && ghost.length === 3)
+    || (actor.length === 8 && ghost.length === 4)
+    || (actor.length === FALLBACK_ACTOR_MARKER_OPTIONS.length && ghost.length === FALLBACK_GHOST_MARKER_OPTIONS.length)
+  );
+  // Earlier catalogs are prefixes of each solid group. Append only the missing
+  // tail, retaining old rows (including RGB and pattern IDs) and their order.
+  const newActors = FALLBACK_ACTOR_MARKER_OPTIONS.slice(actor.length);
+  const newGhosts = FALLBACK_GHOST_MARKER_OPTIONS.slice(ghost.length);
   const names = [...actor, ...ghost, ...object].map((item) => item.name);
-  if ((!legacy && !current) || new Set(names).size !== names.length
-      || (legacy && (names.includes("Cyan") || names.includes("Lavender")))) {
+  if (!supported || new Set(names).size !== names.length
+      || [...newActors, ...newGhosts].some((name) => names.includes(name))) {
     actor = FALLBACK_ACTOR_MARKER_OPTIONS.map((name) => ({ name, kind: "solid" }));
     ghost = FALLBACK_GHOST_MARKER_OPTIONS.map((name) => ({ name, kind: "solid" }));
     object = FALLBACK_PATTERN_MARKER_OPTIONS.map((name) => ({ name, kind: "pattern" }));
-  } else if (legacy) {
-    // Additive v4 -> v5 migration: keep existing names, RGB metadata and order.
-    // Reopened workflows must not hide the new choices or discard their bindings.
-    actor.push({ name: "Cyan", kind: "solid" });
-    ghost.push({ name: "Lavender", kind: "solid" });
+  } else {
+    for (const name of newActors) actor.push({ name, kind: "solid" });
+    for (const name of newGhosts) ghost.push({ name, kind: "solid" });
   }
   return {
     schema: "hmb-marker-catalog",
-    version: Math.max(5, Number(raw.version) || 5),
+    version: Math.max(MARKER_CATALOG_VERSION, Number(raw.version) || 0),
     character: actor,
     background: [...ghost, ...object],
     options: [...actor, ...ghost, ...object].map((item) => item.name),
@@ -11977,11 +12085,13 @@ function hmbRestorePickerViewState(container, snapshot) {
   }
 }
 
-function hmbRenderPickerActivityLog(logView, state, tr) {
+function hmbRenderPickerActivityLog(logView, state, tr, clearButton) {
   if (!logView) return false;
+  const rows = hmbActivityLogRowsForDisplay(state);
+  if (clearButton && clearButton.disabled !== !rows.length) clearButton.disabled = !rows.length;
   const signature = JSON.stringify([
     tr === TEXT.ko ? "ko" : "en",
-    hmbActivityLogRowsForDisplay(state),
+    rows,
   ]);
   if (clean(logView.__hmbPickerActivityLogSignature) === signature) return false;
   const followEnd = hmbPickerScrollNearEnd(logView);
@@ -12839,6 +12949,9 @@ function hmbNativeUiImplementation(container, props) {
       : `<div class="viewport-empty"><div class="camera-frame"></div><b>${escapeHtml(initialToolPreview?.empty ? (state.language === "en" ? "No tool input" : "입력 영상 없음") : tr.noPreviewTitle)}</b><span>${escapeHtml(initialToolPreview?.empty ? (state.language === "en" ? "Drag one video card from the right into this tool." : "오른쪽의 영상 카드를 한 개씩 이 도구에 드래그하세요.") : tr.noPreviewBody)}</span></div>`;
   const viewportModeLabel = snapshotForViewport ? hmbSnapshotViewportLabel(selectedSnapshot, tr) : (tr.preview || "Video");
   const snapshotDeleteEnabled = !runningOperation && !!selectedSnapshot;
+  const overlayEnabled = () => container.__hmbPickerProgressOverlayRuntime === state.runtime_instance_id
+    && container.__hmbPickerProgressOverlayEnabled === true;
+  const initialHeadline = hmbPickerOperationHeadline(state);
   const activityRows = hmbActivityLogRowsForDisplay(state);
   const priorOutlinerScroll = container.querySelector?.(".outliner-scroll");
   const priorOutlinerFocusPath = priorOutlinerScroll?.contains?.(priorOutlinerScroll.ownerDocument?.activeElement)
@@ -12871,10 +12984,7 @@ function hmbNativeUiImplementation(container, props) {
     HMB_PICKER_MAX_REPRESENTATIVE_VIDEOS,
   );
   const fixedTopAssetCount = hmbPickerWorkspaceAssetUids(fixedTopActiveShot).length;
-  const elapsedSeconds = runningOperation && Number(state.operation_started_at_ms || 0) > 0
-    ? Math.max(0, (Date.now() - Number(state.operation_started_at_ms)) / 1000)
-    : Number(state.last_operation_seconds || 0);
-  const elapsedText = `${Math.floor(elapsedSeconds / 60).toString().padStart(2, "0")}:${Math.floor(elapsedSeconds % 60).toString().padStart(2, "0")}`;
+  const elapsedText = hmbPickerElapsedText(hmbPickerElapsedClock(state).seconds);
   const sharedImportInputMarkup = `
           <input type="file" id="import-video-asset" data-picker-shared-import-input accept=".mp4,video/mp4" multiple hidden/>`;
   const fixedTopPaintMarkup = `<style>
@@ -12991,6 +13101,8 @@ function hmbNativeUiImplementation(container, props) {
       .hmbvp[data-theme] .camera-menu{background:linear-gradient(180deg,var(--hmb-panel-top),var(--hmb-panel-bottom));border-color:var(--hmb-line);box-shadow:0 8px 18px rgba(0,0,0,.5)}
       .hmbvp[data-theme] .camera-menu button:hover,.hmbvp[data-theme] .camera-menu button.active{background:var(--hmb-hover)}
       .hmbvp[data-theme] .palette-button.active{border-color:#fff;box-shadow:0 0 0 1px rgba(0,0,0,.65)}
+      .hmbvp .palette-grid[data-palette-kind="actor"]{flex-wrap:nowrap;gap:clamp(1px,.25cqw,4px)}
+      .hmbvp .palette-grid[data-palette-kind="actor"]>.palette-button{min-width:0;flex:0 1 20px}
       .hmbvp[data-theme] .radio-row input,.hmbvp[data-theme] .setting-checks input{accent-color:var(--hmb-accent)}
       .hmbvp .app-header{border-radius:10px 10px 0 0}
 
@@ -13012,6 +13124,11 @@ function hmbNativeUiImplementation(container, props) {
       .hmbvp[data-theme] .scene-load-bar,.hmbvp[data-theme] .snapshot-toolbar,.hmbvp[data-theme] .generate-playblast-toolbar,.hmbvp[data-theme] .playblast-settings-toolbar,.hmbvp[data-theme] .video-seekbar,.hmbvp[data-theme] .video-controls,.hmbvp[data-theme] .frame-info-strip{background:linear-gradient(180deg,rgba(255,255,255,.022),rgba(255,255,255,.004)),var(--hmb-field);border-color:var(--hmb-line-soft)}
       .hmbvp[data-theme] .activity-body{background:var(--hmb-deep)}
       .hmbvp[data-theme] .activity-log-view{color:var(--hmb-text)}
+      .activity-section .section-head>.grow{display:flex;align-items:center;gap:8px;min-width:0;white-space:nowrap}.activity-progress{min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--hmb-text);font-variant-numeric:tabular-nums}
+      .generate-playblast-toolbar{gap:7px}.generate-playblast-toolbar #run-video{flex:1 1 80%;width:auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .generate-playblast-toolbar #stop-playblast{flex:1 0 18%;min-width:52px;height:29px;border:1px solid var(--hmb-line-soft);border-radius:6px;background:var(--hmb-field);color:var(--hmb-text);font-weight:700;cursor:pointer}
+      .generate-playblast-toolbar #stop-playblast:not(:disabled):hover{border-color:var(--hmb-focus)}.generate-playblast-toolbar #stop-playblast:disabled{opacity:.4;cursor:not-allowed}
+      .activity-overlay-toggle[aria-pressed="true"]{border-color:var(--hmb-accent,#67e8f9);color:var(--hmb-accent,#67e8f9)}.picker-progress-overlay{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);max-width:90%;z-index:2;pointer-events:none;user-select:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:4px 10px;border-radius:6px;background:rgba(5,8,18,.8);color:#fff;font-variant-numeric:tabular-nums}.picker-progress-overlay[hidden]{display:none}
       .hmbvp[data-theme] .scene-path-input,.hmbvp[data-theme] .scene-load-bar button,.hmbvp[data-theme] .original-preview-toggle,.hmbvp[data-theme] .mask-playblast-toggle,.hmbvp[data-theme] .depth-playblast-toggle,.hmbvp[data-theme] .motion-guide-toggle,.hmbvp[data-theme] .setting-select,.hmbvp[data-theme] .video-controls button,.hmbvp[data-theme] .frame-number-label input,.hmbvp[data-theme] .snapshot-toolbar>button,.hmbvp[data-theme] .header-actions button,.hmbvp[data-theme] .activity-clear,.hmbvp[data-theme] .import-video-button,.hmbvp[data-theme] .search-input,.hmbvp[data-theme] .camera-fixed,.hmbvp[data-theme] .camera-dropdown summary,.hmbvp[data-theme] .palette-label,.hmbvp[data-theme] .setting-value,.hmbvp[data-theme] .preview-nav button,.hmbvp[data-theme] .video-asset-footer button,.hmbvp[data-theme] .video-order-actions button{border-color:var(--hmb-line-soft);border-radius:7px;background:linear-gradient(180deg,rgba(255,255,255,.032),rgba(255,255,255,.006)),var(--hmb-field);color:var(--hmb-text);box-shadow:inset 0 1px 0 rgba(255,255,255,.018)}
       .hmbvp[data-theme] button:not([data-hmb-native-identity] *,[data-hmb-native-actions] *){letter-spacing:.01em}
       .hmbvp[data-theme] .scene-load-bar .load-scene-button,.hmbvp[data-theme] .snapshot-toolbar #create-snapshot,.hmbvp[data-theme] .generate-button,.hmbvp[data-theme] .import-video-button{border-color:var(--hmb-primary-line);border-radius:7px;background:linear-gradient(180deg,var(--hmb-primary-top),var(--hmb-primary-bottom));color:#fff;box-shadow:0 0 14px var(--hmb-glow),inset 0 1px 0 rgba(255,255,255,.10)}
@@ -13057,8 +13174,8 @@ function hmbNativeUiImplementation(container, props) {
           <div class="panel-title">${escapeHtml(tr.outliner)} <small>(${escapeHtml(tr.filteredPolygon)})</small></div>
           <div class="outliner-palette">
             <div class="palette-head">
-              <div class="palette-group"><div class="palette-label">${escapeHtml(tr.presetActor)}</div><div class="palette-grid" data-palette-kind="actor">${actorOptions.map((name) => `<button type="button" class="palette-button ${state.selected_color === name ? "active" : ""}" data-color="${escapeHtml(name)}" title="${escapeHtml(name)}" aria-label="${escapeHtml(`${tr.presetActor}: ${name}`)}" style="${hmbPickerColorStyle(name, state.marker_catalog)}" ${initialLocked || !selectedNode ? "disabled" : ""}></button>`).join("")}</div></div>
-              <div class="palette-group"><div class="palette-label" title="${escapeHtml(tr.presetGhostScope)}">${escapeHtml(tr.presetGhost)}</div><div class="palette-grid" data-palette-kind="ghost" data-palette-scope="actor-background">${ghostOptions.map((name) => `<button type="button" class="palette-button ${state.selected_color === name ? "active" : ""}" data-color="${escapeHtml(name)}" title="${escapeHtml(`${name} · ${tr.presetGhostScope}`)}" aria-label="${escapeHtml(`${tr.presetGhost}: ${name}. ${tr.presetGhostScope}`)}" style="${hmbPickerColorStyle(name, state.marker_catalog)}" ${initialLocked || !selectedNode ? "disabled" : ""}></button>`).join("")}</div></div>
+              <div class="palette-group"><div class="palette-label">${escapeHtml(tr.presetActor)}</div><div class="palette-grid" data-palette-kind="actor">${actorOptions.map((name) => `<button type="button" class="palette-button ${state.selected_color === name ? "active" : ""}" data-color="${escapeHtml(name)}" title="${escapeHtml(markerDisplayName(name, state.language))}" aria-label="${escapeHtml(`${tr.presetActor}: ${markerDisplayName(name, state.language)}`)}" style="${hmbPickerColorStyle(name, state.marker_catalog)}" ${initialLocked || !selectedNode ? "disabled" : ""}></button>`).join("")}</div></div>
+              <div class="palette-group"><div class="palette-label" title="${escapeHtml(tr.presetGhostScope)}">${escapeHtml(tr.presetGhost)}</div><div class="palette-grid" data-palette-kind="ghost" data-palette-scope="actor-background">${ghostOptions.map((name) => `<button type="button" class="palette-button ${state.selected_color === name ? "active" : ""}" data-color="${escapeHtml(name)}" title="${escapeHtml(`${markerDisplayName(name, state.language)} · ${tr.presetGhostScope}`)}" aria-label="${escapeHtml(`${tr.presetGhost}: ${markerDisplayName(name, state.language)}. ${tr.presetGhostScope}`)}" style="${hmbPickerColorStyle(name, state.marker_catalog)}" ${initialLocked || !selectedNode ? "disabled" : ""}></button>`).join("")}</div></div>
               <div class="palette-group"><div class="palette-label">${escapeHtml(tr.presetObject)}</div><div class="palette-grid" data-palette-kind="object">${objectOptions.map((name) => `<span class="palette-pattern-chip"><button type="button" class="palette-button ${state.selected_color === name ? "active" : ""}" data-color="${escapeHtml(name)}" title="${escapeHtml(name)}" aria-label="${escapeHtml(`${tr.presetObject}: ${name}`)}" ${initialLocked || !selectedNode ? "disabled" : ""}></button><span class="palette-pattern-visual" aria-hidden="true" style="${hmbPickerColorStyle(name, state.marker_catalog)}"></span></span>`).join("")}</div></div>
             </div>
           </div>
@@ -13071,12 +13188,15 @@ function hmbNativeUiImplementation(container, props) {
         <div class="center-stack">
         <section class="panel viewport-panel">
           <div class="panel-title viewport-title">${hmbPickerToolsTabsMarkup(state)} <small>(${escapeHtml(viewportModeLabel)})</small></div>
-          <div class="viewport-stage">${viewportMediaHtml}<div class="picker-crop-overlay nodrag nopan" data-picker-crop-overlay hidden><div class="picker-crop-box" data-picker-crop-box></div></div><div id="picker-preview-load-status" class="preview-load-status" role="alert" aria-live="assertive" hidden><span data-preview-load-message></span><button type="button" id="retry-picker-preview-load">${escapeHtml(tr.retryPreview || "Retry")}</button></div></div>
+          <div class="viewport-stage">${viewportMediaHtml}<span class="picker-progress-overlay" aria-hidden="true" ${overlayEnabled() && initialHeadline && runningOperation ? "" : "hidden"}>${escapeHtml(initialHeadline)}</span><div class="picker-crop-overlay nodrag nopan" data-picker-crop-overlay hidden><div class="picker-crop-box" data-picker-crop-box></div></div><div id="picker-preview-load-status" class="preview-load-status" role="alert" aria-live="assertive" hidden><span data-preview-load-message></span><button type="button" id="retry-picker-preview-load">${escapeHtml(tr.retryPreview || "Retry")}</button></div></div>
           <div class="video-seekbar"><input type="range" id="video-seek" min="${frameStart}" max="${frameEnd}" step="1" value="${Math.round(initialViewportFrame)}" aria-label="Video timeline" ${!selectedVideoUrl || snapshotForViewport || !hasFrameRange ? "disabled" : ""}/></div>
           <div class="video-controls"><button type="button" class="transport-button" id="snapshot-prev" title="${escapeHtml(tr.previousSnapshot || "Previous snapshot")}" aria-label="${escapeHtml(tr.previousSnapshot || "Previous snapshot")}" ${snapshotHistory.length ? "" : "disabled"}>◀</button><button type="button" class="transport-button" id="video-play-toggle" title="${escapeHtml(tr.playVideo || "Play")}" aria-label="${escapeHtml(tr.playVideo || "Play")}" ${selectedVideoUrl ? "" : "disabled"}>▶</button><button type="button" class="transport-button" id="snapshot-next" title="${escapeHtml(tr.nextSnapshot || "Next snapshot")}" aria-label="${escapeHtml(tr.nextSnapshot || "Next snapshot")}" ${snapshotHistory.length ? "" : "disabled"}>▶</button><label class="frame-number-label">${escapeHtml(tr.frameLabel)} <input type="number" id="video-frame-number" min="${frameStart}" max="${frameEnd}" step="1" value="${Math.round(initialViewportFrame)}" aria-label="${escapeHtml(tr.frameLabel)}" ${!hasFrameRange || snapshotForViewport ? "disabled" : ""}/></label></div>
           <div class="frame-info-strip"><span>FRAME <b id="frame-info-frame">${Math.round(initialViewportFrame)} / ${frameEnd}</b></span><span>TIME <b id="frame-info-time">${escapeHtml(initialTimecode)}</b></span><span>FPS <b id="frame-info-fps">${escapeHtml(frameInfoFps || "—")}</b></span><span><span id="frame-info-total-label">${state.language === "en" ? "TOTAL" : "총 길이"}</span> <b id="frame-info-total">${escapeHtml(hmbPickerOutputLengthText(state))}</b></span></div>
           <div class="snapshot-toolbar"><button type="button" id="create-snapshot" ${!buttonAvailability.snapshotEnabled ? "disabled" : ""}>${escapeHtml(tr.snapshot || "Snapshot")}</button><button type="button" id="delete-snapshot" ${!snapshotDeleteEnabled ? "disabled" : ""}>${escapeHtml(tr.deleteSnapshot || "Delete Snapshot")}</button><div class="output-camera-inline"><span class="output-camera-label">${escapeHtml(tr.cameraPrefix)} :</span><div class="picker-camera-control">${cameraControlHtml(state, tr, runningOperation)}</div></div></div>
-          <div class="generate-playblast-toolbar" role="group" aria-label="${escapeHtml(tr.generate)}"><button type="button" class="generate-button" id="run-video" aria-label="${escapeHtml(hmbPickerGenerateCaption(state, container))}" title="${escapeHtml(state.scene_path)}" ${!buttonAvailability.playblastEnabled ? "disabled" : ""}>▶&nbsp; ${escapeHtml(hmbPickerGenerateCaption(state, container))}</button></div>
+          <div class="generate-playblast-toolbar" role="group" aria-label="${escapeHtml(tr.generate)}">
+            <button type="button" class="generate-button" id="run-video" aria-label="${escapeHtml(hmbPickerGenerateCaption(state, container))}" title="${escapeHtml(state.scene_path)}" ${!buttonAvailability.playblastEnabled ? "disabled" : ""}>▶&nbsp; ${escapeHtml(hmbPickerGenerateCaption(state, container))}</button>
+            <button type="button" id="stop-playblast" aria-label="${state.language === "en" ? "Stop playblast" : "플레이블라스트 중지"}" ${!buttonAvailability.stopPlayblastEnabled || container.__hmbStoppingPlayblastId === state.operation_id ? "disabled" : ""}>${state.language === "en" ? "Stop" : "중지"}</button>
+          </div>
           <div class="playblast-settings-toolbar">
             <div class="settings-grid settings-grid-inline">
               <div class="settings-primary-item"><label for="playblast-resolution" class="settings-primary-label">${escapeHtml(tr.resolution)}</label><div style="display:flex;gap:4px;min-width:0"><select id="playblast-resolution" class="setting-select" ${runningOperation ? "disabled" : ""}>${HMB_PLAYBLAST_RESOLUTIONS.map((item) => `<option value="${item.value}" ${item.width === Number(state.output_width) && item.height === Number(state.output_height) ? "selected" : ""}>${item.label}</option>`).join("")}<option value="custom" ${HMB_PLAYBLAST_RESOLUTIONS.some((item) => item.width === state.output_width && item.height === state.output_height) ? "" : "selected"}>${state.language === "en" ? "Custom" : "직접 입력"}</option></select><input type="text" id="playblast-custom-resolution" class="setting-select nodrag nopan" style="min-width:0;cursor:text" aria-label="${state.language === "en" ? "Width × height" : "너비 × 높이"}" value="${state.output_width}×${state.output_height}" ${HMB_PLAYBLAST_RESOLUTIONS.some((item) => item.width === state.output_width && item.height === state.output_height) ? "hidden" : ""} ${runningOperation ? "disabled" : ""}/></div></div>
@@ -13088,7 +13208,7 @@ function hmbNativeUiImplementation(container, props) {
           <section class="picker-tools-panel nodrag nopan nowheel" data-picker-tools-panel hidden></section>
           <div class="picker-tools-status" data-picker-tools-status hidden><span data-picker-tool-message role="status" aria-live="polite"></span><progress max="1" value="0" hidden></progress><button type="button" data-picker-tool-action="cancel" hidden></button><button type="button" data-picker-tool-action="result" hidden></button><button type="button" data-picker-tool-action="add_result" hidden></button></div>
         </section>
-          <section class="side-section activity-section preview-activity-section" data-section-key="log"><div class="section-head"><span class="grow">${escapeHtml(tr.activityLog)}</span><div class="section-tools"><span class="activity-elapsed" id="activity-elapsed" data-start-ms="${Number(state.operation_started_at_ms || 0)}">${escapeHtml(tr.elapsed)} ${elapsedText}</span><button type="button" class="activity-clear" id="clear-activity-log" ${activityRows.length ? "" : "disabled"}>${escapeHtml(tr.clearLog)}</button></div></div><div class="activity-body" id="activity-log-body"><div id="activity-log-view" class="activity-log-view" role="log" aria-live="polite" aria-label="${escapeHtml(tr.activityLog)}">${activityLogMarkup}</div></div></section>
+          <section class="side-section activity-section preview-activity-section" data-section-key="log"><div class="section-head"><span class="grow">${escapeHtml(tr.activityLog)}<span class="activity-progress" id="activity-progress">${escapeHtml(initialHeadline)}</span></span><div class="section-tools"><button type="button" class="activity-clear activity-overlay-toggle" id="activity-overlay-toggle" aria-pressed="${overlayEnabled()}">${escapeHtml(tr.progressOverlay)}</button><span class="activity-elapsed" id="activity-elapsed" data-start-ms="${Number(state.operation_started_at_ms || 0)}">${escapeHtml(tr.elapsed)} ${elapsedText}</span><button type="button" class="activity-clear" id="clear-activity-log" ${activityRows.length ? "" : "disabled"}>${escapeHtml(tr.clearLog)}</button></div></div><div class="activity-body" id="activity-log-body"><div id="activity-log-view" class="activity-log-view" role="log" aria-live="polite" aria-label="${escapeHtml(tr.activityLog)}">${activityLogMarkup}</div></div></section>
         </div>
         <aside class="right-stack">
           <section class="side-section video-assets-section" data-section-key="color" style="${hmbSectionHeightStyle(rightSectionHeights, "color")}">
@@ -13472,17 +13592,36 @@ function hmbNativeUiImplementation(container, props) {
     else scrollToLatest();
   }
   const elapsedElement = container.querySelector("#activity-elapsed");
-  if (elapsedElement && runningOperation && Number(state.operation_started_at_ms || 0) > 0) {
-    const startedAt = Number(state.operation_started_at_ms);
-    const updateElapsed = () => {
-      const seconds = Math.max(0, (Date.now() - startedAt) / 1000);
-      const label = `${Math.floor(seconds / 60).toString().padStart(2, "0")}:${Math.floor(seconds % 60).toString().padStart(2, "0")}`;
-      elapsedElement.textContent = `${tr.elapsed} ${label}`;
+  let elapsedTimer = null;
+  const updateElapsedClock = (next) => {
+    if (!elapsedElement) return;
+    const clock = hmbPickerElapsedClock(next);
+    const elapsedLabel = (TEXT[next.language] || TEXT.ko).elapsed;
+    const paint = () => {
+      const seconds = clock.start ? Math.max(0, (Date.now() - clock.start) / 1000) : clock.seconds;
+      const value = `${elapsedLabel} ${hmbPickerElapsedText(seconds)}`;
+      if (elapsedElement.textContent !== value) elapsedElement.textContent = value;
     };
-    updateElapsed();
-    const elapsedTimer = window.setInterval(updateElapsed, 1000);
-    activeCleanup.push(() => window.clearInterval(elapsedTimer));
-  }
+    paint();
+    if (clock.start && elapsedTimer !== null && elapsedElement.dataset.startMs === String(clock.start)
+        && elapsedElement.dataset.elapsedLabel === elapsedLabel) return;
+    if (elapsedTimer !== null) window.clearInterval(elapsedTimer);
+    elapsedElement.dataset.startMs = String(clock.start);
+    elapsedElement.dataset.elapsedLabel = elapsedLabel;
+    elapsedTimer = clock.start ? window.setInterval(paint, 1000) : null;
+  };
+  activeCleanup.push(() => { if (elapsedTimer !== null) window.clearInterval(elapsedTimer); });
+  const updateActivityProgress = (next, busy) => {
+    const headline = hmbPickerOperationHeadline(next);
+    const header = container.querySelector("#activity-progress");
+    if (header && header.textContent !== headline) header.textContent = headline;
+    const overlay = container.querySelector(".picker-progress-overlay");
+    if (overlay) {
+      const hidden = !overlayEnabled() || !busy || !headline;
+      if (!hidden && overlay.textContent !== headline) overlay.textContent = headline;
+      if (overlay.hidden !== hidden) overlay.hidden = hidden;
+    }
+  };
 
   const applyImmediateCommandUi = (next) => {
     hmbProjectPickerReadRequest(container, next);
@@ -13512,6 +13651,11 @@ function hmbNativeUiImplementation(container, props) {
       !!container.__hmbOriginalCommandPending,
     );
     hmbApplyPickerCommandAvailabilityToDom(container, availability);
+    const stopPlayblast = container.querySelector("#stop-playblast");
+    if (stopPlayblast) {
+      stopPlayblast.disabled = !availability.stopPlayblastEnabled
+        || container.__hmbStoppingPlayblastId === next.operation_id;
+    }
     if (readButton) {
       const labels = TEXT[next?.language] || TEXT.ko;
       readButton.textContent = availability.reload ? labels.reload : labels.read;
@@ -13555,7 +13699,9 @@ function hmbNativeUiImplementation(container, props) {
       container,
       availability.operationBusy || !!container.__hmbPickerOperationSubmissionPending,
     );
-    hmbRenderPickerActivityLog(container.querySelector("#activity-log-view"), next, tr);
+    updateActivityProgress(next, availability.operationBusy);
+    updateElapsedClock(next);
+    hmbRenderPickerActivityLog(container.querySelector("#activity-log-view"), next, tr, container.querySelector("#clear-activity-log"));
   };
   applyImmediateCommandUi(state);
 
@@ -14489,9 +14635,13 @@ function hmbNativeUiImplementation(container, props) {
     // A host echo may arrive between local feedback and the second-frame
     // publication. Keep the visible draft authoritative for media/order only
     // during that bounded window so the card cannot flash back and reselect.
-    const visibleState = container.__hmbPickerPaintFirstState
+    let visibleState = container.__hmbPickerPaintFirstState
       ? normalize(container.__hmbPickerPaintFirstState)
       : nextState;
+    // Playback remains a local view choice when the host locks authored values.
+    if (props.disabled && container.__hmbForceVideoPreviewUid) {
+      visibleState = hmbPreviewVideoAsset(visibleState, container.__hmbForceVideoPreviewUid);
+    }
     const nextLocked = pickerWorkspaceInteractionLocked(nextState);
     const immediateMediaLocked = pickerLocalInteractionLocked(nextState);
     hmbPatchVideoPickerShotWorkspace(
@@ -14709,11 +14859,11 @@ function hmbNativeUiImplementation(container, props) {
         });
       }
       delete container.__hmbAutoplayVideoUid;
-      if (
+      if (!props?.disabled && (
         switchingWorkspace
         || livePreviewUid !== uid
         || clean(liveState.viewport_mode).toLowerCase() !== "video"
-      ) {
+      )) {
         // Keep play/pause immediate. The large shared Picker state is published
         // only after the browser has painted the card playback feedback.
         schedulePickerStatePublicationAfterPaint(nextState, {
@@ -15540,6 +15690,26 @@ function hmbNativeUiImplementation(container, props) {
     }
     result.deliveryPromise?.then?.((outcome) => { if (outcome?.ok === false) rollback(); });
   });
+  on(container.querySelector("#stop-playblast"), "click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const live = currentWidgetState();
+    const operationId = clean(live.operation_id);
+    if (!pickerButtonAvailability(live).stopPlayblastEnabled || container.__hmbStoppingPlayblastId === operationId) return;
+    container.__hmbStoppingPlayblastId = operationId;
+    event.currentTarget.disabled = true;
+    const result = dispatchCommand("cancel_generate", {
+      operation_id: operationId,
+      picker_shot_uuid: live.active_picker_shot_uuid,
+    });
+    const restoreOnFailure = () => {
+      if (container.__hmbStoppingPlayblastId !== operationId) return;
+      delete container.__hmbStoppingPlayblastId;
+      applyImmediateCommandUi(currentWidgetState());
+    };
+    if (!result.delivered) restoreOnFailure();
+    else result.deliveryPromise?.then(outcome => { if (!outcome.ok) restoreOnFailure(); });
+  });
   on(container.querySelector("#run-video"), "click", (event) => {
     event?.preventDefault?.();
     event?.stopPropagation?.();
@@ -15610,11 +15780,6 @@ function hmbNativeUiImplementation(container, props) {
     if (result.duplicate) return;
     if (!result.delivered) {
       appendImmediateLogLine("ERROR", "PLAYBLAST could not be delivered to HMB_PICKER_COMMAND.");
-    } else {
-      appendImmediateLogLine(
-        "INFO",
-        `Generate requested for new history assets: ${selectedOutputs.join(", ")}. Existing assets will be preserved.`,
-      );
     }
   });
   const applyPlayblastSize = (width, height) => {
@@ -15656,6 +15821,14 @@ function hmbNativeUiImplementation(container, props) {
       event.preventDefault();
       customPlayblastSize.blur();
     }
+  });
+  on(container.querySelector("#activity-overlay-toggle"), "click", (event) => {
+    const enabled = !overlayEnabled();
+    container.__hmbPickerProgressOverlayRuntime = state.runtime_instance_id;
+    container.__hmbPickerProgressOverlayEnabled = enabled;
+    event.currentTarget.setAttribute("aria-pressed", String(enabled));
+    const current = currentWidgetState(false);
+    updateActivityProgress(current, pickerButtonAvailability(current).operationBusy);
   });
   on(container.querySelector("#clear-activity-log"), "click", () => {
     commit({
@@ -16069,8 +16242,9 @@ function hmbNativeUiImplementation(container, props) {
     if (!uid) return;
     hmbCancelVideoPickerPendingPreviewStart(container);
     const liveState = currentWidgetState();
-    const livePreviewUid = clean(liveState.preview_video_uid || liveState.selected_video_uid);
     const previewPlayer = container.querySelector("#picker-video");
+    const livePreviewUid = clean((props?.disabled && previewPlayer?.getAttribute?.("data-video-uid"))
+      || liveState.preview_video_uid || liveState.selected_video_uid);
     const alreadyForced = clean(container.__hmbForceVideoPreviewUid) === uid;
     const requested = hmbVideoPickerRequestedPlaybackUid(container) === uid;
     if (
@@ -16103,7 +16277,7 @@ function hmbNativeUiImplementation(container, props) {
     });
     mediaController.refresh(nextState);
     delete container.__hmbAutoplayVideoUid;
-    if (livePreviewUid !== uid || clean(liveState.viewport_mode).toLowerCase() !== "video") {
+    if (!props?.disabled && (livePreviewUid !== uid || clean(liveState.viewport_mode).toLowerCase() !== "video")) {
       commit(nextState, { suppressMatchingEcho: true });
     }
   };
@@ -16614,7 +16788,7 @@ function hmbNativeUiReadCommand(value, kind) {
   if (kind === "lut") return (v.__hmb_color_lut_command__ || v).action === "cancel";
   const command = v.__hmb_picker_command__ || v;
   return ["picker", "picker-bridge"].includes(kind) && command.schema === "hmb-picker-command"
-    && (["stop_read", "cancel_pending", "cancel_video_import"].includes(command.action)
+    && (["stop_read", "cancel_pending", "cancel_generate", "cancel_video_import"].includes(command.action)
       || (command.action === "video_tools" && command.payload?.op === "cancel"));
 }
 // Locked echoes use only primitive/raw-string identity: no state clone/hash.
@@ -16738,7 +16912,7 @@ function hmbNativeUiContract(container, props, mount, policy) {
 // HMB_NATIVE_DISABLED_ADAPTER_V1_END
 
 function hmbNativeStockSafetyImplementation(container, props) {
-  return hmbNativeUiContract(container, props, hmbNativeUiImplementation, { kind: "picker", allowControl: target => Boolean(target?.closest?.("#video-play-toggle,#video-seek,#video-frame-number,#snapshot-prev,#snapshot-next,#stop-read,[data-picker-import-cancel],[data-picker-tool-action='cancel'],[data-hmb-native-identity],[data-hmb-native-actions]")) });
+  return hmbNativeUiContract(container, props, hmbNativeUiImplementation, { kind: "picker", allowControl: target => Boolean(target?.closest?.("[data-play-video-uid],#video-play-toggle,#video-seek,#video-frame-number,#snapshot-prev,#snapshot-next,#activity-overlay-toggle,#stop-read,#stop-playblast,[data-picker-import-cancel],[data-picker-tool-action='cancel'],[data-hmb-native-identity],[data-hmb-native-actions]")) });
 }
 
 // HMB_NATIVE_STOCK_SAFETY_V1_BEGIN
@@ -16848,27 +17022,273 @@ function hmbAcquireNativeStockSafety(container) {
   return { refresh() { if (owner.active) shared.sync(); }, cleanup() { if (owner.active) shared.release(owner); } };
 }
 
+// Griptape loads each widget as a separate module. One selection per editor
+// document also covers stock parameter fields rendered beside an HMB widget.
+function hmbAcquireCanvasWheel(container) {
+  const node = container?.matches?.(".widget-container") && container.closest?.(".react-flow__node");
+  const doc = container?.ownerDocument, win = doc?.defaultView;
+  if (!node?.closest?.(".react-flow") || !win?.WheelEvent) return null;
+  const key = "__HMB_CANVAS_WHEEL_SELECTION_V1__";
+  let router = doc[key];
+  if (!router) {
+    const nodes = new Map();
+    let selected = null;
+    const activeScroll = "data-hmb-active-scroll";
+    const activeSelector = `[${activeScroll}]`;
+    const outlineStyle = doc.createElement("style");
+    outlineStyle.textContent = `.react-flow .react-flow__node.nowheel ${activeSelector} {
+      outline: 2px solid #4dd8ff !important;
+      outline-offset: -2px !important;
+      anchor-name: --hmb-selected-viewport;
+      overscroll-behavior: contain !important;
+    }
+    .react-flow [data-hmb-scroll-frame] {
+      position: absolute !important;
+      position-anchor: --hmb-selected-viewport;
+      top: anchor(top); left: anchor(left);
+      width: anchor-size(width); height: anchor-size(height);
+      box-sizing: border-box; border: 2px solid #4dd8ff;
+      padding: 0; margin: 0; background: transparent;
+      pointer-events: none !important; z-index: 1000;
+    }`;
+    doc.head.appendChild(outlineStyle);
+    // Paint above composited thumbnails and sticky headers, outside the scrolling
+    // content. CSS anchors follow native scroll, resize and React Flow zoom.
+    const frame = doc.createElement("span");
+    frame.setAttribute("data-hmb-scroll-frame", "");
+    frame.setAttribute("aria-hidden", "true");
+    const anchored = win.CSS?.supports("position-anchor", "--hmb-selected-viewport")
+      && win.CSS.supports("width", "anchor-size(width)");
+    const modal = "dialog,[role='dialog'],[aria-modal='true'],[role='menu'],[role='listbox']:not(select),[data-registration-backdrop],[data-refresh-review-backdrop]";
+    const hasScroll = (element, horizontal) => {
+      const room = horizontal ? element.scrollWidth - element.clientWidth : element.scrollHeight - element.clientHeight;
+      if (room <= 1) return false;
+      const style = win.getComputedStyle(element);
+      return /^(auto|scroll|overlay)$/.test(horizontal ? style.overflowX : style.overflowY);
+    };
+    const canScroll = surface => hasScroll(surface, false) || hasScroll(surface, true);
+    const surfaceAt = (target, root) => {
+      const group = target.closest?.("[data-hmb-scroll-viewport]");
+      if (group && root.contains(group)) return group;
+      for (let el = target; el && el !== root; el = el.parentElement) {
+        if (el.matches?.("textarea")) return el;
+        if (el.matches?.("select,input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit])")) return null;
+        if (canScroll(el)) return el;
+      }
+      return null;
+    };
+    const syncOutline = () => {
+      const surface = selected?.surface;
+      if (!surface?.isConnected) return false;
+      const scrollable = canScroll(surface);
+      surface.toggleAttribute(activeScroll, scrollable);
+      if (anchored && scrollable && frame.previousElementSibling !== surface) {
+        frame.style.borderRadius = win.getComputedStyle(surface).borderRadius;
+        surface.after(frame);
+      } else if (!scrollable) {
+        frame.remove();
+      }
+      return scrollable;
+    };
+    const resized = win.ResizeObserver && new win.ResizeObserver(syncOutline);
+    const clearOutline = () => {
+      const {root, surface} = selected;
+      frame.remove();
+      surface.removeAttribute(activeScroll);
+      for (const copy of root.querySelectorAll(activeSelector)) copy.removeAttribute(activeScroll);
+      for (const copy of root.querySelectorAll("[data-hmb-scroll-frame]")) copy.remove();
+    };
+    const restoreViewport = () => {
+      const {root, key} = selected;
+      if (!key || !root.isConnected) return false;
+      const matches = [...root.querySelectorAll("[data-hmb-wheel-key]")].filter(el => el.dataset.hmbWheelKey === key);
+      if (matches.length !== 1) return false;
+      activate(root, matches[0]);
+      return true;
+    };
+    const changed = win.MutationObserver && new win.MutationObserver(records => {
+      if (!selected) return;
+      const {root, surface} = selected;
+      if (!root.contains(surface)) {
+        if (restoreViewport()) return;
+        changed.disconnect();
+        resized?.disconnect();
+        clearOutline();
+        // Give the renderer one turn to attach the replacement. Release the
+        // detached card tree even if there is no subsequent pointer event.
+        const detached = selected;
+        win.setTimeout(() => {
+          if (selected === detached && !restoreViewport()) clear();
+        }, 0);
+        return;
+      }
+      if (selected.key !== surface.dataset.hmbWheelKey) { clear(); return; }
+      // A cloned field inherits attributes, but only the original owns the wheel.
+      for (const record of records) {
+        for (const added of record.addedNodes) {
+          if (added.nodeType !== 1) continue;
+          if (added !== frame && added.hasAttribute("data-hmb-scroll-frame")) {
+            added.remove();
+            continue;
+          }
+          if (added !== surface) added.removeAttribute(activeScroll);
+          for (const copy of added.querySelectorAll(`${activeSelector},[data-hmb-scroll-frame]`)) {
+            if (copy.hasAttribute("data-hmb-scroll-frame")) {
+              if (copy !== frame) copy.remove();
+            } else if (copy !== surface) copy.removeAttribute(activeScroll);
+          }
+        }
+      }
+      if (records.some(record => surface.contains(record.target))
+          || (anchored && surface.hasAttribute(activeScroll) && frame.previousElementSibling !== surface)) syncOutline();
+    });
+    const clear = () => {
+      if (!selected) return;
+      const {surface, root, addedNoWheel, previousOverscroll} = selected;
+      changed?.disconnect();
+      resized?.disconnect();
+      surface.removeEventListener("input", syncOutline, true);
+      surface.removeEventListener("load", syncOutline, true);
+      clearOutline();
+      if (addedNoWheel && root.classList.contains("nowheel")) root.classList.remove("nowheel");
+      if (surface.style.overscrollBehavior === "contain") surface.style.overscrollBehavior = previousOverscroll;
+      selected = null;
+    };
+    const activate = (root, surface) => {
+      if (surface === selected?.surface) return;
+      clear();
+      if (!surface) return;
+      // Some widget renderers use the viewport className as their scroll
+      // restoration key. Put the native wheel filter on the stock node only.
+      selected = {root, surface, key:surface.dataset.hmbWheelKey, addedNoWheel: !root.classList.contains("nowheel"), previousOverscroll: surface.style.overscrollBehavior};
+      if (selected.addedNoWheel) root.classList.add("nowheel");
+      surface.style.overscrollBehavior = "contain";
+      syncOutline();
+      surface.addEventListener("input", syncOutline, true);
+      surface.addEventListener("load", syncOutline, true);
+      resized?.observe(surface);
+      changed?.observe(root, {subtree:true, childList:true});
+      changed?.observe(surface, {subtree:true, childList:true, characterData:true,
+        attributes:true, attributeFilter:[activeScroll,"data-hmb-wheel-key","class","style","hidden","rows"]});
+    };
+    const select = event => {
+      if (event.button !== 0 || event.isPrimary === false) return;
+      const target = event.target, root = target?.closest?.(".react-flow__node");
+      activate(root, nodes.has(root) && !target.closest(modal) ? surfaceAt(target, root) : null);
+    };
+    const actionAt = target => target.closest("button,textarea,[data-asset],[data-asset-key],[data-video-uid],[data-group-path],[data-instance]");
+    const actionKey = element => element && Array.from(element.attributes)
+      .filter(a => a.name !== activeScroll && (a.name === "id" || a.name === "name" || a.name.startsWith("data-")))
+      .map(a => JSON.stringify([a.name,a.value])).sort().join(",");
+    const afterClick = event => {
+      const current = selected;
+      if (event.button !== 0 || !current?.surface.contains(event.target)) return;
+      const action = actionAt(event.target), identity = actionKey(action);
+      if (!identity) return;
+      const shotAt = el => actionKey(el.closest("[data-shot-row],[data-workspace-uuid],[data-shot-uuid]"));
+      const shot = shotAt(action);
+      // A card/folder button can repaint its list on click. Reacquire only
+      // the same action and viewport under this completed pointer gesture.
+      const {clientX, clientY} = event;
+      win.setTimeout(() => {
+        if (selected !== current || current.surface.isConnected) return;
+        const hit = doc.elementFromPoint(clientX, clientY);
+        if (!hit || hit.closest(".react-flow__node") !== current.root || hit.closest(modal)) return;
+        const nextAction = actionAt(hit), next = surfaceAt(hit, current.root);
+        if (next && next.dataset.hmbWheelKey === current.key && next.tagName === current.surface.tagName && next.className === current.surface.className
+            && nextAction?.tagName === action.tagName && actionKey(nextAction) === identity
+            && shotAt(nextAction) === shot) activate(current.root, next);
+      }, 0);
+    };
+    const escape = event => { if (event.key === "Escape") clear(); };
+    const wheel = event => {
+      const target = event.target, root = target?.closest?.(".react-flow__node");
+      if (!nodes.has(root) || event.defaultPrevented || target.closest(modal)) return;
+      if (selected && !selected.root.contains(selected.surface) && !restoreViewport()) clear();
+      if (selected && selected.key !== selected.surface.dataset.hmbWheelKey) clear();
+      if (!event.ctrlKey && !event.metaKey && selected?.root === root && selected.surface.contains(target)) {
+        const surface = selected.surface;
+        if (surfaceAt(target, root) === surface && syncOutline()) {
+          // Keep native scrolling and widget handlers (virtual lists and
+          // horizontal card strips) on the original, trusted event.
+          if (!root.classList.contains("nowheel")) root.classList.add("nowheel");
+          return;
+        }
+      }
+      // Stock parameters can stop wheel at React's capture phase, before
+      // the widget sees it. Deliver one event at the same pointer position
+      // to the native canvas handler, above those parameter-specific guards.
+      event.preventDefault();
+      event.stopPropagation();
+      const canvasLayer = root.closest(".react-flow__nodes") || root.parentElement;
+      canvasLayer.dispatchEvent(new win.WheelEvent("wheel", event));
+    };
+    doc.addEventListener("pointerdown", select, true);
+    doc.addEventListener("click", afterClick, true);
+    doc.addEventListener("keydown", escape, true);
+    doc.addEventListener("wheel", wheel, {capture: true, passive: false});
+    router = {acquire(root) {
+      nodes.set(root, (nodes.get(root) || 0) + 1);
+      return () => {
+        const count = nodes.get(root) - 1;
+        if (count) nodes.set(root, count);
+        else {
+          nodes.delete(root);
+          if (selected?.root === root) clear();
+        }
+        if (nodes.size) return;
+        doc.removeEventListener("pointerdown", select, true);
+        doc.removeEventListener("click", afterClick, true);
+        doc.removeEventListener("keydown", escape, true);
+        doc.removeEventListener("wheel", wheel, true);
+        outlineStyle.remove();
+        delete doc[key];
+      };
+    }};
+    doc[key] = router;
+  }
+  return router.acquire(node);
+}
+
 function hmbNativeStockSafetyContract(container, props, mount) {
   const previous = container?.__hmbNativeStockSafety;
   const lease = previous?.active ? previous.lease : hmbAcquireNativeStockSafety(container);
+  // The stock WidgetLoader adds nowheel to the entire widget host. Leave
+  // wheel ownership to each HMB widget's concrete scroll surfaces instead.
+  const canvasHost = container?.matches?.(".widget-container") && container.closest?.(".react-flow__node") ? container : null;
+  const restoreWheelClass = previous?.active ? previous.restoreWheelClass : canvasHost?.classList.contains("nowheel");
   let handle;
   try { handle = mount(container, props); }
   catch (error) { if (!previous?.active) lease?.cleanup(); throw error; }
   lease?.refresh();
   if (!lease) return handle;
+  const allowCanvasWheel = () => {
+    if (canvasHost?.classList.contains("nowheel")) canvasHost.classList.remove("nowheel");
+  };
+  allowCanvasWheel();
   if (previous?.active && previous.handle === handle) return previous.proxy;
   if (previous) previous.active = false;
-  const state = { active: true, lease, handle, proxy: null };
+  const releaseWheel = previous?.releaseWheel || hmbAcquireCanvasWheel(container);
+  const state = { active: true, lease, handle, restoreWheelClass, releaseWheel, proxy: null };
   state.proxy = {
     update(next) {
       if (!state.active) return;
-      handle?.update?.(next); lease.refresh();
+      handle?.update?.(next);
+      allowCanvasWheel();
+      lease.refresh();
     },
     cleanup() {
       if (!state.active) return;
       state.active = false;
       try { if (typeof handle === "function") handle(); else handle?.cleanup?.(); }
-      finally { lease.cleanup(); if (container.__hmbNativeStockSafety === state) delete container.__hmbNativeStockSafety; }
+      finally {
+        releaseWheel?.();
+        lease.cleanup();
+        if (container.__hmbNativeStockSafety === state) {
+          if (restoreWheelClass) canvasHost?.classList.add("nowheel");
+          delete container.__hmbNativeStockSafety;
+        }
+      }
     },
   };
   container.__hmbNativeStockSafety = state;

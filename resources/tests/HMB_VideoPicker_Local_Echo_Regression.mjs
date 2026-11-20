@@ -453,10 +453,10 @@ assert.match(
   /Select at least one output: Original, Mask, Depth, or Motion Guide/,
   "Zero selected outputs must be rejected before command dispatch.",
 );
-assert.match(
+assert.doesNotMatch(
   generateHandler,
-  /Generate requested for new history assets:[\s\S]*Existing assets will be preserved/,
-  "The Generate log must state that checked roles append immutable history assets.",
+  /Generate requested for new history assets:/,
+  "A button press must not duplicate the worker's confirmed generation start.",
 );
 const previewVideoSource = widgetSource.slice(
   widgetSource.indexOf("function previewVideo"),

@@ -37,6 +37,9 @@ class Controller:
         assert self.active is process
         self.active = None
     def _wait_for_process_with_progress(self, process, _progress, _overall, _stall, _label, *, activity_paths):
+        progress_state = self._picker_state()
+        progress_state["operation_progress"] = {"stage": "rendering_mask_frames", "percent": 25}
+        self._write_state(progress_state)
         while not process.release.wait(0.01):
             if self._hmb_cancel_requested.is_set():
                 picker._terminate_process(process)
@@ -131,6 +134,9 @@ with tempfile.TemporaryDirectory(prefix='hmb_maya_single_flight_') as temporary:
         wait_until(lambda: len(processes) == 1)
         second = launch('B', node_b, job_b, folder_b)
         wait_until(lambda: coordinator.shared_requests == 1 and node_b.active is not None)
+        wait_until(lambda: all(node.state.get("operation_progress") == {
+            "stage": "rendering_mask_frames", "percent": 25,
+        } for node in (node_a, node_b)), timeout=6)
         first_flight = node_a.active.flight
         picker._terminate_process(node_a.active)  # no taskkill, releases only A
         first.join(3)

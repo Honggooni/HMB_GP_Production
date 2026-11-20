@@ -244,10 +244,9 @@ def _load_marker_catalog(job):
     actor_count = len(character_rows)
     object_count = len(background_rows)
     names = [_clean(item.get("name")) for item in rows]
-    # Existing saved jobs can still carry the 14-choice catalog.  The current
-    # palette appends one Actor and one Ghost without changing those markers.
-    if (actor_count, object_count) not in ((7, 7), (8, 8)) or len(names) != len(set(names)) or any(not name for name in names):
-        raise RuntimeError("HMB marker catalog must contain seven or eight Actor and Object choices each.")
+    # Older jobs may carry either of the two previous palette layouts.
+    if (actor_count, object_count) not in ((7, 7), (8, 8), (10, 9)) or len(names) != len(set(names)) or any(not name for name in names):
+        raise RuntimeError("Invalid HMB Actor/Object palette size or duplicate or empty marker name.")
     colors = {}
     patterns = {}
     pattern_ids = {}
@@ -336,6 +335,10 @@ def _write_progress(job, stage, message, **extra):
         "time": time.time(),
     }
     payload.update(extra)
+    if stage_text == "rendering_frames":
+        capture_pass = job.get("capture_pass")
+        payload["capture_role"] = (capture_pass if capture_pass in ("depth", "motion_guide")
+                                   else "mask" if job.get("apply_marker_shaders", True) else "original")
     temp_path = progress_path + ".tmp"
     try:
         _write_json(temp_path, payload)
@@ -16327,7 +16330,8 @@ def _scan_outliner_nodes(progress_callback=None):
             included.add(current)
             current = parent_of(current)
         if progress_callback and index and index % 250 == 0:
-            progress_callback("collecting_meshes", "Collected {0} of {1} polygon shapes.".format(index, len(renderable_shapes)))
+            progress_callback("collecting_meshes", "Collected {0} of {1} polygon shapes.".format(index, len(renderable_shapes)),
+                              completed_units=index, total_units=len(renderable_shapes))
 
     children_by_transform = dict((transform, []) for transform in included)
     parent_by_transform = {}
@@ -16453,7 +16457,8 @@ def _scan_outliner_nodes(progress_callback=None):
                 descendant_connection[current] = merge_connection(descendant_connection[current], shape_connection)
             current = parent_by_transform.get(current, "")
         if progress_callback and index and index % 250 == 0:
-            progress_callback("checking_visibility", "Checked {0} of {1} polygon shapes.".format(index, len(renderable_shapes)))
+            progress_callback("checking_visibility", "Checked {0} of {1} polygon shapes.".format(index, len(renderable_shapes)),
+                              completed_units=index, total_units=len(renderable_shapes))
 
     for transform in sorted(included, key=lambda item: _dag_depth(item), reverse=True):
         own_connection = connection_kind(transform)
@@ -16544,7 +16549,8 @@ def _scan_outliner_nodes(progress_callback=None):
         }
         nodes.append(node)
         if progress_callback and index and index % 500 == 0:
-            progress_callback("building_outliner", "Built {0} of {1} asset-root rows.".format(index, len(ordered)))
+            progress_callback("building_outliner", "Built {0} of {1} asset-root rows.".format(index, len(ordered)),
+                              completed_units=index, total_units=len(ordered))
     return nodes
 
 
@@ -16602,8 +16608,8 @@ def _scan_cameras():
 
 
 def _scan_scene(job, result_path, maya_version, scene_path):
-    def progress(stage, message):
-        _write_progress(job, stage, message)
+    def progress(stage, message, **counts):
+        _write_progress(job, stage, message, **counts)
     outliner_nodes = _scan_outliner_nodes(progress)
     _write_progress(job, "scanning_cameras", "Scanning scene cameras.")
     cameras, selected_camera = _scan_cameras()

@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -195,11 +194,6 @@ if (playwright && fs.existsSync(executablePath)) {
     import mount, * as widget from '/widget.js'; window.widget=widget;
     window.mountReview=(state,compact)=>{window.controller?.cleanup();const previous=document.getElementById('widget'),container=document.createElement('div');container.id='widget';previous.replaceWith(container);window.container=container;window.writes=[];window.props=(value)=>({value,onChange:(serialized)=>window.writes.push(JSON.parse(serialized))});window.controller=mount(container,window.props(state));if(compact)widget.hmbSetImageAssetLibraryCompact(container,true,{geometry:false});};window.ready=true;
   </script>`;
-  const server = http.createServer((req, res) => {
-    res.setHeader("Content-Type", req.url === "/widget.js" ? "text/javascript; charset=utf-8" : "text/html; charset=utf-8");
-    res.end(req.url === "/widget.js" ? widgetSource : html);
-  });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   let browser;
   try {
     browser = await playwright.chromium.launch({ executablePath, headless: true });
@@ -207,10 +201,32 @@ if (playwright && fs.existsSync(executablePath)) {
     page.setDefaultTimeout(6000);
     const errors = [];
     page.on("pageerror", (error) => errors.push(error.message));
-    await page.goto(`http://127.0.0.1:${server.address().port}`);
+    await page.route("http://imageasset.test/**", route => {
+      const script = new URL(route.request().url()).pathname === "/widget.js";
+      return route.fulfill({ contentType: script ? "text/javascript" : "text/html", body: script ? widgetSource : html });
+    });
+    await page.goto("http://imageasset.test/");
     await page.waitForFunction(() => window.ready);
     await page.clock.install();
-    await page.evaluate(value => window.mountReview(value, false), { ...initial, asset_refresh_review: {} });
+    const saved = { ...initial, project_uid: "example", project_cache_uid: "example-cache", asset_refresh_review: {} };
+    await page.evaluate(value => {
+      window.bridgeRequests = [];
+      const registry = window.__HMB_IMAGE_ASSET_THUMBNAIL_PATCH_BRIDGES_V1__ ||= new Map();
+      registry.set(value.shot_routing.publisher_instance_uuid, { dispatch: request => window.bridgeRequests.push(request) });
+      window.mountReview(value, false);
+    }, saved);
+    await page.clock.fastForward(61000);
+    await page.evaluate(value => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("focus"));
+      window.controller.update(window.props(value));
+    }, saved);
+    await page.clock.fastForward(61000);
+    await page.evaluate(value => window.mountReview(value, false), saved);
+    await page.clock.fastForward(61000);
+    assert.deepEqual(await page.evaluate(() => window.bridgeRequests.filter(request => request.operation === "catalog_probe")), [],
+      "Idle time, focus and reopening a saved widget must never poll the shared catalog.");
+    assert.equal(await page.evaluate(() => window.writes.some(value => (value.edits || value).refresh_revision > 0)), false);
     const reload = page.locator("[data-project-reload]");
     await reload.click();
     await page.waitForFunction(() => window.writes.some(value => (value.edits || value).refresh_revision === 1));
@@ -267,9 +283,8 @@ if (playwright && fs.existsSync(executablePath)) {
       assert.equal(await page.locator(".hmb-image-assets").getAttribute("data-library-compact"), String(compact));
     }
     assert.deepEqual(errors, []);
-    console.log("HMB ImageAsset Refresh browser regression: PASS (expanded and compact review, actual confirm clicks, result, close, unchanged layout)");
+    console.log("HMB ImageAsset Refresh browser regression: PASS (session catalog stays pinned through idle, focus and reopen; explicit refresh, expanded and compact review, confirm, close)");
   } finally {
     await browser?.close();
-    await new Promise((resolve) => server.close(resolve));
   }
 } else console.log("HMB ImageAsset Refresh browser regression: SKIP (optional Playwright/Chrome unavailable)");

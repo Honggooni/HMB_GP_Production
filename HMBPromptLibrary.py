@@ -183,8 +183,8 @@ LEGACY_IMAGE_SOURCES_DEFAULT_HEIGHT = 542
 GROUP_START_HEIGHTS = {
     "imageSources": 490,
     "imageText": 210,
-    "videoSources": 150,
-    "soundSources": 150,
+    "videoSources": 180,
+    "soundSources": 180,
     "videoText": 190,
 }
 GROUP_MIN_HEIGHTS = {
@@ -195,7 +195,7 @@ GROUP_MIN_HEIGHTS = {
     "videoText": 150,
 }
 GROUP_START_TOTAL_HEIGHT = sum(GROUP_START_HEIGHTS.values())
-PROMPT_DASHBOARD_FIXED_HEIGHT = 129
+PROMPT_DASHBOARD_FIXED_HEIGHT = 133
 # Native compatibility/dependency ports are retained on the graph but rendered
 # as hidden rows. The custom dashboard therefore owns the full node.
 PROMPT_NATIVE_ASSET_INPUT_ROW_HEIGHT = 0

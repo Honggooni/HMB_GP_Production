@@ -191,10 +191,53 @@ try{
     assert.equal(await page.evaluate(()=>window.root.__hmbImageAssetLatestState.project_uid),'next-project',`${mode} new project resumes page mode`);
     await page.evaluate(()=>{window.wc.cleanup();window.bc.cleanup();});
   }
+  // Five workstations have five independent drafts and receipt owners. A
+  // delayed server commit or another writer's ACK cannot resubmit or close
+  // this client's pending Add.
+  const clients = await Promise.all(Array.from({length:5}, async (_,i) => {
+    const client = await browser.newPage({viewport:{width:1280,height:1080}});
+    client.on('pageerror', error => errors.push(error.message));
+    await client.route('**/*', route => new URL(route.request().url()).hostname === '127.0.0.1' ? route.continue() : route.abort());
+    await client.goto(`http://127.0.0.1:${server.address().port}`);
+    await client.waitForFunction(() => window.ready);
+    await client.clock.install();
+    const file = `Writer-${i}.png`;
+    const row = {...state.assets[95],asset_library_id:`writer-${i}`,source_uid:`project:writer-${i}`,
+      asset_id:`Writer-${i}`,image_name:`Writer ${i}`,path:`C:/fixture/project/CH/${file}`,relative_path:`CH/${file}`};
+    const clientState = api.hmbNormalizeImageAssetState({...state, assets:[row], shot_routing:undefined});
+    await client.evaluate(value => window.boot(value,0),clientState);
+    await client.locator('[data-folder-key][data-source-view="project"][data-folder-path=""]').first().click();
+    await client.locator('[data-asset-add]').click();
+    return client;
+  }));
+  const requests = await Promise.all(clients.map(async client => {
+    await client.locator('[data-registration-submit]').click();
+    await client.locator('[data-registration-submit]').dispatchEvent('click');
+    const request = await client.evaluate(() => window.writes.map(v => (v.edits || v).asset_registration_request).filter(v => v?.request_id));
+    assert.equal(request.length,1);
+    return request[0];
+  }));
+  assert.equal(new Set(requests.map(v => v.request_id)).size,5);
+  await Promise.all(clients.map(async (client,i) => {
+    await client.clock.fastForward(16000);
+    assert.match(await client.locator('[data-registration-status]').textContent(),/waiting for registration/i);
+    const sendReceipt = receipt => client.evaluate(ticket => {
+      const full = structuredClone(window.full);
+      full.ui_edit_revision = window.writes.at(-1).ui_edit_revision;
+      full.asset_registration_result = {request_id:ticket.request_id,asset_library_id:ticket.asset_library_id,ok:true};
+      window.updateFull(full);
+    },receipt);
+    await sendReceipt(requests[(i+1)%clients.length]);
+    assert.ok(await client.locator('[data-registration-submit]').isDisabled(),'Foreign ACK must leave the pending draft open.');
+    await sendReceipt(requests[i]);
+    await client.waitForFunction(() => !document.querySelector('[data-registration-submit]'));
+    assert.equal(await client.evaluate(() => window.writes.filter(v => (v.edits || v).asset_registration_request?.request_id).length),1);
+    await client.close();
+  }));
   assert.deepEqual(errors.filter(message=>!message.includes('ERR_INVALID_URL')),[]);
   fs.writeFileSync(path.join(output,'widget-result.json'),JSON.stringify({browser:'actual Chromium',canonicalRecords:5000,domWindow:80,visibleStateMax:82,latestOnly:true,
     initialAndDelegatedSelectionExactlyOnce:true,offPageTrayRemoval:true,unregisteredPageAssetClassification:true,compositionFocusCaret:true,
     metadataImportRetire:true,thumbnailMonotonic:true,cleanup:true,newWidgetOldBackendFallback:true,
-    timeoutRejectLocalFallback:true,changedProjectPageRecovery:true,externalTransport:0,...browserMetrics},null,2));
+    timeoutRejectLocalFallback:true,changedProjectPageRecovery:true,concurrentIndependentAddClients:clients.length,externalTransport:0,...browserMetrics},null,2));
   console.log('PASS ImageAsset actual Chromium pages: 5k/80 window, debounce, latest-only, focus/selection, metadata/import epochs, thumbnail continuity, cleanup, old-backend and reject/timeout local fallback.');
 }finally{await browser?.close();await new Promise(resolve=>server.close(resolve));}

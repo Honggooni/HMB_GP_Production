@@ -5,7 +5,6 @@ import copy
 import importlib.util
 import json
 import sys
-import tempfile
 import types
 from pathlib import Path
 
@@ -26,11 +25,14 @@ runner._load_marker_catalog({
     "marker_catalog_path": str(catalog_path),
     "marker_catalog_version": catalog["version"],
 })
-assert len(runner.CHARACTER_MARKERS) == 8
-assert len(runner.BACKGROUND_MARKERS) == 8
-assert len(runner.MARKER_OPTIONS) == 16
+assert len(runner.CHARACTER_MARKERS) == 10
+assert len(runner.BACKGROUND_MARKERS) == 9
+assert len(runner.MARKER_OPTIONS) == 19
 assert runner.MARKER_COLORS["Cyan"] == (0.0, 217 / 255, 217 / 255)
 assert runner.MARKER_COLORS["Lavender"] == (184 / 255, 166 / 255, 217 / 255)
+assert runner.MARKER_COLORS["Teal"] == (0, 128 / 255, 128 / 255)
+assert runner.MARKER_COLORS["Brown"] == (139 / 255, 69 / 255, 19 / 255)
+assert runner.MARKER_COLORS["Olive"] == (128 / 255, 128 / 255, 0)
 solid_rgb8 = {
     name: tuple(round(channel * 255) for channel in rgb)
     for name, rgb in runner.MARKER_COLORS.items()
@@ -42,7 +44,7 @@ assert actor_rgb8.isdisjoint(ghost_rgb8), "Actor/Ghost categories share an RGB c
 pattern_ids = set(runner.MARKER_PATTERN_IDS.values())
 assert len(pattern_ids) == 4
 assert set(solid_rgb8.values()).isdisjoint(pattern_ids), "Solid marker aliases a reserved Pattern ID"
-for color in ("Cyan", "Lavender"):
+for color in ("Cyan", "Lavender", "Teal", "Brown", "Olive"):
     rgb8 = tuple(round(channel * 255) for channel in runner.MARKER_COLORS[color])
     assert rgb8 not in pattern_ids, "New solid marker aliases a screen-space Pattern ID"
 
@@ -127,6 +129,7 @@ ghosts = [
     {"color": "Mint", "asset_id": "GhostMint", "subject_root": "|GhostMint"},
     {"color": "Beige", "asset_id": "GhostBeige", "subject_root": "|GhostBeige"},
     {"color": "Lavender", "asset_id": "GhostLavender", "subject_root": "|GhostLavender"},
+    {"color": "Olive", "asset_id": "GhostOlive", "subject_root": "|GhostOlive"},
     {"color": "Sky Blue", "asset_id": "GhostRepeat", "subject_root": "|GhostRepeat"},
 ]
 hidden = {"color": "Mint", "asset_id": "HiddenGhost", "subject_root": "|HiddenGhost"}
@@ -180,18 +183,16 @@ for record in payload[len(actors):]:
     assert record["shading_profile"]["receives_shadows"] is False
 
 # Legacy catalogs embedded in existing jobs retain their original RGB/shaders.
-legacy_catalog = copy.deepcopy(catalog)
-legacy_catalog["version"] = 4
-legacy_catalog["character"] = [row for row in catalog["character"] if row["name"] != "Cyan"]
-legacy_catalog["background"] = [row for row in catalog["background"] if row["name"] != "Lavender"]
-with tempfile.TemporaryDirectory(prefix="hmb-maya-legacy-palette-") as directory:
-    legacy_path = Path(directory) / "catalog.json"
-    legacy_path.write_text(json.dumps(legacy_catalog), encoding="utf-8")
-    runner._load_marker_catalog({"marker_catalog_path": str(legacy_path), "marker_catalog_version": 4})
-    assert len(runner.MARKER_OPTIONS) == 14
-    assert len(runner.CHARACTER_MARKERS) == 7
-    assert len(runner.BACKGROUND_MARKERS) == 7
-    assert "Cyan" not in runner.MARKER_OPTIONS and "Lavender" not in runner.MARKER_OPTIONS
+for version, historical_size in ((4, 7), (5, 8)):
+    legacy_path = Path(__file__).with_name("fixtures") / f"marker_catalog_v{version}.json"
+    legacy_catalog = json.loads(legacy_path.read_text(encoding="utf-8"))
+    runner._load_marker_catalog({"marker_catalog_path": str(legacy_path), "marker_catalog_version": version})
+    assert len(runner.MARKER_OPTIONS) == historical_size * 2
+    assert len(runner.CHARACTER_MARKERS) == historical_size
+    assert len(runner.BACKGROUND_MARKERS) == historical_size
+    assert {"Teal", "Brown", "Olive"}.isdisjoint(runner.MARKER_OPTIONS)
+    assert ("Cyan" in runner.MARKER_OPTIONS) == (version == 5)
+    assert ("Lavender" in runner.MARKER_OPTIONS) == (version == 5)
     assert runner.MARKER_PATTERN_IDS == {
         row["name"]: tuple(row["screen_space_id_rgb"])
         for row in legacy_catalog["background"] if row["kind"] == "pattern"
@@ -200,4 +201,4 @@ with tempfile.TemporaryDirectory(prefix="hmb-maya-legacy-palette-") as directory
         if row["kind"] == "solid":
             assert runner.MARKER_COLORS[row["name"]] == tuple(row["rgb"])
 
-print("HMB VideoPicker Ghost flat shader: PASS (4 exact Ghost colors, 8 Actors, legacy 14-choice jobs, Pattern ID separation, alpha cutout, repeat color, recolor and hidden-object isolation)")
+print("HMB VideoPicker Ghost flat shader: PASS (5 exact Ghost colors, 10 Actors, archived v4/v5 jobs, Pattern ID separation, alpha cutout, repeat color, recolor and hidden-object isolation)")

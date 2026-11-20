@@ -609,7 +609,7 @@ function hmbNativeUiReadCommand(value, kind) {
   if (kind === "lut") return (v.__hmb_color_lut_command__ || v).action === "cancel";
   const command = v.__hmb_picker_command__ || v;
   return ["picker", "picker-bridge"].includes(kind) && command.schema === "hmb-picker-command"
-    && (["stop_read", "cancel_pending", "cancel_video_import"].includes(command.action)
+    && (["stop_read", "cancel_pending", "cancel_generate", "cancel_video_import"].includes(command.action)
       || (command.action === "video_tools" && command.payload?.op === "cancel"));
 }
 // Locked echoes use only primitive/raw-string identity: no state clone/hash.

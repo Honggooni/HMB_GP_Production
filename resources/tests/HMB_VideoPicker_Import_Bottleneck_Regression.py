@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import copy
-import inspect
 import json
 from pathlib import Path
 import sys
@@ -20,21 +19,15 @@ import HMBVideoPickerLibrary as picker
 def make_node():
     node = picker.HMBVideoPickerLibrary(name=f"Import bottleneck regression {uuid.uuid4().hex}")
     try:
-        from griptape_nodes.exe_types.flow import ControlFlow
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
     except ImportError:
         pass  # The hostless fallback intentionally has no Engine registry.
     else:
         manager = GriptapeNodes.EventManager()
         manager.initialize_queue()
-        options = {"name": f"ImportFixtureFlow_{uuid.uuid4().hex}"}
-        if "engine" in inspect.signature(ControlFlow).parameters:
-            options["engine"] = manager.engine
-        flow = ControlFlow(**options)
-        flow.add_node(node)
-        GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
-        GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
-        GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = flow.name
+        from _hmb_fixture_sdk import ensure_fixture_flow, register_fixture_node
+        flow = ensure_fixture_flow(GriptapeNodes, f"ImportFixtureFlow_{uuid.uuid4().hex}")
+        register_fixture_node(GriptapeNodes, flow, node)
     node._schedule_video_removal_output_sync = lambda: None
     return node, node._picker_state()["active_picker_shot_uuid"]
 

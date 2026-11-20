@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -126,22 +127,17 @@ with tempfile.TemporaryDirectory(prefix="hmb_shared_catalog_") as temporary:
     )
     assert resolved_b[2] == hero["media_signature"]
 
-    # Raw files are admitted only after the background worker confirms one
-    # stable second; the browser need not wait for a second 10-second poll.
+    # An older widget may still send probes. They cannot read or adopt files
+    # changed by other users until an explicit Refresh or a new engine session.
     probe_node = object.__new__(asset_library.HMBImageAssetLibrary)
-    probe_node._hmb_catalog_probe_last_manifest_at = 0.0
-    probe_node._hmb_catalog_probe_last_folder_at = 0.0
-    probe_node._hmb_catalog_probe_pending_folder_signature = ""
-    probe_node._hmb_catalog_probe_pending_folder_since = 0.0
     sidekick = project_a / "Sidekick.png"
     sidekick.write_bytes(png_bytes((20, 80, 220)))
-    request = {"probe_kind": "folder"}
-    outcome, changed = probe_node._compute_catalog_probe(state, request)
-    assert outcome == "changed" and changed is not None
-    assert {item["relative_path"] for item in changed["assets"]} == {
-        "Hero.png",
-        "Sidekick.png",
-    }
+    with patch.object(asset_library, "_catalog_directory_entries", side_effect=AssertionError("implicit folder scan")):
+        assert probe_node._compute_catalog_probe(state, {"probe_kind": "folder"}) == ("no_change", None)
+        idle = asset_library._load_project_catalog(catalog_a, adopted)
+        assert {item["relative_path"] for item in idle["assets"]} == {"Hero.png"}
+    changed = asset_library._load_project_catalog(catalog_a, adopted, use_shared_cache=False)
+    assert {item["relative_path"] for item in changed["assets"]} == {"Hero.png", "Sidekick.png"}
 
     bridge = asset_library._normalize_thumbnail_bridge(
         {
@@ -205,7 +201,7 @@ with tempfile.TemporaryDirectory(prefix="hmb_shared_catalog_") as temporary:
     )
 
     # A raw exact-root change invalidates the persistent index immediately;
-    # reopening never displays a stale catalog for another 10-20 seconds.
+    # a cold verification must detect it even when an index is already present.
     asset_library._write_catalog_index(rescanned)
     raw_added = project_a / "RawAdded.png"
     raw_added.write_bytes(png_bytes((40, 50, 60)))
@@ -416,8 +412,6 @@ with tempfile.TemporaryDirectory(prefix="hmb_shared_catalog_") as temporary:
     assert asset_library._read_catalog_index(project_a, cache_state) is None
 
 
-from unittest.mock import patch
-
 with tempfile.TemporaryDirectory(prefix="hmb_incremental_catalog_") as temporary:
     catalog = Path(temporary).resolve()
     project = catalog / "Show"
@@ -432,15 +426,18 @@ with tempfile.TemporaryDirectory(prefix="hmb_incremental_catalog_") as temporary
     routes = deepcopy(current["shot_routing"])
     original_dimensions = asset_library._asset_dimensions
 
-    # Saved state, explicit Refresh and cold persistent index must not reopen
-    # any unchanged image. A metadata check remains required in each case.
+    # A manual Refresh verifies metadata but reuses unchanged image facts.
+    # A new engine must verify the on-disk index before adopting it.
     with patch.object(asset_library, "_asset_dimensions", side_effect=AssertionError("unchanged image decoded")), \
          patch.object(asset_library, "_asset_content_probe", side_effect=AssertionError("unchanged image sampled")):
         for _ in range(3):
             current = asset_library._load_project_catalog(catalog, current, use_shared_cache=False)
             assert len(current["assets"]) == 5 and current["shot_routing"] == routes
         asset_library._write_catalog_index(current)
-        restored = asset_library._load_project_catalog(catalog, initial, use_shared_cache=False)
+        with patch.dict(asset_library._CATALOG_READS, clear=True), \
+             patch.object(asset_library, "_read_catalog_index", wraps=asset_library._read_catalog_index) as reads:
+            restored = asset_library._load_project_catalog(catalog, initial)
+            assert reads.call_count == 1
         assert len(restored["assets"]) == 5
 
     # File-by-file cache survives normalization/serialization and a new file,
@@ -472,51 +469,33 @@ with tempfile.TemporaryDirectory(prefix="hmb_incremental_catalog_") as temporary
         else:
             raise AssertionError("An unavailable share was accepted as an empty inventory")
 
-import asyncio
+# Older widget sessions are acknowledged synchronously with no shared-drive work.
+node = object.__new__(asset_library.HMBImageAssetLibrary)
+state = asset_library._default_state()
+replies = []
+node._set_thumbnail_bridge_value = replies.append
+with patch.object(asset_library, "_catalog_directory_entries", side_effect=AssertionError("legacy folder request scanned")), \
+     patch.object(asset_library, "_asset_manifest_signature", side_effect=AssertionError("legacy request read manifest")):
+    for kind in ("folder", "manifest"):
+        node._schedule_catalog_probe({"request_id": kind, "probe_kind": kind}, state)
+assert [(reply["request_id"], reply["outcome"]) for reply in replies] == [("folder", "no_change"), ("manifest", "no_change")]
 
-async def completed_probe_ack():
-    for outcome in ("no_change", "deferred", "offline"):
-        node = object.__new__(asset_library.HMBImageAssetLibrary)
-        node._ensure_catalog_probe_runtime_state()
-        state = asset_library._default_state()
-        node._current_state = lambda: deepcopy(state)
-        node._scan_owner_is_current = lambda: True
-        node._compute_catalog_probe = lambda *_: (outcome, None)
-        replies = []
-        host = threading.get_ident()
-        def reply(value):
-            assert threading.get_ident() == host, "Probe published from its IO thread"
-            replies.append(value)
-        node._set_thumbnail_bridge_value = reply
-        request = {"request_id": "single-request-" + outcome}
-        node._schedule_catalog_probe(request, state)
-        deadline = time.monotonic() + 3
-        while not replies and time.monotonic() < deadline:
-            await asyncio.sleep(.005)
-        assert len(replies) == 1 and replies[0]["request_id"] == request["request_id"]
-        assert replies[0]["outcome"] == outcome
-        assert not node._hmb_catalog_probe_pending_key
-        assert node._current_state() == state
-
-asyncio.run(completed_probe_ack())
-
-# Several libraries may observe one catalog, but never own one another's
-# selections, Shot UUIDs, binding channels or changes made while IO is pending.
+# Multiple nodes share filesystem facts without sharing the author's shots.
 from concurrent.futures import ThreadPoolExecutor
 import json
 import uuid
 
-def parallel_probe(states, kind):
+
+def concurrent_open(catalog, states):
     barrier = threading.Barrier(len(states))
     def run(state):
-        node = object.__new__(asset_library.HMBImageAssetLibrary)
-        node._ensure_catalog_probe_runtime_state()
         barrier.wait(timeout=5)
-        return node._compute_catalog_probe(state, {"probe_kind": kind})
+        return asset_library._load_project_catalog(catalog, state)
     with ThreadPoolExecutor(max_workers=len(states)) as pool:
         return list(pool.map(run, states))
 
-with tempfile.TemporaryDirectory(prefix="hmb_probe_coalescing_") as temporary:
+
+with tempfile.TemporaryDirectory(prefix="hmb_session_catalog_") as temporary:
     catalog = Path(temporary).resolve()
     project = catalog / "Show"
     project.mkdir()
@@ -548,37 +527,30 @@ with tempfile.TemporaryDirectory(prefix="hmb_probe_coalescing_") as temporary:
             asset["selection_order"] = order.index(asset["source_uid"]) + 1 if asset["selected"] else 0
         states.append(asset_library._normalize_state(state))
     originals = deepcopy(states)
-    # Comparison control: the previous behavior executes every node's reader.
-    with patch.object(asset_library, "_shared_project_probe_value", side_effect=lambda state, kind, read, **kw: read()), \
-         patch.object(asset_library, "_asset_manifest_signature", wraps=asset_library._asset_manifest_signature) as manifests, \
-         patch.object(asset_library, "_project_folder_metadata_signature", wraps=asset_library._project_folder_metadata_signature) as folders:
-        parallel_probe(states, "manifest")
-        parallel_probe(states, "folder")
-        assert manifests.call_count == folders.call_count == 5
-    # Unchanged five-node polls perform exactly one manifest read and one
-    # metadata inventory; no image decode or content sampling is permitted.
-    asset_library._SHARED_PROBE_RESULTS.clear()
-    with patch.object(asset_library, "_asset_manifest_signature", wraps=asset_library._asset_manifest_signature) as manifests, \
-         patch.object(asset_library, "_project_folder_metadata_signature", wraps=asset_library._project_folder_metadata_signature) as folders, \
-         patch.object(asset_library, "_asset_dimensions", side_effect=AssertionError("probe decoded an image")), \
-         patch.object(asset_library, "_asset_content_probe", side_effect=AssertionError("probe opened image bytes")):
-        assert all(result == ("no_change", None) for result in parallel_probe(states, "manifest"))
-        assert all(result == ("no_change", None) for result in parallel_probe(states, "folder"))
-        assert manifests.call_count == folders.call_count == 1
-    assert states == originals
-
-    # A manifest change is rebuilt once. Each consumer then merges its own
-    # current edit, even when a user deselects/reorders during the shared read.
+    # Five already-loaded views cannot schedule a manifest read, a directory
+    # walk, or image decoding during this session, including after a foreign Add.
     manifest_path = asset_library._existing_asset_manifest_path(project)
     manifest = json.loads(manifest_path.read_text("utf-8"))
-    manifest["assets"][0]["image_name"] = "변경된 등록 이름"
+    new_name = "변경된 등록 이름"
+    manifest["assets"][0]["image_name"] = new_name
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
-    asset_library._SHARED_PROBE_RESULTS.clear()
-    with patch.object(asset_library, "_rebind_shared_catalog_snapshot", wraps=asset_library._rebind_shared_catalog_snapshot) as rebuilds:
-        results = parallel_probe(states, "manifest")
-        assert rebuilds.call_count == 1, rebuilds.call_count
-    for state, (outcome, result) in zip(states, results):
-        assert outcome == "changed"
+    with patch.object(asset_library, "_asset_manifest_signature", side_effect=AssertionError("implicit manifest read")), \
+         patch.object(asset_library, "_catalog_directory_entries", side_effect=AssertionError("implicit inventory")), \
+         patch.object(asset_library, "_asset_dimensions", side_effect=AssertionError("implicit decode")):
+        old_views = concurrent_open(catalog, states)
+    for original, view in zip(originals, old_views):
+        assert view["shot_routing"] == original["shot_routing"]
+        assert view["assets"] == original["assets"]
+
+    # One explicit refresh updates the session list. Each later open gets
+    # those records and retains its own selections, even if edited mid-read.
+    updated = asset_library._load_project_catalog(catalog, states[0], use_shared_cache=False)
+    assert updated["assets"][0]["image_name"] == new_name
+    with patch.object(asset_library, "_asset_manifest_signature", side_effect=AssertionError("re-read after refresh")), \
+         patch.object(asset_library, "_catalog_directory_entries", side_effect=AssertionError("re-scanned after refresh")):
+        results = concurrent_open(catalog, states)
+    for state, result in zip(states, results):
+        assert result["assets"][0]["image_name"] == new_name
         assert result["shot_routing"] == state["shot_routing"]
         assert [(a["selected"], a["selection_order"]) for a in result["assets"]] == [
             (a["selected"], a["selection_order"]) for a in state["assets"]]
@@ -594,8 +566,8 @@ with tempfile.TemporaryDirectory(prefix="hmb_probe_coalescing_") as temporary:
         assert restored["shot_routing"] == merged["shot_routing"]
         assert restored["assets"] == merged["assets"]
     # Neither returned data nor later edits can mutate the shared snapshot.
-    results[0][1]["assets"][0]["image_name"] = "private edit"
-    assert results[1][1]["assets"][0]["image_name"] != "private edit"
+    results[0]["assets"][0]["image_name"] = "private edit"
+    assert results[1]["assets"][0]["image_name"] != "private edit"
     assert states == originals
 
     # Key isolation, completion TTL, retries and cache bound are independent
@@ -641,5 +613,5 @@ with tempfile.TemporaryDirectory(prefix="hmb_probe_coalescing_") as temporary:
     for number in range(120):
         asset_library._shared_project_probe_value(base, ("bound", number), reader, ttl=3)
     assert len(asset_library._SHARED_PROBE_RESULTS) == asset_library._SHARED_PROBE_LIMIT
-print("Shared probes: 5 nodes / 25 shot UUIDs; manifest 5->1, folder 5->1, rebuild 5->1; live edits, reopen, identity, TTL, retry: PASS")
+print("Session catalog: five nodes with 25 shot UUIDs kept selections and read no manifests or folders on reopen; explicit refresh, legacy ACK and cache isolation: PASS")
 print("HMB shared catalog/cache/probe/portable media identity and incremental reuse regression: PASS")

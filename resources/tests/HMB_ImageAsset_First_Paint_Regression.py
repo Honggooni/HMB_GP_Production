@@ -68,6 +68,33 @@ class FirstPaintRegression(unittest.TestCase):
             "scan_revision": self.state["scan_revision"],
             "asset_library_ids": [self.state["assets"][0]["asset_library_id"]]}
 
+    def test_unstable_directory_is_retried_once_in_isolation(self):
+        affected = self.image.parent
+        stable = self.project / "Stable"
+        stable.mkdir()
+        original = library._catalog_directory_entries
+        for continuous in (False, True):
+            calls = []
+            def enumerate_directory(root, current):
+                rows = original(root, current)
+                calls.append(current)
+                if current == affected and (continuous or calls.count(affected) == 1):
+                    details = current.stat()
+                    os.utime(current, ns=(details.st_atime_ns, details.st_mtime_ns + 2_000_000_000))
+                return rows
+
+            with patch.object(library, "_catalog_directory_entries", side_effect=enumerate_directory):
+                if continuous:
+                    with self.assertRaisesRegex(OSError, "changed during catalog verification"):
+                        library._catalog_file_inventory(self.project, incremental=True, full=True)
+                else:
+                    folders, images, _ = library._catalog_file_inventory(self.project, incremental=True, full=True)
+                    self.assertIn("Stable", folders)
+                    self.assertIn(self.image, images)
+            self.assertEqual(calls.count(affected), 2)
+            self.assertEqual(calls.count(self.project), 1)
+            self.assertLessEqual(calls.count(stable), 1)
+
     def test_selection_uses_verified_disk_index_and_preserves_semantics(self):
         library._write_catalog_index(self.state)
         before = deepcopy(self.state)
@@ -85,9 +112,13 @@ class FirstPaintRegression(unittest.TestCase):
 
     def test_changed_folder_index_falls_back_to_scan(self):
         library._write_catalog_index(self.state)
-        (self.project / "Assets" / "New.png").write_bytes(b"new image fixture")
-        with patch.object(library, "_adopt_shared_catalog_snapshot", return_value=None), \
+        with patch.object(library, "_catalog_directory_stamp", return_value=(1, 1, 0, 0)), \
+             patch.object(library, "_adopt_shared_catalog_snapshot", return_value=None), \
              patch.object(library, "_scan_project_assets", wraps=library._scan_project_assets) as scanner:
+            # Fast writes on a mapped drive can leave the same observed
+            # directory stamp. A disk index never proves current inventory.
+            library._catalog_file_inventory(self.project, incremental=True, full=True)
+            (self.project / "Assets" / "New.png").write_bytes(b"new image fixture")
             selected = library._select_catalog_project(self.state, self.project)
         self.assertEqual(scanner.call_count, 1)
         self.assertEqual(len(selected["assets"]), 2)
@@ -166,6 +197,88 @@ class FirstPaintRegression(unittest.TestCase):
              patch.object(library, "_generate_thumbnail_payload", side_effect=ValueError("bad fixture")):
             self.assertEqual(library._asset_thumbnail_url(self.image, "hero"), "")
         self.assertEqual(library._ASSET_THUMBNAIL_FLIGHTS, {})
+
+    def test_reopen_keeps_session_catalog_until_explicit_refresh(self):
+        for number in range(18):
+            (self.project / f"Other{number}").mkdir()
+        saved = library._load_project_catalog(self.catalog, self.state, use_shared_cache=False)
+        saved["shot_routing"]["shots"][0]["selected_source_uids"] = [saved["assets"][0]["source_uid"]]
+        serialized = json.dumps(saved)
+        with patch.object(library, "_catalog_directory_entries", wraps=library._catalog_directory_entries) as reads:
+            for _ in range(3):
+                reopened = library._load_project_catalog(self.catalog, json.loads(serialized))
+                self.assertEqual(reopened["shot_routing"], saved["shot_routing"])
+            self.assertEqual(reads.call_count, 0, "opening a save must not trigger the rotating raw-file probe")
+            document = json.loads(self.manifest.read_text(encoding="utf-8"))
+            document["assets"][0]["image_name"] = "서버에서 변경"
+            self.manifest.write_text(json.dumps(document), encoding="utf-8")
+            reopened = library._load_project_catalog(self.catalog, json.loads(serialized))
+            self.assertEqual(reads.call_count, 0)
+            self.assertEqual(reopened["assets"][0]["image_name"], saved["assets"][0]["image_name"])
+            self.assertEqual(reopened["shot_routing"], saved["shot_routing"])
+            self.assertEqual(reopened["assets"][0]["selection_order"], saved["assets"][0]["selection_order"])
+        with patch.object(library, "_catalog_directory_entries", wraps=library._catalog_directory_entries) as reads:
+            refreshed = library._load_project_catalog(self.catalog, reopened, use_shared_cache=False)
+            self.assertEqual(refreshed["assets"][0]["image_name"], "서버에서 변경")
+            self.assertEqual(refreshed["shot_routing"], saved["shot_routing"])
+            self.assertEqual({call.args[1] for call in reads.call_args_list},
+                             {self.project, self.image.parent, *(self.project / f"Other{i}" for i in range(18))})
+
+    def test_new_empty_renamed_removed_and_nested_in_place_files(self):
+        parents = [self.project / f"Sub{i:02d}" / "Nested" for i in range(10)]
+        for parent in parents:
+            parent.mkdir(parents=True)
+        nested = parents[-1] / "raw.png"
+        nested.write_bytes(b"one")
+        warm = library._load_project_catalog(self.catalog, self.state, use_shared_cache=False)
+        (parents[0] / "Empty").mkdir()
+        (parents[0] / "old.png").write_bytes(b"two")
+        self.assertNotIn("Sub00/Nested/Empty", library._load_project_catalog(self.catalog, warm)["folders"])
+        changed = library._load_project_catalog(self.catalog, warm, use_shared_cache=False)
+        self.assertIn("Sub00/Nested/Empty", changed["folders"])
+        (parents[0] / "old.png").rename(parents[0] / "New.png")
+        (parents[0] / "Empty").rmdir()
+        changed = library._load_project_catalog(self.catalog, changed, use_shared_cache=False)
+        self.assertNotIn("Sub00/Nested/Empty", changed["folders"])
+        names = {a["relative_path"] for a in changed["assets"]}
+        self.assertNotIn("Sub00/Nested/old.png", names)
+        self.assertIn("Sub00/Nested/New.png", names)
+        before = changed["folder_signature"]
+        # Updating bytes need not change the directory's timestamp.
+        nested.write_bytes(b"new and longer")
+        with patch.object(library, "_catalog_directory_entries", wraps=library._catalog_directory_entries) as reads:
+            for _ in range(4):
+                reads.reset_mock()
+                signature = library._project_folder_metadata_signature(self.project, reconcile=True)
+                self.assertLessEqual(reads.call_count, library._RAW_FOLDER_PROBE_BATCH)
+                if signature != before:
+                    break
+            self.assertNotEqual(signature, before, "the rolling verifier must eventually visit every old folder")
+            reads.reset_mock()
+            confirm = library._project_folder_metadata_signature(self.project, confirm=signature)
+            self.assertEqual(confirm, signature)
+            self.assertIn(nested.parent, [call.args[1] for call in reads.call_args_list])
+        checked = library._load_project_catalog(self.catalog, changed, use_shared_cache=False)
+        old_media = next(a for a in changed["assets"] if a["path"] == nested.as_posix())
+        new_media = next(a for a in checked["assets"] if a["path"] == nested.as_posix())
+        self.assertNotEqual(old_media["media_signature"], new_media["media_signature"])
+
+    def test_failed_registry_or_directory_verification_preserves_last_snapshot(self):
+        self.state = library._load_project_catalog(self.catalog, self.state, use_shared_cache=False)
+        base = deepcopy(self.state)
+        verified = self.manifest.read_bytes()
+        self.manifest.write_bytes(b"{")
+        with self.assertRaises(ValueError):
+            library._load_project_catalog(self.catalog, self.state, use_shared_cache=False)
+        self.assertEqual(base, self.state)
+        self.manifest.write_bytes(verified)
+        with patch.object(library, "_catalog_directory_entries", side_effect=PermissionError("offline")), \
+             self.assertRaises(PermissionError):
+            library._load_project_catalog(self.catalog, self.state, use_shared_cache=False)
+        recovered = library._load_project_catalog(self.catalog, self.state)
+        self.assertTrue(recovered["assets"][0]["registered"])
+        self.assertTrue(recovered["assets"][0]["selected"])
+        self.assertEqual(recovered["shot_routing"], base["shot_routing"])
 
 
 if __name__ == "__main__":

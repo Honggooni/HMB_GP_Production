@@ -216,21 +216,13 @@ try:
         assert "_clean_project_manifest_refresh(" not in refresh_worker
         assert "_read_catalog_index" not in refresh_branch
         assert "_read_catalog_index" not in refresh_worker
-        process_source = inspect.getsource(asset_library.HMBImageAssetLibrary.process)
-        assert process_source.index("_read_catalog_index(") < process_source.index(
-            "self._load_catalog("
-        )
 
         # PROJECT_ROOT remains authoritative even when a host changes it
         # programmatically without delivering the retained widget callback.
         # Neither an otherwise-current state nor its local index may keep the
         # node attached to the previous catalog.
         requested_process_root = str(temporary / "ReplacementProjects")
-        process_current = deepcopy(indexed_state)
-        # Reproduce the async root-change busy snapshot: catalog_root already
-        # reflects the new picker value while project_root/assets still belong
-        # to the previous project.
-        process_current["catalog_root"] = requested_process_root.replace("\\", "/")
+        process_current = asset_library._load_project_catalog(catalog_root, indexed_state, use_shared_cache=False)
         process_loads = []
 
         class ProcessRootProbe:
@@ -259,24 +251,18 @@ try:
             def _reconcile_hmb_shot_routing(self, _catalog_identity=""):
                 return None
 
-        original_parameter_reader = asset_library._get_parameter_raw
-        original_current_check = asset_library._state_catalog_is_current
-        original_index_reader = asset_library._read_catalog_index
-        asset_library._get_parameter_raw = lambda _node, name: (
-            requested_process_root
-            if name == asset_library.PROJECT_ROOT_PARAMETER
-            else None
-        )
-        asset_library._state_catalog_is_current = lambda _state: True
-        asset_library._read_catalog_index = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("A stale-root catalog index was consulted by process().")
-        )
-        try:
+        selected_root = catalog_root
+        with patch.object(asset_library, "_get_parameter_raw", side_effect=lambda _node, name:
+                selected_root if name == asset_library.PROJECT_ROOT_PARAMETER else None), \
+                patch.object(asset_library, "_read_catalog_index", side_effect=AssertionError("Unexpected disk lookup")), \
+                patch.object(asset_library, "_read_asset_manifest", side_effect=AssertionError("Unexpected share read")):
             asset_library.HMBImageAssetLibrary.process(ProcessRootProbe())
-        finally:
-            asset_library._get_parameter_raw = original_parameter_reader
-            asset_library._state_catalog_is_current = original_current_check
-            asset_library._read_catalog_index = original_index_reader
+            assert not process_loads, "Run reloaded a verified session catalog"
+            # Async root change: the widget carries the new root but still
+            # displays the last project's data until the new load completes.
+            selected_root = requested_process_root
+            process_current["catalog_root"] = requested_process_root.replace("\\", "/")
+            asset_library.HMBImageAssetLibrary.process(ProcessRootProbe())
         assert process_loads == [requested_process_root]
 
         # A failed project reload must retain the last verified outputs and
@@ -1425,10 +1411,9 @@ try:
 
     # External Add performs no project scan, replaces only the source row, and
     # remaps that source UID at the exact position in every Shot.
-    catalog_state = asset_library._load_project_catalog(
-        catalog_root,
-        asset_library._default_state(),
-    )
+    # The earlier fixture registered Hero directly on the server. Its change
+    # becomes visible to this already-open session only after explicit Refresh.
+    catalog_state = asset_library._load_project_catalog(catalog_root, indexed_state, use_shared_cache=False)
     catalog_project_path = next(
         item["path"]
         for item in catalog_state["projects"]
@@ -1579,6 +1564,91 @@ try:
         registered["source_uid"],
         anchor["source_uid"],
     ]
+
+    # A saved workflow opened during startup joins only its own project's
+    # read. Switching to a different file with the same node name must work
+    # while the old disk request is still blocked.
+    from concurrent.futures import ThreadPoolExecutor
+    projects = temporary / "workflow-switch" / "projects"
+    saved_workflows = []
+    for project_name in ("A", "B"):
+        root = projects / project_name / "Ai_Ct_image"
+        (root / ".json").mkdir(parents=True)
+        (root / "Hero.png").write_bytes(png_bytes((8, 8), (0, 0, 0)))
+        (root / ".json" / "hmb_image_assets.json").write_text(asset_library._json_text({
+            "assets": [{"path": "Hero.png", "asset_id": project_name, "image_name": project_name,
+                        "selected": True, "selection_order": 1}]
+        }), encoding="utf-8")
+        saved = asset_library._merge_scan_with_state(asset_library._scan_project_assets(root), {})
+        saved["catalog_root"] = projects.as_posix()
+        saved["assets"][0].update(selected=True, selection_order=1)
+        saved["shot_routing"]["shots"][0]["selected_source_uids"] = [saved["assets"][0]["source_uid"]]
+        saved_workflows.append(asset_library._normalize_state(saved))
+    def project_files():
+        return {path.relative_to(projects): (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in projects.rglob("*") if path.is_file()}
+
+    original_project_files = project_files()
+    started, joined, resume = threading.Event(), threading.Event(), threading.Event()
+    actual_scan = asset_library._scan_project_assets
+    scans = []
+
+    def held_project_scan(path, **kwargs):
+        project_name = Path(path).parent.name
+        scans.append(project_name)
+        if project_name == "A":
+            started.set()
+            assert resume.wait(10)
+        return actual_scan(path, **kwargs)
+
+    actual_read = asset_library._catalog_read_once
+    a_key = asset_library._session_catalog_key("catalog", saved_workflows[0]["project_root"])
+
+    def observed_read(key, read, **kwargs):
+        if key == a_key and started.is_set():
+            joined.set()
+        return actual_read(key, read, **kwargs)
+
+    with patch.object(asset_library, "DEFAULT_PROJECTS_ROOT", projects), patch.object(
+        asset_library, "_scan_project_assets", side_effect=held_project_scan
+    ), patch.object(asset_library, "_catalog_read_once", observed_read), ThreadPoolExecutor(max_workers=2) as executor:
+        worker = asset_library.HMBImageAssetLibrary.start_catalog_warmup(threading.Event())
+        try:
+            assert started.wait(5)
+            a = executor.submit(asset_library._load_project_catalog, projects, saved_workflows[0])
+            assert joined.wait(5), "Opening A started a second source read during startup"
+            b = executor.submit(asset_library._load_project_catalog, projects, saved_workflows[1]).result(timeout=5)
+            assert b["project_id"] == "B" and b["shot_routing"] == saved_workflows[1]["shot_routing"]
+        finally:
+            resume.set()
+            worker.join(10)
+        assert not worker.is_alive()
+        assert a.result(timeout=5)["shot_routing"] == saved_workflows[0]["shot_routing"]
+        assert scans.count("A") == 1, scans
+        with patch.object(asset_library, "_scan_project_assets", side_effect=AssertionError("warm project walked again")):
+            for saved in reversed(saved_workflows):
+                reopened = asset_library._load_project_catalog(projects, saved)
+                assert reopened["project_root"] == saved["project_root"] and reopened["shot_routing"] == saved["shot_routing"]
+            fresh = asset_library._load_project_catalog(projects, asset_library._default_state())
+            assert asset_library._select_catalog_project(fresh, saved_workflows[0]["project_root"])["assets"][0]["selected"]
+            deselected = deepcopy(saved_workflows[0])
+            deselected["assets"][0].update(selected=False, selection_order=0)
+            deselected["shot_routing"]["shots"][0]["selected_source_uids"] = []
+            reopened = asset_library._load_project_catalog(projects, deselected)
+            assert not reopened["assets"][0]["selected"]
+            assert reopened["shot_routing"] == deselected["shot_routing"]
+        assert asset_library._CATALOG_READS[a_key].done()
+    assert project_files() == original_project_files
+    verified_index = asset_library._catalog_index_path(saved_workflows[0]["project_root"])
+    cached_bytes = verified_index.read_bytes()
+    # A new engine lifecycle is the other allowed refresh boundary.
+    with patch.dict(asset_library._CATALOG_READS, clear=True), patch.object(asset_library, "DEFAULT_PROJECTS_ROOT", projects), patch.object(
+        asset_library, "_discover_project_catalog", side_effect=PermissionError("offline share")
+    ), patch.object(asset_library, "_diagnostic_warning") as warning:
+        unavailable = asset_library.HMBImageAssetLibrary.start_catalog_warmup(threading.Event())
+        unavailable.join(5)
+        assert not unavailable.is_alive() and warning.call_count == 1
+    assert verified_index.read_bytes() == cached_bytes and project_files() == original_project_files
 finally:
     asset_library._ASSET_THUMBNAIL_CACHE_ROOT = default_cache_root
     asset_library._ASSET_CATALOG_INDEX_ROOT = default_index_root

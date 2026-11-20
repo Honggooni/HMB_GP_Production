@@ -101,9 +101,9 @@ const paletteGroups = pickerModule.hmbPickerPaletteGroups({
   ].map((name) => ({ name, kind: "pattern" }))),
 });
 assert.deepEqual(paletteGroups.actor, [
-  "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink", "Cyan",
+  "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink", "Cyan", "Teal", "Brown",
 ]);
-assert.deepEqual(paletteGroups.ghost, ["Sky Blue", "Mint", "Beige", "Lavender"]);
+assert.deepEqual(paletteGroups.ghost, ["Sky Blue", "Mint", "Beige", "Lavender", "Olive"]);
 assert.deepEqual(paletteGroups.object, [
   "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern",
 ]);
@@ -152,8 +152,8 @@ for (const [name, source] of [
 assert.match(promptSource, /class="title-mark" aria-hidden="true">PL<\/span>/, "Prompt must use the rounded PL monogram.");
 assert.match(
   promptSource,
-  /imageSources: 490,[\s\S]*?imageText: 210,[\s\S]*?videoSources: 150,[\s\S]*?soundSources: 150,[\s\S]*?videoText: 190,[\s\S]*?const HMB_START_LAYOUT_CHROME_HEIGHT = 129;[\s\S]*?const HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT = 0;[\s\S]*?HMB_START_LAYOUT_CHROME_HEIGHT \+[\s\S]*?HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT;/,
-  "Prompt must retain the approved 1490×1480px startup group's heights, including Sound, without native input-row overhead.",
+  /imageSources: 490,[\s\S]*?imageText: 210,[\s\S]*?videoSources: 180,[\s\S]*?soundSources: 180,[\s\S]*?videoText: 190,[\s\S]*?const HMB_START_LAYOUT_CHROME_HEIGHT = 133;[\s\S]*?const HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT = 0;[\s\S]*?HMB_START_LAYOUT_CHROME_HEIGHT \+[\s\S]*?HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT;/,
+  "Prompt must retain the approved 1490×1544px startup group's heights, including Sound, without native input-row overhead.",
 );
 assert.match(promptSource, /\.topbar\{height:58px;flex:0 0 58px;padding:8px 13px/);
 assert.match(promptSource, /\.title-mark\{flex:0 0 35px;width:35px;height:35px/);
@@ -953,11 +953,31 @@ assertNativeHeaderInteriorGuard(agentSource, {
 const agentNativeDragRules = /\.hmb-agent-dashboard\[data-hmb-native-header="active"\] \.agent-topbar(?::active)?\{cursor:(?:grab|grabbing)\}/g;
 assert.equal([...agentSource.matchAll(agentNativeDragRules)].length, 2,
   "Only the active native title has its explicit grab/grabbing cursor pair.");
+// The separate decorative scroll frame must pass every pointer event through.
+// Ignore only that declaration under the exact single selector. Grouped
+// selectors, other frame declarations and every interactive body rule remain.
+const scrollFrameRule = /(^|\})\s*\.react-flow \[data-hmb-scroll-frame\]\s*\{([^{}]*)\}/g;
+const passThrough = /(^|;)\s*pointer-events\s*:\s*none\s*!important\s*(?=;|$)/;
+const unexpectedHitRule = /(?:^|[;{])\s*cursor\s*:|pointer-events\s*:/m;
+function agentBodyUnderTest(source) {
+  return source.replace(agentNativeDragRules, "").replace(scrollFrameRule, (rule, _boundary, declarations) =>
+    rule.replace(declarations, declarations.replace(passThrough, "$1")));
+}
+const frames = [...agentSource.matchAll(scrollFrameRule)];
+assert.equal(frames.length, 1);
+assert.match(frames[0][2], passThrough);
 assert.doesNotMatch(
-  agentSource.replace(agentNativeDragRules, ""),
-  /(?:^|[;{])\s*cursor\s*:|pointer-events\s*:/m,
+  agentBodyUnderTest(agentSource), unexpectedHitRule,
   "The remaining Agent body must inherit native cursor and hit testing; no broad pointer/cursor override is allowed.",
 );
+for (const prohibited of [
+  ".agent-topbar { pointer-events: none !important; }",
+  ".agent-topbar, .react-flow [data-hmb-scroll-frame] { pointer-events: none !important; }",
+  ".react-flow [data-hmb-scroll-frame] { pointer-events: auto !important; }",
+  ".react-flow [data-hmb-scroll-frame] { cursor: grab; pointer-events: none !important; }",
+]) {
+  assert.match(agentBodyUnderTest(prohibited), unexpectedHitRule);
+}
 assert.doesNotMatch(agentSource, /<select\b[^>]*class="agent-shot-select\b/i,
   "The singleton Agent must not render the retired header Shot selector.");
 assert.doesNotMatch(agentSource, /<button\b[^>]*class="agent-only-toggle\b/i,
@@ -1466,8 +1486,10 @@ assert.match(pickerGenerateContract, /include_original: originalEnabled/);
 assert.match(pickerGenerateContract, /include_mask: maskEnabled/);
 assert.match(pickerGenerateContract, /include_depth: depthEnabled/);
 assert.match(pickerGenerateContract, /include_motion_guide: motionGuideEnabled/);
-assert.match(pickerGenerateContract, /Generate requested for new history assets:/);
-assert.match(pickerGenerateContract, /Existing assets will be preserved/);
+assert.doesNotMatch(pickerGenerateContract, /Generate requested for new history assets:/,
+  "Only the accepted worker operation publishes generation start");
+assert.match(pickerGenerateContract, /PLAYBLAST could not be delivered/,
+  "A failed command delivery still reports its error");
 assert.match(
   videoSource,
   /\.snapshot-toolbar\{[\s\S]*?display:grid;grid-template-columns:minmax\(96px,4fr\) max-content minmax\(145px,6fr\)/,

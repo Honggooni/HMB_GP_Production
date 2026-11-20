@@ -162,6 +162,12 @@
       "required": true
     },
     {
+      "name": "HMB_Widget_Selected_Wheel_Browser_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
       "name": "HMB_Workflow_Serialization_Identity_Regression.py",
       "mode": "manual",
       "coverage": "installed_sdk",
@@ -240,10 +246,9 @@
     },
     {
       "name": "HMB_Generation_Finish_Native_Header_Widget_Regression.mjs",
-      "mode": "manual",
+      "mode": "ci",
       "coverage": "host_browser",
-      "required": false,
-      "reason": "Offline Chromium product headers verify native slot lifecycle, original fields, lock and pointer boundaries without live generation or uploads."
+      "required": true
     },
     {
       "name": "HMB_Image_Bash_Header_Widget_Regression.mjs",
@@ -3496,6 +3501,18 @@
     },
     {
       "name": "HMB_ImageAsset_First_Paint_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_ImageAsset_Workspace_Index_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_ImageAsset_Concurrent_Add_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
       "required": true

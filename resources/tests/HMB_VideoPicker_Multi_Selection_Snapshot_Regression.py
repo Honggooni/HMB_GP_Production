@@ -178,7 +178,9 @@ with tempfile.TemporaryDirectory(prefix="hmb-picker-multi-snapshot-") as tempora
     cloned_many = picker._parse_state(json.loads(json.dumps(many_state)))
     assert cloned_many["slot_assignments"] == many_state["slot_assignments"]
     many_job = node._selected_slot_job_bindings(cloned_many, 1)
-    assert len(many_job) == 128 and len({item["color"] for item in many_job}) == 16
+    assert len(many_job) == 128
+    assert {item["color"] for item in many_job} == set(picker.MARKER_ORDER)
+    assert len(picker.MARKER_ORDER) == 19
     assert len(picker._normalize_markers(many_job + copy.deepcopy(many_job), 1)) == 128
     repeated_many = copy.deepcopy(cloned_many)
     for item in repeated_many["slot_assignments"][0]["bindings"]:
@@ -243,4 +245,4 @@ with tempfile.TemporaryDirectory(prefix="hmb-picker-multi-snapshot-") as tempora
     finally:
         picker._find_mayabatch = original_find_maya
 
-print("VideoPicker 128-object/16-marker same-color reuse, clone/stale preservation, exact Snapshot/Playblast job bindings and retry: PASS")
+print(f"VideoPicker 128-object/{len(picker.MARKER_ORDER)}-marker same-color reuse, clone/stale preservation, exact Snapshot/Playblast job bindings and retry: PASS")

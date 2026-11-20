@@ -94,7 +94,7 @@ assert.equal(paths(picker.hmbPickerSelectOutlinerPath(head, "|N250", { shiftKey:
 // Exercise manual per-object edits with every established palette entry, then
 // apply one repeated color to all targets through the real range selection.
 const palette = picker.hmbNormalizePickerMarkerCatalog(null);
-assert.equal(palette.options.length, 16);
+assert.equal(palette.options.length, 19);
 const manyTargets = { ...initial, runtime_instance_id: "many-target-runtime",
   outliner_nodes: Array.from({ length: 128 }, (_, index) => root(`MaskTarget${index}`)),
   slot_assignments: [{ video_slot: 1, bindings: [] }], marker_catalog: palette };
@@ -245,4 +245,4 @@ assert.equal(commands[1].action, "render_snapshot");
 assert.deepEqual(commands[1].payload.authoring_state.slot_assignments, allPaletteAssignments.slot_assignments,
   "The actual Snapshot click transports all target/color assignments, including the tail after five.");
 
-console.log("HMB VideoPicker multi-selection, 128 targets/16 palette markers, repeated color, stale echo and snapshot retry regression: PASS");
+console.log(`HMB VideoPicker multi-selection, 128 targets/${palette.options.length} palette markers, repeated color, stale echo and snapshot retry regression: PASS`);

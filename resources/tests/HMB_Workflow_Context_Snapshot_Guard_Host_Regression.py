@@ -6,6 +6,7 @@ load/serialization handlers remain real; barriers only expose the proven race.
 from __future__ import annotations
 import argparse
 import asyncio
+import base64
 from contextlib import ExitStack
 import contextvars
 import hashlib
@@ -13,6 +14,7 @@ import importlib
 import json
 from pathlib import Path
 import sys
+import tempfile
 import threading
 import traceback
 from unittest import mock
@@ -81,17 +83,47 @@ async def exercise(engine,_phase,out):
                 guards.enter_context(mock.patch.object(routing,name,lambda *a,**k:False))
             guards.enter_context(mock.patch.object(t._HMBAIBrokerBridge,"_request_json",harness.deny))
             guards.enter_context(mock.patch.object(t.HMBSeedanceGeneration,"_process_generation",harness.deny))
+            private_root = Path(guards.enter_context(tempfile.TemporaryDirectory(dir=out))).resolve()
+            project_root = private_root / "projects"
+            guards.enter_context(mock.patch.object(images, "DEFAULT_PROJECTS_ROOT", project_root))
+            guards.enter_context(mock.patch.object(images, "_ASSET_CATALOG_INDEX_ROOT", private_root / "index"))
+            project = project_root / "WorkflowCatalog" / "Ai_Ct_image"
+            metadata = project / ".json"
+            metadata.mkdir(parents=True, exist_ok=True)
+            (project / "Hero.png").write_bytes(base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg=="))
+            manifest = metadata / "hmb_image_assets.json"
+            registry = {"schema": "hmb-image-assets", "version": 1, "project_cache_uid": "hmbpc1:" + "7" * 32,
+                        "assets": [{"path": "Hero.png", "asset_id": "Hero", "image_name": "Before save"}]}
+            manifest.write_text(json.dumps(registry), encoding="utf-8")
+            lifecycle = object.__new__(bootstrap.HMBProductionLibrary)
+            lifecycle.after_library_nodes_loaded(schema, library)
+            for _ in range(500):
+                if images._catalog_index_path(project).is_file():
+                    break
+                await asyncio.sleep(.01)
+            assert images._catalog_index_path(project).is_file()
+            harness.record("registered_desktop_sdk_prepares_image_catalog_before_first_node")
             flow_name=harness.send(engine,EnsureWorkflowAndFlowRequest(flow_name="SnapshotGuardSDK")).flow_name
             created=harness.send(engine,CreateNodeRequest(node_type="HMBImageAssetLibrary",specific_library_name=schema.name,
                 node_name="Context Source",initial_setup=True,create_error_proxy_on_failure=False))
             source=engine.node_manager.get_node_by_name(created.node_name)
             source._hmb_initial_catalog_scan_pending=False
+            authored = images._load_project_catalog(images.DEFAULT_PROJECTS_ROOT, source._current_state())
+            authored = images._select_catalog_project(authored, project)
+            authored["assets"][0].update(selected=True, selection_order=1)
+            authored["shot_routing"]["shots"][0]["selected_source_uids"] = [authored["assets"][0]["source_uid"]]
+            saved_shot = authored["shot_routing"]["shots"][0]["shot_uuid"]
+            source._publish_state(authored, preserve_outputs=True)
+            assert source._current_state()["shot_routing"]["shots"][0]["selected_source_uids"] == [authored["assets"][0]["source_uid"]]
             original=out/"synthetic-context-workflow.py"
             serialized=harness.send(engine,SerializeFlowToCommandsRequest(flow_name=flow_name)).serialized_flow_commands
             await harness.asend(engine,SaveWorkflowFileFromSerializedFlowRequest(serialized_flow_commands=serialized,
                 file_name=original.stem,file_path=str(original),display_name="Private snapshot guard fixture"))
             await settle()
             assert not registration.snapshot_requests
+            registry["assets"][0]["image_name"] = "New registration after saving"
+            manifest.write_text(json.dumps(registry), encoding="utf-8")
             if hasattr(engine, "close_workflow"):
                 engine.close_workflow(engine.current_workflow())
             else:
@@ -134,6 +166,21 @@ async def exercise(engine,_phase,out):
 
             source=engine.node_manager.get_node_by_name("Context Source")
             source._hmb_initial_catalog_scan_pending=False
+            for _ in range(500):
+                source._consume_pending_catalog_scan_result()
+                restored = source._current_state()
+                if restored["assets"] and not restored.get("scan_busy"):
+                    break
+                await asyncio.sleep(.01)
+            assert restored["assets"] and restored["assets"][0]["image_name"] == "Before save", restored.get("error")
+            assert restored["shot_routing"]["shots"][0]["shot_uuid"] == saved_shot
+            assert restored["shot_routing"]["shots"][0]["selected_source_uids"] == [authored["assets"][0]["source_uid"]]
+            harness.record("native_workflow_file_open_keeps_session_catalog_preserving_shot_and_membership")
+            refreshed = images._load_project_catalog(project_root, restored, use_shared_cache=False)
+            assert refreshed["assets"][0]["image_name"] == "New registration after saving"
+            assert refreshed["shot_routing"]["shots"][0]["shot_uuid"] == saved_shot
+            assert refreshed["shot_routing"]["shots"][0]["selected_source_uids"] == [authored["assets"][0]["source_uid"]]
+            harness.record("explicit_refresh_adopts_registry_edit_preserving_shot_and_membership")
             ready=threading.Event();release=threading.Event();first_results=[]
             original_getter=source._get_raw_parameter_value;paused=False
             def pause_serializer(name):
@@ -196,7 +243,7 @@ async def exercise(engine,_phase,out):
 def main():
     parser=argparse.ArgumentParser();parser.add_argument("--out",type=Path,default=ROOT/"reports/generator-create-context-20261020/guard-native-sdk")
     out=parser.parse_args().out.resolve();out.mkdir(parents=True,exist_ok=True)
-    harness.PRODUCTS=("_hmb_library_bootstrap.py",)
+    harness.PRODUCTS=("_hmb_library_bootstrap.py", "HMBImageAssetLibrary.py")
     harness.exercise=exercise
     harness.run_phase("snapshot-guard",out)
     result=json.loads((out/"snapshot-guard-result.json").read_text("utf-8"))

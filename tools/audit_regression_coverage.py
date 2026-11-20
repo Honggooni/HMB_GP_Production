@@ -89,10 +89,9 @@ def run_registered(root: Path, rows: list[dict[str, Any]], language: str,
     suffixes = (".py",) if language == "python" else (".mjs", ".cjs")
     selected = [row for row in rows if row["name"].endswith(suffixes)]
     results = [{"name": row["name"], "coverage": row["coverage"], "status": "not_run",
-                "reason": row.get("reason", "earlier_test_failed"), "required": row["required"]} for row in selected]
-    failed = False
+                "reason": row.get("reason", "not_started"), "required": row["required"]} for row in selected]
     for index, row in enumerate(selected):
-        if row["mode"] == "manual" or failed:
+        if row["mode"] == "manual":
             continue
         command = [sys.executable if language == "python" else node, str(root / "resources/tests" / row["name"])]
         start = time.monotonic()
@@ -114,7 +113,6 @@ def run_registered(root: Path, rows: list[dict[str, Any]], language: str,
         except (OSError, subprocess.TimeoutExpired) as error:
             status, reason, code = "failed", type(error).__name__, -1
         results[index].update(status=status, reason=reason, exit_code=code, elapsed_seconds=round(time.monotonic() - start, 3))
-        failed = status == "failed"
         print(f"HMB_COVERAGE {row['coverage']} {status} {row['name']}", flush=True)
     for row in selected:
         for extension in row.get("manual_extensions", []):
@@ -126,7 +124,7 @@ def run_registered(root: Path, rows: list[dict[str, Any]], language: str,
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     print(f"HMB_COVERAGE_SUMMARY {language} {json.dumps(summary, sort_keys=True)}", flush=True)
-    return 1 if failed else 0
+    return int(summary["failed"] > 0)
 
 
 def main() -> int:

@@ -35,7 +35,7 @@ class BlenderWorkerRegression(unittest.TestCase):
         if not cls.binary.is_file():
             raise unittest.SkipTest("Installed Blender 5.2 executable was not found.")
 
-    def _make_scene(self, directory, unsafe_driver=False):
+    def _make_scene(self, directory, unsafe_driver=False, palette_extra=False):
         scene = directory / "animated.blend"
         expression = (
             "import bpy;"
@@ -47,6 +47,7 @@ class BlenderWorkerRegression(unittest.TestCase):
             "a=o.copy();a.data=o.data.copy();a.animation_data_clear();a.name='PatternSky';s.collection.objects.link(a);a.location.x=-1.5;"
             "b=o.copy();b.data=o.data.copy();b.animation_data_clear();b.name='PatternFloor';s.collection.objects.link(b);b.location.x=1.5;"
             "c=o.copy();c.data=o.data.copy();c.animation_data_clear();c.name='PatternPosition';s.collection.objects.link(c);c.location.y=1.5;"
+            + ("p=o.copy();p.data=o.data.copy();p.animation_data_clear();p.name='PaletteExtra';s.collection.objects.link(p);p.location=(0,-1.8,0);" if palette_extra else "") +
             "d=o.copy();d.data=o.data.copy();d.animation_data_clear();d.name='HiddenRenderCube';"
             "hc=bpy.data.collections.new('HiddenRender');hc.hide_render=True;s.collection.children.link(hc);hc.objects.link(d);"
             + ("o.driver_add('scale',0).driver.expression='sin(frame)';" if unsafe_driver else "") +
@@ -346,7 +347,7 @@ class BlenderWorkerRegression(unittest.TestCase):
     def test_extended_actor_and_ghost_render_all_auxiliary_outputs(self):
         with tempfile.TemporaryDirectory(prefix="hmb-blender-palette-") as temporary:
             directory = Path(temporary)
-            scene = self._make_scene(directory)
+            scene = self._make_scene(directory, palette_extra=True)
             job, result, process = self._run_job(
                 directory, scene, "render", width=384, height=240,
                 apply_marker_shaders=True,
@@ -354,6 +355,9 @@ class BlenderWorkerRegression(unittest.TestCase):
                 bindings=[
                     {"full_dag_path": "|Cube", "color": "Cyan", "enabled": True},
                     {"full_dag_path": "|PatternSky", "color": "Lavender", "enabled": True},
+                    {"full_dag_path": "|PaletteExtra", "color": "Teal", "enabled": True},
+                    {"full_dag_path": "|PatternFloor", "color": "Brown", "enabled": True},
+                    {"full_dag_path": "|PatternPosition", "color": "Olive", "enabled": True},
                 ],
                 generate_depth_playblast=True,
                 depth_frames_folder=str(directory / "render" / "depth"),
@@ -373,7 +377,10 @@ class BlenderWorkerRegression(unittest.TestCase):
             markers = {row["color"]: row for row in sidecar["markers"]}
             self.assertEqual(markers["Cyan"]["rgb"], [0.0, 217 / 255, 217 / 255])
             self.assertEqual(markers["Lavender"]["rgb"], [184 / 255, 166 / 255, 217 / 255])
-            self.assertEqual(sidecar["marker_catalog_version"], 5)
+            self.assertEqual(markers["Teal"]["rgb"], [0.0, 128 / 255, 128 / 255])
+            self.assertEqual(markers["Brown"]["rgb"], [139 / 255, 69 / 255, 19 / 255])
+            self.assertEqual(markers["Olive"]["rgb"], [128 / 255, 128 / 255, 0.0])
+            self.assertEqual(sidecar["marker_catalog_version"], 6)
             for folder, name in (("frames", "preview"), ("depth", "depth"), ("motion", "motion")):
                 for index in (0, 1):
                     frame = directory / "render" / folder / (name + ".{:06d}.png".format(index))

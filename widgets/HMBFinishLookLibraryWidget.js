@@ -1318,7 +1318,7 @@ function hmbNativeUiReadCommand(value, kind) {
   if (kind === "lut") return (v.__hmb_color_lut_command__ || v).action === "cancel";
   const command = v.__hmb_picker_command__ || v;
   return ["picker", "picker-bridge"].includes(kind) && command.schema === "hmb-picker-command"
-    && (["stop_read", "cancel_pending", "cancel_video_import"].includes(command.action)
+    && (["stop_read", "cancel_pending", "cancel_generate", "cancel_video_import"].includes(command.action)
       || (command.action === "video_tools" && command.payload?.op === "cancel"));
 }
 // Locked echoes use only primitive/raw-string identity: no state clone/hash.
@@ -1552,27 +1552,273 @@ function hmbAcquireNativeStockSafety(container) {
   return { refresh() { if (owner.active) shared.sync(); }, cleanup() { if (owner.active) shared.release(owner); } };
 }
 
+// Griptape loads each widget as a separate module. One selection per editor
+// document also covers stock parameter fields rendered beside an HMB widget.
+function hmbAcquireCanvasWheel(container) {
+  const node = container?.matches?.(".widget-container") && container.closest?.(".react-flow__node");
+  const doc = container?.ownerDocument, win = doc?.defaultView;
+  if (!node?.closest?.(".react-flow") || !win?.WheelEvent) return null;
+  const key = "__HMB_CANVAS_WHEEL_SELECTION_V1__";
+  let router = doc[key];
+  if (!router) {
+    const nodes = new Map();
+    let selected = null;
+    const activeScroll = "data-hmb-active-scroll";
+    const activeSelector = `[${activeScroll}]`;
+    const outlineStyle = doc.createElement("style");
+    outlineStyle.textContent = `.react-flow .react-flow__node.nowheel ${activeSelector} {
+      outline: 2px solid #4dd8ff !important;
+      outline-offset: -2px !important;
+      anchor-name: --hmb-selected-viewport;
+      overscroll-behavior: contain !important;
+    }
+    .react-flow [data-hmb-scroll-frame] {
+      position: absolute !important;
+      position-anchor: --hmb-selected-viewport;
+      top: anchor(top); left: anchor(left);
+      width: anchor-size(width); height: anchor-size(height);
+      box-sizing: border-box; border: 2px solid #4dd8ff;
+      padding: 0; margin: 0; background: transparent;
+      pointer-events: none !important; z-index: 1000;
+    }`;
+    doc.head.appendChild(outlineStyle);
+    // Paint above composited thumbnails and sticky headers, outside the scrolling
+    // content. CSS anchors follow native scroll, resize and React Flow zoom.
+    const frame = doc.createElement("span");
+    frame.setAttribute("data-hmb-scroll-frame", "");
+    frame.setAttribute("aria-hidden", "true");
+    const anchored = win.CSS?.supports("position-anchor", "--hmb-selected-viewport")
+      && win.CSS.supports("width", "anchor-size(width)");
+    const modal = "dialog,[role='dialog'],[aria-modal='true'],[role='menu'],[role='listbox']:not(select),[data-registration-backdrop],[data-refresh-review-backdrop]";
+    const hasScroll = (element, horizontal) => {
+      const room = horizontal ? element.scrollWidth - element.clientWidth : element.scrollHeight - element.clientHeight;
+      if (room <= 1) return false;
+      const style = win.getComputedStyle(element);
+      return /^(auto|scroll|overlay)$/.test(horizontal ? style.overflowX : style.overflowY);
+    };
+    const canScroll = surface => hasScroll(surface, false) || hasScroll(surface, true);
+    const surfaceAt = (target, root) => {
+      const group = target.closest?.("[data-hmb-scroll-viewport]");
+      if (group && root.contains(group)) return group;
+      for (let el = target; el && el !== root; el = el.parentElement) {
+        if (el.matches?.("textarea")) return el;
+        if (el.matches?.("select,input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit])")) return null;
+        if (canScroll(el)) return el;
+      }
+      return null;
+    };
+    const syncOutline = () => {
+      const surface = selected?.surface;
+      if (!surface?.isConnected) return false;
+      const scrollable = canScroll(surface);
+      surface.toggleAttribute(activeScroll, scrollable);
+      if (anchored && scrollable && frame.previousElementSibling !== surface) {
+        frame.style.borderRadius = win.getComputedStyle(surface).borderRadius;
+        surface.after(frame);
+      } else if (!scrollable) {
+        frame.remove();
+      }
+      return scrollable;
+    };
+    const resized = win.ResizeObserver && new win.ResizeObserver(syncOutline);
+    const clearOutline = () => {
+      const {root, surface} = selected;
+      frame.remove();
+      surface.removeAttribute(activeScroll);
+      for (const copy of root.querySelectorAll(activeSelector)) copy.removeAttribute(activeScroll);
+      for (const copy of root.querySelectorAll("[data-hmb-scroll-frame]")) copy.remove();
+    };
+    const restoreViewport = () => {
+      const {root, key} = selected;
+      if (!key || !root.isConnected) return false;
+      const matches = [...root.querySelectorAll("[data-hmb-wheel-key]")].filter(el => el.dataset.hmbWheelKey === key);
+      if (matches.length !== 1) return false;
+      activate(root, matches[0]);
+      return true;
+    };
+    const changed = win.MutationObserver && new win.MutationObserver(records => {
+      if (!selected) return;
+      const {root, surface} = selected;
+      if (!root.contains(surface)) {
+        if (restoreViewport()) return;
+        changed.disconnect();
+        resized?.disconnect();
+        clearOutline();
+        // Give the renderer one turn to attach the replacement. Release the
+        // detached card tree even if there is no subsequent pointer event.
+        const detached = selected;
+        win.setTimeout(() => {
+          if (selected === detached && !restoreViewport()) clear();
+        }, 0);
+        return;
+      }
+      if (selected.key !== surface.dataset.hmbWheelKey) { clear(); return; }
+      // A cloned field inherits attributes, but only the original owns the wheel.
+      for (const record of records) {
+        for (const added of record.addedNodes) {
+          if (added.nodeType !== 1) continue;
+          if (added !== frame && added.hasAttribute("data-hmb-scroll-frame")) {
+            added.remove();
+            continue;
+          }
+          if (added !== surface) added.removeAttribute(activeScroll);
+          for (const copy of added.querySelectorAll(`${activeSelector},[data-hmb-scroll-frame]`)) {
+            if (copy.hasAttribute("data-hmb-scroll-frame")) {
+              if (copy !== frame) copy.remove();
+            } else if (copy !== surface) copy.removeAttribute(activeScroll);
+          }
+        }
+      }
+      if (records.some(record => surface.contains(record.target))
+          || (anchored && surface.hasAttribute(activeScroll) && frame.previousElementSibling !== surface)) syncOutline();
+    });
+    const clear = () => {
+      if (!selected) return;
+      const {surface, root, addedNoWheel, previousOverscroll} = selected;
+      changed?.disconnect();
+      resized?.disconnect();
+      surface.removeEventListener("input", syncOutline, true);
+      surface.removeEventListener("load", syncOutline, true);
+      clearOutline();
+      if (addedNoWheel && root.classList.contains("nowheel")) root.classList.remove("nowheel");
+      if (surface.style.overscrollBehavior === "contain") surface.style.overscrollBehavior = previousOverscroll;
+      selected = null;
+    };
+    const activate = (root, surface) => {
+      if (surface === selected?.surface) return;
+      clear();
+      if (!surface) return;
+      // Some widget renderers use the viewport className as their scroll
+      // restoration key. Put the native wheel filter on the stock node only.
+      selected = {root, surface, key:surface.dataset.hmbWheelKey, addedNoWheel: !root.classList.contains("nowheel"), previousOverscroll: surface.style.overscrollBehavior};
+      if (selected.addedNoWheel) root.classList.add("nowheel");
+      surface.style.overscrollBehavior = "contain";
+      syncOutline();
+      surface.addEventListener("input", syncOutline, true);
+      surface.addEventListener("load", syncOutline, true);
+      resized?.observe(surface);
+      changed?.observe(root, {subtree:true, childList:true});
+      changed?.observe(surface, {subtree:true, childList:true, characterData:true,
+        attributes:true, attributeFilter:[activeScroll,"data-hmb-wheel-key","class","style","hidden","rows"]});
+    };
+    const select = event => {
+      if (event.button !== 0 || event.isPrimary === false) return;
+      const target = event.target, root = target?.closest?.(".react-flow__node");
+      activate(root, nodes.has(root) && !target.closest(modal) ? surfaceAt(target, root) : null);
+    };
+    const actionAt = target => target.closest("button,textarea,[data-asset],[data-asset-key],[data-video-uid],[data-group-path],[data-instance]");
+    const actionKey = element => element && Array.from(element.attributes)
+      .filter(a => a.name !== activeScroll && (a.name === "id" || a.name === "name" || a.name.startsWith("data-")))
+      .map(a => JSON.stringify([a.name,a.value])).sort().join(",");
+    const afterClick = event => {
+      const current = selected;
+      if (event.button !== 0 || !current?.surface.contains(event.target)) return;
+      const action = actionAt(event.target), identity = actionKey(action);
+      if (!identity) return;
+      const shotAt = el => actionKey(el.closest("[data-shot-row],[data-workspace-uuid],[data-shot-uuid]"));
+      const shot = shotAt(action);
+      // A card/folder button can repaint its list on click. Reacquire only
+      // the same action and viewport under this completed pointer gesture.
+      const {clientX, clientY} = event;
+      win.setTimeout(() => {
+        if (selected !== current || current.surface.isConnected) return;
+        const hit = doc.elementFromPoint(clientX, clientY);
+        if (!hit || hit.closest(".react-flow__node") !== current.root || hit.closest(modal)) return;
+        const nextAction = actionAt(hit), next = surfaceAt(hit, current.root);
+        if (next && next.dataset.hmbWheelKey === current.key && next.tagName === current.surface.tagName && next.className === current.surface.className
+            && nextAction?.tagName === action.tagName && actionKey(nextAction) === identity
+            && shotAt(nextAction) === shot) activate(current.root, next);
+      }, 0);
+    };
+    const escape = event => { if (event.key === "Escape") clear(); };
+    const wheel = event => {
+      const target = event.target, root = target?.closest?.(".react-flow__node");
+      if (!nodes.has(root) || event.defaultPrevented || target.closest(modal)) return;
+      if (selected && !selected.root.contains(selected.surface) && !restoreViewport()) clear();
+      if (selected && selected.key !== selected.surface.dataset.hmbWheelKey) clear();
+      if (!event.ctrlKey && !event.metaKey && selected?.root === root && selected.surface.contains(target)) {
+        const surface = selected.surface;
+        if (surfaceAt(target, root) === surface && syncOutline()) {
+          // Keep native scrolling and widget handlers (virtual lists and
+          // horizontal card strips) on the original, trusted event.
+          if (!root.classList.contains("nowheel")) root.classList.add("nowheel");
+          return;
+        }
+      }
+      // Stock parameters can stop wheel at React's capture phase, before
+      // the widget sees it. Deliver one event at the same pointer position
+      // to the native canvas handler, above those parameter-specific guards.
+      event.preventDefault();
+      event.stopPropagation();
+      const canvasLayer = root.closest(".react-flow__nodes") || root.parentElement;
+      canvasLayer.dispatchEvent(new win.WheelEvent("wheel", event));
+    };
+    doc.addEventListener("pointerdown", select, true);
+    doc.addEventListener("click", afterClick, true);
+    doc.addEventListener("keydown", escape, true);
+    doc.addEventListener("wheel", wheel, {capture: true, passive: false});
+    router = {acquire(root) {
+      nodes.set(root, (nodes.get(root) || 0) + 1);
+      return () => {
+        const count = nodes.get(root) - 1;
+        if (count) nodes.set(root, count);
+        else {
+          nodes.delete(root);
+          if (selected?.root === root) clear();
+        }
+        if (nodes.size) return;
+        doc.removeEventListener("pointerdown", select, true);
+        doc.removeEventListener("click", afterClick, true);
+        doc.removeEventListener("keydown", escape, true);
+        doc.removeEventListener("wheel", wheel, true);
+        outlineStyle.remove();
+        delete doc[key];
+      };
+    }};
+    doc[key] = router;
+  }
+  return router.acquire(node);
+}
+
 function hmbNativeStockSafetyContract(container, props, mount) {
   const previous = container?.__hmbNativeStockSafety;
   const lease = previous?.active ? previous.lease : hmbAcquireNativeStockSafety(container);
+  // The stock WidgetLoader adds nowheel to the entire widget host. Leave
+  // wheel ownership to each HMB widget's concrete scroll surfaces instead.
+  const canvasHost = container?.matches?.(".widget-container") && container.closest?.(".react-flow__node") ? container : null;
+  const restoreWheelClass = previous?.active ? previous.restoreWheelClass : canvasHost?.classList.contains("nowheel");
   let handle;
   try { handle = mount(container, props); }
   catch (error) { if (!previous?.active) lease?.cleanup(); throw error; }
   lease?.refresh();
   if (!lease) return handle;
+  const allowCanvasWheel = () => {
+    if (canvasHost?.classList.contains("nowheel")) canvasHost.classList.remove("nowheel");
+  };
+  allowCanvasWheel();
   if (previous?.active && previous.handle === handle) return previous.proxy;
   if (previous) previous.active = false;
-  const state = { active: true, lease, handle, proxy: null };
+  const releaseWheel = previous?.releaseWheel || hmbAcquireCanvasWheel(container);
+  const state = { active: true, lease, handle, restoreWheelClass, releaseWheel, proxy: null };
   state.proxy = {
     update(next) {
       if (!state.active) return;
-      handle?.update?.(next); lease.refresh();
+      handle?.update?.(next);
+      allowCanvasWheel();
+      lease.refresh();
     },
     cleanup() {
       if (!state.active) return;
       state.active = false;
       try { if (typeof handle === "function") handle(); else handle?.cleanup?.(); }
-      finally { lease.cleanup(); if (container.__hmbNativeStockSafety === state) delete container.__hmbNativeStockSafety; }
+      finally {
+        releaseWheel?.();
+        lease.cleanup();
+        if (container.__hmbNativeStockSafety === state) {
+          if (restoreWheelClass) canvasHost?.classList.add("nowheel");
+          delete container.__hmbNativeStockSafety;
+        }
+      }
     },
   };
   container.__hmbNativeStockSafety = state;

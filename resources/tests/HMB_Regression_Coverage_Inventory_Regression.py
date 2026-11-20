@@ -78,8 +78,9 @@ with tempfile.TemporaryDirectory(prefix="hmb-coverage-javascript-") as directory
     (root/"resources/tests"/rows[0]["name"]).write_text("process.exitCode=7;", encoding="utf-8")
     assert coverage.run_registered(root, rows, "javascript", report, node=node) == 1
     result = json.loads(report.read_text("utf-8"))
-    assert result["summary"] == {"passed": 0, "failed": 1, "not_run": 1}
+    assert result["summary"] == {"passed": 1, "failed": 1, "not_run": 0}
     assert result["results"][0]["exit_code"] == 7
+    assert result["results"][1]["status"] == "passed"
     rows[0].update(mode="manual", required=False, reason="Deliberate nonexecuted fixture")
     assert coverage.run_registered(root, rows, "javascript", report, node=node) == 0
     result = json.loads(report.read_text("utf-8"))

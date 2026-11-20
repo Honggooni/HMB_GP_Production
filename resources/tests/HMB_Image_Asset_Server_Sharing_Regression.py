@@ -6,8 +6,8 @@ import json
 from pathlib import Path
 import sys
 import tempfile
-import time
 from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _hmb_image_asset_detached_fixture import initialize_detached_image_asset
@@ -93,7 +93,12 @@ with tempfile.TemporaryDirectory(prefix="hmb_asset_share_", dir=TEMP_ROOT) as te
     registered_signature = asset_library._asset_manifest_signature(project_root)
     assert registered_signature != missing_signature
 
-    registered_state = asset_library._load_project_catalog(catalog_root, prepared)
+    # Another writer registered this image. Reopening the saved workflow
+    # within this session keeps its previous view until the user refreshes.
+    pinned = asset_library._load_project_catalog(catalog_root, prepared)
+    assert pinned["manifest_signature"] == missing_signature
+    assert not any(item["registered"] for item in pinned["assets"])
+    registered_state = asset_library._load_project_catalog(catalog_root, pinned, use_shared_cache=False)
     hero_asset = next(
         item for item in registered_state["assets"] if item["relative_path"] == "Hero.png"
     )
@@ -103,131 +108,34 @@ with tempfile.TemporaryDirectory(prefix="hmb_asset_share_", dir=TEMP_ROOT) as te
     hero_asset["selection_order"] = 1
     registered_state = asset_library._normalize_state(registered_state)
 
+    sidekick_path = project_root / "Sidekick.png"
+    sidekick_path.write_bytes(PNG_BYTES)
+    asset_library._write_asset_manifest_record(project_root, {
+        **hero_record, "path": "Sidekick.png", "asset_id": "Sidekick", "image_name": "Sidekick",
+    })
+    registration = asset_library._asset_manifest_signature(project_root)
+    assert registration != registered_signature
+
     node = object.__new__(asset_library.HMBImageAssetLibrary)
-    initialize_detached_image_asset(node, asset_library, state=registered_state)
-    node._hmb_import_media_by_uid = {}
-    node._hmb_last_manifest_poll_error = ""
-    node.get_parameter_value = lambda _name: []
-    node._publish_state = lambda state: asset_library._normalize_state(state)
-
-    original_scan = asset_library._scan_project_assets
-    scan_count = 0
-
-    def counted_scan(project_root_value, **kwargs):
-        global scan_count
-        scan_count += 1
-        return original_scan(project_root_value, **kwargs)
-
-    asset_library._scan_project_assets = counted_scan
-    try:
-        unchanged = node._apply_manifest_poll(registered_state)
-        assert scan_count == 0
-        assert unchanged["manifest_signature"] == registered_signature
-
-        sidekick_path = project_root / "Sidekick.png"
-        sidekick_path.write_bytes(PNG_BYTES)
-        asset_library._write_asset_manifest_record(
-            project_root,
-            {
-                "path": "Sidekick.png",
-                "asset_id": "Sidekick",
-                "image_name": "Sidekick",
-                "source_type": "Character Appearance",
-                "custom_source_type": "",
-                "scope": "Head / face only",
-            },
-        )
-        refreshed = node._apply_manifest_poll(registered_state)
-        assert scan_count == 1
-        assert refreshed["status"]["registered_asset_count"] == 2
-        selected = [item for item in refreshed["assets"] if item["selected"]]
-        assert [item["asset_id"] for item in selected] == ["Hero"]
-        assert selected[0]["selection_order"] == 1
-    finally:
-        asset_library._scan_project_assets = original_scan
-
-    poll_node = object.__new__(asset_library.HMBImageAssetLibrary)
-    poll_state = initialize_detached_image_asset(poll_node, asset_library, state=registered_state)
-    poll_node._hmb_last_manifest_poll_nonce = ""
-    poll_node._hmb_manifest_poll_pending = False
+    registered_state = initialize_detached_image_asset(node, asset_library, state=registered_state)
     widget_parameter = SimpleNamespace(name=asset_library.WIDGET_STATE_PARAMETER)
-    poll_payload = dict(poll_state)
-    poll_payload["__hmb_manifest_poll_nonce"] = "poll-one"
-    canonical = poll_node.before_value_set(widget_parameter, json.dumps(poll_payload))
-    assert poll_node._hmb_manifest_poll_pending is True
-    assert "__hmb_manifest_poll_nonce" not in json.loads(canonical)
+    payload = {**registered_state, "__hmb_manifest_poll_nonce": "old-widget"}
+    with patch.object(asset_library, "_asset_manifest_signature", side_effect=AssertionError("implicit manifest read")), \
+         patch.object(asset_library, "_catalog_directory_entries", side_effect=AssertionError("implicit folder scan")):
+        canonical = node.before_value_set(widget_parameter, json.dumps(payload))
+        assert "__hmb_manifest_poll_nonce" not in json.loads(canonical)
+        assert not getattr(node, "_hmb_manifest_poll_pending", False)
+        assert not getattr(node, "_hmb_manifest_poll_received", False)
+        unchanged = asset_library._load_project_catalog(catalog_root, registered_state)
+        assert unchanged["manifest_signature"] == registered_signature
+        assert [row["asset_id"] for row in unchanged["assets"]] == ["Hero"]
 
-    no_op_node = object.__new__(asset_library.HMBImageAssetLibrary)
-    refreshed = initialize_detached_image_asset(no_op_node, asset_library, state=refreshed)
-    no_op_node._hmb_manifest_poll_received = False
-    no_op_node._hmb_manifest_poll_pending = False
-    no_op_node._hmb_last_manifest_poll_nonce = ""
-    no_op_node._hmb_last_manifest_poll_error = ""
-    no_op_node._hmb_refresh_revision = refreshed["refresh_revision"]
-    no_op_node._hmb_import_media_by_uid = {}
-    no_op_node.get_parameter_value = lambda name: (
-        refreshed["catalog_root"]
-        if name == asset_library.PROJECT_ROOT_PARAMETER
-        else []
-    )
-    no_op_node._sync_output = lambda _state: (_ for _ in ()).throw(
-        AssertionError("An unchanged manifest probe must not rebuild outputs.")
-    )
-    published_states = []
-    live_state = {"value": refreshed}
-
-    def publish_without_output_rebuild(value):
-        normalized = asset_library._normalize_state(value)
-        live_state["value"] = normalized
-        published_states.append(normalized)
-        return normalized
-
-    no_op_node._publish_state = publish_without_output_rebuild
-    no_op_node._current_state = lambda: live_state["value"]
-    no_op_node._replace_import_media = lambda _media: None
-    no_op_node._scan_owner_is_current = lambda: True
-    no_op_node._hmb_import_revision = 0
-    no_op_payload = dict(refreshed)
-    no_op_payload["__hmb_manifest_poll_nonce"] = "poll-no-change"
-    no_op_canonical = no_op_node.before_value_set(
-        widget_parameter,
-        json.dumps(no_op_payload),
-    )
-    assert no_op_node._hmb_manifest_poll_received is True
-    assert no_op_node._hmb_manifest_poll_pending is True
-
-    # The value-set hook performs no filesystem I/O.  The retained-mode apply
-    # schedules one worker probe, and an unchanged signature must avoid a full
-    # project scan as well as the output rebuild guarded above.
-    no_op_scan_count = [0]
-    original_scan = asset_library._scan_project_assets
-
-    def no_op_counted_scan(project_root_value, **kwargs):
-        no_op_scan_count[0] += 1
-        return original_scan(project_root_value, **kwargs)
-
-    asset_library._scan_project_assets = no_op_counted_scan
-    try:
-        scheduled = no_op_node._apply_widget_state(no_op_canonical)
-        assert scheduled["scan_busy"] is True
-        worker = no_op_node._hmb_scan_thread
-        assert worker is not None
-        worker.join(timeout=10.0)
-        assert worker.is_alive() is False
-        deadline = time.monotonic() + 2.0
-        while (
-            no_op_node._hmb_scan_pending_result is None
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.01)
-        assert no_op_node._consume_pending_catalog_scan_result() is True
-    finally:
-        asset_library._scan_project_assets = original_scan
-    assert no_op_scan_count[0] == 0
-    no_op_result = live_state["value"]
-    assert no_op_result["scan_busy"] is False
-    assert no_op_result["manifest_signature"] == refreshed["manifest_signature"]
-    assert len(published_states) == 2
+    refreshed = asset_library._load_project_catalog(catalog_root, unchanged, use_shared_cache=False)
+    assert refreshed["manifest_signature"] == registration
+    assert refreshed["status"]["registered_asset_count"] == 2
+    assert [row["asset_id"] for row in refreshed["assets"] if row["selected"]] == ["Hero"]
+    assert next(row for row in refreshed["assets"] if row["selected"])["selection_order"] == 1
+    assert refreshed["shot_routing"] == unchanged["shot_routing"]
 
     captured_thumbnail_bytes = []
 
@@ -268,6 +176,6 @@ with tempfile.TemporaryDirectory(prefix="hmb_asset_share_", dir=TEMP_ROOT) as te
 
 
 print(
-    "HMB shared Asset path portability + HTTP thumbnail + manifest auto-sync "
+    "HMB shared Asset path portability + HTTP thumbnail + manual session refresh "
     "+ no-folder-creation regression: PASS"
 )

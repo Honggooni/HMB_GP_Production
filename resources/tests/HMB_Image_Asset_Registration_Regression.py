@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -113,7 +114,25 @@ try:
         "image_sub_type": "Full Appearance",
         "custom_source_type": "",
     }
-    registered_state = asset_library._apply_asset_registration(state, request)
+    original_replace = asset_library.os.replace
+    observed_swaps = []
+
+    def deny_manifest_replace(source, target, error_code):
+        if Path(target) != manifest_path or Path(source).suffix != ".tmp":
+            return original_replace(source, target)
+        observed_swaps.append((str(source), Path(source).read_bytes()))
+        if error_code is not None:
+            error = PermissionError("simulated SMB registration sharing violation")
+            error.winerror = error_code
+            raise error
+        return original_replace(source, target)
+
+    codes = iter((5, 32, 33, None))
+    with patch.object(asset_library.os, "replace",
+                      side_effect=lambda src, dst: deny_manifest_replace(src, dst, next(codes, None)
+                          if Path(dst) == manifest_path and Path(src).suffix == ".tmp" else None)):
+        registered_state = asset_library._apply_asset_registration(state, request)
+    assert len(observed_swaps) == 4 and len(set(observed_swaps)) == 1
     assert manifest_path.is_file()
     assert not legacy_manifest_path.exists()
     assert (
@@ -484,25 +503,24 @@ try:
         "image_sub_type": "Main Background",
         "custom_source_type": "",
     }
-    original_manifest_writer = asset_library._write_asset_manifest_record
-
-    def fail_manifest_write(*_args, **_kwargs):
-        raise RuntimeError("simulated manifest write failure")
-
-    asset_library._write_asset_manifest_record = fail_manifest_write
-    try:
+    original_registry = manifest_path.read_bytes()
+    observed_swaps.clear()
+    with patch.object(asset_library.os, "replace",
+                      side_effect=lambda src, dst: deny_manifest_replace(src, dst, 5)), \
+         patch.object(asset_library.time, "sleep"):
         try:
             asset_library._apply_asset_registration(
                 rollback_state,
                 rollback_request,
                 rollback_media,
             )
-        except RuntimeError as exc:
-            assert "simulated manifest write failure" in str(exc)
+        except PermissionError as exc:
+            assert exc.winerror == 5
         else:
             raise AssertionError("A manifest failure must reject the registration.")
-    finally:
-        asset_library._write_asset_manifest_record = original_manifest_writer
+    assert len(observed_swaps) == 7 and len(set(observed_swaps)) == 1
+    assert manifest_path.read_bytes() == original_registry
+    assert not Path(observed_swaps[0][0]).exists()
     assert not (
         project_root / "Environment" / "Background" / "rollback_source.png"
     ).exists()
@@ -660,10 +678,11 @@ try:
     moved = existing_path.parent / "e202" / existing_path.name
     moved.parent.mkdir()
     existing_path.rename(moved)
-    data = asset_library._scan_project_assets(project_root)
+    restarted = load_module()
+    data = restarted._load_project_catalog(catalog_root, registered_state)
     restored = next(a for a in data["assets"] if a["relative_path"] == moved.relative_to(project_root).as_posix())
     assert restored["registered"] and restored["asset_id"] == existing["asset_id"]
-    assert asset_library._verified_project_relative_path(restored, data) == restored["relative_path"]
+    assert restarted._verified_project_relative_path(restored, data) == restored["relative_path"]
     review = asset_library._audit_project_manifest_refresh(project_root)
     assert not review["error"] and existing["relative_path"] not in review["missing_paths"]
     assert restored["relative_path"] not in review["unregistered_paths"]
@@ -681,6 +700,46 @@ try:
     ambiguous = asset_library._scan_project_assets(project_root)
     assert not any(a["registered"] for a in ambiguous["assets"] if a["path"] in (moved.as_posix(), duplicate.as_posix()))
     assert existing["relative_path"] not in asset_library._audit_project_manifest_refresh(project_root)["missing_paths"]
+
+    # Two workstation sessions can keep editing their own catalogs while
+    # merging each writer's single registration in the same server manifest.
+    shared = test_root / "separate-clients" / "Ai_Ct_image"
+    shared.mkdir(parents=True)
+    for name in ("Author", "Peer"):
+        (shared / f"{name}.png").write_bytes(PNG_1X1)
+    author, peer = load_module(), load_module()
+    author._ASSET_CATALOG_INDEX_ROOT = test_root / "author-cache"
+    peer._ASSET_CATALOG_INDEX_ROOT = test_root / "peer-cache"
+    author_state = author._load_project_catalog(shared, {})
+    peer_state = peer._load_project_catalog(shared, {})
+
+    def add(client, state, name):
+        row = next(item for item in state["assets"] if item["relative_path"] == f"{name}.png")
+        return client._apply_asset_registration(state, {
+            "request_id": f"add-{name}", "project_uid": state["project_uid"],
+            "asset_library_id": row["asset_library_id"], "relative_path": row["relative_path"],
+            "asset_id": name, "image_name": name, "image_main_type": "Character",
+            "image_sub_type": "Full Appearance",
+        })
+
+    def registered_names(state):
+        return {item["image_name"] for item in state["assets"] if item["registered"]}
+
+    peer_state = add(peer, peer_state, "Peer")
+    assert registered_names(peer_state) == {"Peer"}
+    assert not registered_names(author._load_project_catalog(shared, author_state))
+    author_state = add(author, author_state, "Author")
+    assert registered_names(author_state) == {"Author"}
+    assert registered_names(author._load_project_catalog(shared, author_state)) == {"Author"}
+    assert registered_names(peer._load_project_catalog(shared, peer_state)) == {"Peer"}
+    refreshed = author._load_project_catalog(shared, author_state, use_shared_cache=False)
+    assert registered_names(refreshed) == {"Author", "Peer"}
+    fresh_process = load_module()
+    fresh_process._ASSET_CATALOG_INDEX_ROOT = test_root / "after-restart"
+    assert registered_names(fresh_process._load_project_catalog(shared, {})) == {"Author", "Peer"}
+    (shared / "Peer.png").unlink()
+    assert registered_names(author._load_project_catalog(shared, refreshed)) == {"Author", "Peer"}
+    assert registered_names(author._load_project_catalog(shared, refreshed, use_shared_cache=False)) == {"Author"}
 finally:
     shutil.rmtree(test_root, ignore_errors=True)
 

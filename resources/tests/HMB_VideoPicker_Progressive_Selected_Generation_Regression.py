@@ -8,6 +8,7 @@ test does not assert codec validity or rendered image quality.
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import importlib.util
 import json
 import os
@@ -273,12 +274,127 @@ class ProgressiveSelectedGenerationRegression(unittest.TestCase):
         self.network.stop()
         self.patches.stop()
 
+    def assert_generation_log(self, state, owner, outcome):
+        rows = [row for row in state["activity_log"] if row.get("generation_event")]
+        self.assertEqual([row["generation_event"] for row in rows], ["start", outcome], state["activity_log"])
+        self.assertEqual([row["picker_shot_uuid"] for row in rows], [owner, owner])
+        self.assertTrue(rows[0]["operation_id"])
+        self.assertEqual(rows[1]["operation_id"], rows[0]["operation_id"])
+        self.assertIn(rows[1]["message"], state["activity_log_text"])
+        return rows
+
+    def test_long_capture_preserves_history_and_does_not_undo_clear(self):
+        case = Scenario("quiet-generation", roles=("mask",))
+        node = case.node
+        previous = node._picker_state()
+        picker._append_activity_log(previous, "INFO", "Prior independent READ")
+        node._write_state(previous)
+        producer = node._maya_mode
+        def capture(*args, **kwargs):
+            live = node._picker_state()
+            for frame in range(195):
+                picker._append_activity_log(live, "INFO", f"private capture frame {frame}")
+            self.assertEqual(live["activity_log"][-1]["generation_event"], "start")
+            self.assertIn("Prior independent READ", live["activity_log_text"])
+            self.assertNotIn("private capture", live["activity_log_text"])
+            stale = dict(copy.deepcopy(live), state_writer="widget")
+            live.update(activity_log=[], activity_log_text="", activity_log_cleared=True, activity_log_text_user_edited=True,
+                        message="", state_writer="widget", state_revision=live["state_revision"] + 1)
+            case.external_state_write(live, widget=True)
+            self.assertEqual(node._picker_state()["activity_log"], [])
+            case.external_state_write(stale, widget=True)
+            self.assertEqual(node._picker_state()["activity_log"], [])
+            return producer(*args, **kwargs)
+        node._maya_mode = capture
+        with mock.patch.object(picker, "_diagnostic", wraps=picker._diagnostic) as diagnostic:
+            result = case.run()
+        self.assertTrue(any("private capture frame 194" in str(call) for call in diagnostic.call_args_list))
+        self.assertEqual([row.get("generation_event") for row in result["activity_log"]], ["complete"])
+        self.assertNotIn("Prior independent READ", result["activity_log_text"])
+
+    def test_generate_stop_is_scoped_to_this_request_and_preserves_finished_roles(self):
+        case = Scenario("scoped-stop", roles=("mask", "depth"))
+        node = case.node
+        current = node._picker_state()
+        bound = next(row["bound_shot_uuid"] for row in current["picker_shots"] if row["workspace_uuid"] == case.owner)
+        tools_job = {"cancel": threading.Event(), "service": mock.Mock(), "picker_shot_uuid": case.owner,
+                     "route_identity": (current["channel_uuid"], bound)}
+        node._hmb_video_tools_job = tools_job
+        flight = picker._MayaCaptureFlight("fixture", lambda _: None)
+        subscription = picker._MayaCaptureSubscription(flight)
+        sibling = picker._MayaCaptureSubscription(flight)
+        stopped_id = []
+
+        def stop(operation_id, workspace, command_id=None):
+            node._handle_picker_command({
+                "action": "cancel_generate", "action_id": command_id or uuid.uuid4().hex,
+                "runtime_instance_id": node._hmb_runtime_instance_id,
+                "payload": {"operation_id": operation_id, "picker_shot_uuid": workspace},
+            })
+
+        begin = case.begin
+        def when_role_starts(role, context):
+            begin(role, context)
+            if role != "depth":
+                return
+            if stopped_id:
+                stop(stopped_id[0], case.owner)
+                stop(context.operation_id, case.owner, stopped_id[1])
+                self.assertFalse(node._hmb_cancel_requested.is_set(), "Old STOP cancelled a later generation")
+                return
+            for operation_id, workspace in [(context.operation_id, case.other), ("old", case.owner),
+                                            ("", case.owner), (context.operation_id, "")]:
+                stop(operation_id, workspace)
+                self.assertFalse(node._hmb_cancel_requested.is_set())
+            for kind in ("read_scene", "render_snapshot", "render_original_preview"):
+                with mock.patch.object(node, "_hmb_active_operation", replace(context, kind=kind)):
+                    stop(context.operation_id, case.owner)
+                    self.assertFalse(node._hmb_cancel_requested.is_set())
+            node._hmb_active_process = subscription
+            command_id = uuid.uuid4().hex
+            stop(context.operation_id, case.owner, command_id)
+            self.assertTrue(subscription.cancelled.is_set())
+            self.assertFalse(sibling.cancelled.is_set())
+            self.assertFalse(flight.abort.is_set())
+            self.assertEqual(node._picker_state()["status"], "CANCELLING")
+            stop(context.operation_id, case.owner, command_id)
+            stopped_id.extend((context.operation_id, command_id))
+            node._hmb_active_process = None
+
+        case.begin = when_role_starts
+        first = case.run()
+        self.assert_generation_log(first, case.owner, "cancelled")
+        self.assertEqual([item["generation_role"] for item in first["videos"]], ["mask"])
+        node._hmb_cancel_requested.clear()  # standard reservation for the next Run
+        stop(stopped_id[0], case.owner)
+        self.assertFalse(node._hmb_cancel_requested.is_set(), "Late STOP cancelled an idle node")
+        second = case.run()
+        self.assertEqual([item["generation_role"] for item in second["videos"]], ["mask", "mask", "depth"])
+        self.assertIs(node._hmb_video_tools_job, tools_job)
+        self.assertFalse(tools_job["cancel"].is_set())
+        tools_job["service"].cancel.assert_not_called()
+
+    def test_stop_winning_terminal_lock_reports_cancelled_and_retains_published_video(self):
+        case = Scenario("cancel-at-terminal", roles=("mask",))
+        node = case.node
+        commit = node._commit_generate_terminal_state
+        def stop_before_commit(state, context, records, uids):
+            node._handle_picker_command({"action": "cancel_generate", "action_id": uuid.uuid4().hex,
+                "runtime_instance_id": node._hmb_runtime_instance_id,
+                "payload": {"operation_id": context.operation_id, "picker_shot_uuid": context.picker_shot_uuid}})
+            return commit(state, context, records, uids)
+        node._commit_generate_terminal_state = stop_before_commit
+        result = case.run()
+        self.assert_generation_log(result, case.owner, "cancelled")
+        self.assertEqual([r["generation_role"] for r in result["videos"]], ["mask"])
+
     def test_each_completed_role_is_public_before_next_role_for_both_engines(self):
         for engine in ("maya", "blender"):
             with self.subTest(engine=engine):
                 case = Scenario("ordered-" + engine, engine=engine)
                 result = case.run()
                 self.assertEqual(case.entered, list(ROLES), result.get("message"))
+                self.assert_generation_log(result, case.owner, "complete")
                 self.assertEqual([item.get("generation_role") for item in result["videos"]], list(ROLES))
                 self.assertEqual(result["generation_output_roles"], list(ROLES))
                 self.assertEqual(len({item["video_uid"] for item in result["videos"]}), 4)
@@ -301,11 +417,15 @@ class ProgressiveSelectedGenerationRegression(unittest.TestCase):
                                 for value in [result.get("message", ""), *result.get("warnings", [])]))
             self.assertTrue(all(Path(item["video_path"]).is_file() for item in result["videos"]))
 
+            rows = self.assert_generation_log(result, case.owner, "failed")
+            self.assertIn("controlled " + failed + " producer failure", rows[-1]["message"])
+
     def test_stop_keeps_completed_original_and_never_starts_mask(self):
         for index, role in enumerate(ROLES):
             case = Scenario("stop-after-" + role, stop_after=role)
             result = case.run()
             self.assertEqual(case.entered, list(ROLES[:index + 1]), result.get("message"))
+            self.assert_generation_log(result, case.owner, "cancelled")
             self.assertEqual([item["generation_role"] for item in result["videos"]], list(ROLES[:index + 1]))
             self.assertTrue(all(Path(item["video_path"]).is_file() for item in result["videos"]))
 
@@ -320,6 +440,7 @@ class ProgressiveSelectedGenerationRegression(unittest.TestCase):
         result = case.run()
         self.assertEqual(case.entered, list(ROLES), result.get("message"))
         self.assertEqual([item["video_uid"] for item in result["videos"]], ["existing-manual"])
+        self.assert_generation_log(result, case.owner, "failed")
         self.assertEqual(existing.read_bytes(), b"untouched-existing-manual")
         self.assertFalse(any(item.get("generation_role") for item in result["videos"]))
 
@@ -341,6 +462,7 @@ class ProgressiveSelectedGenerationRegression(unittest.TestCase):
                 case = Scenario("stale-" + identity, invalidate_at="mask", identity=identity)
                 result = case.run()
                 self.assertEqual(case.entered, ["original", "mask"], str((result.get("message"), result.get("warnings"))))
+                self.assert_generation_log(result, case.owner, "cancelled")
                 self.assertFalse(any(item.get("generation_role") == "mask" for item in result["videos"]), result.get("message"))
 
     def test_navigation_keeps_click_time_owner(self):
@@ -375,6 +497,68 @@ class ProgressiveSelectedGenerationRegression(unittest.TestCase):
         self.assertEqual(len({item["video_path"] for item in second["videos"]}), 8)
         for path, content in old_bytes.items():
             self.assertEqual(Path(path).read_bytes(), content)
+
+
+class EncodingProgressRegression(unittest.TestCase):
+    def test_measured_progress_and_exact_exit_code(self):
+        log = TEMP / "encode-progress.log"
+        log.write_bytes(b"frame=99\nprogress=end\n")
+        chunks = iter((b"notframe=67\nframe=5", b"0\r\n", b"frame=62\n", b"frame=45\n", b"frame=1000\n",
+                       b"frame=100\nprogress=end\n", None))
+        node = mock.Mock()
+        node._hmb_state_write_lock = threading.RLock()
+        node._hmb_cancel_requested = threading.Event()
+        node._picker_state.side_effect = lambda: {}
+
+        def wait(timeout):
+            chunk = next(chunks)
+            if chunk is None:
+                return 13
+            with log.open("ab") as stream:
+                stream.write(chunk)
+            raise picker.subprocess.TimeoutExpired("ffmpeg", timeout)
+
+        process = mock.Mock()
+        process.wait.side_effect = wait
+        node._hmb_active_process = process
+        result = picker.HMBVideoPickerLibrary._wait_for_ffmpeg_encode(node, process, log, 100, 20)
+        self.assertEqual(result, 13)
+        self.assertEqual([c.args[0]["operation_progress"] for c in node._write_state.call_args_list],
+                         [{"stage": "encoding", "percent": 50}, {"stage": "finishing_stage", "percent": None}])
+
+    def test_absent_log_or_cancelled_process_preserves_wait(self):
+        node = mock.Mock()
+        node._hmb_state_write_lock = threading.RLock()
+        node._hmb_cancel_requested = threading.Event()
+        node._hmb_cancel_requested.set()
+        process = mock.Mock()
+        node._hmb_active_process = process
+        process.wait.return_value = -15
+        wait = picker.HMBVideoPickerLibrary._wait_for_ffmpeg_encode
+        self.assertEqual(wait(node, process, TEMP / "no-such-log", 100, 10), -15)
+        log = TEMP / "cancelled-encode.log"
+        log.write_bytes(b"")
+        def report_then_stop(timeout):
+            if log.stat().st_size:
+                return -15
+            log.write_bytes(b"frame=90\n")
+            raise picker.subprocess.TimeoutExpired("ffmpeg", timeout)
+        process.wait.side_effect = report_then_stop
+        self.assertEqual(wait(node, process, log, 100, 10), -15)
+        node._write_state.assert_not_called()
+
+    def test_overall_deadline_is_not_restarted(self):
+        log = TEMP / "deadline-encode.log"
+        log.write_bytes(b"")
+        process = mock.Mock()
+        process.wait.side_effect = picker.subprocess.TimeoutExpired("ffmpeg", 1)
+        with mock.patch.object(picker.time, "monotonic", side_effect=[10.0, 10.0, 11.02]):
+            with self.assertRaises(picker.subprocess.TimeoutExpired):
+                picker.HMBVideoPickerLibrary._wait_for_ffmpeg_encode(mock.Mock(), process, log, 100, 1.5)
+        waits = [c.kwargs["timeout"] for c in process.wait.call_args_list]
+        self.assertEqual(len(waits), 2)
+        self.assertEqual(waits[0], 1)
+        self.assertAlmostEqual(waits[1], 0.48)
 
 
 if __name__ == "__main__":

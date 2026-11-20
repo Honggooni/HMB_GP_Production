@@ -184,6 +184,19 @@ try{
  assert.equal(w.hmbImageAssetCanSelect(initial.assets[5]),true,'Unregistered user imports were already selectable without project registration');checks++;
  await expanded.locator('[data-asset-key="catalog-6"] [data-asset-add]').click();
  assert.equal(await page.locator('[data-registration-backdrop]').count(),1);
+ const passport=page.locator('[data-registration-backdrop] .asset-passport');
+ const oldMaxHeight=await passport.evaluate(element=>{
+   const previous=element.style.maxHeight;
+   element.style.maxHeight='190px';
+   return previous;
+ });
+ assert.equal(await passport.evaluate(element=>Boolean(element.closest('.nowheel'))),true,
+   'React Flow must leave wheel input inside the Add dialog');
+ await passport.hover({position:{x:8,y:12}});
+ await page.mouse.wheel(0,130);
+ await page.waitForFunction(()=>document.querySelector('[data-registration-backdrop] .asset-passport').scrollTop>0);
+ await passport.evaluate((element,previous)=>{element.style.maxHeight=previous;},oldMaxHeight);
+ checks+=2;
  assert.equal(await page.locator('[data-registration-bash-add]').count(),0,'The new passport action is absent while an ordinary Shot is active');checks+=2;
  await page.locator('[data-registration-cancel]').first().click();
  await page.locator('[data-shot-add]').first().click();

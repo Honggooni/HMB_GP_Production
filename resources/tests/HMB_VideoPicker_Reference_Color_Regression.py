@@ -79,4 +79,4 @@ with tempfile.TemporaryDirectory(prefix="hmb-reference-color-") as tmp:
     legacy = dict(bindings[0], full_dag_path="")
     assert len(picker._normalize_assignment_bindings([legacy, copy.deepcopy(legacy)], 1)) == 1
 
-print("Repeated reference colors: PASS (16 markers, save/reopen, recolor/clear, Snapshot/Playblast admission)")
+print(f"Repeated reference colors: PASS ({len(picker.MARKER_ORDER)} markers, save/reopen, recolor/clear, Snapshot/Playblast admission)")

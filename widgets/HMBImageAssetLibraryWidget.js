@@ -85,14 +85,6 @@ const HMB_IMAGE_ASSET_THUMBNAIL_BRIDGE_REGISTRY_KEY =
 const HMB_IMAGE_ASSET_PRESENTATION_CACHE_KEY =
   "__HMB_IMAGE_ASSET_PRESENTATION_CACHE_V1__";
 const HMB_IMAGE_ASSET_PRESENTATION_CACHE_LIMIT = 32;
-const IMAGE_ASSET_CATALOG_PROBE_ACTIVE_MS = Object.freeze({
-  manifest: 3000,
-  folder: 10000,
-});
-const IMAGE_ASSET_CATALOG_PROBE_BACKGROUND_MS = Object.freeze({
-  manifest: 15000,
-  folder: 30000,
-});
 let imageAssetWidgetMountSequence = 0;
 const imageAssetMountedContainers = new Set();
 const imageAssetCompactNodeKeys = new Set();
@@ -448,9 +440,9 @@ function hmbImageAssetBridgeHasConsumers(entry) {
   );
 }
 
-function hmbDeliverImageAssetBridgeConsumers(entry, catalog, value) {
-  const consumers = catalog ? entry?.catalogConsumers : entry?.consumers;
-  const legacy = catalog ? entry?.catalogConsumer : entry?.consumer;
+function hmbDeliverImageAssetBridgeConsumers(entry, value) {
+  const consumers = entry?.consumers;
+  const legacy = entry?.consumer;
   const delivered = new Set();
   let firstError;
   let hasError = false;
@@ -467,7 +459,7 @@ function hmbDeliverImageAssetBridgeConsumers(entry, catalog, value) {
       // Another consumer can synchronously unmount a sibling while receiving
       // the same result. Never call a removed mount from the copied iteration.
       if (consumers.get(token) !== item) continue;
-      deliver(catalog ? item.consumer : item);
+      deliver(item);
     }
   }
   if (hasError) throw firstError;
@@ -491,68 +483,6 @@ function hmbUnregisterImageAssetThumbnailConsumer(container) {
   delete container?.__hmbImageAssetThumbnailConsumerRuntimeId;
   delete container?.__hmbImageAssetThumbnailConsumerToken;
   delete container?.__hmbImageAssetThumbnailConsumer;
-}
-
-function hmbUnregisterImageAssetCatalogProbeConsumer(container) {
-  const registry = imageAssetThumbnailBridgeRegistry();
-  const runtimeId = clean(container?.__hmbImageAssetCatalogProbeRuntimeId);
-  const token = container?.__hmbImageAssetCatalogProbeConsumerToken;
-  const current = runtimeId ? registry?.get(runtimeId) : null;
-  if (current && token) {
-    const bridge = { ...current };
-    bridge.catalogConsumers?.delete?.(token);
-    if (bridge.catalogConsumerToken === token) {
-      delete bridge.catalogConsumer;
-      delete bridge.catalogConsumerToken;
-      delete bridge.catalogWake;
-    }
-    if (bridge.dispatch || hmbImageAssetBridgeHasConsumers(bridge)) registry.set(runtimeId, bridge);
-    else registry.delete(runtimeId);
-  }
-  delete container?.__hmbImageAssetCatalogProbeRuntimeId;
-  delete container?.__hmbImageAssetCatalogProbeConsumerToken;
-  delete container?.__hmbImageAssetCatalogProbeConsumer;
-}
-
-function hmbRegisterImageAssetCatalogProbeConsumer(
-  container,
-  state,
-  consumer,
-  wake,
-) {
-  if (!container || typeof consumer !== "function") return false;
-  const runtimeId = imageAssetThumbnailRuntimeId(state);
-  if (!runtimeId) {
-    hmbUnregisterImageAssetCatalogProbeConsumer(container);
-    return false;
-  }
-  if (
-    container.__hmbImageAssetCatalogProbeRuntimeId === runtimeId
-    && container.__hmbImageAssetCatalogProbeConsumer === consumer
-    && imageAssetThumbnailBridgeRegistry()?.get(runtimeId)?.catalogConsumers
-      ?.get(container.__hmbImageAssetCatalogProbeConsumerToken)?.consumer === consumer
-  ) return true;
-  hmbUnregisterImageAssetCatalogProbeConsumer(container);
-  const registry = imageAssetThumbnailBridgeRegistry();
-  const token = `hmb-image-catalog-consumer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const current = registry?.get(runtimeId) || {};
-  const consumers = current.catalogConsumers instanceof Map ? current.catalogConsumers : new Map();
-  consumers.set(token, { consumer, wake: typeof wake === "function" ? wake : null });
-  registry?.set(runtimeId, {
-    ...current,
-    catalogConsumers: consumers,
-  });
-  container.__hmbImageAssetCatalogProbeRuntimeId = runtimeId;
-  container.__hmbImageAssetCatalogProbeConsumerToken = token;
-  container.__hmbImageAssetCatalogProbeConsumer = consumer;
-  if (current.catalogPendingResult) {
-    const registered = registry?.get(runtimeId) || {};
-    const { catalogPendingResult: _pending, ...withoutPending } = registered;
-    registry?.set(runtimeId, withoutPending);
-    hmbDeliverImageAssetBridgeConsumers(withoutPending, true, current.catalogPendingResult);
-  }
-  if (typeof current.dispatch === "function" && typeof wake === "function") wake();
-  return true;
 }
 
 function hmbRegisterImageAssetThumbnailConsumer(container, state, consumer) {
@@ -584,7 +514,7 @@ function hmbRegisterImageAssetThumbnailConsumer(container, state, consumer) {
     const registered = registry?.get(runtimeId) || {};
     const { pendingResult: _pendingResult, ...withoutPending } = registered;
     registry?.set(runtimeId, withoutPending);
-    hmbDeliverImageAssetBridgeConsumers(withoutPending, false, current.pendingResult);
+    hmbDeliverImageAssetBridgeConsumers(withoutPending, current.pendingResult);
   }
   return true;
 }
@@ -601,7 +531,7 @@ const IMAGE_ASSET_UI_TEXT = {
     select_project: "Select Project",
     select_a_project: "Select a project",
     project: "PROJECT",
-    reload_projects: "Rescan project media folders",
+    reload_projects: "Refresh project images from the shared folder",
     project_set: "PROJECT SET",
     registered: "REG",
     unregistered: "UNREG",
@@ -685,7 +615,7 @@ const IMAGE_ASSET_UI_TEXT = {
     select_project: "프로젝트 선택",
     select_a_project: "프로젝트를 선택하세요",
     project: "프로젝트",
-    reload_projects: "프로젝트 미디어 폴더 다시 읽기",
+    reload_projects: "새로고침 · 공유 폴더의 이미지 변경 사항 확인",
     project_set: "프로젝트 설정",
     registered: "등록",
     unregistered: "미등록",
@@ -1672,7 +1602,6 @@ function hmbResetImageAssetRuntimeState(container,state) {
     hmbCancelImageAssetSelectionCommit(container);
     hmbForgetImageAssetStateEcho(container);
     hmbCancelImageAssetThumbnailRequest(container);
-    hmbStopImageAssetCatalogPolling(container);
     clearTimeout(container.__hmbImageAssetSearchTimer);
     delete container.__hmbImageAssetSearchTimer;
     container.__hmbHierarchyDispose?.();
@@ -3264,9 +3193,14 @@ function hmbInstallImageAssetCatalogPages(container,getState,accept,acceptFallba
     if(!runtime)return;
     const registry=imageAssetThumbnailBridgeRegistry();const entry=registry?.get(runtime)||{};
     if(!(entry.pageConsumers instanceof Map))entry.pageConsumers=new Map();
-    entry.pageConsumers.set(control.session,{consumer:receive,wake});registry?.set(runtime,entry);
+    entry.pageConsumers.set(control.session,{consumer:receive,wake:onBridgeReady});registry?.set(runtime,entry);
     if(container.__hmbImageAssetSearchTimer!=null)return;
     hmbRequestImageAssetCatalogPage(container,state,container.__hmbImageAssetRenderOffset||0);
+  };
+  const onBridgeReady = () => {
+    container.__hmbImageAssetAuthorityWait?.wake?.();
+    container.__hmbImageAssetLeaseWake?.();
+    wake();
   };
   const receive=result=>{
     const request=control.pending,state=getState();
@@ -4525,179 +4459,6 @@ export function hmbScheduleImageAssetThumbnailRequest(
   return true;
 }
 
-function imageAssetCatalogProbeDelay(kind) {
-  const background = typeof document !== "undefined"
-    && (document.hidden || document.visibilityState === "hidden");
-  const table = background
-    ? IMAGE_ASSET_CATALOG_PROBE_BACKGROUND_MS
-    : IMAGE_ASSET_CATALOG_PROBE_ACTIVE_MS;
-  return table[kind] || table.folder;
-}
-
-function imageAssetCatalogProbeContext(state) {
-  const runtimeId = imageAssetThumbnailRuntimeId(state);
-  const projectUid = clean(state?.project_uid);
-  const projectCacheUid = clean(state?.project_cache_uid);
-  const projectRoot = clean(state?.project_root || state?.catalog_root).replaceAll("\\", "/");
-  if (!runtimeId || !projectUid || !projectRoot) return null;
-  return {
-    runtimeId,
-    projectUid,
-    projectCacheUid,
-    projectRoot,
-    manifestSignature: clean(state?.manifest_signature),
-    scanRevision: hmbNormalizeImageAssetRevision(state?.scan_revision),
-    key: [
-      runtimeId,
-      hmbImageAssetWidgetLease(state),
-      hmbImageAssetPresentationCacheKey(state),
-      projectRoot,
-      hmbNormalizeImageAssetRevision(state?.scan_revision),
-    ].join("\n"),
-  };
-}
-
-export function hmbAcceptImageAssetCatalogProbeResult(container, state, result) {
-  const context = imageAssetCatalogProbeContext(state);
-  if (
-    !container
-    || (hmbImageAssetWidgetLease(state) && hmbImageAssetWidgetLease(result) !== hmbImageAssetWidgetLease(state))
-    || !context
-    || clean(result?.schema) !== "hmb-image-asset-thumbnail-bridge"
-    || clean(result?.operation) !== "catalog_probe"
-    || clean(result?.phase) !== "result"
-    || clean(result?.runtime_instance_id) !== context.runtimeId
-    || clean(result?.project_uid) !== context.projectUid
-    || (clean(result?.project_cache_uid)
-      && clean(result?.project_cache_uid) !== context.projectCacheUid)
-    || clean(result?.manifest_signature) !== context.manifestSignature
-    || hmbNormalizeImageAssetRevision(result?.scan_revision) !== context.scanRevision
-  ) return false;
-  const kind = clean(result?.probe_kind);
-  if (kind !== "manifest" && kind !== "folder") return false;
-  if (!["no_change", "changed", "deferred", "offline"].includes(clean(result?.outcome))) {
-    return false;
-  }
-  const pending = container.__hmbImageAssetCatalogProbePending;
-  const request = pending instanceof Map ? pending.get(kind) : null;
-  if (request && clean(request.requestId) !== clean(result?.request_id)) return false;
-  pending?.delete?.(kind);
-  return true;
-}
-
-function hmbClearImageAssetCatalogProbeTimers(container) {
-  const timers = container?.__hmbImageAssetCatalogProbeTimers;
-  if (timers instanceof Map && typeof clearTimeout === "function") {
-    for (const timer of timers.values()) {
-      try { clearTimeout(timer); } catch (_error) {}
-    }
-  }
-  timers?.clear?.();
-}
-
-export function hmbStopImageAssetCatalogPolling(container) {
-  if (!container) return false;
-  hmbClearImageAssetCatalogProbeTimers(container);
-  const visibilityHandler = container.__hmbImageAssetCatalogVisibilityHandler;
-  if (visibilityHandler && typeof document !== "undefined") {
-    try { document.removeEventListener?.("visibilitychange", visibilityHandler); } catch (_error) {}
-  }
-  delete container.__hmbImageAssetCatalogVisibilityHandler;
-  delete container.__hmbImageAssetCatalogProbeTimers;
-  delete container.__hmbImageAssetCatalogProbePending;
-  delete container.__hmbImageAssetCatalogProbeContextKey;
-  return true;
-}
-
-export function hmbStartImageAssetCatalogPolling(container, state) {
-  if (!container || typeof setTimeout !== "function") return false;
-  if (container.__hmbImageAssetLeaseTransitionPending) return false;
-  const liveState = container.__hmbImageAssetLatestState || state;
-  const context = imageAssetCatalogProbeContext(liveState);
-  const bridge = context
-    ? imageAssetBridgeForNode(container, context.runtimeId)
-    : null;
-  if (!context || typeof bridge?.dispatch !== "function") return false;
-  if (container.__hmbImageAssetCatalogProbeContextKey !== context.key) {
-    hmbStopImageAssetCatalogPolling(container);
-    container.__hmbImageAssetCatalogProbeContextKey = context.key;
-    container.__hmbImageAssetCatalogProbeTimers = new Map();
-    container.__hmbImageAssetCatalogProbePending = new Map();
-  }
-  const timers = container.__hmbImageAssetCatalogProbeTimers;
-  const pending = container.__hmbImageAssetCatalogProbePending;
-
-  const schedule = (kind) => {
-    if (timers.has(kind)) return;
-    const delay = imageAssetCatalogProbeDelay(kind);
-    const timer = setTimeout(() => {
-      timers.delete(kind);
-      const current = container.__hmbImageAssetLatestState || liveState;
-      const currentContext = imageAssetCatalogProbeContext(current);
-      if (
-        !currentContext
-        || currentContext.key !== container.__hmbImageAssetCatalogProbeContextKey
-      ) return;
-      const currentBridge = imageAssetBridgeForNode(container, currentContext.runtimeId);
-      const dispatch = typeof currentBridge?.dispatch === "function"
-        ? currentBridge.dispatch
-        : null;
-      const previous = pending.get(kind);
-      const currentDelay = imageAssetCatalogProbeDelay(kind);
-      if (
-        !current.scan_busy
-        && dispatch
-        && (!previous || Date.now() - previous.startedAt >= currentDelay * 2)
-      ) {
-        const requestId = `catalog-${kind}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-        const request = {
-          schema: "hmb-image-asset-thumbnail-bridge",
-          version: 1,
-          operation: "catalog_probe",
-          phase: "request",
-          request_id: requestId,
-          runtime_instance_id: currentContext.runtimeId,
-          ...(hmbImageAssetWidgetLease(current) ? {widget_runtime_lease:hmbImageAssetWidgetLease(current)} : {}),
-          project_uid: currentContext.projectUid,
-          project_cache_uid: currentContext.projectCacheUid,
-          project_root: currentContext.projectRoot,
-          manifest_signature: currentContext.manifestSignature,
-          scan_revision: currentContext.scanRevision,
-          probe_kind: kind,
-        };
-        pending.set(kind, { requestId, startedAt: Date.now() });
-        try {
-          const dispatched = dispatch(request);
-          if (dispatched && typeof dispatched.then === "function") {
-            Promise.resolve(dispatched).catch(() => pending.delete(kind));
-          }
-        } catch (_error) {
-          pending.delete(kind);
-        }
-      }
-      schedule(kind);
-    }, delay);
-    timers.set(kind, timer);
-  };
-
-  schedule("manifest");
-  schedule("folder");
-  if (
-    !container.__hmbImageAssetCatalogVisibilityHandler
-    && typeof document !== "undefined"
-    && typeof document.addEventListener === "function"
-  ) {
-    const visibilityHandler = () => {
-      hmbClearImageAssetCatalogProbeTimers(container);
-      schedule("manifest");
-      schedule("folder");
-    };
-    container.__hmbImageAssetCatalogVisibilityHandler = visibilityHandler;
-    document.addEventListener("visibilitychange", visibilityHandler);
-  }
-  return true;
-}
-
 function imageAssetBrowseKey(state) {
   return JSON.stringify([imageAssetThumbnailRuntimeId(state), state.project_uid, state.project_root]);
 }
@@ -5610,7 +5371,7 @@ function renderRegistrationDialog(state, draft) {
   const thumbnailSource = imageSource(asset);
   const thumbnailFailed = !thumbnailSource && hmbImageAssetThumbnailFailed(asset);
   return `
-    <div class="asset-registration-backdrop" data-registration-backdrop>
+    <div class="asset-registration-backdrop nowheel" data-registration-backdrop>
       <section class="asset-passport" role="dialog" aria-modal="true" aria-labelledby="asset-registration-title">
         <header class="passport-head" data-hmb-popup-header>
           <div><small>${escapeHtml(imageAssetText(state, "hmb_project_asset"))}</small><h2 id="asset-registration-title">${escapeHtml(imageAssetText(state, "asset_passport"))}</h2></div>
@@ -6223,6 +5984,8 @@ function render(
 ) {
   const catalog = hmbRenderImageAssetGrid(state, renderLimit, renderOffset, gridVisible);
   const activeShot = activeImageAssetShot(state);
+  const viewportKey = (section, folder = "") => state.project_root && activeShot?.shot_uuid
+    ? ` data-hmb-wheel-key="${escapeHtml(JSON.stringify([section, state.project_root, activeShot.shot_uuid, folder]))}"` : "";
   const activePalette = hmbImageAssetShotPalette(activeShot?.number || 1);
   const statusText = hmbImageAssetDisplayStatus(state);
   const filterLabel = state.selected_source_view === "user"
@@ -6278,7 +6041,7 @@ function render(
       <main class="workspace">
         <aside class="panel tree-panel">
           <div class="panel-title"><span>${escapeHtml(imageAssetText(state, "project_folders"))}</span><b>${escapeHtml(hmbImageAssetProjectDisplayName(state) || imageAssetText(state, "ready"))}</b></div>
-          <div class="tree">${renderFolderNode(buildFolderTree(state), state)}</div>
+          <div class="tree"${viewportKey("image-folders")}>${renderFolderNode(buildFolderTree(state), state)}</div>
         </aside>
         <section class="panel assets-panel">
           <div class="toolbar">
@@ -6289,7 +6052,7 @@ function render(
             <div class="toolbar-status" data-count-digits="4" aria-live="polite"><strong title="${escapeHtml(hmbImageAssetDisplayStatusTitle(state))}">${escapeHtml(statusText)}</strong></div>
             <span class="filter-chip">${escapeHtml(filterLabel)}</span>
           </div>
-          <div class="asset-scroll nodrag nopan nowheel" data-asset-scroll>
+          <div class="asset-scroll nodrag nopan nowheel" data-asset-scroll${viewportKey("image-cards", [state.selected_source_view, state.selected_folder_path])}>
             ${catalog.markup}
           </div>
           ${state.warnings.length ? `<div class="warnings">${state.warnings.map((item) => `<div>${escapeHtml(item)}</div>`).join("")}</div>` : ""}
@@ -8898,8 +8661,8 @@ function installEvents(container, state, props, remount, listeners) {
       if (status) status.textContent = draft.save_message;
       draft.save_timer = setTimeout(() => {
         if (container.__hmbImageAssetRegistrationDraft !== draft || draft.request_id !== request.request_id) return;
-        draft.save_message = english ? "No registration receipt yet. Close this window and refresh the project to check."
-          : "아직 등록 결과를 받지 못했습니다. 창을 닫고 프로젝트를 새로고침해 등록 여부를 확인하세요.";
+        draft.save_message = english ? "Still waiting for registration. You can leave this window open for the result. If you close it, use Refresh to check."
+          : "등록 확인을 기다리고 있습니다. 이 창에서 결과를 기다리거나, 창을 닫은 경우 새로고침으로 확인할 수 있습니다.";
         const notice = container.querySelector("[data-registration-status]");
         if (notice) notice.textContent = draft.save_message;
       }, 15000);
@@ -9106,17 +8869,6 @@ function hmbNativeUiImplementation(container, props) {
     hmbScheduleImageAssetThumbnailRequest(container,state,props,{includeWindow:!container.__hmbImageAssetCompact});
   });
 
-  const consumeCatalogProbeResult = (result) => hmbAcceptImageAssetCatalogProbeResult(
-    container,
-    container.__hmbImageAssetLatestState || state,
-    result,
-  );
-  const wakeCatalogPolling = () => {
-    container.__hmbImageAssetAuthorityWait?.wake?.();
-    container.__hmbImageAssetLeaseWake?.();
-    return hmbStartImageAssetCatalogPolling(container, container.__hmbImageAssetLatestState || state);
-  };
-
   const consumeThumbnailPresentationPatch = (patch) => {
     if (patch?.operation?.startsWith("cgt_")) return container.__hmbHierarchyReceive?.(patch) || false;
     const applied = hmbApplyImageAssetThumbnailPresentationPatch(
@@ -9142,13 +8894,6 @@ function hmbNativeUiImplementation(container, props) {
     state,
     consumeThumbnailPresentationPatch,
   );
-  hmbRegisterImageAssetCatalogProbeConsumer(
-    container,
-    state,
-    consumeCatalogProbeResult,
-    wakeCatalogPolling,
-  );
-  hmbStartImageAssetCatalogPolling(container, state);
 
   const clearListeners = () => {
     listeners.forEach(([target, type, handler, options]) => {
@@ -9187,13 +8932,6 @@ function hmbNativeUiImplementation(container, props) {
         state,
         consumeThumbnailPresentationPatch,
       );
-      hmbRegisterImageAssetCatalogProbeConsumer(
-        container,
-        state,
-        consumeCatalogProbeResult,
-        wakeCatalogPolling,
-      );
-      hmbStartImageAssetCatalogPolling(container, state);
       hmbResumeImageAssetThumbnailRequest(container, state, props);
       hmbPatchCompactImageAssetState(container, state);
       const refreshReview = hmbSyncImageAssetRefreshReview(container, state);
@@ -9225,13 +8963,6 @@ function hmbNativeUiImplementation(container, props) {
       state,
       consumeThumbnailPresentationPatch,
     );
-    hmbRegisterImageAssetCatalogProbeConsumer(
-      container,
-      state,
-      consumeCatalogProbeResult,
-      wakeCatalogPolling,
-    );
-    hmbStartImageAssetCatalogPolling(container, state);
     hmbResumeImageAssetThumbnailRequest(container, state, props);
     const refreshReview = hmbSyncImageAssetRefreshReview(container, state);
     const markup = hmbScopeWidgetStyleMarkup(render(
@@ -9375,7 +9106,7 @@ function hmbNativeUiImplementation(container, props) {
           clearLeaseTransition();
           container.__hmbImageAssetLeaseTransitionPending = true;
           hmbInvalidateImageAssetPublication(container); hmbCancelImageAssetSelectionCommit(container);
-          hmbCancelImageAssetThumbnailRequest(container); hmbStopImageAssetCatalogPolling(container);
+          hmbCancelImageAssetThumbnailRequest(container);
           clearTimeout(container.__hmbImageAssetSearchTimer); delete container.__hmbImageAssetSearchTimer;
           delete container.__hmbImageAssetPendingSlowAction; delete container.__hmbImageAssetSlowActionToken;
           delete container.__hmbImageAssetProjectAuthorityPending;
@@ -9759,8 +9490,6 @@ function hmbNativeUiImplementation(container, props) {
     hmbSetImageAssetNativeResizeLocked(container, false);
     hmbDetachImageAssetRegistryContainer(container);
     hmbUnregisterImageAssetThumbnailConsumer(container);
-    hmbUnregisterImageAssetCatalogProbeConsumer(container);
-    hmbStopImageAssetCatalogPolling(container);
     hmbInvalidateImageAssetPublication(container);
     // Library removal must be publication-free. A normal structural remount
     // still flushes visible optimistic feedback, but teardown cancels its
@@ -9814,7 +9543,6 @@ function hmbNativeUiImplementation(container, props) {
     delete container.__hmbImageAssetCompactCardsByLibraryId;
     delete container.__hmbImageAssetBashCardsByLibraryId;
     delete container.__hmbImageAssetThumbnailConsumer;
-    delete container.__hmbImageAssetCatalogProbeConsumer;
     delete container.__hmbImageAssetRenderLimit;
     delete container.__hmbImageAssetRenderOffset;
     delete container.__hmbImageAssetExpandedFragment;
@@ -9869,7 +9597,7 @@ function hmbNativeUiReadCommand(value, kind) {
   if (kind === "lut") return (v.__hmb_color_lut_command__ || v).action === "cancel";
   const command = v.__hmb_picker_command__ || v;
   return ["picker", "picker-bridge"].includes(kind) && command.schema === "hmb-picker-command"
-    && (["stop_read", "cancel_pending", "cancel_video_import"].includes(command.action)
+    && (["stop_read", "cancel_pending", "cancel_generate", "cancel_video_import"].includes(command.action)
       || (command.action === "video_tools" && command.payload?.op === "cancel"));
 }
 // Locked echoes use only primitive/raw-string identity: no state clone/hash.
@@ -10103,27 +9831,273 @@ function hmbAcquireNativeStockSafety(container) {
   return { refresh() { if (owner.active) shared.sync(); }, cleanup() { if (owner.active) shared.release(owner); } };
 }
 
+// Griptape loads each widget as a separate module. One selection per editor
+// document also covers stock parameter fields rendered beside an HMB widget.
+function hmbAcquireCanvasWheel(container) {
+  const node = container?.matches?.(".widget-container") && container.closest?.(".react-flow__node");
+  const doc = container?.ownerDocument, win = doc?.defaultView;
+  if (!node?.closest?.(".react-flow") || !win?.WheelEvent) return null;
+  const key = "__HMB_CANVAS_WHEEL_SELECTION_V1__";
+  let router = doc[key];
+  if (!router) {
+    const nodes = new Map();
+    let selected = null;
+    const activeScroll = "data-hmb-active-scroll";
+    const activeSelector = `[${activeScroll}]`;
+    const outlineStyle = doc.createElement("style");
+    outlineStyle.textContent = `.react-flow .react-flow__node.nowheel ${activeSelector} {
+      outline: 2px solid #4dd8ff !important;
+      outline-offset: -2px !important;
+      anchor-name: --hmb-selected-viewport;
+      overscroll-behavior: contain !important;
+    }
+    .react-flow [data-hmb-scroll-frame] {
+      position: absolute !important;
+      position-anchor: --hmb-selected-viewport;
+      top: anchor(top); left: anchor(left);
+      width: anchor-size(width); height: anchor-size(height);
+      box-sizing: border-box; border: 2px solid #4dd8ff;
+      padding: 0; margin: 0; background: transparent;
+      pointer-events: none !important; z-index: 1000;
+    }`;
+    doc.head.appendChild(outlineStyle);
+    // Paint above composited thumbnails and sticky headers, outside the scrolling
+    // content. CSS anchors follow native scroll, resize and React Flow zoom.
+    const frame = doc.createElement("span");
+    frame.setAttribute("data-hmb-scroll-frame", "");
+    frame.setAttribute("aria-hidden", "true");
+    const anchored = win.CSS?.supports("position-anchor", "--hmb-selected-viewport")
+      && win.CSS.supports("width", "anchor-size(width)");
+    const modal = "dialog,[role='dialog'],[aria-modal='true'],[role='menu'],[role='listbox']:not(select),[data-registration-backdrop],[data-refresh-review-backdrop]";
+    const hasScroll = (element, horizontal) => {
+      const room = horizontal ? element.scrollWidth - element.clientWidth : element.scrollHeight - element.clientHeight;
+      if (room <= 1) return false;
+      const style = win.getComputedStyle(element);
+      return /^(auto|scroll|overlay)$/.test(horizontal ? style.overflowX : style.overflowY);
+    };
+    const canScroll = surface => hasScroll(surface, false) || hasScroll(surface, true);
+    const surfaceAt = (target, root) => {
+      const group = target.closest?.("[data-hmb-scroll-viewport]");
+      if (group && root.contains(group)) return group;
+      for (let el = target; el && el !== root; el = el.parentElement) {
+        if (el.matches?.("textarea")) return el;
+        if (el.matches?.("select,input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit])")) return null;
+        if (canScroll(el)) return el;
+      }
+      return null;
+    };
+    const syncOutline = () => {
+      const surface = selected?.surface;
+      if (!surface?.isConnected) return false;
+      const scrollable = canScroll(surface);
+      surface.toggleAttribute(activeScroll, scrollable);
+      if (anchored && scrollable && frame.previousElementSibling !== surface) {
+        frame.style.borderRadius = win.getComputedStyle(surface).borderRadius;
+        surface.after(frame);
+      } else if (!scrollable) {
+        frame.remove();
+      }
+      return scrollable;
+    };
+    const resized = win.ResizeObserver && new win.ResizeObserver(syncOutline);
+    const clearOutline = () => {
+      const {root, surface} = selected;
+      frame.remove();
+      surface.removeAttribute(activeScroll);
+      for (const copy of root.querySelectorAll(activeSelector)) copy.removeAttribute(activeScroll);
+      for (const copy of root.querySelectorAll("[data-hmb-scroll-frame]")) copy.remove();
+    };
+    const restoreViewport = () => {
+      const {root, key} = selected;
+      if (!key || !root.isConnected) return false;
+      const matches = [...root.querySelectorAll("[data-hmb-wheel-key]")].filter(el => el.dataset.hmbWheelKey === key);
+      if (matches.length !== 1) return false;
+      activate(root, matches[0]);
+      return true;
+    };
+    const changed = win.MutationObserver && new win.MutationObserver(records => {
+      if (!selected) return;
+      const {root, surface} = selected;
+      if (!root.contains(surface)) {
+        if (restoreViewport()) return;
+        changed.disconnect();
+        resized?.disconnect();
+        clearOutline();
+        // Give the renderer one turn to attach the replacement. Release the
+        // detached card tree even if there is no subsequent pointer event.
+        const detached = selected;
+        win.setTimeout(() => {
+          if (selected === detached && !restoreViewport()) clear();
+        }, 0);
+        return;
+      }
+      if (selected.key !== surface.dataset.hmbWheelKey) { clear(); return; }
+      // A cloned field inherits attributes, but only the original owns the wheel.
+      for (const record of records) {
+        for (const added of record.addedNodes) {
+          if (added.nodeType !== 1) continue;
+          if (added !== frame && added.hasAttribute("data-hmb-scroll-frame")) {
+            added.remove();
+            continue;
+          }
+          if (added !== surface) added.removeAttribute(activeScroll);
+          for (const copy of added.querySelectorAll(`${activeSelector},[data-hmb-scroll-frame]`)) {
+            if (copy.hasAttribute("data-hmb-scroll-frame")) {
+              if (copy !== frame) copy.remove();
+            } else if (copy !== surface) copy.removeAttribute(activeScroll);
+          }
+        }
+      }
+      if (records.some(record => surface.contains(record.target))
+          || (anchored && surface.hasAttribute(activeScroll) && frame.previousElementSibling !== surface)) syncOutline();
+    });
+    const clear = () => {
+      if (!selected) return;
+      const {surface, root, addedNoWheel, previousOverscroll} = selected;
+      changed?.disconnect();
+      resized?.disconnect();
+      surface.removeEventListener("input", syncOutline, true);
+      surface.removeEventListener("load", syncOutline, true);
+      clearOutline();
+      if (addedNoWheel && root.classList.contains("nowheel")) root.classList.remove("nowheel");
+      if (surface.style.overscrollBehavior === "contain") surface.style.overscrollBehavior = previousOverscroll;
+      selected = null;
+    };
+    const activate = (root, surface) => {
+      if (surface === selected?.surface) return;
+      clear();
+      if (!surface) return;
+      // Some widget renderers use the viewport className as their scroll
+      // restoration key. Put the native wheel filter on the stock node only.
+      selected = {root, surface, key:surface.dataset.hmbWheelKey, addedNoWheel: !root.classList.contains("nowheel"), previousOverscroll: surface.style.overscrollBehavior};
+      if (selected.addedNoWheel) root.classList.add("nowheel");
+      surface.style.overscrollBehavior = "contain";
+      syncOutline();
+      surface.addEventListener("input", syncOutline, true);
+      surface.addEventListener("load", syncOutline, true);
+      resized?.observe(surface);
+      changed?.observe(root, {subtree:true, childList:true});
+      changed?.observe(surface, {subtree:true, childList:true, characterData:true,
+        attributes:true, attributeFilter:[activeScroll,"data-hmb-wheel-key","class","style","hidden","rows"]});
+    };
+    const select = event => {
+      if (event.button !== 0 || event.isPrimary === false) return;
+      const target = event.target, root = target?.closest?.(".react-flow__node");
+      activate(root, nodes.has(root) && !target.closest(modal) ? surfaceAt(target, root) : null);
+    };
+    const actionAt = target => target.closest("button,textarea,[data-asset],[data-asset-key],[data-video-uid],[data-group-path],[data-instance]");
+    const actionKey = element => element && Array.from(element.attributes)
+      .filter(a => a.name !== activeScroll && (a.name === "id" || a.name === "name" || a.name.startsWith("data-")))
+      .map(a => JSON.stringify([a.name,a.value])).sort().join(",");
+    const afterClick = event => {
+      const current = selected;
+      if (event.button !== 0 || !current?.surface.contains(event.target)) return;
+      const action = actionAt(event.target), identity = actionKey(action);
+      if (!identity) return;
+      const shotAt = el => actionKey(el.closest("[data-shot-row],[data-workspace-uuid],[data-shot-uuid]"));
+      const shot = shotAt(action);
+      // A card/folder button can repaint its list on click. Reacquire only
+      // the same action and viewport under this completed pointer gesture.
+      const {clientX, clientY} = event;
+      win.setTimeout(() => {
+        if (selected !== current || current.surface.isConnected) return;
+        const hit = doc.elementFromPoint(clientX, clientY);
+        if (!hit || hit.closest(".react-flow__node") !== current.root || hit.closest(modal)) return;
+        const nextAction = actionAt(hit), next = surfaceAt(hit, current.root);
+        if (next && next.dataset.hmbWheelKey === current.key && next.tagName === current.surface.tagName && next.className === current.surface.className
+            && nextAction?.tagName === action.tagName && actionKey(nextAction) === identity
+            && shotAt(nextAction) === shot) activate(current.root, next);
+      }, 0);
+    };
+    const escape = event => { if (event.key === "Escape") clear(); };
+    const wheel = event => {
+      const target = event.target, root = target?.closest?.(".react-flow__node");
+      if (!nodes.has(root) || event.defaultPrevented || target.closest(modal)) return;
+      if (selected && !selected.root.contains(selected.surface) && !restoreViewport()) clear();
+      if (selected && selected.key !== selected.surface.dataset.hmbWheelKey) clear();
+      if (!event.ctrlKey && !event.metaKey && selected?.root === root && selected.surface.contains(target)) {
+        const surface = selected.surface;
+        if (surfaceAt(target, root) === surface && syncOutline()) {
+          // Keep native scrolling and widget handlers (virtual lists and
+          // horizontal card strips) on the original, trusted event.
+          if (!root.classList.contains("nowheel")) root.classList.add("nowheel");
+          return;
+        }
+      }
+      // Stock parameters can stop wheel at React's capture phase, before
+      // the widget sees it. Deliver one event at the same pointer position
+      // to the native canvas handler, above those parameter-specific guards.
+      event.preventDefault();
+      event.stopPropagation();
+      const canvasLayer = root.closest(".react-flow__nodes") || root.parentElement;
+      canvasLayer.dispatchEvent(new win.WheelEvent("wheel", event));
+    };
+    doc.addEventListener("pointerdown", select, true);
+    doc.addEventListener("click", afterClick, true);
+    doc.addEventListener("keydown", escape, true);
+    doc.addEventListener("wheel", wheel, {capture: true, passive: false});
+    router = {acquire(root) {
+      nodes.set(root, (nodes.get(root) || 0) + 1);
+      return () => {
+        const count = nodes.get(root) - 1;
+        if (count) nodes.set(root, count);
+        else {
+          nodes.delete(root);
+          if (selected?.root === root) clear();
+        }
+        if (nodes.size) return;
+        doc.removeEventListener("pointerdown", select, true);
+        doc.removeEventListener("click", afterClick, true);
+        doc.removeEventListener("keydown", escape, true);
+        doc.removeEventListener("wheel", wheel, true);
+        outlineStyle.remove();
+        delete doc[key];
+      };
+    }};
+    doc[key] = router;
+  }
+  return router.acquire(node);
+}
+
 function hmbNativeStockSafetyContract(container, props, mount) {
   const previous = container?.__hmbNativeStockSafety;
   const lease = previous?.active ? previous.lease : hmbAcquireNativeStockSafety(container);
+  // The stock WidgetLoader adds nowheel to the entire widget host. Leave
+  // wheel ownership to each HMB widget's concrete scroll surfaces instead.
+  const canvasHost = container?.matches?.(".widget-container") && container.closest?.(".react-flow__node") ? container : null;
+  const restoreWheelClass = previous?.active ? previous.restoreWheelClass : canvasHost?.classList.contains("nowheel");
   let handle;
   try { handle = mount(container, props); }
   catch (error) { if (!previous?.active) lease?.cleanup(); throw error; }
   lease?.refresh();
   if (!lease) return handle;
+  const allowCanvasWheel = () => {
+    if (canvasHost?.classList.contains("nowheel")) canvasHost.classList.remove("nowheel");
+  };
+  allowCanvasWheel();
   if (previous?.active && previous.handle === handle) return previous.proxy;
   if (previous) previous.active = false;
-  const state = { active: true, lease, handle, proxy: null };
+  const releaseWheel = previous?.releaseWheel || hmbAcquireCanvasWheel(container);
+  const state = { active: true, lease, handle, restoreWheelClass, releaseWheel, proxy: null };
   state.proxy = {
     update(next) {
       if (!state.active) return;
-      handle?.update?.(next); lease.refresh();
+      handle?.update?.(next);
+      allowCanvasWheel();
+      lease.refresh();
     },
     cleanup() {
       if (!state.active) return;
       state.active = false;
       try { if (typeof handle === "function") handle(); else handle?.cleanup?.(); }
-      finally { lease.cleanup(); if (container.__hmbNativeStockSafety === state) delete container.__hmbNativeStockSafety; }
+      finally {
+        releaseWheel?.();
+        lease.cleanup();
+        if (container.__hmbNativeStockSafety === state) {
+          if (restoreWheelClass) canvasHost?.classList.add("nowheel");
+          delete container.__hmbNativeStockSafety;
+        }
+      }
     },
   };
   container.__hmbNativeStockSafety = state;

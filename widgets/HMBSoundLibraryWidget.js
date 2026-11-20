@@ -110,17 +110,27 @@ const style = `
 .react-flow__node:not([data-hmb-native-icon-layout],[data-hmb-native-rollup-layout],[data-hmb-native-fold-transition]):has([data-hmb-sound-frame][data-sound-view=compact]),
 .react-flow__node:not([data-hmb-native-icon-layout],[data-hmb-native-rollup-layout],[data-hmb-native-fold-transition]) :has([data-hmb-sound-frame][data-sound-view=compact]){height:auto!important;min-height:0!important;max-height:none!important}
 `;
-function render(state, ui, pending) {
-  const busy=Boolean(state.busy||pending),rows=hmbSoundShotRows(state);
-  const active=rows.find(row=>sameShot(state.shot,row)),selected=active?state.tracks.filter(t=>sameShot(t,active)):[];
-  const list=state.assets.filter(a=>(!ui.role||a.role===ui.role)&&(!ui.folder||String(a.relative_path||"").replaceAll("\\","/").startsWith(ui.folder+"/"))&&`${a.name} ${a.relative_path}`.toLocaleLowerCase().includes(ui.search.toLocaleLowerCase()));
-  const options=(values,current,label=v=>v)=>values.map(v=>`<option value="${escape(v)}"${v===current?" selected":""}>${escape(label(v))}</option>`).join("");
-  const field=(t,key,label)=>`<label>${label}<input data-track="${escape(t.instance_id)}" data-field="${key}" type="number" step="0.01" ${key==="gain_db"?'min="-60" max="12"':'min="0"'} value="${escape(t[key]??"")}"></label>`;
-  const tree=`<button data-folder="" class="${!ui.folder&&!ui.role?'active':''}">${folderIcon}<span>전체 사운드</span><b>${state.assets.length}</b></button><small>폴더</small>${hmbSoundFolders(state).map(([folder,count])=>`<button data-folder="${escape(folder)}" class="${ui.folder===folder?'active':''}" style="padding-left:${8+(folder.split('/').length-1)*12}px">${folderIcon}<span>${escape(folder.split('/').at(-1))}</span><b>${count}</b></button>`).join("")}<small>종류별 보기</small>${roles.map(role=>`<button data-role-filter="${role}" class="${ui.role===role?'active':''}"><span>${labels[role]}</span><b>${state.assets.filter(a=>a.role===role).length}</b></button>`).join("")}`;
+function renderSoundResults(state, ui, active, selected, busy) {
+  const search = ui.search.toLocaleLowerCase();
+  const list = state.assets.filter(asset =>
+    (!ui.role || asset.role === ui.role) &&
+    (!ui.folder || String(asset.relative_path || "").replaceAll("\\", "/").startsWith(ui.folder + "/")) &&
+    (!search || `${asset.name} ${asset.relative_path}`.toLocaleLowerCase().includes(search))
+  );
   const assets=list.slice(0,ui.limit).map(a=>{
     const id=assetIdentity(a),chosen=selected.some(t=>String(t.source_uid||t.relative_path||"")===id),url=assetPreview(state,a);
     return `<article class="hs-asset${chosen?' selected':''}" data-asset="${escape(id)}" style="--audio-color:${colors[a.role]||'#22d3ee'}"><div class="hs-art">${wave(id)}<button type="button" class="hs-preview" data-preview-asset="${escape(id)}" aria-label="${escape(a.name)} 미리듣기" aria-pressed="false" ${url?'':'disabled'}>${playIcon}</button></div><strong class="hs-asset-name" title="${escape(a.relative_path)}">${escape(a.name)}</strong><div class="hs-asset-meta"><span>${escape(labels[a.role]||a.role||'사운드')}</span><span>${a.duration_seconds?seconds(a.duration_seconds):escape(String(a.extension||'').replace('.','').toUpperCase())}</span></div><button type="button" class="hs-asset-select" data-add="${escape(id)}" aria-label="${escape(assetLabel(a.name,chosen))}" ${busy||chosen||!active?'disabled':''}></button></article>`;
   }).join("");
+  return {count:list.length, content:`<div class="hs-files">${assets}</div>${!list.length?'<div class="hs-empty">사운드가 없습니다.<br>대사 · 효과음 · 환경음 · 음악</div>':''}${list.length>ui.limit?'<button class="hs-more" data-more>더 보기</button>':''}`};
+}
+
+function render(state, ui, pending) {
+  const busy=Boolean(state.busy||pending),rows=hmbSoundShotRows(state);
+  const active=rows.find(row=>sameShot(state.shot,row)),selected=active?state.tracks.filter(t=>sameShot(t,active)):[];
+  const results=renderSoundResults(state,ui,active,selected,busy);
+  const options=(values,current,label=v=>v)=>values.map(v=>`<option value="${escape(v)}"${v===current?" selected":""}>${escape(label(v))}</option>`).join("");
+  const field=(t,key,label)=>`<label>${label}<input data-track="${escape(t.instance_id)}" data-field="${key}" type="number" step="0.01" ${key==="gain_db"?'min="-60" max="12"':'min="0"'} value="${escape(t[key]??"")}"></label>`;
+  const tree=`<button data-folder="" class="${!ui.folder&&!ui.role?'active':''}">${folderIcon}<span>전체 사운드</span><b>${state.assets.length}</b></button><small>폴더</small>${hmbSoundFolders(state).map(([folder,count])=>`<button data-folder="${escape(folder)}" class="${ui.folder===folder?'active':''}" style="padding-left:${8+(folder.split('/').length-1)*12}px">${folderIcon}<span>${escape(folder.split('/').at(-1))}</span><b>${count}</b></button>`).join("")}<small>종류별 보기</small>${roles.map(role=>`<button data-role-filter="${role}" class="${ui.role===role?'active':''}"><span>${labels[role]}</span><b>${state.assets.filter(a=>a.role===role).length}</b></button>`).join("")}`;
   const shots=rows.map(row=>{
     const tracks=state.tracks.filter(t=>sameShot(t,row)),isActive=active===row;
     return `<section class="hs-shot-row${isActive?' active':''}" data-shot-row="${escape(row.shot_uuid)}" style="--shot-color:${shotColor(row)}"><button class="hs-shot-head" data-shot="${escape(row.shot_uuid)}" aria-pressed="${isActive}" ${busy?'disabled':''}><i>${row.legacy?'•':escape(String(row.number).padStart(2,'0'))}</i><strong>${escape(row.name)}</strong><span>${tracks.length}개</span></button>${tracks.length?`<div class="hs-bound-list nowheel">${tracks.map(t=>{
@@ -130,7 +140,7 @@ function render(state, ui, pending) {
   }).join("");
   const detail=state.tracks.find(t=>String(t.instance_id)===ui.detail);
   const drawer=detail?`<section class="hs-detail" data-detail-drawer><div class="hs-detail-head"><strong>${escape(detail.name)} · 사운드 상세</strong><button data-duplicate="${escape(detail.instance_id)}" ${busy?'disabled':''}>복제</button><button data-close-detail aria-label="사운드 상세 닫기">×</button></div><div class="hs-flags"><select data-track="${escape(detail.instance_id)}" data-field="role">${options(roles,detail.role,r=>labels[r])}</select><select data-track="${escape(detail.instance_id)}" data-field="purpose">${options(['both','reference','mix'],detail.purpose,v=>({both:'생성 참고 + 믹싱',reference:'생성 참고',mix:'최종 믹싱'}[v]))}</select>${[['enabled','사용'],['lipsync','립싱크'],['loop','반복']].map(([key,label])=>`<label><input type="checkbox" data-track="${escape(detail.instance_id)}" data-field="${key}"${detail[key]?' checked':''}>${label}</label>`).join('')}<input data-track="${escape(detail.instance_id)}" data-field="target" value="${escape(detail.target)}" placeholder="대상 / 화자"></div><textarea data-track="${escape(detail.instance_id)}" data-field="transcript" placeholder="대사 원문 / 사용 의도">${escape(detail.transcript)}</textarea><div class="hs-grid">${field(detail,'start_seconds','샷 시작(초)')}${field(detail,'in_seconds','음원 IN(초)')}${field(detail,'out_seconds','음원 OUT(빈칸=끝)')}${field(detail,'gain_db','볼륨(dB)')}</div></section>`:'';
-  return `<style>${style}</style><div class="hmb-sound nodrag nopan" data-hmb-node-type="HMBSoundLibrary" data-hmb-sound-widget style="--active-shot-color:${shotColor(active)}"><header class="hs-head group" data-sound-toggle-surface="header"><span class="hs-mark hs-brand">${wave('sound')}</span><div class="hs-heading hs-brand"><strong>HMB Sound Library</strong><small>사운드 에셋 · ${escape(active?.name||'샷 선택')}</small></div><div data-hmb-native-identity></div><div data-hmb-native-actions></div><div class="hs-actions nodrag"><button type="button" data-action="refresh" aria-label="사운드 폴더 다시 읽기" title="사운드 폴더 다시 읽기" ${!ui.syncNotice&&(busy||!state.project_root)?'disabled':''}>${scanFolderIcon}</button><button data-action="cancel" ${busy?'':'hidden'}>준비 취소</button></div></header><div class="hs-main"><aside class="hs-panel hs-tree"><div class="hs-panel-title">사운드 폴더<span>${state.assets.length}</span></div><div class="hs-folder-list nowheel">${tree}</div></aside><section class="hs-panel hs-browser"><div class="hs-filter"><input data-search placeholder="⌕  사운드 검색" aria-label="사운드 검색" value="${escape(ui.search)}"><b>${selected.length} 선택 / ${list.length}개</b></div><div class="hs-catalog nowheel"><div class="hs-files">${assets}</div>${!list.length?'<div class="hs-empty">사운드가 없습니다.<br>대사 · 효과음 · 환경음 · 음악</div>':''}${list.length>ui.limit?'<button class="hs-more" data-more>더 보기</button>':''}</div></section></div><div class="hs-shot-stack nowheel" aria-label="ImageAsset 샷 사운드">${shots||'<div class="hs-empty">ImageAsset의 샷을 연결하세요.</div>'}</div>${drawer}<div class="hs-status" role="status" data-error="${Boolean(state.error_code)}">${escape(ui.syncNotice||ui.commandNotice||ui.mediaNotice||(pending?'사운드 작업 적용 중…':state.status||'준비됨'))}${state.error_code?' · '+escape(state.error_code):''}</div></div>`;
+  return `<style>${style}</style><div class="hmb-sound nodrag nopan" data-hmb-node-type="HMBSoundLibrary" data-hmb-sound-widget style="--active-shot-color:${shotColor(active)}"><header class="hs-head group" data-sound-toggle-surface="header"><span class="hs-mark hs-brand">${wave('sound')}</span><div class="hs-heading hs-brand"><strong>HMB Sound Library</strong><small>사운드 에셋 · ${escape(active?.name||'샷 선택')}</small></div><div data-hmb-native-identity></div><div data-hmb-native-actions></div><div class="hs-actions nodrag"><button type="button" data-action="refresh" aria-label="사운드 폴더 다시 읽기" title="사운드 폴더 다시 읽기" ${!ui.syncNotice&&(busy||!state.project_root)?'disabled':''}>${scanFolderIcon}</button><button data-action="cancel" ${busy?'':'hidden'}>준비 취소</button></div></header><div class="hs-main"><aside class="hs-panel hs-tree"><div class="hs-panel-title">사운드 폴더<span>${state.assets.length}</span></div><div class="hs-folder-list nowheel">${tree}</div></aside><section class="hs-panel hs-browser"><div class="hs-filter"><input data-search placeholder="⌕  사운드 검색" aria-label="사운드 검색" value="${escape(ui.search)}"><b>${selected.length} 선택 / ${results.count}개</b></div><div class="hs-catalog nowheel">${results.content}</div></section></div><div class="hs-shot-stack nowheel" aria-label="ImageAsset 샷 사운드">${shots||'<div class="hs-empty">ImageAsset의 샷을 연결하세요.</div>'}</div>${drawer}<div class="hs-status" role="status" data-error="${Boolean(state.error_code)}">${escape(ui.syncNotice||ui.commandNotice||ui.mediaNotice||(pending?'사운드 작업 적용 중…':state.status||'준비됨'))}${state.error_code?' · '+escape(state.error_code):''}</div></div>`;
 }
 function hmbSoundImplementation(container, props = {}) {
   if (!container) return {update(){},cleanup(){}};
@@ -224,6 +234,21 @@ function hmbSoundImplementation(container, props = {}) {
     const status=current.querySelector(".hs-status");status.dataset.error=String(Boolean(state.error_code));
     status.textContent=(ui.syncNotice||ui.commandNotice||ui.mediaNotice||(pending?'사운드 작업 적용 중…':state.status||'준비됨'))+(state.error_code?' · '+state.error_code:'');
     current.toggleAttribute("data-sound-sync-waiting",syncWaiting);syncPlayback();return true;
+  }
+  function paintSearchResults(){
+    const panel = root(), catalog = panel?.querySelector(".hs-catalog");
+    if (!catalog) return;
+    const rows = hmbSoundShotRows(state);
+    const active = rows.find(row => sameShot(pending?.displayShot || state.shot, row));
+    const selected = active ? state.tracks.filter(track => sameShot(track, active)) : [];
+    const busy = Boolean(state.busy || pending || syncWaiting);
+    const results = renderSoundResults(state, ui, active, selected, busy || latest.disabled);
+    catalog.innerHTML = results.content;
+    panel.querySelector(".hs-filter b").textContent = `${selected.length} 선택 / ${results.count}개`;
+    const more = catalog.querySelector("[data-more]");
+    if (more) more.disabled = busy;
+    if (painted) painted = {...painted, filteredCount:results.count, ui:{...ui}};
+    if (preview) syncPlayback();
   }
   function paint(){
     if(disposed)return;
@@ -324,7 +349,7 @@ function hmbSoundImplementation(container, props = {}) {
   };
   const seek=el=>{const next=previewTrack(el.dataset.scrub);if(!next?.url)return;const time=Number(el.value);if(!Number.isFinite(time))return;choosePreview(next,false);const segment=bounds();pendingSeek=Math.max(segment.start,Math.min(segment.end||time,time));syncPlayback();};
   const change=event=>{const el=event.target;if(el.hasAttribute?.("data-scrub")){event.stopPropagation();seek(el);return;}if(el.dataset?.track&&el.dataset.field){event.stopPropagation();const value=el.type==="checkbox"?el.checked:el.type==="number"?(el.value===""&&el.dataset.field==="out_seconds"?null:Number(el.value)):el.value;command("edit",{instance_id:el.dataset.track,changes:{[el.dataset.field]:value}});}};
-  const input=event=>{const el=event.target;if(el.hasAttribute?.("data-scrub")){event.stopPropagation();seek(el);return;}if(!el.hasAttribute?.("data-search"))return;event.stopPropagation();ui.search=el.value;ui.limit=80;const start=el.selectionStart;paint();const next=frame.querySelector("[data-search]");next?.focus();next?.setSelectionRange(start,start);};
+  const input=event=>{const el=event.target;if(el.hasAttribute?.("data-scrub")){event.stopPropagation();seek(el);return;}if(!el.hasAttribute?.("data-search"))return;event.stopPropagation();ui.search=el.value;ui.limit=80;paintSearchResults();};
   const localPointer=event=>{if(event.button===1)return;if(event.target.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]"))return;if(event.target.closest?.("button,input,select,textarea,.hs-asset,.hs-bound,.hs-shot-row"))event.stopPropagation();};
   const keydown=event=>{if(event.target.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]"))return;event.stopPropagation();if(["Delete","Backspace"].includes(event.key)&&!event.target.matches?.("input,textarea,[contenteditable=true]"))event.preventDefault();};
   const dragstart=event=>{if(!event.target.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]")){event.preventDefault();event.stopPropagation();}};
@@ -426,7 +451,7 @@ function hmbNativeUiReadCommand(value, kind) {
   if (kind === "lut") return (v.__hmb_color_lut_command__ || v).action === "cancel";
   const command = v.__hmb_picker_command__ || v;
   return ["picker", "picker-bridge"].includes(kind) && command.schema === "hmb-picker-command"
-    && (["stop_read", "cancel_pending", "cancel_video_import"].includes(command.action)
+    && (["stop_read", "cancel_pending", "cancel_generate", "cancel_video_import"].includes(command.action)
       || (command.action === "video_tools" && command.payload?.op === "cancel"));
 }
 // Locked echoes use only primitive/raw-string identity: no state clone/hash.
@@ -659,27 +684,273 @@ function hmbAcquireNativeStockSafety(container) {
   return { refresh() { if (owner.active) shared.sync(); }, cleanup() { if (owner.active) shared.release(owner); } };
 }
 
+// Griptape loads each widget as a separate module. One selection per editor
+// document also covers stock parameter fields rendered beside an HMB widget.
+function hmbAcquireCanvasWheel(container) {
+  const node = container?.matches?.(".widget-container") && container.closest?.(".react-flow__node");
+  const doc = container?.ownerDocument, win = doc?.defaultView;
+  if (!node?.closest?.(".react-flow") || !win?.WheelEvent) return null;
+  const key = "__HMB_CANVAS_WHEEL_SELECTION_V1__";
+  let router = doc[key];
+  if (!router) {
+    const nodes = new Map();
+    let selected = null;
+    const activeScroll = "data-hmb-active-scroll";
+    const activeSelector = `[${activeScroll}]`;
+    const outlineStyle = doc.createElement("style");
+    outlineStyle.textContent = `.react-flow .react-flow__node.nowheel ${activeSelector} {
+      outline: 2px solid #4dd8ff !important;
+      outline-offset: -2px !important;
+      anchor-name: --hmb-selected-viewport;
+      overscroll-behavior: contain !important;
+    }
+    .react-flow [data-hmb-scroll-frame] {
+      position: absolute !important;
+      position-anchor: --hmb-selected-viewport;
+      top: anchor(top); left: anchor(left);
+      width: anchor-size(width); height: anchor-size(height);
+      box-sizing: border-box; border: 2px solid #4dd8ff;
+      padding: 0; margin: 0; background: transparent;
+      pointer-events: none !important; z-index: 1000;
+    }`;
+    doc.head.appendChild(outlineStyle);
+    // Paint above composited thumbnails and sticky headers, outside the scrolling
+    // content. CSS anchors follow native scroll, resize and React Flow zoom.
+    const frame = doc.createElement("span");
+    frame.setAttribute("data-hmb-scroll-frame", "");
+    frame.setAttribute("aria-hidden", "true");
+    const anchored = win.CSS?.supports("position-anchor", "--hmb-selected-viewport")
+      && win.CSS.supports("width", "anchor-size(width)");
+    const modal = "dialog,[role='dialog'],[aria-modal='true'],[role='menu'],[role='listbox']:not(select),[data-registration-backdrop],[data-refresh-review-backdrop]";
+    const hasScroll = (element, horizontal) => {
+      const room = horizontal ? element.scrollWidth - element.clientWidth : element.scrollHeight - element.clientHeight;
+      if (room <= 1) return false;
+      const style = win.getComputedStyle(element);
+      return /^(auto|scroll|overlay)$/.test(horizontal ? style.overflowX : style.overflowY);
+    };
+    const canScroll = surface => hasScroll(surface, false) || hasScroll(surface, true);
+    const surfaceAt = (target, root) => {
+      const group = target.closest?.("[data-hmb-scroll-viewport]");
+      if (group && root.contains(group)) return group;
+      for (let el = target; el && el !== root; el = el.parentElement) {
+        if (el.matches?.("textarea")) return el;
+        if (el.matches?.("select,input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit])")) return null;
+        if (canScroll(el)) return el;
+      }
+      return null;
+    };
+    const syncOutline = () => {
+      const surface = selected?.surface;
+      if (!surface?.isConnected) return false;
+      const scrollable = canScroll(surface);
+      surface.toggleAttribute(activeScroll, scrollable);
+      if (anchored && scrollable && frame.previousElementSibling !== surface) {
+        frame.style.borderRadius = win.getComputedStyle(surface).borderRadius;
+        surface.after(frame);
+      } else if (!scrollable) {
+        frame.remove();
+      }
+      return scrollable;
+    };
+    const resized = win.ResizeObserver && new win.ResizeObserver(syncOutline);
+    const clearOutline = () => {
+      const {root, surface} = selected;
+      frame.remove();
+      surface.removeAttribute(activeScroll);
+      for (const copy of root.querySelectorAll(activeSelector)) copy.removeAttribute(activeScroll);
+      for (const copy of root.querySelectorAll("[data-hmb-scroll-frame]")) copy.remove();
+    };
+    const restoreViewport = () => {
+      const {root, key} = selected;
+      if (!key || !root.isConnected) return false;
+      const matches = [...root.querySelectorAll("[data-hmb-wheel-key]")].filter(el => el.dataset.hmbWheelKey === key);
+      if (matches.length !== 1) return false;
+      activate(root, matches[0]);
+      return true;
+    };
+    const changed = win.MutationObserver && new win.MutationObserver(records => {
+      if (!selected) return;
+      const {root, surface} = selected;
+      if (!root.contains(surface)) {
+        if (restoreViewport()) return;
+        changed.disconnect();
+        resized?.disconnect();
+        clearOutline();
+        // Give the renderer one turn to attach the replacement. Release the
+        // detached card tree even if there is no subsequent pointer event.
+        const detached = selected;
+        win.setTimeout(() => {
+          if (selected === detached && !restoreViewport()) clear();
+        }, 0);
+        return;
+      }
+      if (selected.key !== surface.dataset.hmbWheelKey) { clear(); return; }
+      // A cloned field inherits attributes, but only the original owns the wheel.
+      for (const record of records) {
+        for (const added of record.addedNodes) {
+          if (added.nodeType !== 1) continue;
+          if (added !== frame && added.hasAttribute("data-hmb-scroll-frame")) {
+            added.remove();
+            continue;
+          }
+          if (added !== surface) added.removeAttribute(activeScroll);
+          for (const copy of added.querySelectorAll(`${activeSelector},[data-hmb-scroll-frame]`)) {
+            if (copy.hasAttribute("data-hmb-scroll-frame")) {
+              if (copy !== frame) copy.remove();
+            } else if (copy !== surface) copy.removeAttribute(activeScroll);
+          }
+        }
+      }
+      if (records.some(record => surface.contains(record.target))
+          || (anchored && surface.hasAttribute(activeScroll) && frame.previousElementSibling !== surface)) syncOutline();
+    });
+    const clear = () => {
+      if (!selected) return;
+      const {surface, root, addedNoWheel, previousOverscroll} = selected;
+      changed?.disconnect();
+      resized?.disconnect();
+      surface.removeEventListener("input", syncOutline, true);
+      surface.removeEventListener("load", syncOutline, true);
+      clearOutline();
+      if (addedNoWheel && root.classList.contains("nowheel")) root.classList.remove("nowheel");
+      if (surface.style.overscrollBehavior === "contain") surface.style.overscrollBehavior = previousOverscroll;
+      selected = null;
+    };
+    const activate = (root, surface) => {
+      if (surface === selected?.surface) return;
+      clear();
+      if (!surface) return;
+      // Some widget renderers use the viewport className as their scroll
+      // restoration key. Put the native wheel filter on the stock node only.
+      selected = {root, surface, key:surface.dataset.hmbWheelKey, addedNoWheel: !root.classList.contains("nowheel"), previousOverscroll: surface.style.overscrollBehavior};
+      if (selected.addedNoWheel) root.classList.add("nowheel");
+      surface.style.overscrollBehavior = "contain";
+      syncOutline();
+      surface.addEventListener("input", syncOutline, true);
+      surface.addEventListener("load", syncOutline, true);
+      resized?.observe(surface);
+      changed?.observe(root, {subtree:true, childList:true});
+      changed?.observe(surface, {subtree:true, childList:true, characterData:true,
+        attributes:true, attributeFilter:[activeScroll,"data-hmb-wheel-key","class","style","hidden","rows"]});
+    };
+    const select = event => {
+      if (event.button !== 0 || event.isPrimary === false) return;
+      const target = event.target, root = target?.closest?.(".react-flow__node");
+      activate(root, nodes.has(root) && !target.closest(modal) ? surfaceAt(target, root) : null);
+    };
+    const actionAt = target => target.closest("button,textarea,[data-asset],[data-asset-key],[data-video-uid],[data-group-path],[data-instance]");
+    const actionKey = element => element && Array.from(element.attributes)
+      .filter(a => a.name !== activeScroll && (a.name === "id" || a.name === "name" || a.name.startsWith("data-")))
+      .map(a => JSON.stringify([a.name,a.value])).sort().join(",");
+    const afterClick = event => {
+      const current = selected;
+      if (event.button !== 0 || !current?.surface.contains(event.target)) return;
+      const action = actionAt(event.target), identity = actionKey(action);
+      if (!identity) return;
+      const shotAt = el => actionKey(el.closest("[data-shot-row],[data-workspace-uuid],[data-shot-uuid]"));
+      const shot = shotAt(action);
+      // A card/folder button can repaint its list on click. Reacquire only
+      // the same action and viewport under this completed pointer gesture.
+      const {clientX, clientY} = event;
+      win.setTimeout(() => {
+        if (selected !== current || current.surface.isConnected) return;
+        const hit = doc.elementFromPoint(clientX, clientY);
+        if (!hit || hit.closest(".react-flow__node") !== current.root || hit.closest(modal)) return;
+        const nextAction = actionAt(hit), next = surfaceAt(hit, current.root);
+        if (next && next.dataset.hmbWheelKey === current.key && next.tagName === current.surface.tagName && next.className === current.surface.className
+            && nextAction?.tagName === action.tagName && actionKey(nextAction) === identity
+            && shotAt(nextAction) === shot) activate(current.root, next);
+      }, 0);
+    };
+    const escape = event => { if (event.key === "Escape") clear(); };
+    const wheel = event => {
+      const target = event.target, root = target?.closest?.(".react-flow__node");
+      if (!nodes.has(root) || event.defaultPrevented || target.closest(modal)) return;
+      if (selected && !selected.root.contains(selected.surface) && !restoreViewport()) clear();
+      if (selected && selected.key !== selected.surface.dataset.hmbWheelKey) clear();
+      if (!event.ctrlKey && !event.metaKey && selected?.root === root && selected.surface.contains(target)) {
+        const surface = selected.surface;
+        if (surfaceAt(target, root) === surface && syncOutline()) {
+          // Keep native scrolling and widget handlers (virtual lists and
+          // horizontal card strips) on the original, trusted event.
+          if (!root.classList.contains("nowheel")) root.classList.add("nowheel");
+          return;
+        }
+      }
+      // Stock parameters can stop wheel at React's capture phase, before
+      // the widget sees it. Deliver one event at the same pointer position
+      // to the native canvas handler, above those parameter-specific guards.
+      event.preventDefault();
+      event.stopPropagation();
+      const canvasLayer = root.closest(".react-flow__nodes") || root.parentElement;
+      canvasLayer.dispatchEvent(new win.WheelEvent("wheel", event));
+    };
+    doc.addEventListener("pointerdown", select, true);
+    doc.addEventListener("click", afterClick, true);
+    doc.addEventListener("keydown", escape, true);
+    doc.addEventListener("wheel", wheel, {capture: true, passive: false});
+    router = {acquire(root) {
+      nodes.set(root, (nodes.get(root) || 0) + 1);
+      return () => {
+        const count = nodes.get(root) - 1;
+        if (count) nodes.set(root, count);
+        else {
+          nodes.delete(root);
+          if (selected?.root === root) clear();
+        }
+        if (nodes.size) return;
+        doc.removeEventListener("pointerdown", select, true);
+        doc.removeEventListener("click", afterClick, true);
+        doc.removeEventListener("keydown", escape, true);
+        doc.removeEventListener("wheel", wheel, true);
+        outlineStyle.remove();
+        delete doc[key];
+      };
+    }};
+    doc[key] = router;
+  }
+  return router.acquire(node);
+}
+
 function hmbNativeStockSafetyContract(container, props, mount) {
   const previous = container?.__hmbNativeStockSafety;
   const lease = previous?.active ? previous.lease : hmbAcquireNativeStockSafety(container);
+  // The stock WidgetLoader adds nowheel to the entire widget host. Leave
+  // wheel ownership to each HMB widget's concrete scroll surfaces instead.
+  const canvasHost = container?.matches?.(".widget-container") && container.closest?.(".react-flow__node") ? container : null;
+  const restoreWheelClass = previous?.active ? previous.restoreWheelClass : canvasHost?.classList.contains("nowheel");
   let handle;
   try { handle = mount(container, props); }
   catch (error) { if (!previous?.active) lease?.cleanup(); throw error; }
   lease?.refresh();
   if (!lease) return handle;
+  const allowCanvasWheel = () => {
+    if (canvasHost?.classList.contains("nowheel")) canvasHost.classList.remove("nowheel");
+  };
+  allowCanvasWheel();
   if (previous?.active && previous.handle === handle) return previous.proxy;
   if (previous) previous.active = false;
-  const state = { active: true, lease, handle, proxy: null };
+  const releaseWheel = previous?.releaseWheel || hmbAcquireCanvasWheel(container);
+  const state = { active: true, lease, handle, restoreWheelClass, releaseWheel, proxy: null };
   state.proxy = {
     update(next) {
       if (!state.active) return;
-      handle?.update?.(next); lease.refresh();
+      handle?.update?.(next);
+      allowCanvasWheel();
+      lease.refresh();
     },
     cleanup() {
       if (!state.active) return;
       state.active = false;
       try { if (typeof handle === "function") handle(); else handle?.cleanup?.(); }
-      finally { lease.cleanup(); if (container.__hmbNativeStockSafety === state) delete container.__hmbNativeStockSafety; }
+      finally {
+        releaseWheel?.();
+        lease.cleanup();
+        if (container.__hmbNativeStockSafety === state) {
+          if (restoreWheelClass) canvasHost?.classList.add("nowheel");
+          delete container.__hmbNativeStockSafety;
+        }
+      }
     },
   };
   container.__hmbNativeStockSafety = state;

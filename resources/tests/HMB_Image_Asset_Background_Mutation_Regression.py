@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _hmb_image_asset_detached_fixture import initialize_detached_image_asset
@@ -377,11 +378,11 @@ assert dropped_node._hmb_scan_pending_key == ""
 
 # The visible PROJECT_ROOT callback must schedule the generation-owned path,
 # never call the synchronous catalog loader directly.
-after_set_source = inspect.getsource(asset_library.HMBImageAssetLibrary.after_value_set)
-assert "self._schedule_catalog_root_change(value)" in after_set_source
-assert "self._load_catalog(value)" not in after_set_source
-
 root_node, root_live, _ = fake_node(failure_snapshot)
+root_node._hmb_state_syncing = False
+root_node._hmb_thumbnail_bridge_syncing = False
+root_node._hmb_restoring_widget_state = False
+root_node._hmb_root_syncing = False
 root_started = threading.Event()
 root_release = threading.Event()
 original_catalog_loader = asset_library._load_project_catalog
@@ -404,7 +405,8 @@ def slow_root_load(root_value, previous):
 asset_library._load_project_catalog = slow_root_load
 try:
     before = time.monotonic()
-    root_pending = root_node._schedule_catalog_root_change("C:/new-catalog")
+    root_node.after_value_set(SimpleNamespace(name=asset_library.PROJECT_ROOT_PARAMETER), "C:/new-catalog")
+    root_pending = root_live["state"]
     elapsed = time.monotonic() - before
     assert elapsed < 0.5, "PROJECT_ROOT callback waited for discovery."
     assert root_started.wait(timeout=1.0)

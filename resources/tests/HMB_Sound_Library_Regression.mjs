@@ -81,7 +81,9 @@ try{
  await page.locator('[data-duplicate="clip-1"]').click();
  assert.equal(await page.evaluate(()=>window.commands.at(-1).__hmb_sound_command.action),'duplicate');
  await page.evaluate(()=>{const id=window.commands.at(-1).__hmb_sound_command.id;window.state={...window.state,revision:window.state.revision+1,ack_command_id:id,tracks:[...window.state.tracks,{...window.state.tracks[0],instance_id:'clip-copy'}]};window.controller.update(window.props());});
+ await page.locator('[data-search]').fill('Voice');
  await page.locator('[data-remove="clip-copy"]').click();
+ await page.locator('[data-search]').fill('');
  assert.equal(await page.evaluate(()=>window.commands.at(-1).__hmb_sound_command.action),'remove','An internal binding X is not a native node-delete action.');
  await page.evaluate(()=>{const id=window.commands.at(-1).__hmb_sound_command.id;window.state={...window.state,revision:window.state.revision+1,ack_command_id:id,tracks:window.state.tracks.filter(t=>t.instance_id!=='clip-copy')};window.controller.update(window.props());});
  assert.equal(await page.evaluate(()=>window.commands.length),bindingBefore+2);
@@ -125,6 +127,10 @@ try{
  await page.evaluate(({id,channel})=>{window.state={...window.state,revision:window.state.revision+1,ack_command_id:id,shot:{channel_uuid:channel,shot_uuid:'shot-3'}};window.controller.update(window.props());},{id:request.id,channel});
  assert.equal(await page.getByText('+ 추가',{exact:true}).count(),0);
  const previewWrites=await page.evaluate(()=>window.commands.length);
+ const shotTracksBefore=await page.locator('[data-instance]').evaluateAll(nodes=>nodes.map(n=>n.dataset.instance));
+ await page.locator('[data-search]').fill('Birds');
+ assert.deepEqual(await page.locator('[data-add]').evaluateAll(nodes=>nodes.map(n=>n.dataset.add)),['source-7']);
+ assert.deepEqual(await page.locator('[data-instance]').evaluateAll(nodes=>nodes.map(n=>n.dataset.instance)),shotTracksBefore);
  await page.locator('[data-preview-asset="source-7"]').click();
  assert.equal(await page.evaluate(()=>window.commands.length),previewWrites,'Preview must not bind the card');
  await page.locator('[data-preview-asset="source-7"]').click();
@@ -141,6 +147,10 @@ try{
  await page.locator('[data-preview-track="bound-shot3"]').click();
  assert.equal(await page.locator('[data-instance="bound-shot3"]').evaluate(n=>getComputedStyle(n).borderColor),'rgb(16, 185, 129)','Playback preserves the shot border color');
  await page.locator('[data-preview-track="bound-shot3"]').click();
+ assert.equal(await page.locator('[data-add="source-7"]').isDisabled(),true);
+ await page.locator('[data-search]').fill('');
+ assert.deepEqual(await page.locator('[data-add]').evaluateAll(nodes=>nodes.map(n=>n.dataset.add)),
+   assets.map(a=>a.source_uid),'Clearing search restores the original catalog order.');
  assert.equal(await page.locator('[data-add="source-7"]').isDisabled(),true);
  assert.equal(await page.locator('[data-asset="source-0"]').evaluate(n=>n.classList.contains('selected')),false);
  assert.equal(await page.locator('[data-shot-row="shot-2"] [data-instance]').count(),7);
@@ -211,6 +221,14 @@ try{
  assert.equal(await page.locator('#widget').getAttribute('data-hmb-native-node-type'),'HMBSoundLibrary');
  assert.equal(await page.locator('[data-hmb-sound-widget]').getAttribute('data-hmb-native-header'),'active');
  await page.locator('[data-search]').fill('Wing');
+ assert.equal(await page.evaluate(()=>window.soundModeRefs.search === document.activeElement
+   && window.soundModeRefs.search === document.querySelector('[data-search]')),true,
+   'Filtering keeps the focused input and its native text composition session.');
+ assert.equal(await page.locator('[data-search]').evaluate(input=>{
+   input.setSelectionRange(1,3);
+   input.dispatchEvent(new InputEvent('input',{bubbles:true,isComposing:true,data:'ㅇ'}));
+   return input.isConnected && input.selectionStart===1 && input.selectionEnd===3;
+ }),true);
  await page.locator('[data-hmb-native-actions] button').dispatchEvent('dblclick',{button:0});
  await page.locator('[data-action="refresh"]').dispatchEvent('dblclick',{button:0});
  await page.locator('.hs-shot-head').first().dispatchEvent('dblclick',{button:0});

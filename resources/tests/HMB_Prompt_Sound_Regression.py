@@ -293,8 +293,8 @@ class PromptSoundRegression(unittest.TestCase):
         self.assertIs(merged["sound_overlays"]["track-1"]["lipsync"], False)
 
     def test_new_default_height_and_saved_user_geometry(self):
-        self.assertEqual(prompt.PROMPT_START_HEIGHT, 1480)
-        self.assertEqual(prompt._prompt_start_metadata({})["size"], {"width": 1490, "height": 1480})
+        self.assertEqual(prompt.PROMPT_START_HEIGHT, 1544)
+        self.assertEqual(prompt._prompt_start_metadata({})["size"], {"width": 1490, "height": 1544})
         saved = {"size": {"width": 1234, "height": 987}, "position": {"x": 0, "y": 1}}
         self.assertEqual(prompt._prompt_start_metadata(saved), saved)
 

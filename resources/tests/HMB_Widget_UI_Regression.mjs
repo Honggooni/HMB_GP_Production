@@ -937,11 +937,12 @@ const promptGuardClip = fakeElement(promptContainer, "hmb-dashboard-clip");
 const promptGuardDashboard = fakeElement(promptGuardClip, "hmb-dashboard");
 const promptImageCard = fakeElement(promptGuardDashboard, "group-card image-card");
 const promptVideoBackground = fakeElement(promptGuardDashboard, "source-scrollbox video-background");
+const promptManagerViewport = fakeElement(promptGuardDashboard, "center");
 for (const element of [promptContainer, promptGuardClip, promptGuardDashboard]) {
   element.classList.add("nodrag", "nopan", "nowheel");
 }
 promptImageCard.classList.add("nodrag", "nopan", "nowheel");
-promptContainer.contains = (element) => element === textInput || element === nextTextInput;
+promptContainer.contains = (element) => [textInput, nextTextInput, promptManagerViewport].includes(element);
 promptContainer.querySelector = (selector) => {
   if (selector === ".hmb-dashboard-clip") return promptGuardClip;
   if (selector === ".hmb-dashboard") return promptGuardDashboard;
@@ -977,7 +978,14 @@ promptContainer.handler("click")({ ...click, target: { closest: () => null } });
 assert.equal(delegatedClickStops, 0, "Prompt background clicks reach the canvas.");
 promptContainer.handler("click")({ ...click, target: { closest: () => textInput } });
 assert.equal(delegatedClickStops, 1, "Prompt control clicks stay within the widget.");
-assert.equal(promptContainer.handler("wheel"), undefined);
+let managerWheelStops = 0;
+const managerWheel = { target: {closest: () => promptManagerViewport}, stopPropagation() { managerWheelStops++; } };
+promptManagerViewport.clientHeight = promptManagerViewport.scrollHeight = 500;
+promptContainer.handler("wheel")(managerWheel);
+assert.equal(managerWheelStops, 0, "A fully visible manager passes wheel zoom to the canvas.");
+promptManagerViewport.scrollHeight = 700;
+promptContainer.handler("wheel")(managerWheel);
+assert.equal(managerWheelStops, 1, "A resized manager keeps wheel scrolling to reach its lower cards.");
 for (const className of ["nodrag", "nopan", "nowheel"]) {
   assert.equal(
     promptImageCard.classList.contains(className),

@@ -81,7 +81,7 @@ try {
   assert.equal(await page.locator("[data-shot-selector]").count(), 0);
   assert.equal(await page.locator(".center").count(), 1);
   assert.equal(await page.locator(".group-card").count(), 5);
-  assert.equal(await page.locator(".center.nowheel").count(), 1, "The bounded body keeps native scrolling instead of canvas zoom.");
+  assert.equal(await page.locator(".center.nowheel").count(), 0, "Wheel zoom is blocked by the manager only while its body overflows.");
   assert.deepEqual(await page.locator(".prompt-shot-row b").allTextContents(), shots.map((shot) => shot.name));
   const textKey = await page.locator("[data-text-key]").first().getAttribute("data-text-key");
   const controlCount = await page.locator("textarea, input, select").count();
@@ -294,7 +294,8 @@ try {
       previousShell.replaceWith(shell);
       shell.style.minWidth='0px';shell.style.minHeight='0px';shell.style.width=storedWidth+'px';shell.style.height=storedHeight+'px';
       document.querySelector('#zoom').style.transform='scale('+scale+')';
-      const raw=structuredClone(window.latest);raw.multi_shot_enabled=manager;
+      const raw=storedHeight>0 ? structuredClone(window.latest) : window.widget.normalizeState({multi_shot_enabled: true});
+      raw.multi_shot_enabled=manager;
       const wrapper=document.querySelector('#legacy-parameter');wrapper.style.height='1193px';wrapper.style.minHeight='1193px';wrapper.style.maxHeight='1193px';
       if(!manager){raw.ui.group_heights={imageSources:1700,imageText:900,videoSources:800,videoText:700};}
       const before=window.changes;window.start(raw);
@@ -309,6 +310,16 @@ try {
         dashboardWithinWrapper:dashboard.bottom<=wrapper.getBoundingClientRect().bottom+1,
         storedGroupsPreserved:JSON.stringify(window.latest.ui.group_heights)===JSON.stringify(raw.ui.group_heights),
         publications:window.changes-before};
+      if (!storedHeight) {
+        result.initialSourceOverflow = ['videoSources','soundSources'].map(key => {
+          const body = document.querySelector(`[data-group-id="${key}"] .group-body`);
+          return body.scrollHeight - body.clientHeight;
+        });
+        let wheelReachedCanvas = false;
+        shell.addEventListener('wheel', () => { wheelReachedCanvas = true; }, {once:true});
+        center.dispatchEvent(new WheelEvent('wheel', {deltaY: 120, bubbles:true}));
+        result.wheelReachedCanvas = wheelReachedCanvas;
+      }
       if(!manager){
         const hydrated=structuredClone(window.latest);hydrated.multi_shot_enabled=true;window.latest=hydrated;
         window.controller.update(window.props(hydrated));
@@ -322,10 +333,10 @@ try {
       }
       window.controller.cleanup();return result;
     },{storedWidth,storedHeight,scale,manager});
-    const expectedWidth=storedWidth>0?storedWidth:1490,expectedHeight=storedHeight>0?storedHeight:1480;
+    const expectedWidth=storedWidth>0?storedWidth:1490,expectedHeight=storedHeight>0?storedHeight:1544;
     assert.equal(initialSize.width,expectedWidth);assert.equal(initialSize.height,expectedHeight);
     if(manager)assert.equal(initialSize.minimum,240);
-    else assert.equal(initialSize.minimum,Math.min(expectedHeight,1269));
+    else assert.equal(initialSize.minimum,Math.min(expectedHeight,1273));
     assert.equal(initialSize.cssWidth,expectedWidth);assert.equal(initialSize.cssHeight,expectedHeight);
     assert.ok(Math.abs(initialSize.visualWidth-expectedWidth*scale)<1,JSON.stringify(initialSize));
     assert.ok(Math.abs(initialSize.visualHeight-expectedHeight*scale)<1,JSON.stringify(initialSize));
@@ -334,6 +345,10 @@ try {
     assert.equal(initialSize.wrapperWithinNode,true);assert.equal(initialSize.dashboardWithinWrapper,true,'An old SDK widget-height wrapper cannot clip the final editor.');
     assert.equal(initialSize.storedGroupsPreserved,true,'Large stored group heights remain authored state and scroll internally.');
     assert.equal(initialSize.publications,0,'Startup geometry and zoom cause no property/engine publication.');
+    if (!storedHeight) {
+      assert.deepEqual(initialSize.initialSourceOverflow,[0,0],'Fresh video and sound cards show their full initial controls.');
+      assert.equal(initialSize.wheelReachedCanvas,true,'Fresh Prompt background must pass the wheel to the canvas.');
+    }
     if(!manager){
       assert.equal(initialSize.afterHydrationHeight,expectedHeight,'Legacy-to-manager hydration cannot replace saved shell dimensions.');
       assert.deepEqual(initialSize.hydratedUserResize,{width:1120,height:780},'Hydrated legacy nodes retain subsequent user resizing.');
@@ -388,7 +403,7 @@ try {
   assert.equal(await page.locator(".center").count(), 1);
   assert.equal(externalRequests, 0);
   assert.deepEqual(failures, []);
-  console.log("HMB Prompt multi Shot browser: PASS (5 independent touch tabs, 5 editor groups, saved sizes/new 1490×1480px default across zoom, VFX reachable, Korean IME/caret, exact echo callback/disabled/draft/source guards, 25 identical props cause 0 publications/mutations; external requests 0)");
+  console.log("HMB Prompt multi Shot browser: PASS (5 independent touch tabs, 5 editor groups, saved sizes/new 1490×1544px default across zoom, VFX reachable, Korean IME/caret, exact echo callback/disabled/draft/source guards, 25 identical props cause 0 publications/mutations; external requests 0)");
 } finally {
   await browser.close();
   await new Promise((resolve) => server.close(resolve));

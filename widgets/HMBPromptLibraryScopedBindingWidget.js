@@ -17,10 +17,10 @@ const FRAME_RANGE_INTENT_VERSION = 1;
 const MAX_SOURCE_SYNC_REVISION = Number.MAX_SAFE_INTEGER;
 const UI_EDIT_REVISION_KEY = "ui_edit_revision";
 const DEFAULT_ACTOR_COLOR_PICK_CHOICES = Object.freeze([
-  "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink", "Cyan",
+  "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink", "Cyan", "Teal", "Brown",
 ]);
 const DEFAULT_OBJECT_COLOR_PICK_CHOICES = Object.freeze([
-  "Sky Blue", "Mint", "Beige", "Lavender",
+  "Sky Blue", "Mint", "Beige", "Lavender", "Olive",
   "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern",
 ]);
 let ACTOR_COLOR_PICK_CHOICES = [...DEFAULT_ACTOR_COLOR_PICK_CHOICES];
@@ -35,8 +35,8 @@ const HMB_LEGACY_IMAGE_SOURCES_DEFAULT_HEIGHT = 542;
 const HMB_GROUP_START_HEIGHTS = Object.freeze({
   imageSources: 490,
   imageText: 210,
-  videoSources: 150,
-  soundSources: 150,
+  videoSources: 180,
+  soundSources: 180,
   videoText: 190,
 });
 const HMB_GROUP_MIN_HEIGHTS = Object.freeze({
@@ -48,7 +48,7 @@ const HMB_GROUP_MIN_HEIGHTS = Object.freeze({
   videoText: 150,
 });
 const HMB_GROUP_DEFAULT_HEIGHTS = HMB_GROUP_START_HEIGHTS;
-const HMB_START_LAYOUT_CHROME_HEIGHT = 129;
+const HMB_START_LAYOUT_CHROME_HEIGHT = 133;
 // Native compatibility/dependency ports are hidden one-pixel host rows.
 const HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT = 0;
 const HMB_DEFAULT_NODE_HEIGHT =
@@ -540,10 +540,13 @@ const HMB_OPTION_KO = {
   "Orange": "주황",
   "Pink": "분홍",
   "Cyan": "시안",
+  "Teal": "틸",
+  "Brown": "브라운",
   "Sky Blue": "하늘색",
   "Mint": "민트",
   "Beige": "베이지",
   "Lavender": "라벤더",
+  "Olive": "올리브",
   "Direction Checker": "방향 체커",
   "Sky Grid": "하늘 그리드",
   "Floor Grid": "바닥 그리드",
@@ -4008,9 +4011,6 @@ export function hmbInstallPromptInteractionIsolation(container, listeners, insta
   // node itself. Node selection and resize activation belong to the native
   // purple title bar only.
   canvasPanRoots.forEach((element) => element.classList?.remove("nopan", "nowheel"));
-  // The manager's four groups share one bounded native scroll viewport.
-  // Keep wheel input there while leaving middle-button canvas pan available.
-  container.querySelector?.('[data-prompt-manager="true"] .center')?.classList?.add("nowheel");
   const interactionSelector = [
     "input",
     "textarea",
@@ -4038,6 +4038,16 @@ export function hmbInstallPromptInteractionIsolation(container, listeners, insta
   container.querySelectorAll(interactionSelector).forEach(isolatePointer);
   container.querySelectorAll("textarea,[contenteditable=true],.source-scrollbox").forEach(element => element.classList?.add("nowheel"));
   if (!installGlobal) return;
+  // A resized manager may need its outer viewport to reach the lower cards.
+  // At its normal size the same background should send wheel events to the canvas.
+  const stopOverflowingManagerWheel = (event) => {
+    const viewport = event.target?.closest?.('[data-prompt-manager="true"] .center');
+    if (viewport && container.contains(viewport) && viewport.scrollHeight > viewport.clientHeight + 1) {
+      event.stopPropagation();
+    }
+  };
+  container.addEventListener("wheel", stopOverflowingManagerWheel, { passive: true });
+  listeners.push([container, "wheel", stopOverflowingManagerWheel]);
   // A control's own handler and native browser behavior run before the event
   // reaches the widget boundary. One guard per event keeps it off the canvas
   // without installing and wrapping listeners on every heavy source row.
@@ -6682,7 +6692,7 @@ function render(state, includeStyle = true) {
   const hVideoText = groupHeightStyle(state, "videoText");
   const editorMarkup = `<div class="layout nodrag"${state.manual_rebind?.required ? ' inert aria-disabled="true"' : ""}>
       <main class="center">
-        <section class="group-card image-card" data-group-id="imageSources" ${hImageSources}><h3>${escapeHtml(uiText(state, "image_source_binding", "IMAGE SOURCE BINDING"))} <b>${state.status.active_images} / ${state.status.max_images}</b></h3><div class="group-body source-scrollbox" data-scroll-id="imageSources"><div class="source-header image-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "target", "TARGET"))}</span><span class="image-video-surface-columns"><span>${escapeHtml(uiText(state, "video_color_pick", "VIDEO / COLOR PICK"))}</span><span class="image-surface-heading">${escapeHtml(uiText(state, "surface_2d", "2DSurface"))}</span></span><span></span></div>${images.map((item, idx) => renderImageRow(item, idx, images, state, renderTargetOptions, deferredTargets)).join("")}${renderImageAddRow(images, state)}</div><div class="group-resize-bar nodrag" data-resize-group="imageSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
+        <section class="group-card image-card" data-group-id="imageSources" ${hImageSources}><h3>${escapeHtml(uiText(state, "image_source_binding", "IMAGE SOURCE BINDING"))} <b>${state.status.active_images} / ${state.status.max_images}</b></h3><div class="group-body source-scrollbox" data-scroll-id="imageSources" data-hmb-scroll-viewport ${state.shot?.shot_uuid ? `data-hmb-wheel-key="${escapeHtml(JSON.stringify(["prompt-images", state.shot.channel_uuid, state.shot.shot_uuid]))}"` : ""}><div class="source-header image-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "target", "TARGET"))}</span><span class="image-video-surface-columns"><span>${escapeHtml(uiText(state, "video_color_pick", "VIDEO / COLOR PICK"))}</span><span class="image-surface-heading">${escapeHtml(uiText(state, "surface_2d", "2DSurface"))}</span></span><span></span></div>${images.map((item, idx) => renderImageRow(item, idx, images, state, renderTargetOptions, deferredTargets)).join("")}${renderImageAddRow(images, state)}</div><div class="group-resize-bar nodrag" data-resize-group="imageSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card imgtext" data-group-id="imageText" ${hImageText}><h3>${escapeHtml(uiText(state, "image_text_context", "SHOT TEXT DIRECTION / EXACT LITERALS"))} <b>${escapeHtml(uiText(state, "scene_level_notes", "scene-level notes"))}</b></h3><div class="group-body"><div class="text-grid">${groupBFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="imageText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card video-card" data-group-id="videoSources" ${hVideoSources}><h3>${escapeHtml(uiText(state, "video_source_binding", "VIDEO SOURCE BINDING"))} <b>${state.status.active_videos} / ${state.status.max_videos}</b></h3><div class="group-body source-scrollbox" data-scroll-id="videoSources"><div class="source-header video-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "keep_out", "KEEP OUT"))}</span><span></span></div>${videos.map((item, idx) => renderVideoRow(item, idx, images, state)).join("")}${renderVideoAddRow(videos, state)}</div><div class="group-resize-bar nodrag" data-resize-group="videoSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card sound-card" data-group-id="soundSources" ${hSoundSources}><h3>${escapeHtml(uiLanguage(state) === "ko" ? "사운드 / 발화 / 립싱크 바인딩" : "SOUND / SPEECH / LIP-SYNC BINDING")} <b>${state.sound_sources?.length || 0} / 64</b></h3><div class="group-body source-scrollbox" data-scroll-id="soundSources">${hmbRenderPromptSoundSources(state)}</div><div class="group-resize-bar nodrag" data-resize-group="soundSources" title="Resize sound binding"></div></section>
@@ -6730,7 +6740,7 @@ function render(state, includeStyle = true) {
       .image-surface-control .image-surface-checkbox:disabled{opacity:.35;cursor:default}
     .hmb-dashboard-clip{width:100%;height:100%;min-width:0;min-height:0;max-width:none;max-height:none;overflow:hidden;background:#050812;box-sizing:border-box;display:flex;flex-direction:column;flex:1 1 auto}
     .hmb-dashboard{--bg:#0b0f19;--panel:#0f172a;--muted:#94a3b8;--line:rgba(148,163,184,.18);--pink:#ec4899;--orange:#f97316;--cyan:#06b6d4;--green:#22c55e;--purple:#a855f7;--safe-x:16px;width:100%;height:100%;min-width:0;min-height:0;max-width:none;max-height:none;padding-left:var(--safe-x);padding-right:var(--safe-x);overflow:hidden;display:flex;flex-direction:column;flex:1 1 auto;background:radial-gradient(circle at 15% 0%,rgba(14,165,233,.16),transparent 34%),linear-gradient(180deg,#0b1120,#050812);color:#e2e8f0;font-family:"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif;border:1px solid rgba(148,163,184,.2);border-radius:11px;box-shadow:0 0 34px rgba(14,165,233,.12);box-sizing:border-box;resize:none;container-type:inline-size}
-    .hmb-dashboard *{box-sizing:border-box;min-width:0}.topbar{height:58px;flex:0 0 58px;padding:8px 13px;border-bottom:1px solid rgba(148,163,184,.14);background:linear-gradient(90deg,rgba(30,41,59,.92),rgba(15,23,42,.78))}.title{flex:1 1 auto;display:flex;align-items:center;gap:12px;overflow:hidden;color:#f8fafc;font-size:15px;font-weight:850;letter-spacing:.01em;white-space:nowrap;text-overflow:ellipsis}.title>span:last-child{overflow:hidden;text-overflow:ellipsis}.title-mark{flex:0 0 35px;width:35px;height:35px;display:grid;place-items:center;border:1px solid rgba(244,114,182,.5);border-radius:8px;background:linear-gradient(145deg,rgba(190,24,93,.28),rgba(88,28,135,.22));color:#f9a8d4;font-size:10px;font-weight:950;letter-spacing:.04em;box-shadow:inset 0 0 0 1px rgba(255,255,255,.035),0 0 10px rgba(168,85,247,.13)}.topbar{display:flex;align-items:center;gap:12px}.prompt-publish-status{flex:0 1 230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--hmb-status-error);font-size:9px;font-weight:800;text-align:right}.prompt-publish-status:empty{display:none}.language-select{width:auto;min-width:92px;height:28px;border-radius:7px;border:1px solid rgba(148,163,184,.28);background:#090d16;color:#e2e8f0;padding:3px 7px;font-size:11px;outline:none}.language-select:focus{border-color:rgba(34,211,238,.75)}.layout{display:grid;grid-template-columns:minmax(0,1fr);gap:0;flex:1 1 auto;min-height:0;height:100%;overflow:hidden;padding:8px}.center{min-height:0;border:1px solid var(--line);border-radius:10px;background:linear-gradient(180deg,rgba(15,23,42,.74),rgba(2,6,23,.72));padding:8px;overflow:hidden;scrollbar-gutter:auto;display:flex;flex-direction:column;gap:7px;align-content:stretch}.group-card{margin:0;border:1px solid var(--line);border-radius:10px;background:rgba(2,6,23,.54);overflow:hidden;display:flex;flex-direction:column;min-height:0;max-height:none;flex:0 0 auto}.group-card h3{margin:0;padding:8px 12px;font-size:12px;letter-spacing:.04em;border-bottom:1px solid rgba(148,163,184,.14);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 0 auto}.group-card h3 b{font-size:10px;color:#94a3b8;font-weight:600}.group-body{flex:1 1 auto;min-height:0;overflow:hidden}.source-scrollbox{overflow:auto;scrollbar-gutter:stable;overscroll-behavior:contain}.source-scrollbox .source-header{position:sticky;top:0;z-index:5;background:linear-gradient(180deg,rgba(8,13,26,.98),rgba(8,13,26,.94));backdrop-filter:blur(2px)}.source-scrollbox .source-row:last-child{border-bottom:1px solid rgba(148,163,184,.1)}.group-resize-bar{flex:0 0 10px;min-height:10px;border-top:1px solid rgba(148,163,184,.16);background:linear-gradient(90deg,transparent,rgba(148,163,184,.18),transparent);cursor:ns-resize;touch-action:none;user-select:none;position:relative}.group-resize-bar::before{content:"";position:absolute;left:50%;top:3px;width:38px;height:3px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.52)}.group-resize-bar:hover::before{background:#67e8f9}.keep-out-resize-shell{display:flex;flex-direction:column;width:100%;min-height:0}.keep-out-field .source-note-input{height:34px;min-height:34px;max-height:34px;resize:none;border-radius:7px 7px 0 0}.keep-out-resize-bar{height:9px;min-height:9px;border:1px solid rgba(148,163,184,.24);border-top:0;border-radius:0 0 7px 7px;background:linear-gradient(90deg,transparent,rgba(148,163,184,.18),transparent);cursor:ns-resize;touch-action:none;user-select:none;position:relative}.keep-out-resize-bar::before{content:"";position:absolute;left:50%;top:3px;width:28px;height:2px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.52)}.keep-out-resize-bar:hover::before{background:#67e8f9}.image-card{border-color:rgba(236,72,153,.58)}.image-card h3{color:#fb7185}.imgtext{border-color:rgba(168,85,247,.55)}.imgtext h3{color:#c084fc}.video-card{border-color:rgba(249,115,22,.7)}.video-card h3{color:#fb923c}.vtext{border-color:rgba(59,130,246,.55)}.vtext h3{color:#60a5fa}.source-header,.source-row{display:grid;gap:8px;align-items:start}.image-header,.source-row.image{grid-template-columns:2.75rem minmax(0,.78fr) minmax(0,.95fr) minmax(0,.82fr) minmax(0,.82fr) minmax(0,.92fr) 3.6rem}.video-header,.source-row.video{grid-template-columns:2.75rem minmax(0,.84fr) minmax(0,.95fr) minmax(0,.95fr) minmax(0,1.36fr) 3rem}.source-header{min-height:22px;padding:5px 10px;color:#b6c5d2;font-size:10px;font-weight:800;border-bottom:1px solid rgba(148,163,184,.11)}.source-header span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-row{padding:6px 10px;border-bottom:1px solid rgba(148,163,184,.1)}.source-row:last-child{border-bottom:none}.source-num{font-weight:800;color:#f8fafc;font-size:11px;line-height:1.3;overflow:hidden;text-overflow:ellipsis}.source-num b{font-size:9px;color:#94a3b8}.source-label,.source-role,.text-field{min-width:0}.source-label input,.source-label textarea,.source-select,.source-target-input,.text-field textarea,.text-field input{width:100%;min-width:0;border-radius:7px;border:1px solid rgba(148,163,184,.24);background:#090d16;color:#e2e8f0;padding:8px;font-size:11px;outline:none}.source-label input,.source-label textarea,.text-field textarea,.text-field input,.custom-inline-input,.custom-fields-panel input{caret-color:#67e8f9}.source-label input::selection,.source-label textarea::selection,.text-field textarea::selection,.text-field input::selection,.custom-inline-input::selection,.custom-fields-panel input::selection{background:rgba(34,211,238,.34);color:#f8fafc}.source-label input:focus,.source-label textarea:focus,.source-select:focus,.source-target-input:focus,.text-field textarea:focus,.text-field input:focus{border-color:#22d3ee;box-shadow:0 0 0 1px rgba(34,211,238,.38),inset 0 0 0 1px rgba(34,211,238,.08);background:#07111b}.source-label small,.source-role small{display:block;margin-top:5px;color:#94a3b8;font-size:9px;line-height:1.25;overflow:hidden;text-overflow:ellipsis}.source-label textarea{resize:none;min-height:34px;line-height:1.35}.source-note-input{height:34px;min-height:34px;max-height:34px;resize:none}.source-status{display:flex;gap:6px;align-items:center;justify-content:flex-end}.source-actions{display:flex;gap:4px;align-items:center;justify-content:flex-end}.source-actions.image-actions{display:grid;grid-template-columns:24px 24px;grid-template-rows:28px 28px;gap:4px;align-items:center;justify-content:flex-end}.image-order-controls{display:grid;width:24px;height:28px;grid-template-rows:1fr 1fr;gap:2px}.source-actions.image-actions .image-order-controls button{width:24px;height:13px;min-height:0;padding:0;border-radius:5px;font-size:8px;line-height:1}.binding-scope-stack,.color-pick-stack{display:flex;flex-direction:column;gap:4px}.binding-scope-entry,.color-binding-entry{display:flex;flex-direction:column;gap:4px}.color-binding-entry{display:block}.binding-scope-cell select,.color-pick-cell select{height:30px;padding:5px 6px}.video-color-pick-wrap{display:grid;grid-template-columns:2rem minmax(0,1fr);gap:4px;align-items:start}.video-color-pick-wrap .image-video-index{height:30px;padding:0 2px;text-align:center;text-align-last:center;font-weight:800}.video-color-pick-wrap .image-video-index:disabled{opacity:.55;cursor:not-allowed}.binding-video-index{padding:0 2px!important;text-align:center;text-align-last:center;font-weight:800}.custom-inline-input,.custom-fields-panel input{width:100%;border-radius:7px;border:1px solid rgba(34,211,238,.28);background:#07111b;color:#dbeafe;padding:7px;font-size:10px;outline:none}.custom-inline-input:focus,.custom-fields-panel input:focus{border-color:#22d3ee}.custom-fields-panel{grid-column:2 / 7;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:6px 8px;border:1px solid rgba(34,211,238,.22);border-radius:8px;background:rgba(8,47,73,.12)}.custom-fields-panel label{display:flex;flex-direction:column;gap:4px}.custom-fields-panel span{font-size:9px;font-weight:800;color:#67e8f9}.video-custom-panel{grid-column:2 / 6}.source-row.image-add-row,.source-row.video-add-row{border-bottom:1px solid rgba(148,163,184,.1);padding-top:6px;padding-bottom:6px}.source-actions button{flex:0 0 24px;width:24px;height:28px;border-radius:7px;border:1px solid rgba(148,163,184,.22);background:#0b1220;color:#94a3b8;cursor:pointer;font-weight:800;line-height:1}.source-actions button:hover{border-color:#67e8f9;color:#67e8f9}.source-actions button.clear-source:hover{border-color:#fb7185;color:#fb7185}.source-actions button:disabled{opacity:.35;cursor:not-allowed}.clear-source{}.add-note{margin:10px;border:1px dashed rgba(148,163,184,.25);border-radius:8px;padding:9px;text-align:center;color:#94a3b8;font-size:11px}.notes{margin:0 10px 10px;color:#cbd5e1;font-size:10px;line-height:1.45}.text-grid{display:grid;grid-template-columns:1fr;align-items:stretch;align-content:stretch;gap:7px;padding:7px;height:100%;min-height:0}.imgtext .text-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.vtext .text-grid{grid-template-columns:1fr}.imgtext .group-body,.vtext .group-body{overflow:hidden;min-height:0}.text-field{display:flex;flex-direction:column;min-width:0;min-height:0}.text-field span{display:block;font-size:10px;color:#cbd5e1;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.text-field textarea{resize:none;display:block;flex:1 1 auto;height:100%;min-height:0;max-height:none}.warning{margin:10px 0 0;padding:8px;border:1px solid rgba(249,115,22,.35);border-radius:8px;color:#fed7aa;background:rgba(124,45,18,.16);font-size:10px;line-height:1.4}
+    .hmb-dashboard *{box-sizing:border-box;min-width:0}.topbar{height:58px;flex:0 0 58px;padding:8px 13px;border-bottom:1px solid rgba(148,163,184,.14);background:linear-gradient(90deg,rgba(30,41,59,.92),rgba(15,23,42,.78))}.title{flex:1 1 auto;display:flex;align-items:center;gap:12px;overflow:hidden;color:#f8fafc;font-size:15px;font-weight:850;letter-spacing:.01em;white-space:nowrap;text-overflow:ellipsis}.title>span:last-child{overflow:hidden;text-overflow:ellipsis}.title-mark{flex:0 0 35px;width:35px;height:35px;display:grid;place-items:center;border:1px solid rgba(244,114,182,.5);border-radius:8px;background:linear-gradient(145deg,rgba(190,24,93,.28),rgba(88,28,135,.22));color:#f9a8d4;font-size:10px;font-weight:950;letter-spacing:.04em;box-shadow:inset 0 0 0 1px rgba(255,255,255,.035),0 0 10px rgba(168,85,247,.13)}.topbar{display:flex;align-items:center;gap:12px}.prompt-publish-status{flex:0 1 230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--hmb-status-error);font-size:9px;font-weight:800;text-align:right}.prompt-publish-status:empty{display:none}.language-select{width:auto;min-width:92px;height:28px;border-radius:7px;border:1px solid rgba(148,163,184,.28);background:#090d16;color:#e2e8f0;padding:3px 7px;font-size:11px;outline:none}.language-select:focus{border-color:rgba(34,211,238,.75)}.layout{display:grid;grid-template-columns:minmax(0,1fr);gap:0;flex:1 1 auto;min-height:0;height:100%;overflow:hidden;padding:8px}.center{min-height:0;border:1px solid var(--line);border-radius:10px;background:linear-gradient(180deg,rgba(15,23,42,.74),rgba(2,6,23,.72));padding:8px;overflow:hidden;scrollbar-gutter:auto;display:flex;flex-direction:column;gap:8px;align-content:stretch}.group-card{margin:0;border:1px solid var(--line);border-radius:10px;background:rgba(2,6,23,.54);overflow:hidden;display:flex;flex-direction:column;min-height:0;max-height:none;flex:0 0 auto}.group-card h3{margin:0;padding:8px 12px;font-size:12px;letter-spacing:.04em;border-bottom:1px solid rgba(148,163,184,.14);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 0 auto}.group-card h3 b{font-size:10px;color:#94a3b8;font-weight:600}.group-body{flex:1 1 auto;min-height:0;overflow:hidden}.source-scrollbox{overflow:auto;scrollbar-gutter:stable;overscroll-behavior:contain}.source-scrollbox .source-header{position:sticky;top:0;z-index:5;background:linear-gradient(180deg,rgba(8,13,26,.98),rgba(8,13,26,.94));backdrop-filter:blur(2px)}.source-scrollbox .source-row:last-child{border-bottom:1px solid rgba(148,163,184,.1)}.group-resize-bar{flex:0 0 10px;min-height:10px;border-top:1px solid rgba(148,163,184,.16);background:linear-gradient(90deg,transparent,rgba(148,163,184,.18),transparent);cursor:ns-resize;touch-action:none;user-select:none;position:relative}.group-resize-bar::before{content:"";position:absolute;left:50%;top:3px;width:38px;height:3px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.52)}.group-resize-bar:hover::before{background:#67e8f9}.keep-out-resize-shell{display:flex;flex-direction:column;width:100%;min-height:0}.keep-out-field .source-note-input{height:34px;min-height:34px;max-height:34px;resize:none;border-radius:7px 7px 0 0}.keep-out-resize-bar{height:9px;min-height:9px;border:1px solid rgba(148,163,184,.24);border-top:0;border-radius:0 0 7px 7px;background:linear-gradient(90deg,transparent,rgba(148,163,184,.18),transparent);cursor:ns-resize;touch-action:none;user-select:none;position:relative}.keep-out-resize-bar::before{content:"";position:absolute;left:50%;top:3px;width:28px;height:2px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.52)}.keep-out-resize-bar:hover::before{background:#67e8f9}.image-card{border-color:rgba(236,72,153,.58)}.image-card h3{color:#fb7185}.imgtext{border-color:rgba(168,85,247,.55)}.imgtext h3{color:#c084fc}.video-card{border-color:rgba(249,115,22,.7)}.video-card h3{color:#fb923c}.vtext{border-color:rgba(59,130,246,.55)}.vtext h3{color:#60a5fa}.source-header,.source-row{display:grid;gap:8px;align-items:start}.image-header,.source-row.image{grid-template-columns:2.75rem minmax(0,.78fr) minmax(0,.95fr) minmax(0,.82fr) minmax(0,.82fr) minmax(0,.92fr) 3.6rem}.video-header,.source-row.video{grid-template-columns:2.75rem minmax(0,.84fr) minmax(0,.95fr) minmax(0,.95fr) minmax(0,1.36fr) 3rem}.source-header{min-height:22px;padding:5px 10px;color:#b6c5d2;font-size:10px;font-weight:800;border-bottom:1px solid rgba(148,163,184,.11)}.source-header span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-row{padding:6px 10px;border-bottom:1px solid rgba(148,163,184,.1)}.source-row:last-child{border-bottom:none}.source-num{font-weight:800;color:#f8fafc;font-size:11px;line-height:1.3;overflow:hidden;text-overflow:ellipsis}.source-num b{font-size:9px;color:#94a3b8}.source-label,.source-role,.text-field{min-width:0}.source-label input,.source-label textarea,.source-select,.source-target-input,.text-field textarea,.text-field input{width:100%;min-width:0;border-radius:7px;border:1px solid rgba(148,163,184,.24);background:#090d16;color:#e2e8f0;padding:8px;font-size:11px;outline:none}.source-label input,.source-label textarea,.text-field textarea,.text-field input,.custom-inline-input,.custom-fields-panel input{caret-color:#67e8f9}.source-label input::selection,.source-label textarea::selection,.text-field textarea::selection,.text-field input::selection,.custom-inline-input::selection,.custom-fields-panel input::selection{background:rgba(34,211,238,.34);color:#f8fafc}.source-label input:focus,.source-label textarea:focus,.source-select:focus,.source-target-input:focus,.text-field textarea:focus,.text-field input:focus{border-color:#22d3ee;box-shadow:0 0 0 1px rgba(34,211,238,.38),inset 0 0 0 1px rgba(34,211,238,.08);background:#07111b}.source-label small,.source-role small{display:block;margin-top:5px;color:#94a3b8;font-size:9px;line-height:1.25;overflow:hidden;text-overflow:ellipsis}.source-label textarea{resize:none;min-height:34px;line-height:1.35}.source-note-input{height:34px;min-height:34px;max-height:34px;resize:none}.source-status{display:flex;gap:6px;align-items:center;justify-content:flex-end}.source-actions{display:flex;gap:4px;align-items:center;justify-content:flex-end}.source-actions.image-actions{display:grid;grid-template-columns:24px 24px;grid-template-rows:28px 28px;gap:4px;align-items:center;justify-content:flex-end}.image-order-controls{display:grid;width:24px;height:28px;grid-template-rows:1fr 1fr;gap:2px}.source-actions.image-actions .image-order-controls button{width:24px;height:13px;min-height:0;padding:0;border-radius:5px;font-size:8px;line-height:1}.binding-scope-stack,.color-pick-stack{display:flex;flex-direction:column;gap:4px}.binding-scope-entry,.color-binding-entry{display:flex;flex-direction:column;gap:4px}.color-binding-entry{display:block}.binding-scope-cell select,.color-pick-cell select{height:30px;padding:5px 6px}.video-color-pick-wrap{display:grid;grid-template-columns:2rem minmax(0,1fr);gap:4px;align-items:start}.video-color-pick-wrap .image-video-index{height:30px;padding:0 2px;text-align:center;text-align-last:center;font-weight:800}.video-color-pick-wrap .image-video-index:disabled{opacity:.55;cursor:not-allowed}.binding-video-index{padding:0 2px!important;text-align:center;text-align-last:center;font-weight:800}.custom-inline-input,.custom-fields-panel input{width:100%;border-radius:7px;border:1px solid rgba(34,211,238,.28);background:#07111b;color:#dbeafe;padding:7px;font-size:10px;outline:none}.custom-inline-input:focus,.custom-fields-panel input:focus{border-color:#22d3ee}.custom-fields-panel{grid-column:2 / 7;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:6px 8px;border:1px solid rgba(34,211,238,.22);border-radius:8px;background:rgba(8,47,73,.12)}.custom-fields-panel label{display:flex;flex-direction:column;gap:4px}.custom-fields-panel span{font-size:9px;font-weight:800;color:#67e8f9}.video-custom-panel{grid-column:2 / 6}.source-row.image-add-row,.source-row.video-add-row{border-bottom:1px solid rgba(148,163,184,.1);padding-top:6px;padding-bottom:6px}.source-actions button{flex:0 0 24px;width:24px;height:28px;border-radius:7px;border:1px solid rgba(148,163,184,.22);background:#0b1220;color:#94a3b8;cursor:pointer;font-weight:800;line-height:1}.source-actions button:hover{border-color:#67e8f9;color:#67e8f9}.source-actions button.clear-source:hover{border-color:#fb7185;color:#fb7185}.source-actions button:disabled{opacity:.35;cursor:not-allowed}.clear-source{}.add-note{margin:10px;border:1px dashed rgba(148,163,184,.25);border-radius:8px;padding:9px;text-align:center;color:#94a3b8;font-size:11px}.notes{margin:0 10px 10px;color:#cbd5e1;font-size:10px;line-height:1.45}.text-grid{display:grid;grid-template-columns:1fr;align-items:stretch;align-content:stretch;gap:7px;padding:7px;height:100%;min-height:0}.imgtext .text-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.vtext .text-grid{grid-template-columns:1fr}.imgtext .group-body,.vtext .group-body{overflow:hidden;min-height:0}.text-field{display:flex;flex-direction:column;min-width:0;min-height:0}.text-field span{display:block;font-size:10px;color:#cbd5e1;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.text-field textarea{resize:none;display:block;flex:1 1 auto;height:100%;min-height:0;max-height:none}.warning{margin:10px 0 0;padding:8px;border:1px solid rgba(249,115,22,.35);border-radius:8px;color:#fed7aa;background:rgba(124,45,18,.16);font-size:10px;line-height:1.4}
     .video-color-pick-wrap{display:block}.color-binding-entry{display:grid;grid-template-columns:2rem minmax(0,1fr);gap:4px;align-items:start}
     .topbar-controls .language-button{min-width:58px;height:28px;padding:0 11px;border:1px solid rgba(148,163,184,.24);border-radius:8px;background:#090d16;color:#e2e8f0;font-size:11px;font-weight:800;cursor:pointer}.topbar-controls .language-button:hover,.topbar-controls .language-button:focus-visible{border-color:var(--hmb-shot-accent);color:var(--hmb-shot-soft);outline:none;box-shadow:0 0 0 1px var(--hmb-shot-accent),0 0 12px var(--hmb-shot-glow)}.shot-selector-shell{flex:0 1 290px;width:290px;max-width:290px;height:30px;display:flex;align-items:center;gap:6px;padding:3px 7px;border:1px solid var(--hmb-shot-line);border-radius:8px;background:linear-gradient(180deg,rgba(var(--hmb-shot-rgb),.24),rgba(15,23,42,.88));box-shadow:0 0 12px var(--hmb-shot-glow)}.shot-selector-shell>span,.shot-selector-shell>i{flex:0 0 auto;color:var(--hmb-shot-soft);font-size:8px;font-style:normal;font-weight:900;letter-spacing:.08em}.shot-selector-shell>i{color:var(--hmb-shot-accent)}.shot-selector{flex:1 1 auto;width:100%;height:22px;padding:0 7px;border:0;border-radius:5px;background:#07101f;color:#dbeafe;font-size:10px;font-weight:800;outline:none}.shot-selector:focus-visible{box-shadow:0 0 0 1px var(--hmb-shot-accent),0 0 10px var(--hmb-shot-glow)}.shot-selector:disabled{opacity:.72}
     .source-row{transition:none}
@@ -6743,7 +6753,7 @@ function render(state, includeStyle = true) {
     .source-row.image-row-dragging{opacity:.42}
     .source-row.image-drop-before{box-shadow:inset 0 3px 0 #67e8f9}
     .source-row.image-drop-after{box-shadow:inset 0 -3px 0 #67e8f9}
-    @container (max-width: 1250px){.layout{grid-template-columns:minmax(0,1fr);gap:0;padding:7px}.center{padding:7px;gap:6px}.image-header,.source-row.image{grid-template-columns:2.5rem minmax(0,.7fr) minmax(0,.9fr) minmax(0,.75fr) minmax(0,.75fr) minmax(0,.84fr) 3.6rem}.video-header,.source-row.video{grid-template-columns:2.5rem minmax(0,.76fr) minmax(0,.9fr) minmax(0,.9fr) minmax(0,1.25fr) 3rem}.source-label textarea{min-height:34px}.source-note-input{height:34px;min-height:34px;max-height:34px}}
+    @container (max-width: 1250px){.layout{grid-template-columns:minmax(0,1fr);gap:0;padding:7px}.center{padding:7px;gap:7px}.image-header,.source-row.image{grid-template-columns:2.5rem minmax(0,.7fr) minmax(0,.9fr) minmax(0,.75fr) minmax(0,.75fr) minmax(0,.84fr) 3.6rem}.video-header,.source-row.video{grid-template-columns:2.5rem minmax(0,.76fr) minmax(0,.9fr) minmax(0,.9fr) minmax(0,1.25fr) 3rem}.source-label textarea{min-height:34px}.source-note-input{height:34px;min-height:34px;max-height:34px}}
     @container (max-width: 930px){.hmb-dashboard{--safe-x:12px}.topbar{height:58px;flex-basis:58px;padding:8px 12px}.title{font-size:17px}.layout{grid-template-columns:minmax(0,1fr);gap:0;padding:8px}.source-header{display:none}.source-row.image,.source-row.video{grid-template-columns:2.4rem minmax(0,1fr) minmax(0,1fr);gap:7px}.source-row.image .source-textarea,.source-row.video .source-textarea{grid-column:span 3}.source-status{grid-column:span 3}.custom-fields-panel,.imgtext .text-grid,.vtext .text-grid{grid-template-columns:1fr}.group-card h3{white-space:normal}.notes{display:none}}
     @container (max-width: 620px){.hmb-dashboard{--safe-x:6px}.source-row.image,.source-row.video{grid-template-columns:1fr}.source-num,.source-row.image .source-textarea,.source-row.video .source-textarea,.source-status{display:flex;grid-column:1}.custom-fields-panel{display:grid;grid-column:1}.source-actions button{flex-basis:30px}.source-label small,.source-role small,.add-note,.warning{display:block}.group-card h3{font-size:11px}.source-row{padding:7px}.text-grid{padding:7px}}
     @container (max-width: 1250px){.frame-binding-row{grid-template-columns:3.4rem minmax(0,.7fr) minmax(0,.9fr) minmax(0,.75fr) minmax(0,.75fr) minmax(0,.84fr) 3.6rem}.frame-track-shell{grid-template-columns:3rem minmax(0,1fr) 3rem}}
@@ -9826,7 +9836,7 @@ function hmbNativeUiReadCommand(value, kind) {
   if (kind === "lut") return (v.__hmb_color_lut_command__ || v).action === "cancel";
   const command = v.__hmb_picker_command__ || v;
   return ["picker", "picker-bridge"].includes(kind) && command.schema === "hmb-picker-command"
-    && (["stop_read", "cancel_pending", "cancel_video_import"].includes(command.action)
+    && (["stop_read", "cancel_pending", "cancel_generate", "cancel_video_import"].includes(command.action)
       || (command.action === "video_tools" && command.payload?.op === "cancel"));
 }
 // Locked echoes use only primitive/raw-string identity: no state clone/hash.
@@ -10060,27 +10070,273 @@ function hmbAcquireNativeStockSafety(container) {
   return { refresh() { if (owner.active) shared.sync(); }, cleanup() { if (owner.active) shared.release(owner); } };
 }
 
+// Griptape loads each widget as a separate module. One selection per editor
+// document also covers stock parameter fields rendered beside an HMB widget.
+function hmbAcquireCanvasWheel(container) {
+  const node = container?.matches?.(".widget-container") && container.closest?.(".react-flow__node");
+  const doc = container?.ownerDocument, win = doc?.defaultView;
+  if (!node?.closest?.(".react-flow") || !win?.WheelEvent) return null;
+  const key = "__HMB_CANVAS_WHEEL_SELECTION_V1__";
+  let router = doc[key];
+  if (!router) {
+    const nodes = new Map();
+    let selected = null;
+    const activeScroll = "data-hmb-active-scroll";
+    const activeSelector = `[${activeScroll}]`;
+    const outlineStyle = doc.createElement("style");
+    outlineStyle.textContent = `.react-flow .react-flow__node.nowheel ${activeSelector} {
+      outline: 2px solid #4dd8ff !important;
+      outline-offset: -2px !important;
+      anchor-name: --hmb-selected-viewport;
+      overscroll-behavior: contain !important;
+    }
+    .react-flow [data-hmb-scroll-frame] {
+      position: absolute !important;
+      position-anchor: --hmb-selected-viewport;
+      top: anchor(top); left: anchor(left);
+      width: anchor-size(width); height: anchor-size(height);
+      box-sizing: border-box; border: 2px solid #4dd8ff;
+      padding: 0; margin: 0; background: transparent;
+      pointer-events: none !important; z-index: 1000;
+    }`;
+    doc.head.appendChild(outlineStyle);
+    // Paint above composited thumbnails and sticky headers, outside the scrolling
+    // content. CSS anchors follow native scroll, resize and React Flow zoom.
+    const frame = doc.createElement("span");
+    frame.setAttribute("data-hmb-scroll-frame", "");
+    frame.setAttribute("aria-hidden", "true");
+    const anchored = win.CSS?.supports("position-anchor", "--hmb-selected-viewport")
+      && win.CSS.supports("width", "anchor-size(width)");
+    const modal = "dialog,[role='dialog'],[aria-modal='true'],[role='menu'],[role='listbox']:not(select),[data-registration-backdrop],[data-refresh-review-backdrop]";
+    const hasScroll = (element, horizontal) => {
+      const room = horizontal ? element.scrollWidth - element.clientWidth : element.scrollHeight - element.clientHeight;
+      if (room <= 1) return false;
+      const style = win.getComputedStyle(element);
+      return /^(auto|scroll|overlay)$/.test(horizontal ? style.overflowX : style.overflowY);
+    };
+    const canScroll = surface => hasScroll(surface, false) || hasScroll(surface, true);
+    const surfaceAt = (target, root) => {
+      const group = target.closest?.("[data-hmb-scroll-viewport]");
+      if (group && root.contains(group)) return group;
+      for (let el = target; el && el !== root; el = el.parentElement) {
+        if (el.matches?.("textarea")) return el;
+        if (el.matches?.("select,input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit])")) return null;
+        if (canScroll(el)) return el;
+      }
+      return null;
+    };
+    const syncOutline = () => {
+      const surface = selected?.surface;
+      if (!surface?.isConnected) return false;
+      const scrollable = canScroll(surface);
+      surface.toggleAttribute(activeScroll, scrollable);
+      if (anchored && scrollable && frame.previousElementSibling !== surface) {
+        frame.style.borderRadius = win.getComputedStyle(surface).borderRadius;
+        surface.after(frame);
+      } else if (!scrollable) {
+        frame.remove();
+      }
+      return scrollable;
+    };
+    const resized = win.ResizeObserver && new win.ResizeObserver(syncOutline);
+    const clearOutline = () => {
+      const {root, surface} = selected;
+      frame.remove();
+      surface.removeAttribute(activeScroll);
+      for (const copy of root.querySelectorAll(activeSelector)) copy.removeAttribute(activeScroll);
+      for (const copy of root.querySelectorAll("[data-hmb-scroll-frame]")) copy.remove();
+    };
+    const restoreViewport = () => {
+      const {root, key} = selected;
+      if (!key || !root.isConnected) return false;
+      const matches = [...root.querySelectorAll("[data-hmb-wheel-key]")].filter(el => el.dataset.hmbWheelKey === key);
+      if (matches.length !== 1) return false;
+      activate(root, matches[0]);
+      return true;
+    };
+    const changed = win.MutationObserver && new win.MutationObserver(records => {
+      if (!selected) return;
+      const {root, surface} = selected;
+      if (!root.contains(surface)) {
+        if (restoreViewport()) return;
+        changed.disconnect();
+        resized?.disconnect();
+        clearOutline();
+        // Give the renderer one turn to attach the replacement. Release the
+        // detached card tree even if there is no subsequent pointer event.
+        const detached = selected;
+        win.setTimeout(() => {
+          if (selected === detached && !restoreViewport()) clear();
+        }, 0);
+        return;
+      }
+      if (selected.key !== surface.dataset.hmbWheelKey) { clear(); return; }
+      // A cloned field inherits attributes, but only the original owns the wheel.
+      for (const record of records) {
+        for (const added of record.addedNodes) {
+          if (added.nodeType !== 1) continue;
+          if (added !== frame && added.hasAttribute("data-hmb-scroll-frame")) {
+            added.remove();
+            continue;
+          }
+          if (added !== surface) added.removeAttribute(activeScroll);
+          for (const copy of added.querySelectorAll(`${activeSelector},[data-hmb-scroll-frame]`)) {
+            if (copy.hasAttribute("data-hmb-scroll-frame")) {
+              if (copy !== frame) copy.remove();
+            } else if (copy !== surface) copy.removeAttribute(activeScroll);
+          }
+        }
+      }
+      if (records.some(record => surface.contains(record.target))
+          || (anchored && surface.hasAttribute(activeScroll) && frame.previousElementSibling !== surface)) syncOutline();
+    });
+    const clear = () => {
+      if (!selected) return;
+      const {surface, root, addedNoWheel, previousOverscroll} = selected;
+      changed?.disconnect();
+      resized?.disconnect();
+      surface.removeEventListener("input", syncOutline, true);
+      surface.removeEventListener("load", syncOutline, true);
+      clearOutline();
+      if (addedNoWheel && root.classList.contains("nowheel")) root.classList.remove("nowheel");
+      if (surface.style.overscrollBehavior === "contain") surface.style.overscrollBehavior = previousOverscroll;
+      selected = null;
+    };
+    const activate = (root, surface) => {
+      if (surface === selected?.surface) return;
+      clear();
+      if (!surface) return;
+      // Some widget renderers use the viewport className as their scroll
+      // restoration key. Put the native wheel filter on the stock node only.
+      selected = {root, surface, key:surface.dataset.hmbWheelKey, addedNoWheel: !root.classList.contains("nowheel"), previousOverscroll: surface.style.overscrollBehavior};
+      if (selected.addedNoWheel) root.classList.add("nowheel");
+      surface.style.overscrollBehavior = "contain";
+      syncOutline();
+      surface.addEventListener("input", syncOutline, true);
+      surface.addEventListener("load", syncOutline, true);
+      resized?.observe(surface);
+      changed?.observe(root, {subtree:true, childList:true});
+      changed?.observe(surface, {subtree:true, childList:true, characterData:true,
+        attributes:true, attributeFilter:[activeScroll,"data-hmb-wheel-key","class","style","hidden","rows"]});
+    };
+    const select = event => {
+      if (event.button !== 0 || event.isPrimary === false) return;
+      const target = event.target, root = target?.closest?.(".react-flow__node");
+      activate(root, nodes.has(root) && !target.closest(modal) ? surfaceAt(target, root) : null);
+    };
+    const actionAt = target => target.closest("button,textarea,[data-asset],[data-asset-key],[data-video-uid],[data-group-path],[data-instance]");
+    const actionKey = element => element && Array.from(element.attributes)
+      .filter(a => a.name !== activeScroll && (a.name === "id" || a.name === "name" || a.name.startsWith("data-")))
+      .map(a => JSON.stringify([a.name,a.value])).sort().join(",");
+    const afterClick = event => {
+      const current = selected;
+      if (event.button !== 0 || !current?.surface.contains(event.target)) return;
+      const action = actionAt(event.target), identity = actionKey(action);
+      if (!identity) return;
+      const shotAt = el => actionKey(el.closest("[data-shot-row],[data-workspace-uuid],[data-shot-uuid]"));
+      const shot = shotAt(action);
+      // A card/folder button can repaint its list on click. Reacquire only
+      // the same action and viewport under this completed pointer gesture.
+      const {clientX, clientY} = event;
+      win.setTimeout(() => {
+        if (selected !== current || current.surface.isConnected) return;
+        const hit = doc.elementFromPoint(clientX, clientY);
+        if (!hit || hit.closest(".react-flow__node") !== current.root || hit.closest(modal)) return;
+        const nextAction = actionAt(hit), next = surfaceAt(hit, current.root);
+        if (next && next.dataset.hmbWheelKey === current.key && next.tagName === current.surface.tagName && next.className === current.surface.className
+            && nextAction?.tagName === action.tagName && actionKey(nextAction) === identity
+            && shotAt(nextAction) === shot) activate(current.root, next);
+      }, 0);
+    };
+    const escape = event => { if (event.key === "Escape") clear(); };
+    const wheel = event => {
+      const target = event.target, root = target?.closest?.(".react-flow__node");
+      if (!nodes.has(root) || event.defaultPrevented || target.closest(modal)) return;
+      if (selected && !selected.root.contains(selected.surface) && !restoreViewport()) clear();
+      if (selected && selected.key !== selected.surface.dataset.hmbWheelKey) clear();
+      if (!event.ctrlKey && !event.metaKey && selected?.root === root && selected.surface.contains(target)) {
+        const surface = selected.surface;
+        if (surfaceAt(target, root) === surface && syncOutline()) {
+          // Keep native scrolling and widget handlers (virtual lists and
+          // horizontal card strips) on the original, trusted event.
+          if (!root.classList.contains("nowheel")) root.classList.add("nowheel");
+          return;
+        }
+      }
+      // Stock parameters can stop wheel at React's capture phase, before
+      // the widget sees it. Deliver one event at the same pointer position
+      // to the native canvas handler, above those parameter-specific guards.
+      event.preventDefault();
+      event.stopPropagation();
+      const canvasLayer = root.closest(".react-flow__nodes") || root.parentElement;
+      canvasLayer.dispatchEvent(new win.WheelEvent("wheel", event));
+    };
+    doc.addEventListener("pointerdown", select, true);
+    doc.addEventListener("click", afterClick, true);
+    doc.addEventListener("keydown", escape, true);
+    doc.addEventListener("wheel", wheel, {capture: true, passive: false});
+    router = {acquire(root) {
+      nodes.set(root, (nodes.get(root) || 0) + 1);
+      return () => {
+        const count = nodes.get(root) - 1;
+        if (count) nodes.set(root, count);
+        else {
+          nodes.delete(root);
+          if (selected?.root === root) clear();
+        }
+        if (nodes.size) return;
+        doc.removeEventListener("pointerdown", select, true);
+        doc.removeEventListener("click", afterClick, true);
+        doc.removeEventListener("keydown", escape, true);
+        doc.removeEventListener("wheel", wheel, true);
+        outlineStyle.remove();
+        delete doc[key];
+      };
+    }};
+    doc[key] = router;
+  }
+  return router.acquire(node);
+}
+
 function hmbNativeStockSafetyContract(container, props, mount) {
   const previous = container?.__hmbNativeStockSafety;
   const lease = previous?.active ? previous.lease : hmbAcquireNativeStockSafety(container);
+  // The stock WidgetLoader adds nowheel to the entire widget host. Leave
+  // wheel ownership to each HMB widget's concrete scroll surfaces instead.
+  const canvasHost = container?.matches?.(".widget-container") && container.closest?.(".react-flow__node") ? container : null;
+  const restoreWheelClass = previous?.active ? previous.restoreWheelClass : canvasHost?.classList.contains("nowheel");
   let handle;
   try { handle = mount(container, props); }
   catch (error) { if (!previous?.active) lease?.cleanup(); throw error; }
   lease?.refresh();
   if (!lease) return handle;
+  const allowCanvasWheel = () => {
+    if (canvasHost?.classList.contains("nowheel")) canvasHost.classList.remove("nowheel");
+  };
+  allowCanvasWheel();
   if (previous?.active && previous.handle === handle) return previous.proxy;
   if (previous) previous.active = false;
-  const state = { active: true, lease, handle, proxy: null };
+  const releaseWheel = previous?.releaseWheel || hmbAcquireCanvasWheel(container);
+  const state = { active: true, lease, handle, restoreWheelClass, releaseWheel, proxy: null };
   state.proxy = {
     update(next) {
       if (!state.active) return;
-      handle?.update?.(next); lease.refresh();
+      handle?.update?.(next);
+      allowCanvasWheel();
+      lease.refresh();
     },
     cleanup() {
       if (!state.active) return;
       state.active = false;
       try { if (typeof handle === "function") handle(); else handle?.cleanup?.(); }
-      finally { lease.cleanup(); if (container.__hmbNativeStockSafety === state) delete container.__hmbNativeStockSafety; }
+      finally {
+        releaseWheel?.();
+        lease.cleanup();
+        if (container.__hmbNativeStockSafety === state) {
+          if (restoreWheelClass) canvasHost?.classList.add("nowheel");
+          delete container.__hmbNativeStockSafety;
+        }
+      }
     },
   };
   container.__hmbNativeStockSafety = state;

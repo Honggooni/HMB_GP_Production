@@ -7,10 +7,13 @@ import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 const playwright=nativeTestPlaywright();
 const root=fileURLToPath(new URL('../..',import.meta.url));
-const names=['HMBAgentLibraryWidget.js','HMBColorLUTLibraryWidget.js','HMBFinishLookLibraryWidget.js','HMBImageAssetLibraryWidget.js','HMBImageBashWidget.js','HMBImageGenerationWidget.js','HMBPromptLibraryScopedBindingWidget.js','HMBSeedanceGenerationWidget.js','HMBVideoPickerLibraryWidget_v032.js','HMBAnalysisAgentWidget.js','HMBSoundLibraryWidget.js'];
+const manifest=JSON.parse(fs.readFileSync(path.join(root,'griptape-nodes-library.json'),'utf8'));
+const hiddenTransports=new Set(['HMBImageAssetThumbnailPatchBridgeWidget','HMBVideoPickerCommandBridgeWidget']);
+const names=manifest.widgets.filter(widget=>!hiddenTransports.has(widget.name)).map(widget=>path.basename(widget.path));
 const sources=names.map(name=>fs.readFileSync(path.join(root,'widgets',name),'utf8'));
 const block=text=>text.slice(text.indexOf('// HMB_NATIVE_STOCK_SAFETY_V1_BEGIN'),text.indexOf('// HMB_NATIVE_STOCK_SAFETY_V1_END')).replace(/\r\n?/g,'\n');
-for(const text of sources){assert.ok(/return hmbNativeStockSafetyContract\(container,\s*props,\s*(?:hmbNativeStockSafetyImplementation|hmbSoundNativeContract)\)/.test(text));assert.equal(block(text),block(sources[0]));}
+assert.ok(names.length>0);
+for(const [index,text] of sources.entries()){assert.ok(text.includes('// HMB_NATIVE_STOCK_SAFETY_V1_BEGIN')&&/return hmbNativeStockSafetyContract\(container,\s*props,\s*(?:hmbNativeStockSafetyImplementation|hmbSoundNativeContract)\)/.test(text),names[index]);assert.equal(block(text),block(sources[0]),names[index]);}
 const source=sources[0]+'\nexport {hmbAcquireNativeStockSafety,hmbNativeStockSafetyContract};';
 const browser=await playwright.chromium.launch({executablePath:process.env.HMB_WIDGET_TEST_BROWSER||'C:/Program Files/Google/Chrome/Application/chrome.exe',headless:true});
 const cases=[],errors=[],report={schema:'hmb-native-stock-deletion-safety/v1',passed:false,cases,paid_calls:0,live_app_calls:0,external_requests:0,source_sha256:names.map((name,i)=>({file:name,sha256:createHash('sha256').update(sources[i]).digest('hex')}))};
@@ -123,19 +126,23 @@ try{
    const results=[];
    for(let i=0;i<sources.length;i++){
     const mod=await import('data:text/javascript;base64,'+btoa(unescape(encodeURIComponent(sources[i]+'\nexport {hmbNativeStockSafetyContract};'))));
-    const outer=document.createElement('div');outer.className='react-flow__node';outer.setAttribute('data-id','Wrapper'+i);const container=document.createElement('div');outer.append(container);document.querySelector('.react-flow').append(outer);
+    const outer=document.createElement('div');outer.className='react-flow__node';outer.setAttribute('data-id','Wrapper'+i);const container=document.createElement('div');container.className='widget-container nodrag nowheel';container.innerHTML='<div class="nowheel">Local scrolling</div>';outer.append(container);document.querySelector('.react-flow').append(outer);
     const original={value:{shots:[{name:'Kept shot',uuid:'kept-id'}],task:'job-kept',result:'kept-output'}},serialized=JSON.stringify(original);
     let updates=0,cleanups=0,exact=false;const base={update(next){updates++;exact=next===original;},cleanup(){cleanups++;}};
     const mount=()=>base,first=mod.hmbNativeStockSafetyContract(container,original,mount),again=mod.hmbNativeStockSafetyContract(container,original,mount);
-    again.update(original);first.cleanup();first.cleanup();
+    const wheelScoped=!container.classList.contains('nowheel') && container.firstElementChild.classList.contains('nowheel');
+    container.classList.add('nowheel');again.update(original);
+    const wheelAfterUpdate=!container.classList.contains('nowheel');
+    first.cleanup();first.cleanup();
+    const wheelRestored=container.classList.contains('nowheel');
     const retained=document.__HMB_NATIVE_STOCK_SAFETY_V1__?.owners.size===0;
     const rebound=mod.hmbNativeStockSafetyContract(container,original,mount);const hotOwners=document.__HMB_NATIVE_STOCK_SAFETY_V1__.owners.size;rebound.cleanup();outer.remove();
     await new Promise(resolve=>setTimeout(resolve,0));
-    results.push({same:first===again,updates,cleanups,exact,retained,hotOwners,unchanged:JSON.stringify(original)===serialized,released:!document.__HMB_NATIVE_STOCK_SAFETY_V1__});
+    results.push({same:first===again,updates,cleanups,exact,retained,hotOwners,wheelScoped,wheelAfterUpdate,wheelRestored,unchanged:JSON.stringify(original)===serialized,released:!document.__HMB_NATIVE_STOCK_SAFETY_V1__});
    }
    return results;
   },sources);
-  assert.equal(result.length,names.length);for(const row of result)assert.deepEqual(row,{same:true,updates:1,cleanups:2,exact:true,retained:true,hotOwners:1,unchanged:true,released:true});
+  assert.equal(result.length,names.length);for(const row of result)assert.deepEqual(row,{same:true,updates:1,cleanups:2,exact:true,retained:true,hotOwners:1,wheelScoped:true,wheelAfterUpdate:true,wheelRestored:true,unchanged:true,released:true});
  });
  await check('measurement_widget_without_native_outer_node_does_not_create_a_status',async()=>{
   const result=await page.evaluate(()=>{const c=document.createElement('div');document.body.append(c);const l=safety.hmbAcquireNativeStockSafety(c);l.refresh();const count=document.querySelectorAll('[data-hmb-native-safety-status]').length;l.cleanup();c.remove();return{count,released:!document.__HMB_NATIVE_STOCK_SAFETY_V1__};});assert.deepEqual(result,{count:0,released:true});

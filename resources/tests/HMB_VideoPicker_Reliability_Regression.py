@@ -730,21 +730,14 @@ prompt_manifest = next(item for item in manifest["nodes"] if item["class_name"] 
 assert picker_manifest["metadata"]["width"] == 1400
 assert prompt_manifest["metadata"]["width"] == 1490
 assert picker_manifest["metadata"]["height"] == 360
-# New Prompt geometry follows the approved compact one-Shot layout.
-assert prompt_manifest["metadata"]["height"] == 1480
-for prompt_height_key in (
-    "height", "default_height", "initial_height",
-):
-    assert prompt_manifest["metadata"][prompt_height_key] == 1480
-assert prompt_manifest["metadata"]["min_height"] == 1269
-for prompt_height_key in (
-    "height", "default_height", "preferred_height", "initial_height",
-):
-    assert prompt_manifest["metadata"]["ui_options"][prompt_height_key] == 1480
-assert prompt_manifest["metadata"]["ui_options"]["min_height"] == 1269
+# Both palette metadata and the constructed node must supply the same geometry.
+prompt_metadata = prompt_manifest["metadata"]
+for options in (prompt_metadata, prompt_metadata["ui_options"]):
+    for key in ("height", "default_height", "initial_height"):
+        assert options[key] == prompt.PROMPT_START_HEIGHT, key
+    assert options["min_height"] == prompt.PROMPT_MIN_HEIGHT
+assert prompt_metadata["ui_options"]["preferred_height"] == prompt.PROMPT_START_HEIGHT
 assert prompt.PROMPT_NATIVE_ASSET_INPUT_ROW_HEIGHT == 0
-assert prompt.PROMPT_START_HEIGHT == 1480
-assert prompt.PROMPT_MIN_HEIGHT == 1269
 finish_manifest = next(item for item in manifest["nodes"] if item["class_name"] == "HMBFinishLookLibrary")
 for finish_options in (finish_manifest["metadata"], finish_manifest["metadata"]["ui_options"]):
     for height_key in ("height", "default_height", "preferred_height", "initial_height"):
@@ -900,11 +893,11 @@ assert "Select at least one output: Original, Mask, Depth, or Motion Guide." in 
 # ---------------------------------------------------------------------------
 catalog_path = ROOT / "resources/picker/HMB_Marker_Catalog.json"
 catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-assert catalog["version"] == 5
+assert catalog["version"] == 6
 character = [item["name"] for item in catalog["character"]]
 background = [item["name"] for item in catalog["background"]]
-expected_actor = ["Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink", "Cyan"]
-expected_ghost = ["Sky Blue", "Mint", "Beige", "Lavender"]
+expected_actor = ["Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink", "Cyan", "Teal", "Brown"]
+expected_ghost = ["Sky Blue", "Mint", "Beige", "Lavender", "Olive"]
 expected_object = [
     *expected_ghost,
     "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern",
@@ -2331,7 +2324,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
         == read_digest
     )
 
-# PICKER_OUT uses the same 16-choice vocabulary and Prompt binds exact Asset IDs.
+# PICKER_OUT uses the same 19-choice vocabulary and Prompt binds exact Asset IDs.
 picker_state = picker._default_widget_state()
 picker_state.update({
     "scene_path": "C:/show/shot.mb",

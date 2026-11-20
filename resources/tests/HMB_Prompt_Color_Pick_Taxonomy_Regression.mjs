@@ -3,8 +3,8 @@ import fs from "node:fs";
 
 import * as prompt from "../../widgets/HMBPromptLibraryScopedBindingWidget.js";
 
-const actor = ["Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink", "Cyan"];
-const ghost = ["Sky Blue", "Mint", "Beige", "Lavender"];
+const actor = ["Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink", "Cyan", "Teal", "Brown"];
+const ghost = ["Sky Blue", "Mint", "Beige", "Lavender", "Olive"];
 const patterns = ["Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern"];
 const object = [...ghost, ...patterns];
 const all = [...actor, ...object];
@@ -46,8 +46,9 @@ assert.deepEqual(state.image_taxonomy.object_color_pick_choices, object);
 assert.equal(state.schema, "prompt-library-state", "The persisted state schema must remain unchanged.");
 
 const legacyTaxonomy = structuredClone(state.image_taxonomy);
-legacyTaxonomy.actor_color_pick_choices = actor.filter((color) => color !== "Cyan");
-legacyTaxonomy.object_color_pick_choices = object.filter((color) => color !== "Lavender");
+const archived = JSON.parse(fs.readFileSync(new URL("./fixtures/marker_catalog_v4.json", import.meta.url), "utf8"));
+legacyTaxonomy.actor_color_pick_choices = archived.character.map(row => row.name);
+legacyTaxonomy.object_color_pick_choices = archived.background.map(row => row.name);
 const restoredLegacyPalette = prompt.normalizeState({ image_taxonomy: legacyTaxonomy });
 assert.deepEqual(restoredLegacyPalette.image_taxonomy.actor_color_pick_choices, actor);
 assert.deepEqual(restoredLegacyPalette.image_taxonomy.object_color_pick_choices, object);
@@ -122,6 +123,11 @@ for (const language of ["ko", "en"]) {
   assert.match(select.innerHTML, language === "ko"
     ? /value="Lavender" >라벤더<\/option>/
     : /value="Lavender" >Lavender<\/option>/);
+  prompt.hmbSyncSelectOptions(select, ["Teal", "Brown", "Olive"], "Brown", "—", restored);
+  for (const [name, korean] of [["Teal", "틸"], ["Brown", "브라운"], ["Olive", "올리브"]]) {
+    const label = language === "ko" ? korean : name;
+    assert.match(select.innerHTML, new RegExp(`value="${name}"[^>]*>${label}</option>`));
+  }
 }
 
 console.log("HMB Prompt Color Pick taxonomy regression: PASS");

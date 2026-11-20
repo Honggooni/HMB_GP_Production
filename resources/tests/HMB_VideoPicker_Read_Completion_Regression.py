@@ -31,7 +31,7 @@ def production_helpers() -> dict:
     tree = ast.parse(SOURCE.read_text(encoding="utf-8-sig"), filename=str(SOURCE))
     names = {
         "_clean", "_scene_path_text", "_norm_path", "_scene_path_key", "_read_json",
-        "_validated_maya_read_result", "_close_drained_process_stdout", "_progress_signature",
+        "_validated_maya_read_result", "_close_drained_process_stdout", "_progress_signature", "_worker_stage_progress",
     }
     functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
     assert {node.name for node in functions} == names, "READ completion production helpers are missing"
@@ -143,6 +143,16 @@ class ReadCompletionTests(unittest.TestCase):
         before = self.result.read_bytes()
         self.assertEqual(self.validate(), self.valid)
         self.assertEqual(self.result.read_bytes(), before)
+
+    def test_stage_percent_uses_worker_counts_only_and_never_displays_100(self):
+        progress = self.ns["_worker_stage_progress"]
+        capture = {"stage": "rendering_frames", "capture_role": "mask", "frame_count": 4}
+        self.assertEqual(progress(dict(capture, completed_frames=1)), {"stage": "rendering_mask_frames", "percent": 25})
+        self.assertEqual(progress(dict(capture, completed_frames=4)), {"stage": "finishing_stage", "percent": None})
+        self.assertEqual(progress({"stage": "checking_visibility", "completed_units": 7, "total_units": 12})["percent"], 58)
+        for malformed in ({"completed_frames": -1}, {"completed_frames": True}, {"completed_frames": 5}, {}):
+            self.assertIsNone(progress({**capture, **malformed})["percent"])
+        self.assertIsNone(progress({"stage": "opening_scene", "time": 12345})["percent"])
 
     def test_missing_partial_or_non_object_result_is_not_completion(self):
         self.assertIsNone(self.validate())

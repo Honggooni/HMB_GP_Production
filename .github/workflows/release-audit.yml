@@ -166,6 +166,7 @@ jobs:
         shell: pwsh
         run: python tools/audit_regression_coverage.py --check
       - name: Prepare the pinned stock editor fixture for native UI checks
+        id: editor_fixture
         shell: pwsh
         run: |
           # Use the upstream wheel as data only. Do not install, execute or
@@ -201,6 +202,8 @@ jobs:
           python -c "import pathlib,sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); pathlib.Path(sys.argv[2]).write_bytes(z.read('griptape_nodes_editor_dist/editor/assets/index-B4peacnU.js'))" $wheel $env:HMB_STOCK_EDITOR_0130_SOURCE
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node resources/tests/HMB_Native_Stock_Deletion_Safety_Browser_Regression.mjs --evidence-path "${{ runner.temp }}/hmb-coverage/stock-editor/stock-editor-0130.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node resources/tests/HMB_Widget_Selected_Wheel_Browser_Regression.mjs --evidence-path "${{ runner.temp }}/hmb-coverage/stock-editor/wheel-0130.json"
       - name: Check the reviewed Desktop 0.30.3 and 0.30.4 Editor overlays and integrated headers
         shell: pwsh
         run: |
@@ -221,11 +224,15 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             node resources/tests/HMB_Native_Stock_Deletion_Safety_Browser_Regression.mjs --evidence-path "${{ runner.temp }}/hmb-coverage/stock-editor/stock-editor-$($editor.version).json"
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            node resources/tests/HMB_Widget_Selected_Wheel_Browser_Regression.mjs --evidence-path "${{ runner.temp }}/hmb-coverage/stock-editor/wheel-$($editor.version).json"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: JavaScript widget regressions with required browser coverage
+        if: ${{ !cancelled() && steps.editor_fixture.outcome == 'success' }}
         shell: pwsh
         run: python tools/audit_regression_coverage.py --run javascript --report "${{ runner.temp }}/hmb-coverage/javascript.json"
       - name: Python release regressions with coverage receipts
+        if: ${{ !cancelled() && steps.editor_fixture.outcome == 'success' }}
         shell: pwsh
         env:
           HMB_IMAGE_PROJECTS_ROOT: ${{ github.workspace }}
@@ -350,6 +357,11 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- ImageAsset reuses a project catalog in the local Griptape workspace. Startup and manual refresh check the shared registry. Concurrent Add operations take turns writing to the registry.",
+            "- HMB nodes zoom on hover and scroll inside a selected scroll area. Its outline marks the active area. HMBPrompt opens with more room for video and sound controls.",
+            "- VideoPicker adds Teal and Brown actor colors and an Olive ghost color. Saved jobs can still use their original palettes.",
+            "- VideoPicker shows the current production stage and measured percentage in the activity log header. You can also show it over the preview while playing a video. The overlay starts off. Generation start and result stay in the log.",
+            "- The Stop button beside Generate Playblast stops the current Shot's generation and preserves completed clips and video playback.",
             "- Restores saved Image Generation model option controls and their values when switching models and reopening an existing workflow.",
             "- Displays asset names in the HMBPrompt sound target picker while preserving saved source identities and shot bindings.",
             "- Supports Desktop 0.30.3 and 0.30.4 with Editor 0.130.2 and 0.130.3. Restores the Rodong Mart startup screen, reloads saved Image Generation options and keeps CGT Shot selection through local edit conflicts and task-status changes.",

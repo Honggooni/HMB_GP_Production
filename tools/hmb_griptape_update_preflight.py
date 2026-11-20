@@ -15,6 +15,7 @@ from tempfile import TemporaryDirectory
 
 from hmb_editor_0130_header import HEADER_SOURCE
 from hmb_rodong_editor_0130 import STOCK_SHA256, build
+from package_runtime_release import WIDGET_FILES, validate_widget_declarations
 from restore_rodong_local_editor import EDITOR_1302, EDITOR_1303, editor_profile, entry_for_overlay, stock_entry_from_active
 
 
@@ -50,6 +51,7 @@ REVIEWED_HOSTS = {
 }
 HEADER_CHECK = "HMB_Editor_0130_Integrated_Header_Regression.mjs"
 DELETION_CHECK = "HMB_Native_Stock_Deletion_Safety_Browser_Regression.mjs"
+WHEEL_CHECK = "HMB_Widget_Selected_Wheel_Browser_Regression.mjs"
 CHECKS = (
     ("HMB_Library_Lifecycle_Order_Host_Regression.py", {}),
     ("HMB_CGT_Own_Task_Regression.py", {}),
@@ -70,6 +72,9 @@ CHECKS = (
     ("HMB_Sound_Delta_Transport_Host_Regression.py", {}),
     ("HMB_Finish_Multishot_Consolidation_Host_Regression.py", {}),
     ("HMB_Image_Asset_Project_Root_Relocation_Regression.py", {}),
+    ("HMB_ImageAsset_First_Paint_Regression.py", {}),
+    ("HMB_Image_Asset_Staged_Loading_Regression.py", {}),
+    ("HMB_Workflow_Context_Snapshot_Guard_Host_Regression.py", {}),
     ("HMB_Image_Bash_Host_Regression.py", {}),
     ("HMB_Image_Bash_Performance_Regression.py", {}),
     ("HMB_Image_Bash_Apply_Readiness_Host_Regression.py", {
@@ -79,6 +84,7 @@ CHECKS = (
 BROWSER_CHECKS = (
     HEADER_CHECK,
     DELETION_CHECK,
+    WHEEL_CHECK,
     "HMB_Image_Asset_Authority_Lifecycle_Regression.mjs",
     "HMB_Image_Bash_Owned_Editor_Browser_Regression.mjs",
     "HMB_CGT_Hierarchy_Widget_Regression.mjs",
@@ -111,6 +117,7 @@ LIBRARY_CHECKS = {
     "HMBImageBash": "HMB_Image_Bash_Apply_Readiness_Host_Regression.py",
 }
 OUT_ARGUMENT_CHECKS = frozenset((
+    "HMB_Workflow_Context_Snapshot_Guard_Host_Regression.py",
     "HMB_Connected_Deletion_Guard_Host_Regression.py", "HMB_Common_Connection_Management_Host_Regression.py",
     "HMB_Page_Only_Shot_Switch_Host_Regression.py", "HMB_Analysis_Agent_Save_Reopen_Host_Regression.py",
     "HMB_Seedance_Execution_Mode_Host_Regression.py",
@@ -128,6 +135,7 @@ def check_inventory() -> dict[str, str]:
     shipped = {item["class_name"] for item in descriptor["nodes"]}
     if shipped != set(LIBRARY_CHECKS):
         raise ValueError(f"Library check coverage differs from shipped nodes: {sorted(shipped ^ set(LIBRARY_CHECKS))}")
+    validate_widget_declarations(descriptor)
     return dict(LIBRARY_CHECKS)
 
 
@@ -222,7 +230,7 @@ def product_digest() -> str:
     files.update(ROOT / item["path"] for item in entries.get("widgets", []))
     files.update(TESTS / script for script, _ in CHECKS)
     files.update(TESTS / script for script in BROWSER_CHECKS)
-    files.add(TESTS / "_hmb_native_editor_fixture.mjs")
+    files.update(path for path in TESTS.glob("_hmb*") if path.suffix in {".py", ".mjs", ".cjs"})
     files.update(path for path in (ROOT / "resources/editor").iterdir() if path.is_file())
     inventory = {path.relative_to(ROOT).as_posix(): digest(path) for path in sorted(files)}
     return sha256(json.dumps(inventory, sort_keys=True).encode()).hexdigest()
@@ -250,6 +258,28 @@ def validate_header_evidence(proof: Path, header_sha: str, stock_sha: str = STOC
             or report.get("header_sha256") != header_sha
             or report.get("integrated_headers") != len(LIBRARY_CHECKS)):
         raise ValueError("Editor 0.130 integrated header evidence is incomplete")
+
+
+def validate_wheel_evidence(proof: Path, stock_sha: str) -> None:
+    report = json.loads(proof.read_bytes())
+    bridges = {"HMBImageAssetThumbnailPatchBridgeWidget", "HMBVideoPickerCommandBridgeWidget"}
+    visible = WIDGET_FILES.keys() - bridges
+    expected_hashes = {WIDGET_FILES[name]: digest(ROOT / WIDGET_FILES[name]) for name in visible}
+    if (not isinstance(report, dict) or report.get("passed") is not True
+            or report.get("editor_sha256") != stock_sha or report.get("widget_sha256") != expected_hashes
+            or report.get("paid_calls") != 0 or report.get("external_requests") != 0
+            or report.get("errors") != []):
+        raise ValueError("Wheel evidence differs from the tested Editor or widgets")
+    cases = report.get("cases")
+    required = {"only_selected", "middle_pan", "selected_viewport_outline_without_reflow",
+                "unmount_releases_outline", "four_edges_visible_in_pixels"}
+    if (not isinstance(cases, dict) or cases.keys() != visible
+            or any(not isinstance(checks, dict) or not required.issubset(checks)
+                   or any(passed is not True for passed in checks.values()) for checks in cases.values())):
+        raise ValueError("Wheel evidence is missing a passing visible-widget interaction")
+    if (cases["HMBImageAssetLibraryWidget"].get("refresh_keeps_same_grid_only") is not True
+            or cases["HMBPromptLibraryScopedBindingWidget"].get("prompt_wheel_over_select_scrolls_table_with_value_preserved") is not True):
+        raise ValueError("Wheel evidence is missing the catalog refresh or Prompt selection check")
 
 
 def run(candidate: Path, standard: Path, output: Path, node: str, legacy_editor_fixture: Path | None = None,
@@ -312,6 +342,8 @@ def run(candidate: Path, standard: Path, output: Path, node: str, legacy_editor_
                 command = [node, str(TESTS / script)]
                 if script == DELETION_CHECK:
                     command += ["--evidence-path", str(folder / "native-safety.json")]
+                elif script == WHEEL_CHECK:
+                    command += ["--evidence-path", str(folder / "wheel.json")]
                 with (folder / "test.log").open("wb") as log:
                     try:
                         check = subprocess.run(command, cwd=folder, env=env, stdout=log, stderr=subprocess.STDOUT,
@@ -339,8 +371,10 @@ def run(candidate: Path, standard: Path, output: Path, node: str, legacy_editor_
             validate_header_evidence(header_proof, result["tested_header_sha256"], stock_sha)
             deletion_proof = output / Path(DELETION_CHECK).stem / "native-safety.json"
             validate_deletion_evidence(deletion_proof, stock_sha)
+            wheel_proof = output / Path(WHEEL_CHECK).stem / "wheel.json"
+            validate_wheel_evidence(wheel_proof, stock_sha)
             result["evidence_sha256"] = {
-                path.relative_to(output).as_posix(): digest(path) for path in (proof, header_proof, deletion_proof)
+                path.relative_to(output).as_posix(): digest(path) for path in (proof, header_proof, deletion_proof, wheel_proof)
             }
             result["status"] = "AUTOMATED_CHECKS_PASSED"
     except (OSError, RuntimeError, ValueError, KeyError) as exc:

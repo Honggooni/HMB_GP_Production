@@ -171,7 +171,26 @@ class WorkerReservationResilience(unittest.TestCase):
             node._start_ui_operation('run_video', state)
         self.assertEqual(rejected, [True])
         self.assert_released(node)
+        self.assertEqual([r["generation_event"] for r in node._picker_state()["activity_log"] if r.get("generation_event")],
+                         ["start", "failed"])
         self.assert_next_read_runs(case)
+
+    def test_terminal_output_rejection_never_logs_success(self):
+        case = self.case()
+        node = case.node
+        sync = node._sync_outputs_from_state
+        def reject_terminal(state, *args, **kwargs):
+            if state["status"] == "VIDEO_READY" and not state["operation_kind"]:
+                self.assertFalse(any(row.get("generation_event") == "complete" for row in state["activity_log"]))
+                raise RuntimeError("Output delivery rejected")
+            return sync(state, *args, **kwargs)
+        node._sync_outputs_from_state = reject_terminal
+        node._start_ui_operation("run_video", self.reserve(node))
+        self.assert_released(node)
+        rows = [r for r in node._picker_state()["activity_log"] if r.get("generation_event")]
+        self.assertEqual([r["generation_event"] for r in rows], ["start", "failed"])
+        self.assertEqual(rows[-1]["message"], "Output delivery rejected")
+        self.assertEqual(rows[-1]["picker_shot_uuid"], case.owner)
 
     def test_queued_scene_is_applied_after_reservation_release_even_on_cancel_error(self):
         case = self.case()

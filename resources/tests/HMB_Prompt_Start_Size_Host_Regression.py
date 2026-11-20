@@ -70,7 +70,7 @@ def expect_start(node, original, check_type=True):
         assert type(node).__name__ == "HMBPromptLibrary", type(node).__name__
     saved = (original or {}).get("size")
     saved = saved if isinstance(saved, dict) else {}
-    for key, default in (("width", 1490), ("height", 1480)):
+    for key, default in (("width", 1490), ("height", 1544)):
         authored = saved.get(key)
         expected = authored if type(authored) in {int, float} and authored > 0 else default
         assert node.metadata["size"][key] == expected, (key, node.metadata["size"], expected)
@@ -97,7 +97,7 @@ async def exercise(engine, selected_case=None):
         AlterParameterDetailsRequest, SetParameterValueRequest)
     from griptape_nodes.serialization.values import encode_value
 
-    assert (prompts.PROMPT_START_WIDTH, prompts.PROMPT_START_HEIGHT) == (1490, 1480)
+    assert (prompts.PROMPT_START_WIDTH, prompts.PROMPT_START_HEIGHT) == (1490, 1544)
     schema = LibrarySchema.model_validate_json((ROOT / "griptape-nodes-library.json").read_text("utf-8-sig"))
     library = LibraryRegistry.generate_new_library(schema)
     classes = {cls.__name__: cls for cls in (prompts.HMBPromptLibrary, generators.HMBSeedanceGeneration)}
@@ -242,7 +242,7 @@ async def exercise(engine, selected_case=None):
             generator = restored_flow.nodes[name]
             assert {key: encode_value(generator._get_raw_parameter_value(key)) for key in values} == values
         assert not ATTEMPTS, ATTEMPTS
-        print("HMB_PROMPT_START_SIZE_HOST=PASS " + json.dumps({"new_default_size": [1490, 1480],
+        print("HMB_PROMPT_START_SIZE_HOST=PASS " + json.dumps({"new_default_size": [1490, 1544],
             "saved_size_cases": CASE_RESULTS, "runtime_resize_preserved": True,
             "position_and_custom_metadata_preserved": True, "authored_request_metadata_unmodified": True,
             "sdk_registration_keys_added": ["library_node_metadata", "library", "node_type"],

@@ -1,6 +1,6 @@
 """Bounded real Maya/FFmpeg palette verification on disposable .ma/.mb scenes.
 
-This creates two tiny animated meshes in a private workspace directory, renders
+This creates a disposable scene with five color markers, renders
 Original/Mask/Depth/Motion Guide, and keeps the artifacts for visual review.
 The optional --mixed-pattern mode adds a Sky Grid backdrop to exercise the
 production world-projection path alongside the two new solid markers.
@@ -39,6 +39,11 @@ for name, x, z in [('ActorCyan', -1.2, 0.0), ('GhostLavender', 1.2, -0.5)]:
     cmds.setAttr(root+'.translateZ', z)
     cmds.setKeyframe(root, attribute='translateY', time=1, value=0.0)
     cmds.setKeyframe(root, attribute='translateY', time=2, value=0.25)
+for name, x in [('ActorTeal', -2.0), ('ActorBrown', 0.0), ('GhostOlive', 2.0)]:
+    mesh = cmds.polyCube(name=name+'Mesh', width=0.95, height=0.95, depth=0.95)[0]
+    root = cmds.group(mesh, name=name)
+    cmds.setAttr(root+'.translateX', x)
+    cmds.setAttr(root+'.translateY', 1.8)
 if sys.argv[2] == '1':
     mesh = cmds.polyPlane(name='SkyGridMesh', width=12.0, height=8.0,
                          subdivisionsX=2, subdivisionsY=2, axis=(0.0, 0.0, 1.0))[0]
@@ -96,6 +101,9 @@ def run_job(mayabatch, scene, folder, *, original=False, mixed_pattern=False):
         "bindings": [
             {"color": "Cyan", "asset_id": "ActorCyan", "subject_root": "|ActorCyan", "full_dag_path": "|ActorCyan", "enabled": True},
             {"color": "Lavender", "asset_id": "GhostLavender", "subject_root": "|GhostLavender", "full_dag_path": "|GhostLavender", "enabled": True},
+            {"color": "Teal", "asset_id": "ActorTeal", "subject_root": "|ActorTeal", "full_dag_path": "|ActorTeal", "enabled": True},
+            {"color": "Brown", "asset_id": "ActorBrown", "subject_root": "|ActorBrown", "full_dag_path": "|ActorBrown", "enabled": True},
+            {"color": "Olive", "asset_id": "GhostOlive", "subject_root": "|GhostOlive", "full_dag_path": "|GhostOlive", "enabled": True},
         ] if not original else [],
         "hidden_paths": [],
         "character_outline_mode": "native_lambert",
@@ -173,7 +181,7 @@ def main():
     mayapy = mayabatch.with_name("mayapy.exe")
     ffmpeg = picker._find_ffmpeg(mayabatch)
     assert mayapy.is_file() and ffmpeg is not None
-    assert picker.MARKER_CATALOG["version"] == 5
+    assert picker.MARKER_CATALOG["version"] == 6
     output = Path(tempfile.mkdtemp(prefix="hmb-palette-maya-", dir=ROOT / ".tmp"))
     execute([str(mayapy), "-c", BUILD_SCENE, str(output), "1" if args.mixed_pattern else "0"], output / "build.log")
     report = {"ok": True, "output_folder": str(output), "maya_binary": str(mayabatch), "mixed_pattern": args.mixed_pattern, "scenes": []}
@@ -184,7 +192,12 @@ def main():
         mask_job, mask = run_job(mayabatch, scene, output / (extension + "_render"), mixed_pattern=args.mixed_pattern)
         sidecar = json.loads(Path(mask_job["sidecar_path"]).read_text(encoding="utf-8"))
         markers = {row["color"]: row for row in sidecar["markers"]}
-        assert set(markers) == ({"Cyan", "Lavender", "Sky Grid"} if args.mixed_pattern else {"Cyan", "Lavender"})
+        expected = {"Cyan", "Lavender", "Teal", "Brown", "Olive"}
+        assert set(markers) == (expected | {"Sky Grid"} if args.mixed_pattern else expected)
+        assert sidecar["marker_catalog_version"] == 6
+        assert markers["Teal"]["shader_model"] == markers["Brown"]["shader_model"] == "lambert"
+        assert markers["Olive"]["shader_model"] == "surfaceShader"
+        assert markers["Olive"]["shading_profile"]["palette_rgb"] == [128 / 255, 128 / 255, 0]
         assert markers["Cyan"]["shader_model"] == "lambert"
         assert markers["Lavender"]["shader_model"] == "surfaceShader"
         assert markers["Lavender"]["shading_profile"]["palette_rgb"] == [184 / 255, 166 / 255, 217 / 255]
@@ -212,6 +225,15 @@ def main():
             lavender_count = sum(b - r > 8 and r - g > 5 and g > 100 for r, g, b in pixels)
             assert cyan_count > 100, "Actor Cyan disappeared or lost its hue"
             assert lavender_count > 100, "Ghost Lavender disappeared or lost its hue"
+            # The three v6 meshes occupy the upper row. Limit hue counts to
+            # their individual columns so Cyan and the Sky Grid cannot satisfy Teal.
+            upper = [(i % image.width, color) for i, color in enumerate(pixels) if i // image.width < image.height * 0.38]
+            new_pixels = {
+                "Teal": sum(x < image.width * 0.4 and r < 50 and min(g, b) > 60 and abs(g - b) < 25 for x, (r, g, b) in upper),
+                "Brown": sum(image.width * 0.4 <= x <= image.width * 0.6 and r - g > 20 and g - b > 10 for x, (r, g, b) in upper),
+                "Olive": sum(x > image.width * 0.6 and min(r, g) > 60 and abs(r - g) < 25 and b < 50 for x, (r, g, b) in upper),
+            }
+            assert all(count > 20 for count in new_pixels.values()), new_pixels
             left = [pixel for index, pixel in enumerate(pixels) if index % image.width < image.width // 2]
             right = [pixel for index, pixel in enumerate(pixels) if index % image.width >= image.width // 2]
             assert sum(r < 60 and g > 70 and b > 70 and abs(g - b) < 30 for r, g, b in left) > 100
@@ -238,6 +260,7 @@ def main():
             "scene_path": str(scene), "source_sha256": before, "source_unchanged": True,
             "frames_per_output": 2, "cyan_pixel_count": cyan_count,
             "lavender_pixel_count": lavender_count,
+            "v6_color_pixel_counts": new_pixels,
             "actor_saturated_cyan_pixel_count": actor_saturated_cyan_count,
             "sky_grid_filler_pixel_count": sky_grid_filler_count,
             "world_pattern_report": world_report, "videos": videos,

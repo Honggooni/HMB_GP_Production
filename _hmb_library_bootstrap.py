@@ -1740,6 +1740,7 @@ class _Registration:
         self.prompt_post_types: list[Any] = []
         self.prompt_pending: dict[Any, tuple[Any, Any]] = {}
         self.load_requests: dict[int, Any] = {}
+        self.loaded_image_nodes: weakref.WeakSet = weakref.WeakSet()
         self.load_post_hook = self.after_workflow_load
         self.load_post_types: list[Any] = []
         self.snapshot_requests: dict[int, tuple[Any, tuple[int, int]]] = {}
@@ -2091,6 +2092,10 @@ class _Registration:
                 node = engine.node_manager.get_node_by_name(name)
             except (KeyError, ValueError, TypeError):
                 node = None
+            if (self.load_requests and request.parameter_name == "HMB_IMAGE_ASSET_STATE"
+                    and _kind_metadata(node) == "HMBImageAssetLibrary"):
+                with self.lock:
+                    self.loaded_image_nodes.add(node)
             if (request.parameter_name == "bash_image"
                     and "fields" in getattr(type(request), "__dataclass_fields__", {}) and request.fields is None
                     and is_loading_workflow() is True and _kind_metadata(node) == _BASH_NODE_TYPE
@@ -2133,9 +2138,19 @@ class _Registration:
             self.load_requests = {key: owner for key, owner in self.load_requests.items() if owner() is not None}
             if self.load_requests:
                 return
+            loaded_images = tuple(self.loaded_image_nodes)
+            self.loaded_image_nodes.clear()
         migration = _migration_module()
         if result.succeeded():
             migration.schedule_loaded_flow_migrations(engine)
+            for node in loaded_images:
+                try:
+                    # A closed or replaced workflow can have a node with the
+                    # same name. Only its exact, still-registered owner may read.
+                    if engine.node_manager.get_node_by_name(node.name) is node:
+                        node.after_deserialize()
+                except Exception as exc:
+                    logging.getLogger(__name__).warning("[HMB_IMAGE_CATALOG_RESTORE] %s", exc)
         else:
             for name in migration.pending_flow_names(engine):
                 migration.clear_flow_migration_pending(engine, name)
@@ -2356,7 +2371,28 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
             # worker are optional. Their failure must not remove a ready gate.
             logging.getLogger(__name__).warning("[HMB_OPTIONAL_BOOTSTRAP_FAILED] %s", type(exc).__name__)
 
+    def after_library_nodes_loaded(self, library_data: Any, library: Any) -> None:
+        if library_data.name != _LIBRARY_NAME:
+            return
+        engine = current_engine() if callable(current_engine) else None
+        if getattr(getattr(engine, "library_manager", None), "is_worker", None) is not False:
+            return
+        if getattr(self, "_hmb_image_warmup_stop", None) is not None:
+            return
+        try:
+            # Resolve the SDK-registered class once on its owner thread. Only
+            # detached filesystem work is dispatched; no canvas node is created.
+            stop = threading.Event()
+            library.get_node_class("HMBImageAssetLibrary").start_catalog_warmup(stop)
+            self._hmb_image_warmup_stop = stop
+        except Exception as exc:
+            logging.getLogger(__name__).warning("[HMB_IMAGE_CATALOG_STARTUP] %s", exc)
+
     def before_library_unregistered(self, _library_data: Any, _library: Any) -> None:
+        stop = getattr(self, "_hmb_image_warmup_stop", None)
+        if stop is not None:
+            stop.set()
+            self._hmb_image_warmup_stop = None
         with _REGISTRY_LOCK:
             for registration in tuple(self._registrations):
                 with registration.lock:
@@ -2372,6 +2408,7 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
                         pass
                     registration.prompt_pending.clear()
                     registration.load_requests.clear()
+                    registration.loaded_image_nodes.clear()
                     registration.snapshot_requests.clear()
                     registration.snapshot_refused_loads.clear()
                     engine = registration.engine()

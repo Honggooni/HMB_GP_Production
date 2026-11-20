@@ -110,5 +110,5 @@ try {
   assert.deepEqual(grouped.colors, ['','','',palettes.at(-1)]);
   if(process.env.HMB_PICKER_COLOR_SCREENSHOT) await page.screenshot({path:process.env.HMB_PICKER_COLOR_SCREENSHOT});
   assert.deepEqual(errors,[]);
-  console.log('Repeated reference browser: PASS (16 repeated colors, reload, single selection, bulk Eye/S/X, no page errors)');
+  console.log(`Repeated reference browser: PASS (${palettes.length} repeated colors, reload, single selection, bulk Eye/S/X, no page errors)`);
 } finally {await browser?.close();await new Promise(resolve=>server.close(resolve));}

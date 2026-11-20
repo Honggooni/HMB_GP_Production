@@ -369,6 +369,169 @@ try {
     assert.equal(backend.after,backend.before,'real backend updates must not use disposable echo shortcut');
     assertLatestViewport(result,'backend updates after Play ACK');
   },crossedEchoFixture());
+  await check('Generation progress stays in the log header while another video plays', async () => {
+    const value = fixture(true);
+    // Record a short test preview entirely in this browser.
+    // Separate blob URLs exercise switching between two distinct asset cards.
+    const urls = await page.evaluate(async () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = 16;
+      const ctx = canvas.getContext('2d');
+      const stream = canvas.captureStream(10);
+      const recorder = new MediaRecorder(stream, {mimeType:'video/webm;codecs=vp8'});
+      const chunks = [];
+      const done = new Promise(resolve => {
+        recorder.ondataavailable = event => chunks.push(event.data);
+        recorder.onstop = () => resolve(new Blob(chunks,{type:'video/webm'}));
+      });
+      recorder.start();
+      for (let i = 0; i < 12; i++) {
+        ctx.fillStyle = i % 2 ? 'blue' : 'green';
+        ctx.fillRect(0, 0, 16, 16);
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      recorder.stop();
+      const blob = await done;
+      stream.getTracks().forEach(track => track.stop());
+      return [URL.createObjectURL(blob), URL.createObjectURL(blob)];
+    });
+    try {
+      for (const item of value.videos) item.video_url = urls[item.video_uid.endsWith('-b') ? 1 : 0];
+      const owner = value.active_picker_shot_uuid;
+      const start = {level:'INFO',time:'11:38:00',message:'Capture started',generation_event:'start',picker_shot_uuid:owner,operation_id:'capture-3'};
+      Object.assign(value, {status:'RUNNING',operation_kind:'run_video',operation_picker_shot_uuid:owner,
+        operation_started_at_ms:Date.now()-2000,operation_progress:{stage:'rendering_mask_frames',percent:12},
+        activity_log:[start],message:'Worker frame detail'});
+      await reset(value);
+      const headline = page.locator('#activity-progress');
+      const logs = page.locator('#activity-log-view');
+      const overlay = page.locator('.viewport-stage .picker-progress-overlay');
+      const toggle = page.getByRole('button', {name:'영상 위 표시'});
+      const stop = page.locator('#stop-playblast');
+      assert.ok(await stop.isVisible());
+      const [generateBox,stopBox]=await Promise.all([page.locator('#run-video').boundingBox(),stop.boundingBox()]);
+      assert.ok(generateBox && stopBox && stopBox.x >= generateBox.x + generateBox.width - 1
+        && Math.abs((generateBox.y + generateBox.height / 2) - (stopBox.y + stopBox.height / 2)) <= 1,
+        'Stop stays to the right of Generate on the same row');
+      assert.equal(await stop.isEnabled(),false,'A request without an admitted job ID cannot be stopped');
+      await publish({operation_id:'capture-3'});
+      assert.equal(await stop.isEnabled(),true);
+      assert.equal(await toggle.getAttribute('aria-pressed'),'false');
+      assert.equal(await overlay.isVisible(),false);
+      assert.match(await headline.textContent(), /마스크.*12%/);
+      assert.equal(await logs.isVisible(), true);
+      assert.match(await logs.textContent(), /Capture started/);
+      assert.doesNotMatch(await logs.textContent(), /Worker frame detail/);
+      await page.locator('.video-asset-grid [data-play-video-uid="s3-a"]').click();
+      await page.waitForFunction(url => {
+        const media = host.querySelector('#picker-video');
+        return media?.currentSrc === url && !media.paused && media.currentTime > 0;
+      }, urls[0]);
+      await page.locator('.video-asset-grid [data-play-video-uid="s3-b"]').click();
+      await page.waitForFunction(url => {
+        const media = host.querySelector('#picker-video');
+        return media?.currentSrc === url && !media.paused && media.currentTime > 0;
+      }, urls[1]);
+      await page.evaluate(() => {
+        window.playerBeforeToggle = host.querySelector('#picker-video');
+        playerBeforeToggle.loop = true;
+        window.playTimeBeforeToggle = playerBeforeToggle.currentTime;
+      });
+      await toggle.click();
+      assert.equal(await toggle.getAttribute('aria-pressed'),'true');
+      assert.equal(await overlay.textContent(),await headline.textContent());
+      assert.equal(await overlay.isVisible(),true);
+      assert.equal(await overlay.evaluate(el=>getComputedStyle(el).pointerEvents),'none');
+      const observed = await page.evaluate(() => {
+        const media = host.querySelector('#picker-video'), before = media.currentTime;
+        const next = {...structuredClone(window.live()), state_writer:'python',operation_progress:{stage:'rendering_mask_frames',percent:64}};
+        next.state_revision += 1;
+        controller.update(props(next));
+        return {headline:host.querySelector('#activity-progress').textContent,
+          same:host.querySelector('#picker-video') === media && window.playerBeforeToggle === media, stillPlaying:!media.paused,
+          playheadRetained:media.currentTime >= before, fullscreenCount:host.querySelectorAll('.viewport-stage #activity-progress').length};
+      });
+      assert.match(observed.headline,/마스크.*64%/);
+      assert.ok(observed.same && observed.stillPlaying && observed.playheadRetained);
+      assert.equal(observed.fullscreenCount, 0);
+      assert.match(await overlay.textContent(),/64%/);
+      await toggle.click();
+      assert.equal(await overlay.isVisible(),false);
+      assert.match(await headline.textContent(),/64%/);
+      assert.ok(await page.evaluate(()=>host.querySelector('#picker-video') === window.playerBeforeToggle && !window.playerBeforeToggle.paused));
+      await toggle.click();
+      async function publish(fields) {
+        await page.evaluate(fields => {
+          const next = {...structuredClone(window.live()), ...fields, state_writer:'python'};
+          next.state_revision += 1;
+          controller.update(props(next));
+        }, fields);
+      }
+      await publish({operation_progress:{stage:'encoding',percent:null}});
+      assert.match(await headline.textContent(), /인코딩/);
+      assert.doesNotMatch(await headline.textContent(), /%/);
+      await publish({operation_progress:{stage:'finishing_stage',percent:null}});
+      assert.doesNotMatch(await headline.textContent(), /100%/);
+      await publish({status:'VIDEO_READY',operation_kind:'',operation_progress:{},operation_picker_shot_uuid:'',
+        last_operation_seconds:15,operation_finished_at_ms:Date.now(),activity_log:[start,{...start,level:'SUCCESS',generation_event:'complete',message:'Capture complete'}]});
+      assert.equal(await headline.textContent(),'작업 완료');
+      assert.equal(await overlay.isVisible(),false);
+      assert.match(await logs.textContent(),/SUCCESS.*Capture complete/);
+      assert.equal(await stop.isEnabled(),false,'The prior completed run cannot be cancelled');
+      assert.match(await page.locator('#activity-elapsed').textContent(),/00:15/);
+      assert.equal(await page.locator('#clear-activity-log').isEnabled(),true);
+      await publish({operation_kind:'run_video',operation_id:'other-capture',status:'RUNNING',operation_finished_at_ms:0,
+        operation_picker_shot_uuid:shots[0],operation_progress:{stage:'rendering_frames',percent:72}});
+      assert.equal(await stop.isEnabled(),false,'Another Shot cannot be stopped here');
+      assert.equal(await headline.textContent(),'');
+      assert.match(await page.locator('#activity-elapsed').textContent(),/00:00/);
+      await publish({status:'READY',operation_kind:'',operation_id:'',operation_picker_shot_uuid:owner,
+        operation_progress:{stage:'rendering_mask_frames',percent:12}, activity_log:[],activity_log_text:'',
+        activity_log_cleared:true,warnings:[],message:''});
+      assert.equal(await headline.textContent(),'');
+      assert.equal(await overlay.isVisible(),false);
+      assert.equal(await page.locator('#clear-activity-log').isEnabled(),false);
+      await publish({activity_log:[start],activity_log_cleared:false});
+      assert.equal(await page.locator('#clear-activity-log').isEnabled(),true);
+      await publish({status:'RUNNING',operation_kind:'run_video',operation_id:'capture-4', operation_picker_shot_uuid:owner,
+        operation_started_at_ms:Date.now(),operation_finished_at_ms:0,operation_progress:{stage:'rendering_mask_frames',percent:6}});
+      const writesBeforePreview = await page.evaluate(() => {
+        controller.update({...props(structuredClone(window.live())),disabled:true});
+        return publications.length;
+      });
+      assert.equal(await stop.isEnabled(),true);
+      assert.equal(await page.locator('.video-asset-grid [data-delete-video-uid="s3-a"]').isEnabled(),false);
+      await page.locator('.video-asset-grid [data-play-video-uid="s3-a"]').click();
+      await page.waitForFunction(url => {
+        const media = host.querySelector('#picker-video');
+        return media?.currentSrc === url && !media.paused && media.currentTime > 0;
+      }, urls[0]);
+      assert.equal(await page.evaluate(() => publications.length),writesBeforePreview,'A locked host previews cards without a parameter write');
+      await page.evaluate(() => {
+        const next={...structuredClone(window.live()),operation_progress:{stage:'rendering_mask_frames',percent:17},state_writer:'python'};
+        next.state_revision+=1;
+        controller.update({...props(next),disabled:true});
+      });
+      assert.match(await headline.textContent(),/17%/);
+      assert.equal(await page.locator('#picker-video').evaluate((media,url)=>media.currentSrc===url&&!media.paused, urls[0]),true);
+      const stopped = await page.evaluate(() => {
+        const button = host.querySelector('#stop-playblast');
+        const player = host.querySelector('#picker-video');
+        const before = player.currentTime;
+        button.click();
+        button.click();
+        const requests = publications.map(item => item.__hmb_picker_command__).filter(cmd => cmd?.action === 'cancel_generate');
+        return { requests, nowDisabled:button.disabled, samePlayer:player === host.querySelector('#picker-video'),
+          stillPlaying:!player.paused && player.currentTime >= before };
+      });
+      assert.equal(stopped.requests.length,1,'Two rapid clicks submit just one stop command');
+      assert.equal(stopped.requests[0].payload.operation_id,'capture-4');
+      assert.equal(stopped.requests[0].payload.picker_shot_uuid,owner);
+      assert.ok(stopped.nowDisabled && stopped.samePlayer && stopped.stillPlaying);
+    } finally {
+      await page.evaluate(urls => urls.forEach(url => URL.revokeObjectURL(url)), urls);
+    }
+  },true);
   await check('Compact three-card replay keeps newest media through crossed exact ACKs and progress',async()=>{
     await setupCard('s3-c');
     await page.locator('[data-picker-toggle-surface="header"]').dispatchEvent('dblclick');

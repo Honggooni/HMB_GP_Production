@@ -21,12 +21,20 @@ def initialize_detached_image_asset(node, module, *, state=None, name=None):
     if getattr(node, "_hmb_widget_runtime_lease", None):
         raise ValueError("Detached admission initialization requires a new owner.")
     node.name = name or getattr(node, "name", "SyntheticDetachedImageAsset")
-    node.engine = SimpleNamespace(event_manager=SimpleNamespace(
+    engine = SimpleNamespace(event_manager=SimpleNamespace(
         _hmb_asset_initial_assignment_context=contextvars.ContextVar(
             "fixture_asset_initial_assignment", default=None),
         _hmb_asset_workspace_assignment_context=contextvars.ContextVar(
             "fixture_asset_workspace_assignment", default=None),
     ))
+    engine_property = getattr(type(node), "engine", None)
+    if isinstance(engine_property, property) and engine_property.fset is None:
+        # SDK nodes expose the engine supplied to their constructor through a
+        # read-only property. The detached owner never joins a workflow.
+        node._engine = engine
+        node._workflow = None
+    else:
+        node.engine = engine
     node._hmb_widget_runtime_lease = str(uuid4())
     node._hmb_workspace_local_assignment = contextvars.ContextVar(
         "fixture_asset_workspace_local", default=None)

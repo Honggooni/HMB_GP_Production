@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, OrderedDict
+from concurrent.futures import Future
 from array import array
 from contextlib import contextmanager
 from pathlib import Path
@@ -8,6 +9,7 @@ import asyncio
 import base64
 import copy
 import contextvars
+import errno
 import hashlib
 import importlib.util
 import inspect
@@ -187,7 +189,8 @@ ASSET_METADATA_DIRECTORY_NAME = ".json"
 ASSET_MANIFEST_SCHEMA = "hmb-image-assets"
 ASSET_MANIFEST_VERSION = 1
 ASSET_MANIFEST_LOCK_NAME = ".hmb_image_assets.lock"
-ASSET_MANIFEST_LOCK_TIMEOUT_SECONDS = 10.0
+ASSET_MANIFEST_LOCK_TIMEOUT_SECONDS = 60.0
+ASSET_THUMBNAIL_LOCK_TIMEOUT_SECONDS = 10.0
 PRODUCTION_PROJECTS_ROOT = "P:/projects"
 _PREVIOUS_PROJECTS_ROOT = "//192.168.200.19/v/projects"
 _RETIRED_PROJECTS_ROOT = "//fin-rcomp1/Composite_Team/projects_AI"
@@ -311,7 +314,31 @@ _ASSET_THUMBNAIL_CACHE_ROOT = Path(
 _ASSET_THUMBNAIL_CACHE_WARNING_EMITTED = False
 _ASSET_THUMBNAIL_CACHE_PRUNE_PENDING = False
 _ASSET_THUMBNAIL_CACHE_DEFER_COUNT = 0
-_ASSET_CATALOG_INDEX_ROOT = _ASSET_THUMBNAIL_CACHE_ROOT.parent / "image_catalogs"
+def _configured_catalog_index_root() -> Path:
+    """Keep the workstation index in the global workspace across workflow/project changes."""
+    workspace = os.environ.get("GTN_CONFIG_WORKSPACE_DIRECTORY", "")
+    try:
+        from griptape_nodes.retained_mode.engine import has_current_engine
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        if has_current_engine():
+            workspace = GriptapeNodes.ConfigManager().configured_global_workspace_path()
+    except (ImportError, AttributeError, OSError, RuntimeError, ValueError):
+        pass
+    # Older SDKs and standalone workers need the Desktop workspace setting.
+    if not workspace and os.environ.get("APPDATA"):
+        desktop_config = Path(os.environ["APPDATA"]) / "Griptape Nodes" / "gtn-workspace.json"
+        try:
+            workspace = json.loads(desktop_config.read_text(encoding="utf-8-sig"))["workspaceDirectory"]
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+    if not isinstance(workspace, (Path, str)) or not Path(workspace).expanduser().is_absolute():
+        workspace = Path.home() / "Documents" / "GriptapeNodes"
+    return Path(workspace).expanduser() / ".json" / "hmb_image_catalogs"
+
+
+_ASSET_CATALOG_INDEX_ROOT = _configured_catalog_index_root()
+_LEGACY_CATALOG_INDEX_ROOT = _ASSET_THUMBNAIL_CACHE_ROOT.parent / "image_catalogs"
 _ASSET_CATALOG_INDEX_SCHEMA = "hmb-image-asset-catalog-index"
 _ASSET_CATALOG_INDEX_VERSION = 2
 _ASSET_CATALOG_INDEX_MAX_BYTES = 32 * 1024 * 1024
@@ -326,6 +353,13 @@ _SHARED_CATALOG_CACHE_LOCK = threading.RLock()
 _SHARED_CATALOG_CACHE: "OrderedDict[tuple[str, str, str], Dict[str, Any]]" = OrderedDict()
 _SHARED_CATALOG_ROOT_BINDINGS: "OrderedDict[str, tuple[str, str, str]]" = OrderedDict()
 _SHARED_CATALOG_CACHE_LIMIT = 32
+_CATALOG_READS: Dict[tuple, Future] = {}
+_CATALOG_SESSION_LOCKS: Dict[tuple, Any] = {}
+_WARM_PROJECT_LIST: Dict[str, Any] = {}
+# Process-only directory facts. Workflow or local-index data cannot seed these.
+_CATALOG_INVENTORIES = OrderedDict()
+_CATALOG_INVENTORIES_LOCK = threading.Lock()
+_RAW_FOLDER_PROBE_BATCH = 8
 CATALOG_PROBE_OPERATION = "catalog_probe"
 CATALOG_PROBE_MANIFEST_SECONDS = 3.0
 CATALOG_PROBE_FOLDER_SECONDS = 10.0
@@ -1253,7 +1287,7 @@ def _thumbnail_cache_process_lock(cache_root: Path):
     lock_path = cache_root / _ASSET_THUMBNAIL_CACHE_PROCESS_LOCK_NAME
     if _is_reparse_point(lock_path):
         raise ValueError("Thumbnail cache lock must not be a reparse point.")
-    deadline = time.monotonic() + ASSET_MANIFEST_LOCK_TIMEOUT_SECONDS
+    deadline = time.monotonic() + ASSET_THUMBNAIL_LOCK_TIMEOUT_SECONDS
     descriptor = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
     acquired = False
     try:
@@ -2287,7 +2321,7 @@ def _verified_project_relative_path(
         records = (
             manifest_records
             if isinstance(manifest_records, dict)
-            else _manifest_for_selection(resolved_root, [asset])
+            else _manifest_for_selection(resolved_root, [asset], catalog_root=state.get("catalog_root"))
         )
         manifest_record = records.get(relative_text.casefold())
     except Exception:
@@ -2324,17 +2358,16 @@ def _asset_metadata_directory(root: Path, *, create: bool = False) -> Path:
     metadata_root = resolved_root / ASSET_METADATA_DIRECTORY_NAME
     if create:
         metadata_root.mkdir(exist_ok=True)
-    if metadata_root.exists():
-        if not metadata_root.is_dir() or _is_reparse_point(metadata_root):
-            raise ValueError(
-                f"{ASSET_METADATA_DIRECTORY_NAME} must be a regular project directory."
-            )
-        try:
-            _resolve_image_path(metadata_root).relative_to(resolved_root)
-        except Exception as exc:
-            raise ValueError(
-                f"{ASSET_METADATA_DIRECTORY_NAME} resolves outside the project."
-            ) from exc
+    try:
+        facts = metadata_root.lstat()
+    except FileNotFoundError:
+        return metadata_root
+    if not stat.S_ISDIR(facts.st_mode) or getattr(facts, "st_file_attributes", 0) & 0x400:
+        raise ValueError(f"{ASSET_METADATA_DIRECTORY_NAME} must be a regular project directory.")
+    try:
+        _resolve_image_path(metadata_root).relative_to(resolved_root)
+    except Exception as exc:
+        raise ValueError(f"{ASSET_METADATA_DIRECTORY_NAME} resolves outside the project.") from exc
     return metadata_root
 
 
@@ -2345,7 +2378,15 @@ def _existing_asset_manifest_path(root: Path) -> Path | None:
         *(metadata_root / name for name in MANIFEST_NAMES),
         *(_resolve_image_path(root) / name for name in MANIFEST_NAMES),
     ]
-    return next((candidate for candidate in candidates if candidate.is_file()), None)
+    for candidate in candidates:
+        try:
+            facts = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(facts.st_mode) or getattr(facts, "st_file_attributes", 0) & 0x400:
+            raise ValueError("Image asset manifest must be a regular file.")
+        return candidate
+    return None
 
 
 def _manifest_asset_relative_path(root: Path, record: Dict[str, Any]) -> str:
@@ -2415,7 +2456,134 @@ def _asset_manifest_lock(root: Path) -> threading.Lock:
 
 
 @contextmanager
+def _manifest_ticket_gate(path: Path):
+    """Keep sequence assignment and removal short; no media or JSON IO here."""
+    descriptor = _open_manifest_ticket(path, os.O_CREAT | os.O_RDWR)
+    try:
+        deadline = time.monotonic() + ASSET_MANIFEST_LOCK_TIMEOUT_SECONDS
+        while not _try_claim_manifest_ticket(descriptor):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Timed out waiting for the shared image registration queue.")
+            time.sleep(0.05)
+        yield
+    finally:
+        # Closing the handle releases the OS lease, including on process exit.
+        os.close(descriptor)
+
+
+def _open_manifest_ticket(path: Path, flags: int) -> int:
+    if _is_reparse_point(path):
+        raise ValueError("Image registration queue entries must be regular files.")
+    descriptor = os.open(path, flags | getattr(os, "O_NOFOLLOW", 0), 0o666)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise ValueError("Image registration queue entries must be regular files.")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _try_claim_manifest_ticket(descriptor: int) -> bool:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            # An open-file-description lease also distinguishes independent
+            # callers sharing one interpreter. The legacy commit byte stays
+            # a POSIX record lock for compatibility with previous releases.
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError as exc:
+        if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+            return False
+        raise
+
+
+@contextmanager
+def _manifest_write_turn(root: Path):
+    """Enter commits in server admission order, independent of client clocks."""
+    directory = _asset_metadata_directory(root, create=True) / ".hmb_image_assets.queue"
+    directory.mkdir(exist_ok=True)
+    if _is_reparse_point(directory) or not stat.S_ISDIR(directory.lstat().st_mode):
+        raise ValueError("Image registration queue must be a regular project directory.")
+    gate = directory / ".admission"
+    lease = None
+    ticket = None
+    try:
+        with _manifest_ticket_gate(gate):
+            names = [name for name in os.listdir(directory) if re.fullmatch(r"[0-9]{16}\.wait", name)]
+            sequence = int(max(names)[:16]) + 1 if names else 1
+            if sequence >= 10**16:
+                raise ValueError("Image registration queue sequence is exhausted.")
+            ticket = directory / f"{sequence:016d}.wait"
+            lease = _open_manifest_ticket(ticket, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            if not _try_claim_manifest_ticket(lease):
+                raise OSError("Could not reserve the new image registration ticket.")
+
+        previous_head = None
+        while True:
+            with _manifest_ticket_gate(gate):
+                names = sorted(name for name in os.listdir(directory)
+                               if name < ticket.name and re.fullmatch(r"[0-9]{16}\.wait", name))
+                for name in names:
+                    predecessor = directory / name
+                    descriptor = _open_manifest_ticket(predecessor, os.O_RDWR)
+                    try:
+                        abandoned = _try_claim_manifest_ticket(descriptor)
+                    finally:
+                        os.close(descriptor)
+                    if not abandoned:
+                        break
+                    # The shared filesystem granted its lease: the previous
+                    # owner exited, including a crash during ticket creation.
+                    predecessor.unlink()
+                else:
+                    break
+            if name != previous_head:
+                previous_head = name
+                deadline = time.monotonic() + ASSET_MANIFEST_LOCK_TIMEOUT_SECONDS
+            if time.monotonic() >= deadline:
+                raise TimeoutError("The preceding shared image registration did not finish.")
+            time.sleep(0.1)
+        def verify_ticket() -> None:
+            # Do not mistake a replaced queue entry for this lease after a
+            # reconnect. The legacy lock still serializes the manifest commit.
+            if not os.path.samestat(os.fstat(lease), ticket.lstat()):
+                raise OSError("The shared image registration ticket changed.")
+
+        yield verify_ticket
+    finally:
+        if lease is not None:
+            try:
+                with _manifest_ticket_gate(gate):
+                    same_ticket = os.path.samestat(os.fstat(lease), ticket.lstat())
+                    os.close(lease)
+                    lease = None
+                    if same_ticket:
+                        ticket.unlink()
+            except (OSError, ValueError) as exc:
+                # A manifest may already be committed. Never report it as
+                # failed solely because temporary ticket cleanup failed.
+                _diagnostic_warning("Image registration ticket cleanup", exc)
+            finally:
+                if lease is not None:
+                    os.close(lease)
+
+
+@contextmanager
 def _asset_manifest_process_lock(root: Path):
+    with _manifest_write_turn(root) as verify_ticket, _legacy_asset_manifest_lock(root):
+        verify_ticket()
+        yield
+
+
+@contextmanager
+def _legacy_asset_manifest_lock(root: Path):
     """Serialize manifest writers with a persistent OS/SMB byte-range lock."""
     lock_path = (
         _asset_metadata_directory(root, create=True) / ASSET_MANIFEST_LOCK_NAME
@@ -2425,7 +2593,7 @@ def _asset_manifest_process_lock(root: Path):
             "Image asset manifest lock must not be a symlink or reparse point."
         )
     deadline = time.monotonic() + ASSET_MANIFEST_LOCK_TIMEOUT_SECONDS
-    descriptor = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    descriptor = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o666)
     acquired = False
     try:
         if os.fstat(descriptor).st_size < 1:
@@ -2533,7 +2701,7 @@ def _folder_metadata_signature_from_inventory(
         directory_count += 1
         digest.update(
             (
-                f"d|{relative.casefold()}|{stat_result.st_mtime_ns}|"
+                f"d|{relative}|{stat_result.st_mtime_ns}|"
                 f"{getattr(stat_result, 'st_ctime_ns', 0)}\n"
             ).encode("utf-8")
         )
@@ -2549,7 +2717,7 @@ def _folder_metadata_signature_from_inventory(
         image_count += 1
         digest.update(
             (
-                f"f|{relative.casefold()}|{stat_result.st_size}|"
+                f"f|{relative}|{stat_result.st_size}|"
                 f"{stat_result.st_mtime_ns}|"
                 f"{getattr(stat_result, 'st_ctime_ns', 0)}\n"
             ).encode("utf-8")
@@ -2558,46 +2726,153 @@ def _folder_metadata_signature_from_inventory(
     return digest.hexdigest()[:24]
 
 
-def _catalog_file_inventory(root: Path) -> tuple[List[str], List[Path], Dict[Path, os.stat_result]]:
-    """Enumerate once, retaining directory-entry metadata on network shares.
+def _catalog_directory_stamp(facts):
+    return facts.st_dev, facts.st_ino, facts.st_mtime_ns, facts.st_ctime_ns
 
-    No image bytes are read. Reparse points are excluded at every boundary;
-    an unreadable directory fails the check rather than accepting a partial
-    inventory as evidence that an old catalog is still current.
+
+def _catalog_directory_entries(root, current):
+    rows = []
+    directory_count = image_count = 0
+    with os.scandir(current) as entries:
+        for entry in sorted(entries, key=lambda item: _natural_key(item.name)):
+            if entry.name.startswith("."):
+                continue
+            if (current == root and root.name.casefold() == "ai_ct_image"
+                    and entry.name.casefold() == root.parent.name.casefold()):
+                continue
+            facts = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(facts.st_mode) or getattr(facts, "st_file_attributes", 0) & 0x400:
+                continue
+            path = Path(entry.path)
+            if stat.S_ISDIR(facts.st_mode) and directory_count < MAX_FOLDERS:
+                directory_count += 1
+                rows.append((path, facts))
+            elif (image_count < MAX_ASSETS and stat.S_ISREG(facts.st_mode)
+                  and path.suffix.casefold() in IMAGE_EXTENSIONS):
+                image_count += 1
+                rows.append((path, facts))
+    return rows
+
+
+def _catalog_file_inventory(root: Path, *, incremental=False, reconcile=False, confirm=False,
+                            manifest_signature="", records=None, full=False):
+    """Default full verification is kept for registration and cleanup authority.
+
+    Display scans only reuse directory entries read by this process from this
+    physical root. Check each directory's own stamp (not its parent's cached
+    entry); an in-place edit need not touch that stamp, so the background raw
+    file probe also revisits a rotating window. Explicit Refresh visits all.
     """
+    if not incremental:
+        return _collect_catalog_inventory(root, {}, set(), full=True)[:3]
+    root_facts = root.lstat()
+    identity = (root, _asset_manifest_cache_root_key(root), root_facts.st_dev, root_facts.st_ino)
+    with _CATALOG_INVENTORIES_LOCK:
+        memo = _CATALOG_INVENTORIES.get(identity)
+        if memo is None:
+            memo = {"lock": threading.Lock(), "entries": {}, "records": {}, "manifest": "", "cursor": 0}
+            _CATALOG_INVENTORIES[identity] = memo
+        _CATALOG_INVENTORIES.move_to_end(identity)
+        while len(_CATALOG_INVENTORIES) > _SHARED_CATALOG_CACHE_LIMIT:
+            _CATALOG_INVENTORIES.popitem(last=False)
+    with memo["lock"]:
+        dirty = set()
+        old = memo["entries"]
+        if records is not None and manifest_signature != memo["manifest"]:
+            # Include the nearest known parent for a registration in a new
+            # directory, even on a share coalescing directory timestamps.
+            directories = {p.relative_to(root).as_posix().casefold(): p for p in old}
+            for key in records.keys() | memo["records"].keys():
+                if records.get(key) == memo["records"].get(key):
+                    continue
+                parent = Path(key).parent
+                while parent != parent.parent and parent.as_posix() not in directories:
+                    parent = parent.parent
+                dirty.add(directories.get(parent.as_posix(), root))
+        cursor = memo["cursor"]
+        if confirm:
+            # Nodes with different saved baselines may share this root. A
+            # later node's probe must not change which folders we confirm.
+            witnesses = memo.get("probes", {}).get(confirm)
+            if witnesses is None:
+                full = True
+            else:
+                dirty.update(witnesses)
+        elif reconcile and old:
+            ordered = sorted(old, key=lambda path: path.as_posix().casefold())
+            count = min(len(ordered), _RAW_FOLDER_PROBE_BATCH)
+            dirty.update(ordered[(cursor + offset) % len(ordered)] for offset in range(count))
+            cursor = (cursor + count) % len(ordered)
+        try:
+            folders, images, metadata, updated, visited = _collect_catalog_inventory(root, old, dirty, full=full)
+        except (FileNotFoundError, NotADirectoryError):
+            # A mapped share can retain the old parent's timestamp after a
+            # child has gone or changed type. Recover from actual directory
+            # entries; never advance the rotation on a failed partial walk.
+            if not old or full:
+                raise
+            folders, images, metadata, updated, visited = _collect_catalog_inventory(root, {}, set(), full=True)
+        # Publish atomically after the complete read. A blocked or disconnected
+        # share cannot replace the last verified snapshot with a partial list.
+        memo["entries"] = updated if len(folders) < MAX_FOLDERS and len(images) < MAX_ASSETS else {}
+        if records is not None:
+            memo["records"] = records
+            memo["manifest"] = manifest_signature
+        if reconcile:
+            memo["cursor"] = cursor
+            signature = _folder_metadata_signature_from_inventory(root, folders, images, metadata=metadata)
+            probes = memo.setdefault("probes", OrderedDict())
+            probes.setdefault(signature, set()).update(visited)
+            probes.move_to_end(signature)
+            while len(probes) > 4:
+                probes.popitem(last=False)
+        return folders, images, metadata
+
+
+def _collect_catalog_inventory(root, previous, dirty, *, full):
     folders: List[str] = []
     images: List[Path] = []
     metadata: Dict[Path, os.stat_result] = {}
+    updated = {}
+    visited = set()
     pending = [root]
     while pending:
         current = pending.pop()
-        if _is_reparse_point(current):
-            raise ValueError("Catalog directory changed to a reparse point.")
-        with os.scandir(current) as entries:
-            for entry in sorted(entries, key=lambda item: _natural_key(item.name)):
-                if entry.name.startswith("."):
-                    continue
-                if (current == root and root.name.casefold() == "ai_ct_image"
-                        and entry.name.casefold() == root.parent.name.casefold()):
-                    continue
-                facts = entry.stat(follow_symlinks=False)
-                if (stat.S_ISLNK(facts.st_mode)
-                        or getattr(facts, "st_file_attributes", 0) & 0x400):
-                    continue
-                path = Path(entry.path)
-                relative = path.relative_to(root).as_posix()
-                if stat.S_ISDIR(facts.st_mode) and len(folders) < MAX_FOLDERS:
-                    folders.append(relative)
-                    metadata[path] = facts
-                    pending.append(path)
-                elif (stat.S_ISREG(facts.st_mode) and path.suffix.casefold() in IMAGE_EXTENSIONS
-                        and len(images) < MAX_ASSETS):
-                    images.append(path)
-                    metadata[path] = facts
-    return sorted(folders, key=_natural_key), sorted(images, key=lambda path: str(path).casefold()), metadata
+        cached = previous.get(current)
+        for attempt in range(2):
+            if attempt:
+                # SMB can publish the directory stamp just after its entries.
+                # Retry only this directory, before admitting any of its rows.
+                time.sleep(0.08)
+            directory = current.lstat()
+            if (not stat.S_ISDIR(directory.st_mode) or stat.S_ISLNK(directory.st_mode)
+                    or getattr(directory, "st_file_attributes", 0) & 0x400):
+                raise NotADirectoryError(f"Catalog path is no longer a regular directory: {current}")
+            stamp = (current.as_posix(), _catalog_directory_stamp(directory))
+            if not attempt and not full and cached is not None and cached[0] == stamp and current not in dirty:
+                rows = cached[1]
+                break
+            rows = _catalog_directory_entries(root, current)
+            if _catalog_directory_stamp(current.lstat()) == stamp[1]:
+                visited.add(current)
+                break
+        else:
+            raise OSError(f"Project directory changed during catalog verification: {current}")
+        if current != root:
+            metadata[current] = directory
+        for path, facts in rows:
+            if stat.S_ISDIR(facts.st_mode) and len(folders) < MAX_FOLDERS:
+                folders.append(path.relative_to(root).as_posix())
+                pending.append(path)
+            elif stat.S_ISREG(facts.st_mode) and len(images) < MAX_ASSETS:
+                images.append(path)
+                metadata[path] = facts
+        if len(folders) < MAX_FOLDERS and len(images) < MAX_ASSETS:
+            updated[current] = (stamp, rows)
+    return sorted(folders, key=_natural_key), sorted(images, key=lambda path: str(path).casefold()), metadata, updated, visited
 
 
-def _project_folder_metadata_signature(project_root: Any) -> str:
+def _project_folder_metadata_signature(project_root: Any, *, reconcile=False, confirm=False) -> str:
     """Hash bounded image/directory metadata without opening image content.
 
     Network file notification delivery is not reliable enough to be the sole
@@ -2612,7 +2887,8 @@ def _project_folder_metadata_signature(project_root: Any) -> str:
     root = _resolve_image_path(Path(root_text).expanduser())
     if not root.is_dir() or _is_reparse_point(root):
         raise ValueError(f"Project root is unavailable: {root}")
-    folders, images, metadata = _catalog_file_inventory(root)
+    folders, images, metadata = _catalog_file_inventory(
+        root, incremental=reconcile or confirm, reconcile=reconcile, confirm=confirm)
     return _folder_metadata_signature_from_inventory(root, folders, images, metadata=metadata)
 
 
@@ -2684,6 +2960,21 @@ def _write_asset_manifest_record(root: Path, record: Dict[str, Any]) -> Path:
     with lock:
         with _asset_manifest_process_lock(root):
             return _write_asset_manifest_record_locked(root, record)
+
+
+def _replace_registration_manifest(temporary: Path, manifest: Path) -> None:
+    """A short-lived SMB reader can deny replacement even with the writer lock."""
+    for delay in (0.04, 0.08, 0.16, 0.32, 0.64, 1.0):
+        try:
+            os.replace(temporary, manifest)
+            return
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in {5, 32, 33}:
+                raise
+            # Keep our existing FIFO turn, prepared bytes and legacy commit
+            # lock. Never remove the previous registry or repeat the Add.
+            time.sleep(delay)
+    os.replace(temporary, manifest)
 
 
 def _write_asset_manifest_record_locked(
@@ -2792,7 +3083,7 @@ def _write_asset_manifest_record_locked(
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, manifest_path)
+        _replace_registration_manifest(temporary, manifest_path)
     except Exception:
         try:
             temporary.unlink(missing_ok=True)
@@ -2805,9 +3096,9 @@ def _write_asset_manifest_record_locked(
     return manifest_path
 
 
-def _read_asset_manifest(root: Path) -> Dict[str, Dict[str, Any]]:
+def _read_asset_manifest(root: Path, *, signature: str = "") -> Dict[str, Dict[str, Any]]:
     resolved_root = _resolve_image_path(root)
-    signature = _asset_manifest_signature(resolved_root)
+    signature = signature or _asset_manifest_signature(resolved_root)
     root_key = _asset_manifest_cache_root_key(resolved_root)
     cache_key = (root_key, signature)
     with _ASSET_MANIFEST_CACHE_LOCK:
@@ -2838,16 +3129,17 @@ def _read_asset_manifest(root: Path) -> Dict[str, Dict[str, Any]]:
 
     # Do not cache a parse under an obsolete signature if another workstation
     # atomically replaces the shared manifest while this process is reading it.
-    if _asset_manifest_signature(resolved_root) == signature:
-        with _ASSET_MANIFEST_CACHE_LOCK:
-            stale_keys = [
-                key for key in _ASSET_MANIFEST_CACHE if key[0] == root_key
-            ]
-            for key in stale_keys:
-                _ASSET_MANIFEST_CACHE.pop(key, None)
-            while len(_ASSET_MANIFEST_CACHE) >= _ASSET_MANIFEST_CACHE_LIMIT:
-                _ASSET_MANIFEST_CACHE.pop(next(iter(_ASSET_MANIFEST_CACHE)))
-            _ASSET_MANIFEST_CACHE[cache_key] = dict(overrides)
+    if _asset_manifest_signature(resolved_root) != signature:
+        raise OSError("ImageAsset registration changed during catalog verification; retry the read.")
+    with _ASSET_MANIFEST_CACHE_LOCK:
+        stale_keys = [
+            key for key in _ASSET_MANIFEST_CACHE if key[0] == root_key
+        ]
+        for key in stale_keys:
+            _ASSET_MANIFEST_CACHE.pop(key, None)
+        while len(_ASSET_MANIFEST_CACHE) >= _ASSET_MANIFEST_CACHE_LIMIT:
+            _ASSET_MANIFEST_CACHE.pop(next(iter(_ASSET_MANIFEST_CACHE)))
+        _ASSET_MANIFEST_CACHE[cache_key] = dict(overrides)
     return overrides
 
 
@@ -3230,10 +3522,30 @@ def _restore_manifest_registration(asset, relative, overrides, stems):
     )
     asset["image_name"] = _clean(values.get("image_name") or values.get("name")) or relative.stem
     asset["registered"] = override is not None
+    # Reconstructed cache rows follow the same registry defaults as a cold
+    # scan. The subsequent per-workflow merge owns explicit local selections.
+    asset["selected"] = override is not None and bool(values.get("selected"))
+    asset["selection_order"] = _non_negative_int(values.get("selection_order"))
     asset["import_source_uid"] = _clean(values.get("import_source_uid"))
 
 
-def _manifest_for_selection(root, selected):
+def _manifest_for_selection(root, selected, *, catalog_root=None):
+    # Only rows obtained from a verified project read or a successful local Add
+    # can authorize a handover. Workflow/preview metadata is never authority.
+    key = _session_catalog_key("catalog", root)
+    with _SHARED_CATALOG_CACHE_LOCK:
+        pinned = _CATALOG_READS.get(key)
+        session_started = bool(catalog_root and _session_catalog_key("projects", catalog_root) in _CATALOG_SESSION_LOCKS)
+    if pinned is not None:
+        if pinned.exception() is not None:
+            return {}
+        requested = {_clean(row.get("relative_path")).casefold() for row in selected}
+        return {row["relative_path"].casefold(): row for row in pinned.result()["assets"]
+                if row.get("registered") and row["relative_path"].casefold() in requested}
+    if session_started:
+        # An offline or still-loading catalog has no verified session rows.
+        # A preview cannot launch a parallel read or authorize saved metadata.
+        return {}
     records = _read_asset_manifest(root)
     if any(row.get("registered") and row.get("source_kind") == "project"
            and _clean(row.get("relative_path")).casefold() not in records for row in selected):
@@ -3269,8 +3581,10 @@ def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | N
     project_uid = _project_uid(root)
     project_cache_uid = _project_cache_uid(root)
     manifest_signature = _asset_manifest_signature(root)
-    manifest_overrides = _read_asset_manifest(root)
-    folders, paths, metadata = _catalog_file_inventory(root)
+    manifest_overrides = _read_asset_manifest(root, signature=manifest_signature)
+    folders, paths, metadata = _catalog_file_inventory(
+        root, incremental=True, full=previous_scan is None,
+        manifest_signature=manifest_signature, records=manifest_overrides)
     manifest_overrides = _manifest_at_current_paths(manifest_overrides, root, folders, paths)
     warnings: List[str] = []
     folder_signature = _folder_metadata_signature_from_inventory(root, folders, paths, metadata=metadata)
@@ -4748,7 +5062,7 @@ def _shared_catalog_cache_key(state: Dict[str, Any]) -> tuple[str, str, str] | N
     return uid, manifest_signature, folder_signature
 
 
-def _shared_catalog_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
+def _shared_catalog_snapshot(state: Dict[str, Any], *, registry_defaults: bool = False) -> Dict[str, Any]:
     """Copy project catalog authority without copying any Shot/UI selection."""
 
     normalized = _normalize_state(state)
@@ -4759,8 +5073,9 @@ def _shared_catalog_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
                          and _non_negative_int(raw_asset.get("import_index")) == 0)):
             continue
         asset = dict(raw_asset)
-        asset["selected"] = False
-        asset["selection_order"] = 0
+        if not registry_defaults:
+            asset["selected"] = False
+            asset["selection_order"] = 0
         if not _thumbnail_url_is_live(
             asset.get("media_signature"), asset.get("thumbnail_url")
         ):
@@ -4845,13 +5160,15 @@ def _rebind_shared_catalog_snapshot(
         manifest_changed = _clean(snapshot.get("manifest_signature")) != manifest_signature
         if manifest_changed and not refresh_manifest:
             return None
-        folders, paths, metadata = _catalog_file_inventory(root)
+        records = _read_asset_manifest(root, signature=manifest_signature)
+        folders, paths, metadata = _catalog_file_inventory(root, incremental=True,
+            manifest_signature=manifest_signature, records=records)
         if _clean(snapshot.get("folder_signature")) != _folder_metadata_signature_from_inventory(
             root, folders, paths, metadata=metadata
         ):
             return None
         verified_paths = set(paths)
-        overrides = _manifest_at_current_paths(_read_asset_manifest(root), root, folders, paths)
+        overrides = _manifest_at_current_paths(records, root, folders, paths)
         stems = Counter(path.stem.casefold() for path in paths)
         assets: List[Dict[str, Any]] = []
         for raw_asset in snapshot.get("assets", []):
@@ -4965,6 +5282,108 @@ def _adopt_shared_catalog_snapshot(
     return _normalize_state(merged)
 
 
+def _session_catalog_key(kind: str, root: Any) -> tuple:
+    return kind, _project_root_text(root).replace("\\", "/").rstrip("/").casefold()
+
+
+def _catalog_session_lock(key: tuple):
+    with _SHARED_CATALOG_CACHE_LOCK:
+        return _CATALOG_SESSION_LOCKS.setdefault(key, threading.RLock())
+
+
+def _catalog_read_once(key: tuple, read: Callable[[], Any], *, refresh: bool = False) -> Any:
+    """Pin one result per project for this engine session. Only Refresh replaces it."""
+    lock = _catalog_session_lock(key)
+    with _SHARED_CATALOG_CACHE_LOCK:
+        cached = _CATALOG_READS.get(key)
+    if cached is not None and not refresh:
+        return cached.result()
+    if not lock.acquire(timeout=PROJECT_REFRESH_TIMEOUT_SECONDS):
+        raise TimeoutError("ImageAsset project read is still pending.")
+    try:
+        with _SHARED_CATALOG_CACHE_LOCK:
+            cached = _CATALOG_READS.get(key)
+        if cached is not None and not refresh:
+            return cached.result()
+        complete = Future()
+        try:
+            result = read()
+        except Exception as exc:
+            # An offline startup gets one attempt. Keep the last good view on
+            # a failed manual refresh; ordinary opens never retry the share.
+            if cached is None:
+                complete.set_exception(OSError(str(exc)))
+                with _SHARED_CATALOG_CACHE_LOCK:
+                    _CATALOG_READS[key] = complete
+            raise
+        complete.set_result(result)
+        with _SHARED_CATALOG_CACHE_LOCK:
+            _CATALOG_READS[key] = complete
+        return result
+    finally:
+        lock.release()
+
+
+def _discover_shared_image_projects(root: Any, *, refresh: bool = False) -> Dict[str, Any]:
+    return _catalog_read_once(_session_catalog_key("projects", root),
+                              lambda: _discover_project_catalog(root), refresh=refresh)
+
+
+def _read_selected_image_catalog(
+    catalog: Dict[str, Any], selected: Dict[str, Any], state: Dict[str, Any], *,
+    use_shared_cache: bool = True, reuse_saved: bool = False,
+) -> Dict[str, Any]:
+    """Share filesystem facts across warmup, new nodes and workflow restores."""
+    project = Path(selected["path"])
+
+    def read():
+        # Never share a node's Shot, imported media, selected assets or UI state.
+        neutral = {"catalog_root": catalog["catalog_root"], "projects": catalog["projects"]}
+        facts = None
+        if use_shared_cache and reuse_saved and state.get("project_cache_uid"):
+            facts = _rebind_shared_catalog_snapshot(
+                _shared_catalog_snapshot(state), selected, catalog, refresh_manifest=True
+            )
+        if facts is None and use_shared_cache:
+            facts = _read_catalog_index(project, neutral)
+        if facts is None:
+            facts = _scan_project_assets(project, previous_scan=state)
+        # Only the just-verified catalog may supply legacy manifest defaults.
+        # Workflow-authored choices are merged after this neutral session read.
+        facts = _shared_catalog_snapshot({**facts, **neutral}, registry_defaults=True)
+        _prepare_catalog_scan_index(facts, normalized=True)
+        return facts
+
+    key = _session_catalog_key("catalog", project)
+    with _SHARED_CATALOG_CACHE_LOCK:
+        had_snapshot = key in _CATALOG_READS
+    try:
+        facts = _catalog_read_once(key, read, refresh=not use_shared_cache)
+    except (OSError, ValueError):
+        if not use_shared_cache:
+            raise
+        offline = _read_local_catalog_snapshot(project, {**state, "catalog_root": catalog["catalog_root"]})
+        if offline is None:
+            raise
+        facts = offline
+    same_revision = use_shared_cache and (had_snapshot or (
+        state.get("manifest_signature") == facts["manifest_signature"]
+        and state.get("folder_signature") == facts["folder_signature"]))
+    merged = _merge_scan_with_state(facts, state)
+    # A replacement node can adopt thumbnails published by this engine after
+    # the immutable catalog was pinned, without reopening the source files.
+    with _ASSET_THUMBNAIL_LOCK:
+        for asset in merged["assets"]:
+            url = _ASSET_THUMBNAIL_URLS.get(asset.get("media_signature"))
+            if url:
+                asset["thumbnail_url"] = url
+    if same_revision:
+        merged["scan_revision"] = _non_negative_int(state.get("scan_revision"))
+    merged["catalog_root"] = catalog["catalog_root"]
+    merged["projects"] = [dict(item) for item in catalog["projects"]]
+    return merged
+
+
 def _load_project_catalog(
     projects_root: Any,
     previous_state: Dict[str, Any],
@@ -4972,7 +5391,26 @@ def _load_project_catalog(
     use_shared_cache: bool = True,
 ) -> Dict[str, Any]:
     previous_state = _normalize_state(previous_state)
-    catalog = _discover_project_catalog(projects_root)
+    try:
+        catalog = _discover_shared_image_projects(projects_root, refresh=not use_shared_cache)
+    except (OSError, ValueError):
+        if not use_shared_cache:
+            raise
+        projects = _read_local_project_list(projects_root)
+        if not projects:
+            raise
+        selected = _match_catalog_project(projects, previous_path=previous_state.get("project_root"),
+                                          previous_uid=previous_state.get("project_uid"),
+                                          previous_project_id=previous_state.get("project_id"))
+        local_state = {**previous_state, "catalog_root": _project_root_text(projects_root), "projects": projects}
+        if not selected:
+            if previous_state.get("project_root"):
+                raise
+            return local_state
+        offline = _read_local_catalog_snapshot(selected["path"], local_state)
+        if offline is None:
+            raise
+        return offline
     state = dict(previous_state)
     state["catalog_root"] = catalog["catalog_root"]
     state["projects"] = catalog["projects"]
@@ -4991,39 +5429,22 @@ def _load_project_catalog(
     if not selected_path and len(catalog["projects"]) == 1:
         only_project = catalog["projects"][0]
         direct_root = Path(catalog["catalog_root"])
-        nested_root = None if direct_root.name.casefold() == "projects" else _nested_image_project_root(direct_root)
+        nested_root = direct_root / "Ai_Ct_image" if direct_root.name.casefold() != "projects" else None
         if (_clean(only_project.get("path")).casefold() == _clean(
             catalog["catalog_root"]
         ).casefold() or (nested_root is not None
                         and _clean(only_project.get("path")).casefold() == nested_root.as_posix().casefold())):
-            selected_path = _clean(only_project.get("path"))
+            selected = only_project
+            selected_path = _clean(selected.get("path"))
     if selected_path:
-        cached = (
-            _adopt_shared_catalog_snapshot(catalog, selected, state)
-            if use_shared_cache and selected is not None
-            else None
+        if not use_shared_cache:
+            # The user's explicit full verification also checks raw in-place
+            # edits in every folder immediately. Later cache/index validation
+            # reuses this very inventory without a second project walk.
+            _catalog_file_inventory(_resolve_image_path(Path(selected_path)), incremental=True, full=True)
+        state = _read_selected_image_catalog(
+            catalog, selected, state, use_shared_cache=use_shared_cache, reuse_saved=True,
         )
-        if cached is None:
-            # A saved workflow is also a reusable catalog, after validating its
-            # complete file inventory. A registration-only change refreshes
-            # taxonomy without decoding unchanged images again.
-            snapshot = _rebind_shared_catalog_snapshot(
-                _shared_catalog_snapshot(state), selected, catalog, refresh_manifest=True
-            ) if selected is not None else None
-            if snapshot is not None:
-                cached = _merge_scan_with_state(snapshot, state)
-                if snapshot.get("manifest_signature") == state.get("manifest_signature"):
-                    cached["scan_revision"] = _non_negative_int(state.get("scan_revision"))
-        if cached is None:
-            # Explicit refresh still audits registrations, but unchanged files
-            # reuse the durable catalog after fresh identity/metadata checks.
-            # The same path is used on cold restore and project re-selection.
-            cached = _read_catalog_index(selected_path, state)
-        state = cached or _merge_scan_with_state(
-            _scan_project_assets(selected_path, previous_scan=state), state
-        )
-        state["catalog_root"] = catalog["catalog_root"]
-        state["projects"] = catalog["projects"]
     else:
         state.update(
             {
@@ -5070,6 +5491,107 @@ def _catalog_index_path_for_verified_uid(project_cache_uid: Any) -> Path:
         raise ValueError("A verified project cache identity is required.")
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     return Path(_ASSET_CATALOG_INDEX_ROOT) / f"{digest}.json"
+
+
+def _catalog_lookup_path(kind: str, root: Path) -> Path:
+    # A lexical key works when the mapped drive is disconnected. Never resolve it here.
+    key = os.path.normcase(str(root)).encode("utf-8")
+    return Path(_ASSET_CATALOG_INDEX_ROOT) / f"{kind}-{hashlib.sha256(key).hexdigest()}.json"
+
+
+def _read_local_index_json(path: Path, *, limit: int = _ASSET_CATALOG_INDEX_MAX_BYTES) -> Any:
+    if _is_reparse_point(path) or path.stat().st_size > limit:
+        raise ValueError("Unsafe or oversized local catalog index")
+    with path.open("rb") as stream:
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("Oversized local catalog index")
+    return json.loads(data)
+
+
+def _read_index_or_legacy(path: Path) -> tuple[Any, bool]:
+    try:
+        return _read_local_index_json(path), False
+    except FileNotFoundError:
+        return _read_local_index_json(_LEGACY_CATALOG_INDEX_ROOT / path.name), True
+
+
+def _atomic_local_index_write(path: Path, payload: bytes) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_local_project_list(catalog_root: Any) -> List[Dict[str, str]]:
+    catalog = Path(_project_root_text(catalog_root))
+    if not catalog.is_absolute():
+        return []
+    try:
+        roster = _read_local_index_json(_catalog_lookup_path("catalog", catalog), limit=1024 * 1024)
+        if not isinstance(roster, dict) or Path(_clean(roster.get("catalog_root"))) != catalog:
+            return []
+        projects = _normalize_project_catalog(roster.get("projects"))
+        for project in projects:
+            relative = Path(project["path"]).relative_to(catalog)
+            if ".." in relative.parts or (len(relative.parts) > 1 and
+                    not (len(relative.parts) == 2 and relative.name.casefold() == "ai_ct_image")):
+                return []
+        return projects
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def _read_local_catalog_snapshot(project_root: Any, previous_state: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Show the last verified workstation catalog without touching the shared drive."""
+    root = Path(_project_root_text(project_root))
+    catalog = Path(_project_root_text(previous_state.get("catalog_root")))
+    if not root.is_absolute() or not catalog.is_absolute() or not root.is_relative_to(catalog):
+        return None
+    try:
+        identity = ""
+        if root == Path(_project_root_text(previous_state.get("project_root"))):
+            identity = _valid_project_cache_uid(previous_state.get("project_cache_uid"))
+        # A project can be replaced at the same location. Never use a retired
+        # saved identity when a newer verified identity is known at this path.
+        try:
+            current = _valid_project_cache_uid(_read_local_index_json(_catalog_lookup_path("project", root), limit=128))
+            if not current or (identity and current != identity):
+                return None
+            identity = current
+        except FileNotFoundError:
+            pass  # Older local indexes only had the saved identity.
+        if not identity:
+            return None
+        raw, _ = _read_index_or_legacy(_catalog_index_path_for_verified_uid(identity))
+        if (not isinstance(raw, dict) or raw.get("schema") != _ASSET_CATALOG_INDEX_SCHEMA
+                or raw.get("version") != _ASSET_CATALOG_INDEX_VERSION or raw.get("project_cache_uid") != identity
+                or Path(_project_root_text(raw.get("project_root"))) != root
+                or Path(_project_root_text(raw.get("catalog_root"))) != catalog
+                or raw.get("project_id") != _project_id(root) or raw.get("project_uid") != _project_uid(root)):
+            return None
+        assets = raw.get("assets")
+        if not isinstance(assets, list) or len(assets) > MAX_ASSETS:
+            return None
+        for asset in assets:
+            if not isinstance(asset, dict):
+                return None
+            relative = Path(_clean(asset.get("relative_path")))
+            if (relative.anchor or ".." in relative.parts or relative.suffix.casefold() not in IMAGE_EXTENSIONS
+                    or asset.get("asset_library_id") != _asset_library_id(raw["project_id"], relative.as_posix())):
+                return None
+            asset["path"] = (root / relative).as_posix()
+            asset["thumbnail_url"] = ""
+        merged = _merge_scan_with_state(raw, previous_state)
+        merged["scan_revision"] = _non_negative_int(previous_state.get("scan_revision"))
+        return merged
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
 
 
 def _catalog_index_projection(
@@ -5130,12 +5652,19 @@ def _write_catalog_index(
         )
         with _ASSET_CATALOG_INDEX_LOCK:
             index_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = index_path.parent / f".{index_path.name}.{uuid.uuid4().hex}.tmp"
-            try:
-                temporary.write_bytes(payload)
-                os.replace(temporary, index_path)
-            finally:
-                temporary.unlink(missing_ok=True)
+            _atomic_local_index_write(index_path, payload)
+            lookups = (
+                (_catalog_lookup_path("project", Path(project_root)), projection["project_cache_uid"]),
+                (_catalog_lookup_path("catalog", Path(projection["catalog_root"])),
+                 {"catalog_root": projection["catalog_root"], "projects": projection["projects"]}),
+            )
+            for path, value in lookups:
+                try:
+                    if _read_local_index_json(path, limit=1024 * 1024) == value:
+                        continue
+                except (OSError, ValueError):
+                    pass
+                _atomic_local_index_write(path, _json_text(value).encode("utf-8"))
     except Exception as exc:
         _diagnostic_warning("Local catalog index write failed", exc)
 
@@ -5180,13 +5709,7 @@ def _read_catalog_index(
         return None
     try:
         index_path = _catalog_index_path(root_text)
-        if (
-            not index_path.is_file()
-            or _is_reparse_point(index_path)
-            or index_path.stat().st_size > _ASSET_CATALOG_INDEX_MAX_BYTES
-        ):
-            return None
-        raw = json.loads(index_path.read_text(encoding="utf-8"))
+        raw, legacy = _read_index_or_legacy(index_path)
         expected_catalog_root = _project_root_text(
             previous_state.get("catalog_root")
         ).replace("\\", "/")
@@ -5218,13 +5741,19 @@ def _read_catalog_index(
             != _asset_manifest_signature(resolved_root)
         ):
             return None
-        folders, paths, metadata = _catalog_file_inventory(resolved_root)
+        records = _read_asset_manifest(resolved_root, signature=raw["manifest_signature"])
+        # A local file cannot establish live inventory. Even an immediately
+        # added file may share its directory's timestamp on NTFS or SMB.
+        # Warm in-process restores take the verified snapshot path above.
+        folders, paths, metadata = _catalog_file_inventory(
+            resolved_root, incremental=True, full=True,
+            manifest_signature=raw["manifest_signature"], records=records)
         if _clean(raw.get("folder_signature")) != _folder_metadata_signature_from_inventory(
             resolved_root, folders, paths, metadata=metadata
         ):
             return None
         verified_paths = set(paths)
-        overrides = _manifest_at_current_paths(_read_asset_manifest(resolved_root), resolved_root, folders, paths)
+        overrides = _manifest_at_current_paths(records, resolved_root, folders, paths)
         stems = Counter(path.stem.casefold() for path in paths)
         assets = raw.get("assets")
         if not isinstance(assets, list) or len(assets) > MAX_ASSETS:
@@ -5262,30 +5791,25 @@ def _read_catalog_index(
         merged["scan_revision"] = _non_negative_int(
             previous_state.get("scan_revision")
         )
+        if legacy:
+            _write_catalog_index(merged, normalized=True)
         return merged
     except Exception:
         return None
 
 
-def _state_catalog_is_current(state: Dict[str, Any]) -> bool:
-    """Cheap SWR guard: validate the managed manifest without walking assets."""
-
-    project_root = _clean(state.get("project_root"))
-    signature = _clean(state.get("manifest_signature"))
-    if not project_root or not signature:
+def _state_catalog_is_current(state: Dict[str, Any], catalog_root: Any = None) -> bool:
+    """Compare with the verified session in memory, including its catalog boundary."""
+    key = _session_catalog_key("catalog", state.get("project_root"))
+    with _SHARED_CATALOG_CACHE_LOCK:
+        pinned = _CATALOG_READS.get(key)
+    if pinned is None or pinned.exception() is not None:
         return False
-    try:
-        root = _resolve_image_path(Path(project_root))
-        return (
-            root.is_dir()
-            and not _is_reparse_point(root)
-            and _clean(state.get("project_id")) == _project_id(root)
-            and _clean(state.get("project_uid")) == _project_uid(root)
-            and _clean(state.get("project_cache_uid")) == _project_cache_uid(root)
-            and signature == _asset_manifest_signature(root)
-        )
-    except Exception:
-        return False
+    facts = pinned.result()
+    return (_session_catalog_key("projects", catalog_root or state.get("catalog_root"))
+            == _session_catalog_key("projects", facts["catalog_root"])
+            and all(state.get(field) == facts.get(field) for field in
+                    ("project_uid", "project_cache_uid", "manifest_signature", "folder_signature")))
 
 
 def _state_project_belongs_to_catalog(
@@ -5339,19 +5863,7 @@ def _select_catalog_project(
         "catalog_root": normalized["catalog_root"],
         "projects": normalized["projects"],
     }
-    merged = _adopt_shared_catalog_snapshot(catalog, selected, normalized)
-    if merged is None:
-        # Reopening the application loses the process snapshot, but not the
-        # local index. This read independently verifies the actual project UID,
-        # manifest, folder fingerprint and all contained row paths before use.
-        merged = _read_catalog_index(selected["path"], normalized)
-    if merged is None:
-        merged = _merge_scan_with_state(
-            _scan_project_assets(selected["path"], previous_scan=normalized),
-            normalized,
-        )
-    merged["catalog_root"] = normalized["catalog_root"]
-    merged["projects"] = normalized["projects"]
+    merged = _read_selected_image_catalog(catalog, selected, normalized)
     merged["selected_main_type"] = ""
     merged["selected_sub_type"] = ""
     merged["selected_source_view"] = "project"
@@ -5623,6 +6135,7 @@ def _resolve_project_asset_file(
     *,
     allow_user_import_path: bool = True,
     verified_file_facts: Dict[str, tuple[Path, int, int, str]] | None = None,
+    project_cache_uid: str = "",
 ) -> tuple[Path, str, str]:
     """Resolve one exact image row without walking the surrounding project."""
 
@@ -5661,7 +6174,7 @@ def _resolve_project_asset_file(
         raise ValueError("The image identity changed while the operation was pending.")
     facts = _asset_file_facts(
         resolved,
-        project_uid=_project_cache_uid(resolved_root),
+        project_uid=project_cache_uid or _project_cache_uid(resolved_root),
         relative_path=canonical_relative,
     )
     if verified_file_facts is not None:
@@ -5831,6 +6344,43 @@ def _apply_asset_registration(
     request_value: Any,
     import_media_by_uid: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    """Serialize this client's Add with its project refresh and patch only that row."""
+    key = _session_catalog_key("catalog", state.get("project_root"))
+    with _catalog_session_lock(key):
+        # A user can press Add on the local preview before startup reaches this
+        # project. Join or perform the same one-time authoritative read before
+        # granting registration authority. Never promote a saved node's rows.
+        with _SHARED_CATALOG_CACHE_LOCK:
+            pinned = _CATALOG_READS.get(key)
+        if pinned is None:
+            _load_project_catalog(state.get("catalog_root"), state)
+            with _SHARED_CATALOG_CACHE_LOCK:
+                pinned = _CATALOG_READS.get(key)
+        if pinned is None or pinned.exception() is not None:
+            raise ValueError("프로젝트의 서버 등록부를 확인할 수 없습니다. 새로고침 후 등록하세요.")
+        result = _commit_asset_registration(state, request_value, import_media_by_uid)
+        library_id = result["asset_registration_result"]["asset_library_id"]
+        row = next(asset for asset in result["assets"] if asset["asset_library_id"] == library_id)
+        snapshot = dict(pinned.result())
+        rows = list(snapshot["assets"])
+        clean_row = dict(row, selected=False, selection_order=0)
+        index = next((i for i, item in enumerate(rows) if item["asset_library_id"] == library_id), len(rows))
+        if index == len(rows):
+            rows.append(clean_row)
+        else:
+            rows[index] = clean_row
+        snapshot.update(assets=rows, manifest_signature=result["manifest_signature"])
+        complete = Future()
+        complete.set_result(snapshot)
+        with _SHARED_CATALOG_CACHE_LOCK:
+            _CATALOG_READS[key] = complete
+        _prepare_catalog_scan_index(snapshot, normalized=True)
+        return result
+
+
+def _commit_asset_registration(
+    state: Dict[str, Any], request_value: Any, import_media_by_uid: Dict[str, Any] | None,
+) -> Dict[str, Any]:
     """Commit and hydrate exactly one Add without rescanning the project."""
     normalized = _normalize_state(state)
     request = _normalize_asset_registration_request(request_value)
@@ -5843,7 +6393,7 @@ def _apply_asset_registration(
     if request.get("project_uid") != project_uid:
         raise ValueError("The asset registration request belongs to a stale project.")
 
-    catalog = _discover_project_catalog(normalized.get("catalog_root"))
+    catalog = _discover_shared_image_projects(normalized.get("catalog_root"))
     selected_project = next(
         (
             item
@@ -5858,6 +6408,10 @@ def _apply_asset_registration(
 
     request_source_kind = request.get("source_kind", "project")
     selected_root = _resolve_image_path(Path(selected_project["path"]))
+    if (not _state_project_belongs_to_catalog(normalized, catalog["catalog_root"])
+            or _is_reparse_point(Path(selected_project["path"]))
+            or _clean(normalized.get("project_cache_uid")) != _project_cache_uid(selected_root)):
+        raise ValueError("The selected image project changed; refresh before registering.")
     registered_library_id = request["asset_library_id"]
     registration_message = ""
     source_selection = False
@@ -6035,16 +6589,9 @@ def _apply_asset_registration(
     try:
         refreshed["manifest_signature"] = _asset_manifest_signature(selected_root)
     except Exception as exc:
-        # The manifest is already durable. Keep the prior signature so the
-        # ordinary poll detects and reconciles it instead of reporting Add as
-        # failed after commit because a share became briefly unavailable.
+        # The manifest is already durable; retain the previous signature until
+        # explicit refresh if the share became temporarily unavailable.
         _diagnostic_warning("Post-registration manifest signature refresh", exc)
-    try:
-        refreshed["folder_signature"] = _project_folder_metadata_signature(
-            selected_root
-        )
-    except Exception as exc:
-        _diagnostic_warning("Post-registration folder signature refresh", exc)
     refreshed["scan_revision"] = _non_negative_int(
         normalized.get("scan_revision")
     ) + 1
@@ -6106,14 +6653,6 @@ def _hydrate_asset_thumbnails(
     )
     project_root_text = _clean(normalized_state.get("project_root"))
     project_id = _clean(normalized_state.get("project_id"))
-    if context_matches and project_root_text and project_id:
-        try:
-            context_matches = (
-                _asset_manifest_signature(Path(project_root_text))
-                == request.get("manifest_signature")
-            )
-        except Exception:
-            context_matches = False
 
     assets = [dict(asset) for asset in normalized_state["assets"]]
     by_library_id = {
@@ -6178,6 +6717,7 @@ def _hydrate_asset_thumbnails(
                         library_id,
                         allow_user_import_path=True,
                         verified_file_facts=verified_file_facts,
+                        project_cache_uid=_clean(normalized_state.get("project_cache_uid")),
                     )
                     expected_signature = _clean(asset.get("media_signature"))
                     if expected_signature and media_signature != expected_signature:
@@ -7282,7 +7822,7 @@ def _resolve_selected_assets(
                     try:
                         project_root = _clean(normalized.get("project_root"))
                         manifest_records = (
-                            _manifest_for_selection(Path(project_root), ordered)
+                            _manifest_for_selection(Path(project_root), ordered, catalog_root=normalized["catalog_root"])
                             if project_root
                             else {}
                         )
@@ -7394,7 +7934,7 @@ def _selection_id(
             try:
                 project_root = _clean(state.get("project_root"))
                 manifest_records = (
-                    _manifest_for_selection(Path(project_root), ordered_assets) if project_root else {}
+                    _manifest_for_selection(Path(project_root), ordered_assets, catalog_root=state.get("catalog_root")) if project_root else {}
                 )
             except Exception:
                 manifest_records = {}
@@ -8891,6 +9431,45 @@ class HMBImageAssetLibrary(DataNode):
     Type remains bound there while Target and Color Pick stay freely editable.
     """
 
+    @staticmethod
+    def start_catalog_warmup(stop: threading.Event) -> threading.Thread:
+        """Prepare catalog metadata at editor startup, independently of any node."""
+        root = DEFAULT_PROJECTS_ROOT
+
+        def prepare() -> None:
+            started = time.monotonic()
+            completed = failures = asset_count = 0
+            _LOGGER.info("[HMB_IMAGE_CATALOG_WARMUP] started root=%s", root)
+            try:
+                catalog = _discover_shared_image_projects(root)
+                if stop.is_set():
+                    return
+                with _SHARED_CATALOG_CACHE_LOCK:
+                    _WARM_PROJECT_LIST.update(catalog)
+                for project in catalog["projects"]:
+                    if stop.is_set():
+                        break
+                    try:
+                        state = _read_selected_image_catalog(catalog, project, {})
+                        completed += 1
+                        asset_count += len(state["assets"])
+                    except Exception as exc:
+                        failures += 1
+                        _diagnostic_warning("Startup image project read", exc)
+            except Exception as exc:
+                failures += 1
+                _diagnostic_warning("Startup project discovery", exc)
+            finally:
+                _LOGGER.info(
+                    "[HMB_IMAGE_CATALOG_WARMUP] %s projects=%d assets=%d errors=%d elapsed=%.2fs",
+                    "cancelled" if stop.is_set() else "finished", completed, asset_count, failures,
+                    time.monotonic() - started,
+                )
+
+        worker = threading.Thread(target=prepare, name="HMBImageCatalogWarmup", daemon=True)
+        worker.start()
+        return worker
+
     def __init__(self, **kwargs: Any):
         self._hmb_widget_runtime_lease = str(uuid.uuid4())
         self._hmb_image_bash_mutation_receipts: OrderedDict[str, Dict[str, Any]] = OrderedDict()
@@ -9481,6 +10060,10 @@ class HMBImageAssetLibrary(DataNode):
         candidate = dict(snapshot)
         candidate["catalog_root"] = requested_root
         candidate["error"] = ""
+        with _SHARED_CATALOG_CACHE_LOCK:
+            if (not candidate.get("projects") and requested_root.rstrip("/").casefold()
+                    == _clean(_WARM_PROJECT_LIST.get("catalog_root")).rstrip("/").casefold()):
+                candidate["projects"] = [dict(item) for item in _WARM_PROJECT_LIST.get("projects", [])]
         captured_import_value = _get_parameter_raw(
             self,
             IMAGE_IMPORT_PARAMETER,
@@ -9509,6 +10092,8 @@ class HMBImageAssetLibrary(DataNode):
                     captured_import_value,
                 ),
                 failure_state=snapshot,
+                keep_editable=bool(candidate.get("projects")),
+                timeout_seconds=PROJECT_REFRESH_TIMEOUT_SECONDS,
             )
 
     def _current_state(self) -> Dict[str, Any]:
@@ -11974,249 +12559,15 @@ class HMBImageAssetLibrary(DataNode):
             "outcome": outcome,
         }
 
-    def _compute_catalog_probe(
-        self,
-        state: Dict[str, Any],
-        request: Dict[str, Any],
-    ) -> tuple[str, Dict[str, Any] | None]:
-        """Probe metadata only; return a full state solely after a real change."""
-
-        project_root_text = _clean(state.get("project_root"))
-        if not project_root_text:
-            return "no_change", None
-        now = time.monotonic()
-        probe_kind = _clean(request.get("probe_kind")).casefold()
-        if probe_kind == "folder":
-            pending_signature = _clean(
-                self._hmb_catalog_probe_pending_folder_signature
-            )
-            if (
-                not pending_signature
-                and now - self._hmb_catalog_probe_last_folder_at
-                < CATALOG_PROBE_FOLDER_SECONDS
-            ):
-                return "deferred", None
-            signature = _shared_project_probe_value(state, "folder", lambda:
-                _project_folder_metadata_signature(project_root_text), ttl=CATALOG_PROBE_FOLDER_SECONDS)
-            self._hmb_catalog_probe_last_folder_at = now
-            current_signature = _clean(state.get("folder_signature"))
-            if not current_signature:
-                state = dict(state)
-                state["folder_signature"] = signature
-                return "changed", _normalize_state(state)
-            if signature == current_signature:
-                self._hmb_catalog_probe_pending_folder_signature = ""
-                self._hmb_catalog_probe_pending_folder_since = 0.0
-                return "no_change", None
-            if pending_signature != signature:
-                self._hmb_catalog_probe_pending_folder_signature = signature
-                self._hmb_catalog_probe_pending_folder_since = now
-                # Confirm a raw copy/replace once inside this background worker.
-                # This preserves the one-second stable-write guard without
-                # making the browser wait for the next 10-second folder poll.
-                time.sleep(CATALOG_PROBE_STABLE_WRITE_SECONDS + 0.05)
-                confirmed_signature = _shared_project_probe_value(state, ("folder_confirm", signature), lambda:
-                    _project_folder_metadata_signature(project_root_text), ttl=0.05)
-                confirmed_at = time.monotonic()
-                self._hmb_catalog_probe_last_folder_at = confirmed_at
-                if confirmed_signature != signature:
-                    self._hmb_catalog_probe_pending_folder_signature = (
-                        confirmed_signature
-                    )
-                    self._hmb_catalog_probe_pending_folder_since = confirmed_at
-                    return "deferred", None
-                signature = confirmed_signature
-                now = confirmed_at
-            if (
-                now - self._hmb_catalog_probe_pending_folder_since
-                < CATALOG_PROBE_STABLE_WRITE_SECONDS
-            ):
-                return "deferred", None
-        else:
-            if (
-                now - self._hmb_catalog_probe_last_manifest_at
-                < CATALOG_PROBE_MANIFEST_SECONDS
-            ):
-                return "deferred", None
-            self._hmb_catalog_probe_last_manifest_at = now
-            signature = _shared_project_probe_value(state, "manifest", lambda:
-                _asset_manifest_signature(Path(project_root_text)), ttl=CATALOG_PROBE_MANIFEST_SECONDS)
-            if signature == _clean(state.get("manifest_signature")):
-                return "no_change", None
-
-        project_record = {"path": project_root_text, **{
-            key: state.get(key, "") for key in ("project_id", "project_uid", "project_cache_uid")
-        }}
-        def read_catalog():
-            scan = _rebind_shared_catalog_snapshot(
-                _shared_catalog_snapshot(state), project_record,
-                {"catalog_root": state["catalog_root"], "projects": state["projects"]},
-                refresh_manifest=True,
-            ) or _scan_project_assets(project_root_text, previous_scan=state)
-            return _shared_catalog_snapshot(scan)
-        refreshed_scan = _shared_project_probe_value(
-            state, ("catalog", probe_kind, signature), read_catalog, ttl=1.0,
-        )
-        refreshed = _merge_scan_with_state(refreshed_scan, state)
-        refreshed["catalog_root"] = state["catalog_root"]
-        refreshed["projects"] = state["projects"]
-        self._hmb_catalog_probe_pending_folder_signature = ""
-        self._hmb_catalog_probe_pending_folder_since = 0.0
-        return "changed", refreshed
+    def _compute_catalog_probe(self, state, request):
+        """Compatibility with pre-session widgets. Browsing never checks the share."""
+        return "no_change", None
 
     def _consume_pending_catalog_probe_result(self) -> bool:
-        self._ensure_catalog_probe_runtime_state()
-        with self._hmb_catalog_probe_lock:
-            pending = self._hmb_catalog_probe_pending_result
-            if pending is None:
-                return False
-            generation, key, payload = pending
-            if (
-                generation != self._hmb_catalog_probe_generation
-                or key != self._hmb_catalog_probe_pending_key
-                or not self._scan_owner_is_current()
-            ):
-                self._hmb_catalog_probe_pending_result = None
-                self._hmb_catalog_probe_pending_key = ""
-                self._hmb_catalog_probe_thread = None
-                return False
-            self._hmb_catalog_probe_pending_result = None
-            self._hmb_catalog_probe_pending_key = ""
-            self._hmb_catalog_probe_thread = None
-        request = dict(payload.get("request") or {})
-        outcome = _clean(payload.get("outcome")) or "deferred"
-        result_state = payload.get("state")
-        live = self._current_state()
-        base = payload.get("base") if isinstance(payload.get("base"), dict) else {}
-        if any(
-            _clean(base.get(field)).replace("\\", "/").casefold()
-            != _clean(live.get(field)).replace("\\", "/").casefold()
-            for field in (
-                "catalog_root",
-                "project_root",
-                "project_cache_uid",
-                "manifest_signature",
-            )
-        ) or _non_negative_int(base.get("scan_revision")) != _non_negative_int(
-            live.get("scan_revision")
-        ):
-            return False
-        if outcome == "changed" and isinstance(result_state, dict):
-            result_state = _merge_async_scan_result_with_live_state(
-                result_state,
-                base or live,
-                live,
-            )
-            result_state["scan_busy"] = False
-            result_state = self._publish_completed_catalog_scan(
-                result_state,
-                f"probe:{key}",
-            )
-        else:
-            result_state = self._current_state()
-        self._set_thumbnail_bridge_value(
-            self._catalog_probe_result_envelope(request, outcome, result_state)
-        )
-        return True
+        return False
 
-    def _schedule_catalog_probe(
-        self,
-        request: Dict[str, Any],
-        state: Dict[str, Any],
-    ) -> None:
-        """Run one bounded compact probe; never publish unchanged full state."""
-
-        self._ensure_catalog_probe_runtime_state()
-        key = _clean(request.get("request_id"))[:128]
-        with self._hmb_catalog_probe_lock:
-            if self._hmb_catalog_probe_pending_key:
-                self._set_thumbnail_bridge_value(
-                    self._catalog_probe_result_envelope(request, "deferred", state)
-                )
-                return
-            self._hmb_catalog_probe_generation += 1
-            generation = self._hmb_catalog_probe_generation
-            self._hmb_catalog_probe_pending_key = key
-            self._hmb_catalog_probe_pending_result = None
-        base = _normalize_state(state)
-        node_ref = weakref.ref(self)
-        host_context = contextvars.copy_context()
-        try:
-            completion_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            completion_loop = None
-        if completion_loop is None:
-            try:
-                from griptape_nodes.retained_mode.engine import has_current_engine
-                from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-                if has_current_engine():
-                    completion_loop = GriptapeNodes.EventManager().event_loop
-            except Exception:
-                pass
-
-        def worker() -> None:
-            owner = node_ref()
-            if owner is None:
-                return
-            try:
-                outcome, result_state = owner._compute_catalog_probe(base, request)
-            except Exception as exc:
-                outcome, result_state = "offline", None
-                message = _clean(exc)
-                if message != getattr(owner, "_hmb_last_manifest_poll_error", ""):
-                    _diagnostic_warning("Shared catalog probe retained last snapshot", exc)
-                    owner._hmb_last_manifest_poll_error = message
-            owner = node_ref()
-            if owner is None:
-                return
-            with owner._hmb_catalog_probe_lock:
-                if (
-                    generation != owner._hmb_catalog_probe_generation
-                    or key != owner._hmb_catalog_probe_pending_key
-                    or bool(getattr(owner, "_hmb_node_deleted", False))
-                ):
-                    return
-            if outcome == "changed" and isinstance(result_state, dict):
-                _prepare_catalog_scan_index(result_state)
-            with owner._hmb_catalog_probe_lock:
-                # Never hold the node lock during filesystem IO.  A newer
-                # request/deletion can proceed while cache preparation waits.
-                if (
-                    generation != owner._hmb_catalog_probe_generation
-                    or key != owner._hmb_catalog_probe_pending_key
-                    or bool(getattr(owner, "_hmb_node_deleted", False))
-                ):
-                    return
-                owner._hmb_catalog_probe_pending_result = (
-                    generation,
-                    key,
-                    {
-                        "request": dict(request),
-                        "outcome": outcome,
-                        "state": result_state,
-                        "base": base,
-                    },
-                )
-            # A completed probe must ACK this request now, not wait for the
-            # next browser poll to drain the previous result. Retained-mode
-            # publication stays on the host loop with the captured context.
-            if completion_loop is not None:
-                try:
-                    if completion_loop.is_running() and not completion_loop.is_closed():
-                        completion_loop.call_soon_threadsafe(
-                            host_context.copy().run, owner._consume_pending_catalog_probe_result
-                        )
-                except RuntimeError:
-                    pass  # Pending result remains available after a loop stop.
-
-        thread = threading.Thread(
-            target=worker,
-            name=f"HMBImageAssetCatalogProbe-{generation}",
-            daemon=True,
-        )
-        with self._hmb_catalog_probe_lock:
-            self._hmb_catalog_probe_thread = thread
-        thread.start()
+    def _schedule_catalog_probe(self, request: Dict[str, Any], state: Dict[str, Any]) -> None:
+        self._set_thumbnail_bridge_value(self._catalog_probe_result_envelope(request, "no_change", state))
 
     def _drain_queued_thumbnail_bridge_request(self) -> bool:
         """Start the latest compact request deferred by thumbnail single-flight."""
@@ -12622,6 +12973,7 @@ class HMBImageAssetLibrary(DataNode):
         on_published: Callable[[Dict[str, Any]], None] | None = None,
         *,
         timeout_seconds: float | None = None,
+        keep_editable: bool = False,
     ) -> Dict[str, Any]:
         """Publish a busy snapshot and run filesystem work off the UI thread.
 
@@ -12634,7 +12986,7 @@ class HMBImageAssetLibrary(DataNode):
         with self._hmb_scan_lock:
             if self._hmb_scan_pending_key == key:
                 current = self._current_state()
-                current["scan_busy"] = True
+                current["scan_busy"] = not keep_editable
                 return current
             if (
                 getattr(self, "_hmb_fresh_registration_scan_key", "")
@@ -12655,10 +13007,10 @@ class HMBImageAssetLibrary(DataNode):
             getattr(self, "_hmb_import_revision", 0)
         )
         busy = dict(scan_base)
-        busy["scan_busy"] = True
+        busy["scan_busy"] = not keep_editable
         busy["scan_request_id"] = request_id
         busy["error"] = ""
-        busy = self._publish_state(busy)
+        busy = self._publish_state(busy, preserve_outputs=True) if keep_editable else self._publish_state(busy)
         node_ref = weakref.ref(self)
         # Never instantiate/resolve Griptape's Engine from this UI callback.
         # In actual-host tests a cold EventManager lookup can take seconds.  A
@@ -12800,16 +13152,53 @@ class HMBImageAssetLibrary(DataNode):
 
         completion_claimed = False
         watchdog: threading.Timer | None = None
+        first_paint = None
 
         def scan_failure(exc: Exception) -> Dict[str, Any]:
-            result = _normalize_state(failure_state or candidate_state)
+            result = _normalize_state(first_paint or failure_state or candidate_state)
             result["error"] = str(exc)
             return result
 
-        def worker() -> None:
+        def publish_preview(preview: Dict[str, Any]) -> None:
+            nonlocal scan_base
             owner = node_ref()
             if owner is None:
                 return
+            with owner._hmb_scan_lock:
+                if (completion_claimed or generation != owner._hmb_scan_generation
+                        or key != owner._hmb_scan_pending_key or not owner._scan_owner_is_current()):
+                    return
+            live = owner._current_state()
+            visible = _merge_async_scan_result_with_live_state(preview, scan_base, live)
+            visible.update(scan_busy=False, scan_request_id=request_id)
+            owner._publish_state(visible, preserve_outputs=True)
+            # The visible cached metadata is the new baseline. Subsequent
+            # changes from the startup check must supersede its old values.
+            scan_base = visible
+
+        def worker() -> None:
+            nonlocal first_paint
+            owner = node_ref()
+            if owner is None:
+                return
+            if key.startswith(("initial:", "project:", "deserialize:", "catalog:")):
+                project = _project_root_text(scan_base.get("project_root"))
+                scope = _project_root_text(scan_base.get("catalog_root"))
+                session_key = _session_catalog_key("catalog", project) if project else _session_catalog_key("projects", scope)
+                with _SHARED_CATALOG_CACHE_LOCK:
+                    has_session = session_key in _CATALOG_READS
+                if not has_session and scope:
+                    try:
+                        if project:
+                            first_paint = _read_local_catalog_snapshot(project, scan_base)
+                        else:
+                            roster = _read_local_project_list(scope)
+                            if roster:
+                                first_paint = {**scan_base, "projects": roster}
+                        if first_paint is not None and event_loop is not None and event_loop.is_running():
+                            event_loop.call_soon_threadsafe(host_context.copy().run, publish_preview, first_paint)
+                    except Exception as exc:
+                        _diagnostic_warning("Local catalog preview unavailable", exc)
             try:
                 scanned = scan()
                 if (
@@ -12843,12 +13232,6 @@ class HMBImageAssetLibrary(DataNode):
                 )
                 if not is_current:
                     return
-            try:
-                _prepare_catalog_scan_index(result, normalized=True)
-            except Exception as exc:
-                _diagnostic_exception("Background project index failed", exc)
-                result = scan_failure(exc)
-                media_by_uid = None
             complete(result, media_by_uid)
 
         def complete(result: Dict[str, Any], media_by_uid: Dict[str, Any] | None) -> None:
@@ -13378,70 +13761,12 @@ class HMBImageAssetLibrary(DataNode):
         )
         return merged, media_by_uid
 
-    def _compute_manifest_poll(
-        self,
-        state: Dict[str, Any],
-        import_value: Any = None,
-    ) -> tuple[Dict[str, Any], Dict[str, Any] | None]:
-        """Compute a shared-manifest refresh without publishing from a worker."""
-        normalized = _normalize_state(state)
-        if not normalized.get("project_root"):
-            return normalized, None
-        catalog = _discover_project_catalog(normalized.get("catalog_root"))
-        selected = _match_catalog_project(
-            catalog["projects"],
-            previous_path=normalized.get("project_root"),
-            previous_uid=normalized.get("project_uid"),
-            previous_project_id=normalized.get("project_id"),
-        )
-        if selected is None:
-            raise ValueError(
-                "The selected project is no longer available in the active project catalog."
-            )
-        current_signature = _asset_manifest_signature(Path(selected["path"]))
-        if (current_signature == _clean(normalized.get("manifest_signature"))
-                and _project_root_text(selected["path"]).casefold()
-                == _project_root_text(normalized.get("project_root")).casefold()
-                and _project_root_text(catalog["catalog_root"]).casefold()
-                == _project_root_text(normalized.get("catalog_root")).casefold()):
-            self._hmb_last_manifest_poll_error = ""
-            return normalized, None
-
-        refreshed_scan = _scan_project_assets(selected["path"], previous_scan=state)
-        refreshed = _merge_scan_with_state(refreshed_scan, normalized)
-        refreshed["catalog_root"] = catalog["catalog_root"]
-        refreshed["projects"] = catalog["projects"]
-        if _flatten_import_values(import_value):
-            refreshed, media_by_uid = _merge_import_input(
-                refreshed,
-                import_value,
-            )
-        else:
-            media_by_uid = None
-        self._hmb_last_manifest_poll_error = ""
-        return refreshed, media_by_uid
+    def _compute_manifest_poll(self, state, import_value=None):
+        """A legacy poll is only an acknowledgement in manual-refresh sessions."""
+        return state, None
 
     def _apply_manifest_poll(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Compatibility entry point; interactive polls use the worker path."""
-        normalized = _normalize_state(state)
-        try:
-            refreshed, media_by_uid = self._compute_manifest_poll(
-                normalized,
-                _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER),
-            )
-            if refreshed == normalized:
-                return normalized
-            if media_by_uid is not None:
-                self._replace_import_media(media_by_uid)
-            return self._publish_state(refreshed)
-        except Exception as exc:
-            message = _clean(exc)
-            if message != self._hmb_last_manifest_poll_error:
-                _diagnostic_exception("Shared manifest auto-sync failed", exc)
-                self._hmb_last_manifest_poll_error = message
-            # Keep the last verified snapshot and outputs intact while a share
-            # is offline or another client is midway through a bad write.
-            return normalized
+        return state
 
     def _schedule_project_manifest_refresh(
         self, state: Dict[str, Any], catalog_root: str, import_value: Any
@@ -13625,10 +13950,6 @@ class HMBImageAssetLibrary(DataNode):
             return self._schedule_project_manifest_cleanup(state, cleanup_request)
         thumbnail_request = dict(state.get("thumbnail_request") or {})
         state["thumbnail_request"] = {}
-        manifest_poll_received = bool(self._hmb_manifest_poll_received)
-        self._hmb_manifest_poll_received = False
-        manifest_poll_requested = bool(self._hmb_manifest_poll_pending)
-        self._hmb_manifest_poll_pending = False
         disconnect_import_uid = _normalize_disconnect_import_uid(
             state.get("disconnect_import_uid")
         )
@@ -13863,17 +14184,6 @@ class HMBImageAssetLibrary(DataNode):
                 state,
                 lambda: self._merge_captured_imports_into_scan(
                     _select_catalog_project(state, requested_path),
-                    captured_import_value,
-                ),
-            )
-        if manifest_poll_received:
-            if not manifest_poll_requested:
-                return state
-            return self._schedule_catalog_scan(
-                f"manifest:{requested_path.casefold()}:{_clean(state.get('manifest_signature'))}",
-                state,
-                lambda: self._compute_manifest_poll(
-                    state,
                     captured_import_value,
                 ),
             )
@@ -14510,47 +14820,9 @@ class HMBImageAssetLibrary(DataNode):
             # polls merge only their identity fields into this authoritative
             # current snapshot and never normalize a client-sent catalog.
             candidate = _normalize_state(current_raw or raw_state)
-            if poll_nonce == getattr(self, "_hmb_last_manifest_poll_nonce", ""):
-                return _json_text(candidate)
-            self._hmb_last_manifest_poll_nonce = poll_nonce
-
-            identity_matches = True
-            for field in (
-                "catalog_root",
-                "project_root",
-                "project_id",
-                "project_uid",
-                "manifest_signature",
-            ):
-                supplied = _clean(raw_state.get(field))
-                if not supplied:
-                    continue
-                authoritative = _clean(candidate.get(field))
-                if field in {"catalog_root", "project_root"}:
-                    supplied = _project_root_text(supplied).replace("\\", "/").casefold()
-                    authoritative = (
-                        _project_root_text(authoritative)
-                        .replace("\\", "/")
-                        .casefold()
-                    )
-                if supplied != authoritative:
-                    identity_matches = False
-                    break
-            if not identity_matches:
-                return _json_text(candidate)
-
-            # Filesystem probes can block for seconds on an unavailable UNC
-            # share. Always force a lightweight value change here; the exact
-            # signature/discovery/scan work is generation-owned by the worker.
-            if _clean(candidate.get("project_root")):
-                candidate["scan_revision"] = (
-                    _non_negative_int(candidate.get("scan_revision")) + 1
-                )
-                self._hmb_manifest_poll_received = True
-                self._hmb_manifest_poll_pending = True
-            if external_state and self._widget_initial_assignment(WIDGET_STATE_PARAMETER) is None:
-                self._hmb_widget_live_authored = True
-            return _json_text(_normalize_state(candidate))
+            # Restored pre-session widgets can still send periodic poll nonces.
+            # Return the current state without treating the nonce as a user edit.
+            return _json_text(candidate)
         if name == PROJECT_ROOT_PARAMETER:
             return _project_root_text(value)
         if name == THUMBNAIL_PATCH_PARAMETER:
@@ -14814,34 +15086,20 @@ class HMBImageAssetLibrary(DataNode):
         import_value = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
         candidate_state = dict(saved_state)
         candidate_state["catalog_root"] = root_value.replace("\\", "/")
-        indexed_state = _read_catalog_index(
-            saved_state.get("project_root"),
-            saved_state,
+        # Even a local index verifies the share. Run that verification in the
+        # same detached path as startup or a new node; paint the saved authoring
+        # state immediately and merge only this generation's verified facts.
+        self._schedule_catalog_scan(
+            f"deserialize:{root_value.casefold()}:{_non_negative_int(saved_state.get('scan_revision'))}",
+            candidate_state,
+            lambda: self._merge_captured_imports_into_scan(
+                _load_project_catalog(root_value, saved_state), import_value, defer_thumbnail=True,
+            ),
+            failure_state=candidate_state,
+            keep_editable=bool(saved_state.get("projects") or saved_assets),
+            timeout_seconds=PROJECT_REFRESH_TIMEOUT_SECONDS,
+            on_published=self._schedule_live_import_thumbnail_hydration,
         )
-        if indexed_state is not None:
-            indexed_state["catalog_root"] = root_value.replace("\\", "/")
-            indexed_state, indexed_media = self._merge_captured_imports_into_scan(
-                indexed_state,
-                import_value,
-                defer_thumbnail=True,
-            )
-            if isinstance(indexed_media, dict):
-                self._replace_import_media(indexed_media)
-            indexed_state = self._publish_state(indexed_state)
-            self._schedule_live_import_thumbnail_hydration(indexed_state)
-        else:
-            self._schedule_catalog_scan(
-                (
-                    f"deserialize:{root_value.casefold()}:"
-                    f"{_non_negative_int(saved_state.get('scan_revision'))}"
-                ),
-                candidate_state,
-                lambda: self._merge_captured_imports_into_scan(
-                    _load_project_catalog(root_value, saved_state),
-                    import_value,
-                ),
-                failure_state=candidate_state,
-            )
         self._hmb_hydration_adopted = True
         self._schedule_post_hydration_shot_reconcile()
         return result
@@ -14867,6 +15125,7 @@ class HMBImageAssetLibrary(DataNode):
         self._ensure_scan_runtime_state()
         self._ensure_thumbnail_runtime_state()
         self._ensure_import_thumbnail_runtime_state()
+        self._ensure_catalog_probe_runtime_state()
         first_delete = not bool(getattr(self, "_hmb_node_deleted", False))
         if first_delete:
             self._hmb_node_deleted = True
@@ -14960,18 +15219,7 @@ class HMBImageAssetLibrary(DataNode):
         import_media: Dict[str, Any], import_revision: int,
     ) -> tuple[Dict[str, Any], Dict[str, Any], int, OrderedDict]:
         """Detached filesystem preparation: no node, ports, or graph mutation."""
-        requested = root_value.replace("\\", "/").rstrip("/").casefold()
-        current_root = _project_root_text(current.get("catalog_root")).rstrip("/").casefold()
-        root_matches = bool(requested and requested == current_root)
-        belongs = _state_project_belongs_to_catalog(current, root_value)
-        if root_matches and belongs and _state_catalog_is_current(current):
-            state = current
-        elif root_matches and belongs:
-            state = _read_catalog_index(current.get("project_root"), current)
-            if state is None:
-                state = _load_project_catalog(root_value, current)
-        else:
-            state = _load_project_catalog(root_value, current)
+        state = current if _state_catalog_is_current(current, root_value) else _load_project_catalog(root_value, current)
         media = import_media
         revision = import_revision
         if _flatten_import_values(import_value):
@@ -15085,42 +15333,8 @@ class HMBImageAssetLibrary(DataNode):
             or str(DEFAULT_PROJECTS_ROOT)
         )
         current = self._current_state()
-        requested_catalog_identity = root_value.replace("\\", "/").rstrip("/").casefold()
-        current_catalog_identity = (
-            _project_root_text(current.get("catalog_root"))
-            .replace("\\", "/")
-            .rstrip("/")
-            .casefold()
-        )
-        catalog_root_matches = bool(
-            requested_catalog_identity
-            and requested_catalog_identity == current_catalog_identity
-        )
-        project_belongs_to_catalog = _state_project_belongs_to_catalog(
-            current,
-            root_value,
-        )
-        loaded_catalog = False
-        if (
-            catalog_root_matches
-            and project_belongs_to_catalog
-            and _state_catalog_is_current(current)
-        ):
-            state = current
-        elif catalog_root_matches and project_belongs_to_catalog:
-            indexed = _read_catalog_index(current.get("project_root"), current)
-            if indexed is not None:
-                state = self._publish_state(indexed)
-            else:
-                state = self._load_catalog(root_value)
-                loaded_catalog = True
-        else:
-            # PROJECT_ROOT is the process-time authority.  A programmatic host
-            # update may arrive without the retained widget callback, so an
-            # otherwise-current snapshot/index from the previous root must not
-            # be adopted here.
-            state = self._load_catalog(root_value)
-            loaded_catalog = True
+        loaded_catalog = not _state_catalog_is_current(current, root_value)
+        state = self._load_catalog(root_value) if loaded_catalog else current
         if loaded_catalog and _clean(current.get("project_root")) and _clean(state.get("error")):
             raise ValueError("ImageAsset project catalog could not be read; the previous selection and outputs were retained. " + _clean(state.get("error")))
         import_value = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)

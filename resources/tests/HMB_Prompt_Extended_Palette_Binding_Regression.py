@@ -29,7 +29,10 @@ catalog = json.loads((ROOT / "resources/picker/HMB_Marker_Catalog.json").read_te
 actor = [item["name"] for item in catalog["character"]]
 objects = [item["name"] for item in catalog["background"]]
 colors = actor + objects
-assert "Cyan" in actor and "Lavender" in objects
+assert catalog["version"] == 6
+assert actor[-3:] == ["Cyan", "Teal", "Brown"]
+assert objects[:5] == ["Sky Blue", "Mint", "Beige", "Lavender", "Olive"]
+assert len(colors) == 19
 
 
 def fixture(engine: str) -> tuple[dict, dict]:

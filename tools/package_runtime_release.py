@@ -18,8 +18,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.9.19"
-RELEASE_VERSION = "0.9.19"
+RELEASE_LABEL = "v0.9.21"
+RELEASE_VERSION = "0.9.21"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -37,6 +37,22 @@ MAX_ARCHIVE_MEMBERS = 4096
 STRICT_SEMVER_PATTERN = re.compile(
     r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
 )
+
+WIDGET_FILES = {
+    "HMBAgentLibraryWidget": "widgets/HMBAgentLibraryWidget.js",
+    "HMBAnalysisAgentWidget": "widgets/HMBAnalysisAgentWidget.js",
+    "HMBColorLUTLibraryWidget": "widgets/HMBColorLUTLibraryWidget.js",
+    "HMBFinishLookLibraryWidget": "widgets/HMBFinishLookLibraryWidget.js",
+    "HMBImageAssetLibraryWidget": "widgets/HMBImageAssetLibraryWidget.js",
+    "HMBImageAssetThumbnailPatchBridgeWidget": "widgets/HMBImageAssetThumbnailPatchBridgeWidget.js",
+    "HMBImageGenerationWidget": "widgets/HMBImageGenerationWidget.js",
+    "HMBImageBashWidget": "widgets/HMBImageBashWidget.js",
+    "HMBPromptLibraryScopedBindingWidget": "widgets/HMBPromptLibraryScopedBindingWidget.js",
+    "HMBSoundLibraryWidget": "widgets/HMBSoundLibraryWidget.js",
+    "HMBSeedanceGenerationWidget": "widgets/HMBSeedanceGenerationWidget.js",
+    "HMBVideoPickerCommandBridgeWidget": "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
+    "HMBVideoPickerLibraryWidget": "widgets/HMBVideoPickerLibraryWidget_v032.js",
+}
 
 RUNTIME_INSTALL_FILES = (
     "__init__.py",
@@ -86,19 +102,7 @@ RUNTIME_INSTALL_FILES = (
     "_hmb_color_lut_usage.py",
     "_hmb_screen_space.py",
     "_hmb_video_tools.py",
-    "widgets/HMBAgentLibraryWidget.js",
-    "widgets/HMBAnalysisAgentWidget.js",
-    "widgets/HMBColorLUTLibraryWidget.js",
-    "widgets/HMBFinishLookLibraryWidget.js",
-    "widgets/HMBImageAssetLibraryWidget.js",
-    "widgets/HMBImageAssetThumbnailPatchBridgeWidget.js",
-    "widgets/HMBImageGenerationWidget.js",
-    "widgets/HMBImageBashWidget.js",
-    "widgets/HMBPromptLibraryScopedBindingWidget.js",
-    "widgets/HMBSoundLibraryWidget.js",
-    "widgets/HMBSeedanceGenerationWidget.js",
-    "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
-    "widgets/HMBVideoPickerLibraryWidget_v032.js",
+    *WIDGET_FILES.values(),
     "resources/maya/HMB_Maya_Background_Preview.py",
     "resources/blender/HMB_Blender_Background_Preview.py",
     "resources/picker/HMB_Marker_Catalog.json",
@@ -861,6 +865,25 @@ def validate_no_policy_artifacts_in_zip(
         raise RuntimeError(f"{label} is not a valid ZIP archive.") from exc
 
 
+def validate_widget_declarations(library_manifest: dict[str, Any]) -> None:
+    declared = library_manifest.get("widgets")
+    if not isinstance(declared, list):
+        raise RuntimeError("Library widget declarations must be a list.")
+    names = set()
+    for row in declared:
+        if not isinstance(row, dict) or not isinstance(row.get("name"), str):
+            raise RuntimeError("Invalid library widget declaration.")
+        name = row["name"]
+        if name in names:
+            raise RuntimeError(f"Duplicate library widget declaration: {name}")
+        if name not in WIDGET_FILES or row.get("path") != WIDGET_FILES[name]:
+            raise RuntimeError(f"Unexpected library widget name/path: {name} / {row.get('path')}")
+        names.add(name)
+    missing = WIDGET_FILES.keys() - names
+    if missing:
+        raise RuntimeError(f"Missing library widget declarations: {', '.join(sorted(missing))}")
+
+
 def validate_editor_dependency_contract(
     project: dict[str, Any], library_manifest: dict[str, Any], sbom: dict[str, Any],
 ) -> None:
@@ -963,19 +986,7 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
     ):
         raise RuntimeError("Bundled Agent policy delivery metadata mismatch.")
 
-    declared_widget_paths = {
-        str(item.get("path") or "").strip()
-        for item in library_manifest.get("widgets", [])
-        if isinstance(item, dict)
-    }
-    if "" in declared_widget_paths or not declared_widget_paths:
-        raise RuntimeError("Library widget declarations are missing or invalid.")
-    omitted_widgets = declared_widget_paths - set(RUNTIME_INSTALL_FILES)
-    if omitted_widgets:
-        raise RuntimeError(
-            "Runtime release omits declared widgets: "
-            + ", ".join(sorted(omitted_widgets))
-        )
+    validate_widget_declarations(library_manifest)
 
     records: list[dict[str, Any]] = []
     for relative in SOURCE_FILES:

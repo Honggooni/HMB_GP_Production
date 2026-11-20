@@ -71,6 +71,8 @@ def _progress(job, stage, message, **extra):
     if path:
         payload = {"stage": stage, "message": message, "time": time.time()}
         payload.update(extra)
+        if stage == "rendering_frames":
+            payload["capture_role"] = "mask" if job.get("apply_marker_shaders", True) else "original"
         try:
             _write_json(path, payload)
         except OSError as exc:
