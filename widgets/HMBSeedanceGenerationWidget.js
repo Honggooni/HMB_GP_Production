@@ -57,6 +57,9 @@ const HMB_SEEDANCE_PREVIEW_SCHEMA = "hmb-seedance-generation-preview";
 const HMB_SEEDANCE_PREVIEW_VERSION = 1;
 const HMB_SEEDANCE_COMMAND_SCHEMA = "hmb-seedance-refresh-command";
 const HMB_SEEDANCE_COMMAND_VERSION = 1;
+const HMB_SEEDANCE_FINAL_RESOLUTIONS = ["1080p", "4k"];
+const HMB_SEEDANCE_FINAL_SELECTIONS = new WeakMap();
+const HMB_SEEDANCE_FINAL_HELP = "선택한 해상도로 이 Draft의 Final을 생성합니다. 현재 프롬프트·소스·설정은 다시 전송하지 않으며 Agent도 재실행하지 않습니다. MOV 기본 · MOV 미지원 시 MP4.";
 const HMB_SEEDANCE_COMMAND_REGISTRY_KEY = "__HMB_SEEDANCE_REFRESH_BRIDGES_V1__";
 const HMB_SEEDANCE_BROKER_PARAMETER = "broker_server_url";
 const HMB_SEEDANCE_BROKER_DIALOGS = new WeakMap();
@@ -531,6 +534,10 @@ export function hmbSeedanceDraftState(value) {
     final_busy: source.final_busy === true,
     final_state: text(source.final_state, 32),
     final_visible: Object.prototype.hasOwnProperty.call(source, "final_visible") ? source.final_visible === true : undefined,
+    source_completed: typeof source.source_completed === "boolean" ? source.source_completed : undefined,
+    final_resolution: HMB_SEEDANCE_FINAL_RESOLUTIONS.includes(source.final_resolution) ? source.final_resolution : "",
+    finals_by_resolution: source.finals_by_resolution === undefined ? undefined : Object.fromEntries(
+      HMB_SEEDANCE_FINAL_RESOLUTIONS.map(resolution => [resolution, text(source.finals_by_resolution?.[resolution], 32) || "unknown"])),
     final_task_id: text(source.final_task_id, 128),
     active_action: text(source.active_action, 80),
     cancel_available: source.cancel_available === true,
@@ -642,6 +649,18 @@ function render(state) {
       .hmb-seedance-shot__select{height:44px;font-size:13px;font-weight:800;line-height:normal}
       .hmb-seedance-shot__number{flex:0 0 auto;min-width:34px;padding:5px 7px;border:1px solid rgba(var(--shot-rgb),.52);border-radius:7px;color:var(--shot-soft);font-size:11px;font-weight:900;text-align:center}
       .hmb-seedance-shot__final{flex:0 0 auto;height:36px;padding:0 10px;border:1px solid rgba(var(--shot-rgb),.7);border-radius:7px;background:rgba(var(--shot-rgb),.2);color:var(--shot-soft);font-size:11px;font-weight:850;cursor:pointer;white-space:nowrap}.hmb-seedance-shot__final:hover{background:rgba(var(--shot-rgb),.34)}.hmb-seedance-shot__final:disabled{cursor:default;opacity:.55}.hmb-seedance-shot__final[hidden]{display:none}
+      /* HMB_FINAL_RESOLUTION_INLINE_BEGIN */
+      .hmb-seedance-shot__final-controls{display:inline-flex;flex:0 0 auto;align-items:center;gap:4px;white-space:nowrap}
+      .hmb-seedance-shot__final-controls[hidden],.hmb-seedance-shot__final-quality[hidden]{display:none}
+      .hmb-seedance-shot__final-quality{height:36px;padding:0 3px;border:1px solid rgba(var(--shot-rgb),.52);border-radius:7px;color:var(--shot-soft);background:#131724;color-scheme:dark;font-size:11px;font-weight:750}
+      .hmb-seedance-shot__final-quality:focus-visible,.hmb-seedance-shot__final:focus-visible{outline:2px solid var(--shot-accent);outline-offset:1px}
+      .hmb-seedance-shot:has(.hmb-seedance-shot__final-controls:not([hidden])){container-type:inline-size}
+      @container(max-width:460px){
+        .hmb-seedance-shot__row:has(.hmb-seedance-shot__final-controls:not([hidden])){gap:4px;padding-inline:6px}
+        .hmb-seedance-shot__final-controls:not([hidden])~.hmb-seedance-shot__number{min-width:24px;padding-inline:3px}
+        .hmb-seedance-shot__final-controls:not([hidden])~.hmb-seedance-shot__select{flex:0 1 90px;padding-inline:3px}
+      }
+      /* HMB_FINAL_RESOLUTION_INLINE_END */
       .hmb-seedance-preview-overlay{position:absolute;inset:0;z-index:24;display:flex;align-items:center;justify-content:center;padding:18px;pointer-events:none;color:#f8fafc;font-family:"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif}
       .hmb-seedance-preview-overlay[data-mode="center"]{background:radial-gradient(circle at 50% 42%,rgba(30,41,59,.34),rgba(0,0,0,.76) 74%)}
       [data-hmb-seedance-preview-static="true"]>:not(.hmb-seedance-preview-overlay),[data-hmb-seedance-preview-static="true"]>:not(.hmb-seedance-preview-overlay) *{visibility:hidden!important;pointer-events:none!important}
@@ -679,7 +698,10 @@ function render(state) {
         <div class="hmb-seedance-shot__native-identity" data-hmb-native-identity></div>
         <div class="hmb-seedance-shot__native-actions nodrag" data-hmb-native-actions></div>
         <span class="hmb-seedance-shot__status" role="status" aria-live="polite" aria-atomic="true"></span>
-        <button type="button" class="hmb-seedance-shot__final nodrag" data-hmb-seedance-finalize-draft hidden disabled title="완료된 Draft로 현재 Generator만 1회 실행해 1080p로 받습니다. 현재 프롬프트·소스·설정은 다시 전송하지 않으며 Agent도 재실행하지 않습니다. MOV 기본 · MOV 미지원 시 MP4.">Draft final</button>
+        <div class="hmb-seedance-shot__final-controls nodrag nopan" data-hmb-seedance-final-controls hidden>
+          <select class="hmb-seedance-shot__final-quality nodrag nopan" data-hmb-seedance-final-resolution aria-label="출력 해상도" hidden disabled></select>
+          <button type="button" class="hmb-seedance-shot__final nodrag" data-hmb-seedance-finalize-draft hidden disabled title="${HMB_SEEDANCE_FINAL_HELP}">생성</button>
+        </div>
         <span class="hmb-seedance-shot__number" data-seedance-shot-number>${hmbSeedanceShotBadge(state)}</span>
         <select class="hmb-seedance-shot__select nodrag" aria-label="Shot">${optionMarkup(state)}</select>
       </div>
@@ -1399,6 +1421,10 @@ function hmbSeedanceCommandBridgeWidget(container, props) {
         if (draftCommand && !/^job-(?:mybox-)?[0-9a-f]{32}$/.test(expectedDraftJobId)) {
           throw new Error("Seedance Final requires the displayed completed Draft identity.");
         }
+        const finalResolution = source.final_resolution === undefined ? "1080p" : source.final_resolution;
+        if (action === "finalize_draft" && !HMB_SEEDANCE_FINAL_RESOLUTIONS.includes(finalResolution)) {
+          throw new Error("Final 해상도를 다시 선택하세요.");
+        }
         return latestProps.onChange({
           schema: HMB_SEEDANCE_COMMAND_SCHEMA,
           version: HMB_SEEDANCE_COMMAND_VERSION,
@@ -1407,6 +1433,7 @@ function hmbSeedanceCommandBridgeWidget(container, props) {
           issued_at_ms: Math.max(0, Math.floor(Number(source.issued_at_ms || Date.now()))),
           // Equality assertion only: the host chooses its current stored source.
           ...(draftCommand ? { expected_draft_job_id: expectedDraftJobId } : {}),
+          ...(action === "finalize_draft" ? { final_resolution: finalResolution } : {}),
         });
       },
     });
@@ -1789,6 +1816,25 @@ function draftScope(state, action = "finalize_draft") {
   ]);
 }
 
+// The choice is local to this Generator and this exact Draft. It is never an
+// edit to the authored resolution or Draft Action parameters.
+function draftFinalSelection(node, state, scope, create) {
+  if (!node || !state.draft.job_id) return null;
+  let shots = HMB_SEEDANCE_FINAL_SELECTIONS.get(node);
+  if (!shots) {
+    if (!create) return null;
+    shots = new Map();
+    HMB_SEEDANCE_FINAL_SELECTIONS.set(node, shots);
+  }
+  const key = hmbSeedanceShotKey(state);
+  const current = shots.get(key);
+  if (current?.scope === scope) return current;
+  if (!create) return null;
+  const next = { scope, resolution: state.draft.final_resolution || "1080p", used: new Set() };
+  shots.set(key, next);
+  return next;
+}
+
 function clearDraftRequest(container) {
   clearTimeout(container.__hmbSeedanceDraftTimeout);
   clearTimeout(container.__hmbSeedanceDraftDispatchTimeout);
@@ -1801,15 +1847,71 @@ function clearDraftRequest(container) {
   delete container.__hmbSeedanceDraftPending;
 }
 
+function draftFinalTargetState(draft, resolution) {
+  if (draft.finals_by_resolution) return draft.finals_by_resolution[resolution] || "unknown";
+  if (["completed", "consumed"].includes(draft.final_state) && resolution && resolution !== draft.final_resolution) return "unknown";
+  return draft.final_state || (draft.final_available ? "available" : "unavailable");
+}
+
+function remainingDraftFinalTargets(draft, selection) {
+  if (!selection) return [];
+  const scoped = draft.finals_by_resolution;
+  const ended = state => state === "completed" || state === "consumed";
+  if (scoped) {
+    for (const resolution of HMB_SEEDANCE_FINAL_RESOLUTIONS) {
+      if (ended(scoped[resolution])) {
+        selection.used.add(resolution);
+        selection.unresolvedReceipt = false;
+      }
+    }
+  } else if (ended(draft.final_state)) {
+    if (draft.final_resolution) {
+      selection.used.add(draft.final_resolution);
+      selection.knownLegacyChild = draft.final_task_id;
+      if (selection.unresolvedReceipt === draft.final_task_id) selection.unresolvedReceipt = false;
+    } else if (!draft.final_task_id || draft.final_task_id !== selection.knownLegacyChild) {
+      selection.unresolvedReceipt = draft.final_task_id || true;
+    }
+  }
+  if (selection.unresolvedReceipt) return [];
+  return HMB_SEEDANCE_FINAL_RESOLUTIONS.filter(resolution => !selection.used.has(resolution)
+    && (!scoped || scoped[resolution] === "available"));
+}
+
+function draftFinalTargetAvailable(draft, resolution, selection) {
+  if (!draft.final_available || !draft.visible || !draft.job_id || draft.source_completed === false
+    || draft.busy || draft.cancel_available || !HMB_SEEDANCE_FINAL_RESOLUTIONS.includes(resolution)
+    || selection?.used.has(resolution) || selection?.unresolvedReceipt) return false;
+  if (draft.finals_by_resolution) {
+    return ["available", "completed", "consumed"].includes(draft.final_state || "available")
+      && Object.values(draft.finals_by_resolution).every(status => ["available", "completed", "consumed",
+        "expired", "not_draft", "source_pending", "unavailable"].includes(status))
+      && draft.finals_by_resolution[resolution] === "available";
+  }
+  return !selection?.used.size && draft.final_visible !== false && (!draft.final_state || draft.final_state === "available");
+}
+
 export function hmbSeedanceSyncDraftAction(container, state) {
   if (!container) return false;
-  const cancelling = state.draft.cancel_available && Boolean(state.draft.active_job_id);
+  const draft = state.draft;
+  const node = hmbSeedanceNodeRoot(container);
+  const sourceScope = draftScope(state);
+  const verifiedAvailable = !draft.final_state || draft.final_state === "available";
+  const ended = ["completed", "consumed"].includes(draft.final_state);
+  const reserved = ["reserved", "running"].includes(draft.final_state);
+  const supportedSource = draft.visible && draft.job_id && draft.source_completed !== false && (!draft.busy || draft.final_busy)
+    && !container.__hmbSeedancePendingShot && !["expired", "source_pending", "not_draft"].includes(draft.final_state);
+  const selection = supportedSource ? draftFinalSelection(node, state, sourceScope,
+    draft.source_completed === true || draft.final_available && verifiedAvailable || ended || reserved) : null;
+  const availableTargets = remainingDraftFinalTargets(draft, selection);
+  const cancelling = draft.cancel_available && Boolean(draft.active_job_id);
   const action = cancelling ? "cancel_draft_final" : "finalize_draft";
   const scope = draftScope(state, action);
   const pending = container.__hmbSeedanceDraftPending;
   if (pending && (
     pending.scope !== scope || pending.action !== action || pending.root !== hmbSeedanceNodeRoot(container)
-    || (pending.action === "finalize_draft" && (state.draft.busy || !state.draft.final_available || container.__hmbSeedancePendingShot))
+    || (pending.action === "finalize_draft" && (!draftFinalTargetAvailable(draft, pending.final_resolution, selection)
+      || container.__hmbSeedancePendingShot || container.__hmbSeedanceLatestProps?.disabled))
     || container.isConnected === false
   )) {
     clearDraftRequest(container);
@@ -1817,43 +1919,94 @@ export function hmbSeedanceSyncDraftAction(container, state) {
     delete container.__hmbSeedanceDraftError;
   }
   if (container.__hmbSeedanceDraftError?.scope !== scope) delete container.__hmbSeedanceDraftError;
-  const button = container.querySelector?.("[data-hmb-seedance-finalize-draft]");
-  if (!button) return false;
-  const waiting = Boolean(container.__hmbSeedanceDraftPending);
-  const hiddenFinal = state.draft.final_visible === false
-    || ["completed", "consumed", "expired", "not_draft"].includes(state.draft.final_state);
-  const verifiedAvailable = !state.draft.final_state || state.draft.final_state === "available";
-  button.hidden = !cancelling && (hiddenFinal || !state.draft.visible || !state.draft.job_id || Boolean(container.__hmbSeedancePendingShot));
-  button.disabled = button.hidden || waiting || (!cancelling && (!verifiedAvailable || !state.draft.final_available || state.draft.busy));
+  let group = container.querySelector?.("[data-hmb-seedance-final-controls]");
+  if (!group) return false;
+  const identity = JSON.stringify([sourceScope, scope]);
+  // A mouse-up or delayed change from an open native picker must never
+  // operate on the next Shot (or turn an old Generate click into a Stop).
+  if (group.__hmbDraftIdentity && (group.__hmbDraftIdentity !== identity || group.__hmbDraftNode !== node)) {
+    const replacement = group.cloneNode(true);
+    group.replaceWith(replacement);
+    group = replacement;
+  }
+  group.__hmbDraftIdentity = identity;
+  group.__hmbDraftNode = node;
+  const button = group.querySelector("[data-hmb-seedance-finalize-draft]");
+  const quality = group.querySelector("[data-hmb-seedance-final-resolution]");
+  const scopedActive = HMB_SEEDANCE_FINAL_RESOLUTIONS.find(res => ["reserved", "running"].includes(draft.finals_by_resolution?.[res]));
+  // A prior resolution's completed receipt can coexist with the next one's
+  // outstanding command. Only a receipt for the requested quality releases it.
+  if (selection?.attempt && (draft.final_busy || (ended && !draft.finals_by_resolution && !draft.final_resolution)
+    || ["reserved", "running", "completed", "consumed"]
+      .includes(draftFinalTargetState(draft, selection.attempt.final_resolution)))) delete selection.attempt;
+  const lockedTarget = selection?.attempt?.final_resolution || "";
+  // Returning to this Shot before its acknowledgement must not resend a click.
+  // The usual watchdog was detached with the prior view, so wake this view once.
+  clearTimeout(container.__hmbSeedanceDraftRetryTimer);
+  const remaining = !container.__hmbSeedanceDraftPending && selection?.attempt
+    ? selection.attempt.retryAfter - Date.now() : 0;
+  if (remaining > 0) container.__hmbSeedanceDraftRetryTimer = setTimeout(() => {
+    if (!container.__hmbSeedancePreviewDisposed && container.isConnected !== false)
+      hmbSeedanceSyncDraftAction(container, hmbSeedanceShotState(container.__hmbSeedanceLatestProps || {}));
+  }, remaining);
+  const waiting = Boolean(container.__hmbSeedanceDraftPending || remaining > 0);
+  const activeTarget = scopedActive || (draft.final_busy || reserved ? draft.final_resolution
+    || (draft.final_busy && HMB_SEEDANCE_FINAL_RESOLUTIONS.includes(draft.effective_resolution) ? draft.effective_resolution : "") : "");
+  // While locked, show the active job's quality as a read-only status. Once it
+  // settles, the native list contains only the remaining choices for this Draft.
+  const inFlight = activeTarget || lockedTarget;
+  const options = inFlight ? [inFlight] : availableTargets;
+  const optionKey = options.join(",");
+  if (quality.dataset.options !== optionKey) {
+    quality.replaceChildren(...options.map(resolution => new Option(resolution === "4k" ? "4K" : "1080p", resolution)));
+    quality.dataset.options = optionKey;
+  }
+  const target = inFlight || (availableTargets.includes(selection?.resolution) ? selection.resolution : availableTargets[0] || "");
+  if (selection && !inFlight && target) selection.resolution = target;
+  const showFinal = Boolean(selection) && Boolean(options.length || reserved || draft.final_busy)
+    && (ended || draft.final_visible !== false);
+  group.hidden = button.hidden = !showFinal && !cancelling;
+  button.disabled = button.hidden || waiting || (!cancelling && (!draftFinalTargetAvailable(draft, target, selection)
+    || container.__hmbSeedanceLatestProps?.disabled));
+  quality.hidden = !showFinal || !options.length;
+  quality.disabled = quality.hidden || waiting || cancelling || draft.busy || reserved || Boolean(scopedActive || lockedTarget)
+    || (!ended && !verifiedAvailable) || container.__hmbSeedanceLatestProps?.disabled === true;
+  if (quality.value !== target) quality.value = target;
   button.setAttribute?.("aria-busy", waiting || (!cancelling && state.draft.final_busy) ? "true" : "false");
   button.title = container.__hmbSeedanceDraftError?.message || (cancelling
     ? "로컬 Final 조회를 중지합니다. 접수된 서버 렌더는 계속될 수 있습니다."
-    : state.draft.reason || "완료된 Draft로 현재 Generator만 1회 실행해 1080p로 받습니다. 현재 프롬프트·소스·설정은 다시 전송하지 않으며 Agent도 재실행하지 않습니다. MOV 기본 · MOV 미지원 시 MP4.");
-  const statusLabel = state.draft.final_state === "checking" ? "Final 상태 확인 중…"
-    : ["reserved", "running"].includes(state.draft.final_state) ? "Final 처리 중…"
-    : ["unknown", "unavailable"].includes(state.draft.final_state) ? "Final 확인 필요" : "Draft final";
+    : !button.disabled ? HMB_SEEDANCE_FINAL_HELP : ended && !draft.finals_by_resolution && target && target !== draft.final_resolution
+    ? "브로커에서 선택한 해상도의 생성 가능 여부를 확인해야 합니다." : state.draft.reason || HMB_SEEDANCE_FINAL_HELP);
+  const status = !ended && !verifiedAvailable ? draft.final_state : draftFinalTargetState(draft, target);
+  const statusLabel = status === "completed" ? "생성 완료"
+    : status === "consumed" ? "Final 접수됨"
+    : status === "checking" ? "Final 상태 확인 중…"
+    : ["reserved", "running"].includes(status) ? "Final 처리 중…"
+    : status === "expired" ? "기한 만료"
+    : ["not_draft", "source_pending"].includes(status) ? "생성 불가"
+    : ["unknown", "unavailable"].includes(status) ? "Final 확인 필요" : "생성";
   setElementText(button, cancelling ? (waiting ? "중지 요청 중…" : "Final 중지")
     : waiting || state.draft.final_busy ? "Final 처리 중…" : statusLabel);
   return !button.hidden;
 }
 
-export function hmbSeedanceRequestDraftFinal(container) {
-  return requestDraftAction(container, "finalize_draft");
+export function hmbSeedanceRequestDraftFinal(container, finalResolution = "1080p") {
+  if (!HMB_SEEDANCE_FINAL_RESOLUTIONS.includes(finalResolution)) return false;
+  return requestDraftAction(container, "finalize_draft", finalResolution);
 }
 
 export function hmbSeedanceRequestDraftCancel(container) {
   return requestDraftAction(container, "cancel_draft_final");
 }
 
-function requestDraftAction(container, action) {
+function requestDraftAction(container, action, finalResolution) {
   const state = hmbSeedanceShotState(container?.__hmbSeedanceLatestProps || {});
   const root = hmbSeedanceNodeRoot(container);
   const cancelling = action === "cancel_draft_final";
   const available = (live) => cancelling
     ? live.draft.cancel_available && Boolean(live.draft.active_job_id)
-    : !container.__hmbSeedancePendingShot && live.draft.visible && Boolean(live.draft.job_id)
-      && live.draft.final_visible !== false && (!live.draft.final_state || live.draft.final_state === "available")
-      && live.draft.final_available && !live.draft.busy && !live.draft.cancel_available;
+    : !container.__hmbSeedanceLatestProps?.disabled && !container.__hmbSeedancePendingShot
+      && draftFinalTargetAvailable(live.draft, finalResolution, draftFinalSelection(root, live, draftScope(live), false));
   if (
     !container || container.__hmbSeedancePreviewDisposed || container.isConnected === false
     || !root || root.isConnected === false || !available(state) || container.__hmbSeedanceDraftPending
@@ -1868,9 +2021,14 @@ function requestDraftAction(container, action) {
   }
   // Reuse an unacknowledged action ID after a delivery timeout. A slow reply
   // must not turn another click into a second billable Final request.
-  const attempt = container.__hmbSeedanceDraftAttempt;
+  const selection = !cancelling && draftFinalSelection(root, state, scope, true);
+  const attempt = cancelling ? container.__hmbSeedanceDraftAttempt : selection?.attempt;
+  if (!cancelling && attempt?.retryAfter > Date.now()) return false;
+  if (!cancelling && attempt?.scope === scope && attempt.dispatched && attempt.final_resolution !== finalResolution) return false;
   const pending = {
     scope, root, action, expected_draft_job_id: cancelling ? state.draft.active_job_id : state.draft.job_id,
+    ...(cancelling ? {} : { final_resolution: finalResolution }),
+    dispatched: attempt?.scope === scope && attempt.dispatched === true,
     action_id: attempt?.scope === scope ? attempt.action_id
       : `${cancelling ? "cancel-final" : "final"}-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`,
   };
@@ -1886,6 +2044,7 @@ function requestDraftAction(container, action) {
   };
   const reject = (message) => {
     if (!current()) return;
+    if (selection?.attempt?.action_id === pending.action_id) selection.attempt.retryAfter = 0;
     clearDraftRequest(container);
     container.__hmbSeedanceDraftError = { scope, message: text(message || HMB_SEEDANCE_REFRESH_DELIVERY_TIMEOUT, 240) };
     update();
@@ -1904,9 +2063,13 @@ function requestDraftAction(container, action) {
     const bridge = hmbSeedanceRefreshCommandBridge(container);
     if (!bridge) { reject("Final 요청 전달 경로가 닫혔습니다. 노드를 다시 연 뒤 재시도하세요."); return; }
     try {
+      pending.dispatched = true;
+      if (selection) selection.attempt = { scope, action_id: pending.action_id, final_resolution: finalResolution,
+        dispatched: true, retryAfter: Date.now() + HMB_SEEDANCE_PREVIEW_ACTION_WATCHDOG_MS };
       const result = bridge.dispatch({
         action, action_id: pending.action_id, issued_at_ms: Date.now(),
         expected_draft_job_id: pending.expected_draft_job_id,
+        ...(cancelling ? {} : { final_resolution: pending.final_resolution }),
       });
       if (result && typeof result.then === "function") Promise.resolve(result).catch((error) => reject(error?.message || error));
     } catch (error) { reject(error?.message || error); }
@@ -2266,6 +2429,7 @@ export function hmbSeedanceCleanupPreviewOverlay(container) {
   if (!container) return false;
   container.__hmbSeedancePreviewDisposed = true;
   clearDraftRequest(container);
+  clearTimeout(container.__hmbSeedanceDraftRetryTimer);
   delete container.__hmbSeedanceDraftAttempt;
   delete container.__hmbSeedanceDraftError;
   container.__hmbSeedancePreviewObserver?.disconnect?.();
@@ -2640,15 +2804,32 @@ function hmbNativeUiImplementation(container, props) {
   installPreviewObserver(container);
   hmbSeedanceSyncRemotePromptEdge(container, initialState);
   const select = container.querySelector?.(".hmb-seedance-shot__select");
-  const finalButton = container.querySelector?.("[data-hmb-seedance-finalize-draft]");
   const onFinalize = (event) => {
+    const button = event.target?.closest?.("[data-hmb-seedance-finalize-draft]");
+    if (!button || button.disabled || button.hidden || event.detail > 1 || !container.contains(button)) return;
     event.preventDefault?.();
     event.stopPropagation?.();
     const state = hmbSeedanceShotState(container.__hmbSeedanceLatestProps || {});
     if (state.draft.cancel_available) hmbSeedanceRequestDraftCancel(container);
-    else hmbSeedanceRequestDraftFinal(container);
+    else {
+      const quality = button.parentElement.querySelector("[data-hmb-seedance-final-resolution]");
+      hmbSeedanceRequestDraftFinal(container, quality.value);
+    }
   };
-  finalButton?.addEventListener?.("click", onFinalize);
+  const onFinalResolutionChange = event => {
+    const quality = event.target;
+    if (!quality?.matches?.("[data-hmb-seedance-final-resolution]") || quality.disabled || quality.hidden
+      || !HMB_SEEDANCE_FINAL_RESOLUTIONS.includes(quality.value) || !container.contains(quality)) return;
+    event.stopPropagation();
+    const state = hmbSeedanceShotState(container.__hmbSeedanceLatestProps || {});
+    const selection = draftFinalSelection(hmbSeedanceNodeRoot(container), state, draftScope(state), false);
+    if (selection) {
+      selection.resolution = quality.value;
+      hmbSeedanceSyncDraftAction(container, state);
+    }
+  };
+  container.addEventListener?.("click", onFinalize);
+  container.addEventListener?.("change", onFinalResolutionChange);
   const onShotChange = () => {
     const liveProps = container.__hmbSeedanceLatestProps || {};
     const previousProps = liveProps;
@@ -2781,7 +2962,8 @@ function hmbNativeUiImplementation(container, props) {
     container.removeEventListener?.("keydown", stopInteriorDelete);
     container.removeEventListener?.("pointerdown", stopInteriorSelection);
     select?.removeEventListener?.("change", onShotChange);
-    finalButton?.removeEventListener?.("click", onFinalize);
+    container.removeEventListener?.("click", onFinalize);
+    container.removeEventListener?.("change", onFinalResolutionChange);
     if (container.__hmbSeedanceCleanup === cleanup) delete container.__hmbSeedanceCleanup;
     delete container.__hmbSeedanceLatestProps;
     delete container.__hmbSeedanceShotChangeError;

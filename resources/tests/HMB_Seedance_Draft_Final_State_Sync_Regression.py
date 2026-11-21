@@ -100,10 +100,88 @@ class DraftFinalStateSyncTests(unittest.TestCase):
         node = Node()
         node.opener.reply.update(prompt="PRIVATE", submit_payload={"prompt": "PRIVATE"}, token="SECRET")
         result = node.query()
-        self.assertEqual(node.opener.calls, [("GET", f"/api/v1/reviews/tasks/{JOB}/draft-final", 5.0)])
+        self.assertEqual(node.opener.calls, [("GET", f"/api/v1/reviews/tasks/{JOB}/draft-final?resolution=1080p", 5.0)])
         self.assertTrue(result["eligible"])
         self.assertFalse({"prompt", "token", "submit_payload"} & result.keys())
         self.assertNotIn("PRIVATE", repr(node._hmb_draft_final_status_cache))
+
+    def test_separate_resolution_queries_restore_the_other_target_and_validate_both_replies(self):
+        state_path = f"/api/v1/reviews/tasks/{JOB}/draft-final?resolution="
+        for finished, remaining in (("1080p", "4k"), ("4k", "1080p")):
+            node = Node()
+            keys = {"1080p": f"hmb-draft-final-v1-{JOB}", "4k": f"hmb-draft-final-v1-{JOB}-4k"}
+            rows = {quality: projection(node.source, resolution=quality, idempotency_key=key)
+                    for quality, key in keys.items()}
+            rows[finished].update(state="completed", eligible=False, consumed=True,
+                                  child_task_id=CHILD, child_status="completed")
+            def reply(request):
+                self.assertIn(request.selector, [state_path + quality for quality in keys])
+                return rows[request.selector.split("=")[-1]]
+            node.opener.reply = reply
+            with self.subTest(finished=finished):
+                result = node.query()
+                self.assertEqual([path for _, path, _ in node.opener.calls], [state_path + q for q in keys])
+                self.assertEqual({q: row["idempotency_key"] for q, row in result["finals_by_resolution"].items()}, keys)
+                self.assertEqual(node._draft_ui_state()["finals_by_resolution"], {finished: "completed", remaining: "available"})
+                self.assertTrue(node._draft_ui_state()["final_available"])
+                self.assertEqual(node._draft_source_record()["final_jobs"], {finished: CHILD})
+                for invalid in ({"owner_user_id": 99}, {"idempotency_key": keys["1080p"]},
+                                {"source_task_id": CHILD}, {"resolution": "1080p"}):
+                    with self.subTest(invalid=invalid), mock.patch.dict(rows["4k"], invalid):
+                        with self.assertRaises(t._BrokerProtocolError):
+                            node.query()
+                        self.assertFalse(node._draft_ui_state()["final_available"])
+                        self.assertEqual(node._draft_source_record()["final_jobs"], {finished: CHILD})
+
+    def test_account_change_between_resolution_reads_stops_the_second_request(self):
+        node = Node()
+        first_path = f"/api/v1/reviews/tasks/{JOB}/draft-final?resolution=1080p"
+
+        def change_account_after_first_read(request):
+            self.assertEqual(request.selector, first_path)
+            node.credential = "offline-account-B"
+            return projection(node.source, resolution="1080p")
+
+        node.opener.reply = change_account_after_first_read
+        with self.assertRaises(t._BrokerAuthenticationError):
+            node.bridge.get_draft_final_state(node.source)
+        self.assertEqual([(method, path) for method, path, _ in node.opener.calls], [("GET", first_path)])
+
+    def test_resolution_scoped_receipts_survive_reload_and_reject_conflicts(self):
+        node = Node()
+        completed = projection(node.source, "completed", consumed=True, child_task_id=CHILD, child_status="succeeded")
+        available = projection(node.source)
+        node.opener.reply = {**completed, "finals_by_resolution": {
+            "1080p": {**completed, "idempotency_key": t._seedance_draft_final_request_id(JOB, "1080p")},
+            "4k": {**available, "idempotency_key": t._seedance_draft_final_request_id(JOB, "4k")},
+        }}
+        node.query()
+        self.assertEqual(node._draft_ui_state()["finals_by_resolution"], {"1080p": "completed", "4k": "available"})
+        self.assertEqual(node._draft_source_record()["final_jobs"], {"1080p": CHILD})
+        original = deepcopy(node.opener.reply)
+        for override in ({"owner_user_id": 89}, {"child_task_id": JOB}, {"child_task_id": "job-" + "f" * 32},
+                         {"idempotency_key": t._seedance_draft_final_request_id(JOB, "4k")},
+                         {"source_task_id": CHILD}, {"finals_by_resolution": {}}):
+            node._hmb_draft_final_status_cache = {}
+            node.opener.reply = deepcopy(original)
+            node.opener.reply["finals_by_resolution"]["1080p"].update(override)
+            with self.subTest(override=override), self.assertRaises(t._BrokerProtocolError):
+                node.query()
+            self.assertFalse(node._draft_ui_state()["final_available"])
+            self.assertEqual(node._draft_source_record()["final_jobs"], {"1080p": CHILD})
+
+    def test_legacy_child_with_unknown_resolution_requires_matching_scoped_child(self):
+        node = Node()
+        node._store_draft_source({**node.source, "final_job_id": CHILD})
+        available = projection(node.source)
+        scoped = {target: {**available, "idempotency_key": t._seedance_draft_final_request_id(JOB, target)}
+                  for target in t.DRAFT_FINAL_RESOLUTIONS}
+        node.opener.reply = {**available, "finals_by_resolution": scoped}
+        with self.assertRaises(t._BrokerProtocolError):
+            node.query()
+        scoped["4k"].update(state="completed", consumed=True, eligible=False, child_task_id=CHILD, child_status="succeeded")
+        node.query()
+        self.assertEqual(node._draft_ui_state()["finals_by_resolution"], {"1080p": "available", "4k": "completed"})
 
     def test_actual_server_synthetic_projection_contract_all_thirteen_cases(self):
         data = json.loads(Path(__file__).with_name("_hmb_draft_final_state_contract_fixtures.json").read_text(encoding="utf-8"))
@@ -135,6 +213,13 @@ class DraftFinalStateSyncTests(unittest.TestCase):
         self.assertTrue(node._draft_ui_state()["final_available"])
         self.assertEqual(node.parameter_values, before)
 
+    def test_legacy_only_id_does_not_show_controls_before_completion_is_verified(self):
+        node = Node(shot=False)
+        node._store_draft_source(dict(fixture.base.SOURCE))
+        self.assertFalse(node._draft_ui_state()["source_completed"])
+        node.query()
+        self.assertTrue(node._draft_ui_state()["source_completed"])
+
     def test_same_draft_web_running_disables_completed_hides_and_keeps_child(self):
         node = Node()
         node.query()
@@ -145,7 +230,22 @@ class DraftFinalStateSyncTests(unittest.TestCase):
             ui = node._draft_ui_state()
             self.assertEqual((ui["final_state"], ui["final_visible"], ui["final_task_id"]), (state, visible, CHILD))
             self.assertFalse(ui["final_available"])
+            self.assertTrue(ui["source_completed"])
+            self.assertNotIn("final_resolution", ui)  # Another client chose the resolution.
         self.assertEqual(node._draft_source_record()["final_job_id"], CHILD)
+
+    def test_inline_header_projection_is_bound_to_completed_source(self):
+        node = Node()
+        node._store_draft_source({**node.source, "final_request_id": t._seedance_draft_final_request_id(JOB), "final_resolution": "4k"})
+        node.opener.reply = projection(node.source, "completed", consumed=True, child_task_id=CHILD, child_status="completed")
+        node.query()
+        result = node._draft_ui_state()
+        self.assertEqual((result["job_id"], result["final_task_id"], result["final_resolution"]), (JOB, CHILD, "4k"))
+        self.assertTrue(result["source_completed"])
+        self.assertFalse(result["final_available"])
+        node.source_connected = False
+        self.assertFalse(node._draft_ui_state()["source_completed"])
+        self.assertNotIn("final_resolution", node._draft_ui_state())
 
     def test_unknown_keeps_child_and_idempotency_identity_never_arms(self):
         node = Node()

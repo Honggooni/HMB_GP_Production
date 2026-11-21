@@ -147,6 +147,29 @@ class ColorLUTUploadRegression(unittest.TestCase):
         self.assertEqual(context["source_task_id"], "job-offline-lut")
         self.assertTrue(self.node._upload_projection()["enabled"])
 
+    def test_bound_source_and_export_require_capability_and_shot_permission_for_client_media(self):
+        caps = self.bridge.review_capabilities()
+        get = self.bridge._request_json
+        for cap, eligibility in ((None, None), ("client-v1", None), (None, "client-v1"),
+                                 ("client-v1", "other"), ("client-v1", "client-v1")):
+            caps["color_lut_upload"]["client_review_media"] = cap
+            def request(method, path, **kwargs):
+                value = get(method, path, **kwargs)
+                if path.endswith("/color-lut"):
+                    value["client_review_media"] = eligibility
+                return value
+            with self.subTest(cap=cap, eligibility=eligibility), \
+                 mock.patch.object(self.bridge, "review_capabilities", return_value=caps), \
+                 mock.patch.object(self.bridge, "_request_json", side_effect=request):
+                for artifact in ("source", "export"):
+                    with self.subTest(artifact=artifact):
+                        context = self.ready(artifact)
+                        expected = "client-v1" if cap == eligibility == "client-v1" else None
+                        self.assertEqual(context.get("client_review_media"), expected)
+                        if expected:
+                            info = Path(context["path"]).stat()
+                            self.assertEqual((context["st_dev"], context["st_ino"]), (info.st_dev, info.st_ino))
+
     def test_hierarchy_rename_keeps_captured_name_and_same_task_receipt(self):
         before = self.ready()
         routing_shot = self.asset._hmb_shot_routing_catalog()["shots"][0]
@@ -160,6 +183,27 @@ class ColorLUTUploadRegression(unittest.TestCase):
         for key in ("source_task_id", "shot_uuid", "channel_uuid", "source_revision", "upload_id", "receipt_id"):
             self.assertEqual(after[key], before[key])
         self.assertEqual(self.node._upload_metadata(after), self.node._upload_metadata(before))
+
+    def test_bound_grade_without_per_shot_media_capability_posts_only_the_graded_file(self):
+        caps = self.bridge.review_capabilities()
+        caps["color_lut_upload"]["client_review_media"] = "client-v1"
+        with mock.patch.object(self.bridge, "review_capabilities", return_value=caps), \
+             mock.patch.object(self.node, "_upload_request", side_effect=lambda context, **kw: self.acknowledgement(context)) as send, \
+             mock.patch("_hmb_color_lut.make_review_media") as encode, \
+             mock.patch.object(self.node, "_upload_review_media") as attach:
+            self.ready("export")
+            for event_id in ("publish-existing-grade", "repeat-existing-grade"):
+                state = copy.deepcopy(self.node._hmb_color_lut_state)
+                self.node._command({"id": event_id, "action": "export_upload", "state": state})
+                self.fixture.drain()
+            send.assert_called_once()
+            encode.assert_not_called()
+            attach.assert_not_called()
+        context = send.call_args.args[0]
+        self.assertEqual(context["artifact"], "export")
+        self.assertNotIn("client_review_media", context)
+        self.assertTrue(Path(context["path"]).samefile(self.root / "graded.mov"))
+        self.assertEqual(target._read_upload_receipt(context["receipt_id"])["phase"], "complete")
 
     def test_invalid_captured_name_still_blocks_after_hierarchy_rename(self):
         original = self.bridge._request_json

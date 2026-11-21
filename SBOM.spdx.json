@@ -2,8 +2,8 @@
   "SPDXID": "SPDXRef-DOCUMENT",
   "spdxVersion": "SPDX-2.3",
   "dataLicense": "CC0-1.0",
-  "name": "HMB_GP_Production-0.9.23",
-  "documentNamespace": "https://hmb.local/spdx/HMB_GP_Production/0.9.23",
+  "name": "HMB_GP_Production-0.9.25",
+  "documentNamespace": "https://hmb.local/spdx/HMB_GP_Production/0.9.25",
   "creationInfo": {
     "created": "2026-08-05T00:00:00Z",
     "creators": [
@@ -15,7 +15,7 @@
     {
       "SPDXID": "SPDXRef-HMB-GP-Production",
       "name": "hmb-gp-production",
-      "versionInfo": "0.9.23",
+      "versionInfo": "0.9.25",
       "downloadLocation": "NOASSERTION",
       "filesAnalyzed": false,
       "licenseConcluded": "LicenseRef-HMB-Internal-1.0",
@@ -41,6 +41,27 @@
       "filesAnalyzed": false,
       "licenseConcluded": "BSD-2-Clause",
       "licenseDeclared": "BSD-2-Clause",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "SPDXID": "SPDXRef-FFmpeg-Review",
+      "name": "FFmpeg",
+      "versionInfo": "7.1.5",
+      "downloadLocation": "https://ffmpeg.org/releases/ffmpeg-7.1.5.tar.xz",
+      "filesAnalyzed": false,
+      "licenseConcluded": "GPL-2.0-or-later",
+      "licenseDeclared": "GPL-2.0-or-later",
+      "copyrightText": "NOASSERTION",
+      "comment": "Windows x64 ffmpeg and ffprobe built with libx264 and distributed with source and rebuild instructions."
+    },
+    {
+      "SPDXID": "SPDXRef-x264-Review",
+      "name": "x264",
+      "versionInfo": "31e19f92f00c7003fa115047ce50978bc98c3a0d",
+      "downloadLocation": "https://code.videolan.org/videolan/x264/-/archive/31e19f92f00c7003fa115047ce50978bc98c3a0d/x264-31e19f92f00c7003fa115047ce50978bc98c3a0d.tar.gz",
+      "filesAnalyzed": false,
+      "licenseConcluded": "GPL-2.0-or-later",
+      "licenseDeclared": "GPL-2.0-or-later",
       "copyrightText": "NOASSERTION"
     },
     {
@@ -85,6 +106,16 @@
       "spdxElementId": "SPDXRef-HMB-GP-Production",
       "relationshipType": "DEPENDS_ON",
       "relatedSpdxElement": "SPDXRef-httpx"
+    },
+    {
+      "spdxElementId": "SPDXRef-HMB-GP-Production",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-FFmpeg-Review"
+    },
+    {
+      "spdxElementId": "SPDXRef-FFmpeg-Review",
+      "relationshipType": "STATIC_LINK",
+      "relatedSpdxElement": "SPDXRef-x264-Review"
     },
     {
       "spdxElementId": "SPDXRef-volcengine-tos",

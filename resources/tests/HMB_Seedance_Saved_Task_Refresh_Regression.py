@@ -58,6 +58,9 @@ class SavedTaskRefreshTests(unittest.TestCase):
     def setUp(self):
         self.boundaries = ExitStack()
         self.addCleanup(self.boundaries.close)
+        self.media_schedule = mock.Mock()
+        self.boundaries.enter_context(mock.patch.dict(sys.modules, {'_hmb_client_review_media':
+            SimpleNamespace(schedule_completed_review_media=self.media_schedule)}))
         original_connect = socket.socket.connect
 
         def local_wakeup_only(sock, address):
@@ -178,10 +181,15 @@ class SavedTaskRefreshTests(unittest.TestCase):
         for _ in range(5):
             asyncio.run(node._refresh_async())
             self.assert_success(node, JOB)
+            call = self.media_schedule.call_args
+            self.assertEqual(call.args, (node.bridge, JOB))
+            self.assertIs(call.kwargs['private'], False)
+            self.assertEqual(call.kwargs['local_source'].result(timeout=0), path)
         self.assert_no_publication(node)
         self.assertEqual(file_identity(path), before)
         self.assertEqual(list(path.parent.iterdir()), [path])
         self.assertEqual(node.bridge.refresh_ids, [JOB] * 5)
+        self.assertEqual(self.media_schedule.call_count, 5)
 
     def test_explicit_resume_of_already_saved_task_does_not_republish_or_submit(self):
         node, path = self.make_node()
@@ -193,6 +201,7 @@ class SavedTaskRefreshTests(unittest.TestCase):
         self.assertEqual(file_identity(path), before)
         self.assertEqual(self.authoring(node), settings)
         self.assertEqual(node.bridge.posts, [])
+        self.media_schedule.assert_not_called()
 
     def test_five_generators_refresh_only_their_own_saved_task(self):
         nodes = [self.make_node(job_id='job-' + str(index) * 32)

@@ -276,14 +276,34 @@ def parse_draft_final_state(job: dict[str, Any]) -> dict[str, Any] | None:
     checked = validate_job(job)
     if "draft_final" not in checked:
         return None
-    state = checked["draft_final"]
+    return normalize_draft_final_projection(checked["draft_final"], source_task_id=checked["task_id"], workspace_id=checked["workspace_id"])
+
+
+def normalize_draft_final_projection(state: Any, *, source_task_id: str, workspace_id: str) -> dict[str, Any]:
+    checked = {"task_id": source_task_id, "workspace_id": workspace_id}
+    result = _private_draft_final_slot(state, checked)
+    if "finals_by_resolution" in state:
+        slots = state["finals_by_resolution"]
+        if not isinstance(slots, dict) or set(slots) != {"1080p", "4k"}:
+            _fail("Private Draft-final resolution slots are incomplete.")
+        targets = {quality: _private_draft_final_slot(slot, checked, quality) for quality, slot in slots.items()}
+        children = [slot["child_task_id"] for slot in targets.values() if slot.get("child_task_id")]
+        if (len(children) != len(set(children)) or (result.get("child_task_id") and result["child_task_id"] not in children)
+                or any(slot["expires_at"] != result["expires_at"] for slot in targets.values())):
+            _fail("Private Draft-final slots disagree about the source or child.", "MY_BOX_IDENTITY_MISMATCH")
+        result["finals_by_resolution"] = targets
+    return result
+
+
+def _private_draft_final_slot(state: Any, checked: dict[str, Any], resolution: str = "") -> dict[str, Any]:
     required = {"schema", "version", "state", "eligible", "source_task_id", "child_task_id", "child_status", "expires_at",
         "expiry_basis", "workspace_id", "selection", "final_client_request_id", "eligibility_scope", "resubmit_allowed", "reason_code"}
     if (not isinstance(state, dict) or not required.issubset(state) or state.get("schema") != DRAFT_FINAL_SCHEMA
             or type(state.get("version")) is not int or state["version"] != 1
             or state.get("state") not in ("available", "reserved", "running", "completed", "expired", "not_draft")
             or type(state.get("eligible")) is not bool or state.get("resubmit_allowed") is not False
-            or state.get("eligibility_scope") != "source_only" or state.get("expiry_basis") != "source_creation_provider_limit"):
+            or state.get("eligibility_scope") not in (("source_only", "source_resolution") if resolution else ("source_only",))
+            or state.get("expiry_basis") != "source_creation_provider_limit"):
         _fail("Broker returned an invalid private Draft-final state.")
     if (state.get("source_task_id") != checked["task_id"] or state.get("workspace_id") != checked["workspace_id"]
             or normalize_selection(state.get("selection"))["workspace_id"] != checked["workspace_id"]):
@@ -307,6 +327,10 @@ def parse_draft_final_state(job: dict[str, Any]) -> dict[str, Any] | None:
             or (name == "reserved" and child_status in ("pending", "running", "downloading", "completed"))):
         _fail("Private Draft-final state conflicts with its eligibility or child.")
     expected_key = "mbx-final-v1-" + checked["task_id"][len("job-mybox-"):]
+    if resolution:
+        if "finals_by_resolution" in state or state.get("resolution", resolution) != resolution:
+            _fail("Private Draft-final resolution identity changed.", "MY_BOX_IDENTITY_MISMATCH")
+        expected_key = "mbx-final-v2-" + checked["task_id"][len("job-mybox-"):] + "-" + resolution
     if state.get("final_client_request_id") != expected_key:
         _fail("Private Draft-final recommended request identity changed.", "MY_BOX_IDENTITY_MISMATCH")
     reason = state.get("reason_code")
@@ -314,7 +338,19 @@ def parse_draft_final_state(job: dict[str, Any]) -> dict[str, Any] | None:
         _fail("Private Draft-final reason is invalid.")
     if name == "available" and reason is not None:
         _fail("Private Draft-final eligible state has a blocking reason.")
-    return json.loads(_json(state, limit=8192))
+    return json.loads(_json({k: state[k] for k in required}, limit=8192))
+
+
+def draft_final_target(state: dict[str, Any], resolution: str) -> dict[str, Any]:
+    """Select a verified slot. A legacy source has exactly one shared reservation."""
+    slots = state.get("finals_by_resolution")
+    if slots is None:
+        return state
+    if (state["state"] in {"expired", "not_draft"}
+            or state["state"] in {"reserved", "running"} and slots[resolution]["state"] == "available"
+            or any(slot["state"] in {"reserved", "running"} for quality, slot in slots.items() if quality != resolution)):
+        _fail("The private Draft source has expired or another Final is unresolved.", "MY_BOX_RESULT_NOT_READY")
+    return slots[resolution]
 
 
 @dataclass(frozen=True)
@@ -416,10 +452,14 @@ class MyBoxBroker:
             intent = admission.workspace_intent
             if intent is None or intent["selection"] != invocation.selection:
                 _fail("Private queue workspace intent does not match the invocation.", "MY_BOX_IDENTITY_MISMATCH")
-        if admission is not None and payload.get("draft_job_id"):
+        if payload.get("draft_job_id") and (admission is not None or invocation.client_request_id.startswith("mbx-final-v2-")):
             detail = self.detail(payload["draft_job_id"], selection=invocation.selection, timeout=min(timeout, 15))
             final = parse_draft_final_state(detail)
+            scoped_key_required = bool(final and final.get("finals_by_resolution")) or invocation.client_request_id.startswith("mbx-final-v2-")
+            if final is not None:
+                final = draft_final_target(final, payload["resolution"])
             if (final is None or not final["eligible"] or final["state"] != "available" or final.get("child_task_id")
+                    or scoped_key_required and final["final_client_request_id"] != invocation.client_request_id
                     or type(final.get("expires_at")) is not int or time.time() >= final["expires_at"]):
                 _fail("Private Draft Final is no longer eligible. Retrieve the same source.", "MY_BOX_RESULT_NOT_READY")
         checked = prepare_invocation(payload, selection=invocation.selection, title=payload.get("my_box_title"),

@@ -10,6 +10,13 @@ HMB GP Production declares the following direct editor/runtime dependencies:
 - The FFmpeg executable supplied through imageio-ffmpeg is governed by the
   license and build configuration published with that binary.
 
+Windows review media generation uses the packaged FFmpeg 7.1.5 utilities and
+the statically linked VideoLAN x264 library. These separate executables are
+licensed under GPL-2.0-or-later. The corresponding upstream source archives,
+build instructions, license and MinGW runtime notices accompany the utilities
+under `resources/media-tools/`. See [FFmpeg](https://ffmpeg.org/) and
+[VideoLAN x264](https://www.videolan.org/developers/x264.html).
+
 Optional Volcengine TOS uploads run in a separate `.venv-tos` interpreter:
 
 - Volcengine TOS Python SDK 2.9.2 — Apache-2.0 license

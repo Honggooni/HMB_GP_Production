@@ -19,6 +19,16 @@ from typing import Any
 
 SCHEMA = "hmb-build-diagnostics"
 RECEIPT_NAME = ".hmb-install-receipt.json"
+_REVIEW_MEDIA_FILES = (
+    "resources/media-tools/win64/ffmpeg.exe",
+    "resources/media-tools/win64/ffprobe.exe",
+    "resources/media-tools/source/ffmpeg-7.1.5.tar.xz",
+    "resources/media-tools/source/x264-31e19f92f00c7003fa115047ce50978bc98c3a0d.tar.gz",
+    "resources/media-tools/COPYING.GPLv2",
+    "resources/media-tools/MINGW-RUNTIME.txt",
+    "resources/media-tools/README.txt",
+    "resources/media-tools/rebuild-review-tools.sh",
+)
 RUNTIME_FILE_PATHS = (
     "__init__.py", "griptape-nodes-library.json", "HMBAgentLibrary.py", "HMBAnalysisAgent.py",
     "HMBColorLUTLibrary.py", "HMBFinishLookLibrary.py", "HMBImageAssetLibrary.py", "HMBImageBash.py", "HMBImageGeneration.py",
@@ -26,7 +36,7 @@ RUNTIME_FILE_PATHS = (
     "_hmb_agent_media.py", "_hmb_analysis_delivery.py", "_hmb_reference_analysis.py", "_hmb_analysis_broker.py", "_hmb_sound.py", "_hmb_agent_session.py", "_hmb_broker_config.py", "_hmb_build_diagnostics.py", "_hmb_image_limits.py", "_hmb_image_generation.py",
     "_hmb_my_box.py", "_hmb_my_box_node.py", "_hmb_reference_leases.py", "_hmb_queue_admission.py",
     "_hmb_library_bootstrap.py", "_hmb_deletion_guard.py", "_hmb_connection_management.py", "_hmb_workflow_migration.py", "_hmb_workflow_serialization_compat.py", "_hmb_project.py", "_hmb_review.py", "_hmb_web_rerender.py", "_hmb_shot_routing.py", "_hmb_mp4_verify.py", "_hmb_common.py",
-    "_hmb_color_lut.py", "_hmb_color_lut_usage.py", "_hmb_screen_space.py", "_hmb_video_tools.py",
+    "_hmb_color_lut.py", "_hmb_client_review_media.py", "_hmb_color_lut_usage.py", "_hmb_screen_space.py", "_hmb_video_tools.py",
     "_hmb_cgt.py", "_hmb_shot_basket.py",
     "_hmb_image_bash_compat.py", "_hmb_image_bash_render.py", "_hmb_image_bash_state.py",
     "widgets/HMBAgentLibraryWidget.js", "widgets/HMBAnalysisAgentWidget.js", "widgets/HMBColorLUTLibraryWidget.js",
@@ -40,6 +50,7 @@ RUNTIME_FILE_PATHS = (
     "resources/maya/HMB_Maya_Background_Preview.py",
     "resources/blender/HMB_Blender_Background_Preview.py",
     "resources/picker/HMB_Marker_Catalog.json",
+    *_REVIEW_MEDIA_FILES,
     "resources/cgt/server-trust.json", "resources/image_bash/compatibility.json", "resources/agent/superwings12/hmb_agent_core.dat",
     "resources/agent/Dinoster5/project.json", "resources/agent/Katuri8/project.json", "resources/agent/Katuri8/hmb_agent_core.dat",
     "resources/agent/superwings12/project.json",
@@ -109,8 +120,10 @@ def _expected_records(value: Any, *, historical: bool = False) -> list[dict[str,
         seen.add(name)
         rows.append({"path": name, "bytes": row["bytes"], "sha256": _sha(row["sha256"])})
     current_paths = set(RUNTIME_FILE_PATHS)
-    pre_basket_paths = current_paths - {"_hmb_shot_basket.py"}
-    if seen != current_paths and not (historical and seen == pre_basket_paths):
+    before_review_media = current_paths.difference(_REVIEW_MEDIA_FILES, {"_hmb_client_review_media.py"})
+    if seen != current_paths and not (
+        historical and seen in (before_review_media, before_review_media - {"_hmb_shot_basket.py"})
+    ):
         raise ValueError("incomplete_inventory")
     return rows
 

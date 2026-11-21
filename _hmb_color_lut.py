@@ -39,6 +39,9 @@ SETTINGS_PRECISION_VERSION = 2
 STEP_SUBDIVISIONS = 4
 CUBE_SIZE = 33
 CODEC_EXTENSIONS = {"hevc10": ".mov", "prores": ".mov", "ffv1": ".mkv"}
+_REVIEW_ENCODER_SLOT = threading.BoundedSemaphore(1)
+_REVIEW_PREVIEW_BYTES = 256 * 1024 * 1024
+_REVIEW_POSTER_BYTES = 256 * 1024
 _UNKNOWN = {"", "unknown", "unspecified", "reserved", "N/A"}
 _SDR_TRANSFERS = {"bt709", "smpte170m", "smpte240m", "bt470bg", "bt470m", "iec61966-2-1"}
 _SDR_PRIMARIES = {"bt709", "bt470bg", "smpte170m", "smpte240m", "bt470m"}
@@ -157,12 +160,22 @@ def resolve_source(reference: Any, *, remote: bool = False) -> Path:
     return VideoMediaService._resolve_input(reference, remote=remote)
 
 
-def _color_details(source: Path) -> dict[str, Any]:
-    ffmpeg = _find_ffmpeg()
-    ffprobe = _find_ffprobe(ffmpeg)
+# The temporary filename may be source.mov even when the broker sends WebM.
+# Probe the content while excluding playlist and external-resource demuxers.
+# The MOV demuxer's external data references and absolute paths default to off.
+_REVIEW_INPUT_FORMATS = ("-format_whitelist", "mov,m4v,matroska,webm")
+
+
+def _color_details(source: Path, *, review_tools: tuple[str, str] | None = None) -> dict[str, Any]:
+    if review_tools is None:
+        ffmpeg = _find_ffmpeg()
+        ffprobe = _find_ffprobe(ffmpeg)
+    else:
+        ffmpeg, ffprobe = review_tools
+    options = _REVIEW_INPUT_FORMATS if review_tools is not None else ()
     if ffprobe:
         try:
-            result = subprocess.run([ffprobe, "-v", "error", "-protocol_whitelist", "file,pipe", "-show_streams", "-show_format", "-of", "json", str(source)],
+            result = subprocess.run([ffprobe, "-v", "error", "-protocol_whitelist", "file,pipe", *options, "-show_streams", "-show_format", "-of", "json", str(source)],
                                     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, check=True)
             payload = json.loads(result.stdout)
             videos = [item for item in payload.get("streams", []) if item.get("codec_type") == "video"]
@@ -176,7 +189,7 @@ def _color_details(source: Path) -> dict[str, Any]:
             raise ColorLUTError(f"Could not verify source color metadata: {exc}") from exc
     # Bundled imageio FFmpeg may not ship ffprobe. Its stream header still reports
     # matrix/primaries/transfer and HDR side data; retain those instead of relabeling.
-    result = subprocess.run([ffmpeg, "-hide_banner", "-protocol_whitelist", "file,pipe", "-i", str(source)], capture_output=True, text=True,
+    result = subprocess.run([ffmpeg, "-hide_banner", "-protocol_whitelist", "file,pipe", *options, "-i", str(source)], capture_output=True, text=True,
                             encoding="utf-8", errors="replace", timeout=30)
     log = result.stderr or result.stdout
     line = next((line for line in log.splitlines() if "Video:" in line
@@ -333,6 +346,97 @@ def make_mov_preview(source: Path, info: Mapping[str, Any], directory: Path, can
                "-movflags", "+faststart", "-map_metadata", "-1", "-f", "mp4", str(preview)]
     _run_export(command, directory, cancel, None, float(info.get("duration") or 0), 0)
     return preview
+
+
+def _review_media_tools() -> tuple[str, str]:
+    if os.name == "nt":
+        directory = Path(__file__).resolve().parent / "resources" / "media-tools" / "win64"
+        ffmpeg, ffprobe = directory / "ffmpeg.exe", directory / "ffprobe.exe"
+        if not ffmpeg.is_file() or not ffprobe.is_file():
+            raise ColorLUTError("Review media tools are missing. Reinstall the HMB library package.")
+        return str(ffmpeg), str(ffprobe)
+    ffmpeg = _find_ffmpeg()
+    return ffmpeg, _find_ffprobe(ffmpeg)
+
+
+def make_review_media(source: Path, directory: Path, cancel_event: threading.Event, *,
+                      expected_sha256: str) -> tuple[Path, Path]:
+    """Build the broker's poster and review MP4 in the caller's private temporary directory."""
+    source = Path(source).resolve(strict=True)
+    if source.suffix.lower() not in {".mov", ".mp4", ".m4v", ".webm"} or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise ColorLUTError("Review media requires a MOV, MP4, M4V or WebM and its upload SHA-256.")
+
+    def check_cancelled() -> None:
+        if cancel_event.is_set():
+            raise ColorLUTError("Color LUT review media was cancelled.")
+
+    def source_stamp() -> tuple[int, int, int, int, int]:
+        info = source.stat()
+        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+    before = source_stamp()
+    pair_id = uuid.uuid4().hex
+    directory = Path(directory).resolve()
+    poster = directory / f"poster-{pair_id}.jpg"
+    preview = directory / f"preview-{pair_id}.mp4"
+    check_cancelled()
+    while not _REVIEW_ENCODER_SLOT.acquire(timeout=0.1):
+        check_cancelled()
+    try:
+        check_cancelled()
+        review_tools = _review_media_tools()
+        details = _color_details(source, review_tools=review_tools)
+        check_cancelled()
+        stream = f"0:{int(details['index'])}"
+        # Preserve VFR presentation timestamps, including the final sample's duration.
+        # FFmpeg-only installations can still preserve the demuxer's time base.
+        timing = ["-enc_time_base:v", "demux"]
+        time_base = re.fullmatch(r"([1-9][0-9]*)/([1-9][0-9]*)", str(details.get("time_base", "")))
+        ticks = str(details.get("duration_ts", ""))
+        duration_ticks = int(ticks) if ticks.isdecimal() else 0
+        if time_base and duration_ticks > 0:
+            clock = int(time_base[2])
+            span = duration_ticks * int(time_base[1])
+            timing = ["-enc_time_base:v", f"1:{clock}", "-bsf:v",
+                      rf"setts=duration=if(eq(NEXT_PTS\,NOPTS)\,max(1\,round(({span}/{clock})/TB)-(PTS-STARTPTS))\,DURATION)"]
+        command = [
+            review_tools[0], "-hide_banner", "-nostdin", "-n", "-loglevel", "error",
+            "-threads", "8", "-filter_threads", "6", "-protocol_whitelist", "file,pipe",
+            *_REVIEW_INPUT_FORMATS, "-i", str(source),
+            "-map", stream, "-map", "0:a:0?", "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn",
+            "-vf", "scale=w='min(iw,1280)':h='min(ih,720)':force_original_aspect_ratio=decrease:"
+                   "force_divisible_by=2:flags=lanczos,format=yuv420p",
+            "-fps_mode:v", "passthrough", "-bf:v", "0", "-c:v", "libx264", "-preset", "veryfast",
+            "-crf", "18", "-pix_fmt", "yuv420p", "-threads", "4", "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+            *timing, "-movflags", "+faststart", "-fs", str(_REVIEW_PREVIEW_BYTES + 1024 * 1024), "-f", "mp4", str(preview),
+            "-map", stream, "-frames:v", "1", "-an", "-sn", "-dn", "-threads", "1",
+            "-vf", "tpad=stop_mode=clone:stop=1,tpad=stop_mode=clone:stop_duration=0.2,trim=start=0.1,"
+                   "scale=w='max(1,trunc(iw*sar*min(1,min(640/(iw*sar),360/ih))))':"
+                   "h='max(1,trunc(ih*min(1,min(640/(iw*sar),360/ih))))':flags=lanczos,"
+                   "setsar=1,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black",
+            "-q:v", "4", "-f", "image2pipe", "-c:v", "mjpeg", str(poster),
+        ]
+        with tempfile.TemporaryDirectory(dir=directory) as work:
+            _run_export(command, Path(work), cancel_event, None, _stream_duration(details), 0)
+        check_cancelled()
+        if not (16 <= poster.stat().st_size <= _REVIEW_POSTER_BYTES
+                and 32 <= preview.stat().st_size <= _REVIEW_PREVIEW_BYTES):
+            raise ColorLUTError("Encoded review media is outside the broker media size bounds.")
+        digest = hashlib.sha256()
+        with source.open("rb") as original:
+            while block := original.read(1024 * 1024):
+                check_cancelled()
+                digest.update(block)
+        check_cancelled()
+        if before != source_stamp() or digest.hexdigest() != expected_sha256:
+            raise ColorLUTError("The video changed while preparing its review media.")
+        return poster, preview
+    except BaseException:
+        poster.unlink(missing_ok=True)
+        preview.unlink(missing_ok=True)
+        raise
+    finally:
+        _REVIEW_ENCODER_SLOT.release()
 
 
 def build_color_filter(source_probe: Mapping[str, Any], codec: str, *, cube_name: str = "grade.cube") -> str:

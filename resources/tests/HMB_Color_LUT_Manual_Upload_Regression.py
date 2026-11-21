@@ -278,6 +278,70 @@ class ManualLUTRegression(unittest.TestCase):
         self.assertIn(Path(context["path"]).read_bytes(), seen["body"])
         self.assertNotIn(str(self.root).encode(), seen["body"])
         self.assertEqual(int(seen["headers"]["Content-length"]), len(seen["body"]))
+        return seen
+
+    def test_source_and_export_announce_client_media_only_for_the_advertised_protocol(self):
+        for value in (None, True, "client-v2", "client-v1"):
+            self.cap["client_review_media"] = value
+            for artifact in ("source", "export"):
+                with self.subTest(value=value, artifact=artifact):
+                    sent = self.assert_manual_wire_contract(artifact)
+                    expected = "client-v1" if value == "client-v1" else None
+                    self.assertEqual(sent["headers"].get("X-hmb-review-media"), expected)
+
+    def test_review_media_streams_poster_then_preview_and_checks_acknowledgement(self):
+        self.cap["client_review_media"] = "client-v1"
+        original = self.assert_manual_wire_contract("source")
+        context = self.ready()
+        derived = self.ack(context)["derived_task_id"]
+        poster, preview = self.root / "poster.jpg", self.root / "preview.mp4"
+        poster_bytes, preview_bytes = b"poster", b"p" * (1024 * 1024 + 42)
+        poster.write_bytes(poster_bytes)
+        preview.write_bytes(preview_bytes)
+        ready = {"state": "ready", "derived_task_id": derived, "source_sha256": context["sha256"]}
+        opener = mock.Mock()
+        context["bridge"]._opener = opener
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        def opened(request, *, timeout):
+            headers = dict(request.header_items())
+            self.assertEqual(request.full_url, f"{ORIGIN}/api/v1/reviews/tasks/{derived}/color-lut/media")
+            self.assertEqual(request.method, "POST")
+            self.assertEqual(headers["Content-type"], "application/octet-stream")
+            self.assertEqual(headers["Content-length"], str(len(poster_bytes) + len(preview_bytes)))
+            self.assertEqual(headers["X-hmb-poster-bytes"], str(len(poster_bytes)))
+            self.assertEqual(headers["X-hmb-source-sha256"], context["sha256"])
+            for name in ("Authorization", "Idempotency-key"):
+                self.assertEqual(headers[name], original["headers"][name])
+            chunks = list(request.data)
+            self.assertLessEqual(max(map(len, chunks)), 1024 * 1024)
+            self.assertEqual(b"".join(chunks), poster_bytes + preview_bytes)
+            return response
+        opener.open.side_effect = opened
+        generator = types.ModuleType("HMBSeedanceGeneration")
+        generator._broker_require_exact_response_url = mock.Mock()
+        generator._broker_read_json = mock.Mock(return_value=ready)
+        with mock.patch.dict(sys.modules, {"HMBSeedanceGeneration": generator}):
+            for status in (201, 200):
+                response.status = status
+                self.assertEqual(self.node._upload_review_media(context, derived, poster, preview, cancel=threading.Event()), ready)
+            for status, patch in ((202, {}), (200, {"state": "pending"}), (201, {"derived_task_id": "other"}),
+                                  (200, {"source_sha256": "0" * 64})):
+                with self.subTest(status=status, mismatch=patch), self.assertRaises(ValueError):
+                    response.status = status
+                    generator._broker_read_json.return_value = {**ready, **patch}
+                    self.node._upload_review_media(context, derived, poster, preview, cancel=threading.Event())
+            opener.open.reset_mock()
+            for invalid in ("../../wrong", "/api/test", ""):
+                with self.subTest(derived=invalid), self.assertRaises(ValueError):
+                    self.node._upload_review_media(context, invalid, poster, preview, cancel=threading.Event())
+            cancelled = threading.Event()
+            cancelled.set()
+            with self.assertRaises(ValueError):
+                self.node._upload_review_media(context, derived, poster, preview, cancel=cancelled)
+            with self.assertRaises(ValueError):
+                self.node._upload_review_media({**context, "client_review_media": None}, derived, poster, preview, cancel=threading.Event())
+            opener.open.assert_not_called()
 
     def test_legacy_export_proof_keeps_original_filename_and_upload_identity(self):
         state = self.node._hmb_color_lut_state

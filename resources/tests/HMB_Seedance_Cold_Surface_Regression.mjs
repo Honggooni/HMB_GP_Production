@@ -57,15 +57,15 @@ try{
   assert.equal(r.managedHidden,true);assert.equal(r.foreignVisible,true);assert.equal(r.markerCleared,true);return r;
  });
  await check('cold_only_catalog_arrives_without_second_click',async()=>{
-  const r=await page.evaluate(()=>{const empty={...state(0),shot_catalog:{}};const f=make(2,false,empty),select=f.header.querySelector('select');
+  const r=await page.evaluate(()=>{const empty={...state(0),shot_catalog:{}};const f=make(2,false,empty),select=f.header.querySelector('.hmb-seedance-shot__select');
    const before=select.selectedOptions[0].textContent;f.update({...state(0),execution_mode_state_revision:2});
-   const r={before,after:select.selectedOptions[0].textContent,options:select.options.length,sameSelector:select===f.header.querySelector('select'),writes:f.writes.length};f.cleanup();return r;});
+   const r={before,after:select.selectedOptions[0].textContent,options:select.options.length,sameSelector:select===f.header.querySelector('.hmb-seedance-shot__select'),writes:f.writes.length};f.cleanup();return r;});
   assert.equal(r.before,'Only');assert.equal(r.after,'Only');assert.equal(r.options,6);assert.equal(r.sameSelector,true);assert.equal(r.writes,0);return r;
  });
  await check('single_choice_ack_and_repeated_shot_switch',async()=>{
-  const r=await page.evaluate(()=>{const f=make(2,false,state(0)),select=f.header.querySelector('select');let rev=1,all=true;
+  const r=await page.evaluate(()=>{const f=make(2,false,state(0)),select=f.header.querySelector('.hmb-seedance-shot__select');let rev=1,all=true;
    for(const n of [1,2,3,4,5,0,5,4,3,2,1,0]){select.value=n?ids[1]+'\u001f'+ids[n+1]:'__hmb_shot_only__';select.dispatchEvent(new Event('change',{bubbles:true}));rev++;f.update({...state(n),execution_mode_revision:rev,execution_mode_state_revision:rev});all=all&&!f.header.__hmbSeedancePendingShot&&select.value===(n?ids[1]+'\u001f'+ids[n+1]:'__hmb_shot_only__');}
-   const r={allApplied:all,writes:f.writes.length,sameSelector:select===f.header.querySelector('select')};f.cleanup();return r;});
+   const r={allApplied:all,writes:f.writes.length,sameSelector:select===f.header.querySelector('.hmb-seedance-shot__select')};f.cleanup();return r;});
   assert.equal(r.allApplied,true);assert.equal(r.writes,12);assert.equal(r.sameSelector,true);return r;
  });
  report.errors=errors;report.passed=report.cases.every(c=>c.passed)&&!errors.length&&!report.external_requests;

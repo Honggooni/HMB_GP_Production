@@ -15,6 +15,14 @@ RUNTIME_RESOURCES = {
     "resources/maya/HMB_Maya_Background_Preview.py",
     "resources/blender/HMB_Blender_Background_Preview.py",
     "resources/picker/HMB_Marker_Catalog.json",
+    "resources/media-tools/win64/ffmpeg.exe",
+    "resources/media-tools/win64/ffprobe.exe",
+    "resources/media-tools/source/ffmpeg-7.1.5.tar.xz",
+    "resources/media-tools/source/x264-31e19f92f00c7003fa115047ce50978bc98c3a0d.tar.gz",
+    "resources/media-tools/COPYING.GPLv2",
+    "resources/media-tools/MINGW-RUNTIME.txt",
+    "resources/media-tools/README.txt",
+    "resources/media-tools/rebuild-review-tools.sh",
     "resources/agent/superwings12/hmb_agent_core.dat",
     "resources/agent/Katuri8/hmb_agent_core.dat",
     "resources/agent/Dinoster5/project.json",
@@ -74,13 +82,13 @@ diagnostics = importlib.util.module_from_spec(diagnostics_spec)
 diagnostics_spec.loader.exec_module(diagnostics)
 # The diagnostic receipt reader must recognize the same independently packaged
 # members. A valid installer receipt must not be rejected as an extra-file list.
-assert len(diagnostics.RUNTIME_FILE_PATHS) == len(set(diagnostics.RUNTIME_FILE_PATHS)) == 70
+assert len(diagnostics.RUNTIME_FILE_PATHS) == len(set(diagnostics.RUNTIME_FILE_PATHS)) == 79
 assert set(diagnostics.RUNTIME_FILE_PATHS) == set(runtime_install_files)
 distribution_only_files = tuple(packager.DISTRIBUTION_ONLY_FILES)
-assert len(runtime_install_files) == 70
+assert len(runtime_install_files) == 79
 assert distribution_only_files == DISTRIBUTION_ONLY_FILES
 assert source_files == (*runtime_install_files, *distribution_only_files)
-assert len(source_files) == 92
+assert len(source_files) == 101
 assert not EXCLUDED_PACKAGE_FILES.intersection(source_files)
 assert not set(runtime_install_files).intersection(distribution_only_files)
 assert {

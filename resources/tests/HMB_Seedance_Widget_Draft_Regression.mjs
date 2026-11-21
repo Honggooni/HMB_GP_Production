@@ -67,10 +67,27 @@ try {
       f.controller = widget.default(container, f.props(state));
       f.update = (value) => { f.state = value; f.controller.update(f.props(value)); };
       f.button = () => container.querySelector("[data-hmb-seedance-finalize-draft]");
+      f.quality = () => f.container.querySelector("select[data-hmb-seedance-final-resolution]");
+      f.selectQuality = resolution => {
+        f.quality().value = resolution;
+        f.quality().dispatchEvent(new Event("change", { bubbles: true }));
+      };
+      f.chooseFinal = (resolution = "1080p") => { f.selectQuality(resolution); f.button().click(); };
       f.cleanup = () => { f.controller.cleanup(); f.bridge?.cleanup(); node.remove(); };
       window.fixtures.push(f); return f;
     };
-    window.view = (f) => ({ hidden: f.button().hidden, disabled: f.button().disabled,
+    window.addNativeHeader = (f) => {
+      const title = document.createElement("span"); title.textContent = "HMB Seedance Generation";
+      title.style.cssText = "min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+      const actions = f.container.querySelector("[data-hmb-native-actions]");
+      const run = document.createElement("button"); run.type = "button"; run.textContent = "▷";
+      run.setAttribute("aria-label", "Run node");
+      f.container.querySelector("[data-hmb-native-identity]").append(title);
+      actions.append(run);
+      f.container.dispatchEvent(new CustomEvent("hmb-color-lut-header-state", { detail: { active: true } }));
+      return { title, run };
+    };
+    window.view = (f) => ({ hidden: !f.button().getClientRects().length, qualityHidden: !f.quality().getClientRects().length, qualityDisabled: f.quality().disabled, quality: f.quality().value, disabled: f.button().disabled,
       text: f.button().textContent, title: f.button().title, busy: f.button().getAttribute("aria-busy"),
       error: f.container.querySelector(".hmb-seedance-shot__status").textContent });
     window.addUnsupportedPreview = async (f) => {
@@ -128,7 +145,12 @@ try {
   };
   await check("completed-current-Shot-and-Only-visible-without-preview-option", async () => {
     const results = await page.evaluate(() => [1, 0].map((shot) => window.view(createFixture(makeState(shot)))));
-    results.forEach((result) => { assert.equal(result.hidden, false); assert.equal(result.disabled, false); assert.equal(result.text, "Draft final"); assert.match(result.title, /Generator만 1회/); assert.match(result.title, /1080p/); assert.match(result.title, /현재 프롬프트·소스·설정은 다시 전송하지/); assert.match(result.title, /Agent도 재실행하지/); assert.match(result.title, /MOV 기본/); assert.match(result.title, /MOV 미지원 시 MP4/); });
+    results.forEach((result) => {
+      assert.equal(result.hidden, false); assert.equal(result.disabled, false);
+      assert.equal(result.quality, "1080p"); assert.equal(result.text, "생성");
+      assert.match(result.title, /이 Draft의 Final/); assert.match(result.title, /현재 프롬프트·소스·설정은 다시 전송하지/);
+      assert.match(result.title, /Agent도 재실행하지/); assert.match(result.title, /MOV 기본/); assert.match(result.title, /MOV 미지원 시 MP4/);
+    });
   });
   await check("absent-legacy-pending-invalid-deleted-source-fail-closed", async () => {
     const results = await page.evaluate(() => {
@@ -138,7 +160,7 @@ try {
         makeState(1, { busy: true }), makeState(1, { final_available: false, reason: "Draft 확인 필요" })]
         .map((value) => view(createFixture(value)));
     });
-    results.slice(0, 4).forEach((value) => assert.equal(value.hidden, true));
+    results.slice(0, 4).forEach((value) => { assert.equal(value.hidden, true); assert.equal(value.qualityHidden, true); });
     results.forEach((value) => assert.equal(value.disabled, true));
     assert.equal(results.at(-1).title, "Draft 확인 필요");
   });
@@ -152,10 +174,43 @@ try {
     assert.equal(result.before.count, 0); assert.equal(result.before.disabled, true);
     assert.equal(result.commands.length, 1); assert.equal(result.authored.length, 0); assert.equal(result.retained, true);
     assert.equal(result.after.disabled, true);
-    assert.deepEqual(Object.keys(result.commands[0]).sort(), ["action", "action_id", "expected_draft_job_id", "issued_at_ms", "schema", "version"]);
+    assert.deepEqual(Object.keys(result.commands[0]).sort(), ["action", "action_id", "expected_draft_job_id", "final_resolution", "issued_at_ms", "schema", "version"]);
     assert.equal(result.commands[0].action, "finalize_draft"); assert.match(result.commands[0].action_id, /^final-/);
+    assert.equal(result.commands[0].final_resolution, "1080p");
     assert.equal(result.commands[0].expected_draft_job_id, `job-${"1".padStart(32, "0")}`);
     assert.equal(result.commands[0].schema, "hmb-seedance-refresh-command");
+  });
+  await check("inline-resolution-is-free-and-isolated-by-Shot-Generator-and-Draft", async () => {
+    const result = await page.evaluate(async () => {
+      const f = createFixture();
+      const labels = [...f.quality().options].filter(option => !option.hidden).map(option => option.textContent);
+      f.selectQuality("4k");
+      f.update(makeState());
+      const afterEcho = view(f);
+      const secondGenerator = view(createFixture(makeState()));
+      f.update(makeState(2)); const shotB = view(f);
+      f.update(makeState(1)); const restored = view(f);
+      const replacement = makeState(1, { job_id: "job-" + "b".repeat(32) });
+      f.update(replacement); const nextDraft = view(f);
+      await flushFrames();
+      const priorCommands = f.commands.length;
+      const invalidAccepted = widget.hmbSeedanceRequestDraftFinal(f.container, "720p");
+      f.chooseFinal("4k");
+      await flushFrames();
+      return { labels, afterEcho, secondGenerator, shotB, restored, nextDraft, priorCommands, invalidAccepted,
+        commands: f.commands, source: f.state.draft.job_id, authored: f.authored };
+    });
+    assert.deepEqual(result.labels, ["1080p", "4K"]);
+    assert.equal(result.afterEcho.quality, "4k");
+    assert.equal(result.restored.quality, "4k");
+    for (const snapshot of [result.secondGenerator, result.shotB, result.nextDraft]) assert.equal(snapshot.quality, "1080p");
+    assert.equal(result.afterEcho.text, "생성");
+    assert.equal(result.priorCommands, 0);
+    assert.equal(result.invalidAccepted, false);
+    assert.equal(result.commands.length, 1);
+    assert.equal(result.commands[0].expected_draft_job_id, result.source);
+    assert.equal(result.commands[0].final_resolution, "4k");
+    assert.deepEqual(result.authored, []);
   });
   await check("Final-bridge-requires-Draft-assertion-refresh-gallery-unchanged", async () => {
     const result = await page.evaluate(() => {
@@ -176,7 +231,7 @@ try {
   });
   await check("busy-acknowledgement-dismisses-late-delivery-rejection", async () => {
     const result = await page.evaluate(async () => {
-      const f = createFixture(); f.button().click(); await flushFrames();
+      const f = createFixture(); f.chooseFinal(); await flushFrames();
       f.update(makeState(1, { busy: true })); f.rejects[0](new Error("old delivery error")); await Promise.resolve();
       return { ...view(f), pending: Boolean(f.container.__hmbSeedanceDraftPending), accepted: widget.hmbSeedanceRequestDraftFinal(f.container) };
     });
@@ -186,19 +241,20 @@ try {
     const result = await page.evaluate(async () => {
       const id = `job-mybox-${"a".repeat(32)}`;
       const f = createFixture(makeState(0, { job_id: id, effective_resolution: "480p" }));
-      f.button().click(); f.button().click(); await flushFrames();
+      f.chooseFinal("4k"); f.button().click(); await flushFrames();
       return { id, commands: f.commands, authored: f.authored, ...view(f) };
     });
     assert.equal(result.commands.length, 1);
     assert.equal(result.commands[0].expected_draft_job_id, result.id);
+    assert.equal(result.commands[0].final_resolution, "4k");
     assert.equal(result.commands[0].action, "finalize_draft");
     assert.equal(result.authored.length, 0);
     assert.equal(result.disabled, true);
   });
   await check("Shot-change-before-dispatch-cancels-old-Draft-and-stale-echo", async () => {
     const result = await page.evaluate(async () => {
-      const f = createFixture(); f.button().click();
-      const select = f.container.querySelector("select"); select.value = select.options[2].value;
+      const f = createFixture(); f.chooseFinal();
+      const select = f.container.querySelector(".hmb-seedance-shot__select"); select.value = select.options[2].value;
       select.dispatchEvent(new Event("change", { bubbles: true }));
       const optimistic = view(f); f.update(makeState()); const stale = view(f);
       await flushFrames(); f.update(makeState(2));
@@ -209,15 +265,15 @@ try {
   });
   await check("node-deletion-before-paint-and-cleanup-cancel-dispatch", async () => {
     const counts = await page.evaluate(async () => {
-      const removed = createFixture(); removed.button().click(); removed.node.remove();
-      const cleaned = createFixture(); cleaned.button().click(); cleaned.controller.cleanup();
+      const removed = createFixture(); removed.chooseFinal(); removed.node.remove();
+      const cleaned = createFixture(); cleaned.chooseFinal(); cleaned.controller.cleanup();
       await flushFrames(); return [removed.commands.length, cleaned.commands.length];
     });
     assert.deepEqual(counts, [0, 0]);
   });
   await check("late-promise-on-new-Shot-never-overwrites-current-state", async () => {
     const result = await page.evaluate(async () => {
-      const f = createFixture(); f.button().click(); await flushFrames();
+      const f = createFixture(); f.chooseFinal(); await flushFrames();
       f.update(makeState(2)); f.rejects[0](new Error("previous Shot rejected")); await Promise.resolve();
       return view(f);
     });
@@ -226,7 +282,7 @@ try {
   await check("delayed-host-consumption-keeps-clicked-Draft-assertion", async () => {
     const result = await page.evaluate(async () => {
       const f = createFixture(); const clicked = f.state.draft.job_id;
-      f.button().click(); await flushFrames(); const command = structuredClone(f.commands[0]);
+      f.chooseFinal(); await flushFrames(); const command = structuredClone(f.commands[0]);
       f.update(makeState(2));
       // Model delayed host consumption only. The actual Python equality guard
       // is exercised separately by the native core regression.
@@ -240,12 +296,16 @@ try {
   });
   await check("delivery-failure-retry-reuses-idempotency-ID", async () => {
     const result = await page.evaluate(async () => {
-      const f = createFixture(); f.button().click(); await flushFrames();
+      const f = createFixture(); f.chooseFinal("4k"); await flushFrames();
       f.rejects[0](new Error("delivery not confirmed")); await Promise.resolve();
-      const failed = view(f); f.button().click(); await flushFrames();
+      const failed = view(f);
+      f.button().click(); f.button().click(); await flushFrames();
       return { failed, commands: f.commands };
     });
     assert.equal(result.failed.disabled, false); assert.equal(result.failed.error, "delivery not confirmed");
+    assert.equal(result.failed.qualityDisabled, true);
+    assert.equal(result.failed.quality, "4k");
+    assert.deepEqual(result.commands.map(command => command.final_resolution), ["4k", "4k"]);
     assert.equal(result.commands.length, 2); assert.equal(result.commands[0].action_id, result.commands[1].action_id);
   });
   await check("delivery-watchdog-retry-reuses-idempotency-ID", async () => {
@@ -256,8 +316,8 @@ try {
         return nativeTimeout(callback, delay, ...args);
       };
       try {
-        f.button().click(); await flushFrames(); timeout(); const released = view(f);
-        f.button().click(); await flushFrames(); return { released, commands: f.commands };
+        f.chooseFinal(); await flushFrames(); timeout(); const released = view(f);
+        f.chooseFinal(); await flushFrames(); return { released, commands: f.commands };
       } finally { window.setTimeout = nativeTimeout; }
     });
     assert.equal(result.released.disabled, false); assert.match(result.released.error, /전달/);
@@ -266,7 +326,7 @@ try {
   await check("missing-or-detached-command-carrier-never-falls-back-to-Run", async () => {
     const result = await page.evaluate(async () => {
       const f = createFixture(makeState(), false); const noBridge = widget.hmbSeedanceRequestDraftFinal(f.container);
-      const g = createFixture(); g.button().click(); g.bridge.cleanup(); await flushFrames();
+      const g = createFixture(); g.chooseFinal(); g.bridge.cleanup(); await flushFrames();
       return { noBridge, noBridgeView: view(f), commands: g.commands.length, detachedView: view(g) };
     });
     assert.equal(result.noBridge, false); assert.match(result.noBridgeView.error, /전달/);
@@ -275,7 +335,7 @@ try {
   await check("multiple-generators-isolated-and-retained-factory-no-duplicate-listeners", async () => {
     const result = await page.evaluate(async () => {
       const all = Array.from({ length: 5 }, () => createFixture());
-      for (const f of all) { f.controller = widget.default(f.container, f.props(f.state)); f.button().click(); f.button().click(); }
+      for (const f of all) { f.controller = widget.default(f.container, f.props(f.state)); f.chooseFinal(); f.button().click(); }
       await flushFrames(); return all.map((f) => f.commands);
     });
     result.forEach((commands) => assert.equal(commands.length, 1));
@@ -283,7 +343,7 @@ try {
   });
   await check("queued-Final-shows-local-Stop-double-click-sends-one-bound-cancel", async () => {
     const result = await page.evaluate(async () => {
-      const f = createFixture(); f.button().click(); await flushFrames();
+      const f = createFixture(); f.chooseFinal(); await flushFrames();
       const active = f.state.draft.job_id;
       f.update(makeState(1, { busy: true, final_available: false, cancel_available: true, active_job_id: active }));
       const running = view(f); f.button().click(); f.button().click(); const queued = view(f);
@@ -302,7 +362,7 @@ try {
     const result = await page.evaluate(async () => {
       const active = makeState(1).draft.job_id;
       const f = createFixture(makeState(1, { busy: true, cancel_available: true, active_job_id: active }));
-      const select = f.container.querySelector("select"); select.value = select.options[2].value;
+      const select = f.container.querySelector(".hmb-seedance-shot__select"); select.value = select.options[2].value;
       select.dispatchEvent(new Event("change", { bubbles: true }));
       const duringSwitch = view(f); f.button().click();
       const changed = makeState(2, { visible: false, final_available: false, busy: true,
@@ -433,7 +493,7 @@ try {
       const f = createFixture(); const input = document.createElement("input");
       input.dataset.parameterName = "resolution"; input.value = "480p"; f.node.append(input);
       const draft = document.createElement("input"); draft.dataset.parameterName = "draft_action"; draft.value = "Draft 480p"; f.node.append(draft);
-      f.button().click(); f.button().click(); await flushFrames();
+      f.chooseFinal(); f.button().click(); await flushFrames();
       f.update(makeState(1, { busy: true, final_available: false }));
       f.update(makeState(1, { final_available: false, reason: "Final already requested" }));
       f.button().click(); await flushFrames();
@@ -454,7 +514,7 @@ try {
       f.button().click(); return { ...view(f), commands: f.commands.length };
     }));
     results.slice(0, 3).forEach((result) => {
-      assert.equal(result.text, "Draft final"); assert.equal(result.busy, "false");
+      assert.equal(result.hidden, true); assert.equal(result.qualityHidden, true); assert.equal(result.busy, "false");
     });
     assert.equal(results[3].text, "Final 처리 중…"); assert.equal(results[3].busy, "true");
     results.forEach((result) => { assert.equal(result.disabled, true); assert.equal(result.commands, 0); });
@@ -464,7 +524,7 @@ try {
       const web = createFixture(makeState(1, { final_available: false, reason: "웹 Draft는 웹에서 Final을 실행하세요." }));
       const local = createFixture();
       const rejected = widget.hmbSeedanceRequestDraftFinal(web.container);
-      web.button().click(); local.button().click(); local.button().click(); await flushFrames();
+      web.button().click(); local.chooseFinal(); local.button().click(); await flushFrames();
       return { web: view(web), rejected, webCommands: web.commands.length, localCommands: local.commands, authored: local.authored };
     });
     assert.equal(result.web.disabled, true); assert.match(result.web.title, /웹 Draft/);
@@ -491,31 +551,66 @@ try {
     });
     assert.equal(result.loads, 1); assert.equal(result.overlay, false); assert.equal(result.static, null);
   });
-  await check("header-geometry-600-and-360-retains-Shot-selector-and-Final", async () => {
-    const results = await page.evaluate(() => [600, 360].map((width) => {
+  await check("inline-Final-and-Shot-controls-fit-one-original-header-row-at-650-360-and-320", async () => {
+    const results = await page.evaluate(() => [650, 360, 320].flatMap(width => [false, true].map(native => {
       const f = createFixture(); f.node.style.width = `${width}px`;
-      const root = f.container.querySelector(".hmb-seedance-shot").getBoundingClientRect();
-      return { width, height: root.height, controls: [f.button(), f.container.querySelector("select")].map((element) => {
-        const box = element.getBoundingClientRect(); return { left: box.left - root.left, right: box.right - root.right, height: box.height, width: box.width };
+      const { title, run } = native ? addNativeHeader(f) : { title: f.container.querySelector(".hmb-seedance-shot__title") };
+      const header = f.container.querySelector(".hmb-seedance-shot"), root = header.getBoundingClientRect();
+      const controls = [title, ...(native ? [run] : []), f.quality(), f.button(), f.container.querySelector(".hmb-seedance-shot__select")];
+      return { native, active: header.dataset.hmbNativeHeader, width: root.width, height: root.height, controls: controls.map((element) => {
+        const box = element.getBoundingClientRect(); return { left: box.left-root.left, right: box.right-root.left, centerY: box.top+box.height/2, height: box.height, width: box.width };
       }) };
-    }));
+    })));
     for (const result of results) {
       assert.equal(result.height, 64);
-      result.controls.forEach((box) => { assert.ok(box.left >= 0 && box.right <= 0); assert.ok(box.width > 0 && box.height > 0); });
+      assert.equal(result.active, result.native ? "active" : "fallback");
+      result.controls.forEach((box, index) => {
+        assert.ok(box.left >= 0 && box.right <= result.width+1);
+        assert.ok(box.width > 0 && box.height > 0, JSON.stringify(result));
+        assert.ok(Math.abs(box.centerY-result.controls[0].centerY)<=1);
+        if (index) assert.ok(box.left>=result.controls[index-1].right-1);
+      });
     }
+  });
+  await check("native-dropdown-keyboard-selection-and-mouse-submit-emit-one-exact-command", async () => {
+    await page.evaluate(() => addNativeHeader(createFixture()));
+    const select = page.locator("select[data-hmb-seedance-final-resolution]");
+    await select.focus(); await page.keyboard.press("End");
+    assert.equal(await select.inputValue(), "4k");
+    assert.equal(await page.evaluate(() => fixtures[0].commands.length), 0);
+    const generate = page.locator("[data-hmb-seedance-finalize-draft]");
+    const box = await generate.boundingBox();
+    await page.mouse.dblclick(box.x + box.width / 2, box.y + box.height / 2);
+    await page.evaluate(() => flushFrames());
+    const commands = await page.evaluate(() => fixtures[0].commands);
+    assert.deepEqual(commands.map(c => [c.action,c.final_resolution]), [["finalize_draft","4k"]]);
   });
   assert.deepEqual(errors, []); assert.equal(receipt.external_requests, 0);
   assert.doesNotMatch(source, /\b(?:fetch|XMLHttpRequest|WebSocket)\s*\(/);
   receipt.status = "PASS";
   if (evidenceDir) {
     fs.mkdirSync(evidenceDir, { recursive: true });
-    await page.evaluate(() => createFixture());
-    await page.screenshot({ path: path.join(evidenceDir, "draft-final-header.png") });
+    await page.evaluate(() => {
+      const f = createFixture(); f.node.style.width = "790px";
+      addNativeHeader(f);
+    });
+    const clip = await page.locator(".hmb-seedance-shot").boundingBox();
+    await page.screenshot({ clip, path: path.join(evidenceDir, "draft-final-header.png") });
+    await page.evaluate(() => { window.fixtures.at(-1).selectQuality("4k"); });
+    await page.screenshot({ clip, path: path.join(evidenceDir, "draft-final-inline-4k.png") });
+    await page.evaluate(() => {
+      const f = window.fixtures.at(-1);
+      f.update(makeState(1, { source_completed: true, final_state: "completed", final_resolution: "1080p",
+        final_available: true, finals_by_resolution: { "1080p": "completed", "4k": "available" } }));
+      f.selectQuality("4k");
+    });
+    assert.equal(await page.locator("[data-hmb-seedance-finalize-draft]").isEnabled(), true);
+    await page.screenshot({ clip, path: path.join(evidenceDir, "after-1080p-select-4k.png") });
     await page.evaluate(() => {
       const f = window.fixtures.at(-1);
       f.update(makeState(1, { busy: true, final_available: false, cancel_available: true, active_job_id: f.state.draft.job_id }));
     });
-    await page.screenshot({ path: path.join(evidenceDir, "draft-stop-header.png") });
+    await page.screenshot({ clip, path: path.join(evidenceDir, "draft-stop-header.png") });
   }
   console.log(`HMB Seedance Draft widget: PASS (${receipt.cases.length} real-browser cases; graph/API/paid 0)`);
 } catch (error) { receipt.status = "FAIL"; receipt.error = error.stack; throw error; }

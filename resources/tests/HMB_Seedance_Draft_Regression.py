@@ -105,12 +105,12 @@ class FakeBridge:
         return bridge
 
     def require_seedance_draft_features(self, *, timeout, output_format="mp4",
-                                       allow_output_fallback=False):
+                                       allow_output_fallback=False, final_resolution=None):
         self.cap_calls += 1
         self.draft_formats.append(output_format)
         result = self._authenticated_capability_bridge().require_seedance_draft_features(
             timeout=timeout, output_format=output_format,
-            allow_output_fallback=allow_output_fallback)
+            allow_output_fallback=allow_output_fallback, final_resolution=final_resolution)
         self.format_resolution_calls.append(("draft", output_format, result))
         return result
 
@@ -392,6 +392,45 @@ class DraftTests(unittest.TestCase):
                  mock.patch.object(bridge, "_request_json", side_effect=AssertionError("network")), \
                  self.assertRaises(t._BrokerProtocolError):
                 bridge.generate_seedance({**payload, **changes}, timeout=30)
+
+    def test_4k_final_accepts_only_an_explicit_draft_capability(self):
+        payload = {"provider": "volcengine_ark", "model": t.SEEDANCE_2_5_MODEL_ID,
+                   "draft_job_id": JOB, "resolution": "4k", "output_format": "mov",
+                   "client_request_id": f"hmb-draft-final-v1-{JOB}-4k", **PROJECT}
+        for advertised, accepted in ((["1080p", "4k"], True), (None, False),
+                                     (["1080p"], False), ("4k", False), ([], False)):
+            response = capability()
+            profile = response["models"][t.SEEDANCE_2_5_MODEL_ID]
+            profile["resolutions"] = ["480p", "1080p", "4k"]
+            if advertised is not None:
+                profile["draft_final_resolutions"] = advertised
+            bridge = t._HMBAIBrokerBridge(server_url=ORIGIN)
+            def wire(method, path, **kwargs):
+                if (method, path) == ("GET", t.BROKER_SEEDANCE_CAPABILITIES_PATH + "?draft=1"):
+                    return deepcopy(response)
+                state_path = f"/api/v1/reviews/tasks/{JOB}/draft-final?resolution="
+                if method == "GET" and path in (state_path + "1080p", state_path + "4k"):
+                    quality = path.split("=")[-1]
+                    return {"schema": "hmb-review-draft-final-v1", "state_schema": "hmb-draft-final-state-v1",
+                            "source_task_id": JOB, "state": "available", "eligible": True, "is_draft": True,
+                            "consumed": False, "owner_user_id": 7, **PROJECT, "resolution": quality,
+                            "checked_at": int(time.time()), "expires_at": int(time.time()) + 604800,
+                            "child_task_id": None, "child_status": None,
+                            "idempotency_key": f"hmb-draft-final-v1-{JOB}" + ("-4k" if quality == "4k" else "")}
+                self.assertEqual((method, path), ("POST", "/api/v1/generate/video"))
+                return {"job_id": "job-" + "c" * 32}
+
+            with self.subTest(advertised=advertised), mock.patch.object(bridge, "_request_json", side_effect=wire) as request:
+                if accepted:
+                    bridge.generate_seedance(payload, timeout=1)
+                else:
+                    with self.assertRaises(t._BrokerProtocolError):
+                        bridge.generate_seedance(payload, timeout=1)
+                self.assertEqual([call.args[0] for call in request.call_args_list],
+                                 ["GET", "GET", "GET", "POST"] if accepted else ["GET"])
+                if accepted:
+                    self.assertEqual(request.call_args.kwargs["payload"], payload)
+                    self.assertEqual(request.call_args.kwargs["idempotency_key"], payload["client_request_id"])
 
     def test_mov_draft_requires_explicit_broker_output_format_capability(self):
         bridge = t._HMBAIBrokerBridge(server_url=ORIGIN)

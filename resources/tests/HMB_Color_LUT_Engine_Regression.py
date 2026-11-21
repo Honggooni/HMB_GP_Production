@@ -86,6 +86,98 @@ class ColorLUTRegression(unittest.TestCase):
         with self.assertRaises(target.ColorLUTError):
             target.transform_rgb(float("nan"), 0, 0, {})
 
+    def test_review_media_preserves_the_video_clock_and_audio_and_is_ready_for_playback(self):
+        with tempfile.TemporaryDirectory(dir=self.root) as folder:
+            poster, preview = target.make_review_media(
+                self.source, Path(folder), threading.Event(), expected_sha256=self.original_hash)
+            self.assertTrue(poster.read_bytes().startswith(bytes.fromhex("ffd8")))
+            jpeg = target._color_details(poster)
+            self.assertEqual((jpeg["width"], jpeg["height"]), (640, 360))
+            actual, original = target._color_details(preview), target._color_details(self.source)
+            self.assertEqual((actual["codec_name"], actual["pix_fmt"], actual["width"], actual["height"]),
+                             ("h264", "yuv420p", 96, 64))
+            self.assertEqual(actual["audio_streams"][0]["codec_name"], "aac")
+            if actual["probe_backend"] == "ffprobe":
+                self.assertEqual(actual["audio_streams"][0]["channels"], 2)
+                self.assertEqual(actual["nb_frames"], original["nb_frames"])
+            self.assertAlmostEqual(float(actual["duration"]), float(original["duration"]), delta=0.001)
+            data = preview.read_bytes()
+            self.assertTrue(0 < data.index(b"moov") < data.index(b"mdat"))
+            self.run_ffmpeg("-xerror", "-i", str(preview), "-f", "null", "-")
+            self.assertEqual(digest(self.source), self.original_hash)
+
+    def test_review_media_cancellation_and_wrong_source_hash_discard_the_pair(self):
+        with tempfile.TemporaryDirectory(dir=self.root) as folder:
+            directory = Path(folder)
+            cancelled = threading.Event()
+            cancelled.set()
+            with mock.patch.object(target, "_color_details", side_effect=AssertionError("started encoding")):
+                with self.assertRaisesRegex(target.ColorLUTError, "cancelled"):
+                    target.make_review_media(self.source, directory, cancelled, expected_sha256=self.original_hash)
+            cancelled.clear()
+            with self.assertRaisesRegex(target.ColorLUTError, "changed"):
+                target.make_review_media(self.source, directory, cancelled, expected_sha256="0" * 64)
+            self.assertEqual(list(directory.iterdir()), [])
+            self.assertEqual(digest(self.source), self.original_hash)
+
+    @unittest.skipUnless(os.name == "nt", "Windows x64 release utilities")
+    def test_review_media_runs_from_the_installation_with_empty_path(self):
+        with tempfile.TemporaryDirectory(dir=self.root) as folder, mock.patch.dict(
+            os.environ, {"PATH": "", "IMAGEIO_FFMPEG_EXE": "unused-ffmpeg.exe"}
+        ), mock.patch.object(target, "_find_ffmpeg", side_effect=AssertionError("global encoder used")):
+            expected = ROOT.resolve() / "resources" / "media-tools" / "win64"
+            self.assertEqual(tuple(map(Path, target._review_media_tools())),
+                             (expected / "ffmpeg.exe", expected / "ffprobe.exe"))
+            poster, preview = target.make_review_media(
+                self.source, Path(folder), threading.Event(), expected_sha256=self.original_hash)
+            self.assertTrue(poster.read_bytes().startswith(bytes.fromhex("ffd8")))
+            details = target._color_details(preview, review_tools=target._review_media_tools())
+            self.assertEqual((details["codec_name"], details["audio_streams"][0]["codec_name"]), ("h264", "aac"))
+
+    def test_review_media_detects_webm_and_m4v_under_downloaded_mov_names(self):
+        with tempfile.TemporaryDirectory(dir=self.root) as folder:
+            directory = Path(folder)
+            for extension, encoder, container in (("webm", "libvpx", "webm"), ("webm", "libvpx-vp9", "webm"),
+                                                  ("m4v", "libx264", "mp4"), ("m4v", "mpeg4", "m4v")):
+                with self.subTest(encoder=encoder):
+                    source = directory / f"{encoder}.{extension}"
+                    args = ["-f", "lavfi", "-i", "testsrc2=s=96x64:r=12:d=0.5"]
+                    if container == "webm":
+                        args += ["-f", "lavfi", "-i", "sine=frequency=440:duration=0.5", "-c:a", "libopus"]
+                    self.run_ffmpeg(*args, "-c:v", encoder, "-threads", "1", "-f", container, str(source))
+                    downloaded = directory / "source.mov"
+                    shutil.copyfile(source, downloaded)
+                    for candidate in (source, downloaded):
+                        poster, preview = target.make_review_media(
+                            candidate, directory, threading.Event(), expected_sha256=digest(candidate))
+                        info = target._color_details(preview, review_tools=target._review_media_tools())
+                        self.assertEqual((info["codec_name"], info["width"], info["height"]), ("h264", 96, 64))
+                        self.assertEqual(info.get("nb_frames", "6"), "6")
+                        self.assertTrue(poster.read_bytes().startswith(bytes.fromhex("ffd8")))
+                        if container == "webm":
+                            self.assertEqual(info["audio_streams"][0]["codec_name"], "aac")
+
+    def test_review_media_preserves_variable_frame_times_including_the_last_sample(self):
+        ffprobe = target._find_ffprobe(self.ffmpeg)
+        if not ffprobe:
+            self.skipTest("Checking individual sample durations requires ffprobe.")
+        with tempfile.TemporaryDirectory(dir=self.root) as folder:
+            directory = Path(folder)
+            source = directory / "variable.MOV"
+            self.run_ffmpeg("-f", "lavfi", "-i", "testsrc2=s=96x64:r=24:d=0.25",
+                            "-vf", "setpts=(N+floor(N/2))/(24*TB)", "-fps_mode", "passthrough", "-bf", "0",
+                            "-c:v", "libx264", "-enc_time_base:v", "1:24000",
+                            "-bsf:v", r"setts=duration=if(eq(NEXT_PTS\,NOPTS)\,3000\,DURATION)",
+                            "-video_track_timescale", "24000", str(source))
+            _, preview = target.make_review_media(source, directory, threading.Event(), expected_sha256=digest(source))
+            def packets(path):
+                output = subprocess.check_output([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_packets",
+                    "-show_entries", "packet=pts_time,duration_time", "-of", "json", str(path)], timeout=30)
+                return json.loads(output)["packets"]
+            original = packets(source)
+            self.assertGreater(len({packet["duration_time"] for packet in original}), 1)
+            self.assertEqual(packets(preview), original)
+
     def test_cube_is_deterministic_and_red_fastest(self) -> None:
         first, second = self.root / "identity.cube", self.root / "identity2.cube"
         target.write_cube(first, {})

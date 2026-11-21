@@ -587,7 +587,14 @@ function hmbNativeUiImplementation(container, props = {}) {
     exportButton.hidden = exportMode.action === "export_upload" && !hasUploadDestination(state);
     exportButton.textContent = exportMode.label;
     exportButton.title = exportMode.title; exportButton.setAttribute("aria-label", exportMode.label); q('[data-action="cancel"]').hidden = !busy;
-    const upload = q('[data-action="upload_web"]'); upload.hidden = !hasUploadDestination(state); upload.disabled = upload.hidden || busy || !state.web_upload.enabled; upload.title = state.web_upload.reason; upload.textContent = state.web_upload.phase === "uploading" ? t.uploading : state.web_upload.phase === "complete" ? t.uploaded : state.web_upload.phase === "unknown" ? t.uploadCheck : state.web_upload.phase === "absent" ? t.uploadRetry : state.audio_mix.enabled ? t.uploadSource : t.upload; q("[data-upload-reason]").textContent = upload.hidden ? uploadDestinationHint(state) : state.web_upload.reason;
+    const upload = q('[data-action="upload_web"]');
+    upload.hidden = !hasUploadDestination(state);
+    upload.disabled = upload.hidden || busy || !state.web_upload.enabled;
+    upload.title = state.web_upload.reason;
+    const uploadLabels = { uploading: t.uploading, complete: t.uploaded, unknown: t.uploadCheck, absent: t.uploadRetry,
+      media_retry: state.language === "ko" ? "미리보기 확인 · 복구" : "Check and recover preview" };
+    upload.textContent = uploadLabels[state.web_upload.phase] || (state.audio_mix.enabled ? t.uploadSource : t.upload);
+    q("[data-upload-reason]").textContent = upload.hidden ? uploadDestinationHint(state) : state.web_upload.reason;
     q("[data-progress]").hidden = !busy; q("[data-progress]").value = state.status.progress;
     q("[data-status]").textContent = localMessage || state.status.message || t.ready;
     const result = q("[data-result]"); result.textContent = t.result; result.hidden = !state.result.url; if (state.result.url && /^(https?:|blob:|\/)/i.test(state.result.url)) result.href = state.result.url; else { result.removeAttribute("href"); result.hidden = true; }

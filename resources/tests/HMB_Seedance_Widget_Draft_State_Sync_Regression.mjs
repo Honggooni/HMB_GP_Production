@@ -66,10 +66,17 @@ try {
       f.controller = widget.default(f.container, f.props(value));
       f.update = (state) => { f.state = state; f.controller.update(f.props(state)); };
       f.button = () => f.container.querySelector("[data-hmb-seedance-finalize-draft]");
+      f.quality = () => f.container.querySelector("select[data-hmb-seedance-final-resolution]");
+      f.selectQuality = resolution => {
+        f.quality().value = resolution;
+        f.quality().dispatchEvent(new Event("change", { bubbles: true }));
+      };
+      f.chooseFinal = (resolution = "1080p") => { f.selectQuality(resolution); f.button().click(); };
       f.cleanup = () => { f.controller.cleanup(); f.bridge.cleanup(); node.remove(); };
       fixtures.push(f); return f;
     };
-    window.view = (f) => ({ hidden: f.button().hidden, disabled: f.button().disabled,
+    window.view = (f) => ({ hidden: !f.button().getClientRects().length, qualityHidden: !f.quality().getClientRects().length, qualityDisabled: f.quality().disabled, quality: f.quality().value, disabled: f.button().disabled,
+      options: Array.from(f.quality().options, option => option.value).filter(Boolean),
       text: f.button().textContent, busy: f.button().getAttribute("aria-busy"), title: f.button().title,
       error: f.container.querySelector(".hmb-seedance-shot__status").textContent,
       resolution: f.node.querySelector('[data-parameter-name="resolution"]').value,
@@ -104,7 +111,7 @@ try {
       legacy.draft.final_available = false; legacy.draft.busy = true; legacy.draft.final_busy = true;
       return { ready, busy: view(createFixture(legacy)) };
     });
-    assert.equal(result.ready.hidden, false); assert.equal(result.ready.disabled, false); assert.equal(result.ready.text, "Draft final");
+    assert.equal(result.ready.hidden, false); assert.equal(result.ready.disabled, false); assert.equal(result.ready.text, "생성");
     assert.equal(result.busy.disabled, true); assert.equal(result.busy.text, "Final 처리 중…");
   });
   await check("only-local-available-Draft-enables-final-while-checking-and-source-pending-do-not", async () => {
@@ -115,7 +122,8 @@ try {
       const accepted = all.map((f) => widget.hmbSeedanceRequestDraftFinal(f.container)); await flushFrames();
       return { views, accepted, counts: all.map((f) => f.commands.length) };
     });
-    assert.match(results.views[0].text, /상태 확인/);
+    assert.deepEqual(results.views.map((value) => value.qualityHidden), [true, true, false]);
+    assert.deepEqual(results.views.map((value) => value.hidden), [true, true, false]);
     assert.deepEqual(results.views.map((value) => value.disabled), [true, true, false]);
     assert.deepEqual(results.accepted, [false, false, true]); assert.deepEqual(results.counts, [0, 0, 1]);
   });
@@ -126,28 +134,188 @@ try {
       const views = all.map(view); const accepted = all.map((f) => widget.hmbSeedanceRequestDraftFinal(f.container));
       await flushFrames(); return { views, accepted, commands: all.flatMap((f) => f.commands) };
     });
-    results.views.forEach((value) => { assert.equal(value.hidden, false); assert.equal(value.disabled, true); });
+    results.views.forEach((value) => assert.equal(value.disabled, true));
+    for (const v of results.views.slice(0, 2)) assert.equal(v.hidden, false);
     results.views.slice(0, 2).forEach((value) => assert.equal(value.text, "Final 처리 중…"));
     assert.equal(results.views[2].text, "Final 확인 필요"); assert.deepEqual(results.accepted, [false, false, false, false]);
     assert.deepEqual(results.commands, []);
   });
-  await check("completed-consumed-expired-and-nonDraft-projections-hide-final-and-close-programmatic-action", async () => {
+  await check("legacy-receipt-shows-only-the-unconfirmed-alternate-for-a-known-completed-target", async () => {
     const results = await page.evaluate(async () => {
       const all = ["completed", "consumed", "expired", "not_draft"].map((final_state) => createFixture(makeState(1,
-        { final_state, final_visible: false, final_available: false })));
+        { final_state, final_visible: false, final_available: false, source_completed: final_state !== "not_draft",
+          final_task_id: ["completed", "consumed"].includes(final_state) ? "job-" + "c".repeat(32) : "",
+          final_resolution: final_state === "completed" ? "4k" : "" })));
       const views = all.map(view); const accepted = all.map((f) => widget.hmbSeedanceRequestDraftFinal(f.container));
       await flushFrames(); return { views, accepted, commands: all.flatMap((f) => f.commands) };
     });
-    results.views.forEach((value) => { assert.equal(value.hidden, true); assert.equal(value.disabled, true); });
+    assert.ok(results.views.every(value => value.disabled));
+    assert.equal(results.views[0].qualityDisabled, false);
+    assert.deepEqual(results.views.map(value=>value.hidden),[false,true,true,true]);
+    assert.deepEqual(results.views.map(value=>value.qualityHidden),[false,true,true,true]);
+    assert.deepEqual(results.views[0].options, ["1080p"]);
+    assert.equal(results.views[0].quality, "1080p");
+    assert.deepEqual(results.views[1].options, [], "An unknown legacy receipt cannot establish a remaining quality.");
     assert.deepEqual(results.accepted, [false, false, false, false]); assert.deepEqual(results.commands, []);
+  });
+  for (const [first, second] of [["1080p", "4k"], ["4k", "1080p"]]) {
+    await check(`one-bound-Draft-can-Final-${first}-then-${second}-without-redrafting`, async () => {
+      const initial = await page.evaluate(() => {
+        const f = createFixture(makeState(1, { source_completed: true,
+          finals_by_resolution: { "1080p": "available", "4k": "available" } }));
+        return { source: f.state.draft.job_id, options: view(f).options };
+      });
+      const { source } = initial;
+      assert.deepEqual(initial.options, ["1080p", "4k"]);
+      const select = page.locator("select[data-hmb-seedance-final-resolution]");
+      const generate = page.locator("[data-hmb-seedance-finalize-draft]");
+      const selectTarget = async (target) => {
+        await select.focus(); await page.keyboard.press(target === "4k" ? "End" : "Home");
+        assert.equal(await select.inputValue(), target);
+      };
+      const clickTwice = async () => {
+        const box = await generate.boundingBox();
+        await page.mouse.dblclick(box.x + box.width / 2, box.y + box.height / 2);
+        await page.evaluate(() => flushFrames());
+      };
+      await selectTarget(first);
+      assert.equal(await page.evaluate(() => fixtures[0].commands.length), 0);
+      await clickTwice();
+      const running = await page.evaluate(([first, second]) => {
+        const f = fixtures[0];
+        f.update(makeState(1, { source_completed: true, final_busy: true, busy: true, final_state: "running",
+          final_available: false, final_resolution: first, finals_by_resolution: { [first]: "running", [second]: "available" } }));
+        return { during: view(f), crossed: widget.hmbSeedanceRequestDraftFinal(f.container, second), count: f.commands.length };
+      }, [first, second]);
+      assert.equal(running.count, 1); assert.equal(running.crossed, false); assert.equal(running.during.disabled, true);
+      const firstComplete = await page.evaluate(([first, second]) => {
+        const f = fixtures[0];
+        f.update(makeState(1, { source_completed: true, final_state: "completed", final_visible: true, final_available: true,
+          final_resolution: first, final_task_id: "job-" + "b".repeat(32), finals_by_resolution: { [first]: "completed", [second]: "available" } }));
+        return { display: view(f), repeated: widget.hmbSeedanceRequestDraftFinal(f.container, first) };
+      }, [first, second]);
+      assert.equal(firstComplete.repeated, false); assert.equal(firstComplete.display.qualityDisabled, false);
+      assert.equal(firstComplete.display.quality, second);
+      assert.deepEqual(firstComplete.display.options, [second], "The completed target must be removed from the select DOM.");
+      assert.equal(await page.evaluate(() => fixtures[0].commands.length), 1);
+      assert.equal(await generate.isEnabled(), true); assert.equal(await generate.textContent(), "생성");
+      await clickTwice();
+      const sameReceiptEcho = await page.evaluate(async (target) => {
+        const f = fixtures[0]; f.update(structuredClone(f.state));
+        f.button().click(); const accepted = widget.hmbSeedanceRequestDraftFinal(f.container, target);
+        await flushFrames(); return { accepted, count: f.commands.length };
+      }, second);
+      assert.deepEqual(sameReceiptEcho, { accepted: false, count: 2 });
+      const done = await page.evaluate(([first, second]) => {
+        const f = fixtures[0];
+        f.update(makeState(1, { source_completed: true, final_state: "completed", final_visible: true, final_available: false,
+          final_resolution: second, final_task_id: "job-" + "c".repeat(32), finals_by_resolution: { [first]: "completed", [second]: "completed" } }));
+        const rejected = [first, second].map(target => widget.hmbSeedanceRequestDraftFinal(f.container, target));
+        return { display: view(f), rejected, commands: f.commands, authored: f.authored };
+      }, [first, second]);
+      assert.equal(done.display.disabled, true); assert.deepEqual(done.rejected, [false, false]);
+      assert.deepEqual(done.display.options, []);
+      assert.ok(done.display.hidden && done.display.qualityHidden, "Hide the pair once all results are claimed.");
+      assert.deepEqual(done.commands.map(command => [command.action, command.expected_draft_job_id, command.final_resolution]),
+        [["finalize_draft", source, first], ["finalize_draft", source, second]]);
+      assert.notEqual(done.commands[0].action_id, done.commands[1].action_id);
+      (receipt.remaining_resolutions ??= []).push({ first, second, initial: initial.options,
+        after_first: firstComplete.display.options, after_both: done.display.options,
+        physical_double_clicks: 2, dispatched: done.commands.map(c => c.final_resolution) });
+      assert.deepEqual(done.authored, []); assert.equal(done.display.action, "Draft 480p"); assert.equal(done.display.resolution, "480p");
+    });
+  }
+  await check("a-completion-between-physical-clicks-cannot-submit-the-newly-selected-quality", async () => {
+    await page.evaluate(() => {
+      const f = createFixture(makeState(1, { source_completed: true,
+        finals_by_resolution: { "1080p": "available", "4k": "available" } }));
+      f.clickDetails = [];
+      f.node.addEventListener("click", e => {
+        if (e.target === f.button() && e.isTrusted) f.clickDetails.push(e.detail);
+      }, true);
+    });
+    const generate = page.locator("[data-hmb-seedance-finalize-draft]");
+    const box = await generate.boundingBox();
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down({ clickCount: 1 }); await page.mouse.up({ clickCount: 1 });
+    const remaining = await page.evaluate(async () => {
+      await flushFrames();
+      const f = fixtures[0];
+      f.update(makeState(1, { source_completed: true, final_state: "completed", final_resolution: "1080p",
+        final_task_id: "job-" + "b".repeat(32), finals_by_resolution: { "1080p": "completed", "4k": "available" } }));
+      return view(f);
+    });
+    assert.deepEqual(remaining.options, ["4k"]); assert.equal(remaining.disabled, false);
+    await page.mouse.down({ clickCount: 2 }); await page.mouse.up({ clickCount: 2 });
+    const clicks = await page.evaluate(async () => {
+      await flushFrames();
+      return { qualities: fixtures[0].commands.map(c => c.final_resolution), details: fixtures[0].clickDetails };
+    });
+    assert.deepEqual(clicks, { qualities: ["1080p"], details: [1, 2] });
+    await generate.click();
+    const approved = await page.evaluate(async () => { await flushFrames(); return fixtures[0].commands.map(c => c.final_resolution); });
+    assert.deepEqual(approved, ["1080p", "4k"]);
+  });
+  await check("legacy-single-completed-receipt-keeps-selector-but-unproven-other-quality-cannot-dispatch", async () => {
+    const result = await page.evaluate(async () => {
+      const f = createFixture(makeState(1, { source_completed: true, final_state: "completed", final_visible: false,
+        final_available: false, final_resolution: "1080p", final_task_id: "job-" + "d".repeat(32) }));
+      const initial = view(f); f.selectQuality("4k"); const chosen = view(f);
+      f.button().click(); const accepted = widget.hmbSeedanceRequestDraftFinal(f.container, "4k");
+      await flushFrames(); return { initial, chosen, accepted, count: f.commands.length };
+    });
+    assert.equal(result.initial.qualityDisabled, false); assert.equal(result.chosen.quality, "4k");
+    assert.deepEqual(result.initial.options, ["4k"]);
+    assert.equal(result.chosen.disabled, true); assert.equal(result.accepted, false); assert.equal(result.count, 0);
+  });
+  await check("legacy-child-with-late-resolution-reconciles-by-child-id-and-keeps-only-the-remaining-target", async () => {
+    const result = await page.evaluate(async () => {
+      const receipt = makeState(1, { source_completed: true, final_state: "completed", final_visible: false,
+        final_available: false, final_task_id: "job-" + "d".repeat(32) });
+      const f = createFixture(receipt);
+      const before = view(f);
+      const known = structuredClone(receipt); known.draft.final_resolution = "1080p";
+      f.update(known); const after = view(f);
+      f.update(receipt);
+      f.button().click(); await flushFrames();
+      return { before, after, replay: view(f), commands: f.commands };
+    });
+    assert.deepEqual(result.before.options, []);
+    for (const item of [result.after, result.replay]) { assert.deepEqual(item.options, ["4k"]); assert.ok(item.disabled); }
+    assert.deepEqual(result.commands, []);
+  });
+  await check("stale-availability-cannot-restore-a-completed-target-after-switching-Shots", async () => {
+    const result = await page.evaluate(async () => {
+      const fresh = shot => makeState(shot, { source_completed: true,
+        finals_by_resolution: { "1080p": "available", "4k": "available" } });
+      const f = createFixture(fresh(1));
+      const completed = makeState(1, { source_completed: true, final_state: "completed", final_resolution: "1080p",
+        final_task_id: "job-" + "b".repeat(32), finals_by_resolution: { "1080p": "completed", "4k": "available" } });
+      f.update(completed); const correct = view(f);
+      f.update(fresh(1)); const oldEcho = view(f);
+      const old = widget.hmbSeedanceRequestDraftFinal(f.container, "1080p");
+      f.update(fresh(2)); const otherShot = view(f);
+      f.update(fresh(1)); const returned = view(f);
+      const returnedAttempt = widget.hmbSeedanceRequestDraftFinal(f.container, "1080p");
+      await flushFrames();
+      const nextDraft = fresh(1);
+      nextDraft.draft.job_id = "job-" + "d".repeat(32);
+      f.update(nextDraft);
+      return { correct, oldEcho, old, otherShot, returned, returnedAttempt, newSource: view(f),
+        authored: f.authored, commands: f.commands };
+    });
+    for (const state of [result.correct, result.oldEcho, result.returned]) assert.deepEqual(state.options, ["4k"]);
+    for (const state of [result.otherShot, result.newSource]) assert.deepEqual(state.options, ["1080p", "4k"]);
+    assert.equal(result.old, false); assert.equal(result.returnedAttempt, false);
+    assert.deepEqual(result.commands, []); assert.deepEqual(result.authored, []);
   });
   await check("explicit-hidden-or-checking-contract-cannot-be-bypassed-by-stale-final-available", async () => {
     const results = await page.evaluate(async () => {
-      const all = [makeState(1, { final_visible: false }), makeState(1, { final_state: "checking" })].map(createFixture);
+      const all = [makeState(1, { final_visible: false }), makeState(1, { final_state: "checking" }), makeState(1, { source_completed: false })].map(createFixture);
       const accepted = all.map((f) => widget.hmbSeedanceRequestDraftFinal(f.container)); await flushFrames();
       return { accepted, views: all.map(view), commands: all.flatMap((f) => f.commands) };
     });
-    assert.deepEqual(results.accepted, [false, false]); assert.equal(results.views[0].hidden, true);
+    assert.deepEqual(results.accepted, [false, false, false]); assert.ok(results.views.every(value=>value.hidden && value.qualityHidden));
     results.views.forEach((value) => assert.equal(value.disabled, true)); assert.deepEqual(results.commands, []);
   });
   await check("same-Draft-server-state-transitions-do-not-write-authored480-or-schedule-actions", async () => {
@@ -165,18 +333,48 @@ try {
   });
   await check("queued-local-click-is-cancelled-by-server-reservation-before-dispatch", async () => {
     const result = await page.evaluate(async () => {
-      const f = createFixture(); f.button().click();
+      const f = createFixture(); f.chooseFinal();
       f.update(makeState(1, { final_state: "reserved", final_available: false, final_task_id: `job-${"f".repeat(32)}` }));
       await flushFrames(); return { ...view(f), commands: f.commands, authored: f.authored };
     });
     assert.equal(result.disabled, true); assert.equal(result.text, "Final 처리 중…");
     assert.deepEqual(result.commands, []); assert.deepEqual(result.authored, []);
   });
+  await check("scope-specific-reservation-before-paint-blocks-the-selected-quality-even-if-the-other-is-available", async () => {
+    const result = await page.evaluate(async () => {
+      const f = createFixture(makeState(1, { source_completed: true, finals_by_resolution: { "1080p": "available", "4k": "available" } }));
+      f.chooseFinal("4k");
+      f.update(makeState(1, { source_completed: true, final_available: true, final_state: "available",
+        finals_by_resolution: { "1080p": "available", "4k": "reserved" } }));
+      await flushFrames();
+      return { accepted: widget.hmbSeedanceRequestDraftFinal(f.container, "4k"), count: f.commands.length, authored: f.authored };
+    });
+    assert.equal(result.accepted, false); assert.equal(result.count, 0); assert.deepEqual(result.authored, []);
+  });
+  await check("absent-or-unrecognized-target-authority-cannot-inherit-another-resolutions-availability", async () => {
+    const results = await page.evaluate(async () => {
+      const states = [{ "1080p": "available" }, { "1080p": "available", "4k": "unrecognized" }];
+      const fixtures = states.map(finals_by_resolution => createFixture(makeState(1, { source_completed: true, finals_by_resolution })));
+      const accepted = fixtures.map(f => widget.hmbSeedanceRequestDraftFinal(f.container, "4k"));
+      await flushFrames();
+      return { accepted, commands: fixtures.flatMap(f => f.commands) };
+    });
+    assert.deepEqual(results.accepted, [false, false]); assert.deepEqual(results.commands, []);
+  });
+  await check("expired-sibling-does-not-disable-an-explicitly-available-resolution", async () => {
+    const result = await page.evaluate(async () => {
+      const f = createFixture(makeState(1, { source_completed: true, finals_by_resolution: { "1080p": "expired", "4k": "available" } }));
+      const options = view(f).options;
+      const expired = widget.hmbSeedanceRequestDraftFinal(f.container, "1080p"); f.chooseFinal("4k");
+      await flushFrames(); return { options, expired, sent: f.commands.map(c => c.final_resolution) };
+    });
+    assert.deepEqual(result, { options: ["4k"], expired: false, sent: ["4k"] });
+  });
   await check("child-task-info-never-replaces-source-Draft-command-id-or-causes-duplicate", async () => {
     const result = await page.evaluate(async () => {
       const f = createFixture(), source = f.state.draft.job_id;
       f.update(makeState(1, { final_task_id: `job-${"f".repeat(32)}` }));
-      f.button().click(); f.button().click(); await flushFrames();
+      f.chooseFinal(); f.button().click(); await flushFrames();
       f.update(makeState(1, { final_state: "running", final_available: false, final_task_id: `job-${"e".repeat(32)}` }));
       return { source, commands: f.commands, authored: f.authored };
     });
@@ -185,8 +383,8 @@ try {
   });
   await check("pending-Shot-switch-blocks-stale-old-Draft-availability-and-late-action-errors", async () => {
     const result = await page.evaluate(async () => {
-      const f = createFixture(); f.button().click(); await flushFrames();
-      const select = f.container.querySelector("select"); select.value = select.options[2].value;
+      const f = createFixture(); f.chooseFinal(); await flushFrames();
+      const select = f.container.querySelector(".hmb-seedance-shot__select"); select.value = select.options[2].value;
       select.dispatchEvent(new Event("change", { bubbles: true }));
       f.update(makeState(1, { final_state: "checking", final_available: false })); const checking = view(f);
       f.update(makeState(1)); const stale = view(f); f.button().click(); await flushFrames();
@@ -202,10 +400,13 @@ try {
     const result = await page.evaluate(async () => {
       const f = createFixture(makeState(1, { final_state: "consumed", final_visible: false, final_available: false }));
       const before = view(f); const next = makeState(1); next.draft.job_id = `job-${"a".repeat(32)}`;
-      f.update(next); const after = view(f); f.button().click(); await flushFrames();
+      f.update(next); const after = view(f); f.chooseFinal(); await flushFrames();
       return { before, after, commands: f.commands, authored: f.authored };
     });
-    assert.equal(result.before.hidden, true); assert.equal(result.after.hidden, false); assert.equal(result.after.disabled, false);
+    assert.equal(result.before.disabled, true);
+    assert.ok(result.before.hidden && result.before.qualityHidden);
+    assert.deepEqual(result.before.options, []);
+    assert.equal(result.after.hidden, false); assert.equal(result.after.disabled, false);
     assert.equal(result.commands.length, 1); assert.equal(result.commands[0].expected_draft_job_id, `job-${"a".repeat(32)}`);
     assert.deepEqual(result.authored, []);
   });

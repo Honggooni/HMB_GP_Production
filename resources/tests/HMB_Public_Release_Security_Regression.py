@@ -70,6 +70,7 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "_hmb_mp4_verify.py",
     "_hmb_common.py",
     "_hmb_color_lut.py",
+    "_hmb_client_review_media.py",
     "_hmb_color_lut_usage.py",
     "_hmb_screen_space.py",
     "_hmb_video_tools.py",
@@ -89,6 +90,14 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "resources/maya/HMB_Maya_Background_Preview.py",
     "resources/blender/HMB_Blender_Background_Preview.py",
     "resources/picker/HMB_Marker_Catalog.json",
+    "resources/media-tools/win64/ffmpeg.exe",
+    "resources/media-tools/win64/ffprobe.exe",
+    "resources/media-tools/source/ffmpeg-7.1.5.tar.xz",
+    "resources/media-tools/source/x264-31e19f92f00c7003fa115047ce50978bc98c3a0d.tar.gz",
+    "resources/media-tools/COPYING.GPLv2",
+    "resources/media-tools/MINGW-RUNTIME.txt",
+    "resources/media-tools/README.txt",
+    "resources/media-tools/rebuild-review-tools.sh",
     "resources/cgt/server-trust.json",
     "resources/image_bash/compatibility.json",
     "resources/agent/superwings12/hmb_agent_core.dat",
@@ -706,6 +715,9 @@ with tempfile.TemporaryDirectory(prefix="hmb-native-release-boundary-") as nativ
             raise AssertionError("Native editor descriptor accepted a missing UI helper.")
 
 release_version, records = builder.validate_sources()
+assert len(builder.REVIEW_MEDIA_SHA256) == 4
+for relative in builder.REVIEW_MEDIA_SHA256:
+    assert_forbidden_archive(zip_bytes({f"{builder.ARCHIVE_ROOT}/{relative}": b"tampered media component"}))
 record_paths = tuple(str(record["path"]) for record in records)
 assert record_paths == EXPECTED_SOURCE_FILES
 assert len(records) == len(EXPECTED_SOURCE_FILES)
@@ -796,11 +808,11 @@ assert set(release_record_by_path) == {
     builder.SHA256SUMS_PATH,
 }
 archive_date_time = builder.current_zip_date_time()
+assert abs((datetime.now() - datetime(*archive_date_time)).total_seconds()) < 5
 first_archive = builder.make_archive(release_records, archive_date_time)
 second_archive = builder.make_archive(release_records, archive_date_time)
 assert first_archive == second_archive
 builder.validate_archive(first_archive, release_records, archive_date_time)
-assert abs((datetime.now() - datetime(*archive_date_time)).total_seconds()) < 5
 for canonical_crlf_member in builder.CANONICAL_CRLF_SOURCE_FILES:
     canonical_record = next(
         record
@@ -821,8 +833,8 @@ for canonical_crlf_member in builder.CANONICAL_CRLF_SOURCE_FILES:
 expected_lf_members = {
     PurePosixPath(relative)
     for relative in EXPECTED_SOURCE_FILES
-    if PurePosixPath(relative).suffix in {".py", ".js", ".json", ".md"}
-    or relative == "LICENSE"
+    if PurePosixPath(relative).suffix in {".py", ".js", ".json", ".md", ".txt", ".sh"}
+    or relative in {"LICENSE", "resources/media-tools/COPYING.GPLv2"}
 }
 expected_text_members = expected_lf_members | builder.CANONICAL_CRLF_SOURCE_FILES
 checkout_source_records = {}

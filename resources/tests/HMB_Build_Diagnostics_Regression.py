@@ -126,7 +126,8 @@ with tempfile.TemporaryDirectory(prefix="hmb-build-override-") as directory:
     manifest_path.write_text(json.dumps({"metadata":{"library_version":"0.8.9"}}), encoding="utf-8")
     rows = [{"path":name,"bytes":(root/name).stat().st_size,
              "sha256":hashlib.sha256((root/name).read_bytes()).hexdigest()}
-            for name in runtime_paths if name != "_hmb_shot_basket.py"]
+            for name in runtime_paths if name not in {"_hmb_shot_basket.py", "_hmb_client_review_media.py"}
+            and not name.startswith("resources/media-tools/")]
     old_receipt = {"schema":"hmb-install-receipt","version":1,"release_version":"0.8.9",
                    "runtime_files":rows,"runtime_fingerprint_sha256":diag.inventory_fingerprint(rows)}
     receipt_path = root/diag.RECEIPT_NAME
@@ -140,6 +141,13 @@ with tempfile.TemporaryDirectory(prefix="hmb-build-override-") as directory:
     assert updated["install"]["recorded_library_version"] == "0.8.9"
     assert updated["package"]["verification_status"] == "not_checked"
     assert receipt_path.read_bytes() == saved_receipt
+    basket = root / "_hmb_shot_basket.py"
+    previous_rows = rows + [{"path": basket.name, "bytes": basket.stat().st_size,
+                             "sha256": hashlib.sha256(basket.read_bytes()).hexdigest()}]
+    previous = dict(old_receipt, runtime_files=previous_rows,
+                    runtime_fingerprint_sha256=diag.inventory_fingerprint(previous_rows))
+    receipt_path.write_text(json.dumps(previous), encoding="utf-8")
+    assert diag.get_build_diagnostics(root, verify_policy=False)["install"]["receipt_status"] == "historical_record"
     old_receipt["release_version"] = "0.8.11"
     receipt_path.write_text(json.dumps(old_receipt), encoding="utf-8")
     assert diag.get_build_diagnostics(root, verify_policy=False)["install"]["receipt_status"] == "invalid"

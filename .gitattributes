@@ -23,3 +23,8 @@ LICENSE text eol=lf
 *.webp binary
 *.zip binary
 *.mp4 binary
+resources/media-tools/win64/*.exe binary
+resources/media-tools/source/*.tar.gz binary
+resources/media-tools/source/*.tar.xz binary
+resources/media-tools/*.sh text eol=lf
+resources/media-tools/COPYING.GPLv2 text eol=lf

@@ -17,9 +17,10 @@ const source = fs.readFileSync(widgetPath, "utf8");
 const hash = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
 const originalCss = "16fb5e7c19e4e1ee1b0dcdd31f827e743ace6cd1c4c89449cd3a8910a4129c34";
 const css = source.match(/function render\(state\) \{[\s\S]*?<style>([\s\S]*?)<\/style>/)?.[1];
-// The opt-in host header adds only its own slots and excludes host controls
-// from generic styling. All legacy header/body/player CSS remains byte-identical.
+// Exclude the additive native slots and inline Draft Final controls. The rest
+// of the header, body and player CSS must stay byte-identical.
 const legacyCss = css.replace(/^[ \t]*\/\* HMB_NATIVE_HEADER_SLOTS_BEGIN \*\/[\s\S]*?\/\* HMB_NATIVE_HEADER_SLOTS_END \*\/\r?\n/m, "")
+  .replace(/^[ \t]*\/\* HMB_FINAL_RESOLUTION_INLINE_BEGIN \*\/[\s\S]*?\/\* HMB_FINAL_RESOLUTION_INLINE_END \*\/\r?\n/m, "")
   .replaceAll(":not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *))", "");
 assert.equal(hash(legacyCss), originalCss, "Native header integration must preserve existing layout, colours and player CSS.");
 const require = createRequire(import.meta.url);
@@ -62,10 +63,10 @@ try {
       f.project = node.querySelector("[data-native-project]"); f.resolution = node.querySelector("[data-resolution]");
       f.props = value => ({ value, onChange(next) { f.writes.push(clone(next)); return new Promise((_, reject) => f.rejects.push(reject)); } });
       f.controller = widget.default(f.header, f.props(value));
-      f.initialSelector = f.header.querySelector("select");
+      f.initialSelector = f.header.querySelector(".hmb-seedance-shot__select");
       f.update = value => f.controller.update(f.props(value));
       f.view = () => {
-        const select = f.header.querySelector("select"), current = widget.hmbSeedanceShotState(f.header.__hmbSeedanceLatestProps);
+        const select = f.header.querySelector(".hmb-seedance-shot__select"), current = widget.hmbSeedanceShotState(f.header.__hmbSeedanceLatestProps);
         return { value: select.value, label: select.selectedOptions[0]?.textContent, badge: f.header.querySelector("[data-seedance-shot-number]").textContent,
           sameSelector: select === f.initialSelector, colour: f.header.querySelector(".hmb-seedance-shot").style.getPropertyValue("--shot-accent"),
           mode: current.execution_mode, intent: current.requested_mode, revision: current.execution_mode_revision,
@@ -76,7 +77,7 @@ try {
           videoUnchanged: f.node.querySelector("video") === f.video && !f.video.getAttribute("src"),
           resolution: f.resolution.value };
       };
-      f.choose = n => { const select = f.header.querySelector("select"); select.value = shotKey(n); select.dispatchEvent(new Event("change", { bubbles: true })); };
+      f.choose = n => { const select = f.header.querySelector(".hmb-seedance-shot__select"); select.value = shotKey(n); select.dispatchEvent(new Event("change", { bubbles: true })); };
       f.cleanup = () => { f.controller.cleanup(); node.remove(); };
       return f;
     };
@@ -183,7 +184,7 @@ try {
   await page.evaluate(() => {
     f.choose(0); const reject = f.rejects.at(-1); f.controller.cleanup();
     f.controller = widget.default(f.header,f.props(state("only",0,0,1)));
-    f.initialSelector = f.header.querySelector("select"); reject(new Error("deleted node rejection"));
+    f.initialSelector = f.header.querySelector(".hmb-seedance-shot__select"); reject(new Error("deleted node rejection"));
   });
   await page.waitForTimeout(0);
   result = await page.evaluate(() => f.view());

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 import contextvars
 import json
 import hashlib
@@ -1219,8 +1221,11 @@ class HMBColorLUTLibrary(DataNode):
         context["artifact"] = artifact
         bridge = _upload_bridge(context["server_url"])
         capabilities = bridge.review_capabilities()
+        cap = capabilities.get("color_lut_manual_upload" if context.get("manual") else "color_lut_upload", {})
+        client_media = isinstance(cap, dict) and cap.get("client_review_media") == "client-v1"
+        context["workstation_media"] = (client_media and (cap.get("workstation_review_media") == "pc-v1"
+                                         or capabilities.get("workstation_review_media") == "pc-v1"))
         if context.get("manual"):
-            cap = capabilities.get("color_lut_manual_upload", {})
             if (not isinstance(cap, dict) or cap.get("schema") != COLOR_LUT_MANUAL_UPLOAD_SCHEMA
                     or type(cap.get("version")) is not int or cap["version"] != 1 or cap.get("enabled") is not True
                     or cap.get("display_name") != "HMB Color LUT"
@@ -1243,13 +1248,14 @@ class HMBColorLUTLibrary(DataNode):
             if artifact == "export" and proof.get("upload_name_suffix") == path.suffix.lower():
                 context["source_file_name"] = context["file_name"]
                 context["file_name"] = str(Path(context["file_name"]).with_suffix(path.suffix.lower()))
+            if client_media:
+                context.update(client_review_media="client-v1", st_dev=info.st_dev, st_ino=info.st_ino)
             context.update(path=str(path), size=info.st_size, mtime_ns=info.st_mtime_ns, sha256=proof["sha256"],
                            settings=proof["settings"], owner_id=owner, bridge=bridge, state_stamp=self._upload_state_stamp(state),
                            settings_sha256=_digest(proof["settings"]))
             context["upload_id"] = hashlib.sha256("\n".join(("hmb-color-lut-manual-upload-v1", context["project_id"], context["file_name"], context["sha256"], context["settings_sha256"])).encode("utf-8")).hexdigest()
             context["receipt_id"] = _digest([context["server_url"], context["owner_id"], context["upload_id"]])
             return context
-        cap = capabilities.get("color_lut_upload", {})
         if (not isinstance(cap, dict) or cap.get("schema") != COLOR_LUT_UPLOAD_SCHEMA or type(cap.get("version")) is not int or cap.get("version") != 1
                 or cap.get("enabled") is not True or cap.get("display_name") != "HMB Color LUT"
                 or not _advertised_api_path_matches(cap.get("upload_path"),
@@ -1285,6 +1291,8 @@ class HMBColorLUTLibrary(DataNode):
         owner = str(me.get("id") or me.get("user_id") or (me.get("user") or {}).get("id") or "")
         if not owner:
             raise ValueError("브로커 로그인 계정을 확인하세요.")
+        if client_media and eligibility.get("client_review_media") == "client-v1":
+            context.update(client_review_media="client-v1", st_dev=info.st_dev, st_ino=info.st_ino)
         context.update(path=str(path), size=info.st_size, mtime_ns=info.st_mtime_ns, sha256=proof["sha256"],
                        settings=proof["settings"], owner_id=owner, bridge=bridge, state_stamp=self._upload_state_stamp(state),
                        source_revision=eligibility["source_revision"], settings_sha256=_digest(proof["settings"]))
@@ -1374,8 +1382,13 @@ class HMBColorLUTLibrary(DataNode):
                     complete = receipt.get("phase") == "complete"
                     pending = receipt.get("phase") in {"pending", "unknown"}
                     absent = receipt.get("phase") == "absent"
-                    if complete:
-                        reason = "원본 웹 업로드 완료"
+                    retry_media = (complete and context.get("workstation_media")
+                                   and receipt.get("client_review_media") == "client-v1"
+                                   and receipt.get("review_media_state") != "ready")
+                    if retry_media and receipt.get("review_media_state") == "fallback":
+                        reason = "원본 업로드 완료 · 서버에서 미리보기 준비 중"
+                    elif complete:
+                        reason = "원본 업로드 완료 · 미리보기 상태 확인 및 복구" if retry_media else "원본 웹 업로드 완료"
                     elif pending or absent:
                         reason = receipt.get("reason") or (_UPLOAD_ABSENT_REASON if absent else _UPLOAD_PENDING_REASON)
                     else:
@@ -1384,7 +1397,7 @@ class HMBColorLUTLibrary(DataNode):
                         reason += " 생성 당시 샷: " + context["shot_name"]
                     if offline:
                         reason = "브로커가 응답하지 않아 웹 업로드를 사용할 수 없습니다."
-                    view = {"enabled": bool(context) and not complete, "phase": "complete" if complete else
+                    view = {"enabled": bool(context) and (not complete or bool(retry_media)), "phase": "media_retry" if retry_media else "complete" if complete else
                             "unknown" if pending else "absent" if absent else "ready" if context else "offline" if offline else "unavailable",
                             "reason": reason}
                     changed = (view != self._web_upload or bool(context) != bool(old_context.get("bridge"))
@@ -1457,7 +1470,8 @@ class HMBColorLUTLibrary(DataNode):
                 yield prefix
                 with Path(context["path"]).open("rb") as stream:
                     stat = os.fstat(stream.fileno())
-                    if stat.st_size != context["size"] or stat.st_mtime_ns != context["mtime_ns"]:
+                    if (stat.st_size != context["size"] or stat.st_mtime_ns != context["mtime_ns"]
+                            or "st_ino" in context and (stat.st_dev, stat.st_ino) != (context["st_dev"], context["st_ino"])):
                         raise ValueError("보정 영상 파일이 변경되었습니다.")
                     digest = hashlib.sha256()
                     while block := stream.read(1024 * 1024):
@@ -1474,7 +1488,8 @@ class HMBColorLUTLibrary(DataNode):
         request = Request(join_broker_url(bridge.server_url, path), data=Body(), method="POST", headers={
             "Authorization": "Bearer " + bridge._load_access_token(), "Accept": "application/json",
             "Content-Type": "multipart/form-data; boundary=" + boundary,
-            "Content-Length": str(len(prefix) + context["size"] + len(suffix)), "Idempotency-Key": identity})
+            "Content-Length": str(len(prefix) + context["size"] + len(suffix)), "Idempotency-Key": identity,
+            **({"X-HMB-Review-Media": "client-v1"} if context.get("client_review_media") == "client-v1" else {})})
         try:
             with bridge._opener.open(request, timeout=300) as response:
                 _broker_require_exact_response_url(response, request.full_url)
@@ -1490,9 +1505,133 @@ class HMBColorLUTLibrary(DataNode):
                 exc.close()
             raise
 
+    def _upload_review_media(self, context: dict[str, Any], derived_task_id: str, poster_path: Path, preview_path: Path,
+                             *, cancel: threading.Event) -> dict[str, Any]:
+        from HMBSeedanceGeneration import _broker_read_json, _broker_require_exact_response_url
+        from _hmb_broker_config import join_broker_url
+        from urllib.request import Request
+
+        source_sha = context["sha256"]
+        key = context["upload_id"]
+        if (context.get("client_review_media") != "client-v1" or not isinstance(derived_task_id, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", derived_task_id) is None
+                or not isinstance(source_sha, str) or re.fullmatch(r"[a-f0-9]{64}", source_sha) is None
+                or not isinstance(key, str) or re.fullmatch(r"[a-f0-9]{64}", key) is None):
+            raise ValueError("미리보기 업로드의 영상 또는 원본 등록 정보를 확인할 수 없습니다.")
+        if cancel.is_set():
+            raise ValueError("미리보기 업로드가 취소되었습니다.")
+        bridge = context["bridge"]
+        url = join_broker_url(bridge.server_url, "/api/v1/reviews/tasks/" + quote(derived_task_id, safe="") + "/color-lut/media")
+        with Path(poster_path).open("rb") as poster, Path(preview_path).open("rb") as preview:
+            poster_size = os.fstat(poster.fileno()).st_size
+            preview_size = os.fstat(preview.fileno()).st_size
+            if poster_size <= 0 or preview_size <= 0:
+                raise ValueError("미리보기 파일이 비어 있습니다.")
+
+            def body():
+                for stream, remaining in ((poster, poster_size), (preview, preview_size)):
+                    while remaining:
+                        if cancel.is_set():
+                            raise ValueError("미리보기 업로드가 취소되었습니다.")
+                        block = stream.read(min(1024 * 1024, remaining))
+                        if not block:
+                            raise ValueError("미리보기 전송 중 파일 크기가 변경되었습니다.")
+                        remaining -= len(block)
+                        yield block
+
+            request = Request(url, data=body(), method="POST", headers={
+                "Authorization": "Bearer " + bridge._load_access_token(), "Accept": "application/json",
+                "Idempotency-Key": key, "Content-Type": "application/octet-stream",
+                "Content-Length": str(poster_size + preview_size), "X-HMB-Poster-Bytes": str(poster_size),
+                "X-HMB-Source-SHA256": source_sha})
+            try:
+                with bridge._opener.open(request, timeout=300) as response:
+                    _broker_require_exact_response_url(response, url)
+                    if response.status not in (200, 201):
+                        raise ValueError("서버가 미리보기 게시를 확인하지 못했습니다.")
+                    result = _broker_read_json(response, max_bytes=65536)
+            except HTTPError as exc:
+                exc.close()
+                raise
+        if (not isinstance(result, dict) or result.get("state") != "ready"
+                or result.get("derived_task_id") != derived_task_id or result.get("source_sha256") != source_sha):
+            raise ValueError("서버가 동일 영상의 미리보기 게시를 확인하지 못했습니다.")
+        return result
+
+    def _finish_review_media(self, context, task_id, encoded, cancel, workstation):
+        """Attach to the accepted original, including after a lost attachment response."""
+        with ExitStack() as scope:
+            lease = None
+            if workstation:
+                from _hmb_client_review_media import get_workstation_media_state, workstation_media_heartbeat
+                if encoded is None:
+                    status = get_workstation_media_state(context["bridge"], task_id)
+                    if (status.get("task_id") != task_id or status.get("source_sha256") != context["sha256"]
+                            or status.get("source_bytes") != context["size"] or status.get("state") not in {"ready", "waiting", "fallback"}):
+                        raise ValueError("미리보기와 원본의 연결을 확인하지 못했습니다.")
+                    if status["state"] in ("ready", "fallback"):
+                        return status["state"]
+                lease = scope.enter_context(workstation_media_heartbeat(
+                    context["bridge"], heartbeat_url=f"/api/v1/reviews/tasks/{quote(task_id, safe='')}/workstation-media/heartbeat",
+                    task_id=task_id, source_sha256=context["sha256"], idempotency_key=context["upload_id"],
+                    cancel_event=cancel))
+            try:
+                if lease and lease.state in ("ready", "fallback"):
+                    return lease.state
+                if encoded is None:
+                    from _hmb_color_lut import make_review_media
+                    directory = scope.enter_context(tempfile.TemporaryDirectory(prefix="hmb-lut-review-"))
+                    poster, preview = make_review_media(Path(context["path"]), Path(directory), cancel,
+                                                        expected_sha256=context["sha256"])
+                else:
+                    poster, preview = encoded.result()
+                if lease and lease.confirm() in ("ready", "fallback"):
+                    return lease.state
+                if cancel.is_set():
+                    raise InterruptedError("LUT review media cancelled")
+                self._upload_review_media(context, task_id, poster, preview, cancel=cancel)
+                return "ready"
+            except Exception:
+                if lease and lease.state in ("ready", "fallback"):
+                    return lease.state
+                raise
+
+    def _complete_web_upload(self, context, response, durable, media_state=""):
+        """Commit the verified original independently of optional review media."""
+        record = {**durable, "schema": COLOR_LUT_UPLOAD_SCHEMA, "phase": "complete",
+                  "upload_id": context["upload_id"], "response": response}
+        if media_state:
+            record["review_media_state"] = media_state
+        try:
+            _write_upload_receipt(context["receipt_id"], record)
+        except OSError:
+            LOGGER.debug("Color LUT completed upload receipt could not be saved", exc_info=True)
+        messages = {"encoding": "웹 업로드 완료 · 이 PC에서 미리보기 준비 중",
+                    "ready": "웹 업로드 완료 · 썸네일과 미리보기 준비 완료",
+                    "pc_pending": "영상 업로드 완료 · 미리보기 상태 확인 및 복구",
+                    "fallback": "웹 업로드 완료 · 서버에서 미리보기 준비 중",
+                    "server": "웹 업로드 완료 · 미리보기 상태는 로동 페이지에서 확인하세요."}
+        with self._lock:
+            if (self._hmb_node_deleted or context["state_stamp"] != self._upload_state_stamp(self._hmb_color_lut_state)
+                    or context["source_token"] != self._source_token or context["route_epoch"] != self._web_upload_epoch):
+                return
+            self._web_upload_context = context
+            retry_media = media_state in ("pc_pending", "fallback")
+            if context.get("artifact") == "export":
+                result = self._hmb_color_lut_state["result"]
+                if retry_media or (media_state == "encoding" and context.get("workstation_media")):
+                    result["review_media_retry"] = {"receipt": context["receipt_id"], "stamp": context["state_stamp"],
+                                                    "output": copy.deepcopy(self._hmb_color_lut_state["output"])}
+                else:
+                    result.pop("review_media_retry", None)
+                self._remember_selection()
+            self._web_upload = {"enabled": retry_media, "phase": "media_retry" if retry_media else "complete",
+                                "reason": messages.get(media_state, "웹 업로드 완료 · HMB Color LUT")}
+            self._hmb_color_lut_state["revision"] += 1
+
     def _start_web_upload(self, state: dict[str, Any], *, artifact: str = "export",
                           chained: bool = False, cancel_event: threading.Event | None = None,
-                          check_only: bool = False) -> None:
+                          check_only: bool = False, repair_receipt: str = "") -> None:
         # Only upload_web or the explicit export_upload command may submit.
         if not chained and not self._upload_projection().get("enabled"):
             self._status("error", self._upload_projection().get("reason", "웹 업로드 준비가 필요합니다."))
@@ -1507,11 +1646,16 @@ class HMBColorLUTLibrary(DataNode):
         cancel = self._cancel = cancel_event if cancel_event is not None else threading.Event()
         def upload() -> None:
             identity, sent, claimed, retrieve, offline, context, durable = "", False, False, False, False, {}, {}
+            resources = ExitStack()
+            encoded = None
+            source_accepted = False
             try:
                 if cancel.is_set() or self._hmb_node_deleted:
                     return
                 context = self._prepare_upload_context(state, artifact=artifact)
                 identity = context["upload_id"]
+                if repair_receipt and repair_receipt != context["receipt_id"]:
+                    raise ValueError("미리보기를 복구할 영상이나 계정이 변경되었습니다.")
                 current = self._upload_source_context(state)
                 if any(current.get(key) != (context.get("source_file_name", context.get(key)) if key == "file_name"
                                             else context.get(key)) for key in current):
@@ -1524,8 +1668,13 @@ class HMBColorLUTLibrary(DataNode):
                     if identity in _UPLOAD_ACTIVE:
                         raise ValueError("동일한 보정 영상의 웹 업로드가 진행 중입니다.")
                     previous = _read_upload_receipt(context["receipt_id"])
+                    if repair_receipt and previous.get("phase") != "complete":
+                        raise ValueError("미리보기를 복구할 기존 업로드 영수증을 확인하세요.")
                     if previous.get("phase") == "complete":
                         response = previous.get("response", {})
+                        durable = previous
+                        _UPLOAD_ACTIVE.add(identity)
+                        claimed = True
                     else:
                         metadata = self._upload_metadata(context)
                         if previous.get("metadata"):
@@ -1545,9 +1694,24 @@ class HMBColorLUTLibrary(DataNode):
                         _UPLOAD_ACTIVE.add(identity)
                         claimed = True
                         retrieve = check_only or previous.get("phase") in {"pending", "unknown"}
+                        if retrieve:
+                            if previous.get("client_review_media") == "client-v1":
+                                durable["client_review_media"] = "client-v1"
+                        elif context.get("client_review_media") == "client-v1":
+                            durable["client_review_media"] = "client-v1"
                         _write_upload_receipt(context["receipt_id"], durable)
                         response = None
                 if response is None:
+                    if not retrieve and durable.get("client_review_media") == "client-v1":
+                        try:
+                            from _hmb_color_lut import make_review_media
+                            directory = resources.enter_context(tempfile.TemporaryDirectory(prefix="hmb-lut-review-"))
+                            pool = resources.enter_context(ThreadPoolExecutor(max_workers=1, thread_name_prefix="HMB LUT media"))
+                            encoded = pool.submit(make_review_media, Path(context["path"]), Path(directory),
+                                                  cancel, expected_sha256=context["sha256"])
+                        except Exception:
+                            # The original receipt and review media have independent outcomes.
+                            LOGGER.warning("Could not start local LUT review media preparation", exc_info=True)
                     # Persist pending before crossing the network boundary. An
                     # uncertain response is retrieved with the same ID only.
                     sent = True
@@ -1573,19 +1737,29 @@ class HMBColorLUTLibrary(DataNode):
                         or not isinstance(response.get("asset_id"), str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", response["asset_id"]) is None
                         or not isinstance(response.get("derived_task_id"), str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", response["derived_task_id"]) is None):
                     raise ValueError("서버가 동일 보정 영상의 업로드 완료를 확인하지 못했습니다.")
-                try:
-                    _write_upload_receipt(context["receipt_id"], {**durable, "schema": COLOR_LUT_UPLOAD_SCHEMA, "phase": "complete", "upload_id": identity, "response": response})
-                except OSError:
-                    # A local receipt failure cannot undo a verified successful
-                    # server upload. The server retains this idempotency key.
-                    LOGGER.debug("Color LUT completed upload receipt could not be saved", exc_info=True)
-                with self._lock:
-                    if (not self._hmb_node_deleted and context["state_stamp"] == self._upload_state_stamp(self._hmb_color_lut_state)
-                            and context["source_token"] == self._source_token and context["route_epoch"] == self._web_upload_epoch):
-                        self._web_upload_context = context
-                        self._web_upload = {"enabled": False, "phase": "complete", "reason": "웹 업로드 완료 · HMB Color LUT"}
-                        self._hmb_color_lut_state["revision"] += 1
+                source_accepted = True
+                media_state = durable.get("review_media_state", "")
+                needs_media = durable.get("client_review_media") == "client-v1" and media_state != "ready"
+                workstation = needs_media and context.get("workstation_media") and context.get("client_review_media") == "client-v1"
+                if needs_media:
+                    media_state = "encoding" if encoded is not None or workstation else "server"
+                self._complete_web_upload(context, response, durable, media_state)
+                if encoded is not None or workstation:
+                    try:
+                        self._publish()
+                    except Exception:
+                        LOGGER.debug("Color LUT receipt notification deferred", exc_info=True)
+                    try:
+                        media_state = self._finish_review_media(context, response["derived_task_id"], encoded, cancel, workstation)
+                    except Exception:
+                        LOGGER.info("Original LUT accepted; review media attachment was not confirmed", exc_info=True)
+                        media_state = "pc_pending" if workstation else "server"
+                    self._complete_web_upload(context, response, durable, media_state)
             except Exception as exc:
+                if source_accepted:
+                    # A projection or follow-up error cannot invalidate the verified original.
+                    LOGGER.warning("Color LUT original accepted; local completion update was interrupted", exc_info=True)
+                    return
                 offline = not sent and _upload_broker_offline(exc)
                 absent = bool(sent and retrieve and _upload_error_status(exc) == 404)
                 if sent and not retrieve:
@@ -1604,6 +1778,12 @@ class HMBColorLUTLibrary(DataNode):
                         self._web_upload = {"enabled": bool(sent), "phase": "absent" if absent else "unknown" if sent else "offline" if offline else "unavailable",
                                             "reason": reason}
             finally:
+                if encoded is not None and not encoded.done():
+                    cancel.set()
+                try:
+                    resources.close()
+                except OSError:
+                    LOGGER.warning("Color LUT temporary media cleanup failed", exc_info=True)
                 with _UPLOAD_LOCK:
                     if claimed:
                         _UPLOAD_ACTIVE.discard(identity)
@@ -2061,7 +2241,9 @@ class HMBColorLUTLibrary(DataNode):
                 self._save_profile(captured, authored)
                 return
             if action == "upload_web":
-                self._start_web_upload(captured, artifact="source", check_only=value.get("check_only") is True)
+                retry_context = self._web_upload_context if self._web_upload.get("phase") == "media_retry" else {}
+                self._start_web_upload(captured, artifact=retry_context.get("artifact", "source"),
+                                       check_only=value.get("check_only") is True, repair_receipt=retry_context.get("receipt_id", ""))
                 return
             if action not in {"export", "export_upload", "browse_video"}:
                 return
@@ -2075,6 +2257,11 @@ class HMBColorLUTLibrary(DataNode):
                         self._status("error", str(exc))
                         return
                 if action == "export_upload":
+                    retry = captured.get("result", {}).get("review_media_retry", {})
+                    if (isinstance(retry, dict) and retry.get("receipt") and retry.get("stamp") == self._upload_state_stamp(captured)
+                            and retry.get("output") == captured["output"]):
+                        self._start_web_upload(captured, artifact="export", chained=True, repair_receipt=retry["receipt"])
+                        return
                     try:
                         if self._upload_projection().get("phase") == "offline":
                             raise ValueError("브로커가 응답하지 않아 웹 업로드를 사용할 수 없습니다.")
@@ -2221,7 +2408,7 @@ class HMBColorLUTLibrary(DataNode):
             return current
 
     def _finish_local_export(self, state: dict[str, Any], result: dict[str, Any], key: str, job_id: str,
-                             cancel: threading.Event) -> None:
+                             cancel: threading.Event, *, upload_after_save: bool = False) -> None:
         # export_video has already probed the complete artifact and published
         # it exclusively. Cancellation before this commit still publishes no
         # result; cancellation during optional work cannot undo a saved file.
@@ -2290,6 +2477,11 @@ class HMBColorLUTLibrary(DataNode):
                 result.pop("web_export_proof", None)
                 self._export_warning(result, "web_receipt", exc)
         current = self._retain_export_result(state, result, key, job_id)
+        if upload_after_save and current and result.get("web_export_proof"):
+            try:
+                self._continue_export_upload(state, cancel, result["web_export_proof"])
+            except Exception as exc:
+                self._export_warning(result, "web_upload", exc)
         # Each notification is independent: a broken output subscriber or UI
         # bridge must not reclassify a successfully saved local video as error.
         callbacks = [("output_notification", lambda: self._publish_result_url(result.get("url", "")))] if current and not early_preview else []
@@ -2407,7 +2599,7 @@ class HMBColorLUTLibrary(DataNode):
                 else:
                     # Also after restart/unknown receipt: retrieve the same
                     # exported bytes rather than re-encoding a replacement.
-                    self._continue_export_upload(state, cancel)
+                    self._continue_export_upload(state, cancel, state["result"]["web_export_proof"])
                     return
             if action in {"export", "export_upload"}:
                 if not source:
@@ -2436,9 +2628,7 @@ class HMBColorLUTLibrary(DataNode):
                     result["sound_contract_sha256"] = _digest(state["_sound_snapshot"])
             result = {**result, "shot": state["shot"], "project_id": state["project_id"], "settings": state["settings"], "job_id": job_id}
             if action in {"export", "export_upload"}:
-                self._finish_local_export(state, result, key, job_id, cancel)
-                if action == "export_upload":
-                    self._continue_export_upload(state, cancel)
+                self._finish_local_export(state, result, key, job_id, cancel, upload_after_save=action == "export_upload")
         except Exception as exc:
             with self._lock:
                 if (self._job_id == job_id and key == _selection_key(self._hmb_color_lut_state)
@@ -2454,11 +2644,12 @@ class HMBColorLUTLibrary(DataNode):
                         normalize_settings(state.get("settings")), _audio_mix_identity(state), _output(state.get("output")),
                         state.get("manual_project"), state.get("manual_episode") if not state["shot"].get("shot_uuid") else ""])
 
-    def _continue_export_upload(self, state: dict[str, Any], cancel: threading.Event) -> None:
+    def _continue_export_upload(self, state: dict[str, Any], cancel: threading.Event, proof_id: str) -> None:
         chain = state.get("_upload_chain", {})
         with self._lock:
             current = self._hmb_color_lut_state
             if (cancel.is_set() or self._hmb_node_deleted
+                    or current["result"].get("web_export_proof") != proof_id
                     or chain.get("stamp") != self._export_operation_stamp(current)
                     or chain.get("source_token") != self._source_token
                     or chain.get("route_epoch") != self._web_upload_epoch):

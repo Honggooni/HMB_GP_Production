@@ -18,8 +18,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.9.23"
-RELEASE_VERSION = "0.9.23"
+RELEASE_LABEL = "v0.9.25"
+RELEASE_VERSION = "0.9.25"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -99,6 +99,7 @@ RUNTIME_INSTALL_FILES = (
     "_hmb_mp4_verify.py",
     "_hmb_common.py",
     "_hmb_color_lut.py",
+    "_hmb_client_review_media.py",
     "_hmb_color_lut_usage.py",
     "_hmb_screen_space.py",
     "_hmb_video_tools.py",
@@ -106,6 +107,14 @@ RUNTIME_INSTALL_FILES = (
     "resources/maya/HMB_Maya_Background_Preview.py",
     "resources/blender/HMB_Blender_Background_Preview.py",
     "resources/picker/HMB_Marker_Catalog.json",
+    "resources/media-tools/win64/ffmpeg.exe",
+    "resources/media-tools/win64/ffprobe.exe",
+    "resources/media-tools/source/ffmpeg-7.1.5.tar.xz",
+    "resources/media-tools/source/x264-31e19f92f00c7003fa115047ce50978bc98c3a0d.tar.gz",
+    "resources/media-tools/COPYING.GPLv2",
+    "resources/media-tools/MINGW-RUNTIME.txt",
+    "resources/media-tools/README.txt",
+    "resources/media-tools/rebuild-review-tools.sh",
     "resources/cgt/server-trust.json",
     "resources/image_bash/compatibility.json",
     "resources/agent/superwings12/hmb_agent_core.dat",
@@ -148,10 +157,10 @@ CANONICAL_CRLF_SOURCE_FILES = {
 CANONICAL_LF_SOURCE_FILES = {
     PurePosixPath(relative)
     for relative in SOURCE_FILES
-    if PurePosixPath(relative).suffix.casefold() in {".py", ".js", ".json", ".md"}
-    or relative == "LICENSE"
+    if PurePosixPath(relative).suffix.casefold() in {".py", ".js", ".json", ".md", ".txt", ".sh"}
+    or relative in {"LICENSE", "resources/media-tools/COPYING.GPLv2"}
 }
-if len(RUNTIME_INSTALL_FILES) != 70 or len(DISTRIBUTION_ONLY_FILES) != 22:
+if len(RUNTIME_INSTALL_FILES) != 79 or len(DISTRIBUTION_ONLY_FILES) != 22:
     raise RuntimeError("Runtime/distribution release boundary count mismatch.")
 if set(RUNTIME_INSTALL_FILES) & set(DISTRIBUTION_ONLY_FILES):
     raise RuntimeError("Runtime and distribution-only release files overlap.")
@@ -217,6 +226,13 @@ STANDARD_AGENT_MODEL_CATALOG_SHA256 = (
 EXPECTED_EDITOR_DEPENDENCIES = frozenset((
     "httpx==0.28.1", "imageio-ffmpeg==0.6.0", "Pillow>=12.3.0,<14",
 ))
+REVIEW_MEDIA_SHA256 = {
+    "resources/media-tools/win64/ffmpeg.exe": "b3a2c9930af7512cc657972ab42775fb7b4c9eb99d5b5044ce440a4c87fd7619",
+    "resources/media-tools/win64/ffprobe.exe": "c8b359e523b8b3073b1788bdfb597e8b35443cb87d2d126aced33ec9ba832c06",
+    "resources/media-tools/source/ffmpeg-7.1.5.tar.xz": "de668509caf9e35e3cd162473441fdb29538c6d96ed080292b3cf9e6fc5d558f",
+    "resources/media-tools/source/x264-31e19f92f00c7003fa115047ce50978bc98c3a0d.tar.gz":
+        "d053c9d86988d6bc78237ca5205865c5ddf99c98ef4cd9927eec8f6d388f6dd9",
+}
 PILLOW_DECLARATION_COMMENT = (
     "Declared editor dependency: Pillow>=12.3.0,<14. No Pillow distribution "
     "is bundled; a compatible host-installed version is reused."
@@ -225,6 +241,12 @@ PILLOW_DECLARATION_COMMENT = (
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def verify_review_media_component(relative: str, data: bytes) -> None:
+    expected = REVIEW_MEDIA_SHA256.get(relative)
+    if expected is not None and digest(data) != expected:
+        raise RuntimeError(f"Review media component checksum mismatch: {relative}")
 
 
 def validate_native_editor_patch_sources() -> dict[str, Any]:
@@ -842,6 +864,10 @@ def validate_no_policy_artifacts_in_zip(
                     continue
                 if info.file_size > MAX_NESTED_ARCHIVE_BYTES:
                     raise RuntimeError(f"{label} member is too large: {info.filename}")
+                review_component = PurePosixPath(*member.parts[-4:]).as_posix()
+                if review_component in REVIEW_MEDIA_SHA256:
+                    verify_review_media_component(review_component, archive.read(info))
+                    continue
                 agent_member = _agent_release_member(member)
                 is_bundled_agent_policy = agent_member in BUNDLED_PROJECT_POLICIES
                 if is_bundled_agent_policy:
@@ -996,6 +1022,7 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
         if not path.is_file() or path.is_symlink():
             raise RuntimeError(f"Missing or linked runtime release member: {relative}")
         data = canonical_release_source_data(member, path.read_bytes())
+        verify_review_media_component(relative, data)
         if member in BUNDLED_PROJECT_POLICIES:
             verified = verify_signed_agent_policy_bytes(data, BUNDLED_PROJECT_POLICIES[member])
             if member == BUNDLED_AGENT_POLICY_MEMBER and verified != policy_identity:
@@ -1624,14 +1651,19 @@ def make_archive(
                 f"{ARCHIVE_ROOT}/{relative}",
                 archive_date_time,
             )
-            info.compress_type = zipfile.ZIP_DEFLATED
+            # Upstream tarballs are already compressed. Preserve their exact bytes
+            # without repeating a deflate pass in every release and parity check.
+            if relative.startswith("resources/media-tools/source/"):
+                info.compress_type = zipfile.ZIP_STORED
+            else:
+                info.compress_type = zipfile.ZIP_DEFLATED
             info.create_system = 3
             info.external_attr = REPRODUCIBLE_ZIP_MODE << 16
             archive.writestr(
                 info,
                 data,
-                compress_type=zipfile.ZIP_DEFLATED,
-                compresslevel=9,
+                compress_type=info.compress_type,
+                compresslevel=9 if info.compress_type == zipfile.ZIP_DEFLATED else None,
             )
     return output.getvalue()
 

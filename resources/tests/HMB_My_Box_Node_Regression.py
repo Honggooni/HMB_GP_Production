@@ -124,6 +124,16 @@ class Backend:
             eligibility_scope='source_only',resubmit_allowed=False,reason_code=None if state=='available' else 'my_box_draft_final_'+state)
     def enable_final(self):
         self.capabilities.update(draft_final_detail_supported=True,draft_final_contract=deepcopy(FINAL_CONTRACT))
+    def scoped_projection(self, source):
+        projection = self.projection(source)
+        slots = {}
+        for quality in ('1080p', '4k'):
+            key = 'mbx-final-v2-' + source.removeprefix('job-mybox-') + '-' + quality
+            jobs = [job for job in self.jobs.values() if job['client_request_id'] == key]
+            slot = self.projection(source, 'completed', jobs[0]['job_id'], 'completed') if jobs else self.projection(source)
+            slots[quality] = dict(slot, final_client_request_id=key, eligibility_scope='source_resolution')
+        projection['finals_by_resolution'] = slots
+        return projection
     class Bridge:
         def __init__(self, backend): self.backend=backend; self.server_url=backend.server_url; self._opener=self
         def _load_access_token(self): return 'OFFLINE_FIXTURE_TOKEN'
@@ -175,7 +185,9 @@ class MyBoxNodeTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup); self.folder=Path(self.temporary.name); self.origin=BASE
         environment={name:str(self.folder/name) for name in ('APPDATA','LOCALAPPDATA','XDG_CONFIG_HOME',
             'XDG_DATA_HOME','XDG_STATE_HOME','XDG_CACHE_HOME')}
+        self.media_schedule=mock.Mock()
         self.patches=[mock.patch.dict(os.environ,environment),
+            mock.patch.dict(sys.modules,{'_hmb_client_review_media': SimpleNamespace(schedule_completed_review_media=self.media_schedule)}),
             mock.patch.object(socket,'create_connection',forbidden),
             mock.patch.object(socket.socket,'connect',local_connect),
             mock.patch.object(urllib.request,'urlopen',forbidden),
@@ -547,6 +559,7 @@ class MyBoxNodeTests(unittest.TestCase):
             self.run_node()
         self.assertEqual(len(self.backend.created),1); cp=self.checkpoint()
         self.assertTrue(cp.get('job_id')); self.assertFalse(self.node._execution_succeeded)
+        self.assertEqual(self.media_schedule.call_args.kwargs['local_source'].result(timeout=0),MOV)
         self.run_node(); self.assert_success(); self.assertEqual(len(self.backend.created),1)
         self.assertEqual(self.checkpoint()['job_id'],cp['job_id'])
     def test_original_mov_bytes_publish_atomically_and_preview_keeps_original(self):
@@ -562,15 +575,22 @@ class MyBoxNodeTests(unittest.TestCase):
             running=asyncio.create_task(self.controller().run())
             try:
                 self.assertTrue(await asyncio.to_thread(self.backend.started.wait,3))
+                call=self.media_schedule.call_args
+                self.assertEqual(call.args,(self.backend.bridge,self.checkpoint()['job_id']))
+                self.assertIs(call.kwargs['private'],True)
+                self.assertFalse(call.kwargs['local_source'].done())
                 self.assertEqual(self.node._hmb_generation_preview_state['phase'],'downloading')
                 self.assertNotEqual(self.checkpoint()['stage'],'local_succeeded')
             finally:self.backend.release.set()
             await running
         asyncio.run(exercise()); path=self.assert_success()
+        self.assertEqual(self.media_schedule.call_count,1)
+        self.assertEqual(self.media_schedule.call_args.kwargs['local_source'].result(timeout=0),path)
         self.assertEqual(self.node._hmb_generation_preview_state['phase'],'succeeded')
         self.assertEqual(self.node._hmb_generation_preview_state['media_revision'],self.node._hmb_generation_media_revision)
         task=self.checkpoint()['job_id']; before=self.authored()
         self.run_node(refresh=True)
+        self.assertEqual(self.media_schedule.call_args.kwargs['local_source'].result(timeout=0),path)
         self.assertEqual(self.assert_success(),path)
         self.assertEqual(self.node._hmb_generation_preview_state['phase'],'succeeded')
         reopened=self.reopen()
@@ -581,6 +601,22 @@ class MyBoxNodeTests(unittest.TestCase):
         self.assertEqual(self.authored(reopened),before)
         self.assertEqual(len(self.backend.created),1)
         self.assertEqual(len(self.backend.downloads),1)
+
+    def test_private_media_worker_failure_preserves_success_and_rejects_foreign_workspace(self):
+        self.media_schedule.side_effect=RuntimeError('offline worker unavailable')
+        self.run_node()
+        stored=self.assert_success()
+        cp=self.checkpoint()
+        self.assertEqual(self.media_schedule.call_count,1)
+        self.assertEqual(self.media_schedule.call_args.kwargs['local_source'].result(timeout=0),stored)
+        self.assertEqual(len(self.backend.created),1)
+        broker=SimpleNamespace(_bridge=self.backend.bridge)
+        job=self.backend.jobs[cp['job_id']]
+        for changes in ({'workspace_id':'another-workspace'},{'publish_to_reviews':True},
+                        {'job_id':'job-mybox-'+'f'*32},{'scope':'project'}):
+            with self.subTest(changes=changes), self.controller()._completed_media_claim(cp,broker,{**job,**changes}):
+                self.assertEqual(self.media_schedule.call_count,1)
+        self.assertEqual(stored.read_bytes(),MOV)
     def test_remote_success_is_not_local_preview_success(self):
         controller=self.controller()
         controller._status('succeeded','job-mybox-'+'a'*32)
@@ -836,6 +872,145 @@ class MyBoxNodeTests(unittest.TestCase):
         before=self.authored(); self.run_node(final=True); self.assert_success()
         self.assertEqual(self.checkpoint()['job_id'],child); self.assertEqual(len(self.backend.created),1)
         self.assertEqual(self.authored(),before); self.assertEqual(original.read_bytes(),MOV)
+        ui = self.controller().draft_ui_state()
+        self.assertEqual((ui['source_completed'], ui['job_id'], ui['final_task_id'], ui['final_state']), (True, source, child, 'completed'))
+        self.assertNotIn('final_resolution', ui)  # This client retrieved an external child's result.
+    def test_4k_final_checks_capability_and_preserves_source_and_draft_settings(self):
+        self.backend.enable_final()
+        before = self.authored()
+        self.run_node()
+        preview = self.assert_success()
+        source = self.checkpoint()['job_id']
+        self.run_node(final=True, final_resolution='4k')
+        final = self.assert_success()
+        self.assertNotEqual(preview, final)
+        self.assertEqual(preview.read_bytes(), MOV)
+        self.assertEqual(self.authored(), before)
+        payload = self.backend.created[1]
+        self.assertEqual((payload['draft_job_id'], payload['quality'], payload['resolution']), (source, '4k', '4k'))
+        self.assertEqual(self.backend.features[-1][1]['final_resolution'], '4k')
+        child = self.checkpoint()['job_id']
+        for view in (self.controller(), self.controller(self.reopen())):
+            ui = view.draft_ui_state()
+            self.assertTrue(ui['source_completed'])
+            self.assertFalse(ui['final_available'])
+            self.assertEqual((ui['job_id'], ui['final_task_id'], ui['final_resolution'], ui['final_state']), (source, child, '4k', 'completed'))
+        self.assertEqual(payload['client_request_id'], 'mbx-final-v1-' + source.removeprefix('job-mybox-'))
+        self.run_node(final=True, final_resolution='1080p')
+        self.assertEqual(len(self.backend.created), 2)
+
+    def test_preview_with_id_is_not_a_completed_source_while_pending_or_failed(self):
+        self.backend.enable_final()
+        self.run_node()
+        cp = self.checkpoint()
+        self.assertTrue(self.controller().draft_ui_state()['source_completed'])
+        for stage, status in [('polling', 'running'), ('failed', 'failed')]:
+            with self.subTest(stage=stage), mock.patch.object(self.controller(), 'checkpoint', return_value={**cp, 'stage':stage, 'status':status}):
+                ui = self.controller().draft_ui_state()
+                self.assertFalse(ui['source_completed'])
+                self.assertFalse(ui['final_visible'])
+                self.assertFalse(ui['final_available'])
+
+    def test_4k_final_rejected_before_create_keeps_available_draft(self):
+        self.backend.enable_final()
+        self.run_node()
+        preview = self.assert_success()
+        source = self.checkpoint()['job_id']
+        with mock.patch.object(self.backend.Bridge, 'require_seedance_draft_features',
+                               side_effect=ValueError('4K Draft Final unavailable')):
+            self.run_node(final=True, final_resolution='4k')
+        self.assertEqual(len(self.backend.created), 1)
+        self.assertEqual(self.checkpoint()['job_id'], source)
+        self.assertEqual(preview.read_bytes(), MOV)
+
+    def check_both_private_finals(self, first, second):
+        self.backend.enable_final()
+        self.run_node()
+        preview = self.assert_success()
+        source = self.checkpoint()['job_id']
+        self.backend.jobs[source]['draft_final'] = self.backend.scoped_projection(source)
+        def publish_slots(payload):
+            self.assertEqual(payload['draft_job_id'], source)
+            self.backend.jobs[source]['draft_final'] = self.backend.scoped_projection(source)
+        self.backend.before_create = publish_slots
+        self.run_node(refresh=True)
+        self.run_node(final=True, expected_source_task_id=source, final_resolution=first)
+        first_file = self.assert_success()
+        ui = self.controller().draft_ui_state()
+        self.assertEqual(ui['job_id'], source)
+        self.assertTrue(ui['final_available'])
+        self.assertEqual(ui['finals_by_resolution'], {first: 'completed', second: 'available'})
+        calls_before_reopen = len(self.backend.calls)
+        reopened = self.reopen()
+        self.assertTrue(self.controller(reopened).draft_ui_state()['final_available'])
+        self.assertEqual(len(self.backend.calls), calls_before_reopen)
+        self.run_node(reopened, final=True, expected_source_task_id=source, final_resolution=first)
+        self.assertEqual(len(self.backend.created), 2)
+        self.run_node(reopened, final=True, expected_source_task_id=source, final_resolution=second)
+        second_file = self.assert_success(reopened)
+        self.assertEqual(len(self.backend.created), 3)
+        self.assertEqual(len({preview, first_file, second_file}), 3)
+        cp = self.checkpoint(reopened)
+        self.assertEqual(set(cp['draft_outputs']), {'480p', first, second})
+        for quality, path in [('480p', preview), (first, first_file), (second, second_file)]:
+            receipt = cp['draft_outputs'][quality]
+            self.assertEqual(Path(receipt['output_file']), path)
+            self.assertEqual(receipt['saved_file_sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
+        ids = [row['client_request_id'] for row in self.backend.created[1:]]
+        self.assertEqual(ids, ['mbx-final-v2-'+source.removeprefix('job-mybox-')+'-'+q for q in (first,second)])
+        self.assertFalse(self.controller(reopened).draft_ui_state()['final_available'])
+        self.run_node(reopened, final=True, expected_source_task_id=source, final_resolution=second)
+        self.assertEqual(len(self.backend.created), 3)
+
+    def test_private_draft_1080p_then_4k_persists_outputs_after_reopen(self):
+        self.check_both_private_finals('1080p', '4k')
+
+    def test_private_draft_4k_then_1080p_persists_outputs_after_reopen(self):
+        self.check_both_private_finals('4k', '1080p')
+
+    def test_private_scoped_slot_cannot_use_foreign_key_or_unresolved_peer(self):
+        self.backend.enable_final()
+        self.run_node()
+        source = self.checkpoint()['job_id']
+        for invalid in ('wrong_key', 'running', 'missing'):
+            with self.subTest(invalid=invalid):
+                state = self.backend.scoped_projection(source)
+                slots = state['finals_by_resolution']
+                if invalid == 'wrong_key':
+                    slots['4k']['final_client_request_id'] = slots['1080p']['final_client_request_id']
+                elif invalid == 'missing':
+                    del slots['1080p']
+                else:
+                    slots['1080p'].update(state='running', eligible=False, child_status='running', child_task_id='job-mybox-'+'c'*32,
+                        reason_code='my_box_draft_final_running')
+                self.backend.jobs[source]['draft_final'] = state
+                self.run_node(final=True, expected_source_task_id=source, final_resolution='4k')
+                self.assertEqual(len(self.backend.created), 1)
+
+    def test_scoped_private_final_lost_response_recovers_prior_task_before_other_target(self):
+        self.backend.enable_final()
+        self.run_node()
+        source = self.checkpoint()['job_id']
+        self.backend.jobs[source]['draft_final'] = self.backend.scoped_projection(source)
+        def update_projection(payload):
+            self.backend.jobs[source]['draft_final'] = self.backend.scoped_projection(source)
+        self.backend.before_create = update_projection
+        self.backend.create_error = protocol.MyBoxError('Synthetic lost create', submission_outcome_unknown=True)
+        self.run_node(final=True, expected_source_task_id=source, final_resolution='1080p')
+        pending_key = self.checkpoint()['client_request_id']
+        self.assertEqual(self.checkpoint()['status'], 'submission_unknown')
+        self.assertFalse(self.controller().draft_ui_state()['final_available'])
+        self.backend.create_error = None
+        reopened = self.reopen()
+        self.run_node(reopened, final=True, expected_source_task_id=source, final_resolution='4k')
+        self.assert_success(reopened)
+        self.assertEqual(self.checkpoint(reopened)['client_request_id'], pending_key)
+        self.assertEqual(len(self.backend.created), 2)  # Restored the first Final; a new click is required.
+        self.backend.jobs[source]['draft_final']['finals_by_resolution']['1080p'] = self.backend.scoped_projection(source)['finals_by_resolution']['4k'].copy()
+        self.backend.jobs[source]['draft_final']['finals_by_resolution']['1080p']['final_client_request_id'] = pending_key
+        self.run_node(reopened, final=True, expected_source_task_id=source, final_resolution='4k')
+        self.assertEqual(len(self.backend.created), 2)  # Fresh source detail lost a durably confirmed child.
+        self.assertIn('1080p', self.checkpoint(reopened)['draft_outputs'])
     def test_expired_or_reserved_failed_child_cannot_submit_replacement_final(self):
         self.backend.enable_final(); self.run_node(); self.assert_success(); source=self.checkpoint()['job_id']
         self.backend.jobs[source]['draft_final']=self.backend.projection(source,'expired')
@@ -1001,7 +1176,7 @@ class MyBoxNodeTests(unittest.TestCase):
                 self.assertIsNot(second,first)
                 await asyncio.wrap_future(second)
                 for _ in range(4):await asyncio.sleep(0)
-                run.assert_awaited_once_with(final=True,expected_source_task_id=source)
+                run.assert_awaited_once_with(final=True,expected_source_task_id=source,final_resolution='1080p')
                 self.assertFalse(self.node._hmb_draft_finalize_pending)
         asyncio.run(scenario())
         self.assertEqual(self.authored(),before); self.assertEqual(self.checkpoint(),checkpoint)

@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
+from concurrent.futures import Future
+from contextlib import ExitStack, suppress
 from copy import deepcopy
 import hashlib
 import json
@@ -29,7 +30,11 @@ _JOURNAL_ID = re.compile(r"[a-f0-9]{32}\Z")
 _SHA = re.compile(r"[a-f0-9]{64}\Z")
 _STAGES = frozenset(("prepared", "submitting", "polling", "remote_completed", "local_succeeded", "failed", "not_submitted", "interrupted"))
 _STATUSES = protocol.JOB_ACTIVE_STATUSES | protocol.JOB_SUCCESS_STATUSES | protocol.JOB_FAILURE_STATUSES | {"not_submitted", "cancelled_locally", "timed_out"}
-_FIELDS = frozenset(("schema", "version", "journal_id", "revision", "selection", "broker_server_url", "client_request_id", "job_id", "stage", "status", "model_id", "task", "output_format", "output_file", "saved_file_sha256", "request_fingerprint", "updated_at_ms", "draft_preview", "draft_source_task_id", "draft_source", "draft_final", "reference_lease_id", "queue_only_headers"))
+_FIELDS = frozenset(("schema", "version", "journal_id", "revision", "selection", "broker_server_url", "client_request_id", "job_id", "stage", "status", "model_id", "task", "output_format", "output_file", "saved_file_sha256", "request_fingerprint", "updated_at_ms", "draft_preview", "draft_source_task_id", "draft_source", "draft_final", "draft_final_resolution", "draft_outputs", "reference_lease_id", "queue_only_headers"))
+
+
+def _preview_task_id(cp: dict[str, Any]) -> str:
+    return cp.get("job_id", "") if cp.get("draft_preview") else cp.get("draft_source_task_id", "")
 
 
 def _host(node: Any) -> Any:
@@ -101,13 +106,33 @@ def normalize_checkpoint(raw: Any) -> dict[str, Any]:
             raise ValueError("The private My Box Draft recovery record is invalid.")
         value = raw.get(field, {})
         allowed = {"schema", "version", "state", "eligible", "source_task_id", "child_task_id", "child_status", "expires_at", "expiry_basis", "workspace_id", "selection", "final_client_request_id", "eligibility_scope", "resubmit_allowed", "reason_code"}
-        if set(value) - allowed or any(isinstance(v, (dict, list)) for k, v in value.items() if k != "selection"):
+        if set(value) - allowed - {"finals_by_resolution"} or any(isinstance(v, (dict, list)) for k, v in value.items() if k not in {"selection", "finals_by_resolution"}):
             raise ValueError("The private My Box recovery record contains unsupported Draft data.")
         if value:
             if value.get("workspace_id") != raw["selection"]["workspace_id"] or protocol.normalize_selection(value.get("selection")) != raw["selection"]:
                 raise ValueError("The private Draft workspace changed.")
+            if "finals_by_resolution" in value:
+                normalized = protocol.normalize_draft_final_projection(value, source_task_id=_preview_task_id(raw), workspace_id=raw["selection"]["workspace_id"])
+                if normalized != value:
+                    raise ValueError("The private Draft checkpoint contains unexpected target fields.")
     if type(raw.get("draft_preview")) is not bool:
         raise ValueError("The private Draft flag is invalid.")
+    if "draft_final_resolution" in raw and (raw["draft_final_resolution"] not in ("1080p", "4k")
+            or raw["draft_preview"] or not raw.get("draft_source_task_id")):
+        raise ValueError("The private Draft Final resolution is invalid.")
+    outputs = raw.get("draft_outputs", {})
+    if not isinstance(outputs, dict) or set(outputs) - {"480p", "1080p", "4k"}:
+        raise ValueError("The private Draft output history is invalid.")
+    for quality, output in outputs.items():
+        if (not isinstance(output, dict) or set(output) != {"job_id", "client_request_id", "output_file", "saved_file_sha256"}
+                or not isinstance(output["job_id"], str) or not protocol.TASK_ID.fullmatch(output["job_id"])
+                or (quality == "480p") != (output["job_id"] == _preview_task_id(raw))
+                or not isinstance(output["client_request_id"], str) or not protocol.IDENTIFIER.fullmatch(output["client_request_id"])
+                or not isinstance(output["output_file"], str) or not output["output_file"] or len(output["output_file"]) > 4096
+                or not isinstance(output["saved_file_sha256"], str) or not _SHA.fullmatch(output["saved_file_sha256"])):
+            raise ValueError("The private Draft output identity is invalid.")
+    if len({output["job_id"] for output in outputs.values()}) != len(outputs):
+        raise ValueError("The private Draft has conflicting output identities.")
     if raw.get("reference_lease_id") and reference_leases.lease_id(raw["reference_lease_id"]) != raw["reference_lease_id"]:
         raise ValueError("The private reference lease identity is invalid.")
     encoded = json.dumps(raw, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
@@ -144,7 +169,7 @@ class MyBoxController:
         self._post_started = False
         self._capabilities = None
         self._pending: set[asyncio.Task[Any]] = set()
-        self._active_final_source = ""
+        self._active_final_resolution = ""
         self._owner_journal_id = ""
         self._projection_checked_at = 0.0
         self._restore_future = None
@@ -356,7 +381,7 @@ class MyBoxController:
         node, m = self.node, _host(self.node)
         if final_source:
             return {"provider": "volcengine_ark", "model": params["model_id"], "hmb_generation_task": final_source["task"],
-                "draft_job_id": final_source["job_id"], "quality": "1080p", "resolution": "1080p", "output_format": params["output_format"]}
+                "draft_job_id": final_source["job_id"], "quality": params["resolution"], "resolution": params["resolution"], "output_format": params["output_format"]}
         source_id = params.get("_private_source_id", "")
         deferred_source = ""
         if source_id:
@@ -451,6 +476,9 @@ class MyBoxController:
     async def _adopt(self, cp: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
         if job["model"] != cp["model_id"] or job.get("task") != cp["task"]:
             raise protocol.MyBoxError("My Box result changed the submitted model or task.", code="MY_BOX_IDENTITY_MISMATCH")
+        if (cp.get("draft_source", {}).get("finals_by_resolution") and cp.get("draft_source_task_id")
+                and job.get("draft_parent_task_id") != cp["draft_source_task_id"]):
+            raise protocol.MyBoxError("Private Final belongs to a different Draft.", code="MY_BOX_IDENTITY_MISMATCH")
         await self.node._run_blocking_generation_stage(self._observe_reference_job, cp, job)
         cp = {**cp, "job_id": job["job_id"], "status": job["status"],
               "stage": "remote_completed" if job["status"] == "completed" else "failed" if job["status"] == "failed" else "polling"}
@@ -464,36 +492,54 @@ class MyBoxController:
             requested_id=cp.get("job_id") or cp["client_request_id"],
             identifier=cp.get("reference_lease_id", ""), private_scope=True)
 
-    async def _complete(self, cp: dict[str, Any], broker: Any, job: dict[str, Any], *, epoch: int, origin: str) -> dict[str, Any]:
+    def _completed_media_claim(self, cp: dict[str, Any], broker: Any, job: dict[str, Any]):
+        workspace = cp.get("selection", {}).get("workspace_id")
+        authorized = (workspace and job.get("status") == "completed" and job.get("scope") == protocol.SCOPE
+            and job.get("publish_to_reviews") is False and job.get("workspace_id") == workspace
+            and job.get("job_id") == cp.get("job_id"))
+        return _host(self.node)._completed_review_source(getattr(broker, "_bridge", None) if authorized else None,
+            job.get("job_id"), private=True)
+
+    async def _complete(self, cp: dict[str, Any], broker: Any, job: dict[str, Any], *, epoch: int, origin: str,
+                        review_source: Future) -> dict[str, Any]:
         node, m = self.node, _host(self.node)
         self._guard(epoch, origin)
         self._status("downloading", job["job_id"])
         data = await asyncio.to_thread(broker.download_result, job, is_alive=lambda: self._alive(epoch, origin), timeout=300)
         self._guard(epoch, origin)
-        self._status("verifying", job["job_id"])
-        destination = m._SeedanceDraftOutputDestination(cp["output_file"])
-        digest = hashlib.sha256(data).hexdigest()
-        def same_file() -> bool:
-            path = Path(cp["output_file"])
-            return path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == digest
-        cancelled = False
-        if await asyncio.to_thread(same_file):
-            saved = m.File(cp["output_file"])
-        else:
-            publication = asyncio.create_task(node._atomic_publish_completed_video(destination, data, cp["output_format"]))
-            while True:
-                try:
-                    saved = await asyncio.shield(publication)
-                    break
-                except asyncio.CancelledError:
-                    # A filesystem commit can have won the cancellation race.
-                    # Observe its outcome before deciding whether this paid Task
-                    # still requires publication; never report saved bytes lost.
-                    cancelled = True
-                    if publication.done() and publication.cancelled():
-                        raise
+        try:
+            self._status("verifying", job["job_id"])
+            destination = m._SeedanceDraftOutputDestination(cp["output_file"])
+            digest = hashlib.sha256(data).hexdigest()
+            def same_file() -> bool:
+                path = Path(cp["output_file"])
+                return path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == digest
+            if await asyncio.to_thread(same_file):
+                saved = m.File(cp["output_file"])
+            else:
+                publication = asyncio.create_task(node._atomic_publish_completed_video(destination, data, cp["output_format"]))
+                while True:
+                    try:
+                        saved = await asyncio.shield(publication)
+                        break
+                    except asyncio.CancelledError:
+                        # A filesystem commit can have won the cancellation race.
+                        # Observe its outcome before deciding whether this paid Task
+                        # still requires publication; never report saved bytes lost.
+                        if publication.done() and publication.cancelled():
+                            raise
+        except Exception:
+            if self._alive(epoch, origin):
+                review_source.set_result(data)
+            raise
+        if self._alive(epoch, origin):
+            review_source.set_result(m._published_review_original(saved, data))
         path = str(saved.location)
         cp = {**cp, "stage": "local_succeeded", "status": "completed", "output_file": path, "saved_file_sha256": digest}
+        quality = "480p" if cp.get("draft_preview") else cp.get("draft_final_resolution")
+        if quality:
+            receipt = {key: cp[key] for key in ("job_id", "client_request_id", "output_file", "saved_file_sha256")}
+            cp["draft_outputs"] = {**cp.get("draft_outputs", {}), quality: receipt}
         # Persist local success before optional UI hooks. A UI notification cannot
         # erase a completed paid render or cause another create on a fresh Run.
         cp = await self._persist(cp, required=False)
@@ -501,15 +547,9 @@ class MyBoxController:
             return cp
         with suppress(Exception):
             self._publish_local(cp)
-        if cp.get("draft_preview"):
+        if cp.get("draft_preview") or cp.get("draft_source", {}).get("finals_by_resolution"):
             with suppress(Exception):
-                detail = await asyncio.to_thread(broker.detail, cp["job_id"], selection=cp["selection"])
-                parser = getattr(protocol, "parse_draft_final_state", None)
-                projection = parser(detail) if callable(parser) else None
-                if projection is not None:
-                    self._guard(epoch, origin)
-                    cp = await self._persist({**cp, "draft_final": projection}, required=False)
-                    self._projection_checked_at = time.monotonic()
+                cp, _ = await self._final_source(broker, cp)
         self._guard(epoch, origin)
         with suppress(Exception):
             self._status("succeeded", cp["job_id"], successful=True,
@@ -546,14 +586,32 @@ class MyBoxController:
         return True
 
     async def _final_source(self, broker: Any, cp: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        if not cp or not cp.get("draft_preview") or not cp.get("job_id"):
+        parent = _preview_task_id(cp)
+        if not parent:
             raise ValueError("Complete this My Box 480p Draft before finalizing.")
-        detail = await asyncio.to_thread(broker.detail, cp["job_id"], selection=cp["selection"])
+        self._projection_checked_at = 0.0
+        detail = await asyncio.to_thread(broker.detail, parent, selection=cp["selection"])
         self._guard(self._run_epoch, self._run_origin)
         parser = getattr(protocol, "parse_draft_final_state", None)
         projection = parser(detail) if callable(parser) else None
         if not getattr(self._capabilities, "draft_final_detail_supported", False) or projection is None:
             raise ValueError("This Broker has not advertised private Draft Final state. No Final was submitted.")
+        if detail.get("status") != "completed" or detail.get("model") != cp["model_id"] or detail.get("task") != cp["task"]:
+            raise ValueError("Wait for this private Draft to complete before finalizing.")
+        if slots := projection.get("finals_by_resolution"):
+            known = {quality: receipt["job_id"] for quality, receipt in cp.get("draft_outputs", {}).items() if quality in slots}
+            for quality, old in cp.get("draft_final", {}).get("finals_by_resolution", {}).items():
+                if old.get("child_task_id"):
+                    known.setdefault(quality, old["child_task_id"])
+            if cp.get("draft_final_resolution") and cp.get("job_id"):
+                known[cp["draft_final_resolution"]] = cp["job_id"]
+            if any(slots[quality].get("child_task_id") != job_id for quality, job_id in known.items()):
+                raise ValueError("The private Draft Final reservation changed. Retrieve the same Task.")
+            scoped_children = {slot.get("child_task_id") for slot in slots.values()}
+            prior_child = cp.get("draft_final", {}).get("child_task_id")
+            if ((prior_child and prior_child not in scoped_children) or (
+                    not cp.get("draft_preview") and not cp.get("draft_final_resolution") and cp.get("job_id") not in scoped_children)):
+                raise ValueError("The prior private Final resolution is unconfirmed. Refresh this Draft first.")
         cp = await self._persist({**cp, "draft_final": projection}, required=False)
         self._projection_checked_at = time.monotonic()
         return cp, projection
@@ -572,22 +630,26 @@ class MyBoxController:
                 self._restore_future = asyncio.run_coroutine_threadsafe(self._reuse_local(cp, epoch=epoch, origin=origin), loop)
                 self._restore_future.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
 
-    def schedule_final(self, details: Any, expected_task_id: str) -> Any:
+    def schedule_final(self, details: Any, expected_task_id: str, *, final_resolution: str = "1080p") -> Any:
         m, node = _host(self.node), self.node
         reserved_here = False
         dispatched = False
-        dispatch = {"started": False}
+        dispatch = {"started": False, "resolution": final_resolution}
         def release() -> None:
             with node._generation_refresh_lock:
                 if self._final_dispatch is dispatch:
                     self._final_dispatch = None
                     node._hmb_draft_finalize_pending = False
         try:
+            if final_resolution not in m.DRAFT_FINAL_RESOLUTIONS:
+                raise ValueError("Choose a supported private Draft Final resolution.")
             if not node._runtime_node_is_live(require_registered=True):
                 raise ValueError("The private Generator is inactive.")
             node._assert_draft_final_flow_idle()
             cp = self.checkpoint()
-            if not is_selected(node) or cp.get("job_id") != expected_task_id or not self.draft_ui_state()["final_available"]:
+            ui = self.draft_ui_state()
+            if (not is_selected(node) or _preview_task_id(cp) != expected_task_id or not ui["final_available"]
+                    or ui.get("finals_by_resolution", {}).get(final_resolution, "available") != "available"):
                 raise ValueError("Refresh this private Draft before finalizing; its identity or availability changed.")
             loop = getattr(m.GriptapeNodes.EventManager(), "event_loop", None)
             if loop is None or not loop.is_running():
@@ -611,9 +673,9 @@ class MyBoxController:
                     dispatch["started"] = True
                 try:
                     self._guard(expected_epoch, expected_origin)
-                    if self.checkpoint().get("job_id") != expected_task_id:
+                    if _preview_task_id(self.checkpoint()) != expected_task_id:
                         raise ValueError("The private Draft changed before Final began; no video was submitted.")
-                    await self.run(final=True, expected_source_task_id=expected_task_id)
+                    await self.run(final=True, expected_source_task_id=expected_task_id, final_resolution=final_resolution)
                 finally:
                     release()
                     with suppress(Exception):
@@ -650,26 +712,60 @@ class MyBoxController:
             cp = self.checkpoint()
             projection = cp.get("draft_final", {}) if cp else {}
             caps = self._capabilities
+            selected_final = self._active_final_resolution or (self._final_dispatch or {}).get("resolution")
             supported = str(node.get_parameter_value("model_id")) in {m.SEEDANCE_2_5_MODEL_ID, m.MODEL_NAME_SEEDANCE_2_5}
-            available = bool(supported and projection.get("eligible") is True and projection.get("state") == "available"
-                and not projection.get("child_task_id") and type(projection.get("expires_at")) is int
-                and time.time() < projection["expires_at"] and self._projection_checked_at > 0
-                and time.monotonic() - self._projection_checked_at <= 30
-                and getattr(caps, "implemented", False) and (
-                    (getattr(caps, "enabled", False) and getattr(caps, "generation_enabled", False) and not getattr(caps, "reason_code", ""))
+            parent_id = cp.get("draft_source_task_id", "")
+            child_of_draft = bool(parent_id and not cp.get("draft_preview") and cp.get("draft_source", {}).get("source_task_id") == parent_id)
+            preview_completed = bool(cp.get("draft_preview") and cp.get("job_id") and cp.get("status") == "completed"
+                and cp.get("stage") in {"remote_completed", "local_succeeded"})
+            source_completed = bool(supported and cp.get("model_id") == m.SEEDANCE_2_5_MODEL_ID and (preview_completed or child_of_draft)
+                and cp.get("broker_server_url") == node._selected_broker_server_url())
+            state = projection.get("state", "unavailable")
+            child_id = projection.get("child_task_id", "")
+            slots = projection.get("finals_by_resolution", {})
+            states = {quality: slot["state"] for quality, slot in slots.items()}
+            for quality in states.keys() & cp.get("draft_outputs", {}).keys():
+                states[quality] = "completed"
+            if child_of_draft:
+                child_id = cp.get("job_id", "")
+                state = {"completed": "completed", "submitting": "reserved", "pending": "running", "running": "running",
+                         "downloading": "running", "failed": "consumed"}.get(cp.get("status"), "unknown")
+                quality = cp.get("draft_final_resolution")
+                if quality in states and cp.get("stage") != "not_submitted":
+                    states[quality] = state
+            if slots:
+                can_select = ("available" in states.values()
+                    and not any(value in {"reserved", "running", "unknown", "consumed"} for value in states.values())
+                    and projection["state"] not in {"expired", "not_draft", "running", "reserved"}
+                    and (preview_completed or child_of_draft and cp.get("stage") == "local_succeeded"))
+            else:
+                can_select = preview_completed and projection.get("eligible") is True and state == "available" and not child_id
+            checked_this_session = (self._projection_checked_at > 0 and (slots or time.monotonic() - self._projection_checked_at <= 30))
+            workspace = getattr(caps, "workspace", None)
+            known_admission = (checked_this_session and getattr(caps, "implemented", False)
+                and (workspace is None or workspace["workspace_id"] == cp.get("selection", {}).get("workspace_id"))
+                and ((caps.enabled and caps.generation_enabled and not caps.reason_code)
                     or "draft_final" in getattr(getattr(caps, "_queue_admission", None), "operations", ()))
-                and getattr(caps, "draft_final_detail_supported", False) and not self._busy)
+                and caps.draft_final_detail_supported)
+            # Saved slots enable an explicit recheck on reopen. run() fetches
+            # credentials, workspace, detail, and target eligibility again before POST.
+            can_recheck_saved = slots and caps is None and cp.get("stage") == "local_succeeded"
+            available = bool(source_completed and can_select and type(projection.get("expires_at")) is int
+                and time.time() < projection["expires_at"] and (known_admission or can_recheck_saved) and not self._busy)
             return m._seedance_draft_ui_value({"visible": supported
-                and (node.get_parameter_value("resolution") == "480p" or bool(cp and cp.get("draft_preview"))),
+                and (node.get_parameter_value("resolution") == "480p" or bool(cp.get("draft_preview")) or source_completed),
                 "action": node.get_parameter_value("draft_action"), "preview_available": not self._busy and node.get_parameter_value("resolution") == "480p",
-                "final_available": available, "job_id": cp.get("job_id", "") if cp.get("draft_preview") else "",
-                "effective_resolution": "1080p" if self._active_final_source else node.get_parameter_value("resolution"),
-                "busy": self._busy, "final_busy": bool(self._busy and self._active_final_source), "cancel_available": False,
-                "final_state": projection.get("state", "unavailable"), "final_visible": bool(supported and cp.get("draft_preview") and projection.get("state") not in {"completed", "expired", "not_draft"}),
-                "final_task_id": projection.get("child_task_id", ""), "reason": "" if available else "Refresh this My Box Task to check private Draft Final availability."})
+                "final_available": available, "job_id": parent_id if child_of_draft else cp.get("job_id", "") if cp.get("draft_preview") else "",
+                "source_completed": source_completed, "final_resolution": selected_final or cp.get("draft_final_resolution"),
+                "active_action": m.DRAFT_ACTION_FINAL if selected_final else "",
+                "effective_resolution": selected_final or node.get_parameter_value("resolution"),
+                "busy": self._busy or bool(selected_final), "final_busy": bool(selected_final), "cancel_available": False,
+                "final_state": state, "final_visible": bool(source_completed and (slots or state not in {"completed", "consumed", "expired", "not_draft"})),
+                **({"finals_by_resolution": states} if slots else {}),
+                "final_task_id": child_id, "reason": "" if available else "Refresh this My Box Task to check private Draft Final availability."})
         return m._seedance_draft_ui_value()
 
-    async def run(self, *, refresh: bool = False, final: bool = False, expected_source_task_id: str = "") -> None:
+    async def run(self, *, refresh: bool = False, final: bool = False, expected_source_task_id: str = "", final_resolution: str = "1080p") -> None:
         if not self._lock.acquire(blocking=False):
             return
         self._busy, self._post_started = True, False
@@ -682,7 +778,11 @@ class MyBoxController:
         historical_unresolved = False
         submitted_this_run = False
         completion_attempted = False
+        review_claim = ExitStack()
+        review_source = None
         try:
+            if final and final_resolution not in _host(self.node).DRAFT_FINAL_RESOLUTIONS:
+                raise ValueError("Choose a supported private Draft Final resolution.")
             if not is_selected(self.node):
                 raise ValueError("Select Only and My Box to retrieve this private Task; no production request was sent.")
             cp = self.checkpoint()
@@ -710,7 +810,7 @@ class MyBoxController:
                     destination_error = exc
             cp = await self._recover_checkpoint(cp)
             historical_unresolved = bool(cp and cp["stage"] not in {"local_succeeded", "failed", "not_submitted"})
-            if expected_source_task_id and (not final or cp.get("job_id") != expected_source_task_id):
+            if expected_source_task_id and (not final or _preview_task_id(cp) != expected_source_task_id):
                 raise ValueError("The private Draft source changed; no Final was submitted.")
             if resume and (not cp or resume not in {cp.get("job_id"), cp.get("client_request_id")}):
                 raise ValueError("Resume Task ID does not match this Generator's private My Box checkpoint. No render was submitted.")
@@ -739,8 +839,12 @@ class MyBoxController:
                 job = await asyncio.to_thread(broker.refresh, cp.get("job_id") or cp["client_request_id"], selection=cp["selection"], client_request_id=cp["client_request_id"], timeout=300)
                 self._guard(epoch, origin)
                 await self.node._run_blocking_generation_stage(self._observe_reference_job, cp, job)
+                if job["status"] == "completed" and cp.get("job_id") == job.get("job_id"):
+                    review_source = review_claim.enter_context(self._completed_media_claim(cp, broker, job))
                 if job["status"] == "completed" and await self._reuse_local(cp, epoch=epoch, origin=origin):
-                    if cp.get("draft_preview"):
+                    if review_source is not None and self._alive(epoch, origin):
+                        review_source.set_result(Path(cp["output_file"]))
+                    if _preview_task_id(cp):
                         with suppress(Exception):
                             await self._final_source(broker, cp)
                     return
@@ -750,17 +854,29 @@ class MyBoxController:
             else:
                 projection = None
                 if final:
-                    cp, projection = await self._final_source(broker, cp)
+                    cp, source_projection = await self._final_source(broker, cp)
                     self._guard(epoch, origin)
+                    parent_id = _preview_task_id(cp)
+                    if not cp.get("draft_preview"):
+                        if not source_projection.get("finals_by_resolution") or cp["stage"] != "local_succeeded":
+                            raise ValueError("This private Broker has no available independent Final for this Draft.")
+                    if final_resolution in cp.get("draft_outputs", {}) or (
+                        not cp.get("draft_preview") and cp.get("draft_final_resolution") == final_resolution
+                    ):
+                        raise ValueError("This private Draft already has a saved Final at this resolution.")
+                    projection = protocol.draft_final_target(source_projection, final_resolution)
                     child = projection.get("child_task_id")
                     if child:
                         job = await asyncio.to_thread(broker.detail, child, selection=cp["selection"])
                         self._guard(epoch, origin)
-                        if job.get("draft_parent_task_id") != cp["job_id"]:
+                        if job.get("draft_parent_task_id") != parent_id or (
+                                source_projection.get("finals_by_resolution") and job["client_request_id"] != projection["final_client_request_id"]):
                             raise ValueError("The private Final child does not match this source Draft. No new render was submitted.")
                         cp = {**cp, "job_id": child, "client_request_id": job["client_request_id"], "draft_preview": False,
-                            "draft_source_task_id": projection["source_task_id"], "draft_source": deepcopy(projection), "draft_final": {},
+                            "draft_source_task_id": parent_id, "draft_source": source_projection, "draft_final": source_projection,
                             "output_file": str(Path(cp["output_file"]).with_name(Path(cp["output_file"]).stem + "-final-" + child + "." + cp["output_format"]))}
+                        if source_projection.get("finals_by_resolution"):
+                            cp["draft_final_resolution"] = final_resolution
                         cp = await self._adopt(cp, job)
                         params = {"generation_timeout_seconds": int(self.node.get_parameter_value("generation_timeout_seconds") or 3600), "poll_interval_seconds": int(self.node.get_parameter_value("poll_interval_seconds") or 30)}
                     elif (not projection.get("eligible") or projection.get("state") != "available"
@@ -778,10 +894,10 @@ class MyBoxController:
                         self._validate_snapshot(params, frozen_title, frozen_source)
                         if destination_error is not None:
                             raise destination_error
-                    source_cp = deepcopy(cp) if final else None
+                    source_cp = {**cp, "job_id": parent_id} if final else None
                     if final:
-                        self._active_final_source = source_cp["job_id"]
-                        params.update(model_id=source_cp["model_id"], resolution="1080p", output_format=source_cp["output_format"], task=source_cp["task"], return_last_frame=False)
+                        self._active_final_resolution = final_resolution
+                        params.update(model_id=source_cp["model_id"], resolution=final_resolution, output_format=source_cp["output_format"], task=source_cp["task"], return_last_frame=False)
                         client_id = projection.get("final_client_request_id") or "mbx-final-v1-" + source_cp["job_id"].removeprefix("job-mybox-")
                         selection = source_cp["selection"]
                     else:
@@ -797,7 +913,8 @@ class MyBoxController:
                     # Capability checks are read-only; never call production create.
                     bridge = broker._bridge
                     if params.get("_private_draft_preview") or final:
-                        params["output_format"] = await asyncio.to_thread(bridge.require_seedance_draft_features, output_format=params["output_format"], allow_output_fallback=True)
+                        params["output_format"] = await asyncio.to_thread(bridge.require_seedance_draft_features,
+                            output_format=params["output_format"], allow_output_fallback=True, final_resolution=final_resolution if final else None)
                     else:
                         params["output_format"] = await asyncio.to_thread(bridge.require_seedance_features,
                             model_id=params["model_id"], task=params["task"], output_format=params["output_format"], return_last_frame=False, allow_output_fallback=True)
@@ -814,7 +931,10 @@ class MyBoxController:
                         "broker_server_url": origin, "client_request_id": client_id, "job_id": "", "stage": "prepared", "status": "submitting",
                         "model_id": params["model_id"], "task": params["task"], "output_format": params["output_format"], "output_file": path,
                         "saved_file_sha256": "", "request_fingerprint": hashlib.sha256(invocation._payload_json.encode()).hexdigest(), "updated_at_ms": int(time.time() * 1000),
-                        "draft_preview": bool(params.get("_private_draft_preview")), "draft_source_task_id": source_cp["job_id"] if source_cp else "", "draft_source": deepcopy(projection or {}), "draft_final": {}}
+                        "draft_preview": bool(params.get("_private_draft_preview")), "draft_source_task_id": source_cp["job_id"] if source_cp else "", "draft_source": source_projection if final else {}, "draft_final": source_projection if final else {}}
+                    if final:
+                        cp["draft_final_resolution"] = params["resolution"]
+                        cp["draft_outputs"] = deepcopy(source_cp.get("draft_outputs", {}))
                     if self._capabilities._queue_admission is not None:
                         cp["queue_only_headers"] = json.loads(invocation._queue_headers_json)
                     cp["reference_lease_id"] = await self.node._run_blocking_generation_stage(
@@ -840,10 +960,15 @@ class MyBoxController:
                 cp = await self._adopt(cp, job)
             if job["status"] == "completed":
                 completion_attempted = True
-                cp = await self._complete(cp, broker, job, epoch=epoch, origin=origin)
+                if review_source is None:
+                    review_source = review_claim.enter_context(self._completed_media_claim(cp, broker, job))
+                cp = await self._complete(cp, broker, job, epoch=epoch, origin=origin, review_source=review_source)
             else:
                 self._status("failed", cp.get("job_id", ""), successful=False, details="FAILURE: My Box Task failed. The saved Task and previous local video are retained.")
         except (Exception, asyncio.CancelledError) as exc:
+            if (review_source is not None and not review_source.done() and self._alive(epoch, origin)
+                    and not isinstance(exc, asyncio.CancelledError)):
+                review_source.set_result(None)
             if not self._deleted and not getattr(self.node, "_hmb_node_deleted", False):
                 with suppress(Exception):
                     current = self.checkpoint()
@@ -873,7 +998,8 @@ class MyBoxController:
             if isinstance(exc, asyncio.CancelledError):
                 raise
         finally:
-            self._active_final_source = ""
+            review_claim.close()
+            self._active_final_resolution = ""
             self._busy = False
             self._lock.release()
             with suppress(Exception):

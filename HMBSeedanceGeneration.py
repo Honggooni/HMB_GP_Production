@@ -26,7 +26,8 @@ import urllib.request
 import webbrowser
 import weakref
 from collections.abc import Iterator
-from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
+from concurrent.futures import Future
+from contextlib import ExitStack, asynccontextmanager, contextmanager, nullcontext, suppress
 from copy import copy, deepcopy
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -108,6 +109,36 @@ def _write_generation_sidecar(file_path: Path, metadata: Any, *, workflow: Any =
 
 def _generation_file(path: str | MacroPath, workflow: Any) -> File:
     return File(path, workflow=workflow) if workflow is not None else File(path)
+
+
+@contextmanager
+def _completed_review_source(bridge: Any, task_id: str, *, private: bool = False) -> Iterator[Future]:
+    """Claim during the foreground fetch. Only its owner supplies bytes, a verified path or a failed fetch."""
+    source = Future()
+    if bridge is not None and isinstance(task_id, str) and re.fullmatch(
+            r"job-mybox-[a-f0-9]{32}" if private else r"job-[a-f0-9]{32}", task_id):
+        try:
+            from _hmb_client_review_media import schedule_completed_review_media
+            schedule_completed_review_media(bridge, task_id, local_source=source, private=private)
+        except Exception as exc:
+            logger.warning("Optional completed-video review media was not scheduled (%s).", type(exc).__name__)
+    try:
+        yield source
+    finally:
+        if not source.done():
+            source.cancel()  # Node deleted, selection changed or foreground operation cancelled.
+
+
+def _published_review_original(saved: Any, downloaded: bytes) -> Path | bytes:
+    """Use the existing original on disk when the host can resolve its destination."""
+    with suppress(Exception):
+        location = Path(str(saved.location))
+        if not location.is_absolute():
+            resolved = saved.resolve()
+            location = Path(str(getattr(resolved, "location", resolved)))
+        if location.is_absolute():
+            return location
+    return downloaded
 
 
 async def _write_generation_png_stage(path: Path, content: bytes, workflow: Any = None) -> Path:
@@ -398,6 +429,7 @@ BROKER_SEEDANCE_DRAFT_CAPABILITIES_VERSION = 3
 DRAFT_ACTION_OFF = "Off"
 DRAFT_ACTION_PREVIEW = "Draft 480p"
 DRAFT_ACTION_FINAL = "Finalize Draft 1080p"
+DRAFT_FINAL_RESOLUTIONS = ("1080p", "4k")
 DRAFT_ACTION_CHOICES = (DRAFT_ACTION_OFF, DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL)
 DRAFT_SOURCE_PARAMETER = "HMB_SEEDANCE_DRAFT_SOURCE"
 DRAFT_SOURCES_PARAMETER = "HMB_SEEDANCE_DRAFT_SOURCES"
@@ -846,6 +878,11 @@ def _seedance_refresh_command_value(value: Any = None) -> dict[str, Any]:
             result.update(action="", action_id="")
         else:
             result["expected_draft_job_id"] = expected
+            if action == "finalize_draft" and "final_resolution" in source:
+                if source["final_resolution"] in DRAFT_FINAL_RESOLUTIONS:
+                    result["final_resolution"] = source["final_resolution"]
+                else:
+                    result.update(action="", action_id="")
     return result
 
 
@@ -946,14 +983,32 @@ def _seedance_draft_source_value(value: Any = None) -> dict[str, Any]:
             if not isinstance(identifier, str) or _TASK_ID_PATTERN.fullmatch(identifier) is None:
                 return {}
             result[name] = identifier
+    if (result.get("final_request_id") or result.get("final_job_id")) and value.get("final_resolution") in DRAFT_FINAL_RESOLUTIONS:
+        result["final_resolution"] = value["final_resolution"]
+    jobs = value.get("final_jobs", {})
+    if not isinstance(jobs, dict) or any(target not in DRAFT_FINAL_RESOLUTIONS
+            or not isinstance(job, str) or re.fullmatch(r"job-[0-9a-f]{32}", job) is None
+            or job == result["draft_job_id"] for target, job in jobs.items()):
+        return {}
+    if (len(set(jobs.values())) != len(jobs) or result.get("final_resolution") in jobs
+            and result.get("final_job_id") and result["final_job_id"] != jobs[result["final_resolution"]]):
+        return {}
+    if jobs:
+        result["final_jobs"] = dict(jobs)
     return result
 
 
-def _seedance_draft_final_request_id(draft_job_id: str) -> str:
-    """Share one Final intent with the authenticated web review workflow."""
+def _seedance_draft_final_request_id(draft_job_id: str, resolution: str | None = None, *, version: int = 2) -> str:
+    """Canonical keys used to validate Broker receipts, including saved v2 receipts."""
     if not isinstance(draft_job_id, str) or re.fullmatch(r"job-[0-9a-f]{32}", draft_job_id) is None:
         raise ValueError("Finalization requires a canonical Broker Draft task ID.")
-    return "hmb-draft-final-v1-" + draft_job_id
+    if resolution is None:
+        return "hmb-draft-final-v1-" + draft_job_id
+    if resolution not in DRAFT_FINAL_RESOLUTIONS:
+        raise ValueError("Finalization requires a supported resolution.")
+    if version == 1:
+        return "hmb-draft-final-v1-" + draft_job_id + ("-4k" if resolution == "4k" else "")
+    return f"hmb-draft-final-v2-{draft_job_id}-{resolution}"
 
 
 _DRAFT_FINAL_SERVER_STATES = frozenset({"available", "source_pending", "reserved", "running",
@@ -962,7 +1017,8 @@ _DRAFT_FINAL_HIDDEN_STATES = frozenset({"completed", "consumed", "expired", "not
 _DRAFT_FINAL_SYNC_SECONDS = 10.0
 
 
-def _seedance_draft_final_state_value(value: Any, source: dict[str, Any]) -> dict[str, Any]:
+def _seedance_draft_final_state_value(value: Any, source: dict[str, Any], *, resolution: str | None = None,
+                                      scalar_target: bool = False) -> dict[str, Any]:
     """Keep only the authenticated, exact-source advisory projection."""
     required = {"schema", "state_schema", "state", "is_draft", "eligible", "consumed", "source_task_id",
                 "checked_at", "expires_at", "owner_user_id", "project_id", "project_name",
@@ -971,6 +1027,7 @@ def _seedance_draft_final_state_value(value: Any, source: dict[str, Any]) -> dic
             or value.get("schema") != "hmb-review-draft-final-v1"
             or value.get("state_schema") != "hmb-draft-final-state-v1"
             or value.get("source_task_id") != source["draft_job_id"]
+            or resolution is not None and value.get("resolution", None if scalar_target else resolution) != resolution
             or not isinstance(value.get("state"), str) or value["state"] not in _DRAFT_FINAL_SERVER_STATES
             or type(value.get("is_draft")) is not bool
             or type(value.get("eligible")) is not bool
@@ -978,13 +1035,15 @@ def _seedance_draft_final_state_value(value: Any, source: dict[str, Any]) -> dic
             or type(value.get("checked_at")) is not int or value["checked_at"] <= 0
             or abs(time.time() - value["checked_at"]) > 300
             or type(value.get("owner_user_id")) is not int or value["owner_user_id"] <= 0
-            or value.get("idempotency_key") != _seedance_draft_final_request_id(source["draft_job_id"])
+            or value.get("idempotency_key") != _seedance_draft_final_request_id(
+                source["draft_job_id"], resolution, version=1 if scalar_target else 2)
             or any(value.get(key) != source[key] for key in ("project_id", "project_name"))):
         raise _BrokerProtocolError("Broker returned an invalid Draft Final state.")
     child = value.get("child_task_id")
     child_status = value.get("child_status")
     expires = value.get("expires_at")
-    if (child is not None and (not isinstance(child, str) or re.fullmatch(r"job-[0-9a-f]{32}", child) is None)
+    if (child is not None and (not isinstance(child, str) or child == source["draft_job_id"]
+                              or re.fullmatch(r"job-[0-9a-f]{32}", child) is None)
             or child_status is not None and (not isinstance(child_status, str) or len(child_status) > 64
                 or re.fullmatch(r"[A-Za-z0-9_-]+", child_status) is None)
             or expires is not None and (type(expires) is not int or expires <= 0)
@@ -992,15 +1051,48 @@ def _seedance_draft_final_state_value(value: Any, source: dict[str, Any]) -> dic
             or value["eligible"] != (value["state"] == "available")
             or value["eligible"] and (value.get("is_draft") is not True
                 or value.get("consumed") is not False or child is not None
-                or expires is None or expires <= max(value["checked_at"], time.time() - 300))
+                or expires is None or expires <= max(value["checked_at"], time.time()))
             or value["state"] in {"reserved", "running", "completed", "consumed"}
                 and (value.get("is_draft") is not True or value.get("consumed") is not True
                      or child is None or child_status is None)
             or value["state"] == "unknown" and value.get("consumed") is not None):
         raise _BrokerProtocolError("Broker returned an inconsistent Draft Final state.")
-    return {key: value.get(key) for key in ("state", "eligible", "consumed", "source_task_id",
+    result = {key: value.get(key) for key in ("state", "eligible", "consumed", "source_task_id",
         "checked_at", "expires_at", "owner_user_id", "project_id", "project_name",
         "child_task_id", "child_status", "idempotency_key")}
+    if "finals_by_resolution" in value:
+        entries = value["finals_by_resolution"]
+        if resolution is not None or not isinstance(entries, dict) or set(entries) != set(DRAFT_FINAL_RESOLUTIONS):
+            raise _BrokerProtocolError("Invalid resolution-scoped Draft Final response.")
+        scoped = {target: _seedance_draft_final_state_value(row, source, resolution=target)
+                  for target, row in entries.items()}
+        return _draft_final_scoped_state(result, scoped)
+    return result
+
+
+def _draft_final_scoped_state(parent: dict[str, Any], rows: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    children = [row["child_task_id"] for row in rows.values() if row["child_task_id"]]
+    if (len(children) != len(set(children))
+            or any(row["owner_user_id"] != parent["owner_user_id"] for row in rows.values())):
+        raise _BrokerProtocolError("Draft Final target ownership or child identity changed.")
+    return {**parent, "finals_by_resolution": rows}
+
+
+def _draft_final_target_state(state: dict[str, Any], resolution: str) -> dict[str, Any]:
+    scoped = state.get("finals_by_resolution")
+    if scoped is None:
+        return state
+    if (state.get("state") in {"source_pending", "not_draft", "expired", "unknown", "unavailable", "running", "reserved"}
+            or any(row["state"] in {"reserved", "running", "unknown", "not_draft", "source_pending"} for row in scoped.values())):
+        return {}
+    return scoped.get(resolution, {})
+
+
+def _draft_final_settled(state: dict[str, Any]) -> bool:
+    scoped = state.get("finals_by_resolution")
+    if scoped:
+        return all(row["state"] in _DRAFT_FINAL_HIDDEN_STATES for row in scoped.values())
+    return state.get("state") in _DRAFT_FINAL_HIDDEN_STATES
 
 
 class _SeedanceDraftOutputDestination:
@@ -1126,6 +1218,8 @@ def _seedance_recovery_value(value: Any = None) -> dict[str, Any]:
     }
     if source.get("draft_action") in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}:
         checkpoint["draft_action"] = source["draft_action"]
+        if source["draft_action"] == DRAFT_ACTION_FINAL and source.get("draft_final_resolution") in DRAFT_FINAL_RESOLUTIONS:
+            checkpoint["draft_final_resolution"] = source["draft_final_resolution"]
         try:
             checkpoint["draft_project"] = resolve_project(source.get("draft_project"), default_legacy=False)
         except (ValueError, TypeError):
@@ -1325,6 +1419,12 @@ def _seedance_draft_ui_value(value: Any = None) -> dict[str, Any]:
             "cancel_available": source.get("cancel_available") is True,
             "active_job_id": str(source.get("active_job_id") or "")[:128],
             "reason": str(source.get("reason") or "")[:400],
+            **({"source_completed": source["source_completed"]} if type(source.get("source_completed")) is bool else {}),
+            **({"finals_by_resolution": {key: state for key, state in source["finals_by_resolution"].items()
+                                         if key in DRAFT_FINAL_RESOLUTIONS and isinstance(state, str)
+                                         and state in _DRAFT_FINAL_SERVER_STATES}}
+               if isinstance(source.get("finals_by_resolution"), dict) else {}),
+            **({"final_resolution": source["final_resolution"]} if source.get("final_resolution") in DRAFT_FINAL_RESOLUTIONS else {}),
             **({"final_state": str(source.get("final_state") or "")[:32],
                 "final_visible": source.get("final_visible") is True,
                 "final_task_id": str(source.get("final_task_id") or "")[:128]}
@@ -1902,6 +2002,10 @@ class _BrokerAuthenticationError(_BrokerError):
 
 class _BrokerProtocolError(_BrokerError):
     pass
+
+
+class _DraftFinalPreflightError(_BrokerProtocolError):
+    """The Final capability check failed before the create request was sent."""
 
 
 class _SubmissionCancelledBeforeStart(RuntimeError):
@@ -2803,9 +2907,34 @@ class _HMBAIBrokerBridge:
         # It never performs refresh, reservation, submission, or media download.
         readonly = copy(self)
         readonly._clear_access_token = lambda: None
-        result = readonly._request_json("GET", self._review_task_path(record["draft_job_id"]) + "/draft-final",
-                                        payload=None, timeout=timeout)
-        return _seedance_draft_final_state_value(result, record)
+        load_token = readonly._load_access_token
+        first_token = None
+
+        def same_account_token() -> str:
+            nonlocal first_token
+            current = load_token()
+            if first_token is None:
+                first_token = current
+            elif current != first_token:
+                raise _BrokerAuthenticationError("The Broker account changed between Draft Final resolution checks.")
+            return current
+
+        readonly._load_access_token = same_account_token
+        route = self._review_task_path(record["draft_job_id"]) + "/draft-final?resolution="
+        deadline = time.monotonic() + timeout
+        first = readonly._request_json("GET", route + "1080p", payload=None, timeout=timeout)
+        if "finals_by_resolution" in first or "resolution" not in first:
+            # A complete v2 map or an older, source-wide receipt.
+            return _seedance_draft_final_state_value(first, record)
+        full_hd = _seedance_draft_final_state_value(first, record, resolution="1080p", scalar_target=True)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _BrokerProtocolError("Draft Final resolution checks timed out.")
+        second = readonly._request_json("GET", route + "4k", payload=None, timeout=remaining)
+        ultra_hd = _seedance_draft_final_state_value(second, record, resolution="4k", scalar_target=True)
+        if first["is_draft"] != second["is_draft"] or full_hd["expires_at"] != ultra_hd["expires_at"]:
+            raise _BrokerProtocolError("The Draft source changed between resolution checks.")
+        return _draft_final_scoped_state(full_hd, {"1080p": full_hd, "4k": ultra_hd})
 
     def put_task_casecard(self, task_id: str, evidence: dict[str, Any]) -> dict[str, Any]:
         if evidence.get("schema") != _review.SCHEMA or evidence.get("version") != 1:
@@ -3130,6 +3259,7 @@ class _HMBAIBrokerBridge:
         idempotency_key: str = "",
         queue_admission: Any = None,
         queue_operation: str = "",
+        expected_auth_digest: str = "",
     ) -> dict[str, Any]:
         if not path.startswith("/") or path.startswith("//"):
             raise _BrokerProtocolError("FN AI Broker request path is invalid.")
@@ -3139,6 +3269,8 @@ class _HMBAIBrokerBridge:
         body = None
         with self._reference_auth_lock:
             token = self._load_access_token()
+            if expected_auth_digest and hashlib.sha256(token.encode("utf-8")).hexdigest() != expected_auth_digest:
+                raise _DraftFinalPreflightError("The Broker account changed before the Draft Final request.")
             reference_auth_epoch = self._reference_auth_epoch
             queue_headers = {}
             if queue_admission is not None:
@@ -3545,7 +3677,8 @@ class _HMBAIBrokerBridge:
 
     def require_seedance_draft_features(self, *, timeout: float = 10.0,
                                        output_format: str = DEFAULT_OUTPUT_FORMAT,
-                                       allow_output_fallback: bool = False) -> str:
+                                       allow_output_fallback: bool = False,
+                                       final_resolution: str | None = None) -> str:
         """Authenticate the exact Draft contract before uploads or either paid POST."""
         requested_format = str(output_format or "").strip().lower()
         if requested_format not in OUTPUT_FORMAT_CHOICES:
@@ -3570,12 +3703,25 @@ class _HMBAIBrokerBridge:
                 or not isinstance(profile, dict)
                 or profile.get("draft_generation") is not True
                 or profile.get("draft_preview_resolution") != "480p"
-                or profile.get("draft_final_resolution") != "1080p"
                 or profile.get("draft_source_reference") != "broker_job_id"
                 or type(profile.get("draft_source_ttl_seconds")) is not int
                 or profile.get("draft_source_ttl_seconds") != 604800):
             raise _BrokerProtocolError(
                 "FN AI Broker has not enabled Seedance 2.5 Draft. No render was submitted."
+            )
+        if "draft_final_resolutions" in profile:
+            targets = profile["draft_final_resolutions"]
+            if (not isinstance(targets, list) or not targets
+                    or not all(isinstance(item, str) and item for item in targets)
+                    or len(set(targets)) != len(targets)):
+                raise _BrokerProtocolError("FN AI Broker Draft Final resolution capabilities are malformed. No render was submitted.")
+        elif profile.get("draft_final_resolution") == "1080p":
+            targets = ["1080p"]
+        else:
+            raise _BrokerProtocolError("FN AI Broker has not declared its Draft Final resolutions. No render was submitted.")
+        if final_resolution is not None and (final_resolution not in DRAFT_FINAL_RESOLUTIONS or final_resolution not in targets):
+            raise _BrokerProtocolError(
+                f"FN AI Broker has not enabled Seedance 2.5 Draft Final at {final_resolution}. No render was submitted."
             )
         self._remember_generation_mode_capability(response)
         # A missing legacy list proves no MOV limitation. Keep old MP4 callers,
@@ -3603,6 +3749,7 @@ class _HMBAIBrokerBridge:
         *,
         timeout: float,
         queue_only_headers: dict[str, str] | None = None,
+        draft_final_identity: tuple[int, str] | None = None,
     ) -> dict[str, Any]:
         if set(payload) - self._ALLOWED_GENERATION_FIELDS:
             raise _BrokerProtocolError(
@@ -3656,26 +3803,52 @@ class _HMBAIBrokerBridge:
             final_resolution = request_payload.get("resolution", request_payload.get("quality"))
             if (model != SEEDANCE_2_5_MODEL_ID or not isinstance(draft_source, str)
                     or re.fullmatch(r"job-[0-9a-f]{32}", draft_source) is None
-                    or final_resolution != "1080p"
+                    or final_resolution not in DRAFT_FINAL_RESOLUTIONS
                     or ("quality" in request_payload and request_payload["quality"] != final_resolution)
                     or request_payload.get("output_format", DEFAULT_OUTPUT_FORMAT) not in OUTPUT_FORMAT_CHOICES
                     or not isinstance(request_payload.get("client_request_id"), str)
                     or _TASK_ID_PATTERN.fullmatch(request_payload["client_request_id"]) is None
                     or set(request_payload) - allowed):
-                raise _BrokerProtocolError("Draft final submission must contain only a local Broker Draft ID, 1080p target and supported output format.")
-            self.require_seedance_draft_features(
-                timeout=min(float(timeout), 30.0),
-                output_format=str(request_payload.get("output_format", DEFAULT_OUTPUT_FORMAT)),
-            )
-            if admission is not None:
-                state = self._request_json("GET", self._review_task_path(draft_source) + "/draft-final", payload=None, timeout=min(timeout, 15))
-                if (state.get("source_task_id") != draft_source or state.get("owner_user_id") != admission.principal_id
+                raise _BrokerProtocolError("Draft Final requires a local Broker Draft ID, a 1080p or 4K target and a supported output format.")
+            try:
+                self.require_seedance_draft_features(
+                    timeout=min(float(timeout), 30.0),
+                    output_format=str(request_payload.get("output_format", DEFAULT_OUTPUT_FORMAT)),
+                    final_resolution=final_resolution,
+                )
+            except _BrokerError as exc:
+                raise _DraftFinalPreflightError(str(exc), status_code=exc.status_code) from exc
+            request_id = request_payload["client_request_id"]
+            scoped_intent = draft_final_identity or request_id.startswith("hmb-draft-final-")
+            if scoped_intent or admission is not None:
+                source = {"draft_job_id": draft_source, "broker_server_url": self.server_url,
+                          **{k: request_payload.get(k) for k in ("project_id", "project_name")}}
+                try:
+                    if scoped_intent:
+                        snapshot = self.get_draft_final_state(source, timeout=min(timeout, 15))
+                    else:
+                        # Maintenance intake may own a previously issued client
+                        # ID without project fields. Keep its principal-bound check.
+                        raw = self._request_json("GET", self._review_task_path(draft_source) + "/draft-final",
+                                                 payload=None, timeout=min(timeout, 15))
+                        if raw.get("resolution", final_resolution) != final_resolution:
+                            raise _BrokerProtocolError("The queued Draft Final resolution changed.")
+                        snapshot = _seedance_draft_final_state_value(raw, source) if "finals_by_resolution" in raw else raw
+                except _BrokerError as exc:
+                    raise _DraftFinalPreflightError(str(exc), status_code=exc.status_code) from exc
+                state = _draft_final_target_state(snapshot, final_resolution)
+                if (draft_final_identity and (not snapshot.get("finals_by_resolution")
+                        or state.get("owner_user_id") != draft_final_identity[0])
+                        or (scoped_intent or snapshot.get("finals_by_resolution")) and state.get("idempotency_key") != request_id):
+                    raise _DraftFinalPreflightError("The Draft Final identity or target changed before submission.")
+                if (state.get("source_task_id") != draft_source or admission is not None and state.get("owner_user_id") != admission.principal_id
                         or state.get("state") != "available" or state.get("eligible") is not True or state.get("child_task_id")
                         or type(state.get("expires_at")) is not int or time.time() >= state["expires_at"]
                         or any(state.get(k) != request_payload[k] for k in ("project_id", "project_name") if k in request_payload)):
-                    raise _BrokerProtocolError("Draft Final source is unavailable, expired or already reserved. Retrieve the same Task.")
+                    raise _DraftFinalPreflightError("Draft Final source is unavailable, expired or already reserved. Retrieve the same Task.")
             return self._request_json("POST", "/api/v1/generate/video", payload=request_payload, timeout=timeout,
                                       submission=True,
+                                      **({"expected_auth_digest": draft_final_identity[1]} if draft_final_identity else {}),
                                       idempotency_key=str(request_payload.get("client_request_id") or ""), **queue_kwargs)
         if draft:
             if request_payload.get("quality") != "480p" or request_payload.get("resolution") != "480p":
@@ -4687,7 +4860,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             ParameterString(
                 name="draft_action", default_value=DRAFT_ACTION_PREVIEW,
                 tooltip=("Seedance 2.5 Only or Shot at 480p. MOV is the default; an explicit MP4-only provider support list uses MP4. "
-                         "After reviewing the Draft, use the dedicated Draft final button once to run only this Generator at 1080p. "
+                         "After reviewing the Draft, choose 1080p or 4K in the Generator header, then press Generate (생성). "
                          "Both stages are separate paid renders. No automatic final render is submitted."),
                 allowed_modes={ParameterMode.PROPERTY},
                 traits={Options(choices=list(DRAFT_ACTION_CHOICES))},
@@ -5456,7 +5629,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         context = getattr(self, "_hmb_draft_final_context", None)
         if isinstance(context, dict):
             try:
-                source = self._validated_draft_final_source(context["source"], allow_reserved=True)
+                source = self._validated_draft_final_source(context["source"], allow_reserved=True, resolution=context["params"]["resolution"])
                 if self._draft_source_record().get("draft_job_id") != source["draft_job_id"]:
                     return False
             except (ValueError, RuntimeError):
@@ -5847,6 +6020,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "output_file": output_file,
                 "broker_server_url": broker_server_url,
                 "draft_action": previous.get("draft_action", source_params.get("draft_action")) if stage != "pre_submit" else source_params.get("draft_action"),
+                "draft_final_resolution": source_params.get("resolution") if stage == "pre_submit" else previous.get("draft_final_resolution"),
                 "draft_project": source_params.get("_hmb_draft_project", previous.get("draft_project")),
                 "draft_source": source_params.get("_hmb_draft_source", previous.get("draft_source")),
                 "draft_source_bindings": source_params.get("_hmb_draft_source_bindings", previous.get("draft_source_bindings")),
@@ -6734,16 +6908,18 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         ).start()
 
     def _on_finalize_draft_clicked(self, _button: Any, _details: Any, *, action_id: str = "",
-                                   expected_draft_job_id: str = "") -> Any:
+                                   expected_draft_job_id: str = "", final_resolution: str = "1080p") -> Any:
         """Capture one exact completed Draft and dispatch only this Generator."""
-        if _my_box_node.is_selected(self):
-            return self._hmb_my_box_controller().schedule_final(_details, expected_draft_job_id)
         reserved_here = False
         try:
+            if final_resolution not in DRAFT_FINAL_RESOLUTIONS:
+                raise ValueError("Select 1080p or 4K for Draft Final.")
+            if _my_box_node.is_selected(self):
+                return self._hmb_my_box_controller().schedule_final(_details, expected_draft_job_id, final_resolution=final_resolution)
             if not self._runtime_node_is_live(require_registered=True):
                 raise ValueError("The Generator is inactive.")
             self._assert_draft_final_flow_idle()
-            source = self._validated_draft_final_source()
+            source = self._validated_draft_final_source(resolution=final_resolution)
             if expected_draft_job_id != source["draft_job_id"]:
                 raise ValueError("The selected Draft changed. Review the current Shot before finalizing.")
             event_loop = getattr(GriptapeNodes.EventManager(), "event_loop", None)
@@ -6755,13 +6931,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     return NodeMessageResult(success=True, details="Generator is busy; no duplicate Final was scheduled.",
                                              response=_details, altered_workflow_state=False)
                 self._hmb_draft_finalize_pending = True
-                self._hmb_draft_pending_source = deepcopy(source)
+                self._hmb_draft_pending_source = {**deepcopy(source), "final_resolution": final_resolution}
                 reserved_here = True
             clear = getattr(self, "clear_cancellation", None)
             if callable(clear):
                 clear()
             command_id = action_id or "final-" + uuid4().hex
-            coroutine = self._run_draft_final(source, command_id)
+            coroutine = self._run_draft_final(source, command_id, final_resolution=final_resolution)
             try:
                 future = asyncio.run_coroutine_threadsafe(coroutine, event_loop)
             except Exception:
@@ -6784,7 +6960,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             future.add_done_callback(finished)
             with suppress(Exception):
                 self._sync_seedance_shot_widget(emit_change=True)
-            return NodeMessageResult(success=True, details="Finalize 1080p was scheduled for this Draft only.",
+            return NodeMessageResult(success=True, details=f"Final {final_resolution} was scheduled for this Draft only.",
                                      response=_details, altered_workflow_state=False)
         except Exception as exc:
             if reserved_here:
@@ -6793,21 +6969,23 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     self._hmb_draft_pending_source = {}
             return NodeMessageResult(success=False, details=str(exc), response=_details, altered_workflow_state=False)
 
-    async def _run_draft_final(self, source: dict[str, Any], action_id: str) -> None:
+    async def _run_draft_final(self, source: dict[str, Any], action_id: str, *, final_resolution: str = "1080p") -> None:
         """No StartFlow/ResolveNode or upstream execution is invoked here."""
         self._hmb_draft_finalize_task = asyncio.current_task()
         try:
+            if final_resolution not in DRAFT_FINAL_RESOLUTIONS:
+                raise ValueError("Select 1080p or 4K for Draft Final.")
             if not self._runtime_node_is_live(require_registered=True) or self.is_cancellation_requested:
                 raise ValueError("Finalization was cancelled before execution.")
             self._assert_draft_final_flow_idle()
-            source = self._validated_draft_final_source(source)
+            source = self._validated_draft_final_source(source, resolution=final_resolution)
             current = self._draft_source_record()
             if current.get("draft_job_id") != source["draft_job_id"]:
                 raise ValueError("The completed Draft changed before Finalization started.")
             params = self._get_parameters()
             params.update(draft_action=DRAFT_ACTION_FINAL, draft_job_id=source["draft_job_id"],
                           _hmb_draft_source=deepcopy(source), _hmb_draft_supported=True,
-                          model_id=SEEDANCE_2_5_MODEL_ID, resolution="1080p", output_format="mov",
+                          model_id=SEEDANCE_2_5_MODEL_ID, resolution=final_resolution, output_format="mov",
                           return_last_frame=False, resume_generation_id="", prompt="", first_frame=None,
                           last_frame=None, reference_images=[], video_references=[], video_reference_slots=[], reference_audio=[],
                           _hmb_generation_origin=deepcopy(source.get("generation_origin", {})))
@@ -6856,7 +7034,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if not callable(check):
                 raise ValueError("Engine execution state is unavailable.")
             if check():
-                raise ValueError("Wait for the current workflow to finish before Finalize 1080p.")
+                raise ValueError("Wait for the current workflow to finish before finalizing the Draft.")
         except ValueError:
             raise
         except Exception as exc:
@@ -6869,6 +7047,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if (source and source.get("final_request_id") == recovery.get("task_id")
                 and recovery.get("task_identity") == "client_request"):
             source.pop("final_request_id", None)
+            source.pop("final_resolution", None)
             self._store_draft_source(source)
 
     def _local_original_generation_preview(self) -> dict[str, str]:
@@ -8625,7 +8804,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     self._schedule_open_review_gallery(gallery_origin)
                 elif command_action == "finalize_draft":
                     expected = value.get("expected_draft_job_id") if isinstance(value, dict) else ""
-                    self._on_finalize_draft_clicked(None, None, action_id=action_id, expected_draft_job_id=expected)
+                    if isinstance(value, dict) and value.get("action_id") == action_id:
+                        self._on_finalize_draft_clicked(None, None, action_id=action_id, expected_draft_job_id=expected,
+                                                       final_resolution=value.get("final_resolution", "1080p"))
                 elif command_action == "cancel_draft_final":
                     expected = value.get("expected_draft_job_id") if isinstance(value, dict) else ""
                     self._cancel_draft_final(str(expected or ""))
@@ -11208,7 +11389,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     def _get_parameters(self) -> dict[str, Any]:
         final_context = self._active_draft_final_context()
         if final_context is not None:
-            self._validated_draft_final_source(final_context["source"], allow_reserved=True)
+            self._validated_draft_final_source(final_context["source"], allow_reserved=True, resolution=final_context["params"]["resolution"])
             return deepcopy(final_context["params"])
         model_id = self._synchronize_model_resolution()
         legacy_video_slots = [
@@ -11317,7 +11498,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 params["output_format"] = "mov"
             params["return_last_frame"] = False
         if params["draft_action"] == DRAFT_ACTION_FINAL and not params["resume_generation_id"]:
-            source = self._validated_draft_final_source()
+            pending = getattr(self, "_hmb_draft_pending_source", {}) or {}
+            target = pending.get("final_resolution", params["resolution"])
+            source = self._validated_draft_final_source(resolution=target)
             params["_hmb_draft_source"] = source
             params["draft_job_id"] = source["draft_job_id"]
         return params
@@ -11399,8 +11582,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if recovered and (not recovered.get("generation_origin") and self._draft_only_mode()
                           or recovered.get("generation_origin") and self._draft_source_key(recovered) == self._draft_source_key()):
             if not source or (source["draft_job_id"] == recovered["draft_job_id"] and recovered.get("final_request_id")):
-                if source.get("draft_job_id") == recovered["draft_job_id"] and source.get("final_job_id"):
-                    recovered["final_job_id"] = source["final_job_id"]
+                if source.get("draft_job_id") == recovered["draft_job_id"]:
+                    if source.get("final_jobs") or recovered.get("final_jobs"):
+                        if any(key in recovered.get("final_jobs", {}) and recovered["final_jobs"][key] != job
+                               for key, job in source.get("final_jobs", {}).items()):
+                            return {}
+                        recovered["final_jobs"] = {**source.get("final_jobs", {}), **recovered.get("final_jobs", {})}
+                    if source.get("final_job_id") and source.get("final_resolution") == recovered.get("final_resolution"):
+                        recovered.setdefault("final_job_id", source["final_job_id"])
                 source = recovered
         return source
 
@@ -11473,19 +11662,52 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 raise _BrokerProtocolError("The authenticated Draft owner changed during status reconciliation.")
             # Never turn a known child or consumed Final into a new intent on
             # a delayed available/expired projection or transient GET error.
-            if old_state.get("consumed") is True and state.get("consumed") is not True:
+            if state.get("finals_by_resolution"):
+                for target, row in state["finals_by_resolution"].items():
+                    old = old_state.get("finals_by_resolution", {}).get(target, {})
+                    if old.get("child_task_id") and (row.get("child_task_id") != old["child_task_id"]
+                            or old.get("state") == "completed" and row["state"] != "completed"):
+                        raise _BrokerProtocolError("The Broker returned conflicting Final child records.")
+            elif old_state.get("finals_by_resolution"):
+                if state.get("state") != "unknown" or state.get("idempotency_key"):
+                    raise _BrokerProtocolError("The Broker no longer confirms the Draft Final resolutions.")
+                # Keep each known child across an unsuccessful GET and retry
+                # the pair. A previous 1080p completion alone cannot settle it.
+                rows = {target: dict(row) for target, row in old_state["finals_by_resolution"].items()}
+                for row in rows.values():
+                    if row["state"] not in _DRAFT_FINAL_HIDDEN_STATES:
+                        row.update(state="unknown", eligible=False, consumed=None)
+                state = {**state, "finals_by_resolution": rows}
+            elif old_state.get("consumed") is True and state.get("consumed") is not True:
                 state = {**old_state, "state": "unknown" if old_state.get("state") not in
                          _DRAFT_FINAL_HIDDEN_STATES else old_state["state"], "eligible": False}
+                state.pop("finals_by_resolution", None)
             elif old_state.get("child_task_id") and not state.get("child_task_id"):
                 state = {**state, "state": "unknown", "consumed": None, "child_task_id": old_state["child_task_id"],
                          "child_status": old_state.get("child_status"), "eligible": False}
+        child = state.get("child_task_id")
+        if state.get("finals_by_resolution") and state.get("idempotency_key"):
+            scoped = state["finals_by_resolution"]
+            jobs = dict(current.get("final_jobs", {}))
+            last_child = current.get("final_job_id")
+            last_target = current.get("final_resolution")
+            if last_child and ((last_target and scoped[last_target]["child_task_id"] != last_child)
+                    or not any(row["child_task_id"] == last_child for row in scoped.values())):
+                raise _BrokerProtocolError("The Broker did not confirm the previous Final child for this Draft.")
+            for target, row in scoped.items():
+                if target in jobs and (jobs[target] != row["child_task_id"] or row["state"] != "completed"):
+                    raise _BrokerProtocolError("The Broker did not confirm the saved Final at this resolution.")
+                if row["state"] == "completed":
+                    jobs[target] = row["child_task_id"]
+            if jobs != current.get("final_jobs", {}):
+                self._store_draft_source({**current, "final_jobs": jobs})
+        elif child:
+            record = self._draft_source_record()
+            if (record.get("draft_job_id") == source["draft_job_id"] and not record.get("final_job_id")
+                    and record.get("final_request_id", "") in ("", _seedance_draft_final_request_id(source["draft_job_id"]))):
+                self._store_draft_source({**record, "final_job_id": child})
         self._hmb_draft_final_status_cache = {"identity": identity, "value": deepcopy(state),
             "owner_user_id": owner_user_id or state.get("owner_user_id"), "received_at": time.monotonic()}
-        child = state.get("child_task_id")
-        if child:
-            record = self._draft_source_record()
-            if record.get("draft_job_id") == source["draft_job_id"] and not record.get("final_job_id"):
-                self._store_draft_source({**record, "final_job_id": child})
         return True
 
     async def _query_draft_final_server_state(self, source: dict[str, Any], *, bridge: Any = None) -> dict[str, Any]:
@@ -11538,7 +11760,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         return
             with suppress(Exception):
                 self._sync_seedance_shot_widget(emit_change=True)
-            if state.get("state") in _DRAFT_FINAL_HIDDEN_STATES:
+            if _draft_final_settled(state):
                 return
             await asyncio.sleep(_DRAFT_FINAL_SYNC_SECONDS)
 
@@ -11548,7 +11770,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         except Exception:
             return {"state": "unavailable", "eligible": False, "child_task_id": None}
         cached = getattr(self, "_hmb_draft_final_status_cache", {})
-        if cached.get("identity") == identity and cached.get("value", {}).get("state") in _DRAFT_FINAL_HIDDEN_STATES:
+        if cached.get("identity") == identity and _draft_final_settled(cached.get("value", {})):
             return deepcopy(cached["value"])
         self._schedule_draft_final_status_sync(source, identity)
         if cached.get("identity") == identity:
@@ -11557,7 +11779,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 return deepcopy(value)
         return {"state": "checking", "eligible": False, "child_task_id": None}
 
-    def _validated_draft_final_source(self, source: dict[str, Any] | None = None, *, allow_reserved: bool = False) -> dict[str, Any]:
+    def _bound_draft_final_source(self, source: dict[str, Any] | None = None) -> dict[str, Any]:
         model = str(self.get_parameter_value("model_id") or "")
         if MODEL_ID_ALIASES.get(model, model) != SEEDANCE_2_5_MODEL_ID:
             raise ValueError("Draft finalization requires Seedance 2.5.")
@@ -11577,15 +11799,30 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 project = {}  # A legacy Only Final retains its original project.
             if project and any(project.get(key) != record[key] for key in ("project_id", "project_name")):
                 raise ValueError("The selected Only project does not match the completed Draft.")
+        # Legacy Only records retain their original Broker; a Shot must still
+        # be bound to the same configured production endpoint.
+        if record.get("generation_origin") and record["broker_server_url"] != self._selected_broker_server_url():
+            raise ValueError("The selected Broker does not match the completed Draft.")
+        return record
+
+    @staticmethod
+    def _require_open_draft_final(record: dict[str, Any], *, allow_reserved: bool = False, resolution: str | None = None) -> None:
         created = record.get("created_at_ms")
         if created is not None and (created > int(time.time() * 1000) or int(time.time() * 1000) >= created + DRAFT_SOURCE_TTL_MS):
             raise ValueError("This Draft has expired. Create a new 480p Draft.")
-        if record.get("final_job_id") or (record.get("final_request_id") and not allow_reserved):
+        previous_target = record.get("final_resolution")
+        jobs = record.get("final_jobs", {})
+        last_child = record.get("final_job_id") or jobs.get(previous_target)
+        if last_child and not previous_target:
+            previous_target = next((target for target, child in jobs.items() if child == last_child), None)
+        other_child = resolution is not None and previous_target in DRAFT_FINAL_RESOLUTIONS and last_child and resolution != previous_target
+        if ((record.get("final_jobs") and resolution is None) or resolution in record.get("final_jobs", {})
+                or not other_child and (record.get("final_job_id") or (record.get("final_request_id") and not allow_reserved))):
             raise ValueError("This Draft already has a Final request. Use Refresh / Retrieve Result for that task.")
-        # Legacy Only records retain their original Broker; Shot mode must
-        # still be bound to the same configured production endpoint.
-        if record.get("generation_origin") and record["broker_server_url"] != self._selected_broker_server_url():
-            raise ValueError("The selected Broker does not match the completed Draft.")
+
+    def _validated_draft_final_source(self, source: dict[str, Any] | None = None, *, allow_reserved: bool = False, resolution: str | None = None) -> dict[str, Any]:
+        record = self._bound_draft_final_source(source)
+        self._require_open_draft_final(record, allow_reserved=allow_reserved, resolution=resolution)
         return deepcopy(record)
 
     def _draft_ui_state(self) -> dict[str, Any]:
@@ -11606,12 +11843,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         reason = ""
         final_state = "unavailable"
         final_task_id = ""
+        source_completed = False
+        target_states = None
         if supported and source:
             server = self._draft_final_server_snapshot(source)
             final_state = str(server.get("state") or "unknown")
             final_task_id = str(server.get("child_task_id") or source.get("final_job_id") or "")
             try:
-                self._validated_draft_final_source(source)
+                self._bound_draft_final_source(source)
+                source_completed = (final_state not in {"source_pending", "not_draft"}
+                    and (source.get("completed") is True or final_state in {"available", "reserved", "running", "completed", "consumed"}))
+                self._require_open_draft_final(source)
                 final_available = not busy and final_state == "available" and server.get("eligible") is True
             except (ValueError, RuntimeError) as exc:
                 reason = str(exc)
@@ -11628,17 +11870,37 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "unknown": "Final 상태를 확인할 수 없습니다. 새 렌더 대신 기존 Task를 조회하세요.",
                     "source_pending": "Draft가 완료된 뒤 Final을 사용할 수 있습니다.",
                     "unavailable": "원래 Broker에 연결해 Final 상태를 확인하세요."}.get(final_state, "")
+            if source_completed and server.get("finals_by_resolution"):
+                target_states = {}
+                for target, row in server["finals_by_resolution"].items():
+                    target_states[target] = row["state"]
+                    if row["state"] == "available":
+                        try:
+                            self._require_open_draft_final(source, resolution=target)
+                            if not _draft_final_target_state(server, target):
+                                target_states[target] = "unknown"
+                        except ValueError:
+                            target_states[target] = "completed" if target in source.get("final_jobs", {}) else "unknown"
+                final_available = not busy and "available" in target_states.values()
+                if final_available:
+                    reason = ""
         elif supported:
-            reason = "Complete a 480p Draft to enable Finalize 1080p."
+            reason = "Complete a 480p Draft to enable Final."
+        pending = getattr(self, "_hmb_draft_pending_source", {}) or {}
+        selected_final = source.get("final_resolution") if source_completed else None
+        if final_busy and source_completed and pending.get("draft_job_id") == source["draft_job_id"]:
+            selected_final = pending.get("final_resolution") or selected_final
         return _seedance_draft_ui_value({"visible": supported and (resolution == "480p" or bool(source)),
             "action": action if supported else DRAFT_ACTION_OFF,
             "preview_available": supported and resolution == "480p" and not busy,
             "final_available": final_available, "job_id": source.get("draft_job_id", ""),
-            "effective_resolution": "1080p" if action == DRAFT_ACTION_FINAL else "480p" if action == DRAFT_ACTION_PREVIEW and supported else resolution,
+            "effective_resolution": (selected_final or "1080p") if final_busy or action == DRAFT_ACTION_FINAL else "480p" if action == DRAFT_ACTION_PREVIEW and supported else resolution,
+            "source_completed": source_completed, "final_resolution": selected_final,
+            **({"finals_by_resolution": target_states} if target_states is not None else {}),
             "busy": busy, "final_busy": final_busy, "active_action": active_action,
             "cancel_available": bool(self._hmb_draft_finalize_pending and self._active_draft_job_id()),
             "active_job_id": self._active_draft_job_id(), "reason": "Generator is busy." if busy else reason,
-            "final_state": final_state, "final_visible": bool(source) and final_state not in _DRAFT_FINAL_HIDDEN_STATES
+            "final_state": final_state, "final_visible": bool(source) and (final_available or final_state not in _DRAFT_FINAL_HIDDEN_STATES)
                 and (not busy or final_busy),
             "final_task_id": final_task_id})
 
@@ -11659,9 +11921,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return action
         if params.get("model_id") != SEEDANCE_2_5_MODEL_ID or not (params.get("_hmb_draft_only") is True or params.get("_hmb_draft_supported") is True):
             raise ValueError("Draft requires Seedance 2.5 in Only or a verified Shot.")
-        expected = "480p" if action == DRAFT_ACTION_PREVIEW else "1080p"
-        if params.get("resolution") != expected or params.get("output_format") not in OUTPUT_FORMAT_CHOICES or params.get("return_last_frame") is not False:
-            raise ValueError("Draft uses a 480p preview or 1080p final in MOV or legacy MP4, without last-frame output.")
+        resolutions = ("480p",) if action == DRAFT_ACTION_PREVIEW else DRAFT_FINAL_RESOLUTIONS
+        if params.get("resolution") not in resolutions or params.get("output_format") not in OUTPUT_FORMAT_CHOICES or params.get("return_last_frame") is not False:
+            raise ValueError("Draft uses a 480p preview or 1080p / 4K Final in MOV or legacy MP4, without last-frame output.")
         if action == DRAFT_ACTION_FINAL and re.fullmatch(r"job-[0-9a-f]{32}", params.get("draft_job_id", "")) is None:
             raise ValueError("Finalize Draft requires a completed LOCAL Broker Draft job ID (job-...).")
         return action
@@ -13052,7 +13314,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             project = {key: resolved_project[key] for key in ("project_id", "project_name")}
             params["_hmb_draft_project"] = dict(project)
             return {"provider": "volcengine_ark", "model": SEEDANCE_2_5_MODEL_ID,
-                    "draft_job_id": params["draft_job_id"], "resolution": "1080p", "output_format": params["output_format"], **project}
+                    "draft_job_id": params["draft_job_id"], "resolution": params["resolution"], "output_format": params["output_format"], **project}
         submitted_prompt = self._compose_finish_look_prompt(
             params.get("prompt"),
             params.get("_hmb_finish_look_out"),
@@ -14431,6 +14693,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         model_id: str | None = None,
         output_format: str | None = None,
         return_last_frame: bool | None = None,
+        review_source: Future | None = None,
     ) -> None:
         if not self._runtime_node_is_live(require_registered=True):
             return
@@ -14439,22 +14702,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             recovery_at_download.get("generation_origin")
             if recovery_at_download.get("task_id") == generation_id else None
         )
-        video_download_url = self._extract_video_url(final_task)
-        if not video_download_url:
-            raise RuntimeError(
-                "FN AI Broker task succeeded but the video URL was missing."
-            )
-        self._publish_generation_preview(
-            "downloading",
-            generation_id=generation_id,
-        )
-        video_bytes = await self._download_broker_video(video_download_url)
-        if not self._runtime_node_is_live(require_registered=True):
-            return
-        self._publish_generation_preview(
-            "verifying",
-            generation_id=generation_id,
-        )
+        media_bridge = getattr(self, "_broker_bridge_instance", None)
+        if (final_task.get("id") != generation_id or final_task.get("status") != "succeeded"
+                or recovery_at_download.get("task_id") == generation_id
+                and recovery_at_download.get("broker_server_url") not in (None, "", getattr(media_bridge, "server_url", None))):
+            media_bridge = None
         if model_id is None:
             raw_model = str(
                 self.get_parameter_value("model_id") or MODEL_NAME_SEEDANCE_2_0
@@ -14473,12 +14725,29 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if effective_model_id == SEEDANCE_2_5_MODEL_ID
             else DEFAULT_OUTPUT_FORMAT
         )
-        saved = await self._atomic_publish_completed_video(
-            destination,
-            video_bytes,
-            effective_output_format,
-            verifier,
-        )
+        # Claim before downloading. The worker heartbeats while the foreground
+        # fetches and publishes, then uses that file without another GET or copy.
+        claim = nullcontext(review_source) if review_source is not None else _completed_review_source(media_bridge, generation_id)
+        with claim as source:
+            video_bytes = None
+            try:
+                video_download_url = self._extract_video_url(final_task)
+                if not video_download_url:
+                    raise RuntimeError("FN AI Broker task succeeded but the video URL was missing.")
+                self._publish_generation_preview("downloading", generation_id=generation_id)
+                video_bytes = await self._download_broker_video(video_download_url)
+                if not self._runtime_node_is_live(require_registered=True):
+                    return
+                self._publish_generation_preview("verifying", generation_id=generation_id)
+                saved = await self._atomic_publish_completed_video(
+                    destination, video_bytes, effective_output_format, verifier,
+                )
+            except Exception:
+                if self._runtime_node_is_live(require_registered=True) and not getattr(self, "is_cancellation_requested", False):
+                    source.set_result(video_bytes)
+                raise
+            if self._runtime_node_is_live(require_registered=True) and not getattr(self, "is_cancellation_requested", False):
+                source.set_result(_published_review_original(saved, video_bytes))
         if not self._runtime_node_is_live(require_registered=True):
             return
         artifact = VideoUrlArtifact(value=saved.location, name=saved.name)
@@ -14554,13 +14823,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self.set_parameter_value("draft_job_id", displayed_id, emit_change=False)
                 with suppress(Exception):
                     self.publish_update_to_parameter("draft_job_id", displayed_id)
-                # The retained one-use Draft final button advertises the next
-                # action. Keep every authored generation setting unchanged;
-                # its 1080p override belongs only to the explicit Final request.
+                # The Final resolution belongs to the explicit request. The
+                # next Draft keeps its authored preview settings.
         elif recovery_at_download.get("draft_action") == DRAFT_ACTION_FINAL:
             completed_draft_source = _seedance_draft_source_value(recovery_at_download.get("draft_source"))
             if completed_draft_source:
                 completed_draft_source["final_job_id"] = generation_id
+                target = completed_draft_source.get("final_resolution")
+                if target in DRAFT_FINAL_RESOLUTIONS:
+                    completed_draft_source.setdefault("final_jobs", {})[target] = generation_id
                 self._store_draft_source(completed_draft_source)
         self._set_generation_recovery_checkpoint(
             stage="local_succeeded",
@@ -14611,7 +14882,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
 
     async def _reuse_saved_generation_result(
-        self, generation_id: str, checkpoint: dict[str, Any] | None = None,
+        self, generation_id: str, checkpoint: dict[str, Any] | None = None, *, review_source: Future | None = None,
     ) -> bool:
         """Restore an exact completed task without publishing its file again.
 
@@ -14711,6 +14982,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise validation_error
         if file_identity is None:
             return False
+        if review_source is not None:
+            review_source.set_result(path)
 
         artifact = self.parameter_output_values.get("VIDEO_OUT")
         if artifact_path(artifact) != path:
@@ -14751,6 +15024,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return
         generation_id = ""
         operation_phase = "broker_lookup"
+        review_claim = ExitStack()
+        review_source = None
         try:
             generation_id = self._authoritative_existing_generation_id()
             if not generation_id:
@@ -14845,9 +15120,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             await self._run_blocking_generation_stage(self._observe_reference_lease_response,
                 response, bridge, broker_origin, requested_generation_id,
                 recovery_contract.get("reference_lease_id", ""))
+            if status == "succeeded":
+                review_source = review_claim.enter_context(_completed_review_source(bridge, generation_id))
             if preserve_local_success:
                 operation_phase = "local_validation"
-                if await self._reuse_saved_generation_result(generation_id, recovery_contract):
+                if await self._reuse_saved_generation_result(
+                    generation_id, recovery_contract, review_source=review_source,
+                ):
                     return
             if status == "succeeded":
                 operation_phase = "local_result"
@@ -14924,6 +15203,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     return_last_frame=bool(
                         refresh_params.get("return_last_frame")
                     ),
+                    review_source=review_source,
                 )
                 return
             if status == "submission_unknown":
@@ -14956,6 +15236,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 return
             if generation_id and self._authoritative_existing_generation_id() != generation_id:
                 return
+            if review_source is not None and not review_source.done():
+                review_source.set_result(None)
             if operation_phase != "local_validation" and generation_id:
                 # A failed GET cannot undo an independently verified local
                 # success. This path never creates a replacement server task.
@@ -15055,6 +15337,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 was_successful=False,
                 result_details=detail,
             )
+        finally:
+            review_claim.close()
 
     def _on_refresh_clicked(
         self,
@@ -15361,13 +15645,21 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 params["_hmb_queue_only_headers"] = bridge._queue_admission_headers(admission, operation)
         if not self._runtime_node_is_live(require_registered=True):
             return
+        final_intent = ""
+        draft_final_identity = None
         if draft_final and not resume_generation_id and not isinstance(self, _HMBWebRerenderExecution):
             state = await self._query_draft_final_server_state(draft_source, bridge=bridge)
-            if state.get("state") != "available" or state.get("eligible") is not True:
+            target = _draft_final_target_state(state, params["resolution"])
+            already_used = draft_source.get("final_request_id") or draft_source.get("final_job_id") or draft_source.get("final_jobs")
+            if ((already_used and not state.get("finals_by_resolution"))
+                    or target.get("state") != "available" or target.get("eligible") is not True):
                 raise _BrokerProtocolError(
                     "This Draft Final is already reserved, unavailable, or awaiting confirmation. "
                     "Review the existing Draft/Final task on the web; no new render was submitted."
                 )
+            final_intent = target["idempotency_key"]
+            if state.get("finals_by_resolution"):
+                draft_final_identity = (target["owner_user_id"], self._hmb_draft_final_status_cache["identity"][-1])
         selection = params.get("_hmb_imageasset_project_selection")
         if (not resume_generation_id and not draft_final and isinstance(selection, dict)
                 and selection.get("schema") == ONLY_PROJECT_SELECTION_SCHEMA):
@@ -15380,6 +15672,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 bridge.require_seedance_draft_features, timeout=10.0,
                 output_format=str(params.get("output_format") or DEFAULT_OUTPUT_FORMAT),
                 allow_output_fallback=True,
+                final_resolution=params["resolution"] if draft_final else None,
             )
             if not self._runtime_node_is_live(require_registered=True):
                 return
@@ -15441,14 +15734,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         draft_client_request_id = ""
         if not resume_generation_id and draft_action != DRAFT_ACTION_OFF:
             context = self._active_draft_final_context()
-            draft_client_request_id = (context["client_request_id"] if context is not None else
+            draft_client_request_id = final_intent or (context["client_request_id"] if context is not None else
                 _seedance_draft_final_request_id(params["draft_job_id"]) if draft_action == DRAFT_ACTION_FINAL else
                 self._new_generation_client_request_id())
             if draft_action == DRAFT_ACTION_PREVIEW:
                 params["_hmb_draft_started_at_ms"] = int(time.time() * 1000)
             draft_output_format = str(params["output_format"])
             base = self._normalized_video_output_path(destination.resolve(), draft_output_format)
-            phase = "draft480p" if draft_action == DRAFT_ACTION_PREVIEW else "final1080p"
+            phase = "draft480p" if draft_action == DRAFT_ACTION_PREVIEW else f"final{params['resolution']}"
             unique_path = base.with_name(f"{base.stem}-{phase}-{draft_client_request_id}.{draft_output_format}")
             destination = _SeedanceDraftOutputDestination(str(unique_path))
             params["_hmb_output_file"] = str(unique_path)
@@ -15535,7 +15828,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if draft_final:
                 final_source = _seedance_draft_source_value(params.get("_hmb_draft_source"))
                 if final_source:
+                    previous_target = final_source.get("final_resolution")
+                    if previous_target in DRAFT_FINAL_RESOLUTIONS and final_source.get("final_job_id"):
+                        final_source.setdefault("final_jobs", {})[previous_target] = final_source["final_job_id"]
+                    final_source.pop("final_job_id", None)
                     final_source["final_request_id"] = client_request_id
+                    final_source["final_resolution"] = params["resolution"]
                     params["_hmb_draft_source"] = final_source
                     self._store_draft_source(final_source)
             self._set_generation_recovery_checkpoint(
@@ -15592,6 +15890,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     bridge.generate_seedance,
                     payload,
                     timeout=min(float(timeout), 1200.0),
+                    **({"draft_final_identity": draft_final_identity} if draft_final_identity else {}),
                     **({"queue_only_headers": params["_hmb_queue_only_headers"]} if params.get("_hmb_queue_only_headers") else {}),
                 )
                 try:
@@ -15622,6 +15921,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 await self._discard_unsent_generation_checkpoint(
                     reason="agent_result_changed_at_submission_gate",
                 )
+                raise
+            except _DraftFinalPreflightError:
+                await self._discard_unsent_generation_checkpoint(reason="draft_final_capability_changed_before_submission")
                 raise
             except _SubmissionCancelledBeforeStart:
                 await self._discard_unsent_generation_checkpoint(

@@ -386,6 +386,201 @@ class DraftShotTests(unittest.TestCase):
         self.assertEqual(node.saved[0][2]['output_format'], 'mov')
         self.assertFalse(Path(node.base.name, 'original.mp4').exists())
 
+    def test_header_command_preserves_resolution_and_source_through_final_save(self):
+        async def scenario(target, advertised):
+            node = Node()
+            node._store_draft_source(completed_source(node))
+            forbid_upstream_work(node)
+            if advertised:
+                profile = node.bridge.capability_response['models'][t.SEEDANCE_2_5_MODEL_ID]
+                profile['draft_final_resolutions'] = ['1080p', '4k']
+            command = {'schema': t.SEEDANCE_REFRESH_COMMAND_SCHEMA, 'version': 1,
+                       'action_id': 'menu-choice', 'action': 'finalize_draft', 'expected_draft_job_id': JOB}
+            if target is not None:
+                command['final_resolution'] = target
+            parameter = node.get_parameter_by_name(t.SEEDANCE_REFRESH_COMMAND_PARAMETER)
+
+            def deliver(envelope):
+                normalized = node.before_value_set(parameter, envelope)
+                node.parameter_values[parameter.name] = normalized
+                node.after_value_set(parameter, normalized)
+
+            with run_boundaries(node), engine_loop_patch(asyncio.get_running_loop()):
+                deliver({**command, 'final_resolution': '720p'})
+                deliver({**command, 'expected_draft_job_id': 'job-' + 'b' * 32})
+                self.assertFalse(getattr(node, '_hmb_draft_finalize_future', None))
+                deliver(command)
+                await asyncio.wrap_future(node._hmb_draft_finalize_future)
+                if target == '4k' and not advertised:
+                    self.assertEqual(node.bridge.posts, [])
+                    self.assertEqual(node.saved, [])
+                    self.assertNotIn('final_request_id', node._draft_source_record())
+                    self.assertTrue(node._draft_ui_state()['final_available'])
+                    return
+                expected = target or '1080p'
+                self.assertEqual(len(node.bridge.posts), 1, node._set_status_results.call_args_list)
+                wire = node.bridge.posts[0]
+                self.assertEqual((wire['draft_job_id'], wire['resolution'], wire['client_request_id']),
+                                 (JOB, expected, t._seedance_draft_final_request_id(JOB)))
+                self.assertEqual(node.get_parameter_value('resolution'), '480p')
+                self.assertIn('final' + expected, node.saved[0][1])
+                self.assertTrue(node.saved[0][1].endswith('.mov'))
+                self.assertEqual(node._generation_recovery_state()['draft_final_resolution'], expected)
+                deliver({**command, 'action_id': 'second-choice', 'final_resolution': '1080p'})
+                self.assertEqual(len(node.bridge.posts), 1)
+        for target, advertised in ((None, False), ('1080p', True), ('4k', True), ('4k', False)):
+            with self.subTest(target=target, advertised=advertised):
+                asyncio.run(scenario(target, advertised))
+
+    def test_4k_capability_withdrawn_directly_before_create_releases_local_final(self):
+        async def scenario():
+            node = Node()
+            source = completed_source(node)
+            node._store_draft_source(source)
+            forbid_upstream_work(node)
+            profile = node.bridge.capability_response['models'][t.SEEDANCE_2_5_MODEL_ID]
+            profile['draft_final_resolutions'] = ['1080p', '4k']
+            transport = node.bridge._authenticated_capability_bridge()
+            node.bridge.generate_seedance = transport.generate_seedance
+            # The first capability read allows 4K. The second at the wire
+            # boundary sees a server that now advertises only legacy 1080p.
+            with run_boundaries(node), engine_loop_patch(asyncio.get_running_loop()), mock.patch.object(
+                transport, '_request_json', return_value=base.capability(),
+            ) as request:
+                accepted = node._on_finalize_draft_clicked(None, None, action_id='4k-before-downgrade',
+                    expected_draft_job_id=JOB, final_resolution='4k')
+                self.assertTrue(accepted.success)
+                await asyncio.wrap_future(node._hmb_draft_finalize_future)
+                self.assertEqual([call.args[0] for call in request.call_args_list], ['GET'])
+                self.assertNotIn('final_request_id', node._draft_source_record())
+                self.assertTrue(node._draft_ui_state()['final_available'])
+                self.assertEqual(node.saved, [])
+        asyncio.run(scenario())
+
+    def test_public_header_can_finalize_each_resolution_of_one_draft_with_scoped_preflight(self):
+        async def scenario(first, second, *, split=False, withdraw_second=False):
+            node = Node()
+            source = completed_source(node)
+            forbid_upstream_work(node)
+            node.bridge.capability_response['models'][t.SEEDANCE_2_5_MODEL_ID]['draft_final_resolutions'] = ['1080p', '4k']
+            children = {}
+            posts = []
+            wire_calls = []
+            draft_file = Path(node.destination.resolve())
+            draft_file.write_bytes(b'original 480p')
+
+            def broker_state(*, downgrade=False, requested=None):
+                def row(resolution, child):
+                    return {'schema': 'hmb-review-draft-final-v1', 'state_schema': 'hmb-draft-final-state-v1',
+                        'source_task_id': JOB, 'is_draft': True, **PROJECT, 'owner_user_id': 7,
+                        'state': 'completed' if child else 'available', 'eligible': not child, 'consumed': bool(child),
+                        'checked_at': int(time.time()), 'expires_at': int(time.time()) + 604800,
+                        'child_task_id': child, 'child_status': 'succeeded' if child else None,
+                        'idempotency_key': t._seedance_draft_final_request_id(JOB, resolution)}
+
+                if split and requested and not downgrade:
+                    result = row(requested, children.get(requested))
+                    result["resolution"] = requested
+                    result["idempotency_key"] = f"hmb-draft-final-v1-{JOB}" + ("-4k" if requested == "4k" else "")
+                    return result
+                result = row(None, next(reversed(children.values())) if children else None)
+                if not downgrade:
+                    result['finals_by_resolution'] = {quality: row(quality, children.get(quality)) for quality in ('1080p', '4k')}
+                return result
+
+            def read_source(record, *, timeout=5):
+                if split:
+                    return transport.get_draft_final_state(record, timeout=timeout)
+                return t._seedance_draft_final_state_value(broker_state(), record)
+
+            def wire(method, path, *, payload=None, **kwargs):
+                wire_calls.append((method, path))
+                if (method, path) == ('GET', t.BROKER_SEEDANCE_CAPABILITIES_PATH + '?draft=1'):
+                    return deepcopy(node.bridge.capability_response)
+                state_path = transport._review_task_path(JOB) + '/draft-final'
+                if method == 'GET' and path in [state_path + '?resolution=' + q for q in ('1080p', '4k')]:
+                    return broker_state(requested=path.split('=')[-1], downgrade=withdraw_second and len(children) == 1)
+                self.assertEqual((method, path), ('POST', '/api/v1/generate/video'))
+                target = payload['resolution']
+                self.assertEqual(wire_calls[-2][0], 'GET')
+                self.assertIn(wire_calls[-2][1], [state_path + '?resolution=' + q for q in ('1080p', '4k')])
+                self.assertNotIn(target, children)
+                self.assertEqual((payload['draft_job_id'], payload['project_id'], payload['output_format']), (JOB, PROJECT['project_id'], 'mov'))
+                expected_key = broker_state(requested=target)['idempotency_key'] if split else t._seedance_draft_final_request_id(JOB, target)
+                self.assertEqual((payload['client_request_id'], kwargs['idempotency_key']), (expected_key, expected_key))
+                posts.append(deepcopy(payload))
+                children[target] = 'job-' + str(len(children)+1)*32
+                return {'id': children[target], 'status': 'succeeded', 'video_url': children[target]}
+
+            async def publish_bytes(destination, video_bytes, output_format, verifier):
+                path = Path(destination.resolve())
+                with path.open('xb') as stream:
+                    stream.write(video_bytes)
+                node.saved.append((video_bytes.decode('ascii'), path, output_format))
+                return SimpleNamespace(location=str(path), name=path.name)
+
+            node.bridge.get_draft_final_state = read_source
+            transport = node.bridge._authenticated_capability_bridge()
+            transport._load_access_token = node.bridge._load_access_token
+            node.bridge.generate_seedance = transport.generate_seedance
+            node._save_completed_task = t.HMBSeedanceGeneration._save_completed_task.__get__(node)
+            node._extract_video_url = lambda task: task['video_url']
+            node._download_broker_video = mock.AsyncMock(side_effect=lambda job_id: job_id.encode('ascii'))
+            node._atomic_publish_completed_video = publish_bytes
+            node._record_completed_video_source = mock.Mock()
+            node._schedule_review_sync = mock.Mock()
+            parameter = node.get_parameter_by_name(t.SEEDANCE_REFRESH_COMMAND_PARAMETER)
+
+            def press(target):
+                command = {'schema': t.SEEDANCE_REFRESH_COMMAND_SCHEMA, 'version': 1, 'action_id': str(uuid4()),
+                           'action': 'finalize_draft', 'expected_draft_job_id': JOB, 'final_resolution': target}
+                normalized = node.before_value_set(parameter, command)
+                node.parameter_values[parameter.name] = normalized
+                node.after_value_set(parameter, normalized)
+
+            with run_boundaries(node), engine_loop_patch(asyncio.get_running_loop()), mock.patch.object(transport, '_request_json', side_effect=wire):
+                node._store_draft_source(source)
+                for index, target in enumerate((first, second)):
+                    press(target)
+                    active = node._hmb_draft_finalize_future
+                    self.assertIsNotNone(active, node._set_status_results.call_args_list)
+                    press(target)
+                    self.assertIs(node._hmb_draft_finalize_future, active)
+                    await asyncio.wrap_future(active)
+                    if withdraw_second and index == 1:
+                        break
+                    self.assertEqual([p['resolution'] for p in posts], [first, second][:index+1], node._set_status_results.call_args_list)
+                    self.assertEqual(node.saved[index][1].read_bytes(), children[target].encode('ascii'))
+                    press(target)
+                    self.assertIs(node._hmb_draft_finalize_future, active)
+                    self.assertEqual(node.get_parameter_value('resolution'), '480p')
+                    self.assertEqual(draft_file.read_bytes(), b'original 480p')
+                    self.assertEqual(node.saved[0][1].read_bytes(), children[first].encode('ascii'))
+                if withdraw_second:
+                    self.assertEqual(wire_calls[-1][0], 'GET')
+                    self.assertTrue(wire_calls[-1][1].startswith(transport._review_task_path(JOB) + '/draft-final?resolution='))
+                else:
+                    for used in (first, second):
+                        press(used)
+                        self.assertIs(node._hmb_draft_finalize_future, active)
+            expected = [first] if withdraw_second else [first, second]
+            self.assertEqual([p['resolution'] for p in posts], expected)
+            self.assertEqual(len({p['client_request_id'] for p in posts}), len(expected))
+            self.assertEqual(len({entry[1] for entry in node.saved}), len(expected))
+            record = node._draft_source_record()
+            self.assertEqual(record['draft_job_id'], JOB)
+            self.assertEqual(record['final_jobs'], children)
+            for target, (job_id, path, _) in zip(expected, node.saved, strict=True):
+                self.assertIn('final' + target, path.name)
+                self.assertEqual(path.read_bytes(), job_id.encode('ascii'))
+            self.assertEqual(draft_file.read_bytes(), b'original 480p')
+
+        for split in (True, False):
+            for first, second in (('1080p', '4k'), ('4k', '1080p')):
+                with self.subTest(first=first, second=second, split=split):
+                    asyncio.run(scenario(first, second, split=split))
+        asyncio.run(scenario('1080p', '4k', withdraw_second=True))
+
     def test_double_click_schedules_one_final_and_later_click_cannot_repeat_it(self):
         async def scenario():
             node = Node()

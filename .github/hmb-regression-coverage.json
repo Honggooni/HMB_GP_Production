@@ -1200,6 +1200,12 @@
       "required": true
     },
     {
+      "name": "HMB_Workstation_Review_Media_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_Color_LUT_Host_Regression.py",
       "mode": "manual",
       "coverage": "installed_sdk",

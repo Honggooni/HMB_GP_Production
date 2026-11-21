@@ -78,7 +78,7 @@ class OnlyProjectOpener(transport_fixture.RouteOpener):
         parsed = urlsplit(request.full_url)
         if (request.get_method() == "GET" and parsed.path.startswith("/api/v1/reviews/tasks/")
                 and parsed.path.endswith("/draft-final")):
-            assert not parsed.query
+            assert parsed.query == "resolution=1080p"
             assert request.data is None
             assert request.get_header("Authorization") == "Bearer " + transport_fixture.SYNTHETIC_TOKEN
             source_id = parsed.path.split("/")[-2]

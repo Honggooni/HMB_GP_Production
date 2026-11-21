@@ -139,7 +139,7 @@ class RouteOpener:
         return [call["path"] for call in self.calls
                 if call["method"] == "GET"
                 and call["path"].startswith("/api/v1/reviews/tasks/")
-                and call["path"].endswith("/draft-final")]
+                and urlsplit(call["path"]).path.endswith("/draft-final")]
 
     def open(self, request, timeout):
         assert request.get_header("Authorization") == "Bearer " + SYNTHETIC_TOKEN
@@ -155,7 +155,7 @@ class RouteOpener:
         METRICS["synthetic_authenticated_requests"] += 1
         if (method == "GET" and parsed.path.startswith("/api/v1/reviews/tasks/")
                 and parsed.path.endswith("/draft-final")):
-            assert not parsed.query
+            assert parsed.query == "resolution=1080p"
             assert request.data is None
             source_id = parsed.path.split("/")[-2]
             assert source_id == base.JOB
@@ -429,7 +429,7 @@ class CapabilityRoutingTests(unittest.TestCase):
             self.assertEqual(set(opener.capability_paths), {DRAFT_PATH})
             self.assertGreater(len(opener.state_paths), state_gets_before_click)
             self.assertEqual(set(opener.state_paths), {
-                "/api/v1/reviews/tasks/" + base.JOB + "/draft-final"})
+                "/api/v1/reviews/tasks/" + base.JOB + "/draft-final?resolution=1080p"})
             self.assertEqual(opener.posts[0]["body"], {"provider": "volcengine_ark",
                 "model": t.SEEDANCE_2_5_MODEL_ID, "draft_job_id": base.JOB,
                 "resolution": "1080p", "output_format": "mov", **base.PROJECT,
