@@ -4,11 +4,14 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 import importlib.util
+import io
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+from urllib.response import addinfourl
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('web_final_shot_fixture', Path(__file__).with_name('HMB_Seedance_Draft_Shot_Regression.py'))
@@ -98,14 +101,22 @@ class FinalParityTests(unittest.TestCase):
 
     def test_transport_idempotency_header_matches_body(self):
         _, body = self.header_final()
-        bridge = t._HMBAIBrokerBridge(server_url=base.ORIGIN)
+        state = base.FakeBridge()
+        create_url = base.ORIGIN + '/api/v1/generate/video'
+        reply = addinfourl(io.BytesIO(b'{"job_id":"job-test-final"}'), {}, create_url, code=200)
+        bridge = t._HMBAIBrokerBridge(server_url=base.ORIGIN, opener=mock.Mock())
         with mock.patch.object(bridge, 'require_seedance_draft_features'), \
              mock.patch.object(bridge, 'queue_admission', return_value=None), \
-             mock.patch.object(bridge, '_request_json', return_value={'job_id': base.JOB}) as request:
+             mock.patch.object(bridge, 'get_draft_final_state', state.get_draft_final_state), \
+             mock.patch.object(bridge, '_load_access_token', state._load_access_token), \
+             mock.patch.object(bridge, '_open_create_request', return_value=reply) as send:
             bridge.generate_seedance(body, timeout=1)
-        self.assertEqual(request.call_args.args[:2], ('POST', '/api/v1/generate/video'))
-        self.assertEqual(request.call_args.kwargs['payload'], body)
-        self.assertEqual(request.call_args.kwargs['idempotency_key'], body['client_request_id'])
+        self.assertEqual(state.draft_state_calls, [base.JOB])
+        send.assert_called_once()
+        request = send.call_args.args[0]
+        self.assertEqual((request.get_method(), request.full_url), ('POST', create_url))
+        self.assertEqual(json.loads(request.data), body)
+        self.assertEqual(request.get_header('Idempotency-key'), body['client_request_id'])
 
     def test_reserved_final_disables_button_and_stale_second_click(self):
         node, _ = self.header_final()

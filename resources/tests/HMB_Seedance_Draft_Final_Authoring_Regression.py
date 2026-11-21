@@ -184,7 +184,7 @@ class DraftFinalAuthoringTests(unittest.TestCase):
                 call = scheduled.call_args
                 self.assertEqual(call.args, (node.bridge, JOB))
                 self.assertIs(call.kwargs['private'], False)
-                self.assertEqual(call.kwargs['local_source'].result(timeout=0), Path(node.destination.resolve()))
+                self.assertTrue(Path(node.destination.resolve()).samefile(call.kwargs['local_source'].result(timeout=0)))
                 self.assertTrue(node.parameter_output_values['VIDEO_OUT'])
                 self.assertEqual(node.bridge.posts, [])
 
@@ -230,7 +230,7 @@ class DraftFinalAuthoringTests(unittest.TestCase):
             path.write_bytes(data)
             return SimpleNamespace(location=str(path), name=path.name)
         def encode(source, directory, cancel, *, expected_sha256):
-            self.assertEqual(source, Path(node.destination.resolve()))
+            self.assertTrue(source.samefile(node.destination.resolve()))
             self.assertEqual(source.read_bytes(), original)
             poster, preview = directory / 'poster.jpg', directory / 'preview.mp4'
             poster.write_bytes(b'\xff\xd8poster')

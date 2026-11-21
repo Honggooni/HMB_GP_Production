@@ -175,12 +175,14 @@ class WorkstationMediaTest(unittest.TestCase):
                                      ("job-mybox-" + "2" * 32, path, True)):
             broker = Broker(task, self.source, private)
             broker.lost_response = True
+            existing_pointers = set(self.root.rglob("local-source.json"))
             self.assertEqual(self.schedule(broker, local_source=media, private=private).result(5)["state"], "ready")
             self.assertEqual(broker.count("GET", broker.original), 0)
             self.assertEqual(broker.count("GET", broker.route), 2)
             self.assertEqual(broker.count("POST", broker.route), 1)
             if isinstance(media, Path):
-                self.assertTrue(any(json.loads(p.read_bytes())["path"] == str(path) for p in self.root.rglob("local-source.json")))
+                pointer, = set(self.root.rglob("local-source.json")) - existing_pointers
+                self.assertTrue(Path(json.loads(pointer.read_bytes())["path"]).samefile(path))
                 broker.ready = False
                 self.schedule(broker, private=private).result(5)
                 self.assertEqual(broker.count("GET", broker.original), 0)
@@ -227,12 +229,14 @@ class WorkstationMediaTest(unittest.TestCase):
         path = self.root / "changing.mov"
         path.write_bytes(self.source)
         def invalidate(source, directory, cancel, *, expected_sha256):
-            if source == path:
+            if source.samefile(path):
                 path.write_bytes(b"x" * len(self.source))
                 raise worker.ColorLUTError("The video changed while preparing its review media.")
             return self.encoder(source, directory, cancel, expected_sha256=expected_sha256)
         with patch.object(worker, "make_review_media", invalidate):
             self.assertEqual(self.schedule(local_source=path).result(5)["state"], "ready")
+        self.assertEqual(path.read_bytes(), b"x" * len(self.source))
+        self.assertEqual(self.encoded, 1)
         self.assertEqual(self.broker.count("GET", self.broker.original), 1)
         self.assertEqual(self.broker.count("POST", self.broker.route), 1)
         broker = Broker("job-healthy-source-encoder-error", self.source)
@@ -479,14 +483,14 @@ class WorkstationMediaTest(unittest.TestCase):
             path.write_bytes(raw)
             directory = self.root / suffix[1:]
             directory.mkdir()
-            self.assertEqual(worker._original(session,broker.task,state,directory,path),path)
+            self.assertTrue(worker._original(session, broker.task, state, directory, path).samefile(path))
             self.assertFalse(any(directory.glob("source.*")))
-            self.assertEqual(worker._original(session,broker.task,state,directory,None),path)
+            self.assertTrue(worker._original(session, broker.task, state, directory, None).samefile(path))
             path.unlink()
             cached = worker._original(session,broker.task,state,directory,None)
             self.assertEqual(cached.suffix,suffix)
             self.assertEqual(cached.read_bytes(),raw)
-            self.assertEqual(worker._original(session,broker.task,state,directory,None),cached)
+            self.assertTrue(worker._original(session, broker.task, state, directory, None).samefile(cached))
             self.assertEqual(broker.count("GET",broker.original),1)
 
     def test_cache_lock_coalesces_independent_worker_sessions(self):

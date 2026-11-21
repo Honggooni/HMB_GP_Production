@@ -184,7 +184,7 @@ class SavedTaskRefreshTests(unittest.TestCase):
             call = self.media_schedule.call_args
             self.assertEqual(call.args, (node.bridge, JOB))
             self.assertIs(call.kwargs['private'], False)
-            self.assertEqual(call.kwargs['local_source'].result(timeout=0), path)
+            self.assertTrue(path.samefile(call.kwargs['local_source'].result(timeout=0)))
         self.assert_no_publication(node)
         self.assertEqual(file_identity(path), before)
         self.assertEqual(list(path.parent.iterdir()), [path])
