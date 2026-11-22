@@ -92,6 +92,34 @@ def owner():
 
 
 class ExecutionContextTests(unittest.TestCase):
+    def test_text_only_direction_requires_an_empty_reference_list_in_both_snapshots(self):
+        fields = {"SCENE_CONTEXT": "Follow the clockwork bird."}
+        job = {"schema": "hmb-public-job-data", "images": [], "videos": []}
+
+        def prompt(data):
+            return "\n".join(("HMB JOB DATA (JSON):", json.dumps(data),
+                              "USER DESCRIPTION DATA (JSON):", json.dumps(fields)))
+
+        empty = {"images": [], "videos": []}
+        self.assertEqual(agent_module._sw_text_only_fields(prompt(job), empty), fields)
+        for kind in ("images", "videos", "audios"):
+            with self.subTest(kind=kind):
+                bound = {kind: [{"target_id": "clockwork-bird"}]}
+                self.assertEqual(agent_module._sw_text_only_fields(prompt(job | bound), empty), {})
+                self.assertEqual(agent_module._sw_text_only_fields(prompt(job), empty | bound), {})
+
+    def test_preserved_text_and_qualified_directions_survive_the_output_pass(self):
+        scene = "Replace the humanoid proxy with a winged robot. Keep the original acting and camera."
+        output = "Maintain the existing established lighting setup, unchanged from the original scene lighting."
+        finish = agent_module._sw_finish_text_only_direction
+        self.assertEqual(finish(output, {"SCENE_CONTEXT": scene}), "Maintain the existing lighting setup.")
+        for edits in ({"PRESERVED_TEXT": "Stage LEFT"}, {"EMOTION_INTENT": "Hold before the turn."},
+                      {"SCENE_CONTEXT": scene + " Except when the second performer enters."}):
+            with self.subTest(edits=edits):
+                self.assertEqual(finish(output, {"SCENE_CONTEXT": scene} | edits), output)
+        quoted = 'The screen reads "Maintain the existing established lighting setup."'
+        self.assertEqual(finish(quoted, {"SCENE_CONTEXT": scene}), quoted)
+
     def test_draft_parent_mode_reaches_agent_instead_of_being_silently_dropped(self):
         for draft, expected in ((True, generator.DRAFT_ACTION_PREVIEW), (False, generator.DRAFT_ACTION_OFF)):
             with self.subTest(draft=draft):

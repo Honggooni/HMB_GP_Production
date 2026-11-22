@@ -441,6 +441,79 @@ ONLY_ACTIVE_PROJECT_IDS = ("superwings12", "katuri8")
 ONLY_PROJECT_CHOICES = (ONLY_PROJECT_UNSELECTED, *(project_display_name(key) for key in ONLY_ACTIVE_PROJECT_IDS),
                         _my_box_node.protocol.MY_BOX_LABEL)
 
+# Public guidance for a native text Agent feeding an independent Super Wings render.
+_ONLY_AGENT_PRODUCTION_RULE = (
+    "Turn the artist's shot direction into the final video prompt. Return the prompt itself, in the "
+    "requested language and format, without headings, commentary or clarification questions unless "
+    "the artist explicitly requests a different deliverable. Preserve written dialogue, signs, tokens "
+    "and deliberate overrides exactly. Use the artist's explicit instructions and configured behaviors "
+    "ahead of these defaults. In animation, '원래 연기' alongside the camera or a performer's motion means "
+    "the original acting and its timing. Describe smoke when the artist actually specifies smoke. "
+    "When a mask points to the aircraft to replace ('마스크는 그 기체를 가리킨다'), use it to identify "
+    "that instance and allow the replacement silhouette. Use the mask as a fixed matte, clip or occluder "
+    "when the artist assigns that role. Keep the approved character design, camera, lighting or other "
+    "properties the brief asks to preserve. Transfer acting beats and contact targets to a new body "
+    "without assuming matching joints. Describe a requested wrap in depth, visible in front according "
+    "to opacity, hidden behind opaque occluders and visible again as it clears them. Apply those details "
+    "only where the brief calls for them. Treat references named in text as artist instructions; claim "
+    "observations only from media actually available. Leave unspecified details open."
+)
+
+
+def _only_agent_inference(source, state, prompt, output_type):
+    """Give this native call its own rules, leaving the saved node and returned AgentState alone."""
+    if output_type is str:
+        try:
+            from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
+
+            # One upstream run publishes one result for all consumers. A mixed route keeps the
+            # artist's native Agent behavior. Re-read the actual edges, modes and project at run time.
+            edges = [
+                edge for edge in source.workflow.flows.connections.get_all_outgoing_connections(source)
+                if edge.source_parameter.output_type != ParameterTypeBuiltin.CONTROL_TYPE.value
+            ]
+            if edges and all(
+                edge.source_node is source and edge.source_parameter.name == "output"
+                and type(edge.target_node) is HMBSeedanceGeneration and edge.target_parameter.name == "prompt"
+                and edge.target_node._hmb_seedance_execution_mode() == "only"
+                and edge.target_node._hmb_generation_project().get("project_id") == "superwings12"
+                for edge in edges
+            ):
+                request_state = copy(state)
+                request_state.rulesets = [
+                    {"name": "HMB Only production defaults", "rules": [_ONLY_AGENT_PRODUCTION_RULE]},
+                    *state.rulesets,
+                ]
+                state = request_state
+        except Exception:
+            # An unavailable/transitioning graph contributes no default. Native inference still runs.
+            logging.getLogger(__name__).debug("Only Agent routing was unavailable; retaining native behavior.")
+    return type(source)._process(source, state, prompt, output_type)
+
+
+def _sync_only_agent_connection(source, source_parameter, *, removed=False):
+    """Adapt just the registered Standard Agent instance on this prompt edge."""
+    if getattr(source_parameter, "name", "") != "output" or type(source).__name__ != "Agent":
+        return
+    try:
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+        if type(source) is not LibraryRegistry.get_library("Griptape Nodes Library").get_node_class("Agent"):
+            return
+        instance_method = vars(source).get("_process")
+        if removed:
+            if getattr(instance_method, "__func__", None) is _only_agent_inference:
+                remaining = source.workflow.flows.connections.get_outgoing_connections_from_parameter(source, source_parameter)
+                if not any(edge.source_node is source and type(edge.target_node) is HMBSeedanceGeneration
+                           and edge.target_parameter.name == "prompt" for edge in remaining):
+                    del source._process
+        elif "_process" not in vars(source) and tuple(inspect.signature(type(source)._process).parameters) == (
+            "self", "state", "prompt", "output_type",
+        ):
+            source._process = _only_agent_inference.__get__(source)
+    except Exception:
+        logging.getLogger(__name__).debug("Native Agent connection retained without the optional Only defaults.")
+
 
 class _ProjectSelectionChanged(ValueError):
     """The captured local selection lost authority before a create request."""
@@ -7618,6 +7691,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         result = super().after_incoming_connection(source_node, source_parameter, target_parameter)
         target_name = getattr(target_parameter, "name", "")
         if target_name == "prompt":
+            _sync_only_agent_connection(source_node, source_parameter)
             self._hmb_refresh_managed_prompt_projection(source_node=source_node, force=True)
         elif target_name == SHOT_SOUND_INPUT_PARAMETER:
             self._hmb_refresh_prompt_sound_audio()
@@ -7625,6 +7699,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     def after_incoming_connection_removed(self, source_node: Any, source_parameter: Any, target_parameter: Any) -> None:
         result = super().after_incoming_connection_removed(source_node, source_parameter, target_parameter)
+        if getattr(target_parameter, "name", "") == "prompt":
+            _sync_only_agent_connection(source_node, source_parameter, removed=True)
         if getattr(target_parameter, "name", "") in {"prompt", SHOT_SOUND_INPUT_PARAMETER}:
             self._hmb_refresh_prompt_sound_audio()
         return result

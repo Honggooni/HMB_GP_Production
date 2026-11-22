@@ -134,6 +134,62 @@ def register(engine, modules):
     return schema
 
 
+def check_connected_only_agent(engine, t, agents, generator):
+    from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
+    from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, DeleteConnectionRequest
+    from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
+    from griptape_nodes_library.llm.agent_state import AgentState
+    from griptape_nodes_library.llm.model_config import ModelConfig, ModelProvider
+
+    schema = LibrarySchema.model_validate_json((STANDARD / "griptape_nodes_library.json").read_bytes())
+    library = LibraryRegistry.generate_new_library(schema)
+    metadata = next(n.metadata for n in schema.nodes if n.class_name == "Agent")
+    library.register_lazy_node_type("Agent", metadata, lambda: agents._BuiltinAgent)
+    created = send(engine, CreateNodeRequest(node_type="Agent", specific_library_name=schema.name,
+        node_name="Only delivery Agent", initial_setup=True, create_error_proxy_on_failure=False))
+    source = engine.node_manager.get_node_by_name(created.node_name)
+    native = importlib.import_module(type(source).__module__)
+    custom = {"name": "Artist", "rules": ["Keep the on-screen title verbatim."]}
+    state = AgentState(model=ModelConfig(provider=ModelProvider.OLLAMA, model="offline-fixture"), rulesets=[custom])
+    brief = "Keep the timing. Preserve the sign {{TITLE_0}}."
+    source.set_parameter_value("agent", state.to_wire(), initial_setup=True)
+    source.set_parameter_value("prompt", brief, initial_setup=True)
+
+    def check(expected_default):
+        # Capture the native model-construction boundary without loading a model or running inference.
+        with mock.patch.object(native, "build_agent_from_state", return_value=mock.sentinel.model) as build, \
+             mock.patch.object(native, "run_agent", return_value=None) as run:
+            steps = source.process()
+            step = next(steps)
+            assert step() is None and next(steps, None) is None
+        build.assert_called_once()
+        run.assert_called_once()
+        assert run.call_args.args == (mock.sentinel.model, brief)
+        rules = build.call_args.args[0].rulesets
+        if expected_default:
+            assert len(rules) == 2 and rules[0]["rules"] == [t._ONLY_AGENT_PRODUCTION_RULE]
+        assert rules[int(expected_default):] == [custom]
+        assert source.parameter_output_values["agent"]["rulesets"] == [custom]
+        assert source.get_parameter_value("agent") == state.to_wire()
+
+    edge = dict(source_node_name=source.name, source_parameter_name="output",
+                target_node_name=generator.name, target_parameter_name="prompt")
+    generator.set_parameter_value("only_project", t.project_display_name("superwings12"), initial_setup=True)
+    check(False)
+    send(engine, CreateConnectionRequest(**edge, initial_setup=True))
+    check(True)
+    source.set_parameter_value("output_schema", {"type": "object", "properties": {"cue": {"type": "string"}}})
+    check(False)
+    source.set_parameter_value("output_schema", None)
+    generator.set_parameter_value("only_project", t.project_display_name("katuri8"), initial_setup=True)
+    check(False)
+    generator.set_parameter_value("only_project", t.project_display_name("superwings12"), initial_setup=True)
+    check(True)
+    send(engine, DeleteConnectionRequest(**edge))
+    check(False)
+    record("only_agent_defaults_follow_actual_route_and_preserve_authored_state", model_calls=0)
+
+
 async def exercise(engine, phase, out):
     t = importlib.import_module("HMBSeedanceGeneration")
     agents = importlib.import_module("HMBAgentLibrary")
@@ -385,6 +441,7 @@ async def exercise(engine, phase, out):
             assert params["_hmb_generation_mode"] == "only"
             send(engine, DeleteConnectionRequest(**edge))
         record("native_standard_and_ordinary_prompt_inputs_allowed_without_execution")
+        check_connected_only_agent(engine, t, agents, gen)
 
 
 def run_phase(phase, out):

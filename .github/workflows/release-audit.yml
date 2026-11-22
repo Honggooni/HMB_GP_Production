@@ -357,6 +357,7 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Loads the signed Super Wings 12 v8.1 policy for linked Prompt and Agent shots. The independent Seedance Only route applies its Super Wings defaults to a connected Standard text Agent and preserves authored directions and other project routes.",
             "- Seedance writes SDK-readable output metadata for MOV, MP4 and last-frame PNG files. Indexed PNG destinations now allocate the next available name, including concurrent saves.",
             "- Seedance resolves output names in the workflow that owns the destination and reuses the filename search when publishing a completed video.",
             "- Color LUT and other Broker clients can check sign-in status without creating a credentials directory on first use.",
