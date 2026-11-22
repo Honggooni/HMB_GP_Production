@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import math
 import os
@@ -25,6 +26,23 @@ from _hmb_native_test_job import run_native_test
 MAYA_RUNNER = ROOT / "resources" / "maya" / "HMB_Maya_Background_Preview.py"
 MAYA_COMMAND = picker._maya_runner_command()
 MEDIA_SUFFIXES = {".avi", ".mov", ".mp4", ".png"}
+
+
+@contextmanager
+def _private_matrix_directory(parent: Path):
+    directory = tempfile.TemporaryDirectory(prefix="hmb-fast-read-", dir=parent)
+    try:
+        yield Path(directory.name)
+    finally:
+        # A just-exited Maya helper can briefly retain a handle into this test directory.
+        for attempt in range(11):
+            try:
+                directory.cleanup()
+                break
+            except OSError as error:
+                if os.name != "nt" or getattr(error, "winerror", None) not in (32, 33) or attempt == 10:
+                    raise
+                time.sleep(0.15)
 
 
 def _clean(value: Any) -> str:
@@ -320,8 +338,7 @@ def main() -> int:
 
     private_parent = ROOT / ".tmp"
     private_parent.mkdir(exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="hmb-fast-read-", dir=private_parent) as temp_text:
-        matrix_root = Path(temp_text)
+    with _private_matrix_directory(private_parent) as matrix_root:
         results = [
             _run_case(
                 index=index,

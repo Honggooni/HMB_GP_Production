@@ -548,6 +548,27 @@ class WorkstationMediaTest(unittest.TestCase):
         self.assertEqual(broker.count("GET", broker.original), 0)
         self.assertEqual(broker.count("POST", broker.route), 1)
 
+        # Long review cache paths are common with redirected Windows profiles.
+        # Exercise real input, JPEG and MP4 paths beyond MAX_PATH.
+        from PIL import Image
+        from _hmb_color_lut import _review_media_tools, make_review_media
+        directory = self.root
+        while len(str(directory)) < 275:
+            directory = directory / ("review-cache-" + "a" * 35)
+        directory.mkdir(parents=True)
+        long_source = directory / "source.mp4"
+        long_source.write_bytes(source.read_bytes())
+        poster, preview = make_review_media(long_source, directory, threading.Event(), expected_sha256=broker.sha)
+        with Image.open(poster) as image:
+            self.assertEqual((image.format, image.size), ("JPEG", (640, 360)))
+            image.load()
+        _, ffprobe = _review_media_tools()
+        streams = subprocess.check_output(
+            [ffprobe, "-v", "error", "-show_streams", "-of", "json", str(preview)], timeout=30)
+        video = json.loads(streams)["streams"][0]
+        self.assertEqual((video["codec_name"], video["width"], video["height"], video["nb_frames"]),
+                         ("h264", 64, 48, "12"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

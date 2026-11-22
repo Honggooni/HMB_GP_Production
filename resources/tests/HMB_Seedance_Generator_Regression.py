@@ -1003,10 +1003,19 @@ def assert_draft_hides_inapplicable_output_controls_without_losing_authorship() 
         assert node.get_parameter_value("return_last_frame") is True
 
     check_visibility(True)
-    source = {"draft_job_id": "job-" + "a" * 32}
-    with mock.patch.object(node, "_draft_source_record", return_value=source), \
+    incomplete = {"draft_job_id": "job-" + "a" * 32}
+    node.set_parameter_value("only_project", "슈퍼윙즈12")
+    source = {**incomplete, "project_id": "superwings12", "project_name": "슈퍼윙즈12",
+              "broker_server_url": "https://broker.example.test", "completed": True}
+    with mock.patch.object(node, "_hmb_generation_project", side_effect=node._selected_only_project), \
          mock.patch.object(node, "_draft_final_server_snapshot", return_value={"state": "available", "eligible": True}), \
-         mock.patch.object(node, "_validated_draft_final_source", return_value=source):
+         mock.patch.object(node, "_draft_source_record", return_value=incomplete) as draft_record:
+        node._update_parameter_visibility()
+        assert not node._draft_ui_state()["final_available"]
+        assert target.DRAFT_ACTION_FINAL not in node.get_parameter_by_name("draft_action").ui_options["simple_dropdown"]
+        draft_record.return_value = source
+        node._update_parameter_visibility()
+        assert node._draft_ui_state()["final_available"]
         for action in (target.DRAFT_ACTION_PREVIEW, target.DRAFT_ACTION_FINAL):
             node.set_parameter_value("draft_action", action)
             node._update_parameter_visibility()

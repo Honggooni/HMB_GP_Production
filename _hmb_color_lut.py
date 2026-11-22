@@ -417,7 +417,10 @@ def make_review_media(source: Path, directory: Path, cancel_event: threading.Eve
             "-q:v", "4", "-f", "image2pipe", "-c:v", "mjpeg", str(poster),
         ]
         with tempfile.TemporaryDirectory(dir=directory) as work:
-            _run_export(command, Path(work), cancel_event, None, _stream_duration(details), 0)
+            # Review inputs and outputs are absolute. Windows rejects long paths
+            # as a child process CWD even when its media files can be opened.
+            _run_export(command, Path(work), cancel_event, None, _stream_duration(details), 0,
+                        use_working_directory=False)
         check_cancelled()
         if not (16 <= poster.stat().st_size <= _REVIEW_POSTER_BYTES
                 and 32 <= preview.stat().st_size <= _REVIEW_PREVIEW_BYTES):
@@ -616,11 +619,13 @@ def _notify(progress: Callable[[float], None] | None, value: float) -> None:
 
 
 def _run_export(command: list[str], cwd: Path, cancel_event: threading.Event | None,
-                progress: Callable[[float], None] | None, duration: float, start_time: float) -> str:
+                progress: Callable[[float], None] | None, duration: float, start_time: float, *,
+                use_working_directory: bool = True) -> str:
     if cancel_event is not None and cancel_event.is_set():
         raise ColorLUTError("Color LUT export was cancelled.")
     with (cwd / "ffmpeg.log").open("w+", encoding="utf-8") as error_log:
-        process = subprocess.Popen(command, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        process = subprocess.Popen(command, cwd=str(cwd) if use_working_directory else None,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=error_log, text=True, encoding="utf-8", errors="replace",
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         latest = [0.0]

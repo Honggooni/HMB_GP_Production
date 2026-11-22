@@ -187,7 +187,7 @@ class MyBoxNodeTests(unittest.TestCase):
             'XDG_DATA_HOME','XDG_STATE_HOME','XDG_CACHE_HOME')}
         self.media_schedule=mock.Mock()
         self.patches=[mock.patch.dict(os.environ,environment),
-            mock.patch.dict(sys.modules,{'_hmb_client_review_media': SimpleNamespace(schedule_completed_review_media=self.media_schedule)}),
+            mock.patch('_hmb_client_review_media.schedule_completed_review_media',self.media_schedule),
             mock.patch.object(socket,'create_connection',forbidden),
             mock.patch.object(socket.socket,'connect',local_connect),
             mock.patch.object(urllib.request,'urlopen',forbidden),

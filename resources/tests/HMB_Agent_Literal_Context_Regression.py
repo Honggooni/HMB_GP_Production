@@ -157,7 +157,11 @@ def no_model_call(agent, prompt, **kwargs):
     value = str(getattr(prompt, "value", prompt))
     assert live._hmb_rules_active is True
     assert live._hmb_runtime_prompt == machine_prompt
-    assert value == merged + "\n\n" + agent_module._AGENT_ENGLISH_OUTPUT_CONTRACT
+    assert live._hmb_execution_project_id == "superwings12"
+    assert live._hmb_policy_identity["project_id"] == "superwings12"
+    assert not live._hmb_policy_omitted
+    assert value == "\n\n".join((merged, agent_module._AGENT_ENGLISH_OUTPUT_CONTRACT,
+                                 agent_module._SW_RENDER_DIRECTION))
     assert digest(value[: len(machine_prompt)]) == snapshot["machine_sha256"]
     captured.append(value)
     # Keep the installed Standard _process/build/runner and its actual
@@ -201,7 +205,7 @@ assert "{{SIGN}}" not in live.parameter_output_values["output"]
 # generated text output above must contain only the model result.
 saved_state = native_module.AgentState.from_wire(live.parameter_output_values["agent"])
 assert saved_state.runs() == [{
-    "input": merged + "\n\n" + agent_module._AGENT_ENGLISH_OUTPUT_CONTRACT,
+    "input": captured[0],
     "output": "Literal context boundary passed.",
 }]
 
