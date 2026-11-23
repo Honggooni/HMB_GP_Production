@@ -510,15 +510,19 @@ export function hmbWaitForImageAssetAuthority(container, state, options = {}) {
       finish(imageAssetLocalAuthoritySuperseded());return;
     }
     if(pending.queried&&pending.readCanonicalGeneration!==undefined&&pending.readCanonicalGeneration!==(Number(container.__hmbImageAssetCanonicalGeneration)||0)
-      &&bridge.authoritySnapshot?.canonical_scope&&imageAssetScopeKey(bridge.authoritySnapshot.canonical_scope)!==imageAssetScopeKey(hmbImageAssetAuthorityScope(current))){
+      &&bridge.authoritySnapshot?.canonical_scope&&imageAssetScopeKey(bridge.authoritySnapshot.canonical_scope)!==(pending.latestCanonicalKey||imageAssetScopeKey(hmbImageAssetAuthorityScope(current)))){
       finish(new Error("라이브러리 작업 정보가 변경되었습니다. 최신 상태에서 다시 선택하세요."));return;
     }
     if(container.__hmbImageAssetPendingPublications?.size)return;
     if (bridge.widget_runtime_lease === lease && pending.queried) {
       const snapshot = bridge.authoritySnapshot;
       if (!snapshot?.canonical_scope) { finish(new Error("라이브러리 작업 정보를 확인하지 못했습니다. 다시 선택하세요.")); return; }
-      if (!container.__hmbImageAssetAdoptAuthority?.(snapshot)) return;
-      finish(); return;
+      if (container.__hmbImageAssetAdoptAuthority?.(snapshot)) { finish(); return; }
+      // A scoped bridge can still hold the view from before a folder click or
+      // thumbnail update. Request the current pair once, then wait for either
+      // delivery order of its canonical view and receipt.
+      if (pending.readPromise) return;
+      pending.queried = false;
     }
     if (pending.querying || typeof bridge.queryWidgetLease !== "function") return;
     pending.readGeneration=Number(container.__hmbImageAssetSemanticGeneration)||0;
@@ -1421,6 +1425,7 @@ function normalizeAsset(raw) {
     asset_project_uid: clean(raw.asset_project_uid),
     asset_id: assetId,
     image_name: imageName,
+    ...(raw.registration_default_name ? {registration_default_name:clean(raw.registration_default_name).slice(0,256)} : {}),
     path: hmbRelocateImageProjectPath(raw.path || raw.asset_path).replaceAll("\\", "/"),
     thumbnail_url: hmbRelocateImageProjectPath(raw.thumbnail_url),
     media_signature: clean(raw.media_signature).slice(0, 64),
@@ -5434,7 +5439,7 @@ export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}, state
     relative_path: relativePath,
     target_folder: sourceKind === "project" ? lockedFolder : vendorDefault,
     target_folder_confirmed: sourceKind === "project" || Boolean(vendorDefault),
-    image_name: clean(asset.image_name).slice(0, 256),
+    image_name: (clean(asset.registration_default_name) || clean(asset.image_name)).slice(0, 256),
     asset_id: clean(asset.asset_id).slice(0, 256),
     image_main_type: sourceType,
     image_sub_type: assetSubType,
@@ -9504,8 +9509,17 @@ function hmbNativeUiImplementation(container, props) {
       && imageAssetScopeKey(hmbNormalizeImageBashWorkspace(incomingState.image_bash_workspace)) === workspaceHold.workspace) {
       delete container.__hmbImageAssetWorkspaceAuthorityUnknown;
     }
-    if(!forceAuthority&&rawIncoming?.schema==="hmb-image-asset-library-state"&&hmbImageAssetRevisionDisposition(container,incomingState)!=="stale"
-      &&imageAssetScopeKey(hmbImageAssetAuthorityScope(incomingState))!==imageAssetScopeKey(hmbImageAssetAuthorityScope(state)))container.__hmbImageAssetCanonicalGeneration=(Number(container.__hmbImageAssetCanonicalGeneration)||0)+1;
+    if (!forceAuthority && rawIncoming?.schema === "hmb-image-asset-library-state"
+        && hmbImageAssetRevisionDisposition(container,incomingState) !== "stale") {
+      const incomingKey = imageAssetScopeKey(hmbImageAssetAuthorityScope(incomingState));
+      if (incomingKey !== imageAssetScopeKey(hmbImageAssetAuthorityScope(state))) {
+        container.__hmbImageAssetCanonicalGeneration = (Number(container.__hmbImageAssetCanonicalGeneration) || 0) + 1;
+        // During registration the authoritative view may arrive before the
+        // edited form is repainted. Compare the read to that accepted view.
+        const wait = container.__hmbImageAssetAuthorityWait;
+        if (wait) wait.latestCanonicalKey = incomingKey;
+      }
+    }
     if(!forceAuthority && rawIncoming?.schema==="hmb-image-asset-library-state" && hmbImageAssetWidgetLease(incomingState) && hmbImageAssetRevisionDisposition(container,incomingState)==="stale"){
       imageAssetRecheckAuthorityInBackground(container,container.__hmbImageAssetLatestState||state,error=>hmbShowImageAssetTransportError(container,error,state));
     }
@@ -9707,6 +9721,12 @@ function hmbNativeUiImplementation(container, props) {
     const raw=container.__hmbImageAssetAuthorityCandidate,parsed=parseValue(raw);
     if(parsed?.schema!=="hmb-image-asset-library-state" || imageAssetScopeKey(hmbImageAssetAuthorityScope(parsed))!==imageAssetScopeKey(scope))return false;
     if(imageAssetScopeKey(hmbImageAssetAuthorityScope(state))===imageAssetScopeKey(scope))return true;
+    // The form intentionally defers host updates while the user edits it.
+    // Keep that same form and publish from the verified view when Save resumes.
+    if (container.__hmbImageAssetRegistrationDraft && hmbImageAssetRevisionDisposition(container, parsed) !== "stale") {
+      hmbDeferImageAssetPropsDuringRegistration(container, {...props, value:raw});
+      return true;
+    }
     const pending=container.__hmbImageAssetPendingSlowAction,token=container.__hmbImageAssetSlowActionToken,waiting=container.__hmbImageAssetProjectAuthorityPending;
     hmbResetImageAssetRuntimeState(container,parsed);
     if(waiting){container.__hmbImageAssetPendingSlowAction=pending;container.__hmbImageAssetSlowActionToken=token;}

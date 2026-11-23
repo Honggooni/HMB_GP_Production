@@ -122,11 +122,16 @@ class SiteSettingsRegression(unittest.TestCase):
                 self.assertEqual(confirmed["write_site_id"], prior["write_site_id"])
                 self.assertEqual(confirmed["revision"], prior["revision"])
                 self.assertEqual(confirmed["generation"], 2)
-                self.assertEqual({entry.name for entry in self.busan.iterdir()}, {"add", ".json"})
+                expected = {"add", ".json"} if media == "image" else set()
+                self.assertEqual({entry.name for entry in self.busan.iterdir()}, expected)
                 self.assertEqual(list(self.gang.iterdir()), [])
                 restarted = load_module()
                 restored = restarted.site_profiles([dict(project_uid="p", path=str(base))], media)
                 self.assertEqual(restored["p"], confirmed)
+                if media == "sound":
+                    self.assertEqual(restarted.confirm_site_folder(base, media, confirmed["revision"], second_id), confirmed)
+                    self.assertEqual(list(self.busan.iterdir()), [])
+                    continue
                 marker = self.busan / ".json" / "existing.json"
                 marker.write_bytes(b"keep")
                 self.assertEqual(restarted.confirm_site_folder(base, media, confirmed["revision"], second_id), confirmed)

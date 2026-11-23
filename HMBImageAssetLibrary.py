@@ -3036,6 +3036,18 @@ def _replace_registration_manifest(temporary: Path, manifest: Path) -> None:
     os.replace(temporary, manifest)
 
 
+class _RegistrationFieldConflict(ValueError):
+    def __init__(self, field: str, value: str, existing_path: str):
+        self.field = field
+        self.value = value
+        self.existing_path = existing_path
+        super().__init__(f"{field} {value!r} is already registered for {existing_path or 'another image'}.")
+
+    def korean_message(self) -> str:
+        label = "에셋 ID" if self.field == "Asset ID" else "이미지 이름"
+        return f"‘{self.existing_path or '다른 이미지'}’에 이미 등록된 {label}입니다. ‘{self.value}’ 대신 다른 값을 입력하세요."
+
+
 def _write_asset_manifest_record_locked(
     root: Path,
     record: Dict[str, Any],
@@ -3081,19 +3093,13 @@ def _write_asset_manifest_record_locked(
             asset_id_key
             and _clean(raw.get("asset_id")).casefold() == asset_id_key
         ):
-            raise ValueError(
-                f"Asset ID {_clean(record.get('asset_id'))!r} is already registered "
-                f"for {other_path or 'another image'}."
-            )
+            raise _RegistrationFieldConflict("Asset ID", _clean(record.get("asset_id")), other_path)
         if (
             image_name_key
             and _clean(raw.get("image_name") or raw.get("name")).casefold()
             == image_name_key
         ):
-            raise ValueError(
-                f"Image Name {_clean(record.get('image_name'))!r} is already "
-                f"registered for {other_path or 'another image'}."
-            )
+            raise _RegistrationFieldConflict("Image Name", _clean(record.get("image_name")), other_path)
 
     updated_records = list(records)
     if matching_indices:
@@ -3575,6 +3581,7 @@ def _manifest_at_current_paths(records, root, folders, paths):
 def _restore_manifest_registration(asset, relative, overrides, stems):
     override = overrides.get(relative.as_posix().casefold())
     values = override or {}
+    asset.pop("registration_default_name", None)
     asset.update(_normalize_image_taxonomy_fields(values))
     asset["asset_id"] = _clean(values.get("asset_id")) or (
         relative.with_suffix("").as_posix() if stems.get(relative.stem.casefold(), 0) > 1 else relative.stem
@@ -3649,6 +3656,51 @@ def _manifest_for_selection(root, selected, *, catalog_root=None, wait_for_catal
     requested = {_clean(row.get("relative_path")).casefold() for row in selected}
     return {row["relative_path"].casefold(): row for row in facts["assets"]
             if row.get("registered") and row.get("connected", True) and row["relative_path"].casefold() in requested}
+
+
+def _suggest_registration_names(assets, *, writer="hq", manifest_records=()):
+    """Offer names for new drafts, scoped to each physical registration file."""
+    counts = {}
+    occupied = {("hq", name.casefold()) for row in manifest_records
+                if (name := _clean(row.get("image_name") or row.get("name")))}
+    candidates = []
+    for asset in assets:
+        name = _clean(asset.get("image_name"))
+        if not name:
+            continue
+        site, relative = _site_location(asset.get("relative_path"))
+        if asset.get("source_kind") == "user" and asset.get("import_index"):
+            site = writer
+        key = site, name.casefold()
+        counts[key] = counts.get(key, 0) + 1
+        if not asset.get("registered"):
+            candidates.append((asset, site, relative, name, key))
+    reserved = occupied | counts.keys()
+    suffix_counts = {}
+    for asset, site, relative, name, key in candidates:
+        previous = _clean(asset.get("registration_default_name"))
+        if not previous and counts[key] == 1 and key not in occupied:
+            continue
+        # Retain a scan's suggestion even in an offline cache, including a
+        # name reserved by a manifest row whose image is currently missing.
+        if previous and (site, previous.casefold()) not in reserved:
+            proposed = previous
+        else:
+            folder = relative.rpartition("/")[0] or relative or _clean(asset.get("asset_id"))
+            if len(folder) > 100:
+                folder = folder[:90] + "…" + hashlib.sha256(folder.encode()).hexdigest()[:8]
+            label = f" [{folder}]"
+            base = name[:256 - len(label)] + label
+            proposed = base
+            base_key = site, base.casefold()
+            number = suffix_counts.get(base_key, 1)
+            while (site, proposed.casefold()) in reserved:
+                number += 1
+                suffix = f" ({number})"
+                proposed = base[:256 - len(suffix)] + suffix
+            suffix_counts[base_key] = number
+        asset["registration_default_name"] = proposed
+        reserved.add((site, proposed.casefold()))
 
 
 def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -3782,6 +3834,7 @@ def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | N
                 "connected": True,
             }
         )
+    _suggest_registration_names(assets, manifest_records=manifest_overrides.values())
     if len(paths) >= MAX_ASSETS:
         warnings.append(
             f"Project scan reached the {MAX_ASSETS}-asset safety limit."
@@ -3846,6 +3899,8 @@ def _normalize_asset(raw: Any) -> Dict[str, Any] | None:
         "asset_project_uid": _clean(raw.get("asset_project_uid")),
         "asset_id": asset_id,
         "image_name": image_name,
+        **({"registration_default_name": _clean(raw["registration_default_name"])[:256]}
+           if raw.get("registration_default_name") and not registered else {}),
         "path": path,
         "thumbnail_url": _relocate_image_project_path(raw.get("thumbnail_url")),
         "media_signature": _clean(raw.get("media_signature"))[:64],
@@ -4960,6 +5015,7 @@ def _merge_scan_with_state(
         and _non_negative_int(asset.get("import_index")) > 0
     )
     state = dict(previous_state)
+    _suggest_registration_names(assets, writer=_parse_mapping(previous_state.get("site_settings")).get("write_site_id") or "hq")
     state.update(
         {
             "project_root": scan.get("project_root", ""),
@@ -5392,6 +5448,7 @@ def _rebind_shared_catalog_snapshot(
             assets.append(asset)
         if {Path(asset["path"]) for asset in assets} != verified_paths:
             return None
+        _suggest_registration_names(assets, manifest_records=records.values())
         rebound_snapshot = dict(snapshot)
         rebound_snapshot.update(
             {
@@ -6130,6 +6187,7 @@ def _read_catalog_index(
             asset["thumbnail_url"] = ""
         if {Path(asset["path"]) for asset in assets} != verified_paths:
             return None
+        _suggest_registration_names(assets, manifest_records=records.values())
         indexed = dict(previous_state)
         indexed.update(raw)
         indexed["catalog_root"] = catalog["catalog_root"]
@@ -6981,6 +7039,7 @@ def _commit_asset_registration(
         assets.append(registered_row)
     else:
         assets[source_index] = registered_row
+    _suggest_registration_names(assets, writer=site)
     refreshed["assets"] = assets
     refreshed["catalog_root"] = catalog["catalog_root"]
     refreshed["projects"] = catalog["projects"]
@@ -7378,6 +7437,7 @@ def _merge_import_input(
         by_library_id[library_id] = len(assets) - 1
         by_source_uid[uid] = len(assets) - 1
         existing_asset_ids[_clean(imported.get("asset_id"))] = uid
+    _suggest_registration_names(assets, writer=(normalized.get("site_settings") or {}).get("write_site_id") or "hq")
     normalized["assets"] = assets
     normalized["scan_revision"] = _non_negative_int(
         normalized.get("scan_revision")
@@ -14596,11 +14656,12 @@ class HMBImageAssetLibrary(DataNode):
                     cleanup_capture_error = str(exc)
 
             def register_and_patch() -> Any:
-                registered = _apply_asset_registration(
-                    state,
-                    request_snapshot,
-                    captured_import_media,
-                )
+                try:
+                    registered = _apply_asset_registration(state, request_snapshot, captured_import_media)
+                except _RegistrationFieldConflict as exc:
+                    if state.get("language") == "ko":
+                        raise ValueError(exc.korean_message()) from exc
+                    raise
                 if not _flatten_import_values(captured_import_value):
                     return registered
                 return _merge_import_input(registered, captured_import_value)

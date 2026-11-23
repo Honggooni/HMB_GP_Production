@@ -268,10 +268,8 @@ def _read_sound_folder(root: Path, previous_assets: list[dict], refresh: bool,
         canonical = root.resolve()
         if not canonical.is_dir():
             raise SoundError("SOUND_PROJECT_ROOT_UNAVAILABLE", "선택한 사운드 폴더와 연결을 확인하세요.")
-        from _hmb_image_asset_sites import ensure_registration_directory
-        warning = ensure_registration_directory(canonical, refresh=refresh, vendor=bool(site_id))
         result = _scan_sound_inventory(canonical, previous_assets)
-        result.warnings = [warning] if warning else []
+        result.warnings = []
         result.canonical_root = canonical
         with _CATALOG_LOCK:
             _SESSION_CATALOGS[key] = _SESSION_CATALOGS[(str(canonical).casefold(), site_id)] = result

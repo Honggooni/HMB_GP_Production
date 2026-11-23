@@ -45,6 +45,58 @@ try{
  result.cases.hidden_carrier_reparent=await page.evaluate(async()=>{const f=await make(4),replacement=document.createElement('article');replacement.className='react-flow__node';replacement.dataset.id=f.node.dataset.id;document.body.append(replacement);replacement.append(f.mainNode,f.carrier);
   f.choose('P:/projects/One/Ai_Ct_image');await frames();await f.ack();await frames(6);const value={after:f.writes.length,target:f.writes.at(-1)?.project_root||''};f.close();replacement.remove();return value});
  if(!baseline){
+ for(const order of ['view-first','receipt-first']){
+  result.cases['registration_'+order]=await page.evaluate(async order=>{
+   // The editor can mount a second view for the same node (measurement or
+   // sidebar). Its scoped bridge must not acknowledge the editable view.
+   const f=await make(40,0,false), other=await make(40);
+   try{
+    const folder='BG/e202', key='fixture-card', name='FirstFloor';
+    Object.assign(f.state,{project_root:'P:/projects/One/Ai_Ct_image',project_id:'One',project_uid:'project-1',
+     manifest_signature:'fixture-manifest',folder_signature:'fixture-folders',selected_folder_path:folder,folders:['BG',folder],
+     assets:[{asset_library_id:key,asset_id:name,image_name:name,source_kind:'project',source_uid:'project:'+key,
+      relative_path:folder+'/'+name+'.png',registered:false,image_main_type:'Environment',
+      ...(order==='receipt-first'?{registration_default_name:name+' e202'}:{})}]});
+    const update=()=>{f.raw=JSON.stringify(f.state);f.mh.update(f.mainProps())};
+    update();f.mountBridge();await f.ack();await frames();
+    const item=f.mainNode.querySelector('[data-asset-key="'+key+'"] [data-asset-add]');item.click();
+    const nameField=f.mainNode.querySelector('[data-registration-field="image_name"]');
+    const expected=order==='receipt-first'?name+' e202':name;
+    if(nameField.value!==expected||f.mainNode.__hmbImageAssetLatestState.assets[0].image_name!==name)
+      throw Error('Registration must use the suggested name without renaming a catalog card');
+    nameField.value='Artist edit';nameField.dispatchEvent(new Event('input',{bubbles:true}));
+    const type=f.mainNode.querySelector('[data-registration-main]');type.selectedIndex=1;type.dispatchEvent(new Event('change',{bubbles:true}));
+    // Newer authoritative widget props during form editing; cached bridge
+    // receipt still reflects the previous folder view/thumbnail revision.
+    f.state.ui_edit_revision+=1;f.state.thumbnail_revision+=1;update();await frames();
+    const authorityCount=()=>f.requests.filter(q=>q.operation==='widget_authority').length;
+    const before=authorityCount(), foreignBefore=other.requests.filter(q=>q.operation==='widget_authority').length;
+    const slot=()=>f.writes.map(w=>(w.edits||w).asset_registration_request).filter(r=>r?.request_id);
+    const save=f.mainNode.querySelector('[data-registration-submit]');
+    if(!save||save.disabled)throw Error('Registration not submittable after editing');
+    save.click();save.dispatchEvent(new MouseEvent('click',{bubbles:true}));await frames();
+    if(authorityCount()!==before+1||slot().length)throw Error('Stale cached authority must cause exactly one scoped read before registration');
+    const request=f.requests.filter(q=>q.operation==='widget_authority').at(-1);
+    // Duplicate/wrong receipts cannot unlock the write. The true response may
+    // arrive before or after the matching canonical widget-state event.
+    const scope=f.m.hmbImageAssetAuthorityScope(f.state);
+    const reply=(extra={})=>f.bh.update(f.bridgeProps({...request,phase:'result',
+     widget_runtime_lease:f.state.widget_runtime_lease,canonical_node_name:f.node.dataset.id,canonical_scope:scope,...extra}));
+    reply({request_id:'unrelated'});await frames();if(slot().length)throw Error('Wrong receipt accepted');
+    if(order==='receipt-first'){
+     f.state.thumbnail_revision++;scope.thumbnail_revision=f.state.thumbnail_revision;
+     reply();await frames();if(slot().length)throw Error('Write happened before the matching host view arrived');update();
+    }else{update();reply();}
+    await frames(4);
+    const requests=slot();
+    return {reads:authorityCount()-before,foreignReads:other.requests.filter(q=>q.operation==='widget_authority').length-foreignBefore,
+     writes:requests.length,asset:requests[0]?.asset_library_id,name:requests[0]?.image_name,folder:requests[0]?.relative_path,
+     editor:f.mainNode.querySelector('[data-registration-field="image_name"]')?.value};
+   }finally{f.close();other.close()}
+  },order);
+  assert.deepEqual(result.cases['registration_'+order],{reads:1,foreignReads:0,writes:1,asset:'fixture-card',
+   name:'Artist edit',folder:'BG/e202/FirstFloor.png',editor:'Artist edit'});
+ }
  result.cases.same_lease_saved_clock_rollback=await page.evaluate(async()=>{const f=await make(5),old=structuredClone(f.state);old.ui_edit_revision=26;old.image_bash_workspace.revision=17;
   while(old.image_bash_workspace.instances.length<9)old.image_bash_workspace.instances.push({instance_id:crypto.randomUUID(),source_uid:'project:a'});
   f.mh.update({...f.mainProps(),value:JSON.stringify(old)});f.mh.update(f.mainProps());await frames();const before=f.mainNode.__hmbImageAssetLatestState.image_bash_workspace.instances.length;

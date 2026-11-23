@@ -399,13 +399,14 @@ def add_site_folder(project_root, selected, media):
                     raise ValueError("이미 연결된 폴더와 겹칩니다.")
             name = Path(root).name
             links.append({"id": site_id, "label": name[:128], "root": root})
-        _prepare_selected_folder(physical)
+        if media == "image":
+            _prepare_selected_folder(physical)
         target = site_id if media == "image" else profile["write_site_id"]
         return _store_profile(path, profile, links, target, site_id), site_id
 
 
 def confirm_site_folder(project_root, media, expected_revision, selected):
-    """Verify the committed project profile and prepare its selected vendor only."""
+    """Verify the committed selection, preparing registration storage for images."""
     path = settings_path(project_root, media)
     path.parent.mkdir(parents=True, exist_ok=True)
     with _settings_lock(path):
@@ -425,7 +426,8 @@ def confirm_site_folder(project_root, media, expected_revision, selected):
             _, physical = _external_folder(project_root, link["root"], check_headquarters=False)
             if _folder_identity(physical) != selected:
                 raise ValueError("선택한 폴더의 연결 대상이 변경되었습니다. 등록 폴더를 다시 선택하세요.")
-            _prepare_selected_folder(physical)
+            if media == "image":
+                _prepare_selected_folder(physical)
         return _store_profile(path, profile, profile["links"], profile["write_site_id"], selected)
 
 

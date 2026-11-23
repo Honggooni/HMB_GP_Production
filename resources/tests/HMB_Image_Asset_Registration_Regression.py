@@ -24,10 +24,11 @@ def load_module():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    module._ASSET_CATALOG_INDEX_ROOT = test_root / "workstation-index"
+    module._ASSET_THUMBNAIL_CACHE_ROOT = test_root / "workstation-thumbnails"
     return module
 
 
-asset_library = load_module()
 PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg=="
 )
@@ -36,6 +37,7 @@ tmp_parent = ROOT / ".tmp"
 tmp_parent.mkdir(parents=True, exist_ok=True)
 test_root = Path(tempfile.mkdtemp(prefix="hmb_asset_registration_", dir=tmp_parent))
 try:
+    asset_library = load_module()
     catalog_root = test_root / "Projects"
     project_root = catalog_root / "shot_registration" / "Ai_Ct_image"
     existing_path = project_root / "Environment" / "Background" / "existing.png"
@@ -740,6 +742,73 @@ try:
     (shared / "Peer.png").unlink()
     assert registered_names(author._load_project_catalog(shared, refreshed)) == {"Author", "Peer"}
     assert registered_names(author._load_project_catalog(shared, refreshed, use_shared_cache=False)) == {"Author"}
+
+    # A registered image in another episode may be outside the widget's
+    # current page. Its name is still reserved in this physical registry.
+    case = test_root / "duplicate-names" / "new_project" / "Ai_Ct_image"
+    stem = "DrBugBaseFirstFloor_ASheet_Front_"
+    folders = ["BG/e201", "BG/e202", "BG/e202/Tone"]
+    for folder in folders:
+        (case / folder).mkdir(parents=True, exist_ok=True)
+        (case / folder / (stem + ".png")).write_bytes(PNG_1X1)
+    first = {"path": f"{folders[0]}/{stem}.png", "asset_id": stem, "image_name": stem,
+             "image_main_type": "Environment / Background", "image_sub_type": "Main Background"}
+    asset_library._write_asset_manifest_record(case, first)
+    scan = asset_library._scan_project_assets(case)
+    def name_rows(state):
+        return {r["relative_path"].rsplit("/", 1)[0]: r for r in state["assets"]}
+    by_folder = name_rows(scan)
+    for folder in folders[1:]:
+        assert by_folder[folder]["registration_default_name"] == f"{stem} [{folder}]"
+        assert by_folder[folder]["image_name"] == stem
+    assert "registration_default_name" not in by_folder[folders[0]]
+
+    # Materialize a v0.9.34 cache without hints; first paint should rebuild
+    # them from its rows even while the network inventory is unavailable.
+    live = asset_library._load_project_catalog(case, {})
+    asset_library._write_catalog_index(live)
+    index = asset_library._catalog_index_path_for_verified_uid(live["project_cache_uid"])
+    legacy = json.loads(index.read_bytes())
+    for row in legacy["assets"]:
+        row.pop("registration_default_name", None)
+    index.write_text(json.dumps(legacy), encoding="utf-8")
+    offline = load_module()
+    with patch.object(offline, "_catalog_file_inventory", side_effect=AssertionError("network scan")), \
+         patch.object(offline, "_read_asset_manifest", side_effect=AssertionError("shared manifest read")):
+        cached = name_rows(offline._read_local_catalog_snapshot(case, {"catalog_root": live["catalog_root"]}))
+    assert [cached[f].get("registration_default_name") for f in folders] == [
+        by_folder[f].get("registration_default_name") for f in folders]
+
+    same_names = [dict(by_folder[folders[0]]),
+                  {**by_folder[folders[1]], "relative_path": f"site:separate/{stem}.png"}]
+    same_names[1].pop("registration_default_name")
+    asset_library._suggest_registration_names(same_names)
+    assert "registration_default_name" not in same_names[1]
+
+    def submit(folder, name, state):
+        row = name_rows(state)[folder]
+        return asset_library._apply_asset_registration(state, {
+            "request_id": folder.replace("/","-"), "project_uid": state["project_uid"],
+            "source_kind":"project", "asset_library_id":row["asset_library_id"], "relative_path":row["relative_path"],
+            "asset_id":row["asset_id"], "image_name":name, "image_main_type":"Environment / Background",
+            "image_sub_type":"Main Background",
+        })
+    try:
+        submit(folders[1], stem, live)
+    except asset_library._RegistrationFieldConflict as exc:
+        assert exc.field == "Image Name" and first["path"] in exc.korean_message() and "이미지 이름" in exc.korean_message()
+    else:
+        raise AssertionError("An explicit duplicate must fail without silently renaming it")
+    live = submit(folders[1], by_folder[folders[1]]["registration_default_name"], live)
+    live = submit(folders[2], "사용자 지정 이름", live)
+    fresh = load_module()
+    fresh._ASSET_CATALOG_INDEX_ROOT = test_root / "fresh-names-index"
+    saved = name_rows(fresh._load_project_catalog(case, {}))
+    for folder in folders:
+        assert saved[folder]["registered"]
+        assert (case/folder/(stem+".png")).read_bytes() == PNG_1X1
+    assert [saved[f]["image_name"] for f in folders] == [stem, f"{stem} [BG/e202]", "사용자 지정 이름"]
+    assert saved[folders[0]]["asset_id"] == stem
 finally:
     shutil.rmtree(test_root, ignore_errors=True)
 

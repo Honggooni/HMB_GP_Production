@@ -100,6 +100,68 @@ class SoundLibraryRegression(unittest.TestCase):
         self.assertFalse(missing.exists())
         self.assertEqual(self.path.read_bytes(), before)
 
+    def test_four_read_only_sound_roots_refresh_restart_and_detach(self):
+        import subprocess
+        import _hmb_image_asset_sites as sites
+
+        vendors = [self.audio.with_name(name) for name in ("Studio A", "Studio B", "Studio C")]
+        sources = [self.path, *(root / "Dialogue" / "voice.wav" for root in vendors)]
+        for source in sources[1:]:
+            make_wave(source)
+        roots = [self.audio, *vendors]
+        original_bytes = [path.read_bytes() for path in sources]
+        mkdir = Path.mkdir
+
+        def deny_media_write(path, *args, **kwargs):
+            if any(path.is_relative_to(root) for root in roots):
+                raise PermissionError(f"Read-only sound share: {path}")
+            return mkdir(path, *args, **kwargs)
+
+        with (mock.patch.dict(os.environ, GTN_CONFIG_WORKSPACE_DIRECTORY=str(self.root / "workspace")),
+              mock.patch.object(Path, "mkdir", deny_media_write),
+              mock.patch.object(helper, "_scan_sound_inventory", wraps=helper._scan_sound_inventory) as scans):
+            for root in vendors:
+                profile, selected = sites.add_site_folder(self.audio, str(root), "sound")
+                sites.confirm_site_folder(self.audio, "sound", profile["revision"], selected)
+            worker = helper.start_sound_catalog_warmup(threading.Event(), self.root)
+            worker.join(10)
+            self.assertFalse(worker.is_alive())
+            self.assertCountEqual([call.args[0] for call in scans.call_args_list], roots)
+
+            def catalog(refresh=False):
+                rows = helper.scan_sound_project(self.audio, profile=profile, refresh=refresh)
+                self.assertEqual(rows.warnings, [])
+                return {row["relative_path"]: row["source_uid"] for row in rows}
+
+            expected = catalog()
+            self.assertEqual(len(set(expected.values())), 4)
+            for _ in range(5):
+                self.assertEqual(catalog(), expected)
+            self.assertEqual(scans.call_count, 4)
+            self.assertEqual(catalog(refresh=True), expected)
+            self.assertEqual(scans.call_count, 8)
+            script = """import json, sys
+from _hmb_image_asset_sites import get_site_settings
+from _hmb_sound import scan_sound_project
+root = sys.argv[1]
+rows = scan_sound_project(root, profile=get_site_settings(root, "sound"), refresh=False)
+print(json.dumps({row["relative_path"]: row["source_uid"] for row in rows}))
+"""
+            restart = subprocess.check_output([sys.executable, "-B", "-c", script, str(self.audio)],
+                                              cwd=ROOT, timeout=30)
+            self.assertEqual(json.loads(restart), expected)
+            removed, *kept = profile["links"]
+            profile = sites.save_site_settings(self.audio, kept, "hq", profile["revision"],
+                                               media="sound", existing_only=True)
+            remaining = {rel: uid for rel, uid in expected.items()
+                         if not rel.startswith("site:" + removed["id"] + "/")}
+            self.assertEqual(len(remaining), 3)
+            self.assertEqual(catalog(), remaining)
+            self.assertEqual(scans.call_count, 8)
+            self.assertEqual([path.read_bytes() for path in sources], original_bytes)
+            for root in roots:
+                self.assertEqual(set(root.iterdir()), {root / "Dialogue"})
+
     def test_extra_folder_preload_once_add_refresh_detach_and_process_restart(self):
         import subprocess
         import time
@@ -119,8 +181,8 @@ class SoundLibraryRegression(unittest.TestCase):
                 worker.join(10)
                 self.assertFalse(worker.is_alive())
                 self.assertEqual(walk.call_count, 2)
-                self.assertTrue((self.audio / ".json").is_dir())
-                self.assertTrue((vendor / ".json").is_dir())
+                self.assertFalse((self.audio / ".json").exists())
+                self.assertFalse((vendor / ".json").exists())
                 make_wave(vendor / ".json" / "not-a-catalog-item.wav")
                 cold = time.perf_counter() - start
                 start = time.perf_counter()
@@ -519,7 +581,7 @@ class SoundNodeRegression(SoundLibraryRegression):
             self.assertEqual(self.node._snapshot()["tracks"], snapshot["tracks"])
             self.assertEqual(helper.resolve_sound_tracks(snapshot)[-1]["path"], chosen["path"])
             current = folders("save", links=[], write_site_id="hq", expected_revision=profile["revision"])
-            self.assertTrue((vendor / ".json").is_dir())
+            self.assertFalse((vendor / ".json").exists())
             self.assertEqual(self.node._snapshot()["tracks"][-1]["instance_id"], chosen["instance_id"])
             folders("save", links=[linked], write_site_id="hq", expected_revision=current["revision"])
             self.assertEqual(self.node._snapshot()["tracks"], snapshot["tracks"])
