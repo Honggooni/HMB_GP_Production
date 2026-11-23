@@ -94,6 +94,13 @@ def register(station_name, directory, barrier):
         assert sorted(counts.values()) == [2, 2, 2], counts
         assert sum(a["registered"] and a["asset_id"] == "DuplicateLabel" for a in refreshed["assets"]) == 2
         assert refreshed["shot_routing"]["shots"][0]["selected_source_uids"] == [anchor["source_uid"]]
+        additions = sorted((a for a in refreshed["assets"] if a["registered"] and a["asset_id"] == "DuplicateLabel"),
+                           key=lambda a: a["relative_path"])
+        order = [anchor["source_uid"]]
+        for added in additions:
+            order.append(added["source_uid"])
+            added.update(selected=True, selection_order=len(order))
+        refreshed["shot_routing"]["shots"][0]["selected_source_uids"] = order
         saved = root / ("workflow-" + station_name + ".json")
         saved.write_text(json.dumps(refreshed), encoding="utf-8")
 
@@ -105,9 +112,22 @@ def reopened(station_name, directory):
     catalog = hq.parents[1]
     settings = lib.get_site_settings(hq)
     assert len(settings["links"]) == 2
-    state = load(lib, catalog, json.loads((root / ("workflow-" + station_name + ".json")).read_text("utf-8")))
+    saved = json.loads((root / ("workflow-" + station_name + ".json")).read_text("utf-8"))
+    # A workstation can open a saved shot before Windows reconnects its mapped drive.
+    # Read the persisted index first, then reconnect without changing either registration.
+    with patch.object(lib, "_discover_shared_image_projects", side_effect=OSError("share not mounted")), \
+            patch.object(lib, "_read_asset_manifest", side_effect=AssertionError("offline registry read")):
+        offline = load(lib, catalog, saved)
+    def registered_sources(state):
+        return {a["source_uid"] for a in state["assets"] if a["registered"]}
+    assert registered_sources(offline) == registered_sources(saved)
+    assert offline["shot_routing"]["shots"] == saved["shot_routing"]["shots"]
+    assert lib.get_site_settings(hq, fresh=True) == settings
+    state = load(lib, catalog, offline)
+    assert registered_sources(state) == registered_sources(saved)
     assert len([a for a in state["assets"] if a["asset_id"] == "DuplicateLabel"]) == 2
-    assert len(state["shot_routing"]["shots"][0]["selected_source_uids"]) == 1
+    assert state["shot_routing"]["shots"][0]["selected_source_uids"] == saved["shot_routing"]["shots"][0]["selected_source_uids"]
+    assert len(state["shot_routing"]["shots"][0]["selected_source_uids"]) == 3
     assets = [a for a in state["assets"] if a.get("registered")]
     assert len(assets) == 4, [(r["relative_path"], r["registered"]) for r in state["assets"]]
     for i, asset in enumerate(assets, 1):

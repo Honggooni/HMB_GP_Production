@@ -444,12 +444,12 @@ async def exercise(engine, phase, out):
         check_connected_only_agent(engine, t, agents, gen)
 
 
-def run_phase(phase, out):
+def run_phase(phase, out, *, workspace=None):
     private = out / (phase + "-profile")
     for key, leaf in (("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state"),
                       ("XDG_CACHE_HOME", "cache"), ("LOCALAPPDATA", "local"), ("APPDATA", "app"),
                       ("GTN_CONFIG_WORKSPACE_DIRECTORY", "workspace"), ("HMB_IMAGE_PROJECTS_ROOT", "projects")):
-        folder = private / leaf
+        folder = workspace if key == "GTN_CONFIG_WORKSPACE_DIRECTORY" and workspace is not None else private / leaf
         folder.mkdir(parents=True, exist_ok=True)
         os.environ[key] = str(folder)
     os.environ["HMB_GRIPTAPE_STANDARD_LIBRARY_PATH"] = str(STANDARD)

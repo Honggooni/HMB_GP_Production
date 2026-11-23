@@ -26,6 +26,7 @@ import HMB_Finish_Multishot_Consolidation_Host_Regression as media_fixture
 
 async def exercise(engine, phase, out):
     import _hmb_sound as helper
+    import _hmb_image_asset_sites as sites
     import _hmb_shot_routing as routing
     import HMBSoundLibrary as sounds
     import HMBPromptLibrary as prompts
@@ -298,13 +299,34 @@ async def exercise(engine, phase, out):
             harness.record("native_audio_auto_on_for_exact_prompt_with_immediate_manual_restore", provider_calls=0)
             stream_before_save = assert_sound_ui_read()
             harness.record("readonly_sound_snapshot_before_save_preserves_authored_audio", altered_workflow_state=False)
+            from HMB_Sound_Library_Regression import make_wave
+            multi_audio = out / "fixtures" / "four-studios" / "Ai_Ct_audio"
+            multi = create("HMBSoundLibrary", "Four studio sources")
+            for folder in (multi_audio, *(multi_audio.with_name(name) for name in ("Studio A", "Studio B", "Studio C"))):
+                make_wave(folder / "voice.wav")
+                if folder != multi_audio:
+                    sites.add_site_folder(multi_audio, str(folder), "sound")
+            profile = sites.get_site_settings(multi_audio, "sound")
+            inventory = helper.scan_sound_project(multi_audio, profile=profile)
+            assert len(inventory) == 4 and not inventory.warnings
+            shot = {"channel_uuid": harness.CHANNEL, **catalog["shots"][1]}
+            tracks = [helper.make_sound_track(multi_audio, row["relative_path"],
+                      channel_uuid=shot["channel_uuid"], shot_uuid=shot["shot_uuid"]) for row in inventory]
+            state = {**sounds.default_state(), "project_id": multi_audio.parent.name,
+                     "project_root": str(multi_audio), "project_uid": helper.project_uid(multi_audio),
+                     "channel_uuid": shot["channel_uuid"], "shot_catalog": catalog, "shot": shot,
+                     "tracks": tracks, "assets": list(inventory)}
+            harness.send(engine, SetParameterValueRequest(node_name=multi.name, parameter_name=sounds.UI,
+                         value=state, initial_setup=True))
             serialized = harness.send(engine, SerializeFlowToCommandsRequest(flow_name="SoundWireChain")).serialized_flow_commands
             await harness.asend(engine, SaveWorkflowFileFromSerializedFlowRequest(file_name=saved.stem,
                 file_path=str(saved), display_name="Offline Sound physical chain fixture", serialized_flow_commands=serialized))
             expected_file.write_text(json.dumps({"names": {key: node.name for key, node in nodes.items()},
                 "sound": sound._hmb_sound_snapshot_for(channel_uuid=harness.CHANNEL, shot_uuid=harness.SHOTS[0]["shot_uuid"]),
                 "effective_sound": active_document["audio_sources"], "completed_sound": completed_sound,
-                "sound_ui_stream": stream_before_save}, ensure_ascii=False), "utf-8")
+                "sound_ui_stream": stream_before_save, "four_folders": {"name": multi.name,
+                    "shot": multi._state_sound["shot"], "tracks": multi._snapshot()["tracks"], "profile": profile}},
+                ensure_ascii=False), "utf-8")
             # A second real five-node flow deliberately reuses the same UUIDs.
             # Its lack of Sound must remain optional and cannot discover the
             # first flow's Sound through browser/global/source caches.
@@ -345,6 +367,18 @@ async def exercise(engine, phase, out):
             harness.record("second_flow_original_five_nodes_same_uuids_no_audio_unchanged", nodes=5, foreign_audio=0, provider_calls=0)
         else:
             expected = json.loads(expected_file.read_text("utf-8"))
+            folders = expected["four_folders"]
+            multi = engine.node_manager.get_node_by_name(folders["name"])
+            multi_audio = Path(multi._state_sound["project_root"])
+            profile = sites.get_site_settings(multi_audio, "sound")
+            assert len(profile["links"]) == 3 and profile == folders["profile"]
+            assert multi._state_sound["shot"] == folders["shot"]
+            restored = helper.resolve_sound_tracks(multi._snapshot(), channel_uuid=folders["shot"]["channel_uuid"],
+                                                   shot_uuid=folders["shot"]["shot_uuid"])
+            assert len(restored) == 4 and restored == folders["tracks"]
+            roots = [multi_audio, *(Path(link["root"]) for link in profile["links"])]
+            assert all({p.name for p in root.iterdir()} == {"voice.wav"} for root in roots)
+            harness.record("cold_sdk_reopen_keeps_four_sound_folders_and_shot_track_ids", sources=len(restored))
             stale_read = engine.handle_request(read_sound_ui(node_name=sound.name,
                 expected_stream_id=expected["sound_ui_stream"], broadcast_result=False))
             assert stale_read.succeeded() and not stale_read.snapshot and stale_read.altered_workflow_state is False
@@ -376,7 +410,8 @@ def main():
         harness.exercise = exercise
         harness.PRODUCTS = ("HMBSoundLibrary.py", "HMBPromptLibrary.py", "HMBAgentLibrary.py", "HMBSeedanceGeneration.py",
             "HMBAnalysisAgent.py", "_hmb_sound.py")
-        harness.run_phase(args.phase, args.out.resolve())
+        # The engine/cache is new for each launch. The station's workspace persists.
+        harness.run_phase(args.phase, args.out.resolve(), workspace=args.out.resolve() / "workspace")
     else:
         for phase in ("create", "reopen"):
             subprocess.run([sys.executable, "-B", str(Path(__file__).resolve()), "--phase", phase, "--out", str(args.out.resolve())], check=True)
