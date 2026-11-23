@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from contextlib import contextmanager
 from io import BytesIO
 import json
@@ -9,10 +10,12 @@ import multiprocessing
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 from tempfile import mkdtemp, TemporaryDirectory
 import time
 import traceback
+from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -22,6 +25,28 @@ def png(index):
     data = BytesIO()
     Image.new("RGB", (4, 4), (12 + index, 53, 160)).save(data, "PNG")
     return data.getvalue()
+
+
+def deselect_connected_import(state, uid):
+    """Pass the existing selection through the same toggle as the Shot card."""
+    widget = Path(__file__).resolve().parents[2] / "widgets/HMBImageAssetLibraryWidget.js"
+    script = """
+        import {readFileSync} from 'node:fs';
+        const {hmbToggleImageAssetShotAsset} = await import(process.argv[1]);
+        const state = JSON.parse(readFileSync(0, 'utf8'));
+        const uid = process.argv[2];
+        if (!hmbToggleImageAssetShotAsset(state, state.shot_routing.active_shot_uuid, uid)) {
+            throw Error('Shot card did not toggle the connected import');
+        }
+        process.stdout.write(JSON.stringify(state));
+    """
+    changed = subprocess.run(["node", "--input-type=module", "-e", script, widget.as_uri(), uid],
+                             input=json.dumps(state), text=True, encoding="utf-8", capture_output=True, timeout=20)
+    assert changed.returncode == 0, changed.stderr
+    state = json.loads(changed.stdout)
+    row = next(a for a in state["assets"] if a["source_uid"] == uid)
+    assert not row["selected"] and row["selection_order"] == 0
+    return state
 
 
 def client(number, connection, workstation, burst_start):
@@ -45,15 +70,23 @@ def client(number, connection, workstation, burst_start):
             anchor.update(selected=True, selection_order=1)
             shot = state["shot_routing"]["shots"][0]
             shot["selected_source_uids"] = [anchor["source_uid"]]
+            other = {**deepcopy(shot), "shot_uuid": str(uuid4()), "number": 2, "name": "Other Shot"}
+            state["shot_routing"]["shots"].append(other)
             slot = 0 if duplicate else number
             media = {}
+            keep_selected = external and number % 2 == 0
             if external:
                 source = workstation / "take.png"
                 source.write_bytes(png(number))
                 state, media = lib._merge_import_input(state, [str(source)])
                 item = next(row for row in state["assets"] if row["source_kind"] == "user" and row["import_index"])
+                assert state["shot_routing"]["shots"][0]["selected_source_uids"] == [anchor["source_uid"], item["source_uid"]]
+                if not keep_selected:
+                    state = deselect_connected_import(state, item["source_uid"])
             else:
                 item = next(row for row in state["assets"] if row["relative_path"] == f"Images/c{slot}.png")
+            expected_before = [anchor["source_uid"], item["source_uid"]] if keep_selected else [anchor["source_uid"]]
+            assert [s["selected_source_uids"] for s in state["shot_routing"]["shots"]] == [expected_before, [anchor["source_uid"]]]
             request = {"request_id": f"client-{number}", "project_uid": state["project_uid"],
                        "asset_library_id": item["asset_library_id"], "source_kind": item["source_kind"],
                        "source_uid": item["source_uid"], "relative_path": item["relative_path"],
@@ -74,7 +107,12 @@ def client(number, connection, workstation, burst_start):
                 connection.send(("rejected", str(exc)))
             else:
                 assert result["asset_registration_result"]["ok"]
-                assert result["shot_routing"]["shots"][0]["selected_source_uids"] == [anchor["source_uid"]]
+                registered = next(row for row in result["assets"] if row["asset_id"] == f"Asset{slot}" and row["registered"])
+                if external:
+                    assert registered["import_source_uid"] == item["source_uid"] != registered["source_uid"]
+                assert (registered["selected"], registered["selection_order"]) == (keep_selected, 2 if keep_selected else 0)
+                expected_after = [anchor["source_uid"], registered["source_uid"]] if keep_selected else [anchor["source_uid"]]
+                assert [s["selected_source_uids"] for s in result["shot_routing"]["shots"]] == [expected_after, [anchor["source_uid"]]]
                 visible = {row["asset_id"] for row in result["assets"] if row["registered"]}
                 assert visible == {"Existing", f"Asset{slot}"}, visible
                 connection.send(("committed", f"Asset{slot}"))

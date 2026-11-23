@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+from HMB_ImageAsset_Concurrent_Add_Regression import deselect_connected_import
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -70,6 +71,10 @@ def register(station_name, directory, barrier):
         Image.new("RGB", (9, 6), "red" if site == "hq" else "blue").save(source)
         state, media = lib._merge_import_input(state, [str(source)])
         incoming = next(a for a in state["assets"] if a["source_kind"] == "user")
+        assert state["shot_routing"]["shots"][0]["selected_source_uids"] == [anchor["source_uid"], incoming["source_uid"]]
+        if site != "hq":
+            state = deselect_connected_import(state, incoming["source_uid"])
+            assert state["shot_routing"]["shots"][0]["selected_source_uids"] == [anchor["source_uid"]]
         request = {"request_id": "add-" + station_name, "project_uid": state["project_uid"],
                    "asset_library_id": incoming["asset_library_id"], "source_uid": incoming["source_uid"],
                    "source_kind": "user", "target_folder": "CH" if site == "hq" else f"site:{site}/CH",
@@ -86,14 +91,19 @@ def register(station_name, directory, barrier):
         result = lib._apply_asset_registration(state, request, media)
         assert result["asset_registration_result"]["ok"]
         assert sorted(counts.values()) == [1, 1, 1], counts
-        assert result["shot_routing"]["shots"][0]["selected_source_uids"] == [anchor["source_uid"]]
+        registered = next(a for a in result["assets"] if a["registered"] and a["import_source_uid"] == incoming["source_uid"])
+        assert registered["source_uid"] != incoming["source_uid"]
+        assert (registered["selected"], registered["selection_order"]) == ((True, 2) if site == "hq" else (False, 0))
+        expected_after = [anchor["source_uid"], registered["source_uid"]] if site == "hq" else [anchor["source_uid"]]
+        assert result["shot_routing"]["shots"][0]["selected_source_uids"] == expected_after
         barrier.wait(25)
         frozen = load(lib, catalog, result)
+        assert frozen["shot_routing"]["shots"][0]["selected_source_uids"] == expected_after
         assert sum(a["registered"] and a["asset_id"] == "DuplicateLabel" for a in frozen["assets"]) == 1
         refreshed = lib._load_project_catalog(catalog, frozen, use_shared_cache=False)
         assert sorted(counts.values()) == [2, 2, 2], counts
         assert sum(a["registered"] and a["asset_id"] == "DuplicateLabel" for a in refreshed["assets"]) == 2
-        assert refreshed["shot_routing"]["shots"][0]["selected_source_uids"] == [anchor["source_uid"]]
+        assert refreshed["shot_routing"]["shots"][0]["selected_source_uids"] == expected_after
         additions = sorted((a for a in refreshed["assets"] if a["registered"] and a["asset_id"] == "DuplicateLabel"),
                            key=lambda a: a["relative_path"])
         order = [anchor["source_uid"]]
