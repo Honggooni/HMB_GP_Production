@@ -140,6 +140,31 @@ def digest(value):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def published_shot(publications, node, receipt, shot_id):
+    return next((snapshot for owner, snapshot in publications if owner is node
+        and all(snapshot[name] == receipt[name] for name in (
+            "publisher_instance_uuid", "channel_uuid", "generation", "metadata_sha256"))
+        and any(shot["shot_uuid"] == shot_id for shot in snapshot["shots"])), None)
+
+
+async def wait_for_reconnected_publications(nodes, publications):
+    prompt = nodes[base.KINDS[2]]
+    started = time.monotonic()
+    while True:
+        state = prompt._hmb_prompt_merge_snapshot()["state"]
+        pending = prompt._hmb_sync_queued_token is not None
+        matching = {
+            kind: published_shot(publications[kind], nodes[base.KINDS[index]],
+                state[kind]["shot_routing"], state["shot"]["shot_uuid"]) is not None
+            for index, kind in enumerate(("image_asset", "picker"))
+        }
+        if not pending and all(matching.values()):
+            return round(time.monotonic() - started, 3)
+        if time.monotonic() - started >= 10:
+            raise AssertionError(f"Timed out awaiting native Prompt receipts: queued={pending}, matched={matching}")
+        await asyncio.sleep(.05)
+
+
 def assert_reconnected_authoring(nodes, expected, publications):
     actual = common.authoring(nodes)
     expected = deepcopy(expected)
@@ -159,11 +184,8 @@ def assert_reconnected_authoring(nodes, expected, publications):
         # Reading the same publisher again can advance its sequence if another
         # consumer asked for a different Shot. Use the actual delivered snapshot.
         receipt = after[kind]["shot_routing"]
-        snapshot = next((snapshot for owner, snapshot in publications[kind]
-            if owner is node and snapshot["generation"] == receipt["generation"] and
-            snapshot["publisher_instance_uuid"] == receipt["publisher_instance_uuid"] and
-            any(shot_id == shot["shot_uuid"] for shot in snapshot["shots"])), None)
-        assert snapshot is not None, f"Missing {kind} publication at gen {receipt['generation']}, observed {[(owner is node,s['generation']) for owner,s in publications[kind]][-16:]}"
+        snapshot = published_shot(publications[kind], node, receipt, shot_id)
+        assert snapshot is not None, "Missing native " + kind + " publication"
         selected = next(shot for shot in snapshot["shots"] if shot["shot_uuid"] == shot_id)["selected_source_uids"]
         metadata_keys = ["channel_uuid", "generation", "shots", media_field]
         if kind == "image_asset":
@@ -204,12 +226,13 @@ async def replay(engine, modules, folder, artifact, expected, original_edges, sc
         if scenario == "detached":
             for kind, cls_name in zip(publications, base.KINDS[:2]):
                 cls = getattr(modules[cls_name], cls_name)
-                original = getattr(cls, "_hmb_shot_routing_snapshot_for")
-                def capture(self, *args, _read=original, _kind=kind, **kwargs):
-                    result = _read(self, *args, **kwargs)
-                    publications[_kind].append((self, deepcopy(result)))
-                    return result
-                observed.enter_context(mock.patch.object(cls, "_hmb_shot_routing_snapshot_for", capture))
+                for method in ("_hmb_shot_routing_snapshot", "_hmb_shot_routing_snapshot_for"):
+                    original = getattr(cls, method)
+                    def capture(self, *args, _read=original, _kind=kind, **kwargs):
+                        result = _read(self, *args, **kwargs)
+                        publications[_kind].append((self, deepcopy(result)))
+                        return result
+                    observed.enter_context(mock.patch.object(cls, method, capture))
         await replay_observed(engine, modules, folder, artifact, expected, original_edges, scenario, publications)
 
 
@@ -279,11 +302,12 @@ async def replay_observed(engine, modules, folder, artifact, expected, original_
         restored = await base.asend(engine, api.HMBManageNodeConnectionsRequest(node_name=agent.name,
             operation="reconnect", expected_state_token=current.state_token))
         assert not restored.detached and restored.can_disconnect
-        await asyncio.sleep(.1)
         assert common.edges(engine) == original_edges
+        settled_seconds = await wait_for_reconnected_publications(nodes, publications)
         assert_reconnected_authoring(nodes, expected, publications)
+        assert common.edges(engine) == original_edges
         record("cold_detached_Agent_reconnect_restores_exact_edges_and_TaskIDs", initial=view,
-               after=capabilities(engine, nodes))
+               after=capabilities(engine, nodes), settled_seconds=settled_seconds)
 
 
 async def registered_stage(engine, modules, callback):
