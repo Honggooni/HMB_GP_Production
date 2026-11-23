@@ -295,6 +295,36 @@ try:
         for item in imported_state["assets"]
         if item["source_kind"] == "user"
     )
+    uid = imported["source_uid"]
+    assert imported_state["shot_routing"]["shots"][0]["selected_source_uids"] == [uid]
+    def replay(state, values=None):
+        stored = json.loads(json.dumps(state))
+        return asset_library._merge_import_input(stored, [imported_value] if values is None else values)[0]
+
+    assert replay(imported_state)["shot_routing"] == imported_state["shot_routing"]
+    removed = deepcopy(imported_state)
+    removed["shot_routing"]["shots"][0]["selected_source_uids"] = []
+    assert replay(removed)["shot_routing"]["shots"][0]["selected_source_uids"] == []
+    legacy = deepcopy(removed)
+    row = next(item for item in legacy["assets"] if item["source_uid"] == uid)
+    row.pop("import_shot_initialized")
+    assert replay(legacy)["shot_routing"]["shots"][0]["selected_source_uids"] == [uid]
+    row["selected"] = False
+    assert replay(legacy)["shot_routing"]["shots"][0]["selected_source_uids"] == []
+    foreign = deepcopy(imported_state)
+    shots = foreign["shot_routing"]["shots"]
+    second_id = "b4960848-65b5-4ab3-9b7d-71cdb52ca9d7"
+    shots.append(dict(shots[0], shot_uuid=second_id, number=2, name="Shot 2", selected_source_uids=[]))
+    foreign["shot_routing"]["active_shot_uuid"] = second_id
+    second_value = FakeImageArtifact(PNG_1X1 + b"second", "Other.png")
+    with_both = replay(foreign, [imported_value, second_value])
+    second_uid = next(item["source_uid"] for item in with_both["assets"] if item.get("image_name")=="Other")
+    assert [row["selected_source_uids"] for row in with_both["shot_routing"]["shots"]] == [[uid], [second_uid]]
+    disconnected = replay(with_both, [second_value])
+    assert [row["selected_source_uids"] for row in disconnected["shot_routing"]["shots"]] == [[], [second_uid]]
+    with_more = replay(sw12_state, [FakeImageArtifact(PNG_1X1 + bytes([i]), f"Input{i}.png")
+                                    for i in range(asset_library.MAX_SHOT_IMAGES + 1)])
+    assert len(with_more["shot_routing"]["shots"][0]["selected_source_uids"]) == asset_library.MAX_SHOT_IMAGES
     assert imported["asset_project_uid"] == ""
     assert imported["relative_path"] == ""
     assert imported["path"] == ""

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack, nullcontext, suppress
 from copy import deepcopy
 from pathlib import Path
 import socket
@@ -32,7 +32,7 @@ def observer_type():
     tree = ast.parse(source.read_text("utf-8"), filename=str(source))
     owner = next(row for row in tree.body if isinstance(row, ast.ClassDef)
                  and row.name == "HMBSeedanceGeneration")
-    names = {"_draft_final_server_snapshot", "_schedule_draft_final_status_sync",
+    names = {"_draft_workflow_context", "_draft_final_server_snapshot", "_schedule_draft_final_status_sync",
              "_poll_draft_final_server_state"}
     methods = [deepcopy(row) for row in owner.body
                if isinstance(row, (ast.FunctionDef, ast.AsyncFunctionDef)) and row.name in names]
@@ -42,16 +42,18 @@ def observer_type():
                          {"_DRAFT_FINAL_HIDDEN_STATES", "_DRAFT_FINAL_SYNC_SECONDS"}
                          for target in row.targets)]
     assert len(constants) == 2
+    settled = deepcopy(next(row for row in tree.body if isinstance(row, ast.FunctionDef)
+                            and row.name == "_draft_final_settled"))
     shell = deepcopy(owner)
     shell.name = "Observer"
     shell.bases = []
     shell.keywords = []
     shell.decorator_list = []
     shell.body = methods
-    namespace = {"asyncio": asyncio, "deepcopy": deepcopy, "suppress": suppress,
+    namespace = {"asyncio": asyncio, "deepcopy": deepcopy, "nullcontext": nullcontext, "suppress": suppress,
                  "time": time, "GriptapeNodes": SimpleNamespace(
                      EventManager=lambda: SimpleNamespace(event_loop=asyncio.get_running_loop()))}
-    module = ast.Module(body=constants + [shell], type_ignores=[])
+    module = ast.Module(body=constants + [settled, shell], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
     return namespace["Observer"]
 

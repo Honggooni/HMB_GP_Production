@@ -59,6 +59,9 @@ async def check_wired_image_with_existing_shot(workspace):
     from PIL import Image
     from _hmb_fixture_sdk import ensure_fixture_flow
     import HMBPromptLibrary as prompt
+    import HMBSeedanceGeneration as seedance
+    from base64 import b64decode
+    from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
 
     standard = Path(os.environ.get("HMB_STANDARD_LIBRARY_ROOT",
                                    Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard"))
@@ -67,13 +70,18 @@ async def check_wired_image_with_existing_shot(workspace):
 
     current_engine().event_manager.initialize_queue()
     flow = ensure_fixture_flow(GriptapeNodes, "WiredImageExistingShot")
+    schema = LibrarySchema.model_validate_json((Path(asset.__file__).parent / "griptape-nodes-library.json").read_bytes())
+    registered = LibraryRegistry.generate_new_library(schema)
+    for cls in (asset.HMBImageAssetLibrary, seedance.HMBSeedanceGeneration):
+        entry = next(item for item in schema.nodes if item.class_name == cls.__name__)
+        registered.register_lazy_node_type(entry.class_name, entry.metadata, lambda cls=cls: cls)
 
     with patch.dict(os.environ, HMB_IMAGE_THUMBNAIL_CACHE=str(workspace / "thumbnails")):
         path = workspace / "inputs/images/Dingo.jpg"
         path.parent.mkdir(parents=True)
         Image.new("RGB", (32, 24), "orange").save(path)
         catalog = workspace / "projects"
-        project = catalog / "Sample" / "Ai_Ct_image"
+        project = catalog / "superwings12" / "Ai_Ct_image"
         (project / ".json").mkdir(parents=True)
         Image.new("RGB", (8, 8)).save(project / "Anchor.png")
         (project / ".json/hmb_image_assets.json").write_text(json.dumps({"assets": [{
@@ -85,6 +93,7 @@ async def check_wired_image_with_existing_shot(workspace):
         image.set_parameter_value("path", str(path))
         with patch.object(asset, "DEFAULT_PROJECTS_ROOT", catalog):
             library = asset.HMBImageAssetLibrary(name="HMB ImageAsset Library")
+            library.metadata.update(library=schema.name, node_type="HMBImageAssetLibrary")
             register(flow, library)
             library._hmb_initial_catalog_scan_pending = False
             library._hmb_hydration_adopted = True
@@ -189,6 +198,43 @@ async def check_wired_image_with_existing_shot(workspace):
             assert [(row["order_key"], row["selection_order"]) for row in received["ordered_images"]] == [
                 (anchor["source_uid"], 1), (imports[0]["source_uid"], 2),
             ], received["ordered_images"]
+            generator = seedance.HMBSeedanceGeneration(name="Wired Shot Generator")
+            generator.metadata.update(library=schema.name, node_type="HMBSeedanceGeneration")
+            register(flow, generator)
+            shot = library._current_state()["shot_routing"]
+            for name, value in (("shot_channel_uuid", shot["channel_uuid"]), ("shot_uuid", shot_id),
+                                ("shot_number", 1), ("shot_name", "Shot 1")):
+                generator.set_parameter_value(name, value, initial_setup=True)
+            wire = await GriptapeNodes.ahandle_request(CreateConnectionRequest(
+                source_node_name=library.name, source_parameter_name="SHOT_ASSET_OUT",
+                target_node_name=generator.name, target_parameter_name="SHOT_ASSET_IN", initial_setup=True))
+            assert wire.succeeded(), wire.result_details
+            params = generator._resolve_exact_shot_generation_inputs({**generator._get_parameters(), "model_id": seedance.SEEDANCE_2_5_MODEL_ID,
+                "duration": 4, "resolution": "480p", "prompt": "Use @image1 and @image2"})
+            prepared, _ = generator._prepare_image_references_for_run(params, cloud_driver=None)
+            payload = generator._build_broker_payload(prepared)
+            decoded = [b64decode(uri.split(",", 1)[1], validate=True) for uri in payload["image_urls"]]
+            assert decoded == [(project / "Anchor.png").read_bytes(), path.read_bytes()]
+            # Verify the retained widget's browser resource, not just the original file used by Prompt.
+            from urllib.parse import unquote, urlsplit
+            uid = imports[0]["source_uid"]
+            async with asyncio.timeout(5):
+                while True:
+                    value = library.get_parameter_value(asset.WIDGET_STATE_PARAMETER)
+                    visible = json.loads(value) if isinstance(value, str) else value
+                    row = next(item for item in visible["assets"] if item["source_uid"] == uid)
+                    if row.get("thumbnail_url"):
+                        break
+                    await asyncio.sleep(.02)
+            assert row["media_ref_kind"] == "artifact" and row["path"] == "{inputs}/images/Dingo.jpg"
+            assert row["selected"] and row["selection_order"] == 2
+            preview_url = urlsplit(row["thumbnail_url"])
+            assert preview_url.scheme in {"http", "https"} and "/staticfiles/" in preview_url.path
+            generated = workspace / "staticfiles" / Path(unquote(preview_url.path)).name
+            with Image.open(generated) as preview:
+                assert preview.size == (32, 24)
+                red, green, blue = preview.convert("RGB").getpixel((16, 12))
+                assert red > 220 and green > 100 and blue < 50
             await current_engine().aclose_workflow(library.workflow)
             assert not library._scan_owner_is_current(), "Closed workflow still owns pending execution"
     print("Standard LoadImage -> ImageAsset -> HMBPrompt: macro JPEG, first/repeat Resolve, legacy declaration, "

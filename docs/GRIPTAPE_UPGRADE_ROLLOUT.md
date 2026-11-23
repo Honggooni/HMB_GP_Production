@@ -9,6 +9,14 @@
 
 릴리스 보고서에는 등록된 HMB 노드 수와 실제로 실행한 연결 경로를 각각 기록한다. 연결 오류를 수정하면 재현한 입력, 기존 샷 선택, 반복 실행, 다음 노드가 받은 결과를 해당 경로의 필수 회귀 검사에 포함한다. 예를 들어 ImageAsset 검사는 합성 JPEG를 Standard LoadImage로 열고 기존 프로젝트 이미지와 함께 HMBPrompt에 전달된 순서를 확인한다. 사용한 SDK와 Standard 버전, 실제 Desktop 화면에서 확인한 범위, 미실행 항목을 함께 남긴다.
 
+별도 워크트리에서 배포할 때는 Team 게시물과 Local 설치 검증이 끝난 뒤 개발 PC의 배포 완료 절차에서 다음 명령을 실행한다. 팀원 PC의 일반 설치 절차는 이 명령을 사용하지 않는다.
+
+```powershell
+python tools/sync_published_workspace.py --workspace C:\HMB_GP_Production --tag <Team태그> --verified-stage <검증폴더>
+```
+
+검증 폴더의 `publication/verified.json`, `local-verified.json`과 실제 설치 영수증이 같은 배포를 가리켜야 한다. 채팅 작업 폴더의 `main`이 깨끗하고 원격 `main`과 Team 태그가 검증 커밋을 가리키면 fast-forward한다. 작업 중인 변경이나 분기된 커밋이 있으면 보존하고 중단한다. 출력의 `fast_forwarded` 또는 `already_current`와 함께 완료를 기록한다.
+
 Team v0.8.59는 SDK 0.104의 연결과 저장 경로를 복구한다. Editor 0.130 전용 헤더 연동과 실제 화면 검증은 별도로 남아 있다.
 
 ## Team v0.8.59 compatibility check

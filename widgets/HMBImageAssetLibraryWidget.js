@@ -1443,6 +1443,7 @@ function normalizeAsset(raw) {
     selected: Boolean(raw.selected) && (sourceKind === "user" || registered),
     selection_order: Math.max(0, Number.parseInt(raw.selection_order || 0, 10) || 0),
     import_index: Math.max(0, Number.parseInt(raw.import_index || 0, 10) || 0),
+    ...(sourceKind === "user" && raw.import_shot_initialized === true ? { import_shot_initialized: true } : {}),
     media_ref_kind: clean(raw.media_ref_kind) || "path",
     connected: raw.connected !== false,
   };

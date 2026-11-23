@@ -208,6 +208,8 @@ async def exercise_live_sync(engine, node, target, source, schema, original_shot
         assert target.get_parameter_value("HMB_BASH_VERIFICATION").get("apply_pixel_equal") is True
         feedback_rows = [a for a in node._current_state()["assets"] if a.get("source_kind") == "user"]
         assert len(feedback_rows) == 1 and feedback_rows[0]["selected"] is False, feedback_rows
+        assert all(feedback_rows[0]["source_uid"] not in shot["selected_source_uids"]
+                   for shot in node._current_state()["shot_routing"]["shots"])
         receipt = deepcopy(target.get_parameter_value("HMB_BASH_VERIFICATION"))
         await asyncio.sleep(.25)
         assert target.get_parameter_value("HMB_BASH_VERIFICATION") == receipt

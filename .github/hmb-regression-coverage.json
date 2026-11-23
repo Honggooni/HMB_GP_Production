@@ -3,6 +3,12 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_Published_Workspace_Sync_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_ImageAsset_Site_Settings_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",

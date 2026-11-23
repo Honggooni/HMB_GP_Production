@@ -2084,6 +2084,7 @@ def _normalize_import_input(
                 "image_name",
                 "selected",
                 "selection_order",
+                "import_shot_initialized",
             ):
                 if field in prior:
                     record[field] = prior[field]
@@ -3921,6 +3922,7 @@ def _normalize_asset(raw: Any) -> Dict[str, Any] | None:
         ),
         "selection_order": _non_negative_int(raw.get("selection_order")),
         "import_index": _non_negative_int(raw.get("import_index")),
+        **({"import_shot_initialized": True} if source_kind == "user" and raw.get("import_shot_initialized") is True else {}),
         "media_ref_kind": _clean(raw.get("media_ref_kind")) or "path",
         "connected": bool(raw.get("connected", True)),
     }
@@ -7409,11 +7411,26 @@ def _merge_import_input(
         and bool(asset.get("registered"))
         and _clean(asset.get("import_source_uid"))
     }
+    previous_uids = {asset["source_uid"] for asset in normalized["assets"]}
+    routing = normalized["shot_routing"]
+    shots = routing["shots"]
+    active = next(shot for shot in shots if shot["shot_uuid"] == routing["active_shot_uuid"])
+    owned = {uid for shot in shots for uid in shot["selected_source_uids"]}
+    added_to_shot = []
     for imported in imports:
         imported["asset_project_uid"] = ""
         uid = _clean(imported.get("source_uid"))
         if uid in registered_import_uids:
             continue
+        if not imported.get("import_shot_initialized"):
+            # A new wire participates in the currently active Shot. Older single-Shot
+            # saves sometimes contain selected imports only in the global image list.
+            # Older multi-Shot saves do not identify which row owned an orphan.
+            if (imported["selected"] and uid not in owned
+                    and (uid not in previous_uids or len(shots) == 1)
+                    and len(active["selected_source_uids"]) + len(added_to_shot) < MAX_SHOT_IMAGES):
+                added_to_shot.append(uid)
+            imported["import_shot_initialized"] = True
         library_id = _clean(imported.get("asset_library_id"))
         match_index = by_source_uid.get(uid)
         if match_index is None:
@@ -7437,12 +7454,26 @@ def _merge_import_input(
         by_library_id[library_id] = len(assets) - 1
         by_source_uid[uid] = len(assets) - 1
         existing_asset_ids[_clean(imported.get("asset_id"))] = uid
+    if added_to_shot:
+        active["selected_source_uids"].extend(added_to_shot)
+        active.update(revision=active["revision"] + 1, media_count=0, metadata_sha256="", media_sha256="")
+        routing["generation"] += 1
     _suggest_registration_names(assets, writer=(normalized.get("site_settings") or {}).get("write_site_id") or "hq")
     normalized["assets"] = assets
     normalized["scan_revision"] = _non_negative_int(
         normalized.get("scan_revision")
     ) + 1
     return _normalize_state(normalized), media_by_uid
+
+
+def _is_macro_image_import(asset: Dict[str, Any]) -> bool:
+    """A native File macro keeps its serialized artifact identity and Shot selection."""
+    path = _clean(asset.get("path"))
+    return (
+        asset.get("media_ref_kind") == "artifact"
+        and re.match(r"^\{[A-Za-z_][A-Za-z0-9_]*\}[/\\]", path) is not None
+        and Path(path).suffix.casefold() in IMAGE_EXTENSIONS
+    )
 
 
 def _hydrate_live_import_thumbnails(
@@ -7458,9 +7489,10 @@ def _hydrate_live_import_thumbnails(
         signature = ""
         url = ""
         try:
-            path, _size, _mtime_ns, signature = _asset_file_facts(
-                Path(path_text)
-            )
+            path = _resolve_import_file_reference(path_text) if path_text.startswith("{") else Path(path_text)
+            if path is None:
+                continue
+            path, _size, _mtime_ns, signature = _asset_file_facts(path)
             url = _asset_thumbnail_url_for_media(path, uid, signature)
             if url:
                 _resolved, _size, _mtime_ns, current_signature = (
@@ -7495,7 +7527,7 @@ def _merge_live_import_thumbnail_result(
             update is not None
             and _clean(asset.get("source_kind")) == "user"
             and _non_negative_int(asset.get("import_index")) > 0
-            and _clean(asset.get("media_ref_kind")) == "path"
+            and (_clean(asset.get("media_ref_kind")) == "path" or _is_macro_image_import(asset))
             and _clean(asset.get("path")) == update[0]
         ):
             _path, signature, url = update
@@ -14047,7 +14079,7 @@ class HMBImageAssetLibrary(DataNode):
                 ):
                     return False
             if merged is not None:
-                self._publish_state(merged, normalized=True)
+                self._publish_state(merged, normalized=True, preserve_outputs=True, reconcile_graph=False)
             completed = True
             return True
         except Exception as exc:
@@ -14075,7 +14107,7 @@ class HMBImageAssetLibrary(DataNode):
             if isinstance(asset, dict)
             and _clean(asset.get("source_kind")) == "user"
             and _non_negative_int(asset.get("import_index")) > 0
-            and _clean(asset.get("media_ref_kind")) == "path"
+            and (_clean(asset.get("media_ref_kind")) == "path" or _is_macro_image_import(asset))
             and _clean(asset.get("source_uid"))
             and _clean(asset.get("path"))
         ]
@@ -14088,7 +14120,12 @@ class HMBImageAssetLibrary(DataNode):
         if not rows:
             return
         node_ref = weakref.ref(self)
-        host_context = contextvars.copy_context()
+        workflow = getattr(self, "workflow", None)
+        if workflow is not None:
+            with workflow.engine.bind_workflow(workflow):
+                host_context = contextvars.copy_context()
+        else:
+            host_context = contextvars.copy_context()
 
         def active_loop() -> Any:
             try:
@@ -14124,7 +14161,7 @@ class HMBImageAssetLibrary(DataNode):
                 )
 
         def run_once() -> None:
-            results = _hydrate_live_import_thumbnails(rows, is_current)
+            results = host_context.copy().run(_hydrate_live_import_thumbnails, rows, is_current)
             owner = node_ref()
             if owner is None or not is_current():
                 return
