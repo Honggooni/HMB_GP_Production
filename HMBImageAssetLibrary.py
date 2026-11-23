@@ -38,7 +38,7 @@ if str(_THIS_DIR) not in sys.path:
 from _hmb_deletion_guard import hmb_binding_mutation
 from _hmb_image_asset_sites import (
     run_site_folder_command, ensure_registration_directory, get_site_settings, save_site_settings,
-    site_profiles, verify_folder_identity,
+    site_profiles, verify_folder_identity, image_execution_workspace,
 )
 from _hmb_project import project_display_name
 
@@ -9159,9 +9159,9 @@ def _add_shot_asset_output(node: Any) -> None:
 
 
 def _add_image_import_input(node: Any) -> None:
-    _ensure_import_child_removal_observers(node)
     if parameter_exists(node, IMAGE_IMPORT_PARAMETER):
         return
+    _ensure_import_child_removal_observers(node)
     tooltip = (
         "Optional external images appended to IMAGE_OUT with their readable content "
         "and available name/order metadata. Project verification fields remain "
@@ -9537,13 +9537,11 @@ def _propagate_image_output_to_connections(
     node_name = _clean(getattr(node, "name", ""))
     if not node_name or not still_owned():
         return
-    try:
-        registered = GriptapeNodes.NodeManager().get_node_by_name(node_name)
-    except Exception:
+    if not node._scan_owner_is_current() or not still_owned():
         return
-    if registered is not node or not still_owned():
-        return
-    result = GriptapeNodes.handle_request(
+    workflow = getattr(node, "workflow", None)
+    request = getattr(workflow, "handle_request", GriptapeNodes.handle_request)
+    result = request(
         ListConnectionsForNodeRequest(
             node_name=node_name,
             broadcast_result=False,
@@ -9570,15 +9568,7 @@ def _propagate_image_output_to_connections(
         )
         if not target_node_name or not target_parameter_name:
             continue
-        try:
-            target_node = GriptapeNodes.NodeManager().get_node_by_name(
-                target_node_name
-            )
-        except Exception:
-            target_node = None
-        if bool(getattr(target_node, "lock", False)):
-            continue
-        set_result = GriptapeNodes.handle_request(
+        set_result = request(
             SetParameterValueRequest(
                 node_name=target_node_name,
                 parameter_name=target_parameter_name,
@@ -9586,12 +9576,21 @@ def _propagate_image_output_to_connections(
                 data_type=data_type or None,
                 incoming_connection_source_node_name=node_name,
                 incoming_connection_source_parameter_name=name,
+                failure_log_level=logging.DEBUG,
             )
         )
         if not still_owned():
             return
         if not isinstance(set_result, SetParameterValueResultSuccess):
+            from griptape_nodes.retained_mode.events.node_events import GetAllNodeInfoRequest
+
             details = _clean(getattr(set_result, "result_details", ""))
+            # The SDK checks the destination's current lock while applying the
+            # write, including when the destination lives in another process.
+            target = request(GetAllNodeInfoRequest(node_name=target_node_name,
+                             broadcast_result=False, failure_log_level=logging.DEBUG))
+            if getattr(target, "locked", False):
+                continue
             raise RuntimeError(
                 details
                 or (
@@ -10133,6 +10132,11 @@ class HMBImageAssetLibrary(DataNode):
         _add_project_root(self)
         _add_project_root(self, site_draft=True)
         _add_widget_state(self)
+        # This parameter carries serialized JSON. Substituting a Windows
+        # workspace path inside that JSON inserts unescaped backslashes.
+        widget_state = _get_parameter_obj(self, WIDGET_STATE_PARAMETER)
+        if getattr(widget_state, "allow_variable_substitution", False):
+            widget_state.allow_variable_substitution = False
         _add_thumbnail_patch_bridge(self)
 
     def _widget_initial_assignment(self, name: str) -> Dict[str, Any] | None:
@@ -12876,6 +12880,7 @@ class HMBImageAssetLibrary(DataNode):
         *,
         normalized: bool = False,
         preserve_outputs: bool = False,
+        reconcile_graph: bool = True,
     ) -> Dict[str, Any]:
         state = dict(state)
         state[WIDGET_RUNTIME_LEASE_KEY] = self._hmb_widget_runtime_lease
@@ -12947,23 +12952,31 @@ class HMBImageAssetLibrary(DataNode):
         )
         if not pending_only:
             normalized = self._sync_output(normalized, normalized=True)
-            self._reconcile_hmb_shot_routing(
-                _shot_routing_catalog_identity(normalized, normalized=True)
-            )
+            if reconcile_graph:
+                self._reconcile_hmb_shot_routing(
+                    _shot_routing_catalog_identity(normalized, normalized=True)
+                )
         elif resolution_pending and normalized.get("image_bash_workspace"):
             self._sync_image_bash_output(normalized, pending=True)
         self._sync_thumbnail_bridge_identity(normalized)
         # Optional finishing UI only; no catalog scan, selection or output change.
-        try:
-            _hmb_shot_routing.notify_color_lut_project_change(self, normalized)
-        except Exception:
-            pass
+        if reconcile_graph:
+            try:
+                _hmb_shot_routing.notify_color_lut_project_change(self, normalized)
+            except Exception:
+                pass
         return normalized
 
     def _scan_owner_is_current(self) -> bool:
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return False
         try:
+            workflow = getattr(self, "workflow", None)
+            lookup = getattr(getattr(workflow, "objects", None), "get", None)
+            if callable(lookup):
+                # A running node (including a worker copy) belongs to this
+                # workflow even if the editor has activated another document.
+                return not getattr(workflow, "closed", False) and lookup(self.name) is self
             from griptape_nodes.retained_mode.engine import has_current_engine  # type: ignore
             from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes  # type: ignore
 
@@ -15825,6 +15838,7 @@ class HMBImageAssetLibrary(DataNode):
     def _execution_preparation_identity(self) -> str:
         state = self._current_state()
         imports = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
+        routing = state["shot_routing"]
         return _sha256_canonical({
             "root": _project_root_text(_get_parameter_raw(self, PROJECT_ROOT_PARAMETER)),
             "selection": _project_output_fingerprint(
@@ -15833,9 +15847,15 @@ class HMBImageAssetLibrary(DataNode):
             ),
             "imports": _canonical_import_input_identity(imports),
             "import_revision": _non_negative_int(getattr(self, "_hmb_import_revision", 0)),
-            "routing": _shot_routing_catalog_identity(state, normalized=True),
-            "shot_membership": [list(shot["selected_source_uids"])
-                                for shot in state["shot_routing"]["shots"]],
+            # The routing generation acknowledges publication. A downstream
+            # reader can advance it for these same shots while files are read.
+            "publisher": routing["publisher_instance_uuid"],
+            "channel": routing["channel_uuid"],
+            "active_shot": routing["active_shot_uuid"],
+            "shots": [
+                (shot["shot_uuid"], shot["number"], shot["name"], shot["revision"], shot["selected_source_uids"])
+                for shot in routing["shots"]
+            ],
         })
 
     @staticmethod
@@ -15861,6 +15881,10 @@ class HMBImageAssetLibrary(DataNode):
 
     async def aprocess(self) -> None:
         """Verify shared files off-loop, then publish one current pair on-loop."""
+        with image_execution_workspace():
+            await self._execute_image_selection()
+
+    async def _execute_image_selection(self) -> None:
         self._hmb_hydration_adopted = True
         self._consume_pending_catalog_scan_result()
         self._consume_pending_thumbnail_result()
@@ -15911,6 +15935,9 @@ class HMBImageAssetLibrary(DataNode):
             )]
             prepared["shot_routing"] = copy.deepcopy(worker_state["shot_routing"])
             prepared["shot_routing"]["expanded"] = live["shot_routing"]["expanded"]
+            prepared["shot_routing"]["generation"] = max(
+                prepared["shot_routing"]["generation"], live["shot_routing"]["generation"],
+            )
             prepared = _normalize_state(prepared)
         # The merge may retain newer presentation facts, but every selected
         # project row must still have the exact worker-verified cache key.
@@ -15929,14 +15956,32 @@ class HMBImageAssetLibrary(DataNode):
         self._hmb_resolution_cache_identity = _resolution_cache_state_identity(prepared)
         self._hmb_last_output_fingerprint = ""
         self._hmb_shot_routing_input_identity = ""
-        published = self._publish_state(prepared, normalized=True)
+        published = self._publish_state(prepared, normalized=True, reconcile_graph=False)
         # Thumbnail hydration is presentation work and may still be busy.
         # _publish_state intentionally preserves old outputs for a busy UI
         # acknowledgement; execution must stage the verified pair regardless.
-        synchronized = self._sync_output(published, normalized=True)
-        self._reconcile_hmb_shot_routing(_shot_routing_catalog_identity(synchronized, normalized=True))
+        self._sync_output(published, normalized=True)
+        self._schedule_execution_graph_updates(generation)
         if _flatten_import_values(import_value):
             self._schedule_live_import_thumbnail_hydration(published)
+
+    def _schedule_execution_graph_updates(self, generation: int) -> None:
+        # Shot routing and following the selected project belong to the retained
+        # editor graph. Native execution has already published the verified ports.
+        workflow = getattr(self, "workflow", None)
+        if workflow is None or self.engine.library_manager.is_worker:
+            return
+
+        def reconcile() -> None:
+            if (generation != self._hmb_execution_prepare_generation
+                    or not self._scan_owner_is_current()):
+                return
+            with self.engine.bind_workflow(workflow):
+                state = self._current_state()
+                self._reconcile_hmb_shot_routing(_shot_routing_catalog_identity(state, normalized=True))
+                _hmb_shot_routing.notify_color_lut_project_change(self, state)
+
+        asyncio.get_running_loop().call_soon(reconcile)
 
     def process(self) -> None:
         self._hmb_hydration_adopted = True

@@ -1534,10 +1534,9 @@
     },
     {
       "name": "HMB_Image_Asset_Selection_Resolution_Host_Integration.py",
-      "mode": "manual",
+      "mode": "ci",
       "coverage": "installed_sdk",
-      "required": false,
-      "reason": "Requires actual retained SDK callback, heartbeat and downstream resolution; run only in a disposable engine and guarded offline process."
+      "required": true
     },
     {
       "name": "HMB_Image_Asset_Server_Sharing_Regression.py",

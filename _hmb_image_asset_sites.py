@@ -25,6 +25,7 @@ _CACHE_LOCK = threading.RLock()
 _DIRECTORY_LOCKS = {}
 _DIRECTORY_STATUS = {}
 _PROFILE_DIRECTORIES = set()
+_EXECUTION_WORKSPACE = contextvars.ContextVar("hmb_image_site_execution_workspace", default=None)
 
 
 def _default():
@@ -45,6 +46,9 @@ def _desktop_workspace(appdata):
 
 
 def _workspace():
+    execution_path = _EXECUTION_WORKSPACE.get()
+    if execution_path is not None:
+        return execution_path
     directory = os.environ.get("GTN_CONFIG_WORKSPACE_DIRECTORY", "")
     try:
         from griptape_nodes.retained_mode.engine import has_current_engine
@@ -56,6 +60,36 @@ def _workspace():
     if directory and Path(directory).is_absolute():
         return Path(directory)
     return _desktop_workspace(os.environ.get("APPDATA", ""))
+
+
+@contextmanager
+def image_execution_workspace():
+    """Read the engine's configured (un-pinned) workspace once for this run."""
+    directory = os.environ.get("GTN_CONFIG_WORKSPACE_DIRECTORY")
+    fallback = _desktop_workspace(os.environ.get("APPDATA", ""))
+    if not directory:
+        try:
+            from griptape_nodes.retained_mode.engine import has_current_engine
+            from griptape_nodes.retained_mode.events.config_events import GetConfigLayersRequest, GetConfigValueRequest
+            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+            if has_current_engine():
+                result = GriptapeNodes.handle_request(GetConfigValueRequest(category_and_key="workspace_directory", broadcast_result=False))
+                if result.succeeded():
+                    directory = result.value
+                    if result.source.layer == "runtime":
+                        # The current project's temporary pin must not redirect
+                        # workstation-wide folder settings into its workspace.
+                        layers = GriptapeNodes.handle_request(GetConfigLayersRequest(broadcast_result=False))
+                        directory = next((layer.values["workspace_directory"] for layer in reversed(layers.layers)
+                                          if layer.layer != "runtime" and layer.values.get("workspace_directory")), None)
+        except (ImportError, AttributeError, RuntimeError, OSError, ValueError):
+            directory = None
+    path = Path(directory).expanduser().resolve() if directory else fallback
+    token = _EXECUTION_WORKSPACE.set(path)
+    try:
+        yield
+    finally:
+        _EXECUTION_WORKSPACE.reset(token)
 
 
 @lru_cache(maxsize=1)

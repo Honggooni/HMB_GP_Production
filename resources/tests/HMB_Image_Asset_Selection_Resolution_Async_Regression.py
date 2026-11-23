@@ -14,7 +14,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("HMB_IMAGE_ASSET_TEST_ROOT", Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(ROOT))
 SPEC = importlib.util.spec_from_file_location(
     "hmb_image_selection_resolution_async",

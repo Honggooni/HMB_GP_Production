@@ -4,18 +4,27 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import sys
+import tempfile
 import threading
 import time
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, os.environ.get("HMB_IMAGE_ASSET_TEST_ROOT", str(ROOT)))
+# The SDK binds its config paths on import. Keep the developer's Desktop
+# settings and catalog out of both the native dispatch and the wired journey.
+_profile = tempfile.TemporaryDirectory(prefix="hmb-imageasset-execution-")
+_base = Path(_profile.name)
+os.environ.update(XDG_CONFIG_HOME=str(_base / "config"), XDG_DATA_HOME=str(_base / "data"),
+                  LOCALAPPDATA=str(_base / "local"), APPDATA=str(_base / "app"),
+                  GTN_CONFIG_WORKSPACE_DIRECTORY=str(_base), HMB_IMAGE_PROJECTS_ROOT=str(_base / "projects"))
 try:
     from griptape_nodes.exe_types.flow import ControlFlow
     from griptape_nodes.exe_types.node_types import NodeResolutionState
-    from griptape_nodes.retained_mode.engine import current_engine
+    from griptape_nodes.retained_mode.engine import current_engine, engine_scope
     from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest
     from griptape_nodes.retained_mode.events.execution_events import ResolveNodeRequest
     from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeRequest, SetParameterValueRequest
@@ -42,6 +51,148 @@ class ImageSink(asset.DataNode):
 def register(flow, node):
     from _hmb_fixture_sdk import register_fixture_node
     register_fixture_node(GriptapeNodes, flow, node)
+
+
+async def check_wired_image_with_existing_shot(workspace):
+    """Resolve the SDK's dynamic image slot and an already-selected project image together."""
+    from griptape_nodes.retained_mode.engine import NO_WORKFLOW
+    from PIL import Image
+    from _hmb_fixture_sdk import ensure_fixture_flow
+    import HMBPromptLibrary as prompt
+
+    standard = Path(os.environ.get("HMB_STANDARD_LIBRARY_ROOT",
+                                   Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard"))
+    sys.path.insert(0, str(standard))
+    from griptape_nodes_library.image.load_image import LoadImage
+
+    current_engine().event_manager.initialize_queue()
+    flow = ensure_fixture_flow(GriptapeNodes, "WiredImageExistingShot")
+
+    with patch.dict(os.environ, HMB_IMAGE_THUMBNAIL_CACHE=str(workspace / "thumbnails")):
+        path = workspace / "inputs/images/Dingo.jpg"
+        path.parent.mkdir(parents=True)
+        Image.new("RGB", (32, 24), "orange").save(path)
+        catalog = workspace / "projects"
+        project = catalog / "Sample" / "Ai_Ct_image"
+        (project / ".json").mkdir(parents=True)
+        Image.new("RGB", (8, 8)).save(project / "Anchor.png")
+        (project / ".json/hmb_image_assets.json").write_text(json.dumps({"assets": [{
+            "path": "Anchor.png", "asset_id": "Anchor", "image_name": "Anchor",
+            "image_main_type": "Custom / Context", "image_sub_type": "Context",
+        }]}), encoding="utf-8")
+        image = LoadImage(name="Dingo")
+        register(flow, image)
+        image.set_parameter_value("path", str(path))
+        with patch.object(asset, "DEFAULT_PROJECTS_ROOT", catalog):
+            library = asset.HMBImageAssetLibrary(name="HMB ImageAsset Library")
+            register(flow, library)
+            library._hmb_initial_catalog_scan_pending = False
+            library._hmb_hydration_adopted = True
+            state = asset._load_project_catalog(catalog, {})
+            if not state["project_root"]:
+                state = asset._select_catalog_project(state, state["projects"][0]["path"])
+            anchor = next(row for row in state["assets"] if row["registered"])
+            anchor.update(selected=True, selection_order=1)
+            state["shot_routing"]["shots"][0]["selected_source_uids"] = [anchor["source_uid"]]
+            library._sync_output(state, force=True)
+            library._publish_state(state)
+            slot = await GriptapeNodes.ahandle_request(AddParameterToNodeRequest(
+                node_name=library.name, parent_container_name=asset.IMAGE_IMPORT_PARAMETER))
+            assert not slot.failed(), slot
+            connection = await GriptapeNodes.ahandle_request(CreateConnectionRequest(
+                source_node_name=image.name, source_parameter_name="image",
+                target_node_name=library.name, target_parameter_name=slot.parameter_name))
+            assert not connection.failed(), connection
+            shot_id = state["shot_routing"]["active_shot_uuid"]
+            checked_state_reads = []
+            original_prepare = library._execution_preparation_identity
+
+            def record_widget_read():
+                checked_state_reads.append((library.get_parameter_value(asset.WIDGET_STATE_PARAMETER),
+                                            library.parameter_values[asset.WIDGET_STATE_PARAMETER]))
+                return original_prepare()
+
+            for attempt in (1, 2):
+                if attempt == 2:
+                    # Saved nodes can restore the old Parameter declaration.
+                    library.get_parameter_by_name(asset.WIDGET_STATE_PARAMETER).allow_variable_substitution = True
+                with patch.object(library, "_execution_preparation_identity", record_widget_read):
+                    result = await GriptapeNodes.ahandle_request(ResolveNodeRequest(node_name=library.name))
+                assert not result.failed(), (attempt, str(result.result_details))
+                assert image.parameter_output_values["was_successful"]
+                assert image.parameter_output_values["image"].value == "{inputs}/images/Dingo.jpg"
+                assert checked_state_reads
+                for sdk_value, stored_json in checked_state_reads:
+                    assert sdk_value == stored_json, "Workflow variables changed an opaque JSON document during Resolve"
+                    assert json.loads(sdk_value)["shot_routing"]["active_shot_uuid"] == shot_id
+                    assert "{inputs}/images/Dingo.jpg" in stored_json
+                checked_state_reads.clear()
+                updated = library._current_state()
+                imports = [row for row in updated["assets"] if row["source_kind"] == "user"]
+                assert len(imports) == 1 and imports[0]["image_name"] == "Dingo", imports
+                media = library._hmb_import_media_by_uid[imports[0]["source_uid"]]
+                assert getattr(media, "value", None) == "{inputs}/images/Dingo.jpg", media
+                assert asset._local_import_source(imports[0], media).samefile(path)
+                assert updated["shot_routing"]["active_shot_uuid"] == shot_id
+                assert anchor["source_uid"] in updated["shot_routing"]["shots"][0]["selected_source_uids"]
+                assert any(row["source_uid"] == anchor["source_uid"] and row["selected"] for row in updated["assets"])
+                output = library.parameter_output_values[asset.MEDIA_OUTPUT_PARAMETER]
+                assert anchor["path"] in output
+                output_reference = getattr(output[1], "value", output[1])
+                assert asset._resolve_import_file_reference(output_reference).samefile(path)
+
+            # A peer can publish an acknowledgement while the node is still
+            # verifying the same images off-thread. Only the cursor advances.
+            entered = threading.Event()
+            release = threading.Event()
+            prepare = library._prepare_execution_files
+
+            def paused_prepare(*args):
+                entered.set()
+                assert release.wait(4), "Timed out waiting for peer publication"
+                return prepare(*args)
+
+            with patch.object(library, "_prepare_execution_files", paused_prepare):
+                pending = asyncio.create_task(GriptapeNodes.ahandle_request(ResolveNodeRequest(node_name=library.name)))
+                try:
+                    assert await asyncio.to_thread(entered.wait, 3)
+                    live = library._current_state()
+                    newer = dict(library._cache_shot_routing_snapshot(live, normalized=True))
+                    newer["generation"] = live["shot_routing"]["generation"] + 1
+                    library._persist_shot_routing_facts(live, newer)
+                    assert library._current_state()["shot_routing"]["generation"] == newer["generation"]
+                finally:
+                    release.set()
+                result = await pending
+            assert not result.failed(), str(result.result_details)
+            assert library._current_state()["shot_routing"]["generation"] >= newer["generation"]
+            run = library.aprocess
+
+            async def run_without_ambient_workflow():
+                with current_engine().bind_workflow(NO_WORKFLOW):
+                    await run()
+
+            with patch.object(library, "aprocess", run_without_ambient_workflow):
+                result = await GriptapeNodes.ahandle_request(ResolveNodeRequest(node_name=library.name))
+            assert not result.failed(), str(result.result_details)
+            assert library._current_state()["shot_routing"]["active_shot_uuid"] == shot_id
+            downstream = prompt.HMBPromptLibrary(name="HMBPrompt")
+            register(flow, downstream)
+            wire = await GriptapeNodes.ahandle_request(CreateConnectionRequest(
+                source_node_name=library.name, source_parameter_name=asset.OUTPUT_PARAMETER,
+                target_node_name=downstream.name, target_parameter_name=prompt.IMAGE_ASSET_INPUT_PARAMETER_NAME))
+            assert wire.succeeded(), wire.result_details
+            result = await GriptapeNodes.ahandle_request(ResolveNodeRequest(node_name=downstream.name))
+            assert result.succeeded(), str(result.result_details)
+            received = downstream.get_parameter_value(prompt.IMAGE_ASSET_INPUT_PARAMETER_NAME)
+            received = json.loads(received) if isinstance(received, str) else received
+            assert [(row["order_key"], row["selection_order"]) for row in received["ordered_images"]] == [
+                (anchor["source_uid"], 1), (imports[0]["source_uid"], 2),
+            ], received["ordered_images"]
+            await current_engine().aclose_workflow(library.workflow)
+            assert not library._scan_owner_is_current(), "Closed workflow still owns pending execution"
+    print("Standard LoadImage -> ImageAsset -> HMBPrompt: macro JPEG, first/repeat Resolve, legacy declaration, "
+          "preserved Shot and image order, peer publication, unbound callback, retired workflow PASS")
 
 
 async def main():
@@ -269,4 +420,7 @@ async def main():
 
 
 asyncio.run(main())
+with tempfile.TemporaryDirectory() as workspace, patch.dict(os.environ, GTN_CONFIG_WORKSPACE_DIRECTORY=workspace):
+    with engine_scope():
+        asyncio.run(check_wired_image_with_existing_shot(Path(workspace)))
 print("ImageAsset selection native SDK dispatch/heartbeat/immediate Run: PASS")

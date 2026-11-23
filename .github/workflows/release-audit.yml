@@ -127,6 +127,27 @@ jobs:
           }
       - name: Install pinned direct and audit dependencies
         run: python -m pip install "Pillow==12.3.0" "imageio-ffmpeg==0.6.0" "httpx==0.28.1" "packaging==26.3" "requests==2.34.2"
+      - name: Check out the tested Standard image node for the connected SDK regression
+        uses: actions/checkout@v4
+        with:
+          repository: griptape-ai/griptape-nodes-library-standard
+          ref: 29e91f362343e2eba4fb3d2d48ef05d43bb34d53
+          path: .tmp/standard-library
+          sparse-checkout: |
+            griptape_nodes_library/image
+            griptape_nodes_library/utils
+          persist-credentials: false
+      - name: Prepare the Desktop SDK in an isolated regression interpreter
+        shell: pwsh
+        run: |
+          $sdkRoot = Join-Path $env:RUNNER_TEMP 'hmb-desktop-sdk'
+          python -m venv $sdkRoot
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create the SDK regression environment.' }
+          $sdkPython = Join-Path $sdkRoot 'Scripts/python.exe'
+          & $sdkPython -m pip install "griptape-nodes==0.104.3" "griptape==1.13.0" "Pillow==13.0.0" "numpy==2.5.5"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not install the tested Desktop SDK.' }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_RELEASE_SDK_PYTHON=$sdkPython"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_STANDARD_LIBRARY_ROOT=$(Join-Path $PWD '.tmp/standard-library')"
       - name: Install pinned media probe for real stream-copy regressions
         shell: pwsh
         run: |
@@ -357,10 +378,11 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- ImageAsset resolves connected image inputs alongside saved shot selections. Publishing the same selection during file preparation now succeeds, while changing the selected images still discards stale results.",
             "- Color LUT shows Group, Project and Episode in one row. A team member's group is filled from their signed-in account, and episode choices follow the operating page's project and group.",
             "- Project Add in ImageAsset and Sound manages linked folders for each project. Select a folder to register images there, or disconnect a folder to remove it from the local catalog. Existing files stay on disk.",
             "- ImageAsset reads the headquarters and partner registries together. Registrations use the selected folder's registry and are serialized per registry, including when two workstations Add images concurrently.",
-            "- Loads the signed Super Wings 12 v8.1 policy for linked Prompt and Agent shots. The independent Seedance Only route applies its Super Wings defaults to a connected Standard text Agent and preserves authored directions and other project routes.",
+            "- Loads the signed Super Wings 12 policy for linked Prompt and Agent shots. The independent Seedance Only route applies its Super Wings defaults to a connected Standard text Agent and preserves authored directions and other project routes.",
             "- Color LUT can create the review JPEG and MP4 when a Windows workstation stores its review cache under a long directory path.",
             "- Seedance writes SDK-readable output metadata for MOV, MP4 and last-frame PNG files. Indexed PNG destinations now allocate the next available name, including concurrent saves.",
             "- Seedance resolves output names in the workflow that owns the destination and reuses the filename search when publishing a completed video.",
