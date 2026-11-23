@@ -135,7 +135,85 @@ def retained_nodes(engine):
     return found
 
 
+def digest(value):
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def assert_reconnected_authoring(nodes, expected, publications):
+    actual = common.authoring(nodes)
+    expected = deepcopy(expected)
+    prompt_state = nodes[base.KINDS[2]]._current_state()
+    channel = prompt_state["shot"]["channel_uuid"]
+    shot_id = prompt_state["shot"]["shot_uuid"]
+    key = channel + "/" + shot_id
+    before = json.loads(expected["prompt_documents"][key])
+    after = json.loads(actual["prompt_documents"][key])
+
+    # A cold physical reconnection republishes only the active document. Verify the
+    # new receipts against each actual upstream node before comparing authoring.
+    for kind, node, media_field in (
+        ("image_asset", nodes[base.KINDS[0]], "ordered_assets"),
+        ("picker", nodes[base.KINDS[1]], "ordered_videos"),
+    ):
+        # Reading the same publisher again can advance its sequence if another
+        # consumer asked for a different Shot. Use the actual delivered snapshot.
+        receipt = after[kind]["shot_routing"]
+        snapshot = next((snapshot for owner, snapshot in publications[kind]
+            if owner is node and snapshot["generation"] == receipt["generation"] and
+            snapshot["publisher_instance_uuid"] == receipt["publisher_instance_uuid"] and
+            any(shot_id == shot["shot_uuid"] for shot in snapshot["shots"])), None)
+        assert snapshot is not None, f"Missing {kind} publication at gen {receipt['generation']}, observed {[(owner is node,s['generation']) for owner,s in publications[kind]][-16:]}"
+        selected = next(shot for shot in snapshot["shots"] if shot["shot_uuid"] == shot_id)["selected_source_uids"]
+        metadata_keys = ["channel_uuid", "generation", "shots", media_field]
+        if kind == "image_asset":
+            metadata_keys.append("project_id")
+        metadata_digest = digest({name: snapshot[name] for name in metadata_keys})
+        media_digest = digest({"media_descriptors": [
+            {"source_uid": row["source_uid"], "media_value_sha256":
+                hashlib.sha256(snapshot["media_by_source_uid"][row["source_uid"]].encode("utf8")).hexdigest()}
+            for row in snapshot[media_field]
+        ]})
+        assert snapshot["metadata_sha256"] == metadata_digest and snapshot["media_sha256"] == media_digest, kind
+        assert snapshot["channel_uuid"] == channel
+        route = {
+            "publisher_instance_uuid": snapshot["publisher_instance_uuid"], "channel_uuid": channel,
+            "generation": snapshot["generation"], "metadata_sha256": metadata_digest, "media_sha256": media_digest,
+            "media_count": len(selected), "media_order_sha256": digest({"selected_source_uids": selected}),
+        }
+        assert after[kind]["shot_routing"] == route, kind
+        old = before[kind]["shot_routing"]
+        assert all(old[name] == route[name] for name in ("channel_uuid", "media_count", "media_sha256", "media_order_sha256")), kind
+        if kind == "image_asset":
+            for document, generation in ((before, old["generation"]), (after, route["generation"])):
+                selection = {"channel_uuid": channel, "generation": generation, "shot_uuid": shot_id, "selected_source_uids": selected}
+                assert document[kind]["selection_id"] == digest(selection)
+            before[kind]["selection_id"] = after[kind]["selection_id"]
+        before[kind]["shot_routing"] = route
+    assert after["source_sync_revision"] == prompt_state["source_sync_revision"]
+    assert after["source_sync_revision"] >= before["source_sync_revision"]
+    before["source_sync_revision"] = after["source_sync_revision"]
+    assert before == after, "Active Shot authored data changed"
+    expected["prompt_documents"][key] = actual["prompt_documents"][key]
+    assert actual == expected, "Other Shot documents, memberships, saved settings or results changed"
+
+
 async def replay(engine, modules, folder, artifact, expected, original_edges, scenario):
+    publications = {"image_asset": [], "picker": []}
+    with ExitStack() as observed:
+        if scenario == "detached":
+            for kind, cls_name in zip(publications, base.KINDS[:2]):
+                cls = getattr(modules[cls_name], cls_name)
+                original = getattr(cls, "_hmb_shot_routing_snapshot_for")
+                def capture(self, *args, _read=original, _kind=kind, **kwargs):
+                    result = _read(self, *args, **kwargs)
+                    publications[_kind].append((self, deepcopy(result)))
+                    return result
+                observed.enter_context(mock.patch.object(cls, "_hmb_shot_routing_snapshot_for", capture))
+        await replay_observed(engine, modules, folder, artifact, expected, original_edges, scenario, publications)
+
+
+async def replay_observed(engine, modules, folder, artifact, expected, original_edges, scenario, publications):
     import _hmb_connection_management as api
     from griptape_nodes.retained_mode.events.node_events import SetLockNodeStateRequest
     from griptape_nodes.retained_mode.events.workflow_events import RunWorkflowFromScratchRequest
@@ -202,7 +280,8 @@ async def replay(engine, modules, folder, artifact, expected, original_edges, sc
             operation="reconnect", expected_state_token=current.state_token))
         assert not restored.detached and restored.can_disconnect
         await asyncio.sleep(.1)
-        assert common.authoring(nodes) == expected and common.edges(engine) == original_edges
+        assert common.edges(engine) == original_edges
+        assert_reconnected_authoring(nodes, expected, publications)
         record("cold_detached_Agent_reconnect_restores_exact_edges_and_TaskIDs", initial=view,
                after=capabilities(engine, nodes))
 

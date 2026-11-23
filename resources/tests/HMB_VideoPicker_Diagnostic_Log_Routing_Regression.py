@@ -33,6 +33,7 @@ def diagnostic_node(scene):
     # receipt store while preserving the real publication/diagnostic methods.
     node._hmb_read_requests = {}
     node._hmb_runtime_instance_id = "diagnostic-regression"
+    node._hmb_picker_publisher_uuid = str(uuid.uuid4())
     node._hmb_lifecycle_generation = 1
     node._hmb_state_revision = 0
     node._hmb_active_operation = None

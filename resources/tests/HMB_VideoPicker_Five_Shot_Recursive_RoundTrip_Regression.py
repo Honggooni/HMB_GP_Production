@@ -107,7 +107,11 @@ def recursive_semantic_copy(value: Any, *, key: str = "") -> Any:
 
 
 def semantic_bytes(state: Any) -> bytes:
-    return canonical_bytes(recursive_semantic_copy(picker._parse_state(state)))
+    durable = recursive_semantic_copy(picker._parse_state(state))
+    # Only this top-level UI publisher belongs to the running node. Bound
+    # catalog publishers, Shot IDs and channel identities remain part of the comparison.
+    durable.pop("picker_publisher_instance_uuid", None)
+    return canonical_bytes(durable)
 
 
 def shot_records(count: int) -> list[dict[str, Any]]:
@@ -350,9 +354,12 @@ def run_hook_order_round_trips(
     payload = copy.deepcopy(serialized)
     for round_number in range(1, 4):
         node = restored_node(payload, catalog)
+        previous_publisher = payload["picker_publisher_instance_uuid"]
+        assert previous_publisher and node._hmb_picker_publisher_uuid != previous_publisher
         for hook_name in hook_order:
             getattr(node, hook_name)()
             current = node._picker_state()
+            assert current["picker_publisher_instance_uuid"] == node._hmb_picker_publisher_uuid
             assert_recursive_five_shot_invariants(current)
             assert semantic_bytes(current) == baseline_semantics, (
                 f"Durable state changed at round {round_number}, hook {hook_name}, "

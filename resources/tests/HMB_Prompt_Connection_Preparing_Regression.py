@@ -21,6 +21,8 @@ class PromptConnectionPreparationTests(unittest.TestCase):
         self.node=self.fixture.node
         self.node.parameter_values={}
         self.node._hmb_connected_source_nodes={}
+        self.node._hmb_media_preview_source_ports={}
+        self.node.get_parameter_by_name={prompt.WIDGET_PARAMETER_NAME:SimpleNamespace(ui_options={})}.get
         self.node._reconcile_connected_source_inputs_from_graph=Mock(return_value=True)
         self.node._schedule_post_hydration_shot_reconcile=Mock(return_value=False)
         parent=prompt.HMBPromptLibrary.__bases__[0]
