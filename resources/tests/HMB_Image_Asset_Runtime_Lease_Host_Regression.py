@@ -319,6 +319,16 @@ async def exercise(engine):
 
             cases.append('saved_old_lease_rebound_only_initial')
 
+            saved_command = dict(state, site_settings_request={"request_id": "saved-command", "action": "save",
+                "project_uid": state["project_uid"], "expected_revision": "0", "links": [], "write_site_id": "hq"})
+            restored = create('SavedStationCommand')
+            with mock.patch.object(product, 'save_site_settings', side_effect=AssertionError('Saved command must be inert')):
+                setstate(restored, saved_command, initial=True)
+                setstate(restored, saved_command, initial=True, output=True)
+            assert not current(restored).get('site_settings_request')
+            assert current(restored)['image_bash_workspace'] == state['image_bash_workspace']
+            cases.append('saved_station_command_inert_across_both_sdk_initial_slots')
+
             legacy=create('PartialLegacy')
 
             partial={'schema':product.STATE_SCHEMA,'assets':deepcopy(state['assets']),

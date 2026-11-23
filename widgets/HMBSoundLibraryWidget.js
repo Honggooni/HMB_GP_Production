@@ -1,10 +1,184 @@
+// Standalone Griptape widgets load as individual modules. Keep this dialog in sync in both libraries.
+function openProjectFolderCards(container, state, options) {
+  container.__hmbFolderCards?.close();
+  const doc = container.ownerDocument, sound = options.media === "sound";
+  const label = (ko, en) => state.language === "en" ? en : ko;
+  const leaf = path => String(path || "").replace(/[/\\]+$/, "").split(/[/\\]/).pop() || "";
+  const projects = new Map();
+  const available = sound && Array.isArray(state.site_projects) ? state.site_projects : state.projects || [];
+  for (const row of [...available, {project_uid:state.project_uid, project_id:state.project_id, path:state.project_root}]) {
+    const id = String(row.project_uid || (row.project_id === state.project_id && state.project_uid) || row.project_id || "");
+    const path = String(row.path || row.project_root || "");
+    if (id && path && !projects.has(id)) projects.set(id, {path,name:row.name || row.project_id || leaf(path)});
+  }
+  const dialog = doc.createElement("dialog");
+  dialog.className = "hmb-project-folders nodrag nopan nowheel";
+  dialog.setAttribute("aria-label", label("프로젝트 Add", "Project Add"));
+  dialog.innerHTML = `<style>
+.hmb-project-folders{box-sizing:border-box;color-scheme:dark;width:min(540px,94vw);max-height:86vh;padding:0;background:#101725;color:#e6edf7;border:1px solid #46546d;border-radius:12px;box-shadow:0 16px 60px #000a;font:14px/1.4 system-ui,sans-serif;overflow:auto}
+.hmb-project-folders::backdrop{background:#06091099}
+.hmb-project-folders *{box-sizing:border-box}
+.hmb-project-folders header,.hmb-project-folders footer{display:flex;gap:9px;align-items:center}
+.hmb-project-folders header{padding:12px 16px;background:linear-gradient(110deg,#4e253f,#182236 70%);border-bottom:1px solid #3b475b;font-size:16px;font-weight:700}
+.hmb-project-folders header button{margin-left:auto}
+.hmb-project-folders section{padding:16px}
+.hmb-project-folders label,.hmb-project-folders [data-pf-heading]{display:block;margin:0 0 6px;color:#c4cfdf;font-size:13px}
+.hmb-project-folders input,.hmb-project-folders select,.hmb-project-folders button{font:inherit;color:inherit;background:#131c2c;border:1px solid #42506a;border-radius:6px;padding:6px 11px}
+.hmb-project-folders button{cursor:pointer}
+.hmb-project-folders button:disabled{opacity:.45;cursor:default}
+.hmb-project-folders :focus-visible{outline:2px solid #65dbed;outline-offset:2px}
+.hmb-project-folders select,.hmb-project-folders input{width:100%;height:36px;background:#0c1320}
+.hmb-project-folders .pf-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(195px,100%),1fr));gap:8px;max-height:40vh;overflow:auto;padding:3px}
+.hmb-project-folders .pf-card{display:flex;align-items:center;gap:10px;text-align:left;min-height:60px;min-width:0}
+.hmb-project-folders .pf-card[aria-pressed=true]{border-color:#42c2d4;background:#123444}
+.hmb-project-folders .pf-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.hmb-project-folders .pf-icon{color:#7ccadc}
+.hmb-project-folders [data-pf-status]{min-height:1.5em;color:#9cabbf;font-size:12px;margin:9px 0}
+.hmb-project-folders footer{justify-content:flex-end;border-top:1px solid #334054;padding:10px 16px}
+.hmb-project-folders [data-pf-add]{background:#225368;border-color:#387f90}
+.hmb-project-folders .pf-controls{margin-top:14px}
+.hmb-project-folders [hidden]{display:none!important}
+</style>`
+    + '<header><span class="pf-icon" aria-hidden="true">▱</span><span data-pf-title></span><button type="button" data-pf-close>×</button></header>'
+    + '<section><label><span data-pf-project-label></span><select data-pf-project></select></label><div class="pf-controls"><strong data-pf-heading></strong><div class="pf-grid" data-pf-cards></div></div>'
+    + '<label data-pf-entry hidden><span data-pf-path-label></span><input type="text" data-pf-path autocomplete="off" spellcheck="false"></label><div data-pf-status role="status" aria-live="polite"></div></section>'
+    + '<footer><button type="button" data-pf-add></button><button type="button" data-pf-remove></button></footer>';
+  const find = name => dialog.querySelector("[data-pf-" + name + "]");
+  const select = find("project"), closeButton = find("close"), add = find("add"), remove = find("remove");
+  find("title").textContent = label("프로젝트 Add", "Project Add");
+  find("project-label").textContent = label("프로젝트", "Project");
+  find("heading").textContent = label("연결된 폴더", "Linked folders");
+  find("path-label").textContent = label("등록할 폴더의 전체 경로", "Full folder path");
+  add.textContent = label("추가", "Add"); remove.textContent = label("삭제", "Remove");
+  closeButton.setAttribute("aria-label", label("닫기", "Close"));
+  for (const [id, row] of projects) select.add(new doc.defaultView.Option(row.name, id));
+  let project = projects.has(state.project_uid) ? state.project_uid : projects.keys().next().value || "";
+  select.value = project;
+  let profile = null, selected = "hq", pending = "", timer, choosing = false, disposed = false, pickerToken = state.site_picker_draft?.token || "", stopPicker = () => {};
+  const notice = text => { find("status").textContent = text || ""; };
+  const writeId = () => profile?.write_site_id || "hq";
+  const asyncId = () => globalThis.crypto?.randomUUID?.() || Date.now().toString(16) + Math.random().toString(16).slice(2);
+  function paint() {
+    find("entry").hidden = !choosing;
+    const grid = find("cards"); grid.replaceChildren();
+    const base = profile?.base_root || projects.get(project)?.path || "";
+    const cards = base ? [{id:"hq", label:leaf(base),root:base}, ...(profile?.links || [])] : [];
+    for (const item of cards) {
+      const button = doc.createElement("button"), icon = doc.createElement("span"), name = doc.createElement("span");
+      button.type = "button"; button.className = "pf-card"; button.dataset.pfSite = item.id; button.title = item.root;
+      button.setAttribute("aria-pressed", String(item.id === selected)); button.disabled = !!pending || !profile || choosing;
+      icon.className = "pf-icon"; icon.textContent = "📁"; icon.setAttribute("aria-hidden","true");
+      name.className = "pf-name"; name.textContent = item.label || leaf(item.root);
+      button.append(icon,name); grid.appendChild(button);
+      button.onclick = () => {
+        if (!sound && item.id !== writeId()) save(profile.links, item.id);
+        else { selected = item.id; paint(); notice(sound ? item.root : label("Add 저장 위치 · ", "Add destination · ") + item.root); }
+      };
+    }
+    select.disabled = !!pending; add.disabled = !profile || !!pending; remove.disabled = !profile || !!pending || choosing || selected === "hq";
+  }
+  function restoreModal() {
+    if (!disposed && dialog.open && !dialog.matches(":modal")) { dialog.close(); dialog.showModal(); }
+  }
+  function endPicker() { choosing=false; stopPicker(); stopPicker=()=>{}; find("path").value=""; restoreModal(); }
+  function close() {
+    if (disposed) return;
+    disposed = true; clearTimeout(timer); endPicker(); dialog.remove(); delete container.__hmbFolderCards;
+    options.trigger?.focus?.({preventScroll:true});
+  }
+  function request(action, extra = {}) {
+    const request_id = asyncId(); pending = request_id;
+    clearTimeout(timer);
+    timer=setTimeout(() => {
+      if (disposed || pending !== request_id) return;
+      notice(label("엔진 응답을 기다리는 중입니다. 이 창에서 결과를 확인하거나 다시 열 수 있습니다.", "Waiting for the engine. Keep this window open for confirmation, or reopen it."));
+    },15000);
+    paint(); notice(action === "save" ? label("폴더 설정 저장 중…","Saving folder settings…") : label("폴더 확인 중…","Reading folder settings…"));
+    const fail = error => { if (disposed || pending !== request_id) return; clearTimeout(timer); pending=""; profile=null; paint(); notice(String(error?.message||error)); };
+    try { Promise.resolve(options.send({request_id,project_uid:project,action,...extra},fail)).catch(fail); } catch(error){ fail(error); }
+  }
+  function save(links,id) { if (profile && !pending) request("save",{links,write_site_id:id,expected_revision:profile.revision}); }
+  function addPath(input) {
+    const path = String(input || "").trim().replace(/^["']|["']$/g,"");
+    if (!/^(?:[a-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+|\/(?!\/))/i.test(path) || /[\\/]fakepath[\\/]/i.test(path)) {
+      notice(label("공유 폴더의 전체 경로를 입력하세요.","Enter the full shared folder path.")); return;
+    }
+    const key = p => p.replaceAll("\\","/").replace(/\/+$/,"").toLowerCase();
+    if ([profile.base_root || projects.get(project)?.path, ...profile.links.map(link=>link.root)].some(p=>p && key(p)===key(path))) {
+      notice(label("이미 연결된 폴더입니다.","This folder is already linked.")); return;
+    }
+    const id = "new-" + asyncId().replaceAll("-","");
+    endPicker(); save([...profile.links,{id,label:leaf(path),root:path}],sound ? writeId() : id);
+  }
+  function browse() {
+    choosing = true; paint(); find("path").focus();
+    notice(label("폴더를 선택하거나 전체 경로를 입력한 뒤 추가를 누르세요.","Choose a folder, or enter its full path and press Add."));
+    const shell = container.closest(".react-flow__node,[data-node-id]");
+    const selector = '[data-parameter-name="HMB_SITE_FOLDER_DRAFT"],[data-parameter="HMB_SITE_FOLDER_DRAFT"],[data-parameter-key="HMB_SITE_FOLDER_DRAFT"],[data-parameter-id$="HMB_SITE_FOLDER_DRAFT" i]';
+    const input = shell?.querySelector('input[name="HMB_SITE_FOLDER_DRAFT"],input[id*="HMB_SITE_FOLDER_DRAFT" i]');
+    const row = shell?.querySelector(selector) || input?.closest('[role="group"]') || input?.parentElement;
+    if (!row || row.contains(container)) return;
+    const controls = [...row.querySelectorAll('button,[role="button"]')].filter(el=>!el.disabled);
+    const description = el => [el.title,el.getAttribute("aria-label"),el.textContent].join(" ");
+    const control = controls.find(el=>/browse|choose|select|찾아|선택/i.test(description(el)) && !/reveal|explorer|편집|reset/i.test(description(el)))
+      || controls.find(el=>!el.title && el.matches("button.border-l") && el.querySelector("svg.lucide-folder"));
+    if (!control) return;
+    const accept = event => {
+      const path = event.target?.value;
+      if (choosing && path && !/fakepath/i.test(path)) { find("path").value=path; addPath(path); }
+    };
+    row.addEventListener("change", accept);
+    stopPicker = () => row.removeEventListener("change",accept);
+    // The native editor can render its chooser in a portal outside the widget.
+    // Leave the browser top layer so that chooser, including Cancel, remains interactive.
+    dialog.close(); dialog.show(); control.click();
+  }
+  function receive(snapshot) {
+    if (disposed) return;
+    const picked = snapshot.site_picker_draft;
+    if (picked?.token && picked.token !== pickerToken) {
+      pickerToken = picked.token;
+      if (choosing && profile && !pending && picked.path) { find("path").value=picked.path; addPath(picked.path); }
+    }
+    const result = snapshot.site_settings_result;
+    if (!pending || result?.request_id !== pending || result?.project_uid !== project) return;
+    clearTimeout(timer); pending="";
+    if (!result.ok) {
+      profile=null; paint(); notice(result.message || label("폴더 설정을 확인할 수 없습니다. 창을 다시 열어 주세요.","Could not read folder settings. Reopen Project Add.")); return;
+    }
+    profile = {...result,links:Array.isArray(result.links) ? result.links : []};
+    selected = !sound || !profile.links.some(link=>link.id===selected) ? writeId() : selected;
+    paint();
+    const pickedCard = find("cards").querySelector('[aria-pressed="true"]');
+    notice(result.message || (!sound && pickedCard ? label("Add 저장 위치 · ", "Add destination · ") + pickedCard.title : ""));
+  }
+  select.onchange = () => {
+    endPicker();
+    project=select.value; profile=null; selected="hq"; request("get");
+  };
+  add.onclick = () => { if (choosing) addPath(find("path").value); else browse(); };
+  remove.onclick = () => { if (selected!=="hq") save(profile.links.filter(link=>link.id!==selected),writeId()===selected?"hq":writeId()); };
+  closeButton.onclick = close;
+  dialog.addEventListener("cancel", event=>{event.preventDefault();close();});
+  dialog.addEventListener("keydown",event=>{
+    if(event.key==="Escape"){event.preventDefault();if(choosing){endPicker();paint();notice("");}else close();}
+    if(event.key==="Enter" && event.target===find("path")){event.preventDefault();addPath(event.target.value);}
+    event.stopPropagation();
+  });
+  for (const type of ["pointerdown","mousedown","click","wheel"]) dialog.addEventListener(type,event=>event.stopPropagation());
+  doc.body.appendChild(dialog); dialog.showModal();
+  container.__hmbFolderCards={close,receive};
+  if (project) request("get"); else { paint();notice(label("먼저 프로젝트 폴더를 선택하세요.","Select a project folder first.")); }
+}
+// End standalone project folder dialog.
+
 const escape = value => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
 const roles = ["Dialogue", "SFX", "Ambience", "Music"];
 const labels = {Dialogue:"대사", SFX:"효과음", Ambience:"환경음", Music:"음악"};
 const colors = {Dialogue:"#22d3ee", SFX:"#f472b6", Ambience:"#2dd4bf", Music:"#a78bfa"};
 const record = value => value && typeof value === "object" && !Array.isArray(value) ? value : {};
 const soundPayload = props => {let value=props?.value??props?.parameterValue??props?.data??props; if(typeof value==="string"){try{value=JSON.parse(value);}catch{value={};}}return record(value);};
-const soundFields = new Set(["schema","version","revision","project_id","project_root","project_uid","channel_uuid","shot","shot_catalog","projects","project_states","assets","folders","tracks","status","busy","error_code","ack_command_id","ui"]);
+const soundFields = new Set(["schema","version","revision","project_id","project_root","project_uid","channel_uuid","shot","shot_catalog","projects","project_states","assets","folders","tracks","status","busy","error_code","ack_command_id","ui","site_settings","site_settings_result","site_picker_draft","site_projects"]);
 const sameSoundValue = (a,b) => {
   if(a===b)return true;
   if(!a||!b||typeof a!=="object"||typeof b!=="object"||Array.isArray(a)!==Array.isArray(b))return false;
@@ -59,7 +233,7 @@ export function hmbSoundState(props = {}) {
     shot_catalog:{...catalog,shots:(Array.isArray(catalog.shots) ? catalog.shots : []).filter(v=>v && typeof v === "object")},
     projects:(Array.isArray(raw.projects) ? raw.projects : []).filter(v=>v && typeof v === "object"),
     assets:(Array.isArray(raw.assets) ? raw.assets : []).filter(v=>v && typeof v === "object"),
-    folders:(Array.isArray(raw.folders) ? raw.folders : []).filter(v=>typeof v==="string"&&v&&!v.startsWith("/")&&!v.startsWith("\\")&&!v.includes(":")&&!v.includes("\0")&&!v.replaceAll("\\","/").split("/").includes("..")),
+    folders:(Array.isArray(raw.folders) ? raw.folders : []).filter(v=>typeof v==="string"&&v&&!v.startsWith("/")&&!v.startsWith("\\")&&(!v.includes(":") || /^site:site-[0-9a-f]{32}(?:\/[^:]+)?$/.test(v))&&!v.includes("\0")&&!v.replaceAll("\\","/").split("/").includes("..")),
     tracks:(Array.isArray(raw.tracks) ? raw.tracks : []).filter(v=>v && typeof v === "object")};
 }
 const read = hmbSoundState;
@@ -98,6 +272,7 @@ const style = `
 .hmb-sound .hs-status{height:32px;flex:0 0 32px;display:flex;align-items:center;padding:0 12px;border-top:1px solid var(--line);color:#8fa8bb;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.hmb-sound .hs-status[data-error=true]{color:#fda4af}.hmb-sound .hs-detail{flex:0 1 auto;min-height:0;max-height:240px;overflow:auto;margin:0 8px 7px;padding:9px;border:1px solid #597591;border-radius:8px;background:#0a1422}.hmb-sound .hs-detail-head{display:flex;align-items:center;gap:8px;margin-bottom:8px}.hmb-sound .hs-detail-head strong{flex:1;font-size:11px}.hmb-sound .hs-detail button{padding:3px 8px;font-size:10px}.hmb-sound .hs-detail select,.hmb-sound .hs-detail input,.hmb-sound .hs-detail textarea{max-width:100%;padding:5px;border:1px solid #3a5068;border-radius:5px;background:#0a1120;color:#e2ebf4;font-size:10px}.hmb-sound .hs-detail textarea{width:100%;height:42px;resize:vertical}.hmb-sound .hs-flags{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:7px}.hmb-sound .hs-flags label{display:flex;align-items:center;gap:4px;font-size:10px}.hmb-sound .hs-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:7px}.hmb-sound .hs-grid label{display:flex;flex-direction:column;gap:4px;font-size:9px;color:#9badc0}
 .hmb-sound [data-hmb-native-identity],.hmb-sound [data-hmb-native-actions]{display:none}.hmb-sound[data-hmb-native-header=active] [data-hmb-native-identity],.hmb-sound[data-hmb-native-header=active] [data-hmb-native-actions]{display:flex;align-items:center}.hmb-sound[data-hmb-native-header=active] .hs-brand{display:none}@container(max-width:820px){.hmb-sound .hs-main{grid-template-columns:150px minmax(0,1fr)}.hmb-sound .hs-files{grid-template-columns:repeat(auto-fill,minmax(118px,1fr))}.hmb-sound .hs-heading small{display:none}.hmb-sound .hs-bound{flex-basis:200px;width:200px}}
 .hmb-sound .hs-head[data-sound-toggle-surface=header]{cursor:grab}
+.react-flow__node:has(.hmb-sound) [data-parameter-name="HMB_SITE_FOLDER_DRAFT"]{display:none!important}
 .hmb-sound .hs-main{flex-basis:240px}
 .hmb-sound .hs-head[data-sound-toggle-surface=header]:active{cursor:grabbing}
 .hmb-sound[data-hmb-native-header=active] [data-hmb-native-identity]{flex:1 1 auto}
@@ -130,7 +305,7 @@ function render(state, ui, pending) {
   const results=renderSoundResults(state,ui,active,selected,busy);
   const options=(values,current,label=v=>v)=>values.map(v=>`<option value="${escape(v)}"${v===current?" selected":""}>${escape(label(v))}</option>`).join("");
   const field=(t,key,label)=>`<label>${label}<input data-track="${escape(t.instance_id)}" data-field="${key}" type="number" step="0.01" ${key==="gain_db"?'min="-60" max="12"':'min="0"'} value="${escape(t[key]??"")}"></label>`;
-  const tree=`<button data-folder="" class="${!ui.folder&&!ui.role?'active':''}">${folderIcon}<span>전체 사운드</span><b>${state.assets.length}</b></button><small>폴더</small>${hmbSoundFolders(state).map(([folder,count])=>`<button data-folder="${escape(folder)}" class="${ui.folder===folder?'active':''}" style="padding-left:${8+(folder.split('/').length-1)*12}px">${folderIcon}<span>${escape(folder.split('/').at(-1))}</span><b>${count}</b></button>`).join("")}<small>종류별 보기</small>${roles.map(role=>`<button data-role-filter="${role}" class="${ui.role===role?'active':''}"><span>${labels[role]}</span><b>${state.assets.filter(a=>a.role===role).length}</b></button>`).join("")}`;
+  const tree=`<button data-folder="" class="${!ui.folder&&!ui.role?'active':''}">${folderIcon}<span>전체 사운드</span><b>${state.assets.length}</b></button><small>폴더</small>${hmbSoundFolders(state).map(([folder,count])=>`<button data-folder="${escape(folder)}" class="${ui.folder===folder?'active':''}" style="padding-left:${8+(folder.split('/').length-1)*12}px">${folderIcon}<span>${escape((folder.startsWith('site:') && !folder.includes('/') && state.site_settings?.links?.find(link=>link.id===folder.slice(5))?.label) || folder.split('/').at(-1))}</span><b>${count}</b></button>`).join("")}<small>종류별 보기</small>${roles.map(role=>`<button data-role-filter="${role}" class="${ui.role===role?'active':''}"><span>${labels[role]}</span><b>${state.assets.filter(a=>a.role===role).length}</b></button>`).join("")}`;
   const shots=rows.map(row=>{
     const tracks=state.tracks.filter(t=>sameShot(t,row)),isActive=active===row;
     return `<section class="hs-shot-row${isActive?' active':''}" data-shot-row="${escape(row.shot_uuid)}" style="--shot-color:${shotColor(row)}"><button class="hs-shot-head" data-shot="${escape(row.shot_uuid)}" aria-pressed="${isActive}" ${busy?'disabled':''}><i>${row.legacy?'•':escape(String(row.number).padStart(2,'0'))}</i><strong>${escape(row.name)}</strong><span>${tracks.length}개</span></button>${tracks.length?`<div class="hs-bound-list nowheel">${tracks.map(t=>{
@@ -140,7 +315,7 @@ function render(state, ui, pending) {
   }).join("");
   const detail=state.tracks.find(t=>String(t.instance_id)===ui.detail);
   const drawer=detail?`<section class="hs-detail" data-detail-drawer><div class="hs-detail-head"><strong>${escape(detail.name)} · 사운드 상세</strong><button data-duplicate="${escape(detail.instance_id)}" ${busy?'disabled':''}>복제</button><button data-close-detail aria-label="사운드 상세 닫기">×</button></div><div class="hs-flags"><select data-track="${escape(detail.instance_id)}" data-field="role">${options(roles,detail.role,r=>labels[r])}</select><select data-track="${escape(detail.instance_id)}" data-field="purpose">${options(['both','reference','mix'],detail.purpose,v=>({both:'생성 참고 + 믹싱',reference:'생성 참고',mix:'최종 믹싱'}[v]))}</select>${[['enabled','사용'],['lipsync','립싱크'],['loop','반복']].map(([key,label])=>`<label><input type="checkbox" data-track="${escape(detail.instance_id)}" data-field="${key}"${detail[key]?' checked':''}>${label}</label>`).join('')}<input data-track="${escape(detail.instance_id)}" data-field="target" value="${escape(detail.target)}" placeholder="대상 / 화자"></div><textarea data-track="${escape(detail.instance_id)}" data-field="transcript" placeholder="대사 원문 / 사용 의도">${escape(detail.transcript)}</textarea><div class="hs-grid">${field(detail,'start_seconds','샷 시작(초)')}${field(detail,'in_seconds','음원 IN(초)')}${field(detail,'out_seconds','음원 OUT(빈칸=끝)')}${field(detail,'gain_db','볼륨(dB)')}</div></section>`:'';
-  return `<style>${style}</style><div class="hmb-sound nodrag nopan" data-hmb-node-type="HMBSoundLibrary" data-hmb-sound-widget style="--active-shot-color:${shotColor(active)}"><header class="hs-head group" data-sound-toggle-surface="header"><span class="hs-mark hs-brand">${wave('sound')}</span><div class="hs-heading hs-brand"><strong>HMB Sound Library</strong><small>사운드 에셋 · ${escape(active?.name||'샷 선택')}</small></div><div data-hmb-native-identity></div><div data-hmb-native-actions></div><div class="hs-actions nodrag"><button type="button" data-action="refresh" aria-label="사운드 폴더 다시 읽기" title="사운드 폴더 다시 읽기" ${!ui.syncNotice&&(busy||!state.project_root)?'disabled':''}>${scanFolderIcon}</button><button data-action="cancel" ${busy?'':'hidden'}>준비 취소</button></div></header><div class="hs-main"><aside class="hs-panel hs-tree"><div class="hs-panel-title">사운드 폴더<span>${state.assets.length}</span></div><div class="hs-folder-list nowheel">${tree}</div></aside><section class="hs-panel hs-browser"><div class="hs-filter"><input data-search placeholder="⌕  사운드 검색" aria-label="사운드 검색" value="${escape(ui.search)}"><b>${selected.length} 선택 / ${results.count}개</b></div><div class="hs-catalog nowheel">${results.content}</div></section></div><div class="hs-shot-stack nowheel" aria-label="ImageAsset 샷 사운드">${shots||'<div class="hs-empty">ImageAsset의 샷을 연결하세요.</div>'}</div>${drawer}<div class="hs-status" role="status" data-error="${Boolean(state.error_code)}">${escape(ui.syncNotice||ui.commandNotice||ui.mediaNotice||(pending?'사운드 작업 적용 중…':state.status||'준비됨'))}${state.error_code?' · '+escape(state.error_code):''}</div></div>`;
+  return `<style>${style}</style><div class="hmb-sound nodrag nopan" data-hmb-node-type="HMBSoundLibrary" data-hmb-sound-widget style="--active-shot-color:${shotColor(active)}"><header class="hs-head group" data-sound-toggle-surface="header"><span class="hs-mark hs-brand">${wave('sound')}</span><div class="hs-heading hs-brand"><strong>HMB Sound Library</strong><small>사운드 에셋 · ${escape(active?.name||'샷 선택')}</small></div><div data-hmb-native-identity></div><div data-hmb-native-actions></div><div class="hs-actions nodrag"><button type="button" data-action="site-settings" aria-label="프로젝트 Add" title="프로젝트 Add">S</button><button type="button" data-action="refresh" aria-label="사운드 폴더 다시 읽기" title="사운드 폴더 다시 읽기" ${!ui.syncNotice&&(busy||!state.project_root)?'disabled':''}>${scanFolderIcon}</button><button data-action="cancel" ${busy?'':'hidden'}>준비 취소</button></div></header><div class="hs-main"><aside class="hs-panel hs-tree"><div class="hs-panel-title">사운드 폴더<span>${state.assets.length}</span></div><div class="hs-folder-list nowheel">${tree}</div></aside><section class="hs-panel hs-browser"><div class="hs-filter"><input data-search placeholder="⌕  사운드 검색" aria-label="사운드 검색" value="${escape(ui.search)}"><b>${selected.length} 선택 / ${results.count}개</b></div><div class="hs-catalog nowheel">${results.content}</div></section></div><div class="hs-shot-stack nowheel" aria-label="ImageAsset 샷 사운드">${shots||'<div class="hs-empty">ImageAsset의 샷을 연결하세요.</div>'}</div>${drawer}<div class="hs-status" role="status" data-error="${Boolean(state.error_code)}">${escape(ui.syncNotice||ui.commandNotice||ui.mediaNotice||(pending?'사운드 작업 적용 중…':state.status||'준비됨'))}${state.error_code?' · '+escape(state.error_code):''}</div></div>`;
 }
 function hmbSoundImplementation(container, props = {}) {
   if (!container) return {update(){},cleanup(){}};
@@ -229,6 +404,7 @@ function hmbSoundImplementation(container, props = {}) {
       }
     }
     for(const button of current.querySelectorAll("[data-remove],[data-more]"))button.disabled=busy;
+    current.querySelector('[data-action="site-settings"]').disabled=busy||Boolean(latest.disabled);
     current.querySelector('[data-action="refresh"]').disabled=!ui.syncNotice&&(busy||!state.project_root);
     current.querySelector('[data-action="cancel"]').hidden=!busy;
     const status=current.querySelector(".hs-status");status.dataset.error=String(Boolean(state.error_code));
@@ -268,6 +444,7 @@ function hmbSoundImplementation(container, props = {}) {
     if(current){
       const liveHeader=current.firstElementChild;
       liveHeader.querySelector(".hs-heading small").textContent=header.querySelector(".hs-heading small").textContent;
+      liveHeader.querySelector('[data-action="site-settings"]').disabled=Boolean(latest.disabled||state.busy||pending||syncWaiting);
       liveHeader.querySelector('[data-action="refresh"]').disabled=header.querySelector('[data-action="refresh"]').disabled;
       liveHeader.querySelector('[data-action="cancel"]').hidden=header.querySelector('[data-action="cancel"]').hidden;
       while(current.lastElementChild!==liveHeader)current.lastElementChild.remove();
@@ -334,6 +511,10 @@ function hmbSoundImplementation(container, props = {}) {
     if(event.target.closest?.("[data-hmb-native-identity],[data-hmb-native-actions]"))return;
     const button=event.target.closest?.("button");if(!button||button.disabled)return;
     event.stopPropagation();
+    if(button.dataset.action==="site-settings"){
+      openProjectFolderCards(container,state,{media:"sound",trigger:button,send:request=>command("site_settings",{site_settings_request:request})});
+      return;
+    }
     if(button.dataset.action==="refresh"&&syncWaiting){requestSync(true);return;}
     if(button.hasAttribute("data-preview-track")){choosePreview(previewTrack(button.dataset.previewTrack));return;}
     if(button.hasAttribute("data-preview-asset")){choosePreview(previewAsset(button.dataset.previewAsset));return;}
@@ -399,6 +580,7 @@ function hmbSoundImplementation(container, props = {}) {
       ui.commandNotice="사운드 변경 완료를 확인하지 못했습니다. 현재 목록을 확인한 뒤 다시 선택하세요.";
     }
     transport=received.transport;state=incoming;
+    container.__hmbFolderCards?.receive(state);
     const caughtUp = received.kind==="delta" && syncWaiting && !pending
       && (!syncFloor || (received.transport.stream_id===syncFloor.stream_id
         && received.transport.sequence>=syncFloor.sequence));
@@ -424,7 +606,7 @@ function hmbSoundImplementation(container, props = {}) {
     }
     if(!acceptTransport(received)&&disabledChanged)paint();
     if(unlocked&&syncWaiting)queueMicrotask(()=>requestSync(true));
-  },cleanup(){if(disposed)return;announceNativeHeader("retire");disposed=true;pending=null;clearTimeout(ackTimer);ackTimer=null;clearTimeout(syncTimer);syncTimer=null;retireAudio();for(const [name,fn]of listeners)container.removeEventListener(name,fn);for(const name of mediaEvents)audio.removeEventListener(name,syncPlayback);container.removeAttribute("data-hmb-color-lut-widget");container.removeAttribute("data-hmb-native-node-type");container.classList.toggle("nodrag",initialNoDrag);container.replaceChildren();if(container.__hmbSoundController===controller)delete container.__hmbSoundController;}};
+  },cleanup(){if(disposed)return;container.__hmbFolderCards?.close();announceNativeHeader("retire");disposed=true;pending=null;clearTimeout(ackTimer);ackTimer=null;clearTimeout(syncTimer);syncTimer=null;retireAudio();for(const [name,fn]of listeners)container.removeEventListener(name,fn);for(const name of mediaEvents)audio.removeEventListener(name,syncPlayback);container.removeAttribute("data-hmb-color-lut-widget");container.removeAttribute("data-hmb-native-node-type");container.classList.toggle("nodrag",initialNoDrag);container.replaceChildren();if(container.__hmbSoundController===controller)delete container.__hmbSoundController;}};
   container.__hmbSoundController=controller;
   announceNativeHeader("ready");
   if(initial.needsSync)queueMicrotask(()=>requestSync());

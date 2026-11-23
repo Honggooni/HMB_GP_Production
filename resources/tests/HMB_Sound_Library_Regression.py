@@ -100,6 +100,71 @@ class SoundLibraryRegression(unittest.TestCase):
         self.assertFalse(missing.exists())
         self.assertEqual(self.path.read_bytes(), before)
 
+    def test_extra_folder_preload_once_add_refresh_detach_and_process_restart(self):
+        import subprocess
+        import time
+        import _hmb_image_asset_sites as sites
+        vendor = self.audio.with_name("Ai_Ct_audio_Gang")
+        voice = vendor / "Dialogue" / "voice.wav"
+        make_wave(voice)
+        for i in range(160):
+            (vendor / f"take-{i}.wav").touch()
+        link = {"id": "new-gang", "label": "광주", "root": str(vendor)}
+        with mock.patch.dict(os.environ, GTN_CONFIG_WORKSPACE_DIRECTORY=str(self.root / "workspace")):
+            profile = sites.save_site_settings(self.audio, [link], "hq", "0", media="sound")
+            relative = "site:" + profile["links"][0]["id"] + "/Dialogue/voice.wav"
+            with mock.patch.object(helper, "_scan_sound_inventory", wraps=helper._scan_sound_inventory) as walk:
+                start = time.perf_counter()
+                worker = helper.start_sound_catalog_warmup(threading.Event(), self.root)
+                worker.join(10)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(walk.call_count, 2)
+                self.assertTrue((self.audio / ".json").is_dir())
+                self.assertTrue((vendor / ".json").is_dir())
+                make_wave(vendor / ".json" / "not-a-catalog-item.wav")
+                cold = time.perf_counter() - start
+                start = time.perf_counter()
+                for _ in range(5):
+                    rows = helper.scan_sound_project(self.audio, profile=profile, refresh=False)
+                    self.assertEqual(len(rows), 162)
+                warm = (time.perf_counter() - start) / 5
+                self.assertEqual(walk.call_count, 2)
+                duplicate = [a for a in rows if a["name"] == "voice"]
+                self.assertEqual(len({row["source_uid"] for row in duplicate}), 2)
+                chosen = helper.make_sound_track(self.audio, relative, channel_uuid=CHANNEL, shot_uuid=SHOTS[0]["shot_uuid"])
+                chosen["gain_db"] = -4.0
+                doc = {**self.snapshot, "channel_uuid": CHANNEL, "tracks": [chosen]}
+                self.assertEqual(helper.normalize_sound_snapshot(doc)["tracks"][0]["path"], str(voice))
+                chosen_scope = {"shot_uuid": SHOTS[0]["shot_uuid"], "channel_uuid": CHANNEL}
+                self.assertEqual(helper.resolve_sound_tracks(doc, **chosen_scope)[0]["path"], str(voice))
+                new = vendor / "another.wav"
+                make_wave(new)
+                self.assertEqual(len(helper.scan_sound_project(self.audio, profile=profile, refresh=False)), 162)
+                refreshed = helper.scan_sound_project(self.audio, profile=profile, refresh=True)
+                self.assertEqual(len(refreshed), 163)
+                self.assertEqual(walk.call_count, 4)
+                print(f"Sound fixture: 162 assets, cold {cold*1000:.1f}ms, warm mean {warm*1000:.2f}ms, five opens 0 rescans")
+            save = self.root / "shot.json"
+            save.write_text(json.dumps(doc), encoding="utf-8")
+            script = """import json,sys,threading
+from pathlib import Path
+from _hmb_sound import start_sound_catalog_warmup,resolve_sound_tracks
+root=Path(sys.argv[1])
+start_sound_catalog_warmup(threading.Event(),root).join(10)
+doc=json.loads((root/'shot.json').read_text(encoding='utf-8'))
+track=doc['tracks'][0]
+rows=resolve_sound_tracks(doc,channel_uuid=track['channel_uuid'],shot_uuid=track['shot_uuid'])
+assert rows[0]['instance_id']==track['instance_id'] and rows[0]['gain_db']==-4
+assert Path(rows[0]['path'])==root/'showA'/'Ai_Ct_audio_Gang'/'Dialogue'/'voice.wav'
+"""
+            subprocess.run([sys.executable, "-B", "-c", script, str(self.root)], cwd=ROOT, check=True, timeout=30)
+            removed = sites.save_site_settings(self.audio, [], "hq", profile["revision"], media="sound")
+            self.assertEqual(helper.normalize_sound_snapshot(doc)["tracks"][0]["instance_id"], chosen["instance_id"])
+            with self.assertRaisesRegex(helper.SoundError, "다시 연결"):
+                helper.resolve_sound_tracks(doc, **chosen_scope)
+            sites.save_site_settings(self.audio, [link], "hq", removed["revision"], media="sound")
+            self.assertEqual(helper.resolve_sound_tracks(doc, **chosen_scope)[0]["media_signature"], chosen["media_signature"])
+
     def test_real_folder_names_empty_nested_add_and_remove(self):
         empty = self.audio / "새 폴더" / "비어 있음"
         empty.mkdir(parents=True)
@@ -328,6 +393,42 @@ class SoundNodeRegression(SoundLibraryRegression):
         restored = target.HMBSoundLibrary._normalize_saved_state(json.loads(json.dumps(self.node._state_sound)))
         self.assertEqual(restored['folders'], self.node._state_sound['folders'])
         self.assertEqual(restored['tracks'], preserved['tracks'])
+
+    def test_folder_dialog_and_native_sound_add_preserve_current_shot(self):
+        import _hmb_image_asset_sites as sites
+        vendor = self.audio.with_name("Ai_Ct_audio_Gang")
+        make_wave(vendor / "Dialogue" / "voice.wav")
+        self.assertIsNotNone(self.node.get_parameter_by_name("HMB_SITE_FOLDER_DRAFT"))
+        uid = self.node._state_sound["project_uid"]
+        first = copy.deepcopy(self.node._state_sound["tracks"])
+        def folders(action, **kwargs):
+            self.command("site_settings", site_settings_request={
+                "request_id": str(uuid4()), "project_uid": uid, "action": action, **kwargs})
+            self.drain()
+            result = self.node._sound_ui_state()[0]["site_settings_result"]
+            self.assertTrue(result["ok"], result)
+            return result
+        with mock.patch.object(sites, "_workspace", return_value=self.root / "workspace"):
+            original = folders("get")
+            linked = {"id": "new-test", "label": "광주", "root": str(vendor)}
+            profile = folders("save", links=[linked], write_site_id="hq", expected_revision=original["revision"])
+            src = next(row for row in self.node._state_sound["assets"] if row["relative_path"].startswith("site:"))
+            self.command("add", relative_path=src["relative_path"], source_uid=src["source_uid"])
+            self.drain()
+            self.assertEqual(self.node._state_sound["tracks"][:len(first)], first)
+            chosen = self.node._state_sound["tracks"][-1]
+            self.assertEqual(chosen["source_uid"], src["source_uid"])
+            self.assertEqual(Path(chosen["path"]), vendor / "Dialogue" / "voice.wav")
+            snapshot = self.node._snapshot()
+            self.command("refresh")
+            self.drain()
+            self.assertEqual(self.node._snapshot()["tracks"], snapshot["tracks"])
+            self.assertEqual(helper.resolve_sound_tracks(snapshot)[-1]["path"], chosen["path"])
+            current = folders("save", links=[], write_site_id="hq", expected_revision=profile["revision"])
+            self.assertTrue((vendor / ".json").is_dir())
+            self.assertEqual(self.node._snapshot()["tracks"][-1]["instance_id"], chosen["instance_id"])
+            folders("save", links=[linked], write_site_id="hq", expected_revision=current["revision"])
+            self.assertEqual(self.node._snapshot()["tracks"], snapshot["tracks"])
 
     def test_failed_refresh_keeps_catalog_tracks_order_and_binding(self):
         shots=[dict(SHOTS[0],shot_uuid=f'33333333-3333-4333-8333-{n:012d}',number=n,name=f'Shot {n}') for n in range(1,6)]

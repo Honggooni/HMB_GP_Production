@@ -36,6 +36,9 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 from _hmb_deletion_guard import hmb_binding_mutation
+from _hmb_image_asset_sites import (
+    ensure_registration_directory, get_site_settings, save_site_settings, verify_folder_identity,
+)
 from _hmb_project import project_display_name
 
 
@@ -118,6 +121,7 @@ THUMBNAIL_BRIDGE_WIDGET_NAME = "HMBImageAssetThumbnailPatchBridgeWidget"
 THUMBNAIL_BRIDGE_SCHEMA = "hmb-image-asset-thumbnail-bridge"
 THUMBNAIL_BRIDGE_VERSION = 1
 PROJECT_ROOT_PARAMETER = "PROJECT_ROOT"
+SITE_FOLDER_DRAFT_PARAMETER = "HMB_SITE_FOLDER_DRAFT"
 IMAGE_IMPORT_PARAMETER = "IMAGE_IMPORT_IN"
 OUTPUT_PARAMETER = "IMAGE_ASSET_OUT"
 MEDIA_OUTPUT_PARAMETER = "IMAGE_OUT"
@@ -152,7 +156,7 @@ IMAGE_ASSET_EDIT_FIELDS = (
     "root_edit_enabled", "selected_folder_path", "expanded_folders",
     "selected_main_type", "selected_sub_type", "selected_source_view",
     "search", "language", "asset_view_mode", "refresh_revision",
-    "thumbnail_request", "asset_registration_request", "asset_cleanup_request",
+    "thumbnail_request", "asset_registration_request", "asset_cleanup_request", "site_settings_request",
     "disconnect_import_uid", "shot_routing", "shot_hierarchy", "shot_hierarchy_request",
     "image_bash_workspace", "image_bash_active", "image_bash_workspace_request", IMAGE_BASH_WORKSPACE_EDIT_KEY,
 )
@@ -2253,6 +2257,52 @@ def _asset_library_id(project_id: str, relative_path: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
+# The colon cannot occur in a real Windows directory, including legacy HQ paths.
+def _site_location(value: Any) -> tuple[str, str]:
+    text = _clean(value).replace("\\", "/")
+    if text.startswith("site:"):
+        prefix, _, relative = text.partition("/")
+        return prefix[5:], relative
+    return "hq", text
+
+
+def _site_mutation_lock(root: Any):
+    return _catalog_session_lock(("site-write", _project_root_text(root).casefold()))
+
+
+def _site_link(settings: dict, site: str) -> dict:
+    for link in settings["links"]:
+        if link["id"] == site:
+            return link
+    raise ValueError("연결이 해제된 등록 폴더입니다. 등록 폴더 설정을 확인하세요.")
+
+
+def _site_root(root: Path, settings: dict, site: str) -> Path:
+    if site == "hq":
+        return root
+    configured = Path(_site_link(settings, site)["root"])
+    # Repeat the saved-folder boundary check when using it; a share could have
+    # been remapped or replaced since setup. Never acquire a lock in HQ by mistake.
+    if not configured.is_absolute() or _is_reparse_point(configured):
+        raise ValueError("외주 등록 폴더의 연결을 확인하세요.")
+    return verify_folder_identity(configured, root, site)
+
+
+def _site_project_key(project_id: str, site: str) -> str:
+    return project_id if site == "hq" else f"{project_id}\nsite:{site}"
+
+
+def _site_digest(*parts: str) -> str:
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:24]
+
+
+def _site_view_row(row: dict, project_id: str, project_uid: str, site: str) -> dict:
+    relative = row["relative_path"]
+    library_id = _asset_library_id(_site_project_key(project_id, site), relative)
+    return {**row, "asset_library_id": library_id, "source_uid": f"project:{library_id}",
+            "asset_project_uid": project_uid, "relative_path": f"site:{site}/{relative}"}
+
+
 def _is_user_import_relative_path(value: Any) -> bool:
     relative = Path(_clean(value).replace("\\", "/"))
     directory_keys = [_taxonomy_key(part) for part in relative.parts[:-1]]
@@ -2283,6 +2333,7 @@ def _verified_project_relative_path(
     if (
         _clean(asset.get("source_kind")).casefold() != "project"
         or not bool(asset.get("registered"))
+        or asset.get("connected") is False
     ):
         return ""
     project_root = _clean(state.get("project_root"))
@@ -2299,9 +2350,12 @@ def _verified_project_relative_path(
     root = Path(project_root)
     path = Path(_clean(asset.get("path")))
     try:
-        resolved_root = _resolve_image_path(root)
+        site, site_rel = _site_location(asset.get("relative_path"))
+        resolved_root = (_site_root(root, get_site_settings(root), site) if site != "hq"
+                         else _resolve_image_path(root))
         resolved_path = _resolve_image_path(path)
         relative = resolved_path.relative_to(resolved_root)
+        identity = _site_project_key(project_id, site)
     except Exception:
         return ""
     if (
@@ -2314,14 +2368,18 @@ def _verified_project_relative_path(
     if (
         _is_user_import_relative_path(relative_text)
         or _clean(asset.get("asset_library_id"))
-        != _asset_library_id(project_id, relative_text)
+        != _asset_library_id(identity, relative_text)
     ):
         return ""
+    if site != "hq":
+        if relative_text.casefold() != site_rel.casefold():
+            return ""
+        relative_text = f"site:{site}/{relative_text}"
     try:
         records = (
             manifest_records
             if isinstance(manifest_records, dict)
-            else _manifest_for_selection(resolved_root, [asset], catalog_root=state.get("catalog_root"))
+            else _manifest_for_selection(root, [asset], catalog_root=state.get("catalog_root"))
         )
         manifest_record = records.get(relative_text.casefold())
     except Exception:
@@ -3559,6 +3617,28 @@ def _manifest_for_selection(root, selected, *, catalog_root=None, wait_for_catal
         except TimeoutError as exc:
             raise _ImageAssetSelectionPreparing("ImageAsset project registrations are still preparing.") from exc
     else:
+        settings = get_site_settings(root)
+        if settings.get("links"):
+            # No session catalog yet: verify against the designated registries
+            # rather than accepting saved workflow rows as registration proof.
+            records = {}
+            selected_sites = {}
+            for row in selected:
+                if row.get("source_kind") == "project" and row.get("registered"):
+                    site, relative = _site_location(row.get("relative_path"))
+                    selected_sites.setdefault(site, set()).add(relative.casefold())
+            for site, wanted in selected_sites.items():
+                try:
+                    physical = _site_root(root, settings, site)
+                    entries = _read_asset_manifest(physical)
+                    if not wanted.issubset(entries):
+                        folders, paths, _ = _catalog_file_inventory(physical)
+                        entries = _manifest_at_current_paths(entries, physical, folders, paths)
+                except (OSError, ValueError):
+                    continue
+                prefix = "" if site == "hq" else f"site:{site}/"
+                records.update({prefix + rel: value for rel, value in entries.items() if rel in wanted})
+            return records
         records = _read_asset_manifest(root)
         if any(row.get("registered") and row.get("source_kind") == "project"
                and _clean(row.get("relative_path")).casefold() not in records for row in selected):
@@ -3567,7 +3647,7 @@ def _manifest_for_selection(root, selected, *, catalog_root=None, wait_for_catal
         return records
     requested = {_clean(row.get("relative_path")).casefold() for row in selected}
     return {row["relative_path"].casefold(): row for row in facts["assets"]
-            if row.get("registered") and row["relative_path"].casefold() in requested}
+            if row.get("registered") and row.get("connected", True) and row["relative_path"].casefold() in requested}
 
 
 def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -3939,6 +4019,15 @@ def _compact_selection_order(assets: List[Dict[str, Any]]) -> None:
             asset["selection_order"] = 0
 
 
+def _site_settings_project(state, uid):
+    if not uid or not isinstance(state, dict):
+        return ""
+    if uid == state.get("project_uid") and state.get("project_root"):
+        return state["project_root"]
+    return next((p["path"] for p in state.get("projects", [])
+                 if isinstance(p, dict) and p.get("project_uid") == uid and p.get("path")), "")
+
+
 def _normalize_asset_registration_request(value: Any) -> Dict[str, str]:
     if not isinstance(value, dict):
         return {}
@@ -3967,6 +4056,7 @@ def _normalize_asset_registration_request(value: Any) -> Dict[str, str]:
         "source_uid": source_uid,
         "relative_path": relative_path,
         "target_folder": target_folder,
+        "site_settings_revision": _clean(value.get("site_settings_revision"))[:128],
         "image_name": _clean(value.get("image_name"))[:256],
         "asset_id": _clean(value.get("asset_id"))[:256],
         "image_main_type": _clean(value.get("image_main_type"))[:256],
@@ -4427,7 +4517,7 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
     project_cache_uid = _clean(source.get("project_cache_uid"))
     assets: List[Dict[str, Any]] = []
     seen_library_ids: set[str] = set()
-    seen_asset_ids: set[str] = set()
+    seen_asset_ids: set[tuple[str, str]] = set()
     raw_assets = source.get("assets")
     if isinstance(raw_assets, list):
         for raw in raw_assets[:MAX_ASSETS]:
@@ -4436,10 +4526,11 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
                 continue
             if asset["asset_library_id"] in seen_library_ids:
                 continue
-            if asset["asset_id"] in seen_asset_ids:
+            asset_identity = (_site_location(asset["relative_path"])[0], asset["asset_id"])
+            if asset_identity in seen_asset_ids:
                 asset["selected"] = False
             seen_library_ids.add(asset["asset_library_id"])
-            seen_asset_ids.add(asset["asset_id"])
+            seen_asset_ids.add(asset_identity)
             assets.append(asset)
     _compact_selection_order(assets)
     ordered_selected_source_uids = [
@@ -4516,6 +4607,7 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
             "folder_signature": _clean(source.get("folder_signature"))[:128],
             "folders": folders,
             "assets": assets,
+            "site_selection_memory": _normalize_site_selection_memory(source.get("site_selection_memory")),
             "shot_routing": _normalize_shot_routing(
                 source.get("shot_routing"),
                 ordered_selected_source_uids,
@@ -4559,6 +4651,10 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
             "asset_registration_result": _normalize_asset_registration_result(
                 source.get("asset_registration_result")
             ),
+            "site_settings": _parse_mapping(source.get("site_settings")),
+            "site_settings_result": _parse_mapping(source.get("site_settings_result")),
+            "site_picker_draft": _parse_mapping(source.get("site_picker_draft")),
+            "site_settings_request": _parse_mapping(source.get("site_settings_request")),
             "asset_refresh_review": _normalize_asset_refresh_review(
                 source.get("asset_refresh_review")
             ),
@@ -4731,6 +4827,75 @@ def _reset_image_asset_state_preserving_shot_media(value: Any) -> Dict[str, Any]
     return _normalize_state(reset)
 
 
+def _normalize_site_selection_memory(value):
+    """Workflow-only bookmarks. A bookmark cannot grant file access."""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for uid, entry in value.items():
+        if (not isinstance(uid, str) or not re.fullmatch(r"project:[a-f0-9]{24}", uid)
+                or not isinstance(entry, dict) or not re.fullmatch(r"site-[a-f0-9]{32}", _clean(entry.get("site")))):
+            continue
+        ranks = entry.get("shots")
+        ranks = {_uuid_text(k): min(MAX_SHOT_IMAGES, _non_negative_int(v)) for k, v in ranks.items()
+                 if _uuid_text(k) and _non_negative_int(v)} if isinstance(ranks, dict) else {}
+        result[uid] = {"site": entry["site"], "rank": min(MAX_SELECTED_IMAGES, max(1, _non_negative_int(entry.get("rank")))),
+                       "shots": dict(list(ranks.items())[:MAX_SHOTS])}
+        if len(result) >= MAX_ASSETS:
+            break
+    return result
+
+
+def _restore_site_selection(state, previous, same_project):
+    memory = _normalize_site_selection_memory(previous.get("site_selection_memory")) if same_project else {}
+    state["site_selection_memory"] = memory
+    if not same_project:
+        return
+    indexed = {a["source_uid"]: a for a in state["assets"]}
+    routing = previous.get("shot_routing") or {}
+    # Only a disconnected folder generates bookmarks. Removal of a registered
+    # image inside a connected folder still follows the normal removal rules.
+    active_sites = {f[5:] for f in state.get("folders", []) if f.startswith("site:") and "/" not in f}
+    for asset in previous.get("assets", []):
+        if asset.get("source_kind") != "project" or not asset.get("selected") or asset["source_uid"] in indexed:
+            continue
+        site = _site_location(asset.get("relative_path"))[0]
+        if site == "hq" or site in active_sites:
+            continue
+        uid = asset["source_uid"]
+        memory[uid] = {"site": site, "rank": asset["selection_order"], "shots": {
+            shot["shot_uuid"]: shot["selected_source_uids"].index(uid) + 1 for shot in routing.get("shots", [])
+            if uid in shot.get("selected_source_uids", [])}}
+    if not memory:
+        return
+    ordered = sorted((a for a in state["assets"] if a.get("selected")), key=lambda a: a["selection_order"])
+    restored = {}
+    for uid, entry in sorted(memory.items(), key=lambda item: item[1]["rank"]):
+        row = indexed.get(uid)
+        if (not row or not row.get("registered") or row.get("connected") is False
+                or _site_location(row.get("relative_path"))[0] != entry["site"]):
+            continue
+        if row not in ordered:
+            if len(ordered) >= MAX_SELECTED_IMAGES:
+                continue
+            ordered.insert(entry["rank"] - 1, row)
+        restored[uid] = entry
+    if not restored:
+        return
+    for rank, row in enumerate(ordered, 1):
+        row.update(selected=True, selection_order=rank)
+    state["shot_routing"] = copy.deepcopy(state.get("shot_routing") or {})
+    for shot in state["shot_routing"].get("shots", []):
+        members = shot["selected_source_uids"]
+        positions = [(item["shots"][shot["shot_uuid"]], uid) for uid, item in restored.items()
+                     if shot["shot_uuid"] in item["shots"] and uid not in members]
+        for rank, uid in sorted(positions):
+            if len(members) < MAX_SHOT_IMAGES:
+                members.insert(rank - 1, uid)
+    for uid in restored:
+        del memory[uid]
+
+
 def _merge_scan_with_state(
     scan: Dict[str, Any],
     previous_state: Dict[str, Any],
@@ -4807,6 +4972,7 @@ def _merge_scan_with_state(
             "scan_revision": int(previous_state.get("scan_revision") or 0) + 1,
         }
     )
+    _restore_site_selection(state, previous_state, same_project)
     return _normalize_state(state)
 
 
@@ -4949,6 +5115,8 @@ def _merge_async_scan_result_with_live_state(
         and _non_negative_int(asset.get("import_index")) > 0
     )
     merged["assets"] = assets
+    _restore_site_selection(merged, live, bool(scanned.get("project_cache_uid"))
+                            and scanned["project_cache_uid"] == live.get("project_cache_uid"))
     merged["scan_revision"] = max(
         _non_negative_int(scanned.get("scan_revision")),
         _non_negative_int(live.get("scan_revision")),
@@ -5299,7 +5467,12 @@ def _adopt_shared_catalog_snapshot(
 
 
 def _session_catalog_key(kind: str, root: Any) -> tuple:
-    return kind, _project_root_text(root).replace("\\", "/").rstrip("/").casefold()
+    path_key = _project_root_text(root).replace("\\", "/").rstrip("/").casefold()
+    if kind == "catalog" and path_key:
+        settings = get_site_settings(root)
+        if settings.get("revision") and settings["revision"] != "0":
+            return kind, path_key, settings["revision"]
+    return kind, path_key
 
 
 def _catalog_session_lock(key: tuple):
@@ -5361,6 +5534,48 @@ def _discover_shared_image_projects(root: Any, *, refresh: bool = False) -> Dict
     return _catalog_read_once(_session_catalog_key("projects", root), discover, refresh=refresh)
 
 
+def _scan_linked_sites(project: Path, settings: dict, prior: dict, *, refresh=False) -> dict:
+    home = _scan_project_assets(project, previous_scan=prior)
+    rows = [row for row in home["assets"] if settings["write_site_id"] == "hq" or row.get("registered")]
+    folders = list(home["folders"])
+    warnings = list(home["warnings"])
+    manifest_signatures = [home["manifest_signature"]]
+    folder_signatures = [home["folder_signature"]]
+    for link in settings["links"]:
+        site = link["id"]
+        prefix = f"site:{site}"
+        previous_rows = [r for r in prior.get("assets", []) if _site_location(r.get("relative_path"))[0] == site]
+        folders.append(prefix)
+        try:
+            physical = _site_root(project, settings, site)
+            notice = ensure_registration_directory(physical, refresh=refresh)
+            if notice:
+                warnings.append(f'{link["label"]}: {notice}')
+            previous = {"project_cache_uid": _project_cache_uid(physical),
+                        "assets": [{**r, "relative_path": _site_location(r["relative_path"])[1]} for r in previous_rows]}
+            external = _scan_project_assets(physical, previous_scan=previous)
+        except (OSError, ValueError) as exc:
+            # Preserve the author's selection while this link is temporarily
+            # offline. Offline rows are display data, never handover authority.
+            rows.extend({**r, "connected": False} for r in previous_rows if site == settings["write_site_id"] or r.get("registered"))
+            folders.extend(f for f in prior.get("folders", []) if f.startswith(prefix + "/"))
+            warnings.append(f'{link["label"]}: 등록 폴더를 확인할 수 없습니다. {exc}')
+            manifest_signatures.extend((site, "offline"))
+            folder_signatures.extend((site, "offline"))
+            continue
+        rows.extend(_site_view_row(row, home["project_id"], home["project_uid"], site) for row in external["assets"]
+                    if site == settings["write_site_id"] or row.get("registered"))
+        folders.extend(f"{prefix}/{name}" for name in external["folders"])
+        warnings.extend(external["warnings"])
+        manifest_signatures.extend((site, external["manifest_signature"]))
+        folder_signatures.extend((site, external["folder_signature"]))
+    if len(rows) > MAX_ASSETS or len(folders) > MAX_FOLDERS:
+        raise ValueError("연결한 이미지 목록이 프로젝트의 최대 에셋 또는 폴더 수를 초과합니다.")
+    return {**home, "assets": rows, "folders": folders, "warnings": warnings,
+            "manifest_signature": _site_digest(*manifest_signatures),
+            "folder_signature": _site_digest(*folder_signatures)}
+
+
 def _read_verified_image_catalog(
     catalog: Dict[str, Any], selected: Dict[str, Any], state: Dict[str, Any], *,
     use_shared_cache: bool = True, reuse_saved: bool = False,
@@ -5372,7 +5587,14 @@ def _read_verified_image_catalog(
         # Never share a node's Shot, imported media, selected assets or UI state.
         neutral = {"catalog_root": catalog["catalog_root"], "projects": catalog["projects"]}
         facts = None
-        if use_shared_cache and reuse_saved and state.get("project_cache_uid"):
+        settings = get_site_settings(project)
+        notice = ensure_registration_directory(project, refresh=not use_shared_cache)
+        if settings.get("links"):
+            previous = _read_local_catalog_snapshot(project, {**neutral, **state}) or state
+            if _clean(previous.get("project_cache_uid")) != _project_cache_uid(project):
+                previous = {}
+            facts = _scan_linked_sites(project, settings, previous, refresh=not use_shared_cache)
+        elif use_shared_cache and reuse_saved and state.get("project_cache_uid"):
             facts = _rebind_shared_catalog_snapshot(
                 _shared_catalog_snapshot(state), selected, catalog, refresh_manifest=True
             )
@@ -5380,12 +5602,16 @@ def _read_verified_image_catalog(
             facts = _read_catalog_index(project, neutral)
         if facts is None:
             facts = _scan_project_assets(project, previous_scan=state)
+        if notice:
+            facts = {**facts, "warnings": [*facts.get("warnings", []), notice]}
         # Only the just-verified catalog may supply legacy manifest defaults.
         # Workflow-authored choices are merged after this neutral session read.
         facts = _shared_catalog_snapshot({**facts, **neutral}, registry_defaults=True)
         _prepare_catalog_scan_index(facts, normalized=True)
         return facts
 
+    if not use_shared_cache:
+        get_site_settings(project, fresh=True)
     return _catalog_read_once(_session_catalog_key("catalog", project), read, refresh=not use_shared_cache)
 
 
@@ -5632,6 +5858,7 @@ def _read_local_catalog_snapshot(project_root: Any, previous_state: Dict[str, An
     if not root.is_absolute() or not catalog.is_absolute() or not root.is_relative_to(catalog):
         return None
     try:
+        links = {link["id"]: link["root"] for link in get_site_settings(root)["links"]}
         identity = ""
         if root == Path(_project_root_text(previous_state.get("project_root"))):
             identity = _valid_project_cache_uid(previous_state.get("project_cache_uid"))
@@ -5659,11 +5886,18 @@ def _read_local_catalog_snapshot(project_root: Any, previous_state: Dict[str, An
         for asset in assets:
             if not isinstance(asset, dict):
                 return None
-            relative = Path(_clean(asset.get("relative_path")))
+            virtual_path = _clean(asset.get("relative_path"))
+            site, site_rel = _site_location(virtual_path)
+            relative = Path(site_rel)
+            row_root, identity_project = root, raw["project_id"]
+            if site != "hq":
+                if site not in links or raw.get("linked_site_roots", {}).get(site) != links[site]:
+                    return None
+                row_root, identity_project = Path(links[site]), _site_project_key(raw["project_id"], site)
             if (relative.anchor or ".." in relative.parts or relative.suffix.casefold() not in IMAGE_EXTENSIONS
-                    or asset.get("asset_library_id") != _asset_library_id(raw["project_id"], relative.as_posix())):
+                    or asset.get("asset_library_id") != _asset_library_id(identity_project, relative.as_posix())):
                 return None
-            asset["path"] = (root / relative).as_posix()
+            asset["path"] = (row_root / relative).as_posix()
             asset["thumbnail_url"] = ""
         merged = _merge_scan_with_state(raw, previous_state)
         merged["scan_revision"] = _non_negative_int(previous_state.get("scan_revision"))
@@ -5693,6 +5927,7 @@ def _catalog_index_projection(
         assets.append(asset)
     return {
         "schema": _ASSET_CATALOG_INDEX_SCHEMA,
+        "linked_site_roots": {link["id"]: link["root"] for link in get_site_settings(normalized_state["project_root"])["links"]},
         "version": _ASSET_CATALOG_INDEX_VERSION,
         "catalog_root": normalized_state["catalog_root"],
         "projects": normalized_state["projects"],
@@ -6157,8 +6392,11 @@ def _copy_import_to_project(
     media_value: Any,
     project_root: Path,
     target_folder: Any,
+    *,
+    allow_root: bool = False,
 ) -> Path:
-    target_parent = _registration_folder_path(project_root, target_folder)
+    target_parent = (project_root if allow_root and target_folder == ""
+                     else _registration_folder_path(project_root, target_folder))
     local_source = _local_import_source(asset, media_value)
     payload = None if local_source is not None else _import_media_bytes(media_value)
     if local_source is None and payload is None:
@@ -6222,10 +6460,25 @@ def _resolve_project_asset_file(
     allow_user_import_path: bool = True,
     verified_file_facts: Dict[str, tuple[Path, int, int, str]] | None = None,
     project_cache_uid: str = "",
+    site_scopes: dict | None = None,
 ) -> tuple[Path, str, str]:
     """Resolve one exact image row without walking the surrounding project."""
 
     relative_text = _clean(relative_value).replace("\\", "/").strip("/")
+    site, site_rel = _site_location(relative_text)
+    if site != "hq":
+        scope = site_scopes.get(site) if site_scopes is not None else None
+        if scope is None:
+            physical = _site_root(project_root, get_site_settings(project_root), site)
+            scope = (physical, _project_cache_uid(physical))
+            if site_scopes is not None:
+                site_scopes[site] = scope
+        physical, uid = scope
+        resolved, physical_rel, signature = _resolve_project_asset_file(
+            physical, _site_project_key(project_id, site), site_rel, expected_library_id,
+            allow_user_import_path=allow_user_import_path, verified_file_facts=verified_file_facts,
+            project_cache_uid=uid)
+        return resolved, f"site:{site}/{physical_rel}", signature
     relative_path = Path(relative_text)
     parts = [part for part in relative_path.parts if part]
     if (
@@ -6431,6 +6684,16 @@ def _apply_asset_registration(
     import_media_by_uid: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Serialize this client's Add with its project refresh and patch only that row."""
+    root = state.get("project_root")
+    with _site_mutation_lock(root):
+        settings = get_site_settings(root, fresh=True)
+        expected = _clean(request_value.get("site_settings_revision")) if isinstance(request_value, dict) else ""
+        if (expected or settings.get("links") or settings.get("write_site_id") != "hq") and expected != settings["revision"]:
+            raise ValueError("등록 폴더 설정이 바뀌었습니다. 현재 프로젝트에서 등록 창을 다시 여세요.")
+        return _apply_asset_registration_for_site(state, request_value, import_media_by_uid)
+
+
+def _apply_asset_registration_for_site(state, request_value, import_media_by_uid):
     key = _session_catalog_key("catalog", state.get("project_root"))
     with _catalog_session_lock(key):
         # A user can press Add on the local preview before startup reaches this
@@ -6498,6 +6761,17 @@ def _commit_asset_registration(
             or _is_reparse_point(Path(selected_project["path"]))
             or _clean(normalized.get("project_cache_uid")) != _project_cache_uid(selected_root)):
         raise ValueError("The selected image project changed; refresh before registering.")
+    settings = get_site_settings(selected_root)
+    site, site_rel = _site_location(request.get("relative_path") if request_source_kind == "project"
+                                    else request.get("target_folder"))
+    if site != settings["write_site_id"]:
+        raise ValueError("현재 작업 위치의 이미지 폴더에만 등록할 수 있습니다.")
+    write_root = selected_root
+    project_id = _clean(selected_project["project_id"])
+    write_project_id = project_id
+    if site != "hq":
+        write_root = _site_root(selected_root, settings, site)
+        write_project_id = _site_project_key(project_id, site)
     registered_library_id = request["asset_library_id"]
     registration_message = ""
     source_selection = False
@@ -6542,13 +6816,13 @@ def _commit_asset_registration(
         if relative_text.casefold() != request.get("relative_path", "").casefold():
             raise ValueError("The image path changed while the registration window was open.")
         source_path, relative_text, _media_signature = _resolve_project_asset_file(
-            selected_root,
-            _clean(selected_project.get("project_id")),
-            relative_text,
+            write_root,
+            write_project_id,
+            site_rel if site != "hq" else relative_text,
             request.get("asset_library_id"),
             allow_user_import_path=False,
         )
-        manifest_records = _read_asset_manifest(selected_root)
+        manifest_records = _read_asset_manifest(write_root)
         if relative_text.casefold() in manifest_records:
             raise ValueError(
                 "This image asset is already registered and cannot be edited. "
@@ -6560,10 +6834,9 @@ def _commit_asset_registration(
             {"relative_path": relative_text},
         )
         registered_row = _registered_project_asset_row(
-            project_root=selected_root,
-            project_id=_clean(selected_project.get("project_id")),
-            project_cache_uid=_clean(normalized.get("project_cache_uid"))
-            or _project_cache_uid(selected_root),
+            project_root=write_root,
+            project_id=write_project_id,
+            project_cache_uid=_project_cache_uid(write_root),
             relative_text=relative_text,
             manifest_record=record,
             previous_asset=source_asset,
@@ -6572,7 +6845,7 @@ def _commit_asset_registration(
             verified_dimensions=verified_dimensions,
             hydrate_thumbnail=True,
         )
-        manifest_path = _write_asset_manifest_record(selected_root, record)
+        manifest_path = _write_asset_manifest_record(write_root, record)
         registration_message = f"Registered in {manifest_path.name}."
     else:
         source_matches = [
@@ -6616,27 +6889,25 @@ def _commit_asset_registration(
         for field in ("path", "extension", "media_ref_kind"):
             copy_source_asset[field] = authoritative_import[0].get(field)
         record = _registration_record(request, {"relative_path": ""})
-        copied_destination = _copy_import_to_project(
-            copy_source_asset,
-            media_value,
-            selected_root,
-            target_folder,
-        )
-        relative_text = copied_destination.relative_to(selected_root).as_posix()
+        if site != "hq":
+            copied_destination = _copy_import_to_project(copy_source_asset, media_value, write_root,
+                                                         site_rel, allow_root=not site_rel)
+        else:
+            copied_destination = _copy_import_to_project(copy_source_asset, media_value, write_root, target_folder)
+        relative_text = copied_destination.relative_to(write_root).as_posix()
         record["path"] = relative_text
         record["import_source_uid"] = request["source_uid"]
         registered_library_id = _asset_library_id(
-            _clean(selected_project.get("project_id")),
+            write_project_id,
             relative_text,
         )
         source_selection = bool(source_asset.get("selected"))
         source_selection_order = _non_negative_int(source_asset.get("selection_order"))
         try:
             registered_row = _registered_project_asset_row(
-                project_root=selected_root,
-                project_id=_clean(selected_project.get("project_id")),
-                project_cache_uid=_clean(normalized.get("project_cache_uid"))
-                or _project_cache_uid(selected_root),
+                project_root=write_root,
+                project_id=write_project_id,
+                project_cache_uid=_project_cache_uid(write_root),
                 relative_text=relative_text,
                 manifest_record=record,
                 selected=source_selection,
@@ -6644,7 +6915,7 @@ def _commit_asset_registration(
                 verified_dimensions=_asset_dimensions(copied_destination),
                 hydrate_thumbnail=True,
             )
-            manifest_path = _write_asset_manifest_record(selected_root, record)
+            manifest_path = _write_asset_manifest_record(write_root, record)
         except Exception as exc:
             cleanup_error: Exception | None = None
             try:
@@ -6661,6 +6932,8 @@ def _commit_asset_registration(
             f"Copied to {relative_text} and registered in {manifest_path.name}."
         )
 
+    if site != "hq":
+        registered_row = _site_view_row(registered_row, project_id, project_uid, site)
     refreshed = dict(normalized)
     assets = [dict(asset) for asset in normalized["assets"]]
     if source_index < 0 or source_index > len(assets):
@@ -6673,7 +6946,12 @@ def _commit_asset_registration(
     refreshed["catalog_root"] = catalog["catalog_root"]
     refreshed["projects"] = catalog["projects"]
     try:
-        refreshed["manifest_signature"] = _asset_manifest_signature(selected_root)
+        # The pinned snapshot only incorporates our own Add. Do not poll other
+        # sites or advance their signatures here; Refresh or restart reads them.
+        signature = _asset_manifest_signature(write_root)
+        if settings.get("links"):
+            signature = _site_digest(normalized.get("manifest_signature",""), site, signature)
+        refreshed["manifest_signature"] = signature
     except Exception as exc:
         # The manifest is already durable; retain the previous signature until
         # explicit refresh if the share became temporarily unavailable.
@@ -6779,6 +7057,7 @@ def _hydrate_asset_thumbnails(
         # Lifetime is one bounded request; never reuse these facts across
         # edits, catalog revisions or source selection/generation requests.
         verified_file_facts: Dict[str, tuple[Path, int, int, str]] = {}
+        site_scopes = {}
         global _ASSET_THUMBNAIL_CACHE_DEFER_COUNT
         with _ASSET_THUMBNAIL_LOCK:
             _ASSET_THUMBNAIL_CACHE_DEFER_COUNT += 1
@@ -6804,6 +7083,7 @@ def _hydrate_asset_thumbnails(
                         allow_user_import_path=True,
                         verified_file_facts=verified_file_facts,
                         project_cache_uid=_clean(normalized_state.get("project_cache_uid")),
+                        site_scopes=site_scopes,
                     )
                     expected_signature = _clean(asset.get("media_signature"))
                     if expected_signature and media_signature != expected_signature:
@@ -6818,11 +7098,12 @@ def _hydrate_asset_thumbnails(
                     if not thumbnail_url:
                         failed.append(library_id)
                         continue
+                    site, raw_relative = _site_location(asset["relative_path"])
                     _resolved, _size, _mtime_ns, hydrated_signature = (
                         _asset_file_facts(
                             path,
-                            project_uid=normalized_state.get("project_cache_uid"),
-                            relative_path=asset.get("relative_path"),
+                            project_uid=(site_scopes[site][1] if site != "hq" else normalized_state.get("project_cache_uid")),
+                            relative_path=raw_relative,
                         )
                     )
                     if hydrated_signature != media_signature:
@@ -8842,8 +9123,9 @@ def _add_image_import_input(node: Any) -> None:
     _safe_add_parameter(node, **kwargs)
 
 
-def _add_project_root(node: Any) -> None:
-    if parameter_exists(node, PROJECT_ROOT_PARAMETER):
+def _add_project_root(node: Any, *, site_draft: bool = False) -> None:
+    name = SITE_FOLDER_DRAFT_PARAMETER if site_draft else PROJECT_ROOT_PARAMETER
+    if parameter_exists(node, name):
         return
     tooltip = (
         "Select a projects catalog. Each direct child "
@@ -8852,6 +9134,9 @@ def _add_project_root(node: Any) -> None:
         "Name, optional Main/Sub metadata, and default selection. Registered "
         "records are read-only; only unregistered project media can use Add."
     )
+    if site_draft:
+        tooltip = "Choose a shared vendor asset folder. Save in ImageAsset project settings to apply."
+    default = "" if site_draft else str(DEFAULT_PROJECTS_ROOT)
     trait = None
     if FileSystemPicker is not None:
         for trait_kwargs in (
@@ -8869,10 +9154,10 @@ def _add_project_root(node: Any) -> None:
                 continue
     if ParameterString is not None:
         parameter = ParameterString(
-            name=PROJECT_ROOT_PARAMETER,
-            default_value=str(DEFAULT_PROJECTS_ROOT),
+            name=name,
+            default_value=default,
             tooltip=tooltip,
-            placeholder_text=str(DEFAULT_PROJECTS_ROOT),
+            placeholder_text=default,
         )
         if trait is not None:
             try:
@@ -8887,8 +9172,8 @@ def _add_project_root(node: Any) -> None:
             options = dict(getattr(parameter, "ui_options", {}) or {})
             options.update(
                 {
-                    "display_name": "PROJECT_ROOT",
-                    "placeholder_text": str(DEFAULT_PROJECTS_ROOT),
+                    "display_name": name,
+                    "placeholder_text": default,
                     "is_full_width": True,
                 }
             )
@@ -8898,16 +9183,16 @@ def _add_project_root(node: Any) -> None:
         node.add_parameter(parameter)
         return
     kwargs: Dict[str, Any] = {
-        "name": PROJECT_ROOT_PARAMETER,
-        "default_value": str(DEFAULT_PROJECTS_ROOT),
+        "name": name,
+        "default_value": default,
         "type": "str",
         "tooltip": tooltip,
         "allow_input": False,
         "allow_output": False,
         "allow_property": True,
         "ui_options": {
-            "display_name": "PROJECT_ROOT",
-            "placeholder_text": str(DEFAULT_PROJECTS_ROOT),
+            "display_name": name,
+            "placeholder_text": default,
             "is_full_width": True,
         },
     }
@@ -9747,6 +10032,7 @@ class HMBImageAssetLibrary(DataNode):
         _add_image_bash_outputs(self)
         _add_image_import_input(self)
         _add_project_root(self)
+        _add_project_root(self, site_draft=True)
         _add_widget_state(self)
         _add_thumbnail_patch_bridge(self)
 
@@ -10910,6 +11196,18 @@ class HMBImageAssetLibrary(DataNode):
             raw["assets"] = base.get("assets", [])
             raw["folders"] = base.get("folders", [])
         if raw.get("schema") != IMAGE_ASSET_EDIT_SCHEMA:
+            # These commands are workstation preferences. Opening a workflow
+            # can hydrate a view, but only a live, admitted widget edit can
+            # originate one. The SDK may echo the admitted edit as a full value.
+            site_request = raw.get("site_settings_request")
+            if site_request and (privileged or site_request != getattr(self, "_hmb_live_site_request", None)):
+                raw["site_settings_request"] = {}
+                # The SDK revalidates the sanitized hydration value in its
+                # nested callbacks. Admit only this projection of the already
+                # admitted snapshot, and only for this initial assignment.
+                assignment = self._widget_initial_assignment(WIDGET_STATE_PARAMETER)
+                if assignment is not None:
+                    assignment["allowed"].add(_widget_assignment_digest(raw))
             return raw
         revision = raw.get(UI_EDIT_REVISION_KEY)
         if (raw.get("version") != 1 or isinstance(raw.get("version"), bool)
@@ -10992,6 +11290,15 @@ class HMBImageAssetLibrary(DataNode):
         if "image_bash_active" in edits and type(edits["image_bash_active"]) is not bool:
             raise ValueError("Image Bash 화면 선택이 올바르지 않습니다.")
         base.update(edits)
+        site_request = edits.get("site_settings_request")
+        if site_request:
+            if (privileged or not isinstance(site_request, dict)
+                    or site_request.get("action") not in {"get", "picked", "save"}
+                    or not isinstance(site_request.get("request_id"), str)
+                    or not 1 <= len(site_request["request_id"]) <= 128
+                    or not _site_settings_project(base, site_request.get("project_uid"))):
+                raise ValueError("현재 선택한 프로젝트에서 등록 폴더 설정을 다시 여세요.")
+            self._hmb_live_site_request = copy.deepcopy(site_request)
         base = self._canonical_workspace_edit(base, workspace_edit)
         if base.get("image_bash_workspace_request"):
             command = _normalize_image_bash_workspace_request(base["image_bash_workspace_request"])
@@ -12461,6 +12768,16 @@ class HMBImageAssetLibrary(DataNode):
     ) -> Dict[str, Any]:
         state = dict(state)
         state[WIDGET_RUNTIME_LEASE_KEY] = self._hmb_widget_runtime_lease
+        state["site_settings_request"] = {}
+        try:
+            state["site_settings"] = get_site_settings(state.get("project_root"))
+        except (ValueError, OSError) as exc:
+            state["site_settings"] = {"links": [], "write_site_id": "", "revision": ""}
+            state["error"] = f"등록 폴더 설정: {exc}"
+        result = getattr(self, "_hmb_site_settings_result", {})
+        state["site_settings_result"] = result if result and _site_settings_project(state, result.get("project_uid")) else {}
+        picked = getattr(self, "_hmb_site_picker_draft", {})
+        state["site_picker_draft"] = picked if picked.get("project_uid") == state.get("project_uid") else {}
         state["asset_registration_request"] = {}
         state["asset_cleanup_request"] = {}
         state["disconnect_import_uid"] = ""
@@ -13876,15 +14193,24 @@ class HMBImageAssetLibrary(DataNode):
 
         def read_project() -> Any:
             if project_root:
-                audit = _audit_project_manifest_refresh(Path(project_root))
+                settings = get_site_settings(project_root, fresh=True)
+                writer = settings["write_site_id"]
+                try:
+                    audit_root = _site_root(Path(project_root), settings, writer)
+                    audit = _audit_project_manifest_refresh(audit_root)
+                except (OSError, ValueError) as exc:
+                    audit = {"project_root": project_root, "safe_to_clean": False, "error": str(exc)}
                 report.update(audit)
                 report.update({
                     "request_id": token,
+                    "catalog_project_root": project_root,
+                    "site_revision": settings["revision"],
+                    "write_site_id": writer,
                     "project_uid": _clean(state.get("project_uid")),
                     "project_id": _clean(state.get("project_id")),
                     "status": "error" if audit.get("error") else "review",
                 })
-                if audit.get("error"):
+                if audit.get("error") and not settings["links"]:
                     # Do not replace a verified catalog with a partial share walk.
                     return state
             loaded = _load_project_catalog(catalog_root, state, use_shared_cache=False)
@@ -13951,7 +14277,7 @@ class HMBImageAssetLibrary(DataNode):
             isinstance(authority, dict)
             and token and token == authority.get("request_id")
             and authority.get("safe_to_clean") is True
-            and _project_root_text(authority.get("project_root")).casefold()
+            and _project_root_text(authority.get("catalog_project_root") or authority.get("project_root")).casefold()
             == _project_root_text(state.get("project_root")).casefold()
             and _clean(authority.get("project_uid")) == _clean(state.get("project_uid"))
             and self._scan_owner_is_current()
@@ -13968,6 +14294,7 @@ class HMBImageAssetLibrary(DataNode):
             failed["error"] = message
             return self._publish_state(failed)
         confirmed = copy.deepcopy(authority)
+        logical_root = _project_root_text(confirmed.get("catalog_project_root") or confirmed["project_root"])
         self._hmb_refresh_authority = None  # Single use; even failure needs a new review.
         expected_generation = self._hmb_scan_generation + 1
         report: Dict[str, Any] = dict(confirmed)
@@ -13982,12 +14309,19 @@ class HMBImageAssetLibrary(DataNode):
             current = self._current_state()
             return (
                 _project_root_text(current.get("project_root")).casefold()
-                == _project_root_text(confirmed.get("project_root")).casefold()
+                == logical_root.casefold()
                 and _clean(current.get("project_uid")) == _clean(confirmed.get("project_uid"))
             )
 
         def cleanup() -> Any:
-            cleaned = _clean_project_manifest_refresh(confirmed, is_current)
+            with _site_mutation_lock(logical_root):
+                settings = get_site_settings(logical_root, fresh=True)
+                owner = _site_root(Path(logical_root), settings, settings["write_site_id"])
+                if (settings["revision"] != confirmed.get("site_revision", "0")
+                        or settings["write_site_id"] != confirmed.get("write_site_id", "hq")
+                        or owner != Path(confirmed["project_root"])):
+                    raise ValueError("등록 위치가 변경되었습니다. 새로고침 후 다시 확인하세요.")
+                cleaned = _clean_project_manifest_refresh(confirmed, is_current)
             report.update(cleaned)
             report.update({"request_id": token, "status": "cleaned", "safe_to_clean": False})
             if cleaned.get("backup_warning"):
@@ -14003,7 +14337,7 @@ class HMBImageAssetLibrary(DataNode):
             )
             if (
                 _project_root_text(loaded.get("project_root")).casefold()
-                != _project_root_text(confirmed.get("project_root")).casefold()
+                != logical_root.casefold()
                 or _clean(loaded.get("project_uid")) != _clean(confirmed.get("project_uid"))
             ):
                 raise ValueError("Registration cleanup completed, but the project became unavailable; the previous catalog was retained.")
@@ -14024,8 +14358,56 @@ class HMBImageAssetLibrary(DataNode):
         )
 
     @hmb_binding_mutation
+    def _apply_site_settings(self, state, request):
+        project_uid = request["project_uid"]
+        root = _site_settings_project(state, project_uid)
+        if not root:
+            raise ValueError("프로젝트 목록을 새로고침 후 등록 폴더 설정을 다시 여세요.")
+        receipt = {"request_id": request["request_id"], "project_uid": project_uid, "base_root": root}
+        if request["action"] != "save":
+            try:
+                receipt.update(get_site_settings(root, fresh=request["action"] == "get"), ok=True, message="")
+                if request["action"] == "picked":
+                    receipt["picked_root"] = _clean(_get_parameter_raw(self, SITE_FOLDER_DRAFT_PARAMETER))
+            except (OSError, ValueError) as exc:
+                receipt.update(ok=False, message=str(exc))
+            self._hmb_site_settings_result = receipt
+            return self._publish_state(state, preserve_outputs=True)
+        captured = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
+
+        def save_and_read():
+            revision = request.get("expected_revision")
+            if not isinstance(revision, str) or not revision:
+                raise ValueError("등록 폴더 설정을 다시 열어 최신 목록을 확인하세요.")
+            with _site_mutation_lock(root):
+                profile = save_site_settings(root, request.get("links"), request.get("write_site_id"), revision)
+            receipt.update(profile, ok=True, message="")
+            if project_uid != state.get("project_uid"):
+                return state
+            loaded = _load_project_catalog(state["catalog_root"], state, use_shared_cache=False)
+            return self._merge_captured_imports_into_scan(loaded, captured)
+
+        def merge(result, base, live):
+            error = _clean(result.get("error"))
+            if not receipt.get("ok"):
+                receipt.update(ok=False, message=error or "등록 폴더 설정을 저장하지 못했습니다.")
+            elif error:
+                receipt["message"] = f"등록 폴더를 저장했습니다. 목록을 다시 읽는 중 오류: {error}"
+            self._hmb_site_settings_result = dict(receipt)
+            return _merge_async_scan_result_with_live_state(result, base, live)
+
+        self._hmb_refresh_authority = None
+        state["asset_refresh_review"] = {}
+        return self._schedule_catalog_scan(
+            "sites:" + request["request_id"], state, save_and_read, failure_state=state, result_merger=merge,
+        )
+
     def _apply_widget_state(self, value: Any) -> Dict[str, Any]:
         state = _normalize_state(self._expand_widget_edit(value))
+        site_request = state.pop("site_settings_request", None)
+        if site_request and site_request == getattr(self, "_hmb_live_site_request", None):
+            self._hmb_live_site_request = None
+            return self._apply_site_settings(state, site_request)
         cleanup_request = dict(state.get("asset_cleanup_request") or {})
         state["asset_cleanup_request"] = {}
         # A displayed report is not a durable permission to modify a project.
@@ -14953,6 +15335,14 @@ class HMBImageAssetLibrary(DataNode):
                 or self._hmb_restoring_widget_state):
             return result
         name = _clean(getattr(parameter, "name", ""))
+        if name == SITE_FOLDER_DRAFT_PARAMETER:
+            current = self._current_state()
+            self._hmb_site_picker_draft = {
+                "project_uid": current.get("project_uid", ""), "path": _clean(value),
+                "token": uuid.uuid4().hex,
+            }
+            self._publish_state(current, preserve_outputs=True)
+            return result
         if name == THUMBNAIL_PATCH_PARAMETER:
             self._apply_thumbnail_bridge_request(value)
             return result

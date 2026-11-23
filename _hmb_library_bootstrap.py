@@ -2379,14 +2379,19 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
             return
         if getattr(self, "_hmb_image_warmup_stop", None) is not None:
             return
+        stop = threading.Event()
+        self._hmb_image_warmup_stop = stop
         try:
             # Resolve the SDK-registered class once on its owner thread. Only
             # detached filesystem work is dispatched; no canvas node is created.
-            stop = threading.Event()
             library.get_node_class("HMBImageAssetLibrary").start_catalog_warmup(stop)
-            self._hmb_image_warmup_stop = stop
         except Exception as exc:
             logging.getLogger(__name__).warning("[HMB_IMAGE_CATALOG_STARTUP] %s", exc)
+        try:
+            from _hmb_sound import start_sound_catalog_warmup
+            start_sound_catalog_warmup(stop)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("[HMB_SOUND_CATALOG_STARTUP] %s", exc)
 
     def before_library_unregistered(self, _library_data: Any, _library: Any) -> None:
         stop = getattr(self, "_hmb_image_warmup_stop", None)

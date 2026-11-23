@@ -24,11 +24,12 @@ from HMBFinishLookLibrary import (
     _normalize_shot_selection,
 )
 from _hmb_deletion_guard import hmb_binding_mutation
+from _hmb_image_asset_sites import get_site_settings, save_site_settings
 from _hmb_sound import (
     DEFAULT_PROJECTS_ROOT, SCHEMA, VERSION, SoundError, discover_sound_projects,
     scan_sound_project, make_sound_track, normalize_sound_snapshot, project_uid,
     MAX_TRACKS,
-    relative_audio_path, absolute_path,
+    relative_audio_path, absolute_path, _SITE_PREFIX, known_sound_projects,
 )
 
 UI = "HMB_SOUND_UI_STATE"
@@ -187,6 +188,9 @@ class HMBSoundLibrary(DataNode):
         self._ui_sequence = 0
         self._ui_previous = None
         self._ui_catalog_cache = None
+        self._site_profile = {"links": [], "revision": "0", "write_site_id": "hq"}
+        self._site_result = {}
+        self._site_picker = {}
         self._ui_projection = contextvars.ContextVar("hmb_sound_ui_projection", default=None)
         initial = getattr(self, "set_initial_node_size", None)
         if "size" not in self.metadata:
@@ -202,6 +206,8 @@ class HMBSoundLibrary(DataNode):
         _add_parameter(self, name=COMMAND, type="str", input_types=["str"], default_value="",
             allow_input=False, allow_output=False, allow_property=True, allowed_modes=_mode("PROPERTY"),
             ui_options={"hide": True, "hide_property": True, "hide_handles": True})
+        from HMBImageAssetLibrary import _add_project_root
+        _add_project_root(self, site_draft=True)
         _add_parameter(self, name=CATALOG_IN, type="str", input_types=["str", "dict"], default_value="",
             allow_input=True, allow_output=False, allow_property=False, allowed_modes=_mode("INPUT"),
             ui_options={"hide": True, "hide_property": True, "hide_handles": True})
@@ -263,7 +269,7 @@ class HMBSoundLibrary(DataNode):
             and isinstance(p.get("relative_path"), str) and isinstance(p.get("name"), str)]
         saved["folders"] = [p for p in saved.get("folders", []) if isinstance(p, str)
             and p and len(p) <= 4096 and not p.startswith(("/", "\\")) and ".." not in p.replace("\\", "/").split("/")
-            and ":" not in p and "\x00" not in p] if isinstance(saved.get("folders"), list) else []
+            and ":" not in _SITE_PREFIX.sub("", p + "/", count=1) and "\x00" not in p] if isinstance(saved.get("folders"), list) else []
         histories = saved.get("project_states")
         if not isinstance(histories, dict) or len(histories) > 64:
             raise SoundError("SOUND_SNAPSHOT_INVALID", "저장된 프로젝트 사운드 기록을 확인하세요.")
@@ -307,6 +313,9 @@ class HMBSoundLibrary(DataNode):
                     self._sound_preparing = False
                     self._sound_preparation_error = ""
                     self._state_sound = restored
+                    self._site_result = {}
+                    self._site_picker = {}
+                    self._site_profile = {"links": [], "revision": "0", "write_site_id": "hq"}
                     self._context_epoch += 1
                     self._scan_requested_root = ""
                     self._scan_finished_root = ""
@@ -378,19 +387,26 @@ class HMBSoundLibrary(DataNode):
     def _sound_ui_state(self) -> tuple[dict[str, Any], tuple]:
         """Build the display snapshot and candidate catalog cache without writes."""
         state = copy.deepcopy({key: value for key, value in self._state_sound.items() if key != "assets"})
+        state["site_settings"] = copy.deepcopy(getattr(self, "_site_profile", {"links": [], "revision": "0", "write_site_id": "hq"}))
+        state["site_settings_result"] = copy.deepcopy(getattr(self, "_site_result", {}))
+        state["site_picker_draft"] = dict(getattr(self, "_site_picker", {}))
+        state["site_projects"] = self._folder_projects()
+        for item in state["site_projects"]:
+            if item.get("project_root"):
+                item.setdefault("project_uid", project_uid(Path(item["project_root"])))
         try:
             from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
             base = str(GriptapeNodes.StaticFilesManager().static_server_base_url).rstrip("/")
         except Exception:
             base = ""
         source_assets = self._state_sound["assets"]
-        scope = (state["project_root"], state["project_uid"], state["channel_uuid"], base)
+        scope = (state["project_root"], state["project_uid"], state["channel_uuid"], base, state["site_settings"]["revision"])
         cached = self._ui_catalog_cache
         if cached is None or cached[0] != scope or cached[1] != source_assets:
             assets = copy.deepcopy(source_assets)
             for asset in assets:
                 try:
-                    path = relative_audio_path(Path(state["project_root"]), asset["relative_path"])
+                    path = relative_audio_path(Path(state["project_root"]), asset["relative_path"], state["site_settings"])
                     raw = str(path)
                     external = raw if raw.startswith("\\\\") else raw.replace("\\", "/").lstrip("/")
                     asset["preview_url"] = base + "/external/" + quote(external, safe="/:") + f"?v={asset.get('size', 0)}-{asset.get('mtime_ns', 0)}" if base else ""
@@ -402,7 +418,7 @@ class HMBSoundLibrary(DataNode):
         # Browser preview URLs are presentation only, never authority.
         for track in state["tracks"]:
             try:
-                path = Path(track["path"])
+                path = relative_audio_path(Path(state["project_root"]), track["relative_path"], state["site_settings"])
                 raw = str(path)
                 external = raw if raw.startswith("\\\\") else raw.replace("\\", "/").lstrip("/")
                 track["preview_url"] = base + "/external/" + quote(external, safe="/:") + "?v=" + track["media_signature"][:16] if base else ""
@@ -552,6 +568,7 @@ class HMBSoundLibrary(DataNode):
                 if old_root != str(root):
                     state["assets"] = []
                     state["folders"] = []
+                    self._site_profile = {"links": [], "revision": "0", "write_site_id": "hq"}
             self._image_project_source = context.get("source")
             self._catalog_available = bool(catalog)
             if state["shot_catalog"] != catalog or changed:
@@ -581,8 +598,9 @@ class HMBSoundLibrary(DataNode):
             restoring_tracks = bool(state["tracks"] and self._scan_finished_root != uid)
             previous_assets = copy.deepcopy(state["assets"])
             def work():
-                assets = scan_sound_project(root, previous_assets=previous_assets)
-                canonical_root = Path(root).resolve()
+                profile = get_site_settings(root, "sound")
+                assets = scan_sound_project(root, previous_assets=previous_assets, profile=profile, refresh=force)
+                canonical_root = assets.canonical_root
                 canonical_uid = project_uid(canonical_root)
                 def commit():
                     if epoch != self._context_epoch or self._state_sound["project_uid"] != uid:
@@ -601,9 +619,13 @@ class HMBSoundLibrary(DataNode):
                         self._context_epoch += 1
                         self._root_aliases[str(absolute_path(root)).casefold()] = str(canonical_root)
                     self._state_sound["assets"] = assets
+                    self._site_profile = profile
                     self._state_sound["folders"] = list(getattr(assets, "folders", []))
                     self._scan_requested_root = canonical_uid
                     self._scan_finished_root = canonical_uid
+                    if assets.warnings:
+                        self._state_sound.update(status=" / ".join(assets.warnings), error_code="SOUND_FOLDER_UNAVAILABLE")
+                        return False
                 return commit
             self._start_job(work, "사운드 목록 준비 중…", replace=True, preparing=restoring_tracks, scope=None)
 
@@ -623,7 +645,7 @@ class HMBSoundLibrary(DataNode):
                 return
             self._standalone_discovery_started = True
             def work():
-                projects = discover_sound_projects(DEFAULT_PROJECTS_ROOT)
+                projects = discover_sound_projects(DEFAULT_PROJECTS_ROOT, refresh=force)
                 def commit():
                     current = self._registered_image_context()
                     if current is not None:
@@ -734,6 +756,74 @@ class HMBSoundLibrary(DataNode):
             self._publish(notify=False)
             launch(operation, generation)
 
+    def _folder_projects(self):
+        state = self._state_sound
+        projects = {item["project_id"]: dict(item) for item in state["projects"]}
+        if state.get("project_root"):
+            parent = Path(state["project_root"]).parent.parent
+            for item in known_sound_projects(parent):
+                projects.setdefault(item["project_id"], item)
+            projects[state["project_id"]] = {key: state[key] for key in ("project_id", "project_root", "project_uid")}
+        else:
+            for item in known_sound_projects(DEFAULT_PROJECTS_ROOT):
+                projects.setdefault(item["project_id"], item)
+        return list(projects.values())
+
+    def _folder_settings(self, request):
+        if not isinstance(request, dict) or not isinstance(request.get("request_id"), str):
+            raise SoundError("SOUND_COMMAND_INVALID", "폴더 관리 창을 다시 열어 주세요.")
+        uid = request.get("project_uid")
+        project = next((p for p in self._folder_projects() if uid in
+                        (p.get("project_uid") or project_uid(Path(p["project_root"])), p["project_id"])), None)
+        result = {"request_id": request["request_id"], "project_uid": uid, "ok": False}
+        if not project:
+            self._site_result = {**result, "message": "프로젝트를 먼저 선택하세요."}
+            self._publish(notify=False, outputs=False)
+            return
+        root = project["project_root"]
+        result["base_root"] = root
+        self._site_picker_project = uid
+        action = request.get("action")
+        if action in ("get", "picked"):
+            try:
+                profile = get_site_settings(root, "sound", fresh=action == "get")
+                result.update(profile, ok=True, message="")
+                if action == "picked":
+                    result["picked_root"] = str(self.get_parameter_value("HMB_SITE_FOLDER_DRAFT") or "")
+            except (ValueError, OSError) as exc:
+                result["message"] = str(exc)
+            self._site_result = result
+            self._publish(notify=False, outputs=False)
+            return
+        if action != "save" or not request.get("expected_revision") or self._state_sound["busy"]:
+            self._site_result = {**result, "message": "진행 중인 작업을 확인하고 폴더 목록을 다시 열어 주세요."}
+            self._publish(notify=False, outputs=False)
+            return
+
+        def save():
+            assets = None
+            try:
+                profile = save_site_settings(root, request.get("links"), request.get("write_site_id"),
+                                             request["expected_revision"], media="sound")
+                result.update(profile, ok=True, message="")
+                if root == self._state_sound["project_root"]:
+                    assets = scan_sound_project(root, profile=profile, refresh=False)
+            except (ValueError, OSError) as exc:
+                result["message"] = str(exc)
+
+            def commit():
+                self._site_result = result
+                if assets is not None and root == self._state_sound["project_root"]:
+                    self._site_profile = profile
+                    self._state_sound.update(assets=assets, folders=assets.folders)
+                    if assets.warnings:
+                        result["message"] = " / ".join(assets.warnings)
+                if result.get("message"):
+                    self._state_sound["status"] = result["message"]
+                    return False
+            return commit
+        self._start_job(save, "사운드 등록 폴더 확인 중…")
+
     @hmb_binding_mutation
     def _command(self, value: Any) -> None:
         command = json.loads(value) if isinstance(value, str) else value
@@ -766,6 +856,9 @@ class HMBSoundLibrary(DataNode):
                 return
             if self._hmb_node_deleted:
                 raise SoundError("SOUND_OWNER_UNAVAILABLE", "삭제된 사운드 라이브러리에는 작업할 수 없습니다.")
+            if action == "site_settings":
+                self._folder_settings(command.get("site_settings_request"))
+                return
             supplied = command.get("context")
             expected = {"project_uid": state["project_uid"], "channel_uuid": state["shot"].get("channel_uuid", ""),
                         "shot_uuid": state["shot"].get("shot_uuid", ""), "revision": state["revision"]}
@@ -796,15 +889,21 @@ class HMBSoundLibrary(DataNode):
                 self._desired_project_root = selected["project_root"]
                 previous_assets = copy.deepcopy(state["assets"]) if state["project_root"] == selected["project_root"] else []
                 def work():
-                    assets = scan_sound_project(selected["project_root"], previous_assets=previous_assets)
+                    profile = get_site_settings(selected["project_root"], "sound", fresh=action == "refresh")
+                    assets = scan_sound_project(selected["project_root"], previous_assets=previous_assets,
+                                               profile=profile, refresh=action == "refresh")
                     def commit():
                         if state["project_root"] != selected["project_root"] and state["tracks"]:
                             raise SoundError("SOUND_PROJECT_IN_USE", "기존 사운드는 보존했습니다. 현재 샷의 사운드 폴더 연결을 확인하세요.")
                         state.update(**selected, project_uid=project_uid(Path(selected["project_root"])), assets=assets,
                                      folders=list(getattr(assets, "folders", [])))
+                        self._site_profile = profile
                         self._scan_requested_root = state["project_uid"]
                         self._scan_finished_root = state["project_uid"]
                         self._desired_project_root = ""
+                        if assets.warnings:
+                            state.update(status=" / ".join(assets.warnings), error_code="SOUND_FOLDER_UNAVAILABLE")
+                            return False
                     return commit
                 self._start_job(work, "사운드 목록 준비 중…", replace=action == "project")
                 return
@@ -924,7 +1023,11 @@ class HMBSoundLibrary(DataNode):
         if self._syncing:
             return result
         name = getattr(parameter, "name", parameter)
-        if name == COMMAND and value:
+        if name == "HMB_SITE_FOLDER_DRAFT":
+            self._site_picker = {"project_uid": getattr(self, "_site_picker_project", self._state_sound.get("project_uid", "")),
+                                 "path": str(value or ""), "token": uuid4().hex}
+            self._publish(notify=False, outputs=False)
+        elif name == COMMAND and value:
             try:
                 self._command(value)
             except Exception as exc:

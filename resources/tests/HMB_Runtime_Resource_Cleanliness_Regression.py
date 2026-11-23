@@ -82,13 +82,13 @@ diagnostics = importlib.util.module_from_spec(diagnostics_spec)
 diagnostics_spec.loader.exec_module(diagnostics)
 # The diagnostic receipt reader must recognize the same independently packaged
 # members. A valid installer receipt must not be rejected as an extra-file list.
-assert len(diagnostics.RUNTIME_FILE_PATHS) == len(set(diagnostics.RUNTIME_FILE_PATHS)) == 79
+assert len(diagnostics.RUNTIME_FILE_PATHS) == len(set(diagnostics.RUNTIME_FILE_PATHS)) == 80
 assert set(diagnostics.RUNTIME_FILE_PATHS) == set(runtime_install_files)
 distribution_only_files = tuple(packager.DISTRIBUTION_ONLY_FILES)
-assert len(runtime_install_files) == 79
+assert len(runtime_install_files) == 80
 assert distribution_only_files == DISTRIBUTION_ONLY_FILES
 assert source_files == (*runtime_install_files, *distribution_only_files)
-assert len(source_files) == 101
+assert len(source_files) == 102
 assert not EXCLUDED_PACKAGE_FILES.intersection(source_files)
 assert not set(runtime_install_files).intersection(distribution_only_files)
 assert {
@@ -187,6 +187,7 @@ assert "_hmb_connection_management.py" in runtime_install_files
 assert "_hmb_workflow_migration.py" in runtime_install_files
 assert "_hmb_workflow_serialization_compat.py" in runtime_install_files
 assert "_hmb_image_limits.py" in runtime_install_files
+assert "_hmb_image_asset_sites.py" in runtime_install_files
 assert "_hmb_review.py" in runtime_install_files
 assert "_hmb_web_rerender.py" in runtime_install_files
 assert "_hmb_color_lut_usage.py" in runtime_install_files

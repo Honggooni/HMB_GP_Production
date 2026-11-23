@@ -53,6 +53,7 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "_hmb_workflow_migration.py",
     "_hmb_workflow_serialization_compat.py",
     "_hmb_image_limits.py",
+    "_hmb_image_asset_sites.py",
     "_hmb_image_bash_compat.py",
     "_hmb_image_bash_render.py",
     "_hmb_image_bash_state.py",

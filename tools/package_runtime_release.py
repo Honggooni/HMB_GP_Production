@@ -18,8 +18,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.9.29"
-RELEASE_VERSION = "0.9.29"
+RELEASE_LABEL = "v0.9.31"
+RELEASE_VERSION = "0.9.31"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -82,6 +82,7 @@ RUNTIME_INSTALL_FILES = (
     "_hmb_workflow_migration.py",
     "_hmb_workflow_serialization_compat.py",
     "_hmb_image_limits.py",
+    "_hmb_image_asset_sites.py",
     "_hmb_image_bash_compat.py",
     "_hmb_image_bash_render.py",
     "_hmb_image_bash_state.py",
@@ -160,7 +161,7 @@ CANONICAL_LF_SOURCE_FILES = {
     if PurePosixPath(relative).suffix.casefold() in {".py", ".js", ".json", ".md", ".txt", ".sh"}
     or relative in {"LICENSE", "resources/media-tools/COPYING.GPLv2"}
 }
-if len(RUNTIME_INSTALL_FILES) != 79 or len(DISTRIBUTION_ONLY_FILES) != 22:
+if len(RUNTIME_INSTALL_FILES) != 80 or len(DISTRIBUTION_ONLY_FILES) != 22:
     raise RuntimeError("Runtime/distribution release boundary count mismatch.")
 if set(RUNTIME_INSTALL_FILES) & set(DISTRIBUTION_ONLY_FILES):
     raise RuntimeError("Runtime and distribution-only release files overlap.")

@@ -1,3 +1,177 @@
+// Standalone Griptape widgets load as individual modules. Keep this dialog in sync in both libraries.
+function openProjectFolderCards(container, state, options) {
+  container.__hmbFolderCards?.close();
+  const doc = container.ownerDocument, sound = options.media === "sound";
+  const label = (ko, en) => state.language === "en" ? en : ko;
+  const leaf = path => String(path || "").replace(/[/\\]+$/, "").split(/[/\\]/).pop() || "";
+  const projects = new Map();
+  const available = sound && Array.isArray(state.site_projects) ? state.site_projects : state.projects || [];
+  for (const row of [...available, {project_uid:state.project_uid, project_id:state.project_id, path:state.project_root}]) {
+    const id = String(row.project_uid || (row.project_id === state.project_id && state.project_uid) || row.project_id || "");
+    const path = String(row.path || row.project_root || "");
+    if (id && path && !projects.has(id)) projects.set(id, {path,name:row.name || row.project_id || leaf(path)});
+  }
+  const dialog = doc.createElement("dialog");
+  dialog.className = "hmb-project-folders nodrag nopan nowheel";
+  dialog.setAttribute("aria-label", label("프로젝트 Add", "Project Add"));
+  dialog.innerHTML = `<style>
+.hmb-project-folders{box-sizing:border-box;color-scheme:dark;width:min(540px,94vw);max-height:86vh;padding:0;background:#101725;color:#e6edf7;border:1px solid #46546d;border-radius:12px;box-shadow:0 16px 60px #000a;font:14px/1.4 system-ui,sans-serif;overflow:auto}
+.hmb-project-folders::backdrop{background:#06091099}
+.hmb-project-folders *{box-sizing:border-box}
+.hmb-project-folders header,.hmb-project-folders footer{display:flex;gap:9px;align-items:center}
+.hmb-project-folders header{padding:12px 16px;background:linear-gradient(110deg,#4e253f,#182236 70%);border-bottom:1px solid #3b475b;font-size:16px;font-weight:700}
+.hmb-project-folders header button{margin-left:auto}
+.hmb-project-folders section{padding:16px}
+.hmb-project-folders label,.hmb-project-folders [data-pf-heading]{display:block;margin:0 0 6px;color:#c4cfdf;font-size:13px}
+.hmb-project-folders input,.hmb-project-folders select,.hmb-project-folders button{font:inherit;color:inherit;background:#131c2c;border:1px solid #42506a;border-radius:6px;padding:6px 11px}
+.hmb-project-folders button{cursor:pointer}
+.hmb-project-folders button:disabled{opacity:.45;cursor:default}
+.hmb-project-folders :focus-visible{outline:2px solid #65dbed;outline-offset:2px}
+.hmb-project-folders select,.hmb-project-folders input{width:100%;height:36px;background:#0c1320}
+.hmb-project-folders .pf-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(195px,100%),1fr));gap:8px;max-height:40vh;overflow:auto;padding:3px}
+.hmb-project-folders .pf-card{display:flex;align-items:center;gap:10px;text-align:left;min-height:60px;min-width:0}
+.hmb-project-folders .pf-card[aria-pressed=true]{border-color:#42c2d4;background:#123444}
+.hmb-project-folders .pf-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.hmb-project-folders .pf-icon{color:#7ccadc}
+.hmb-project-folders [data-pf-status]{min-height:1.5em;color:#9cabbf;font-size:12px;margin:9px 0}
+.hmb-project-folders footer{justify-content:flex-end;border-top:1px solid #334054;padding:10px 16px}
+.hmb-project-folders [data-pf-add]{background:#225368;border-color:#387f90}
+.hmb-project-folders .pf-controls{margin-top:14px}
+.hmb-project-folders [hidden]{display:none!important}
+</style>`
+    + '<header><span class="pf-icon" aria-hidden="true">▱</span><span data-pf-title></span><button type="button" data-pf-close>×</button></header>'
+    + '<section><label><span data-pf-project-label></span><select data-pf-project></select></label><div class="pf-controls"><strong data-pf-heading></strong><div class="pf-grid" data-pf-cards></div></div>'
+    + '<label data-pf-entry hidden><span data-pf-path-label></span><input type="text" data-pf-path autocomplete="off" spellcheck="false"></label><div data-pf-status role="status" aria-live="polite"></div></section>'
+    + '<footer><button type="button" data-pf-add></button><button type="button" data-pf-remove></button></footer>';
+  const find = name => dialog.querySelector("[data-pf-" + name + "]");
+  const select = find("project"), closeButton = find("close"), add = find("add"), remove = find("remove");
+  find("title").textContent = label("프로젝트 Add", "Project Add");
+  find("project-label").textContent = label("프로젝트", "Project");
+  find("heading").textContent = label("연결된 폴더", "Linked folders");
+  find("path-label").textContent = label("등록할 폴더의 전체 경로", "Full folder path");
+  add.textContent = label("추가", "Add"); remove.textContent = label("삭제", "Remove");
+  closeButton.setAttribute("aria-label", label("닫기", "Close"));
+  for (const [id, row] of projects) select.add(new doc.defaultView.Option(row.name, id));
+  let project = projects.has(state.project_uid) ? state.project_uid : projects.keys().next().value || "";
+  select.value = project;
+  let profile = null, selected = "hq", pending = "", timer, choosing = false, disposed = false, pickerToken = state.site_picker_draft?.token || "", stopPicker = () => {};
+  const notice = text => { find("status").textContent = text || ""; };
+  const writeId = () => profile?.write_site_id || "hq";
+  const asyncId = () => globalThis.crypto?.randomUUID?.() || Date.now().toString(16) + Math.random().toString(16).slice(2);
+  function paint() {
+    find("entry").hidden = !choosing;
+    const grid = find("cards"); grid.replaceChildren();
+    const base = profile?.base_root || projects.get(project)?.path || "";
+    const cards = base ? [{id:"hq", label:leaf(base),root:base}, ...(profile?.links || [])] : [];
+    for (const item of cards) {
+      const button = doc.createElement("button"), icon = doc.createElement("span"), name = doc.createElement("span");
+      button.type = "button"; button.className = "pf-card"; button.dataset.pfSite = item.id; button.title = item.root;
+      button.setAttribute("aria-pressed", String(item.id === selected)); button.disabled = !!pending || !profile || choosing;
+      icon.className = "pf-icon"; icon.textContent = "📁"; icon.setAttribute("aria-hidden","true");
+      name.className = "pf-name"; name.textContent = item.label || leaf(item.root);
+      button.append(icon,name); grid.appendChild(button);
+      button.onclick = () => {
+        if (!sound && item.id !== writeId()) save(profile.links, item.id);
+        else { selected = item.id; paint(); notice(sound ? item.root : label("Add 저장 위치 · ", "Add destination · ") + item.root); }
+      };
+    }
+    select.disabled = !!pending; add.disabled = !profile || !!pending; remove.disabled = !profile || !!pending || choosing || selected === "hq";
+  }
+  function restoreModal() {
+    if (!disposed && dialog.open && !dialog.matches(":modal")) { dialog.close(); dialog.showModal(); }
+  }
+  function endPicker() { choosing=false; stopPicker(); stopPicker=()=>{}; find("path").value=""; restoreModal(); }
+  function close() {
+    if (disposed) return;
+    disposed = true; clearTimeout(timer); endPicker(); dialog.remove(); delete container.__hmbFolderCards;
+    options.trigger?.focus?.({preventScroll:true});
+  }
+  function request(action, extra = {}) {
+    const request_id = asyncId(); pending = request_id;
+    clearTimeout(timer);
+    timer=setTimeout(() => {
+      if (disposed || pending !== request_id) return;
+      notice(label("엔진 응답을 기다리는 중입니다. 이 창에서 결과를 확인하거나 다시 열 수 있습니다.", "Waiting for the engine. Keep this window open for confirmation, or reopen it."));
+    },15000);
+    paint(); notice(action === "save" ? label("폴더 설정 저장 중…","Saving folder settings…") : label("폴더 확인 중…","Reading folder settings…"));
+    const fail = error => { if (disposed || pending !== request_id) return; clearTimeout(timer); pending=""; profile=null; paint(); notice(String(error?.message||error)); };
+    try { Promise.resolve(options.send({request_id,project_uid:project,action,...extra},fail)).catch(fail); } catch(error){ fail(error); }
+  }
+  function save(links,id) { if (profile && !pending) request("save",{links,write_site_id:id,expected_revision:profile.revision}); }
+  function addPath(input) {
+    const path = String(input || "").trim().replace(/^["']|["']$/g,"");
+    if (!/^(?:[a-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+|\/(?!\/))/i.test(path) || /[\\/]fakepath[\\/]/i.test(path)) {
+      notice(label("공유 폴더의 전체 경로를 입력하세요.","Enter the full shared folder path.")); return;
+    }
+    const key = p => p.replaceAll("\\","/").replace(/\/+$/,"").toLowerCase();
+    if ([profile.base_root || projects.get(project)?.path, ...profile.links.map(link=>link.root)].some(p=>p && key(p)===key(path))) {
+      notice(label("이미 연결된 폴더입니다.","This folder is already linked.")); return;
+    }
+    const id = "new-" + asyncId().replaceAll("-","");
+    endPicker(); save([...profile.links,{id,label:leaf(path),root:path}],sound ? writeId() : id);
+  }
+  function browse() {
+    choosing = true; paint(); find("path").focus();
+    notice(label("폴더를 선택하거나 전체 경로를 입력한 뒤 추가를 누르세요.","Choose a folder, or enter its full path and press Add."));
+    const shell = container.closest(".react-flow__node,[data-node-id]");
+    const selector = '[data-parameter-name="HMB_SITE_FOLDER_DRAFT"],[data-parameter="HMB_SITE_FOLDER_DRAFT"],[data-parameter-key="HMB_SITE_FOLDER_DRAFT"],[data-parameter-id$="HMB_SITE_FOLDER_DRAFT" i]';
+    const input = shell?.querySelector('input[name="HMB_SITE_FOLDER_DRAFT"],input[id*="HMB_SITE_FOLDER_DRAFT" i]');
+    const row = shell?.querySelector(selector) || input?.closest('[role="group"]') || input?.parentElement;
+    if (!row || row.contains(container)) return;
+    const controls = [...row.querySelectorAll('button,[role="button"]')].filter(el=>!el.disabled);
+    const description = el => [el.title,el.getAttribute("aria-label"),el.textContent].join(" ");
+    const control = controls.find(el=>/browse|choose|select|찾아|선택/i.test(description(el)) && !/reveal|explorer|편집|reset/i.test(description(el)))
+      || controls.find(el=>!el.title && el.matches("button.border-l") && el.querySelector("svg.lucide-folder"));
+    if (!control) return;
+    const accept = event => {
+      const path = event.target?.value;
+      if (choosing && path && !/fakepath/i.test(path)) { find("path").value=path; addPath(path); }
+    };
+    row.addEventListener("change", accept);
+    stopPicker = () => row.removeEventListener("change",accept);
+    // The native editor can render its chooser in a portal outside the widget.
+    // Leave the browser top layer so that chooser, including Cancel, remains interactive.
+    dialog.close(); dialog.show(); control.click();
+  }
+  function receive(snapshot) {
+    if (disposed) return;
+    const picked = snapshot.site_picker_draft;
+    if (picked?.token && picked.token !== pickerToken) {
+      pickerToken = picked.token;
+      if (choosing && profile && !pending && picked.path) { find("path").value=picked.path; addPath(picked.path); }
+    }
+    const result = snapshot.site_settings_result;
+    if (!pending || result?.request_id !== pending || result?.project_uid !== project) return;
+    clearTimeout(timer); pending="";
+    if (!result.ok) {
+      profile=null; paint(); notice(result.message || label("폴더 설정을 확인할 수 없습니다. 창을 다시 열어 주세요.","Could not read folder settings. Reopen Project Add.")); return;
+    }
+    profile = {...result,links:Array.isArray(result.links) ? result.links : []};
+    selected = !sound || !profile.links.some(link=>link.id===selected) ? writeId() : selected;
+    paint();
+    const pickedCard = find("cards").querySelector('[aria-pressed="true"]');
+    notice(result.message || (!sound && pickedCard ? label("Add 저장 위치 · ", "Add destination · ") + pickedCard.title : ""));
+  }
+  select.onchange = () => {
+    endPicker();
+    project=select.value; profile=null; selected="hq"; request("get");
+  };
+  add.onclick = () => { if (choosing) addPath(find("path").value); else browse(); };
+  remove.onclick = () => { if (selected!=="hq") save(profile.links.filter(link=>link.id!==selected),writeId()===selected?"hq":writeId()); };
+  closeButton.onclick = close;
+  dialog.addEventListener("cancel", event=>{event.preventDefault();close();});
+  dialog.addEventListener("keydown",event=>{
+    if(event.key==="Escape"){event.preventDefault();if(choosing){endPicker();paint();notice("");}else close();}
+    if(event.key==="Enter" && event.target===find("path")){event.preventDefault();addPath(event.target.value);}
+    event.stopPropagation();
+  });
+  for (const type of ["pointerdown","mousedown","click","wheel"]) dialog.addEventListener(type,event=>event.stopPropagation());
+  doc.body.appendChild(dialog); dialog.showModal();
+  container.__hmbFolderCards={close,receive};
+  if (project) request("get"); else { paint();notice(label("먼저 프로젝트 폴더를 선택하세요.","Select a project folder first.")); }
+}
+// End standalone project folder dialog.
+
 export function hmbScopeWidgetCss(cssText, rootSelector) {
   const css = String(cssText || "");
   const root = String(rootSelector || "").trim();
@@ -532,7 +706,7 @@ const IMAGE_ASSET_UI_TEXT = {
     select_a_project: "Select a project",
     project: "PROJECT",
     reload_projects: "Refresh project images from the shared folder",
-    project_set: "PROJECT SET",
+    project_set: "Project Add",
     registered: "REG",
     unregistered: "UNREG",
     selected: "SEL",
@@ -616,7 +790,7 @@ const IMAGE_ASSET_UI_TEXT = {
     select_a_project: "프로젝트를 선택하세요",
     project: "프로젝트",
     reload_projects: "새로고침 · 공유 폴더의 이미지 변경 사항 확인",
-    project_set: "프로젝트 설정",
+    project_set: "프로젝트 Add",
     registered: "등록",
     unregistered: "미등록",
     selected: "선택",
@@ -1230,6 +1404,7 @@ function normalizeRegistrationRequest(raw) {
     request_id: requestId,
     project_uid: clean(raw.project_uid).slice(0, 256),
     asset_library_id: assetLibraryId,
+    ...(raw.site_settings_revision ? {site_settings_revision:clean(raw.site_settings_revision)} : {}),
     source_kind: sourceKind,
     source_uid: sourceUid,
     relative_path: relativePath,
@@ -1604,6 +1779,7 @@ function hmbResetImageAssetRuntimeState(container,state) {
     hmbCancelImageAssetThumbnailRequest(container);
     clearTimeout(container.__hmbImageAssetSearchTimer);
     delete container.__hmbImageAssetSearchTimer;
+    container.__hmbFolderCards?.close();
     container.__hmbHierarchyDispose?.();
     const page = container.__hmbImageAssetPageControl;
     if (page) { clearTimeout(page.timer); page.pending = null; page.key = ""; page.acceptedContext = ""; page.disabledContext = ""; page.fullState = state; }
@@ -1746,6 +1922,11 @@ function normalizeState(value) {
     project_display_name: clean(input.project_display_name),
     project_uid: clean(input.project_uid),
     project_cache_uid: clean(input.project_cache_uid),
+    ...(input.site_settings && typeof input.site_settings === "object" ? {site_settings:input.site_settings} : {}),
+    ...(input.site_selection_memory && typeof input.site_selection_memory === "object" ? {site_selection_memory:input.site_selection_memory} : {}),
+    ...(input.site_picker_draft?.token ? {site_picker_draft:input.site_picker_draft} : {}),
+    ...(input.site_settings_result?.request_id ? {site_settings_result:input.site_settings_result} : {}),
+    ...(input.site_settings_request?.request_id ? {site_settings_request: input.site_settings_request} : {}),
     manifest_signature: clean(input.manifest_signature).slice(0, 128),
     folder_signature: clean(input.folder_signature).slice(0, 128),
     taxonomy,
@@ -2699,6 +2880,7 @@ export function hmbBuildImageAssetCompactEdit(state, acceptedIdentity) {
     "asset_cleanup_request", "disconnect_import_uid", "shot_routing", "shot_hierarchy", "shot_hierarchy_request",
     "image_bash_workspace", "image_bash_active", "image_bash_workspace_request", "image_bash_workspace_edit",
   ]) edits[field] = state[field];
+  if (state.site_settings_request?.request_id) edits.site_settings_request = state.site_settings_request;
   return {
     schema: IMAGE_ASSET_EDIT_SCHEMA, version: 1,
     ...(hmbImageAssetWidgetLease(state) ? {widget_runtime_lease:hmbImageAssetWidgetLease(state)} : {}),
@@ -3090,7 +3272,7 @@ function renderFolderNode(node, state, depth = 0) {
       data-has-children="${hasChildren ? "1" : "0"}"
       style="--tree-depth:${depth}">
       <i>${hasChildren ? (expanded ? "▾" : "▸") : "·"}</i>
-      <span>${escapeHtml(node.label)}</span><b>${node.assetCount}</b>
+      <span>${escapeHtml(imageFolderLabel(state, node.path, node.label))}</span><b>${node.assetCount}</b>
     </button>`;
   if (!hasChildren || !expanded) return row;
   return row + node.children.map((child) => renderFolderNode(child, state, depth + 1)).join("");
@@ -3588,10 +3770,21 @@ function assetCardThumbnailImageMarkup(asset) {
     : `<span class="asset-thumb-placeholder" aria-hidden="true">${imageAssetThumbnailFallbackMarkup(asset)}</span>`;
 }
 
-export function hmbImageAssetCanRegister(asset) {
+function imageFolderSite(value) {
+  return /^site:([^/]+)(?:\/|$)/.exec(clean(value).replaceAll("\\", "/"))?.[1] || "hq";
+}
+
+function imageFolderLabel(state, folder, fallback) {
+  if (!folder.startsWith("site:") || folder.includes("/")) return fallback;
+  return state.site_settings?.links?.find(link => link.id === imageFolderSite(folder))?.label || fallback;
+}
+
+export function hmbImageAssetCanRegister(asset, state) {
   if (!asset || typeof asset !== "object" || asset.registered) return false;
   const sourceKind = clean(asset.source_kind).toLowerCase();
-  if (!sourceKind || sourceKind === "project") return true;
+  if (!sourceKind || sourceKind === "project") {
+    return !state || imageFolderSite(asset.relative_path) === (state.site_settings?.write_site_id || "hq");
+  }
   return sourceKind === "user"
     && Number(asset.import_index || 0) > 0;
 }
@@ -3606,7 +3799,7 @@ function assetThumbnailHtml(asset, state) {
   const source = imageSource(asset);
   const failed = !source && hmbImageAssetThumbnailFailed(asset);
   const sourceName = clean(asset.image_name) || clean(asset.asset_id) || "Image";
-  const add = hmbImageAssetCanRegister(asset)
+  const add = hmbImageAssetCanRegister(asset, state)
     ? `<button type="button" class="asset-add" data-asset-add aria-label="${escapeHtml(imageAssetText(state, "add_image_asset"))}">${escapeHtml(imageAssetText(state, "add"))}</button>`
     : "";
   return `
@@ -5161,8 +5354,8 @@ export function hmbImageAssetRegistrationSubTypes(taxonomy, sourceType) {
   return uniqueStrings(Array.isArray(mapped) ? mapped : []).filter(Boolean);
 }
 
-export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}) {
-  if (!hmbImageAssetCanRegister(asset)) return null;
+export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}, state) {
+  if (!hmbImageAssetCanRegister(asset, state)) return null;
   const assetMainType = clean(asset.image_main_type);
   const assetSubType = clean(asset.image_sub_type);
   const sourceType = assetMainType !== "Select Image Main Type" ? assetMainType : "";
@@ -5173,6 +5366,7 @@ export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}) {
     : ROOT_FOLDER_KEY;
   return {
     asset_library_id: clean(asset.asset_library_id),
+    site_settings_revision: clean(state?.site_settings?.revision),
     source_kind: sourceKind,
     source_uid: clean(asset.source_uid),
     relative_path: relativePath,
@@ -5322,11 +5516,16 @@ function registrationFolderOptions(state, draft) {
   const options = [
     `<option value="" ${selected ? "" : "selected"} disabled>${escapeHtml(imageAssetText(state, "select_project_folder"))}</option>`,
   ];
-  state.folders
-    .filter((folder) => clean(folder) && !isUserImportFolder(folder))
-    .forEach((folder) => {
+  const writeSite = state.site_settings?.write_site_id || "hq";
+  const root = "site:" + writeSite;
+  const folders = writeSite === "hq" ? state.folders : [...new Set([root, ...state.folders])];
+  folders
+    .filter(folder => clean(folder) && !isUserImportFolder(folder) && imageFolderSite(folder) === writeSite)
+    .forEach(folder => {
+      const label = folder === root ? imageFolderLabel(state, folder, root)
+        : writeSite === "hq" ? folder : folder.slice(root.length + 1);
       options.push(
-        `<option value="${escapeHtml(folder)}" ${selected === folder ? "selected" : ""}>${escapeHtml(folder)}</option>`,
+        `<option value="${escapeHtml(folder)}" ${selected === folder ? "selected" : ""}>${escapeHtml(label)}</option>`,
       );
     });
   return options.join("");
@@ -5350,7 +5549,7 @@ function renderRegistrationDialog(state, draft) {
   const externalImport = asset?.source_kind === "user" && Number(asset?.import_index || 0) > 0;
   if (
     !asset
-    || !hmbImageAssetCanRegister(asset)
+    || !hmbImageAssetCanRegister(asset, state)
   ) return "";
   const mainTypes = uniqueStrings([
     ...registrationMainTypes(state.taxonomy),
@@ -6968,6 +7167,7 @@ function nativeProjectRootHosts(container) {
   };
   [
     '[data-parameter-name="PROJECT_ROOT"]',
+    '[data-parameter-name="HMB_SITE_FOLDER_DRAFT"]',
     '[data-parameter="PROJECT_ROOT"]',
     '[data-parameter-key="PROJECT_ROOT"]',
     '[data-parameter-id*="PROJECT_ROOT" i]',
@@ -7049,43 +7249,6 @@ function concealNativeProjectRootPicker(container) {
     host.style.setProperty("opacity", "0", "important");
     host.style.setProperty("pointer-events", "none", "important");
   });
-}
-
-function openNativeProjectRootPicker(container) {
-  const controls = [];
-  const seen = new Set();
-  nativeProjectRootHosts(container).forEach((host) => {
-    host.querySelectorAll?.('input[type="file"], button, [role="button"]').forEach((control) => {
-      if (container.contains?.(control) || seen.has(control)) return;
-      const description = clean(
-        `${control.textContent || ""} ${control.getAttribute?.("title") || ""} ${control.getAttribute?.("aria-label") || ""}`,
-      );
-      if (/open\s+(?:file|folder|url)|reveal|explorer/i.test(description)) return;
-      seen.add(control);
-      controls.push(control);
-    });
-  });
-  controls.sort((left, right) => {
-    const score = (control) => {
-      if (control.matches?.('input[type="file"]')) return 3;
-      const label = clean(`${control.textContent || ""} ${control.getAttribute?.("title") || ""}`);
-      return /browse|picker|select|choose|찾아|선택/i.test(label) ? 2 : 1;
-    };
-    return score(right) - score(left);
-  });
-  for (const control of controls) {
-    if (control.matches?.('input[type="file"]') && typeof control.showPicker === "function") {
-      try {
-        control.showPicker();
-        return true;
-      } catch (_error) {}
-    }
-    if (typeof control.click === "function") {
-      control.click();
-      return true;
-    }
-  }
-  return false;
 }
 
 function hmbInstallShotHierarchyDragging(dialog, doc) {
@@ -8164,7 +8327,20 @@ function installEvents(container, state, props, remount, listeners) {
   on(container.querySelector("[data-project-set]"), "click", (event) => {
     event.preventDefault();
     event.stopPropagation();
-    openNativeProjectRootPicker(container);
+    const live = container.__hmbImageAssetLatestState || state;
+    openProjectFolderCards(container,live,{
+      media:"image",trigger:event.currentTarget,
+      send(request,failed) {
+        hmbFlushImageAssetSelectionCommit(container);
+        const send = () => {
+          if (!container.__hmbFolderCards) return;
+          const base = container.__hmbImageAssetLatestState || state;
+          emit(props,{...base,site_settings_request:request},container,failed);
+        };
+        if (hmbImageAssetWidgetLease(live)) return hmbWaitForImageAssetAuthority(container,live).then(send);
+        send();
+      },
+    });
   });
   on(container.querySelector("[data-project-reload]"), "click", (event) => {
     event.preventDefault();
@@ -8269,7 +8445,7 @@ function installEvents(container, state, props, remount, listeners) {
     on(card.querySelector("[data-asset-add]"), "click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      if (!hmbImageAssetCanRegister(asset)) return;
+      if (!hmbImageAssetCanRegister(asset, state)) return;
       container.__hmbImageAssetRegistrationReturnFocus = {
         descriptor: imageAssetFocusDescriptor(container),
         assetKey: asset.asset_library_id,
@@ -8277,6 +8453,7 @@ function installEvents(container, state, props, remount, listeners) {
       container.__hmbImageAssetRegistrationDraft = hmbCreateImageAssetRegistrationDraft(
         asset,
         state.taxonomy,
+        state,
       );
       remount(state);
       Promise.resolve().then(() => {
@@ -8477,12 +8654,12 @@ function installEvents(container, state, props, remount, listeners) {
     if (add) {
       event.preventDefault();
       event.stopPropagation();
-      if (!hmbImageAssetCanRegister(asset)) return;
+      if (!hmbImageAssetCanRegister(asset, state)) return;
       container.__hmbImageAssetRegistrationReturnFocus = {
         descriptor: imageAssetFocusDescriptor(container),
         assetKey: asset.asset_library_id,
       };
-      container.__hmbImageAssetRegistrationDraft = hmbCreateImageAssetRegistrationDraft(asset, state.taxonomy);
+      container.__hmbImageAssetRegistrationDraft = hmbCreateImageAssetRegistrationDraft(asset, state.taxonomy, state);
       remount(state);
       Promise.resolve().then(() => {
         container.querySelector?.('[data-registration-field="image_name"]')?.focus?.();
@@ -8633,10 +8810,15 @@ function installEvents(container, state, props, remount, listeners) {
         failed(new Error("프로젝트 연결이 변경되었습니다. 현재 프로젝트에서 등록 창을 다시 여세요."));
         return;
       }
+      if (clean(draft.site_settings_revision) !== clean(base.site_settings?.revision)) {
+        failed(new Error("등록 폴더가 변경되었습니다. 등록 창을 다시 열어 주세요."));
+        return;
+      }
       const request = {
         request_id: `asset-registration-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
         project_uid: base.project_uid,
         asset_library_id: draft.asset_library_id,
+        site_settings_revision: clean(draft.site_settings_revision),
         source_kind: draft.source_kind,
         source_uid: draft.source_uid,
         relative_path: draft.relative_path,
@@ -9219,6 +9401,8 @@ function hmbNativeUiImplementation(container, props) {
       return;
     }
     const incomingState = normalizeState(hmbImageAssetLocalPageProjection(rawIncoming,state,container));
+    if (hmbImageAssetRevisionDisposition(container, incomingState) !== "stale") container.__hmbFolderCards?.receive(incomingState);
+    delete incomingState.site_settings_request;
     const incomingRefreshScope = hmbImageAssetRefreshScope(incomingState);
     if (container.__hmbImageAssetSettledRefresh?.scope === incomingRefreshScope && incomingState.scan_busy
         && incomingState.refresh_revision <= container.__hmbImageAssetSettledRefresh.revision
@@ -9477,6 +9661,7 @@ function hmbNativeUiImplementation(container, props) {
     delete container.__hmbImageAssetSemanticGeneration;delete container.__hmbImageAssetPendingPublications;delete container.__hmbImageAssetCanonicalGeneration;
     delete container.__hmbImageAssetWorkspaceAuthorityUnknown;
     leaseDisposed = true; clearLeaseTransition();
+    container.__hmbFolderCards?.close();
     container.__hmbHierarchyDispose?.();
     container.__hmbHierarchyDialog?.close?.();
     container.__hmbHierarchyDialog?.remove?.();

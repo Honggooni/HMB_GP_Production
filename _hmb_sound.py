@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import math
+import logging
 import os
 from pathlib import Path
 import re
@@ -29,9 +30,14 @@ REFERENCE_EXTENSIONS = frozenset({".wav", ".mp3"})
 MAX_TRACKS = 64
 MAX_CATALOG_FILES = 20000
 MAX_SOURCE_BYTES = 1024 * 1024 * 1024
-DEFAULT_PROJECTS_ROOT = "//192.168.200.19/v/projects"
+DEFAULT_PROJECTS_ROOT = os.environ.get("HMB_IMAGE_PROJECTS_ROOT") or "P:/projects"
 _CATALOG_LOCK = threading.RLock()
-_CATALOG_FLIGHTS: dict[str, dict] = {}
+_CATALOG_FLIGHTS: dict[tuple[str, str], dict] = {}
+_SESSION_CATALOGS: dict[tuple[str, str], SoundCatalog] = {}
+_SESSION_FAILURES: dict[tuple[str, str], str] = {}
+_DISCOVERED_PROJECTS: dict[str, list[dict]] = {}
+_PROJECT_ALIASES: dict[str, str] = {}
+_SITE_PREFIX = re.compile(r"^site:(site-[0-9a-f]{32})/")
 _PROBE_LOCK = threading.RLock()
 _PREPARED_INFO: OrderedDict[tuple, dict] = OrderedDict()
 _PROBE_FLIGHTS: dict[tuple, dict] = {}
@@ -108,7 +114,20 @@ def _reject_reparse_path(path: Path) -> None:
         current = current.parent
 
 
-def relative_audio_path(root: Path, relative: str) -> Path:
+def _audio_location(root: Path, relative: str, profile: dict | None = None) -> tuple[Path, str]:
+    match = _SITE_PREFIX.match(relative) if isinstance(relative, str) else None
+    if not match:
+        return root, relative
+    if profile is None:
+        from _hmb_image_asset_sites import get_site_settings
+        profile = get_site_settings(root, "sound")
+    link = next((item for item in profile["links"] if item["id"] == match[1]), None)
+    if link is None:
+        raise SoundError("SOUND_FOLDER_DISCONNECTED", "이 음원의 등록 폴더를 다시 연결하세요.")
+    return Path(link["root"]), relative[match.end():]
+
+
+def _join_audio_path(root: Path, relative: str) -> Path:
     """Pure lexical join for already cataloged presentation; no file reads."""
     if not isinstance(relative, str):
         raise SoundError("SOUND_SOURCE_OUTSIDE_PROJECT", "프로젝트 사운드 폴더 안의 음원을 선택하세요.")
@@ -121,8 +140,18 @@ def relative_audio_path(root: Path, relative: str) -> Path:
     return path
 
 
+def relative_audio_path(root: Path, relative: str, profile: dict | None = None) -> Path:
+    return _join_audio_path(*_audio_location(root, relative, profile))
+
+
 def _source_path(root: Path, relative: str) -> Path:
-    path = relative_audio_path(root, relative)
+    project = root
+    site = _SITE_PREFIX.match(relative) if isinstance(relative, str) else None
+    root, relative = _audio_location(project, relative)
+    if site:
+        from _hmb_image_asset_sites import verify_folder_identity
+        verify_folder_identity(root, project, site[1])
+    path = _join_audio_path(root, relative)
     _reject_reparse_path(path)
     resolved = path.resolve()
     if not resolved.is_relative_to(root.resolve()) or resolved.suffix.casefold() not in EXTENSIONS:
@@ -182,25 +211,44 @@ def probe_sound(path: Path) -> dict[str, Any]:
         raise SoundError("SOUND_DECODE_UNAVAILABLE", "음원 길이·오디오 스트림을 확인하지 못했습니다. 파일 형식과 로컬 FFmpeg를 확인하세요.") from None
 
 
-def discover_sound_projects(projects_root: str | Path = DEFAULT_PROJECTS_ROOT) -> list[dict[str, str]]:
+def known_sound_projects(projects_root: str | Path) -> list[dict]:
+    with _CATALOG_LOCK:
+        return copy.deepcopy(_DISCOVERED_PROJECTS.get(str(absolute_path(projects_root)).casefold(), []))
+
+
+def discover_sound_projects(projects_root: str | Path = DEFAULT_PROJECTS_ROOT, *, refresh: bool = False) -> list[dict[str, str]]:
+    key = str(absolute_path(projects_root)).casefold()
+    with _CATALOG_LOCK:
+        if not refresh and key in _DISCOVERED_PROJECTS:
+            return copy.deepcopy(_DISCOVERED_PROJECTS[key])
     _reject_reparse_path(Path(projects_root))
     root = Path(projects_root).resolve()
     try:
-        return [{"project_id": child.name, "project_root": str(child / "Ai_Ct_audio").replace("\\", "/")}
+        result = [{"project_id": child.name, "project_root": str(child / "Ai_Ct_audio").replace("\\", "/"),
+                   "project_uid": project_uid(child / "Ai_Ct_audio")}
             for child in sorted(root.iterdir(), key=lambda p: p.name.casefold())
             if child.is_dir() and not child.is_symlink() and (child / "Ai_Ct_audio").is_dir()
             and (child / "Ai_Ct_audio").resolve().is_relative_to(root)]
+        with _CATALOG_LOCK:
+            _DISCOVERED_PROJECTS[key] = _DISCOVERED_PROJECTS[str(root).casefold()] = result
+            for item in result:
+                authored = absolute_path(projects_root) / item["project_id"] / "Ai_Ct_audio"
+                _PROJECT_ALIASES[str(authored).casefold()] = str(absolute_path(item["project_root"])).casefold()
+        return copy.deepcopy(result)
     except OSError:
         raise SoundError("SOUND_PROJECT_ROOT_UNAVAILABLE", "프로젝트 공유 경로에 연결할 수 없습니다. 사운드 폴더와 네트워크 연결을 확인하세요.") from None
 
 
-def scan_sound_project(project_root: str | Path, *, previous_assets: list[dict] | None = None) -> list[dict[str, Any]]:
-    _reject_reparse_path(Path(project_root))
-    root = Path(project_root).resolve()
-    if root.name.casefold() != "ai_ct_audio" or not root.is_dir():
-        raise SoundError("SOUND_PROJECT_ROOT_UNAVAILABLE", "선택한 프로젝트의 Ai_Ct_audio 폴더를 확인하세요.")
-    key = str(root).casefold()
+def _read_sound_folder(root: Path, previous_assets: list[dict], refresh: bool,
+                       project: Path | None = None, site_id: str = "") -> SoundCatalog:
+    key = (str(absolute_path(root)).casefold(), site_id)
     with _CATALOG_LOCK:
+        if not site_id:
+            key = (_PROJECT_ALIASES.get(key[0], key[0]), "")
+        if not refresh and key in _SESSION_FAILURES:
+            raise SoundError("SOUND_SCAN_INCOMPLETE", _SESSION_FAILURES[key])
+        if not refresh and key in _SESSION_CATALOGS:
+            return _SESSION_CATALOGS[key]
         job = _CATALOG_FLIGHTS.get(key)
         owner = job is None
         if owner:
@@ -211,18 +259,92 @@ def scan_sound_project(project_root: str | Path, *, previous_assets: list[dict] 
             raise SoundError("SOUND_SCAN_INCOMPLETE", "사운드 목록 확인이 지연되고 있습니다. 기존 목록을 보존했습니다.")
         if job["error"] is not None:
             raise job["error"]
-        return copy.deepcopy(job["result"])
+        return job["result"]
     try:
-        result = _scan_sound_inventory(root, previous_assets or [])
-        job["result"] = result
-        return copy.deepcopy(result)
+        _reject_reparse_path(root)
+        if site_id:
+            from _hmb_image_asset_sites import verify_folder_identity
+            verify_folder_identity(root, project, site_id)
+        canonical = root.resolve()
+        if not canonical.is_dir():
+            raise SoundError("SOUND_PROJECT_ROOT_UNAVAILABLE", "선택한 사운드 폴더와 연결을 확인하세요.")
+        from _hmb_image_asset_sites import ensure_registration_directory
+        warning = ensure_registration_directory(canonical, refresh=refresh)
+        result = _scan_sound_inventory(canonical, previous_assets)
+        result.warnings = [warning] if warning else []
+        result.canonical_root = canonical
+        with _CATALOG_LOCK:
+            _SESSION_CATALOGS[key] = _SESSION_CATALOGS[(str(canonical).casefold(), site_id)] = result
+            _SESSION_FAILURES.pop(key, None)
+            job["result"] = result
+        return result
     except BaseException as exc:
+        if isinstance(exc, (SoundError, OSError, ValueError)):
+            with _CATALOG_LOCK:
+                _SESSION_FAILURES[key] = str(exc)
         job["error"] = exc
         raise
     finally:
         with _CATALOG_LOCK:
             _CATALOG_FLIGHTS.pop(key, None)
             job["done"].set()
+
+
+def scan_sound_project(project_root: str | Path, *, previous_assets: list[dict] | None = None,
+                       refresh: bool = True, profile: dict | None = None) -> SoundCatalog:
+    root = absolute_path(project_root)
+    if root.name.casefold() != "ai_ct_audio":
+        raise SoundError("SOUND_PROJECT_ROOT_UNAVAILABLE", "선택한 프로젝트의 Ai_Ct_audio 폴더를 확인하세요.")
+    base = _read_sound_folder(root, previous_assets or [], refresh)
+    result = SoundCatalog(dict(row) for row in base)
+    result.canonical_root = base.canonical_root
+    result.folders = list(base.folders)
+    result.warnings = list(base.warnings)
+    for site in (profile or {}).get("links", []):
+        prefix = "site:" + site["id"]
+        folder = Path(site["root"])
+        try:
+            inventory = _read_sound_folder(folder, [], refresh, root, site["id"])
+        except (SoundError, OSError, ValueError) as exc:
+            result.warnings.append(f"{site['label']} · {exc}")
+            with _CATALOG_LOCK:
+                inventory = _SESSION_CATALOGS.get((str(absolute_path(folder)).casefold(), site["id"]))
+            if inventory is None:
+                continue
+        if len(result) + len(inventory) > MAX_CATALOG_FILES:
+            raise SoundError("SOUND_CATALOG_LIMIT", "연결된 사운드 목록의 파일 수가 한도를 초과했습니다.")
+        result.warnings.extend(f"{site['label']} · {warning}" for warning in inventory.warnings)
+        result.folders.append(prefix)
+        result.folders.extend(prefix + "/" + item for item in inventory.folders)
+        uid = project_uid(base.canonical_root)
+        for row in inventory:
+            relative = prefix + "/" + row["relative_path"]
+            identity = hashlib.sha256((uid + "\n" + relative.casefold()).encode()).hexdigest()
+            result.append({**row, "relative_path": relative, "source_uid": "sound:" + identity})
+    return result
+
+
+def start_sound_catalog_warmup(stop: threading.Event, projects_root: str | Path = DEFAULT_PROJECTS_ROOT):
+    from _hmb_image_asset_sites import get_site_settings
+
+    def prepare():
+        try:
+            projects = discover_sound_projects(projects_root)
+        except SoundError as exc:
+            logging.getLogger(__name__).warning("Sound catalog discovery: %s", exc)
+            return
+        for project in projects:
+            if stop.is_set():
+                return
+            root = project["project_root"]
+            try:
+                scan_sound_project(root, refresh=False, profile=get_site_settings(root, "sound"))
+            except (SoundError, OSError, ValueError) as exc:
+                logging.getLogger(__name__).warning("Sound catalog warmup %s: %s", root, exc)
+
+    worker = threading.Thread(target=prepare, name="HMBSoundCatalogWarmup", daemon=True)
+    worker.start()
+    return worker
 
 
 def _scan_sound_inventory(root: Path, previous_assets: list[dict]) -> list[dict[str, Any]]:
@@ -248,6 +370,8 @@ def _scan_sound_inventory(root: Path, previous_assets: list[dict]) -> list[dict[
                         continue
                     path = Path(entry.path)
                     if stat.S_ISDIR(facts.st_mode):
+                        if entry.name.casefold() == ".json":
+                            continue
                         children.append(path)
                         folders.append(path.relative_to(root).as_posix())
                         continue
@@ -368,11 +492,28 @@ def normalize_sound_snapshot(value: Any) -> dict[str, Any]:
         raise SoundError("SOUND_TRACK_LIMIT", "선택한 사운드 트랙 수를 확인하세요.")
     output = []
     seen = set()
+    site_profile = None
     for row in tracks:
         if not isinstance(row, dict):
             raise SoundError("SOUND_SNAPSHOT_INVALID", "사운드 트랙 형식이 올바르지 않습니다.")
         relative = _text(row.get("relative_path"))
-        path = relative_audio_path(root, relative)
+        site = _SITE_PREFIX.match(relative)
+        if site:
+            # Detached links remain valid authoring data. Execution always
+            # resolves the current workstation's approved folder and hash.
+            _join_audio_path(root, relative[site.end():])
+            if site_profile is None:
+                from _hmb_image_asset_sites import get_site_settings
+                try:
+                    site_profile = get_site_settings(root, "sound")
+                except (OSError, ValueError):
+                    site_profile = {"links": []}
+            try:
+                path = relative_audio_path(root, relative, site_profile)
+            except SoundError:
+                path = ""
+        else:
+            path = relative_audio_path(root, relative)
         identity = "sound:" + hashlib.sha256((uid + "\n" + relative.casefold()).encode("utf-8")).hexdigest()
         signature = _text(row.get("media_signature"), 64)
         instance = _text(row.get("instance_id"), 128)
@@ -381,7 +522,7 @@ def normalize_sound_snapshot(value: Any) -> dict[str, Any]:
             raise SoundError("SOUND_SOURCE_IDENTITY_INVALID", "사운드 원본·인스턴스 식별자가 올바르지 않습니다.")
         if (row_channel and row_channel != channel) or bool(row_channel) != bool(shot):
             raise SoundError("SOUND_SHOT_MISMATCH", "사운드의 프로젝트·샷 연결이 일치하지 않습니다.")
-        if _text(row.get("path")) and absolute_path(row["path"]) != path:
+        if not site and _text(row.get("path")) and absolute_path(row["path"]) != path:
             raise SoundError("SOUND_SOURCE_OUTSIDE_PROJECT", "사운드 원본 경로가 프로젝트와 일치하지 않습니다.")
         role, purpose = row.get("role", "SFX"), row.get("purpose", "both")
         if role not in ROLES or purpose not in PURPOSES:

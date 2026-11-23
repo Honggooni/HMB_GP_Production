@@ -3,6 +3,24 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_ImageAsset_Site_Settings_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Asset_Multisite_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Project_Folder_Cards_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
       "name": "HMB_Update_Preflight_Guard_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",

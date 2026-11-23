@@ -239,8 +239,8 @@ assert.doesNotMatch(
 assert.match(assetSource, /asset\.source_kind !== "project"/, "The project asset grid must exclude external imports.");
 assert.match(assetSource, /isUserImportFolder\(folderPath\)/, "The project folder tree must hide the reserved import cache.");
 assert.doesNotMatch(assetSource, /root-load-bar|data-root-edit|data-root-path|data-root-browse/, "The removed Project Set/check/path bar must not return.");
-assert.match(assetSource, /data-project-set[^>]*>S<\/button>/, "The Project Set root-picker icon must remain available.");
-assert.match(assetSource, /data-project-set[\s\S]*?openNativeProjectRootPicker\(container\)/, "Project Set must still open the native project-root picker.");
+assert.match(assetSource, /data-project-set[^>]*>S<\/button>/, "The original S slot must remain available for project folders.");
+assert.match(assetSource, /on\(container\.querySelector\("\[data-project-set\]"\)[\s\S]*?openProjectFolderCards\(container,live/, "The former Project Set slot must open the linked folder cards.");
 assert.doesNotMatch(assetSource, /project_set_request/, "Project Set root selection must not trigger default-folder creation.");
 assert.match(assetSource, /data-project-reload[^>]*aria-label="\$\{escapeHtml\(imageAssetText\(state, "reload_projects"\)\)\}"/, "Project reload must use a localized accessible icon button.");
 assert.match(assetSource, /<select data-project-select(?:\s[^>]*)?>[\s\S]*?<button type="button" class="language-button" data-language-toggle/, "The ImageAsset Korean/EN toggle must sit directly after the project selector even while asynchronous loading disables the selector.");
@@ -293,7 +293,7 @@ assert.match(assetSource, /data-registration-field="asset_id"/, "The Add passpor
 assert.match(assetSource, /function assetCardThumbnailImageMarkup\(asset\)[\s\S]*?class="asset-thumb-placeholder"[\s\S]*?class="asset-thumb-media">\$\{assetCardThumbnailImageMarkup\(asset\)\}\$\{add\}<\/div>[\s\S]*?class="asset-thumb-footer"><span class="asset-source-name"/, "Every asset card must use an image-or-neutral-placeholder media area and show only the source name in its footer.");
 assert.doesNotMatch(assetSource.match(/function assetThumbnailHtml\(asset, state\)[\s\S]*?\n\}/)?.[0] || "", /thumbnailImageMarkup\(asset\)/, "Asset-card fallback media must never expose extension text.");
 const assetThumbnailSource = assetSource.match(/function assetThumbnailHtml\([\s\S]*?\n\}/)?.[0] || "";
-assert.match(assetThumbnailSource, /const add = hmbImageAssetCanRegister\(asset\)[\s\S]*?data-asset-add[\s\S]*?: ""/, "Only unregistered registerable media may expose Add.");
+assert.match(assetThumbnailSource, /const add = hmbImageAssetCanRegister\(asset, state\)[\s\S]*?data-asset-add[\s\S]*?: ""/, "Only unregistered registerable media may expose Add.");
 assert.doesNotMatch(assetThumbnailSource, /✎|edit_image_asset/, "Registered asset editing must not remain reachable from the thumbnail.");
 assert.doesNotMatch(assetSource, /class="asset-format"/, "Thumbnail footers must no longer spend their label on the file extension.");
 assert.match(assetSource, /class="asset-title"[\s\S]*?class="asset-extension-badge"/, "Detail content must place the extension badge at the title's top-right edge.");
@@ -306,9 +306,9 @@ assert.match(registrationFolderOptionsSource, /state\.folders[\s\S]*?!isUserImpo
 assert.doesNotMatch(registrationFolderOptionsSource, /ROOT_FOLDER_KEY|project_root/, "Add must never offer the already-selected project root as a destination folder.");
 assert.match(assetSource, /source_kind: draft\.source_kind[\s\S]*?source_uid: draft\.source_uid[\s\S]*?target_folder:/, "External registration requests must carry trusted source identity and the selected destination folder.");
 assert.match(assetSource, /asset_registration_request/, "The registration dialog must submit a one-shot backend request.");
-assert.match(assetSource, /export function hmbImageAssetCanRegister\(asset\)[\s\S]*?asset\.registered[\s\S]*?source_kind[\s\S]*?import_index/, "One central contract must allow Add only for unregistered project media or live external imports.");
-assert.match(assetSource, /if \(!hmbImageAssetCanRegister\(asset\)\) return null;/, "Registered assets must not create a registration draft.");
-assert.match(assetSource, /!asset[\s\S]*?\|\| !hmbImageAssetCanRegister\(asset\)[\s\S]*?\) return "";/, "The registration passport must render only for Add candidates.");
+assert.match(assetSource, /export function hmbImageAssetCanRegister\(asset, state\)[\s\S]*?asset\.registered[\s\S]*?source_kind[\s\S]*?import_index/, "One central contract must allow Add only for unregistered project media or live external imports.");
+assert.match(assetSource, /if \(!hmbImageAssetCanRegister\(asset, state\)\) return null;/, "Registered assets must not create a registration draft.");
+assert.match(assetSource, /!asset[\s\S]*?\|\| !hmbImageAssetCanRegister\(asset, state\)[\s\S]*?\) return "";/, "The registration passport must render only for Add candidates.");
 const promptSubtypeControlSource = promptSource.match(
   /function renderSubtypeControls\(item, state\)[\s\S]*?\n\}/,
 )?.[0] || "";
