@@ -425,7 +425,9 @@ def main():
         harness.PRODUCTS = (*[f"{name}.py" for name in NODE_MODULES.values()],
                             "_hmb_shot_basket.py", "_hmb_shot_routing.py", "_hmb_library_bootstrap.py",
                             "_hmb_workflow_migration.py")
-        harness.run_phase(args.phase, out)
+        expected = ("native_workflow_saved_without_executing_the_graph" if args.phase == "save"
+                    else "cold_native_open_retains_shot_media_order_nodes_and_routes")
+        harness.run_phase(args.phase, out, expected_cases=(expected,))
         return
     out.mkdir(parents=True, exist_ok=False)
     for phase in ("save", "reopen"):

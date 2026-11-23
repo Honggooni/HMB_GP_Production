@@ -2406,6 +2406,66 @@ function hmbApplyVideoAssetSelection(state, orderedUids, requestedPreviewUid = "
   };
 }
 
+// This editor-only notification carries names and source IDs. Executable media
+// still comes exclusively from the SDK's verified VIDEO_OUT / Shot snapshot.
+export function hmbPreviewPickerShotSelections(container, next, rollbackState = null) {
+  const view = container.ownerDocument?.defaultView;
+  const publisher = hmbUuid(next?.picker_publisher_instance_uuid);
+  const channel = hmbUuid(next?.channel_uuid);
+  if (!view?.CustomEvent || !publisher) return;
+  const eventName = "hmb-shot-media-selection-preview-v1";
+  const scope = publisher + "/" + channel;
+  if (container.__hmbPickerSelectionPreview?.scope !== scope) {
+    container.__hmbPickerSelectionPreview = { scope, shots: new Map() };
+  }
+  const previous = container.__hmbPickerSelectionPreview.shots;
+  const workspace = next.picker_shots || [];
+  const shots = channel ? workspace.filter(row => hmbUuid(row.bound_shot_uuid)).map(row =>
+    ({ row, key: row.bound_shot_uuid, shotId: row.bound_shot_uuid, channel, direct: false })) : [];
+  const active = workspace.find(row => row.workspace_uuid === next.active_picker_shot_uuid);
+  if (active) shots.push({row: active, key: "direct", shotId: active.workspace_uuid, channel: publisher, direct: true});
+  const activeKeys = new Set(shots.map(item => item.key));
+  for (const key of previous.keys()) if (!activeKeys.has(key)) previous.delete(key);
+  const nextRevision = () => {
+    const revision = Math.max(Math.floor((view.performance.timeOrigin + view.performance.now()) * 1000),
+      (container.__hmbPickerSelectionPreviewRevision || 0) + 1);
+    container.__hmbPickerSelectionPreviewRevision = revision;
+    return revision;
+  };
+  let byUid;
+  for (const {row: shot, key, shotId, channel: previewChannel, direct} of shots) {
+    const uids = shot.selected_video_uids || [];
+    const identity = JSON.stringify([shotId, uids]);
+    const rowRevision = Number(shot.revision) || 0;
+    const previousShot = previous.get(key);
+    if (rollbackState) {
+      const restored = (rollbackState.picker_shots || []).find(row => direct
+        ? row.workspace_uuid === rollbackState.active_picker_shot_uuid : row.bound_shot_uuid === shotId);
+      if (restored && JSON.stringify([direct ? restored.workspace_uuid : restored.bound_shot_uuid,
+        restored.selected_video_uids || []]) === identity) continue;
+      if (!previousShot || previousShot.identity !== identity || previousShot.rowRevision !== rowRevision) continue;
+      container.dispatchEvent(new view.CustomEvent(eventName, { bubbles: true, composed: true,
+        detail: { ...previousShot.detail, revision: nextRevision(), cancelled: true } }));
+      previous.delete(key);
+      continue;
+    }
+    if (previousShot?.detail.shot_uuid === shotId && rowRevision < previousShot.rowRevision) continue;
+    if (previousShot?.identity === identity) {
+      previousShot.rowRevision = rowRevision;
+      continue;
+    }
+    if (!byUid) byUid = new Map((next.videos || []).map((item, index) =>
+      [hmbVideoAssetUid(item, index), hmbVideoAssetTitle(item, index)]));
+    if (uids.some(uid => !byUid.has(uid))) continue;
+    const rows = uids.map(source_uid => ({ source_uid, label: byUid.get(source_uid) }));
+    const detail = { schema: eventName, kind: "picker", publisher_instance_uuid: publisher,
+      channel_uuid: previewChannel, shot_uuid: shotId, revision: nextRevision(), rows };
+    if (direct) detail.scope = "direct";
+    previous.set(key, { identity, rowRevision, detail });
+    container.dispatchEvent(new view.CustomEvent(eventName, { detail, bubbles: true, composed: true }));
+  }
+}
+
 export function hmbToggleVideoAssetSelection(state, uid) {
   const targetUid = clean(uid);
   if (!targetUid) return { ...state };
@@ -13789,6 +13849,7 @@ function hmbNativeUiImplementation(container, props) {
             && !container.__hmbPickerPaintFirstState) delete container.__hmbPickerOutlinerDraft;
         const rollbackState = previousPendingState || previousAuthoritativeState || state;
         const resolvedRollbackState = hmbPickerStateRollbackFallback(container, normalized);
+        hmbPreviewPickerShotSelections(container, normalized, resolvedRollbackState || rollbackState);
         const visiblePublicationError = container.__hmbVisiblePickerStatePublicationError;
         applyImmediateCommandUi(resolvedRollbackState || rollbackState);
         const visibleOutliner = container.__hmbPickerPaintFirstState || resolvedRollbackState || rollbackState;
@@ -13863,6 +13924,7 @@ function hmbNativeUiImplementation(container, props) {
       );
       if (!publication.delivered) return { state: normalized, delivered: false, deliveryPromise: null };
       const deliveryResult = publication.result;
+      hmbPreviewPickerShotSelections(container, normalized);
       delivered = publication.delivered;
       if (deliveryResult && typeof deliveryResult.then === "function") {
         deliveryPromise = Promise.resolve(deliveryResult)
@@ -14295,6 +14357,7 @@ function hmbNativeUiImplementation(container, props) {
     options = {},
     deferredVisualUpdate = null,
   ) => {
+    hmbPreviewPickerShotSelections(container, nextState);
     hmbRememberPickerInteractionDraft(container, nextState, container.__hmbPickerPaintFirstState || container.__hmbPendingPickerState || state);
     container.__hmbPickerPaintFirstState = nextState;
     container.__hmbPickerPaintFirstPublication = { options, deferredVisualUpdate };
@@ -14627,6 +14690,7 @@ function hmbNativeUiImplementation(container, props) {
     const liveExpanded = container.__hmbVideoPickerExpanded === true;
     props = nextProps || {};
     state = nextState;
+    hmbPreviewPickerShotSelections(container, nextState);
     container.__hmbAuthoritativePickerState = normalize(nextState);
     if (
       nextState.state_writer === "python"

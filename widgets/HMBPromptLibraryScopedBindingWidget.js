@@ -6411,6 +6411,7 @@ export function hmbPromptPaletteShotNumber(state) {
 
 export function hmbApplyPromptShotFeedback(container, state) {
   if (!container || !state) return false;
+  container.__hmbSyncMediaPreview?.();
   const selectorPatched = hmbPatchPromptShotSelector(container, state);
   const dashboard = container.querySelector?.(".hmb-dashboard");
   dashboard?.setAttribute?.(
@@ -6813,6 +6814,7 @@ function render(state, includeStyle = true) {
     .video-color-pick-wrap{display:block}.color-binding-entry{display:grid;grid-template-columns:2rem minmax(0,1fr);gap:4px;align-items:start}
     .topbar-controls .language-button{min-width:58px;height:28px;padding:0 11px;border:1px solid rgba(148,163,184,.24);border-radius:8px;background:#090d16;color:#e2e8f0;font-size:11px;font-weight:800;cursor:pointer}.topbar-controls .language-button:hover,.topbar-controls .language-button:focus-visible{border-color:var(--hmb-shot-accent);color:var(--hmb-shot-soft);outline:none;box-shadow:0 0 0 1px var(--hmb-shot-accent),0 0 12px var(--hmb-shot-glow)}.shot-selector-shell{flex:0 1 290px;width:290px;max-width:290px;height:30px;display:flex;align-items:center;gap:6px;padding:3px 7px;border:1px solid var(--hmb-shot-line);border-radius:8px;background:linear-gradient(180deg,rgba(var(--hmb-shot-rgb),.24),rgba(15,23,42,.88));box-shadow:0 0 12px var(--hmb-shot-glow)}.shot-selector-shell>span,.shot-selector-shell>i{flex:0 0 auto;color:var(--hmb-shot-soft);font-size:8px;font-style:normal;font-weight:900;letter-spacing:.08em}.shot-selector-shell>i{color:var(--hmb-shot-accent)}.shot-selector{flex:1 1 auto;width:100%;height:22px;padding:0 7px;border:0;border-radius:5px;background:#07101f;color:#dbeafe;font-size:10px;font-weight:800;outline:none}.shot-selector:focus-visible{box-shadow:0 0 0 1px var(--hmb-shot-accent),0 0 10px var(--hmb-shot-glow)}.shot-selector:disabled{opacity:.72}
     .source-row{transition:none}
+    [data-hmb-selection-preview]{margin-left:12px;color:var(--hmb-shot-accent);font-size:11px;font-weight:600}
     .frame-binding-row{grid-column:1/-1;display:grid;grid-template-columns:3.55rem minmax(0,.78fr) minmax(0,.95fr) minmax(0,.82fr) minmax(0,.82fr) minmax(0,.92fr) 3.6rem;gap:8px;align-items:center;min-height:36px;margin-top:-2px}.frame-range-toggle-wrap{grid-column:1;position:relative;display:flex;align-items:center;min-width:0;color:#cbd5e1;font-size:8px;font-weight:800;line-height:1;cursor:pointer}.frame-range-toggle{position:absolute;inset:0;inline-size:100%;block-size:100%;margin:0;opacity:0;pointer-events:auto;cursor:pointer;z-index:2}.frame-range-toggle-ui{width:100%;min-width:52px;height:24px;display:inline-flex;align-items:center;justify-content:space-between;gap:3px;padding:0 5px;border:1px solid rgba(148,163,184,.28);border-radius:7px;background:#090d16;color:#94a3b8;white-space:nowrap;overflow:hidden}.frame-range-toggle:hover+.frame-range-toggle-ui,.frame-range-toggle:focus-visible+.frame-range-toggle-ui{border-color:rgba(34,211,238,.62);color:#cbd5e1;box-shadow:0 0 0 1px rgba(34,211,238,.2)}.frame-range-toggle-ui b,.frame-range-toggle-ui em{font-size:7px;font-style:normal;font-weight:900;letter-spacing:.02em}.frame-range-toggle-ui em{min-width:17px;text-align:center;color:#64748b}.frame-range-toggle:checked+.frame-range-toggle-ui{border-color:rgba(34,211,238,.52);background:rgba(8,145,178,.18);color:#e0f2fe}.frame-range-toggle:checked+.frame-range-toggle-ui em{color:#67e8f9}.frame-range-toggle:disabled+.frame-range-toggle-ui{opacity:.42;cursor:not-allowed}.frame-track-shell{grid-column:2/5;display:grid;grid-template-columns:3.25rem minmax(0,1fr) 3.25rem;align-items:center;gap:5px;min-width:0}.frame-track-stage{position:relative;min-width:0}.frame-domain-number{width:100%;height:26px;border:1px solid rgba(148,163,184,.28);border-radius:7px;background:#090d16;color:#e2e8f0;padding:2px 4px;font-size:9px;font-weight:800;font-variant-numeric:tabular-nums;text-align:center;outline:none}.frame-domain-number:focus{border-color:#22d3ee;box-shadow:0 0 0 1px rgba(34,211,238,.3)}.frame-domain-number[readonly]{border-color:rgba(34,211,238,.25);background:rgba(8,47,73,.18);color:#bae6fd;cursor:default}.frame-domain-number.is-hidden{visibility:hidden;pointer-events:none}.frame-track{position:relative;height:26px;border:1px solid rgba(148,163,184,.26);border-radius:7px;background:#070d17;overflow:hidden;touch-action:none;user-select:none}.frame-track.editable{cursor:crosshair;border-color:rgba(34,211,238,.42)}.frame-track:focus{outline:1px solid #22d3ee;outline-offset:1px}.frame-track-grid{position:absolute;inset:0;background:repeating-linear-gradient(90deg,transparent 0,transparent calc(10% - 1px),rgba(148,163,184,.09) calc(10% - 1px),rgba(148,163,184,.09) 10%)}.frame-track>em{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#718096;font-size:8px;font-style:normal;font-weight:800;letter-spacing:.05em;pointer-events:none}.frame-binding-row.enabled .frame-track>em{justify-content:flex-end;padding-right:7px;color:#fbbf24}.frame-binding-row.invalid .frame-track{border-color:rgba(248,113,113,.65)}.frame-binding-row.invalid .frame-track>em{color:#fca5a5}.frame-range-bar{position:absolute;z-index:2;top:3px;height:18px;min-width:2px;border:1px solid #22d3ee;border-radius:5px;background:linear-gradient(180deg,rgba(34,211,238,.78),rgba(8,145,178,.72));cursor:grab;overflow:visible}.frame-range-bar.selected{border-color:#f8fafc;box-shadow:0 0 0 1px rgba(34,211,238,.85),0 0 8px rgba(34,211,238,.5)}.frame-range-bar>b{display:block;padding:1px 8px;color:#fff;font-size:8px;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}.frame-range-handle{position:absolute;z-index:3;top:-1px;bottom:-1px;width:7px;background:rgba(255,255,255,.45);cursor:ew-resize}.frame-range-handle.left{left:-1px;border-radius:5px 0 0 5px}.frame-range-handle.right{right:-1px;border-radius:0 5px 5px 0}.frame-binding-row.disabled .frame-track{opacity:.72}.frame-binding-row.disabled .frame-range-bar{filter:saturate(.35)}.frame-custom-scope{grid-column:5;display:flex;flex-direction:column;gap:4px;min-width:0}.frame-custom-scope:empty{min-height:1px}.frame-binding-context{grid-column:6;display:flex;align-items:center;gap:5px;min-width:0;color:#94a3b8;font-size:8px;white-space:nowrap;overflow:hidden}.frame-binding-context b,.frame-binding-context span{overflow:hidden;text-overflow:ellipsis}.frame-binding-context.error{color:#fca5a5}.frame-range-editor{position:absolute;z-index:30;left:50%;top:30px;transform:translateX(-50%);display:flex;align-items:center;gap:5px;padding:5px;border:1px solid rgba(34,211,238,.52);border-radius:7px;background:#07111b;box-shadow:0 8px 18px rgba(0,0,0,.55)}.frame-range-editor label{display:flex;align-items:center;gap:3px;color:#cbd5e1;font-size:8px;font-weight:800}.frame-range-number{width:58px;height:24px;border:1px solid rgba(148,163,184,.28);border-radius:5px;background:#090d16;color:#fff;padding:2px 4px;font-size:9px}.frame-range-delete{width:24px;height:24px;border:1px solid rgba(248,113,113,.45);border-radius:5px;background:#3f1720;color:#fecaca;cursor:pointer}
     .image-drag-handle{padding:5px 4px;border:1px solid transparent;border-radius:7px;cursor:grab;user-select:none;-webkit-user-select:none;touch-action:none}
     .image-drag-handle:hover{border-color:rgba(103,232,249,.5);background:rgba(34,211,238,.08)}
@@ -8564,6 +8566,7 @@ function hmbNativeUiImplementation(container, props) {
     hmbSyncPromptNativeHeaderSurface(container);
   };
   container.addEventListener?.("hmb-color-lut-header-state", nativeHeaderState);
+  let directSources = props.ui_options?.media_preview_sources;
   let state = hmbMergeStoredGroupHeights(container, parseValue(props.value));
   state.disabled = Boolean(props.disabled);
   hmbRememberPromptRevisionState(container, state, state.disabled, false);
@@ -8574,6 +8577,96 @@ function hmbNativeUiImplementation(container, props) {
   const sharedControls = new WeakSet();
   const controlValues = new WeakMap();
   let sharedListenersInstalled = false;
+  // A source can paint its selection while the SDK verifies media. Keep hints
+  // outside authoring, saved Shot documents, and all model-ready parameters.
+  const pendingMedia = new Map();
+  const hasMediaEdge = (source, output, input) => {
+    const graph = container.closest?.(".react-flow");
+    const from = source?.closest?.(".react-flow__node")?.getAttribute("data-id");
+    const to = container.closest?.(".react-flow__node")?.getAttribute("data-id");
+    if (!graph || !from || !to || source.closest(".react-flow") !== graph) return false;
+    const prefix = from + "-" + output + "-" + to + "-" + input + "-";
+    const xyEdge = "xy-edge__" + from + output + "-" + to + input;
+    for (const edge of graph.querySelectorAll(".react-flow__edge[data-id][aria-label]")) {
+      const id = edge.getAttribute("data-id");
+      if (edge.getAttribute("aria-label") === "Edge from " + from + " to " + to
+        && ((id.startsWith(prefix) && id.length > prefix.length) || id === xyEdge)) return true;
+    }
+    return false;
+  };
+  const sameShot = detail => {
+    if (state.manual_rebind?.required) return false;
+    const image = detail.kind === "image_asset";
+    if (detail.scope === "direct") {
+      if (!detail.publisher_instance_uuid || detail.channel_uuid !== detail.publisher_instance_uuid
+        || (image && state.shot?.channel_uuid && state.shot.shot_uuid)
+        || (!image && state.picker?.shot_routing?.publisher_instance_uuid)) return false;
+      if (directSources?.[detail.kind]) return directSources[detail.kind] === detail.publisher_instance_uuid;
+      return hasMediaEdge(detail.source, image ? "IMAGE_ASSET_OUT" : "PICKER_OUT", image ? "IMAGE_ASSET_IN" : "PICKER_IN");
+    }
+    const routing = state[detail.kind]?.shot_routing;
+    if (!detail.shot_uuid || !detail.channel_uuid || state.shot?.channel_uuid !== detail.channel_uuid
+      || state.shot.shot_uuid !== detail.shot_uuid) return false;
+    if (routing?.publisher_instance_uuid) return routing.generation > 0
+      && routing.publisher_instance_uuid === detail.publisher_instance_uuid && routing.channel_uuid === detail.channel_uuid;
+    return hasMediaEdge(detail.source, image ? "SHOT_ASSET_OUT" : "SHOT_PICKER_OUT", image ? "SHOT_ASSET_IN" : "SHOT_PICKER_IN")
+      || (image && hasMediaEdge(detail.source, "IMAGE_ASSET_OUT", "IMAGE_ASSET_IN"));
+  };
+  const syncMediaPreview = () => {
+    for (const [kind, preview] of pendingMedia) {
+      const image = kind === "image_asset";
+      const heading = container.querySelector(image ? ".image-card h3" : ".video-card h3");
+      if (!sameShot(preview)) { preview.hint?.remove(); clearTimeout(preview.timer); pendingMedia.delete(kind); continue; }
+      const ready = image ? state.image_asset.ordered_source_uids : state.picker.ordered_video_uids;
+      if (preview.cancelled || (ready.length === preview.rows.length &&
+        ready.every((uid, index) => uid === preview.rows[index].source_uid))) {
+        preview.hint?.remove();
+        clearTimeout(preview.timer);
+        preview.cancelled = true;
+        continue;
+      }
+      if (!heading) continue;
+      const hint = preview.hint || container.ownerDocument.createElement("span");
+      if (!preview.hint) {
+        preview.hint = hint;
+        hint.setAttribute("data-hmb-selection-preview", kind);
+        hint.setAttribute("role", "status");
+      }
+      if (hint.parentNode !== heading) heading.append(hint);
+      const ko = uiLanguage(state) === "ko";
+      const labels = preview.rows.map(row => row.label).join(" · ") || (ko ? "선택 없음" : "No selection");
+      const text = (ko ? "선택 반영 중  " : "Updating selection  ") + labels;
+      if (hint.textContent !== text) { hint.textContent = text; hint.title = text; }
+    }
+  };
+  container.__hmbSyncMediaPreview = syncMediaPreview;
+  const receiveMediaPreview = event => {
+    const detail = event.detail;
+    if (detail?.schema !== "hmb-shot-media-selection-preview-v1"
+        || !["image_asset", "picker"].includes(detail.kind) || !sameShot({...detail, source:event.target})
+        || event.target?.ownerDocument !== container.ownerDocument
+        || event.target.closest?.(".react-flow") !== container.closest?.(".react-flow")
+        || !Number.isSafeInteger(detail.revision) || detail.revision <= 0 || !Array.isArray(detail.rows)
+        || detail.rows.length > (detail.kind === "image_asset" ? MAX_IMAGES : MAX_VIDEOS)) return;
+    const previous = pendingMedia.get(detail.kind);
+    if (previous?.source === event.target && sameShot(previous) && previous.revision >= detail.revision) return;
+    const rows = detail.rows.map(row => ({source_uid:clean(row?.source_uid), label:clean(row?.label).slice(0,256)}));
+    if (rows.some(row => !row.source_uid || !row.label) || new Set(rows.map(row => row.source_uid)).size !== rows.length) return;
+    clearTimeout(previous?.timer);
+    const preview = {kind:detail.kind, scope:detail.scope, publisher_instance_uuid:detail.publisher_instance_uuid,
+      channel_uuid:detail.channel_uuid, shot_uuid:detail.shot_uuid, revision:detail.revision,
+      rows, source:event.target, hint:previous?.hint, cancelled:detail.cancelled === true};
+    pendingMedia.set(detail.kind, preview);
+    // Unmounts normally send a cancellation. A lost renderer may not, while
+    // a healthy renderer reading a slow share can legitimately take minutes.
+    const checkOwner = () => {
+      if (pendingMedia.get(detail.kind) !== preview || preview.cancelled) return;
+      if (!preview.source.isConnected || !sameShot(preview)) { preview.cancelled = true; syncMediaPreview(); }
+      else preview.timer = setTimeout(checkOwner, 30000);
+    };
+    preview.timer = setTimeout(checkOwner, 30000);
+    syncMediaPreview();
+  };
   let preparingViews = false;
   let targetOptionWarmup = null;
   const pendingTargetSelector = "select[data-hmb-target-options-pending]";
@@ -8652,6 +8745,8 @@ function hmbNativeUiImplementation(container, props) {
     preparedViews.delete(key);
     section.appendChild(entry.editor);
     listeners = entry.listeners;
+    // Retained editors keep their DOM, including a hint from the previous Shot.
+    syncMediaPreview();
     for (const tab of container.querySelectorAll('[data-prompt-shot]')) {
       const active = tab.getAttribute('data-prompt-shot') === key;
       tab.classList.toggle('active', active);
@@ -8734,6 +8829,7 @@ function hmbNativeUiImplementation(container, props) {
       && (!activeText || !container.contains?.(activeText))
     ) hmbReleasePromptCompositionLatch(container);
     hmbSyncAllSourceRowActivation(container);
+    syncMediaPreview();
     hmbFitGroupHeightsToCenter(container, state, measuredHosts);
     hmbInstallPromptInteractionIsolation(container, listeners, !sharedListenersInstalled);
     hmbInstallSourceScrollPositionLock(container, listeners);
@@ -8808,6 +8904,8 @@ function hmbNativeUiImplementation(container, props) {
       };
       window.addEventListener("hmb-shot-routing-catalog-v1", shotCatalogHandler);
       listeners.push([window, "hmb-shot-routing-catalog-v1", shotCatalogHandler]);
+      window.addEventListener("hmb-shot-media-selection-preview-v1", receiveMediaPreview);
+      listeners.push([window, "hmb-shot-media-selection-preview-v1", receiveMediaPreview]);
       const discover = () => {
         try {
           window.dispatchEvent(new CustomEvent("hmb-shot-routing-discover-v1", {
@@ -9803,6 +9901,11 @@ function hmbNativeUiImplementation(container, props) {
     }
   };
   const applyProps = (nextProps = {}) => {
+    const nextSources = nextProps.ui_options?.media_preview_sources;
+    if (directSources?.image_asset !== nextSources?.image_asset || directSources?.picker !== nextSources?.picker) {
+      directSources = nextSources;
+      syncMediaPreview();
+    }
     if (container.__hmbPromptPreviousPublisher) {
       const routing = hmbPromptPropsRouting(nextProps.value);
       if (routing?.channel_uuid && routing.publisher_instance_uuid
@@ -9846,6 +9949,9 @@ function hmbNativeUiImplementation(container, props) {
   const cleanup = () => {
     hmbAnnouncePromptNativeHeader(container, "retire");
     disposeLifecycle();
+    delete container.__hmbSyncMediaPreview;
+    for (const preview of pendingMedia.values()) { clearTimeout(preview.timer); preview.hint?.remove(); }
+    pendingMedia.clear();
     container.removeEventListener?.("hmb-color-lut-header-state", nativeHeaderState);
     delete container.__hmbPromptShotPointerFocus;
     delete container.__hmbPromptShotInteractionStates;

@@ -6,7 +6,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 
-const source = fs.readFileSync(new URL('../../widgets/HMBVideoPickerLibraryWidget_v032.js', import.meta.url), 'utf8');
+const source = fs.readFileSync(process.env.HMB_PICKER_TEST_ROOT
+  ? path.join(process.env.HMB_PICKER_TEST_ROOT,'widgets/HMBVideoPickerLibraryWidget_v032.js')
+  : new URL('../../widgets/HMBVideoPickerLibraryWidget_v032.js', import.meta.url), 'utf8');
+const promptSource = fs.readFileSync(process.env.HMB_PROMPT_TEST_ROOT || process.env.HMB_PICKER_TEST_ROOT
+  ? path.join(process.env.HMB_PROMPT_TEST_ROOT || process.env.HMB_PICKER_TEST_ROOT,'widgets/HMBPromptLibraryScopedBindingWidget.js')
+  : new URL('../../widgets/HMBPromptLibraryScopedBindingWidget.js', import.meta.url), 'utf8');
 const require = createRequire(import.meta.url);
 let playwright;
 try { playwright = require('playwright'); }
@@ -67,7 +72,10 @@ window.observeViewport=()=>{
 };
 window.ready=true;
 </script>`;
-const server = http.createServer((req,res)=>{res.setHeader('Content-Type',req.url==='/widget.js'?'text/javascript; charset=utf-8':'text/html; charset=utf-8');res.end(req.url==='/widget.js'?source:html);});
+const server = http.createServer((req,res)=>{
+  const js = req.url === '/widget.js' ? source : req.url === '/prompt.js' ? promptSource : '';
+  res.setHeader('Content-Type',js?'text/javascript; charset=utf-8':'text/html; charset=utf-8');res.end(js || html);
+});
 await listenBrowserSafeLoopback(server);
 const shots = ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb','cccccccc-cccc-4ccc-8ccc-cccccccccccc','dddddddd-dddd-4ddd-8ddd-dddddddddddd','eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'];
 const fixture = (media=false) => ({
@@ -75,6 +83,7 @@ const fixture = (media=false) => ({
   scene_path:'C:/scene.mb',scene_request_path:'C:/scene.mb',native_read_ready:true,
   scene_stage:'OUTLINER_READY',status:'OUTLINER_READY',active_slot_count:1,
   shot_publisher_instance_uuid:'11111111-1111-4111-8111-111111111111',
+  picker_publisher_instance_uuid:'99999999-9999-4999-8999-999999999999',
   channel_uuid:'22222222-2222-4222-8222-222222222222',
   shot_uuid:shots[2],shot_number:3,shot_name:'Shot 3',active_picker_shot_uuid:shots[2],
   shot_selections:shots.map((uid,i)=>({shot_uuid:uid,number:i+1,name:'Shot '+(i+1),revision:1})),
@@ -165,6 +174,154 @@ try {
       assert.equal(change.value||'',expected||'',`${label}: transient ${change.name} changed to ${change.value}`);
     }
   };
+  await check('Picker selection preview precedes a held transport and ignores superseded replies',async()=>{
+    const timings = await page.evaluate(() => {
+      window.hold = true;
+      window.previewLog = [];
+      window.listenPreview = event => {
+        if (event.detail.scope !== 'direct' && event.detail.shot_uuid === window.live().shot_uuid) {
+          window.previewLog.push({ ms: performance.now(), ...event.detail, source: event.target === window.host });
+        }
+      };
+      window.addEventListener('hmb-shot-media-selection-preview-v1', window.listenPreview);
+      const target = window.host.querySelector('[data-toggle-video-uid="s3-b"]');
+      const start = performance.now();
+      target.click();
+      const selected = window.previewLog.at(-1);
+      target.click();
+      const dropped = window.previewLog.at(-1);
+      return { elapsed: selected?.ms - start, selected, dropped };
+    });
+    assert.deepEqual(timings.selected?.rows.map(row => row.source_uid), ['s3-a', 's3-b']);
+    assert.deepEqual(timings.dropped?.rows.map(row => row.source_uid), ['s3-a']);
+    assert.equal(timings.selected.rows[1].label, 'Shot 3 b');
+    assert.ok(timings.selected.source && timings.dropped.revision > timings.selected.revision);
+    await page.waitForFunction(() => typeof window.heldReject === 'function');
+    const revisions = await page.evaluate(() => {
+      window.oldEcho(window.baseline);
+      window.hold = false;
+      window.heldReject(new Error('Cancelled fixture transport'));
+      return window.previewLog.filter(row => !row.cancelled).map(row => row.revision);
+    });
+    assert.deepEqual(revisions, [timings.selected.revision, timings.dropped.revision]);
+    console.log('Picker click to authored selection event (ms): '+timings.elapsed.toFixed(2));
+  },true);
+  await check('A rejected Picker write cancels precisely its preview',async()=>{
+    await page.evaluate(() => {
+      window.hold = true;
+      delete window.heldReject;
+      window.previewLog = [];
+      window.host.querySelector('[data-toggle-video-uid="s3-b"]').click();
+    });
+    await page.waitForFunction(() => window.publications.length && window.heldReject);
+    await page.evaluate(() => {
+      window.hold = false;
+      window.heldReject(new Error('Rejected fixture selection'));
+    });
+    await page.waitForFunction(() => window.previewLog.some(row => row.cancelled));
+    const rows = await page.evaluate(() => window.previewLog);
+    const latest = rows.at(-1);
+    assert.equal(latest.source, true);
+    assert.equal(latest.cancelled, true);
+    assert.ok(latest.revision > rows.find(row => !row.cancelled).revision);
+    await page.evaluate(() => window.removeEventListener('hmb-shot-media-selection-preview-v1', window.listenPreview));
+  },true);
+  await check('Bound Prompt paints the selected Shot and never paints the neighbour',async()=>{
+    const result = await page.evaluate(async () => {
+      const {default:mountPrompt}=await import('/prompt.js');
+      const source=window.live();
+      const graph=document.createElement('div');graph.className='react-flow';
+      window.host.before(graph);graph.append(window.host);
+      const mounted = shot => {
+        const host=document.createElement('div');graph.append(host);
+        const binding={channel_uuid:source.channel_uuid,shot_uuid:shot};
+        const uid=source.picker_shots.find(row=>row.bound_shot_uuid===shot).selected_video_uids[0];
+        const state={shot:binding,multi_shot_enabled:true,videos:[{video_uid:uid,source_uid:uid,present:true,label:uid}],
+          picker:{enabled:true,ordered_video_uids:[uid],shot_routing:{publisher_instance_uuid:source.picker_publisher_instance_uuid,
+            channel_uuid:source.channel_uuid,generation:1}},source_sync_revision:1};
+        const ctr=mountPrompt(host,{value:JSON.stringify(state),onChange:()=>{}});
+        return {host,ctr};
+      };
+      const current=mounted(source.shot_uuid), other=mounted(source.picker_shots[0].bound_shot_uuid);
+      const hint=widget=>widget.host.querySelector('[data-hmb-selection-preview="picker"]')?.textContent||'';
+      const started=performance.now();
+      const card=window.host.querySelector('[data-toggle-video-uid="s3-b"]');
+      card.click();
+      const elapsed=performance.now()-started, selected=hint(current), neighbour=hint(other);
+      card.click();const removed=hint(current);
+      current.ctr.cleanup();other.ctr.cleanup();graph.before(window.host);graph.remove();
+      return {elapsed,selected,neighbour,removed};
+    });
+    assert.match(result.selected,/Shot 3 a.*Shot 3 b/);
+    assert.equal(result.neighbour,'');
+    assert.equal(result.removed,'');
+    console.log('Bound click to matching Prompt DOM (ms): '+result.elapsed.toFixed(2));
+  },true);
+  const only = fixture(true);
+  only.channel_uuid = only.shot_uuid = only.shot_publisher_instance_uuid = '';
+  only.shot_selections = [];
+  only.picker_shots = [only.picker_shots[0]];
+  only.picker_shots[0].bound_shot_uuid = '';
+  only.active_picker_shot_uuid = only.picker_shots[0].workspace_uuid;
+  only.videos = only.videos.slice(0,2);
+  await check('Only preview precedes a one-second host delay and reports the exact direct source',async()=>{
+    const data = await page.evaluate(async () => {
+      const {default:mountPrompt} = await import('/prompt.js');
+      const graph=document.createElement('div');graph.className='react-flow';
+      const layer=document.createElement('div');layer.className='react-flow__edges';
+      window.host.before(graph);graph.append(layer);
+      const shell = name => { const node=document.createElement('div');node.className='react-flow__node';
+        node.dataset.id=name;graph.append(node);return node; };
+      shell('Only Picker').append(window.host);
+      const addPrompt = name => {
+        const host=document.createElement('div');shell(name).append(host);
+        const model={videos:[{video_uid:'s1-a',source_uid:'s1-a',label:'Shot 1 a',present:true}],
+          picker:{enabled:true,ordered_video_uids:['s1-a']},source_sync_revision:1};
+        const outputs=[];
+        const controller=mountPrompt(host,{value:JSON.stringify(model),nodeName:name,onChange:value=>outputs.push(value)});
+        return {host,controller,outputs};
+      };
+      const cold=addPrompt('Direct Cold Prompt');
+      const other=addPrompt('Unrelated Prompt');
+      const edge=document.createElement('g');edge.classList.add('react-flow__edge');
+      edge.dataset.id='Only Picker-PICKER_OUT-Direct Cold Prompt-PICKER_IN-id';
+      edge.setAttribute('aria-label','Edge from Only Picker to Direct Cold Prompt');layer.append(edge);
+      const hint=prompt=>prompt.host.querySelector('[data-hmb-selection-preview="picker"]')?.textContent || '';
+      const events = [];
+      const listener = e => events.push({...e.detail, at: performance.now(), fromPicker:e.target === window.host});
+      window.addEventListener('hmb-shot-media-selection-preview-v1', listener);
+      window.hold = true;
+      const start = performance.now();
+      window.host.querySelector('[data-toggle-video-uid="s1-b"]').click();
+      const seenImmediately = events.length;
+      const directMs=performance.now()-start;
+      const immediate=hint(cold), unrelated=hint(other);
+      await new Promise(resolve => setTimeout(resolve, 1050));
+      const beforeCancel=hint(cold);
+      window.hold = false;
+      window.heldReject(new Error('Only fixture write rejected'));
+      await new Promise(resolve => setTimeout(resolve, 50));
+      window.removeEventListener('hmb-shot-media-selection-preview-v1', listener);
+      const afterCancel=hint(cold);
+      const leaked=[...cold.outputs,...other.outputs].some(payload=>String(payload).includes('Shot 1 b'));
+      cold.controller.cleanup();other.controller.cleanup();graph.before(window.host);graph.remove();
+      return {events, seenImmediately, start,directMs,immediate,unrelated,beforeCancel,afterCancel,leaked};
+    });
+    assert.equal(data.seenImmediately, 1);
+    const event=data.events[0];
+    assert.ok(event.fromPicker && event.scope==='direct' && event.channel_uuid===only.picker_publisher_instance_uuid);
+    assert.deepEqual(event.rows.map(row => row.source_uid), ['s1-a', 's1-b']);
+    assert.ok(data.events.every(row => row.scope==='direct'));
+    const cancelled=data.events.find(row=>row.cancelled);
+    assert.ok(cancelled && cancelled.revision>event.revision && cancelled.at-event.at>=1000);
+    assert.match(data.immediate,/Shot 1 a.*Shot 1 b/);
+    assert.equal(data.beforeCancel,data.immediate);
+    assert.equal(data.unrelated,'');
+    assert.equal(data.afterCancel,'');
+    assert.equal(data.leaked,false);
+    console.log('Only click to connected Prompt DOM (ms): '+data.directMs.toFixed(2));
+    console.log('Only click to direct-source event (ms): '+(event.at-data.start).toFixed(2));
+  },only);
   await check('Shot 3 -> 1 retains navigation through delayed progress and duplicate ACK',async()=>{
     await page.locator(`[data-picker-shot-activate="${shots[0]}"]`).click();
     assert.equal(await page.evaluate(()=>window.active()),shots[0]);

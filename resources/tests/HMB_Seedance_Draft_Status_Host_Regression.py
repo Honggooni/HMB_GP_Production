@@ -126,7 +126,14 @@ async def exercise(engine, phase, out):
 
 if __name__ == "__main__":
     if len(sys.argv) == 3:
-        host.run_phase(sys.argv[1], Path(sys.argv[2]), exercise_flow=exercise, use_standard=False)
+        phase, out = sys.argv[1], Path(sys.argv[2])
+        expected = ("detached_callback_queries_each_final_quality", "status_retry_wakes_same_draft_without_render")
+        if phase == "save":
+            # Several older SDK probes register their callback after importing the harness.
+            with patch.object(host, "exercise", exercise):
+                host.run_phase(phase, out, use_standard=False, expected_cases=expected)
+        else:
+            host.run_phase(phase, out, exercise_flow=exercise, use_standard=False, expected_cases=expected)
     else:
         with tempfile.TemporaryDirectory(prefix="hmb-draft-status-") as tmp:
             for case in ("save", "reopen"):

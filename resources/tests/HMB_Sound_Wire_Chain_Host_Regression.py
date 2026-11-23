@@ -411,7 +411,9 @@ def main():
         harness.PRODUCTS = ("HMBSoundLibrary.py", "HMBPromptLibrary.py", "HMBAgentLibrary.py", "HMBSeedanceGeneration.py",
             "HMBAnalysisAgent.py", "_hmb_sound.py")
         # The engine/cache is new for each launch. The station's workspace persists.
-        harness.run_phase(args.phase, args.out.resolve(), workspace=args.out.resolve() / "workspace")
+        expected = ("readonly_sound_snapshot_before_save_preserves_authored_audio" if args.phase == "create"
+                    else "cold_sdk_reopen_retains_completed_generation_effective_prompt_sound")
+        harness.run_phase(args.phase, args.out.resolve(), workspace=args.out.resolve() / "workspace", expected_cases=(expected,))
     else:
         for phase in ("create", "reopen"):
             subprocess.run([sys.executable, "-B", str(Path(__file__).resolve()), "--phase", phase, "--out", str(args.out.resolve())], check=True)

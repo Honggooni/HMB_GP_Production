@@ -852,7 +852,8 @@ async def exercise(engine):
             imported_uids = [row["source_uid"] for row in imported_state["assets"]]
             first_imported_shot = imported_state["shot_routing"]["shots"][0]
             imported_state["shot_routing"]["shots"] = [dict(first_imported_shot, shot_uuid=str(uuid4()), number=number,
-                name="Existing external Shot " + str(number), name_is_custom=True, selected_source_uids=imported_uids[:1])
+                name="Existing external Shot " + str(number), name_is_custom=True,
+                selected_source_uids=imported_uids[::-1] if number == 2 else imported_uids[:1])
                 for number in range(1, 6)]
             imported_state["shot_routing"]["active_shot_uuid"] = imported_state["shot_routing"]["shots"][3]["shot_uuid"]
             import_workspace = dict(workspace_id=str(uuid4()), revision=0, instances=[
@@ -874,11 +875,21 @@ async def exercise(engine):
                 for shot in authored["shots"]:
                     shot.pop("metadata_sha256", None)
                 return authored
-            # A new imported catalog member advances derived media metadata,
-            # while every authored Shot field and selection remains intact.
-            assert authored_shots(imported_state["shot_routing"]) == authored_shots(import_shots)
-            import_shots = deepcopy(imported_state["shot_routing"])
             new_uid = next(row["source_uid"] for row in imported_state["assets"] if row["source_uid"] not in imported_uids)
+            expected_routing = authored_shots(import_shots)
+            active = next(shot for shot in expected_routing["shots"] if shot["shot_uuid"] == expected_routing["active_shot_uuid"])
+            active["selected_source_uids"].append(new_uid)
+            actual_routing = authored_shots(imported_state["shot_routing"])
+            updated = next(shot for shot in actual_routing["shots"] if shot["shot_uuid"] == active["shot_uuid"])
+            assert len(bytes.fromhex(updated["media_sha256"])) == 32 and updated["media_sha256"] != active["media_sha256"]
+            active.update(revision=active["revision"] + 1, media_count=active["media_count"] + 1, media_sha256=updated["media_sha256"])
+            assert actual_routing == expected_routing
+            assert imported_state["image_bash_workspace"] == import_workspace
+            # Re-evaluating the same live input must also preserve every Shot and Bash instance.
+            imported_state = imported_source._apply_import_value(source._get_parameter_raw(imported_source, source.IMAGE_IMPORT_PARAMETER))
+            assert authored_shots(imported_state["shot_routing"]) == expected_routing
+            assert imported_state["image_bash_workspace"] == import_workspace
+            import_shots = deepcopy(imported_state["shot_routing"])
             next_workspace = deepcopy(import_workspace)
             next_workspace["revision"] += 1
             next_workspace["instances"].append(dict(instance_id=str(uuid4()), source_uid=new_uid))

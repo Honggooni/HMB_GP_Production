@@ -303,7 +303,7 @@ def main():
     before = {name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in PRODUCTS}
     os.environ.pop("HMB_AGENT_POLICY_PATH", None)
     host.exercise = exercise
-    host.run_phase("five-shot", out)
+    host.run_phase("five-shot", out, expected_cases=("concurrent_one_waiting_four_exact_tickets_continue",))
     after = {name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in PRODUCTS}
     (out / "source-preservation.json").write_text(json.dumps(dict(before=before, after=after,
         stable=before == after, test_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()), indent=2), encoding="utf-8")

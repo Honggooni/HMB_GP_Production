@@ -128,7 +128,9 @@ def main():
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     host.exercise = exercise
-    host.run_phase('override-order', out)
+    host.run_phase('override-order', out, expected_cases=(
+        'native_advanced_hook_order_normal', 'native_advanced_hook_order_before_callback_raises',
+        'native_advanced_hook_order_constructor_raises'))
     print('HMB_OVERRIDE_ENVIRONMENT_HOOK_ORDER_HOST=PASS cases=3 external=0 provider=0')
 
 

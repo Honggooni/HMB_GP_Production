@@ -10309,6 +10309,7 @@ class HMBPromptLibrary(DataNode):
         self._hmb_image_asset_connected = False
         self._hmb_sound_connected = False
         self._hmb_connected_source_nodes: Dict[str, Any] = {}
+        self._hmb_media_preview_source_ports: Dict[str, str] = {}
         # Prepared display pages are independent of execution snapshots.
         self._hmb_prompt_shot_views = {}
         self._hmb_prompt_view_catalog_keys = None
@@ -10868,6 +10869,34 @@ class HMBPromptLibrary(DataNode):
         self._registered_sound_source()
         self._schedule_prompt_sync(source_burst=True)
 
+    def _hmb_refresh_media_preview_sources(self) -> None:
+        """Expose live physical input identities only to the editor widget."""
+        element = _get_parameter_obj(self, WIDGET_PARAMETER_NAME)
+        if element is None:
+            return
+        ports = getattr(self, "_hmb_media_preview_source_ports", {})
+        sources = getattr(self, "_hmb_connected_source_nodes", {})
+        identities = {}
+        for kind, target, output, routed_input, attr in (
+            ("picker", PICKER_INPUT_PARAMETER_NAME, "PICKER_OUT", SHOT_PICKER_INPUT_PARAMETER_NAME, "_hmb_picker_publisher_uuid"),
+            ("image_asset", IMAGE_ASSET_INPUT_PARAMETER_NAME, "IMAGE_ASSET_OUT", SHOT_ASSET_INPUT_PARAMETER_NAME, "_hmb_widget_runtime_lease"),
+        ):
+            source = sources.get(target)
+            if routed_input in ports or ports.get(target) != output or getattr(source, "_hmb_node_deleted", False):
+                continue
+            identity = getattr(source, attr, "")
+            if identity:
+                identities[kind] = identity
+        authored_options = getattr(element, "authored_ui_options", None)
+        options = dict((authored_options() if callable(authored_options) else getattr(element, "ui_options", {})) or {})
+        if options.get("media_preview_sources", {}) == identities:
+            return
+        if identities:
+            options["media_preview_sources"] = identities
+        else:
+            options.pop("media_preview_sources", None)
+        element.ui_options = options
+
     def _reconcile_connected_source_inputs_from_graph(self) -> bool:
         """Refresh source inputs from their actual connected output caches.
 
@@ -11027,6 +11056,10 @@ class HMBPromptLibrary(DataNode):
                 # Bypass this class's hydration reconciliation and all normal
                 # before/after hooks while retaining parameter conversion.
                 parent_setter(target_name, value, initial_setup=True)
+        self._hmb_media_preview_source_ports = {
+            target: edge.source_parameter_name for target, edge in incoming_by_target.items()
+        }
+        self._hmb_refresh_media_preview_sources()
         return True
 
     def _apply_exact_shot_routes(
@@ -12695,6 +12728,7 @@ class HMBPromptLibrary(DataNode):
                 and self._hmb_apply_manual_rebind(value)):
             return
         if is_widget_write and initial_setup:
+            self._hmb_refresh_media_preview_sources()
             self._hmb_initial_shot_autoclaim_pending = False
             self._hmb_initial_shot_preferred_uuid = ""
             self._hmb_initial_shot_exact_refresh_pending = False
@@ -12850,6 +12884,7 @@ class HMBPromptLibrary(DataNode):
 
     def _hmb_post_hydration_state_restore(self) -> None:
         self._flush_initial_prompt_hydration()
+        self._hmb_refresh_media_preview_sources()
 
     def _flush_initial_prompt_hydration(self) -> bool:
         with self._hmb_sync_lock:
@@ -14175,6 +14210,8 @@ class HMBPromptLibrary(DataNode):
                     self._hmb_image_asset_connected = True
                 self._hmb_connected_source_nodes[target_name] = source_node
                 source_name = getattr(source_parameter, "name", "")
+                self._hmb_media_preview_source_ports[target_name] = source_name
+                self._hmb_refresh_media_preview_sources()
                 sentinel = object()
                 value: Any = sentinel
                 outputs = getattr(source_node, "parameter_output_values", {})
@@ -14252,6 +14289,8 @@ class HMBPromptLibrary(DataNode):
                 }:
                     self._hmb_image_asset_connected = False
                 self._hmb_connected_source_nodes.pop(target_name, None)
+                self._hmb_media_preview_source_ports.pop(target_name, None)
+                self._hmb_refresh_media_preview_sources()
                 try:
                     _set_parameter_value(
                         self,

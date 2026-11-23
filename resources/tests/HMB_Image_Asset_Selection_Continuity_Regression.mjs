@@ -11,6 +11,7 @@ catch { playwright = require(path.join(os.homedir(), ".cache/codex-runtimes/code
 const executablePath = process.env.HMB_IMAGE_ASSET_TEST_BROWSER || "C:/Program Files/Google/Chrome/Application/chrome.exe";
 assert.ok(fs.existsSync(executablePath), "Selection continuity requires the real browser fixture.");
 const source = fs.readFileSync(new URL("../../widgets/HMBImageAssetLibraryWidget.js", import.meta.url), "utf8");
+const promptSource = fs.readFileSync(new URL("../../widgets/HMBPromptLibraryScopedBindingWidget.js", import.meta.url), "utf8");
 const browser = await playwright.chromium.launch({ executablePath, headless: true });
 const cases = [], errors = [];
 let remoteRequests = 0;
@@ -19,8 +20,8 @@ try {
     const page = await browser.newPage({ viewport: { width: 1300, height: 1000 } });
     page.on("pageerror", (error) => errors.push(String(error)));
     await page.route("**/*", (route) => { remoteRequests++; return route.abort(); });
-    await page.setContent('<style>.react-flow__node{width:1200px;height:850px}#widget{height:820px}</style><div class="react-flow__node" data-id="SelectionContinuity"><div id="widget"></div></div>');
-    await page.evaluate(async ({ uri, format }) => {
+    await page.setContent('<style>.react-flow__node{width:1200px;height:850px}#widget{height:820px}</style><div class="react-flow"><div class="react-flow__node" data-id="SelectionContinuity"><div id="widget"></div></div><div class="react-flow__node" data-id="Prompt"><div id="prompt"></div></div></div>');
+    await page.evaluate(async ({ uri, promptUri, format }) => {
       const widget = await import(uri);
       const canvas = document.createElement("canvas"); canvas.width = canvas.height = 12;
       canvas.getContext("2d").fillRect(0, 0, 12, 12);
@@ -38,6 +39,17 @@ try {
       });
       const container = document.querySelector("#widget");
       const fixture = { widget, container, state, writes: [], format, removedImages: 0 };
+      const {default:mountPrompt} = await import(promptUri);
+      const {channel_uuid, publisher_instance_uuid, shots} = state.shot_routing;
+      const shot = {...shots[0], channel_uuid};
+      const other = {...shot, shot_uuid:"b602b5d3-117d-42ee-9444-e2952ca6db02", number:2, name:"Shot 2", selected_source_uids:[]};
+      shots.push(other);
+      const route = {publisher_instance_uuid, channel_uuid, generation:1, metadata_sha256:"a".repeat(64)};
+      fixture.promptWrites = 0;
+      fixture.prompt = mountPrompt(document.querySelector("#prompt"), {value:JSON.stringify({
+        shot, multi_shot_enabled:true, image_asset:{enabled:true, shot_routing:route,
+          shot_catalog_routing:route, shot_catalog:[shot,other]},
+      }), onChange:() => { fixture.promptWrites++; }});
       fixture.view = () => ({
         cards: container.querySelectorAll(".asset-grid [data-asset-key]").length,
         project: container.querySelector("[data-project-select]")?.value || "",
@@ -63,11 +75,16 @@ try {
       });
       fixture.observer.observe(container, { childList: true, subtree: true });
       window.selectionFixture = fixture;
-    }, { uri: "data:text/javascript;base64," + Buffer.from(source).toString("base64"), format });
+    }, { uri: "data:text/javascript;base64," + Buffer.from(source).toString("base64"),
+      promptUri:"data:text/javascript;base64," + Buffer.from(promptSource).toString("base64"), format });
     await page.waitForFunction(() => selectionFixture.images.every((image) => image.complete && image.naturalWidth > 0));
     const result = await page.evaluate(async () => {
       const f = selectionFixture;
       f.cards[0].click();
+      const hint = document.querySelector("#prompt [data-hmb-selection-preview]")?.textContent;
+      if (!hint?.includes("Hero 0") || f.writes.length || f.promptWrites) {
+        throw Error("The bound Prompt must paint the selected name before the first host write.");
+      }
       f.widget.hmbFlushImageAssetSelectionCommit(f.container);
       await Promise.resolve();
       const request = JSON.parse(f.writes[0]);
@@ -118,7 +135,24 @@ try {
     assert.equal(reordered.sameImages, true);
     assert.equal(reordered.removedImages, 0);
     cases[cases.length - 1].reordered = reordered;
-    await page.evaluate(() => { selectionFixture.observer.disconnect(); selectionFixture.controller.cleanup(); });
+    await page.evaluate(async () => {
+      const f = selectionFixture, prompt = document.querySelector("#prompt");
+      const shotIds = f.state.shot_routing.shots.map(shot => shot.shot_uuid);
+      const switchTo = id => {
+        const tab = prompt.querySelector('[data-prompt-shot="' + id + '"]');
+        if (!tab) throw Error("The bound Shot tab is missing.");
+        tab.click();
+      };
+      const hint = () => prompt.querySelector("[data-hmb-selection-preview]")?.textContent;
+      if (!hint()?.includes("Hero 2")) throw Error("The original Shot should show its pending selection.");
+      switchTo(shotIds[1]);
+      if (hint()) throw Error("Another Shot is displaying this Shot’s pending selection.");
+      f.cards[2].click();
+      await new Promise(resolve => setTimeout(resolve, 100));
+      switchTo(shotIds[0]);
+      if (hint()) throw Error("A retained editor restored a stale selection after its source changed.");
+    });
+    await page.evaluate(() => { selectionFixture.observer.disconnect(); selectionFixture.controller.cleanup(); selectionFixture.prompt.cleanup(); });
     await page.close();
   }
   assert.deepEqual(errors, []);

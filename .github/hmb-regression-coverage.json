@@ -3,6 +3,12 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_VideoPicker_Selected_Probe_Regression.py",
+      "mode": "ci",
+      "coverage": "installed_sdk",
+      "required": true
+    },
+    {
       "name": "HMB_Published_Workspace_Sync_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",

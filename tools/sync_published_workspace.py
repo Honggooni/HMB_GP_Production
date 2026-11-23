@@ -39,6 +39,11 @@ def verified_commit(stage, tag):
     published = json.loads((stage / "publication" / "verified.json").read_bytes())
     installed = json.loads((stage / "local-verified.json").read_bytes())
     commit = published["commit"]
+    local_version = installed.get("local", "")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", local_version) or (
+        tuple(map(int, local_version.split("."))) <= tuple(map(int, tag[1:].split(".")))
+    ):
+        raise ValueError("The installed Local version must be higher than the published Team version")
     if not (
         re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit)
         and published["tag"] == tag and installed["published_team"] == tag[1:]

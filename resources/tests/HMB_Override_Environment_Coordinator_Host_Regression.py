@@ -128,9 +128,11 @@ def main():
     parser.add_argument('--loaded-dependency',action='store_true')
     args=parser.parse_args();out=args.out.resolve();out.mkdir(parents=True,exist_ok=True)
     if args.loaded_dependency:
-        host.exercise=exercise;host.run_phase('loaded-dependency',out)
+        host.exercise = exercise
+        host.run_phase('loaded-dependency', out, expected_cases=('actual_loaded_record_member_preserved',))
         return
-    host.exercise=exercise;host.run_phase('coordinator-native',out)
+    host.exercise = exercise
+    host.run_phase('coordinator-native', out, expected_cases=('actual_cold_constructor_targeted_cleanup', 'same_code_normal_refresh_fast_cache', 'new_override_loaded_nodes_defers'))
     # Each process keeps a single deletion-protection owner for its lifetime.
     subprocess.run([sys.executable,'-B',str(Path(__file__).resolve()),'--out',str(out/'second-process'),
         '--loaded-dependency'],env={**os.environ},timeout=90,check=True)

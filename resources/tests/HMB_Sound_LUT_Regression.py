@@ -7,6 +7,7 @@ import copy
 import hashlib
 import importlib.util
 import math
+import os
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
+PRODUCT_ROOT = Path(os.environ.get("HMB_REGRESSION_PRODUCT_ROOT", ROOT)).resolve()
 sys.path.insert(0, str(ROOT))
 import _hmb_color_lut as engine
 import HMBColorLUTLibrary as node_module
@@ -245,7 +247,7 @@ class SoundLUTNodeRegression(unittest.TestCase):
         self.node._receive_sound(snapshot)
         edge = types.SimpleNamespace(target_parameter_name=node_module.SOUND_IN, source_parameter_name="SOUND_OUT", source_node_name="sound-node")
         with mock.patch.dict(sys.modules, {"_hmb_sound": types.SimpleNamespace(normalize_sound_snapshot=copy.deepcopy)}), \
-             mock.patch("inspect.getfile", return_value=str(ROOT / "HMBSoundLibrary.py")), \
+             mock.patch("inspect.getfile", return_value=str(PRODUCT_ROOT / "HMBSoundLibrary.py")), \
              mock.patch.object(routing, "_same_flow_nodes", return_value=("flow", [self.node, source])), \
              mock.patch.object(routing, "_incoming_connections", return_value=[edge]):
             self.assertEqual(self.node._capture_sound_snapshot(self.node._hmb_color_lut_state), snapshot)
@@ -276,7 +278,7 @@ class SoundLUTNodeRegression(unittest.TestCase):
         state=copy.deepcopy(self.node._hmb_color_lut_state);state.update(shot=shot,source=source_record,audio_mix={"enabled":True,"source":"current"})
         nodes=[self.node,sound,prompt,generator]
         with mock.patch.object(sound_helper,"normalize_sound_snapshot",side_effect=copy.deepcopy), \
-             mock.patch("inspect.getfile",side_effect=lambda kind:str(ROOT/(kind.__name__+".py"))), \
+             mock.patch("inspect.getfile",side_effect=lambda kind:str(PRODUCT_ROOT/(kind.__name__+".py"))), \
              mock.patch.object(__import__("_hmb_shot_routing"),"_incoming_connections",return_value=[types.SimpleNamespace(
                  target_parameter_name=node_module.SOURCE,source_parameter_name="HMB_GENERATED_VIDEO_SOURCE",source_node_name=generator.name)]):
             selected=self.node._current_shot_sound_contract(state,nodes,sound)

@@ -444,7 +444,10 @@ async def exercise(engine, phase, out):
         check_connected_only_agent(engine, t, agents, gen)
 
 
-def run_phase(phase, out, *, workspace=None, exercise_flow=exercise, use_standard=True):
+def run_phase(phase, out, *, workspace=None, exercise_flow=None, use_standard=True, expected_cases=()):
+    if exercise_flow is None:
+        exercise_flow = exercise
+    first_case = len(RESULTS)
     private = out / (phase + "-profile")
     for key, leaf in (("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state"),
                       ("XDG_CACHE_HOME", "cache"), ("LOCALAPPDATA", "local"), ("APPDATA", "app"),
@@ -487,13 +490,16 @@ def run_phase(phase, out, *, workspace=None, exercise_flow=exercise, use_standar
             from griptape_nodes.retained_mode.engine import engine_scope
             with engine_scope() as engine:
                 asyncio.run(exercise_flow(engine, phase, out))
+                observed = {case["name"] for case in RESULTS[first_case:] if case["passed"]}
+                missing = set(expected_cases) - observed
+                assert not missing, (phase, "Expected SDK cases did not run", sorted(missing), sorted(observed))
     except BaseException as exc:
         error = exc
         raise
     finally:
         logging.shutdown()
         result = dict(schema="hmb-seedance-execution-mode-installed-sdk/v1", phase=phase,
-            passed=error is None and not attempts and not ATTEMPTS, cases=RESULTS, native_requests=REQUESTS,
+            passed=error is None and not attempts and not ATTEMPTS, cases=RESULTS[first_case:], native_requests=REQUESTS,
             forbidden_execution_attempts=len(ATTEMPTS), external_or_live_socket_attempts=len(attempts),
             provider_or_paid_calls=0, live_graph_actions=0,
             source_sha256={name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in PRODUCTS})

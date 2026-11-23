@@ -2365,6 +2365,46 @@ export function hmbPublishImageAssetShotRoutingCatalog(state, eventTarget = glob
   return detail;
 }
 
+// Paint the names on an already-bound Prompt while the engine validates the
+// actual image files. This event never transports paths, handles or pixels.
+const selectionPreviewEvent = "hmb-shot-media-selection-preview-v1";
+let previewRevision = 0;
+function publishShotPreview(container, routing, shot, assets, scope = "shot", cancelled = false) {
+  const Custom = container?.ownerDocument?.defaultView?.CustomEvent;
+  if (!Custom || !routing?.publisher_instance_uuid || !routing.channel_uuid || !shot?.shot_uuid) return;
+  const rows = assets.map(asset => ({source_uid: asset.source_uid, label: asset.image_name}));
+  const previews = container.__hmbImageAssetShotPreviews ||= new Map();
+  const key = scope === "direct" ? "direct" : shot.shot_uuid;
+  const signature = JSON.stringify([routing.publisher_instance_uuid, routing.channel_uuid, rows, cancelled]);
+  if (previews.get(key)?.signature === signature) return;
+  const detail = {schema:selectionPreviewEvent, kind:"image_asset", scope,
+    publisher_instance_uuid:routing.publisher_instance_uuid, channel_uuid:routing.channel_uuid,
+    shot_uuid:shot.shot_uuid, revision:++previewRevision, rows, cancelled};
+  previews.set(key, {signature, detail});
+  container.dispatchEvent(new Custom(selectionPreviewEvent, {detail, bubbles:true, composed:true}));
+}
+
+function publishDirectPreview(container, state, selected, cancelled = false) {
+  const lease = hmbImageAssetWidgetLease(state);
+  if (lease) publishShotPreview(container, {publisher_instance_uuid:lease, channel_uuid:lease},
+    {shot_uuid:state.shot_routing?.active_shot_uuid}, selected, "direct", cancelled);
+}
+
+function retireShotPreviews(container, routing, lease) {
+  const previews = container.__hmbImageAssetShotPreviews;
+  if (!previews) return;
+  for (const [shotId, {detail}] of previews) {
+    if (shotId === "direct" && lease && detail.publisher_instance_uuid === lease) continue;
+    if (routing?.publisher_instance_uuid === detail.publisher_instance_uuid && routing.channel_uuid === detail.channel_uuid
+      && routing.shots.some(shot => shot.shot_uuid === shotId)) continue;
+    previews.delete(shotId);
+    const Custom = container.ownerDocument?.defaultView?.CustomEvent;
+    if (Custom) container.dispatchEvent(new Custom(selectionPreviewEvent, {
+      detail:{...detail, revision:++previewRevision, cancelled:true}, bubbles:true, composed:true,
+    }));
+  }
+}
+
 export function hmbAddImageAssetShot(state) {
   const routing = ensureImageAssetShotRouting(state);
   if (!routing || routing.shots.length >= MAX_IMAGE_ASSET_SHOTS) return false;
@@ -5223,9 +5263,12 @@ export function hmbApplyImageAssetSelectionFeedback(container, state, options = 
     ? options.selectedAssets
     : imageAssetShotAssets(state, shot);
   const selectedCount = selected.length;
+  publishShotPreview(container, state.shot_routing, shot, selected);
+  const master = selectedAssets(state);
+  publishDirectPreview(container, state, master);
   state.status = {
     ...(state.status || {}),
-    selected_count: selectedAssets(state).length,
+    selected_count: master.length,
   };
   const previousSelectedCount = Number(options.previousSelectedCount);
   const crossedSelectionLimit = Number.isFinite(previousSelectedCount) && (
@@ -5990,11 +6033,13 @@ function hmbRebuildImageAssetIndexes(container, state) {
   if (!container || !state) return false;
   const assetsById = new Map();
   const assetsBySourceUid = new Map();
+  const selected = [];
   state.assets.forEach((asset) => {
     const assetId = clean(asset.asset_library_id);
     const sourceUid = clean(asset.source_uid);
     if (assetId) assetsById.set(assetId, asset);
     if (sourceUid) assetsBySourceUid.set(sourceUid, asset);
+    if (asset.selected) selected.push(asset);
   });
   const cardById = new Map();
   const selectedById = new Map();
@@ -6025,6 +6070,20 @@ function hmbRebuildImageAssetIndexes(container, state) {
   });
   container.__hmbImageAssetByLibraryId = assetsById;
   container.__hmbImageAssetBySourceUid = assetsBySourceUid;
+  // Host updates include Standard LoadImage wires and restored workspaces.
+  // Reuse the index this paint already built, including non-visible Shot rows.
+  const routing = state.shot_routing;
+  retireShotPreviews(container, routing, hmbImageAssetWidgetLease(state));
+  let incomplete = Boolean(state.error);
+  for (const shot of routing?.shots || []) {
+    const assets = shot.selected_source_uids.map(uid => assetsBySourceUid.get(uid));
+    // New edits clear both hashes. An SDK-authored complete snapshot carries
+    // a hash even when verification rejected one of the originally chosen files.
+    const rejected = Boolean(shot.media_sha256) && shot.media_count !== assets.length;
+    incomplete ||= rejected;
+    if (assets.every(Boolean)) publishShotPreview(container, routing, shot, assets, "shot", rejected || Boolean(state.error));
+  }
+  publishDirectPreview(container, state, selected.sort((left, right) => left.selection_order - right.selection_order), incomplete);
   container.__hmbImageAssetCardByLibraryId = cardById;
   container.__hmbImageAssetSelectedCardByLibraryId = selectedById;
   container.__hmbImageAssetCompactCardsByLibraryId = compactById;
@@ -9736,6 +9795,8 @@ function hmbNativeUiImplementation(container, props) {
 
   const cleanup = () => {
     hmbClearImageAssetRefreshWait(container);
+    retireShotPreviews(container, null);
+    delete container.__hmbImageAssetShotPreviews;
     delete container.__hmbImageAssetSettledRefresh;
     clearTimeout(container.__hmbImageAssetRegistrationDraft?.save_timer);
     container.__hmbImageAssetBashEditQueue?.dispose();delete container.__hmbImageAssetBashEditQueue;delete container.__hmbImageAssetBashQueueExecute;

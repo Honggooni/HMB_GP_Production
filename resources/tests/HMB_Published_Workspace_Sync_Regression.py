@@ -50,17 +50,19 @@ class WorkspaceSyncTest(unittest.TestCase):
         return subprocess.check_output(["git", *command], cwd=cwd, env=self.env, text=True,
                                        stderr=subprocess.PIPE).strip()
 
-    def proofs(self):
+    def proofs(self, local=None):
         def save(path, **values):
             path.write_text(json.dumps(values), encoding="utf-8")
 
+        major, minor, patch = self.tag[1:].split(".")
+        local = local or f"{major}.{minor}.{int(patch) + 1}"
         save(self.stage / "publication/verified.json", published=True, tag=self.tag, commit=self.commit,
              verified_members=7, archive_sha256="a"*64)
-        save(self.stage / "local-verified.json", published_team=self.tag[1:], local="0.9.40", commit=self.commit,
+        save(self.stage / "local-verified.json", published_team=self.tag[1:], local=local, commit=self.commit,
              verified_runtime_files=6, published_archive_sha256="a"*64, receipt="matches_recorded_inventory",
              policy="verified", target=str(self.installed), runtime_fingerprint="b"*64)
         save(self.installed / ".hmb-install-receipt.json", team_release=self.tag[1:], team_commit=self.commit,
-             release_version="0.9.40", runtime_fingerprint_sha256="b"*64, team_functional_parity=True)
+             release_version=local, runtime_fingerprint_sha256="b"*64, team_functional_parity=True)
 
     def invoke(self, *, rejected=False, workspace=None):
         result = subprocess.run([sys.executable, str(TOOL), "--workspace", str(workspace or self.chat),
@@ -125,6 +127,13 @@ class WorkspaceSyncTest(unittest.TestCase):
         receipt["team_commit"] = self.before
         path.write_text(json.dumps(receipt), encoding="utf-8")
         self.assertIn("current Local installation", self.invoke(rejected=True))
+
+    def test_local_version_must_exceed_team(self):
+        for version in ("0.9.40", "0.9.41"):
+            with self.subTest(version=version):
+                self.proofs(local=version)
+                self.assertIn("Local version must be higher", self.invoke(rejected=True))
+                self.assertEqual(self.git(self.chat, "rev-parse", "HEAD"), self.before)
         self.assertEqual(self.git(self.chat, "rev-parse", "HEAD"), self.before)
 
 

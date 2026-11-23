@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("HMB_PICKER_TEST_ROOT", Path(__file__).resolve().parents[2]))
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -262,12 +262,22 @@ assert prompt_library._get_parameter_raw(
 assert hydration_prompt._current_state()["picker"]["ordered_video_uids"] == [
     "hydrated-current"
 ]
+def direct_stamps(node: Any) -> dict:
+    return node.get_parameter_by_name(prompt_library.WIDGET_PARAMETER_NAME).ui_options.get("media_preview_sources", {})
+
+assert direct_stamps(hydration_prompt) == {"picker": hydration_picker._hmb_picker_publisher_uuid}
 
 
 # A successful graph lookup with no edge makes a serialized target transport
 # cache non-authoritative and clears it during hydration.
 orphan_prompt = prompt_library.HMBPromptLibrary(name=f"OrphanPrompt_{stamp}")
 register(flow, orphan_prompt)
+orphan_widget = orphan_prompt.get_parameter_by_name(prompt_library.WIDGET_PARAMETER_NAME)
+orphan_widget.ui_options = {**orphan_widget.authored_ui_options(), "media_preview_sources": direct_stamps(hydration_prompt)}
+stale_widget = orphan_prompt._current_state()
+stale_widget["media_preview_sources"] = direct_stamps(hydration_prompt)
+set_value(orphan_prompt, prompt_library.WIDGET_PARAMETER_NAME, prompt_library._json_dumps(stale_widget), "str", initial_setup=True)
+assert direct_stamps(orphan_prompt) == {}
 set_value(
     orphan_prompt,
     prompt_library.PICKER_INPUT_PARAMETER_NAME,
@@ -510,4 +520,21 @@ assert reentrant_sink.get_parameter_value("prompt") == "g2-prompt"
 assert reentrant_sink.seen == ["g2-prompt"]
 
 
+# Scope follows real incoming edges even when an old copy of the node state
+# exists elsewhere in the same SDK document.
+from HMBImageAssetLibrary import HMBImageAssetLibrary
+image_source = HMBImageAssetLibrary(name=f"ImageDirect_{stamp}")
+register(flow, image_source)
+connect(image_source, "IMAGE_ASSET_OUT", hydration_prompt, "IMAGE_ASSET_IN")
+assert direct_stamps(hydration_prompt) == {
+    "picker": hydration_picker._hmb_picker_publisher_uuid,
+    "image_asset": image_source._hmb_widget_runtime_lease,
+}
+assert direct_stamps(orphan_prompt) == {}
+disconnect(hydration_picker, "PICKER_OUT", hydration_prompt, "PICKER_IN")
+assert direct_stamps(hydration_prompt) == {"image_asset": image_source._hmb_widget_runtime_lease}
+disconnect(image_source, "IMAGE_ASSET_OUT", hydration_prompt, "IMAGE_ASSET_IN")
+assert direct_stamps(hydration_prompt) == {}
+assert "media_preview_sources" not in str(hydration_prompt.parameter_output_values.get("PROMPT_OUT"))
+print("HMB direct physical media sources: connected Picker and ImageAsset, detached, stale hydration and unrelated Prompt: PASS")
 print("HMB Picker -> Prompt -> Agent live host regression: PASS")

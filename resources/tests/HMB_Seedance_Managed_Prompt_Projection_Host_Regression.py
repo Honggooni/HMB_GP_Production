@@ -258,7 +258,7 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     harness.PRODUCTS = ("HMBSeedanceGeneration.py", "HMBAgentLibrary.py")
     harness.exercise = exercise
-    harness.run_phase("projection", args.out.resolve())
+    harness.run_phase("projection", args.out.resolve(), expected_cases=("actual_sdk_cold_reopen_preserves_all_five_individual_agent_outputs_and_generator_prompts",))
     result = json.loads((args.out / "projection-result.json").read_text("utf-8"))
     print(json.dumps({"passed": result["passed"], "cases": len(result["cases"]), "paid_calls": 0}))
     assert result["passed"]

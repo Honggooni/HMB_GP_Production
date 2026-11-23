@@ -16,6 +16,7 @@ python tools/sync_published_workspace.py --workspace C:\HMB_GP_Production --tag 
 ```
 
 검증 폴더의 `publication/verified.json`, `local-verified.json`과 실제 설치 영수증이 같은 배포를 가리켜야 한다. 채팅 작업 폴더의 `main`이 깨끗하고 원격 `main`과 Team 태그가 검증 커밋을 가리키면 fast-forward한다. 작업 중인 변경이나 분기된 커밋이 있으면 보존하고 중단한다. 출력의 `fast_forwarded` 또는 `already_current`와 함께 완료를 기록한다.
+동기화할 때 실제 설치된 Local 버전이 게시된 Team 버전보다 높은지도 확인한다.
 
 Team v0.8.59는 SDK 0.104의 연결과 저장 경로를 복구한다. Editor 0.130 전용 헤더 연동과 실제 화면 검증은 별도로 남아 있다.
 

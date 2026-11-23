@@ -318,15 +318,17 @@ def main() -> None:
     if args.phase:
         host.exercise = exercise
         host.PRODUCTS = ("HMBAnalysisAgent.py", "griptape-nodes-library.json", "HMBPromptLibrary.py", "_hmb_reference_analysis.py", "_hmb_analysis_delivery.py",
-            "HMBImageAssetLibrary.py", "_hmb_library_bootstrap.py", "_hmb_connection_management.py", "_hmb_workflow_migration.py",
-            Path(__file__).resolve().relative_to(ROOT).as_posix())
+            "HMBImageAssetLibrary.py", "_hmb_library_bootstrap.py", "_hmb_connection_management.py", "_hmb_workflow_migration.py")
         # This fixture only registers its three HMB classes. Keep the desktop
         # SDK's own dependencies ahead of an unrelated Standard virtualenv.
         host.STANDARD = out / "unused-standard-library"
-        host.run_phase(args.phase, out)
+        expected = ("real_sdk_native_save_five_slots_and_two_selected_results_with_independent_upstream_state"
+                    if args.phase == "save" else "second_process_restored_all_slots_reused_results_and_rejected_replaced_source")
+        host.run_phase(args.phase, out, expected_cases=(expected,), use_standard=False)
         result_path = out / f"{args.phase}-result.json"
         report = json.loads(result_path.read_text("utf-8"))
         report["schema"] = "hmb-analysis-agent-save-reopen-sdk/v1"
+        report["test_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         result_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return
     reports = []

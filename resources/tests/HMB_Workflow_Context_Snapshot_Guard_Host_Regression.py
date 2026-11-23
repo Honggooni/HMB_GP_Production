@@ -245,7 +245,7 @@ def main():
     out=parser.parse_args().out.resolve();out.mkdir(parents=True,exist_ok=True)
     harness.PRODUCTS=("_hmb_library_bootstrap.py", "HMBImageAssetLibrary.py")
     harness.exercise=exercise
-    harness.run_phase("snapshot-guard",out)
+    harness.run_phase("snapshot-guard", out, expected_cases=("public_create_generator_finish_and_lut_after_reopen_has_valid_current_flow",))
     result=json.loads((out/"snapshot-guard-result.json").read_text("utf-8"))
     print(json.dumps({"passed":result["passed"],"cases":len(result["cases"]),"paid_calls":0}))
     assert result["passed"]

@@ -450,7 +450,7 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     harness.PRODUCTS = ("HMBAgentLibrary.py", "HMBSeedanceGeneration.py")
     harness.exercise = exercise
-    harness.run_phase("worker", args.out.resolve())
+    harness.run_phase("worker", args.out.resolve(), expected_cases=("five_actual_generator_wrappers_await_native_workers_reverse_order_keep_exact_submission",))
     result = json.loads((args.out / "worker-result.json").read_text("utf-8"))
     print(json.dumps(dict(passed=result["passed"], cases=len(result["cases"]), paid_calls=0)))
     assert result["passed"]

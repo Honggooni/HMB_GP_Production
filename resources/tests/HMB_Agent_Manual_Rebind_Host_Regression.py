@@ -245,7 +245,8 @@ def main():
     parser=argparse.ArgumentParser();parser.add_argument("--out",type=Path,default=ROOT/"reports/critical-agent-isolation-20261020/manual-api")
     args=parser.parse_args();args.out.mkdir(parents=True,exist_ok=True)
     harness.PRODUCTS=("HMBAgentLibrary.py","widgets/HMBAgentLibraryWidget.js","_hmb_workflow_migration.py")
-    harness.exercise=exercise;harness.run_phase("manual",args.out.resolve())
+    harness.exercise = exercise
+    harness.run_phase("manual", args.out.resolve(), expected_cases=("exact_original_uuid_confirmation_preserves_own_authored_values_shot_5",))
     report=json.loads((args.out/"manual-result.json").read_text("utf-8"))
     print(json.dumps(dict(passed=report["passed"],cases=len(report["cases"]),paid_calls=0)))
     assert report["passed"]

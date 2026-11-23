@@ -218,7 +218,7 @@ def main():
     harness.exercise = exercise
     harness.PRODUCTS = ("HMBSoundLibrary.py", "HMBImageAssetLibrary.py", "HMBPromptLibrary.py", "HMBAgentLibrary.py",
         "HMBSeedanceGeneration.py", "HMBColorLUTLibrary.py", "_hmb_sound.py", "_hmb_shot_routing.py")
-    harness.run_phase("automatic", args.out.resolve())
+    harness.run_phase("automatic", args.out.resolve(), expected_cases=("advanced_alias_automatic_sound_chain_without_save",))
     result = json.loads((args.out / "automatic-result.json").read_text("utf-8"))
     assert result["passed"]
     print("HMB Sound automatic advanced-library chain: PASS (both source orders; no Save, models, provider, or live graph)")

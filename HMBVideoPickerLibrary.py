@@ -4975,6 +4975,19 @@ def _picker_representative_video_uids(
     return candidates
 
 
+def _picker_output_video_uids(state: Dict[str, Any]) -> set[str]:
+    """The public selection and every Shot representative, including legacy overflow."""
+    selected = set(_picker_selected_video_uids(state))
+    rows = list(state.get("picker_shots") or [])
+    legacy = state.get("picker_legacy_membership_fallbacks")
+    if isinstance(legacy, dict):
+        rows.extend(legacy.values())
+    for row in rows:
+        if isinstance(row, dict):
+            selected.update(_picker_representative_video_uids(row.get("selected_video_uids")))
+    return selected
+
+
 def _picker_workspace_uuid_for_number(number: int) -> str:
     """Return one stable local identity for a legacy positional workspace."""
     normalized_number = max(1, min(SHOT_ROUTING_MAX_SHOTS, int(number or 1)))
@@ -14696,6 +14709,7 @@ class HMBVideoPickerLibrary(DataNode):
         state["python_core_loaded"] = True
         state["python_core_path"] = str(Path(__file__).resolve()).replace("\\", "/")
         state["runtime_instance_id"] = self._hmb_runtime_instance_id
+        state["picker_publisher_instance_uuid"] = self._hmb_picker_publisher_uuid
         if not recovered_runtime_state:
             state["scene_request_status"] = "IDLE"
         state["state_revision"] = max(
@@ -15095,6 +15109,7 @@ class HMBVideoPickerLibrary(DataNode):
             )
             normalized["state_revision"] = current_revision + 1
             normalized["state_writer"] = "python"
+            normalized["picker_publisher_instance_uuid"] = self._hmb_picker_publisher_uuid
             normalized["writer_runtime_instance_id"] = (
                 self._hmb_runtime_instance_id
             )
@@ -16592,7 +16607,6 @@ class HMBVideoPickerLibrary(DataNode):
 
         target = _uuid_text(target_shot_uuid)
         catalog_shots = catalog["shots"]
-        target_uids: Optional[set[str]] = None
         if target:
             catalog_shots = [row for row in catalog_shots if row["shot_uuid"] == target]
             if len(catalog_shots) != 1:
@@ -16608,6 +16622,8 @@ class HMBVideoPickerLibrary(DataNode):
             target_uids = set(_picker_representative_video_uids(
                 target_row.get("selected_video_uids", []) if isinstance(target_row, dict) else [],
                 target_row.get("preview_video_uid", "") if isinstance(target_row, dict) else ""))
+        else:
+            target_uids = _picker_output_video_uids(state)
 
         source_items: Dict[str, Dict[str, Any]] = {}
         source_media_by_uid: Dict[str, str] = {}
@@ -16616,7 +16632,7 @@ class HMBVideoPickerLibrary(DataNode):
                 continue
             item = dict(raw)
             uid = _clean(item.get("video_uid") or item.get("source_uid"))
-            if target_uids is not None and uid not in target_uids:
+            if uid not in target_uids:
                 continue
             media = _select_synchronized_video_media(
                 item,
@@ -19668,7 +19684,11 @@ class HMBVideoPickerLibrary(DataNode):
                     with self._hmb_command_lock:
                         self._hmb_video_removal_sync_running = False
 
-        worker = threading.Thread(target=publish_latest, name="HMBPicker-RemovalOutputs", daemon=True)
+        # The SDK's workflow and engine are ContextVars. Forward the caller's
+        # scope so the owner-loop publication can find the same physical edges
+        # after this worker finishes probing the selected reference.
+        host_context = copy_context()
+        worker = threading.Thread(target=host_context.run, args=(publish_latest,), name="HMBPicker-RemovalOutputs", daemon=True)
         self._hmb_video_removal_sync_thread = worker
         worker.start()
 
@@ -26180,8 +26200,9 @@ class HMBVideoPickerLibrary(DataNode):
     def _prepare_execution_media(state: Dict[str, Any]) -> tuple[Any, Any, Any]:
         """Detached I/O only: never mutate state, node caches or graph outputs."""
         probe_cache: Dict[str, Optional[Path]] = {}
+        selected = _picker_output_video_uids(state)
         for raw in state.get("videos", []):
-            if isinstance(raw, dict):
+            if isinstance(raw, dict) and _clean(raw.get("video_uid") or raw.get("source_uid")) in selected:
                 _select_synchronized_video_media(dict(raw), enforce_media_availability=True, probe_cache=probe_cache)
         payload, media = _build_synchronized_video_outputs(
             state, enforce_media_availability=True, probe_cache=probe_cache,
