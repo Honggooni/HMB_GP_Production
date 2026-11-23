@@ -394,6 +394,43 @@ class SoundNodeRegression(SoundLibraryRegression):
         self.assertEqual(restored['folders'], self.node._state_sound['folders'])
         self.assertEqual(restored['tracks'], preserved['tracks'])
 
+    def test_committed_folder_receipt_survives_cancel_during_catalog_read(self):
+        import _hmb_image_asset_sites as sites
+        vendor = self.audio.with_name("Ai_Ct_audio_Gang")
+        make_wave(vendor / "Dialogue" / "new.wav")
+        uid = self.node._state_sound["project_uid"]
+        tracks = copy.deepcopy(self.node._state_sound["tracks"])
+        def send(action, **fields):
+            envelope = {"__hmb_sound_command": {"id": str(uuid4()), "action": action, **fields}}
+            if NATIVE:
+                response = self.engine.handle_request(SetParameterValueRequest(
+                    node_name=self.node.name, parameter_name=target.UI, value=envelope))
+                self.assertTrue(response.succeeded(), str(response.result_details))
+            else:
+                self.node.after_value_set(types.SimpleNamespace(name=target.UI), envelope)
+        def cancel_during_read(*args, **kwargs):
+            self.assertTrue(self.node._state_sound["busy"])
+            self.assertEqual(len(sites.get_site_settings(self.audio, "sound", fresh=True)["links"]), 1)
+            send("cancel")
+            return helper.scan_sound_project(*args, **kwargs)
+        with mock.patch.object(sites, "_workspace", return_value=self.root / "workspace"):
+            send("site_settings", site_settings_request={"action":"get", "request_id":"first-open","project_uid":uid})
+            profile = self.node.get_parameter_value(target.UI)["site_settings_result"]
+            self.assertTrue(profile["ok"])
+            with mock.patch.object(target, "scan_sound_project", side_effect=cancel_during_read):
+                send("site_settings", site_settings_request={"action":"save","request_id":"link-while-open",
+                     "project_uid":uid, "expected_revision":profile["revision"],"write_site_id":"hq",
+                     "links":[{"id":"new","label":"광주","root":str(vendor)}]})
+                self.drain()
+            ui = self.node.get_parameter_value(target.UI)
+            receipt = ui["site_settings_result"]
+            self.assertEqual(receipt["request_id"], "link-while-open")
+            self.assertTrue(receipt["ok"])
+            self.assertEqual(ui["site_settings"]["revision"], receipt["revision"])
+            self.assertEqual(self.node._state_sound["tracks"], tracks)
+            self.assertFalse(self.node._state_sound["busy"])
+            self.assertIn("취소", self.node._state_sound["status"])
+
     def test_folder_dialog_and_native_sound_add_preserve_current_shot(self):
         import _hmb_image_asset_sites as sites
         vendor = self.audio.with_name("Ai_Ct_audio_Gang")

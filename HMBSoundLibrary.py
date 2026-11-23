@@ -667,7 +667,8 @@ class HMBSoundLibrary(DataNode):
         except Exception:
             pass
 
-    def _start_job(self, operation, message: str, *, replace: bool = False, preparing: bool = False, scope: tuple[str, str] | None = ("", "")) -> None:
+    def _start_job(self, operation, message: str, *, replace: bool = False, preparing: bool = False,
+                   scope: tuple[str, str] | None = ("", ""), on_superseded=None) -> None:
         with self._lock:
             if self._worker is not None:
                 if not replace:
@@ -676,7 +677,7 @@ class HMBSoundLibrary(DataNode):
                 self._sound_preparing = preparing
                 self._sound_preparation_error = ""
                 self._sound_pending_scope = scope
-                self._pending_job = (operation, self._generation)
+                self._pending_job = (operation, self._generation, on_superseded)
                 self._state_sound.update(busy=True, status=message, error_code="")
                 self._publish(notify=False)
                 return
@@ -699,7 +700,7 @@ class HMBSoundLibrary(DataNode):
                 except Exception:
                     pass
 
-            def launch(active_operation, active_generation):
+            def launch(active_operation, active_generation, superseded):
                 def finish(result, failure):
                     with self._lock:
                         if self._worker is not worker:
@@ -731,6 +732,14 @@ class HMBSoundLibrary(DataNode):
                                 self._publish()
                             except Exception:
                                 pass  # Accepted data is retained for read-only UI recovery.
+                        elif superseded is not None:
+                            # A completed settings write still needs a receipt after
+                            # a cancellation or a newer project scan takes over.
+                            superseded(result, failure)
+                            try:
+                                self._publish(notify=False, outputs=False)
+                            except Exception:
+                                pass  # ui_sync reads the retained receipt.
                         if pending is not None:
                             launch(*pending)
 
@@ -754,7 +763,7 @@ class HMBSoundLibrary(DataNode):
                 worker.start()
 
             self._publish(notify=False)
-            launch(operation, generation)
+            launch(operation, generation, on_superseded)
 
     def _folder_projects(self):
         state = self._state_sound
@@ -800,6 +809,7 @@ class HMBSoundLibrary(DataNode):
             self._publish(notify=False, outputs=False)
             return
 
+        epoch = self._context_epoch
         def save():
             assets = None
             try:
@@ -811,18 +821,23 @@ class HMBSoundLibrary(DataNode):
             except (ValueError, OSError) as exc:
                 result["message"] = str(exc)
 
-            def commit():
+            def commit(*, report_status=True):
                 self._site_result = result
-                if assets is not None and root == self._state_sound["project_root"]:
+                if assets is not None and epoch == self._context_epoch and root == self._state_sound["project_root"]:
                     self._site_profile = profile
                     self._state_sound.update(assets=assets, folders=assets.folders)
                     if assets.warnings:
                         result["message"] = " / ".join(assets.warnings)
-                if result.get("message"):
+                if report_status and result.get("message"):
                     self._state_sound["status"] = result["message"]
                     return False
             return commit
-        self._start_job(save, "사운드 등록 폴더 확인 중…")
+        def finish_superseded(commit, failure):
+            if failure is None:
+                commit(report_status=False)
+            else:
+                self._site_result = {**result, "message": str(failure)}
+        self._start_job(save, "사운드 등록 폴더 확인 중…", on_superseded=finish_superseded)
 
     @hmb_binding_mutation
     def _command(self, value: Any) -> None:
