@@ -57,14 +57,21 @@ class ManualLUTRegression(unittest.TestCase):
                              "state": copy.deepcopy(self.node._hmb_color_lut_state), "project_id": identity, **kwargs})
         self.fixture.drain()
 
-    def enable_company_groups(self):
+    def enable_company_groups(self, *, destination=False, admin=True, role="member", home="seoul", writable=None):
         self.seoul = "grp-" + "1" * 32
         self.gwangju = "grp-" + "2" * 32
-        self.membership = self.seoul
-        self.admin = True
+        self.membership = {"seoul": self.seoul, "gwangju": self.gwangju, None: None}[home]
+        self.admin = admin
         self.owner = "fixture-owner"
         self.group_error = None
         self.group_requests = []
+        self.episodes = {self.seoul: ["e201"], self.gwangju: ["e202"], "ungrouped": ["e202"]}
+        scopes = [{"id": self.seoul, "name": "서울", "project_ids": ["superwings12"]},
+                  {"id": self.gwangju, "name": "광주", "project_ids": ["katuri8", "superwings12"]}]
+        self.writable = scopes if writable is None else [scopes[i] for i in writable]
+        if destination:
+            self.cap["group_destination"] = "group-v1"
+            self.cap["episodes_path"] = target.COLOR_LUT_MANUAL_UPLOAD_PATH + "/projects/{group_id}/{project_id}/episodes"
         self.bridge.review_capabilities = lambda: {"color_lut_manual_upload": self.cap, "company_groups_supported": True}
 
         def grouped(method, path, **kwargs):
@@ -74,20 +81,160 @@ class ManualLUTRegression(unittest.TestCase):
                     raise self.group_error
                 return {"schema": "hmb-company-groups-v1", "can_view_all": self.admin,
                         "membership": {"group_id": self.membership, "enabled": True},
-                        "items": [{"id": self.seoul, "name": "서울", "project_ids": ["superwings12"]},
-                                  {"id": self.gwangju, "name": "광주", "project_ids": ["katuri8", "superwings12"]}]}
+                        "items": scopes}
             if path == "/api/me":
-                return {"id": self.owner, "company_group_id": self.membership}
+                return {"id": self.owner, "role": role, "company_group_id": self.membership}
+            if destination and path == target.COLOR_LUT_MANUAL_UPLOAD_PATH + "/projects":
+                return {**self.request(method, path, **kwargs), "upload_groups": copy.deepcopy(self.writable)}
+            if destination and path.startswith(target.COLOR_LUT_MANUAL_UPLOAD_PATH + "/projects/") and path.endswith("/episodes"):
+                group, project = path.split("/")[-3:-1]
+                self.assertTrue(any(g["id"] == group and project in g["project_ids"] for g in self.writable))
+                return {"group_id": group, "project_id": project, "items": [{"episode": code} for code in self.episodes[group]]}
             if "/episodes?" in path:
+                self.assertFalse(destination, "Only the dedicated LUT endpoint supplies group-v1 episodes")
                 group = parse_qs(urlsplit(path).query)["group_id"][0]
-                self.assertIn(group, (self.seoul, self.gwangju, "ungrouped") if self.admin else (self.membership or "ungrouped",))
+                permitted = ([item["id"] for item in self.writable] if destination else [])
+                if group not in permitted:
+                    self.assertIn(group, (self.seoul, self.gwangju, "ungrouped") if self.admin else (self.membership or "ungrouped",))
                 return {"schema": "hmb-review-episodes-v1", "has_more": False,
-                        "items": [{"episode": "e201" if group == self.seoul else "e202"}]}
+                        "items": [{"episode": code} for code in self.episodes[group]]}
             return self.request(method, path, **kwargs)
 
         self.bridge._request_json = grouped
         self.node._schedule_manual_projects(force=True)
         self.fixture.drain()
+
+    def select_manual_destination(self, group, project, episode):
+        self.node._command({"id": "group-" + str(len(self.node._seen_commands)),
+                            "action": "select_upload_group", "group_id": group})
+        self.fixture.drain()
+        self.choose(project, group_id=group)
+        self.assertIn(episode, self.node.get_parameter_value(target.UI)["upload_episodes"])
+        self.node._command({"id": "episode-" + str(len(self.node._seen_commands)), "action": "select_upload_episode",
+                            "group_id": group, "project_id": project, "episode": episode})
+        self.fixture.drain()
+
+    def assert_group_button_requests(self, group, project, episode):
+        sent = []
+        def open_request(request, **kwargs):
+            self.assertEqual(request.method, "POST")
+            self.assertEqual(request.full_url, ORIGIN + target.COLOR_LUT_MANUAL_UPLOAD_PATH)
+            body = b"".join(request.data)
+            metadata = json.loads(body.split(b"\r\n\r\n", 1)[1].split(b"\r\n--", 1)[0])
+            self.assertEqual((metadata["group_id"], metadata["project_id"], metadata["episode"]), (group, project, episode))
+            identity = hashlib.sha256("\n".join(("hmb-color-lut-manual-group-v1", group, project, episode,
+                metadata["file_name"], metadata["export_sha256"], metadata["settings_sha256"])).encode()).hexdigest()
+            self.assertEqual(request.get_header("Idempotency-key"), identity)
+            sent.append((metadata["output_format"], identity))
+            return mock.MagicMock()
+        self.bridge._opener = types.SimpleNamespace(open=open_request)
+        self.bridge._load_access_token = lambda: "fixture-token"
+        for action, artifact in (("upload_web", "source"), ("export_upload", "export")):
+            context = self.ready(artifact)
+            self.assertTrue(self.node._upload_projection()["enabled"])
+            ack = {**self.ack(context), "group_id": group, "episode": episode}
+            generator = types.ModuleType("HMBSeedanceGeneration")
+            generator._broker_require_exact_response_url = mock.Mock()
+            generator._broker_read_json = mock.Mock(return_value=ack)
+            with mock.patch.dict(sys.modules, {"HMBSeedanceGeneration": generator}):
+                for attempt in ("first", "again"):
+                    self.node._command({"id": group + action + attempt, "action": action,
+                                        "state": copy.deepcopy(self.node._hmb_color_lut_state)})
+                    self.fixture.drain()
+            self.assertEqual(target._read_upload_receipt(context["receipt_id"])["phase"], "complete")
+        self.assertEqual([format_ for format_, _ in sent], ["mp4", "mov"])
+        return {key for _, key in sent}
+
+    def test_employee_two_buttons_send_only_the_authorized_group_project_episode(self):
+        self.enable_company_groups(destination=True, admin=False, writable=[0])
+        view = self.node.get_parameter_value(target.UI)
+        self.assertEqual([g["id"] for g in view["upload_groups"]], [self.seoul])
+        self.select_manual_destination(self.seoul, "superwings12", "e201")
+        self.assert_group_button_requests(self.seoul, "superwings12", "e201")
+
+    def test_team_lead_two_buttons_send_the_selected_group_project_episode(self):
+        self.enable_company_groups(destination=True, admin=False, home="seoul", role="leader")
+        self.select_manual_destination(self.gwangju, "katuri8", "e202")
+        self.assert_group_button_requests(self.gwangju, "katuri8", "e202")
+
+    def test_employee_can_use_lut_destination_outside_general_browsing_scope(self):
+        self.enable_company_groups(destination=True, admin=False, home="seoul")
+        self.group_error = HTTPError(ORIGIN, 403, "General catalog unavailable", {}, None)
+        fetch = self.bridge._request_json
+        def limited_gallery(method, path, **kwargs):
+            response = fetch(method, path, **kwargs)
+            if path == target.COLOR_LUT_MANUAL_UPLOAD_PATH + "/projects":
+                return {**response, "upload_projects": response["projects"], "projects": [
+                    {"project_id": "superwings12", "project_name": "슈퍼윙즈12"},
+                    {"project_id": "my-box", "project_name": "My Box"},
+                ]}
+            return response
+        self.bridge._request_json = limited_gallery
+        self.node._schedule_manual_projects(force=True)
+        self.fixture.drain()
+        self.select_manual_destination(self.gwangju, "katuri8", "e202")
+        self.assert_group_button_requests(self.gwangju, "katuri8", "e202")
+        self.assertIn("my-box", [p["id"] for p in self.node.get_parameter_value(target.UI)["upload_projects"]])
+        self.assertNotIn("/api/company-groups", self.group_requests)
+        self.assertIn(target.COLOR_LUT_MANUAL_UPLOAD_PATH + "/projects/" + self.gwangju + "/katuri8/episodes", self.group_requests)
+
+    def test_unassigned_admin_two_buttons_can_publish_to_both_authorized_groups(self):
+        self.enable_company_groups(destination=True, home=None, role="superadmin")
+        self.episodes[self.gwangju] = ["e201", "e202"]
+        self.select_manual_destination(self.seoul, "superwings12", "e201")
+        first_keys = self.assert_group_button_requests(self.seoul, "superwings12", "e201")
+        self.select_manual_destination(self.gwangju, "superwings12", "e201")
+        second_keys = self.assert_group_button_requests(self.gwangju, "superwings12", "e201")
+        self.assertTrue(first_keys.isdisjoint(second_keys))
+
+    def test_group_change_clears_project_and_rejects_a_different_episode_catalog(self):
+        self.enable_company_groups(destination=True, home="seoul")
+        self.select_manual_destination(self.seoul, "superwings12", "e201")
+        fetch = self.bridge._request_json
+        def other_destination(method, path, **kwargs):
+            response = fetch(method, path, **kwargs)
+            if path.endswith("/episodes"):
+                return {**response, "group_id": self.seoul}
+            return response
+        self.bridge._request_json = other_destination
+        self.node._command({"id": "change-group", "action": "select_upload_group", "group_id": self.gwangju})
+        self.fixture.drain()
+        view = self.node.get_parameter_value(target.UI)
+        self.assertFalse(view["manual_project"])
+        self.assertFalse(view["manual_episode"])
+        self.choose("superwings12", group_id=self.gwangju)
+        view = self.node.get_parameter_value(target.UI)
+        self.assertFalse(view["upload_episodes"])
+        self.assertFalse(view["web_upload"]["enabled"])
+
+    def test_revoked_selected_destination_blocks_both_buttons_and_my_box_stays_private(self):
+        self.enable_company_groups(destination=True, home=None, role="superadmin")
+        self.select_manual_destination(self.gwangju, "superwings12", "e202")
+        self.writable = [self.writable[0]]
+        with mock.patch.object(self.node, "_upload_request") as send:
+            for action in ("upload_web", "export_upload"):
+                self.node._command({"id": "revoked-" + action, "action": action,
+                                    "state": copy.deepcopy(self.node._hmb_color_lut_state)})
+                self.fixture.drain()
+            send.assert_not_called()
+        self.choose_my_box()
+        for artifact in ("source", "export"):
+            context = self.ready(artifact)
+            self.assertEqual(context["project_id"], "my-box")
+            metadata = self.node._upload_metadata(context)
+            self.assertNotIn("group_id", metadata)
+            self.assertNotIn("episode", metadata)
+
+    def test_group_upload_acknowledgement_cannot_substitute_another_destination(self):
+        self.enable_company_groups(destination=True, home=None, role="superadmin")
+        self.select_manual_destination(self.gwangju, "superwings12", "e202")
+        context = self.ready()
+        wrong = {**self.ack(context), "group_id": self.seoul, "episode": "e202"}
+        with mock.patch.object(self.node, "_upload_request", return_value=wrong) as send:
+            self.upload("wrong-ack")
+            self.assertTrue(send.called)
+        self.assertEqual(self.node._web_upload["phase"], "unknown")
+        self.assertNotEqual(target._read_upload_receipt(context["receipt_id"])["phase"], "complete")
 
     def test_admin_reads_another_group_without_submitting_or_adopting_own_receipt(self):
         self.enable_company_groups()

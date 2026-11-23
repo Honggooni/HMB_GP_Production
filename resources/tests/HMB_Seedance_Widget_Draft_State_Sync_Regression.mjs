@@ -127,6 +127,34 @@ try {
     assert.deepEqual(results.views.map((value) => value.disabled), [true, true, false]);
     assert.deepEqual(results.accepted, [false, false, true]); assert.deepEqual(results.counts, [0, 0, 1]);
   });
+  for (const shot of [0, 1]) {
+    await check(`completed-Draft-480p-status-arrival-unblocks-same-control-after-reopen-${shot ? "shot" : "only"}`, async () => {
+      await page.evaluate(shot => {
+        const f = createFixture(makeState(shot, { source_completed:true, final_state:"checking",
+          final_available:false, final_visible:true }));
+        window.originalFinalizeControl = f.button();
+      }, shot);
+      const button = page.locator("[data-hmb-seedance-finalize-draft]");
+      const select = page.locator("select[data-hmb-seedance-final-resolution]");
+      assert.equal(await button.isVisible(), true);
+      assert.equal(await button.textContent(), "Final 상태 확인 중…");
+      assert.equal(await button.isDisabled(), true);
+      assert.equal(await select.inputValue(), "1080p");
+      await page.evaluate(shot => {
+        const f = fixtures[0];
+        f.update(makeState(shot, { source_completed:true, final_state:"available", final_available:true,
+          finals_by_resolution:{"1080p":"available", "4k":"available"} }));
+      }, shot);
+      assert.equal(await page.evaluate(() => fixtures[0].button() === window.originalFinalizeControl), true);
+      assert.equal(await button.isEnabled(), true);
+      assert.equal(await button.textContent(), "생성");
+      await select.selectOption("4k");
+      assert.equal(await page.evaluate(() => fixtures[0].commands.length), 0, "Reading or selecting does not create a render");
+      await button.dblclick();
+      const calls = await page.evaluate(async () => { await flushFrames(); return fixtures[0].commands; });
+      assert.deepEqual(calls.map(c => [c.action,c.final_resolution]), [["finalize_draft","4k"]]);
+    });
+  }
   await check("shared-server-reservation-running-unknown-states-never-dispatch-another-final", async () => {
     const results = await page.evaluate(async () => {
       const all = ["reserved", "running", "unknown", "unavailable"].map((final_state) => createFixture(makeState(1,
@@ -140,6 +168,27 @@ try {
     assert.equal(results.views[2].text, "Final 확인 필요"); assert.deepEqual(results.accepted, [false, false, false, false]);
     assert.deepEqual(results.commands, []);
   });
+  for (const status of ["unknown", "unavailable"]) {
+    await check(`retry-${status}-checks-only-the-completed-Draft-without-generating`, async () => {
+      const job = await page.evaluate(status => {
+        const f = createFixture(makeState(1, {source_completed:true, final_available:false, final_state:status}));
+        return f.state.draft.job_id;
+      }, status);
+      const retry = page.locator("[data-hmb-seedance-retry-final]");
+      assert.equal(await retry.isVisible(), true);
+      assert.equal(await retry.textContent(), "상태 다시 조회");
+      assert.equal(await page.locator("[data-hmb-seedance-finalize-draft]").isVisible(), false);
+      await retry.click();
+      const commands = await page.evaluate(async () => {await flushFrames(); return fixtures[0].commands;});
+      assert.deepEqual(commands.map(c=>[c.action,c.expected_draft_job_id]), [["refresh_draft_final_status",job]]);
+      assert.equal(Object.hasOwn(commands[0],"final_resolution"),false);
+      await page.evaluate(() => fixtures[0].update(makeState(1,{source_completed:true,final_state:"available",
+        finals_by_resolution:{"1080p":"available","4k":"available"}})));
+      assert.equal(await retry.isVisible(), false);
+      assert.equal(await page.locator("[data-hmb-seedance-finalize-draft]").isEnabled(), true);
+      assert.equal(await page.evaluate(()=>fixtures[0].commands.length),1);
+    });
+  }
   await check("legacy-receipt-shows-only-the-unconfirmed-alternate-for-a-known-completed-target", async () => {
     const results = await page.evaluate(async () => {
       const all = ["completed", "consumed", "expired", "not_draft"].map((final_state) => createFixture(makeState(1,

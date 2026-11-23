@@ -701,6 +701,7 @@ function render(state) {
         <div class="hmb-seedance-shot__final-controls nodrag nopan" data-hmb-seedance-final-controls hidden>
           <select class="hmb-seedance-shot__final-quality nodrag nopan" data-hmb-seedance-final-resolution aria-label="출력 해상도" hidden disabled></select>
           <button type="button" class="hmb-seedance-shot__final nodrag" data-hmb-seedance-finalize-draft hidden disabled title="${HMB_SEEDANCE_FINAL_HELP}">생성</button>
+          <button type="button" class="hmb-seedance-shot__final nodrag" data-hmb-seedance-retry-final hidden>상태 다시 조회</button>
         </div>
         <span class="hmb-seedance-shot__number" data-seedance-shot-number>${hmbSeedanceShotBadge(state)}</span>
         <select class="hmb-seedance-shot__select nodrag" aria-label="Shot">${optionMarkup(state)}</select>
@@ -1411,11 +1412,11 @@ function hmbSeedanceCommandBridgeWidget(container, props) {
         const source = rawCommand && typeof rawCommand === "object" ? rawCommand : {};
         const action = text(source.action, 48).toLowerCase();
         const actionId = text(source.action_id, 128);
-        if (!["refresh_existing", "open_gallery", "finalize_draft", "cancel_draft_final"].includes(action) || !actionId) {
+        if (!["refresh_existing", "open_gallery", "finalize_draft", "cancel_draft_final", "refresh_draft_final_status"].includes(action) || !actionId) {
           throw new Error("Seedance refresh command is invalid.");
         }
         const expectedDraftJobId = text(source.expected_draft_job_id, 160);
-        const draftCommand = ["finalize_draft", "cancel_draft_final"].includes(action);
+        const draftCommand = ["finalize_draft", "cancel_draft_final", "refresh_draft_final_status"].includes(action);
         // This is an identity assertion only. The host separately authorizes
         // public Shot/Only and owner-private My Box sources before any submit.
         if (draftCommand && !/^job-(?:mybox-)?[0-9a-f]{32}$/.test(expectedDraftJobId)) {
@@ -1978,6 +1979,18 @@ export function hmbSeedanceSyncDraftAction(container, state) {
     : !button.disabled ? HMB_SEEDANCE_FINAL_HELP : ended && !draft.finals_by_resolution && target && target !== draft.final_resolution
     ? "브로커에서 선택한 해상도의 생성 가능 여부를 확인해야 합니다." : state.draft.reason || HMB_SEEDANCE_FINAL_HELP);
   const status = !ended && !verifiedAvailable ? draft.final_state : draftFinalTargetState(draft, target);
+  const retry = group.querySelector("[data-hmb-seedance-retry-final]");
+  const canRetry = supportedSource && draft.source_completed === true && !draft.busy && !cancelling
+    && /^job-[0-9a-f]{32}$/.test(draft.job_id) && ["unknown", "unavailable"].includes(draft.final_state);
+  if (retry) {
+    retry.hidden = !canRetry;
+    retry.title = canRetry ? draft.reason : "";
+    if (canRetry) {
+      group.hidden = false;
+      button.hidden = true;
+      quality.hidden = true;
+    }
+  }
   const statusLabel = status === "completed" ? "생성 완료"
     : status === "consumed" ? "Final 접수됨"
     : status === "checking" ? "Final 상태 확인 중…"
@@ -2805,6 +2818,24 @@ function hmbNativeUiImplementation(container, props) {
   hmbSeedanceSyncRemotePromptEdge(container, initialState);
   const select = container.querySelector?.(".hmb-seedance-shot__select");
   const onFinalize = (event) => {
+    const retry = event.target?.closest?.("[data-hmb-seedance-retry-final]");
+    if (retry && !retry.hidden && event.detail <= 1 && container.contains(retry)) {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      const { draft } = hmbSeedanceShotState(container.__hmbSeedanceLatestProps || {});
+      if (draft.source_completed && !draft.busy && ["unknown", "unavailable"].includes(draft.final_state)
+          && /^job-[0-9a-f]{32}$/.test(draft.job_id)) {
+        const bridge = hmbSeedanceRefreshCommandBridge(container);
+        const failed = () => { retry.title = "상태 조회 요청을 전달하지 못했습니다. 엔진 연결을 확인하세요."; };
+        if (!bridge) failed();
+        else try {
+          Promise.resolve(bridge.dispatch({action: "refresh_draft_final_status",
+            action_id: `draft-status-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`,
+            issued_at_ms: Date.now(), expected_draft_job_id: draft.job_id})).catch(failed);
+        } catch { failed(); }
+      }
+      return;
+    }
     const button = event.target?.closest?.("[data-hmb-seedance-finalize-draft]");
     if (!button || button.disabled || button.hidden || event.detail > 1 || !container.contains(button)) return;
     event.preventDefault?.();

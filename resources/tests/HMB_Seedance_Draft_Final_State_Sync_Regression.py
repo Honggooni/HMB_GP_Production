@@ -408,14 +408,33 @@ class DraftFinalStateSyncTests(unittest.TestCase):
             node._store_draft_source({**node.source, "final_request_id": t._seedance_draft_final_request_id(JOB)})
             identity = node._draft_final_status_identity(node.source)
             node.opener.reply = urllib.error.URLError("synthetic timeout")
-            async def stop(_seconds):
-                node.live = False
-            with mock.patch.object(t.asyncio, "sleep", stop):
-                await node._poll_draft_final_server_state(node.source, identity)
+            polling = asyncio.create_task(node._poll_draft_final_server_state(node.source, identity))
+            for _ in range(100):
+                if getattr(node, "_hmb_draft_final_status_wake", None):
+                    break
+                await asyncio.sleep(.01)
             self.assertEqual(node._hmb_draft_final_status_cache["value"]["state"], "unknown")
             self.assertEqual(len(node.opener.calls), 1)
             self.assertEqual(node._draft_source_record()["final_request_id"], t._seedance_draft_final_request_id(JOB))
+            self.assertIn("다시 조회", node._hmb_draft_final_status_cache["value"]["status_reason"])
+            node.opener.reply = projection(node.source, "completed", consumed=True,
+                child_task_id=CHILD, child_status="completed")
+            node._hmb_draft_final_status_wake[2].set()
+            await asyncio.wait_for(polling, 2)
+            self.assertEqual([call[0] for call in node.opener.calls], ["GET", "GET"])
+            self.assertEqual(node._draft_ui_state()["final_state"], "completed")
         asyncio.run(scenario())
+
+    def test_unscheduled_lookup_uses_only_a_fresh_authenticated_reply(self):
+        node = Node()
+        node.query()
+        node._schedule_draft_final_status_sync.return_value = False
+        self.assertTrue(node._draft_ui_state()["final_available"])
+        node._hmb_draft_final_status_cache["received_at"] -= t._DRAFT_FINAL_SYNC_SECONDS + 6
+        ui = node._draft_ui_state()
+        self.assertEqual(ui["final_state"], "unavailable")
+        self.assertFalse(ui["final_available"])
+        self.assertIn("엔진", ui["reason"])
 
     def test_unrelated_preview_busy_hides_old_final_and_has_no_native_cancel(self):
         node = Node()

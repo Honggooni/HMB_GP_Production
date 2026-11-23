@@ -444,7 +444,7 @@ async def exercise(engine, phase, out):
         check_connected_only_agent(engine, t, agents, gen)
 
 
-def run_phase(phase, out, *, workspace=None):
+def run_phase(phase, out, *, workspace=None, exercise_flow=exercise, use_standard=True):
     private = out / (phase + "-profile")
     for key, leaf in (("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state"),
                       ("XDG_CACHE_HOME", "cache"), ("LOCALAPPDATA", "local"), ("APPDATA", "app"),
@@ -453,7 +453,9 @@ def run_phase(phase, out, *, workspace=None):
         folder.mkdir(parents=True, exist_ok=True)
         os.environ[key] = str(folder)
     os.environ["HMB_GRIPTAPE_STANDARD_LIBRARY_PATH"] = str(STANDARD)
-    sys.path[:0] = [str(ROOT), str(ROOT / "resources/tests"), str(STANDARD), str(STANDARD / ".venv/Lib/site-packages")]
+    sys.path[:0] = [str(ROOT), str(ROOT / "resources/tests")]
+    if use_standard:
+        sys.path[2:2] = [str(STANDARD), str(STANDARD / ".venv/Lib/site-packages")]
     sys.dont_write_bytecode = True
     attempts = []
     original_connect = socket.socket.connect
@@ -484,7 +486,7 @@ def run_phase(phase, out, *, workspace=None):
             logging.disable(logging.CRITICAL)
             from griptape_nodes.retained_mode.engine import engine_scope
             with engine_scope() as engine:
-                asyncio.run(exercise(engine, phase, out))
+                asyncio.run(exercise_flow(engine, phase, out))
     except BaseException as exc:
         error = exc
         raise

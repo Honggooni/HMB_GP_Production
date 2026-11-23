@@ -230,6 +230,22 @@ try {
   await page.evaluate(()=>{window.state={...window.state,revision:167,manual_episode:'',upload_episodes:['e202']};window.controller.update(window.props());});
   await episode.selectOption('e202');
   assert.equal(await page.evaluate(()=>window.commands.at(-1).group_id),'grp-seoul');
+  for (const [index, [control, action]] of [[button,'upload_web'], [outputButton,'export_upload']].entries()) {
+    await page.evaluate(({admin, index}) => {
+      window.state = {...admin, revision:168+index, upload_group:{id:'grp-seoul',name:'서울'},
+        upload_destination_readonly:false, manual_group_id:'grp-seoul', manual_project:{id:'katuri8',name:'까투리8'},
+        project_id:'katuri8', upload_episodes:['e202'], manual_episode:'e202'};
+      window.controller.update(window.props());
+    }, {admin,index});
+    assert.equal(await control.isEnabled(),true);
+    await control.click();
+    const destination = await page.evaluate(() => {
+      const command = window.commands.at(-1);
+      const state = command.state;
+      return [command.action, state.upload_group.id, state.manual_project.id, state.manual_episode];
+    });
+    assert.deepEqual(destination,[action,'grp-seoul','katuri8','e202']);
+  }
   await page.evaluate(({admin,mybox})=>{window.state={...admin,...mybox,revision:170,upload_group_selectable:true,upload_destination_readonly:true};window.controller.update(window.props());},{admin,mybox});
   assert.equal(await group.inputValue(),'개인');
   assert.equal(await button.isEnabled(),true,'My Box stays private and writable');

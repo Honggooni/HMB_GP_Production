@@ -927,7 +927,7 @@ def _seedance_refresh_command_value(value: Any = None) -> dict[str, Any]:
     if (
         source.get("schema") != SEEDANCE_REFRESH_COMMAND_SCHEMA
         or source.get("version") != SEEDANCE_REFRESH_COMMAND_VERSION
-        or action not in {"refresh_existing", "open_gallery", "finalize_draft", "cancel_draft_final"}
+        or action not in {"refresh_existing", "open_gallery", "finalize_draft", "cancel_draft_final", "refresh_draft_final_status"}
         or not action_id
         or len(action_id) > 128
         or _TASK_ID_PATTERN.fullmatch(action_id) is None
@@ -945,7 +945,7 @@ def _seedance_refresh_command_value(value: Any = None) -> dict[str, Any]:
         "action_id": action_id,
         "issued_at_ms": issued_at_ms,
     }
-    if action in {"finalize_draft", "cancel_draft_final"}:
+    if action in {"finalize_draft", "cancel_draft_final", "refresh_draft_final_status"}:
         expected = source.get("expected_draft_job_id")
         if not isinstance(expected, str) or re.fullmatch(r"job-(?:mybox-)?[0-9a-f]{32}", expected) is None:
             result.update(action="", action_id="")
@@ -1088,6 +1088,19 @@ _DRAFT_FINAL_SERVER_STATES = frozenset({"available", "source_pending", "reserved
     "completed", "consumed", "expired", "unknown", "not_draft"})
 _DRAFT_FINAL_HIDDEN_STATES = frozenset({"completed", "consumed", "expired", "not_draft"})
 _DRAFT_FINAL_SYNC_SECONDS = 10.0
+
+
+def _draft_final_lookup_reason(error: Exception) -> str:
+    status = getattr(error, "status_code", None)
+    if isinstance(error, _BrokerAuthenticationError) or status == 401:
+        return "브로커 로그인이 필요합니다. 원래 계정으로 연결한 뒤 Final 상태를 다시 조회하세요."
+    if status in (403, 404):
+        return f"이 계정으로 Draft 상태를 조회할 수 없습니다 (HTTP {status}). 원래 계정과 프로젝트를 확인하세요."
+    if type(status) is int:
+        return f"브로커의 Final 상태 조회가 실패했습니다 (HTTP {status}). 다시 조회하세요."
+    if isinstance(error, _BrokerProtocolError):
+        return "브로커 응답에서 이 Draft의 작업과 해상도별 상태를 확인할 수 없습니다. 다시 조회하세요."
+    return "브로커의 Final 상태 조회가 완료되지 않았습니다. 연결을 확인하고 다시 조회하세요."
 
 
 def _seedance_draft_final_state_value(value: Any, source: dict[str, Any], *, resolution: str | None = None,
@@ -6980,9 +6993,24 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             daemon=True,
         ).start()
 
+    def _draft_workflow_context(self):
+        owner = getattr(self, "workflow", None)
+        return owner.engine.bind_workflow(owner) if owner is not None else nullcontext()
+
+    def _draft_command_matches(self, job_id: str) -> bool:
+        with self._draft_workflow_context():
+            if not self._runtime_node_is_live(require_registered=True):
+                return False
+            state = self._draft_ui_state()
+            return bool(state["final_available"] and state["job_id"] == job_id)
+
     def _on_finalize_draft_clicked(self, _button: Any, _details: Any, *, action_id: str = "",
                                    expected_draft_job_id: str = "", final_resolution: str = "1080p") -> Any:
         """Capture one exact completed Draft and dispatch only this Generator."""
+        with self._draft_workflow_context():
+            return self._schedule_bound_draft_final(_details, action_id, expected_draft_job_id, final_resolution)
+
+    def _schedule_bound_draft_final(self, _details: Any, action_id: str, expected_draft_job_id: str, final_resolution: str) -> Any:
         reserved_here = False
         try:
             if final_resolution not in DRAFT_FINAL_RESOLUTIONS:
@@ -8577,12 +8605,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self._hmb_pending_generation_command_action = "open_gallery"
                 self._hmb_pending_gallery_origin = self._selected_broker_server_url()
             elif (normalized["action"] == "finalize_draft" and action_id and action_id not in processed_ids
-                    and self._runtime_node_is_live(require_registered=True)
-                    and self._draft_ui_state()["final_available"]
-                    and ((self._draft_ui_state().get("job_id") if _my_box_node.is_selected(self)
-                          else self._draft_source_record().get("draft_job_id")) == normalized.get("expected_draft_job_id"))):
+                    and self._draft_command_matches(normalized.get("expected_draft_job_id", ""))):
                 self._hmb_pending_generation_command_id = action_id
                 self._hmb_pending_generation_command_action = "finalize_draft"
+            elif (normalized["action"] == "refresh_draft_final_status" and action_id and action_id not in processed_ids
+                    and not _my_box_node.is_selected(self)
+                    and normalized.get("expected_draft_job_id") == self._draft_source_record().get("draft_job_id")):
+                self._hmb_pending_generation_command_id = action_id
+                self._hmb_pending_generation_command_action = "refresh_draft_final_status"
             elif (normalized["action"] == "cancel_draft_final" and action_id and action_id not in processed_ids
                     and self._hmb_draft_finalize_pending
                     and self._active_draft_job_id() == normalized.get("expected_draft_job_id")):
@@ -8878,6 +8908,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     self._hmb_processed_generation_command_ids = retained
                 if command_action == "open_gallery":
                     self._schedule_open_review_gallery(gallery_origin)
+                elif command_action == "refresh_draft_final_status":
+                    source = self._draft_source_record()
+                    if (isinstance(value, dict) and value.get("action_id") == action_id and source
+                            and source["draft_job_id"] == value.get("expected_draft_job_id")):
+                        self._sync_seedance_shot_widget(emit_change=True)
+                        wake = getattr(self, "_hmb_draft_final_status_wake", None)
+                        if wake and wake[0] == source["draft_job_id"] and not wake[1].is_closed():
+                            wake[1].call_soon_threadsafe(wake[2].set)
                 elif command_action == "finalize_draft":
                     expected = value.get("expected_draft_job_id") if isinstance(value, dict) else ""
                     if isinstance(value, dict) and value.get("action_id") == action_id:
@@ -11791,33 +11829,50 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if bridge is None:
             bridge = self._get_broker_bridge(server_url=source["broker_server_url"])
         try:
-            state = await asyncio.to_thread(bridge.get_draft_final_state, source, timeout=5.0)
+            state = await asyncio.wait_for(asyncio.to_thread(bridge.get_draft_final_state, source, timeout=5.0), 7.0)
             if not self._apply_draft_final_server_state(source, identity, state):
                 raise _BrokerProtocolError("The Draft or Broker account changed while checking Final status.")
-        except Exception:
+        except Exception as exc:
             with suppress(Exception):
                 self._apply_draft_final_server_state(source, identity, {"state": "unknown", "eligible": False,
-                    "consumed": None, "source_task_id": source["draft_job_id"], "child_task_id": None})
+                    "consumed": None, "source_task_id": source["draft_job_id"], "child_task_id": None,
+                    "status_reason": _draft_final_lookup_reason(exc)})
             raise
         return deepcopy(self._hmb_draft_final_status_cache["value"])
 
-    def _schedule_draft_final_status_sync(self, source: dict[str, Any], identity: tuple[str, ...]) -> None:
-        if getattr(self, "_web_owner", None) is not None or not self._runtime_node_is_live(require_registered=True):
-            return
+    def _schedule_draft_final_status_sync(self, source: dict[str, Any], identity: tuple[str, ...]) -> bool:
+        if getattr(self, "_web_owner", None) is not None:
+            return False
+        owner = getattr(self, "workflow", None)
+        if owner is not None:
+            if (owner.closed or getattr(self, "_hmb_node_deleted", False)
+                    or owner.objects.get(self.name) is not self):
+                return False
+        elif not self._runtime_node_is_live(require_registered=True):
+            return False
         future = getattr(self, "_hmb_draft_final_status_future", None)
         if future is not None and not future.done():
             if getattr(self, "_hmb_draft_final_status_scope", ()) == identity:
-                return
+                return True
             future.cancel()
         try:
-            loop = getattr(GriptapeNodes.EventManager(), "event_loop", None)
+            manager = owner.engine.event_manager if owner is not None else GriptapeNodes.EventManager()
+            loop = manager.event_loop
             if loop is None or not loop.is_running():
-                return
-            self._hmb_draft_final_status_scope = identity
-            self._hmb_draft_final_status_future = asyncio.run_coroutine_threadsafe(
-                self._poll_draft_final_server_state(deepcopy(source), identity), loop)
+                return False
+            # A retained widget callback may run with no workflow bound. The
+            # polling task inherits the source's workflow on the owning loop.
+            with self._draft_workflow_context():
+                task = self._poll_draft_final_server_state(deepcopy(source), identity)
+                try:
+                    self._hmb_draft_final_status_future = asyncio.run_coroutine_threadsafe(task, loop)
+                except RuntimeError:
+                    task.close()
+                    raise
+                self._hmb_draft_final_status_scope = identity
+            return True
         except (RuntimeError, AttributeError):
-            return
+            return False
 
     async def _poll_draft_final_server_state(self, source: dict[str, Any], identity: tuple[str, ...]) -> None:
         while self._runtime_node_is_live(require_registered=True):
@@ -11828,9 +11883,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 state = await self._query_draft_final_server_state(source)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 state = {"state": "unknown", "eligible": False, "consumed": None,
-                         "source_task_id": source["draft_job_id"], "child_task_id": None}
+                         "source_task_id": source["draft_job_id"], "child_task_id": None,
+                         "status_reason": _draft_final_lookup_reason(exc)}
                 with suppress(Exception):
                     if not self._apply_draft_final_server_state(source, identity, state):
                         return
@@ -11838,21 +11894,35 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self._sync_seedance_shot_widget(emit_change=True)
             if _draft_final_settled(state):
                 return
-            await asyncio.sleep(_DRAFT_FINAL_SYNC_SECONDS)
+            if state.get("state") == "unknown":
+                wake = (source["draft_job_id"], asyncio.get_running_loop(), asyncio.Event())
+                self._hmb_draft_final_status_wake = wake
+                try:
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(wake[2].wait(), timeout=_DRAFT_FINAL_SYNC_SECONDS)
+                finally:
+                    if self._hmb_draft_final_status_wake is wake:
+                        self._hmb_draft_final_status_wake = None
+            else:
+                await asyncio.sleep(_DRAFT_FINAL_SYNC_SECONDS)
 
     def _draft_final_server_snapshot(self, source: dict[str, Any]) -> dict[str, Any]:
         try:
             identity = self._draft_final_status_identity(source)
-        except Exception:
-            return {"state": "unavailable", "eligible": False, "child_task_id": None}
+        except Exception as exc:
+            return {"state": "unavailable", "eligible": False, "child_task_id": None,
+                    "status_reason": _draft_final_lookup_reason(exc)}
         cached = getattr(self, "_hmb_draft_final_status_cache", {})
         if cached.get("identity") == identity and _draft_final_settled(cached.get("value", {})):
             return deepcopy(cached["value"])
-        self._schedule_draft_final_status_sync(source, identity)
+        scheduled = self._schedule_draft_final_status_sync(source, identity)
         if cached.get("identity") == identity:
             value = cached.get("value", {})
             if time.monotonic() - cached.get("received_at", 0) <= _DRAFT_FINAL_SYNC_SECONDS + 5:
                 return deepcopy(value)
+        if scheduled is False:
+            return {"state": "unavailable", "eligible": False, "child_task_id": None,
+                    "status_reason": "Griptape 엔진에서 이 Draft의 상태 조회를 시작할 수 없습니다. 엔진 연결 후 다시 조회하세요."}
         return {"state": "checking", "eligible": False, "child_task_id": None}
 
     def _bound_draft_final_source(self, source: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -11940,7 +12010,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 elif "expired" in reason.lower() and not final_task_id:
                     final_state = "expired"
             if not final_available and not reason:
-                reason = {"checking": "Final 상태를 확인하고 있습니다.",
+                reason = server.get("status_reason") or {"checking": "Final 상태를 확인하고 있습니다.",
                     "reserved": "이 Draft의 Final 요청이 접수되었습니다. 웹에서 같은 Task를 확인하세요.",
                     "running": "이 Draft의 Final이 처리 중입니다. 웹에서 같은 Task를 확인하세요.",
                     "unknown": "Final 상태를 확인할 수 없습니다. 새 렌더 대신 기존 Task를 조회하세요.",

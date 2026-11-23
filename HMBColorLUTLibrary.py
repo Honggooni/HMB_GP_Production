@@ -82,6 +82,7 @@ _USAGE_ACTIVE: set[str] = set()
 COLOR_LUT_UPLOAD_SCHEMA = "hmb-color-lut-upload"
 COLOR_LUT_MANUAL_UPLOAD_SCHEMA = "hmb-color-lut-manual-upload"
 COLOR_LUT_MANUAL_UPLOAD_PATH = "/api/v1/reviews/color-lut/manual"
+_MANUAL_EPISODES_PATH = COLOR_LUT_MANUAL_UPLOAD_PATH + "/projects/{group_id}/{project_id}/episodes"
 
 
 def _advertised_api_path_matches(value: Any, expected: str, server_url: str) -> bool:
@@ -430,6 +431,24 @@ def _upload_project(value: Any) -> dict[str, str]:
     return {"id": identity, "name": name}
 
 
+def _writable_upload_groups(rows, projects):
+    """Validate the authenticated manual-upload destinations, including their project assignments."""
+    if not isinstance(rows, list) or len(rows) > 1000:
+        raise ValueError("서버의 업로드 가능 그룹 목록을 확인하세요.")
+    allowed_projects = {p["id"] for p in projects if p["id"] != "my-box"}
+    result = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("서버의 업로드 가능 그룹 정보를 확인하세요.")
+        key, name, ids = row.get("id"), row.get("name"), row.get("project_ids")
+        if (not isinstance(key, str) or not re.fullmatch(r"grp-[a-f0-9]{32}", key) or key in result
+                or not isinstance(name, str) or not 1 <= len(name.strip()) <= 64
+                or not isinstance(ids, list) or any(not isinstance(p, str) for p in ids)):
+            raise ValueError("서버의 업로드 가능 그룹 정보를 확인하세요.")
+        result[key] = {"id": key, "name": name, "project_ids": allowed_projects.intersection(ids)}
+    return result
+
+
 def _upload_company_scope(bridge: Any, capabilities: Mapping[str, Any], me=None):
     """Read the same membership and project assignments as the operating page."""
     if capabilities.get("company_groups_supported") is not True:
@@ -576,6 +595,7 @@ class HMBColorLUTLibrary(DataNode):
         self._group_catalog = {}
         self._all_manual_projects = []
         self._group_selectable = False
+        self._explicit_upload_groups = False
         self._group_owner = ""
         self._catalog_generation = 0
         self._manual_projects_worker: threading.Thread | None = None
@@ -679,7 +699,8 @@ class HMBColorLUTLibrary(DataNode):
         result = state.get("result") if isinstance(state.get("result"), Mapping) else {}
         return _digest([_selection_key(state), _source_identity(state.get("source")),
                         normalize_settings(state.get("settings")), _audio_mix_identity(state), result.get("path"), result.get("job_id"),
-                        state.get("manual_episode") if not state["shot"].get("shot_uuid") else ""])
+                        (state.get("manual_group_id"), state.get("manual_group_owner"), state.get("manual_episode"))
+                        if not state["shot"].get("shot_uuid") else ""])
 
     def _receive_sound(self, value: Any, *, publish: bool = True) -> None:
         # The published digest is UI/proof invalidation only. Execution reads the
@@ -857,6 +878,9 @@ class HMBColorLUTLibrary(DataNode):
 
     def _read_only_group(self, state):
         selected = state.get("manual_group_id")
+        if self._explicit_upload_groups:
+            return bool(selected and not state["shot"].get("shot_uuid") and state["manual_project"].get("id") != "my-box"
+                        and (selected not in self._group_catalog or state.get("manual_group_owner") != self._group_owner))
         return bool(not state["shot"].get("shot_uuid") and state["manual_project"].get("id") != "my-box"
                     and selected and (selected != self._member_group_id or not self._group_owner))
 
@@ -868,7 +892,7 @@ class HMBColorLUTLibrary(DataNode):
             self._upload_group = {"id": selected, "name": row["name"]}
             self._upload_group_status = "unassigned" if selected == "ungrouped" else "confirmed"
             projects = row["project_ids"]
-        elif selected == self._member_group_id:
+        elif selected == self._member_group_id and not self._explicit_upload_groups:
             self._upload_group, self._upload_group_status = dict(member_group), status
             projects = None
         else:
@@ -890,6 +914,7 @@ class HMBColorLUTLibrary(DataNode):
             origin, projects, notice = "", [], "unavailable"
             group_status, group = "unavailable", {}
             available, selectable, owner = {}, False, ""
+            explicit = False
             try:
                 from _hmb_broker_config import load_broker_base_url
                 origin = load_broker_base_url()
@@ -903,14 +928,24 @@ class HMBColorLUTLibrary(DataNode):
                         or type(cap.get("version")) is not int or cap["version"] != 1
                         or not _advertised_api_path_matches(cap.get("projects_path"), COLOR_LUT_MANUAL_UPLOAD_PATH + "/projects", origin)):
                     raise ValueError("서버 업데이트 후 프로젝트를 선택할 수 있습니다.")
-                projects = self._manual_project_rows(bridge)
+                explicit = cap.get("group_destination") == "group-v1"
+                projects, group_rows = self._manual_upload_catalog(bridge, explicit=explicit)
+                if explicit and not _advertised_api_path_matches(cap.get("episodes_path"), _MANUAL_EPISODES_PATH, origin):
+                    raise ValueError("서버의 LUT 에피소드 경로를 확인하세요.")
                 me = None
-                if capabilities.get("company_groups_supported") is True:
+                if explicit or capabilities.get("company_groups_supported") is True:
                     me = bridge._request_json("GET", "/api/me", payload=None, timeout=5)
                     if not me.get("id"):
                         raise ValueError("브로커 로그인 계정을 확인하세요.")
                     owner = _digest([origin, str(me["id"])])
-                group_status, group, available, selectable = _upload_company_scope(bridge, capabilities, me)
+                if explicit:
+                    writable = _writable_upload_groups(group_rows, projects)
+                    member = me.get("company_group_id") or "ungrouped"
+                    group = {"id": member, "name": writable.get(member, {}).get("name", "")}
+                    group_status = "unassigned" if member == "ungrouped" else "confirmed"
+                    available, selectable = writable, bool(writable)
+                else:
+                    group_status, group, available, selectable = _upload_company_scope(bridge, capabilities, me)
                 notice = "" if projects else "empty"
             except Exception:
                 LOGGER.debug("Color LUT manual projects unavailable")
@@ -925,12 +960,14 @@ class HMBColorLUTLibrary(DataNode):
                     self._web_upload_epoch += 1
                 if (self._manual_projects_origin != origin or self._all_manual_projects != projects
                         or self._group_catalog != available or self._member_group_id != group.get("id", "")
-                        or self._group_owner != owner or self._group_selectable != selectable):
+                        or self._group_owner != owner or self._group_selectable != selectable
+                        or self._explicit_upload_groups != explicit):
                     self._catalog_generation += 1
                     self._episode_cache.clear()
                     self._episode_key, self._episode_codes = None, []
                     self._episodes_checked = 0.0
                 self._group_catalog, self._group_selectable, self._group_owner = available, selectable, owner
+                self._explicit_upload_groups = explicit
                 self._all_manual_projects, self._manual_projects_origin = projects, origin
                 self._member_group_id = group.get("id", "")
                 saved = state.get("manual_group_id")
@@ -958,6 +995,7 @@ class HMBColorLUTLibrary(DataNode):
                 return
             origin = self._manual_projects_origin
             group_id = self._upload_group.get("id", "")
+            explicit = self._explicit_upload_groups
             generation = self._catalog_generation
             selected = state["manual_project"].get("id") if not state["shot"].get("shot_uuid") else None
             allowed = {row["id"] for row in self._manual_projects if row["id"] != "my-box"}
@@ -1004,8 +1042,9 @@ class HMBColorLUTLibrary(DataNode):
                     bridge = _usage_bridge(key[0])
                     if bridge is None:
                         return
-                    query = "/api/v1/reviews/episodes?paged=true&project_id=" + quote(project_id, safe="")
-                    if group_id:
+                    query = (_MANUAL_EPISODES_PATH.format(group_id=quote(group_id, safe=""), project_id=quote(project_id, safe=""))
+                             if explicit else "/api/v1/reviews/episodes?paged=true&project_id=" + quote(project_id, safe=""))
+                    if group_id and not explicit:
                         query += "&group_id=" + quote(group_id, safe="")
                     path, cursors = query, set()
                     while path:
@@ -1024,7 +1063,9 @@ class HMBColorLUTLibrary(DataNode):
                                 with self._lock:
                                     if not still_allowed():
                                         return
-                        if page.get("schema") != "hmb-review-episodes-v1" or not isinstance(page.get("items"), list):
+                        if (not isinstance(page.get("items"), list)
+                                or (explicit and (page.get("group_id"), page.get("project_id")) != (group_id, project_id))
+                                or (not explicit and page.get("schema") != "hmb-review-episodes-v1")):
                             return
                         previous_count = len(codes)
                         codes.update(code for row in page["items"] if isinstance(row, dict) and (code := _episode_code(row.get("episode"))))
@@ -1036,7 +1077,7 @@ class HMBColorLUTLibrary(DataNode):
                                     self._episode_codes = sorted(codes.union(self._episode_codes))
                                     self._hmb_color_lut_state["revision"] += 1
                                     self._publish()
-                        if not page.get("has_more"):
+                        if explicit or not page.get("has_more"):
                             complete = True
                             break
                         cursor = page.get("next_cursor")
@@ -1058,6 +1099,9 @@ class HMBColorLUTLibrary(DataNode):
                             if complete:
                                 self._episodes_checked = time.monotonic()
                                 self._episode_codes = sorted(codes)
+                                if explicit and self._hmb_color_lut_state.get("manual_episode"):
+                                    self._web_upload_probe_key = ""
+                                    self._schedule_upload_probe()
                             self._hmb_color_lut_state["revision"] += 1
                             self._publish()
                         self._schedule_episodes(skip_selected=current and not complete)
@@ -1065,21 +1109,55 @@ class HMBColorLUTLibrary(DataNode):
             self._episode_worker.start()
 
     @staticmethod
-    def _manual_project_rows(bridge: Any) -> list[dict[str, str]]:
+    def _manual_upload_catalog(bridge: Any, *, explicit: bool):
         reply = bridge._request_json("GET", COLOR_LUT_MANUAL_UPLOAD_PATH + "/projects", payload=None, timeout=5)
-        rows = reply.get("projects")
-        if (reply.get("schema") != "hmb-color-lut-manual-projects" or type(reply.get("version")) is not int or reply["version"] != 1
-                or not isinstance(rows, list) or len(rows) > 100):
+        if reply.get("schema") != "hmb-color-lut-manual-projects" or type(reply.get("version")) is not int or reply["version"] != 1:
             raise ValueError("서버 프로젝트 목록을 확인할 수 없습니다.")
-        result = [_upload_project(row) for row in rows]
-        if any(not row for row in result) or len({row["id"] for row in result}) != len(result):
-            raise ValueError("서버 프로젝트 목록이 올바르지 않습니다.")
-        return result
 
-    def _check_upload_company(self, bridge, capabilities, context, me, state):
+        def projects(key):
+            rows = reply.get(key)
+            if not isinstance(rows, list) or len(rows) > 100:
+                raise ValueError("서버 프로젝트 목록을 확인할 수 없습니다.")
+            result = [_upload_project(row) for row in rows]
+            if any(not row for row in result) or len({row["id"] for row in result}) != len(result):
+                raise ValueError("서버 프로젝트 목록이 올바르지 않습니다.")
+            return result
+
+        choices = projects("projects")
+        if explicit and "upload_projects" in reply:
+            # Public LUT registration and private gallery visibility are distinct.
+            # Only the legacy list can advertise the account's private My Box.
+            public = [row for row in projects("upload_projects") if row["id"] != "my-box"]
+            choices = public + [row for row in choices if row["id"] == "my-box"]
+        return choices, reply.get("upload_groups")
+
+    def _check_upload_company(self, bridge, capabilities, context, me, state, writable=None):
         if context["project_id"] == "my-box":
             return
+        if writable is not None:
+            # Re-read the server's write grants at submission, independently of
+            # browse permissions, the saved widget and the current cached list.
+            member = me.get("company_group_id") if "company_group_id" in me else ""
+            selected = state.get("manual_group_id") or ("ungrouped" if member is None else member)
+            account = _digest([context["server_url"], str(me.get("id") or "")])
+            with self._lock:
+                same_choice = (self._explicit_upload_groups and account == self._group_owner
+                               and self._manual_projects_origin == context["server_url"]
+                               and self._upload_group.get("id") == selected
+                               and (not state.get("manual_group_id") or state.get("manual_group_owner") == account))
+                if not same_choice or selected not in writable or context["project_id"] not in writable[selected]["project_ids"]:
+                    raise ValueError("서버에서 업로드 가능한 그룹과 프로젝트를 다시 선택하세요.")
+                episode = _episode_code(state.get("manual_episode"))
+                if (not episode or self._episode_key != (context["server_url"], selected, context["project_id"])
+                        or self._episodes_status != "complete" or episode not in self._episode_codes):
+                    context["upload_destination_issue"] = "현재 그룹과 프로젝트의 에피소드 목록에서 선택하세요."
+                context.update(group_id=selected, episode=episode,
+                               upload_group={"id": selected, "name": writable[selected]["name"]},
+                               upload_group_status="confirmed")
+            return
         if capabilities.get("company_groups_supported") is not True:
+            if context.get("manual") and state.get("manual_group_id"):
+                raise ValueError("현재 서버에서 선택한 그룹으로 업로드할 수 없습니다.")
             context["upload_group_status"] = "legacy"
             return
         # The broker freezes the authenticated uploader's membership on intake.
@@ -1418,14 +1496,18 @@ class HMBColorLUTLibrary(DataNode):
                 raise ValueError("보정 영상이 서버의 업로드 용량 제한을 초과했습니다.")
             if path.suffix.lower() not in {".mov", ".mp4"}:
                 raise ValueError("이 출력 형식은 웹 업로드를 지원하지 않습니다.")
-            projects = self._manual_project_rows(bridge)
+            explicit = cap.get("group_destination") == "group-v1" and context["project_id"] != "my-box"
+            # Private uploads stay on the existing contract even if a public
+            # project permission or grouping service is currently unavailable.
+            projects, group_rows = self._manual_upload_catalog(bridge, explicit=explicit)
             if {"id": context["project_id"], "name": context["project_name"]} not in projects:
                 raise ValueError("선택한 프로젝트가 서버의 업로드 목록에 없습니다. 프로젝트를 다시 선택하세요.")
             me = bridge._request_json("GET", "/api/me", payload=None, timeout=5)
             owner = str(me.get("id") or me.get("user_id") or (me.get("user") or {}).get("id") or "")
             if not owner:
                 raise ValueError("브로커 로그인 계정을 확인하세요.")
-            self._check_upload_company(bridge, capabilities, context, me, state)
+            self._check_upload_company(bridge, capabilities, context, me, state,
+                                       _writable_upload_groups(group_rows, projects) if explicit else None)
             if artifact == "export" and proof.get("upload_name_suffix") == path.suffix.lower():
                 context["source_file_name"] = context["file_name"]
                 context["file_name"] = str(Path(context["file_name"]).with_suffix(path.suffix.lower()))
@@ -1434,7 +1516,10 @@ class HMBColorLUTLibrary(DataNode):
             context.update(path=str(path), size=info.st_size, mtime_ns=info.st_mtime_ns, sha256=proof["sha256"],
                            settings=proof["settings"], owner_id=owner, bridge=bridge, state_stamp=self._upload_state_stamp(state),
                            settings_sha256=_digest(proof["settings"]))
-            context["upload_id"] = hashlib.sha256("\n".join(("hmb-color-lut-manual-upload-v1", context["project_id"], context["file_name"], context["sha256"], context["settings_sha256"])).encode("utf-8")).hexdigest()
+            destination = (("hmb-color-lut-manual-group-v1", context["group_id"], context["project_id"], context["episode"])
+                           if "group_id" in context else ("hmb-color-lut-manual-upload-v1", context["project_id"]))
+            context["upload_id"] = hashlib.sha256("\n".join((*destination, context["file_name"], context["sha256"],
+                                                            context["settings_sha256"])).encode("utf-8")).hexdigest()
             context["receipt_id"] = _digest([context["server_url"], context["owner_id"], context["upload_id"]])
             return context
         if (not isinstance(cap, dict) or cap.get("schema") != COLOR_LUT_UPLOAD_SCHEMA or type(cap.get("version")) is not int or cap.get("version") != 1
@@ -1622,6 +1707,7 @@ class HMBColorLUTLibrary(DataNode):
         if context.get("manual"):
             return {"schema": COLOR_LUT_MANUAL_UPLOAD_SCHEMA, "version": 1,
                     **{key: context[key] for key in ("project_id", "file_name", "settings_sha256")},
+                    **({"group_id": context["group_id"], "episode": context["episode"]} if "group_id" in context else {}),
                     "workflow_id": context["flow"], "color_lut_node_id": self._web_node_id,
                     "export_sha256": context["sha256"], "export_bytes": context["size"],
                     "output_format": Path(context["path"]).suffix.lower().lstrip(".")}
@@ -1915,6 +2001,8 @@ class HMBColorLUTLibrary(DataNode):
                 manual = context.get("manual") is True
                 expected_schema = "hmb-color-lut-manual-upload-result" if manual else "hmb-color-lut-upload-result"
                 identity_fields = ("project_id", "project_name", "sha256", "file_name") if manual else ("source_task_id", "project_id", "project_name", "channel_uuid", "shot_uuid", "sha256", "shot_name")
+                if manual and "group_id" in context:
+                    identity_fields += ("group_id", "episode")
                 if (not isinstance(response, dict) or response.get("schema") != expected_schema or type(response.get("version")) is not int or response.get("version") != 1
                         or any(response.get(key) != context[key] for key in
                                identity_fields)
@@ -2095,7 +2183,7 @@ class HMBColorLUTLibrary(DataNode):
                         if group_owner != self._group_owner or not self._group_selectable or group_id not in self._group_catalog:
                             self._hmb_color_lut_state.update(manual_group_id="", manual_group_owner="", manual_episode="")
                 if self._group_owner and self._group_catalog:
-                    self._apply_group_view(self._group_catalog[self._member_group_id], self._upload_group_status)
+                    self._apply_group_view(self._group_catalog.get(self._member_group_id, {}), self._upload_group_status)
                 if initial_manual:
                     manual = self._hmb_color_lut_state["manual_project"]
                     self._hmb_color_lut_state.update(project_id=manual["id"], project=copy.deepcopy(manual))
@@ -2379,12 +2467,12 @@ class HMBColorLUTLibrary(DataNode):
                 state = self._hmb_color_lut_state
                 self._remember_selection()
                 state.update(manual_group_id=identity if identity != self._member_group_id else "", manual_group_owner=self._group_owner)
-                self._apply_group_view(self._group_catalog[self._member_group_id], self._upload_group_status)
+                self._apply_group_view(self._group_catalog.get(self._member_group_id, {}), self._upload_group_status)
                 project_id = state["manual_project"].get("id", "")
-                if project_id and not any(p["id"] == project_id for p in self._manual_projects):
+                if self._explicit_upload_groups or project_id and not any(p["id"] == project_id for p in self._manual_projects):
                     state.update(manual_project={}, project={}, project_id="", preset_id="")
                 cached = self._episode_cache.get((self._manual_projects_origin, identity, project_id))
-                if not cached or state.get("manual_episode") not in cached[1]:
+                if self._explicit_upload_groups or not cached or state.get("manual_episode") not in cached[1]:
                     state["manual_episode"] = ""
                 state["revision"] += 1
                 self._episode_key, self._episode_codes = None, []

@@ -973,6 +973,12 @@
       "required": true
     },
     {
+      "name": "HMB_Seedance_Draft_Status_Host_Regression.py",
+      "mode": "ci",
+      "coverage": "installed_sdk",
+      "required": true
+    },
+    {
       "name": "HMB_Seedance_Draft_Final_State_Sync_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",

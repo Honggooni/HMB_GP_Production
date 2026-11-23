@@ -169,6 +169,24 @@ class ColorLUTUploadRegression(unittest.TestCase):
         self.assertEqual(context["source_task_id"], "job-offline-lut")
         self.assertTrue(self.node._upload_projection()["enabled"])
 
+    def test_manual_group_destination_does_not_retarget_either_bound_upload(self):
+        original_caps = self.bridge.review_capabilities()
+        contexts = {artifact: self.ready(artifact) for artifact in ("source", "export")}
+        state = self.node._hmb_color_lut_state
+        state.update(manual_group_id="grp-" + "2" * 32, manual_project={"id":"katuri8","name":"까투리8"},
+                     manual_episode="e999")
+        caps = {**original_caps, "color_lut_manual_upload": {"group_destination": "group-v1"}}
+        with mock.patch.object(self.bridge, "review_capabilities", return_value=caps):
+            for artifact, prior in contexts.items():
+                with self.subTest(artifact=artifact):
+                    context = self.ready(artifact)
+                    for field in ("upload_id", "receipt_id", "source_task_id", "project_id", "channel_uuid", "shot_uuid"):
+                        self.assertEqual(context[field], prior[field])
+                    metadata = self.node._upload_metadata(context)
+                    self.assertEqual(metadata, self.node._upload_metadata(prior))
+                    self.assertNotIn("group_id", metadata)
+                    self.assertNotIn("episode", metadata)
+
     def test_bound_source_and_export_require_capability_and_shot_permission_for_client_media(self):
         caps = self.bridge.review_capabilities()
         get = self.bridge._request_json

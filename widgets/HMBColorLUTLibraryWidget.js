@@ -268,8 +268,12 @@ const groupLabel = (state) => {
 };
 const groupSelectable = state => !state.shot.shot_uuid && !privateDestination(state) && state.upload_group_selectable && state.upload_groups.length > 0;
 const groupReadOnlyDestination = state => state.upload_destination_readonly && !privateDestination(state);
-const groupOptions = state => state.upload_groups.map(group =>
-  `<option value="${escape(group.id)}">${escape(group.id === "ungrouped" ? textFor(state).groupUnassigned : group.name)}</option>`).join("");
+const groupOptions = state => {
+  const choose = state.upload_groups.length && !state.upload_group.id
+    ? `<option value="" disabled>${state.language === "ko" ? "그룹 선택" : "Select group"}</option>` : "";
+  return choose + state.upload_groups.map(group =>
+    `<option value="${escape(group.id)}">${escape(group.id === "ungrouped" ? textFor(state).groupUnassigned : group.name)}</option>`).join("");
+};
 const hasUploadDestination = (state) => Boolean(state.shot.shot_uuid
   || (state.manual_project.id && (state.manual_project.id === "my-box" || /^e(?!000)[0-9]{3}$/.test(state.manual_episode))));
 const uploadDestinationHint = (state) => state.manual_project.id
