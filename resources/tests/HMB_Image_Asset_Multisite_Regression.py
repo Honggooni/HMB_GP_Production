@@ -191,7 +191,10 @@ def live_profile_changes(root):
         state = load(lib,catalog,state)
         assert not any(f.startswith(f"site:{site}/") for f in state["folders"])
         assert state["shot_routing"]["shots"][0]["selected_source_uids"] == [anchor["source_uid"]]
-        assert [c.args[0] for c in scans.call_args_list] == [first,second], scans.call_args_list
+        # A Windows temporary root may be supplied as an 8.3 path while the scanner returns its long form.
+        observed = [Path(call.args[0]) for call in scans.call_args_list]
+        assert len(observed) == 2, observed
+        assert observed[0].samefile(first) and observed[1].samefile(second), observed
 
 
 def run():

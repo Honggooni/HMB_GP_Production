@@ -168,7 +168,9 @@ async def exercise(engine):
             with mock.patch.object(sites, "choose_site_folder", side_effect=[str(destination), ""]) as chooser:
                 setstate(folder_node, folder_request("open"))
                 receipt = await folder_receipt("open")
-                assert receipt["ok"] and receipt["links"][0]["root"] == destination.as_posix(), receipt
+                assert receipt["ok"], receipt
+                saved_root = receipt["links"][0]["root"]
+                assert "\\" not in saved_root and Path(saved_root).samefile(destination), receipt
                 setstate(folder_node, folder_request("open"))
                 setstate(folder_node, folder_request("cancel"))
                 cancelled = await folder_receipt("cancel")

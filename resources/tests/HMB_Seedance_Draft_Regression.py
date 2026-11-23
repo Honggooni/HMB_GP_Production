@@ -775,7 +775,8 @@ class DraftTests(unittest.TestCase):
                     asyncio.run(node._process_generation_impl())
                 self.assertEqual(len(node.bridge.posts), 1)
                 output = Path(node.saved[0][1])
-                self.assertEqual(output.parent, Path(node.base.name) / "shot_001")
+                self.assertEqual(output.parent.name, "shot_001")
+                self.assertTrue(output.parent.parent.samefile(node.base.name))
                 self.assertTrue(output.name.startswith(f"cut_v001-{stage}-"), output)
                 self.assertEqual(output.suffix, ".mov")
 

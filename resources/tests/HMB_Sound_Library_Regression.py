@@ -448,7 +448,8 @@ class SoundNodeRegression(SoundLibraryRegression):
                 self.assertEqual(done["revision"], saved["revision"])
                 self.assertTrue(any(a["relative_path"].endswith("/Dialogue/vendor.wav") for a in self.node._state_sound["assets"]))
                 self.assertEqual(self.node._state_sound["tracks"], tracks)
-            self.assertEqual([c.args[0] for c in scans.call_args_list], [vendor])
+            self.assertEqual(scans.call_count, 1)
+            self.assertTrue(Path(scans.call_args.args[0]).samefile(vendor))
 
     def test_committed_folder_receipt_survives_cancel_during_catalog_read(self):
         import _hmb_image_asset_sites as sites
