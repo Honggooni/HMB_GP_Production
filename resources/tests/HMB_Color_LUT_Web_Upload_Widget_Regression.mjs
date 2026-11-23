@@ -17,12 +17,18 @@ const value = { shot_catalog: catalog, shot: { channel_uuid: "channel-one", shot
 assert.equal(hmbColorLUTState(value).web_upload.enabled, true);
 assert.equal(hmbColorLUTState({ ...value, shot: {} }).web_upload.enabled, false, "Only cannot enable a web upload");
 const manual = { ...value, shot: {}, project_id: "superwings12", manual_project: { id: "superwings12", name: "슈퍼윙즈12" },
+  upload_group_status: "confirmed", upload_group: { id: "grp-fixture", name: "서울" },
   manual_episode: "e202",
   manual_project_display_name: "superwings12",
   upload_projects: [{ id: "superwings12", name: "슈퍼윙즈12", display_name: "superwings12" },
     { id: "katuri8", name: "까투리8", display_name: "Katuri8" }],
   source: { path: "C:/synthetic/11-12.mp4", name: "11-12.mp4" }, result: {} };
 assert.equal(hmbColorLUTState(manual).web_upload.enabled, true, "Only with explicit server project can upload original before final export");
+assert.match(hmbRenderColorLUTWidget(manual), /data-group type="text" readonly value="서울"/);
+assert.match(hmbRenderColorLUTWidget({ ...manual, upload_group:{id:"grp-fixture",name:""} }), /data-group type="text" readonly value="소속 그룹 · 이름 확인 중"/);
+assert.match(hmbRenderColorLUTWidget({ ...manual, upload_group_status: "unavailable" }), /data-group type="text" readonly value="그룹 조회 불가"/);
+assert.match(hmbRenderColorLUTWidget({ ...manual, language: "en", upload_group_status: "unassigned" }), /data-group type="text" readonly value="Unclassified"/);
+assert.match(hmbRenderColorLUTWidget({ ...manual, upload_group: {}, upload_group_status: "legacy" }), /data-group type="text" readonly value="서버 자동 배정"/);
 assert.match(hmbRenderColorLUTWidget(manual), /<option value="katuri8">Katuri8<\/option>/);
 assert.match(hmbRenderColorLUTWidget({ ...value, project: { name: "까투리8" }, project_id: "bound-uid",
   project_display_name: "Katuri8" }), /<option value="bound-uid">Katuri8<\/option>/);
@@ -101,6 +107,16 @@ try {
     assert.equal(await outputButton.textContent(),language==='ko'?'최종출력 & 웹 업로드':'Final export & web upload');
     for (const width of [430, 760, 1185, 1800]) {
       await page.locator('#widget').evaluate((el, width) => el.style.width = `${width}px`, width);
+      const boxes = await page.locator('.cl-project').evaluate(panel =>
+        [...panel.querySelectorAll('[data-group], [data-project], [data-episode]')].map(el => {
+          const {width,top,right,left}=el.getBoundingClientRect();
+          return {width,top,right,left};
+        }));
+      const [groupBox,projectBox,episodeBox]=boxes;
+      assert.ok(Math.abs(groupBox.width-episodeBox.width)<1 && Math.abs(2*groupBox.width-projectBox.width)<1,
+        `Group/project/episode keep the 25/50/25 proportions at ${width}/${language}`);
+      assert.ok(Math.abs(groupBox.top-projectBox.top)<1 && Math.abs(projectBox.top-episodeBox.top)<1 &&
+        groupBox.right<projectBox.left && projectBox.right<episodeBox.left, 'Destination fields follow reading order on one row');
       const fit = await outputButton.evaluate(el => ({ width: el.clientWidth, content: el.scrollWidth, wrap: getComputedStyle(el).whiteSpace,
         outerWidth:el.getBoundingClientRect().width,paddingLeft:getComputedStyle(el).paddingLeft,paddingRight:getComputedStyle(el).paddingRight,
         right:el.getBoundingClientRect().right,rowRight:el.closest('.cl-output-controls').getBoundingClientRect().right }));
@@ -133,6 +149,9 @@ try {
     await page.locator('.cl-output').screenshot({path:process.env.HMB_LUT_UPLOAD_UI_CAPTURE});
   }
   assert.equal(await page.locator('[data-project]').isEnabled(), true);
+  const group = page.getByRole('textbox', {name:'그룹',exact:true});
+  assert.equal(await group.inputValue(), '서울');
+  assert.equal(await group.isEditable(), false);
   assert.equal(await page.locator('[data-source]').textContent(), "11-12.mp4");
   await page.locator('[data-project]').selectOption("katuri8");
   const selection = await page.evaluate(() => window.commands.filter(c => c.action === 'select_upload_project').at(-1));
@@ -162,13 +181,6 @@ try {
   assert.equal(await page.evaluate(() => window.commands.filter(c => c.action === 'upload_web' && !c.check_only).length), 2);
   assert.equal(await episode.evaluate(el => el.tagName), 'SELECT');
   assert.equal(await page.locator('[data-episode-choice], [data-profile-name], [data-apply-profile], [data-action="save_profile"], [data-action="delete_profile"]').count(), 0);
-  const layout = await page.locator('.cl-project').evaluate(panel => {
-    const project = panel.querySelector('[data-project]').getBoundingClientRect();
-    const episode = panel.querySelector('[data-episode]').getBoundingClientRect();
-    return { projectWidth: project.width, episodeWidth: episode.width, sameRow: Math.abs(project.top - episode.top) < 2 && project.right < episode.left };
-  });
-  assert.ok(Math.abs(layout.projectWidth - layout.episodeWidth) < 2 && layout.sameRow);
-  assert.ok(layout.episodeWidth >= 110);
   await page.evaluate(() => {
     window.state = { ...window.state, revision: 129, upload_episodes: ['e201'], upload_episodes_status: 'partial' };
     window.controller.update(window.props());
@@ -181,12 +193,47 @@ try {
   }), {action:'select_upload_episode', project_id:'katuri8', episode:'e201'});
   await page.evaluate((mybox) => { window.state = { ...mybox, revision: 130 }; window.controller.update(window.props()); }, mybox);
   assert.equal(await page.locator('[data-project]').inputValue(), 'my-box');
+  assert.equal(await group.inputValue(), '개인');
   assert.equal(await episode.isDisabled(), true);
   assert.equal(await page.locator('[data-project] option').allTextContents().then(rows => rows.includes('My Box')), true);
   assert.equal(await button.isEnabled(), true);
-  await page.evaluate((value) => { window.state = { ...value, revision: 150 }; window.controller.update(window.props()); }, value);
+  await page.evaluate((value) => { window.state = { ...value, upload_group_status:'confirmed', upload_group:{id:'grp-other',name:'광주'}, revision: 150 }; window.controller.update(window.props()); }, value);
+  assert.equal(await group.inputValue(), '광주');
   assert.equal(await page.locator('[data-project]').isDisabled(), true, "Bound destination remains automatic");
   assert.equal(await episode.isDisabled(), true);
+  const admin = {...manual, upload_group_selectable:true, upload_group_status:'unassigned',
+    upload_groups:[{id:'ungrouped',name:''},{id:'grp-seoul',name:'서울'},{id:'grp-gwangju',name:'광주'}], upload_group:{id:'ungrouped',name:''}};
+  const owner = 'a'.repeat(64);
+  const restored = hmbColorLUTState({...admin,manual_group_id:'grp-seoul',manual_group_owner:owner});
+  assert.equal(restored.manual_group_id,'grp-seoul');
+  assert.equal(restored.manual_group_owner,owner,'Account-scoped group restoration survives widget round-trips');
+  await page.evaluate(data=>{window.state={...data,revision:160};window.controller.update(window.props());},admin);
+  const groups = page.getByRole('combobox',{name:'그룹',exact:true});
+  assert.deepEqual(await groups.locator('option').allTextContents(),['미분류','서울','광주']);
+  assert.equal(await groups.inputValue(),'ungrouped');
+  assert.equal(await button.isEnabled(),true);
+  await groups.selectOption('grp-seoul');
+  assert.equal(await page.evaluate(()=>window.commands.at(-1).group_id),'grp-seoul');
+  assert.equal(await page.evaluate(()=>window.commands.at(-1).action),'select_upload_group');
+  assert.equal(await button.isVisible(),false,'Changing groups immediately retires the previous destination');
+  await page.evaluate(admin=>{window.state={...admin,revision:164,upload_group_status:'confirmed',upload_group:{id:'grp-seoul',name:'서울'},
+    upload_destination_readonly:true};window.controller.update(window.props());},admin);
+  assert.equal(await groups.inputValue(),'grp-seoul');
+  assert.equal(await button.isDisabled(),true);
+  assert.equal(await outputButton.isDisabled(),true);
+  assert.match(await page.locator('[data-upload-reason]').textContent(),/조회 전용/);
+  const sent=await page.evaluate(()=>window.commands.length);
+  await button.dispatchEvent('click');await outputButton.dispatchEvent('click');
+  assert.equal(await page.evaluate(()=>window.commands.length),sent);
+  await page.locator('[data-project]').selectOption('katuri8');
+  assert.equal(await page.evaluate(()=>window.commands.at(-1).group_id),'grp-seoul');
+  await page.evaluate(()=>{window.state={...window.state,revision:167,manual_episode:'',upload_episodes:['e202']};window.controller.update(window.props());});
+  await episode.selectOption('e202');
+  assert.equal(await page.evaluate(()=>window.commands.at(-1).group_id),'grp-seoul');
+  await page.evaluate(({admin,mybox})=>{window.state={...admin,...mybox,revision:170,upload_group_selectable:true,upload_destination_readonly:true};window.controller.update(window.props());},{admin,mybox});
+  assert.equal(await group.inputValue(),'개인');
+  assert.equal(await button.isEnabled(),true,'My Box stays private and writable');
+  assert.equal(await outputButton.isEnabled(),true);
   // Native select changes must repaint the action before any host echo.
   await page.evaluate(local=>{window.state={...local,output:{...local.output,codec:'hevc10'},revision:200};window.controller.update(window.props());},localFFV1);
   assert.equal(await outputButton.isDisabled(),true);

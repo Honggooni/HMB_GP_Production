@@ -81,6 +81,28 @@ class ColorLUTUploadRegression(unittest.TestCase):
                 **{key: context[key] for key in
                 ("source_task_id", "project_id", "project_name", "channel_uuid", "shot_uuid", "sha256", "shot_name")}}
 
+    def test_bound_upload_uses_its_broker_membership_and_captured_shot(self):
+        group_id = "grp-" + "a" * 32
+        request = self.bridge._request_json
+        capabilities = {**self.bridge.review_capabilities(), "company_groups_supported": True}
+        self.bridge.review_capabilities = lambda: capabilities
+        def grouped(method, path, **kwargs):
+            if path == "/api/company-groups":
+                return {"schema": "hmb-company-groups-v1", "membership": {"enabled": True, "group_id": group_id},
+                        "items": [{"id": group_id, "name": "서울", "project_ids": ["superwings12"]}]}
+            result = request(method, path, **kwargs)
+            return {**result, "company_group_id": group_id} if path == "/api/me" else result
+        self.bridge._request_json = grouped
+        self.node._manual_projects_origin = "https://other.test"
+        self.node._upload_group = {"id": "grp-" + "b" * 32, "name": "광주"}
+        for artifact in ("source", "export"):
+            context = self.ready(artifact)
+            self.assertEqual(context["upload_group"], {"id": group_id, "name": "서울"})
+            self.assertEqual(context["source_task_id"], self.source["task_id"])
+            self.node._publish()
+            self.assertEqual(self.node.get_parameter_value(target.UI)["upload_group"], context["upload_group"])
+            self.assertNotIn("group_id", self.node._upload_metadata(context))
+
     def mounted_responses(self, prefix):
         """The server's broker_path mounts advertised URLs, as well as HTTP."""
         capability = copy.deepcopy(self.bridge.review_capabilities())

@@ -96,6 +96,12 @@ export function hmbColorLUTState(input = {}) {
     project_display_name: clean(s.project_display_name, 256),
     manual_project_display_name: clean(s.manual_project_display_name, 256),
     manual_project: manualProject, upload_projects: projects,
+    upload_group: { id: clean(record(s.upload_group).id, 128), name: clean(record(s.upload_group).name, 256) },
+    upload_group_status: clean(s.upload_group_status, 32),
+    upload_groups: (Array.isArray(s.upload_groups) ? s.upload_groups : []).map(g => ({ id: clean(record(g).id, 128), name: clean(record(g).name, 256) })).filter(g => g.id),
+    manual_group_id: clean(s.manual_group_id, 128), manual_group_owner: clean(s.manual_group_owner, 64),
+    upload_group_selectable: s.upload_group_selectable === true,
+    upload_destination_readonly: s.upload_destination_readonly === true,
     upload_projects_notice: clean(s.upload_projects_notice, 32), manual_episode: clean(s.manual_episode, 4), upload_episodes_status: clean(s.upload_episodes_status, 32),
     upload_episodes: Array.isArray(s.upload_episodes) ? s.upload_episodes.filter(e => typeof e === "string" && /^e[0-9]{3}$/.test(e)) : [],
     settings: hmbColorLUTSettings(s.settings), source: sourceMatches ? { path: clean(source.path), url: clean(source.url), name: clean(source.name, 256),
@@ -226,7 +232,7 @@ export function hmbColorLUTFallbackBudget() {
   };
 }
 export function hmbColorLUTCommand(action, state, id = `cl-${Date.now()}-${Math.random().toString(36).slice(2)}`) {
-  if (!["browse_video", "export", "export_upload", "cancel", "save_profile", "delete_profile", "upload_web", "select_upload_project", "refresh_upload_projects", "select_upload_episode", "refresh_upload_episodes"].includes(action)) throw new Error("Unsupported Color LUT action.");
+  if (!["browse_video", "export", "export_upload", "cancel", "save_profile", "delete_profile", "upload_web", "select_upload_group", "select_upload_project", "refresh_upload_projects", "select_upload_episode", "refresh_upload_episodes"].includes(action)) throw new Error("Unsupported Color LUT action.");
   const captured = hmbColorLUTState(state);
   if (action === "delete_profile") {
     if (!hmbColorLUTCanDeleteProfile(captured)) throw new Error("Select a saved personal preset before deleting.");
@@ -238,18 +244,32 @@ export function hmbColorLUTCommand(action, state, id = `cl-${Date.now()}-${Math.
 const TEXT = {
   ko: { subtitle: "최종 영상 컬러 마감", language: "언어", shot: "바인딩 샷", preview: "미리보기", original: "원본", compare: "비교", graded: "보정", wipe: "비교 위치",
     browse: "영상 불러오기", standalone: "Only · 독립 영상 입력", empty: "완료 영상을 연결하거나 영상 불러오기로 시작하세요", loading: "영상을 불러오는 중", ready: "준비됨", sourceError: "영상을 읽을 수 없습니다", previewError: "컬러 미리보기를 표시할 수 없습니다", transportError: "상태 전송을 사용할 수 없습니다", commandError: "요청을 전달할 수 없습니다",
-    play: "▶ 재생", pause: "Ⅱ 일시정지", step: "한 프레임", seek: "프레임 탐색", frame: "프레임", enable: "사용", grade: "프로젝트 룩 · 샷 보정", project: "프로젝트", episode: "에피소드", filenameEpisode: "파일명 기준", projectSelect: "프로젝트 선택", projectLogin: "Generator 로그인 후 다시 조회", projectEmpty: "업로드 가능한 프로젝트 없음", projectRetry: "클릭하여 다시 조회", reset: "원본 값", upload: "웹 업로드", uploadCheck: "업로드 상태 확인", uploadRetry: "다시 업로드", uploaded: "웹 업로드 완료", uploading: "웹 업로드 중…", neutral: "기본", stage: "단계",
+    play: "▶ 재생", pause: "Ⅱ 일시정지", step: "한 프레임", seek: "프레임 탐색", frame: "프레임", enable: "사용", grade: "프로젝트 룩 · 샷 보정", group: "그룹", groupUnassigned: "미분류", groupNamePending: "소속 그룹 · 이름 확인 중", groupBrowseOnly: "이 그룹은 조회 전용입니다. 업로드하려면 내 소속 그룹 또는 My Box를 선택하세요.", groupAutomatic: "서버 자동 배정", groupUnavailable: "그룹 조회 불가", privateGroup: "개인", project: "프로젝트", episode: "에피소드", filenameEpisode: "파일명 기준", projectSelect: "프로젝트 선택", projectLogin: "Generator 로그인 후 다시 조회", projectEmpty: "업로드 가능한 프로젝트 없음", projectRetry: "클릭하여 다시 조회", reset: "원본 값", upload: "웹 업로드", uploadCheck: "업로드 상태 확인", uploadRetry: "다시 업로드", uploaded: "웹 업로드 완료", uploading: "웹 업로드 중…", neutral: "기본", stage: "단계",
     exposure: "노출", temperature: "색온도", contrast: "대비", saturation: "채도", shadows: "그림자", highlights: "하이라이트", low: ["어둡게", "차갑게", "부드럽게", "낮게", "깊게", "억제"], high: ["밝게", "따뜻하게", "선명하게", "높게", "밝게", "강조"],
     enabled: "샷별 보정 적용 중", disabled: "원본 유지 · 보정 사용 안함", live: "조절 중 미리보기", output: "최종 영상 출력", outputUpload: "최종출력 & 웹 업로드", outputSource: "영상을 연결하거나 불러온 뒤 출력하세요.", outputUploadProject: "업로드할 프로젝트 또는 My Box를 선택하세요.", outputLocalFormat: "FFV1은 웹 업로드 없이 로컬에 무손실 영상으로 출력합니다.", outputNote: "원본 해상도 · FPS 유지 / 원본에서 1회 인코딩", manual: "출력 경로 직접 지정", path: "출력 경로", autoPath: "자동 · 입력 영상 폴더 / 새 버전 파일", customPath: "저장할 전체 파일 경로", codec: "출력 형식", hevc: "HEVC 10-bit · 고품질", prores: "ProRes 422 HQ · 마스터", ffv1: "FFV1 · 무손실", cancel: "출력 취소", result: "출력 영상 열기", pending: "요청을 처리하는 중", bound: "샷 연결", unbound: "샷 바인딩 없음" },
   en: { subtitle: "Final video color finishing", language: "Language", shot: "Bound shot", preview: "Preview", original: "Original", compare: "Compare", graded: "Graded", wipe: "Compare position",
     browse: "Import video", standalone: "Only · Standalone video", empty: "Connect a completed video or import a video to begin", loading: "Loading video", ready: "Ready", sourceError: "Unable to load video", previewError: "Unable to display color preview", transportError: "State transport is unavailable", commandError: "Unable to deliver request",
-    play: "▶ Play", pause: "Ⅱ Pause", step: "One frame", seek: "Seek frame", frame: "Frame", enable: "Enable", grade: "Project look · Shot grade", project: "Project", episode: "Episode", filenameEpisode: "From filename", projectSelect: "Select project", projectLogin: "Sign in to Generator, then retry", projectEmpty: "No upload projects available", projectRetry: "Click to retry", reset: "Original values", upload: "Upload to web", uploadCheck: "Check upload", uploadRetry: "Retry upload", uploaded: "Uploaded", uploading: "Uploading…", neutral: "Neutral", stage: "stage",
+    play: "▶ Play", pause: "Ⅱ Pause", step: "One frame", seek: "Seek frame", frame: "Frame", enable: "Enable", grade: "Project look · Shot grade", group: "Group", groupUnassigned: "Unclassified", groupNamePending: "Group name pending", groupBrowseOnly: "This group is view-only. To upload, select your assigned group or My Box.", groupAutomatic: "Server assigned", groupUnavailable: "Group unavailable", privateGroup: "Private", project: "Project", episode: "Episode", filenameEpisode: "From filename", projectSelect: "Select project", projectLogin: "Sign in to Generator, then retry", projectEmpty: "No upload projects available", projectRetry: "Click to retry", reset: "Original values", upload: "Upload to web", uploadCheck: "Check upload", uploadRetry: "Retry upload", uploaded: "Uploaded", uploading: "Uploading…", neutral: "Neutral", stage: "stage",
     exposure: "Exposure", temperature: "Temperature", contrast: "Contrast", saturation: "Saturation", shadows: "Shadows", highlights: "Highlights", low: ["Darker", "Cooler", "Softer", "Lower", "Deeper", "Suppress"], high: ["Brighter", "Warmer", "Sharper", "Higher", "Brighter", "Emphasize"],
     enabled: "Shot grade enabled", disabled: "Original · Grading disabled", live: "Live preview while adjusting", output: "Export final video", outputUpload: "Final export & web upload", outputSource: "Connect or import a video before exporting.", outputUploadProject: "Select an upload project or My Box.", outputLocalFormat: "FFV1 exports lossless video locally without web upload.", outputNote: "Original resolution · FPS / Encode once from source", manual: "Set output path", path: "Output path", autoPath: "Automatic · Source folder / New version file", customPath: "Full output file path", codec: "Output format", hevc: "HEVC 10-bit · High quality", prores: "ProRes 422 HQ · Master", ffv1: "FFV1 · Lossless", cancel: "Cancel export", result: "Open output video", pending: "Processing request", bound: "Shot linked", unbound: "No shot binding" },
 };
 Object.assign(TEXT.ko, { audioSource: "사운드 소스", currentSound: "현재 샷 사운드", renderedSound: "생성 당시 사운드", audioMix: "Audio Mix", soundConnected: "Sound Library 연결됨", soundMissing: "Sound Library를 연결하세요", originalAudio: "원본 오디오", preserveAudio: "유지하며 믹스", muteAudio: "음소거 / 선택 음원만", soundNote: "선택 음원은 새 영상 저장 · 최종출력 & 웹 업로드에 적용됩니다. 색상 보정 OFF 시 가능한 원본 영상은 재인코딩 없이 저장합니다.", saveLocal: "새 영상 저장", uploadSource: "원본 웹 업로드" });
 Object.assign(TEXT.en, { audioSource: "Sound source", currentSound: "Current Shot sound", renderedSound: "Sound captured at generation", audioMix: "Audio Mix", soundConnected: "Sound Library connected", soundMissing: "Connect a Sound Library", originalAudio: "Original audio", preserveAudio: "Preserve in mix", muteAudio: "Mute / Selected sounds only", soundNote: "Selected sounds apply to Save new video and Final export & web upload. With grading off, compatible video is copied without re-encoding.", saveLocal: "Save new video", uploadSource: "Upload original" });
 const textFor = (s) => TEXT[s.language] || TEXT.ko;
+const privateDestination = (s) => (s.shot.shot_uuid ? s.project_id : s.manual_project.id) === "my-box";
+const groupLabel = (state) => {
+  const t = textFor(state);
+  if (privateDestination(state)) return t.privateGroup;
+  if (state.upload_group_status === "confirmed") return state.upload_group.name || t.groupNamePending;
+  if (state.upload_group_status === "unassigned") return t.groupUnassigned;
+  if (state.upload_group_status === "legacy") return t.groupAutomatic;
+  if (state.upload_group_status === "unavailable") return t.groupUnavailable;
+  return "—";
+};
+const groupSelectable = state => !state.shot.shot_uuid && !privateDestination(state) && state.upload_group_selectable && state.upload_groups.length > 0;
+const groupReadOnlyDestination = state => state.upload_destination_readonly && !privateDestination(state);
+const groupOptions = state => state.upload_groups.map(group =>
+  `<option value="${escape(group.id)}">${escape(group.id === "ungrouped" ? textFor(state).groupUnassigned : group.name)}</option>`).join("");
 const hasUploadDestination = (state) => Boolean(state.shot.shot_uuid
   || (state.manual_project.id && (state.manual_project.id === "my-box" || /^e(?!000)[0-9]{3}$/.test(state.manual_episode))));
 const uploadDestinationHint = (state) => state.manual_project.id
@@ -266,6 +286,7 @@ const exportAction = (state) => {
   if (!reason && !local && !state.shot.shot_uuid && !state.upload_projects.some(project => project.id === state.manual_project.id
     && project.name === state.manual_project.name)) reason = text.outputUploadProject;
   if (!local && !hasUploadDestination(state)) reason = uploadDestinationHint(state);
+  if (!local && groupReadOnlyDestination(state)) reason = text.groupBrowseOnly;
   return { action: local ? "export" : "export_upload", label, reason,
     title: reason ? `${reason}${local ? ` ${text.outputLocalFormat}` : ""}` : local ? text.outputLocalFormat : label };
 };
@@ -278,6 +299,7 @@ const shotMarkup = (s) => hmbColorLUTShotOptions(s).map((option) => `<option val
 
 export function hmbRenderColorLUTWidget(input = {}) {
   const s = hmbColorLUTState(input), t = textFor(s), accent = hmbColorLUTShotAccent(s);
+  const groupFields = `<label data-group-fixed${groupSelectable(s) ? " hidden" : ""}><span data-text="group">${escape(t.group)}</span><input data-group type="text" readonly value="${escape(groupLabel(s))}" title="${escape(groupLabel(s))}"></label><label data-group-choice${groupSelectable(s) ? "" : " hidden"}><span data-text="group">${escape(t.group)}</span><select data-group-select>${groupOptions(s)}</select></label>`;
   const label = (key) => `<span data-text="${key}">${escape(t[key])}</span>`;
   const audioDetails = `<div class="cl-audio-mix" data-audio-details${s.audio_mix.enabled ? "" : " hidden"}>
     <label>${label("audioSource")}<select data-audio-source aria-label="${t.audioSource}"><option value="current" data-text="currentSound"${s.audio_mix.source === "current" ? " selected" : ""}>${t.currentSound}</option><option value="rendered" data-text="renderedSound"${s.audio_mix.source === "rendered" ? " selected" : ""}${s.shot.shot_uuid ? "" : " disabled"}>${t.renderedSound}</option></select></label>
@@ -291,8 +313,9 @@ export function hmbRenderColorLUTWidget(input = {}) {
 .hmb-color-lut .cl-head{display:flex;align-items:center;gap:12px;padding:0 16px;height:68px;background:linear-gradient(90deg,rgba(var(--cl-rgb),.2),#090c16fa);border-bottom:1px solid rgba(var(--cl-rgb),.4)}.hmb-color-lut .cl-mark{flex:0 0 30px;width:30px;height:30px;display:grid;place-items:center;border:1px solid var(--cl-accent);border-radius:8px;color:var(--cl-accent);font-size:9px;font-weight:950;letter-spacing:.06em}.hmb-color-lut .cl-brand{flex:1;min-width:0;overflow:hidden}.hmb-color-lut .cl-brand strong{display:block;font-size:15px;font-weight:800;white-space:nowrap}.hmb-color-lut .cl-brand small{display:block;color:var(--cl-muted);font-size:9px;white-space:nowrap}.hmb-color-lut .cl-shot-shell{display:flex;gap:7px;align-items:center;flex:0 1 210px;width:210px;min-width:120px}.hmb-color-lut .cl-shot-shell>span{font-size:8px;color:var(--cl-muted);font-weight:900}.hmb-color-lut .cl-shot-shell select{width:100%;height:44px;font-size:13px;font-weight:800;border-color:rgba(var(--cl-rgb),.6);background:rgba(var(--cl-rgb),.1)}.hmb-color-lut option{background:#0b111d}.hmb-color-lut .cl-lang{height:30px;min-width:58px;font-size:12px;font-weight:800;border-color:rgba(var(--cl-rgb),.6)}
 .hmb-color-lut .cl-input{display:flex;align-items:center;gap:9px;padding:10px 14px;border-bottom:1px solid var(--cl-line);flex-wrap:wrap}.hmb-color-lut .cl-dot{width:7px;height:7px;border-radius:50%;background:var(--cl-accent)}.hmb-color-lut .cl-source{flex:1;min-width:120px;overflow-wrap:anywhere}.hmb-color-lut .cl-input small{color:var(--cl-muted);font-size:10px}.hmb-color-lut .cl-input button{font-size:11px}.hmb-color-lut .cl-work{display:grid;grid-template-columns:minmax(0,1.85fr) minmax(250px,1fr);gap:12px;padding:12px}.hmb-color-lut :is(.cl-preview,.cl-grade){min-width:0;border:1px solid var(--cl-line);border-radius:8px;background:var(--cl-panel);overflow:hidden}.hmb-color-lut .cl-panel-head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--cl-line);min-height:46px}.hmb-color-lut .cl-panel-head>span:first-child{flex:1}.hmb-color-lut .cl-mode{display:flex;gap:4px}.hmb-color-lut .cl-mode button{font-size:11px;min-height:28px;padding:4px 8px}
 .hmb-color-lut .cl-screen{position:relative;background:#05070c;aspect-ratio:16/10;overflow:hidden}.hmb-color-lut canvas{position:absolute;width:100%;height:100%;object-fit:contain;inset:0}.hmb-color-lut .cl-seam{position:absolute;inset:0 auto 0 50%;width:1px;background:#fff;pointer-events:none}.hmb-color-lut .cl-seam button{position:absolute;top:45%;left:-20px;width:40px;height:40px;min-width:40px;min-height:40px;padding:0;border-radius:50%;background:#142033;border:1px solid #b8c9e1;display:grid;place-items:center;pointer-events:auto;touch-action:none;cursor:ew-resize}.hmb-color-lut .cl-label{position:absolute;top:12px;font-size:11px;padding:4px 8px;border-radius:4px;background:#090e18dc;pointer-events:none}.hmb-color-lut .cl-before{left:12px}.hmb-color-lut .cl-after{right:12px;color:var(--cl-accent)}.hmb-color-lut .cl-empty{position:absolute;inset:0;background:#0a101b;display:grid;place-items:center;padding:20px;text-align:center;color:var(--cl-muted)}.hmb-color-lut input[type=range]{width:100%;accent-color:var(--cl-accent);cursor:pointer;margin:0;min-height:23px;touch-action:pan-y}.hmb-color-lut .cl-transport{padding:12px;border-top:1px solid var(--cl-line)}.hmb-color-lut .cl-player-row{display:flex;align-items:center;gap:8px;margin-top:7px}.hmb-color-lut .cl-player-row small{margin-left:auto;color:var(--cl-muted);font-size:10px;font-variant-numeric:tabular-nums}.hmb-color-lut .cl-player-row button{font-size:11px;min-height:29px}.hmb-color-lut .cl-note{display:flex;justify-content:space-between;gap:8px;padding:10px 12px;border-top:1px solid var(--cl-line);color:var(--cl-muted);font-size:10px}
-.hmb-color-lut .cl-grade-body{padding:12px}.hmb-color-lut .cl-project{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:12px}.hmb-color-lut .cl-project label{display:flex;flex-direction:column;gap:5px;color:var(--cl-muted);font-size:11px}.hmb-color-lut .cl-project select{width:100%;min-width:0;font-size:12px}.hmb-color-lut .cl-enable{display:flex;align-items:center;gap:6px;font-size:11px}.hmb-color-lut input[type=checkbox]{accent-color:var(--cl-accent);width:14px;height:14px}.hmb-color-lut .cl-control{margin:0 0 9px}.hmb-color-lut .cl-control label{display:flex;flex-direction:column;gap:2px;font-size:12px}.hmb-color-lut .cl-control label>span:first-child{display:flex;justify-content:space-between;gap:6px}.hmb-color-lut .cl-value{color:var(--cl-accent);font-size:11px}.hmb-color-lut .cl-endpoints{display:flex;justify-content:space-between;color:#8795aa;font-size:10px;margin-top:-3px}.hmb-color-lut .cl-grade-actions{display:flex;gap:6px;padding-top:8px;border-top:1px solid var(--cl-line)}.hmb-color-lut .cl-grade-actions button{flex:1;font-size:11px}
+.hmb-color-lut .cl-grade-body{padding:12px}.hmb-color-lut .cl-project{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,2fr) minmax(0,1fr);gap:8px;margin-bottom:12px}.hmb-color-lut .cl-project label{display:flex;flex-direction:column;gap:5px;color:var(--cl-muted);font-size:11px}.hmb-color-lut .cl-project :is(select,input){width:100%;min-width:0;font-size:12px;text-overflow:ellipsis}.hmb-color-lut .cl-enable{display:flex;align-items:center;gap:6px;font-size:11px}.hmb-color-lut input[type=checkbox]{accent-color:var(--cl-accent);width:14px;height:14px}.hmb-color-lut .cl-control{margin:0 0 9px}.hmb-color-lut .cl-control label{display:flex;flex-direction:column;gap:2px;font-size:12px}.hmb-color-lut .cl-control label>span:first-child{display:flex;justify-content:space-between;gap:6px}.hmb-color-lut .cl-value{color:var(--cl-accent);font-size:11px}.hmb-color-lut .cl-endpoints{display:flex;justify-content:space-between;color:#8795aa;font-size:10px;margin-top:-3px}.hmb-color-lut .cl-grade-actions{display:flex;gap:6px;padding-top:8px;border-top:1px solid var(--cl-line)}.hmb-color-lut .cl-grade-actions button{flex:1;font-size:11px}
 .hmb-color-lut .cl-web-upload{display:flex;flex-direction:column;gap:3px;margin-top:4px}.hmb-color-lut .cl-web-upload button{width:100%;font-weight:700;border-color:rgba(var(--cl-rgb),.65)}.hmb-color-lut .cl-web-upload small{color:var(--cl-muted);font-size:10px;line-height:1.4;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;max-height:2.8em}.hmb-color-lut .cl-output{padding:12px;border-top:1px solid var(--cl-line);background:#0c1220}.hmb-color-lut .cl-output-top{display:flex;gap:10px;align-items:center;margin-bottom:9px}.hmb-color-lut .cl-output-top>span{flex:1}.hmb-color-lut .cl-output-top small{color:var(--cl-muted);font-size:10px}.hmb-color-lut .cl-output-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.hmb-color-lut .cl-output-controls label{display:flex;gap:6px;align-items:center;font-size:11px;white-space:nowrap}.hmb-color-lut .cl-output-controls input[type=text]{flex:1;min-width:120px;font-size:11px}.hmb-color-lut .cl-output-controls :is(select,button){font-size:11px}.hmb-color-lut .cl-export{flex:0 0 auto;width:auto;min-width:max-content;white-space:nowrap;padding-inline:20px;background:rgba(var(--cl-rgb),.85);border-color:var(--cl-accent);color:#090d17;font-weight:700}.hmb-color-lut .cl-status{padding:10px 14px;border-top:1px solid var(--cl-line);display:flex;align-items:center;gap:8px;color:#b5c0d0;font-size:11px;min-height:38px;overflow-wrap:anywhere}.hmb-color-lut .cl-status progress{width:80px;accent-color:var(--cl-accent)}.hmb-color-lut .cl-status a{color:var(--cl-accent)}
+@container(min-width:721px) and (max-width:950px){.hmb-color-lut .cl-project :is(select,input[type=text]){padding-inline:4px}}
 @container(max-width:720px){.hmb-color-lut .cl-head{gap:9px;padding:0 12px}.hmb-color-lut .cl-brand small{display:none}.hmb-color-lut .cl-shot-shell{flex:1;width:auto}.hmb-color-lut .cl-work{grid-template-columns:1fr}.hmb-color-lut .cl-control-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 16px}.hmb-color-lut .cl-output-controls input[type=text]{min-width:50%;flex-basis:60%}.hmb-color-lut .cl-output-top{flex-wrap:wrap}}
 @container(max-width:430px){.hmb-color-lut .cl-mark,.hmb-color-lut .cl-shot-shell>span{display:none}.hmb-color-lut .cl-brand strong{font-size:12px}.hmb-color-lut .cl-lang{min-width:46px;padding-inline:5px}.hmb-color-lut .cl-work{padding:7px}.hmb-color-lut .cl-panel-head{flex-wrap:wrap}.hmb-color-lut .cl-note{flex-wrap:wrap}.hmb-color-lut .cl-output-controls>*{max-width:100%}}
 /* Mini Studio 04 visual prototype. Existing geometry, text and behavior remain native. */
@@ -326,7 +349,7 @@ export function hmbRenderColorLUTWidget(input = {}) {
 <header class="cl-head group"><div class="cl-mark" aria-hidden="true">CL</div><div class="cl-brand"><strong>HMB Color LUT</strong><small data-text="subtitle">${t.subtitle}</small></div><div class="cl-native-identity" data-hmb-native-identity></div><div class="cl-native-actions nodrag" data-hmb-native-actions></div><label class="cl-shot-shell nodrag"><span>SHOT</span><select data-shot-selector aria-label="${t.shot}">${shotMarkup(s)}</select></label><button class="cl-lang nodrag" data-language-toggle type="button" aria-label="${t.language}">${s.language === "ko" ? "한국어" : "EN"}</button></header>
 <div class="cl-input nodrag"><span class="cl-dot"></span><span class="cl-source" data-source></span><small data-source-revision></small><button data-action="browse_video" type="button">${label("browse")}</button></div>
 <main class="cl-work nodrag"><section class="cl-preview"><div class="cl-panel-head">${label("preview")}<div class="cl-mode">${["original", "compare", "graded"].map((view) => `<button type="button" data-view="${view}" aria-pressed="${view === "compare"}">${label(view)}</button>`).join("")}</div></div><div class="cl-screen"><canvas data-preview width="960" height="540" role="img" aria-label="${t.preview}"></canvas><span class="cl-label cl-before" data-text="original">${t.original}</span><span class="cl-label cl-after" data-text="graded">${t.graded}</span><div class="cl-seam"><button type="button" data-wipe-handle role="slider" aria-label="${t.wipe}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50">↔</button></div><div class="cl-empty" data-empty>${t.empty}</div></div><div class="cl-transport"><input data-seek type="range" min="0" max="0" value="0" step="1" aria-label="${t.seek}" disabled><div class="cl-player-row"><button data-play type="button" disabled>${t.play}</button><button data-step type="button" disabled>${label("step")}</button><small data-frame></small></div></div><div class="cl-note"><span data-preview-note></span>${label("live")}</div></section>
-<section class="cl-grade"><div class="cl-panel-head">${label("grade")}<label class="cl-enable"><input data-enable type="checkbox"${s.settings.enabled ? " checked" : ""}>${label("enable")}</label></div><div class="cl-grade-body"><div class="cl-project"><label>${label("project")}<select data-project disabled>${projectOptions(s)}</select></label><label>${label("episode")}<select data-episode disabled></select></label></div><div class="cl-control-grid">${HMB_COLOR_LUT_CONTROLS.map((key, i) => `<div class="cl-control"><label><span>${label(key)}<output class="cl-value" data-value="${key}">${escape(stageLabel(s, key))}</output></span><input data-adjust="${key}" type="range" min="-${HMB_COLOR_LUT_MAX_STEP}" max="${HMB_COLOR_LUT_MAX_STEP}" step="1" value="${sliderStep(s.settings[key])}" aria-label="${t[key]}" aria-valuetext="${escape(stageLabel(s, key))}"><span class="cl-endpoints"><span data-low="${i}">${t.low[i]}</span><span data-high="${i}">${t.high[i]}</span></span></label></div>`).join("")}</div><div class="cl-grade-actions"><button data-reset type="button">${label("reset")}</button></div><div class="cl-web-upload"><button data-action="upload_web" type="button" disabled>${label("upload")}</button><small data-upload-reason aria-live="polite"></small></div></div></section></main>
+<section class="cl-grade"><div class="cl-panel-head">${label("grade")}<label class="cl-enable"><input data-enable type="checkbox"${s.settings.enabled ? " checked" : ""}>${label("enable")}</label></div><div class="cl-grade-body"><div class="cl-project">${groupFields}<label>${label("project")}<select data-project disabled>${projectOptions(s)}</select></label><label>${label("episode")}<select data-episode disabled></select></label></div><div class="cl-control-grid">${HMB_COLOR_LUT_CONTROLS.map((key, i) => `<div class="cl-control"><label><span>${label(key)}<output class="cl-value" data-value="${key}">${escape(stageLabel(s, key))}</output></span><input data-adjust="${key}" type="range" min="-${HMB_COLOR_LUT_MAX_STEP}" max="${HMB_COLOR_LUT_MAX_STEP}" step="1" value="${sliderStep(s.settings[key])}" aria-label="${t[key]}" aria-valuetext="${escape(stageLabel(s, key))}"><span class="cl-endpoints"><span data-low="${i}">${t.low[i]}</span><span data-high="${i}">${t.high[i]}</span></span></label></div>`).join("")}</div><div class="cl-grade-actions"><button data-reset type="button">${label("reset")}</button></div><div class="cl-web-upload"><button data-action="upload_web" type="button" disabled>${label("upload")}</button><small data-upload-reason aria-live="polite"></small></div></div></section></main>
 <section class="cl-output nodrag"><div class="cl-output-top">${label("output")}<label class="cl-audio-toggle"><input data-audio-enable type="checkbox"${s.audio_mix.enabled ? " checked" : ""}>${label("audioMix")}</label><small data-text="outputNote">${t.outputNote}</small></div><div class="cl-output-controls"><label><input data-manual-output type="checkbox"${s.output.manual_output_enabled ? " checked" : ""}>${label("manual")}</label><input data-output-path type="text" value="${escape(s.output.path)}" aria-label="${t.path}" placeholder="${s.output.manual_output_enabled ? t.customPath : t.autoPath}"${s.output.manual_output_enabled ? "" : " disabled"}><select data-codec aria-label="${t.codec}">${[["hevc10", "hevc"], ["prores", "prores"], ["ffv1", "ffv1"]].map(([v, k]) => `<option value="${v}" data-text="${k}"${s.output.codec === v ? " selected" : ""}>${t[k]}</option>`).join("")}</select><button data-export-local type="button">${label("saveLocal")}</button><button class="cl-export" data-action="export" type="button" ${exportAction(s).reason ? "disabled" : ""} title="${escape(exportAction(s).title)}" aria-label="${escape(exportAction(s).label)}">${escape(exportAction(s).label)}</button><button data-action="cancel" type="button" hidden>${label("cancel")}</button></div>${audioDetails}</section><div class="cl-status nodrag" role="status" aria-live="polite"><span data-status>${t.ready}</span><progress data-progress max="1" value="0" hidden></progress><a data-result target="_blank" rel="noopener noreferrer" hidden>${t.result}</a></div></div>`;
 }
 
@@ -553,6 +576,18 @@ function hmbNativeUiImplementation(container, props = {}) {
     q("[data-export-local]").disabled = busy || !state.source.path || (state.audio_mix.enabled && !state.sound.connected);
     q("[data-export-local]").hidden = state.output.codec === "ffv1";
     for (const key of HMB_COLOR_LUT_CONTROLS) { const el = q(`[data-adjust="${key}"]`); el.value = String(sliderStep(state.settings[key])); el.setAttribute("aria-valuetext", stageLabel(state, key)); el.setAttribute("aria-label", t[key]); q(`[data-value="${key}"]`).textContent = stageLabel(state, key); }
+    const group = q("[data-group]");
+    group.value = groupLabel(state);
+    group.title = group.value;
+    const chooseGroup = groupSelectable(state);
+    q("[data-group-fixed]").hidden = chooseGroup;
+    q("[data-group-choice]").hidden = !chooseGroup;
+    const groupSelect = q("[data-group-select]");
+    const groupMarkup = groupOptions(state);
+    if (groupSelect.innerHTML !== groupMarkup) groupSelect.innerHTML = groupMarkup;
+    groupSelect.value = state.upload_group.id;
+    groupSelect.disabled = !chooseGroup || busy;
+    groupSelect.title = groupSelect.selectedOptions?.[0]?.textContent || group.value;
     const project = q("[data-project]");
     const boundProject = Boolean(state.shot.shot_uuid);
     const manual = state.manual_project;
@@ -572,7 +607,7 @@ function hmbNativeUiImplementation(container, props = {}) {
       : state.manual_episode;
     const codes = boundProject ? [] : state.upload_episodes;
     const choices = [...new Set([...codes, ...(selectedEpisode ? [selectedEpisode] : [])])].sort();
-    const placeholder = episodeNotice[episodeStatus] && !choices.length
+    const placeholder = privateDestination(state) ? "—" : episodeNotice[episodeStatus] && !choices.length
       ? episodeNotice[episodeStatus] : (state.language === "ko" ? "에피소드 선택" : "Select episode");
     const listMarkup = '<option value="">' + escape(placeholder) + '</option>'
       + choices.map(code => '<option value="' + escape(code) + '">' + escape(code) + '</option>').join("");
@@ -589,12 +624,12 @@ function hmbNativeUiImplementation(container, props = {}) {
     exportButton.title = exportMode.title; exportButton.setAttribute("aria-label", exportMode.label); q('[data-action="cancel"]').hidden = !busy;
     const upload = q('[data-action="upload_web"]');
     upload.hidden = !hasUploadDestination(state);
-    upload.disabled = upload.hidden || busy || !state.web_upload.enabled;
-    upload.title = state.web_upload.reason;
+    upload.disabled = upload.hidden || busy || !state.web_upload.enabled || groupReadOnlyDestination(state);
+    upload.title = groupReadOnlyDestination(state) ? t.groupBrowseOnly : state.web_upload.reason;
     const uploadLabels = { uploading: t.uploading, complete: t.uploaded, unknown: t.uploadCheck, absent: t.uploadRetry,
       media_retry: state.language === "ko" ? "미리보기 확인 · 복구" : "Check and recover preview" };
     upload.textContent = uploadLabels[state.web_upload.phase] || (state.audio_mix.enabled ? t.uploadSource : t.upload);
-    q("[data-upload-reason]").textContent = upload.hidden ? uploadDestinationHint(state) : state.web_upload.reason;
+    q("[data-upload-reason]").textContent = groupReadOnlyDestination(state) ? t.groupBrowseOnly : (upload.hidden ? uploadDestinationHint(state) : state.web_upload.reason);
     q("[data-progress]").hidden = !busy; q("[data-progress]").value = state.status.progress;
     q("[data-status]").textContent = localMessage || state.status.message || t.ready;
     const result = q("[data-result]"); result.textContent = t.result; result.hidden = !state.result.url; if (state.result.url && /^(https?:|blob:|\/)/i.test(state.result.url)) result.href = state.result.url; else { result.removeAttribute("href"); result.hidden = true; }
@@ -627,7 +662,7 @@ function hmbNativeUiImplementation(container, props = {}) {
       action = mode.action;
     }
     if (action === "export" && extra.local_only && (!state.source.path || (state.audio_mix.enabled && !state.sound.connected))) { say(state.source.path ? textFor(state).soundMissing : textFor(state).outputSource); return; }
-    if (action === "upload_web" && (!hasUploadDestination(state) || !state.web_upload.enabled)) return;
+    if (action === "upload_web" && (!hasUploadDestination(state) || !state.web_upload.enabled || groupReadOnlyDestination(state))) return;
     if (action === "upload_web") { extra = { ...extra, check_only: state.web_upload.phase === "unknown" }; state.web_upload.enabled = false; state.web_upload.phase = "uploading"; }
     if (commitTimer) { win.clearTimeout(commitTimer); commitTimer = 0; } pendingEdit = false;
     state.output.path = clean(q("[data-output-path]").value);
@@ -653,11 +688,18 @@ function hmbNativeUiImplementation(container, props = {}) {
     state.settings = copy(settingsCache.get(cacheKey()) || hmbColorLUTSettings()); state.audio_mix = copy(audioMixCache.get(cacheKey()) || {enabled:false,original_audio:"preserve",source:"current"}); state.source = {}; state.result = {}; state.web_upload = { enabled: false, phase: "unavailable", reason: "" }; localMessage = ""; publish(true); sync();
   };
   bind(q("[data-shot-selector]"), "change", (event) => { const option = hmbColorLUTShotOptions(state).find((s) => s.key === event.target.value); if (option) switchContext(() => { state.shot = option.only ? onlyShot() : { channel_uuid: option.channel_uuid, shot_uuid: option.shot_uuid, number: option.number, name: option.name }; }); });
+  bind(q("[data-group-select]"), "change", (event) => {
+    const selection = state.upload_groups.find(g => g.id === event.target.value);
+    if (event.target.disabled || !groupSelectable(state) || !selection || selection.id === state.upload_group.id) return;
+    state.manual_project = {}; state.manual_episode = ""; state.upload_projects = []; state.upload_episodes = [];
+    invalidateUpload();
+    command("select_upload_group", { group_id: selection.id });
+  });
   bind(q("[data-project]"), "change", (event) => {
     if (!state.shot.shot_uuid && event.target.value !== (state.manual_project.id || "")) {
       state.manual_episode = "";
       invalidateUpload();
-      command("select_upload_project", { project_id: clean(event.target.value, 128) });
+      command("select_upload_project", { group_id: state.upload_group.id, project_id: clean(event.target.value, 128) });
     }
   });
   const retryEpisodeList = () => {
@@ -673,7 +715,7 @@ function hmbNativeUiImplementation(container, props = {}) {
       const projectId = state.manual_project.id;
       if (!episode) state.manual_episode = "";
       invalidateUpload();
-      command("select_upload_episode", { project_id: projectId, episode });
+      command("select_upload_episode", { group_id: state.upload_group.id, project_id: projectId, episode });
       if (!event.target.disabled && state.manual_project.id === projectId) event.target.value = episode;
     }
   });

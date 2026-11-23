@@ -357,6 +357,7 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Color LUT shows Group, Project and Episode in one row. A team member's group is filled from their signed-in account, and episode choices follow the operating page's project and group.",
             "- Project Add in ImageAsset and Sound manages linked folders for each project. Select a folder to register images there, or disconnect a folder to remove it from the local catalog. Existing files stay on disk.",
             "- ImageAsset reads the headquarters and partner registries together. Registrations use the selected folder's registry and are serialized per registry, including when two workstations Add images concurrently.",
             "- Loads the signed Super Wings 12 v8.1 policy for linked Prompt and Agent shots. The independent Seedance Only route applies its Super Wings defaults to a connected Standard text Agent and preserves authored directions and other project routes.",
