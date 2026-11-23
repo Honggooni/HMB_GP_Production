@@ -144,6 +144,62 @@ async def exercise(engine):
 
               mock.patch.object(product,'_scan_project_assets',side_effect=AssertionError('No scan'))):
 
+            import _hmb_image_asset_sites as sites
+            destination = Path.cwd() / "vendor" / "배경"
+            destination.mkdir(parents=True)
+            headquarters = Path.cwd() / "shows" / "directory-test" / "Ai_Ct_image"
+            uid = product._project_uid(headquarters)
+            folder_node = create("LocalFolderPicker")
+            no_header = dict(state, project_root="", project_id="", project_uid="", projects=[
+                {"project_id":"directory-test", "name":"directory-test", "project_uid":uid, "path":str(headquarters)}])
+            folder_node._publish_state(product._normalize_state(no_header), preserve_outputs=True)
+            lease = folder_node._hmb_widget_runtime_lease
+            def folder_request(key, **fields):
+                return {"schema":"hmb-image-asset-site-command-v1", "widget_runtime_lease":lease,
+                        "site_settings_request":{"action":"browse_add", "request_id":key, "project_uid":uid, **fields}}
+            async def folder_receipt(key):
+                for _ in range(200):
+                    receipt = current(folder_node)["site_settings_result"]
+                    if receipt.get("request_id") == key:
+                        return receipt
+                    await asyncio.sleep(.01)
+                raise AssertionError(("No folder picker receipt", key, folder_node._hmb_node_deleted))
+            prior = current(folder_node)
+            with mock.patch.object(sites, "choose_site_folder", side_effect=[str(destination), ""]) as chooser:
+                setstate(folder_node, folder_request("open"))
+                receipt = await folder_receipt("open")
+                assert receipt["ok"] and receipt["links"][0]["root"] == destination.as_posix(), receipt
+                setstate(folder_node, folder_request("open"))
+                setstate(folder_node, folder_request("cancel"))
+                cancelled = await folder_receipt("cancel")
+                assert cancelled["cancelled"] and cancelled["revision"] == receipt["revision"]
+                selected = receipt["added_site_id"]
+                (destination / "add").rmdir()
+                setstate(folder_node, folder_request("done", action="confirm", selected_site_id=selected,
+                                                     expected_revision=receipt["revision"]))
+                done = await folder_receipt("done")
+                assert done["ok"] and done["selected_site_id"] == selected and (destination/"add").is_dir(), done
+                setstate(folder_node, folder_request("conflict", action="confirm", selected_site_id=selected,
+                                                     expected_revision="old-revision"))
+                conflict = await folder_receipt("conflict")
+                assert not conflict["ok"] and conflict["links"] == done["links"] and conflict["generation"] == done["generation"]
+                assert chooser.call_count == 2
+                setstate(folder_node, dict(folder_request("stale"),widget_runtime_lease="retired"), ok=False)
+                assert chooser.call_count == 2
+            after = current(folder_node)
+            assert not after["project_root"] and after["site_profiles"][uid]["links"] == receipt["links"]
+            assert after["shot_routing"] == prior["shot_routing"] and after["assets"] == prior["assets"]
+            legacy_roster = dict(after, projects=[dict(after["projects"][0], project_uid="")])
+            folder_node._publish_state(legacy_roster, preserve_outputs=True)
+            with mock.patch.object(sites, "choose_site_folder", return_value=""):
+                setstate(folder_node, folder_request("legacy", project_uid="directory-test"))
+                assert (await folder_receipt("legacy"))["cancelled"]
+            assert current(folder_node)["site_profiles"]["directory-test"]["links"] == receipt["links"]
+            cases.append("local_folder_command_without_header_get_or_scan_confirm_cancel_dedup")
+            cases.append("done_repair_and_conflict_receipts_without_changing_shot_or_catalog")
+
+            send(DeleteNodeRequest(node_name=folder_node.name))
+
             node=create('LeaseReceiver')
 
             fresh=current(node);lease=node._hmb_widget_runtime_lease

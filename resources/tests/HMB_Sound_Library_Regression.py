@@ -394,6 +394,62 @@ class SoundNodeRegression(SoundLibraryRegression):
         self.assertEqual(restored['folders'], self.node._state_sound['folders'])
         self.assertEqual(restored['tracks'], preserved['tracks'])
 
+    def test_confirm_folder_while_sound_busy_without_reading_catalog(self):
+        import _hmb_image_asset_sites as sites
+        folder = self.audio.with_name("Ai_Ct_audio_Gang")
+        folder.mkdir()
+        uid = self.node._state_sound["project_uid"]
+        tracks = copy.deepcopy(self.node._state_sound["tracks"])
+        self.node._state_sound["busy"] = True
+        def request(key):
+            self.command("site_settings", site_settings_request={
+                "request_id":key, "project_uid":uid, "action":"browse_add"})
+        with (mock.patch.object(sites, "_workspace", return_value=self.root / "workspace"),
+              mock.patch.object(sites, "threading", types.SimpleNamespace(Thread=ControlledThread)),
+              mock.patch.object(sites, "choose_site_folder", side_effect=[str(folder), ""]) as choose,
+              mock.patch.object(target, "scan_sound_project", side_effect=AssertionError("No catalog scan"))):
+            request("browse")
+            request("browse")
+            self.drain()
+            ui = self.node._sound_ui_state()[0]
+            saved = ui["site_settings_result"]
+            self.assertTrue(saved["ok"], saved)
+            self.assertEqual(saved["links"][0]["id"], saved["added_site_id"])
+            self.assertEqual(ui["site_profiles"][uid]["revision"], saved["revision"])
+            request("cancel-browse")
+            self.drain()
+            receipt = self.node._sound_ui_state()[0]["site_settings_result"]
+            self.assertTrue(receipt["cancelled"])
+            self.assertEqual(receipt["revision"], saved["revision"])
+            self.assertEqual(choose.call_count, 2)
+            self.assertEqual(self.node._state_sound["tracks"], tracks)
+            self.assertTrue(self.node._state_sound["busy"])
+
+    def test_done_updates_active_sound_catalog_and_never_rescans_existing_sources(self):
+        import _hmb_image_asset_sites as sites
+        vendor = self.audio.with_name("Ai_Ct_audio_Gang")
+        make_wave(vendor / "Dialogue" / "vendor.wav")
+        uid = self.node._state_sound["project_uid"]
+        tracks = copy.deepcopy(self.node._state_sound["tracks"])
+        with (mock.patch.object(sites, "_workspace", return_value=self.root / "workspace"),
+              mock.patch.object(sites, "threading", types.SimpleNamespace(Thread=ControlledThread, Lock=threading.Lock)),
+              mock.patch.object(sites, "choose_site_folder", return_value=str(vendor)),
+              mock.patch.object(helper, "_scan_sound_inventory", wraps=helper._scan_sound_inventory) as scans):
+            def issue(action, key, **fields):
+                self.command("site_settings", site_settings_request=dict(
+                    action=action, request_id=key, project_uid=uid, **fields))
+                self.drain()
+                receipt = self.node._sound_ui_state()[0]["site_settings_result"]
+                self.assertTrue(receipt["ok"], receipt)
+                return receipt
+            saved = issue("browse_add","browse")
+            for key in ("done","done-again"):
+                done = issue("confirm", key, selected_site_id=saved["added_site_id"], expected_revision=saved["revision"])
+                self.assertEqual(done["revision"], saved["revision"])
+                self.assertTrue(any(a["relative_path"].endswith("/Dialogue/vendor.wav") for a in self.node._state_sound["assets"]))
+                self.assertEqual(self.node._state_sound["tracks"], tracks)
+            self.assertEqual([c.args[0] for c in scans.call_args_list], [vendor])
+
     def test_committed_folder_receipt_survives_cancel_during_catalog_read(self):
         import _hmb_image_asset_sites as sites
         vendor = self.audio.with_name("Ai_Ct_audio_Gang")

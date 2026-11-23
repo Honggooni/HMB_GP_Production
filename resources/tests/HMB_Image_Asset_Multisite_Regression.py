@@ -161,6 +161,39 @@ def reopened(station_name, directory):
     assert not lib._resolve_selected_assets(restored)["unresolved"]
 
 
+def live_profile_changes(root):
+    from _hmb_image_asset_sites import add_site_folder, confirm_site_folder
+    from PIL import Image
+    lib = station(root / "pc-confirm-active")
+    hq, first, second = paths(root)
+    Image.new("RGB", (4, 4)).save(first/"CH"/"unregistered.png")
+    catalog = hq.parents[1]
+    state = load(lib, catalog)
+    anchor = next(a for a in state["assets"] if a["registered"])
+    anchor.update(selected=True, selection_order=1)
+    state["shot_routing"]["shots"][0]["selected_source_uids"] = [anchor["source_uid"]]
+    with patch.object(lib, "_scan_project_assets", wraps=lib._scan_project_assets) as scans:
+        profile, site = add_site_folder(hq, str(first), "image")
+        confirm_site_folder(hq, "image", profile["revision"], site)
+        state = load(lib,catalog,state)
+        assert f"site:{site}/add" in state["folders"]
+        assert any(a["relative_path"] == f"site:{site}/CH/unregistered.png" for a in state["assets"])
+        for _ in range(2):
+            confirm_site_folder(hq, "image", profile["revision"], site)
+            state = load(lib,catalog,state)
+        profile2, site2 = add_site_folder(hq, str(second), "image")
+        confirm_site_folder(hq, "image", profile2["revision"], site2)
+        state = load(lib,catalog,state)
+        assert not any(a["relative_path"] == f"site:{site}/CH/unregistered.png" for a in state["assets"])
+        assert any(a["relative_path"].startswith(f"site:{site2}/") for a in state["assets"])
+        clipped = lib.save_site_settings(hq, profile2["links"][1:], site2, profile2["revision"], existing_only=True)
+        confirm_site_folder(hq, "image", clipped["revision"], site2)
+        state = load(lib,catalog,state)
+        assert not any(f.startswith(f"site:{site}/") for f in state["folders"])
+        assert state["shot_routing"]["shots"][0]["selected_source_uids"] == [anchor["source_uid"]]
+        assert [c.args[0] for c in scans.call_args_list] == [first,second], scans.call_args_list
+
+
 def run():
     from PIL import Image
     with TemporaryDirectory(prefix="hmb-site-") as home:
@@ -176,6 +209,9 @@ def run():
             (location / ".json" / "hmb_image_assets.json").write_text(json.dumps({"assets": [record]}), encoding="utf-8")
         busan_manifest = busan / ".json" / "hmb_image_assets.json"
         untouched = busan_manifest.read_bytes()
+        # Initialize from the clean station env before importing the library.
+        station(root / "pc-confirm-active")
+        live_profile_changes(root)
         context = multiprocessing.get_context("spawn")
         barrier = context.Barrier(2)
         for entry, arguments in [(register, (barrier,)), (reopened, ())]:

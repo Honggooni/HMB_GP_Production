@@ -75,6 +75,84 @@ class SiteSettingsRegression(unittest.TestCase):
         self.assertTrue(self.sites.settings_path(self.project).is_relative_to(self.workspace))
         self.assertEqual(list(self.gang.iterdir()) + list(self.busan.iterdir()), [])
 
+    def test_directory_confirmation_appends_without_reading_other_media(self):
+        self.project.rmdir()
+        _, first_id = self.sites.add_site_folder(self.project, str(self.gang), "image")
+        self.gang.rename(self.gang.with_name("offline"))  # A previously linked vendor is offline.
+        with patch.object(self.sites, "_check_directory_route", wraps=self.sites._check_directory_route) as check:
+            added, second_id = self.sites.add_site_folder(self.project, str(self.busan), "image")
+            self.assertEqual([x.args[0] for x in check.call_args_list], [self.busan])
+        self.assertEqual([r["id"] for r in added["links"]], [first_id, second_id])
+        self.assertEqual(added["write_site_id"], second_id)
+        replay, again_id = self.sites.add_site_folder(self.project, str(self.busan), "image")
+        self.assertEqual((replay, again_id), (added, second_id))
+        restored = load_module()
+        projects = [{"project_uid":"p", "path":str(self.project)}]
+        with patch.object(restored, "_check_directory_route", side_effect=AssertionError("unexpected media probe")):
+            self.assertEqual(restored.site_profiles(projects, "image"), {"p": added})
+            with patch.object(restored, "_read", side_effect=AssertionError("repeated disk read")):
+                self.assertEqual(restored.site_profiles(projects, "image"), {"p": added})
+            self.assertEqual(restored.site_profiles(projects, "sound"), {})
+            with self.assertRaises(ValueError):
+                restored.save_site_settings(self.project, added["links"], "hq", added["revision"], existing_only=True)
+            result = restored.save_site_settings(self.project, added["links"][1:], second_id,
+                                                added["revision"], existing_only=True)
+            self.assertEqual(len(result["links"]), 1)
+            last = restored.save_site_settings(self.project, [], "hq", result["revision"], existing_only=True)
+            self.assertEqual((last["links"], last["write_site_id"]), ([], "hq"))
+            self.assertEqual(restored.site_profiles(projects, "image"), {"p": last})
+
+    def test_done_upgrades_legacy_selection_and_only_prepares_the_chosen_folder(self):
+        for media, base in (("image", self.project), ("sound", self.sound)):
+            with self.subTest(media=media):
+                links = [{"id": key, "label": key, "root": str(root)} for key, root in
+                         (("first", self.gang), ("second", self.busan))]
+                prior = self.sites.save_site_settings(base, links, "first" if media == "image" else "hq",
+                                                     "0", media=media)
+                # Recreate a genuine profile written before the Done control existed.
+                path = self.sites.settings_path(base, media)
+                record = json.loads(path.read_text(encoding="utf-8"))
+                del record["selected_site_id"], record["generation"]
+                path.write_text(json.dumps(record), encoding="utf-8")
+                second_id = prior["links"][1]["id"]
+                with patch.object(self.sites, "_check_directory_route", wraps=self.sites._check_directory_route) as inspected:
+                    confirmed = self.sites.confirm_site_folder(base, media, prior["revision"], second_id)
+                    self.assertEqual([call.args[0] for call in inspected.call_args_list], [self.busan])
+                self.assertEqual(confirmed["selected_site_id"], second_id)
+                self.assertEqual(confirmed["write_site_id"], prior["write_site_id"])
+                self.assertEqual(confirmed["revision"], prior["revision"])
+                self.assertEqual(confirmed["generation"], 2)
+                self.assertEqual({entry.name for entry in self.busan.iterdir()}, {"add", ".json"})
+                self.assertEqual(list(self.gang.iterdir()), [])
+                restarted = load_module()
+                restored = restarted.site_profiles([dict(project_uid="p", path=str(base))], media)
+                self.assertEqual(restored["p"], confirmed)
+                marker = self.busan / ".json" / "existing.json"
+                marker.write_bytes(b"keep")
+                self.assertEqual(restarted.confirm_site_folder(base, media, confirmed["revision"], second_id), confirmed)
+                self.assertEqual(marker.read_bytes(), b"keep")
+                (self.busan/"add").rmdir()
+                (self.busan/"add").write_bytes(b"file in place of directory")
+                with self.assertRaisesRegex(ValueError, "같은 이름의 파일"):
+                    restarted.confirm_site_folder(base, media, confirmed["revision"], second_id)
+                self.assertEqual(restarted.get_site_settings(base, media, fresh=True), confirmed)
+                (self.busan/"add").unlink()
+                marker.unlink()
+                (self.busan/".json").rmdir()
+
+    def test_failed_add_or_stale_done_preserves_committed_profile(self):
+        first, site_id = self.sites.add_site_folder(self.project, str(self.gang), "image")
+        self.assertEqual(first["selected_site_id"], site_id)
+        self.assertTrue((self.gang/"add").is_dir())
+        self.assertTrue((self.gang/".json").is_dir())
+        (self.busan/"add").write_bytes(b"conflict")
+        with self.assertRaisesRegex(ValueError, "같은 이름의 파일"):
+            self.sites.add_site_folder(self.project, str(self.busan), "image")
+        with patch.object(self.sites, "_check_directory_route", side_effect=AssertionError("irrelevant share I/O")):
+            with self.assertRaisesRegex(ValueError, "다른 창"):
+                self.sites.confirm_site_folder(self.project, "image", "old", site_id)
+        self.assertEqual(self.sites.get_site_settings(self.project, fresh=True), first)
+
     def test_disconnect_offline_and_reconnect_preserve_identity(self):
         link = {"id": "new-a", "label": "광주", "root": str(self.gang)}
         first = self.sites.save_site_settings(self.project, [link], "new-a", "0")

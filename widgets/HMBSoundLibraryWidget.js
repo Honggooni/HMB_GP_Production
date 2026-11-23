@@ -1,21 +1,64 @@
 // Standalone Griptape widgets load as individual modules. Keep this dialog in sync in both libraries.
+function projectFolderMemory(container) {
+  return container.__hmbFolderMemory ||= {profiles:new Map(), selections:new Map(), project:"", pending:null};
+}
+
+function rememberProjectFolderProfile(memory, uid, value, confirmed = false) {
+  if (!uid || !value?.revision || !Array.isArray(value.links)) return;
+  const previous = memory.profiles.get(uid);
+  if (previous) {
+    const incoming = Number.isSafeInteger(value.generation) ? value.generation : -1;
+    const current = Number.isSafeInteger(previous.generation) ? previous.generation : -1;
+    if (incoming < current || (!confirmed && incoming === current && previous.revision !== value.revision
+        && (current >= 0 || previous.confirmed))) return;
+    if (previous.revision === value.revision && incoming === current) {
+      if (confirmed) previous.confirmed = true;
+      return;
+    }
+    if (value.selected_site_id !== previous.selected_site_id && memory.selections.get(uid) === previous.selected_site_id) {
+      memory.selections.set(uid, value.selected_site_id || "");
+    }
+  }
+  memory.profiles.set(uid, {revision:value.revision, generation:value.generation, selected_site_id:value.selected_site_id || "",
+    write_site_id:value.write_site_id || "hq", links:value.links.map(link=>({...link})), confirmed:confirmed || previous?.confirmed === true});
+}
+
+function syncProjectFolderProfiles(container, snapshot, receiptOnly = false) {
+  const memory = container.__hmbFolderMemory;
+  if (!memory) return;
+  // A missing entry in a partial snapshot says nothing about a saved folder.
+  // Explicit profiles, including empty tombstones, carry the workstation's durable generation.
+  if (!receiptOnly) {
+    rememberProjectFolderProfile(memory, snapshot.project_uid, snapshot.site_settings);
+    for (const [id, value] of Object.entries(snapshot.site_profiles || {})) {
+      rememberProjectFolderProfile(memory, id, value);
+    }
+  }
+  const req = memory.pending, result = snapshot.site_settings_result;
+  if (!req || result?.request_id !== req.request_id || result.project_uid !== req.project_uid) return null;
+  memory.pending = null;
+  rememberProjectFolderProfile(memory, req.project_uid, result, true);
+  const current = memory.profiles.get(req.project_uid);
+  if (result.ok && !result.cancelled && req.action === "browse_add"
+      && current && current.revision === result.revision && current.generation === result.generation
+      && current.links.some(link => link.id === result.added_site_id)) {
+    memory.selections.set(req.project_uid, result.added_site_id);
+  }
+  return {req, result};
+}
+
 function openProjectFolderCards(container, state, options) {
   container.__hmbFolderCards?.close();
   const doc = container.ownerDocument, sound = options.media === "sound";
   const label = (ko, en) => state.language === "en" ? en : ko;
   const leaf = path => String(path || "").replace(/[/\\]+$/, "").split(/[/\\]/).pop() || "";
-  const projects = new Map();
-  const available = sound && Array.isArray(state.site_projects) ? state.site_projects : state.projects || [];
-  for (const row of [...available, {project_uid:state.project_uid, project_id:state.project_id, path:state.project_root}]) {
-    const id = String(row.project_uid || (row.project_id === state.project_id && state.project_uid) || row.project_id || "");
-    const path = String(row.path || row.project_root || "");
-    if (id && path && !projects.has(id)) projects.set(id, {path,name:row.name || row.project_id || leaf(path)});
-  }
+  const memory = projectFolderMemory(container);
+  let projects = new Map();
   const dialog = doc.createElement("dialog");
   dialog.className = "hmb-project-folders nodrag nopan nowheel";
   dialog.setAttribute("aria-label", label("프로젝트 Add", "Project Add"));
   dialog.innerHTML = `<style>
-.hmb-project-folders{box-sizing:border-box;color-scheme:dark;width:min(540px,94vw);max-height:86vh;padding:0;background:#101725;color:#e6edf7;border:1px solid #46546d;border-radius:12px;box-shadow:0 16px 60px #000a;font:14px/1.4 system-ui,sans-serif;overflow:auto}
+.hmb-project-folders{position:fixed;inset:0;margin:auto;height:fit-content;box-sizing:border-box;color-scheme:dark;width:min(540px,94vw);max-height:86vh;padding:0;background:#101725;color:#e6edf7;border:1px solid #46546d;border-radius:12px;box-shadow:0 16px 60px #000a;font:14px/1.4 system-ui,sans-serif;overflow:auto}
 .hmb-project-folders::backdrop{background:#06091099}
 .hmb-project-folders *{box-sizing:border-box}
 .hmb-project-folders header,.hmb-project-folders footer{display:flex;gap:9px;align-items:center}
@@ -23,14 +66,17 @@ function openProjectFolderCards(container, state, options) {
 .hmb-project-folders header button{margin-left:auto}
 .hmb-project-folders section{padding:16px}
 .hmb-project-folders label,.hmb-project-folders [data-pf-heading]{display:block;margin:0 0 6px;color:#c4cfdf;font-size:13px}
-.hmb-project-folders input,.hmb-project-folders select,.hmb-project-folders button{font:inherit;color:inherit;background:#131c2c;border:1px solid #42506a;border-radius:6px;padding:6px 11px}
+.hmb-project-folders select,.hmb-project-folders button{font:inherit;color:inherit;background:#131c2c;border:1px solid #42506a;border-radius:6px;padding:6px 11px}
 .hmb-project-folders button{cursor:pointer}
 .hmb-project-folders button:disabled{opacity:.45;cursor:default}
 .hmb-project-folders :focus-visible{outline:2px solid #65dbed;outline-offset:2px}
-.hmb-project-folders select,.hmb-project-folders input{width:100%;height:36px;background:#0c1320}
+.hmb-project-folders select{width:100%;height:36px;background:#0c1320}
 .hmb-project-folders .pf-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(195px,100%),1fr));gap:8px;max-height:40vh;overflow:auto;padding:3px}
-.hmb-project-folders .pf-card{display:flex;align-items:center;gap:10px;text-align:left;min-height:60px;min-width:0}
-.hmb-project-folders .pf-card[aria-pressed=true]{border-color:#42c2d4;background:#123444}
+.hmb-project-folders .pf-card{min-width:0;border:1px solid #42506a;border-radius:6px;background:#131c2c;overflow:hidden}
+.hmb-project-folders .pf-card:has([aria-pressed=true]){border-color:#42c2d4;background:#123444}
+.hmb-project-folders .pf-select{display:flex;align-items:center;gap:10px;width:100%;min-height:50px;text-align:left;border:0;background:transparent}
+.hmb-project-folders .pf-write{display:flex;align-items:center;gap:6px;margin:0;padding:2px 10px 8px;font-size:12px;cursor:pointer}
+.hmb-project-folders .pf-write input{margin:0;accent-color:#6ad9ed}
 .hmb-project-folders .pf-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
 .hmb-project-folders .pf-icon{color:#7ccadc}
 .hmb-project-folders [data-pf-status]{min-height:1.5em;color:#9cabbf;font-size:12px;margin:9px 0}
@@ -41,134 +87,147 @@ function openProjectFolderCards(container, state, options) {
 </style>`
     + '<header><span class="pf-icon" aria-hidden="true">▱</span><span data-pf-title></span><button type="button" data-pf-close>×</button></header>'
     + '<section><label><span data-pf-project-label></span><select data-pf-project></select></label><div class="pf-controls"><strong data-pf-heading></strong><div class="pf-grid" data-pf-cards></div></div>'
-    + '<label data-pf-entry hidden><span data-pf-path-label></span><input type="text" data-pf-path autocomplete="off" spellcheck="false"></label><div data-pf-status role="status" aria-live="polite"></div></section>'
-    + '<footer><button type="button" data-pf-add></button><button type="button" data-pf-remove></button></footer>';
+    + '<div data-pf-status role="status" aria-live="polite"></div></section>'
+    + '<footer><button type="button" data-pf-add></button><button type="button" data-pf-remove></button><button type="button" data-pf-done></button></footer>';
   const find = name => dialog.querySelector("[data-pf-" + name + "]");
-  const select = find("project"), closeButton = find("close"), add = find("add"), remove = find("remove");
+  const select = find("project"), closeButton = find("close"), add = find("add"), remove = find("remove"), done = find("done");
   find("title").textContent = label("프로젝트 Add", "Project Add");
   find("project-label").textContent = label("프로젝트", "Project");
-  find("heading").textContent = label("연결된 폴더", "Linked folders");
-  find("path-label").textContent = label("등록할 폴더의 전체 경로", "Full folder path");
+  find("heading").textContent = label("추가한 폴더", "Added folders");
   add.textContent = label("추가", "Add"); remove.textContent = label("삭제", "Remove");
+  done.textContent = label("완료", "Done");
   closeButton.setAttribute("aria-label", label("닫기", "Close"));
-  for (const [id, row] of projects) select.add(new doc.defaultView.Option(row.name, id));
-  let project = projects.has(state.project_uid) ? state.project_uid : projects.keys().next().value || "";
-  select.value = project;
-  let profile = null, selected = "hq", pending = "", timer, choosing = false, disposed = false, pickerToken = state.site_picker_draft?.token || "", stopPicker = () => {};
+  let project = memory.pending?.project_uid || memory.project, disposed = false, confirmRequest = "";
   const notice = text => { find("status").textContent = text || ""; };
-  const writeId = () => profile?.write_site_id || "hq";
-  const asyncId = () => globalThis.crypto?.randomUUID?.() || Date.now().toString(16) + Math.random().toString(16).slice(2);
+  const profile = () => memory.profiles.get(project);
+  const selectedId = () => memory.selections.get(project) || "";
+  const writeId = () => profile()?.write_site_id || "hq";
+  const writeGroup = "hmb-folder-write-" + String(globalThis.crypto?.randomUUID?.() || Math.random());
+  function useSnapshot(snapshot) {
+    // The editor may publish the local project catalog after the dialog opens.
+    const available = sound && Array.isArray(snapshot.site_projects) ? snapshot.site_projects : snapshot.projects || [];
+    const next = new Map();
+    for (const row of [...available, {project_uid:snapshot.project_uid, project_id:snapshot.project_id, path:snapshot.project_root}]) {
+      const id = String(row.project_uid || (row.project_id === snapshot.project_id && snapshot.project_uid) || row.project_id || "");
+      const path = String(row.path || row.project_root || "");
+      if (id && path && !next.has(id)) next.set(id, {path,name:row.name || row.project_id || leaf(path)});
+    }
+    const changed = next.size !== projects.size || [...next].some(([id, row]) => {
+      const old = projects.get(id); return !old || old.path !== row.path || old.name !== row.name;
+    });
+    if (changed || !next.has(project)) {
+      projects = next;
+      if (!projects.has(project)) {
+        project = [memory.pending?.project_uid, memory.project, snapshot.project_uid].find(id=>projects.has(id)) || projects.keys().next().value || "";
+      }
+      select.replaceChildren();
+      for (const [id, row] of projects) select.add(new doc.defaultView.Option(row.name, id));
+      select.value = project;
+    }
+    if (project) memory.project = project;
+    return changed;
+  }
   function paint() {
-    find("entry").hidden = !choosing;
     const grid = find("cards"); grid.replaceChildren();
-    const base = profile?.base_root || projects.get(project)?.path || "";
-    const cards = base ? [{id:"hq", label:leaf(base),root:base}, ...(profile?.links || [])] : [];
-    for (const item of cards) {
-      const button = doc.createElement("button"), icon = doc.createElement("span"), name = doc.createElement("span");
-      button.type = "button"; button.className = "pf-card"; button.dataset.pfSite = item.id; button.title = item.root;
-      button.setAttribute("aria-pressed", String(item.id === selected)); button.disabled = !!pending || !profile || choosing;
+    const links = profile()?.links || [];
+    const pending = memory.pending;
+    let selected = selectedId();
+    if (!links.some(link => link.id === selected)) {
+      selected = [profile()?.selected_site_id, writeId(), links[0]?.id].find(id=>links.some(link=>link.id === id)) || "";
+      memory.selections.set(project, selected);
+    }
+    for (const item of links) {
+      const card = doc.createElement("div"), button = doc.createElement("button"), icon = doc.createElement("span"), name = doc.createElement("span");
+      card.className = "pf-card";
+      button.type = "button"; button.className = "pf-select"; button.dataset.pfSite = item.id; button.title = item.root;
+      button.setAttribute("aria-pressed", String(item.id === selected));
+      button.disabled = !!pending;
       icon.className = "pf-icon"; icon.textContent = "📁"; icon.setAttribute("aria-hidden","true");
       name.className = "pf-name"; name.textContent = item.label || leaf(item.root);
-      button.append(icon,name); grid.appendChild(button);
-      button.onclick = () => {
-        if (!sound && item.id !== writeId()) save(profile.links, item.id);
-        else { selected = item.id; paint(); notice(sound ? item.root : label("Add 저장 위치 · ", "Add destination · ") + item.root); }
-      };
+      button.append(icon,name); card.appendChild(button); grid.appendChild(card);
+      button.onclick = () => { memory.selections.set(project, item.id); paint(); notice(item.root); };
+      if (!sound) {
+        const field = doc.createElement("label"), radio = doc.createElement("input");
+        radio.type = "radio"; radio.name = writeGroup; radio.dataset.pfWriteSite = item.id;
+        radio.checked = item.id === writeId(); radio.disabled = !!pending || !profile()?.revision;
+        const caption = label("Add 저장 위치", "Add destination");
+        radio.setAttribute("aria-label", caption + " · " + (item.label || leaf(item.root)));
+        radio.onchange = () => { if (radio.checked && item.id !== writeId()) save(profile().links, item.id); };
+        field.className = "pf-write"; field.append(radio, doc.createTextNode(caption)); card.appendChild(field);
+      }
     }
-    select.disabled = !!pending; add.disabled = !profile || !!pending; remove.disabled = !profile || !!pending || choosing || selected === "hq";
+    select.disabled = !!pending;
+    add.disabled = !project || !!pending;
+    done.disabled = !project || !!pending;
+    remove.disabled = !profile()?.revision || !!pending || !links.some(link => link.id === selected);
   }
-  function restoreModal() {
-    if (!disposed && dialog.open && !dialog.matches(":modal")) { dialog.close(); dialog.showModal(); }
-  }
-  function endPicker() { choosing=false; stopPicker(); stopPicker=()=>{}; find("path").value=""; restoreModal(); }
   function close() {
     if (disposed) return;
-    disposed = true; clearTimeout(timer); endPicker(); dialog.remove(); delete container.__hmbFolderCards;
+    disposed = true; dialog.close(); dialog.remove(); delete container.__hmbFolderCards;
     options.trigger?.focus?.({preventScroll:true});
   }
   function request(action, extra = {}) {
-    const request_id = asyncId(); pending = request_id;
-    clearTimeout(timer);
-    timer=setTimeout(() => {
-      if (disposed || pending !== request_id) return;
-      notice(label("엔진 응답을 기다리는 중입니다. 이 창에서 결과를 확인하거나 다시 열 수 있습니다.", "Waiting for the engine. Keep this window open for confirmation, or reopen it."));
-    },15000);
-    paint(); notice(action === "save" ? label("폴더 설정 저장 중…","Saving folder settings…") : label("폴더 확인 중…","Reading folder settings…"));
-    const fail = error => { if (disposed || pending !== request_id) return; clearTimeout(timer); pending=""; profile=null; paint(); notice(String(error?.message||error)); };
-    try { Promise.resolve(options.send({request_id,project_uid:project,action,...extra},fail)).catch(fail); } catch(error){ fail(error); }
-  }
-  function save(links,id) { if (profile && !pending) request("save",{links,write_site_id:id,expected_revision:profile.revision}); }
-  function addPath(input) {
-    const path = String(input || "").trim().replace(/^["']|["']$/g,"");
-    if (!/^(?:[a-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+|\/(?!\/))/i.test(path) || /[\\/]fakepath[\\/]/i.test(path)) {
-      notice(label("공유 폴더의 전체 경로를 입력하세요.","Enter the full shared folder path.")); return;
-    }
-    const key = p => p.replaceAll("\\","/").replace(/\/+$/,"").toLowerCase();
-    if ([profile.base_root || projects.get(project)?.path, ...profile.links.map(link=>link.root)].some(p=>p && key(p)===key(path))) {
-      notice(label("이미 연결된 폴더입니다.","This folder is already linked.")); return;
-    }
-    const id = "new-" + asyncId().replaceAll("-","");
-    endPicker(); save([...profile.links,{id,label:leaf(path),root:path}],sound ? writeId() : id);
-  }
-  function browse() {
-    choosing = true; paint(); find("path").focus();
-    notice(label("폴더를 선택하거나 전체 경로를 입력한 뒤 추가를 누르세요.","Choose a folder, or enter its full path and press Add."));
-    const shell = container.closest(".react-flow__node,[data-node-id]");
-    const selector = '[data-parameter-name="HMB_SITE_FOLDER_DRAFT"],[data-parameter="HMB_SITE_FOLDER_DRAFT"],[data-parameter-key="HMB_SITE_FOLDER_DRAFT"],[data-parameter-id$="HMB_SITE_FOLDER_DRAFT" i]';
-    const input = shell?.querySelector('input[name="HMB_SITE_FOLDER_DRAFT"],input[id*="HMB_SITE_FOLDER_DRAFT" i]');
-    const row = shell?.querySelector(selector) || input?.closest('[role="group"]') || input?.parentElement;
-    if (!row || row.contains(container)) return;
-    const controls = [...row.querySelectorAll('button,[role="button"]')].filter(el=>!el.disabled);
-    const description = el => [el.title,el.getAttribute("aria-label"),el.textContent].join(" ");
-    const control = controls.find(el=>/browse|choose|select|찾아|선택/i.test(description(el)) && !/reveal|explorer|편집|reset/i.test(description(el)))
-      || controls.find(el=>!el.title && el.matches("button.border-l") && el.querySelector("svg.lucide-folder"));
-    if (!control) return;
-    const accept = event => {
-      const path = event.target?.value;
-      if (choosing && path && !/fakepath/i.test(path)) { find("path").value=path; addPath(path); }
-    };
-    row.addEventListener("change", accept);
-    stopPicker = () => row.removeEventListener("change",accept);
-    // The native editor can render its chooser in a portal outside the widget.
-    // Leave the browser top layer so that chooser, including Cancel, remains interactive.
-    dialog.close(); dialog.show(); control.click();
-  }
-  function receive(snapshot) {
-    if (disposed) return;
-    const picked = snapshot.site_picker_draft;
-    if (picked?.token && picked.token !== pickerToken) {
-      pickerToken = picked.token;
-      if (choosing && profile && !pending && picked.path) { find("path").value=picked.path; addPath(picked.path); }
-    }
-    const result = snapshot.site_settings_result;
-    if (!pending || result?.request_id !== pending || result?.project_uid !== project) return;
-    clearTimeout(timer); pending="";
-    if (!result.ok) {
-      profile=null; paint(); notice(result.message || label("폴더 설정을 확인할 수 없습니다. 창을 다시 열어 주세요.","Could not read folder settings. Reopen Project Add.")); return;
-    }
-    profile = {...result,links:Array.isArray(result.links) ? result.links : []};
-    selected = !sound || !profile.links.some(link=>link.id===selected) ? writeId() : selected;
+    if (disposed || !project || memory.pending) return;
+    const id = globalThis.crypto?.randomUUID?.() || Date.now().toString(16) + Math.random().toString(16).slice(2);
+    const req = {request_id:id, project_uid:project, action, ...extra};
+    memory.pending = req;
+    if (action === "confirm") confirmRequest = id;
     paint();
-    const pickedCard = find("cards").querySelector('[aria-pressed="true"]');
-    notice(result.message || (!sound && pickedCard ? label("Add 저장 위치 · ", "Add destination · ") + pickedCard.title : ""));
+    notice(action === "browse_add" ? label("추가할 폴더를 선택하고 확인을 누르세요.", "Choose a folder and confirm.") : label("폴더 설정 저장 중…", "Saving folder settings…"));
+    const fail = error => {
+      if (memory.pending !== req) return;
+      memory.pending = null;
+      container.__hmbFolderCards?.failed(String(error?.message || error));
+    };
+    try { Promise.resolve(options.send(req)).catch(fail); } catch(error) { fail(error); }
   }
-  select.onchange = () => {
-    endPicker();
-    project=select.value; profile=null; selected="hq"; request("get");
+  function save(links, id) {
+    if (profile()?.revision) request("update_links", {links, write_site_id:id, expected_revision:profile().revision});
+  }
+  function receive(snapshot, receiptOnly = false) {
+    if (disposed) return;
+    const before = profile();
+    const acknowledged = syncProjectFolderProfiles(container, snapshot, receiptOnly);
+    const changed = !receiptOnly && !memory.pending && useSnapshot(snapshot);
+    if (!acknowledged && !changed && before === profile()) return;
+    paint();
+    if (!acknowledged) return;
+    const {req,result} = acknowledged;
+    if (!result.ok) {
+      notice(result.message || label("폴더 설정을 저장하지 못했습니다.", "Could not save the folder settings.")); return;
+    }
+    if (req.action === "confirm" && req.request_id === confirmRequest) {
+      if (result.revision && result.revision === profile()?.revision && Array.isArray(result.links)
+          && result.selected_site_id === req.selected_site_id && profile()?.selected_site_id === req.selected_site_id
+          && !result.cancelled) close();
+      else notice(label("현재 폴더 설정을 다시 확인해 주세요.", "Review the current folder settings."));
+      return;
+    }
+    const card = find("cards").querySelector('[aria-pressed="true"]');
+    notice(result.message || card?.title || "");
+  }
+  select.onchange = () => { memory.project = project = select.value; paint(); notice(""); };
+  add.onclick = () => request("browse_add");
+  done.onclick = () => request("confirm", {expected_revision:profile()?.revision || "", selected_site_id:selectedId()});
+  remove.onclick = () => {
+    const selected = selectedId();
+    if (profile()?.links.some(link => link.id === selected)) {
+      const remaining = profile().links.filter(link => link.id !== selected);
+      const destination = writeId() === selected ? (remaining[0]?.id || "hq") : writeId();
+      save(remaining, destination);
+    }
   };
-  add.onclick = () => { if (choosing) addPath(find("path").value); else browse(); };
-  remove.onclick = () => { if (selected!=="hq") save(profile.links.filter(link=>link.id!==selected),writeId()===selected?"hq":writeId()); };
   closeButton.onclick = close;
-  dialog.addEventListener("cancel", event=>{event.preventDefault();close();});
-  dialog.addEventListener("keydown",event=>{
-    if(event.key==="Escape"){event.preventDefault();if(choosing){endPicker();paint();notice("");}else close();}
-    if(event.key==="Enter" && event.target===find("path")){event.preventDefault();addPath(event.target.value);}
+  dialog.addEventListener("cancel", event => { event.preventDefault(); close(); });
+  dialog.addEventListener("keydown", event => {
+    if (event.key === "Escape") { event.preventDefault(); close(); }
     event.stopPropagation();
   });
-  for (const type of ["pointerdown","mousedown","click","wheel"]) dialog.addEventListener(type,event=>event.stopPropagation());
-  doc.body.appendChild(dialog); dialog.showModal();
-  container.__hmbFolderCards={close,receive};
-  if (project) request("get"); else { paint();notice(label("먼저 프로젝트 폴더를 선택하세요.","Select a project folder first.")); }
+  for (const type of ["pointerdown","mousedown","click","wheel"]) dialog.addEventListener(type, event=>event.stopPropagation());
+  container.__hmbFolderCards = {close, receive, failed:message=>{paint(); notice(message);}};
+  syncProjectFolderProfiles(container, state);
+  useSnapshot(state); paint(); doc.body.appendChild(dialog); dialog.showModal();
+  if (!project) notice(label("먼저 프로젝트 폴더를 선택하세요.", "Select a project folder first."));
 }
 // End standalone project folder dialog.
 
@@ -178,7 +237,7 @@ const labels = {Dialogue:"대사", SFX:"효과음", Ambience:"환경음", Music:
 const colors = {Dialogue:"#22d3ee", SFX:"#f472b6", Ambience:"#2dd4bf", Music:"#a78bfa"};
 const record = value => value && typeof value === "object" && !Array.isArray(value) ? value : {};
 const soundPayload = props => {let value=props?.value??props?.parameterValue??props?.data??props; if(typeof value==="string"){try{value=JSON.parse(value);}catch{value={};}}return record(value);};
-const soundFields = new Set(["schema","version","revision","project_id","project_root","project_uid","channel_uuid","shot","shot_catalog","projects","project_states","assets","folders","tracks","status","busy","error_code","ack_command_id","ui","site_settings","site_settings_result","site_picker_draft","site_projects"]);
+const soundFields = new Set(["schema","version","revision","project_id","project_root","project_uid","channel_uuid","shot","shot_catalog","projects","project_states","assets","folders","tracks","status","busy","error_code","ack_command_id","ui","site_settings","site_settings_result","site_picker_draft","site_projects","site_profiles"]);
 const sameSoundValue = (a,b) => {
   if(a===b)return true;
   if(!a||!b||typeof a!=="object"||typeof b!=="object"||Array.isArray(a)!==Array.isArray(b))return false;
@@ -404,7 +463,7 @@ function hmbSoundImplementation(container, props = {}) {
       }
     }
     for(const button of current.querySelectorAll("[data-remove],[data-more]"))button.disabled=busy;
-    current.querySelector('[data-action="site-settings"]').disabled=busy||Boolean(latest.disabled);
+    current.querySelector('[data-action="site-settings"]').disabled=Boolean(latest.disabled);
     current.querySelector('[data-action="refresh"]').disabled=!ui.syncNotice&&(busy||!state.project_root);
     current.querySelector('[data-action="cancel"]').hidden=!busy;
     const status=current.querySelector(".hs-status");status.dataset.error=String(Boolean(state.error_code));
@@ -444,7 +503,7 @@ function hmbSoundImplementation(container, props = {}) {
     if(current){
       const liveHeader=current.firstElementChild;
       liveHeader.querySelector(".hs-heading small").textContent=header.querySelector(".hs-heading small").textContent;
-      liveHeader.querySelector('[data-action="site-settings"]').disabled=Boolean(latest.disabled||state.busy||pending||syncWaiting);
+      liveHeader.querySelector('[data-action="site-settings"]').disabled=Boolean(latest.disabled);
       liveHeader.querySelector('[data-action="refresh"]').disabled=header.querySelector('[data-action="refresh"]').disabled;
       liveHeader.querySelector('[data-action="cancel"]').hidden=header.querySelector('[data-action="cancel"]').hidden;
       while(current.lastElementChild!==liveHeader)current.lastElementChild.remove();
@@ -456,7 +515,7 @@ function hmbSoundImplementation(container, props = {}) {
     for(const el of frame.querySelectorAll(".hs-catalog,.hs-shot-stack,.hs-folder-list,.hs-bound-list")){const saved=scroll.get(el.className+":"+(el.closest("[data-shot-row]")?.dataset.shotRow||""));if(saved){el.scrollTop=saved[0];el.scrollLeft=saved[1];}}
     root()?.toggleAttribute("data-sound-sync-waiting",syncWaiting);
     if(latest.disabled)for(const control of frame.querySelectorAll("[data-add]"))control.disabled=true;
-    if(state.busy||pending||syncWaiting)for(const control of frame.querySelectorAll("button,input,select,textarea"))if(!control.matches("[data-action=cancel],[data-search],[data-folder],[data-role-filter],[data-preview-track],[data-preview-asset],[data-scrub],[data-detail],[data-close-detail],[data-hmb-native-identity] *,[data-hmb-native-actions] *")&&!(syncWaiting&&control.matches('[data-action="refresh"]')))control.disabled=true;
+    if(state.busy||pending||syncWaiting)for(const control of frame.querySelectorAll("button,input,select,textarea"))if(!control.matches("[data-action=cancel],[data-action=site-settings],[data-search],[data-folder],[data-role-filter],[data-preview-track],[data-preview-asset],[data-scrub],[data-detail],[data-close-detail],[data-hmb-native-identity] *,[data-hmb-native-actions] *")&&!(syncWaiting&&control.matches('[data-action="refresh"]')))control.disabled=true;
     syncPlayback();
     const filteredCount=Number(frame.querySelector(".hs-filter b").textContent.match(/\/ (\d+)개$/)?.[1]||0);
     painted={state,ui:{...ui},filteredCount};
@@ -512,7 +571,10 @@ function hmbSoundImplementation(container, props = {}) {
     const button=event.target.closest?.("button");if(!button||button.disabled)return;
     event.stopPropagation();
     if(button.dataset.action==="site-settings"){
-      openProjectFolderCards(container,state,{media:"sound",trigger:button,send:request=>command("site_settings",{site_settings_request:request})});
+      openProjectFolderCards(container,state,{media:"sound",trigger:button,send(request) {
+        if (typeof latest.onChange !== "function") throw new Error("폴더 선택 요청을 보낼 수 없습니다.");
+        return latest.onChange({__hmb_sound_command:{id:request.request_id,action:"site_settings",site_settings_request:request}});
+      }});
       return;
     }
     if(button.dataset.action==="refresh"&&syncWaiting){requestSync(true);return;}
@@ -580,7 +642,8 @@ function hmbSoundImplementation(container, props = {}) {
       ui.commandNotice="사운드 변경 완료를 확인하지 못했습니다. 현재 목록을 확인한 뒤 다시 선택하세요.";
     }
     transport=received.transport;state=incoming;
-    container.__hmbFolderCards?.receive(state);
+    if (container.__hmbFolderCards) container.__hmbFolderCards.receive(state);
+    else syncProjectFolderProfiles(container, state);
     const caughtUp = received.kind==="delta" && syncWaiting && !pending
       && (!syncFloor || (received.transport.stream_id===syncFloor.stream_id
         && received.transport.sequence>=syncFloor.sequence));

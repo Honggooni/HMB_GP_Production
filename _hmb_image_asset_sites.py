@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from functools import lru_cache
+import asyncio
+import contextvars
 import hashlib
 import json
 import os
@@ -16,12 +18,13 @@ import unicodedata
 import uuid
 
 
-DEFAULT = {"links": [], "write_site_id": "hq", "revision": "0"}
+DEFAULT = {"links": [], "write_site_id": "hq", "selected_site_id": "", "revision": "0", "generation": 0}
 _ID = re.compile(r"site-[0-9a-f]{32}\Z")
 _CACHE = {}
 _CACHE_LOCK = threading.RLock()
 _DIRECTORY_LOCKS = {}
 _DIRECTORY_STATUS = {}
+_PROFILE_DIRECTORIES = set()
 
 
 def _default():
@@ -67,6 +70,11 @@ def settings_path(project_root, media="image"):
         raise ValueError("등록 폴더의 미디어 종류를 확인하세요.")
     if not project_root:
         raise ValueError("프로젝트를 먼저 선택하세요.")
+    return _workspace() / ".json" / "hmb_image_asset_sites" / _station() / _profile_filename(project_root, media)
+
+
+@lru_cache(maxsize=1024)
+def _profile_filename(project_root, media):
     root = Path(project_root)
     if not root.is_absolute() and PureWindowsPath(project_root).is_absolute():
         root = PureWindowsPath(project_root)
@@ -78,7 +86,7 @@ def settings_path(project_root, media="image"):
     if not project:
         raise ValueError("프로젝트 이름을 확인하세요.")
     key = hashlib.sha256(unicodedata.normalize("NFC", project).casefold().encode("utf-8")).hexdigest()
-    return _workspace() / ".json" / "hmb_image_asset_sites" / _station() / (key + "." + media + ".json")
+    return key + "." + media + ".json"
 
 
 def _read(path):
@@ -99,11 +107,49 @@ def _read(path):
         ids.add(link["id"])
     if value.get("write_site_id") not in ids:
         raise ValueError("저장된 Add 대상이 연결 목록에 없습니다.")
+    # Version 2 preferences predating the explicit Done control remain readable.
+    value.setdefault("generation", 1)
+    value.setdefault("selected_site_id", value["write_site_id"] if value["write_site_id"] != "hq"
+                     else next((link["id"] for link in value["links"]), ""))
+    if (type(value["generation"]) is not int or value["generation"] < 0 or not isinstance(value["selected_site_id"], str) or
+            (value["selected_site_id"] and value["selected_site_id"] not in ids - {"hq"})):
+        raise ValueError("저장된 폴더 선택 설정을 확인하세요.")
     return {key: value[key] for key in DEFAULT}
 
 
 def _copy_profile(value):
     return {**value, "links": [dict(link) for link in value["links"]]}
+
+
+def site_profiles(projects, media):
+    """Publish previously linked folders from this workstation, without touching media roots."""
+    if not projects:
+        return {}
+    directory = _workspace() / ".json" / "hmb_image_asset_sites" / _station()
+    with _CACHE_LOCK:
+        if (directory, media) not in _PROFILE_DIRECTORIES:
+            try:
+                for path in directory.glob("*." + media + ".json"):
+                    if path not in _CACHE:
+                        try:
+                            _CACHE[path] = _read(path)
+                        except (OSError, ValueError):
+                            continue  # An unrelated profile must not hide healthy projects.
+            except OSError:
+                pass
+            _PROFILE_DIRECTORIES.add((directory, media))
+        if not any(p.parent == directory and p.name.endswith("." + media + ".json") and v["revision"] != "0"
+                   for p, v in _CACHE.items()):
+            return {}
+        visible = {}
+        for row in projects:
+            uid = row.get("project_uid") or row.get("project_id")
+            root = row.get("path") or row.get("project_root")
+            if uid and root:
+                profile = _CACHE.get(directory / _profile_filename(root, media))
+                if profile and profile["revision"] != "0":
+                    visible[uid] = _copy_profile(profile)
+        return visible
 
 
 def get_site_settings(project_root, media="image", *, fresh=False):
@@ -144,7 +190,25 @@ def _check_directory_route(path):
     _plain_directory(path)
 
 
-def ensure_registration_directory(media_root, *, refresh=False):
+def _ensure_plain_subdirectory(path):
+    try:
+        _plain_directory(path)
+    except FileNotFoundError:
+        path.mkdir(exist_ok=True)
+        _plain_directory(path)
+
+
+def _prepare_selected_folder(root):
+    # Only called after the chosen root was strictly resolved and its route checked.
+    # Keep existing media and registries intact, including on a repeated confirmation.
+    for name in ("add", ".json"):
+        try:
+            _ensure_plain_subdirectory(root / name)
+        except OSError as exc:
+            raise ValueError(f"등록 폴더를 준비할 수 없습니다 ({root / name}). 공유 폴더 권한을 확인하세요.") from exc
+
+
+def ensure_registration_directory(media_root, *, refresh=False, vendor=False):
     """Prepare metadata on a catalog read; never create the source root or a registry file."""
     root = _media_root(media_root)
     with _CACHE_LOCK:
@@ -152,29 +216,26 @@ def ensure_registration_directory(media_root, *, refresh=False):
         if lock is None:
             lock = _DIRECTORY_LOCKS[root] = threading.Lock()
     with lock:
-        if not refresh and root in _DIRECTORY_STATUS:
-            return _DIRECTORY_STATUS[root]
-        _DIRECTORY_STATUS.pop(root, None)
+        key = (root, vendor)
+        if not refresh and key in _DIRECTORY_STATUS:
+            return _DIRECTORY_STATUS[key]
+        _DIRECTORY_STATUS.pop(key, None)
         status = ""
         try:
             _check_directory_route(root)
             directory = root / ".json"
-            try:
-                _plain_directory(directory)
-            except FileNotFoundError:
-                try:
-                    directory.mkdir()
-                except FileExistsError:
-                    pass  # Another workstation can initialize this folder concurrently.
-                _plain_directory(directory)
+            _ensure_plain_subdirectory(directory)
+            if vendor:
+                directory = root / "add"
+                _ensure_plain_subdirectory(directory)
         except OSError as error:
-            status = (f"등록 폴더를 준비할 수 없습니다 ({root / '.json'}). "
+            status = (f"등록 폴더를 준비할 수 없습니다 ({root}). "
                       f"공유 폴더 연결과 권한을 확인한 뒤 새로고침하세요. {error}")
-        _DIRECTORY_STATUS[root] = status
+        _DIRECTORY_STATUS[key] = status
         return status
 
 
-def _external_folder(project, value):
+def _external_folder(project, value, *, check_headquarters=True):
     if not isinstance(value, str) or any(ord(ch) < 32 for ch in value):
         raise ValueError("외주 공유 폴더의 절대 경로를 입력하세요.")
     value = value.strip()
@@ -184,12 +245,23 @@ def _external_folder(project, value):
     except OSError as error:
         raise ValueError("접근할 수 있는 외주 프로젝트 폴더를 선택하세요.") from error
     resolved = external.resolve(strict=True)
-    headquarters = Path(project).resolve(strict=True)
+    headquarters = Path(project).resolve(strict=True) if check_headquarters else _mapped_path(Path(project))
     if (not resolved.name or any(part.casefold() == ".json" for part in resolved.parts)
             or resolved.is_relative_to(headquarters) or headquarters.is_relative_to(resolved)):
         raise ValueError("본사 폴더와 겹치지 않는 별도의 외주 프로젝트 폴더를 선택하세요.")
     # Keep the user's drive spelling, including P:, instead of persisting resolved UNC.
     return external.as_posix(), resolved
+
+
+def _mapped_path(path):
+    """Expand the workstation's drive mapping without opening files on the share."""
+    if os.name == "nt" and len(path.drive) == 2:
+        import ctypes
+        name = ctypes.create_unicode_buffer(32768)
+        size = ctypes.c_uint32(len(name))
+        if ctypes.windll.mpr.WNetGetConnectionW(path.drive, name, ctypes.byref(size)) == 0:
+            return Path(name.value, *path.parts[1:])
+    return path
 
 
 def _folder_identity(resolved):
@@ -264,19 +336,37 @@ def _links_for_save(project_root, current, links, write_site_id):
     return result, ids[write_site_id]
 
 
-def save_site_settings(project_root, links, write_site_id, expected_revision=None, *, media="image"):
+def save_site_settings(project_root, links, write_site_id, expected_revision=None, *, media="image",
+                       existing_only=False):
     path = settings_path(project_root, media)
     path.parent.mkdir(parents=True, exist_ok=True)
     with _settings_lock(path):
         current = _read(path)
         if expected_revision is not None and current["revision"] != expected_revision:
             raise ValueError("다른 창에서 등록 폴더 설정이 변경됐습니다. 다시 열어 확인하세요.")
+        if existing_only:
+            if not isinstance(expected_revision, str) or not isinstance(links, list) or any(
+                    item not in current["links"] for item in links):
+                raise ValueError("현재 등록된 폴더만 선택하거나 해제할 수 있습니다.")
+            if media == "image" and links and write_site_id == "hq" and current["write_site_id"] != "hq":
+                raise ValueError("추가한 폴더 중에서 Add 대상을 선택하세요.")
         validated, target = _links_for_save(project_root, current, links, write_site_id)
-        if current["links"] == validated and current["write_site_id"] == target:
-            with _CACHE_LOCK:
-                _CACHE[path] = current
-            return _copy_profile(current)
-        result = {"links": validated, "write_site_id": target, "revision": uuid.uuid4().hex}
+        return _store_profile(path, current, validated, target)
+
+
+def _store_profile(path, current, links, target, selected=None):
+    if selected is None:
+        selected = current["selected_site_id"]
+        if selected not in {link["id"] for link in links}:
+            selected = target if target != "hq" else next((link["id"] for link in links), "")
+    result = current
+    links_changed = current["links"] != links or current["write_site_id"] != target
+    if links_changed or current["selected_site_id"] != selected:
+        # The registration revision keys media scans and open Add commands.
+        # Selecting a card only advances the presentation generation.
+        result = {"links": links, "write_site_id": target, "selected_site_id": selected,
+                  "revision": uuid.uuid4().hex if links_changed else current["revision"],
+                  "generation": current["generation"] + 1}
         fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.stem + ".", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -286,6 +376,199 @@ def save_site_settings(project_root, links, write_site_id, expected_revision=Non
             os.replace(temporary, path)
         finally:
             Path(temporary).unlink(missing_ok=True)
-        with _CACHE_LOCK:
-            _CACHE[path] = result
+    with _CACHE_LOCK:
+        _CACHE[path] = result
     return _copy_profile(result)
+
+
+def add_site_folder(project_root, selected, media):
+    """Append to the latest profile under its lock. Inspect only the folder just chosen."""
+    root, physical = _external_folder(project_root, selected, check_headquarters=False)
+    site_id = _folder_identity(physical)
+    path = settings_path(project_root, media)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _settings_lock(path):
+        profile = _read(path)
+        links = list(profile["links"])
+        if not any(item["id"] == site_id for item in links):
+            if len(links) >= 128:
+                raise ValueError("연결 가능한 폴더 수를 초과했습니다.")
+            for item in links:
+                other = _mapped_path(Path(item["root"]))
+                if physical.is_relative_to(other) or other.is_relative_to(physical):
+                    raise ValueError("이미 연결된 폴더와 겹칩니다.")
+            name = Path(root).name
+            links.append({"id": site_id, "label": name[:128], "root": root})
+        _prepare_selected_folder(physical)
+        target = site_id if media == "image" else profile["write_site_id"]
+        return _store_profile(path, profile, links, target, site_id), site_id
+
+
+def confirm_site_folder(project_root, media, expected_revision, selected):
+    """Verify the committed project profile and prepare its selected vendor only."""
+    path = settings_path(project_root, media)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _settings_lock(path):
+        profile = _read(path)
+        # When a widget does not yet have a revision it may only acknowledge
+        # the existing profile. It cannot silently overwrite someone else's selection.
+        if expected_revision and expected_revision != profile["revision"]:
+            raise ValueError("다른 창에서 폴더 설정이 변경되었습니다. 표시된 목록을 확인하고 완료를 다시 누르세요.")
+        if selected is None or selected == "" or not expected_revision:
+            selected = profile["selected_site_id"]
+        if not isinstance(selected, str):
+            raise ValueError("추가된 폴더 중에서 선택하세요.")
+        if selected:
+            link = next((item for item in profile["links"] if item["id"] == selected), None)
+            if not link:
+                raise ValueError("추가된 폴더 중에서 선택하세요.")
+            _, physical = _external_folder(project_root, link["root"], check_headquarters=False)
+            if _folder_identity(physical) != selected:
+                raise ValueError("선택한 폴더의 연결 대상이 변경되었습니다. 등록 폴더를 다시 선택하세요.")
+            _prepare_selected_folder(physical)
+        return _store_profile(path, profile, profile["links"], profile["write_site_id"], selected)
+
+
+def _windows_directory_dialog():
+    """Windows Shell Common Item Dialog in folder mode (shobjidl_core.h)."""
+    import ctypes as ct
+    from ctypes import wintypes
+
+    ole = ct.WinDLL("ole32")
+    user = ct.WinDLL("user32")
+    ptr = ct.c_void_p
+    dialog, item, path = ptr(), ptr(), ptr()
+
+    def check(hr):
+        if hr < 0:
+            raise OSError(f"Windows 폴더 선택 오류 (HRESULT 0x{hr & 0xffffffff:08X})")
+
+    def method(interface, slot, *arguments):
+        table = ct.cast(interface, ct.POINTER(ct.POINTER(ptr))).contents
+        return ct.WINFUNCTYPE(ct.c_long, ptr, *arguments)(table[slot])
+
+    # Only the foreground Desktop that launched this engine may own its modal.
+    # A separate editor, another Desktop instance or this test harness keeps
+    # its own focus and remains usable.
+    user.GetForegroundWindow.restype = wintypes.HWND
+    window = user.GetForegroundWindow()
+    owner = None
+    if window:
+        pid = wintypes.DWORD()
+        user.GetWindowThreadProcessId(wintypes.HWND(window), ct.byref(pid))
+        if pid.value in (os.getpid(), os.getppid()):
+            title = ct.create_unicode_buffer(512)
+            user.GetWindowTextW(wintypes.HWND(window), title, len(title))
+            if "griptape" in title.value.casefold():
+                owner = window
+
+    clsid = uuid.UUID("dc1c5a9c-e88a-4dde-a5a1-60f82a20aef7").bytes_le  # FileOpenDialog
+    iid = uuid.UUID("42f85136-db7e-439c-85f1-e4075d135fc8").bytes_le    # IFileDialog
+    check(ole.CoInitializeEx(None, 2))  # COINIT_APARTMENTTHREADED, on the picker worker
+    try:
+        check(ole.CoCreateInstance(clsid, None, 1, iid, ct.byref(dialog)))
+        # IFileDialog::GetOptions / SetOptions; PICKFOLDERS | FORCEFILESYSTEM | PATHMUSTEXIST
+        flags = wintypes.DWORD()
+        check(method(dialog, 10, ct.POINTER(wintypes.DWORD))(dialog, ct.byref(flags)))
+        check(method(dialog, 9, wintypes.DWORD)(dialog, flags.value | 0x20 | 0x40 | 0x800))
+        check(method(dialog, 17, wintypes.LPCWSTR)(dialog, "등록할 폴더 선택"))
+        check(method(dialog, 18, wintypes.LPCWSTR)(dialog, "확인"))
+        shown = method(dialog, 3, wintypes.HWND)(dialog, owner)
+        if shown & 0xffffffff == 0x800704c7:  # HRESULT_FROM_WIN32(ERROR_CANCELLED)
+            return ""
+        check(shown)
+        check(method(dialog, 20, ct.POINTER(ptr))(dialog, ct.byref(item)))  # GetResult
+        check(method(item, 5, wintypes.DWORD, ct.POINTER(ptr))(item, 0x80058000, ct.byref(path)))
+        return ct.wstring_at(path)  # IShellItem::GetDisplayName(SIGDN_FILESYSPATH)
+    finally:
+        if path:
+            ole.CoTaskMemFree(path)
+        if item:
+            method(item, 2)(item)
+        if dialog:
+            method(dialog, 2)(dialog)
+        ole.CoUninitialize()
+
+
+def choose_site_folder():
+    """Show an OS directory chooser on the workstation running the Desktop engine."""
+    if os.name == "nt":
+        return _windows_directory_dialog()
+    import tkinter as tk
+    from tkinter import filedialog
+    window = tk.Tk()
+    window.withdraw()
+    try:
+        return filedialog.askdirectory(parent=window, title="등록할 폴더 선택", mustexist=True)
+    finally:
+        window.destroy()
+
+
+def run_site_folder_command(node, project, uid, request, media, publish, *, prepare_catalog=None):
+    """Run one picker or confirmation per node. Report to its originating host context."""
+    request_id = request["request_id"]
+    receipt = {"request_id": request_id, "project_uid": uid, "base_root": project}
+    history = getattr(node, "_hmb_folder_dialog_history", None)
+    if history is None:
+        history = node._hmb_folder_dialog_history = {}
+    if request_id in history:
+        if history[request_id] is not None:
+            publish(dict(history[request_id]))
+        return
+    if any(result is None for result in history.values()):
+        publish({**receipt, "ok": False, "message": "열려 있는 폴더 선택창을 먼저 확인해 주세요."})
+        return
+    if len(history) >= 32:
+        history.pop(next(iter(history)))
+    history[request_id] = None
+    context = contextvars.copy_context()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+            loop = GriptapeNodes.EventManager().event_loop
+        except (ImportError, AttributeError, RuntimeError):
+            loop = None
+
+    def finish():
+        if not getattr(node, "_hmb_node_deleted", False):
+            history[request_id] = dict(receipt)
+            publish(receipt)
+
+    def worker():
+        try:
+            if request["action"] == "confirm":
+                profile = confirm_site_folder(project, media, request.get("expected_revision"), request.get("selected_site_id"))
+                if prepare_catalog is not None:
+                    prepare_catalog(profile)
+                    latest = get_site_settings(project, media, fresh=True)
+                    if latest["generation"] != profile["generation"]:
+                        raise ValueError("폴더 설정이 변경되었습니다. 최신 목록에서 완료를 다시 누르세요.")
+                receipt.update(profile, ok=True, message="")
+            else:
+                selected = choose_site_folder()
+                if getattr(node, "_hmb_node_deleted", False):
+                    return
+                if selected:
+                    profile, selected_id = add_site_folder(project, selected, media)
+                    receipt.update(profile, ok=True, added_site_id=selected_id, message="")
+                else:
+                    receipt.update(get_site_settings(project, media, fresh=True), ok=True, cancelled=True, message="")
+        except (ValueError, OSError) as exc:
+            receipt.update(ok=False, message=str(exc))
+            try:
+                receipt.update(get_site_settings(project, media, fresh=True))
+            except (ValueError, OSError):
+                pass
+        except Exception:
+            receipt.update(ok=False, message="폴더 선택창을 열 수 없습니다. Desktop에서 다시 시도하세요.")
+        if loop is not None and loop.is_running() and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(context.copy().run, finish)
+                return
+            except RuntimeError:
+                pass
+        finish()
+
+    threading.Thread(target=lambda: context.copy().run(worker), daemon=True, name="HMB-Project-Folder").start()

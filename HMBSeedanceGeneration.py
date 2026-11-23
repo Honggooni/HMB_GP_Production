@@ -15816,7 +15816,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if draft_action == DRAFT_ACTION_PREVIEW:
                 params["_hmb_draft_started_at_ms"] = int(time.time() * 1000)
             draft_output_format = str(params["output_format"])
-            base = self._normalized_video_output_path(destination.resolve(), draft_output_format)
+            # Explicit paths and connected destinations may still contain an
+            # unbound {_index} even after build_file(_index=1).
+            base = next(self._output_destination_candidates(destination, draft_output_format))
             phase = "draft480p" if draft_action == DRAFT_ACTION_PREVIEW else f"final{params['resolution']}"
             unique_path = base.with_name(f"{base.stem}-{phase}-{draft_client_request_id}.{draft_output_format}")
             destination = _SeedanceDraftOutputDestination(str(unique_path))

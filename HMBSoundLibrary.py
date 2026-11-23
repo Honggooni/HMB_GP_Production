@@ -24,7 +24,7 @@ from HMBFinishLookLibrary import (
     _normalize_shot_selection,
 )
 from _hmb_deletion_guard import hmb_binding_mutation
-from _hmb_image_asset_sites import get_site_settings, save_site_settings
+from _hmb_image_asset_sites import DEFAULT as DEFAULT_SITE_PROFILE, run_site_folder_command, get_site_settings, save_site_settings, site_profiles
 from _hmb_sound import (
     DEFAULT_PROJECTS_ROOT, SCHEMA, VERSION, SoundError, discover_sound_projects,
     scan_sound_project, make_sound_track, normalize_sound_snapshot, project_uid,
@@ -394,6 +394,7 @@ class HMBSoundLibrary(DataNode):
         for item in state["site_projects"]:
             if item.get("project_root"):
                 item.setdefault("project_uid", project_uid(Path(item["project_root"])))
+        state["site_profiles"] = site_profiles(state["site_projects"], "sound")
         try:
             from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
             base = str(GriptapeNodes.StaticFilesManager().static_server_base_url).rstrip("/")
@@ -605,6 +606,10 @@ class HMBSoundLibrary(DataNode):
                 def commit():
                     if epoch != self._context_epoch or self._state_sound["project_uid"] != uid:
                         return False
+                    confirmed = getattr(self, "_confirmed_site_revision", None)
+                    if (confirmed and confirmed[0] == root and confirmed[1] != profile["revision"]
+                            and confirmed[1] == get_site_settings(root, "sound")["revision"]):
+                        return False
                     if canonical_uid != uid:
                         current = self._state_sound
                         old_key = self._project_key(current)
@@ -793,6 +798,36 @@ class HMBSoundLibrary(DataNode):
         result["base_root"] = root
         self._site_picker_project = uid
         action = request.get("action")
+        if action in ("browse_add", "confirm"):
+            confirmed_catalog = None
+            def prepare(profile):
+                nonlocal confirmed_catalog
+                if root == self._state_sound["project_root"]:
+                    # Existing folders join their session reads; only new links scan.
+                    confirmed_catalog = scan_sound_project(root, profile=profile, refresh=False)
+            def publish(receipt):
+                with self._lock:
+                    self._site_result = receipt
+                    if "revision" in receipt and root == self._state_sound["project_root"]:
+                        self._site_profile = {key: receipt[key] for key in DEFAULT_SITE_PROFILE}
+                        if receipt["ok"] and confirmed_catalog is not None:
+                            self._state_sound.update(assets=confirmed_catalog, folders=list(confirmed_catalog.folders))
+                            self._confirmed_site_revision = (root, receipt["revision"])
+                    self._publish(notify=False, outputs=False)
+            run_site_folder_command(self, root, uid, request, "sound", publish, prepare_catalog=prepare)
+            return
+        if action == "update_links":
+            try:
+                profile = save_site_settings(root, request.get("links"), request.get("write_site_id"),
+                                             request.get("expected_revision"), media="sound", existing_only=True)
+                result.update(profile, ok=True, message="")
+                if root == self._state_sound["project_root"]:
+                    self._site_profile = profile
+            except (ValueError, OSError) as exc:
+                result["message"] = str(exc)
+            self._site_result = result
+            self._publish(notify=False, outputs=False)
+            return
         if action in ("get", "picked"):
             try:
                 profile = get_site_settings(root, "sound", fresh=action == "get")
@@ -910,6 +945,11 @@ class HMBSoundLibrary(DataNode):
                     def commit():
                         if state["project_root"] != selected["project_root"] and state["tracks"]:
                             raise SoundError("SOUND_PROJECT_IN_USE", "기존 사운드는 보존했습니다. 현재 샷의 사운드 폴더 연결을 확인하세요.")
+                        confirmed = getattr(self, "_confirmed_site_revision", None)
+                        if (confirmed and confirmed[0] == selected["project_root"] and confirmed[1] != profile["revision"]
+                                and confirmed[1] == get_site_settings(selected["project_root"], "sound")["revision"]):
+                            self._desired_project_root = ""
+                            return False
                         state.update(**selected, project_uid=project_uid(Path(selected["project_root"])), assets=assets,
                                      folders=list(getattr(assets, "folders", [])))
                         self._site_profile = profile

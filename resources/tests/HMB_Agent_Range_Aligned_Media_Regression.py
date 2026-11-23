@@ -127,6 +127,29 @@ class AlignedMediaTests(unittest.TestCase):
         records[0]["timing"] = {"authored_timing_cues": [{"frame": 121}]}
         self.assertEqual(media._sample_plan(records, 5)[0]["seek"], 0)
 
+    def test_sustained_preview_view_uses_bounded_decode_and_preserves_fallback(self):
+        # Simulated decoded RGB thumbnails. The source is read-only and the decoder is never invoked.
+        source_before = self.hero.read_bytes()
+        def sample(frames):
+            data = SimpleNamespace(stdout=b"".join(bytes(rgb) * (16 * 10) for rgb in frames))
+            with patch.object(media, "_run", return_value=data) as decode:
+                seek = media._missing_preview_view(self.hero, Path("ffmpeg"), 24, time.monotonic() + 12)
+            decode.assert_called_once()
+            args, _deadline = decode.call_args.args
+            self.assertLessEqual(int(args[args.index("-frames:v") + 1]), 289)
+            return seek
+        # Three sustained views in 24 seconds, 12 samples/second. The ordinary middle misses the second view.
+        first, second, third = (255, 30, 30), (30, 255, 30), (30, 30, 255)
+        self.assertTrue(5 <= sample([first]*60 + [second]*24 + [third]*204) < 7)
+        self.assertIsNone(sample([(min(255, i), 255-min(255, i), 30) for i in range(288)]))
+        with patch.object(media, "_run", side_effect=subprocess.TimeoutExpired("ffmpeg", .8)) as decode:
+            self.assertIsNone(media._missing_preview_view(self.hero, Path("ffmpeg"), 24, time.monotonic()+12))
+            decode.assert_called_once()
+            for duration, budget in [(31, 12), (4, 1)]:
+                self.assertIsNone(media._missing_preview_view(self.hero, Path("ffmpeg"), duration, time.monotonic()+budget))
+            decode.assert_called_once()
+        self.assertEqual(self.hero.read_bytes(), source_before)
+
     def test_real_three_pass_nonzero_pts_and_character_role_reservation(self):
         if not self.sources:
             self.skipTest("local FFmpeg/FFprobe unavailable")

@@ -676,6 +676,7 @@ class DraftTests(unittest.TestCase):
 
     def test_model_specific_default_format_without_authored_choice(self):
         for model, expected in ((t.MODEL_NAME_SEEDANCE_2_0, "mp4"),
+                                (t.MODEL_NAME_SEEDANCE_2_0_FAST, "mp4"),
                                 (t.MODEL_NAME_SEEDANCE_2_5, "mov")):
             with self.subTest(model=model):
                 node = Node()
@@ -734,6 +735,49 @@ class DraftTests(unittest.TestCase):
         self.assertEqual(node.upload_calls, 1)
         self.assertIn("draft480p", node.saved[0][1])
         self.assertFalse(Path(node.base.name, "original.mp4").exists())
+
+    def test_draft_stages_resolve_index_in_authored_absolute_output(self):
+        def make_destination(template):
+            if t.ProjectFileParameter.__name__ != "StubProjectFileParameter":
+                return t.ProjectFileDestination(str(template))
+            # CI's SDK substitute has no macro parser. Supply a required index
+            # segment and format it with the variables the generator actually binds.
+            index = SimpleNamespace(info=SimpleNamespace(name="_index", is_required=True))
+            expression = SimpleNamespace(segments=[index], template=str(template))
+            macro = t.MacroPath(parsed_macro=expression, variables={})
+
+            def file_for(path, workflow=None):
+                return SimpleNamespace(resolve=lambda: path.parsed_macro.template.format_map(path.variables))
+
+            self.enterContext(mock.patch.object(t, "_generation_file", file_for))
+            return SimpleNamespace(_file=SimpleNamespace(_file_path=macro), resolve=file_for(macro).resolve)
+
+        for action, resolution, stage in ((t.DRAFT_ACTION_PREVIEW, "480p", "draft480p"),
+                                          (t.DRAFT_ACTION_FINAL, "1080p", "final1080p")):
+            with self.subTest(stage=stage):
+                values = params(action)
+                values.update(resolution=resolution, output_format="mov")
+                node = Node(values)
+                # Absolute paths and FileOutputSettings can supply a destination
+                # whose parsed variables do not include the parameter's _index.
+                folder = Path(node.base.name) / "shot_{_index:03}"
+                node.destination = make_destination(folder / "cut_v{_index:03}.mov")
+                with self.assertRaisesRegex(Exception, "_index"):
+                    node.destination.resolve()
+                if action == t.DRAFT_ACTION_FINAL:
+                    node._store_draft_source(values["_hmb_draft_source"])
+                selection = {"schema": t.PROJECT_SELECTION_SCHEMA, "project": deepcopy(PROJECT)}
+                node._resolve_exact_shot_generation_inputs = lambda current: {
+                    **current, "_hmb_imageasset_project_selection": selection}
+                with mock.patch.object(t, "_resolve_mp4_decode_verifier", return_value=SimpleNamespace(executable="fixture", backend="test")), \
+                     mock.patch.object(node, "_capture_imageasset_project_selection", return_value=selection), \
+                     mock.patch.object(t._review, "capture_inputs", return_value={}):
+                    asyncio.run(node._process_generation_impl())
+                self.assertEqual(len(node.bridge.posts), 1)
+                output = Path(node.saved[0][1])
+                self.assertEqual(output.parent, Path(node.base.name) / "shot_001")
+                self.assertTrue(output.name.startswith(f"cut_v001-{stage}-"), output)
+                self.assertEqual(output.suffix, ".mov")
 
     def test_ordinary_25_fallback_freezes_supported_format_before_output_and_post(self):
         for formats, expected in ((["mp4", "mov"], "mov"), (["mp4"], "mp4")):

@@ -252,6 +252,8 @@ def _source(value: Any, kind: str, *, allow_verified_network: bool = False) -> t
         if len(blob) > MAX_INPUT_IMAGE_BYTES:
             raise ValueError("input_limit")
         return blob, ("data", hashlib.sha256(blob).hexdigest())
+    if re.match(r"^https?://", text, re.IGNORECASE):
+        raise ValueError("nonlocal")
     if text.startswith(("\\\\", "//")) and not allow_verified_network:
         raise ValueError("nonlocal")
     try:
@@ -543,6 +545,82 @@ def _sample_plan(records: list[dict], duration: float | None) -> list[dict]:
     return requests[:64]
 
 
+def _view_distance(left: bytes, right: bytes) -> float:
+    """Measure thumbnail color/layout change while discounting uniform exposure shifts."""
+    if left == right:
+        return 0.0
+    differences = [a - b for a, b in zip(left, right)]
+    offsets = [sum(differences[i:i + 3]) // 3 for i in range(0, len(left), 3)]
+    exposure = sorted(offsets)[len(offsets) // 2]
+    changed = 0
+    for p, level in enumerate(offsets):
+        r, g, b = differences[3*p:3*p + 3]
+        changed += min(80, max(abs(level - exposure), abs(r - g), abs(b - g)))
+    return changed / len(offsets)
+
+
+def _different_layouts(first: bytes, second: bytes) -> bool:
+    """Recognize displaced details while ignoring an exposure or color pulse over the same view."""
+    fields = []
+    for frame in (first, second):
+        levels = [sum(frame[i:i + 3]) / 3 for i in range(0, len(frame), 3)]
+        sorted_levels = sorted(levels)
+        low, high = sorted_levels[len(levels) // 10], sorted_levels[-len(levels) // 10]
+        if high - low < 26:
+            return False
+        fields.append([max(0, min(1, (y - low) / (high - low))) for y in levels])
+    return sum(abs(a - b) > .42 for a, b in zip(*fields)) >= len(fields[0]) * .16
+
+
+def _missing_preview_view(path: Path, ffmpeg: Path, duration: float, deadline: float) -> float | None:
+    """Return a middle-slot seek when first/middle/end miss a sustained visual state."""
+    if duration <= 0 or duration > 30 or time.monotonic() + 3 >= deadline:
+        return None
+    rate, stride = min(24, int(288 / duration)), 16 * 10 * 3
+    expected = math.ceil(duration * rate)
+    if expected < 6:
+        return None
+    # One short, time-limited decode. Raw output is bounded to at most 289 thumbnails.
+    try:
+        if path.stat().st_size > 64 * 1024 * 1024:
+            return None
+        decoded = _run([str(ffmpeg), "-nostdin", "-v", "error", "-threads", "1",
+                        "-protocol_whitelist", "file,pipe", "-i", str(path), "-map", "0:V:0",
+                        "-an", "-sn", "-dn", "-vf", f"setpts=PTS-STARTPTS,fps={rate},scale=16:10:flags=area",
+                        "-frames:v", str(expected + 1), "-threads", "1", "-pix_fmt", "rgb24",
+                        "-f", "rawvideo", "pipe:1"], min(deadline - 2, time.monotonic() + .8))
+    except (OSError, ValueError, TimeoutError, subprocess.SubprocessError):
+        return None
+    raw = decoded.stdout
+    if len(raw) % stride or abs(len(raw) // stride - expected) > 1:
+        return None
+    frames = [raw[i:i + stride] for i in range(0, len(raw), stride)]
+    # Only two isolated changes can justify moving the middle sample. Longer or more
+    # ambiguous sequences retain the existing camera and performance observations.
+    steps = [_view_distance(a, b) for a, b in zip(frames, frames[1:])]
+    jumps = [i + 1 for i, score in enumerate(steps) if score >= 19]
+    if len(jumps) != 2:
+        return None
+    edges = [0, *jumps, len(frames)]
+    if any(b - a < 3 for a, b in zip(edges, edges[1:])):
+        return None
+    if any(steps[n - 2] > 7 or steps[n] > 7 for n in jumps):
+        return None
+    middles = [(a + b - 1) // 2 for a, b in zip(edges, edges[1:])]
+    left, middle, right = (frames[i] for i in middles)
+    if min(_view_distance(left, middle), _view_distance(middle, right)) < 15:
+        return None
+    if _view_distance(left, right) < 15:
+        # A return to the first angle requires sustained geometry change in both
+        # comparisons. A bright flash/dim or uniform color overlay is insufficient.
+        if ((jumps[1] - jumps[0]) / rate < .25 or not _different_layouts(left, middle)
+                or not _different_layouts(middle, right)):
+            return None
+    if jumps[0] <= duration * rate / 2 < jumps[1] or max(0, duration - .1) * rate < jumps[1]:
+        return None
+    return middles[1] / rate
+
+
 def _audio_clip(record: dict, ffmpeg: Path | None, deadline: float) -> bytes:
     """Bound one local audio original to a short, finalized PCM WAV clip."""
     source, _identity = _source(record.get("source"), "audio",
@@ -586,7 +664,7 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
     report = {"schema": "hmb-agent-reference-observation", "version": 1,
               "machine_sha256": (snapshot.get("machine_sha256") if isinstance(snapshot, dict)
                   and re.fullmatch(r"[0-9a-f]{64}", str(snapshot.get("machine_sha256") or "")) else ""),
-              "sampling_policy": "authored_event_range_aligned_roles_v1", "status": "unobserved",
+              "sampling_policy": "authored_event_range_aligned_roles_v2", "status": "unobserved",
               "coverage": [], "skips": [], "groups": [], "budget_summary": {}}
     started = time.monotonic()
     attachments: list[Any] = []
@@ -741,6 +819,9 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
         videos.sort(key=lambda v: (0 if v.get("_hmb_verified_analysis_original") is True else 1,
                                    priorities[_role(v, "video")]))
         infos: dict[str, dict] = {}
+        local_preview_paths: dict[str, Path] = {}
+        sample_plans: dict[tuple, list[dict]] = {}
+        preview_scan_used = False
         units: list[list[dict]] = []
         grouped: dict[tuple, list[dict]] = {}
         for record in videos:
@@ -761,6 +842,7 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
                                         min(priorities[_role(v, "video")] for v in members)))
 
         def observe_unit(members: list[dict], sample_index: int) -> None:
+            nonlocal preview_scan_used
             if not is_live() or time.monotonic() >= deadline or count + len(members) > MAX_ATTACHMENTS:
                 for record in members:
                     skip(record, "video", "cancelled" if not is_live() else
@@ -774,6 +856,8 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
                             allow_verified_network=record.get("_hmb_verified_analysis_original") is True)
                         if not isinstance(source, Path):
                             raise ValueError("nonlocal")
+                        if _role(record, "video") == "original" and not record.get("_hmb_verified_analysis_original"):
+                            local_preview_paths[token] = source
                         with _CACHE_LOCK:
                             info = _PROBE_CACHE.get(identity)
                         cache_summary["probe_hits" if info is not None else "probe_misses"] += 1
@@ -793,7 +877,24 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
             if clock:
                 durations.append((clock[2] - clock[1] + 1) / clock[0])
             duration = min(durations) if durations else None
-            plan = _sample_plan(members, duration)
+            key = tuple(_token(v) for v in members)
+            if key not in sample_plans:
+                plan = _sample_plan(members, duration)
+                original = next((t for t in key if t in local_preview_paths), None)
+                has_authored_timing = any(v.get("analysis_range_seconds")
+                    or (isinstance(v.get("timing"), dict) and v["timing"].get("authored_timing_cues"))
+                    or (isinstance(v.get("frame_ranges"), list)
+                        and any(r.get("enabled") is True for r in v["frame_ranges"] if isinstance(r, dict)))
+                    for v in members)
+                if (original and not preview_scan_used and not has_authored_timing and ffmpeg and duration
+                        and infos[original].get("duration") == duration and duration <= 30):
+                    preview_scan_used = True
+                    middle_seek = _missing_preview_view(local_preview_paths[original], ffmpeg, duration, deadline)
+                    if middle_seek is not None and len(plan) == 3:
+                        plan[1] = {"seek": round(middle_seek, 6), "reason": "preview_visual_coverage",
+                                   "requested_source_frame": None}
+                sample_plans[key] = plan
+            plan = sample_plans[key]
             if sample_index >= len(plan):
                 return
             sample = plan[sample_index]
@@ -866,6 +967,10 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
             "Complete the prompt from all available sources with LOCAL CONTINUATION. "
             "Sources without attached pixels: " + json.dumps(unobserved, ensure_ascii=False) + "."
         )
+        if any(row.get("observation_role") == "original" for row in report["coverage"]):
+            guidance += (" The samples illustrate visible states. Follow the source preview's edit and "
+                         "transitions, including changes between samples. The user's explicit directions define "
+                         "any editorial changes. State exact cut times only when supplied or directly measured.")
         if native_user_content:
             return [prompt + guidance, *attachments]
         return ListArtifact([TextArtifact(prompt + guidance), *attachments])
