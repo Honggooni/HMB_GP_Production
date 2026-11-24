@@ -88,7 +88,7 @@ BLENDER_RUNNER = _THIS_DIR / "resources" / "blender" / "HMB_Blender_Background_P
 MARKER_CATALOG_PATH = _THIS_DIR / "resources" / "picker" / "HMB_Marker_Catalog.json"
 ORIGINAL_MATERIAL_PASS_SOURCES = ("AIPicker_SET", "AIPickerM_SET")
 MASK_MATERIAL_PASS_SOURCES = ("AIPicker_SET", "AIPickerM_SET")
-MASK_MATERIAL_PASS_PROFILE = "mask_authored_set_material_pass_v2"
+MASK_MATERIAL_PASS_PROFILE = "mask_authored_set_material_pass_v3"
 WIDGET_NAME = "HMBVideoPickerLibraryWidget"
 WIDGET_LIBRARY_NAME = "HMB_GP_Production"
 
@@ -140,7 +140,7 @@ PROXY_H264_LEVEL = "4.2"
 FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE = "hmb_full_smooth_geometry_v2"
 ORIGINAL_VIEWPORT_QUALITY_PROFILE = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
 ORIGINAL_MATERIAL_OVERRIDE_PROFILE = (
-    "maya-midgray-solid-studio-v4-eye-groups"
+    "maya-midgray-solid-studio-v5-eye-color-correct"
 )
 ORIGINAL_EYE_FALLBACK_POLICY = (
     "maya_default_shader_for_unavailable_eye_dependencies_v1"

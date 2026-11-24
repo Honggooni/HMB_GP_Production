@@ -4561,12 +4561,21 @@ function imageAssetThumbnailElementMatchesAsset(image, asset) {
   const thumbnailUrl = clean(asset?.thumbnail_url);
   const persistedProjectAsset = Number(asset?.import_index || 0) === 0
     && Boolean(clean(asset?.relative_path));
+  let localCacheMedia = false;
+  try {
+    const url = new URL(thumbnailUrl);
+    const signature = clean(asset?.media_signature);
+    localCacheMedia = /^https?:$/.test(url.protocol)
+      && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)
+      && /^\/(external|workspace)\//.test(url.pathname)
+      && /^[0-9a-f]{64}$/.test(signature)
+      && [".webp", ".png"].some(extension => url.pathname.endsWith(`/${signature}${extension}`));
+  } catch {
+    // Non-URL media values do not use the project thumbnail error path.
+  }
   if (
     !persistedProjectAsset
-    // Only process-lifetime StaticFilesManager URLs are eligible for this
-    // recovery. Durable external HTTP sources and inline data media remain
-    // browser-owned even when their catalog row is persisted.
-    || !/^https?:\/\/[^/]+\/workspace\/static_files(?:\/|[?#]|$)/i.test(thumbnailUrl)
+    || (!localCacheMedia && !/^https?:\/\/[^/]+\/workspace\/static_files(?:\/|[?#]|$)/i.test(thumbnailUrl))
   ) return false;
   const elementUrl = clean(
     image?.getAttribute?.("src")

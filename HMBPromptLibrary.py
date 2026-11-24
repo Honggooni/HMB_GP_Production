@@ -176,7 +176,8 @@ MAX_SOURCE_SYNC_REVISION = (1 << 53) - 1
 # Picker/ImageAsset can publish sibling public and exact-Shot updates for one
 # pointer action. Keep that burst outside the source widget's critical path and
 # compile only its newest generation on the retained host loop.
-PROMPT_SOURCE_BURST_DELAY_SECONDS = 0.04
+# Allow companion inputs to collect on the host loop for one 60 Hz frame.
+PROMPT_SOURCE_BURST_DELAY_SECONDS = 0.016
 UI_RESIZE_MODE = "stacked_outer_1000"
 UI_HEADER_LAYOUT_VERSION = 2
 LEGACY_IMAGE_SOURCES_DEFAULT_HEIGHT = 542
@@ -14219,9 +14220,12 @@ class HMBPromptLibrary(DataNode):
             if self._hmb_manual_rebind_pending():
                 return
             self._retire_deleted_document_sources()
-            retry_identity = self._prompt_sync_retry_identity()
             failure = getattr(self, "_hmb_prompt_sync_failure", None)
-            if isinstance(failure, dict) and failure.get("identity") == retry_identity:
+            # Snapshot fingerprints are needed only for the recorded-failure
+            # gate. Healthy image/video notifications can join the burst
+            # without parsing and hashing the same large Prompt envelope.
+            if (isinstance(failure, dict)
+                    and failure.get("identity") == self._prompt_sync_retry_identity()):
                 return
             self._hmb_sync_generation += 1
             self._hmb_sync_publish_shot_media_pending = bool(

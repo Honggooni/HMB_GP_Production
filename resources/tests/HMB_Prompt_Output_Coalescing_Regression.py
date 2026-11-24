@@ -455,6 +455,9 @@ try:
     delayed_callbacks.clear()
     sync_calls.clear()
     latest_shot_seen = []
+    retry_checks = []
+    original_retry_identity = sync_node._prompt_sync_retry_identity
+    sync_node._prompt_sync_retry_identity = lambda: retry_checks.append(True) or "current-source"
     sync_node._sync_prompt_output_from_state = MethodType(
         lambda self, **_kwargs: (
             latest_shot_seen.append(self._regression_latest_shot_uuid) or {}
@@ -465,6 +468,7 @@ try:
         sync_node._regression_latest_shot_uuid = f"shot-{index + 1:02d}"
         sync_node._schedule_prompt_sync(source_burst=True)
     assert len(scheduled_callbacks) == 1
+    assert not retry_checks, "A healthy source batch should not hash the Prompt for its error gate."
     assert delayed_callbacks == []
     scheduled_callbacks.pop()()
     assert len(delayed_callbacks) == 1
@@ -474,6 +478,15 @@ try:
         "The delayed source batch must resolve the newest Shot binding rather "
         "than replaying the first queued snapshot."
     )
+    sync_node._hmb_prompt_sync_failure = {"identity": "current-source"}
+    sync_node._schedule_prompt_sync(source_burst=True)
+    assert len(retry_checks) == 1 and not scheduled_callbacks
+    sync_node._hmb_prompt_sync_failure = {"identity": "older-source"}
+    sync_node._schedule_prompt_sync(source_burst=True)
+    assert len(retry_checks) == 2 and len(scheduled_callbacks) == 1
+    scheduled_callbacks.pop()()
+    delayed_callbacks.pop()()
+    sync_node._prompt_sync_retry_identity = original_retry_identity
 
     # A direct Prompt edit arriving during that short source window owns an
     # immediate callback and invalidates the older delayed owner.

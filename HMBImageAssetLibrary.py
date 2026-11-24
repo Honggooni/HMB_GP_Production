@@ -1165,10 +1165,10 @@ def _thumbnail_cache_paths(
     )
 
 
-def _read_persistent_thumbnail_cache(
+def _persistent_thumbnail_entry(
     signature: str,
-) -> tuple[bytes, str, int, int] | None:
-    """Read one bounded local thumbnail entry without trusting cached paths."""
+) -> tuple[Path, str, int, int] | None:
+    """Find a bounded local thumbnail without reopening its source image."""
 
     try:
         metadata_path, _ = _thumbnail_cache_paths(signature)
@@ -1191,20 +1191,36 @@ def _read_persistent_thumbnail_cache(
             or _is_reparse_point(media_path)
             or media_size <= 0
             or media_size > 8 * 1024 * 1024
+            or ("bytes" in metadata and metadata["bytes"] != media_size)
         ):
             return None
         width = max(0, int(metadata.get("width") or 0))
         height = max(0, int(metadata.get("height") or 0))
-        payload = media_path.read_bytes()
-        # File mtimes provide a low-cost persistent LRU across processes.
+        # Touch metadata only. The local static driver's URL uses the image
+        # inode/mtime so browser cache entries must keep a stable URL.
         try:
             os.utime(metadata_path, None)
-            os.utime(media_path, None)
         except Exception:
             pass
-        return payload, extension, width, height
+        return media_path, extension, width, height
     except Exception:
         return None
+
+
+def _read_persistent_thumbnail_cache(
+    signature: str,
+) -> tuple[bytes, str, int, int] | None:
+    entry = _persistent_thumbnail_entry(signature)
+    if entry:
+        path, extension, width, height = entry
+        try:
+            with path.open("rb") as stream:
+                payload = stream.read(8 * 1024 * 1024 + 1)
+            if 0 < len(payload) <= 8 * 1024 * 1024:
+                return payload, extension, width, height
+        except OSError:
+            pass
+    return None
 
 
 def _prune_persistent_thumbnail_cache(cache_root: Path) -> None:
@@ -1359,6 +1375,7 @@ def _write_persistent_thumbnail_cache(
                 "version": 1,
                 "signature": signature,
                 "extension": extension,
+                "bytes": len(payload),
                 "width": max(0, int(width)),
                 "height": max(0, int(height)),
             }
@@ -1435,6 +1452,74 @@ def _publish_thumbnail_payload(
     )
 
 
+def _remember_thumbnail_url(signature: str, url: str) -> str:
+    if url:
+        with _ASSET_THUMBNAIL_LOCK:
+            _ASSET_THUMBNAIL_URLS[signature] = url
+            _ASSET_THUMBNAIL_URLS.move_to_end(signature)
+            while len(_ASSET_THUMBNAIL_URLS) > _ASSET_THUMBNAIL_CACHE_MAX_ENTRIES:
+                _ASSET_THUMBNAIL_URLS.popitem(last=False)
+    return url
+
+
+def _cached_asset_thumbnail_url(signature: str, driver: Any = None) -> str:
+    """Serve immutable cache media through the desktop's own local file server."""
+    if not re.fullmatch(r"[0-9a-f]{64}", signature):
+        return ""
+    try:
+        if driver is None:
+            driver = _local_thumbnail_storage_driver()
+        if driver is None:
+            return ""
+        entry = _persistent_thumbnail_entry(signature)
+        if entry is None:
+            with _ASSET_THUMBNAIL_LOCK:
+                url = _ASSET_THUMBNAIL_URLS.get(signature, "")
+                if f"/{signature}." in url:
+                    _ASSET_THUMBNAIL_URLS.pop(signature, None)
+            return ""
+        return _remember_thumbnail_url(
+            signature, _clean(driver.create_signed_download_url(entry[0]))
+        )
+    except Exception:
+        return ""
+
+
+def _local_thumbnail_storage_driver() -> Any:
+    try:
+        from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
+        from griptape_nodes.retained_mode.engine import has_current_engine
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        if has_current_engine():
+            driver = GriptapeNodes.StaticFilesManager().storage_driver
+            if (isinstance(driver, LocalStorageDriver)
+                    and urlparse(driver.base_url).hostname in {"localhost", "127.0.0.1", "::1"}):
+                return driver
+    except Exception:
+        pass
+    return None
+
+
+def _restore_cached_catalog_thumbnails(state: Dict[str, Any]) -> None:
+    """Attach the first page and selected Shot previews to the catalog payload."""
+    driver = _local_thumbnail_storage_driver()
+    if driver is None:
+        return
+    rows = state.get("assets", [])
+    selected = [row for row in rows if row.get("selected")]
+    folder = _clean(state.get("selected_folder_path"))
+    visible = [row for row in rows if row.get("source_kind") == "project" and not row.get("selected")]
+    if folder:
+        visible.sort(key=lambda row: not _clean(row.get("relative_path")).startswith(folder + "/"))
+    for row in selected + visible[:80]:
+        if (not row.get("thumbnail_url") and row.get("relative_path")
+                and not _non_negative_int(row.get("import_index"))):
+            url = _cached_asset_thumbnail_url(_clean(row.get("media_signature")), driver)
+            if url:
+                row["thumbnail_url"] = url
+
+
 def _flush_persistent_thumbnail_cache_prune() -> None:
     """Prune once after a staged hydration batch, not once per new image."""
 
@@ -1506,6 +1591,9 @@ def _asset_thumbnail_url(
             if cached_url:
                 _ASSET_THUMBNAIL_URLS.move_to_end(signature)
                 return cached_url
+        url = _cached_asset_thumbnail_url(signature)
+        if url:
+            return url
         cached = _read_persistent_thumbnail_cache(signature)
         if cached is None:
             try:
@@ -1524,6 +1612,9 @@ def _asset_thumbnail_url(
                 height,
                 prune=prune,
             )
+            url = _cached_asset_thumbnail_url(signature)
+            if url:
+                return url
         else:
             payload, extension, _width, _height = cached
         try:
@@ -1535,18 +1626,7 @@ def _asset_thumbnail_url(
             )
         except Exception:
             return ""
-        if url:
-            with _ASSET_THUMBNAIL_LOCK:
-                while (
-                    len(_ASSET_THUMBNAIL_URLS)
-                    >= _ASSET_THUMBNAIL_CACHE_MAX_ENTRIES
-                ):
-                    try:
-                        _ASSET_THUMBNAIL_URLS.popitem(last=False)
-                    except KeyError:
-                        break
-                _ASSET_THUMBNAIL_URLS[signature] = url
-        return url
+        return _remember_thumbnail_url(signature, url)
 
 
 def _asset_thumbnail_url_for_media(
@@ -7282,6 +7362,13 @@ def _hydrate_asset_thumbnails(
                 ):
                     failed.append(library_id)
                     continue
+                expected_signature = _clean(asset.get("media_signature"))
+                cached_url = _cached_asset_thumbnail_url(expected_signature)
+                if cached_url:
+                    asset["thumbnail_url"] = cached_url
+                    assets[index] = asset
+                    completed.append(library_id)
+                    continue
                 try:
                     path, _relative_text, media_signature = _resolve_project_asset_file(
                         project_root,
@@ -7293,7 +7380,6 @@ def _hydrate_asset_thumbnails(
                         project_cache_uid=_clean(normalized_state.get("project_cache_uid")),
                         site_scopes=site_scopes,
                     )
-                    expected_signature = _clean(asset.get("media_signature"))
                     if expected_signature and media_signature != expected_signature:
                         failed.append(library_id)
                         continue
@@ -12800,8 +12886,15 @@ class HMBImageAssetLibrary(DataNode):
         # The retained tree repeats every asset ID. The widget derives its
         # folder tree from folders/counts, so never copy that full export here.
         dto = {key: value for key, value in state.items() if key not in {"assets", "catalog_page", "tree"}}
-        dto["assets"] = assets
-        dto["catalog_page"] = {key: value for key, value in page.items() if key != "epoch"}
+        cached = page.get("cached_thumbnails", {})
+        dto["assets"] = [
+            {**row, "thumbnail_url": entry[1]}
+            if not row.get("thumbnail_url") and (entry := cached.get(row["asset_library_id"]))
+               and entry[0] == row.get("media_signature")
+            else row
+            for row in assets
+        ]
+        dto["catalog_page"] = {key: value for key, value in page.items() if key not in {"epoch", "cached_thumbnails"}}
         dto["catalog_page"].update(version=1,
             import_revision=_non_negative_int(getattr(self, "_hmb_import_revision", 0)),
             catalog_revision=_non_negative_int(getattr(self, "_hmb_catalog_search_catalog_revision", 0)),
@@ -12922,6 +13015,19 @@ class HMBImageAssetLibrary(DataNode):
                         page = index.query(intent, lambda: epoch_retired() or current_generation != owner._hmb_catalog_search_generations.get(intent["session_id"]))
                         if epoch_retired():
                             continue
+                        driver = host_context.copy().run(_local_thumbnail_storage_driver)
+                        if driver is not None:
+                            cached = {}
+                            rows = getattr(owner, "_hmb_catalog_search_assets", {})
+                            for asset_id in page["asset_library_ids"]:
+                                row = rows.get(asset_id, {})
+                                if (row.get("relative_path") and not row.get("thumbnail_url")
+                                        and not _non_negative_int(row.get("import_index"))):
+                                    signature = _clean(row.get("media_signature"))
+                                    url = _cached_asset_thumbnail_url(signature, driver)
+                                    if url:
+                                        cached[asset_id] = (signature, url)
+                            page["cached_thumbnails"] = cached
                         page.update({key: intent[key] for key in ("query", "folder", "source_view", "session_id", "sequence")})
                         page.update(epoch=identity, folder_counts=index.folder_counts,
                             index_builds=owner._hmb_catalog_search_builds)
@@ -13910,6 +14016,8 @@ class HMBImageAssetLibrary(DataNode):
                     try:
                         if project:
                             first_paint = _read_local_catalog_snapshot(project, scan_base)
+                            if first_paint is not None:
+                                host_context.copy().run(_restore_cached_catalog_thumbnails, first_paint)
                         else:
                             roster = _read_local_project_list(scope)
                             if roster:
@@ -13935,6 +14043,8 @@ class HMBImageAssetLibrary(DataNode):
                     scanned_state = scanned
                     media_by_uid = None
                 result = _normalize_state(scanned_state)
+                if first_paint is None:
+                    host_context.copy().run(_restore_cached_catalog_thumbnails, result)
                 result["error"] = ""
             except Exception as exc:
                 result = scan_failure(exc)

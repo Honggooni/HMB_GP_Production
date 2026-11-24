@@ -249,6 +249,11 @@ class FakeMaterialCmds(types.ModuleType):
     def shadingNode(self, node_type, asShader=False, name="", **kwargs):
         as_utility = bool(kwargs.get("asUtility"))
         as_texture = bool(kwargs.get("asTexture"))
+        if as_utility and node_type in ("rgbToHsv", "hsvToRgb", "multDoubleLinear", "addDoubleLinear", "condition"):
+            self.counter += 1
+            node = name.rstrip("#") + str(self.counter)
+            self.node_types[node] = node_type
+            return node
         assert (
             (node_type == "lambert" and asShader is True)
             or (node_type == "place2dTexture" and as_utility)
@@ -432,7 +437,7 @@ def original_connections(fake: FakeMaterialCmds) -> dict[str, str]:
 
 # The fake Maya foundation above is retained for portable SG-membership tests.
 # No old per-material/color/alpha/renderer-fallback expectations remain.
-PROFILE = "maya-midgray-solid-studio-v4-eye-groups"
+PROFILE = "maya-midgray-solid-studio-v5-eye-color-correct"
 assert runner.ORIGINAL_MATERIAL_OVERRIDE_PROFILE == PROFILE
 
 
@@ -1196,17 +1201,21 @@ with tempfile.TemporaryDirectory(prefix="hmb-authored-eye-") as texture_root:
     # A native utility containing a missing renderer input must be cloned before
     # rewiring. The original blend and unknown renderer graph remain untouched.
     wrapped_eye = EyeMidgrayCmds(texture_directory)
-    wrapped_eye.node_types.update({"EyeMat": "unknown", "EyeCorrection": "unknown", "EyeBlend": "blendColors"})
-    wrapped_eye.eye_nodes.update(("EyeCorrection", "EyeBlend"))
+    wrapped_eye.node_types.update({"EyeMat": "unknown", "EyeCorrection": "unknown",
+                                   "EyeBlend": "blendColors", "EyeSwitch": "animCurveUU"})
+    wrapped_eye.eye_nodes.update(("EyeCorrection", "EyeBlend", "EyeSwitch"))
     wrapped_eye.connections.update({
         "EyeMat.color": "EyeBlend.output", "EyeBlend.color1": "EyeCorrection.outColor",
-        "EyeCorrection.input": "EyeColor.outColor",
+        "EyeCorrection.input": "EyeColor.outColor", "EyeBlend.blender": "EyeSwitch.output",
     })
     wrapped_eye.values.update({"EyeBlend.color1": [(0.2, 0.3, 0.4)], "EyeBlend.color2": [(0.0, 0.0, 0.0)],
-                              "EyeBlend.blender": 1.0, "EyeCorrection.input": [(0.15, 0.35, 0.7)]})
+                              "EyeBlend.blender": 1.0, "EyeCorrection.input": [(0.15, 0.35, 0.7)],
+                              "EyeCorrection.hue": 160.0, "EyeCorrection.updatedMode": 1.0})
     wrapped_eye.attr_types.update({"EyeBlend.output": "double3", "EyeBlend.color1": "double3",
                                   "EyeBlend.color2": "double3", "EyeBlend.blender": "double",
-                                  "EyeCorrection.input": "double3", "EyeCorrection.outColor": "double3"})
+                                  "EyeCorrection.input": "double3", "EyeCorrection.outColor": "double3",
+                                  "EyeCorrection.hue": "double", "EyeCorrection.updatedMode": "double",
+                                  "EyeSwitch.output": "double"})
     wrapped_before = wrapped_eye.snapshot()
     wrapped_inputs = copy.deepcopy(wrapped_eye.connections)
     wrapped_controller = controller_for(wrapped_eye, [wrapped_eye.EYE_LEFT])
@@ -1214,7 +1223,13 @@ with tempfile.TemporaryDirectory(prefix="hmb-authored-eye-") as texture_root:
     wrapped_record = wrapped_report["eye_fallback_records"][0]
     assert wrapped_record["color_source"].startswith("HMB_Original_EyeNativeGraph")
     assert wrapped_record["color_source"].endswith(".output")
-    assert wrapped_eye.node_types[wrapped_record["color_source"].split(".", 1)[0]] == "blendColors"
+    clone = wrapped_record["color_source"].split(".", 1)[0]
+    assert wrapped_eye.node_types[clone] == "blendColors"
+    assert wrapped_eye.connections[clone + ".blender"] == "EyeSwitch.output"
+    corrected = wrapped_eye.connections[clone + ".color1"]
+    assert corrected.endswith(".outRgb") and wrapped_eye.node_types[corrected.split(".", 1)[0]] == "hsvToRgb"
+    assert any(value == 160.0 and plug.endswith(".input1") and plug.startswith("HMB_")
+               for plug, value in wrapped_eye.values.items())
     for destination, incoming in wrapped_inputs.items():
         if destination.split(".", 1)[0] in wrapped_eye.eye_nodes:
             assert wrapped_eye.connections[destination] == incoming

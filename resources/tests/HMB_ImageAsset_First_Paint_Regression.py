@@ -162,6 +162,34 @@ class FirstPaintRegression(unittest.TestCase):
         self.assertEqual(result["thumbnail_result"]["failed_asset_library_ids"], self.request()["asset_library_ids"])
         self.assertEqual(result["assets"][0]["thumbnail_url"], "")
 
+    def test_disk_thumbnail_reopens_with_catalog_without_source_io(self):
+        library._write_catalog_index(self.state)
+        signature = self.state["assets"][0]["media_signature"]
+        library._write_persistent_thumbnail_cache(signature, b"cached", "webp", 1, 1)
+        _, media_path = library._thumbnail_cache_paths(signature)
+        media_mtime = media_path.stat().st_mtime_ns
+
+        class LocalDriver:
+            def create_signed_download_url(self, path):
+                return f"http://localhost:8124/external/{path.as_posix()}?v={path.stat().st_mtime_ns}"
+
+        with patch.object(library, "_local_thumbnail_storage_driver", return_value=LocalDriver()), \
+             patch.object(library, "_asset_file_facts", side_effect=AssertionError("opened original")), \
+             patch.object(library, "_generate_thumbnail_payload", side_effect=AssertionError("decoded original")), \
+             patch.object(library, "_publish_thumbnail_payload", side_effect=AssertionError("republished thumbnail")):
+            snapshot = library._read_local_catalog_snapshot(self.project, self.state)
+            self.assertIsNotNone(snapshot)
+            library._restore_cached_catalog_thumbnails(snapshot)
+            thumb = snapshot["assets"][0]["thumbnail_url"]
+            self.assertIn(f"/{signature}.webp", thumb)
+            library._ASSET_THUMBNAIL_URLS.clear()
+            recovered = library._hydrate_asset_thumbnails(self.state, self.request())
+            self.assertEqual(recovered["assets"][0]["thumbnail_url"], thumb)
+            self.assertEqual(recovered["thumbnail_result"]["completed_asset_library_ids"], self.request()["asset_library_ids"])
+            self.assertEqual(media_path.stat().st_mtime_ns, media_mtime)
+            media_path.write_bytes(b"short")
+            self.assertEqual(library._cached_asset_thumbnail_url(signature), "")
+
     def test_slow_signature_does_not_block_another_or_duplicate_its_work(self):
         other = self.project / "Assets" / "Other.png"
         other.write_bytes(b"different fixture")

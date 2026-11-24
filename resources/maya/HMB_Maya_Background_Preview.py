@@ -45,14 +45,14 @@ SMOOTH_PREVIEW_GEOMETRY_BUDGET_FACES = 10000000
 SMOOTH_PREVIEW_GEOMETRY_BUDGET_POLICY = "hmb_smooth_preview_geometry_budget_v1"
 ORIGINAL_VIEWPORT_QUALITY_PROFILE = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
 ORIGINAL_MATERIAL_OVERRIDE_PROFILE = (
-    "maya-midgray-solid-studio-v4-eye-groups"
+    "maya-midgray-solid-studio-v5-eye-color-correct"
 )
 ORIGINAL_LAMBERT_ASSIGNMENT_MODE = (
     "original_midgray_body_authored_eyes"
 )
 ORIGINAL_MATERIAL_PASS_SETS = ("AIPicker_SET", "AIPickerM_SET")
 MASK_MATERIAL_PASS_SETS = ("AIPicker_SET", "AIPickerM_SET")
-MASK_MATERIAL_PASS_PROFILE = "mask_authored_set_material_pass_v2"
+MASK_MATERIAL_PASS_PROFILE = "mask_authored_set_material_pass_v3"
 SCREEN_SPACE_PATTERN_PROFILE = "hmb_screen_space_pattern_post_v2"
 SCREEN_SPACE_PATTERN_LINEAR_SCALE_DIVISOR = 3
 SCREEN_SPACE_PATTERN_BASE_CELL_DIVISOR = 8
@@ -4158,6 +4158,12 @@ def _original_plugin_dependency_report(source_plug):
     }
 
 
+def _original_is_redshift_color_correction(node):
+    return (_original_plugin_node_state(node) == "unavailable"
+            and _original_plugin_node_record(node, "unavailable")["real_class"].casefold()
+            == "redshiftcolorcorrection")
+
+
 def _original_upstream_plugin_nodes(source_plug):
     """Compatibility helper returning every renderer dependency node name."""
     report = _original_plugin_dependency_report(source_plug)
@@ -5049,6 +5055,114 @@ class _OriginalLambertOverrideController(object):
             )
         )
 
+    def _eye_utility(self, kind):
+        node = cmds.shadingNode(kind, asUtility=True, name="HMB_Original_EyeColorCorrect#")
+        self.created_nodes.append(node)
+        return node
+
+    def _eye_color_control(self, record, plugs, default):
+        value = _numeric_attr_components(record.get("value"))
+        source = _clean(record.get("source"))
+        if source:
+            source = self._eye_native_source(source)
+        for plug in plugs:
+            if source:
+                _original_connect(source, plug)
+            else:
+                cmds.setAttr(plug, value[0] if value else default)
+
+    def _eye_native_color_correct(self, node):
+        """Keep an authored Redshift eye correction in a live Maya DG graph."""
+        color = _original_attr_record(node, ("input", "inputColor", "input_color"))
+        hue = _original_attr_record(node, ("hue", "hueShift", "hue_shift"))
+        saturation = _original_attr_record(node, ("sat", "saturation", "saturationScale"))
+        gamma = _original_attr_record(node, ("gamma",))
+        contrast = _original_attr_record(node, ("contrast",))
+        level = _original_attr_record(node, ("level", "levelScale"))
+
+        def active(record, neutral):
+            values = _numeric_attr_components(record.get("value"))
+            return bool(record.get("source") or (values and values[0] != neutral))
+
+        use_hsv = active(hue, 0.0) or active(saturation, 1.0)
+        use_gamma = active(gamma, 1.0)
+        use_contrast = active(contrast, 0.5)
+        use_level = active(level, 1.0)
+        if not (use_hsv or use_gamma or use_contrast or use_level):
+            source = _clean(color.get("source"))
+            if source and not any(color.get("component_sources") or ()):
+                return self._eye_native_source(source)
+
+        def wire_color(target, source):
+            if source:
+                _original_connect(source, target)
+            else:
+                self._eye_fallback_wire(color, target, (0.0, 0.0, 0.0))
+
+        result = ""
+        if use_gamma:
+            adjust = self._eye_utility("gammaCorrect")
+            wire_color(adjust + ".value", result)
+            self._eye_color_control(gamma, [adjust + ".gamma" + axis for axis in "XYZ"], 1.0)
+            result = adjust + ".outValue"
+        if use_contrast:
+            adjust = self._eye_utility("contrast")
+            wire_color(adjust + ".value", result)
+            scale = self._eye_utility("multDoubleLinear")
+            self._eye_color_control(contrast, [scale + ".input1"], 0.5)
+            cmds.setAttr(scale + ".input2", 2.0)
+            for axis in "XYZ":
+                _original_connect(scale + ".output", adjust + ".contrast" + axis)
+            result = adjust + ".outValue"
+        if use_hsv:
+            hsv = self._eye_utility("rgbToHsv")
+            rgb = self._eye_utility("hsvToRgb")
+            wire_color(hsv + ".inRgb", result)
+            angle = hsv + ".outHsvH"
+            if active(hue, 0.0):
+                scale = self._eye_utility("multDoubleLinear")
+                self._eye_color_control(hue, [scale + ".input1"], 0.0)
+                mode = _numeric_attr_components(_plug_value(node + ".updatedMode"))
+                # Updated Maya nodes store degrees; the legacy control used
+                # turns. Older files with a value outside one turn used degrees.
+                hue_values = _numeric_attr_components(hue.get("value"))
+                degrees = (mode and mode[0]) or (hue_values and abs(hue_values[0]) > 1.0)
+                cmds.setAttr(scale + ".input2", 1.0 if degrees else 360.0)
+                shift = self._eye_utility("addDoubleLinear")
+                _original_connect(angle, shift + ".input1")
+                _original_connect(scale + ".output", shift + ".input2")
+                minus_turn = self._eye_utility("addDoubleLinear")
+                _original_connect(shift + ".output", minus_turn + ".input1")
+                cmds.setAttr(minus_turn + ".input2", -360.0)
+                wrap = self._eye_utility("condition")
+                cmds.setAttr(wrap + ".operation", 3)  # Greater or equal
+                cmds.setAttr(wrap + ".secondTerm", 360.0)
+                _original_connect(shift + ".output", wrap + ".firstTerm")
+                _original_connect(minus_turn + ".output", wrap + ".colorIfTrueR")
+                _original_connect(shift + ".output", wrap + ".colorIfFalseR")
+                angle = wrap + ".outColorR"
+            sat = hsv + ".outHsvS"
+            if active(saturation, 1.0):
+                scale = self._eye_utility("multDoubleLinear")
+                _original_connect(sat, scale + ".input1")
+                self._eye_color_control(saturation, [scale + ".input2"], 1.0)
+                sat = scale + ".output"
+            # Maya names the hsvToRgb input's child plugs R/G/B.
+            _original_connect(angle, rgb + ".inHsvR")
+            _original_connect(sat, rgb + ".inHsvG")
+            _original_connect(hsv + ".outHsvV", rgb + ".inHsvB")
+            result = rgb + ".outRgb"
+        if use_level:
+            scale = self._eye_utility("multiplyDivide")
+            wire_color(scale + ".input1", result)
+            self._eye_color_control(level, [scale + ".input2" + axis for axis in "XYZ"], 1.0)
+            result = scale + ".output"
+        if not result:
+            neutral = self._eye_utility("multiplyDivide")
+            wire_color(neutral + ".input1", "")
+            result = neutral + ".output"
+        return result
+
     def _eye_native_source(self, source):
         source = _clean(source)
         if not source:
@@ -5063,7 +5177,9 @@ class _OriginalLambertOverrideController(object):
         self.eye_native_resolving.add(source)
         try:
             node, _, attribute = source.partition(".")
-            if _original_plugin_node_state(node) == "unavailable":
+            if attribute in ("oc", "outColor") and _original_is_redshift_color_correction(node):
+                replacement = self._eye_native_color_correct(node)
+            elif _original_plugin_node_state(node) == "unavailable":
                 shader = self._create_eye_fallback_shader(node, source)
                 replacement = shader + (
                     ".transparency" if "transparen" in attribute.lower()
@@ -5146,10 +5262,13 @@ class _OriginalLambertOverrideController(object):
         # RedshiftArchitectural uses diffuse; color corrections use input.
         # These recorded inputs remain readable even while their provider is
         # absent. The shader's unknown output is never reused as a live input.
-        color = _original_attr_record(
-            material, _ORIGINAL_COLOR_INPUT_ATTRIBUTES +
-            ("diffuse", "input", "input_color", "inputColor"),
-        )
+        if _original_is_redshift_color_correction(material):
+            color = _original_output_color_record(material, source)
+        else:
+            color = _original_attr_record(
+                material, _ORIGINAL_COLOR_INPUT_ATTRIBUTES +
+                ("diffuse", "input", "input_color", "inputColor"),
+            )
         if not color and _original_plugin_node_state(material) != "unavailable":
             color = _original_output_color_record(material, source)
         color_mode, color_source = self._eye_fallback_wire(
