@@ -25,6 +25,11 @@ from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrar
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 try:
+    from griptape_nodes.retained_mode.runtime.binding import WorkflowNotOpenError
+    _CLOSED_WORKFLOW_ERRORS = (WorkflowNotOpenError,)
+except ImportError:
+    _CLOSED_WORKFLOW_ERRORS = ()
+try:
     from griptape_nodes.retained_mode.engine import current_engine
 except ImportError:
     # Keep import possible so the library-load hook can report the required
@@ -2139,6 +2144,8 @@ class _Registration:
 
     async def after_workflow_load(self, request: Any, result: Any) -> None:
         """Notification only: coordinator requests run on a later empty context."""
+        from contextlib import nullcontext
+
         engine, manager = self.engine(), self.manager()
         if not self._prompt_owner(engine, manager):
             return
@@ -2156,12 +2163,18 @@ class _Registration:
         if result.succeeded():
             migration.schedule_loaded_flow_migrations(engine)
             for node in loaded_images:
+                owner = getattr(node, "workflow", None)
+                if getattr(owner, "closed", False) is True:
+                    continue
                 try:
-                    # A closed or replaced workflow can have a node with the
-                    # same name. Only its exact, still-registered owner may read.
-                    if engine.node_manager.get_node_by_name(node.name) is node:
-                        node.after_deserialize()
+                    # A saved tab can reopen with the same ID and node names
+                    # while its previous runtime still has a queued load callback.
+                    with engine.bind_workflow(owner) if owner is not None else nullcontext():
+                        if engine.node_manager.get_node_by_name(node.name) is node:
+                            node.after_deserialize()
                 except Exception as exc:
+                    if isinstance(exc, _CLOSED_WORKFLOW_ERRORS) and getattr(owner, "closed", False) is True:
+                        continue
                     logging.getLogger(__name__).warning("[HMB_IMAGE_CATALOG_RESTORE] %s", exc)
         else:
             for name in migration.pending_flow_names(engine):

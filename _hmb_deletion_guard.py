@@ -7,9 +7,11 @@ is not a binding. No provider, media resolution or filesystem work belongs here.
 """
 from __future__ import annotations
 
+import asyncio
 import importlib
 import inspect
 import functools
+import logging
 import threading
 import weakref
 import secrets
@@ -45,6 +47,107 @@ _HANDLERS = globals().get("_HANDLERS", weakref.WeakKeyDictionary())
 _checked_delete_identity: ContextVar[Any] = ContextVar("hmb_checked_delete_identity", default=None)
 _BINDING_BARRIERS = globals().get("_BINDING_BARRIERS", weakref.WeakKeyDictionary())
 _BINDING_BARRIERS_LOCK = globals().get("_BINDING_BARRIERS_LOCK", threading.RLock())
+
+
+class _ClosingFlows:
+    """Exact SDK requests issued by the synchronous flow cascade of one tab close."""
+
+    def __init__(self, workflow: Any) -> None:
+        self.workflow = workflow
+        self.thread = threading.get_ident()
+        self.task = asyncio.current_task()
+        self.active = True
+        self.admitted: dict[int, Any] = {}
+
+    def admit(self, engine: Any, request: Any) -> None:
+        if (not self.active or self.workflow.engine is not engine or self.thread != threading.get_ident()
+                or self.task is not asyncio.current_task()
+                or engine.current_workflow_or_none() is not self.workflow):
+            return
+        from griptape_nodes.retained_mode.managers.event_manager import current_request_type
+        parent = current_request_type()
+        if parent is not None and (parent.__name__ == "DeleteFlowRequest" or
+                (parent.__name__ == "CloseWorkflowRequest" and type(request).__name__ == "DeleteFlowRequest")):
+            self.admitted[id(request)] = request
+
+
+_closing_flows: ContextVar[_ClosingFlows | None] = ContextVar("hmb_native_close_flows", default=None)
+
+
+def _restore_close_connections(workflow: Any, edges: tuple[Any, ...]) -> None:
+    # Engine 0.113 clears all three connection tables before trying to delete
+    # its first flow. A refused or partial close still has a live graph.
+    from griptape_nodes.exe_types.core_types import ParameterMode
+
+    def retained(node: Any, port: Any) -> bool:
+        owner = workflow.nodes.name_to_parent_flow_name.get(node.name)
+        flow = workflow.objects.get(owner)
+        return (workflow.objects.get(node.name) is node and flow is not None
+                and flow.nodes.get(node.name) is node and node.get_parameter_by_name(port.name) is port)
+
+    graph = workflow.flows.connections
+    for edge in edges:
+        key = id(edge)
+        if key in graph.connections:
+            continue
+        src, out = edge.source_node, edge.source_parameter
+        dst, inp = edge.target_node, edge.target_parameter
+        if not retained(src, out) or not retained(dst, inp):
+            continue
+        if (ParameterMode.OUTPUT not in out.get_mode() or ParameterMode.INPUT not in inp.get_mode()
+                or graph.find_connection(src.name, out.name, dst.name, inp.name) is not None
+                or not graph.connection_allowed(src, out, is_source=True)
+                or not graph.connection_allowed(dst, inp, is_source=False)):
+            continue
+        # Keep the same SDK object and ID, including internal group edges.
+        graph.connections[key] = edge
+        graph.outgoing_index.setdefault(src.name, {}).setdefault(out.name, []).append(key)
+        graph.incoming_index.setdefault(dst.name, {}).setdefault(inp.name, []).append(key)
+
+
+def _install_native_close_scope(engine: Any) -> None:
+    """Recognize the Desktop 0.31 tab-close cascade when the SDK offers it."""
+    tear_down = getattr(engine, "_tear_down_workflow", None)
+    if (getattr(tear_down, "__self__", None) is not engine or inspect.iscoroutinefunction(tear_down)
+            or not callable(getattr(engine, "current_workflow_or_none", None))):
+        return  # Already wrapped, or this SDK uses a different close path.
+    try:
+        from griptape_nodes.retained_mode.events.context_events import CloseWorkflowRequest
+        from griptape_nodes.retained_mode.managers.event_manager import current_request_type
+
+        inspect.signature(tear_down).bind(workflow=object())
+    except (ImportError, ValueError, TypeError):
+        return
+
+    @functools.wraps(tear_down)
+    def close_workflow(workflow: Any) -> Any:
+        # Native Close passes the runtime named in its payload after cancellation.
+        # Rollback and close-all use the same SDK method with another parent.
+        if current_request_type() is not CloseWorkflowRequest or engine.open_workflows.find(workflow.workflow_id) is not workflow:
+            return tear_down(workflow)
+        edges = tuple(workflow.flows.connections.connections.values())
+        close = _ClosingFlows(workflow)
+        token = _closing_flows.set(close)
+        try:
+            return tear_down(workflow)
+        except BaseException:
+            try:
+                if engine.open_workflows.find(workflow.workflow_id) is workflow:
+                    _restore_close_connections(workflow, edges)
+            except Exception:
+                logging.getLogger(__name__).exception("Failed to restore connections after the native tab close failed")
+            raise
+        finally:
+            # Async node handlers run on a side loop. Invalidate their context
+            # copies even when a native handler raises or the close is cancelled.
+            close.active = False
+            close.admitted.clear()
+            _closing_flows.reset(token)
+
+    try:
+        engine._tear_down_workflow = close_workflow
+    except (AttributeError, TypeError):
+        return  # A host without this extension keeps its normal deletion guard.
 
 
 @contextmanager
@@ -695,10 +798,12 @@ def install_handler_barrier(engine: Any) -> Any:
         if (not callable(getattr(existing, "engine_ref", None)) or existing.engine_ref() is not engine
                 or not callable(getattr(existing, "is_installed", None)) or not existing.is_installed()):
             raise RuntimeError("[HMB_DELETE_GUARD_NOT_READY] SDK 삭제 핸들러 보호 소유권이 변경됐습니다.")
+        _install_native_close_scope(engine)
         return existing
     barrier = _HandlerDeletionBarrier(engine, manager)
     barrier.prepare()
     barrier.install()
+    _install_native_close_scope(engine)
     return barrier
 
 
@@ -728,6 +833,10 @@ class _ReentrantDeletionBarrier:
         manager, engine = self.manager_ref(), self.engine_ref()
         if manager is None or engine is None:
             return self.failure(result_details="[HMB_DELETE_GUARD_NOT_READY] 삭제 보호 엔진을 확인할 수 없습니다.")
+        closing = _closing_flows.get()
+        if (closing is not None and not context and not getattr(manager._hook_evaluation, "active", False)
+                and type(request).__name__ in {"DeleteFlowRequest", "DeleteNodeRequest"}):
+            closing.admit(engine, request)
         if (getattr(manager._hook_evaluation, "active", False) is True
                 and type(request).__name__ in _DESTRUCTIVE):
             try:
@@ -1221,6 +1330,10 @@ def guard_request(engine: Any, request: Any) -> Any:
     from griptape_nodes.retained_mode.managers.event_manager import current_request_type
     parent = current_request_type()
     parent_name = parent.__name__ if parent is not None else ""
+    closing = _closing_flows.get()
+    if (closing is not None and closing.active and closing.admitted.get(id(request)) is request
+            and engine.current_workflow_or_none() is closing.workflow):
+        return None
     if kind == "ClearAllObjectStateRequest" and parent_name in _LOAD_PARENTS:
         _teardown_engine.set(id(engine))
         return None

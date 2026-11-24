@@ -270,10 +270,10 @@
     },
     {
       "name": "HMB_Connected_Deletion_Guard_Host_Regression.py",
-      "mode": "manual",
+      "mode": "ci",
       "coverage": "installed_sdk",
-      "required": false,
-      "reason": "Isolated actual SDK verifies native delete/reset/group/flow/forced clear refusal before mutation, future HMB identity and live remote dependencies, disconnected deletion and ordinary workflow replacement without provider execution."
+      "sdk": "desktop_031",
+      "required": true
     },
     {
       "name": "HMB_Native_Connected_Deletion_Guard_Regression.mjs",

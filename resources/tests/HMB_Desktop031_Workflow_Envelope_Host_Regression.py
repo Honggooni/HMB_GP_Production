@@ -72,6 +72,155 @@ async def draft_final(engine, owner, other):
         assert not _engine_has_running_flow(engine)
 
 
+async def check_closing_connected_tab(engine, send, first, second):
+    from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest
+    from griptape_nodes.retained_mode.events.context_events import CloseWorkflowRequest, OpenWorkflowRequest
+    from griptape_nodes.retained_mode.events.flow_events import DeleteFlowRequest, SerializeFlowToCommandsRequest
+    from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
+    from griptape_nodes.retained_mode.events.node_events import (
+        DeleteNodeRequest, DeleteNodeResultFailure, ResetNodeToDefaultsRequest,
+    )
+    from griptape_nodes.retained_mode.events.workflow_events import (
+        RunWorkflowFromScratchRequest, SaveWorkflowFileFromSerializedFlowRequest,
+    )
+    from _hmb_connection_management import HMBGetNodeConnectionsRequest
+
+    async def retained_graph(runtime):
+        flow = runtime.context.get_current_flow()
+        nodes = {type(node).__name__: node for node in flow.nodes.values()}
+        image, picker, prompt = (nodes[kind] for kind in (
+            "HMBImageAssetLibrary", "HMBVideoPickerLibrary", "HMBPromptLibrary"))
+        with engine.bind_workflow(runtime):
+            picker._hmb_reconcile_shot_routing(image._hmb_shot_routing_catalog())
+        linked = await send(CreateConnectionRequest(source_node_name=image.name, source_parameter_name="IMAGE_ASSET_OUT",
+            target_node_name=prompt.name, target_parameter_name="IMAGE_ASSET_IN", initial_setup=True), runtime.workflow_id)
+        assert linked.succeeded(), linked.result_details
+        return flow, image, picker, prompt
+
+    async def protected(runtime, graph):
+        flow, image, picker, prompt = graph
+        lookup = await send(HMBGetNodeConnectionsRequest(node_name=image.name), runtime.workflow_id)
+        assert lookup.succeeded(), lookup.result_details
+        relations = {(row["kind"], row["peer_name"]) for row in lookup.connections}
+        assert {("wire", prompt.name), ("remote", picker.name)} <= relations, relations
+        for request in (DeleteFlowRequest(flow_name=flow.name), DeleteNodeRequest(node_name=picker.name),
+                        ResetNodeToDefaultsRequest(node_name=prompt.name)):
+            denied = await send(request, runtime.workflow_id)
+            assert denied.failed() and "HMB_DELETE_CONNECTED" in str(denied.result_details), denied.result_details
+        for node in (image, picker, prompt):
+            assert engine.node_manager.get_node_by_name_in(runtime, node.name) is node
+
+    original = await retained_graph(first)
+    sibling = await retained_graph(second)
+    assert original[0].name == sibling[0].name and original[0] is not sibling[0]
+    assert not engine.workflow_registry.get(first.workflow_id).is_saved
+    await protected(first, original)
+    await protected(second, sibling)
+    serialized = await send(SerializeFlowToCommandsRequest(flow_name=original[0].name), first.workflow_id)
+    assert serialized.succeeded(), serialized.result_details
+    saved = Path(os.environ["GTN_CONFIG_WORKSPACE_DIRECTORY"]) / "connected_tab.py"
+    result = await send(SaveWorkflowFileFromSerializedFlowRequest(serialized_flow_commands=serialized.serialized_flow_commands,
+        file_path=str(saved), file_name=saved.stem, display_name="Connected tab"), first.workflow_id)
+    assert result.succeeded(), result.result_details
+    contents = saved.read_bytes()
+    assert contents
+    await protected(first, original)
+
+    def refuse_flow(request, _context):
+        if isinstance(request, DeleteFlowRequest):
+            return GenericResultFailure(result_details="fixture stopped close before the flow was removed")
+        return None
+
+    engine.event_manager.add_pre_dispatch_hook(refuse_flow)
+    try:
+        refused = await send(CloseWorkflowRequest(workflow_id=first.workflow_id), second.workflow_id)
+        assert refused.failed() and "fixture stopped close" in str(refused.result_details), refused.result_details
+    finally:
+        engine.event_manager.remove_pre_dispatch_hook(refuse_flow)
+    await protected(first, original)
+    await protected(second, sibling)
+
+    # A third-party node may refuse after another node has already been removed.
+    # Only the wire between the surviving original endpoints can then be restored.
+    flow, image, _, _ = original
+    agent = next(node for node in flow.nodes.values() if type(node).__name__ == "HMBAgentLibrary")
+    control = await send(CreateConnectionRequest(source_node_name=agent.name, source_parameter_name=agent.control_parameter_out.name,
+        target_node_name=image.name, target_parameter_name=image.control_parameter_in.name, initial_setup=True), first.workflow_id)
+    assert control.succeeded(), control.result_details
+
+    def refuse_image(request, _context):
+        if isinstance(request, DeleteNodeRequest) and request.node_name == image.name:
+            return DeleteNodeResultFailure(result_details="fixture refused the second node")
+        return None
+
+    engine.event_manager.add_pre_dispatch_hook(refuse_image)
+    try:
+        partial = await send(CloseWorkflowRequest(workflow_id=first.workflow_id), second.workflow_id)
+        assert partial.failed() and image.name in str(partial.result_details), partial.result_details
+    finally:
+        engine.event_manager.remove_pre_dispatch_hook(refuse_image)
+    assert agent.name not in flow.nodes
+    with engine.bind_workflow(first):
+        edges = engine.flow_manager.get_connections().connections.values()
+        assert all(edge.source_node is not agent and edge.target_node is not agent for edge in edges)
+    await protected(first, original)
+    await protected(second, sibling)
+
+    # Native Close uses its explicit target, even when another tab is active in the editor.
+    closed = await send(CloseWorkflowRequest(workflow_id=first.workflow_id), second.workflow_id)
+    assert closed.succeeded() and not closed.already_closed, closed.result_details
+    assert engine.open_workflows.find(first.workflow_id) is None
+    repeated = await send(CloseWorkflowRequest(workflow_id=first.workflow_id), second.workflow_id)
+    assert repeated.succeeded() and repeated.already_closed
+    assert engine.open_workflows.get(second.workflow_id) is second
+    await protected(second, sibling)
+    assert saved.read_bytes() == contents
+
+    reopened = await send(RunWorkflowFromScratchRequest(file_path=str(saved)))
+    assert reopened.succeeded(), reopened.result_details
+    restored = engine.open_workflows.get(reopened.workflow_id)
+    assert restored is not first and restored is not second
+    assert engine.workflow_registry.get(restored.workflow_id).is_saved
+    closed_saved = await send(CloseWorkflowRequest(workflow_id=restored.workflow_id), second.workflow_id)
+    assert closed_saved.succeeded() and engine.open_workflows.find(restored.workflow_id) is None
+    assert saved.read_bytes() == contents
+    opened = await send(OpenWorkflowRequest(workflow_id=restored.workflow_id))
+    assert opened.succeeded() and not opened.already_open, opened.result_details
+    view = await send(HMBGetNodeConnectionsRequest(node_name=original[1].name), opened.open_workflow.workflow_id)
+    assert view.succeeded() and any(row["kind"] == "wire" and row["peer_name"] == original[3].name
+                                    for row in view.connections), view.result_details
+    assert saved.read_bytes() == contents
+    await protected(second, sibling)
+    await check_delayed_image_restore(engine, original[1], sibling[1])
+
+
+async def check_delayed_image_restore(engine, closed_image, live_image):
+    import logging
+    import _hmb_library_bootstrap as bootstrap
+
+    registration = bootstrap._REGISTRATIONS[engine.event_manager]
+    result = SimpleNamespace(succeeded=lambda: True)
+    logger = logging.getLogger(bootstrap.__name__)
+    assert closed_image.workflow.closed and closed_image.name == live_image.name
+    with engine.bind_workflow(live_image.workflow), ExitStack() as checks:
+        checks.enter_context(patch.object(bootstrap._migration_module(), "schedule_loaded_flow_migrations"))
+        lookup = checks.enter_context(patch.object(engine.node_manager, "get_node_by_name",
+                                                   wraps=engine.node_manager.get_node_by_name))
+        stale_restore = checks.enter_context(patch.object(closed_image, "after_deserialize"))
+        live_restore = checks.enter_context(patch.object(live_image, "after_deserialize", side_effect=OSError("fixture read failed")))
+        warning = checks.enter_context(patch.object(logger, "warning"))
+        registration.loaded_image_nodes.add(closed_image)
+        await registration.after_workflow_load(object(), result)
+        lookup.assert_not_called()
+        stale_restore.assert_not_called()
+        live_restore.assert_not_called()
+        warning.assert_not_called()
+        registration.loaded_image_nodes.add(live_image)
+        await registration.after_workflow_load(object(), result)
+        live_restore.assert_called_once_with()
+        assert warning.call_count == 1 and "fixture read failed" in str(warning.call_args)
+
+
 async def check_basket_envelopes(engine, send):
     from griptape_nodes.retained_mode.events import context_events
     from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
@@ -125,6 +274,14 @@ async def check_basket_envelopes(engine, send):
         assert status.data["status"] == "ready" and status.data["cgt_required"] and not status.data["cgt_bound"]
         assert len(first.context.get_current_flow().nodes) == 6 and not second.context.get_current_flow().nodes
         assert engine.current_workflow_or_none() is None
+        prepared = await basket("prepare", second_names, second.workflow_id)
+        assert prepared.succeeded() and prepared.data["prepared"], prepared.result_details
+        await check_closing_connected_tab(engine, send, first, second)
+        third, names = await open_tab("Basket after close")
+        created = await basket("prepare", names, third.workflow_id)
+        assert created.succeeded() and created.data["created"], created.result_details
+        assert len(third.context.get_current_flow().nodes) == 6
+        print("HMB_CONNECTED_TAB_CLOSE=PASS unsaved, saved, failed-close, sibling, direct protection, reopen, fresh basket")
 
 
 async def exercise(engine, patches):

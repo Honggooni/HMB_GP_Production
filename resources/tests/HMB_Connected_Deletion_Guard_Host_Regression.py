@@ -175,11 +175,26 @@ async def exercise(engine, _phase, out):
 
     try:
         with ExitStack() as patches:
+            # Follow the tab returned by the SDK when the host has per-workflow
+            # runtimes. The previous host keeps its own current workflow.
+            view = patches.enter_context(ExitStack())
+
+            def select_view(result):
+                workflow_id = getattr(result, "workflow_id", None)
+                if workflow_id is not None and callable(getattr(engine, "bind_workflow", None)):
+                    view.close()
+                    view.enter_context(engine.bind_workflow(engine.open_workflows.get(workflow_id)))
+
+            def open_flow(name):
+                result = harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name=name))
+                select_view(result)
+                return result.flow_name
+
             patches.enter_context(mock.patch.object(registration, "start_web_worker", lambda: None))
             patches.enter_context(mock.patch.object(migration, "schedule_loaded_flow_migrations", lambda *a: None))
             for key in ("schedule_post_registration_reconcile", "schedule_post_hydration_reconcile"):
                 patches.enter_context(mock.patch.object(routing, key, lambda *a, **k: False))
-            flow = harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name="DeletionGuardSDK")).flow_name
+            flow = open_flow("DeletionGuardSDK")
             source, target = create("connected source"), create("connected target")
             edge = wire(source, target)
             barrier = getattr(manager, guard.REENTRANT_BARRIER_ATTRIBUTE)
@@ -1033,8 +1048,9 @@ async def exercise(engine, _phase, out):
             # Normal New/Close releases loaded view without deleting a saved
             # file. Its permission must not leak to a subsequent direct clear.
             await harness.asend(engine, guard.HMBPrepareWorkflowTransitionRequest())
+            view.close()
             assert not _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager")
-            flow = harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name="SavedDeletionGuardSDK")).flow_name
+            flow = open_flow("SavedDeletionGuardSDK")
             source, target = create("saved guard source"), create("saved guard target")
             wire(source, target)
             commands = harness.send(engine, SerializeFlowToCommandsRequest(flow_name=flow)).serialized_flow_commands
@@ -1061,6 +1077,7 @@ async def exercise(engine, _phase, out):
                     await harness.asend(engine, CloseWorkflowRequest(workflow_id=current_runtime.workflow_id))
                     assert active.find(current_runtime.workflow_id) is None
                     assert active.get(new_id) is reopened_runtime
+            select_view(loaded)
             assert engine.node_manager.get_node_by_name(source.name) is not source
             assert saved.read_bytes() == digest
             await blocked(ClearAllObjectStateRequest(i_know_what_im_doing=True), "direct_force_clear_after_scratch_load_is_not_authorized")
@@ -1069,11 +1086,13 @@ async def exercise(engine, _phase, out):
             from griptape_nodes.node_library.workflow_registry import read_workflow_metadata
             registered = harness.send(engine, RegisterWorkflowRequest(metadata=read_workflow_metadata(saved), file_name=str(saved)))
             registry_name = registered.workflow_name
-            await harness.asend(engine, RunWorkflowFromRegistryRequest(workflow_name=registry_name, run_with_clean_slate=True))
+            reloaded = await harness.asend(engine, RunWorkflowFromRegistryRequest(workflow_name=registry_name, run_with_clean_slate=True))
+            select_view(reloaded)
             await blocked(ClearAllObjectStateRequest(i_know_what_im_doing=True), "direct_force_clear_after_registry_load_is_not_authorized")
             assert saved.read_bytes() == digest
             harness.record("native_registry_clean_slate_load_remains_available")
             await harness.asend(engine, guard.HMBPrepareWorkflowTransitionRequest())
+            view.close()
             stable_handler = registration.deletion_handlers
             owner.before_library_unregistered(schema, library)
             assert not registration.active
@@ -1089,7 +1108,7 @@ async def exercise(engine, _phase, out):
             assert registration.deletion_handlers is not None, "Refresh failed to rebind typed request handlers"
             assert registration.deletion_handlers is stable_handler
             assert stable_handler.owner_ref() is registration and stable_handler.engine_ref() is engine
-            flow = harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name="After library refresh")).flow_name
+            flow = open_flow("After library refresh")
             assert harness.send(engine, guard.HMBCheckNodeDeletionRequest(node_names=[])).can_delete
             source, target = create("refreshed source"), create("refreshed target")
             wire(source, target)
@@ -1191,12 +1210,13 @@ async def exercise(engine, _phase, out):
             owner.before_library_unregistered(schema, library)
             assert not registration.active and guard.protection_readiness(engine) == (True, "")
             await harness.asend(engine, guard.HMBPrepareWorkflowTransitionRequest(broadcast_result=False))
+            view.close()
             assert not _inventory(engine, "nodes", "name_to_parent_flow_name", "node_manager") and saved_gap.read_bytes() == saved_bytes
             inactive_empty = engine.handle_request(guard.HMBCheckNodeDeletionRequest(node_names=[], broadcast_result=False))
             assert not inactive_empty.succeeded()
             harness.record("healthy_unload_gap_New_Close_releases_view_and_preserves_saved_source")
 
-            harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name="Standard only after unload"))
+            open_flow("Standard only after unload")
             for callback in (None, harness.deny):
                 standard = create("ordinary independent", hmb=False)
                 with mock.patch.object(lifetime_gate, "callback", callback):
