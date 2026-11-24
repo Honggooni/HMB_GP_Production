@@ -6,6 +6,7 @@ import importlib.util
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -215,8 +216,6 @@ class RegistrationIdentityTests(unittest.TestCase):
         self.assertEqual(media, ["media-0", "media-1", "media-2"])
 
     def test_exact_shot_restores_absolute_import_authoring_after_macro_reconnect(self):
-        from griptape_nodes.files.file import File
-
         def import_uid(kind, reference):
             return "import:" + hashlib.sha256(f"{kind}\n{reference}".encode()).hexdigest()[:24]
 
@@ -239,7 +238,11 @@ class RegistrationIdentityTests(unittest.TestCase):
                 snapshot = {"channel_uuid": "channel", "generation": 2,
                             "ordered_assets": [{"source_uid": row["source_uid"], "metadata": row} for row in rows],
                             "media_by_source_uid": dict(zip(uids, media))}
-                with patch.object(File, "resolve", return_value=str(path)):
+                fake_file_module = SimpleNamespace(
+                    File=lambda _reference: SimpleNamespace(resolve=lambda: str(path)),
+                    FileLoadError=OSError,
+                )
+                with patch.dict(sys.modules, {"griptape_nodes.files.file": fake_file_module}):
                     prompt._restore_external_macro_row_authoring(state, snapshot, shot)
                 routed, _ = prompt._shot_image_payload_from_snapshot(snapshot, shot)
                 return prompt._apply_image_asset_payload(state, routed, connected=True)
