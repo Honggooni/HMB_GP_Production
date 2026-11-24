@@ -11,8 +11,9 @@ import unittest
 import weakref
 
 ROOT=Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 tree=ast.parse((ROOT/"_hmb_library_bootstrap.py").read_text("utf-8"))
-names={"_guard_context_snapshot_request","after_context_snapshot","after_workflow_load","before_create"}
+names={"_guard_context_snapshot_request","after_context_snapshot","after_workflow_load","before_create","_check_request"}
 methods=[item for owner in tree.body if isinstance(owner,ast.ClassDef) for item in owner.body
          if isinstance(item,(ast.FunctionDef,ast.AsyncFunctionDef)) and item.name in names]
 serial=tuple(type(name,(),{}) for name in ("SerializeFlowToCommandsRequest","SerializeNodeToCommandsRequest","SerializeSelectedNodesToCommandsRequest"))
