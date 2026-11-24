@@ -7128,14 +7128,21 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         source = context.get("source", {}) if isinstance(context, dict) else getattr(self, "_hmb_draft_pending_source", {})
         return str(source.get("draft_job_id") or "") if self._hmb_draft_finalize_pending else ""
 
-    @staticmethod
-    def _assert_draft_final_flow_idle() -> None:
+    def _assert_draft_final_flow_idle(self) -> None:
         try:
-            manager = GriptapeNodes.FlowManager()
-            check = getattr(manager, "check_for_existing_running_flow", None)
-            if not callable(check):
-                raise ValueError("Engine execution state is unavailable.")
-            if check():
+            workflow = getattr(self, "workflow", None)
+            manager = workflow.engine.flow_manager if workflow is not None else GriptapeNodes.FlowManager()
+            scoped = getattr(manager, "check_for_existing_running_flow_in", None)
+            if workflow is not None and callable(scoped):
+                if workflow.closed:
+                    raise ValueError("The Draft's workflow has closed; no Final was submitted.")
+                running = scoped(workflow)
+            else:
+                legacy = getattr(manager, "check_for_existing_running_flow", None)
+                if not callable(legacy):
+                    raise ValueError("Engine execution state is unavailable.")
+                running = legacy()
+            if running:
                 raise ValueError("Wait for the current workflow to finish before finalizing the Draft.")
         except ValueError:
             raise

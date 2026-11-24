@@ -7,12 +7,53 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(os.environ.get("HMB_MODE_TEST_LIBRARY_ROOT", Path(__file__).resolve().parents[2])).resolve()
 sys.path.insert(0, str(ROOT))
 STANDARD = Path(os.environ.get("HMB_GRIPTAPE_STANDARD_LIBRARY_PATH",
                                Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard"))
+
+
+async def draft_final(engine, owner, other):
+    """Use the real Final button callback, SDK idle check and Generator with an offline broker."""
+    import HMB_Seedance_Draft_Shot_Regression as fixture
+    from _hmb_workflow_migration import _engine_has_running_flow
+
+    with engine.bind_workflow(owner), ExitStack() as boundaries:
+        boundaries.enter_context(patch.object(fixture.t._broker_config, "load_broker_base_url", return_value=fixture.base.ORIGIN))
+        node = fixture.Node()
+        boundaries.callback(node.base.cleanup)
+        engine.object_manager.add_object_by_name_in(owner, node.name, node)
+        assert node.workflow is owner
+        source = fixture.completed_source(node)
+        node._store_draft_source(source)
+        fixture.forbid_upstream_work(node)
+        boundaries.enter_context(fixture.run_boundaries(node))
+
+        def click():
+            return node._on_finalize_draft_clicked(None, None, action_id="offline-final",
+                expected_draft_job_id=source["draft_job_id"], final_resolution="1080p")
+
+        machine = SimpleNamespace(current_state=object())
+        with patch.object(owner.flows, "global_control_flow_machine", machine):
+            assert _engine_has_running_flow(engine)
+            denied = click()
+            assert not denied.success and "Wait for the current workflow" in str(denied.details), denied.details
+            assert not node.bridge.posts
+        with patch.object(other.flows, "global_control_flow_machine", machine), engine.bind_workflow(other):
+            assert _engine_has_running_flow(engine)
+            started = click()
+            assert started.success, started.details
+            completion = node._hmb_draft_finalize_future
+            click()
+            await asyncio.wrap_future(completion)
+            assert len(node.bridge.posts) == 1, node._set_status_results.call_args_list
+            posted = node.bridge.posts[0]
+            assert posted["draft_job_id"] == source["draft_job_id"] and posted["resolution"] == "1080p"
+            assert node.upload_calls == 0 and node.saved
+        assert not _engine_has_running_flow(engine)
 
 
 async def check_basket_envelopes(engine, send):
@@ -57,8 +98,15 @@ async def check_basket_envelopes(engine, send):
             if any(item["project_id"] == project for item in status.data["projects"]):
                 break
             await asyncio.sleep(0.05)
-        bound = await basket("create", dict(first_names, project_id=project, shot_name="Offline shot"), first.workflow_id)
+        bound = await basket("create", dict(first_names, project_id=project, cgt_setup=True), first.workflow_id)
         assert bound.succeeded() and bound.data.get("bound") and not bound.data["created"], bound.result_details
+        for _ in range(100):
+            status = await basket("status", first_names, first.workflow_id)
+            assert status.succeeded(), status.result_details
+            if status.data["status"] == "ready":
+                break
+            await asyncio.sleep(0.05)
+        assert status.data["status"] == "ready" and status.data["cgt_required"] and not status.data["cgt_bound"]
         assert len(first.context.get_current_flow().nodes) == 6 and not second.context.get_current_flow().nodes
         assert engine.current_workflow_or_none() is None
 
@@ -86,7 +134,6 @@ async def exercise(engine, patches):
     # Local graph and provider boundary only, independent of accounts and desktop patches.
     patches.enter_context(patch.object(bootstrap._Registration, "start_web_worker", return_value=None))
     patches.enter_context(patch.object(bootstrap, "_hmb_coordinate_native_editor_update", return_value=None))
-    patches.enter_context(patch.object(classes["HMBImageAssetLibrary"], "_schedule_catalog_scan", return_value=False))
     for action in ("schedule_post_registration_reconcile", "schedule_post_hydration_reconcile"):
         patches.enter_context(patch.object(routing, action, return_value=False))
     owner = bootstrap.HMBProductionLibrary.__new__(bootstrap.HMBProductionLibrary)
@@ -109,11 +156,13 @@ async def exercise(engine, patches):
         return node
 
     await check_basket_envelopes(engine, send)
+    patches.enter_context(patch.object(classes["HMBImageAssetLibrary"], "_schedule_catalog_scan", return_value=False))
     first = await send(EnsureWorkflowAndFlowRequest(flow_name="Editor A"))
     second = await send(EnsureWorkflowAndFlowRequest(flow_name="Editor B"))
     assert first.succeeded() and second.succeeded() and first.workflow_id != second.workflow_id
     a, b = first.workflow_id, second.workflow_id
     nodes = {name: await create(name, a) for name in classes}
+    await draft_final(engine, engine.open_workflows.get(a), engine.open_workflows.get(b))
     run_names = ("HMBAgentLibrary", "HMBSeedanceGeneration")
     calls = []
 
@@ -182,7 +231,8 @@ async def exercise(engine, patches):
         assert not deletion.succeeded() and "HMB_DELETE_CONNECTED" in str(deletion.result_details)
     assert engine.node_manager.get_node_by_name_in(engine.open_workflows.get(a), generator.name) is generator
     print(json.dumps({"created_nodes": list(nodes), "executed_offline": list(run_names),
-                      "same_names_isolated": True, "native_model_choices": list(native._model_access.model_choices),
+                      "same_names_isolated": True, "offline_draft_final_posts": 1,
+                      "native_model_choices": list(native._model_access.model_choices),
                       "native_model_provider": native.get_parameter_value("model_provider"),
                       "native_model": native.get_parameter_value("model"), "external_calls": 0}))
 

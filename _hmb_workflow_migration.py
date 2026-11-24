@@ -87,6 +87,15 @@ def _node_manual_rebind_required(node: Any) -> bool:
     return bool(isinstance(value, dict) and value.get("required")) or bool(callable(pending) and pending())
 
 
+def _engine_has_running_flow(engine: Any) -> bool:
+    """Consolidation may mutate the graph only while the engine is idle."""
+    scoped = getattr(engine.flow_manager, "check_for_existing_running_flow_in", None)
+    all_open = getattr(getattr(engine, "open_workflows", None), "all_open", None)
+    if callable(scoped) and callable(all_open):
+        return any(scoped(workflow) for workflow in all_open())
+    return engine.flow_manager.check_for_existing_running_flow()
+
+
 def _finish_manual_rebind(engine: Any, flow: Any, editors: list[Any]) -> None:
     """Retire transaction-only export filters after the graph verifies."""
     _require(not any(_node_manual_rebind_required(node) for node in editors),
@@ -111,7 +120,7 @@ def _manual_rebind_context(node: Any, expected_source_digest: str) -> tuple[Any,
     flow = _registered_flow(engine, flow_name)
     _require(not flow_migration_pending(engine, flow_name),
         "Wait for the workflow connection check to finish before reconnecting a Shot")
-    _require(not engine.flow_manager.check_for_existing_running_flow(),
+    _require(not _engine_has_running_flow(engine),
         "Stop the running workflow before reconnecting an existing Shot")
     with _LOCK:
         transaction = _MANUAL_REBINDS.get(engine, {}).get(flow_name)
@@ -329,7 +338,7 @@ async def _send(engine: Any, request: Any, expected: Any) -> Any:
         # Native deletion enters a Node context even with an explicit name.
         # Its only suspending path cancels a running flow: migration forbids
         # that path, including a fresh check immediately before dispatch.
-        _require(not engine.flow_manager.check_for_existing_running_flow(),
+        _require(not _engine_has_running_flow(engine),
             "A workflow started; editor deletion was refused")
         node_name = getattr(request, "node_name", None)
         _require(isinstance(node_name, str) and bool(node_name), "Migration deletion requires an explicit node")
@@ -741,7 +750,7 @@ async def migrate_flow(engine: Any, flow_name: str, *, backup_root: Path | None 
     survivors: dict[str, Any] = {}
     stage = "preflight"
     try:
-        _require(not engine.flow_manager.check_for_existing_running_flow(), "A workflow is running; consolidation was deferred")
+        _require(not _engine_has_running_flow(engine), "A workflow is running; consolidation was deferred")
         flow = _registered_flow(engine, flow_name)
         groups, exports = _capture_editors(flow)
         existing = [node for nodes in groups.values() for node in nodes]

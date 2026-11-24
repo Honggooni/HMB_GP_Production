@@ -232,11 +232,12 @@ def _owned_nodes(engine: Any, flow: Any) -> dict[str, Any]:
     return kinds
 
 
-def _root_flow_without_subflows(engine, flow):
+def _root_flow_without_subflows(engine: Any, flow: Any) -> bool:
     current = getattr(engine, "current_workflow_or_none", None)
     runtime = current() if callable(current) else None
-    parents = runtime.flows.name_to_parent_name if runtime is not None else getattr(engine.flow_manager, "_name_to_parent_name", {})
-    return isinstance(parents, dict) and flow.name in parents and parents[flow.name] is None and flow.name not in parents.values()
+    parents = (runtime.flows.name_to_parent_name if runtime is not None
+               else getattr(engine.flow_manager, "_name_to_parent_name", {}))
+    return isinstance(parents, dict) and parents.get(flow.name, False) is None and flow.name not in parents.values()
 
 
 def _ensure_empty_flow(engine: Any, flow: Any) -> Any:
