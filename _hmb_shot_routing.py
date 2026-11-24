@@ -32,6 +32,14 @@ SUBSCRIPTION_VERSION = 1
 SHOT_ROUTING_PROTOCOL_VERSION = "2026-08-20.shot-routing.v1"
 MAX_SHOTS = 5
 
+
+class ShotImageUnavailable(ValueError):
+    """The exact Shot exists, but some of its selected image files do not."""
+
+    def __init__(self, source_paths: Mapping[str, str]):
+        self.source_paths = dict(source_paths)
+        super().__init__("ImageAsset exact Shot selected image media is unavailable: " + ", ".join(source_paths))
+
 # Management data lives beside the native, fixed-shape Shot identity.  It must
 # never enter Agent prompts/rules, media identity rows, or CGT status writes.
 SHOT_HIERARCHY_SCHEMA = "hmb-shot-hierarchy"

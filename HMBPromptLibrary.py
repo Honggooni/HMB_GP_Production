@@ -2523,6 +2523,12 @@ def _normalize_image_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
     out["asset_source_uid"] = _clean_string(
         item.get("asset_source_uid") or item.get("source_uid")
     )
+    if out["asset_source_uid"]:
+        saved_path = _prompt_image_display_path(item.get("asset_last_source_path"))
+        if saved_path:
+            out["asset_last_source_path"] = saved_path
+        if item.get("asset_source_unavailable") is True:
+            out["asset_source_unavailable"] = True
     out["asset_project_uid"] = _clean_string(item.get("asset_project_uid"))
     try:
         out["asset_selection_order"] = max(
@@ -2806,7 +2812,8 @@ def _normalize_items(state: Dict[str, Any], key: str, max_count: int) -> List[Di
 
 
 def _is_active_image(item: Dict[str, Any]) -> bool:
-    return _has_image_meaning(item) and item.get("source_type") != "Ignore / Unused"
+    return (not item.get("asset_source_unavailable") and _has_image_meaning(item)
+            and item.get("source_type") != "Ignore / Unused")
 
 
 def _reconcile_image_target_contract(
@@ -4290,6 +4297,85 @@ def _shot_image_payload_from_snapshot(
     return payload, media
 
 
+def _prompt_image_display_path(reference: Any) -> str:
+    path = _clean_string(reference)
+    if len(path) > 4096 or re.match(r"^(?:data|blob|[A-Za-z][A-Za-z0-9+.-]*://)", path, re.IGNORECASE):
+        return ""
+    return path
+
+
+def _project_unavailable_prompt_images(state: Dict[str, Any], missing: Dict[str, str]) -> None:
+    for row in state["images"]:
+        uid = _image_asset_row_uid(row)
+        if uid not in missing:
+            row.pop("asset_source_unavailable", None)
+            continue
+        row["asset_source_unavailable"] = True
+        path = _prompt_image_display_path(missing[uid] or row.get("asset_last_source_path") or row.get("asset_path"))
+        if path:
+            row["asset_last_source_path"] = path
+
+
+def _restore_external_macro_row_authoring(
+    state: Dict[str, Any], snapshot: Dict[str, Any], shot: Dict[str, Any],
+    *, unavailable: bool = False,
+) -> set[str]:
+    """Recover a legacy absolute-path import row from the exact live Shot."""
+    visible = state["images"]
+    dormant = state["image_asset"]["dormant_asset_rows"]
+
+    def by_source(rows):
+        return {_image_asset_row_uid(row): row for row in rows
+                if row.get("asset_source_kind") == "user" and not row.get("asset_verified")}
+
+    visible_by_uid, dormant_by_uid = by_source(visible), by_source(dormant)
+    old_rows = {**dormant_by_uid, **visible_by_uid}
+    active_uids = set(shot["selected_source_uids"])
+    if not old_rows.keys() - active_uids:
+        return set()
+
+    from griptape_nodes.files.file import File, FileLoadError
+
+    aliases: Dict[str, List[str]] = {}
+    for source in snapshot["ordered_assets"]:
+        uid = source["source_uid"]
+        metadata = source["metadata"]
+        if uid not in active_uids or metadata.get("source_kind") != "user" or metadata.get("verified_asset"):
+            continue
+        reference = snapshot["media_by_source_uid"][uid]
+        if len(reference) > 4096 or not re.match(r"^\{[A-Za-z_][A-Za-z0-9_]*\}[/\\]", reference):
+            continue
+        if uid != "import:" + hashlib.sha256(f"artifact\n{reference}".encode("utf-8")).hexdigest()[:24]:
+            continue
+        try:
+            path = Path(File(reference).resolve())
+            if not path.is_absolute() or "{" in str(path):
+                continue
+            canonical = path.resolve(strict=not unavailable)
+            if not unavailable and not canonical.is_file():
+                continue
+        except (FileLoadError, OSError, ValueError, RuntimeError, KeyError):
+            continue
+        path_uid = "import:" + hashlib.sha256(f"path\n{canonical.as_posix().casefold()}".encode("utf-8")).hexdigest()[:24]
+        if path_uid in old_rows and path_uid not in active_uids:
+            aliases.setdefault(path_uid, []).append(uid)
+
+    restored: set[str] = set()
+    for old_uid, matches in aliases.items():
+        if len(matches) != 1:
+            continue
+        uid = matches[0]
+        old = old_rows[old_uid]
+        current = old_rows.get(uid)
+        if current is None:
+            old["asset_source_uid"] = uid
+        elif old is dormant_by_uid.get(old_uid) and _external_image_authoring_is_blank(current):
+            _copy_prompt_ui_fields(current, old, _EXTERNAL_IMAGE_AUTHORING_FIELDS)
+            _pop_dormant_asset_row(dormant, old_uid)
+            restored.add(uid)
+    return restored
+
+
 def _shot_selection_contract(state: Dict[str, Any]) -> Dict[str, Any]:
     shot = _normalize_shot_selection(state.get("shot"))
     image_asset = (
@@ -4854,6 +4940,16 @@ _PROMPT_EDITABLE_IMAGE_UI_FIELDS = (
     "image_main_type",
 )
 
+_EXTERNAL_IMAGE_AUTHORING_FIELDS = (
+    *_PROMPT_IMAGE_UI_FIELDS, *_PROMPT_EDITABLE_IMAGE_UI_FIELDS, "frame_range_bindings",
+)
+
+
+def _external_image_authoring_is_blank(row: Dict[str, Any]) -> bool:
+    defaults = _normalize_image_item(_default_image_item(1), 1)
+    return all(row[field] == defaults[field] for field in _EXTERNAL_IMAGE_AUTHORING_FIELDS)
+
+
 _PROMPT_MANUAL_IMAGE_UI_FIELDS = (
     "label",
 )
@@ -5038,6 +5134,8 @@ def _merge_prompt_shot_document_revisions(source: Dict[str, str], ui: Dict[str, 
 def _merge_prompt_revision_axes(
     source_state: Dict[str, Any],
     ui_state: Dict[str, Any],
+    *,
+    restored_external_rows: set[str] | None = None,
 ) -> Dict[str, Any]:
     """Merge a newer source snapshot with newer Prompt-authored UI intent.
 
@@ -5079,6 +5177,11 @@ def _merge_prompt_revision_axes(
             continue
         ui_item = ui_images.get(_prompt_revision_image_identity(item, index))
         if not isinstance(ui_item, dict):
+            continue
+        if (restored_external_rows and _image_asset_row_uid(item) in restored_external_rows
+                and _external_image_authoring_is_blank(ui_item)):
+            # This publication recovered the saved row for the same external
+            # file. Its previous blank projection is only a hydration echo.
             continue
         _copy_prompt_ui_fields(item, ui_item, _PROMPT_IMAGE_UI_FIELDS)
         if not _verified_project_image(item):
@@ -11070,6 +11173,7 @@ class HMBPromptLibrary(DataNode):
         picker_source_node: Any = None,
         allow_picker_hydration_pending: bool = False,
         already_normalized: bool = False,
+        show_unavailable_images: bool = False,
     ) -> tuple[Dict[str, Any], List[str], List[str], bool, bool]:
         """Project one graph-owned shot generation onto Prompt state/media."""
 
@@ -11134,8 +11238,25 @@ class HMBPromptLibrary(DataNode):
                     expected_channel_uuid=expected_channel)
             image_targeted = bool(compact_catalog and any(
                 row["shot_uuid"] == current_shot["shot_uuid"] for row in compact_catalog["shots"]))
-            raw_snapshot = (image_target_api(channel_uuid=expected_channel, shot_uuid=current_shot["shot_uuid"])
-                if image_targeted else image_api(expected_channel_uuid=expected_channel))
+            from _hmb_shot_routing import ShotImageUnavailable
+
+            try:
+                raw_snapshot = (image_target_api(channel_uuid=expected_channel, shot_uuid=current_shot["shot_uuid"])
+                    if image_targeted else image_api(expected_channel_uuid=expected_channel))
+            except ShotImageUnavailable as error:
+                if not show_unavailable_images:
+                    raise _ShotRoutingContractError(str(error)) from error
+                restored = _restore_external_macro_row_authoring(normalized, {
+                    "ordered_assets": [{"source_uid": uid, "metadata": {"source_kind": "user"}}
+                                       for uid in error.source_paths if uid.startswith("import:")],
+                    "media_by_source_uid": error.source_paths,
+                }, current_shot, unavailable=True)
+                if restored and getattr(self, "_hmb_ui_syncing", False):
+                    self._hmb_restored_external_rows = restored
+                _project_unavailable_prompt_images(normalized, error.source_paths)
+                if not any(row.get("asset_source_unavailable") for row in normalized["images"]):
+                    raise _ShotRoutingContractError(str(error)) from error
+                return normalized, [], [], True, False
             image_snapshot = _validate_shot_routing_snapshot(
                 raw_snapshot,
                 expected_channel_uuid=expected_channel,
@@ -11202,9 +11323,29 @@ class HMBPromptLibrary(DataNode):
                     image_snapshot, selected_shot
                 )
                 normalized["shot"] = selected_shot
+                restored = _restore_external_macro_row_authoring(normalized, image_snapshot, selected_shot)
+                if restored and getattr(self, "_hmb_ui_syncing", False):
+                    self._hmb_restored_external_rows = restored
+                live_uids = set(selected_shot["selected_source_uids"])
+                registered_imports = {item.get("import_source_uid") for item in payload["verified_assets"]}
+                lost_uids = {_image_asset_row_uid(row) for row in normalized["images"] if row.get("asset_managed")}
+                lost_uids.difference_update(live_uids, registered_imports, {""})
+                known_sources = getattr(image_source_node, "_hmb_prompt_known_image_sources", None)
+                if lost_uids and callable(known_sources):
+                    lost_uids.difference_update(known_sources(lost_uids))
+                    if lost_uids:
+                        if not show_unavailable_images:
+                            raise _ShotRoutingContractError("The Shot has disconnected image sources.")
+                        _project_unavailable_prompt_images(normalized, dict.fromkeys(lost_uids, ""))
+                        return normalized, [], [], True, False
+                _project_unavailable_prompt_images(normalized, {})
                 normalized = _apply_image_asset_payload(
                     normalized, payload, connected=True
                 )
+                for row in normalized["images"]:
+                    last_path = _prompt_image_display_path(image_snapshot["media_by_source_uid"].get(_image_asset_row_uid(row)))
+                    if last_path:
+                        row["asset_last_source_path"] = last_path
                 projected_image_uids = [
                     _clean_string(
                         item.get("asset_source_uid") or item.get("source_uid")
@@ -12769,6 +12910,17 @@ class HMBPromptLibrary(DataNode):
             return
         if guarded_widget_write:
             value = self._hmb_filter_prompt_widget_write(value)
+            before = self._current_state()
+            if any(row.get("asset_source_unavailable") for row in before["images"]):
+                after = _normalize_state(value if isinstance(value, dict) else _parse_state(value))
+                if _prompt_document_key(before["shot"]) == _prompt_document_key(after["shot"]):
+                    removed = {_image_asset_row_uid(row) for row in before["images"] if row.get("asset_source_unavailable")}
+                    removed.difference_update(_image_asset_row_uid(row) for row in after["images"])
+                    sources = getattr(self, "_hmb_connected_source_nodes", {})
+                    source = sources.get(SHOT_ASSET_INPUT_PARAMETER_NAME) or sources.get(IMAGE_ASSET_INPUT_PARAMETER_NAME)
+                    dismiss = getattr(source, "_hmb_dismiss_unavailable_prompt_images", None)
+                    if removed and callable(dismiss):
+                        dismiss(before["shot"]["channel_uuid"], before["shot"]["shot_uuid"], removed)
 
         previous_widget_state = getattr(
             self, "_hmb_last_accepted_widget_state", None
@@ -12947,7 +13099,12 @@ class HMBPromptLibrary(DataNode):
         ui_state = incoming if ui_is_newer else accepted
         if source_advanced_without_ui:
             ui_state = accepted
-        merged = _merge_prompt_revision_axes(source_state, ui_state)
+        restored = (getattr(self, "_hmb_restored_external_rows", None)
+                    if source_is_newer and incoming_ui == accepted_ui
+                    and getattr(self, "_hmb_ui_syncing", False)
+                    and _prompt_document_key(incoming.get("shot")) == _prompt_document_key(accepted.get("shot"))
+                    else None)
+        merged = _merge_prompt_revision_axes(source_state, ui_state, restored_external_rows=restored)
         return merged if isinstance(value, dict) else _json_dumps(merged)
 
     def _accept_widget_state_baseline(self, value: Any) -> None:
@@ -13076,6 +13233,7 @@ class HMBPromptLibrary(DataNode):
             return self._current_state()
         try:
             self._hmb_ui_syncing = True
+            self._hmb_restored_external_rows = set()
             graph_sources_authoritative = (
                 self._reconcile_connected_source_inputs_from_graph()
             )
@@ -13102,7 +13260,15 @@ class HMBPromptLibrary(DataNode):
                     allow_picker_hydration_pending
                 ),
                 already_normalized=True,
+                show_unavailable_images=True,
             )
+            if any(row.get("asset_source_unavailable") for row in state["images"]):
+                self._hmb_current_shot_images = []
+                self._hmb_prompt_shot_views.pop(_prompt_document_key(state["shot"]), None)
+                if state != current_state:
+                    state[SOURCE_SYNC_REVISION_KEY] = min(MAX_SOURCE_SYNC_REVISION, source_sync_revision + 1)
+                    _set_parameter_value(self, WIDGET_PARAMETER_NAME, _json_dumps(state))
+                return state
             picker_route_hydration_pending = bool(
                 getattr(self, "_hmb_picker_route_hydration_pending", False)
             )
@@ -13283,6 +13449,7 @@ class HMBPromptLibrary(DataNode):
             self._hmb_source_input_fingerprints = source_input_fingerprints
             return state
         finally:
+            self._hmb_restored_external_rows = set()
             self._hmb_ui_syncing = False
 
     def _sync_prompt_output_from_state(
@@ -13302,6 +13469,8 @@ class HMBPromptLibrary(DataNode):
         if allow_picker_hydration_pending:
             self._reconcile_shared_shot_edges()
             state = self._write_dashboard_state(allow_picker_hydration_pending=True)
+            if any(row.get("asset_source_unavailable") for row in state["images"]):
+                return state
             if getattr(self, "_hmb_picker_route_hydration_pending", False):
                 # The dashboard can show verified images while Picker restores
                 # its exact catalog. Keep the last atomic output generation
@@ -13450,6 +13619,8 @@ class HMBPromptLibrary(DataNode):
         input (including private intent, clocks, media order and route proof)
         in the key. Source/ownership checks and contexts are never cached.
         """
+        if any(row.get("asset_source_unavailable") for row in state["images"]):
+            raise _ShotRoutingContractError("The Shot has disconnected image sources.")
         owner = getattr(self, "_hmb_execution_registered_owner", self)
         with owner._hmb_sync_lock:
             document = _prompt_document_key(state.get("shot"))

@@ -5,7 +5,9 @@ import hashlib
 import importlib.util
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -211,6 +213,65 @@ class RegistrationIdentityTests(unittest.TestCase):
         self.assert_authored(self.state["images"][0], result["images"][0])
         self.assertEqual(result["text"], self.state["text"])
         self.assertEqual(media, ["media-0", "media-1", "media-2"])
+
+    def test_exact_shot_restores_absolute_import_authoring_after_macro_reconnect(self):
+        from griptape_nodes.files.file import File
+
+        def import_uid(kind, reference):
+            return "import:" + hashlib.sha256(f"{kind}\n{reference}".encode()).hexdigest()[:24]
+
+        with TemporaryDirectory() as directory:
+            path = (Path(directory) / "Dingo.jpg").resolve()
+            path.write_bytes(b"existing imported image")
+            old_uid = import_uid("path", path.as_posix().casefold())
+            old = {**external("Dingo"), "source_uid": old_uid, "order_key": old_uid}
+            reference = "{inputs}/images/Dingo.jpg"
+            new_uid = import_uid("artifact", reference)
+            new = {**old, "source_uid": new_uid, "order_key": new_uid}
+            authored_state = authored([old, self.sources[1]])
+            authored_state["text"]["SCENE_CONTEXT"] = "Keep @image1 in frame."
+            empty_state = apply(authored_state, [new, self.sources[1]])
+            empty_state["text"] = deepcopy(authored_state["text"])
+
+            def reconcile(state, rows, media):
+                uids = [row["source_uid"] for row in rows]
+                shot = {"shot_uuid": "shot", "selected_source_uids": uids}
+                snapshot = {"channel_uuid": "channel", "generation": 2,
+                            "ordered_assets": [{"source_uid": row["source_uid"], "metadata": row} for row in rows],
+                            "media_by_source_uid": dict(zip(uids, media))}
+                with patch.object(File, "resolve", return_value=str(path)):
+                    prompt._restore_external_macro_row_authoring(state, snapshot, shot)
+                routed, _ = prompt._shot_image_payload_from_snapshot(snapshot, shot)
+                return prompt._apply_image_asset_payload(state, routed, connected=True)
+
+            for state in (authored_state, empty_state):
+                result = reconcile(deepcopy(state), [new, self.sources[1]], [reference, "remote"])
+                self.assert_authored(authored_state["images"][0], result["images"][0])
+                self.assertEqual(result["images"][0]["image_main_type"], "Character")
+                self.assertEqual(result["images"][0]["asset_source_uid"], new_uid)
+                self.assertEqual(result["text"], authored_state["text"])
+                self.assertNotIn(old_uid, [row["asset_source_uid"] for row in result["image_asset"]["dormant_asset_rows"]])
+                self.assertEqual(reconcile(deepcopy(result), [new, self.sources[1]], [reference, "remote"]), result)
+
+            merged = prompt._merge_prompt_revision_axes(result, empty_state, restored_external_rows={new_uid})
+            self.assert_authored(authored_state["images"][0], merged["images"][0])
+
+            edited = deepcopy(empty_state)
+            edited["images"][0]["owner"] = "Current target"
+            result = reconcile(edited, [new, self.sources[1]], [reference, "remote"])
+            self.assertEqual(result["images"][0]["owner"], "Current target")
+            merged = prompt._merge_prompt_revision_axes(result, edited, restored_external_rows={new_uid})
+            self.assertEqual(merged["images"][0]["owner"], "Current target")
+
+            forged = {**new, "source_uid": self.sources[2]["source_uid"]}
+            result = reconcile(deepcopy(empty_state), [forged], [reference])
+            self.assertNotEqual(result["images"][0]["owner"], "Authored Target 1")
+
+            alternative = "{project_dir}/inputs/images/Dingo.jpg"
+            alternate_uid = import_uid("artifact", alternative)
+            alternate = {**new, "source_uid": alternate_uid, "order_key": alternate_uid}
+            result = reconcile(deepcopy(empty_state), [new, alternate], [reference, alternative])
+            self.assertTrue(all(row["owner"] != "Authored Target 1" for row in result["images"]))
 
 
 if __name__ == "__main__":

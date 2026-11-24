@@ -238,6 +238,30 @@ try{
   },multiShot);
   assert.equal(await replacementText.inputValue(),'New workspace edit');
  }
+ const externalImage={...row('import:dingo','Dingo'),asset_source_kind:'user',asset_verified:false,
+  asset_last_source_path:'{inputs}/images/Dingo.jpg',color_picks:['Mint']};
+ const connected=[row('project:replacement','Replacement'),externalImage];
+ await page.evaluate(()=>{window.latest.ui.language='ko';});
+ await accepted(connected);
+ const missing=[connected[0],{...externalImage,asset_source_unavailable:true}];
+ const brokenRow=page.locator('.source-row.image.image-source-missing');
+ await accepted(missing);
+ await brokenRow.waitFor();
+ assert.equal(await brokenRow.locator('[data-field="image_main_type"]').inputValue(),'Character');
+ assert.equal(await brokenRow.locator('[data-field="image_sub_type"]').inputValue(),'Full Appearance');
+ assert.equal(await brokenRow.locator('[data-field="owner"]').inputValue(),'Dingo');
+ assert.equal(await brokenRow.locator('[data-field="color_picks"]').inputValue(),'Mint');
+ assert.match(await brokenRow.innerText(),/소스 끊김/);
+ assert.match(await brokenRow.innerText(),/\{inputs\}\/images\/Dingo\.jpg/);
+ assert.equal(await page.locator('[data-group-id="imageSources"] h3 b').textContent(),'1 / 50');
+ await accepted(connected);
+ await brokenRow.waitFor({state:'detached'});
+ assert.equal(await page.locator('[data-group-id="imageSources"] h3 b').textContent(),'2 / 50');
+ await accepted(missing);
+ await brokenRow.locator('.clear-source').click();
+ await waitForLabels(['Replacement']);
+ await page.waitForFunction(()=>!window.latest.images.some(image=>image.asset_source_uid==='import:dingo'));
+ assert.equal(await replacementText.inputValue(),'New workspace edit');
  assert.equal(external,0);assert.deepEqual(failures,[]);
  console.log('HMB Prompt Asset selection lifecycle: PASS (same UUID add/remove/reorder, UID/Main/Sub/Color and five documents repaint; unrelated renumber retains UUID/body; one retained editor; Korean draft/caret and stale-echo guard; external0)');
 }finally{await browser.close();await new Promise(resolve=>server.close(resolve));}

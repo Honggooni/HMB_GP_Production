@@ -11041,8 +11041,44 @@ class HMBImageAssetLibrary(DataNode):
             missing = [uid for uid in requested if uid not in snapshot["media_by_source_uid"]]
             if any(_asset_resolution_cache_key(by_uid[uid], scoped, revision) not in cache for uid in missing):
                 raise _ImageAssetSelectionPreparing("ImageAsset exact Shot media is still preparing.")
-            raise ValueError("ImageAsset exact Shot selected image media is unavailable: " + ", ".join(missing))
+            raise _hmb_shot_routing.ShotImageUnavailable({uid: _clean(by_uid[uid].get("path")) for uid in missing})
+        missing_files = {}
+        for uid in requested:
+            asset = by_uid[uid]
+            reference = snapshot["media_by_source_uid"][uid]
+            if asset.get("source_kind") == "user" and (
+                Path(reference).is_absolute() or reference.lower().startswith("file:")
+                or re.match(r"^\{[A-Za-z_][A-Za-z0-9_]*\}[/\\]", reference)
+            ) and _resolve_import_file_reference(reference) is None:
+                missing_files[uid] = reference
+        if missing_files:
+            raise _hmb_shot_routing.ShotImageUnavailable(missing_files)
         return self._hmb_image_shot_snapshot_view(snapshot, scoped=True)
+
+    def _hmb_prompt_known_image_sources(self, source_uids: set[str]) -> set[str]:
+        return {row["source_uid"] for row in self._current_state()["assets"]
+                if row["source_uid"] in source_uids}
+
+    @hmb_binding_mutation
+    def _hmb_dismiss_unavailable_prompt_images(self, channel_uuid: str, shot_uuid: str, uids: set[str]) -> None:
+        state = self._current_state()
+        routing = state["shot_routing"]
+        selected = next((row for row in routing["shots"] if row["shot_uuid"] == shot_uuid), None)
+        if channel_uuid != routing["channel_uuid"] or selected is None:
+            raise ValueError("The image selection belongs to a different Shot.")
+        remove = uids.intersection(selected["selected_source_uids"])
+        if not remove:
+            return
+        try:
+            self._hmb_shot_routing_snapshot_for(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+        except _hmb_shot_routing.ShotImageUnavailable as error:
+            if remove <= error.source_paths.keys():
+                selected["selected_source_uids"] = [uid for uid in selected["selected_source_uids"] if uid not in remove]
+                selected.update(revision=selected["revision"] + 1, media_count=0, metadata_sha256="", media_sha256="")
+                routing["generation"] += 1
+                self._publish_state(state)
+                return
+        raise ValueError("The image source has recovered. Refresh the Shot before editing its selection.")
 
     def _hmb_shot_routing_catalog(self) -> Dict[str, Any]:
         """Return the bounded, media-free Shot catalog used by same-flow peers."""

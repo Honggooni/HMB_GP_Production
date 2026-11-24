@@ -2160,6 +2160,11 @@ function normalizeImage(item, slot) {
   out.asset_path = clean(item.asset_path);
   out.asset_library_id = clean(item.asset_library_id);
   out.asset_source_uid = clean(item.asset_source_uid || item.source_uid);
+  if (out.asset_source_uid) {
+    const lastPath = clean(item.asset_last_source_path);
+    if (lastPath) out.asset_last_source_path = lastPath.slice(0, 4096);
+    if (item.asset_source_unavailable === true) out.asset_source_unavailable = true;
+  }
   out.asset_project_uid = clean(item.asset_project_uid);
   out.asset_selection_order = Math.max(
     0,
@@ -2394,7 +2399,7 @@ function normalizeDormantVideoRows(value, managed) {
 }
 
 function isActiveImage(item) {
-  return hasImageMeaning(item) && item.source_type !== "Ignore / Unused";
+  return !item.asset_source_unavailable && hasImageMeaning(item) && item.source_type !== "Ignore / Unused";
 }
 
 function isActiveImageForState(item, state) {
@@ -5771,6 +5776,10 @@ function videoNumberOptions(state, current) {
 }
 
 function renderImageActions(item, state, index, imageCount) {
+  if (item.asset_source_unavailable) {
+    const label = escapeHtml(uiText(state, "delete_image_row", "Delete image source row"));
+    return `<div class="source-actions"><button type="button" class="clear-source" title="${label}" aria-label="${label}">×</button></div>`;
+  }
   const pickerActions = hmbImagePickerActionAvailability(state, item);
   const canRemove = pickerActions.canRemove;
   const canAdd = pickerActions.canAdd;
@@ -6336,16 +6345,21 @@ function renderImageRow(item, index, images, state, renderTargetOptions, deferre
     && item.asset_verified
     && clean(item.asset_source_kind).toLowerCase() === "project"
   );
-  const dragEnabled = !orderManaged && images.length > 1;
+  const unavailable = item.asset_source_unavailable === true;
+  const dragEnabled = !unavailable && !orderManaged && images.length > 1;
   const identityTitle = verifiedAsset
     ? "Image Name, Asset ID, Main Type, and @image order are controlled by HMBImageAssetLibrary; Sub Type and Target are editable per-shot choices"
     : (rowManaged
       ? "Generator order is controlled by HMBImageAssetLibrary; Name and Prompt fields remain editable"
       : (item.asset_id ? `Asset ID: ${item.asset_id}` : ""));
   const expandedLeftFields = hmbImageRowHasExpandedLeftFields(item);
-  return `<div class="source-row image ${item.present ? "active" : "next"} ${rowManaged ? "asset-order-managed" : ""} ${verifiedAsset ? "asset-authority-managed" : ""} ${expandedLeftFields ? "image-expanded-left-fields" : ""}" data-kind="image" data-index="${index}" data-source-key="${escapeHtml(hmbPromptSourceIdentity(item, "image"))}">
+  const korean = uiLanguage(state) === "ko";
+  const missingBadge = unavailable ? `<span class="image-source-missing-label"><span class="image-source-missing-icon" aria-hidden="true"></span>${korean ? "소스 끊김" : "Source disconnected"}</span>` : "";
+  const missingPath = unavailable && item.asset_last_source_path
+    ? `<div class="image-source-missing-path" title="${escapeHtml(item.asset_last_source_path)}">${korean ? "마지막 저장 경로" : "Last saved path"} ${escapeHtml(item.asset_last_source_path)}</div>` : "";
+  return `<div class="source-row image ${item.present ? "active" : "next"} ${rowManaged ? "asset-order-managed" : ""} ${verifiedAsset ? "asset-authority-managed" : ""} ${expandedLeftFields ? "image-expanded-left-fields" : ""} ${unavailable ? "image-source-missing" : ""}" data-kind="image" data-index="${index}" data-source-key="${escapeHtml(hmbPromptSourceIdentity(item, "image"))}">
     <div class="source-num image-index-cell image-drag-handle nodrag" data-image-drag-handle draggable="${dragEnabled ? "true" : "false"}" role="button" tabindex="${dragEnabled ? "0" : "-1"}" aria-label="${escapeHtml(dragEnabled ? uiText(state, "drag_image_row", "Drag or use arrow keys to reorder image source") : (orderManaged ? "Order is controlled by HMBImageAssetLibrary" : ""))}" title="${escapeHtml(dragEnabled ? uiText(state, "drag_image_row", "Drag to reorder image source") : (orderManaged ? "Order is controlled by HMBImageAssetLibrary" : ""))}">${String(item.slot).padStart(2, "0")}</div>
-    <div class="source-label image-name-cell"><input class="source-label-input" data-field="label" maxlength="${MAX_IDENTIFIER_CHARS}" value="${escapeHtml(item.label)}" placeholder="${escapeHtml(uiText(state, "name", "Name"))}" title="${escapeHtml(identityTitle)}" ${verifiedAsset ? "readonly" : ""}/></div>
+    <div class="source-label image-name-cell"><input class="source-label-input" data-field="label" maxlength="${MAX_IDENTIFIER_CHARS}" value="${escapeHtml(item.label)}" placeholder="${escapeHtml(uiText(state, "name", "Name"))}" title="${escapeHtml(identityTitle)}" ${verifiedAsset ? "readonly" : ""}/>${missingBadge}</div>
     <div class="source-role image-main-type-cell"><select class="source-select" data-field="image_main_type" ${verifiedAsset ? "disabled" : ""}>${options(sourceTypeChoices, item.image_main_type, "", state)}</select></div>
     <div class="source-role binding-scope-cell">${renderSubtypeControls(item, state)}</div>
     <div class="source-role image-target-cell">${renderImageTargetControls(item, renderTargetOptions, state, deferredTargets)}</div>
@@ -6353,6 +6367,7 @@ function renderImageRow(item, index, images, state, renderTargetOptions, deferre
     <div class="source-status image-actions-cell">${renderImageActions(item, state, index, images.length)}</div>
     ${renderFrameRangeRow(item, index, state)}
     ${renderImageCustomPanel(item, state)}
+    ${missingPath}
   </div>`;
 }
 
@@ -6900,6 +6915,13 @@ function render(state, includeStyle = true) {
     .hmb-dashboard .vtext{border-color:var(--hmb-line-strong)}.hmb-dashboard .vtext h3{color:var(--hmb-group-vfx)}
     .hmb-dashboard .source-actions button:hover{border-color:var(--hmb-focus);color:var(--hmb-text);box-shadow:0 0 12px var(--hmb-glow)}
     .hmb-dashboard .source-actions button.clear-source:hover{border-color:var(--hmb-selection);color:var(--hmb-text)}
+    .hmb-dashboard .source-row.image.image-source-missing{background:rgba(118,27,42,.23);border-radius:7px;outline:1px solid #d85468;outline-offset:-1px}
+    .hmb-dashboard .image-source-missing-label{display:inline-flex;align-items:center;gap:4px;margin-top:4px;padding:2px 5px;border-radius:4px;background:#86273a;color:#ffe2e7;font-size:10px;font-weight:750}
+    .hmb-dashboard .image-source-missing-icon{display:inline-flex;gap:2px;transform:rotate(-38deg)}
+    .hmb-dashboard .image-source-missing-icon::before,.hmb-dashboard .image-source-missing-icon::after{content:"";width:5px;height:4px;border:1px solid currentColor;border-radius:4px}
+    .hmb-dashboard .image-source-missing-icon::before{border-right-color:transparent}
+    .hmb-dashboard .image-source-missing-icon::after{border-left-color:transparent}
+    .hmb-dashboard .image-source-missing-path{grid-column:2 / -1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f1a8b3;font-size:10px}
     .hmb-dashboard .warning{color:var(--hmb-status-warning);background:rgba(120,53,15,.1);border-color:rgba(251,191,36,.22)}
     .hmb-dashboard .title-mark{border-color:var(--hmb-shot-line);background:rgba(var(--hmb-shot-rgb),.12);color:var(--hmb-shot-accent);box-shadow:inset 0 0 0 1px rgba(255,255,255,.025),0 0 13px var(--hmb-glow)}
     /* Shared HMB header typography and Shot selector sizing. */
@@ -9230,7 +9252,7 @@ function hmbNativeUiImplementation(container, props) {
         if (target[index]) {
           if (kind === "image") {
             if (
-              target[index].asset_managed
+              !target[index].asset_source_unavailable && target[index].asset_managed
               && state?.image_asset?.enabled
               && state?.image_asset?.order_managed
             ) return;
