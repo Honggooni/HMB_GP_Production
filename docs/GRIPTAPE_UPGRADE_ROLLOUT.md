@@ -23,6 +23,16 @@ Windows 시작 메뉴의 **HMB Griptape Local**이 전용 실행 주소 `%LOCALA
 
 릴리스 보고서에는 등록된 HMB 노드 수와 실제로 실행한 연결 경로를 각각 기록한다. 연결 오류를 수정하면 재현한 입력, 기존 샷 선택, 반복 실행, 다음 노드가 받은 결과를 해당 경로의 필수 회귀 검사에 포함한다. 예를 들어 ImageAsset 검사는 합성 JPEG를 Standard LoadImage로 열고 기존 프로젝트 이미지와 함께 HMBPrompt에 전달된 순서를 확인한다. 사용한 SDK와 Standard 버전, 실제 Desktop 화면에서 확인한 범위, 미실행 항목을 함께 남긴다.
 
+### Team 태그 게시 전 검사
+
+후보 커밋을 `main`에 푸시한 뒤, 같은 커밋의 Windows 배포 검사가 끝나면 아래 도구로 새 Team 태그를 올린다. 도구는 GitHub에서 해당 커밋의 브라우저·Python 회귀 검사, ZIP 검사, Team/Local 일치 검사 성공을 확인한다. 이미 원격에 있는 태그는 보존한다.
+
+```powershell
+python tools/publish_team_tag.py <Team버전> --push
+```
+
+게시가 끝나면 GitHub ZIP과 SHA-256을 실제로 내려받아 일치하는지 확인하고, 설치에 사용한 Local ZIP과 기능 구성의 일치도 확인한다.
+
 별도 워크트리에서 배포할 때는 Team 게시물과 Local 설치 검증이 끝난 뒤 개발 PC의 배포 완료 절차에서 다음 명령을 실행한다. 팀원 PC의 일반 설치 절차는 이 명령을 사용하지 않는다.
 
 ```powershell
