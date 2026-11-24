@@ -5,6 +5,7 @@ import asyncio
 from copy import deepcopy
 import importlib.util
 import io
+import os
 from pathlib import Path
 import socket
 import sys
@@ -16,7 +17,7 @@ from unittest import mock
 from uuid import uuid4
 import urllib.error
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("HMB_MODE_TEST_LIBRARY_ROOT", Path(__file__).resolve().parents[2])).resolve()
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _hmb_seedance_clean_ci_stubs import install_clean_ci_griptape_stubs

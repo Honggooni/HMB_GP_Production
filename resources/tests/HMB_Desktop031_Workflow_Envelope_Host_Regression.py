@@ -21,6 +21,22 @@ async def draft_final(engine, owner, other):
     import HMB_Seedance_Draft_Shot_Regression as fixture
     from _hmb_workflow_migration import _engine_has_running_flow
 
+    assert Path(fixture.t.__file__).resolve() == ROOT / "HMBSeedanceGeneration.py"
+    with engine.bind_workflow(other), ExitStack() as normal:
+        shot = fixture.Node(shot=True)
+        normal.callback(shot.base.cleanup)
+        engine.object_manager.add_object_by_name_in(other, shot.name, shot)
+        project = {"schema": fixture.t.PROJECT_SELECTION_SCHEMA, "project": fixture.PROJECT}
+        origin = shot._capture_generated_video_origin()
+        normal.enter_context(patch.object(shot, "_capture_imageasset_project_selection", return_value=project))
+        normal.enter_context(patch.object(shot, "_resolve_exact_shot_generation_inputs", side_effect=lambda values: {
+            **values, **fixture.PROJECT, "_hmb_imageasset_project_selection": project, "_hmb_generation_origin": origin}))
+        normal.enter_context(fixture.run_boundaries(shot))
+        await shot._process_generation_impl()
+        assert len(shot.bridge.posts) == 1 and shot.saved, shot._set_status_results.call_args_list
+        assert shot.bridge.posts[0]["project_id"] == fixture.PROJECT["project_id"]
+        assert "draft_job_id" not in shot.bridge.posts[0] and not shot.bridge.posts[0].get("draft")
+
     with engine.bind_workflow(owner), ExitStack() as boundaries:
         boundaries.enter_context(patch.object(fixture.t._broker_config, "load_broker_base_url", return_value=fixture.base.ORIGIN))
         node = fixture.Node()
@@ -231,7 +247,7 @@ async def exercise(engine, patches):
         assert not deletion.succeeded() and "HMB_DELETE_CONNECTED" in str(deletion.result_details)
     assert engine.node_manager.get_node_by_name_in(engine.open_workflows.get(a), generator.name) is generator
     print(json.dumps({"created_nodes": list(nodes), "executed_offline": list(run_names),
-                      "same_names_isolated": True, "offline_draft_final_posts": 1,
+                      "same_names_isolated": True, "offline_draft_final_posts": 1, "offline_bound_shot_posts": 1,
                       "native_model_choices": list(native._model_access.model_choices),
                       "native_model_provider": native.get_parameter_value("model_provider"),
                       "native_model": native.get_parameter_value("model"), "external_calls": 0}))
