@@ -2313,8 +2313,10 @@ def _site_digest(*parts: str) -> str:
 def _site_view_row(row: dict, project_id: str, project_uid: str, site: str) -> dict:
     relative = row["relative_path"]
     library_id = _asset_library_id(_site_project_key(project_id, site), relative)
+    registration_path = row.get("registration_relative_path")
     return {**row, "asset_library_id": library_id, "source_uid": f"project:{library_id}",
-            "asset_project_uid": project_uid, "relative_path": f"site:{site}/{relative}"}
+            "asset_project_uid": project_uid, "relative_path": f"site:{site}/{relative}",
+            "registration_relative_path": f"site:{site}/{registration_path}" if registration_path else ""}
 
 
 def _is_user_import_relative_path(value: Any) -> bool:
@@ -3591,7 +3593,7 @@ def _manifest_at_current_paths(records, root, folders, paths):
     return {moves.get(key, key): record for key, record in records.items()}
 
 
-def _restore_manifest_registration(asset, relative, overrides, stems):
+def _restore_manifest_registration(asset, root, relative, overrides, stems):
     override = overrides.get(relative.as_posix().casefold())
     values = override or {}
     asset.pop("registration_default_name", None)
@@ -3601,11 +3603,49 @@ def _restore_manifest_registration(asset, relative, overrides, stems):
     )
     asset["image_name"] = _clean(values.get("image_name") or values.get("name")) or relative.stem
     asset["registered"] = override is not None
+    asset["registration_relative_path"] = _manifest_asset_relative_path(root, values)
     # Reconstructed cache rows follow the same registry defaults as a cold
     # scan. The subsequent per-workflow merge owns explicit local selections.
     asset["selected"] = override is not None and bool(values.get("selected"))
     asset["selection_order"] = _non_negative_int(values.get("selection_order"))
     asset["import_source_uid"] = _clean(values.get("import_source_uid"))
+
+
+def _read_selection_registrations(root, selected):
+    """Verify the selected registrations without joining the full image catalog scan."""
+    settings = get_site_settings(root)
+    selected_sites = {}
+    for row in selected:
+        if row.get("source_kind") == "project" and row.get("registered"):
+            site, relative = _site_location(row.get("relative_path"))
+            selected_sites.setdefault(site, set()).add(relative.casefold())
+    records = {}
+    for site, wanted in selected_sites.items():
+        try:
+            physical = _site_root(root, settings, site)
+            entries = _read_asset_manifest(physical)
+            missing = wanted - entries.keys()
+            for key in wanted & entries.keys():
+                origin = _manifest_asset_relative_path(physical, entries[key])
+                if origin and not (physical / origin).is_file():
+                    missing.add(key)
+            current_paths = {}
+            if missing:
+                folders, paths, _ = _catalog_file_inventory(physical)
+                entries = _manifest_at_current_paths(entries, physical, folders, paths)
+                current_paths = {path.relative_to(physical).as_posix().casefold():
+                                 path.relative_to(physical).as_posix() for path in paths}
+        except (OSError, ValueError):
+            continue
+        prefix = "" if site == "hq" else f"site:{site}/"
+        for relative, record in entries.items():
+            origin = _manifest_asset_relative_path(physical, record).casefold()
+            if relative in wanted or origin in missing:
+                direct = {key: value for key, value in record.items() if key != "_selected_move_path"}
+                records[prefix + relative] = direct
+                if origin in missing and origin != relative and relative in current_paths:
+                    records[prefix + origin] = {**direct, "_selected_move_path": prefix + current_paths[relative]}
+    return records
 
 
 def _manifest_for_selection(root, selected, *, catalog_root=None, wait_for_catalog=False):
@@ -3632,43 +3672,64 @@ def _manifest_for_selection(root, selected, *, catalog_root=None, wait_for_catal
                 return {}
             if not wait_for_catalog:
                 raise _ImageAssetSelectionPreparing("ImageAsset project registrations are still preparing.")
-            # Only the worker may join (or start) this roster member's single
-            # session read. Neither a saved row nor an offline index grants access.
-            facts = _read_verified_image_catalog(catalog, project, {})
+            # The selection worker can verify the approved root's registries
+            # while another thread hydrates the browse catalog. The latter may
+            # be opening image headers for hundreds of unrelated files.
+            return _read_selection_registrations(Path(project["path"]), selected)
         except TimeoutError as exc:
             raise _ImageAssetSelectionPreparing("ImageAsset project registrations are still preparing.") from exc
     else:
-        settings = get_site_settings(root)
-        if settings.get("links"):
-            # No session catalog yet: verify against the designated registries
-            # rather than accepting saved workflow rows as registration proof.
-            records = {}
-            selected_sites = {}
-            for row in selected:
-                if row.get("source_kind") == "project" and row.get("registered"):
-                    site, relative = _site_location(row.get("relative_path"))
-                    selected_sites.setdefault(site, set()).add(relative.casefold())
-            for site, wanted in selected_sites.items():
-                try:
-                    physical = _site_root(root, settings, site)
-                    entries = _read_asset_manifest(physical)
-                    if not wanted.issubset(entries):
-                        folders, paths, _ = _catalog_file_inventory(physical)
-                        entries = _manifest_at_current_paths(entries, physical, folders, paths)
-                except (OSError, ValueError):
-                    continue
-                prefix = "" if site == "hq" else f"site:{site}/"
-                records.update({prefix + rel: value for rel, value in entries.items() if rel in wanted})
-            return records
-        records = _read_asset_manifest(root)
-        if any(row.get("registered") and row.get("source_kind") == "project"
-               and _clean(row.get("relative_path")).casefold() not in records for row in selected):
-            folders, paths, _ = _catalog_file_inventory(root)
-            return _manifest_at_current_paths(records, root, folders, paths)
-        return records
+        return _read_selection_registrations(root, selected)
     requested = {_clean(row.get("relative_path")).casefold() for row in selected}
-    return {row["relative_path"].casefold(): row for row in facts["assets"]
-            if row.get("registered") and row.get("connected", True) and row["relative_path"].casefold() in requested}
+    records = {}
+    for row in facts["assets"]:
+        if not row.get("registered") or not row.get("connected", True):
+            continue
+        relative = row["relative_path"].casefold()
+        origin = _clean(row.get("registration_relative_path")).casefold()
+        if relative in requested or origin in requested:
+            records[relative] = row
+        if origin in requested and origin != relative:
+            records[origin] = {**row, "_selected_move_path": row["relative_path"]}
+    return records
+
+
+def _verify_moved_selection(asset, state, records):
+    # Preserve the exact saved Shot slot while the browse scan catches up.
+    old_path = _clean(asset.get("relative_path"))
+    moved_path = _clean(records.get(old_path.casefold(), {}).get("_selected_move_path"))
+    if not moved_path:
+        return asset, ""
+    site, old_relative = _site_location(old_path)
+    new_site, new_relative = _site_location(moved_path)
+    project = _site_project_key(state["project_id"], site)
+    if new_site != site or asset.get("asset_library_id") != _asset_library_id(project, old_relative):
+        return asset, ""
+    root = Path(state["project_root"])
+    try:
+        physical = _site_root(root, get_site_settings(root), site)
+        previous = _resolve_image_path(physical / old_relative)
+        if _resolve_image_path(Path(asset["path"])) != previous or previous.is_file():
+            return asset, ""
+    except (OSError, ValueError):
+        return asset, ""
+    current = {**asset, "relative_path": moved_path, "path": str(physical / new_relative),
+               "asset_library_id": _asset_library_id(project, new_relative)}
+    verified = _verified_project_relative_path(current, state, records)
+    return (current, verified) if verified else (asset, "")
+
+
+def _revalidate_saved_registration(asset, state, records):
+    """Read current registry metadata for the exact file in an older save."""
+    relative = _clean(asset.get("relative_path"))
+    record = records.get(relative.casefold())
+    if record is None or record.get("_selected_move_path"):
+        return asset, ""
+    current = {**asset, **_normalize_image_taxonomy_fields(record)}
+    current["asset_id"] = _clean(record.get("asset_id")) or asset["asset_id"]
+    current["image_name"] = _clean(record.get("image_name") or record.get("name")) or asset["image_name"]
+    verified = _verified_project_relative_path(current, state, records)
+    return (current, verified) if verified and verified.casefold() == relative.casefold() else (asset, "")
 
 
 def _suggest_registration_names(assets, *, writer="hq", manifest_records=()):
@@ -3826,6 +3887,7 @@ def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | N
                 "media_signature": media_signature,
                 "catalog_file_stamp": file_stamp,
                 "relative_path": relative_text,
+                "registration_relative_path": _manifest_asset_relative_path(root, override_values),
                 "extension": path.suffix.casefold(),
                 "width": width,
                 "height": height,
@@ -3919,6 +3981,8 @@ def _normalize_asset(raw: Any) -> Dict[str, Any] | None:
         "media_signature": _clean(raw.get("media_signature"))[:64],
         "catalog_file_stamp": _clean(raw.get("catalog_file_stamp"))[:64],
         "relative_path": _clean(raw.get("relative_path")).replace("\\", "/"),
+        **({"registration_relative_path": _clean(raw["registration_relative_path"])[:4096]}
+           if registered and raw.get("registration_relative_path") else {}),
         "extension": _clean(raw.get("extension")).casefold(),
         "width": width,
         "height": height,
@@ -5046,6 +5110,7 @@ def _merge_scan_with_state(
             "scan_revision": int(previous_state.get("scan_revision") or 0) + 1,
         }
     )
+    _restore_catalog_relocations(state, previous_state, same_project)
     _restore_site_selection(state, previous_state, same_project)
     return _normalize_state(state)
 
@@ -5074,6 +5139,32 @@ _ASYNC_SCAN_LIVE_STATE_FIELDS = (
     "asset_registration_result",
     "disconnect_import_uid",
 )
+
+
+def _restore_catalog_relocations(state, previous, same_project):
+    """Carry Shot membership across moves already proven by the registration scan."""
+    if not same_project:
+        return
+    previous_rows = [row for row in previous.get("assets", []) if isinstance(row, dict)]
+    old_by_path = {_clean(row.get("relative_path")).casefold(): row for row in previous_rows
+                   if row.get("registered") and row.get("relative_path")}
+    current_paths = {row["relative_path"].casefold() for row in state["assets"] if row.get("relative_path")}
+    previous_uids = {_clean(row.get("source_uid")) for row in previous_rows}
+    origins = Counter(row["registration_relative_path"].casefold() for row in state["assets"]
+                      if row.get("registered") and row.get("registration_relative_path"))
+    for asset in state["assets"]:
+        origin = _clean(asset.get("registration_relative_path")).casefold()
+        old = old_by_path.get(origin)
+        old_uid = _clean(old.get("source_uid")) if old else ""
+        old_asset_id = _clean(old.get("asset_id")).casefold() if old else ""
+        if (not old_uid or not old_asset_id or origin in current_paths or origins[origin] != 1
+                or not asset.get("registered") or asset.get("connected") is False
+                or old_asset_id != _clean(asset.get("asset_id")).casefold()):
+            continue
+        if asset["source_uid"] not in previous_uids or old.get("selected"):
+            asset["selected"] = bool(old.get("selected"))
+            asset["selection_order"] = _non_negative_int(old.get("selection_order"))
+        _remap_shot_routing_source_uid(state, old_uid, asset["source_uid"])
 
 _ASYNC_SCAN_USER_ASSET_FIELDS = (
     "asset_id",
@@ -5195,8 +5286,9 @@ def _merge_async_scan_result_with_live_state(
         and _non_negative_int(asset.get("import_index")) > 0
     )
     merged["assets"] = assets
-    _restore_site_selection(merged, live, bool(scanned.get("project_cache_uid"))
-                            and scanned["project_cache_uid"] == live.get("project_cache_uid"))
+    same_project = bool(scanned.get("project_cache_uid")) and scanned["project_cache_uid"] == live.get("project_cache_uid")
+    _restore_catalog_relocations(merged, live, same_project)
+    _restore_site_selection(merged, live, same_project)
     merged["scan_revision"] = max(
         _non_negative_int(scanned.get("scan_revision")),
         _non_negative_int(live.get("scan_revision")),
@@ -5455,7 +5547,7 @@ def _rebind_shared_catalog_snapshot(
                 return None
             asset["path"] = str(rebound).replace("\\", "/")
             asset["asset_project_uid"] = project_uid
-            _restore_manifest_registration(asset, relative, overrides, stems)
+            _restore_manifest_registration(asset, root, relative, overrides, stems)
             if not _thumbnail_url_is_live(
                 asset.get("media_signature"), asset.get("thumbnail_url")
             ):
@@ -6007,6 +6099,9 @@ def _read_local_catalog_snapshot(project_root: Any, previous_state: Dict[str, An
                 return None
             asset["path"] = (row_root / relative).as_posix()
             asset["thumbnail_url"] = ""
+            # An offline index can paint existing choices. Only the current
+            # registration scan may authorize a saved selection's relocation.
+            asset.pop("registration_relative_path", None)
         merged = _merge_scan_with_state(raw, previous_state)
         merged["scan_revision"] = _non_negative_int(previous_state.get("scan_revision"))
         return merged
@@ -6198,7 +6293,7 @@ def _read_catalog_index(
             if resolved_asset not in verified_paths:
                 return None
             asset["path"] = str(resolved_asset).replace("\\", "/")
-            _restore_manifest_registration(asset, relative, overrides, stems)
+            _restore_manifest_registration(asset, resolved_root, relative, overrides, stems)
             asset["thumbnail_url"] = ""
         if {Path(asset["path"]) for asset in assets} != verified_paths:
             return None
@@ -8328,6 +8423,7 @@ def _resolve_selected_assets(
             relative_path = ""
             media_value = ""
             reason = ""
+            verified_asset = asset
             if source_kind == "project":
                 if not manifest_loaded:
                     manifest_loaded = True
@@ -8350,8 +8446,12 @@ def _resolve_selected_assets(
                         manifest_records = {}
                 if manifest_records:
                     relative_path = _verified_project_relative_path(asset, normalized, manifest_records)
+                    if not relative_path and wait_for_catalog:
+                        verified_asset, relative_path = _revalidate_saved_registration(asset, normalized, manifest_records)
+                    if not relative_path:
+                        verified_asset, relative_path = _verify_moved_selection(asset, normalized, manifest_records)
                 if relative_path:
-                    media_value = _resolved_media_value(asset.get("path"))
+                    media_value = _resolved_media_value(verified_asset.get("path"))
                 else:
                     reason = "project_catalog_preparing" if manifest_pending else "project_asset_verification_failed"
             else:
@@ -8364,6 +8464,7 @@ def _resolve_selected_assets(
                 "relative_path": relative_path,
                 "media": media_value,
                 "reason": reason,
+                "asset": verified_asset if verified_asset is not asset else None,
                 # Only a manifest-backed registration may carry an identity
                 # handover. A frontend-edited alias cannot claim a Prompt row.
                 "import_source_uid": _clean(
@@ -8387,7 +8488,7 @@ def _resolve_selected_assets(
             continue
         resolved.append(
             {
-                "asset": asset,
+                "asset": cached.get("asset") or asset,
                 "media": media_value,
                 "source_uid": source_uid,
                 "requested_selection_order": requested_order,

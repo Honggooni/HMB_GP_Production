@@ -79,6 +79,22 @@ with tempfile.TemporaryDirectory() as temporary:
     assert data_uri.startswith("data:audio/wav;base64,")
     assert base64.b64decode(data_uri.split(",", 1)[1], validate=True) == media
 
+    # A saved filename can have the wrong extension without invalidating the image.
+    mislabeled = folder / "saved.jpg"
+    Image.new("RGB", (64, 48)).save(mislabeled, format="PNG")
+    original = mislabeled.read_bytes()
+    generator = seedance.HMBSeedanceGeneration
+    assert generator._read_image_for_cloud_upload(str(mislabeled)) == (original, "image/png", "saved.png")
+    prepared = generator._prepare_media_reference("image", str(mislabeled))
+    assert prepared.startswith("data:image/png;base64,")
+    assert base64.b64decode(prepared.partition(",")[2], validate=True) == original == mislabeled.read_bytes()
+    try:
+        generator._prepare_media_reference("image", prepared.replace("image/png", "image/jpeg", 1))
+    except ValueError as exc:
+        assert "different from its declared MIME type" in str(exc)
+    else:
+        raise AssertionError("A mismatched data URI must still be rejected")
+
     # Two individually valid images exceed the request envelope together. The
     # projection rejects them from stat data before either file is read/Base64'd.
     image_a = folder / "large-a.png"

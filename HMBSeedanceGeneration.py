@@ -12554,7 +12554,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         kind: str,
         value: Any,
     ) -> int:
-        """Project the exact JSON string size before loading local media bytes."""
+        """Bound the JSON string size before loading local media bytes."""
 
         reference = cls._coerce_reference_value(value)
         text = str(reference).strip()
@@ -12627,7 +12627,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 f"{limit_mb} MB: {path.name}"
             )
         base64_size = 4 * ((size + 2) // 3)
-        return len(f"data:{mime};base64,".encode("ascii")) + base64_size + 2
+        mime_size = max(map(len, ALLOWED_IMAGE_MIMES)) if kind == "image" else len(mime)
+        return len("data:;base64,") + mime_size + base64_size + 2
 
     @classmethod
     def _preflight_broker_media_size(
@@ -12736,7 +12737,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
         try:
             if kind == "image":
-                cls._validate_image_content(path.read_bytes(), mime, media_name=path.name)
+                content, actual_mime, _ = cls._read_validated_local_image(path, mime)
+                return f"data:{actual_mime};base64,{base64.b64encode(content).decode('ascii')}"
             return cls._encode_local_media_data_uri(path, mime)
         except OSError as exc:
             raise ValueError(
@@ -13048,12 +13050,23 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 f"{MAX_IMAGE_BYTES // (1024 * 1024)} MB: {path.name}"
             )
         try:
-            content = path.read_bytes()
-            cls._validate_image_content(content, mime, media_name=path.name,
-                                        reference_ordinal=reference_ordinal)
-            return content, mime, path.name
+            return cls._read_validated_local_image(path, mime, reference_ordinal)
         except OSError as exc:
             raise ValueError(f"Image reference cannot be read: {path}") from exc
+
+    @staticmethod
+    def _read_validated_local_image(path: Path, suffix_mime: str, reference_ordinal: int = 1) -> tuple[bytes, str, str]:
+        # Older saved workflows can reference PNG bytes in a JPEG-named file.
+        # Keep the original path and make only the outgoing name/MIME match.
+        with path.open("rb") as stream:
+            content = stream.read(MAX_IMAGE_BYTES)
+        mime = inspect_seedance_image_payload(
+            content, media_name=path.name, reference_ordinal=reference_ordinal,
+        )["mime_type"]
+        if mime == suffix_mime:
+            return content, mime, path.name
+        suffix = next(suffix for suffix, candidate in IMAGE_MIME_BY_SUFFIX.items() if candidate == mime)
+        return content, mime, path.with_suffix(suffix).name
 
     def _upload_image_to_griptape_cloud(
         self,

@@ -692,14 +692,36 @@ try:
         raise AssertionError("The locked manifest writer must reject existing paths.")
     assert manifest_path.read_bytes() == manifest_before_registered_edit
     # Another workstation starts after the team reorganizes files into episodes.
+    stale_registration = deepcopy(registered_state)
+    for row in stale_registration["assets"]:
+        row["selected"] = row["asset_id"] == existing["asset_id"]
+        if row["selected"]:
+            row.update(asset_id="HistoricalId", image_name="Historical name", selection_order=1)
+    revalidated = asset_library._resolve_selected_assets(stale_registration, wait_for_catalog=True)
+    assert not revalidated["unresolved"]
+    assert revalidated["resolved"][0]["asset"]["asset_id"] == existing["asset_id"]
+    assert Path(revalidated["resolved"][0]["media"]) == existing_path
     moved = existing_path.parent / "e202" / existing_path.name
     moved.parent.mkdir()
     existing_path.rename(moved)
     restarted = load_module()
+    saved = deepcopy(registered_state)
+    saved_existing = next(row for row in saved["assets"] if row["asset_id"] == existing["asset_id"])
+    for row in saved["assets"]:
+        row["selected"] = row is saved_existing
+        row["selection_order"] = int(row["selected"])
+    saved["shot_routing"]["shots"][0]["selected_source_uids"] = [saved_existing["source_uid"]]
+    before_browse = restarted._resolve_selected_assets(saved, wait_for_catalog=True)
+    assert not before_browse["unresolved"], before_browse["unresolved"]
+    assert Path(before_browse["resolved"][0]["media"]) == moved
+    assert before_browse["resolved"][0]["source_uid"] == saved_existing["source_uid"]
     data = restarted._load_project_catalog(catalog_root, registered_state)
     restored = next(a for a in data["assets"] if a["relative_path"] == moved.relative_to(project_root).as_posix())
     assert restored["registered"] and restored["asset_id"] == existing["asset_id"]
     assert restarted._verified_project_relative_path(restored, data) == restored["relative_path"]
+    merged = restarted._merge_scan_with_state(data, saved)
+    assert merged["shot_routing"]["shots"][0]["selected_source_uids"] == [restored["source_uid"]]
+    assert manifest_path.read_bytes() == manifest_before_registered_edit
     review = asset_library._audit_project_manifest_refresh(project_root)
     assert not review["error"] and existing["relative_path"] not in review["missing_paths"]
     assert restored["relative_path"] not in review["unregistered_paths"]
@@ -716,6 +738,7 @@ try:
     duplicate.write_bytes(PNG_1X1)
     ambiguous = asset_library._scan_project_assets(project_root)
     assert not any(a["registered"] for a in ambiguous["assets"] if a["path"] in (moved.as_posix(), duplicate.as_posix()))
+    assert asset_library._resolve_selected_assets(saved, wait_for_catalog=True)["unresolved"]
     assert existing["relative_path"] not in asset_library._audit_project_manifest_refresh(project_root)["missing_paths"]
 
     # Two workstation sessions can keep editing their own catalogs while
