@@ -5,9 +5,14 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import {createRequire} from 'node:module';
-import * as api from '../../widgets/HMBImageAssetLibraryWidget.js';
+import {pathToFileURL} from 'node:url';
 
 const require=createRequire(import.meta.url);
+const libraryRoot=process.env.HMB_IMAGE_ASSET_TEST_ROOT
+  ? pathToFileURL(path.resolve(process.env.HMB_IMAGE_ASSET_TEST_ROOT)+path.sep)
+  : new URL('../../',import.meta.url);
+const widgetPath=new URL('widgets/HMBImageAssetLibraryWidget.js',libraryRoot);
+const api=await import(widgetPath);
 let playwright;try{playwright=require('playwright');}catch{playwright=require(path.join(os.homedir(),'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'));}
 const pixel='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j14sAAAAASUVORK5CYII=';
 const state=api.hmbNormalizeImageAssetState({language:'en',edit_transport_schema:'hmb-image-asset-edit-v1',
@@ -18,8 +23,8 @@ const state=api.hmbNormalizeImageAssetState({language:'en',edit_transport_schema
     image_name:`${i%7===0?'캐릭터':'Background'} ${i}`,relative_path:`${i%2?'CH':'BG'}/image-${i}.png`,
     image_main_type:i%2?'Character':'Background',image_sub_type:'Hero',thumbnail_url:pixel,media_signature:`media-${i}`,
     selected:i===1||i===87,selection_order:i===1?1:i===87?2:0}))});
-const widget=fs.readFileSync(new URL('../../widgets/HMBImageAssetLibraryWidget.js',import.meta.url));
-const bridge=fs.readFileSync(new URL('../../widgets/HMBImageAssetThumbnailPatchBridgeWidget.js',import.meta.url));
+const widget=fs.readFileSync(widgetPath);
+const bridge=fs.readFileSync(new URL('widgets/HMBImageAssetThumbnailPatchBridgeWidget.js',libraryRoot));
 const html=`<!doctype html><meta charset="utf-8"><style>body{margin:0;background:#101018}.react-flow__node{width:1220px;height:1020px}#widget{height:1000px}</style><div class="react-flow__node" data-id="fixture"><div id="bridge"></div><div id="widget"></div></div>
 <script type="module">
 import mount,* as api from '/widget.js';import bridgeMount from '/bridge.js';
@@ -192,6 +197,61 @@ try{
     assert.equal(await page.evaluate(()=>window.root.__hmbImageAssetLatestState.project_uid),'next-project',`${mode} new project resumes page mode`);
     await page.evaluate(()=>{window.wc.cleanup();window.bc.cleanup();});
   }
+  for (const writer of ['hq', 'site-' + 'a'.repeat(32)]) {
+    const client = await browser.newPage({viewport:{width:1280,height:1080}});
+    client.on('pageerror', error => errors.push(error.message));
+    await client.route('**/*', route => new URL(route.request().url()).hostname === '127.0.0.1' ? route.continue() : route.abort());
+    await client.goto(`http://127.0.0.1:${server.address().port}`);
+    await client.waitForFunction(() => window.ready);
+    const vendor = writer !== 'hq';
+    const prefix = vendor ? `site:${writer}/` : '';
+    const folders = ['BG', 'BG/e201', 'BG/e202', 'BG/e202/Tone', 'BG_lighting', 'CH', 'user_imports'].map(folder => prefix + folder);
+    folders.push(vendor ? 'HQOnly' : `site:${'site-' + 'a'.repeat(32)}/VendorOnly`);
+    const row = {...state.assets[95], asset_library_id:'dingo', source_uid:'import:dingo', source_kind:'user', import_index:1,
+      image_name:'Dingo', asset_id:'Dingo', path:'{inputs}/images/Dingo.jpg', relative_path:'', registered:false};
+    const clientState = api.hmbNormalizeImageAssetState({...state, folders, assets:[row], selected_source_view:'user',
+      shot_routing:undefined, site_settings:{write_site_id:writer,revision:'test',links:vendor ? [{id:writer,label:'Partner'}] : []}});
+    await client.evaluate(value => window.boot(value,0),clientState);
+    await client.locator('[data-asset-key="dingo"] [data-asset-add]').click();
+    const submit = client.locator('[data-registration-submit]');
+    const chooser = client.locator('[data-registration-folder]');
+    const control = action => chooser.locator(`[data-registration-folder-action="${action}"]`);
+    const folder = path => chooser.locator(`[data-registration-folder-path="${prefix}${path}"]`);
+    const rows = () => chooser.locator('[data-registration-folder-path]:not(.passport-folder-here) span:first-child').allTextContents();
+    assert.equal(await submit.isEnabled(),vendor);
+    const previous = await control('open').textContent();
+    if (vendor) assert.match(previous,/Partner \/ add/);
+    await control('open').click();
+    assert.equal(await submit.isDisabled(),true);
+    assert.deepEqual(await rows(),vendor ? ['BG','BG_lighting','CH','add'] : ['BG','BG_lighting','CH']);
+    await folder('BG').click();
+    assert.deepEqual(await rows(),['e201','e202']);
+    await chooser.getByRole('button',{name:'Save in this folder'}).click();
+    assert.match(await control('open').textContent(),/BG/);
+    assert.equal(await submit.isEnabled(),true);
+    await control('open').click();
+    await folder('BG').click();
+    await folder('BG/e202').click();
+    assert.deepEqual(await rows(),['Tone']);
+    await control('back').click();
+    assert.deepEqual(await rows(),['e201','e202']);
+    await control('close').click();
+    assert.match(await control('open').textContent(),/BG/);
+    await control('open').click();
+    await folder('BG').click();
+    await folder('BG/e202').click();
+    await folder('BG/e202/Tone').click();
+    assert.match(await control('open').textContent(),/BG\/e202\/Tone/);
+    const registrationRequests = () => client.evaluate(() => window.writes.map(v => (v.edits || v).asset_registration_request).filter(v => v?.request_id));
+    assert.deepEqual(await registrationRequests(),[]);
+    assert.equal(await client.evaluate(() => window.requests.length),0,'Folder navigation uses the loaded catalog');
+    await submit.click();
+    const requests = await registrationRequests();
+    assert.equal(requests.length,1);
+    assert.equal(requests[0].target_folder,prefix+'BG/e202/Tone');
+    await client.close();
+  }
+
   // Five workstations have five independent drafts and receipt owners. A
   // delayed server commit or another writer's ACK cannot resubmit or close
   // this client's pending Add.

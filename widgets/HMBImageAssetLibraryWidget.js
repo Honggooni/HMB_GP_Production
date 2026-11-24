@@ -823,6 +823,11 @@ const IMAGE_ASSET_UI_TEXT = {
     project_folder_locked: "Existing project assets keep their current folder.",
     project_folder_select: "Select the existing child Asset Folder where the external image will be copied.",
     select_project_folder: "Select Asset Folder",
+    registration_folder_root: "Project folders",
+    registration_folder_parent: "Parent folder",
+    registration_folder_close: "Close folder chooser",
+    registration_folder_choose: "Save in this folder",
+    registration_folder_empty: "No folders available",
     details_view: "Details view",
     image_only_view: "Image-only view",
     language: "Language",
@@ -907,6 +912,11 @@ const IMAGE_ASSET_UI_TEXT = {
     project_folder_locked: "기존 프로젝트 에셋은 현재 폴더로 고정됩니다.",
     project_folder_select: "외부 이미지를 복사할 기존 하위 에셋 폴더를 선택하세요.",
     select_project_folder: "에셋 폴더 선택",
+    registration_folder_root: "프로젝트 폴더",
+    registration_folder_parent: "상위 폴더",
+    registration_folder_close: "폴더 선택 닫기",
+    registration_folder_choose: "여기에 저장",
+    registration_folder_empty: "선택할 폴더가 없습니다.",
     details_view: "자세히 보기",
     image_only_view: "이미지만 보기",
     language: "언어",
@@ -3559,7 +3569,7 @@ function imageAssetFocusDescriptor(container) {
     "data-shot-rename-input",
     "data-shot-delete",
     "data-registration-field",
-    "data-registration-folder",
+    "data-registration-folder-action",
     "data-registration-main",
     "data-registration-sub",
     "data-registration-submit",
@@ -5615,6 +5625,7 @@ function registrationDraftIsComplete(draft) {
       draft?.source_kind !== "user"
       || (
         draft?.target_folder_confirmed
+        && typeof draft.folder_picker_path !== "string"
         && clean(draft?.target_folder)
         && clean(draft?.target_folder) !== ROOT_FOLDER_KEY
       )
@@ -5622,33 +5633,58 @@ function registrationDraftIsComplete(draft) {
   );
 }
 
-function registrationFolderOptions(state, draft) {
-  const selected = clean(draft?.target_folder);
-  const options = [
-    `<option value="" ${selected ? "" : "selected"} disabled>${escapeHtml(imageAssetText(state, "select_project_folder"))}</option>`,
-  ];
+function registrationFolderRoot(state) {
   const writeSite = state.site_settings?.write_site_id || "hq";
-  const root = "site:" + writeSite;
-  const folders = writeSite === "hq" ? state.folders : [...new Set([root, root + "/add", ...state.folders])];
-  folders
-    .filter(folder => clean(folder) && !isUserImportFolder(folder) && imageFolderSite(folder) === writeSite)
-    .forEach(folder => {
-      const label = folder === root ? imageFolderLabel(state, folder, root)
-        : writeSite === "hq" ? folder : folder.slice(root.length + 1);
-      options.push(
-        `<option value="${escapeHtml(folder)}" ${selected === folder ? "selected" : ""}>${escapeHtml(label)}</option>`,
-      );
-    });
-  return options.join("");
+  return writeSite === "hq" ? "" : `site:${writeSite}`;
+}
+
+function registrationFolderContents(state, draft) {
+  const text = (key) => escapeHtml(imageAssetText(state, key));
+  const root = registrationFolderRoot(state);
+  const rootLabel = root ? imageFolderLabel(state, root, root) : imageAssetText(state, "registration_folder_root");
+  const folderLabel = (path) => root
+    ? (path === root ? rootLabel : `${rootLabel} / ${path.slice(root.length + 1)}`)
+    : path || rootLabel;
+  const current = draft.folder_picker_path;
+  if (typeof current !== "string") {
+    const selected = draft.target_folder_confirmed ? clean(draft.target_folder) : "";
+    const label = selected ? escapeHtml(folderLabel(selected)) : text("select_project_folder");
+    return `<button type="button" class="passport-folder-trigger" data-registration-folder-action="open" aria-expanded="false"><span>${label}</span><span aria-hidden="true">⌄</span></button>`;
+  }
+
+  const available = new Set(state.folders.filter(folder => clean(folder) && folder !== root
+    && folder !== ROOT_FOLDER_KEY && imageFolderSite(folder) === (state.site_settings?.write_site_id || "hq")
+    && !isUserImportFolder(root ? folder.slice(root.length + 1) : folder)));
+  if (root) available.add(`${root}/add`);
+  const prefix = current ? `${current}/` : "";
+  const children = new Map();
+  for (const folder of available) {
+    if (!folder.startsWith(prefix) || folder === current) continue;
+    const [name, descendant] = folder.slice(prefix.length).split("/", 2);
+    const path = prefix + name;
+    children.set(path, Boolean(descendant) || children.get(path) === true);
+  }
+  const selectCurrent = available.has(current)
+    ? `<button type="button" class="passport-folder-here" data-registration-folder-action="choose" data-registration-folder-path="${escapeHtml(current)}">${text("registration_folder_choose")}</button>` : "";
+  const rows = [...children].map(([path, hasChildren]) =>
+    `<button type="button" data-registration-folder-action="${hasChildren ? "enter" : "choose"}" data-registration-folder-path="${escapeHtml(path)}"><span>${escapeHtml(path.slice(prefix.length))}</span>${hasChildren ? '<span aria-hidden="true">›</span>' : ""}</button>`).join("");
+  const heading = escapeHtml(folderLabel(current));
+  return `<div class="passport-folder-nav">
+    ${current !== root ? `<button type="button" data-registration-folder-action="back" aria-label="${text("registration_folder_parent")}">‹</button>` : ""}
+    <b title="${heading}">${heading}</b>
+    <button type="button" data-registration-folder-action="close" aria-label="${text("registration_folder_close")}">&times;</button>
+  </div><div class="passport-folder-list" role="group" aria-label="${heading}">
+    ${selectCurrent}${rows || (!selectCurrent ? `<span>${text("registration_folder_empty")}</span>` : "")}
+  </div>`;
 }
 
 function registrationFolderField(state, draft, externalImport) {
   if (!externalImport) return "";
   return (
-    `<label class="passport-folder" title="${escapeHtml(imageAssetText(state, "project_folder_select"))}">`
+    `<div class="passport-folder" data-registration-folder title="${escapeHtml(imageAssetText(state, "project_folder_select"))}">`
     + `<span>${escapeHtml(imageAssetText(state, "project_folder"))}</span>`
-    + `<select data-registration-folder>${registrationFolderOptions(state, draft)}</select>`
-    + "</label>"
+    + `<div class="passport-folder-controls">${registrationFolderContents(state, draft)}</div>`
+    + "</div>"
   );
 }
 
@@ -6342,7 +6378,21 @@ function render(
       .shot-routing{margin:0 8px 8px;border:1px solid rgba(34,211,238,.3);border-radius:9px;background:linear-gradient(180deg,rgba(7,28,40,.94),rgba(6,10,18,.98));overflow:hidden}.shot-routing-head{height:38px;display:flex;align-items:center;gap:7px;padding:0 8px}.shot-toggle,.shot-add,.shot-tab,.shot-source button{border:1px solid rgba(34,211,238,.24);border-radius:6px;background:#08131e;color:#a9c6d8;cursor:pointer}.shot-toggle{width:25px;height:25px;padding:0;color:var(--accent)}.shot-routing-head>b{font-size:8px;letter-spacing:.08em;color:var(--accent);white-space:nowrap}.shot-channel{max-width:58px;color:#5f7f94;font-size:7px;font-family:ui-monospace,monospace}.shot-tabs{display:flex;flex:1;align-items:center;gap:5px;min-width:0;overflow-x:auto;padding:2px}.shot-tab{height:27px;display:flex;align-items:center;gap:5px;padding:0 7px;white-space:nowrap}.shot-tab small{color:#5e7e93;font-size:6px}.shot-tab b{max-width:92px;overflow:hidden;text-overflow:ellipsis;font-size:8px}.shot-tab em{color:#6f90a5;font-size:7px;font-style:normal}.shot-tab.active{border-color:var(--accent);background:rgba(8,145,178,.18);color:#e6fbff}.shot-add{height:27px;padding:0 9px;color:#bceef5;font-size:8px;font-weight:900;white-space:nowrap}.shot-add:disabled,.shot-source button:disabled{opacity:.28;cursor:default}.shot-routing-body{min-height:78px;display:grid;grid-template-columns:190px minmax(0,1fr);gap:8px;padding:7px 9px 9px;border-top:1px solid rgba(34,211,238,.14)}.shot-routing-summary{display:flex;flex-direction:column;gap:3px;padding:7px;border:1px solid rgba(34,211,238,.16);border-radius:7px;background:rgba(4,14,24,.65)}.shot-routing-summary b{color:#d9f8ff;font-size:10px}.shot-routing-summary span{color:var(--accent);font-size:8px;font-weight:900}.shot-routing-summary small{color:#708ba0;font-size:7px;line-height:1.35}.shot-sources{display:flex;align-content:flex-start;gap:5px;overflow-x:auto;padding:3px}.shot-source{height:30px;display:flex;flex:0 0 auto;align-items:stretch}.shot-source>button:first-child{max-width:145px;display:flex;align-items:center;gap:5px;padding:0 7px}.shot-source i{color:#5d7d91;font-size:8px;font-style:normal}.shot-source span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:8px}.shot-source.selected>button:first-child{border-color:rgba(244,114,182,.62);background:rgba(131,24,67,.22);color:#ffe0f1}.shot-source.selected i{color:#f9a8d4}.shot-source .shot-source-move{width:22px;margin-left:2px;padding:0;color:#8eb6ca}.shot-routing-empty{align-self:center;color:#607b90;font-size:8px}
       .shot-stack{max-height:360px;margin:0 8px 8px;display:flex;flex-direction:column;gap:5px;overflow:auto;scrollbar-gutter:stable}.shot-panel{flex:0 0 auto;overflow:hidden;border:1px solid rgba(var(--shot-rgb),.34);border-radius:10px;background:linear-gradient(180deg,rgba(var(--shot-rgb),.10),rgba(8,11,19,.96));box-shadow:0 0 16px rgba(var(--shot-rgb),.07)}.shot-panel-head{height:38px;display:flex;align-items:center;gap:6px;padding:4px 7px;min-width:0;border-bottom:1px solid transparent}.shot-panel.active .shot-panel-head{border-bottom-color:rgba(var(--shot-rgb),.20)}.shot-panel-toggle{height:29px;min-width:0;flex:1;display:grid;grid-template-columns:30px minmax(0,1fr) minmax(0,1fr) auto auto;align-items:center;gap:7px;padding:0 8px;border:1px solid rgba(var(--shot-rgb),.32);border-radius:7px;background:linear-gradient(90deg,rgba(var(--shot-rgb),.16),rgba(8,13,23,.72));color:#d9e6f3;text-align:left;cursor:pointer}.shot-panel-toggle small{color:var(--shot-accent);font-size:8px;font-weight:950}.shot-panel-toggle b{max-width:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f8fafc;font-size:10px}.shot-panel-toggle span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(var(--shot-rgb),.92);font-size:8px;font-weight:900;letter-spacing:.06em}.shot-panel-toggle em{color:var(--shot-accent);font-size:8px;font-style:normal;font-weight:900}.shot-panel-toggle i{color:#7f95a8;font-size:7px;font-style:normal;letter-spacing:.08em}.shot-panel.active{border-color:rgba(var(--shot-rgb),.68);box-shadow:0 0 18px rgba(var(--shot-rgb),.14)}.shot-panel.active .shot-panel-toggle{border-color:var(--shot-accent);box-shadow:0 0 10px rgba(var(--shot-rgb),.14)}.shot-panel .shot-delete{width:29px;height:29px;flex:0 0 29px;padding:0;border:1px solid rgba(var(--shot-rgb),.42);border-radius:7px;background:rgba(var(--shot-rgb),.10);color:var(--shot-accent);font-size:16px;line-height:1;cursor:pointer}.shot-panel .shot-delete:hover:not(:disabled),.shot-panel .shot-delete:focus-visible{border-color:var(--shot-accent);background:rgba(var(--shot-rgb),.22);outline:none;box-shadow:0 0 10px rgba(var(--shot-rgb),.18)}.shot-panel .shot-delete:disabled{opacity:.25;cursor:default}.shot-panel .shot-add{flex:0 0 auto;height:29px;padding:0 11px;border:1px solid rgba(var(--shot-rgb),.54);border-radius:7px;background:rgba(var(--shot-rgb),.14);color:var(--shot-accent);font-size:8px;font-weight:950;white-space:nowrap;cursor:pointer}.shot-panel .shot-add:disabled{opacity:.3;cursor:default}.shot-panel .tray-scroll{height:132px;display:flex;align-items:stretch;gap:8px;overflow-x:auto;overflow-y:hidden;padding:7px}.shot-panel .selected-card{border-color:rgba(var(--shot-rgb),.30);background:linear-gradient(145deg,rgba(var(--shot-rgb),.15),rgba(12,17,28,.94))}.shot-panel .selected-thumb{border-color:rgba(var(--shot-rgb),.30)}.shot-panel .slot{border-color:rgba(var(--shot-rgb),.70);background:rgba(var(--shot-rgb),.20);color:var(--shot-accent)}.shot-panel .tray-empty{border-color:rgba(var(--shot-rgb),.22);color:rgba(var(--shot-rgb),.72)}.hmb-image-assets .asset-card.selected{border-color:var(--active-shot-accent);box-shadow:inset 0 0 0 .3px rgba(var(--active-shot-rgb),.48),0 0 15px rgba(var(--active-shot-rgb),.34),0 0 4px rgba(var(--active-shot-rgb),.55)}
       .asset-registration-backdrop{position:absolute;inset:0;z-index:80;display:grid;place-items:center;padding:18px;background:rgba(1,4,10,.78);backdrop-filter:blur(5px)}.asset-passport{width:min(390px,100%);max-height:calc(100% - 12px);display:flex;flex-direction:column;overflow:auto;border:1px solid rgba(244,114,182,.62);border-radius:18px 18px 28px 28px;background:radial-gradient(circle at 50% -8%,rgba(190,24,93,.24),transparent 30%),linear-gradient(180deg,#171020,#090d17 45%,#060912);box-shadow:0 24px 70px rgba(0,0,0,.62),0 0 28px rgba(244,114,182,.2)}.passport-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 10px;border-bottom:1px solid rgba(244,114,182,.2)}.passport-head small{display:block;color:#d8a2be;font-size:7px;font-weight:900;letter-spacing:.18em}.passport-head h2{margin:3px 0 0;color:#fff1f8;font-size:15px;letter-spacing:.08em}.passport-head button{width:28px;height:28px;border:1px solid rgba(244,114,182,.25);border-radius:50%;background:#0b0d16;color:#e7b9d1;font-size:18px;line-height:1;cursor:pointer}.passport-photo{position:relative;width:128px;aspect-ratio:3/4;display:grid;place-items:center;align-self:center;margin:14px 0 8px;overflow:hidden;border:1px solid rgba(244,114,182,.38);border-radius:8px;background:#050910;color:#84677a;font-size:10px;font-weight:900;box-shadow:0 0 18px rgba(244,114,182,.12)}.passport-photo img{width:100%;height:100%;object-fit:cover}.passport-photo>span{display:none}.passport-photo.fallback img{display:none}.passport-photo.fallback>span{display:block}.passport-file{display:flex;flex-direction:column;gap:3px;padding:0 18px 12px;text-align:center}.passport-file b,.passport-file span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.passport-file b{color:#d7e2ef;font-size:8px}.passport-file span{color:#73899d;font-size:7px}.passport-fields{display:grid;grid-template-columns:1fr 1fr;gap:9px;padding:12px 16px;border-top:1px dashed rgba(244,114,182,.24)}.passport-fields label{display:flex;flex-direction:column;gap:4px}.passport-fields label:nth-last-child(1){grid-column:1/-1}.passport-fields label span{color:#bb8fa8;font-size:7px;font-weight:900;letter-spacing:.06em}.passport-fields input,.passport-fields select{width:100%;height:32px;border:1px solid rgba(148,163,184,.27);border-radius:7px;background:#060b13;color:#eef5ff;padding:0 8px;font-size:9px;outline:none}.passport-fields input:focus,.passport-fields select:focus{border-color:var(--asset-selection);box-shadow:0 0 0 1px rgba(244,114,182,.18)}.passport-fields select:disabled{opacity:.42}.passport-actions{display:flex;justify-content:flex-end;gap:7px;padding:11px 16px 15px}.passport-actions button{height:31px;padding:0 13px;border:1px solid rgba(148,163,184,.24);border-radius:7px;background:#0a101a;color:#bac9d8;font-size:8px;font-weight:900;cursor:pointer}.passport-actions .passport-register{border-color:rgba(244,114,182,.62);background:linear-gradient(180deg,rgba(190,24,93,.55),rgba(88,28,135,.42));color:#ffe4f2;box-shadow:0 0 12px rgba(244,114,182,.18)}.passport-actions button:disabled{opacity:.32;cursor:default;box-shadow:none}
-      .passport-fields .passport-folder{grid-column:1/-1}.passport-taxonomy-contract{grid-column:1/-1;display:flex;flex-direction:column;gap:4px;padding:8px 9px;border:1px solid rgba(148,163,184,.18);border-radius:7px;background:rgba(2,6,14,.58)}.passport-taxonomy-contract[hidden]{display:none}.passport-taxonomy-contract small{color:#bb8fa8;font-size:7px;font-weight:900;letter-spacing:.06em}.passport-taxonomy-contract span{color:#cbd8e6;font-size:8px;line-height:1.45}
+      .passport-fields .passport-folder{grid-column:1/-1;min-width:0;display:grid;gap:4px}
+      .passport-folder>span{color:var(--selection-soft,#bb8fa8);font-size:7px;font-weight:900;letter-spacing:.06em}
+      .passport-folder-controls{border:1px solid rgba(148,163,184,.27);border-radius:7px;background:#060b13;color:#eef5ff;font-size:9px}
+      .passport-folder-controls:focus-within{border-color:var(--asset-selection)}
+      .passport-folder-controls button{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:29px;padding:0 8px;border:0;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
+      .passport-folder-controls button:hover,.passport-folder-controls button:focus-visible{background:rgba(148,163,184,.12);outline:none}
+      .passport-folder-controls button span,.passport-folder-nav b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .passport-folder-trigger,.passport-folder-list button{width:100%}
+      .passport-folder-nav{display:flex;align-items:center;gap:4px;padding:0 3px;border-bottom:1px solid rgba(148,163,184,.18)}
+      .passport-folder-nav b{flex:1;padding:0 5px}
+      .passport-folder-nav button{font-size:14px}
+      .passport-folder-list{max-height:145px;overflow:auto;overscroll-behavior:contain}
+      .passport-folder-list>span{display:block;padding:8px;color:#a0afc1}
+      .passport-folder-controls .passport-folder-here{color:var(--selection-strong,#ffe4f2);font-weight:900}
+      .passport-taxonomy-contract{grid-column:1/-1;display:flex;flex-direction:column;gap:4px;padding:8px 9px;border:1px solid rgba(148,163,184,.18);border-radius:7px;background:rgba(2,6,14,.58)}.passport-taxonomy-contract[hidden]{display:none}.passport-taxonomy-contract small{color:#bb8fa8;font-size:7px;font-weight:900;letter-spacing:.06em}.passport-taxonomy-contract span{color:#cbd8e6;font-size:8px;line-height:1.45}
       .asset-refresh-review{width:min(580px,100%)}.refresh-review-body{padding:4px 16px 12px;font-size:10px;line-height:1.6;color:#cbd8e6}.refresh-review-body h3{margin:14px 0 4px;font-size:11px;color:var(--selection-text)}.refresh-review-body p{margin:7px 0}.refresh-review-body ul{max-height:120px;overflow:auto;margin:8px 0;padding:9px 9px 9px 26px;border:1px solid rgba(148,163,184,.2);border-radius:7px;background:#060b13}.refresh-review-body li,.refresh-review-root,.refresh-review-path{overflow-wrap:anywhere;white-space:pre-wrap}.refresh-review-error{color:#fca5a5}.refresh-review-confirm{padding:10px;border:1px solid var(--selection-soft);border-radius:7px;color:var(--selection-strong);background:rgba(var(--selection-rgb),.12)}
       /* Fixed P-base visual language. Shot 1-5 are the only accent authority. */
       .hmb-image-assets[data-theme] .top{background:linear-gradient(90deg,var(--header-tint),rgba(14,23,38,.92) 44%,rgba(6,9,18,.96))}.hmb-image-assets[data-theme] .mark{border-color:rgba(var(--selection-rgb),.54);background:linear-gradient(145deg,rgba(var(--selection-rgb),.16),rgba(8,13,23,.86));color:var(--accent);box-shadow:inset 0 0 0 1px rgba(255,255,255,.025),0 0 14px rgba(var(--selection-rgb),.11)}
@@ -8882,11 +8932,35 @@ function installEvents(container, state, props, remount, listeners) {
     });
   });
   const registrationFolder = container.querySelector("[data-registration-folder]");
-  on(registrationFolder, "change", () => {
+  on(registrationFolder, "click", (event) => {
     const draft = container.__hmbImageAssetRegistrationDraft;
-    if (!draft) return;
-    draft.target_folder = clean(registrationFolder.value);
-    draft.target_folder_confirmed = Boolean(draft.target_folder);
+    const button = event.target.closest?.("[data-registration-folder-action]");
+    if (!draft || draft.saving || !button) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const action = button.dataset.registrationFolderAction;
+    const path = button.dataset.registrationFolderPath;
+    const previous = draft.folder_picker_path;
+    if (action === "open") {
+      draft.folder_picker_path = registrationFolderRoot(state);
+    } else if (action === "back") {
+      draft.folder_picker_path = previous.slice(0, Math.max(0, previous.lastIndexOf("/")));
+    } else if (action === "enter") {
+      draft.folder_picker_path = path;
+    } else {
+      if (action === "choose") {
+        draft.target_folder = path;
+        draft.target_folder_confirmed = true;
+      }
+      delete draft.folder_picker_path;
+    }
+    const controls = registrationFolder.querySelector(".passport-folder-controls");
+    controls.innerHTML = registrationFolderContents(state, draft);
+    const previousRow = action === "back" && [...controls.querySelectorAll("[data-registration-folder-path]")]
+      .find(row => row.dataset.registrationFolderPath === previous);
+    const focus = previousRow || controls.querySelector("[data-registration-folder-action='open'], [data-registration-folder-path]:not(.passport-folder-here)")
+      || controls.querySelector("[data-registration-folder-path], [data-registration-folder-action='close']");
+    focus?.focus({ preventScroll: true });
     updateRegistrationSubmit();
   });
   const registrationMain = container.querySelector("[data-registration-main]");
