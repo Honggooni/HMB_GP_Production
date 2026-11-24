@@ -6,6 +6,7 @@ from copy import deepcopy
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import threading
@@ -234,8 +235,16 @@ async def check_wired_image_with_existing_shot(workspace):
             assert row["media_ref_kind"] == "artifact" and row["path"] == "{inputs}/images/Dingo.jpg"
             assert row["selected"] and row["selection_order"] == 2
             preview_url = urlsplit(row["thumbnail_url"])
-            assert preview_url.scheme in {"http", "https"} and "/staticfiles/" in preview_url.path
-            generated = workspace / "staticfiles" / Path(unquote(preview_url.path)).name
+            assert preview_url.scheme in {"http", "https"}
+            name = Path(unquote(preview_url.path)).name
+            if "/staticfiles/" in preview_url.path:
+                generated = workspace / "staticfiles" / name
+            else:
+                assert preview_url.hostname in {"localhost", "127.0.0.1", "::1"}
+                assert re.fullmatch(r"[0-9a-f]{64}\.(?:png|webp)", name)
+                generated = Path(asset._ASSET_THUMBNAIL_CACHE_ROOT) / name
+                driver = GriptapeNodes.StaticFilesManager().storage_driver
+                assert preview_url == urlsplit(driver.create_signed_download_url(generated))
             with Image.open(generated) as preview:
                 assert preview.size == (32, 24)
                 red, green, blue = preview.convert("RGB").getpixel((16, 12))
