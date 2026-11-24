@@ -1207,7 +1207,12 @@ assert pending_picker.snapshot_calls == 1
 dashboard_writer_source = inspect.getsource(
     prompt.HMBPromptLibrary._write_dashboard_state
 )
-assert dashboard_writer_source.count("_json_dumps(state)") == 3
+# The unavailable-source projection publishes once and returns before the
+# source synchronization/normal publication below can serialize anything.
+unavailable, normal = dashboard_writer_source.split("picker_route_hydration_pending = bool(", 1)
+assert unavailable.count("_json_dumps(state)") == 2
+assert unavailable.index("_set_parameter_value(self, WIDGET_PARAMETER_NAME, _json_dumps(state))") < unavailable.rindex("return state")
+assert normal.count("_json_dumps(state)") == 2
 assert "serialized_state = _json_dumps(state)" in dashboard_writer_source
 assert "serialized_state != state_before_source_sync" in dashboard_writer_source
 assert (

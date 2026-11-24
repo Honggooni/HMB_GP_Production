@@ -12,7 +12,7 @@ import tempfile
 import threading
 import urllib.error
 import urllib.request
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace

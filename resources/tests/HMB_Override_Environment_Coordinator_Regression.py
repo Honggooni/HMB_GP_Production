@@ -242,6 +242,9 @@ class NativeEditorCoordinator(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory(prefix='hmb-native-coordinator-')
         self.addCleanup(self.tmp.cleanup)
         self.documents=Path(self.tmp.name).resolve()/'Documents'
+        local_environment = mock.patch.dict(os.environ, {"LOCALAPPDATA": str(self.documents.parent / "AppData/Local")})
+        local_environment.start()
+        self.addCleanup(local_environment.stop)
         self.root=self.documents/'GriptapeNodes/libraries/HMB_GP_Production'
         (self.root/'tools').mkdir(parents=True)
         (self.root/'resources/editor').mkdir(parents=True)
@@ -258,7 +261,7 @@ class NativeEditorCoordinator(unittest.TestCase):
         constants={'_HMB_NATIVE_EDITOR_STATE_MODULE','_HMB_NATIVE_EDITOR_RESPONSE_LIMIT','_HMB_NATIVE_EDITOR_TIMEOUT_SECONDS',
             '_HMB_EDITOR_0130_OVERLAY_SHA256','_HMB_EDITOR_0130_ENTRY_SHA256','_HMB_EDITOR_0130_OUTPUTS'}
         nodes=[n for n in TREE.body if isinstance(n,ast.FunctionDef) and
-            (n.name.startswith('_hmb_native_editor_') or n.name=='_hmb_coordinate_native_editor_update') or
+            (n.name.startswith('_hmb_native_editor_') or n.name in {'_hmb_coordinate_native_editor_update', '_hmb_private_desktop_resources'}) or
             isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id in constants for t in n.targets)]
         self.ns=dict(Path=Path,Any=object,sys=sys,os=os,hashlib=hashlib,json=json,threading=threading,
             logging=logging,types=types,subprocess=subprocess,weakref=weakref,UUID=UUID,
@@ -509,7 +512,7 @@ source,folder,documents=map(Path,sys.argv[1:])
 tree=ast.parse(source.read_text('utf-8'))
 names={'_HMB_NATIVE_EDITOR_STATE_MODULE','_HMB_NATIVE_EDITOR_RESPONSE_LIMIT','_HMB_NATIVE_EDITOR_TIMEOUT_SECONDS',
     '_HMB_EDITOR_0130_OVERLAY_SHA256','_HMB_EDITOR_0130_ENTRY_SHA256','_HMB_EDITOR_0130_OUTPUTS'}
-nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and (n.name.startswith('_hmb_native_editor_') or n.name=='_hmb_coordinate_native_editor_update') or isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id in names for t in n.targets)]
+nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and (n.name.startswith('_hmb_native_editor_') or n.name in {'_hmb_coordinate_native_editor_update', '_hmb_private_desktop_resources'}) or isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id in names for t in n.targets)]
 scope=dict(Path=Path,Any=object,sys=sys,os=os,hashlib=hashlib,json=json,threading=threading,logging=logging,types=types,weakref=weakref,UUID=UUID,__file__=str(folder/'_hmb_library_bootstrap.py'),__name__='private_process_fixture',_LIBRARY_NAME='HMB_GP_Production')
 exec(compile(ast.Module(body=nodes,type_ignores=[]),str(source),'exec'),scope)
 scope['_hmb_native_editor_documents_path']=lambda:documents

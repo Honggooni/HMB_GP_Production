@@ -1640,13 +1640,12 @@ try:
                 preview = resolve_a(False)
             assert [row["reason"] for row in preview["unresolved"]] == ["project_catalog_preparing"]
             assert not preview["resolved"] and not cache, "A saved selection cannot authorize or poison the cold catalog."
-            with patch.object(asset_library, "PROJECT_REFRESH_TIMEOUT_SECONDS", 0.02):
+            with patch.object(asset_library, "_read_selection_registrations", side_effect=TimeoutError("registration read pending")):
                 timed_out = resolve_a(True)
             assert [row["reason"] for row in timed_out["unresolved"]] == ["project_catalog_preparing"]
             assert not cache
-            joined.clear()
-            selection = executor.submit(resolve_a, True)
-            assert joined.wait(5), "The selection worker did not join the existing project read."
+            ready = executor.submit(resolve_a, True).result(timeout=5)
+            assert not resume.is_set(), "The selected image must resolve without waiting for the browse scan."
             joined.clear()
             a = executor.submit(asset_library._load_project_catalog, projects, saved_workflows[0])
             assert joined.wait(5), "Opening A started a second source read during startup"
@@ -1657,7 +1656,6 @@ try:
             worker.join(10)
         assert not worker.is_alive()
         assert a.result(timeout=5)["shot_routing"] == saved_workflows[0]["shot_routing"]
-        ready = selection.result(timeout=5)
         assert [row["source_uid"] for row in ready["resolved"]] == requested
         assert Path(ready["resolved"][0]["media"]).samefile(projects / "A" / "Ai_Ct_image" / "Hero.png")
         assert not ready["unresolved"] and len(cache) == 1

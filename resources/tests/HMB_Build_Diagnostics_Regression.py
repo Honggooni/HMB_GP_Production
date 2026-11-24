@@ -127,7 +127,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-build-override-") as directory:
     rows = [{"path":name,"bytes":(root/name).stat().st_size,
              "sha256":hashlib.sha256((root/name).read_bytes()).hexdigest()}
             for name in runtime_paths if name not in {"_hmb_shot_basket.py", "_hmb_client_review_media.py"}
-            and not name.startswith("resources/media-tools/")]
+            and not name.startswith(("resources/media-tools/", "_hmb_native_agent/"))]
     old_receipt = {"schema":"hmb-install-receipt","version":1,"release_version":"0.8.9",
                    "runtime_files":rows,"runtime_fingerprint_sha256":diag.inventory_fingerprint(rows)}
     receipt_path = root/diag.RECEIPT_NAME
