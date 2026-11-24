@@ -40,9 +40,12 @@ from uuid import UUID, uuid4
 import httpx
 from griptape.artifacts import ImageUrlArtifact
 from griptape.artifacts.video_url_artifact import VideoUrlArtifact
-from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import (
-    GriptapeCloudStorageDriver,
-)
+try:
+    from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import (
+        GriptapeCloudStorageDriver,
+    )
+except ImportError:  # Optional transport for local reference media.
+    GriptapeCloudStorageDriver = None  # type: ignore[assignment,misc]
 try:
     from griptape_nodes.drivers.cloud_credentials import resolve_cloud_credential
 except ImportError:  # Older Griptape hosts expose only GT_CLOUD_API_KEY.
@@ -6645,16 +6648,26 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         """Acknowledge command first; open only an ordinary authenticated page."""
         epoch = int(getattr(self, "_hmb_review_sync_epoch", 0))
         origin = _broker_validated_server_url(origin)
+        workflow = getattr(self, "workflow", None)
+
         def launch() -> None:
-            if not self._review_sync_is_live(epoch):
-                return
             try:
-                if self._selected_broker_server_url() != origin:
-                    return
-                webbrowser.open(origin + "/reviews", new=2, autoraise=True)
-                task_id = self._authoritative_existing_generation_id()
-                if task_id:
-                    self._schedule_review_sync(task_id)
+                with ExitStack() as context:
+                    if workflow is not None:
+                        from griptape_nodes.retained_mode.engine import engine_scope
+
+                        engine = workflow.engine
+                        context.enter_context(engine_scope(engine))
+                        context.enter_context(engine.bind_workflow(workflow))
+                    if not self._review_sync_is_live(epoch):
+                        return
+                    if self._selected_broker_server_url() != origin:
+                        return
+                    if not webbrowser.open(origin + "/reviews", new=2, autoraise=True):
+                        logger.warning("Review gallery could not open in the default browser.")
+                    task_id = self._authoritative_existing_generation_id()
+                    if task_id:
+                        self._schedule_review_sync(task_id)
             except Exception as exc:
                 logger.warning("Review gallery could not open (%s).", type(exc).__name__)
         try:
@@ -12779,6 +12792,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         return str(value or "").strip()
 
     def _create_gt_cloud_storage_driver(self) -> GriptapeCloudStorageDriver:
+        if GriptapeCloudStorageDriver is None:
+            raise RuntimeError("The optional Griptape Cloud storage driver is unavailable.")
         cloud_credential = self._resolve_gt_cloud_credential()
         if not cloud_credential:
             raise RuntimeError(

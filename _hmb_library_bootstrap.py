@@ -234,6 +234,26 @@ _HMB_EDITOR_0130_OUTPUTS = {
 }
 
 
+def _hmb_private_desktop_resources() -> Path | None:
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        return None
+    python = Path(sys.executable).resolve()
+    hosts = (Path(local) / "HMB_GP_Production" / "hosts").resolve()
+    if python.is_relative_to(hosts):
+        relative = python.relative_to(hosts)
+    else:
+        hosts = (Path(local) / "ai.griptape.nodes.desktop").resolve()
+        if not python.is_relative_to(hosts):
+            return None
+        relative = python.relative_to(hosts)
+        if not relative.parts or not relative.parts[0].startswith("HMB-pinned-desktop-"):
+            return None
+    if len(relative.parts) != 5 or relative.parts[1:] != ("resources", "engine-bundle", "python", "python.exe"):
+        raise LookupError("unrecognized_private_host_layout")
+    return hosts / relative.parts[0] / "resources"
+
+
 def _hmb_native_editor_runtime_fingerprint() -> tuple[str, str, str]:
     """Fingerprint the *active* editor, so vendor updates invalidate a cache.
 
@@ -245,7 +265,7 @@ def _hmb_native_editor_runtime_fingerprint() -> tuple[str, str, str]:
     local = os.environ.get("LOCALAPPDATA")
     if not local:
         raise ValueError("native_editor_local_appdata_missing")
-    resources = Path(local) / "ai.griptape.nodes.desktop/current/resources"
+    resources = _hmb_private_desktop_resources() or Path(local) / "ai.griptape.nodes.desktop/current/resources"
     embedded = _hmb_native_editor_plain_path(resources /
         "engine-bundle/python/Lib/site-packages/griptape_nodes_editor_dist/editor")
     root = embedded if (embedded / "index-editor.html").is_file() else _hmb_native_editor_plain_path(resources / "editor-bundle")
@@ -357,6 +377,17 @@ def _hmb_coordinate_native_editor_update(owner: Any, engine: Any, library_data: 
         state = _hmb_native_editor_state()
         runtime = _hmb_native_editor_runtime_fingerprint()
         identity = (str(root), tuple(sorted(hashes.items())), runtime)
+        if _hmb_private_desktop_resources() is not None:
+            # The private host is built atomically alongside the HMB release.
+            # Its startup checks must never write to the standard Desktop.
+            ready = runtime[1:] in _HMB_EDITOR_0130_OUTPUTS
+            summary = _hmb_native_editor_summary(
+                "current" if ready else "unsupported",
+                "reviewed_private_editor" if ready else "private_editor_requires_repair",
+                restart_required=not ready)
+            owner._hmb_native_editor_update_identity = engine._hmb_native_editor_update_identity = identity
+            _hmb_native_editor_publish(owner, engine, identity, summary)
+            return summary
     except LookupError as exc:
         summary = _hmb_native_editor_summary("unsupported", str(exc))
         owner._hmb_native_editor_update_identity = None
@@ -1525,6 +1556,13 @@ try:
 except ImportError:
     _LOAD_TYPES = ()
     is_loading_workflow = lambda: False
+
+try:
+    from griptape_nodes.retained_mode.events.context_events import OpenWorkflowRequest
+except ImportError:
+    pass
+else:
+    _LOAD_TYPES += (OpenWorkflowRequest,)
 
 try:
     from griptape_nodes.retained_mode.events import flow_events, node_events, workflow_events

@@ -24,14 +24,20 @@ import tempfile
 from unittest import mock
 from urllib.parse import urlparse
 
+from hmb_host_workflow import run_in_fixture_workflow
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.dont_write_bytecode = True
-STANDARD = Path(os.environ.get("HMB_IMAGE_BASH_STANDARD_LIBRARY_PATH") or (
-    Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard"))
-EDITOR = Path(os.environ.get("HMB_IMAGE_BASH_EDITOR_BUNDLE_PATH") or (
-    Path(os.environ.get("LOCALAPPDATA", "")) / "ai.griptape.nodes.desktop/current/resources/editor-bundle"))
 ATTEMPTS = []
+
+
+class MissingStandardLibrary:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".", 1)[0] == "griptape_nodes_library":
+            ATTEMPTS.append(fullname)
+            raise ModuleNotFoundError(fullname)
+        return None
 
 
 def deny_network(*_args, **_kwargs):
@@ -850,7 +856,7 @@ async def exercise(engine, directory):
             "native_resolve_node_validation_scheduling": True,
             "native_file_uri_raster_alias_single_apply": True, "painted_brush_new_raster_single_apply": True,
             "editor_initial_original_http_input_contract_preserved": True,
-            "native_hidden_ui_options_and_owned_editor": True,
+            "native_hidden_ui_options_and_owned_editor": True, "standard_library_imports": 0,
             "resolver_media_signature_only_refresh_native_resolve": True,
             "sdk_root_envelope_identity_preserves_apply": True,
             "duplicate_layers_and_brush": True, "stable_source_reorder": True,
@@ -874,12 +880,14 @@ def main():
             "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
             "XDG_STATE_HOME", "GTN_ENGINE_CONFIG_DIR", "GTN_ENGINE_DATA_DIR", "GTN_ENGINE_STATE_DIR",
             "GTN_CONFIG_WORKSPACE_DIRECTORY")}
-        env.update(HMB_IMAGE_BASH_STANDARD_LIBRARY_PATH=str(STANDARD),
-                   HMB_IMAGE_BASH_EDITOR_BUNDLE_PATH=str(EDITOR))
-        for key, value in env.items():
-            if key not in {"HMB_IMAGE_BASH_STANDARD_LIBRARY_PATH", "HMB_IMAGE_BASH_EDITOR_BUNDLE_PATH"}:
-                Path(value).mkdir()
-        with mock.patch.dict(os.environ, env), mock.patch.object(socket, "create_connection", deny_network):
+        for value in env.values():
+            Path(value).mkdir()
+        missing = directory / "uninstalled-standard"
+        assert not missing.exists() and not any(key.split(".", 1)[0] == "griptape_nodes_library" for key in sys.modules)
+        env.update(HMB_IMAGE_BASH_STANDARD_LIBRARY_PATH=str(missing), HMB_GRIPTAPE_STANDARD_LIBRARY_PATH=str(missing),
+                   HMB_IMAGE_BASH_EDITOR_BUNDLE_PATH=str(directory / "uninstalled-stock-modal"))
+        with mock.patch.dict(os.environ, env), mock.patch.object(socket, "create_connection", deny_network), \
+                mock.patch.object(sys, "meta_path", [MissingStandardLibrary(), *sys.meta_path]):
             os.chdir(directory)
             logging.disable(logging.CRITICAL)
             faulthandler.enable()
@@ -888,7 +896,7 @@ def main():
             try:
                 from griptape_nodes.retained_mode.engine import engine_scope
                 with engine_scope() as engine:
-                    asyncio.run(exercise(engine, directory))
+                    asyncio.run(run_in_fixture_workflow(engine, "ImageBashSDKRegression", exercise, directory))
             finally:
                 faulthandler.cancel_dump_traceback_later()
                 os.chdir(previous)

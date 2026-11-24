@@ -1,8 +1,22 @@
 # Griptape Desktop 업데이트 검증
 
-팀원 PC와 로컬 PC는 Griptape Desktop의 기본 업데이트 기능을 사용한다. HMB 라이브러리는 기존 Git Update/Override 경로로 업데이트한다.
+Desktop과 HMB는 각각 버전을 관리한다. 이번 독립화 릴리스는 개발 PC의 Local 0.9.46을 대상으로 한다. 팀원용 설치 및 Git Update는 별도 배포로 관리한다.
 
-1. 작업을 저장하고 Desktop의 기본 업데이트 절차를 따른다. 새 SDK·Editor 조합에서는 아래 검사를 거쳐 HMB 화면 연동의 적용 여부를 결정한다.
+### 새 기능을 HMB에 반영하는 절차
+
+1. 공식 Windows Stable 업데이트 목록과 Standard의 정식 릴리스 목록을 내려받아 검토할 때만 `python tools/hmb_review_upstream.py --desktop-feed <Windows Stable JSON> --standard-releases <GitHub Releases JSON>`을 실행한다. 이 도구는 두 파일에서 새 버전·공식 설명과 같은 번호의 Windows 패키지 변경 여부를 출력한다. 실행 중인 라이브러리는 이 목록을 조회하지 않는다. [Windows Stable](https://downloads.griptapenodes.com/stable/releases.win-x64-stable.json) · [Standard 릴리스 API](https://api.github.com/repos/griptape-ai/griptape-nodes-library-standard/releases?per_page=100)
+2. 후보마다 사용할 기능, 영향받는 HMB 노드·저장본과 검증 방법을 기록한다. 예를 들어 새 Seedance 해상도는 Draft 다음 선택, 중복 접수, 기존 샷 복원을 함께 검사한다. 브로커의 모델 식별자, 권한, 접수 또는 영수증 계약이 달라져야 하면 서버 작업으로 분리해 먼저 보고한다.
+3. 채택한 기능만 HMB 소스에 반영해 HMB 버전으로 배포한다. 실제 SDK에서 등록·실행·저장·재열기를, 실제 편집기 코드에서 11개 노드의 위젯·헤더와 로동마트 진입을 확인한다. 필수 검사가 건너뛰어지거나 새 번들·엔진의 식별값이 바뀌면 해당 조합은 추가 검토 대상으로 남긴다. [공식 버전 이력 및 HMB 영향](HMB_GRIPTAPE_RELEASE_HISTORY_KO.md)
+
+### Local 독립 실행본
+
+Windows 시작 메뉴의 **HMB Griptape Local**이 전용 실행 주소 `%LOCALAPPDATA%\HMB_GP_Production\Start-HMB.cmd`로 연결된다. 이 경로는 설치 영수증과 HMB 제품 파일을 대조하고, 선택한 고정 Desktop의 엔진과 편집기를 실행한다. Desktop 업데이트 비활성 설정은 이 프로세스에서만 적용된다. 일반 Griptape 바로가기는 공식 설치본을 연다.
+
+다음 Local 릴리스는 승인 ZIP으로 라이브러리를 설치한 뒤 `tools/set_hmb_local_launcher.py`에 해당 ZIP, SHA-256, 실제 라이브러리 위치와 검증된 호스트 폴더를 전달한다. 도구가 일치 여부를 확인하면 같은 실행 주소를 새 버전으로 전환한다. 관리창에서 강제로 Git 동기화해 승인본과 달라지면 HMB 실행기가 중단 사유를 알린다. 해당 릴리스의 복원본과 설치 기록으로 복구한다.
+
+### 별도 PC에서 새 공식 Desktop을 검토할 때
+
+1. 검증 PC의 작업을 저장하고 Desktop의 기본 업데이트 절차를 따른다. 새 SDK·Editor 조합에서는 아래 검사를 거쳐 HMB 화면 연동의 적용 여부를 결정한다.
 2. 별도 검증 PC에서 새 Desktop을 설치하고, 그 Desktop에 포함된 Python으로 `tools/check_griptape_upgrade.py --report-dir <검사 폴더>`를 실행한다. 실제 SDK의 노드 생성·연결·삭제 보호와 저장·재열기를 검사하고, 네이티브 편집기 파일이 검토된 파일인지 기록한다.
 3. 검증 PC에서 샷 관리 화면, 저장·재열기, 연결된 노드의 삭제 거부를 실제로 확인한다. 업그레이드 도구의 성공은 SDK와 디스크 파일 검사 결과다. 실제 화면 결과를 함께 기록한 뒤 관리자 설치본을 팀에 배포한다.
 4. 적용 전 Desktop 설치본과 HMB Git 태그를 함께 보관한다. 새 버전에 문제가 있으면 공식 설치본으로 복구하고 작업 파일은 기존 위치에서 연다.

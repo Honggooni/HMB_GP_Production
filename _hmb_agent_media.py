@@ -66,7 +66,7 @@ with Image.open(io.BytesIO(blob)) as original:
 def _uses_native_user_content(agent: Any) -> bool:
     """Recognize the installed Standard Agent's current native state type."""
     try:
-        from griptape_nodes_library.llm.agent_state import AgentState
+        from _hmb_native_agent.llm.agent_state import AgentState
 
         return type(agent) is AgentState
     except (ImportError, AttributeError):
@@ -79,7 +79,7 @@ def driver_accepts_images(agent: Any) -> bool:
         from griptape_nodes.drivers.cloud_models import VISION_MODEL_CHOICES
 
         if _uses_native_user_content(agent):
-            from griptape_nodes_library.llm.model_config import ModelProvider
+            from _hmb_native_agent.llm.model_config import ModelProvider
 
             config = agent.model
             return (config is not None and config.provider == ModelProvider.GRIPTAPE_CLOUD

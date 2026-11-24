@@ -138,8 +138,8 @@ def check_connected_only_agent(engine, t, agents, generator):
     from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
     from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, DeleteConnectionRequest
     from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
-    from griptape_nodes_library.llm.agent_state import AgentState
-    from griptape_nodes_library.llm.model_config import ModelConfig, ModelProvider
+    from _hmb_native_agent.llm.agent_state import AgentState
+    from _hmb_native_agent.llm.model_config import ModelConfig, ModelProvider
 
     schema = LibrarySchema.model_validate_json((STANDARD / "griptape_nodes_library.json").read_bytes())
     library = LibraryRegistry.generate_new_library(schema)
@@ -215,6 +215,8 @@ async def exercise(engine, phase, out):
         if phase == "reopen":
             result = await asend(engine, RunWorkflowWithCurrentStateRequest(file_path=str(saved)))
             assert str(getattr(result.status, "name", result.status)) == "GOOD", str(result.status)
+            if getattr(result, "open_workflow", None) is not None:
+                guards.enter_context(engine.bind_workflow(engine.open_workflows.get(result.workflow_id)))
             expected = json.loads(expected_file.read_text("utf-8"))
             restored = []
             for name, wanted in expected.items():
@@ -269,7 +271,10 @@ async def exercise(engine, phase, out):
                        mode=node._hmb_seedance_execution_mode(), manual_hook_calls=0)
             return
 
-        flow = engine.flow_manager.get_flow_by_name(send(engine, EnsureWorkflowAndFlowRequest(flow_name="ExplicitOnlySDK")).flow_name)
+        ensured = send(engine, EnsureWorkflowAndFlowRequest(flow_name="ExplicitOnlySDK"))
+        if getattr(ensured, "open_workflow", None) is not None:
+            guards.enter_context(engine.bind_workflow(engine.open_workflows.get(ensured.workflow_id)))
+        flow = engine.flow_manager.get_flow_by_name(ensured.flow_name)
         source_result = send(engine, CreateNodeRequest(node_type="HMBImageAssetLibrary", specific_library_name=schema.name,
             node_name="Disposable Image publisher", initial_setup=True, create_error_proxy_on_failure=False))
         source = engine.node_manager.get_node_by_name(source_result.node_name)
@@ -374,6 +379,8 @@ async def exercise(engine, phase, out):
         # admission failure. Native StartFlow must finish, without inference.
         blocked_flow = engine.flow_manager.get_flow_by_name(send(engine, CreateFlowRequest(
             parent_flow_name=None, flow_name="OnlyBlockedManagerSDK", set_as_new_context=True)).flow_name)
+        if hasattr(engine, "bind_workflow"):
+            guards.enter_context(engine.context_manager.flow(blocked_flow))
         # Keep a deliberately invalid pre-existing wire long enough to inspect
         # the native pre-run guard. Normal HMB routing removes this wire earlier.
         guards.enter_context(mock.patch.object(routing, "reconcile_shot_routing",
@@ -458,7 +465,8 @@ def run_phase(phase, out, *, workspace=None, exercise_flow=None, use_standard=Tr
     os.environ["HMB_GRIPTAPE_STANDARD_LIBRARY_PATH"] = str(STANDARD)
     sys.path[:0] = [str(ROOT), str(ROOT / "resources/tests")]
     if use_standard:
-        sys.path[2:2] = [str(STANDARD), str(STANDARD / ".venv/Lib/site-packages")]
+        sys.path.insert(2, str(STANDARD))
+        sys.path.append(str(STANDARD / ".venv/Lib/site-packages"))
     sys.dont_write_bytecode = True
     attempts = []
     original_connect = socket.socket.connect

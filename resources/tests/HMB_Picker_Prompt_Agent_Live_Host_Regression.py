@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import atexit
+from contextlib import ExitStack
 import copy
 import json
 import os
@@ -205,6 +207,11 @@ GriptapeNodes.EventManager().initialize_queue()
 stamp = time.time_ns()
 ensured = GriptapeNodes.handle_request(EnsureWorkflowAndFlowRequest(flow_name=f"HMBPickerPromptAgentLive_{stamp}"))
 assert ensured.succeeded(), ensured.result_details
+workflow_context = ExitStack()
+atexit.register(workflow_context.close)
+if getattr(ensured, "open_workflow", None) is not None:
+    engine = GriptapeNodes.get_instance()
+    workflow_context.enter_context(engine.bind_workflow(engine.open_workflows.get(ensured.open_workflow.workflow_id)))
 flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
 
 
@@ -538,3 +545,4 @@ assert direct_stamps(hydration_prompt) == {}
 assert "media_preview_sources" not in str(hydration_prompt.parameter_output_values.get("PROMPT_OUT"))
 print("HMB direct physical media sources: connected Picker and ImageAsset, detached, stale hydration and unrelated Prompt: PASS")
 print("HMB Picker -> Prompt -> Agent live host regression: PASS")
+workflow_context.close()

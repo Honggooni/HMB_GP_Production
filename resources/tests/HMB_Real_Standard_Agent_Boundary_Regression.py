@@ -201,7 +201,7 @@ captured = {}
 def non_billable_model_step(self, agent, prompt, *native_args):
     if current_native:
         from pydantic_ai.models.test import TestModel
-        from griptape_nodes_library.llm.models import override_model
+        from _hmb_native_agent.llm.models import override_model
         rulesets = list(agent.rulesets or [])
         runtime_prompt = str(prompt)
         captured["prompt_exact"] = runtime_prompt == (

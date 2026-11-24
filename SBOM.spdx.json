@@ -2,8 +2,8 @@
   "SPDXID": "SPDXRef-DOCUMENT",
   "spdxVersion": "SPDX-2.3",
   "dataLicense": "CC0-1.0",
-  "name": "HMB_GP_Production-0.9.43",
-  "documentNamespace": "https://hmb.local/spdx/HMB_GP_Production/0.9.43",
+  "name": "HMB_GP_Production-0.9.51",
+  "documentNamespace": "https://hmb.local/spdx/HMB_GP_Production/0.9.51",
   "creationInfo": {
     "created": "2026-08-05T00:00:00Z",
     "creators": [
@@ -15,7 +15,7 @@
     {
       "SPDXID": "SPDXRef-HMB-GP-Production",
       "name": "hmb-gp-production",
-      "versionInfo": "0.9.43",
+      "versionInfo": "0.9.51",
       "downloadLocation": "NOASSERTION",
       "filesAnalyzed": false,
       "licenseConcluded": "LicenseRef-HMB-Internal-1.0",
@@ -84,6 +84,17 @@
       "licenseDeclared": "Apache-2.0",
       "copyrightText": "NOASSERTION",
       "comment": "Optional local-video upload runtime. Installed only in .venv-tos and executed in an isolated child interpreter; never an editor-process dependency."
+    },
+    {
+      "SPDXID": "SPDXRef-Griptape-Agent-Subset",
+      "name": "Griptape Nodes Library Standard - reviewed Agent implementation",
+      "versionInfo": "0.91.1",
+      "downloadLocation": "git+https://github.com/griptape-ai/griptape-nodes-library-standard.git@29e91f362343e2eba4fb3d2d48ef05d43bb34d53",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "copyrightText": "NOASSERTION",
+      "comment": "The HMB private namespace contains the reviewed Agent subset. Original and modified file digests are listed in _hmb_native_agent/UPSTREAM.json."
     }
   ],
   "relationships": [
@@ -122,6 +133,11 @@
       "relationshipType": "OPTIONAL_DEPENDENCY_OF",
       "relatedSpdxElement": "SPDXRef-HMB-GP-Production",
       "comment": "Only the explicitly selected TOS upload path requires this separate runtime."
+    },
+    {
+      "spdxElementId": "SPDXRef-HMB-GP-Production",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Griptape-Agent-Subset"
     }
   ],
   "hasExtractedLicensingInfos": [

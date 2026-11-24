@@ -10,7 +10,7 @@ const stockPath=process.env.HMB_STOCK_EDITOR_0130_SOURCE;
 const overlayPath=process.env.HMB_HEADER_0130_CANDIDATE;
 const assets=path.dirname(stockPath);
 const origin='http://127.0.0.1:12732';
-const editorHtml=fs.readFileSync(path.join(assets,'..','index-editor.html'),'utf8');
+const editorHtml=fs.readFileSync(process.env.HMB_REVIEWED_STOCK_ENTRY || path.join(assets,'..','index-editor.html'),'utf8');
 assert.ok(editorHtml.includes(path.basename(stockPath)));
 const sha=file=>createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 const stockHash=sha(stockPath);

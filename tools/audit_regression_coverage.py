@@ -80,6 +80,8 @@ def validate_registry(root: Path = ROOT, registry: str = REGISTRY) -> list[dict[
 def classify_result(row: dict[str, Any], returncode: int, output: str) -> tuple[str, str]:
     if returncode:
         return "failed", "nonzero_exit"
+    if re.search(r"^Exception in thread [^\r\n]+:\r?\nTraceback \(most recent call last\):", output, re.MULTILINE):
+        return "failed", "unhandled_thread_exception"
     if _SKIP.search(output):
         return ("failed", "required_coverage_skipped") if row["required"] else ("not_run", "optional_runtime_unavailable")
     return "passed", "exit_zero_without_skip"

@@ -20,6 +20,8 @@ import tempfile
 from unittest import mock
 from uuid import uuid4
 
+from hmb_host_workflow import run_in_fixture_workflow
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
@@ -186,7 +188,7 @@ def main():
             try:
                 from griptape_nodes.retained_mode.engine import engine_scope
                 with engine_scope() as engine:
-                    asyncio.run(exercise(engine))
+                    asyncio.run(run_in_fixture_workflow(engine, "SyntheticBridgeMount", exercise))
             finally:
                 os.chdir(previous)
                 logging.shutdown()

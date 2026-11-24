@@ -14,11 +14,7 @@ from unittest import mock
 
 
 ROOT = Path(os.environ.get("HMB_PICKER_TEST_ROOT", str(Path(__file__).resolve().parents[2])))
-STANDARD = Path(os.environ.get(
-    "HMB_GRIPTAPE_STANDARD_LIBRARY_PATH",
-    str(Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard"),
-))
-sys.path[:0] = [str(ROOT), str(STANDARD)]
+sys.path.insert(0, str(ROOT))
 
 
 def main() -> None:
@@ -33,7 +29,8 @@ def main() -> None:
             "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "LOCALAPPDATA", "APPDATA",
         )}
         env["GTN_CONFIG_WORKSPACE_DIRECTORY"] = str(workspace)
-        with mock.patch.dict(os.environ, env), mock.patch.object(
+        blocked = {"griptape_nodes_library": None, "griptape_nodes_library.utils.macro_path_utils": None}
+        with mock.patch.dict(sys.modules, blocked), mock.patch.dict(os.environ, env), mock.patch.object(
             socket, "create_connection", side_effect=AssertionError("Network forbidden")
         ):
             logging.disable(logging.CRITICAL)
@@ -41,7 +38,6 @@ def main() -> None:
                 from griptape_nodes.files.file import File
                 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
                 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import _resolve_sidecar_path
-                from griptape_nodes_library.utils.macro_path_utils import resolve_to_macro_path
                 import HMBVideoPickerLibrary as picker
                 from _hmb_video_tools import _find_ffmpeg
 
@@ -56,7 +52,7 @@ def main() -> None:
                     _find_ffmpeg(), "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=96x64:r=24",
                     "-t", "0.25", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
                 ], check=True)
-                assert resolve_to_macro_path(str(source)).is_external
+                assert picker._picker_project_macro(source, workflow) is None
                 # Each output uses the same publication API, regardless of Maya version.
                 for slot, role in enumerate(("Original", "Mask", "Depth", "MotionGuide"), 1):
                     records = []
@@ -67,7 +63,17 @@ def main() -> None:
                     target = Path(File(macro).resolve()).resolve()
                     assert target.is_relative_to(workspace.resolve()), target
                     assert target.read_bytes() == source.read_bytes()
-                    assert not resolve_to_macro_path(str(target)).is_external
+                    assert picker._picker_project_macro(target, workflow) == macro
+                    reopened = Path(File(macro, workflow=workflow).resolve()).resolve()
+                    assert reopened == target and reopened.read_bytes() == source.read_bytes()
+                    with engine.bind_workflow(workflow):
+                        assert picker._picker_tools_reference_path(macro) == reopened
+                    duplicate_records = []
+                    _, same_macro = picker._copy_video_to_griptape_project(
+                        SimpleNamespace(name=f"Picker_{role}", workflow=workflow), reopened, slot,
+                        transaction_records=duplicate_records, backup_folder=root / f"duplicate-{slot}",
+                    )
+                    assert same_macro == macro and not duplicate_records
                     metadata = _resolve_sidecar_path(target, engine, workflow)
                     assert metadata.is_relative_to(workspace.resolve()), metadata
                     document = json.loads(metadata.read_text(encoding="utf-8"))
@@ -76,7 +82,7 @@ def main() -> None:
                     picker.HMBVideoPickerLibrary._restore_playblast_bundle(records)
                     assert not target.exists() and not metadata.exists()
                     assert source.is_file(), "Rollback must not remove the source video."
-    print("HMB_PICKER_SIDECAR_HOST=PASS (real host project copy, engine, metadata, rollback; 4 output roles)")
+    print("HMB_PICKER_SIDECAR_HOST=PASS (real host project copy, macro reopen without duplicate, metadata, rollback; 4 output roles, Standard blocked)")
 
 
 if __name__ == "__main__":

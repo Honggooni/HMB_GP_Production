@@ -72,6 +72,10 @@ async def check_wired_image_with_existing_shot(workspace):
     flow = ensure_fixture_flow(GriptapeNodes, "WiredImageExistingShot")
     schema = LibrarySchema.model_validate_json((Path(asset.__file__).parent / "griptape-nodes-library.json").read_bytes())
     registered = LibraryRegistry.generate_new_library(schema)
+    standard_schema = LibrarySchema.model_validate_json((standard / "griptape_nodes_library.json").read_bytes())
+    standard_library = LibraryRegistry.generate_new_library(standard_schema)
+    load_entry = next(item for item in standard_schema.nodes if item.class_name == "LoadImage")
+    standard_library.register_lazy_node_type("LoadImage", load_entry.metadata, lambda: LoadImage)
     for cls in (asset.HMBImageAssetLibrary, seedance.HMBSeedanceGeneration):
         entry = next(item for item in schema.nodes if item.class_name == cls.__name__)
         registered.register_lazy_node_type(entry.class_name, entry.metadata, lambda cls=cls: cls)
@@ -89,6 +93,7 @@ async def check_wired_image_with_existing_shot(workspace):
             "image_main_type": "Custom / Context", "image_sub_type": "Context",
         }]}), encoding="utf-8")
         image = LoadImage(name="Dingo")
+        image.metadata.update(library=standard_schema.name, node_type="LoadImage")
         register(flow, image)
         image.set_parameter_value("path", str(path))
         with patch.object(asset, "DEFAULT_PROJECTS_ROOT", catalog):
@@ -128,7 +133,7 @@ async def check_wired_image_with_existing_shot(workspace):
                 with patch.object(library, "_execution_preparation_identity", record_widget_read):
                     result = await GriptapeNodes.ahandle_request(ResolveNodeRequest(node_name=library.name))
                 assert not result.failed(), (attempt, str(result.result_details))
-                assert image.parameter_output_values["was_successful"]
+                assert image.parameter_output_values.get("image"), (image.state, image.get_parameter_value("result_details"))
                 assert image.parameter_output_values["image"].value == "{inputs}/images/Dingo.jpg"
                 assert checked_state_reads
                 for sdk_value, stored_json in checked_state_reads:
@@ -465,8 +470,19 @@ async def main():
     release.set()
 
 
-asyncio.run(main())
-with tempfile.TemporaryDirectory() as workspace, patch.dict(os.environ, GTN_CONFIG_WORKSPACE_DIRECTORY=workspace):
-    with engine_scope():
-        asyncio.run(check_wired_image_with_existing_shot(Path(workspace)))
+from hmb_host_workflow import run_in_fixture_workflow
+
+
+async def check_dispatch(_engine):
+    await main()
+
+
+async def check_wired(_engine, workspace):
+    await check_wired_image_with_existing_shot(workspace)
+
+
+with engine_scope() as engine:
+    asyncio.run(run_in_fixture_workflow(engine, "ImageAssetSelectionOfflineFlow", check_dispatch))
+with engine_scope() as engine:
+    asyncio.run(run_in_fixture_workflow(engine, "WiredImageExistingShot", check_wired, _base))
 print("ImageAsset selection native SDK dispatch/heartbeat/immediate Run: PASS")

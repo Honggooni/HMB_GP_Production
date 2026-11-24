@@ -14168,6 +14168,25 @@ def _call_picker_sidecar_api(function: Any, *args: Any, workflow: Any = None) ->
     return function(*positional, **keyword)
 
 
+def _picker_project_macro(path: Path, workflow: Any) -> Optional[str]:
+    """Ask the owning Griptape project for the portable reference of a local file."""
+    from griptape_nodes.retained_mode.events.project_events import (
+        AttemptMapAbsolutePathToProjectRequest,
+        AttemptMapAbsolutePathToProjectResultSuccess,
+    )
+    if not path.is_file():
+        return None
+    request = AttemptMapAbsolutePathToProjectRequest(absolute_path=path.resolve(), broadcast_result=False)
+    try:
+        from griptape_nodes.files.workflow_requests import handle_request_in
+    except ImportError:
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        result = GriptapeNodes.handle_request(request)
+    else:
+        result = handle_request_in(workflow, request)
+    return result.mapped_path if isinstance(result, AttemptMapAbsolutePathToProjectResultSuccess) else None
+
+
 def _copy_video_to_griptape_project(
     node: Any,
     path: Path,
@@ -14178,18 +14197,16 @@ def _copy_video_to_griptape_project(
     defer_metadata: bool = False,
 ) -> tuple[Any, str]:
     """Return a project artifact and optionally enroll its files in rollback."""
+    workflow = getattr(node, "workflow", None)
     try:
-        from griptape_nodes_library.utils.macro_path_utils import (  # type: ignore
-            resolve_to_macro_path,
-        )
-    except Exception:
+        macro_path = _picker_project_macro(path, workflow)
+    except ImportError:
         value = str(path.resolve())
         return _video_artifact_value(value), value
 
     metadata = {} if defer_metadata else _local_video_player_metadata(path)
-    resolved = resolve_to_macro_path(str(path.resolve()))
-    if not resolved.is_external:
-        return _video_artifact_value(resolved.resolved_path, metadata), resolved.resolved_path
+    if macro_path is not None:
+        return _video_artifact_value(macro_path, metadata), macro_path
     if VideoUrlArtifact is None:
         value = str(path.resolve())
         return value, value
@@ -14219,7 +14236,6 @@ def _copy_video_to_griptape_project(
             "Griptape project artifact rollback support is unavailable."
         ) from exc
 
-    workflow = getattr(node, "workflow", None)
     bound_destination = getattr(ProjectFileDestination, "from_situation_in_workflow", None)
     destination_factory = bound_destination if callable(bound_destination) else ProjectFileDestination.from_situation
     project_destination = destination_factory(
@@ -14340,12 +14356,11 @@ def _copy_video_to_griptape_project(
                 "Griptape project metadata sidecar is not a valid JSON object."
             ) from exc
 
-        macro_result = resolve_to_macro_path(str(actual_target))
-        if macro_result.is_external:
+        macro_path = _picker_project_macro(actual_target, workflow)
+        if macro_path is None:
             raise RuntimeError(
                 "Griptape could not map its project copy back to a project macro."
             )
-        macro_path = macro_result.resolved_path
         transaction_records.extend(pending_records)
     except Exception:
         if pending_records:
@@ -16557,6 +16572,25 @@ class HMBVideoPickerLibrary(DataNode):
             validate_media=validate_media,
             _target_shot_uuid=target,
         )
+
+    def _hmb_restore_accepted_shot_catalog(self, value: Any) -> bool:
+        """Rehydrate an empty runtime cache only from the persisted acceptance receipt."""
+        if getattr(self, "_hmb_shot_catalog_snapshot", None) is not None:
+            return False
+        with self._hmb_catalog_state_commit():
+            state = self._picker_state()
+            channel = _uuid_text(state.get("channel_uuid"))
+            if not channel or getattr(self, "_hmb_shot_catalog_snapshot", None) is not None:
+                return False
+            snapshot = self._validate_image_shot_catalog_snapshot(value, expected_channel_uuid=channel)
+            if (snapshot["publisher_instance_uuid"] != state.get("shot_publisher_instance_uuid")
+                    or snapshot["publisher_instance_uuid"] != state.get("accepted_shot_catalog_publisher_instance_uuid")
+                    or channel != state.get("accepted_shot_catalog_channel_uuid")
+                    or snapshot["generation"] != state.get("accepted_shot_catalog_generation")
+                    or snapshot["metadata_sha256"] != state.get("accepted_shot_catalog_metadata_sha256")):
+                return False
+            self._hmb_shot_catalog_snapshot = snapshot
+            return True
 
     def _hmb_shot_routing_snapshot_locked(
         self,
@@ -21268,9 +21302,15 @@ class HMBVideoPickerLibrary(DataNode):
             ) == owner_generation:
                 return False
             self._hmb_thumbnail_recovery_generation = owner_generation
+            workflow = getattr(self, "workflow", None)
+            if workflow is not None:
+                with workflow.engine.bind_workflow(workflow):
+                    recovery_context = copy_context()
+            else:
+                recovery_context = copy_context()
             worker = threading.Thread(
-                target=self._recover_missing_video_thumbnails,
-                args=(owner_generation,),
+                target=recovery_context.run,
+                args=(self._recover_missing_video_thumbnails, owner_generation),
                 name="HMBVideoPicker-thumbnail-recovery",
                 daemon=True,
             )

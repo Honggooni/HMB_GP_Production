@@ -202,6 +202,11 @@ def missing_display_callback_does_not_requeue_itself(prompt, row, channel):
 
 
 async def prompt_views(engine):
+    from hmb_host_workflow import run_in_fixture_workflow
+    await run_in_fixture_workflow(engine, "PrivateScopedColdReload", check_prompt_views)
+
+
+async def check_prompt_views(engine):
     import HMBImageAssetLibrary as images
     import HMBVideoPickerLibrary as pickers
     import HMBPromptLibrary as prompts
@@ -219,8 +224,11 @@ async def prompt_views(engine):
     else:
         flow_name = engine.node_manager._name_to_parent_flow_name[prompt.name]
     owner_flow = engine.flow_manager.get_flow_by_name(flow_name)
-    if not engine.context_manager.has_current_flow():
-        engine.context_manager.push_flow(owner_flow)
+    with engine.context_manager.flow(owner_flow):
+        check_loaded_prompt(engine, prompt, image, picker, cold, prompts, images, pickers)
+
+
+def check_loaded_prompt(engine, prompt, image, picker, cold, prompts, images, pickers):
     assert callable(getattr(prompt, "_hmb_prompt_shot_view", None)), "Presentation-only Prompt API is required"
     record("native_five_shot_source_bindings_and_literal_cold_reopen", shots=5,
         actual_SDK_serialize_delete_deserialize=True, image_and_video_per_Shot=True)
@@ -378,7 +386,8 @@ def main():
     for key in tuple(os.environ):
         if any(token in key.upper() for token in ("API_KEY", "ACCESS_TOKEN", "SECRET", "PASSWORD")):
             os.environ.pop(key, None)
-    sys.path[:0] = [str(ROOT), str(ROOT / "resources/tests"), str(standard), str(standard / ".venv/Lib/site-packages")]
+    sys.path[:0] = [str(ROOT), str(ROOT / "resources/tests"), str(standard)]
+    sys.path.append(str(standard / ".venv/Lib/site-packages"))
     if importlib.util.find_spec("griptape_nodes") is None:
         print("HMB_PAGE_ONLY_SHOT_SWITCH_HOST=SKIP (installed SDK required)")
         return

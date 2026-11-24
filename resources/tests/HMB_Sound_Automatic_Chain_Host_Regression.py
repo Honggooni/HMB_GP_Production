@@ -88,13 +88,18 @@ async def exercise(engine, phase, out):
                 stream.setnchannels(1); stream.setsampwidth(2); stream.setframerate(8000)
                 stream.writeframes(b"\x00\x08" * 2000)
             expected_audio_roots.append(str(audio_root.resolve()))
-            while engine.context_manager.has_current_flow():
-                engine.context_manager.pop_flow()
+            if hasattr(engine.context_manager, "pop_flow"):
+                while engine.context_manager.has_current_flow():
+                    engine.context_manager.pop_flow()
             flow_name = f"Automatic Sound order {index}"
             if index == 1:
-                harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name=flow_name))
+                ensured = harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name=flow_name))
+                if getattr(ensured, "open_workflow", None) is not None:
+                    guards.enter_context(engine.bind_workflow(engine.open_workflows.get(ensured.workflow_id)))
             else:
-                harness.send(engine, CreateFlowRequest(flow_name=flow_name, parent_flow_name="Automatic Sound order 1", set_as_new_context=True))
+                created = harness.send(engine, CreateFlowRequest(flow_name=flow_name, parent_flow_name="Automatic Sound order 1", set_as_new_context=True))
+                if hasattr(engine, "bind_workflow"):
+                    guards.enter_context(engine.context_manager.flow(created.flow_name))
             nodes = {}
             order = ("HMBSoundLibrary", "HMBColorLUTLibrary", "HMBSeedanceGeneration", "HMBAgentLibrary", "HMBPromptLibrary", "HMBImageAssetLibrary") if sound_first else (
                 "HMBImageAssetLibrary", "HMBPromptLibrary", "HMBAgentLibrary", "HMBSeedanceGeneration", "HMBColorLUTLibrary", "HMBSoundLibrary")
@@ -181,9 +186,12 @@ async def exercise(engine, phase, out):
         assert flows[1]["HMBSoundLibrary"]._state_sound["project_root"] == expected_audio_roots[1]
         assert expected_audio_roots[0] != expected_audio_roots[1]
         harness.record("same_uuids_other_flow_keeps_independent_sound_project_catalog_and_tracks", provider_calls=0)
-        while engine.context_manager.has_current_flow():
-            engine.context_manager.pop_flow()
-        harness.send(engine, CreateFlowRequest(flow_name="Cancelled Sound registration", parent_flow_name="Automatic Sound order 1", set_as_new_context=True))
+        if hasattr(engine.context_manager, "pop_flow"):
+            while engine.context_manager.has_current_flow():
+                engine.context_manager.pop_flow()
+        created = harness.send(engine, CreateFlowRequest(flow_name="Cancelled Sound registration", parent_flow_name="Automatic Sound order 1", set_as_new_context=True))
+        if hasattr(engine, "bind_workflow"):
+            guards.enter_context(engine.context_manager.flow(created.flow_name))
         temp_image = create("HMBImageAssetLibrary", "Registration lifetime Image")
         image_module = modules["HMBImageAssetLibrary"]
         saved_image = image_module._load_project_catalog(projects, image_module._default_state(), use_shared_cache=False)

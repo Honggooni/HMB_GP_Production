@@ -247,8 +247,8 @@ class ReferenceAnalysisTest(unittest.TestCase):
         from openai import AsyncOpenAI
         from pydantic_ai.models.openai import OpenAIChatModel
         from pydantic_ai.providers.openai import OpenAIProvider
-        from griptape_nodes_library.llm.models import override_model
-        from griptape_nodes_library.utils import model_invocation
+        from _hmb_native_agent.llm.models import override_model
+        from _hmb_native_agent.utils import model_invocation
 
         requests = []
         receipts = []
@@ -344,9 +344,9 @@ class ReferenceAnalysisTest(unittest.TestCase):
         self.assertEqual(uncertain.exception.code, "ANALYSIS_RESULT_UNCONFIRMED")
 
     def test_validation_reuses_agent_model_credentials_and_token_settings(self):
-        from griptape_nodes_library.llm import runner
-        from griptape_nodes_library.llm.model_config import cloud_model_config
-        from griptape_nodes_library.utils import model_invocation
+        from _hmb_native_agent.llm import runner
+        from _hmb_native_agent.llm.model_config import cloud_model_config
+        from _hmb_native_agent.utils import model_invocation
 
         config = cloud_model_config("gemini-2.5-pro")
         config.settings["max_tokens"] = 1234
@@ -382,9 +382,9 @@ class ReferenceAnalysisTest(unittest.TestCase):
             self.assertNotIn(config.api_key, entry.read_text("utf-8"))
 
     def test_selected_agent_audio_model_keeps_exact_settings_without_fallback(self):
-        from griptape_nodes_library.llm import runner
-        from griptape_nodes_library.llm.model_config import cloud_model_config
-        from griptape_nodes_library.utils import model_invocation
+        from _hmb_native_agent.llm import runner
+        from _hmb_native_agent.llm.model_config import cloud_model_config
+        from _hmb_native_agent.utils import model_invocation
 
         config = cloud_model_config("gemini-2.5-pro")
         config.settings["max_tokens"] = 1379
@@ -401,7 +401,7 @@ class ReferenceAnalysisTest(unittest.TestCase):
 
     def test_same_shot_agent_model_uses_active_and_saved_native_choices(self):
         import HMBAgentLibrary as agent_module
-        from griptape_nodes_library.llm.model_config import ModelConfig, ModelProvider, cloud_model_config
+        from _hmb_native_agent.llm.model_config import ModelConfig, ModelProvider, cloud_model_config
 
         class RegisteredAgent(agent_module.HMBAgentLibrary):
             pass

@@ -100,8 +100,12 @@ async def exercise(engine, directory):
             library.register_lazy_node_type(definition.class_name, definition.metadata, lambda cls=cls: cls)
     engine.event_manager.initialize_queue()
     reference_nodes = []
+    workflow_context = ExitStack()
     try:
         ensured = send(engine, EnsureWorkflowAndFlowRequest(flow_name="SyntheticPromptSaveRoundtrip"))
+        if getattr(ensured, "open_workflow", None) is not None:
+            workflow = engine.open_workflows.get(ensured.open_workflow.workflow_id)
+            workflow_context.enter_context(engine.bind_workflow(workflow))
         flow = engine.flow_manager.get_flow_by_name(ensured.flow_name)
 
         def create(kind, name):
@@ -291,6 +295,7 @@ async def exercise(engine, directory):
         assert not ATTEMPTS, ATTEMPTS
         print("HMB_PROMPT_SAVE_ROUNDTRIP_HOST=PASS (actual SDK10 reference constructors; 120 catalog ACK/write0; codegen AST; native temp atomic save + denied-rename old-file protection; 10 nodes/21 exact edges + five Prompt/Agent/Finish bodies preserved; RGB/OFF/0/literals; Draft/Resume/480p unchanged; model/render/network0)")
     finally:
+        workflow_context.close()
         LibraryRegistry.unregister_library(schema.name, event_manager=engine.event_manager)
 
 

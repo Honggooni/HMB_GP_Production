@@ -14,6 +14,12 @@ const patch3 = editorSourceHash === 'b0c4f9d4c8d78243b5f1d505187d1c5e49119854912
 const editor132 = editorSourceHash === '547cd4cc14430531d96b865d2d45f1263f32b260f0108300acd0f6ed4cd4a1b4';
 assert.ok(editor132 || patch3 || patch2 || editorSourceHash === '841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e');
 const candidate = candidateBytes.toString('utf8');
+if (editor132) {
+  assert.ok(stockBytes.toString('utf8').includes('T.showNodeDocsButton!==!1&&(0,Z.jsx)(yOe,'));
+  assert.ok(!candidate.includes('(0,Z.jsx)(yOe,'), 'Node header still mounts Open docs');
+  assert.ok(candidate.includes('children:[hmb130ConnectionIcon(e,hmbLibrary),ge.map(e=>ve(e)),ne?'),
+    'An empty slot was left between the header actions and the status');
+}
 // Run the bundled click handler with the same outer node and inner action
 // scopes as the native toolbar. Using the fixture's node directly hides shadowing.
 const headerScope = candidate.match(/hmbLibrary\}\)=>\{const ([^;]*?)hmbHeaderHost=Y\.useRef/);

@@ -51,6 +51,12 @@ def assert_no_values(document):
 
 
 def exercise(engine):
+    from hmb_host_workflow import scoped_fixture_workflow
+    with scoped_fixture_workflow(engine, "PrivateNativeAgentSwitch"):
+        _exercise(engine)
+
+
+def _exercise(engine):
     import HMBAgentLibrary as agents
     import HMB_Agent_Shot_Switch_Native_Host_Regression as native
     from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema

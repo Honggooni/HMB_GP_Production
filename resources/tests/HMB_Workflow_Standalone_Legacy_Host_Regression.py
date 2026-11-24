@@ -274,8 +274,6 @@ async def roundtrip(engine, directory, phase):
             expected = decode_value(json.loads((directory / "expected.json").read_text("utf-8")))
             assert expected["writer_pid"] != os.getpid()
             context = base.send(engine, EnsureWorkflowAndFlowRequest(flow_name="ReadOnlyReopenContext"))
-            while engine.context_manager.has_current_flow():
-                engine.context_manager.pop_flow()
             base.send(engine, DeleteFlowRequest(flow_name=context.flow_name))
             loaded = await engine.ahandle_request(DeserializeFlowFromCommandsRequest(
                 serialized_flow_commands=decode_value(json.loads(saved)), broadcast_result=False))
@@ -346,12 +344,14 @@ def main():
             stack.enter_context(mock.patch.object(agents.HMBAgentLibrary, "process", base.no_execution))
             stack.enter_context(mock.patch.object(generators.HMBSeedanceGeneration, "_process_generation", base.no_execution))
             logging.disable(logging.CRITICAL)
+            from hmb_host_workflow import run_in_fixture_workflow
             with engine_scope() as engine:
                 if args.roundtrip_phase:
                     assert args.roundtrip_dir and args.roundtrip_dir.is_dir()
-                    asyncio.run(roundtrip(engine, args.roundtrip_dir, args.roundtrip_phase))
+                    flow_name = "StandaloneSchemaRoundtrip" if args.roundtrip_phase == "write" else "ReadOnlyReopenContext"
+                    asyncio.run(run_in_fixture_workflow(engine, flow_name, roundtrip, args.roundtrip_dir, args.roundtrip_phase))
                 else:
-                    asyncio.run(exercise(engine, temporary))
+                    asyncio.run(run_in_fixture_workflow(engine, "LegacyStandalone", exercise, temporary))
             assert base.NETWORK == [] and base.EXECUTED == []
     if args.roundtrip_phase:
         return

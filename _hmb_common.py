@@ -118,6 +118,7 @@ _AGENT_POLICY_DIAGNOSTIC_STAGES = frozenset(
         "provenance_argv0_rejected",
         "provenance_arguments_rejected",
         "provenance_parent_rejected",
+        "provenance_pinned_host_rejected",
         "provenance_probe_exception",
         "local_dat_read_enter",
         "local_dat_read_ok",
@@ -744,6 +745,12 @@ _AGENT_POLICY_ROAMING_APPDATA_GUID = _AgentPolicyGuid(
     0x4CF6,
     (ctypes.c_ubyte * 8)(0xA0, 0x3A, 0xE3, 0xEF, 0x65, 0x72, 0x9F, 0x3D),
 )
+_AGENT_POLICY_LOCAL_APPDATA_GUID = _AgentPolicyGuid(
+    0xF1B32785,
+    0x6FBA,
+    0x4FCF,
+    (ctypes.c_ubyte * 8)(0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91),
+)
 
 
 def _wipe_agent_policy_buffer(value: Optional[bytearray]) -> None:
@@ -758,8 +765,12 @@ def _agent_policy_roaming_appdata_path() -> Path:
         path = Path(appdata)
         if path.is_absolute():
             return path
+    return _agent_policy_known_folder(_AGENT_POLICY_ROAMING_APPDATA_GUID)
+
+
+def _agent_policy_known_folder(folder: _AgentPolicyGuid) -> Path:
     if os.name != "nt":
-        raise RuntimeError("The saved FN AI Broker login is unavailable.")
+        raise RuntimeError("The Windows profile folder is unavailable.")
 
     shell32, ole32 = ctypes.windll.shell32, ctypes.windll.ole32
     shell32.SHGetKnownFolderPath.argtypes = [
@@ -775,22 +786,22 @@ def _agent_policy_roaming_appdata_path() -> Path:
     try:
         result = int(
             shell32.SHGetKnownFolderPath(
-                ctypes.byref(_AGENT_POLICY_ROAMING_APPDATA_GUID),
+                ctypes.byref(folder),
                 0,
                 None,
                 ctypes.byref(allocated),
             )
         )
         if result != 0 or not allocated.value:
-            raise RuntimeError("The saved FN AI Broker login is unavailable.")
+            raise RuntimeError("The Windows profile folder is unavailable.")
         resolved = Path(ctypes.wstring_at(allocated.value))
         if not resolved.is_absolute():
-            raise RuntimeError("The saved FN AI Broker login is unavailable.")
+            raise RuntimeError("The Windows profile folder is unavailable.")
         return resolved
     except RuntimeError:
         raise
     except Exception as exc:
-        raise RuntimeError("The saved FN AI Broker login is unavailable.") from exc
+        raise RuntimeError("The Windows profile folder is unavailable.") from exc
     finally:
         if allocated.value:
             ole32.CoTaskMemFree(allocated)
@@ -1018,26 +1029,62 @@ def _agent_policy_process_command_line() -> tuple[str, ...]:
         kernel32.LocalFree(ctypes.cast(arguments, wintypes.HLOCAL))
 
 
+_AGENT_POLICY_DESKTOP_EXE = Path("griptape-nodes-desktop.exe")
+_AGENT_POLICY_DESKTOP_PYTHON = Path("resources/engine-bundle/python/python.exe")
+_AGENT_POLICY_APP_MODULE = _AGENT_POLICY_DESKTOP_PYTHON.parent / "Lib/site-packages/griptape_nodes_app"
+# Compiled pins for the reviewed official Windows Desktop distribution.
+# The last two folder components are the independently versioned Editor
+# overlay and HMB launcher build. Their names do not grant policy access.
+_AGENT_POLICY_PINNED_DESKTOP_VERSION = "0.31.0"
+_AGENT_POLICY_PINNED_HOST_FILES = {
+    _AGENT_POLICY_DESKTOP_EXE: "ed02e54b65e5555089931495071b37728792458acfdbae4f37db19ca5b5de856",
+    _AGENT_POLICY_DESKTOP_PYTHON: "d8e3f0adf246db00358c0c4ed349cf714898178f9558fb0e944f79f5c07f8eaa",
+    Path("resources/app.asar"): "01749103f8e298d28bd0632a8cd7f57ec1a0aed09e2eeb7f4fcc1ec8208725d3",
+    _AGENT_POLICY_APP_MODULE / "__main__.py": "3a13d4b67d942acac8d21883ad3fca5bff14fb97122a0371d52c9fd9c585eef2",
+    _AGENT_POLICY_APP_MODULE / "__init__.py": "00438a40627d8fe6e61824d879298b4e1fa5a8db8750b502db5abd7d40130ae8",
+}
+
+
+def _agent_policy_pinned_host_is_reviewed(root: Path) -> bool:
+    vendor_dir = _agent_policy_known_folder(_AGENT_POLICY_LOCAL_APPDATA_GUID) / "ai.griptape.nodes.desktop"
+    if root.parent != vendor_dir or root.resolve(strict=True) != root:
+        return False
+    for relative, expected_hash in _AGENT_POLICY_PINNED_HOST_FILES.items():
+        path = root / relative
+        if path.resolve(strict=True) != path:
+            return False
+        before = path.lstat()
+        if _agent_policy_path_is_reparse(before) or not stat.S_ISREG(before.st_mode):
+            return False
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if not os.path.samestat(opened, before):
+                return False
+            actual_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+            if (_agent_policy_file_identity(os.fstat(stream.fileno())) != _agent_policy_file_identity(opened)
+                    or _agent_policy_file_identity(path.lstat()) != _agent_policy_file_identity(before)):
+                return False
+        if not hmac.compare_digest(actual_hash, expected_hash):
+            return False
+    return True
+
+
 def _agent_policy_process_provenance_valid() -> bool:
     if os.name != "nt":
         _agent_policy_log_stage("provenance_platform_rejected")
         return False
     try:
-        # Electron may construct the engine environment without LOCALAPPDATA.
-        # Derive the immutable packaged root from the running executable, then
-        # verify its exact directory shape, argv and immediate Desktop parent.
-        # This is not a relaxed path: copied/arbitrary Python installations do
-        # not satisfy the fixed ai.griptape.nodes.desktop/current structure.
-        expected_python = Path(sys.executable)
-        current = expected_python.parents[3]
-        expected_parent = current / "griptape-nodes-desktop.exe"
-        arguments = _agent_policy_process_command_line()
-        if not (
-            current.name.casefold() == "current"
-            and current.parent.name.casefold() == "ai.griptape.nodes.desktop"
-        ):
+        executable = Path(sys.executable)
+        root = executable.parents[3]
+        expected_python = root / _AGENT_POLICY_DESKTOP_PYTHON
+        pinned = re.fullmatch(
+            rf"hmb-pinned-desktop-{re.escape(_AGENT_POLICY_PINNED_DESKTOP_VERSION)}-[0-9a-f]{{8}}-[0-9a-f]{{8}}",
+            root.name.casefold(),
+        )
+        if root.parent.name.casefold() != "ai.griptape.nodes.desktop" or not (root.name.casefold() == "current" or pinned):
             _agent_policy_log_stage("provenance_layout_rejected")
             return False
+        arguments = _agent_policy_process_command_line()
         if len(arguments) != 3:
             _agent_policy_log_stage("provenance_argv_count_rejected")
             return False
@@ -1051,9 +1098,12 @@ def _agent_policy_process_provenance_valid() -> bool:
             _agent_policy_log_stage("provenance_arguments_rejected")
             return False
         if not _agent_policy_exact_windows_path(
-            _agent_policy_parent_process_image(), expected_parent
+            _agent_policy_parent_process_image(), root / _AGENT_POLICY_DESKTOP_EXE
         ):
             _agent_policy_log_stage("provenance_parent_rejected")
+            return False
+        if pinned and not _agent_policy_pinned_host_is_reviewed(root):
+            _agent_policy_log_stage("provenance_pinned_host_rejected")
             return False
         _agent_policy_log_stage("provenance_accepted")
         return True

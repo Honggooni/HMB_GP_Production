@@ -15,6 +15,8 @@ import threading
 import time
 from unittest import mock
 
+from hmb_host_workflow import run_in_fixture_workflow
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 STANDARD = Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard"
@@ -26,6 +28,10 @@ RESULT = {}
 def deny(*args, **kwargs): raise AssertionError("Provider/network is forbidden")
 
 async def exercise(engine, directory, extension=None):
+    return await run_in_fixture_workflow(engine, "BashWorkerActualSDK", exercise_workflow, directory, extension)
+
+
+async def exercise_workflow(engine, directory, extension=None):
     import HMBImageBash as product
     from PIL import Image
     from griptape_nodes.exe_types.core_types import Parameter, ParameterMode

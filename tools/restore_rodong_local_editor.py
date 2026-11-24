@@ -53,7 +53,7 @@ EDITOR_1303 = EditorProfile("index-Dq4UDcw5.js",
 EDITOR_1320 = EditorProfile("index-BnKynVUp.js",
     "547cd4cc14430531d96b865d2d45f1263f32b260f0108300acd0f6ed4cd4a1b4",
     "885afee77565b37d5905fc32a09b4017c5d34d9f391e19db9ff0ff7d2a6ffebe",
-    "cd8e6758c89ead317a6067d9d0846b9e335496443283041bcdb889ddfe0c338d")
+    "74bc17db683bd39f60cb4bee552074bb2f063ee8457f37c267b0eecd154155ba")
 
 
 def editor_profile(entry: bytes) -> EditorProfile:
@@ -79,7 +79,7 @@ def stock_entry_from_active(entry: bytes, overlay_name: str) -> bytes:
     previous = {
         EDITOR_1300: (*PREVIOUS_OVERLAYS, "index-hmb-rodong-355e3f9500e457ae.js"),
         EDITOR_1302: ("index-hmb-rodong-ba1b96f56bc3c465.js",),
-        EDITOR_1320: (),
+        EDITOR_1320: ("index-hmb-rodong-cd8e6758c89ead31.js",),
         EDITOR_1303: ("index-hmb-rodong-38cbcd43a1959b4f.js",),
     }[profile]
     for name in (overlay_name, *previous):

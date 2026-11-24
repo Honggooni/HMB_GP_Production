@@ -44,7 +44,6 @@ from _hmb_project import ProjectPolicyPendingError, project_from_asset_payload, 
 DataNode = _hmb.DataNode
 Parameter = _hmb.Parameter
 ParameterMode = _hmb.ParameterMode
-find_builtin_agent_class = _hmb.find_builtin_agent_class
 
 try:
     from griptape_nodes.traits.widget import Widget  # type: ignore
@@ -56,7 +55,11 @@ try:
 except Exception:
     ParameterMessage = None  # type: ignore
 
-_BuiltinAgent = find_builtin_agent_class()
+try:
+    from _hmb_native_agent.agents.agent import Agent as _BuiltinAgent
+except ImportError as exc:
+    _BuiltinAgent = None
+    _AGENT_RUNTIME_IMPORT_ERROR = exc
 _BaseAgent = _BuiltinAgent or DataNode
 
 _HMB_LIBRARY_NAME = "HMB_GP_Production"
@@ -1918,7 +1921,7 @@ class HMBAgentLibrary(_BaseAgent):
     for that one execution. Prompt-only, Prompt+Asset, Prompt+Picker, and
     Prompt+Asset+Picker are equally valid; the Agent neither identifies nor
     requires those upstream sources itself. The model, schema, output handling,
-    and Agent wire format remain owned by the Standard Library Agent. Canonical
+    and Agent wire format come from the native implementation pinned by HMB. Canonical
     HMB execution swaps in the exact authenticated Prompt bytes, lets the native
     Agent merge caller context, appends one private English-output contract to
     the final model-bound prompt, and appends the two sealed Behaviors; caller
@@ -1951,9 +1954,9 @@ class HMBAgentLibrary(_BaseAgent):
     def __init__(self, **kwargs):
         if _BuiltinAgent is None:
             raise RuntimeError(
-                "HMBAgentLibrary requires the installed Griptape Standard Library Agent. "
-                "Refresh the Standard Library or set HMB_GRIPTAPE_STANDARD_LIBRARY_PATH."
-            )
+                "The bundled HMB Agent runtime could not be loaded. Check the installed HMB "
+                "library and its Python dependencies."
+            ) from _AGENT_RUNTIME_IMPORT_ERROR
         # Base Agent construction dispatches lifecycle callbacks through this
         # subclass. Initialize every field those callbacks can inspect before
         # calling ``super().__init__`` so the real Griptape host can instantiate
@@ -7511,7 +7514,7 @@ def _same_shot_analysis_model_config(prompt_owner, *, channel_uuid, shot_uuid):
     """Read the same native settings used by the exact Shot Agent."""
     from _hmb_reference_analysis import AnalysisError
     try:
-        from griptape_nodes_library.llm.agent_state import connected_agent_state
+        from _hmb_native_agent.llm.agent_state import connected_agent_state
         from HMBAnalysisAgent import _registered_node_class, _same_flow_nodes
     except ImportError:
         raise AnalysisError("ANALYSIS_AGENT_UNAVAILABLE", "Griptape Agent 분석 모델 연결을 확인하세요.") from None
@@ -7570,7 +7573,7 @@ def get_same_shot_analysis_model_label(prompt_owner, *, channel_uuid, shot_uuid)
 
 def get_same_shot_analysis_model(prompt_owner, *, channel_uuid, shot_uuid, kind):
     """Verify the exact Shot Agent model supports the requested media."""
-    from griptape_nodes_library.llm.agent_state import AgentState
+    from _hmb_native_agent.llm.agent_state import AgentState
     from _hmb_agent_media import driver_accepts_audio, driver_accepts_images
     from _hmb_reference_analysis import AnalysisError
 

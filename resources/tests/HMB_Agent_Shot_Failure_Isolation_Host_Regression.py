@@ -127,7 +127,7 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
     native_base = agent_module.HMBAgentLibrary.__mro__[1]
     standard_module = inspect.getmodule(native_base)
     assert standard_module is not None
-    from griptape_nodes_library.llm import runner as native_runner
+    from _hmb_native_agent.llm import runner as native_runner
     original_native_process = native_base._process
     original_run_agent = standard_module.run_agent
 

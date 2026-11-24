@@ -746,15 +746,9 @@ def _native_invoke(node: Any, model: str, prompt: str, attachments: list[tuple[s
                    kind: str, model_config: Any = None,
                    on_usage: Callable[[dict[str, str | int]], None] | None = None) -> Any:
     try:
-        try:
-            from griptape_nodes_library.llm import runner
-        except ImportError:
-            from _hmb_common import find_builtin_agent_class
-            if find_builtin_agent_class() is None:
-                raise
-            from griptape_nodes_library.llm import runner
-        from griptape_nodes_library.llm.model_config import cloud_model_config
-        from griptape_nodes_library.utils.model_invocation import require_model_invocation_sync
+        from _hmb_native_agent.llm import runner
+        from _hmb_native_agent.llm.model_config import cloud_model_config
+        from _hmb_native_agent.utils.model_invocation import require_model_invocation_sync
         from pydantic_ai import StructuredDict, ToolOutput
         from pydantic_ai.messages import BinaryContent
         from pydantic_ai.usage import UsageLimits
@@ -914,8 +908,8 @@ def analyze_reference(node: Any, *, source: str, kind: str, start: Any = None, e
     selected_times = normalize_analysis_ranges(time_ranges, kind="audio") if time_ranges is not None else None
     model_settings_digest = ""
     if model_config is not None:
-        from griptape_nodes_library.llm.agent_state import AgentState
-        from griptape_nodes_library.llm.model_config import ModelConfig
+        from _hmb_native_agent.llm.agent_state import AgentState
+        from _hmb_native_agent.llm.model_config import ModelConfig
         from _hmb_agent_media import driver_accepts_audio, driver_accepts_images
 
         if (not isinstance(model_config, ModelConfig)

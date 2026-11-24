@@ -291,15 +291,15 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.9.43",
+    "library_version": "0.9.51",
     "engine_version": "",
     "agent_policy_delivery": {
-      "archive_source_count": 102,
+      "archive_source_count": 129,
       "mode": "bundled_signed_dat",
       "runtime_path": "resources/agent/superwings12/hmb_agent_core.dat",
-      "policy_version": "2026-11-23.source-edit.v8.2",
-      "envelope_sha256": "298c7e911e869dcd82f57b87b63d55afd08932f86f5becc61e1b1c95476cf81a",
-      "contract_sha256": "02a25cf06aba06c23907a3de179d02ee6d98ecb67b83f39ffccaab38370d39d9",
+      "policy_version": "2026-11-24.sheet-shape.v8.5",
+      "envelope_sha256": "07b1b51b4b568102cdee077cf8cf1ce5d0ed767c91683cd890d356125a35ded2",
+      "contract_sha256": "3577f0e7b4ed958bb185cc380778e395470e0523ed3c1be7eef210db1ba559c2",
       "verification": "rsa3072_sha256_v3_contract_once_per_process",
       "default_project_id": "superwings12",
       "projects": [
@@ -480,7 +480,13 @@
       "pip_dependencies": [
         "imageio-ffmpeg==0.6.0",
         "Pillow>=12.3.0,<14",
-        "httpx==0.28.1"
+        "httpx==0.28.1",
+        "pydantic-ai-slim[anthropic,bedrock,cohere,mcp,openai]>=2.66.0,<=2.71.0",
+        "dateparser==1.4.1",
+        "asteval==1.0.9",
+        "ddgs==9.14.4",
+        "exa-py==2.15.0",
+        "trafilatura==2.1.0"
       ]
     }
   },

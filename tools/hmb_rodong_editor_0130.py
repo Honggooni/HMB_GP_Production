@@ -253,7 +253,13 @@ function hmb132Request(type, payload, options) {
     patch("be=Oze(t,!!ye.backgroundColor,F);return(0,Z.jsxs)(`div`,",
           "be=Oze(t,!!ye.backgroundColor,F);return hmb130IntegratedHeader(hmbHeaderSlots,(0,Z.jsxs)(`div`,")
     patch("onDoubleClick:le,style:kD(t)?ye:B", "onDoubleClick:le,ref:hmbHeaderHost,style:kD(t)?ye:B")
-    patch("children:[ge.map(e=>ve(e)),T.showNodeDocsButton", "children:[hmb130ConnectionIcon(e,hmbLibrary),ge.map(e=>ve(e)),T.showNodeDocsButton")
+    # The pinned editor uses this header for both HMB and ordinary nodes.
+    # Omit the Docs action from its children so no button or tooltip slot mounts.
+    patch("children:[ge.map(e=>ve(e)),T.showNodeDocsButton!==!1&&(0,Z.jsx)(yOe,{"
+          "className:`flex justify-center items-center p-0 w-8 h-8 rounded-md transition-colors "
+          "borde-0 focus:outline-none focus:ring-0 active:bg-transparent nodrag select-none ${ee}`,"
+          "nodeName:e,nodeType:t,style:U}),ne?",
+          "children:[hmb130ConnectionIcon(e,hmbLibrary),ge.map(e=>ve(e)),ne?")
     patch("nodeName:e})]})})]})};function Fze", "nodeName:e})]})})]}))};function Fze")
     patch("isVisible:qe,minHeight:Je,minWidth:Ye",
           "isVisible:qe,handleStyle:hmb130Library(n)===`HMB_GP_Production`?{opacity:0}:void 0,"

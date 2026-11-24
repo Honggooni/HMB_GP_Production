@@ -22,6 +22,8 @@ import sys
 import tempfile
 from unittest import mock
 
+from hmb_host_workflow import run_in_fixture_workflow
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.dont_write_bytecode = True
@@ -495,7 +497,7 @@ def main():
                         # created outside it would make GriptapeNodes' static
                         # lifecycle calls consult the unrelated default engine.
                         with asyncio.Runner() as runner:
-                            runner.run(scenario(engine,modules,source_state,order,label,replacement))
+                            runner.run(run_in_fixture_workflow(engine, label, scenario, modules, source_state, order, label, replacement))
                 assert not ATTEMPTS,ATTEMPTS
                 print("HMB_LIBRARY_LIFECYCLE_ORDER_HOST=PASS "+json.dumps(dict(cases=RESULTS,execution_calls=0,paid_calls=0),ensure_ascii=False))
             finally:

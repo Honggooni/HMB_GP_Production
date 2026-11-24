@@ -33,17 +33,14 @@ if importlib.util.find_spec("griptape_nodes") is None:
     print("HMB_AGENT_CURRENT_STANDARD_TRANSPORT=SKIP (installed SDK required)")
     raise SystemExit(0)
 
-standard = Path(os.environ.get("HMB_GRIPTAPE_STANDARD_LIBRARY_PATH") or Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard")
-sys.path.extend([str(standard), str(standard / ".venv/Lib/site-packages")])
-
 import httpx
 from openai import AsyncOpenAI
 from PIL import Image
 from griptape_nodes.drivers.cloud_models import VISION_MODEL_CHOICES
 from griptape_nodes.retained_mode.engine import engine_scope
-from griptape_nodes_library.llm import models as native_models
-from griptape_nodes_library.llm.agent_state import AgentState
-from griptape_nodes_library.llm.model_config import ModelConfig, ModelProvider
+from _hmb_native_agent.llm import models as native_models
+from _hmb_native_agent.llm.agent_state import AgentState
+from _hmb_native_agent.llm.model_config import ModelConfig, ModelProvider
 import HMBAgentLibrary as hmb
 import HMBAnalysisAgent
 import HMBPromptLibrary as prompt_module

@@ -108,7 +108,7 @@ async def exercise(engine,directory):
         assert len(flow.nodes)==16 and migration._edge_records(engine,set(flow.nodes))==old_edges
         editors=ps+ags
         assert set(outcome["manual_rebind_editors"])=={node.name for node in editors},outcome
-        transaction=migration._MANUAL_REBINDS[engine][flow.name]
+        transaction=migration._MANUAL_REBINDS[migration._migration_scope(engine)][flow.name]
         assert ags[0].name in transaction["nodes"]
         assert ags[0]._hmb_manual_rebind["required"] is True
         print("MANUAL_REBIND_DISCONNECTED_NOTICE_PASS root10leasespreserved",flush=True)
@@ -144,7 +144,10 @@ async def exercise(engine,directory):
             reject(lambda:migration.validate_manual_rebind(p0,token(p0),channel_uuid=base.CHANNEL,
                 shot_uuid=base.SHOTS[0]["shot_uuid"]),"replaced publisher")
         assert catalog["publisher_instance_uuid"]==old_publisher
-        with mock.patch.object(engine.flow_manager,"check_for_existing_running_flow",return_value=True):
+        check_running = ("check_for_existing_running_flow_in"
+            if callable(getattr(engine.flow_manager, "check_for_existing_running_flow_in", None))
+            else "check_for_existing_running_flow")
+        with mock.patch.object(engine.flow_manager,check_running,return_value=True):
             reject(lambda:migration.validate_manual_rebind(p0,token(p0),channel_uuid=base.CHANNEL,
                 shot_uuid=base.SHOTS[0]["shot_uuid"]),"running flow")
         print("MANUAL_REBIND_NEGATIVE_PASS stale foreign oldUUID missing/modifiedbackup publisher running",flush=True)
@@ -266,7 +269,7 @@ async def exercise(engine,directory):
             assert vault["native_slot"]["values"]["additional_context"]==f"Original native settings {index}"
             assert vault["native_slot"]["outputs"]["output"]==f"Original old result {index}"
             assert vault["backup_path"]==str(backup)
-        assert not migration._MANUAL_REBINDS.get(engine,{}).get(flow.name)
+        assert not migration._MANUAL_REBINDS.get(migration._migration_scope(engine),{}).get(flow.name)
         assert manager._hmb_manual_rebind.get("status")=="cleared"
         assert "target_key" not in manager._hmb_manual_rebind
         print("MANUAL_REBIND_RETIREMENT_PASS exported5targetSlots original5SourceVaults ledgerRetired",flush=True)
@@ -297,8 +300,9 @@ def main():
             guard.enter_context(mock.patch.object(agents.HMBAgentLibrary,"process",base.no_execution))
             guard.enter_context(mock.patch.object(generators.HMBSeedanceGeneration,"_process_generation",base.no_execution))
             logging.disable(logging.CRITICAL)
-            with engine_scope() as engine:
-                with asyncio.Runner() as runner:runner.run(exercise(engine,folder))
+            from hmb_host_workflow import run_in_fixture_workflow
+            with engine_scope() as engine, asyncio.Runner() as runner:
+                runner.run(run_in_fixture_workflow(engine, "PrivateManualLegacyFive", exercise, folder))
             assert base.EXECUTED==[] and base.NETWORK==[]
     print("HMB_LEGACY_MANUAL_REBIND_HOST=PASS (private actual SDK, exact ownership, durable backups, authoring CAS and no execution)")
 

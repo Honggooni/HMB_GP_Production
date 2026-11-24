@@ -172,8 +172,10 @@ def main():
             logging.disable(logging.CRITICAL)
             try:
                 modules = {kind:importlib.import_module(kind) for kind in base.KINDS}
-                with engine_scope() as engine:
-                    with asyncio.Runner() as runner: saved, expected = runner.run(save_healthy(engine, modules, folder))
+                from hmb_host_workflow import run_in_fixture_workflow
+                with engine_scope() as engine, asyncio.Runner() as runner:
+                    saved, expected = runner.run(run_in_fixture_workflow(
+                        engine, 'OfflineGeneratedRestore', save_healthy, modules, folder))
                 for legacy in (False, True):
                     with engine_scope() as engine:
                         with asyncio.Runner() as runner: runner.run(restore_generated(engine, modules, saved, expected, legacy_cursor=legacy))

@@ -1924,7 +1924,8 @@ def _import_record(
             resolved = path
         # File identity must not depend on a transient SMB/mapped-drive outage.
         # Keep the same canonical path/UID even while thumbnail I/O is unavailable.
-        if resolved.suffix.casefold() in IMAGE_EXTENSIONS and _canonical_import_path(reference):
+        if ("{" not in reference and resolved.suffix.casefold() in IMAGE_EXTENSIONS
+                and _canonical_import_path(reference)):
             media_ref_kind = "path"
             display_reference = str(resolved).replace("\\", "/")
             identity_material = display_reference.casefold()
@@ -1984,8 +1985,19 @@ def _import_record(
 
 def _canonical_import_path(value: Any) -> str:
     text = _clean(value)
-    if not text or "{" in text:
+    if not text:
         return ""
+    if "{" in text:
+        if not re.match(r"^\{[A-Za-z_][A-Za-z0-9_]*\}[/\\]", text):
+            return ""
+        try:
+            from griptape_nodes.files.file import File
+            resolved = File(text).resolve()
+            if not resolved or "{" in str(resolved) or not os.path.isabs(resolved):
+                return ""
+            text = str(resolved)
+        except (ImportError, ValueError, RuntimeError, OSError, KeyError):
+            return ""
     if (re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", text)
         and not re.match(r"^[a-zA-Z]:[\\/]", text)
         and not text.lower().startswith("file:")):
@@ -2010,11 +2022,8 @@ def _normalize_import_input(
         if isinstance(asset, dict)
         and _clean(asset.get("source_kind")) == "user"
     }
-    previous_paths = {
-        _canonical_import_path(asset.get("path")): asset
-        for asset in previous.values()
-        if _canonical_import_path(asset.get("path"))
-    }
+    previous_paths = {path: asset for asset in previous.values()
+                      if (path := _canonical_import_path(asset.get("path")))}
     imports: List[Dict[str, Any]] = []
     media_by_uid: Dict[str, Any] = {}
     seen: set[str] = set()
@@ -2059,10 +2068,13 @@ def _normalize_import_input(
         if imported is None:
             continue
         record, media_value = imported
-        # Saved workflows may contain the old availability-dependent URL UID.
-        # Keep that exact addressed image stable; do not relink by file name.
+        # Griptape can reserialize the same saved File with a different macro
+        # (such as {inputs} becoming {project_dir}/inputs) or an absolute path.
+        # Retain the saved wire UID when the host resolves both to the same file.
         prior_path = previous_paths.get(_canonical_import_path(record.get("path")))
-        if prior_path is not None and record.get("media_ref_kind") == "path":
+        if prior_path is not None and (
+            record.get("media_ref_kind") == "path" or _is_macro_image_import(record)
+        ):
             record["source_uid"] = _clean(prior_path.get("source_uid")) or record["source_uid"]
             record["asset_library_id"] = record["source_uid"]
             if defer_thumbnail and _thumbnail_url_is_live(
@@ -4575,7 +4587,6 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
     project_cache_uid = _clean(source.get("project_cache_uid"))
     assets: List[Dict[str, Any]] = []
     seen_library_ids: set[str] = set()
-    seen_asset_ids: set[tuple[str, str]] = set()
     raw_assets = source.get("assets")
     if isinstance(raw_assets, list):
         for raw in raw_assets[:MAX_ASSETS]:
@@ -4584,12 +4595,14 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
                 continue
             if asset["asset_library_id"] in seen_library_ids:
                 continue
-            asset_identity = (_site_location(asset["relative_path"])[0], asset["asset_id"])
-            if asset_identity in seen_asset_ids:
-                asset["selected"] = False
             seen_library_ids.add(asset["asset_library_id"])
-            seen_asset_ids.add(asset_identity)
             assets.append(asset)
+    seen_asset_ids: set[tuple[str, str, str]] = set()
+    for asset in assets:
+        asset_identity = (asset["source_kind"], _site_location(asset["relative_path"])[0], asset["asset_id"])
+        if asset_identity in seen_asset_ids:
+            asset["selected"] = False
+        seen_asset_ids.add(asset_identity)
     _compact_selection_order(assets)
     ordered_selected_source_uids = [
         _clean(asset.get("source_uid"))
@@ -7404,14 +7417,11 @@ def _merge_import_input(
         for asset in assets
         if _clean(asset.get("asset_id"))
     }
-    registered_import_uids = {
-        _clean(asset.get("import_source_uid"))
-        for asset in assets
-        if _clean(asset.get("source_kind")) == "project"
-        and bool(asset.get("registered"))
-        and _clean(asset.get("import_source_uid"))
-    }
+    registered_imports = {asset["import_source_uid"] for asset in assets
+                          if asset["registered"] and asset.get("import_source_uid")}
     previous_uids = {asset["source_uid"] for asset in normalized["assets"]}
+    previous_live_uids = {asset["source_uid"] for asset in normalized["assets"]
+                          if asset["source_kind"] == "user" and asset["import_index"]}
     routing = normalized["shot_routing"]
     shots = routing["shots"]
     active = next(shot for shot in shots if shot["shot_uuid"] == routing["active_shot_uuid"])
@@ -7420,7 +7430,9 @@ def _merge_import_input(
     for imported in imports:
         imported["asset_project_uid"] = ""
         uid = _clean(imported.get("source_uid"))
-        if uid in registered_import_uids:
+        # Explicit Add retires its live row. A catalog refresh can also see an
+        # Add from another workflow, which cannot retire this workflow's wire.
+        if uid in registered_imports and uid not in previous_live_uids:
             continue
         if not imported.get("import_shot_initialized"):
             # A new wire participates in the currently active Shot. Older single-Shot
@@ -14249,8 +14261,8 @@ class HMBImageAssetLibrary(DataNode):
                     self._hmb_import_thumbnail_thread = None
                 _diagnostic_warning("Imported image preview worker unavailable", exc)
 
-    def _apply_import_value(self, value: Any) -> Dict[str, Any]:
-        state = self._current_state()
+    def _apply_import_value(self, value: Any, *, restored_state: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        state = self._current_state() if restored_state is None else restored_state
         input_identity = _canonical_import_input_identity(value)
         last_identity = getattr(self, "_hmb_last_applied_import_identity", None)
         if input_identity == last_identity:
@@ -15758,22 +15770,25 @@ class HMBImageAssetLibrary(DataNode):
                 _set_parameter_value(self, PROJECT_ROOT_PARAMETER, root_value)
             finally:
                 self._hmb_root_syncing = False
-        import_value = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
         candidate_state = dict(saved_state)
         candidate_state["catalog_root"] = root_value.replace("\\", "/")
+        import_value = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
+        if _flatten_import_values(import_value):
+            # The native load has finished replaying the exact wired aggregate.
+            # Restore live media and legacy Shot membership before the scan
+            # captures its base. The scan merger correctly defers to live
+            # membership and would discard any restoration done in its worker.
+            candidate_state = self._apply_import_value(import_value, restored_state=candidate_state)
         # Even a local index verifies the share. Run that verification in the
         # same detached path as startup or a new node; paint the saved authoring
         # state immediately and merge only this generation's verified facts.
         self._schedule_catalog_scan(
             f"deserialize:{root_value.casefold()}:{_non_negative_int(saved_state.get('scan_revision'))}",
             candidate_state,
-            lambda: self._merge_captured_imports_into_scan(
-                _load_project_catalog(root_value, saved_state), import_value, defer_thumbnail=True,
-            ),
+            lambda: _load_project_catalog(root_value, candidate_state),
             failure_state=candidate_state,
             keep_editable=bool(saved_state.get("projects") or saved_assets),
             timeout_seconds=PROJECT_REFRESH_TIMEOUT_SECONDS,
-            on_published=self._schedule_live_import_thumbnail_hydration,
         )
         self._hmb_hydration_adopted = True
         self._schedule_post_hydration_shot_reconcile()

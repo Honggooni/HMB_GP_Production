@@ -199,6 +199,13 @@ async def check_delayed_image_restore(engine, closed_image, live_image):
     import _hmb_library_bootstrap as bootstrap
 
     registration = bootstrap._REGISTRATIONS[engine.event_manager]
+    # OpenWorkflow's real post-dispatch restore is detached. Wait until it
+    # releases its own admission before simulating delayed user callbacks.
+    for _ in range(100):
+        if not registration.load_requests:
+            break
+        await asyncio.sleep(0.01)
+    assert not registration.load_requests
     result = SimpleNamespace(succeeded=lambda: True)
     logger = logging.getLogger(bootstrap.__name__)
     assert closed_image.workflow.closed and closed_image.name == live_image.name
@@ -377,7 +384,12 @@ async def exercise(engine, patches):
     assert not duplicate.succeeded()
     assert engine.current_workflow_or_none() is None
     agent = nodes["HMBAgentLibrary"]
-    native_cls = importlib.import_module("HMBAgentLibrary")._BuiltinAgent
+    agent_module = importlib.import_module("HMBAgentLibrary")
+    pinned = agent_module._BuiltinAgent
+    assert pinned is not None and isinstance(agent, pinned)
+    assert Path(sys.modules[pinned.__module__].__file__).resolve().is_relative_to(ROOT / "_hmb_native_agent")
+    native_cls = agent_module._hmb.find_builtin_agent_class()
+    assert native_cls is not pinned, "The stock comparison must load a separate Agent implementation"
     assert native_cls is not None and Path(sys.modules[native_cls.__module__].__file__).resolve().is_relative_to(
         STANDARD.resolve()), "Expected the Agent from the selected Standard Library checkout"
     std_schema = LibrarySchema.model_validate_json((STANDARD / "griptape_nodes_library.json").read_bytes())

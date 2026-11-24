@@ -131,7 +131,7 @@ from _hmb_bundled_policy_session import install_bundled_policy_session  # noqa: 
 install_bundled_policy_session(agent_module._hmb)
 native_module = inspect.getmodule(base_agent)
 assert native_module is not None
-from griptape_nodes_library.llm import runner as native_runner  # noqa: E402
+from _hmb_native_agent.llm import runner as native_runner  # noqa: E402
 from pydantic_ai.models.test import TestModel  # noqa: E402
 
 original_build_model = native_runner.build_model

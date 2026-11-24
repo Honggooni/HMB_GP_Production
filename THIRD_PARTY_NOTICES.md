@@ -1,5 +1,14 @@
 # Third-party notices
 
+HMB's private Agent implementation includes reviewed parts of Griptape Nodes
+Library Standard under Apache-2.0 (library 0.91.1, Python project 0.86.0,
+commit `29e91f362343e2eba4fb3d2d48ef05d43bb34d53`). The source and modified
+file hashes are in `_hmb_native_agent/UPSTREAM.json`. The original Apache
+license accompanies those files in `_hmb_native_agent/LICENSE`. HMB relocated
+the Python modules, preserved the Agent wire format and deferred loading the
+DateTime tool dependency. The optional Python tool and provider distributions
+retain their own license files in the local installation.
+
 HMB GP Production declares the following direct editor/runtime dependencies:
 
 - Pillow >=12.3.0,<14 — MIT-CMU license. This is a declared compatibility

@@ -68,7 +68,7 @@ async def exercise(engine, _phase, out):
     routing = importlib.import_module("_hmb_shot_routing")
     base = agents.HMBAgentLibrary.__mro__[1]
     native_module = inspect.getmodule(base)
-    from griptape_nodes_library.llm import runner as native_runner
+    from _hmb_native_agent.llm import runner as native_runner
     from pydantic_ai.models.test import TestModel
     from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
     from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, DeleteNodeRequest

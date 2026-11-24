@@ -287,7 +287,7 @@ if module._BuiltinAgent is None:
 # Use the installed native model/schema/tools lifecycle; replace only the
 # billable processor. Model/credential access is mocked in this process only.
 native = inspect.getmodule(base)
-from griptape_nodes_library.llm import runner as native_runner
+from _hmb_native_agent.llm import runner as native_runner
 from pydantic import TypeAdapter
 from pydantic_ai.models.test import TestModel
 

@@ -14,6 +14,22 @@ import hmb_griptape_update_preflight as preflight
 
 
 class PreflightGuardTests(unittest.TestCase):
+    def test_background_assertion_fails_an_otherwise_successful_host_check(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "test.log"
+            log.write_text("Exception in thread snapshot:\nTraceback (most recent call last):\n"
+                           "AssertionError\nHMB_HOST=PASS\n", encoding="utf-8")
+            self.assertEqual(preflight.required_check_outcome(0, log), "unhandled_thread_exception")
+
+    def test_missing_standard_agent_cannot_pass_a_required_host_check(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "test.log"
+            log.write_text("HMB_REAL_STANDARD_AGENT_BOUNDARY=SKIP (standard Agent not importable)\n", encoding="utf8")
+            self.assertEqual(preflight.required_check_outcome(0, log), "required_coverage_skipped")
+            log.write_text("HMB_DESKTOP031_WORKFLOW_ENVELOPE=PASS\n", encoding="utf8")
+            self.assertEqual(preflight.required_check_outcome(0, log), 0)
+            self.assertEqual(preflight.required_check_outcome(1, log), 1)
+
     def test_every_registered_node_has_a_mandatory_check(self):
         self.assertEqual(len(preflight.check_inventory()), 11)
 

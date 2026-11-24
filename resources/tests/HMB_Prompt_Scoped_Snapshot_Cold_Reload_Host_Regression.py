@@ -49,8 +49,12 @@ async def exercise(engine):
         if cls:
             library.register_lazy_node_type(definition.class_name, definition.metadata, lambda cls=cls: cls)
     engine.event_manager.initialize_queue()
+    workflow_context = ExitStack()
     try:
         result = send(engine, EnsureWorkflowAndFlowRequest(flow_name="PrivateScopedColdReload"))
+        if getattr(result, "open_workflow", None) is not None:
+            workflow = engine.open_workflows.get(result.open_workflow.workflow_id)
+            workflow_context.enter_context(engine.bind_workflow(workflow))
         flow = engine.flow_manager.get_flow_by_name(result.flow_name)
         def create(kind, name):
             result = send(engine, CreateNodeRequest(node_type=kind, node_name=name,
@@ -158,8 +162,6 @@ async def exercise(engine):
         assert idle_after == idle_before, "Read-only five-shot preparation rewrote the active Prompt dashboard"
         serialized = send(engine, SerializeFlowToCommandsRequest(flow_name=flow.name)).serialized_flow_commands
         original_names = set(flow.nodes)
-        while engine.context_manager.has_current_flow():
-            engine.context_manager.pop_flow()
         send(engine, DeleteFlowRequest(flow_name=flow.name))
         loaded = await engine.ahandle_request(DeserializeFlowFromCommandsRequest(
             serialized_flow_commands=serialized, broadcast_result=False))
@@ -214,6 +216,7 @@ async def exercise(engine):
         print("PASS empty Picker preserves 34px Editor measurement without idle writes; real video reselection still publishes")
         print("PASS actual Image/Picker exact readers; 120 alternating views; 10 idle five-view preparations without dashboard writes; five saved generations >100; SDK serialize/delete/cold reload; fresh lower source clocks safely rebase all five exact Prompt/media documents without UI writes")
     finally:
+        workflow_context.close()
         LibraryRegistry.unregister_library(schema.name, event_manager=engine.event_manager)
 
 

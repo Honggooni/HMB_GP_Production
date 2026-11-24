@@ -30,6 +30,33 @@ _REVIEW_MEDIA_FILES = (
     "resources/media-tools/rebuild-review-tools.sh",
 )
 RUNTIME_FILE_PATHS = (
+    "_hmb_native_agent/LICENSE",
+    "_hmb_native_agent/UPSTREAM.json",
+    "_hmb_native_agent/__init__.py",
+    "_hmb_native_agent/agents/__init__.py",
+    "_hmb_native_agent/agents/agent.py",
+    "_hmb_native_agent/llm/__init__.py",
+    "_hmb_native_agent/llm/agent_node_support.py",
+    "_hmb_native_agent/llm/agent_state.py",
+    "_hmb_native_agent/llm/budget.py",
+    "_hmb_native_agent/llm/errors.py",
+    "_hmb_native_agent/llm/history.py",
+    "_hmb_native_agent/llm/model_config.py",
+    "_hmb_native_agent/llm/models.py",
+    "_hmb_native_agent/llm/rulesets.py",
+    "_hmb_native_agent/llm/runner.py",
+    "_hmb_native_agent/llm/tools.py",
+    "_hmb_native_agent/llm/web.py",
+    "_hmb_native_agent/utils/__init__.py",
+    "_hmb_native_agent/utils/attribution.py",
+    "_hmb_native_agent/utils/cloud_credential_utils.py",
+    "_hmb_native_agent/utils/cloud_legacy_models.py",
+    "_hmb_native_agent/utils/griptape_cloud_headers.py",
+    "_hmb_native_agent/utils/model_invocation.py",
+    "_hmb_native_agent/utils/node_error_utils.py",
+    "_hmb_native_agent/utils/provider_selection_component.py",
+    "_hmb_native_agent/utils/secret_utils.py",
+    "_hmb_native_agent/utils/utilities.py",
     "__init__.py", "griptape-nodes-library.json", "HMBAgentLibrary.py", "HMBAnalysisAgent.py",
     "HMBColorLUTLibrary.py", "HMBFinishLookLibrary.py", "HMBImageAssetLibrary.py", "HMBImageBash.py", "HMBImageGeneration.py",
     "HMBPromptLibrary.py", "HMBSoundLibrary.py", "HMBSeedanceGeneration.py", "HMBVideoPickerLibrary.py",
@@ -120,9 +147,10 @@ def _expected_records(value: Any, *, historical: bool = False) -> list[dict[str,
         seen.add(name)
         rows.append({"path": name, "bytes": row["bytes"], "sha256": _sha(row["sha256"])})
     current_paths = set(RUNTIME_FILE_PATHS)
-    before_review_media = current_paths.difference(_REVIEW_MEDIA_FILES, {"_hmb_client_review_media.py"})
+    before_private_agent = {name for name in current_paths if not name.startswith("_hmb_native_agent/")}
+    before_review_media = before_private_agent.difference(_REVIEW_MEDIA_FILES, {"_hmb_client_review_media.py"})
     if seen != current_paths and not (
-        historical and seen in (before_review_media, before_review_media - {"_hmb_shot_basket.py"})
+        historical and seen in (before_private_agent, before_review_media, before_review_media - {"_hmb_shot_basket.py"})
     ):
         raise ValueError("incomplete_inventory")
     return rows

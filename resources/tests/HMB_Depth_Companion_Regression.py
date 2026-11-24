@@ -2717,7 +2717,6 @@ module_names = (
     "griptape_nodes_library",
     "griptape_nodes_library.utils",
     "griptape_nodes_library.utils.ffmpeg_utils",
-    "griptape_nodes_library.utils.macro_path_utils",
     "griptape_nodes",
     "griptape_nodes.files",
     "griptape_nodes.files.file",
@@ -2734,6 +2733,7 @@ saved_modules = {
     for name in module_names
 }
 saved_artifact_class = picker.VideoUrlArtifact
+saved_project_macro = picker._picker_project_macro
 try:
     fake_modules = {
         name: types.ModuleType(name)
@@ -2755,10 +2755,6 @@ try:
         def __init__(self, value="", meta=None):
             self.value = value
             self.meta = dict(meta or {})
-
-    class ExternalResolution:
-        resolved_path = ""
-        is_external = True
 
     class FakeExistingFilePolicy:
         CREATE_NEW = "create_new"
@@ -2824,16 +2820,13 @@ try:
             def resolve(self):
                 return str(project_target)
 
-        def fake_resolve_to_macro_path(value):
+        def fake_project_macro(value, workflow):
             value_path = Path(value).resolve()
             if value_path == source.resolve():
-                return ExternalResolution()
+                return None
             if control["macro_fail"]:
                 raise RuntimeError("simulated macro post-processing failure")
-            return types.SimpleNamespace(
-                resolved_path=f"{{inputs}}/{value_path.name}",
-                is_external=False,
-            )
+            return f"{{inputs}}/{value_path.name}"
 
         def fake_resolve_sidecar_path(media_path):
             media_path = Path(media_path).resolve()
@@ -2863,9 +2856,7 @@ try:
         fake_modules[
             "griptape_nodes_library.utils.ffmpeg_utils"
         ].extract_video_player_metadata = lambda _path: {"duration": 1.0}
-        fake_modules[
-            "griptape_nodes_library.utils.macro_path_utils"
-        ].resolve_to_macro_path = fake_resolve_to_macro_path
+        picker._picker_project_macro = fake_project_macro
         fake_modules["griptape_nodes_library.utils"].ffmpeg_utils = (
             fake_modules["griptape_nodes_library.utils.ffmpeg_utils"]
         )
@@ -3274,6 +3265,7 @@ try:
         assert overwrite_alternate.read_bytes() == b"valuable-overwrite-target"
 finally:
     picker.VideoUrlArtifact = saved_artifact_class
+    picker._picker_project_macro = saved_project_macro
     for module_name, saved_module in saved_modules.items():
         if saved_module is None:
             sys.modules.pop(module_name, None)

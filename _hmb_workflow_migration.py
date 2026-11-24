@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+from contextlib import nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
@@ -65,20 +66,32 @@ def _kind(node: Any) -> str | None:
     return _KINDS.get(metadata.get("node_type"))
 
 
+def _migration_scope(engine: Any) -> Any:
+    current = getattr(engine, "current_workflow_or_none", None)
+    return (current() if callable(current) else None) or engine
+
+
+def _open_scopes(engine: Any) -> tuple[Any, ...]:
+    all_open = getattr(getattr(engine, "open_workflows", None), "all_open", None)
+    return (*all_open(), engine) if callable(all_open) else (engine,)
+
+
 def mark_flow_migration_pending(engine: Any, flow_name: str) -> None:
     if isinstance(flow_name, str) and flow_name:
+        flow = engine.flow_manager.get_flow_by_name(flow_name)
         with _LOCK:
-            _PENDING.setdefault(engine, set()).add(flow_name)
+            _PENDING.setdefault(_migration_scope(engine), {})[flow_name] = weakref.ref(flow)
 
 
 def flow_migration_pending(engine: Any, flow_name: str) -> bool:
     with _LOCK:
-        return flow_name in _PENDING.get(engine, ()) or flow_name in _INFLIGHT.get(engine, ())
+        scope = _migration_scope(engine)
+        return flow_name in _PENDING.get(scope, ()) or flow_name in _INFLIGHT.get(scope, ())
 
 
 def flow_migration_blocked(engine: Any, flow_name: str) -> dict[str, Any] | None:
     with _LOCK:
-        return deepcopy(_BLOCKED.get(engine, {}).get(flow_name))
+        return deepcopy(_BLOCKED.get(_migration_scope(engine), {}).get(flow_name))
 
 
 def _node_manual_rebind_required(node: Any) -> bool:
@@ -106,7 +119,7 @@ def _finish_manual_rebind(engine: Any, flow: Any, editors: list[Any]) -> None:
         if callable(clear) and isinstance(manual, dict) and manual.get("status") == "confirmed":
             clear("verified_workflow_consolidation")
     with _LOCK:
-        _MANUAL_REBINDS.get(engine, {}).pop(flow.name, None)
+        _MANUAL_REBINDS.get(_migration_scope(engine), {}).pop(flow.name, None)
 
 
 def _manual_rebind_context(node: Any, expected_source_digest: str) -> tuple[Any, Any, dict, dict]:
@@ -123,7 +136,7 @@ def _manual_rebind_context(node: Any, expected_source_digest: str) -> tuple[Any,
     _require(not _engine_has_running_flow(engine),
         "Stop the running workflow before reconnecting an existing Shot")
     with _LOCK:
-        transaction = _MANUAL_REBINDS.get(engine, {}).get(flow_name)
+        transaction = _MANUAL_REBINDS.get(_migration_scope(engine), {}).get(flow_name)
         entry = transaction.get("nodes", {}).get(name) if isinstance(transaction, dict) else None
         _require(isinstance(entry, dict) and entry["node"]() is node
             and entry["digest"] == expected_source_digest and not entry.get("confirmed"),
@@ -208,7 +221,7 @@ def _offer_manual_rebind(engine: Any, flow: Any, exports: dict[str, Any], recove
         "backup_path": str(recovery), "backup_sha256": hashlib.sha256(recovery.read_bytes()).hexdigest(),
         "nodes": prepared}
     with _LOCK:
-        _MANUAL_REBINDS.setdefault(engine, {})[flow.name] = transaction
+        _MANUAL_REBINDS.setdefault(_migration_scope(engine), {})[flow.name] = transaction
     for name, exported in exports.items():
         node = flow.nodes.get(name)
         kind = _kind(node)
@@ -245,28 +258,29 @@ def _offer_manual_rebind(engine: Any, flow: Any, exports: dict[str, Any], recove
 
 def _block_flow(engine: Any, flow_name: str, value: dict[str, Any]) -> None:
     with _LOCK:
-        _BLOCKED.setdefault(engine, {})[flow_name] = {"code": "workflow_migration_failed",
+        _BLOCKED.setdefault(_migration_scope(engine), {})[flow_name] = {"code": "workflow_migration_failed",
             "reason": value.get("reason", value.get("code", "Consolidation did not complete")),
             "backup_path": value.get("backup_path"), "rollback": value.get("rollback", "not_needed")}
 
 
 def pending_flow_names(engine: Any) -> tuple[str, ...]:
     with _LOCK:
-        return tuple(_PENDING.get(engine, ()))
+        return tuple(_PENDING.get(_migration_scope(engine), ()))
 
 
 def clear_flow_migration_pending(engine: Any, flow_name: str) -> None:
     with _LOCK:
-        _PENDING.get(engine, set()).discard(flow_name)
+        _PENDING.get(_migration_scope(engine), {}).pop(flow_name, None)
 
 
 def cancel_queued_flow_migrations(engine: Any) -> None:
     """Invalidate only queued work; a started transaction must commit/restore."""
     with _LOCK:
         _SCHEDULE_GENERATIONS[engine] = _SCHEDULE_GENERATIONS.get(engine, 0) + 1
-        for name in _PENDING.get(engine, ()):
-            _block_flow(engine, name, {"reason": "Library unloaded before editor consolidation completed"})
-        _PENDING.pop(engine, None)
+        for scope in _open_scopes(engine):
+            with engine.bind_workflow(scope) if scope is not engine else nullcontext():
+                for name in _PENDING.pop(scope, {}):
+                    _block_flow(engine, name, {"reason": "Library unloaded before editor consolidation completed"})
 
 
 def mutation_is_internal() -> bool:
@@ -275,12 +289,12 @@ def mutation_is_internal() -> bool:
 
 def last_migration_result(engine: Any, flow_name: str) -> dict[str, Any] | None:
     with _LOCK:
-        return deepcopy(_RESULTS.get(engine, {}).get(flow_name))
+        return deepcopy(_RESULTS.get(_migration_scope(engine), {}).get(flow_name))
 
 
 def _result(engine: Any, flow_name: str, value: dict[str, Any]) -> dict[str, Any]:
     with _LOCK:
-        _RESULTS.setdefault(engine, {})[flow_name] = deepcopy(value)
+        _RESULTS.setdefault(_migration_scope(engine), {})[flow_name] = deepcopy(value)
     if value.get("ok") is not True:
         logging.getLogger("griptape_nodes").warning("HMB editor consolidation for %s: %s; recovery: %s",
             flow_name, value.get("reason", value.get("code")), value.get("backup_path"))
@@ -289,8 +303,10 @@ def _result(engine: Any, flow_name: str, value: dict[str, Any]) -> dict[str, Any
 
 def flow_migration_inflight(engine: Any, flow_name: str | None = None) -> bool:
     with _LOCK:
-        names = _INFLIGHT.get(engine, ())
-        return bool(names) if flow_name is None else flow_name in names
+        if flow_name is None:
+            return any(names for scope, names in _INFLIGHT.items()
+                       if scope is engine or getattr(scope, "engine", None) is engine)
+        return flow_name in _INFLIGHT.get(_migration_scope(engine), ())
 
 
 def _edge_records(engine: Any, node_names: set[str]) -> list[dict[str, Any]]:
@@ -736,11 +752,12 @@ async def _restore(engine: Any, flow: Any, snapshot: dict[str, Any], affected: s
 
 async def migrate_flow(engine: Any, flow_name: str, *, backup_root: Path | None = None) -> dict[str, Any]:
     """Migrate one idle, fully hydrated flow; never resolve/run any node."""
+    scope = _migration_scope(engine)
     with _LOCK:
-        if flow_name in _INFLIGHT.get(engine, ()):
+        if flow_name in _INFLIGHT.get(scope, ()):
             return _result(engine, flow_name, {"ok": False, "code": "migration_already_running", "flow_name": flow_name})
-        _INFLIGHT.setdefault(engine, set()).add(flow_name)
-        _BLOCKED.get(engine, {}).pop(flow_name, None)
+        _INFLIGHT.setdefault(scope, set()).add(flow_name)
+        _BLOCKED.get(scope, {}).pop(flow_name, None)
     token = _INTERNAL.set(True)
     recovery: Path | None = None
     snapshot = None
@@ -905,8 +922,11 @@ async def migrate_flow(engine: Any, flow_name: str, *, backup_root: Path | None 
     finally:
         _INTERNAL.reset(token)
         with _LOCK:
-            _INFLIGHT.get(engine, set()).discard(flow_name)
-            _PENDING.get(engine, set()).discard(flow_name)
+            active = _INFLIGHT.get(scope, set())
+            active.discard(flow_name)
+            if not active:
+                _INFLIGHT.pop(scope, None)
+            _PENDING.get(scope, {}).pop(flow_name, None)
         # Resume normal routing only after a verified commit. Failed/restored
         # legacy graphs remain explicitly suspended, not in a loading spinner.
         try:
@@ -928,25 +948,38 @@ async def migrate_flow(engine: Any, flow_name: str, *, backup_root: Path | None 
 
 def schedule_loaded_flow_migrations(engine: Any) -> None:
     """Post-dispatch notification schedules work outside the hook's context."""
-    names = pending_flow_names(engine)
-    if not names:
-        return
     with _LOCK:
+        work = [(scope, name, ref) for scope in _open_scopes(engine)
+                for name, ref in _PENDING.get(scope, {}).items()]
         generation = _SCHEDULE_GENERATIONS.get(engine, 0)
+    if not work:
+        return
     loop = getattr(engine.event_manager, "event_loop", None)
     if loop is None or loop.is_closed() or not loop.is_running():
         # Unsupported/no-loop hosts retain originals and report no success.
-        for name in names:
-            clear_flow_migration_pending(engine, name)
+        with _LOCK:
+            for scope, name, ref in work:
+                pending = _PENDING.get(scope, {})
+                if pending.get(name) is ref:
+                    pending.pop(name)
         return
     async def coordinator() -> None:
         from griptape_nodes.retained_mode.engine import engine_scope
         with engine_scope(engine):
-            for name in names:
+            for scope, name, ref in work:
                 with _LOCK:
                     if _SCHEDULE_GENERATIONS.get(engine, 0) != generation:
                         return
-                await migrate_flow(engine, name)
+                    if _PENDING.get(scope, {}).get(name) is not ref or name in _INFLIGHT.get(scope, ()):
+                        continue
+                if scope is not engine and engine.open_workflows.find(scope.workflow_id) is not scope:
+                    continue
+                with engine.bind_workflow(scope) if scope is not engine else nullcontext():
+                    flow = ref()
+                    if flow is None or engine.object_manager.attempt_get_object_by_name(name) is not flow:
+                        clear_flow_migration_pending(engine, name)
+                        continue
+                    await migrate_flow(engine, name)
     def start() -> None:
         asyncio.create_task(coordinator(), context=contextvars.Context())
     loop.call_soon_threadsafe(start, context=contextvars.Context())

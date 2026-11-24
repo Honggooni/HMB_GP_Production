@@ -38,6 +38,12 @@ def send(engine, request):
 
 
 def exercise(engine):
+    from hmb_host_workflow import scoped_fixture_workflow
+    with scoped_fixture_workflow(engine, "PrivateNativeAgentSwitch"):
+        _exercise(engine)
+
+
+def _exercise(engine):
     import HMBAgentLibrary as agents
     from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
     from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest

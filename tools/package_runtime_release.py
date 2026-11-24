@@ -18,8 +18,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.9.43"
-RELEASE_VERSION = "0.9.43"
+RELEASE_LABEL = "v0.9.51"
+RELEASE_VERSION = "0.9.51"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -55,6 +55,33 @@ WIDGET_FILES = {
 }
 
 RUNTIME_INSTALL_FILES = (
+    "_hmb_native_agent/LICENSE",
+    "_hmb_native_agent/UPSTREAM.json",
+    "_hmb_native_agent/__init__.py",
+    "_hmb_native_agent/agents/__init__.py",
+    "_hmb_native_agent/agents/agent.py",
+    "_hmb_native_agent/llm/__init__.py",
+    "_hmb_native_agent/llm/agent_node_support.py",
+    "_hmb_native_agent/llm/agent_state.py",
+    "_hmb_native_agent/llm/budget.py",
+    "_hmb_native_agent/llm/errors.py",
+    "_hmb_native_agent/llm/history.py",
+    "_hmb_native_agent/llm/model_config.py",
+    "_hmb_native_agent/llm/models.py",
+    "_hmb_native_agent/llm/rulesets.py",
+    "_hmb_native_agent/llm/runner.py",
+    "_hmb_native_agent/llm/tools.py",
+    "_hmb_native_agent/llm/web.py",
+    "_hmb_native_agent/utils/__init__.py",
+    "_hmb_native_agent/utils/attribution.py",
+    "_hmb_native_agent/utils/cloud_credential_utils.py",
+    "_hmb_native_agent/utils/cloud_legacy_models.py",
+    "_hmb_native_agent/utils/griptape_cloud_headers.py",
+    "_hmb_native_agent/utils/model_invocation.py",
+    "_hmb_native_agent/utils/node_error_utils.py",
+    "_hmb_native_agent/utils/provider_selection_component.py",
+    "_hmb_native_agent/utils/secret_utils.py",
+    "_hmb_native_agent/utils/utilities.py",
     "__init__.py",
     "griptape-nodes-library.json",
     "HMBAgentLibrary.py",
@@ -161,7 +188,7 @@ CANONICAL_LF_SOURCE_FILES = {
     if PurePosixPath(relative).suffix.casefold() in {".py", ".js", ".json", ".md", ".txt", ".sh"}
     or relative in {"LICENSE", "resources/media-tools/COPYING.GPLv2"}
 }
-if len(RUNTIME_INSTALL_FILES) != 80 or len(DISTRIBUTION_ONLY_FILES) != 22:
+if len(RUNTIME_INSTALL_FILES) != 107 or len(DISTRIBUTION_ONLY_FILES) != 22:
     raise RuntimeError("Runtime/distribution release boundary count mismatch.")
 if set(RUNTIME_INSTALL_FILES) & set(DISTRIBUTION_ONLY_FILES):
     raise RuntimeError("Runtime and distribution-only release files overlap.")
@@ -221,11 +248,13 @@ COMMON_TOKEN_PATTERNS = (
 )
 STANDARD_AGENT_LIBRARY_ENV = "HMB_GRIPTAPE_STANDARD_LIBRARY_PATH"
 STANDARD_AGENT_MANIFEST_NAME = "griptape_nodes_library.json"
+APPROVED_AGENT_MODEL_ORDER_SHA256 = "d5dd3a3b6e0bde3bff74dfdf1f12944a15c98f431b15bcdf7a64b0d6d18554aa"
 STANDARD_AGENT_MODEL_CATALOG_SHA256 = (
     "c4d6afd6633ff27fa30557b2b9be281c4c89fb9c6b41f376aa3cc572823e63a2"
 )
 EXPECTED_EDITOR_DEPENDENCIES = frozenset((
     "httpx==0.28.1", "imageio-ffmpeg==0.6.0", "Pillow>=12.3.0,<14",
+    "pydantic-ai-slim[anthropic,bedrock,cohere,mcp,openai]>=2.66.0,<=2.71.0", "dateparser==1.4.1", "asteval==1.0.9", "ddgs==9.14.4", "exa-py==2.15.0", "trafilatura==2.1.0",
 ))
 REVIEW_MEDIA_SHA256 = {
     "resources/media-tools/win64/ffmpeg.exe": "b3a2c9930af7512cc657972ab42775fb7b4c9eb99d5b5044ce440a4c87fd7619",
@@ -699,17 +728,14 @@ def standard_agent_manifest_candidates() -> tuple[Path, ...]:
 
 def validate_standard_agent_model_parity(
     library_manifest: dict[str, Any],
+    *,
+    compare_upstream: bool = False,
 ) -> Path | None:
-    """Keep HMB's host declaration equal to the installed stock Agent surface.
-
-    ``model_usage`` is the Griptape permission/accounting declaration required
-    before a model call; it is not an HMB content allowlist.  Public CI may not
-    have the Standard Library checkout, so the HMB declaration is always
-    validated for shape and uniqueness, and exact stock parity is additionally
-    enforced whenever the canonical installed manifest is available.
-    """
+    """Validate HMB's approved catalog and optionally compare a Standard checkout."""
 
     hmb_ids = node_model_usage_ids(library_manifest, "HMBAgentLibrary")
+    if digest("\n".join(hmb_ids).encode("utf-8")) != APPROVED_AGENT_MODEL_ORDER_SHA256:
+        raise RuntimeError("The approved HMB Agent model-usage declaration changed.")
     catalog_ids = set(library_model_catalog_ids(library_manifest))
     providers = library_model_catalog_providers(library_manifest)
     analysis_id = "gtc_gemini_4_argon"
@@ -734,7 +760,12 @@ def validate_standard_agent_model_parity(
             "HMBAgentLibrary model usage does not resolve inside its own catalog "
             f"(unresolved={unresolved}, unused={unused})."
         )
-    for candidate in standard_agent_manifest_candidates():
+    if not compare_upstream:
+        return None
+    candidates = standard_agent_manifest_candidates()
+    if os.environ.get(STANDARD_AGENT_LIBRARY_ENV):
+        candidates = candidates[:1]
+    for candidate in candidates:
         if not candidate.is_file():
             continue
         try:
@@ -1808,6 +1839,11 @@ def main() -> None:
         description="Build a verified runtime ZIP with the approved signed Agent DAT."
     )
     parser.add_argument(
+        "--review-standard-catalog",
+        action="store_true",
+        help="Compare HMB's approved catalog to the configured Standard checkout without writing a ZIP.",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="Validate sources and the in-memory ZIP without writing an artifact.",
@@ -1855,6 +1891,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     primary_modes = (
+        args.review_standard_catalog,
         args.check,
         args.check_output,
         args.write_parity_proof,
@@ -1863,8 +1900,7 @@ def main() -> None:
     )
     if sum(bool(item) for item in primary_modes) > 1:
         parser.error(
-            "--check, --check-output, --write-parity-proof, and "
-            "--check-parity-proof, and --check-local-parity-proof are mutually exclusive"
+            "Choose one catalog review, build check, or parity proof operation."
         )
     if args.reference_sha256 and not args.parity_with:
         parser.error("--reference-sha256 requires --parity-with")
@@ -1874,7 +1910,13 @@ def main() -> None:
         parser.error("--parity-with requires --check or --check-output")
     if args.parity_with and (args.write_parity_proof or args.check_parity_proof or args.check_local_parity_proof):
         parser.error("--parity-with cannot be combined with parity proof modes")
-    if args.write_parity_proof:
+    if args.review_standard_catalog:
+        manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
+        reviewed = validate_standard_agent_model_parity(manifest, compare_upstream=True)
+        if reviewed is None:
+            parser.error(f"No Standard manifest was found. Set {STANDARD_AGENT_LIBRARY_ENV} to select a checkout.")
+        result = {"matched_standard_manifest": str(reviewed), "approved_catalog_sha256": STANDARD_AGENT_MODEL_CATALOG_SHA256}
+    elif args.write_parity_proof:
         result = write_parity_proof(args.write_parity_proof, args.output)
     elif args.check_parity_proof:
         result = check_parity_proof(args.check_parity_proof)

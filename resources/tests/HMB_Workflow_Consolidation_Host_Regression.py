@@ -70,8 +70,7 @@ def disconnect_fixture_nodes(engine, flow, names):
 
     identities = {name: id(node) for name, node in flow.nodes.items()}
     before = authored()
-    engine.context_manager.push_flow(flow)
-    try:
+    with engine.context_manager.flow(flow):
         for name in names:
             state = send(engine, connections.HMBGetNodeConnectionsRequest(node_name=name))
             if state.can_disconnect:
@@ -80,8 +79,6 @@ def disconnect_fixture_nodes(engine, flow, names):
             assert not deletion.connected_targets(engine, [name]), name
         assert identities == {name: id(node) for name, node in flow.nodes.items()}
         assert authored() == before, "Explicit fixture detach changed saved inputs or Shot results"
-    finally:
-        engine.context_manager.pop_flow()
 
 
 def register_library(engine):
@@ -114,6 +111,7 @@ async def canonical_case(engine, directory):
     from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest
     from griptape_nodes.node_library.library_registry import LibraryRegistry
     library, advanced, images, prompts, agents, generators = register_library(engine)
+    flow_contexts = ExitStack()
     try:
         ensured = send(engine, EnsureWorkflowAndFlowRequest(flow_name="CanonicalLegacyFive"))
         flow = engine.flow_manager.get_flow_by_name(ensured.flow_name)
@@ -261,10 +259,11 @@ async def canonical_case(engine, directory):
         from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, DeserializeFlowFromCommandsRequest
         from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
         from griptape_nodes.retained_mode.events.workflow_events import RunWorkflowWithCurrentStateRequest
-        other = send(engine, CreateFlowRequest(flow_name="UnrelatedEditableFlow", parent_flow_name=None, set_as_new_context=True))
+        other = send(engine, CreateFlowRequest(flow_name="UnrelatedEditableFlow", parent_flow_name=flow.name, set_as_new_context=True))
+        flow_contexts.enter_context(engine.context_manager.flow(other.flow_name))
         before_guard = migration._stamp(engine, flow)
         with migration._LOCK:
-            migration._INFLIGHT.setdefault(engine, set()).add(flow.name)
+            migration._INFLIGHT.setdefault(migration._migration_scope(engine), set()).add(flow.name)
         try:
             blocked_requests = [
                 CreateNodeRequest(node_type="HMBAgentLibrary", specific_library_name="HMB_GP_Production", override_parent_flow_name=flow.name),
@@ -279,7 +278,7 @@ async def canonical_case(engine, directory):
             assert migration._stamp(engine, flow) == before_guard
         finally:
             with migration._LOCK:
-                migration._INFLIGHT.get(engine, set()).discard(flow.name)
+                migration._INFLIGHT.get(migration._migration_scope(engine), set()).discard(flow.name)
         # One ordinary standalone editor requires no Shot choice when there is
         # no publisher and no saved binding. Preserve it without consolidation.
         legacy_agent = create("HMBAgentLibrary", "Single legacy unbound Agent")
@@ -308,6 +307,7 @@ async def canonical_case(engine, directory):
         assert migration._stamp(engine, flow) == before_unload
         print("PASS unload invalidates queued coordinator and clears pending without changing the graph")
     finally:
+        flow_contexts.close()
         LibraryRegistry.unregister_library("HMB_GP_Production", event_manager=engine.event_manager)
 
 
@@ -539,7 +539,7 @@ async def actual_saved_file_case(engine, directory, *, complete_manual_rebind=Fa
         disconnect_fixture_nodes(engine, flow, tuple(flow.nodes))
         send(engine, DeleteFlowRequest(flow_name=old_name))
         with migration._LOCK:
-            migration._RESULTS.get(engine, {}).pop(old_name, None)
+            migration._RESULTS.get(migration._migration_scope(engine), {}).pop(old_name, None)
         with mock.patch.object(routing, "schedule_post_hydration_reconcile", NATIVE_HYDRATION_SCHEDULER):
             loaded = await engine.ahandle_request(DeserializeFlowFromCommandsRequest(
                 serialized_flow_commands=serialized, broadcast_result=False))
@@ -593,8 +593,9 @@ def main():
             stack.enter_context(mock.patch.object(agents.HMBAgentLibrary, "process", no_execution))
             stack.enter_context(mock.patch.object(generators.HMBSeedanceGeneration, "_process_generation", no_execution))
             logging.disable(logging.CRITICAL)
+            from hmb_host_workflow import run_in_fixture_workflow
             with engine_scope() as engine:
-                asyncio.run(canonical_case(engine, temporary))
+                asyncio.run(run_in_fixture_workflow(engine, "CanonicalLegacyFive", canonical_case, temporary))
             with engine_scope() as engine:
                 asyncio.run(actual_saved_file_case(engine, temporary))
             assert EXECUTED == [] and NETWORK == []

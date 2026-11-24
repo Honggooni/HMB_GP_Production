@@ -1,10 +1,10 @@
 [project]
 name = "hmb-gp-production"
-version = "0.9.43"
+version = "0.9.51"
 description = "HMB production libraries with a bundled signed Agent policy and authenticated Broker-managed Seedance generation"
 authors = [{name = "HMB Pipeline"}]
 requires-python = ">=3.12,<3.13"
-dependencies = ["httpx==0.28.1", "imageio-ffmpeg==0.6.0", "Pillow>=12.3.0,<14"]
+dependencies = ["httpx==0.28.1", "imageio-ffmpeg==0.6.0", "Pillow>=12.3.0,<14", "pydantic-ai-slim[anthropic,bedrock,cohere,mcp,openai]>=2.66.0,<=2.71.0", "dateparser==1.4.1", "asteval==1.0.9", "ddgs==9.14.4", "exa-py==2.15.0", "trafilatura==2.1.0"]
 
 [project.optional-dependencies]
 tos-runtime = ["tos==2.9.2"]

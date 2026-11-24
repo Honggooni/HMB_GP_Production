@@ -11320,6 +11320,9 @@ class HMBPromptLibrary(DataNode):
                     picker_exact,
                 )
             picker_exact = True
+            restore_catalog = getattr(picker_source_node, "_hmb_restore_accepted_shot_catalog", None)
+            if compact_catalog is not None and callable(restore_catalog):
+                restore_catalog(compact_catalog)
             try:
                 if callable(picker_target_api):
                     raw_picker_snapshot = picker_target_api(

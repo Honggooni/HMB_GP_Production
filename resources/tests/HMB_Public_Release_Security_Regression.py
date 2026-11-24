@@ -26,6 +26,33 @@ assert re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", RELEAS
 RELEASE_PARTS = tuple(int(part) for part in RELEASE_VERSION.split("."))
 RELEASE_LABEL = f"v{RELEASE_PARTS[0]}.{RELEASE_PARTS[1]}.{RELEASE_PARTS[2]:02d}"
 EXPECTED_RUNTIME_INSTALL_FILES = (
+    "_hmb_native_agent/LICENSE",
+    "_hmb_native_agent/UPSTREAM.json",
+    "_hmb_native_agent/__init__.py",
+    "_hmb_native_agent/agents/__init__.py",
+    "_hmb_native_agent/agents/agent.py",
+    "_hmb_native_agent/llm/__init__.py",
+    "_hmb_native_agent/llm/agent_node_support.py",
+    "_hmb_native_agent/llm/agent_state.py",
+    "_hmb_native_agent/llm/budget.py",
+    "_hmb_native_agent/llm/errors.py",
+    "_hmb_native_agent/llm/history.py",
+    "_hmb_native_agent/llm/model_config.py",
+    "_hmb_native_agent/llm/models.py",
+    "_hmb_native_agent/llm/rulesets.py",
+    "_hmb_native_agent/llm/runner.py",
+    "_hmb_native_agent/llm/tools.py",
+    "_hmb_native_agent/llm/web.py",
+    "_hmb_native_agent/utils/__init__.py",
+    "_hmb_native_agent/utils/attribution.py",
+    "_hmb_native_agent/utils/cloud_credential_utils.py",
+    "_hmb_native_agent/utils/cloud_legacy_models.py",
+    "_hmb_native_agent/utils/griptape_cloud_headers.py",
+    "_hmb_native_agent/utils/model_invocation.py",
+    "_hmb_native_agent/utils/node_error_utils.py",
+    "_hmb_native_agent/utils/provider_selection_component.py",
+    "_hmb_native_agent/utils/secret_utils.py",
+    "_hmb_native_agent/utils/utilities.py",
     "__init__.py",
     "griptape-nodes-library.json",
     "HMBAgentLibrary.py",
@@ -402,11 +429,18 @@ finally:
         os.environ.pop(builder.STANDARD_AGENT_LIBRARY_ENV, None)
     else:
         os.environ[builder.STANDARD_AGENT_LIBRARY_ENV] = saved_standard_root
-standard_manifest_path = builder.validate_standard_agent_model_parity(manifest)
+with mock.patch.object(builder, "standard_agent_manifest_candidates", side_effect=AssertionError):
+    assert builder.validate_standard_agent_model_parity(manifest) is None
+review_checkout = os.environ.get("HMB_STANDARD_LIBRARY_ROOT") or saved_standard_root
+review_environment = {builder.STANDARD_AGENT_LIBRARY_ENV: review_checkout} if review_checkout else {}
+with mock.patch.dict(os.environ, review_environment):
+    standard_manifest_path = builder.validate_standard_agent_model_parity(manifest, compare_upstream=True)
+if review_checkout:
+    assert standard_manifest_path is not None, "The configured Standard catalog review fixture is missing."
 if standard_manifest_path is not None:
     standard_manifest = json.loads(standard_manifest_path.read_text(encoding="utf-8"))
     # Read the installed declaration independently of the package helper; the
-    # Standard Agent's current ordered model surface is the release authority.
+    # reviewed upstream fixture supplies an independent comparison.
     standard_agent_node = next(
         node for node in standard_manifest["nodes"] if node["class_name"] == "Agent"
     )

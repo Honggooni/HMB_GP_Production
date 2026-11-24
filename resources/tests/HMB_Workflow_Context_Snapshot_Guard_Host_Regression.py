@@ -32,7 +32,8 @@ def snapshot(engine):
     parents = workflow.nodes.name_to_parent_flow_name if workflow is not None else getattr(engine.node_manager, "_name_to_parent_flow_name", {})
     return {"workflow":context.get_current_workflow_name() if context.has_current_workflow() else None,
         "flow":context.get_current_flow().name if context.has_current_flow() else None,
-        "flows":len(stack._flow_stack) if stack is not None else 0,
+        "flows": (int(context.has_current_flow()) if workflow is not None
+                  else len(stack._flow_stack) if stack is not None else 0),
         "nodes":tuple(sorted(parents))}
 
 
@@ -104,7 +105,10 @@ async def exercise(engine,_phase,out):
                 await asyncio.sleep(.01)
             assert images._catalog_index_path(project).is_file()
             harness.record("registered_desktop_sdk_prepares_image_catalog_before_first_node")
-            flow_name=harness.send(engine,EnsureWorkflowAndFlowRequest(flow_name="SnapshotGuardSDK")).flow_name
+            ensured = harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name="SnapshotGuardSDK"))
+            if getattr(ensured, "open_workflow", None) is not None:
+                guards.enter_context(engine.bind_workflow(engine.open_workflows.get(ensured.workflow_id)))
+            flow_name = ensured.flow_name
             created=harness.send(engine,CreateNodeRequest(node_type="HMBImageAssetLibrary",specific_library_name=schema.name,
                 node_name="Context Source",initial_setup=True,create_error_proxy_on_failure=False))
             source=engine.node_manager.get_node_by_name(created.node_name)
@@ -125,7 +129,9 @@ async def exercise(engine,_phase,out):
             registry["assets"][0]["image_name"] = "New registration after saving"
             manifest.write_text(json.dumps(registry), encoding="utf-8")
             if hasattr(engine, "close_workflow"):
+                from griptape_nodes.retained_mode.engine import NO_WORKFLOW
                 engine.close_workflow(engine.current_workflow())
+                guards.enter_context(engine.bind_workflow(NO_WORKFLOW))
             else:
                 await harness.asend(engine,ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
@@ -133,32 +139,50 @@ async def exercise(engine,_phase,out):
             # previously could enter and steal the loader's shared Flow scope.
             entered=threading.Event();finished=threading.Event();results=[]
             loader_thread=threading.get_ident();captured=contextvars.copy_context()
-            original_push_node=engine.context_manager.push_node;fired=False
+            node_hook = "node" if hasattr(engine, "bind_workflow") else "push_node"
+            original_push_node = getattr(engine.context_manager, node_hook)
+            fired = False
+            loading_workflow = None
+            worker_errors = []
             def push_node(node):
-                nonlocal fired
+                nonlocal fired, loading_workflow
                 result=original_push_node(node)
                 file_scope=any(frame.filename=="<string>" for frame in traceback.extract_stack())
                 if not fired and threading.get_ident()==loader_thread and file_scope:
+                    if hasattr(engine, "bind_workflow"):
+                        loading_workflow = engine.current_workflow()
                     fired=True;entered.set();assert finished.wait(15),"External snapshot did not finish"
                 return result
             never_written=out/"must-not-write-while-loading.py"
+            def check_conflict():
+                before = snapshot(engine)
+                result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_name, broadcast_result=False))
+                save_result = engine.handle_request(SaveWorkflowFileFromSerializedFlowRequest(
+                    serialized_flow_commands=serialized, file_name=never_written.stem,
+                    file_path=str(never_written), display_name="Must refuse", broadcast_result=False))
+                results.append((result.succeeded(), save_result.succeeded(), before == snapshot(engine)))
+                assert not result.succeeded() and not save_result.succeeded()
+                assert "not queued" in str(result.result_details), result.result_details
             def external_snapshot():
                 try:
                     assert entered.wait(15)
-                    before=snapshot(engine)
-                    result=engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_name,broadcast_result=False))
-                    save_result=engine.handle_request(SaveWorkflowFileFromSerializedFlowRequest(serialized_flow_commands=serialized,
-                        file_name=never_written.stem,file_path=str(never_written),display_name="Must refuse",broadcast_result=False))
-                    results.append((result.succeeded(),save_result.succeeded(),before==snapshot(engine)))
-                    assert not result.succeeded() and not save_result.succeeded()
-                    assert "not queued" in str(result.result_details)
+                    with ExitStack() as caller:
+                        if loading_workflow is not None:
+                            caller.enter_context(engine.bind_workflow(loading_workflow))
+                        check_conflict()
+                except BaseException as error:
+                    worker_errors.append(error)
                 finally:finished.set()
             worker=threading.Thread(target=captured.run,args=(external_snapshot,))
             worker.start()
-            with mock.patch.object(engine.context_manager,"push_node",push_node):
+            with mock.patch.object(engine.context_manager, node_hook, push_node):
                 loaded=await engine.ahandle_request(RunWorkflowWithCurrentStateRequest(file_path=str(original),broadcast_result=False))
             worker.join(20);assert not worker.is_alive()
+            if worker_errors:
+                raise worker_errors[0]
             assert loaded.succeeded(),str(loaded.result_details)
+            if getattr(loaded, "open_workflow", None) is not None:
+                guards.enter_context(engine.bind_workflow(engine.open_workflows.get(loaded.workflow_id)))
             await settle()
             assert results==[(False,False,True)] and not never_written.exists()
             assert snapshot(engine)["flows"]==1 and not registration.load_requests
@@ -219,10 +243,13 @@ async def exercise(engine,_phase,out):
             await settle()
             if hasattr(engine, "close_workflow"):
                 engine.close_workflow(engine.current_workflow())
+                guards.enter_context(engine.bind_workflow(NO_WORKFLOW))
             else:
                 await harness.asend(engine,ClearAllObjectStateRequest(i_know_what_im_doing=True))
             reopened=await engine.ahandle_request(RunWorkflowWithCurrentStateRequest(file_path=str(new_saved),broadcast_result=False))
             assert reopened.succeeded(),str(reopened.result_details)
+            if getattr(reopened, "open_workflow", None) is not None:
+                guards.enter_context(engine.bind_workflow(engine.open_workflows.get(reopened.workflow_id)))
             await settle()
             assert snapshot(engine)["flows"]==1
             harness.record("native_save_and_file_reopen_after_busy_releases_remain_normal")

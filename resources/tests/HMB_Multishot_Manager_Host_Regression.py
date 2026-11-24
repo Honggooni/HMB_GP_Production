@@ -201,7 +201,7 @@ async def exercise(engine):
     native_base = agent_module.HMBAgentLibrary.__mro__[1]
     native_module = inspect.getmodule(native_base)
     assert agent_module._BuiltinAgent is not None and native_module is not None
-    from griptape_nodes_library.llm import runner as native_runner
+    from _hmb_native_agent.llm import runner as native_runner
     original_native_process = native_base._process
     original_run_agent = native_module.run_agent
     with ExitStack() as stack:

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from contextlib import ExitStack
 import sys
 from types import SimpleNamespace
 from unittest import mock
@@ -156,9 +157,12 @@ async def exercise(engine, phase: str, out: Path) -> None:
          mock.patch.object(prompt_module.HMBPromptLibrary, "_hmb_analysis_upstream_sources_for", fixture_sources), \
          mock.patch.object(prompt_module.HMBPromptLibrary, "_hmb_analysis_upstream_reference_for", fixture_reference), \
          mock.patch("HMBAgentLibrary.get_same_shot_analysis_model", return_value=config), \
-         mock.patch.object(backend, "analyze_reference", fixture_analysis):
+         mock.patch.object(backend, "analyze_reference", fixture_analysis), ExitStack() as workflow_context:
         if phase == "save":
-            flow_name = host.send(engine, EnsureWorkflowAndFlowRequest(flow_name="AnalysisSaveReopenFixture")).flow_name
+            ensured = host.send(engine, EnsureWorkflowAndFlowRequest(flow_name="AnalysisSaveReopenFixture"))
+            if getattr(ensured, "open_workflow", None) is not None:
+                workflow_context.enter_context(engine.bind_workflow(engine.open_workflows.get(ensured.workflow_id)))
+            flow_name = ensured.flow_name
             node = await create("HMBAnalysisAgent", "Cold Analysis Agent", flow_name)
             prompt = await create("HMBPromptLibrary", "Cold Prompt", flow_name)
             source_node = await create("HMBImageAssetLibrary", "Cold Analysis Image Publisher", flow_name)
@@ -267,6 +271,8 @@ async def exercise(engine, phase: str, out: Path) -> None:
             return
 
         loaded = await host.asend(engine, RunWorkflowWithCurrentStateRequest(file_path=str(saved)))
+        if getattr(loaded, "open_workflow", None) is not None:
+            workflow_context.enter_context(engine.bind_workflow(engine.open_workflows.get(loaded.workflow_id)))
         assert str(getattr(loaded.status, "name", loaded.status)) == "GOOD"
         node, before, prompt = get("Cold Analysis Agent"), get("Cold Upstream Analysis Agent"), get("Cold Prompt")
         configure_image_source(get("Cold Analysis Image Publisher"), prompt)

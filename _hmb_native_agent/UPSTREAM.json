@@ -1,0 +1,117 @@
+{
+  "source": "https://github.com/griptape-ai/griptape-nodes-library-standard",
+  "revision": "29e91f362343e2eba4fb3d2d48ef05d43bb34d53",
+  "upstream_library_version": "0.91.1",
+  "upstream_python_project_version": "0.86.0",
+  "upstream_engine_version": "0.108.0",
+  "upstream_library_schema_version": "0.10.0",
+  "license": "Apache-2.0",
+  "origin_namespace": "griptape_nodes_library",
+  "namespace": "_hmb_native_agent",
+  "files": {
+    "LICENSE": {
+      "original_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "local_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    "griptape_nodes_library/__init__.py": {
+      "original_sha256": "750a25b8106ee12c35a63452807738068f1a44e6df3d6532c271523efed936a4",
+      "local_sha256": "253ae4335b5fa6b0deb4dff4f77f07769b75c293540a6ad268106ed9d23a7cdf"
+    },
+    "griptape_nodes_library/agents/__init__.py": {
+      "original_sha256": "c2dfa0c85276214ca43c1d25366b7767bc884de3d97664ae188da543f64d063d",
+      "local_sha256": "c3907d67fb3007e939d3ddca91ef719830f20456006ba7c921e2d5afa2e6693d"
+    },
+    "griptape_nodes_library/agents/agent.py": {
+      "original_sha256": "55873e3539626559f301b25085079d33c78cf6bee805e42eaecf16cded3330dc",
+      "local_sha256": "c7adeed3f40a7d0840cfb479a5927534dea76b34b17db800b66792b62bd4f24c"
+    },
+    "griptape_nodes_library/llm/__init__.py": {
+      "original_sha256": "d052b09392a16330ff74b64d227558bd73a9f0384e52be960501a61c499ebb62",
+      "local_sha256": "18d4e9d1d7bb082087bafec8536d25dec2721e5b267b7105fca02b0be6d7c191"
+    },
+    "griptape_nodes_library/llm/agent_node_support.py": {
+      "original_sha256": "0c3095b7ba21e9e388b980f8d6fa5a451923f023df2297c01b7e6b353a66d9f6",
+      "local_sha256": "e800e1811502972877e7dadae5f77a5e1902c810d1ee8bd76901bce0e66438d4"
+    },
+    "griptape_nodes_library/llm/agent_state.py": {
+      "original_sha256": "e2ee49f34f0d1b592af132c72b30cbf8aadb9d5f64837e63cf3f36696b5908c4",
+      "local_sha256": "792326b9d33b40499d7f669bd19c600c250830450f6bca600515483c77d0fb81"
+    },
+    "griptape_nodes_library/llm/budget.py": {
+      "original_sha256": "e52902245a5e3a91f8d6949cba1501b30e6e5ee0dc8fb761badd2f3dcc5f2df1",
+      "local_sha256": "f41de173d09130240c34415bb2195d3443a71bca2ec98c4cc4f73f33564d5d03"
+    },
+    "griptape_nodes_library/llm/errors.py": {
+      "original_sha256": "4525e00d4c9ecb827748d12a198f264db743f70618178751e4bfb4742d104d15",
+      "local_sha256": "7f3660088f823891c7f25e555bd90eca4b5f1ecd6b9388d2bf79cd25113e5078"
+    },
+    "griptape_nodes_library/llm/history.py": {
+      "original_sha256": "dee1b2ee19b4c72b9e9999424be3307445465d0e244a5576fab670fd8a49fcf6",
+      "local_sha256": "51e29e889ac7fa735f064713c6d9559e9c09d21cdd99023095ff91187b9c32ce"
+    },
+    "griptape_nodes_library/llm/model_config.py": {
+      "original_sha256": "39e7a78b7193699a025a25a2a38757ed07a27a5588a55e94a7959eae9453089f",
+      "local_sha256": "bd755879c3950bd364e0c038905cc6c0f711f4e59160228d84aabfba98c6db5d"
+    },
+    "griptape_nodes_library/llm/models.py": {
+      "original_sha256": "ced697dc86e76e3fd52ad74e9eb6b53f23209104c1bb4acc2657dbbf60ee7e01",
+      "local_sha256": "fe917171800fcaeda68b35ccfb8ef0331591768bee12207738eb74fcfb8e2874"
+    },
+    "griptape_nodes_library/llm/rulesets.py": {
+      "original_sha256": "fea5eb134ce357a38c1320f5af6e27b82ca679404d9cddf73105e1c041dda20c",
+      "local_sha256": "1d7cd79e8e416d508aac1b0b360e509279c507d07aa678e438783b5cd083d78d"
+    },
+    "griptape_nodes_library/llm/runner.py": {
+      "original_sha256": "2a59223911f47112ae4dca6f6253e816328a343f74d6cfdc77c97e79d8fd69af",
+      "local_sha256": "ac285e26fcf18f0eef6bd02ef579b2cdc90719137e007536050216086248861e"
+    },
+    "griptape_nodes_library/llm/tools.py": {
+      "original_sha256": "9ccf182a4b62c7679ec79c3a508c326957bc34bee8f3120db35966322d640e30",
+      "local_sha256": "bb339727f3d9d86fc51da5c8b55c59fca3020db3a3b6d885d19f3f44fec959e5"
+    },
+    "griptape_nodes_library/llm/web.py": {
+      "original_sha256": "d82b6116fbc28d2762a6890fea0eb21f85e3461e3dc2305ce8f32f4465c60502",
+      "local_sha256": "494348bd71f391595b67960e8ac6b8f17bc09ebfb33525a9ee5c1d7951230dbc"
+    },
+    "griptape_nodes_library/utils/__init__.py": {
+      "original_sha256": "b4fdcbf24ac684768b6871bbadf4fa6429dff87d2041f62b90cc6d69adc2ef6f",
+      "local_sha256": "e9b6664af1e391baf93445dc94ca14eeb01d12804d803f81414355932e2751d4"
+    },
+    "griptape_nodes_library/utils/attribution.py": {
+      "original_sha256": "e092f9f8df750d2de8a44a3fcf23c368ffff04bb155a9b800f0d99cbabbf24e3",
+      "local_sha256": "47be4b9bb34bd312b0a319403046ca20a433a218dd6cdddc62172ca8fe640a72"
+    },
+    "griptape_nodes_library/utils/cloud_credential_utils.py": {
+      "original_sha256": "f8de102e386777533eea2e48b199b922bf4203f78e95326671c4c78eae585bcd",
+      "local_sha256": "415cd9e88560630951f0f0ddb93706145c1928d2a492432233602aeb68469ec1"
+    },
+    "griptape_nodes_library/utils/cloud_legacy_models.py": {
+      "original_sha256": "3f60eae7dfaccd444611a9d3e9f3d8a1f65174cf262a6a6662656848fbee45f6",
+      "local_sha256": "2429b88c3b4493d73d8804ade2202d265d180bb882b7d8c6aacb68ba8163b86a"
+    },
+    "griptape_nodes_library/utils/griptape_cloud_headers.py": {
+      "original_sha256": "b3181432d092f28b5ceec8f39357231afa7ee00ae48cbfa1f549b8db90704ee6",
+      "local_sha256": "ed4e34fd9b038841ba25a3c53ba5b5ac81ce9eccfb4215c926f59555f09cdccf"
+    },
+    "griptape_nodes_library/utils/model_invocation.py": {
+      "original_sha256": "47c20b267fff26768c84da277b3cb14bce41c0da010e3f2417b587132272ee50",
+      "local_sha256": "984da42fe780c4e9dba50b4a1cd7e02e7bdb2802065487b6dff2619b3997d627"
+    },
+    "griptape_nodes_library/utils/node_error_utils.py": {
+      "original_sha256": "9e6fbb9c3774a345bfc1749b59f58f134f3cb760030bab1c04b9303f58eee350",
+      "local_sha256": "c4c82645764e6a2e74383f429249aed0ebd66e2c3361cf5752f2e3200e7451ef"
+    },
+    "griptape_nodes_library/utils/provider_selection_component.py": {
+      "original_sha256": "3b2634b07450ebefb82365c59e5898d563a38addda49d3cada6a2abd22dc27db",
+      "local_sha256": "5b9f2ee8ade612443283b882ab2464f786dab2b72331abbe9282b06c39693e83"
+    },
+    "griptape_nodes_library/utils/secret_utils.py": {
+      "original_sha256": "2a1fc754e55ad670c5d04c149f28c3f7abc7fad19cc987098e2fe2f16f211cf6",
+      "local_sha256": "95731b33bd1ae1013b36e879fb56fea0c3c1ea8025e9f5268f5a59fce28fcc0a"
+    },
+    "griptape_nodes_library/utils/utilities.py": {
+      "original_sha256": "6cb3ebd19accc41164e8c4b00a92a43bf0d832399fcc8008f8a7aa0f93fea1f7",
+      "local_sha256": "46b0fdd4ac4d1cdfc77e10b48e8a8c674fb2d33685725e92db6dbf26f690a456"
+    }
+  }
+}

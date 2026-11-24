@@ -21,6 +21,8 @@ import tempfile
 from types import SimpleNamespace
 from unittest import mock
 
+from hmb_host_workflow import run_in_fixture_workflow
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.dont_write_bytecode = True
@@ -347,7 +349,7 @@ def main():
                     runner.get_loop()
                     with mock.patch.object(socket.socket, "connect", connect), mock.patch.object(socket.socket, "connect_ex", deny):
                         with engine_scope() as engine:
-                            runner.run(exercise(engine, directory))
+                            runner.run(run_in_fixture_workflow(engine, "PersonalImageFixture", exercise, directory))
             finally:
                 logging.shutdown()
                 os.chdir(previous)

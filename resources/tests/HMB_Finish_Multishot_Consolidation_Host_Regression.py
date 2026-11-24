@@ -107,6 +107,7 @@ async def exercise(engine, directory):
     from griptape_nodes.serialization.values import decode_value
     engine.event_manager.initialize_queue()
     library, advanced, images, finishes, generators = register_library(engine)
+    current_flow = ExitStack()
     try:
         result = send(engine, EnsureWorkflowAndFlowRequest(flow_name="LegacyFiveFinishLook"))
         flow = engine.flow_manager.get_flow_by_name(result.flow_name)
@@ -205,16 +206,14 @@ async def exercise(engine, directory):
         # SDK CreateFlow(None) means the ambient flow when one exists. A real
         # reopen clears that context; discard this fixture's deleted canvas
         # before replay so it cannot become its own parent by name.
-        while engine.context_manager.has_current_flow():
-            engine.context_manager.pop_flow()
         send(engine, DeleteFlowRequest(flow_name=old_name))
         with migration._LOCK:
-            migration._RESULTS.get(engine, {}).pop(old_name, None)
+            migration._RESULTS.get(migration._migration_scope(engine), {}).pop(old_name, None)
         loaded = await engine.ahandle_request(DeserializeFlowFromCommandsRequest(
             serialized_flow_commands=serialized, broadcast_result=False))
         assert loaded.succeeded(), str(loaded.result_details)
         flow = engine.flow_manager.get_flow_by_name(loaded.flow_name)
-        engine.context_manager.push_flow(flow)
+        current_flow.enter_context(engine.context_manager.flow(flow))
         source = next(node for node in flow.nodes.values() if node.metadata.get("node_type") == "HMBImageAssetLibrary")
         media_fixture(source)
         for _ in range(100):
@@ -288,7 +287,9 @@ async def exercise(engine, directory):
         # A single standalone public Finish output stays wired exactly as it
         # was. Several differently authored standalone outputs are ambiguous:
         # retain every original rather than guessing a Shot from node names.
-        other = send(engine, CreateFlowRequest(flow_name="StandaloneFinish", parent_flow_name=None, set_as_new_context=True))
+        current_flow.close()
+        other = send(engine, CreateFlowRequest(flow_name="StandaloneFinish", parent_flow_name=flow.name))
+        current_flow.enter_context(engine.context_manager.flow(other.flow_name))
         standalone = create("HMBFinishLookLibrary", "Standalone Finish")
         target = create("HMBSeedanceGeneration", "Standalone manual consumer")
         raw = finishes.default_widget_state()
@@ -327,7 +328,9 @@ async def exercise(engine, directory):
         # The real SDK must carry the optional command through before/set/after,
         # not merely a direct Python helper. Creative and public outputs stay
         # on the existing nine-key/Beauty schema contracts.
-        clock_flow = send(engine, CreateFlowRequest(flow_name="FinishUITransport", parent_flow_name=None, set_as_new_context=True))
+        current_flow.close()
+        clock_flow = send(engine, CreateFlowRequest(flow_name="FinishUITransport", parent_flow_name=flow.name))
+        current_flow.enter_context(engine.context_manager.flow(clock_flow.flow_name))
         clock_node = create("HMBFinishLookLibrary", "Native UI Clock Finish")
         def ui_wire(node):
             node._restore_widget_parameter(live=False)
@@ -365,11 +368,12 @@ async def exercise(engine, directory):
         saved=send(engine,SerializeFlowToCommandsRequest(flow_name=clock_flow.flow_name)).serialized_flow_commands
         saved_ui_values=[value for value in saved.unique_parameter_uuid_to_values.values() if isinstance(value,dict) and finishes.UI_TRANSPORT_KEY in value]
         assert saved_ui_values and all(len(finishes.validate_widget_state(value))==9 for value in saved_ui_values)
-        while engine.context_manager.has_current_flow():engine.context_manager.pop_flow()
+        current_flow.close()
         send(engine,DeleteFlowRequest(flow_name=clock_flow.flow_name))
         reopened=await engine.ahandle_request(DeserializeFlowFromCommandsRequest(serialized_flow_commands=saved,broadcast_result=False))
         assert reopened.succeeded(),str(reopened.result_details)
-        reopened_flow=engine.flow_manager.get_flow_by_name(reopened.flow_name);engine.context_manager.push_flow(reopened_flow)
+        reopened_flow=engine.flow_manager.get_flow_by_name(reopened.flow_name)
+        current_flow.enter_context(engine.context_manager.flow(reopened_flow))
         clock_node=reopened_flow.nodes["Native UI Clock Finish"]
         assert clock_node._last_valid_state["beauty"]["brightness"]==1.2
         assert ui_wire(clock_node)[finishes.UI_TRANSPORT_KEY]["session_id"]!=old_session
@@ -380,7 +384,62 @@ async def exercise(engine, directory):
         assert finishes.UI_TRANSPORT_KEY not in clock_node.get_parameter_value(finishes.SHOT_STORE_PARAMETER_NAME)
         print("PASS actual SetParameterValueRequest refresh/edit/duplicate carries UI request ID and lease; official save/reload preserves Beauty with a fresh instance session and rejects old commands; refresh compiles nothing")
     finally:
+        current_flow.close()
         LibraryRegistry.unregister_library("HMB_GP_Production", event_manager=engine.event_manager)
+
+
+async def queued_owner_checks(engine, root):
+    from griptape_nodes.retained_mode.events.context_events import (
+        EnsureWorkflowAndFlowRequest, EnsureWorkflowAndFlowResultSuccess)
+    from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, DeleteFlowRequest
+    import _hmb_workflow_migration as migration
+
+    if "open_workflow" not in EnsureWorkflowAndFlowResultSuccess.__dataclass_fields__:
+        return  # Older SDK has only one open tab at a time.
+    engine.event_manager.initialize_queue()
+    name = "Same saved canvas"
+    def opened(label):
+        result = send(engine, EnsureWorkflowAndFlowRequest(flow_name=name, display_name=label))
+        path = root / (label + ".py")
+        path.write_text("# Synthetic saved tab identity\n", encoding="utf8")
+        engine.workflow_registry.set_file_path(engine.workflow_registry.get(result.workflow_id), path)
+        return engine.open_workflows.get(result.workflow_id)
+
+    first, second = opened("first"), opened("second")
+    assert first is not second
+    for owner in (first, second):
+        with engine.bind_workflow(owner):
+            migration.mark_flow_migration_pending(engine, name)
+    visited = []
+    migrate = migration.migrate_flow
+    async def observe(host, flow_name):
+        visited.append((host.current_workflow(), host.flow_manager.get_flow_by_name(flow_name)))
+        return await migrate(host, flow_name)
+
+    with mock.patch.object(migration, "migrate_flow", observe):
+        migration.schedule_loaded_flow_migrations(engine)
+        engine.close_workflow(first)
+        reopened = engine.open_workflow(first.workflow_id)
+        with engine.bind_workflow(reopened):
+            send(engine, CreateFlowRequest(flow_name=name, parent_flow_name=None))
+        assert reopened is not first and reopened.workflow_id == first.workflow_id
+        for _ in range(3):
+            await asyncio.sleep(0)
+        with engine.bind_workflow(second):
+            assert visited == [(second, engine.flow_manager.get_flow_by_name(name))]
+            assert migration.last_migration_result(engine, name)["ok"]
+        with engine.bind_workflow(reopened):
+            assert migration.last_migration_result(engine, name) is None
+            migration.mark_flow_migration_pending(engine, name)
+            migration.schedule_loaded_flow_migrations(engine)
+            send(engine, DeleteFlowRequest(flow_name=name))
+            send(engine, CreateFlowRequest(flow_name=name, parent_flow_name=None))
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert not migration.flow_migration_pending(engine, name)
+            assert migration.last_migration_result(engine, name) is None
+        assert len(visited) == 1
+    print("PASS same-name tabs: only live owner migrated; closing and reopening same ID or replacing its flow discards stale work")
 
 
 def main():
@@ -409,7 +468,10 @@ def main():
             stack.enter_context(mock.patch.object(generators.HMBSeedanceGeneration, "_process_generation", deny_execution))
             logging.disable(logging.CRITICAL)
             with engine_scope() as engine:
-                asyncio.run(exercise(engine, root))
+                from hmb_host_workflow import run_in_fixture_workflow
+                asyncio.run(run_in_fixture_workflow(engine, "LegacyFiveFinishLook", exercise, root))
+            with engine_scope() as engine:
+                asyncio.run(queued_owner_checks(engine, root))
             assert NETWORK == [] and EXECUTED == []
     print("HMB_FINISH_MULTISHOT_CONSOLIDATION_HOST=PASS (actual SDK; no network, render or user graph changes)")
 

@@ -3,6 +3,26 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_Agent_Independent_Host_Regression.py",
+      "mode": "ci",
+      "coverage": "installed_sdk",
+      "required": true,
+      "sdk": "desktop_031"
+    },
+    {
+      "name": "HMB_Seedance_Standalone_Host_Regression.py",
+      "mode": "ci",
+      "coverage": "installed_sdk",
+      "required": true,
+      "sdk": "desktop_031"
+    },
+    {
+      "name": "HMB_Pinned_Agent_Provenance_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_Editor_0132_Rodong_Launch_Regression.mjs",
       "mode": "manual",
       "coverage": "host_browser",

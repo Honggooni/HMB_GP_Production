@@ -297,6 +297,21 @@ try:
     assert copied_asset["selected"] is True
     assert copied_asset["selection_order"] == 1
     assert copied_asset["import_source_uid"] == imported_asset["source_uid"]
+    # Another workflow can Add the same image to the shared registry. The
+    # saved external wire still owns its selection and Shot membership.
+    legacy = deepcopy(imported_registered)
+    old_wire = dict(imported_asset, selected=True, asset_id=copied_asset["asset_id"])
+    old_wire.pop("import_shot_initialized", None)
+    legacy["assets"] = [dict(copied_asset, selected=False), old_wire]
+    legacy["shot_routing"]["shots"][0]["selected_source_uids"] = []
+    restored, media = asset_library._merge_import_input(legacy, [str(external_source)])
+    assert set(media) == {old_wire["source_uid"]}
+    assert restored["shot_routing"]["shots"][0]["selected_source_uids"] == [old_wire["source_uid"]]
+    assert [row["source_uid"] for row in restored["assets"] if row["selected"]] == [old_wire["source_uid"]]
+    for row in restored["assets"]:
+        row["selected"] = False
+    restored, _ = asset_library._merge_import_input(restored, [str(external_source)])
+    assert not restored["shot_routing"]["shots"][0]["selected_source_uids"]
     registration_output = asset_library._build_output_payload(imported_registered)
     registered_output = next(item for item in registration_output["verified_assets"]
                              if item["source_uid"] == copied_asset["source_uid"])

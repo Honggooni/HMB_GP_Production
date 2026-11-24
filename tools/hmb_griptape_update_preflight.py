@@ -13,6 +13,7 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 
+from audit_regression_coverage import classify_result
 from hmb_editor_0130_header import HEADER_SOURCE
 from hmb_rodong_editor_0130 import STOCK_SHA256, build
 from package_runtime_release import WIDGET_FILES, validate_widget_declarations
@@ -110,6 +111,14 @@ BROWSER_CHECKS = (
     "HMB_Shot_Basket_Creation_Widget_Regression.mjs",
 )
 
+WORKFLOW_SCOPED_CHECKS = (
+    ("HMB_Desktop031_Workflow_Envelope_Host_Regression.py", {}),
+    ("HMB_Seedance_Standalone_Host_Regression.py", {}),
+    ("HMB_Agent_Model_Identity_Host_Regression.py", {}),
+    ("HMB_Real_Standard_Agent_Boundary_Regression.py", {}),
+)
+WORKFLOW_SCOPED_BROWSER_CHECKS = ("HMB_Editor_0132_Rodong_Launch_Regression.mjs",)
+
 # A release must cover every shipped library, including Local-only nodes.
 LIBRARY_CHECKS = {
     "HMBImageAssetLibrary": "HMB_Image_Asset_Authority_Lifecycle_Regression.mjs",
@@ -133,7 +142,7 @@ OUT_ARGUMENT_CHECKS = frozenset((
 
 
 def check_inventory() -> dict[str, str]:
-    names = [name for name, _ in CHECKS] + list(BROWSER_CHECKS)
+    names = [name for name, _ in CHECKS + WORKFLOW_SCOPED_CHECKS] + list(BROWSER_CHECKS + WORKFLOW_SCOPED_BROWSER_CHECKS)
     if len(names) != len(set(names)) or set(LIBRARY_CHECKS.values()) - set(names):
         raise ValueError("Upgrade check coverage is duplicate or incomplete")
     for name in names:
@@ -235,10 +244,11 @@ def product_digest() -> str:
     manifest = ROOT / "griptape-nodes-library.json"
     entries = json.loads(manifest.read_bytes())
     files = {manifest, *ROOT.glob("*.py"), *Path(__file__).parent.glob("*.py")}
+    files.update(path for path in (ROOT / "_hmb_native_agent").rglob("*")
+                 if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc")
     files.update(ROOT / item["path"] for item in entries.get("widgets", []))
-    files.update(TESTS / script for script, _ in CHECKS)
-    files.update(TESTS / script for script in BROWSER_CHECKS)
-    files.update(path for path in TESTS.glob("_hmb*") if path.suffix in {".py", ".mjs", ".cjs"})
+    # Host-specific checks also import fixtures from other regression scripts.
+    files.update(path for path in TESTS.iterdir() if path.suffix in {".py", ".mjs", ".cjs"})
     files.update(path for path in (ROOT / "resources/editor").iterdir() if path.is_file())
     inventory = {path.relative_to(ROOT).as_posix(): digest(path) for path in sorted(files)}
     return sha256(json.dumps(inventory, sort_keys=True).encode()).hexdigest()
@@ -290,6 +300,14 @@ def validate_wheel_evidence(proof: Path, stock_sha: str) -> None:
         raise ValueError("Wheel evidence is missing the catalog refresh or Prompt selection check")
 
 
+def required_check_outcome(code: int, log: Path) -> int | str:
+    if code:
+        return code
+    output = log.read_text(encoding="utf-8", errors="replace")
+    status, reason = classify_result({"required": True}, code, output)
+    return 0 if status == "passed" else reason
+
+
 def run(candidate: Path, standard: Path, output: Path, node: str, legacy_editor_fixture: Path | None = None,
         *, header_source: Path = HEADER_SOURCE) -> int:
     expected = {name for name, _ in CHECKS} | set(BROWSER_CHECKS)
@@ -303,12 +321,8 @@ def run(candidate: Path, standard: Path, output: Path, node: str, legacy_editor_
         host_checks = CHECKS
         browser_checks = BROWSER_CHECKS
         if result["identity"]["editor"] == "0.132.0":
-            host_checks += (
-                ("HMB_Desktop031_Workflow_Envelope_Host_Regression.py", {}),
-                ("HMB_Agent_Model_Identity_Host_Regression.py", {}),
-                ("HMB_Real_Standard_Agent_Boundary_Regression.py", {}),
-            )
-            browser_checks += ("HMB_Editor_0132_Rodong_Launch_Regression.mjs",)
+            host_checks += WORKFLOW_SCOPED_CHECKS
+            browser_checks += WORKFLOW_SCOPED_BROWSER_CHECKS
             expected = {name for name, _ in host_checks} | set(browser_checks)
             result["mandatory_checks"] = sorted(expected)
         result["hmb_source_sha256"] = product_digest()
@@ -338,7 +352,7 @@ def run(candidate: Path, standard: Path, output: Path, node: str, legacy_editor_
                         command += ["--out", str(folder / "evidence")]
                     check = subprocess.run(command, cwd=folder, env=env,
                                            stdout=log, stderr=subprocess.STDOUT, timeout=150, check=False)
-                    result["checks"][script] = check.returncode
+                    result["checks"][script] = required_check_outcome(check.returncode, folder / "test.log")
                 except subprocess.TimeoutExpired:
                     result["checks"][script] = "timeout"
         bundled_node_modules = Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules"
@@ -367,7 +381,7 @@ def run(candidate: Path, standard: Path, output: Path, node: str, legacy_editor_
                     try:
                         check = subprocess.run(command, cwd=folder, env=env, stdout=log, stderr=subprocess.STDOUT,
                                                timeout=60, check=False)
-                        result["checks"][script] = check.returncode
+                        result["checks"][script] = required_check_outcome(check.returncode, folder / "test.log")
                     except subprocess.TimeoutExpired:
                         result["checks"][script] = "timeout"
         if (inspect_candidate(candidate, header_source=header_source) != result["identity"]

@@ -24,6 +24,8 @@ from types import SimpleNamespace
 from unittest import mock
 from uuid import uuid4
 
+from hmb_host_workflow import run_in_fixture_workflow
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT), str(ROOT / "resources/tests")]
 sys.dont_write_bytecode = True
@@ -76,6 +78,51 @@ def authoring(nodes):
         generators={node.name: dict(values={key:deepcopy(node.get_parameter_value(key)) for key in generator_fields},
             outputs={key:deepcopy(node.parameter_output_values.get(key)) for key in ("generation_id", "generation_status", "result_details", "video_url", "was_successful")})
             for node in nodes[base.KINDS[5]]})
+
+
+def assert_reopened_authoring(previous, restored, nodes, old_picker_id):
+    """Recompute both publishers' evidence for the same saved, ordered media."""
+    source, picker = (nodes[kind] for kind in base.KINDS[:2])
+    expected = deepcopy(previous)
+    for key, saved in previous["prompt_documents"].items():
+        current = restored["prompt_documents"][key]
+        if current == saved:
+            continue
+        old, new = json.loads(saved), json.loads(current)
+        shot_id = new["shot"]["shot_uuid"]
+        snapshot = source._hmb_shot_routing_snapshot_for(channel_uuid=new["shot"]["channel_uuid"], shot_uuid=shot_id)
+        shot = next(row for row in snapshot["shots"] if row["shot_uuid"] == shot_id)
+        for document in (old, new):
+            image = document["image_asset"]
+            view = image["shot_routing"]
+            generation = view["generation"]
+            assert generation >= image["shot_catalog_routing"]["generation"]
+            assert view["metadata_sha256"] == base.digest(dict(channel_uuid=snapshot["channel_uuid"], generation=generation,
+                project_id=snapshot["project_id"], shots=snapshot["shots"], ordered_assets=snapshot["ordered_assets"]))
+            assert image["selection_id"] == base.digest(dict(channel_uuid=snapshot["channel_uuid"], generation=generation,
+                shot_uuid=shot_id, selected_source_uids=shot["selected_source_uids"]))
+        assert new["source_sync_revision"] >= old["source_sync_revision"]
+        old["source_sync_revision"] = new["source_sync_revision"]
+        old["image_asset"]["selection_id"] = new["image_asset"]["selection_id"]
+        for field in ("generation", "metadata_sha256"):
+            old["image_asset"]["shot_routing"][field] = new["image_asset"]["shot_routing"][field]
+        old_view, new_view = (document["picker"]["shot_routing"] for document in (old, new))
+        if old_view != new_view:
+            # A restored native Picker has a new per-instance UUID. Its real
+            # publication may land immediately after file-open or on reconnect.
+            video = picker._hmb_shot_routing_snapshot_for(channel_uuid=new["shot"]["channel_uuid"],
+                shot_uuid=shot_id, validate_media=False)
+            assert old_view["publisher_instance_uuid"] == old_picker_id
+            assert new_view["publisher_instance_uuid"] == video["publisher_instance_uuid"] == picker._hmb_picker_publisher_uuid
+            for view in (old_view, new_view):
+                assert view["generation"] > 0
+                assert view["metadata_sha256"] == base.digest(dict(channel_uuid=video["channel_uuid"],
+                    generation=view["generation"], shots=video["shots"], ordered_videos=video["ordered_videos"]))
+            for field in ("publisher_instance_uuid", "generation", "metadata_sha256"):
+                old_view[field] = new_view[field]
+        assert old == new, key
+        expected["prompt_documents"][key] = current
+    assert expected == restored
 
 
 def hooks(engine, modules, patches):
@@ -311,7 +358,11 @@ async def exercise(engine, modules, folder, out):
             replay.write_text("".join(text for line,text in enumerate(saved_text.splitlines(keepends=True),1) if line not in omitted), encoding="utf-8")
             # Native file-open owns context setup and deferred hydration. The
             # only omitted command re-registers the already loaded library.
-            await base.asend(engine, RunWorkflowFromScratchRequest(file_path=str(replay)))
+            old_picker_id = nodes[base.KINDS[1]]._hmb_picker_publisher_uuid
+            reopened = await base.asend(engine, RunWorkflowFromScratchRequest(file_path=str(replay)))
+            if hasattr(engine, "bind_workflow"):
+                # Native RunFromScratch replaces the fixture's unsaved tab.
+                patches.enter_context(engine.bind_workflow(engine.open_workflows.get(reopened.workflow_id)))
             for kind in base.KINDS[:5]: nodes[kind] = engine.node_manager.get_node_by_name(nodes[kind].name)
             nodes[base.KINDS[5]] = [engine.node_manager.get_node_by_name(node.name) for node in nodes[base.KINDS[5]]]
             agent = nodes[base.KINDS[3]]
@@ -319,7 +370,8 @@ async def exercise(engine, modules, folder, out):
             assert get(agent).detached and not any(agent.name in (edge[0], edge[2]) for edge in edges(engine))
             assert agent.metadata["hmb_connection_management_v1"] == recipe
             assert {name:deepcopy(engine.node_manager.get_node_by_name(name).metadata.get("hmb_connection_identity_v1")) for name in identities} == identities
-            assert authoring(nodes) == expected
+            restored = authoring(nodes)
+            assert_reopened_authoring(expected, restored, nodes, old_picker_id)
             assert saved.read_bytes() == saved_bytes
             record("detached_native_save_and_generated_reopen_preserves_peer_UUID_recipe_and_five_shot_authoring")
 
@@ -342,7 +394,8 @@ async def exercise(engine, modules, folder, out):
                 (out/"reconnect-shot-diagnostic.json").write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
             assert reconnected.succeeded(), str(reconnected.result_details)
             await base.settle(lambda: edges(engine) == original_edges, seconds=3)
-            assert authoring(nodes) == expected and not get(agent).detached
+            assert_reopened_authoring(expected, authoring(nodes), nodes, old_picker_id)
+            assert not get(agent).detached
             record("exact_original_peers_reconnect_without_reexecution_or_authoring_loss")
             assert get(agent).can_refresh
             assert getattr(agent, verified_source) is nodes[base.KINDS[2]]
@@ -350,7 +403,8 @@ async def exercise(engine, modules, folder, out):
             refreshed = await manage(agent, "refresh")
             assert refreshed.succeeded() and refreshed.can_refresh
             assert agent._native_parameter_value("prompt", "") == retained_prompt
-            assert authoring(nodes) == expected and edges(engine) == original_edges
+            assert_reopened_authoring(expected, authoring(nodes), nodes, old_picker_id)
+            assert edges(engine) == original_edges
             record("reopened_explicit_reconnect_and_refresh_rebind_exact_native_Prompt_with_existing_shot_results")
 
             # A recipe cannot silently reconnect a Shot removed after detach.
@@ -402,10 +456,18 @@ async def exercise(engine, modules, folder, out):
 
 
 async def future_wire_cases(engine, api, schema, library, folder):
+    from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest
+
+    created = base.send(engine, CreateFlowRequest(parent_flow_name="OfflineCommonConnections",
+        flow_name="Future connection contracts", set_as_new_context=True))
+    with engine.context_manager.flow(created.flow_name):
+        await exercise_future_wires(engine, api, schema, library, folder, created.flow_name)
+
+
+async def exercise_future_wires(engine, api, schema, library, folder, flow):
     from griptape_nodes.exe_types.node_types import DataNode
     from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
     from griptape_nodes.exe_types.param_types.parameter_string import ParameterString
-    from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
     from griptape_nodes.retained_mode.events.node_events import (
         CreateNodeRequest, DeleteNodeRequest, DuplicateSelectedNodesRequest, MoveNodeToNewFlowRequest, SetNodeMetadataRequest)
     from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest
@@ -423,8 +485,6 @@ async def future_wire_cases(engine, api, schema, library, folder):
         def process(self): deny()
 
     library.register_lazy_node_type("FutureHMBConnectionTool", schema.nodes[0].metadata, lambda:FutureHMBConnectionTool)
-    flow = base.send(engine, CreateFlowRequest(parent_flow_name="OfflineCommonConnections", flow_name="Future connection contracts", set_as_new_context=True)).flow_name
-
     def make(name):
         result = base.send(engine, CreateNodeRequest(node_type="FutureHMBConnectionTool", specific_library_name=schema.name,
             node_name=name, override_parent_flow_name=flow, create_error_proxy_on_failure=False))
@@ -551,7 +611,11 @@ async def future_wire_cases(engine, api, schema, library, folder):
     if not public_occupy.succeeded():
         # A native/plugin race can bypass the pre-dispatch hook. Reconnect must
         # still revalidate occupancy instead of clobbering that existing edge.
-        native_occupy = engine.flow_manager.on_create_connection_request(CreateConnectionRequest(**occupied, initial_setup=True, broadcast_result=False))
+        import inspect
+        native_create = engine.flow_manager.on_create_connection_request
+        workflow = {"workflow": engine.current_workflow()} if "workflow" in inspect.signature(native_create).parameters else {}
+        native_occupy = native_create(
+            CreateConnectionRequest(**occupied, initial_setup=True, broadcast_result=False), **workflow)
         assert native_occupy.succeeded(), str(native_occupy.result_details)
     before = retained()
     failed = await manage(source, "reconnect")
@@ -720,7 +784,9 @@ def main():
             logging.disable(logging.CRITICAL)
             try:
                 with engine_scope() as engine:
-                    with asyncio.Runner() as runner: runner.run((fixture_smoke if args.fixture_only else exercise)(engine, modules, folder, out))
+                    with asyncio.Runner() as runner:
+                        check = fixture_smoke if args.fixture_only else exercise
+                        runner.run(run_in_fixture_workflow(engine, "OfflineCommonConnections", check, modules, folder, out))
                 passed = True
             finally:
                 logging.shutdown()

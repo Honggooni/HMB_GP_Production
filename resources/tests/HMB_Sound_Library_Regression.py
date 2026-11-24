@@ -416,6 +416,9 @@ class SoundNodeRegression(SoundLibraryRegression):
             self.engine.event_manager.initialize_queue()
             ensured = self.engine.handle_request(EnsureWorkflowAndFlowRequest(flow_name="SoundFixture"))
             self.assertTrue(ensured.succeeded(), str(ensured.result_details))
+            if getattr(ensured, "open_workflow", None) is not None:
+                workflow = self.engine.open_workflows.get(ensured.workflow_id)
+                self.enterContext(self.engine.bind_workflow(workflow))
             self.flow = self.engine.flow_manager.get_flow_by_name(ensured.flow_name)
         ControlledThread.pending = []
         for patch in (mock.patch.object(routing, "schedule_post_registration_reconcile"),
