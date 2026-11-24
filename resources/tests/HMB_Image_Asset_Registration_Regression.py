@@ -312,6 +312,11 @@ try:
         row["selected"] = False
     restored, _ = asset_library._merge_import_input(restored, [str(external_source)])
     assert not restored["shot_routing"]["shots"][0]["selected_source_uids"]
+    reconnected, _ = asset_library._merge_import_input(
+        imported_registered, [str(external_source)], reconnected_uids={old_wire["source_uid"]},
+    )
+    assert old_wire["source_uid"] in reconnected["shot_routing"]["shots"][0]["selected_source_uids"]
+    assert any(row["source_uid"] == copied_asset["source_uid"] for row in reconnected["assets"])
     registration_output = asset_library._build_output_payload(imported_registered)
     registered_output = next(item for item in registration_output["verified_assets"]
                              if item["source_uid"] == copied_asset["source_uid"])

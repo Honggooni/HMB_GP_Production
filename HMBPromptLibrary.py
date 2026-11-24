@@ -4316,11 +4316,36 @@ def _project_unavailable_prompt_images(state: Dict[str, Any], missing: Dict[str,
             row["asset_last_source_path"] = path
 
 
+def _same_griptape_input_file(first: Path, second: Path | None) -> bool:
+    if second is None:
+        return False
+    if first == second:
+        return True
+    try:
+        if first.samefile(second):
+            return True
+        # A copied workflow can resolve {inputs} inside its own folder while
+        # {project_dir}/inputs still points at the byte-identical project copy.
+        one, two = first.stat(), second.stat()
+        if one.st_size != two.st_size or not 0 < one.st_size <= 64 * 1024 * 1024:
+            return False
+        with first.open("rb") as left, second.open("rb") as right:
+            for chunk in iter(lambda: left.read(256 * 1024), b""):
+                if chunk != right.read(len(chunk)):
+                    return False
+            after_one, after_two = first.stat(), second.stat()
+            return (not right.read(1)
+                    and (after_one.st_size, after_one.st_mtime_ns) == (one.st_size, one.st_mtime_ns)
+                    and (after_two.st_size, after_two.st_mtime_ns) == (two.st_size, two.st_mtime_ns))
+    except OSError:
+        return False
+
+
 def _restore_external_macro_row_authoring(
     state: Dict[str, Any], snapshot: Dict[str, Any], shot: Dict[str, Any],
     *, unavailable: bool = False,
-) -> set[str]:
-    """Recover a legacy absolute-path import row from the exact live Shot."""
+) -> tuple[set[str], set[str]]:
+    """Recover authored rows when the live Shot resolves the same local file."""
     visible = state["images"]
     dormant = state["image_asset"]["dormant_asset_rows"]
 
@@ -4332,9 +4357,23 @@ def _restore_external_macro_row_authoring(
     old_rows = {**dormant_by_uid, **visible_by_uid}
     active_uids = set(shot["selected_source_uids"])
     if not old_rows.keys() - active_uids:
-        return set()
+        return set(), set()
 
     from griptape_nodes.files.file import File, FileLoadError
+
+    def resolve(reference: str) -> Path | None:
+        try:
+            path = Path(File(reference).resolve())
+            if path.is_absolute() and "{" not in str(path):
+                canonical = path.resolve(strict=not unavailable)
+                if unavailable or canonical.is_file():
+                    return canonical
+        except (FileLoadError, OSError, ValueError, RuntimeError, KeyError):
+            pass
+        return None
+
+    def import_uid(kind: str, reference: str) -> str:
+        return "import:" + hashlib.sha256(f"{kind}\n{reference}".encode("utf-8")).hexdigest()[:24]
 
     aliases: Dict[str, List[str]] = {}
     for source in snapshot["ordered_assets"]:
@@ -4345,35 +4384,47 @@ def _restore_external_macro_row_authoring(
         reference = snapshot["media_by_source_uid"][uid]
         if len(reference) > 4096 or not re.match(r"^\{[A-Za-z_][A-Za-z0-9_]*\}[/\\]", reference):
             continue
-        if uid != "import:" + hashlib.sha256(f"artifact\n{reference}".encode("utf-8")).hexdigest()[:24]:
+        if uid != import_uid("artifact", reference):
             continue
-        try:
-            path = Path(File(reference).resolve())
-            if not path.is_absolute() or "{" in str(path):
-                continue
-            canonical = path.resolve(strict=not unavailable)
-            if not unavailable and not canonical.is_file():
-                continue
-        except (FileLoadError, OSError, ValueError, RuntimeError, KeyError):
+        canonical = resolve(reference)
+        if canonical is None:
             continue
-        path_uid = "import:" + hashlib.sha256(f"path\n{canonical.as_posix().casefold()}".encode("utf-8")).hexdigest()[:24]
-        if path_uid in old_rows and path_uid not in active_uids:
-            aliases.setdefault(path_uid, []).append(uid)
+        candidates = {import_uid("path", canonical.as_posix().casefold())}
+        inputs = re.fullmatch(r"\{inputs\}(?P<tail>[/\\].+)", reference)
+        project = re.fullmatch(r"\{project_dir\}[/\\]inputs(?P<tail>[/\\].+)", reference)
+        alternate = ("{project_dir}/inputs" + inputs["tail"] if inputs else
+                     "{inputs}" + project["tail"] if project else "")
+        if alternate:
+            alternate_uid = import_uid("artifact", alternate)
+            if (alternate_uid in old_rows and alternate_uid not in active_uids
+                    and _same_griptape_input_file(canonical, resolve(alternate))):
+                candidates.add(alternate_uid)
+        for old_uid in (candidates & old_rows.keys()) - active_uids:
+            aliases.setdefault(old_uid, []).append(uid)
 
     restored: set[str] = set()
+    replacements: Dict[str, List[str]] = {}
     for old_uid, matches in aliases.items():
-        if len(matches) != 1:
+        if len(matches) == 1:
+            replacements.setdefault(matches[0], []).append(old_uid)
+    retired: set[str] = set()
+    for uid, previous_uids in replacements.items():
+        previous_visible = [row_uid for row_uid in visible_by_uid if row_uid in previous_uids]
+        previous_authored = [row_uid for row_uid in previous_uids if not _external_image_authoring_is_blank(old_rows[row_uid])]
+        if len(previous_visible) > 1 or len(previous_authored) > 1:
             continue
-        uid = matches[0]
-        old = old_rows[old_uid]
         current = old_rows.get(uid)
         if current is None:
-            old["asset_source_uid"] = uid
-        elif old is dormant_by_uid.get(old_uid) and _external_image_authoring_is_blank(current):
-            _copy_prompt_ui_fields(current, old, _EXTERNAL_IMAGE_AUTHORING_FIELDS)
+            source_uid = (previous_visible or previous_authored or previous_uids)[0]
+            current = old_rows[source_uid]
+            current["asset_source_uid"] = uid
+        if previous_authored and _external_image_authoring_is_blank(current):
+            old_uid = previous_authored[0]
+            _copy_prompt_ui_fields(current, old_rows[old_uid], _EXTERNAL_IMAGE_AUTHORING_FIELDS)
             _pop_dormant_asset_row(dormant, old_uid)
             restored.add(uid)
-    return restored
+        retired.update(previous_uids)
+    return restored, retired
 
 
 def _shot_selection_contract(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -11246,7 +11297,7 @@ class HMBPromptLibrary(DataNode):
             except ShotImageUnavailable as error:
                 if not show_unavailable_images:
                     raise _ShotRoutingContractError(str(error)) from error
-                restored = _restore_external_macro_row_authoring(normalized, {
+                restored, _retired = _restore_external_macro_row_authoring(normalized, {
                     "ordered_assets": [{"source_uid": uid, "metadata": {"source_kind": "user"}}
                                        for uid in error.source_paths if uid.startswith("import:")],
                     "media_by_source_uid": error.source_paths,
@@ -11323,13 +11374,13 @@ class HMBPromptLibrary(DataNode):
                     image_snapshot, selected_shot
                 )
                 normalized["shot"] = selected_shot
-                restored = _restore_external_macro_row_authoring(normalized, image_snapshot, selected_shot)
+                restored, retired = _restore_external_macro_row_authoring(normalized, image_snapshot, selected_shot)
                 if restored and getattr(self, "_hmb_ui_syncing", False):
                     self._hmb_restored_external_rows = restored
                 live_uids = set(selected_shot["selected_source_uids"])
                 registered_imports = {item.get("import_source_uid") for item in payload["verified_assets"]}
                 lost_uids = {_image_asset_row_uid(row) for row in normalized["images"] if row.get("asset_managed")}
-                lost_uids.difference_update(live_uids, registered_imports, {""})
+                lost_uids.difference_update(live_uids, registered_imports, retired, {""})
                 known_sources = getattr(image_source_node, "_hmb_prompt_known_image_sources", None)
                 if lost_uids and callable(known_sources):
                     lost_uids.difference_update(known_sources(lost_uids))
@@ -13427,7 +13478,8 @@ class HMBPromptLibrary(DataNode):
             source_application_changed_state = (
                 serialized_state != state_before_source_sync
             )
-            if upstream_source_changed and source_application_changed_state:
+            recovered_image_source = any(row.get("asset_source_unavailable") for row in current_state["images"])
+            if (upstream_source_changed or recovered_image_source) and source_application_changed_state:
                 state[SOURCE_SYNC_REVISION_KEY] = min(
                     MAX_SOURCE_SYNC_REVISION,
                     source_sync_revision + 1,
@@ -13451,6 +13503,13 @@ class HMBPromptLibrary(DataNode):
         finally:
             self._hmb_restored_external_rows = set()
             self._hmb_ui_syncing = False
+
+    def _hmb_wake_reconnected_prompt_images(self, image_source: Any) -> None:
+        sources = getattr(self, "_hmb_connected_source_nodes", {})
+        if (any(sources.get(name) is image_source for name in (SHOT_ASSET_INPUT_PARAMETER_NAME, IMAGE_ASSET_INPUT_PARAMETER_NAME))
+                and any(row.get("asset_source_unavailable") for row in self._current_state()["images"])):
+            self._hmb_prompt_sync_failure = None
+            self._schedule_prompt_sync(source_burst=True, publish_shot_media=True)
 
     def _sync_prompt_output_from_state(
         self,

@@ -270,6 +270,19 @@ class RegistrationIdentityTests(unittest.TestCase):
             alternative = "{project_dir}/inputs/images/Dingo.jpg"
             alternate_uid = import_uid("artifact", alternative)
             alternate = {**new, "source_uid": alternate_uid, "order_key": alternate_uid}
+            state = deepcopy(empty_state)
+            result = reconcile(state, [alternate, self.sources[1]], [alternative, "remote"])
+            self.assertEqual(result["images"][0]["asset_source_uid"], alternate_uid)
+            self.assert_authored(authored_state["images"][0], result["images"][0])
+            self.assertEqual(result["text"], authored_state["text"])
+            duplicate_folder = path.parent / "copy"
+            duplicate_folder.mkdir()
+            duplicate = duplicate_folder / path.name
+            duplicate.write_bytes(path.read_bytes())
+            self.assertTrue(prompt._same_griptape_input_file(path, duplicate))
+            duplicate.write_bytes(b"different image bytes!!")
+            self.assertFalse(prompt._same_griptape_input_file(path, duplicate))
+            alternate = {**new, "source_uid": alternate_uid, "order_key": alternate_uid}
             result = reconcile(deepcopy(empty_state), [new, alternate], [reference, alternative])
             self.assertTrue(all(row["owner"] != "Authored Target 1" for row in result["images"]))
 

@@ -7478,6 +7478,7 @@ def _merge_import_input(
     value: Any,
     *,
     defer_thumbnail: bool = False,
+    reconnected_uids: set[str] | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     normalized = _normalize_state(state)
     if not _flatten_import_values(value):
@@ -7527,7 +7528,8 @@ def _merge_import_input(
         uid = _clean(imported.get("source_uid"))
         # Explicit Add retires its live row. A catalog refresh can also see an
         # Add from another workflow, which cannot retire this workflow's wire.
-        if uid in registered_imports and uid not in previous_live_uids:
+        if (uid in registered_imports and uid not in previous_live_uids
+                and uid not in (reconnected_uids or ())):
             continue
         if not imported.get("import_shot_initialized"):
             # A new wire participates in the currently active Shot. Older single-Shot
@@ -11046,8 +11048,8 @@ class HMBImageAssetLibrary(DataNode):
         for uid in requested:
             asset = by_uid[uid]
             reference = snapshot["media_by_source_uid"][uid]
-            if asset.get("source_kind") == "user" and (
-                Path(reference).is_absolute() or reference.lower().startswith("file:")
+            if asset.get("source_kind") == "user" and len(reference) <= 4096 and (
+                Path(reference).is_absolute() or reference[:5].lower() == "file:"
                 or re.match(r"^\{[A-Za-z_][A-Za-z0-9_]*\}[/\\]", reference)
             ) and _resolve_import_file_reference(reference) is None:
                 missing_files[uid] = reference
@@ -14398,11 +14400,18 @@ class HMBImageAssetLibrary(DataNode):
                     self._hmb_import_thumbnail_thread = None
                 _diagnostic_warning("Imported image preview worker unavailable", exc)
 
-    def _apply_import_value(self, value: Any, *, restored_state: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    def _apply_import_value(self, value: Any, *, restored_state: Dict[str, Any] | None = None,
+                            reconnected_value: Any = None) -> Dict[str, Any]:
         state = self._current_state() if restored_state is None else restored_state
         input_identity = _canonical_import_input_identity(value)
         last_identity = getattr(self, "_hmb_last_applied_import_identity", None)
-        if input_identity == last_identity:
+        reconnected_uids: set[str] = set()
+        if _flatten_import_values(reconnected_value):
+            reconnected, _media = _normalize_import_input(reconnected_value, state["assets"], defer_thumbnail=True)
+            previous_live = {row["source_uid"] for row in state["assets"]
+                             if row["source_kind"] == "user" and row["import_index"]}
+            reconnected_uids = {row["source_uid"] for row in reconnected} - previous_live
+        if input_identity == last_identity and not reconnected_uids:
             # A fresh empty node is already authoritative. A hydrated state with
             # stale live rows is the sole empty-input exception and must still
             # execute once to remove them.
@@ -14439,7 +14448,7 @@ class HMBImageAssetLibrary(DataNode):
                 except Exception as exc:
                     _diagnostic_warning("Image Bash feedback classification unavailable", exc)
             state, media_by_uid = _merge_import_input(
-                state, value, defer_thumbnail=True,
+                state, value, defer_thumbnail=True, reconnected_uids=reconnected_uids,
             )
             if feedback_uids:
                 for row in state.get("assets", []):
@@ -14461,6 +14470,8 @@ class HMBImageAssetLibrary(DataNode):
                 self._hmb_last_applied_import_identity = input_identity
             else:
                 self._hmb_last_applied_import_identity = None
+            if reconnected_uids.intersection(media_by_uid):
+                self._wake_prompt_image_reconnect()
             return published
         except Exception as exc:
             self._hmb_last_applied_import_identity = None
@@ -14468,6 +14479,23 @@ class HMBImageAssetLibrary(DataNode):
             state["error"] = f"IMAGE_IMPORT_IN: {exc}"
             _diagnostic_exception("Image import failed", exc)
             return self._publish_state(state)
+
+    def _wake_prompt_image_reconnect(self) -> None:
+        """Wake red-row owners even when the recovered compact token is unchanged."""
+        try:
+            targets = {edge.target_node_name for edge in _import_connection_snapshot(self).outgoing_connections
+                       if (edge.source_parameter_name, edge.target_parameter_name) in {
+                           (SHOT_ASSET_OUTPUT_PARAMETER, "SHOT_ASSET_IN"), (OUTPUT_PARAMETER, "IMAGE_ASSET_IN"),
+                       }}
+            if not targets:
+                return
+            _flow, nodes = _hmb_shot_routing._same_flow_nodes(self)
+            for node in nodes:
+                wake = getattr(node, "_hmb_wake_reconnected_prompt_images", None)
+                if node.name in targets and callable(wake):
+                    wake(self)
+        except Exception as exc:
+            _diagnostic_warning("Prompt reconnect refresh could not be scheduled", exc)
 
     @staticmethod
     def _merge_captured_imports_into_scan(
@@ -15758,27 +15786,12 @@ class HMBImageAssetLibrary(DataNode):
                 # replacing the whole list with only the newly connected
                 # source value.
                 value = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
-                if not _flatten_import_values(value):
-                    # Local-validation/older-host fallback for a first
-                    # connection whose aggregate has not been exposed yet.
-                    source_name = _clean(getattr(source_parameter, "name", ""))
-                    sentinel = object()
-                    source_value: Any = sentinel
-                    outputs = getattr(source_node, "parameter_output_values", {})
-                    if source_name and source_name in outputs:
-                        source_value = outputs[source_name]
-                    elif source_name:
-                        values = getattr(source_node, "parameter_values", {})
-                        if source_name in values:
-                            source_value = values[source_name]
-                        else:
-                            try:
-                                source_value = source_node.get_parameter_value(source_name)
-                            except Exception:
-                                source_value = sentinel
-                    if source_value is not sentinel:
-                        value = source_value
-                self._apply_import_value(value)
+                source_name = _clean(getattr(source_parameter, "name", ""))
+                readable, source_value = _source_parameter_output_value(source_node, source_name)
+                if readable and not _flatten_import_values(value):
+                    # Some hosts populate the aggregate after this callback.
+                    value = source_value
+                self._apply_import_value(value, reconnected_value=source_value if readable else None)
         except Exception as exc:
             _diagnostic_exception("Incoming image import synchronization failed", exc)
         return result
