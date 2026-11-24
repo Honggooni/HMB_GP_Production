@@ -4471,6 +4471,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "tooltip": "Select one backend-verified production Shot.",
             "allowed_modes": {ParameterMode.PROPERTY},
             "serializable": False,
+            "hide_label": True,
             "ui_options": {
                 "display_name": "HMBSeedanceGeneration",
                 "is_full_width": True,
@@ -5032,17 +5033,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
             ParameterDict(
                 name=DRAFT_SOURCE_PARAMETER, default_value={},
-                allowed_modes={ParameterMode.PROPERTY}, hide=True,
+                allowed_modes={ParameterMode.PROPERTY}, hide=True, hide_label=True, hide_property=True,
                 ui_options={"hide": True, "hide_property": True, "hide_label": True, "hide_handles": True},
             )
             ParameterDict(
                 name=DRAFT_SOURCES_PARAMETER, default_value={"version": 1, "sources": {}},
-                allowed_modes={ParameterMode.PROPERTY}, hide=True,
+                allowed_modes={ParameterMode.PROPERTY}, hide=True, hide_label=True, hide_property=True,
                 ui_options={"hide": True, "hide_property": True, "hide_label": True, "hide_handles": True},
             )
             ParameterString(
                 name=DRAFT_OWNER_PARAMETER, default_value=str(uuid4()),
-                allowed_modes={ParameterMode.PROPERTY}, hide=True,
+                allowed_modes={ParameterMode.PROPERTY}, hide=True, hide_label=True, hide_property=True,
                 ui_options={"hide": True, "hide_property": True, "hide_label": True, "hide_handles": True},
             )
             ParameterString(

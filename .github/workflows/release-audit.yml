@@ -146,10 +146,20 @@ jobs:
           python -m venv $sdkRoot
           if ($LASTEXITCODE -ne 0) { throw 'Could not create the SDK regression environment.' }
           $sdkPython = Join-Path $sdkRoot 'Scripts/python.exe'
-          & $sdkPython -m pip install "griptape-nodes==0.104.3" "griptape==1.13.0" "Pillow==13.0.0" "numpy==2.5.5" "dateparser==1.4.1"
+          & $sdkPython -m pip install "griptape-nodes==0.104.3" "griptape-nodes-engine==0.108.1" "griptape==1.13.0" "Pillow==13.0.0" "numpy==2.5.5" "dateparser==1.4.1"
           if ($LASTEXITCODE -ne 0) { throw 'Could not install the tested Desktop SDK.' }
           Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_RELEASE_SDK_PYTHON=$sdkPython"
           Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_STANDARD_LIBRARY_ROOT=$(Join-Path $PWD '.tmp/standard-library')"
+      - name: Prepare Desktop 0.31 for workflow-scoped execution checks
+        shell: pwsh
+        run: |
+          $currentSdk = Join-Path $env:RUNNER_TEMP 'hmb-desktop-031'
+          python -m venv $currentSdk
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create the Desktop 0.31 environment.' }
+          $currentPython = Join-Path $currentSdk 'Scripts/python.exe'
+          & $currentPython -m pip install "griptape-nodes==0.106.0" "griptape-nodes-engine==0.113.0" "griptape==1.13.0" "Pillow==13.0.0" "numpy==2.5.5" "dateparser==1.4.1"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not install the Desktop 0.31 SDK.' }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_CURRENT_DESKTOP_PYTHON=$currentPython"
       - name: Install pinned media probe for real stream-copy regressions
         shell: pwsh
         run: |
@@ -227,22 +237,29 @@ jobs:
           node resources/tests/HMB_Native_Stock_Deletion_Safety_Browser_Regression.mjs --evidence-path "${{ runner.temp }}/hmb-coverage/stock-editor/stock-editor-0130.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node resources/tests/HMB_Widget_Selected_Wheel_Browser_Regression.mjs --evidence-path "${{ runner.temp }}/hmb-coverage/stock-editor/wheel-0130.json"
-      - name: Check the reviewed Desktop 0.30.3 and 0.30.4 Editor overlays and integrated headers
+      - name: Check reviewed Desktop Editor overlays and integrated headers through 0.31.0
         shell: pwsh
         run: |
           $editors = @(
             @{ version='0.130.2'; wheel='https://files.pythonhosted.org/packages/41/9f/45869a2dfd7bc9d7155b148c37590f5790932ea7cb04b5692d814854b5f9/griptape_nodes_editor_dist-0.130.2-py3-none-any.whl'; sha='e54afb87d9c294ff7ca5d6a2f6b1297ffda7ca08fb3270252d93afd90a703233'; bundle='index-DW0x78hS.js' }
             @{ version='0.130.3'; wheel='https://files.pythonhosted.org/packages/a1/e9/39d33e2f066239cfb9233c93c5db081786d4a82a43dbec5c7c680b43897f/griptape_nodes_editor_dist-0.130.3-py3-none-any.whl'; sha='9cd7f089f42a174b8650de6e2262a5ac1f42e9e33d39d7dd694bcb5ffecc546d'; bundle='index-Dq4UDcw5.js' }
+            @{ version='0.132.0'; wheel='https://files.pythonhosted.org/packages/b1/92/b9a9341ba2602d92daea7a66d64b31e53628f42ef325ab208a5a394d9cf2/griptape_nodes_editor_dist-0.132.0-py3-none-any.whl'; sha='3ec9441da957e45bfa0f46b109a3181a9f17b8364da2e556174eb82e14fae1de'; bundle='index-BnKynVUp.js' }
           )
           foreach ($editor in $editors) {
             $fixtures = Join-Path $env:RUNNER_TEMP "editor-$($editor.version)"
             $wheel = "$fixtures.whl"
             Invoke-WebRequest -Uri $editor.wheel -OutFile $wheel -MaximumRetryCount 2 -RetryIntervalSec 3
             if ((Get-FileHash $wheel -Algorithm SHA256).Hash -ine $editor.sha) { throw "Editor $($editor.version) wheel hash mismatch" }
-            $env:HMB_STOCK_EDITOR_0130_SOURCE = Join-Path $fixtures $editor.bundle
+            $env:HMB_STOCK_EDITOR_0130_SOURCE = Join-Path $fixtures "assets/$($editor.bundle)"
             $env:HMB_HEADER_0130_CANDIDATE = Join-Path $fixtures 'overlay.js'
-            python -c "import pathlib,sys,zipfile; sys.path.insert(0,'tools'); from hmb_griptape_update_preflight import EDITOR_1302_FIXTURES,EDITOR_1303_FIXTURES,build,inspect_editor_fixtures; z=zipfile.ZipFile(sys.argv[1]); d=pathlib.Path(sys.argv[2]); d.mkdir(); files={'0.130.2':EDITOR_1302_FIXTURES,'0.130.3':EDITOR_1303_FIXTURES}[sys.argv[3]]; [d.joinpath(n).write_bytes(z.read('griptape_nodes_editor_dist/editor/assets/'+n)) for n in files]; inspect_editor_fixtures(d,files); d.joinpath('overlay.js').write_bytes(build(d.joinpath(sys.argv[4]).read_bytes()))" $wheel $fixtures $editor.version $editor.bundle
+            python .github/scripts/prepare_editor_fixture.py $wheel $fixtures $editor.version $editor.bundle
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($editor.version -eq '0.132.0') {
+              $env:HMB_LIFECYCLE_REPORT_DIR = Join-Path $env:RUNNER_TEMP 'hmb-coverage/rodong'
+              node resources/tests/HMB_Editor_0132_Rodong_Launch_Regression.mjs
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              Remove-Item Env:HMB_LIFECYCLE_REPORT_DIR
+            }
             node resources/tests/HMB_Editor_0130_Integrated_Header_Regression.mjs
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             node resources/tests/HMB_Native_Stock_Deletion_Safety_Browser_Regression.mjs --evidence-path "${{ runner.temp }}/hmb-coverage/stock-editor/stock-editor-$($editor.version).json"
@@ -280,6 +297,7 @@ jobs:
           path: |
             ${{ runner.temp }}/hmb-coverage/*.json
             ${{ runner.temp }}/hmb-coverage/stock-editor/*.json
+            ${{ runner.temp }}/hmb-coverage/rodong/*
           if-no-files-found: warn
           retention-days: 30
       - name: Summarize actual regression coverage
@@ -404,7 +422,7 @@ jobs:
             "- Playblast jobs carry their own marker palette. Maya can open older jobs against the verified additive palette without changing the assigned mask colors.",
             "- Restores saved Image Generation model option controls and their values when switching models and reopening an existing workflow.",
             "- Displays asset names in the HMBPrompt sound target picker while preserving saved source identities and shot bindings.",
-            "- Supports Desktop 0.30.3 and 0.30.4 with Editor 0.130.2 and 0.130.3. Restores the Rodong Mart startup screen, reloads saved Image Generation options and keeps CGT Shot selection through local edit conflicts and task-status changes.",
+            "- Restores HMB headers and Rodong Mart on Desktop 0.31.0 (Editor 0.132.0) and retains the previously supported Desktop builds.",
             "- Checks the official Windows stable package identity daily and before Team distribution. A new or republished build requires compatibility verification.",
             "- Continue editing another Shot while generators are busy. Maya Mask and Depth output publishes on the editor event loop, pending media checks wait before Agent execution, and sound validation follows the bound Shot.",
             "- In HMBPrompt, enable the sound range bar and drag empty space to cut multiple cues from one sound. Click a cue for source trim and shot placement. Korean sound usage labels, speaker reference and the full-width dialogue field are included.",

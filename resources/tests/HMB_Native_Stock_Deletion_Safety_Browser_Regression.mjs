@@ -24,15 +24,16 @@ const bytes=newEditor?fs.readFileSync(newEditorPath):Buffer.from(readNativeEdito
 report.editor_source_sha256=createHash('sha256').update(bytes).digest('hex');
 const patch2=report.editor_source_sha256==='8433f4e108e2416707c6877354234607aaa2cb8b4e15fe080856fdd656771d17';
 const patch3=report.editor_source_sha256==='b0c4f9d4c8d78243b5f1d505187d1c5e49119854912a2e516be03170590fc4fc';
-if(newEditor&&!patch2&&!patch3)assert.equal(report.editor_source_sha256,'841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e');
+const editor132=report.editor_source_sha256==='547cd4cc14430531d96b865d2d45f1263f32b260f0108300acd0f6ed4cd4a1b4';
+if(newEditor&&!patch2&&!patch3&&!editor132)assert.equal(report.editor_source_sha256,'841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e');
 const stock=bytes.toString('utf8');
-const startAnchor=newEditor?'(S=e=>{let t=c.current,a=t?e.map':'bn=(0,S.useCallback)(e=>{let t=E.current,r=t?e.map';
-const endAnchor=newEditor?',t[0]=g,t[1]=h,t[2]=v,t[3]=_':',xn=(0,S.useCallback)';
+const startAnchor=editor132?'(C=e=>{let t=s.current;if(t)for(let n of e.getByType(`select`))':newEditor?'(S=e=>{let t=c.current,a=t?e.map':'bn=(0,S.useCallback)(e=>{let t=E.current,r=t?e.map';
+const endAnchor=editor132?',t[2]=h,t[3]=m,t[4]=_,t[5]=g':newEditor?',t[0]=g,t[1]=h,t[2]=v,t[3]=_':',xn=(0,S.useCallback)';
 const start=stock.indexOf(startAnchor),end=stock.indexOf(endAnchor,start);
 assert.ok(start>0&&end>start&&stock.indexOf(startAnchor,start+1)<0);
 const callback=stock.slice(start+3,end);
-const fa=stock.indexOf(patch3?'I=r(`DeleteNodeResultFailure`,':newEditor?'L=r(`DeleteNodeResultFailure`,':'o=m(`DeleteNodeResultFailure`,');
-const fb=stock.indexOf(patch3?',L=r(`SetNodeMetadataResultSuccess`':newEditor?',R=r(`SetNodeMetadataResultSuccess`':',s=m(`DeleteConnectionResultSuccess`',fa);
+const fa=stock.indexOf(editor132?'D=i(`DeleteNodeResultFailure`,':patch3?'I=r(`DeleteNodeResultFailure`,':newEditor?'L=r(`DeleteNodeResultFailure`,':'o=m(`DeleteNodeResultFailure`,');
+const fb=stock.indexOf(editor132?',O=i(`SetNodeMetadataResultSuccess`':patch3?',L=r(`SetNodeMetadataResultSuccess`':newEditor?',R=r(`SetNodeMetadataResultSuccess`':',s=m(`DeleteConnectionResultSuccess`',fa);
 assert.ok(fa>0&&fb>fa);const failure=stock.slice(fa+2,fb);
 try{
  const page=await browser.newPage();page.on('pageerror',e=>errors.push(e.message));await page.route('**/*',r=>{report.external_requests++;return r.abort();});
@@ -90,7 +91,7 @@ try{
  await check('native_rename_while_widget_unmounted_preserves_same_outer_identity_protection',async()=>{await page.evaluate(()=>node.setAttribute('data-id','Renamed_HMB'));await page.locator('[data-trash]').click();assert.equal(await page.evaluate(()=>counts.native),2);await page.getByRole('button',{name:'확인',exact:true}).click();});
  await check('actual_outer_node_removed_releases_last_capture_observer_and_status',async()=>{await page.evaluate(()=>node.remove());await page.waitForFunction(()=>document.__HMB_NATIVE_STOCK_SAFETY_V1__===undefined);assert.equal(await page.locator('[data-hmb-native-safety-status]').count(),0);assert.deepEqual(await page.evaluate(()=>guardListeners.remove.slice().sort()),['click','contextmenu','keydown']);await page.locator('[data-standard-trash]').click();assert.equal(await page.evaluate(()=>counts.native),3);});
  await check('exact_pristine_stock_callback_reproduces_optimistic_remove_before_failure',async()=>{
-  const actual=await page.evaluate(({callback,failure,newEditor,patch2,patch3})=>{
+  const actual=await page.evaluate(({callback,failure,newEditor,patch2,patch3,editor132})=>{
    window.makeStock=()=>{
     const nodes=[{id:'ExactHMB',type:'CustomNode',data:{metadata:{library:'HMB_GP_Production'}}}],calls=[],clears=[];
     const env={console:{error(){}},S:{useCallback:fn=>fn},E:{current:null},w:{current:nodes},b:nodes,N:{showHelperLines:false},Ct:{current:{}},
@@ -105,11 +106,18 @@ try{
     });
     if(patch2)Object.assign(env,{FGt:env.OUt,PGt:env.DUt,NGt:env.EUt,MGt:env.TUt,gE:env.nO,pE:env.$D,IGt:env.kUt});
     if(patch3)Object.assign(env,{MGt:env.OUt,jGt:env.DUt,AGt:env.EUt,kGt:env.TUt,VE:env.nO,RE:env.$D,NGt:env.kUt,Kn:env.Xd});
-    return{nodes,calls,clears,handler:Function('env',`with(env){return (${callback});}`)(env),failure:Function('env',`with(env){return (${failure});}`)(env)};
+    if(editor132)Object.assign(env,{
+      s:{current:null},r:{current:nodes},a:{showHelperLines:false},b:env.Xd,
+      h:env.Dt,m:env.Et,nJt:row=>row.id,AD:()=>false,DD:()=>false,i:(_name,fn)=>fn,
+      c:changes=>env.C(changes.getByType('remove')),
+    });
+    const nativeCallback=Function('env',`with(env){return (${callback});}`)(env);
+    const handler=editor132?rows=>nativeCallback({getByType:type=>rows.filter(row=>row.type===type)}):nativeCallback;
+    return{nodes,calls,clears,handler,failure:Function('env',`with(env){return (${failure});}`)(env)};
    };
    const f=makeStock();f.handler([{type:'remove',id:'ExactHMB'}]);f.failure({result_details:'HMB_DELETE_CONNECTED'},{node_name:'ExactHMB'});
    return{removed:f.nodes.length===0,sent:f.calls[0][0],clears:f.clears};
-  },{callback,failure,newEditor,patch2,patch3});
+  },{callback,failure,newEditor,patch2,patch3,editor132});
   assert.deepEqual(actual,{removed:true,sent:'DeleteNodeRequest',clears:['ExactHMB','pending-edits']});
  });
  await check('capture_prevents_exact_stock_callback_and_cache_mutation_before_request',async()=>{

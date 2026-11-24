@@ -11,45 +11,55 @@ const stockBytes = fs.readFileSync(stockPath);
 const editorSourceHash = sha(stockBytes);
 const patch2 = editorSourceHash === '8433f4e108e2416707c6877354234607aaa2cb8b4e15fe080856fdd656771d17';
 const patch3 = editorSourceHash === 'b0c4f9d4c8d78243b5f1d505187d1c5e49119854912a2e516be03170590fc4fc';
-assert.ok(patch3 || patch2 || editorSourceHash === '841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e');
+const editor132 = editorSourceHash === '547cd4cc14430531d96b865d2d45f1263f32b260f0108300acd0f6ed4cd4a1b4';
+assert.ok(editor132 || patch3 || patch2 || editorSourceHash === '841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e');
 const candidate = candidateBytes.toString('utf8');
 // Run the bundled click handler with the same outer node and inner action
 // scopes as the native toolbar. Using the fixture's node directly hides shadowing.
 const headerScope = candidate.match(/hmbLibrary\}\)=>\{const ([^;]*?)hmbHeaderHost=Y\.useRef/);
-const resetBranch = candidate.match(/(\w+)===`reset`&&m\?[^;]*?onClick:(hmbEvent=>\{[^}]+\})/);
+const resetBranch = candidate.match(/(\w+)===`reset`&&m\?[^;]*?onClick:((?:hmbEvent|event)=>\{[^}]+\})/);
 assert.ok(headerScope && resetBranch, 'Missing production header or reset handler');
 const resetFactory = `function bundledClick(e,hmbLibrary,m,action){
   ${headerScope[1] ? 'const '+headerScope[1].replace(/,$/,'')+';' : ''}
   return (${resetBranch[1]}=>${resetBranch[1]}==='reset' ? (${resetBranch[2]}) : undefined)(action);
 }`;
 assert.ok(candidate.includes('return hmb130IntegratedHeader(hmbHeaderSlots,(0,Z.jsxs)'));
-assert.ok(candidate.includes(patch3 ? 'hmb130ConnectionIcon(e,hmbLibrary),me.map' : 'hmb130ConnectionIcon(e,hmbLibrary),he.map'));
-assert.equal((candidate.match(/await hmb130PrepareNewWorkflow\(\);/g)||[]).length,3, 'File New, Workflows New and Mart startup use checked transition');
-assert.ok(!candidate.includes('await kt();'));
-const transition = candidate.match(/async function hmb130PrepareNewWorkflow\(\)\{(.*?)\}function (?:hFn|CFn|EFn)/)[1];
-for (const workflowName of ['', 'saved-fixture']) {
-  const calls=[];
-  await new Function(patch3 ? 'rD' : patch2 ? 'NE' : 'fO','hmb130ConnectionRequest','kt',`return (async()=>{${transition};})()`)(
-    {getState:()=>({workflowName})}, async (...args)=>calls.push(args),async()=>calls.push(['empty-stock-clear']));
-  assert.deepEqual(calls, workflowName ? [['HMBPrepareWorkflowTransitionRequest',{}]] : [['empty-stock-clear']]);
+assert.ok(candidate.includes(editor132 ? 'hmb130ConnectionIcon(e,hmbLibrary),ge.map' : patch3 ? 'hmb130ConnectionIcon(e,hmbLibrary),me.map' : 'hmb130ConnectionIcon(e,hmbLibrary),he.map'));
+if (editor132) {
+  assert.ok(candidate.includes('const created=await v2(t,e,i);if(typeof hmbBeforeOpen===`function`)hmbBeforeOpen(created.workflowName)'));
+} else {
+  assert.equal((candidate.match(/await hmb130PrepareNewWorkflow\(\);/g)||[]).length,3, 'File New, Workflows New and Mart startup use checked transition');
+  assert.ok(!candidate.includes('await kt();'));
+  const transition = candidate.match(/async function hmb130PrepareNewWorkflow\(\)\{(.*?)\}function (?:hFn|CFn|EFn)/)[1];
+  for (const workflowName of ['', 'saved-fixture']) {
+    const calls=[];
+    await new Function(patch3 ? 'rD' : patch2 ? 'NE' : 'fO','hmb130ConnectionRequest','kt',`return (async()=>{${transition};})()`)(
+      {getState:()=>({workflowName})}, async (...args)=>calls.push(args),async()=>calls.push(['empty-stock-clear']));
+    assert.deepEqual(calls, workflowName ? [['HMBPrepareWorkflowTransitionRequest',{}]] : [['empty-stock-clear']]);
+  }
 }
 const helperStart = candidate.indexOf('function hmbNativeOpenConnections(');
-const helperEnd = candidate.indexOf(patch3 ? 'function EFn(){' : patch2 ? 'function CFn(){' : 'function hFn(){', helperStart);
+const helperEnd = candidate.indexOf(editor132 ? 'function DBn(){' : patch3 ? 'function EFn(){' : patch2 ? 'function CFn(){' : 'function hFn(){', helperStart);
 assert.ok(helperStart > 0 && helperEnd > helperStart);
-const engineFile = patch3 ? 'EngineContext-Dn3QR2Uz.js' : 'EngineContext-B0JaCG1N.js';
+const engineFile = editor132 ? 'EngineContext-D-bkzERZ.js' : patch3 ? 'EngineContext-Dn3QR2Uz.js' : 'EngineContext-B0JaCG1N.js';
 const dependencies = new Map(Object.entries({
-  'react-Cwox1F5v.js':patch3 ? 'fda3fe1ed97f70bc23018eac1c326c8a9f77ebaba073d2202928751b92d76d16' : patch2 ? 'aae8144f8b0ba979cc255ad06f3b408c81bab69bf96667fedeeb15f81ace14af' : '0922625a90900001152ac5899de0daf62230d0c18bc54979e9cccb50dad13750',
+  'react-Cwox1F5v.js':editor132 ? 'b634f2b5dcdeed26c869f67f077f88051df6da9ce5de3a32a96f0820ec01ae3f' : patch3 ? 'fda3fe1ed97f70bc23018eac1c326c8a9f77ebaba073d2202928751b92d76d16' : patch2 ? 'aae8144f8b0ba979cc255ad06f3b408c81bab69bf96667fedeeb15f81ace14af' : '0922625a90900001152ac5899de0daf62230d0c18bc54979e9cccb50dad13750',
   'rolldown-runtime-DSDNlrLa.js':'9642411c8411b70e62cea3e38c4093f5fcd4419ec151356d87dc835062db7b69',
-  [engineFile]:patch3 ? '23363c57131e015d00833ea9f86f2c1995cc714f56994fb899ceacdb57899a17' : patch2 ? '6ea1e20cb6cb2c728f44bf8bb50253bd55e5f99a68ea5b805b2b474d9b647d06' : '0eac023d9df0796c79a038ea8c37415fc7c97afb979bc7aa58bc730d1672e5e6',
+  [engineFile]:editor132 ? '9397d0eb000091df7cff271b54a5c306dc3924dbdfaa36be32d3f88842ed2f71' : patch3 ? '23363c57131e015d00833ea9f86f2c1995cc714f56994fb899ceacdb57899a17' : patch2 ? '6ea1e20cb6cb2c728f44bf8bb50253bd55e5f99a68ea5b805b2b474d9b647d06' : '0eac023d9df0796c79a038ea8c37415fc7c97afb979bc7aa58bc730d1672e5e6',
 }).map(([name,hash])=>{
   const bytes=fs.readFileSync(path.join(path.dirname(stockPath),name));
-  assert.equal(sha(bytes),hash,`Unexpected Editor 0.130 dependency: ${name}`);
+  assert.equal(sha(bytes),hash,`Unexpected Editor dependency: ${name}`);
   return [name,bytes];
 }));
 const stock = stockBytes.toString('utf8');
-const reactStart=stock.indexOf(patch3 ? 'var Ha=i((e=>{' : 'var Fa=i((e=>{'), reactEnd=stock.indexOf(patch3 ? ',Ka=/^(?:' : ',za=/^(?:',reactStart);
-assert.ok(reactStart>=0&&reactEnd>reactStart,'Missing Editor 0.130 React renderer');
-const runtime = [
+const reactStart=stock.indexOf(editor132 ? 'var Xa=n((e=>{' : patch3 ? 'var Ha=i((e=>{' : 'var Fa=i((e=>{'), reactEnd=stock.indexOf(editor132 ? ',$a=/^(?:' : patch3 ? ',Ka=/^(?:' : ',za=/^(?:',reactStart);
+assert.ok(reactStart>=0&&reactEnd>reactStart,'Missing Editor React renderer');
+const runtime = editor132 ? [
+  'import {a as e,t as n} from "./rolldown-runtime-DSDNlrLa.js";',
+  'import {t as wr} from "./react-Cwox1F5v.js";',
+  `import {di as kt,gi as Ut,hi as Jt} from "./${engineFile}";`,
+  stock.slice(reactStart,reactEnd) + ';const Z=kt(),th=e(Jt(),1),w=Qa;',
+].join('\n') : [
   'import {a as e,t as i} from "./rolldown-runtime-DSDNlrLa.js";',
   'import {t as a} from "./react-Cwox1F5v.js";',
   `import {${patch3 ? 'di as jt,fi as Bt,pi as Mn' : 'oi as wn,si as Hn,ci as Et'}} from "./${engineFile}";`,
@@ -63,6 +73,7 @@ window.soundSession='fixture-session'; window.soundReads=[]; window.soundScope=n
 function hmb130SessionId(){return window.soundSession;}
 function hmb130SoundScope(){return window.soundScope;}
 const fO={getState:()=>({setIsSaved(){}})}, NE=fO, rD=fO, z={success(){},error(){}}, Rn=z;
+const nO={setState(){}}, hmb132Toast=z;
 function hmb130ConnectionError(error){return error.message;}
 async function hmb130ConnectionRequest(type, payload){
   requests.push({type,payload});

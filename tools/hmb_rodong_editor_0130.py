@@ -1,4 +1,4 @@
-"""Build the Local Rodong Mart overlay for the reviewed stock Editor 0.130."""
+"""Build the HMB header and Rodong Mart overlay for the reviewed stock editors."""
 from __future__ import annotations
 
 import base64
@@ -8,10 +8,10 @@ from pathlib import Path
 
 if __package__:
     from .hmb_editor_0130_header import HEADER_SOURCE, integrate_header
-    from .restore_rodong_local_editor import EDITOR_1302, EDITOR_1303, editor_profile, entry_for_overlay, stock_entry_from_active
+    from .restore_rodong_local_editor import EDITOR_1302, EDITOR_1303, EDITOR_1320, editor_profile, entry_for_overlay, stock_entry_from_active
 else:
     from hmb_editor_0130_header import HEADER_SOURCE, integrate_header
-    from restore_rodong_local_editor import EDITOR_1302, EDITOR_1303, editor_profile, entry_for_overlay, stock_entry_from_active
+    from restore_rodong_local_editor import EDITOR_1302, EDITOR_1303, EDITOR_1320, editor_profile, entry_for_overlay, stock_entry_from_active
 EDITOR = Path(__file__).resolve().parents[1] / "resources/editor"
 STOCK_SHA256 = "841b879c94cd6bb18601f5b360daf094508bdfbfa0ec88b830a1caaf0df5871e"
 
@@ -93,8 +93,8 @@ def editor_patch_fragment(fragment, bindings):
 
 def build(stock: bytes, *, header_source: Path = HEADER_SOURCE) -> bytes:
     digest = sha256(stock).hexdigest()
-    if digest not in (STOCK_SHA256, EDITOR_1302_STOCK, EDITOR_1303.stock_digest):
-        raise ValueError("Unsupported stock Editor 0.130 bundle")
+    if digest not in (STOCK_SHA256, EDITOR_1302_STOCK, EDITOR_1303.stock_digest, EDITOR_1320.stock_digest):
+        raise ValueError("Unsupported stock Editor bundle")
     bindings = {EDITOR_1302_STOCK: EDITOR_1302_BINDINGS,
                 EDITOR_1303.stock_digest: EDITOR_1303_BINDINGS}.get(digest, {})
     source = stock.decode("utf-8")
@@ -126,6 +126,8 @@ def build(stock: bytes, *, header_source: Path = HEADER_SOURCE) -> bytes:
     entry = bindings.get("hFn", "hFn")
     opening = f"function {entry}(){{"
     components = "\n".join((adapter, connection_ui(), header_source.read_text(encoding="utf-8")))
+    if digest == EDITOR_1320.stock_digest:
+        return build_0132(source, components, basket).encode("utf-8")
     if bindings:
         components = editor_patch_fragment(components, bindings)
     source = replace_once(source, opening, f"{continue_artwork()}\n{basket}\n{components}\n{opening}")
@@ -193,6 +195,100 @@ def build(stock: bytes, *, header_source: Path = HEADER_SOURCE) -> bytes:
         "await v();}}),(0,Z.jsx)(QWt,{isLoading:Lt||!e,workflowReady:e,",
     ).encode("utf-8")
 
+def build_0132(source: str, components: str, basket: str) -> str:
+    """Attach HMB views inside the scoped workflow surface in Desktop 0.31.0."""
+    def patch(old: str, new: str) -> None:
+        nonlocal source
+        source = replace_once(source, old, new)
+
+    # 0.132 routes workflow operations by open_workflow_id. Keep engine-only
+    # startup prewarm available before the first workflow has been opened.
+    components = components.replace("yn.request(", "hmb132Request(").replace("yn.getSessionId?.()", "Nt.getSessionId()")
+    components = components.replace("fO.getState().setIsSaved(false)", "nO.setState({isSaved:false})")
+    components = components.replace("fO.getState()", "nO.getState()").replace("Cm.createPortal", "th.createPortal")
+    components = components.replace("$D(node)", "DD(node)")
+    for level in ("warning", "error", "success"):
+        components = components.replace(f"z.{level}(", f"hmb132Toast.{level}(")
+
+    # Capture the id as well as the displayed name for operations that outlive a tab switch.
+    components = replace_once(components, "const origin = latest.current;",
+                              "const origin = latest.current, originId = nO.getState().workflowId;")
+    components = replace_once(components, "const isCurrent = () => controller.current &&",
+                              "const isCurrent = () => controller.current && nO.getState().workflowId === originId &&")
+    transport = """const hmb132Toast = p;
+function hmb132Request(type, payload, options) {
+  const id = nO.getState().workflowId;
+  if (id) return Nt.forWorkflow(id).request(type, payload, options);
+  if (type === "HMBShotBasketRequest" && payload.action === "status" && payload.payload?.prewarm) {
+    return Nt.request(type, payload, options);
+  }
+  return Promise.reject(new Error("작업공간 연결을 확인해 주세요."));
+}"""
+    # Invalidate pending deletes and connection actions as soon as the active
+    # tab changes, before React can dispose the previous canvas layout.
+    root = ("function DBn(){Y.useLayoutEffect(()=>nO.subscribe((next,previous)=>{"
+            "if(next.workflowId!==previous.workflowId)hmbNativeStudioFlowEpoch+=1;}),[]);")
+    patch("function DBn(){", "\n".join((continue_artwork(), basket, transport, components, root)))
+
+    # React Flow now delivers NodeChangeSet rather than NodeChange[]. Forward
+    # its original object for ordinary edits, including high-frequency drags.
+    patch("t[19]!==b?(C=e=>{let t=s.current;if(t)for(let n of e.getByType(`select`))",
+          "t[19]!==b?(C=hmbSet=>{const hmbApply=e=>{let t=s.current;if(t)for(let n of e.getByType(`select`))")
+    patch("measured:{width:300,height:48}}:e)))},t[2]=h,t[3]=m,t[4]=_",
+          "measured:{width:300,height:48}}:e)))};if(!hmbSet.getByType(`remove`).length)return hmbApply(hmbSet);"
+          "hmb130GuardRemovals(hmbSet.toArray(),r.current,changes=>hmbApply(new Qm(changes)))},t[2]=h,t[3]=m,t[4]=_")
+
+    patch("onDoubleClick:b,children:x,color:S})=>{let C=pn()",
+          "onDoubleClick:b,children:x,color:S,hmbLibrary})=>{const hmbHeaderNodeName=e,hmbHeaderHost=Y.useRef(null),"
+          "hmbArtworkRef=hmb130HeaderArtwork(e,hmbLibrary),hmbHeaderSlots=hmbUse130IntegratedHeader("
+          "hmbHeaderHost,e,t,hmbLibrary,v,hmbArtworkRef);let C=pn()")
+    patch("let e=T.nodeHeaderItems||[`lock`,`run`,`startFlow`];return Eze.filter",
+          "let e=hmb130HeaderItems(t,hmbLibrary,T.nodeHeaderItems);return Eze.filter")
+    patch("},[T.nodeHeaderItems,G]),_e=", "},[T.nodeHeaderItems,G,t,hmbLibrary]),_e=")
+    patch("onClick:e=>{e.preventDefault(),e.stopPropagation(),m()},style:U,type:`button`,children:(0,Z.jsx)(_T",
+          "onClick:event=>{event.preventDefault(),event.stopPropagation(),hmbLibrary===`HMB_GP_Production`?"
+          "hmb130RefreshConnections(hmbHeaderNodeName):m()},style:U,type:`button`,children:(0,Z.jsx)(_T")
+    patch("[_,te,ne,l,s,c,u,d,f,m,h,ee,U,W,me,de,fe,pe,he,_e])",
+          "[_,te,ne,l,s,c,u,d,f,m,h,ee,U,W,me,de,fe,pe,he,_e,hmbLibrary,hmbHeaderNodeName])")
+    patch("be=Oze(t,!!ye.backgroundColor,F);return(0,Z.jsxs)(`div`,",
+          "be=Oze(t,!!ye.backgroundColor,F);return hmb130IntegratedHeader(hmbHeaderSlots,(0,Z.jsxs)(`div`,")
+    patch("onDoubleClick:le,style:kD(t)?ye:B", "onDoubleClick:le,ref:hmbHeaderHost,style:kD(t)?ye:B")
+    patch("children:[ge.map(e=>ve(e)),T.showNodeDocsButton", "children:[hmb130ConnectionIcon(e,hmbLibrary),ge.map(e=>ve(e)),T.showNodeDocsButton")
+    patch("nodeName:e})]})})]})};function Fze", "nodeName:e})]})})]}))};function Fze")
+    patch("isVisible:qe,minHeight:Je,minWidth:Ye",
+          "isVisible:qe,handleStyle:hmb130Library(n)===`HMB_GP_Production`?{opacity:0}:void 0,"
+          "lineStyle:hmb130Library(n)===`HMB_GP_Production`?{opacity:0}:void 0,minHeight:Je,minWidth:Ye")
+    patch("t[159]!==Ze?(Qe=(0,Z.jsxs)(Pze,{...Te,children:[Ze,u]}),",
+          "t[159]!==Ze||t[160]?.props.hmbLibrary!==hmb130Library(n)?(Qe=(0,Z.jsxs)(Pze,"
+          "{...Te,hmbLibrary:hmb130Library(n),children:[Ze,u]}),")
+
+    # Run through the same new-tab transaction and restoration gating as the
+    # stock editor. The standard workflow dialog can always be reopened.
+    patch("{isOpen:_,close:v,open:y}=V$(),{isOpen:b,close:x,activeTab:S}",
+          "{isOpen:_,close:v,open:y}=V$(),hmbMart=hmbUseMartStartup(y,l,_,n,v),{isOpen:b,close:x,activeTab:S}")
+    patch("ge=(0,Y.useCallback)(async()=>{try{let e=await y2(),n=V$.getState().lastPath",
+          "ge=(0,Y.useCallback)(async hmbBeforeOpen=>{try{let e=await y2(),n=V$.getState().lastPath")
+    patch("await v2(t,e,i)}catch(e){console.error(`Failed to create workflow:`",
+          "const created=await v2(t,e,i);if(typeof hmbBeforeOpen===`function`)hmbBeforeOpen(created.workflowName);"
+          "return created.workflowName}catch(e){console.error(`Failed to create workflow:`")
+    patch("(0,Z.jsxs)(p4t,{children:[r?(0,Z.jsx)(wBn,{}):null,",
+          "(0,Z.jsxs)(p4t,{children:[hmbMart.visible&&(hmbMart.entering||hmbMart.awaitingWorkflow||(!n&&l===`connected`))?"
+          "Z.jsx(hmbMartStartup,{onDismiss:hmbMart.dismiss,onEnter:()=>hmbMart.enter(ge)}):null,r?(0,Z.jsx)(wBn,{}):null,")
+    patch("_?(0,Z.jsx)(uIn,{onClose:v}):null", "_&&!hmbMart.visible?(0,Z.jsx)(uIn,{onClose:v,onRodong:!n?hmbMart.reopen:void 0}):null")
+    patch("function uIn({onClose:e}={})", "function uIn({onClose:e,onRodong:hmbOnRodong}={})")
+    patch('(0,Z.jsx)(`div`,{className:`mb-4`,children:(0,Z.jsx)(`h2`,{className:`text-xl font-semibold text-foreground`,children:`Workflows`})})',
+          'Z.jsxs(`div`,{className:`mb-4 flex items-center gap-3`,children:[Z.jsx(`h2`,{className:`text-xl font-semibold text-foreground`,children:`Workflows`}),'
+          'hmbOnRodong?Z.jsx(`button`,{type:`button`,className:`rounded border px-3 py-1`,onClick:hmbOnRodong,children:`HMB 로동마트`}):null]})')
+    patch("children:[(0,Z.jsx)(SYt,{isLoading:Yt||!n,workflowReady:n,",
+          "children:[Z.jsx(hmbMartCanvas,{ready:n&&!Yt,empty:!x.length,"
+          "hasBasket:x.some(node=>Boolean(node.data?.metadata?.hmb_shot_basket_v1)),flowName:b,workflowName:nO.getState().workflowName,"
+          "onCreated:async(flow,isCurrent)=>{const graph=await m(flow);if(!isCurrent())return;"
+          "S(current=>Array.from(new Map([...current,...graph.nodes].map(node=>[node.id,node])).values()));"
+          "O(current=>Array.from(new Map([...current,...graph.connections].map(edge=>[edge.id,edge])).values()));"
+          "await y();}}),(0,Z.jsx)(SYt,{isLoading:Yt||!n,workflowReady:n,")
+    return source
+
+
 def verify_installed(editor: Path) -> Path:
     """Rebuild from the supported stock bundle and verify the active entry."""
     assets = editor / "assets"
@@ -219,10 +315,10 @@ if __name__ == "__main__":
     editor = args.editor_dir
     if editor is None:
         package = distribution("griptape-nodes-editor-dist")
-        if package.version not in ("0.130.0", "0.130.2", "0.130.3"):
+        if package.version not in ("0.130.0", "0.130.2", "0.130.3", "0.132.0"):
             parser.exit(1, f"Editor {package.version} needs a compatibility check before local rollout.\n")
         editor = package.locate_file("griptape_nodes_editor_dist/editor")
     try:
-        print(f"Editor 0.130 Rodong Mart verified: {verify_installed(editor)}")
+        print(f"Editor Rodong Mart verified: {verify_installed(editor)}")
     except (OSError, ValueError) as error:
         parser.exit(1, f"{error}\n")

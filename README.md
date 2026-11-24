@@ -1,10 +1,10 @@
 # HMB GP Production
 
-Team **v0.8.71**은 Local **v0.8.72**에서 검증한 기능과 UI 자산을 함께 제공합니다. 이번 변경 및 검증 범위는 [릴리스 안내](docs/HMB_TEAM_V0_8_71.md)를 확인하세요.
+Team **v0.9.43**은 Griptape Desktop **0.31.0**에서 HMB 통합 헤더, 로동마트와 Agent·Generator 실행 경로를 복구합니다. [장애 원인 및 검증 범위](docs/HMB_DESKTOP_0_31_HOTFIX.md)
 
-## Team v0.8.71 최초 설치
+## 팀원용 최초 설치
 
-1. Griptape Desktop과 Standard 라이브러리를 준비합니다. 이 패키지는 SDK 0.104.0과 Editor 0.130.0 조합에서 검증했습니다.
+1. Griptape Desktop과 Standard 라이브러리를 준비합니다. Desktop 0.31.0에는 SDK 0.106.0, Engine 0.113.0과 Editor 0.132.0이 포함됩니다.
 2. Griptape에서 HMB Git 라이브러리를 등록한 뒤 작업을 저장하고 Griptape를 완전히 종료·재시작합니다. 설치 ZIP을 사용하는 경우 Griptape를 종료한 뒤 ZIP을 풀고 그 안의 `Install_HMB_GP_Production.ps1`을 실행합니다.
 3. 재시작 후 통합 헤더, 연결 관리, 로동마트 및 ‘로동 작업 계속’ 이미지가 표시되는지 확인합니다. 운영 서버를 사용하는 기능에는 팀원 본인의 인증이 필요합니다.
 

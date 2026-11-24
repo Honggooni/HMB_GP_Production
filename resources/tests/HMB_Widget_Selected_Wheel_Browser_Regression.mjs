@@ -20,7 +20,8 @@ const explicitEditor = process.env.HMB_STOCK_EDITOR_0130_SOURCE || process.env.H
 const stock = explicitEditor ? fs.readFileSync(explicitEditor, 'utf8') : readNativeEditorSource(root);
 const hostClass = stock.match(/className:`(widget-container [^`]*\bnowheel)`/)?.[1];
 const filter = stock.match(/function (\w+)\(\{noWheelClassName:\w+,preventScrolling:\w+,d3ZoomHandler:\w+\}\)\{.*?\}\}(?=function )/s);
-const closest = stock.match(/([\w$]+)=\(e,t\)=>e\.target\.closest\(`\.\$\{t\}`\)/);
+const closest = stock.match(/([\w$]+)=\(e,t\)=>e\.target\.closest\(`\.\$\{t\}`\)/)
+  || stock.match(/([\w$]+)=\(e,t\)=>\{if\(!t\)return!1;let n=e\.target;return n instanceof Element&&!!n\.closest\(`\.\$\{t\}`\)\}/);
 const delta = stock.match(/([\w$]+)=e=>\{let t=e\.ctrlKey&&([\w$]+)\(\)\?10:1;return-e\.deltaY\*\(e\.deltaMode===1\?\.05:e\.deltaMode\?1:\.002\)\*t\}/);
 assert.ok(hostClass && filter && closest && delta && filter[0].includes(closest[1] + '('),
   'Unrecognized stock wheel contract. Check the new Editor source before accepting these results.');

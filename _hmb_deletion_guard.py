@@ -48,6 +48,27 @@ _BINDING_BARRIERS_LOCK = globals().get("_BINDING_BARRIERS_LOCK", threading.RLock
 
 
 @contextmanager
+def request_workflow_scope(engine: Any, request: Any, context: Any):
+    """Run graph checks in the SDK request's workflow before its handler binds it."""
+    if isinstance(context, dict) and (context.get("open_workflow_id") is not None or context.get("sender") is not None):
+        bind = getattr(engine, "bind_workflow", None)
+        scope_for = getattr(getattr(engine, "event_manager", None), "get_scope_for_request_type", None)
+        if callable(bind) and callable(scope_for):
+            from griptape_nodes.retained_mode.engine import NO_WORKFLOW
+
+            workflow_id = context.get("open_workflow_id")
+            workflow = None
+            if workflow_id is not None and scope_for(type(request)) != "host":
+                workflow = engine.open_workflows.find(workflow_id)
+            with bind(workflow if workflow is not None else NO_WORKFLOW):
+                yield
+            return
+    # In-process calls inherit the caller's binding. Older engines already
+    # supplied their graph context to hooks and have no workflow router.
+    yield
+
+
+@contextmanager
 def binding_mutation(node: Any, *, operation: str = "", parameter: str = ""):
     """Reserve a retained HMB flow briefly while a binding state is changed.
 
@@ -713,10 +734,11 @@ class _ReentrantDeletionBarrier:
                 # A nested call bypasses the lifetime gate as well as every
                 # other hook. Do not let an unready or replaced barrier become
                 # a way to remove any HMB node during a hot update.
-                ready, _ = protection_readiness(engine)
-                if not ready and any(_is_hmb(node) for node in _retained_nodes(engine).values()):
-                    return self.failure(result_details="[HMB_DELETE_GUARD_NOT_READY] 재진입 삭제 보호가 준비되지 않아 요청을 중단했습니다.")
-                return guard_request(engine, request)
+                with request_workflow_scope(engine, request, context):
+                    ready, _ = protection_readiness(engine)
+                    if not ready and any(_is_hmb(node) for node in _retained_nodes(engine).values()):
+                        return self.failure(result_details="[HMB_DELETE_GUARD_NOT_READY] 재진입 삭제 보호가 준비되지 않아 요청을 중단했습니다.")
+                    return guard_request(engine, request)
             except Exception:
                 return self.failure(result_details="[HMB_DELETE_CHECK_FAILED] 재진입 삭제 보호를 확인하지 못해 요청을 중단했습니다.")
         return self.original(request, context)

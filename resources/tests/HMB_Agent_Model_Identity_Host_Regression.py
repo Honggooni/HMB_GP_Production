@@ -82,8 +82,11 @@ def exercise(engine, folder):
         else:
             raise AssertionError("Unsupported model silently resolved")
 
+    bindings = ExitStack()
     try:
-        send(engine, EnsureWorkflowAndFlowRequest(flow_name="SyntheticModelIdentity"))
+        opened = send(engine, EnsureWorkflowAndFlowRequest(flow_name="SyntheticModelIdentity"))
+        if getattr(opened, "workflow_id", None) and hasattr(engine, "bind_workflow"):
+            bindings.enter_context(engine.bind_workflow(engine.open_workflows.get(opened.workflow_id)))
         node = create("Synthetic Agent")
         supported = node._model_access.model_choices[0]
         old = "claude-sonnet-4-6"
@@ -206,7 +209,10 @@ def exercise(engine, folder):
             rejected(facade, old)
         check("Choose a supported model explicitly" in hmb._hmb_execution_failure_message("MODEL_SELECTION_REQUIRED"), "published failure asks for explicit model selection")
     finally:
-        LibraryRegistry.unregister_library("HMB_GP_Production", event_manager=engine.event_manager)
+        try:
+            LibraryRegistry.unregister_library("HMB_GP_Production", event_manager=engine.event_manager)
+        finally:
+            bindings.close()
 
 
 def main():

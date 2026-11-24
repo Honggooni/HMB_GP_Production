@@ -55,6 +55,8 @@ def validate_registry(root: Path = ROOT, registry: str = REGISTRY) -> list[dict[
                 or name in seen or row.get("coverage") not in COVERAGE_TYPES
                 or row.get("mode") not in {"ci", "manual"} or type(row.get("required")) is not bool):
             raise ValueError(f"Invalid or duplicate coverage entry: {name}")
+        if "sdk" in row and (row["sdk"] != "desktop_031" or row["coverage"] != "installed_sdk"):
+            raise ValueError(f"Invalid SDK selection: {name}")
         if row["mode"] == "manual" and not str(row.get("reason") or "").strip():
             raise ValueError(f"Manual coverage needs a reason: {name}")
         extensions = row.get("manual_extensions", [])
@@ -94,6 +96,8 @@ def run_registered(root: Path, rows: list[dict[str, Any]], language: str,
         if row["mode"] == "manual":
             continue
         python = os.environ.get("HMB_RELEASE_SDK_PYTHON", sys.executable) if row["coverage"] == "installed_sdk" else sys.executable
+        if row.get("sdk") == "desktop_031":
+            python = os.environ.get("HMB_CURRENT_DESKTOP_PYTHON", python)
         command = [python if language == "python" else node, str(root / "resources/tests" / row["name"])]
         start = time.monotonic()
         try:
@@ -101,6 +105,8 @@ def run_registered(root: Path, rows: list[dict[str, Any]], language: str,
             # .venv; their worker must use the interpreter selected here.
             child_env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8",
                              HMB_REGRESSION_PYTHON=python, HMB_TEST_PYTHON=python)
+            if row.get("sdk") == "desktop_031" and "HMB_STANDARD_LIBRARY_ROOT" in child_env:
+                child_env["HMB_GRIPTAPE_STANDARD_LIBRARY_PATH"] = child_env["HMB_STANDARD_LIBRARY_ROOT"]
             completed = subprocess.run(command, cwd=root, text=True, encoding="utf-8", errors="replace",
                                        capture_output=True, timeout=900, env=child_env)
             output = completed.stdout + completed.stderr

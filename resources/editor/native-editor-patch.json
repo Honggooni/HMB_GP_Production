@@ -8,7 +8,7 @@
   "helper_path": "resources/editor/hmb-color-lut-native-header.js",
   "helper_sha256": "67612a63afe072a654c2b2ce7c0ae98ffdce10f580799595c5542560c1c942bf",
   "patcher_path": "tools/hmb_color_lut_native_header_patch.py",
-  "patcher_sha256": "14ace5ca3ec25a00fb580c3d3a2eb35f7d775285b6643a82f43a8c5fdc731cd8",
+  "patcher_sha256": "84b9effdcc23e75d6025d2e8c32879749751dc2dd7309fa570deddae675efc8f",
   "previous_candidates": [
     {
       "bundle_sha256": "dd88eb46ec485a38078eb7f14b06a0ca980f6b0335e230dba3ac9b8b1ba2985d",

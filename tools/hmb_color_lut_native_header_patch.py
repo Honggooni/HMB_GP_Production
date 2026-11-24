@@ -1196,8 +1196,8 @@ def _git_override_apply_active_unlocked() -> dict:
 
 EDITOR_0130_OVERLAY_INPUTS = {
     "tools/hmb_editor_0130_header.py": "75e6bec05306df685a3bb9457dcba1f6d5a1d6ab5503cba4e4853b69bfe63cee",
-    "tools/restore_rodong_local_editor.py": "15505efc7e77b8169fb3ac2c91ac1dd3e6ef80ef8b5ecb9c6a1550f53c989385",
-    "tools/hmb_rodong_editor_0130.py": "a053ac7b9a9c0db28cd613f3ce5de3ec6e1cbf26c679f6651fe5323b99bf2d5d",
+    "tools/restore_rodong_local_editor.py": "5bc4ddd3ae8f4c5aec32b3f6dd9757b637a5d1a32d7990cda0eab862105019e8",
+    "tools/hmb_rodong_editor_0130.py": "ea85265ba75121faaf7ec014cb4499872fe4f9d43a0217e8168b86806b17e9e5",
     "tools/hmb_editor_0130_override.py": "9d9cc2d4004ad8bb2b8322036fbb700c72e5d035f158f23e7aa7303bb3f72058",
     "resources/editor/hmb-header-0130.js": "488c40fdb65327be7f30c74a2e33203aa2e29948ad66b6c2c894fd5a35c54a04",
     "resources/editor/hmb-rodong-editor-0130.js": "87a8b9b8deeb6410c43198c48c24bb69e08285a3c0efce858545bbf492d07354",

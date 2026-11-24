@@ -50,8 +50,14 @@ EDITOR_1303 = EditorProfile("index-Dq4UDcw5.js",
     "19ffa1631d33cc31ab62724563b25355202a99924461be936fec9fd44a5f372b")
 
 
+EDITOR_1320 = EditorProfile("index-BnKynVUp.js",
+    "547cd4cc14430531d96b865d2d45f1263f32b260f0108300acd0f6ed4cd4a1b4",
+    "885afee77565b37d5905fc32a09b4017c5d34d9f391e19db9ff0ff7d2a6ffebe",
+    "cd8e6758c89ead317a6067d9d0846b9e335496443283041bcdb889ddfe0c338d")
+
+
 def editor_profile(entry: bytes) -> EditorProfile:
-    return next((profile for profile in (EDITOR_1303, EDITOR_1302)
+    return next((profile for profile in (EDITOR_1320, EDITOR_1303, EDITOR_1302)
                  if profile.ref in entry), EDITOR_1300)
 
 
@@ -73,6 +79,7 @@ def stock_entry_from_active(entry: bytes, overlay_name: str) -> bytes:
     previous = {
         EDITOR_1300: (*PREVIOUS_OVERLAYS, "index-hmb-rodong-355e3f9500e457ae.js"),
         EDITOR_1302: ("index-hmb-rodong-ba1b96f56bc3c465.js",),
+        EDITOR_1320: (),
         EDITOR_1303: ("index-hmb-rodong-38cbcd43a1959b4f.js",),
     }[profile]
     for name in (overlay_name, *previous):
@@ -156,7 +163,7 @@ def main() -> int:
     try:
         editor_package = distribution("griptape-nodes-editor-dist")
         if (version("griptape-nodes"), editor_package.version) not in (
-            ("0.104.0", "0.130.0"), ("0.104.2", "0.130.2"), ("0.104.3", "0.130.3")
+            ("0.104.0", "0.130.0"), ("0.104.2", "0.130.2"), ("0.104.3", "0.130.3"), ("0.106.0", "0.132.0")
         ):
             raise ValueError("SDK and Editor versions need isolated preflight")
         bundled_editor = Path(editor_package.locate_file("griptape_nodes_editor_dist/editor")).resolve()

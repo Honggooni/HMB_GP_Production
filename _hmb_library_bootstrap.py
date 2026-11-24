@@ -224,6 +224,8 @@ _HMB_EDITOR_0130_OUTPUTS = {
      "a66b4418781b1f850b93011cd2868a0cb5bb0cb5329546d9016f31b9542c255a"),
     ("e1805f017291eac8139569f6f79cba33b1e0189cf00babd6e19788d065c5a88d",
      "19ffa1631d33cc31ab62724563b25355202a99924461be936fec9fd44a5f372b"),
+    ("1bc878adb8206168a9eadc5d461c107cdc2a2e73959b697fae49cb728d72f8e3",
+     "cd8e6758c89ead317a6067d9d0846b9e335496443283041bcdb889ddfe0c338d"),
 }
 
 
@@ -1630,13 +1632,18 @@ class _DeletionLifetimeGate:
         with lock:
             return any(hook is self.hook for hook in hooks)
 
-    def before_dispatch(self, request: Any, _result_context: Any) -> Any:
+    def before_dispatch(self, request: Any, result_context: Any) -> Any:
         if type(request).__name__ not in {"DeleteNodeRequest", "ResetNodeToDefaultsRequest",
                 "DeleteFlowRequest", "ClearAllObjectStateRequest", "DeleteWorkflowRequest"}:
             return None
         engine, manager = self.engine_ref(), self.manager_ref()
         if engine is None or manager is None:
             return None
+        from _hmb_deletion_guard import request_workflow_scope
+        with request_workflow_scope(engine, request, result_context):
+            return self._check_deletion(engine, manager, request)
+
+    def _check_deletion(self, engine: Any, manager: Any, request: Any) -> Any:
         # A trusted consolidation transaction transfers retained identities
         # before removing obsolete instances. Request flags never grant this.
         try:
@@ -1778,10 +1785,15 @@ class _Registration:
             # Older hosts and optional Broker failures cannot block editing.
             return
 
-    def before_create(self, request: Any, _result_context: Any) -> Any:
+    def before_create(self, request: Any, result_context: Any) -> Any:
         # Dispatch is also the late-loop wakeup after a desktop startup that
         # loaded libraries before initializing its event queue.
         self.start_web_worker()
+        from _hmb_deletion_guard import request_workflow_scope
+        with request_workflow_scope(self.engine(), request, result_context):
+            return self._check_request(request)
+
+    def _check_request(self, request: Any) -> Any:
         snapshot_failure = self._guard_context_snapshot_request(request)
         if snapshot_failure is not None:
             return snapshot_failure

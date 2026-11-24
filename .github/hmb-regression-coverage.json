@@ -3,6 +3,20 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_Editor_0132_Rodong_Launch_Regression.mjs",
+      "mode": "manual",
+      "coverage": "host_browser",
+      "required": true,
+      "reason": "The release workflow executes this in its pinned full Editor 0.132.0 wheel step and saves a separate browser receipt."
+    },
+    {
+      "name": "HMB_Desktop031_Workflow_Envelope_Host_Regression.py",
+      "mode": "ci",
+      "coverage": "installed_sdk",
+      "required": true,
+      "sdk": "desktop_031"
+    },
+    {
       "name": "HMB_VideoPicker_Selected_Probe_Regression.py",
       "mode": "ci",
       "coverage": "installed_sdk",
@@ -2026,10 +2040,10 @@
     },
     {
       "name": "HMB_Real_Standard_Agent_Boundary_Regression.py",
-      "mode": "manual",
+      "mode": "ci",
       "coverage": "installed_sdk",
-      "required": false,
-      "reason": "This script includes native installed SDK/Standard Agent checks; clean CI can skip those checks, so the entire script is explicitly audited locally and not counted as a hostless CI success."
+      "required": true,
+      "sdk": "desktop_031"
     },
     {
       "name": "HMB_Regression_Coverage_Inventory_Regression.py",
@@ -3330,10 +3344,10 @@
     },
     {
       "name": "HMB_Agent_Model_Identity_Host_Regression.py",
-      "mode": "manual",
+      "mode": "ci",
       "coverage": "installed_sdk",
-      "required": false,
-      "reason": "Isolated native SDK preserves saved provider/model identities and rejects unsupported execution before provider calls."
+      "required": true,
+      "sdk": "desktop_031"
     },
     {
       "name": "HMB_Workflow_Standalone_Legacy_Host_Regression.py",

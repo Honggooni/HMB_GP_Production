@@ -16,7 +16,7 @@ from tempfile import TemporaryDirectory
 from hmb_editor_0130_header import HEADER_SOURCE
 from hmb_rodong_editor_0130 import STOCK_SHA256, build
 from package_runtime_release import WIDGET_FILES, validate_widget_declarations
-from restore_rodong_local_editor import EDITOR_1302, EDITOR_1303, editor_profile, entry_for_overlay, stock_entry_from_active
+from restore_rodong_local_editor import EDITOR_1302, EDITOR_1303, EDITOR_1320, editor_profile, entry_for_overlay, stock_entry_from_active
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,10 +44,18 @@ EDITOR_1303_FIXTURES = {
     "rolldown-runtime-DSDNlrLa.js": "9642411c8411b70e62cea3e38c4093f5fcd4419ec151356d87dc835062db7b69",
     "index-B032WlhJ.css": "bd05e77301d87bf2bc9c688bbc0f94a8db46675b4c94e275c06fe4faf9752444",
 }
+EDITOR_1320_FIXTURES = {
+    EDITOR_1320.bundle: EDITOR_1320.stock_digest,
+    "EngineContext-D-bkzERZ.js": "9397d0eb000091df7cff271b54a5c306dc3924dbdfaa36be32d3f88842ed2f71",
+    "react-Cwox1F5v.js": "b634f2b5dcdeed26c869f67f077f88051df6da9ce5de3a32a96f0820ec01ae3f",
+    "rolldown-runtime-DSDNlrLa.js": "9642411c8411b70e62cea3e38c4093f5fcd4419ec151356d87dc835062db7b69",
+    "index-BQL8JrHF.css": "966abada52c3d0d45325367b32e1bafbff4181f501a90387684baa0c0eafad5c",
+}
 REVIEWED_HOSTS = {
     ("0.104.0", "0.130.0"): ("0.108.0", EDITOR_0130_FIXTURES),
     ("0.104.2", "0.130.2"): ("0.108.1", EDITOR_1302_FIXTURES),
     ("0.104.3", "0.130.3"): ("0.108.1", EDITOR_1303_FIXTURES),
+    ("0.106.0", "0.132.0"): ("0.113.0", EDITOR_1320_FIXTURES),
 }
 HEADER_CHECK = "HMB_Editor_0130_Integrated_Header_Regression.mjs"
 DELETION_CHECK = "HMB_Native_Stock_Deletion_Safety_Browser_Regression.mjs"
@@ -148,7 +156,7 @@ def inspect_editor_fixtures(assets: Path, fixtures=None) -> dict[str, str]:
     fixtures = EDITOR_0130_FIXTURES if fixtures is None else fixtures
     for name, expected_sha in fixtures.items():
         if digest(assets / name) != expected_sha:
-            raise ValueError(f"Editor asset does not match the reviewed 0.130 distribution: {name}")
+            raise ValueError(f"Editor asset does not match the reviewed distribution: {name}")
     return dict(fixtures)
 
 
@@ -292,6 +300,17 @@ def run(candidate: Path, standard: Path, output: Path, node: str, legacy_editor_
         result["header_source"] = str(header_source)
         result["header_source_sha256"] = digest(header_source)
         result["identity"] = inspect_candidate(candidate, header_source=header_source)
+        host_checks = CHECKS
+        browser_checks = BROWSER_CHECKS
+        if result["identity"]["editor"] == "0.132.0":
+            host_checks += (
+                ("HMB_Desktop031_Workflow_Envelope_Host_Regression.py", {}),
+                ("HMB_Agent_Model_Identity_Host_Regression.py", {}),
+                ("HMB_Real_Standard_Agent_Boundary_Regression.py", {}),
+            )
+            browser_checks += ("HMB_Editor_0132_Rodong_Launch_Regression.mjs",)
+            expected = {name for name, _ in host_checks} | set(browser_checks)
+            result["mandatory_checks"] = sorted(expected)
         result["hmb_source_sha256"] = product_digest()
         standard_manifest = standard / "griptape_nodes_library.json"
         result["standard_manifest_sha256"] = digest(standard_manifest)
@@ -307,7 +326,7 @@ def run(candidate: Path, standard: Path, output: Path, node: str, legacy_editor_
             raise ValueError("Compiled Editor overlay differs from the inspected candidate")
         if legacy_editor_fixture is not None:
             result["legacy_fixture_sha256"] = digest(legacy_editor_fixture)
-        for script, reports in CHECKS:
+        for script, reports in host_checks:
             folder = output / Path(script).stem
             folder.mkdir()
             env = isolated_environment(folder, standard, editor)
@@ -323,7 +342,7 @@ def run(candidate: Path, standard: Path, output: Path, node: str, legacy_editor_
                 except subprocess.TimeoutExpired:
                     result["checks"][script] = "timeout"
         bundled_node_modules = Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules"
-        for script in BROWSER_CHECKS:
+        for script in browser_checks:
             folder = output / Path(script).stem
             folder.mkdir()
             # Chromium adds long GPU-cache names under TEMP on Windows.

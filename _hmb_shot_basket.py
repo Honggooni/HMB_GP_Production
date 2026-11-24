@@ -232,6 +232,13 @@ def _owned_nodes(engine: Any, flow: Any) -> dict[str, Any]:
     return kinds
 
 
+def _root_flow_without_subflows(engine, flow):
+    current = getattr(engine, "current_workflow_or_none", None)
+    runtime = current() if callable(current) else None
+    parents = runtime.flows.name_to_parent_name if runtime is not None else getattr(engine.flow_manager, "_name_to_parent_name", {})
+    return isinstance(parents, dict) and flow.name in parents and parents[flow.name] is None and flow.name not in parents.values()
+
+
 def _ensure_empty_flow(engine: Any, flow: Any) -> Any:
     from _hmb_library_bootstrap import _empty_maps, _registered_unsaved_workflow
     from griptape_nodes.retained_mode.events.context_events import (
@@ -243,9 +250,7 @@ def _ensure_empty_flow(engine: Any, flow: Any) -> Any:
     if workflow_name and not _registered_unsaved_workflow(workflow_name):
         raise BasketError("새 빈 작업공간에서 로동마트를 시작하세요.")
     if flow is not None:
-        parents = getattr(engine.flow_manager, "_name_to_parent_name", {})
-        if (not isinstance(parents, dict) or flow.name not in parents or parents[flow.name] is not None
-                or flow.name in parents.values() or _nodes(engine, flow)):
+        if not _root_flow_without_subflows(engine, flow) or _nodes(engine, flow):
             raise BasketError("새 빈 작업공간에서 로동마트를 시작하세요.")
         return flow
     current_runtime = getattr(engine, "current_workflow_or_none", None)
@@ -361,12 +366,10 @@ def _bind_prepared(engine: Any, flow: Any, kinds: dict, project: dict, projects:
     from HMBImageAssetLibrary import UI_EDIT_REVISION_KEY
 
     nodes = _nodes(engine, flow)
-    parents = getattr(engine.flow_manager, "_name_to_parent_name", {})
     image = kinds["image"]
     state = image._current_state()
     markers = {kind: node.metadata[_MARKER] for kind, node in kinds.items()}
-    if (len(nodes) != len(kinds) or not isinstance(parents, dict) or flow.name not in parents
-            or parents[flow.name] is not None or flow.name in parents.values()
+    if (len(nodes) != len(kinds) or not _root_flow_without_subflows(engine, flow)
             or any(marker.get("reserved") is not True or marker.get("project_id")
                    or marker.get("shot_name") for marker in markers.values())
             or any(not _node_ready(node) or node.metadata.get("position") != {"x": _NODES[kind][2], "y": _NODES[kind][3]}
@@ -869,7 +872,13 @@ def _browse_video(node: Any, shot_uuid: str, channel_uuid: str, session: _Sessio
         raise
 
 
-def _handle_scoped_request(engine: Any, payload: dict) -> dict:
+def _handle_scoped_request(engine: Any, payload: dict, workflow=None) -> dict:
+    # The 0.106 SDK binds the workflow named by the editor envelope. Validate
+    # the supplied workflow/flow names there, even if another open tab matches.
+    if workflow is not None:
+        return handle_workspace_request(engine, payload)
+    # Older editors send the names without an envelope. Require a unique
+    # match as before when no workflow was supplied by the SDK.
     bind = getattr(engine, "bind_workflow", None)
     workflow_name = _text(payload.get("workflow_name", ""), 512)
     flow_name = _text(payload.get("flow_name", ""), 512)
@@ -1038,14 +1047,14 @@ def install_request_handlers(engine: Any, registration: Any) -> Any:
             engine_ref = ref(engine)
 
             @handles(globals()["HMBShotBasketRequest"])
-            def request(self, request):
+            def request(self, request, workflow=None):
                 owner, current = self.owner_ref(), self.engine_ref()
                 try:
                     if owner is None or not owner.active or current is None:
                         raise BasketError("HMB 라이브러리를 새로고침한 뒤 로동마트를 다시 여세요.")
                     if not isinstance(request.payload, dict):
                         raise BasketError("로동마트 요청 형식을 확인하세요.")
-                    data = _handle_scoped_request(current, {**request.payload, "action": request.action})
+                    data = _handle_scoped_request(current, {**request.payload, "action": request.action}, workflow)
                     return globals()["HMBShotBasketResultSuccess"](
                         data=data, result_details="HMB shot basket request completed.")
                 except Exception as exc:

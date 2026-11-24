@@ -8,7 +8,7 @@ existing local source check for an exact connected Image Bash workspace.
 """
 from __future__ import annotations
 
-from _hmb_deletion_guard import hmb_binding_management
+from _hmb_deletion_guard import hmb_binding_management, request_workflow_scope
 
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -770,7 +770,7 @@ def guard_request(engine: Any, request: Any) -> Any:
         try:
             source = engine.node_manager.get_node_by_name(source_name)
             target = engine.node_manager.get_node_by_name(target_name)
-        except KeyError:
+        except (KeyError, ValueError):
             return None
         if relationship_suspended(source, target, source_parameter=request.source_parameter_name, target_parameter=request.target_parameter_name):
             from griptape_nodes.retained_mode.events.connection_events import CreateConnectionResultFailure
@@ -778,7 +778,7 @@ def guard_request(engine: Any, request: Any) -> Any:
     elif kind == "ResolveNodeRequest":
         try:
             node = engine.node_manager.get_node_by_name(request.node_name)
-        except KeyError:
+        except (KeyError, ValueError):
             return None
         if is_detached(node) or target_has_suspended_role(node):
             from griptape_nodes.retained_mode.events.execution_events import ResolveNodeResultFailure
@@ -887,15 +887,17 @@ def install_request_handlers(engine: Any, registration: Any) -> Any:
         def __init__(self, owner_ref, engine_ref):
             self.owner_ref, self.engine_ref = owner_ref, engine_ref
 
-        def protect_detached_ports(self, request, _context):
+        def protect_detached_ports(self, request, context):
             owner, current = self.owner_ref(), self.engine_ref()
-            if owner is None or not owner.active or current is None:
+            if (type(request).__name__ != "RemoveParameterFromNodeRequest"
+                    or owner is None or not owner.active or current is None):
                 return None
-            if _leased_port_removal(current, request):
-                from griptape_nodes.retained_mode.events.parameter_events import RemoveParameterFromNodeResultFailure
-                return RemoveParameterFromNodeResultFailure(result_details=(
-                    "[HMB_CONNECTION_PORT_RETAINED] 다시 연결할 원본 포트입니다. "
-                    "연결을 복구하거나 연결 기록을 정리한 뒤 제거하세요."))
+            with request_workflow_scope(current, request, context):
+                if _leased_port_removal(current, request):
+                    from griptape_nodes.retained_mode.events.parameter_events import RemoveParameterFromNodeResultFailure
+                    return RemoveParameterFromNodeResultFailure(result_details=(
+                        "[HMB_CONNECTION_PORT_RETAINED] 다시 연결할 원본 포트입니다. "
+                        "연결을 복구하거나 연결 기록을 정리한 뒤 제거하세요."))
             return None
 
         def reply(self, request, mutation=False):
