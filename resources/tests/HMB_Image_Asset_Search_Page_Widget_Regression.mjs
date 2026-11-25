@@ -204,24 +204,42 @@ try{
     await client.goto(`http://127.0.0.1:${server.address().port}`);
     await client.waitForFunction(() => window.ready);
     const vendor = writer !== 'hq';
+    const secondSite = 'site-' + 'b'.repeat(32);
     const prefix = vendor ? `site:${writer}/` : '';
     const folders = ['BG', 'BG/e201', 'BG/e202', 'BG/e202/Tone', 'BG_lighting', 'CH', 'user_imports'].map(folder => prefix + folder);
     folders.push(vendor ? 'HQOnly' : `site:${'site-' + 'a'.repeat(32)}/VendorOnly`);
+    if (vendor) folders.push(`site:${secondSite}/SecondOnly`);
     const row = {...state.assets[95], asset_library_id:'dingo', source_uid:'import:dingo', source_kind:'user', import_index:1,
       image_name:'Dingo', asset_id:'Dingo', path:'{inputs}/images/Dingo.jpg', relative_path:'', registered:false};
     const clientState = api.hmbNormalizeImageAssetState({...state, folders, assets:[row], selected_source_view:'user',
-      shot_routing:undefined, site_settings:{write_site_id:writer,revision:'test',links:vendor ? [{id:writer,label:'Partner'}] : []}});
+      shot_routing:undefined, site_settings:{write_site_id:writer,revision:'test',
+        links:vendor ? [{id:writer,label:'Partner'},{id:secondSite,label:'Second partner'}] : []}});
     await client.evaluate(value => window.boot(value,0),clientState);
     await client.locator('[data-asset-key="dingo"] [data-asset-add]').click();
     const submit = client.locator('[data-registration-submit]');
+    const destination = client.locator('[data-registration-destination]');
     const chooser = client.locator('[data-registration-folder]');
     const control = action => chooser.locator(`[data-registration-folder-action="${action}"]`);
     const folder = path => chooser.locator(`[data-registration-folder-path="${prefix}${path}"]`);
     const rows = () => chooser.locator('[data-registration-folder-path]:not(.passport-folder-here) span:first-child').allTextContents();
-    assert.equal(await submit.isEnabled(),vendor);
-    const previous = await control('open').textContent();
-    if (vendor) assert.match(previous,/Partner \/ add/);
-    await control('open').click();
+    assert.equal(await submit.isDisabled(),true);
+    if (vendor) {
+      assert.deepEqual(await destination.locator('option').allTextContents(),['Select a save location','Default folder','Partner','Second partner']);
+      assert.equal(await control('open').isDisabled(),true);
+      await destination.selectOption(writer);
+      await folder('add').click();
+      assert.match(await control('open').textContent(),/Partner \/ add/);
+      assert.equal(await submit.isEnabled(),true);
+      await destination.selectOption('hq');
+      assert.deepEqual(await rows(),['HQOnly']);
+      assert.equal(await submit.isDisabled(),true);
+      await destination.selectOption(secondSite);
+      assert.deepEqual(await rows(),['SecondOnly','add']);
+      await destination.selectOption(writer);
+    } else {
+      assert.equal(await destination.count(),0);
+      await control('open').click();
+    }
     assert.equal(await submit.isDisabled(),true);
     assert.deepEqual(await rows(),vendor ? ['BG','BG_lighting','CH','add'] : ['BG','BG_lighting','CH']);
     await folder('BG').click();
@@ -249,6 +267,7 @@ try{
     const requests = await registrationRequests();
     assert.equal(requests.length,1);
     assert.equal(requests[0].target_folder,prefix+'BG/e202/Tone');
+    assert.equal(requests[0].target_site_id,vendor ? writer : undefined);
     await client.close();
   }
 
@@ -269,6 +288,7 @@ try{
     await client.evaluate(value => window.boot(value,0),clientState);
     await client.locator('[data-folder-key][data-source-view="project"][data-folder-path=""]').first().click();
     await client.locator('[data-asset-add]').click();
+    assert.equal(await client.locator('[data-registration-destination], [data-registration-folder]').count(),0);
     return client;
   }));
   const requests = await Promise.all(clients.map(async client => {

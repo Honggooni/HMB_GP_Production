@@ -4270,6 +4270,7 @@ def _normalize_asset_registration_request(value: Any) -> Dict[str, str]:
         "source_uid": source_uid,
         "relative_path": relative_path,
         "target_folder": target_folder,
+        "target_site_id": _clean(value.get("target_site_id"))[:128],
         "site_settings_revision": _clean(value.get("site_settings_revision"))[:128],
         "image_name": _clean(value.get("image_name"))[:256],
         "asset_id": _clean(value.get("asset_id"))[:256],
@@ -7043,11 +7044,17 @@ def _commit_asset_registration(
             or _clean(normalized.get("project_cache_uid")) != _project_cache_uid(selected_root)):
         raise ValueError("The selected image project changed; refresh before registering.")
     settings = get_site_settings(selected_root)
-    if request_source_kind == "user" and not request["target_folder"] and settings["write_site_id"] != "hq":
-        request["target_folder"] = f"site:{settings['write_site_id']}/add"
+    writer = settings["write_site_id"]
+    explicit_site = request["target_site_id"] if request_source_kind == "user" else ""
+    if request_source_kind == "user" and not explicit_site and not request["target_folder"] and writer != "hq":
+        request["target_folder"] = f"site:{writer}/add"
     site, site_rel = _site_location(request.get("relative_path") if request_source_kind == "project"
                                     else request.get("target_folder"))
-    if site != settings["write_site_id"]:
+    if explicit_site:
+        if (not settings["links"] or site != explicit_site or not site_rel
+                or (site == "hq" and request["target_folder"].startswith("site:"))):
+            raise ValueError("선택한 저장 위치와 하위 에셋 폴더를 다시 확인하세요.")
+    elif site != writer:
         raise ValueError("현재 작업 위치의 이미지 폴더에만 등록할 수 있습니다.")
     write_root = selected_root
     project_id = _clean(selected_project["project_id"])
@@ -7147,7 +7154,7 @@ def _commit_asset_registration(
             _clean(folder).casefold(): _clean(folder)
             for folder in normalized.get("folders", [])
             if _clean(folder)
-            and not _is_user_import_relative_path(f"{_clean(folder)}/asset.png")
+            and not _is_user_import_relative_path(f"{_site_location(folder)[1]}/asset.png")
         }
         if not requested_folder:
             raise ValueError(
@@ -7229,7 +7236,7 @@ def _commit_asset_registration(
         assets.append(registered_row)
     else:
         assets[source_index] = registered_row
-    _suggest_registration_names(assets, writer=site)
+    _suggest_registration_names(assets, writer=writer)
     refreshed["assets"] = assets
     refreshed["catalog_root"] = catalog["catalog_root"]
     refreshed["projects"] = catalog["projects"]

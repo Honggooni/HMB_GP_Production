@@ -823,6 +823,9 @@ const IMAGE_ASSET_UI_TEXT = {
     project_folder_locked: "Existing project assets keep their current folder.",
     project_folder_select: "Select the existing child Asset Folder where the external image will be copied.",
     select_project_folder: "Select Asset Folder",
+    registration_destination: "SAVE LOCATION",
+    registration_destination_select: "Select a save location",
+    registration_destination_default: "Default folder",
     registration_folder_root: "Project folders",
     registration_folder_parent: "Parent folder",
     registration_folder_close: "Close folder chooser",
@@ -912,6 +915,9 @@ const IMAGE_ASSET_UI_TEXT = {
     project_folder_locked: "기존 프로젝트 에셋은 현재 폴더로 고정됩니다.",
     project_folder_select: "외부 이미지를 복사할 기존 하위 에셋 폴더를 선택하세요.",
     select_project_folder: "에셋 폴더 선택",
+    registration_destination: "저장 위치",
+    registration_destination_select: "저장 위치 선택",
+    registration_destination_default: "기본 폴더",
     registration_folder_root: "프로젝트 폴더",
     registration_folder_parent: "상위 폴더",
     registration_folder_close: "폴더 선택 닫기",
@@ -1484,6 +1490,7 @@ function normalizeRegistrationRequest(raw) {
     source_uid: sourceUid,
     relative_path: relativePath,
     target_folder: targetFolder,
+    ...(raw.target_site_id && sourceKind === "user" ? {target_site_id: clean(raw.target_site_id).slice(0, 128)} : {}),
     image_name: clean(raw.image_name).slice(0, 256),
     asset_id: clean(raw.asset_id).slice(0, 256),
     image_main_type: imageMainType.slice(0, 256),
@@ -3569,6 +3576,7 @@ function imageAssetFocusDescriptor(container) {
     "data-shot-rename-input",
     "data-shot-delete",
     "data-registration-field",
+    "data-registration-destination",
     "data-registration-folder-action",
     "data-registration-main",
     "data-registration-sub",
@@ -5493,13 +5501,15 @@ export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}, state
     ? relativePath.slice(0, relativePath.lastIndexOf("/"))
     : ROOT_FOLDER_KEY;
   const writer = state?.site_settings?.write_site_id;
-  const vendorDefault = writer && writer !== "hq" ? "site:" + writer + "/add" : "";
+  const chooseDestination = sourceKind === "user" && Boolean(state?.site_settings?.links?.length);
+  const vendorDefault = !chooseDestination && writer && writer !== "hq" ? "site:" + writer + "/add" : "";
   return {
     asset_library_id: clean(asset.asset_library_id),
     site_settings_revision: clean(state?.site_settings?.revision),
     source_kind: sourceKind,
     source_uid: clean(asset.source_uid),
     relative_path: relativePath,
+    ...(chooseDestination ? {target_site_id: ""} : {}),
     target_folder: sourceKind === "project" ? lockedFolder : vendorDefault,
     target_folder_confirmed: sourceKind === "project" || Boolean(vendorDefault),
     image_name: (clean(asset.registration_default_name) || clean(asset.image_name)).slice(0, 256),
@@ -5633,7 +5643,8 @@ function registrationDraftIsComplete(draft) {
     && (
       draft?.source_kind !== "user"
       || (
-        draft?.target_folder_confirmed
+        draft?.target_site_id !== ""
+        && draft?.target_folder_confirmed
         && typeof draft.folder_picker_path !== "string"
         && clean(draft?.target_folder)
         && clean(draft?.target_folder) !== ROOT_FOLDER_KEY
@@ -5642,14 +5653,14 @@ function registrationDraftIsComplete(draft) {
   );
 }
 
-function registrationFolderRoot(state) {
-  const writeSite = state.site_settings?.write_site_id || "hq";
-  return writeSite === "hq" ? "" : `site:${writeSite}`;
+function registrationFolderRoot(state, draft) {
+  const site = draft.target_site_id || state.site_settings?.write_site_id || "hq";
+  return site === "hq" ? "" : `site:${site}`;
 }
 
 function registrationFolderContents(state, draft) {
   const text = (key) => escapeHtml(imageAssetText(state, key));
-  const root = registrationFolderRoot(state);
+  const root = registrationFolderRoot(state, draft);
   const rootLabel = root ? imageFolderLabel(state, root, root) : imageAssetText(state, "registration_folder_root");
   const folderLabel = (path) => root
     ? (path === root ? rootLabel : `${rootLabel} / ${path.slice(root.length + 1)}`)
@@ -5658,11 +5669,11 @@ function registrationFolderContents(state, draft) {
   if (typeof current !== "string") {
     const selected = draft.target_folder_confirmed ? clean(draft.target_folder) : "";
     const label = selected ? escapeHtml(folderLabel(selected)) : text("select_project_folder");
-    return `<button type="button" class="passport-folder-trigger" data-registration-folder-action="open" aria-expanded="false"><span>${label}</span><span aria-hidden="true">⌄</span></button>`;
+    return `<button type="button" class="passport-folder-trigger" data-registration-folder-action="open" aria-expanded="false" ${draft.target_site_id === "" ? "disabled" : ""}><span>${label}</span><span aria-hidden="true">⌄</span></button>`;
   }
 
   const available = new Set(state.folders.filter(folder => clean(folder) && folder !== root
-    && folder !== ROOT_FOLDER_KEY && imageFolderSite(folder) === (state.site_settings?.write_site_id || "hq")
+    && folder !== ROOT_FOLDER_KEY && imageFolderSite(folder) === (root ? imageFolderSite(root) : "hq")
     && !isUserImportFolder(root ? folder.slice(root.length + 1) : folder)));
   if (root) available.add(`${root}/add`);
   const prefix = current ? `${current}/` : "";
@@ -5689,8 +5700,21 @@ function registrationFolderContents(state, draft) {
 
 function registrationFolderField(state, draft, externalImport) {
   if (!externalImport) return "";
+  const text = (key) => escapeHtml(imageAssetText(state, key));
+  const destination = typeof draft.target_site_id === "string"
+    ? `<label class="passport-destination"><span>${text("registration_destination")}</span>
+        <select data-registration-destination ${draft.saving ? "disabled" : ""}>
+          <option value="">${text("registration_destination_select")}</option>
+          ${[
+            {id: "hq", label: imageAssetText(state, "registration_destination_default")},
+            ...(state.site_settings?.links || []),
+          ].map(({id, label, root}) =>
+            `<option value="${escapeHtml(id)}" title="${escapeHtml(root || state.project_root)}" ${draft.target_site_id === id ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+        </select></label>`
+    : "";
   return (
-    `<div class="passport-folder" data-registration-folder title="${escapeHtml(imageAssetText(state, "project_folder_select"))}">`
+    destination
+    + `<div class="passport-folder" data-registration-folder title="${text("project_folder_select")}">`
     + `<span>${escapeHtml(imageAssetText(state, "project_folder"))}</span>`
     + `<div class="passport-folder-controls">${registrationFolderContents(state, draft)}</div>`
     + "</div>"
@@ -6387,12 +6411,13 @@ function render(
       .shot-routing{margin:0 8px 8px;border:1px solid rgba(34,211,238,.3);border-radius:9px;background:linear-gradient(180deg,rgba(7,28,40,.94),rgba(6,10,18,.98));overflow:hidden}.shot-routing-head{height:38px;display:flex;align-items:center;gap:7px;padding:0 8px}.shot-toggle,.shot-add,.shot-tab,.shot-source button{border:1px solid rgba(34,211,238,.24);border-radius:6px;background:#08131e;color:#a9c6d8;cursor:pointer}.shot-toggle{width:25px;height:25px;padding:0;color:var(--accent)}.shot-routing-head>b{font-size:8px;letter-spacing:.08em;color:var(--accent);white-space:nowrap}.shot-channel{max-width:58px;color:#5f7f94;font-size:7px;font-family:ui-monospace,monospace}.shot-tabs{display:flex;flex:1;align-items:center;gap:5px;min-width:0;overflow-x:auto;padding:2px}.shot-tab{height:27px;display:flex;align-items:center;gap:5px;padding:0 7px;white-space:nowrap}.shot-tab small{color:#5e7e93;font-size:6px}.shot-tab b{max-width:92px;overflow:hidden;text-overflow:ellipsis;font-size:8px}.shot-tab em{color:#6f90a5;font-size:7px;font-style:normal}.shot-tab.active{border-color:var(--accent);background:rgba(8,145,178,.18);color:#e6fbff}.shot-add{height:27px;padding:0 9px;color:#bceef5;font-size:8px;font-weight:900;white-space:nowrap}.shot-add:disabled,.shot-source button:disabled{opacity:.28;cursor:default}.shot-routing-body{min-height:78px;display:grid;grid-template-columns:190px minmax(0,1fr);gap:8px;padding:7px 9px 9px;border-top:1px solid rgba(34,211,238,.14)}.shot-routing-summary{display:flex;flex-direction:column;gap:3px;padding:7px;border:1px solid rgba(34,211,238,.16);border-radius:7px;background:rgba(4,14,24,.65)}.shot-routing-summary b{color:#d9f8ff;font-size:10px}.shot-routing-summary span{color:var(--accent);font-size:8px;font-weight:900}.shot-routing-summary small{color:#708ba0;font-size:7px;line-height:1.35}.shot-sources{display:flex;align-content:flex-start;gap:5px;overflow-x:auto;padding:3px}.shot-source{height:30px;display:flex;flex:0 0 auto;align-items:stretch}.shot-source>button:first-child{max-width:145px;display:flex;align-items:center;gap:5px;padding:0 7px}.shot-source i{color:#5d7d91;font-size:8px;font-style:normal}.shot-source span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:8px}.shot-source.selected>button:first-child{border-color:rgba(244,114,182,.62);background:rgba(131,24,67,.22);color:#ffe0f1}.shot-source.selected i{color:#f9a8d4}.shot-source .shot-source-move{width:22px;margin-left:2px;padding:0;color:#8eb6ca}.shot-routing-empty{align-self:center;color:#607b90;font-size:8px}
       .shot-stack{max-height:360px;margin:0 8px 8px;display:flex;flex-direction:column;gap:5px;overflow:auto;scrollbar-gutter:stable}.shot-panel{flex:0 0 auto;overflow:hidden;border:1px solid rgba(var(--shot-rgb),.34);border-radius:10px;background:linear-gradient(180deg,rgba(var(--shot-rgb),.10),rgba(8,11,19,.96));box-shadow:0 0 16px rgba(var(--shot-rgb),.07)}.shot-panel-head{height:38px;display:flex;align-items:center;gap:6px;padding:4px 7px;min-width:0;border-bottom:1px solid transparent}.shot-panel.active .shot-panel-head{border-bottom-color:rgba(var(--shot-rgb),.20)}.shot-panel-toggle{height:29px;min-width:0;flex:1;display:grid;grid-template-columns:30px minmax(0,1fr) minmax(0,1fr) auto auto;align-items:center;gap:7px;padding:0 8px;border:1px solid rgba(var(--shot-rgb),.32);border-radius:7px;background:linear-gradient(90deg,rgba(var(--shot-rgb),.16),rgba(8,13,23,.72));color:#d9e6f3;text-align:left;cursor:pointer}.shot-panel-toggle small{color:var(--shot-accent);font-size:8px;font-weight:950}.shot-panel-toggle b{max-width:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f8fafc;font-size:10px}.shot-panel-toggle span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(var(--shot-rgb),.92);font-size:8px;font-weight:900;letter-spacing:.06em}.shot-panel-toggle em{color:var(--shot-accent);font-size:8px;font-style:normal;font-weight:900}.shot-panel-toggle i{color:#7f95a8;font-size:7px;font-style:normal;letter-spacing:.08em}.shot-panel.active{border-color:rgba(var(--shot-rgb),.68);box-shadow:0 0 18px rgba(var(--shot-rgb),.14)}.shot-panel.active .shot-panel-toggle{border-color:var(--shot-accent);box-shadow:0 0 10px rgba(var(--shot-rgb),.14)}.shot-panel .shot-delete{width:29px;height:29px;flex:0 0 29px;padding:0;border:1px solid rgba(var(--shot-rgb),.42);border-radius:7px;background:rgba(var(--shot-rgb),.10);color:var(--shot-accent);font-size:16px;line-height:1;cursor:pointer}.shot-panel .shot-delete:hover:not(:disabled),.shot-panel .shot-delete:focus-visible{border-color:var(--shot-accent);background:rgba(var(--shot-rgb),.22);outline:none;box-shadow:0 0 10px rgba(var(--shot-rgb),.18)}.shot-panel .shot-delete:disabled{opacity:.25;cursor:default}.shot-panel .shot-add{flex:0 0 auto;height:29px;padding:0 11px;border:1px solid rgba(var(--shot-rgb),.54);border-radius:7px;background:rgba(var(--shot-rgb),.14);color:var(--shot-accent);font-size:8px;font-weight:950;white-space:nowrap;cursor:pointer}.shot-panel .shot-add:disabled{opacity:.3;cursor:default}.shot-panel .tray-scroll{height:132px;display:flex;align-items:stretch;gap:8px;overflow-x:auto;overflow-y:hidden;padding:7px}.shot-panel .selected-card{border-color:rgba(var(--shot-rgb),.30);background:linear-gradient(145deg,rgba(var(--shot-rgb),.15),rgba(12,17,28,.94))}.shot-panel .selected-thumb{border-color:rgba(var(--shot-rgb),.30)}.shot-panel .slot{border-color:rgba(var(--shot-rgb),.70);background:rgba(var(--shot-rgb),.20);color:var(--shot-accent)}.shot-panel .tray-empty{border-color:rgba(var(--shot-rgb),.22);color:rgba(var(--shot-rgb),.72)}.hmb-image-assets .asset-card.selected{border-color:var(--active-shot-accent);box-shadow:inset 0 0 0 .3px rgba(var(--active-shot-rgb),.48),0 0 15px rgba(var(--active-shot-rgb),.34),0 0 4px rgba(var(--active-shot-rgb),.55)}
       .asset-registration-backdrop{position:absolute;inset:0;z-index:80;display:grid;place-items:center;padding:18px;background:rgba(1,4,10,.78);backdrop-filter:blur(5px)}.asset-passport{width:min(390px,100%);max-height:calc(100% - 12px);display:flex;flex-direction:column;overflow:auto;border:1px solid rgba(244,114,182,.62);border-radius:18px 18px 28px 28px;background:radial-gradient(circle at 50% -8%,rgba(190,24,93,.24),transparent 30%),linear-gradient(180deg,#171020,#090d17 45%,#060912);box-shadow:0 24px 70px rgba(0,0,0,.62),0 0 28px rgba(244,114,182,.2)}.passport-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 10px;border-bottom:1px solid rgba(244,114,182,.2)}.passport-head small{display:block;color:#d8a2be;font-size:7px;font-weight:900;letter-spacing:.18em}.passport-head h2{margin:3px 0 0;color:#fff1f8;font-size:15px;letter-spacing:.08em}.passport-head button{width:28px;height:28px;border:1px solid rgba(244,114,182,.25);border-radius:50%;background:#0b0d16;color:#e7b9d1;font-size:18px;line-height:1;cursor:pointer}.passport-photo{position:relative;width:128px;aspect-ratio:3/4;display:grid;place-items:center;align-self:center;margin:14px 0 8px;overflow:hidden;border:1px solid rgba(244,114,182,.38);border-radius:8px;background:#050910;color:#84677a;font-size:10px;font-weight:900;box-shadow:0 0 18px rgba(244,114,182,.12)}.passport-photo img{width:100%;height:100%;object-fit:cover}.passport-photo>span{display:none}.passport-photo.fallback img{display:none}.passport-photo.fallback>span{display:block}.passport-file{display:flex;flex-direction:column;gap:3px;padding:0 18px 12px;text-align:center}.passport-file b,.passport-file span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.passport-file b{color:#d7e2ef;font-size:8px}.passport-file span{color:#73899d;font-size:7px}.passport-fields{display:grid;grid-template-columns:1fr 1fr;gap:9px;padding:12px 16px;border-top:1px dashed rgba(244,114,182,.24)}.passport-fields label{display:flex;flex-direction:column;gap:4px}.passport-fields label:nth-last-child(1){grid-column:1/-1}.passport-fields label span{color:#bb8fa8;font-size:7px;font-weight:900;letter-spacing:.06em}.passport-fields input,.passport-fields select{width:100%;height:32px;border:1px solid rgba(148,163,184,.27);border-radius:7px;background:#060b13;color:#eef5ff;padding:0 8px;font-size:9px;outline:none}.passport-fields input:focus,.passport-fields select:focus{border-color:var(--asset-selection);box-shadow:0 0 0 1px rgba(244,114,182,.18)}.passport-fields select:disabled{opacity:.42}.passport-actions{display:flex;justify-content:flex-end;gap:7px;padding:11px 16px 15px}.passport-actions button{height:31px;padding:0 13px;border:1px solid rgba(148,163,184,.24);border-radius:7px;background:#0a101a;color:#bac9d8;font-size:8px;font-weight:900;cursor:pointer}.passport-actions .passport-register{border-color:rgba(244,114,182,.62);background:linear-gradient(180deg,rgba(190,24,93,.55),rgba(88,28,135,.42));color:#ffe4f2;box-shadow:0 0 12px rgba(244,114,182,.18)}.passport-actions button:disabled{opacity:.32;cursor:default;box-shadow:none}
-      .passport-fields .passport-folder{grid-column:1/-1;min-width:0;display:grid;gap:4px}
+      .passport-fields .passport-destination,.passport-fields .passport-folder{grid-column:1/-1;min-width:0;display:grid;gap:4px}
       .passport-folder>span{color:var(--selection-soft,#bb8fa8);font-size:7px;font-weight:900;letter-spacing:.06em}
       .passport-folder-controls{border:1px solid rgba(148,163,184,.27);border-radius:7px;background:#060b13;color:#eef5ff;font-size:9px}
       .passport-folder-controls:focus-within{border-color:var(--asset-selection)}
       .passport-folder-controls button{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:29px;padding:0 8px;border:0;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
       .passport-folder-controls button:hover,.passport-folder-controls button:focus-visible{background:rgba(148,163,184,.12);outline:none}
+      .passport-folder-controls button:disabled{opacity:.42;cursor:default;background:transparent}
       .passport-folder-controls button span,.passport-folder-nav b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       .passport-folder-trigger,.passport-folder-list button{width:100%}
       .passport-folder-nav{display:flex;align-items:center;gap:4px;padding:0 3px;border-bottom:1px solid rgba(148,163,184,.18)}
@@ -8924,12 +8949,13 @@ function installEvents(container, state, props, remount, listeners) {
   );
   hmbInstallImageAssetRefreshReviewEvents(container, state, props, remount);
   const updateRegistrationSubmit = () => {
+    const draft = container.__hmbImageAssetRegistrationDraft;
     const submit = container.querySelector("[data-registration-submit]");
     if (submit) {
-      submit.disabled = !registrationDraftIsComplete(
-        container.__hmbImageAssetRegistrationDraft,
-      ) || Boolean(container.__hmbImageAssetRegistrationDraft?.bash_pending || container.__hmbImageAssetRegistrationDraft?.saving);
+      submit.disabled = !registrationDraftIsComplete(draft) || Boolean(draft?.bash_pending || draft?.saving);
     }
+    const destination = container.querySelector("[data-registration-destination]");
+    if (destination) destination.disabled = Boolean(draft?.saving);
   };
   container.querySelectorAll("[data-registration-field]").forEach((input) => {
     const field = clean(input.getAttribute("data-registration-field"));
@@ -8941,17 +8967,32 @@ function installEvents(container, state, props, remount, listeners) {
     });
   });
   const registrationFolder = container.querySelector("[data-registration-folder]");
+  const registrationDestination = container.querySelector("[data-registration-destination]");
+  on(registrationDestination, "change", () => {
+    const draft = container.__hmbImageAssetRegistrationDraft;
+    if (!draft || draft.saving) return;
+    draft.target_site_id = registrationDestination.value;
+    draft.target_folder = "";
+    draft.target_folder_confirmed = false;
+    if (draft.target_site_id) {
+      draft.folder_picker_path = registrationFolderRoot(state, draft);
+    } else {
+      delete draft.folder_picker_path;
+    }
+    registrationFolder.querySelector(".passport-folder-controls").innerHTML = registrationFolderContents(state, draft);
+    updateRegistrationSubmit();
+  });
   on(registrationFolder, "click", (event) => {
     const draft = container.__hmbImageAssetRegistrationDraft;
     const button = event.target.closest?.("[data-registration-folder-action]");
-    if (!draft || draft.saving || !button) return;
+    if (!draft || draft.saving || !button || button.disabled) return;
     event.preventDefault();
     event.stopPropagation();
     const action = button.dataset.registrationFolderAction;
     const path = button.dataset.registrationFolderPath;
     const previous = draft.folder_picker_path;
     if (action === "open") {
-      draft.folder_picker_path = registrationFolderRoot(state);
+      draft.folder_picker_path = registrationFolderRoot(state, draft);
     } else if (action === "back") {
       draft.folder_picker_path = previous.slice(0, Math.max(0, previous.lastIndexOf("/")));
     } else if (action === "enter") {
@@ -9028,6 +9069,7 @@ function installEvents(container, state, props, remount, listeners) {
         source_uid: draft.source_uid,
         relative_path: draft.relative_path,
         target_folder: clean(draft.target_folder),
+        ...(draft.target_site_id ? {target_site_id: draft.target_site_id} : {}),
         image_name: clean(draft.image_name),
         asset_id: clean(draft.asset_id),
         image_main_type: clean(draft.image_main_type),

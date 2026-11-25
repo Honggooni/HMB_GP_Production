@@ -227,6 +227,74 @@ def live_profile_changes(root):
         assert observed[0].samefile(first) and observed[1].samefile(second), observed
 
 
+def explicit_import_destinations(root):
+    from PIL import Image
+
+    root.mkdir()
+    lib = station(root / "workstation")
+    hq, first, second = paths(root)
+    for store in (hq, first, second):
+        (store / "CH").mkdir(parents=True)
+    catalog = hq.parents[1]
+    profile = lib.save_site_settings(hq, [
+        {"id": "first", "label": "First", "root": str(first)},
+        {"id": "second", "label": "Second", "root": str(second)},
+    ], "first", "0")
+    first_id, second_id = (link["id"] for link in profile["links"])
+    assert profile["write_site_id"] == first_id
+    manual = first / "CH" / "manual.png"
+    Image.new("RGB", (9, 6), "green").save(manual)
+    manual_bytes = manual.read_bytes()
+    state = load(lib, catalog)
+
+    for site, storage, destination in (
+        ("hq", hq, "CH"),
+        (first_id, first, f"site:{first_id}/CH"),
+        (second_id, second, f"site:{second_id}/add"),
+    ):
+        source = root / f"external-{storage.parents[2].name}.png"
+        Image.new("RGB", (9, 6), "blue").save(source)
+        state, media = lib._merge_import_input(state, [str(source)])
+        incoming = next(a for a in state["assets"] if a["source_kind"] == "user")
+        request = {"request_id": f"choose-{site}", "project_uid": state["project_uid"],
+                   "asset_library_id": incoming["asset_library_id"], "source_uid": incoming["source_uid"],
+                   "source_kind": "user", "target_folder": destination, "target_site_id": site,
+                   "asset_id": "External", "image_name": "External", "image_main_type": "Custom / Context",
+                   "image_sub_type": "Context", "site_settings_revision": profile["revision"]}
+        for bad_request in (
+            {**request, "target_site_id": "missing"},
+            {**request, "target_site_id": "missing", "target_folder": "site:missing/add"},
+            {**request, "site_settings_revision": "stale"},
+        ):
+            try:
+                lib._apply_asset_registration(state, bad_request, media)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("An invalid or stale destination received an Add")
+        state = lib._apply_asset_registration(state, request, media)
+        assert state["asset_registration_result"]["ok"]
+        child = "add" if site == second_id else "CH"
+        saved = storage / child / source.name
+        assert source.read_bytes() == saved.read_bytes()
+        for other in (hq, first, second):
+            records = lib._read_asset_manifest(other)
+            assert (f"{child}/{source.name}".casefold() in records) == (other == storage)
+        assert lib.get_site_settings(hq, fresh=True) == profile
+
+    row = next(a for a in state["assets"] if a["relative_path"] == f"site:{first_id}/CH/manual.png")
+    state = lib._apply_asset_registration(state, {
+        "request_id": "manual", "project_uid": state["project_uid"],
+        "asset_library_id": row["asset_library_id"], "relative_path": row["relative_path"],
+        "asset_id": "Manual", "image_name": "Manual", "image_main_type": "Custom / Context",
+        "image_sub_type": "Context", "site_settings_revision": profile["revision"],
+    })
+    assert state["asset_registration_result"]["ok"]
+    assert manual.read_bytes() == manual_bytes
+    assert "ch/manual.png" in lib._read_asset_manifest(first)
+    assert len(list(root.rglob("manual.png"))) == 1
+
+
 def run():
     from PIL import Image
     with TemporaryDirectory(prefix="hmb-site-") as home:
@@ -244,6 +312,8 @@ def run():
         untouched = busan_manifest.read_bytes()
         # Initialize from the clean station env before importing the library.
         station(root / "pc-confirm-active")
+        explicit_import_destinations(root / "destination-choice")
+        station(root / "pc-confirm-active")
         live_profile_changes(root)
         context = multiprocessing.get_context("spawn")
         barrier = context.Barrier(2)
@@ -259,7 +329,8 @@ def run():
             assert len(manifest["assets"]) == expected
         assert busan_manifest.read_bytes() == untouched
     print("PASS: 3 sources, 2 concurrent workstations, per-root read once per startup/refresh, independent Add, "
-          "4 hot reopens, 2 cold restores, Shot identity, equal asset IDs, media, thumbnails, unlink/relink.")
+          "4 hot reopens, 2 cold restores, Shot identity, equal asset IDs, media, thumbnails, unlink/relink, "
+          "per-import destination choice with independent registries and in-place manual Add.")
 
 
 if __name__ == "__main__":
