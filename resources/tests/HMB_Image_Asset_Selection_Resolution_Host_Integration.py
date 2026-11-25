@@ -89,10 +89,13 @@ async def check_wired_image_with_existing_shot(workspace):
         project = catalog / "superwings12" / "Ai_Ct_image"
         (project / ".json").mkdir(parents=True)
         Image.new("RGB", (8, 8)).save(project / "Anchor.png")
+        names = ["Anchor", *(f"Extra{index}" for index in range(6))]
+        for index, name in enumerate(names[1:], 1):
+            Image.new("RGB", (8, 8), (index * 30, 100, 80)).save(project / f"{name}.png")
         (project / ".json/hmb_image_assets.json").write_text(json.dumps({"assets": [{
-            "path": "Anchor.png", "asset_id": "Anchor", "image_name": "Anchor",
+            "path": f"{name}.png", "asset_id": name, "image_name": name,
             "image_main_type": "Custom / Context", "image_sub_type": "Context",
-        }]}), encoding="utf-8")
+        } for name in names]}), encoding="utf-8")
         image = LoadImage(name="Dingo")
         image.metadata.update(library=standard_schema.name, node_type="LoadImage")
         register(flow, image)
@@ -106,7 +109,7 @@ async def check_wired_image_with_existing_shot(workspace):
             state = asset._load_project_catalog(catalog, {})
             if not state["project_root"]:
                 state = asset._select_catalog_project(state, state["projects"][0]["path"])
-            anchor = next(row for row in state["assets"] if row["registered"])
+            anchor = next(row for row in state["assets"] if row["image_name"] == "Anchor")
             anchor.update(selected=True, selection_order=1)
             state["shot_routing"]["shots"][0]["selected_source_uids"] = [anchor["source_uid"]]
             library._sync_output(state, force=True)
@@ -249,10 +252,93 @@ async def check_wired_image_with_existing_shot(workspace):
                 assert preview.size == (32, 24)
                 red, green, blue = preview.convert("RGB").getpixel((16, 12))
                 assert red > 220 and green > 100 and blue < 50
+            await check_repeated_wired_selection(library, downstream, anchor["source_uid"], uid)
             await current_engine().aclose_workflow(library.workflow)
             assert not library._scan_owner_is_current(), "Closed workflow still owns pending execution"
     print("Standard LoadImage -> ImageAsset -> HMBPrompt: macro JPEG, first/repeat Resolve, legacy declaration, "
           "preserved Shot and image order, peer publication, unbound callback, retired workflow PASS")
+
+
+async def check_repeated_wired_selection(library, downstream, anchor, imported):
+    import HMBPromptLibrary as prompt
+
+    state = library._current_state()
+    extra = [row["source_uid"] for row in state["assets"] if row["image_name"].startswith("Extra")]
+    assert len(extra) == 6, state["assets"]
+    source_paths = {row["source_uid"]: row["path"] for row in state["assets"]}
+    initial = [anchor, imported]
+    expected = initial
+
+    async def submit(selection, *, paged=False):
+        live = library._current_state()
+        routing = live["shot_routing"]
+        shot = routing["shots"][0]
+        shot.update(selected_source_uids=selection, revision=shot["revision"] + 1,
+                    media_count=0, metadata_sha256="", media_sha256="")
+        routing["generation"] += 1
+        edit = {
+            "schema": asset.IMAGE_ASSET_EDIT_SCHEMA, "version": 1,
+            asset.WIDGET_RUNTIME_LEASE_KEY: library._hmb_widget_runtime_lease,
+            asset.UI_EDIT_REVISION_KEY: live[asset.UI_EDIT_REVISION_KEY] + 1,
+            "catalog_identity": {key: live[key] for key in asset.IMAGE_ASSET_EDIT_CATALOG_FIELDS},
+            "selected_source_uids": selection,
+            "edits": {"shot_routing": routing},
+        }
+        if paged:
+            # A selection can leave the compact transport during a catalog
+            # page change. The browser sends all selected rows plus its page,
+            # never the complete ingest catalog in this fallback envelope.
+            order = {uid: index for index, uid in enumerate(selection, 1)}
+            live[asset.UI_EDIT_REVISION_KEY] = edit[asset.UI_EDIT_REVISION_KEY]
+            live["assets"] = [dict(row, selected=row["source_uid"] in order,
+                                   selection_order=order.get(row["source_uid"], 0))
+                              for row in live["assets"]]
+            page = {"epoch": library._catalog_search_epoch(live), "version": 1, "total": 6,
+                    "offset": 0, "limit": 1, "sequence": 1, "session_id": "burst-page",
+                    "asset_library_ids": [next(row["asset_library_id"] for row in live["assets"]
+                                               if row["source_uid"] == extra[0])]}
+            edit = library._catalog_page_projection(live, page)
+            assert len(edit["assets"]) < len(live["assets"])
+            edit["assets"] = [dict(row, path="C:/untrusted/other-image.png") for row in edit["assets"]]
+        result = await GriptapeNodes.ahandle_request(SetParameterValueRequest(
+            node_name=library.name, parameter_name=asset.WIDGET_STATE_PARAMETER,
+            value=json.dumps(edit), data_type="str"))
+        assert result.succeeded(), str(result.result_details)
+        retained = library._current_state()
+        actual = retained["shot_routing"]["shots"][0]["selected_source_uids"]
+        assert actual == selection, ("Accepted ImageAsset edit lost its selection", paged, selection, actual)
+        assert {row["source_uid"]: row["path"] for row in retained["assets"]} == source_paths
+
+    async def check_settled(selection):
+        deadline = time.monotonic() + 2
+        while True:
+            current = downstream._current_state()
+            shown = current["image_asset"]["ordered_source_uids"]
+            editable = [row["asset_source_uid"] for row in current["images"] if row.get("asset_source_uid")]
+            if shown == editable == selection:
+                break
+            assert time.monotonic() < deadline, (selection, shown, editable,
+                getattr(downstream, "_hmb_prompt_sync_failure", None), library._current_state()["shot_routing"])
+            await asyncio.sleep(.01)
+        raw = library.parameter_output_values[asset.OUTPUT_PARAMETER]
+        pair = json.loads(raw) if isinstance(raw, str) else raw
+        assert [row["order_key"] for row in pair["ordered_images"]] == selection
+        assert len(library.parameter_output_values[asset.MEDIA_OUTPUT_PARAMETER]) == len(selection)
+
+    await check_settled(expected)
+    for batch in range(8):
+        for click in range(12):
+            uid = extra[(batch + click // 2) % len(extra)]
+            expected = [item for item in expected if item != uid] if uid in expected else [*expected, uid]
+            await submit(expected)
+        expected = [*initial, *extra[batch % 3:batch % 3 + 4]] if batch % 2 == 0 else initial
+        await submit(expected, paged=True)
+        await check_settled(expected)
+    await submit([], paged=True)
+    await check_settled([])
+    await submit(initial)
+    await check_settled(initial)
+    print("Repeated SDK selection: 106 compact and paged edits, exact Prompt editable rows and matching ImageAsset media PASS")
 
 
 async def main():

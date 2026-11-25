@@ -11666,12 +11666,25 @@ class HMBImageAssetLibrary(DataNode):
         if raw.get("schema") == STATE_SCHEMA and raw.get("shot_hierarchy_request"):
             return self._prepare_shot_hierarchy_edit(raw, raw["shot_hierarchy_request"])
         if raw.get("schema") == STATE_SCHEMA and isinstance(raw.get("catalog_page"), dict):
-            # Display pages never replace the full canonical persisted catalog.
+            # The page contains every selected row and a window of browse rows.
+            # Merge its selection intent before restoring the full catalog.
+            # Source paths, registration and metadata remain server-owned.
             base = _parse_mapping(getattr(self, "_hmb_last_accepted_widget_state", ""))
             if not base or base.get("schema") != STATE_SCHEMA:
                 raise ValueError("A display page requires an accepted ImageAsset catalog.")
+            page_assets = raw.get("assets")
+            if not isinstance(page_assets, list):
+                raise ValueError("An ImageAsset page edit is missing its selection rows.")
+            order_by_source = {
+                (_clean(row.get("asset_library_id")), _clean(row.get("source_uid"))):
+                    _non_negative_int(row.get("selection_order"))
+                for row in page_assets if isinstance(row, dict) and row.get("selected") is True
+            }
             raw.pop("catalog_page", None)
-            raw["assets"] = base.get("assets", [])
+            raw["assets"] = []
+            for row in base.get("assets", []):
+                order = order_by_source.get((row["asset_library_id"], row["source_uid"]), 0)
+                raw["assets"].append(dict(row, selected=bool(order), selection_order=order))
             raw["folders"] = base.get("folders", [])
         if raw.get("schema") != IMAGE_ASSET_EDIT_SCHEMA:
             # These commands are workstation preferences. Opening a workflow
