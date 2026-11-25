@@ -75,8 +75,6 @@ function openProjectFolderCards(container, state, options) {
 .hmb-project-folders .pf-card{min-width:0;border:1px solid #42506a;border-radius:6px;background:#131c2c;overflow:hidden}
 .hmb-project-folders .pf-card:has([aria-pressed=true]){border-color:#42c2d4;background:#123444}
 .hmb-project-folders .pf-select{display:flex;align-items:center;gap:10px;width:100%;min-height:50px;text-align:left;border:0;background:transparent}
-.hmb-project-folders .pf-write{display:flex;align-items:center;gap:6px;margin:0;padding:2px 10px 8px;font-size:12px;cursor:pointer}
-.hmb-project-folders .pf-write input{margin:0;accent-color:#6ad9ed}
 .hmb-project-folders .pf-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
 .hmb-project-folders .pf-icon{color:#7ccadc}
 .hmb-project-folders [data-pf-status]{min-height:1.5em;color:#9cabbf;font-size:12px;margin:9px 0}
@@ -88,21 +86,21 @@ function openProjectFolderCards(container, state, options) {
     + '<header><span class="pf-icon" aria-hidden="true">▱</span><span data-pf-title></span><button type="button" data-pf-close>×</button></header>'
     + '<section><label><span data-pf-project-label></span><select data-pf-project></select></label><div class="pf-controls"><strong data-pf-heading></strong><div class="pf-grid" data-pf-cards></div></div>'
     + '<div data-pf-status role="status" aria-live="polite"></div></section>'
-    + '<footer><button type="button" data-pf-add></button><button type="button" data-pf-remove></button><button type="button" data-pf-done></button></footer>';
+    + '<footer><button type="button" data-pf-add></button><button type="button" data-pf-remove></button>'
+    + (sound ? '<button type="button" data-pf-done></button>' : '') + '</footer>';
   const find = name => dialog.querySelector("[data-pf-" + name + "]");
   const select = find("project"), closeButton = find("close"), add = find("add"), remove = find("remove"), done = find("done");
   find("title").textContent = label("프로젝트 Add", "Project Add");
   find("project-label").textContent = label("프로젝트", "Project");
-  find("heading").textContent = sound ? label("추가한 폴더", "Added folders") : label("저장 폴더", "Save folders");
+  find("heading").textContent = sound ? label("추가한 폴더", "Added folders") : label("프로젝트 폴더", "Project folders");
   add.textContent = label("추가", "Add"); remove.textContent = label("삭제", "Remove");
-  done.textContent = label("완료", "Done");
+  if (done) done.textContent = label("완료", "Done");
   closeButton.setAttribute("aria-label", label("닫기", "Close"));
   let project = memory.pending?.project_uid || memory.project, disposed = false, confirmRequest = "";
   const notice = text => { find("status").textContent = text || ""; };
   const profile = () => memory.profiles.get(project);
   const selectedId = () => memory.selections.get(project) || "";
   const writeId = () => profile()?.write_site_id || "hq";
-  const writeGroup = "hmb-folder-write-" + String(globalThis.crypto?.randomUUID?.() || Math.random());
   function useSnapshot(snapshot) {
     // The editor may publish the local project catalog after the dialog opens.
     const available = sound && Array.isArray(snapshot.site_projects) ? snapshot.site_projects : snapshot.projects || [];
@@ -131,13 +129,13 @@ function openProjectFolderCards(container, state, options) {
     const grid = find("cards"); grid.replaceChildren();
     const links = profile()?.links || [];
     const folders = !sound && project ? [
-      {id: "hq", label: label("기본 폴더", "Default folder"), root: projects.get(project)?.path || ""},
       ...links,
+      {id: "hq", label: "Ai_Ct_image", root: projects.get(project)?.path || ""},
     ] : links;
     const pending = memory.pending;
     let selected = selectedId();
     if (!folders.some(folder => folder.id === selected)) {
-      selected = [profile()?.selected_site_id, writeId(), folders[0]?.id].find(id=>folders.some(folder=>folder.id === id)) || "";
+      selected = [profile()?.selected_site_id, folders[0]?.id].find(id=>folders.some(folder=>folder.id === id)) || "";
       memory.selections.set(project, selected);
     }
     for (const item of folders) {
@@ -150,19 +148,10 @@ function openProjectFolderCards(container, state, options) {
       name.className = "pf-name"; name.textContent = item.label || leaf(item.root);
       button.append(icon,name); card.appendChild(button); grid.appendChild(card);
       button.onclick = () => { memory.selections.set(project, item.id); paint(); notice(item.root); };
-      if (!sound) {
-        const field = doc.createElement("label"), radio = doc.createElement("input");
-        radio.type = "radio"; radio.name = writeGroup; radio.dataset.pfWriteSite = item.id;
-        radio.checked = item.id === writeId(); radio.disabled = !!pending || !profile()?.revision;
-        const caption = label("Add 저장 위치", "Add destination");
-        radio.setAttribute("aria-label", caption + " · " + (item.label || leaf(item.root)));
-        radio.onchange = () => { if (radio.checked && item.id !== writeId()) save(profile().links, item.id); };
-        field.className = "pf-write"; field.append(radio, doc.createTextNode(caption)); card.appendChild(field);
-      }
     }
     select.disabled = !!pending;
     add.disabled = !project || !!pending;
-    done.disabled = !project || !!pending;
+    if (done) done.disabled = !project || !!pending;
     remove.disabled = !profile()?.revision || !!pending || !links.some(link => link.id === selected);
   }
   function close() {
@@ -213,7 +202,7 @@ function openProjectFolderCards(container, state, options) {
   }
   select.onchange = () => { memory.project = project = select.value; paint(); notice(""); };
   add.onclick = () => request("browse_add");
-  done.onclick = () => request("confirm", {expected_revision:profile()?.revision || "", selected_site_id:selectedId()});
+  if (done) done.onclick = () => request("confirm", {expected_revision:profile()?.revision || "", selected_site_id:selectedId()});
   remove.onclick = () => {
     const selected = selectedId();
     if (profile()?.links.some(link => link.id === selected)) {
@@ -303,6 +292,9 @@ const IMAGE_ASSET_UI_EDIT_REVISION_KEY = "ui_edit_revision";
 const IMAGE_ASSET_EDIT_SCHEMA = "hmb-image-asset-edit-v1";
 const IMAGE_BASH_WORKSPACE_EDIT_SCHEMA = "hmb-image-bash-workspace-edit-v1";
 const ROOT_FOLDER_KEY = "$root";
+const DEFAULT_FOLDER_KEY = "$default";
+const MY_UPLOAD_LABEL = "My Upload";
+const DEFAULT_FOLDER_LABEL = "Ai_Ct_image";
 const IMAGE_ASSET_STATE_VERSION = 4;
 const IMAGE_TAXONOMY_SCHEMA = "hmb-image-taxonomy";
 const IMAGE_TAXONOMY_VERSION = 3;
@@ -784,6 +776,7 @@ const IMAGE_ASSET_UI_TEXT = {
     search_placeholder: "Search Image Name, Asset ID, path, Main Type, or Sub Type",
     choose_folder: "Select a folder or enter a search term.",
     no_match: "No image asset matches this project folder or search.",
+    no_owned_uploads: "This account has no registered images in this project.",
     selected_images: "SELECTED IMAGES / GENERATOR ORDER",
     drag_hint: "Drag cards; Prompt image order updates automatically.",
     tray_empty: "Select a verified project asset or connect IMAGE_IMPORT_IN.",
@@ -825,16 +818,11 @@ const IMAGE_ASSET_UI_TEXT = {
     register_asset: "Register Asset",
     edit_asset: "Edit registration",
     delete_asset_registration: "Remove registration",
-    confirm_asset_registration_delete: "Confirm removal",
-    asset_registration_delete_notice: "The registration is removed from the library. The image file is kept.",
     import_in: "IMAGE IMPORT IN",
     project_folder: "ASSET FOLDER",
     project_folder_locked: "Existing project assets keep their current folder.",
     project_folder_select: "Select the existing child Asset Folder where the external image will be copied.",
     select_project_folder: "Select Asset Folder",
-    registration_destination: "SAVE LOCATION",
-    registration_destination_select: "Select a save location",
-    registration_destination_default: "Default folder",
     registration_folder_root: "Project folders",
     registration_folder_parent: "Parent folder",
     registration_folder_close: "Close folder chooser",
@@ -849,6 +837,7 @@ const IMAGE_ASSET_UI_TEXT = {
     busy_loading: "Loading project assets…",
     transport_failed: "The change could not be saved. Please try again.",
     refresh_review: "Project media scan review",
+    refresh_folders: "Folders checked",
     refresh_files: "Image files",
     refresh_missing: "Registered paths without files",
     refresh_missing_hint: "These files may have been moved or renamed. Check the paths before removing their registrations.",
@@ -880,6 +869,7 @@ const IMAGE_ASSET_UI_TEXT = {
     search_placeholder: "이미지 이름, 에셋 ID, 경로, 주요 유형 또는 세부 유형 검색",
     choose_folder: "폴더를 선택하거나 검색어를 입력하세요.",
     no_match: "이 프로젝트 폴더 또는 검색 조건에 맞는 이미지 에셋이 없습니다.",
+    no_owned_uploads: "이 프로젝트에 이 계정으로 등록한 이미지가 없습니다.",
     selected_images: "선택 이미지 / 생성기 순서",
     drag_hint: "카드를 드래그하면 프롬프트 이미지 순서가 자동으로 갱신됩니다.",
     tray_empty: "검증된 프로젝트 에셋을 선택하거나 IMAGE_IMPORT_IN을 연결하세요.",
@@ -921,16 +911,11 @@ const IMAGE_ASSET_UI_TEXT = {
     register_asset: "에셋 등록",
     edit_asset: "등록 정보 편집",
     delete_asset_registration: "등록 삭제",
-    confirm_asset_registration_delete: "삭제 확인",
-    asset_registration_delete_notice: "라이브러리에서 등록을 삭제합니다. 이미지 파일은 보관됩니다.",
     import_in: "이미지 가져오기",
     project_folder: "에셋 폴더",
     project_folder_locked: "기존 프로젝트 에셋은 현재 폴더로 고정됩니다.",
     project_folder_select: "외부 이미지를 복사할 기존 하위 에셋 폴더를 선택하세요.",
     select_project_folder: "에셋 폴더 선택",
-    registration_destination: "저장 위치",
-    registration_destination_select: "저장 위치 선택",
-    registration_destination_default: "기본 폴더",
     registration_folder_root: "프로젝트 폴더",
     registration_folder_parent: "상위 폴더",
     registration_folder_close: "폴더 선택 닫기",
@@ -945,6 +930,7 @@ const IMAGE_ASSET_UI_TEXT = {
     busy_loading: "프로젝트 에셋 불러오는 중…",
     transport_failed: "변경 사항을 저장하지 못했습니다. 다시 시도하세요.",
     refresh_review: "프로젝트 미디어 목록 검사 결과",
+    refresh_folders: "검사한 폴더",
     refresh_files: "이미지 파일",
     refresh_missing: "파일이 없는 등록 경로",
     refresh_missing_hint: "파일이 이동되었거나 이름이 바뀌었을 수 있습니다. 등록을 정리하기 전에 경로를 확인하세요.",
@@ -1396,6 +1382,19 @@ function normalizeRelativeFolder(value) {
   return parts.some((part) => part === "..") ? "" : parts.join("/");
 }
 
+function imageAssetSourceView(value) {
+  const view = clean(value).toLowerCase();
+  return ["user", "default"].includes(view) ? view : "project";
+}
+
+function imageAssetCatalogView(state) {
+  return state.my_upload_only ? "owned" : imageAssetSourceView(state.selected_source_view);
+}
+
+function imageAssetCatalogFolder(state) {
+  return state.my_upload_only ? "" : normalizeRelativeFolder(state.selected_folder_path);
+}
+
 const PRODUCTION_PROJECTS_ROOT = "P:/projects";
 const PREVIOUS_PROJECTS_ROOT = "//192.168.200.19/v/projects";
 const RETIRED_PROJECTS_ROOT = "//fin-rcomp1/Composite_Team/projects_AI";
@@ -1548,6 +1547,12 @@ function normalizeAssetRefreshReview(raw) {
     unregistered_paths: uniqueStrings(raw.unregistered_paths),
     cleaned_count: count(raw.cleaned_count),
     backup_path: clean(raw.backup_path),
+    folders: (Array.isArray(raw.folders) ? raw.folders.slice(0, 129) : [])
+      .filter(folder => folder && typeof folder === "object" && clean(folder.label))
+      .map(folder => ({label:clean(folder.label), project_root:clean(folder.project_root),
+        registered_count:count(folder.registered_count), file_count:count(folder.file_count),
+        missing_count:count(folder.missing_count), cleaned_count:count(folder.cleaned_count),
+        backup_path:clean(folder.backup_path)})),
   };
 }
 
@@ -1979,13 +1984,14 @@ function normalizeState(value) {
   const selectedFolderPath = normalizeRelativeFolder(input.selected_folder_path);
   const hasExpandedFolders = Array.isArray(input.expanded_folders);
   const expandedFolders = uniqueStrings(input.expanded_folders)
-    .map((item) => item === ROOT_FOLDER_KEY ? ROOT_FOLDER_KEY : normalizeRelativeFolder(item))
-    .filter((item) => item === ROOT_FOLDER_KEY || folders.includes(item));
+    .map(normalizeRelativeFolder)
+    .filter((item) => item === ROOT_FOLDER_KEY || item === DEFAULT_FOLDER_KEY || folders.includes(item));
   const projectRoot = hmbRelocateImageProjectPath(input.project_root).replaceAll("\\", "/");
-  if (projectRoot && !hasExpandedFolders) expandedFolders.push(ROOT_FOLDER_KEY);
-  const selectedSourceView = clean(input.selected_source_view).toLowerCase() === "user"
-    ? "user"
-    : "project";
+  if (projectRoot && !hasExpandedFolders) expandedFolders.push(ROOT_FOLDER_KEY, DEFAULT_FOLDER_KEY);
+  if (selectedFolderPath && !selectedFolderPath.startsWith("site:") && !expandedFolders.includes(DEFAULT_FOLDER_KEY)) {
+    expandedFolders.push(DEFAULT_FOLDER_KEY);
+  }
+  const selectedSourceView = imageAssetSourceView(input.selected_source_view);
   const selectedMainType = clean(input.selected_main_type);
   const selectedSubType = clean(input.selected_sub_type);
   const shotRouting = normalizeImageAssetShotRouting(input.shot_routing, assets);
@@ -2045,6 +2051,7 @@ function normalizeState(value) {
     selected_main_type: selectedMainType,
     selected_sub_type: selectedSubType,
     selected_source_view: selectedSourceView,
+    my_upload_only: input.my_upload_only === true,
     search: clean(input.search).slice(0, 256),
     language: clean(input.language).toLowerCase() === "en" ? "en" : "ko",
     asset_view_mode: clean(input.asset_view_mode).toLowerCase() === "detail" ? "detail" : "image",
@@ -3014,7 +3021,7 @@ export function hmbBuildImageAssetCompactEdit(state, acceptedIdentity) {
   const edits = {};
   for (const field of [
     "root_edit_enabled", "selected_folder_path", "expanded_folders", "selected_main_type",
-    "selected_sub_type", "selected_source_view", "search", "language", "asset_view_mode",
+    "selected_sub_type", "selected_source_view", "my_upload_only", "search", "language", "asset_view_mode",
     "refresh_revision", "thumbnail_request", "asset_registration_request",
     "asset_cleanup_request", "disconnect_import_uid", "shot_routing", "shot_hierarchy", "shot_hierarchy_request",
     "image_bash_workspace", "image_bash_active", "image_bash_workspace_request", "image_bash_workspace_edit",
@@ -3382,6 +3389,16 @@ function buildFolderTree(state) {
     return node.assetCount;
   };
   finalize(root);
+  if (state.project_root) {
+    const linkedFolders = root.children.filter((node) => node.path.startsWith("site:"));
+    const defaultFolders = root.children.filter((node) => !node.path.startsWith("site:"));
+    const linkedAssetCount = linkedFolders.reduce((total, node) => total + node.assetCount, 0);
+    root.children = [
+      ...linkedFolders,
+      {key: DEFAULT_FOLDER_KEY, path: "", label: DEFAULT_FOLDER_LABEL, sourceView: "default",
+        children: defaultFolders, assetCount: Math.max(0, root.assetCount - linkedAssetCount)},
+    ];
+  }
   const importedAssets = state.assets.filter((asset) => asset.source_kind === "user");
   if (importedAssets.length || Number(state.catalog_page && state.status?.user_asset_count)>0) {
     root.children.push({
@@ -3398,10 +3415,9 @@ function buildFolderTree(state) {
 
 function renderFolderNode(node, state, depth = 0) {
   const expanded = state.expanded_folders.includes(node.key);
-  const sourceView = node.sourceView === "user" ? "user" : "project";
-  const selected = sourceView === "user"
-    ? state.selected_source_view === "user"
-    : state.selected_source_view !== "user" && state.selected_folder_path === node.path;
+  const sourceView = imageAssetSourceView(node.sourceView);
+  const selected = state.selected_source_view === sourceView
+    && state.selected_folder_path === node.path;
   const hasChildren = node.children.length > 0;
   const row = `
     <button class="tree-row ${node.key === ROOT_FOLDER_KEY ? "root" : ""} ${selected ? "active" : ""}"
@@ -3418,6 +3434,9 @@ function renderFolderNode(node, state, depth = 0) {
 }
 
 function folderAssets(state) {
+  if (state.my_upload_only) {
+    return state.assets.filter((asset) => asset.registration_revision);
+  }
   if (state.selected_source_view === "user") {
     return state.assets.filter((asset) => asset.source_kind === "user");
   }
@@ -3425,6 +3444,7 @@ function folderAssets(state) {
   return state.assets.filter((asset) => {
     if (asset.source_kind !== "project") return false;
     const relative = clean(asset.relative_path).replaceAll("\\", "/").toLowerCase();
+    if (state.selected_source_view === "default") return !relative.startsWith("site:");
     if (folder && !(relative === folder || relative.startsWith(`${folder}/`))) return false;
     return true;
   });
@@ -3440,7 +3460,7 @@ function hmbCatalogPage(value) {
 }
 
 function hmbImageAssetCatalogFingerprint(assets) {
-  const fields=["asset_id","image_name","relative_path","image_main_type","image_sub_type","source_kind","asset_library_id","source_uid"];
+  const fields=["asset_id","image_name","relative_path","image_main_type","image_sub_type","source_kind","asset_library_id","source_uid","registration_revision"];
   return JSON.stringify((Array.isArray(assets)?assets:[]).map(asset=>fields.map(key=>clean(asset?.[key]))));
 }
 
@@ -3478,8 +3498,8 @@ export function hmbRequestImageAssetCatalogPage(container,state,offset=0) {
   if(!control || !imageAssetGridVisible(container, state) || control.disabledContext===hmbCatalogPageContextKey(state)
     || entry?.catalogPageVersion!==1 || !context.project_uid || !entry.dispatch)return false;
   const request={schema:"hmb-image-asset-thumbnail-bridge",version:1,operation:"catalog_page",phase:"request",...context,
-    session_id:control.session,query:String(state.search||"").slice(0,256).trim(),folder:normalizeRelativeFolder(state.selected_folder_path),
-    source_view:state.selected_source_view==="user"?"user":"project",offset:Math.max(0,Number(offset)||0),limit:80};
+    session_id:control.session,query:String(state.search||"").slice(0,256).trim(),folder:imageAssetCatalogFolder(state),
+    source_view:imageAssetCatalogView(state),offset:Math.max(0,Number(offset)||0),limit:80};
   const key=JSON.stringify(request);
   if(control.key===key && control.pending)return true;
   const page=hmbCatalogPage(state.catalog_page);
@@ -3531,8 +3551,8 @@ function hmbInstallImageAssetCatalogPages(container,getState,accept,acceptFallba
     if(JSON.stringify(hmbCatalogPageContext(result.state))!==JSON.stringify(hmbCatalogPageContext(state)))return false;
     const page=hmbCatalogPage(result.state?.catalog_page);if(!page || page.session_id!==control.session || page.sequence!==request.sequence)return false;
     if(page.query!==request.query || page.folder!==request.folder || page.source_view!==request.source_view)return false;
-    if(String(state.search||"").slice(0,256).trim()!==request.query || normalizeRelativeFolder(state.selected_folder_path)!==request.folder
-      || state.selected_source_view!==request.source_view)return false;
+    if(String(state.search||"").slice(0,256).trim()!==request.query || imageAssetCatalogFolder(state)!==request.folder
+      || imageAssetCatalogView(state)!==request.source_view)return false;
     clearTimeout(control.timer);control.pending=null;control.key="";control.acceptedContext=hmbCatalogPageContextKey(state);
     accept(result.state);return true;
   };
@@ -3919,12 +3939,17 @@ function imageFolderLabel(state, folder, fallback) {
   return state.site_settings?.links?.find(link => link.id === imageFolderSite(folder))?.label || fallback;
 }
 
-export function hmbImageAssetCanRegister(asset, state) {
+function imageFolderDisplayPath(state, pathname) {
+  const path = clean(pathname);
+  if (!path.startsWith("site:")) return path;
+  const [root, ...parts] = path.split("/");
+  return [imageFolderLabel(state, root, root), ...parts].join("/");
+}
+
+export function hmbImageAssetCanRegister(asset) {
   if (!asset || typeof asset !== "object" || asset.registered) return false;
   const sourceKind = clean(asset.source_kind).toLowerCase();
-  if (!sourceKind || sourceKind === "project") {
-    return !state || imageFolderSite(asset.relative_path) === (state.site_settings?.write_site_id || "hq");
-  }
+  if (!sourceKind || sourceKind === "project") return true;
   return sourceKind === "user"
     && Number(asset.import_index || 0) > 0;
 }
@@ -3939,7 +3964,7 @@ function assetThumbnailHtml(asset, state) {
   const source = imageSource(asset);
   const failed = !source && hmbImageAssetThumbnailFailed(asset);
   const sourceName = clean(asset.image_name) || clean(asset.asset_id) || "Image";
-  const add = hmbImageAssetCanRegister(asset, state)
+  const add = hmbImageAssetCanRegister(asset)
     ? `<button type="button" class="asset-add" data-asset-add aria-label="${escapeHtml(imageAssetText(state, "add_image_asset"))}">${escapeHtml(imageAssetText(state, "add"))}</button>`
     : "";
   const edit = asset.registration_revision
@@ -3972,6 +3997,7 @@ function renderAssetCard(asset, selectedCount, search, state, shot = activeImage
     : imageAssetTaxonomyLabel(state, asset.image_main_type) || unclassified;
   const subUnassigned = imageAssetText(state, "sub_unassigned");
   const extension = (asset.extension || ".img").replace(".", "").toUpperCase() || "IMG";
+  const location = imageFolderDisplayPath(state, asset.relative_path || asset.media_ref_kind);
   return `
     <article class="asset-card ${selectedForShot ? "selected" : ""} ${selectionBlocked ? "selection-blocked" : ""} ${selectable ? "" : "unregistered"}"
       data-asset-key="${escapeHtml(asset.asset_library_id)}"
@@ -3993,7 +4019,7 @@ function renderAssetCard(asset, selectedCount, search, state, shot = activeImage
         <div class="asset-meta">
           <b title="${escapeHtml(imageAssetText(state, "main_type"))}: ${escapeHtml(sourceTypeLabel)}">${escapeHtml(sourceTypeLabel)}</b>
           <span title="${escapeHtml(imageAssetText(state, "sub_type"))}: ${escapeHtml(imageAssetTaxonomyLabel(state, asset.image_sub_type) || subUnassigned)}">${escapeHtml(imageAssetTaxonomyLabel(state, asset.image_sub_type) || subUnassigned)}</span>
-          <span class="asset-location" title="${escapeHtml(`${dimensions} · ${asset.relative_path || asset.media_ref_kind}`)}">${escapeHtml(dimensions)} · ${escapeHtml(asset.relative_path || asset.media_ref_kind)}</span>
+          <span class="asset-location" title="${escapeHtml(`${dimensions} · ${location}`)}">${escapeHtml(dimensions)} · ${escapeHtml(location)}</span>
         </div>
       </div>
     </article>
@@ -4006,7 +4032,7 @@ export function hmbImageAssetCatalogWindow(
   offset = 0,
 ) {
   const page=hmbCatalogPage(state?.catalog_page);
-  if(page){const byId=new Map(state.assets.map(asset=>[asset.asset_library_id,asset]));return {
+  if(page && page.source_view === imageAssetCatalogView(state)){const byId=new Map(state.assets.map(asset=>[asset.asset_library_id,asset]));return {
     matches:{length:page.total},rendered:page.asset_library_ids.map(id=>byId.get(id)).filter(Boolean),
     offset:page.offset,limit:page.limit};}
   const matches = folderAssets(state).filter((asset) => assetMatchesSearch(asset, state.search));
@@ -4809,7 +4835,7 @@ function imageAssetBrowseKey(state) {
 }
 
 function imageAssetGridVisible(container, state) {
-  return Boolean(clean(state.search) || state.selected_folder_path || state.selected_source_view === "user"
+  return Boolean(state.my_upload_only || clean(state.search) || state.selected_folder_path || state.selected_source_view !== "project"
     || container?.__hmbImageAssetBrowseKey === imageAssetBrowseKey(state));
 }
 
@@ -4828,7 +4854,8 @@ export function hmbRenderImageAssetGrid(
     .join("");
   const empty = windowed.matches.length
     ? ""
-    : `<div class="empty" data-search-empty>${escapeHtml(imageAssetText(state, "no_match"))}</div>`;
+    : `<div class="empty" data-search-empty>${escapeHtml(imageAssetText(state,
+      state.my_upload_only && !clean(state.search) ? "no_owned_uploads" : "no_match"))}</div>`;
   const first = windowed.rendered.length ? windowed.offset + 1 : 0;
   const last = windowed.offset + windowed.rendered.length;
   const previous = windowed.offset > 0
@@ -5462,11 +5489,19 @@ export function hmbFlushImageAssetSelectionCommit(container) {
 
 export function hmbScheduleImageAssetSelectionCommit(container, commit) {
   if (!container || typeof commit !== "function") return 0;
+  const mountToken = Number(container.__hmbImageAssetMountToken) || 0;
+  const queued = container.__hmbImageAssetSelectionCommitJob;
+  if (queued && !queued.settled && queued.mountToken === mountToken) {
+    // Every click already paints its feedback. Keep the first click's frame
+    // and timer so the native graph also advances during a continuous burst.
+    queued.commit = commit;
+    return queued.token;
+  }
   hmbCancelImageAssetSelectionCommit(container);
   const token = ++imageAssetSelectionCommitSequence;
   const job = {
     token,
-    mountToken: Number(container.__hmbImageAssetMountToken) || 0,
+    mountToken,
     commit,
     settled: false,
     firstFrame: null,
@@ -5510,7 +5545,7 @@ export function hmbImageAssetRegistrationSubTypes(taxonomy, sourceType) {
 }
 
 export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}, state) {
-  if (!asset?.registration_revision && !hmbImageAssetCanRegister(asset, state)) return null;
+  if (!asset?.registration_revision && !hmbImageAssetCanRegister(asset)) return null;
   const assetMainType = clean(asset.image_main_type);
   const assetSubType = clean(asset.image_sub_type);
   const sourceType = assetMainType !== "Select Image Main Type" ? assetMainType : "";
@@ -5519,9 +5554,6 @@ export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}, state
   const lockedFolder = relativePath.includes("/")
     ? relativePath.slice(0, relativePath.lastIndexOf("/"))
     : ROOT_FOLDER_KEY;
-  const writer = state?.site_settings?.write_site_id || "hq";
-  const chooseDestination = sourceKind === "user" && Boolean(state?.site_settings?.links?.length);
-  const defaultFolder = writer === "hq" ? "add" : `site:${writer}/add`;
   return {
     asset_library_id: clean(asset.asset_library_id),
     site_settings_revision: clean(state?.site_settings?.revision),
@@ -5529,9 +5561,9 @@ export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}, state
     source_uid: clean(asset.source_uid),
     relative_path: relativePath,
     ...(asset.registration_revision ? {registration_revision: asset.registration_revision} : {}),
-    ...(chooseDestination ? {target_site_id: writer} : {}),
-    target_folder: sourceKind === "project" ? lockedFolder : defaultFolder,
-    target_folder_confirmed: true,
+    target_folder: sourceKind === "project" ? lockedFolder : "",
+    target_folder_confirmed: sourceKind === "project",
+    ...(sourceKind === "user" ? {folder_picker_path: ""} : {}),
     image_name: (clean(asset.registration_default_name) || clean(asset.image_name)).slice(0, 256),
     asset_id: clean(asset.asset_id).slice(0, 256),
     image_main_type: sourceType,
@@ -5663,8 +5695,7 @@ function registrationDraftIsComplete(draft) {
     && (
       draft?.source_kind !== "user"
       || (
-        draft?.target_site_id !== ""
-        && draft?.target_folder_confirmed
+        draft?.target_folder_confirmed
         && typeof draft.folder_picker_path !== "string"
         && clean(draft?.target_folder)
         && clean(draft?.target_folder) !== ROOT_FOLDER_KEY
@@ -5673,29 +5704,30 @@ function registrationDraftIsComplete(draft) {
   );
 }
 
-function registrationFolderRoot(state, draft) {
-  const site = draft.target_site_id || state.site_settings?.write_site_id || "hq";
-  return site === "hq" ? "" : `site:${site}`;
-}
-
 function registrationFolderContents(state, draft) {
   const text = (key) => escapeHtml(imageAssetText(state, key));
-  const root = registrationFolderRoot(state, draft);
-  const rootLabel = root ? imageFolderLabel(state, root, root) : imageAssetText(state, "registration_folder_root");
-  const folderLabel = (path) => root
-    ? (path === root ? rootLabel : `${rootLabel} / ${path.slice(root.length + 1)}`)
-    : path || rootLabel;
+  const roots = new Map((state.site_settings?.links || []).map(link => [`site:${link.id}`, link.label]));
+  roots.set(DEFAULT_FOLDER_KEY, "Ai_Ct_image");
+  const folderLabel = (path) => {
+    const [root, ...parts] = path.split("/");
+    return path ? [roots.get(root) || root, ...parts].join(" / ") : imageAssetText(state, "registration_folder_root");
+  };
   const current = draft.folder_picker_path;
   if (typeof current !== "string") {
     const selected = draft.target_folder_confirmed ? clean(draft.target_folder) : "";
-    const label = selected ? escapeHtml(folderLabel(selected)) : text("select_project_folder");
-    return `<button type="button" class="passport-folder-trigger" data-registration-folder-action="open" aria-expanded="false" ${draft.target_site_id === "" ? "disabled" : ""}><span>${label}</span><span aria-hidden="true">⌄</span></button>`;
+    const display = selected && !selected.startsWith("site:") && selected !== DEFAULT_FOLDER_KEY ? `${DEFAULT_FOLDER_KEY}/${selected}` : selected;
+    return `<button type="button" class="passport-folder-trigger" data-registration-folder-action="open" aria-expanded="false"><span>${display ? escapeHtml(folderLabel(display)) : text("select_project_folder")}</span><span aria-hidden="true">⌄</span></button>`;
   }
 
-  const available = new Set(state.folders.filter(folder => clean(folder) && folder !== root
-    && folder !== ROOT_FOLDER_KEY && imageFolderSite(folder) === (root ? imageFolderSite(root) : "hq")
-    && !isUserImportFolder(root ? folder.slice(root.length + 1) : folder)));
-  available.add(root ? `${root}/add` : "add");
+  const available = new Set(roots.keys());
+  for (const folder of state.folders) {
+    if (!folder || folder === ROOT_FOLDER_KEY || folder === DEFAULT_FOLDER_KEY) continue;
+    const site = imageFolderSite(folder);
+    const root = site === "hq" ? DEFAULT_FOLDER_KEY : `site:${site}`;
+    const relative = site === "hq" ? folder : folder.slice(root.length + 1);
+    if (!roots.has(root) || !relative || isUserImportFolder(relative)) continue;
+    available.add(`${root}/${relative}`);
+  }
   const prefix = current ? `${current}/` : "";
   const children = new Map();
   for (const folder of available) {
@@ -5707,10 +5739,10 @@ function registrationFolderContents(state, draft) {
   const selectCurrent = available.has(current)
     ? `<button type="button" class="passport-folder-here" data-registration-folder-action="choose" data-registration-folder-path="${escapeHtml(current)}">${text("registration_folder_choose")}</button>` : "";
   const rows = [...children].map(([path, hasChildren]) =>
-    `<button type="button" data-registration-folder-action="${hasChildren ? "enter" : "choose"}" data-registration-folder-path="${escapeHtml(path)}"><span>${escapeHtml(path.slice(prefix.length))}</span>${hasChildren ? '<span aria-hidden="true">›</span>' : ""}</button>`).join("");
+    `<button type="button" data-registration-folder-action="${hasChildren || !current ? "enter" : "choose"}" data-registration-folder-path="${escapeHtml(path)}"><span>${escapeHtml(current ? path.slice(prefix.length) : roots.get(path))}</span>${hasChildren || !current ? '<span aria-hidden="true">›</span>' : ""}</button>`).join("");
   const heading = escapeHtml(folderLabel(current));
   return `<div class="passport-folder-nav">
-    ${current !== root ? `<button type="button" data-registration-folder-action="back" aria-label="${text("registration_folder_parent")}">‹</button>` : ""}
+    ${current ? `<button type="button" data-registration-folder-action="back" aria-label="${text("registration_folder_parent")}">‹</button>` : ""}
     <b title="${heading}">${heading}</b>
     <button type="button" data-registration-folder-action="close" aria-label="${text("registration_folder_close")}">&times;</button>
   </div><div class="passport-folder-list" role="group" aria-label="${heading}">
@@ -5720,21 +5752,8 @@ function registrationFolderContents(state, draft) {
 
 function registrationFolderField(state, draft, externalImport) {
   if (!externalImport) return "";
-  const text = (key) => escapeHtml(imageAssetText(state, key));
-  const destination = typeof draft.target_site_id === "string"
-    ? `<label class="passport-destination"><span>${text("registration_destination")}</span>
-        <select data-registration-destination ${draft.saving ? "disabled" : ""}>
-          <option value="">${text("registration_destination_select")}</option>
-          ${[
-            {id: "hq", label: imageAssetText(state, "registration_destination_default")},
-            ...(state.site_settings?.links || []),
-          ].map(({id, label, root}) =>
-            `<option value="${escapeHtml(id)}" title="${escapeHtml(root || state.project_root)}" ${draft.target_site_id === id ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
-        </select></label>`
-    : "";
   return (
-    destination
-    + `<div class="passport-folder" data-registration-folder title="${text("project_folder_select")}">`
+    `<div class="passport-folder" data-registration-folder title="${escapeHtml(imageAssetText(state, "project_folder_select"))}">`
     + `<span>${escapeHtml(imageAssetText(state, "project_folder"))}</span>`
     + `<div class="passport-folder-controls">${registrationFolderContents(state, draft)}</div>`
     + "</div>"
@@ -5751,7 +5770,7 @@ function renderRegistrationDialog(state, draft) {
     !asset
     || (draft.registration_revision
       ? draft.registration_revision !== asset.registration_revision
-      : !hmbImageAssetCanRegister(asset, state))
+      : !hmbImageAssetCanRegister(asset))
   ) return "";
   const mainTypes = uniqueStrings([
     ...registrationMainTypes(state.taxonomy),
@@ -5779,7 +5798,7 @@ function renderRegistrationDialog(state, draft) {
           <button type="button" data-registration-cancel aria-label="${escapeHtml(imageAssetText(state, "close_registration"))}">&times;</button>
         </header>
         <div class="passport-photo ${thumbnailSource ? "" : thumbnailFailed ? "fallback thumbnail-failed" : "fallback thumbnail-loading"}" data-thumbnail-loading="${thumbnailSource || thumbnailFailed ? "false" : "true"}" data-thumbnail-failed="${thumbnailFailed ? "true" : "false"}">${thumbnailImageMarkup(asset)}</div>
-        <div class="passport-file"><b>${escapeHtml(asset.relative_path || asset.path || asset.media_ref_kind)}</b><span>${asset.width && asset.height ? `${asset.width} × ${asset.height}` : escapeHtml(imageAssetText(state, "metadata_pending"))}</span></div>
+        <div class="passport-file"><b>${escapeHtml(imageFolderDisplayPath(state, asset.relative_path || asset.path || asset.media_ref_kind))}</b><span>${asset.width && asset.height ? `${asset.width} × ${asset.height}` : escapeHtml(imageAssetText(state, "metadata_pending"))}</span></div>
         <div class="passport-fields">
           ${registrationFolderField(state, draft, externalImport)}
           <label><span>${escapeHtml(imageAssetText(state, "final_image_name"))}</span><input data-registration-field="image_name" maxlength="256" value="${escapeHtml(draft.image_name)}"/></label>
@@ -5792,7 +5811,7 @@ function renderRegistrationDialog(state, draft) {
         <div role="status" data-registration-status>${escapeHtml(draft.save_message || "")}</div>
         <footer class="passport-actions">
           <button type="button" data-registration-cancel>${escapeHtml(imageAssetText(state, "cancel"))}</button>
-          ${draft.registration_revision ? `<button type="button" data-registration-delete ${draft.saving ? "disabled" : ""}>${escapeHtml(imageAssetText(state, draft.confirm_delete ? "confirm_asset_registration_delete" : "delete_asset_registration"))}</button>` : ""}
+          ${draft.registration_revision ? `<button type="button" data-registration-delete ${draft.saving ? "disabled" : ""}>${escapeHtml(imageAssetText(state, "delete_asset_registration"))}</button>` : ""}
           ${externalImport && state.image_bash_active && state.image_bash_workspace?.workspace_id ? `<button type="button" data-registration-bash-add ${draft.bash_pending || state.image_bash_workspace.instances.length >= MAX_SELECTED_IMAGES ? "disabled" : ""}>HMBImageBash에 추가</button>` : ""}
           <button type="button" class="passport-register" data-registration-submit ${registrationDraftIsComplete(draft) && !draft.bash_pending && !draft.saving ? "" : "disabled"}>${escapeHtml(draft.registration_revision ? (state.language === "ko" ? "저장" : "Save") : imageAssetText(state, "register_asset"))}</button>
         </footer>
@@ -5867,13 +5886,19 @@ export function hmbRenderImageAssetRefreshReview(state, view) {
     ? `<ul>${items.map((path) => `<li>${escapeHtml(path)}</li>`).join("")}</ul>`
     : `<p>${label("refresh_none")}</p>`;
   const canClean = hmbImageAssetRefreshCleanupEligible(state, review) && !busy && !state.scan_busy;
+  const folders = review.folders || [];
   return `<div class="asset-registration-backdrop asset-refresh-backdrop nodrag nopan nowheel" data-refresh-review-backdrop>
     <section class="asset-passport asset-refresh-review" role="dialog" aria-modal="true" aria-label="${label(confirming ? "refresh_confirm" : "refresh_review")}" ${busy ? 'aria-busy="true"' : ""}>
       <header class="passport-head" data-hmb-popup-header><div><small>${label("project")} · ${escapeHtml(review.project_id)}</small><h2>${label(confirming ? "refresh_confirm" : "refresh_review")}</h2></div><button type="button" data-refresh-review-cancel aria-label="${label("refresh_close")}">&times;</button></header>
       <div class="refresh-review-body">
         <p class="refresh-review-root">${escapeHtml(review.project_root)}</p>
         <p>${label("registered")}: ${review.registered_count} · ${label("refresh_files")}: ${review.file_count}</p>
-        ${review.status === "cleaned" ? `<p role="status">${label("refresh_cleaned")}: ${review.cleaned_count}</p>${review.backup_path ? `<p>${label("refresh_backup")}: <span class="refresh-review-path">${escapeHtml(review.backup_path)}</span></p>` : ""}` : ""}
+        ${review.status === "cleaned" ? `<p role="status">${label("refresh_cleaned")}: ${review.cleaned_count}</p>${review.backup_path && folders.length < 2 ? `<p>${label("refresh_backup")}: <span class="refresh-review-path">${escapeHtml(review.backup_path)}</span></p>` : ""}` : ""}
+        ${folders.length > 1 ? `<h3>${label("refresh_folders")}</h3><ul>${folders.map(folder => `
+          <li title="${escapeHtml(folder.project_root)}"><strong>${escapeHtml(folder.label)}</strong> ·
+            ${label("registered")}: ${folder.registered_count} · ${label("refresh_files")}: ${folder.file_count} · ${label("refresh_missing")}: ${folder.missing_count}
+            ${folder.cleaned_count ? ` · ${label("refresh_cleaned")}: ${folder.cleaned_count}` : ""}
+            ${folder.backup_path ? `<div>${label("refresh_backup")}: <span class="refresh-review-path">${escapeHtml(folder.backup_path)}</span></div>` : ""}</li>`).join("")}</ul>` : ""}
         ${view.error || review.error ? `<p class="refresh-review-error" role="alert">${escapeHtml(view.error || review.error)}</p>` : ""}
         ${review.status === "review" && !review.safe_to_clean ? `<p class="refresh-review-error">${label("refresh_unsafe")}</p>` : ""}
         <h3>${label("refresh_missing")}: ${review.missing_count}</h3><p>${label("refresh_missing_hint")}</p>${paths(review.missing_paths)}
@@ -6406,9 +6431,14 @@ function render(
     ? ` data-hmb-wheel-key="${escapeHtml(JSON.stringify([section, state.project_root, activeShot.shot_uuid, folder]))}"` : "";
   const activePalette = hmbImageAssetShotPalette(activeShot?.number || 1);
   const statusText = hmbImageAssetDisplayStatus(state);
-  const filterLabel = state.selected_source_view === "user"
-    ? imageAssetText(state, "import_in")
-    : state.selected_folder_path || imageAssetText(state, "project_root");
+  const selectedFolderPath = state.selected_folder_path;
+  const filterLabels = {
+    user: imageAssetText(state, "import_in"), default: DEFAULT_FOLDER_LABEL,
+  };
+  const filterLabel = state.my_upload_only ? imageAssetText(state, "project_root")
+    : filterLabels[state.selected_source_view] || (selectedFolderPath
+    ? imageFolderDisplayPath(state, selectedFolderPath)
+    : imageAssetText(state, "project_root"));
   const detailView = state.asset_view_mode === "detail";
   const viewToggleLabel = imageAssetText(state, detailView ? "image_only_view" : "details_view");
   return `
@@ -6420,13 +6450,14 @@ function render(
       .hmb-image-assets{--bg:#090c16;--panel:#101523;--line:rgba(148,163,184,.19);--accent:#22d3ee;--pink:#f472b6;--asset-selection:#f472b6;--text:#e6edf7;--muted:#8fa3b8;--selection-rgb:244,114,182;--selection-deep-rgb:190,24,93;--selection-secondary-rgb:217,70,239;--selection-text:#f8c6df;--selection-soft:#f3a8ce;--selection-strong:#ffe4f2;--selection-panel:rgba(30,14,30,.9);--selection-card:rgba(61,23,49,.6);--header-tint:rgba(72,35,101,.44);container-type:inline-size;position:relative;width:100%;height:100%;min-height:680px;display:grid;grid-template-rows:58px minmax(0,1fr);overflow:hidden;border:1px solid var(--line);border-radius:11px;background:radial-gradient(circle at 8% -10%,rgba(168,85,247,.16),transparent 34%),linear-gradient(180deg,#0b1020,#060912);color:var(--text);font-family:"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif;font-synthesis:none;-webkit-font-smoothing:antialiased;box-sizing:border-box}
       .hmb-image-assets *{box-sizing:border-box;min-width:0}.top{display:flex;align-items:center;gap:12px;padding:8px 13px;border-bottom:1px solid var(--line);background:linear-gradient(90deg,rgba(72,35,101,.44),rgba(14,23,38,.9) 44%)}.mark{flex:0 0 35px;width:35px;height:35px;display:grid;place-items:center;border:1px solid rgba(34,211,238,.7);border-radius:8px;background:rgba(8,145,178,.12);color:var(--accent);font-size:11px;font-weight:950}.heading{display:flex;flex:0 1 auto;flex-direction:column;gap:2px;overflow:hidden}.heading b{overflow:hidden;font-size:15px;letter-spacing:.01em;white-space:nowrap;text-overflow:ellipsis}.heading span{max-width:360px;color:var(--muted);font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.project-switch{margin-left:auto;display:grid;grid-template-columns:auto auto minmax(150px,260px);align-items:center;gap:7px;min-width:0}.project-actions{display:flex;align-items:center;gap:5px}.project-action{width:31px;height:31px;display:grid;place-items:center;padding:0;border:1px solid rgba(96,165,250,.5);border-radius:7px;background:linear-gradient(180deg,rgba(37,99,235,.3),rgba(15,23,42,.9));color:#93c5fd;font-size:12px;font-weight:950;cursor:pointer}.project-action:hover{border-color:var(--accent);color:#fff;box-shadow:0 0 10px rgba(34,211,238,.2)}.project-action svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.project-switch label{min-width:max-content;color:#aebed0;font-size:8px;font-weight:900;letter-spacing:.08em;white-space:nowrap;word-break:keep-all}.project-switch select{width:100%;height:31px;border:1px solid rgba(148,163,184,.28);border-radius:7px;background:#080d17;color:#edf5ff;padding:0 8px;font-size:10px;outline:none}.project-switch select:focus{border-color:var(--accent)}.status{display:flex;flex:0 1 auto;flex-direction:column;align-items:flex-end;gap:2px;font-size:8px;color:var(--muted)}.status strong{max-width:260px;color:${state.error ? "#fda4af" : "#86efac"};white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       .workspace{display:grid;grid-template-columns:minmax(230px,252px) minmax(0,1fr);gap:8px;min-height:0;padding:8px}.panel{min-height:0;border:1px solid var(--line);border-radius:9px;background:rgba(8,13,23,.76);overflow:hidden}.tree-panel{display:flex;flex-direction:column}.panel-title{height:35px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 10px;border-bottom:1px solid var(--line);background:rgba(19,27,42,.78);color:#bed0e3;font-size:9px;font-weight:900;letter-spacing:.07em}.panel-title>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;word-break:keep-all}.panel-title b{flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--accent);font-size:8px}.tree{padding:6px;overflow:auto;scrollbar-gutter:stable}.tree-row{width:100%;min-height:30px;display:grid;grid-template-columns:13px minmax(0,1fr) auto;align-items:center;gap:5px;margin:0 0 3px;padding:5px 8px 5px calc(8px + var(--tree-depth,0) * 14px);border:1px solid transparent;border-radius:6px;background:transparent;color:#96a9bd;font-size:8px;text-align:left;cursor:pointer;transition:border-color 120ms ease,background-color 120ms ease,color 120ms ease}.tree-row i{color:#61778c;font-style:normal}.tree-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tree-row b{color:#587087}.tree-row:hover{border-color:rgba(34,211,238,.3);color:#def9ff}.tree-row.active{border-color:rgba(34,211,238,.52);background:linear-gradient(90deg,rgba(8,145,178,.2),rgba(8,145,178,.04));color:#e7fcff}.tree-row.root{min-height:35px;color:#fff;font-size:10px;font-weight:850}
-      .assets-panel{display:flex;flex-direction:column}.toolbar{height:44px;display:flex;align-items:center;gap:8px;padding:7px 9px;border-bottom:1px solid var(--line)}.toolbar input{flex:1;height:30px;border:1px solid rgba(148,163,184,.25);border-radius:7px;background:#070c15;color:#edf5ff;padding:0 9px;font-size:9px;outline:none}.toolbar input:focus{border-color:var(--accent)}.filter-chip{max-width:260px;padding:5px 8px;border:1px solid rgba(244,114,182,.3);border-radius:99px;background:rgba(131,24,67,.1);color:#f8c6df;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-scroll{flex:1;min-height:0;overflow:auto;scrollbar-gutter:stable;padding:9px}.asset-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px}.asset-card{display:grid;grid-template-columns:112px minmax(0,1fr);gap:10px;min-height:152px;padding:9px;border:1px solid rgba(148,163,184,.16);border-radius:9px;background:linear-gradient(145deg,rgba(19,27,42,.86),rgba(9,14,24,.82));cursor:pointer;outline:none;content-visibility:auto;contain-intrinsic-size:167px;transition:border-color 120ms ease,box-shadow 120ms ease,background-color 120ms ease,opacity 120ms ease}.asset-card:hover{border-color:rgba(34,211,238,.34)}.asset-card:focus-visible{box-shadow:0 0 0 2px rgba(34,211,238,.45)}.asset-card.selected{border-color:var(--asset-selection);box-shadow:inset 0 0 0 .3px rgba(244,114,182,.45),0 0 15px rgba(244,114,182,.34),0 0 4px rgba(217,70,239,.55)}.asset-card.selection-blocked{opacity:.58}.asset-card.unregistered{cursor:default}.asset-card.unregistered .asset-state{color:#f3a8ce}.asset-thumb{position:relative;width:112px;height:132px;display:grid;grid-template-rows:2fr 1fr;overflow:hidden;border:1px solid rgba(148,163,184,.2);border-radius:7px;background:#050910;color:#648198;font-size:9px;font-weight:900}.asset-thumb-media{position:relative;display:grid;place-items:center;min-height:0;overflow:hidden;border-bottom:1px solid rgba(148,163,184,.18)}.asset-thumb-media img{width:100%;height:100%;object-fit:cover}.asset-thumb-media>span{display:none}.asset-thumb.fallback .asset-thumb-media img{display:none}.asset-thumb.fallback .asset-thumb-media>span{display:block}.asset-thumb-footer{display:flex;align-items:center;justify-content:center;gap:6px;min-height:0;padding:4px 6px;background:linear-gradient(180deg,#080d16,#050810)}.asset-source-name{min-width:0;flex:1;color:#a8bdd0;font-size:8px;font-weight:800;line-height:1.25;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-extension-badge{flex:0 0 auto;max-width:48px;padding:3px 5px;border:1px solid rgba(34,211,238,.4);border-radius:5px;background:rgba(8,145,178,.1);color:var(--accent);font-family:inherit;font-size:7px;font-weight:900;line-height:1;letter-spacing:.07em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-thumb-media .asset-add{position:absolute;right:5px;bottom:5px;z-index:2}.asset-add{min-width:56px;height:25px;padding:0 13px;border:1px solid rgba(244,114,182,.7);border-radius:99px;background:rgba(131,24,67,.26);color:#ffd5eb;font-size:9px;font-weight:950;letter-spacing:.04em;cursor:pointer;box-shadow:0 0 10px rgba(244,114,182,.16)}.asset-add:hover{border-color:#f9a8d4;background:rgba(190,24,93,.32);box-shadow:0 0 13px rgba(244,114,182,.3)}.asset-content{display:flex;flex-direction:column;gap:8px}.asset-title{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.asset-title-copy{display:flex;flex:1;flex-direction:column;gap:2px;min-width:0}.asset-state{color:var(--accent);font-size:7px;font-weight:900}.asset-id-line{display:flex;align-items:center;gap:5px;min-width:0;color:#9bacc0;font-size:7px;font-weight:500}.asset-id-line em{flex:0 0 auto;color:#6e859c;font-size:6px;font-style:normal;font-weight:900;letter-spacing:.05em}.asset-id-line span{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-meta{display:flex;flex-direction:column;gap:3px;color:#71879c;font-size:7px}.asset-meta b,.asset-meta span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-meta b{color:#bcd0e2}.empty{grid-column:1/-1;padding:30px;border:1px dashed rgba(148,163,184,.2);border-radius:8px;color:#667e94;font-size:9px;text-align:center}.warnings{max-height:64px;overflow:auto;padding:6px 9px;border-top:1px solid rgba(251,191,36,.2);background:rgba(120,53,15,.1);color:#fcd34d;font-size:7px}
+      .assets-panel{display:flex;flex-direction:column}.toolbar{height:44px;display:flex;align-items:center;gap:8px;padding:7px 9px;border-bottom:1px solid var(--line)}.toolbar [data-search]{flex:1;min-width:0;height:30px;border:1px solid rgba(148,163,184,.25);border-radius:7px;background:#070c15;color:#edf5ff;padding:0 9px;font-size:9px;outline:none}.toolbar [data-search]:focus{border-color:var(--accent)}.filter-chip{max-width:260px;padding:5px 8px;border:1px solid rgba(244,114,182,.3);border-radius:99px;background:rgba(131,24,67,.1);color:#f8c6df;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-scroll{flex:1;min-height:0;overflow:auto;scrollbar-gutter:stable;padding:9px}.asset-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px}.asset-card{display:grid;grid-template-columns:112px minmax(0,1fr);gap:10px;min-height:152px;padding:9px;border:1px solid rgba(148,163,184,.16);border-radius:9px;background:linear-gradient(145deg,rgba(19,27,42,.86),rgba(9,14,24,.82));cursor:pointer;outline:none;content-visibility:auto;contain-intrinsic-size:167px;transition:border-color 120ms ease,box-shadow 120ms ease,background-color 120ms ease,opacity 120ms ease}.asset-card:hover{border-color:rgba(34,211,238,.34)}.asset-card:focus-visible{box-shadow:0 0 0 2px rgba(34,211,238,.45)}.asset-card.selected{border-color:var(--asset-selection);box-shadow:inset 0 0 0 .3px rgba(244,114,182,.45),0 0 15px rgba(244,114,182,.34),0 0 4px rgba(217,70,239,.55)}.asset-card.selection-blocked{opacity:.58}.asset-card.unregistered{cursor:default}.asset-card.unregistered .asset-state{color:#f3a8ce}.asset-thumb{position:relative;width:112px;height:132px;display:grid;grid-template-rows:2fr 1fr;overflow:hidden;border:1px solid rgba(148,163,184,.2);border-radius:7px;background:#050910;color:#648198;font-size:9px;font-weight:900}.asset-thumb-media{position:relative;display:grid;place-items:center;min-height:0;overflow:hidden;border-bottom:1px solid rgba(148,163,184,.18)}.asset-thumb-media img{width:100%;height:100%;object-fit:cover}.asset-thumb-media>span{display:none}.asset-thumb.fallback .asset-thumb-media img{display:none}.asset-thumb.fallback .asset-thumb-media>span{display:block}.asset-thumb-footer{display:flex;align-items:center;justify-content:center;gap:6px;min-height:0;padding:4px 6px;background:linear-gradient(180deg,#080d16,#050810)}.asset-source-name{min-width:0;flex:1;color:#a8bdd0;font-size:8px;font-weight:800;line-height:1.25;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-extension-badge{flex:0 0 auto;max-width:48px;padding:3px 5px;border:1px solid rgba(34,211,238,.4);border-radius:5px;background:rgba(8,145,178,.1);color:var(--accent);font-family:inherit;font-size:7px;font-weight:900;line-height:1;letter-spacing:.07em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-thumb-media .asset-add{position:absolute;right:5px;bottom:5px;z-index:2}.asset-add{min-width:56px;height:25px;padding:0 13px;border:1px solid rgba(244,114,182,.7);border-radius:99px;background:rgba(131,24,67,.26);color:#ffd5eb;font-size:9px;font-weight:950;letter-spacing:.04em;cursor:pointer;box-shadow:0 0 10px rgba(244,114,182,.16)}.asset-add:hover{border-color:#f9a8d4;background:rgba(190,24,93,.32);box-shadow:0 0 13px rgba(244,114,182,.3)}.asset-content{display:flex;flex-direction:column;gap:8px}.asset-title{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.asset-title-copy{display:flex;flex:1;flex-direction:column;gap:2px;min-width:0}.asset-state{color:var(--accent);font-size:7px;font-weight:900}.asset-id-line{display:flex;align-items:center;gap:5px;min-width:0;color:#9bacc0;font-size:7px;font-weight:500}.asset-id-line em{flex:0 0 auto;color:#6e859c;font-size:6px;font-style:normal;font-weight:900;letter-spacing:.05em}.asset-id-line span{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-meta{display:flex;flex-direction:column;gap:3px;color:#71879c;font-size:7px}.asset-meta b,.asset-meta span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-meta b{color:#bcd0e2}.empty{grid-column:1/-1;padding:30px;border:1px dashed rgba(148,163,184,.2);border-radius:8px;color:#667e94;font-size:9px;text-align:center}.warnings{max-height:64px;overflow:auto;padding:6px 9px;border-top:1px solid rgba(251,191,36,.2);background:rgba(120,53,15,.1);color:#fcd34d;font-size:7px}
       .asset-window-nav{grid-column:1/-1;display:flex;justify-content:center;gap:8px}.asset-window-more{min-width:160px;min-height:34px;border:1px solid rgba(34,211,238,.3);border-radius:8px;background:rgba(8,145,178,.1);color:#a5f3fc;font-size:9px;font-weight:850;cursor:pointer}.asset-window-more:hover,.asset-window-more:focus-visible{border-color:var(--accent);outline:none;background:rgba(8,145,178,.18)}
       @keyframes hmb-image-leaf-pulse{0%,12.5%{opacity:1;filter:brightness(1.65);box-shadow:0 0 7px rgba(226,232,240,.42)}37.5%,100%{opacity:.2;filter:brightness(.62);box-shadow:none}}.thumbnail-loading .thumbnail-placeholder,.thumbnail-loading .asset-thumb-placeholder,.thumbnail-loading .compact-shot-placeholder{display:grid!important;width:100%;height:100%;place-items:center;background:rgba(5,9,16,.82)}.thumbnail-loading .thumbnail-placeholder{min-width:100%;min-height:100%}.hmb-image-leaf-loader{position:relative;display:block!important;pointer-events:none;width:38px!important;height:38px!important;min-width:38px!important;min-height:38px!important;background:transparent!important}.hmb-image-leaf-loader>i{--leaf-angle:calc(var(--leaf-index) * 45deg);position:absolute;left:50%;top:50%;width:6px;height:12px;margin:-6px 0 0 -3px;border-radius:90% 12% 90% 12%;background:linear-gradient(135deg,#fff 4%,#cbd5e1 48%,#64748b 100%);transform:rotate(var(--leaf-angle)) translateY(-13px) rotate(45deg);transform-origin:50% 50%;opacity:.2;animation:hmb-image-leaf-pulse 1s linear infinite;animation-delay:calc(var(--leaf-index) * .125s)}@media (prefers-reduced-motion:reduce){.hmb-image-leaf-loader>i{animation:none;opacity:.45;filter:none;box-shadow:none}.hmb-image-leaf-loader>i:first-child{opacity:.9}}
       .hmb-image-leaf-loader,.hmb-image-leaf-loader *{pointer-events:none}
       .thumbnail-failed .thumbnail-placeholder,.thumbnail-failed .asset-thumb-placeholder,.thumbnail-failed .compact-shot-placeholder{display:grid!important;width:100%;height:100%;place-items:center;background:rgba(5,9,16,.82)}.thumbnail-failed .thumbnail-placeholder{min-width:100%;min-height:100%}.hmb-image-thumbnail-unavailable{display:grid!important;place-items:center;width:30px!important;height:30px!important;border:1px solid rgba(248,113,113,.42);border-radius:50%;background:rgba(69,10,10,.36)!important;color:#fca5a5;font-size:15px;font-weight:950;line-height:1}.thumbnail-failed{animation:none!important}
       .shot-panel .shot-rename{width:29px;height:29px;flex:0 0 29px;padding:0;border:1px solid rgba(var(--shot-rgb),.42);border-radius:7px;background:rgba(var(--shot-rgb),.10);color:var(--shot-accent);font-size:13px;cursor:pointer}.shot-panel .shot-rename:disabled{opacity:.28;cursor:default}.shot-panel .shot-rename:hover:not(:disabled),.shot-panel .shot-rename:focus-visible{border-color:var(--shot-accent);background:rgba(var(--shot-rgb),.22);outline:none}.shot-name-input{width:min(180px,100%);height:24px;border:1px solid var(--shot-accent);border-radius:5px;background:#060b13;color:#f8fafc;padding:0 6px;font:inherit;outline:none;box-shadow:0 0 0 2px rgba(var(--shot-rgb),.2)}
       .toolbar-status{flex:0 0 190px;width:190px;min-width:190px;height:30px;display:flex;align-items:center;justify-content:flex-end;overflow:hidden;color:var(--muted);font-size:8px}.toolbar-status strong{display:block;width:100%;color:${state.error ? "#fda4af" : "#86efac"};font-variant-numeric:tabular-nums;letter-spacing:-.02em;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.toolbar .filter-chip{flex:0 0 120px;width:120px;max-width:120px;text-align:center}
+      .my-upload-toggle{display:flex;align-items:center;gap:5px;flex:0 0 auto;color:#c1d7e7;font-size:10px;font-weight:800;white-space:nowrap;cursor:pointer}.my-upload-toggle input{inline-size:13px;block-size:13px;margin:0;accent-color:var(--accent);cursor:pointer}.my-upload-toggle input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.my-upload-toggle:has(input:checked){color:var(--accent)}.my-upload-toggle:has(input:disabled){opacity:.52;cursor:default}
       .asset-view-toggle{flex:0 0 31px;width:31px;height:30px;display:grid;place-items:center;padding:0;border:1px solid rgba(96,165,250,.46);border-radius:7px;background:linear-gradient(180deg,rgba(37,99,235,.2),rgba(15,23,42,.88));color:#7dd3fc;cursor:pointer}.asset-view-toggle:hover,.asset-view-toggle:focus-visible,.asset-view-toggle[aria-pressed="true"]{border-color:var(--accent);background:linear-gradient(180deg,rgba(37,99,235,.38),rgba(15,23,42,.94));color:#e0f2fe;outline:none;box-shadow:0 0 10px rgba(34,211,238,.2)}.asset-view-toggle svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
       .hmb-image-assets .asset-card{min-height:167px;padding:10px}.hmb-image-assets .asset-thumb{width:123px;height:145px}.hmb-image-assets .asset-add{min-width:52px;height:28px;padding:0 10px;font-size:10px}.hmb-image-assets .asset-source-name{font-size:9px}.hmb-image-assets[data-asset-view="image"] .asset-grid{grid-template-columns:repeat(auto-fill,145px);align-content:start;justify-content:start;gap:9px}.hmb-image-assets[data-asset-view="image"] .asset-card{width:145px;grid-template-columns:123px;gap:0}.hmb-image-assets[data-asset-view="image"] .asset-content,.hmb-image-assets[data-asset-view="image"] .asset-extension-badge{display:none}.hmb-image-assets[data-asset-view="detail"] .asset-grid{grid-template-columns:repeat(auto-fill,286px);align-content:start;justify-content:start;gap:9px}.hmb-image-assets[data-asset-view="detail"] .asset-card{width:286px;grid-template-columns:123px minmax(0,1fr);gap:11px}.hmb-image-assets[data-asset-view="detail"] .asset-content{display:flex}
       .tray{margin:0 8px 8px;border:1px solid rgba(244,114,182,.34);border-radius:10px;background:linear-gradient(180deg,rgba(30,14,30,.9),rgba(8,11,19,.96));overflow:hidden}.tray-head{height:34px;display:flex;align-items:center;gap:9px;padding:0 10px;border-bottom:1px solid rgba(244,114,182,.2)}.tray-head b{font-size:9px;letter-spacing:.07em;color:#f9c2df}.tray-head span{color:#8ea3b8;font-size:7px}.tray-head em{margin-left:auto;color:var(--asset-selection);font-size:7px;font-style:normal}.tray-scroll{height:132px;display:flex;align-items:stretch;gap:8px;overflow-x:auto;overflow-y:hidden;padding:7px}.selected-card{position:relative;flex:0 0 244.5px;display:grid;grid-template-rows:25px minmax(0,1fr);padding:6px;border:1px solid rgba(244,114,182,.25);border-radius:8px;background:linear-gradient(145deg,rgba(61,23,49,.6),rgba(12,17,28,.94));cursor:grab}.selected-card:active{cursor:grabbing}.selected-card.dragging{opacity:.35}.selected-card.drop-target{border-color:var(--accent);box-shadow:0 0 0 1px rgba(34,211,238,.28)}.selected-card.missing{border-color:rgba(248,113,113,.5)}.selected-card-top{display:flex;align-items:center;gap:7px}.slot{min-width:30px;height:21px;display:grid;place-items:center;border:1px solid rgba(96,165,250,.68);border-radius:5px;background:rgba(37,99,235,.24);color:#93c5fd;font-size:10px;font-weight:950}.selected-actions{display:flex;gap:3px;margin-left:auto}.selected-actions button{width:23px;height:21px;border:1px solid rgba(148,163,184,.2);border-radius:5px;background:#0a101b;color:#b9cad9;cursor:pointer}.selected-actions button:hover{border-color:var(--accent);color:#fff}.selected-card-body{display:grid;grid-template-columns:102px minmax(0,1fr);align-items:center;gap:9px}.selected-thumb{position:relative;width:102px;height:82px;display:grid;place-items:center;overflow:hidden;border:1px solid rgba(244,114,182,.25);border-radius:6px;background:#060912;color:#725a70;font-size:7px;font-weight:900}.selected-thumb img{width:100%;height:100%;object-fit:cover}.selected-thumb span{display:none}.selected-thumb.fallback span{display:block}.selected-copy{display:flex;flex-direction:column;gap:4px}.selected-copy b,.selected-copy span,.selected-copy small{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.selected-copy b{font-size:10px}.selected-copy span{color:#a7b7c8;font-size:8px}.selected-copy em{color:#f3a8ce;font-size:7px;font-style:normal;font-weight:900}.selected-copy small{color:#667e94;font-size:7px}.tray-empty{min-width:100%;display:grid;place-items:center;border:1px dashed rgba(244,114,182,.18);border-radius:7px;color:#765d70;font-size:9px}
@@ -6434,7 +6465,7 @@ function render(
       .shot-routing{margin:0 8px 8px;border:1px solid rgba(34,211,238,.3);border-radius:9px;background:linear-gradient(180deg,rgba(7,28,40,.94),rgba(6,10,18,.98));overflow:hidden}.shot-routing-head{height:38px;display:flex;align-items:center;gap:7px;padding:0 8px}.shot-toggle,.shot-add,.shot-tab,.shot-source button{border:1px solid rgba(34,211,238,.24);border-radius:6px;background:#08131e;color:#a9c6d8;cursor:pointer}.shot-toggle{width:25px;height:25px;padding:0;color:var(--accent)}.shot-routing-head>b{font-size:8px;letter-spacing:.08em;color:var(--accent);white-space:nowrap}.shot-channel{max-width:58px;color:#5f7f94;font-size:7px;font-family:ui-monospace,monospace}.shot-tabs{display:flex;flex:1;align-items:center;gap:5px;min-width:0;overflow-x:auto;padding:2px}.shot-tab{height:27px;display:flex;align-items:center;gap:5px;padding:0 7px;white-space:nowrap}.shot-tab small{color:#5e7e93;font-size:6px}.shot-tab b{max-width:92px;overflow:hidden;text-overflow:ellipsis;font-size:8px}.shot-tab em{color:#6f90a5;font-size:7px;font-style:normal}.shot-tab.active{border-color:var(--accent);background:rgba(8,145,178,.18);color:#e6fbff}.shot-add{height:27px;padding:0 9px;color:#bceef5;font-size:8px;font-weight:900;white-space:nowrap}.shot-add:disabled,.shot-source button:disabled{opacity:.28;cursor:default}.shot-routing-body{min-height:78px;display:grid;grid-template-columns:190px minmax(0,1fr);gap:8px;padding:7px 9px 9px;border-top:1px solid rgba(34,211,238,.14)}.shot-routing-summary{display:flex;flex-direction:column;gap:3px;padding:7px;border:1px solid rgba(34,211,238,.16);border-radius:7px;background:rgba(4,14,24,.65)}.shot-routing-summary b{color:#d9f8ff;font-size:10px}.shot-routing-summary span{color:var(--accent);font-size:8px;font-weight:900}.shot-routing-summary small{color:#708ba0;font-size:7px;line-height:1.35}.shot-sources{display:flex;align-content:flex-start;gap:5px;overflow-x:auto;padding:3px}.shot-source{height:30px;display:flex;flex:0 0 auto;align-items:stretch}.shot-source>button:first-child{max-width:145px;display:flex;align-items:center;gap:5px;padding:0 7px}.shot-source i{color:#5d7d91;font-size:8px;font-style:normal}.shot-source span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:8px}.shot-source.selected>button:first-child{border-color:rgba(244,114,182,.62);background:rgba(131,24,67,.22);color:#ffe0f1}.shot-source.selected i{color:#f9a8d4}.shot-source .shot-source-move{width:22px;margin-left:2px;padding:0;color:#8eb6ca}.shot-routing-empty{align-self:center;color:#607b90;font-size:8px}
       .shot-stack{max-height:360px;margin:0 8px 8px;display:flex;flex-direction:column;gap:5px;overflow:auto;scrollbar-gutter:stable}.shot-panel{flex:0 0 auto;overflow:hidden;border:1px solid rgba(var(--shot-rgb),.34);border-radius:10px;background:linear-gradient(180deg,rgba(var(--shot-rgb),.10),rgba(8,11,19,.96));box-shadow:0 0 16px rgba(var(--shot-rgb),.07)}.shot-panel-head{height:38px;display:flex;align-items:center;gap:6px;padding:4px 7px;min-width:0;border-bottom:1px solid transparent}.shot-panel.active .shot-panel-head{border-bottom-color:rgba(var(--shot-rgb),.20)}.shot-panel-toggle{height:29px;min-width:0;flex:1;display:grid;grid-template-columns:30px minmax(0,1fr) minmax(0,1fr) auto auto;align-items:center;gap:7px;padding:0 8px;border:1px solid rgba(var(--shot-rgb),.32);border-radius:7px;background:linear-gradient(90deg,rgba(var(--shot-rgb),.16),rgba(8,13,23,.72));color:#d9e6f3;text-align:left;cursor:pointer}.shot-panel-toggle small{color:var(--shot-accent);font-size:8px;font-weight:950}.shot-panel-toggle b{max-width:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f8fafc;font-size:10px}.shot-panel-toggle span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(var(--shot-rgb),.92);font-size:8px;font-weight:900;letter-spacing:.06em}.shot-panel-toggle em{color:var(--shot-accent);font-size:8px;font-style:normal;font-weight:900}.shot-panel-toggle i{color:#7f95a8;font-size:7px;font-style:normal;letter-spacing:.08em}.shot-panel.active{border-color:rgba(var(--shot-rgb),.68);box-shadow:0 0 18px rgba(var(--shot-rgb),.14)}.shot-panel.active .shot-panel-toggle{border-color:var(--shot-accent);box-shadow:0 0 10px rgba(var(--shot-rgb),.14)}.shot-panel .shot-delete{width:29px;height:29px;flex:0 0 29px;padding:0;border:1px solid rgba(var(--shot-rgb),.42);border-radius:7px;background:rgba(var(--shot-rgb),.10);color:var(--shot-accent);font-size:16px;line-height:1;cursor:pointer}.shot-panel .shot-delete:hover:not(:disabled),.shot-panel .shot-delete:focus-visible{border-color:var(--shot-accent);background:rgba(var(--shot-rgb),.22);outline:none;box-shadow:0 0 10px rgba(var(--shot-rgb),.18)}.shot-panel .shot-delete:disabled{opacity:.25;cursor:default}.shot-panel .shot-add{flex:0 0 auto;height:29px;padding:0 11px;border:1px solid rgba(var(--shot-rgb),.54);border-radius:7px;background:rgba(var(--shot-rgb),.14);color:var(--shot-accent);font-size:8px;font-weight:950;white-space:nowrap;cursor:pointer}.shot-panel .shot-add:disabled{opacity:.3;cursor:default}.shot-panel .tray-scroll{height:132px;display:flex;align-items:stretch;gap:8px;overflow-x:auto;overflow-y:hidden;padding:7px}.shot-panel .selected-card{border-color:rgba(var(--shot-rgb),.30);background:linear-gradient(145deg,rgba(var(--shot-rgb),.15),rgba(12,17,28,.94))}.shot-panel .selected-thumb{border-color:rgba(var(--shot-rgb),.30)}.shot-panel .slot{border-color:rgba(var(--shot-rgb),.70);background:rgba(var(--shot-rgb),.20);color:var(--shot-accent)}.shot-panel .tray-empty{border-color:rgba(var(--shot-rgb),.22);color:rgba(var(--shot-rgb),.72)}.hmb-image-assets .asset-card.selected{border-color:var(--active-shot-accent);box-shadow:inset 0 0 0 .3px rgba(var(--active-shot-rgb),.48),0 0 15px rgba(var(--active-shot-rgb),.34),0 0 4px rgba(var(--active-shot-rgb),.55)}
       .asset-registration-backdrop{position:absolute;inset:0;z-index:80;display:grid;place-items:center;padding:18px;background:rgba(1,4,10,.78);backdrop-filter:blur(5px)}.asset-passport{width:min(390px,100%);max-height:calc(100% - 12px);display:flex;flex-direction:column;overflow:auto;border:1px solid rgba(244,114,182,.62);border-radius:18px 18px 28px 28px;background:radial-gradient(circle at 50% -8%,rgba(190,24,93,.24),transparent 30%),linear-gradient(180deg,#171020,#090d17 45%,#060912);box-shadow:0 24px 70px rgba(0,0,0,.62),0 0 28px rgba(244,114,182,.2)}.passport-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 10px;border-bottom:1px solid rgba(244,114,182,.2)}.passport-head small{display:block;color:#d8a2be;font-size:7px;font-weight:900;letter-spacing:.18em}.passport-head h2{margin:3px 0 0;color:#fff1f8;font-size:15px;letter-spacing:.08em}.passport-head button{width:28px;height:28px;border:1px solid rgba(244,114,182,.25);border-radius:50%;background:#0b0d16;color:#e7b9d1;font-size:18px;line-height:1;cursor:pointer}.passport-photo{position:relative;width:128px;aspect-ratio:3/4;display:grid;place-items:center;align-self:center;margin:14px 0 8px;overflow:hidden;border:1px solid rgba(244,114,182,.38);border-radius:8px;background:#050910;color:#84677a;font-size:10px;font-weight:900;box-shadow:0 0 18px rgba(244,114,182,.12)}.passport-photo img{width:100%;height:100%;object-fit:cover}.passport-photo>span{display:none}.passport-photo.fallback img{display:none}.passport-photo.fallback>span{display:block}.passport-file{display:flex;flex-direction:column;gap:3px;padding:0 18px 12px;text-align:center}.passport-file b,.passport-file span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.passport-file b{color:#d7e2ef;font-size:8px}.passport-file span{color:#73899d;font-size:7px}.passport-fields{display:grid;grid-template-columns:1fr 1fr;gap:9px;padding:12px 16px;border-top:1px dashed rgba(244,114,182,.24)}.passport-fields label{display:flex;flex-direction:column;gap:4px}.passport-fields label:nth-last-child(1){grid-column:1/-1}.passport-fields label span{color:#bb8fa8;font-size:7px;font-weight:900;letter-spacing:.06em}.passport-fields input,.passport-fields select{width:100%;height:32px;border:1px solid rgba(148,163,184,.27);border-radius:7px;background:#060b13;color:#eef5ff;padding:0 8px;font-size:9px;outline:none}.passport-fields input:focus,.passport-fields select:focus{border-color:var(--asset-selection);box-shadow:0 0 0 1px rgba(244,114,182,.18)}.passport-fields select:disabled{opacity:.42}.passport-actions{display:flex;justify-content:flex-end;gap:7px;padding:11px 16px 15px}.passport-actions button{height:31px;padding:0 13px;border:1px solid rgba(148,163,184,.24);border-radius:7px;background:#0a101a;color:#bac9d8;font-size:8px;font-weight:900;cursor:pointer}.passport-actions .passport-register{border-color:rgba(244,114,182,.62);background:linear-gradient(180deg,rgba(190,24,93,.55),rgba(88,28,135,.42));color:#ffe4f2;box-shadow:0 0 12px rgba(244,114,182,.18)}.passport-actions button:disabled{opacity:.32;cursor:default;box-shadow:none}
-      .passport-fields .passport-destination,.passport-fields .passport-folder{grid-column:1/-1;min-width:0;display:grid;gap:4px}
+      .passport-fields .passport-folder{grid-column:1/-1;min-width:0;display:grid;gap:4px}
       .asset-edit{position:absolute;top:5px;right:5px;z-index:2;width:25px;height:25px;border:1px solid var(--asset-selection);border-radius:6px;background:#141522;color:#ffd5eb;cursor:pointer}
       .passport-actions [data-registration-delete]{color:#fda4af}
       .passport-folder>span{color:var(--selection-soft,#bb8fa8);font-size:7px;font-weight:900;letter-spacing:.06em}
@@ -6484,10 +6515,11 @@ function render(
               <svg viewBox="0 0 18 18" aria-hidden="true"><rect x="2" y="2.5" width="4.5" height="4.5" rx=".8"/><path d="M9 4.75h7"/><rect x="2" y="11" width="4.5" height="4.5" rx=".8"/><path d="M9 13.25h7"/></svg>
             </button>
             <input data-search value="${escapeHtml(state.search)}" placeholder="${escapeHtml(imageAssetText(state, "search_placeholder"))}" aria-label="${escapeHtml(imageAssetText(state, "search_placeholder"))}"/>
+            <label class="my-upload-toggle nodrag"><input type="checkbox" data-my-upload ${state.my_upload_only ? "checked" : ""} ${state.project_root ? "" : "disabled"}/>${MY_UPLOAD_LABEL}</label>
             <div class="toolbar-status" data-count-digits="4" aria-live="polite"><strong title="${escapeHtml(hmbImageAssetDisplayStatusTitle(state))}">${escapeHtml(statusText)}</strong></div>
             <span class="filter-chip">${escapeHtml(filterLabel)}</span>
           </div>
-          <div class="asset-scroll nodrag nopan nowheel" data-asset-scroll${viewportKey("image-cards", [state.selected_source_view, state.selected_folder_path])}>
+          <div class="asset-scroll nodrag nopan nowheel" data-asset-scroll${viewportKey("image-cards", [imageAssetCatalogView(state), imageAssetCatalogFolder(state)])}>
             ${catalog.markup}
           </div>
           ${state.warnings.length ? `<div class="warnings">${state.warnings.map((item) => `<div>${escapeHtml(item)}</div>`).join("")}</div>` : ""}
@@ -8538,7 +8570,7 @@ function installEvents(container, state, props, remount, listeners) {
       state.project_cache_uid = "";
       state.folder_signature = "";
       state.selected_folder_path = "";
-      state.expanded_folders = [ROOT_FOLDER_KEY];
+      state.expanded_folders = [ROOT_FOLDER_KEY, DEFAULT_FOLDER_KEY];
       state.selected_main_type = "";
       state.selected_sub_type = "";
       state.selected_source_view = "project";
@@ -8591,9 +8623,7 @@ function installEvents(container, state, props, remount, listeners) {
     const key = clean(row.getAttribute("data-folder-key"));
     const path = normalizeRelativeFolder(row.getAttribute("data-folder-path"));
     container.__hmbImageAssetBrowseKey = imageAssetBrowseKey(state);
-    state.selected_source_view = row.getAttribute("data-source-view") === "user"
-      ? "user"
-      : "project";
+    state.selected_source_view = imageAssetSourceView(row.getAttribute("data-source-view"));
     state.selected_folder_path = path;
     if (row.getAttribute("data-has-children") === "1") {
       const expanded = new Set(state.expanded_folders);
@@ -8607,6 +8637,17 @@ function installEvents(container, state, props, remount, listeners) {
     remount(state);
   };
   on(container, "click", onTreeClick);
+
+  const myUploadToggle = container.querySelector("[data-my-upload]");
+  on(myUploadToggle, "change", () => {
+    state.my_upload_only = myUploadToggle.checked;
+    clearTimeout(container.__hmbImageAssetSearchTimer);
+    delete container.__hmbImageAssetSearchTimer;
+    container.__hmbImageAssetRenderLimit = IMAGE_ASSET_RENDER_WINDOW;
+    container.__hmbImageAssetRenderOffset = 0;
+    state = emit(props, state, container);
+    remount(state);
+  });
 
   const search = container.querySelector("[data-search]");
   const flushSearch = () => {
@@ -8676,7 +8717,7 @@ function installEvents(container, state, props, remount, listeners) {
     on(card.querySelector("[data-asset-add], [data-asset-edit]"), "click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      if (!asset.registration_revision && !hmbImageAssetCanRegister(asset, state)) return;
+      if (!asset.registration_revision && !hmbImageAssetCanRegister(asset)) return;
       container.__hmbImageAssetRegistrationReturnFocus = {
         descriptor: imageAssetFocusDescriptor(container),
         assetKey: asset.asset_library_id,
@@ -8885,7 +8926,7 @@ function installEvents(container, state, props, remount, listeners) {
     if (add) {
       event.preventDefault();
       event.stopPropagation();
-      if (!asset.registration_revision && !hmbImageAssetCanRegister(asset, state)) return;
+      if (!asset.registration_revision && !hmbImageAssetCanRegister(asset)) return;
       container.__hmbImageAssetRegistrationReturnFocus = {
         descriptor: imageAssetFocusDescriptor(container),
         assetKey: asset.asset_library_id,
@@ -8979,8 +9020,6 @@ function installEvents(container, state, props, remount, listeners) {
     if (submit) {
       submit.disabled = !registrationDraftIsComplete(draft) || Boolean(draft?.bash_pending || draft?.saving);
     }
-    const destination = container.querySelector("[data-registration-destination]");
-    if (destination) destination.disabled = Boolean(draft?.saving);
     const remove = container.querySelector("[data-registration-delete]");
     if (remove) remove.disabled = Boolean(draft?.saving);
   };
@@ -8994,21 +9033,6 @@ function installEvents(container, state, props, remount, listeners) {
     });
   });
   const registrationFolder = container.querySelector("[data-registration-folder]");
-  const registrationDestination = container.querySelector("[data-registration-destination]");
-  on(registrationDestination, "change", () => {
-    const draft = container.__hmbImageAssetRegistrationDraft;
-    if (!draft || draft.saving) return;
-    draft.target_site_id = registrationDestination.value;
-    draft.target_folder = "";
-    draft.target_folder_confirmed = false;
-    if (draft.target_site_id) {
-      draft.folder_picker_path = registrationFolderRoot(state, draft);
-    } else {
-      delete draft.folder_picker_path;
-    }
-    registrationFolder.querySelector(".passport-folder-controls").innerHTML = registrationFolderContents(state, draft);
-    updateRegistrationSubmit();
-  });
   on(registrationFolder, "click", (event) => {
     const draft = container.__hmbImageAssetRegistrationDraft;
     const button = event.target.closest?.("[data-registration-folder-action]");
@@ -9019,14 +9043,14 @@ function installEvents(container, state, props, remount, listeners) {
     const path = button.dataset.registrationFolderPath;
     const previous = draft.folder_picker_path;
     if (action === "open") {
-      draft.folder_picker_path = registrationFolderRoot(state, draft);
+      draft.folder_picker_path = "";
     } else if (action === "back") {
       draft.folder_picker_path = previous.slice(0, Math.max(0, previous.lastIndexOf("/")));
     } else if (action === "enter") {
       draft.folder_picker_path = path;
     } else {
       if (action === "choose") {
-        draft.target_folder = path;
+        draft.target_folder = path.startsWith(`${DEFAULT_FOLDER_KEY}/`) ? path.slice(DEFAULT_FOLDER_KEY.length + 1) : path;
         draft.target_folder_confirmed = true;
       }
       delete draft.folder_picker_path;
@@ -9059,20 +9083,18 @@ function installEvents(container, state, props, remount, listeners) {
     event.stopPropagation();
     const draft = container.__hmbImageAssetRegistrationDraft;
     if (!draft || draft.saving || draft.bash_pending) return;
-    if (action === "delete") {
-      if (!draft.registration_revision) return;
-      if (!draft.confirm_delete) {
-        draft.confirm_delete = true;
-        draft.save_message = imageAssetText(state, "asset_registration_delete_notice");
-        remount(state);
-        container.querySelector("[data-registration-delete]")?.focus();
-        return;
-      }
-    } else if (!registrationDraftIsComplete(draft)) return;
+    const removing = action === "delete";
+    if (removing ? !draft.registration_revision : !registrationDraftIsComplete(draft)) return;
     const projectKey = imageAssetBrowseKey(state);
     const widgetLease = hmbImageAssetWidgetLease(state);
     draft.saving = true;
     updateRegistrationSubmit();
+    const english = imageAssetLanguage(state) === "en";
+    if (removing) {
+      draft.save_message = english ? "Removing registration…" : "등록 삭제 중…";
+      const status = container.querySelector("[data-registration-status]");
+      if (status) status.textContent = draft.save_message;
+    }
     const failed = (error) => {
       if (container.__hmbImageAssetRegistrationDraft !== draft) return;
       clearTimeout(draft.save_timer);
@@ -9099,7 +9121,7 @@ function installEvents(container, state, props, remount, listeners) {
       }
       const request = {
         request_id: `asset-registration-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-        ...(draft.registration_revision ? {action: action === "delete" ? "delete" : "edit",
+        ...(draft.registration_revision ? {action: removing ? "delete" : "edit",
           registration_revision: draft.registration_revision} : {}),
         project_uid: base.project_uid,
         asset_library_id: draft.asset_library_id,
@@ -9108,7 +9130,6 @@ function installEvents(container, state, props, remount, listeners) {
         source_uid: draft.source_uid,
         relative_path: draft.relative_path,
         target_folder: clean(draft.target_folder),
-        ...(draft.target_site_id ? {target_site_id: draft.target_site_id} : {}),
         image_name: clean(draft.image_name),
         asset_id: clean(draft.asset_id),
         image_main_type: clean(draft.image_main_type),
@@ -9124,13 +9145,17 @@ function installEvents(container, state, props, remount, listeners) {
       draft.request_id = request.request_id;
       draft.project_key = projectKey;
       const status = container.querySelector("[data-registration-status]");
-      const english = imageAssetLanguage(state) === "en";
-      draft.save_message = english ? "Waiting for project registration…" : "프로젝트 등록 결과를 기다리는 중…";
-      if (status) status.textContent = draft.save_message;
+      if (!removing) {
+        draft.save_message = english ? "Waiting for project registration…" : "프로젝트 등록 결과를 기다리는 중…";
+        if (status) status.textContent = draft.save_message;
+      }
       draft.save_timer = setTimeout(() => {
         if (container.__hmbImageAssetRegistrationDraft !== draft || draft.request_id !== request.request_id) return;
-        draft.save_message = english ? "Still waiting for registration. You can leave this window open for the result. If you close it, use Refresh to check."
-          : "등록 확인을 기다리고 있습니다. 이 창에서 결과를 기다리거나, 창을 닫은 경우 새로고침으로 확인할 수 있습니다.";
+        draft.save_message = removing
+          ? (english ? "Still waiting for removal. If you close this window, use Refresh to check the result."
+            : "삭제 결과를 기다리고 있습니다. 창을 닫은 경우 새로고침으로 확인할 수 있습니다.")
+          : (english ? "Still waiting for registration. You can leave this window open for the result. If you close it, use Refresh to check."
+            : "등록 확인을 기다리고 있습니다. 이 창에서 결과를 기다리거나, 창을 닫은 경우 새로고침으로 확인할 수 있습니다.");
         const notice = container.querySelector("[data-registration-status]");
         if (notice) notice.textContent = draft.save_message;
       }, 15000);
@@ -9319,6 +9344,7 @@ function hmbNativeUiImplementation(container, props) {
       const retained=prior || {};
       Object.assign(retained,asset,{thumbnail_url:thumbnail,
         selected:selectedIds.has(asset.source_uid),selection_order:0});
+      if (!asset.registration_revision) delete retained.registration_revision;
       byId.set(asset.asset_library_id,retained);
     }
     state.assets=[...byId.values()];state.catalog_page=page.catalog_page;
@@ -9330,8 +9356,12 @@ function hmbNativeUiImplementation(container, props) {
   },(full)=>{
     const canonical=normalizeState(full),selected=selectedAssets(state),order=new Map(selected.map((asset,index)=>[asset.source_uid,index+1]));
     const visible=new Map(state.assets.map(asset=>[asset.asset_library_id,asset]));
-    state.assets=canonical.assets.map(asset=>Object.assign(visible.get(asset.asset_library_id)||{},asset,
-      {selected:order.has(asset.source_uid),selection_order:order.get(asset.source_uid)||0}));
+    state.assets=canonical.assets.map(asset=>{
+      const retained = Object.assign(visible.get(asset.asset_library_id) || {}, asset,
+        {selected:order.has(asset.source_uid),selection_order:order.get(asset.source_uid)||0});
+      if (!asset.registration_revision) delete retained.registration_revision;
+      return retained;
+    });
     state.status={...canonical.status,selected_count:selected.length};
     delete state.catalog_page;
     container.__hmbImageAssetLatestState=state;
@@ -9696,7 +9726,12 @@ function hmbNativeUiImplementation(container, props) {
       // A matching folder receipt is independent of optimistic shot edit revisions.
       const receiptOnly = hmbImageAssetRevisionDisposition(container, incomingState) === "stale";
       if (container.__hmbFolderCards) container.__hmbFolderCards.receive(incomingState, receiptOnly);
-      else syncProjectFolderProfiles(container, incomingState, receiptOnly);
+      else {
+        const acknowledged = syncProjectFolderProfiles(container, incomingState, receiptOnly);
+        if (acknowledged && !acknowledged.result.ok && acknowledged.result.message) {
+          hmbShowImageAssetTransportError(container, acknowledged.result.message, incomingState);
+        }
+      }
     }
     delete incomingState.site_settings_request;
     const incomingRefreshScope = hmbImageAssetRefreshScope(incomingState);
@@ -9705,8 +9740,21 @@ function hmbNativeUiImplementation(container, props) {
         && (!container.__hmbImageAssetSettledRefresh.requestId || incomingState.scan_request_id === container.__hmbImageAssetSettledRefresh.requestId)) return;
     incomingState.image_bash_workspace_request = {};
     incomingState.image_bash_workspace_edit = {};
-    const draft = container.__hmbImageAssetRegistrationDraft;
+    let draft = container.__hmbImageAssetRegistrationDraft;
     const receipt = incomingState.asset_registration_result;
+    if (draft?.source_kind === "project" && imageAssetBrowseKey(state) === imageAssetBrowseKey(incomingState)
+        && hmbImageAssetRevisionDisposition(container, incomingState) !== "stale"
+        && incomingState.site_settings?.revision !== state.site_settings?.revision
+        && Array.isArray(incomingState.site_settings?.links)) {
+      const site = imageFolderSite(draft.relative_path);
+      if (site !== "hq" && !incomingState.site_settings.links.some(link => link.id === site)) {
+        clearTimeout(draft.save_timer);
+        delete container.__hmbImageAssetRegistrationDraft;
+        delete container.__hmbImageAssetRegistrationReturnFocus;
+        hmbTakeDeferredImageAssetProps(container);
+        draft = null;
+      }
+    }
     if (draft?.request_id && receipt?.request_id === draft.request_id
         && draft.project_key === imageAssetBrowseKey(incomingState)
         && hmbImageAssetRevisionDisposition(container, incomingState) !== "stale") {

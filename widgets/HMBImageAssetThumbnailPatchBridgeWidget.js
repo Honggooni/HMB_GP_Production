@@ -379,7 +379,8 @@ function hmbNativeUiImplementation(container, props) {
     } else if (operation === "catalog_page") {
       Object.assign(request,{session_id:clean(source.session_id),sequence:Math.max(0,Math.floor(Number(source.sequence)||0)),
         query:String(source.query||"").slice(0,256),folder:clean(source.folder).replaceAll("\\","/"),
-        folder_signature:clean(source.folder_signature),source_view:source.source_view==="user"?"user":"project",
+        folder_signature:clean(source.folder_signature),
+        source_view:["user","owned","default"].includes(source.source_view)?source.source_view:"project",
         offset:Math.max(0,Math.floor(Number(source.offset)||0)),limit:Math.min(80,Math.max(1,Math.floor(Number(source.limit)||80)))});
       if(!request.session_id || !request.request_id || request.runtime_instance_id!==runtimeId || !request.project_uid)
         throw new Error("Invalid HMB image catalog page request.");

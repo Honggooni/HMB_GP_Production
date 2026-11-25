@@ -46,7 +46,9 @@ async def main():
         project_cache_uid="search-cache", manifest_signature="manifest", folder_signature="folders", scan_revision=9,
         assets=[dict(asset_library_id=f"library-{i}", asset_id=f"asset-{i}", source_uid=f"source-{i}",
             source_kind="project", registered=True, path=f"C:/fixture/search-project/{i}.png",
-            relative_path=f"CH/{i}.png", image_name=f"Character {i}", image_main_type="CH", image_sub_type="Full body",
+            relative_path=f"site:partner/add/{i}.png" if i in (4997, 4998) else f"CH/{i}.png",
+            registration_revision=f"owner-{i}" if i in (1, 4998) else "",
+            image_name=f"Character {i}", image_main_type="CH", image_sub_type="Full body",
             selected=i in (1,87), selection_order=1 if i==1 else 2 if i==87 else 0) for i in range(5000)])
     state = image._normalize_state(state)
     source._store_thumbnail_state_silently(state, normalized=True)
@@ -64,15 +66,15 @@ async def main():
             events.append(deepcopy(value)); threads.append(threading.get_ident())
         return publisher(name, value)
     source.publish_update_to_parameter = publish
-    def request(number, query="Character"):
+    def request(number, query="Character", source_view="project"):
         return dict(schema=image.THUMBNAIL_BRIDGE_SCHEMA,version=1,operation="catalog_page",phase="request",
             runtime_instance_id=source._thumbnail_runtime_id(state),request_id=f"native-{number}",session_id="native-page-client",
             sequence=number,project_uid=state["project_uid"],project_cache_uid=state["project_cache_uid"],
             manifest_signature=state["manifest_signature"],folder_signature=state["folder_signature"],
-            scan_revision=state["scan_revision"],widget_runtime_lease=source._hmb_widget_runtime_lease,query=query,folder="",source_view="project",offset=0,limit=80)
-    async def dispatch(number, query="Character"):
+            scan_revision=state["scan_revision"],widget_runtime_lease=source._hmb_widget_runtime_lease,query=query,folder="",source_view=source_view,offset=0,limit=80)
+    async def dispatch(number, query="Character", source_view="project"):
         result = await GriptapeNodes.ahandle_request(SetParameterValueRequest(
-            node_name=source.name,parameter_name=image.THUMBNAIL_PATCH_PARAMETER,value=request(number,query),data_type="dict"))
+            node_name=source.name,parameter_name=image.THUMBNAIL_PATCH_PARAMETER,value=request(number,query,source_view),data_type="dict"))
         assert not result.failed(), result
     entered, release = threading.Event(), threading.Event()
     original = image._ImageCatalogSearchIndex.__init__
@@ -100,11 +102,16 @@ async def main():
         assert events[-1]["state"]["catalog_page"]["asset_library_ids"] == ["library-4999"]
         await dispatch(3,"asset-4000")
         await wait_until(lambda: any(event.get("sequence")==3 for event in events))
+        await dispatch(4,"",source_view="owned")
+        await wait_until(lambda: any(event.get("sequence")==4 for event in events))
+        owned = events[-1]["state"]
+        assert owned["catalog_page"]["asset_library_ids"] == ["library-1", "library-4998"]
+        assert owned["catalog_page"]["source_view"] == "owned" and owned["catalog_page"]["total"] == 2
         assert source._hmb_catalog_search_builds == 1
         assert all(thread != owner_thread for thread in worker_threads)
         assert all(thread == owner_thread for thread in threads)
     last_ready = events[-1]["state"]
-    stale = dict(request(4), manifest_signature="replaced")
+    stale = dict(request(5), manifest_signature="replaced")
     await GriptapeNodes.ahandle_request(SetParameterValueRequest(
         node_name=source.name, parameter_name=image.THUMBNAIL_PATCH_PARAMETER, value=stale, data_type="dict"))
     assert events[-1]["request_id"] == stale["request_id"] and events[-1]["outcome"] == "stale"
@@ -125,7 +132,8 @@ async def main():
     result = {"sdk":"official installed SDK","records":5000,"sdk_dispatch_ms":round(dispatch_ms,3),
         "index_builds":source._hmb_catalog_search_builds,"heartbeat_during_blocked_index":True,
         "publication_on_owner_loop":True,"stale_query_publications":0,"full_retained_catalog_unchanged":True,
-        "native_output_pair_unchanged":True,"legacy_client_full_property_preserved":True,"paid_calls":0}
+        "native_output_pair_unchanged":True,"legacy_client_full_property_preserved":True,
+        "owned_default_and_linked_only":True,"paid_calls":0}
     out=ROOT/"reports/feature123-local804-20261016/search"
     out.mkdir(parents=True,exist_ok=True)
     (out/"native-sdk-result.json").write_text(json.dumps(result,indent=2),encoding="utf-8")

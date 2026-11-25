@@ -22,8 +22,6 @@ DEFAULT = {"links": [], "write_site_id": "hq", "selected_site_id": "", "revision
 _ID = re.compile(r"site-[0-9a-f]{32}\Z")
 _CACHE = {}
 _CACHE_LOCK = threading.RLock()
-_DIRECTORY_LOCKS = {}
-_DIRECTORY_STATUS = {}
 _PROFILE_DIRECTORIES = set()
 _EXECUTION_WORKSPACE = contextvars.ContextVar("hmb_image_site_execution_workspace", default=None)
 
@@ -224,51 +222,6 @@ def _check_directory_route(path):
     _plain_directory(path)
 
 
-def _ensure_plain_subdirectory(path):
-    try:
-        _plain_directory(path)
-    except FileNotFoundError:
-        path.mkdir(exist_ok=True)
-        _plain_directory(path)
-
-
-def _prepare_selected_folder(root):
-    # Only called after the chosen root was strictly resolved and its route checked.
-    # Keep existing media and registries intact, including on a repeated confirmation.
-    for name in ("add", ".json"):
-        try:
-            _ensure_plain_subdirectory(root / name)
-        except OSError as exc:
-            raise ValueError(f"등록 폴더를 준비할 수 없습니다 ({root / name}). 공유 폴더 권한을 확인하세요.") from exc
-
-
-def ensure_registration_directory(media_root, *, refresh=False, vendor=False):
-    """Prepare metadata on a catalog read; never create the source root or a registry file."""
-    root = _media_root(media_root)
-    with _CACHE_LOCK:
-        lock = _DIRECTORY_LOCKS.get(root)
-        if lock is None:
-            lock = _DIRECTORY_LOCKS[root] = threading.Lock()
-    with lock:
-        key = (root, vendor)
-        if not refresh and key in _DIRECTORY_STATUS:
-            return _DIRECTORY_STATUS[key]
-        _DIRECTORY_STATUS.pop(key, None)
-        status = ""
-        try:
-            _check_directory_route(root)
-            directory = root / ".json"
-            _ensure_plain_subdirectory(directory)
-            if vendor:
-                directory = root / "add"
-                _ensure_plain_subdirectory(directory)
-        except OSError as error:
-            status = (f"등록 폴더를 준비할 수 없습니다 ({root}). "
-                      f"공유 폴더 연결과 권한을 확인한 뒤 새로고침하세요. {error}")
-        _DIRECTORY_STATUS[key] = status
-        return status
-
-
 def _external_folder(project, value, *, check_headquarters=True):
     if not isinstance(value, str) or any(ord(ch) < 32 for ch in value):
         raise ValueError("외주 공유 폴더의 절대 경로를 입력하세요.")
@@ -431,13 +384,11 @@ def add_site_folder(project_root, selected, media):
                     raise ValueError("이미 연결된 폴더와 겹칩니다.")
             name = Path(root).name
             links.append({"id": site_id, "label": name[:128], "root": root})
-        if media == "image":
-            _prepare_selected_folder(physical)
         return _store_profile(path, profile, links, profile["write_site_id"], site_id), site_id
 
 
 def confirm_site_folder(project_root, media, expected_revision, selected):
-    """Verify the committed selection, preparing registration storage for images."""
+    """Verify the selected folder without modifying its contents."""
     path = settings_path(project_root, media)
     path.parent.mkdir(parents=True, exist_ok=True)
     with _settings_lock(path):
@@ -449,7 +400,6 @@ def confirm_site_folder(project_root, media, expected_revision, selected):
         if media == "image" and selected == "hq":
             root = _media_root(project_root)
             _check_directory_route(root)
-            _prepare_selected_folder(root)
             return _store_profile(path, profile, profile["links"], profile["write_site_id"], "")
         if selected is None or selected == "" or not expected_revision:
             selected = profile["selected_site_id"]
@@ -462,8 +412,6 @@ def confirm_site_folder(project_root, media, expected_revision, selected):
             _, physical = _external_folder(project_root, link["root"], check_headquarters=False)
             if _folder_identity(physical) != selected:
                 raise ValueError("선택한 폴더의 연결 대상이 변경되었습니다. 등록 폴더를 다시 선택하세요.")
-            if media == "image":
-                _prepare_selected_folder(physical)
         return _store_profile(path, profile, profile["links"], profile["write_site_id"], selected)
 
 
@@ -543,7 +491,7 @@ def choose_site_folder():
 
 
 def run_site_folder_command(node, project, uid, request, media, publish, *, prepare_catalog=None):
-    """Run one picker or confirmation per node. Report to its originating host context."""
+    """Run one folder command per node and report to its originating host context."""
     request_id = request["request_id"]
     receipt = {"request_id": request_id, "project_uid": uid, "base_root": project}
     history = getattr(node, "_hmb_folder_dialog_history", None)
@@ -576,23 +524,32 @@ def run_site_folder_command(node, project, uid, request, media, publish, *, prep
 
     def worker():
         try:
-            if request["action"] == "confirm":
+            action = request["action"]
+            added_site_id = ""
+            if action == "confirm":
                 profile = confirm_site_folder(project, media, request.get("expected_revision"), request.get("selected_site_id"))
-                if prepare_catalog is not None:
-                    prepare_catalog(profile)
-                    latest = get_site_settings(project, media, fresh=True)
-                    if latest["generation"] != profile["generation"]:
-                        raise ValueError("폴더 설정이 변경되었습니다. 최신 목록에서 완료를 다시 누르세요.")
-                receipt.update(profile, ok=True, message="")
+            elif action == "update_links":
+                profile = save_site_settings(project, request.get("links"), request.get("write_site_id"),
+                                             request.get("expected_revision"), media=media, existing_only=True)
             else:
                 selected = choose_site_folder()
                 if getattr(node, "_hmb_node_deleted", False):
                     return
                 if selected:
-                    profile, selected_id = add_site_folder(project, selected, media)
-                    receipt.update(profile, ok=True, added_site_id=selected_id, message="")
+                    profile, added_site_id = add_site_folder(project, selected, media)
                 else:
-                    receipt.update(get_site_settings(project, media, fresh=True), ok=True, cancelled=True, message="")
+                    profile = None
+            if profile is None:
+                receipt.update(get_site_settings(project, media, fresh=True), ok=True, cancelled=True, message="")
+            else:
+                if prepare_catalog is not None and (media == "image" or action == "confirm"):
+                    prepare_catalog(profile)
+                    latest = get_site_settings(project, media, fresh=True)
+                    if latest["generation"] != profile["generation"]:
+                        raise ValueError("폴더 설정이 변경되었습니다. 최신 폴더 목록을 확인하세요.")
+                receipt.update(profile, ok=True, message="")
+                if added_site_id:
+                    receipt["added_site_id"] = added_site_id
         except (ValueError, OSError) as exc:
             receipt.update(ok=False, message=str(exc))
             try:

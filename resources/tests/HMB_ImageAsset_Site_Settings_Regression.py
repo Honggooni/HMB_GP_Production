@@ -103,13 +103,13 @@ class SiteSettingsRegression(unittest.TestCase):
         with patch.object(restored, "_check_directory_route", wraps=restored._check_directory_route) as check:
             default = restored.confirm_site_folder(self.project, "image", default["revision"], "hq")
             self.assertEqual([call.args[0] for call in check.call_args_list], [self.project])
-            self.assertTrue((self.project / "add").is_dir())
+            self.assertEqual(list(self.project.iterdir()), [])
             self.assertEqual(default["selected_site_id"], "")
             last = restored.save_site_settings(self.project, [], "hq", default["revision"], existing_only=True)
             self.assertEqual((last["links"], last["write_site_id"]), ([], "hq"))
             self.assertEqual(restored.site_profiles(projects, "image"), {"p": last})
 
-    def test_done_upgrades_legacy_selection_and_only_prepares_the_chosen_folder(self):
+    def test_done_upgrades_legacy_selection_without_changing_folder_contents(self):
         for media, base in (("image", self.project), ("sound", self.sound)):
             with self.subTest(media=media):
                 links = [{"id": key, "label": key, "root": str(root)} for key, root in
@@ -129,37 +129,23 @@ class SiteSettingsRegression(unittest.TestCase):
                 self.assertEqual(confirmed["write_site_id"], prior["write_site_id"])
                 self.assertEqual(confirmed["revision"], prior["revision"])
                 self.assertEqual(confirmed["generation"], 2)
-                expected = {"add", ".json"} if media == "image" else set()
-                self.assertEqual({entry.name for entry in self.busan.iterdir()}, expected)
+                self.assertEqual(list(self.busan.iterdir()), [])
                 self.assertEqual(list(self.gang.iterdir()), [])
                 restarted = load_module()
                 restored = restarted.site_profiles([dict(project_uid="p", path=str(base))], media)
                 self.assertEqual(restored["p"], confirmed)
-                if media == "sound":
-                    self.assertEqual(restarted.confirm_site_folder(base, media, confirmed["revision"], second_id), confirmed)
-                    self.assertEqual(list(self.busan.iterdir()), [])
-                    continue
-                marker = self.busan / ".json" / "existing.json"
-                marker.write_bytes(b"keep")
+                marker = self.busan / "add"
+                marker.write_bytes(b"existing user entry")
                 self.assertEqual(restarted.confirm_site_folder(base, media, confirmed["revision"], second_id), confirmed)
-                self.assertEqual(marker.read_bytes(), b"keep")
-                (self.busan/"add").rmdir()
-                (self.busan/"add").write_bytes(b"file in place of directory")
-                with self.assertRaisesRegex(ValueError, "같은 이름의 파일"):
-                    restarted.confirm_site_folder(base, media, confirmed["revision"], second_id)
-                self.assertEqual(restarted.get_site_settings(base, media, fresh=True), confirmed)
-                (self.busan/"add").unlink()
+                self.assertEqual(marker.read_bytes(), b"existing user entry")
                 marker.unlink()
-                (self.busan/".json").rmdir()
 
     def test_failed_add_or_stale_done_preserves_committed_profile(self):
         first, site_id = self.sites.add_site_folder(self.project, str(self.gang), "image")
         self.assertEqual(first["selected_site_id"], site_id)
-        self.assertTrue((self.gang/"add").is_dir())
-        self.assertTrue((self.gang/".json").is_dir())
-        (self.busan/"add").write_bytes(b"conflict")
-        with self.assertRaisesRegex(ValueError, "같은 이름의 파일"):
-            self.sites.add_site_folder(self.project, str(self.busan), "image")
+        self.assertEqual(list(self.gang.iterdir()), [])
+        with self.assertRaises(ValueError):
+            self.sites.add_site_folder(self.project, str(self.busan / "missing"), "image")
         with patch.object(self.sites, "_check_directory_route", side_effect=AssertionError("irrelevant share I/O")):
             with self.assertRaisesRegex(ValueError, "다른 창"):
                 self.sites.confirm_site_folder(self.project, "image", "old", site_id)
@@ -194,61 +180,18 @@ class SiteSettingsRegression(unittest.TestCase):
         copy["links"].clear()
         self.assertEqual(self.sites.get_site_settings(self.project), first)
 
-    def test_first_read_prepares_separate_directories_and_reuses_result(self):
-        ensure = self.sites.ensure_registration_directory
-        existing = self.project / ".json"
-        existing.mkdir()
-        registry = existing / "hmb_image_assets.json"
-        registry.write_bytes(b"existing registry")
-        self.assertEqual(ensure(self.project), "")
-        for root in (self.gang, self.busan, self.sound):
-            self.assertEqual(ensure(root), "")
-            self.assertEqual(list((root / ".json").iterdir()), [])
-        with patch.object(Path, "lstat", side_effect=AssertionError("unexpected I/O")):
-            self.assertEqual(ensure(self.project), "")
-            self.assertEqual(ensure(self.gang), "")
-        self.assertEqual(registry.read_bytes(), b"existing registry")
-
-    def test_missing_source_read_only_and_explicit_retry(self):
-        ensure = self.sites.ensure_registration_directory
-        missing = self.path / "disconnected-media"
-        self.assertIn("새로고침", ensure(missing))
-        self.assertFalse(missing.exists())
-        missing.mkdir()
-        self.assertEqual(ensure(missing, refresh=True), "")
-        with patch.object(Path, "mkdir", side_effect=PermissionError("read only")):
-            warning = ensure(self.gang)
-        self.assertIn("권한", warning)
-        self.assertFalse((self.gang / ".json").exists())
-        with patch.object(Path, "lstat", side_effect=AssertionError("unexpected I/O")):
-            self.assertEqual(ensure(self.gang), warning)
-        self.assertEqual(ensure(self.gang, refresh=True), "")
-        self.assertTrue((self.gang / ".json").is_dir())
-
-    def test_conflicts_and_redirects_do_not_create_or_replace_files(self):
-        ensure = self.sites.ensure_registration_directory
-        target = self.gang / ".json"
-        target.write_bytes(b"this is a file")
-        with self.assertRaises(ValueError):
-            ensure(self.gang)
-        self.assertEqual(target.read_bytes(), b"this is a file")
-        target.unlink()
-        self.assertEqual(ensure(self.gang, refresh=True), "")
+    def test_redirected_link_is_rejected_without_creating_folders(self):
         original_lstat = Path.lstat
-        for redirected in (self.gang, self.gang.parent, target):
+        for redirected in (self.gang, self.gang.parent):
             def flagged_lstat(path):
                 info = original_lstat(path)
                 return (SimpleNamespace(st_mode=info.st_mode, st_file_attributes=0x400)
                         if path == redirected else info)
             with patch.object(Path, "lstat", flagged_lstat):
                 with self.assertRaises(ValueError):
-                    ensure(self.gang, refresh=True)
-                with self.assertRaises(ValueError):
-                    ensure(self.gang)
-        self.assertEqual(list(target.iterdir()), [])
-        for invalid in ("https://example.invalid/source", "relative/path", str(self.path / ".." / "elsewhere")):
-            with self.assertRaises(ValueError):
-                ensure(invalid)
+                    self.sites.add_site_folder(self.project, str(self.gang), "image")
+        self.assertEqual(list(self.gang.iterdir()), [])
+        self.assertEqual(self.sites.get_site_settings(self.project)["links"], [])
 
     def test_competing_settings_dialogs_cannot_overwrite_each_other(self):
         ctx = multiprocessing.get_context("spawn")

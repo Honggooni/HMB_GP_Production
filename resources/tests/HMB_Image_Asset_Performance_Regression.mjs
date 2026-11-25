@@ -592,6 +592,22 @@ try {
   backgroundFrames.splice(0).forEach((callback) => callback());
   assert.equal(backgroundCommits, 1, "Late animation frames must not duplicate a fallback publish.");
 
+  const continuous = { __hmbImageAssetMountToken: 45 };
+  const delivered = [];
+  assetWidget.hmbScheduleImageAssetSelectionCommit(continuous, () => delivered.push(1));
+  const firstDeadline = [...backgroundTimers.keys()][0];
+  backgroundFrames.shift()();
+  assetWidget.hmbScheduleImageAssetSelectionCommit(continuous, () => delivered.push(2));
+  assert.deepEqual([...backgroundTimers.keys()], [firstDeadline], "A new click must not move the first publication deadline.");
+  backgroundFrames.shift()();
+  assert.deepEqual(delivered, [2], "Publish during the burst on its original second frame.");
+  assetWidget.hmbScheduleImageAssetSelectionCommit(continuous, () => delivered.push(3));
+  assetWidget.hmbScheduleImageAssetSelectionCommit(continuous, () => delivered.push(4));
+  [...backgroundTimers.values()][0]();
+  assert.deepEqual(delivered, [2, 4], "Fallback publication must also progress while clicks continue.");
+  backgroundFrames.splice(0).forEach((callback) => callback());
+  assert.deepEqual(delivered, [2, 4]);
+
   const flushContainer = { __hmbImageAssetMountToken: 42 };
   const flushed = [];
   assetWidget.hmbScheduleImageAssetSelectionCommit(flushContainer, () => flushed.push("old"));

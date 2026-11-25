@@ -34,7 +34,8 @@ window.idle={schema:'hmb-image-asset-thumbnail-bridge',version:1,operation:'idle
 window.bc=bridgeMount(document.getElementById('bridge'),{value:window.idle,onChange:value=>{if(value.operation==='catalog_page'){window.requests.push(value);if(mode==='throw')throw Error('fixture rejection');if(mode==='reject')return Promise.reject(Error('fixture rejection'));}}});
 const start=performance.now();window.wc=mount(window.root,{value:JSON.stringify(full),onChange:value=>window.writes.push(JSON.parse(value))});window.metrics.fullInitialMountMs=performance.now()-start;};
 window.response=(request,overrides={})=>{const full=window.full;const needle=request.query.trim().toLowerCase(),folder=request.folder.toLowerCase();
-const matches=full.assets.filter(a=>a.source_kind===request.source_view&&(!folder||a.relative_path.toLowerCase().startsWith(folder+'/'))&&[a.asset_id,a.image_name,a.relative_path,a.image_main_type,a.image_sub_type].map(x=>String(x||'').trim().toLowerCase()).join('\\n').includes(needle));
+const view=request.source_view;
+const matches=full.assets.filter(a=>a.source_kind===(view==='user'?'user':'project')&&(view!=='owned'||a.registration_revision)&&(view!=='default'||!a.relative_path.startsWith('site:'))&&(!folder||a.relative_path.toLowerCase().startsWith(folder+'/'))&&[a.asset_id,a.image_name,a.relative_path,a.image_main_type,a.image_sub_type].map(x=>String(x||'').trim().toLowerCase()).join('\\n').includes(needle));
 const offset=Math.min(request.offset,matches.length?Math.floor((matches.length-1)/80)*80:0),ids=matches.slice(offset,offset+80).map(a=>a.asset_library_id);
 const page={...full,assets:full.assets.filter(a=>a.selected||ids.includes(a.asset_library_id)),catalog_page:{version:1,session_id:request.session_id,sequence:request.sequence,query:request.query,folder:request.folder,source_view:request.source_view,offset,limit:80,total:matches.length,asset_library_ids:ids,folder_counts:{'':5000,CH:2500,BG:2500},...overrides}};
 return{...request,phase:'result',outcome:'ready',catalog_page_version:1,state:page};};
@@ -220,35 +221,34 @@ try{
     const destination = client.locator('[data-registration-destination]');
     const chooser = client.locator('[data-registration-folder]');
     const control = action => chooser.locator(`[data-registration-folder-action="${action}"]`);
-    const folder = path => chooser.locator(`[data-registration-folder-path="${prefix}${path}"]`);
+    const rootFolder = vendor ? `site:${writer}` : '$default';
+    const folder = path => chooser.locator(`[data-registration-folder-path="${rootFolder}/${path}"]`);
+    const enterRoot = root => chooser.locator(`[data-registration-folder-action="enter"][data-registration-folder-path="${root}"]`).click();
     const rows = () => chooser.locator('[data-registration-folder-path]:not(.passport-folder-here) span:first-child').allTextContents();
-    assert.equal(await submit.isEnabled(),true);
-    assert.match(await control('open').textContent(),/add/);
-    if (vendor) {
-      assert.deepEqual(await destination.locator('option').allTextContents(),['Select a save location','Default folder','Partner','Second partner']);
-      assert.equal(await destination.inputValue(),writer);
-      await control('open').click();
-      await folder('add').click();
-      assert.match(await control('open').textContent(),/Partner \/ add/);
-      assert.equal(await submit.isEnabled(),true);
-      await destination.selectOption('hq');
-      assert.deepEqual(await rows(),['HQOnly','add']);
-      assert.equal(await submit.isDisabled(),true);
-      await destination.selectOption(secondSite);
-      assert.deepEqual(await rows(),['SecondOnly','add']);
-      await destination.selectOption(writer);
-    } else {
-      assert.equal(await destination.count(),0);
-      await control('open').click();
-    }
+    assert.equal(await destination.count(),0);
     assert.equal(await submit.isDisabled(),true);
-    assert.deepEqual(await rows(),['BG','BG_lighting','CH','add']);
+    assert.deepEqual(await rows(),vendor ? ['Partner','Second partner','Ai_Ct_image'] : ['Ai_Ct_image']);
+    if (vendor) {
+      await enterRoot('$default');
+      assert.deepEqual(await rows(),['HQOnly']);
+      await chooser.getByRole('button',{name:'Save in this folder'}).click();
+      assert.match(await control('open').textContent(),/Ai_Ct_image/);
+      assert.equal(await submit.isEnabled(),true);
+      await control('open').click();
+      await enterRoot(`site:${secondSite}`);
+      assert.deepEqual(await rows(),['SecondOnly']);
+      await control('back').click();
+    }
+    await enterRoot(rootFolder);
+    assert.equal(await submit.isDisabled(),true);
+    assert.deepEqual(await rows(),['BG','BG_lighting','CH']);
     await folder('BG').click();
     assert.deepEqual(await rows(),['e201','e202']);
     await chooser.getByRole('button',{name:'Save in this folder'}).click();
     assert.match(await control('open').textContent(),/BG/);
     assert.equal(await submit.isEnabled(),true);
     await control('open').click();
+    await enterRoot(rootFolder);
     await folder('BG').click();
     await folder('BG/e202').click();
     assert.deepEqual(await rows(),['Tone']);
@@ -257,10 +257,11 @@ try{
     await control('close').click();
     assert.match(await control('open').textContent(),/BG/);
     await control('open').click();
+    await enterRoot(rootFolder);
     await folder('BG').click();
     await folder('BG/e202').click();
     await folder('BG/e202/Tone').click();
-    assert.match(await control('open').textContent(),/BG\/e202\/Tone/);
+    assert.match(await control('open').textContent(),/BG \/ e202 \/ Tone/);
     const registrationRequests = () => client.evaluate(() => window.writes.map(v => (v.edits || v).asset_registration_request).filter(v => v?.request_id));
     assert.deepEqual(await registrationRequests(),[]);
     assert.equal(await client.evaluate(() => window.requests.length),0,'Folder navigation uses the loaded catalog');
@@ -268,7 +269,7 @@ try{
     const requests = await registrationRequests();
     assert.equal(requests.length,1);
     assert.equal(requests[0].target_folder,prefix+'BG/e202/Tone');
-    assert.equal(requests[0].target_site_id,vendor ? writer : undefined);
+    assert.equal(requests[0].target_site_id,undefined);
     await client.close();
   }
 
@@ -279,21 +280,99 @@ try{
   await editor.waitForFunction(() => window.ready);
   const ownerRow = {...state.assets[1], relative_path:'CH/owned.png', registration_revision:'test-owner-revision'};
   const otherRow = {...state.assets[2], relative_path:'CH/other.png'};
-  await editor.evaluate(value => window.boot(value,0), api.hmbNormalizeImageAssetState({...state,
-    assets:[ownerRow,otherRow], shot_routing:undefined}));
-  await editor.locator('[data-folder-key][data-source-view="project"][data-folder-path=""]').first().click();
-  assert.equal(await editor.locator('[data-asset-edit]').count(),1);
-  await editor.locator('[data-asset-edit]').click();
+  const site = 'site-' + 'a'.repeat(32);
+  const linkedOwner = {...state.assets[3], relative_path:`site:${site}/add/owned-link.png`, registration_revision:'link-owner-revision'};
+  const linkedOther = {...state.assets[4], relative_path:`site:${site}/add/other-link.png`};
+  await editor.evaluate(value => window.boot(value,1), api.hmbNormalizeImageAssetState({...state,
+    assets:[ownerRow,otherRow,linkedOwner,linkedOther], folders:['CH',`site:${site}`,`site:${site}/add`],
+    expanded_folders:['$root','$default'], shot_routing:undefined,
+    site_settings:{links:[{id:site,label:'Partner Uploads',root:'D:/Partner Uploads'}],write_site_id:'hq',revision:'test'}}));
+  const labels = await editor.locator('.tree-row').evaluateAll(rows => rows
+    .filter(row => row.style.getPropertyValue('--tree-depth') === '1')
+    .map(row => row.querySelector('span').textContent));
+  assert.deepEqual(labels, ['Partner Uploads','Ai_Ct_image']);
+  const myUpload = editor.getByRole('checkbox',{name:'My Upload'});
+  assert.equal(await myUpload.evaluate(input => input.closest('label').previousElementSibling.matches('[data-search]')),true);
+  const assetIds = () => editor.locator('.asset-grid [data-asset-key]').evaluateAll(cards => cards.map(card => card.dataset.assetKey));
+  async function answerView(view, folder='') {
+    await editor.waitForFunction(([view,folder])=>window.requests.at(-1)?.source_view===view&&window.requests.at(-1)?.folder===folder,[view,folder]);
+    await editor.evaluate(()=>window.answer(window.requests.at(-1)));
+    await editor.waitForFunction(([view,folder])=>{
+      const p=window.root.__hmbImageAssetLatestState?.catalog_page;
+      return p?.source_view===view&&p.folder===folder;
+    },[view,folder]);
+  }
+  await editor.getByRole('button',{name:/Partner Uploads/}).click();
+  await answerView('project',`site:${site}`);
+  assert.deepEqual(await assetIds(),[linkedOwner.asset_library_id,linkedOther.asset_library_id]);
+  await myUpload.check();
+  assert.ok((await assetIds()).every(id=>[ownerRow.asset_library_id,linkedOwner.asset_library_id].includes(id)),
+    'A previous catalog page must not flash another user’s images inside My Upload.');
+  await answerView('owned');
+  assert.deepEqual(await assetIds(),[ownerRow.asset_library_id,linkedOwner.asset_library_id]);
+  assert.equal(await editor.locator('[data-asset-edit]').count(),2);
+  assert.equal(await editor.evaluate(()=>window.root.__hmbImageAssetLatestState.selected_folder_path),`site:${site}`);
+  await myUpload.uncheck();
+  await answerView('project',`site:${site}`);
+  assert.deepEqual(await assetIds(),[linkedOwner.asset_library_id,linkedOther.asset_library_id]);
+  await editor.getByRole('button',{name:/Ai_Ct_image/}).click();
+  await answerView('default');
+  assert.deepEqual(await assetIds(),[ownerRow.asset_library_id,otherRow.asset_library_id]);
+  await myUpload.check();
+  await answerView('owned');
+  await editor.locator(`[data-asset-key="${linkedOwner.asset_library_id}"] [data-asset-edit]`).click();
+  await editor.getByRole('dialog',{name:'Edit registration'}).waitFor();
+  assert.match(await editor.locator('.passport-file').innerText(),/Partner Uploads\/add\/owned-link\.png/);
+  await editor.getByRole('button',{name:'Cancel',exact:true}).click();
+  await editor.locator(`[data-asset-key="${ownerRow.asset_library_id}"] [data-asset-edit]`).click();
   await editor.getByRole('dialog',{name:'Edit registration'}).waitFor();
   const remove = editor.locator('[data-registration-delete]');
+  assert.equal(await remove.textContent(),'Remove registration');
   await remove.click();
-  assert.equal(await remove.textContent(),'Confirm removal');
-  assert.equal(await editor.evaluate(() => window.writes.filter(v => (v.edits || v).asset_registration_request?.request_id).length),0);
-  await remove.click();
+  await editor.waitForFunction(() => window.writes.some(v => (v.edits || v).asset_registration_request?.request_id));
+  assert.ok(await remove.isDisabled());
+  assert.match(await editor.locator('[data-registration-status]').innerText(),/Removing registration/);
+  await remove.dispatchEvent('click');
+  assert.equal(await editor.evaluate(() => window.writes.filter(v => (v.edits || v).asset_registration_request?.request_id).length),1);
   const removal = await editor.evaluate(() => window.writes.map(v => (v.edits || v).asset_registration_request).find(v => v?.request_id));
   assert.equal(removal.action,'delete');
   assert.equal(removal.registration_revision,'test-owner-revision');
   assert.equal(removal.asset_library_id,ownerRow.asset_library_id);
+  await editor.evaluate(request => {
+    const full = structuredClone(window.full);
+    full.ui_edit_revision = window.writes.at(-1).ui_edit_revision;
+    full.assets = full.assets.map(row => row.asset_library_id === request.asset_library_id
+      ? {...row,registered:false,registration_revision:''} : row);
+    full.asset_registration_result = {request_id:request.request_id,ok:true,
+      asset_library_id:request.asset_library_id,message:'Registration removed; the image file is kept.'};
+    window.updateFull(full);
+  }, removal);
+  await editor.getByRole('dialog',{name:'Edit registration'}).waitFor({state:'hidden'});
+  assert.equal(await editor.locator('[data-asset-edit]').count(),1);
+  await editor.locator(`[data-asset-key="${linkedOwner.asset_library_id}"] [data-asset-edit]`).click();
+  await editor.getByRole('dialog',{name:'Edit registration'}).waitFor();
+  const pageRequestsBeforeUnlink = await editor.evaluate(() => window.requests.length);
+  await editor.evaluate(site => {
+    const full = structuredClone(window.full);
+    full.ui_edit_revision++;
+    full.scan_revision++;
+    full.my_upload_only = true;
+    full.selected_folder_path = '';
+    full.folder_signature = 'unlinked-folders';
+    full.manifest_signature = 'unlinked-registry';
+    full.folders = full.folders.filter(folder => !folder.startsWith(`site:${site}`));
+    full.assets = full.assets.filter(row => !row.relative_path.startsWith(`site:${site}/`));
+    full.site_settings = {links:[],write_site_id:'hq',revision:'unlinked-site-settings'};
+    full.asset_registration_result = {};
+    window.updateFull(full);
+  }, site);
+  await editor.getByRole('dialog',{name:'Edit registration'}).waitFor({state:'hidden'});
+  await answerView('owned');
+  assert.deepEqual(await assetIds(),[]);
+  assert.equal(await editor.getByRole('button',{name:/Partner Uploads/}).count(),0);
+  assert.equal(await editor.evaluate(() => window.requests.length),pageRequestsBeforeUnlink+1,
+    'Unlink settles with exactly one page request and no repeated reload');
+  assert.ok(await editor.evaluate(() => !window.root.__hmbImageAssetLatestState.scan_busy));
   await editor.close();
 
   // Five workstations have five independent drafts and receipt owners. A

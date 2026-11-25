@@ -398,6 +398,11 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- ImageAsset shows Ai_Ct_image and linked folders at the top level. External images can be registered in a selected root or subfolder. Project Add applies folder changes immediately.",
+            "- My Upload filters the current project's registrations by uploader. Authors can edit or remove their own registrations while preserving the source files.",
+            "- ImageAsset Refresh previews the registration JSON audit for each linked folder. After confirmation it backs up affected registries and removes verified missing entries.",
+            "- ImageAsset updates the Prompt preview as images are added or removed and preserves Shot identity across overlapping selections.",
+            "",
             "- ImageAsset resolves connected image inputs alongside saved shot selections. Publishing the same selection during file preparation now succeeds, while changing the selected images still discards stale results.",
             "- External images connected from Load Image appear in the active shot and its preview. Project-relative image paths retain their original reference when the workflow is reopened.",
             "- HMBPrompt batches incoming ImageAsset and VideoPicker updates in a shorter window and skips repeated error fingerprints for healthy inputs. The selected media and Shot ordering stay consistent.",

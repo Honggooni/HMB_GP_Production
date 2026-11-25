@@ -27,6 +27,10 @@ const report = {
   unregistered_paths: ["Background/new.png", "Background/새 이미지.png"],
   cleaned_count: 0,
   backup_path: "",
+  folders: [
+    {label:"Ai_Ct_image",project_root:"C:/projects/Example",registered_count:3,file_count:4,missing_count:0,cleaned_count:0,backup_path:""},
+    {label:"Partner A",project_root:"D:/Partner A",registered_count:4,file_count:4,missing_count:1,cleaned_count:0,backup_path:""},
+  ],
 };
 const initial = hmbNormalizeImageAssetState({
   project_root: report.project_root,
@@ -53,6 +57,8 @@ let markup = hmbRenderImageAssetRefreshReview(initial, view);
 assert.match(markup, /파일 없는 등록 정리/);
 assert.match(markup, /이동되었거나 이름이 바뀌었을 수/);
 assert.match(markup, /자동으로 등록하지 않습니다/);
+assert.match(markup, /검사한 폴더/);
+assert.match(markup, /Partner A/);
 assert.ok(markup.includes("Character/&lt;missing&gt; &amp; &quot;old&quot;.png"));
 assert.ok(!markup.includes("<missing>"));
 delete lifecycle.__hmbImageAssetRefreshReviewOpen;
@@ -141,7 +147,10 @@ assert.deepEqual(confirmed.container.__hmbImageAssetLatestState.asset_cleanup_re
 const futureWrites = [];
 hmbPublishImageAssetState(confirmed.container, { onChange(value) { futureWrites.push(JSON.parse(value)); } }, confirmed.container.__hmbImageAssetLatestState);
 assert.deepEqual(futureWrites[0].asset_cleanup_request, {}, "Later state publications cannot replay cleanup.");
-const cleanedState = hmbNormalizeImageAssetState({ ...confirmed.container.__hmbImageAssetLatestState, asset_refresh_review: { ...report, status: "cleaned", cleaned_count: 1, backup_path: "C:/projects/Example/backup.json" } });
+const cleanedState = hmbNormalizeImageAssetState({ ...confirmed.container.__hmbImageAssetLatestState, asset_refresh_review: {
+  ...report, status: "cleaned", cleaned_count: 1, backup_path: "D:/Partner A/backup.json",
+  folders: [report.folders[0], {...report.folders[1], missing_count:0, cleaned_count:1, backup_path:"D:/Partner A/backup.json"}],
+} });
 confirmed.remount(cleanedState);
 assert.match(confirmed.container.markup, /정리한 등록: 1/);
 assert.match(confirmed.container.markup, /backup\.json/);

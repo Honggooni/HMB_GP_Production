@@ -135,6 +135,28 @@ try {
     assert.equal(reordered.sameImages, true);
     assert.equal(reordered.removedImages, 0);
     cases[cases.length - 1].reordered = reordered;
+    const immediate = await page.evaluate(() => {
+      const f = selectionFixture, prompt = document.querySelector('#prompt');
+      const heading = () => prompt.querySelector('.image-card h3 b')?.textContent;
+      const writesBefore = f.writes.length;
+      for (let repeat=0; repeat<30; repeat++) {
+        f.container.querySelector('[data-selected-key="asset-2"] [data-remove-selected]').click();
+        if (heading() !== '2 / 50' || prompt.querySelector('[data-hmb-image-selection-pending="source-2"]')) {
+          throw Error(`Prompt did not remove image on click ${2*repeat+1}`);
+        }
+        f.container.querySelector('.asset-grid [data-asset-key="asset-2"]').click();
+        if (heading() !== '3 / 50' || !prompt.querySelector('[data-hmb-image-selection-pending="source-2"]')) {
+          throw Error(`Prompt did not add image on click ${2*repeat+2}`);
+        }
+      }
+      const firstPaintWrites = f.writes.length - writesBefore;
+      f.widget.hmbFlushImageAssetSelectionCommit(f.container);
+      f.controller.update({value:JSON.stringify(f.canonical),onChange:f.onChange});
+      return {firstPaintWrites, committed:f.writes.length - writesBefore, promptWrites:f.promptWrites,
+        error:f.container.querySelector('[data-transport-status]')?.textContent};
+    });
+    assert.deepEqual(immediate,{firstPaintWrites:0,committed:1,promptWrites:0,error:''},
+      'All 60 clicks repaint immediately before the retained selection is committed.');
     await page.evaluate(async () => {
       const f = selectionFixture, prompt = document.querySelector("#prompt");
       const shotIds = f.state.shot_routing.shots.map(shot => shot.shot_uuid);

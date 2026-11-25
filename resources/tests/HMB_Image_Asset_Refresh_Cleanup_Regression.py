@@ -157,6 +157,72 @@ class RefreshCleanupRegression(unittest.TestCase):
         self.assertIsInstance(node._hmb_refresh_authority, dict)
         return node, live, published
 
+    def linked_refresh_fixture(self):
+        from _hmb_image_asset_sites import _folder_identity
+
+        manifests = [self.manifest]
+        links = []
+        for label in ("Partner A", "Partner B"):
+            root = self.root.parent / label
+            manifest = root / ".json" / self.manifest.name
+            manifest.parent.mkdir(parents=True)
+            manifest.write_bytes(self.manifest.read_bytes())
+            media = root / self.keep["path"]
+            media.parent.mkdir(parents=True)
+            media.write_bytes((self.root / self.keep["path"]).read_bytes())
+            links.append({"id": _folder_identity(root), "label": label, "root": root.as_posix()})
+            manifests.append(manifest)
+        return {"revision": "linked-v1", "links": links, "write_site_id": links[0]["id"]}, manifests
+
+    def test_refresh_previews_and_cleans_each_linked_json_after_confirmation(self):
+        profile, manifests = self.linked_refresh_fixture()
+        originals = {path: path.read_bytes() for path in manifests}
+        with patch.object(library, "get_site_settings", return_value=profile):
+            node, live, _ = self.refresh_node()
+            report = live["state"]["asset_refresh_review"]
+            self.assertEqual(report["project_root"], self.root.as_posix())
+            self.assertEqual([row["label"] for row in report["folders"]], ["Ai_Ct_image", "Partner A", "Partner B"])
+            self.assertEqual(report["missing_count"], 3)
+            self.assertEqual(report["missing_paths"], [self.missing["path"],
+                f"Partner A / {self.missing['path']}", f"Partner B / {self.missing['path']}"])
+            self.assertEqual({path: path.read_bytes() for path in manifests}, originals)
+            self.assertNotIn("inventory_digest", str(report))
+            with patch.object(library, "_load_project_catalog", side_effect=lambda _root, state, **_kw: deepcopy(state)) as reload:
+                node._schedule_project_manifest_cleanup(live["state"], {"request_id": report["request_id"]})
+                applied = finish_worker(node, live)
+                self.assertFalse(applied["scan_busy"])
+                reload.assert_called_once()
+        report = applied["asset_refresh_review"]
+        self.assertEqual((report["status"], report["cleaned_count"], report["missing_count"]), ("cleaned", 3, 0))
+        for path, row in zip(manifests, report["folders"], strict=True):
+            self.assertEqual(row["cleaned_count"], 1)
+            self.assertEqual(Path(row["backup_path"]).read_bytes(), originals[path])
+            self.assertEqual(json.loads(path.read_bytes())["assets"], [self.keep])
+            self.assertTrue((path.parents[1] / self.keep["path"]).is_file())
+
+    def test_incomplete_and_changed_folder_registries_are_preserved(self):
+        profile, (default, available, unreadable) = self.linked_refresh_fixture()
+        unreadable.write_bytes(b'{"malformed user metadata"')
+        unreadable_before = unreadable.read_bytes()
+        with patch.object(library, "get_site_settings", return_value=profile), patch.object(
+            library, "_load_project_catalog", side_effect=lambda _root, state, **_kw: deepcopy(state)
+        ):
+            node, live, _ = self.refresh_node()
+            first_report = live["state"]["asset_refresh_review"]
+            self.assertEqual(first_report["missing_count"], 2)
+            self.assertIn("Partner B", first_report["error"])
+            replacement = dict(self.payload, assets=[*self.payload["assets"], record("Other.png", "FreshRegistration")])
+            available.write_text(json.dumps(replacement), encoding="utf-8")
+            available_before = available.read_bytes()
+            node._schedule_project_manifest_cleanup(live["state"], {"request_id": first_report["request_id"]})
+            finished = finish_worker(node, live)["asset_refresh_review"]
+        self.assertEqual(finished["cleaned_count"], 1)
+        self.assertIn("Partner A", finished["error"])
+        self.assertIn("Partner B", finished["error"])
+        self.assertEqual(json.loads(default.read_bytes())["assets"], [self.keep])
+        self.assertEqual(available.read_bytes(), available_before)
+        self.assertEqual(unreadable.read_bytes(), unreadable_before)
+
     def test_audit_full_relative_paths_missing_folder_and_no_mutation(self):
         before = self.snapshot()
         review = self.audit()

@@ -75,8 +75,6 @@ function openProjectFolderCards(container, state, options) {
 .hmb-project-folders .pf-card{min-width:0;border:1px solid #42506a;border-radius:6px;background:#131c2c;overflow:hidden}
 .hmb-project-folders .pf-card:has([aria-pressed=true]){border-color:#42c2d4;background:#123444}
 .hmb-project-folders .pf-select{display:flex;align-items:center;gap:10px;width:100%;min-height:50px;text-align:left;border:0;background:transparent}
-.hmb-project-folders .pf-write{display:flex;align-items:center;gap:6px;margin:0;padding:2px 10px 8px;font-size:12px;cursor:pointer}
-.hmb-project-folders .pf-write input{margin:0;accent-color:#6ad9ed}
 .hmb-project-folders .pf-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
 .hmb-project-folders .pf-icon{color:#7ccadc}
 .hmb-project-folders [data-pf-status]{min-height:1.5em;color:#9cabbf;font-size:12px;margin:9px 0}
@@ -88,21 +86,21 @@ function openProjectFolderCards(container, state, options) {
     + '<header><span class="pf-icon" aria-hidden="true">▱</span><span data-pf-title></span><button type="button" data-pf-close>×</button></header>'
     + '<section><label><span data-pf-project-label></span><select data-pf-project></select></label><div class="pf-controls"><strong data-pf-heading></strong><div class="pf-grid" data-pf-cards></div></div>'
     + '<div data-pf-status role="status" aria-live="polite"></div></section>'
-    + '<footer><button type="button" data-pf-add></button><button type="button" data-pf-remove></button><button type="button" data-pf-done></button></footer>';
+    + '<footer><button type="button" data-pf-add></button><button type="button" data-pf-remove></button>'
+    + (sound ? '<button type="button" data-pf-done></button>' : '') + '</footer>';
   const find = name => dialog.querySelector("[data-pf-" + name + "]");
   const select = find("project"), closeButton = find("close"), add = find("add"), remove = find("remove"), done = find("done");
   find("title").textContent = label("프로젝트 Add", "Project Add");
   find("project-label").textContent = label("프로젝트", "Project");
-  find("heading").textContent = sound ? label("추가한 폴더", "Added folders") : label("저장 폴더", "Save folders");
+  find("heading").textContent = sound ? label("추가한 폴더", "Added folders") : label("프로젝트 폴더", "Project folders");
   add.textContent = label("추가", "Add"); remove.textContent = label("삭제", "Remove");
-  done.textContent = label("완료", "Done");
+  if (done) done.textContent = label("완료", "Done");
   closeButton.setAttribute("aria-label", label("닫기", "Close"));
   let project = memory.pending?.project_uid || memory.project, disposed = false, confirmRequest = "";
   const notice = text => { find("status").textContent = text || ""; };
   const profile = () => memory.profiles.get(project);
   const selectedId = () => memory.selections.get(project) || "";
   const writeId = () => profile()?.write_site_id || "hq";
-  const writeGroup = "hmb-folder-write-" + String(globalThis.crypto?.randomUUID?.() || Math.random());
   function useSnapshot(snapshot) {
     // The editor may publish the local project catalog after the dialog opens.
     const available = sound && Array.isArray(snapshot.site_projects) ? snapshot.site_projects : snapshot.projects || [];
@@ -131,13 +129,13 @@ function openProjectFolderCards(container, state, options) {
     const grid = find("cards"); grid.replaceChildren();
     const links = profile()?.links || [];
     const folders = !sound && project ? [
-      {id: "hq", label: label("기본 폴더", "Default folder"), root: projects.get(project)?.path || ""},
       ...links,
+      {id: "hq", label: "Ai_Ct_image", root: projects.get(project)?.path || ""},
     ] : links;
     const pending = memory.pending;
     let selected = selectedId();
     if (!folders.some(folder => folder.id === selected)) {
-      selected = [profile()?.selected_site_id, writeId(), folders[0]?.id].find(id=>folders.some(folder=>folder.id === id)) || "";
+      selected = [profile()?.selected_site_id, folders[0]?.id].find(id=>folders.some(folder=>folder.id === id)) || "";
       memory.selections.set(project, selected);
     }
     for (const item of folders) {
@@ -150,19 +148,10 @@ function openProjectFolderCards(container, state, options) {
       name.className = "pf-name"; name.textContent = item.label || leaf(item.root);
       button.append(icon,name); card.appendChild(button); grid.appendChild(card);
       button.onclick = () => { memory.selections.set(project, item.id); paint(); notice(item.root); };
-      if (!sound) {
-        const field = doc.createElement("label"), radio = doc.createElement("input");
-        radio.type = "radio"; radio.name = writeGroup; radio.dataset.pfWriteSite = item.id;
-        radio.checked = item.id === writeId(); radio.disabled = !!pending || !profile()?.revision;
-        const caption = label("Add 저장 위치", "Add destination");
-        radio.setAttribute("aria-label", caption + " · " + (item.label || leaf(item.root)));
-        radio.onchange = () => { if (radio.checked && item.id !== writeId()) save(profile().links, item.id); };
-        field.className = "pf-write"; field.append(radio, doc.createTextNode(caption)); card.appendChild(field);
-      }
     }
     select.disabled = !!pending;
     add.disabled = !project || !!pending;
-    done.disabled = !project || !!pending;
+    if (done) done.disabled = !project || !!pending;
     remove.disabled = !profile()?.revision || !!pending || !links.some(link => link.id === selected);
   }
   function close() {
@@ -213,7 +202,7 @@ function openProjectFolderCards(container, state, options) {
   }
   select.onchange = () => { memory.project = project = select.value; paint(); notice(""); };
   add.onclick = () => request("browse_add");
-  done.onclick = () => request("confirm", {expected_revision:profile()?.revision || "", selected_site_id:selectedId()});
+  if (done) done.onclick = () => request("confirm", {expected_revision:profile()?.revision || "", selected_site_id:selectedId()});
   remove.onclick = () => {
     const selected = selectedId();
     if (profile()?.links.some(link => link.id === selected)) {

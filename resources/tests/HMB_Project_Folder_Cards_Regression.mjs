@@ -16,19 +16,20 @@ const exampleSite = "site-" + "a".repeat(32);
 const settings = {site_settings:{write_site_id:exampleSite,revision:"current"}};
 const baseAsset = {asset_library_id:"source",source_kind:"project",relative_path:"CH/Hero.png",asset_id:"Hero",registered:false};
 const vendorAsset = {...baseAsset,relative_path:"site:" + exampleSite + "/CH/Hero.png"};
-assert.equal(imageWidget.hmbImageAssetCanRegister(baseAsset, settings), false);
-assert.equal(imageWidget.hmbImageAssetCanRegister(vendorAsset, {}), false);
+assert.equal(imageWidget.hmbImageAssetCanRegister(baseAsset, settings), true);
+assert.equal(imageWidget.hmbImageAssetCanRegister(vendorAsset, {}), true);
 assert.equal(imageWidget.hmbImageAssetCanRegister(vendorAsset, settings), true);
 assert.equal(imageWidget.hmbImageAssetCanRegister({...vendorAsset,registered:true}, settings), false);
 assert.equal(imageWidget.hmbCreateImageAssetRegistrationDraft(vendorAsset, {}, settings).site_settings_revision, "current");
 assert.equal(imageWidget.hmbImageAssetCanRegister({...baseAsset,source_kind:"user",import_index:1}, settings), true);
 const imported = {...baseAsset,source_kind:"user",import_index:1};
 const defaultDraft = imageWidget.hmbCreateImageAssetRegistrationDraft(imported,{},settings);
-assert.equal(defaultDraft.target_folder,"site:"+exampleSite+"/add");
-assert.equal(defaultDraft.target_folder_confirmed,true);
+assert.equal(defaultDraft.target_folder,"");
+assert.equal(defaultDraft.target_folder_confirmed,false);
+assert.equal(defaultDraft.folder_picker_path,"");
 assert.equal(imageWidget.hmbCreateImageAssetRegistrationDraft(vendorAsset,{},settings).target_folder,"site:"+exampleSite+"/CH");
-assert.equal(imageWidget.hmbCreateImageAssetRegistrationDraft(imported,{},{}).target_folder,"add");
-assert.equal(imageWidget.hmbCreateImageAssetRegistrationDraft(imported,{},{}).target_folder_confirmed,true);
+assert.equal(imageWidget.hmbCreateImageAssetRegistrationDraft(imported,{},{}).target_folder,"");
+assert.equal(imageWidget.hmbCreateImageAssetRegistrationDraft(imported,{},{}).target_folder_confirmed,false);
 const browser = await nativeTestPlaywright().chromium.launch({executablePath:nativeTestBrowserPath(),headless:true});
 const errors=[];
 // Use the local/CI editor stylesheet when available; the fallback is its exact Desktop reset.
@@ -109,7 +110,8 @@ try {
           profile.write_site_id=req.write_site_id;
           if(!profile.links.some(link=>link.id===profile.selected_site_id))profile.selected_site_id=profile.links[0]?.id||"";
           profile.generation++;profile.revision="r"+(++f.writes);
-          setTimeout(deliver,0);
+          if(f.deferUnlink) f.finishUnlink=deliver;
+          else setTimeout(deliver,0);
           return;
         }
         if(req.action==="confirm"){
@@ -157,16 +159,15 @@ try {
     await page.setViewportSize({width:1240,height:900});
     assert.equal(await cards.count(),0);assert.equal(await remove.isDisabled(),true);
     const done=dialog.locator("[data-pf-done]");
-    assert.deepEqual(await dialog.locator("footer button").allTextContents(),["추가","삭제","완료"]);
+    assert.deepEqual(await dialog.locator("footer button").allTextContents(),media==="image"?["추가","삭제"]:["추가","삭제","완료"]);
     assert.deepEqual(await dialog.locator("select option").allTextContents(),["superwings12","Katuri8"]);
     const projects=dialog.locator("select");
     const baseCard=dialog.locator('[data-pf-site="hq"]');
     const selectedCard=dialog.locator('[data-pf-site]:not([data-pf-site="hq"])[aria-pressed="true"]');
-    const baseWrite=dialog.locator('[data-pf-write-site="hq"]');
     async function checkBase() {
       assert.equal(await baseCard.count(),Number(media==="image"));
-      assert.equal(await baseWrite.count(),Number(media==="image"));
-      if(media==="image") assert.equal(await baseCard.textContent(),"📁기본 폴더");
+      assert.equal(await dialog.locator('[data-pf-write-site]').count(),0);
+      if(media==="image") assert.equal(await baseCard.textContent(),"📁Ai_Ct_image");
     }
     await checkBase();
     assert.equal(await selectedCard.count(),0);
@@ -233,50 +234,57 @@ try {
     await first.click();
     assert.equal(await first.getAttribute("aria-pressed"),"true");
     assert.equal(await page.evaluate(()=>fixture.writes),beforeClick,"Clicking the card selects it without changing the Add destination");
-    await done.dblclick();
-    assert.equal(await done.isDisabled(),true);
-    assert.equal(await dialog.isVisible(),true,"Done waits for the matching durable acknowledgement");
-    const confirm=await page.evaluate(()=>fixture.calls.at(-1));
-    assert.equal(confirm.action,"confirm");assert.equal(confirm.selected_site_id,await first.getAttribute("data-pf-site"));
-    await page.evaluate(request=>fixture.deliverStale({...fixture.profiles.superwings12,request_id:"stale-"+request.request_id,project_uid:"superwings12",ok:true}),confirm);
-    assert.equal(await dialog.isVisible(),true);assert.equal(await done.isDisabled(),true);
-    await page.evaluate(()=>fixture.confirm(false));
-    await page.waitForFunction(()=>!document.querySelector("[data-pf-done]")?.disabled);
-    assert.match(await dialog.locator("[data-pf-status]").innerText(),/변경/);
-    await done.click();
-    await page.evaluate(()=>{
-      const current=fixture.profiles.superwings12, req=fixture.calls.at(-1);
-      const stale={...structuredClone(current),generation:current.generation+1,
-        selected_site_id:req.selected_site_id,request_id:req.request_id,project_uid:req.project_uid,ok:true};
-      current.generation+=2;
-      fixture.replayProfiles(fixture.profiles);
-      fixture.deliverStale(stale);
-    });
-    assert.equal(await dialog.isVisible(),true,"A stale Done receipt must not close over a newer saved selection with the same revision");
-    assert.equal(await done.isEnabled(),true);
-    await first.click();
-    await done.click();await page.evaluate(()=>fixture.confirm());
-    await dialog.waitFor({state:"detached"});
-    await page.evaluate(()=>fixture.remount());
-    await button.click();await first.waitFor();
-    assert.equal(await first.getAttribute("aria-pressed"),"true","A fresh widget restores the selected folder from the confirmed profile");
-    if(media==="image")assert.equal(await baseWrite.isChecked(),true);
-    const writeSite=dialog.locator("[data-pf-write-site]");
+    if (media==="sound") {
+      await done.dblclick();
+      assert.equal(await done.isDisabled(),true);
+      assert.equal(await dialog.isVisible(),true,"Done waits for the matching durable acknowledgement");
+      const confirm=await page.evaluate(()=>fixture.calls.at(-1));
+      assert.equal(confirm.action,"confirm");assert.equal(confirm.selected_site_id,await first.getAttribute("data-pf-site"));
+      await page.evaluate(request=>fixture.deliverStale({...fixture.profiles.superwings12,request_id:"stale-"+request.request_id,project_uid:"superwings12",ok:true}),confirm);
+      assert.equal(await dialog.isVisible(),true);assert.equal(await done.isDisabled(),true);
+      await page.evaluate(()=>fixture.confirm(false));
+      await page.waitForFunction(()=>!document.querySelector("[data-pf-done]")?.disabled);
+      assert.match(await dialog.locator("[data-pf-status]").innerText(),/변경/);
+      await done.click();
+      await page.evaluate(()=>{
+        const current=fixture.profiles.superwings12, req=fixture.calls.at(-1);
+        const stale={...structuredClone(current),generation:current.generation+1,
+          selected_site_id:req.selected_site_id,request_id:req.request_id,project_uid:req.project_uid,ok:true};
+        current.generation+=2;
+        fixture.replayProfiles(fixture.profiles);
+        fixture.deliverStale(stale);
+      });
+      assert.equal(await dialog.isVisible(),true,"A stale Done receipt must not close over a newer saved selection with the same revision");
+      assert.equal(await done.isEnabled(),true);
+      await first.click();
+      await done.click();await page.evaluate(()=>fixture.confirm());
+      await dialog.waitFor({state:"detached"});
+      await page.evaluate(()=>fixture.remount());
+      await button.click();await first.waitFor();
+      assert.equal(await first.getAttribute("aria-pressed"),"true","A fresh widget restores the selected folder from the confirmed profile");
+    }
     if (media==="image") {
-      const siteId=await first.getAttribute("data-pf-site");
-      await dialog.locator('[data-pf-write-site="'+siteId+'"]').click();
-      await page.waitForFunction(id=>fixture.profiles.superwings12.write_site_id===id,siteId);
-      await baseWrite.click();
-      await page.waitForFunction(()=>fixture.profiles.superwings12.write_site_id==="hq");
       await baseCard.click();
       assert.equal(await remove.isDisabled(),true,"The baseline folder cannot be removed.");
       await first.click();
-    } else assert.equal(await writeSite.count(),0);
+    }
     await page.waitForFunction(()=>!document.querySelector("[data-pf-remove]")?.disabled);
-    await remove.click();await first.waitFor({state:"detached"});
+    if (media==="image") {
+      const beforeUnlink=await page.evaluate(()=>{
+        fixture.deferUnlink=true;
+        return structuredClone(fixture.profiles);
+      });
+      await remove.click();
+      await dialog.locator('[data-pf-close]').click();
+      await dialog.waitFor({state:'detached'});
+      await page.evaluate(()=>{fixture.finishUnlink();fixture.deferUnlink=false;});
+      await page.evaluate(old=>fixture.replayProfiles(old),beforeUnlink);
+      await button.click(); await second.waitFor();
+    } else {
+      await remove.click(); await first.waitFor({state:"detached"});
+    }
     assert.equal(await first.count(),0);
     assert.equal(await second.getAttribute("aria-pressed"),"true","Removing the selected link selects the remaining linked folder");
-    if(media==="image") assert.equal(await baseWrite.isChecked(),true);
     await dialog.locator("[data-pf-close]").click();
     await button.click(); await second.waitFor();
     await checkBase();
@@ -288,16 +296,22 @@ try {
     await page.evaluate(()=>fixture.replayProfiles({}));
     await dialog.locator("[data-pf-close]").click();await button.click();
     assert.equal(await cards.count(),0);
-    await done.click();await page.evaluate(()=>fixture.confirm());await dialog.waitFor({state:"detached"});
+    if (media==="image") {
+      assert.equal(await done.count(),0);
+      await dialog.locator('[data-pf-close]').click();
+    } else {
+      await done.click();await page.evaluate(()=>fixture.confirm());await dialog.waitFor({state:"detached"});
+    }
     const snapshots=await page.evaluate(()=>({calls:fixture.calls,profiles:fixture.profiles}));assert.equal(snapshots.profiles.Katuri8.revision,"r0");
     assert.equal(snapshots.profiles.superwings12.links.length,0);assert.equal(snapshots.profiles.superwings12.write_site_id,"hq");
     assert.deepEqual(snapshots.calls.filter(command=>command.action==="browse_add").map(command=>command.project_uid),
       ["Katuri8","superwings12","superwings12"]);
     assert.equal(new Set(snapshots.calls.map(command=>command.request_id)).size,snapshots.calls.length);
+    if (media==="image") assert.equal(snapshots.calls.filter(command=>command.action==="confirm").length,0);
     const updates=snapshots.calls.filter(command=>command.action==="update_links");
-    assert.equal(updates.length,media==="image"?4:2);
+    assert.equal(updates.length,2);
     assert.ok(updates.every(command=>command.expected_revision));
-    await page.close();console.log(media+": Desktop dialog centering, immediate browse without profile, cancel, project+request ownership, single confirmation, UNC, unlink and reopen PASS");
+    await page.close();console.log(media+": Desktop dialog centering, immediate browse, cancel, project+request ownership, UNC, unlink and reopen PASS");
   }
   assert.deepEqual(errors,[]);
 }finally{await browser.close();}

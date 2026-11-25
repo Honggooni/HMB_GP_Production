@@ -190,6 +190,20 @@ for needle in ("", "캐릭터", "İΣ", "id-000097", "main\nhero", "background",
             assert page["total"] == len(matching)
 rows[97]["image_name"] = "externally-mutated"
 assert index.query({"query": "캐릭터", "source_view": "project"})["total"] == len(expected(assets(5000), "캐릭터"))
+
+owned_rows = [
+    dict(rows[1], registration_revision="owner-on-default"),
+    dict(rows[2], relative_path="site:partner/add/owned.png", registration_revision="owner-on-partner"),
+    dict(rows[3], relative_path="site:partner/add/other.png"),
+    rows[4],
+]
+owned_index = image._ImageCatalogSearchIndex(owned_rows)
+assert owned_index.query({"source_view": "owned"})["asset_library_ids"] == ["lib-1", "lib-2"]
+assert owned_index.stats["candidate_checks"] == 2, "My Upload must query only the owner's indexed rows"
+assert owned_index.query({"source_view": "owned", "query": "owned.png"})["asset_library_ids"] == ["lib-2"]
+assert owned_index.query({"source_view": "default"})["asset_library_ids"] == ["lib-1", "lib-4"]
+assert owned_index.query({"source_view": "project", "folder": "site:partner"})["asset_library_ids"] == ["lib-2", "lib-3"]
+assert image._normalize_thumbnail_bridge({"operation": "catalog_page", "phase": "request", "source_view": "owned"})["source_view"] == "owned"
 result = asyncio.run(check_protocol())
 
 # Stress index only: production import/scan limit stays 5,000.

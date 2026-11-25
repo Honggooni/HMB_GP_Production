@@ -38,7 +38,7 @@ if str(_THIS_DIR) not in sys.path:
 
 from _hmb_deletion_guard import hmb_binding_mutation
 from _hmb_image_asset_sites import (
-    run_site_folder_command, ensure_registration_directory, get_site_settings, save_site_settings,
+    run_site_folder_command, get_site_settings, save_site_settings,
     site_profiles, verify_folder_identity, image_execution_workspace,
 )
 from _hmb_project import project_display_name
@@ -154,9 +154,13 @@ IMAGE_ASSET_EDIT_CATALOG_FIELDS = (
     "catalog_root", "project_root", "project_uid", "project_cache_uid",
     "manifest_signature", "folder_signature", "scan_revision",
 )
+IMAGE_ASSET_CATALOG_SEARCH_FIELDS = (
+    "asset_id", "image_name", "relative_path", "image_main_type", "image_sub_type",
+    "source_kind", "asset_library_id", "source_uid", "registration_revision",
+)
 IMAGE_ASSET_EDIT_FIELDS = (
     "root_edit_enabled", "selected_folder_path", "expanded_folders",
-    "selected_main_type", "selected_sub_type", "selected_source_view",
+    "selected_main_type", "selected_sub_type", "selected_source_view", "my_upload_only",
     "search", "language", "asset_view_mode", "refresh_revision",
     "thumbnail_request", "asset_registration_request", "asset_cleanup_request", "site_settings_request",
     "disconnect_import_uid", "shot_routing", "shot_hierarchy", "shot_hierarchy_request",
@@ -517,14 +521,20 @@ def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _image_asset_source_view(value: Any) -> str:
+    view = _clean(value).casefold()
+    return view if view in {"project", "user", "owned", "default"} else "project"
+
+
 class _ImageCatalogSearchIndex:
     """Immutable, background-built substring index; no files or SDK access."""
 
     def __init__(self, assets: Sequence[Dict[str, Any]], cancelled: Callable[[], bool] = lambda: False):
-        fields = ("asset_id", "image_name", "relative_path", "image_main_type", "image_sub_type", "source_kind", "asset_library_id")
-        self.assets = tuple({key: _clean(asset.get(key)) for key in fields} for asset in assets)
+        self.assets = tuple({key: _clean(asset.get(key)) for key in IMAGE_ASSET_CATALOG_SEARCH_FIELDS}
+                            for asset in assets)
         self.texts: List[str] = []
         self.postings: Dict[str, Any] = {}
+        self.owned_rows = array("I")
         self.folder_counts: Dict[str, int] = {}
         self.stats = {"records": len(assets), "queries": 0, "candidate_checks": 0}
         for number, asset in enumerate(self.assets):
@@ -536,6 +546,8 @@ class _ImageCatalogSearchIndex:
             for gram in set(text[pos:pos + 3] for pos in range(max(0, len(text) - 2))):
                 self.postings.setdefault(gram, array("I")).append(number)
             if asset.get("source_kind") == "project":
+                if asset["registration_revision"]:
+                    self.owned_rows.append(number)
                 parts = _clean(asset.get("relative_path")).replace("\\", "/").split("/")[:-1]
                 for depth in range(len(parts) + 1):
                     folder = "/".join(parts[:depth])
@@ -544,18 +556,23 @@ class _ImageCatalogSearchIndex:
     def query(self, request: Dict[str, Any], cancelled: Callable[[], bool] = lambda: False) -> Dict[str, Any]:
         needle = str(request.get("query") or "").strip().lower()
         folder = _clean(request.get("folder")).replace("\\", "/").strip("/").lower()
-        source = "user" if request.get("source_view") == "user" else "project"
-        candidates: Any = range(len(self.assets))
+        view = _image_asset_source_view(request.get("source_view"))
+        source = "user" if view == "user" else "project"
+        candidates: Any = self.owned_rows if view == "owned" else range(len(self.assets))
         if len(needle) >= 3:
             grams = {needle[pos:pos + 3] for pos in range(len(needle) - 2)}
-            candidates = min((self.postings.get(gram, ()) for gram in grams), key=len)
+            candidates = min([candidates, *(self.postings.get(gram, ()) for gram in grams)], key=len)
         matches = []
         for position, number in enumerate(candidates):
             if position % 256 == 0 and cancelled():
                 raise InterruptedError("Catalog query retired")
             asset = self.assets[number]
             relative = _clean(asset.get("relative_path")).replace("\\", "/").lower()
-            if asset.get("source_kind") != source or (source == "project" and folder
+            if (asset.get("source_kind") != source
+                    or (view == "owned" and not asset["registration_revision"])
+                    or (view == "default" and relative.startswith("site:"))):
+                continue
+            if (view == "project" and folder
                     and not (relative == folder or relative.startswith(folder + "/"))):
                 continue
             self.stats["candidate_checks"] += 1
@@ -635,7 +652,7 @@ def _normalize_thumbnail_bridge(value: Any) -> Dict[str, Any]:
             sequence=_non_negative_int(raw.get("sequence")),
             query=str(raw.get("query") or "")[:256],
             folder=_clean(raw.get("folder")).replace("\\", "/").strip("/")[:4096],
-            source_view="user" if raw.get("source_view") == "user" else "project",
+            source_view=_image_asset_source_view(raw.get("source_view")),
             offset=_non_negative_int(raw.get("offset")), limit=min(80, max(1, _non_negative_int(raw.get("limit")) or 80)))
         if phase == "result":
             bridge["state"] = raw.get("state") if isinstance(raw.get("state"), dict) else {}
@@ -4706,6 +4723,7 @@ def _normalize_asset_refresh_review(value: Any) -> Dict[str, Any]:
         "safe_to_clean": source.get("safe_to_clean") is True,
         "error": _clean(source.get("error"))[:4096],
         "backup_path": _clean(source.get("backup_path"))[:4096],
+        "folders": [],
     }
     for key in ("registered_count", "file_count", "missing_count",
                 "unregistered_count", "cleaned_count"):
@@ -4715,7 +4733,32 @@ def _normalize_asset_refresh_review(value: Any) -> Dict[str, Any]:
         result[key] = [
             _clean(item)[:4096] for item in values if isinstance(item, str) and _clean(item)
         ][:MAX_ASSETS] if isinstance(values, list) else []
+    for folder in (source.get("folders", []) if isinstance(source.get("folders"), list) else [])[:129]:
+        if not isinstance(folder, dict):
+            continue
+        result["folders"].append({
+            "label": _clean(folder.get("label"))[:128],
+            "project_root": _clean(folder.get("project_root"))[:4096],
+            "error": _clean(folder.get("error"))[:4096],
+            "backup_path": _clean(folder.get("backup_path"))[:4096],
+            **{key: _non_negative_int(folder.get(key)) for key in (
+                "registered_count", "file_count", "missing_count", "unregistered_count", "cleaned_count")},
+        })
     return result
+
+
+def _summarize_asset_refresh_folders(folders: list[dict[str, Any]]) -> Dict[str, Any]:
+    """Keep per-directory proofs private and report paths with their folder names."""
+    summary = dict(folders=folders, safe_to_clean=any(folder.get("safe_to_clean") for folder in folders),
+                   backup_path=next((folder["backup_path"] for folder in folders if folder.get("backup_path")), ""))
+    for key in ("registered_count", "file_count", "missing_count", "unregistered_count", "cleaned_count"):
+        summary[key] = sum(_non_negative_int(folder.get(key)) for folder in folders)
+    for key in ("missing_paths", "unregistered_paths"):
+        summary[key] = [path if folder["site_id"] == "hq" else f"{folder['label']} / {path}"
+                        for folder in folders for path in folder.get(key, [])]
+    summary["error"] = "\n".join(f"{folder['label']}: {message}" for folder in folders
+        for message in (folder.get("error"), folder.get("backup_warning")) if message)
+    return summary
 
 
 def _normalize_cgt_work_start_notice(value: Any) -> Dict[str, Any]:
@@ -4751,10 +4794,11 @@ def _default_state() -> Dict[str, Any]:
         "tree": _build_asset_tree("", "", [], []),
         "root_edit_enabled": False,
         "selected_folder_path": "",
-        "expanded_folders": ["$root"],
+        "expanded_folders": ["$root", "$default"],
         "selected_main_type": "",
         "selected_sub_type": "",
         "selected_source_view": "project",
+        "my_upload_only": False,
         "search": "",
         "language": "ko",
         "asset_view_mode": "image",
@@ -4838,13 +4882,11 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
     if isinstance(raw_expanded, list):
         for raw in raw_expanded:
             folder = _clean(raw).replace("\\", "/").strip("/")
-            if raw == "$root" or folder == "$root":
-                folder = "$root"
-            if folder == "$root" or folder in folders:
+            if folder in {"$root", "$default"} or folder in folders:
                 if folder not in expanded_folders:
                     expanded_folders.append(folder)
     if not isinstance(raw_expanded, list) and project_root:
-        expanded_folders = ["$root"]
+        expanded_folders = ["$root", "$default"]
     selected_main_type = _clean(source.get("selected_main_type"))
     selected_sub_type = _clean(source.get("selected_sub_type"))
     if selected_main_type == IMAGE_MAIN_TYPE_UNCLASSIFIED:
@@ -4857,8 +4899,8 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
         not in image_sub_type_choices_for_main_type(selected_main_type)
     ):
         selected_sub_type = ""
-    selected_source_view = _clean(source.get("selected_source_view")).casefold()
-    if selected_source_view not in {"project", "user"}:
+    selected_source_view = _image_asset_source_view(source.get("selected_source_view"))
+    if selected_source_view == "owned":
         selected_source_view = "project"
     try:
         scan_revision = max(0, int(source.get("scan_revision") or 0))
@@ -4905,6 +4947,7 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
             "selected_main_type": selected_main_type,
             "selected_sub_type": selected_sub_type,
             "selected_source_view": selected_source_view,
+            "my_upload_only": source.get("my_upload_only") is True,
             "search": _clean(source.get("search"))[:256],
             "language": (
                 "en"
@@ -5275,6 +5318,7 @@ _ASYNC_SCAN_LIVE_STATE_FIELDS = (
     "selected_main_type",
     "selected_sub_type",
     "selected_source_view",
+    "my_upload_only",
     "search",
     "language",
     "asset_view_mode",
@@ -5859,18 +5903,16 @@ def _discover_shared_image_projects(root: Any, *, refresh: bool = False) -> Dict
     return _catalog_read_once(_session_catalog_key("projects", root), discover, refresh=refresh)
 
 
-def _scan_linked_sites(project: Path, settings: dict, prior: dict, *, refresh=False, pinned=None) -> dict:
+def _scan_linked_sites(project: Path, settings: dict, prior: dict, *, pinned=None) -> dict:
     # On a profile edit the pinned facts are from this engine's last verified
     # read. Workflow data may preserve selections but cannot replace those facts.
-    writer = settings["write_site_id"]
-    previous_writer = pinned.get("_write_site_id", "hq") if pinned is not None else ""
     known_sites = set(pinned.get("folders", [])) if pinned is not None else set()
-    if pinned is not None and (writer != "hq" or previous_writer == "hq"):
+    if pinned is not None:
         home = {**pinned, "assets": [row for row in pinned["assets"] if _site_location(row["relative_path"])[0] == "hq"],
                 "folders": [folder for folder in pinned["folders"] if not folder.startswith("site:")]}
     else:
         home = _scan_project_assets(project, previous_scan=prior)
-    rows = [row for row in home["assets"] if settings["write_site_id"] == "hq" or row.get("registered")]
+    rows = list(home["assets"])
     folders = list(home["folders"])
     warnings = list(home["warnings"])
     manifest_signatures = [home["manifest_signature"]]
@@ -5880,31 +5922,27 @@ def _scan_linked_sites(project: Path, settings: dict, prior: dict, *, refresh=Fa
         prefix = f"site:{site}"
         previous_rows = [r for r in prior.get("assets", []) if _site_location(r.get("relative_path"))[0] == site]
         folders.append(prefix)
-        if prefix in known_sites and (site != writer or previous_writer == writer):
-            rows.extend(row for row in previous_rows if site == writer or row.get("registered"))
+        if prefix in known_sites:
+            rows.extend(previous_rows)
             folders.extend(folder for folder in pinned["folders"] if folder.startswith(prefix + "/"))
             manifest_signatures.append(site)
             folder_signatures.append(site)
             continue
         try:
             physical = _site_root(project, settings, site)
-            notice = ensure_registration_directory(physical, refresh=refresh, vendor=True)
-            if notice:
-                warnings.append(f'{link["label"]}: {notice}')
             previous = {"project_cache_uid": _project_cache_uid(physical),
                         "assets": [{**r, "relative_path": _site_location(r["relative_path"])[1]} for r in previous_rows]}
             external = _scan_project_assets(physical, previous_scan=previous)
         except (OSError, ValueError) as exc:
             # Preserve the author's selection while this link is temporarily
             # offline. Offline rows are display data, never handover authority.
-            rows.extend({**r, "connected": False} for r in previous_rows if site == settings["write_site_id"] or r.get("registered"))
+            rows.extend({**r, "connected": False} for r in previous_rows)
             folders.extend(f for f in prior.get("folders", []) if f.startswith(prefix + "/"))
             warnings.append(f'{link["label"]}: 등록 폴더를 확인할 수 없습니다. {exc}')
             manifest_signatures.extend((site, "offline"))
             folder_signatures.extend((site, "offline"))
             continue
-        rows.extend(_site_view_row(row, home["project_id"], home["project_uid"], site) for row in external["assets"]
-                    if site == settings["write_site_id"] or row.get("registered"))
+        rows.extend(_site_view_row(row, home["project_id"], home["project_uid"], site) for row in external["assets"])
         folders.extend(f"{prefix}/{name}" for name in external["folders"])
         warnings.extend(external["warnings"])
         manifest_signatures.extend((site, external["manifest_signature"]))
@@ -5935,17 +5973,13 @@ def _read_verified_image_catalog(
                 pinned = next((value.result() for key, value in reversed(_CATALOG_READS.items())
                                if key[:2] == ("catalog", prefix) and value.done() and not value.cancelled()
                                and value.exception() is None), None)
-        # Keep an existing catalog index valid when the default Add folder is
-        # still virtual. Confirming the default or writing its first Add
-        # prepares the physical directory without slowing workflow reopen.
-        notice = "" if pinned is not None else ensure_registration_directory(project, refresh=not use_shared_cache)
         if pinned is not None:
             facts = _scan_linked_sites(project, settings, pinned, pinned=pinned)
         elif settings.get("links"):
             previous = _read_local_catalog_snapshot(project, {**neutral, **state}) or state
             if _clean(previous.get("project_cache_uid")) != _project_cache_uid(project):
                 previous = {}
-            facts = _scan_linked_sites(project, settings, previous, refresh=not use_shared_cache)
+            facts = _scan_linked_sites(project, settings, previous)
         elif use_shared_cache and reuse_saved and state.get("project_cache_uid"):
             facts = _rebind_shared_catalog_snapshot(
                 _shared_catalog_snapshot(state), selected, catalog, refresh_manifest=True
@@ -5954,12 +5988,9 @@ def _read_verified_image_catalog(
             facts = _read_catalog_index(project, neutral)
         if facts is None:
             facts = _scan_project_assets(project, previous_scan=state)
-        if notice:
-            facts = {**facts, "warnings": [*facts.get("warnings", []), notice]}
         # Only the just-verified catalog may supply legacy manifest defaults.
         # Workflow-authored choices are merged after this neutral session read.
         facts = _shared_catalog_snapshot({**facts, **neutral}, registry_defaults=True)
-        facts["_write_site_id"] = settings["write_site_id"]
         facts["_site_catalog_revision"] = settings["revision"]
         _prepare_catalog_scan_index(facts, normalized=True)
         return facts
@@ -6548,7 +6579,7 @@ def _select_catalog_project(
     merged["selected_sub_type"] = ""
     merged["selected_source_view"] = "project"
     merged["selected_folder_path"] = ""
-    merged["expanded_folders"] = ["$root"]
+    merged["expanded_folders"] = ["$root", "$default"]
     return _normalize_state(merged)
 
 
@@ -6601,10 +6632,10 @@ def _registration_folder_path(project_root: Path, folder_value: Any) -> Path:
     """Resolve one existing project folder without creating or following redirects."""
     folder_text = _clean(folder_value).replace("\\", "/").strip("/")
     parts = [part for part in folder_text.split("/") if part]
-    if not parts:
-        raise ValueError(
-            "Select an existing Asset Folder below the project root before registering."
-        )
+    if folder_text == "$default":
+        parts = []
+    elif not parts:
+        raise ValueError("Select an existing Asset Folder before registering.")
     if any(part in {".", ".."} for part in parts):
         raise ValueError("Project Folder contains an unsafe path segment.")
     if Path(folder_text).is_absolute() or re.match(r"^[A-Za-z]:", folder_text):
@@ -7121,16 +7152,10 @@ def _commit_asset_registration(
     writer = settings["write_site_id"]
     action = request["action"]
     explicit_site = request["target_site_id"] if request_source_kind == "user" else ""
-    if request_source_kind == "user" and not explicit_site and not request["target_folder"] and writer != "hq":
-        request["target_folder"] = f"site:{writer}/add"
     site, site_rel = _site_location(request.get("relative_path") if request_source_kind == "project"
                                     else request.get("target_folder"))
-    if explicit_site:
-        if (not settings["links"] or site != explicit_site or not site_rel
-                or (site == "hq" and request["target_folder"].startswith("site:"))):
-            raise ValueError("선택한 저장 위치와 하위 에셋 폴더를 다시 확인하세요.")
-    elif action == "add" and site != writer:
-        raise ValueError("현재 작업 위치의 이미지 폴더에만 등록할 수 있습니다.")
+    if explicit_site and site != explicit_site:
+        raise ValueError("선택한 에셋 폴더를 다시 확인하세요.")
     write_root = selected_root
     project_id = _clean(selected_project["project_id"])
     write_project_id = project_id
@@ -7243,16 +7268,9 @@ def _commit_asset_registration(
             and not _is_user_import_relative_path(f"{_site_location(folder)[1]}/asset.png")
         }
         if not requested_folder:
-            raise ValueError(
-                "Select an existing Asset Folder below the project root before registering."
-            )
-        # A newly linked folder is usable before the next user-initiated scan.
-        # Only its known default import destination may bypass the snapshot.
-        if site_rel.casefold() == "add" or (site != "hq" and not site_rel):
-            target_folder = "add"
-            notice = ensure_registration_directory(write_root, vendor=True)
-            if notice:
-                raise ValueError(notice)
+            raise ValueError("Select an existing Asset Folder before registering.")
+        if requested_folder == "$default" or (site != "hq" and requested_folder == f"site:{site}"):
+            target_folder = "$default"
         elif requested_folder.casefold() not in available_folders:
             raise ValueError("The selected Project Folder is no longer available.")
         else:
@@ -11759,10 +11777,23 @@ class HMBImageAssetLibrary(DataNode):
         old_rows = {row["shot_uuid"]: row for row in current_routing.get("shots", [])}
         new_generation = _non_negative_int(routing.get("generation"))
         old_generation = _non_negative_int(current_routing.get("generation"))
+        current_ids = list(old_rows)
+        submitted_ids = [row["shot_uuid"] for row in rows]
         if new_generation < old_generation:
-            raise ValueError("Image asset Shot structure changed; refresh and retry.")
-        if ([row["shot_uuid"] for row in current_routing.get("shots", [])]
-                != [row["shot_uuid"] for row in rows] and new_generation <= old_generation):
+            # File verification can advance its publication cursor before the
+            # browser receives that acknowledgement. A newer click may carry
+            # the older derived clock even though its Shot and edit still own
+            # the selection. Rebase only the cursor; structural and row-level
+            # conflicts still pass through their existing checks.
+            if (revision <= _non_negative_int(base.get(UI_EDIT_REVISION_KEY))
+                    or submitted_ids != current_ids
+                    or any(row.get(field) != old_rows[row["shot_uuid"]].get(field)
+                           for row in rows for field in ("number", "name", "name_is_custom"))):
+                raise ValueError("Image asset Shot structure changed; refresh and retry.")
+            new_generation = old_generation + 1
+            routing = dict(routing, generation=new_generation)
+            edits["shot_routing"] = routing
+        if submitted_ids != current_ids and new_generation <= old_generation:
             raise ValueError("Image asset Shot structure requires a newer structure revision.")
         for row in rows:
             previous = old_rows.get(row["shot_uuid"])
@@ -11878,9 +11909,7 @@ class HMBImageAssetLibrary(DataNode):
                 serialized = _json_text(normalized_state)
         # A detached scalar search projection owns index invalidation. Selection
         # and thumbnail edits do not rebuild it; same-count metadata edits do.
-        fields = ("asset_id", "image_name", "relative_path", "image_main_type",
-                  "image_sub_type", "source_kind", "asset_library_id", "source_uid")
-        projection = tuple(tuple(_clean(asset.get(key)) for key in fields)
+        projection = tuple(tuple(_clean(asset.get(key)) for key in IMAGE_ASSET_CATALOG_SEARCH_FIELDS)
                            for asset in normalized_state.get("assets", []))
         if projection != getattr(self, "_hmb_catalog_search_projection", None):
             self._hmb_catalog_search_projection = projection
@@ -11943,7 +11972,7 @@ class HMBImageAssetLibrary(DataNode):
             return None
         rebased = dict(latest)
         rebased.update(project_root=selected["path"], project_id="", project_uid="", project_cache_uid="",
-                       folder_signature="", selected_folder_path="", expanded_folders=["$root"],
+                       folder_signature="", selected_folder_path="", expanded_folders=["$root", "$default"],
                        selected_main_type="", selected_sub_type="", selected_source_view="project")
         rebased[UI_EDIT_REVISION_KEY] = revision
         return rebased
@@ -13107,10 +13136,8 @@ class HMBImageAssetLibrary(DataNode):
                         return bool(getattr(owner, "_hmb_node_deleted", False)) or identity != owner._catalog_search_epoch(live)
                     try:
                         if owner._hmb_catalog_search_index_epoch != identity:
-                            fields = ("asset_id", "image_name", "relative_path", "image_main_type",
-                                      "image_sub_type", "source_kind", "asset_library_id", "source_uid")
                             index = _ImageCatalogSearchIndex(
-                                [dict(zip(fields, row)) for row in projection], epoch_retired)
+                                [dict(zip(IMAGE_ASSET_CATALOG_SEARCH_FIELDS, row)) for row in projection], epoch_retired)
                             if epoch_retired():
                                 continue
                             owner._hmb_catalog_search_index = index
@@ -14750,23 +14777,24 @@ class HMBImageAssetLibrary(DataNode):
         def read_project() -> Any:
             if project_root:
                 settings = get_site_settings(project_root, fresh=True)
-                writer = settings["write_site_id"]
-                try:
-                    audit_root = _site_root(Path(project_root), settings, writer)
-                    audit = _audit_project_manifest_refresh(audit_root)
-                except (OSError, ValueError) as exc:
-                    audit = {"project_root": project_root, "safe_to_clean": False, "error": str(exc)}
-                report.update(audit)
+                folders = []
+                for link in [{"id": "hq", "label": "Ai_Ct_image", "root": project_root}, *settings["links"]]:
+                    try:
+                        audit_root = _site_root(Path(project_root), settings, link["id"])
+                        audit = _audit_project_manifest_refresh(audit_root)
+                    except (OSError, ValueError) as exc:
+                        audit = {"project_root": link["root"], "safe_to_clean": False, "error": str(exc)}
+                    folders.append({**audit, "site_id": link["id"], "label": link["label"]})
+                report.update(_summarize_asset_refresh_folders(folders))
                 report.update({
                     "request_id": token,
-                    "catalog_project_root": project_root,
+                    "project_root": project_root,
                     "site_revision": settings["revision"],
-                    "write_site_id": writer,
                     "project_uid": _clean(state.get("project_uid")),
                     "project_id": _clean(state.get("project_id")),
-                    "status": "error" if audit.get("error") else "review",
+                    "status": "review" if report["safe_to_clean"] else "error",
                 })
-                if audit.get("error") and not settings["links"]:
+                if not report["safe_to_clean"]:
                     # Do not replace a verified catalog with a partial share walk.
                     return state
             loaded = _load_project_catalog(catalog_root, state, use_shared_cache=False)
@@ -14775,6 +14803,8 @@ class HMBImageAssetLibrary(DataNode):
                 or _clean(loaded.get("project_uid")) != _clean(state.get("project_uid"))
             ):
                 raise ValueError("The selected project is no longer available; the previous catalog was retained.")
+            if project_root and get_site_settings(project_root)["revision"] != report["site_revision"]:
+                raise ValueError("검사 중 폴더 연결이 변경되었습니다. 새로고침 후 다시 확인하세요.")
             return self._merge_captured_imports_into_scan(loaded, import_value)
 
         def refresh() -> Any:
@@ -14808,7 +14838,7 @@ class HMBImageAssetLibrary(DataNode):
                 merged["asset_refresh_review"] = _normalize_asset_refresh_review(refresh_report)
                 if refresh_report.get("error"):
                     merged["error"] = _clean(refresh_report["error"])
-                if refresh_report.get("safe_to_clean") and not refresh_report.get("error"):
+                if refresh_report.get("safe_to_clean") and refresh_report.get("missing_count"):
                     # Assigned only after the scheduler's owner/generation guard.
                     self._hmb_refresh_authority = copy.deepcopy(refresh_report)
             return _normalize_state(merged)
@@ -14833,7 +14863,7 @@ class HMBImageAssetLibrary(DataNode):
             isinstance(authority, dict)
             and token and token == authority.get("request_id")
             and authority.get("safe_to_clean") is True
-            and _project_root_text(authority.get("catalog_project_root") or authority.get("project_root")).casefold()
+            and _project_root_text(authority.get("project_root")).casefold()
             == _project_root_text(state.get("project_root")).casefold()
             and _clean(authority.get("project_uid")) == _clean(state.get("project_uid"))
             and self._scan_owner_is_current()
@@ -14850,7 +14880,7 @@ class HMBImageAssetLibrary(DataNode):
             failed["error"] = message
             return self._publish_state(failed)
         confirmed = copy.deepcopy(authority)
-        logical_root = _project_root_text(confirmed.get("catalog_project_root") or confirmed["project_root"])
+        logical_root = _project_root_text(confirmed["project_root"])
         self._hmb_refresh_authority = None  # Single use; even failure needs a new review.
         expected_generation = self._hmb_scan_generation + 1
         report: Dict[str, Any] = dict(confirmed)
@@ -14867,24 +14897,32 @@ class HMBImageAssetLibrary(DataNode):
                 _project_root_text(current.get("project_root")).casefold()
                 == logical_root.casefold()
                 and _clean(current.get("project_uid")) == _clean(confirmed.get("project_uid"))
+                and get_site_settings(logical_root)["revision"] == confirmed["site_revision"]
             )
 
         def cleanup() -> Any:
+            folders = []
+            post_commit_read_failed = False
             with _site_mutation_lock(logical_root):
                 settings = get_site_settings(logical_root, fresh=True)
-                owner = _site_root(Path(logical_root), settings, settings["write_site_id"])
-                if (settings["revision"] != confirmed.get("site_revision", "0")
-                        or settings["write_site_id"] != confirmed.get("write_site_id", "hq")
-                        or owner != Path(confirmed["project_root"])):
-                    raise ValueError("등록 위치가 변경되었습니다. 새로고침 후 다시 확인하세요.")
-                cleaned = _clean_project_manifest_refresh(confirmed, is_current)
-            report.update(cleaned)
-            report.update({"request_id": token, "status": "cleaned", "safe_to_clean": False})
-            if cleaned.get("backup_warning"):
-                report["error"] = "\n".join(filter(None, (
-                    _clean(report.get("error")), _clean(cleaned["backup_warning"])
-                )))
-            if cleaned.get("error"):
+                if settings["revision"] != confirmed["site_revision"]:
+                    raise ValueError("폴더 연결이 변경되었습니다. 새로고침 후 다시 확인하세요.")
+                for review in confirmed["folders"]:
+                    result = review
+                    if review.get("safe_to_clean") and review.get("missing_count"):
+                        try:
+                            owner = _site_root(Path(logical_root), settings, review["site_id"])
+                            if _resolve_image_path(owner, strict=True) != Path(review["project_root"]):
+                                raise ValueError("검사한 폴더가 변경되었습니다. 새로고침 후 다시 확인하세요.")
+                            cleaned = _clean_project_manifest_refresh({**review, "request_id": token}, is_current)
+                            post_commit_read_failed |= bool(cleaned.get("error"))
+                            result = {**review, **cleaned}
+                        except (OSError, ValueError, RuntimeError) as exc:
+                            result = {**review, "safe_to_clean": False, "error": str(exc)}
+                    folders.append(result)
+            report.update(_summarize_asset_refresh_folders(folders))
+            report.update({"status": "cleaned" if report["cleaned_count"] else "error", "safe_to_clean": False})
+            if post_commit_read_failed or not report["cleaned_count"]:
                 # The manifest commit succeeded; retain the last usable catalog
                 # if the share became unavailable during post-write verification.
                 return state
@@ -14910,7 +14948,8 @@ class HMBImageAssetLibrary(DataNode):
             return _normalize_state(merged)
 
         return self._schedule_catalog_scan(
-            key, state, cleanup, failure_state=state, result_merger=merge
+            key, state, cleanup, failure_state=state, result_merger=merge,
+            timeout_seconds=PROJECT_REFRESH_TIMEOUT_SECONDS,
         )
 
     @hmb_binding_mutation
@@ -14920,7 +14959,7 @@ class HMBImageAssetLibrary(DataNode):
         if not root:
             raise ValueError("프로젝트 목록을 새로고침 후 등록 폴더 설정을 다시 여세요.")
         receipt = {"request_id": request["request_id"], "project_uid": project_uid, "base_root": root}
-        if request["action"] in ("browse_add", "confirm"):
+        if request["action"] in ("browse_add", "update_links", "confirm"):
             confirmed_facts = None
             def prepare(profile):
                 nonlocal confirmed_facts
@@ -14928,26 +14967,39 @@ class HMBImageAssetLibrary(DataNode):
                     catalog = {"catalog_root": state["catalog_root"], "projects": state["projects"]}
                     confirmed_facts = _read_verified_image_catalog(catalog, {"path": root}, state)
             def publish(result):
+                if not self._scan_owner_is_current():
+                    return
                 self._hmb_site_settings_result = result
                 live = self._current_state()
-                if (result["ok"] and confirmed_facts and root == live.get("project_root")
-                        and (live.get("manifest_signature"), live.get("folder_signature")) !=
-                        (confirmed_facts["manifest_signature"], confirmed_facts["folder_signature"])):
-                    live = _merge_scan_with_state(confirmed_facts, live)
-                if result["ok"] and confirmed_facts and root == live.get("project_root"):
-                    live["site_catalog_revision"] = result["revision"]
-                self._publish_state(live, preserve_outputs=True)
+                changed = False
+                if root == live.get("project_root") and "revision" in result:
+                    profile = get_site_settings(root)
+                    revision = profile["revision"]
+                    if result["revision"] == revision:
+                        if result["ok"] and confirmed_facts and confirmed_facts.get("_site_catalog_revision") == revision:
+                            changed = (live.get("site_catalog_revision"), live.get("manifest_signature"), live.get("folder_signature")) != (
+                                revision, confirmed_facts["manifest_signature"], confirmed_facts["folder_signature"])
+                            if changed:
+                                live = _merge_scan_with_state(confirmed_facts, live)
+                                live["site_catalog_revision"] = revision
+                        else:
+                            # If a catalog read failed after an unlink was saved,
+                            # immediately retire only rows from removed roots.
+                            allowed = {"hq", *(link["id"] for link in profile["links"])}
+                            folders = [folder for folder in live["folders"] if _site_location(folder)[0] in allowed]
+                            if folders != live["folders"]:
+                                facts = {**live, "folders": folders, "assets": [asset for asset in live["assets"]
+                                    if asset.get("source_kind") == "project" and _site_location(asset.get("relative_path"))[0] in allowed]}
+                                live = _merge_scan_with_state(facts, live)
+                                live["site_catalog_revision"] = revision
+                                changed = True
+                if changed:
+                    self._hmb_refresh_authority = None
+                    live["asset_refresh_review"] = {}
+                self._publish_state(live, preserve_outputs=not changed)
+            published = self._publish_state(state, preserve_outputs=True)
             run_site_folder_command(self, root, project_uid, request, "image", publish, prepare_catalog=prepare)
-            return self._publish_state(state, preserve_outputs=True)
-        if request["action"] == "update_links":
-            try:
-                profile = save_site_settings(root, request.get("links"), request.get("write_site_id"),
-                                             request.get("expected_revision"), existing_only=True)
-                receipt.update(profile, ok=True, message="")
-            except (OSError, ValueError) as exc:
-                receipt.update(ok=False, message=str(exc))
-            self._hmb_site_settings_result = receipt
-            return self._publish_state(state, preserve_outputs=True)
+            return published
         if request["action"] != "save":
             try:
                 receipt.update(get_site_settings(root, fresh=request["action"] == "get"), ok=True, message="")
@@ -16102,6 +16154,9 @@ class HMBImageAssetLibrary(DataNode):
         retired_thumbnail_url = False
         for raw_asset in saved_state.get("assets", []):
             asset = dict(raw_asset)
+            # A workflow can come from another account. Its saved UI edit
+            # marker never supplies My Upload membership on this workstation.
+            asset.pop("registration_revision", None)
             if (
                 _clean(asset.get("thumbnail_url"))
                 and not _thumbnail_url_is_live(

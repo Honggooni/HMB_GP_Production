@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 
 import base64
+from contextlib import ExitStack
 
 from copy import deepcopy
 
@@ -176,11 +177,10 @@ async def exercise(engine):
                 cancelled = await folder_receipt("cancel")
                 assert cancelled["cancelled"] and cancelled["revision"] == receipt["revision"]
                 selected = receipt["added_site_id"]
-                (destination / "add").rmdir()
                 setstate(folder_node, folder_request("done", action="confirm", selected_site_id=selected,
                                                      expected_revision=receipt["revision"]))
                 done = await folder_receipt("done")
-                assert done["ok"] and done["selected_site_id"] == selected and (destination/"add").is_dir(), done
+                assert done["ok"] and done["selected_site_id"] == selected and not any(destination.iterdir()), done
                 setstate(folder_node, folder_request("conflict", action="confirm", selected_site_id=selected,
                                                      expected_revision="old-revision"))
                 conflict = await folder_receipt("conflict")
@@ -301,7 +301,9 @@ async def exercise(engine):
             views=[call.args[0].wrapped_event for call in publish.call_args_list
                    if getattr(getattr(getattr(call.args[0], "wrapped_event", None), "payload", None), "parameter_name", None)
                    == product.WIDGET_STATE_PARAMETER]
-            assert any(view.workflow_id == node._event_workflow_id() and view.workflow_id for view in views)
+            workflow_id = node._event_workflow_id()
+            assert workflow_id and any((getattr(view, 'open_workflow_id', None) or getattr(view, 'workflow_id', None)) == workflow_id
+                                       for view in views)
             recovery = send(SetParameterValueRequest(node_name=node.name,
                 parameter_name=product.THUMBNAIL_PATCH_PARAMETER,
                 value=dict(req, request_id="authority-recovery", include_view=True))).finalized_value
@@ -445,13 +447,21 @@ async def exercise(engine):
 
             from griptape_nodes.retained_mode.engine import engine_scope
 
-            with engine_scope() as freshengine:
+            with ExitStack() as fresh_scope:
+
+                freshengine = fresh_scope.enter_context(engine_scope())
+                if hasattr(freshengine, 'bind_workflow'):
+                    from griptape_nodes.retained_mode.engine import NO_WORKFLOW
+                    fresh_scope.enter_context(freshengine.bind_workflow(NO_WORKFLOW))
 
                 freshengine.event_manager.initialize_queue()
 
                 madeflow=freshengine.handle_request(EnsureWorkflowAndFlowRequest(flow_name='FirstPasteNoPriorAsset'))
 
                 assert madeflow.succeeded(),madeflow.result_details
+
+                if hasattr(freshengine, 'bind_workflow'):
+                    fresh_scope.enter_context(freshengine.bind_workflow(freshengine.open_workflows.get(madeflow.workflow_id)))
 
                 assert not hasattr(freshengine.event_manager,'_hmb_asset_initial_value_admission')
 
@@ -698,7 +708,9 @@ if __name__=='__main__':
             try:
 
                 from griptape_nodes.retained_mode.engine import engine_scope
+                from hmb_host_workflow import run_in_fixture_workflow
 
-                with engine_scope() as engine:asyncio.run(exercise(engine))
+                with engine_scope() as engine:
+                    asyncio.run(run_in_fixture_workflow(engine, 'WidgetRuntimeLease', exercise))
 
             finally:os.chdir(previous);logging.shutdown()

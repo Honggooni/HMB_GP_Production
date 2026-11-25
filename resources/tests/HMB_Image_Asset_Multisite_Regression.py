@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
+from threading import Event
 from unittest.mock import patch
 from HMB_ImageAsset_Concurrent_Add_Regression import deselect_connected_import
 
@@ -56,8 +57,8 @@ def register(station_name, directory, barrier):
     with patch.object(lib, "_scan_project_assets", side_effect=counted):
         state = load(lib, catalog)
         assert sorted(counts.values()) == [1, 1, 1], counts
-        assert all((path / ".json").is_dir() for path in (hq, gwangju, busan))
-        assert not (gwangju / ".json" / "hmb_image_assets.json").exists()
+        assert not (gwangju / ".json").exists()
+        assert not any((path / "add").exists() for path in (hq, gwangju, busan))
         anchor = next(row for row in state["assets"] if row["asset_id"] == "Existing")
         anchor.update(selected=True, selection_order=1)
         shot = state["shot_routing"]["shots"][0]
@@ -80,13 +81,13 @@ def register(station_name, directory, barrier):
                    "source_kind": "user", "target_folder": "CH" if site == "hq" else f"site:{site}/CH",
                    "asset_id": "DuplicateLabel", "image_name": "Common", "image_main_type": "Custom / Context",
                    "image_sub_type": "Context", "site_settings_revision": settings["revision"]}
-        wrong = {**request, "target_folder": f"site:{settings['links'][1]['id']}/CH"}
+        wrong = {**request, "target_folder": f"site:{settings['links'][1]['id']}/missing"}
         try:
             lib._apply_asset_registration(state, wrong, media)
         except ValueError:
             pass
         else:
-            raise AssertionError("peer received a write")
+            raise AssertionError("a missing folder received a write")
         barrier.wait(25)
         result = lib._apply_asset_registration(state, request, media)
         assert result["asset_registration_result"]["ok"]
@@ -208,7 +209,8 @@ def live_profile_changes(root):
         profile = lib.save_site_settings(hq, profile["links"], site, profile["revision"], existing_only=True)
         confirm_site_folder(hq, "image", profile["revision"], site)
         state = load(lib,catalog,state)
-        assert f"site:{site}/add" in state["folders"]
+        assert f"site:{site}/add" not in state["folders"]
+        assert not (first / "add").exists()
         assert any(a["relative_path"] == f"site:{site}/CH/unregistered.png" for a in state["assets"])
         for _ in range(2):
             confirm_site_folder(hq, "image", profile["revision"], site)
@@ -218,7 +220,7 @@ def live_profile_changes(root):
         profile2 = lib.save_site_settings(hq, profile2["links"], site2, profile2["revision"], existing_only=True)
         confirm_site_folder(hq, "image", profile2["revision"], site2)
         state = load(lib,catalog,state)
-        assert not any(a["relative_path"] == f"site:{site}/CH/unregistered.png" for a in state["assets"])
+        assert any(a["relative_path"] == f"site:{site}/CH/unregistered.png" for a in state["assets"])
         assert any(a["relative_path"].startswith(f"site:{site2}/") for a in state["assets"])
         clipped = lib.save_site_settings(hq, profile2["links"][1:], site2, profile2["revision"], existing_only=True)
         confirm_site_folder(hq, "image", clipped["revision"], site2)
@@ -229,6 +231,73 @@ def live_profile_changes(root):
         observed = [Path(call.args[0]) for call in scans.call_args_list]
         assert len(observed) == 2, observed
         assert observed[0].samefile(first) and observed[1].samefile(second), observed
+
+
+def folder_commands_publish_live_catalog(root):
+    from PIL import Image
+    import _hmb_image_asset_sites as sites
+
+    root.mkdir()
+    lib = station(root / "workstation")
+    hq, partner, _ = paths(root)
+    for location in (hq, partner):
+        (location / "CH").mkdir(parents=True)
+        Image.new("RGB", (3, 3)).save(location / "CH" / "example.png")
+    catalog = hq.parents[1]
+
+    class FolderWidget:
+        _apply_site_settings = lib.HMBImageAssetLibrary._apply_site_settings
+        _hmb_site_settings_result = {}
+
+        def __init__(self):
+            self.state = load(lib, catalog)
+            self.settled = Event()
+
+        def _current_state(self):
+            return deepcopy(self.state)
+
+        def _scan_owner_is_current(self):
+            return True
+
+        def _publish_state(self, state, *, preserve_outputs):
+            self.state = deepcopy(state)
+            if self._hmb_site_settings_result.get("request_id") == self.request_id:
+                self.preserve_outputs = preserve_outputs
+                self.settled.set()
+            return state
+
+        def send(self, action, **options):
+            self.settled.clear()
+            self.request_id = action
+            self._apply_site_settings(self._current_state(), dict(action=action, request_id=action,
+                project_uid=self.state["project_uid"], **options))
+            assert self.settled.wait(10), (action, self._hmb_site_settings_result)
+            return self._hmb_site_settings_result
+
+    widget = FolderWidget()
+    with patch.object(sites, "choose_site_folder", return_value=str(partner)):
+        linked = widget.send("browse_add")
+    assert linked["ok"], linked
+    site = linked["added_site_id"]
+    key = f"site:{site}"
+    assert key in widget.state["folders"] and not widget.preserve_outputs
+    previous = widget._current_state()
+    previous["selected_folder_path"] = key
+    widget.state["selected_folder_path"] = key
+    # Unlink is a change to the pinned catalog. It must not reopen the retired
+    # share, reread HQ, or rely on a project-settings dialog being present.
+    with patch.object(lib, "_scan_project_assets", side_effect=AssertionError("Unexpected rescan")):
+        unlinked = widget.send("update_links", links=[], write_site_id="hq", expected_revision=linked["revision"])
+        assert unlinked["ok"], unlinked
+        assert not widget.preserve_outputs
+        assert widget.state["site_catalog_revision"] == unlinked["revision"]
+        assert not widget.state["scan_busy"] and not widget.state["selected_folder_path"]
+        assert (partner / "CH/example.png").exists()
+        late = lib._merge_async_scan_result_with_live_state(previous, previous, widget.state)
+        reopened = load(lib, catalog, previous)
+    for state in (widget.state, late, reopened):
+        assert key not in state["folders"]
+        assert [row["relative_path"] for row in state["assets"]] == ["CH/example.png"]
 
 
 def explicit_import_destinations(root):
@@ -252,9 +321,9 @@ def explicit_import_destinations(root):
     state = load(lib, catalog)
 
     for site, storage, destination in (
-        ("hq", hq, "add"),
+        ("hq", hq, "$default"),
         (first_id, first, f"site:{first_id}/CH"),
-        (second_id, second, f"site:{second_id}/add"),
+        (second_id, second, f"site:{second_id}"),
     ):
         source = root / f"external-{storage.parents[2].name}.png"
         Image.new("RGB", (9, 6), "blue").save(source)
@@ -262,12 +331,14 @@ def explicit_import_destinations(root):
         incoming = next(a for a in state["assets"] if a["source_kind"] == "user")
         request = {"request_id": f"choose-{site}", "project_uid": state["project_uid"],
                    "asset_library_id": incoming["asset_library_id"], "source_uid": incoming["source_uid"],
-                   "source_kind": "user", "target_folder": destination, "target_site_id": site,
+                   "source_kind": "user", "target_folder": destination,
                    "asset_id": "External", "image_name": "External", "image_main_type": "Custom / Context",
                    "image_sub_type": "Context", "site_settings_revision": profile["revision"]}
         for bad_request in (
             {**request, "target_site_id": "missing"},
             {**request, "target_site_id": "missing", "target_folder": "site:missing/add"},
+            {**request, "target_folder": "add"},
+            {**request, "target_folder": ""},
             {**request, "site_settings_revision": "stale"},
         ):
             try:
@@ -278,12 +349,12 @@ def explicit_import_destinations(root):
                 raise AssertionError("An invalid or stale destination received an Add")
         state = lib._apply_asset_registration(state, request, media)
         assert state["asset_registration_result"]["ok"]
-        child = "CH" if site == first_id else "add"
+        child = "CH" if site == first_id else ""
         saved = storage / child / source.name
         assert source.read_bytes() == saved.read_bytes()
         for other in (hq, first, second):
             records = lib._read_asset_manifest(other)
-            assert (f"{child}/{source.name}".casefold() in records) == (other == storage)
+            assert ((Path(child) / source.name).as_posix().casefold() in records) == (other == storage)
         assert lib.get_site_settings(hq, fresh=True) == profile
 
     row = next(a for a in state["assets"] if a["relative_path"] == f"site:{first_id}/CH/manual.png")
@@ -329,7 +400,16 @@ def explicit_import_destinations(root):
     assert not next(a for a in state["assets"] if a["asset_library_id"] == row["asset_library_id"])["registered"]
     assert "ch/manual.png" not in lib._read_asset_manifest(first)
     assert manual.read_bytes() == manual_bytes
-    assert (hq / "add").is_dir()
+    state = lib._apply_asset_registration(state, {
+        **edit, "request_id": "register-again", "action": "add", "registration_revision": "",
+        "image_name": "Manual registered again",
+    })
+    assert state["asset_registration_result"]["ok"]
+    records = lib._read_asset_manifest(first)
+    assert records["ch/manual.png"]["image_name"] == "Manual registered again"
+    assert sum(item["asset_id"] == "Manual" for item in records.values()) == 1
+    assert manual.read_bytes() == manual_bytes
+    assert not any((store / "add").exists() for store in (hq, first, second))
 
 
 def run():
@@ -349,6 +429,7 @@ def run():
         untouched = busan_manifest.read_bytes()
         # Initialize from the clean station env before importing the library.
         station(root / "pc-confirm-active")
+        folder_commands_publish_live_catalog(root / "folder-actions")
         explicit_import_destinations(root / "destination-choice")
         station(root / "pc-confirm-active")
         live_profile_changes(root)

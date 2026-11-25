@@ -269,13 +269,13 @@ async def check_repeated_wired_selection(library, downstream, anchor, imported):
     initial = [anchor, imported]
     expected = initial
 
-    async def submit(selection, *, paged=False):
+    async def submit(selection, *, paged=False, observed_generation=None):
         live = library._current_state()
         routing = live["shot_routing"]
         shot = routing["shots"][0]
         shot.update(selected_source_uids=selection, revision=shot["revision"] + 1,
                     media_count=0, metadata_sha256="", media_sha256="")
-        routing["generation"] += 1
+        routing["generation"] = (routing["generation"] if observed_generation is None else observed_generation) + 1
         edit = {
             "schema": asset.IMAGE_ASSET_EDIT_SCHEMA, "version": 1,
             asset.WIDGET_RUNTIME_LEASE_KEY: library._hmb_widget_runtime_lease,
@@ -338,7 +338,17 @@ async def check_repeated_wired_selection(library, downstream, anchor, imported):
     await check_settled([])
     await submit(initial)
     await check_settled(initial)
-    print("Repeated SDK selection: 106 compact and paged edits, exact Prompt editable rows and matching ImageAsset media PASS")
+    # The file worker may publish a derived cursor while the UI still holds
+    # its last canonical packet. This is a new click on the very same Shot.
+    live = library._current_state()
+    observed_generation = live["shot_routing"]["generation"]
+    completed = dict(library._cache_shot_routing_snapshot(live, normalized=True),
+                     generation=observed_generation + 3)
+    library._persist_shot_routing_facts(live, completed)
+    assert library._current_state()["shot_routing"]["generation"] > observed_generation + 1
+    await submit([*initial, extra[0]], observed_generation=observed_generation)
+    await check_settled([*initial, extra[0]])
+    print("Repeated SDK selection: 107 compact and paged edits, crossed cursor, exact Prompt rows and matching media PASS")
 
 
 async def main():
