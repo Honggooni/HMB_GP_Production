@@ -121,7 +121,8 @@ assert "$null = $allowed.Add('SHA256SUMS')" not in installer
 assert "Close Griptape completely" in installer
 assert "Get-ChildItem -LiteralPath $target -Force -Recurse -File" in installer
 assert "Move-Item -LiteralPath $target -Destination $rollback" in installer
-assert "Move-Item -LiteralPath $preservedVenv" in installer
+assert "Copy-Item -LiteralPath $preservedVenv" in installer
+assert "Move-Item -LiteralPath $preservedVenv" not in installer
 assert "LocalApplicationData" in installer
 assert "Rollback data must be stored outside the Griptape libraries folder" in installer
 assert "MyInvocation.MyCommand.Path" in installer

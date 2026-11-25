@@ -139,6 +139,9 @@ class FixtureOpener:
 @contextmanager
 def fixture(*, opener=None, legacy=True, old_directory=False, scoped=False):
     with tempfile.TemporaryDirectory(prefix="hmb-gateway-auth-") as temporary, ExitStack() as stack:
+        # Authenticate against a transport reserved for the credential probe.
+        # Review media discovery has its own transport and account tests.
+        stack.enter_context(mock.patch("_hmb_client_review_media.start_pending_review_media"))
         stack.enter_context(mock.patch.dict(os.environ, {"APPDATA": temporary, "LOCALAPPDATA": temporary}))
         stack.enter_context(mock.patch.object(target, "_broker_dpapi", side_effect=protected))
         legacy_loader = stack.enter_context(mock.patch.object(

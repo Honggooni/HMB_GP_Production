@@ -36,6 +36,9 @@ CID = "synthetic-queue-client"
 
 class AdmissionTests(unittest.TestCase):
     def setUp(self):
+        # This transport asserts the synchronous admission contract. The
+        # workstation suite exercises the independent media discovery worker.
+        self.enterContext(mock.patch("_hmb_client_review_media.start_pending_review_media"))
         self.ns = fixture.isolated_bridge_methods()
         self.auth = "synthetic-token-A"
         self.calls = []
