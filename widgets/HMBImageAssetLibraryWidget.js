@@ -93,7 +93,7 @@ function openProjectFolderCards(container, state, options) {
   const select = find("project"), closeButton = find("close"), add = find("add"), remove = find("remove"), done = find("done");
   find("title").textContent = label("프로젝트 Add", "Project Add");
   find("project-label").textContent = label("프로젝트", "Project");
-  find("heading").textContent = label("추가한 폴더", "Added folders");
+  find("heading").textContent = sound ? label("추가한 폴더", "Added folders") : label("저장 폴더", "Save folders");
   add.textContent = label("추가", "Add"); remove.textContent = label("삭제", "Remove");
   done.textContent = label("완료", "Done");
   closeButton.setAttribute("aria-label", label("닫기", "Close"));
@@ -130,13 +130,17 @@ function openProjectFolderCards(container, state, options) {
   function paint() {
     const grid = find("cards"); grid.replaceChildren();
     const links = profile()?.links || [];
+    const folders = !sound && project ? [
+      {id: "hq", label: label("기본 폴더", "Default folder"), root: projects.get(project)?.path || ""},
+      ...links,
+    ] : links;
     const pending = memory.pending;
     let selected = selectedId();
-    if (!links.some(link => link.id === selected)) {
-      selected = [profile()?.selected_site_id, writeId(), links[0]?.id].find(id=>links.some(link=>link.id === id)) || "";
+    if (!folders.some(folder => folder.id === selected)) {
+      selected = [profile()?.selected_site_id, writeId(), folders[0]?.id].find(id=>folders.some(folder=>folder.id === id)) || "";
       memory.selections.set(project, selected);
     }
-    for (const item of links) {
+    for (const item of folders) {
       const card = doc.createElement("div"), button = doc.createElement("button"), icon = doc.createElement("span"), name = doc.createElement("span");
       card.className = "pf-card";
       button.type = "button"; button.className = "pf-select"; button.dataset.pfSite = item.id; button.title = item.root;
@@ -197,8 +201,9 @@ function openProjectFolderCards(container, state, options) {
       notice(result.message || label("폴더 설정을 저장하지 못했습니다.", "Could not save the folder settings.")); return;
     }
     if (req.action === "confirm" && req.request_id === confirmRequest) {
+      const savedSelection = req.selected_site_id === "hq" ? "" : req.selected_site_id;
       if (result.revision && result.revision === profile()?.revision && Array.isArray(result.links)
-          && result.selected_site_id === req.selected_site_id && profile()?.selected_site_id === req.selected_site_id
+          && result.selected_site_id === savedSelection && profile()?.selected_site_id === savedSelection
           && !result.cancelled) close();
       else notice(label("현재 폴더 설정을 다시 확인해 주세요.", "Review the current folder settings."));
       return;
@@ -213,7 +218,7 @@ function openProjectFolderCards(container, state, options) {
     const selected = selectedId();
     if (profile()?.links.some(link => link.id === selected)) {
       const remaining = profile().links.filter(link => link.id !== selected);
-      const destination = writeId() === selected ? (remaining[0]?.id || "hq") : writeId();
+      const destination = writeId() === selected ? "hq" : writeId();
       save(remaining, destination);
     }
   };
@@ -818,6 +823,10 @@ const IMAGE_ASSET_UI_TEXT = {
     select_sub_type: "Select Sub Type",
     cancel: "Cancel",
     register_asset: "Register Asset",
+    edit_asset: "Edit registration",
+    delete_asset_registration: "Remove registration",
+    confirm_asset_registration_delete: "Confirm removal",
+    asset_registration_delete_notice: "The registration is removed from the library. The image file is kept.",
     import_in: "IMAGE IMPORT IN",
     project_folder: "ASSET FOLDER",
     project_folder_locked: "Existing project assets keep their current folder.",
@@ -910,6 +919,10 @@ const IMAGE_ASSET_UI_TEXT = {
     select_sub_type: "세부 유형 선택",
     cancel: "취소",
     register_asset: "에셋 등록",
+    edit_asset: "등록 정보 편집",
+    delete_asset_registration: "등록 삭제",
+    confirm_asset_registration_delete: "삭제 확인",
+    asset_registration_delete_notice: "라이브러리에서 등록을 삭제합니다. 이미지 파일은 보관됩니다.",
     import_in: "이미지 가져오기",
     project_folder: "에셋 폴더",
     project_folder_locked: "기존 프로젝트 에셋은 현재 폴더로 고정됩니다.",
@@ -1456,6 +1469,7 @@ function normalizeAsset(raw) {
     scope_candidate: clean(raw.scope_candidate),
     color_pick_candidates: uniqueStrings(raw.color_pick_candidates),
     registered,
+    ...(registered && raw.registration_revision ? {registration_revision: clean(raw.registration_revision).slice(0,128)} : {}),
     selected: Boolean(raw.selected) && (sourceKind === "user" || registered),
     selection_order: Math.max(0, Number.parseInt(raw.selection_order || 0, 10) || 0),
     import_index: Math.max(0, Number.parseInt(raw.import_index || 0, 10) || 0),
@@ -1473,6 +1487,7 @@ function normalizeRegistrationRequest(raw) {
   const sourceUid = clean(raw.source_uid).slice(0, 512);
   const relativePath = clean(raw.relative_path).replaceAll("\\", "/").slice(0, 1024);
   const targetFolder = normalizeRelativeFolder(raw.target_folder).slice(0, 1024);
+  const action = clean(raw.action);
   if (
     !requestId
     || !assetLibraryId
@@ -1483,6 +1498,7 @@ function normalizeRegistrationRequest(raw) {
   const imageSubType = clean(raw.image_sub_type);
   return {
     request_id: requestId,
+    ...(action ? {action, registration_revision: clean(raw.registration_revision).slice(0,128)} : {}),
     project_uid: clean(raw.project_uid).slice(0, 256),
     asset_library_id: assetLibraryId,
     ...(raw.site_settings_revision ? {site_settings_revision:clean(raw.site_settings_revision)} : {}),
@@ -3926,9 +3942,12 @@ function assetThumbnailHtml(asset, state) {
   const add = hmbImageAssetCanRegister(asset, state)
     ? `<button type="button" class="asset-add" data-asset-add aria-label="${escapeHtml(imageAssetText(state, "add_image_asset"))}">${escapeHtml(imageAssetText(state, "add"))}</button>`
     : "";
+  const edit = asset.registration_revision
+    ? `<button type="button" class="asset-edit" data-asset-edit aria-label="${escapeHtml(imageAssetText(state, "edit_asset"))}" title="${escapeHtml(imageAssetText(state, "edit_asset"))}">✎</button>`
+    : "";
   return `
     <div class="asset-thumb ${source ? "" : failed ? "fallback thumbnail-failed" : "fallback thumbnail-loading"}" data-thumbnail-loading="${source || failed ? "false" : "true"}" data-thumbnail-failed="${failed ? "true" : "false"}">
-      <div class="asset-thumb-media">${assetCardThumbnailImageMarkup(asset)}${add}</div>
+      <div class="asset-thumb-media">${assetCardThumbnailImageMarkup(asset)}${add}${edit}</div>
       <div class="asset-thumb-footer"><span class="asset-source-name" title="${escapeHtml(sourceName)}">${escapeHtml(sourceName)}</span></div>
     </div>
   `;
@@ -5491,7 +5510,7 @@ export function hmbImageAssetRegistrationSubTypes(taxonomy, sourceType) {
 }
 
 export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}, state) {
-  if (!hmbImageAssetCanRegister(asset, state)) return null;
+  if (!asset?.registration_revision && !hmbImageAssetCanRegister(asset, state)) return null;
   const assetMainType = clean(asset.image_main_type);
   const assetSubType = clean(asset.image_sub_type);
   const sourceType = assetMainType !== "Select Image Main Type" ? assetMainType : "";
@@ -5500,18 +5519,19 @@ export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}, state
   const lockedFolder = relativePath.includes("/")
     ? relativePath.slice(0, relativePath.lastIndexOf("/"))
     : ROOT_FOLDER_KEY;
-  const writer = state?.site_settings?.write_site_id;
+  const writer = state?.site_settings?.write_site_id || "hq";
   const chooseDestination = sourceKind === "user" && Boolean(state?.site_settings?.links?.length);
-  const vendorDefault = !chooseDestination && writer && writer !== "hq" ? "site:" + writer + "/add" : "";
+  const defaultFolder = writer === "hq" ? "add" : `site:${writer}/add`;
   return {
     asset_library_id: clean(asset.asset_library_id),
     site_settings_revision: clean(state?.site_settings?.revision),
     source_kind: sourceKind,
     source_uid: clean(asset.source_uid),
     relative_path: relativePath,
-    ...(chooseDestination ? {target_site_id: ""} : {}),
-    target_folder: sourceKind === "project" ? lockedFolder : vendorDefault,
-    target_folder_confirmed: sourceKind === "project" || Boolean(vendorDefault),
+    ...(asset.registration_revision ? {registration_revision: asset.registration_revision} : {}),
+    ...(chooseDestination ? {target_site_id: writer} : {}),
+    target_folder: sourceKind === "project" ? lockedFolder : defaultFolder,
+    target_folder_confirmed: true,
     image_name: (clean(asset.registration_default_name) || clean(asset.image_name)).slice(0, 256),
     asset_id: clean(asset.asset_id).slice(0, 256),
     image_main_type: sourceType,
@@ -5675,7 +5695,7 @@ function registrationFolderContents(state, draft) {
   const available = new Set(state.folders.filter(folder => clean(folder) && folder !== root
     && folder !== ROOT_FOLDER_KEY && imageFolderSite(folder) === (root ? imageFolderSite(root) : "hq")
     && !isUserImportFolder(root ? folder.slice(root.length + 1) : folder)));
-  if (root) available.add(`${root}/add`);
+  available.add(root ? `${root}/add` : "add");
   const prefix = current ? `${current}/` : "";
   const children = new Map();
   for (const folder of available) {
@@ -5729,7 +5749,9 @@ function renderRegistrationDialog(state, draft) {
   const externalImport = asset?.source_kind === "user" && Number(asset?.import_index || 0) > 0;
   if (
     !asset
-    || !hmbImageAssetCanRegister(asset, state)
+    || (draft.registration_revision
+      ? draft.registration_revision !== asset.registration_revision
+      : !hmbImageAssetCanRegister(asset, state))
   ) return "";
   const mainTypes = uniqueStrings([
     ...registrationMainTypes(state.taxonomy),
@@ -5753,7 +5775,7 @@ function renderRegistrationDialog(state, draft) {
     <div class="asset-registration-backdrop nowheel" data-registration-backdrop>
       <section class="asset-passport" role="dialog" aria-modal="true" aria-labelledby="asset-registration-title">
         <header class="passport-head" data-hmb-popup-header>
-          <div><small>${escapeHtml(imageAssetText(state, "hmb_project_asset"))}</small><h2 id="asset-registration-title">${escapeHtml(imageAssetText(state, "asset_passport"))}</h2></div>
+          <div><small>${escapeHtml(imageAssetText(state, "hmb_project_asset"))}</small><h2 id="asset-registration-title">${escapeHtml(imageAssetText(state, draft.registration_revision ? "edit_asset" : "asset_passport"))}</h2></div>
           <button type="button" data-registration-cancel aria-label="${escapeHtml(imageAssetText(state, "close_registration"))}">&times;</button>
         </header>
         <div class="passport-photo ${thumbnailSource ? "" : thumbnailFailed ? "fallback thumbnail-failed" : "fallback thumbnail-loading"}" data-thumbnail-loading="${thumbnailSource || thumbnailFailed ? "false" : "true"}" data-thumbnail-failed="${thumbnailFailed ? "true" : "false"}">${thumbnailImageMarkup(asset)}</div>
@@ -5770,8 +5792,9 @@ function renderRegistrationDialog(state, draft) {
         <div role="status" data-registration-status>${escapeHtml(draft.save_message || "")}</div>
         <footer class="passport-actions">
           <button type="button" data-registration-cancel>${escapeHtml(imageAssetText(state, "cancel"))}</button>
+          ${draft.registration_revision ? `<button type="button" data-registration-delete ${draft.saving ? "disabled" : ""}>${escapeHtml(imageAssetText(state, draft.confirm_delete ? "confirm_asset_registration_delete" : "delete_asset_registration"))}</button>` : ""}
           ${externalImport && state.image_bash_active && state.image_bash_workspace?.workspace_id ? `<button type="button" data-registration-bash-add ${draft.bash_pending || state.image_bash_workspace.instances.length >= MAX_SELECTED_IMAGES ? "disabled" : ""}>HMBImageBash에 추가</button>` : ""}
-          <button type="button" class="passport-register" data-registration-submit ${registrationDraftIsComplete(draft) && !draft.bash_pending && !draft.saving ? "" : "disabled"}>${escapeHtml(imageAssetText(state, "register_asset"))}</button>
+          <button type="button" class="passport-register" data-registration-submit ${registrationDraftIsComplete(draft) && !draft.bash_pending && !draft.saving ? "" : "disabled"}>${escapeHtml(draft.registration_revision ? (state.language === "ko" ? "저장" : "Save") : imageAssetText(state, "register_asset"))}</button>
         </footer>
       </section>
     </div>
@@ -6412,6 +6435,8 @@ function render(
       .shot-stack{max-height:360px;margin:0 8px 8px;display:flex;flex-direction:column;gap:5px;overflow:auto;scrollbar-gutter:stable}.shot-panel{flex:0 0 auto;overflow:hidden;border:1px solid rgba(var(--shot-rgb),.34);border-radius:10px;background:linear-gradient(180deg,rgba(var(--shot-rgb),.10),rgba(8,11,19,.96));box-shadow:0 0 16px rgba(var(--shot-rgb),.07)}.shot-panel-head{height:38px;display:flex;align-items:center;gap:6px;padding:4px 7px;min-width:0;border-bottom:1px solid transparent}.shot-panel.active .shot-panel-head{border-bottom-color:rgba(var(--shot-rgb),.20)}.shot-panel-toggle{height:29px;min-width:0;flex:1;display:grid;grid-template-columns:30px minmax(0,1fr) minmax(0,1fr) auto auto;align-items:center;gap:7px;padding:0 8px;border:1px solid rgba(var(--shot-rgb),.32);border-radius:7px;background:linear-gradient(90deg,rgba(var(--shot-rgb),.16),rgba(8,13,23,.72));color:#d9e6f3;text-align:left;cursor:pointer}.shot-panel-toggle small{color:var(--shot-accent);font-size:8px;font-weight:950}.shot-panel-toggle b{max-width:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f8fafc;font-size:10px}.shot-panel-toggle span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(var(--shot-rgb),.92);font-size:8px;font-weight:900;letter-spacing:.06em}.shot-panel-toggle em{color:var(--shot-accent);font-size:8px;font-style:normal;font-weight:900}.shot-panel-toggle i{color:#7f95a8;font-size:7px;font-style:normal;letter-spacing:.08em}.shot-panel.active{border-color:rgba(var(--shot-rgb),.68);box-shadow:0 0 18px rgba(var(--shot-rgb),.14)}.shot-panel.active .shot-panel-toggle{border-color:var(--shot-accent);box-shadow:0 0 10px rgba(var(--shot-rgb),.14)}.shot-panel .shot-delete{width:29px;height:29px;flex:0 0 29px;padding:0;border:1px solid rgba(var(--shot-rgb),.42);border-radius:7px;background:rgba(var(--shot-rgb),.10);color:var(--shot-accent);font-size:16px;line-height:1;cursor:pointer}.shot-panel .shot-delete:hover:not(:disabled),.shot-panel .shot-delete:focus-visible{border-color:var(--shot-accent);background:rgba(var(--shot-rgb),.22);outline:none;box-shadow:0 0 10px rgba(var(--shot-rgb),.18)}.shot-panel .shot-delete:disabled{opacity:.25;cursor:default}.shot-panel .shot-add{flex:0 0 auto;height:29px;padding:0 11px;border:1px solid rgba(var(--shot-rgb),.54);border-radius:7px;background:rgba(var(--shot-rgb),.14);color:var(--shot-accent);font-size:8px;font-weight:950;white-space:nowrap;cursor:pointer}.shot-panel .shot-add:disabled{opacity:.3;cursor:default}.shot-panel .tray-scroll{height:132px;display:flex;align-items:stretch;gap:8px;overflow-x:auto;overflow-y:hidden;padding:7px}.shot-panel .selected-card{border-color:rgba(var(--shot-rgb),.30);background:linear-gradient(145deg,rgba(var(--shot-rgb),.15),rgba(12,17,28,.94))}.shot-panel .selected-thumb{border-color:rgba(var(--shot-rgb),.30)}.shot-panel .slot{border-color:rgba(var(--shot-rgb),.70);background:rgba(var(--shot-rgb),.20);color:var(--shot-accent)}.shot-panel .tray-empty{border-color:rgba(var(--shot-rgb),.22);color:rgba(var(--shot-rgb),.72)}.hmb-image-assets .asset-card.selected{border-color:var(--active-shot-accent);box-shadow:inset 0 0 0 .3px rgba(var(--active-shot-rgb),.48),0 0 15px rgba(var(--active-shot-rgb),.34),0 0 4px rgba(var(--active-shot-rgb),.55)}
       .asset-registration-backdrop{position:absolute;inset:0;z-index:80;display:grid;place-items:center;padding:18px;background:rgba(1,4,10,.78);backdrop-filter:blur(5px)}.asset-passport{width:min(390px,100%);max-height:calc(100% - 12px);display:flex;flex-direction:column;overflow:auto;border:1px solid rgba(244,114,182,.62);border-radius:18px 18px 28px 28px;background:radial-gradient(circle at 50% -8%,rgba(190,24,93,.24),transparent 30%),linear-gradient(180deg,#171020,#090d17 45%,#060912);box-shadow:0 24px 70px rgba(0,0,0,.62),0 0 28px rgba(244,114,182,.2)}.passport-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 10px;border-bottom:1px solid rgba(244,114,182,.2)}.passport-head small{display:block;color:#d8a2be;font-size:7px;font-weight:900;letter-spacing:.18em}.passport-head h2{margin:3px 0 0;color:#fff1f8;font-size:15px;letter-spacing:.08em}.passport-head button{width:28px;height:28px;border:1px solid rgba(244,114,182,.25);border-radius:50%;background:#0b0d16;color:#e7b9d1;font-size:18px;line-height:1;cursor:pointer}.passport-photo{position:relative;width:128px;aspect-ratio:3/4;display:grid;place-items:center;align-self:center;margin:14px 0 8px;overflow:hidden;border:1px solid rgba(244,114,182,.38);border-radius:8px;background:#050910;color:#84677a;font-size:10px;font-weight:900;box-shadow:0 0 18px rgba(244,114,182,.12)}.passport-photo img{width:100%;height:100%;object-fit:cover}.passport-photo>span{display:none}.passport-photo.fallback img{display:none}.passport-photo.fallback>span{display:block}.passport-file{display:flex;flex-direction:column;gap:3px;padding:0 18px 12px;text-align:center}.passport-file b,.passport-file span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.passport-file b{color:#d7e2ef;font-size:8px}.passport-file span{color:#73899d;font-size:7px}.passport-fields{display:grid;grid-template-columns:1fr 1fr;gap:9px;padding:12px 16px;border-top:1px dashed rgba(244,114,182,.24)}.passport-fields label{display:flex;flex-direction:column;gap:4px}.passport-fields label:nth-last-child(1){grid-column:1/-1}.passport-fields label span{color:#bb8fa8;font-size:7px;font-weight:900;letter-spacing:.06em}.passport-fields input,.passport-fields select{width:100%;height:32px;border:1px solid rgba(148,163,184,.27);border-radius:7px;background:#060b13;color:#eef5ff;padding:0 8px;font-size:9px;outline:none}.passport-fields input:focus,.passport-fields select:focus{border-color:var(--asset-selection);box-shadow:0 0 0 1px rgba(244,114,182,.18)}.passport-fields select:disabled{opacity:.42}.passport-actions{display:flex;justify-content:flex-end;gap:7px;padding:11px 16px 15px}.passport-actions button{height:31px;padding:0 13px;border:1px solid rgba(148,163,184,.24);border-radius:7px;background:#0a101a;color:#bac9d8;font-size:8px;font-weight:900;cursor:pointer}.passport-actions .passport-register{border-color:rgba(244,114,182,.62);background:linear-gradient(180deg,rgba(190,24,93,.55),rgba(88,28,135,.42));color:#ffe4f2;box-shadow:0 0 12px rgba(244,114,182,.18)}.passport-actions button:disabled{opacity:.32;cursor:default;box-shadow:none}
       .passport-fields .passport-destination,.passport-fields .passport-folder{grid-column:1/-1;min-width:0;display:grid;gap:4px}
+      .asset-edit{position:absolute;top:5px;right:5px;z-index:2;width:25px;height:25px;border:1px solid var(--asset-selection);border-radius:6px;background:#141522;color:#ffd5eb;cursor:pointer}
+      .passport-actions [data-registration-delete]{color:#fda4af}
       .passport-folder>span{color:var(--selection-soft,#bb8fa8);font-size:7px;font-weight:900;letter-spacing:.06em}
       .passport-folder-controls{border:1px solid rgba(148,163,184,.27);border-radius:7px;background:#060b13;color:#eef5ff;font-size:9px}
       .passport-folder-controls:focus-within{border-color:var(--asset-selection)}
@@ -8648,10 +8673,10 @@ function installEvents(container, state, props, remount, listeners) {
     const key = clean(card.getAttribute("data-asset-key"));
     const asset = assetsByLibraryId.get(key);
     if (!asset) return;
-    on(card.querySelector("[data-asset-add]"), "click", (event) => {
+    on(card.querySelector("[data-asset-add], [data-asset-edit]"), "click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      if (!hmbImageAssetCanRegister(asset, state)) return;
+      if (!asset.registration_revision && !hmbImageAssetCanRegister(asset, state)) return;
       container.__hmbImageAssetRegistrationReturnFocus = {
         descriptor: imageAssetFocusDescriptor(container),
         assetKey: asset.asset_library_id,
@@ -8856,11 +8881,11 @@ function installEvents(container, state, props, remount, listeners) {
     const key = clean(card.getAttribute("data-asset-key"));
     const asset = container.__hmbImageAssetByLibraryId?.get(key) || assetsByLibraryId.get(key);
     if (!asset) return;
-    const add = event.target?.closest?.("[data-asset-add]");
+    const add = event.target?.closest?.("[data-asset-add], [data-asset-edit]");
     if (add) {
       event.preventDefault();
       event.stopPropagation();
-      if (!hmbImageAssetCanRegister(asset, state)) return;
+      if (!asset.registration_revision && !hmbImageAssetCanRegister(asset, state)) return;
       container.__hmbImageAssetRegistrationReturnFocus = {
         descriptor: imageAssetFocusDescriptor(container),
         assetKey: asset.asset_library_id,
@@ -8956,6 +8981,8 @@ function installEvents(container, state, props, remount, listeners) {
     }
     const destination = container.querySelector("[data-registration-destination]");
     if (destination) destination.disabled = Boolean(draft?.saving);
+    const remove = container.querySelector("[data-registration-delete]");
+    if (remove) remove.disabled = Boolean(draft?.saving);
   };
   container.querySelectorAll("[data-registration-field]").forEach((input) => {
     const field = clean(input.getAttribute("data-registration-field"));
@@ -9027,11 +9054,21 @@ function installEvents(container, state, props, remount, listeners) {
     draft.image_sub_type = clean(registrationSub.value);
     remount(state);
   });
-  on(container.querySelector("[data-registration-submit]"), "click", (event) => {
+  const commitRegistration = (event, action) => {
     event.preventDefault();
     event.stopPropagation();
     const draft = container.__hmbImageAssetRegistrationDraft;
-    if (!registrationDraftIsComplete(draft) || draft.saving || draft.bash_pending) return;
+    if (!draft || draft.saving || draft.bash_pending) return;
+    if (action === "delete") {
+      if (!draft.registration_revision) return;
+      if (!draft.confirm_delete) {
+        draft.confirm_delete = true;
+        draft.save_message = imageAssetText(state, "asset_registration_delete_notice");
+        remount(state);
+        container.querySelector("[data-registration-delete]")?.focus();
+        return;
+      }
+    } else if (!registrationDraftIsComplete(draft)) return;
     const projectKey = imageAssetBrowseKey(state);
     const widgetLease = hmbImageAssetWidgetLease(state);
     draft.saving = true;
@@ -9062,6 +9099,8 @@ function installEvents(container, state, props, remount, listeners) {
       }
       const request = {
         request_id: `asset-registration-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+        ...(draft.registration_revision ? {action: action === "delete" ? "delete" : "edit",
+          registration_revision: draft.registration_revision} : {}),
         project_uid: base.project_uid,
         asset_library_id: draft.asset_library_id,
         site_settings_revision: clean(draft.site_settings_revision),
@@ -9100,7 +9139,9 @@ function installEvents(container, state, props, remount, listeners) {
     };
     if (widgetLease) hmbWaitForImageAssetAuthority(container, state).then(publishRegistration).catch(failed);
     else publishRegistration();
-  });
+  };
+  on(container.querySelector("[data-registration-submit]"), "click", commitRegistration);
+  on(container.querySelector("[data-registration-delete]"), "click", event => commitRegistration(event, "delete"));
   on(container, "keydown", (event) => {
     if (!container.__hmbImageAssetRegistrationDraft) return;
     if (event.key === "Escape") {

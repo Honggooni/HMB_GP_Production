@@ -13,11 +13,17 @@ const shots=Array.from({length:5},(_,i)=>({channel_uuid:channel,shot_uuid:`22222
 const row=(uid,label,main="Character",sub="Full Appearance")=>({slot:1,present:true,label,asset_source_uid:uid,asset_library_id:uid,asset_source_kind:"project",asset_managed:true,asset_verified:true,image_main_type:main,image_sub_type:sub,owner:label,color_picks:[uid.includes("background")?"Green":"Red"],binding_video_slots:[1]});
 const fixture={multi_shot_enabled:true,shot:shots[0],images:[row("project:hero","Hero")],videos:[{slot:1,label:"Mask",present:true,manual:true}],source_sync_revision:1,ui_edit_revision:0,
  image_asset:{enabled:true,project_id:"superwings12",selected_assets:1,order_managed:true,ordered_source_uids:["project:hero"],shot_catalog:shots,shot_catalog_routing:{publisher_instance_uuid:channel,channel_uuid:channel,generation:1,metadata_sha256:"a".repeat(64)}}};
-const html=`<!doctype html><meta charset="utf-8"><div id="shell" class="react-flow__node" style="width:980px;height:620px"><div style="height:96px">Native header</div><div id="host"></div></div><script type="module">
+const html=`<!doctype html><meta charset="utf-8"><main class="react-flow"><div class="react-flow__node" data-id="Asset"><div id="asset-widget"></div></div><div class="react-flow__edge" aria-label="Edge from Asset to Prompt" data-id="xy-edge__AssetSHOT_ASSET_OUT-PromptSHOT_ASSET_IN"></div><div id="shell" class="react-flow__node" data-id="Prompt" style="width:980px;height:620px"><div style="height:96px">Native header</div><div id="host"></div></div></main><script type="module">
 import mount,* as widget from '/widget.js';window.widget=widget;window.latest=widget.normalizeState(${JSON.stringify(fixture)});window.writes=0;
 window.props=value=>({value:JSON.stringify(value),disabled:false,onChange(next){window.latest=JSON.parse(next);window.writes++;window.controller.update(window.props(window.latest));}});
 window.controller=mount(document.getElementById('host'),window.props(window.latest));window.ready=true;
 window.accept=raw=>{window.latest=widget.normalizeState(raw);window.controller.update(window.props(window.latest));};
+window.preview=(revision,rows,cancelled=false)=>{
+ const detail={schema:'hmb-shot-media-selection-preview-v1',kind:'image_asset',scope:'shot',
+   publisher_instance_uuid:window.latest.shot.channel_uuid,channel_uuid:window.latest.shot.channel_uuid,
+   shot_uuid:window.latest.shot.shot_uuid,revision,rows,cancelled};
+ document.getElementById('asset-widget').dispatchEvent(new CustomEvent(detail.schema,{detail,bubbles:true,composed:true}));
+};
 window.sourceUpdate=(images,advance=1)=>{
  const state=structuredClone(window.latest);
  state.source_sync_revision+=advance;
@@ -65,6 +71,23 @@ try{
  const expected=[row('project:hero','Hero'),row('project:background','Background','Environment / Background','Main Background')];
  await accepted(expected);
  assert.deepEqual(await labels(),['Hero','Background'],'New selected assets must repaint the existing manager body.');
+ const visibleLabels=()=>page.locator('.source-row.image .source-label-input:visible').evaluateAll(inputs=>inputs.map(input=>input.value));
+ const heading=page.locator('.image-card h3 b');
+ const pending=page.locator('[data-hmb-image-selection-pending]');
+ const writesBeforePreview=await page.evaluate(()=>window.writes);
+ await page.evaluate(()=>window.preview(1,[{source_uid:'project:hero',label:'Hero'}]));
+ assert.deepEqual(await visibleLabels(),['Hero']);
+ assert.equal(await heading.textContent(),'1 / 50');
+ await page.evaluate(()=>window.preview(2,[{source_uid:'project:hero',label:'Hero'},{source_uid:'project:titan',label:'Titan'}]));
+ assert.match(await pending.innerText(),/Titan/);
+ assert.equal(await heading.textContent(),'2 / 50');
+ await page.evaluate(()=>{window.preview(3,[]);window.preview(2,[{source_uid:'project:titan',label:'Titan'}]);});
+ assert.deepEqual(await visibleLabels(),[]);
+ assert.equal(await pending.count(),0);
+ assert.equal(await heading.textContent(),'0 / 50');
+ assert.equal(await page.evaluate(()=>window.writes),writesBeforePreview,'Immediate display must not submit a Prompt edit.');
+ await page.evaluate(()=>window.preview(4,[],true));
+ assert.deepEqual(await visibleLabels(),['Hero','Background']);
  const crossed=await page.evaluate(async images=>{
   const host=document.getElementById('host');
   const schedule=host.__hmbPromptLibraryScheduleFrame;

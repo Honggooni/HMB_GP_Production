@@ -14205,6 +14205,7 @@ class HMBPromptLibrary(DataNode):
         *,
         source_burst: bool = False,
         publish_shot_media: bool = False,
+        image_retry: int = 0,
     ) -> None:
         """Schedule on the host loop, or synchronize on the current host thread.
 
@@ -14250,6 +14251,8 @@ class HMBPromptLibrary(DataNode):
             self._hmb_sync_queued_token = queued_token
             self._hmb_sync_queued_source_burst = bool(source_burst)
 
+        event_loop = None
+
         def run_sync() -> None:
             publish_media = False
             try:
@@ -14289,6 +14292,18 @@ class HMBPromptLibrary(DataNode):
                             self._hmb_sync_publish_shot_media_pending = bool(
                                 self._hmb_sync_publish_shot_media_pending or publish_media
                             )
+                            # A preparation callback can be coalesced with a
+                            # newer selection. Give the current Shot a bounded
+                            # retry even when no additional edge signal arrives.
+                            if (getattr(exc, "hmb_image_asset_selection_preparing", False) is True
+                                    and event_loop is not None and event_loop.is_running() and image_retry < 7):
+                                generation = self._hmb_sync_generation
+
+                                def retry_current_image_selection() -> None:
+                                    if self._hmb_sync_generation == generation:
+                                        self._schedule_prompt_sync(source_burst=True, image_retry=image_retry + 1)
+
+                                event_loop.call_later(min(1.0, 0.05 * 2**image_retry), retry_current_image_selection)
                     return
                 # A corrupt/replaced source must remain an explicit error, but
                 # an unchanged five-second refresh cannot recompile/log forever.

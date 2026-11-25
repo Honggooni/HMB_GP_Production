@@ -93,7 +93,7 @@ function openProjectFolderCards(container, state, options) {
   const select = find("project"), closeButton = find("close"), add = find("add"), remove = find("remove"), done = find("done");
   find("title").textContent = label("프로젝트 Add", "Project Add");
   find("project-label").textContent = label("프로젝트", "Project");
-  find("heading").textContent = label("추가한 폴더", "Added folders");
+  find("heading").textContent = sound ? label("추가한 폴더", "Added folders") : label("저장 폴더", "Save folders");
   add.textContent = label("추가", "Add"); remove.textContent = label("삭제", "Remove");
   done.textContent = label("완료", "Done");
   closeButton.setAttribute("aria-label", label("닫기", "Close"));
@@ -130,13 +130,17 @@ function openProjectFolderCards(container, state, options) {
   function paint() {
     const grid = find("cards"); grid.replaceChildren();
     const links = profile()?.links || [];
+    const folders = !sound && project ? [
+      {id: "hq", label: label("기본 폴더", "Default folder"), root: projects.get(project)?.path || ""},
+      ...links,
+    ] : links;
     const pending = memory.pending;
     let selected = selectedId();
-    if (!links.some(link => link.id === selected)) {
-      selected = [profile()?.selected_site_id, writeId(), links[0]?.id].find(id=>links.some(link=>link.id === id)) || "";
+    if (!folders.some(folder => folder.id === selected)) {
+      selected = [profile()?.selected_site_id, writeId(), folders[0]?.id].find(id=>folders.some(folder=>folder.id === id)) || "";
       memory.selections.set(project, selected);
     }
-    for (const item of links) {
+    for (const item of folders) {
       const card = doc.createElement("div"), button = doc.createElement("button"), icon = doc.createElement("span"), name = doc.createElement("span");
       card.className = "pf-card";
       button.type = "button"; button.className = "pf-select"; button.dataset.pfSite = item.id; button.title = item.root;
@@ -197,8 +201,9 @@ function openProjectFolderCards(container, state, options) {
       notice(result.message || label("폴더 설정을 저장하지 못했습니다.", "Could not save the folder settings.")); return;
     }
     if (req.action === "confirm" && req.request_id === confirmRequest) {
+      const savedSelection = req.selected_site_id === "hq" ? "" : req.selected_site_id;
       if (result.revision && result.revision === profile()?.revision && Array.isArray(result.links)
-          && result.selected_site_id === req.selected_site_id && profile()?.selected_site_id === req.selected_site_id
+          && result.selected_site_id === savedSelection && profile()?.selected_site_id === savedSelection
           && !result.cancelled) close();
       else notice(label("현재 폴더 설정을 다시 확인해 주세요.", "Review the current folder settings."));
       return;
@@ -213,7 +218,7 @@ function openProjectFolderCards(container, state, options) {
     const selected = selectedId();
     if (profile()?.links.some(link => link.id === selected)) {
       const remaining = profile().links.filter(link => link.id !== selected);
-      const destination = writeId() === selected ? (remaining[0]?.id || "hq") : writeId();
+      const destination = writeId() === selected ? "hq" : writeId();
       save(remaining, destination);
     }
   };

@@ -175,7 +175,12 @@ try:
     persisted = next(
         item for item in document["assets"] if item.get("asset_id") == "HeroRig"
     )
-    assert persisted == {
+    owner = asset_library._asset_registration_owner()
+    if owner:
+        assert persisted["registration_owner"] == owner
+        assert persisted["registration_revision"] == registered_candidate["registration_revision"]
+    assert {key: value for key, value in persisted.items()
+            if key not in ("registration_owner", "registration_revision")} == {
         "path": candidate_path.relative_to(project_root).as_posix(),
         "asset_id": "HeroRig",
         "image_name": "Hero Final",

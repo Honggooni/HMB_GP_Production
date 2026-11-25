@@ -4,6 +4,7 @@ from collections import Counter, OrderedDict
 from concurrent.futures import Future
 from array import array
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 import asyncio
 import base64
@@ -3108,12 +3109,60 @@ def _load_asset_manifest_document(
     return manifest_path, payload, records
 
 
-def _write_asset_manifest_record(root: Path, record: Dict[str, Any]) -> Path:
-    """Atomically create one record; an existing project-relative path is immutable."""
+@lru_cache(maxsize=1)
+def _asset_registration_owner() -> str:
+    """Fingerprint the Windows account running the engine, independent of UI input."""
+    if os.name != "nt":
+        return ""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    token_api = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    token_api.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    token_api.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+    ]
+    token_api.GetLengthSid.argtypes = [ctypes.c_void_p]
+    token_api.GetLengthSid.restype = wintypes.DWORD
+    token = wintypes.HANDLE()
+    if not token_api.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+        return ""
+    try:
+        size = wintypes.DWORD()
+        token_user = 1
+        token_api.GetTokenInformation(token, token_user, None, 0, ctypes.byref(size))
+        if not 0 < size.value <= 4096:
+            return ""
+        buffer = ctypes.create_string_buffer(size.value)
+        if not token_api.GetTokenInformation(token, token_user, buffer, size.value, ctypes.byref(size)):
+            return ""
+        # TOKEN_USER starts with its PSID. Hash the binary SID locally without
+        # resolving account names, contacting a domain controller or touching a share.
+        sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
+        if not sid:
+            return ""
+        return hashlib.sha256(b"hmb-image-registration:" + ctypes.string_at(sid, token_api.GetLengthSid(sid))).hexdigest()
+    finally:
+        kernel.CloseHandle(token)
+
+
+def _editable_registration_revision(record: Dict[str, Any]) -> str:
+    revision = _clean(record.get("registration_revision"))
+    if not revision:
+        return ""
+    owner = _asset_registration_owner()
+    return revision if owner and owner == record.get("registration_owner") else ""
+
+
+def _write_asset_manifest_record(root: Path, record: Dict[str, Any], *, action="add", revision="") -> Path:
+    """Atomically mutate one registration using the shared manifest lock."""
     lock = _asset_manifest_lock(root)
     with lock:
         with _asset_manifest_process_lock(root):
-            return _write_asset_manifest_record_locked(root, record)
+            return _write_asset_manifest_record_locked(root, record, action=action, revision=revision)
 
 
 def _replace_registration_manifest(temporary: Path, manifest: Path) -> None:
@@ -3146,6 +3195,7 @@ class _RegistrationFieldConflict(ValueError):
 def _write_asset_manifest_record_locked(
     root: Path,
     record: Dict[str, Any],
+    *, action="add", revision="",
 ) -> Path:
     """Write one record while both in-process and shared-file locks are held."""
     relative_text = _clean(record.get("path")).replace("\\", "/")
@@ -3164,7 +3214,12 @@ def _write_asset_manifest_record_locked(
         raise ValueError(
             f"{manifest_path.name} contains duplicate records for {relative_text}."
         )
-    if not matching_indices:
+    if action != "add":
+        if len(matching_indices) != 1 or not revision or _editable_registration_revision(records[matching_indices[0]]) != revision:
+            raise ValueError("등록한 계정만 수정하거나 삭제할 수 있습니다. 등록 정보가 바뀌었다면 새로고침하세요.")
+    elif matching_indices:
+        raise ValueError("This image asset is already registered and cannot be edited. Only unregistered assets can be added.")
+    else:
         # An old client can still post Add against a moved row using a new
         # display name. Recheck that exceptional case under the shared lock.
         by_path = {_manifest_asset_relative_path(root, row).casefold(): row for row in records if isinstance(row, dict)}
@@ -3180,7 +3235,7 @@ def _write_asset_manifest_record_locked(
 
     asset_id_key = _clean(record.get("asset_id")).casefold()
     image_name_key = _clean(record.get("image_name")).casefold()
-    for index, raw in enumerate(records):
+    for index, raw in enumerate(records if action != "delete" else ()):
         if not isinstance(raw, dict) or index in matching_indices:
             continue
         other_path = _clean(raw.get("path") or raw.get("relative_path"))
@@ -3197,13 +3252,18 @@ def _write_asset_manifest_record_locked(
             raise _RegistrationFieldConflict("Image Name", _clean(record.get("image_name")), other_path)
 
     updated_records = list(records)
-    if matching_indices:
-        raise ValueError(
-            "This image asset is already registered and cannot be edited. "
-            "Only unregistered assets can be added."
-        )
+    saved_record = {}
+    if action == "delete":
+        del updated_records[matching_indices[0]]
+    elif action == "edit":
+        index = matching_indices[0]
+        saved_record = {**records[index], **record, "registration_revision": uuid.uuid4().hex}
+        updated_records[index] = saved_record
     else:
-        updated_records.append(dict(record))
+        owner = _asset_registration_owner()
+        saved_record = ({**record, "registration_owner": owner, "registration_revision": uuid.uuid4().hex}
+                        if owner else dict(record))
+        updated_records.append(saved_record)
 
     persisted_cache_uid = (
         _valid_project_cache_uid(payload.get(_ASSET_PROJECT_CACHE_UID_FIELD))
@@ -3253,6 +3313,7 @@ def _write_asset_manifest_record_locked(
     _invalidate_asset_manifest_cache(root)
     _invalidate_project_cache_uid(root)
     _cleanup_legacy_asset_metadata(root)
+    record.update(saved_record)
     return manifest_path
 
 
@@ -3684,6 +3745,7 @@ def _restore_manifest_registration(asset, root, relative, overrides, stems):
     asset["image_name"] = _clean(values.get("image_name") or values.get("name")) or relative.stem
     asset["registered"] = override is not None
     asset["registration_relative_path"] = _manifest_asset_relative_path(root, values)
+    asset["registration_revision"] = _editable_registration_revision(values)
     # Reconstructed cache rows follow the same registry defaults as a cold
     # scan. The subsequent per-workflow merge owns explicit local selections.
     asset["selected"] = override is not None and bool(values.get("selected"))
@@ -3968,6 +4030,7 @@ def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | N
                 "catalog_file_stamp": file_stamp,
                 "relative_path": relative_text,
                 "registration_relative_path": _manifest_asset_relative_path(root, override_values),
+                "registration_revision": _editable_registration_revision(override_values) if registered else "",
                 "extension": path.suffix.casefold(),
                 "width": width,
                 "height": height,
@@ -4063,6 +4126,8 @@ def _normalize_asset(raw: Any) -> Dict[str, Any] | None:
         "relative_path": _clean(raw.get("relative_path")).replace("\\", "/"),
         **({"registration_relative_path": _clean(raw["registration_relative_path"])[:4096]}
            if registered and raw.get("registration_relative_path") else {}),
+        **({"registration_revision": _clean(raw["registration_revision"])[:128]}
+           if registered and raw.get("registration_revision") else {}),
         "extension": _clean(raw.get("extension")).casefold(),
         "width": width,
         "height": height,
@@ -4255,15 +4320,20 @@ def _normalize_asset_registration_request(value: Any) -> Dict[str, str]:
     relative_path = _clean(value.get("relative_path")).replace("\\", "/")[:1024]
     source_uid = _clean(value.get("source_uid"))[:512]
     target_folder = _clean(value.get("target_folder")).replace("\\", "/")[:1024]
+    action = _clean(value.get("action")) or "add"
     if (
         not request_id
         or not asset_library_id
+        or action not in {"add", "edit", "delete"}
+        or (action != "add" and (source_kind != "project" or not _clean(value.get("registration_revision"))))
         or (source_kind == "project" and not relative_path)
         or (source_kind == "user" and not source_uid)
     ):
         return {}
     return {
         "request_id": request_id,
+        "action": action,
+        "registration_revision": _clean(value.get("registration_revision"))[:128],
         "project_uid": _clean(value.get("project_uid"))[:256],
         "asset_library_id": asset_library_id,
         "source_kind": source_kind,
@@ -5251,6 +5321,7 @@ _ASYNC_SCAN_USER_ASSET_FIELDS = (
     "asset_id",
     "image_name",
     "registered",
+    "registration_revision",
     "image_main_type",
     "image_sub_type",
     "source_type",
@@ -5864,7 +5935,7 @@ def _read_verified_image_catalog(
                 pinned = next((value.result() for key, value in reversed(_CATALOG_READS.items())
                                if key[:2] == ("catalog", prefix) and value.done() and not value.cancelled()
                                and value.exception() is None), None)
-        notice = "" if pinned is not None else ensure_registration_directory(project, refresh=not use_shared_cache)
+        notice = "" if pinned is not None else ensure_registration_directory(project, refresh=not use_shared_cache, vendor=True)
         if pinned is not None:
             facts = _scan_linked_sites(project, settings, pinned, pinned=pinned)
         elif settings.get("links"):
@@ -7045,6 +7116,7 @@ def _commit_asset_registration(
         raise ValueError("The selected image project changed; refresh before registering.")
     settings = get_site_settings(selected_root)
     writer = settings["write_site_id"]
+    action = request["action"]
     explicit_site = request["target_site_id"] if request_source_kind == "user" else ""
     if request_source_kind == "user" and not explicit_site and not request["target_folder"] and writer != "hq":
         request["target_folder"] = f"site:{writer}/add"
@@ -7054,7 +7126,7 @@ def _commit_asset_registration(
         if (not settings["links"] or site != explicit_site or not site_rel
                 or (site == "hq" and request["target_folder"].startswith("site:"))):
             raise ValueError("선택한 저장 위치와 하위 에셋 폴더를 다시 확인하세요.")
-    elif site != writer:
+    elif action == "add" and site != writer:
         raise ValueError("현재 작업 위치의 이미지 폴더에만 등록할 수 있습니다.")
     write_root = selected_root
     project_id = _clean(selected_project["project_id"])
@@ -7097,7 +7169,7 @@ def _commit_asset_registration(
                 "selected": False,
                 "selection_order": 0,
             }
-        if bool(source_asset.get("registered")):
+        if action == "add" and bool(source_asset.get("registered")):
             raise ValueError(
                 "This image asset is already registered and cannot be edited. "
                 "Only unregistered assets can be added."
@@ -7113,16 +7185,19 @@ def _commit_asset_registration(
             allow_user_import_path=False,
         )
         manifest_records = _read_asset_manifest(write_root)
-        if relative_text.casefold() in manifest_records:
+        current_record = manifest_records.get(relative_text.casefold())
+        if action == "add" and current_record is not None:
             raise ValueError(
                 "This image asset is already registered and cannot be edited. "
                 "Only unregistered assets can be added."
             )
-        verified_dimensions = _verified_image_dimensions(source_path)
+        if action != "add" and (not current_record or _editable_registration_revision(current_record) != request["registration_revision"]):
+            raise ValueError("등록한 계정만 수정하거나 삭제할 수 있습니다. 등록 정보가 바뀌었다면 새로고침하세요.")
+        verified_dimensions = _verified_image_dimensions(source_path) if action != "delete" else None
         record = _registration_record(
             request,
             {"relative_path": relative_text},
-        )
+        ) if action != "delete" else {"path": relative_text}
         registered_row = _registered_project_asset_row(
             project_root=write_root,
             project_id=write_project_id,
@@ -7130,13 +7205,21 @@ def _commit_asset_registration(
             relative_text=relative_text,
             manifest_record=record,
             previous_asset=source_asset,
-            selected=bool(source_asset.get("selected")),
+            selected=action != "delete" and bool(source_asset.get("selected")),
             selection_order=_non_negative_int(source_asset.get("selection_order")),
             verified_dimensions=verified_dimensions,
             hydrate_thumbnail=True,
         )
-        manifest_path = _write_asset_manifest_record(write_root, record)
-        registration_message = f"Registered in {manifest_path.name}."
+        if action == "add":
+            manifest_path = _write_asset_manifest_record(write_root, record)
+            registration_message = f"Registered in {manifest_path.name}."
+        else:
+            _write_asset_manifest_record(write_root, record, action=action, revision=request["registration_revision"])
+            registration_message = "Registration updated." if action == "edit" else "Registration removed; the image file is kept."
+            if action == "delete":
+                registered_row["registered"] = False
+            else:
+                registered_row["import_source_uid"] = _clean(record.get("import_source_uid"))
     else:
         source_matches = [
             (index, asset)
@@ -7162,7 +7245,7 @@ def _commit_asset_registration(
             )
         # A newly linked folder is usable before the next user-initiated scan.
         # Only its known default import destination may bypass the snapshot.
-        if site != "hq" and site_rel.casefold() in ("", "add"):
+        if site_rel.casefold() == "add" or (site != "hq" and not site_rel):
             target_folder = "add"
             notice = ensure_registration_directory(write_root, vendor=True)
             if notice:
@@ -7226,6 +7309,7 @@ def _commit_asset_registration(
             f"Copied to {relative_text} and registered in {manifest_path.name}."
         )
 
+    registered_row["registration_revision"] = _editable_registration_revision(record) if action != "delete" else ""
     if site != "hq":
         registered_row = _site_view_row(registered_row, project_id, project_uid, site)
     refreshed = dict(normalized)
@@ -9185,7 +9269,7 @@ def _add_output(node: Any) -> None:
         "tooltip": (
             "ASSET_OUT optionally shares selected images and available project, name, "
             "order, and taxonomy metadata with any downstream node. A verified "
-            "registration is immutable in this library. HMBPromptLibrary may still "
+            "registration may be edited by its registering account. HMBPromptLibrary may still "
             "select an effective per-shot Look Sub Type where its own taxonomy permits "
             "it, without making Prompt a prerequisite."
         ),

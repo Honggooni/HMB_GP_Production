@@ -83,7 +83,7 @@ class SiteSettingsRegression(unittest.TestCase):
             added, second_id = self.sites.add_site_folder(self.project, str(self.busan), "image")
             self.assertEqual([x.args[0] for x in check.call_args_list], [self.busan])
         self.assertEqual([r["id"] for r in added["links"]], [first_id, second_id])
-        self.assertEqual(added["write_site_id"], second_id)
+        self.assertEqual(added["write_site_id"], "hq")
         replay, again_id = self.sites.add_site_folder(self.project, str(self.busan), "image")
         self.assertEqual((replay, again_id), (added, second_id))
         restored = load_module()
@@ -93,12 +93,19 @@ class SiteSettingsRegression(unittest.TestCase):
             with patch.object(restored, "_read", side_effect=AssertionError("repeated disk read")):
                 self.assertEqual(restored.site_profiles(projects, "image"), {"p": added})
             self.assertEqual(restored.site_profiles(projects, "sound"), {})
-            with self.assertRaises(ValueError):
-                restored.save_site_settings(self.project, added["links"], "hq", added["revision"], existing_only=True)
             result = restored.save_site_settings(self.project, added["links"][1:], second_id,
                                                 added["revision"], existing_only=True)
             self.assertEqual(len(result["links"]), 1)
-            last = restored.save_site_settings(self.project, [], "hq", result["revision"], existing_only=True)
+            default = restored.save_site_settings(self.project, result["links"], "hq", result["revision"], existing_only=True)
+            self.assertEqual(default["write_site_id"], "hq")
+            self.assertEqual(default["links"], result["links"])
+        self.project.mkdir()
+        with patch.object(restored, "_check_directory_route", wraps=restored._check_directory_route) as check:
+            default = restored.confirm_site_folder(self.project, "image", default["revision"], "hq")
+            self.assertEqual([call.args[0] for call in check.call_args_list], [self.project])
+            self.assertTrue((self.project / "add").is_dir())
+            self.assertEqual(default["selected_site_id"], "")
+            last = restored.save_site_settings(self.project, [], "hq", default["revision"], existing_only=True)
             self.assertEqual((last["links"], last["write_site_id"]), ([], "hq"))
             self.assertEqual(restored.site_profiles(projects, "image"), {"p": last})
 

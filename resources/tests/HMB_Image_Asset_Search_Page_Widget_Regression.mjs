@@ -222,16 +222,17 @@ try{
     const control = action => chooser.locator(`[data-registration-folder-action="${action}"]`);
     const folder = path => chooser.locator(`[data-registration-folder-path="${prefix}${path}"]`);
     const rows = () => chooser.locator('[data-registration-folder-path]:not(.passport-folder-here) span:first-child').allTextContents();
-    assert.equal(await submit.isDisabled(),true);
+    assert.equal(await submit.isEnabled(),true);
+    assert.match(await control('open').textContent(),/add/);
     if (vendor) {
       assert.deepEqual(await destination.locator('option').allTextContents(),['Select a save location','Default folder','Partner','Second partner']);
-      assert.equal(await control('open').isDisabled(),true);
-      await destination.selectOption(writer);
+      assert.equal(await destination.inputValue(),writer);
+      await control('open').click();
       await folder('add').click();
       assert.match(await control('open').textContent(),/Partner \/ add/);
       assert.equal(await submit.isEnabled(),true);
       await destination.selectOption('hq');
-      assert.deepEqual(await rows(),['HQOnly']);
+      assert.deepEqual(await rows(),['HQOnly','add']);
       assert.equal(await submit.isDisabled(),true);
       await destination.selectOption(secondSite);
       assert.deepEqual(await rows(),['SecondOnly','add']);
@@ -241,7 +242,7 @@ try{
       await control('open').click();
     }
     assert.equal(await submit.isDisabled(),true);
-    assert.deepEqual(await rows(),vendor ? ['BG','BG_lighting','CH','add'] : ['BG','BG_lighting','CH']);
+    assert.deepEqual(await rows(),['BG','BG_lighting','CH','add']);
     await folder('BG').click();
     assert.deepEqual(await rows(),['e201','e202']);
     await chooser.getByRole('button',{name:'Save in this folder'}).click();
@@ -270,6 +271,30 @@ try{
     assert.equal(requests[0].target_site_id,vendor ? writer : undefined);
     await client.close();
   }
+
+  const editor = await browser.newPage({viewport:{width:1280,height:1080}});
+  editor.on('pageerror', error => errors.push(error.message));
+  await editor.route('**/*', route => new URL(route.request().url()).hostname === '127.0.0.1' ? route.continue() : route.abort());
+  await editor.goto(`http://127.0.0.1:${server.address().port}`);
+  await editor.waitForFunction(() => window.ready);
+  const ownerRow = {...state.assets[1], relative_path:'CH/owned.png', registration_revision:'test-owner-revision'};
+  const otherRow = {...state.assets[2], relative_path:'CH/other.png'};
+  await editor.evaluate(value => window.boot(value,0), api.hmbNormalizeImageAssetState({...state,
+    assets:[ownerRow,otherRow], shot_routing:undefined}));
+  await editor.locator('[data-folder-key][data-source-view="project"][data-folder-path=""]').first().click();
+  assert.equal(await editor.locator('[data-asset-edit]').count(),1);
+  await editor.locator('[data-asset-edit]').click();
+  await editor.getByRole('dialog',{name:'Edit registration'}).waitFor();
+  const remove = editor.locator('[data-registration-delete]');
+  await remove.click();
+  assert.equal(await remove.textContent(),'Confirm removal');
+  assert.equal(await editor.evaluate(() => window.writes.filter(v => (v.edits || v).asset_registration_request?.request_id).length),0);
+  await remove.click();
+  const removal = await editor.evaluate(() => window.writes.map(v => (v.edits || v).asset_registration_request).find(v => v?.request_id));
+  assert.equal(removal.action,'delete');
+  assert.equal(removal.registration_revision,'test-owner-revision');
+  assert.equal(removal.asset_library_id,ownerRow.asset_library_id);
+  await editor.close();
 
   // Five workstations have five independent drafts and receipt owners. A
   // delayed server commit or another writer's ACK cannot resubmit or close

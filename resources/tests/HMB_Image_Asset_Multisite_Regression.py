@@ -204,6 +204,8 @@ def live_profile_changes(root):
     state["shot_routing"]["shots"][0]["selected_source_uids"] = [anchor["source_uid"]]
     with patch.object(lib, "_scan_project_assets", wraps=lib._scan_project_assets) as scans:
         profile, site = add_site_folder(hq, str(first), "image")
+        assert profile["write_site_id"] == "hq"
+        profile = lib.save_site_settings(hq, profile["links"], site, profile["revision"], existing_only=True)
         confirm_site_folder(hq, "image", profile["revision"], site)
         state = load(lib,catalog,state)
         assert f"site:{site}/add" in state["folders"]
@@ -212,6 +214,8 @@ def live_profile_changes(root):
             confirm_site_folder(hq, "image", profile["revision"], site)
             state = load(lib,catalog,state)
         profile2, site2 = add_site_folder(hq, str(second), "image")
+        assert profile2["write_site_id"] == site
+        profile2 = lib.save_site_settings(hq, profile2["links"], site2, profile2["revision"], existing_only=True)
         confirm_site_folder(hq, "image", profile2["revision"], site2)
         state = load(lib,catalog,state)
         assert not any(a["relative_path"] == f"site:{site}/CH/unregistered.png" for a in state["assets"])
@@ -293,6 +297,39 @@ def explicit_import_destinations(root):
     assert manual.read_bytes() == manual_bytes
     assert "ch/manual.png" in lib._read_asset_manifest(first)
     assert len(list(root.rglob("manual.png"))) == 1
+    owned = next(a for a in state["assets"] if a["asset_library_id"] == row["asset_library_id"])
+    revision = owned["registration_revision"]
+    edit = {
+        "request_id": "edit", "action": "edit", "project_uid": state["project_uid"],
+        "asset_library_id": row["asset_library_id"], "relative_path": row["relative_path"],
+        "asset_id": "Manual", "image_name": "Manual updated", "image_main_type": "Custom / Context",
+        "image_sub_type": "Context", "site_settings_revision": profile["revision"],
+        "registration_revision": revision,
+    }
+    with patch.object(lib, "_asset_registration_owner", return_value="another Windows account"):
+        for action in ("edit", "delete"):
+            try:
+                lib._apply_asset_registration(state, {**edit, "action": action})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("A different account changed a registration")
+    state = lib._apply_asset_registration(state, edit)
+    edited = next(a for a in state["assets"] if a["asset_library_id"] == row["asset_library_id"])
+    assert edited["image_name"] == "Manual updated" and edited["registration_revision"] != revision
+    try:
+        lib._apply_asset_registration(state, {**edit, "action": "delete"})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("A stale version deleted the edited registration")
+    state = lib._apply_asset_registration(state, {
+        **edit, "request_id": "delete", "action": "delete", "registration_revision": edited["registration_revision"],
+    })
+    assert not next(a for a in state["assets"] if a["asset_library_id"] == row["asset_library_id"])["registered"]
+    assert "ch/manual.png" not in lib._read_asset_manifest(first)
+    assert manual.read_bytes() == manual_bytes
+    assert (hq / "add").is_dir()
 
 
 def run():

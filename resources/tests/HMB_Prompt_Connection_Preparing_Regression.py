@@ -84,6 +84,24 @@ class PromptConnectionPreparationTests(unittest.TestCase):
                     self.assertIs(self.fixture.diag.call_args.args[1],error)
                     schedule.assert_not_called()
 
+    def test_image_selection_retries_when_readiness_notification_is_coalesced(self):
+        self.fixture.pending = True
+        self.fixture.error = fixture_module.Preparing('image verification still running')
+        original = self.node._sync_prompt_output_from_state
+
+        def prepare_once(**kwargs):
+            try:
+                return original(**kwargs)
+            finally:
+                self.fixture.pending = False
+
+        self.node._sync_prompt_output_from_state = prepare_once
+        self.node._schedule_prompt_sync(source_burst=True, publish_shot_media=True)
+        self.fixture.loop.drain()
+        self.assertEqual(len(self.fixture.calls), 1)
+        self.assertTrue(self.fixture.calls[0][1]['publish_shot_media'])
+        self.assertFalse(self.node._hmb_sync_publish_shot_media_pending)
+
     def test_truthy_non_boolean_or_false_flags_do_not_hide_value_errors(self):
         for marker in (False,1,'true'):
             for entry in ('incoming','initial'):

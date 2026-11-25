@@ -382,8 +382,6 @@ def save_site_settings(project_root, links, write_site_id, expected_revision=Non
             if not isinstance(expected_revision, str) or not isinstance(links, list) or any(
                     item not in current["links"] for item in links):
                 raise ValueError("현재 등록된 폴더만 선택하거나 해제할 수 있습니다.")
-            if media == "image" and links and write_site_id == "hq" and current["write_site_id"] != "hq":
-                raise ValueError("추가한 폴더 중에서 Add 대상을 선택하세요.")
         validated, target = _links_for_save(project_root, current, links, write_site_id)
         return _store_profile(path, current, validated, target)
 
@@ -435,8 +433,7 @@ def add_site_folder(project_root, selected, media):
             links.append({"id": site_id, "label": name[:128], "root": root})
         if media == "image":
             _prepare_selected_folder(physical)
-        target = site_id if media == "image" else profile["write_site_id"]
-        return _store_profile(path, profile, links, target, site_id), site_id
+        return _store_profile(path, profile, links, profile["write_site_id"], site_id), site_id
 
 
 def confirm_site_folder(project_root, media, expected_revision, selected):
@@ -449,6 +446,11 @@ def confirm_site_folder(project_root, media, expected_revision, selected):
         # the existing profile. It cannot silently overwrite someone else's selection.
         if expected_revision and expected_revision != profile["revision"]:
             raise ValueError("다른 창에서 폴더 설정이 변경되었습니다. 표시된 목록을 확인하고 완료를 다시 누르세요.")
+        if media == "image" and selected == "hq":
+            root = _media_root(project_root)
+            _check_directory_route(root)
+            _prepare_selected_folder(root)
+            return _store_profile(path, profile, profile["links"], profile["write_site_id"], "")
         if selected is None or selected == "" or not expected_revision:
             selected = profile["selected_site_id"]
         if not isinstance(selected, str):

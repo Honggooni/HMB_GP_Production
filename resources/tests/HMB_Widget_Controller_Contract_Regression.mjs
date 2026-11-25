@@ -290,22 +290,22 @@ assert.match(assetSource, /\.hmb-image-assets\[data-asset-view="detail"\] \.asse
 assert.doesNotMatch(assetSource, /data-asset-view="image"[\s\S]{0,500}asset-thumb-footer\{display:none/, "Image-only mode must retain the source-name/Add thumbnail footer.");
 assert.doesNotMatch(assetSource, /@media\(max-width:920px\)\{[^}]*\.asset-grid\{grid-template-columns:1fr\}/, "Responsive layout must not restore the stretched green trailing area.");
 assert.match(assetSource, /data-registration-field="asset_id"/, "The Add passport must retain editable Asset ID because Picker and Prompt bind against it.");
-assert.match(assetSource, /function assetCardThumbnailImageMarkup\(asset\)[\s\S]*?class="asset-thumb-placeholder"[\s\S]*?class="asset-thumb-media">\$\{assetCardThumbnailImageMarkup\(asset\)\}\$\{add\}<\/div>[\s\S]*?class="asset-thumb-footer"><span class="asset-source-name"/, "Every asset card must use an image-or-neutral-placeholder media area and show only the source name in its footer.");
+assert.match(assetSource, /function assetCardThumbnailImageMarkup\(asset\)[\s\S]*?class="asset-thumb-placeholder"[\s\S]*?class="asset-thumb-media">\$\{assetCardThumbnailImageMarkup\(asset\)\}\$\{add\}\$\{edit\}<\/div>[\s\S]*?class="asset-thumb-footer"><span class="asset-source-name"/, "Asset cards keep the action controls in the media area and the source name in the footer.");
 assert.doesNotMatch(assetSource.match(/function assetThumbnailHtml\(asset, state\)[\s\S]*?\n\}/)?.[0] || "", /thumbnailImageMarkup\(asset\)/, "Asset-card fallback media must never expose extension text.");
 const assetThumbnailSource = assetSource.match(/function assetThumbnailHtml\([\s\S]*?\n\}/)?.[0] || "";
 assert.match(assetThumbnailSource, /const add = hmbImageAssetCanRegister\(asset, state\)[\s\S]*?data-asset-add[\s\S]*?: ""/, "Only unregistered registerable media may expose Add.");
-assert.doesNotMatch(assetThumbnailSource, /✎|edit_image_asset/, "Registered asset editing must not remain reachable from the thumbnail.");
+assert.match(assetThumbnailSource, /const edit = asset\.registration_revision[\s\S]*?data-asset-edit/, "Only an owner-authorized registration can expose the edit icon.");
 assert.doesNotMatch(assetSource, /class="asset-format"/, "Thumbnail footers must no longer spend their label on the file extension.");
 assert.match(assetSource, /class="asset-title"[\s\S]*?class="asset-extension-badge"/, "Detail content must place the extension badge at the title's top-right edge.");
 assert.match(assetSource, /\.asset-extension-badge\{[^}]*color:var\(--accent\);[^}]*font-family:inherit;[^}]*font-size:7px;[^}]*font-weight:900/, "The detail extension badge must use the project accent and inherited project font.");
 assert.match(assetSource, /data-asset-view="image"\] \.asset-content,\.hmb-image-assets\[data-asset-view="image"\] \.asset-extension-badge\{display:none\}/, "Image-only view must explicitly hide the detail-only extension badge.");
-assert.match(assetSource, /role="dialog" aria-modal="true"[\s\S]*?imageAssetText\(state, "asset_passport"\)[\s\S]*?data-registration-main[\s\S]*?data-registration-sub/, "Add must open a localized passport registration dialog with Main and Sub Type selectors.");
+assert.match(assetSource, /role="dialog" aria-modal="true"[\s\S]*?"edit_asset" : "asset_passport"[\s\S]*?data-registration-main[\s\S]*?data-registration-sub/, "Add and Edit share the localized passport fields.");
 assert.match(assetSource, /function registrationFolderField\(state, draft, externalImport\)[\s\S]*?if \(!externalImport\) return "";[\s\S]*?data-registration-folder/, "Only external imports should render the destination Asset Folder chooser.");
 assert.match(assetSource, /source_kind: draft\.source_kind[\s\S]*?source_uid: draft\.source_uid[\s\S]*?target_folder:/, "External registration requests must carry trusted source identity and the selected destination folder.");
 assert.match(assetSource, /asset_registration_request/, "The registration dialog must submit a one-shot backend request.");
 assert.match(assetSource, /export function hmbImageAssetCanRegister\(asset, state\)[\s\S]*?asset\.registered[\s\S]*?source_kind[\s\S]*?import_index/, "One central contract must allow Add only for unregistered project media or live external imports.");
-assert.match(assetSource, /if \(!hmbImageAssetCanRegister\(asset, state\)\) return null;/, "Registered assets must not create a registration draft.");
-assert.match(assetSource, /!asset[\s\S]*?\|\| !hmbImageAssetCanRegister\(asset, state\)[\s\S]*?\) return "";/, "The registration passport must render only for Add candidates.");
+assert.match(assetSource, /if \(!asset\?\.registration_revision && !hmbImageAssetCanRegister\(asset, state\)\) return null;/, "The passport requires a new Add or owner-authorized registration.");
+assert.match(assetSource, /draft\.registration_revision !== asset\.registration_revision[\s\S]*?data-registration-delete/, "Edit is bound to one registration revision and offers removal.");
 const promptSubtypeControlSource = promptSource.match(
   /function renderSubtypeControls\(item, state\)[\s\S]*?\n\}/,
 )?.[0] || "";
@@ -713,8 +713,8 @@ const externalRegistrationDraftProbe = assetModule.hmbCreateImageAssetRegistrati
 });
 assert.equal(externalRegistrationDraftProbe.source_kind, "user");
 assert.equal(externalRegistrationDraftProbe.source_uid, "import:source");
-assert.equal(externalRegistrationDraftProbe.target_folder, "");
-assert.equal(externalRegistrationDraftProbe.target_folder_confirmed, false);
+assert.equal(externalRegistrationDraftProbe.target_folder, "add");
+assert.equal(externalRegistrationDraftProbe.target_folder_confirmed, true);
 const deferredRegistrationContainer = {
   __hmbImageAssetRegistrationDraft: {
     image_name: "Typing Hero Beauty",
