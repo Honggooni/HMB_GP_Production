@@ -252,7 +252,7 @@ def explicit_import_destinations(root):
     state = load(lib, catalog)
 
     for site, storage, destination in (
-        ("hq", hq, "CH"),
+        ("hq", hq, "add"),
         (first_id, first, f"site:{first_id}/CH"),
         (second_id, second, f"site:{second_id}/add"),
     ):
@@ -278,7 +278,7 @@ def explicit_import_destinations(root):
                 raise AssertionError("An invalid or stale destination received an Add")
         state = lib._apply_asset_registration(state, request, media)
         assert state["asset_registration_result"]["ok"]
-        child = "add" if site == second_id else "CH"
+        child = "CH" if site == first_id else "add"
         saved = storage / child / source.name
         assert source.read_bytes() == saved.read_bytes()
         for other in (hq, first, second):

@@ -5935,7 +5935,10 @@ def _read_verified_image_catalog(
                 pinned = next((value.result() for key, value in reversed(_CATALOG_READS.items())
                                if key[:2] == ("catalog", prefix) and value.done() and not value.cancelled()
                                and value.exception() is None), None)
-        notice = "" if pinned is not None else ensure_registration_directory(project, refresh=not use_shared_cache, vendor=True)
+        # Keep an existing catalog index valid when the default Add folder is
+        # still virtual. Confirming the default or writing its first Add
+        # prepares the physical directory without slowing workflow reopen.
+        notice = "" if pinned is not None else ensure_registration_directory(project, refresh=not use_shared_cache)
         if pinned is not None:
             facts = _scan_linked_sites(project, settings, pinned, pinned=pinned)
         elif settings.get("links"):

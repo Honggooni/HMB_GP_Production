@@ -109,6 +109,7 @@ class FirstPaintRegression(unittest.TestCase):
         for field in ("source_uid", "media_signature", "selected", "selection_order"):
             self.assertEqual(selected["assets"][0][field], before["assets"][0][field])
         self.assertEqual(self.manifest.read_bytes(), manifest_bytes)
+        self.assertFalse((self.project / "add").exists(), "Catalog reopen leaves the unused default Add destination virtual")
 
     def test_changed_folder_index_falls_back_to_scan(self):
         library._write_catalog_index(self.state)
