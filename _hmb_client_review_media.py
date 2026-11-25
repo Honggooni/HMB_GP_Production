@@ -18,6 +18,7 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request
+from weakref import WeakSet
 
 from _hmb_broker_config import join_broker_url, normalize_broker_base_url
 from _hmb_color_lut import ColorLUTError, make_review_media
@@ -35,6 +36,10 @@ _WORK_SLOTS = threading.BoundedSemaphore(3)
 _SOURCE_WAIT_SECONDS = 30 * 60
 _LOCK = threading.RLock()
 _ACTIVE = {}
+_PENDING_PATH = "/api/v1/reviews/color-lut/manual/workstation-pending"
+_DISCOVERY_TASK = re.compile(r"job-(?:mybox-)?[a-f0-9]{32}\Z")
+_DISCOVERY_INTERVAL = 5
+_DISCOVERY_BRIDGES = {}
 
 
 def _require(ok, message):
@@ -76,8 +81,8 @@ class _Session:
             raise ValueError("Broker media response changed its URL")
         return response
 
-    def get_json(self, url):
-        with self.open(url, headers={"Accept": "application/json"}) as response:
+    def get_json(self, url, *, headers=None, timeout=20):
+        with self.open(url, headers={"Accept": "application/json", **(headers or {})}, timeout=timeout) as response:
             _require(response.status == 200, "Unexpected Broker metadata status")
             return _read_json(response)
 
@@ -168,7 +173,8 @@ def _valid_key(key):
 
 
 def _state(session, task):
-    state = session.get_json(join_broker_url(session.origin, _task_path(task)))
+    # An unprepared source can take up to 30 seconds to fingerprint on the Broker.
+    state = session.get_json(join_broker_url(session.origin, _task_path(task)), timeout=35)
     _require(state.get("task_id") == task and state.get("state") in ("waiting", "ready", "fallback") and
              isinstance(state.get("source_sha256"), str) and _SHA.fullmatch(state["source_sha256"]),
              "Invalid Broker workstation media state")
@@ -514,3 +520,70 @@ def schedule_completed_review_media(bridge, task_id, *, local_source=None, priva
         job = Future()
         job.set_exception(exc)
         return job
+
+
+def _pending_review_tasks(session):
+    result = session.get_json(
+        join_broker_url(session.origin, _PENDING_PATH), headers={"X-HMB-Workstation-MyBox": "1"},
+    )
+    tasks = result.get("tasks")
+    _require(
+        result.get("protocol") == "pc-v1" and isinstance(tasks, list)
+        and len(tasks) <= 4
+        and all(isinstance(task, str) and _DISCOVERY_TASK.fullmatch(task) for task in tasks),
+        "Invalid Broker workstation pending response",
+    )
+    return tuple(dict.fromkeys(tasks))
+
+
+def start_pending_review_media(bridge):
+    """Discover eligible completions while a verified desktop account is active."""
+    origin = normalize_broker_base_url(bridge.server_url)
+    fingerprint = bridge._reference_auth_digest
+    if not fingerprint:
+        return
+    key = origin, fingerprint
+    with _LOCK:
+        active = _DISCOVERY_BRIDGES.get(key)
+        if active is not None:
+            active.add(bridge)
+            return
+        bridges = WeakSet((bridge,))
+        _DISCOVERY_BRIDGES[key] = bridges
+
+    def run():
+        try:
+            while True:
+                with _LOCK:
+                    current = next((item for item in bridges if item.server_url == origin
+                                    and item._reference_auth_digest == fingerprint), None)
+                    if current is None:
+                        del _DISCOVERY_BRIDGES[key]
+                        return
+                try:
+                    session = _Session(current)
+                    if session.origin == origin and hashlib.sha256(session.token.encode()).hexdigest() == fingerprint:
+                        for task in _pending_review_tasks(session):
+                            if current._reference_auth_digest != fingerprint:
+                                break
+                            schedule_completed_review_media(current, task, private=task.startswith("job-mybox-"))
+                except HTTPError as error:
+                    error.close()
+                    if error.code in (401, 403, 404, 405):
+                        return
+                except (OSError, ValueError, RuntimeError, http.client.HTTPException) as error:
+                    _LOG.debug("Workstation media discovery deferred (%s).", type(error).__name__)
+                finally:
+                    del current
+                time.sleep(_DISCOVERY_INTERVAL)
+        finally:
+            with _LOCK:
+                if _DISCOVERY_BRIDGES.get(key) is bridges:
+                    del _DISCOVERY_BRIDGES[key]
+
+    try:
+        threading.Thread(target=run, name="HMBReviewDiscovery", daemon=True).start()
+    except RuntimeError:
+        with _LOCK:
+            del _DISCOVERY_BRIDGES[key]
+        raise

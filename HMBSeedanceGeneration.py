@@ -3491,8 +3491,17 @@ class _HMBAIBrokerBridge:
                 submission_outcome_unknown=submission,
             )
         result["_http_status"] = status_code
-        return self._reference_auth_response(result, reference_auth_epoch,
-            account=method.upper() == "GET" and path == "/api/me")
+        account_read = method.upper() == "GET" and path == "/api/me"
+        result = self._reference_auth_response(result, reference_auth_epoch, account=account_read)
+        if account_read:
+            with self._reference_principal_scope(result) as principal:
+                if principal:
+                    try:
+                        from _hmb_client_review_media import start_pending_review_media
+                        start_pending_review_media(self)
+                    except (ImportError, ValueError, RuntimeError) as error:
+                        logger.debug("Optional workstation discovery unavailable (%s).", type(error).__name__)
+        return result
 
     def account_snapshot(self, *, connect: bool) -> _BrokerAccountSnapshot:
         # Only this call's authenticated /api/me response can authorize release

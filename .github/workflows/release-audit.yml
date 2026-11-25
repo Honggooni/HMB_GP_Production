@@ -398,6 +398,9 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- The workstation finds completed Broker videos for Team Reviews and My Box. It makes the preview and thumbnail locally, renews its claim while working, and skips encoding if the Broker has taken over or the files are ready.",
+            "- The Windows installer prepares the HMB library dependencies before the first Desktop launch. The startup check reuses dependency metadata and checks fewer filesystem paths.",
+            "",
             "- ImageAsset shows Ai_Ct_image and linked folders at the top level. External images can be registered in a selected root or subfolder. Project Add applies folder changes immediately.",
             "- My Upload filters the current project's registrations by uploader. Authors can edit or remove their own registrations while preserving the source files.",
             "- ImageAsset Refresh previews the registration JSON audit for each linked folder. After confirmation it backs up affected registries and removes verified missing entries.",

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -42,7 +43,7 @@ class Coordinator(unittest.TestCase):
         self.member = self.site / 'wrapt/__init__.py'
         self.member.parent.mkdir()
         self.member.write_text('raise AssertionError("must not import")\n', encoding='utf-8')
-        self.ns = dict(Path=Path, Any=object, sys=sys, os=os, hashlib=hashlib, json=json, threading=threading,
+        self.ns = dict(Path=Path, Any=object, sys=sys, os=os, stat=stat, hashlib=hashlib, json=json, threading=threading,
             logging=logging, types=types, subprocess=subprocess, __file__=str(self.file), __name__='offline_coordinator', _LIBRARY_NAME='HMB_GP_Production')
         exec(PROGRAM, self.ns)
         self.ns['_HMB_ENV_STATE_MODULE'] += '_' + self.root.name.replace('-', '_')
@@ -85,6 +86,18 @@ class Coordinator(unittest.TestCase):
         self.assertTrue(self.calls[0]['site_quarantined'])
         self.assertIn(str(self.site),sys.path)
         self.assertIn('concurrent-unrelated-library',sys.path)
+    def test_cold_start_only_records_the_cache_after_audit(self):
+        stamp = mock.Mock(wraps=self.ns['_hmb_environment_stamp'])
+        self.ns['_hmb_environment_stamp'] = stamp
+        self.assertEqual(self.run_coordinator()['status'], 'clean')
+        self.assertEqual(stamp.call_count, 1)
+        self.assertTrue(self.run_coordinator()['cached'])
+        self.assertEqual(stamp.call_count, 2)
+    def test_optional_runtime_marker_invalidates_the_clean_cache(self):
+        self.run_coordinator()
+        (self.root / '.hmb-tos-runtime-needed.json').write_text('{}', encoding='utf-8')
+        self.assertFalse(self.run_coordinator().get('cached', False))
+        self.assertEqual([r['operation'] for r in self.calls], ['audit', 'audit'])
     def test_changed_dependency_invalidates_cached_clean_without_mutating_loaded(self):
         self.run_coordinator()
         self.member.write_text('changed by explicit external update\n',encoding='utf-8')

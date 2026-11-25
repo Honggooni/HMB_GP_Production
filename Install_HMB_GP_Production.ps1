@@ -96,6 +96,67 @@ function Get-HmbInventoryFingerprint {
     finally { $hasher.Dispose() }
 }
 
+function Initialize-HmbEditEnvironment {
+    param([string]$LibraryRoot)
+    $python = Get-HmbFullPath -Path $EnginePython
+    $prepare = @'
+import asyncio
+from contextlib import redirect_stdout
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+manifest = Path(sys.argv[1]).resolve(strict=True) / 'griptape-nodes-library.json'
+
+async def prepare():
+    from griptape_nodes.retained_mode.engine import engine_scope
+    from griptape_nodes.retained_mode.events.library_events import (
+        InstallLibraryDependenciesRequest, InstallLibraryDependenciesResultSuccess,
+    )
+    with engine_scope() as engine:
+        manager = engine.library_manager
+        dependencies = getattr(manager, 'dependencies', manager)
+        result = await dependencies.install_library_dependencies_request(
+            InstallLibraryDependenciesRequest(library_file_path=str(manifest))
+        )
+    if not isinstance(result, InstallLibraryDependenciesResultSuccess):
+        raise RuntimeError('Griptape could not prepare the library dependencies. Check package index access and disk space.')
+    if not (manifest.parent / '.venv/pyvenv.cfg').is_file():
+        raise RuntimeError('Griptape did not create the library virtual environment.')
+    return {'status': 'ready', 'dependencies': result.dependencies_installed}
+
+with tempfile.TemporaryDirectory(prefix='hmb-library-install-', ignore_cleanup_errors=True) as directory:
+    # Give the SDK a clean profile so it reads only this release's manifest.
+    for name in list(os.environ):
+        if name.startswith(('GTN_CONFIG_', 'GTN_ENGINE_')):
+            del os.environ[name]
+    for name, folder in (
+        ('GTN_ENGINE_CONFIG_DIR', 'config'), ('GTN_ENGINE_DATA_DIR', 'data'),
+        ('GTN_ENGINE_STATE_DIR', 'state'), ('GTN_CONFIG_WORKSPACE_DIRECTORY', 'workspace'),
+        ('XDG_CONFIG_HOME', 'xdg-config'), ('XDG_DATA_HOME', 'xdg-data'),
+        ('XDG_STATE_HOME', 'xdg-state'),
+    ):
+        path = Path(directory) / folder
+        path.mkdir()
+        os.environ[name] = str(path)
+    os.chdir(os.environ['GTN_CONFIG_WORKSPACE_DIRECTORY'])
+    try:
+        with redirect_stdout(sys.stderr):
+            result = asyncio.run(asyncio.wait_for(prepare(), timeout=180))
+    finally:
+        os.chdir(Path(sys.executable).parent)
+print(json.dumps(result))
+'@
+    Write-Host 'Preparing HMB Python dependencies before the first Desktop start...'
+    $output = & $python -I -B -c $prepare $LibraryRoot
+    if ($LASTEXITCODE -ne 0) {
+        throw 'HMB dependency preparation failed. The installer will restore the previous installation if present.'
+    }
+    return ($output | ConvertFrom-Json)
+}
+
 function Repair-HmbTosIsolation {
     param([string]$LibraryRoot, [bool]$PrepareRuntime, [bool]$CleanLegacyEnvironment)
     if (-not $PrepareRuntime -and -not $CleanLegacyEnvironment) { return $null }
@@ -449,14 +510,8 @@ try {
     }
 
     if ($preservedVenv) {
-        if ($needsTosMigration) {
-            # Keep the exact original in rollback while editing only this copy.
-            Copy-Item -LiteralPath $preservedVenv -Destination (Join-Path $target '.venv') -Recurse
-        }
-        else {
-            Move-Item -LiteralPath $preservedVenv -Destination (Join-Path $target '.venv')
-            $relocatedUserMembers.Add('.venv')
-        }
+        # Dependency preparation can rebuild the environment; keep the original for rollback.
+        Copy-Item -LiteralPath $preservedVenv -Destination (Join-Path $target '.venv') -Recurse
     }
     if ($preservedTosVenv) {
         Move-Item -LiteralPath $preservedTosVenv -Destination (Join-Path $target '.venv-tos')
@@ -470,6 +525,7 @@ try {
     $environmentMigration = Repair-HmbTosIsolation -LibraryRoot $target `
         -PrepareRuntime ($PrepareTosRuntime.IsPresent -or $legacyTosEnvironment) `
         -CleanLegacyEnvironment $needsTosMigration
+    $editEnvironment = Initialize-HmbEditEnvironment -LibraryRoot $target
     $nativeEditorResult = Invoke-HmbNativeEditorPatch -Action 'apply' -Plan $nativeEditorPlan.plan
     $receipt = [ordered]@{
         schema = 'hmb-install-receipt'; version = 1
@@ -488,6 +544,7 @@ try {
         })
         preserved_user_members = @($relocatedUserMembers)
         isolated_tos_migration = $environmentMigration
+        edit_environment = $editEnvironment
         native_editor_patch = $nativeEditorResult
     }
     $receiptPath = Join-Path $target '.hmb-install-receipt.json'

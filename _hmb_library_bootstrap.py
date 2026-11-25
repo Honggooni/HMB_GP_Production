@@ -12,6 +12,7 @@ import logging
 import os
 from pathlib import Path
 import socket
+import stat
 import subprocess
 import sys
 import textwrap
@@ -596,26 +597,32 @@ def _audit(request, *, active_transaction=None, installer=False):
         raise RuntimeError('The legacy edit environment is incomplete; its files were preserved')
     _local(root, site)
     distributions = {}
+    distribution_metadata = {}
     for item in metadata.distributions(path=[str(site)]):
-        name = _norm(item.metadata['Name'])
+        fields = item.metadata
+        name = _norm(fields['Name'])
         if name in distributions:
             raise RuntimeError('Duplicate edit dependency metadata is not supported')
         distributions[name] = item
+        distribution_metadata[name] = fields
     from packaging.version import Version
     from packaging.requirements import Requirement
     legacy = LEGACY & distributions.keys()
     known_legacy_versions = {'tos': '2.9.2', 'wrapt': '1.16.0', 'deprecated': '1.3.1'}
-    if not installer and any(distributions[name].version != known_legacy_versions[name] for name in legacy):
+    if not installer and any(distribution_metadata[name]['Version'] != known_legacy_versions[name] for name in legacy):
         report.update(ok=False, status='refused', reason='unrecognized_legacy_version')
         return report
     engine_versions = {name: metadata.version(name) for name in ENGINE_BACKED}
     backed = {name for name in ENGINE_BACKED & distributions.keys()
-              if Version(distributions[name].version) < Version(engine_versions[name])}
+              if Version(distribution_metadata[name]['Version']) < Version(engine_versions[name])}
     removable = legacy | backed
     for name, item in distributions.items():
         if name in removable:
             continue
-        for raw in item.requires or []:
+        requirements = distribution_metadata[name].get_all('Requires-Dist')
+        if not requirements and item.read_text('requires.txt'):
+            requirements = item.requires
+        for raw in requirements or []:
             requirement = Requirement(raw)
             if requirement.marker is not None and not requirement.marker.evaluate({'extra': ''}):
                 continue
@@ -629,7 +636,7 @@ def _audit(request, *, active_transaction=None, installer=False):
     metadata_rows = []
     for name, item in sorted(distributions.items()):
         metadata_path = _local(root, Path(item._path) / 'METADATA')
-        metadata_rows.append([name, item.version, _digest(metadata_path)])
+        metadata_rows.append([name, distribution_metadata[name]['Version'], _digest(metadata_path)])
         if name not in removable:
             continue
         record = item.read_text('RECORD')
@@ -669,7 +676,7 @@ def _audit(request, *, active_transaction=None, installer=False):
                         raise RuntimeError('A removable file is also owned by a retained edit dependency')
     report.update(status='needed' if removable else 'clean',
                   legacy_packages_removed=sorted(legacy), engine_backed_duplicates_removed=sorted(backed),
-                  removed_versions={name: distributions[name].version for name in sorted(removable)},
+                  removed_versions={name: distribution_metadata[name]['Version'] for name in sorted(removable)},
                   removal_paths=[str(edit / value) for value in sorted(files)],
                   needs_tos_runtime=report['needs_tos_runtime'] or 'tos' in legacy)
     report['inspected_fingerprint'] = _json_digest([manifest_sha, metadata_rows, engine_versions, files])
@@ -1064,6 +1071,7 @@ def _hmb_environment_python(root: Path) -> Path:
 
 def _hmb_environment_loaded(root: Path, paths: list[Path] | None = None) -> str:
     targets = {os.path.normcase(str(path)) for path in paths or []}
+    seen: set[str] = set()
     for module in list(sys.modules.values()):
         if module is None:
             continue
@@ -1073,7 +1081,16 @@ def _hmb_environment_loaded(root: Path, paths: list[Path] | None = None) -> str:
             for value in values:
                 if not isinstance(value, str) or not value or value in {"built-in", "frozen"}:
                     continue
-                path = Path(value).resolve()
+                if value in seen:
+                    continue
+                path = Path(value)
+                try:
+                    # For an existing file this resolves aliases without the
+                    # extra stat that pathlib uses in non-strict mode.
+                    path = path.resolve(strict=True)
+                except OSError:
+                    path = path.resolve()
+                seen.add(value)
                 if path.parent == root and path.name in _HMB_ENV_NODE_FILES:
                     return "HMB node code is already loaded"
                 if os.path.normcase(str(path)) in targets:
@@ -1087,15 +1104,36 @@ def _hmb_environment_loaded(root: Path, paths: list[Path] | None = None) -> str:
 def _hmb_environment_stamp(root: Path) -> str:
     """A read-only cache invalidator, never authority to delete a dependency."""
     rows = []
-    for directory in (root / ".venv", root / ".hmb-environment-backups"):
-        if not directory.exists():
-            rows.append((directory.name, None))
+
+    def record(relative: str, info: os.stat_result) -> bool:
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise ValueError("Linked environment cache member")
+        if stat.S_ISDIR(info.st_mode):
+            # Children establish directory contents. Windows may update a
+            # directory timestamp after those same entries are already visible.
+            rows.append((relative, "directory"))
+            return True
+        rows.append((relative, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+        return False
+
+    pending = []
+    for name in (".venv", ".hmb-environment-backups", ".hmb-tos-runtime-needed.json"):
+        path = root / name
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            rows.append((name, None))
             continue
-        for path in (directory, *directory.rglob("*")):
-            if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
-                raise ValueError("Linked environment cache member")
-            stat = path.stat()
-            rows.append((str(path.relative_to(root)), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+        if record(name, info):
+            pending.append((path, name))
+
+    while pending:
+        directory, relative = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                member = os.path.join(relative, entry.name)
+                if record(member, entry.stat(follow_symlinks=False)):
+                    pending.append((entry.path, member))
     return hashlib.sha256(json.dumps(sorted(rows), separators=(",", ":")).encode()).hexdigest()
 
 
@@ -1231,13 +1269,14 @@ def _hmb_coordinate_environment_repair() -> dict[str, Any]:
         raise RuntimeError("HMB environment repair code is unavailable. Restore the verified library before loading it.")
     identity = (str(root), manifest_sha, hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         str(python), python.stat().st_size, python.stat().st_mtime_ns)
-    try:
-        stamp = _hmb_environment_stamp(root)
-    except (OSError, ValueError):
-        stamp = None
     completed = state.completed.get(identity)
-    if stamp is not None and completed is not None and completed["stamp"] == stamp:
-        return {**completed["summary"], "cached": True}
+    if completed is not None:
+        try:
+            stamp = _hmb_environment_stamp(root)
+        except (OSError, ValueError):
+            stamp = None
+        if stamp is not None and completed["stamp"] == stamp:
+            return {**completed["summary"], "cached": True}
     loaded_hmb = _hmb_environment_loaded(root)
     if loaded_hmb and completed is None:
         _hmb_environment_notice(state, (identity, "loaded"), "HMB code is already loaded. Restart Griptape once to finish the environment update; active library files were preserved.")

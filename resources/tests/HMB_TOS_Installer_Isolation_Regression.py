@@ -130,6 +130,14 @@ class InstallerRepair(unittest.TestCase):
         self.assertEqual(self.calls,[])
         self.assertEqual(len(list(metadata.distributions(path=[str(self.site)]))),4)
 
+    def test_legacy_requires_txt_still_blocks_removing_a_needed_package(self):
+        self.legacy()
+        custom = self.package("custom", "1.0")
+        (custom / "requires.txt").write_text("wrapt>=1.16\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "custom edit dependency"):
+            self.run_repair()
+        self.assertEqual(self.calls, [])
+
     def test_custom_engine_version_or_direct_URL_must_not_be_silently_replaced(self):
         for requirement in ("urllib3<2.8","urllib3 @ https://public.invalid/custom.whl"):
             with self.subTest(requirement=requirement):
@@ -222,6 +230,15 @@ class InstallerTransaction(unittest.TestCase):
         fixture_text = fixture_text.replace("    $receiptPath = Join-Path $target '.hmb-install-receipt.json'",
             "    if ($global:fixtureFailure -eq 'receipt') { throw 'INJECTED receipt failure after native apply' }\n"
             "    $receiptPath = Join-Path $target '.hmb-install-receipt.json'")
+        prepare_edit = "    $editEnvironment = Initialize-HmbEditEnvironment -LibraryRoot $target"
+        self.assertEqual(fixture_text.count(prepare_edit), 1)
+        fixture_text = fixture_text.replace(prepare_edit, """
+    if ($global:fixtureFailure -eq 'dependencies') {
+        [IO.File]::WriteAllText((Join-Path $target '.venv/Scripts/keep.bin'), 'partially prepared')
+        throw 'INJECTED dependency preparation failure'
+    }
+    $editEnvironment = @{ status = 'ready'; dependencies = 9 }
+""")
         self.native_original = b"synthetic pristine editor for PS installation transaction\n"
         self.native_candidate = b"synthetic patched editor for PS installation transaction\n"
         self.native = self.base / "app/current/resources/editor-bundle/assets/index-DEZU41rc.js"
@@ -431,6 +448,10 @@ try {
         self.assertEqual(len(plans), 1)
         self.assertEqual(json.loads(plans[0].read_text())["status"], "rolled_back")
 
+    def test_dependency_failure_restores_previous_environment_before_editor_apply(self):
+        self.assert_preserved_failure("dependencies", "INJECTED dependency preparation failure")
+        self.assertEqual(len(list(self.rollback.glob("failed-new-*"))), 1)
+
     def test_unknown_native_editor_fails_before_runtime_move(self):
         self.native.write_bytes(b"foreign native editor")
         result = self.run_install()
@@ -446,6 +467,7 @@ try {
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.native.read_bytes(), self.native_candidate)
         receipt = json.loads((self.target / ".hmb-install-receipt.json").read_text("utf-8-sig"))
+        self.assertEqual(receipt["edit_environment"], {"status": "ready", "dependencies": 9})
         self.assertTrue(receipt["native_editor_patch"]["already_current"])
         self.assertFalse(receipt["native_editor_patch"]["changed"])
 
@@ -530,7 +552,8 @@ try {
         backups = list(self.rollback.glob("v*"))
         self.assertEqual(len(backups), 1)
         self.assertEqual(self.inventory(backups[0]), {name: value for name, value in self.before.items()
-                                                     if name in ("old-runtime.py", ".hmb-install-receipt.json")})
+                                                     if name in ("old-runtime.py", ".hmb-install-receipt.json")
+                                                     or name.startswith(".venv/")})
 
     def test_first_install_retains_editor_and_ui_support(self):
         self.target.rename(self.base / "unused-existing-install")

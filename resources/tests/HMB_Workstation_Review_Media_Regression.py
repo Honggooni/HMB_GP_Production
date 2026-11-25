@@ -46,6 +46,7 @@ class Broker:
         self.lost_response = False
         self.truncated = False
         self.transient = False
+        self.pending_unavailable = False
         self.requests = []
         self.entered, self.release = threading.Event(), threading.Event()
         self.release.set()
@@ -66,6 +67,12 @@ class Broker:
             return Reply(url, {"workstation_review_media": "pc-v1", "workstation_fallback_seconds": 30} if self.supported else {})
         if route == "/api/me" and method == "GET":
             return Reply(url, {"id": self.owner})
+        if route == worker._PENDING_PATH and method == "GET":
+            assert hdr["x-hmb-workstation-mybox"] == "1"
+            if self.pending_unavailable:
+                self.pending_unavailable = False
+                raise HTTPError(url, 503, "Transient", {}, BytesIO())
+            return Reply(url, {"protocol": "pc-v1", "tasks": [] if self.ready else [self.task, self.task]})
         if route == self.route and method == "GET":
             return Reply(url, {"task_id": self.task, "state": self.descriptor_state or ("ready" if self.ready else "waiting"),
                                "source_sha256": self.sha, "source_bytes": len(self.source), "idempotency_key": self.key,
@@ -568,6 +575,92 @@ class WorkstationMediaTest(unittest.TestCase):
         video = json.loads(streams)["streams"][0]
         self.assertEqual((video["codec_name"], video["width"], video["height"], video["nb_frames"]),
                          ("h264", 64, 48, "12"))
+
+    def test_discovers_completed_broker_task_without_a_generator_callback(self):
+        from _hmb_video_tools import _find_ffmpeg
+        source = self.root / "broker-original.mp4"
+        subprocess.run(
+            [_find_ffmpeg(), "-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi", "-i",
+             "color=c=blue:s=64x48:r=24:d=0.5", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
+            check=True, timeout=30,
+        )
+        broker = Broker("job-" + "a" * 32, source.read_bytes())
+        fingerprint = hashlib.sha256(broker.token.encode()).hexdigest()
+        broker._reference_auth_digest = fingerprint
+        broker.pending_unavailable = True
+        self.enter(patch.object(worker, "_DISCOVERY_INTERVAL", .03))
+        key = broker.server_url, fingerprint
+        worker.start_pending_review_media(broker)
+        worker.start_pending_review_media(broker)
+        try:
+            deadline = time.monotonic() + 10
+            while not broker.ready and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertTrue(broker.ready)
+            self.assertGreaterEqual(broker.count("GET", worker._PENDING_PATH), 2)
+            self.assertEqual(broker.count("GET", broker.original), 1)
+            self.assertEqual(broker.count("POST", broker.route), 1)
+            self.assertEqual(broker.count("POST", broker.original), 0)
+        finally:
+            broker._reference_auth_digest = ""
+            deadline = time.monotonic() + 4
+            while key in worker._DISCOVERY_BRIDGES and time.monotonic() < deadline:
+                time.sleep(.02)
+        self.assertNotIn(key, worker._DISCOVERY_BRIDGES)
+
+    def test_pending_discovery_never_uses_a_replaced_account_token(self):
+        broker = Broker("job-" + "b" * 32, self.source)
+        old_digest = hashlib.sha256(broker.token.encode()).hexdigest()
+        broker._reference_auth_digest = old_digest
+
+        def rotated_token():
+            broker.token = "replacement-token"
+            broker._reference_auth_digest = hashlib.sha256(broker.token.encode()).hexdigest()
+            attempted.set()
+            return broker.token
+
+        attempted = threading.Event()
+        broker._load_access_token = rotated_token
+        self.enter(patch.object(worker, "_DISCOVERY_INTERVAL", .03))
+        key = broker.server_url, old_digest
+        worker.start_pending_review_media(broker)
+        self.assertTrue(attempted.wait(3))
+        deadline = time.monotonic() + 3
+        while key in worker._DISCOVERY_BRIDGES and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.assertNotIn(key, worker._DISCOVERY_BRIDGES)
+        self.assertEqual(broker.requests, [])
+
+    def test_discovers_my_box_and_skips_server_owned_or_completed_work(self):
+        self.enter(patch.object(worker, "_DISCOVERY_INTERVAL", .03))
+        self.enter(patch.object(worker, "make_review_media", self.encoder))
+        for state in ("waiting", "fallback", "ready"):
+            with self.subTest(state=state):
+                task = "job-mybox-" + hashlib.sha256(state.encode()).hexdigest()[:32]
+                broker = Broker(task, self.source, private=True)
+                broker.token = state
+                fingerprint = hashlib.sha256(broker.token.encode()).hexdigest()
+                broker._reference_auth_digest = fingerprint
+                broker.descriptor_state = state
+                key = broker.server_url, fingerprint
+                worker.start_pending_review_media(broker)
+                try:
+                    deadline = time.monotonic() + 4
+                    while not broker.count("GET", broker.route) and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    self.assertGreaterEqual(broker.count("GET", broker.route), 1)
+                    if state == "waiting":
+                        while not broker.ready and time.monotonic() < deadline:
+                            time.sleep(.02)
+                        self.assertTrue(broker.ready)
+                    self.assertEqual(broker.count("GET", broker.original), int(state == "waiting"))
+                    self.assertEqual(broker.count("POST", broker.route), int(state == "waiting"))
+                finally:
+                    broker._reference_auth_digest = ""
+                    while key in worker._DISCOVERY_BRIDGES and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    self.assertNotIn(key, worker._DISCOVERY_BRIDGES)
+        self.assertEqual(self.encoded, 1)
 
 
 if __name__ == "__main__":
