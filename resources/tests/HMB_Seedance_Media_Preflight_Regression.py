@@ -8,9 +8,11 @@ import json
 import subprocess
 import sys
 import tempfile
+from contextlib import nullcontext
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from PIL import Image
 
@@ -52,6 +54,23 @@ def check_seedance_reference_upload_copy():
         assert not copy.exists() and original.read_bytes() == original_bytes
         with upload_path(original, seedance.SEEDANCE_2_0_MODEL_ID) as unchanged:
             assert unchanged == original
+
+        heavy = Path(directory) / "Picker-original.mov"
+        subprocess.run([_find_ffmpeg(), "-nostdin", "-v", "error", "-f", "lavfi",
+                        "-i", "testsrc2=s=854x480:r=24:d=2",
+                        "-vf", "noise=alls=50:allf=t+u", "-c:v", "libx264",
+                        "-preset", "ultrafast", "-crf", "0", str(heavy)], check=True, timeout=30)
+        source_bytes = heavy.read_bytes()
+        assert len(source_bytes) * 8 / 2 > seedance.SEEDANCE_REFERENCE_VIDEO_COPY_THRESHOLD
+        with upload_path(heavy, seedance.SEEDANCE_2_5_MODEL_ID) as copy:
+            assert copy.suffix == ".mp4" and copy != heavy
+            assert copy.stat().st_size < len(source_bytes) / 2
+            media = probe_video(copy)
+            assert (media["width"], media["height"], media["frame_rate"], media["duration"],
+                    media["video_codec"]) == (854, 480, 24.0, 2.0, "h264")
+            encoded = copy.read_bytes()
+            assert encoded.index(b"moov") < encoded.index(b"mdat")
+        assert heavy.read_bytes() == source_bytes and not copy.exists()
 
 
 check_seedance_reference_upload_copy()
@@ -275,6 +294,55 @@ with tempfile.TemporaryDirectory() as temporary:
     assert cloud_params["video_reference_slots"][0] == str(upload_path)
     assert len(cloud_driver.uploads) == 3
     assert len(cloud_node._temporary_video_uploads) == 3
+
+    # The failing PNG pattern keeps its original bytes and order while fitting
+    # in the 2.5 inline budget. Only a new Cloud link needs the Range preflight.
+    sheet = folder / "BeetoHeadgear-fixture.png"
+    Image.new("RGB", (4000, 1800), (17, 33, 48)).save(sheet)
+    signed_download = "https://storage.example/reference.mp4?signature=secret-canary"
+    with (
+        mock.patch.object(cloud_node, "_upload_image_to_griptape_cloud") as upload_image,
+        mock.patch.object(cloud_node, "_confirm_seedance_reference_download") as check_download,
+        mock.patch.object(cloud_node, "_upload_local_video_to_griptape_cloud", return_value=signed_download),
+        mock.patch.object(seedance.HMBSeedanceGeneration, "_reference_video_upload_path",
+                          side_effect=lambda path, _model: nullcontext(path)),
+    ):
+        params_25 = dict(cloud_params, model_id=seedance.SEEDANCE_2_5_MODEL_ID,
+                         first_frame=None, last_frame=None,
+                         reference_images=[str(sheet), "https://cdn.example/second.png"])
+        result = cloud_node._prepare_video_references_for_run(params_25)
+        assert base64.b64decode(result["reference_images"][0].partition(",")[2]) == sheet.read_bytes()
+        assert result["reference_images"][1] == params_25["reference_images"][1]
+        assert result["video_references"] == [signed_download]
+        upload_image.assert_not_called()
+        check_download.assert_called_once_with(signed_download, f"@video1 ({upload_path.name})")
+        assert params_25["reference_images"][0] == str(sheet)
+
+        lossless = folder / "transparent-sheet.png"
+        Image.new("RGBA", (400, 300), (220, 32, 120, 0)).save(lossless)
+        with mock.patch.object(seedance, "SEEDANCE_LOSSLESS_PNG_COPY_THRESHOLD", 1):
+            compact, _ = cloud_node._prepare_image_references_for_run(
+                dict(params_25, reference_images=[str(lossless)]), cloud_driver=None)
+        encoded = compact["reference_images"][0]
+        assert encoded.startswith("data:image/webp;base64,")
+        with (Image.open(lossless) as original,
+              Image.open(BytesIO(base64.b64decode(encoded.partition(",")[2]))) as uploaded):
+            assert original.tobytes() == uploaded.tobytes()
+
+    for code, body in ((206, b"x"), (200, b""), (403, b"")):
+        stream = mock.MagicMock()
+        response = stream.__enter__.return_value
+        response.status_code = code
+        response.iter_raw.return_value = iter([body])
+        with mock.patch.object(seedance.httpx, "stream", return_value=stream) as range_get:
+            try:
+                cloud_node._confirm_seedance_reference_download(signed_download, "@video1")
+            except ValueError as exc:
+                assert code != 206 and "@video1" in str(exc)
+                assert "secret-canary" not in str(exc)
+            else:
+                assert code == 206
+            assert range_get.call_args.kwargs["headers"] == {"Range": "bytes=0-0"}
 
     # Without a usable Cloud credential/bucket, image preparation remains on
     # the existing Base64 JSON path and public video references need no upload.

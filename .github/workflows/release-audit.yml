@@ -398,6 +398,10 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Seedance attaches small local references directly and prepares a lossless WebP copy of large PNGs when it fits the request budget. Reference order is preserved.",
+            "- Seedance prepares smaller upload copies of high-bitrate local references and checks newly issued storage links before submitting.",
+            "- After an HTTP 504, Seedance checks the original request or task ID. This recovery does not submit a new render.",
+            "",
             "- The workstation finds completed Broker videos for Team Reviews and My Box. It makes the preview and thumbnail locally, renews its claim while working, and skips encoding if the Broker has taken over or the files are ready.",
             "- The Windows installer prepares the HMB library dependencies before the first Desktop launch. The startup check reuses dependency metadata and checks fewer filesystem paths.",
             "",

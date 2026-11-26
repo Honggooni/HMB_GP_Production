@@ -99,7 +99,87 @@ class ResponseBridge:
         raise AssertionError("Recovery must not submit a render")
 
 
+class TimedOutCreateBridge(ResponseBridge):
+    def __init__(self, *responses):
+        super().__init__(None)
+        self.responses = iter(responses)
+        self.create_key = ""
+
+    def generate_seedance(self, payload, **_kwargs):
+        self.create_count += 1
+        self.create_key = payload["client_request_id"]
+        raise target._BrokerError("HTTP 504", status_code=504, submission_outcome_unknown=True)
+
+    def refresh_job(self, job_id, **_kwargs):
+        self.lookups.append(job_id)
+        response = next(self.responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+async def run_timed_out_create(bridge):
+    node = node_with_checkpoint(task_id="")
+    node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0)
+    node.set_parameter_value(target.TASK_PARAMETER, target.TASK_TEXT_ONLY)
+    node.set_parameter_value("prompt", "synthetic request")
+    node.set_parameter_value("duration", 5)
+    node.set_parameter_value("ratio", "adaptive")
+    node.set_parameter_value("execution_expires_after", 172800)
+    node.set_parameter_value("priority", 0)
+    node.set_parameter_value("poll_interval_seconds", 1)
+    node.set_parameter_value("generation_timeout_seconds", 30)
+    selection = {"schema": target.PROJECT_SELECTION_SCHEMA,
+                 "project": {"project_id": "superwings12", "project_name": "슈퍼윙즈12"}}
+    node._resolve_exact_shot_generation_inputs = lambda params: dict(params, _hmb_imageasset_project_selection=selection)
+    node._assert_imageasset_project_selection = mock.Mock()
+    node._ensure_broker_connected = mock.AsyncMock(return_value=bridge)
+    node._build_generation_output_destination = mock.Mock(return_value=object())
+    node._preflight_output_destination = mock.Mock(return_value="test.mp4")
+    node._start_review_case = mock.Mock()
+    node._bind_temporary_reference_lease = mock.Mock(return_value="")
+    node._sleep = mock.AsyncMock()
+    with mock.patch.object(target, "_resolve_mp4_decode_verifier", return_value=SimpleNamespace(executable="test", backend="test")):
+        try:
+            await node._process_generation_impl()
+        except RuntimeError as exc:
+            return node, exc
+    raise AssertionError("The synthetic render should end in a known failure or an unknown submission")
+
+
 async def verify_recovery():
+    # The fake POST returns 504 after reservation. The client adopts that job by
+    # the original request key, then tolerates a gateway timeout in normal polling.
+    running = {"status": "running", "job_id": "job-already-created"}
+    failed = {"status": "failed", "job_id": "job-already-created"}
+    gateway_timeout = target._BrokerError("HTTP 504", status_code=504)
+    bridge = TimedOutCreateBridge(running, gateway_timeout, failed)
+    node, exc = await run_timed_out_create(bridge)
+    assert "ended with status failed" in str(exc), str(exc)
+    assert bridge.create_count == 1, str(exc)
+    assert bridge.lookups == [bridge.create_key, "job-already-created", "job-already-created"]
+    assert node._generation_recovery_state()["task_id"] == "job-already-created"
+    assert node._generation_recovery_state()["terminal"] is True
+
+    # An absent, malformed or unreachable lookup cannot erase the original
+    # request key or authorize another create.
+    for response in ({"status": "running"}, target._BrokerError("HTTP 404", status_code=404), gateway_timeout):
+        bridge = TimedOutCreateBridge(response)
+        node, exc = await run_timed_out_create(bridge)
+        assert str(exc) == "HTTP 504", str(exc)
+        assert bridge.create_count == 1 and bridge.lookups == [bridge.create_key]
+        recovery = node._generation_recovery_state()
+        assert recovery["task_id"] == bridge.create_key
+        assert recovery["task_identity"] == "client_request" and not recovery["terminal"]
+
+    # Manual refresh also retries only its recorded task after a transient 504.
+    bridge = TimedOutCreateBridge(gateway_timeout, failed)
+    node = node_with_checkpoint("job-already-created", "broker_task")
+    node._ensure_broker_connected = mock.AsyncMock(return_value=bridge)
+    await node._refresh_async()
+    assert bridge.create_count == 0 and bridge.lookups == ["job-already-created"] * 2
+    assert node._generation_recovery_state()["terminal"]
+
     # The canonical failed job recovered after an unknown POST unlocks Run,
     # while keeping the ID as terminal history. Refresh never creates a job.
     node = node_with_checkpoint()

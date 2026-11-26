@@ -667,6 +667,10 @@ LEGACY_VIDEO_REFERENCE_SLOTS = 3
 MAX_IMAGE_BYTES = 30 * 1024 * 1024
 MAX_AUDIO_BYTES = 15 * 1024 * 1024
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
+SEEDANCE_INLINE_IMAGE_BUDGET = 12 * 1024 * 1024
+SEEDANCE_LOSSLESS_PNG_COPY_THRESHOLD = 2 * 1024 * 1024
+SEEDANCE_REFERENCE_VIDEO_COPY_RATE = 5_000_000
+SEEDANCE_REFERENCE_VIDEO_COPY_THRESHOLD = 8_000_000
 MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024
 MAX_LAST_FRAME_BYTES = 64 * 1024 * 1024
 
@@ -13246,16 +13250,19 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         params: dict[str, Any],
         cloud_driver: Any = _CLOUD_DRIVER_UNSET,
     ) -> tuple[dict[str, Any], Any]:
-        """Prefer Cloud HTTPS for embeddable images, preserving Base64 fallback."""
+        """Carry smaller Seedance 2.5 images in the request to avoid remote fetches."""
 
         values = [
             params.get("first_frame"),
             params.get("last_frame"),
             *(params.get("reference_images") or []),
         ]
-        candidates: list[Any] = []
+        inline_remaining = (
+            SEEDANCE_INLINE_IMAGE_BUDGET if params.get("model_id") == SEEDANCE_2_5_MODEL_ID else 0
+        )
+        candidates: list[tuple[int, Any, str]] = []
         ordinal = 0
-        for value in values:
+        for index, value in enumerate(values):
             if not self._has_reference_value(value):
                 continue
             ordinal += 1
@@ -13265,33 +13272,66 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             # Validate all local inputs before creating any upload. In
             # particular, a later oversized reference must not leave earlier
             # references partially uploaded before its error is reported.
-            self._read_image_for_cloud_upload(value, reference_ordinal=ordinal)
-            candidates.append(value)
+            content, mime, name = self._read_image_for_cloud_upload(value, reference_ordinal=ordinal)
+            if inline_remaining and mime == "image/png" and len(content) >= SEEDANCE_LOSSLESS_PNG_COPY_THRESHOLD:
+                content, mime = self._compact_seedance_png_reference(content)
+            prefix = f"data:{mime};base64,"
+            inline_size = len(prefix) + 4 * ((len(content) + 2) // 3)
+            if inline_size <= inline_remaining:
+                values[index] = prefix + base64.b64encode(content).decode("ascii")
+                inline_remaining -= inline_size
+            else:
+                candidates.append((index, value, name))
 
-        if not candidates:
-            return dict(params), cloud_driver
-        if cloud_driver is _CLOUD_DRIVER_UNSET:
+        if candidates and cloud_driver is _CLOUD_DRIVER_UNSET:
             cloud_driver = self._try_create_gt_cloud_storage_driver()
-        if cloud_driver is None:
-            # `_build_broker_payload` retains the bounded canonical Base64 JSON
-            # conversion for local/data-URI image references.
-            return dict(params), None
+        if candidates and cloud_driver is not None:
+            for index, value, name in candidates:
+                url = self._upload_image_to_griptape_cloud(cloud_driver, value)
+                if params.get("model_id") == SEEDANCE_2_5_MODEL_ID:
+                    self._confirm_seedance_reference_download(url, name)
+                values[index] = url
+        first_frame, last_frame, *images = values
+        return dict(params, first_frame=first_frame, last_frame=last_frame, reference_images=images), cloud_driver
 
-        def prepare(value: Any) -> Any:
-            if not self._has_reference_value(value):
-                return value
-            text = str(self._coerce_reference_value(value)).strip()
-            if text.startswith(("http://", "https://", "asset://")):
-                return value
-            return self._upload_image_to_griptape_cloud(cloud_driver, value)
+    @staticmethod
+    def _compact_seedance_png_reference(content: bytes) -> tuple[bytes, str]:
+        """Encode a smaller transport copy without changing pixel values."""
+        from io import BytesIO
+        from PIL import Image
 
-        updated = dict(params)
-        updated["first_frame"] = prepare(params.get("first_frame"))
-        updated["last_frame"] = prepare(params.get("last_frame"))
-        updated["reference_images"] = [
-            prepare(value) for value in params.get("reference_images") or []
-        ]
-        return updated, cloud_driver
+        try:
+            with Image.open(BytesIO(content)) as image:
+                if image.mode not in {"RGB", "RGBA"} or getattr(image, "is_animated", False):
+                    return content, "image/png"
+                with BytesIO() as buffer:
+                    image.save(buffer, format="WEBP", lossless=True, exact=True, method=0,
+                               icc_profile=image.info.get("icc_profile") or b"",
+                               exif=image.info.get("exif") or b"")
+                    if buffer.tell() < len(content):
+                        return buffer.getvalue(), "image/webp"
+        except (OSError, ValueError, KeyError):
+            # Optional lossless packing can fall back to the already validated PNG.
+            pass
+        return content, "image/png"
+
+    @staticmethod
+    def _confirm_seedance_reference_download(url: str, label: str) -> None:
+        """Check a newly issued storage URL without reading the attachment."""
+        try:
+            with httpx.stream(
+                "GET", url, headers={"Range": "bytes=0-0"}, timeout=5.0,
+                follow_redirects=False, trust_env=False,
+            ) as response:
+                if response.status_code in (200, 206):
+                    if next(response.iter_raw(chunk_size=1), b""):
+                        return
+                    reason = "empty response"
+                else:
+                    reason = f"HTTP {response.status_code}"
+        except httpx.RequestError as exc:
+            reason = type(exc).__name__
+        raise ValueError(f"Seedance reference {label} could not be downloaded from storage ({reason}).") from None
 
     def _prepare_video_references_for_run(
         self,
@@ -13308,7 +13348,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
         prepared: list[str] = []
         tos_context: tuple[Any, Any, str] | None = None
-        for value in references:
+        for ordinal, value in enumerate(references, 1):
             reference = self._coerce_reference_value(value)
             text = str(reference).strip()
             if text.startswith(("http://", "https://", "asset://", "data:")):
@@ -13353,6 +13393,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "endpoint, then retry. Alternatively provide a public https:// "
                     "URL or Volcengine asset:// reference."
                 ) from exc
+            if params.get("model_id") == SEEDANCE_2_5_MODEL_ID:
+                self._confirm_seedance_reference_download(public_url, f"@video{ordinal} ({local_path.name})")
             prepared.append(self._prepare_media_reference("video", public_url))
 
         updated = dict(params)
@@ -13366,7 +13408,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     @staticmethod
     @contextmanager
     def _reference_video_upload_path(path: Path, model_id: Any) -> Iterator[Path]:
-        """Prepare out-of-range geometry for Ark without changing the selected file."""
+        """Make a bounded H.264 upload copy when Ark would need a heavy decode."""
         if model_id != SEEDANCE_2_5_MODEL_ID:
             yield path
             return
@@ -13382,27 +13424,39 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         area = width * height
         ratio = width / height
         # Ark's input geometry is independent of the user's selected output resolution.
-        if 300 <= min(width, height) <= max(width, height) <= 6000 and 407_696 <= area <= 8_295_044 and .4 <= ratio <= 2.5:
+        valid_geometry = (
+            300 <= min(width, height) <= max(width, height) <= 6000
+            and 407_696 <= area <= 8_847_360 and .4 <= ratio <= 2.5
+        )
+        seconds = metadata.get("duration")
+        heavy = bool(seconds and path.stat().st_size * 8 > seconds * SEEDANCE_REFERENCE_VIDEO_COPY_THRESHOLD)
+        supported_codec = metadata.get("video_codec") in {"h264", "hevc"}
+        if valid_geometry and not heavy and supported_codec and path.suffix.lower() in {".mp4", ".mov"}:
             yield path
             return
 
-        canvas_area = min(8_250_000, max(410_000, area))
-        canvas_ratio = min(2.5, max(.4, ratio))
-        target_width = 2 * round(sqrt(canvas_area * canvas_ratio) / 2)
-        target_height = 2 * round(sqrt(canvas_area / canvas_ratio) / 2)
-        # Even-pixel rounding can push extreme ratios past Ark's edge.
-        target_width = max(target_width, 2 * ceil(target_height / 5))
-        target_height = max(target_height, 2 * ceil(target_width / 5))
-        frame = (
-            f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
-            f"setsar=1,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2"
-        )
+        if valid_geometry:
+            frame = "pad=ceil(iw/2)*2:ceil(ih/2)*2"
+        else:
+            canvas_area = min(8_250_000, max(410_000, area))
+            canvas_ratio = min(2.5, max(.4, ratio))
+            target_width = 2 * round(sqrt(canvas_area * canvas_ratio) / 2)
+            target_height = 2 * round(sqrt(canvas_area / canvas_ratio) / 2)
+            # Even-pixel rounding can push extreme ratios past Ark's edge.
+            target_width = max(target_width, 2 * ceil(target_height / 5))
+            target_height = max(target_height, 2 * ceil(target_width / 5))
+            frame = (
+                f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+                f"setsar=1,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2"
+            )
         with TemporaryDirectory(prefix="hmb-seedance-reference-") as directory:
             prepared = Path(directory) / (path.stem + ".mp4")
             try:
                 subprocess.run([_find_ffmpeg(), "-nostdin", "-v", "error", "-i", str(path),
                                 "-map", f"0:{metadata['video_stream_index']}", "-map", "0:a?", "-vf", frame,
                                 "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+                                "-maxrate", str(SEEDANCE_REFERENCE_VIDEO_COPY_RATE),
+                                "-bufsize", str(2 * SEEDANCE_REFERENCE_VIDEO_COPY_RATE),
                                 "-c:a", "aac", "-movflags", "+faststart", str(prepared)],
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=True, timeout=180)
@@ -13493,6 +13547,29 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                                         requested_id: str, identifier: str) -> None:
         self._observe_reference_lease(response, bridge=bridge, origin=origin,
             requested_id=requested_id, identifier=identifier)
+
+    async def _recover_gateway_timed_out_submission(
+        self, bridge: Any, broker_origin: str, client_request_id: str,
+    ) -> dict[str, Any] | None:
+        """Look up the durable reservation for the exact key used by the create call."""
+        try:
+            response = await asyncio.to_thread(bridge.refresh_job, client_request_id, timeout=6.0)
+            if not isinstance(response, dict):
+                return None
+            job_id = response.get("job_id") or response.get("id") or response.get("task_id")
+            if not isinstance(job_id, str) or not job_id.startswith("job-"):
+                return None
+            task = self._normalize_broker_task(response, server_url=broker_origin)
+        except _BrokerError:
+            return None
+        if task["status"] == "submission_unknown":
+            return None
+        await self._run_blocking_generation_stage(
+            self._observe_reference_lease_response,
+            response, bridge, broker_origin, client_request_id,
+            getattr(self, "_hmb_reference_upload_lease_id", ""),
+        )
+        return task
 
     def _build_broker_payload(self, params: dict[str, Any]) -> dict[str, Any]:
         """Map the HMB media contract to the FN AI Broker Seedance schema."""
@@ -15248,11 +15325,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             # Refresh retrieves status for this authoritative job only.  In
             # particular, an uncertain submission never replays
             # generate_seedance (the create-task request) here.
-            response = await asyncio.to_thread(
-                bridge.refresh_job,
-                generation_id,
-                timeout=300,
-            )
+            try:
+                response = await asyncio.to_thread(bridge.refresh_job, generation_id, timeout=300)
+            except _BrokerError as exc:
+                if exc.status_code != 504:
+                    raise
+                if (not self._runtime_node_is_live(require_registered=True)
+                        or self._authoritative_existing_generation_id() != generation_id):
+                    return
+                response = await asyncio.to_thread(bridge.refresh_job, generation_id, timeout=6.0)
             if not self._runtime_node_is_live(require_registered=True):
                 return
             if self._authoritative_existing_generation_id() != generation_id:
@@ -15953,6 +16034,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         deadline = started + timeout
         poll_interval = params["poll_interval_seconds"]
         final_task: dict[str, Any] | None = None
+        consecutive_gateway_timeouts = 0
 
         if resume_generation_id:
             generation_id = self._validate_task_id(resume_generation_id)
@@ -16134,6 +16216,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             except _BrokerError as exc:
                 if not self._runtime_node_is_live(require_registered=True):
                     return
+                recovered_task = None
                 if getattr(exc, "_hmb_web_submission_not_started", False) is True:
                     # The web prepared handshake failed before the normal
                     # create transport. Its provisional key is not a task.
@@ -16166,6 +16249,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         required=False,
                         reason="submission_unknown",
                     )
+                    if exc.status_code == 504 and self._runtime_node_is_live(require_registered=True):
+                        recovered_task = await self._recover_gateway_timed_out_submission(
+                            bridge, broker_origin, client_request_id,
+                        )
                 elif (
                     exc.status_code is not None
                     and not exc.submission_outcome_unknown
@@ -16192,7 +16279,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         required=False,
                         reason="definitive_submission_rejection",
                     )
-                raise
+                if recovered_task is None:
+                    raise
+                task = recovered_task
+                submission_cancelled = self.is_cancellation_requested
             if not self._runtime_node_is_live(require_registered=True):
                 return
             generation_id = str(task["id"])
@@ -16320,11 +16410,21 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 )
 
             requested_generation_id = generation_id
-            response = await asyncio.to_thread(
-                bridge.refresh_job,
-                generation_id,
-                timeout=min(300.0, max(1.0, deadline - now)),
-            )
+            try:
+                response = await asyncio.to_thread(
+                    bridge.refresh_job,
+                    generation_id,
+                    timeout=min(300.0, max(1.0, deadline - now)),
+                )
+            except _BrokerError as exc:
+                if exc.status_code != 504 or consecutive_gateway_timeouts == 2:
+                    raise
+                consecutive_gateway_timeouts += 1
+                remaining = deadline - self._monotonic()
+                if remaining > 0:
+                    await self._sleep(min(poll_interval, remaining))
+                continue
+            consecutive_gateway_timeouts = 0
             if not self._runtime_node_is_live(require_registered=True):
                 return
             task = self._normalize_broker_task(
