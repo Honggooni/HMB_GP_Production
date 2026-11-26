@@ -13085,8 +13085,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self,
         driver: GriptapeCloudStorageDriver,
         value: Any,
+        compact_copy: tuple[bytes, str] | None = None,
     ) -> str:
-        content, _mime, filename = self._read_image_for_cloud_upload(value)
+        if compact_copy is None:
+            content, _mime, filename = self._read_image_for_cloud_upload(value)
+        else:
+            content, filename = compact_copy
         remote_path = Path("artifact_url_storage") / uuid4().hex / filename
         self._temporary_video_uploads.append((driver, remote_path))
 
@@ -13257,10 +13261,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             params.get("last_frame"),
             *(params.get("reference_images") or []),
         ]
-        inline_remaining = (
-            SEEDANCE_INLINE_IMAGE_BUDGET if params.get("model_id") == SEEDANCE_2_5_MODEL_ID else 0
-        )
-        candidates: list[tuple[int, Any, str]] = []
+        seedance_25 = params.get("model_id") == SEEDANCE_2_5_MODEL_ID
+        inline_remaining = SEEDANCE_INLINE_IMAGE_BUDGET if seedance_25 else 0
+        candidates: list[tuple[int, Any, str, tuple[bytes, str] | None]] = []
         ordinal = 0
         for index, value in enumerate(values):
             if not self._has_reference_value(value):
@@ -13273,21 +13276,24 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             # particular, a later oversized reference must not leave earlier
             # references partially uploaded before its error is reported.
             content, mime, name = self._read_image_for_cloud_upload(value, reference_ordinal=ordinal)
-            if inline_remaining and mime == "image/png" and len(content) >= SEEDANCE_LOSSLESS_PNG_COPY_THRESHOLD:
+            compact_copy = None
+            if seedance_25 and mime == "image/png" and len(content) >= SEEDANCE_LOSSLESS_PNG_COPY_THRESHOLD:
                 content, mime = self._compact_seedance_png_reference(content)
+                if mime == "image/webp":
+                    compact_copy = (content, Path(name).with_suffix(".webp").name)
             prefix = f"data:{mime};base64,"
             inline_size = len(prefix) + 4 * ((len(content) + 2) // 3)
             if inline_size <= inline_remaining:
                 values[index] = prefix + base64.b64encode(content).decode("ascii")
                 inline_remaining -= inline_size
             else:
-                candidates.append((index, value, name))
+                candidates.append((index, value, name, compact_copy))
 
         if candidates and cloud_driver is _CLOUD_DRIVER_UNSET:
             cloud_driver = self._try_create_gt_cloud_storage_driver()
         if candidates and cloud_driver is not None:
-            for index, value, name in candidates:
-                url = self._upload_image_to_griptape_cloud(cloud_driver, value)
+            for index, value, name, compact_copy in candidates:
+                url = self._upload_image_to_griptape_cloud(cloud_driver, value, compact_copy)
                 if params.get("model_id") == SEEDANCE_2_5_MODEL_ID:
                     self._confirm_seedance_reference_download(url, name)
                 values[index] = url
@@ -13552,13 +13558,27 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self, bridge: Any, broker_origin: str, client_request_id: str,
     ) -> dict[str, Any] | None:
         """Look up the durable reservation for the exact key used by the create call."""
+        # Refresh can wait behind the Broker's in-flight provider poll. A
+        # short first lookup keeps fast responses fast; allow one longer lookup
+        # of the same reservation when the first one misses or times out.
+        for timeout in (6.0, 30.0):
+            if self.is_cancellation_requested or not self._runtime_node_is_live(require_registered=True):
+                return None
+            try:
+                response = await asyncio.to_thread(bridge.refresh_job, client_request_id, timeout=timeout)
+            except _BrokerError as exc:
+                transient = isinstance(exc, _BrokerUnavailableError) or exc.status_code in (404, 502, 503, 504)
+                if timeout == 30.0 or not transient:
+                    return None
+                await self._sleep(2.0)
+                continue
+            break
+        if not isinstance(response, dict):
+            return None
+        job_id = response.get("job_id") or response.get("id") or response.get("task_id")
+        if not isinstance(job_id, str) or not job_id.startswith("job-"):
+            return None
         try:
-            response = await asyncio.to_thread(bridge.refresh_job, client_request_id, timeout=6.0)
-            if not isinstance(response, dict):
-                return None
-            job_id = response.get("job_id") or response.get("id") or response.get("task_id")
-            if not isinstance(job_id, str) or not job_id.startswith("job-"):
-                return None
             task = self._normalize_broker_task(response, server_url=broker_origin)
         except _BrokerError:
             return None

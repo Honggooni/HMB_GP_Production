@@ -329,6 +329,19 @@ with tempfile.TemporaryDirectory() as temporary:
               Image.open(BytesIO(base64.b64decode(encoded.partition(",")[2]))) as uploaded):
             assert original.tobytes() == uploaded.tobytes()
 
+    # Earlier references can consume the entire inline budget. The Cloud
+    # upload must still carry the prepared lossless copy and matching suffix.
+    overflow_driver = LegacyCloudDriver()
+    with (mock.patch.object(seedance, "SEEDANCE_INLINE_IMAGE_BUDGET", 0),
+          mock.patch.object(seedance, "SEEDANCE_LOSSLESS_PNG_COPY_THRESHOLD", 1),
+          mock.patch.object(cloud_node, "_confirm_seedance_reference_download") as confirm):
+        result, _ = cloud_node._prepare_image_references_for_run(
+            dict(params_25, reference_images=[str(lossless)]), cloud_driver=overflow_driver)
+        uploaded, = overflow_driver.uploads
+        assert uploaded["path"].name == "transparent-sheet.webp"
+        assert uploaded["file_content"] == base64.b64decode(encoded.partition(",")[2])
+        confirm.assert_called_once_with(result["reference_images"][0], lossless.name)
+
     for code, body in ((206, b"x"), (200, b""), (403, b"")):
         stream = mock.MagicMock()
         response = stream.__enter__.return_value

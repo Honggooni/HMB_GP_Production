@@ -20,6 +20,9 @@ def station(workspace):
     workspace.mkdir(exist_ok=True)
     os.environ["GTN_CONFIG_WORKSPACE_DIRECTORY"] = str(workspace)
     os.environ["HMB_IMAGE_THUMBNAIL_CACHE"] = str(workspace / "thumbs")
+    import _hmb_image_asset_sites as sites
+    # Pin this simulated station even if the installed SDK has a current engine.
+    sites._EXECUTION_WORKSPACE.set(workspace)
     import HMBImageAssetLibrary as lib
     # The CLI engine has no StaticFiles HTTP publisher.
     lib._asset_thumbnail_url = lambda _path, key, *_args, **_kw: f"memory://{key}"
@@ -412,6 +415,81 @@ def explicit_import_destinations(root):
     assert not any((store / "add").exists() for store in (hq, first, second))
 
 
+def repeat_same_file(directory, station_name, barrier):
+    root = Path(directory)
+    lib = station(root / station_name)
+    shared = root / "shared"
+    source = shared / "e203/Stone.png"
+    catalog = root / "projects"
+    hq = catalog / "Show/Ai_Ct_image"
+    from _hmb_image_asset_sites import add_site_folder
+    profile, site = add_site_folder(hq, str(shared), "image")
+    state = load(lib, catalog)
+    active, media = lib._merge_import_input(state, [str(source)])
+    incoming = next(row for row in active["assets"] if row["import_index"])
+    request = dict(request_id=station_name, project_uid=active["project_uid"], source_kind="user",
+                   asset_library_id=incoming["asset_library_id"], source_uid=incoming["source_uid"],
+                   target_folder=f"site:{site}/e203", image_name="Stone", asset_id="Stone",
+                   image_main_type="Custom / Context", image_sub_type="Context", site_settings_revision=profile["revision"])
+    barrier.wait(30)
+    with patch.object(lib, "_asset_registration_owner", return_value=station_name):
+        result = lib._apply_asset_registration(active, request, media)
+        # Replay the same file via both processes, including a stale catalog.
+        for _ in range(49):
+            lib._register_external_file(incoming, str(source), shared, "e203", lib._site_project_key("Show", site),
+                                        {"import_source_uid": incoming["source_uid"]})
+    current = lib._merge_async_registration_result_with_live_state(result, active, active, request)
+    refreshed = lib._load_project_catalog(catalog, current, use_shared_cache=False)
+    expected = [result["assets"][-1]["source_uid"]]
+    for view in (current, refreshed):
+        assert len(view["assets"]) == 1 and view["assets"][0]["registered"]
+        assert view["shot_routing"]["shots"][0]["selected_source_uids"] == expected
+
+
+def shared_duplicate_regression(root):
+    from PIL import Image
+    lib = station(root / "verification")
+    hq = root / "projects/Show/Ai_Ct_image"
+    hq.mkdir(parents=True)
+    shared = root / "shared"
+    folder = shared / "e203"
+    folder.mkdir(parents=True)
+    original = folder / "Stone.png"
+    Image.new("RGB", (9, 9), "green").save(original)
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(2)
+    workers = [ctx.Process(target=repeat_same_file, args=(str(root), who, barrier)) for who in ("alice", "bob")]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(90)
+        assert worker.exitcode == 0
+    records = lib._read_asset_manifest(shared)
+    assert list(records) == ["e203/stone.png"] and list(folder.iterdir()) == [original]
+    assert records["e203/stone.png"]["registration_owner"] in {"alice", "bob"}
+    from_other_pc = root / "verification/Stone.png"
+    from_other_pc.write_bytes(original.read_bytes())
+    imported, media = lib._import_record(str(from_other_pc), 1, defer_thumbnail=True)
+    path, reused, _ = lib._register_external_file(imported, media, shared, "e203", "Show",
+                                                  {"import_source_uid": imported["source_uid"]})
+    assert path == "e203/Stone.png" and reused == records["e203/stone.png"]
+    assert list(folder.iterdir()) == [original]
+
+    # Legacy copies keep the registered ID for old workflows. Suppress only
+    # the unregistered original proven by the saved input UID and exact bytes.
+    copy = folder / "Stone_2.png"
+    copy.write_bytes(original.read_bytes())
+    manifest = lib._asset_manifest_path(shared)
+    data = json.loads(manifest.read_bytes())
+    data["assets"][0]["path"] = "e203/Stone_2.png"
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+    def listed():
+        return {row["relative_path"] for row in lib._scan_project_assets(shared)["assets"]}
+    assert listed() == {"e203/Stone_2.png"} and original.exists()
+    Image.new("RGB", (9, 9), "red").save(original)
+    assert listed() == {"e203/Stone.png", "e203/Stone_2.png"}
+
+
 def run():
     from PIL import Image
     with TemporaryDirectory(prefix="hmb-site-") as home:
@@ -429,6 +507,7 @@ def run():
         untouched = busan_manifest.read_bytes()
         # Initialize from the clean station env before importing the library.
         station(root / "pc-confirm-active")
+        shared_duplicate_regression(root)
         folder_commands_publish_live_catalog(root / "folder-actions")
         explicit_import_destinations(root / "destination-choice")
         station(root / "pc-confirm-active")

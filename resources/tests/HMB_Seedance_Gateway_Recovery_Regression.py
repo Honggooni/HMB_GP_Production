@@ -69,7 +69,8 @@ for body in ({}, {"error": "gateway"}, {"status": "failed"}, {"status": "running
 
 def node_with_checkpoint(task_id="hmb-client-key", identity="client_request"):
     node = target.HMBSeedanceGeneration(name="Gateway Recovery")
-    node.is_cancellation_requested = False
+    if not hasattr(node, "is_cancellation_requested"):
+        node.is_cancellation_requested = False  # Host-independent CI stub.
     node._runtime_node_is_live = lambda **_kwargs: True
     node._force_save_generation_recovery_checkpoint = mock.AsyncMock(return_value=True)
     node._set_status_results = mock.Mock()
@@ -120,6 +121,7 @@ class TimedOutCreateBridge(ResponseBridge):
 
 async def run_timed_out_create(bridge):
     node = node_with_checkpoint(task_id="")
+    node._manual_agent_prompt_source = lambda: None  # Text-only fixture has no upstream Agent.
     node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0)
     node.set_parameter_value(target.TASK_PARAMETER, target.TASK_TEXT_ONLY)
     node.set_parameter_value("prompt", "synthetic request")
@@ -161,13 +163,25 @@ async def verify_recovery():
     assert node._generation_recovery_state()["task_id"] == "job-already-created"
     assert node._generation_recovery_state()["terminal"] is True
 
+    # The client misses the first refresh while the Broker is still polling.
+    # A delayed 202 must reconnect to the one already-running provider task.
+    for early in (target._BrokerUnavailableError("read timed out"), gateway_timeout,
+                  target._BrokerError("not yet visible", status_code=404)):
+        bridge = TimedOutCreateBridge(early, dict(running, _http_status=202), failed)
+        node, exc = await run_timed_out_create(bridge)
+        assert "ended with status failed" in str(exc)
+        assert bridge.lookups == [bridge.create_key, bridge.create_key, "job-already-created"]
+        assert bridge.create_count == 1 and node._generation_recovery_state()["terminal"]
+
     # An absent, malformed or unreachable lookup cannot erase the original
     # request key or authorize another create.
-    for response in ({"status": "running"}, target._BrokerError("HTTP 404", status_code=404), gateway_timeout):
-        bridge = TimedOutCreateBridge(response)
+    for responses in (({"status": "running"},), (target._BrokerError("HTTP 401", status_code=401),),
+                      (target._BrokerError("HTTP 404", status_code=404), gateway_timeout),
+                      (gateway_timeout, gateway_timeout)):
+        bridge = TimedOutCreateBridge(*responses)
         node, exc = await run_timed_out_create(bridge)
         assert str(exc) == "HTTP 504", str(exc)
-        assert bridge.create_count == 1 and bridge.lookups == [bridge.create_key]
+        assert bridge.create_count == 1 and bridge.lookups == [bridge.create_key] * len(responses)
         recovery = node._generation_recovery_state()
         assert recovery["task_id"] == bridge.create_key
         assert recovery["task_identity"] == "client_request" and not recovery["terminal"]

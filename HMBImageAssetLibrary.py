@@ -2042,9 +2042,7 @@ def _import_record(
             image_name = Path(reference).stem or f"Imported Image {index:02d}"
             extension = Path(reference).suffix.casefold()
 
-    source_uid = "import:" + hashlib.sha256(
-        f"{media_ref_kind}\n{identity_material}".encode("utf-8")
-    ).hexdigest()[:24]
+    source_uid = _import_identity_uid(media_ref_kind, identity_material)
     thumbnail_url = (
         _asset_thumbnail_url(thumbnail_path, source_uid)
         if thumbnail_path is not None and not defer_thumbnail
@@ -2079,6 +2077,10 @@ def _import_record(
         "connected": True,
     }
     return record, media_value
+
+
+def _import_identity_uid(kind: str, identity: str) -> str:
+    return "import:" + hashlib.sha256(f"{kind}\n{identity}".encode("utf-8")).hexdigest()[:24]
 
 
 def _canonical_import_path(value: Any) -> str:
@@ -3936,7 +3938,49 @@ def _suggest_registration_names(assets, *, writer="hq", manifest_records=()):
         reserved.add((site, proposed.casefold()))
 
 
-def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | None = None) -> Dict[str, Any]:
+@lru_cache(maxsize=256)
+def _image_content_digest(path, size, modified, changed, inode):
+    # The stat fields key the cache for the small number of import collisions.
+    with path.open("rb") as stream:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+        return digest.digest()
+
+
+def _file_content_key(path):
+    facts = path.stat()
+    return (path, facts.st_size, facts.st_mtime_ns, facts.st_ctime_ns, facts.st_ino)
+
+
+def _legacy_import_originals(root, paths, registrations):
+    """Keep the registered Shot identity when an older Add copied its own input."""
+    originals = set()
+    for copy_path in paths:
+        match = re.fullmatch(r"(.+)_([1-9][0-9]*)", copy_path.stem)
+        if not match or int(match[2]) < 2:
+            continue
+        record = registrations.get(copy_path.relative_to(root).as_posix().casefold()) or {}
+        uid = record.get("import_source_uid")
+        if not uid:
+            continue
+        original = copy_path.with_name(match[1] + copy_path.suffix)
+        if (original.relative_to(root).as_posix().casefold() in registrations
+                or uid != _import_identity_uid("path", original.as_posix().casefold())):
+            continue
+        try:
+            if _is_reparse_point(original) or _is_reparse_point(copy_path):
+                continue
+            left, right = _file_content_key(original), _file_content_key(copy_path)
+            if left[1] == right[1] and _image_content_digest(*left) == _image_content_digest(*right):
+                originals.add(original)
+        except OSError:
+            continue
+    return originals
+
+
+def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | None = None,
+                         verify_all_files: bool = False) -> Dict[str, Any]:
     """Scan one selected project and classify image files with common taxonomy."""
     root_text = _project_root_text(project_root)
     if not root_text:
@@ -3965,7 +4009,7 @@ def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | N
     manifest_signature = _asset_manifest_signature(root)
     manifest_overrides = _read_asset_manifest(root, signature=manifest_signature)
     folders, paths, metadata = _catalog_file_inventory(
-        root, incremental=True, full=previous_scan is None,
+        root, incremental=True, full=verify_all_files or previous_scan is None,
         manifest_signature=manifest_signature, records=manifest_overrides)
     manifest_overrides = _manifest_at_current_paths(manifest_overrides, root, folders, paths)
     warnings: List[str] = []
@@ -3982,7 +4026,10 @@ def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | N
         stem_counts[stem_key] = stem_counts.get(stem_key, 0) + 1
 
     assets: List[Dict[str, Any]] = []
+    legacy_originals = _legacy_import_originals(root, paths, manifest_overrides)
     for path in paths:
+        if path in legacy_originals:
+            continue
         relative = path.relative_to(root)
         relative_text = relative.as_posix()
         override = manifest_overrides.get(relative_text.casefold())
@@ -5366,6 +5413,8 @@ _ASYNC_SCAN_USER_ASSET_FIELDS = (
     "image_name",
     "registered",
     "registration_revision",
+    "registration_relative_path",
+    "import_source_uid",
     "image_main_type",
     "image_sub_type",
     "source_type",
@@ -5473,6 +5522,14 @@ def _merge_async_scan_result_with_live_state(
                 asset["thumbnail_url"] = _clean(current.get("thumbnail_url"))
         assets.append(asset)
 
+    # A new project row can commit while a scan is in flight. A row absent
+    # from both the baseline and the old scan was never observed as removed.
+    same_project = bool(scanned.get("project_cache_uid")) and scanned["project_cache_uid"] == live.get("project_cache_uid")
+    if same_project and live.get("site_catalog_revision") == scanned.get("site_catalog_revision"):
+        assets.extend(dict(row) for key, row in live_assets.items()
+                      if key not in scanned_keys and key not in base_assets
+                      and row.get("source_kind") == "project" and row.get("registered"))
+
     # IMAGE_IMPORT_IN can change while a slow UNC scan is blocked.  Its latest
     # live rows are authoritative and never come from project filesystem walk.
     assets.extend(
@@ -5482,7 +5539,6 @@ def _merge_async_scan_result_with_live_state(
         and _non_negative_int(asset.get("import_index")) > 0
     )
     merged["assets"] = assets
-    same_project = bool(scanned.get("project_cache_uid")) and scanned["project_cache_uid"] == live.get("project_cache_uid")
     _restore_catalog_relocations(merged, live, same_project)
     _restore_site_selection(merged, live, same_project)
     merged["scan_revision"] = max(
@@ -5514,92 +5570,52 @@ def _merge_async_registration_result_with_live_state(
     scanned = _normalize_state(registration_result)
     live = _normalize_state(live_state)
     request = _normalize_asset_registration_request(request_value)
-    merged = _merge_async_scan_result_with_live_state(
-        scanned,
-        registration_base,
-        live,
-    )
-    merged["thumbnail_revision"] = max(
-        _non_negative_int(scanned.get("thumbnail_revision")),
-        _non_negative_int(live.get("thumbnail_revision")),
-    )
-
-    result = _normalize_asset_registration_result(
-        scanned.get("asset_registration_result")
-    )
-    if not result and _clean(scanned.get("error")):
-        result = {
-            "request_id": _clean(request.get("request_id")),
-            "ok": False,
-            "asset_library_id": _clean(request.get("asset_library_id")),
-            "message": _clean(scanned.get("error")),
-        }
+    merged = dict(live)
+    result = _normalize_asset_registration_result(scanned.get("asset_registration_result"))
+    if not result and scanned.get("error"):
+        result = {"request_id": _clean(request.get("request_id")), "ok": False,
+                  "asset_library_id": _clean(request.get("asset_library_id")), "message": scanned["error"]}
+    if live.get("project_root") != scanned.get("project_root") or live.get("site_catalog_revision") != scanned.get("site_catalog_revision"):
+        return live
     merged["asset_registration_result"] = result
-    if result and not bool(result.get("ok")):
-        message = _clean(result.get("message"))
-        merged["error"] = f"Asset registration: {message}" if message else (
-            "Asset registration failed."
-        )
+    if not result or not result.get("ok"):
+        if result:
+            merged["error"] = f"Asset registration: {result['message']}"
         return _normalize_state(merged)
 
-    if not result or not bool(result.get("ok")):
-        return _normalize_state(merged)
-
-    # A project registration retains the same stable library key, so the
-    # generic merger above already combines its newly verified passport with
-    # the latest selection.  A copied IMAGE_IMPORT_IN source changes identity;
-    # transfer only that source's latest selection to the durable project row
-    # and retire only that exact live import.
-    if _clean(request.get("source_kind")).casefold() == "user":
-        source_uid = _clean(request.get("source_uid"))
-        latest_source = next(
-            (
-                asset
-                for asset in live.get("assets", [])
-                if _clean(asset.get("source_kind")) == "user"
-                and _clean(asset.get("source_uid")) == source_uid
-            ),
-            None,
-        )
-        target_library_id = _clean(result.get("asset_library_id"))
-        assets = [
-            dict(asset)
-            for asset in merged.get("assets", [])
-            if not (
-                _clean(asset.get("source_kind")) == "user"
-                and _clean(asset.get("source_uid")) == source_uid
-            )
-        ]
-        target = next(
-            (
-                asset
-                for asset in assets
-                if _clean(asset.get("source_kind")) == "project"
-                and _clean(asset.get("asset_library_id")) == target_library_id
-            ),
-            None,
-        )
-        if target is not None:
-            if latest_source is not None:
-                target["selected"] = bool(latest_source.get("selected"))
-                target["selection_order"] = (
-                    _non_negative_int(latest_source.get("selection_order"))
-                    if target["selected"]
-                    else 0
-                )
-            else:
-                # A disconnect committed while Add was copying is live UI/graph
-                # authority. Keep the durable new project row, but never revive
-                # the retired import's captured selection or Shot membership.
-                target["selected"] = False
-                target["selection_order"] = 0
-        merged["assets"] = assets
-        if latest_source is not None:
-            _remap_shot_routing_source_uid(
-                merged,
-                source_uid,
-                target.get("source_uid") if target is not None else "",
-            )
+    # The worker owns only the registered row. A newer refresh may already
+    # have added or removed other files while the shared writer was pending.
+    target_id = result["asset_library_id"]
+    target = next((dict(row) for row in scanned["assets"] if row["asset_library_id"] == target_id), None)
+    if target is None:
+        return live
+    import_uid = request.get("source_uid") if request.get("source_kind") == "user" else None
+    rows = []
+    selected_order = 0
+    inserted = False
+    for row in live["assets"]:
+        is_target = row["asset_library_id"] == target_id
+        is_import = import_uid and row["source_uid"] == import_uid
+        if is_target or is_import:
+            if row.get("selected"):
+                selected_order = selected_order or row["selection_order"]
+            if not inserted:
+                rows.append(target)
+                inserted = True
+        else:
+            rows.append(row)
+    if not inserted:
+        rows.append(target)
+    target["selected"] = bool(selected_order and target.get("registered"))
+    target["selection_order"] = selected_order if target["selected"] else 0
+    merged["assets"] = rows
+    if import_uid:
+        _remap_shot_routing_source_uid(merged, import_uid, target["source_uid"])
+    for field in ("scan_revision", "thumbnail_revision"):
+        merged[field] = max(scanned[field], live[field])
+    if live.get("manifest_signature") == registration_base.get("manifest_signature"):
+        merged["manifest_signature"] = scanned["manifest_signature"]
+    _suggest_registration_names(rows, writer=(live.get("site_settings") or {}).get("write_site_id") or "hq")
 
     merged["error"] = ""
     return _normalize_state(merged)
@@ -5719,8 +5735,8 @@ def _rebind_shared_catalog_snapshot(
             root, folders, paths, metadata=metadata
         ):
             return None
-        verified_paths = set(paths)
         overrides = _manifest_at_current_paths(records, root, folders, paths)
+        verified_paths = set(paths) - _legacy_import_originals(root, paths, overrides)
         stems = Counter(path.stem.casefold() for path in paths)
         assets: List[Dict[str, Any]] = []
         for raw_asset in snapshot.get("assets", []):
@@ -5903,7 +5919,7 @@ def _discover_shared_image_projects(root: Any, *, refresh: bool = False) -> Dict
     return _catalog_read_once(_session_catalog_key("projects", root), discover, refresh=refresh)
 
 
-def _scan_linked_sites(project: Path, settings: dict, prior: dict, *, pinned=None) -> dict:
+def _scan_linked_sites(project: Path, settings: dict, prior: dict, *, pinned=None, verify_all_files=False) -> dict:
     # On a profile edit the pinned facts are from this engine's last verified
     # read. Workflow data may preserve selections but cannot replace those facts.
     known_sites = set(pinned.get("folders", [])) if pinned is not None else set()
@@ -5911,7 +5927,7 @@ def _scan_linked_sites(project: Path, settings: dict, prior: dict, *, pinned=Non
         home = {**pinned, "assets": [row for row in pinned["assets"] if _site_location(row["relative_path"])[0] == "hq"],
                 "folders": [folder for folder in pinned["folders"] if not folder.startswith("site:")]}
     else:
-        home = _scan_project_assets(project, previous_scan=prior)
+        home = _scan_project_assets(project, previous_scan=prior, verify_all_files=verify_all_files)
     rows = list(home["assets"])
     folders = list(home["folders"])
     warnings = list(home["warnings"])
@@ -5932,7 +5948,7 @@ def _scan_linked_sites(project: Path, settings: dict, prior: dict, *, pinned=Non
             physical = _site_root(project, settings, site)
             previous = {"project_cache_uid": _project_cache_uid(physical),
                         "assets": [{**r, "relative_path": _site_location(r["relative_path"])[1]} for r in previous_rows]}
-            external = _scan_project_assets(physical, previous_scan=previous)
+            external = _scan_project_assets(physical, previous_scan=previous, verify_all_files=verify_all_files)
         except (OSError, ValueError) as exc:
             # Preserve the author's selection while this link is temporarily
             # offline. Offline rows are display data, never handover authority.
@@ -5979,7 +5995,7 @@ def _read_verified_image_catalog(
             previous = _read_local_catalog_snapshot(project, {**neutral, **state}) or state
             if _clean(previous.get("project_cache_uid")) != _project_cache_uid(project):
                 previous = {}
-            facts = _scan_linked_sites(project, settings, previous)
+            facts = _scan_linked_sites(project, settings, previous, verify_all_files=not use_shared_cache)
         elif use_shared_cache and reuse_saved and state.get("project_cache_uid"):
             facts = _rebind_shared_catalog_snapshot(
                 _shared_catalog_snapshot(state), selected, catalog, refresh_manifest=True
@@ -5987,7 +6003,7 @@ def _read_verified_image_catalog(
         if facts is None and use_shared_cache:
             facts = _read_catalog_index(project, neutral)
         if facts is None:
-            facts = _scan_project_assets(project, previous_scan=state)
+            facts = _scan_project_assets(project, previous_scan=state, verify_all_files=not use_shared_cache)
         # Only the just-verified catalog may supply legacy manifest defaults.
         # Workflow-authored choices are merged after this neutral session read.
         facts = _shared_catalog_snapshot({**facts, **neutral}, registry_defaults=True)
@@ -6091,11 +6107,6 @@ def _load_project_catalog(
             selected = only_project
             selected_path = _clean(selected.get("path"))
     if selected_path:
-        if not use_shared_cache:
-            # The user's explicit full verification also checks raw in-place
-            # edits in every folder immediately. Later cache/index validation
-            # reuses this very inventory without a second project walk.
-            _catalog_file_inventory(_resolve_image_path(Path(selected_path)), incremental=True, full=True)
         state = _read_selected_image_catalog(
             catalog, selected, state, use_shared_cache=use_shared_cache, reuse_saved=True,
         )
@@ -6354,7 +6365,12 @@ def _write_catalog_index(
         )
         with _ASSET_CATALOG_INDEX_LOCK:
             index_path.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_local_index_write(index_path, payload)
+            try:
+                unchanged = index_path.stat().st_size == len(payload) and index_path.read_bytes() == payload
+            except FileNotFoundError:
+                unchanged = False
+            if not unchanged:
+                _atomic_local_index_write(index_path, payload)
             lookups = (
                 (_catalog_lookup_path("project", Path(project_root)), projection["project_cache_uid"]),
                 (_catalog_lookup_path("catalog", Path(projection["catalog_root"])),
@@ -6454,8 +6470,8 @@ def _read_catalog_index(
             resolved_root, folders, paths, metadata=metadata
         ):
             return None
-        verified_paths = set(paths)
         overrides = _manifest_at_current_paths(records, resolved_root, folders, paths)
+        verified_paths = set(paths) - _legacy_import_originals(resolved_root, paths, overrides)
         stems = Counter(path.stem.casefold() for path in paths)
         assets = raw.get("assets")
         if not isinstance(assets, list) or len(assets) > MAX_ASSETS:
@@ -6838,6 +6854,67 @@ def _copy_import_to_project(
     raise ValueError("Unable to choose a unique filename in the selected Asset Folder.")
 
 
+def _register_external_file(asset, media, root, folder, project_id, record):
+    parent = _registration_folder_path(root, folder)
+    source = _local_import_source(asset, media)
+    filename = Path(_safe_import_filename(asset, media, source))
+    numbered_name = re.compile(re.escape(filename.stem) + r"_[1-9][0-9]*" + re.escape(filename.suffix), re.I)
+    # Choose or create the file and claim its registration in one shared
+    # writer turn. A second workstation must see the first one's decision.
+    with _asset_manifest_lock(root), _asset_manifest_process_lock(root):
+        records = _read_asset_manifest(root)
+        candidates = []
+        for prior in records.values():
+            origin = prior.get("import_source_uid")
+            if not origin:
+                continue
+            relative = _manifest_asset_relative_path(root, prior)
+            candidate = root / relative
+            if candidate.parent == parent and (origin == record["import_source_uid"] or numbered_name.fullmatch(candidate.name)):
+                candidates.append(candidate)
+        # Colleagues may mount the same input at different drive letters.
+        # Path-derived import IDs can differ even when the destination name
+        # and all source bytes agree.
+        candidates.append(parent / filename)
+        destination = None
+        for candidate in dict.fromkeys(candidates):
+            if not candidate.is_file() or _is_reparse_point(candidate):
+                continue
+            if candidate == source:
+                destination = candidate
+                break
+            if source is not None:
+                left, right = _file_content_key(source), _file_content_key(candidate)
+                same = left[1] == right[1] and _image_content_digest(*left) == _image_content_digest(*right)
+            else:
+                payload = _import_media_bytes(media)
+                same = payload is not None and hashlib.sha256(payload).digest() == _image_content_digest(*_file_content_key(candidate))
+            if same:
+                destination = candidate
+                break
+        if destination is None and source is not None and source.parent.samefile(parent):
+            destination = parent / source.name
+        created = destination is None
+        if created:
+            destination = _copy_import_to_project(asset, media, root, folder)
+        try:
+            relative = destination.relative_to(root).as_posix()
+            path, relative, _ = _resolve_project_asset_file(root, project_id, relative, allow_user_import_path=False)
+            dimensions = _verified_image_dimensions(path)
+            existing = records.get(relative.casefold())
+            if existing is None:
+                record["path"] = relative
+                _write_asset_manifest_record_locked(root, record)
+            else:
+                # Keep the original author's metadata and edit permissions.
+                record = existing
+        except Exception:
+            if created:
+                destination.unlink(missing_ok=True)
+            raise
+    return relative, record, dimensions
+
+
 def _resolve_project_asset_file(
     project_root: Path,
     project_id: str,
@@ -7166,7 +7243,6 @@ def _commit_asset_registration(
     registration_message = ""
     source_selection = False
     source_selection_order = 0
-    copied_destination: Path | None = None
     registered_row: Dict[str, Any]
     source_index = -1
 
@@ -7291,44 +7367,27 @@ def _commit_asset_registration(
         for field in ("path", "extension", "media_ref_kind"):
             copy_source_asset[field] = authoritative_import[0].get(field)
         record = _registration_record(request, {"relative_path": ""})
-        copied_destination = _copy_import_to_project(copy_source_asset, media_value, write_root, target_folder)
-        relative_text = copied_destination.relative_to(write_root).as_posix()
-        record["path"] = relative_text
         record["import_source_uid"] = request["source_uid"]
+        relative_text, record, dimensions = _register_external_file(
+            copy_source_asset, media_value, write_root, target_folder, write_project_id, record)
         registered_library_id = _asset_library_id(
             write_project_id,
             relative_text,
         )
         source_selection = bool(source_asset.get("selected"))
         source_selection_order = _non_negative_int(source_asset.get("selection_order"))
-        try:
-            registered_row = _registered_project_asset_row(
-                project_root=write_root,
-                project_id=write_project_id,
-                project_cache_uid=_project_cache_uid(write_root),
-                relative_text=relative_text,
-                manifest_record=record,
-                selected=source_selection,
-                selection_order=source_selection_order,
-                verified_dimensions=_asset_dimensions(copied_destination),
-                hydrate_thumbnail=True,
-            )
-            manifest_path = _write_asset_manifest_record(write_root, record)
-        except Exception as exc:
-            cleanup_error: Exception | None = None
-            try:
-                copied_destination.unlink(missing_ok=True)
-            except Exception as cleanup_exc:
-                cleanup_error = cleanup_exc
-            if cleanup_error is not None:
-                raise RuntimeError(
-                    "Manifest update failed and the copied image could not be rolled "
-                    f"back: {cleanup_error}"
-                ) from exc
-            raise
-        registration_message = (
-            f"Copied to {relative_text} and registered in {manifest_path.name}."
+        registered_row = _registered_project_asset_row(
+            project_root=write_root,
+            project_id=write_project_id,
+            project_cache_uid=_project_cache_uid(write_root),
+            relative_text=relative_text,
+            manifest_record=record,
+            selected=source_selection,
+            selection_order=source_selection_order,
+            verified_dimensions=dimensions,
+            hydrate_thumbnail=True,
         )
+        registration_message = f"Registered at {relative_text}."
 
     registered_row["registration_revision"] = _editable_registration_revision(record) if action != "delete" else ""
     if site != "hq":
@@ -7341,6 +7400,12 @@ def _commit_asset_registration(
         assets.append(registered_row)
     else:
         assets[source_index] = registered_row
+    if request_source_kind == "user":
+        # An in-place Add replaces both the scanned file and the live wire.
+        for item in assets:
+            if item is not registered_row and item["asset_library_id"] == registered_library_id and item.get("selected"):
+                registered_row.update(selected=True, selection_order=item["selection_order"])
+        assets = [item for item in assets if item is registered_row or item["asset_library_id"] != registered_library_id]
     _suggest_registration_names(assets, writer=writer)
     refreshed["assets"] = assets
     refreshed["catalog_root"] = catalog["catalog_root"]

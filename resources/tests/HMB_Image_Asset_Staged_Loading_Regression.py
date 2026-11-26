@@ -1514,6 +1514,11 @@ try:
     live_during_add["search"] = "edit committed while Add worker ran"
     live_during_add[asset_library.UI_EDIT_REVISION_KEY] += 1
     live_during_add = asset_library._normalize_state(live_during_add)
+    # A competing refresh delivered a newly registered card after Add began.
+    other = {**anchor, "asset_library_id": "arrived-during-add", "source_uid": "project:arrived-during-add",
+             "path": str(project_root / "Late.png"), "relative_path": "Late.png", "selected": False,
+             "selection_order": 0, "registered": True}
+    live_during_add["assets"].append(other)
     async_added = asset_library._merge_async_registration_result_with_live_state(
         added,
         catalog_state,
@@ -1524,6 +1529,11 @@ try:
         item for item in async_added["assets"] if item["asset_id"] == "ExternalRegistered"
     )
     assert async_added["search"] == "edit committed while Add worker ran"
+    assert any(row["source_uid"] == other["source_uid"] and row["registered"] for row in async_added["assets"])
+    late_scan = asset_library._merge_async_scan_result_with_live_state(catalog_state, catalog_state, async_added)
+    assert any(row["source_uid"] == async_registered["source_uid"] and row["registered"] for row in late_scan["assets"])
+    assert late_scan["shot_routing"]["shots"][0]["selected_source_uids"] == [
+        anchor["source_uid"], async_registered["source_uid"]]
     assert all(
         imported["source_uid"] not in shot["selected_source_uids"]
         for shot in async_added["shot_routing"]["shots"]
