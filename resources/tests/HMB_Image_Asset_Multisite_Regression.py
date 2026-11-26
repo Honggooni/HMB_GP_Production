@@ -436,7 +436,8 @@ def repeat_same_file(directory, station_name, barrier):
         result = lib._apply_asset_registration(active, request, media)
         # Replay the same file via both processes, including a stale catalog.
         for _ in range(49):
-            lib._register_external_file(incoming, str(source), shared, "e203", lib._site_project_key("Show", site),
+            alias = shared / ".." / shared.name
+            lib._register_external_file(incoming, str(source), alias, "e203", lib._site_project_key("Show", site),
                                         {"import_source_uid": incoming["source_uid"]})
     current = lib._merge_async_registration_result_with_live_state(result, active, active, request)
     refreshed = lib._load_project_catalog(catalog, current, use_shared_cache=False)

@@ -6855,6 +6855,7 @@ def _copy_import_to_project(
 
 
 def _register_external_file(asset, media, root, folder, project_id, record):
+    root = _resolve_image_path(root, strict=True)
     parent = _registration_folder_path(root, folder)
     source = _local_import_source(asset, media)
     filename = Path(_safe_import_filename(asset, media, source))
