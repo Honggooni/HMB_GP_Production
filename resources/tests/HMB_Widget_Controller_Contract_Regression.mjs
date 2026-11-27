@@ -637,11 +637,10 @@ assert.match(
   /hmbInstallImageAssetShotDragReorder\(container, \{[\s\S]*?listen: \(eventName, handler\) => on\(container, eventName, handler, true\)[\s\S]*?on\(selectedTray, "click"/,
   "Capture-phase root drag delegation must survive selected-card morphs while the delete control remains tray-local.",
 );
-assert.match(
-  assetSource,
-  /export function hmbScheduleImageAssetSelectionCommit\([\s\S]*?requestAnimationFrame\(\(\) => \{[\s\S]*?requestAnimationFrame\(run\)/,
-  "Asset selection must paint one local frame before the host publish/remount path.",
-);
+const selectionScheduler = assetSource.match(/export function hmbScheduleImageAssetSelectionCommit\([\s\S]*?\n\}/)[0];
+assert.match(selectionScheduler, /setTimeout\(run, 0\)/, "A backgrounded editor must dispatch on the next turn.");
+assert.match(selectionScheduler, /requestAnimationFrame\(run\)/, "The first available frame must dispatch the same selection.");
+assert.equal(selectionScheduler.match(/requestAnimationFrame\(/g).length, 1, "Do not wait a second frame to publish.");
 assert.match(
   assetSource,
   /if \(!container\.__hmbImageAssetSelectionCommitPending\) \{[\s\S]*?__hmbImageAssetSelectionBase/,
