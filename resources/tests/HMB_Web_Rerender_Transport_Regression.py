@@ -544,6 +544,7 @@ class TransportRegression(unittest.TestCase):
                         raise error
                     bridge.generate_seedance = reject
                     snapshot = node._hmb_web_rerender_capture_inputs()
+                    self.assertEqual(snapshot["params"]["_hmb_broker_server_url"], bridge.server_url)
                     with self.subTest(failure=failure):
                         async with node._hmb_web_rerender_claim(snapshot) as claim:
                             node._hmb_web_rerender_bind_parent_settings(claim, wire_settings(snapshot["generation_settings"]))

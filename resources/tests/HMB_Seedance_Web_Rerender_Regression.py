@@ -44,6 +44,9 @@ worker_spec.loader.exec_module(worker)
 
 def new_node():
     node = Base(name="Web Rerender Test")
+    # Imported fixtures must freeze the same synthetic origin as their
+    # submission bridge, regardless of the workstation's saved Broker.
+    node._selected_broker_server_url = lambda: Broker.server_url
     # This execution fixture has no retained graph. Exact registered project
     # topology is exercised by HMB_Seedance_Project_Source_Routing_Regression.
     node._capture_imageasset_project_selection = lambda: {
@@ -488,7 +491,6 @@ def source_readiness_contracts():
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="hmb-web-generator-") as temp, \
          mock.patch.dict(os.environ, {"LOCALAPPDATA": temp}), \
-         mock.patch.object(target._broker_config, "load_broker_base_url", return_value=Broker.server_url), \
          mock.patch.object(Base, "_runtime_node_is_live", lambda self, **kw: not self._hmb_node_deleted), \
          mock.patch.object(Base, "_manual_agent_prompt_source", lambda self: agent), \
          mock.patch.object(Base, "_exact_incoming_source", lambda self, *a, **kw: None), \
