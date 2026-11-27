@@ -141,6 +141,10 @@ class DraftShotTests(unittest.TestCase):
         selected = mock.patch.object(t._broker_config, 'load_broker_base_url', return_value=ORIGIN)
         self.selected_broker = selected.start()
         self.addCleanup(selected.stop)
+        # This suite exercises changes to the selected Broker, including old
+        # Drafts that continue to use their original endpoint after a switch.
+        self.enterContext(mock.patch.object(Node, "_selected_broker_server_url",
+                                            t.HMBSeedanceGeneration._selected_broker_server_url))
 
     def tearDown(self):
         while base.TEMPORARIES:
@@ -297,6 +301,7 @@ class DraftShotTests(unittest.TestCase):
         node = Node(shot=False)
         node.parameter_values[t.DRAFT_SOURCE_PARAMETER] = deepcopy(base.SOURCE)
         self.selected_broker.return_value = 'https://synthetic-broker.invalid'
+        self.assertEqual(node._selected_broker_server_url(), self.selected_broker.return_value)
         self.assertEqual(node._validated_draft_final_source(), base.SOURCE)
         # Deserialized legacy identity is retained, but availability now waits
         # for an advisory GET against that original authenticated Broker.

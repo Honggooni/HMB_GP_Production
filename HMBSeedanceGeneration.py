@@ -2324,24 +2324,24 @@ def _broker_display_server_url() -> str:
 
 
 async def _negotiate_cloud_reference_proof(bridge: Any, origin: str, params: dict[str, Any]) -> bool:
-    """Enable v1 only for an explicitly upgraded Broker and its authenticated diagnostic route."""
+    """Discover the production Broker contract, or require v1 on an explicitly selected Broker."""
     target = os.environ.get("HMB_CLOUD_PREFLIGHT_V1_BROKER_URL", "").strip()
-    if not target:
+    required = bool(target) and _broker_validated_server_url(target) == origin
+    if not required and origin != _broker_config.DEFAULT_BROKER_BASE_URL:
         return False
     refs = [params.get("first_frame"), params.get("last_frame")]
     for field in ("reference_images", "reference_audio", "video_references", "video_reference_slots"):
         refs.extend(params.get(field) or ())
     if not any(HMBSeedanceGeneration._has_reference_value(value) for value in refs):
         return False
-    if _broker_validated_server_url(target) != origin:
-        return False
     if bridge is None or bridge.server_url != origin:
         raise _BrokerProtocolError("Cloud reference preflight does not match the selected Broker.")
-    # No URLs in this probe, hence neither Cloud downloads nor provider creates.
-    # Never fall back to an unsigned request if this designated server was rolled back.
+    # The authenticated probe has no URLs and cannot download media or create a render.
     response = await asyncio.to_thread(
         bridge._request_json, "POST", "/api/v1/preflight/griptape-cloud", payload={}, timeout=10.0,
     )
+    if not required and response == {"_http_status": 404, "error": "API를 찾을 수 없습니다"}:
+        return False
     if (not isinstance(response, dict) or response.get("_http_status") != 200
             or response.get("provider_submitted") is not False or response.get("files") != []):
         raise _BrokerProtocolError("The selected Broker could not confirm Cloud reference preflight v1.")
@@ -3485,6 +3485,20 @@ class _HMBAIBrokerBridge:
                     status_code=401,
                 ) from exc
             error_body: bytes | None = getattr(exc, "_hmb_interval_response_body", None)
+            if (exc.code == 404 and method == "POST" and path == "/api/v1/preflight/griptape-cloud"
+                    and self.server_url == _broker_config.DEFAULT_BROKER_BASE_URL and payload == {}
+                    and not submission):
+                _broker_require_exact_response_url(exc, request.full_url)
+                content_type = (exc.headers or {}).get("Content-Type", "").partition(";")[0].strip().lower()
+                if content_type == "application/json":
+                    with exc:
+                        error_body = exc.read(1025)
+                    try:
+                        missing = json.loads(error_body) if len(error_body) <= 1024 else None
+                    except (UnicodeError, ValueError):
+                        missing = None
+                    if missing == {"error": "API를 찾을 수 없습니다"}:
+                        return {"_http_status": 404, **missing}
             if submission and path == "/api/v1/generate/video" and exc.code in {422, 429}:
                 if error_body is None:
                     try:

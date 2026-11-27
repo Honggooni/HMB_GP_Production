@@ -9,6 +9,7 @@ import asyncio
 from contextlib import nullcontext
 from copy import deepcopy
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError, URLError
 
 ROOT = Path(__file__).resolve().parents[2]
 TESTS = Path(__file__).resolve().parent
@@ -56,6 +58,33 @@ class AdvancedTransportOptionsRegression(unittest.TestCase):
     def tearDown(self):
         while fixture.TEMPORARIES:
             fixture.TEMPORARIES.pop().cleanup()
+
+    def test_official_broker_negotiates_without_employee_configuration(self):
+        origin = t._broker_config.DEFAULT_BROKER_BASE_URL
+        ref = {"reference_audio": ["audio.wav"]}
+        opener = Mock()
+        bridge = t._HMBAIBrokerBridge(opener=opener, server_url=origin)
+        url = origin + "/api/v1/preflight/griptape-cloud"
+        legacy = {"error": "API를 찾을 수 없습니다"}
+        def error(code, body, content_type="application/json"):
+            return HTTPError(url, code, "test", {"Content-Type": content_type},
+                             io.BytesIO(json.dumps(body).encode()))
+        with patch.dict(os.environ, {"HMB_CLOUD_PREFLIGHT_V1_BROKER_URL": ""}), \
+                patch.object(bridge, "_load_access_token", return_value="test"), \
+                patch.object(bridge, "_clear_access_token"):
+            opener.open.side_effect = error(404, legacy)
+            self.assertFalse(asyncio.run(t._negotiate_cloud_reference_proof(bridge, origin, ref)))
+            req = opener.open.call_args.args[0]
+            self.assertEqual((req.full_url, req.method, req.data), (url, "POST", b"{}"))
+            self.assertEqual(req.get_header("Authorization"), "Bearer test")
+            for exc in (error(404, {"error": "proxy not found"}), error(404, legacy, "text/html"),
+                        error(401, {}), error(503, {}), URLError("timeout")):
+                opener.open.side_effect = exc
+                with self.assertRaises(t._BrokerError):
+                    asyncio.run(t._negotiate_cloud_reference_proof(bridge, origin, ref))
+            with patch.object(bridge, "_request_json", return_value={
+                    "_http_status": 200, "files": [], "provider_submitted": False}):
+                self.assertTrue(asyncio.run(t._negotiate_cloud_reference_proof(bridge, origin, ref)))
 
     def values(self, **changes):
         values = fixture.params()

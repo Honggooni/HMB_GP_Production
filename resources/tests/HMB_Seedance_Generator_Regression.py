@@ -309,6 +309,9 @@ class BrokerScriptedNode(RuntimeRegisteredSeedance):
     def _create_broker_bridge(self, *, server_url=None):
         return self.bridge
 
+    def _selected_broker_server_url(self):
+        return "https://broker.example.test"
+
     def _resolve_exact_shot_generation_inputs(
         self,
         params: dict,

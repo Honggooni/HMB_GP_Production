@@ -89,6 +89,8 @@ async def fake_save(self, final_task, generation_id, destination, *args, **kwarg
 
 
 class Broker:
+    server_url = target.AI_BROKER_INTERNAL_ORIGIN
+
     def __init__(self, checkpoints):
         self.calls, self.checkpoints = [], checkpoints
     def account_snapshot(self, **kwargs):
@@ -486,6 +488,7 @@ def source_readiness_contracts():
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="hmb-web-generator-") as temp, \
          mock.patch.dict(os.environ, {"LOCALAPPDATA": temp}), \
+         mock.patch.object(target._broker_config, "load_broker_base_url", return_value=Broker.server_url), \
          mock.patch.object(Base, "_runtime_node_is_live", lambda self, **kw: not self._hmb_node_deleted), \
          mock.patch.object(Base, "_manual_agent_prompt_source", lambda self: agent), \
          mock.patch.object(Base, "_exact_incoming_source", lambda self, *a, **kw: None), \

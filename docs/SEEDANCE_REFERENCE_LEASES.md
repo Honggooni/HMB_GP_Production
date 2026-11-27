@@ -9,14 +9,16 @@ bind its final Task ID once. A new Run or another Shot cannot consume that lease
 
 ## Broker preflight v1
 
-For the staged rollout, set `HMB_CLOUD_PREFLIGHT_V1_BROKER_URL` in the HMB engine
-environment to the exact upgraded Broker base URL, including its gateway prefix.
-Select that Broker in the client. Project and My Box reference submissions first
+The official production Broker is detected automatically. Set
+`HMB_CLOUD_PREFLIGHT_V1_BROKER_URL` to require v1 on an exact Broker base URL
+including its gateway prefix. Project and My Box reference submissions first
 send an authenticated empty POST to `/api/v1/preflight/griptape-cloud`. The
 client requires HTTP 200, an empty `files` array and `provider_submitted: false`.
-The empty probe has no media to download. Other Broker addresses use their
-existing reference format. An unavailable designated endpoint blocks the new
-reference submission before upload.
+The empty probe has no media to download. For automatic production detection,
+only the older Broker's exact JSON route-not-found response permits the legacy
+format. Network errors, authentication errors and unrecognized replies stop the
+submission before upload. An explicitly configured endpoint always requires v1.
+Other custom Broker addresses retain their existing format.
 
 On the designated Broker, the download URL carries
 `#hmb-v1=<sha256>:<bytes>`. Both values describe the uploaded representation.

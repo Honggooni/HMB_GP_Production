@@ -156,6 +156,9 @@ class Node(t.HMBSeedanceGeneration):
     def _get_broker_bridge(self, *, server_url=None):
         return self.bridge
 
+    def _selected_broker_server_url(self):
+        return ORIGIN
+
     def _store_draft_source(self, value):
         super()._store_draft_source(value)
         # Existing billing/authoring tests start after the synthetic GET watch
