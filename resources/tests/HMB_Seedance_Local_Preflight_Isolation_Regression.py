@@ -37,6 +37,38 @@ def node(error=None, *, existing=False):
     return value
 
 class LocalPreflightTests(unittest.TestCase):
+    def test_upstream_resolve_can_never_silently_change_the_clicked_image_order(self):
+        value = node()
+        active = ('channel', 'shot-3')
+        images = {active: ('project:one', 'import:saved', 'project:two')}
+        value._shot_identity = lambda: dict(channel_uuid=active[0], shot_uuid=active[1])
+        source = SimpleNamespace(_hmb_render_selected_image_uids=lambda channel, shot: images[(channel, shot)])
+        edge = SimpleNamespace(target_node=value, source_node=source, source_parameter=SimpleNamespace(name='SHOT_ASSET_OUT'))
+        dag = {}
+        graph = SimpleNamespace(incoming_index={value.name: {t.SHOT_ASSET_INPUT_PARAMETER: [1]}}, connections={1: edge})
+        flow = SimpleNamespace(flows=SimpleNamespace(connections=graph, global_dag_builder=SimpleNamespace(node_to_reference=dag)))
+        with (mock.patch.object(t.HMBSeedanceGeneration, 'workflow', flow, create=True),
+              mock.patch.object(t.SuccessFailureNode, 'validate_before_workflow_run', return_value=None, create=True)):
+            value.validate_before_workflow_run()
+            dag[value.name] = object()
+            images[active] = ('project:one', 'project:two', 'import:replacement')
+            # A concurrent validation while the node is queued cannot bless
+            # the replacement. Both the managed model and submission stay idle.
+            value.validate_before_workflow_run()
+            asyncio.run(value._aprocess_impl())
+            value._prepare_managed_agent_shot.assert_not_awaited()
+            value._process_generation.assert_not_awaited()
+            self.assertIn('이미지 목록', value._hmb_local_preflight_failure)
+
+            # Explicitly clicking again accepts the now-visible selection.
+            dag.clear()
+            value.validate_before_workflow_run()
+            dag[value.name] = object()
+            images[('channel', 'shot-4')] = ('import:other',)
+            asyncio.run(value._aprocess_impl())
+            value._prepare_managed_agent_shot.assert_awaited_once()
+            value._process_generation.assert_awaited_once()
+
     def tearDown(self):
         while fixture.base.TEMPORARIES:
             fixture.base.TEMPORARIES.pop().cleanup()
@@ -113,7 +145,7 @@ class LocalPreflightTests(unittest.TestCase):
         value._process_generation.assert_awaited_once()
 
     def test_preparing_media_waits_before_agent_and_submission(self):
-        for flag in ('hmb_picker_media_preparing', 'hmb_image_asset_selection_preparing'):
+        for flag in ('hmb_picker_media_preparing', 'hmb_image_asset_selection_preparing', 'hmb_sound_preparing'):
             with self.subTest(flag=flag):
                 value = node()
                 pending = ValueError('pending media')
@@ -136,6 +168,33 @@ class LocalPreflightTests(unittest.TestCase):
         value._assert_imageasset_project_selection = mock.Mock(side_effect=ValueError('binding changed'))
         with mock.patch.object(type(value), 'is_cancellation_requested', False, create=True):
             asyncio.run(value._aprocess_impl())
+        value._prepare_managed_agent_shot.assert_not_awaited()
+        value._process_generation.assert_not_awaited()
+
+    def test_accepted_edit_finishes_before_its_shot_locks_for_inference(self):
+        value = node()
+        scope = {"channel_uuid": "channel", "shot_uuid": "A"}
+        value._hmb_requested_edit_shot = scope
+        value._hmb_running_edit_shot = None
+        value._shot_identity = lambda: dict(scope)
+        events = []
+        async def finish_edit():
+            self.assertIsNone(value._hmb_running_edit_shot)
+            events.append("edit")
+        value._await_local_render_preflight = finish_edit
+        value._sync_render_edit_lock = lambda _: events.append(("lock",value._hmb_running_edit_shot))
+        value._prepare_managed_agent_shot = mock.AsyncMock(side_effect=lambda: events.append("agent"))
+        asyncio.run(value._aprocess_impl())
+        self.assertEqual(events, ["edit", ("lock", scope), "agent"])
+        value._process_generation.assert_awaited_once()
+
+        value._hmb_running_edit_shot = None
+        value._shot_identity = lambda: dict(scope, shot_uuid="B")
+        value._prepare_managed_agent_shot.reset_mock()
+        value._process_generation.reset_mock()
+        events.clear()
+        asyncio.run(value._aprocess_impl())
+        self.assertEqual(events, ["edit"])
         value._prepare_managed_agent_shot.assert_not_awaited()
         value._process_generation.assert_not_awaited()
 

@@ -94,6 +94,7 @@ async def exercise_workers(engine, out):
     from _hmb_native_agent.llm import runner as native_runner
     from pydantic_ai.models.test import TestModel
     from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
+    from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, DeleteConnectionRequest
     from griptape_nodes.retained_mode.events.node_events import (CreateNodeRequest, DeleteNodeRequest,
         DeserializeNodeFromCommandsRequest, SerializeNodeToCommandsRequest)
     from griptape_nodes.serialization.values import decode_value
@@ -236,6 +237,7 @@ async def exercise_workers(engine, out):
             assert inference.call_count == 1
         assert owner.get_parameter_value("prompt") == text
         assert owner.get_parameter_value("SHOT_PROMPT_IN") == text
+        assert active not in owner._hmb_completed_stage_revisions
         harness.record("manager_resolve_and_shot_run_read_current_upstream_order", paid_calls=0)
         targets = [SimpleNamespace(_hmb_node_deleted=False, is_cancellation_requested=False) for _ in range(2)]
         scope = dict(channel_uuid=harness.CHANNEL, shot_uuid=row["shot_uuid"])
@@ -244,11 +246,18 @@ async def exercise_workers(engine, out):
             assert inference.call_count == 0, "Unchanged upstream inputs repeated native inference"
             assert first["result"]["reused_from_run_id"] == second["result"]["reused_from_run_id"]
             assert first["result"]["run_id"] != second["result"]["run_id"]
+            assert active not in owner._hmb_completed_stage_revisions, "Cache reuse alone cannot acknowledge a Generator"
             assert owner._hmb_agent_shot_result(**scope, generator=targets[0], run_id=first["result"]["run_id"]) == first
             assert not owner._hmb_agent_shot_result(**scope, generator=targets[1], run_id=first["result"]["run_id"])
+            targets[1]._manual_agent_prompt_source = lambda: owner
+            targets[1]._hmb_shot_channel_subscription = lambda: subscription(row)
+            assert owner._hmb_ack_generator_shot_result(**scope, generator=targets[1], run_id=second["result"]["run_id"], record=second)
+            assert active in owner._hmb_completed_stage_revisions
             source.order.reverse()
             updated = await run(owner, source, row, targets[0])
             assert "reused_from_run_id" not in updated["result"] and inference.call_count == 1
+            assert active not in owner._hmb_completed_stage_revisions
+            assert not owner._hmb_ack_generator_shot_result(**scope, generator=targets[1], run_id=second["result"]["run_id"], record=second)
             for count, role in enumerate(("before", "after"), start=2):
                 manual = {role: {"manual_run_id": "1" * 32}}
                 with mock.patch("_hmb_analysis_delivery.analysis_render_input_preview", return_value=manual):
@@ -272,6 +281,15 @@ async def exercise_workers(engine, out):
             assert original_digest
             reads.reset_mock()
             assert owner._hmb_model_input_digest(doc, slot, {}, []) == original_digest
+            render_settings = {"sources": [{"generator": "G", "generate_audio": False}]}
+            audio_doc = dict(doc, generation_context=render_settings)
+            disabled_digest = owner._hmb_model_input_digest(audio_doc, slot, {}, [])
+            assert disabled_digest and disabled_digest != original_digest
+            render_settings["sources"][0].update(generate_audio=True)
+            enabled_digest = owner._hmb_model_input_digest(audio_doc, slot, {}, [])
+            assert enabled_digest and enabled_digest != disabled_digest
+            render_settings["sources"][0].update(resolution="1080p")
+            assert owner._hmb_model_input_digest(audio_doc, slot, {}, []) == enabled_digest
             assert not reads.called, "Unchanged inputs reread media contents"
             stat = media_path.stat()
             media_path.write_bytes(b"DEF")
@@ -560,7 +578,7 @@ async def exercise_workers(engine, out):
         # Hold the native inference call after it has read its exact Prompt.
         # A subsequent same-Shot authored text or To Agent edit must never
         # admit that old result, even when FINAL TEXT and media paths match.
-        for kind in ("prompt", "to_agent", "pre_submit"):
+        for kind in ("prompt", "to_agent", "pre_submit", "pre_submit_source_pending"):
             owner, source = new_manager("upstream-change-" + kind)
             row, other = harness.SHOTS[:2]
             scope = dict(channel_uuid=harness.CHANNEL, shot_uuid=row["shot_uuid"])
@@ -580,20 +598,38 @@ async def exercise_workers(engine, out):
                     source.directions[other["shot_uuid"]] = "changed sibling"
                 gates[row["shot_uuid"]].set()
                 outcome = (await asyncio.gather(task, return_exceptions=True))[0]
-                if kind == "pre_submit":
+                if kind.startswith("pre_submit"):
                     assert outcome is None, outcome
                     node._assert_agent_result_available(allow_resume=False)
-                    source.directions[row["shot_uuid"]] = "edit during upload"
-                    try:
-                        node._assert_agent_result_available(allow_resume=False)
-                    except seedance._AgentResultUnavailable as exc:
-                        outcome = exc
+                    if kind == "pre_submit_source_pending":
+                        # The picker changed this tick; the cached display is still identical.
+                        source._hmb_agent_execution_source_reads_current = lambda **_: False
+                    else:
+                        source.directions[row["shot_uuid"]] = "edit during upload"
+                    with mock.patch.object(owner, "_hmb_agent_shot_result", wraps=owner._hmb_agent_shot_result) as lookup:
+                        try:
+                            node._assert_agent_result_available(node._get_parameters()["prompt"], allow_resume=False)
+                        except seedance._AgentResultUnavailable as exc:
+                            outcome = exc
+                        lookup.assert_not_called()
                 assert isinstance(outcome, seedance._AgentResultUnavailable), (kind, outcome)
             harness.record("changed_same_shot_upstream_rejected_" + kind, broker_calls=0)
 
         owner, source = new_manager("five-wrapper-concurrent")
         nodes = [new_generator(owner, row, "concurrent-" + str(row["number"])) for row in harness.SHOTS]
+        def connect(target):
+            edge = dict(source_node_name=owner.name, source_parameter_name="output",
+                        target_node_name=target.name, target_parameter_name="prompt")
+            harness.send(engine, CreateConnectionRequest(**edge, initial_setup=True))
+            return edge
+        edges = [connect(node) for node in nodes]
         tasks = [asyncio.create_task(node._prepare_managed_agent_shot()) for node in nodes]
+        submission_events = []
+        def mock_dispatch(target, row, prompt):
+            key = owner._hmb_slot_key(harness.CHANNEL, row["shot_uuid"])
+            target._assert_agent_result_available(prompt, allow_resume=False)
+            assert key in owner._hmb_completed_stage_revisions
+            submission_events.append(row["shot_uuid"])
         for row in harness.SHOTS:
             await wait_enter(row["shot_uuid"])
         for row, node, task in reversed(list(zip(harness.SHOTS, nodes, tasks))):
@@ -602,6 +638,19 @@ async def exercise_workers(engine, out):
             node._assert_agent_result_available(allow_resume=False)
             assert node._hmb_agent_submission_prompt == "Exact native output " + row["shot_uuid"]
             assert node._get_parameters()["prompt"] == node._hmb_agent_submission_prompt
+            key = owner._hmb_slot_key(harness.CHANNEL, row["shot_uuid"])
+            assert key not in owner._hmb_completed_stage_revisions
+            with mock.patch.object(owner, "_hmb_ack_generator_shot_result", wraps=owner._hmb_ack_generator_shot_result) as ack:
+                try:
+                    mock_dispatch(node, row, "Stale Generator text")
+                except seedance._AgentResultUnavailable:
+                    pass
+                else:
+                    raise AssertionError("Mismatched text reached the broker boundary")
+                ack.assert_not_called()
+                assert row["shot_uuid"] not in submission_events and key not in owner._hmb_completed_stage_revisions
+                mock_dispatch(node, row, node._get_parameters()["prompt"])
+                ack.assert_called_once()
             for foreign in nodes:
                 if foreign is node:
                     continue
@@ -610,6 +659,34 @@ async def exercise_workers(engine, out):
                     generator=foreign)
         harness.record("five_actual_generator_wrappers_await_native_workers_reverse_order_keep_exact_submission",
             generators=5, mismatched_ticket_admissions=0, broker_calls=0)
+        assert submission_events == [row["shot_uuid"] for row in reversed(harness.SHOTS)]
+        harness.record("five_selected_shots_match_agent_receipt_before_mock_dispatch_wrong_text_zero",
+                       mock_dispatches=len(submission_events), broker_calls=0)
+
+        old = nodes[2]
+        row = harness.SHOTS[2]
+        scope = dict(channel_uuid=harness.CHANNEL, shot_uuid=row["shot_uuid"])
+        key = owner._hmb_slot_key(**scope)
+        old_record = old._hmb_managed_agent_request["record"]
+        remaining = set(owner._hmb_completed_stage_revisions) - {key}
+        assert len(remaining) == 4 and key in owner._hmb_completed_stage_revisions
+        harness.send(engine, DeleteConnectionRequest(**edges[2]))
+        assert set(owner._hmb_completed_stage_revisions) == remaining
+        harness.send(engine, DeleteNodeRequest(node_name=old.name))
+        # SDK deletion reconciles the flow. Republish the synthetic picker's
+        # five retained rows, which the normal ImageAsset node supplies live.
+        owner._hmb_shot_catalog_snapshot = harness.catalog(seedance)
+        replacement = new_generator(owner, row, "concurrent-3")
+        assert replacement is not old and replacement.name == old.name
+        connect(replacement)
+        assert not owner._hmb_ack_generator_shot_result(**scope, generator=old,
+            run_id=old_record["result"]["run_id"], record=old_record)
+        assert set(owner._hmb_completed_stage_revisions) == remaining
+        await replacement._prepare_managed_agent_shot()
+        assert set(owner._hmb_completed_stage_revisions) == remaining
+        mock_dispatch(replacement, row, replacement._get_parameters()["prompt"])
+        assert set(owner._hmb_completed_stage_revisions) == remaining | {key}
+        harness.record("sdk_removed_shot3_generator_same_name_replacement_waits_for_own_receipt_other_four_keep_checks", broker_calls=0)
 
         # Pause each analyzer to catch a stale read at the actual native model boundary.
         from functools import partial
@@ -633,13 +710,22 @@ async def exercise_workers(engine, out):
             if role == "before":
                 source.order = ["fresh-before-Prompt"]
 
+        analysis = {"edited_result": "fresh-after-Prompt"}
+        originals = []
+        delivery_receipt = object()
         def to_agent(prompt, **scope):
-            assert prompt is source and scope["destination"] == "agent" and completed == ["before", "after"]
-            return {"edited_result": "fresh-after-Prompt"}
+            assert prompt is source and scope["shot_uuid"] == row["shot_uuid"] and completed == ["before", "after"]
+            return analysis, originals, delivery_receipt
+        def received(prompt, **values):
+            assert prompt is source and values["agent"] is owner
+            assert values["channel_uuid"] == harness.CHANNEL and values["shot_uuid"] == row["shot_uuid"]
+            assert values["analysis"] is analysis and values["originals"] is originals
+            return values["receipt"] is delivery_receipt
 
         gates[row["shot_uuid"]].set()
         with mock.patch("_hmb_analysis_delivery.prepare_analysis_for_run", analyze), \
-                mock.patch("_hmb_analysis_delivery.analysis_delivery_context", to_agent), \
+                mock.patch("_hmb_analysis_delivery.read_analysis_for_agent", to_agent), \
+                mock.patch("_hmb_analysis_delivery.acknowledge_analysis_for_agent", side_effect=received) as acknowledged, \
                 mock.patch.object(native_module, "run_agent", wraps=model_run) as inference:
             task = asyncio.create_task(node._prepare_managed_agent_shot())
             for role in ("before", "after"):
@@ -648,11 +734,19 @@ async def exercise_workers(engine, out):
                 release[role].set()
             await asyncio.wait_for(task, 12)
             inference.assert_called_once()
+            acknowledged.assert_called_once()
             submitted = str(inference.call_args.args[1])
             assert "fresh-before-Prompt" in submitted and "fresh-after-Prompt" in submitted
             node._assert_agent_result_available(allow_resume=False)
             assert node._get_parameters()["prompt"] == "Exact native output " + row["shot_uuid"]
         harness.record("generator_waits_for_both_analyzers_then_uses_current_native_agent_result", paid_calls=0)
+        with mock.patch("_hmb_analysis_delivery.read_analysis_for_agent", to_agent), \
+                mock.patch("_hmb_analysis_delivery.acknowledge_analysis_for_agent", return_value=False), \
+                mock.patch.object(native_module, "run_agent", wraps=model_run) as inference:
+            outcome = (await asyncio.gather(run(owner, source, row, node), return_exceptions=True))[0]
+            assert isinstance(outcome, RuntimeError) and "analysis changed" in str(outcome)
+            inference.assert_not_called()
+        harness.record("changed_analysis_after_receiving_frozen_inputs_prevents_inference_and_cache_reuse", paid_calls=0)
 
         (out / "observations.json").write_text(json.dumps(dict(failures=failures,
             native_calls=len(native_calls), cases=harness.RESULTS), indent=2), encoding="utf-8")

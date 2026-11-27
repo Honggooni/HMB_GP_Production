@@ -147,6 +147,22 @@ assert merge_active_row["selected_video_slot"] == 1
 assert merge_result["preview_video_uid"] == "video-b"
 assert not any(item["selected"] for item in merge_result["videos"])
 
+# A pure selection edit publishes the changed Shot media without rebuilding
+# unrelated Sound/LUT/Generator routes. Any simultaneous topology edit wins.
+assert picker._picker_route_changes(merge_authoritative, merge_authoritative) == (False, False)
+assert picker._picker_route_changes(merge_authoritative, merge_result) == (False, True)
+for field, value in (("active_picker_shot_uuid", SHOT_UUIDS[1]), ("channel_uuid", CHANNEL_UUID)):
+    changed = copy.deepcopy(merge_result)
+    changed[field] = value
+    assert picker._picker_route_changes(merge_authoritative, changed) == (True, True), field
+for field, value in (("video_asset_uids", []), ("bound_shot_uuid", SHOT_UUIDS[1]), ("name", "Renamed shot")):
+    changed = copy.deepcopy(merge_result)
+    changed["picker_shots"][0][field] = value
+    assert picker._picker_route_changes(merge_authoritative, changed) == (True, True), field
+for rows in ([], [*merge_result["picker_shots"], picker._new_picker_workspace_row(2)]):
+    changed = {**merge_result, "picker_shots": rows}
+    assert picker._picker_route_changes(merge_authoritative, changed) == (True, True)
+
 
 catalog = build_catalog()
 state = picker._default_widget_state()
@@ -283,6 +299,18 @@ with tempfile.TemporaryDirectory(prefix="hmb-picker-output-cohesion-") as temp:
     node.parameter_values[picker.WIDGET_STATE_PARAMETER] = copy.deepcopy(
         conflicting
     )
+    from unittest.mock import patch
+    with patch.object(node, "_picker_state", side_effect=AssertionError("unchanged subscribed Shot reparsed all videos")):
+        projection = node._hmb_shot_channel_subscription()
+    assert projection["channel_uuid"] == conflicting["channel_uuid"]
+    assert projection["shot_uuid"] == conflicting["shot_uuid"]
+    replacement = copy.deepcopy(conflicting)
+    replacement.update(shot_name="New retained name", state_revision=conflicting["state_revision"] + 1)
+    node.parameter_values[picker.WIDGET_STATE_PARAMETER] = replacement
+    with patch.object(node, "_picker_state", return_value=replacement) as reader:
+        assert node._hmb_shot_channel_subscription()["shot_name"] == "New retained name"
+        reader.assert_called_once()
+    node.parameter_values[picker.WIDGET_STATE_PARAMETER] = copy.deepcopy(conflicting)
 
     original_notify = picker._notify_parameter_update
     original_propagate = picker._propagate_parameter_update_to_connections

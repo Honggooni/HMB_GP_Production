@@ -195,6 +195,40 @@ with patch.object(routing, "_same_flow_nodes", return_value=("flow-1", [render_a
     assert differing["common"]["generate_audio"] is False
     assert "draft_action" not in differing["common"]
 
+# Two Generators subscribe to this Shot but only A receives this Prompt via
+# the real Agent port. A mix-only or disabled track is not an audio reference.
+import _hmb_sound as sound
+for missing in ({}, {"sources": []}, {"sources": [{"generator": "other", "generate_audio": False}]}):
+    assert sound.generation_context_with_analysis_audio(missing, ["deleted"], [{"kind": "audio", "path": "old.wav"}]) is missing
+audio_scope = dict(channel_uuid="channel-1", shot_uuid="shot-1")
+audio_row = dict(**audio_scope, enabled=True, purpose="reference", path="selected.wav")
+sound_source = dict(channel_uuid="channel-1", tracks=[audio_row])
+agent = SimpleNamespace(_hmb_reference_analysis_owner=lambda **scope: source if scope == audio_scope else None)
+for observer, incoming in ((render_a, agent), (render_b, None)):
+    observer._hmb_sound_port_registered = True
+    observer._manual_agent_prompt_source = lambda incoming=incoming: incoming
+    observer._hmb_preflight_kind = lambda node: "HMBAgentLibrary" if node is agent else ""
+    observer._hmb_accepts_prompt_audio_for = generator.HMBSeedanceGeneration._hmb_accepts_prompt_audio_for.__get__(observer)
+def audio_context(rows, originals=()):
+    candidates = []
+    context = prompt.HMBPromptLibrary._hmb_agent_generation_context(source, machine,
+        sound_snapshot=dict(sound_source, tracks=rows), analysis_audio_generators=candidates)
+    return sound.generation_context_with_analysis_audio(context, candidates, originals)
+with patch.object(routing, "_same_flow_nodes", return_value=("flow-1", [render_a, render_b])):
+    audio_contexts = [audio_context([audio_row]), audio_context([dict(audio_row, purpose="both")]),
+                      audio_context([], [dict(kind="audio", path="analysis.mp3")])]
+    for result in audio_contexts:
+        assert [row["generate_audio"] for row in result["sources"]] == [True, False]
+        assert "generate_audio" in result["conflicting_fields"] and "generate_audio" not in result["common"]
+        assert result["settings_sha256"] == prompt._canonical_sha256({"sources": result["sources"]})
+    for rows in ([dict(audio_row, enabled=False)], [dict(audio_row, purpose="mix")],
+                 [dict(audio_row, shot_uuid="shot-2")], []):
+        assert audio_context(rows)["common"]["generate_audio"] is False
+    render_b.values["generate_audio"] = True
+    assert audio_context([audio_row])["common"]["generate_audio"] is True
+    render_b.values.pop("generate_audio")
+    assert "generate_audio" not in render_a.values
+
 # A compatible publisher is discovered by its callable typed settings
 # capability. Its participant kind and arbitrary model/task labels are not a
 # provider allowlist. Read-only observation retains registered identity even

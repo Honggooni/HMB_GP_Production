@@ -642,6 +642,67 @@ assert.equal(imageBindingUiMerge.images[0].owner, "Prompt target");
 assert.deepEqual(imageBindingUiMerge.images[0].color_picks, ["Sky Blue"]);
 assert.deepEqual(imageBindingUiMerge.images[0].binding_video_slots, [3]);
 
+// A debounced edit can arrive from a dashboard still showing the prior
+// physical media order. Preserve which clip the author actually selected.
+const oldMediaUi = widget.normalizeState({
+  picker: { order_managed: true },
+  image_asset: { order_managed: true },
+  images: ["image-a", "image-b", "image-c"].map(asset_source_uid => ({
+    asset_source_uid, present: true, color_picks: ["Mint", "Sky Blue"], binding_video_slots: [1, 2],
+    preview_marker: "look at @video1",
+  })),
+  videos: ["clip-a", "clip-b"].map(video_uid => ({
+    video_uid, present: true, keep_out: "Keep @image1 away from @video2",
+  })),
+  text: { SCENE_CONTEXT: "@image1 @image2 @image3  @video1 @video2", PRESERVED_TEXT: "@video1 @image1" },
+  analysis_generated_text: { SCENE_CONTEXT: "@image3  @video1 @video2", PRESERVED_TEXT: "@video1 @image1" },
+  ui: { resize_mode: "stacked_outer_1000", textarea_heights: { "video:1:keep_out": 200, "video:2:keep_out": 250 } },
+});
+const latestMedia = structuredClone(oldMediaUi);
+latestMedia.images = [latestMedia.images[2], latestMedia.images[0]];
+latestMedia.videos.reverse();
+const shifted = widget.hmbMergePromptRevisionAxes(latestMedia, oldMediaUi);
+assert.deepEqual(shifted.images[0].binding_video_slots, [2, 1]);
+assert.equal(shifted.images[0].marker_video, 2);
+assert.deepEqual(shifted.images[0].color_picks, ["Mint", "Sky Blue"]);
+assert.equal(shifted.images[0].preview_marker, "look at @video2");
+assert.equal(shifted.text.SCENE_CONTEXT, "@image2 [deselected image source #2] @image1  @video2 @video1");
+assert.equal(shifted.text.PRESERVED_TEXT, "@video1 @image1");
+assert.equal(shifted.analysis_generated_text.SCENE_CONTEXT, "@image1  @video2 @video1");
+assert.equal(shifted.analysis_generated_text.PRESERVED_TEXT, "@video1 @image1");
+assert.equal(shifted.videos[0].keep_out, "Keep @image2 away from @video1");
+assert.deepEqual(shifted.ui.textarea_heights, { "video:1:keep_out": 250, "video:2:keep_out": 200 });
+assert.deepEqual(widget.hmbMergePromptRevisionAxes(shifted, shifted), shifted);
+assert.deepEqual(oldMediaUi.images[0].binding_video_slots, [1, 2]);
+const remainingMedia = structuredClone(latestMedia);
+remainingMedia.videos = [latestMedia.videos[0]];
+const removed = widget.hmbMergePromptRevisionAxes(remainingMedia, oldMediaUi);
+assert.deepEqual(removed.images[0].binding_video_slots, [1, 1]);
+assert.deepEqual(removed.images[0].color_picks, ["", "Sky Blue"]);
+assert.equal(removed.images[0].preview_marker, "look at [deselected video source #1]");
+assert.equal(removed.ui.textarea_heights["video:1:keep_out"], 250);
+assert.equal(removed.ui.textarea_heights["video:2:keep_out"], undefined);
+const intentionalEdit = structuredClone(shifted);
+intentionalEdit.images[0].binding_video_slots = [1, 1];
+assert.deepEqual(widget.hmbMergePromptRevisionAxes(shifted, intentionalEdit).images[0].binding_video_slots, [1, 1]);
+const oldImported = { images: [{ present: true, asset_source_uid: "import:user-a", owner: "New owner" }], text: { SCENE_CONTEXT: "@image1" } };
+const projectAlias = id => ({
+  present: true, asset_source_uid: id, asset_library_id: id.slice(8), asset_source_kind: "project", asset_verified: true,
+  asset_import_source_uid: "import:user-a",
+});
+function importedReference(images) {
+  return widget.hmbMergePromptRevisionAxes({ images, image_asset: { order_managed: true } }, oldImported);
+}
+const promoted = importedReference([{ asset_source_uid: "project:other" }, projectAlias("project:a")]);
+assert.equal(promoted.text.SCENE_CONTEXT, "@image2");
+assert.equal(promoted.images[1].asset_import_source_uid, "import:user-a");
+assert.equal(promoted.images[1].owner, "New owner");
+assert.equal(importedReference([projectAlias("project:a"), oldImported.images[0]]).text.SCENE_CONTEXT, "@image2");
+assert.equal(importedReference([projectAlias("project:a"), projectAlias("project:b")]).text.SCENE_CONTEXT, "[deselected image source #1]");
+assert.equal(importedReference([{ ...projectAlias("project:a"), asset_verified: false }]).text.SCENE_CONTEXT, "[deselected image source #1]");
+assert.equal(importedReference([{ ...projectAlias("project:a"), asset_library_id: "b" }]).images[0].asset_import_source_uid, undefined);
+assert.equal(importedReference([{ ...projectAlias("project:a"), asset_import_source_uid: "import:"+"a".repeat(255) }]).images[0].asset_import_source_uid, undefined);
+
 const manualImageMerge = widget.hmbMergePromptRevisionAxes(
   {
     images: [{

@@ -17,6 +17,7 @@ import re
 import stat
 import subprocess
 import threading
+import wave
 from collections import OrderedDict
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -180,8 +181,24 @@ def media_signature(path: Path) -> str:
 
 
 def probe_sound(path: Path) -> dict[str, Any]:
-    from _hmb_video_tools import _find_ffmpeg, _find_ffprobe
     try:
+        if path.suffix.casefold() == ".wav":
+            try:
+                wav = wave.open(str(path), "rb")
+            except (wave.Error, EOFError):
+                # The installed FFmpeg supports additional WAV encodings.
+                pass
+            else:
+                with wav:
+                    frames, rate, channels = wav.getnframes(), wav.getframerate(), wav.getnchannels()
+                    if frames < 1 or rate < 1 or channels < 1:
+                        raise ValueError("Invalid PCM format")
+                    wav.setpos(frames - 1)
+                    if len(wav.readframes(1)) != channels * wav.getsampwidth():
+                        raise ValueError("Incomplete PCM data")
+                    return {"duration_seconds": _number(frames / rate, low=0.000001),
+                            "sample_rate": rate, "channels": channels}
+        from _hmb_video_tools import _find_ffmpeg, _find_ffprobe
         ffmpeg = _find_ffmpeg()
         try:
             probe = _find_ffprobe(ffmpeg)
@@ -593,4 +610,30 @@ def public_sound_directions(snapshot: Any, *, channel_uuid: str = "", shot_uuid:
         result.append({"audio": token, **{key: row[key] for key in ("name", "role", "purpose", "transcript", "target", "in_seconds", "out_seconds", "start_seconds", "gain_db", "loop", "lipsync")}})
         if "ranges" in row:
             result[-1]["ranges"] = [dict(range_number=i, **clip) for i, clip in enumerate(row["ranges"], 1)]
+    return result
+
+
+def generation_context_with_analysis_audio(settings, generators, originals):
+    """Complete the exact Generator flags using the originals already accepted by this Agent run."""
+    if not generators or not settings:
+        return settings
+    matches = [index for index, row in enumerate(settings.get("sources", ()))
+               if row.get("generator") in generators and row.get("generate_audio") is False]
+    if not matches or not any(row.get("kind") == "audio" and
+            Path(row.get("path") or "").suffix.casefold() in REFERENCE_EXTENSIONS for row in originals):
+        return settings
+    result = copy.deepcopy(settings)
+    sources = result["sources"]
+    for index in matches:
+        sources[index]["generate_audio"] = True
+    common = result["common"]
+    if all(row.get("generate_audio") is True for row in sources):
+        common["generate_audio"] = True
+        result["conflicting_fields"] = [key for key in result["conflicting_fields"] if key != "generate_audio"]
+    else:
+        common.pop("generate_audio", None)
+        if "generate_audio" not in result["conflicting_fields"]:
+            result["conflicting_fields"].append("generate_audio")
+    encoded = json.dumps({"sources": sources}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    result["settings_sha256"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     return result

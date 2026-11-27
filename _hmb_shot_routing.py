@@ -16,6 +16,7 @@ registry.
 
 from dataclasses import dataclass, replace
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 import asyncio
 import logging
 import json
@@ -2461,6 +2462,34 @@ def _subscription_requires_authority(subscription: ShotSubscription) -> bool:
     )
 
 
+def _image_catalog_route_shape(source, snapshot, participants, nodes):
+    """Identify an unchanged, registered graph for compact-catalog-only delivery."""
+    from _hmb_connection_management import is_detached, target_has_suspended_role
+    try:
+        edges = source.workflow.flows.connections.connections
+        if not isinstance(edges, dict) or any(is_detached(item) or target_has_suspended_role(item) for item in nodes):
+            return None
+        state = source._selected_routing_state()
+        members = tuple((id(item), item.name) for item in nodes)
+        wires = tuple((key, id(edge), id(edge.source_node), edge.source_parameter.name,
+                       id(edge.target_node), edge.target_parameter.name) for key, edge in edges.items())
+        bindings = tuple((id(part.node), part.kind, part.enabled, part.channel_uuid, part.shot_uuid,
+                          part.shot_number, part.shot_name) for part in participants)
+        slots = tuple((slot["shot_uuid"], slot["number"], slot["name"]) for slot in snapshot["shots"])
+        # A completed result changes LUT eligibility even if the Shot selector
+        # did not move. Consult the same source contract as full reconciliation.
+        lut = any(part.kind == KIND_COLOR_LUT for part in participants)
+        generator_state = tuple((_seedance_execution_mode(part.node),
+            part.node._hmb_generated_video_source_snapshot() if lut else None)
+            for part in participants if part.kind == KIND_SEEDANCE)
+        return (members, wires, bindings, slots, snapshot["publisher_instance_uuid"], snapshot["channel_uuid"],
+                state.get("project_uid"), state.get("project_root"), state.get("catalog_root"),
+                copy.deepcopy(state.get("shot_hierarchy")), generator_state)
+    except Exception:
+        # Runtime doubles and older engines continue through the normal full pass.
+        return None
+
+
 @hmb_binding_mutation
 def reconcile_shot_routing(
     node: Any,
@@ -2765,6 +2794,8 @@ def reconcile_shot_routing(
             ]
             pre_catalog_values = tuple(values)
             pre_catalog_by_name = dict(by_name)
+            media_publisher = unique_image_sources[0].node if len(image_sources) == len(unique_image_sources) == 1 else None
+            media_catalog = None
             # A Prompt may synchronously resolve both exact publishers from
             # inside its compact-catalog callback.  Deliver the same ImageAsset
             # generation to VideoPicker first so a Shot add/rename/delete can
@@ -2799,6 +2830,8 @@ def reconcile_shot_routing(
                     != source.channel_uuid
                 ):
                     continue
+                if source.node is media_publisher:
+                    media_catalog = snapshot
                 for recipient in catalog_recipients:
                     if recipient.node is source.node:
                         continue
@@ -3072,6 +3105,23 @@ def reconcile_shot_routing(
             ]
             by_name = {item.node_name: item for item in values}
             post_catalog_by_name = {item.node_name: item for item in values}
+            # All recipients have received the new generation through their usual
+            # catalog callbacks. A media revision alone cannot change the wires
+            # of an already verified graph. Compare physical identities again
+            # after callbacks so a repaired or replaced binding takes a full pass.
+            media_route = None
+            if media_catalog is not None and not failures and not changed and not catalog_rejected_node_ids:
+                media_route = _image_catalog_route_shape(media_publisher, media_catalog, values, nodes)
+                previous = getattr(media_publisher, "_hmb_verified_media_catalog_route", None)
+                generation = media_catalog.get("generation")
+                if (node is media_publisher and not _allow_unready_cleanup and media_route is not None
+                        and isinstance(previous, tuple) and isinstance(generation, int)
+                        and generation > previous[0] and media_route == previous[1]):
+                    media_publisher._hmb_verified_media_catalog_route = (generation, media_route)
+                    return _ReconcileResult({"ok": True, "code": "ready", "changed": 0, "failures": ()},
+                                            covered_node_ids=(id(value) for value in nodes))
+            if media_publisher is not None:
+                media_publisher._hmb_verified_media_catalog_route = None
             for rejected in tuple(values):
                 if id(rejected.node) not in catalog_rejected_node_ids:
                     continue
@@ -4042,6 +4092,8 @@ def reconcile_shot_routing(
             # existing generation routes when its own input is unavailable.
             changed += _reconcile_color_lut_routes(routable_values, by_name, nodes)
 
+            if media_route is not None and not changed and not failures and not _allow_unready_cleanup:
+                media_publisher._hmb_verified_media_catalog_route = (media_catalog["generation"], media_route)
             return _ReconcileResult(
                 {
                     "ok": not failures,
@@ -4103,32 +4155,171 @@ def _notify_source_shot_status(node):
         _LOGGER.debug("Could not publish source Shot status", exc_info=True)
 
 
-def record_source_shot_check(node, state, channel, shot):
-    key = node._hmb_source_shot_key(state, channel, shot)
-    scope = (channel, shot)
+_PROMPT_SOURCE_READS = ContextVar("hmb_prompt_source_reads", default=None)
+
+
+class _ShotReceiverLink:
+    def __init__(self, receiver, forgotten):
+        self.active = True
+        self.receipts = {}
+        self.receiver = weakref.ref(receiver, forgotten)
+        self.analysis_observers = weakref.WeakSet()
+
+
+def shot_receiver_link(source, receiver):
+    """Identity for one continuous source-to-receiver connection."""
+    identity = id(receiver)
     with _SHOT_EDIT_GUARD:
-        receipts = getattr(node, "_hmb_source_checks", {})
-        if key is None or receipts.get(scope) == key:
+        # SDK nodes hash their editable name. Key the physical instance so a
+        # rename cannot strand a live receipt or hide it on disconnect.
+        links = vars(source).setdefault("_hmb_shot_receiver_links", {})
+        link = links.get(identity)
+        if link is None:
+            owner = weakref.ref(source)
+            def forgotten(ref):
+                node = owner()
+                if node is not None:
+                    _release_receiver_link(node, identity, ref)
+            links[identity] = link = _ShotReceiverLink(receiver, forgotten)
+        return link
+
+
+def release_source_receiver(source, receiver):
+    _release_receiver_link(source, id(receiver))
+
+
+def _release_receiver_link(source, identity, ref=None):
+    with _SHOT_EDIT_GUARD:
+        links = getattr(source, "_hmb_shot_receiver_links", {})
+        link = links.get(identity)
+        if link is None or (ref is not None and link.receiver is not ref):
             return
-        receipts = {owner: token for owner, token in receipts.items()
-                    if owner[0] == channel and owner != scope}
-        node._hmb_source_checks = {**dict(list(receipts.items())[-(MAX_SHOTS - 1):]), scope: key}
-    _notify_source_shot_status(node)
+        links.pop(identity)
+        link.active = False
+        checked = getattr(source, "_hmb_source_checks", {})
+        remove = {scope for scope, key in link.receipts.items() if checked.get(scope) == key
+                  and not any(other.receipts.get(scope) == key for other in links.values())}
+        if remove:
+            source._hmb_source_checks = {scope: key for scope, key in checked.items() if scope not in remove}
+    if remove:
+        _notify_source_shot_status(source)
+
+
+@contextmanager
+def collect_prompt_source_reads(receiver):
+    """Keep exact input reads private to one synchronous Prompt compilation."""
+    reads = {}
+    token = _PROMPT_SOURCE_READS.set((receiver, reads))
+    try:
+        yield reads
+    finally:
+        _PROMPT_SOURCE_READS.reset(token)
+
+
+def observe_prompt_source_read(node, state, channel, shot):
+    collecting = _PROMPT_SOURCE_READS.get()
+    if collecting is None:
+        return
+    receiver, reads = collecting
+    scope = channel, shot, id(node)
+    if scope not in reads:
+        key = node._hmb_source_shot_key(state, channel, shot)
+        if key is not None:
+            reads[scope] = node, key, shot_receiver_link(node, receiver)
+
+
+def current_prompt_sources(reads, channel, shot):
+    for node, key, link in reads:
+        receiver = link.receiver()
+        if receiver is None or not link.active or node._hmb_current_source_shot_key(channel, shot) != key:
+            return False
+        ports = getattr(receiver, "_hmb_connected_source_nodes", None)
+        if isinstance(ports, dict) and not any(source is node for source in ports.values()):
+            return False
+    return True
+
+
+def accept_prompt_source_reads(reads, channel, shot):
+    """Publish only the selected Shot's checks after a complete, current Prompt read."""
+    scoped = tuple(row for (ch, sh, _), row in reads.items() if (ch, sh) == (channel, shot))
+    if not current_prompt_sources(scoped, channel, shot):
+        return None
+    return scoped if _publish_source_shot_checks(scoped, channel, shot) else None
+
+
+def record_source_shot_check(node, state, channel, shot, *, receiver, link):
+    """Finish Look retains its independent completed-read contract."""
+    key = node._hmb_source_shot_key(state, channel, shot)
+    if key is not None and getattr(node, "_hmb_shot_receiver_links", {}).get(id(receiver)) is link:
+        return _publish_source_shot_checks(((node, key, link),), channel, shot)
+    return False
+
+
+def _publish_source_shot_checks(scoped, channel, shot):
+    changed = []
+    scope = channel, shot
+    with _SHOT_EDIT_GUARD:
+        if any(not link.active for _, _, link in scoped):
+            return False
+        for node, key, link in scoped:
+            kept = [(k, v) for k, v in link.receipts.items() if k[0] == channel and k != scope]
+            link.receipts = {**dict(kept[-(MAX_SHOTS - 1):]), scope: key}
+            receipts = getattr(node, "_hmb_source_checks", {})
+            if receipts.get(scope) != key:
+                receipts = {owner: token for owner, token in receipts.items() if owner[0] == channel and owner != scope}
+                node._hmb_source_checks = {**dict(list(receipts.items())[-(MAX_SHOTS - 1):]), scope: key}
+                changed.append(node)
+    for node in changed:
+        _notify_source_shot_status(node)
+    return True
+
+
+def _revoke_source_receipts(node, outdated):
+    """Notify the Prompt instances that actually accepted the superseded inputs."""
+    if not outdated:
+        return
+    deliveries = []
+    with _SHOT_EDIT_GUARD:
+        checked = getattr(node, "_hmb_source_checks", {})
+        revoked = {scope: token for scope, token in outdated.items() if checked.get(scope) == token}
+        if not revoked:
+            return
+        node._hmb_source_checks = {scope: token for scope, token in checked.items() if scope not in revoked}
+        for link in list(getattr(node, "_hmb_shot_receiver_links", {}).values()):
+            previous = {scope: link.receipts.pop(scope) for scope in revoked if scope in link.receipts}
+            recipient = link.receiver()
+            if recipient is not None and previous and link.active:
+                deliveries.append((recipient, previous))
+    for recipient, previous in deliveries:
+        revoke = getattr(recipient, "_hmb_source_receipts_changed", None)
+        if callable(revoke):
+            revoke(node, previous)
 
 
 def clear_source_shot_check(node, channel, shot):
-    with _SHOT_EDIT_GUARD:
-        receipts = getattr(node, "_hmb_source_checks", {})
-        if (channel, shot) not in receipts:
-            return
-        node._hmb_source_checks = {owner: token for owner, token in receipts.items() if owner != (channel, shot)}
-    _notify_source_shot_status(node)
-
-
-def source_shot_status_fields(node, state):
+    scope = channel, shot
     receipts = getattr(node, "_hmb_source_checks", {})
-    checked = [{"channel_uuid": channel, "shot_uuid": shot} for (channel, shot), token in receipts.items()
-               if node._hmb_source_shot_key(state, channel, shot) == token]
+    if scope in receipts:
+        _revoke_source_receipts(node, {scope: receipts[scope]})
+        _notify_source_shot_status(node)
+
+
+def invalidate_changed_source_receipts(node, state):
+    receipts = getattr(node, "_hmb_source_checks", {})
+    _revoke_source_receipts(node, {scope: token for scope, token in receipts.items()
+                                   if node._hmb_source_shot_key(state, *scope) != token})
+
+
+def source_shot_status_fields(node, state, *, committed=False):
+    receipts = getattr(node, "_hmb_source_checks", {})
+    checked = []
+    outdated = {}
+    for (channel, shot), token in receipts.items():
+        if node._hmb_source_shot_key(state, channel, shot) == token:
+            checked.append({"channel_uuid": channel, "shot_uuid": shot})
+        elif committed:
+            outdated[(channel, shot)] = token
+    _revoke_source_receipts(node, outdated)
     return {"shot_edit_locks": shot_edit_locks(node), "verified_shots": checked}
 
 

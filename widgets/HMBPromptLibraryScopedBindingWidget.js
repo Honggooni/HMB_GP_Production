@@ -2161,6 +2161,12 @@ function normalizeImage(item, slot) {
   out.asset_library_id = clean(item.asset_library_id);
   out.asset_source_uid = clean(item.asset_source_uid || item.source_uid);
   if (out.asset_source_uid) {
+    const importedUid = clean(item.asset_import_source_uid);
+    if (importedUid.startsWith("import:") && importedUid.length <= MAX_IDENTIFIER_CHARS
+      && item.asset_verified === true && item.asset_source_kind === "project"
+      && out.asset_library_id && out.asset_source_uid === `project:${out.asset_library_id}`) {
+      out.asset_import_source_uid = importedUid;
+    }
     const lastPath = clean(item.asset_last_source_path);
     if (lastPath) out.asset_last_source_path = lastPath.slice(0, 4096);
     if (item.asset_source_unavailable === true) out.asset_source_unavailable = true;
@@ -4739,6 +4745,60 @@ function hmbPromptVideoRevisionIdentity(item, index) {
   return `video-slot:${Math.max(1, Number(item?.slot) || index + 1)}`;
 }
 
+function hmbMovedSourceSlots(previous, current, uidOf, importSlots) {
+  const currentSlots = new Map();
+  current.forEach((row, i) => {
+    const uid = uidOf(row);
+    if (uid) currentSlots.set(uid, i + 1);
+  });
+  if (importSlots) current.forEach((row, i) => {
+    const alias = row.asset_import_source_uid;
+    if (alias && !currentSlots.has(alias)) importSlots.set(alias, importSlots.has(alias) ? 0 : i + 1);
+  });
+  const moved = new Map();
+  previous.forEach((row, i) => {
+    const uid = uidOf(row);
+    if (!uid) return;
+    const next = currentSlots.get(uid) || importSlots?.get(uid) || 0;
+    if (next !== i + 1) moved.set(i + 1, next);
+  });
+  return moved;
+}
+
+function hmbProjectAuthoredSourceSlots(ui, source, importSlots) {
+  if (source.image_asset.order_managed) {
+    const imageSlots = hmbMovedSourceSlots(ui.images, source.images,
+      row => clean(row.asset_source_uid || row.source_uid || row.asset_library_id),
+      importSlots);
+    remapSourceReferencesInTextFields(ui, imageSlots, "image");
+  }
+  if (!source.picker.order_managed) return;
+  const slots = hmbMovedSourceSlots(ui.videos, source.videos, row => clean(row.video_uid || row.source_uid));
+  if (!slots.size) return;
+  remapSourceReferencesInTextFields(ui, slots, "video");
+  // Only these authored fields cross the revision boundary. Measured frame
+  // bindings and automatic Picker metadata already belong to the source.
+  ui.images.forEach(image => {
+    image.binding_video_slots = image.binding_video_slots.map((slot, index) => {
+      if (!slots.has(slot)) return slot;
+      const next = slots.get(slot);
+      if (next) return next;
+      image.color_picks[index] = "";
+      return 1;
+    });
+    image.marker_video = image.binding_video_slots[0] || 1;
+    image.preview_marker = remapSourceReferences(image.preview_marker, slots, "video");
+  });
+  const heights = {};
+  for (const [key, height] of Object.entries(ui.ui.textarea_heights)) {
+    const match = /^video:(\d+):keep_out$/.exec(key);
+    const oldSlot = match && Number(match[1]);
+    if (!slots.has(oldSlot)) heights[key] = height;
+    else if (slots.get(oldSlot)) heights[`video:${slots.get(oldSlot)}:keep_out`] = height;
+  }
+  ui.ui.textarea_heights = heights;
+}
+
 function hmbPromptCloneRangeField(value) {
   if (value === undefined) return undefined;
   try { return JSON.parse(JSON.stringify(value)); } catch (_error) { return value; }
@@ -4824,6 +4884,10 @@ export function hmbMergePromptRevisionAxes(sourceState, uiState) {
   // valid concurrent UI Shot switches were materialized above before merging.
   const authoredUi = source.multi_shot_enabled && ui.multi_shot_enabled
     && hmbPromptDocumentKey(source.shot) !== hmbPromptDocumentKey(ui.shot) ? source : ui;
+  const importSlots = new Map();
+  if (authoredUi !== source && hmbPromptDocumentKey(authoredUi.shot) === hmbPromptDocumentKey(source.shot)) {
+    hmbProjectAuthoredSourceSlots(authoredUi, source, importSlots);
+  }
   hmbReconcilePromptSourceIdentities(authoredUi, source);
   const uiImages = new Map();
   authoredUi.images.forEach((item, index) => {
@@ -4831,7 +4895,10 @@ export function hmbMergePromptRevisionAxes(sourceState, uiState) {
     if (!uiImages.has(identity)) uiImages.set(identity, item);
   });
   source.images.forEach((item, index) => {
-    const uiItem = uiImages.get(hmbPromptFrameRangeIdentity(item, index));
+    let uiItem = uiImages.get(hmbPromptFrameRangeIdentity(item, index));
+    if (!uiItem && importSlots.get(item.asset_import_source_uid) === index + 1) {
+      uiItem = uiImages.get(`image-uid:${item.asset_import_source_uid}`);
+    }
     if (!uiItem) return;
     hmbPromptCopyUiFields(item, uiItem, HMB_PROMPT_IMAGE_UI_FIELDS);
     hmbPromptCopyUiFields(item, uiItem, ["image_sub_type", "custom_source_type"]);
@@ -5850,30 +5917,32 @@ function renderImageActions(item, state, index, imageCount) {
   return `<div class="source-actions image-actions"><button class="clear-source" ${rowManaged ? "disabled" : ""} title="${escapeHtml(deleteLabel)}" aria-label="${escapeHtml(deleteLabel)}">X</button><span class="image-order-controls"><button class="move-image-up" ${canMoveUp ? "" : "disabled"} title="${escapeHtml(orderTitle)}" aria-label="${escapeHtml(orderTitle)}">▲</button><button class="move-image-down" ${canMoveDown ? "" : "disabled"} title="${escapeHtml(downLabel)}" aria-label="${escapeHtml(downLabel)}">▼</button></span><button class="remove-color-pick" ${canRemove ? "" : "disabled"} title="${escapeHtml(uiText(state, "remove_color_pick", "Remove Color Pick"))}" aria-label="${escapeHtml(uiText(state, "remove_color_pick", "Remove Color Pick"))}">-</button><button class="add-color-pick" ${canAdd ? "" : "disabled"} title="${escapeHtml(uiText(state, "add_color_pick", "Add Color Pick"))}" aria-label="${escapeHtml(uiText(state, "add_color_pick", "Add Color Pick"))}">+</button></div>`;
 }
 
-function remapImageSourceReferences(value, slotMap) {
+function remapSourceReferences(value, slotMap, kind) {
   const source = String(value == null ? "" : value);
   if (!source || !(slotMap instanceof Map) || !slotMap.size) return source;
-  return source.replace(/@image(\d+)(?!\d)/gi, (token, rawSlot) => {
+  const references = kind === "video" ? /@video(\d+)(?!\d)/gi : /@image(\d+)(?!\d)/gi;
+  return source.replace(references, (token, rawSlot) => {
     const slot = Number(rawSlot);
     if (!slotMap.has(slot)) return token;
     const nextSlot = Number(slotMap.get(slot) || 0);
     // Preserve a removed reference without allowing it to bind to a promoted
     // row that later inherits the old slot number.
-    return nextSlot > 0 ? `@image${nextSlot}` : `[deselected image source #${slot}]`;
+    return nextSlot > 0 ? `@${kind}${nextSlot}` : `[deselected ${kind} source #${slot}]`;
   });
 }
 
-function remapImageSourceReferencesInState(state, slotMap) {
+function remapSourceReferencesInTextFields(state, slotMap, kind) {
   if (!state || !(slotMap instanceof Map) || !slotMap.size) return;
-  if (state.text && typeof state.text === "object") {
-    Object.keys(state.text).forEach((key) => {
+  for (const text of [state.text, state.analysis_generated_text]) {
+    if (!text || typeof text !== "object") continue;
+    Object.keys(text).forEach((key) => {
       if (key === "PRESERVED_TEXT") return;
-      state.text[key] = remapImageSourceReferences(state.text[key], slotMap);
+      text[key] = remapSourceReferences(text[key], slotMap, kind);
     });
   }
   (Array.isArray(state.videos) ? state.videos : []).forEach((item) => {
     if (!item || typeof item !== "object") return;
-    item.keep_out = remapImageSourceReferences(item.keep_out, slotMap);
+    item.keep_out = remapSourceReferences(item.keep_out, slotMap, kind);
   });
 }
 
@@ -5896,10 +5965,10 @@ export function swapImageRowsWithoutReset(state, firstIndex, secondIndex) {
   state.images[firstIndex] = state.images[secondIndex];
   state.images[secondIndex] = temporary;
   renumberImageRows(state.images);
-  remapImageSourceReferencesInState(state, new Map([
+  remapSourceReferencesInTextFields(state, new Map([
     [firstSlot, secondSlot],
     [secondSlot, firstSlot],
-  ]));
+  ]), "image");
   return true;
 }
 
@@ -5951,7 +6020,7 @@ export function removeImageRowAndPromote(state, sourceIndex) {
   ) {
     state.picker.matched_images = Math.max(0, Number(state.picker.matched_images || 0) - 1);
   }
-  remapImageSourceReferencesInState(state, slotMap);
+  remapSourceReferencesInTextFields(state, slotMap, "image");
   return { changed: true, removedSlot, remaining: state.images.length };
 }
 

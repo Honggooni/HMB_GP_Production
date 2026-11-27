@@ -11036,6 +11036,26 @@ class HMBImageAssetLibrary(DataNode):
             self._hmb_selected_routing_view = (raw, _json_text(state))
         return state
 
+    def _hmb_current_source_shot_key(self, channel, shot):
+        return self._hmb_source_shot_key(self._selected_routing_state(), channel, shot)
+
+    def _hmb_render_selected_image_uids(self, channel, shot):
+        """Read the Shot's authored order before resolving upstream LoadImage nodes."""
+        routing = self._selected_routing_state()["shot_routing"]
+        if routing["channel_uuid"] == channel:
+            for row in routing["shots"]:
+                if row["shot_uuid"] == shot:
+                    return tuple(row["selected_source_uids"])
+        return None
+
+    def _hmb_prompt_view_epoch(self, channel, shot):
+        routing = self._selected_routing_state()["shot_routing"]
+        if routing["channel_uuid"] == channel:
+            for row in routing["shots"]:
+                if row["shot_uuid"] == shot:
+                    return row["revision"], getattr(self, "_hmb_import_revision", 0)
+        return None
+
     @staticmethod
     def _hmb_source_shot_key(state, channel, shot):
         routing = state.get("shot_routing") or {}
@@ -11078,8 +11098,8 @@ class HMBImageAssetLibrary(DataNode):
             if state:
                 self._publish_source_status_if_changed(state)
 
-    def _publish_source_status_if_changed(self, state):
-        view = _hmb_shot_routing.source_shot_status_fields(self, state)
+    def _publish_source_status_if_changed(self, state, *, committed=False):
+        view = _hmb_shot_routing.source_shot_status_fields(self, state, committed=committed)
         previous = getattr(self, "_hmb_last_shot_status", None)
         if view == previous or (previous is None and not any(view.values())):
             return
@@ -11403,7 +11423,7 @@ class HMBImageAssetLibrary(DataNode):
         except (_hmb_shot_routing.ShotImageUnavailable, ValueError):
             _hmb_shot_routing.clear_source_shot_check(self, channel_uuid, shot_uuid)
             raise
-        _hmb_shot_routing.record_source_shot_check(self, state, channel_uuid, shot_uuid)
+        _hmb_shot_routing.observe_prompt_source_read(self, state, channel_uuid, shot_uuid)
         return result
 
     def _read_image_shot(self, state, channel_uuid, shot_uuid, cached_only, include_link_notices):
@@ -12216,7 +12236,7 @@ class HMBImageAssetLibrary(DataNode):
         self._hmb_catalog_search_selected = tuple(
             asset for asset in normalized_state.get("assets", []) if asset.get("selected"))
         if getattr(self, "_hmb_source_checks", None) or getattr(self, "_hmb_last_shot_status", None):
-            self._publish_source_status_if_changed(normalized_state)
+            self._publish_source_status_if_changed(normalized_state, committed=True)
         self._hmb_last_accepted_widget_state = serialized or _json_text(normalized_state)
         self._hmb_durable_shot_generation = (
             self._hmb_last_accepted_widget_state,

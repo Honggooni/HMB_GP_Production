@@ -9,6 +9,7 @@ import socket
 import sys
 import tempfile
 from unittest.mock import patch
+from hmb_host_workflow import scoped_fixture_workflow
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -45,7 +46,7 @@ def main():
                 # the managed Sound edge during the disconnect assertion.
                 guard.enter_context(patch.object(prompt.HMBPromptLibrary, "_reconcile_shared_shot_edges", return_value=None))
                 guard.enter_context(patch.object(sound_node.HMBSoundLibrary, "_schedule_reconcile", return_value=None))
-                with engine_scope() as engine:
+                with engine_scope() as engine, scoped_fixture_workflow(engine, "Isolated Sound Prompt"):
                     schema = LibrarySchema.model_validate_json((ROOT / "griptape-nodes-library.json").read_text("utf-8-sig"))
                     library = LibraryRegistry.generate_new_library(schema)
                     classes = {cls.__name__: cls for cls in (prompt.HMBPromptLibrary, sound_node.HMBSoundLibrary)}

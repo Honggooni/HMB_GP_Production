@@ -102,6 +102,7 @@ class AnalysisNodeRegression(unittest.TestCase):
         node._lock = threading.RLock()
         node._active = ("", "")
         node._slots = {}
+        node._hmb_analysis_receipts = {}
         node._revision = 0
         node._job = None
         node._model_choices = {}
@@ -152,6 +153,31 @@ class AnalysisNodeRegression(unittest.TestCase):
         with self.assertRaises(analysis._AnalysisStateError):
             other._run_command({"action": "set_role", "role": "after", "revision": other._revision})
         self.assertEqual(other._role, "before")
+
+    def test_after_analysis_check_requires_agent_to_receive_current_context_and_originals(self):
+        self.assertTrue(self.pick())
+        self.set_fixture_result()
+        self.command("delivery", send_agent=True, categories=["camera"], results_only=False)
+        scope = {"channel_uuid": "channel", "shot_uuid": "shot-1"}
+        agent = mock.Mock()
+        agent._hmb_manager_prompt_owner.return_value = self.prompt
+        self.prompt._hmb_connected_shot_agents = lambda: [agent]
+        context, originals, receipt = delivery.read_analysis_for_agent(self.prompt, **scope)
+        self.assertTrue(context)
+        self.assertIsNotNone(receipt)
+        request = dict(scope, agent=agent, analysis=context, originals=originals, receipt=receipt)
+        self.assertFalse(self.node._hmb_analysis_shot_received("after","channel","shot-1"))
+        for wrong in ({"agent": object()}, {"shot_uuid": "shot-2"}, {"originals": []}, {"analysis": {}}):
+            self.assertFalse(delivery.acknowledge_analysis_for_agent(self.prompt, **{**request, **wrong}))
+        self.assertTrue(delivery.acknowledge_analysis_for_agent(self.prompt, **request))
+        before = self.node._publish.call_count
+        self.assertTrue(delivery.acknowledge_analysis_for_agent(self.prompt, **request))
+        self.assertEqual(self.node._publish.call_count, before)
+        self.assertTrue(self.node._hmb_analysis_shot_received("after","channel","shot-1"))
+        self.assertFalse(self.node._hmb_analysis_shot_received("after","channel","shot-2"))
+        self.node._slots[analysis._scope("channel", "shot-1")]["guidance"] = "Changed"
+        self.assertFalse(delivery.acknowledge_analysis_for_agent(self.prompt, **request))
+        self.assertFalse(self.node._hmb_analysis_shot_received("after","channel","shot-1"))
 
     def test_page_switch_uses_prepared_exact_shot_without_original_io(self):
         self.assertTrue(self.pick())
@@ -230,6 +256,13 @@ class AnalysisNodeRegression(unittest.TestCase):
         self.assertIn("Fixture effect", fields["VIDEO_VFX"])
         self.assertEqual(fields["PRESERVED_TEXT"], "")
         self.assertTrue(before._slots[key]["prompt_applied"])
+        self.assertFalse(before._hmb_analysis_shot_received("before", channel, shot))
+        self.prompt._hmb_analysis_fields_sha256 = mock.Mock(
+            return_value=delivery.analysis_payload_sha256({k: v for k, v in fields.items() if v}))
+        self.assertTrue(before._apply_prompt_fields(self.prompt, channel, shot))
+        self.assertTrue(before._hmb_analysis_shot_received("before", channel, shot))
+        self.prompt._hmb_analysis_fields_sha256.return_value = "changed"
+        self.assertFalse(before._hmb_analysis_shot_received("before", channel, shot))
         authored = "[Dialogue]  Exact punctuation!  "
         before._run_command({"action": "set_field", "field": "PRESERVED_TEXT", "text": authored,
             "channel_uuid": channel, "shot_uuid": shot, "revision": before._revision})

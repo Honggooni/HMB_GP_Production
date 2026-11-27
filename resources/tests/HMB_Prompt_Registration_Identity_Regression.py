@@ -125,6 +125,22 @@ class RegistrationIdentityTests(unittest.TestCase):
         self.assertEqual(result["text"]["SCENE_CONTEXT"], "Use @image2 with @image1.")
         self.assertEqual(result["text"]["PRESERVED_TEXT"], "Literal @image1.")
 
+    def test_crossed_widget_edit_follows_proven_registration_and_reorder(self):
+        result = apply(self.state, [self.sources[2], self.saved, self.sources[1]])
+        self.assertEqual(result["images"][1]["asset_import_source_uid"], self.sources[0]["source_uid"])
+        ui = deepcopy(self.state)
+        ui["images"][0]["owner"] = "Edited during registration"
+        ui["text"]["SCENE_CONTEXT"] = "Latest @image1 with @image3."
+        merged = prompt._merge_prompt_revision_axes(result, ui)
+        self.assertEqual(merged["images"][1]["owner"], "Edited during registration")
+        self.assertEqual(merged["text"]["SCENE_CONTEXT"], "Latest @image2 with @image1.")
+        self.assertEqual(merged["text"]["PRESERVED_TEXT"], "Literal @image1.")
+        ambiguous = apply(self.state, [self.saved, registered(self.sources[0], name="Another"), *self.sources[1:]])
+        self.assertTrue(all("asset_import_source_uid" not in row for row in ambiguous["images"]))
+        actual = prompt._merge_prompt_revision_axes(ambiguous, ui)
+        self.assertIn("[deselected image source #1]", actual["text"]["SCENE_CONTEXT"])
+        self.assertNotIn("Edited during registration", [row["owner"] for row in actual["images"]])
+
     def test_dormant_external_row_resumes_under_registered_identity(self):
         deselected = apply(self.state, self.sources[1:])
         result = apply(deselected, [self.saved, *self.sources[1:]])
@@ -197,6 +213,8 @@ class RegistrationIdentityTests(unittest.TestCase):
         rows = [self.saved, *self.sources[1:]]
         expected = apply(already_addressed, rows)
         result = apply(self.state, rows)
+        self.assertNotIn("asset_import_source_uid", expected["images"][0])
+        self.assertEqual(result["images"][0].pop("asset_import_source_uid"), self.sources[0]["source_uid"])
         self.assertEqual(result["images"], expected["images"])
         self.assertEqual(result["text"], expected["text"])
 

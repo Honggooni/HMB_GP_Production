@@ -1299,11 +1299,12 @@ class HMBFinishLookLibrary(DataNode):
             _set_parameter_silently(self, WIDGET_PARAMETER_NAME, view)
             publish_source_widget_view(self, WIDGET_PARAMETER_NAME, view)
 
-    def _hmb_confirm_finish_shot_read(self, snapshot):
+    def _hmb_confirm_finish_shot_read(self, snapshot, *, receiver, link):
         channel, shot = snapshot["channel_uuid"], snapshot["shot_uuid"]
         with self._state_lock:
             if self._hmb_source_shot_key(self._widget_state, channel, shot) == snapshot["state_sha256"]:
-                record_source_shot_check(self, self._widget_state, channel, shot)
+                return record_source_shot_check(self, self._widget_state, channel, shot, receiver=receiver, link=link)
+            return False
 
     def _restore_widget_parameter(self, *, live: bool = False) -> None:
         self._hmb_finish_ensure_manager_state()
@@ -2115,9 +2116,6 @@ class HMBFinishLookLibrary(DataNode):
         if remote_value:
             self._apply_remote_value(remote_value, report_duplicate=False)
         self._publish_all(live=False)
-        shot = self._widget_state.get("shot") or {}
-        if shot.get("channel_uuid") and shot.get("shot_uuid"):
-            record_source_shot_check(self, self._widget_state, shot["channel_uuid"], shot["shot_uuid"])
         LOGGER.info("[HMB][FINISH] FINISH_LOOK_OUT compiled.")
         return None
 

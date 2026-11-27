@@ -42,6 +42,7 @@ class NativeBoundary:
 GLOBALS = {
     '__name__': __name__, 'Any': object, 'hashlib': hashlib, 'json': __import__('json'),
     '_HMBWebRerenderExecution': type('WebExecution', (), {}),
+    '_HMBAgentShotSource': type('ManagedShotSource', (), {}),
     '_VERIFIED_PROMPT_SOURCE_ATTRIBUTE': '_verified_source',
     '_with_english_agent_output_contract': lambda prompt: prompt,
     '_prompt_text_sha256': lambda text: hashlib.sha256(text.encode('utf-8')).hexdigest(),

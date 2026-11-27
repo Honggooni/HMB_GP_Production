@@ -198,6 +198,20 @@ async def exercise(engine, *, check_image_repair=False):
             print('state diff', diff(old, new), 'content proofs', proof_before,
                   getattr(prompt, '_hmb_dashboard_route_content', {}))
         assert idle_after == idle_before, "Read-only five-shot preparation rewrote the active Prompt dashboard"
+        # A media notification keeps already prepared sibling pages only while
+        # their actual producer, authored document and Shot's inputs still match.
+        routed = []
+        original_route = prompts.HMBPromptLibrary._apply_exact_shot_routes
+        def observe_routes(node, value, **kwargs):
+            routed.append(value["shot"]["shot_uuid"])
+            return original_route(node, value, **kwargs)
+        with mock.patch.object(prompts.HMBPromptLibrary, "_apply_exact_shot_routes", observe_routes):
+            prompt._hmb_prepare_prompt_shot_views(media_edit=True)
+            active = prompt._current_state()["shot"]["shot_uuid"]
+            assert routed == [active], routed
+            routed.clear()
+            prompt._hmb_prepare_prompt_shot_views()
+            assert set(routed) == {row["shot_uuid"] for row in ROWS}, routed
         serialized = send(engine, SerializeFlowToCommandsRequest(flow_name=flow.name)).serialized_flow_commands
         original_names = set(flow.nodes)
         send(engine, DeleteFlowRequest(flow_name=flow.name))

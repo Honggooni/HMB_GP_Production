@@ -211,6 +211,10 @@ def main():
                     assert first["shots"][0]["selected_source_uids"]
                     scope = {"channel_uuid":channel, "shot_uuid":shot}
                     state = n._picker_state()
+                    assert scope not in picker._shot_routing.source_shot_status_fields(n, state)["verified_shots"]
+                    with picker._shot_routing.collect_prompt_source_reads(n) as reads:
+                        n._hmb_shot_routing_snapshot_for(**scope)
+                    assert picker._shot_routing.accept_prompt_source_reads(reads, channel, shot)
                     assert scope in picker._shot_routing.source_shot_status_fields(n, state)["verified_shots"]
                     edited = copy.deepcopy(state)
                     edited["videos"][0]["camera"] = "Changed Camera"

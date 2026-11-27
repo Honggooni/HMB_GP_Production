@@ -342,8 +342,22 @@ assert Path(rows[0]['path'])==root/'showA'/'Ai_Ct_audio_Gang'/'Dialogue'/'voice.
 
     def test_ffmpeg_header_fallback_when_ffprobe_lookup_raises(self):
         import _hmb_video_tools
-        with mock.patch.object(_hmb_video_tools, "_find_ffprobe", side_effect=ValueError("probe not bundled")):
+        # A non-PCM WAV container remains on the external decoder path.
+        with mock.patch.object(helper.wave, "open", side_effect=helper.wave.Error("unsupported format")), \
+                mock.patch.object(_hmb_video_tools, "_find_ffprobe", side_effect=ValueError("probe not bundled")) as probe:
             self.assertAlmostEqual(helper.probe_sound(self.path)["duration_seconds"], .25, places=2)
+            probe.assert_called_once()
+
+    def test_pcm_wave_selection_uses_real_frames_and_rejects_a_truncated_payload(self):
+        with mock.patch.object(helper.subprocess, "run", side_effect=AssertionError("unexpected decoder launch")):
+            with helper.wave.open(str(self.path), "rb") as wav:
+                expected = {"duration_seconds": wav.getnframes() / wav.getframerate(),
+                            "channels": wav.getnchannels(), "sample_rate": wav.getframerate()}
+            self.assertEqual(helper.probe_sound(self.path), expected)
+            self.path.write_bytes(self.path.read_bytes()[:-8])
+            with self.assertRaises(helper.SoundError) as failure:
+                helper.probe_sound(self.path)
+            self.assertEqual(failure.exception.code, "SOUND_DECODE_UNAVAILABLE")
 
     def test_only_and_numbered_shot_rows_never_cross_scopes(self):
         numbered = copy.deepcopy(self.track)
@@ -421,6 +435,7 @@ class SoundNodeRegression(SoundLibraryRegression):
                 self.enterContext(self.engine.bind_workflow(workflow))
             self.flow = self.engine.flow_manager.get_flow_by_name(ensured.flow_name)
         ControlledThread.pending = []
+        self.notify_consumers = target.HMBSoundLibrary._notify_consumers
         for patch in (mock.patch.object(routing, "schedule_post_registration_reconcile"),
                       mock.patch.object(target.HMBSoundLibrary, "_notify_consumers"),
                       mock.patch.object(target, "threading", types.SimpleNamespace(RLock=threading.RLock,Thread=ControlledThread))):
@@ -902,6 +917,29 @@ class SoundNodeRegression(SoundLibraryRegression):
         self.assertEqual(state["tracks"][-1]["shot_uuid"],SHOTS[1]["shot_uuid"])
         with self.assertRaises(helper.SoundError):self.command("shot_add",source_uid=state["assets"][0]["source_uid"],shot_uuid="invented-shot")
 
+    def test_sound_change_notifies_its_generator_and_shared_or_unknown_consumers(self):
+        def peer(name, port, mode, identity):
+            return types.SimpleNamespace(name=name, port=port, identity=identity,
+                _hmb_seedance_execution_mode=lambda: mode, _hmb_hydrate_sound_source=mock.Mock())
+        def sub(shot):
+            return types.SimpleNamespace(kind=routing.KIND_SEEDANCE, enabled=True, channel_uuid="c", shot_uuid=shot)
+        peers = [peer("current", "SHOT_SOUND_IN", "shot", sub("1")),
+                 peer("sibling", "SHOT_SOUND_IN", "shot", sub("2")),
+                 peer("only", "SHOT_SOUND_IN", "only", sub("2")),
+                 peer("unknown", "SHOT_SOUND_IN", "shot", None),
+                 peer("prompt", "SOUND_IN", "", None)]
+        def edge(node):
+            return [types.SimpleNamespace(source_node_name=self.node.name, source_parameter_name="SHOT_SOUND_OUT",
+                                          target_parameter_name=node.port)]
+        with (mock.patch.object(routing, "_same_flow_nodes", return_value=("test", peers)),
+              mock.patch.object(routing, "_incoming_connections", side_effect=edge),
+              mock.patch.object(routing, "_subscription_for", side_effect=lambda node: node.identity),
+              mock.patch("_hmb_connection_management.is_detached", return_value=False)):
+            self.notify_consumers(self.node, ("c", "1"))
+            self.assertEqual([p._hmb_hydrate_sound_source.call_count for p in peers], [1, 0, 1, 1, 1])
+            self.notify_consumers(self.node)
+            self.assertEqual([p._hmb_hydrate_sound_source.call_count for p in peers], [2, 1, 2, 2, 2])
+
     def test_running_shot_is_readable_and_sibling_is_editable(self):
         self.node._hmb_reconcile_shot_routing(CATALOG)
         state = self.node._state_sound
@@ -909,6 +947,10 @@ class SoundNodeRegression(SoundLibraryRegression):
         scope = {"channel_uuid":CHANNEL,"shot_uuid":shot_a}
         with mock.patch.object(routing,"shot_edit_locks",return_value=[scope]):
             self.node._hmb_sound_snapshot_for(**scope)
+            self.assertNotIn(scope, routing.source_shot_status_fields(self.node,state)["verified_shots"])
+            with routing.collect_prompt_source_reads(self.node) as reads:
+                self.node._hmb_sound_snapshot_for(**scope)
+            self.assertTrue(routing.accept_prompt_source_reads(reads, CHANNEL, shot_a))
             self.assertIn(scope, routing.source_shot_status_fields(self.node,state)["verified_shots"])
             source = state["assets"][0]["source_uid"]
             with self.assertRaisesRegex(ValueError,"Generator"):

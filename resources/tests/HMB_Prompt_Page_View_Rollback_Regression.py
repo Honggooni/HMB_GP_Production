@@ -203,7 +203,7 @@ class PromptPageViewRollback(unittest.TestCase):
             edge.target_parameter_name = "SHOT_PROMPT_IN"
         connections = SimpleNamespace(get_outgoing_connections_from_parameter=lambda *args: edges)
         flow = SimpleNamespace(get_connections=lambda: connections)
-        def prepare():
+        def prepare(*, media_edit=False):
             node._hmb_remember_prompt_shot_view(edited, "Ready edited inactive Shot 3")
             return {key}
         before_outputs = deepcopy(dict(node.parameter_output_values))

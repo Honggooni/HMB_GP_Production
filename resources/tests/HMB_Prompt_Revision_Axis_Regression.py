@@ -282,6 +282,57 @@ assert manual_merged["images"][0]["label"] == "Manual Image UI"
 assert manual_merged["videos"][0]["label"] == "Manual Video UI"
 
 
+# Both source axes can advance between two Prompt writes. A slot in the
+# older UI still refers to the same UID when that edit reaches the new order.
+before = prompt._default_widget_state()
+before["shot"] = copy.deepcopy(ui["shot"])
+before["picker"]["order_managed"] = before["image_asset"]["order_managed"] = True
+before["text"].update(SCENE_CONTEXT="@image1, @image2, @video1, @video2", PRESERVED_TEXT="@image1 @video1")
+before["analysis_generated_text"] = {"SCENE_CONTEXT": before["text"]["SCENE_CONTEXT"], "PRESERVED_TEXT": "@image1 @video1"}
+before["sound_overlays"] = {"dialog": {"speaker_binding": {"kind": "video", "source_id": "original", "color": "Red"}}}
+before["images"] = [dict(prompt._default_image_item(n), asset_source_uid=uid, asset_managed=True,
+    present=True, label=uid, binding_video_slots=[1], color_picks=["Red"], frame_range_intent=range_intent(2, 8),
+    preview_marker="@video1") for n, uid in enumerate(("left", "retired", "right"), 1)]
+before["videos"] = [dict(prompt._default_video_item(n), video_uid=uid, source_uid=uid, present=True,
+    label=uid, picker_managed=True, keep_out="@image1 @video1") for n, uid in enumerate(("original", "mask"), 1)]
+before["ui"]["textarea_heights"] = {"video:1:keep_out": 333}
+before[prompt.SOURCE_SYNC_REVISION_KEY] = 1
+before = prompt._normalize_state(before)
+latest = copy.deepcopy(before)
+latest[prompt.SOURCE_SYNC_REVISION_KEY] = 2
+latest["images"] = [latest["images"][2], latest["images"][0]]
+latest["videos"].reverse()
+result = prompt._merge_prompt_revision_axes(latest, before)
+assert [item["binding_video_slots"] for item in result["images"]] == [[2], [2]]
+assert result["images"][0]["marker_video"] == 2 and result["images"][0]["color_picks"] == ["Red"]
+assert result["images"][0]["frame_range_intent"] == range_intent(2, 8)
+assert result["text"]["SCENE_CONTEXT"] == "@image2, [deselected image source #2], @video2, @video1"
+assert result["text"]["PRESERVED_TEXT"] == "@image1 @video1"
+assert result["analysis_generated_text"]["SCENE_CONTEXT"] == result["text"]["SCENE_CONTEXT"]
+assert result["analysis_generated_text"]["PRESERVED_TEXT"] == before["analysis_generated_text"]["PRESERVED_TEXT"]
+assert result["sound_overlays"] == before["sound_overlays"]
+reanalyzed = copy.deepcopy(result)
+assert prompt._merge_analysis_generated_text(reanalyzed, {"SCENE_CONTEXT": "New analysis of @video2"})
+assert reanalyzed["text"]["SCENE_CONTEXT"] == "New analysis of @video2"
+assert result["videos"][0]["keep_out"] == "@image2 @video2"
+assert result["ui"]["textarea_heights"] == {"video:2:keep_out": 333}
+assert prompt._merge_prompt_revision_axes(result, result) == result
+
+concurrent_ui = copy.deepcopy(before)
+concurrent_ui[prompt.UI_EDIT_REVISION_KEY] += 1
+concurrent_ui["images"][0]["binding_video_slots"] = [2]
+concurrent_ui["text"]["SCENE_CONTEXT"] = "Follow the mask @video2."
+concurrent = prompt._merge_prompt_revision_axes(latest, concurrent_ui)
+assert concurrent["images"][1]["binding_video_slots"] == [1]
+assert concurrent["text"]["SCENE_CONTEXT"] == "Follow the mask @video1."
+removed = copy.deepcopy(latest)
+removed["videos"] = removed["videos"][:1]
+result = prompt._merge_prompt_revision_axes(removed, before)
+assert result["images"][0]["color_picks"] == [""] and result["images"][0]["binding_video_slots"] == [1]
+assert "[deselected video source #1]" in result["text"]["SCENE_CONTEXT"]
+assert result["sound_overlays"]["dialog"]["speaker_binding"]["source_id"] == "original"
+
+
 # Equal clocks are acknowledgements only. An exact echo is accepted, while a
 # same-clock payload with older selections/Range is rejected by both setter and
 # the host's assign-before-after_value_set callback path.

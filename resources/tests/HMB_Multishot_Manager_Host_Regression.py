@@ -498,9 +498,35 @@ async def exercise(engine):
             assert machine.is_complete() and not machine.is_errored(), machine.get_error_message()
             return participants
 
+        # Only the physically connected receiver may acknowledge the latest issued Shot document.
+        identity = dict(channel_uuid=CHANNEL, shot_uuid=SHOTS[2]["shot_uuid"])
+        verified_prompt = f"{CHANNEL}/{identity['shot_uuid']}"
+        selected_finish = finish_manager._widget_state["shot"]
+        finish_manager._hmb_source_checks = {}
+        finish_manager.process()
+        assert not finish_manager._hmb_source_checks
+        finish_snapshot = finish_manager._hmb_finish_look_shot_snapshot_for(
+            channel_uuid=CHANNEL, shot_uuid=selected_finish["shot_uuid"])
+        finish_link = routing.shot_receiver_link(finish_manager, generators[2])
+        finish_manager._hmb_confirm_finish_shot_read({**finish_snapshot, "state_sha256": "0" * 64},
+                                                     receiver=generators[2], link=finish_link)
+        assert not finish_manager._hmb_source_checks
+        prompt._hmb_set_prompt_completion([verified_prompt], False)
+        delivered = prompt._hmb_prompt_document_for_agent_run(**identity)
+        assert verified_prompt not in prompt._hmb_completed_prompt_shots
+        wrong_agent = mock.Mock()
+        wrong_agent._hmb_manager_prompt_owner.return_value = prompt
+        assert not prompt._hmb_ack_agent_shot_document(agent=wrong_agent, document=delivered, **identity)
+        assert not prompt._hmb_ack_agent_shot_document(agent=manager, document=deepcopy(delivered), **identity)
+        assert prompt._hmb_ack_agent_shot_document(agent=manager, document=delivered, **identity)
+        assert verified_prompt in prompt._hmb_completed_prompt_shots
+        prompt._hmb_set_prompt_completion([verified_prompt], False)
+        assert not prompt._hmb_ack_agent_shot_document(agent=manager, document=delivered, **identity)
+
         # One selected Generator invokes exactly one model although the shared
         # manager declares five available Shots.
         participants = await resolve([generators[2]])
+        assert (CHANNEL, identity["shot_uuid"]) in finish_manager._hmb_source_checks
         assert sum(node is manager for node in participants) == 1, [node.name for node in participants]
         assert [number for kind, number, _ in events if kind == "model_started"] == [3], (events,
             {key: generators[2].parameter_output_values.get(key) for key in ("was_successful", "result_details", "generation_status")},
@@ -793,6 +819,27 @@ async def exercise(engine):
         assert all(node.state == stale for node in chain)
         assert all(node.state == resolved for node in independent) and not events, ([n.state for n in independent], events)
         print("PASS native green checks: image edit invalidates its downstream DAG, independent Video/Sound/Analysis stay resolved; before/after Analysis invalidates exact Shot recipients; no model or render on edit")
+
+        # A media revision leaves the compact delivery shape intact. A renamed
+        # Shot or a physically removed Agent wire must force the full route.
+        from griptape_nodes.retained_mode.events.connection_events import DeleteConnectionRequest
+        def delivery_shape(snapshot):
+            nodes = list(flow.nodes.values())
+            participants = [sub for node in nodes if (sub := routing._subscription_for(node)) is not None]
+            return routing._image_catalog_route_shape(source, snapshot, participants, nodes)
+        before = delivery_shape(catalog)
+        assert before is not None
+        edited = deepcopy(catalog)
+        edited["shots"][0]["revision"] += 1
+        assert delivery_shape(edited) == before
+        edited["shots"][0]["name"] += " renamed"
+        assert delivery_shape(edited) != before
+        edge = next(e for e in engine.flow_manager.get_connections().connections.values()
+                    if e.source_node is manager and e.target_node in generators and e.target_parameter.name == "prompt")
+        removed = engine.handle_request(DeleteConnectionRequest(source_node_name=edge.source_node.name,
+            source_parameter_name=edge.source_parameter.name, target_node_name=edge.target_node.name,
+            target_parameter_name=edge.target_parameter.name))
+        assert removed.succeeded() and delivery_shape(catalog) != before
 
     print("HMB_MULTISHOT_MANAGER_HOST=PASS (real DAG; one Prompt; one Agent; five Shot rows; native ParameterList/schema isolation; five concurrent intents; single selection; rerender; Resume/Final Agent zero; failure/cancel isolation; editor switch; signed v7 policy; 480p retained)")
 

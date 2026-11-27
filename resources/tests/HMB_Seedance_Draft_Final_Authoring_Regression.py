@@ -146,6 +146,39 @@ class DraftFinalAuthoringTests(unittest.TestCase):
         node.parameter_output_values.update(generation_id=job_id,
             generation_status=status, provider_response={'id': job_id, 'status': status})
 
+    def test_shot_check_requires_matching_received_video(self):
+        node = self.make_node()
+        digest = node._render_authoring_digest()
+        self.seed_checkpoint(node, action=t.DRAFT_ACTION_PREVIEW, digest=digest,
+                             stage='accepted', status='queued')
+        self.assertFalse(node._draft_ui_state().get('render_completed'))
+        node._set_generation_recovery_checkpoint(stage='remote_succeeded',
+            task_id=JOB, task_identity='broker_task', status='succeeded')
+        self.assertFalse(node._draft_ui_state().get('render_completed'))
+        before = authored(node)
+        with self.publication(node, before, download_error=TimeoutError('test download timed out')):
+            with self.assertRaises(TimeoutError):
+                asyncio.run(node._save_completed_task({}, JOB, node.destination,
+                    model_id=t.SEEDANCE_2_5_MODEL_ID, output_format='mov', return_last_frame=False))
+        self.assertFalse(node._draft_ui_state().get('render_completed'))
+        with self.publication(node, before):
+            asyncio.run(node._save_completed_task({}, JOB, node.destination,
+                model_id=t.SEEDANCE_2_5_MODEL_ID, output_format='mov', return_last_frame=False))
+        self.assertTrue(node._draft_ui_state()['render_completed'])
+        node.parameter_values['duration'] = 7
+        self.assertFalse(node._draft_ui_state().get('render_completed'))
+        node.parameter_values['duration'] = 4
+        self.assertTrue(node._draft_ui_state()['render_completed'])
+        node.parameter_values['resume_generation_id'] = 'job-' + 'd' * 32
+        self.assertFalse(node._draft_ui_state().get('render_completed'))
+        node.parameter_values['resume_generation_id'] = JOB
+        self.assertTrue(node._draft_ui_state()['render_completed'])
+        node.parameter_values['resume_generation_id'] = ''
+        self.seed_checkpoint(node, action=t.DRAFT_ACTION_PREVIEW, digest=digest,
+                             job_id='job-' + 'b' * 32, stage='accepted', status='queued')
+        self.assertFalse(node._draft_ui_state().get('render_completed'))
+        self.assertFalse(node.bridge.posts)
+
     def test_completed_draft_updates_source_and_button_without_changing_authored_settings(self):
         for shot in (False, True):
             with self.subTest(shot=shot):

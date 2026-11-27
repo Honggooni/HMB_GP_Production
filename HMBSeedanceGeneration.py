@@ -6623,17 +6623,33 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if target_name == "prompt":
             _sync_only_agent_connection(source_node, source_parameter)
             self._hmb_refresh_managed_prompt_projection(source_node=source_node, force=True)
+        elif target_name == SHOT_FINISH_LOOK_INPUT_PARAMETER:
+            previous = getattr(self, "_hmb_finish_receipt_source", None)
+            if previous is not None and previous() is not source_node:
+                self._hmb_release_finish_receipt()
         elif target_name == SHOT_SOUND_INPUT_PARAMETER:
             self._hmb_refresh_prompt_sound_audio()
         return result
 
     def after_incoming_connection_removed(self, source_node: Any, source_parameter: Any, target_parameter: Any) -> None:
         result = super().after_incoming_connection_removed(source_node, source_parameter, target_parameter)
+        if getattr(target_parameter, "name", "") == SHOT_FINISH_LOOK_INPUT_PARAMETER:
+            _shot_routing.release_source_receiver(source_node, self)
+            previous = getattr(self, "_hmb_finish_receipt_source", None)
+            if previous is not None and previous() is source_node:
+                self._hmb_finish_receipt_source = None
         if getattr(target_parameter, "name", "") == "prompt":
             _sync_only_agent_connection(source_node, source_parameter, removed=True)
         if getattr(target_parameter, "name", "") in {"prompt", SHOT_SOUND_INPUT_PARAMETER}:
             self._hmb_refresh_prompt_sound_audio()
         return result
+
+    def _hmb_release_finish_receipt(self) -> None:
+        reference = getattr(self, "_hmb_finish_receipt_source", None)
+        self._hmb_finish_receipt_source = None
+        previous = reference() if reference is not None else None
+        if previous is not None:
+            _shot_routing.release_source_receiver(previous, self)
 
     def _hmb_hydrate_sound_source(self, _source: Any) -> None:
         self._hmb_refresh_prompt_sound_audio()
@@ -9328,6 +9344,18 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if model_id == SEEDANCE_2_5_MODEL_ID else False,
         }
 
+    def _hmb_accepts_prompt_audio_for(self, owner, *, channel_uuid, shot_uuid, model_id):
+        """Match the physical Generator → Agent → Prompt chain without reopening a Shot document."""
+        if not getattr(self, "_hmb_sound_port_registered", False) or model_id not in BROKER_SUPPORTED_MODEL_IDS:
+            return False
+        try:
+            agent = self._manual_agent_prompt_source()
+            return (agent is not None and self._hmb_preflight_kind(agent) == "HMBAgentLibrary"
+                    and agent._hmb_reference_analysis_owner(channel_uuid=channel_uuid, shot_uuid=shot_uuid) is owner)
+        except (AttributeError, KeyError, RuntimeError, ValueError):
+            # An unbound sibling cannot inherit this Prompt's audio setting.
+            return False
+
     def _resolve_exact_shot_generation_inputs(
         self,
         params: dict[str, Any],
@@ -9550,6 +9578,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             required=False,
         )
         if finish_node is not None:
+            confirm_read = (getattr(finish_node, "_hmb_confirm_finish_shot_read", None)
+                            if getattr(self, "_web_owner", None) is None else None)
+            if callable(confirm_read):
+                previous = getattr(self, "_hmb_finish_receipt_source", None)
+                if previous is not None and previous() is not finish_node:
+                    self._hmb_release_finish_receipt()
+                finish_link = _shot_routing.shot_receiver_link(finish_node, self)
+                self._hmb_finish_receipt_source = weakref.ref(finish_node)
             finish_subscription = self._finish_look_source_subscription(finish_node, subscription)
             if (
                 finish_subscription.get("channel_uuid") != subscription["channel_uuid"]
@@ -9583,9 +9619,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 expected_subscription=subscription,
             )
             finish_look_out = finish_snapshot["finish_look_out"]
-            confirm_read = getattr(finish_node, "_hmb_confirm_finish_shot_read", None)
-            if callable(confirm_read):
-                confirm_read(finish_snapshot)
+            if callable(confirm_read) and not confirm_read(finish_snapshot, receiver=self, link=finish_link):
+                raise RuntimeError("The selected Shot's Finish Look connection or settings changed during verification.")
 
         resolved = dict(params)
         resolved.pop("_hmb_sound_reference_bindings", None)
@@ -10806,13 +10841,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return False
         return saved == self._render_authoring_digest(draft_action=draft_action)
 
+    def _received_render_digest(self) -> str:
+        records = self.get_parameter_value(COMPLETED_RENDER_INPUTS_PARAMETER)
+        return records.get(self._draft_source_key(), "") if isinstance(records, dict) and records else ""
+
     def _matching_completed_render(self, draft_source: dict[str, Any] | None = None) -> bool:
         if getattr(self, "_web_owner", None) is not None or self.get_parameter_value("resume_generation_id"):
             return False
-        records = self.get_parameter_value(COMPLETED_RENDER_INPUTS_PARAMETER)
-        saved = records.get(self._draft_source_key()) if isinstance(records, dict) and records else None
         draft = self._draft_source_record() if draft_source is None else draft_source
-        hashes = {item for item in (saved, draft.get("render_input_sha256")) if isinstance(item, str) and item}
+        hashes = {item for item in (self._received_render_digest(), draft.get("render_input_sha256")) if isinstance(item, str) and item}
         if not hashes:
             return False
         return self._render_authoring_digest() in hashes
@@ -11175,12 +11212,27 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         resolution = str(self.get_parameter_value("resolution") or "")
         action = self.get_parameter_value("draft_action") or DRAFT_ACTION_OFF
         source = self._draft_source_record() if supported else {}
-        run_locked = self._matching_completed_render(source)
         verifying = self._manual_reference_unverified()
-        if run_locked:
-            checkpoint = self._generation_recovery_state()
-            run_locked = not checkpoint.get("task_id") or checkpoint.get("stage") == "local_succeeded"
-        if verifying or (source.get("render_input_sha256") and not self._matches_render_digest(source["render_input_sha256"])):
+        received_digest = self._received_render_digest()
+        draft_digest = source.get("render_input_sha256")
+        checkpoint = self.get_parameter_value(SEEDANCE_RECOVERY_PARAMETER) or {}
+        if not isinstance(checkpoint, dict) or not checkpoint.get("task_id") or self._draft_source_key(checkpoint) != self._draft_source_key():
+            checkpoint = {}
+        task_digest = checkpoint.get("render_input_sha256") if checkpoint.get("stage") == "local_succeeded" else ""
+        current = self._render_authoring_digest() if not verifying and (received_digest or draft_digest or task_digest) else ""
+        resume_id = str(self.get_parameter_value("resume_generation_id") or "").strip()
+        native_input = getattr(self, "_web_owner", None) is None and not resume_id
+        run_locked = bool(native_input and current and current in (received_digest, draft_digest)
+                          and (not checkpoint or checkpoint.get("stage") == "local_succeeded"))
+        # A reusable Draft alone can lock Run. A new task in this Shot supersedes
+        # the previous video receipt until its own video has arrived.
+        if checkpoint:
+            render_completed = bool(current and current == task_digest and checkpoint.get("stage") == "local_succeeded"
+                                    and checkpoint.get("task_identity") == "broker_task"
+                                    and checkpoint.get("status") in BROKER_SUCCESS_STATUSES)
+        else:
+            render_completed = bool(current and current == received_digest)
+        if verifying or (draft_digest and current != draft_digest):
             source = {}
         busy = bool(self._generation_run_active.is_set() or self._generation_refresh_running
                     or getattr(self, "_hmb_draft_finalize_pending", False))
@@ -11242,7 +11294,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if final_busy and source_completed and pending.get("draft_job_id") == source["draft_job_id"]:
             selected_final = pending.get("final_resolution") or selected_final
         return _seedance_draft_ui_value({"visible": supported and (resolution == "480p" or bool(source)),
-            "render_completed": run_locked and not verifying and not busy,
+            "render_completed": render_completed and not verifying and not busy
+                and (not resume_id or resume_id == checkpoint.get("task_id")),
             "run_locked": (run_locked or (verifying and not self.get_parameter_value("resume_generation_id")
                 and not self._generation_recovery_blocks_new_submission())) and not busy,
             "action": action if supported else DRAFT_ACTION_OFF,
@@ -11536,8 +11589,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self._validate_local_render_preflight()
                 return
             except ValueError as exc:
-                if not (getattr(exc, "hmb_picker_media_preparing", False)
-                        or getattr(exc, "hmb_image_asset_selection_preparing", False)):
+                if not _shot_routing._hmb_source_is_preparing(exc):
                     raise
                 remaining = deadline - loop.time()
                 if remaining <= 0:
@@ -11580,8 +11632,55 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         else:
             self._hmb_local_preflight_failure = ""
 
+    def _sdk_shot_image_order(self, workflow):
+        identity = self._shot_identity()
+        channel, shot = identity.get("channel_uuid"), identity.get("shot_uuid")
+        if not channel or not shot:
+            return None
+        # The SDK validates in an executor as well as on the event loop. Read
+        # the actual retained edge without dispatching a nested engine request.
+        graph = workflow.flows.connections
+        edge_ids = graph.incoming_index.get(self.name, {}).get(SHOT_ASSET_INPUT_PARAMETER, ())
+        if len(edge_ids) != 1:
+            return None
+        edge = graph.connections.get(edge_ids[0])
+        if (edge is None or edge.target_node is not self
+                or edge.source_parameter.name != "SHOT_ASSET_OUT"):
+            return None
+        source = edge.source_node
+        read = getattr(source, "_hmb_render_selected_image_uids", None)
+        if callable(read):
+            uids = read(channel, shot)
+            if uids is not None:
+                return source, channel, shot, uids
+        return None
+
+    def _remember_sdk_shot_image_order(self):
+        workflow = getattr(self, "workflow", None)
+        if workflow is None:
+            return
+        # A validation request while another Resolve already owns this node
+        # must not replace the selection captured before its dependencies ran.
+        if self.name in workflow.flows.global_dag_builder.node_to_reference:
+            return
+        self._hmb_before_resolve_images = None
+        if (_my_box_node.is_selected(self) or self._draft_final_requested()
+                or self._retry_uses_existing_generation(self._generation_recovery_state())):
+            return
+        self._hmb_before_resolve_images = self._sdk_shot_image_order(workflow)
+
+    def _assert_sdk_shot_image_order(self):
+        expected = getattr(self, "_hmb_before_resolve_images", None)
+        if expected is None:
+            return
+        workflow = getattr(self, "workflow", None)
+        if (workflow is not None and self.name in workflow.flows.global_dag_builder.node_to_reference
+                and self._sdk_shot_image_order(workflow) != expected):
+            raise ValueError("샷의 이미지 또는 순서가 원본을 읽는 동안 변경되었습니다. 이미지 목록을 확인한 뒤 다시 실행하세요.")
+
     def validate_before_workflow_run(self) -> list[Exception] | None:
         exceptions = super().validate_before_workflow_run() or []
+        self._remember_sdk_shot_image_order()
         self._record_local_render_preflight()
         return exceptions or None
 
@@ -15065,6 +15164,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # abort cleanly without leaving a live node that has surrendered Shot
         # ownership.
         self._discard_dangling_owned_list_connections_before_delete()
+        self._hmb_release_finish_receipt()
         controller = getattr(self, "_hmb_my_box_controller_instance", None)
         if controller is not None:
             controller.invalidate(deleted=True)
@@ -16174,7 +16274,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             public_run = not _my_box_node.is_selected(self)
             if public_run:
                 checkpoint = self._generation_recovery_state()
-                self._hmb_running_edit_shot = _pending_render_shot(checkpoint) or self._shot_identity()
+                self._hmb_running_edit_shot = _pending_render_shot(checkpoint)
+                self._hmb_requested_edit_shot = self._shot_identity()
                 self._sync_render_edit_lock(checkpoint)
             await self._aprocess_impl()
         finally:
@@ -16182,6 +16283,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             # transferred edit ownership to its persisted Broker checkpoint.
             try:
                 if public_run:
+                    self._hmb_before_resolve_images = None
+                    self._hmb_requested_edit_shot = None
                     self._hmb_running_edit_shot = None
                     self._sync_render_edit_lock(self._generation_recovery_state())
             finally:
@@ -16230,6 +16333,16 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self._clear_execution_status()
             try:
                 await self._await_local_render_preflight()
+                self._assert_sdk_shot_image_order()
+                # A picker edit accepted before Run can finish asynchronously.
+                # Lock the requested Shot after its sources settle and before inference.
+                requested = getattr(self, "_hmb_requested_edit_shot", None)
+                if requested and not self._hmb_running_edit_shot:
+                    current = self._shot_identity()
+                    if any(current[key] != requested[key] for key in ("channel_uuid", "shot_uuid")):
+                        raise ValueError("The selected Shot changed during render preparation.")
+                    self._hmb_running_edit_shot = requested
+                    self._sync_render_edit_lock(self._generation_recovery_state())
             except Exception as exc:
                 self._hmb_local_preflight_failure = self._safe_exception_message(exc)
                 self._publish_agent_result_skipped(
@@ -16452,6 +16565,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise _AgentResultUnavailable("The selected Shot project is unavailable. No render was submitted.")
         prepared_inputs = self._managed_agent_input_fingerprint(validation)
         origin = self._capture_generated_video_origin()
+        self._assert_sdk_shot_image_order()
         record = await run_api(channel_uuid=channel, shot_uuid=shot,
                                prompt_owner=prompt_owner, generator=self)
         if isinstance(record, dict):
@@ -16479,6 +16593,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
         if not isinstance(record, dict) or not isinstance(record.get("result"), dict):
             raise _AgentResultUnavailable("The Shot Agent returned no completed result. No render was submitted.")
+        audio_outputs = record.get("generator_audio_outputs")
+        if isinstance(audio_outputs, dict) and (self.name in audio_outputs or
+                (current_inputs.get("_hmb_sound_provenance") or {}).get("kind") == "exact_prompt_document"):
+            if audio_outputs.get(self.name) is not bool(current_inputs.get("generate_audio")):
+                raise _AgentResultUnavailable("Agent와 Generator의 샷 오디오 설정이 달라 렌더를 접수하지 않았습니다.")
         HMBSeedanceGeneration._assert_managed_prompt_current(source, record, channel_uuid=channel, shot_uuid=shot)
         # Display name/number may legitimately change after the worker returns.
         # The frozen ticket stays byte-for-byte intact; current catalog metadata
@@ -16586,6 +16705,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         previous = getattr(self, "_hmb_expected_agent_result", None)
         if previous is not None and token != previous:
             raise _AgentResultUnavailable("Agent result changed during preparation. No new render was submitted.")
+        if isinstance(managed, dict) and prompt is not None and not allow_resume:
+            acknowledge = getattr(source, "_hmb_ack_generator_shot_result", None)
+            if not callable(acknowledge) or not acknowledge(channel_uuid=managed["channel_uuid"],
+                    shot_uuid=managed["shot_uuid"], run_id=snapshot["run_id"],
+                    generator=self, record=managed["record"]):
+                raise _AgentResultUnavailable("The Agent could not confirm receipt of this Shot revision. No new render was submitted.")
         self._hmb_expected_agent_result = token
         if not allow_resume:
             self._hmb_agent_submission_prompt = text

@@ -416,10 +416,14 @@ class HMBSoundLibrary(DataNode):
                 snapshot.pop("preparation_error", None)
             if channel_uuid and shot_uuid:
                 if snapshot and not snapshot.get("preparing") and not snapshot.get("preparation_error"):
-                    _shot_routing.record_source_shot_check(self, self._state_sound, channel_uuid, shot_uuid)
+                    _shot_routing.observe_prompt_source_read(self, self._state_sound, channel_uuid, shot_uuid)
                 else:
                     _shot_routing.clear_source_shot_check(self, channel_uuid, shot_uuid)
             return copy.deepcopy(snapshot)
+
+    def _hmb_current_source_shot_key(self, channel, shot):
+        with self._lock:
+            return self._hmb_source_shot_key(self._state_sound, channel, shot)
 
     @staticmethod
     def _hmb_source_shot_key(state, channel, shot):
@@ -467,10 +471,10 @@ class HMBSoundLibrary(DataNode):
         parent = getattr(super(), "get_display_value_for_output", None)
         return parent(parameter_name, output_value) if callable(parent) else output_value
 
-    def _sound_ui_state(self) -> tuple[dict[str, Any], tuple]:
+    def _sound_ui_state(self, *, committed: bool = False) -> tuple[dict[str, Any], tuple]:
         """Build the display snapshot and candidate catalog cache without writes."""
         state = copy.deepcopy({key: value for key, value in self._state_sound.items() if key != "assets"})
-        state.update(_shot_routing.source_shot_status_fields(self, self._state_sound))
+        state.update(_shot_routing.source_shot_status_fields(self, self._state_sound, committed=committed))
         state["site_settings"] = copy.deepcopy(getattr(self, "_site_profile", {"links": [], "revision": "0", "write_site_id": "hq"}))
         state["site_settings_result"] = copy.deepcopy(getattr(self, "_site_result", {}))
         state["site_picker_draft"] = dict(getattr(self, "_site_picker", {}))
@@ -527,13 +531,14 @@ class HMBSoundLibrary(DataNode):
                 "mode": "full", "stream_id": self._ui_stream, "sequence": sequence, "catalog_key": catalog_key}
             return value
 
-    def _publish(self, *, notify: bool = True, full: bool = False, outputs: bool = True) -> None:
+    def _publish(self, *, notify: bool = True, full: bool = False, outputs: bool = True,
+                 edited_shot: tuple[str, str] | None = None) -> None:
         if self._hmb_node_deleted:
             return
         with self._lock:
             self._syncing = True
             try:
-                state, self._ui_catalog_cache = self._sound_ui_state()
+                state, self._ui_catalog_cache = self._sound_ui_state(committed=True)
                 _set_parameter_silently(self, UI, state)
                 publisher = getattr(self, "publish_update_to_parameter", None)
                 if callable(publisher):
@@ -554,9 +559,9 @@ class HMBSoundLibrary(DataNode):
             finally:
                 self._syncing = False
         if notify:
-            self._notify_consumers()
+            self._notify_consumers(edited_shot)
 
-    def _notify_consumers(self) -> None:
+    def _notify_consumers(self, edited_shot: tuple[str, str] | None = None) -> None:
         try:
             from _hmb_shot_routing import _same_flow_nodes, _incoming_connections
             from _hmb_connection_management import is_detached
@@ -568,6 +573,16 @@ class HMBSoundLibrary(DataNode):
                     continue
                 for edge in _incoming_connections(node):
                     if getattr(edge, "source_node_name", "") == self.name and getattr(edge, "source_parameter_name", "") in OUTPUTS:
+                        # One managed Generator projects a single exact Shot.
+                        # Managers, Only mode and unresolved scopes still see
+                        # the full update, just as they do for catalog edits.
+                        if (edited_shot and all(edited_shot) and getattr(edge, "target_parameter_name", "") == "SHOT_SOUND_IN"
+                                and _shot_routing._seedance_execution_mode(node) == "shot"):
+                            sub = _shot_routing._subscription_for(node)
+                            if (sub is not None and sub.kind == _shot_routing.KIND_SEEDANCE and sub.enabled
+                                    and sub.channel_uuid and sub.shot_uuid
+                                    and (sub.channel_uuid, sub.shot_uuid) != edited_shot):
+                                continue
                         callback = getattr(node, "_hmb_hydrate_sound_source", None)
                         if callable(callback):
                             callback(self)
@@ -819,7 +834,7 @@ class HMBSoundLibrary(DataNode):
                             return
                         if active_generation == self._generation:
                             try:
-                                self._publish()
+                                self._publish(edited_shot=self._sound_pending_scope if not self._state_sound.get("error_code") else None)
                             except Exception:
                                 pass  # Accepted data is retained for read-only UI recovery.
                         elif superseded is not None:
@@ -977,6 +992,7 @@ class HMBSoundLibrary(DataNode):
             self._seen_commands.append(command["id"])
             self._seen_commands = self._seen_commands[-256:]
             action = command.get("action")
+            edited_shot = None
             state = self._state_sound
             state["ack_command_id"] = command["id"]
             if action == "cancel":
@@ -1096,6 +1112,7 @@ class HMBSoundLibrary(DataNode):
                 if track is None:
                     raise SoundError("SOUND_TRACK_UNAVAILABLE", "최신 사운드 목록에서 다시 선택하세요.")
                 _shot_routing.assert_shot_editable(self, track["channel_uuid"], track["shot_uuid"])
+                edited_shot = (track["channel_uuid"], track["shot_uuid"])
                 if action == "remove":
                     state["tracks"] = [t for t in state["tracks"] if t is not track]
                 elif action == "duplicate":
@@ -1117,7 +1134,7 @@ class HMBSoundLibrary(DataNode):
             else:
                 raise SoundError("SOUND_COMMAND_INVALID", "지원하지 않는 사운드 명령입니다.")
             state["revision"] += 1
-            self._publish()
+            self._publish(edited_shot=edited_shot)
 
     def _hmb_reconcile_shot_routing(self, snapshot: Any) -> None:
         catalog = _normalize_shot_catalog(snapshot, strict=True, allow_sparse=True)

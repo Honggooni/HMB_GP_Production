@@ -176,6 +176,83 @@ def analysis_render_input_preview(prompt_owner: Any, *, channel_uuid: str, shot_
     return result
 
 
+def analysis_payload_sha256(value) -> str:
+    data = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def active_analysis_routes(prompt_owner, channel, shot):
+    """Only attached analyzers contributing material to this specific Shot."""
+    from _hmb_connection_management import relationship_suspended
+    _, nodes = _same_flow_nodes(prompt_owner)
+    key = _scope(channel, shot)
+    routes = {}
+    for role in _ROLES:
+        node = _find_analysis_node(nodes, role=role)
+        if node is None or relationship_suspended(prompt_owner, node):
+            continue
+        with node._lock:
+            slot = node._slots.get(key) or {}
+            result = bool(slot.get("result") or slot.get("analysis_pending"))
+            if role == "after":
+                result = (result and slot.get("send_agent")) or slot.get("results_only") or slot.get("origin") == "direct"
+            if result:
+                routes[role] = node
+    return routes
+
+
+def read_analysis_for_agent(prompt_owner, *, channel_uuid, shot_uuid):
+    """Read model input once and bind the delivered pair to this analyzer revision."""
+    scope = dict(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+    _, nodes = _same_flow_nodes(prompt_owner)
+    node = _find_analysis_node(nodes, role="after")
+    key = _scope(channel_uuid, shot_uuid)
+    token = node._hmb_analysis_delivery_token(key) if node is not None else ""
+    from _hmb_shot_routing import shot_receiver_link
+    links = ({shot_receiver_link(prompt_owner, agent) for agent in prompt_owner._hmb_connected_shot_agents()}
+             if token else set())
+    analysis = analysis_delivery_context(prompt_owner, destination="agent", **scope)
+    originals = analysis_originals(prompt_owner, **scope)
+    if node is None or not token:
+        return analysis, originals, None
+    with node._lock:
+        slot = node._slots.get(key, {})
+        selected_original = any(row.get("source_id") == slot.get("source_id") for row in originals)
+        if not analysis and not (selected_original and (slot.get("send_original") or slot.get("origin") == "direct")):
+            return analysis, originals, None
+        if token != node._hmb_analysis_delivery_token(key):
+            raise _AnalysisStateError("분석기를 읽는 동안 해당 샷이 변경되었습니다.")
+    return analysis, originals, (node, key, token, analysis_payload_sha256((analysis, originals)), links)
+
+
+def acknowledge_analysis_for_agent(prompt_owner, *, agent, channel_uuid, shot_uuid, analysis, originals, receipt):
+    if receipt is None:
+        return True
+    node, key, token, delivered, links = receipt
+    _, nodes = _same_flow_nodes(prompt_owner)
+    if (key != _scope(channel_uuid, shot_uuid) or _find_analysis_node(nodes, role="after") is not node
+            or not any(connected is agent for connected in prompt_owner._hmb_connected_shot_agents())
+            or agent._hmb_manager_prompt_owner(channel_uuid=channel_uuid, shot_uuid=shot_uuid) is not prompt_owner
+            or node._exact_owner(node._registered_catalogs(), channel_uuid, shot_uuid) is not prompt_owner
+            or delivered != analysis_payload_sha256((analysis, originals))):
+        return False
+    with node._lock:
+        if not token or token != node._hmb_analysis_delivery_token(key):
+            return False
+        link = next((item for item in links if item.receiver() is agent and item.active), None)
+        if link is None:
+            return False
+        receipts = node._hmb_analysis_receipts
+        old = receipts.get(("after", key))
+        owners = old[2] if old and old[:2] == (token, delivered) else set()
+        if link in owners:
+            return True
+        link.analysis_observers.add(node)
+        receipts[("after", key)] = (token, delivered, {old_link for old_link in owners if old_link.active} | {link})
+    node._publish()
+    return True
+
+
 async def prepare_analysis_for_run(owner: Any, *, channel_uuid: str, shot_uuid: str,
                                    role: str, check_live=None) -> None:
     """Refresh only this execution's applied Analysis route at its point in the chain."""

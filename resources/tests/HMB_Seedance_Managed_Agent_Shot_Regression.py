@@ -135,6 +135,24 @@ class ManagedShotTests(unittest.IsolatedAsyncioTestCase):
         await second._prepare_managed_agent_shot()
         first._assert_agent_result_available(allow_resume=False)
 
+    async def test_acknowledge_only_the_prompt_actually_bound_for_submission(self):
+        node = self.nodes[0]
+        receive = self.manager._hmb_ack_generator_shot_result = mock.Mock(return_value=True)
+        await node._prepare_managed_agent_shot()
+        record = node._hmb_managed_agent_request["record"]
+        node._assert_agent_result_available(allow_resume=False)
+        receive.assert_not_called()
+        with self.assertRaises(t._AgentResultUnavailable):
+            node._assert_agent_result_available("stale text in the Generator", allow_resume=False)
+        receive.assert_not_called()
+        node._assert_agent_result_available(record["text"], allow_resume=False)
+        receive.assert_called_once_with(channel_uuid=node.subscription["channel_uuid"],
+            shot_uuid=node.subscription["shot_uuid"], run_id=record["result"]["run_id"],
+            generator=node, record=record)
+        receive.return_value = False
+        with self.assertRaises(t._AgentResultUnavailable):
+            node._assert_agent_result_available(record["text"], allow_resume=False)
+
     async def test_two_generators_same_shot_keep_their_own_request_tickets(self):
         first, second = self.nodes[:2]
         second.subscription = deepcopy(first.subscription)
@@ -153,6 +171,21 @@ class ManagedShotTests(unittest.IsolatedAsyncioTestCase):
         self.manager.records[node.subscription["shot_uuid"]]["result"]["run_id"] = "replacement"
         with self.assertRaises(t._AgentResultUnavailable):
             node._assert_agent_result_available()
+
+    async def test_model_audio_flag_must_match_this_generators_resolved_request(self):
+        node = self.nodes[0]
+        native = self.manager._hmb_run_agent_shot
+        async def contradictory_sound(**kwargs):
+            record = await native(**kwargs)
+            record["generator_audio_outputs"] = {node.name: not bool(node._get_parameters().get("generate_audio"))}
+            return record
+        self.manager._hmb_run_agent_shot = contradictory_sound
+        node._clear_execution_status = mock.Mock()
+        node._publish_agent_result_skipped = mock.Mock()
+        node._process_generation = mock.AsyncMock(side_effect=AssertionError("Mismatched audio reached generation"))
+        await node._aprocess_impl()
+        self.assertIn("오디오 설정", node._publish_agent_result_skipped.call_args.args[0])
+        node._process_generation.assert_not_awaited()
 
     async def test_foreign_shot_result_rejected_even_with_valid_hash(self):
         node = self.nodes[0]

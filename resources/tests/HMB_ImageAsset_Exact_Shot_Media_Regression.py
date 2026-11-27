@@ -95,13 +95,41 @@ with mock.patch.object(images,"_resolved_media_value", wraps=images._resolved_me
 assert json.dumps(state,sort_keys=True) == baseline
 scope = {"channel_uuid":channel, "shot_uuid":shots[0]["shot_uuid"]}
 view = images._hmb_shot_routing.source_shot_status_fields
+assert scope not in view(node,state)["verified_shots"]
+with images._hmb_shot_routing.collect_prompt_source_reads(node) as reads:
+    exact(1, cached_only=True)
+assert scope not in view(node,state)["verified_shots"]
+assert images._hmb_shot_routing.accept_prompt_source_reads(reads, channel, scope["shot_uuid"])
 assert scope in view(node,state)["verified_shots"]
+other_reader = mock.Mock()
+with images._hmb_shot_routing.collect_prompt_source_reads(other_reader) as independent_read:
+    exact(1, cached_only=True)
+assert images._hmb_shot_routing.accept_prompt_source_reads(independent_read, channel, scope["shot_uuid"])
+images._hmb_shot_routing.release_source_receiver(node, node)
+assert scope in view(node,state)["verified_shots"]
+assert images._hmb_shot_routing.accept_prompt_source_reads(reads, channel, scope["shot_uuid"]) is None
+images._hmb_shot_routing.release_source_receiver(node, other_reader)
+assert scope not in view(node,state)["verified_shots"]
+with images._hmb_shot_routing.collect_prompt_source_reads(node) as replacement_read:
+    exact(1, cached_only=True)
+assert images._hmb_shot_routing.accept_prompt_source_reads(independent_read, channel, scope["shot_uuid"]) is None
+assert images._hmb_shot_routing.accept_prompt_source_reads(replacement_read, channel, scope["shot_uuid"])
 assert dict(scope, shot_uuid=shots[1]["shot_uuid"]) not in view(node,state)["verified_shots"]
 switched = deepcopy(state)
 switched["shot_routing"]["active_shot_uuid"] = shots[3]["shot_uuid"]
 assert scope in view(node,switched)["verified_shots"]
 switched["shot_routing"]["shots"][0]["selected_source_uids"].reverse()
 assert scope not in view(node,switched)["verified_shots"]
+with images._hmb_shot_routing.collect_prompt_source_reads(other_reader) as fresh_read:
+    exact(1, cached_only=True)
+assert images._hmb_shot_routing.accept_prompt_source_reads(fresh_read, channel, scope["shot_uuid"])
+other_reader._hmb_source_receipts_changed.assert_not_called()
+assert scope not in view(node, switched, committed=True)["verified_shots"]
+receiver_source, revoked = other_reader._hmb_source_receipts_changed.call_args.args
+assert receiver_source is node and set(revoked) == {(channel, scope["shot_uuid"])}
+assert scope not in view(node,state)["verified_shots"]
+view(node, switched, committed=True)
+other_reader._hmb_source_receipts_changed.assert_called_once()
 with mock.patch.object(images._hmb_shot_routing,"shot_edit_locks",return_value=[scope]):
     try:
         node._hmb_dismiss_unavailable_prompt_images(scope["channel_uuid"],scope["shot_uuid"],{"import:c"})

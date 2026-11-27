@@ -82,18 +82,31 @@ try{
   const firstRow=page.locator('[data-picker-shot-layout="compact"][data-picker-shot-row="11111111-1111-4111-8111-000000000001"]');
   assert.equal(await page.locator('.hmbvp').getAttribute('data-picker-view'),'compact');
   assert.match(await firstRow.innerText(),/로동중\.\.\. 수정불가/,'Cold compact mount must hydrate an existing render');
-  async function assertCheckedNumber(row) {
-    const check=row.locator('.picker-shot-number[data-hmb-shot-check="true"]');
-    assert.equal(await check.textContent(),'01');
-    assert.match(await check.getAttribute('aria-label'),/검증 완료/);
-    assert.deepEqual(await check.evaluate(el=>{
-      const glyph=getComputedStyle(el,'::before');
-      let parent=el;
-      while(parent && getComputedStyle(parent).filter==='none' && getComputedStyle(parent).opacity==='1')parent=parent.parentElement;
-      return [glyph.content,glyph.color,glyph.fontSize,parent?.className||''];
-    }),['"✓"','rgb(74, 222, 128)','20px','']);
+  async function assertCheckedNumber(layout) {
+    // A layout change replaces the row. Select and measure the live row in one browser callback.
+    const snapshot = await page.waitForFunction(layout => {
+      const view = document.querySelector(`#widget .hmbvp[data-picker-view="${layout}"]`);
+      const row = view?.querySelector(`[data-picker-shot-layout="${layout}"][data-picker-shot-row="11111111-1111-4111-8111-000000000001"]`);
+      const number = row?.querySelector('.picker-shot-number[data-hmb-shot-check="true"]');
+      if (!number?.isConnected || !number.getClientRects().length) return false;
+      const glyph = getComputedStyle(number, '::before');
+      let parent = number;
+      while (parent) {
+        const style = getComputedStyle(parent);
+        if (style.filter !== 'none' || style.opacity !== '1') break;
+        parent = parent.parentElement;
+      }
+      return {number: number.textContent, label: number.getAttribute('aria-label'), locked: row.textContent,
+        glyph: [glyph.content, glyph.color, glyph.fontSize, parent?.className || '']};
+    }, layout);
+    const measured = await snapshot.jsonValue();
+    await snapshot.dispose();
+    assert.equal(measured.number, '01');
+    assert.match(measured.label, /검증 완료/);
+    assert.match(measured.locked, /로동중\.\.\. 수정불가/);
+    assert.deepEqual(measured.glyph, ['"✓"', 'rgb(74, 222, 128)', '20px', '']);
   }
-  await assertCheckedNumber(firstRow);
+  await assertCheckedNumber('compact');
   const headerVisibility=await page.evaluate(()=>{
     const actions=document.querySelector('[data-hmb-native-actions]');
     const group=document.createElement('section');
@@ -126,7 +139,7 @@ try{
   assert.equal(await firstRow.locator('[data-picker-shot-load]').isDisabled(),true);
   await page.evaluate(()=>controller.update(props({...initialPickerState,state_revision:10})));
   assert.match(await firstRow.innerText(),/로동중\.\.\. 수정불가/);
-  await assertCheckedNumber(firstRow);
+  await assertCheckedNumber('compact');
   await page.evaluate(()=>{
     const third='11111111-1111-4111-8111-000000000003';
     const shot={workspace_uuid:third,bound_shot_uuid:third,number:3,name:'Shot 3',revision:1,video_asset_uids:[],selected_video_uids:[]};
@@ -136,9 +149,7 @@ try{
   assert.equal(await page.locator('[data-picker-shot-load="11111111-1111-4111-8111-000000000003"]').isEnabled(),true);
   assert.equal(await firstRow.locator('[data-picker-shot-load]').isDisabled(),true);
   if(await page.locator('.hmbvp').getAttribute('data-picker-view')!=='expanded')await page.locator('[data-picker-toggle-surface="header"]').dispatchEvent('dblclick');
-  const lockedRow=page.locator('[data-picker-shot-row="11111111-1111-4111-8111-000000000001"]:visible').first();
-  assert.match(await lockedRow.textContent(), /로동중\.\.\. 수정불가/);
-  await assertCheckedNumber(lockedRow);
+  await assertCheckedNumber('expanded');
   assert.equal(await page.locator('.outliner-scroll:visible').evaluate(el=>el.inert),true);
   await page.locator('[data-picker-shot-activate="11111111-1111-4111-8111-000000000002"]').first().click();
   assert.equal(await page.locator('.outliner-scroll:visible').evaluate(el=>el.inert),false);

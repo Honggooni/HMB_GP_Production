@@ -4771,6 +4771,35 @@ def _uuid_text(value: Any) -> str:
         return ""
 
 
+def _picker_route_changes(previous: Dict[str, Any], current: Dict[str, Any]) -> tuple[bool, bool]:
+    """Return whether to reconcile shot bindings and whether to publish media."""
+    identity_fields = (
+        "shot_publisher_instance_uuid", "channel_uuid", "shot_uuid", "shot_number", "shot_name",
+        "active_picker_shot_uuid", "picker_legacy_membership_fallbacks",
+    )
+    if any(previous.get(key) != current.get(key) for key in identity_fields):
+        return True, True
+    local_fields = {"selected_video_uids", "revision", "preview_video_uid", "selected_video_slot", "preview_frame"}
+    rows_changed = False
+    selection_changed = False
+    for key in ("shot_selections", "picker_shots"):
+        old_rows = previous.get(key) or []
+        new_rows = current.get(key) or []
+        if len(old_rows) != len(new_rows):
+            return True, True
+        for old, new in zip(old_rows, new_rows):
+            if old == new:
+                continue
+            # Selected slots and their preview cursor belong to an existing
+            # workspace. Ownership, bindings and every unknown field still
+            # take the full routing path, including mixed edits.
+            if any(old.get(field) != new.get(field) for field in (old.keys() | new.keys()) - local_fields):
+                return True, True
+            rows_changed = True
+            selection_changed |= old.get("selected_video_uids") != new.get("selected_video_uids")
+    return rows_changed and not selection_changed, rows_changed
+
+
 def _normalize_shot_selection_fields(state: Dict[str, Any]) -> None:
     """Normalize only durable subscriber identity and per-shot video membership."""
     state["shot_publisher_instance_uuid"] = _uuid_text(
@@ -15167,6 +15196,7 @@ class HMBVideoPickerLibrary(DataNode):
             self._hmb_state_revision = normalized["state_revision"]
             self._hmb_authoritative_state = dict(normalized)
             self._hmb_latest_widget_state = dict(normalized)
+            _shot_routing.invalidate_changed_source_receipts(self, normalized)
 
     @staticmethod
     def _merge_widget_state(authoritative: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
@@ -15719,7 +15749,17 @@ class HMBVideoPickerLibrary(DataNode):
         }
 
     def _hmb_shot_channel_subscription(self) -> Dict[str, Any]:
-        state = self._picker_state()
+        # Routing needs four scalars. For the exact accepted native value the
+        # Picker already owns a normalized copy, including the channel. A
+        # different incoming/hydrating value still goes through the full
+        # revision arbitration and old-workflow migration in _picker_state.
+        stored = getattr(self, "parameter_values", {}).get(WIDGET_STATE_PARAMETER)
+        accepted = getattr(self, "_hmb_authoritative_state", None)
+        if (isinstance(stored, dict) and isinstance(accepted, dict)
+                and accepted.get("channel_uuid") and stored == accepted):
+            state = accepted
+        else:
+            state = self._picker_state()
         channel_uuid = _uuid_text(state.get("channel_uuid"))
         shot_uuid = _uuid_text(state.get("shot_uuid"))
         if not channel_uuid:
@@ -16563,7 +16603,7 @@ class HMBVideoPickerLibrary(DataNode):
                 _shot_routing.clear_source_shot_check(self, channel, target)
             raise
         if validate_media:
-            _shot_routing.record_source_shot_check(self, state, channel, target)
+            _shot_routing.observe_prompt_source_read(self, state, channel, target)
         return snapshot
 
     def _picker_source_row(self, state, channel, shot):
@@ -16586,6 +16626,9 @@ class HMBVideoPickerLibrary(DataNode):
             if (tuple(row.get("video_asset_uids", ())) != tuple(new_row.get("video_asset_uids", ()))
                     or self._hmb_source_shot_key(previous, channel, shot) != self._hmb_source_shot_key(updated, channel, shot)):
                 _shot_routing.assert_shot_editable(self, channel, shot)
+
+    def _hmb_current_source_shot_key(self, channel, shot):
+        return self._hmb_source_shot_key(self._picker_state(), channel, shot)
 
     def _hmb_source_shot_key(self, state, channel, shot):
         row = self._picker_source_row(state, channel, shot)
@@ -21057,6 +21100,7 @@ class HMBVideoPickerLibrary(DataNode):
             self._synchronize_picker_expanded_geometry_metadata(merged)
             self._hmb_latest_widget_state = dict(merged)
             self._hmb_authoritative_state = dict(merged)
+            _shot_routing.invalidate_changed_source_receipts(self, merged)
             self._hmb_state_revision = max(
                 int(getattr(self, "_hmb_state_revision", 0) or 0),
                 int(merged.get("state_revision") or 0),
@@ -21087,42 +21131,14 @@ class HMBVideoPickerLibrary(DataNode):
                         "A camera, frame, Color Pick, or scene input changed during execution. The old result will be discarded.",
                         terminate=True,
                     )
-            previous_output_signature = _json_text({
-                "active_slot_count": int(previous_state.get("active_slot_count") or 1),
-                "videos": previous_state.get("videos") or [],
-            })
-            merged_output_signature = _json_text({
-                "active_slot_count": int(merged.get("active_slot_count") or 1),
-                "videos": merged.get("videos") or [],
-            })
-            previous_route_signature = _json_text({
-                "shot_publisher_instance_uuid": previous_state.get("shot_publisher_instance_uuid"),
-                "channel_uuid": previous_state.get("channel_uuid"),
-                "shot_uuid": previous_state.get("shot_uuid"),
-                "shot_number": previous_state.get("shot_number"),
-                "shot_name": previous_state.get("shot_name"),
-                "shot_selections": previous_state.get("shot_selections") or [],
-                "picker_shots": previous_state.get("picker_shots") or [],
-                "active_picker_shot_uuid": previous_state.get("active_picker_shot_uuid"),
-                "picker_legacy_membership_fallbacks": previous_state.get("picker_legacy_membership_fallbacks") or {},
-            })
-            merged_route_signature = _json_text({
-                "shot_publisher_instance_uuid": merged.get("shot_publisher_instance_uuid"),
-                "channel_uuid": merged.get("channel_uuid"),
-                "shot_uuid": merged.get("shot_uuid"),
-                "shot_number": merged.get("shot_number"),
-                "shot_name": merged.get("shot_name"),
-                "shot_selections": merged.get("shot_selections") or [],
-                "picker_shots": merged.get("picker_shots") or [],
-                "active_picker_shot_uuid": merged.get("active_picker_shot_uuid"),
-                "picker_legacy_membership_fallbacks": merged.get("picker_legacy_membership_fallbacks") or {},
-            })
-            if merged_route_signature != previous_route_signature:
+            bindings_changed, route_changed = _picker_route_changes(previous_state, merged)
+            # A picker with no confirmed live catalog must still rediscover it.
+            if route_changed and (bindings_changed or not getattr(self, "_hmb_shot_catalog_snapshot", None)
+                                  or (getattr(self, "_hmb_shot_route_status", None) or {}).get("code") != "ready"):
                 self._reconcile_shared_shot_routing()
                 merged = self._picker_state()
-            if merged_output_signature != previous_output_signature:
-                self._sync_outputs_from_state(dict(merged))
-            elif merged_route_signature != previous_route_signature:
+            if (route_changed or previous_state.get("active_slot_count") != merged.get("active_slot_count")
+                    or previous_state.get("videos") != merged.get("videos")):
                 self._sync_outputs_from_state(dict(merged))
         except Exception as exc:
             _diagnostic_exception("after_value_set failed", exc)

@@ -251,6 +251,34 @@ class MultishotTests(unittest.TestCase):
                 return await asyncio.gather(node._hmb_run_agent_shot(channel_uuid="channel",shot_uuid="shot-1",prompt_owner=prompt,generator=one),node._hmb_run_agent_shot(channel_uuid="channel",shot_uuid="shot-1",prompt_owner=prompt,generator=two))
         first,second=asyncio.run(run())
         self.assertEqual(len(counter),2)
+        scope = dict(channel_uuid="channel", shot_uuid="shot-1")
+        key = node._hmb_slot_key(**scope)
+        node._hmb_request_editor_layout = Mock()
+        for target in (one, two):
+            target._manual_agent_prompt_source = lambda: node
+            target._hmb_shot_channel_subscription = lambda: subscription(1)
+        self.assertNotIn(key, node._hmb_completed_stage_revisions)  # Both model runs succeeded.
+        def receipt(target, record, **identity):
+            return node._hmb_ack_generator_shot_result(generator=target, run_id=record["result"]["run_id"],
+                                                       record=record, **(identity or scope))
+        self.assertTrue(receipt(one, first))  # Independent ticket remains valid for its Generator.
+        self.assertNotIn(key, node._hmb_completed_stage_revisions)
+        self.assertFalse(receipt(one, second))
+        self.assertFalse(receipt(two, second, channel_uuid="channel", shot_uuid="shot-2"))
+        self.assertFalse(receipt(two, {**second, "text": "different output"}))
+        two.is_cancellation_requested = True
+        self.assertFalse(receipt(two, second))
+        two.is_cancellation_requested = False
+        two._manual_agent_prompt_source = lambda: object()
+        self.assertFalse(receipt(two, second))
+        two._manual_agent_prompt_source = lambda: node
+        self.assertTrue(receipt(two, second))
+        self.assertTrue(receipt(two, copy.deepcopy(second)))
+        node._hmb_request_editor_layout.assert_called_once()
+        self.assertIn(key, node._hmb_completed_stage_revisions)
+        node._hmb_invalidate_shot_stage(**scope)
+        self.assertFalse(receipt(two, second))  # Previous ticket survives, its badge does not.
+        self.assertNotIn(key, node._hmb_completed_stage_revisions)
         self.assertEqual(node._hmb_agent_shot_result(channel_uuid="channel",shot_uuid="shot-1",run_id=first["result"]["run_id"],generator=one),first)
         self.assertEqual(node._hmb_agent_shot_result(channel_uuid="channel",shot_uuid="shot-1",run_id=second["result"]["run_id"],generator=two),second)
         self.assertEqual(node._hmb_agent_shot_result(channel_uuid="channel",shot_uuid="shot-1")["text"],second["text"])
@@ -259,6 +287,11 @@ class MultishotTests(unittest.TestCase):
         self.assertTrue(node._hmb_release_agent_shot_result(channel_uuid="channel",shot_uuid="shot-1",run_id=first["result"]["run_id"],generator=one))
         self.assertEqual(node._hmb_agent_shot_result(channel_uuid="channel",shot_uuid="shot-1",run_id=first["result"]["run_id"],generator=one),{})
         self.assertEqual(node._hmb_agent_shot_result(channel_uuid="channel",shot_uuid="shot-1",run_id=second["result"]["run_id"],generator=two),second)
+        with patch.object(module._HMBAgentShotExecution, "_from_owner", side_effect=factory):
+            third = asyncio.run(node._hmb_run_agent_shot(**scope, prompt_owner=prompt, generator=two))
+            fourth = asyncio.run(node._hmb_run_agent_shot(**scope, prompt_owner=prompt, generator=two))
+        self.assertFalse(receipt(two, third))  # Same Generator replaced its own request.
+        self.assertTrue(receipt(two, fourth))
 
     def test_completed_run_preserves_settings_edited_for_future_renders(self):
         node,prompt=manager();key="channel\x1fshot-1";seen=[]
@@ -281,6 +314,33 @@ class MultishotTests(unittest.TestCase):
         node,_=manager()
         with patch.object(module._HMBAgentShotExecution,"_from_owner",side_effect=AssertionError("foreign prompt started")):
             with self.assertRaises(RuntimeError):asyncio.run(node._hmb_run_agent_shot(channel_uuid="channel",shot_uuid="shot-1",prompt_owner=object()))
+
+    def test_prompt_receipt_uses_received_shot_input_and_original_validated_document(self):
+        node, owner = manager()
+        shot = subscription(2)
+        visible, machine = "Current visible shot", "Machine envelope"
+        paired = {"schema": "hmb-prompt-paired-snapshot", "version": 1, "generation": 7,
+                  "visible_sha256": hashlib.sha256(visible.encode()).hexdigest(),
+                  "machine_sha256": hashlib.sha256(machine.encode()).hexdigest(), "machine_prompt": machine}
+        document = {"schema": "hmb-prompt-shot-document", "version": 1, "generation": 7,
+                    "subscription": {**shot, "participant_kind": "prompt"}, "visible_prompt": visible,
+                    "machine_prompt": machine, "paired_snapshot": paired}
+        owner._hmb_ack_agent_shot_document = Mock(return_value=True)
+        node._hmb_ack_received_prompt_document(owner, shot, document, received_prompt=visible)
+        ack = owner._hmb_ack_agent_shot_document
+        self.assertIs(ack.call_args.kwargs["document"], document)
+        self.assertIs(ack.call_args.kwargs["agent"], node)
+        ack.reset_mock()
+        for wrong_shot, wrong_doc, received in (
+                (subscription(1), document, visible), (shot, document, "Previous input"),
+                (shot, {**document, "generation": 8}, visible),
+                (shot, {**document, "paired_snapshot": {**paired, "machine_sha256": "0" * 64}}, visible)):
+            with self.assertRaises(RuntimeError):
+                node._hmb_ack_received_prompt_document(owner, wrong_shot, wrong_doc, received_prompt=received)
+        ack.assert_not_called()
+        ack.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "changed before"):
+            node._hmb_ack_received_prompt_document(owner, shot, document, received_prompt=visible)
 
     def test_failed_shot_clears_only_its_old_admission(self):
         node,prompt=manager();node._hmb_shot_results={"channel\x1fshot-1":{"text":"old"},"channel\x1fshot-2":{"text":"keep"}}

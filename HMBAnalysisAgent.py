@@ -11,6 +11,7 @@ import secrets
 from stat import S_ISREG
 from tempfile import TemporaryDirectory
 import threading
+import weakref
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -18,7 +19,7 @@ from _hmb_node_controls import (
     DataNode, _add_parameter, _add_widget_parameter, _mode, _set_parameter_silently,
 )
 from _hmb_analysis_delivery import (
-    ANALYSIS_RESULT_TEXT_LIMIT, invalidate_resolved_analysis_consumer,
+    ANALYSIS_RESULT_TEXT_LIMIT, analysis_payload_sha256, invalidate_resolved_analysis_consumer,
     _ROLES, _AnalysisStateError, _OtherShotAnalyzing, _analysis_role, _edited_result,
     _find_analysis_node, _live_analysis_nodes, _prompt_analysis_originals, _reference_tokens,
     _registered_node_class, _scope, analysis_render_input_preview, get_analysis_context,
@@ -395,6 +396,7 @@ class HMBAnalysisAgent(DataNode):
         self._lock = threading.RLock()
         self._role: str | None = None
         self._slots: dict[str, dict] = {}
+        self._hmb_analysis_receipts = {}
         self._active = ("", "")
         self._revision = 0
         self._ack = ""
@@ -470,6 +472,7 @@ class HMBAnalysisAgent(DataNode):
             if len(live) > len(_ROLES) or any(node is not self and _analysis_role(node) == role for node in live):
                 raise _AnalysisStateError("이 워크플로에서 해당 사용 위치의 분석 노드가 이미 있습니다.")
             self._role = role
+            self._hmb_analysis_receipts.clear()
         self._refresh_sources(preserve_results=True)
         for owner, catalog in self._registered_catalogs():
             for shot in catalog["shots"]:
@@ -754,6 +757,22 @@ class HMBAnalysisAgent(DataNode):
         except ValueError as exc:
             raise _AnalysisStateError(str(exc)) from exc
 
+    def _hmb_analysis_delivery_token(self, key):
+        with self._lock:
+            slot = self._slots.get(key)
+            return (analysis_payload_sha256({name: value for name, value in slot.items() if name != "prompt_applied"})
+                    if slot and slot.get("origin") else "")
+
+    def _hmb_analysis_shot_received(self, role, channel, shot):
+        key = _scope(channel, shot)
+        receipt = self._hmb_analysis_receipts.get((role, key))
+        if not receipt or receipt[0] != self._hmb_analysis_delivery_token(key):
+            return False
+        if role == "after":
+            return any(link.active for link in receipt[2])
+        owner = receipt[2]()
+        return owner is not None and receipt[1] == owner._hmb_analysis_fields_sha256(channel, shot)
+
     def _publish(self) -> None:
         role, available_roles, role_conflict = self._role_options()
         with self._lock:
@@ -777,9 +796,8 @@ class HMBAnalysisAgent(DataNode):
                 if end is not None and 0 < end - start <= 30:
                     public["time_ranges"] = [{"start": start, "end": end}]
             jobs = self._job[0] if self._job is not None else ""
-            applied_field = "prompt_applied" if role == "before" else "applied"
             rows = [{**row, "busy": _scope(channel, row["shot_uuid"]) == jobs,
-                     "applied": bool(self._slots.get(_scope(channel, row["shot_uuid"]), {}).get(applied_field))}
+                     "applied": self._hmb_analysis_shot_received(role, channel, row["shot_uuid"])}
                     for row in self._catalog.get("shots", [])]
             state = {"schema": _SCHEMA, "version": 1, "role": role, "active": list(self._active),
                      "slots": copy.deepcopy(self._slots)}
@@ -843,6 +861,7 @@ class HMBAnalysisAgent(DataNode):
                     if isinstance(active, list) and len(active) == 2:
                         self._active = tuple(_text(part, 128) for part in active)
                     if isinstance(supplied, dict):
+                        self._hmb_analysis_receipts.clear()
                         self._slots = {key: _normalize_slot(slot) for key, slot in list(supplied.items())[:32]
                             if isinstance(key, str) and len(key) <= 257 and key.count("\x1f") == 1}
         return super().set_parameter_value(name, value, *args, **kwargs)
@@ -850,10 +869,9 @@ class HMBAnalysisAgent(DataNode):
     def _hmb_post_registration_shot_discovery(self) -> None:
         self._refresh_sources()
         self._publish()
-        if _analysis_role(self) == "after":
-            for owner, catalog in self._registered_catalogs():
-                for shot in catalog["shots"]:
-                    _notify_prompt_media_changed(owner, catalog["channel_uuid"], shot["shot_uuid"])
+        for owner, catalog in self._registered_catalogs():
+            for shot in catalog["shots"]:
+                _notify_prompt_media_changed(owner, catalog["channel_uuid"], shot["shot_uuid"])
         _, nodes = _same_flow_nodes(self)
         for node in _live_analysis_nodes(nodes):
             if node is not self:
@@ -902,9 +920,10 @@ class HMBAnalysisAgent(DataNode):
 
     def after_node_deleted(self, *args: Any, **kwargs: Any) -> Any:
         _, nodes = _same_flow_nodes(self)
-        catalogs = self._registered_catalogs() if _analysis_role(self) == "after" else []
+        catalogs = self._registered_catalogs()
         with self._lock:
             self._hmb_node_deleted = True
+            self._hmb_analysis_receipts.clear()
             if self._job is not None:
                 self._job[1].set()
         for node in _live_analysis_nodes(nodes):
@@ -1001,14 +1020,23 @@ class HMBAnalysisAgent(DataNode):
         slot, _ = self._verified_delivery(owner, channel, shot, "prompt_fields")
         apply = getattr(owner, "_hmb_apply_analysis_fields", None)
         accepted = False
+        fields = _prompt_result_fields(slot) if slot else {}
         try:
-            accepted = bool(slot and callable(apply) and apply(channel, shot, _prompt_result_fields(slot)) is True)
+            accepted = bool(slot and callable(apply) and apply(channel, shot, fields) is True)
         except (RuntimeError, ValueError):
             _LOG.exception("Unable to apply reference analysis to Prompt Shot")
         with self._lock:
-            current = self._slots.get(_scope(channel, shot))
+            key = _scope(channel, shot)
+            current = self._slots.get(key)
             if current == slot:
                 current["prompt_applied"] = accepted
+                expected = analysis_payload_sha256({name: value for name, value in fields.items() if value})
+                confirm = getattr(owner, "_hmb_analysis_fields_sha256", None)
+                if accepted and callable(confirm) and confirm(channel, shot) == expected:
+                    self._hmb_analysis_receipts[("before", key)] = (
+                        self._hmb_analysis_delivery_token(key), expected, weakref.ref(owner))
+                else:
+                    self._hmb_analysis_receipts.pop(("before", key), None)
             self._status = ("선택한 샷의 Prompt 필드에 분석 결과 반영 완료" if accepted
                             else "분석 결과를 보존했습니다. Prompt 샷 연결과 잠금을 확인하세요.")
         return accepted
@@ -1168,7 +1196,7 @@ class HMBAnalysisAgent(DataNode):
                     if self._slots.get(key) == slot:
                         self._slots[key]["source_binding"] = source["source_binding"]
             if _analysis_role(self) == "before":
-                if execution_digest is None or not slot["prompt_applied"]:
+                if execution_digest is None or not self._hmb_analysis_shot_received("before", channel, shot):
                     self._apply_prompt_fields(owner, channel, shot)
             else:
                 with self._lock:
