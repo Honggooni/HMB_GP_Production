@@ -26,15 +26,15 @@ build instructions, license and MinGW runtime notices accompany the utilities
 under `resources/media-tools/`. See [FFmpeg](https://ffmpeg.org/) and
 [VideoLAN x264](https://www.videolan.org/developers/x264.html).
 
-Optional Volcengine TOS uploads run in a separate `.venv-tos` interpreter:
+Legacy TOS installations may contain a separate `.venv-tos` interpreter:
 
 - Volcengine TOS Python SDK 2.9.2 — Apache-2.0 license
 - Its dependencies, including wrapt 1.16.0, belong only to that isolated
   interpreter. They are not imported into the Griptape engine environment.
 - After a normal Git Update/Override, the next cold library load safely
   migrates known legacy TOS editor dependencies with a verified recovery copy.
-  Loaded dependencies defer migration until Griptape is restarted. Optional
-  TOS preparation runs separately from Cloud generation and saved-result playback.
+  Loaded dependencies defer migration until Griptape is restarted.
+  Generator render inputs use Griptape Cloud.
 - The included installer is an alternative for explicit installation and recovery.
   On a fresh installation, `-PrepareTosRuntime` provisions this optional runtime.
   Rendering does not install packages.

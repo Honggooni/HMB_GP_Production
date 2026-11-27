@@ -174,6 +174,28 @@ try {
       switchTo(shotIds[0]);
       if (hint()) throw Error("A retained editor restored a stale selection after its source changed.");
     });
+    await page.evaluate(() => {
+      const f = selectionFixture, source = f.container;
+      const cached = structuredClone(source.__hmbImageAssetLatestState);
+      cached.scan_revision++;
+      cached.error = "프로젝트 폴더 읽기가 지연되었습니다.";
+      cached.shot_routing.shots[0].image_link_notices = [{uid:"old-file",label:"Disconnected",path:"old/asset.png"}];
+      const apply = value => f.controller.update({value:JSON.stringify(value),onChange:f.onChange});
+      f.controller.cleanup();
+      f.controller = f.widget.default(source,{value:JSON.stringify(cached),onChange:f.onChange});
+      source.querySelector("[data-shot-tray] [data-dismiss-shot-link]").click();
+      source.querySelector('.asset-grid [data-asset-key="asset-2"]').click();
+      f.widget.hmbFlushImageAssetSelectionCommit(source);
+      const repaint = structuredClone(source.__hmbImageAssetLatestState);
+      repaint.scan_revision++;
+      apply(repaint);
+      const prompt = document.querySelector("#prompt");
+      if (!prompt.querySelector('[data-hmb-selection-preview]')?.textContent.includes("Hero 2")
+          || prompt.querySelector('.image-card h3 b')?.textContent !== '3 / 50'
+          || source.querySelector("[data-dismiss-shot-link]")) {
+        throw Error("A folder read warning cancelled a new selection after the old link notice was dismissed.");
+      }
+    });
     await page.evaluate(() => { selectionFixture.observer.disconnect(); selectionFixture.controller.cleanup(); selectionFixture.prompt.cleanup(); });
     await page.close();
   }

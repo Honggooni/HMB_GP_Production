@@ -301,6 +301,24 @@ try{
  await notice.waitFor({state:'detached'});
  await page.waitForFunction(()=>!(window.latest.image_link_notices||[]).length);
  assert.equal(await activeCopy.locator('[data-field="image_sub_type"]').count(),1);
+ // The retained catalog can publish the UID list before the new editable row
+ // arrives. A dismissed notice must not acknowledge that replacement.
+ const somi = row('project:somi','Somi_ASheet_');
+ await page.evaluate(({base,somi})=>{
+   const partial=window.sourceUpdate([base,somi]);
+   partial.images=[base];
+   window.accept(partial);
+ },{base:connected[0],somi});
+ await waitForLabels(['Replacement']);
+ await page.evaluate(()=>window.preview(100,[{source_uid:'project:replacement',label:'Replacement'},
+   {source_uid:'project:somi',label:'Somi_ASheet_'}]));
+ assert.equal(await page.locator('.image-card h3 b').textContent(),'2 / 50',
+   'Two selected UIDs are visible while only one confirmed row is available');
+ assert.equal(await page.locator('[data-hmb-image-selection-pending="project:somi"]').count(),1);
+ await accepted([connected[0],somi]);
+ assert.equal(await page.locator('[data-hmb-image-selection-pending]').count(),0);
+ assert.equal(await page.locator('[data-hmb-image-selection-uid="project:somi"] [data-field="image_main_type"]').count(),1);
+ assert.equal(await notice.count(),0);
  assert.equal(await replacementText.inputValue(),'New workspace edit');
  assert.equal(external,0);assert.deepEqual(failures,[]);
  console.log('HMB Prompt Asset selection lifecycle: PASS (same UUID add/remove/reorder, UID/Main/Sub/Color and five documents repaint; unrelated renumber retains UUID/body; one retained editor; Korean draft/caret and stale-echo guard; external0)');

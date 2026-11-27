@@ -153,6 +153,17 @@ async def exercise(engine):
         image._hmb_update_shot_link_notices(CHANNEL, ROWS[0]["shot_uuid"], dismiss={"project:removed-path"})
         probe, actual_media, *_ = prompt._apply_exact_shot_routes(probe)
         assert not probe.get("image_link_notices") and actual_media == media
+        # Re-registration at the same path can produce the very same UID.
+        # Dismissing the historical notice must never remove the new live row.
+        current_uid = ROWS[0]["selected_source_uids"][0]
+        same_uid_notice = {"uid": current_uid, "label": active["label"], "path": "old/e203/A.png"}
+        image._hmb_update_shot_link_notices(CHANNEL, ROWS[0]["shot_uuid"], additions=[same_uid_notice])
+        probe, actual_media, *_ = prompt._apply_exact_shot_routes(probe)
+        assert probe["image_link_notices"] == [same_uid_notice] and actual_media == media
+        image._hmb_update_shot_link_notices(CHANNEL, ROWS[0]["shot_uuid"], dismiss={current_uid})
+        probe, actual_media, *_ = prompt._apply_exact_shot_routes(probe)
+        assert not probe.get("image_link_notices") and actual_media == media
+        assert [r["asset_source_uid"] for r in probe["images"] if r.get("asset_managed")] == [current_uid]
         for _ in range(24):
             for n, row in enumerate(ROWS, 1):
                 state = prompts._select_prompt_shot_document(state, {**row, "channel_uuid": CHANNEL})

@@ -8660,8 +8660,13 @@ function hmbNativeUiImplementation(container, props) {
       const heading = container.querySelector(image ? ".image-card h3" : ".video-card h3");
       if (!sameShot(preview)) { preview.hint?.remove(); clearTimeout(preview.timer); pendingMedia.delete(kind); continue; }
       const ready = image ? state.image_asset.ordered_source_uids : state.picker.ordered_video_uids;
+      const confirmedImages = image ? state.images
+        .filter(row => row.asset_managed && row.present && !row.asset_source_unavailable)
+        .map(row => row.asset_source_uid) : null;
       if (preview.cancelled || (ready.length === preview.rows.length &&
-        ready.every((uid, index) => uid === preview.rows[index].source_uid))) {
+        ready.every((uid, index) => uid === preview.rows[index].source_uid)
+        && (!image || (confirmedImages.length === ready.length
+          && confirmedImages.every((uid, index) => uid === ready[index]))))) {
         preview.hint?.remove();
         clearTimeout(preview.timer);
         preview.cancelled = true;

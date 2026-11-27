@@ -117,8 +117,8 @@ class AdvancedTransportOptionsRegression(unittest.TestCase):
         self.assertEqual(body["output_format"], "mov")
         self.assertEqual(values, original)
 
-    def test_cloud_and_tos_selection_are_local_transport_controls_not_provider_fields(self):
-        for service in t.LOCAL_VIDEO_UPLOAD_SERVICES:
+    def test_legacy_transport_settings_survive_reopen_and_stay_out_of_render_requests(self):
+        for service in (*t.LOCAL_VIDEO_UPLOAD_SERVICES, "unsupported saved uploader"):
             for auto_publish in (False, True):
                 with self.subTest(service=service, auto_publish=auto_publish):
                     values = self.values(local_video_upload_service=service,
@@ -131,32 +131,28 @@ class AdvancedTransportOptionsRegression(unittest.TestCase):
                                   "tos_endpoint", "tos_url_validity_seconds"):
                         self.assertNotIn(field, body)
                     self.assertEqual(values, original)
-        self.invalid(local_video_upload_service="unsupported uploader")
 
-    def test_tos_signed_url_exact_one_hour_and_thirty_day_limits(self):
-        for ttl in (3600, 86400, 2592000):
+    def test_retired_tos_ttl_does_not_block_cloud_requests(self):
+        for ttl in (3600, 86400, 2592000, 3599, 2592001, 0, True, False, 3600.0, "3600", None):
             with self.subTest(ttl=ttl):
                 values = self.values(local_video_upload_service=t.LOCAL_VIDEO_UPLOAD_TOS,
                     tos_url_validity_seconds=ttl, tos_region=t.DEFAULT_TOS_REGION,
                     tos_endpoint=t.DEFAULT_TOS_ENDPOINT)
                 self.validate(values)
                 self.assertEqual(values["tos_url_validity_seconds"], ttl)
-        for ttl in (3599, 2592001, 0, True, False, 3600.0, "3600", None):
-            with self.subTest(ttl=ttl):
-                self.invalid(local_video_upload_service=t.LOCAL_VIDEO_UPLOAD_TOS,
-                    tos_url_validity_seconds=ttl, tos_region=t.DEFAULT_TOS_REGION,
-                    tos_endpoint=t.DEFAULT_TOS_ENDPOINT)
 
-    def test_tos_endpoint_host_and_scheme_are_validated_before_upload(self):
+    def test_stale_tos_endpoint_from_workflow_is_never_forwarded(self):
         for endpoint in ("http://tos-cn-beijing.volces.com", "https://attacker.example",
                          "https://tos-cn-beijing.volces.com/path",
                          "https://secret@tos-cn-beijing.volces.com",
                          "https://tos-cn-beijing.volces.com?token=fixture",
                          "https://tos-cn-beijing.volces.com:444"):
             with self.subTest(endpoint=endpoint):
-                self.invalid(local_video_upload_service=t.LOCAL_VIDEO_UPLOAD_TOS,
+                values = self.values(local_video_upload_service=t.LOCAL_VIDEO_UPLOAD_TOS,
                     tos_url_validity_seconds=86400, tos_region=t.DEFAULT_TOS_REGION,
                     tos_endpoint=endpoint)
+                payload = self.validate(values)._build_broker_payload(values)
+                self.assertNotIn(endpoint, json.dumps(payload))
 
     def test_cloud_selection_is_not_blocked_by_unused_stale_tos_options(self):
         values = self.values(local_video_upload_service=t.LOCAL_VIDEO_UPLOAD_GRIPTAPE,

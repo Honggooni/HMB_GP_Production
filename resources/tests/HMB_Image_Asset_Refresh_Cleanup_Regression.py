@@ -1,6 +1,7 @@
 """Explicit Refresh audit/confirmation regression; all durable IO is temporary."""
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 import importlib.util
 import json
@@ -670,14 +671,61 @@ class RefreshCleanupRegression(unittest.TestCase):
         self.assertNotIn("manifest_digest", review)
         self.assertNotIn("missing_records", review)
 
-    def test_stalled_share_ends_refresh_and_late_result_cannot_replace_catalog(self):
+    def test_slow_refresh_keeps_catalog_until_worker_replies_or_fails(self):
+        for disconnected in (False, True):
+            with self.subTest(disconnected=disconnected):
+                self.check_delayed_refresh(disconnected)
+
+    def test_event_loop_receives_delay_and_completion_without_another_click(self):
+        node, live, published = fake_node(self.state())
+        release = threading.Event()
+        audit = library._audit_project_manifest_refresh
+
+        def read(root):
+            if not release.wait(5):
+                raise AssertionError("Test did not release delayed audit")
+            return audit(root)
+
+        async def run():
+            changed = asyncio.Event()
+            original_publish = node._publish_state
+
+            def publish(value, **_kwargs):
+                result = original_publish(value)
+                changed.set()
+                return result
+
+            node._publish_state = publish
+            pending = node._schedule_project_manifest_refresh(live["state"], self.root.parent.as_posix(), [])
+            changed.clear()
+            try:
+                await asyncio.wait_for(changed.wait(), 3)
+                self.assertTrue(live["state"]["scan_delayed"])
+                self.assertEqual(live["state"]["scan_request_id"], pending["scan_request_id"])
+                changed.clear()
+            finally:
+                release.set()
+            await asyncio.wait_for(changed.wait(), 3)
+            self.assertEqual(live["state"]["asset_refresh_review"]["status"], "review")
+            self.assertEqual([(s["scan_busy"], s["scan_delayed"]) for s in published],
+                             [(True, False), (True, True), (False, False)])
+
+        with patch.object(library, "PROJECT_REFRESH_TIMEOUT_SECONDS", 0.05), patch.object(
+            library, "_audit_project_manifest_refresh", side_effect=read
+        ), patch.object(library, "_load_project_catalog", side_effect=lambda _root, state, **_kw: deepcopy(state)):
+            asyncio.run(run())
+
+    def check_delayed_refresh(self, disconnected):
         node, live, published = fake_node(self.state())
         started, release = threading.Event(), threading.Event()
         audit = library._audit_project_manifest_refresh
 
         def blocked_audit(root):
             started.set()
-            release.wait(3)
+            if not release.wait(5):
+                raise AssertionError("Test did not release delayed audit")
+            if disconnected:
+                raise OSError("project share unavailable")
             return audit(root)
 
         def refresh():
@@ -686,35 +734,46 @@ class RefreshCleanupRegression(unittest.TestCase):
             )
 
         before = deepcopy(live["state"])
-        with patch.object(library, "PROJECT_REFRESH_TIMEOUT_SECONDS", 0.15, create=True), patch.object(
+        with patch.object(library, "PROJECT_REFRESH_TIMEOUT_SECONDS", 0.05), patch.object(
             library, "_audit_project_manifest_refresh", side_effect=blocked_audit
         ) as audit_call, patch.object(
             library, "_load_project_catalog", side_effect=lambda _root, state, **_kw: deepcopy(state)
         ):
             try:
-                self.assertTrue(refresh()["scan_busy"])
+                pending = refresh()
+                self.assertTrue(pending["scan_busy"])
+                self.assertFalse(pending["scan_delayed"])
                 self.assertTrue(started.wait(1))
                 worker = node._hmb_scan_thread
-                deadline = time.monotonic() + 1
-                while time.monotonic() < deadline and not node._consume_pending_catalog_scan_result():
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline and not live["state"]["scan_delayed"]:
+                    self.assertFalse(node._consume_pending_catalog_scan_result())
                     time.sleep(0.01)
-                completed = live["state"]
-                self.assertFalse(completed["scan_busy"])
-                self.assertEqual(completed["asset_refresh_review"]["status"], "error")
-                self.assertEqual(completed["assets"], before["assets"])
-                self.assertEqual(completed["shot_routing"], before["shot_routing"])
+                delayed = live["state"]
+                self.assertTrue(delayed["scan_busy"] and delayed["scan_delayed"])
+                self.assertFalse(delayed["error"])
+                self.assertFalse(delayed["asset_refresh_review"])
+                self.assertEqual(delayed["assets"], before["assets"])
+                self.assertEqual(delayed["shot_routing"], before["shot_routing"])
                 self.assertIsNone(node._hmb_refresh_authority)
-                self.assertTrue(refresh()["scan_busy"])
-                self.assertFalse(finish_worker(node, live)["scan_busy"])
+                self.assertEqual(refresh()["scan_request_id"], pending["scan_request_id"])
+                self.assertIs(node._hmb_scan_thread, worker)
                 self.assertEqual(audit_call.call_count, 1)
-                publication_count = len(published)
                 release.set()
-                worker.join(1)
-                self.assertFalse(worker.is_alive())
+                result = finish_worker(node, live)
+                self.assertFalse(result["scan_busy"] or result["scan_delayed"])
+                self.assertEqual(result["scan_request_id"], pending["scan_request_id"])
+                self.assertEqual(result["asset_refresh_review"]["status"], "error" if disconnected else "review")
+                if disconnected:
+                    self.assertIn("project share unavailable", result["error"])
+                    self.assertEqual(result["assets"], before["assets"])
+                    self.assertEqual(result["shot_routing"], before["shot_routing"])
+                    self.assertIsNone(node._hmb_refresh_authority)
+                else:
+                    self.assertFalse(result["error"])
+                    self.assertTrue(node._hmb_refresh_authority)
+                self.assertEqual(sum(s["scan_delayed"] for s in published), 1)
                 self.assertFalse(node._consume_pending_catalog_scan_result())
-                self.assertEqual(len(published), publication_count)
-                self.assertTrue(refresh()["scan_busy"])
-                self.assertEqual(finish_worker(node, live)["asset_refresh_review"]["status"], "review")
             finally:
                 release.set()
 

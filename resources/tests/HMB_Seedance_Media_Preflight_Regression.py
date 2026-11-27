@@ -228,8 +228,8 @@ with tempfile.TemporaryDirectory() as temporary:
     assert "https://storage.example/private-upload.png?[REDACTED]" in safe_error
 
     # One verified Cloud driver is shared by image and video preparation. Local
-    # images/data URIs become HTTPS references, while an existing public HTTPS
-    # image is preserved byte-for-byte and saved parameter values stay untouched.
+    # and remote inputs are staged by the same driver. Repeating a source
+    # retains each slot but creates only one upload and cleanup lease.
     image_path = folder / "cloud-reference.png"
     image_stream = BytesIO()
     with Image.new("RGB", (32, 16), (24, 105, 188)) as image:
@@ -253,7 +253,7 @@ with tempfile.TemporaryDirectory() as temporary:
                     "timeout": timeout,
                 }
             )
-            return f"https://storage.example/{path.name}?signed=opaque"
+            return f"https://storage.example/{path.parent.name}/{path.name}?signed=opaque"
 
         def delete_file(self, path: Path) -> None:
             self.deletes.append(path)
@@ -263,150 +263,66 @@ with tempfile.TemporaryDirectory() as temporary:
     cloud_node.name = "Cloud Media Transport Regression"
     cloud_node._temporary_video_uploads = []
     cloud_node._temporary_tos_video_uploads = []
-    cloud_node._try_create_gt_cloud_storage_driver = lambda: cloud_driver
+    cloud_node._create_gt_cloud_storage_driver = lambda: cloud_driver
+    remote_image = "https://cdn.example/already-public.png"
+    downloads = []
+    async def read_remote(url, *, destination, **_kwargs):
+        assert url == remote_image
+        downloads.append(url)
+        destination.write(image_bytes)
+        return b""
+    cloud_node._download_external_media = read_remote
+    audio = b"RIFF" + bytes(4) + b"WAVEfmt "
+    audio_uri = "data:audio/wav;base64," + base64.b64encode(audio).decode("ascii")
     cloud_params = {
-        "first_frame": str(image_path),
-        "last_frame": None,
-        "reference_images": [
-            image_data_uri,
-            "https://cdn.example/already-public.png",
-        ],
-        "video_reference_slots": [str(upload_path)],
-        "video_references": [],
-        "auto_publish_local_videos": True,
-        # A ready Griptape Cloud credential+bucket is the preferred transport
-        # for both media kinds; TOS remains the no-Cloud video fallback.
-        "local_video_upload_service": seedance.LOCAL_VIDEO_UPLOAD_TOS,
+        "model_id": seedance.SEEDANCE_2_5_MODEL_ID,
+        "first_frame": str(image_path), "last_frame": str(image_path),
+        "reference_images": [image_data_uri, remote_image, {"url":remote_image}, {"path":str(image_path)}],
+        "reference_audio": [audio_uri, audio_uri], "video_reference_slots": [str(upload_path), str(upload_path)],
+        "auto_publish_local_videos": False, "local_video_upload_service": seedance.LOCAL_VIDEO_UPLOAD_TOS,
     }
-    prepared_cloud = cloud_node._prepare_video_references_for_run(cloud_params)
-    assert prepared_cloud["first_frame"].startswith("https://storage.example/")
-    assert prepared_cloud["reference_images"][0].startswith(
-        "https://storage.example/"
-    )
-    assert prepared_cloud["reference_images"][1] == (
-        "https://cdn.example/already-public.png"
-    )
-    assert prepared_cloud["video_references"][0].startswith(
-        "https://storage.example/"
-    )
-    assert cloud_params["first_frame"] == str(image_path)
-    assert cloud_params["reference_images"][0] == image_data_uri
-    assert cloud_params["video_reference_slots"][0] == str(upload_path)
-    assert len(cloud_driver.uploads) == 3
-    assert len(cloud_node._temporary_video_uploads) == 3
-
-    # The failing PNG pattern keeps its original bytes and order while fitting
-    # in the 2.5 inline budget. Only a new Cloud link needs the Range preflight.
-    sheet = folder / "BeetoHeadgear-fixture.png"
-    Image.new("RGB", (4000, 1800), (17, 33, 48)).save(sheet)
-    signed_download = "https://storage.example/reference.mp4?signature=secret-canary"
     with (
-        mock.patch.object(cloud_node, "_upload_image_to_griptape_cloud") as upload_image,
-        mock.patch.object(cloud_node, "_confirm_seedance_reference_download") as check_download,
-        mock.patch.object(cloud_node, "_upload_local_video_to_griptape_cloud", return_value=signed_download),
-        mock.patch.object(seedance.HMBSeedanceGeneration, "_reference_video_upload_path",
-                          side_effect=lambda path, _model: nullcontext(path)),
+        mock.patch.object(cloud_node, "_reference_video_upload_path", side_effect=lambda path, model: nullcontext(path)) as staged_video,
+        mock.patch.object(cloud_node, "_read_image_for_cloud_upload", wraps=cloud_node._read_image_for_cloud_upload) as read_image,
+        mock.patch.object(seedance, "MAX_IMAGE_BYTES", len(image_bytes) + 1),
+        mock.patch.object(seedance, "TemporaryDirectory", wraps=tempfile.TemporaryDirectory) as scratch,
     ):
-        params_25 = dict(cloud_params, model_id=seedance.SEEDANCE_2_5_MODEL_ID,
-                         first_frame=None, last_frame=None,
-                         reference_images=[str(sheet), "https://cdn.example/second.png"])
-        result = cloud_node._prepare_video_references_for_run(params_25)
-        assert base64.b64decode(result["reference_images"][0].partition(",")[2]) == sheet.read_bytes()
-        assert result["reference_images"][1] == params_25["reference_images"][1]
-        assert result["video_references"] == [signed_download]
-        upload_image.assert_not_called()
-        check_download.assert_called_once_with(signed_download, f"@video1 ({upload_path.name})")
-        assert params_25["reference_images"][0] == str(sheet)
-
-        lossless = folder / "transparent-sheet.png"
-        Image.new("RGBA", (400, 300), (220, 32, 120, 0)).save(lossless)
-        with mock.patch.object(seedance, "SEEDANCE_LOSSLESS_PNG_COPY_THRESHOLD", 1):
-            compact, _ = cloud_node._prepare_image_references_for_run(
-                dict(params_25, reference_images=[str(lossless)]), cloud_driver=None)
-        encoded = compact["reference_images"][0]
-        assert encoded.startswith("data:image/webp;base64,")
-        with (Image.open(lossless) as original,
-              Image.open(BytesIO(base64.b64decode(encoded.partition(",")[2]))) as uploaded):
-            assert original.tobytes() == uploaded.tobytes()
-
-    # Earlier references can consume the entire inline budget. The Cloud
-    # upload must still carry the prepared lossless copy and matching suffix.
-    overflow_driver = LegacyCloudDriver()
-    with (mock.patch.object(seedance, "SEEDANCE_INLINE_IMAGE_BUDGET", 0),
-          mock.patch.object(seedance, "SEEDANCE_LOSSLESS_PNG_COPY_THRESHOLD", 1),
-          mock.patch.object(cloud_node, "_confirm_seedance_reference_download") as confirm):
-        result, _ = cloud_node._prepare_image_references_for_run(
-            dict(params_25, reference_images=[str(lossless)]), cloud_driver=overflow_driver)
-        uploaded, = overflow_driver.uploads
-        assert uploaded["path"].name == "transparent-sheet.webp"
-        assert uploaded["file_content"] == base64.b64decode(encoded.partition(",")[2])
-        confirm.assert_called_once_with(result["reference_images"][0], lossless.name)
-
-    for code, body in ((206, b"x"), (200, b""), (403, b"")):
-        stream = mock.MagicMock()
-        response = stream.__enter__.return_value
-        response.status_code = code
-        response.iter_raw.return_value = iter([body])
-        with mock.patch.object(seedance.httpx, "stream", return_value=stream) as range_get:
-            try:
-                cloud_node._confirm_seedance_reference_download(signed_download, "@video1")
-            except ValueError as exc:
-                assert code != 206 and "@video1" in str(exc)
-                assert "secret-canary" not in str(exc)
-            else:
-                assert code == 206
-            assert range_get.call_args.kwargs["headers"] == {"Range": "bytes=0-0"}
-
-    # Without a usable Cloud credential/bucket, image preparation remains on
-    # the existing Base64 JSON path and public video references need no upload.
-    fallback_node = object.__new__(seedance.HMBSeedanceGeneration)
-    fallback_node.name = "Base64 Image Fallback Regression"
-    fallback_node._temporary_video_uploads = []
-    fallback_node._temporary_tos_video_uploads = []
-    fallback_node._try_create_gt_cloud_storage_driver = lambda: None
-    fallback_params = {
-        "first_frame": str(image_path),
-        "last_frame": None,
-        "reference_images": [image_data_uri],
-        "video_reference_slots": ["https://cdn.example/reference.mp4"],
-        "video_references": [],
-        "auto_publish_local_videos": True,
-        "local_video_upload_service": seedance.LOCAL_VIDEO_UPLOAD_GRIPTAPE,
-    }
-    prepared_fallback = fallback_node._prepare_video_references_for_run(
-        fallback_params
-    )
-    assert prepared_fallback["first_frame"] == str(image_path)
-    assert prepared_fallback["reference_images"] == [image_data_uri]
-    assert prepared_fallback["video_references"] == [
-        "https://cdn.example/reference.mp4"
-    ]
-    encoded_fallback = fallback_node._prepare_media_reference(
-        "image",
-        prepared_fallback["first_frame"],
-    )
-    assert encoded_fallback.startswith("data:image/png;base64,")
-    assert base64.b64decode(encoded_fallback.split(",", 1)[1]) == image_bytes
-
-    # Local video still cannot use Base64. When Cloud is unavailable, the
-    # existing explicitly selected TOS path remains the permitted fallback.
-    fallback_node._create_tos_storage_context = lambda _params: ("tos", "client", "bucket")
-    fallback_node._upload_local_video_to_tos = (
-        lambda _path, _params, _context: "https://tos.example/reference.mp4?signed=opaque"
-    )
-    tos_params = dict(fallback_params)
-    tos_params["first_frame"] = None
-    tos_params["reference_images"] = []
-    tos_params["video_reference_slots"] = [str(upload_path)]
-    tos_params["local_video_upload_service"] = seedance.LOCAL_VIDEO_UPLOAD_TOS
-    prepared_tos = fallback_node._prepare_video_references_for_run(tos_params)
-    assert prepared_tos["video_references"] == [
-        "https://tos.example/reference.mp4?signed=opaque"
-    ]
+        ready = cloud_node._prepare_video_references_for_run(cloud_params)
+    urls = [ready["first_frame"], ready["last_frame"], *ready["reference_images"],
+            *ready["video_references"], *ready["reference_audio"]]
+    assert len(urls) == 10
+    assert all(url.startswith("https://storage.example/") for url in urls)
+    assert ready["first_frame"] == ready["last_frame"] == ready["reference_images"][3]
+    assert ready["reference_images"][1] == ready["reference_images"][2]
+    assert ready["reference_images"][1] != ready["reference_images"][0]
+    assert ready["video_references"][0] == ready["video_references"][1]
+    assert ready["reference_audio"][0] == ready["reference_audio"][1]
+    assert downloads == [remote_image] and staged_video.call_count == 1
+    assert read_image.call_count == 3  # Path, distinct inline source, downloaded URL.
+    assert sum(call.args[0] == str(image_path) for call in read_image.call_args_list) == 1
+    assert len(cloud_driver.uploads) == len(cloud_node._temporary_video_uploads) == 5
+    assert sum(call.kwargs.get("prefix") == "hmb-render-inputs-" for call in scratch.call_args_list) == 1
+    assert cloud_params["first_frame"] == str(image_path) and cloud_params["reference_images"][2] == {"url":remote_image}
+    assert [upload["file_content"] for upload in cloud_driver.uploads[:3]] == [image_bytes] * 3
+    assert cloud_driver.uploads[3]["file_content"] == upload_media
+    assert cloud_driver.uploads[-1]["file_content"] == audio
+    assert cloud_params["reference_images"] == [image_data_uri, remote_image, {"url":remote_image}, {"path":str(image_path)}]
+    try:
+        cloud_node._prepare_video_references_for_run(cloud_params, cloud_driver=None)
+    except RuntimeError as exc:
+        assert "Griptape Cloud" in str(exc)
+    else:
+        raise AssertionError("Missing Cloud driver allowed a render transport fallback")
+    try:
+        cloud_node._prepare_video_references_for_run(dict(cloud_params, first_frame="asset://opaque"))
+    except ValueError as exc:
+        assert "asset://" in str(exc)
+    else:
+        raise AssertionError("Opaque provider asset passed through without a source file")
 
     # Cloud readiness is one atomic credential+accessible-bucket contract.
-    # A blank explicit bucket may resolve the account default; missing auth or
-    # an inaccessible configured bucket selects the media fallbacks instead.
+    # A blank explicit bucket may resolve the account default. Missing auth or
+    # an inaccessible configured bucket blocks preparation of render references.
     class ReadinessSecrets:
         def __init__(self, values: dict[str, str]) -> None:
             self.values = dict(values)

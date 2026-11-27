@@ -835,6 +835,7 @@ const IMAGE_ASSET_UI_TEXT = {
     showing_images: "Showing",
     rename_shot: "Rename Shot",
     busy_loading: "Loading project assets…",
+    refresh_delayed: "Refresh delayed",
     transport_failed: "The change could not be saved. Please try again.",
     refresh_review: "Project media scan review",
     refresh_folders: "Folders checked",
@@ -927,6 +928,7 @@ const IMAGE_ASSET_UI_TEXT = {
     showing_images: "표시 중",
     rename_shot: "Shot 이름 변경",
     busy_loading: "프로젝트 에셋 불러오는 중…",
+    refresh_delayed: "새로고침 지연 중",
     transport_failed: "변경 사항을 저장하지 못했습니다. 다시 시도하세요.",
     refresh_review: "프로젝트 미디어 목록 검사 결과",
     refresh_folders: "검사한 폴더",
@@ -1063,7 +1065,12 @@ export function hmbCgtWorkStartNoticeMessage(value, language = "ko") {
   return messages[notice.status]+" "+counts;
 }
 
+function imageAssetScanLoading(state) {
+  return state.scan_busy && !state.scan_delayed;
+}
+
 function hmbImageAssetDisplayStatus(state) {
+  if (state.scan_delayed) return imageAssetText(state, "refresh_delayed");
   return state.scan_busy ? imageAssetText(state,"busy_loading")
     : state.error ? state.error
     : state.asset_registration_result?.ok && state.asset_registration_result.message
@@ -2064,6 +2071,7 @@ function normalizeState(value) {
     scan_revision: Math.max(0, Number.parseInt(input.scan_revision || 0, 10) || 0),
     refresh_revision: Math.max(0, Number.parseInt(input.refresh_revision || 0, 10) || 0),
     scan_busy: Boolean(input.scan_busy),
+    scan_delayed: Boolean(input.scan_busy && input.scan_delayed),
     scan_request_id: clean(input.scan_request_id).slice(0, 128),
     thumbnail_request: normalizeThumbnailRequest(input.thumbnail_request),
     thumbnail_result: normalizeThumbnailResult(input.thumbnail_result),
@@ -2213,6 +2221,7 @@ function imageAssetThumbnailOnlyTransition(localState, incomingState, expectedRe
     && hmbNormalizeImageAssetRevision(localState[IMAGE_ASSET_UI_EDIT_REVISION_KEY])
       === hmbNormalizeImageAssetRevision(incomingState[IMAGE_ASSET_UI_EDIT_REVISION_KEY])
     && Boolean(localState.scan_busy) === Boolean(incomingState.scan_busy)
+    && Boolean(localState.scan_delayed) === Boolean(incomingState.scan_delayed)
     && clean(localState.error) === clean(incomingState.error)
     && clean(localState.asset_registration_result?.request_id)
       === clean(incomingState.asset_registration_result?.request_id)
@@ -4695,7 +4704,7 @@ export function hmbScheduleImageAssetThumbnailRequest(
   if (container?.__hmbImageAssetLeaseTransitionPending) return false;
   if (!container) return false;
   const liveState = container.__hmbImageAssetLatestState || state;
-  if (!liveState || liveState.scan_busy || liveState.thumbnail_busy) return false;
+  if (!liveState || imageAssetScanLoading(liveState) || liveState.thumbnail_busy) return false;
   const tracking = imageAssetThumbnailRequestTracking(container, liveState);
   if (!tracking.contextKey) return false;
   if (imageAssetThumbnailRequestMatchesState(liveState, liveState.thumbnail_request)) {
@@ -4723,7 +4732,7 @@ export function hmbScheduleImageAssetThumbnailRequest(
     if (
       !currentTracking.contextKey
       || currentTracking.contextKey !== tracking.contextKey
-      || current.scan_busy
+      || imageAssetScanLoading(current)
       || current.thumbnail_busy
       || imageAssetThumbnailRequestMatchesState(current, current.thumbnail_request)
       || container.__hmbImageAssetThumbnailPendingRequestId
@@ -6196,14 +6205,16 @@ function hmbRebuildImageAssetIndexes(container, state) {
   // Reuse the index this paint already built, including non-visible Shot rows.
   const routing = state.shot_routing;
   retireShotPreviews(container, routing, hmbImageAssetWidgetLease(state));
-  let incomplete = Boolean(state.error);
+  let incomplete = false;
   for (const shot of routing?.shots || []) {
     const assets = shot.selected_source_uids.map(uid => assetsBySourceUid.get(uid));
     // New edits clear both hashes. An SDK-authored complete snapshot carries
     // a hash even when verification rejected one of the originally chosen files.
     const rejected = Boolean(shot.media_sha256) && shot.media_count !== assets.length;
     incomplete ||= rejected;
-    if (assets.every(Boolean)) publishShotPreview(container, routing, shot, assets, "shot", rejected || Boolean(state.error));
+    // A catalog or folder error can coexist with valid selected images.
+    // Only the verification result for this Shot can retract its preview.
+    if (assets.every(Boolean)) publishShotPreview(container, routing, shot, assets, "shot", rejected);
   }
   publishDirectPreview(container, state, selected.sort((left, right) => left.selection_order - right.selection_order), incomplete);
   container.__hmbImageAssetCardByLibraryId = cardById;
@@ -6363,13 +6374,13 @@ function renderImageAssetFixedTop(state) {
       <div class="hmb-native-identity" data-hmb-native-identity></div><div class="hmb-native-actions nodrag" data-hmb-native-actions></div>
       <div class="project-switch">
         <div class="project-actions">
-          <button type="button" class="project-action" data-project-set aria-label="${escapeHtml(imageAssetText(state, "project_set"))}" title="${escapeHtml(imageAssetText(state, "project_set"))}" ${state.scan_busy ? "disabled" : ""}>S</button>
-          <button type="button" class="project-action" data-project-reload aria-label="${escapeHtml(imageAssetText(state, "reload_projects"))}" title="${escapeHtml(imageAssetText(state, "reload_projects"))}" ${state.scan_busy ? "disabled" : ""}>
+          <button type="button" class="project-action" data-project-set aria-label="${escapeHtml(imageAssetText(state, "project_set"))}" title="${escapeHtml(imageAssetText(state, "project_set"))}" ${imageAssetScanLoading(state) ? "disabled" : ""}>S</button>
+          <button type="button" class="project-action" data-project-reload aria-label="${escapeHtml(imageAssetText(state, "reload_projects"))}" title="${escapeHtml(imageAssetText(state, "reload_projects"))}" ${imageAssetScanLoading(state) ? "disabled" : ""}>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 19V6h6l2 2h10v4M3 19h8"/><circle cx="16" cy="15" r="3"/><path d="m18.2 17.2 3 3"/></svg>
           </button>
         </div>
         <label>${escapeHtml(imageAssetText(state, "project"))}</label>
-        <select data-project-select ${state.scan_busy ? "disabled" : ""}>${projectOptions(state)}</select>
+        <select data-project-select ${imageAssetScanLoading(state) ? "disabled" : ""}>${projectOptions(state)}</select>
         <button type="button" class="language-button" data-language-toggle aria-label="${escapeHtml(imageAssetText(state, "language"))}">${imageAssetLanguage(state) === "ko" ? "한국어" : "EN"}</button>
       </div>
     </header>`;
@@ -6395,8 +6406,8 @@ export function hmbPatchCompactImageAssetState(container, state) {
   const activeShot = activeImageAssetShot(state);
   const palette = hmbImageAssetShotPalette(activeShot?.number || 1);
   root.setAttribute?.("data-shot-number", String(activeShot?.number || 1));
-  root.setAttribute?.("data-busy", state.scan_busy ? "true" : "false");
-  if (state.scan_busy) root.setAttribute?.("aria-busy", "true");
+  root.setAttribute?.("data-busy", imageAssetScanLoading(state) ? "true" : "false");
+  if (imageAssetScanLoading(state)) root.setAttribute?.("aria-busy", "true");
   else root.removeAttribute?.("aria-busy");
   root.style?.setProperty?.("--active-shot-accent", palette.accent);
   root.style?.setProperty?.("--active-shot-rgb", palette.rgb);
@@ -6506,7 +6517,7 @@ function render(
       .hmb-image-assets .hmb-native-identity,.hmb-image-assets .hmb-native-actions{display:none;min-width:0;--node-header-text:#e8eef7}.hmb-image-assets[data-hmb-native-header="active"]>.top>.mark,.hmb-image-assets[data-hmb-native-header="active"]>.top>.heading{display:none}.hmb-image-assets[data-hmb-native-header="active"]>.top>.hmb-native-identity{display:flex;align-items:center;flex:1;min-width:0}.hmb-image-assets[data-hmb-native-header="active"]>.top>.hmb-native-actions{display:flex;align-items:center;flex:0 0 auto}.hmb-image-assets .hmb-native-identity>div{min-width:0;max-width:100%}.hmb-image-assets .hmb-native-actions svg{flex-shrink:0}.hmb-image-assets[data-hmb-native-header="active"]>.top{cursor:grab}.hmb-image-assets[data-hmb-native-header="active"]>.top:active{cursor:grabbing}
       @media (prefers-reduced-motion:reduce){.hmb-image-assets *{scroll-behavior:auto!important;animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}}
     </style>
-    <div class="hmb-image-assets nodrag" data-hmb-library="image-asset" data-library-compact="false" data-theme="P" data-shot-number="${activeShot?.number || 1}" data-asset-view="${detailView ? "detail" : "image"}" data-busy="${state.scan_busy ? "true" : "false"}" ${state.scan_busy ? 'aria-busy="true"' : ""} style="--active-shot-accent:${activePalette.accent};--active-shot-rgb:${activePalette.rgb}" tabindex="0">
+    <div class="hmb-image-assets nodrag" data-hmb-library="image-asset" data-library-compact="false" data-theme="P" data-shot-number="${activeShot?.number || 1}" data-asset-view="${detailView ? "detail" : "image"}" data-busy="${imageAssetScanLoading(state) ? "true" : "false"}" ${imageAssetScanLoading(state) ? 'aria-busy="true"' : ""} style="--active-shot-accent:${activePalette.accent};--active-shot-rgb:${activePalette.rgb}" tabindex="0">
       ${renderImageAssetFixedTop(state)}
       <div class="library-expanded" data-library-expanded>
       <main class="workspace">
@@ -8245,10 +8256,12 @@ function installEvents(container, state, props, remount, listeners) {
           hmbClearImageAssetRefreshWait(container);
           const current = container.__hmbImageAssetLatestState || state;
           if (hmbImageAssetRefreshScope(current) !== wait.scope || container.__hmbImageAssetSlowActionToken !== token) return;
-          container.__hmbImageAssetSettledRefresh = wait;
+          container.__hmbImageAssetSettledRefresh = {
+            scope: wait.scope, revision: wait.revision, requestId: wait.requestId, timedOut: true,
+          };
           delete container.__hmbImageAssetSlowActionToken;
           hmbSetImageAssetBusy(container, false);
-          state = remount({ ...current, scan_busy: false });
+          state = remount({ ...current, scan_busy: false, scan_delayed: false });
           hmbShowImageAssetTransportError(container, imageAssetLanguage(state) === "en"
             ? "Refresh did not return a result. The current catalog is still available. Try refresh again."
             : "새로고침 결과를 받지 못했습니다. 현재 목록을 유지했습니다. 다시 시도하세요.", state);
@@ -9748,9 +9761,15 @@ function hmbNativeUiImplementation(container, props) {
     }
     delete incomingState.site_settings_request;
     const incomingRefreshScope = hmbImageAssetRefreshScope(incomingState);
-    if (container.__hmbImageAssetSettledRefresh?.scope === incomingRefreshScope && incomingState.scan_busy
-        && incomingState.refresh_revision <= container.__hmbImageAssetSettledRefresh.revision
-        && (!container.__hmbImageAssetSettledRefresh.requestId || incomingState.scan_request_id === container.__hmbImageAssetSettledRefresh.requestId)) return;
+    const settledRefresh = container.__hmbImageAssetSettledRefresh;
+    if (settledRefresh?.scope === incomingRefreshScope && incomingState.scan_busy
+        && incomingState.refresh_revision <= settledRefresh.revision
+        && (!settledRefresh.requestId || incomingState.scan_request_id === settledRefresh.requestId)
+        && !(settledRefresh.timedOut && incomingState.scan_delayed)) return;
+    // A delayed generation cannot go back to its initial busy phase.
+    if (state.scan_delayed && incomingState.scan_busy && !incomingState.scan_delayed
+        && state.scan_request_id && state.scan_request_id === incomingState.scan_request_id
+        && hmbImageAssetRefreshScope(state) === incomingRefreshScope) return;
     incomingState.image_bash_workspace_request = {};
     incomingState.image_bash_workspace_edit = {};
     let draft = container.__hmbImageAssetRegistrationDraft;
@@ -9982,16 +10001,24 @@ function hmbNativeUiImplementation(container, props) {
       : JSON.stringify(nextState);
     if (currentValue === nextValue) return;
     if (hmbDeferImageAssetPropsDuringRegistration(container, props)) return;
-    if (container.__hmbImageAssetRefreshWait && (container.__hmbImageAssetRefreshWait.scope !== incomingRefreshScope
-      || (!nextState.scan_busy && nextState.refresh_revision >= container.__hmbImageAssetRefreshWait.revision
-        && nextState.scan_request_id && nextState.scan_request_id !== container.__hmbImageAssetRefreshWait.previousRequestId))) {
-      if (container.__hmbImageAssetRefreshWait.scope === incomingRefreshScope) {
-        container.__hmbImageAssetSettledRefresh = { scope: container.__hmbImageAssetRefreshWait.scope, revision: nextState.refresh_revision, requestId: nextState.scan_request_id };
-      }
+    const refreshWait = container.__hmbImageAssetRefreshWait;
+    if (refreshWait && refreshWait.scope !== incomingRefreshScope) {
       hmbClearImageAssetRefreshWait(container);
+    } else if (refreshWait && nextState.refresh_revision >= refreshWait.revision && nextState.scan_request_id
+        && nextState.scan_request_id !== refreshWait.previousRequestId) {
+      refreshWait.requestId = nextState.scan_request_id;
+      if (nextState.scan_delayed || !nextState.scan_busy) hmbClearImageAssetRefreshWait(container);
+    }
+    if (!nextState.scan_busy && nextState.scan_request_id && (refreshWait?.requestId === nextState.scan_request_id
+        || (state.scan_delayed && state.scan_request_id === nextState.scan_request_id)
+        || (settledRefresh?.timedOut && settledRefresh.scope === incomingRefreshScope
+          && settledRefresh.revision === nextState.refresh_revision))) {
+      container.__hmbImageAssetSettledRefresh = {
+        scope: incomingRefreshScope, revision: nextState.refresh_revision, requestId: nextState.scan_request_id,
+      };
     }
     remount(nextState);
-    if (nextState.scan_busy) {
+    if (imageAssetScanLoading(nextState)) {
       container.__hmbImageAssetBusy = true;
     } else if (container.__hmbImageAssetRefreshWait) {
       hmbSetImageAssetBusy(container, true, imageAssetText(nextState, "busy_loading"));

@@ -61,7 +61,6 @@ async def check_wired_image_with_existing_shot(workspace):
     from _hmb_fixture_sdk import ensure_fixture_flow
     import HMBPromptLibrary as prompt
     import HMBSeedanceGeneration as seedance
-    from base64 import b64decode
     from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
 
     standard = Path(os.environ.get("HMB_STANDARD_LIBRARY_ROOT",
@@ -220,10 +219,21 @@ async def check_wired_image_with_existing_shot(workspace):
             assert wire.succeeded(), wire.result_details
             params = generator._resolve_exact_shot_generation_inputs({**generator._get_parameters(), "model_id": seedance.SEEDANCE_2_5_MODEL_ID,
                 "duration": 4, "resolution": "480p", "prompt": "Use @image1 and @image2"})
-            prepared, _ = generator._prepare_image_references_for_run(params, cloud_driver=None)
+            class RecordingCloud:
+                def __init__(self):
+                    self.objects = {}
+
+                def upload_file(self, *, path, file_content, timeout):
+                    url = f"https://fixture.invalid/{path.as_posix()}"
+                    self.objects[url] = bytes(file_content)
+                    return url
+
+            cloud = RecordingCloud()
+            prepared = generator._prepare_video_references_for_run(params, cloud_driver=cloud)
             payload = generator._build_broker_payload(prepared)
-            decoded = [b64decode(uri.split(",", 1)[1], validate=True) for uri in payload["image_urls"]]
-            assert decoded == [(project / "Anchor.png").read_bytes(), path.read_bytes()]
+            assert len(cloud.objects) == len(payload["image_urls"]) == 2
+            assert [cloud.objects[url] for url in payload["image_urls"]] == [
+                (project / "Anchor.png").read_bytes(), path.read_bytes()]
             # Verify the retained widget's browser resource, not just the original file used by Prompt.
             from urllib.parse import unquote, urlsplit
             uid = imports[0]["source_uid"]
@@ -326,6 +336,30 @@ async def check_repeated_wired_selection(library, downstream, anchor, imported):
         assert len(library.parameter_output_values[asset.MEDIA_OUTPUT_PARAMETER]) == len(selection)
 
     await check_settled(expected)
+    # A saved Shot stays editable while its already-open project's manual
+    # Refresh waits on an unrelated folder. The new source is not in the
+    # resolution cache and must reach Prompt before the scan can complete.
+    resume_refresh = threading.Event()
+    catalog = library._current_state()
+    def delayed_refresh():
+        assert resume_refresh.wait(15)
+        return catalog
+
+    library._schedule_catalog_scan("refresh:slow-folder", catalog, delayed_refresh)
+    try:
+        await submit([anchor, extra[0]])
+        await check_settled([anchor, extra[0]])
+        assert library._current_state()["scan_busy"]
+        await submit(initial)
+        await check_settled(initial)
+    finally:
+        resume_refresh.set()
+    deadline = time.monotonic() + 3
+    while library._current_state()["scan_busy"]:
+        assert time.monotonic() < deadline
+        await asyncio.sleep(.01)
+    await check_settled(initial)
+
     for batch in range(8):
         for click in range(12):
             uid = extra[(batch + click // 2) % len(extra)]

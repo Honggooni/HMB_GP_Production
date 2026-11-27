@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from copy import deepcopy
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import hashlib
 import io
 import importlib.util
@@ -784,7 +784,10 @@ def assert_constructor_and_public_contract() -> None:
     assert saved_audio_node.get_parameter_value("generate_audio") is True
     assert saved_audio_node._get_parameters()["generate_audio"] is True
     node.set_parameter_value("local_video_upload_service", target.LOCAL_VIDEO_UPLOAD_TOS)
-    assert node.get_parameter_by_name("tos_region").hide is False
+    assert node.get_parameter_value("local_video_upload_service") == target.LOCAL_VIDEO_UPLOAD_GRIPTAPE
+    for legacy_setting in ("auto_publish_local_videos", "local_video_upload_service",
+                           "tos_region", "tos_endpoint", "tos_url_validity_seconds"):
+        assert node.get_parameter_by_name(legacy_setting).hide is True
     node.set_parameter_value(
         "local_video_upload_service", target.LOCAL_VIDEO_UPLOAD_GRIPTAPE
     )
@@ -1787,6 +1790,26 @@ def protected_seedance_host():
                 LibraryRegistry.unregister_library(schema.name, event_manager=engine.event_manager)
 
 
+def bind_created_workflow(engine, ensured):
+    """Bind requests to the new runtime until this test closes that workflow."""
+    if not hasattr(engine, "bind_workflow"):
+        async def close_legacy():
+            result = await GriptapeNodes.ahandle_request(DeleteWorkflowRequest(name=ensured.workflow_name))
+            assert isinstance(result, DeleteWorkflowResultSuccess), result.result_details
+        return close_legacy
+
+    runtime = engine.open_workflows.get(ensured.workflow_id)
+    binding = ExitStack()
+    binding.enter_context(engine.bind_workflow(runtime))
+
+    def close():
+        # Reset the context in the caller, including prior to asyncio.run().
+        binding.close()
+        return engine.aclose_workflow(runtime)
+
+    return close
+
+
 def create_host_node(node_type, name):
     result = GriptapeNodes.handle_request(CreateNodeRequest(node_type=node_type,
         specific_library_name="HMB_GP_Production", node_name=name,
@@ -1817,7 +1840,7 @@ def disconnect_host_wires(flow):
             assert result.succeeded(), str(result.result_details)
 
 
-def assert_image_asset_single_wire_host_contract() -> None:
+def assert_image_asset_single_wire_host_contract(engine) -> None:
     context_manager = GriptapeNodes.ContextManager()
     assert not context_manager.has_current_workflow(), (
         "Host connection regression must run in an isolated process."
@@ -1836,6 +1859,7 @@ def assert_image_asset_single_wire_host_contract() -> None:
     )
     assert ensured.created_workflow is True
     assert ensured.created_flow is True
+    close_workflow = bind_created_workflow(engine, ensured)
     flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
 
     def publish_selected(source: object, values: list[str]) -> None:
@@ -1960,15 +1984,7 @@ def assert_image_asset_single_wire_host_contract() -> None:
             )["image_urls"] == overflow
     finally:
         disconnect_host_wires(flow)
-        deleted = asyncio.run(
-            GriptapeNodes.ahandle_request(
-                DeleteWorkflowRequest(name=ensured.workflow_name)
-            )
-        )
-        assert isinstance(deleted, DeleteWorkflowResultSuccess), (
-            type(deleted).__name__,
-            getattr(deleted, "result_details", ""),
-        )
+        asyncio.run(close_workflow())
         assert not context_manager.has_current_workflow()
         assert not context_manager.has_current_flow()
         assert (
@@ -1979,7 +1995,7 @@ def assert_image_asset_single_wire_host_contract() -> None:
         )
 
 
-def assert_video_picker_single_wire_host_contract() -> None:
+def assert_video_picker_single_wire_host_contract(engine) -> None:
     context_manager = GriptapeNodes.ContextManager()
     assert not context_manager.has_current_workflow(), (
         "Host connection regression must run in an isolated process."
@@ -1996,6 +2012,7 @@ def assert_video_picker_single_wire_host_contract() -> None:
         type(ensured).__name__,
         getattr(ensured, "result_details", ""),
     )
+    close_workflow = bind_created_workflow(engine, ensured)
     flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
 
     try:
@@ -2061,20 +2078,12 @@ def assert_video_picker_single_wire_host_contract() -> None:
         )
     finally:
         disconnect_host_wires(flow)
-        deleted = asyncio.run(
-            GriptapeNodes.ahandle_request(
-                DeleteWorkflowRequest(name=ensured.workflow_name)
-            )
-        )
-        assert isinstance(deleted, DeleteWorkflowResultSuccess), (
-            type(deleted).__name__,
-            getattr(deleted, "result_details", ""),
-        )
+        asyncio.run(close_workflow())
         assert not context_manager.has_current_workflow()
         assert not context_manager.has_current_flow()
 
 
-def assert_seedance_delete_recreate_shot1_publication_contract() -> None:
+def assert_seedance_delete_recreate_shot1_publication_contract(engine) -> None:
     """Deleting and recreating a generator republishes its reclaimed Shot 1."""
 
     async def scenario() -> None:
@@ -2087,6 +2096,7 @@ def assert_seedance_delete_recreate_shot1_publication_contract() -> None:
             )
         )
         assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
+        close_workflow = bind_created_workflow(engine, ensured)
         flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
 
         async def settle() -> None:
@@ -2169,15 +2179,12 @@ def assert_seedance_delete_recreate_shot1_publication_contract() -> None:
                 if isinstance(node, target.HMBSeedanceGeneration):
                     disconnect_host_node(node.name)
             disconnect_host_wires(flow)
-            deleted_workflow = await GriptapeNodes.ahandle_request(
-                DeleteWorkflowRequest(name=ensured.workflow_name)
-            )
-            assert isinstance(deleted_workflow, DeleteWorkflowResultSuccess)
+            await close_workflow()
 
     asyncio.run(scenario())
 
 
-def assert_seedance_native_reset_fresh_recovery_contract() -> None:
+def assert_seedance_native_reset_fresh_recovery_contract(engine) -> None:
     """Check protected Reset and the supported native delete/recreate lifecycle."""
     async def scenario():
         GriptapeNodes.EventManager().initialize_queue()
@@ -2186,6 +2193,7 @@ def assert_seedance_native_reset_fresh_recovery_contract() -> None:
             display_name=f"Reset recovery audit {stamp}", flow_name=f"ResetRecovery_{stamp}",
         ))
         assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
+        close_workflow = bind_created_workflow(engine, ensured)
         try:
             with tempfile.TemporaryDirectory(prefix="hmb-native-reset-") as temporary, \
                  mock.patch.object(target, "_seedance_recovery_journal_path", side_effect=lambda key: Path(temporary) / f"{key}.json"), \
@@ -2216,12 +2224,11 @@ def assert_seedance_native_reset_fresh_recovery_contract() -> None:
                     assert not old._runtime_node_is_live(require_registered=True)
                     assert fresh._runtime_node_is_live(require_registered=True)
         finally:
-            result = await GriptapeNodes.ahandle_request(DeleteWorkflowRequest(name=ensured.workflow_name))
-            assert isinstance(result, DeleteWorkflowResultSuccess)
+            await close_workflow()
     asyncio.run(scenario())
 
 
-def assert_seedance_discarded_workflow_snapshot_contract() -> None:
+def assert_seedance_discarded_workflow_snapshot_contract(engine) -> None:
     """Real host close/reopen must restore the saved result, not a newer journal.
 
     Snapshot values stand in for the user's manual save. No workflow file,
@@ -2241,16 +2248,13 @@ def assert_seedance_discarded_workflow_snapshot_contract() -> None:
                 flow_name=f"SavedSnapshot_{stamp}",
             ))
             assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
-            current_workflow = ensured.workflow_name
+            current_workflow = bind_created_workflow(engine, ensured)
             return create_host_node("HMBSeedanceGeneration", name)
 
         async def close_workflow() -> None:
             nonlocal current_workflow
             if current_workflow is not None:
-                closed = await GriptapeNodes.ahandle_request(
-                    DeleteWorkflowRequest(name=current_workflow)
-                )
-                assert isinstance(closed, DeleteWorkflowResultSuccess), closed
+                await current_workflow()
                 current_workflow = None
                 assert not GriptapeNodes.ContextManager().has_current_workflow()
 
@@ -2346,7 +2350,7 @@ def assert_seedance_discarded_workflow_snapshot_contract() -> None:
     asyncio.run(scenario())
 
 
-def assert_seedance_dangling_list_delete_live_host_contract() -> None:
+def assert_seedance_dangling_list_delete_live_host_contract(engine) -> None:
     """A stale list wire can be detached before deleting the protected node."""
 
     context_manager = GriptapeNodes.ContextManager()
@@ -2362,6 +2366,7 @@ def assert_seedance_dangling_list_delete_live_host_contract() -> None:
         )
     )
     assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
+    close_workflow = bind_created_workflow(engine, ensured)
     flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
 
     try:
@@ -2440,12 +2445,7 @@ def assert_seedance_dangling_list_delete_live_host_contract() -> None:
         assert f"{destination.name}_temp" not in flow.nodes
     finally:
         disconnect_host_wires(flow)
-        deleted_workflow = asyncio.run(
-            GriptapeNodes.ahandle_request(
-                DeleteWorkflowRequest(name=ensured.workflow_name)
-            )
-        )
-        assert isinstance(deleted_workflow, DeleteWorkflowResultSuccess)
+        asyncio.run(close_workflow())
         assert not context_manager.has_current_workflow()
         assert not context_manager.has_current_flow()
 
@@ -3860,56 +3860,6 @@ class FakeCloudDriver:
         self.deletes.append(path)
 
 
-class FakeTosClient:
-    def __init__(self) -> None:
-        self.uploads: list[dict] = []
-        self.deletes: list[tuple[str, str]] = []
-        self.presigns: list[dict] = []
-        self.close_count = 0
-
-    def put_object_from_file(
-        self, bucket_name: str, object_key: str, file_path: str, *, content_type: str
-    ):
-        self.uploads.append(
-            {
-                "bucket": bucket_name,
-                "key": object_key,
-                "file_path": file_path,
-                "content_type": content_type,
-            }
-        )
-        return SimpleNamespace(status_code=200)
-
-    def pre_signed_url(
-        self, method, bucket_name: str, object_key: str, *, expires: int
-    ):
-        self.presigns.append(
-            {
-                "method": method,
-                "bucket": bucket_name,
-                "key": object_key,
-                "expires": expires,
-            }
-        )
-        return SimpleNamespace(
-            signed_url=(
-                f"https://team-bucket.tos-cn-beijing.volces.com/{object_key}"
-                "?X-Tos-Signature=temporary-tos-secret"
-            )
-        )
-
-    def delete_object(self, bucket_name: str, object_key: str) -> None:
-        self.deletes.append((bucket_name, object_key))
-
-    def close(self) -> None:
-        self.close_count += 1
-
-
-class FakeTosModule:
-    class HttpMethodType:
-        Http_Method_Get = "GET"
-
-
 def assert_local_video_temporary_publication() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         local_video = Path(temporary) / "picker-reference.mp4"
@@ -3952,21 +3902,24 @@ def assert_local_video_temporary_publication() -> None:
         assert "temporary-secret" not in output_dump
 
         public_node = target.HMBSeedanceGeneration(
-            name="Public Video Bypasses Cloud Regression"
+            name="Public Video Staged in Cloud Regression"
         )
         public_node.set_parameter_value(
             "reference_video_1",
             target.VideoUrlArtifact("https://cdn.example/already-public.mp4"),
         )
-        public_node._create_gt_cloud_storage_driver = lambda: (_ for _ in ()).throw(
-            AssertionError("Public URL initialized Griptape Cloud storage")
-        )
-        public_params = public_node._prepare_video_references_for_run(
-            public_node._get_parameters()
-        )
+        public_driver = FakeCloudDriver()
+        async def download_fixture(url, *, destination, **kwargs):
+            assert url == "https://cdn.example/already-public.mp4"
+            destination.write(local_bytes)
+        with mock.patch.object(public_node, "_download_external_media", side_effect=download_fixture):
+            public_params = public_node._prepare_video_references_for_run(public_node._get_parameters(), public_driver)
+        assert [upload["file_content"] for upload in public_driver.uploads] == [local_bytes]
         assert public_params["video_references"] == [
-            "https://cdn.example/already-public.mp4"
+            "https://storage.example/reference.mp4?signature=temporary-secret"
         ]
+        public_node._cleanup_temporary_video_uploads()
+        assert public_driver.deletes == [public_driver.uploads[0]["path"]]
 
         missing_bridge = FakeBrokerBridge([])
         missing_node = BrokerScriptedNode(missing_bridge)
@@ -4000,14 +3953,13 @@ def assert_local_video_temporary_publication() -> None:
         )
         disabled_node.set_parameter_value("reference_video_1", original_artifact)
         disabled_node.set_parameter_value("auto_publish_local_videos", False)
-        try:
-            disabled_node._prepare_video_references_for_run(
-                disabled_node._get_parameters()
-            )
-        except ValueError as exc:
-            assert "does not accept Base64/local video" in str(exc)
-        else:
-            raise AssertionError("Disabled local-video publication was bypassed")
+        assert disabled_node.get_parameter_value("auto_publish_local_videos") is True
+        legacy_driver = FakeCloudDriver()
+        prepared = disabled_node._prepare_video_references_for_run(disabled_node._get_parameters(), legacy_driver)
+        assert prepared["video_references"] == ["https://storage.example/reference.mp4?signature=temporary-secret"]
+        assert [upload["file_content"] for upload in legacy_driver.uploads] == [local_bytes]
+        disabled_node._cleanup_temporary_video_uploads()
+        assert legacy_driver.deletes == [legacy_driver.uploads[0]["path"]]
 
         failing_driver = FakeCloudDriver()
         failing_bridge = FakeBrokerBridge([])
@@ -4196,11 +4148,11 @@ def assert_local_video_temporary_publication() -> None:
         assert target._reference_leases.pending_metadata(blocking_node._hmb_reference_upload_lease_id)["unresolved"] is True
 
 
-def assert_tos_local_video_temporary_publication() -> None:
+def assert_legacy_tos_setting_uses_cloud_and_old_leases_can_be_cleaned() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         local_video = Path(temporary) / "team-reference.mp4"
         local_video.write_bytes(b"\x00\x00\x00\x18ftypmp42tos-reference")
-        tos_client = FakeTosClient()
+        tos_client = mock.Mock()
         bridge = FakeBrokerBridge(
             [
                 {
@@ -4222,40 +4174,23 @@ def assert_tos_local_video_temporary_publication() -> None:
         node.set_parameter_value(
             "local_video_upload_service", target.LOCAL_VIDEO_UPLOAD_TOS
         )
-        node._create_tos_storage_context = lambda _params: (
-            FakeTosModule,
-            tos_client,
-            "team-bucket",
-        )
-        asyncio.run(node.aprocess())
-
-        assert len(tos_client.uploads) == 1
-        upload = tos_client.uploads[0]
-        assert upload["bucket"] == "team-bucket"
-        assert upload["file_path"] == str(local_video)
-        assert upload["content_type"] == "video/mp4"
-        assert upload["key"].startswith("hmb-seedance-temp/")
-        assert upload["key"].endswith(".mp4")
-        assert "team-reference" not in upload["key"]
-        assert tos_client.presigns == [
-            {
-                "method": "GET",
-                "bucket": "team-bucket",
-                "key": upload["key"],
-                "expires": 86400,
-            }
-        ]
-        assert tos_client.deletes == [("team-bucket", upload["key"])]
-        assert tos_client.close_count == 1
+        assert node.get_parameter_value("local_video_upload_service") == target.LOCAL_VIDEO_UPLOAD_GRIPTAPE
+        driver = FakeCloudDriver()
+        node._create_gt_cloud_storage_driver = lambda: driver
+        with mock.patch.object(node, "_create_tos_storage_context", side_effect=AssertionError("Unexpected TOS setup")) as create_tos:
+            asyncio.run(node.aprocess())
+        create_tos.assert_not_called()
+        assert [upload["file_content"] for upload in driver.uploads] == [local_video.read_bytes()]
+        assert driver.deletes == [driver.uploads[0]["path"]]
         post_payload = bridge.generate_payloads[0]
-        reference_url = post_payload["video_urls"][0]
-        assert reference_url.startswith(
-            "https://team-bucket.tos-cn-beijing.volces.com/"
-        )
-        assert "temporary-tos-secret" in reference_url
-        assert "temporary-tos-secret" not in json.dumps(
-            node.parameter_output_values, default=str
-        )
+        assert post_payload["video_urls"] == ["https://storage.example/reference.mp4?signature=temporary-secret"]
+        assert "temporary-secret" not in json.dumps(node.parameter_output_values, default=str)
+
+        old_key = "hmb-seedance-temp/old.mp4"
+        node._temporary_tos_video_uploads.append((tos_client, "team-bucket", old_key))
+        node._cleanup_temporary_video_uploads()
+        tos_client.delete_object.assert_called_once_with("team-bucket", old_key)
+        tos_client.close.assert_called_once_with()
 
         assert (
             target.HMBSeedanceGeneration._normalize_tos_endpoint(
@@ -5100,6 +5035,7 @@ def assert_gallery_callback(engine) -> None:
         display_name=f"Gallery callback {stamp}", flow_name=f"GalleryCallback_{stamp}"))
     assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
     original_broker_address = target._broker_config.load_broker_base_url()
+    close_workflow = bind_created_workflow(engine, ensured)
     try:
         native = create_host_node("HMBSeedanceGeneration", f"NativeGallery_{stamp}")
         native.set_parameter_value(target.BROKER_SERVER_URL_PARAMETER, "https://gallery.example")
@@ -5120,17 +5056,20 @@ def assert_gallery_callback(engine) -> None:
             assert set(stored) == {"schema", "version", "action", "action_id", "issued_at_ms"}
             assert "SECRET" not in json.dumps(stored) and "browser-owned" not in json.dumps(stored)
     finally:
-        if hasattr(engine, "close_workflow"):
-            engine.close_workflow(engine.current_workflow())
-        else:
-            deleted = asyncio.run(GriptapeNodes.ahandle_request(DeleteWorkflowRequest(name=ensured.workflow_name)))
-            assert isinstance(deleted, DeleteWorkflowResultSuccess)
+        asyncio.run(close_workflow())
         target._broker_config.save_broker_base_url(original_broker_address)
 
 
 if "--gallery-only" in sys.argv[1:]:
     assert_hidden_task_evidence_and_gallery_contract()
     print("HMB_SEEDANCE_GALLERY_CURRENT_SDK=PASS registered CreateNode, duplicate pulse, sanitized state, clean close")
+    raise SystemExit(0)
+
+if "--cloud-media-only" in sys.argv[1:]:
+    with mock.patch.object(target, "_validate_decodable_mp4_file", side_effect=accept_structural_regression_mp4):
+        assert_local_video_temporary_publication()
+        assert_legacy_tos_setting_uses_cloud_and_old_leases_can_be_cleaned()
+    print("HMB Seedance Cloud staging and recovery regression: PASS")
     raise SystemExit(0)
 
 assert_fake_broker_authentication_boundary()
@@ -5152,8 +5091,8 @@ for host_check in (
     assert_seedance_discarded_workflow_snapshot_contract,
     assert_seedance_dangling_list_delete_live_host_contract,
 ):
-    with protected_seedance_host():
-        host_check()
+    with protected_seedance_host() as engine:
+        host_check(engine)
     print(f"PASS {host_check.__name__}", flush=True)
 assert_payload_and_media_contract()
 assert_seedance_25_model_contract()
@@ -5167,7 +5106,7 @@ with mock.patch.object(
     assert_refresh_during_submission_contract()
     assert_broker_account_and_button_contract()
     assert_local_video_temporary_publication()
-    assert_tos_local_video_temporary_publication()
+    assert_legacy_tos_setting_uses_cloud_and_old_leases_can_be_cleaned()
     assert_broker_result_download_contract()
     assert_last_frame_download_security_contract()
     assert_mov_and_last_frame_pair_refresh_contract()

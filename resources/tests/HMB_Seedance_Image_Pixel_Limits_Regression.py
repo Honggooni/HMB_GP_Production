@@ -190,10 +190,10 @@ class SeedanceImagePipelineIntegrationRegression(unittest.TestCase):
                                 "input_mode": target.INPUT_MODE_MULTIMODAL_REFERENCES,
                                 "reference_images": list(references)})
             node.parameter_values.update(node.values)
-            # Keep real image validation, cloud preparation and Base64 request
-            # construction; replace only external capabilities and transport.
+            # Use a content digest to verify the bytes supplied to Cloud without a network call.
             node._prepare_video_references_for_run = target.HMBSeedanceGeneration._prepare_video_references_for_run.__get__(node)
-            node._try_create_gt_cloud_storage_driver = unittest.mock.Mock(return_value=None)
+            node._create_gt_cloud_storage_driver = unittest.mock.Mock(return_value=object())
+            node._upload_cloud_reference_bytes = lambda driver, content, name: "https://storage.example/" + hashlib.sha256(content).hexdigest()
             node.bridge.require_seedance_features = unittest.mock.Mock(
                 side_effect=lambda *, output_format, **_features: output_format,
             )
@@ -223,7 +223,7 @@ class SeedanceImagePipelineIntegrationRegression(unittest.TestCase):
                 messages.append(message)
                 self.assertEqual(node.bridge.posts, [])
                 self.assertEqual(node._temporary_video_uploads, [])
-                node._try_create_gt_cloud_storage_driver.assert_not_called()
+                node._create_gt_cloud_storage_driver.assert_not_called()
             self.assertEqual(len(set(messages)), 1)
             self.assertEqual({path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (good, bad)}, before)
 
@@ -244,7 +244,7 @@ class SeedanceImagePipelineIntegrationRegression(unittest.TestCase):
                 wire = node.bridge.posts[0]
                 self.assertEqual(len(wire["image_urls"]), 3)
                 for url, original in zip(wire["image_urls"], contents):
-                    self.assertEqual(base64.b64decode(url.split(",", 1)[1], validate=True), original)
+                    self.assertEqual(url, "https://storage.example/" + hashlib.sha256(original).hexdigest())
                 self.assertEqual(node.values, authored)
                 keys.append(wire["client_request_id"])
             self.assertEqual(len(set(keys)), 5)
@@ -260,7 +260,7 @@ class SeedanceImagePipelineIntegrationRegression(unittest.TestCase):
             self.assertIn("SEEDANCE_IMAGE_INVALID", node.results[-1]["result_details"])
             self.assertIn("Image reference 3", node.results[-1]["result_details"])
             self.assertEqual(node.bridge.posts, [])
-            node._try_create_gt_cloud_storage_driver.assert_not_called()
+            node._create_gt_cloud_storage_driver.assert_not_called()
 
     def test_https_reference_keeps_local_error_ordinal_and_does_not_fetch_remote_image(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -273,7 +273,7 @@ class SeedanceImagePipelineIntegrationRegression(unittest.TestCase):
                 self.assertIs(node.results[-1]["was_successful"], False)
                 self.assertIn("Image reference 3 (third-reference.png)", node.results[-1]["result_details"])
                 self.assertEqual(node.bridge.posts, [])
-                node._try_create_gt_cloud_storage_driver.assert_not_called()
+                node._create_gt_cloud_storage_driver.assert_not_called()
 
 
 if __name__ == "__main__":

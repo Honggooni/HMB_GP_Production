@@ -213,12 +213,9 @@ _RECOVERY_JOURNAL_OWNERS_GUARD = threading.Lock()
 _DRAFT_OWNERS: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
 _DRAFT_OWNERS_GUARD = threading.Lock()
 
-LOCAL_VIDEO_UPLOAD_GRIPTAPE = "Griptape Cloud (Existing)"
+LOCAL_VIDEO_UPLOAD_GRIPTAPE = "Griptape Cloud"
 LOCAL_VIDEO_UPLOAD_TOS = "Volcengine TOS"
-LOCAL_VIDEO_UPLOAD_SERVICES = (
-    LOCAL_VIDEO_UPLOAD_GRIPTAPE,
-    LOCAL_VIDEO_UPLOAD_TOS,
-)
+LOCAL_VIDEO_UPLOAD_SERVICES = (LOCAL_VIDEO_UPLOAD_GRIPTAPE,)
 DEFAULT_TOS_REGION = "cn-beijing"
 DEFAULT_TOS_ENDPOINT = "tos-cn-beijing.volces.com"
 
@@ -636,7 +633,6 @@ LEGACY_VIDEO_REFERENCE_SLOTS = 3
 MAX_IMAGE_BYTES = 30 * 1024 * 1024
 MAX_AUDIO_BYTES = 15 * 1024 * 1024
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
-SEEDANCE_INLINE_IMAGE_BUDGET = 12 * 1024 * 1024
 SEEDANCE_LOSSLESS_PNG_COPY_THRESHOLD = 2 * 1024 * 1024
 SEEDANCE_REFERENCE_VIDEO_COPY_RATE = 5_000_000
 SEEDANCE_REFERENCE_VIDEO_COPY_THRESHOLD = 8_000_000
@@ -4826,9 +4822,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 ],
                 default_value="",
                 tooltip=(
-                    f"Optional reference video {index}. Public URLs and asset:// "
-                    "references pass through; a local MP4 can be temporarily "
-                    "published through the selected upload service at execution time."
+                    f"Optional reference video {index}. Render inputs are staged in Griptape Cloud."
                 ),
                 allowed_modes={ParameterMode.INPUT},
                 hide_property=True,
@@ -4844,9 +4838,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 variant="cloud-upload",
                 title="Media Upload",
                 message=(
-                    "Local video files are temporarily uploaded through the selected "
-                    "service so the selected Seedance model can read them. The temporary "
-                    "object is deleted when this node execution ends."
+                    "Render reference files are uploaded to Griptape Cloud. Seedance reads the signed links."
                 ),
                 hide_clear_button=False,
             )
@@ -5087,25 +5079,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             ParameterBool(
                 name="auto_publish_local_videos",
                 default_value=True,
-                tooltip=(
-                    "When Griptape Cloud authentication and a bucket are ready, "
-                    "temporarily publish local image and video references as Cloud "
-                    "HTTPS URLs. Otherwise images keep the Base64 JSON path and "
-                    "videos use an already-supported fallback transport."
-                ),
+                tooltip="Render reference files use Griptape Cloud.",
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
                 ui_options={"display_name": "Auto Publish Local Videos"},
             )
             ParameterString(
                 name="local_video_upload_service",
                 default_value=LOCAL_VIDEO_UPLOAD_GRIPTAPE,
-                tooltip=(
-                    "Used for local video only when Griptape Cloud is unavailable. "
-                    "Choose Volcengine TOS for the existing signed-HTTPS fallback; "
-                    "public HTTPS and asset:// references always pass through."
-                ),
-                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+                tooltip="Legacy saved-workflow setting. Render reference files use Griptape Cloud.",
+                allowed_modes={ParameterMode.PROPERTY},
                 traits={Options(choices=list(LOCAL_VIDEO_UPLOAD_SERVICES))},
+                settable=False,
                 ui_options={"display_name": "Local Video Upload"},
             )
             ParameterString(
@@ -8198,6 +8182,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         workflows and to prevent an unknown model from silently becoming Full.
         """
 
+        if param_name == "local_video_upload_service":
+            value = LOCAL_VIDEO_UPLOAD_GRIPTAPE
+        elif param_name == "auto_publish_local_videos":
+            value = True
         if param_name == BROKER_SERVER_URL_PARAMETER:
             # Workflow hydration is never permission to replace the user's
             # PC-wide setting. Old serialized per-node values are ignored.
@@ -9477,16 +9465,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self.show_parameter_by_name(["last_frame_url", "last_frame_file"])
         else:
             self.hide_parameter_by_name(["last_frame_url", "last_frame_file"])
-        if (
-            self.get_parameter_value("local_video_upload_service")
-            == LOCAL_VIDEO_UPLOAD_TOS
-        ):
-            for name in ("tos_region", "tos_endpoint", "tos_url_validity_seconds"):
-                self.show_parameter_by_name(name)
-        else:
-            self.hide_parameter_by_name(
-                ["tos_region", "tos_endpoint", "tos_url_validity_seconds"]
-            )
+        # Retain legacy parameter names for deserialization of saved workflows.
+        self.hide_parameter_by_name(["auto_publish_local_videos", "local_video_upload_service",
+                                     "tos_region", "tos_endpoint", "tos_url_validity_seconds"])
 
     def _synchronize_model_resolution(self) -> str:
         """Apply the selected Volcengine model's generation contract."""
@@ -11587,13 +11568,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "generation_timeout_seconds": self.get_parameter_value(
                 "generation_timeout_seconds"
             ),
-            "auto_publish_local_videos": bool(
-                self.get_parameter_value("auto_publish_local_videos")
-            ),
-            "local_video_upload_service": str(
-                self.get_parameter_value("local_video_upload_service")
-                or LOCAL_VIDEO_UPLOAD_GRIPTAPE
-            ),
+            "auto_publish_local_videos": True,
+            "local_video_upload_service": LOCAL_VIDEO_UPLOAD_GRIPTAPE,
             "tos_region": str(
                 self.get_parameter_value("tos_region") or DEFAULT_TOS_REGION
             ).strip(),
@@ -12103,23 +12079,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if self._validate_draft_parameters(params) == DRAFT_ACTION_FINAL:
             # Finalization sends no new prompt/media/input/duration/audio settings.
             return
-
-        upload_service = params.get(
-            "local_video_upload_service", LOCAL_VIDEO_UPLOAD_GRIPTAPE
-        )
-        if upload_service not in LOCAL_VIDEO_UPLOAD_SERVICES:
-            raise ValueError(f"Unsupported local video upload service: {upload_service!r}.")
-        if upload_service == LOCAL_VIDEO_UPLOAD_TOS:
-            validity = params.get("tos_url_validity_seconds")
-            if not isinstance(validity, int) or isinstance(validity, bool):
-                raise ValueError("tos_url_validity_seconds must be an integer.")
-            if not MIN_TOS_URL_VALIDITY_SECONDS <= validity <= MAX_TOS_URL_VALIDITY_SECONDS:
-                raise ValueError(
-                    "tos_url_validity_seconds must be between 3600 and 2592000."
-                )
-            if not params.get("tos_region"):
-                raise ValueError("TOS Region cannot be blank.")
-            self._normalize_tos_endpoint(params.get("tos_endpoint", ""))
 
         model_id = params["model_id"]
         if model_id not in MODEL_RESOLUTIONS:
@@ -13050,16 +13009,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         suffix = next(suffix for suffix, candidate in IMAGE_MIME_BY_SUFFIX.items() if candidate == mime)
         return content, mime, path.with_suffix(suffix).name
 
-    def _upload_image_to_griptape_cloud(
-        self,
-        driver: GriptapeCloudStorageDriver,
-        value: Any,
-        compact_copy: tuple[bytes, str] | None = None,
-    ) -> str:
-        if compact_copy is None:
-            content, _mime, filename = self._read_image_for_cloud_upload(value)
-        else:
-            content, filename = compact_copy
+    def _upload_cloud_reference_bytes(self, driver: Any, content: bytes, filename: str) -> str:
         remote_path = Path("artifact_url_storage") / uuid4().hex / filename
         self._temporary_video_uploads.append((driver, remote_path))
 
@@ -13218,57 +13168,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
         return signed_url
 
-    def _prepare_image_references_for_run(
-        self,
-        params: dict[str, Any],
-        cloud_driver: Any = _CLOUD_DRIVER_UNSET,
-    ) -> tuple[dict[str, Any], Any]:
-        """Carry smaller Seedance 2.5 images in the request to avoid remote fetches."""
-
-        values = [
-            params.get("first_frame"),
-            params.get("last_frame"),
-            *(params.get("reference_images") or []),
-        ]
-        seedance_25 = params.get("model_id") == SEEDANCE_2_5_MODEL_ID
-        inline_remaining = SEEDANCE_INLINE_IMAGE_BUDGET if seedance_25 else 0
-        candidates: list[tuple[int, Any, str, tuple[bytes, str] | None]] = []
-        ordinal = 0
-        for index, value in enumerate(values):
-            if not self._has_reference_value(value):
-                continue
-            ordinal += 1
-            text = str(self._coerce_reference_value(value)).strip()
-            if text.startswith(("http://", "https://", "asset://")):
-                continue
-            # Validate all local inputs before creating any upload. In
-            # particular, a later oversized reference must not leave earlier
-            # references partially uploaded before its error is reported.
-            content, mime, name = self._read_image_for_cloud_upload(value, reference_ordinal=ordinal)
-            compact_copy = None
-            if seedance_25 and mime == "image/png" and len(content) >= SEEDANCE_LOSSLESS_PNG_COPY_THRESHOLD:
-                content, mime = self._compact_seedance_png_reference(content)
-                if mime == "image/webp":
-                    compact_copy = (content, Path(name).with_suffix(".webp").name)
-            prefix = f"data:{mime};base64,"
-            inline_size = len(prefix) + 4 * ((len(content) + 2) // 3)
-            if inline_size <= inline_remaining:
-                values[index] = prefix + base64.b64encode(content).decode("ascii")
-                inline_remaining -= inline_size
-            else:
-                candidates.append((index, value, name, compact_copy))
-
-        if candidates and cloud_driver is _CLOUD_DRIVER_UNSET:
-            cloud_driver = self._try_create_gt_cloud_storage_driver()
-        if candidates and cloud_driver is not None:
-            for index, value, name, compact_copy in candidates:
-                url = self._upload_image_to_griptape_cloud(cloud_driver, value, compact_copy)
-                if params.get("model_id") == SEEDANCE_2_5_MODEL_ID:
-                    self._confirm_seedance_reference_download(url, name)
-                values[index] = url
-        first_frame, last_frame, *images = values
-        return dict(params, first_frame=first_frame, last_frame=last_frame, reference_images=images), cloud_driver
-
     @staticmethod
     def _compact_seedance_png_reference(content: bytes) -> tuple[bytes, str]:
         """Encode a smaller transport copy without changing pixel values."""
@@ -13290,91 +13189,156 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             pass
         return content, "image/png"
 
-    @staticmethod
-    def _confirm_seedance_reference_download(url: str, label: str) -> None:
-        """Check a newly issued storage URL without reading the attachment."""
-        try:
-            with httpx.stream(
-                "GET", url, headers={"Range": "bytes=0-0"}, timeout=5.0,
-                follow_redirects=False, trust_env=False,
-            ) as response:
-                if response.status_code in (200, 206):
-                    if next(response.iter_raw(chunk_size=1), b""):
-                        return
-                    reason = "empty response"
+    @contextmanager
+    def _cloud_reference_source(self, kind: str, value: Any) -> Iterator[str]:
+        text = str(self._coerce_reference_value(value)).strip()
+        if text.startswith("asset://"):
+            raise ValueError("공급자 asset:// ID만으로는 원본을 읽을 수 없습니다. 원본 파일이나 다운로드 URL을 연결하세요.")
+        if not text.startswith(("http://", "https://")):
+            yield text
+            return
+
+        # Do not forward a third-party link or a private authorization header to Ark.
+        limits = {"image": MAX_IMAGE_BYTES, "video": MAX_DOWNLOAD_BYTES, "audio": MAX_AUDIO_BYTES}
+        suffix = Path(urlparse(text).path).suffix.lower()
+        with TemporaryDirectory(prefix="hmb-cloud-input-") as folder:
+            path = Path(folder) / "reference"
+            with path.open("wb") as stream:
+                asyncio.run(self._download_external_media(
+                    text, accept=f"{kind}/*,application/octet-stream", max_bytes=limits[kind],
+                    media_label=f"Reference {kind}", destination=stream,
+                ))
+            if kind == "image":
+                suffix = suffix if suffix in IMAGE_MIME_BY_SUFFIX else ".png"
+            elif kind == "video":
+                suffix = suffix if suffix in {".mp4", ".mov", ".webm", ".mkv"} else ".mp4"
+            elif suffix not in AUDIO_MIME_BY_SUFFIX:
+                with path.open("rb") as stream:
+                    header = stream.read(12)
+                if header.startswith(b"RIFF") and header[8:12] == b"WAVE":
+                    suffix = ".wav"
+                elif header.startswith(b"ID3") or (len(header) >= 2 and header[0] == 255 and header[1] & 224 == 224):
+                    suffix = ".mp3"
                 else:
-                    reason = f"HTTP {response.status_code}"
-        except httpx.RequestError as exc:
-            reason = type(exc).__name__
-        raise ValueError(f"Seedance reference {label} could not be downloaded from storage ({reason}).") from None
+                    raise ValueError("External reference audio must be WAV or MP3.")
+            yield str(path.rename(path.with_suffix(suffix)))
+
+    @classmethod
+    def _read_cloud_reference_audio(cls, source: str) -> tuple[bytes, str]:
+        if source.startswith("data:"):
+            inline = cls._validate_data_uri("audio", source)
+            prefix, encoded = inline.split(",", 1)
+            suffix = next(ext for ext, mime in AUDIO_MIME_BY_SUFFIX.items() if prefix == f"data:{mime};base64")
+            return base64.b64decode(encoded, validate=True), "reference" + suffix
+        path = Path(File(source).resolve())
+        if path.suffix.lower() not in AUDIO_MIME_BY_SUFFIX or not path.is_file():
+            raise ValueError("Reference audio must be an existing WAV or MP3 file.")
+        with path.open("rb") as stream:
+            content = stream.read(MAX_AUDIO_BYTES + 1)
+        if not 0 < len(content) <= MAX_AUDIO_BYTES:
+            raise ValueError("Reference audio must be nonempty and no larger than 15 MiB.")
+        return content, path.name
+
+    def _prepare_cloud_image(self, source: str, model: str, ordinal: int) -> tuple[bytes, str]:
+        content, mime, name = self._read_image_for_cloud_upload(source, reference_ordinal=ordinal)
+        if model == SEEDANCE_2_5_MODEL_ID and mime == "image/png" and len(content) >= SEEDANCE_LOSSLESS_PNG_COPY_THRESHOLD:
+            content, mime = self._compact_seedance_png_reference(content)
+            if mime == "image/webp":
+                name = Path(name).with_suffix(".webp").name
+        return content, name
+
+    def _stage_cloud_reference(self, driver: Any, kind: str, value: Any, model: str, ordinal: int) -> str:
+        with self._cloud_reference_source(kind, value) as source:
+            if kind == "video":
+                path = self._resolve_local_video_path(source)
+                with self._reference_video_upload_path(path, model) as upload_path:
+                    key = Path("artifact_url_storage") / uuid4().hex / upload_path.name
+                    self._temporary_video_uploads.append((driver, key))
+                    return self._upload_local_video_to_griptape_cloud(driver, upload_path, key)
+            if kind == "audio":
+                content, name = self._read_cloud_reference_audio(source)
+            else:
+                content, name = self._prepare_cloud_image(source, model, ordinal)
+            return self._upload_cloud_reference_bytes(driver, content, name)
 
     def _prepare_video_references_for_run(
-        self,
-        params: dict[str, Any],
-        cloud_driver: Any = _CLOUD_DRIVER_UNSET,
+        self, params: dict[str, Any], cloud_driver: Any = _CLOUD_DRIVER_UNSET,
     ) -> dict[str, Any]:
-        """Prepare image/video transport without changing selected media order."""
+        """Stage every client-supplied render file in Cloud before building the Broker request."""
         self._assert_operation_project_selection()
-        references = self._generation_video_reference_values(params)
-        params, cloud_driver = self._prepare_image_references_for_run(
-            params,
-            cloud_driver,
-        )
+        images = [params.get("first_frame"), params.get("last_frame"), *(params.get("reference_images") or [])]
+        videos = self._generation_video_reference_values(params)
+        audio = params.get("reference_audio") or []
+        model = params.get("model_id")
 
-        prepared: list[str] = []
-        tos_context: tuple[Any, Any, str] | None = None
-        for ordinal, value in enumerate(references, 1):
-            reference = self._coerce_reference_value(value)
-            text = str(reference).strip()
-            if text.startswith(("http://", "https://", "asset://", "data:")):
-                prepared.append(self._prepare_media_reference("video", text))
-                continue
-            if not params.get("auto_publish_local_videos", True):
-                prepared.append(self._prepare_media_reference("video", value))
-                continue
+        def source_key(kind: str, value: Any) -> tuple[str, str]:
+            text = str(self._coerce_reference_value(value)).strip()
+            if not text.startswith(("http://", "https://", "asset://", "data:")):
+                text = os.path.normcase(os.path.normpath(str(File(text).resolve())))
+            return kind, text
 
-            try:
-                local_path = self._resolve_local_video_path(text)
-                upload_service = params.get(
-                    "local_video_upload_service", LOCAL_VIDEO_UPLOAD_GRIPTAPE
-                )
+        with ExitStack() as scratch:
+            # Validate every local image before the first upload. Retain at most
+            # one image budget in memory. Spill larger batches to private scratch
+            # so a network source is only read once, even if it changes on disk.
+            prepared: dict[tuple[str, str], tuple[bytes | Path, str]] = {}
+            memory_left = MAX_IMAGE_BYTES
+            spill_dir = None
+            ordinal = 0
+            for image in images:
+                if not self._has_reference_value(image):
+                    continue
+                ordinal += 1
+                key = source_key("image", image)
+                source = str(self._coerce_reference_value(image)).strip()
+                if source.startswith(("http://", "https://", "asset://")) or key in prepared:
+                    continue
+                content, name = self._prepare_cloud_image(source, model, ordinal)
+                if len(content) <= memory_left:
+                    prepared[key] = (content, name)
+                    memory_left -= len(content)
+                else:
+                    if spill_dir is None:
+                        spill_dir = Path(scratch.enter_context(TemporaryDirectory(prefix="hmb-render-inputs-")))
+                    staged = spill_dir / str(ordinal)
+                    staged.write_bytes(content)
+                    prepared[key] = (staged, name)
+                del content
+
+            for video in dict.fromkeys(source_key("video", value)[1] for value in videos):
+                if not video.startswith(("http://", "https://", "asset://", "data:")):
+                    self._resolve_local_video_path(video)
+            if ordinal or videos or audio:
                 if cloud_driver is _CLOUD_DRIVER_UNSET:
-                    cloud_driver = self._try_create_gt_cloud_storage_driver()
-                if cloud_driver is None and upload_service != LOCAL_VIDEO_UPLOAD_TOS:
-                    raise RuntimeError(
-                        "Griptape Cloud authentication or bucket access is not "
-                        "available for this local video. Use a public HTTPS URL, "
-                        "a Volcengine asset:// reference, or select a configured "
-                        "Volcengine TOS transport."
-                    )
-                with self._reference_video_upload_path(local_path, params.get("model_id")) as upload_path:
-                    if cloud_driver is not None:
-                        remote_path = Path("artifact_url_storage") / uuid4().hex / upload_path.name
-                        self._temporary_video_uploads.append((cloud_driver, remote_path))
-                        public_url = self._upload_local_video_to_griptape_cloud(cloud_driver, upload_path, remote_path)
-                    else:
-                        if tos_context is None:
-                            tos_context = self._create_tos_storage_context(params)
-                        public_url = self._upload_local_video_to_tos(upload_path, params, tos_context)
-            except LocalReferenceVideoError:
-                # Preserve the actionable local/project-path diagnosis. The
-                # generic upload-service hint is only appropriate after a
-                # readable local file reached the selected storage service.
-                raise
-            except Exception as exc:
-                raise RuntimeError(
-                    "Local reference-video publishing failed through an allowed "
-                    "upload service. Check its credentials, bucket, region, and "
-                    "endpoint, then retry. Alternatively provide a public https:// "
-                    "URL or Volcengine asset:// reference."
-                ) from exc
-            if params.get("model_id") == SEEDANCE_2_5_MODEL_ID:
-                self._confirm_seedance_reference_download(public_url, f"@video{ordinal} ({local_path.name})")
-            prepared.append(self._prepare_media_reference("video", public_url))
+                    cloud_driver = self._create_gt_cloud_storage_driver()
+                if cloud_driver is None:
+                    raise RuntimeError("Griptape Cloud 저장소에 연결할 수 없습니다. 로그인과 버킷 설정을 확인하세요.")
 
-        updated = dict(params)
-        updated["video_references"] = prepared
-        return updated
+            uploaded: dict[tuple[str, str], str] = {}
+
+            def upload_once(kind: str, value: Any, index: int) -> str:
+                key = source_key(kind, value)
+                if key not in uploaded:
+                    if key in prepared:
+                        blob, name = prepared.pop(key)
+                        content = blob.read_bytes() if isinstance(blob, Path) else blob
+                        uploaded[key] = self._upload_cloud_reference_bytes(cloud_driver, content, name)
+                    else:
+                        uploaded[key] = self._stage_cloud_reference(cloud_driver, kind, value, model, index)
+                return uploaded[key]
+
+            ordinal = 0
+            for index, value in enumerate(images):
+                if self._has_reference_value(value):
+                    ordinal += 1
+                    images[index] = upload_once("image", value, ordinal)
+            video_urls = [upload_once("video", value, index) for index, value in enumerate(videos, 1)]
+            audio_urls = [upload_once("audio", value, index) for index, value in enumerate(audio, 1)]
+        first, last, *references = images
+        return dict(
+            params, first_frame=first, last_frame=last, reference_images=references,
+            video_references=video_urls, reference_audio=audio_urls,
+        )
 
     def _generation_video_reference_values(self, params: dict[str, Any]) -> list[Any]:
         slots = [value for value in params.get("video_reference_slots") or [] if self._has_reference_value(value)]
@@ -14105,16 +14069,16 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 addresses.append(address)
         return tuple(addresses)
 
-    async def _validate_download_url(self, url: str) -> tuple[str, ...]:
+    async def _validate_download_url(self, url: str, *, allow_http: bool = False) -> tuple[str, ...]:
         parsed = urlparse(url)
-        if parsed.scheme != "https" or not parsed.hostname:
+        if (parsed.scheme != "https" and not (allow_http and parsed.scheme == "http")) or not parsed.hostname:
             raise ValueError(
                 "External result download URL must use HTTPS."
             )
         if parsed.username is not None or parsed.password is not None:
             raise ValueError("Video download URL must not contain user credentials.")
         try:
-            port = parsed.port or 443
+            port = parsed.port or (80 if parsed.scheme == "http" else 443)
         except ValueError as exc:
             raise ValueError("Video download URL contains an invalid port.") from exc
         addresses = await asyncio.to_thread(
@@ -14188,13 +14152,19 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         accept: str,
         max_bytes: int,
         media_label: str,
+        destination: Any = None,
     ) -> bytes:
         timeout = httpx.Timeout(connect=20.0, read=300.0, write=60.0, pool=20.0)
         current_url = url
         attempts = 0
         redirects = 0
         while attempts < 3:
-            validated_addresses = await self._validate_download_url(current_url)
+            if destination is not None and urlparse(current_url).scheme == "http":
+                if urlparse(url).scheme != "http":
+                    raise ValueError("HTTPS reference redirect cannot downgrade to HTTP.")
+                validated_addresses = await self._validate_download_url(current_url, allow_http=True)
+            else:
+                validated_addresses = await self._validate_download_url(current_url)
             pinned_url, host_header, sni_hostname = self._pinned_download_target(
                 current_url,
                 validated_addresses[attempts % len(validated_addresses)],
@@ -14259,12 +14229,20 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                             )
 
                         content = bytearray()
+                        received = 0
+                        if destination is not None:
+                            destination.seek(0)
+                            destination.truncate()
                         async for chunk in response.aiter_bytes():
-                            if len(content) + len(chunk) > max_bytes:
+                            received += len(chunk)
+                            if received > max_bytes:
                                 raise RuntimeError(
                                     f"Downloaded {media_label.lower()} exceeds the safety limit."
                                 )
-                            content.extend(chunk)
+                            if destination is None:
+                                content.extend(chunk)
+                            else:
+                                destination.write(chunk)
             except httpx.TransportError as exc:
                 attempts += 1
                 if attempts < 3:
@@ -14274,7 +14252,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     f"{media_label} download failed ({type(exc).__name__})."
                 ) from exc
 
-            if not content:
+            if not received:
                 raise RuntimeError(f"Result returned an empty {media_label.lower()} file.")
             return bytes(content)
         raise RuntimeError(f"{media_label} download exhausted its retry limit.")

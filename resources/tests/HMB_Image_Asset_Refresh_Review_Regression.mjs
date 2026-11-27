@@ -245,6 +245,12 @@ if (playwright && fs.existsSync(executablePath)) {
     assert.match(await page.locator("[data-transport-status]").textContent(), /새로고침 결과를 받지 못했습니다/);
     await page.evaluate(() => window.controller.update(window.props({ ...window.ack })));
     assert.equal(await reload.isEnabled(), true, "A late busy frame cannot re-lock Refresh");
+    await page.evaluate(() => window.controller.update(window.props({ ...window.ack, scan_delayed: true })));
+    assert.equal(await page.locator(".toolbar-status strong").textContent(), "새로고침 지연 중",
+      "A late delay acknowledgement supersedes the client deadline for the same request");
+    assert.doesNotMatch(await page.locator("[data-transport-status]").textContent(), /결과를 받지 못했습니다/);
+    await page.evaluate(() => window.controller.update(window.props({ ...window.ack, scan_busy: false })));
+    assert.doesNotMatch(await page.locator(".toolbar-status strong").textContent(), /지연 중|불러오는 중/);
     await reload.click();
     await page.waitForFunction(() => window.writes.some(value => (value.edits || value).refresh_revision === 2));
     await page.evaluate(() => {
@@ -253,6 +259,27 @@ if (playwright && fs.existsSync(executablePath)) {
       window.controller.update(window.props({ ...result, scan_busy: true }));
     });
     assert.equal(await reload.isEnabled(), true, "A successful retry stays idle after an out-of-order busy frame");
+    await reload.click();
+    await page.waitForFunction(() => window.writes.some(value => (value.edits || value).refresh_revision === 3));
+    await page.evaluate(() => {
+      window.delayed = { ...window.container.__hmbImageAssetLatestState, scan_request_id: "slow-share",
+        refresh_revision: 3, scan_busy: true, scan_delayed: true };
+      window.controller.update(window.props({ ...window.delayed, scan_delayed: false }));
+      window.controller.update(window.props(window.delayed));
+    });
+    const status = page.locator(".toolbar-status strong");
+    assert.equal(await status.textContent(), "새로고침 지연 중");
+    assert.equal(await page.locator("[data-project-select]").isEnabled(), true, "A slow share leaves project navigation usable");
+    await page.clock.fastForward(81000);
+    await page.evaluate(() => window.controller.update(window.props({ ...window.delayed, scan_delayed: false })));
+    assert.equal(await status.textContent(), "새로고침 지연 중", "The local deadline and older busy frame cannot end an active scan");
+    assert.doesNotMatch(await page.locator("[data-transport-status]").textContent(), /결과를 받지 못했습니다/);
+    await page.evaluate(() => {
+      window.controller.update(window.props({ ...window.delayed, scan_revision: 2, scan_busy: false, scan_delayed: false }));
+      window.controller.update(window.props(window.delayed));
+    });
+    assert.doesNotMatch(await status.textContent(), /지연 중|불러오는 중/);
+    assert.equal(await reload.isEnabled(), true);
     for (const compact of [false, true]) {
       await page.evaluate(({ value, compact }) => window.mountReview(value, compact), { value: { ...initial, asset_refresh_review: {} }, compact });
       const sizeBefore = await page.locator(".hmb-image-assets").boundingBox();
@@ -287,7 +314,7 @@ if (playwright && fs.existsSync(executablePath)) {
       assert.equal(await page.locator(".hmb-image-assets").getAttribute("data-library-compact"), String(compact));
     }
     assert.deepEqual(errors, []);
-    console.log("HMB ImageAsset Refresh browser regression: PASS (session catalog stays pinned through idle, focus and reopen; explicit refresh, expanded and compact review, confirm, close)");
+    console.log("HMB ImageAsset Refresh browser regression: PASS (local catalog on reopen, delayed scan, late acknowledgement/completion, unresponsive request, expanded/compact review)");
   } finally {
     await browser?.close();
   }

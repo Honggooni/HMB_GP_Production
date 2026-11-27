@@ -1,6 +1,7 @@
 # Temporary reference lifetime
 
-Cloud and TOS reference uploads belong to one explicit Seedance invocation.
+Generator stages render references in Griptape Cloud for each explicit Seedance invocation.
+Previously created TOS handles follow the same lease cleanup rules.
 Before create, their live storage handles transfer into a process-private lease
 bound to the original Broker origin, authenticated account fingerprint and
 client request ID. A validated response from that create or same-key lookup may

@@ -4909,6 +4909,7 @@ def _default_state() -> Dict[str, Any]:
         "scan_revision": 0,
         "refresh_revision": 0,
         "scan_busy": False,
+        "scan_delayed": False,
         "scan_request_id": "",
         "thumbnail_request": {},
         "thumbnail_result": {},
@@ -5066,6 +5067,7 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
             "scan_revision": scan_revision,
             "refresh_revision": refresh_revision,
             "scan_busy": bool(source.get("scan_busy", False)),
+            "scan_delayed": bool(source.get("scan_busy") and source.get("scan_delayed")),
             "scan_request_id": _clean(source.get("scan_request_id"))[:128],
             "thumbnail_request": _normalize_thumbnail_request(
                 source.get("thumbnail_request")
@@ -8643,11 +8645,14 @@ def _asset_resolution_cache_key(
 def _resolution_cache_get(
     cache: OrderedDict[str, Dict[str, Any]] | None,
     key: str,
+    edit_revision: int,
 ) -> Dict[str, Any] | None:
     if not isinstance(cache, OrderedDict) or not key:
         return None
     cached = cache.get(key)
     if not isinstance(cached, dict):
+        return None
+    if "failed_edit_revision" in cached and cached["failed_edit_revision"] != edit_revision:
         return None
     cache.move_to_end(key)
     return cached
@@ -8750,7 +8755,7 @@ def _resolve_selected_assets(
         cached = (
             None
             if force
-            else _resolution_cache_get(resolution_cache, cache_key)
+            else _resolution_cache_get(resolution_cache, cache_key, _non_negative_int(normalized.get(UI_EDIT_REVISION_KEY)))
         )
         if cached is None:
             relative_path = ""
@@ -8803,6 +8808,10 @@ def _resolve_selected_assets(
                 ) if relative_path else "",
             }
             if reason != "project_catalog_preparing":
+                if reason and source_kind == "project":
+                    # A fresh authored selection can revisit a recovered path
+                    # even when its UID, catalog revision and filename match.
+                    cached["failed_edit_revision"] = _non_negative_int(normalized.get(UI_EDIT_REVISION_KEY))
                 _resolution_cache_put(resolution_cache, cache_key, cached)
         relative_path = _clean(cached.get("relative_path"))
         media_value = _clean(cached.get("media"))
@@ -11356,7 +11365,9 @@ class HMBImageAssetLibrary(DataNode):
         cache = self._resolution_cache_for_state(scoped)
         revision = _non_negative_int(getattr(self, "_hmb_import_revision", 0))
         if cached_only:
-            if any(_asset_resolution_cache_key(row, scoped, revision) not in cache for row in scoped["assets"]):
+            edit_revision = _non_negative_int(scoped.get(UI_EDIT_REVISION_KEY))
+            if any(_resolution_cache_get(cache, _asset_resolution_cache_key(row, scoped, revision), edit_revision) is None
+                   for row in scoped["assets"]):
                 raise _ImageAssetSelectionPreparing("ImageAsset exact Shot media cache is still preparing.")
         else:
             try:
@@ -12313,9 +12324,12 @@ class HMBImageAssetLibrary(DataNode):
         cache = self._resolution_cache_for_state(live)
         for key, entry in entries.items():
             _resolution_cache_put(cache, key, entry)
-        if publish and not live.get("scan_busy"):
+        if publish and (not live.get("scan_busy") or
+                        _clean(getattr(self, "_hmb_scan_pending_key", "")).startswith("refresh:")):
             # Only the current selection owns publication. A late completion
             # can warm its exact project cache, never restore a previous click.
+            # Refresh keeps the same project and can outlive many edits. Its
+            # folder scan must not swallow the verified Shot's readiness wake.
             self._sync_output(live, normalized=True, selection_ready=True)
             self._reconcile_hmb_shot_routing(
                 _shot_routing_catalog_identity(live, normalized=True)
@@ -12339,15 +12353,22 @@ class HMBImageAssetLibrary(DataNode):
         selections = [state]
         if state.get("image_bash_workspace"):
             selections.append(_image_bash_selection_state(state))
-        missing = [
-            _asset_resolution_cache_key(asset, state, revision)
-            for selection in selections
-            for asset in selection.get("assets", [])
-            if asset.get("selected")
-            and (_clean(asset.get("source_kind")).casefold() == "project"
-                 or _asset_resolution_cache_key(asset, state, revision) in retry_keys)
-            and _asset_resolution_cache_key(asset, state, revision) not in cache
-        ]
+        missing = set()
+        pending_rows = []
+        edit_revision = _non_negative_int(state.get(UI_EDIT_REVISION_KEY))
+        for selection in selections:
+            rows = []
+            for asset in selection.get("assets", []):
+                if not asset.get("selected"):
+                    continue
+                cache_key = _asset_resolution_cache_key(asset, state, revision)
+                if cache_key in missing or _resolution_cache_get(cache, cache_key, edit_revision) is not None:
+                    continue
+                if _clean(asset.get("source_kind")).casefold() == "project" or cache_key in retry_keys:
+                    rows.append(asset)
+                    missing.add(cache_key)
+            if rows:
+                pending_rows.append((selection, rows))
         if not missing:
             return False
         loop = None
@@ -12375,14 +12396,18 @@ class HMBImageAssetLibrary(DataNode):
             self._hmb_selection_resolution_work = work
         identity = _resolution_cache_state_identity(state)
         key = _sha256_canonical([identity, sorted(missing), work["epoch"]])
-        task = (key, identity, work["epoch"], copy.deepcopy(selections),
-                dict(getattr(self, "_hmb_import_media_by_uid", {}) or {}), revision)
         with work["lock"]:
             if key == work["key"]:
                 work["queued"] = None
                 return True
             if work["queued"] and work["queued"][0] == key:
                 return True
+            # The worker reads these scalar catalog fields and its own rows.
+            # Copying every unselected card also copied the full thumbnail
+            # catalog on the UI thread each time a new image was clicked.
+            snapshots = [{**selection, "assets": copy.deepcopy(rows)} for selection, rows in pending_rows]
+            task = (key, identity, work["epoch"], snapshots,
+                    dict(getattr(self, "_hmb_import_media_by_uid", {}) or {}), revision)
             if work["active"]:
                 # Bound a stalled share to one worker and retain only the
                 # newest pending selection instead of spawning on every click.
@@ -14095,6 +14120,7 @@ class HMBImageAssetLibrary(DataNode):
         on_published: Callable[[Dict[str, Any]], None] | None = None,
         *,
         timeout_seconds: float | None = None,
+        delay_notice_seconds: float | None = None,
         keep_editable: bool = False,
     ) -> Dict[str, Any]:
         """Publish a busy snapshot and run filesystem work off the UI thread.
@@ -14123,6 +14149,7 @@ class HMBImageAssetLibrary(DataNode):
             # to the prior generation and must not be retained after a newer
             # user request supersedes it.
             self._hmb_scan_pending_result = None
+            self._hmb_scan_delay_notice = None
 
         scan_base = _normalize_state(candidate_state)
         scan_import_revision = _non_negative_int(
@@ -14130,6 +14157,7 @@ class HMBImageAssetLibrary(DataNode):
         )
         busy = dict(scan_base)
         busy["scan_busy"] = not keep_editable
+        busy["scan_delayed"] = False
         busy["scan_request_id"] = request_id
         busy["error"] = ""
         busy = self._publish_state(busy, preserve_outputs=True) if keep_editable else self._publish_state(busy)
@@ -14236,6 +14264,7 @@ class HMBImageAssetLibrary(DataNode):
                 ):
                     owner._replace_import_media(media_by_uid)
                 result["scan_busy"] = False
+                result["scan_delayed"] = False
                 result["scan_request_id"] = request_id
                 published = owner._publish_completed_catalog_scan(result, key)
                 if on_published is not None:
@@ -14374,6 +14403,7 @@ class HMBImageAssetLibrary(DataNode):
                 ):
                     return
                 completion_claimed = True
+                owner._hmb_scan_delay_notice = None
                 if watchdog is not None:
                     watchdog.cancel()
                 # Retain before enqueue for the same loop-stop race handled by
@@ -14453,7 +14483,25 @@ class HMBImageAssetLibrary(DataNode):
         # Starting a daemon thread is bounded and does not require any retained-
         # mode manager.  Only the completed result is marshalled back to the
         # captured UI loop.
-        if timeout_seconds is not None:
+        if delay_notice_seconds is not None:
+            def mark_delayed() -> None:
+                owner = node_ref()
+                if owner is None:
+                    return
+                with owner._hmb_scan_lock:
+                    if (completion_claimed or generation != owner._hmb_scan_generation
+                            or key != owner._hmb_scan_pending_key or owner._hmb_node_deleted):
+                        return
+                    owner._hmb_scan_delay_notice = (generation, key, request_id)
+                loop = host_context.copy().run(resolve_scan_event_loop, event_loop)
+                if loop is not None:
+                    try:
+                        loop.call_soon_threadsafe(host_context.copy().run, owner._publish_catalog_delay_notice)
+                    except RuntimeError:
+                        pass  # The next retained callback will consume the notice.
+
+            watchdog = threading.Timer(delay_notice_seconds, mark_delayed)
+        elif timeout_seconds is not None:
             def expire() -> None:
                 message = (
                     "프로젝트 폴더 읽기가 지연되어 새로고침을 종료했습니다. 드라이브 연결을 확인한 뒤 다시 시도하세요."
@@ -14463,6 +14511,7 @@ class HMBImageAssetLibrary(DataNode):
                 complete(scan_failure(TimeoutError(message)), None)
 
             watchdog = threading.Timer(timeout_seconds, expire)
+        if watchdog is not None:
             watchdog.daemon = True
             watchdog.start()
         launch()
@@ -14484,6 +14533,7 @@ class HMBImageAssetLibrary(DataNode):
         self._ensure_scan_runtime_state()
         if bool(getattr(self, "_hmb_catalog_completion_active", False)):
             return False
+        self._publish_catalog_delay_notice()
         with self._hmb_scan_lock:
             pending = self._hmb_scan_pending_result
             if pending is None:
@@ -14520,6 +14570,7 @@ class HMBImageAssetLibrary(DataNode):
             ):
                 self._replace_import_media(media_by_uid)
             result["scan_busy"] = False
+            result["scan_delayed"] = False
             result["scan_request_id"] = request_id
             published = self._publish_completed_catalog_scan(result, key)
             on_published = payload.get("on_published")
@@ -14538,6 +14589,20 @@ class HMBImageAssetLibrary(DataNode):
             self._hmb_scan_pending_key = ""
             self._hmb_scan_thread = None
         return True
+
+    def _publish_catalog_delay_notice(self) -> None:
+        with self._hmb_scan_lock:
+            notice = getattr(self, "_hmb_scan_delay_notice", None)
+            if notice is None:
+                return
+            self._hmb_scan_delay_notice = None
+            generation, key, request_id = notice
+            if (generation != self._hmb_scan_generation or key != self._hmb_scan_pending_key
+                    or self._hmb_scan_pending_result is not None or not self._scan_owner_is_current()):
+                return
+        live = self._current_state()
+        if live.get("scan_busy") and live.get("scan_request_id") == request_id:
+            self._publish_state({**live, "scan_delayed": True})
 
     def _load_catalog(self, root_value: Any) -> Dict[str, Any]:
         previous = self._current_state()
@@ -15009,7 +15074,7 @@ class HMBImageAssetLibrary(DataNode):
         return self._schedule_catalog_scan(
             f"refresh:{catalog_root.casefold()}:{_non_negative_int(state.get('refresh_revision'))}",
             state, refresh, failure_state=state, result_merger=merge,
-            timeout_seconds=PROJECT_REFRESH_TIMEOUT_SECONDS,
+            delay_notice_seconds=PROJECT_REFRESH_TIMEOUT_SECONDS,
         )
 
     def _schedule_project_manifest_cleanup(

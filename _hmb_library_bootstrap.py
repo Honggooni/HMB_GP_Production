@@ -1238,24 +1238,6 @@ def _hmb_environment_child(python: Path, source: str, request: dict[str, Any], *
                 pass
 
 
-def _hmb_environment_prepare(state: Any, key: Any, python: Path, source: str, request: dict[str, Any]) -> None:
-    with state.lock:
-        if key in state.jobs:
-            return
-        state.jobs[key] = {"status": "preparing"}
-    def prepare() -> None:
-        try:
-            result = _hmb_environment_child(python, source, {**request, "operation": "prepare"}, timeout=660)
-            ready = result.get("ok") is True and result.get("status") == "prepared"
-        except Exception:
-            ready = False
-        with state.lock:
-            state.jobs[key] = {"status": "ready" if ready else "pending"}
-        if not ready:
-            _hmb_environment_notice(state, (key, "prepare"), "HMB optional TOS preparation is pending. Cloud generation, saved Tasks and video previews remain available.")
-    threading.Thread(target=prepare, name="HMB isolated TOS preparation", daemon=True).start()
-
-
 def _hmb_coordinate_environment_repair() -> dict[str, Any]:
     """One guarded cold repair; live reloads defer without editing active files."""
     state = _hmb_environment_state()
@@ -1367,9 +1349,6 @@ def _hmb_coordinate_environment_repair() -> dict[str, Any]:
             completed_stamp = None
         if completed_stamp is not None:
             state.completed[identity] = {"stamp": completed_stamp, "fingerprint": fingerprint, "summary": dict(summary)}
-        if audit["needs_tos_runtime"]:
-            _hmb_environment_prepare(state, identity, python, source, request)
-            summary["optional_tos"] = "preparing"
         return dict(summary)
     finally:
         for index, value in sorted(saved_paths):

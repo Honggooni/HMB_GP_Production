@@ -141,6 +141,37 @@ class SelectionResolutionTests(unittest.IsolatedAsyncioTestCase):
         node._sync_output(state)
         self.assertEqual(len(self.reads), count)
 
+    async def test_folder_refresh_verifies_only_new_shot_image_and_publishes_before_completion(self):
+        node, live = fake_node(selected_state("A"))
+        self.release.set()
+        node._sync_output(live["state"])
+        await self.wait_until(lambda: bool(self.published))
+        second = selected_state("B")["assets"][0]
+        second["selection_order"] = 2
+        state = live["state"]
+        state["assets"].append(second)
+        for index in range(500):
+            state["assets"].append(dict(second, asset_library_id=f"other-{index}",
+                                        source_uid=f"project:other-{index}", selected=False, selection_order=0))
+        shot = state["shot_routing"]["shots"][0]
+        shot.update(selected_source_uids=["project:A", "project:B"], revision=shot["revision"] + 1)
+        state["shot_routing"]["generation"] += 1
+        state.update(scan_busy=True, scan_delayed=True)
+        live["state"] = state = asset._normalize_state(state)
+        node._hmb_scan_pending_key = "refresh:ProjectA:1"
+        worked = []
+        resolve = asset._resolve_selected_assets
+        def trace_rows(view, *args, **kwargs):
+            if kwargs.get("wait_for_catalog"):
+                worked.append([row["source_uid"] for row in view["assets"]])
+            return resolve(view, *args, **kwargs)
+        with patch.object(asset, "_resolve_selected_assets", side_effect=trace_rows):
+            node._sync_output(state)
+            await self.wait_until(lambda: len(self.published[-1][1]) == 2)
+        self.assertEqual(worked, [["project:B"]])
+        self.assertEqual(self.published[-1][1], [state["assets"][0]["path"], second["path"]])
+        self.assertTrue(live["state"]["scan_busy"])
+
     async def test_explicit_import_retry_uses_bounded_worker_without_host_unc_reads(self):
         state = selected_state("UNC")
         state["assets"][0].update(source_kind="user", source_uid="user:retry-unc",
@@ -173,6 +204,35 @@ class SelectionResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(live["state"], before)
         self.assertEqual(self.published[-1][1], [state["assets"][0]["path"]])
         self.assertEqual(len(threads), 1)
+
+    async def test_reselect_rechecks_previously_unavailable_same_uid(self):
+        state = selected_state("A")
+        node, live = fake_node(state)
+        self.release.set()
+        available = False
+        checks = []
+        def verify(row, _state, _records):
+            checks.append(row["source_uid"])
+            return row["relative_path"] if available else ""
+        with patch.object(asset, "_verified_project_relative_path", side_effect=verify):
+            node._sync_output(live["state"])
+            await self.wait_until(lambda: bool(self.published))
+            self.assertEqual(self.published[-1][1], [])
+            first_checks = len(checks)
+            node._sync_output(live["state"])
+            self.assertEqual(len(checks), first_checks)
+            available = True
+            for selected in (False, True):
+                latest = deepcopy(live["state"])
+                latest[asset.UI_EDIT_REVISION_KEY] += 1
+                latest["assets"][0].update(selected=selected, selection_order=int(selected))
+                shot = latest["shot_routing"]["shots"][0]
+                shot.update(selected_source_uids=["project:A"] if selected else [], revision=shot["revision"] + 1)
+                latest["shot_routing"]["generation"] += 1
+                live["state"] = asset._normalize_state(latest)
+                node._sync_output(live["state"])
+            await self.wait_until(lambda: self.published[-1][1] == [state["assets"][0]["path"]])
+            self.assertEqual(len(checks), first_checks + 1)
 
     async def test_rapid_selection_keeps_only_latest_queued_click(self):
         node, live = fake_node(selected_state("A"))

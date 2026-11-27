@@ -523,7 +523,7 @@ try {
         $relocatedUserMembers.Add($relative)
     }
     $environmentMigration = Repair-HmbTosIsolation -LibraryRoot $target `
-        -PrepareRuntime ($PrepareTosRuntime.IsPresent -or $legacyTosEnvironment) `
+        -PrepareRuntime $PrepareTosRuntime.IsPresent `
         -CleanLegacyEnvironment $needsTosMigration
     $editEnvironment = Initialize-HmbEditEnvironment -LibraryRoot $target
     $nativeEditorResult = Invoke-HmbNativeEditorPatch -Action 'apply' -Plan $nativeEditorPlan.plan

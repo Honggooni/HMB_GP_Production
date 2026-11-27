@@ -83,7 +83,7 @@
       "licenseConcluded": "Apache-2.0",
       "licenseDeclared": "Apache-2.0",
       "copyrightText": "NOASSERTION",
-      "comment": "Optional local-video upload runtime. Installed only in .venv-tos and executed in an isolated child interpreter; never an editor-process dependency."
+      "comment": "Optional compatibility runtime for legacy TOS installations, isolated in .venv-tos. The Generator stages render inputs in Griptape Cloud."
     },
     {
       "SPDXID": "SPDXRef-Griptape-Agent-Subset",
@@ -132,7 +132,7 @@
       "spdxElementId": "SPDXRef-volcengine-tos",
       "relationshipType": "OPTIONAL_DEPENDENCY_OF",
       "relatedSpdxElement": "SPDXRef-HMB-GP-Production",
-      "comment": "Only the explicitly selected TOS upload path requires this separate runtime."
+      "comment": "The manual installer can provision this isolated legacy runtime on explicit request."
     },
     {
       "spdxElementId": "SPDXRef-HMB-GP-Production",
