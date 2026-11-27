@@ -393,6 +393,32 @@ async def check_repeated_wired_selection(library, downstream, anchor, imported, 
     prepared = generator._prepare_video_references_for_run(params, cloud_driver=cloud)
     urls = generator._build_broker_payload(prepared)["image_urls"]
     assert [cloud.objects[url] for url in urls] == [Path(source_paths[uid]).read_bytes() for uid in chosen]
+    # A Prompt arrow moves an existing Shot member. The master asset list
+    # stays in its original order even when the publisher widget is unmounted.
+    for start, end in ((1, 2), (0, 2), (2, 0), (2, 1)):
+        before = list(chosen)
+        routing = library._current_state()["shot_routing"]
+        request = {"schema": "hmb-prompt-image-order-v1",
+                   "channel": routing["channel_uuid"], "publisher": routing["publisher_instance_uuid"],
+                   "shot": routing["shots"][0]["shot_uuid"], "order": before,
+                   "source": before[start], "target": before[end]}
+        response = await GriptapeNodes.ahandle_request(SetParameterValueRequest(
+            node_name=downstream.name, parameter_name="HMB_UI_STATE", value=json.dumps(request), data_type="str"))
+        assert response.succeeded(), response.result_details
+        chosen = list(before)
+        chosen.insert(end, chosen.pop(start))
+        deadline = time.monotonic() + 3
+        while downstream._current_state()["image_asset"]["ordered_source_uids"] != chosen:
+            assert time.monotonic() < deadline, (before, chosen, downstream._current_state()["image_asset"]["ordered_source_uids"])
+            await asyncio.sleep(.01)
+        assert library._current_state()["shot_routing"]["shots"][0]["selected_source_uids"] == chosen
+        images = generator._resolve_exact_shot_generation_inputs({
+            **generator._get_parameters(), "model_id": seedance.SEEDANCE_2_5_MODEL_ID,
+            "resolution":"480p", "duration":4, "prompt":"Use all three references.",
+        })
+        payload = generator._build_broker_payload(generator._prepare_video_references_for_run(images, cloud_driver=cloud))
+        assert [cloud.objects[url] for url in payload["image_urls"]] == [Path(source_paths[uid]).read_bytes() for uid in chosen]
+    assert chosen == extra[:3]
     # The project roster and the local browse index can already be available
     # while another reader is still preparing the complete project catalog.
     # Run must verify the three selected registrations without another click.

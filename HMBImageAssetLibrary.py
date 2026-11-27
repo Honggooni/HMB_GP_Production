@@ -11498,6 +11498,28 @@ class HMBImageAssetLibrary(DataNode):
                 if row["source_uid"] in source_uids}
 
     @hmb_binding_mutation
+    def _hmb_move_prompt_image(self, request: dict) -> None:
+        state = self._current_state()
+        routing = state["shot_routing"]
+        shot = next((item for item in routing["shots"] if item["shot_uuid"] == request.get("shot")), None)
+        if (getattr(self, "lock", False) or shot is None
+                or routing["publisher_instance_uuid"] != request.get("publisher")
+                or routing["channel_uuid"] != request.get("channel")):
+            raise ValueError("현재 샷의 이미지 라이브러리 연결을 확인하세요.")
+        order = shot["selected_source_uids"]
+        source, target = request.get("source"), request.get("target")
+        if order != request.get("order") or source not in order or target not in order:
+            raise ValueError("샷의 이미지 순서가 변경되었습니다. 현재 순서에서 다시 이동하세요.")
+        if source != target:
+            to = order.index(target)
+            order.remove(source)
+            order.insert(to, source)
+            shot.update(revision=shot["revision"] + 1, media_count=0, metadata_sha256="", media_sha256="")
+            routing["generation"] += 1
+            state[UI_EDIT_REVISION_KEY] += 1
+            self._publish_state(state, normalized=True)
+
+    @hmb_binding_mutation
     def _hmb_dismiss_unavailable_prompt_images(self, channel_uuid: str, shot_uuid: str, uids: set[str]) -> None:
         state = self._current_state()
         routing = state["shot_routing"]

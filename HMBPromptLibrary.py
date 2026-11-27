@@ -12906,16 +12906,25 @@ class HMBPromptLibrary(DataNode):
                 return self._hmb_shot_channel_subscription()
             if image_source_node is None and picker_source_node is None:
                 self._reconcile_connected_source_inputs_from_graph()
+            current = self._current_state()
             state, images, videos, _image_exact, _picker_exact = (
                 self._apply_exact_shot_routes(
-                    self._current_state(),
+                    current,
                     image_source_node=image_source_node,
                     picker_source_node=picker_source_node,
                 )
             )
             self._hmb_current_shot_images = list(images)
             self._hmb_current_shot_videos = list(videos)
-            _set_parameter_value(self, WIDGET_PARAMETER_NAME, _json_dumps(state))
+            if state != current:
+                # Exact peer updates can precede the scheduled dashboard sync.
+                # Publish new rows on the source clock so the editor accepts
+                # their order even when the user hasn't edited a Prompt field.
+                if state["images"] != current["images"] or state["videos"] != current["videos"]:
+                    state[SOURCE_SYNC_REVISION_KEY] = min(
+                        MAX_SOURCE_SYNC_REVISION, int(current.get(SOURCE_SYNC_REVISION_KEY) or 0) + 1
+                    )
+                _set_parameter_value(self, WIDGET_PARAMETER_NAME, _json_dumps(state))
             if _image_exact or _picker_exact:
                 self._consume_routing_hydration_rebase()
             self._sync_prompt_output_from_state(publish_shot_media=True)
@@ -12979,6 +12988,22 @@ class HMBPromptLibrary(DataNode):
 
         parent_setter = getattr(super(), "set_parameter_value")
         is_widget_write = param_name == WIDGET_PARAMETER_NAME
+        if is_widget_write and (isinstance(value, dict) or (
+                isinstance(value, str) and "hmb-prompt-image-order-v1" in value[:72])):
+            request = value if isinstance(value, dict) else _parse_state(value)
+            if request.get("schema") == "hmb-prompt-image-order-v1":
+                if initial_setup:
+                    return
+                current = self._current_state()
+                shot = current["shot"]
+                sources = getattr(self, "_hmb_connected_source_nodes", {})
+                publisher = sources.get(SHOT_ASSET_INPUT_PARAMETER_NAME) or sources.get(IMAGE_ASSET_INPUT_PARAMETER_NAME)
+                move = getattr(publisher, "_hmb_move_prompt_image", None)
+                if (getattr(self, "lock", False) or not callable(move) or self._hmb_manual_rebind_pending()
+                        or shot["shot_uuid"] != request.get("shot") or shot["channel_uuid"] != request.get("channel")):
+                    raise ValueError("현재 프롬프트와 연결된 샷에서 이미지를 이동하세요.")
+                move(request)
+                return
         if is_widget_write and _is_retired_analysis_pick(value):
             return
         if (is_widget_write and not initial_setup and not getattr(self, "_hmb_ui_syncing", False)

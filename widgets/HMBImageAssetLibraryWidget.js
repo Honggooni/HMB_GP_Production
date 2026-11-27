@@ -8294,9 +8294,36 @@ function installEvents(container, state, props, remount, listeners) {
     return true;
   };
 
+  const moveShotSource = (shotUuid, sourceUid, targetUid) => {
+    state = container.__hmbImageAssetLatestState || state;
+    return commitShotMutation(
+      () => hmbReorderImageAssetShotSource(state, shotUuid, sourceUid, targetUid),
+      () => {
+        hmbApplyImageAssetShotSourceOrderToDom(container, state, shotUuid);
+        const shot = state.shot_routing.shots.find(item => item.shot_uuid === shotUuid);
+        publishShotPreview(container, state.shot_routing, shot, imageAssetShotAssets(state, shot, assetsBySourceUid));
+      },
+    );
+  };
   const publishShotRouting = () => hmbPublishImageAssetShotRoutingCatalog(state);
   if (typeof window !== "undefined") {
     on(window, "hmb-shot-routing-discover-v1", publishShotRouting);
+    on(window, "hmb-prompt-image-order-v1", event => {
+      const graph = container.closest?.(".react-flow");
+      const live = container.__hmbImageAssetLatestState || state;
+      const routing = live.shot_routing;
+      const request = event.detail;
+      if (!graph || event.defaultPrevented || event.target?.closest?.(".react-flow") !== graph
+        || !request || !routing || request.publisher !== routing.publisher_instance_uuid
+        || request.channel !== routing.channel_uuid) return;
+      const shot = routing.shots.find(item => item.shot_uuid === request.shot);
+      if (!shot) return;
+      event.preventDefault();
+      if (container.__hmbNativeUiContract?.props?.disabled || !Array.isArray(request.order)
+        || shot.selected_source_uids.length !== request.order.length
+        || !shot.selected_source_uids.every((uid, i) => uid === request.order[i])) return;
+      request.applied = moveShotSource(request.shot, request.source, request.target);
+    });
     publishShotRouting();
   }
   const executeImageBashMutation = (mutate, create = false, completion = null, event = null, hint = {}, settlement = null, job = null) => {
@@ -9240,14 +9267,7 @@ function installEvents(container, state, props, remount, listeners) {
   hmbInstallImageAssetShotDragReorder(container, {
     listen: (eventName, handler) => on(container, eventName, handler, true),
     currentState: () => container.__hmbImageAssetLatestState || state,
-    commitReorder: ({ shotUuid, sourceUid, targetUid }) => {
-      const liveState = container.__hmbImageAssetLatestState || state;
-      if (liveState !== state) state = liveState;
-      return commitShotMutation(
-        () => hmbReorderImageAssetShotSource(state, shotUuid, sourceUid, targetUid),
-        () => hmbApplyImageAssetShotSourceOrderToDom(container, state, shotUuid),
-      );
-    },
+    commitReorder: ({ shotUuid, sourceUid, targetUid }) => moveShotSource(shotUuid, sourceUid, targetUid),
   });
   on(selectedTray, "click", (event) => {
     const action = event.target?.closest?.("[data-remove-selected]");

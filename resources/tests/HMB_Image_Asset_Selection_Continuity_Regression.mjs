@@ -40,6 +40,7 @@ try {
       const container = document.querySelector("#widget");
       const fixture = { widget, container, state, writes: [], format, removedImages: 0 };
       const {default:mountPrompt} = await import(promptUri);
+      fixture.mountPrompt = mountPrompt;
       const {channel_uuid, publisher_instance_uuid, shots} = state.shot_routing;
       const shot = {...shots[0], channel_uuid};
       const other = {...shot, shot_uuid:"b602b5d3-117d-42ee-9444-e2952ca6db02", number:2, name:"Shot 2", selected_source_uids:[]};
@@ -135,6 +136,50 @@ try {
     assert.equal(reordered.sameImages, true);
     assert.equal(reordered.removedImages, 0);
     cases[cases.length - 1].reordered = reordered;
+    await page.evaluate(() => {
+      const f = selectionFixture, prompt = document.querySelector("#prompt");
+      const original = [...f.canonical.shot_routing.shots[0].selected_source_uids];
+      const routing = f.canonical.shot_routing;
+      const shot = {...routing.shots[0], channel_uuid:routing.channel_uuid};
+      const route = {publisher_instance_uuid:routing.publisher_instance_uuid, channel_uuid:routing.channel_uuid,
+        generation:3, metadata_sha256:"b".repeat(64)};
+      const confirmed = {shot, multi_shot_enabled:true, source_sync_revision:4,
+        image_asset:{enabled:true, order_managed:true, shot_routing:route, shot_catalog_routing:route,
+          shot_catalog:routing.shots.map(s => ({...s,channel_uuid:routing.channel_uuid})), ordered_source_uids:original},
+        images:original.map((uid,i) => ({asset_source_uid:uid, asset_managed:true, present:true, slot:i+1,
+          label:"Hero "+i, asset_verified:true, asset_source_kind:"project", image_main_type:"Character"}))};
+      const saved = prompt.__hmbNativeUiContract.props;
+      f.prompt.cleanup();
+      f.prompt = f.mountPrompt(prompt,{value:JSON.stringify(confirmed),onChange:() => {
+        throw Error("A mounted publisher must own a managed order edit.");
+      }});
+      const card = uid => f.container.querySelector('[data-shot-tray] [data-shot-source-uid="'+uid+'"]');
+      const row = uid => prompt.querySelector('[data-hmb-image-selection-uid="'+uid+'"]');
+      const drag = (source, target) => {
+        const dataTransfer = new DataTransfer();
+        for (const [node,event] of [[source,"dragstart"],[target,"dragover"],[target,"drop"],[source,"dragend"]]) {
+          node.dispatchEvent(new DragEvent(event,{bubbles:true,cancelable:true,dataTransfer}));
+        }
+      };
+      const check = order => {
+        const displayed = [...prompt.querySelectorAll("[data-hmb-image-selection-uid]")];
+        if (JSON.stringify(displayed.map(el => el.dataset.hmbImageSelectionUid)) !== JSON.stringify(order)
+          || displayed.some((el,i) => Number(el.querySelector("[data-image-drag-handle]").textContent) !== i+1)
+          || JSON.stringify(f.container.__hmbImageAssetLatestState.shot_routing.shots[0].selected_source_uids) !== JSON.stringify(order))
+          throw Error("Shot, visible editable rows and slot numbers diverged.");
+      };
+      const [a,b,c] = original;
+      for (let cycle=0; cycle<12; cycle++) {
+        drag(card(a),card(c)); check([b,c,a]);
+        row(a).querySelector(".move-image-up").click(); check([b,a,c]);
+        row(b).querySelector(".move-image-down").click(); check([a,b,c]);
+        drag(row(c).querySelector("[data-image-drag-handle]"),row(a)); check([c,a,b]);
+        drag(card(c),card(b)); check([a,b,c]);
+      }
+      f.widget.hmbFlushImageAssetSelectionCommit(f.container);
+      f.prompt.cleanup();
+      f.prompt=f.mountPrompt(prompt,saved);
+    });
     const immediate = await page.evaluate(() => {
       const f = selectionFixture, prompt = document.querySelector('#prompt');
       const heading = () => prompt.querySelector('.image-card h3 b')?.textContent;

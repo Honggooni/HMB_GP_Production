@@ -5795,6 +5795,13 @@ function videoNumberOptions(state, current) {
   return options(selection.choices, selection.value, "—", state);
 }
 
+function promptImageOrderOwner(state) {
+  const route = state.image_asset?.shot_routing?.publisher_instance_uuid
+    ? state.image_asset.shot_routing : state.image_asset?.shot_catalog_routing;
+  return state.shot?.shot_uuid && route?.channel_uuid === state.shot.channel_uuid
+    && route.publisher_instance_uuid && !state.manual_rebind?.required ? route : null;
+}
+
 function renderImageActions(item, state, index, imageCount) {
   if (item.asset_source_unavailable) {
     const label = escapeHtml(uiText(state, "delete_image_row", "Delete image source row"));
@@ -5805,13 +5812,15 @@ function renderImageActions(item, state, index, imageCount) {
   const canAdd = pickerActions.canAdd;
   const orderManaged = Boolean(state?.image_asset?.enabled && state?.image_asset?.order_managed);
   const rowManaged = Boolean(orderManaged && item?.asset_managed);
-  const canMoveUp = !orderManaged && index > 0;
-  const canMoveDown = !orderManaged && index < Math.max(0, Number(imageCount || 0) - 1);
-  const orderTitle = orderManaged
+  const mayMove = !orderManaged || (rowManaged && promptImageOrderOwner(state));
+  const canMoveUp = mayMove && index > 0;
+  const canMoveDown = mayMove && index < Math.max(0, Number(imageCount || 0) - 1)
+    && !state.images[index + 1]?.asset_source_unavailable;
+  const orderTitle = !mayMove
     ? "Order is controlled by HMBImageAssetLibrary"
     : uiText(state, "move_image_up", "Move image up");
   const deleteLabel = rowManaged ? "Deselect this source in HMBImageAssetLibrary" : uiText(state, "delete_image_row", "Delete image source row");
-  const downLabel = orderManaged ? "Order is controlled by HMBImageAssetLibrary" : uiText(state, "move_image_down", "Move image down");
+  const downLabel = !mayMove ? "Order is controlled by HMBImageAssetLibrary" : uiText(state, "move_image_down", "Move image down");
   return `<div class="source-actions image-actions"><button class="clear-source" ${rowManaged ? "disabled" : ""} title="${escapeHtml(deleteLabel)}" aria-label="${escapeHtml(deleteLabel)}">X</button><span class="image-order-controls"><button class="move-image-up" ${canMoveUp ? "" : "disabled"} title="${escapeHtml(orderTitle)}" aria-label="${escapeHtml(orderTitle)}">▲</button><button class="move-image-down" ${canMoveDown ? "" : "disabled"} title="${escapeHtml(downLabel)}" aria-label="${escapeHtml(downLabel)}">▼</button></span><button class="remove-color-pick" ${canRemove ? "" : "disabled"} title="${escapeHtml(uiText(state, "remove_color_pick", "Remove Color Pick"))}" aria-label="${escapeHtml(uiText(state, "remove_color_pick", "Remove Color Pick"))}">-</button><button class="add-color-pick" ${canAdd ? "" : "disabled"} title="${escapeHtml(uiText(state, "add_color_pick", "Add Color Pick"))}" aria-label="${escapeHtml(uiText(state, "add_color_pick", "Add Color Pick"))}">+</button></div>`;
 }
 
@@ -6366,7 +6375,7 @@ function renderImageRow(item, index, images, state, renderTargetOptions, deferre
     && clean(item.asset_source_kind).toLowerCase() === "project"
   );
   const unavailable = item.asset_source_unavailable === true;
-  const dragEnabled = !unavailable && !orderManaged && images.length > 1;
+  const dragEnabled = !unavailable && (!orderManaged || (rowManaged && promptImageOrderOwner(state))) && images.length > 1;
   const identityTitle = verifiedAsset
     ? "Image Name, Asset ID, Main Type, and @image order are controlled by HMBImageAssetLibrary; Sub Type and Target are editable per-shot choices"
     : (rowManaged
@@ -8729,26 +8738,46 @@ function hmbNativeUiImplementation(container, props) {
     if (count && count.textContent !== countText) count.textContent = countText;
     const drawn = [...body.querySelectorAll("[data-hmb-image-selection-pending]")];
     const nextRows = imagePreview?.rows.filter(row => !shown.has(row.source_uid)) || [];
-    if (drawn.length === nextRows.length && drawn.every((row, index) =>
+    const pendingMatch = drawn.length === nextRows.length && drawn.every((row, index) =>
       row.dataset.hmbImageSelectionPending === nextRows[index].source_uid
-      && row.lastElementChild?.textContent === nextRows[index].label)) return;
-    drawn.forEach(row => row.remove());
-    if (!desired) return;
-    const addRow = body.querySelector(".image-add-row");
-    const fragment = container.ownerDocument.createDocumentFragment();
-    imagePreview.rows.forEach(({source_uid: uid, label}, index) => {
-      if (shown.has(uid)) return;
-      const row = container.ownerDocument.createElement("div");
-      row.className = "source-row image image-selection-pending";
-      row.dataset.hmbImageSelectionPending = uid;
-      const slot = container.ownerDocument.createElement("span");
-      slot.textContent = String(index + 1).padStart(2, "0");
-      const name = container.ownerDocument.createElement("span");
-      name.textContent = label;
-      row.append(slot, name);
-      fragment.append(row);
-    });
-    body.insertBefore(fragment, addRow);
+      && row.lastElementChild?.textContent === nextRows[index].label);
+    if (!pendingMatch) {
+      drawn.forEach(row => row.remove());
+      const fragment = container.ownerDocument.createDocumentFragment();
+      for (const {source_uid: uid, label} of nextRows) {
+        const row = container.ownerDocument.createElement("div");
+        row.className = "source-row image image-selection-pending";
+        row.dataset.hmbImageSelectionPending = uid;
+        const name = container.ownerDocument.createElement("span");
+        name.textContent = label;
+        row.append(container.ownerDocument.createElement("span"), name);
+        fragment.append(row);
+      }
+      body.insertBefore(fragment, body.querySelector(".image-add-row"));
+    }
+    if (!desired && !body.hasAttribute("data-hmb-preview-order")) return;
+    body.toggleAttribute("data-hmb-preview-order", Boolean(desired));
+    const uids = desired ? [...desired.keys()] : state.images.map(item => item.asset_source_uid).filter(Boolean);
+    const rows = new Map([...body.querySelectorAll("[data-hmb-image-selection-uid],[data-hmb-image-selection-pending]")]
+      .map(row => [row.dataset.hmbImageSelectionUid || row.dataset.hmbImageSelectionPending, row]));
+    let after = body.querySelector(".source-header");
+    for (const [index, uid] of uids.entries()) {
+      const row = rows.get(uid);
+      if (!row) continue;
+      if (after && after.nextElementSibling !== row) {
+        if (typeof body.moveBefore === "function" && body.isConnected) body.moveBefore(row, after.nextSibling);
+        else body.insertBefore(row, after.nextSibling);
+      }
+      after = row;
+      const slot = row.querySelector("[data-image-drag-handle]") || row.firstElementChild;
+      const label = String(index + 1).padStart(2, "0");
+      if (slot && slot.textContent !== label) slot.textContent = label;
+      if (promptImageOrderOwner(state) && !state.disabled) {
+        const up = row.querySelector(".move-image-up"), down = row.querySelector(".move-image-down");
+        if (up) up.disabled = index === 0;
+        if (down) down.disabled = index === uids.length - 1;
+      }
+    }
   };
   container.__hmbSyncMediaPreview = syncMediaPreview;
   const receiveMediaPreview = event => {
@@ -9225,15 +9254,46 @@ function hmbNativeUiImplementation(container, props) {
       listeners.push([checkbox, "change", handler]);
     });
 
+    const managedImageOrder = () => Boolean(state.image_asset?.enabled && state.image_asset.order_managed);
+    const displayedImageOrder = () => [...container.querySelectorAll(
+      ".image-card [data-hmb-image-selection-uid]:not([data-hmb-image-selection-hidden]),.image-card [data-hmb-image-selection-pending]",
+    )].map(row => row.dataset.hmbImageSelectionUid || row.dataset.hmbImageSelectionPending);
+    const requestManagedMove = (order, from, to) => {
+      const owner = promptImageOrderOwner(state);
+      if (state.disabled || !owner || from === to || !order[from] || !order[to]) return false;
+      const detail = {publisher:owner.publisher_instance_uuid, channel:owner.channel_uuid,
+        shot:state.shot.shot_uuid, order, source:order[from], target:order[to]};
+      const event = new container.ownerDocument.defaultView.CustomEvent("hmb-prompt-image-order-v1",
+        {detail, bubbles:true, composed:true, cancelable:true});
+      const failed = error => hmbSetPromptPublicationStatus(container,
+        uiLanguage(state) === "ko" ? "현재 샷의 이미지 순서를 확인하세요." : "Check the current Shot image order.", error);
+      if (container.dispatchEvent(event)) {
+        // The publisher widget may be outside the mounted editor viewport.
+        // Forward the same checked operation to the owning engine node.
+        try {
+          Promise.resolve(props.onChange(JSON.stringify({schema:"hmb-prompt-image-order-v1", ...detail}))).catch(failed);
+        } catch (error) { failed(error); }
+      } else if (!detail.applied) {
+        failed();
+        return false;
+      }
+      return true;
+    };
+    const stepImage = (row, index, direction) => {
+      if (state.disabled) return;
+      if (managedImageOrder()) {
+        const order = displayedImageOrder(), from = order.indexOf(row?.dataset.hmbImageSelectionUid);
+        requestManagedMove(order, from, from + direction);
+      } else if (swapImageRowsWithoutReset(state, index, index + direction)) {
+        hmbCommitLocalPromptStructure(container, props, state, remount);
+      }
+    };
     container.querySelectorAll(".move-image-up, .move-image-down").forEach((button) => {
       const row = button.closest(".source-row");
       const index = row ? Number(row.getAttribute("data-index")) : -1;
       const direction = button.classList.contains("move-image-up") ? -1 : 1;
       const handler = () => {
-        if (state?.image_asset?.enabled && state?.image_asset?.order_managed) return;
-        const targetIndex = index + direction;
-        if (!swapImageRowsWithoutReset(state, index, targetIndex)) return;
-        hmbCommitLocalPromptStructure(container, props, state, remount);
+        stepImage(row, index, direction);
       };
       button.addEventListener("click", handler);
       listeners.push([button, "click", handler]);
@@ -9249,7 +9309,7 @@ function hmbNativeUiImplementation(container, props) {
         event.stopPropagation();
         if (
           state.disabled
-          || (state?.image_asset?.enabled && state?.image_asset?.order_managed)
+          || handle.getAttribute("draggable") !== "true"
           || state.images.length < 2
           || sourceIndex < 0
         ) {
@@ -9259,6 +9319,7 @@ function hmbNativeUiImplementation(container, props) {
         hmbCaptureSourceScroll(container);
         hmbClearImageDragIndicators(container);
         container.__hmbPromptImageDragIndex = sourceIndex;
+        container.__hmbPromptImageDragUid = row.dataset.hmbImageSelectionUid;
         row?.classList?.add("image-row-dragging");
         container.__hmbPromptImageDragIndicators = { source: row, hover: null, after: false, sourceIndex };
         try {
@@ -9270,15 +9331,14 @@ function hmbNativeUiImplementation(container, props) {
         event.stopPropagation();
         hmbClearImageDragIndicators(container);
         delete container.__hmbPromptImageDragIndex;
+        delete container.__hmbPromptImageDragUid;
       };
       const keyDown = (event) => {
         if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
-        if (state.disabled || (state?.image_asset?.enabled && state?.image_asset?.order_managed)) return;
-        const targetIndex = sourceIndex + (event.key === "ArrowUp" ? -1 : 1);
-        if (!swapImageRowsWithoutReset(state, sourceIndex, targetIndex)) return;
+        if (state.disabled || handle.getAttribute("draggable") !== "true") return;
         event.preventDefault();
         event.stopPropagation();
-        hmbCommitLocalPromptStructure(container, props, state, remount);
+        stepImage(row, sourceIndex, event.key === "ArrowUp" ? -1 : 1);
       };
       handle.addEventListener("pointerdown", pointerDown);
       handle.addEventListener("dragstart", dragStart);
@@ -9298,7 +9358,7 @@ function hmbNativeUiImplementation(container, props) {
         return Number(event.clientY || 0) >= Number(rect.top || 0) + Number(rect.height || 0) / 2;
       };
       const dragOver = (event) => {
-        if (state?.image_asset?.enabled && state?.image_asset?.order_managed) return;
+        if (managedImageOrder() && (!container.__hmbPromptImageDragUid || !row.dataset.hmbImageSelectionUid)) return;
         const sourceIndex = Number(container.__hmbPromptImageDragIndex);
         if (!Number.isInteger(sourceIndex) || sourceIndex < 0 || sourceIndex >= state.images.length) return;
         event.preventDefault();
@@ -9307,7 +9367,19 @@ function hmbNativeUiImplementation(container, props) {
         hmbUpdateImageDragIndicators(container, row, sourceIndex, dropPosition(event));
       };
       const drop = (event) => {
-        if (state?.image_asset?.enabled && state?.image_asset?.order_managed) return;
+        if (managedImageOrder()) {
+          const fromUid = container.__hmbPromptImageDragUid;
+          if (!fromUid || !row.dataset.hmbImageSelectionUid) return;
+          event.preventDefault();
+          event.stopPropagation();
+          const order = displayedImageOrder(), from = order.indexOf(fromUid);
+          const to = hmbImageDropTargetIndex(from, order.indexOf(row.dataset.hmbImageSelectionUid), dropPosition(event), order.length);
+          hmbClearImageDragIndicators(container);
+          delete container.__hmbPromptImageDragUid;
+          delete container.__hmbPromptImageDragIndex;
+          requestManagedMove(order, from, to);
+          return;
+        }
         event.preventDefault();
         event.stopPropagation();
         let sourceIndex = Number(container.__hmbPromptImageDragIndex);
@@ -10020,6 +10092,9 @@ function hmbNativeUiImplementation(container, props) {
     }
   };
   const applyProps = (nextProps = {}) => {
+    const value = nextProps.value;
+    if (value?.schema === "hmb-prompt-image-order-v1"
+      || (typeof value === "string" && value.startsWith('{"schema":"hmb-prompt-image-order-v1",'))) return;
     const nextSources = nextProps.ui_options?.media_preview_sources;
     if (directSources?.image_asset !== nextSources?.image_asset || directSources?.picker !== nextSources?.picker) {
       directSources = nextSources;
