@@ -577,8 +577,7 @@ class MyBoxController:
         self._projection_checked_at = 0.0
         detail = await asyncio.to_thread(broker.detail, parent, selection=cp["selection"])
         self._guard(self._run_epoch, self._run_origin)
-        parser = getattr(protocol, "parse_draft_final_state", None)
-        projection = parser(detail) if callable(parser) else None
+        projection = protocol.parse_draft_final_state(detail)
         if not getattr(self._capabilities, "draft_final_detail_supported", False) or projection is None:
             raise ValueError("This Broker has not advertised private Draft Final state. No Final was submitted.")
         if detail.get("status") != "completed" or detail.get("model") != cp["model_id"] or detail.get("task") != cp["task"]:
@@ -713,7 +712,12 @@ class MyBoxController:
             state = projection.get("state", "unavailable")
             child_id = projection.get("child_task_id", "")
             slots = projection.get("finals_by_resolution", {})
-            states = {quality: slot["state"] for quality, slot in slots.items()}
+            deadline = projection.get("expires_at")
+            within_window = type(deadline) is int and time.time() < deadline
+            if state == "available" and not within_window:
+                state = "expired"
+            states = {quality: "expired" if slot["state"] == "available" and not within_window else slot["state"]
+                      for quality, slot in slots.items()}
             for quality in states.keys() & cp.get("draft_outputs", {}).keys():
                 states[quality] = "completed"
             if child_of_draft:
@@ -740,8 +744,9 @@ class MyBoxController:
             # Saved slots enable an explicit recheck on reopen. run() fetches
             # credentials, workspace, detail, and target eligibility again before POST.
             can_recheck_saved = slots and caps is None and cp.get("stage") == "local_succeeded"
-            available = bool(source_completed and can_select and type(projection.get("expires_at")) is int
-                and time.time() < projection["expires_at"] and (known_admission or can_recheck_saved) and not self._busy)
+            available = bool(source_completed and can_select and within_window and (known_admission or can_recheck_saved) and not self._busy)
+            hidden = {"completed", "consumed", "expired", "not_draft"}
+            final_visible = any(value not in hidden for value in states.values()) if slots else state not in hidden
             return m._seedance_draft_ui_value({"visible": supported
                 and (node.get_parameter_value("resolution") == "480p" or bool(cp.get("draft_preview")) or source_completed),
                 "action": node.get_parameter_value("draft_action"), "preview_available": not self._busy and node.get_parameter_value("resolution") == "480p",
@@ -753,7 +758,7 @@ class MyBoxController:
                 "active_action": m.DRAFT_ACTION_FINAL if selected_final else "",
                 "effective_resolution": selected_final or node.get_parameter_value("resolution"),
                 "busy": self._busy or bool(selected_final), "final_busy": bool(selected_final), "cancel_available": False,
-                "final_state": state, "final_visible": bool(source_completed and (slots or state not in {"completed", "consumed", "expired", "not_draft"})),
+                "final_state": state, "final_visible": source_completed and final_visible,
                 **({"finals_by_resolution": states} if slots else {}),
                 "final_task_id": child_id, "reason": "" if available else "Refresh this My Box Task to check private Draft Final availability."})
         return m._seedance_draft_ui_value()

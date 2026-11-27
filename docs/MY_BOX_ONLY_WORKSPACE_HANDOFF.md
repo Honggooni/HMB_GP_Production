@@ -27,7 +27,7 @@ My Box는 샷 제작 전의 개인 소스 영상, Video Editing 및 Video Extens
 | 자동 정리 | `automatic_deletion_enabled=false`, `management_deadline_disables_media=false`를 유지한다. 30일 표시는 자동 삭제 작업이 켜졌다는 뜻이 아니다. |
 | Keep | 본인 Keep 상태를 변경한다. Keep 시 관리 만료 예정일을 해제하며, 해제 시점부터 30일 관리 예정일을 다시 설정한다. 실제 정리 정책은 별도 서버 관리 범위다. |
 | Confirm | 본인 개인 영상의 컨펌 상태다. 일반 팀 컨펌의 공개·공유 확장을 적용하지 않는다. |
-| Draft Final | 원본 생성 시점 및 공급자 제한을 기준으로 최대 7일이다. 완료·Keep·30일 관리 기간으로 새 7일을 부여하지 않는다. |
+| Draft Final | 원본 Draft 생성 시점부터 13일이며 만료 시각에 도달하면 종료된다. 원본별 만료 시각을 우선하고, 새 기간 정보를 제공하지 않는 구형 브로커에는 기존 7일을 적용한다. 보관 기간과 Final 신청 기한은 별도로 계산한다. |
 | 480p 설정 | 반복 생성·재렌더·Final 후에도 Generator의 기존 480p 및 Draft 작성 설정을 보존한다. Final 제출 시에만 원본 Task에 묶인 임시 1080p 요청을 사용한다. |
 | 중복 방지 | 이미 예약·실행·완료·실패한 Final child가 있으면 그 Task를 조회한다. 불확정 결과를 새 키로 재제출하지 않는다. |
 
@@ -42,7 +42,7 @@ My Box는 샷 제작 전의 개인 소스 영상, Video Editing 및 Video Extens
 5. 개인 Task는 `job-mybox-<소문자 16진수 32자리>`다. 응답 불명 시 같은 client request ID로 `POST /api/v1/jobs/{id}/refresh`를 수행한다. 자동 새 생성과 자동 새 키 발급은 금지한다.
 6. 상세는 `GET /api/v1/only/my-box/items/{task_id}`, 원본은 같은 Task의 `/media?download=1`로 조회한다. 기존 Broker 인증을 사용하고 정확한 주소·길이·SHA256·영상 컨테이너를 검증한다.
 7. Editing/Extension/Reference의 개인 원본은 본인 Task의 `/source-reference`에서 대상 client request ID·작업 종류에 묶인 단기 grant를 발급받는다. 다른 사용자나 제작 프로젝트의 Task로 우회하지 않는다.
-8. Final은 capability의 `draft_final_detail_supported`, `draft_final_contract`와 원본 detail의 `draft_final`을 모두 확인한다. 원본 선택·workspace·source/child Task·현재 상태·7일 제한이 일치해야 한다. 권장 키 `mbx-final-v1-{source_task_hex32}`와 이미 저장된 실제 키를 보존한다.
+8. Final은 capability의 `draft_final_detail_supported`, `draft_final_contract`와 원본 detail의 `draft_final`을 모두 확인한다. 원본 선택·workspace·source/child Task·현재 상태·만료 시각을 확인한다. 권장 키 `mbx-final-v1-{source_task_hex32}`와 이미 저장된 실제 키를 보존한다.
 
 기능 flag와 별도로 서버가 계정 한도·모델·작업 지원을 검증한다. `budget_limits_supported=false`인 서버는 지원하지 않는 비제로 한도 계정의 새 생성을 차단할 수 있다. 이 제한이나 제작 프로젝트 원본 재사용 미지원을 클라이언트가 우회하지 않는다. My Box의 별도 last-frame 이미지 출력은 현재 지원하지 않아 제출 전에 차단한다.
 
@@ -71,7 +71,7 @@ Broker 설정은 사용자 공용 설정을 기억한다. 기존 Task의 원점�
 | 서버 미지원·OFF | 업로드·생성 0회, 명확한 준비 상태 표시, 제작 프로젝트 fallback 없음 |
 | 개인 권한 | 다른 사용자 Task·workspace·원본·grant·Confirm·Keep 교차 접근 거절 |
 | 생성·편집·확장 | 지원 모델의 정확한 제출 옵션·개인 범위·입력 보존 |
-| Draft·Final | 반복 480p 설정 유지, 동일 원본 Task 상태 동기화, 일회성 Final과 7일 제한 |
+| Draft·Final | 반복 480p 설정 유지, 동일 원본 Task 상태 동기화, 일회성 Final과 새 브로커 13일·구형 브로커 7일 기한 |
 | 로컬·플레이어 | 원본 저장·즉시 재생·저장/재오픈·동일 Task 복구, 불필요한 서버 다운로드·새 생성 없음 |
 | 취소·장애 | 중복 클릭·응답 유실·취소·노드 삭제·Broker 변경 후 잘못된 게시·재제출 없음 |
 | 보관·공유 | 30일 관리 표시와 자동 정리 OFF 구분, Keep/Confirm 후에도 개인 권한 유지 |

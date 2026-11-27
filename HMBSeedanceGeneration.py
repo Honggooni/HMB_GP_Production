@@ -1002,6 +1002,15 @@ def _generated_video_source_value(value: Any = None) -> dict[str, Any]:
             "completed": True}
 
 
+def _draft_reuse_window_seconds(profile: dict[str, Any]) -> int:
+    nested = profile.get("draft")
+    values = [row[key] for row, key in ((profile, "draft_reuse_window_seconds"), (nested, "reuse_window_seconds"))
+              if isinstance(row, dict) and key in row]
+    if any(type(value) is not int or value <= 0 or value != values[0] for value in values):
+        raise _BrokerProtocolError("The Broker Draft reuse window is invalid.")
+    return values[0] if values else DRAFT_SOURCE_TTL_MS // 1000
+
+
 def _seedance_draft_source_value(value: Any = None) -> dict[str, Any]:
     """Retain only local job identity, project and origin; never prompt or media URLs."""
     if (not isinstance(value, dict) or not isinstance(value.get("broker_server_url"), str)
@@ -1021,18 +1030,25 @@ def _seedance_draft_source_value(value: Any = None) -> dict[str, Any]:
         generation_origin = _generated_video_origin(value.get("generation_origin"))
         owner = _seedance_uuid_text(value.get("owner_id"))
         created = value.get("created_at_ms")
-        if (not owner or type(created) is not int or not 0 < created < 9_999_999_999_999
+        missing_creation_time = created is None and value.get("broker_expiry_required") is True
+        if (not owner or not missing_creation_time and (type(created) is not int or not 0 < created < 9_999_999_999_999)
                 or value.get("completed") is not True
                 or (value.get("generation_origin") != {} and not generation_origin)):
             return {}
-        result.update(generation_origin=generation_origin, owner_id=owner,
-                      created_at_ms=created, completed=True)
+        result.update(generation_origin=generation_origin, owner_id=owner, completed=True)
+        if missing_creation_time:
+            result["broker_expiry_required"] = True
+        else:
+            result["created_at_ms"] = created
         bindings = value.get("source_bindings", {})
         if not isinstance(bindings, dict) or set(bindings) - {"image_asset", "video_picker"}:
             return {}
         if any(not _seedance_uuid_text(item) for item in bindings.values()):
             return {}
         result["source_bindings"] = dict(bindings)
+    for key in ("draft_reuse_window_seconds", "expires_at"):
+        if type(value.get(key)) is int and value[key] > 0:
+            result[key] = value[key]
     if re.fullmatch(r"[0-9a-f]{64}", str(value.get("render_input_sha256") or "")):
         result["render_input_sha256"] = value["render_input_sha256"]
     for name in ("final_request_id", "final_job_id"):
@@ -1143,6 +1159,8 @@ def _seedance_draft_final_state_value(value: Any, source: dict[str, Any], *, res
 
 def _draft_final_scoped_state(parent: dict[str, Any], rows: dict[str, dict[str, Any]]) -> dict[str, Any]:
     children = [row["child_task_id"] for row in rows.values() if row["child_task_id"]]
+    if any(row["expires_at"] != parent["expires_at"] for row in rows.values()):
+        raise _BrokerProtocolError("Draft Final targets disagree about the source expiration.")
     if (len(children) != len(set(children))
             or any(row["owner_user_id"] != parent["owner_user_id"] for row in rows.values())):
         raise _BrokerProtocolError("Draft Final target ownership or child identity changed.")
@@ -1303,6 +1321,9 @@ def _seedance_recovery_value(value: Any = None) -> dict[str, Any]:
         started = source.get("draft_started_at_ms")
         if type(started) is int and 0 < started < 9_999_999_999_999:
             checkpoint["draft_started_at_ms"] = started
+        window = source.get("draft_reuse_window_seconds")
+        if type(window) is int and window > 0:
+            checkpoint["draft_reuse_window_seconds"] = window
     if task_id and source.get("queue_only_headers"):
         import _hmb_queue_admission as queue
         checkpoint["queue_only_headers"] = queue.identity(source["queue_only_headers"])
@@ -3111,7 +3132,7 @@ class _HMBAIBrokerBridge:
             raise _BrokerProtocolError("Draft Final resolution checks timed out.")
         second = readonly._request_json("GET", route + "4k", payload=None, timeout=remaining)
         ultra_hd = _seedance_draft_final_state_value(second, record, resolution="4k", scalar_target=True)
-        if first["is_draft"] != second["is_draft"] or full_hd["expires_at"] != ultra_hd["expires_at"]:
+        if first["is_draft"] != second["is_draft"]:
             raise _BrokerProtocolError("The Draft source changed between resolution checks.")
         return _draft_final_scoped_state(full_hd, {"1080p": full_hd, "4k": ultra_hd})
 
@@ -3932,6 +3953,7 @@ class _HMBAIBrokerBridge:
         self._remember_generation_mode_capability(response)
         # A missing legacy list proves no MOV limitation. Keep old MP4 callers,
         # but stop fresh MOV requests until the server declares its actual formats.
+        self._seedance_draft_reuse_window_seconds = _draft_reuse_window_seconds(profile)
         draft_formats = profile.get("draft_output_formats")
         if "draft_output_formats" not in profile:
             if requested_format == "mp4" and not getattr(self, "_seedance_draft_formats_declared", False):
@@ -5143,7 +5165,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 name="draft_job_id", default_value="",
                 tooltip=("Completed Draft LOCAL Broker job ID (job-...). Stored after Draft success. "
                          "Finalization reuses its original prompt/media/settings on the Broker; "
-                         "current Generator settings are not resubmitted. Source valid for 7 days."),
+                         "The Broker gives each Draft its expiration. The reuse window starts at Draft creation "
+                         "(13 days on updated servers, 7 days on legacy servers)."),
                 allowed_modes={ParameterMode.PROPERTY},
                 ui_options={"display_name": "Draft Broker Job ID", "readonly": True}, hide=True,
             )
@@ -6232,7 +6255,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "draft_project": source_params.get("_hmb_draft_project", previous.get("draft_project")),
                 "draft_source": source_params.get("_hmb_draft_source", previous.get("draft_source")),
                 "draft_source_bindings": source_params.get("_hmb_draft_source_bindings", previous.get("draft_source_bindings")),
-                "draft_started_at_ms": source_params.get("_hmb_draft_started_at_ms", previous.get("draft_started_at_ms")),
+                "draft_started_at_ms": (source_params.get("_hmb_draft_started_at_ms") or int(time.time() * 1000)
+                    if stage == "pre_submit" and source_params.get("draft_action") == DRAFT_ACTION_PREVIEW
+                    else previous.get("draft_started_at_ms")),
+                "draft_reuse_window_seconds": (source_params.get("_hmb_draft_reuse_window_seconds") if stage == "pre_submit"
+                    else previous.get("draft_reuse_window_seconds")),
                 "generation_origin": (
                     source_params.get("_hmb_generation_origin")
                     if "_hmb_generation_origin" in source_params
@@ -12356,9 +12383,19 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         return record
 
     @staticmethod
-    def _require_open_draft_final(record: dict[str, Any], *, allow_reserved: bool = False, resolution: str | None = None) -> None:
+    def _require_open_draft_final(record: dict[str, Any], *, allow_reserved: bool = False, resolution: str | None = None,
+                                  expires_at: int | None = None) -> None:
         created = record.get("created_at_ms")
-        if created is not None and (created > int(time.time() * 1000) or int(time.time() * 1000) >= created + DRAFT_SOURCE_TTL_MS):
+        now_ms = int(time.time() * 1000)
+        explicit_expiry = expires_at if expires_at is not None else record.get("expires_at")
+        expiration_ms = None
+        if type(explicit_expiry) is int and explicit_expiry > 0:
+            expiration_ms = explicit_expiry * 1000
+        elif record.get("broker_expiry_required"):
+            raise ValueError("Check the original Draft expiration on the Broker before finalizing.")
+        elif created is not None:
+            expiration_ms = created + record.get("draft_reuse_window_seconds", DRAFT_SOURCE_TTL_MS // 1000) * 1000
+        if (created is not None and created > now_ms) or (expiration_ms is not None and now_ms >= expiration_ms):
             raise ValueError("This Draft has expired. Create a new 480p Draft.")
         previous_target = record.get("final_resolution")
         jobs = record.get("final_jobs", {})
@@ -12372,7 +12409,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     def _validated_draft_final_source(self, source: dict[str, Any] | None = None, *, allow_reserved: bool = False, resolution: str | None = None) -> dict[str, Any]:
         record = self._bound_draft_final_source(source)
-        self._require_open_draft_final(record, allow_reserved=allow_reserved, resolution=resolution)
+        cached = getattr(self, "_hmb_draft_final_status_cache", {})
+        expires_at = None
+        if cached.get("value", {}).get("expires_at") is not None and cached.get("identity") == self._draft_final_status_identity(record):
+            expires_at = cached["value"]["expires_at"]
+        self._require_open_draft_final(record, allow_reserved=allow_reserved, resolution=resolution, expires_at=expires_at)
         return deepcopy(record)
 
     def _draft_ui_state(self) -> dict[str, Any]:
@@ -12410,11 +12451,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self._bound_draft_final_source(source)
                 source_completed = (final_state not in {"source_pending", "not_draft"}
                     and (source.get("completed") is True or final_state in {"available", "reserved", "running", "completed", "consumed"}))
-                self._require_open_draft_final(source)
+                self._require_open_draft_final(source, expires_at=server.get("expires_at"))
                 final_available = not busy and final_state == "available" and server.get("eligible") is True
             except (ValueError, RuntimeError) as exc:
                 reason = str(exc)
-                if source.get("final_job_id") and final_state in {"available", "checking", "unavailable"}:
+                if final_task_id and final_state in {"reserved", "running", "completed", "consumed", "unknown"}:
+                    reason = "기존 Final 작업이 있습니다. Refresh / Retrieve Result로 같은 작업을 조회하세요."
+                elif source.get("final_job_id") and final_state in {"available", "checking", "unavailable"}:
                     final_state = "consumed"
                 elif source.get("final_request_id") and final_state in {"available", "checking", "unavailable"}:
                     final_state = "unknown"
@@ -12433,7 +12476,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     target_states[target] = row["state"]
                     if row["state"] == "available":
                         try:
-                            self._require_open_draft_final(source, resolution=target)
+                            self._require_open_draft_final(source, resolution=target, expires_at=row.get("expires_at"))
                             if not _draft_final_target_state(server, target):
                                 target_states[target] = "unknown"
                         except ValueError:
@@ -15544,7 +15587,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "owner_id": self._draft_owner_id(),
                 "completed": True,
                 "render_input_sha256": recovery_at_download.get("render_input_sha256"),
-                "created_at_ms": recovery_at_download.get("draft_started_at_ms") or recovery_at_download.get("updated_at_ms"),
+                "draft_reuse_window_seconds": recovery_at_download.get("draft_reuse_window_seconds"),
+                "created_at_ms": recovery_at_download.get("draft_started_at_ms"),
+                "broker_expiry_required": not recovery_at_download.get("draft_started_at_ms"),
                 "source_bindings": recovery_at_download.get("draft_source_bindings", {}),
             })
             if completed_draft_source:
@@ -16456,6 +16501,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self._new_generation_client_request_id())
             if draft_action == DRAFT_ACTION_PREVIEW:
                 params["_hmb_draft_started_at_ms"] = int(time.time() * 1000)
+                params["_hmb_draft_reuse_window_seconds"] = getattr(bridge, "_seedance_draft_reuse_window_seconds", None)
             draft_output_format = str(params["output_format"])
             # Explicit paths and connected destinations may still contain an
             # unbound {_index} even after build_file(_index=1).

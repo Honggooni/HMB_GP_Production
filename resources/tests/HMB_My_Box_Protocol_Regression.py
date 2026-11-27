@@ -367,8 +367,11 @@ FINAL_CONTRACT = {"schema": box.DRAFT_FINAL_SCHEMA, "version": 1, "detail_field"
 new_caps = dict(CAPS, draft_final_detail_supported=True, draft_final_contract=FINAL_CONTRACT)
 parsed = box.parse_capabilities(new_caps)
 check(parsed.draft_final_detail_supported and parsed.draft_final_contract == FINAL_CONTRACT)
+extended = box.parse_capabilities(dict(new_caps, draft_final_contract=dict(FINAL_CONTRACT, reuse_window_seconds=1123200)))
+check(extended.draft_final_contract["source_ttl_seconds"] == 604800 and extended.draft_final_contract["reuse_window_seconds"] == 1123200)
 check(not caps.draft_final_detail_supported and caps.draft_final_contract is None)
-for key, bad in (("version", True), ("source_ttl_seconds", 30 * 86400), ("requires_generation_enabled", False),
+for key, bad in (("version", True), ("source_ttl_seconds", 13 * 86400), ("reuse_window_seconds", True),
+                 ("reuse_window_seconds", 0), ("reuse_window_seconds", "1123200"), ("requires_generation_enabled", False),
                  ("existing_child_has_precedence", False), ("resubmit_allowed", True),
                  ("projection_scope", "public"), ("final_client_request_id_required", True)):
     contract = dict(FINAL_CONTRACT, **{key: bad})
@@ -386,6 +389,12 @@ for key in STATE:
     state = copy.deepcopy(STATE)
     state.pop(key)
     rejects(lambda: box.parse_draft_final_state(dict(COMPLETE, draft_final=state)))
+for seconds in (604800, 1123200):
+    detail = dict(COMPLETE, created_at=100, provider_created_at=160, completed_at=500, management_expires_at=9999999,
+                  draft_final=dict(STATE, expires_at=160 + seconds))
+    check(box.parse_draft_final_state(detail)["expires_at"] == 160 + seconds)
+    detail["draft_final"]["expires_at"] = None
+    rejects(lambda: box.parse_draft_final_state(detail))
 for key, bad in (("version", True), ("source_task_id", "job-mybox-" + "9" * 32),
                  ("workspace_id", "mbx_" + "9" * 32), ("selection", dict(SELECTION, workspace_id="mbx_" + "9" * 32)),
                  ("eligible", 1), ("eligible", False), ("resubmit_allowed", True), ("expires_at", True),
@@ -416,5 +425,9 @@ rejects(lambda: box.parse_draft_final_state(dict(COMPLETE, draft_final=state)))
 old = box.prepare_invocation(dict(PAYLOAD, draft_job_id=TID), selection=SELECTION,
     title="기존 키 복구", client_request_id="preexisting-final-key")
 check(old.client_request_id == "preexisting-final-key")
+unadvertised = box.MyBoxBroker(Bridge())
+unadvertised.capabilities()
+rejects(lambda: unadvertised.create(old), "MY_BOX_UNSUPPORTED")
+check(not any(method == "POST" for method, _, _ in unadvertised._bridge.calls))
 
 print("PASS HMB_My_Box_Protocol_Regression:", checks, "offline checks; paid/network/production writes = 0")

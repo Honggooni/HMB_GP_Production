@@ -17,10 +17,11 @@ const source = fs.readFileSync(widgetPath, "utf8");
 const hash = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
 const originalCss = "16fb5e7c19e4e1ee1b0dcdd31f827e743ace6cd1c4c89449cd3a8910a4129c34";
 const css = source.match(/function render\(state\) \{[\s\S]*?<style>([\s\S]*?)<\/style>/)?.[1];
-// Exclude the additive native slots and inline Draft Final controls. The rest
-// of the header, body and player CSS must stay byte-identical.
+// The native slots, inline Final controls and the completed-Run indicator are
+// additive. Preserve the baseline fingerprint for all other header and player CSS.
 const legacyCss = css.replace(/^[ \t]*\/\* HMB_NATIVE_HEADER_SLOTS_BEGIN \*\/[\s\S]*?\/\* HMB_NATIVE_HEADER_SLOTS_END \*\/\r?\n/m, "")
   .replace(/^[ \t]*\/\* HMB_FINAL_RESOLUTION_INLINE_BEGIN \*\/[\s\S]*?\/\* HMB_FINAL_RESOLUTION_INLINE_END \*\/\r?\n/m, "")
+  .replace(/^[ \t]*button\[data-hmb-completed-render\]\{opacity:\.45!important;cursor:default!important;pointer-events:none!important\}\r?\n/m, "")
   .replaceAll(":not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *))", "");
 assert.equal(hash(legacyCss), originalCss, "Native header integration must preserve existing layout, colours and player CSS.");
 const require = createRequire(import.meta.url);
@@ -82,6 +83,31 @@ try {
       return f;
     };
   }, source);
+
+  const runStyles = await page.evaluate(() => {
+    const value = state(), fixture = makeFixture(value);
+    const actions = fixture.header.querySelector("[data-hmb-native-actions]");
+    const run = document.createElement("button"), neighbor = document.createElement("button");
+    run.setAttribute("aria-label", "Run node");
+    for (const button of [run, neighbor]) {
+      button.style.cssText = "opacity:.9;cursor:pointer;pointer-events:auto";
+      actions.append(button);
+    }
+    const appearance = button => {
+      const style = getComputedStyle(button);
+      return [style.opacity, style.cursor, style.pointerEvents, button.inert];
+    };
+    fixture.update({ ...value, draft: { ...value.draft, run_locked: true } });
+    const locked = appearance(run), other = appearance(neighbor);
+    fixture.update(value);
+    const restored = appearance(run);
+    fixture.cleanup();
+    return { locked, other, restored };
+  });
+  assert.deepEqual(runStyles.locked, ["0.45", "default", "none", true]);
+  assert.deepEqual(runStyles.other, ["0.9", "pointer", "auto", false]);
+  assert.deepEqual(runStyles.restored, runStyles.other);
+  report.cases.push("completed_render_styles_only_the_native_Run_button_until_inputs_change");
 
   // Missing catalog is a waiting Shot, never independent Only. Old hosts keep
   // their previous shape/selector semantics, including their Only fallback.

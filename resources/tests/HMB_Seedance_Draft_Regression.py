@@ -370,6 +370,21 @@ class DraftTests(unittest.TestCase):
         with mock.patch.object(bridge, "_request_json", return_value=capability()):
             bridge.require_seedance_draft_features()
 
+    def test_draft_capability_supports_model_reuse_window_and_keeps_legacy_ttl(self):
+        bridge = t._HMBAIBrokerBridge(server_url=ORIGIN)
+        for profile_fields, expected in (({}, 604800), ({"draft_reuse_window_seconds": 1123200}, 1123200),
+                ({"draft": {"reuse_window_seconds": 1123200}}, 1123200),
+                ({"draft_reuse_window_seconds": 1123200, "draft": {"reuse_window_seconds": 1123200}}, 1123200)):
+            response = capability()
+            profile = response["models"][t.SEEDANCE_2_5_MODEL_ID]
+            profile.update(profile_fields)
+            with self.subTest(profile_fields=profile_fields), mock.patch.object(bridge, "_request_json", return_value=response):
+                bridge.require_seedance_draft_features()
+                self.assertEqual(bridge._seedance_draft_reuse_window_seconds, expected)
+                self.assertEqual(profile["draft_source_ttl_seconds"], 604800)
+        with self.assertRaises(t._BrokerProtocolError):
+            t._draft_reuse_window_seconds({"draft_reuse_window_seconds": 1123200, "draft": {"reuse_window_seconds": 604800}})
+
     def test_bridge_final_does_not_add_inherited_fields(self):
         bridge = t._HMBAIBrokerBridge(server_url=ORIGIN)
         payload = {"provider": "volcengine_ark", "model": t.SEEDANCE_2_5_MODEL_ID,

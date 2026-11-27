@@ -1076,7 +1076,7 @@ class MyBoxNodeTests(unittest.TestCase):
         payload=dict(provider='volcengine_ark',model=target.SEEDANCE_2_5_MODEL_ID,client_request_id=key,hmb_generation_task=target.TASK_TEXT_ONLY)
         self.backend.jobs[child]=dict(self.backend.job(payload,15),task_id=child,job_id=child,
             download_url=BASE+protocol.API+'/items/'+child+'/media?download=1',draft_parent_task_id=source)
-        self.backend.jobs[source]['draft_final']=self.backend.projection(source,'completed',child,'completed')
+        self.backend.jobs[source]['draft_final']=dict(self.backend.projection(source,'completed',child,'completed'), expires_at=1)
         self.backend.capabilities.update(generation_enabled=False,reason_code='my_box_budget_limits_unsupported')
         before=self.authored(); self.run_node(final=True); self.assert_success()
         self.assertEqual(self.checkpoint()['job_id'],child); self.assertEqual(len(self.backend.created),1)
@@ -1177,6 +1177,72 @@ class MyBoxNodeTests(unittest.TestCase):
     def test_private_draft_4k_then_1080p_persists_outputs_after_reopen(self):
         self.check_both_private_finals('4k', '1080p')
 
+    def test_private_source_deadlines_across_reopen_and_final_preflight(self):
+        self.backend.enable_final()
+        self.backend.capabilities['draft_final_contract']['reuse_window_seconds'] = 13 * 86400
+        self.run_node()
+        source = self.checkpoint()['job_id']
+        detail = self.backend.jobs[source]
+        now = int(time.time())
+        detail['created_at'] = now - 9 * 86400
+        expiry = detail['created_at'] + 13 * 86400
+        projection = self.backend.scoped_projection(source)
+        for row in [projection, *projection['finals_by_resolution'].values()]:
+            row['expires_at'] = expiry
+        detail['draft_final'] = projection
+        self.run_node(refresh=True)
+        self.assertEqual(self.checkpoint()['draft_final']['expires_at'], expiry)
+        reopened = self.reopen()
+        with mock.patch.object(time, 'time', return_value=expiry-1):
+            self.assertTrue(self.controller(reopened).draft_ui_state()['final_available'])
+        with mock.patch.object(time, 'time', return_value=expiry):
+            ui = self.controller(reopened).draft_ui_state()
+            self.assertFalse(ui['final_available'])
+            self.assertFalse(ui['final_visible'])
+            self.assertEqual(ui['finals_by_resolution'], {'1080p':'expired', '4k':'expired'})
+            self.run_node(reopened, final=True, expected_source_task_id=source)
+            self.assertEqual(len(self.backend.created), 1)
+        # An advertised window cannot supply a missing or contradictory owner deadline.
+        for row in [projection, projection['finals_by_resolution']['4k']]:
+            for bad in ('missing', None, expiry + 60):
+                if bad == 'missing':
+                    del row['expires_at']
+                else:
+                    row['expires_at'] = bad
+                self.run_node(reopened, final=True, expected_source_task_id=source)
+                self.assertEqual(len(self.backend.created), 1)
+                row['expires_at'] = expiry
+        # The task-specific deadline wins on both new and legacy Brokers.
+        for row in [projection, *projection['finals_by_resolution'].values()]:
+            row['expires_at'] = detail['created_at'] + 7 * 86400
+        self.run_node(reopened, final=True, expected_source_task_id=source)
+        self.assertEqual(len(self.backend.created), 1)
+        del self.backend.capabilities['draft_final_contract']['reuse_window_seconds']
+        self.run_node(reopened, final=True, expected_source_task_id=source)
+        self.assertEqual(len(self.backend.created), 1)
+        self.backend.capabilities['draft_final_contract']['reuse_window_seconds'] = 13 * 86400
+        for row in [projection, *projection['finals_by_resolution'].values()]:
+            row['expires_at'] = expiry
+        self.run_node(reopened, final=True, expected_source_task_id=source)
+        self.assertEqual(len(self.backend.created), 2)
+        self.assert_success(reopened)
+
+    def test_final_post_rechecks_owner_deadline_after_local_preparation(self):
+        self.backend.enable_final()
+        self.backend.capabilities['draft_final_contract']['reuse_window_seconds'] = 13 * 86400
+        self.run_node()
+        source = self.checkpoint()['job_id']
+        detail = self.backend.jobs[source]
+        detail['created_at'] = int(time.time())
+        first_check = self.backend.bridge.require_seedance_draft_features
+        def drop_deadline(**kwargs):
+            del detail['draft_final']['expires_at']
+            return first_check(**kwargs)
+        with mock.patch.object(self.backend.bridge, 'require_seedance_draft_features', side_effect=drop_deadline):
+            self.run_node(final=True, expected_source_task_id=source)
+        self.assertNotIn('expires_at', detail['draft_final'])
+        self.assertEqual(len(self.backend.created), 1)
+
     def test_private_scoped_slot_cannot_use_foreign_key_or_unresolved_peer(self):
         self.backend.enable_final()
         self.run_node()
@@ -1230,7 +1296,7 @@ class MyBoxNodeTests(unittest.TestCase):
         child='job-mybox-'+'e'*32; key='mbx-final-v1-'+source.removeprefix('job-mybox-')
         payload=dict(provider='volcengine_ark',model=target.SEEDANCE_2_5_MODEL_ID,client_request_id=key,hmb_generation_task=target.TASK_TEXT_ONLY)
         self.backend.jobs[child]=dict(self.backend.job(payload,14),task_id=child,job_id=child,status='failed',download_url=None,video_url=None,draft_parent_task_id=source)
-        self.backend.jobs[source]['draft_final']=self.backend.projection(source,'reserved',child,'failed')
+        self.backend.jobs[source]['draft_final']=dict(self.backend.projection(source,'reserved',child,'failed'), expires_at=1)
         self.run_node(final=True); self.assertEqual(len(self.backend.created),1)
         self.assertEqual(self.checkpoint()['job_id'],child); self.assertFalse(self.node._execution_succeeded)
     def test_final_child_requires_exact_original_source_parent(self):

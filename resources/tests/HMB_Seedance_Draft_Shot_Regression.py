@@ -297,6 +297,53 @@ class DraftShotTests(unittest.TestCase):
                 with self.subTest(created=created), self.assertRaises(ValueError):
                     node._validated_draft_final_source(completed_source(node, created_at_ms=created))
 
+    def test_window_from_creation_and_authenticated_draft_expiry_in_shot_and_only(self):
+        created = 1_900_000_000
+        end = created + 1123200
+        for shot in (True, False):
+            with self.subTest(shot=shot):
+                node = Node(shot=shot)
+                source = completed_source(node, created_at_ms=created * 1000, draft_reuse_window_seconds=1123200)
+                node._store_draft_source(source)
+                node._hmb_draft_final_status_cache = {}
+                self.assertEqual(node._draft_source_record(), source)
+                with mock.patch.object(t.time, "time", return_value=end - 0.001):
+                    self.assertEqual(node._validated_draft_final_source(), source)
+                with mock.patch.object(t.time, "time", return_value=end), self.assertRaisesRegex(ValueError, "expired"):
+                    node._validated_draft_final_source()
+                now = created + 10 * 86400
+                with mock.patch.object(t.time, "time", return_value=now):
+                    # A legacy receipt is allowed beyond seven days if the exact authenticated source permits it.
+                    legacy = {k: v for k, v in source.items() if k != "draft_reuse_window_seconds"}
+                    node._store_draft_source(legacy)
+                    reply = {**node.bridge.get_draft_final_state(legacy), "expires_at": end}
+                    with mock.patch.object(node.bridge, "get_draft_final_state", return_value=reply):
+                        asyncio.run(node._query_draft_final_server_state(legacy))
+                    self.assertTrue(node._draft_ui_state()["final_available"])
+                    self.assertEqual(node._validated_draft_final_source(), legacy)
+                    # Conversely, the provider may expire one source under the former seven-day cutoff.
+                    node._store_draft_source(source)
+                    reply.update(state="expired", eligible=False, expires_at=created + 604800)
+                    with mock.patch.object(node.bridge, "get_draft_final_state", return_value=reply):
+                        asyncio.run(node._query_draft_final_server_state(source))
+                    self.assertFalse(node._draft_ui_state()["final_available"])
+                    with self.assertRaisesRegex(ValueError, "expired"):
+                        node._validated_draft_final_source()
+                    self.assertEqual(node.bridge.posts, [])
+
+    def test_legacy_recovery_without_original_clock_requires_task_expiry(self):
+        node = Node()
+        source = completed_source(node, broker_expiry_required=True)
+        source.pop("created_at_ms")
+        node._store_draft_source(source)
+        node._hmb_draft_final_status_cache = {}
+        self.assertEqual(node._draft_source_record(), source)
+        with self.assertRaisesRegex(ValueError, "expiration"):
+            node._validated_draft_final_source()
+        asyncio.run(node._query_draft_final_server_state(source))
+        self.assertEqual(node._validated_draft_final_source(), source)
+        self.assertTrue(node._draft_ui_state()["final_available"])
+
     def test_only_legacy_source_retains_original_endpoint_and_project(self):
         node = Node(shot=False)
         node.parameter_values[t.DRAFT_SOURCE_PARAMETER] = deepcopy(base.SOURCE)
@@ -930,7 +977,7 @@ class DraftShotTests(unittest.TestCase):
         values = base.params(t.DRAFT_ACTION_PREVIEW)
         values.update(resolution='480p', _hmb_draft_project=PROJECT, _hmb_broker_server_url=ORIGIN,
                       _hmb_generation_origin=origin, _hmb_draft_source_bindings={'image_asset': PUBLISHER},
-                      _hmb_draft_started_at_ms=started_at_ms)
+                      _hmb_draft_started_at_ms=started_at_ms, _hmb_draft_reuse_window_seconds=1123200)
         node._set_generation_recovery_checkpoint(stage='pre_submit', task_id='hmb-preview',
             task_identity='client_request', status='submitting', params=values)
         node._set_generation_recovery_checkpoint(stage='remote_succeeded', task_id=JOB,
@@ -953,6 +1000,7 @@ class DraftShotTests(unittest.TestCase):
         self.assertEqual(source['source_bindings'], {'image_asset': PUBLISHER})
         self.assertIs(source['completed'], True)
         self.assertEqual(source['created_at_ms'], started_at_ms)
+        self.assertEqual(source['draft_reuse_window_seconds'], 1123200)
         self.assertTrue(node._draft_ui_state()['final_available'])
         self.assertEqual((node.get_parameter_value('resolution'), node.get_parameter_value('draft_action')),
                          ('480p', t.DRAFT_ACTION_PREVIEW))

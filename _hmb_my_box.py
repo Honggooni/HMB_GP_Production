@@ -26,6 +26,7 @@ CAPABILITIES_SCHEMA = "hmb-only-my-box-capabilities-v1"
 WORKSPACE_SCHEMA = "hmb-only-my-box-workspace-v1"
 JOB_SCHEMA = "hmb-only-my-box-job-v1"
 DRAFT_FINAL_SCHEMA = "hmb-only-my-box-draft-final-v1"
+LEGACY_DRAFT_REUSE_SECONDS = 7 * 86400
 SCOPE = "personal_my_box"
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024
@@ -183,12 +184,16 @@ def parse_capabilities(raw: Any) -> MyBoxCapabilities:
                 or final_contract.get("existing_child_has_precedence") is not True
                 or final_contract.get("resubmit_allowed") is not False
                 or final_contract.get("expiry_basis") != "source_creation_provider_limit"
-                or type(final_contract.get("source_ttl_seconds")) is not int or final_contract["source_ttl_seconds"] != 7 * 86400
+                or type(final_contract.get("source_ttl_seconds")) is not int or final_contract["source_ttl_seconds"] != LEGACY_DRAFT_REUSE_SECONDS
                 or final_contract.get("final_client_request_id_required") is not False
                 or final_contract.get("client_key_namespace_conflicts_rejected") is not True
                 or final_contract.get("states") != ["available", "reserved", "running", "completed", "expired", "not_draft"]
                 or final_contract.get("final_client_request_id_rule") != "mbx-final-v1-{source_task_hex32}"):
             _fail("Broker My Box Draft-final contract is invalid.")
+        if "reuse_window_seconds" in final_contract:
+            window = final_contract["reuse_window_seconds"]
+            if type(window) is not int or window <= 0:
+                _fail("Broker My Box Draft reuse window is invalid.")
     return MyBoxCapabilities(*(raw[k] for k in ("implemented", "enabled", "generation_enabled", "workspace_management_enabled")),
         reason or "", raw["budget_limits_supported"], raw["project_source_reuse_enabled"], _json(workspace),
         final_supported, _json(final_contract, limit=8192))
@@ -452,7 +457,9 @@ class MyBoxBroker:
             intent = admission.workspace_intent
             if intent is None or intent["selection"] != invocation.selection:
                 _fail("Private queue workspace intent does not match the invocation.", "MY_BOX_IDENTITY_MISMATCH")
-        if payload.get("draft_job_id") and (admission is not None or invocation.client_request_id.startswith("mbx-final-v2-")):
+        if payload.get("draft_job_id"):
+            if not self._capabilities.draft_final_detail_supported:
+                _fail("This Broker has not advertised private Draft Final state.", "MY_BOX_UNSUPPORTED")
             detail = self.detail(payload["draft_job_id"], selection=invocation.selection, timeout=min(timeout, 15))
             final = parse_draft_final_state(detail)
             scoped_key_required = bool(final and final.get("finals_by_resolution")) or invocation.client_request_id.startswith("mbx-final-v2-")

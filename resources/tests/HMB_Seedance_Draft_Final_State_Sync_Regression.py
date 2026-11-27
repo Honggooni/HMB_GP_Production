@@ -150,7 +150,7 @@ class DraftFinalStateSyncTests(unittest.TestCase):
     def test_resolution_scoped_receipts_survive_reload_and_reject_conflicts(self):
         node = Node()
         completed = projection(node.source, "completed", consumed=True, child_task_id=CHILD, child_status="succeeded")
-        available = projection(node.source)
+        available = projection(node.source, expires_at=completed["expires_at"])
         node.opener.reply = {**completed, "finals_by_resolution": {
             "1080p": {**completed, "idempotency_key": t._seedance_draft_final_request_id(JOB, "1080p")},
             "4k": {**available, "idempotency_key": t._seedance_draft_final_request_id(JOB, "4k")},
@@ -161,7 +161,8 @@ class DraftFinalStateSyncTests(unittest.TestCase):
         original = deepcopy(node.opener.reply)
         for override in ({"owner_user_id": 89}, {"child_task_id": JOB}, {"child_task_id": "job-" + "f" * 32},
                          {"idempotency_key": t._seedance_draft_final_request_id(JOB, "4k")},
-                         {"source_task_id": CHILD}, {"finals_by_resolution": {}}):
+                         {"source_task_id": CHILD}, {"finals_by_resolution": {}},
+                         {"expires_at": completed["expires_at"] + 1}):
             node._hmb_draft_final_status_cache = {}
             node.opener.reply = deepcopy(original)
             node.opener.reply["finals_by_resolution"]["1080p"].update(override)

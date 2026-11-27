@@ -168,6 +168,32 @@ try {
     assert.equal(results.views[2].text, "Final 확인 필요"); assert.deepEqual(results.accepted, [false, false, false, false]);
     assert.deepEqual(results.commands, []);
   });
+  await check("deadline-arriving-before-Final-dispatch-preserves-an-existing-child", async () => {
+    const result = await page.evaluate(async () => {
+      const source = makeState(1, { source_completed: true });
+      const f = createFixture(source);
+      const armed = !f.button().disabled;
+      f.button().click();
+      f.update(makeState(1, { source_completed: true, final_state: "expired",
+        final_available: false, final_visible: false }));
+      await flushFrames();
+      const expired = view(f);
+      const child = "job-" + "c".repeat(32);
+      f.update(makeState(1, { source_completed: true, final_state: "running",
+        final_available: false, final_visible: true, final_task_id: child }));
+      f.button().click();
+      await flushFrames();
+      return { armed, expired, running: view(f), id: widget.hmbSeedanceDraftState(f.state.draft).final_task_id,
+        child, commands: f.commands };
+    });
+    assert.equal(result.armed, true);
+    assert.equal(result.expired.hidden && result.expired.disabled, true);
+    assert.equal(result.running.hidden, false);
+    assert.equal(result.running.disabled, true);
+    assert.equal(result.running.text, "Final 처리 중…");
+    assert.equal(result.id, result.child);
+    assert.deepEqual(result.commands, []);
+  });
   for (const status of ["unknown", "unavailable"]) {
     await check(`retry-${status}-checks-only-the-completed-Draft-without-generating`, async () => {
       const job = await page.evaluate(status => {

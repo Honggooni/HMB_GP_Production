@@ -26,6 +26,7 @@ async def exercise(engine, phase, out):
     schema = host.register(engine, {"HMBSeedanceGeneration": t})
     engine.event_manager.initialize_queue()
     job = "job-" + "a" * 32
+    created_at = int(time.time()) - 10 * 86400
     origin = "https://sdk-fixture.invalid"
     project = t.resolve_project("katuri8", default_legacy=False)
     resolutions = {"1080p": "available", "4k": "available"}
@@ -43,7 +44,7 @@ async def exercise(engine, phase, out):
         return dict(schema="hmb-review-draft-final-v1", state_schema="hmb-draft-final-state-v1",
                     state="available", is_draft=True, eligible=True, consumed=False, source_task_id=job,
                     resolution=quality, owner_user_id=7, project_id=project["project_id"], project_name=project["project_name"],
-                    child_task_id=None, child_status=None, checked_at=int(time.time()), expires_at=int(time.time())+604800,
+                    child_task_id=None, child_status=None, checked_at=int(time.time()), expires_at=created_at + 1123200,
                     idempotency_key=t._seedance_draft_final_request_id(job, quality, version=1))
 
     async def require_state(state):
@@ -77,20 +78,26 @@ async def exercise(engine, phase, out):
         guards.enter_context(patch.object(bridge, "_load_access_token", return_value="synthetic-token"))
         guards.enter_context(patch.object(bridge, "_request_json", side_effect=read))
         if phase == "save":
-            flow = host.send(engine, EnsureWorkflowAndFlowRequest(flow_name="Offline Draft")).flow_name
+            ensured = host.send(engine, EnsureWorkflowAndFlowRequest(flow_name="Offline Draft"))
+            flow = ensured.flow_name
+            if getattr(ensured, "open_workflow", None) is not None:
+                guards.enter_context(engine.bind_workflow(engine.open_workflows.get(ensured.workflow_id)))
             host.send(engine, CreateNodeRequest(node_type="HMBSeedanceGeneration", specific_library_name=schema.name,
                       node_name=name, initial_setup=True, metadata={t.SEEDANCE_EXECUTION_MODE_METADATA: host.intent(t)},
                       create_error_proxy_on_failure=False))
         else:
             result = await host.asend(engine, RunWorkflowWithCurrentStateRequest(file_path=str(saved)))
             assert str(getattr(result.status, "name", result.status)) == "GOOD"
+            if getattr(result, "open_workflow", None) is not None:
+                guards.enter_context(engine.bind_workflow(engine.open_workflows.get(result.workflow_id)))
         node = engine.node_manager.get_node_by_name(name)
         if phase == "save":
             host.configure(t, node, 6)
             node._hmb_clear_shot_routing_catalog()
             host.select(engine, t, node)
             node.set_parameter_value("draft_action", "Draft 480p", emit_change=False)
-            node._store_draft_source(dict(draft_job_id=job, completed=True, created_at_ms=int(time.time()*1000)-1000,
+            node._store_draft_source(dict(draft_job_id=job, completed=True, created_at_ms=created_at * 1000,
+                draft_reuse_window_seconds=1123200,
                 broker_server_url=origin, project_id=project["project_id"], project_name=project["project_name"],
                 generation_origin=node._capture_generated_video_origin(), owner_id=node._draft_owner_id(), source_bindings={}))
             serialized = host.send(engine, SerializeFlowToCommandsRequest(flow_name=flow)).serialized_flow_commands
@@ -98,6 +105,8 @@ async def exercise(engine, phase, out):
                                file_name=saved.stem, file_path=str(saved), display_name="Offline Draft"))
         source = node._draft_source_record()
         assert source["draft_job_id"] == job and source["completed"] and node._draft_only_mode()
+        assert source["draft_reuse_window_seconds"] == 1123200
+        created_at = source["created_at_ms"] // 1000
         await clear_watch()
         with engine.bind_workflow(NO_WORKFLOW):
             node._sync_seedance_shot_widget(emit_change=True)
