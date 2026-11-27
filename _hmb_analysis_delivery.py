@@ -31,20 +31,28 @@ _FILE_DIGEST_LOCK = threading.Lock()
 _FILE_READ_LOCKS = tuple(threading.Lock() for _ in range(32))
 
 
-def _file_change_time(stream, info):
+def _file_change_token(stream, info):
     if os.name != "nt":
         return info.st_ctime_ns
-    # Python's Windows st_ctime can be the creation time. Use the NT change
-    # time on the opened file so restored modification times cannot hide edits.
+    # NTFS ChangeTime itself can repeat for successive writes in one clock
+    # tick. Only a journal sequence from this file may authorize reuse.
     import ctypes
     import msvcrt
+    import struct
     from ctypes import wintypes
 
-    basic_info = (ctypes.c_longlong * 5)()  # FILE_BASIC_INFO, including its final padding
     handle = wintypes.HANDLE(msvcrt.get_osfhandle(stream.fileno()))
-    ok = ctypes.windll.kernel32.GetFileInformationByHandleEx(
-        handle, 0, ctypes.byref(basic_info), ctypes.sizeof(basic_info))
-    return basic_info[3] if ok else 0
+    versions = (ctypes.c_ushort * 2)(2, 3)
+    data = ctypes.create_string_buffer(1024)  # header and a single UTF-16 filename
+    received = wintypes.DWORD()
+    ok = ctypes.windll.kernel32.DeviceIoControl(
+        handle, 0x000900EB, versions, ctypes.sizeof(versions), data, ctypes.sizeof(data),
+        ctypes.byref(received), None)  # FSCTL_READ_FILE_USN_DATA
+    if ok and received.value >= 48:
+        version = struct.unpack_from("<H", data, 4)[0]
+        if version in (2, 3):
+            return struct.unpack_from("<q", data, 24 if version == 2 else 40)[0]
+    return 0  # No per-file journal (e.g. SMB): verify the bytes.
 
 
 class FileChangedDuringHash(OSError):
@@ -60,7 +68,7 @@ def cached_file_sha256(path: Path, *, read=None, refresh=False, max_size=None) -
         if max_size is not None and not 0 < info.st_size <= max_size:
             raise OverflowError("Source exceeds the analysis size limit")
         identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
-        change = _file_change_time(stream, info)
+        change = _file_change_token(stream, info)
         key = (path, *identity, change) if change and info.st_ino else None
         with _FILE_DIGEST_LOCK:
             digest = _FILE_DIGESTS.get(key) if key and not refresh else None
@@ -68,7 +76,7 @@ def cached_file_sha256(path: Path, *, read=None, refresh=False, max_size=None) -
             digest = read(stream) if read else hashlib.file_digest(stream, "sha256").hexdigest()
         current = path.stat()
         if (identity != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
-                or change != _file_change_time(stream, os.fstat(stream.fileno()))):
+                or change != _file_change_token(stream, os.fstat(stream.fileno()))):
             raise FileChangedDuringHash("Source changed during file verification")
         if key:
             with _FILE_DIGEST_LOCK:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -576,7 +577,6 @@ class AnalysisNodeRegression(unittest.TestCase):
                     self.prompt, channel_uuid="channel", shot_uuid="shot-2", for_agent=True)
                 self.assertEqual(calls, [])
                 self.assertEqual(full_reads, [self.path])
-                import os
                 original_stat = self.path.stat()
                 self.path.write_bytes(original[::-1])  # previous stat identity deliberately retained
                 os.utime(self.path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
@@ -634,6 +634,27 @@ class AnalysisNodeRegression(unittest.TestCase):
         self.assertEqual(calls, ["before", "after"])
         self.assertIn("new before", self.prompt._hmb_apply_analysis_fields.call_args.args[2]["VIDEO_VFX"])
         self.assertEqual(self.context("agent")["items"][0]["observation"], "new after")
+
+    def test_rapid_same_size_same_timestamp_replacements_and_unversioned_file(self):
+        import _hmb_analysis_delivery as delivery
+
+        fixed = self.path.stat()
+        with self.path.open("rb") as stream:
+            journal = delivery._file_change_token(stream, os.fstat(stream.fileno()))
+        with mock.patch.object(hashlib, "file_digest", wraps=hashlib.file_digest) as reads:
+            for index in range(128):
+                content = index.to_bytes(4, "big")
+                self.path.write_bytes(content)
+                os.utime(self.path, ns=(fixed.st_atime_ns, fixed.st_mtime_ns))
+                expected = hashlib.sha256(content).hexdigest()
+                for _ in range(2):
+                    self.assertEqual(delivery.cached_file_sha256(self.path), expected)
+            self.assertEqual(reads.call_count, 128 if journal else 256)
+            reads.reset_mock()
+            with mock.patch.object(delivery, "_file_change_token", return_value=0):
+                for _ in range(3):
+                    self.assertEqual(delivery.cached_file_sha256(self.path), expected)
+            self.assertEqual(reads.call_count, 3)
 
     def test_passive_invalidation_persists_pending_and_original_only_never_starts_analysis(self):
         scope = {"channel_uuid": "channel", "shot_uuid": "shot-1"}

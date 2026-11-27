@@ -33,6 +33,7 @@ PRODUCTS = ("HMBSeedanceGeneration.py", "_hmb_shot_routing.py", "widgets/HMBSeed
 ATTEMPTS = []
 RESULTS = []
 REQUESTS = 0
+_LIVE_SERVICE_PORTS = frozenset({8124, 8125, 8443, 14823})
 
 
 def deny(*args, **kwargs):
@@ -469,6 +470,7 @@ def run_phase(phase, out, *, workspace=None, exercise_flow=None, use_standard=Tr
         sys.path.append(str(STANDARD / ".venv/Lib/site-packages"))
     sys.dont_write_bytecode = True
     attempts = []
+    local_socketpair_collisions = 0
     original_connect = socket.socket.connect
     original_connect_ex = socket.socket.connect_ex
     original_create = socket.create_connection
@@ -476,10 +478,23 @@ def run_phase(phase, out, *, workspace=None, exercise_flow=None, use_standard=Tr
     def allowed(address):
         host = address[0] if isinstance(address, tuple) else address
         port = address[1] if isinstance(address, tuple) and len(address) > 1 else None
-        if port in {8124, 8125, 8443, 14823} or host is not None and str(host).lower() not in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
+        if port in _LIVE_SERVICE_PORTS or host is not None and str(host).lower() not in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
             attempts.append("blocked_network")
             raise AssertionError("No live engine, Broker or external network in ModeHost")
     def connect(sock, address, *a, **k):
+        nonlocal local_socketpair_collisions
+        if (os.name == "nt" and isinstance(address, tuple) and len(address) == 2
+                and address[0] in {"127.0.0.1", "::1"} and address[1] in _LIVE_SERVICE_PORTS):
+            # Windows socketpair binds a private listener on port zero. Its
+            # OS-assigned port can overlap a protected engine port on this PC.
+            caller = sys._getframe(1)
+            if caller.f_code is getattr(socket.socketpair, "__code__", None):
+                listener = caller.f_locals.get("lsock")
+                if (isinstance(listener, socket.socket) and caller.f_locals.get("csock") is sock
+                        and listener.getsockname()[:2] == address
+                        and listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)):
+                    local_socketpair_collisions += 1
+                    return original_connect(sock, address, *a, **k)
         allowed(address)
         return original_connect(sock, address, *a, **k)
     def connect_ex(sock, address, *a, **k):
@@ -509,6 +524,7 @@ def run_phase(phase, out, *, workspace=None, exercise_flow=None, use_standard=Tr
         result = dict(schema="hmb-seedance-execution-mode-installed-sdk/v1", phase=phase,
             passed=error is None and not attempts and not ATTEMPTS, cases=RESULTS[first_case:], native_requests=REQUESTS,
             forbidden_execution_attempts=len(ATTEMPTS), external_or_live_socket_attempts=len(attempts),
+            private_socketpairs_on_protected_ports=local_socketpair_collisions,
             provider_or_paid_calls=0, live_graph_actions=0,
             source_sha256={name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in PRODUCTS})
         (out / (phase + "-result.json")).write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
