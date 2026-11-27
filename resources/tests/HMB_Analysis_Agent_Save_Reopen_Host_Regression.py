@@ -130,6 +130,10 @@ async def exercise(engine, phase: str, out: Path) -> None:
         shots = [{**row, "revision": row["number"], "selected_source_uids": []} for row in SHOTS]
         with mock.patch.multiple(media_fixture, CHANNEL=CHANNEL, SHOTS=shots):
             catalog = media_fixture.media_fixture(source_node)
+            # The shared fixture closes over its module's default channel.
+            # Keep this publisher's actual identity across asynchronous execution.
+            subscription = source_node._hmb_shot_channel_subscription()
+            source_node._hmb_shot_channel_subscription = lambda: deepcopy(subscription)
         prompt._hmb_reconcile_shot_routing(deepcopy(catalog))
 
     def assert_delivery(prompt, index: int) -> None:
@@ -312,6 +316,23 @@ async def exercise(engine, phase: str, out: Path) -> None:
         assert analysis.get_analysis_context(prompt, channel_uuid=CHANNEL, shot_uuid=first, destination="agent") == {}
         assert_delivery(prompt, 1)
         host.record("second_process_restored_all_slots_reused_results_and_rejected_replaced_source", mock_analysis_calls=len(calls))
+        scope = {"channel_uuid": CHANNEL, "shot_uuid": first}
+        await prompt._hmb_prepare_shot_analysis(**scope, for_agent=True)
+        refreshed = analysis.get_analysis_context(prompt, **scope, destination="agent")
+        assert len(calls) == 1 and refreshed["cache_key"] == calls[0]
+        assert "edited_result" not in refreshed and refreshed["items"][0]["category"] == "lighting_reference"
+        await prompt._hmb_prepare_shot_analysis(**scope, for_agent=True)
+        assert len(calls) == 1
+        upstream = SHOTS[2]["shot_uuid"]
+        old_text = prompt_document(prompt, upstream)["text"]["PROJECT_STYLE_LOOK"]
+        Image.new("RGB", (15, 11), color=(20, 30, 40)).save(source(upstream)["path"])
+        await prompt._hmb_prepare_shot_analysis(channel_uuid=CHANNEL, shot_uuid=upstream)
+        new_text = prompt_document(prompt, upstream)["text"]["PROJECT_STYLE_LOOK"]
+        assert len(calls) == 2 and f"Lighting {calls[-1][12:24]}" in new_text
+        assert old_text.split("\n\n")[-1] not in new_text
+        assert_delivery(prompt, 1)
+        host.record("reopened_downstream_run_refreshes_each_changed_original_once_and_replaces_generated_fields",
+                    mock_analysis_calls=len(calls))
 
 
 def main() -> None:

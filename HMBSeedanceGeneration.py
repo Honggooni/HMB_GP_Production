@@ -402,6 +402,17 @@ DRAFT_FINAL_RESOLUTIONS = ("1080p", "4k")
 DRAFT_ACTION_CHOICES = (DRAFT_ACTION_OFF, DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL)
 DRAFT_SOURCE_PARAMETER = "HMB_SEEDANCE_DRAFT_SOURCE"
 DRAFT_SOURCES_PARAMETER = "HMB_SEEDANCE_DRAFT_SOURCES"
+COMPLETED_RENDER_INPUTS_PARAMETER = "HMB_SEEDANCE_COMPLETED_INPUTS"
+ONLY_REFERENCE_DIGESTS_PARAMETER = "HMB_SEEDANCE_ONLY_REFERENCE_DIGESTS"
+_MANUAL_REFERENCE_FIELDS = ("reference_images", "VIDEO_REFERENCES", "reference_audio", "first_frame", "last_frame",
+                            "reference_video_1", "reference_video_2", "reference_video_3")
+_RENDER_AUTHORING_FIELDS = frozenset((
+    "model_id", "task", "input_mode", "resolution", "draft_action", "ratio", "duration",
+    "generate_audio", "watermark", "output_format", "return_last_frame", "priority",
+    "execution_expires_after", "prompt", "first_frame", "last_frame", "reference_images",
+    "VIDEO_REFERENCES", "reference_video_1", "reference_video_2", "reference_video_3", "reference_audio",
+    "only_project", "my_box_title",
+))
 PROJECT_SELECTION_SCHEMA = "hmb-imageasset-project-selection-v1"
 ONLY_PROJECT_SELECTION_SCHEMA = "hmb-only-project-selection-v1"
 ONLY_PROJECT_PARAMETER = "only_project"
@@ -796,7 +807,7 @@ GENERATION_PREVIEW_GUIDANCE = {
         "자동 조회 시간이 끝났습니다. 기존 작업 결과만 다시 확인합니다."
     ),
     "submission_unknown": (
-        "접수 여부가 불명확합니다. 결과 조회는 기존 요청만 확인하며, 새 Run은 별도 렌더를 제출합니다. 중복 과금될 수 있습니다."
+        "접수 여부를 확인하고 있습니다. 실행 또는 결과 조회를 누르면 기존 요청 ID로 상태를 확인합니다."
     ),
     "failed": "작업 상태 또는 결과 수신을 확인해야 합니다.",
     "succeeded": "",
@@ -1022,6 +1033,8 @@ def _seedance_draft_source_value(value: Any = None) -> dict[str, Any]:
         if any(not _seedance_uuid_text(item) for item in bindings.values()):
             return {}
         result["source_bindings"] = dict(bindings)
+    if re.fullmatch(r"[0-9a-f]{64}", str(value.get("render_input_sha256") or "")):
+        result["render_input_sha256"] = value["render_input_sha256"]
     for name in ("final_request_id", "final_job_id"):
         identifier = value.get(name)
         if identifier:
@@ -1274,6 +1287,8 @@ def _seedance_recovery_value(value: Any = None) -> dict[str, Any]:
         "generation_origin": _generated_video_origin(source.get("generation_origin")) if task_id else {},
         "reference_lease_id": _reference_leases.lease_id(source.get("reference_lease_id")) if task_id else "",
     }
+    if task_id and re.fullmatch(r"[0-9a-f]{64}", str(source.get("render_input_sha256") or "")):
+        checkpoint["render_input_sha256"] = source["render_input_sha256"]
     if source.get("draft_action") in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}:
         checkpoint["draft_action"] = source["draft_action"]
         if source["draft_action"] == DRAFT_ACTION_FINAL and source.get("draft_final_resolution") in DRAFT_FINAL_RESOLUTIONS:
@@ -1466,6 +1481,7 @@ def _seedance_widget_value(
 def _seedance_draft_ui_value(value: Any = None) -> dict[str, Any]:
     source = value if isinstance(value, dict) else {}
     return {"visible": source.get("visible") is True,
+            "run_locked": source.get("run_locked") is True,
             "action": source.get("action") if source.get("action") in DRAFT_ACTION_CHOICES else DRAFT_ACTION_OFF,
             "preview_available": source.get("preview_available") is True,
             "final_available": source.get("final_available") is True,
@@ -5141,6 +5157,16 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 allowed_modes={ParameterMode.PROPERTY}, hide=True, hide_label=True, hide_property=True,
                 ui_options={"hide": True, "hide_property": True, "hide_label": True, "hide_handles": True},
             )
+            ParameterDict(
+                name=COMPLETED_RENDER_INPUTS_PARAMETER, default_value={},
+                allowed_modes={ParameterMode.PROPERTY}, hide=True, hide_label=True, hide_property=True,
+                ui_options={"hide": True, "hide_property": True, "hide_label": True, "hide_handles": True},
+            )
+            ParameterDict(
+                name=ONLY_REFERENCE_DIGESTS_PARAMETER, default_value={},
+                allowed_modes={ParameterMode.PROPERTY}, hide=True, hide_label=True, hide_property=True,
+                ui_options={"hide": True, "hide_property": True, "hide_label": True, "hide_handles": True},
+            )
             ParameterString(
                 name=DRAFT_OWNER_PARAMETER, default_value=str(uuid4()),
                 allowed_modes={ParameterMode.PROPERTY}, hide=True, hide_label=True, hide_property=True,
@@ -6101,11 +6127,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
         output_id = self.parameter_output_values.get("generation_id")
         resume_id = self.get_parameter_value("resume_generation_id")
-        candidates = (
-            (checkpoint_id, output_id, resume_id)
-            if checkpoint_requires_resolution
-            else (output_id, resume_id, checkpoint_id)
-        )
+        if checkpoint_requires_resolution:
+            candidates = (checkpoint_id, output_id, resume_id)
+        elif checkpoint_status in TERMINAL_FAILURE_STATUSES:
+            candidates = (resume_id, checkpoint_id, output_id)
+        else:
+            candidates = (output_id, resume_id, checkpoint_id)
         for candidate in candidates:
             task_id = str(candidate or "").strip()
             if not task_id:
@@ -6199,6 +6226,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "output_file": output_file,
                 "broker_server_url": broker_server_url,
                 "draft_action": previous.get("draft_action", source_params.get("draft_action")) if stage != "pre_submit" else source_params.get("draft_action"),
+                "render_input_sha256": (source_params.get("_hmb_render_input_sha256") if stage == "pre_submit" else
+                    previous.get("render_input_sha256") or source_params.get("_hmb_recovered_render_input_sha256")),
                 "draft_final_resolution": source_params.get("resolution") if stage == "pre_submit" else previous.get("draft_final_resolution"),
                 "draft_project": source_params.get("_hmb_draft_project", previous.get("draft_project")),
                 "draft_source": source_params.get("_hmb_draft_source", previous.get("draft_source")),
@@ -6990,6 +7019,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if terminal:
             return False
         if status in BROKER_SUCCESS_STATUSES or status == "succeeded":
+            # A saved Draft receipt can precede the final local_succeeded
+            # journal write. The dedicated Final already verified that receipt
+            # and its exact owner; its child must not retrieve the parent again.
+            final_context = self._active_draft_final_context()
+            parent = final_context.get("source", {}) if final_context else {}
+            if (parent.get("completed") is True and parent.get("draft_job_id") == checkpoint["task_id"]
+                    and checkpoint.get("task_identity") == "broker_task"):
+                return False
             # ``local_succeeded`` is persisted only after the remote result was
             # downloaded, decoded, verified, atomically published, and exposed
             # as this node's output.  Griptape does not reliably serialize the
@@ -7020,32 +7057,35 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
         return True
 
-    def _assert_new_submission_is_safe(self, *, explicit_run: bool = False) -> None:
-        """Unresolved history prevents automatic replay, not a fresh explicit Run.
+    def _retry_uses_existing_generation(self, checkpoint: Mapping[str, Any]) -> bool:
+        if not checkpoint.get("task_id"):
+            return False
+        if self._generation_recovery_blocks_new_submission():
+            return True
+        if checkpoint.get("status") not in TERMINAL_FAILURE_STATUSES:
+            return False
+        if self.get_parameter_value("resume_generation_id"):
+            return True
+        saved_digest = checkpoint.get("render_input_sha256")
+        if saved_digest:
+            try:
+                current_digest = self._render_authoring_digest()
+                return not current_digest or saved_digest == current_digest
+            except (ValueError, RuntimeError, TypeError, KeyError, AttributeError):
+                pass  # An unreadable upstream cannot authorize a replacement.
+        return True
 
-        The live run/refresh lock in ``aprocess`` still serializes this node.
-        Do not clear or mark the previous remote task terminal here: preflight
-        may fail, and Refresh must still be able to inspect the saved identity.
-        Only a validated new pre-submit checkpoint replaces that identity.
-        """
+    def _assert_new_submission_is_safe(self) -> None:
+        """A Run cannot supersede a task whose provider outcome is unknown."""
         if not self._generation_recovery_blocks_new_submission():
             return
         checkpoint = self._generation_recovery_state()
-        if explicit_run:
-            logger.warning(
-                "%s explicit Run supersedes unresolved task %s (%s). "
-                "The remote task was not cancelled; duplicate charges are possible. "
-                "No automatic resubmission is enabled.",
-                self.name, checkpoint["task_id"], checkpoint.get("status"),
-            )
-            return
         self._restore_generation_recovery_preview()
         raise RuntimeError(
             "A previously submitted Seedance task still requires confirmation. "
             f"Task ID: {checkpoint['task_id']}. Click Status > Refresh / Retrieve "
             "Result (or the central Existing Task Result button) to resolve this "
-            "same request first. A confirmed failed/cancelled/expired task or a "
-            "successfully retrieved video allows the next explicit Run. "
+            "same request first. "
             "A replacement render was not submitted."
         )
 
@@ -7789,7 +7829,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             projected = self._hmb_managed_prompt_projection()
             if projected is not None:
                 return projected
-        return super()._get_raw_parameter_value(param_name)
+        value = super()._get_raw_parameter_value(param_name)
+        if param_name in {"reference_images", VIDEO_REFERENCES_PARAMETER, "reference_audio"} and isinstance(value, list):
+            # The SDK tracks each object's id while saving the workflow, but
+            # produces temporary raw values for ParameterList. Keep the three
+            # lists alive so a video list cannot be serialized as an image list.
+            if not hasattr(self, "_hmb_native_reference_aggregates"):
+                self._hmb_native_reference_aggregates = {}
+            self._hmb_native_reference_aggregates[param_name] = value
+        return value
 
     def _hmb_refresh_managed_prompt_projection(
         self, *, source_node: Any = None, channel_uuid: str = "", shot_uuid: str = "", force: bool = False,
@@ -7815,6 +7863,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if projected is None:
             return False
         if not force and getattr(self, "parameter_values", {}).get("prompt") == projected:
+            if self.get_parameter_value(COMPLETED_RENDER_INPUTS_PARAMETER):
+                self._sync_seedance_shot_widget(emit_change=True)
             return False
         self._hmb_prompt_projection_syncing = True
         try:
@@ -8522,6 +8572,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         )
                 finally:
                     self._hmb_list_parent_syncing = False
+                if not initial_setup:
+                    self._manual_reference_reselected(value)
                 return
         parent = super().set_parameter_value
         if param_name == "model_id" and not initial_setup:
@@ -8554,6 +8606,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if param_name == "model_id" and not initial_setup:
                 with suppress(AttributeError):
                     del self._hmb_model_switch_previous_id
+        if not initial_setup and not previous_list_sync and (child_list_sync or param_name in _MANUAL_REFERENCE_FIELDS):
+            self._manual_reference_reselected(value)
         if param_name == "resolution" and initial_setup:
             self._hmb_resolution_initial_setup_seen = True
         if param_name == TASK_PARAMETER and initial_setup:
@@ -8863,6 +8917,19 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self._hmb_handle_preflight_command(value)
             return None
         authored_draft = self.get_parameter_value("draft_action")
+        if (parameter.name == "resolution" and value == "480p" and authored_draft == DRAFT_ACTION_OFF
+                and not self._hmb_draft_controls_syncing):
+            if _my_box_node.is_selected(self):
+                cp = self._hmb_my_box_controller().checkpoint()
+                saved = cp.get("render_input_sha256") if _my_box_node._preview_task_id(cp) else ""
+            else:
+                saved = self._draft_source_record().get("render_input_sha256")
+            if saved and self._matches_render_digest(saved, draft_action=DRAFT_ACTION_PREVIEW):
+                # The old resolution's Off-only dropdown is still installed
+                # inside this callback. Restore with the saved-action converter;
+                # the native resolution update below republishes the new menu.
+                self.set_parameter_value("draft_action", DRAFT_ACTION_PREVIEW, initial_setup=True, emit_change=False)
+                self.publish_update_to_parameter("draft_action", DRAFT_ACTION_PREVIEW)
         expected_resolution = "480p" if authored_draft == DRAFT_ACTION_PREVIEW else "1080p"
         if (parameter.name == "resolution" and str(value) != expected_resolution
                 and not self._hmb_draft_controls_syncing
@@ -9046,11 +9113,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self._hmb_generation_action_only_update = False
             if action_requested:
                 self._schedule_existing_generation_refresh()
-        if not self._hmb_shot_syncing and parameter.name in {"draft_action", "resolution", "draft_job_id", DRAFT_SOURCE_PARAMETER,
-                               DRAFT_SOURCES_PARAMETER, "model_id", SHOT_SELECTOR_PARAMETER,
-                               SEEDANCE_SHOT_WIDGET_PARAMETER,
-                               SHOT_UUID_PARAMETER, SHOT_CHANNEL_UUID_PARAMETER, BROKER_SERVER_URL_PARAMETER,
-                               ONLY_PROJECT_PARAMETER}:
+        header_changed = parameter.name in {"draft_action", "resolution", "draft_job_id", DRAFT_SOURCE_PARAMETER,
+            DRAFT_SOURCES_PARAMETER, "model_id", SHOT_SELECTOR_PARAMETER, SEEDANCE_SHOT_WIDGET_PARAMETER,
+            SHOT_UUID_PARAMETER, SHOT_CHANNEL_UUID_PARAMETER, BROKER_SERVER_URL_PARAMETER, ONLY_PROJECT_PARAMETER}
+        render_input_changed = parameter.name in _RENDER_AUTHORING_FIELDS | {SHOT_ASSET_INPUT_PARAMETER, SHOT_PICKER_INPUT_PARAMETER,
+            SHOT_SOUND_INPUT_PARAMETER, SHOT_FINISH_LOOK_INPUT_PARAMETER, "resume_generation_id"}
+        if not self._hmb_shot_syncing and (header_changed or render_input_changed and (
+                self.get_parameter_value(COMPLETED_RENDER_INPUTS_PARAMETER) or self.get_parameter_value(_my_box_node.CHECKPOINT_PARAMETER))):
             # A header selection must publish its final authoritative mode once
             # routing and native parameter visibility have settled. The generic
             # setter echo may still contain the incoming request's old revision.
@@ -9543,7 +9612,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             choices = [DRAFT_ACTION_OFF]
             if draft_state["preview_available"] or (draft_state["busy"] and draft_state["action"] == DRAFT_ACTION_PREVIEW):
                 choices.append(DRAFT_ACTION_PREVIEW)
-            if draft_state["final_available"] or (draft_state["busy"] and draft_state["action"] == DRAFT_ACTION_FINAL):
+            if (draft_state["final_available"] and not draft_state.get("run_locked")
+                    or draft_state["busy"] and draft_state["action"] == DRAFT_ACTION_FINAL):
                 choices.append(DRAFT_ACTION_FINAL)
             draft_parameter.ui_options = {**draft_parameter.ui_options, "simple_dropdown": choices}
         if draft_state["visible"]:
@@ -11748,6 +11818,237 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         owner = (source or {}).get("owner_id") or self._draft_owner_id()
         return ":".join((str(origin.get("channel_uuid") or "only"), str(origin.get("shot_uuid") or "only"), str(owner)))
 
+    @classmethod
+    def _local_reference_paths(cls, values: Any) -> dict[str, str]:
+        paths = {}
+        for value in values if isinstance(values, (tuple, list)) else (values,):
+            if value is None:
+                continue
+            try:
+                text = str(cls._coerce_reference_value(value))
+            except ValueError:
+                continue  # The normal media validator handles unsupported values.
+            local_uri = text.lower().startswith("file://")
+            if not text or ("://" in text and not local_uri) or text.lower().startswith(("https:", "http:", "data:", "asset:")):
+                continue
+            key = hashlib.sha256(os.path.normcase(os.path.normpath(text)).encode("utf-8")).hexdigest()
+            paths[key] = text
+        return paths
+
+    def _selected_manual_reference_paths(self) -> dict[str, str]:
+        if getattr(self, "_web_owner", None) is not None or not self._draft_only_mode():
+            return {}
+        model = self.get_parameter_value("model_id")
+        task = self.get_parameter_value(TASK_PARAMETER) or TASK_REFERENCE_TO_VIDEO
+        if MODEL_ID_ALIASES.get(model, model) != SEEDANCE_2_5_MODEL_ID:
+            task = INPUT_MODE_TASKS.get(self.get_parameter_value("input_mode"), task)
+        if task == TASK_TEXT_ONLY:
+            return {}
+        if task == TASK_FIRST_LAST_FRAME:
+            fields = ("first_frame", "last_frame")
+        else:
+            fields = ("reference_images", VIDEO_REFERENCES_PARAMETER, "reference_audio")
+        paths = {}
+        for field in fields:
+            values = self._get_list_input(field) if field in _MANUAL_REFERENCE_FIELDS[:3] else self.get_parameter_value(field)
+            if field == VIDEO_REFERENCES_PARAMETER and not values and not self._list_input_is_authoritative(field):
+                values = [self.get_parameter_value(name) for name in _MANUAL_REFERENCE_FIELDS[5:]]
+            paths.update(self._local_reference_paths(values))
+        return paths
+
+    def _manual_reference_reselected(self, value: Any) -> None:
+        if getattr(self, "_web_owner", None) is not None or not self._draft_only_mode():
+            return
+        selected = self._selected_manual_reference_paths()
+        previous = getattr(self, "_hmb_manual_reference_dirty", {})
+        requested = set(previous) | self._local_reference_paths(value).keys()
+        self._hmb_manual_reference_dirty = {key: path for key, path in selected.items() if key in requested}
+        self._hmb_manual_reference_revision = getattr(self, "_hmb_manual_reference_revision", 0) + 1
+        failures = getattr(self, "_hmb_manual_reference_errors", {})
+        self._hmb_manual_reference_errors = {key: error for key, error in failures.items() if key in selected and key not in requested}
+        if self._hmb_manual_reference_dirty:
+            self._schedule_manual_reference_check()
+        with suppress(Exception):
+            self._sync_seedance_shot_widget(emit_change=True)
+
+    @staticmethod
+    def _read_manual_reference_hashes(paths: dict[str, str]) -> dict[str, str]:
+        # File.resolve() uses the active Griptape project for relative paths.
+        # This worker performs only file I/O. No remote URL enters this path.
+        records = _web_rerender_reference_identity({"reference_images": list(paths.values())}, inspect_files=True)
+        return {key: row["content_sha256"] for key, row in zip(paths, records, strict=True)}
+
+    def _schedule_manual_reference_check(self) -> Any:
+        future = getattr(self, "_hmb_manual_reference_future", None)
+        if future is not None and not future.done():
+            return future
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            with suppress(Exception):
+                loop = GriptapeNodes.EventManager().event_loop
+                if loop is not None and loop.is_running():
+                    return self._dispatch_manual_reference_check(loop)
+            return None  # A synchronous host will start it before execution.
+        return self._dispatch_manual_reference_check(loop)
+
+    def _dispatch_manual_reference_check(self, loop: asyncio.AbstractEventLoop) -> Any:
+        self._hmb_manual_reference_future = asyncio.run_coroutine_threadsafe(self._check_manual_reference_files(), loop)
+        def finish(done):
+            if (not done.cancelled() and done.exception() is None and not getattr(self, "_hmb_node_deleted", False)
+                    and getattr(self, "_hmb_manual_reference_dirty", {}) and loop.is_running()
+                    and self._hmb_manual_reference_future is done):
+                loop.call_soon_threadsafe(self._schedule_manual_reference_check)
+        self._hmb_manual_reference_future.add_done_callback(finish)
+        return self._hmb_manual_reference_future
+
+    async def _check_manual_reference_files(self) -> None:
+        while dirty := getattr(self, "_hmb_manual_reference_dirty", {}):
+            revision = self._hmb_manual_reference_revision
+            try:
+                hashes = await asyncio.to_thread(self._read_manual_reference_hashes, dirty)
+                error = ""
+            except (OSError, ValueError, RuntimeError, KeyError, FileLoadError) as exc:
+                hashes = {}
+                error = f"Could not verify the selected local reference. Select the file again. {exc}"
+            if getattr(self, "_hmb_node_deleted", False):
+                return
+            if revision != self._hmb_manual_reference_revision:
+                continue  # A newer native edit owns the selection.
+            if hashes:
+                saved = self.get_parameter_value(ONLY_REFERENCE_DIGESTS_PARAMETER) or {}
+                selected = self._selected_manual_reference_paths()
+                current = {key: hashes.get(key, saved.get(key)) for key in selected if key in hashes or key in saved}
+                if current != saved:
+                    self.set_parameter_value(ONLY_REFERENCE_DIGESTS_PARAMETER, current, emit_change=False)
+            failures = getattr(self, "_hmb_manual_reference_errors", {}).copy()
+            for key in dirty:
+                if error:
+                    failures[key] = error
+                else:
+                    failures.pop(key, None)
+            self._hmb_manual_reference_errors = failures
+            self._hmb_manual_reference_dirty = {}
+            with suppress(Exception):
+                self._sync_seedance_shot_widget(emit_change=True)
+
+    def _manual_reference_unverified(self) -> bool:
+        dirty = getattr(self, "_hmb_manual_reference_dirty", {})
+        failures = getattr(self, "_hmb_manual_reference_errors", {})
+        return bool((dirty or failures) and self._selected_manual_reference_paths().keys() & (dirty.keys() | failures.keys()))
+
+    async def _await_manual_reference_content(self) -> None:
+        selected = self._selected_manual_reference_paths()
+        if not selected:
+            return
+        def raise_failed_selection():
+            for key, error in getattr(self, "_hmb_manual_reference_errors", {}).items():
+                if key in selected:
+                    raise ValueError(error)
+        raise_failed_selection()
+        saved = self.get_parameter_value(ONLY_REFERENCE_DIGESTS_PARAMETER) or {}
+        dirty = getattr(self, "_hmb_manual_reference_dirty", {})
+        missing = {key: path for key, path in selected.items() if key not in saved and key not in dirty}
+        if missing:
+            self._hmb_manual_reference_dirty = {**dirty, **missing}
+            self._hmb_manual_reference_revision = getattr(self, "_hmb_manual_reference_revision", 0) + 1
+        revision = getattr(self, "_hmb_manual_reference_revision", 0)
+        while getattr(self, "_hmb_manual_reference_dirty", {}):
+            await asyncio.shield(asyncio.wrap_future(self._schedule_manual_reference_check()))
+            if getattr(self, "_hmb_node_deleted", False):
+                raise ValueError("The Generator was closed during local reference verification.")
+            if revision != self._hmb_manual_reference_revision:
+                raise ValueError("The selected references changed during verification. Run with the current selection.")
+            raise_failed_selection()
+
+    def _include_manual_reference_content(self, authored: str, selected: dict[str, str]) -> str:
+        saved = self.get_parameter_value(ONLY_REFERENCE_DIGESTS_PARAMETER) or {}
+        hashes = {key: saved[key] for key in selected if key in saved}
+        return _web_rerender_digest([authored, hashes]) if hashes and authored else authored
+
+    def _render_authoring_digest(self, *, draft_action: str | None = None) -> str:
+        """Fingerprint the current authoring and selected Shot without reading media or running a node."""
+        try:
+            if self._manual_reference_unverified():
+                return ""
+            digest = self._read_render_authoring_digest(draft_action=draft_action)
+            if self.get_parameter_value(ONLY_REFERENCE_DIGESTS_PARAMETER) and self._draft_only_mode():
+                return self._include_manual_reference_content(digest, self._selected_manual_reference_paths())
+            return digest
+        except (ValueError, RuntimeError, TypeError, KeyError, AttributeError):
+            # Old workflows and unhydrated retained nodes can have unsupported
+            # display values. Only a trustworthy comparison may lock a control.
+            return ""
+
+    def _read_render_authoring_digest(self, *, draft_action: str | None) -> str:
+        values = {name: self.get_parameter_value(name) for name in _RENDER_AUTHORING_FIELDS}
+        if draft_action is not None:
+            values["draft_action"] = draft_action
+        identity = self._shot_identity()
+        values["shot"] = [identity.get("channel_uuid"), identity.get("shot_uuid")]
+        if identity.get("shot_uuid"):
+            agent = self._manual_agent_prompt_source()
+            read = getattr(agent, "_hmb_render_input_preview", None)
+            if callable(read):
+                preview = read(channel_uuid=identity["channel_uuid"], shot_uuid=identity["shot_uuid"])
+                if not preview:
+                    return ""
+                values["agent_inputs"] = preview
+            # Read the selected row only. Another Shot's edits and catalog
+            # revision changes do not invalidate a completed render.
+            for port in (SHOT_ASSET_INPUT_PARAMETER, SHOT_PICKER_INPUT_PARAMETER, SHOT_FINISH_LOOK_INPUT_PARAMETER, SHOT_SOUND_INPUT_PARAMETER):
+                snapshot = self.get_parameter_value(port)
+                if port == SHOT_ASSET_INPUT_PARAMETER and ((isinstance(snapshot, str) and snapshot)
+                        or (isinstance(snapshot, dict) and snapshot.get("schema") == "hmb-shot-asset-dependency")):
+                    publisher = self._exact_incoming_source(port, "SHOT_ASSET_OUT")
+                    digest = publisher._hmb_render_shot_media_digest(snapshot, channel_uuid=identity["channel_uuid"],
+                                                                     shot_uuid=identity["shot_uuid"])
+                    if not digest:
+                        return ""
+                    values[port] = digest
+                    continue
+                if isinstance(snapshot, dict) and snapshot.get("channel_uuid") == identity["channel_uuid"]:
+                    row = next((item for item in snapshot.get("shots", ()) if isinstance(item, dict)
+                        and item.get("shot_uuid") == identity["shot_uuid"]), None)
+                    if row is not None:
+                        values[port] = {key: val for key, val in row.items() if key not in {"revision", "number", "name"}}
+                        selected = set(row.get("selected_source_uids") or ())
+                        if selected:
+                            records = snapshot.get("ordered_assets") or snapshot.get("ordered_videos") or ()
+                            values[port]["selected_media"] = {
+                                record["source_uid"]: record.get("metadata", {}) for record in records
+                                if isinstance(record, dict) and record.get("source_uid") in selected
+                            }
+                            media = snapshot.get("media_by_source_uid") or {}
+                            values[port]["selected_references"] = {uid: media.get(uid) for uid in selected}
+        return _web_rerender_digest(values)
+
+    def _matches_render_digest(self, saved: Any, *, draft_action: str | None = None) -> bool:
+        if not saved:
+            return False
+        return saved == self._render_authoring_digest(draft_action=draft_action)
+
+    def _matching_completed_render(self, draft_source: dict[str, Any] | None = None) -> bool:
+        if getattr(self, "_web_owner", None) is not None or self.get_parameter_value("resume_generation_id"):
+            return False
+        records = self.get_parameter_value(COMPLETED_RENDER_INPUTS_PARAMETER)
+        saved = records.get(self._draft_source_key()) if isinstance(records, dict) and records else None
+        draft = self._draft_source_record() if draft_source is None else draft_source
+        hashes = {item for item in (saved, draft.get("render_input_sha256")) if isinstance(item, str) and item}
+        if not hashes:
+            return False
+        return self._render_authoring_digest() in hashes
+
+    def _remember_completed_render(self, checkpoint: dict[str, Any]) -> None:
+        digest = checkpoint.get("render_input_sha256")
+        if not digest or checkpoint.get("draft_action") == DRAFT_ACTION_FINAL or getattr(self, "_web_owner", None) is not None:
+            return
+        history = self.get_parameter_value(COMPLETED_RENDER_INPUTS_PARAMETER)
+        records = dict(history) if isinstance(history, dict) else {}
+        origin = {"generation_origin": checkpoint.get("generation_origin") or {}}
+        records[self._draft_source_key(origin)] = digest
+        self.set_parameter_value(COMPLETED_RENDER_INPUTS_PARAMETER, dict(list(records.items())[-64:]), emit_change=False)
+
     def _store_draft_source(self, value: dict[str, Any]) -> None:
         # Web-created Drafts belong to their server operation journal. Never
         # publish them as native one-use Final sources on the retained node.
@@ -11968,10 +12269,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return False
 
     async def _poll_draft_final_server_state(self, source: dict[str, Any], identity: tuple[str, ...]) -> None:
-        while self._runtime_node_is_live(require_registered=True):
+        task = asyncio.current_task()
+        while self._runtime_node_is_live(require_registered=True) and not task.cancelling():
             try:
                 if (self._draft_source_record().get("draft_job_id") != source["draft_job_id"]
-                        or self._draft_final_status_identity(source) != identity):
+                        or self._draft_final_status_identity(source) != identity
+                        or source.get("render_input_sha256") and not self._matches_render_digest(source["render_input_sha256"])):
                     return
                 state = await self._query_draft_final_server_state(source)
             except asyncio.CancelledError:
@@ -11983,6 +12286,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 with suppress(Exception):
                     if not self._apply_draft_final_server_state(source, identity, state):
                         return
+            # A completed lookup can race cancellation of asyncio.wait_for
+            # on older supported engines. Never re-arm a cancelled poller.
+            if task.cancelling():
+                return
             with suppress(Exception):
                 self._sync_seedance_shot_widget(emit_change=True)
             if _draft_final_settled(state):
@@ -12025,6 +12332,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         record = _seedance_draft_source_value(source if source is not None else self._draft_source_record())
         if not record:
             raise ValueError("Complete a Draft for this Shot before finalizing.")
+        if self._manual_reference_unverified():
+            raise ValueError("Verify the selected local references before finalizing.")
+        if record.get("render_input_sha256") and not self._matches_render_digest(record["render_input_sha256"]):
+            raise ValueError("Restore the completed Draft's original inputs and settings before finalizing.")
         if record.get("owner_id") and record["owner_id"] != self._draft_owner_id():
             raise ValueError("This Draft belongs to a different Generator.")
         if record.get("generation_origin"):
@@ -12072,6 +12383,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         resolution = str(self.get_parameter_value("resolution") or "")
         action = self.get_parameter_value("draft_action") or DRAFT_ACTION_OFF
         source = self._draft_source_record() if supported else {}
+        run_locked = self._matching_completed_render(source)
+        verifying = self._manual_reference_unverified()
+        if run_locked:
+            checkpoint = self._generation_recovery_state()
+            run_locked = not checkpoint.get("task_id") or checkpoint.get("stage") == "local_succeeded"
+        if verifying or (source.get("render_input_sha256") and not self._matches_render_digest(source["render_input_sha256"])):
+            source = {}
         busy = bool(self._generation_run_active.is_set() or self._generation_refresh_running
                     or getattr(self, "_hmb_draft_finalize_pending", False))
         active_action = getattr(self, "_hmb_active_draft_action", DRAFT_ACTION_OFF) if busy else DRAFT_ACTION_OFF
@@ -12130,6 +12448,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if final_busy and source_completed and pending.get("draft_job_id") == source["draft_job_id"]:
             selected_final = pending.get("final_resolution") or selected_final
         return _seedance_draft_ui_value({"visible": supported and (resolution == "480p" or bool(source)),
+            "run_locked": (run_locked or (verifying and not self.get_parameter_value("resume_generation_id")
+                and not self._generation_recovery_blocks_new_submission())) and not busy,
             "action": action if supported else DRAFT_ACTION_OFF,
             "preview_available": supported and resolution == "480p" and not busy,
             "final_available": final_available, "job_id": source.get("draft_job_id", ""),
@@ -14078,8 +14398,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "its recovery window without confirming a failed or unsubmitted render. "
             "The task ID was retained. Use Status > Refresh / Retrieve Result for "
             "this same task, or ask the Broker administrator to reconcile its provider "
-            "record. A new explicit Run with Resume Task ID empty submits a separate "
-            "render without cancelling the previous task; duplicate charges are possible."
+            "record. Run also checks this existing request."
         ) + ("\nServer details: " + safe_detail if safe_detail else "")
 
     def _set_broker_task_outputs(
@@ -15214,6 +15533,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "succeeded",
             generation_id=generation_id,
         )
+        self._remember_completed_render(recovery_at_download)
         completed_draft_source = {}
         if recovery_at_download.get("draft_action") == DRAFT_ACTION_PREVIEW:
             completed_draft_source = _seedance_draft_source_value({
@@ -15223,6 +15543,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "generation_origin": completed_origin,
                 "owner_id": self._draft_owner_id(),
                 "completed": True,
+                "render_input_sha256": recovery_at_download.get("render_input_sha256"),
                 "created_at_ms": recovery_at_download.get("draft_started_at_ms") or recovery_at_download.get("updated_at_ms"),
                 "source_bindings": recovery_at_download.get("draft_source_bindings", {}),
             })
@@ -15418,7 +15739,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
         return True
 
-    async def _refresh_async(self) -> None:
+    async def _refresh_async(self, *, from_active_run: bool = False) -> None:
         """Refresh one Broker job without ever creating a replacement task."""
         if _my_box_node.is_selected(self) or self._hmb_my_box_existing_task():
             await self._hmb_my_box_controller().run(refresh=True)
@@ -15428,7 +15749,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # A running generation already owns automatic polling.  Mixing a
         # manual refresh into it can race output publication even though both
         # operations target the same server job.
-        if self._generation_run_active.is_set():
+        if self._generation_run_active.is_set() and not from_active_run:
             return
         generation_id = ""
         operation_phase = "broker_lookup"
@@ -15565,6 +15886,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 ),
             )
             if not preserve_local_success:
+                if (status in TERMINAL_FAILURE_STATUSES and same_task
+                        and not recovery_contract.get("render_input_sha256")):
+                    # Establish a legacy signature only after a confirmed failed lookup.
+                    with suppress(ValueError, RuntimeError, TypeError, KeyError, AttributeError):
+                        refresh_params["_hmb_recovered_render_input_sha256"] = self._render_authoring_digest()
                 self._set_generation_recovery_checkpoint(
                     stage=(
                         "remote_succeeded"
@@ -15624,8 +15950,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     was_successful=False,
                     result_details=self._broker_terminal_failure_message(
                         task, generation_id
-                    ) + " The task is confirmed terminal. The next explicit Run "
-                    "can start a new render; Refresh did not submit one.",
+                    ) + " The task is confirmed terminal. No replacement render was submitted.",
                 )
                 return
             self.status_component.clear_execution_status(
@@ -15914,33 +16239,21 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if (requested_resume_id
                 and await self._reuse_saved_generation_result(requested_resume_id, recovery_before_run)):
             return
-        if (
-            requested_resume_id
-            and requested_resume_id == recovery_before_run.get("task_id")
-            and not self._generation_recovery_blocks_new_submission()
-        ):
-            # Saved pre-patch workflows can still contain a Resume ID whose
-            # confirmed failure was already recorded. Run starts fresh; Refresh
-            # remains available for inspecting that preserved terminal record.
-            self._retire_failed_resume_id(
-                {
-                    "id": requested_resume_id,
-                    "status": recovery_before_run.get("status"),
-                },
-                requested_resume_id,
-            )
-            requested_resume_id = str(
-                self.get_parameter_value("resume_generation_id") or ""
-            ).strip()
+        matching_resume = bool(requested_resume_id and requested_resume_id == recovery_before_run.get("task_id"))
+        if (not matching_resume or recovery_before_run.get("status") in TERMINAL_FAILURE_STATUSES) and self._retry_uses_existing_generation(recovery_before_run):
+            await self._refresh_async(from_active_run=True)
+            return
+        if not requested_resume_id and not self._draft_final_requested() and self._matching_completed_render():
+            return
+        if not requested_resume_id and (not self._draft_final_requested() or self._manual_reference_unverified()):
+            await self._await_manual_reference_content()
+            if not self._draft_final_requested() and self._matching_completed_render():
+                return
         if not requested_resume_id or (
             self._generation_recovery_blocks_new_submission()
             and requested_resume_id != recovery_before_run.get("task_id")
         ):
-            # Run without an explicit Resume ID means a fresh render, even if
-            # an older request is still unknown/running remotely. This is not
-            # a retry loop: one new client key and at most one create per Run.
-            # An explicit Resume remains a same-task, non-billable lookup.
-            self._assert_new_submission_is_safe(explicit_run=not requested_resume_id)
+            self._assert_new_submission_is_safe()
         self._set_safe_defaults()
         self._begin_generation_preview()
         self._set_generation_status("resolving_inputs", generation_id="")
@@ -15955,6 +16268,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             # billable Broker create-task request. Prompt text remains manual.
             params = self._resolve_exact_shot_generation_inputs(params)
             if not isinstance(self, _HMBWebRerenderExecution):
+                params["_hmb_render_input_sha256"] = self._render_authoring_digest()
                 selection = params.get("_hmb_imageasset_project_selection")
                 if not isinstance(selection, dict):
                     raise ValueError("A verified selected ImageAsset project is required before rendering.")
@@ -16544,8 +16858,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 raise TimeoutError(
                     f"FN AI Broker task {generation_id} did not finish within "
                     f"{timeout} seconds. The server render continues; use Refresh / "
-                    "Retrieve Result to check this same ID. A new explicit Run submits "
-                    "a separate render and may incur duplicate charges."
+                    "Retrieve Result to check this same ID. Run also checks this task."
                 )
 
             requested_generation_id = generation_id
@@ -16981,11 +17294,27 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             await self._hmb_my_box_controller().run(final=(MODEL_ID_ALIASES.get(raw_model, raw_model) == SEEDANCE_2_5_MODEL_ID
                 and self.get_parameter_value("draft_action") == DRAFT_ACTION_FINAL))
             return
-        self._clear_execution_status()
         self._hmb_expected_agent_result = None
         self._hmb_agent_submission_prompt = None
         self._hmb_managed_agent_request = None
         try:
+            recovery = self._generation_recovery_state()
+            if self._retry_uses_existing_generation(recovery):
+                resume_id = str(self.get_parameter_value("resume_generation_id") or "").strip()
+                if resume_id == recovery["task_id"] and recovery["status"] not in TERMINAL_FAILURE_STATUSES:
+                    # Explicit Resume validates the frozen output destination
+                    # before contacting the Broker, including Draft retrievals.
+                    await self._process_generation()
+                else:
+                    await self._refresh_async(from_active_run=True)
+                return
+            if not self._draft_final_requested() and self._matching_completed_render():
+                return
+            if not self.get_parameter_value("resume_generation_id") and (not self._draft_final_requested() or self._manual_reference_unverified()):
+                await self._await_manual_reference_content()
+                if not self._draft_final_requested() and self._matching_completed_render():
+                    return
+            self._clear_execution_status()
             try:
                 await self._await_local_render_preflight()
             except Exception as exc:
@@ -17076,7 +17405,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 elif terminal:
                     safe_message += (
                         f"\nExisting task ID: {generation_id}. This Broker job is "
-                        "terminal. The next explicit Run can start a new render. "
+                        "terminal. Run with unchanged inputs checks this same task. "
                         "Refresh / Retrieve Result only retrieves the same "
                         "final state; it does not resume, restart, or duplicate "
                         "a render. No automatic render was submitted."
@@ -17085,10 +17414,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     safe_message += (
                         f"\nExisting task ID: {generation_id}. The server render can "
                         "continue after a disconnect. Use Refresh / Retrieve Result to "
-                        "check this same task without creating a duplicate. A new "
-                        "explicit Run with Resume Task ID empty submits a separate "
-                        "render; the previous task is not cancelled and duplicate "
-                        "charges are possible."
+                        "check this same task. Run also checks this existing task."
                     )
             if submission_unknown:
                 if not self._runtime_node_is_live(require_registered=True):
@@ -17102,9 +17428,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "\nRefresh / Retrieve Result checks the same client request ID "
                     "only. It never repeats the create-task request or creates a new "
                     "idempotency key."
-                    "\nA new explicit Run with Resume Task ID empty submits a separate "
-                    "render. The previous task is not cancelled; duplicate charges "
-                    "are possible. No automatic resubmission was performed."
+                    "\nRun checks this same request. No automatic resubmission was performed."
                     "\nTemporary local video uploads are being retained for up to "
                     "30 minutes so an accepted remote task can still fetch them."
                 )
@@ -17161,6 +17485,16 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "_hmb_sound_provenance", "_hmb_sound_reference_bindings",
                 "_hmb_analysis_media_bindings", "_hmb_analysis_video_references")
         return self._canonical_sha256({key: params.get(key) for key in keys})
+
+    @staticmethod
+    def _assert_managed_prompt_current(source, record, *, channel_uuid, shot_uuid):
+        expected = record.get("upstream_intent_sha256")
+        if not expected:
+            return
+        scope = dict(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
+        owner = source._hmb_manager_prompt_owner(**scope)
+        if source._hmb_managed_prompt_input_digest(owner, **scope) != expected:
+            raise _AgentResultUnavailable("The selected Shot Prompt or Analysis changed. Run this Shot again; no render was submitted.")
 
     async def _prepare_managed_agent_shot(self) -> None:
         """Pull one exact Shot from a manager without executing sibling Agents.
@@ -17232,6 +17566,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
         if not isinstance(record, dict) or not isinstance(record.get("result"), dict):
             raise _AgentResultUnavailable("The Shot Agent returned no completed result. No render was submitted.")
+        HMBSeedanceGeneration._assert_managed_prompt_current(source, record, channel_uuid=channel, shot_uuid=shot)
         # Display name/number may legitimately change after the worker returns.
         # The frozen ticket stays byte-for-byte intact; current catalog metadata
         # supplies the submission label, while immutable UUIDs own the result.
@@ -17275,6 +17610,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if isinstance(managed, dict):
             if source is not managed["source"]:
                 raise _AgentResultUnavailable("Agent manager connection changed before submission.")
+            HMBSeedanceGeneration._assert_managed_prompt_current(source, managed["record"],
+                channel_uuid=managed["channel_uuid"], shot_uuid=managed["shot_uuid"])
             getter = getattr(source, "_hmb_agent_shot_result", None)
             if not callable(getter):
                 raise _AgentResultUnavailable("The Shot Agent result is unavailable.")

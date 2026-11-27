@@ -117,6 +117,12 @@ def main() -> None:
     assert all(set(row).isdisjoint({"path", "selector", "visible_prompt", "machine_prompt"}) for row in public)
     source = node._hmb_analysis_reference_for(channel_uuid=CHANNEL, shot_uuid=SHOT, kind="image", source_id=records[0]["source_id"])
     assert source["path"] == IMAGE_PATHS[0]
+    changed_paths = [IMAGE_PATHS[1], IMAGE_PATHS[0], IMAGE_PATHS[2]]
+    changed = HMBPromptLibrary._hmb_project_analysis_sources(STATE, changed_paths, VIDEO_PATHS, SOUND)
+    bound = node._hmb_find_analysis_reference(changed, "image", source["source_binding"])
+    assert bound["path"] == changed_paths[0] and bound["source_id"] != source["source_id"]
+    assert not node._hmb_find_analysis_reference(changed[1:], "image", source["source_binding"])
+    assert not node._hmb_find_analysis_reference(changed + [changed[0]], "image", source["source_binding"])
     assert not node._hmb_analysis_reference_for(channel_uuid=CHANNEL, shot_uuid=OTHER, kind="image", source_id=records[0]["source_id"])
     assert not node._hmb_analysis_reference_for(channel_uuid=CHANNEL, shot_uuid=SHOT, kind="video", source_id=records[0]["source_id"])
     assert not node._hmb_analysis_reference_for(channel_uuid=CHANNEL, shot_uuid=SHOT, kind="image",

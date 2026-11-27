@@ -177,6 +177,7 @@ class HMBSoundLibrary(DataNode):
         self._seen_commands: list[str] = []
         self._source_nodes: dict[str, Any] = {}
         self._image_project_source = None
+        self._resolved_sound_inputs = None
         self._context_epoch = 0
         self._scan_requested_root = ""
         self._scan_finished_root = ""
@@ -289,11 +290,74 @@ class HMBSoundLibrary(DataNode):
         saved.update(busy=False, ack_command_id="", status="저장된 사운드 복원 완료", error_code="")
         return saved
 
+    @staticmethod
+    def _sound_shot_roster(catalog: dict[str, Any]) -> tuple:
+        roster = tuple((row["shot_uuid"], row["number"], row["name"]) for row in catalog.get("shots", ()))
+        return catalog.get("channel_uuid"), catalog.get("publisher_instance_uuid"), roster
+
+    def _sound_completion_inputs(self) -> tuple:
+        state = self._state_sound
+        return (state["project_id"], state["project_root"], state["project_uid"], state["channel_uuid"],
+                self._catalog_available, self._sound_shot_roster(state["shot_catalog"]),
+                state["tracks"], self._site_profile.get("revision"),
+                self._sound_preparing, self._sound_preparation_error)
+
+    def _wired_image_catalog(self) -> Any:
+        try:
+            workflow = getattr(self, "_workflow", None)
+            connections = workflow.flows.connections if workflow is not None else self.engine.flow_manager.get_connections()
+            edges = connections.get_incoming_connections_to_parameter(self, self.get_parameter_by_name(CATALOG_IN))
+            if len(edges) == 1 and edges[0].source_parameter.name == "SHOT_ASSET_OUT":
+                source = edges[0].source_node
+                if (type(source).__name__ == "HMBImageAssetLibrary" and not getattr(source, "_hmb_node_deleted", False)
+                        and (self._image_project_source is None or source is self._image_project_source)):
+                    return source
+        except (AttributeError, KeyError, ValueError, RuntimeError):
+            pass
+        return None
+
+    def _completed_image_source(self) -> Any:
+        receipt = getattr(self, "_resolved_sound_inputs", None)
+        if (not receipt or self._hmb_node_deleted or self._sound_preparing or self._sound_preparation_error
+                or getattr(getattr(self, "state", None), "name", "") != "RESOLVED"):
+            return None
+        source = self._wired_image_catalog()
+        with self._lock:
+            if source is receipt[0] and source is not None and self._sound_completion_inputs() == receipt[1]:
+                return source
+        return None
+
+    def make_node_unresolved(self, current_states_to_trigger_change_event: Any = None) -> None:
+        # The SDK unresolves an entire downstream data graph after a native
+        # parameter edit, even when a consumer only depends on its catalog.
+        # Skip only a proven image-only edit in the same dispatch and graph.
+        try:
+            from griptape_nodes.retained_mode.managers.event_manager import current_request_id, current_request_type
+            event_states = {getattr(state, "name", "") for state in current_states_to_trigger_change_event or ()}
+            if (event_states == {"RESOLVED", "RESOLVING"}
+                    and getattr(current_request_type(), "__name__", "") == "SetParameterValueRequest"
+                    and (request_id := current_request_id())):
+                source = self._completed_image_source()
+                if source is not None and request_id == getattr(source, "_hmb_sound_unchanged_image_request_id", None):
+                    return
+        except (AttributeError, ImportError, KeyError, RuntimeError, TypeError, ValueError):
+            pass
+        self._resolved_sound_inputs = None
+        super().make_node_unresolved(current_states_to_trigger_change_event=current_states_to_trigger_change_event)
+
     @hmb_binding_mutation
     def set_parameter_value(self, name: str, value: Any, *args: Any, **kwargs: Any) -> Any:
         lock = getattr(self, "_lock", None)
         if lock is None:
             return super().set_parameter_value(name, value, *args, **kwargs)
+        if name == CATALOG_IN and not kwargs.get("initial_setup") and isinstance(value, str) and value:
+            source = self._completed_image_source()
+            if source is not None and value == getattr(source, "_hmb_sound_unchanged_image_token", None):
+                # This hidden trigger carries image media revisions. Sound's
+                # actual catalog arrives separately via _hmb_reconcile_shot_routing.
+                # An equal audio dependency should not dirty Sound a second
+                # time in the SDK's nested (id-less) propagation request.
+                return None
         restored_state = False
         with lock:
             if name == UI and isinstance(value, dict) and "__hmb_sound_command" in value:
@@ -573,12 +637,13 @@ class HMBSoundLibrary(DataNode):
             self._image_project_source = context.get("source")
             self._catalog_available = bool(catalog)
             if state["shot_catalog"] != catalog or changed:
+                if changed or self._sound_shot_roster(state["shot_catalog"]) != self._sound_shot_roster(catalog):
+                    state["revision"] += 1
                 state["shot_catalog"] = catalog
                 selected = _normalize_shot_selection(state["shot"], catalog)
                 if catalog and not selected.get("shot_uuid"):
                     selected = {"channel_uuid": channel, **{key: catalog["shots"][0][key] for key in ("shot_uuid", "number", "name")}}
                 state["shot"] = selected if catalog else default_state()["shot"]
-                state["revision"] += 1
             if changed or owner_changed:
                 self._context_epoch += 1
                 self._generation += 1
@@ -1052,9 +1117,10 @@ class HMBSoundLibrary(DataNode):
             self._state_sound["shot_catalog"] = catalog
             self._state_sound["shot"] = _normalize_shot_selection(self._state_sound["shot"], catalog)
             self._catalog_available = True
-            if previous != catalog:
+            roster_changed = self._sound_shot_roster(previous) != self._sound_shot_roster(catalog)
+            if roster_changed:
                 self._state_sound["revision"] += 1
-            self._publish(notify=False)
+            self._publish(notify=False, outputs=roster_changed)
 
     def _hmb_clear_shot_routing_catalog(self, reason: str = "publisher_unavailable") -> dict[str, Any]:
         with self._lock:
@@ -1156,4 +1222,9 @@ class HMBSoundLibrary(DataNode):
         return getattr(super(), "after_node_deleted", lambda *_a, **_k: None)(*args, **kwargs)
 
     def process(self):
+        self._resolved_sound_inputs = None
         self._publish()
+        source = self._wired_image_catalog()
+        with self._lock:
+            if source is not None and not self._hmb_node_deleted and not self._sound_preparing and not self._sound_preparation_error:
+                self._resolved_sound_inputs = source, copy.deepcopy(self._sound_completion_inputs())

@@ -24,7 +24,8 @@ import threading
 import time
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+ROOT = Path(os.environ.get("HMB_MODE_TEST_LIBRARY_ROOT") or Path(__file__).resolve().parents[2]).resolve()
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("HMB_GRIPTAPE_STANDARD_LIBRARY_PATH", str(
     Path.home() / "Documents/GriptapeNodes/libraries/griptape-nodes-library-standard"))
@@ -610,6 +611,57 @@ async def exercise(engine):
         assert manager.metadata["size"] == {"width": 811, "height": 777}
         print("PASS real Prompt1/Agent1/Finish1 to five Generators: exact per-Shot Beauty at every mocked render boundary, literal prompt/480p retained; user resize never forced")
 
+        from HMBAnalysisAgent import HMBAnalysisAgent, _notify_prompt_media_changed
+        from HMBSoundLibrary import HMBSoundLibrary
+        from HMBVideoPickerLibrary import HMBVideoPickerLibrary
+        independent = [HMBVideoPickerLibrary(name="Unchanged Video Picker"),
+                       HMBSoundLibrary(name="Unchanged Sound"),
+                       HMBAnalysisAgent(name="Unchanged Video Analyst")]
+        for node in independent:
+            register(node)
+        await resolve(independent)
+        await resolve(generators)
+        resolved, stale = NodeResolutionState.RESOLVED, NodeResolutionState.UNRESOLVED
+        chain = [source, prompt, manager, *generators]
+        assert all(node.state == resolved for node in chain + independent)
+        events.clear()
+        scope = (prompt, CHANNEL, SHOTS[0]["shot_uuid"])
+        _notify_prompt_media_changed(*scope, changed_role="after")
+        assert [node.state for node in chain] == [resolved, resolved, stale, stale, *([resolved] * 4)]
+        assert all(node.state == resolved for node in independent) and not events, ([n.state for n in independent], events)
+        await resolve([generators[0]])
+        assert all(n == 1 for _, n, _ in events), events
+        # Native run scheduling dirties siblings of a shared Agent. Establish
+        # the original five completed badges again before testing the next edit.
+        await resolve(generators)
+        assert all(node.state == resolved for node in chain + independent)
+        events.clear()
+        _notify_prompt_media_changed(*scope, changed_role="before")
+        assert [node.state for node in chain] == [resolved, stale, stale, stale, *([resolved] * 4)], [n.state for n in chain]
+        assert all(node.state == resolved for node in independent) and not events, ([n.state for n in independent], events)
+        await resolve([generators[0]])
+        events.clear()
+        state = source._current_state()
+        routing_state = deepcopy(state["shot_routing"])
+        edited_shot = routing_state["shots"][0]
+        edited_shot["selected_source_uids"].append(state["assets"][1]["source_uid"])
+        edited_shot.update(revision=edited_shot["revision"] + 1, media_count=0, metadata_sha256="", media_sha256="")
+        routing_state["generation"] += 1
+        edit = {"schema": image_module.IMAGE_ASSET_EDIT_SCHEMA, "version": 1,
+                image_module.WIDGET_RUNTIME_LEASE_KEY: source._hmb_widget_runtime_lease,
+                image_module.UI_EDIT_REVISION_KEY: state[image_module.UI_EDIT_REVISION_KEY] + 1,
+                "catalog_identity": {field: state[field] for field in image_module.IMAGE_ASSET_EDIT_CATALOG_FIELDS},
+                "selected_source_uids": [row["source_uid"] for row in state["assets"]],
+                "edits": {"shot_routing": routing_state}}
+        changed = await engine.ahandle_request(SetParameterValueRequest(node_name=source.name,
+            parameter_name=image_module.WIDGET_STATE_PARAMETER, value=json.dumps(edit), data_type="str"),
+            result_context={"request_id": "desktop-edit-image-selection-1"})
+        assert changed.succeeded(), changed.result_details
+        assert source._hmb_sound_unchanged_image_request_id == "desktop-edit-image-selection-1"
+        assert all(node.state == stale for node in chain)
+        assert all(node.state == resolved for node in independent) and not events, ([n.state for n in independent], events)
+        print("PASS native green checks: image edit invalidates its downstream DAG, independent Video/Sound/Analysis stay resolved; before/after Analysis invalidates exact Shot recipients; no model or render on edit")
+
     print("HMB_MULTISHOT_MANAGER_HOST=PASS (real DAG; one Prompt; one Agent; five Shot rows; native ParameterList/schema isolation; five concurrent intents; single selection; rerender; Resume/Final Agent zero; failure/cancel isolation; editor switch; signed v7 policy; 480p retained)")
 
 
@@ -625,8 +677,9 @@ def main():
             logging.disable(logging.CRITICAL)
             try:
                 from griptape_nodes.retained_mode.engine import engine_scope
+                from hmb_host_workflow import run_in_fixture_workflow
                 with engine_scope() as engine:
-                    asyncio.run(exercise(engine))
+                    asyncio.run(run_in_fixture_workflow(engine, "OfflineMultishotManagers", exercise))
             finally:
                 os.chdir(previous)
 

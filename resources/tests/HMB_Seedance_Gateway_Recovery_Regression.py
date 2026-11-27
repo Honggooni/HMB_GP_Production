@@ -232,13 +232,10 @@ async def verify_recovery():
     # A different explicit Resume must not discard an unresolved paid task.
     guarded = node_with_checkpoint()
     guarded.set_parameter_value("resume_generation_id", "job-unrelated")
-    with mock.patch.object(guarded, "_ensure_broker_connected", side_effect=AssertionError("wrong Resume reached Broker")):
-        try:
-            await guarded._process_generation_impl()
-        except RuntimeError as exc:
-            assert "still requires confirmation" in str(exc)
-        else:
-            raise AssertionError("Resume replaced an unresolved ID")
+    bridge = ResponseBridge({"status": "running", "job_id": "hmb-client-key"})
+    guarded._ensure_broker_connected = mock.AsyncMock(return_value=bridge)
+    await guarded._process_generation_impl()
+    assert bridge.lookups == ["hmb-client-key"] and bridge.create_count == 0
     assert guarded._generation_recovery_state()["task_id"] == "hmb-client-key"
 
     # Explicit same-key Resume promotes to canonical ID; a normal independent

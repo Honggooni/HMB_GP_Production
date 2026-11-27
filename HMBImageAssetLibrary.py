@@ -9178,6 +9178,8 @@ def _shot_asset_metadata(
             "image_source_frame_range": True,
         },
     }
+    if asset.get("media_signature"):
+        metadata["media_signature"] = _clean(asset["media_signature"])
     return metadata
 
 
@@ -9347,6 +9349,7 @@ def _apply_shot_routing_state_facts(
 
 _OUTPUT_FINGERPRINT_ASSET_FIELDS = (
     "asset_library_id",
+    "media_signature",
     "source_uid",
     "import_source_uid",
     "source_kind",
@@ -11281,8 +11284,16 @@ class HMBImageAssetLibrary(DataNode):
         self._hmb_shot_routing_input_identity = input_identity
         self._hmb_shot_routing_generation = generation
         self._hmb_shot_routing_cache = snapshot
+        self._hmb_render_shot_media_digests = (snapshot, {})
         _apply_shot_routing_state_facts(state, snapshot)
         return snapshot
+
+    @property
+    def _hmb_sound_unchanged_image_token(self):
+        """The live projection for the last admitted image-only editor request."""
+        if getattr(self, "_hmb_sound_unchanged_image_request_id", None):
+            return self.parameter_output_values.get(SHOT_ASSET_OUTPUT_PARAMETER)
+        return None
 
     @staticmethod
     def _shot_asset_dependency_token(snapshot: Dict[str, Any]) -> str:
@@ -11302,6 +11313,36 @@ class HMBImageAssetLibrary(DataNode):
                 "shot_count": len(snapshot.get("shots") or []),
             }
         )
+
+    def _hmb_render_shot_media_digest(self, token: Any, *, channel_uuid: str, shot_uuid: str) -> str:
+        """Read only the published snapshot's selected image identities. Never resolve files here."""
+        snapshot = getattr(self, "_hmb_shot_routing_cache", None)
+        dependency = _parse_mapping(token)
+        if (getattr(self, "_hmb_node_deleted", False) or not isinstance(snapshot, dict)
+                or dependency.get("schema") != "hmb-shot-asset-dependency"
+                or channel_uuid != dependency.get("channel_uuid") or channel_uuid != snapshot.get("channel_uuid")
+                or snapshot.get("publisher_instance_uuid") != dependency.get("publisher_instance_uuid")):
+            return ""
+        cached = getattr(self, "_hmb_render_shot_media_digests", None)
+        if not cached or cached[0] is not snapshot:
+            cached = (snapshot, {})
+            self._hmb_render_shot_media_digests = cached
+        digests = cached[1]
+        if shot_uuid not in digests:
+            shots = [row for row in snapshot["shots"] if row["shot_uuid"] == shot_uuid]
+            if len(shots) != 1:
+                return ""
+            signatures = {row["source_uid"]: row["metadata"].get("media_signature", "")
+                          for row in snapshot["ordered_assets"]}
+            media = snapshot["media_by_source_uid"]
+            members = shots[0]["selected_source_uids"]
+            if any(uid not in media or uid not in signatures for uid in members):
+                return ""
+            # Master selection order and publication clocks also change when a sibling Shot is edited.
+            # Only the exact Shot's order, identity, original reference and content belong in this digest.
+            digests[shot_uuid] = _sha256_canonical([snapshot["project_id"], _shot_media_descriptors(members, media),
+                                                    [signatures[uid] for uid in members]])
+        return digests[shot_uuid]
 
     def _hmb_shot_routing_snapshot(
         self,
@@ -12170,6 +12211,26 @@ class HMBImageAssetLibrary(DataNode):
         serialized: str = "",
     ) -> None:
         normalized_state[WIDGET_RUNTIME_LEASE_KEY] = self._hmb_widget_runtime_lease
+        routing = normalized_state["shot_routing"]
+        shots = routing["shots"]
+        sound_roster = (normalized_state["project_root"], normalized_state.get("project_uid"),
+                        normalized_state.get("project_id"), normalized_state.get("project_cache_uid"),
+                        routing["publisher_instance_uuid"], routing["channel_uuid"], routing["active_shot_uuid"],
+                        tuple((row["shot_uuid"], row["number"], row["name"]) for row in shots))
+        image_order = tuple(tuple(row["selected_source_uids"]) for row in shots)
+        previous = getattr(self, "_hmb_sound_edit_projection", None)
+        if previous != (sound_roster, image_order):
+            self._hmb_sound_unchanged_image_request_id = None
+            if previous is not None and previous[0] == sound_roster and not (
+                    self._hmb_state_syncing or getattr(self, "_hmb_restoring_widget_state", False)):
+                try:
+                    from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
+                    from griptape_nodes.retained_mode.managers.event_manager import current_request_id, current_request_type
+                    if current_request_type() is SetParameterValueRequest:
+                        self._hmb_sound_unchanged_image_request_id = current_request_id()
+                except ImportError:
+                    pass
+            self._hmb_sound_edit_projection = (sound_roster, image_order)
         if serialized:
             parsed = _parse_mapping(serialized)
             if parsed.get(WIDGET_RUNTIME_LEASE_KEY) != self._hmb_widget_runtime_lease:
@@ -14790,9 +14851,18 @@ class HMBImageAssetLibrary(DataNode):
             self._hmb_import_thumbnail_processing_generation = generation
         completed = False
         try:
-            merged = _merge_live_import_thumbnail_result(
-                self._current_state(), results,
-            )
+            live = self._current_state()
+            if getattr(self, "_hmb_active_image_resolves", 0) and not any(
+                row.get("selected") and row.get("media_signature")
+                and row.get("path") == update[0] and row["media_signature"] != update[1]
+                for row in live["assets"] if (update := results.get(row["source_uid"]))
+            ):
+                # Keep the newest preview queued until the verified selection
+                # is published. A first thumbnail signature is presentation
+                # metadata. A replacement of an already known file signature
+                # must still invalidate an execution that captured the old one.
+                return False
+            merged = _merge_live_import_thumbnail_result(live, results)
             with self._hmb_import_thumbnail_lock:
                 if (
                     generation != self._hmb_import_thumbnail_generation
@@ -16725,13 +16795,19 @@ class HMBImageAssetLibrary(DataNode):
     async def aprocess(self) -> None:
         """Verify shared files off-loop, then publish one current pair on-loop."""
         with image_execution_workspace():
-            await self._execute_image_selection()
+            self._consume_pending_import_thumbnail_result()
+            self._hmb_active_image_resolves = getattr(self, "_hmb_active_image_resolves", 0) + 1
+            try:
+                await self._execute_image_selection()
+            finally:
+                self._hmb_active_image_resolves -= 1
+                if not self._hmb_active_image_resolves:
+                    self._consume_pending_import_thumbnail_result()
 
     async def _execute_image_selection(self) -> None:
         self._hmb_hydration_adopted = True
         self._consume_pending_catalog_scan_result()
         self._consume_pending_thumbnail_result()
-        self._consume_pending_import_thumbnail_result()
         self._consume_pending_catalog_probe_result()
         self._ensure_parameters()
         generation = _non_negative_int(getattr(self, "_hmb_execution_prepare_generation", 0)) + 1

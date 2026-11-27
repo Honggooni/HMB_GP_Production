@@ -1,10 +1,15 @@
 """Serialize selected analysis as bounded data at the existing native calls."""
 from __future__ import annotations
 
+from collections import OrderedDict
+import hashlib
 import json
 import math
 import os
+from pathlib import Path
 import re
+import stat
+import threading
 from urllib.parse import urlsplit
 from urllib.request import url2pathname
 
@@ -13,6 +18,65 @@ from _hmb_reference_analysis import ANALYSIS_CATEGORIES
 
 ANALYSIS_ORIGINAL_REFERENCE = "@analysis_original"
 ANALYSIS_RESULT_TEXT_LIMIT = 26000
+
+
+def invalidate_resolved_analysis_consumer(node) -> None:
+    """Emit the SDK's normal stale event for a changed implicit input."""
+    state = getattr(node, "state", None)
+    if getattr(state, "name", "") == "RESOLVED" and not getattr(node, "lock", False):
+        node.make_node_unresolved(current_states_to_trigger_change_event={state})
+
+_FILE_DIGESTS = OrderedDict()
+_FILE_DIGEST_LOCK = threading.Lock()
+_FILE_READ_LOCKS = tuple(threading.Lock() for _ in range(32))
+
+
+def _file_change_time(stream, info):
+    if os.name != "nt":
+        return info.st_ctime_ns
+    # Python's Windows st_ctime can be the creation time. Use the NT change
+    # time on the opened file so restored modification times cannot hide edits.
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    basic_info = (ctypes.c_longlong * 5)()  # FILE_BASIC_INFO, including its final padding
+    handle = wintypes.HANDLE(msvcrt.get_osfhandle(stream.fileno()))
+    ok = ctypes.windll.kernel32.GetFileInformationByHandleEx(
+        handle, 0, ctypes.byref(basic_info), ctypes.sizeof(basic_info))
+    return basic_info[3] if ok else 0
+
+
+class FileChangedDuringHash(OSError):
+    pass
+
+
+def cached_file_sha256(path: Path, *, read=None, refresh=False, max_size=None) -> str:
+    """Reuse bytes only while the open file identity and OS change token agree."""
+    with _FILE_READ_LOCKS[hash(path) % len(_FILE_READ_LOCKS)], path.open("rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("Source is not a regular file")
+        if max_size is not None and not 0 < info.st_size <= max_size:
+            raise OverflowError("Source exceeds the analysis size limit")
+        identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+        change = _file_change_time(stream, info)
+        key = (path, *identity, change) if change and info.st_ino else None
+        with _FILE_DIGEST_LOCK:
+            digest = _FILE_DIGESTS.get(key) if key and not refresh else None
+        if digest is None:
+            digest = read(stream) if read else hashlib.file_digest(stream, "sha256").hexdigest()
+        current = path.stat()
+        if (identity != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+                or change != _file_change_time(stream, os.fstat(stream.fileno()))):
+            raise FileChangedDuringHash("Source changed during file verification")
+        if key:
+            with _FILE_DIGEST_LOCK:
+                _FILE_DIGESTS[key] = digest
+                _FILE_DIGESTS.move_to_end(key)
+                if len(_FILE_DIGESTS) > 512:
+                    _FILE_DIGESTS.popitem(last=False)
+        return digest
 
 
 def analysis_original(prompt_owner, *, channel_uuid, shot_uuid):

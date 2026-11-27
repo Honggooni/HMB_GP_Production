@@ -109,6 +109,7 @@ def make_generator(source, number: int = 1):
     node._generation_refresh_lock = threading.Lock()
     node._generation_refresh_running = False
     node._generation_run_active = threading.Event()
+    node._hmb_generation_started_monotonic = None
     node._hmb_draft_finalize_pending = False
     node._hmb_draft_finalize_task = None
     node._hmb_draft_final_context = None
@@ -143,7 +144,8 @@ def make_generator(source, number: int = 1):
         assert not node.checkpoint.get("task_id"), "Existing task must be explicitly resumed"
 
     def checkpoint(**value):
-        node.checkpoint = {key: item for key, item in value.items() if key != "params"}
+        node.checkpoint = {**{key: item for key, item in value.items() if key != "params"},
+                           "broker_server_url": (value.get("params") or {}).get("_hmb_broker_server_url", "")}
 
     async def save_checkpoint(**value):
         node.saved_checkpoints.append((value["reason"], copy.deepcopy(node.checkpoint)))
@@ -429,13 +431,14 @@ async def run():
         "status": "running", "stage": "accepted",
         "broker_server_url": seedance_module._broker_validated_server_url(),
     }
-    saved = copy.deepcopy(existing.checkpoint)
-    await existing.aprocess()
-    assert existing.checkpoint == saved
+    with mock.patch.object(existing.broker, "refresh_job", return_value={"id": "existing-paid-task", "status": "running"}) as lookup:
+        await existing.aprocess()
+    lookup.assert_called_once_with("existing-paid-task", timeout=300)
+    assert existing.checkpoint["task_id"] == "existing-paid-task"
     assert existing.parameter_output_values["generation_id"] == "existing-paid-task"
     assert existing.parameter_output_values["generation_status"] == "running"
     assert existing.previews[-1]["action"] == "refresh_existing"
-    assert existing.broker.creates == [] and existing.saved_checkpoints == []
+    assert existing.broker.creates == []
 
     # Explicit retrieval bypasses Agent gating and preserves the same remote ID.
     existing.parameter_values["resume_generation_id"] = "existing-paid-task"

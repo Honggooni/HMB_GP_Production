@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 from pathlib import Path
 import sys
 import tempfile
@@ -502,6 +503,208 @@ class AnalysisNodeRegression(unittest.TestCase):
         resolve.assert_called_once_with(self.prompt, channel_uuid="channel", shot_uuid="shot-1", kind="video")
         self.assertEqual(self.node._slots, previous)
         self.assertEqual(self.node._status, "저장된 분석 결과 재사용")
+
+    def test_downstream_runs_refresh_changed_bytes_in_order_and_share_inflight_work(self):
+        from HMBPromptLibrary import HMBPromptLibrary
+        from _hmb_analysis_delivery import cached_file_sha256
+
+        before = self.make_node()
+        before._role = "before"
+        self.nodes.append(before)
+        scope = {"channel_uuid": "channel", "shot_uuid": "shot-1"}
+        key = analysis._scope("channel", "shot-1")
+        original = self.path.read_bytes()
+        original_digest = hashlib.sha256(original).hexdigest()
+        for node in (before, self.node):
+            self.assertTrue(node._hmb_pick_prompt_reference(self.prompt, **scope,
+                kind="video", source_id=self.prompt.source_id))
+            self.set_fixture_result(node)
+            slot = node._slots[key]
+            slot["model"] = slot["result"]["model"] = "gemini-4-argon"
+            slot["result"]["source_digest"] = original_digest
+            slot["prompt_applied"] = node is before
+        initial_stamp = before._slots[key]["stamp"]
+        template = copy.deepcopy(before._slots[key]["result"])
+        calls = []
+        full_reads = []
+
+        def count_file_reads(path, *, read, **options):
+            def record_read(stream):
+                full_reads.append(path)
+                return read(stream)
+            return cached_file_sha256(path, read=record_read, **options)
+
+        def analyze(node, **kwargs):
+            role = analysis._analysis_role(node)
+            if role == "after":
+                self.assertTrue(before._slots[key]["prompt_applied"])
+                self.assertNotEqual(before._slots[key]["result"]["source_digest"], original_digest)
+            calls.append(role)
+            digest = hashlib.sha256(Path(kwargs["source"]).read_bytes()).hexdigest()
+            return {**template, "source_digest": digest, "cache_key": digest,
+                    "observations": {"camera": [{"observation": "refreshed " + role}]}}
+
+        async def run():
+            runtime = SimpleNamespace(GriptapeNodes=SimpleNamespace(
+                EventManager=lambda: SimpleNamespace(event_loop=asyncio.get_running_loop())))
+            with mock.patch.dict(sys.modules, {"griptape_nodes.retained_mode.griptape_nodes": runtime}), \
+                 mock.patch("_hmb_reference_analysis.analyze_reference", side_effect=analyze), \
+                 mock.patch("_hmb_analysis_delivery.cached_file_sha256", side_effect=count_file_reads), \
+                 mock.patch.object(analysis, "_source_stamp", return_value=initial_stamp):
+                async def prepare(for_agent):
+                    await HMBPromptLibrary._hmb_prepare_shot_analysis(self.prompt, **scope, for_agent=for_agent)
+
+                class PickerPreparing(ValueError):
+                    hmb_picker_media_preparing = True
+                getter = self.prompt._hmb_analysis_upstream_reference_for
+                reads = []
+                def delayed(**kwargs):
+                    reads.append(1)
+                    if len(reads) == 1:
+                        raise PickerPreparing()
+                    return getter(**kwargs)
+                with mock.patch.object(self.prompt, "_hmb_analysis_upstream_reference_for", side_effect=delayed):
+                    await prepare(True)
+                self.assertEqual(calls, [])
+                self.assertEqual(full_reads, [self.path])
+                for suffix in (".png", ".wav"):
+                    self.path.with_suffix(suffix).write_bytes(b"updated unrelated source")
+                    self.node._refresh_sources()
+                    before._refresh_sources()
+                    await prepare(True)
+                await HMBPromptLibrary._hmb_prepare_shot_analysis(
+                    self.prompt, channel_uuid="channel", shot_uuid="shot-2", for_agent=True)
+                self.assertEqual(calls, [])
+                self.assertEqual(full_reads, [self.path])
+                import os
+                original_stat = self.path.stat()
+                self.path.write_bytes(original[::-1])  # previous stat identity deliberately retained
+                os.utime(self.path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+                await asyncio.gather(prepare(True), prepare(True))
+                self.assertEqual(calls, ["before", "after"])
+                self.assertEqual(full_reads, [self.path, self.path])
+                self.assertEqual(self.context("agent")["items"][0]["observation"], "refreshed after")
+                self.assertIn("refreshed before", self.prompt._hmb_apply_analysis_fields.call_args.args[2]["VIDEO_VFX"])
+                await prepare(True)
+                self.assertEqual(calls, ["before", "after"])
+                self.assertEqual(full_reads, [self.path, self.path])
+                self.path.write_bytes(original)
+                await prepare(False)
+                self.assertEqual(calls, ["before", "after", "before"])
+                with mock.patch("_hmb_reference_analysis.analyze_reference", side_effect=analysis.AnalysisError(
+                        "ANALYSIS_FAILED", "fixture upstream failure")):
+                    with self.assertRaisesRegex(analysis._AnalysisStateError, "fixture upstream failure"):
+                        await prepare(True)
+        asyncio.run(run())
+
+    def test_manual_reanalysis_forces_one_new_result_on_its_selected_route(self):
+        before = self.make_node()
+        before._role = "before"
+        self.nodes.append(before)
+        scope = dict(channel_uuid="channel", shot_uuid="shot-1")
+        key = analysis._scope("channel", "shot-1")
+        runtime = SimpleNamespace(GriptapeNodes=SimpleNamespace(
+            EventManager=lambda: SimpleNamespace(event_loop=asyncio.get_running_loop())))
+        calls = []
+        def analyze(node, **kwargs):
+            self.assertTrue(kwargs["force_refresh"])
+            role = analysis._analysis_role(node)
+            calls.append(role)
+            return {**node._slots[key]["result"], "observations": {"camera": [{"observation": "new " + role}]}}
+
+        async def run():
+            with mock.patch.dict(sys.modules, {"griptape_nodes.retained_mode.griptape_nodes": runtime}), \
+                 mock.patch("_hmb_reference_analysis.analyze_reference", side_effect=analyze):
+                for node in (before, self.node):
+                    self.assertTrue(node._hmb_pick_prompt_reference(self.prompt, **scope, kind="video",
+                        source_id=self.prompt.source_id))
+                    self.set_fixture_result(node)
+                    node._slots[key]["model"] = node._slots[key]["result"]["model"] = "gemini-4-argon"
+                    node._run_command(dict(action="analyze", **scope, model="gemini-4-argon", full_video=True,
+                        confirmed_paid=True, reanalyze=True, revision=node._revision))
+                    role = analysis._analysis_role(node)
+                    self.assertTrue(analysis.analysis_render_input_preview(self.prompt, **scope)[role]["analysis_pending"])
+                    self.assertEqual(await asyncio.wrap_future(node._job_completion), "")
+                    result = node._slots[key]["result"]
+                    self.assertEqual(analysis._normalize_slot(node._slots[key])["result"], result)
+                    preview = analysis.analysis_render_input_preview(self.prompt, **scope)[role]
+                    self.assertEqual(preview["manual_run_id"], result["manual_run_id"])
+                    self.assertFalse(preview["analysis_pending"])
+        asyncio.run(run())
+        self.assertEqual(calls, ["before", "after"])
+        self.assertIn("new before", self.prompt._hmb_apply_analysis_fields.call_args.args[2]["VIDEO_VFX"])
+        self.assertEqual(self.context("agent")["items"][0]["observation"], "new after")
+
+    def test_passive_invalidation_persists_pending_and_original_only_never_starts_analysis(self):
+        scope = {"channel_uuid": "channel", "shot_uuid": "shot-1"}
+        self.assertTrue(self.pick())
+        self.set_fixture_result()
+        self.path.write_bytes(b"changed")
+        self.node._refresh_sources()
+        key = analysis._scope("channel", "shot-1")
+        slot = self.node._slots[key]
+        self.assertTrue(analysis._normalize_slot(slot)["analysis_pending"])
+        self.assertTrue(analysis.analysis_render_input_preview(self.prompt, **scope)["after"]["analysis_pending"])
+        self.command("apply", send_agent=False, send_original=True)
+        with mock.patch("_hmb_reference_analysis.reference_source_digest", side_effect=AssertionError("read original")):
+            asyncio.run(analysis.prepare_analysis_for_run(self.prompt, **scope, role="after"))
+
+    def test_replacement_follows_exact_picker_binding_after_old_source_id_disappears(self):
+        from HMBPromptLibrary import HMBPromptLibrary
+
+        row = {"kind": "video", "selector": "original-picker-item", "source_id": self.prompt.source_id,
+               "path": str(self.path), "name": self.path.name}
+        def lookup(*, kind, source_id, **_scope):
+            return HMBPromptLibrary._hmb_find_analysis_reference([row], kind, source_id)
+
+        with mock.patch.object(self.prompt, "_hmb_analysis_reference_for", side_effect=lookup):
+            self.assertTrue(self.pick())
+            self.set_fixture_result()
+            slot = self.node._slots[analysis._scope("channel", "shot-1")]
+            binding = slot["source_binding"]
+            row["source_id"] = "updated-media"
+            self.assertEqual(self.context("agent"), {})
+            self.node._refresh_sources()
+            self.assertTrue(slot["analysis_pending"])
+            restored = analysis._normalize_slot(slot)
+            self.assertEqual(restored["source_binding"], binding)
+            self.assertEqual(self.node._resolve_source(self.prompt, "channel", "shot-1", restored)["source_id"], "updated-media")
+            row["selector"] = "different-picker-item"
+            self.assertEqual(self.node._resolve_source(self.prompt, "channel", "shot-1", restored), {})
+
+    def test_two_shots_wait_for_their_own_analysis_results(self):
+        self.assertTrue(self.pick())
+        self.set_fixture_result()
+        key = analysis._scope("channel", "shot-1")
+        self.node._slots[key]["model"] = "gemini-4-argon"
+        self.node._slots[analysis._scope("channel", "shot-2")] = copy.deepcopy(self.node._slots[key])
+        template = self.node._slots[key]["result"]
+        digest = hashlib.sha256(self.path.read_bytes()).hexdigest()
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+
+        def analyze(node, *, analysis_context, **kwargs):
+            calls.append(analysis_context["shot_uuid"])
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return {**template, "model": kwargs["model"], "source_digest": digest, "cache_key": digest}
+
+        async def run():
+            runtime = SimpleNamespace(GriptapeNodes=SimpleNamespace(
+                EventManager=lambda: SimpleNamespace(event_loop=asyncio.get_running_loop())))
+            with mock.patch.dict(sys.modules, {"griptape_nodes.retained_mode.griptape_nodes": runtime}), \
+                 mock.patch("_hmb_reference_analysis.analyze_reference", side_effect=analyze):
+                tasks = [asyncio.create_task(analysis.prepare_analysis_for_run(
+                    self.prompt, channel_uuid="channel", shot_uuid=shot, role="after")) for shot in ("shot-1", "shot-2")]
+                try:
+                    self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+                finally:
+                    release.set()
+                await asyncio.gather(*tasks)
+                self.assertCountEqual(calls, ["shot-1", "shot-2"])
+                for shot in calls:
+                    self.assertEqual(self.context("agent", shot)["cache_key"], digest)
+        asyncio.run(run())
 
 
 if __name__ == "__main__":

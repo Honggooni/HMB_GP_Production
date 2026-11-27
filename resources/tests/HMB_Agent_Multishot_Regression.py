@@ -45,7 +45,8 @@ def manager():
     node.parameter_values = {"prompt":"Only authored text","model":"Only model","agent":None}; node.parameter_output_values = {}
     node._hmb_persist_shot_store = Mock(); node._hmb_publish_shot_status = Mock(); node._refresh_agent_shot_route = Mock()
     node._hmb_capture_active_slot = Mock()
-    prompt = SimpleNamespace(_hmb_node_deleted=False, _hmb_prompt_shot_document=lambda **kw: {"identity":kw})
+    prompt = SimpleNamespace(_hmb_node_deleted=False, _hmb_prompt_shot_document=lambda **kw: {
+        "identity": kw, "visible_prompt": "Current prompt for " + kw["shot_uuid"]})
     node._hmb_manager_prompt_owner = lambda **kw: prompt
     return node, prompt
 

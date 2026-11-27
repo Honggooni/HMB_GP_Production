@@ -449,6 +449,50 @@ class SoundNodeRegression(SoundLibraryRegression):
     def drain(self):
         while ControlledThread.pending: ControlledThread.pending[0].run()
 
+    def test_image_publication_clock_updates_catalog_without_changing_audio_outputs(self):
+        self.node._hmb_reconcile_shot_routing(CATALOG)
+        snapshot = self.node._snapshot()
+        updated = copy.deepcopy(CATALOG)
+        updated["generation"] += 1
+        updated["shots"][0]["revision"] += 1
+        def sign(catalog):
+            document = {key: catalog[key] for key in ("channel_uuid", "generation", "shots")}
+            catalog["metadata_sha256"] = hashlib.sha256(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+        sign(updated)
+        self.node._hmb_reconcile_shot_routing(updated)
+        self.assertEqual(self.node._state_sound["shot_catalog"]["generation"], updated["generation"])
+        self.assertEqual(self.node._snapshot(), snapshot)
+        updated["generation"] += 1
+        updated["shots"][0]["name"] = "Renamed"
+        sign(updated)
+        self.node._hmb_reconcile_shot_routing(updated)
+        self.assertGreater(self.node._snapshot()["revision"], snapshot["revision"])
+
+    def test_sound_completion_rejects_edits_and_unrelated_invalidation(self):
+        from griptape_nodes.retained_mode.managers import event_manager
+        states = type(self.node.state)
+        request_id = str(uuid4())
+        image = types.SimpleNamespace(_hmb_sound_unchanged_image_request_id=request_id)
+        traversal = {states.RESOLVING, states.RESOLVED}
+        with mock.patch.object(self.node, "_wired_image_catalog", return_value=image), \
+                mock.patch.object(event_manager, "current_request_type", return_value=SetParameterValueRequest), \
+                mock.patch.object(event_manager, "current_request_id", return_value=request_id):
+            self.node.process()
+            self.node.state = states.RESOLVED
+            self.node.make_node_unresolved(traversal)
+            self.assertEqual(self.node.state, states.RESOLVED)
+            self.command("edit", instance_id=self.track["instance_id"], changes={"transcript": "new audio direction"})
+            self.assertIsNone(self.node._completed_image_source())
+            self.node.make_node_unresolved(traversal)
+            self.assertEqual(self.node.state, states.UNRESOLVED)
+            self.node.process()
+            self.node.state = states.RESOLVED
+            image._hmb_sound_unchanged_image_request_id = str(uuid4())
+            self.node.make_node_unresolved(traversal)
+            self.assertEqual(self.node.state, states.UNRESOLVED)
+            self.assertIsNone(self.node._resolved_sound_inputs)
+
     def test_folder_refresh_keeps_tracks_shot_and_saved_directory_names(self):
         preserved = copy.deepcopy({k: self.node._state_sound[k] for k in ('tracks','shot','shot_catalog','channel_uuid')})
         (self.audio/'자유 폴더'/'빈 폴더').mkdir(parents=True)

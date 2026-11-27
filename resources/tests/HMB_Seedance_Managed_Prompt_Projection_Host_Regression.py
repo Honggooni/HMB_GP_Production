@@ -76,7 +76,11 @@ async def exercise(engine, _phase, out):
         guards.enter_context(mock.patch.object(t.HMBSeedanceGeneration, "_process_generation", harness.deny))
         guards.enter_context(mock.patch.object(agents.HMBAgentLibrary, "_hmb_run_agent_shot", harness.deny))
         guards.enter_context(mock.patch.object(agents.HMBAgentLibrary, "_run_native_agent_once", harness.deny))
-        flow_name = harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name="ManagedPromptProjectionSDK")).flow_name
+        ensured = harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name="ManagedPromptProjectionSDK"))
+        original_workflow = guards.enter_context(ExitStack())
+        if getattr(ensured, "open_workflow", None) is not None:
+            original_workflow.enter_context(engine.bind_workflow(engine.open_workflows.get(ensured.workflow_id)))
+        flow_name = ensured.flow_name
         source_created = harness.send(engine, CreateNodeRequest(node_type="HMBImageAssetLibrary", specific_library_name=schema.name,
             node_name="Projection Image publisher", initial_setup=True, create_error_proxy_on_failure=False))
         publisher = engine.node_manager.get_node_by_name(source_created.node_name)
@@ -223,10 +227,13 @@ async def exercise(engine, _phase, out):
         # No original workflow or live desktop graph is read or replaced.
         names = [node.name for node in generators]
         await harness.asend(engine, ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        original_workflow.close()
         with ExitStack() as hydration:
             for key, callback in schedulers.items():
                 hydration.enter_context(mock.patch.object(routing, key, callback))
-            await harness.asend(engine, RunWorkflowWithCurrentStateRequest(file_path=str(saved)))
+            opened = await harness.asend(engine, RunWorkflowWithCurrentStateRequest(file_path=str(saved)))
+            if getattr(opened, "open_workflow", None) is not None:
+                guards.enter_context(engine.bind_workflow(engine.open_workflows.get(opened.workflow_id)))
             reopened_publisher = engine.node_manager.get_node_by_name(publisher.name)
             reopened_publisher._hmb_initial_catalog_scan_pending = False
             for _ in range(250):

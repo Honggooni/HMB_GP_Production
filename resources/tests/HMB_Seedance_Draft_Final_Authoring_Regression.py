@@ -124,11 +124,12 @@ class DraftFinalAuthoringTests(unittest.TestCase):
             yield phases
 
     def seed_checkpoint(self, node, *, action, source=None, status='succeeded',
-                        job_id=JOB, stage='remote_succeeded'):
+                        job_id=JOB, stage='remote_succeeded', digest=''):
         values = base.params(action)
         values.update(resolution='480p' if action == t.DRAFT_ACTION_PREVIEW else '1080p',
             output_format='mov', return_last_frame=False,
             _hmb_draft_project=deepcopy(fixture.PROJECT),
+            _hmb_render_input_sha256=digest,
             _hmb_broker_server_url=fixture.ORIGIN,
             _hmb_generation_origin=node._capture_generated_video_origin(),
             _hmb_draft_source_bindings={} if node._draft_only_mode() else
@@ -161,6 +162,112 @@ class DraftFinalAuthoringTests(unittest.TestCase):
                 self.assertTrue(node._draft_ui_state()['final_available'])
                 self.assertEqual(phases, ['downloading', 'verifying', 'succeeded'])
                 self.assertEqual(node.bridge.posts, [])
+
+    def test_completed_input_changes_restore_draft_and_do_not_submit_from_native_run(self):
+        for action in (t.DRAFT_ACTION_PREVIEW, t.DRAFT_ACTION_OFF):
+            with self.subTest(action=action):
+                node = self.make_node()
+                node.parameter_values['draft_action'] = action
+                digest = node._render_authoring_digest()
+                self.seed_checkpoint(node, action=action, digest=digest)
+                before = authored(node)
+                with self.publication(node, before):
+                    asyncio.run(node._save_completed_task({}, JOB, node.destination,
+                        model_id=t.SEEDANCE_2_5_MODEL_ID, output_format='mov', return_last_frame=False))
+                self.assertEqual(node._generation_recovery_state()['render_input_sha256'], digest)
+                self.assertTrue(node._draft_ui_state()['run_locked'])
+                with mock.patch.object(node, '_await_local_render_preflight', side_effect=AssertionError('Unexpected preflight')):
+                    asyncio.run(node.aprocess())
+                self.assertFalse(node.bridge.posts)
+                for field, changed in [('ratio', '9:16'), ('duration', 8), ('prompt', 'edited'), ('resolution', '1080p')]:
+                    original = node.parameter_values.get(field)
+                    node.parameter_values[field] = changed
+                    state = node._draft_ui_state()
+                    self.assertFalse(state['run_locked'], field)
+                    self.assertFalse(state['final_available'], field)
+                    if action == t.DRAFT_ACTION_PREVIEW:
+                        self.assertEqual(node._draft_source_record()['draft_job_id'], JOB)
+                        with self.assertRaisesRegex(ValueError, 'Restore'):
+                            node._validated_draft_final_source(resolution='1080p')
+                    node.parameter_values[field] = original
+                    self.assertTrue(node._draft_ui_state()['run_locked'], field)
+                    self.assertEqual(node._draft_ui_state()['final_available'], action == t.DRAFT_ACTION_PREVIEW)
+
+    def test_current_shot_image_bytes_and_prompt_change_invalidate_unchanged_agent_display(self):
+        node = self.make_node()
+        first = {'source_uid': 'a', 'metadata': {'media_signature': 'a' * 64}}
+        other = {'source_uid': 'b', 'metadata': {'media_signature': 'b' * 64}}
+        node.parameter_values[t.SHOT_ASSET_INPUT_PARAMETER] = {
+            'channel_uuid': fixture.CHANNEL, 'ordered_assets': [first, other],
+            'shots': [{'shot_uuid': fixture.SHOT_A, 'selected_source_uids': ['a']},
+                      {'shot_uuid': fixture.SHOT_B, 'selected_source_uids': ['b']}]}
+        preview = {'prompt': 'current editor text'}
+        node._manual_agent_prompt_source.return_value = SimpleNamespace(_hmb_render_input_preview=lambda **scope: preview)
+        digest = node._render_authoring_digest()
+        self.assertTrue(digest)
+        other['metadata']['media_signature'] = 'c' * 64
+        self.assertEqual(node._render_authoring_digest(), digest)
+        first['metadata']['media_signature'] = 'd' * 64
+        self.assertNotEqual(node._render_authoring_digest(), digest)
+        first['metadata']['media_signature'] = 'a' * 64
+        preview['prompt'] = 'edited without another Agent run'
+        self.assertNotEqual(node._render_authoring_digest(), digest)
+
+    def test_compact_image_port_uses_only_selected_shot_published_media(self):
+        from HMBImageAssetLibrary import HMBImageAssetLibrary
+
+        node = self.make_node()
+        publisher = object.__new__(HMBImageAssetLibrary)
+        exact = mock.Mock(return_value=publisher)
+        node._exact_incoming_source = exact
+        node._manual_agent_prompt_source.return_value = SimpleNamespace(
+            _hmb_render_input_preview=lambda **_scope: {'prompt': 'frozen Prompt and FINAL TEXT'})
+        def publish(first='same', sibling='old', order=('a', 'c'), path='P:/A.png', generation=1):
+            snapshot = {'channel_uuid': fixture.CHANNEL, 'project_id': 'fixture', 'generation': generation,
+                'publisher_instance_uuid': fixture.PUBLISHER, 'metadata_sha256': str(generation) * 64,
+                'media_sha256': 'f' * 64, 'shots': [
+                    {'shot_uuid': fixture.SHOT_A, 'selected_source_uids': list(order)},
+                    {'shot_uuid': fixture.SHOT_B, 'selected_source_uids': ['b']}],
+                'ordered_assets': [{'source_uid': uid, 'metadata': {'media_signature': signature}}
+                                   for uid, signature in [('a', first), ('b', sibling), ('c', 'fixed')]],
+                'media_by_source_uid': {'a': path, 'b': 'P:/B.png', 'c': 'P:/C.png'}}
+            publisher._hmb_shot_routing_cache = snapshot
+            node.parameter_values[t.SHOT_ASSET_INPUT_PARAMETER] = publisher._shot_asset_dependency_token(snapshot)
+
+        publish()
+        digest = node._render_authoring_digest()
+        self.assertTrue(digest)
+        exact.assert_called_with(t.SHOT_ASSET_INPUT_PARAMETER, 'SHOT_ASSET_OUT')
+        node._remember_completed_render({'render_input_sha256': digest,
+                                         'generation_origin': node._capture_generated_video_origin()})
+        publish(sibling='new', generation=2)
+        self.assertTrue(node._matching_completed_render())
+        for change in ({'first': 'overwritten'}, {'path': 'P:/moved.png'}, {'order': ('c', 'a')}):
+            publish(**change)
+            self.assertFalse(node._matching_completed_render(), change)
+        publish(generation=3)
+        self.assertTrue(node._matching_completed_render())
+        publisher._hmb_shot_routing_cache = {}
+        self.assertEqual(node._render_authoring_digest(), '')
+
+    def test_only_manual_prompt_and_all_reference_types_change_and_restore_the_lock(self):
+        node = self.make_node(shot=False)
+        digest = node._render_authoring_digest()
+        node._remember_completed_render({'render_input_sha256': digest})
+        self.assertTrue(node._matching_completed_render())
+        for name, edited in [('prompt', 'Manual or Standard Agent update'), ('reference_images', ['image.png']),
+                             ('VIDEO_REFERENCES', ['video.mov']), ('reference_audio', ['audio.wav']),
+                             ('first_frame', 'first.png'), ('last_frame', 'last.png'),
+                             ('reference_video_1', 'legacy-video.mp4')]:
+            existed = name in node.parameter_values
+            before = node.parameter_values.get(name)
+            node.parameter_values[name] = edited
+            self.assertFalse(node._matching_completed_render(), name)
+            if existed:
+                node.parameter_values[name] = before
+            else:
+                del node.parameter_values[name]
+            self.assertTrue(node._matching_completed_render(), name)
 
     def test_broker_server_owns_media_for_normal_draft_and_final(self):
         for action in (t.DRAFT_ACTION_OFF, t.DRAFT_ACTION_PREVIEW, t.DRAFT_ACTION_FINAL):

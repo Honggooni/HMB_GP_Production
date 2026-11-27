@@ -527,6 +527,7 @@ export function hmbSeedanceDraftState(value) {
     visible: source.visible === true,
     action: text(source.action, 80),
     preview_available: source.preview_available === true,
+    run_locked: source.run_locked === true,
     final_available: source.final_available === true,
     job_id: text(source.job_id, 160),
     effective_resolution: text(source.effective_resolution, 16),
@@ -640,6 +641,7 @@ function render(state) {
   const theme = SHOT_THEME[number];
   return `
     <style>
+      button[data-hmb-completed-render]{opacity:.45!important;cursor:default!important;pointer-events:none!important}
       .hmb-seedance-shot :is(button,input,select,textarea):not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)){font-family:inherit}
       .hmb-seedance-preview-overlay :is(button,input,select,textarea){font-family:inherit}
       .hmb-seedance-shot{--shot-accent:${accent};--shot-rgb:${theme.rgb};--shot-soft:${theme.soft};position:relative;width:100%;height:64px;overflow:hidden;box-sizing:border-box;border:1px solid rgba(var(--shot-rgb),.5);border-radius:11px;background:radial-gradient(circle at 8% -45%,rgba(var(--shot-rgb),.25),transparent 54%),linear-gradient(90deg,rgba(var(--shot-rgb),.2),rgba(14,23,38,.96) 46%,#060912);color:#e6edf7;box-shadow:inset 0 1px 0 rgba(255,255,255,.04),0 8px 24px rgba(0,0,0,.24),0 0 18px rgba(var(--shot-rgb),.18);font-family:"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif;user-select:none}
@@ -1892,9 +1894,49 @@ function draftFinalTargetAvailable(draft, resolution, selection) {
   return !selection?.used.size && draft.final_visible !== false && (!draft.final_state || draft.final_state === "available");
 }
 
+function syncCompletedRunControl(container, locked) {
+  const lock = container.__hmbCompletedRunControl;
+  if (!locked) {
+    if (!lock) return;
+    lock.observer?.disconnect();
+    if (lock.button) {
+      lock.button.removeAttribute("data-hmb-completed-render");
+      lock.button.inert = lock.inert;
+      if (lock.aria === null) lock.button.removeAttribute("aria-disabled");
+      else lock.button.setAttribute("aria-disabled", lock.aria);
+    }
+    delete container.__hmbCompletedRunControl;
+    return;
+  }
+  if (lock) return;
+  const node = hmbSeedanceNodeRoot(container);
+  if (!node?.querySelector) return;
+  const entry = container.__hmbCompletedRunControl = {};
+  const apply = () => {
+    if (entry.button && node.contains(entry.button)) return;
+    // Stable exposes the square-play SVG inside an unlabelled native button.
+    // Restrict the lookup to this node and leave the host's disabled flag alone.
+    const button = node.querySelector('button[aria-label="Run node" i], button:has(svg.lucide-square-play), button:has(svg path[d^="M9 9.003"])');
+    if (!button) return;
+    entry.button = button;
+    entry.inert = button.inert;
+    entry.aria = button.getAttribute("aria-disabled");
+    button.setAttribute("data-hmb-completed-render", "");
+    button.setAttribute("aria-disabled", "true");
+    button.inert = true;
+  };
+  apply();
+  const Observer = node.ownerDocument?.defaultView?.MutationObserver;
+  if (Observer) {
+    entry.observer = new Observer(apply);
+    entry.observer.observe(node, {subtree: true, childList: true});
+  }
+}
+
 export function hmbSeedanceSyncDraftAction(container, state) {
   if (!container) return false;
   const draft = state.draft;
+  syncCompletedRunControl(container, draft.run_locked && !draft.busy && !container.__hmbSeedancePendingShot);
   const node = hmbSeedanceNodeRoot(container);
   const sourceScope = draftScope(state);
   const verifiedAvailable = !draft.final_state || draft.final_state === "available";
@@ -2440,6 +2482,7 @@ function installPreviewObserver(container) {
 
 export function hmbSeedanceCleanupPreviewOverlay(container) {
   if (!container) return false;
+  syncCompletedRunControl(container, false);
   container.__hmbSeedancePreviewDisposed = true;
   clearDraftRequest(container);
   clearTimeout(container.__hmbSeedanceDraftRetryTimer);

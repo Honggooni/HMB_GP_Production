@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import ExitStack
 from copy import deepcopy
 import json
 import os
@@ -138,7 +139,38 @@ async def check_wired_image_with_existing_shot(workspace):
                 if attempt == 2:
                     # Saved nodes can restore the old Parameter declaration.
                     library.get_parameter_by_name(asset.WIDGET_STATE_PARAMETER).allow_variable_substitution = True
-                with patch.object(library, "_execution_preparation_identity", record_widget_read):
+                with ExitStack() as gates:
+                    gates.enter_context(patch.object(library, "_execution_preparation_identity", record_widget_read))
+                    if attempt == 1:
+                        # Deliver the real LoadImage preview precisely while its
+                        # first wired Resolve is verifying the existing Shot.
+                        started = threading.Event()
+                        offered = threading.Event()
+                        hydrate = asset._hydrate_live_import_thumbnails
+                        prepare = library._prepare_execution_files
+                        consume = library._consume_pending_import_thumbnail_result
+                        offered_signatures = []
+
+                        def hydrate_during_verification(rows, is_current):
+                            assert started.wait(10), "The first wired verification never started"
+                            return hydrate(rows, is_current)
+
+                        def wait_for_preview(*args):
+                            started.set()
+                            assert offered.wait(10), "The preview never reached the owner loop"
+                            return prepare(*args)
+
+                        def record_preview():
+                            pending = library._hmb_import_thumbnail_pending_result
+                            result = consume()
+                            if started.is_set() and pending is not None and not offered.is_set():
+                                offered_signatures.extend(item[1] for item in pending[1].values())
+                                offered.set()
+                            return result
+
+                        gates.enter_context(patch.object(asset, "_hydrate_live_import_thumbnails", hydrate_during_verification))
+                        gates.enter_context(patch.object(library, "_prepare_execution_files", wait_for_preview))
+                        gates.enter_context(patch.object(library, "_consume_pending_import_thumbnail_result", record_preview))
                     result = await GriptapeNodes.ahandle_request(ResolveNodeRequest(node_name=library.name))
                 assert not result.failed(), (attempt, str(result.result_details))
                 assert image.parameter_output_values.get("image"), (image.state, image.get_parameter_value("result_details"))
@@ -152,6 +184,8 @@ async def check_wired_image_with_existing_shot(workspace):
                 updated = library._current_state()
                 imports = [row for row in updated["assets"] if row["source_kind"] == "user"]
                 assert len(imports) == 1 and imports[0]["image_name"] == "Dingo", imports
+                if attempt == 1:
+                    assert imports[0]["media_signature"] and imports[0]["media_signature"] in offered_signatures
                 media = library._hmb_import_media_by_uid[imports[0]["source_uid"]]
                 assert getattr(media, "value", None) == "{inputs}/images/Dingo.jpg", media
                 assert asset._local_import_source(imports[0], media).samefile(path)
@@ -171,7 +205,7 @@ async def check_wired_image_with_existing_shot(workspace):
 
             def paused_prepare(*args):
                 entered.set()
-                assert release.wait(4), "Timed out waiting for peer publication"
+                assert release.wait(10), "Timed out waiting for peer publication"
                 return prepare(*args)
 
             with patch.object(library, "_prepare_execution_files", paused_prepare):
@@ -188,6 +222,29 @@ async def check_wired_image_with_existing_shot(workspace):
                 result = await pending
             assert not result.failed(), str(result.result_details)
             assert library._current_state()["shot_routing"]["generation"] >= newer["generation"]
+            # A second signature for this same path is an actual replacement.
+            # It must reach the verifier even while first previews are deferred.
+            entered.clear()
+            release.clear()
+            imported_uid = imports[0]["source_uid"]
+            def import_signature():
+                return next(row["media_signature"] for row in library._current_state()["assets"]
+                            if row["source_uid"] == imported_uid)
+            original_signature = import_signature()
+            assert original_signature
+            with patch.object(library, "_prepare_execution_files", paused_prepare):
+                pending = asyncio.create_task(GriptapeNodes.ahandle_request(ResolveNodeRequest(node_name=library.name)))
+                try:
+                    assert await asyncio.to_thread(entered.wait, 5)
+                    Image.new("RGB", (32, 24), (245, 135, 20)).save(path)
+                    library._schedule_live_import_thumbnail_hydration(library._current_state())
+                    async with asyncio.timeout(8):
+                        while import_signature() == original_signature:
+                            await asyncio.sleep(.01)
+                finally:
+                    release.set()
+                replaced = await pending
+            assert replaced.failed() and "inputs changed while preparing execution" in str(replaced.result_details)
             run = library.aprocess
 
             async def run_without_ambient_workflow():
@@ -263,15 +320,17 @@ async def check_wired_image_with_existing_shot(workspace):
                 generated = Path(asset._ASSET_THUMBNAIL_CACHE_ROOT) / name
                 driver = GriptapeNodes.StaticFilesManager().storage_driver
                 assert preview_url == urlsplit(driver.create_signed_download_url(generated))
-            with Image.open(generated) as preview:
+            with Image.open(generated) as preview, Image.open(path) as current_source:
                 assert preview.size == (32, 24)
-                red, green, blue = preview.convert("RGB").getpixel((16, 12))
-                assert red > 220 and green > 100 and blue < 50
+                actual = preview.convert("RGB").getpixel((16, 12))
+                expected = current_source.convert("RGB").getpixel((16, 12))
+                assert max(abs(a - b) for a, b in zip(actual, expected, strict=True)) <= 6, (actual, expected)
             await check_repeated_wired_selection(library, downstream, anchor["source_uid"], uid, generator, cloud)
             await current_engine().aclose_workflow(library.workflow)
             assert not library._scan_owner_is_current(), "Closed workflow still owns pending execution"
-    print("Standard LoadImage -> ImageAsset -> HMBPrompt: macro JPEG, first/repeat Resolve, legacy declaration, "
-          "preserved Shot and image order, peer publication, unbound callback, retired workflow PASS")
+    print("Standard LoadImage -> ImageAsset -> HMBPrompt: macro JPEG, first/repeat Resolve, initial preview "
+          "during verification, same-path replacement rejected, legacy declaration, preserved Shot and image "
+          "order, peer publication, unbound callback, retired workflow PASS")
 
 
 async def check_repeated_wired_selection(library, downstream, anchor, imported, generator, cloud):
@@ -412,6 +471,16 @@ async def check_repeated_wired_selection(library, downstream, anchor, imported, 
             assert time.monotonic() < deadline, (before, chosen, downstream._current_state()["image_asset"]["ordered_source_uids"])
             await asyncio.sleep(.01)
         assert library._current_state()["shot_routing"]["shots"][0]["selected_source_uids"] == chosen
+        # Agent Run can arrive before a restored/edited Prompt has published its
+        # fresh editor rows. Verify the outgoing text and actual reference order.
+        downstream.parameter_output_values["PROMPT_OUT"] = "Previous Shot order"
+        document = downstream._hmb_prompt_document_for_agent_run(
+            channel_uuid=request["channel"], shot_uuid=request["shot"])
+        visible = document["visible_prompt"]
+        assert downstream.parameter_output_values["PROMPT_OUT"] == visible
+        assert list(document["image_media"]) == [source_paths[uid] for uid in chosen]
+        for number, uid in enumerate(chosen, 1):
+            assert f"@image{number} = {Path(source_paths[uid]).stem}" in visible, (number, visible)
         images = generator._resolve_exact_shot_generation_inputs({
             **generator._get_parameters(), "model_id": seedance.SEEDANCE_2_5_MODEL_ID,
             "resolution":"480p", "duration":4, "prompt":"Use all three references.",

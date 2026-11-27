@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Future
 import copy
 import hashlib
 import logging
 from pathlib import Path
 import re
+import secrets
 from stat import S_ISREG
 from tempfile import TemporaryDirectory
 import threading
@@ -15,7 +17,7 @@ from urllib.parse import urlsplit
 from HMBFinishLookLibrary import (
     DataNode, _add_parameter, _add_widget_parameter, _mode, _set_parameter_silently,
 )
-from _hmb_analysis_delivery import ANALYSIS_RESULT_TEXT_LIMIT
+from _hmb_analysis_delivery import ANALYSIS_RESULT_TEXT_LIMIT, invalidate_resolved_analysis_consumer
 from _hmb_reference_analysis import ANALYSIS_CATEGORIES, AnalysisError, _source_path, analysis_model_choices
 from _hmb_shot_routing import _same_flow_nodes, release_node_lifecycle, schedule_post_registration_reconcile
 
@@ -55,7 +57,14 @@ _LOG = logging.getLogger(__name__)
 
 
 class _AnalysisStateError(ValueError):
-    pass
+    code = "ANALYSIS_STATE_INVALID"
+
+
+class _OtherShotAnalyzing(Exception):
+    """An execution must await an already admitted job before its own admission."""
+
+    def __init__(self, completion):
+        self.completion = completion
 
 
 def _text(value: Any, limit: int) -> str:
@@ -147,6 +156,9 @@ def _result(value: Any, kind: str) -> dict:
     model_settings_digest = value.get("model_settings_sha256")
     if isinstance(model_settings_digest, str) and re.fullmatch("[0-9a-f]{64}", model_settings_digest):
         result["model_settings_sha256"] = model_settings_digest
+    manual_run = value.get("manual_run_id")
+    if isinstance(manual_run, str) and re.fullmatch("[0-9a-f]{32}", manual_run):
+        result["manual_run_id"] = manual_run
     broker_request_id = value.get("broker_request_id")
     if isinstance(broker_request_id, str) and re.fullmatch("analysis-[0-9a-f]{32}", broker_request_id):
         result["broker_request_id"] = broker_request_id
@@ -162,9 +174,9 @@ def _scope(channel: str, shot: str) -> str:
 
 
 def _default_slot() -> dict:
-    return {"origin": "", "kind": "", "source_id": "", "source_role": "after", "path": "", "model": "", "guidance": "",
+    return {"origin": "", "kind": "", "source_id": "", "source_binding": "", "source_role": "after", "path": "", "model": "", "guidance": "",
             "start": None, "end": None, "frame_ranges": [], "time_ranges": [], "full_video": False,
-            "result": {}, "stamp": [], "categories": [],
+            "result": {}, "stamp": [], "categories": [], "analysis_pending": False,
             "edited_result": "", "edited_categories": [], "field_overrides": {},
             "applied": False, "prompt_applied": False, "results_only": False,
             "send_agent": True, "send_original": False, "original_stamp": []}
@@ -250,6 +262,8 @@ def _normalize_slot(value: Any) -> dict:
         return slot
     saved_model = _text(value.get("model"), 128)
     slot.update(origin=origin, kind=kind, source_id=_text(value.get("source_id"), 512),
+        source_binding=_text(value.get("source_binding"), 80) if origin == "prompt" else "",
+        analysis_pending=value.get("analysis_pending") is True,
         source_role=value["source_role"] if value.get("source_role") in _ROLES else "after",
         path=_text(value.get("path"), 4096) if origin == "direct" else "",
         model=saved_model if saved_model in analysis_model_choices(kind) else "",
@@ -265,6 +279,8 @@ def _normalize_slot(value: Any) -> dict:
             not slot["frame_ranges"] and slot["start"] is None and slot["end"] is None)
     result = _result(value.get("result"), kind)
     stamp, categories = value.get("stamp"), value.get("categories")
+    if slot["analysis_pending"] and isinstance(categories, list):
+        slot["categories"] = [key for key in ANALYSIS_CATEGORIES[kind] if key in categories]
     if result and _valid_stamp(stamp) and isinstance(categories, list):
         selected = [key for key in result["observations"] if key in categories]
         slot.update(result=result, stamp=list(stamp), categories=selected,
@@ -332,6 +348,77 @@ def _find_analysis_node(nodes: list[Any], *, role: str) -> Any | None:
     live = _live_analysis_nodes(nodes)
     matches = [node for node in live if _analysis_role(node) == role]
     return matches[0] if len(live) <= len(_ROLES) and len(matches) == 1 else None
+
+
+def analysis_render_input_preview(prompt_owner: Any, *, channel_uuid: str, shot_uuid: str) -> dict:
+    """Project applied settings for controls without resolving, hashing or opening media."""
+    from _hmb_connection_management import relationship_suspended
+
+    flow, nodes = _same_flow_nodes(prompt_owner)
+    if not flow or prompt_owner not in nodes:
+        return {}
+    key = _scope(channel_uuid, shot_uuid)
+    result = {}
+    for role in _ROLES:
+        node = _find_analysis_node(nodes, role=role)
+        if node is None or relationship_suspended(prompt_owner, node):
+            continue
+        with node._lock:
+            slot = node._slots.get(key)
+            if not slot:
+                continue
+            contributes = bool(slot["result"] or slot.get("analysis_pending"))
+            if role == "after":
+                contributes = ((contributes and slot["send_agent"]) or slot["results_only"]
+                               or slot["origin"] == "direct")
+            if not contributes:
+                continue
+            row = {field: copy.deepcopy(slot[field]) for field in (
+                "origin", "kind", "source_id", "path", "model", "guidance", "start", "end", "full_video",
+                "frame_ranges", "time_ranges", "categories", "field_overrides", "results_only", "send_agent")}
+            running = node._job is not None and node._job[0] == key
+            row.update(cache_key=slot["result"].get("cache_key", ""), edited=_edited_result(slot),
+                       analysis_pending=bool(slot.get("analysis_pending") or running))
+            if manual_run := slot["result"].get("manual_run_id"):
+                row["manual_run_id"] = manual_run
+            result[role] = row
+    return result
+
+
+async def prepare_analysis_for_run(owner: Any, *, channel_uuid: str, shot_uuid: str,
+                                   role: str, check_live=None) -> None:
+    """Refresh only this execution's applied Analysis route at its point in the chain."""
+    from _hmb_connection_management import relationship_suspended
+
+    flow, nodes = _same_flow_nodes(owner)
+    if not flow or owner not in nodes:
+        return
+    live = _live_analysis_nodes(nodes)
+    matching = [node for node in live if _analysis_role(node) == role
+                and not relationship_suspended(owner, node)]
+    if not matching:
+        return
+    if len(matching) != 1 or _find_analysis_node(nodes, role=role) is not matching[0]:
+        raise _AnalysisStateError("분석 노드의 위치와 중복 연결을 확인하세요.")
+    from HMBAgentLibrary import (_HMB_SOURCE_PREPARE_RETRY_SECONDS, _HMB_SOURCE_PREPARE_TIMEOUT_SECONDS,
+                                 _HMBSourcePreparationError, _hmb_source_is_preparing)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _HMB_SOURCE_PREPARE_TIMEOUT_SECONDS
+    while True:
+        if check_live is not None:
+            check_live()
+        try:
+            await matching[0]._prepare_for_run(owner, channel_uuid, shot_uuid, role, check_live)
+            return
+        except _OtherShotAnalyzing as busy:
+            await asyncio.shield(asyncio.wrap_future(busy.completion))
+        except ValueError as exc:
+            if not _hmb_source_is_preparing(exc):
+                raise
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise _HMBSourcePreparationError("SOURCE_PREPARATION_TIMEOUT") from None
+            await asyncio.sleep(min(remaining, _HMB_SOURCE_PREPARE_RETRY_SECONDS))
 
 
 def get_analysis_context(prompt_owner: Any, *, channel_uuid: str, shot_uuid: str, destination: str) -> dict:
@@ -406,7 +493,10 @@ def get_analysis_results_only(prompt_owner: Any, *, channel_uuid: str, shot_uuid
                 and node._slots.get(_scope(channel_uuid, shot_uuid), {}).get("results_only") is True)
 
 
-def _notify_prompt_media_changed(owner: Any, channel: str, shot: str) -> None:
+def _notify_prompt_media_changed(owner: Any, channel: str, shot: str, *, changed_role: str = "") -> None:
+    invalidate = getattr(owner, "_hmb_invalidate_analysis_route", None)
+    if changed_role in _ROLES and callable(invalidate):
+        invalidate(channel_uuid=channel, shot_uuid=shot, role=changed_role)
     notify = getattr(owner, "_hmb_notify_analysis_delivery_changed", None)
     if callable(notify):
         notify(channel_uuid=channel, shot_uuid=shot)
@@ -622,7 +712,7 @@ class HMBAnalysisAgent(DataNode):
                    and any(row["shot_uuid"] == shot for row in catalog["shots"])]
         return matched[0] if len(matched) == 1 else None
 
-    def _resolve_source(self, owner: Any, channel: str, shot: str, slot: dict) -> dict:
+    def _resolve_source(self, owner: Any, channel: str, shot: str, slot: dict, *, execution: bool = False) -> dict:
         if slot["origin"] == "direct":
             try:
                 path, kind = _local_file(slot["path"])
@@ -638,10 +728,15 @@ class HMBAnalysisAgent(DataNode):
         if not callable(getter):
             return {}
         try:
-            row = getter(channel_uuid=channel, shot_uuid=shot, kind=slot["kind"], source_id=slot["source_id"])
+            row = getter(channel_uuid=channel, shot_uuid=shot, kind=slot["kind"],
+                         source_id=slot.get("source_binding") or slot["source_id"])
         except (RuntimeError, ValueError):
+            if execution:
+                raise
             return {}
-        if (not isinstance(row, dict) or row.get("kind") != slot["kind"] or row.get("source_id") != slot["source_id"]
+        if (not isinstance(row, dict) or row.get("kind") != slot["kind"]
+                or (row.get("source_id") != slot["source_id"] and not (
+                    slot.get("source_binding") and row.get("source_binding") == slot["source_binding"]))
                 or not isinstance(row.get("path"), str) or not row["path"]):
             return {}
         return row
@@ -720,7 +815,8 @@ class HMBAnalysisAgent(DataNode):
                  (_source_stamp(selected) if selected and (slot["result"] or slot["send_original"]
                   or not path.startswith("data:image/")) else []))
         other_role_source = not selected and slot["origin"] == "prompt" and slot["source_role"] != _analysis_role(self)
-        invalidated = not prepared_page and not other_role_source and bool(slot["result"] and stamp != slot["stamp"])
+        invalidated = not prepared_page and not other_role_source and bool(slot["result"] and (
+            stamp != slot["stamp"] or selected.get("source_id") != slot["source_id"]))
         original_changed = not prepared_page and not other_role_source and slot["send_original"] and stamp != slot["original_stamp"]
         with self._lock:
             current = self._slots.get(_scope(channel, shot), _default_slot())
@@ -755,15 +851,23 @@ class HMBAnalysisAgent(DataNode):
                     self._queue_preview(identity, selected, slot["start"], slot["end"])
             else:
                 self._queue_preview(identity, selected, slot["start"], slot["end"])
-            if invalidated and not preserve_results:
-                current.update(result={}, stamp=[], categories=[], edited_result="", edited_categories=[],
-                               field_overrides={}, prompt_applied=False, applied=slot["send_original"])
-            if original_changed and not preserve_results:
+            may_invalidate = not preserve_results and not (self._job and self._job[0] == _scope(channel, shot))
+            if (not prepared_page and may_invalidate and not slot.get("source_binding")
+                    and selected.get("source_binding") and selected.get("source_id") == slot["source_id"]):
+                current["source_binding"] = selected["source_binding"]
+            if invalidated and may_invalidate:
+                current.update(result={}, stamp=[], edited_result="", edited_categories=[],
+                               field_overrides={}, prompt_applied=False, applied=slot["send_original"],
+                               analysis_pending=True)
+            if original_changed and may_invalidate:
                 current.update(original_stamp=[], send_original=False,
                                applied=current["send_agent"] and bool(current["result"]))
-            if invalidated or original_changed:
+            if (invalidated or original_changed) and may_invalidate:
                 self._revision += 1
                 self._status = "참고 소스가 변경되어 다시 분석해야 합니다."
+        if (invalidated or original_changed) and may_invalidate:
+            invalidate_resolved_analysis_consumer(self)
+            _notify_prompt_media_changed(owner, channel, shot, changed_role=_analysis_role(self))
 
     def _queue_preview(self, identity: tuple, source: dict, legacy_start: float | None, legacy_end: float | None) -> None:
         if self._preview_request is None or self._preview_request[0] != identity:
@@ -829,7 +933,7 @@ class HMBAnalysisAgent(DataNode):
             key = _scope(channel, shot)
             slot = self._slots.get(key, _default_slot())
             public = {k: copy.deepcopy(v) for k, v in slot.items()
-                      if k not in ("path", "source_role", "stamp", "original_stamp", "edited_result",
+                      if k not in ("path", "source_role", "source_binding", "stamp", "original_stamp", "edited_result",
                                    "edited_categories", "field_overrides", "prompt_applied")}
             if role == "before":
                 public["fields"] = _prompt_result_fields(slot)
@@ -876,7 +980,7 @@ class HMBAnalysisAgent(DataNode):
                 live_keys.add(identity)
                 saved = self._slots.get(_scope(channel, row_id), _default_slot())
                 shown = {k: copy.deepcopy(v) for k, v in saved.items()
-                    if k not in ("path", "source_role", "stamp", "original_stamp", "edited_result",
+                    if k not in ("path", "source_role", "source_binding", "stamp", "original_stamp", "edited_result",
                                  "edited_categories", "field_overrides", "prompt_applied")}
                 if role == "before":
                     shown["fields"] = _prompt_result_fields(saved)
@@ -991,9 +1095,12 @@ class HMBAnalysisAgent(DataNode):
             current = self._slots.get(key, {})
             slot["results_only"] = current.get("results_only", False)
             slot["source_role"] = _analysis_role(self) or "after"
-            for field in ("origin", "kind", "source_id", "source_role", "path", "start", "end", "frame_ranges",
+            for field in ("origin", "kind", "source_id", "source_binding", "source_role", "path", "start", "end", "frame_ranges",
                           "time_ranges", "full_video", "model", "guidance"):
                 if current.get(field) != slot[field]:
+                    if current.get("result") or current.get("analysis_pending"):
+                        slot["analysis_pending"] = True
+                        slot["send_agent"] = current["send_agent"]
                     self._slots[key] = slot
                     break
             self._active = (channel, shot)
@@ -1002,9 +1109,11 @@ class HMBAnalysisAgent(DataNode):
         self._refresh_sources()
         if publish:
             self._publish()
-        if _analysis_role(self) == "after" and (current.get("origin") == "direct" or slot["origin"] == "direct"):
+        if current != slot and (current.get("result") or slot.get("analysis_pending")
+                or (_analysis_role(self) == "after" and (current.get("origin") == "direct" or slot["origin"] == "direct"))):
             owner = self._exact_owner(self._registered_catalogs(), channel, shot)
-            _notify_prompt_media_changed(owner, channel, shot)
+            invalidate_resolved_analysis_consumer(self)
+            _notify_prompt_media_changed(owner, channel, shot, changed_role=_analysis_role(self))
 
     def _hmb_pick_prompt_reference(self, prompt_owner: Any, *, channel_uuid: str, shot_uuid: str,
             kind: str, source_id: str, guidance: str = "", publish: bool = True) -> bool:
@@ -1027,6 +1136,7 @@ class HMBAnalysisAgent(DataNode):
                             applied=slot["send_original"])
         elif kind != "image":
             slot.update(start=_seconds(source.get("start_seconds")), end=_seconds(source.get("end_seconds")))
+        slot["source_binding"] = source.get("source_binding", "")
         try:
             self._select_source(channel_uuid, shot_uuid, slot, publish=publish)
         except _AnalysisStateError:
@@ -1051,7 +1161,8 @@ class HMBAnalysisAgent(DataNode):
         stamp = _source_stamp(source)
         with self._lock:
             if (self._hmb_node_deleted or _analysis_role(self) != role
-                    or self._slots.get(key) != slot or stamp != slot[stamp_key]):
+                    or self._slots.get(key) != slot or stamp != slot[stamp_key]
+                    or source.get("source_id") != slot["source_id"]):
                 return {}, {}
         return slot, source
 
@@ -1137,7 +1248,58 @@ class HMBAnalysisAgent(DataNode):
             context.update(items=[], edited_result=edited)
         return context
 
-    def _start_analysis(self, owner: Any, channel: str, shot: str, slot: dict, source: dict, command: dict) -> None:
+    async def _prepare_for_run(self, owner, channel, shot, role, check_live):
+        from _hmb_reference_analysis import reference_source_digest
+
+        key = _scope(channel, shot)
+        with self._lock:
+            slot = copy.deepcopy(self._slots.get(key, {}))
+            job = self._job
+        if (not slot.get("origin") or (role == "after" and not slot["send_agent"])
+                or not (slot["result"] or slot.get("analysis_pending") or (job and job[0] == key))):
+            return
+        if self._exact_owner(self._registered_catalogs(), channel, shot) is not owner:
+            raise _AnalysisStateError("분석기의 샷 연결을 확인하세요.")
+        with self._lock:
+            job = self._job
+            completion = self._job_completion if job else None
+        if completion is not None:
+            # Manual and inherited Runs share the same in-flight work. Jobs for
+            # a different Shot serialize on this analyzer but keep their own outcomes.
+            if job[0] != key:
+                raise _OtherShotAnalyzing(completion)
+            failure = await asyncio.shield(asyncio.wrap_future(completion))
+            if failure:
+                raise _AnalysisStateError(failure)
+            self._require_run_result(owner, channel, shot, role)
+            return
+        source = self._resolve_source(owner, channel, shot, slot, execution=True)
+        if not source:
+            raise _AnalysisStateError("이 샷의 분석 원본을 읽을 수 없습니다.")
+        # Only explicitly executed, previously analyzed media is read. A
+        # same-size overwrite with a restored modification time must be detected.
+        digest = await asyncio.to_thread(reference_source_digest, source["path"], slot["kind"])
+        if check_live is not None:
+            check_live()
+        if (self._hmb_node_deleted or _analysis_role(self) != role
+                or self._exact_owner(self._registered_catalogs(), channel, shot) is not owner):
+            raise _AnalysisStateError("분석기의 샷 연결이 변경되었습니다.")
+        pending = self._start_analysis(owner, channel, shot, slot, source,
+            {"confirmed_paid": True}, execution_digest=digest)
+        if pending is not None:
+            failure = await asyncio.shield(asyncio.wrap_future(pending))
+            if failure:
+                raise _AnalysisStateError(failure)
+        self._require_run_result(owner, channel, shot, role)
+
+    def _require_run_result(self, owner, channel, shot, role):
+        route = "prompt_fields" if role == "before" else "send_agent"
+        slot, _ = self._verified_delivery(owner, channel, shot, route)
+        if not slot or (role == "before" and not slot["prompt_applied"]):
+            raise _AnalysisStateError(self._status or "이 샷의 분석 결과를 적용하지 못했습니다.")
+
+    def _start_analysis(self, owner: Any, channel: str, shot: str, slot: dict, source: dict,
+                        command: dict, *, execution_digest: str | None = None) -> Future | None:
         if command.get("confirmed_paid") is not True:
             raise _AnalysisStateError("유료 분석 실행을 확인하세요.")
         stamp = _source_stamp(source)
@@ -1154,10 +1316,29 @@ class HMBAnalysisAgent(DataNode):
             model = model_config.model
             model_digest = analysis_model_settings_digest(model_config)
         cached = slot["result"]
-        if (cached and slot["stamp"] == stamp and cached["model"] == model
+        reanalyze = execution_digest is None and command.get("reanalyze") is True
+        key = _scope(channel, shot)
+        with self._lock:
+            current = self._slots.get(key)
+            if current != slot:
+                inputs = ("origin", "source_role", "source_id", "kind", "path", "start", "end",
+                          "frame_ranges", "time_ranges", "full_video", "model", "guidance", "send_agent")
+                if execution_digest is None or not current or any(current[f] != slot[f] for f in inputs):
+                    raise _AnalysisStateError("샷이나 소스가 변경되었습니다. 분석 상태를 다시 확인하세요.")
+                # Another waiter may have finished the same exact input during the hash read.
+                slot = copy.deepcopy(current)
+                cached = slot["result"]
+        source_revised = source["source_id"] != slot["source_id"]
+        if (cached and not reanalyze and not source_revised and slot["stamp"] == stamp and cached["model"] == model
+                and (execution_digest is None or cached["source_digest"] == execution_digest)
                 and cached.get("model_settings_sha256", "") == model_digest):
+            if source.get("source_binding") and not slot.get("source_binding"):
+                with self._lock:
+                    if self._slots.get(key) == slot:
+                        self._slots[key]["source_binding"] = source["source_binding"]
             if _analysis_role(self) == "before":
-                self._apply_prompt_fields(owner, channel, shot)
+                if execution_digest is None or not slot["prompt_applied"]:
+                    self._apply_prompt_fields(owner, channel, shot)
             else:
                 with self._lock:
                     self._status = "저장된 분석 결과 재사용"
@@ -1168,57 +1349,82 @@ class HMBAnalysisAgent(DataNode):
         loop = GriptapeNodes.EventManager().event_loop
         if loop is None or loop.is_closed() or not loop.is_running():
             raise _AnalysisStateError("엔진이 시작된 뒤 분석을 실행하세요.")
-        key = _scope(channel, shot)
         token = threading.Event()
+        completion = Future()
         with self._lock:
             if self._slots.get(key) != slot:
                 raise _AnalysisStateError("샷이나 소스가 변경되었습니다. 분석 상태를 다시 확인하세요.")
             if self._job is not None:
+                if execution_digest is not None:
+                    if self._job[0] == key:
+                        return self._job_completion
+                    raise _OtherShotAnalyzing(self._job_completion)
                 raise _AnalysisStateError("실행 중인 분석이 완료된 뒤 다시 시도하세요.")
             self._job = key, token
+            self._job_completion = completion
             self._status, self._error = "참고 소스 분석 중…", ""
 
         async def run() -> None:
+            failure = "분석이 취소되었거나 소스가 변경되었습니다."
             try:
-                if slot["full_video"]:
+                if slot["full_video"] or (source_revised and slot["kind"] == "audio" and not slot["time_ranges"]):
                     range_arguments = {"start": _seconds(source.get("start_seconds")),
                                        "end": _seconds(source.get("end_seconds"))}
                 elif slot["frame_ranges"]:
                     range_arguments = {"frame_ranges": slot["frame_ranges"]}
                 elif slot["time_ranges"]:
+                    if source_revised and any(
+                        (source.get("start_seconds") is not None and row["start"] < source["start_seconds"])
+                        or (source.get("end_seconds") is not None and row["end"] > source["end_seconds"])
+                        for row in slot["time_ranges"]
+                    ):
+                        raise _AnalysisStateError("선택한 오디오 분석 구간이 변경된 소스 범위를 벗어났습니다.")
                     range_arguments = {"time_ranges": slot["time_ranges"]}
                 else:
                     range_arguments = {"start": slot["start"], "end": slot["end"]}
                 result = await asyncio.to_thread(analyze_reference, self, source=source["path"],
                     kind=slot["kind"], **range_arguments,
                     model=model, model_config=model_config, guidance=slot["guidance"], is_live=lambda: not token.is_set(),
-                    analysis_context={"channel_uuid": channel, "shot_uuid": shot})
+                    analysis_context={"channel_uuid": channel, "shot_uuid": shot}, force_refresh=reanalyze)
                 result = _result(result, slot["kind"])
                 if not result:
                     raise _AnalysisStateError("검토할 수 있는 분석 결과를 받지 못했습니다.")
-                owner = self._exact_owner(self._registered_catalogs(), channel, shot)
-                fresh = self._resolve_source(owner, channel, shot, slot) if owner is not None else {}
-                if not fresh or _source_stamp(fresh) != stamp:
+                if reanalyze:
+                    result["manual_run_id"] = secrets.token_hex(16)
+                current_owner = self._exact_owner(self._registered_catalogs(), channel, shot)
+                fresh = self._resolve_source(owner, channel, shot, slot) if current_owner is owner else {}
+                if (not fresh or _source_stamp(fresh) != stamp or fresh["source_id"] != source["source_id"]
+                        or (execution_digest is not None and result["source_digest"] != execution_digest)):
                     raise _AnalysisStateError("분석 중 참고 소스가 바뀌었습니다.")
                 committed = False
                 with self._lock:
                     if not token.is_set() and self._slots.get(key) == slot:
                         previous_edit = ({name: slot[name] for name in ("categories", "edited_result", "edited_categories", "field_overrides")}
-                                         if slot["result"].get("cache_key") == result["cache_key"]
+                                         if not reanalyze and slot["result"].get("cache_key") == result["cache_key"]
                                          else {"categories": [], "edited_result": "", "edited_categories": [], "field_overrides": {}})
                         self._slots[key] = {**slot, "result": result, "stamp": stamp,
+                            "source_id": source["source_id"], "source_binding": source.get("source_binding", ""),
                             **previous_edit,
-                            "prompt_applied": False, "applied": slot["send_original"] or slot["send_agent"]}
+                            "analysis_pending": False, "prompt_applied": False,
+                            "applied": slot["send_original"] or slot["send_agent"]}
+                        if reanalyze or (execution_digest is not None and result["cache_key"] != slot["result"].get("cache_key")):
+                            self._slots[key]["categories"] = [key for key in slot["categories"]
+                                                              if key in result["observations"]]
+                        if source_revised and slot["kind"] == "audio" and not slot["time_ranges"]:
+                            self._slots[key].update(range_arguments)
                         committed = True
                         self._status = "저장된 분석 결과 재사용" if result["cache_hit"] else "분석 완료"
-                if committed and _analysis_role(self) == "before" and not token.is_set():
-                    self._apply_prompt_fields(owner, channel, shot)
+                if committed and not token.is_set():
+                    if _analysis_role(self) != "before" or self._apply_prompt_fields(owner, channel, shot):
+                        failure = ""
             except (AnalysisError, _AnalysisStateError) as exc:
+                failure = str(exc)
                 with self._lock:
                     if not token.is_set():
                         self._error, self._status = getattr(exc, "code", "ANALYSIS_SOURCE_CHANGED"), str(exc)
             except Exception:
                 _LOG.exception("Reference analysis failed")
+                failure = "참고 소스 분석을 완료하지 못했습니다."
                 with self._lock:
                     if not token.is_set():
                         self._error, self._status = "ANALYSIS_FAILED", "참고 소스 분석을 완료하지 못했습니다."
@@ -1229,7 +1435,11 @@ class HMBAnalysisAgent(DataNode):
                         self._revision += 1
                         if token.is_set():
                             self._status = "분석 취소"
-                self._publish()
+                try:
+                    _notify_prompt_media_changed(owner, channel, shot, changed_role=_analysis_role(self) if not failure else "")
+                finally:
+                    completion.set_result(failure)
+                    self._publish()
 
         coroutine = run()
         try:
@@ -1238,7 +1448,11 @@ class HMBAnalysisAgent(DataNode):
             coroutine.close()
             with self._lock:
                 self._job = None
+            completion.set_result("엔진에 분석 요청을 전달할 수 없습니다.")
             raise _AnalysisStateError("엔진에 분석 요청을 전달할 수 없습니다.") from None
+        if reanalyze:
+            _notify_prompt_media_changed(owner, channel, shot, changed_role=_analysis_role(self))
+        return completion
 
     def _run_command(self, command: dict) -> None:
         action = command.get("action")
@@ -1283,8 +1497,8 @@ class HMBAnalysisAgent(DataNode):
                     self._slots.pop(key, None)
             self._refresh_sources()
             self._status = "참고 소스 선택 해제"
-            if _analysis_role(self) == "after" and slot["origin"] == "direct":
-                _notify_prompt_media_changed(owner, channel, shot)
+            if slot["result"] or slot.get("analysis_pending") or (_analysis_role(self) == "after" and slot["origin"] == "direct"):
+                _notify_prompt_media_changed(owner, channel, shot, changed_role=_analysis_role(self))
             return
         route_only = (action == "delivery" and "results_only" in command and "result_text" not in command
                       and command.get("categories", slot["categories"]) == slot["categories"])
@@ -1408,8 +1622,8 @@ class HMBAnalysisAgent(DataNode):
                     raise _AnalysisStateError("분석 작업의 샷 저장 공간이 가득 찼습니다.")
                 self._slots[key] = updated
                 self._status = "분석 결과 수정 저장" if editing else "이 샷의 전달 설정 저장"
-            if results_only != slot["results_only"]:
-                _notify_prompt_media_changed(owner, channel, shot)
+            if updated != slot:
+                _notify_prompt_media_changed(owner, channel, shot, changed_role=_analysis_role(self))
             return
         raise _AnalysisStateError("분석 명령을 확인하세요.")
 

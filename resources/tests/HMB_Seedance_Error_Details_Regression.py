@@ -284,7 +284,7 @@ class ErrorDetailTests(unittest.TestCase):
             node._set_broker_task_outputs(task, generation_id="job-diag", status=task["status"])
             self.assertEqual(node.get_parameter_value("resume_generation_id"), "job-diag")
 
-    def test_explicit_runs_after_saved_failed_resume_create_once_each(self):
+    def test_saved_failed_resume_rechecks_same_task_on_every_run(self):
         async def check():
             node = self.node()
             node._clear_execution_status = mock.Mock()
@@ -292,46 +292,19 @@ class ErrorDetailTests(unittest.TestCase):
                 stage="terminal", task_id="job-old", task_identity="broker_task", status="failed", terminal=True,
             )
             node.set_parameter_value("resume_generation_id", "job-old")
-            node._submission_start_is_authorized = lambda **kwargs: True
-            node._output_file = SimpleNamespace(build_file=lambda: object(), _default_filename="output.mp4")
-            node._get_parameters = lambda: {
-                "resume_generation_id": node.get_parameter_value("resume_generation_id") or "",
-                "model_id": target.SEEDANCE_2_0_MODEL_ID, target.TASK_PARAMETER: target.TASK_TEXT_ONLY,
-                "output_format": "mp4", "return_last_frame": False,
-                "generation_timeout_seconds": 600, "poll_interval_seconds": 5,
-            }
-            # Transport/retry fixture: retained graph provenance is covered by
-            # the project-source suite; keep operation snapshot guards active.
-            node._manual_agent_prompt_source = lambda: None
-            selection = {"schema": target.PROJECT_SELECTION_SCHEMA,
-                         "project": {"project_id": "superwings12", "project_name": "슈퍼윙즈12"}}
-            node._capture_imageasset_project_selection = lambda: deepcopy(selection)
-            node._resolve_exact_shot_generation_inputs = lambda params: {
-                **params, **selection["project"],
-                "_hmb_imageasset_project_selection": deepcopy(selection)}
-            node._validate_parameters = lambda params: None
-            node._preflight_output_destination = lambda *args: None
-            node._prepare_video_references_for_run = lambda params: params
-            node._build_broker_payload = lambda params: {}
             bridge = SimpleNamespace(
-                generate_seedance=mock.Mock(side_effect=[
-                    {"job_id": f"job-new-{i}", "status": "failed", "error": "provider task ended with status failed"}
-                    for i in range(2)
-                ]),
-                refresh_job=mock.Mock(side_effect=AssertionError("Run must not query the already failed Resume task")),
+                generate_seedance=mock.Mock(side_effect=AssertionError("Unexpected paid submission")),
+                refresh_job=mock.Mock(return_value={"job_id": "job-old", "status": "failed",
+                                      "error": "provider task ended with status failed"}),
             )
             node._ensure_broker_connected = mock.AsyncMock(return_value=bridge)
-            with mock.patch.object(target, "_resolve_mp4_decode_verifier", return_value=SimpleNamespace(executable="fake", backend="regression")):
-                for count in range(1, 3):
-                    await node._aprocess_impl()
-                    self.assertEqual(bridge.generate_seedance.call_count, count)
-                    self.assertFalse(node.get_parameter_value("resume_generation_id"))
-                    self.assertFalse(node._generation_recovery_blocks_new_submission())
-                    self.assertEqual(node._generation_recovery_state()["task_id"], f"job-new-{count - 1}")
-                    self.assertIn("next explicit Run", node._set_status_results.call_args.kwargs["result_details"])
-            bridge.refresh_job.assert_not_called()
-            keys = [call.args[0]["client_request_id"] for call in bridge.generate_seedance.call_args_list]
-            self.assertEqual(len(set(keys)), 2)
+            for _ in range(2):
+                await node._aprocess_impl()
+                self.assertFalse(node.get_parameter_value("resume_generation_id"))
+                self.assertEqual(node._generation_recovery_state()["task_id"], "job-old")
+                self.assertIn("confirmed terminal", node._set_status_results.call_args.kwargs["result_details"])
+            bridge.generate_seedance.assert_not_called()
+            self.assertEqual([call.args[0] for call in bridge.refresh_job.call_args_list], ["job-old"] * 2)
         asyncio.run(check())
 
     def test_project_run_shows_original_name_after_cloud_staging(self):

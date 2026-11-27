@@ -241,6 +241,13 @@ class ReferenceAnalysisTest(unittest.TestCase):
             self.assertNotEqual(video["cache_key"], different["cache_key"])
         self.assertEqual(len(calls), 4)
         self.assertIn("효과 참고", calls[-1][0])
+        rerun = analysis.analyze_reference(None, source=str(self.video), kind="video", invoke=invoke,
+                                           cache_dir=cache, force_refresh=True)
+        self.assertFalse(rerun["cache_hit"])
+        self.assertEqual(len(calls), 5)
+        self.assertTrue(analysis.analyze_reference(None, source=str(self.video), kind="video", invoke=invoke,
+                                                  cache_dir=cache)["cache_hit"])
+        self.assertEqual(len(calls), 5)
 
     def test_installed_sdk_serializes_image_video_and_wav_inputs(self):
         import httpx

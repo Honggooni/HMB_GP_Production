@@ -11963,8 +11963,12 @@ class HMBPromptLibrary(DataNode):
         # Source clocks and catalog-wide generations are transport proofs, not
         # changes to another Shot's displayed text. Actual execution validates
         # all those proofs again through _hmb_prompt_shot_document.
-        return _canonical_sha256({key: state.get(key) for key in (
-            "shot", "images", "videos", "text", "sound_sources", "sound_overlays", "sound_direction", _SOURCE_INTENT_FALLBACKS_KEY)})
+        shot = state.get("shot") or {}
+        payload = {key: state.get(key) for key in (
+            "images", "videos", "text", "sound_sources", "sound_overlays", "sound_direction", _SOURCE_INTENT_FALLBACKS_KEY)}
+        # Renaming/re-numbering a catalog entry changes no authored model input.
+        payload["shot"] = {key: shot.get(key) for key in ("channel_uuid", "shot_uuid", "selected_source_uids")}
+        return _canonical_sha256(payload)
 
     def _hmb_remember_prompt_shot_view(self, state: Dict[str, Any], visible: str) -> bool:
         selected = _normalize_shot_selection(state.get("shot"))
@@ -12063,6 +12067,12 @@ class HMBPromptLibrary(DataNode):
                 try:
                     if keys is not None:
                         subscription = target._hmb_shot_channel_subscription()
+                        notify = getattr(target, "_hmb_notify_shot_preview", None)
+                        if callable(notify):
+                            for key in keys:
+                                channel, separator, shot = key.partition("/")
+                                if separator and shot:
+                                    notify(channel_uuid=channel, shot_uuid=shot)
                         if _prompt_document_key(subscription) not in keys:
                             continue
                     seen.add(id(target))
@@ -12071,6 +12081,43 @@ class HMBPromptLibrary(DataNode):
                     continue
         except Exception:
             pass
+
+    def _hmb_invalidate_analysis_route(self, *, channel_uuid: str, shot_uuid: str, role: str) -> None:
+        """An Analysis remote has no native wire to dirty its consumers."""
+        from _hmb_analysis_delivery import invalidate_resolved_analysis_consumer
+        if not channel_uuid or not shot_uuid or self._hmb_node_deleted:
+            return
+        if role == "before":
+            if self.lock:
+                return
+            invalidate_resolved_analysis_consumer(self)
+        workflow = getattr(self, "_workflow", None)
+        connections = getattr(getattr(workflow, "flows", None), "connections", None)
+        if connections is None:
+            try:
+                from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+                connections = GriptapeNodes.FlowManager().get_connections()
+            except (ImportError, AttributeError, RuntimeError, KeyError):
+                return
+        output = _get_parameter_obj(self, "PROMPT_OUT")
+        if output is None:
+            return
+        for edge in connections.get_outgoing_connections_from_parameter(self, output):
+            agent = edge.target_node
+            if (edge.target_parameter.name != "SHOT_PROMPT_IN" or getattr(agent, "lock", False)
+                    or not callable(getattr(agent, "_hmb_refresh_analysis_source_preview", None))):
+                continue
+            invalidate_resolved_analysis_consumer(agent)
+            final_text = _get_parameter_obj(agent, "output")
+            if final_text is None:
+                continue
+            for render_edge in connections.get_outgoing_connections_from_parameter(agent, final_text):
+                generator = render_edge.target_node
+                identify = getattr(generator, "_shot_identity", None)
+                if render_edge.target_parameter.name == "prompt" and callable(identify):
+                    identity = identify()
+                    if identity.get("channel_uuid") == channel_uuid and identity.get("shot_uuid") == shot_uuid:
+                        invalidate_resolved_analysis_consumer(generator)
 
     def _hmb_notify_analysis_delivery_changed(self, *, channel_uuid: str, shot_uuid: str) -> None:
         """Refresh the analysis note on the exact connected Agent display."""
@@ -12118,7 +12165,8 @@ class HMBPromptLibrary(DataNode):
                               for source in cached.get("_sources", ())):
             return {"schema": cached["schema"], "version": cached["version"],
                 "subscription": dict(cached["subscription"]),
-                "visible_prompt": cached["visible_prompt"], "revision": cached["revision"]}
+                "visible_prompt": cached["visible_prompt"], "revision": cached["revision"],
+                "fingerprint": cached.get("fingerprint", "")}
         if not bool(getattr(self, "_hmb_prompt_view_warmup_pending", False)):
             try:
                 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
@@ -12144,9 +12192,22 @@ class HMBPromptLibrary(DataNode):
                 self._hmb_prompt_view_warmup_pending = False
         return {}
 
+    def _hmb_prompt_document_for_agent_run(self, *, channel_uuid: str, shot_uuid: str) -> Dict[str, Any]:
+        return self._hmb_prompt_shot_document(channel_uuid=channel_uuid, shot_uuid=shot_uuid, _publish_for_agent=True)
+
+    async def _hmb_prepare_shot_analysis(self, *, channel_uuid, shot_uuid, for_agent=False, check_live=None):
+        from HMBAnalysisAgent import prepare_analysis_for_run
+
+        for role in (("before", "after") if for_agent else ("before",)):
+            if check_live is not None:
+                check_live()
+            await prepare_analysis_for_run(self, channel_uuid=channel_uuid, shot_uuid=shot_uuid,
+                                           role=role, check_live=check_live)
+
     def _hmb_prompt_shot_document(
         self, *, channel_uuid: Any, shot_uuid: Any, _analysis_sources_only: bool = False,
         _analysis_exclusions_only: bool = False, _analysis_upstream: bool = False,
+        _publish_for_agent: bool = False,
     ) -> Dict[str, Any]:
         """Read one exact execution document without changing the visible Shot.
 
@@ -12203,8 +12264,7 @@ class HMBPromptLibrary(DataNode):
                 "participant_kind": "prompt", "enabled": True,
                 "channel_uuid": selected["channel_uuid"], "shot_uuid": selected["shot_uuid"],
                 "shot_number": selected["number"], "shot_name": selected["name"]}
-            self._hmb_remember_prompt_shot_view(state, visible)
-            return copy.deepcopy({"schema": "hmb-prompt-shot-document", "version": 1,
+            document = copy.deepcopy({"schema": "hmb-prompt-shot-document", "version": 1,
                 "shot": state["shot"], "subscription": subscription, "visible_prompt": visible,
                 "machine_prompt": machine, "paired_snapshot": paired, "generation": generation,
                 "fingerprint": fingerprint, "context": context, "shot_context": context,
@@ -12214,6 +12274,17 @@ class HMBPromptLibrary(DataNode):
                 "reference_media": view._hmb_agent_reference_media(machine),
                 "generation_context": view._hmb_agent_generation_context(machine),
                 "project_identity": {key: project[key] for key in ("project_id", "project_name")}})
+            if (_publish_for_agent and _prompt_document_key(current.get("shot")) == _prompt_document_key(selected)
+                    and (self.parameter_output_values.get("PROMPT_OUT") != visible
+                         or self._hmb_last_machine_prompt_output != machine
+                         or self.parameter_output_values.get(SHOT_IMAGE_OUTPUT_PARAMETER_NAME) != images
+                         or self.parameter_output_values.get(SHOT_VIDEO_OUTPUT_PARAMETER_NAME) != videos)):
+                self._hmb_current_shot_images = list(images)
+                self._hmb_current_shot_videos = list(videos)
+                self._publish_compiled_prompt_state(state, visible, machine, fingerprint, publish_shot_media=True)
+            else:
+                self._hmb_remember_prompt_shot_view(state, visible)
+            return document
 
     @staticmethod
     def _hmb_analysis_visual_rows(state: Dict[str, Any], images: List[str], videos: List[str]):
@@ -12369,6 +12440,7 @@ class HMBPromptLibrary(DataNode):
             if not active:
                 state["shot_documents"] = target["shot_documents"]
             self.set_parameter_value(WIDGET_PARAMETER_NAME, _json_dumps(state))
+            self._hmb_invalidate_analysis_route(channel_uuid=channel_uuid, shot_uuid=shot_uuid, role="before")
             publisher = getattr(self, "publish_update_to_parameter", None)
             if callable(publisher):
                 try:
@@ -12416,8 +12488,18 @@ class HMBPromptLibrary(DataNode):
     ) -> Dict[str, Any]:
         rows = self._hmb_prompt_shot_document(channel_uuid=channel_uuid, shot_uuid=shot_uuid,
             _analysis_sources_only=True, _analysis_upstream=True)["analysis_sources"]
-        return next(({key: value for key, value in row.items() if key != "selector"} for row in rows
-                     if row["kind"] == kind and row["source_id"] == source_id), {})
+        return self._hmb_find_analysis_reference(rows, kind, source_id)
+
+    @staticmethod
+    def _hmb_find_analysis_reference(rows, kind, source_id):
+        matches = []
+        for row in rows:
+            if row["kind"] != kind:
+                continue
+            binding = "picker:" + _canonical_sha256([kind, row["selector"]])
+            if source_id in (row["source_id"], binding):
+                matches.append({**{k: v for k, v in row.items() if k != "selector"}, "source_binding": binding})
+        return matches[0] if len(matches) == 1 else {}
 
     def _hmb_analysis_preview_exclusions_for(self, *, channel_uuid: str, shot_uuid: str) -> Dict[str, List[str]]:
         view = self._hmb_analysis_preview_view(channel_uuid=channel_uuid, shot_uuid=shot_uuid)
@@ -12432,8 +12514,7 @@ class HMBPromptLibrary(DataNode):
     ) -> Dict[str, Any]:
         rows = self._hmb_prompt_shot_document(channel_uuid=channel_uuid, shot_uuid=shot_uuid,
             _analysis_sources_only=True)["analysis_sources"]
-        return next(({key: value for key, value in row.items() if key != "selector"} for row in rows
-                     if row["kind"] == kind and row["source_id"] == source_id), {})
+        return self._hmb_find_analysis_reference(rows, kind, source_id)
 
     def _hmb_available_prompt_shot_catalog(
         self,
@@ -13648,6 +13729,10 @@ class HMBPromptLibrary(DataNode):
             state, prompt, machine_prompt, fingerprint = (
                 self._compile_current_prompt_pair()
             )
+        return self._publish_compiled_prompt_state(state, prompt, machine_prompt, fingerprint,
+            publish_shot_media=publish_shot_media)
+
+    def _publish_compiled_prompt_state(self, state, prompt, machine_prompt, fingerprint, *, publish_shot_media):
         # Finish preparing display pages before content publication can wake an
         # Agent. Page-only writes never enter this synchronization method.
         active_view_changed = self._hmb_remember_prompt_shot_view(state, prompt)
@@ -14793,6 +14878,23 @@ class HMBPromptLibrary(DataNode):
         self._restore_picker_connection_state()
         self._schedule_post_hydration_shot_reconcile()
         return result
+
+    async def aprocess(self) -> None:
+        if getattr(self, "_hmb_node_deleted", False):
+            return
+        scope = self._hmb_shot_channel_subscription()
+        if scope["enabled"]:
+            channel, shot = scope["channel_uuid"], scope["shot_uuid"]
+
+            def check_shot():
+                current = self._hmb_shot_channel_subscription()
+                if (self._hmb_node_deleted or not current["enabled"]
+                        or (current["channel_uuid"], current["shot_uuid"]) != (channel, shot)):
+                    raise RuntimeError("분석 대기 중 실행할 Prompt 샷이 변경되었습니다.")
+
+            await self._hmb_prepare_shot_analysis(channel_uuid=channel, shot_uuid=shot, check_live=check_shot)
+            check_shot()
+        self.process()
 
     def process(self) -> None:
         if bool(getattr(self, "_hmb_node_deleted", False)):

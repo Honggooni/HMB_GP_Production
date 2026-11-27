@@ -29,7 +29,7 @@ _JOURNAL_ID = re.compile(r"[a-f0-9]{32}\Z")
 _SHA = re.compile(r"[a-f0-9]{64}\Z")
 _STAGES = frozenset(("prepared", "submitting", "polling", "remote_completed", "local_succeeded", "failed", "not_submitted", "interrupted"))
 _STATUSES = protocol.JOB_ACTIVE_STATUSES | protocol.JOB_SUCCESS_STATUSES | protocol.JOB_FAILURE_STATUSES | {"not_submitted", "cancelled_locally", "timed_out"}
-_FIELDS = frozenset(("schema", "version", "journal_id", "revision", "selection", "broker_server_url", "client_request_id", "job_id", "stage", "status", "model_id", "task", "output_format", "output_file", "saved_file_sha256", "request_fingerprint", "updated_at_ms", "draft_preview", "draft_source_task_id", "draft_source", "draft_final", "draft_final_resolution", "draft_outputs", "reference_lease_id", "queue_only_headers"))
+_FIELDS = frozenset(("schema", "version", "journal_id", "revision", "selection", "broker_server_url", "client_request_id", "job_id", "stage", "status", "model_id", "task", "output_format", "output_file", "saved_file_sha256", "request_fingerprint", "render_input_sha256", "updated_at_ms", "draft_preview", "draft_source_task_id", "draft_source", "draft_final", "draft_final_resolution", "draft_outputs", "reference_lease_id", "queue_only_headers"))
 
 
 def _preview_task_id(cp: dict[str, Any]) -> str:
@@ -96,7 +96,7 @@ def normalize_checkpoint(raw: Any) -> dict[str, Any]:
             raise ValueError("The private My Box Task identity is invalid.")
     if raw.get("output_format") not in {"mp4", "mov"} or raw["output_file"].startswith(("http:", "https:", "data:")):
         raise ValueError("The private My Box local destination is invalid.")
-    for field in ("saved_file_sha256", "request_fingerprint"):
+    for field in ("saved_file_sha256", "request_fingerprint", "render_input_sha256"):
         if raw.get(field) and (not isinstance(raw[field], str) or _SHA.fullmatch(raw[field]) is None):
             raise ValueError("The private My Box recovery checksum is invalid.")
     # Final metadata is a bounded, validated protocol projection, never raw detail.
@@ -705,6 +705,11 @@ class MyBoxController:
                 and cp.get("stage") in {"remote_completed", "local_succeeded"})
             source_completed = bool(supported and cp.get("model_id") == m.SEEDANCE_2_5_MODEL_ID and (preview_completed or child_of_draft)
                 and cp.get("broker_server_url") == node._selected_broker_server_url())
+            digest = cp.get("render_input_sha256")
+            matches = bool(digest and node._matches_render_digest(digest))
+            verifying = node._manual_reference_unverified()
+            if verifying or (digest and not matches and not selected_final):
+                source_completed = False
             state = projection.get("state", "unavailable")
             child_id = projection.get("child_task_id", "")
             slots = projection.get("finals_by_resolution", {})
@@ -742,6 +747,9 @@ class MyBoxController:
                 "action": node.get_parameter_value("draft_action"), "preview_available": not self._busy and node.get_parameter_value("resolution") == "480p",
                 "final_available": available, "job_id": parent_id if child_of_draft else cp.get("job_id", "") if cp.get("draft_preview") else "",
                 "source_completed": source_completed, "final_resolution": selected_final or cp.get("draft_final_resolution"),
+                "run_locked": (cp.get("stage") == "local_succeeded" and matches or verifying and
+                    (not cp or cp.get("stage") in {"local_succeeded", "not_submitted"}))
+                    and not node.get_parameter_value("resume_generation_id") and not self._busy,
                 "active_action": m.DRAFT_ACTION_FINAL if selected_final else "",
                 "effective_resolution": selected_final or node.get_parameter_value("resolution"),
                 "busy": self._busy or bool(selected_final), "final_busy": bool(selected_final), "cancel_available": False,
@@ -754,8 +762,6 @@ class MyBoxController:
         if not self._lock.acquire(blocking=False):
             return
         self._busy, self._post_started = True, False
-        self._capabilities = None
-        self._projection_checked_at = 0.0
         epoch = self._epoch
         cp: dict[str, Any] = {}
         origin = ""
@@ -779,10 +785,13 @@ class MyBoxController:
             # Recovery uses the durable checkpoint/Task, not this legacy value.
             frozen_source = ""
             frozen_action = self.node.get_parameter_value("draft_action")
+            frozen_digest = "" if refresh else self.node._render_authoring_digest()
+            manual_paths = {} if refresh else self.node._selected_manual_reference_paths()
+            manual_revision = getattr(self.node, "_hmb_manual_reference_revision", 0)
+            if manual_paths:
+                frozen_authoring = self.node._read_render_authoring_digest(draft_action=None)
             if frozen_params["model_id"] != _host(self.node).SEEDANCE_2_5_MODEL_ID:
                 frozen_action = _host(self.node).DRAFT_ACTION_OFF
-                if final:
-                    raise ValueError("Private Draft final requires Seedance 2.5.")
             resume = str(self.node.get_parameter_value("resume_generation_id") or "").strip()
             frozen_destination = None
             destination_error = None
@@ -792,6 +801,22 @@ class MyBoxController:
                 except Exception as exc:
                     destination_error = exc
             cp = await self._recover_checkpoint(cp)
+            edited_failed = bool(cp.get("stage") == "failed" and frozen_digest and cp.get("render_input_sha256")
+                                 and cp["render_input_sha256"] != frozen_digest)
+            may_create = not refresh and not resume and (not cp or cp.get("stage") in {"local_succeeded", "not_submitted"} or edited_failed)
+            if may_create and final and frozen_params["model_id"] != _host(self.node).SEEDANCE_2_5_MODEL_ID:
+                raise ValueError("Private Draft final requires Seedance 2.5.")
+            if (manual_paths and may_create and
+                    (self.node._manual_reference_unverified() or (not final and cp.get("render_input_sha256") != frozen_digest))):
+                if manual_revision != getattr(self.node, "_hmb_manual_reference_revision", 0):
+                    raise ValueError("The selected references changed during verification. Run with the current selection.")
+                await self.node._await_manual_reference_content()
+                frozen_digest = self.node._include_manual_reference_content(frozen_authoring, manual_paths)
+            if may_create and cp.get("render_input_sha256"):
+                if final and frozen_digest != cp["render_input_sha256"]:
+                    raise ValueError("Restore the completed private Draft's original inputs and settings before finalizing.")
+                if not final and cp["stage"] == "local_succeeded" and cp["render_input_sha256"] == frozen_digest:
+                    return
             historical_unresolved = bool(cp and cp["stage"] not in {"local_succeeded", "failed", "not_submitted"})
             if expected_source_task_id and (not final or _preview_task_id(cp) != expected_source_task_id):
                 raise ValueError("The private Draft source changed; no Final was submitted.")
@@ -801,8 +826,14 @@ class MyBoxController:
                 raise ValueError("There is no saved My Box Task to retrieve.")
             unresolved = bool(cp and cp["stage"] not in {"local_succeeded", "failed", "not_submitted"})
             historical_unresolved = unresolved
-            # Unknown or not-yet-published intents always recover, even on Run.
-            refreshing = bool(refresh or resume or unresolved)
+            # A repeated Run follows the original private task, including a
+            # confirmed failure until the authored inputs have changed.
+            failed_retry = bool(cp and cp["stage"] == "failed" and not final and (
+                not cp.get("render_input_sha256") or not frozen_digest
+                or cp["render_input_sha256"] == frozen_digest))
+            refreshing = bool(refresh or resume or unresolved or failed_retry)
+            self._capabilities = None
+            self._projection_checked_at = 0.0
             origin = cp["broker_server_url"] if refreshing or final else self.node._selected_broker_server_url()
             self._run_epoch, self._run_origin = epoch, origin
             if origin != self.node._selected_broker_server_url():
@@ -821,6 +852,9 @@ class MyBoxController:
                 # when the current account no longer has a workspace projection.
                 job = await asyncio.to_thread(broker.refresh, cp.get("job_id") or cp["client_request_id"], selection=cp["selection"], client_request_id=cp["client_request_id"], timeout=300)
                 self._guard(epoch, origin)
+                if job["status"] in protocol.JOB_FAILURE_STATUSES and not cp.get("render_input_sha256"):
+                    with suppress(ValueError, RuntimeError, TypeError, KeyError, AttributeError):
+                        cp = {**cp, "render_input_sha256": frozen_digest or self.node._render_authoring_digest()}
                 await self.node._run_blocking_generation_stage(self._observe_reference_job, cp, job)
                 if job["status"] == "completed" and await self._reuse_local(cp, epoch=epoch, origin=origin):
                     if _preview_task_id(cp):
@@ -910,6 +944,7 @@ class MyBoxController:
                         "broker_server_url": origin, "client_request_id": client_id, "job_id": "", "stage": "prepared", "status": "submitting",
                         "model_id": params["model_id"], "task": params["task"], "output_format": params["output_format"], "output_file": path,
                         "saved_file_sha256": "", "request_fingerprint": hashlib.sha256(invocation._payload_json.encode()).hexdigest(), "updated_at_ms": int(time.time() * 1000),
+                        "render_input_sha256": (source_cp.get("render_input_sha256", "") if final else frozen_digest),
                         "draft_preview": bool(params.get("_private_draft_preview")), "draft_source_task_id": source_cp["job_id"] if source_cp else "", "draft_source": source_projection if final else {}, "draft_final": source_projection if final else {}}
                     if final:
                         cp["draft_final_resolution"] = params["resolution"]
@@ -961,7 +996,7 @@ class MyBoxController:
                         with suppress(Exception):
                             self._status("succeeded", cp["job_id"], successful=True, details="SUCCESS: My Box original was saved. Refresh can restore its player.")
                     return
-                if cp and cp.get("stage") != "local_succeeded":
+                if cp and cp.get("stage") not in {"local_succeeded", "failed"}:
                     status = "submission_unknown" if ambiguous else cp["status"] if cp.get("job_id") or historical_unresolved and not rejection else "not_submitted"
                     cp = await self._persist({**cp, "status": status, "stage": "interrupted" if ambiguous or cp.get("job_id") else "not_submitted"}, required=False)
                 identifier = cp.get("job_id") or cp.get("client_request_id", "")

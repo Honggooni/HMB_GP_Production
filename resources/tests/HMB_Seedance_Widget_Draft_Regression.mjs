@@ -143,6 +143,27 @@ try {
     await callback(); receipt.cases.push({ name, passed: true });
     await page.evaluate(() => { window.fixtures.splice(0).forEach((f) => f.cleanup()); });
   };
+  await check("native-run-lock-follows-draft-edits-and-header-remount", async () => {
+    const observed = await page.evaluate(async () => {
+      const f = createFixture(makeState(1, { run_locked: true }));
+      let { run } = addNativeHeader(f);
+      await Promise.resolve();
+      const locked = run.inert && run.getAttribute("aria-disabled") === "true";
+      const changed = makeState(1, { run_locked: false, source_completed: false, final_available: false });
+      f.update(changed);
+      const released = !run.inert && !run.hasAttribute("aria-disabled") && f.button().hidden;
+      run.remove();
+      run = document.createElement("button");
+      run.innerHTML = '<svg class="lucide-square-play"></svg>';
+      run.disabled = true; // Independently owned stock engine disablement.
+      f.container.querySelector("[data-hmb-native-actions]").append(run);
+      f.update(makeState(1, { run_locked: true }));
+      const restored = run.inert && !f.button().hidden && !f.button().disabled;
+      f.update(changed);
+      return { locked, released, restored, hostStillDisabled: run.disabled && !run.inert };
+    });
+    assert.deepEqual(observed, { locked: true, released: true, restored: true, hostStillDisabled: true });
+  });
   await check("completed-current-Shot-and-Only-visible-without-preview-option", async () => {
     const results = await page.evaluate(() => [1, 0].map((shot) => window.view(createFixture(makeState(shot)))));
     results.forEach((result) => {

@@ -11,7 +11,6 @@ import math
 import os
 from pathlib import Path
 import re
-import stat
 import subprocess
 import sys
 import tempfile
@@ -121,10 +120,6 @@ def _validate_header(path: Path, kind: str) -> None:
         raise AnalysisError("ANALYSIS_SOURCE_FORMAT", "원본의 실제 미디어 형식을 확인하세요.")
 
 
-def _stat_identity(info: os.stat_result) -> tuple[int, ...]:
-    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
-
-
 def _read_source(source: str, kind: str, *, stage: Path | None = None,
                  is_live: Callable[[], bool]) -> str:
     if kind == "image" and isinstance(source, str) and source.startswith("data:"):
@@ -144,13 +139,11 @@ def _read_source(source: str, kind: str, *, stage: Path | None = None,
         return hashlib.sha256(data).hexdigest()
     path = _source_path(source, kind)
     limit = _MAX_IMAGE_BYTES if kind == "image" else _MAX_SOURCE_BYTES
-    digest = hashlib.sha256()
-    try:
-        info = path.stat()
-        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= limit:
-            raise AnalysisError("ANALYSIS_SOURCE_LIMIT", "참조 파일의 크기가 분석 범위를 벗어났습니다.")
-        with path.open("rb") as original, (stage.open("xb") if stage else nullcontext()) as output:
-            before = os.fstat(original.fileno())
+    from _hmb_analysis_delivery import FileChangedDuringHash, cached_file_sha256
+
+    def read_original(original):
+        digest = hashlib.sha256()
+        with (stage.open("xb") if stage else nullcontext()) as output:
             size = 0
             for chunk in iter(lambda: original.read(1024 * 1024), b""):
                 _live(is_live)
@@ -160,16 +153,19 @@ def _read_source(source: str, kind: str, *, stage: Path | None = None,
                 digest.update(chunk)
                 if output is not None:
                     output.write(chunk)
-            after = os.fstat(original.fileno())
-        # On Windows stat() and fstat() can report different creation-time
-        # values for the same file. Compare each clock only to its own later read.
-        if (size != info.st_size or _stat_identity(info) != _stat_identity(path.stat())
-                or _stat_identity(before) != _stat_identity(after)
-                or _stat_identity(info)[:-1] != _stat_identity(before)[:-1]):
-            raise AnalysisError("ANALYSIS_SOURCE_CHANGED", "분석 준비 중 원본이 변경되었습니다. 파일을 다시 선택하세요.")
+        if size != os.fstat(original.fileno()).st_size:
+            raise FileChangedDuringHash("Source changed during staging")
+        return digest.hexdigest()
+
+    try:
+        _live(is_live)
+        return cached_file_sha256(path, read=read_original, refresh=stage is not None, max_size=limit)
+    except FileChangedDuringHash:
+        raise AnalysisError("ANALYSIS_SOURCE_CHANGED", "분석 준비 중 원본이 변경되었습니다. 파일을 다시 선택하세요.") from None
+    except OverflowError:
+        raise AnalysisError("ANALYSIS_SOURCE_LIMIT", "참조 파일의 크기가 분석 범위를 벗어났습니다.") from None
     except OSError:
         raise AnalysisError("ANALYSIS_SOURCE_UNAVAILABLE", "선택한 원본 파일을 읽을 수 없습니다.") from None
-    return digest.hexdigest()
 
 
 def reference_source_digest(source: str, kind: str, *, is_live: Callable[[], bool] = lambda: True) -> str:
@@ -897,7 +893,7 @@ def analyze_reference(node: Any, *, source: str, kind: str, start: Any = None, e
                       model: str | None = None, guidance: str = "", is_live: Callable[[], bool] = lambda: True,
                       cache_dir: Path | None = None, invoke: Callable | None = None,
                       model_config: Any = None, frame_ranges: Any = None,
-                      time_ranges: Any = None, analysis_context: dict | None = None) -> dict:
+                      time_ranges: Any = None, analysis_context: dict | None = None, force_refresh: bool = False) -> dict:
     """Analyze one previously authorized source. Call on a worker after explicit user action."""
     if kind not in ANALYSIS_CATEGORIES:
         raise AnalysisError("ANALYSIS_SOURCE_FORMAT", "이미지, 동영상 또는 오디오 소스 한 개를 선택하세요.")
@@ -984,13 +980,14 @@ def analyze_reference(node: Any, *, source: str, kind: str, start: Any = None, e
             expected = _cache_identity(identity)
             key = expected["cache_key"]
             result_path = root / f"{key}.json"
-            if cached := _cache_get(result_path, expected):
-                return cached
-            previous = _cache_identity({**identity, "version": _PREVIOUS_ANALYSIS_VERSION})
-            if cached := _cache_get(root / (previous["cache_key"] + ".json"), previous):
-                return cached
-            with _request_claim(root / f"{key}.pending") as mark_submitted:
+            if not force_refresh:
                 if cached := _cache_get(result_path, expected):
+                    return cached
+                previous = _cache_identity({**identity, "version": _PREVIOUS_ANALYSIS_VERSION})
+                if cached := _cache_get(root / (previous["cache_key"] + ".json"), previous):
+                    return cached
+            with _request_claim(root / f"{key}.pending") as mark_submitted:
+                if not force_refresh and (cached := _cache_get(result_path, expected)):
                     return cached
                 attachments, evidence = _attachments(staged, kind, ("reference-analysis", source_digest),
                                                      ffmpeg, start_pts, span, is_live, frame_times=frame_times)

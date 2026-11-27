@@ -1,4 +1,4 @@
-"""Offline: an explicit fresh Run supersedes history, never an active invocation.
+"""Offline: an explicit Run resolves an existing Broker submission before new work.
 
 No provider requests, uploads, renders, workflow saves, or media deletion.
 """
@@ -97,62 +97,94 @@ def history(node, status, stage=None):
 async def matrix():
     cases = (("submission_unknown", None), ("queued", "accepted"), ("running", "accepted"),
              ("timed_out", None), ("cancelled_locally", None), ("failed", None),
-             ("cancelled", None), ("expired", None), ("succeeded", "remote_succeeded"),
-             ("succeeded", "local_succeeded"))
-    keys = []
+             ("cancelled", None), ("expired", None), ("succeeded", "remote_succeeded"))
     for shot in range(1, 6):
         for status, stage in cases:
             node = make_node(shot)
             history(node, status, stage)
-            before = copy.deepcopy(node._generation_recovery_state())
-            # The previous ID remains recoverable until the new request is ready.
-            def check_history(*args):
-                assert node._generation_recovery_state() == before, "history cleared early"
-            node._preflight_output_destination.side_effect = check_history
-            await node.aprocess()
-            node.bridge.generate_seedance.assert_called_once()
-            node.bridge.refresh_job.assert_not_called()
-            key = node.bridge.generate_seedance.call_args.args[0]["client_request_id"]
-            assert key != before["task_id"] and key.startswith("hmb-")
-            keys.append(key)
-            checkpoint = node._generation_recovery_state()
-            assert checkpoint["task_id"] == f"new-shot-{shot}"
-            assert checkpoint["generation_origin"] == node.origin
+            old_id = node._generation_recovery_state()["task_id"]
+            node.bridge.refresh_job.side_effect = None
+            node.bridge.refresh_job.return_value = {
+                "job_id": old_id, "status": "failed", "error": "Fixture terminal failure"}
+            node._prepare_managed_agent_shot = mock.AsyncMock()
+            node._await_local_render_preflight = mock.AsyncMock()
+            for _ in range(2):
+                await node.aprocess()
+                assert node._generation_recovery_state()["task_id"] == old_id
+                assert "Fixture terminal failure" in node._set_status_results.call_args.kwargs["result_details"]
+                assert not node._generation_run_active.is_set()
+            assert [c.args[0] for c in node.bridge.refresh_job.call_args_list] == [old_id] * 2
+            node.bridge.generate_seedance.assert_not_called()
+            node._prepare_managed_agent_shot.assert_not_awaited()
+            node._await_local_render_preflight.assert_not_awaited()
             assert node.parameter_output_values["VIDEO_OUT"] is node.previous_video
-            assert node._set_status_results.call_args.kwargs["was_successful"] is False
-            assert "synthetic provider failure" in node._set_status_results.call_args.kwargs["result_details"]
-            assert not node._generation_run_active.is_set()
-    assert len(set(keys)) == len(keys) == 50
 
 
 async def unknown_then_run():
     node = make_node()
-    history(node, "submission_unknown")
     node.bridge.generate_seedance.side_effect = target._BrokerError(
-        "Synthetic HTTP 502", status_code=502, submission_outcome_unknown=True,
-    )
-    keys = []
-    for count in range(1, 4):
+        "Synthetic HTTP 502", status_code=502, submission_outcome_unknown=True)
+    await node.aprocess()
+    node.bridge.generate_seedance.assert_called_once()
+    cp = node._generation_recovery_state()
+    key = cp["task_id"]
+    assert key.startswith("hmb-") and cp["status"] == "submission_unknown"
+    initial_message = node._set_status_results.call_args.kwargs["result_details"]
+    assert "Run checks this same request" in initial_message
+    assert "separate render" not in initial_message and "duplicate charges" not in initial_message
+    assert "기존 요청 ID" in target.GENERATION_PREVIEW_GUIDANCE["submission_unknown"]
+    for status in (404, 502, 504):
+        node.bridge.refresh_job.side_effect = target._BrokerError("lookup failed", status_code=status)
         await node.aprocess()
-        assert node.bridge.generate_seedance.call_count == count
-        checkpoint = node._generation_recovery_state()
-        keys.append(checkpoint["task_id"])
-        assert checkpoint["status"] == "submission_unknown" and not checkpoint["terminal"]
-        assert node._set_status_results.call_args.kwargs["was_successful"] is False
-        assert "duplicate charges" in node._set_status_results.call_args.kwargs["result_details"]
-    assert len(set(keys)) == 3
-    # Refresh inspects the newest ID once without generating a fourth render.
+        assert node._generation_recovery_state()["task_id"] == key
+        assert all(call.args[0] == key for call in node.bridge.refresh_job.call_args_list)
+        message = node._set_status_results.call_args.kwargs["result_details"]
+        assert key in message and "separate render" not in message and "duplicate charges" not in message
+        node.bridge.generate_seedance.assert_called_once()
     node.bridge.refresh_job.side_effect = None
-    node.bridge.refresh_job.return_value = {"job_id": "resolved-newest", "status": "failed"}
-    await node._refresh_async()
-    assert node.bridge.refresh_job.call_args.args[0] == keys[-1]
-    assert node.bridge.generate_seedance.call_count == 3
+    node.bridge.refresh_job.return_value = {"job_id": "job-canonical", "status": "failed", "error": "fixture rejection"}
+    await node.aprocess()
+    assert node._generation_recovery_state()["task_id"] == "job-canonical"
+    await node.aprocess()
+    assert node.bridge.refresh_job.call_args.args[0] == "job-canonical"
+    node.bridge.generate_seedance.assert_called_once()
+    node.set_parameter_value("prompt", "Changed authored shot")
+    node.bridge.generate_seedance.side_effect = None
+    await node.aprocess()
+    assert node.bridge.generate_seedance.call_count == 2
+    assert node.bridge.generate_seedance.call_args.args[0]["client_request_id"] != key
+
+
+async def reopened_legacy_receipts():
+    for initial in ("submission_unknown", "failed"):
+        saved = make_node()
+        history(saved, initial)
+        old_receipt = copy.deepcopy(saved._generation_recovery_state())
+        old_receipt.pop("render_input_sha256", None)
+        reopened = make_node()
+        reopened.origin = dict(saved.origin)
+        reopened.set_parameter_value(target.SEEDANCE_RECOVERY_PARAMETER, old_receipt, emit_change=False)
+        reopened.set_parameter_value("prompt", "Edited after loading the old workfile")
+        reopened.parameter_output_values["generation_id"] = "stale-output-job"
+        old_id = old_receipt["task_id"]
+        reopened.bridge.refresh_job.side_effect = None
+        reopened.bridge.refresh_job.return_value = {"job_id": old_id, "status": "failed"}
+        await reopened.aprocess()
+        reopened.bridge.generate_seedance.assert_not_called()
+        assert [call.args[0] for call in reopened.bridge.refresh_job.call_args_list] == [old_id]
+        verified = reopened._generation_recovery_state()
+        assert verified["task_id"] == old_id and verified["terminal"]
+        assert verified["render_input_sha256"] == reopened._render_authoring_digest()
+        await reopened.aprocess()
+        reopened.bridge.generate_seedance.assert_not_called()
+        reopened.set_parameter_value("prompt", "An intentional edit after confirmed terminal status")
+        await reopened.aprocess()
+        reopened.bridge.generate_seedance.assert_called_once()
 
 
 async def preparation_failures():
     for step in ("_validate_parameters", "_preflight_output_destination", "_ensure_broker_connected"):
         node = make_node()
-        history(node, "submission_unknown")
         before = copy.deepcopy(node._generation_recovery_state())
         getattr(node, step).side_effect = ValueError("Synthetic preparation/authentication rejection")
         await node.aprocess()
@@ -165,14 +197,12 @@ async def preparation_failures():
         node.bridge.generate_seedance.assert_called_once()
     # Agent failure is not submitted as prompt text, even in fresh-Run mode.
     node = make_node()
-    history(node, "submission_unknown")
     node.set_parameter_value("prompt", "[HMB EXECUTION FAILED] synthetic")
     await node.aprocess()
     node.bridge.generate_seedance.assert_not_called()
     # A required recovery write and native Stop/delete remain pre-POST gates.
     for gate in ("journal", "stop", "deleted"):
         node = make_node()
-        history(node, "submission_unknown")
         if gate == "journal":
             node._force_save_generation_recovery_checkpoint.side_effect = OSError("synthetic write failure")
         elif gate == "stop":
@@ -192,8 +222,6 @@ async def preparation_failures():
 
 async def active_lock_and_shots():
     nodes = [make_node(shot) for shot in range(1, 6)]
-    for node in nodes:
-        history(node, "submission_unknown")
     started, release = threading.Event(), threading.Event()
     def slow_create(payload, **kw):
         started.set()
@@ -213,8 +241,11 @@ async def active_lock_and_shots():
         release.set()
         await task
     nodes[0].bridge.generate_seedance.side_effect = None
-    await nodes[0].aprocess()  # After completion a deliberate Run starts anew.
-    assert nodes[0].bridge.generate_seedance.call_count == 2
+    nodes[0].bridge.refresh_job.side_effect = None
+    nodes[0].bridge.refresh_job.return_value = {"job_id": "new-shot-1", "status": "failed"}
+    await nodes[0].aprocess()
+    assert nodes[0].bridge.generate_seedance.call_count == 1
+    assert nodes[0].bridge.refresh_job.call_args.args[0] == "new-shot-1"
     for node in nodes:
         assert node._generation_recovery_state()["generation_origin"] == node.origin
         assert node.parameter_output_values["VIDEO_OUT"] is node.previous_video
@@ -236,17 +267,19 @@ async def explicit_resume():
     assert node.bridge.refresh_job.call_args.args[0] == old_id
     assert not node.get_parameter_value("resume_generation_id")
     await node.aprocess()
-    node.bridge.generate_seedance.assert_called_once()
+    assert node.bridge.refresh_job.call_args.args[0] == "canonical-existing"
+    node.bridge.generate_seedance.assert_not_called()
 
 
 async def main():
     with mock.patch.object(target, "_resolve_mp4_decode_verifier", return_value=SimpleNamespace(executable="fake", backend="offline")):
         await matrix()
         await unknown_then_run()
+        await reopened_legacy_receipts()
         await preparation_failures()
         await active_lock_and_shots()
         await explicit_resume()
 
 
 asyncio.run(main())
-print("PASS: 50 history/shot combinations; repeated 502 -> explicit fresh Run; exact-ID Refresh/Resume; no automatic replay; live locks; preparation/Agent/journal/Stop gates; five-shot isolation; previous media preserved")
+print("PASS: 45 recovery cases across 5 shots, repeated unknown and terminal retrievals without re-submission, changed inputs, locking and validation gates")

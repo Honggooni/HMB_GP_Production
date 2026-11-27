@@ -386,14 +386,17 @@ try {
   await page.evaluate(() => {
     window.state = {...window.state, revision: 9, ack: window.commands.at(-1).id,
       result_text: "Edited while changing route",
-      slot: {...window.state.slot, categories: ["effect_shape", "effect_timing"]}};
+      slot: {...window.state.slot, categories: ["effect_shape", "effect_timing"],
+        result: {...window.state.slot.result, cache_key: "a".repeat(64)}}};
     window.controller.update(window.props());
   });
   await page.locator("[data-guidance]").fill("Look at the effect shape");
+  assert.equal(await analyze.textContent(), "To Agent 재분석");
   await page.locator("[data-action=analyze]").click();
   const run = await page.evaluate(() => window.commands.at(-1));
   assert.equal(run.action, "analyze");
   assert.equal(run.confirmed_paid, true);
+  assert.equal(run.reanalyze, true);
   assert.equal(run.guidance, "Look at the effect shape");
   assert.deepEqual(run.frame_ranges, [{start: 0, end: 95}]);
   assert.equal(run.full_video, false);

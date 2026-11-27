@@ -17,6 +17,7 @@ def node(error=None, *, existing=False):
     value = t.HMBSeedanceGeneration.__new__(t.HMBSeedanceGeneration)
     value.name = 'Preflight isolated shot'
     value.parameter_values = {}
+    value.get_parameter_value = value.parameter_values.get
     value.parameter_output_values = {'generation_id': 'job-existing', 'generation_status': 'succeeded',
                                     'video_url': 'original.mov', 'VIDEO_OUT': 'original.mov'} if existing else {}
     value._runtime_node_is_live = lambda **kwargs: True
@@ -27,7 +28,8 @@ def node(error=None, *, existing=False):
     value._prepare_managed_agent_shot = mock.AsyncMock()
     value._assert_agent_result_available = mock.Mock()
     value._process_generation = mock.AsyncMock()
-    value._generation_recovery_state = lambda: {'task_id': 'job-existing', 'status': 'succeeded'} if existing else {}
+    value._generation_recovery_state = lambda: {
+        'task_id': 'job-existing', 'status': 'succeeded', 'stage': 'local_succeeded'} if existing else {}
     value._publish_generation_preview = mock.Mock()
     value._set_generation_status = mock.Mock()
     value._set_status_results = mock.Mock()

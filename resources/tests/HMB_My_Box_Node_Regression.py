@@ -37,6 +37,7 @@ from griptape.artifacts import VideoUrlArtifact
 from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
 from griptape_nodes.retained_mode.engine import engine_scope
 from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
+from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest, DeleteNodeRequest, DeserializeNodeFromCommandsRequest, SerializeNodeToCommandsRequest,
 )
@@ -298,6 +299,97 @@ class MyBoxNodeTests(unittest.TestCase):
         before=self.authored(); self.controller().preflight()
         self.assertEqual(self.authored(),before); self.assertFalse(self.backend.calls)
 
+    def test_reselect_manual_file_by_native_child_checks_bytes_and_survives_reopen(self):
+        self.backend.enable_final()
+        cloud = CloudInputFixture(self.folder)
+        path = cloud.images[0]
+        original = path.read_bytes()
+        original_times = path.stat()
+        self.node.set_parameter_value("task", target.TASK_REFERENCE_TO_VIDEO)
+        self.node.set_parameter_value("reference_images", [str(path)])
+        self.node._create_gt_cloud_storage_driver = mock.Mock(return_value=cloud)
+        self.run_node()
+        self.assert_success()
+        saved = self.checkpoint()["render_input_sha256"]
+        self.assertTrue(saved and self.controller().draft_ui_state()["final_available"])
+        fields = {name: self.node.get_parameter_value(name) for name in target._RENDER_AUTHORING_FIELDS}
+        before_manifest = self.node.get_parameter_value(target.ONLY_REFERENCE_DIGESTS_PARAMETER)
+        self.node = self.reopen()
+        self.assertEqual(before_manifest, self.node.get_parameter_value(target.ONLY_REFERENCE_DIGESTS_PARAMETER))
+        restored_fields = {name: self.node.get_parameter_value(name) for name in fields}
+        self.assertEqual({key: (value, restored_fields[key]) for key, value in fields.items()
+                          if value != restored_fields[key]}, {})
+        def reselect():
+            child = self.node.get_parameter_by_name("reference_images").get_child_parameters()[0]
+            self.send(SetParameterValueRequest(node_name=self.node.name, parameter_name=child.name, value=str(path)))
+            asyncio.run(self.node._await_manual_reference_content())
+        def replace(data):
+            path.write_bytes(data)
+            os.utime(path, ns=(original_times.st_atime_ns, original_times.st_mtime_ns))
+        replace(bytes([original[0] ^ 1]) + original[1:])
+        with mock.patch.object(self.node, "_read_manual_reference_hashes", side_effect=forbidden):
+            self.assertTrue(self.controller().draft_ui_state()["run_locked"])
+            self.assertEqual(self.node._render_authoring_digest(), saved)
+        reselect()
+        self.assertNotEqual(self.node._render_authoring_digest(), saved)
+        ui = self.controller().draft_ui_state()
+        self.assertFalse(ui["run_locked"] or ui["final_available"])
+        replace(original)
+        reselect()
+        self.assertEqual(self.node._render_authoring_digest(), saved)
+        self.assertTrue(self.controller().draft_ui_state()["run_locked"])
+        self.run_node()
+        self.assertEqual(len(self.backend.created), 1)
+        # A Project Only node uses the same stock control and shared verifier.
+        self.node = self.create("Project Only manual references")
+        self.node.set_parameter_value("only_project", target.ONLY_PROJECT_CHOICES[1])
+        self.node.set_parameter_value("task", target.TASK_REFERENCE_TO_VIDEO)
+        self.node.set_parameter_value("reference_images", [str(path)])
+        asyncio.run(self.node._await_manual_reference_content())
+        self.node._remember_completed_render({"render_input_sha256": self.node._render_authoring_digest()})
+        reselect()
+        self.assertTrue(self.node._matching_completed_render())
+        path.unlink()
+        with self.assertRaisesRegex(ValueError, "select the file again|Select the file again"):
+            reselect()
+        self.assertTrue(self.node._draft_ui_state()["run_locked"])
+        replace(original)
+        reselect()
+        self.assertTrue(self.node._matching_completed_render())
+        self.node.set_parameter_value("reference_images", [path.as_uri()])
+        asyncio.run(self.node._await_manual_reference_content())
+        uri_key = next(iter(self.node._local_reference_paths(path.as_uri())))
+        self.assertEqual(self.node.get_parameter_value(target.ONLY_REFERENCE_DIGESTS_PARAMETER)[uri_key],
+                         hashlib.sha256(original).hexdigest())
+
+    def test_rapid_native_reselection_discards_older_file_verification(self):
+        node = self.node
+        node.set_parameter_value("task", target.TASK_REFERENCE_TO_VIDEO)
+        paths = [self.folder / name for name in ("first.png", "second.png")]
+        for path in paths:
+            path.write_bytes(path.name.encode())
+        started, release = threading.Event(), threading.Event()
+        original_hash = node._read_manual_reference_hashes
+        def hash_files(selected):
+            if str(paths[0]) in selected.values():
+                started.set()
+                self.assertTrue(release.wait(4))
+            return original_hash(selected)
+        async def rapid():
+            node.set_parameter_value("reference_images", [str(paths[0])])
+            self.assertTrue(await asyncio.to_thread(started.wait, 4))
+            try:
+                node.set_parameter_value("reference_images", [str(paths[1])])
+                self.assertTrue(node._draft_ui_state()["run_locked"])
+            finally:
+                release.set()
+            await node._await_manual_reference_content()
+        with mock.patch.object(node, "_read_manual_reference_hashes", side_effect=hash_files):
+            asyncio.run(rapid())
+        evidence = node.get_parameter_value(target.ONLY_REFERENCE_DIGESTS_PARAMETER)
+        self.assertEqual(set(evidence.values()), {hashlib.sha256(paths[1].read_bytes()).hexdigest()})
+        self.assertFalse(self.backend.calls)
+
     def test_cloud_proof_private_submission_retrieve_download_and_final(self):
         self.backend.enable_final()
         proof_route = '/api/v1/preflight/griptape-cloud'
@@ -433,10 +525,14 @@ class MyBoxNodeTests(unittest.TestCase):
     def test_budget_not_supported_reason_cannot_be_bypassed(self):
         self.backend.capabilities.update(generation_enabled=False,reason_code='my_box_budget_limits_unsupported')
         self.run_node(); self.assertFalse(self.backend.created); self.assertFalse(self.node._execution_succeeded)
-    def test_repeated_480_runs_keep_all_authored_settings_and_old_files(self):
-        before=self.authored(); paths=[]
-        for _ in range(4):
+    def test_edited_480_runs_keep_each_authored_setting_and_old_files(self):
+        paths=[]
+        for i in range(4):
+            self.node.set_parameter_value('prompt', f'Private Draft version {i}')
+            before=self.authored()
             self.run_node(); paths.append(self.assert_success()); self.assertEqual(self.authored(),before)
+            self.run_node()
+            self.assertEqual(len(self.backend.created), i + 1)
         self.assertEqual(len({p.resolve() for p in paths}),4)
         self.assertEqual(len({p['client_request_id'] for p in self.backend.created}),4)
         self.assertTrue(all(p.read_bytes()==MOV for p in paths))
@@ -499,6 +595,7 @@ class MyBoxNodeTests(unittest.TestCase):
         node.set_parameter_value('output_file',str(base)); self.backend.enable_final()
         self.run_node(); draft=self.assert_success()
         self.run_node(final=True); final=self.assert_success()
+        node.set_parameter_value('prompt', 'Edited prompt for the same named output folder')
         self.run_node(); rerender=self.assert_success()
         self.assertEqual(len({draft,final,rerender}),3)
         self.assertTrue(all(path.parent==base.parent and path.stem.startswith(base.stem+'-mybox-') for path in (draft,final,rerender)))
@@ -517,9 +614,31 @@ class MyBoxNodeTests(unittest.TestCase):
         self.run_node(); checkpoint=self.checkpoint(); self.assertEqual(len(self.backend.created),1)
         request=self.backend.created[0]['client_request_id']
         self.assertIn(request,json.dumps(checkpoint)); self.assertFalse(self.node._execution_succeeded)
-        self.backend.create_error=None; self.run_node(); self.assert_success()
+        reopened = self.reopen()
+        reopened.set_parameter_value("prompt", "Edited while the private submission was uncertain")
+        self.backend.create_error=None; self.run_node(reopened); self.assert_success(reopened)
         self.assertEqual(len(self.backend.created),1)
         self.assertTrue(any(p=='/api/v1/jobs/'+request+'/refresh' for m,p,k in self.backend.calls))
+    def test_unchanged_failed_run_retrieves_original_and_edited_inputs_start_new_work(self):
+        self.backend.status = "failed"
+        self.run_node()
+        first = self.checkpoint()
+        self.assertEqual(first["stage"], "failed")
+        legacy = dict(first)
+        legacy.pop("render_input_sha256", None)
+        asyncio.run(self.controller()._persist(legacy))
+        reopened = self.reopen()
+        reopened.set_parameter_value("prompt", "Edited on reopen before legacy failure was checked")
+        self.run_node(reopened)
+        self.assertEqual(len(self.backend.created), 1)
+        self.assertEqual(self.checkpoint(reopened)["job_id"], first["job_id"])
+        self.assertEqual(self.checkpoint(reopened)["render_input_sha256"], reopened._render_authoring_digest())
+        self.assertTrue(any(path == "/api/v1/jobs/" + first["job_id"] + "/refresh"
+                            for _, path, _ in self.backend.calls))
+        reopened.set_parameter_value("prompt", "Updated private shot direction")
+        self.run_node(reopened)
+        self.assertEqual(len(self.backend.created), 2)
+        self.assertNotEqual(first["client_request_id"], self.checkpoint(reopened)["client_request_id"])
     def test_unknown_request_lookup_failures_never_authorize_a_new_create_or_key(self):
         for failure in ('404','503','timeout'):
             with self.subTest(failure=failure):
@@ -928,8 +1047,29 @@ class MyBoxNodeTests(unittest.TestCase):
         self.assertEqual(payload['resolution'],'1080p'); self.assertNotIn('draft',payload)
         self.assertFalse(FORBIDDEN_PROJECT_FIELDS & set(payload))
         self.run_node(final=True); self.assertEqual(len(self.backend.created),2)
+        self.run_node(); self.assertEqual(len(self.backend.created),2)
+        self.node.set_parameter_value('prompt', 'Edited prompt for the next Draft')
+        before=self.authored()
         self.run_node(); self.assert_success(); self.assertEqual(len(self.backend.created),3)
         self.assertEqual(self.backend.created[2]['resolution'],'480p'); self.assertEqual(self.authored(),before)
+
+    def test_native_resolution_edit_releases_private_draft_and_revert_restores_its_button(self):
+        self.backend.enable_final()
+        self.run_node()
+        self.assert_success()
+        cp=self.checkpoint()
+        self.assertTrue(self.controller().draft_ui_state()['run_locked'])
+        self.node.set_parameter_value('resolution', '1080p')
+        ui=self.controller().draft_ui_state()
+        self.assertFalse(ui['run_locked'])
+        self.assertFalse(ui['final_available'])
+        self.run_node(final=True)
+        self.assertEqual(len(self.backend.created), 1)
+        self.node.set_parameter_value('resolution', '480p')
+        self.assertEqual(self.node.get_parameter_value('draft_action'), target.DRAFT_ACTION_PREVIEW)
+        self.assertEqual(self.checkpoint()['job_id'], cp['job_id'])
+        self.assertTrue(self.controller().draft_ui_state()['run_locked'])
+        self.assertTrue(self.controller().draft_ui_state()['final_available'])
     def test_existing_completed_final_child_is_adopted_even_when_new_generation_is_blocked(self):
         self.backend.enable_final(); self.run_node(); original=self.assert_success(); source=self.checkpoint()['job_id']
         child='job-mybox-'+'f'*32; key='mbx-final-v1-'+source.removeprefix('job-mybox-')
@@ -1071,10 +1211,13 @@ class MyBoxNodeTests(unittest.TestCase):
         self.assertFalse(self.controller().draft_ui_state()['final_available'])
         self.backend.create_error = None
         reopened = self.reopen()
+        original_prompt = reopened.get_parameter_value("prompt")
+        reopened.set_parameter_value("prompt", "Edited while the Final acceptance is unknown")
         self.run_node(reopened, final=True, expected_source_task_id=source, final_resolution='4k')
         self.assert_success(reopened)
         self.assertEqual(self.checkpoint(reopened)['client_request_id'], pending_key)
         self.assertEqual(len(self.backend.created), 2)  # Restored the first Final; a new click is required.
+        reopened.set_parameter_value("prompt", original_prompt)
         self.backend.jobs[source]['draft_final']['finals_by_resolution']['1080p'] = self.backend.scoped_projection(source)['finals_by_resolution']['4k'].copy()
         self.backend.jobs[source]['draft_final']['finals_by_resolution']['1080p']['final_client_request_id'] = pending_key
         self.run_node(reopened, final=True, expected_source_task_id=source, final_resolution='4k')
@@ -1255,6 +1398,7 @@ class MyBoxNodeTests(unittest.TestCase):
         self.assertEqual(len(self.backend.calls),calls)
     def test_stale_scheduled_final_cannot_finalize_a_newer_draft_source(self):
         self.backend.enable_final(); self.run_node(); self.assert_success(); old=self.checkpoint()['job_id']
+        self.node.set_parameter_value('prompt', 'Another Draft source')
         self.run_node(); self.assert_success(); newest=self.checkpoint()['job_id']
         self.assertNotEqual(newest,old); count=len(self.backend.created)
         self.run_node(final=True,expected_source_task_id=old)

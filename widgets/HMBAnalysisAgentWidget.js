@@ -387,7 +387,7 @@ ${escape(fieldText)}</textarea></label>
   </fieldset>`;
   const actions = `<div class="ha-bottom" data-ha-key="actions"><span class="ha-status" role="status" data-error="${Boolean(notice || state.error)}">${escape(notice || state.status || (result.cache_hit ? "저장 결과 재사용" : ""))}</span>
     ${busy ? `<button type="button" data-action="cancel"${disabled(locked || pending)}>분석 취소</button>` : ""}
-    <button type="button" data-action="analyze" data-primary${disabled(!canAnalyze(state, locked, pending, spec, intervals))}>${role === "before" ? "To Prompt 실행" : "To Agent 실행"}</button></div>`;
+    <button type="button" data-action="analyze" data-primary${disabled(!canAnalyze(state, locked, pending, spec, intervals))}>${role === "before" ? "To Prompt" : "To Agent"} ${result.cache_key ? "재분석" : "실행"}</button></div>`;
   return `<style>${style}</style><div class="hmb-analysis nodrag nopan" data-hmb-analysis-widget data-hmb-color-lut-widget
     data-hmb-node-type="HMBAnalysisAgent" data-hmb-native-node-type="HMBAnalysisAgent"${view.nativeHeader ? ' data-hmb-native-header="active"' : ""}>
     <header class="ha-header group"><span class="ha-mark ha-brand">◈</span><b class="ha-brand">HMB Analysis Agent</b>
@@ -877,7 +877,7 @@ function hmbNativeStockSafetyImplementation(container, props = {}) {
     }
     const action = button.dataset.action;
     if (action === "analyze") {
-      command(action, {...configuration(), confirmed_paid: true});
+      command(action, {...configuration(), confirmed_paid: true, reanalyze: Boolean(state.slot?.result?.cache_key)});
     } else if (action === "toggle-range") {
       rangeDragCleanup?.();
       if (state.slot?.kind === "video") view.videoRangesEnabled = !view.videoRangesEnabled;
