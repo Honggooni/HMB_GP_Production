@@ -6868,7 +6868,6 @@ function render(state, includeStyle = true) {
     .video-color-pick-wrap{display:block}.color-binding-entry{display:grid;grid-template-columns:2rem minmax(0,1fr);gap:4px;align-items:start}
     .topbar-controls .language-button{min-width:58px;height:28px;padding:0 11px;border:1px solid rgba(148,163,184,.24);border-radius:8px;background:#090d16;color:#e2e8f0;font-size:11px;font-weight:800;cursor:pointer}.topbar-controls .language-button:hover,.topbar-controls .language-button:focus-visible{border-color:var(--hmb-shot-accent);color:var(--hmb-shot-soft);outline:none;box-shadow:0 0 0 1px var(--hmb-shot-accent),0 0 12px var(--hmb-shot-glow)}.shot-selector-shell{flex:0 1 290px;width:290px;max-width:290px;height:30px;display:flex;align-items:center;gap:6px;padding:3px 7px;border:1px solid var(--hmb-shot-line);border-radius:8px;background:linear-gradient(180deg,rgba(var(--hmb-shot-rgb),.24),rgba(15,23,42,.88));box-shadow:0 0 12px var(--hmb-shot-glow)}.shot-selector-shell>span,.shot-selector-shell>i{flex:0 0 auto;color:var(--hmb-shot-soft);font-size:8px;font-style:normal;font-weight:900;letter-spacing:.08em}.shot-selector-shell>i{color:var(--hmb-shot-accent)}.shot-selector{flex:1 1 auto;width:100%;height:22px;padding:0 7px;border:0;border-radius:5px;background:#07101f;color:#dbeafe;font-size:10px;font-weight:800;outline:none}.shot-selector:focus-visible{box-shadow:0 0 0 1px var(--hmb-shot-accent),0 0 10px var(--hmb-shot-glow)}.shot-selector:disabled{opacity:.72}
     .source-row{transition:none}
-    [data-hmb-selection-preview]{margin-left:12px;color:var(--hmb-shot-accent);font-size:11px;font-weight:600}
     .image-card [data-hmb-image-selection-hidden]{display:none}
     .image-card .image-selection-pending{color:#a9b9ca}
     .image-selection-pending span:last-child{grid-column:2 / -1}
@@ -8641,8 +8640,8 @@ function hmbNativeUiImplementation(container, props) {
   const sharedControls = new WeakSet();
   const controlValues = new WeakMap();
   let sharedListenersInstalled = false;
-  // A source can paint its selection while the SDK verifies media. Keep hints
-  // outside authoring, saved Shot documents, and all model-ready parameters.
+  // Update the existing rows and counts while the SDK verifies the selection.
+  // Only confirmed media can reach saved Shot documents and model inputs.
   const pendingMedia = new Map();
   const hasMediaEdge = (source, output, input) => {
     const graph = container.closest?.(".react-flow");
@@ -8677,43 +8676,40 @@ function hmbNativeUiImplementation(container, props) {
       || (image && hasMediaEdge(detail.source, "IMAGE_ASSET_OUT", "IMAGE_ASSET_IN"));
   };
   const syncMediaPreview = () => {
-    const imageCard = container.querySelector(".image-card");
     let imagePreview = null;
+    let videoPreview = null;
     for (const [kind, preview] of pendingMedia) {
+      if (preview.cancelled) continue;
       const image = kind === "image_asset";
-      const heading = container.querySelector(image ? ".image-card h3" : ".video-card h3");
-      if (!sameShot(preview)) { preview.hint?.remove(); clearTimeout(preview.timer); pendingMedia.delete(kind); continue; }
+      if (!sameShot(preview)) { clearTimeout(preview.timer); pendingMedia.delete(kind); continue; }
       const ready = image ? state.image_asset.ordered_source_uids : state.picker.ordered_video_uids;
       const confirmedImages = image ? state.images
         .filter(row => row.asset_managed && row.present && !row.asset_source_unavailable)
         .map(row => row.asset_source_uid) : null;
-      if (preview.cancelled || (ready.length === preview.rows.length &&
+      if (ready.length === preview.rows.length &&
         ready.every((uid, index) => uid === preview.rows[index].source_uid)
         && (!image || (confirmedImages.length === ready.length
-          && confirmedImages.every((uid, index) => uid === ready[index]))))) {
-        preview.hint?.remove();
+          && confirmedImages.every((uid, index) => uid === ready[index])))) {
         clearTimeout(preview.timer);
         preview.cancelled = true;
         continue;
       }
-      if (!heading) continue;
       if (image) imagePreview = preview;
-      const hint = preview.hint || container.ownerDocument.createElement("span");
-      if (!preview.hint) {
-        preview.hint = hint;
-        hint.setAttribute("data-hmb-selection-preview", kind);
-        hint.setAttribute("role", "status");
-      }
-      if (hint.parentNode !== heading) heading.append(hint);
-      const ko = uiLanguage(state) === "ko";
-      const labels = preview.rows.map(row => row.label).join(" · ") || (ko ? "선택 없음" : "No selection");
-      const text = (ko ? "선택 반영 중  " : "Updating selection  ") + labels;
-      if (hint.textContent !== text) { hint.textContent = text; hint.title = text; }
+      else videoPreview = preview;
     }
-    if (!imageCard) return;
-    const body = imageCard.querySelector(".group-body");
+    const videoCount = container.querySelector(videoPreview ? ".video-card h3 b" : ".video-card h3 b[data-hmb-preview-count]");
+    if (videoCount) {
+      const active = state.status.active_videos;
+      const selected = videoPreview
+        ? Math.max(0, active - state.videos.filter(row => row.present && row.picker_managed).length) + videoPreview.rows.length
+        : active;
+      const text = `${selected} / ${state.status.max_videos}`;
+      if (videoCount.textContent !== text) videoCount.textContent = text;
+      videoCount.toggleAttribute("data-hmb-preview-count", Boolean(videoPreview));
+    }
+    const body = container.querySelector(imagePreview ? ".image-card .group-body" : ".image-card .group-body[data-hmb-preview-order]");
     if (!body) return;
-    const count = imageCard.querySelector("h3 b");
+    const count = body.closest(".image-card").querySelector("h3 b");
     // Only the display follows click intent. Saved rows and model inputs stay
     // on the confirmed Shot until the engine acknowledges its source list.
     const desired = imagePreview ? new Map(imagePreview.rows.map(row => [row.source_uid, row])) : null;
@@ -8755,7 +8751,6 @@ function hmbNativeUiImplementation(container, props) {
       }
       body.insertBefore(fragment, body.querySelector(".image-add-row"));
     }
-    if (!desired && !body.hasAttribute("data-hmb-preview-order")) return;
     body.toggleAttribute("data-hmb-preview-order", Boolean(desired));
     const uids = desired ? [...desired.keys()] : state.images.map(item => item.asset_source_uid).filter(Boolean);
     const rows = new Map([...body.querySelectorAll("[data-hmb-image-selection-uid],[data-hmb-image-selection-pending]")]
@@ -8795,7 +8790,7 @@ function hmbNativeUiImplementation(container, props) {
     clearTimeout(previous?.timer);
     const preview = {kind:detail.kind, scope:detail.scope, publisher_instance_uuid:detail.publisher_instance_uuid,
       channel_uuid:detail.channel_uuid, shot_uuid:detail.shot_uuid, revision:detail.revision,
-      rows, source:event.target, hint:previous?.hint, cancelled:detail.cancelled === true};
+      rows, source:event.target, cancelled:detail.cancelled === true};
     pendingMedia.set(detail.kind, preview);
     // Unmounts normally send a cancellation. A lost renderer may not, while
     // a healthy renderer reading a slow share can legitimately take minutes.
@@ -8804,7 +8799,7 @@ function hmbNativeUiImplementation(container, props) {
       if (!preview.source.isConnected || !sameShot(preview)) { preview.cancelled = true; syncMediaPreview(); }
       else preview.timer = setTimeout(checkOwner, 30000);
     };
-    preview.timer = setTimeout(checkOwner, 30000);
+    if (!preview.cancelled) preview.timer = setTimeout(checkOwner, 30000);
     syncMediaPreview();
   };
   let preparingViews = false;
@@ -10144,7 +10139,7 @@ function hmbNativeUiImplementation(container, props) {
     hmbAnnouncePromptNativeHeader(container, "retire");
     disposeLifecycle();
     delete container.__hmbSyncMediaPreview;
-    for (const preview of pendingMedia.values()) { clearTimeout(preview.timer); preview.hint?.remove(); }
+    for (const preview of pendingMedia.values()) clearTimeout(preview.timer);
     pendingMedia.clear();
     container.removeEventListener?.("hmb-color-lut-header-state", nativeHeaderState);
     delete container.__hmbPromptShotPointerFocus;

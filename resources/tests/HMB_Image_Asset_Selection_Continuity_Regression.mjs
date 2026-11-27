@@ -82,9 +82,11 @@ try {
     const result = await page.evaluate(async () => {
       const f = selectionFixture;
       f.cards[0].click();
-      const hint = document.querySelector("#prompt [data-hmb-selection-preview]")?.textContent;
-      if (!hint?.includes("Hero 0") || f.writes.length || f.promptWrites) {
-        throw Error("The bound Prompt must paint the selected name before the first host write.");
+      const prompt = document.querySelector("#prompt");
+      const row = prompt.querySelector('[data-hmb-image-selection-pending="source-0"]');
+      if (!row?.textContent.includes("Hero 0") || prompt.querySelector(".image-card h3").textContent.includes("Hero 0")
+        || f.writes.length || f.promptWrites) {
+        throw Error("The bound Prompt must show the selection once, in its slot, before the first host write.");
       }
       f.widget.hmbFlushImageAssetSelectionCommit(f.container);
       await Promise.resolve();
@@ -210,14 +212,14 @@ try {
         if (!tab) throw Error("The bound Shot tab is missing.");
         tab.click();
       };
-      const hint = () => prompt.querySelector("[data-hmb-selection-preview]")?.textContent;
-      if (!hint()?.includes("Hero 2")) throw Error("The original Shot should show its pending selection.");
+      const selectedRow = () => prompt.querySelector('[data-hmb-image-selection-pending="source-2"]');
+      if (!selectedRow()) throw Error("The original Shot should show its selected slot.");
       switchTo(shotIds[1]);
-      if (hint()) throw Error("Another Shot is displaying this Shot’s pending selection.");
+      if (selectedRow()) throw Error("Another Shot is displaying this Shot’s selected slot.");
       f.cards[2].click();
       await new Promise(resolve => setTimeout(resolve, 100));
       switchTo(shotIds[0]);
-      if (hint()) throw Error("A retained editor restored a stale selection after its source changed.");
+      if (selectedRow()) throw Error("A retained editor restored a stale selection after its source changed.");
     });
     await page.evaluate(() => {
       const f = selectionFixture, source = f.container;
@@ -235,7 +237,7 @@ try {
       repaint.scan_revision++;
       apply(repaint);
       const prompt = document.querySelector("#prompt");
-      if (!prompt.querySelector('[data-hmb-selection-preview]')?.textContent.includes("Hero 2")
+      if (!prompt.querySelector('[data-hmb-image-selection-pending="source-2"]')?.textContent.includes("Hero 2")
           || prompt.querySelector('.image-card h3 b')?.textContent !== '3 / 50'
           || source.querySelector("[data-dismiss-shot-link]")) {
         throw Error("A folder read warning cancelled a new selection after the old link notice was dismissed.");
