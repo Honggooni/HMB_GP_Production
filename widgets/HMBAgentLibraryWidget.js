@@ -264,21 +264,6 @@ function hmbAgentExecutionStatus(phase) {
 
 export function hmbAgentWidgetHeight(state) { return state?.manual_rebind?.required ? 144 : 64; }
 
-function hmbAgentRows(state) {
-  if (!state.shot_manager) return "";
-  const shots = state.shot_catalog.shots || [];
-  if (!shots.length) return '<div class="agent-shot-empty">ImageAsset에서 샷을 추가하세요.</div>';
-  return shots.map((shot) => {
-    const selected = shot.shot_uuid === state.shot.shot_uuid;
-    const status = state.shot_states[shot.shot_uuid] || "";
-    const running = ["preparing", "running"].includes(status);
-    return `<div class="agent-shot-row" data-shot-number="${shot.number}" data-active="${selected}" data-agent-row="${hmbAgentEscape(shot.shot_uuid)}">
-      <button type="button" class="agent-shot-tab nodrag" data-agent-select="${hmbAgentEscape(shot.shot_uuid)}" aria-pressed="${selected}"><span class="agent-row-number">${String(shot.number).padStart(2, "0")}</span><b>${hmbAgentEscape(shot.name)}</b><span class="agent-row-status">${({preparing:"소스 준비 중…",running:"Agent 실행 중…",succeeded:"완료",failed:"실패",cancelled:"취소"})[status] || ""}</span></button>
-      <button type="button" class="agent-shot-run nodrag" data-agent-run="${hmbAgentEscape(shot.shot_uuid)}" title="${running ? "이 샷 Agent만 취소" : "이 샷 Agent만 실행"}" aria-label="${running ? "Cancel Shot Agent" : "Run Shot Agent"}">${running ? "■" : "▷"}</button>
-    </div>`;
-  }).join("");
-}
-
 function renderAgentDashboard(state, container) {
   const paletteShotNumber = hmbAgentDisplayShotNumber(container, state);
   const executionStatus = hmbAgentProgressLabel(state, hmbAgentExecutionStatus(state.execution_phase));
@@ -303,7 +288,6 @@ function renderAgentDashboard(state, container) {
       .hmb-agent-dashboard .agent-rebind-confirm{height:32px;border:1px solid var(--hmb-chip-line);border-radius:6px;background:var(--hmb-chip-bg);color:var(--hmb-text);padding:0 10px}
       .hmb-agent-dashboard .agent-only-toggle{flex:0 0 auto;height:29px;padding:0 10px;border:1px solid var(--hmb-chip-line);border-radius:7px;background:var(--hmb-chip-bg);color:var(--hmb-chip-text);font:inherit;font-size:10px;font-weight:850}
       .hmb-agent-dashboard .agent-only-toggle[aria-pressed="true"]{box-shadow:0 0 10px var(--hmb-chip-glow);border-color:var(--hmb-shot-accent)}
-      .hmb-agent-dashboard .agent-shot-list{padding:0 8px 8px;display:flex;flex-direction:column;gap:0}
       .hmb-agent-dashboard .agent-shot-row{--hmb-shot-accent:#F472B6;--row-rgb:244,114,182;display:flex;align-items:center;gap:6px;height:42px;border-top:1px solid rgba(var(--row-rgb),.35);background:linear-gradient(90deg,rgba(var(--row-rgb),.12),transparent);border-radius:5px}
       .hmb-agent-dashboard .agent-shot-row[data-shot-number="2"]{--hmb-shot-accent:#3B82F6;--row-rgb:59,130,246}.hmb-agent-dashboard .agent-shot-row[data-shot-number="3"]{--hmb-shot-accent:#10B981;--row-rgb:16,185,129}.hmb-agent-dashboard .agent-shot-row[data-shot-number="4"]{--hmb-shot-accent:#8B5CF6;--row-rgb:139,92,246}.hmb-agent-dashboard .agent-shot-row[data-shot-number="5"]{--hmb-shot-accent:#EAB308;--row-rgb:234,179,8}
       .hmb-agent-dashboard .agent-shot-row[data-active="true"]{box-shadow:inset 3px 0 var(--hmb-shot-accent);background:linear-gradient(90deg,rgba(var(--row-rgb),.23),rgba(var(--row-rgb),.04))}
@@ -311,15 +295,19 @@ function renderAgentDashboard(state, container) {
       .hmb-agent-dashboard .agent-row-number{width:29px;height:29px;display:grid;place-items:center;border:1px solid var(--hmb-shot-accent);border-radius:7px;color:var(--hmb-shot-accent);font-weight:850}
       .hmb-agent-dashboard .agent-shot-tab b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hmb-agent-dashboard .agent-row-status{margin-left:auto;color:var(--hmb-muted);font-size:9px}
       .hmb-agent-dashboard .agent-shot-run{flex:0 0 29px;height:29px;margin-right:6px;border:1px solid rgba(var(--row-rgb),.5);border-radius:7px;background:rgba(var(--row-rgb),.12);color:var(--hmb-shot-accent);font-size:16px}
-      .hmb-agent-dashboard .agent-shot-empty{height:42px;display:flex;align-items:center;justify-content:center;color:var(--hmb-muted);font-size:10px}
       .hmb-agent-dashboard .agent-native-identity,.hmb-agent-dashboard .agent-native-actions{display:none;min-width:0;--node-header-text:var(--hmb-text)}
       .hmb-agent-dashboard[data-hmb-native-header="active"] .agent-mark,.hmb-agent-dashboard[data-hmb-native-header="active"] .agent-heading{display:none}
       .hmb-agent-dashboard[data-hmb-native-header="active"] .agent-native-identity{display:flex;align-items:center;flex:1;min-width:0}
       .hmb-agent-dashboard[data-hmb-native-header="active"] .agent-native-actions{display:flex;align-items:center;flex:0 0 auto}
       .hmb-agent-dashboard .agent-native-identity>div{min-width:0;max-width:100%}.hmb-agent-dashboard .agent-native-actions svg{flex-shrink:0}
       .hmb-agent-dashboard[data-hmb-native-header="active"] .agent-topbar{cursor:grab}.hmb-agent-dashboard[data-hmb-native-header="active"] .agent-topbar:active{cursor:grabbing}
+      .hmb-agent-dashboard[data-hmb-managed-shot=true] [data-hmb-native-actions] div:is(.bg-green-600,.bg-blue-600):has(>span.leading-none){display:none!important}
+      .hmb-agent-dashboard .agent-shot-row[data-render-locked=true]{--hmb-shot-accent:#939aa6;background:#232630;color:#c1c4cb;box-shadow:none;border-color:#555d68}
+      .hmb-agent-dashboard .agent-shot-row[data-stage-completed=true]:not([data-render-locked=true]) .agent-row-status{color:#92e5ad}
+      [data-hmb-shot-check="true"]{display:inline-flex!important;align-items:center;justify-content:center;gap:2px!important;width:38px!important;min-width:38px!important;max-width:38px!important;height:30px!important;min-height:30px!important;max-height:30px!important;flex:none!important;padding:0!important;box-sizing:border-box!important;font:700 11px/1 system-ui!important;font-variant-numeric:tabular-nums;background:#12301d!important;color:#dcfce7!important;border:1px solid #4ade80!important;border-radius:5px!important;filter:none!important;opacity:1!important}
+      [data-hmb-shot-check="true"]::before{content:"✓";font:900 20px/1 system-ui;color:#4ade80;flex:none}
     </style>
-    <div class="hmb-agent-dashboard nodrag" data-shot-number="${paletteShotNumber}" data-execution-phase="${hmbAgentEscape(state.execution_phase)}" style="height:${height}px" tabindex="0">
+    <div class="hmb-agent-dashboard nodrag" data-shot-number="${paletteShotNumber}" data-hmb-managed-shot="${Boolean(state.shot?.shot_uuid)}" data-execution-phase="${hmbAgentEscape(state.execution_phase)}" style="height:${height}px" tabindex="0">
       <header class="agent-topbar group">
         <div class="agent-mark" aria-hidden="true"><span>AG</span></div>
         <div class="agent-heading"><b>HMB Agent</b></div>
@@ -356,13 +344,8 @@ function hmbRefreshAgentDashboard(container, props) {
   root.__hmbAgentPresentationSignature = signature;
   const toggle = root.querySelector?.(".agent-only-toggle");
   if (toggle) { toggle.setAttribute("aria-pressed", String(state.only_mode)); toggle.disabled = Boolean(state.execution_phase); }
-  const rows = root.querySelector?.(".agent-shot-list");
-  if (rows) {
-    rows.style.display = state.shot_manager ? "flex" : "none";
-    const html = hmbAgentRows(state);
-    if (rows.__hmbRowsMarkup !== html) { rows.innerHTML = html; rows.__hmbRowsMarkup = html; }
-  }
   hmbAgentSetAttribute(root,"data-shot-number",String(paletteShotNumber));
+  hmbAgentSetAttribute(root,"data-hmb-managed-shot",String(Boolean(state.shot?.shot_uuid)));
   hmbAgentSetAttribute(root,"data-execution-phase",state.execution_phase || "");
   const select = root.querySelector?.(".agent-shot-select");
   if (select) {
@@ -769,6 +752,9 @@ export function hmbAgentShotRowState(props) {
   return {schema:"hmb-agent-shot-row",version:1,
     shot:valid ? {channel_uuid:shot.channel_uuid,shot_uuid:shot.shot_uuid,number,name:String(shot.name || `Shot ${number}`).slice(0,128),revision:Number(shot.revision)||0} : {},
     selected:valid && raw.selected === true,expanded:valid && raw.expanded === true,
+    render_locked:valid && Array.isArray(raw.shot_edit_locks) && raw.shot_edit_locks.some(
+      lock=>lock?.channel_uuid===shot.channel_uuid && lock?.shot_uuid===shot.shot_uuid),
+    stage_completed:valid && raw.stage_completed===true && raw.status==="succeeded",
     ...(valid && raw.display_page && typeof raw.display_page.prompt === "string" ? {
       display_page:Object.fromEntries(["prompt","additional_context","output"]
         .filter(key=>typeof raw.display_page[key]==="string").map(key=>[key,raw.display_page[key]]))} : {}),
@@ -806,6 +792,43 @@ function hmbGuardPendingAgentEditor(container,ticket) {
   return ()=>{for(const name of events)host.removeEventListener(name,guard,true);};
 }
 
+const hmbAgentRenderEditorOwners = new WeakMap();
+function hmbProtectAgentRenderInputs(container) {
+  const host = hmbAgentNodeRoot(container);
+  if (!host?.querySelectorAll) return () => {};
+  const previous = hmbAgentRenderEditorOwners.get(host);
+  if (previous) {
+    previous.owners.add(container);
+    return () => previous.release(container);
+  }
+  const owned = new Map();
+  const authored = row => /^(?:model_provider|model|agent|include_details|output_schema|additional_context|agent_memory|prompt|tools|rulesets|tools_.+|rulesets_.+|behavior.*)$/i.test(row.getAttribute("data-parameter-name"));
+  const restore = (row,filter) => {row.inert = false; row.style.filter = filter; owned.delete(row);};
+  const protect = () => {
+    for (const [row,filter] of owned) if (!host.contains(row) || !authored(row)) restore(row,filter);
+    for (const row of host.querySelectorAll("[data-parameter-name]")) {
+      if (!authored(row) || row.inert) continue;
+      owned.set(row, row.style.filter);
+      row.inert = true;
+      row.style.filter = "saturate(.2)";
+    }
+  };
+  protect();
+  const Observer = host.ownerDocument?.defaultView?.MutationObserver;
+  const observer = Observer ? new Observer(protect) : null;
+  observer?.observe(host, {subtree:true,childList:true,attributes:true,attributeFilter:["data-parameter-name"]});
+  const owners = new Set([container]);
+  const release = owner => {
+    owners.delete(owner);
+    if (owners.size) return;
+    observer?.disconnect();
+    for (const [row,filter] of owned) restore(row,filter);
+    hmbAgentRenderEditorOwners.delete(host);
+  };
+  hmbAgentRenderEditorOwners.set(host,{owners,release});
+  return () => release(container);
+}
+
 function hmbAgentShotRowWidget(container, initialProps) {
   if (!container) return {cleanup(){},update(){}};
   if (container.__hmbAgentRowHandle) {
@@ -834,6 +857,7 @@ function hmbAgentShotRowWidget(container, initialProps) {
   const style=header.match(/<style>[\s\S]*?<\/style>/)?.[0] || "";
   container.innerHTML=style+`<div class="hmb-agent-dashboard hmb-agent-shot-accordion nodrag" style="height:42px;border-radius:7px;box-shadow:none" data-shot-number="${state.shot.number || 1}"><div class="agent-shot-row" style="height:40px" data-shot-number="${state.shot.number || 1}"><button type="button" class="agent-shot-tab nodrag" data-agent-shot="${hmbAgentEscape(state.shot.shot_uuid || "")}" aria-expanded="false"><span class="agent-row-number"></span><b></b><span class="agent-row-status"></span><span class="agent-row-chevron" aria-hidden="true"></span></button><button type="button" class="agent-shot-run nodrag" aria-label="Run Shot Agent"></button></div></div>`;
   const root=container.querySelector(".hmb-agent-dashboard"),row=container.querySelector(".agent-shot-row"),select=container.querySelector(".agent-shot-tab"),run=container.querySelector(".agent-shot-run");
+  let releaseNativeEditor = null;
   const number=select.querySelector(".agent-row-number"),label=select.querySelector("b"),status=select.querySelector(".agent-row-status"),chevron=select.querySelector(".agent-row-chevron");
   let presentationSignature="";
   const refresh=()=>{
@@ -841,21 +865,28 @@ function hmbAgentShotRowWidget(container, initialProps) {
     const ticket=channelEntry()?.pending;const switching=ticket?.kind==="select" && !ticket.recovering;
     const own=ticket?.owner===container;
     const current=switching ? {...canonical,selected:own,expanded:own && ticket.expanded} : canonical;
+    const protectEditor = canonical.selected && canonical.expanded && canonical.render_locked;
+    if (protectEditor && !releaseNativeEditor) releaseNativeEditor = hmbProtectAgentRenderInputs(container);
+    if (!protectEditor && releaseNativeEditor) {releaseNativeEditor(); releaseNativeEditor = null;}
     const recovering=own && ticket?.recovering;
     const savedResult=typeof current.display_page?.output==="string" ? current.display_page.output : "";
     const resultAvailable=current.status==="succeeded" && Boolean(savedResult.trim()) && !current.expanded;
-    const text=canonical.routing_pending ? "샷 연결 확인 중…" : own ? (recovering ? "응답 확인 필요" : switching ? "전환 중…" : "전달 중…") : lastError ? (lastRejected ? "요청 거절됨" : "응답 확인 필요") : hmbAgentProgressLabel(current, ({preparing:"소스 준비 중…",running:"Agent 실행 중…",succeeded:resultAvailable?"완료 · 결과 보기":"완료",failed:"실패",cancelled:"취소"})[current.status] || "");
+    const text=canonical.render_locked ? "로동중... 수정불가" : canonical.routing_pending ? "샷 연결 확인 중…" : own ? (recovering ? "응답 확인 필요" : switching ? "전환 중…" : "전달 중…") : lastError ? (lastRejected ? "요청 거절됨" : "응답 확인 필요") : hmbAgentProgressLabel(current, ({preparing:"소스 준비 중…",running:"Agent 실행 중…",succeeded:current.stage_completed?(resultAvailable?"완료 · 결과 보기":"완료"):"",failed:"실패",cancelled:"취소"})[current.status] || "");
     const running=["preparing","running"].includes(current.status),runText=recovering ? "↻" : running ? "■" : "▷";
     const title=recovering?"현재 상태만 확인합니다. Agent/Run은 다시 실행하지 않습니다.":lastError || (running?"이 샷 Agent만 취소":"이 샷 Agent만 실행");
-    const disabled=Boolean(ticket) || Boolean(canonical.routing_pending) || !shot.shot_uuid,runDisabled=disabled && (!recovering || Boolean(canonical.routing_pending));
+    const disabled=Boolean(ticket) || Boolean(canonical.routing_pending) || !shot.shot_uuid,runDisabled=canonical.render_locked || (disabled && (!recovering || Boolean(canonical.routing_pending)));
     // The host may update geometry independently of the authored value.
     for(const [key,value] of [["height","42px"],["min-height","42px"],["max-height","42px"],["flex","0 0 42px"],["overflow","hidden"]])if(container.style?.getPropertyValue?.(key)!==value)container.style?.setProperty?.(key,value,"important");
     const resultTitle=resultAvailable ? "클릭하여 저장된 FINAL TEXT를 확인합니다.\n"+savedResult.slice(0,600) : "클릭하여 이 샷을 펼치거나 접습니다.";
-    const signature=JSON.stringify([shot,current.selected,current.expanded,text,runText,title,resultTitle,Boolean(ticket),disabled,runDisabled,Boolean(props.disabled)]);
+    const signature=JSON.stringify([shot,current.selected,current.expanded,current.stage_completed,current.render_locked,text,runText,title,resultTitle,Boolean(ticket),disabled,runDisabled,Boolean(props.disabled)]);
     if(signature===presentationSignature)return;
     presentationSignature=signature;
     hmbAgentSetAttribute(root,"data-shot-number",String(shot.number || 1));hmbAgentSetAttribute(row,"data-shot-number",String(shot.number || 1));
     hmbAgentSetAttribute(row,"data-active",String(current.selected));hmbAgentSetAttribute(row,"data-shot-uuid",shot.shot_uuid || "");
+    hmbAgentSetAttribute(row,"data-render-locked",String(current.render_locked));
+    hmbAgentSetAttribute(row,"data-stage-completed",String(current.stage_completed));
+    hmbAgentSetAttribute(number,"data-hmb-shot-check",String(current.stage_completed));
+    hmbAgentSetAttribute(number,"title",current.stage_completed?"완료":"");
     hmbAgentSetAttribute(select,"data-agent-shot",shot.shot_uuid || "");hmbAgentSetAttribute(select,"aria-expanded",String(current.expanded));hmbAgentSetAttribute(select,"aria-pressed",String(current.selected));
     hmbAgentSetAttribute(select,"title",resultTitle);
     if(number.textContent!==String(shot.number||0).padStart(2,"0"))number.textContent=String(shot.number||0).padStart(2,"0");
@@ -872,6 +903,7 @@ function hmbAgentShotRowWidget(container, initialProps) {
     if(headerProps)hmbAgentSetAttribute(header,"data-shot-number",String(hmbAgentDisplayShotNumber(headerContainer,hmbAgentState(headerProps))));
   };
   const send=(kind)=>{
+    if (!["select","refresh"].includes(kind) && hmbAgentShotRowState(props).render_locked) return;
     const previous=channelEntry()?.pending;
     if(disposed || (previous && !(kind==="refresh" && previous.recovering && previous.owner===container)) || typeof props.onChange!=="function")return;
     const current=hmbAgentShotRowState(props);if(!current.shot.shot_uuid || current.routing_pending)return;
@@ -949,6 +981,7 @@ function hmbAgentShotRowWidget(container, initialProps) {
     while(retiredAcks.size>256)retiredAcks.delete(retiredAcks.values().next().value);
     refresh();
   },cleanup(){
+    releaseNativeEditor?.();
     if(disposed)return;disposed=true;unregister();
     select.removeEventListener("click",selectClick);run.removeEventListener("click",runClick);container.removeEventListener?.("keydown",keydown);container.removeEventListener?.("pointerdown",pointerdown);container.removeAttribute?.("data-hmb-node-delete-protected");delete container.__hmbAgentRowHandle;container.innerHTML="";
   }};
@@ -1117,23 +1150,34 @@ function hmbAcquireNativeStockSafety(container) {
   const key = "__HMB_NATIVE_STOCK_SAFETY_V1__";
   let shared = doc[key];
   if (!shared) {
-    const owners = new Set(), identities = new Map();
+    const owners = new Set(), identities = new Set();
+    let parents = new WeakSet(), awaitingMount = false;
     let contextNode = null, notice = null, noticeTimer = null, disposed = false;
     const nativeReady = () => doc.documentElement.getAttribute("data-hmb-native-deletion-guard") === "engine-preflight"
       && doc.documentElement.getAttribute("data-hmb-native-deletion-protection-version") === "2";
     const rootOf = value => value?.closest?.(".react-flow__node[data-id]") || null;
+    const currentRoot = owner => owner.container?.isConnected ? rootOf(owner.container) : null;
+    const trackParents = element => {
+      for (let parent = element?.parentNode; parent && !parents.has(parent); parent = parent.parentNode) {
+        parents.add(parent);
+      }
+    };
     const roots = () => {
+      parents = new WeakSet();
+      awaitingMount = false;
       for (const owner of owners) {
-        const node = owner.active && owner.container?.isConnected ? rootOf(owner.container) : null;
-        if (node) identities.set(node, node.getAttribute("data-id"));
+        owner.node = currentRoot(owner);
+        if (owner.node) identities.add(owner.node);
+        if (owner.container.isConnected) trackParents(owner.container);
+        else awaitingMount = true;
       }
       // A stock fold/virtualized widget unmount is not a node deletion. Keep
       // its exact outer DOM identity until that node actually leaves the view.
-      for (const [node] of identities) {
+      for (const node of identities) {
         if (!node.isConnected) identities.delete(node);
-        else identities.set(node, node.getAttribute("data-id")); // Native rename keeps this exact retained outer node.
+        else trackParents(node);
       }
-      return new Set(identities.keys());
+      return identities;
     };
     const isEditing = target => Boolean(target?.closest?.("input,textarea,select,[contenteditable='true'],[contenteditable=''],[role='textbox'],.CodeMirror,.cm-editor"));
     const canvasOf = node => node?.closest?.(".react-flow");
@@ -1200,10 +1244,16 @@ function hmbAcquireNativeStockSafety(container) {
       if (!owners.size && !retained.size) { dispose(); return; }
       if (nativeReady() || !retained.size) dismiss();
     };
-    const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(sync) : null;
+    // Card and prompt edits occur below the widget host and cannot move its
+    // outer node. Still observe reparenting, folds, native markers and late mounts.
+    const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(records => {
+      if (awaitingMount || records.some(record => record.type === "attributes" || parents.has(record.target))) sync();
+    }) : null;
     observer?.observe(doc.documentElement, { attributes: true, attributeFilter: ["data-hmb-native-deletion-guard", "data-hmb-native-deletion-protection-version", "data-id"], childList: true, subtree: true });
     win.addEventListener("keydown", keydown, true); win.addEventListener("click", click, true); win.addEventListener("contextmenu", contextmenu, true);
-    shared = { owners, sync, release(owner) {
+    shared = { owners, sync, refresh(owner) {
+      if (currentRoot(owner) !== owner.node) sync();
+    }, release(owner) {
       owner.active = false; owners.delete(owner);
       sync();
     } };
@@ -1212,7 +1262,7 @@ function hmbAcquireNativeStockSafety(container) {
   const owner = { container, active: true };
   shared.owners.add(owner);
   shared.sync();
-  return { refresh() { if (owner.active) shared.sync(); }, cleanup() { if (owner.active) shared.release(owner); } };
+  return { refresh() { if (owner.active) (shared.refresh || shared.sync)(owner); }, cleanup() { if (owner.active) shared.release(owner); } };
 }
 
 // Griptape loads each widget as a separate module. One selection per editor

@@ -1129,7 +1129,7 @@ export function hmbRenameLocalPickerShot(stateValue, workspaceUuid, requestedNam
   const state = normalize(stateValue);
   const target = state.picker_shots.find((row) => row.workspace_uuid === hmbUuid(workspaceUuid));
   const name = clean(requestedName).slice(0, 128);
-  if (!target || !name || target.name === name) return state;
+  if (!target || pickerShotStatus(state, target) || !name || target.name === name) return state;
   target.name = name;
   target.custom_name = true;
   target.revision += 1;
@@ -2467,6 +2467,7 @@ export function hmbPreviewPickerShotSelections(container, next, rollbackState = 
 }
 
 export function hmbToggleVideoAssetSelection(state, uid) {
+  if (pickerShotStatus(state, hmbActivePickerWorkspace(state))) return state;
   const targetUid = clean(uid);
   if (!targetUid) return { ...state };
   const ordered = hmbSelectedVideoAssets(state).map((item) => clean(item.video_uid));
@@ -2487,6 +2488,7 @@ export function hmbToggleVideoAssetSelection(state, uid) {
 }
 
 export function hmbMoveSelectedVideoAsset(state, uid, targetIndex) {
+  if (pickerShotStatus(state, hmbActivePickerWorkspace(state))) return state;
   const targetUid = clean(uid);
   const ordered = hmbSelectedVideoAssets(state).map((item) => clean(item.video_uid));
   const currentIndex = ordered.indexOf(targetUid);
@@ -2524,6 +2526,7 @@ function hmbApplySelectedVideoAssetOrderToDomNormalized(container, normalized, t
       (row) => hmbUuid(row?.workspace_uuid) === workspaceUuid,
     );
     if (!workspace) continue;
+    const rowLocked = locked || pickerShotStatus(normalized, workspace);
     const selectedUids = Array.from(new Set(
       (Array.isArray(workspace.selected_video_uids) ? workspace.selected_video_uids : [])
         .map(clean).filter(Boolean),
@@ -2561,14 +2564,14 @@ function hmbApplySelectedVideoAssetOrderToDomNormalized(container, normalized, t
       card.setAttribute?.("data-selected-video-order", String(order));
       if (selectedAsset) {
         card.setAttribute?.("data-selected-video-uid", uid);
-        card.setAttribute?.("draggable", locked || selectedUids.length < 2 ? "false" : "true");
+        card.setAttribute?.("draggable", rowLocked || selectedUids.length < 2 ? "false" : "true");
       } else {
         card.removeAttribute?.("data-selected-video-uid");
         card.setAttribute?.("draggable", "false");
       }
       const selectionSurface = card.querySelector?.("[data-toggle-video-uid]");
       if (selectionSurface) {
-        const disabled = !!locked || blocked;
+        const disabled = !!rowLocked || blocked;
         if ("disabled" in selectionSurface) selectionSurface.disabled = disabled;
         selectionSurface.setAttribute?.("aria-disabled", disabled ? "true" : "false");
         selectionSurface.setAttribute?.("aria-pressed", selectedAsset ? "true" : "false");
@@ -2583,8 +2586,8 @@ function hmbApplySelectedVideoAssetOrderToDomNormalized(container, normalized, t
       }
       const deleteButton = card.querySelector?.("[data-delete-video-uid]");
       if (deleteButton) {
-        deleteButton.disabled = !!locked;
-        deleteButton.setAttribute?.("aria-disabled", locked ? "true" : "false");
+        deleteButton.disabled = !!rowLocked;
+        deleteButton.setAttribute?.("aria-disabled", rowLocked ? "true" : "false");
       }
     }
     const status = rowElement.querySelector?.(".compact-shot-status");
@@ -2604,6 +2607,7 @@ function hmbApplySelectedVideoAssetOrderToDomNormalized(container, normalized, t
   const toolSourceDragEnabled = container?.__hmbVideoPickerExpanded === true
     && hmbPickerToolsEntry(normalized).active_tool !== "preview";
   const gridState = hmbPickerToolsSourceDisplayState(container, normalized);
+  locked = locked || pickerShotStatus(gridState, hmbActivePickerWorkspace(gridState));
   const selectedUids = hmbSelectedVideoAssets(gridState).map((item) => clean(item.video_uid));
   const selectedOrder = new Map(selectedUids.map((uid, index) => [uid, index + 1]));
   const cardByUid = new Map(cards.map((card) => [clean(card.getAttribute?.("data-video-uid")), card]));
@@ -5048,6 +5052,34 @@ function normalize(value) {
 function hmbPickerStateFromProps(props) {
   if (!props || typeof props !== "object") return {};
   return props.value ?? props.parameterValue ?? props.defaultValue;
+}
+
+// Media edits and Maya progress do not carry leases. Keep the latest
+// same-runtime status through those updates and read retained Python UI
+// options when a compact widget mounts after the status event.
+function hmbPickerShotStatusProps(container, props) {
+  let value = hmbPickerStateFromProps(props);
+  if (typeof value === "string") {
+    try { value = JSON.parse(value); } catch (_error) { return props; }
+  }
+  const runtime = clean(value?.runtime_instance_id);
+  const channel = clean(value?.channel_uuid || value?.picker_publisher_instance_uuid);
+  if (!runtime || !channel) return props;
+  let current = container.__hmbPickerShotStatus;
+  if (current?.runtime_instance_id !== runtime || current.channel_uuid !== channel) current = null;
+  const options = props.ui_options?.picker_shot_status;
+  for (const packet of [value, options]) {
+    if (!Array.isArray(packet?.shot_edit_locks) || !Array.isArray(packet.verified_shots)) continue;
+    if (packet === options && (packet.runtime_instance_id !== runtime || packet.channel_uuid !== channel)) continue;
+    const revision = Number(packet.picker_shot_status_revision || 0);
+    if (packet === value && !revision && value.state_writer === "widget") continue;
+    if (current && (revision < current.revision || (packet === value && revision > 0 && revision === current.revision))) continue;
+    current = {runtime_instance_id:runtime, channel_uuid:channel, revision,
+      shot_edit_locks:packet.shot_edit_locks, verified_shots:packet.verified_shots};
+  }
+  container.__hmbPickerShotStatus = current;
+  return current ? {...props, value:{...value, shot_edit_locks:current.shot_edit_locks,
+    verified_shots:current.verified_shots, picker_shot_status_revision:current.revision}} : props;
 }
 
 // UI authoring needs its own ACK floor: navigation does not change card-row
@@ -10443,7 +10475,21 @@ export function hmbDisposeVideoPickerCompactThumbnailController(container) {
   return true;
 }
 
+function pickerShotStatus(state, row, field = "shot_edit_locks") {
+  const channel = state.channel_uuid || state.picker_publisher_instance_uuid;
+  const shot = state.channel_uuid ? row?.bound_shot_uuid : row?.workspace_uuid;
+  return !!shot && state[field]?.some(scope => scope.channel_uuid === channel && scope.shot_uuid === shot);
+}
+function pickerShotBadge(state, row) {
+  return pickerShotStatus(state, row) ? '<strong class="picker-shot-lock">로동중... 수정불가</strong>' : '';
+}
+function pickerShotNumberAttributes(state, row) {
+  const checked = pickerShotStatus(state, row, "verified_shots");
+  const label = escapeHtml(checked ? row.name + " · 검증 완료" : row.name);
+  return `data-hmb-shot-check="${checked}" aria-label="${label}" title="${label}"`;
+}
 function hmbVideoPickerCompactShotPanelHtml(state, row, tr, locked = false) {
+  locked = locked || pickerShotStatus(state, row);
   const palette = hmbPickerShotPalette(row.number);
   const active = row.workspace_uuid === clean(state.active_picker_shot_uuid);
   const assetCount = hmbPickerWorkspaceAssetUids(row).length;
@@ -10451,8 +10497,8 @@ function hmbVideoPickerCompactShotPanelHtml(state, row, tr, locked = false) {
   const hasCards = assetCount > 0 || imports.length > 0;
   const reservedCount = assetCount + imports.filter((job) => job.status !== "failed").length;
   const selectedCount = Math.min(row.selected_video_uids.length, HMB_PICKER_MAX_REPRESENTATIVE_VIDEOS);
-  return `<article class="compact-shot-row ${active ? "active" : ""} ${hasCards ? "" : "empty"}" data-picker-shot-row="${escapeHtml(row.workspace_uuid)}" data-shot-number="${row.number}" data-picker-shot-layout="compact" aria-current="${active ? "true" : "false"}" style="--local-shot-accent:${palette.accent};--local-shot-deep:${palette.deep};--shot-accent:${palette.accent};--shot-rgb:${palette.rgb.join(",")}">
-      <header class="compact-shot-head"><button type="button" class="picker-shot-number" data-picker-shot-activate="${escapeHtml(row.workspace_uuid)}" aria-label="${escapeHtml(row.name)}" aria-pressed="${active ? "true" : "false"}" >${String(row.number).padStart(2, "0")}</button><b class="picker-shot-name-label" data-picker-shot-name>${escapeHtml(row.name)}</b><span class="compact-shot-status">VIDEOS ${assetCount}/10 · USE ${selectedCount}</span><em class="picker-shot-video-count">${assetCount}/${HMB_PICKER_MAX_ASSETS_PER_SHOT}</em><button type="button" class="picker-shot-rename compact-shot-rename" data-picker-shot-rename="${escapeHtml(row.workspace_uuid)}" aria-label="${escapeHtml(`Rename ${row.name}`)}" ${locked ? "disabled" : ""}>✎</button><button type="button" class="compact-shot-load import-video-button" data-picker-shot-load="${escapeHtml(row.workspace_uuid)}" ${locked || reservedCount >= HMB_PICKER_MAX_ASSETS_PER_SHOT ? "disabled" : ""}>${escapeHtml(tr.load || tr.importVideoAsset || "LOAD")}</button></header>
+  return `<article class="compact-shot-row ${active ? "active" : ""} ${hasCards ? "" : "empty"}" data-picker-shot-bound="${!!state.channel_uuid}" data-render-locked="${!!pickerShotStatus(state, row)}" data-picker-shot-row="${escapeHtml(row.workspace_uuid)}" data-shot-number="${row.number}" data-picker-shot-layout="compact" aria-current="${active ? "true" : "false"}" style="--local-shot-accent:${palette.accent};--local-shot-deep:${palette.deep};--shot-accent:${palette.accent};--shot-rgb:${palette.rgb.join(",")}">
+      <header class="compact-shot-head"><button type="button" class="picker-shot-number" data-picker-shot-activate="${escapeHtml(row.workspace_uuid)}" ${pickerShotNumberAttributes(state, row)} aria-pressed="${active ? "true" : "false"}">${String(row.number).padStart(2, "0")}</button><b class="picker-shot-name-label" data-picker-shot-name>${escapeHtml(row.name)}</b><span data-picker-shot-badges>${pickerShotBadge(state, row)}</span><span class="compact-shot-status">VIDEOS ${assetCount}/10 · USE ${selectedCount}</span><em class="picker-shot-video-count">${assetCount}/${HMB_PICKER_MAX_ASSETS_PER_SHOT}</em><button type="button" class="picker-shot-rename compact-shot-rename" data-picker-shot-rename="${escapeHtml(row.workspace_uuid)}" aria-label="${escapeHtml(`Rename ${row.name}`)}" ${locked ? "disabled" : ""}>✎</button><button type="button" class="compact-shot-load import-video-button" data-picker-shot-load="${escapeHtml(row.workspace_uuid)}" ${locked || reservedCount >= HMB_PICKER_MAX_ASSETS_PER_SHOT ? "disabled" : ""}>${escapeHtml(tr.load || tr.importVideoAsset || "LOAD")}</button></header>
       <div class="compact-shot-assets nowheel ${hasCards ? "" : "empty"}" data-compact-shot-assets="${escapeHtml(row.workspace_uuid)}">${hmbVideoPickerCompactVideosHtml(state, row, tr, locked)}</div>
     </article>`;
 }
@@ -10460,7 +10506,7 @@ function hmbVideoPickerCompactShotPanelHtml(state, row, tr, locked = false) {
 function hmbVideoPickerExpandedShotButtonHtml(state, row, _tr, locked = false) {
   const palette = hmbPickerShotPalette(row.number);
   const active = row.workspace_uuid === clean(state.active_picker_shot_uuid);
-  return `<article class="picker-shot-tab ${active ? "active" : ""}" data-picker-shot-row="${escapeHtml(row.workspace_uuid)}" data-picker-shot-layout="expanded" style="--local-shot-accent:${palette.accent};--local-shot-deep:${palette.deep}"><button type="button" class="picker-shot-activate" data-picker-shot-activate="${escapeHtml(row.workspace_uuid)}" aria-label="${escapeHtml(row.name)}" aria-pressed="${active ? "true" : "false"}" ><span class="picker-shot-number">${String(row.number).padStart(2, "0")}</span></button></article>`;
+  return `<article class="picker-shot-tab ${active ? "active" : ""}" data-picker-shot-bound="${!!state.channel_uuid}" data-render-locked="${!!pickerShotStatus(state, row)}" data-picker-shot-row="${escapeHtml(row.workspace_uuid)}" data-picker-shot-layout="expanded" style="--local-shot-accent:${palette.accent};--local-shot-deep:${palette.deep}"><button type="button" class="picker-shot-activate" data-picker-shot-activate="${escapeHtml(row.workspace_uuid)}" aria-label="${escapeHtml(row.name)}" aria-pressed="${active ? "true" : "false"}" ><span class="picker-shot-number" ${pickerShotNumberAttributes(state, row)}>${String(row.number).padStart(2, "0")}</span><span data-picker-shot-badges>${pickerShotBadge(state, row)}</span></button></article>`;
 }
 
 function hmbVideoPickerShotTabsHtml(stateValue, tr, locked = false, mode = "compact") {
@@ -10525,6 +10571,12 @@ export function hmbPatchVideoPickerShotWorkspace(
         container.__hmbPickerRegionalParseCount = Number(container.__hmbPickerRegionalParseCount || 0) + 1;
       }
       retained.add(workspaceUuid);
+      const rowLocked = !!pickerShotStatus(state, shot);
+      row.setAttribute?.("data-render-locked", String(rowLocked));
+      row.setAttribute?.("data-picker-shot-bound", String(!!state.channel_uuid));
+      const badge = row.querySelector?.("[data-picker-shot-badges]");
+      const badgeMarkup = pickerShotBadge(state, shot);
+      if (badge && badge.innerHTML !== badgeMarkup) badge.innerHTML = badgeMarkup;
       row.classList?.toggle?.("active", active);
       row.style?.setProperty?.("--local-shot-accent", palette.accent);
       row.style?.setProperty?.("--local-shot-deep", palette.deep);
@@ -10538,7 +10590,15 @@ export function hmbPatchVideoPickerShotWorkspace(
       // may still be in flight, but that must not impose a 1.5s click delay.
       if (activate) activate.disabled = false;
       const number = row.querySelector?.(".picker-shot-number");
-      if (number) number.textContent = String(shot.number).padStart(2, "0");
+      if (number) {
+        const checked = pickerShotStatus(state, shot, "verified_shots");
+        const label = checked ? shot.name + " · 검증 완료" : shot.name;
+        number.textContent = String(shot.number).padStart(2, "0");
+        number.setAttribute?.("data-hmb-shot-check", String(checked));
+        number.setAttribute?.("title", label);
+        number.setAttribute?.("aria-label", label);
+        activate?.setAttribute?.("aria-label", label);
+      }
       if (mode === "expanded") {
         const atIndex = tabs.children?.[desiredIndex] || null;
         if (atIndex !== row) tabs.insertBefore?.(row, atIndex);
@@ -10561,7 +10621,7 @@ export function hmbPatchVideoPickerShotWorkspace(
       const rename = row.querySelector?.("[data-picker-shot-rename]");
       rename?.setAttribute?.("data-picker-shot-rename", workspaceUuid);
       rename?.setAttribute?.("aria-label", `Rename ${shot.name}`);
-      if (rename) rename.disabled = locked || !!activeRenameInput;
+      if (rename) rename.disabled = locked || rowLocked || !!activeRenameInput;
       const remove = row.querySelector?.("[data-picker-shot-delete]");
       remove?.setAttribute?.("data-picker-shot-delete", workspaceUuid);
       remove?.setAttribute?.("aria-label", `Delete ${shot.name}`);
@@ -10576,11 +10636,11 @@ export function hmbPatchVideoPickerShotWorkspace(
         if (desiredVideos.length) compactAssets.querySelector?.(".compact-shot-empty")?.remove?.();
         desiredVideos.forEach((video, videoIndex) => {
           const slot = videoIndex + 1;
-          const desiredFingerprint = hmbVideoPickerCompactSlotFingerprint(state, video, locked, slot);
+          const desiredFingerprint = hmbVideoPickerCompactSlotFingerprint(state, video, locked || rowLocked, slot);
           let card = existingCards.get(video.uid) || null;
           if (!card || clean(card.getAttribute?.("data-compact-video-fingerprint")) !== desiredFingerprint) {
             const template = ownerDocument.createElement("template");
-            template.innerHTML = hmbVideoPickerCompactVideoHtml(state, shot, video, tr, locked, slot);
+            template.innerHTML = hmbVideoPickerCompactVideoHtml(state, shot, video, tr, locked || rowLocked, slot);
             const replacement = template.content?.firstElementChild || template.firstElementChild || null;
             if (!replacement) return;
             if (card?.parentElement === compactAssets) compactAssets.replaceChild?.(replacement, card);
@@ -10616,6 +10676,16 @@ export function hmbPatchVideoPickerShotWorkspace(
     });
   }
   const active = hmbActivePickerWorkspace(state);
+  const editingLocked = !!pickerShotStatus(state, active);
+  for (const section of container?.querySelectorAll?.(".scene-load-bar,.outliner-palette,.outliner-scroll,.depth-range-settings,.generate-playblast-toolbar,.snapshot-toolbar,.picker-tools-panel") || []) {
+    if (editingLocked && !section.hasAttribute?.("inert")) {
+      section.setAttribute?.("data-render-edit-disabled", "");
+      section.setAttribute?.("inert", "");
+    } else if (!editingLocked && section.hasAttribute?.("data-render-edit-disabled")) {
+      section.removeAttribute?.("data-render-edit-disabled");
+      section.removeAttribute?.("inert");
+    }
+  }
   const activeControls = container?.querySelector?.("[data-picker-active-shot-controls]");
   if (activeControls && active) {
     activeControls.setAttribute?.("data-picker-active-shot-controls", active.workspace_uuid);
@@ -10624,7 +10694,7 @@ export function hmbPatchVideoPickerShotWorkspace(
     if (!activeInput && activeName) activeName.textContent = active.name;
     const activeRename = activeControls.querySelector?.("[data-picker-shot-rename]");
     activeRename?.setAttribute?.("data-picker-shot-rename", active.workspace_uuid);
-    if (activeRename) activeRename.disabled = locked || !!activeInput;
+    if (activeRename) activeRename.disabled = locked || pickerShotStatus(state, active) || !!activeInput;
     const activeDelete = activeControls.querySelector?.("[data-picker-shot-delete]");
     activeDelete?.setAttribute?.("data-picker-shot-delete", active.workspace_uuid);
     if (activeDelete) activeDelete.disabled = true;
@@ -10653,7 +10723,7 @@ export function hmbPatchVideoPickerShotWorkspace(
       : active;
     const targetCount = hmbPickerWorkspaceAssetUids(targetShot).length
       + hmbPickerPendingImports(state, targetShot?.workspace_uuid, container).filter((job) => job.status !== "failed").length;
-    load.disabled = resolvedLoadLocked
+    load.disabled = resolvedLoadLocked || pickerShotStatus(state, targetShot)
       || !targetShot
       || targetCount >= HMB_PICKER_MAX_ASSETS_PER_SHOT;
   }
@@ -12634,6 +12704,7 @@ function hmbNativeUiImplementation(container, props) {
   if (hmbVideoPickerIsHostMeasurementClone(container)) {
     return hmbMountVideoPickerHostMeasurement(container, props || {});
   }
+  props = hmbPickerShotStatusProps(container, props || {});
   // A new factory mount is live.  Host deletion flips this before running any
   // cleanup so late promise/timer callbacks cannot publish into a removed
   // node.
@@ -12835,6 +12906,11 @@ function hmbNativeUiImplementation(container, props) {
     }
   }
   let state = pendingState && !engineIsNewer ? pendingState : engineState;
+  if (state !== engineState && container.__hmbPickerShotStatus && state.runtime_instance_id === engineState.runtime_instance_id
+      && (state.channel_uuid || state.picker_publisher_instance_uuid) === (engineState.channel_uuid || engineState.picker_publisher_instance_uuid)) {
+    state.shot_edit_locks = engineState.shot_edit_locks;
+    state.verified_shots = engineState.verified_shots;
+  }
   // During a compact/full swap, publishing the hidden measurement before the
   // live DOM and shell geometry agree lets React's adaptive allocator replace
   // the visible row in the middle of our mount.  The transition commits one
@@ -13048,6 +13124,14 @@ function hmbNativeUiImplementation(container, props) {
   const sharedImportInputMarkup = `
           <input type="file" id="import-video-asset" data-picker-shared-import-input accept=".mp4,video/mp4" multiple hidden/>`;
   const fixedTopPaintMarkup = `<style>
+    .hmbvp [data-picker-shot-row][data-render-locked="true"]{--shot-rgb:115,121,135!important;--shot-accent:#c7cbd2!important;--local-shot-accent:#8b929f!important;--local-shot-deep:#454b56!important}
+    .hmbvp [data-render-locked="true"] .compact-shot-assets{filter:saturate(.30)}
+    .hmbvp .picker-shot-lock{color:#f8dd9d;font-size:10px;white-space:nowrap}
+    .hmbvp [data-picker-shot-badges]:empty{display:none}
+    .hmbvp .picker-shot-tabs[data-picker-shot-layout="expanded"]>.picker-shot-tab:has([data-picker-shot-badges]:not(:empty)){flex:0 0 auto;min-width:64px;width:auto;max-width:none}
+    .hmbvp .picker-shot-tabs[data-picker-shot-layout="expanded"] .picker-shot-activate:has([data-picker-shot-badges]:not(:empty)){width:auto;padding:0 8px}
+    .hmbvp [data-render-edit-disabled]{filter:saturate(.30)}
+    .hmbvp:has([data-picker-shot-bound="true"]) [data-hmb-native-actions] div:is(.bg-green-600,.bg-blue-600):has(>span.leading-none){display:none!important}
       .hmbvp :is(button,input,select,textarea):not([data-hmb-native-identity] *,[data-hmb-native-actions] *){font-family:inherit}
       .hmbvp>.app-header.top[data-picker-toggle-surface="header"]{--hmb-primary-top:#F472B6;--hmb-primary-bottom:#BE185D;--hmb-primary-line:#F3A8CE;--hmb-focus:#22D3EE;--hmb-accent:#22D3EE;--hmb-glow:rgba(168,85,247,.16);--selection-rgb:244,114,182;--selection-deep-rgb:190,24,93;--selection-text:#F8C6DF;--selection-soft:#F3A8CE;--selection-strong:#FFE4F2;background:linear-gradient(90deg,rgba(72,35,101,.44),rgba(14,23,38,.92) 44%,rgba(6,9,18,.96))!important;background-color:#060912!important;border-bottom-color:rgba(148,163,184,.19)!important;box-shadow:none!important;filter:none!important;backdrop-filter:none!important;transition:none!important}
       .hmbvp>.app-header.top[data-picker-toggle-surface="header"] *:not([data-hmb-native-identity] *,[data-hmb-native-actions] *){transition:none!important}.hmbvp>.app-header.top[data-picker-toggle-surface="header"] button:not([data-hmb-native-identity] *,[data-hmb-native-actions] *){box-shadow:none!important}.hmbvp>.app-header.top[data-picker-toggle-surface="header"] .brand-mark{border-color:rgba(34,211,238,.70)!important;background:rgba(8,145,178,.12)!important;color:#22D3EE!important;box-shadow:none!important}
@@ -13055,6 +13139,10 @@ function hmbNativeUiImplementation(container, props) {
       .hmbvp>.app-header.top[data-picker-toggle-surface="header"][data-picker-view-transition-pending="true"]{cursor:progress!important}
       .hmbvp .picker-shot-tabs[data-picker-shot-layout="expanded"]>.picker-shot-tab.active{border-color:color-mix(in srgb,var(--local-shot-accent) 48%,#263449)!important;box-shadow:none!important}.hmbvp .picker-shot-tabs[data-picker-shot-layout="expanded"] .picker-shot-activate[aria-pressed="true"]{outline:2px solid var(--local-shot-accent)!important;outline-offset:-3px;border-radius:6px;box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--local-shot-accent) 38%,transparent)!important}
       .hmbvp.hmbvp-compact .compact-shot-row.active{border-color:rgba(var(--shot-rgb),.38)!important;box-shadow:none!important}.hmbvp.hmbvp-compact .compact-shot-row.active .compact-shot-head>.picker-shot-number{outline:2px solid var(--shot-accent)!important;outline-offset:2px;border-radius:4px;box-shadow:none!important}
+    .hmbvp .picker-shot-tabs[data-picker-shot-layout="expanded"]>.picker-shot-tab:has([data-hmb-shot-check="true"]){flex:0 0 auto;min-width:44px;width:auto;max-width:none}
+    .hmbvp .picker-shot-tabs[data-picker-shot-layout="expanded"] .picker-shot-activate:has([data-hmb-shot-check="true"]){width:auto;min-width:38px}
+    .hmbvp [data-hmb-shot-check="true"]{display:inline-flex!important;align-items:center;justify-content:center;gap:2px!important;width:38px!important;min-width:38px!important;max-width:38px!important;height:30px!important;min-height:30px!important;max-height:30px!important;flex:none!important;padding:0!important;box-sizing:border-box!important;font:700 11px/1 system-ui!important;font-variant-numeric:tabular-nums;background:#12301d!important;color:#dcfce7!important;border:1px solid #4ade80!important;border-radius:5px!important;filter:none!important;opacity:1!important}
+    .hmbvp [data-hmb-shot-check="true"]::before{content:"✓";font:900 20px/1 system-ui;color:#4ade80;flex:none}
     </style>`;
   const fixedTopMarkup = `${fixedTopPaintMarkup}<header class="app-header top group" data-picker-toggle-surface="header" aria-label="HMB VideoPicker">
         <div class="brand"><span class="brand-mark"></span><span>HMB VideoPicker</span></div><div class="hmb-native-identity" data-hmb-native-identity></div><div class="hmb-native-actions nodrag" data-hmb-native-actions></div>
@@ -14125,6 +14213,10 @@ function hmbNativeUiImplementation(container, props) {
     const resolvedActionId = clean(actionId)
       || `${clean(action) || "command"}-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
     const commandPayload = hmbPickerCommandPayload(liveState, payload);
+    const target = liveState.picker_shots.find(row => row.workspace_uuid === (commandPayload.picker_shot_uuid || liveState.active_picker_shot_uuid));
+    if (pickerShotStatus(liveState, target) && !["cancel_generate","cancel_pending","cancel_operation","stop_read","open_log_folder"].includes(action)) {
+      return {command:null, delivered:false, duplicate:true, deliveryPromise:null};
+    }
     const command = {
       schema: "hmb-picker-command",
       version: 1,
@@ -16756,6 +16848,7 @@ function hmbNativeUiImplementation(container, props) {
   });
   schedulePickerFit(true);
   container.__hmbVideoPickerControllerUpdate = (nextProps) => {
+    nextProps = hmbPickerShotStatusProps(container, nextProps || {});
     // An ACK belongs to the raw backend receipt, not the protected media
     // projection below (which may keep state_writer="widget" for a newer
     // selection in another Shot). Consume only this runtime's receipt.
@@ -16765,6 +16858,16 @@ function hmbNativeUiImplementation(container, props) {
     }
     const receiptRuntime = clean(receipt?.runtime_instance_id);
     if (receiptRuntime && receiptRuntime === clean(state.runtime_instance_id)) {
+      if (Array.isArray(receipt.shot_edit_locks) && Array.isArray(receipt.verified_shots)) {
+        const live = currentWidgetState(false);
+        const view = {shot_edit_locks:receipt.shot_edit_locks, verified_shots:receipt.verified_shots};
+        if (JSON.stringify([live.shot_edit_locks,live.verified_shots]) !== JSON.stringify([view.shot_edit_locks,view.verified_shots])) {
+          for (const current of [state,container.__hmbPendingPickerState,container.__hmbPickerPaintFirstState]) {
+            if (current) Object.assign(current, view);
+          }
+          hmbPatchVideoPickerShotWorkspace(container,{...live,...view},TEXT[live.language] || TEXT.ko);
+        }
+      }
       hmbReconcilePickerCommandAcknowledgements(container, receipt);
     }
     nextProps = { ...(nextProps || {}), value: hmbApplyOptimisticPickerSnapshotDeletions(container,
@@ -16988,23 +17091,34 @@ function hmbAcquireNativeStockSafety(container) {
   const key = "__HMB_NATIVE_STOCK_SAFETY_V1__";
   let shared = doc[key];
   if (!shared) {
-    const owners = new Set(), identities = new Map();
+    const owners = new Set(), identities = new Set();
+    let parents = new WeakSet(), awaitingMount = false;
     let contextNode = null, notice = null, noticeTimer = null, disposed = false;
     const nativeReady = () => doc.documentElement.getAttribute("data-hmb-native-deletion-guard") === "engine-preflight"
       && doc.documentElement.getAttribute("data-hmb-native-deletion-protection-version") === "2";
     const rootOf = value => value?.closest?.(".react-flow__node[data-id]") || null;
+    const currentRoot = owner => owner.container?.isConnected ? rootOf(owner.container) : null;
+    const trackParents = element => {
+      for (let parent = element?.parentNode; parent && !parents.has(parent); parent = parent.parentNode) {
+        parents.add(parent);
+      }
+    };
     const roots = () => {
+      parents = new WeakSet();
+      awaitingMount = false;
       for (const owner of owners) {
-        const node = owner.active && owner.container?.isConnected ? rootOf(owner.container) : null;
-        if (node) identities.set(node, node.getAttribute("data-id"));
+        owner.node = currentRoot(owner);
+        if (owner.node) identities.add(owner.node);
+        if (owner.container.isConnected) trackParents(owner.container);
+        else awaitingMount = true;
       }
       // A stock fold/virtualized widget unmount is not a node deletion. Keep
       // its exact outer DOM identity until that node actually leaves the view.
-      for (const [node] of identities) {
+      for (const node of identities) {
         if (!node.isConnected) identities.delete(node);
-        else identities.set(node, node.getAttribute("data-id")); // Native rename keeps this exact retained outer node.
+        else trackParents(node);
       }
-      return new Set(identities.keys());
+      return identities;
     };
     const isEditing = target => Boolean(target?.closest?.("input,textarea,select,[contenteditable='true'],[contenteditable=''],[role='textbox'],.CodeMirror,.cm-editor"));
     const canvasOf = node => node?.closest?.(".react-flow");
@@ -17071,10 +17185,16 @@ function hmbAcquireNativeStockSafety(container) {
       if (!owners.size && !retained.size) { dispose(); return; }
       if (nativeReady() || !retained.size) dismiss();
     };
-    const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(sync) : null;
+    // Card and prompt edits occur below the widget host and cannot move its
+    // outer node. Still observe reparenting, folds, native markers and late mounts.
+    const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(records => {
+      if (awaitingMount || records.some(record => record.type === "attributes" || parents.has(record.target))) sync();
+    }) : null;
     observer?.observe(doc.documentElement, { attributes: true, attributeFilter: ["data-hmb-native-deletion-guard", "data-hmb-native-deletion-protection-version", "data-id"], childList: true, subtree: true });
     win.addEventListener("keydown", keydown, true); win.addEventListener("click", click, true); win.addEventListener("contextmenu", contextmenu, true);
-    shared = { owners, sync, release(owner) {
+    shared = { owners, sync, refresh(owner) {
+      if (currentRoot(owner) !== owner.node) sync();
+    }, release(owner) {
       owner.active = false; owners.delete(owner);
       sync();
     } };
@@ -17083,7 +17203,7 @@ function hmbAcquireNativeStockSafety(container) {
   const owner = { container, active: true };
   shared.owners.add(owner);
   shared.sync();
-  return { refresh() { if (owner.active) shared.sync(); }, cleanup() { if (owner.active) shared.release(owner); } };
+  return { refresh() { if (owner.active) (shared.refresh || shared.sync)(owner); }, cleanup() { if (owner.active) shared.release(owner); } };
 }
 
 // Griptape loads each widget as a separate module. One selection per editor

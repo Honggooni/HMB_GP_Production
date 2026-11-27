@@ -260,9 +260,9 @@ class CapabilityRoutingTests(unittest.TestCase):
         self.boundaries.start()
         self.review = mock.patch.object(t._review, "capture_inputs", return_value={})
         self.review.start()
-        self.diagnostics = mock.patch.object(t, "_broker_log_transport_error")
+        self.diagnostics = mock.patch.object(t._broker_transport, "_broker_log_transport_error")
         self.diagnostics.start()
-        self.token_fence = mock.patch.object(t, "_broker_load_token",
+        self.token_fence = mock.patch.object(t._broker_transport, "_broker_load_token",
             side_effect=AssertionError("Offline regression attempted to load a real credential"))
         self.token_fence.start()
         self.network_fence = mock.patch.object(t.urllib.request.OpenerDirector, "open",
@@ -616,7 +616,7 @@ class CapabilityRoutingTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    t.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.0
+    t._broker_transport.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.0
     runner = unittest.main(exit=False)
     print(json.dumps({"suite": "seedance-capability-routing", "tests_run": runner.result.testsRun,
         "failures": len(runner.result.failures), "errors": len(runner.result.errors),

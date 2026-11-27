@@ -957,7 +957,8 @@ class MyBoxController:
                     if self._capabilities._queue_admission is not None:
                         cp["queue_only_headers"] = json.loads(invocation._queue_headers_json)
                     cp["reference_lease_id"] = await self.node._run_blocking_generation_stage(
-                        lambda: self.node._bind_temporary_reference_lease(broker._bridge, origin, client_id, scope="my_box"))
+                        lambda: self.node._bind_temporary_reference_lease(
+                            broker._bridge, origin, client_id, scope="my_box", wire_payload=base))
                     cp = await self._persist(cp)
                     self._guard(epoch, origin)
                     self._status("submitting", client_id)

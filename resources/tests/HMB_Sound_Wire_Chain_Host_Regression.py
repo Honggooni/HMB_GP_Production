@@ -73,9 +73,13 @@ async def exercise(engine, phase, out):
         if phase == "reopen":
             result = await harness.asend(engine, RunWorkflowWithCurrentStateRequest(file_path=str(saved)))
             assert str(getattr(result.status, "name", result.status)) == "GOOD", str(result.status)
+            if getattr(result, "open_workflow", None) is not None:
+                guards.enter_context(engine.bind_workflow(engine.open_workflows.get(result.workflow_id)))
             nodes = {key: engine.node_manager.get_node_by_name(name) for key, name in json.loads(expected_file.read_text("utf-8"))["names"].items()}
         else:
-            harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name="SoundWireChain"))
+            ensured = harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name="SoundWireChain"))
+            if getattr(ensured, "open_workflow", None) is not None:
+                guards.enter_context(engine.bind_workflow(engine.open_workflows.get(ensured.workflow_id)))
             def create(kind, name, metadata=None):
                 result = harness.send(engine, CreateNodeRequest(node_type=kind, node_name=name,
                     specific_library_name=schema.name, initial_setup=True, metadata=metadata or {}, create_error_proxy_on_failure=False))
@@ -330,8 +334,11 @@ async def exercise(engine, phase, out):
             # A second real five-node flow deliberately reuses the same UUIDs.
             # Its lack of Sound must remain optional and cannot discover the
             # first flow's Sound through browser/global/source caches.
-            harness.send(engine, CreateFlowRequest(flow_name="NoSoundFiveNodeSameUUID", parent_flow_name=None, set_as_new_context=True))
-            foreign_read = engine.handle_request(read_sound_ui(node_name=sound.name, broadcast_result=False))
+            created = harness.send(engine, CreateFlowRequest(flow_name="NoSoundFiveNodeSameUUID", parent_flow_name="SoundWireChain", set_as_new_context=True))
+            if hasattr(engine, "bind_workflow"):
+                guards.enter_context(engine.context_manager.flow(created.flow_name))
+            foreign_scope = {**sound_scope, "flow_name": created.flow_name}
+            foreign_read = engine.handle_request(read_sound_ui(node_name=sound.name, broadcast_result=False, **foreign_scope))
             assert foreign_read.succeeded() and not foreign_read.snapshot and foreign_read.altered_workflow_state is False
             image2 = create("HMBImageAssetLibrary", "NoSound Image Publisher")
             picker2 = create("HMBVideoPickerLibrary", "NoSound Video Picker")
@@ -380,7 +387,7 @@ async def exercise(engine, phase, out):
             assert all({p.name for p in root.iterdir()} == {"voice.wav"} for root in roots)
             harness.record("cold_sdk_reopen_keeps_four_sound_folders_and_shot_track_ids", sources=len(restored))
             stale_read = engine.handle_request(read_sound_ui(node_name=sound.name,
-                expected_stream_id=expected["sound_ui_stream"], broadcast_result=False))
+                expected_stream_id=expected["sound_ui_stream"], broadcast_result=False, **sound_scope))
             assert stale_read.succeeded() and not stale_read.snapshot and stale_read.altered_workflow_state is False
             assert assert_sound_ui_read() != expected["sound_ui_stream"]
             harness.record("cold_sdk_reopen_readonly_sound_snapshot_uses_fresh_stream", altered_workflow_state=False)

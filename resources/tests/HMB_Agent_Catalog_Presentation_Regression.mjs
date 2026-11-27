@@ -81,12 +81,16 @@ try{
   const completed={...rowValue(1),status:'succeeded',selected:true,expanded:false,
     display_page:{prompt:'한글 입력',output:'한글 FINAL TEXT 결과',additional_context:''}};
   handles[0].update({value:completed,onChange:onRow});
+  const legacyCheck = rows[0].querySelector('[data-hmb-shot-check]').dataset.hmbShotCheck;
+  const legacyTitle = rows[0].querySelector('.agent-shot-tab').title;
+  handles[0].update({value:{...completed,stage_completed:true},onChange:onRow});
   const status=rows[0].querySelector('.agent-row-status').textContent;
   const title=rows[0].querySelector('.agent-shot-tab').title;
   const beforeCalls=calls.length;rows[0].querySelector('.agent-shot-tab').click();
-  return {status,title,beforeCalls};
+  return {status,title,beforeCalls,legacyCheck,legacyTitle};
  });
  assert.equal(result.status,'완료 · 결과 보기');assert.ok(result.title.includes('한글 FINAL TEXT 결과'));
+ assert.equal(result.legacyCheck,'false');assert.ok(result.legacyTitle.includes('한글 FINAL TEXT 결과'));
  await page.waitForFunction(count=>calls.length===count+1,result.beforeCalls);
  const action=await page.evaluate(()=>calls.at(-1).action);
  assert.equal(action.kind,'select');assert.equal(action.expanded,true);

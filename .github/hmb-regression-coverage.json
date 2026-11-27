@@ -17,6 +17,12 @@
       "sdk": "desktop_031"
     },
     {
+      "name": "HMB_Broker_Transport_Isolation_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_Pinned_Agent_Provenance_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
@@ -801,14 +807,14 @@
       "mode": "manual",
       "coverage": "installed_sdk",
       "required": false,
-      "reason": "Requires a cold installed SDK without external Standard dependency path injection; validates native Agent discovery, constructor and five-slot restore with external work denied."
+      "reason": "Requires a cold installed SDK; checks bundled Agent construction and restores five saved shots with external Standard discovery unavailable."
     },
     {
       "name": "HMB_Standard_Agent_Cross_Library_Import_Host_Regression.py",
       "coverage": "installed_sdk",
       "mode": "manual",
       "required": false,
-      "reason": "Requires fresh installed SDK, registered Standard and Advanced Media edit environments; run canonical, Advanced-front and cached-Advanced cases separately through the SDK offline guard."
+      "reason": "Checks the bundled Agent in fresh installed SDK processes with normal, Advanced-first and cached Advanced Media dependencies. Older explicit comparison roots still exercise the external Standard implementation."
     },
     {
       "name": "HMB_Prompt_Connection_Preparing_Regression.py",
@@ -3163,6 +3169,12 @@
     },
     {
       "name": "HMB_Shot_Hierarchy_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Shot_Number_Check_Browser_Regression.mjs",
       "mode": "ci",
       "coverage": "host_browser",
       "required": true

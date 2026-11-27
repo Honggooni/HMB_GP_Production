@@ -71,7 +71,7 @@ def validate_receipt(value: Any, model: str, kind: str, *, request_id: str = "")
 class AnalysisClient:
     def __init__(self, model: str, kind: str, *, is_live: Callable[[], bool]):
         self.origin, self.model, self.kind, self.is_live = production_origin(), model, kind, is_live
-        from HMBSeedanceGeneration import _HMBAIBrokerBridge
+        from _hmb_broker_transport import _HMBAIBrokerBridge
         self.bridge = _HMBAIBrokerBridge(server_url=self.origin)
         _live(is_live)
         self._request("GET", "/api/me", payload=None, timeout=5)

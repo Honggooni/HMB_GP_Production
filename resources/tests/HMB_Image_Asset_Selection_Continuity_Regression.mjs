@@ -10,8 +10,11 @@ try { playwright = require("playwright"); }
 catch { playwright = require(path.join(os.homedir(), ".cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright")); }
 const executablePath = process.env.HMB_IMAGE_ASSET_TEST_BROWSER || "C:/Program Files/Google/Chrome/Application/chrome.exe";
 assert.ok(fs.existsSync(executablePath), "Selection continuity requires the real browser fixture.");
-const source = fs.readFileSync(new URL("../../widgets/HMBImageAssetLibraryWidget.js", import.meta.url), "utf8");
-const promptSource = fs.readFileSync(new URL("../../widgets/HMBPromptLibraryScopedBindingWidget.js", import.meta.url), "utf8");
+const widgetSource = name => fs.readFileSync(process.env.HMB_MODE_TEST_LIBRARY_ROOT
+  ? path.join(process.env.HMB_MODE_TEST_LIBRARY_ROOT, "widgets", name)
+  : new URL("../../widgets/" + name, import.meta.url), "utf8");
+const source = widgetSource("HMBImageAssetLibraryWidget.js");
+const promptSource = widgetSource("HMBPromptLibraryScopedBindingWidget.js");
 const browser = await playwright.chromium.launch({ executablePath, headless: true });
 const cases = [], errors = [];
 let remoteRequests = 0;
@@ -84,7 +87,7 @@ try {
       f.cards[0].click();
       const prompt = document.querySelector("#prompt");
       const row = prompt.querySelector('[data-hmb-image-selection-pending="source-0"]');
-      if (!row?.textContent.includes("Hero 0") || prompt.querySelector(".image-card h3").textContent.includes("Hero 0")
+      if (row?.querySelector('[data-field="label"]')?.value !== "Hero 0" || !row.querySelector('[data-field="owner"]') || !row.querySelector('[data-field="color_picks"]') || prompt.querySelector(".image-card h3").textContent.includes("Hero 0")
         || f.writes.length || f.promptWrites) {
         throw Error("The bound Prompt must show the selection once, in its slot, before the first host write.");
       }
@@ -237,11 +240,83 @@ try {
       repaint.scan_revision++;
       apply(repaint);
       const prompt = document.querySelector("#prompt");
-      if (!prompt.querySelector('[data-hmb-image-selection-pending="source-2"]')?.textContent.includes("Hero 2")
+      if (prompt.querySelector('[data-hmb-image-selection-pending="source-2"] [data-field="label"]')?.value !== "Hero 2"
           || prompt.querySelector('.image-card h3 b')?.textContent !== '3 / 50'
           || source.querySelector("[data-dismiss-shot-link]")) {
         throw Error("A folder read warning cancelled a new selection after the old link notice was dismissed.");
       }
+    });
+    const eight = await page.evaluate(() => {
+      const f = selectionFixture, prompt = document.querySelector("#prompt");
+      const next = structuredClone(f.container.__hmbImageAssetLatestState);
+      next.scan_revision++;
+      next.assets = Array.from({length:8}, (_,i) => ({...next.assets[0], asset_id:"Hero"+i, image_name:"Hero "+i,
+        source_uid:"source-"+i, asset_library_id:"asset-"+i, relative_path:"Hero"+i+".png",
+        image_main_type:"Character", image_sub_type:"Full Appearance", source_type:"Character Appearance",
+        selected:false, selection_order:0}));
+      next.shot_routing.shots.forEach(shot=>{shot.selected_source_uids=[];shot.media_count=0;});
+      f.controller.cleanup();
+      f.controller=f.widget.default(f.container,{value:JSON.stringify(next),onChange:f.onChange});
+      const startWrites=f.promptWrites, timings=[];
+      for (let i=0;i<8;i++) {
+        const start=performance.now();
+        f.container.querySelector('.asset-grid [data-asset-key="asset-'+i+'"]').click();
+        const row=prompt.querySelector('[data-hmb-image-selection-pending="source-'+i+'"]');
+        if (row?.querySelector('[data-field="label"]')?.value!== "Hero "+i
+          || row.querySelector('[data-field="image_main_type"]').value!== "Character"
+          || row.querySelector('[data-field="image_sub_type"]').value!== "Full Appearance"
+          || !row.querySelector('[data-field="owner"]') || !row.querySelector('[data-field="color_picks"]'))
+          throw Error("Selecting a registered image did not immediately expose its normal controls at slot "+(i+1));
+        timings.push(performance.now()-start);
+      }
+      const uid = () => [...prompt.querySelectorAll('.image-card [data-hmb-image-selection-pending]')].map(row=>row.dataset.hmbImageSelectionUid);
+      const last=prompt.querySelector('[data-hmb-image-selection-pending="source-7"]');
+      last.querySelector(".move-image-up").click();
+      if (uid()[6]!=="source-7") throw Error("The eighth image did not move up.");
+      const transfer=new DataTransfer(), first=prompt.querySelector('[data-hmb-image-selection-pending="source-0"]');
+      for (const [el,type] of [[last.querySelector("[data-image-drag-handle]"),"dragstart"],[first,"dragover"],
+        [first,"drop"],[last,"dragend"]]) el.dispatchEvent(new DragEvent(type,{bubbles:true,cancelable:true,dataTransfer:transfer}));
+      return {timings,first:uid()[0],promptWrites:f.promptWrites-startWrites};
+    });
+    assert.equal(eight.first,'source-7');
+    assert.equal(eight.promptWrites,0);
+    console.log(JSON.stringify({format,eighth_click_to_full_editor_ms:eight.timings[7],order:eight.first}));
+    await page.evaluate(() => {
+      const f=selectionFixture;
+      f.widget.hmbFlushImageAssetSelectionCommit(f.container);
+      const value=f.container.__hmbImageAssetLatestState;
+      const scope={channel_uuid:value.shot_routing.channel_uuid,shot_uuid:value.shot_routing.active_shot_uuid};
+      const update=locked=>f.controller.update({onChange:f.onChange,value:JSON.stringify({
+        schema:"hmb-image-shot-status",widget_runtime_lease:value.widget_runtime_lease,
+        channel_uuid:scope.channel_uuid,shot_edit_locks:locked?[scope]:[],verified_shots:[scope]})});
+      update(true);
+      const panel=()=>f.container.querySelector(".shot-panel.active");
+      if (!panel().querySelector("[data-shot-lock]") || !panel().querySelector('[data-hmb-shot-check="true"]')
+          || !panel().querySelector("[data-shot-rename]").disabled || panel().querySelector("[data-shot-tab]").disabled
+          || panel().querySelector('[data-selected-key][draggable="true"]'))
+        throw Error("Locked Shot still allows edits or hides navigation/verified status");
+      const checkHeader = () => {
+        const host=f.container.querySelector("[data-hmb-native-actions]");
+        host.closest(".hmb-image-assets").dataset.hmbNativeHeader="active";
+        host.innerHTML='<div class="bg-green-600"><span class="leading-none">Resolved</span></div>'
+          +'<div class="bg-blue-600"><span class="leading-none">Unresolved</span></div>'
+          +'<div class="bg-orange-600"><span class="leading-none">Running</span></div>'
+          +'<div class="bg-red-600"><span class="leading-none">Error</span></div><button class="bg-blue-600">Run</button>';
+        if (![...host.children].every((el,i)=>(getComputedStyle(el).display==="none")===(i<2)))
+          throw Error("Shot header hid an action/error or retained a node-wide status");
+      };
+      checkHeader();
+      f.widget.hmbSetImageAssetLibraryCompact(f.container,true,{geometry:false});
+      checkHeader();
+      const compact = f.container.querySelector('[data-compact-shot-row]');
+      const number=compact.querySelector('[data-hmb-shot-check="true"]');
+      if (!number || number.textContent!=="01" || getComputedStyle(number,"::before").fontSize!=="20px"
+          || !compact.querySelector("[data-shot-lock]")) throw Error("Compact Shot status lost during mode switch");
+      update(false);
+      if (compact.querySelector("[data-shot-lock]")) throw Error("Compact status did not update before any mode toggle");
+      f.widget.hmbSetImageAssetLibraryCompact(f.container,false,{geometry:false});
+      if (panel().querySelector("[data-shot-lock]") || panel().querySelector("[data-shot-rename]").disabled
+          || !panel().querySelector('[data-hmb-shot-check="true"]')) throw Error("Release failed to restore Shot editing");
     });
     await page.evaluate(() => { selectionFixture.observer.disconnect(); selectionFixture.controller.cleanup(); selectionFixture.prompt.cleanup(); });
     await page.close();

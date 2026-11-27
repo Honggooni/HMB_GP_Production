@@ -17,9 +17,11 @@ assert spec and spec.loader
 fixture = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = fixture
 spec.loader.exec_module(fixture)
-suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(case)
-    for case in (fixture.LeaseTests, fixture.AuthContinuityTests))
-assert suite.countTestCases() == 15
+suite = unittest.TestSuite()
+for case in (fixture.LeaseTests, fixture.AuthContinuityTests):
+    cases = unittest.defaultTestLoader.loadTestsFromTestCase(case)
+    assert cases.countTestCases() >= 8, f"Missing reference or authentication coverage in {case.__name__}"
+    suite.addTests(cases)
 result = unittest.TextTestRunner(verbosity=2).run(suite)
 print(json.dumps({"status": "PASS" if result.wasSuccessful() else "FAIL", "tests": result.testsRun,
     "actual_broker_method_bodies": True, "synthetic_loader_and_opener": True,

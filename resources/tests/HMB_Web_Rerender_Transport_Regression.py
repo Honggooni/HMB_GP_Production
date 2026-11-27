@@ -576,7 +576,7 @@ class TransportRegression(unittest.TestCase):
 
     def test_actual_generator_filtered_payload_is_prepared_fingerprint(self):
         wire = RecordingOpener()
-        with patch.object(generator, "_broker_load_token", return_value="offline-synthetic-token"), patch.object(generator, "_broker_validated_server_url", return_value=ORIGIN):
+        with patch.object(generator._broker_transport, "_broker_load_token", return_value="offline-synthetic-token"), patch.object(generator._broker_transport, "_broker_validated_server_url", return_value=ORIGIN):
             bridge = generator._HMBAIBrokerBridge(opener=wire, server_url=ORIGIN)
             bridge.queue_admission = lambda **kwargs: None  # Native filtered-POST fixture, no discovery server.
             protocol = PreparedProtocol(bridge)

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import _hmb_common as common
+import hmb_standard_agent_reference as common
 
 
 MANAGED_PREFIX = "griptape_nodes"
@@ -102,7 +102,7 @@ try:
         # the synthetic, renamed registration above. The installed-SDK audit
         # may have appended a real Standard root before entering this fixture;
         # keep that other host's same-named package out of this synthetic host.
-        # Product discovery must still append the exact registered root itself.
+        # Reference lookup must still append the exact registered root itself.
         sys.path[:] = [
             value for value in sys.path
             if not (Path(value) / "griptape_nodes_library" / "agents" / "agent.py").is_file()

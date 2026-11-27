@@ -143,17 +143,17 @@ def fixture(*, opener=None, legacy=True, old_directory=False, scoped=False):
         # Review media discovery has its own transport and account tests.
         stack.enter_context(mock.patch("_hmb_client_review_media.start_pending_review_media"))
         stack.enter_context(mock.patch.dict(os.environ, {"APPDATA": temporary, "LOCALAPPDATA": temporary}))
-        stack.enter_context(mock.patch.object(target, "_broker_dpapi", side_effect=protected))
+        stack.enter_context(mock.patch.object(target._broker_transport, "_broker_dpapi", side_effect=protected))
         legacy_loader = stack.enter_context(mock.patch.object(
-            target, "_broker_load_bearer_token_readonly", side_effect=load_legacy
+            target._broker_transport, "_broker_load_bearer_token_readonly", side_effect=load_legacy
         ))
-        stack.enter_context(mock.patch.object(target, "_broker_load_bearer_token_from_path_readonly", side_effect=load_path))
-        stack.enter_context(mock.patch.object(target, "_broker_device_login", side_effect=AssertionError("Device login is forbidden")))
+        stack.enter_context(mock.patch.object(target._broker_transport, "_broker_load_bearer_token_from_path_readonly", side_effect=load_path))
+        stack.enter_context(mock.patch.object(target._broker_transport, "_broker_device_login", side_effect=AssertionError("Device login is forbidden")))
         # Never permit a forgotten/injected opener to reach the network.
         stack.enter_context(mock.patch.object(target.urllib.request.OpenerDirector, "open", side_effect=AssertionError("Real HTTP is forbidden")))
-        stack.enter_context(mock.patch.object(target, "_broker_log_transport_error"))
+        stack.enter_context(mock.patch.object(target._broker_transport, "_broker_log_transport_error"))
         if opener is not None:
-            stack.enter_context(mock.patch.object(target, "_broker_build_opener", return_value=opener))
+            stack.enter_context(mock.patch.object(target._broker_transport, "_broker_build_opener", return_value=opener))
         root = Path(temporary)
         legacy_path = root / ("CompanyAIBroker" if old_directory else "FNAIBroker") / "access_token_v2.dpapi"
         if legacy:
@@ -178,7 +178,7 @@ for old_directory in (False, True):
     opener = FixtureOpener()
     with fixture(opener=opener, old_directory=old_directory) as (legacy_path, scoped_path, _):
         before = fingerprint(legacy_path)
-        with mock.patch.object(target, "_broker_save_token", wraps=target._broker_save_token) as save:
+        with mock.patch.object(target._broker_transport, "_broker_save_token", wraps=target._broker_save_token) as save:
             assert target._broker_migrate_legacy_gateway_token(server_url=OFFICIAL) == LEGACY_TOKEN
             assert len(opener.requests) == 1
             save.assert_called_once_with(LEGACY_TOKEN, server_url=OFFICIAL, only_if_missing=True)
@@ -192,7 +192,7 @@ for old_directory in (False, True):
 native = FixtureOpener(expected_token=SCOPED_TOKEN)
 with fixture(opener=FixtureOpener(), scoped=True) as (legacy_path, scoped_path, legacy_loader):
     before = fingerprint(legacy_path), fingerprint(scoped_path)
-    with mock.patch.object(target, "_broker_migrate_legacy_gateway_token", side_effect=AssertionError("Scoped login must win")):
+    with mock.patch.object(target._broker_transport, "_broker_migrate_legacy_gateway_token", side_effect=AssertionError("Scoped login must win")):
         state = target._HMBAIBrokerBridge(opener=native, server_url=OFFICIAL).account_snapshot(connect=False)
     assert state.connected and state.state == "connected" and state.account == "Fixture Owner"
     assert len(native.requests) == 1
@@ -220,7 +220,7 @@ with fixture(opener=migration) as (legacy_path, scoped_path, _):
         gate.wait(timeout=5)
         return target._broker_migrate_legacy_gateway_token(server_url=OFFICIAL)
 
-    with mock.patch.object(target, "_broker_save_token", wraps=target._broker_save_token) as save:
+    with mock.patch.object(target._broker_transport, "_broker_save_token", wraps=target._broker_save_token) as save:
         with ThreadPoolExecutor(max_workers=5) as pool:
             results = list(pool.map(concurrent_migration, range(5)))
         assert results == [LEGACY_TOKEN] * 5
@@ -238,7 +238,7 @@ with fixture(opener=migration) as (legacy_path, scoped_path, _):
         gate.wait(timeout=5)
         return target._HMBAIBrokerBridge(opener=native, server_url=OFFICIAL).account_snapshot(connect=False)
 
-    with mock.patch.object(target, "_broker_save_token", wraps=target._broker_save_token) as save:
+    with mock.patch.object(target._broker_transport, "_broker_save_token", wraps=target._broker_save_token) as save:
         with ThreadPoolExecutor(max_workers=5) as pool:
             states = list(pool.map(concurrent_snapshot, range(5)))
         assert all(state.connected and state.account == "Fixture Owner" for state in states)
@@ -382,7 +382,7 @@ with fixture(opener=migration) as (legacy_path, scoped_path, _):
             scoped_path.write_bytes(protected(SCOPED_TOKEN.encode("ascii"), protect=True))
         return protected(value, protect=protect)
 
-    with mock.patch.object(target, "_broker_dpapi", side_effect=publish_newer_scoped):
+    with mock.patch.object(target._broker_transport, "_broker_dpapi", side_effect=publish_newer_scoped):
         assert target._broker_migrate_legacy_gateway_token(server_url=OFFICIAL) == SCOPED_TOKEN
     assert load_path(scoped_path) == SCOPED_TOKEN, "Migration replaced a newer scoped login"
     assert fingerprint(legacy_path) == before
@@ -405,7 +405,7 @@ with fixture(opener=migration) as (legacy_path, scoped_path, _):
         clear_started.set()
         target._broker_clear_token(server_url=OFFICIAL)
 
-    with mock.patch.object(target, "_broker_dpapi", side_effect=pause_encryption):
+    with mock.patch.object(target._broker_transport, "_broker_dpapi", side_effect=pause_encryption):
         with ThreadPoolExecutor(max_workers=2) as pool:
             migrate = pool.submit(target._broker_migrate_legacy_gateway_token, server_url=OFFICIAL)
             assert encrypting.wait(timeout=5), "Migration never reached encryption"

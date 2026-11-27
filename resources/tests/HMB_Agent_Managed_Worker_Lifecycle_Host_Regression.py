@@ -251,7 +251,7 @@ async def exercise_workers(engine, out):
             assert "reused_from_run_id" not in updated["result"] and inference.call_count == 1
             for count, role in enumerate(("before", "after"), start=2):
                 manual = {role: {"manual_run_id": "1" * 32}}
-                with mock.patch("HMBAnalysisAgent.analysis_render_input_preview", return_value=manual):
+                with mock.patch("_hmb_analysis_delivery.analysis_render_input_preview", return_value=manual):
                     fresh = await run(owner, source, row, targets[0])
                     unchanged = await run(owner, source, row, targets[0])
                     assert "reused_from_run_id" not in fresh["result"] and inference.call_count == count
@@ -568,7 +568,7 @@ async def exercise_workers(engine, out):
             source.directions[row["shot_uuid"]] = "original direction"
             source.directions[other["shot_uuid"]] = "sibling direction"
             guidance = {row["shot_uuid"]: "original analysis"}
-            with mock.patch("HMBAnalysisAgent.analysis_render_input_preview",
+            with mock.patch("_hmb_analysis_delivery.analysis_render_input_preview",
                     side_effect=lambda _owner, **selected: {"after": {"edited": guidance.get(selected["shot_uuid"])}}):
                 task = asyncio.create_task(node._prepare_managed_agent_shot())
                 await wait_enter(row["shot_uuid"])
@@ -638,7 +638,7 @@ async def exercise_workers(engine, out):
             return {"edited_result": "fresh-after-Prompt"}
 
         gates[row["shot_uuid"]].set()
-        with mock.patch("HMBAnalysisAgent.prepare_analysis_for_run", analyze), \
+        with mock.patch("_hmb_analysis_delivery.prepare_analysis_for_run", analyze), \
                 mock.patch("_hmb_analysis_delivery.analysis_delivery_context", to_agent), \
                 mock.patch.object(native_module, "run_agent", wraps=model_run) as inference:
             task = asyncio.create_task(node._prepare_managed_agent_shot())

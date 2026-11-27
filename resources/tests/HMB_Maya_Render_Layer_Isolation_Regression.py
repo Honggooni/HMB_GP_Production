@@ -169,7 +169,7 @@ NATIVE_WORKER = r'''from __future__ import annotations
 import hashlib, importlib.util, json, os, traceback, uuid
 from pathlib import Path
 import maya.cmds as cmds
-ROOT=Path("C:/HMB_GP_Production")
+ROOT=Path(os.environ["HMB_MAYA_TEST_ROOT"])
 OUT=Path(os.environ["HMB_LAYER_TEST_OUTPUT"]).resolve()
 OUT.mkdir(parents=True,exist_ok=True)
 RUNNER=ROOT/"resources/maya/HMB_Maya_Background_Preview.py"
@@ -303,7 +303,7 @@ if args.live_maya:
     environment = os.environ.copy()
     environment.update({"MAYA_APP_DIR": str(args.output / "maya-app"),
                         "TEMP": str(args.output / "tmp"), "TMP": str(args.output / "tmp"),
-                        "HMB_LAYER_TEST_OUTPUT": str(args.output),
+                        "HMB_MAYA_TEST_ROOT":str(ROOT), "HMB_LAYER_TEST_OUTPUT": str(args.output),
                         "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1",
                         "MAYA_DISABLE_CIP": "1", "MAYA_DISABLE_CER": "1",
                         "MAYA_DISABLE_ADP": "1",

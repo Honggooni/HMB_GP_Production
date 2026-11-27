@@ -14,7 +14,7 @@ const widget=await import(`data:text/javascript;base64,${Buffer.from(source).toS
 // workflow hydration: a new runtime may remount, but is never this READ's ACK.
 const receiptStart=source.indexOf('container.__hmbVideoPickerControllerUpdate = (nextProps) => {',source.indexOf('  schedulePickerFit(true);'));
 assert.ok(receiptStart>=0);
-const bodyStart=source.indexOf('{',receiptStart)+1;
+const bodyStart=source.indexOf('    let receipt =',receiptStart);
 const bodyEnd=source.indexOf('    nextProps = {',bodyStart);
 assert.ok(bodyEnd>bodyStart);
 const acceptReceipt=new Function('container','state','nextProps','hmbPickerStateFromProps','clean','hmbReconcilePickerCommandAcknowledgements',source.slice(bodyStart,bodyEnd));
@@ -66,7 +66,12 @@ try{
       preview_video_uid:'b',selected_video_uid:'b',start_frame:101,end_frame:150,current_frame:101,source_fps:24,output_fps:24,output_width:1280,output_height:720,
       selected_camera:'|oldCamera',cameras:[{name:'oldCamera',full_path:'|oldCamera'}],outliner_nodes:[{name:'OldRoot',full_path:'|OldRoot',maya_uuid:'old-root'}],
       mask_enabled:true,operation_kind:'',operation_started_at_ms:1,operation_finished_at_ms:2,active_process_pid:0};
-    const host=document.getElementById('widget');window.controller=mountWidget(host,props(state));
+    const scope={channel_uuid:state.channel_uuid,shot_uuid:first};
+    window.firstScope=scope;window.initialPickerState=structuredClone(state);
+    const host=document.getElementById('widget');
+    window.leasePacket={runtime_instance_id:state.runtime_instance_id,channel_uuid:state.channel_uuid,
+      shot_edit_locks:[scope],verified_shots:[scope],picker_shot_status_revision:1};
+    window.controller=mountWidget(host,{...props(state),ui_options:{picker_shot_status:leasePacket}});
     window.live=()=>structuredClone(host.__hmbPendingPickerState||host.__hmbAuthoritativePickerState);
     window.inspect=()=>{const s=live();return {status:s.status,stage:s.scene_stage,ready:s.native_read_ready,rootCount:s.outliner_nodes.length,
       pending:!!host.__hmbReadCommandPending,readDisabled:host.querySelector('#read-scene')?.disabled,generateDisabled:host.querySelector('#run-video')?.disabled,
@@ -74,8 +79,69 @@ try{
       frames:[host.querySelector('[data-picker-maya-frame-start]')?.textContent,host.querySelector('[data-picker-maya-frame-end]')?.textContent],
       rows:host.querySelectorAll('.outliner-row').length};};
   });
+  const firstRow=page.locator('[data-picker-shot-layout="compact"][data-picker-shot-row="11111111-1111-4111-8111-000000000001"]');
+  assert.equal(await page.locator('.hmbvp').getAttribute('data-picker-view'),'compact');
+  assert.match(await firstRow.innerText(),/로동중\.\.\. 수정불가/,'Cold compact mount must hydrate an existing render');
+  async function assertCheckedNumber(row) {
+    const check=row.locator('.picker-shot-number[data-hmb-shot-check="true"]');
+    assert.equal(await check.textContent(),'01');
+    assert.match(await check.getAttribute('aria-label'),/검증 완료/);
+    assert.deepEqual(await check.evaluate(el=>{
+      const glyph=getComputedStyle(el,'::before');
+      let parent=el;
+      while(parent && getComputedStyle(parent).filter==='none' && getComputedStyle(parent).opacity==='1')parent=parent.parentElement;
+      return [glyph.content,glyph.color,glyph.fontSize,parent?.className||''];
+    }),['"✓"','rgb(74, 222, 128)','20px','']);
+  }
+  await assertCheckedNumber(firstRow);
+  const headerVisibility=await page.evaluate(()=>{
+    const actions=document.querySelector('[data-hmb-native-actions]');
+    const group=document.createElement('section');
+    for(const [status,color] of [['Resolved','green'],['Unresolved','blue'],['Running','orange'],['Error','red']]){
+      const node=document.createElement('div');node.className='bg-'+color+'-600';
+      const label=document.createElement('span');label.className='leading-none';label.textContent=status;
+      node.append(label);group.append(node);
+    }
+    const button=document.createElement('button');button.textContent='Reset';group.append(button);
+    actions.append(group);const display=Array.from(group.children,el=>getComputedStyle(el).display!=='none');
+    group.remove();return display;
+  });
+  assert.deepEqual(headerVisibility,[false,false,true,true,true]);
+  await page.evaluate(()=>controller.update({...props(initialPickerState),ui_options:{
+    picker_shot_status:{...leasePacket,picker_shot_status_revision:2,shot_edit_locks:[],verified_shots:[]}}}));
+  assert.equal(await firstRow.locator('.picker-shot-lock,[data-hmb-shot-check="true"]').count(),0);
+  assert.equal(await firstRow.locator('[data-picker-shot-load]').isDisabled(),false);
+  await page.evaluate(()=>controller.update({...props(initialPickerState),ui_options:{picker_shot_status:leasePacket}}));
+  assert.equal(await firstRow.locator('.picker-shot-lock').count(),0,'Stale received metadata must not relock a completed shot');
+  await page.evaluate(()=>controller.update({...props(initialPickerState),ui_options:{
+    picker_shot_status:{...leasePacket,runtime_instance_id:'previous-desktop-runtime',picker_shot_status_revision:99}}}));
+  assert.equal(await firstRow.locator('.picker-shot-lock').count(),0,'Restored metadata from another Desktop runtime must be ignored');
+  await page.evaluate(()=>controller.update(props({...initialPickerState,state_writer:'widget',shot_edit_locks:[firstScope],verified_shots:[firstScope],picker_shot_status_revision:2})));
+  assert.equal(await firstRow.locator('.picker-shot-lock').count(),0,'Echoed media edits cannot replace a displayed release');
+  await page.evaluate(()=>controller.update(props({...initialPickerState,shot_edit_locks:[firstScope],verified_shots:[],picker_shot_status_revision:3})));
+  assert.equal(await firstRow.locator('.picker-shot-lock').count(),1);
+  assert.equal(await firstRow.locator('[data-hmb-shot-check="true"]').count(),0,'A render lock alone does not verify an input');
+  await page.evaluate(()=>controller.update(props({...initialPickerState,shot_edit_locks:[firstScope],verified_shots:[firstScope],picker_shot_status_revision:4})));
+  assert.match(await firstRow.innerText(),/로동중\.\.\. 수정불가/);
+  assert.equal(await firstRow.locator('[data-picker-shot-load]').isDisabled(),true);
+  await page.evaluate(()=>controller.update(props({...initialPickerState,state_revision:10})));
+  assert.match(await firstRow.innerText(),/로동중\.\.\. 수정불가/);
+  await assertCheckedNumber(firstRow);
+  await page.evaluate(()=>{
+    const third='11111111-1111-4111-8111-000000000003';
+    const shot={workspace_uuid:third,bound_shot_uuid:third,number:3,name:'Shot 3',revision:1,video_asset_uids:[],selected_video_uids:[]};
+    controller.update(props({...initialPickerState,state_revision:11,picker_shots:[...initialPickerState.picker_shots,shot],
+      shot_selections:[...initialPickerState.shot_selections,{shot_uuid:third,number:3,name:shot.name,revision:1}]}));
+  });
+  assert.equal(await page.locator('[data-picker-shot-load="11111111-1111-4111-8111-000000000003"]').isEnabled(),true);
+  assert.equal(await firstRow.locator('[data-picker-shot-load]').isDisabled(),true);
   if(await page.locator('.hmbvp').getAttribute('data-picker-view')!=='expanded')await page.locator('[data-picker-toggle-surface="header"]').dispatchEvent('dblclick');
+  const lockedRow=page.locator('[data-picker-shot-row="11111111-1111-4111-8111-000000000001"]:visible').first();
+  assert.match(await lockedRow.textContent(), /로동중\.\.\. 수정불가/);
+  await assertCheckedNumber(lockedRow);
+  assert.equal(await page.locator('.outliner-scroll:visible').evaluate(el=>el.inert),true);
   await page.locator('[data-picker-shot-activate="11111111-1111-4111-8111-000000000002"]').first().click();
+  assert.equal(await page.locator('.outliner-scroll:visible').evaluate(el=>el.inert),false);
   await page.locator('#maya-scene-path').fill('C:/shots/second.mb');await page.locator('#maya-scene-path').dispatchEvent('change');
   await page.locator('#read-scene').click();
   const clicked=await page.evaluate(()=>{
@@ -110,5 +176,6 @@ try{
   const reload=await page.evaluate(()=>{const publication=publications.findLast(p=>p.__hmb_picker_command__);return {ready:publication.native_read_ready,roots:publication.outliner_nodes.length,scene:publication.__hmb_picker_command__.payload.scene_path};});
   assert.deepEqual(reload,{ready:true,roots:1,scene:'C:/shots/second.mb'});
   assert.deepEqual(errors,[]);
-  console.log(JSON.stringify({passed:true,rawReceiptCases:5,actualReadClick:true,staleAckRejected:true,mediaOrderPreserved:true,completedReload:true,updateMs:terminal.updateMs}));
+  console.log(JSON.stringify({passed:true,rawReceiptCases:5,coldCompactLock:true,staleRelockRejected:true,
+    nativeHeaderStatuses:true,newCatalogShotEditable:true,actualReadClick:true,staleAckRejected:true,mediaOrderPreserved:true,completedReload:true,updateMs:terminal.updateMs}));
 }finally{await browser?.close();await new Promise(resolve=>server.close(resolve));}

@@ -1,10 +1,8 @@
 from pathlib import Path
 import importlib.util
 import json
-import os
 import random
 import sys
-import tempfile
 import types
 
 from _hmb_bundled_policy_session import install_bundled_policy_session
@@ -163,26 +161,9 @@ def drive_scheduler(generator):
         return yielded
 
 
-package = types.ModuleType("griptape_nodes_library")
-package.__path__ = []
-agents_package = types.ModuleType("griptape_nodes_library.agents")
-agents_package.__path__ = []
-agent_module = types.ModuleType("griptape_nodes_library.agents.agent")
+agent_module = types.ModuleType("_hmb_native_agent.agents.agent")
 agent_module.Agent = Agent
-_standard_library_temp = tempfile.TemporaryDirectory()
-_canonical_agent_file = (
-    Path(_standard_library_temp.name)
-    / "griptape_nodes_library"
-    / "agents"
-    / "agent.py"
-)
-_canonical_agent_file.parent.mkdir(parents=True)
-_canonical_agent_file.write_text("# canonical test Agent module\n", encoding="utf-8")
-agent_module.__file__ = str(_canonical_agent_file)
-os.environ["HMB_GRIPTAPE_STANDARD_LIBRARY_PATH"] = _standard_library_temp.name
-sys.modules["griptape_nodes_library"] = package
-sys.modules["griptape_nodes_library.agents"] = agents_package
-sys.modules["griptape_nodes_library.agents.agent"] = agent_module
+sys.modules[agent_module.__name__] = agent_module
 
 spec = importlib.util.spec_from_file_location("HMBAgentLibrary_regression", ROOT / "HMBAgentLibrary.py")
 module = importlib.util.module_from_spec(spec)

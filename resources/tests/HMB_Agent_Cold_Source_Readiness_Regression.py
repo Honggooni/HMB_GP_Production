@@ -213,7 +213,7 @@ class ColdSourceReadinessTests(unittest.TestCase):
             self.node._hmb_handle_shot_action({"kind": "cancel_selected", "request_id": "e" * 32})
             raise SourcePreparing("PRIVATE pending")
         self.prompt._hmb_prompt_shot_document = get_document
-        with self.assertRaises(asyncio.CancelledError):
+        with patch.object(module, "_HMB_SOURCE_PREPARE_TIMEOUT_SECONDS", 0), self.assertRaises(asyncio.CancelledError):
             self.run_once()
         self.assertEqual(self.calls, [])
         self.assertEqual(self.node._hmb_shot_run_status[KEY], "cancelled")

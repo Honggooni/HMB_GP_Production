@@ -428,8 +428,8 @@ class ReferenceAnalysisTest(unittest.TestCase):
             active if model == active.model and provider == "griptape_cloud" else
             saved if model == saved.model and provider == "griptape_cloud" else None)
         agent._hmb_reference_analysis_owner = lambda **_scope: owner
-        with patch("HMBAnalysisAgent._same_flow_nodes", return_value=("flow", [owner, agent])), \
-                patch("HMBAnalysisAgent._registered_node_class", return_value=RegisteredAgent):
+        with patch("_hmb_analysis_delivery._same_flow_nodes", return_value=("flow", [owner, agent])), \
+                patch("_hmb_analysis_delivery._registered_node_class", return_value=RegisteredAgent):
             selected = agent_module.get_same_shot_analysis_model(owner,
                 channel_uuid="channel", shot_uuid="shot", kind="image")
             self.assertEqual(selected.model, active.model)

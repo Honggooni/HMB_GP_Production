@@ -167,7 +167,7 @@ assert.match(
 
 const sourceSelectHandler = source.slice(
   source.indexOf('container.querySelectorAll(".source-select")'),
-  source.indexOf('container.querySelectorAll(".move-image-up, .move-image-down")'),
+  source.indexOf('container.querySelectorAll(".image-surface-checkbox")', source.indexOf('container.querySelectorAll(".source-select")')),
 );
 assert.match(
   sourceSelectHandler,

@@ -236,6 +236,7 @@ def sync_publisher(name, value):
 
 
 sync_node = SimpleNamespace(
+    _shot_edit_widget_fields=lambda identity: {'shot_edit_locks': [], 'shot_edit_fields': []},
     _hmb_shot_catalog_snapshot={},
     _hmb_generation_preview_state=target._seedance_generation_preview_value(
         {

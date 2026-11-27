@@ -63,6 +63,8 @@ RUNTIME_FILE_PATHS = (
     "_hmb_agent_media.py", "_hmb_analysis_delivery.py", "_hmb_reference_analysis.py", "_hmb_analysis_broker.py", "_hmb_sound.py", "_hmb_agent_session.py", "_hmb_broker_config.py", "_hmb_build_diagnostics.py", "_hmb_image_limits.py", "_hmb_image_generation.py",
     "_hmb_image_asset_sites.py", "_hmb_my_box.py", "_hmb_my_box_node.py", "_hmb_reference_leases.py", "_hmb_queue_admission.py",
     "_hmb_library_bootstrap.py", "_hmb_deletion_guard.py", "_hmb_connection_management.py", "_hmb_workflow_migration.py", "_hmb_workflow_serialization_compat.py", "_hmb_project.py", "_hmb_review.py", "_hmb_web_rerender.py", "_hmb_shot_routing.py", "_hmb_mp4_verify.py", "_hmb_common.py",
+    "_hmb_node_controls.py",
+    "_hmb_broker_transport.py",
     "_hmb_color_lut.py", "_hmb_client_review_media.py", "_hmb_color_lut_usage.py", "_hmb_screen_space.py", "_hmb_video_tools.py",
     "_hmb_cgt.py", "_hmb_shot_basket.py",
     "_hmb_image_bash_compat.py", "_hmb_image_bash_render.py", "_hmb_image_bash_state.py",

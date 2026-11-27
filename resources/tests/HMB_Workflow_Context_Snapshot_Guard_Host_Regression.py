@@ -100,11 +100,13 @@ async def exercise(engine,_phase,out):
             lifecycle = object.__new__(bootstrap.HMBProductionLibrary)
             lifecycle.after_library_nodes_loaded(schema, library)
             for _ in range(500):
-                if images._catalog_index_path(project).is_file():
+                with images._SHARED_CATALOG_CACHE_LOCK:
+                    warm_paths = [Path(item["path"]) for item in images._WARM_PROJECT_LIST.get("projects", [])]
+                if project in warm_paths:
                     break
                 await asyncio.sleep(.01)
-            assert images._catalog_index_path(project).is_file()
-            harness.record("registered_desktop_sdk_prepares_image_catalog_before_first_node")
+            assert project in warm_paths and not images._catalog_index_path(project).is_file()
+            harness.record("registered_desktop_sdk_discovers_projects_without_scanning_assets_before_first_node")
             ensured = harness.send(engine, EnsureWorkflowAndFlowRequest(flow_name="SnapshotGuardSDK"))
             if getattr(ensured, "open_workflow", None) is not None:
                 guards.enter_context(engine.bind_workflow(engine.open_workflows.get(ensured.workflow_id)))

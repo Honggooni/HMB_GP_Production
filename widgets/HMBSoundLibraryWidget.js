@@ -231,7 +231,7 @@ const labels = {Dialogue:"대사", SFX:"효과음", Ambience:"환경음", Music:
 const colors = {Dialogue:"#22d3ee", SFX:"#f472b6", Ambience:"#2dd4bf", Music:"#a78bfa"};
 const record = value => value && typeof value === "object" && !Array.isArray(value) ? value : {};
 const soundPayload = props => {let value=props?.value??props?.parameterValue??props?.data??props; if(typeof value==="string"){try{value=JSON.parse(value);}catch{value={};}}return record(value);};
-const soundFields = new Set(["schema","version","revision","project_id","project_root","project_uid","channel_uuid","shot","shot_catalog","projects","project_states","assets","folders","tracks","status","busy","error_code","ack_command_id","ui","site_settings","site_settings_result","site_picker_draft","site_projects","site_profiles"]);
+const soundFields = new Set(["schema","version","revision","project_id","project_root","project_uid","channel_uuid","shot","shot_catalog","shot_edit_locks","verified_shots","projects","project_states","assets","folders","tracks","status","busy","error_code","ack_command_id","ui","site_settings","site_settings_result","site_picker_draft","site_projects","site_profiles"]);
 const sameSoundValue = (a,b) => {
   if(a===b)return true;
   if(!a||!b||typeof a!=="object"||typeof b!=="object"||Array.isArray(a)!==Array.isArray(b))return false;
@@ -293,6 +293,9 @@ const read = hmbSoundState;
 const previewURL = value => typeof value === "string" && (/^https?:\/\//i.test(value) || /^blob:/i.test(value) || /^\/(?!\/)/.test(value)) ? value : "";
 const scopeKey = state => JSON.stringify([state.project_uid,state.shot.channel_uuid,state.shot.shot_uuid]);
 const sameShot = (track, row) => String(track.channel_uuid || "") === String(row.channel_uuid || "") && String(track.shot_uuid || "") === String(row.shot_uuid || "");
+function soundShotStatus(state, shot, field = "shot_edit_locks") {
+  return !!shot?.shot_uuid && state[field]?.some(scope => sameShot(scope, shot));
+}
 export function hmbSoundShotRows(state) {
   if (state.shot_catalog.shots.length) return state.shot_catalog.shots.map(row=>({...row,channel_uuid:String(row.channel_uuid || state.shot_catalog.channel_uuid || "")}));
   return !state.shot_catalog.channel_uuid && !state.shot.channel_uuid && !state.shot.shot_uuid
@@ -316,6 +319,9 @@ const shotColor = shot => shotColors[Number(shot?.number) - 1] || shotColors[0];
 const assetLabel = (name, chosen) => name + (chosen ? " · 연결됨" : " · 선택한 샷에 연결");
 
 const style = `
+.hmb-sound [data-render-locked="true"] .hs-bound-list,.hs-detail[data-render-locked="true"]{filter:saturate(.30)}
+.hmb-sound [data-shot-lock]{color:#e2e8f0;font-size:10px}.hmb-sound [data-render-locked="true"] .hs-shot-head>:not([data-hmb-shot-check]){filter:saturate(.30)}
+.hmb-sound:has([data-shot-row]:not([data-shot-row=""])) [data-hmb-native-actions] div:is(.bg-green-600,.bg-blue-600):has(>span.leading-none){display:none!important}
 .hmb-sound{--bg:#090c16;--panel:#101523;--line:rgba(148,163,184,.19);--cyan:#22d3ee;--pink:#f472b6;--muted:#8fa3b8;container-type:inline-size;position:relative;width:100%;height:100%;min-height:500px;display:flex;flex-direction:column;overflow:hidden;border:1px solid var(--line);border-radius:11px;background:radial-gradient(circle at 8% -10%,rgba(168,85,247,.16),transparent 34%),linear-gradient(180deg,#0b1020,#060912);color:#e6edf7;font:12px "Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,sans-serif;font-synthesis:none;-webkit-font-smoothing:antialiased}
 .hmb-sound,.hmb-sound *{box-sizing:border-box;min-width:0}.hmb-sound :is(button,input,select,textarea){font:inherit;color:inherit}.hmb-sound button{cursor:pointer;border:1px solid var(--line);border-radius:6px;background:#0b1220}.hmb-sound button:disabled{opacity:.35;cursor:default}.hmb-sound button:focus-visible,.hmb-sound input:focus-visible{outline:2px solid #22d3ee;outline-offset:2px}.hmb-sound svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .hmb-sound .hs-head{height:58px;flex:0 0 58px;display:flex;align-items:center;gap:10px;padding:8px 13px;border-bottom:1px solid var(--line);background:linear-gradient(90deg,rgba(72,35,101,.55),rgba(14,23,38,.92) 60%)}.hmb-sound .hs-mark{width:34px;height:34px;display:grid;place-items:center;border:1px solid #9a58b2;border-radius:8px;background:rgba(129,31,144,.3);color:#e6b6fb;box-shadow:inset 0 0 14px #a855f72b}.hmb-sound .hs-heading{display:flex;flex-direction:column;gap:2px}.hmb-sound .hs-heading strong{font-size:15px}.hmb-sound .hs-heading small{font-size:9px;color:#9aa8be}.hmb-sound .hs-actions{display:flex;gap:6px;margin-left:auto}.hmb-sound .hs-actions button{height:30px;min-width:30px;padding:0 9px;border-color:#3577a3;color:#93d7f8;background:linear-gradient(#12304a,#091325)}
@@ -337,6 +343,7 @@ const style = `
 [data-hmb-sound-frame][data-sound-view=compact],
 .react-flow__node:not([data-hmb-native-icon-layout],[data-hmb-native-rollup-layout],[data-hmb-native-fold-transition]):has([data-hmb-sound-frame][data-sound-view=compact]),
 .react-flow__node:not([data-hmb-native-icon-layout],[data-hmb-native-rollup-layout],[data-hmb-native-fold-transition]) :has([data-hmb-sound-frame][data-sound-view=compact]){height:auto!important;min-height:0!important;max-height:none!important}
+.hmb-sound .hs-shot-head [data-hmb-shot-check="true"]{display:inline-flex!important;align-items:center;justify-content:center;gap:2px!important;width:38px!important;min-width:38px!important;max-width:38px!important;height:30px!important;min-height:30px!important;max-height:30px!important;flex:none!important;padding:0!important;box-sizing:border-box!important;font:700 11px/1 system-ui!important;font-variant-numeric:tabular-nums;background:#12301d!important;color:#dcfce7!important;border:1px solid #4ade80!important;border-radius:5px!important;filter:none!important;opacity:1!important}.hmb-sound .hs-shot-head [data-hmb-shot-check="true"]::before{content:"✓";font:900 20px/1 system-ui;color:#4ade80;flex:none}
 `;
 function renderSoundResults(state, ui, active, selected, busy) {
   const search = ui.search.toLocaleLowerCase();
@@ -347,7 +354,7 @@ function renderSoundResults(state, ui, active, selected, busy) {
   );
   const assets=list.slice(0,ui.limit).map(a=>{
     const id=assetIdentity(a),chosen=selected.some(t=>String(t.source_uid||t.relative_path||"")===id),url=assetPreview(state,a);
-    return `<article class="hs-asset${chosen?' selected':''}" data-asset="${escape(id)}" style="--audio-color:${colors[a.role]||'#22d3ee'}"><div class="hs-art">${wave(id)}<button type="button" class="hs-preview" data-preview-asset="${escape(id)}" aria-label="${escape(a.name)} 미리듣기" aria-pressed="false" ${url?'':'disabled'}>${playIcon}</button></div><strong class="hs-asset-name" title="${escape(a.relative_path)}">${escape(a.name)}</strong><div class="hs-asset-meta"><span>${escape(labels[a.role]||a.role||'사운드')}</span><span>${a.duration_seconds?seconds(a.duration_seconds):escape(String(a.extension||'').replace('.','').toUpperCase())}</span></div><button type="button" class="hs-asset-select" data-add="${escape(id)}" aria-label="${escape(assetLabel(a.name,chosen))}" ${busy||chosen||!active?'disabled':''}></button></article>`;
+    return `<article class="hs-asset${chosen?' selected':''}" data-asset="${escape(id)}" style="--audio-color:${colors[a.role]||'#22d3ee'}"><div class="hs-art">${wave(id)}<button type="button" class="hs-preview" data-preview-asset="${escape(id)}" aria-label="${escape(a.name)} 미리듣기" aria-pressed="false" ${url?'':'disabled'}>${playIcon}</button></div><strong class="hs-asset-name" title="${escape(a.relative_path)}">${escape(a.name)}</strong><div class="hs-asset-meta"><span>${escape(labels[a.role]||a.role||'사운드')}</span><span>${a.duration_seconds?seconds(a.duration_seconds):escape(String(a.extension||'').replace('.','').toUpperCase())}</span></div><button type="button" class="hs-asset-select" data-add="${escape(id)}" aria-label="${escape(assetLabel(a.name,chosen))}" ${busy||chosen||!active||soundShotStatus(state,active)?'disabled':''}></button></article>`;
   }).join("");
   return {count:list.length, content:`<div class="hs-files">${assets}</div>${!list.length?'<div class="hs-empty">사운드가 없습니다.<br>대사 · 효과음 · 환경음 · 음악</div>':''}${list.length>ui.limit?'<button class="hs-more" data-more>더 보기</button>':''}`};
 }
@@ -361,13 +368,16 @@ function render(state, ui, pending) {
   const tree=`<button data-folder="" class="${!ui.folder&&!ui.role?'active':''}">${folderIcon}<span>전체 사운드</span><b>${state.assets.length}</b></button><small>폴더</small>${hmbSoundFolders(state).map(([folder,count])=>`<button data-folder="${escape(folder)}" class="${ui.folder===folder?'active':''}" style="padding-left:${8+(folder.split('/').length-1)*12}px">${folderIcon}<span>${escape((folder.startsWith('site:') && !folder.includes('/') && state.site_settings?.links?.find(link=>link.id===folder.slice(5))?.label) || folder.split('/').at(-1))}</span><b>${count}</b></button>`).join("")}<small>종류별 보기</small>${roles.map(role=>`<button data-role-filter="${role}" class="${ui.role===role?'active':''}"><span>${labels[role]}</span><b>${state.assets.filter(a=>a.role===role).length}</b></button>`).join("")}`;
   const shots=rows.map(row=>{
     const tracks=state.tracks.filter(t=>sameShot(t,row)),isActive=active===row;
-    return `<section class="hs-shot-row${isActive?' active':''}" data-shot-row="${escape(row.shot_uuid)}" style="--shot-color:${shotColor(row)}"><button class="hs-shot-head" data-shot="${escape(row.shot_uuid)}" aria-pressed="${isActive}" ${busy?'disabled':''}><i>${row.legacy?'•':escape(String(row.number).padStart(2,'0'))}</i><strong>${escape(row.name)}</strong><span>${tracks.length}개</span></button>${tracks.length?`<div class="hs-bound-list nowheel">${tracks.map(t=>{
+    const locked = !!soundShotStatus(state,row);
+    const verified = !!soundShotStatus(state,row,"verified_shots");
+    const badge = locked ? ' <b data-shot-lock>로동중... 수정불가</b>' : '';
+    return `<section data-render-locked="${locked}" class="hs-shot-row${isActive?' active':''}" data-shot-row="${escape(row.shot_uuid)}" style="--shot-color:${shotColor(row)}"><button class="hs-shot-head" data-shot="${escape(row.shot_uuid)}" aria-pressed="${isActive}" ${busy?'disabled':''}><i data-hmb-shot-check="${verified}" title="${verified?'검증 완료':''}">${row.legacy?'•':escape(String(row.number).padStart(2,'0'))}</i><strong>${escape(row.name)}${badge}</strong><span>${tracks.length}개</span></button>${tracks.length?`<div class="hs-bound-list nowheel">${tracks.map(t=>{
       const start=Number(t.in_seconds)||0,end=t.out_seconds==null?Number(t.duration_seconds)||0:Number(t.out_seconds);
-      return `<article class="hs-bound" data-instance="${escape(t.instance_id)}"><button class="hs-preview" data-preview-track="${escape(t.instance_id)}" aria-label="${escape(t.name)} 재생" aria-pressed="false" ${trackPreview(state,t)?'':'disabled'}>${playIcon}</button><div><button class="hs-bound-name" data-detail="${escape(t.instance_id)}" title="${escape(t.name)} · 상세 편집">${escape(t.name)}</button><input type="range" min="${start}" max="${end||1}" step="0.01" value="${start}" data-scrub="${escape(t.instance_id)}" aria-label="${escape(t.name)} 재생 위치" ${trackPreview(state,t)?'':'disabled'}><span class="hs-time" data-time="${escape(t.instance_id)}">0:00 / ${seconds(Math.max(0,end-start))}</span></div><button class="hs-remove" data-remove="${escape(t.instance_id)}" aria-label="${escape(t.name)} 연결 해제" ${busy?'disabled':''}>×</button></article>`;
+      return `<article class="hs-bound" data-instance="${escape(t.instance_id)}"><button class="hs-preview" data-preview-track="${escape(t.instance_id)}" aria-label="${escape(t.name)} 재생" aria-pressed="false" ${trackPreview(state,t)?'':'disabled'}>${playIcon}</button><div><button class="hs-bound-name" data-detail="${escape(t.instance_id)}" title="${escape(t.name)} · 상세 편집">${escape(t.name)}</button><input type="range" min="${start}" max="${end||1}" step="0.01" value="${start}" data-scrub="${escape(t.instance_id)}" aria-label="${escape(t.name)} 재생 위치" ${trackPreview(state,t)?'':'disabled'}><span class="hs-time" data-time="${escape(t.instance_id)}">0:00 / ${seconds(Math.max(0,end-start))}</span></div><button class="hs-remove" data-remove="${escape(t.instance_id)}" aria-label="${escape(t.name)} 연결 해제" ${busy||soundShotStatus(state,row)?'disabled':''}>×</button></article>`;
     }).join("")}</div>`:isActive?'<div class="hs-row-empty">사운드 카드를 선택해 이 샷에 연결하세요.</div>':''}</section>`;
   }).join("");
   const detail=state.tracks.find(t=>String(t.instance_id)===ui.detail);
-  const drawer=detail?`<section class="hs-detail" data-detail-drawer><div class="hs-detail-head"><strong>${escape(detail.name)} · 사운드 상세</strong><button data-duplicate="${escape(detail.instance_id)}" ${busy?'disabled':''}>복제</button><button data-close-detail aria-label="사운드 상세 닫기">×</button></div><div class="hs-flags"><select data-track="${escape(detail.instance_id)}" data-field="role">${options(roles,detail.role,r=>labels[r])}</select><select data-track="${escape(detail.instance_id)}" data-field="purpose">${options(['both','reference','mix'],detail.purpose,v=>({both:'생성 참고 + 믹싱',reference:'생성 참고',mix:'최종 믹싱'}[v]))}</select>${[['enabled','사용'],['lipsync','립싱크'],['loop','반복']].map(([key,label])=>`<label><input type="checkbox" data-track="${escape(detail.instance_id)}" data-field="${key}"${detail[key]?' checked':''}>${label}</label>`).join('')}<input data-track="${escape(detail.instance_id)}" data-field="target" value="${escape(detail.target)}" placeholder="대상 / 화자"></div><textarea data-track="${escape(detail.instance_id)}" data-field="transcript" placeholder="대사 원문 / 사용 의도">${escape(detail.transcript)}</textarea><div class="hs-grid">${field(detail,'start_seconds','샷 시작(초)')}${field(detail,'in_seconds','음원 IN(초)')}${field(detail,'out_seconds','음원 OUT(빈칸=끝)')}${field(detail,'gain_db','볼륨(dB)')}</div></section>`:'';
+  const drawer=detail?`<section class="hs-detail" data-detail-drawer data-render-locked="${!!soundShotStatus(state,detail)}"><div class="hs-detail-head"><strong>${escape(detail.name)} · 사운드 상세</strong><button data-duplicate="${escape(detail.instance_id)}" ${busy?'disabled':''}>복제</button><button data-close-detail aria-label="사운드 상세 닫기">×</button></div><div class="hs-flags"><select data-track="${escape(detail.instance_id)}" data-field="role">${options(roles,detail.role,r=>labels[r])}</select><select data-track="${escape(detail.instance_id)}" data-field="purpose">${options(['both','reference','mix'],detail.purpose,v=>({both:'생성 참고 + 믹싱',reference:'생성 참고',mix:'최종 믹싱'}[v]))}</select>${[['enabled','사용'],['lipsync','립싱크'],['loop','반복']].map(([key,label])=>`<label><input type="checkbox" data-track="${escape(detail.instance_id)}" data-field="${key}"${detail[key]?' checked':''}>${label}</label>`).join('')}<input data-track="${escape(detail.instance_id)}" data-field="target" value="${escape(detail.target)}" placeholder="대상 / 화자"></div><textarea data-track="${escape(detail.instance_id)}" data-field="transcript" placeholder="대사 원문 / 사용 의도">${escape(detail.transcript)}</textarea><div class="hs-grid">${field(detail,'start_seconds','샷 시작(초)')}${field(detail,'in_seconds','음원 IN(초)')}${field(detail,'out_seconds','음원 OUT(빈칸=끝)')}${field(detail,'gain_db','볼륨(dB)')}</div></section>`:'';
   return `<style>${style}</style><div class="hmb-sound nodrag nopan" data-hmb-node-type="HMBSoundLibrary" data-hmb-sound-widget style="--active-shot-color:${shotColor(active)}"><header class="hs-head group" data-sound-toggle-surface="header"><span class="hs-mark hs-brand">${wave('sound')}</span><div class="hs-heading hs-brand"><strong>HMB Sound Library</strong><small>사운드 에셋 · ${escape(active?.name||'샷 선택')}</small></div><div data-hmb-native-identity></div><div data-hmb-native-actions></div><div class="hs-actions nodrag"><button type="button" data-action="site-settings" aria-label="프로젝트 Add" title="프로젝트 Add">S</button><button type="button" data-action="refresh" aria-label="사운드 폴더 다시 읽기" title="사운드 폴더 다시 읽기" ${!ui.syncNotice&&(busy||!state.project_root)?'disabled':''}>${scanFolderIcon}</button><button data-action="cancel" ${busy?'':'hidden'}>준비 취소</button></div></header><div class="hs-main"><aside class="hs-panel hs-tree"><div class="hs-panel-title">사운드 폴더<span>${state.assets.length}</span></div><div class="hs-folder-list nowheel">${tree}</div></aside><section class="hs-panel hs-browser"><div class="hs-filter"><input data-search placeholder="⌕  사운드 검색" aria-label="사운드 검색" value="${escape(ui.search)}"><b>${selected.length} 선택 / ${results.count}개</b></div><div class="hs-catalog nowheel">${results.content}</div></section></div><div class="hs-shot-stack nowheel" aria-label="ImageAsset 샷 사운드">${shots||'<div class="hs-empty">ImageAsset의 샷을 연결하세요.</div>'}</div>${drawer}<div class="hs-status" role="status" data-error="${Boolean(state.error_code)}">${escape(ui.syncNotice||ui.commandNotice||ui.mediaNotice||(pending?'사운드 작업 적용 중…':state.status||'준비됨'))}${state.error_code?' · '+escape(state.error_code):''}</div></div>`;
 }
 function hmbSoundImplementation(container, props = {}) {
@@ -433,7 +443,7 @@ function hmbSoundImplementation(container, props = {}) {
     // Catalog/track changes use the full renderer. Page and status changes
     // reuse the prepared cards, scroll positions and playing audio element.
     if(!painted || ui.detail || !root() || !sameSoundValue(painted.ui,ui)
-      || !["project_uid","project_id","project_root","assets","folders","tracks","shot_catalog"].every(key=>sameSoundValue(painted.state[key],state[key])))return false;
+      || !["project_uid","project_id","project_root","assets","folders","tracks","shot_catalog","verified_shots","shot_edit_locks"].every(key=>sameSoundValue(painted.state[key],state[key])))return false;
     const rows=hmbSoundShotRows(view),active=rows.find(row=>sameShot(view.shot,row));
     const selected=active?view.tracks.filter(t=>sameShot(t,active)):[];
     const selectedIds=new Set(selected.map(t=>String(t.source_uid||t.relative_path||"")));
@@ -444,7 +454,7 @@ function hmbSoundImplementation(container, props = {}) {
     count.textContent=`${selected.length} 선택 / ${painted.filteredCount}개`;
     for(const card of current.querySelectorAll("[data-asset]")){
       const chosen=selectedIds.has(card.dataset.asset),add=card.querySelector("[data-add]");
-      card.classList.toggle("selected",chosen);add.disabled=busy||latest.disabled||chosen||!active;
+      card.classList.toggle("selected",chosen);add.disabled=busy||latest.disabled||chosen||!active||!!soundShotStatus(view,active);
       add.setAttribute("aria-label",assetLabel(card.querySelector(".hs-asset-name").textContent,chosen));
     }
     for(const row of current.querySelectorAll("[data-shot-row]")){
@@ -456,7 +466,7 @@ function hmbSoundImplementation(container, props = {}) {
         const empty=doc.createElement("div");empty.className="hs-row-empty";empty.textContent="사운드 카드를 선택해 이 샷에 연결하세요.";row.append(empty);
       }
     }
-    for(const button of current.querySelectorAll("[data-remove],[data-more]"))button.disabled=busy;
+    for(const button of current.querySelectorAll("[data-remove],[data-more]"))button.disabled=busy||button.closest?.('[data-render-locked="true"]')!=null;
     current.querySelector('[data-action="site-settings"]').disabled=Boolean(latest.disabled);
     current.querySelector('[data-action="refresh"]').disabled=!ui.syncNotice&&(busy||!state.project_root);
     current.querySelector('[data-action="cancel"]').hidden=!busy;
@@ -508,6 +518,7 @@ function hmbSoundImplementation(container, props = {}) {
     }
     for(const el of frame.querySelectorAll(".hs-catalog,.hs-shot-stack,.hs-folder-list,.hs-bound-list")){const saved=scroll.get(el.className+":"+(el.closest("[data-shot-row]")?.dataset.shotRow||""));if(saved){el.scrollTop=saved[0];el.scrollLeft=saved[1];}}
     root()?.toggleAttribute("data-sound-sync-waiting",syncWaiting);
+    for(const control of frame.querySelectorAll('.hs-detail[data-render-locked="true"] [data-track],.hs-detail[data-render-locked="true"] [data-duplicate]'))control.disabled=true;
     if(latest.disabled)for(const control of frame.querySelectorAll("[data-add]"))control.disabled=true;
     if(state.busy||pending||syncWaiting)for(const control of frame.querySelectorAll("button,input,select,textarea"))if(!control.matches("[data-action=cancel],[data-action=site-settings],[data-search],[data-folder],[data-role-filter],[data-preview-track],[data-preview-asset],[data-scrub],[data-detail],[data-close-detail],[data-hmb-native-identity] *,[data-hmb-native-actions] *")&&!(syncWaiting&&control.matches('[data-action="refresh"]')))control.disabled=true;
     syncPlayback();
@@ -538,6 +549,10 @@ function hmbSoundImplementation(container, props = {}) {
   }
   function command(action,extra={}){
     if(disposed||((pending||state.busy||latest.disabled||syncWaiting)&&action!=="cancel"))return;
+    const target = action === "shot_add" ? {channel_uuid:state.channel_uuid,shot_uuid:extra.shot_uuid}
+      : action === "add" ? state.shot : ["edit","duplicate","remove"].includes(action)
+      ? state.tracks.find(t=>t.instance_id===extra.instance_id) : null;
+    if (soundShotStatus(state,target)) return;
     const fail=()=>{if(!disposed){clearTimeout(ackTimer);ackTimer=null;pending=null;state={...state,error_code:"SOUND_TRANSPORT_FAILED",status:"사운드 변경을 전송하지 못했습니다. 연결을 확인하세요."};paint();}};
     if(typeof latest.onChange!=="function"){fail();return;}
     const request={id:globalThis.crypto?.randomUUID?.()||`${Date.now()}-${Math.random()}`,action,...extra,context:{project_uid:state.project_uid,channel_uuid:state.shot.channel_uuid,shot_uuid:state.shot.shot_uuid,revision:state.revision}};
@@ -825,23 +840,34 @@ function hmbAcquireNativeStockSafety(container) {
   const key = "__HMB_NATIVE_STOCK_SAFETY_V1__";
   let shared = doc[key];
   if (!shared) {
-    const owners = new Set(), identities = new Map();
+    const owners = new Set(), identities = new Set();
+    let parents = new WeakSet(), awaitingMount = false;
     let contextNode = null, notice = null, noticeTimer = null, disposed = false;
     const nativeReady = () => doc.documentElement.getAttribute("data-hmb-native-deletion-guard") === "engine-preflight"
       && doc.documentElement.getAttribute("data-hmb-native-deletion-protection-version") === "2";
     const rootOf = value => value?.closest?.(".react-flow__node[data-id]") || null;
+    const currentRoot = owner => owner.container?.isConnected ? rootOf(owner.container) : null;
+    const trackParents = element => {
+      for (let parent = element?.parentNode; parent && !parents.has(parent); parent = parent.parentNode) {
+        parents.add(parent);
+      }
+    };
     const roots = () => {
+      parents = new WeakSet();
+      awaitingMount = false;
       for (const owner of owners) {
-        const node = owner.active && owner.container?.isConnected ? rootOf(owner.container) : null;
-        if (node) identities.set(node, node.getAttribute("data-id"));
+        owner.node = currentRoot(owner);
+        if (owner.node) identities.add(owner.node);
+        if (owner.container.isConnected) trackParents(owner.container);
+        else awaitingMount = true;
       }
       // A stock fold/virtualized widget unmount is not a node deletion. Keep
       // its exact outer DOM identity until that node actually leaves the view.
-      for (const [node] of identities) {
+      for (const node of identities) {
         if (!node.isConnected) identities.delete(node);
-        else identities.set(node, node.getAttribute("data-id")); // Native rename keeps this exact retained outer node.
+        else trackParents(node);
       }
-      return new Set(identities.keys());
+      return identities;
     };
     const isEditing = target => Boolean(target?.closest?.("input,textarea,select,[contenteditable='true'],[contenteditable=''],[role='textbox'],.CodeMirror,.cm-editor"));
     const canvasOf = node => node?.closest?.(".react-flow");
@@ -908,10 +934,16 @@ function hmbAcquireNativeStockSafety(container) {
       if (!owners.size && !retained.size) { dispose(); return; }
       if (nativeReady() || !retained.size) dismiss();
     };
-    const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(sync) : null;
+    // Card and prompt edits occur below the widget host and cannot move its
+    // outer node. Still observe reparenting, folds, native markers and late mounts.
+    const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(records => {
+      if (awaitingMount || records.some(record => record.type === "attributes" || parents.has(record.target))) sync();
+    }) : null;
     observer?.observe(doc.documentElement, { attributes: true, attributeFilter: ["data-hmb-native-deletion-guard", "data-hmb-native-deletion-protection-version", "data-id"], childList: true, subtree: true });
     win.addEventListener("keydown", keydown, true); win.addEventListener("click", click, true); win.addEventListener("contextmenu", contextmenu, true);
-    shared = { owners, sync, release(owner) {
+    shared = { owners, sync, refresh(owner) {
+      if (currentRoot(owner) !== owner.node) sync();
+    }, release(owner) {
       owner.active = false; owners.delete(owner);
       sync();
     } };
@@ -920,7 +952,7 @@ function hmbAcquireNativeStockSafety(container) {
   const owner = { container, active: true };
   shared.owners.add(owner);
   shared.sync();
-  return { refresh() { if (owner.active) shared.sync(); }, cleanup() { if (owner.active) shared.release(owner); } };
+  return { refresh() { if (owner.active) (shared.refresh || shared.sync)(owner); }, cleanup() { if (owner.active) shared.release(owner); } };
 }
 
 // Griptape loads each widget as a separate module. One selection per editor

@@ -77,8 +77,19 @@ function analysisIntervalMessage(rows, kind, videoRangesEnabled) {
     : intervalMessage(rows, kind);
 }
 
+function renderLocked(state, shot = state.shot_uuid) {
+  return Boolean(shot) && list(state.shot_edit_locks).some(
+    lock => lock?.channel_uuid === state.channel_uuid && lock.shot_uuid === shot);
+}
+
+function shotStatus(state, shot) {
+  if (renderLocked(state, shot.shot_uuid)) return " · 로동중... 수정불가";
+  if (shot.busy) return " · 분석 중";
+  return shot.applied ? " · 완료" : "";
+}
+
 function canAnalyze(state, locked, pending, spec, intervals) {
-  if (locked || pending || state.busy || state.running || !state.source?.source_id ||
+  if (locked || renderLocked(state) || pending || state.busy || state.running || !state.source?.source_id ||
       !state.shot_uuid ||
       !list(state.shots).some(shot => shot?.shot_uuid === state.shot_uuid)) return false;
   return state.slot?.kind !== "audio" || Boolean(spec && intervals.length && intervalTotal(intervals, "audio") <= 30);
@@ -119,6 +130,13 @@ function renderPreview(source, slot) {
 }
 
 const style = `
+  .react-flow__node:has(.hmb-analysis .ha-content[data-locked-shot="true"]) [data-parameter-name="HMB_ANALYSIS_FILE"]{filter:grayscale(1);pointer-events:none;interactivity:inert}
+  .hmb-analysis .ha-content[data-locked-shot="true"]{filter:grayscale(1);color:#edf0f4}
+  .hmb-analysis .ha-tabs button[data-locked-shot="true"]{--shot:#94a3b8!important;color:#edf0f4}
+  .hmb-analysis [data-hmb-shot-check="true"]{display:inline-flex!important;align-items:center;justify-content:center;gap:2px!important;width:38px!important;min-width:38px!important;max-width:38px!important;height:30px!important;min-height:30px!important;max-height:30px!important;flex:none!important;padding:0!important;box-sizing:border-box!important;font:700 11px/1 system-ui!important;font-variant-numeric:tabular-nums;background:#12301d!important;color:#dcfce7!important;border:1px solid #4ade80!important;border-radius:5px!important;filter:none!important;opacity:1!important}.hmb-analysis [data-hmb-shot-check="true"]::before{content:"✓";font:900 20px/1 system-ui;color:#4ade80;flex:none}
+  .hmb-analysis [data-locked-shot="true"] .ha-check{color:#e2e8f0}
+  .hmb-analysis [data-verified-shot="true"]:not([data-locked-shot="true"]) .ha-check{color:#86efac}
+  .hmb-analysis:has([data-shot]) [data-hmb-native-actions] div:is(.bg-green-600,.bg-blue-600):has(>span.leading-none){display:none!important}
   .hmb-analysis {
     --line: #41485f; --muted: #aab8d1;
     color: #e8edf8; background: #101724; border: 1px solid #505773;
@@ -305,18 +323,19 @@ function render(state, view, locked, pending, notice) {
   const busy = state.busy === true;
   const role = state.role === "before" ? "before" : "after";
   const availableRoles = Array.isArray(state.available_roles) ? state.available_roles : ["before", "after"];
-  const editDisabled = locked || pending || busy || !active;
+  const editDisabled = locked || renderLocked(state) || pending || busy || !active;
   const sourceLabel = role === "before" ? "샷 참고 소스" : "Prompt 참고 소스";
   const sourceCount = list(state.sources).length;
   const roles = [["before", "To Prompt"], ["after", "To Agent"]].map(([key, label]) => {
-    const available = availableRoles.includes(key);
+    const available = availableRoles.includes(key) && !shots.some(shot => renderLocked(state, shot.shot_uuid));
     return `<button type="button" data-role="${key}" aria-pressed="${role === key}"${disabled(locked || pending || busy || state.running === true || !available)}${available ? "" : ' title="이 위치에 연결된 Analysis Agent가 있습니다."'}>${label}</button>`;
   }).join("");
   const tabs = shots.map(shot => {
     const name = shot.name || `샷 ${shot.number}`;
-    const status = shot.busy ? " · 분석 중" : shot.applied ? " · 적용" : "";
+    const status = shotStatus(state, shot);
     return `<button type="button" role="tab" aria-selected="${shot === active}" data-shot="${escape(shot.shot_uuid)}"
-      style="--shot:${shotColors[shot.number - 1]}" title="${escape(name + status)}"${disabled(locked || pending)}>${String(shot.number).padStart(2, "0")} ${escape(name + status)}</button>`;
+      data-locked-shot="${renderLocked(state, shot.shot_uuid)}" data-verified-shot="${Boolean(shot.applied && !shot.busy)}"
+      style="--shot:${shotColors[shot.number - 1]}" title="${escape(name + status)}"${disabled(locked || pending)}><span data-hmb-shot-check="${Boolean(shot.applied && !shot.busy)}" title="${shot.applied && !shot.busy ? "분석 완료" : ""}">${String(shot.number).padStart(2, "0")}</span> ${escape(name)}<span class="ha-check">${escape(status)}</span></button>`;
   }).join("");
   const kinds = Object.entries(kindLabels).map(([key, label]) =>
     `<option value="${key}"${view.kind === key ? " selected" : ""}>${label}</option>`).join("");
@@ -395,7 +414,7 @@ ${escape(fieldText)}</textarea></label>
     </header>
     <span class="ha-role-conflict" role="status"${state.role_conflict ? "" : " hidden"}>같은 위치에 Analysis Agent가 연결되어 있습니다.</span>
     <div class="ha-tabs" role="tablist" aria-label="분석 샷"${tabs ? "" : " hidden"}>${tabs}</div>
-    <div class="ha-content" role="tabpanel"><div class="ha-panel">
+    <div class="ha-content" role="tabpanel" data-locked-shot="${renderLocked(state)}"><div class="ha-panel">
       <div class="ha-row ha-source-heading" data-ha-key="source-heading"><b>${escape(active?.name || "Prompt 샷 연결 대기")}</b>
         <span class="ha-subtle">${slot.origin === "direct" ? "직접 선택 파일" : `${sourceLabel} ${sourceCount}개`}</span>
         <button type="button" data-action="refresh" aria-label="샷 및 소스 새로고침" title="샷 및 소스 새로고침"${disabled(locked || pending)}>↻</button></div>
@@ -517,7 +536,7 @@ function hmbNativeStockSafetyImplementation(container, props = {}) {
     if (disposed) return;
     // Canonical state continues to own all commands. A prepared page changes
     // only what is painted while its exact select request is in flight.
-    const shown = displayPage || state;
+    const shown = displayPage ? {...displayPage, shot_edit_locks: state.shot_edit_locks, shots: state.shots} : state;
     const scroll = frame.querySelector(".ha-content")?.scrollTop || 0;
     const fieldTabScroll = frame.querySelector(".ha-field-tabs")?.scrollLeft || 0;
     const currentEditor = frame.querySelector("[data-result-text],[data-field-text]");
@@ -565,14 +584,14 @@ function hmbNativeStockSafetyImplementation(container, props = {}) {
     const toggle = frame.querySelector("[data-results-only]");
     if (toggle) {
       toggle.checked = state.slot?.results_only === true;
-      toggle.disabled = Boolean(latest.disabled || state.busy || pending || !state.shot_uuid);
+      toggle.disabled = Boolean(latest.disabled || renderLocked(state) || state.busy || pending || !state.shot_uuid);
     }
     const label = frame.querySelector(".ha-results-toggle-ui em");
     if (label) label.textContent = toggle?.checked ? "ON" : "OFF";
     const run = frame.querySelector("[data-action=analyze]");
     if (run && run.dataset.routePrevDisabled !== undefined) {
       run.disabled = run.dataset.routePrevDisabled === "true" ||
-        Boolean(latest.disabled || state.busy || state.running);
+        Boolean(latest.disabled || renderLocked(state) || state.busy || state.running);
       delete run.dataset.routePrevDisabled;
     }
     const status = frame.querySelector(".ha-status");
@@ -584,15 +603,24 @@ function hmbNativeStockSafetyImplementation(container, props = {}) {
     for (const shot of list(state.shots)) {
       const tab = tabs.get(shot.shot_uuid);
       if (!tab) continue;
-      const suffix = shot.busy ? " · 분석 중" : shot.applied ? " · 적용" : "";
+      const suffix = shotStatus(state, shot);
       const name = shot.name || `샷 ${shot.number}`;
-      tab.textContent = `${String(shot.number).padStart(2, "0")} ${name}${suffix}`;
+      const mark = tab.querySelector(".ha-check");
+      if (mark) mark.textContent = suffix;
+      tab.dataset.lockedShot = String(renderLocked(state, shot.shot_uuid));
+      tab.dataset.verifiedShot = String(Boolean(shot.applied && !shot.busy));
+      const number = tab.querySelector("[data-hmb-shot-check]");
+      if (number) {
+        number.dataset.hmbShotCheck = tab.dataset.verifiedShot;
+        number.title = shot.applied && !shot.busy ? "분석 완료" : "";
+      }
       tab.title = `${name}${suffix}`;
     }
   }
 
   function command(action, fields = {}) {
     if (disposed || pending || latest.disabled || typeof latest.onChange !== "function") return;
+    if (renderLocked(state) && !["select_shot", "refresh", "cancel"].includes(action)) return;
     const id = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
     const fail = () => {
       if (pending !== id) return;
@@ -847,7 +875,8 @@ function hmbNativeStockSafetyImplementation(container, props = {}) {
 
   function navigate(action, fields) {
     const next = {action, fields};
-    if (dirtyPromptField()) {
+    if (renderLocked(state) && action === "select_shot") finishNavigation(next);
+    else if (dirtyPromptField()) {
       queuedNavigation = next;
       savePromptField();
     } else if (view.resultTextDraft?.shot_uuid === state.shot_uuid &&
@@ -1052,23 +1081,34 @@ function hmbAcquireNativeStockSafety(container) {
   const key = "__HMB_NATIVE_STOCK_SAFETY_V1__";
   let shared = doc[key];
   if (!shared) {
-    const owners = new Set(), identities = new Map();
+    const owners = new Set(), identities = new Set();
+    let parents = new WeakSet(), awaitingMount = false;
     let contextNode = null, notice = null, noticeTimer = null, disposed = false;
     const nativeReady = () => doc.documentElement.getAttribute("data-hmb-native-deletion-guard") === "engine-preflight"
       && doc.documentElement.getAttribute("data-hmb-native-deletion-protection-version") === "2";
     const rootOf = value => value?.closest?.(".react-flow__node[data-id]") || null;
+    const currentRoot = owner => owner.container?.isConnected ? rootOf(owner.container) : null;
+    const trackParents = element => {
+      for (let parent = element?.parentNode; parent && !parents.has(parent); parent = parent.parentNode) {
+        parents.add(parent);
+      }
+    };
     const roots = () => {
+      parents = new WeakSet();
+      awaitingMount = false;
       for (const owner of owners) {
-        const node = owner.active && owner.container?.isConnected ? rootOf(owner.container) : null;
-        if (node) identities.set(node, node.getAttribute("data-id"));
+        owner.node = currentRoot(owner);
+        if (owner.node) identities.add(owner.node);
+        if (owner.container.isConnected) trackParents(owner.container);
+        else awaitingMount = true;
       }
       // A stock fold/virtualized widget unmount is not a node deletion. Keep
       // its exact outer DOM identity until that node actually leaves the view.
-      for (const [node] of identities) {
+      for (const node of identities) {
         if (!node.isConnected) identities.delete(node);
-        else identities.set(node, node.getAttribute("data-id")); // Native rename keeps this exact retained outer node.
+        else trackParents(node);
       }
-      return new Set(identities.keys());
+      return identities;
     };
     const isEditing = target => Boolean(target?.closest?.("input,textarea,select,[contenteditable='true'],[contenteditable=''],[role='textbox'],.CodeMirror,.cm-editor"));
     const canvasOf = node => node?.closest?.(".react-flow");
@@ -1135,10 +1175,16 @@ function hmbAcquireNativeStockSafety(container) {
       if (!owners.size && !retained.size) { dispose(); return; }
       if (nativeReady() || !retained.size) dismiss();
     };
-    const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(sync) : null;
+    // Card and prompt edits occur below the widget host and cannot move its
+    // outer node. Still observe reparenting, folds, native markers and late mounts.
+    const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(records => {
+      if (awaitingMount || records.some(record => record.type === "attributes" || parents.has(record.target))) sync();
+    }) : null;
     observer?.observe(doc.documentElement, { attributes: true, attributeFilter: ["data-hmb-native-deletion-guard", "data-hmb-native-deletion-protection-version", "data-id"], childList: true, subtree: true });
     win.addEventListener("keydown", keydown, true); win.addEventListener("click", click, true); win.addEventListener("contextmenu", contextmenu, true);
-    shared = { owners, sync, release(owner) {
+    shared = { owners, sync, refresh(owner) {
+      if (currentRoot(owner) !== owner.node) sync();
+    }, release(owner) {
       owner.active = false; owners.delete(owner);
       sync();
     } };
@@ -1147,7 +1193,7 @@ function hmbAcquireNativeStockSafety(container) {
   const owner = { container, active: true };
   shared.owners.add(owner);
   shared.sync();
-  return { refresh() { if (owner.active) shared.sync(); }, cleanup() { if (owner.active) shared.release(owner); } };
+  return { refresh() { if (owner.active) (shared.refresh || shared.sync)(owner); }, cleanup() { if (owner.active) shared.release(owner); } };
 }
 
 // Griptape loads each widget as a separate module. One selection per editor

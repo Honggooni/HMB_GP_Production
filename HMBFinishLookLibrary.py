@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import hmac
-import importlib.util
 import json
 import logging
 import math
@@ -20,42 +19,22 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 from _hmb_deletion_guard import hmb_binding_mutation
+from _hmb_shot_routing import publish_source_widget_view, record_source_shot_check, shot_edit_locks, source_shot_status_fields
 
 
-def _load_hmb_common() -> Any:
-    module_path = _THIS_DIR / "_hmb_common.py"
-    module_name = "_hmb_gp_production_common"
-    existing = sys.modules.get(module_name)
-    if existing is not None and Path(getattr(existing, "__file__", "")).resolve() == module_path.resolve():
-        return existing
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Unable to load HMB common module: {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-_hmb = _load_hmb_common()
-DataNode = _hmb.DataNode
-Parameter = _hmb.Parameter
-ParameterMode = _hmb.ParameterMode
-add_group = _hmb.add_group
-set_output = _hmb.set_output
-parameter_exists = _hmb.parameter_exists
-
-try:
-    from griptape_nodes.traits.widget import Widget  # type: ignore
-except Exception:
-    Widget = None  # type: ignore
+from _hmb_node_controls import (
+    DataNode, FinishLookValidationError, MAX_SHOTS, SHOT_ROUTING_CATALOG_SCHEMA,
+    SHOT_ROUTING_CATALOG_VERSION, _add_parameter, _add_widget_parameter,
+    _apply_parameter_ui_options, _hidden_transport_ui_options, _hide_transport_parameter,
+    _mode, _normalize_shot_catalog, _normalize_shot_selection, _parameter_object,
+    _raw_parameter, _set_parameter_silently, _shot_only, add_group, set_output,
+)
 
 
 LOGGER = logging.getLogger("griptape_nodes")
 EPSILON = 1e-6
 SCHEMA_VERSION = 2
 WIDGET_NAME = "HMBFinishLookLibraryWidget"
-WIDGET_LIBRARY_NAME = "HMB_GP_Production"
 WIDGET_PARAMETER_NAME = "HMB_FINISH_LOOK_UI_STATE"
 REMOTE_INPUT_PARAMETER_NAME = "FINISH_LOOK_REMOTE_IN"
 SHOT_STORE_PARAMETER_NAME = "HMB_FINISH_LOOK_SHOT_STATES"
@@ -72,13 +51,10 @@ REMOTE_STATUS_OUTPUT_PARAMETER_NAME = "HMB_FINISH_LOOK_REMOTE_STATUS"
 REMOTE_SCHEMA = "hmb-finish-look-remote-patch"
 MAX_REQUEST_ID_LENGTH = 128
 MAX_REMOTE_HISTORY = 256
-SHOT_ROUTING_CATALOG_SCHEMA = "hmb-shot-routing-catalog"
-SHOT_ROUTING_CATALOG_VERSION = 1
 SHOT_SUBSCRIPTION_SCHEMA = "hmb-shot-channel-subscription"
 SHOT_SUBSCRIPTION_VERSION = 1
 FINISH_LOOK_SHOT_SNAPSHOT_SCHEMA = "hmb-finish-look-shot-snapshot"
 FINISH_LOOK_SHOT_SNAPSHOT_VERSION = 2
-MAX_SHOTS = 5
 FINISH_LOOK_NODE_WIDTH = 980
 FINISH_LOOK_SHOT_TAB_HEIGHT = 51
 # Beauty controls, five fixed Shot tabs and the status footer fit without the
@@ -88,10 +64,6 @@ FINISH_LOOK_NODE_HEIGHT = FINISH_LOOK_WIDGET_HEIGHT + 76
 FINISH_LOOK_NODE_MIN_WIDTH = 700
 FINISH_LOOK_NODE_MIN_HEIGHT = 620
 FINISH_LOOK_WIDGET_MIN_HEIGHT = 180
-
-
-class FinishLookValidationError(ValueError):
-    """A state or remote request violates the public Finish Look contract."""
 
 
 DEFAULT_FINISH_LOOK_STATE: dict[str, Any] = {
@@ -123,187 +95,6 @@ DEFAULT_REMOTE_STATUS: dict[str, Any] = {
 
 def default_finish_look_state() -> dict[str, Any]:
     return copy.deepcopy(DEFAULT_FINISH_LOOK_STATE)
-
-
-def _shot_only() -> dict[str, Any]:
-    return {
-        "channel_uuid": "",
-        "shot_uuid": "",
-        "number": 1,
-        "name": "Only",
-    }
-
-
-def _normalize_shot_catalog(
-    value: Any,
-    *,
-    strict: bool = False,
-    allow_sparse: bool = False,
-) -> dict[str, Any]:
-    """Normalize the compact ImageAsset-owned Shot catalog.
-
-    Finish Look never persists media in its selector state.  The catalog is
-    only a bounded UUID/name option list supplied by the same-flow router.
-    """
-
-    if not value:
-        return {}
-    if not isinstance(value, Mapping):
-        if strict:
-            raise FinishLookValidationError("Shot catalog must be an object.")
-        return {}
-    required = {
-        "schema",
-        "version",
-        "publisher_instance_uuid",
-        "channel_uuid",
-        "generation",
-        "metadata_sha256",
-        "shots",
-    }
-    if set(value) != required:
-        if strict:
-            raise FinishLookValidationError("Shot catalog shape is invalid.")
-        return {}
-    publisher = str(value.get("publisher_instance_uuid") or "")
-    channel = str(value.get("channel_uuid") or "")
-    metadata_sha256 = str(value.get("metadata_sha256") or "").casefold()
-    generation = value.get("generation")
-    shots_value = value.get("shots")
-    if (
-        value.get("schema") != SHOT_ROUTING_CATALOG_SCHEMA
-        or value.get("version") != SHOT_ROUTING_CATALOG_VERSION
-        or not publisher
-        or publisher != publisher.strip()
-        or len(publisher) > 128
-        or not channel
-        or channel != channel.strip()
-        or len(channel) > 128
-        or isinstance(generation, bool)
-        or not isinstance(generation, int)
-        or not 1 <= generation <= (1 << 53) - 1
-        or re.fullmatch(r"[0-9a-f]{64}", metadata_sha256) is None
-        or not isinstance(shots_value, list)
-        or not 1 <= len(shots_value) <= MAX_SHOTS
-    ):
-        if strict:
-            raise FinishLookValidationError("Shot catalog metadata is invalid.")
-        return {}
-    shots: list[dict[str, Any]] = []
-    shot_ids: set[str] = set()
-    shot_numbers: set[int] = set()
-    for raw in shots_value:
-        if not isinstance(raw, Mapping) or set(raw) != {
-            "shot_uuid",
-            "number",
-            "name",
-            "revision",
-        }:
-            if strict:
-                raise FinishLookValidationError("Shot catalog row is invalid.")
-            return {}
-        shot_uuid = str(raw.get("shot_uuid") or "")
-        name = " ".join(str(raw.get("name") or "").split())
-        number = raw.get("number")
-        revision = raw.get("revision")
-        if (
-            not shot_uuid
-            or shot_uuid != shot_uuid.strip()
-            or len(shot_uuid) > 128
-            or shot_uuid in shot_ids
-            or isinstance(number, bool)
-            or not isinstance(number, int)
-            or not 1 <= number <= MAX_SHOTS
-            or number in shot_numbers
-            or not name
-            or len(name) > 128
-            or isinstance(revision, bool)
-            or not isinstance(revision, int)
-            or not 0 <= revision <= (1 << 53) - 1
-        ):
-            if strict:
-                raise FinishLookValidationError("Shot catalog row value is invalid.")
-            return {}
-        shot_ids.add(shot_uuid)
-        shot_numbers.add(number)
-        shots.append(
-            {
-                "shot_uuid": shot_uuid,
-                "number": number,
-                "name": name,
-                "revision": revision,
-            }
-        )
-    shots.sort(key=lambda item: (item["number"], item["shot_uuid"]))
-    if (
-        not allow_sparse
-        and [item["number"] for item in shots] != list(range(1, len(shots) + 1))
-    ):
-        if strict:
-            raise FinishLookValidationError("Shot catalog numbering is invalid.")
-        return {}
-    document = {
-        "channel_uuid": channel,
-        "generation": generation,
-        "shots": shots,
-    }
-    expected_sha256 = hashlib.sha256(
-        json.dumps(
-            document,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-    if not hmac.compare_digest(metadata_sha256, expected_sha256):
-        if strict:
-            raise FinishLookValidationError("Shot catalog hash does not match.")
-        return {}
-    return {
-        "schema": SHOT_ROUTING_CATALOG_SCHEMA,
-        "version": SHOT_ROUTING_CATALOG_VERSION,
-        "publisher_instance_uuid": publisher,
-        "channel_uuid": channel,
-        "generation": generation,
-        "metadata_sha256": metadata_sha256,
-        "shots": shots,
-    }
-
-
-def _normalize_shot_selection(value: Any, catalog: Any = None) -> dict[str, Any]:
-    source = value if isinstance(value, Mapping) else {}
-    channel = str(source.get("channel_uuid") or "").strip()[:128]
-    shot_uuid = str(source.get("shot_uuid") or "").strip()[:128]
-    if not channel or not shot_uuid:
-        return _shot_only()
-    normalized_catalog = _normalize_shot_catalog(catalog, allow_sparse=True)
-    if normalized_catalog and normalized_catalog.get("channel_uuid") != channel:
-        return _shot_only()
-    selected = next(
-        (
-            item
-            for item in normalized_catalog.get("shots", [])
-            if item.get("shot_uuid") == shot_uuid
-        ),
-        None,
-    )
-    if normalized_catalog and selected is None:
-        return _shot_only()
-    try:
-        number = max(1, min(MAX_SHOTS, int(source.get("number") or 1)))
-    except (TypeError, ValueError, OverflowError):
-        number = 1
-    if selected is not None:
-        number = int(selected["number"])
-        name = str(selected["name"])
-    else:
-        name = " ".join(str(source.get("name") or f"Shot {number}").split())[:128]
-    return {
-        "channel_uuid": channel,
-        "shot_uuid": shot_uuid,
-        "number": number,
-        "name": name or f"Shot {number}",
-    }
 
 
 def _mapping(value: Any, field: str) -> Mapping[str, Any]:
@@ -694,7 +485,7 @@ def validate_widget_state(value: Any) -> dict[str, Any]:
         "catalog",  # Discard the obsolete catalog during legacy hydration.
         "shot_catalog",
         "shot",
-        "shot_manager", "shot_editor_expanded", "shot_documents", UI_TRANSPORT_KEY,
+        "shot_manager", "shot_editor_expanded", "shot_documents", "shot_edit_locks", "verified_shots", UI_TRANSPORT_KEY,
     }
     missing = sorted(required - set(state))
     unknown = sorted(set(state) - allowed)
@@ -724,209 +515,6 @@ def validate_widget_state(value: Any) -> dict[str, Any]:
         "shot_editor_expanded": state.get("shot_editor_expanded", True) is not False,
         "shot_documents": copy.deepcopy(state.get("shot_documents") or {}),
     }
-
-
-def _mode(name: str) -> Any:
-    if ParameterMode is None:
-        return None
-    return {getattr(ParameterMode, name)}
-
-
-def _parameter_attempts(kwargs: dict[str, Any]) -> list[dict[str, Any]]:
-    modern = dict(kwargs)
-    if modern.get("allowed_modes") is not None:
-        for key in ("allow_input", "allow_output", "allow_property"):
-            modern.pop(key, None)
-    legacy = dict(kwargs)
-    legacy.pop("allowed_modes", None)
-    attempts: list[dict[str, Any]] = []
-    for candidate in (modern, legacy):
-        attempts.append(candidate)
-        without_type = dict(candidate)
-        without_type.pop("type", None)
-        if without_type != candidate:
-            attempts.append(without_type)
-    return attempts
-
-
-def _add_parameter(node: Any, **kwargs: Any) -> Any:
-    if parameter_exists(node, str(kwargs.get("name") or "")):
-        return getattr(node, "parameters", {}).get(kwargs["name"])
-    last_error: Exception | None = None
-    for attempt in _parameter_attempts(kwargs):
-        try:
-            parameter = Parameter(**attempt)
-            node.add_parameter(parameter)
-            return parameter
-        except Exception as exc:
-            last_error = exc
-    raise last_error or RuntimeError(f"Unable to add parameter {kwargs.get('name')}.")
-
-
-def _parameter_object(node: Any, name: str) -> Any:
-    for getter_name in ("get_parameter_by_name", "get_parameter"):
-        getter = getattr(node, getter_name, None)
-        if callable(getter):
-            try:
-                parameter = getter(name)
-                if parameter is not None:
-                    return parameter
-            except Exception:
-                pass
-    parameters = getattr(node, "parameters", None)
-    if isinstance(parameters, dict):
-        return parameters.get(name)
-    if isinstance(parameters, (list, tuple)):
-        return next(
-            (
-                parameter
-                for parameter in parameters
-                if getattr(parameter, "name", None) == name
-            ),
-            None,
-        )
-    return None
-
-
-def _add_widget_parameter(node: Any, *, widget_name: str, **kwargs: Any) -> Any:
-    """Attach the Widget trait before Griptape performs its first row layout."""
-
-    name = str(kwargs.get("name") or "")
-    if parameter_exists(node, name):
-        parameter = _parameter_object(node, name)
-    else:
-        parameter = None
-        last_error: Exception | None = None
-        for attempt in _parameter_attempts(kwargs):
-            if Widget is not None:
-                try:
-                    parameter = Parameter(
-                        **{
-                            **attempt,
-                            "traits": {
-                                Widget(name=widget_name, library=WIDGET_LIBRARY_NAME)
-                            },
-                        }
-                    )
-                    break
-                except Exception as exc:
-                    last_error = exc
-            try:
-                parameter = Parameter(**attempt)
-                if Widget is not None:
-                    parameter.add_trait(
-                        Widget(name=widget_name, library=WIDGET_LIBRARY_NAME)
-                    )
-                break
-            except Exception as exc:
-                parameter = None
-                last_error = exc
-        if parameter is None:
-            raise last_error or RuntimeError(f"Unable to add widget parameter {name}.")
-        # Adding the trait after add_parameter() leaves the host's first layout
-        # cached as a compact native dict row (about 40-48 px).
-        node.add_parameter(parameter)
-
-    if Widget is not None and parameter is not None:
-        has_widget = False
-        try:
-            finder = getattr(parameter, "find_elements_by_type", None)
-            if callable(finder):
-                has_widget = bool(finder(Widget, find_recursively=True))
-        except Exception:
-            has_widget = False
-        if not has_widget:
-            try:
-                parameter.add_trait(
-                    Widget(name=widget_name, library=WIDGET_LIBRARY_NAME)
-                )
-            except Exception:
-                pass
-    return parameter
-
-
-def _apply_parameter_ui_options(parameter: Any, options: Mapping[str, Any]) -> None:
-    if parameter is None:
-        return
-    try:
-        current = dict(getattr(parameter, "ui_options", {}) or {})
-        current.update(dict(options))
-        parameter.ui_options = current
-    except Exception:
-        return
-    updater = getattr(parameter, "update_ui_options_key", None)
-    if callable(updater):
-        for key, value in options.items():
-            try:
-                updater(key, value)
-            except Exception:
-                pass
-
-
-def _hidden_transport_ui_options() -> dict[str, Any]:
-    return {
-        "display_name": "",
-        "hide": True,
-        "hide_property": True,
-        "hide_label": True,
-        "hide_handles": True,
-        "height": 1,
-        "min_height": 0,
-        "max_height": 1,
-        "is_full_width": True,
-        "expandable": False,
-        "compact": True,
-    }
-
-
-def _hide_transport_parameter(parameter: Any) -> None:
-    if parameter is None:
-        return
-    for attribute in ("hide", "hide_property", "hide_label"):
-        try:
-            setattr(parameter, attribute, True)
-        except Exception:
-            pass
-    _apply_parameter_ui_options(parameter, _hidden_transport_ui_options())
-
-
-def _raw_parameter(node: Any, name: str) -> Any:
-    try:
-        return node.get_parameter_value(name)
-    except Exception:
-        parameter = getattr(node, "parameters", {}).get(name)
-        return getattr(parameter, "default_value", None)
-
-
-def _set_parameter_silently(node: Any, name: str, value: Any) -> None:
-    parent_setter = getattr(super(type(node), node), "set_parameter_value", None)
-    if callable(parent_setter):
-        try:
-            if ParameterMode is None:
-                parent_setter(name, copy.deepcopy(value))
-            else:
-                parent_setter(
-                    name,
-                    copy.deepcopy(value),
-                    initial_setup=False,
-                    emit_change=False,
-                    skip_before_value_set=True,
-                )
-            return
-        except (AttributeError, TypeError):
-            try:
-                parent_setter(name, copy.deepcopy(value))
-                return
-            except Exception:
-                pass
-        except Exception:
-            pass
-    parameter = getattr(node, "parameters", {}).get(name)
-    if parameter is not None:
-        try:
-            parameter.default_value = copy.deepcopy(value)
-        except Exception:
-            pass
 
 
 class HMBFinishLookLibrary(DataNode):
@@ -1465,6 +1053,8 @@ class HMBFinishLookLibrary(DataNode):
             changed = requested_state != document.get("finish_look", default_finish_look_state())
             if changed and (command["base_revision"] > clock["revision"] or command["base_target_revision"] != clock["target_revisions"][key]):
                 self._hmb_finish_ui_reply(command, "conflict");return
+            if changed and self._render_owns_shot(requested["channel_uuid"], requested["shot_uuid"]):
+                self._hmb_finish_ui_reply(command, "render_locked");return
             if changed and self._remote_connected:
                 self._hmb_finish_ui_reply(command, "remote_locked");return
             if changed:
@@ -1685,6 +1275,36 @@ class HMBFinishLookLibrary(DataNode):
             self._hmb_finish_legacy_mode=cache["legacy_mode"]
             return True
 
+    def _render_owns_shot(self, channel, shot):
+        return bool(channel and shot and {"channel_uuid": channel, "shot_uuid": shot} in shot_edit_locks(self))
+
+    def _hmb_source_shot_key(self, state, channel, shot):
+        catalog = state.get("shot_catalog") or {}
+        if channel != catalog.get("channel_uuid") or not any(row["shot_uuid"] == shot for row in catalog.get("shots", [])):
+            return None
+        key = self._hmb_finish_key(channel, shot)
+        values = self._last_valid_state if key == self._hmb_finish_active_key else state.get("shot_documents", {}).get(key)
+        return _canonical_sha256(values) if values is not None else None
+
+    def _hmb_shot_edit_locks_changed(self) -> None:
+        with self._state_lock:
+            current = _raw_parameter(self, WIDGET_PARAMETER_NAME)
+            if not isinstance(current, dict):
+                return
+            flags = source_shot_status_fields(self, self._widget_state)
+            if all(current.get(k, []) == v for k, v in flags.items()):
+                return
+            view = {k: v for k, v in current.items() if k not in flags}
+            view.update({k: v for k, v in flags.items() if v})
+            _set_parameter_silently(self, WIDGET_PARAMETER_NAME, view)
+            publish_source_widget_view(self, WIDGET_PARAMETER_NAME, view)
+
+    def _hmb_confirm_finish_shot_read(self, snapshot):
+        channel, shot = snapshot["channel_uuid"], snapshot["shot_uuid"]
+        with self._state_lock:
+            if self._hmb_source_shot_key(self._widget_state, channel, shot) == snapshot["state_sha256"]:
+                record_source_shot_check(self, self._widget_state, channel, shot)
+
     def _restore_widget_parameter(self, *, live: bool = False) -> None:
         self._hmb_finish_ensure_manager_state()
         shot_catalog = _normalize_shot_catalog(
@@ -1707,6 +1327,7 @@ class HMBFinishLookLibrary(DataNode):
                 for row in shot_catalog.get("shots", [])},
             }
         wire_value = {**copy.deepcopy(self._widget_state), UI_TRANSPORT_KEY: self._hmb_finish_ui_clock()}
+        wire_value.update({k: v for k, v in source_shot_status_fields(self, self._widget_state).items() if v})
         try:
             self._syncing_widget = True
             changed = _raw_parameter(self, WIDGET_PARAMETER_NAME) != wire_value
@@ -2185,6 +1806,9 @@ class HMBFinishLookLibrary(DataNode):
             if self._hmb_shot_manager_enabled() and (shot_changed and not saved_initial_authoring or self._hmb_finish_hydrating and self._hmb_finish_loaded_store):
                 requested_state = copy.deepcopy(self._last_valid_state)
             state_changed = requested_state != self._last_valid_state
+            if state_changed and not saved_initial_authoring and self._render_owns_shot(requested_shot["channel_uuid"], requested_shot["shot_uuid"]):
+                self._restore_widget_parameter(live=True)
+                return
             if self._remote_connected and state_changed:
                 remote_locked_rejected = True
                 requested_state = copy.deepcopy(self._last_valid_state)
@@ -2263,6 +1887,9 @@ class HMBFinishLookLibrary(DataNode):
                         }
                     else:
                         return
+                elif self._render_owns_shot(self._widget_state["shot"]["channel_uuid"], self._widget_state["shot"]["shot_uuid"]):
+                    self._remote_status = {"schema_version": 1, "status": "rejected", "code": "render_locked",
+                        "message": "로동중... 수정불가", "request_id": request_id, "revision": self._remote_revision}
                 else:
                     next_state, status = apply_finish_look_remote_request(
                         self._last_valid_state,
@@ -2302,6 +1929,10 @@ class HMBFinishLookLibrary(DataNode):
                 "snapshot_fingerprint": "", "snapshot": {}})
             if normalized["request_id"] in document["seen_remote_requests"]:
                 return {**copy.deepcopy(document["remote_status"]), "status": "duplicate", "code": "duplicate_request"}
+            if self._render_owns_shot(channel_uuid, shot_uuid):
+                return {"schema_version": 1, "status": "rejected", "code": "render_locked",
+                        "message": "로동중... 수정불가", "request_id": normalized["request_id"],
+                        "revision": document["remote_revision"]}
             state, status = apply_finish_look_remote_request(document["finish_look"], normalized,
                 current_revision=document["remote_revision"])
             document["remote_status"] = status
@@ -2484,6 +2115,9 @@ class HMBFinishLookLibrary(DataNode):
         if remote_value:
             self._apply_remote_value(remote_value, report_duplicate=False)
         self._publish_all(live=False)
+        shot = self._widget_state.get("shot") or {}
+        if shot.get("channel_uuid") and shot.get("shot_uuid"):
+            record_source_shot_check(self, self._widget_state, shot["channel_uuid"], shot["shot_uuid"])
         LOGGER.info("[HMB][FINISH] FINISH_LOOK_OUT compiled.")
         return None
 

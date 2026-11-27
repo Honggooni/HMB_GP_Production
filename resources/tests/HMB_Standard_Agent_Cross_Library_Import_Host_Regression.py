@@ -88,6 +88,7 @@ if args.case != "canonical-control":
     if args.case == "cached-advanced":
         importlib.import_module("anthropic")
 sys.path.insert(0, str(hmb_site))
+sys.path.insert(0, str(target))
 # SDK environment.py also publishes the library package root independently of
 # its edit-time dependency environment; the dynamic Agent imports its siblings.
 sys.path.append(str(standard))
@@ -134,10 +135,16 @@ with mock.patch.object(Engine, "__init__", no_engine), \
     spec.loader.exec_module(agents)
 
 assert not engine_attempts
-assert sys.path.index(str(standard_site)) >= len(path_before), "Product must append Standard dependencies"
 assert Path(agents._hmb.__file__).resolve() == (target / "_hmb_common.py").resolve()
 native = agents._BuiltinAgent
-if args.expect == "native":
+bundled_source = target / "_hmb_native_agent/agents/agent.py"
+if bundled_source.is_file():
+    assert args.expect == "native", "The unavailable comparison only applies to older external-Agent libraries"
+    assert native is not None and agents._BaseAgent is native and native in agents.HMBAgentLibrary.__mro__
+    assert Path(sys.modules[native.__module__].__file__).resolve() == bundled_source.resolve()
+    assert str(standard_site) not in sys.path and not native_classes and not registry_errors
+elif args.expect == "native":
+    assert sys.path.index(str(standard_site)) >= len(path_before)
     assert native is not None, json.dumps({"case": args.case, "registry_error_chain": registry_errors}, ensure_ascii=True)
     assert native_classes and native is native_classes[-1]
     assert agents._BaseAgent is native and native in agents.HMBAgentLibrary.__mro__
@@ -155,8 +162,8 @@ record = {"schema": "hmb-standard-agent-cross-library-import-v1", "passed": True
           "case": args.case, "expected": args.expect, "native_agent_available": native is not None,
           "product_root": str(target), "product_root_explicit": args.product_root is not None,
           "edit_environment_site": str(hmb_site),
-          "actual_sdk_module_loader_used": True, "standard_dependencies_externally_injected": False,
-          "product_appended_standard_site": True,
+          "actual_sdk_module_loader_used": bool(native_classes or registry_errors), "standard_dependencies_externally_injected": False,
+          "bundled_agent": bundled_source.is_file(), "product_appended_standard_site": str(standard_site) in sys.path,
           "advanced_site": str(advanced_site), "advanced_site_explicit_clone": args.advanced_site is not None,
           "anthropic_module_path": str(getattr(anthropic, "__file__", "")),
           "anthropic_module_version": getattr(anthropic, "__version__", None),

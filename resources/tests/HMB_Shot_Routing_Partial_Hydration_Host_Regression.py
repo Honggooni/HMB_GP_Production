@@ -83,7 +83,9 @@ def main():
         with mock.patch.dict(os.environ,variables):
             try:
                 logging.disable(logging.CRITICAL)
-                with engine_scope() as engine:asyncio.run(scenario(engine))
+                from hmb_host_workflow import run_in_fixture_workflow
+                with engine_scope() as engine:
+                    asyncio.run(run_in_fixture_workflow(engine, 'RoutingPartialHydration', scenario))
             finally:logging.shutdown()
     print('HMB_SHOT_ROUTING_PARTIAL_HYDRATION_HOST=PASS (real native saved-store replay, exact private owner, five authored documents preserved, repeated clear suppressed)')
 

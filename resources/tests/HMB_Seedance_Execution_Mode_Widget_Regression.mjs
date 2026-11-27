@@ -20,6 +20,7 @@ const css = source.match(/function render\(state\) \{[\s\S]*?<style>([\s\S]*?)<\
 // The native slots, inline Final controls and the completed-Run indicator are
 // additive. Preserve the baseline fingerprint for all other header and player CSS.
 const legacyCss = css.replace(/^[ \t]*\/\* HMB_NATIVE_HEADER_SLOTS_BEGIN \*\/[\s\S]*?\/\* HMB_NATIVE_HEADER_SLOTS_END \*\/\r?\n/m, "")
+  .replace(/^[ \t]*\/\* HMB_SHOT_PROGRESS_BEGIN \*\/[\s\S]*?\/\* HMB_SHOT_PROGRESS_END \*\/\r?\n/m, "")
   .replace(/^[ \t]*\/\* HMB_FINAL_RESOLUTION_INLINE_BEGIN \*\/[\s\S]*?\/\* HMB_FINAL_RESOLUTION_INLINE_END \*\/\r?\n/m, "")
   .replace(/^[ \t]*button\[data-hmb-completed-render\]\{opacity:\.45!important;cursor:default!important;pointer-events:none!important\}\r?\n/m, "")
   .replaceAll(":not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *))", "");

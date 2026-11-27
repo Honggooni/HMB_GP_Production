@@ -7,7 +7,9 @@ import path from "node:path";
 import {createRequire} from "node:module";
 const require=createRequire(import.meta.url);
 let playwright;try{playwright=require("playwright");}catch{playwright=require(path.join(os.homedir(),".cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright"));}
-const source=fs.readFileSync(new URL("../../widgets/HMBPromptLibraryScopedBindingWidget.js",import.meta.url),"utf8");
+const source=fs.readFileSync(process.env.HMB_MODE_TEST_LIBRARY_ROOT
+ ? path.join(process.env.HMB_MODE_TEST_LIBRARY_ROOT,"widgets","HMBPromptLibraryScopedBindingWidget.js")
+ : new URL("../../widgets/HMBPromptLibraryScopedBindingWidget.js",import.meta.url),"utf8");
 const channel="11111111-1111-4111-8111-111111111111";
 const shots=Array.from({length:5},(_,i)=>({channel_uuid:channel,shot_uuid:`22222222-2222-4222-8222-${String(i+1).padStart(12,"0")}`,number:i+1,name:`asset_${i+1}`,selected_source_uids:[]}));
 const row=(uid,label,main="Character",sub="Full Appearance")=>({slot:1,present:true,label,asset_source_uid:uid,asset_library_id:uid,asset_source_kind:"project",asset_managed:true,asset_verified:true,image_main_type:main,image_sub_type:sub,owner:label,color_picks:[uid.includes("background")?"Green":"Red"],binding_video_slots:[1]});
@@ -23,10 +25,10 @@ if(location.search==='?empty'){
 window.props=value=>({value:JSON.stringify(value),disabled:false,onChange(next){window.latest=JSON.parse(next);window.writes++;window.controller.update(window.props(window.latest));}});
 window.controller=mount(document.getElementById('host'),window.props(window.latest));window.ready=true;
 window.accept=raw=>{window.latest=widget.normalizeState(raw);window.controller.update(window.props(window.latest));};
-window.preview=(revision,rows,cancelled=false)=>{
+window.preview=(revision,rows,cancelled=false,source_generation)=>{
  const detail={schema:'hmb-shot-media-selection-preview-v1',kind:'image_asset',scope:'shot',
    publisher_instance_uuid:window.latest.shot.channel_uuid,channel_uuid:window.latest.shot.channel_uuid,
-   shot_uuid:window.latest.shot.shot_uuid,revision,rows,cancelled};
+   shot_uuid:window.latest.shot.shot_uuid,revision,rows,cancelled,source_generation};
  document.getElementById('asset-widget').dispatchEvent(new CustomEvent(detail.schema,{detail,bubbles:true,composed:true}));
 };
 window.sourceUpdate=(images,advance=1)=>{
@@ -55,7 +57,7 @@ try{
   await page.waitForFunction(names=>{
    const inputs=document.querySelectorAll('.source-row.image .source-label-input');
    return !document.getElementById('host').__hmbPromptLibrarySourcePropsApply
-     && inputs.length===names.length && names.every((name,i)=>inputs[i].value===name);
+     && !document.querySelector('[data-hmb-image-selection-pending]') && inputs.length===names.length && names.every((name,i)=>inputs[i].value===name);
   },expected);
  };
  const accepted=async(images,{deferDelivery=false}={})=>{
@@ -84,7 +86,8 @@ try{
  assert.deepEqual(await visibleLabels(),['Hero']);
  assert.equal(await heading.textContent(),'1 / 50');
  await page.evaluate(()=>window.preview(2,[{source_uid:'project:hero',label:'Hero'},{source_uid:'project:titan',label:'Titan'}]));
- assert.match(await pending.innerText(),/Titan/);
+ assert.equal(await pending.locator('[data-field="label"]').inputValue(),'Titan');
+ assert.equal(await pending.locator('[data-field="image_sub_type"]:visible').count(),1);
  assert.equal(await heading.textContent(),'2 / 50');
  await page.evaluate(()=>{window.preview(3,[]);window.preview(2,[{source_uid:'project:titan',label:'Titan'}]);});
  assert.deepEqual(await visibleLabels(),[]);
@@ -332,7 +335,7 @@ try{
  await page.waitForFunction(()=>!window.latest.images.some(image=>image.asset_source_unavailable));
  await page.evaluate(images=>window.preview(101,images.map(({asset_source_uid,label})=>({source_uid:asset_source_uid,label}))),reeds);
  assert.equal(await pending.count(),3);
- assert.deepEqual(await visibleLabels(),[],'Blank editable placeholders cannot precede the three newly selected cards.');
+ assert.deepEqual(await visibleLabels(),reeds.map(image=>image.label),'Every newly selected card must immediately paint its complete editor.');
  assert.equal(await heading.textContent(),'3 / 50');
  const queued=await page.evaluate(()=>window.latest.images.filter(item=>item.asset_managed&&item.present).length);
  assert.equal(queued,0,'Provisional selections cannot become render inputs before source acknowledgement.');
@@ -365,7 +368,7 @@ try{
   window.controller.update(window.props(unsequenced));
  },reeds);
  assert.equal(await pending.count(),3);
- assert.equal(await page.locator('.source-row.image.active [data-field="owner"]:visible').count(),0);
+ assert.equal(await page.locator('.source-row.image.active [data-field="owner"]:visible').count(),3);
  const queuedDeliveries=await page.evaluate(images=>{
   const host=document.getElementById('host'), callbacks=[];
   const schedule=host.__hmbPromptLibraryScheduleFrame;
@@ -392,6 +395,146 @@ try{
   'A queued verified source acknowledgement cannot be evicted by a conflicting retained echo.');
  assert.equal(await pending.count(),0);
  assert.equal(await page.locator('.source-row.image.active [data-field="image_sub_type"]:visible').count(),3);
+ // The reported 7 -> 8 case must expose the registered type and all editable
+ // bindings on the same click. A delayed ACK may move that UID to another
+ // index. In-flight edits belong to the UID, never the prior slot or shot.
+ const eight=Array.from({length:8},(_,i)=>row('project:sheet-'+i,'Sheet '+i));
+ const descriptors=items=>items.map(item=>({source_uid:item.asset_source_uid,label:item.label,source_kind:'project',
+  registered:true,image_main_type:item.image_main_type,image_sub_type:item.image_sub_type,source_type:'Character Appearance'}));
+ await accepted(eight.slice(0,7));
+ await page.evaluate(rows=>window.preview(104,rows),descriptors(eight));
+ const eighth=pending.locator('[data-field="color_picks"]');
+ assert.equal(await pending.locator('[data-field="label"]').inputValue(),'Sheet 7');
+ assert.equal(await pending.locator('[data-field="label"]').evaluate(field=>field.readOnly),true);
+ assert.equal(await pending.locator('[data-field="image_main_type"]').inputValue(),'Character');
+ assert.equal(await pending.locator('[data-field="image_main_type"]').isDisabled(),true);
+ assert.equal(await pending.locator('[data-field="image_sub_type"]').inputValue(),'Full Appearance');
+ assert.equal(await pending.locator('[data-field="owner"]:visible').count(),1);
+ const beforeEdit=await page.evaluate(()=>window.writes);
+ await eighth.selectOption('Blue');
+ assert.deepEqual(await page.evaluate(()=>({writes:window.writes,uids:window.latest.images.map(item=>item.asset_source_uid)})),
+  {writes:beforeEdit,uids:eight.slice(0,7).map(item=>item.asset_source_uid)});
+ const moved=[eight[7],...eight.slice(0,7)];
+ await page.evaluate(rows=>window.preview(105,rows),descriptors(moved));
+ assert.equal(await pending.locator('[data-image-drag-handle]').innerText(),'01');
+ assert.equal(await eighth.inputValue(),'Blue');
+ await accepted(moved);
+ await page.waitForFunction(()=>window.latest.images[0].color_picks[0]==='Blue');
+ assert.deepEqual(await page.evaluate(()=>window.latest.images.map(item=>item.color_picks[0])),
+  ['Blue',...Array(7).fill('Red')]);
+ await accepted(eight.slice(0,7));
+ await page.evaluate(rows=>window.preview(106,rows),descriptors(eight));
+ await eighth.selectOption('Mint');
+ await page.evaluate(rows=>{window.preview(107,rows,true);window.preview(108,rows);},descriptors(eight));
+ await accepted(eight);
+ assert.equal(await page.locator('[data-hmb-image-selection-uid="project:sheet-7"] [data-field="color_picks"]').inputValue(),'Red',
+  'A cancelled selection loses its staged edits even when the same UID is later selected again.');
+ await accepted(eight.slice(0,7));
+ await page.evaluate(rows=>window.preview(109,rows),descriptors(eight));
+ await eighth.selectOption('Mint');
+ await choose(1);
+ await accepted([eight[7]]);
+ assert.equal(await page.locator('[data-hmb-image-selection-uid="project:sheet-7"] [data-field="color_picks"]').inputValue(),'Red',
+  'An in-flight edit cannot cross shots that include the same file.');
+ await choose(0);
+ await accepted(eight);
+ assert.equal(await page.locator('[data-hmb-image-selection-uid="project:sheet-7"] [data-field="color_picks"]').inputValue(),'Red',
+  'Switching away before confirmation retires the earlier edit intent.');
+ await accepted(eight.slice(0,7));
+ await page.evaluate(rows=>window.preview(110,rows),descriptors(eight));
+ await eighth.selectOption('Blue');
+ await accepted([...eight.slice(0,7),{...eight[7],asset_source_kind:"user",asset_verified:false}]);
+ assert.equal(await page.locator('[data-hmb-image-selection-uid="project:sheet-7"] [data-field="color_picks"]').inputValue(),'Red',
+  'An edit intended for a registered project source cannot be applied to an import that reuses its UID.');
+ // A mounted publisher may miss its cancellation. Only a newer complete
+ // media acknowledgement for this Shot may displace its visible preview.
+ const trio=eight.slice(0,3), previewOrder=[trio[2],trio[1],trio[0]], confirmed=[trio[1],trio[2],trio[0]];
+ const deliverGeneration=(images,generation,mediaGeneration=generation,catalogImages=images)=>page.evaluate(({images,generation,mediaGeneration,catalogImages})=>{
+   const next=window.sourceUpdate(images);
+   next.image_asset.shot_routing={...next.image_asset.shot_catalog_routing,generation:mediaGeneration};
+   next.image_asset.shot_catalog_routing.generation=generation;
+   next.image_asset.shot_catalog.find(item=>item.shot_uuid===next.shot.shot_uuid)
+     .selected_source_uids=catalogImages.map(image=>image.asset_source_uid);
+   window.accept(next);
+ },{images,generation,mediaGeneration,catalogImages});
+ await deliverGeneration(trio,200);
+ await waitForLabels(trio.map(r=>r.label));
+ await page.evaluate(rows=>window.preview(120,rows,false,202),descriptors(previewOrder));
+ assert.deepEqual(await visibleLabels(),previewOrder.map(r=>r.label));
+ await deliverGeneration(trio,201,504);
+ await page.waitForFunction(()=>!document.getElementById('host').__hmbPromptLibrarySourcePropsApply);
+ assert.deepEqual(await visibleLabels(),previewOrder.map(r=>r.label));
+ await deliverGeneration(trio,203,505);
+ await page.waitForFunction(()=>!document.getElementById('host').__hmbPromptLibrarySourcePropsApply);
+ assert.deepEqual(await visibleLabels(),previewOrder.map(r=>r.label),'Other Shots can advance both clocks without resolving this edit.');
+ await deliverGeneration(confirmed,204,506);
+ await page.waitForFunction(want=>JSON.stringify([...document.querySelectorAll('.source-row.image:not([data-hmb-image-selection-hidden]) .source-label-input')]
+   .filter(r=>r.offsetWidth).map(r=>r.value))===JSON.stringify(want),confirmed.map(r=>r.label));
+ assert.deepEqual(await visibleLabels(),confirmed.map(r=>r.label));
+ await deliverGeneration(trio,205,507,confirmed);
+ await waitForLabels(trio.map(r=>r.label));
+ assert.deepEqual(await page.evaluate(()=>JSON.parse(document.getElementById('host').__hmbPromptLatestLocalStateValue).shot.selected_source_uids),
+   trio.map(r=>r.asset_source_uid),'An authored edit cannot restore the stale media list from the same Shot catalog row.');
+ const shotLock=await page.evaluate(async()=>{
+   const shot=latest.shot,scope={channel_uuid:shot.channel_uuid,shot_uuid:shot.shot_uuid};
+   const opts={shot_edit_locks:[scope],completed_prompt_shots:[scope.channel_uuid+'/'+scope.shot_uuid]};
+   const set=ui_options=>controller.update({...props(latest),ui_options});
+   set(opts);
+   const active=document.querySelector('.prompt-shot-content'),tab=document.querySelector('[data-prompt-shot][aria-selected=true]');
+   const other=[...document.querySelectorAll('[data-prompt-shot]')].find(el=>el!==tab);
+   const locked=[tab.querySelector('.prompt-shot-lock')?.textContent,tab.hasAttribute('data-stage-completed'),
+     active.querySelector('textarea')?.inert,other?.disabled,other?.hasAttribute('data-render-locked')];
+   set({});
+   const unlocked=[active.querySelector('textarea')?.inert,tab.hasAttribute('data-stage-completed')];
+   // The pinned editor calls update on value changes. ui_options alone is not
+   // a delivery, and an old editor echo can arrive after a render starts.
+   const packet=(revision,locks,completed)=>JSON.stringify({schema:'hmb-prompt-shot-status',
+     status:{shot_status_revision:revision,shot_edit_locks:locks,completed_prompt_shots:completed},document:latest});
+   const deliver=value=>controller.update({...props(latest),value});
+   const lock=packet(9,[scope],[]), completed=packet(10,[],[scope.channel_uuid+'/'+scope.shot_uuid]);
+   deliver(lock);set({});
+   const live=[tab.querySelector('.prompt-shot-lock')?.textContent,active.querySelector('textarea')?.inert,
+     other?.hasAttribute('data-render-locked')];
+   deliver(completed);deliver(lock);
+   live.push(tab.hasAttribute('data-stage-completed'),active.querySelector('textarea')?.inert,
+     document.querySelector('.prompt-shot-content')===active);
+   const number=tab.querySelector('.prompt-shot-number');
+   const mark=()=>[number.dataset.hmbShotCheck,getComputedStyle(number,'::before').content,
+     getComputedStyle(number,'::before').color,number.title];
+   const completeMark=mark();
+   deliver(packet(11,[scope],[scope.channel_uuid+'/'+scope.shot_uuid]));
+   const headers=document.querySelector('#host [data-hmb-native-actions]');
+   const native=['blue','green','red','orange'].map(color=>{
+     const badge=document.createElement('div');badge.className='bg-'+color+'-600';
+     badge.innerHTML='<svg></svg><span class="leading-none">Native</span>';headers.append(badge);
+     return getComputedStyle(badge).display;
+   });
+   live.push(completeMark,mark(),getComputedStyle(tab).filter,native);
+   const cold=document.createElement('div');document.body.append(cold);
+   const initial=structuredClone(latest),catalog=initial.image_asset.shot_catalog;
+   initial.image_asset.shot_catalog=catalog.filter(item=>item.shot_uuid===scope.shot_uuid);
+   const limited=JSON.parse(lock);limited.document=initial;
+   const mounted=widget.default(cold,{...props(initial),value:JSON.stringify(limited)});
+   const opened=cold.querySelector('[data-prompt-shot][aria-selected=true]');
+   live.push(opened?.getAttribute('data-prompt-shot')===scope.shot_uuid,opened?.hasAttribute('data-render-locked'),
+     cold.querySelector('.prompt-shot-content textarea')?.inert);
+   const added=catalog.find(item=>item.shot_uuid!==scope.shot_uuid),next=structuredClone(initial);
+   next.source_sync_revision++;
+   next.image_asset.shot_catalog_routing.generation++;
+   next.image_asset.shot_catalog_routing.metadata_sha256='b'.repeat(64);
+   next.image_asset.shot_catalog.push(added);
+   mounted.update(props(next));
+   await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+   const newTab=[...cold.querySelectorAll('[data-prompt-shot]')].find(el=>el.dataset.promptShot===added.shot_uuid);
+   live.push(Boolean(newTab),newTab?.disabled,newTab?.hasAttribute('data-render-locked'),
+     cold.querySelector('[aria-selected=true]')?.hasAttribute('data-render-locked'));
+   mounted.unmount?.();cold.remove();
+   return [...locked,...unlocked,...live];
+ });
+ const checked=['true','"✓"','rgb(74, 222, 128)','완료'];
+ assert.deepEqual(shotLock,['로동중... 수정불가',true,true,false,false,false,false,
+   '로동중... 수정불가',true,false,true,false,true,checked,checked,'none',['none','none','block','block'],true,true,true,
+   true,false,false,true]);
  assert.equal(external,0);assert.deepEqual(failures,[]);
- console.log('HMB Prompt Asset selection lifecycle: PASS (same UUID add/remove/reorder, UID/Main/Sub/Color and five documents repaint; unrelated renumber retains UUID/body; one retained editor; Korean draft/caret; disconnected X and fresh 0-1-3 selections with deferred, unsequenced and conflicting host echoes; external0)');
+ console.log('HMB Prompt Asset selection lifecycle: PASS (same UUID add/remove/reorder, five documents, Korean draft/caret, disconnected X and fresh 0-1-3 selections; 7-to-8 full editor, edit before ACK, reordered UID, cancellation and shot-switch isolation; external0)');
 }finally{await browser.close();await new Promise(resolve=>server.close(resolve));}

@@ -20,7 +20,7 @@ TREE = ast.parse((ROOT / 'HMBSeedanceGeneration.py').read_text(encoding='utf-8-s
 HOST = next(node for node in TREE.body if isinstance(node, ast.ClassDef) and node.name == 'HMBSeedanceGeneration')
 NAMESPACE = dict(Any=Any, Parameter=Any, re=re, ipaddress=ipaddress, urlparse=urlparse, Path=Path, deepcopy=deepcopy,
     _TASK_ID_PATTERN=re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,255}'),
-    SEEDANCE_SHOT_WIDGET_PARAMETER='shot_widget')
+    SEEDANCE_SHOT_WIDGET_PARAMETER='shot_widget', SHOT_SELECTOR_PARAMETER='shot_selector')
 for name in ('SEEDANCE_PREFLIGHT_PARAMETER', 'SEEDANCE_RECOVERY_PARAMETER',
              'BROKER_SERVER_URL_PARAMETER', 'SEEDANCE_REFRESH_COMMAND_PARAMETER'):
     NAMESPACE[name] = name
@@ -35,7 +35,7 @@ definitions = [node for node in TREE.body if isinstance(node, ast.FunctionDef)
     and node.name in {'_seedance_local_preview_value', '_seedance_generation_preview_value'}]
 methods = [node for node in HOST.body if isinstance(node, ast.FunctionDef)
     and node.name in {'_local_original_generation_preview', '_generation_preview_for_widget',
-                     '_sync_seedance_shot_widget', 'before_value_set',
+                     '_sync_seedance_shot_widget', 'before_value_set', '_shot_uuid',
                      '_restore_saved_generation_media_revision'}]
 definitions.append(ast.ClassDef(name='PreviewHost', bases=[], keywords=[], decorator_list=[], body=methods))
 exec(compile(ast.fix_missing_locations(ast.Module(body=definitions, type_ignores=[])), '<exact-original-preview-code>', 'exec'), NAMESPACE)
@@ -92,6 +92,7 @@ class Node(NAMESPACE['PreviewHost']):
         self.values = {'resolution': '480p', 'draft_action': 'Draft 480p', 'prompt': 'retained literal'}
         self.published = []
         self._hmb_shot_syncing = False
+        self._hmb_autoclaim_in_progress = False
 
     def get_parameter_by_name(self, name):
         return self.parameter if name == 'shot_widget' else None
@@ -101,6 +102,12 @@ class Node(NAMESPACE['PreviewHost']):
 
     def _shot_identity(self):
         return {'channel_uuid': 'same-channel', 'shot_uuid': 'same-shot'}
+
+    def _shot_edit_widget_fields(self, identity):
+        return {'shot_edit_locks': [], 'shot_edit_fields': []}
+
+    def _assert_shot_reassignment_editable(self, shot_uuid):
+        self.requested_shot = shot_uuid
 
     def _hmb_available_seedance_shot_catalog(self, value):
         return value

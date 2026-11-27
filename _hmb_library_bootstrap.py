@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import ast
 import asyncio
+from contextlib import contextmanager
 import hashlib
 import inspect
 import ipaddress
@@ -90,6 +91,14 @@ _WINDOWS_CLOSE_GUARD_LOCK_KEY = "_hmb_windows_transport_close_lock_v1"
 _HMB_NATIVE_EDITOR_STATE_MODULE = "_hmb_gp_production_native_editor_update_state_v1"
 _HMB_NATIVE_EDITOR_RESPONSE_LIMIT = 1024 * 1024
 _HMB_NATIVE_EDITOR_TIMEOUT_SECONDS = 20
+
+
+@contextmanager
+def _optional_host_feature(name: str):
+    try:
+        yield
+    except Exception as exc:
+        logging.getLogger(__name__).warning("[HMB_OPTIONAL_BOOTSTRAP_FAILED] %s: %s", name, type(exc).__name__)
 
 
 def _hmb_native_editor_documents_path() -> Path:
@@ -2430,17 +2439,18 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
                     gate.readiness_error = ""
                     self._hmb_deletion_readiness_error = ""
                     if registration.connection_handlers is None:
-                        from _hmb_connection_management import install_request_handlers
-                        registration.connection_handlers = install_request_handlers(engine, registration)
+                        with _optional_host_feature("connection management"):
+                            from _hmb_connection_management import install_request_handlers
+                            registration.connection_handlers = install_request_handlers(engine, registration)
                     if registration.shot_basket_handlers is None:
-                        from _hmb_shot_basket import install_request_handlers as install_shot_basket_handlers
-                        registration.shot_basket_handlers = install_shot_basket_handlers(engine, registration)
-                    _acquire_windows_transport_close_guard(registration)
-                    try:
+                        with _optional_host_feature("shot basket"):
+                            from _hmb_shot_basket import install_request_handlers as install_shot_basket_handlers
+                            registration.shot_basket_handlers = install_shot_basket_handlers(engine, registration)
+                    with _optional_host_feature("Windows transport close"):
+                        _acquire_windows_transport_close_guard(registration)
+                    with _optional_host_feature("workflow serialization"):
                         from _hmb_workflow_serialization_compat import acquire as acquire_save_identity_guard
                         acquire_save_identity_guard(registration)
-                    except ImportError:
-                        pass  # Older hosts can omit this optional SDK seam.
                     registration.start_web_worker()
         except Exception as exc:
             if not gate.ready:
@@ -2486,12 +2496,11 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
                     if registration.owners:
                         continue
                     registration.active = False
-                    _release_windows_transport_close_guard(registration)
-                    try:
+                    with _optional_host_feature("Windows transport close release"):
+                        _release_windows_transport_close_guard(registration)
+                    with _optional_host_feature("workflow serialization release"):
                         from _hmb_workflow_serialization_compat import release as release_save_identity_guard
                         release_save_identity_guard(registration)
-                    except ImportError:
-                        pass
                     registration.prompt_pending.clear()
                     registration.load_requests.clear()
                     registration.loaded_image_nodes.clear()
@@ -2500,9 +2509,11 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
                     engine = registration.engine()
                     migration = sys.modules.get("_hmb_workflow_migration")
                     if migration is not None and engine is not None:
-                        migration.cancel_queued_flow_migrations(engine)
+                        with _optional_host_feature("cancel queued workflow migrations"):
+                            migration.cancel_queued_flow_migrations(engine)
                     if registration.web_worker_module is not None and engine is not None:
-                        registration.web_worker_module.stop_engine_worker(engine)
+                        with _optional_host_feature("stop web worker"):
+                            registration.web_worker_module.stop_engine_worker(engine)
                     manager = registration.manager()
                     if manager is not None:
                         handler = registration.connection_handlers

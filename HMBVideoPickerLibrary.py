@@ -834,16 +834,6 @@ BACKGROUND_MARKERS = frozenset(
 REPEATABLE_MARKERS = set(MARKER_ORDER)
 
 
-def _screen_space_preflight(bindings: Sequence[Dict[str, Any]]) -> tuple[str, ...]:
-    active = _screen_space.active_patterns_from_bindings(
-        bindings,
-        MARKER_CATALOG,
-    )
-    if active:
-        _screen_space.preflight_pillow()
-    return active
-
-
 def _world_pattern_preflight(
     bindings: Sequence[Dict[str, Any]],
 ) -> tuple[str, ...]:
@@ -9231,6 +9221,11 @@ def _parse_state(value: Any) -> Dict[str, Any]:
     state = _default_widget_state()
     if isinstance(source, dict):
         state.update(source)
+    # Render leases and checks are process-local views. Never replay a saved
+    # or browser-supplied lease into the authoritative media catalog.
+    state.pop("shot_edit_locks", None)
+    state.pop("verified_shots", None)
+    state.pop("picker_shot_status_revision", None)
     # The bridge extracts this before normalization. Never serialize or echo a
     # one-shot action back into another host value-set callback.
     state.pop(WIDGET_STATE_EMBEDDED_COMMAND_FIELD, None)
@@ -9912,24 +9907,7 @@ def _is_remote_video_reference(value: Any) -> bool:
     return False
 
 
-def _open_video_for_inspection(path: Path):
-    """Read-only probes must allow an editor to rename or remove its MP4."""
-    if os.name != "nt":
-        return path.open("rb")
-    import _winapi
-    import msvcrt
-
-    def open_shared(name, _flags):
-        # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE. This grants
-        # sharing to other handles; our own handle has read access only.
-        handle = _winapi.CreateFile(name, _winapi.GENERIC_READ, 0x7, 0, _winapi.OPEN_EXISTING, 0, 0)
-        try:
-            return msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
-        except BaseException:
-            _winapi.CloseHandle(handle)
-            raise
-
-    return open(path, "rb", opener=open_shared)
+_open_video_for_inspection = _hmb.open_shared_media
 
 
 def _probe_readable_video_reference(value: Any) -> Optional[Path]:
@@ -10857,10 +10835,14 @@ def _propagate_parameter_update_to_connections(
     node_name = _clean(getattr(node, "name", ""))
     if not node_name:
         return
+    workflow = getattr(node, "workflow", None)
+    def lookup(name):
+        if workflow is not None:
+            return workflow.engine.node_manager.get_node_by_name_in(workflow, name)
+        return GriptapeNodes.NodeManager().get_node_by_name(name)
+    request = getattr(workflow, "handle_request", GriptapeNodes.handle_request)
     try:
-        registered_node = GriptapeNodes.NodeManager().get_node_by_name(
-            node_name
-        )
+        registered_node = lookup(node_name)
     except Exception:
         # Unit probes and constructor-time synchronization legitimately run
         # before the node belongs to a retained-mode graph.  There cannot be
@@ -10868,7 +10850,7 @@ def _propagate_parameter_update_to_connections(
         return
     if registered_node is not node:
         return
-    connections_result = GriptapeNodes.handle_request(
+    connections_result = request(
         ListConnectionsForNodeRequest(
             node_name=node_name,
             broadcast_result=False,
@@ -10895,14 +10877,12 @@ def _propagate_parameter_update_to_connections(
         if not target_node_name or not target_parameter_name:
             continue
         try:
-            target_node = GriptapeNodes.NodeManager().get_node_by_name(
-                target_node_name
-            )
+            target_node = lookup(target_node_name)
         except Exception:
             target_node = None
         if bool(getattr(target_node, "lock", False)):
             continue
-        set_result = GriptapeNodes.handle_request(
+        set_result = request(
             SetParameterValueRequest(
                 node_name=target_node_name,
                 parameter_name=target_parameter_name,
@@ -15068,6 +15048,8 @@ class HMBVideoPickerLibrary(DataNode):
                 ]
             else:
                 normalized.pop("video_imports", None)
+            if isinstance(authoritative, dict):
+                self._assert_locked_shots_unchanged(authoritative, normalized)
             self._reconcile_video_tools_state(normalized)
             active_context = getattr(self, "_hmb_active_operation", None)
             if active_context is not None and active_context.picker_shot_uuid:
@@ -16381,7 +16363,12 @@ class HMBVideoPickerLibrary(DataNode):
         }
         if normalized != self._picker_state():
             self._write_state(normalized)
-            self._sync_outputs_from_state(normalized)
+            # ImageAsset advances the shared catalog receipt for image-only
+            # edits too. Its accepted clock is durable, but those edits do not
+            # invalidate a verified video selection or publish new video data.
+            verified = getattr(self, "_hmb_verified_media", None)
+            if not (isinstance(verified, tuple) and verified[0] == self._execution_media_identity(normalized)):
+                self._sync_outputs_from_state(normalized)
         return self._hmb_shot_channel_subscription()
 
     @hmb_binding_mutation
@@ -16534,6 +16521,7 @@ class HMBVideoPickerLibrary(DataNode):
                         # Retained snapshot polling is a read. Reuse the
                         # worker's current preparation instead of invalidating
                         # its publication token on every pending read.
+                        self._hmb_shot_readiness_waiting = True
                         self._ensure_video_output_preparation()
                         raise _HMBPickerMediaPreparing("VideoPicker media is still preparing; keep the current Shot selection.")
                 else:
@@ -16565,13 +16553,88 @@ class HMBVideoPickerLibrary(DataNode):
         channel, target = _uuid_text(channel_uuid), _uuid_text(shot_uuid)
         if not channel or not target:
             raise ValueError("VideoPicker exact Shot identity is unavailable.")
-        return self._hmb_shot_routing_snapshot(
-            expected_channel_uuid=channel,
-            state_snapshot=state_snapshot,
-            probe_cache=probe_cache,
-            validate_media=validate_media,
-            _target_shot_uuid=target,
-        )
+        state = state_snapshot if isinstance(state_snapshot, dict) else self._picker_state()
+        try:
+            snapshot = self._hmb_shot_routing_snapshot(
+                expected_channel_uuid=channel, state_snapshot=state, probe_cache=probe_cache,
+                validate_media=validate_media, _target_shot_uuid=target)
+        except ValueError:
+            if validate_media:
+                _shot_routing.clear_source_shot_check(self, channel, target)
+            raise
+        if validate_media:
+            _shot_routing.record_source_shot_check(self, state, channel, target)
+        return snapshot
+
+    def _picker_source_row(self, state, channel, shot):
+        standalone = not state.get("channel_uuid")
+        if (getattr(self, "_hmb_picker_publisher_uuid", "") if standalone else state["channel_uuid"]) != channel:
+            return None
+        id_key = "workspace_uuid" if standalone else "bound_shot_uuid"
+        row = next((row for row in state.get("picker_shots", ()) if row.get(id_key) == shot), None)
+        if row is None:
+            row = state.get("picker_legacy_membership_fallbacks", {}).get(shot)
+        return row
+
+    def _assert_locked_shots_unchanged(self, previous, updated):
+        for lock in _shot_routing.shot_edit_locks(self):
+            channel, shot = lock["channel_uuid"], lock["shot_uuid"]
+            row = self._picker_source_row(previous, channel, shot)
+            if row is None:
+                continue
+            new_row = self._picker_source_row(updated, channel, shot) or {}
+            if (tuple(row.get("video_asset_uids", ())) != tuple(new_row.get("video_asset_uids", ()))
+                    or self._hmb_source_shot_key(previous, channel, shot) != self._hmb_source_shot_key(updated, channel, shot)):
+                _shot_routing.assert_shot_editable(self, channel, shot)
+
+    def _hmb_source_shot_key(self, state, channel, shot):
+        row = self._picker_source_row(state, channel, shot)
+        if row is None:
+            return None
+        order = tuple(_picker_representative_video_uids(row.get("selected_video_uids", []), row.get("preview_video_uid", "")))
+        by_uid = {v.get("video_uid") or v.get("source_uid"): v for v in state.get("videos", ())}
+        # Global projected selection flags and preview navigation belong to
+        # the displayed workspace. Only the ordered target media are inputs.
+        fields = ("video_path", "project_video_path", "video_url", "name", "media_signature", "media_kind",
+                  "generation_role", "video_role", "camera", "source_fps", "output_fps",
+                  "source_frame_count", "output_frame_count", "decoded_frame_count", "start_frame",
+                  "end_frame", "source_duration_seconds", "output_duration_seconds", "output_width",
+                  "output_height", "motion_guide_report", "frame_metadata")
+        def media_key(uid):
+            video = by_uid.get(uid, {})
+            markers = [{key: value for key, value in marker.items() if key != "video_slot"}
+                       for marker in video.get("markers", ())]
+            return tuple(video.get(k) for k in fields), markers
+        return row.get("name"), order, tuple(media_key(uid) for uid in order)
+
+    def _hmb_shot_edit_locks_changed(self):
+        if getattr(self, "workflow", None) and not getattr(self, "_hmb_node_deleted", False):
+            state = self._picker_state()
+            flags = _shot_routing.source_shot_status_fields(self, state)
+            revision = self._retain_picker_shot_status(state, flags)
+            _shot_routing.publish_source_widget_view(self, WIDGET_STATE_PARAMETER,
+                {**state, **flags, "picker_shot_status_revision": revision})
+
+    def _retain_picker_shot_status(self, state, flags):
+        """Keep read-only row status available to newly mounted widget instances."""
+        previous = getattr(self, "_hmb_picker_shot_status", {})
+        revision = previous.get("picker_shot_status_revision", 0)
+        if not previous and not any(flags.values()):
+            return revision
+        packet = {"runtime_instance_id": self._hmb_runtime_instance_id,
+                  "channel_uuid": state.get("channel_uuid") or state.get("picker_publisher_instance_uuid"),
+                  **flags, "picker_shot_status_revision": revision}
+        if previous == packet:
+            return revision
+        element = _get_parameter_obj(self, WIDGET_STATE_PARAMETER)
+        if element is not None:
+            getter = getattr(element, "authored_ui_options", None)
+            options = (getter() if callable(getter) else getattr(element, "ui_options", {})) or {}
+            revision += 1
+            packet["picker_shot_status_revision"] = revision
+            element.ui_options = {**options, "picker_shot_status": packet}
+            self._hmb_picker_shot_status = packet
+        return revision
 
     def _hmb_restore_accepted_shot_catalog(self, value: Any) -> bool:
         """Rehydrate an empty runtime cache only from the persisted acceptance receipt."""
@@ -16986,8 +17049,18 @@ class HMBVideoPickerLibrary(DataNode):
                 if propagate_connections is None
                 else bool(propagate_connections)
             )
+            wake_shot_readers = (getattr(self, "_hmb_shot_readiness_waiting", False)
+                                 and int(shot_envelope.get("generation") or 0) > 0)
             if should_propagate_connections:
-                for name, value in synchronized_outputs:
+                graph_updates = synchronized_outputs
+                if wake_shot_readers:
+                    self._hmb_shot_readiness_waiting = False
+                    if not shot_changed:
+                        # A Prompt may have deferred an image edit until its videos
+                        # were verified. Deliver readiness even if their bytes and
+                        # dependency envelope did not change.
+                        graph_updates += ((SHOT_PICKER_OUTPUT_PARAMETER, shot_envelope),)
+                for name, value in graph_updates:
                     if not still_owned():
                         return ""
                     try:
@@ -16997,6 +17070,8 @@ class HMBVideoPickerLibrary(DataNode):
                             value,
                         )
                     except Exception as error:
+                        if name == SHOT_PICKER_OUTPUT_PARAMETER and wake_shot_readers:
+                            self._hmb_shot_readiness_waiting = True
                         notification_errors.append((f"{name} graph", error))
             if not still_owned():
                 return ""
@@ -18708,6 +18783,7 @@ class HMBVideoPickerLibrary(DataNode):
                         # Keep raw Shot-row presence for legacy cursor clients;
                         # the merge itself performs complete state normalization.
                         incoming = self._merge_widget_state(authoritative, value)
+                        self._assert_locked_shots_unchanged(authoritative, incoming)
 
                     action_id = _clean(incoming.get("pending_action_id"))
                     if action_id and action_id in self._hmb_processed_action_ids:
@@ -18719,7 +18795,13 @@ class HMBVideoPickerLibrary(DataNode):
                         )
             incoming["pending_action"] = ""
             incoming["pending_action_id"] = ""
-            return _parse_state(incoming)
+            result = _parse_state(incoming)
+            view = _shot_routing.source_shot_status_fields(self, result)
+            revision = self._retain_picker_shot_status(result, view)
+            if any(view.values()):
+                result.update(view)
+                result["picker_shot_status_revision"] = revision
+            return result
         if name == WIDGET_COMMAND_PARAMETER:
             return _parse_picker_command(final_value)
         return final_value
@@ -20260,6 +20342,13 @@ class HMBVideoPickerLibrary(DataNode):
             duplicate_state["backend_ack_action_id"] = action_id
             self._write_state(duplicate_state)
             return
+        if action in PICKER_WORKSPACE_SENSITIVE_ACTIONS or action in {"delete_video_asset", "remove_video_asset", "delete_video", "video_tools"}:
+            state = self._picker_state()
+            workspace = payload.get("picker_shot_uuid") or payload.get("workspace_uuid") or state.get("active_picker_shot_uuid")
+            row = next((r for r in state.get("picker_shots", ()) if r.get("workspace_uuid") == workspace), {})
+            channel = state.get("channel_uuid") or self._hmb_picker_publisher_uuid
+            shot = row.get("bound_shot_uuid") if state.get("channel_uuid") else workspace
+            _shot_routing.assert_shot_editable(self, channel, shot)
         if action == "read_scene" and not _read_dispatched:
             self._queue_picker_read(command)
             return
@@ -26219,18 +26308,25 @@ class HMBVideoPickerLibrary(DataNode):
 
     def _execution_media_identity(self, state: Dict[str, Any]) -> str:
         """Bind verification to sources, selection, route/project and lifetime."""
+        catalog = getattr(self, "_hmb_shot_catalog_snapshot", None) or {}
         return _sha256_canonical({
             "videos": state.get("videos", []),
             "workspaces": [{key: row.get(key) for key in (
                 "workspace_uuid", "bound_shot_uuid", "number", "name",
                 "video_asset_uids", "selected_video_uids",
             )} for row in state.get("picker_shots", []) if isinstance(row, dict)],
+            "legacy_membership": state.get("picker_legacy_membership_fallbacks", {}),
             "selection": {key: state.get(key) for key in (
                 "active_picker_shot_uuid", "channel_uuid", "shot_uuid", "shot_number",
-                "shot_name", "shot_publisher_instance_uuid", "shot_selections",
-                "accepted_shot_catalog_generation", "accepted_shot_catalog_metadata_sha256",
+                "shot_name", "shot_publisher_instance_uuid",
             )},
-            "catalog": getattr(self, "_hmb_shot_catalog_snapshot", None),
+            # ImageAsset advances its catalog and Shot revision on every image
+            # edit. The accepted receipt is still checked during reconciliation.
+            # Video verification depends on membership, layout and publisher.
+            "shot_selections": [{k: v for k, v in row.items() if k != "revision"}
+                                for row in state.get("shot_selections", []) if isinstance(row, dict)],
+            "catalog": {**{k: v for k, v in catalog.items() if k not in ("generation", "metadata_sha256", "shots")},
+                        "shots": [{k: v for k, v in row.items() if k != "revision"} for row in catalog.get("shots", [])]},
             "route_status": getattr(self, "_hmb_shot_route_status", None),
             "lifecycle": getattr(self, "_hmb_lifecycle_generation", 0),
             "runtime": getattr(self, "_hmb_runtime_instance_id", ""),

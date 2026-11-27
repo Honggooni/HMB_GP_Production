@@ -24,7 +24,7 @@ def _run_regression(isolated_root):
     target = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = target
     spec.loader.exec_module(target)
-    target.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0
+    target._broker_transport.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0
     identifier = "00000000-0000-4000-8000-000000000001"
     for destination in (
         target._reference_leases._journal_path(identifier),
@@ -89,7 +89,7 @@ def _run_regression(isolated_root):
     for body in (b"not-json", b"[]", b"null"):
         for submission in (False, True):
             opener = BodyOpener(body)
-            with mock.patch.object(target, "_broker_load_token", return_value="synthetic"), mock.patch.object(target, "_broker_validated_server_url", return_value="https://broker.invalid"):
+            with mock.patch.object(target._broker_transport, "_broker_load_token", return_value="synthetic"), mock.patch.object(target._broker_transport, "_broker_validated_server_url", return_value="https://broker.invalid"):
                 bridge = target._HMBAIBrokerBridge(opener=opener)
                 try:
                     bridge._request_json("POST", "/api/v1/generate/video" if submission else "/api/v1/jobs/test/refresh", payload={}, timeout=1, submission=submission)
@@ -107,7 +107,7 @@ def _run_regression(isolated_root):
         def reject(request, timeout):
             raise target.urllib.error.HTTPError(request.full_url, status, "rejected", {}, io.BytesIO(b"{}"))
         opener = SimpleNamespace(open=mock.Mock(side_effect=reject))
-        with mock.patch.object(target, "_broker_load_token", return_value="synthetic"), mock.patch.object(target, "_broker_clear_token"), mock.patch.object(target, "_broker_validated_server_url", return_value="https://broker.invalid"):
+        with mock.patch.object(target._broker_transport, "_broker_load_token", return_value="synthetic"), mock.patch.object(target._broker_transport, "_broker_clear_token"), mock.patch.object(target._broker_transport, "_broker_validated_server_url", return_value="https://broker.invalid"):
             bridge = target._HMBAIBrokerBridge(opener=opener)
             try:
                 bridge._request_json("POST", "/api/v1/generate/video", payload={}, timeout=1, submission=True)
@@ -119,7 +119,7 @@ def _run_regression(isolated_root):
         assert opener.open.call_count == 1
 
     # A local preflight failure still occurs before any request/unknown marker.
-    with mock.patch.object(target, "_broker_load_token", return_value="synthetic"), mock.patch.object(target, "_broker_validated_server_url", return_value="https://broker.invalid"):
+    with mock.patch.object(target._broker_transport, "_broker_load_token", return_value="synthetic"), mock.patch.object(target._broker_transport, "_broker_validated_server_url", return_value="https://broker.invalid"):
         opener = SimpleNamespace(open=mock.Mock(side_effect=AssertionError("Preflight reached POST")))
         bridge = target._HMBAIBrokerBridge(opener=opener)
         try:

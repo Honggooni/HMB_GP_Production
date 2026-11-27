@@ -35,8 +35,8 @@ class HTTPFailure:
 
 def request(code, payload, *, create=False):
     bridge = target._HMBAIBrokerBridge(opener=HTTPFailure(code, payload))
-    with mock.patch.object(target, "_broker_load_token", return_value="test-token"), mock.patch.object(
-        target, "_broker_validated_server_url", return_value="https://broker.invalid"
+    with mock.patch.object(target._broker_transport, "_broker_load_token", return_value="test-token"), mock.patch.object(
+        target._broker_transport, "_broker_validated_server_url", return_value="https://broker.invalid"
     ):
         return bridge._request_json(
             "POST", "/api/v1/generate/video" if create else "/api/v1/jobs/hmb-client-key/refresh",

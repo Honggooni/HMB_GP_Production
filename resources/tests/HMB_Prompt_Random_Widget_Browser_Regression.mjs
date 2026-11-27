@@ -14,7 +14,7 @@ try{playwright=require('playwright');}catch{playwright=require(path.join(os.home
 const source=fs.readFileSync(path.join(root,'widgets/HMBPromptLibraryScopedBindingWidget.js'),'utf8');
 const out=path.join(root,'reports/release-readiness-local804-20261016/widget-random');
 fs.mkdirSync(out,{recursive:true});
-const label=process.env.HMB_RANDOM_WIDGET_LABEL||'r1';assert.match(label,/^[A-Za-z0-9-]+$/);
+const label=process.env.HMB_RANDOM_WIDGET_LABEL||('run-'+crypto.randomUUID());assert.match(label,/^[A-Za-z0-9-]+$/);
 const output=path.join(out,label+'.json');assert.equal(fs.existsSync(output),false);
 const server=http.createServer((req,res)=>{
   if(req.url==='/widget.js'){res.setHeader('Content-Type','text/javascript; charset=utf-8');res.end(source);}

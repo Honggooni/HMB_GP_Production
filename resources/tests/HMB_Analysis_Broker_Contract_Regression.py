@@ -63,7 +63,7 @@ class Contract(unittest.TestCase):
         FakeBridge.instances=[];FakeBridge.enabled=True;FakeBridge.principal='owner-a'
         FakeBridge.reply=result();FakeBridge.error=None;FakeBridge.after_post=None
         FakeBridge.get_error=None
-        self.module=patch.dict(sys.modules,{'HMBSeedanceGeneration':SimpleNamespace(_HMBAIBrokerBridge=FakeBridge)})
+        self.module=patch.dict(sys.modules,{'_hmb_broker_transport':SimpleNamespace(_HMBAIBrokerBridge=FakeBridge)})
         self.module.start();self.addCleanup(self.module.stop)
         self.blob=b'\x89PNG\r\n\x1a\n' + b'fixture'
         self.attachments=[('frame 001 / 0.000s',self.blob,'image/png')]

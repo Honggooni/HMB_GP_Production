@@ -438,8 +438,8 @@ async def run_full_lifecycle() -> tuple[list[FullLifecycleNode], FullLifecycleCo
 
 
 assert target.SHOT_ROUTING_MAX_SHOTS == NODE_COUNT
-target.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.05
-target._BROKER_SUBMISSION_LAST_STARTED = 0.0
+target._broker_transport.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.05
+target._broker_transport._BROKER_SUBMISSION_LAST_STARTED = 0.0
 asyncio.run(run_full_lifecycle())
 
 # A late project read must not let a later reserved slot overtake the actual
@@ -462,7 +462,7 @@ def delayed_project_guard(self):
     return original_project_guard(self)
 
 
-target._BROKER_SUBMISSION_LAST_STARTED = 0.0
+target._broker_transport._BROKER_SUBMISSION_LAST_STARTED = 0.0
 with mock.patch.object(target.HMBSeedanceGeneration, "_assert_operation_project_selection", delayed_project_guard):
     asyncio.run(run_full_lifecycle())
 assert project_guard_stalled

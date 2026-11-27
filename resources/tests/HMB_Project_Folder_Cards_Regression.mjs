@@ -10,7 +10,7 @@ const sources = ["HMBImageAssetLibraryWidget", "HMBSoundLibraryWidget"].map(name
     : new URL("../../"+relative,import.meta.url);
   return fs.readFileSync(filename,"utf8");
 });
-assert.equal(...sources.map(source=>source.split("// End standalone project folder dialog.")[0]));
+assert.equal(...sources.map(source=>source.split("// End standalone project folder dialog.")[0].replace(/\r\n/g,"\n")));
 const imageWidget = await import("data:text/javascript;base64," + Buffer.from(sources[0]).toString("base64"));
 const exampleSite = "site-" + "a".repeat(32);
 const settings = {site_settings:{write_site_id:exampleSite,revision:"current"}};

@@ -135,15 +135,15 @@ with tempfile.TemporaryDirectory(prefix="hmb-broker-origin-regression-") as temp
             target._broker_clear_token(server_url=DEFAULT_URL)
             marker = target._broker_legacy_migration_block_path(DEFAULT_URL)
             assert marker.is_file(), "Sign-out on a fresh profile must persist the legacy migration block"
-            with mock.patch.object(target, "_broker_dpapi", side_effect=fake_dpapi):
+            with mock.patch.object(target._broker_transport, "_broker_dpapi", side_effect=fake_dpapi):
                 target._broker_save_token("fixture-login-after-signout", server_url=DEFAULT_URL)
             assert not marker.exists()
             assert fake_bounded_token_load(target._broker_token_path(server_url=DEFAULT_URL)) == "fixture-login-after-signout"
 
         with (
-            mock.patch.object(target, "_broker_dpapi", side_effect=fake_dpapi),
+            mock.patch.object(target._broker_transport, "_broker_dpapi", side_effect=fake_dpapi),
             mock.patch.object(
-                target, "_broker_load_bearer_token_from_path_readonly",
+                target._broker_transport, "_broker_load_bearer_token_from_path_readonly",
                 side_effect=fake_bounded_token_load,
             ),
         ):
@@ -159,7 +159,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-broker-origin-regression-") as temp
             # historical LAN credential. No node hydration may change it.
             with (
                 mock.patch.object(
-                    target, "_broker_load_bearer_token_readonly",
+                    target._broker_transport, "_broker_load_bearer_token_readonly",
                     side_effect=AssertionError(
                         "The shared LAN token was read for another origin"
                     ),
@@ -253,9 +253,9 @@ class NoNetworkOpener:
 
 
 with (
-    mock.patch.object(target, "_broker_build_opener", return_value=NoNetworkOpener()),
+    mock.patch.object(target._broker_transport, "_broker_build_opener", return_value=NoNetworkOpener()),
     mock.patch.object(
-        target, "_broker_device_login",
+        target._broker_transport, "_broker_device_login",
         side_effect=AssertionError("Editing a Broker address started device login"),
     ),
     mock.patch.object(
@@ -376,7 +376,7 @@ for slash in ("", "/"):
     opener = DeviceOpener(verification_url)
     with (
         mock.patch.object(target.webbrowser, "open", return_value=True) as browser,
-        mock.patch.object(target, "_broker_save_token") as save_token,
+        mock.patch.object(target._broker_transport, "_broker_save_token") as save_token,
     ):
         assert target._broker_device_login(opener=opener, server_url=SERVER_A) == {"status": "connected"}
         browser.assert_called_once_with(verification_url, new=2, autoraise=True)
@@ -393,7 +393,7 @@ for verification_url, status, redirected_token in (
     opener = DeviceOpener(verification_url, start_status=status, redirected_token=redirected_token)
     with (
         mock.patch.object(target.webbrowser, "open", return_value=True) as browser,
-        mock.patch.object(target, "_broker_save_token") as save_token,
+        mock.patch.object(target._broker_transport, "_broker_save_token") as save_token,
     ):
         try:
             target._broker_device_login(opener=opener, server_url=SERVER_A)

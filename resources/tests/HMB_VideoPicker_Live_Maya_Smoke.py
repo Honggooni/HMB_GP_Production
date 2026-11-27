@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
-import inspect
 import json
 import re
 import shutil
@@ -21,10 +20,8 @@ if str(ROOT) not in sys.path:
 import HMBVideoPickerLibrary as picker
 
 try:
-    from griptape_nodes.exe_types.flow import ControlFlow
     from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-except Exception:
-    ControlFlow = None
+except ImportError:
     GriptapeNodes = None
 
 
@@ -89,7 +86,16 @@ def main() -> int:
     )
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
+    name = f"HMBVideoPickerLiveFlow_{time.time_ns()}"
+    if GriptapeNodes is not None:
+        from hmb_host_workflow import scoped_fixture_workflow
+        manager = GriptapeNodes.EventManager()
+        manager.initialize_queue()
+        with scoped_fixture_workflow(getattr(manager, "engine", None), name):
+            return exercise(args, name)
+    return exercise(args, name)
 
+def exercise(args: argparse.Namespace, flow_name: str) -> int:
     source_scene = args.scene.resolve()
     if not source_scene.is_file() or source_scene.suffix.lower() not in {".ma", ".mb"}:
         raise FileNotFoundError(f"A Maya .ma or .mb scene is required: {source_scene}")
@@ -117,14 +123,9 @@ def main() -> int:
         raise ValueError("--motion-guide requires --playblast.")
 
     node = picker.HMBVideoPickerLibrary(name=f"HMBVideoPickerLive_{time.time_ns()}")
-    if GriptapeNodes is not None and ControlFlow is not None:
-        GriptapeNodes.EventManager().initialize_queue()
-        flow_options = {"name": f"HMBVideoPickerLiveFlow_{time.time_ns()}"}
-        if "engine" in inspect.signature(ControlFlow).parameters:
-            flow_options["engine"] = GriptapeNodes.EventManager().engine
-        flow = ControlFlow(**flow_options)
+    if GriptapeNodes is not None:
         from _hmb_fixture_sdk import ensure_fixture_flow, register_fixture_node
-        flow = ensure_fixture_flow(GriptapeNodes, flow.name)
+        flow = ensure_fixture_flow(GriptapeNodes, flow_name)
         register_fixture_node(GriptapeNodes, flow, node)
     original_write_state = node._write_state
 

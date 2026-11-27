@@ -167,6 +167,7 @@ class PromptPageViewRollback(unittest.TestCase):
         edited["text"][next(iter(prompt.TEXT_FIELD_DEFAULTS))] = "Edited exact inactive Shot 3"
         key = prompt._prompt_document_key(ROWS[2])
         node._hmb_last_prompt_output = "Stable active Shot 1"
+        node._hmb_remember_prompt_shot_view(state, "Stable active Shot 1")
         node._hmb_last_machine_prompt_output = "Stable private active Shot 1"
         node._hmb_last_prompt_semantic_fingerprint = "stable-active-fingerprint"
         node._hmb_current_shot_images = []
@@ -194,6 +195,12 @@ class PromptPageViewRollback(unittest.TestCase):
         edges = [SimpleNamespace(source_node=node, target_node=item)
             for item in (failed, other, locked, target, target)]
         edges.append(SimpleNamespace(source_node=object(), target_node=foreign))
+        failed._hmb_invalidate_shot_stage = mock.Mock(side_effect=RuntimeError("Deleted target"))
+        target._hmb_invalidate_shot_stage = mock.Mock()
+        foreign._hmb_invalidate_shot_stage = mock.Mock()
+        edges[0].target_parameter = SimpleNamespace(name="SHOT_PROMPT_IN")
+        for edge in edges[3:]:
+            edge.target_parameter_name = "SHOT_PROMPT_IN"
         connections = SimpleNamespace(get_outgoing_connections_from_parameter=lambda *args: edges)
         flow = SimpleNamespace(get_connections=lambda: connections)
         def prepare():
@@ -208,6 +215,9 @@ class PromptPageViewRollback(unittest.TestCase):
               mock.patch.object(prompt, "_stage_and_notify_prompt_output", side_effect=AssertionError("Display republished unchanged active output"))):
             node._sync_prompt_output_from_state()
         self.assertEqual(observed, ["Ready edited inactive Shot 3"])
+        failed._hmb_invalidate_shot_stage.assert_called_once_with(CHANNEL, ROWS[2]["shot_uuid"])
+        target._hmb_invalidate_shot_stage.assert_called_once_with(CHANNEL, ROWS[2]["shot_uuid"])
+        foreign._hmb_invalidate_shot_stage.assert_not_called()
         target._hmb_hydrate_shot_prompt_from_source.assert_called_once_with(node, "PROMPT_OUT")
         for item in (failed, other, locked, foreign):
             item._hmb_hydrate_shot_prompt_from_source.assert_not_called()

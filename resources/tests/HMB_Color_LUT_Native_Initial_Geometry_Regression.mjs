@@ -112,13 +112,15 @@ import copy,json,logging,os,socket,sys,tempfile
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0,sys.argv[1])
+sys.path.insert(0,str(Path(sys.argv[1])/'resources/tests'))
+from hmb_host_workflow import scoped_fixture_workflow
 with tempfile.TemporaryDirectory(prefix='hmb-native-geometry-') as folder:
  env={key:str(Path(folder)/key) for key in ('XDG_CONFIG_HOME','XDG_DATA_HOME','XDG_CACHE_HOME','LOCALAPPDATA','APPDATA')}
  env['GTN_CONFIG_WORKSPACE_DIRECTORY']=folder
  with mock.patch.dict(os.environ,env),mock.patch.object(socket,'create_connection',side_effect=AssertionError('Network forbidden')):
   logging.disable(logging.CRITICAL)
   from griptape_nodes.retained_mode.engine import engine_scope
-  with engine_scope() as engine:
+  with engine_scope() as engine, scoped_fixture_workflow(engine,'NativeGeometryOffline'):
    from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
    from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
    from griptape_nodes.node_library.library_registry import LibraryRegistry,LibrarySchema

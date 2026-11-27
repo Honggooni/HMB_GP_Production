@@ -689,11 +689,12 @@ def save_image_atomic(image: ValidatedImage, output_path: str | Path, *,
 
 
 def _broker_auth_failure(exc: BaseException) -> bool:
-    """Recognize the real Broker authentication type without importing video at module load."""
+    """Recognize authentication failures from the shared Broker transport."""
     if getattr(exc, "status_code", None) == 401:
         return True
-    return any(cls.__name__ == "_BrokerAuthenticationError" and cls.__module__ == "HMBSeedanceGeneration"
-               for cls in type(exc).__mro__)
+    from _hmb_broker_transport import _BrokerAuthenticationError
+
+    return isinstance(exc, _BrokerAuthenticationError)
 
 
 _SAFE_IMAGE_JOB_FAILURES = {
@@ -719,7 +720,7 @@ class ImageGenerationBroker:
     """Image-specific protocol over the existing user-wide Broker auth session."""
     def __init__(self, bridge: Any = None, *, server_url: str | None = None) -> None:
         if bridge is None:
-            from HMBSeedanceGeneration import _HMBAIBrokerBridge
+            from _hmb_broker_transport import _HMBAIBrokerBridge
             bridge = _HMBAIBrokerBridge(server_url=server_url)
         self._bridge = bridge
         self.server_url = broker_config.normalize_broker_base_url(bridge.server_url)

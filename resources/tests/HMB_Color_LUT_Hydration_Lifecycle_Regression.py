@@ -54,6 +54,8 @@ class ColorLUTHydrationLifecycle(unittest.TestCase):
         self.engine.event_manager.initialize_queue()
         ensured=self.engine.handle_request(EnsureWorkflowAndFlowRequest(flow_name='ColorLUTHydration'))
         self.assertTrue(ensured.succeeded(),str(ensured.result_details))
+        if hasattr(self.engine, "bind_workflow"):
+            self.enterContext(self.engine.bind_workflow(self.engine.open_workflows.get(ensured.workflow_id)))
         self.flow=self.engine.flow_manager.get_flow_by_name(ensured.flow_name)
         for name in ('schedule_post_registration_reconcile','schedule_post_hydration_reconcile','schedule_post_deletion_reconcile','reconcile_shot_routing'):
             patch=mock.patch.object(routing,name);patch.start();self.addCleanup(patch.stop)

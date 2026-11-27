@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 from unittest import mock
+from hmb_host_workflow import run_in_fixture_workflow
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -238,11 +239,15 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
         # actual runtime prompt guard must still reject the known failed source.
         events.clear()
         generators[0].prepare_to_run_again()
-        single_dag = engine.flow_manager.global_dag_builder
+        flows = workflow.flows if workflow is not None else engine.flow_manager
+        single_dag = flows.global_dag_builder
         single_dag.clear()
         single_dag.add_node_with_dependencies(generators[0], generators[0].name)
         assert len(single_dag.node_to_reference) == 1
-        engine.flow_manager._global_single_node_resolution = True
+        if workflow is not None:
+            flows.global_single_node_resolution = True
+        else:
+            flows._global_single_node_resolution = True
         single_machine = ParallelResolutionMachine(
             flow.name, max_nodes_in_parallel=2, dag_builder=single_dag, engine=engine, **runtime_kwargs,
         )
@@ -268,8 +273,16 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
             stage="polling", task_id="offline-existing-task",
             task_identity="broker_task", status="running",
         )
+        lookup_ids = []
+        class OfflineBroker:
+            def refresh_job(self, task_id, **kwargs):
+                lookup_ids.append(task_id)
+                raise seedance_module._BrokerError("Offline fixture", status_code=503)
+        stack.enter_context(mock.patch.object(existing, "_ensure_broker_connected",
+                                              new=mock.AsyncMock(return_value=OfflineBroker())))
         await resolve_only(existing)
         assert not events, events
+        assert lookup_ids == ["offline-existing-task"]
         assert existing._generation_recovery_state() == checkpoint
         assert existing.parameter_output_values["generation_id"] == "offline-existing-task"
         assert existing.parameter_output_values["generation_status"] == "running"
@@ -322,7 +335,8 @@ def main() -> None:
                     with mock.patch.object(agent_module._hmb, "_bootstrap_agent_policy_session", no_network), \
                          mock.patch.object(agent_module._hmb, "_load_agent_rule_payload", no_network), \
                          mock.patch.object(seedance_module._HMBAIBrokerBridge, "account_snapshot", no_network):
-                        asyncio.run(exercise_host(engine, agent_module, seedance_module))
+                        asyncio.run(run_in_fixture_workflow(engine, "OfflineShotIsolation", exercise_host,
+                            agent_module, seedance_module))
             finally:
                 os.chdir(previous_cwd)
 

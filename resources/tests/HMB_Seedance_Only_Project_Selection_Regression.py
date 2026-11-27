@@ -182,8 +182,8 @@ class OnlyProjectSelectionTests(unittest.TestCase):
         stack = project.ExitStack()
         stack.enter_context(mock.patch.object(t._review, "bind_task_origin"))
         stack.enter_context(mock.patch.object(t._review, "bind_task_project"))
-        stack.enter_context(mock.patch.object(t, "_broker_log_transport_error"))
-        stack.enter_context(mock.patch.object(t, "_broker_load_token",
+        stack.enter_context(mock.patch.object(t._broker_transport, "_broker_log_transport_error"))
+        stack.enter_context(mock.patch.object(t._broker_transport, "_broker_load_token",
             side_effect=AssertionError("Offline regression attempted to load a real credential")))
         stack.enter_context(mock.patch.object(t.urllib.request.OpenerDirector, "open",
             side_effect=AssertionError("Offline regression attempted an external request")))
@@ -613,5 +613,5 @@ class OnlyProjectSelectionTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    t.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.0
+    t._broker_transport.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.0
     unittest.main()

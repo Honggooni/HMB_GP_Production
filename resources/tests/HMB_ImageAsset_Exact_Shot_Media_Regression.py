@@ -93,6 +93,22 @@ with mock.patch.object(images,"_resolved_media_value", wraps=images._resolved_me
     exact(4);exact(5)
 
 assert json.dumps(state,sort_keys=True) == baseline
+scope = {"channel_uuid":channel, "shot_uuid":shots[0]["shot_uuid"]}
+view = images._hmb_shot_routing.source_shot_status_fields
+assert scope in view(node,state)["verified_shots"]
+assert dict(scope, shot_uuid=shots[1]["shot_uuid"]) not in view(node,state)["verified_shots"]
+switched = deepcopy(state)
+switched["shot_routing"]["active_shot_uuid"] = shots[3]["shot_uuid"]
+assert scope in view(node,switched)["verified_shots"]
+switched["shot_routing"]["shots"][0]["selected_source_uids"].reverse()
+assert scope not in view(node,switched)["verified_shots"]
+with mock.patch.object(images._hmb_shot_routing,"shot_edit_locks",return_value=[scope]):
+    try:
+        node._hmb_dismiss_unavailable_prompt_images(scope["channel_uuid"],scope["shot_uuid"],{"import:c"})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Locked source allowed a Prompt selection change")
 catalog = node._hmb_shot_routing_catalog()
 assert len(catalog["shots"]) == 5
 catalog_before = deepcopy(catalog)

@@ -34,17 +34,22 @@ CAPABILITIES = {"schema": "hmb-review-portal", "version": 1, "review_portal": Tr
 def production_namespace(queued: list, opened: list, tokens: list) -> dict:
     """Compile unchanged production methods, replacing only host/HTTP boundaries."""
     tree = ast.parse((ROOT / "HMBSeedanceGeneration.py").read_text(encoding="utf-8"))
+    transport = ast.parse((ROOT / "_hmb_broker_transport.py").read_text(encoding="utf-8"))
     names = {"_BrokerError", "_BrokerUnavailableError", "_BrokerAuthenticationError", "_BrokerProtocolError",
              "_broker_validated_server_url", "_broker_read_json", "_broker_require_exact_response_url",
              "_captured_display_title_operation_id", "_captured_display_title_request",
              "_validate_captured_display_title_request", "_validate_captured_display_title_response"}
-    definitions = [item for item in tree.body if isinstance(item, (ast.FunctionDef, ast.ClassDef)) and item.name in names]
+    definitions = [item for item in (*tree.body, *transport.body) if isinstance(item, (ast.FunctionDef, ast.ClassDef)) and item.name in names]
     bridge = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == "_HMBAIBrokerBridge")
+    base = next(item for item in transport.body if isinstance(item, ast.ClassDef) and item.name == "_HMBAIBrokerBridge")
     methods = {"__init__", "server_url", "_review_task_path", "review_capabilities", "put_task_casecard", "get_task_casecard",
                "get_task_captured_title", "post_task_captured_title", "post_task_feedback", "task_feedback",
                "_load_access_token", "_clear_access_token", "_request_json",
                "_forget_reference_auth", "_reference_auth_response"}
-    definitions.append(ast.ClassDef(name="Bridge", bases=[], keywords=[], decorator_list=[], body=[
+    definitions.append(ast.ClassDef(name="BrokerTransport", bases=[], keywords=[], decorator_list=[], body=[
+        item for item in base.body if isinstance(item, ast.FunctionDef) and item.name in methods]))
+    definitions.append(ast.ClassDef(name="Bridge", bases=[ast.Name(id="BrokerTransport", ctx=ast.Load())],
+        keywords=[], decorator_list=[], body=[
         item for item in bridge.body if isinstance(item, ast.FunctionDef) and item.name in methods]))
     node = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == "HMBSeedanceGeneration")
     methods = {"_review_origin_for_task", "_review_sync_is_live", "_sync_review_task", "_schedule_review_sync",

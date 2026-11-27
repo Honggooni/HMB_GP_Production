@@ -30,6 +30,25 @@ try{
   window.ack=(index=requests.length-1)=>{const {next,resolve}=requests[index];const n=next.shot.number;if(next.action.kind==='select'){expanded=next.action.expanded;selected=n;}acks[n]=next.action.request_id;sync();resolve();command=null;};
   sync();window.originalRows=rows.map(row=>row.firstElementChild);window.originalInput=document.querySelector('#native-input');window.nativeRuns=0;document.querySelector('#native-run').addEventListener('click',()=>nativeRuns++);
  },source);
+ const renderLock=await page.evaluate(()=>{
+   const lock={channel_uuid:'latency-channel',shot_uuid:'shot-1'};
+   const update=(n,status,proof)=>handles[n-1].update({value:{...value(n),status,
+     shot_edit_locks:[lock],stage_completed:proof},onChange:onRow});
+   update(1,'running',true);update(2,'succeeded',true);
+   const busy=rows[0].querySelector('.agent-shot-row'),other=rows[1].querySelector('.agent-shot-row');
+   const observed=[busy.dataset.stageCompleted,busy.querySelector('.agent-row-status').textContent,
+     busy.querySelector('.agent-shot-run').disabled,busy.querySelector('.agent-shot-tab').disabled,
+     body.inert,other.dataset.stageCompleted,other.querySelector('.agent-shot-run').disabled];
+   update(1,'succeeded',true);
+   const badge=busy.querySelector('.agent-row-number');
+   observed.push(badge.dataset.hmbShotCheck,badge.textContent,badge.title,getComputedStyle(badge,'::before').content,
+     getComputedStyle(badge,'::before').color,getComputedStyle(busy).filter,
+     busy.querySelector('.agent-row-status').textContent,other.querySelector('.agent-row-number').dataset.hmbShotCheck);
+   sync();return [...observed,body.inert];
+ });
+ assert.deepEqual(renderLock,['false','로동중... 수정불가',true,false,true,'true',false,
+   'true','01','완료','"✓"','rgb(74, 222, 128)','none','로동중... 수정불가','true',false]);
+ receipt.cases.push('Only the generating Shot locks its native body and Run. Worker progress never receives a completed stage.');
  const immediate=await page.evaluate(()=>{
   timing={start:performance.now(),start_frame:frames};rows[3].querySelector('.agent-shot-tab').click();
   const visual_ms=performance.now()-timing.start;

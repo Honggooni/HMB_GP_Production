@@ -85,8 +85,17 @@ class PromptConnectionPreparationTests(unittest.TestCase):
                     schedule.assert_not_called()
 
     def test_image_selection_retries_when_readiness_notification_is_coalesced(self):
+        self.check_selection_retry(fixture_module.Preparing)
+
+    def test_image_change_while_unchanged_picker_is_preparing(self):
+        self.check_selection_retry(fixture_module.PickerPreparing)
+
+    def test_selection_change_while_connected_sound_is_preparing(self):
+        self.check_selection_retry(lambda _: fixture_module.prompt._hmb_sound.SoundPreparingError())
+
+    def check_selection_retry(self, error_type):
         self.fixture.pending = True
-        self.fixture.error = fixture_module.Preparing('image verification still running')
+        self.fixture.error = error_type('media verification still running')
         original = self.node._sync_prompt_output_from_state
 
         def prepare_once(**kwargs):

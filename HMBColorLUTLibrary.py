@@ -24,7 +24,7 @@ from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 
-from HMBFinishLookLibrary import (
+from _hmb_node_controls import (
     DataNode, _add_parameter, _add_widget_parameter, _hidden_transport_ui_options,
     _hide_transport_parameter, _mode, _normalize_shot_catalog,
     _normalize_shot_selection, _raw_parameter, _set_parameter_silently,
@@ -144,8 +144,34 @@ def _read_upload_receipt(identity: str) -> dict[str, Any]:
         return {}
 
 
+def _bound_upload_id(context: Mapping[str, Any]) -> str:
+    identity = ("hmb-color-lut-upload-v1", context["source_task_id"], context["sha256"],
+                context["settings_sha256"], context["shot_uuid"])
+    return hashlib.sha256("\n".join(identity).encode("utf-8")).hexdigest()
+
+
+def _confirmed_publication(context: Mapping[str, Any], receipt: Mapping[str, Any]) -> bool:
+    if not context.get("shot_uuid") or context.get("manual") or receipt.get("schema") != COLOR_LUT_UPLOAD_SCHEMA:
+        return False
+    response, metadata = receipt.get("response"), receipt.get("metadata")
+    if not isinstance(response, dict) or not isinstance(metadata, dict):
+        return False
+    fields = ("source_task_id", "project_id", "project_name", "channel_uuid", "shot_uuid", "sha256", "shot_name")
+    return (receipt.get("phase") == "complete" and receipt.get("upload_id") == context["upload_id"]
+            and (receipt.get("publication_stamp") == context.get("publication_stamp")
+                 if "publication_stamp" in receipt else context.get("legacy_publication_matches_grade") is True)
+            and metadata.get("source_revision") == context["source_revision"]
+            and metadata.get("settings_sha256") == context["settings_sha256"]
+            and metadata.get("export_sha256") == context["sha256"]
+            and response.get("schema") == "hmb-color-lut-upload-result" and response.get("version") == 1
+            and response.get("display_name") == "HMB Color LUT" and response.get("source_kind") == "HMB Color LUT"
+            and bool(response.get("derived_task_id")) and bool(response.get("asset_id"))
+            and type(response.get("created")) is bool and response.get("bytes") == context["size"]
+            and all(response.get(key) == context[key] for key in fields))
+
+
 def _upload_bridge(origin: str) -> Any:
-    # Reuse the Generator's origin-scoped credentials and redirect protections.
+    # Use the shared origin-scoped credentials and redirect protections.
     # Opening a Color LUT never starts device login or upstream generation.
     bridge = _usage_bridge(origin)
     if bridge is None:
@@ -171,7 +197,7 @@ def _upload_failure_summary(error: Exception) -> str:
     # The Broker wraps HTTP transport and missing-token failures in its own
     # exception types; inspect types/status only, never exception text.
     try:
-        from HMBSeedanceGeneration import _BrokerAuthenticationError, _BrokerUnavailableError
+        from _hmb_broker_transport import _BrokerAuthenticationError, _BrokerUnavailableError
     except ImportError:
         _BrokerAuthenticationError = _BrokerUnavailableError = ()
     code = _upload_error_status(error)
@@ -198,7 +224,7 @@ _GROUP_READ_ONLY_NOTICE = "이 그룹은 조회 전용입니다. 업로드하려
 
 def _upload_broker_offline(error: Exception) -> bool:
     try:
-        from HMBSeedanceGeneration import _BrokerUnavailableError
+        from _hmb_broker_transport import _BrokerUnavailableError
     except ImportError:
         _BrokerUnavailableError = ()
     code = _upload_error_status(error)
@@ -208,7 +234,7 @@ def _upload_broker_offline(error: Exception) -> bool:
 
 def _usage_bridge(origin: str) -> Any:
     """Use an existing login only; optional statistics never change that login."""
-    from HMBSeedanceGeneration import _HMBAIBrokerBridge, _broker_load_token
+    from _hmb_broker_transport import _HMBAIBrokerBridge, _broker_load_token
     bridge = _HMBAIBrokerBridge(server_url=origin)
     token = _broker_load_token(server_url=bridge.server_url)
     if not token:
@@ -866,6 +892,9 @@ class HMBColorLUTLibrary(DataNode):
             return {"enabled": False, "phase": "unavailable", "reason": "원본 샷 연결이 변경되었습니다."}
         if self._hmb_node_deleted:
             view["enabled"] = False
+        if (context.get("publication_stamp") != _digest([context.get("state_stamp"), _output(current["output"])])
+                or current["status"].get("phase") not in ("idle", "complete")):
+            view.pop("published_shot", None)
         if context.get("manual"):
             from _hmb_broker_config import load_broker_base_url
             try:
@@ -1563,9 +1592,27 @@ class HMBColorLUTLibrary(DataNode):
         context.update(path=str(path), size=info.st_size, mtime_ns=info.st_mtime_ns, sha256=proof["sha256"],
                        settings=proof["settings"], owner_id=owner, bridge=bridge, state_stamp=self._upload_state_stamp(state),
                        source_revision=eligibility["source_revision"], settings_sha256=_digest(proof["settings"]))
-        context["upload_id"] = hashlib.sha256("\n".join(("hmb-color-lut-upload-v1", context["source_task_id"], context["sha256"], context["settings_sha256"], context["shot_uuid"])).encode("utf-8")).hexdigest()
+        context["upload_id"] = _bound_upload_id(context)
         context["receipt_id"] = _digest([context["server_url"], context["owner_id"], context["upload_id"]])
+        context["publication_stamp"] = _digest([context["state_stamp"], _output(state["output"])])
+        context["legacy_publication_matches_grade"] = (artifact == "export" or
+            (proof["settings"] == normalize_settings(state["settings"]) and not _audio_mix_identity(state)["enabled"]))
         return context
+
+    def _published_export_context(self, state, context):
+        # A source-upload button and a graded export use different receipts.
+        # Derive the export's identity once per ready context, entirely locally.
+        if not context.get("shot_uuid") or not state.get("result", {}).get("web_export_proof"):
+            return None
+        try:
+            proof = self._export_upload_proof(state, recheck_file=False)
+        except (OSError, ValueError, RuntimeError):
+            return None
+        export = {**context, "sha256": proof["sha256"], "size": proof["size"], "legacy_publication_matches_grade": True,
+                  "settings_sha256": _digest(proof["settings"])}
+        export["upload_id"] = _bound_upload_id(export)
+        export["receipt_id"] = _digest([export["server_url"], export["owner_id"], export["upload_id"]])
+        return export
 
     def _schedule_upload_probe(self) -> None:
         with self._lock:
@@ -1589,6 +1636,7 @@ class HMBColorLUTLibrary(DataNode):
             retry = 0
             selected = None
             monitored = None
+            export_context = None
             while True:
                 with self._lock:
                     if self._hmb_node_deleted:
@@ -1598,6 +1646,7 @@ class HMBColorLUTLibrary(DataNode):
                         selected, self._web_upload_pending = self._web_upload_pending, None
                         retry = 0
                         monitored = None
+                        export_context = None
                     if selected is None:
                         self._web_upload_probe = None
                         return
@@ -1626,6 +1675,7 @@ class HMBColorLUTLibrary(DataNode):
                         raise ValueError(error)
                     if monitored is None:
                         context = self._prepare_upload_context(selected, recheck_file=False, artifact="source")
+                        export_context = self._published_export_context(selected, context)
                     else:
                         # Read reachability only while idle. Verify full ownership
                         # again on recovery and before any actual upload.
@@ -1667,6 +1717,10 @@ class HMBColorLUTLibrary(DataNode):
                     view = {"enabled": bool(context) and (not complete or bool(retry_media)), "phase": "media_retry" if retry_media else "complete" if complete else
                             "unknown" if pending else "absent" if absent else "ready" if context else "offline" if offline else "unavailable",
                             "reason": reason}
+                    if context and (not receipt or complete) and (_confirmed_publication(context, receipt) or
+                            (export_context and _confirmed_publication(export_context,
+                                _read_upload_receipt(export_context["receipt_id"])))):
+                        view["published_shot"] = {"channel_uuid": context["channel_uuid"], "shot_uuid": context["shot_uuid"]}
                     if context.get("upload_destination_issue") and not (complete or pending):
                         view.update(enabled=False, phase="unavailable", reason=context["upload_destination_issue"])
                     changed = (view != self._web_upload or bool(context) != bool(old_context.get("bridge"))
@@ -1718,7 +1772,7 @@ class HMBColorLUTLibrary(DataNode):
                 "export_bytes": context["size"], "output_format": Path(context["path"]).suffix.lower().lstrip(".")}
 
     def _upload_request(self, context: dict[str, Any], *, retrieve: bool, cancel: threading.Event) -> dict[str, Any]:
-        from HMBSeedanceGeneration import _broker_require_exact_response_url, _broker_read_json
+        from _hmb_broker_transport import _broker_require_exact_response_url, _broker_read_json
         from _hmb_broker_config import join_broker_url
         from urllib.request import Request
         from urllib.parse import quote as urlquote
@@ -1777,7 +1831,7 @@ class HMBColorLUTLibrary(DataNode):
 
     def _upload_review_media(self, context: dict[str, Any], derived_task_id: str, poster_path: Path, preview_path: Path,
                              *, cancel: threading.Event) -> dict[str, Any]:
-        from HMBSeedanceGeneration import _broker_read_json, _broker_require_exact_response_url
+        from _hmb_broker_transport import _broker_read_json, _broker_require_exact_response_url
         from _hmb_broker_config import join_broker_url
         from urllib.request import Request
 
@@ -1870,6 +1924,8 @@ class HMBColorLUTLibrary(DataNode):
         """Commit the verified original independently of optional review media."""
         record = {**durable, "schema": COLOR_LUT_UPLOAD_SCHEMA, "phase": "complete",
                   "upload_id": context["upload_id"], "response": response}
+        if context.get("publication_stamp"):
+            record["publication_stamp"] = context["publication_stamp"]
         if media_state:
             record["review_media_state"] = media_state
         try:
@@ -1897,6 +1953,8 @@ class HMBColorLUTLibrary(DataNode):
                 self._remember_selection()
             self._web_upload = {"enabled": retry_media, "phase": "media_retry" if retry_media else "complete",
                                 "reason": messages.get(media_state, "웹 업로드 완료 · HMB Color LUT")}
+            if _confirmed_publication(context, record):
+                self._web_upload["published_shot"] = {"channel_uuid": context["channel_uuid"], "shot_uuid": context["shot_uuid"]}
             self._hmb_color_lut_state["revision"] += 1
 
     def _start_web_upload(self, state: dict[str, Any], *, artifact: str = "export",

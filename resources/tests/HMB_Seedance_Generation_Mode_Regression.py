@@ -69,11 +69,11 @@ class GenerationModeTests(unittest.TestCase):
             side_effect=AssertionError("External network is forbidden")))
         self.stack.enter_context(mock.patch.object(t.urllib.request.OpenerDirector, "open",
             side_effect=AssertionError("External transport is forbidden")))
-        self.stack.enter_context(mock.patch.object(t, "_broker_load_token",
+        self.stack.enter_context(mock.patch.object(t._broker_transport, "_broker_load_token",
             side_effect=AssertionError("Real credentials are forbidden")))
         for name in ("bind_task_origin", "bind_task_project"):
             self.stack.enter_context(mock.patch.object(t._review, name))
-        self.stack.enter_context(mock.patch.object(t, "_broker_log_transport_error"))
+        self.stack.enter_context(mock.patch.object(t._broker_transport, "_broker_log_transport_error"))
 
     def tearDown(self):
         while base.TEMPORARIES:
@@ -219,6 +219,6 @@ class GenerationModeTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    t.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.0
-    transport.t.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.0
+    t._broker_transport.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.0
+    transport.t._broker_transport.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.0
     unittest.main()

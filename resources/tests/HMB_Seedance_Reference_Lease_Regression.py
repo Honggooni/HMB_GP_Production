@@ -133,6 +133,22 @@ class LeaseTests(unittest.TestCase):
         self.assertEqual(before, path.read_bytes())
         self.cloud.delete_file.assert_not_called(); self.tos.delete_object.assert_not_called()
 
+    def test_terminal_diagnostic_matches_only_a_unique_transmitted_filename_and_kind(self):
+        one = "https://storage.invalid/opaque?sig=do-not-log#hmb-v1=" + "a"*64 + ":42"
+        key = Path("artifact_url_storage") / ("b"*32) / "actual.webp"
+        for refs in ([one], [one, one]):
+            identifier = leases.acquire(origin=ORIGIN, principal=PRINCIPAL, client_request_id="hmb-offline-1",
+                cloud=[(self.cloud, key)], tos=[], wire_payload={"image_urls": refs},
+                proof_handles={one: key.as_posix()})
+            failed = {"id": "job-offline-1", "status": "failed", "provider_failure_diagnostics": {
+                "reference_failure": {"name": "actual.webp", "kind": "image", "stage": "download"}}}
+            self.assertEqual([len(x) for x in self.observe(identifier, failed)], [1, 0])
+            entry = json.loads(leases._journal_path(identifier).read_bytes())
+            if len(refs) == 1:
+                self.assertEqual(entry["failed_reference"], {"stage":"download", "field":"image_urls", "slot":1})
+            else:
+                self.assertNotIn("failed_reference", entry)
+
     def test_bad_paths_unverified_account_and_failed_journal_never_authorize_delete(self):
         for path in ("https://host.invalid/key?secret=private", "key?signature=secret", "../foreign", "C:/local"):
             with self.assertRaises(ValueError):
@@ -158,7 +174,7 @@ class LeaseTests(unittest.TestCase):
 
 def isolated_bridge_methods():
     """Actual Bridge bodies and real urllib Request; only loader/opener are fake."""
-    tree = ast.parse((ROOT / "HMBSeedanceGeneration.py").read_text("utf-8"))
+    tree = ast.parse((ROOT / "_hmb_broker_transport.py").read_text("utf-8"))
     original = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "_HMBAIBrokerBridge")
     names = {"__init__", "server_url", "_load_access_token", "_clear_access_token", "_forget_reference_auth",
         "_reference_auth_response", "_reference_principal_scope", "_reference_transfer_response", "_request_json",
@@ -365,8 +381,8 @@ def native_suite():
             super().setUp()
             opener = self.bridge._opener
             self.ns["_BrokerAuthenticationError"] = fixture.target._BrokerAuthenticationError
-            for patcher in (mock.patch.object(fixture.target, "_broker_load_token", side_effect=self.ns["_broker_load_token"]),
-                            mock.patch.object(fixture.target, "_broker_clear_token", self.clears)):
+            for patcher in (mock.patch.object(fixture.target._broker_transport, "_broker_load_token", side_effect=self.ns["_broker_load_token"]),
+                            mock.patch.object(fixture.target._broker_transport, "_broker_clear_token", self.clears)):
                 patcher.start(); self.addCleanup(patcher.stop)
             self.bridge = fixture.target._HMBAIBrokerBridge(opener=opener, server_url=ORIGIN)
             self.bridge._open_create_request = opener.open
@@ -395,7 +411,7 @@ def native_suite():
                     payload=json.loads(request.data) if request.data else None, timeout=timeout,
                     submission=path == "/api/v1/generate/video", idempotency_key=request.get_header("Idempotency-key", ""))
                 return JsonResponse(request.full_url, data)
-            loader = mock.patch.object(fixture.target, "_broker_load_token", return_value="NATIVE_OFFLINE_FIXTURE")
+            loader = mock.patch.object(fixture.target._broker_transport, "_broker_load_token", return_value="NATIVE_OFFLINE_FIXTURE")
             loader.start(); self.addCleanup(loader.stop)
             bridge = fixture.target._HMBAIBrokerBridge(opener=SimpleNamespace(open=open_request), server_url=self.backend.server_url)
             bridge._open_create_request = open_request
@@ -448,8 +464,8 @@ def native_suite():
             opener = SimpleNamespace(open=mock.Mock(return_value=JsonResponse(json.dumps({
                 "user": {"id": 3, "username": "fixture", "display_name": "different"}}).encode())))
             bridge = fixture.target._HMBAIBrokerBridge(opener=opener, server_url=ORIGIN)
-            with mock.patch.object(fixture.target, "_broker_load_token", return_value="NATIVE_OFFLINE_FIXTURE"), \
-                 mock.patch.object(fixture.target, "_broker_clear_token") as clear:
+            with mock.patch.object(fixture.target._broker_transport, "_broker_load_token", return_value="NATIVE_OFFLINE_FIXTURE"), \
+                 mock.patch.object(fixture.target._broker_transport, "_broker_clear_token") as clear:
                 self.assertTrue(bridge.account_snapshot(connect=False).connected)
                 self.assertEqual(bridge._reference_account_fingerprint, PRINCIPAL)
                 opener.open.side_effect = urllib.error.HTTPError(ORIGIN + "/api/me", 401, "offline", {}, io.BytesIO(b'{}'))

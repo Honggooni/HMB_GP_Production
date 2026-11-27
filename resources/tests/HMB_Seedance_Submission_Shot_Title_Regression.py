@@ -116,10 +116,10 @@ class SubmissionShotTitleTests(unittest.TestCase):
             side_effect=AssertionError("External network forbidden")))
         stack.enter_context(mock.patch.object(t.urllib.request.OpenerDirector, "open",
             side_effect=AssertionError("External transport forbidden")))
-        stack.enter_context(mock.patch.object(t, "_broker_load_token",
+        stack.enter_context(mock.patch.object(t._broker_transport, "_broker_load_token",
             side_effect=AssertionError("Real credentials forbidden")))
-        stack.enter_context(mock.patch.object(t, "_broker_log_transport_error"))
-        stack.enter_context(mock.patch.object(t, "AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS", 0.0))
+        stack.enter_context(mock.patch.object(t._broker_transport, "_broker_log_transport_error"))
+        stack.enter_context(mock.patch.object(t._broker_transport, "AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS", 0.0))
         for name in ("bind_task_origin", "bind_task_project"):
             stack.enter_context(mock.patch.object(t._review, name))
 
@@ -157,7 +157,7 @@ class SubmissionShotTitleTests(unittest.TestCase):
             return result["id"], deepcopy(opener.accepted[result["id"]][FIELD])
         # Disable only the production cadence in this transport identity test;
         # its independently tested pacing would serialize this synthetic barrier.
-        with mock.patch.object(t, "_broker_wait_for_http_submission", return_value=True):
+        with mock.patch.object(t._broker_transport, "_broker_wait_for_http_submission", return_value=True):
             with ThreadPoolExecutor(max_workers=5) as pool:
                 results = list(pool.map(send, payloads))
         self.assertEqual(len(opener.accepted), 5)

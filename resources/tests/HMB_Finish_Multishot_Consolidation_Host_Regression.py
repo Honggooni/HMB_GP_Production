@@ -85,7 +85,10 @@ def media_fixture(source):
     source._hmb_hydration_adopted = True
     source._hmb_shot_routing_catalog = lambda: deepcopy(catalog)
     source._hmb_shot_routing_snapshot = lambda *a, **k: deepcopy(snapshot)
-    source._hmb_shot_routing_snapshot_for = lambda **kwargs: deepcopy(snapshot)
+    def targeted_snapshot(*, include_link_notices=False, **_):
+        value = deepcopy(snapshot)
+        return (value, []) if include_link_notices else value
+    source._hmb_shot_routing_snapshot_for = targeted_snapshot
     source._hmb_project_identity = lambda: dict(PROJECT)
     source._hmb_shot_channel_subscription = lambda: dict(schema="hmb-shot-channel-subscription", version=1,
         participant_kind="image_asset", enabled=True, channel_uuid=CHANNEL,
@@ -189,6 +192,22 @@ async def exercise(engine, directory):
             assert prepared["_hmb_finish_look_out"] == finishes.compile_finish_look_prompt(authored[shot["shot_uuid"]])
             assert prepared["prompt"] == "Literal authored {{SIGN}} prompt"
         assert manager._hmb_finish_merge_snapshot()["active_subscription"]["shot_uuid"] == SHOTS[0]["shot_uuid"]
+        from _hmb_shot_routing import set_shot_edit_lock
+        verified = manager.get_parameter_value(finishes.WIDGET_PARAMETER_NAME)["verified_shots"]
+        assert {r["shot_uuid"] for r in verified} == {r["shot_uuid"] for r in SHOTS}
+        owned = {"channel_uuid": CHANNEL, "shot_uuid": SHOTS[0]["shot_uuid"]}
+        set_shot_edit_lock(generator_nodes[0], owned)
+        try:
+            pending_view = manager.get_parameter_value(finishes.WIDGET_PARAMETER_NAME)
+            assert pending_view["shot_edit_locks"] == [owned]
+            assert not manager._render_owns_shot(CHANNEL, SHOTS[1]["shot_uuid"])
+            attempted = deepcopy(manager._widget_state)
+            attempted["finish_look"]["beauty"]["enabled"] = not attempted["finish_look"]["beauty"]["enabled"]
+            manager._apply_widget_value(attempted)
+            assert manager._last_valid_state == authored[owned["shot_uuid"]]
+        finally:
+            set_shot_edit_lock(generator_nodes[0], None)
+        assert not manager.get_parameter_value(finishes.WIDGET_PARAMETER_NAME).get("shot_edit_locks")
         print("PASS every bound Generator reads its exact per-Shot Finish context while the visible editor stays on another Shot; literal prompt unchanged")
 
         # Replay a fully saved single manager; hidden per-Shot settings survive

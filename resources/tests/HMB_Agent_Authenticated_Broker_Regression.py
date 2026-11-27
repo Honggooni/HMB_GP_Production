@@ -21,7 +21,7 @@ def load_common():
 
 common = load_common()
 common_source = (ROOT / "_hmb_common.py").read_text(encoding="utf-8")
-seedance_source = (ROOT / "HMBSeedanceGeneration.py").read_text(encoding="utf-8")
+broker_source = (ROOT / "_hmb_broker_transport.py").read_text(encoding="utf-8")
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
 delivery = manifest["metadata"]["agent_policy_delivery"]
 
@@ -30,7 +30,7 @@ assert "_fetch_agent_policy" not in common_source
 assert "http.client" not in common_source
 assert "import ssl" not in common_source
 assert "_broker_load_bearer_token_readonly" in common_source
-assert "_broker_load_bearer_token_readonly" in seedance_source
+assert "_broker_load_bearer_token_readonly" in broker_source
 
 assert delivery["mode"] == "bundled_signed_dat"
 assert delivery["runtime_path"] == "resources/agent/superwings12/hmb_agent_core.dat"

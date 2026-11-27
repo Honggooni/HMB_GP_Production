@@ -71,7 +71,7 @@ class IntervalAdmission(unittest.TestCase):
         self.server.requests = []; self.server.accepted = {}; self.server.mode = "accept"
         self.server.capability_barrier = None
         t._BROKER_HTTP_SUBMISSION_STATES.clear()
-        self.interval = mock.patch.object(t, "AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS", 0.0)
+        self.interval = mock.patch.object(t._broker_transport, "AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS", 0.0)
         self.interval.start()
         self.addCleanup(self.interval.stop)
         # The only HTTP exception stays origin-exact; this fixture substitutes
@@ -102,7 +102,7 @@ class IntervalAdmission(unittest.TestCase):
             payload = self.payload(index=index)
             payload.pop("draft"); payload["quality"] = payload["resolution"] = "720p"
             return bridge.generate_seedance(payload, timeout=10)
-        with mock.patch.object(t, "AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS", 1.20):
+        with mock.patch.object(t._broker_transport, "AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS", 1.20):
             with ThreadPoolExecutor(max_workers=5) as pool: results = list(pool.map(send, range(1, 6)))
         self.assertEqual(len(results), 5); self.assertEqual(len(self.server.accepted), 5)
         times = sorted(row[0] for row in self.server.requests)
@@ -147,7 +147,7 @@ class IntervalAdmission(unittest.TestCase):
 
     def test_elapsed_retry_budget_retains_definitive_429(self):
         self.server.mode = "always_interval"
-        with mock.patch.object(t, "AI_BROKER_INTERVAL_RETRY_MAX_SECONDS", 0):
+        with mock.patch.object(t._broker_transport, "AI_BROKER_INTERVAL_RETRY_MAX_SECONDS", 0):
             with self.assertRaises(t._BrokerError) as raised: self.submit()
         self.assertEqual(raised.exception.status_code, 429)
         self.assertFalse(raised.exception.submission_outcome_unknown)
@@ -165,7 +165,7 @@ class IntervalAdmission(unittest.TestCase):
                 try: return original(request, origin, deadline=time.monotonic() + .03)
                 finally: state["lock"].release()
             return original(request, origin)
-        with mock.patch.object(t, "_broker_wait_for_http_submission", side_effect=gate):
+        with mock.patch.object(t._broker_transport, "_broker_wait_for_http_submission", side_effect=gate):
             with self.assertRaises(t._BrokerError) as raised: self.submit()
         self.assertEqual(raised.exception.status_code, 429)
         self.assertFalse(raised.exception.submission_outcome_unknown)

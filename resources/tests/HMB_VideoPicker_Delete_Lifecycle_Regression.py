@@ -142,7 +142,7 @@ with tempfile.TemporaryDirectory(
     prefix="hmb_delete_lifecycle_",
     dir=tmp_parent,
 ) as temporary:
-    source_mp4 = Path(temporary) / "import_after_delete.mp4"
+    source_mp4 = Path(temporary) / "가져온_영상.mp4"
     source_mp4.write_bytes(
         b"\x00\x00\x00\x08ftyp"
         b"\x00\x00\x00\x08mdat"

@@ -30,6 +30,33 @@ try{
  assert.equal(await page.locator('[data-finish-shot]').count(),5);assert.equal(await page.locator('.hmb-finish-look__content').count(),1);
  assert.equal(await page.locator('[data-shot-selector]').isVisible(),false);assert.equal(await page.locator('[data-finish-step]').count(),11);
  assert.equal(await page.evaluate(()=>Object.values(widget.HMB_FINISH_LOOK_STEPS).reduce((total,list)=>total+list.length,0)),62);
+ await page.evaluate(()=>{
+   const shot={channel_uuid:"channel",shot_uuid:"uuid-1"};
+   controller.update({...props,value:{...initial,shot_edit_locks:[shot]}});
+ });
+ assert.match(await page.locator('[data-finish-shot="uuid-1"]').innerText(),/로동중\.\.\. 수정불가/);
+ assert.equal(await page.locator('[data-enable="beauty"]').isDisabled(),true);
+ assert.equal(await page.locator('[data-finish-shot="uuid-2"]').isEnabled(),true);
+ assert.equal(await page.locator('[data-finish-shot-row][data-checked=true]').count(),0);
+ await page.evaluate(()=>controller.update({...props,value:{...initial,verified_shots:[{channel_uuid:"channel",shot_uuid:"uuid-1"}]}}));
+ assert.equal(await page.locator('[data-enable="beauty"]').isEnabled(),true);
+ const firstNumber=page.locator('[data-finish-shot="uuid-1"] > [data-hmb-shot-check]');
+ assert.equal(await firstNumber.textContent(),"01");
+ assert.equal(await firstNumber.evaluate(el=>getComputedStyle(el,"::before").content),'"✓"');
+ const legacy=await page.evaluate(()=>{
+   const host=document.createElement("div");document.body.append(host);
+   const scope={channel_uuid:"channel",shot_uuid:"uuid-1"};
+   const setup={...initial,shot_manager:false,shot_edit_locks:[scope],verified_shots:[scope]};
+   const c=widget.default(host,{value:setup,onChange(){}});
+   const read=()=>[host.querySelector("[data-finish-selected-number]").dataset.hmbShotCheck,
+     host.querySelector('[data-enable="beauty"]').disabled,host.querySelector('[data-finish-step="beauty.brightness"]').disabled];
+   const first=read();
+   c.update({value:{...setup,shot:{channel_uuid:"channel",...catalog.shots[1]}},onChange(){}});
+   const next=read();c.cleanup();host.remove();return [first,next];
+ });
+ assert.deepEqual(legacy,[["true",true,true],["false",false,false]]);
+ await page.evaluate(()=>controller.update(props));
+ receipt.cases.push("render lock changes only its shot; a check appears only after a verified result");
  receipt.cases.push('five named top tabs and one original Beauty body; eleven controls and sixty-two stops retained');
  await page.locator('[data-finish-shot="uuid-4"]').click();
  assert.equal(await page.locator('[data-finish-shot="uuid-4"]').getAttribute('aria-pressed'),'true');

@@ -10,7 +10,6 @@ from __future__ import annotations
 import copy
 from contextlib import nullcontext
 import hashlib
-import inspect
 import os
 from pathlib import Path
 import sys
@@ -263,21 +262,20 @@ class BlenderScissorsPickerIntegration(unittest.TestCase):
                     "shot_number": 1,
                     "shot_name": "Shot 1",
                 })
-                node = picker.HMBVideoPickerLibrary(name="BlenderScissorsPickerIntegration")
                 try:
-                    from griptape_nodes.exe_types.flow import ControlFlow
                     from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
                 except ImportError:
-                    pass
-                else:
+                    GriptapeNodes = None
+                if GriptapeNodes is not None:
+                    from hmb_host_workflow import scoped_fixture_workflow
                     manager = GriptapeNodes.EventManager()
                     manager.initialize_queue()
-                    options = {"name": f"BlenderFixtureFlow_{uuid.uuid4().hex}"}
-                    if "engine" in inspect.signature(ControlFlow).parameters:
-                        options["engine"] = manager.engine
-                    flow = ControlFlow(**options)
+                    flow_name = f"BlenderFixtureFlow_{uuid.uuid4().hex}"
+                    self.enterContext(scoped_fixture_workflow(getattr(manager, "engine", None), flow_name))
+                node = picker.HMBVideoPickerLibrary(name="BlenderScissorsPickerIntegration")
+                if GriptapeNodes is not None:
                     from _hmb_fixture_sdk import ensure_fixture_flow, register_fixture_node
-                    flow = ensure_fixture_flow(GriptapeNodes, flow.name)
+                    flow = ensure_fixture_flow(GriptapeNodes, flow_name)
                     register_fixture_node(GriptapeNodes, flow, node)
                 node._hmb_shot_catalog_snapshot = copy.deepcopy(catalog)
                 node._hmb_shot_route_status = {"ok": True, "code": "ready"}

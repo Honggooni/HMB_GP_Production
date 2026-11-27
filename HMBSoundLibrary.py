@@ -18,12 +18,13 @@ from urllib.parse import quote
 from uuid import uuid4
 import weakref
 
-from HMBFinishLookLibrary import (
+from _hmb_node_controls import (
     DataNode, _add_parameter, _add_widget_parameter, _mode,
     _parameter_object, _set_parameter_silently, _normalize_shot_catalog, set_output,
-    _normalize_shot_selection,
+    _normalize_shot_selection, add_site_folder_parameter,
 )
 from _hmb_deletion_guard import hmb_binding_mutation
+import _hmb_shot_routing as _shot_routing
 from _hmb_image_asset_sites import DEFAULT as DEFAULT_SITE_PROFILE, run_site_folder_command, get_site_settings, save_site_settings, site_profiles
 from _hmb_sound import (
     DEFAULT_PROJECTS_ROOT, SCHEMA, VERSION, SoundError, discover_sound_projects,
@@ -207,8 +208,7 @@ class HMBSoundLibrary(DataNode):
         _add_parameter(self, name=COMMAND, type="str", input_types=["str"], default_value="",
             allow_input=False, allow_output=False, allow_property=True, allowed_modes=_mode("PROPERTY"),
             ui_options={"hide": True, "hide_property": True, "hide_handles": True})
-        from HMBImageAssetLibrary import _add_project_root
-        _add_project_root(self, site_draft=True)
+        add_site_folder_parameter(self)
         _add_parameter(self, name=CATALOG_IN, type="str", input_types=["str", "dict"], default_value="",
             allow_input=True, allow_output=False, allow_property=False, allowed_modes=_mode("INPUT"),
             ui_options={"hide": True, "hide_property": True, "hide_handles": True})
@@ -414,7 +414,26 @@ class HMBSoundLibrary(DataNode):
             if self._sound_pending_scope is not None and (channel_uuid is not None or shot_uuid is not None) and (channel_uuid or "", shot_uuid or "") != self._sound_pending_scope:
                 snapshot.pop("preparing", None)
                 snapshot.pop("preparation_error", None)
+            if channel_uuid and shot_uuid:
+                if snapshot and not snapshot.get("preparing") and not snapshot.get("preparation_error"):
+                    _shot_routing.record_source_shot_check(self, self._state_sound, channel_uuid, shot_uuid)
+                else:
+                    _shot_routing.clear_source_shot_check(self, channel_uuid, shot_uuid)
             return copy.deepcopy(snapshot)
+
+    @staticmethod
+    def _hmb_source_shot_key(state, channel, shot):
+        if channel != state.get("channel_uuid") or not any(row.get("shot_uuid") == shot for row in state.get("shot_catalog", {}).get("shots", ())):
+            return None
+        tracks = [row for row in state.get("tracks", ()) if row.get("channel_uuid") == channel and row.get("shot_uuid") == shot]
+        return state.get("project_uid"), json.dumps(tracks, sort_keys=True, ensure_ascii=False)
+
+    def _hmb_shot_edit_locks_changed(self):
+        if getattr(self, "workflow", None) and not getattr(self, "_hmb_node_deleted", False):
+            with self._lock:
+                if self._ui_previous and self._ui_catalog_cache:
+                    state = {**self._ui_previous[1], **_shot_routing.source_shot_status_fields(self, self._state_sound)}
+                    _shot_routing.publish_source_widget_view(self, UI, self._sound_ui_projection(state))
 
     def _sound_ui_projection(self, state: dict[str, Any], *, full: bool = False) -> dict[str, Any]:
         """Prepare full/delta display data without changing persisted state."""
@@ -451,6 +470,7 @@ class HMBSoundLibrary(DataNode):
     def _sound_ui_state(self) -> tuple[dict[str, Any], tuple]:
         """Build the display snapshot and candidate catalog cache without writes."""
         state = copy.deepcopy({key: value for key, value in self._state_sound.items() if key != "assets"})
+        state.update(_shot_routing.source_shot_status_fields(self, self._state_sound))
         state["site_settings"] = copy.deepcopy(getattr(self, "_site_profile", {"links": [], "revision": "0", "write_site_id": "hq"}))
         state["site_settings_result"] = copy.deepcopy(getattr(self, "_site_result", {}))
         state["site_picker_draft"] = dict(getattr(self, "_site_picker", {}))
@@ -1049,6 +1069,7 @@ class HMBSoundLibrary(DataNode):
                     scope = {"channel_uuid": state["channel_uuid"], **{key: selected_shot[key] for key in ("shot_uuid", "number", "name")}}
                 else:
                     scope = copy.deepcopy(state["shot"])
+                _shot_routing.assert_shot_editable(self, scope["channel_uuid"], scope["shot_uuid"])
                 if any(t["relative_path"] == relative and t["shot_uuid"] == scope["shot_uuid"] and t["channel_uuid"] == scope["channel_uuid"] for t in state["tracks"]):
                     return
                 root = state["project_root"]
@@ -1056,6 +1077,7 @@ class HMBSoundLibrary(DataNode):
                 def work():
                     track = make_sound_track(root, relative, channel_uuid=scope["channel_uuid"], shot_uuid=scope["shot_uuid"])
                     def commit():
+                        _shot_routing.assert_shot_editable(self, scope["channel_uuid"], scope["shot_uuid"])
                         if state["project_root"] != root or epoch != self._context_epoch:
                             raise SoundError("SOUND_CONTEXT_CHANGED", "음원 준비 중 프로젝트·샷이 변경되었습니다.")
                         if scope["shot_uuid"] and not any(row["shot_uuid"] == scope["shot_uuid"] for row in state["shot_catalog"].get("shots", [])):
@@ -1073,6 +1095,7 @@ class HMBSoundLibrary(DataNode):
                 track = next((t for t in state["tracks"] if t["instance_id"] == command.get("instance_id")), None)
                 if track is None:
                     raise SoundError("SOUND_TRACK_UNAVAILABLE", "최신 사운드 목록에서 다시 선택하세요.")
+                _shot_routing.assert_shot_editable(self, track["channel_uuid"], track["shot_uuid"])
                 if action == "remove":
                     state["tracks"] = [t for t in state["tracks"] if t is not track]
                 elif action == "duplicate":

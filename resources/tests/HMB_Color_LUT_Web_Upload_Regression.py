@@ -1,7 +1,6 @@
 """Offline shot provenance, export proof and exactly-once web publication checks."""
 from __future__ import annotations
 
-import ast
 import copy
 import importlib.util
 import json
@@ -354,6 +353,37 @@ class ColorLUTUploadRegression(unittest.TestCase):
             self.node._schedule_upload_probe(); self.fixture.drain()
             self.assertEqual(self.node._web_upload["phase"], "complete")
             self.assertFalse(self.node._upload_projection()["enabled"])
+            self.assertEqual(self.node._upload_projection()["published_shot"]["shot_uuid"], self.source["shot_uuid"])
+
+    def test_check_requires_matching_web_receipt_even_after_export_or_switch(self):
+        context = self.ready(artifact="export")
+        self.assertNotIn("published_shot", self.node._upload_projection())
+        original = copy.deepcopy(self.node._hmb_color_lut_state)
+        durable = {"metadata": self.node._upload_metadata(context)}
+        self.node._complete_web_upload(context, self.acknowledgement(context), durable)
+        self.assertEqual(self.node._upload_projection()["published_shot"],
+                         {key: context[key] for key in ("channel_uuid", "shot_uuid")})
+        # An existing export receipt survives a fresh readiness probe of the original.
+        self.node._web_upload_context = {}
+        self.node._web_upload_probe_key = ""
+        self.node._schedule_upload_probe()
+        self.fixture.drain()
+        self.assertIn("published_shot", self.node._upload_projection())
+        projection_state = self.node._hmb_color_lut_state
+        for key, value in (("shot", {}), ("shot", {**original["shot"], "shot_uuid": "other-shot"}),
+                           ("status", {"phase":"error"}), ("status", {"phase":"exporting"}),
+                           ("source", {**original["source"], "result_revision": "another-result"})):
+            previous = projection_state[key]
+            projection_state[key] = value
+            try:
+                self.assertNotIn("published_shot", self.node._upload_projection())
+            finally:
+                projection_state[key] = previous
+        receipt = target._read_upload_receipt(context["receipt_id"])
+        for invalid in ({**receipt, "phase": "pending"}, {**receipt, "publication_stamp":"stale"},
+                        {**receipt, "response": {**receipt["response"], "sha256": "f" * 64}},
+                        {**receipt, "metadata": {**receipt["metadata"], "source_revision":"older"}}):
+            self.assertFalse(target._confirmed_publication(context, invalid))
 
     def test_uncertain_upload_only_retrieves_same_identity_after_reopen(self):
         self.ready()
@@ -385,30 +415,19 @@ class ColorLUTUploadRegression(unittest.TestCase):
             self.assertEqual(request.call_args.args[0]["upload_id"], context["upload_id"])
 
     def test_unknown_upload_diagnostics_do_not_expose_exception_text(self):
-        # Exercise the real Broker exception definitions without importing the
-        # provider/desktop SDK. This suite deliberately runs in offline CI.
-        source_path = ROOT / "HMBSeedanceGeneration.py"
-        tree = ast.parse(source_path.read_text(encoding="utf-8-sig"), filename=str(source_path))
-        names = {"_BrokerError", "_BrokerAuthenticationError", "_BrokerUnavailableError"}
-        definitions = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name in names]
-        self.assertEqual({node.name for node in definitions}, names)
-        broker = types.ModuleType("HMBSeedanceGeneration")
-        exec(compile(ast.Module(body=definitions, type_ignores=[]), str(source_path), "exec"), broker.__dict__)
-        _BrokerAuthenticationError = broker._BrokerAuthenticationError
-        _BrokerUnavailableError = broker._BrokerUnavailableError
+        from _hmb_broker_transport import _BrokerAuthenticationError, _BrokerUnavailableError
         cases = ((HTTPError("https://secret.invalid", 403, "secret", {}, None), "권한"),
                  (HTTPError("https://secret.invalid", 503, "secret", {}, None), "서버 오류"),
                  (HTTPError("https://secret.invalid", 404, "secret", {}, None), "HTTP 404"),
                  (URLError("secret"), "연결"), (TimeoutError("secret"), "시간"),
                  (_BrokerAuthenticationError("secret", status_code=None), "로그인이 필요"),
                  (_BrokerUnavailableError("secret", status_code=None), "연결"))
-        with mock.patch.dict(sys.modules, {"HMBSeedanceGeneration": broker}):
-            for error, expected in cases:
-                with self.subTest(error=type(error).__name__, code=getattr(error, "code", None)):
-                    reason = target._unknown_upload_reason(error)
-                    self.assertIn(expected, reason)
-                    self.assertIn("상태 확인은 파일을 전송하지 않습니다", reason)
-                    self.assertNotIn("secret", reason)
+        for error, expected in cases:
+            with self.subTest(error=type(error).__name__, code=getattr(error, "code", None)):
+                reason = target._unknown_upload_reason(error)
+                self.assertIn(expected, reason)
+                self.assertIn("상태 확인은 파일을 전송하지 않습니다", reason)
+                self.assertNotIn("secret", reason)
 
     def test_confirmed_absent_allows_only_next_click_retry_with_frozen_metadata(self):
         self.ready()
@@ -473,10 +492,10 @@ class ColorLUTUploadRegression(unittest.TestCase):
             return Response()
         self.bridge._load_access_token = lambda: "offline-token"
         self.bridge._opener = types.SimpleNamespace(open=send)
-        fake_seedance = types.ModuleType("HMBSeedanceGeneration")
-        fake_seedance._broker_require_exact_response_url = lambda *_args: None
-        fake_seedance._broker_read_json = lambda *_args, **_kwargs: self.acknowledgement(context)
-        with mock.patch.dict(sys.modules, {"HMBSeedanceGeneration": fake_seedance}):
+        fake_transport = types.ModuleType("_hmb_broker_transport")
+        fake_transport._broker_require_exact_response_url = lambda *_args: None
+        fake_transport._broker_read_json = lambda *_args, **_kwargs: self.acknowledgement(context)
+        with mock.patch.dict(sys.modules, {"_hmb_broker_transport": fake_transport}):
             self.node._upload_request(context, retrieve=False, cancel=threading.Event())
         request, body = captured["request"], captured["body"]
         self.assertEqual(request.full_url, self.bridge.server_url + "/api/v1/reviews/tasks/" + self.source["task_id"] + "/color-lut")

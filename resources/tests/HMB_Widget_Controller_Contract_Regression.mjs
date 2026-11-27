@@ -461,7 +461,7 @@ assert.doesNotMatch(assetSource, /data-asset-selected|type="checkbox" data-asset
 assert.doesNotMatch(assetSource, /candidate-list|writing-mode/, "Removed color chips and rotated slot text must not return.");
 assert.match(assetSource, /String\(index \+ 1\)\.padStart\(2, "0"\)/, "Selected cards must use horizontal 01/02 numbering.");
 assert.doesNotMatch(assetSource, /IMAGE_IMPORT_IN →[\s\S]*?Video Generation Out → Generator/, "The removed header flow-help text must not return.");
-const selectedCardMarkup = assetSource.match(/function renderSelectedCard\([\s\S]*?\n\}\n\nexport function hmbApplyImageAssetSelectionFeedback/)?.[0] || "";
+const selectedCardMarkup = assetSource.match(/function renderSelectedCard\([\s\S]*?\r?\n\}/)?.[0] || "";
 assert.match(selectedCardMarkup, /class="slot"[\s\S]*?data-remove-selected[\s\S]*?selected-thumb/, "Compact selected cards must keep number, delete, and image controls inside one draggable box.");
 assert.doesNotMatch(selectedCardMarkup, /data-move=|move_left|move_right|>‹<|>›</, "The retired one-step arrow controls must not remain in selected-card markup.");
 assert.doesNotMatch(selectedCardMarkup, /drag-handle|selected-copy/, "Compact selected cards must not render drag hints or metadata text.");
@@ -1306,9 +1306,9 @@ assert.match(
 assert.match(promptSource, /hmbCapturePromptControlFocus\(container\)[\s\S]*?hmbRestorePromptControlFocus\(container\)/, "Prompt structural refreshes must preserve non-text control focus.");
 assert.match(promptSource, /container\.__hmbPromptLibraryApplyProps/, "Prompt must reuse one mounted controller across host refreshes.");
 assert.match(promptSource, /data-image-drag-handle draggable=/);
-assert.match(promptSource, /addEventListener\("dragstart", dragStart\)/);
-assert.match(promptSource, /addEventListener\("dragover", dragOver\)/);
-assert.match(promptSource, /addEventListener\("drop", drop\)/);
+const orderEvents = promptSource.match(/for \(const type of (\[[^\]]+\])\) \{\s*container\.addEventListener\(type, orderInteraction, true\);\s*listeners\.push\(\[container,type,orderInteraction,true\]\);/);
+assert.ok(orderEvents, "Prompt must own and release delegated order listeners for dynamic image rows.");
+for (const event of ["dragstart","dragover","drop","dragend"]) assert.ok(JSON.parse(orderEvents[1]).includes(event));
 assert.match(promptSource, /export function moveImageRowWithoutReset\(state, sourceIndex, targetIndex\)/);
 assert.match(promptSource, /export function removeImageRowAndPromote\(state, sourceIndex\)/);
 assert.match(promptSource, /state\.images\.splice\(index, 1\)/);

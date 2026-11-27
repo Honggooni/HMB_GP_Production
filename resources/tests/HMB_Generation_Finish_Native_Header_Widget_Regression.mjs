@@ -84,6 +84,22 @@ try {
     }, i);
     check(initial,{type:types[i],marker:true,status:"fallback",slots:2,ready:1,writes:0,commands:0,brand:true,actions:"none"},files[i]+" fallback");
     await page.evaluate(i=>fixtures[i].state(true),i);
+    if (i < 2) {
+      const status = await page.evaluate(i => {
+        const actions = fixtures[i].actions;
+        const classes = ["bg-blue-600","bg-green-600","bg-orange-500","bg-red-600"];
+        return classes.map(color => {
+          const pill = document.createElement("div");
+          pill.className = color;
+          pill.innerHTML = "<span class='leading-none'>status</span>";
+          actions.append(pill);
+          const visible = getComputedStyle(pill).display !== "none";
+          pill.remove();
+          return visible;
+        });
+      }, i);
+      check(status,[false,false,true,true],files[i]+" managed Shot header suppresses only the two redundant readiness indicators");
+    }
     const active = await page.evaluate(i => {
       const f=fixtures[i],button=getComputedStyle(f.button),name=getComputedStyle(f.name);
       f.button.dispatchEvent(new PointerEvent("pointerdown",{bubbles:true,button:0}));

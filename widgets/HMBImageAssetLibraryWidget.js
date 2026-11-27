@@ -1345,6 +1345,20 @@ export function hmbApplyShotHierarchyEdit(state, request) {
   });
   if (prior.schema && Object.keys(binding).every(key => key === "revision" || JSON.stringify(binding[key]) === JSON.stringify(prior[key]))) return { ...state };
   const result = { ...state, shot_routing: { ...routing, generation: routing.generation + 1, shots: rows }, shot_hierarchy: binding };
+  for (const shot of routing.shots) {
+    if (!imageShotStatus(state, shot.shot_uuid)) continue;
+    const relation = hierarchy => {
+      const members = hierarchy.members || [];
+      const owner = members.find(member => member.gp_shot_uuid === shot.shot_uuid);
+      if (!owner) return null;
+      return [hierarchy.binding_id, owner.member_id, owner.parent_id, members.filter(member => member.parent_id === owner.member_id).map(member => member.member_id)];
+    };
+    const updated = bySlot.get(shot.shot_uuid);
+    if (shot.name !== updated.name || shot.name_is_custom !== updated.name_is_custom
+        || JSON.stringify(relation(prior)) !== JSON.stringify(relation(binding))) {
+      throw new Error("로동중... 수정불가");
+    }
+  }
   delete result.shot_hierarchy_request;
   hmbValidateHierarchyRouting(binding, result.shot_routing);
   return result;
@@ -2044,6 +2058,8 @@ function normalizeState(value) {
     assets,
     ...(hmbCatalogPage(input.catalog_page) ? {catalog_page:hmbCatalogPage(input.catalog_page)} : {}),
     shot_routing: shotRouting,
+    shot_edit_locks: Array.isArray(input.shot_edit_locks) ? input.shot_edit_locks : [],
+    verified_shots: Array.isArray(input.verified_shots) ? input.verified_shots : [],
     shot_hierarchy: shotHierarchy,
     shot_hierarchy_request: input.shot_hierarchy_request || {},
     image_bash_workspace: hmbNormalizeImageBashWorkspace(input.image_bash_workspace),
@@ -2413,14 +2429,19 @@ export function hmbPublishImageAssetShotRoutingCatalog(state, eventTarget = glob
   return detail;
 }
 
-// Paint the names on an already-bound Prompt while the engine validates the
-// actual image files. This event never transports paths, handles or pixels.
+// The bound Prompt can paint the same controls as its verified editor while
+// the engine checks the files. Only display metadata crosses this UI event.
 const selectionPreviewEvent = "hmb-shot-media-selection-preview-v1";
 let previewRevision = 0;
 function publishShotPreview(container, routing, shot, assets, scope = "shot", cancelled = false) {
   const Custom = container?.ownerDocument?.defaultView?.CustomEvent;
   if (!Custom || !routing?.publisher_instance_uuid || !routing.channel_uuid || !shot?.shot_uuid) return;
-  const rows = assets.map(asset => ({source_uid: asset.source_uid, label: asset.image_name}));
+  const rows = assets.map(asset => ({
+    source_uid: asset.source_uid, label: asset.image_name,
+    source_kind: asset.source_kind, registered: asset.registered,
+    image_main_type: asset.image_main_type, image_sub_type: asset.image_sub_type,
+    source_type: asset.source_type,
+  }));
   const previews = container.__hmbImageAssetShotPreviews ||= new Map();
   const key = scope === "direct" ? "direct" : shot.shot_uuid;
   const signature = JSON.stringify([routing.publisher_instance_uuid, routing.channel_uuid, rows, cancelled]);
@@ -2428,6 +2449,7 @@ function publishShotPreview(container, routing, shot, assets, scope = "shot", ca
   const detail = {schema:selectionPreviewEvent, kind:"image_asset", scope,
     publisher_instance_uuid:routing.publisher_instance_uuid, channel_uuid:routing.channel_uuid,
     shot_uuid:shot.shot_uuid, revision:++previewRevision, rows, cancelled};
+  if (scope === "shot") detail.source_generation = routing.generation;
   previews.set(key, {signature, detail});
   container.dispatchEvent(new Custom(selectionPreviewEvent, {detail, bubbles:true, composed:true}));
 }
@@ -2475,7 +2497,46 @@ export function hmbAddImageAssetShot(state) {
   return true;
 }
 
+function imageShotStatus(state, shotUuid, field = "shot_edit_locks") {
+  return !!shotUuid && !!state[field]?.some(row => row.channel_uuid === state.shot_routing?.channel_uuid && row.shot_uuid === shotUuid);
+}
+function imageShotCheckAttributes(state, shotUuid) {
+  const verified = imageShotStatus(state, shotUuid, "verified_shots");
+  return `data-hmb-shot-check="${verified}" title="${verified ? "검증 완료" : ""}"`;
+}
+function imageShotBadge(state, shotUuid) {
+  const badge = imageShotStatus(state, shotUuid) ? '<strong data-shot-lock>로동중... 수정불가</strong>' : '';
+  return '<span data-shot-badges>' + badge + '</span>';
+}
+
+function applyImageShotStatus(container, state, value) {
+  Object.assign(state, {shot_edit_locks:value.shot_edit_locks, verified_shots:value.verified_shots});
+  const panels = [...container.querySelectorAll("[data-shot-panel],[data-compact-shot-row]")];
+  const detached = container.__hmbImageAssetExpandedElement;
+  if (detached && !container.contains(detached)) panels.push(...detached.querySelectorAll("[data-shot-panel]"));
+  for (const panel of panels) {
+    const uuid = panel.dataset.shotUuid || panel.dataset.compactShotRow;
+    const locked = !!imageShotStatus(state, uuid);
+    panel.dataset.renderLocked = String(locked);
+    const number = panel.querySelector("[data-hmb-shot-check]");
+    if (number) {
+      const verified = imageShotStatus(state, uuid, "verified_shots");
+      number.dataset.hmbShotCheck = String(verified);
+      number.title = verified ? "검증 완료" : "";
+    }
+    const badge = panel.querySelector("[data-shot-badges]");
+    if (badge) badge.outerHTML = imageShotBadge(state, uuid);
+    const rename = panel.querySelector("[data-shot-rename]");
+    if (rename) rename.disabled = !hmbImageAssetShotCanRename(state, uuid);
+    const remove = panel.querySelector("[data-shot-delete]");
+    if (remove) remove.disabled = locked || state.shot_routing.shots.length <= 1
+      || !!state.shot_hierarchy?.members?.some(row => row.gp_shot_uuid === uuid);
+    for (const button of panel.querySelectorAll("[data-remove-selected],[data-dismiss-shot-link]")) button.disabled = locked;
+    for (const card of panel.querySelectorAll("[data-selected-key],[data-compact-asset-key]")) card.draggable = !locked;
+  }
+}
 export function hmbDeleteImageAssetShot(state, shotUuid) {
+  if (imageShotStatus(state, shotUuid)) return false;
   if (state.shot_hierarchy?.members?.some(row => row.gp_shot_uuid === shotUuid)) return false;
   const routing = ensureImageAssetShotRouting(state);
   const target = imageAssetUuid(shotUuid);
@@ -2534,6 +2595,7 @@ export function hmbActivateImageAssetShot(state, shotUuid) {
 }
 
 export function hmbRenameImageAssetShot(state, shotUuid, value) {
+  if (imageShotStatus(state, shotUuid)) return false;
   if (state.shot_hierarchy?.members?.some(row => row.gp_shot_uuid === shotUuid)) return false;
   const routing = ensureImageAssetShotRouting(state);
   const shot = routing?.shots.find((item) => item.shot_uuid === imageAssetUuid(shotUuid));
@@ -2546,7 +2608,7 @@ export function hmbRenameImageAssetShot(state, shotUuid, value) {
 }
 
 export function hmbImageAssetShotCanRename(state, shotUuid) {
-  return !state.shot_hierarchy?.members?.some(row => row.gp_shot_uuid === shotUuid && row.origin === "cgt");
+  return !imageShotStatus(state, shotUuid) && !state.shot_hierarchy?.members?.some(row => row.gp_shot_uuid === shotUuid && row.origin === "cgt");
 }
 
 export function hmbImageAssetManualRenameRequest(state, shotUuid, value) {
@@ -2563,6 +2625,7 @@ export function hmbImageAssetManualRenameRequest(state, shotUuid, value) {
 }
 
 export function hmbToggleImageAssetShotSource(state, shotUuid, sourceUid) {
+  if (imageShotStatus(state, shotUuid)) return false;
   const routing = ensureImageAssetShotRouting(state);
   const shot = routing?.shots.find((item) => item.shot_uuid === imageAssetUuid(shotUuid));
   const uid = clean(sourceUid);
@@ -2582,6 +2645,7 @@ export function hmbToggleImageAssetShotSource(state, shotUuid, sourceUid) {
 }
 
 export function hmbReorderImageAssetShotSource(state, shotUuid, sourceUid, targetSourceUid) {
+  if (imageShotStatus(state, shotUuid)) return false;
   const routing = ensureImageAssetShotRouting(state);
   const shot = routing?.shots.find((item) => item.shot_uuid === imageAssetUuid(shotUuid));
   const source = clean(sourceUid);
@@ -2599,6 +2663,7 @@ export function hmbReorderImageAssetShotSource(state, shotUuid, sourceUid, targe
 }
 
 export function hmbToggleImageAssetShotAsset(state, shotUuid, sourceUid, assetHint = null) {
+  if (imageShotStatus(state, shotUuid)) return false;
   const routing = ensureImageAssetShotRouting(state);
   const shot = routing?.shots.find((item) => item.shot_uuid === imageAssetUuid(shotUuid));
   const uid = clean(sourceUid);
@@ -3991,7 +4056,7 @@ function renderAssetCard(asset, selectedCount, search, state, shot = activeImage
     : imageAssetText(state, "metadata_pending");
   const selectable = hmbImageAssetCanSelect(asset);
   const selectedForShot = state.image_bash_active ? imageBashSourceUids(state).has(asset.source_uid) : imageAssetShotContains(shot, asset.source_uid);
-  const selectionBlocked = selectable && (state.image_bash_active
+  const selectionBlocked = (!state.image_bash_active && imageShotStatus(state, shot?.shot_uuid)) || selectable && (state.image_bash_active
     ? state.image_bash_workspace.instances.length >= MAX_SELECTED_IMAGES : !selectedForShot && selectedCount >= MAX_SHOT_IMAGES);
   const cardTitle = !selectable
     ? imageAssetText(state, "register_before_select")
@@ -4911,6 +4976,7 @@ export function hmbReconcileImageAssetCatalog(container, state, options = {}) {
 }
 
 export function hmbDismissShotLinkNotice(state, shotUuid, uid) {
+  if (imageShotStatus(state, shotUuid)) return false;
   const shot = state.shot_routing.shots.find(row => row.shot_uuid === shotUuid);
   if (!shot?.image_link_notices?.some(n => n.uid === uid)) return false;
   shot.image_link_notices = shot.image_link_notices.filter(n => n.uid !== uid);
@@ -4931,12 +4997,12 @@ function renderSelectedCard(asset, index, selected, state, shot = activeImageAss
   const number = String(index + 1).padStart(2, "0");
   const removeTitle = imageAssetText(state, "remove_selection");
   return `
-    <article class="selected-card ${asset.connected ? "" : "missing"}" draggable="true" aria-grabbed="false"
+    <article class="selected-card ${asset.connected ? "" : "missing"}" draggable="${!imageShotStatus(state, shot?.shot_uuid)}" aria-grabbed="false"
       data-selected-key="${escapeHtml(asset.asset_library_id)}" data-shot-source-uid="${escapeHtml(asset.source_uid)}" data-shot-uuid="${escapeHtml(shot?.shot_uuid || "")}" aria-label="${escapeHtml(`${number} ${asset.image_name}`)}" title="${escapeHtml(asset.image_name)}">
       <div class="selected-card-top">
         <strong class="slot">${number}</strong>
         <div class="selected-actions">
-          <button type="button" data-remove-selected title="${escapeHtml(removeTitle)}" aria-label="${escapeHtml(removeTitle)}">×</button>
+          <button type="button" data-remove-selected ${imageShotStatus(state, shot?.shot_uuid) ? "disabled" : ""} title="${escapeHtml(removeTitle)}" aria-label="${escapeHtml(removeTitle)}">×</button>
         </div>
       </div>
       <div class="selected-card-body">
@@ -4950,7 +5016,7 @@ function hmbApplyImageAssetCardFeedback(card, asset, selectedCount, state, shot 
   if (!card || !asset) return false;
   const selectable = hmbImageAssetCanSelect(asset);
   const selectedForShot = state.image_bash_active ? imageBashSourceUids(state).has(asset.source_uid) : imageAssetShotContains(shot, asset.source_uid);
-  const selectionBlocked = selectable && (state.image_bash_active
+  const selectionBlocked = (!state.image_bash_active && imageShotStatus(state, shot?.shot_uuid)) || selectable && (state.image_bash_active
     ? state.image_bash_workspace.instances.length >= MAX_SELECTED_IMAGES : !selectedForShot && selectedCount >= MAX_SHOT_IMAGES);
   card.classList?.toggle("selected", selectedForShot);
   card.classList?.toggle("selection-blocked", selectionBlocked);
@@ -5110,6 +5176,7 @@ export function hmbApplyImageAssetShotSourceOrderToDom(container, state, shotUui
 
 function hmbImageAssetShotForDrag(state, shotUuid) {
   const uuid = imageAssetUuid(shotUuid);
+  if (imageShotStatus(state, uuid)) return null;
   return (Array.isArray(state?.shot_routing?.shots) ? state.shot_routing.shots : [])
     .find((item) => imageAssetUuid(item?.shot_uuid) === uuid) || null;
 }
@@ -6063,6 +6130,13 @@ function renderImageBashWorkspace(state, compact = false) {
   return `<section class="${compact ? "compact-shot-row" : "shot-panel"} image-bash-panel ${active ? "active" : "collapsed"}" data-image-bash-panel="${workspace.workspace_id}" style="--shot-accent:#22d3ee;--shot-rgb:34,211,238"><header class="shot-panel-head"><button type="button" class="shot-panel-toggle" data-image-bash-tab aria-expanded="${active}"><small>IB</small><b>HMBImageBash</b><span>${escapeHtml(imageAssetText(state, "selected_images"))}</span><em>${rows.length}/${MAX_SELECTED_IMAGES}</em><i>REMOTE</i></button></header>${tray}</section>`;
 }
 
+function imageShotAddButton(state, number, compact = false) {
+  if (number !== 1) return "";
+  const title = imageAssetLanguage(state) === "ko"
+    ? "CGT 선택 · 수동 샷 추가 · 묶음 구성" : "Select CGT shots · Add manual shots · Manage groups";
+  return `<button type="button" class="shot-add" ${compact ? "data-compact-shot-add" : "data-shot-add"} title="${escapeHtml(title)}">+ Shot</button>`;
+}
+
 function renderImageAssetShotStack(state) {
   const routing = ensureImageAssetShotRouting(state);
   const active = routing.shots.find((shot) => shot.shot_uuid === routing.active_shot_uuid)
@@ -6076,17 +6150,15 @@ function renderImageAssetShotStack(state) {
     const number = String(shot.number).padStart(2, "0");
     const canRename = hmbImageAssetShotCanRename(state, shot.shot_uuid);
     const renameLabel = canRename ? imageAssetText(state, "rename_shot") : (isKorean ? "CGT 샷 이름은 원본으로 유지됩니다" : "CGT shot names are fixed");
-    const addButton = shot.number === 1
-      ? `<button type="button" class="shot-add" data-shot-add title="${escapeHtml(isKorean ? "CGT 선택 · 수동 샷 추가 · 묶음 구성" : "Select CGT shots · Add manual shots · Manage groups")}">+ Shot</button>`
-      : "";
+    const addButton = imageShotAddButton(state, shot.number);
     const tray = isActive
       ? `<div class="tray-scroll" data-shot-tray="${escapeHtml(shot.shot_uuid)}">${shotAssets.map((asset, index) => renderSelectedCard(asset, index, shotAssets, state, shot)).join("") + renderShotLinkNotices(shot, state) || `<div class="tray-empty">${escapeHtml(imageAssetText(state, "tray_empty"))}</div>`}</div>`
       : "";
-    return `<section class="shot-panel ${isActive ? "active" : "collapsed"}" data-shot-panel data-shot-number="${shot.number}" data-shot-uuid="${escapeHtml(shot.shot_uuid)}" style="--shot-accent:${palette.accent};--shot-rgb:${palette.rgb}">
+    return `<section class="shot-panel ${isActive ? "active" : "collapsed"}" data-shot-panel data-render-locked="${!!imageShotStatus(state, shot.shot_uuid)}" data-shot-number="${shot.number}" data-shot-uuid="${escapeHtml(shot.shot_uuid)}" style="--shot-accent:${palette.accent};--shot-rgb:${palette.rgb}">
       <header class="shot-panel-head">
         <button type="button" class="shot-panel-toggle" data-shot-tab="${escapeHtml(shot.shot_uuid)}" aria-expanded="${isActive ? "true" : "false"}" title="${escapeHtml(isKorean ? "클릭하여 Shot 열기" : "Open Shot")}">
-          <small>${number}</small><b data-shot-name>${escapeHtml(shot.name)}</b><span>${escapeHtml(imageAssetText(state, "selected_images"))}</span><em>${shotAssets.length}/${MAX_SHOT_IMAGES}</em><i>REMOTE</i>
-        </button><button type="button" class="shot-rename" data-shot-rename="${escapeHtml(shot.shot_uuid)}" aria-label="${escapeHtml(renameLabel)}" title="${escapeHtml(renameLabel)}" ${canRename ? "" : "disabled"}>✎</button><button type="button" class="shot-delete" data-shot-delete="${escapeHtml(shot.shot_uuid)}" aria-label="${escapeHtml(imageAssetText(state, "delete_shot"))}" title="${escapeHtml(hierarchyBound ? "묶음 구성에서 연결 해제 후 삭제하세요" : routing.shots.length <= 1 ? imageAssetText(state, "keep_one_shot") : imageAssetText(state, "delete_shot"))}" ${routing.shots.length <= 1 || hierarchyBound ? "disabled" : ""}>&times;</button>${addButton}
+          <small ${imageShotCheckAttributes(state, shot.shot_uuid)}>${number}</small><b data-shot-name>${escapeHtml(shot.name)}${imageShotBadge(state, shot.shot_uuid)}</b><span>${escapeHtml(imageAssetText(state, "selected_images"))}</span><em>${shotAssets.length}/${MAX_SHOT_IMAGES}</em><i>REMOTE</i>
+        </button><button type="button" class="shot-rename" data-shot-rename="${escapeHtml(shot.shot_uuid)}" aria-label="${escapeHtml(renameLabel)}" title="${escapeHtml(renameLabel)}" ${canRename ? "" : "disabled"}>✎</button><button type="button" class="shot-delete" data-shot-delete="${escapeHtml(shot.shot_uuid)}" aria-label="${escapeHtml(imageAssetText(state, "delete_shot"))}" title="${escapeHtml(hierarchyBound ? "묶음 구성에서 연결 해제 후 삭제하세요" : routing.shots.length <= 1 ? imageAssetText(state, "keep_one_shot") : imageAssetText(state, "delete_shot"))}" ${routing.shots.length <= 1 || hierarchyBound || imageShotStatus(state, shot.shot_uuid) ? "disabled" : ""}>&times;</button>${addButton}
       </header>${tray}
     </section>`;
   }).join("")}${renderImageBashWorkspace(state)}</section>`;
@@ -6112,7 +6184,7 @@ export function hmbImageAssetCompactShotRows(state) {
   }));
 }
 
-function renderImageAssetCompactAsset(asset, index, shotUuid, count) {
+function renderImageAssetCompactAsset(asset, index, shotUuid, count, locked = false) {
   const sourceUid = clean(asset?.source_uid);
   const key = sourceUid || clean(asset?.asset_library_id) || `compact-${index}`;
   const name = clean(asset?.image_name) || clean(asset?.asset_id) || `Image ${index + 1}`;
@@ -6121,7 +6193,7 @@ function renderImageAssetCompactAsset(asset, index, shotUuid, count) {
   const media = source
     ? `<img data-hmb-compact-src="${escapeHtml(source)}" alt="" draggable="false" loading="lazy" decoding="async" fetchpriority="low"/>`
     : `<span class="compact-shot-placeholder" aria-hidden="true">${imageAssetThumbnailFallbackMarkup(asset)}</span>`;
-  return `<article class="compact-shot-asset ${source ? "" : failed ? "thumbnail-failed" : "thumbnail-loading"}" draggable="true" aria-grabbed="false" role="listitem" aria-posinset="${index + 1}" aria-setsize="${count}" data-thumbnail-loading="${source || failed ? "false" : "true"}" data-thumbnail-failed="${failed ? "true" : "false"}" data-compact-asset-key="${escapeHtml(key)}" data-shot-source-uid="${escapeHtml(sourceUid)}" data-shot-uuid="${escapeHtml(shotUuid)}" data-compact-order="${index + 1}" title="${escapeHtml(name)}">
+  return `<article class="compact-shot-asset ${source ? "" : failed ? "thumbnail-failed" : "thumbnail-loading"}" draggable="${!locked}" aria-grabbed="false" role="listitem" aria-posinset="${index + 1}" aria-setsize="${count}" data-thumbnail-loading="${source || failed ? "false" : "true"}" data-thumbnail-failed="${failed ? "true" : "false"}" data-compact-asset-key="${escapeHtml(key)}" data-shot-source-uid="${escapeHtml(sourceUid)}" data-shot-uuid="${escapeHtml(shotUuid)}" data-compact-order="${index + 1}" title="${escapeHtml(name)}">
       <div class="compact-shot-thumb">${media}<small>${String(index + 1).padStart(2, "0")}</small></div>
       <b>${escapeHtml(name)}</b>
     </article>`;
@@ -6129,9 +6201,9 @@ function renderImageAssetCompactAsset(asset, index, shotUuid, count) {
 
 function renderImageAssetCompactShotRow(state, row) {
   const assets = Array.isArray(row?.assets) ? row.assets.slice(0, MAX_SHOT_IMAGES) : [];
-  return `<article class="compact-shot-row ${row.active ? "active" : ""}" data-compact-shot-row="${escapeHtml(row.shot_uuid)}" data-shot-number="${row.number}" style="--shot-accent:${row.palette.accent};--shot-rgb:${row.palette.rgb}">
-      <header class="compact-shot-head"><small>${String(row.number).padStart(2, "0")}</small><b data-compact-shot-name>${escapeHtml(row.name)}</b><span>${escapeHtml(imageAssetText(state, "selected_images"))}</span><em data-compact-shot-count>${assets.length}/${MAX_SHOT_IMAGES}</em><i>REMOTE</i></header>
-      <div class="compact-shot-assets ${assets.length ? "" : "empty"}" role="list" data-compact-shot-assets="${escapeHtml(row.shot_uuid)}">${assets.map((asset, index) => renderImageAssetCompactAsset(asset, index, row.shot_uuid, assets.length)).join("") + renderShotLinkNotices(row, state) || `<span class="compact-shot-empty">${escapeHtml(imageAssetText(state, "tray_empty"))}</span>`}</div>
+  return `<article class="compact-shot-row ${row.active ? "active" : ""}" data-render-locked="${!!imageShotStatus(state, row.shot_uuid)}" data-compact-shot-row="${escapeHtml(row.shot_uuid)}" data-shot-number="${row.number}" style="--shot-accent:${row.palette.accent};--shot-rgb:${row.palette.rgb}">
+      <header class="compact-shot-head"><small ${imageShotCheckAttributes(state, row.shot_uuid)}>${String(row.number).padStart(2, "0")}</small><button type="button" data-compact-shot-tab="${escapeHtml(row.shot_uuid)}" aria-pressed="${row.active}"><b data-compact-shot-name>${escapeHtml(row.name)}${imageShotBadge(state, row.shot_uuid)}</b></button><span>${escapeHtml(imageAssetText(state, "selected_images"))}</span><em data-compact-shot-count>${assets.length}/${MAX_SHOT_IMAGES}</em><i>REMOTE</i>${imageShotAddButton(state, row.number, true)}</header>
+      <div class="compact-shot-assets ${assets.length ? "" : "empty"}" role="list" data-compact-shot-assets="${escapeHtml(row.shot_uuid)}">${assets.map((asset, index) => renderImageAssetCompactAsset(asset, index, row.shot_uuid, assets.length, imageShotStatus(state, row.shot_uuid))).join("") + renderShotLinkNotices(row, state) || `<span class="compact-shot-empty">${escapeHtml(imageAssetText(state, "tray_empty"))}</span>`}</div>
     </article>`;
 }
 
@@ -6471,6 +6543,13 @@ function render(
       .tray{margin:0 8px 8px;border:1px solid rgba(244,114,182,.34);border-radius:10px;background:linear-gradient(180deg,rgba(30,14,30,.9),rgba(8,11,19,.96));overflow:hidden}.tray-head{height:34px;display:flex;align-items:center;gap:9px;padding:0 10px;border-bottom:1px solid rgba(244,114,182,.2)}.tray-head b{font-size:9px;letter-spacing:.07em;color:#f9c2df}.tray-head span{color:#8ea3b8;font-size:7px}.tray-head em{margin-left:auto;color:var(--asset-selection);font-size:7px;font-style:normal}.tray-scroll{height:132px;display:flex;align-items:stretch;gap:8px;overflow-x:auto;overflow-y:hidden;padding:7px}.selected-card{position:relative;flex:0 0 244.5px;display:grid;grid-template-rows:25px minmax(0,1fr);padding:6px;border:1px solid rgba(244,114,182,.25);border-radius:8px;background:linear-gradient(145deg,rgba(61,23,49,.6),rgba(12,17,28,.94));cursor:grab}.selected-card:active{cursor:grabbing}.selected-card.dragging{opacity:.35}.selected-card.drop-target{border-color:var(--accent);box-shadow:0 0 0 1px rgba(34,211,238,.28)}.selected-card.missing{border-color:rgba(248,113,113,.5)}.selected-card-top{display:flex;align-items:center;gap:7px}.slot{min-width:30px;height:21px;display:grid;place-items:center;border:1px solid rgba(96,165,250,.68);border-radius:5px;background:rgba(37,99,235,.24);color:#93c5fd;font-size:10px;font-weight:950}.selected-actions{display:flex;gap:3px;margin-left:auto}.selected-actions button{width:23px;height:21px;border:1px solid rgba(148,163,184,.2);border-radius:5px;background:#0a101b;color:#b9cad9;cursor:pointer}.selected-actions button:hover{border-color:var(--accent);color:#fff}.selected-card-body{display:grid;grid-template-columns:102px minmax(0,1fr);align-items:center;gap:9px}.selected-thumb{position:relative;width:102px;height:82px;display:grid;place-items:center;overflow:hidden;border:1px solid rgba(244,114,182,.25);border-radius:6px;background:#060912;color:#725a70;font-size:7px;font-weight:900}.selected-thumb img{width:100%;height:100%;object-fit:cover}.selected-thumb span{display:none}.selected-thumb.fallback span{display:block}.selected-copy{display:flex;flex-direction:column;gap:4px}.selected-copy b,.selected-copy span,.selected-copy small{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.selected-copy b{font-size:10px}.selected-copy span{color:#a7b7c8;font-size:8px}.selected-copy em{color:#f3a8ce;font-size:7px;font-style:normal;font-weight:900}.selected-copy small{color:#667e94;font-size:7px}.tray-empty{min-width:100%;display:grid;place-items:center;border:1px dashed rgba(244,114,182,.18);border-radius:7px;color:#765d70;font-size:9px}
       .selected-card{flex-basis:120px;width:120px;height:118px;grid-template-rows:23px minmax(0,1fr)}.selected-card-top{gap:4px}.slot{flex:0 0 28px;width:28px;min-width:28px;height:21px;font-size:9px;font-variant-numeric:tabular-nums}.selected-actions{display:flex;gap:2px;margin-left:auto}.selected-actions button{width:22px;height:21px;padding:0;display:grid;place-items:center}.selected-card-body{display:grid;grid-template-columns:1fr;place-items:center;gap:0;min-height:0}.selected-thumb{width:106px;height:81px}.selected-copy{display:none}
       .shot-routing{margin:0 8px 8px;border:1px solid rgba(34,211,238,.3);border-radius:9px;background:linear-gradient(180deg,rgba(7,28,40,.94),rgba(6,10,18,.98));overflow:hidden}.shot-routing-head{height:38px;display:flex;align-items:center;gap:7px;padding:0 8px}.shot-toggle,.shot-add,.shot-tab,.shot-source button{border:1px solid rgba(34,211,238,.24);border-radius:6px;background:#08131e;color:#a9c6d8;cursor:pointer}.shot-toggle{width:25px;height:25px;padding:0;color:var(--accent)}.shot-routing-head>b{font-size:8px;letter-spacing:.08em;color:var(--accent);white-space:nowrap}.shot-channel{max-width:58px;color:#5f7f94;font-size:7px;font-family:ui-monospace,monospace}.shot-tabs{display:flex;flex:1;align-items:center;gap:5px;min-width:0;overflow-x:auto;padding:2px}.shot-tab{height:27px;display:flex;align-items:center;gap:5px;padding:0 7px;white-space:nowrap}.shot-tab small{color:#5e7e93;font-size:6px}.shot-tab b{max-width:92px;overflow:hidden;text-overflow:ellipsis;font-size:8px}.shot-tab em{color:#6f90a5;font-size:7px;font-style:normal}.shot-tab.active{border-color:var(--accent);background:rgba(8,145,178,.18);color:#e6fbff}.shot-add{height:27px;padding:0 9px;color:#bceef5;font-size:8px;font-weight:900;white-space:nowrap}.shot-add:disabled,.shot-source button:disabled{opacity:.28;cursor:default}.shot-routing-body{min-height:78px;display:grid;grid-template-columns:190px minmax(0,1fr);gap:8px;padding:7px 9px 9px;border-top:1px solid rgba(34,211,238,.14)}.shot-routing-summary{display:flex;flex-direction:column;gap:3px;padding:7px;border:1px solid rgba(34,211,238,.16);border-radius:7px;background:rgba(4,14,24,.65)}.shot-routing-summary b{color:#d9f8ff;font-size:10px}.shot-routing-summary span{color:var(--accent);font-size:8px;font-weight:900}.shot-routing-summary small{color:#708ba0;font-size:7px;line-height:1.35}.shot-sources{display:flex;align-content:flex-start;gap:5px;overflow-x:auto;padding:3px}.shot-source{height:30px;display:flex;flex:0 0 auto;align-items:stretch}.shot-source>button:first-child{max-width:145px;display:flex;align-items:center;gap:5px;padding:0 7px}.shot-source i{color:#5d7d91;font-size:8px;font-style:normal}.shot-source span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:8px}.shot-source.selected>button:first-child{border-color:rgba(244,114,182,.62);background:rgba(131,24,67,.22);color:#ffe0f1}.shot-source.selected i{color:#f9a8d4}.shot-source .shot-source-move{width:22px;margin-left:2px;padding:0;color:#8eb6ca}.shot-routing-empty{align-self:center;color:#607b90;font-size:8px}
+      [data-render-locked="true"] :is(.tray-scroll,.compact-shot-assets),[data-render-locked="true"] .shot-panel-toggle>:not([data-hmb-shot-check]),[data-render-locked="true"] .compact-shot-head>:not(.shot-add,[data-hmb-shot-check]){filter:saturate(.30)}
+      .hmb-image-assets .shot-panel-toggle:has(>[data-hmb-shot-check="true"]){height:34px;grid-template-columns:38px minmax(0,1fr) minmax(0,1fr) auto auto}
+      .hmb-image-assets .compact-shot-head:has(>[data-hmb-shot-check="true"]){min-height:32px;grid-template-columns:38px minmax(90px,auto) minmax(120px,1fr) auto auto}
+      .hmb-image-assets .compact-shot-head:has([data-compact-shot-add]){grid-template-columns:38px minmax(90px,auto) minmax(50px,1fr) auto auto auto}
+      .hmb-image-assets [data-compact-shot-tab]{min-width:0;max-width:100%;text-align:left;overflow:hidden;text-overflow:ellipsis;background:none;border:0;padding:0;color:inherit;cursor:pointer}
+      [data-shot-lock]{margin-inline-start:4px;color:#e2e8f0!important;font-size:10px;white-space:nowrap}
+      .hmb-image-assets [data-hmb-native-actions] div:is(.bg-green-600,.bg-blue-600):has(>span.leading-none){display:none!important}
       .shot-stack{max-height:360px;margin:0 8px 8px;display:flex;flex-direction:column;gap:5px;overflow:auto;scrollbar-gutter:stable}.shot-panel{flex:0 0 auto;overflow:hidden;border:1px solid rgba(var(--shot-rgb),.34);border-radius:10px;background:linear-gradient(180deg,rgba(var(--shot-rgb),.10),rgba(8,11,19,.96));box-shadow:0 0 16px rgba(var(--shot-rgb),.07)}.shot-panel-head{height:38px;display:flex;align-items:center;gap:6px;padding:4px 7px;min-width:0;border-bottom:1px solid transparent}.shot-panel.active .shot-panel-head{border-bottom-color:rgba(var(--shot-rgb),.20)}.shot-panel-toggle{height:29px;min-width:0;flex:1;display:grid;grid-template-columns:30px minmax(0,1fr) minmax(0,1fr) auto auto;align-items:center;gap:7px;padding:0 8px;border:1px solid rgba(var(--shot-rgb),.32);border-radius:7px;background:linear-gradient(90deg,rgba(var(--shot-rgb),.16),rgba(8,13,23,.72));color:#d9e6f3;text-align:left;cursor:pointer}.shot-panel-toggle small{color:var(--shot-accent);font-size:8px;font-weight:950}.shot-panel-toggle b{max-width:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f8fafc;font-size:10px}.shot-panel-toggle span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(var(--shot-rgb),.92);font-size:8px;font-weight:900;letter-spacing:.06em}.shot-panel-toggle em{color:var(--shot-accent);font-size:8px;font-style:normal;font-weight:900}.shot-panel-toggle i{color:#7f95a8;font-size:7px;font-style:normal;letter-spacing:.08em}.shot-panel.active{border-color:rgba(var(--shot-rgb),.68);box-shadow:0 0 18px rgba(var(--shot-rgb),.14)}.shot-panel.active .shot-panel-toggle{border-color:var(--shot-accent);box-shadow:0 0 10px rgba(var(--shot-rgb),.14)}.shot-panel .shot-delete{width:29px;height:29px;flex:0 0 29px;padding:0;border:1px solid rgba(var(--shot-rgb),.42);border-radius:7px;background:rgba(var(--shot-rgb),.10);color:var(--shot-accent);font-size:16px;line-height:1;cursor:pointer}.shot-panel .shot-delete:hover:not(:disabled),.shot-panel .shot-delete:focus-visible{border-color:var(--shot-accent);background:rgba(var(--shot-rgb),.22);outline:none;box-shadow:0 0 10px rgba(var(--shot-rgb),.18)}.shot-panel .shot-delete:disabled{opacity:.25;cursor:default}.shot-panel .shot-add{flex:0 0 auto;height:29px;padding:0 11px;border:1px solid rgba(var(--shot-rgb),.54);border-radius:7px;background:rgba(var(--shot-rgb),.14);color:var(--shot-accent);font-size:8px;font-weight:950;white-space:nowrap;cursor:pointer}.shot-panel .shot-add:disabled{opacity:.3;cursor:default}.shot-panel .tray-scroll{height:132px;display:flex;align-items:stretch;gap:8px;overflow-x:auto;overflow-y:hidden;padding:7px}.shot-panel .selected-card{border-color:rgba(var(--shot-rgb),.30);background:linear-gradient(145deg,rgba(var(--shot-rgb),.15),rgba(12,17,28,.94))}.shot-panel .selected-thumb{border-color:rgba(var(--shot-rgb),.30)}.shot-panel .slot{border-color:rgba(var(--shot-rgb),.70);background:rgba(var(--shot-rgb),.20);color:var(--shot-accent)}.shot-panel .tray-empty{border-color:rgba(var(--shot-rgb),.22);color:rgba(var(--shot-rgb),.72)}.hmb-image-assets .asset-card.selected{border-color:var(--active-shot-accent);box-shadow:inset 0 0 0 .3px rgba(var(--active-shot-rgb),.48),0 0 15px rgba(var(--active-shot-rgb),.34),0 0 4px rgba(var(--active-shot-rgb),.55)}
       .asset-registration-backdrop{position:absolute;inset:0;z-index:80;display:grid;place-items:center;padding:18px;background:rgba(1,4,10,.78);backdrop-filter:blur(5px)}.asset-passport{width:min(390px,100%);max-height:calc(100% - 12px);display:flex;flex-direction:column;overflow:auto;border:1px solid rgba(244,114,182,.62);border-radius:18px 18px 28px 28px;background:radial-gradient(circle at 50% -8%,rgba(190,24,93,.24),transparent 30%),linear-gradient(180deg,#171020,#090d17 45%,#060912);box-shadow:0 24px 70px rgba(0,0,0,.62),0 0 28px rgba(244,114,182,.2)}.passport-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 10px;border-bottom:1px solid rgba(244,114,182,.2)}.passport-head small{display:block;color:#d8a2be;font-size:7px;font-weight:900;letter-spacing:.18em}.passport-head h2{margin:3px 0 0;color:#fff1f8;font-size:15px;letter-spacing:.08em}.passport-head button{width:28px;height:28px;border:1px solid rgba(244,114,182,.25);border-radius:50%;background:#0b0d16;color:#e7b9d1;font-size:18px;line-height:1;cursor:pointer}.passport-photo{position:relative;width:128px;aspect-ratio:3/4;display:grid;place-items:center;align-self:center;margin:14px 0 8px;overflow:hidden;border:1px solid rgba(244,114,182,.38);border-radius:8px;background:#050910;color:#84677a;font-size:10px;font-weight:900;box-shadow:0 0 18px rgba(244,114,182,.12)}.passport-photo img{width:100%;height:100%;object-fit:cover}.passport-photo>span{display:none}.passport-photo.fallback img{display:none}.passport-photo.fallback>span{display:block}.passport-file{display:flex;flex-direction:column;gap:3px;padding:0 18px 12px;text-align:center}.passport-file b,.passport-file span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.passport-file b{color:#d7e2ef;font-size:8px}.passport-file span{color:#73899d;font-size:7px}.passport-fields{display:grid;grid-template-columns:1fr 1fr;gap:9px;padding:12px 16px;border-top:1px dashed rgba(244,114,182,.24)}.passport-fields label{display:flex;flex-direction:column;gap:4px}.passport-fields label:nth-last-child(1){grid-column:1/-1}.passport-fields label span{color:#bb8fa8;font-size:7px;font-weight:900;letter-spacing:.06em}.passport-fields input,.passport-fields select{width:100%;height:32px;border:1px solid rgba(148,163,184,.27);border-radius:7px;background:#060b13;color:#eef5ff;padding:0 8px;font-size:9px;outline:none}.passport-fields input:focus,.passport-fields select:focus{border-color:var(--asset-selection);box-shadow:0 0 0 1px rgba(244,114,182,.18)}.passport-fields select:disabled{opacity:.42}.passport-actions{display:flex;justify-content:flex-end;gap:7px;padding:11px 16px 15px}.passport-actions button{height:31px;padding:0 13px;border:1px solid rgba(148,163,184,.24);border-radius:7px;background:#0a101a;color:#bac9d8;font-size:8px;font-weight:900;cursor:pointer}.passport-actions .passport-register{border-color:rgba(244,114,182,.62);background:linear-gradient(180deg,rgba(190,24,93,.55),rgba(88,28,135,.42));color:#ffe4f2;box-shadow:0 0 12px rgba(244,114,182,.18)}.passport-actions button:disabled{opacity:.32;cursor:default;box-shadow:none}
       .passport-fields .passport-folder{grid-column:1/-1;min-width:0;display:grid;gap:4px}
@@ -6508,6 +6587,7 @@ function render(
       .image-bash-panel .shot-panel-head{display:flex;align-items:center;min-height:38px}.image-bash-panel .shot-panel-toggle{min-width:0;flex:1}.image-bash-panel .selected-actions{display:flex;gap:3px}.image-bash-panel .selected-actions button{min-width:18px}.image-bash-panel .selected-actions button:disabled{opacity:.3}.image-bash-card.compact-shot-asset{grid-template-rows:18px 60px 12px;gap:4px}.image-bash-card.compact-shot-asset .selected-thumb{width:100%;height:60px}.image-bash-card.compact-shot-asset .selected-card-top{margin:0}.image-bash-missing{font-size:8px;color:#94a3b8}.image-bash-panel .tray-scroll{min-height:110px}
       .hmb-image-assets .hmb-native-identity,.hmb-image-assets .hmb-native-actions{display:none;min-width:0;--node-header-text:#e8eef7}.hmb-image-assets[data-hmb-native-header="active"]>.top>.mark,.hmb-image-assets[data-hmb-native-header="active"]>.top>.heading{display:none}.hmb-image-assets[data-hmb-native-header="active"]>.top>.hmb-native-identity{display:flex;align-items:center;flex:1;min-width:0}.hmb-image-assets[data-hmb-native-header="active"]>.top>.hmb-native-actions{display:flex;align-items:center;flex:0 0 auto}.hmb-image-assets .hmb-native-identity>div{min-width:0;max-width:100%}.hmb-image-assets .hmb-native-actions svg{flex-shrink:0}.hmb-image-assets[data-hmb-native-header="active"]>.top{cursor:grab}.hmb-image-assets[data-hmb-native-header="active"]>.top:active{cursor:grabbing}
       @media (prefers-reduced-motion:reduce){.hmb-image-assets *{scroll-behavior:auto!important;animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}}
+      [data-hmb-shot-check="true"]{display:inline-flex!important;align-items:center;justify-content:center;gap:2px!important;width:38px!important;min-width:38px!important;max-width:38px!important;height:30px!important;min-height:30px!important;max-height:30px!important;flex:none!important;padding:0!important;box-sizing:border-box!important;font:700 11px/1 system-ui!important;font-variant-numeric:tabular-nums;background:#12301d!important;color:#dcfce7!important;border:1px solid #4ade80!important;border-radius:5px!important;filter:none!important;opacity:1!important}[data-hmb-shot-check="true"]::before{content:"✓";font:900 20px/1 system-ui;color:#4ade80;flex:none}
     </style>
     <div class="hmb-image-assets nodrag" data-hmb-library="image-asset" data-library-compact="false" data-theme="P" data-shot-number="${activeShot?.number || 1}" data-asset-view="${detailView ? "detail" : "image"}" data-busy="${imageAssetScanLoading(state) ? "true" : "false"}" ${imageAssetScanLoading(state) ? 'aria-busy="true"' : ""} style="--active-shot-accent:${activePalette.accent};--active-shot-rgb:${activePalette.rgb}" tabindex="0">
       ${renderImageAssetFixedTop(state)}
@@ -7676,7 +7756,7 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
     delete container.__hmbHierarchyDispose;
     dialog.close?.(); dialog.remove();
     if (container.__hmbHierarchyDialog === dialog) delete container.__hmbHierarchyDialog;
-    container.querySelector?.("[data-shot-add]")?.focus?.({ preventScroll: true });
+    container.querySelector?.(container.__hmbImageAssetCompact ? "[data-compact-shot-add]" : "[data-shot-add]")?.focus?.({ preventScroll: true });
     if (typeof options.onClose === "function") queueMicrotask(options.onClose);
   };
   const notice = message => { dialog.querySelector("[data-hier-message]").textContent = message; };
@@ -7860,7 +7940,7 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
       const role = row.parent_id ? hasChildren ? "하위 · 대표" : "하위" : "대표";
       return `<article class="hier-row ${row.parent_id ? "hier-child" : ""}" data-hier-member="${row.manual_uuid}" style="--shot-accent:${palette.accent};--shot-rgb:${palette.rgb};--hier-depth:${depths.get(row.member_id) || 0}"><div class="hier-row-head"><b>${String(number).padStart(2, "0")} · ${role}</b><select data-hier-parent="${row.manual_uuid}" aria-label="${escapeHtml(row.source_name)} 대표·하위 선택" title="하위 샷도 다른 샷의 대표로 선택할 수 있습니다"><option value="" ${row.parent_id === null ? "selected" : ""}>독립 대표</option>${parentOptions.map(parent => `<option value="${escapeHtml(parent.member_id)}" ${parent.member_id === row.parent_id ? "selected" : ""}>${String(slotNumber(parent)).padStart(2, "0")} · ${escapeHtml(parent.canonical_name)}의 하위</option>`).join("")}</select></div>${parts.shot ? `<small>에피소드 ${parts.episode} · 샷 ${parts.shot} · 분리컷 ${parts.split_cut}${sameBase(row) ? " · 같은 원본 샷의 분리컷" : ""}</small>` : ""}<div class="hier-name-tools" data-hier-name-tools><label>정식 이름<input data-hier-name="${row.manual_uuid}" value="${escapeHtml(row.source_name)}" autocomplete="off" ${row.origin === "cgt" ? "readonly" : ""}></label><button type="button" data-hier-remove="${row.manual_uuid}" ${hasChildren ? "disabled title=\"하위를 먼저 선택 해제하세요\"" : ""}>선택 해제</button></div></article>`;
     }).join("")}</div>
-    <div class="hier-manual"><h3 data-hier-manual-title>수동 샷 추가</h3><label data-hier-manual-name-field>샷 이름<input data-hier-manual-name placeholder="정식 샷 코드 또는 수동 이름" autocomplete="off"></label><label>연결할 슬롯<select data-hier-slot><option value="new">새 독립 샷 추가</option>${state.shot_routing.shots.map(shot => `<option value="${shot.shot_uuid}" ${used.has(shot.shot_uuid) ? "disabled" : ""}>${String(shot.number).padStart(2, "0")} · ${escapeHtml(shot.name)} (입력·연결 유지)</option>`).join("")}${typeof addImageBash === "function" ? '<option value="image_bash">HMBImageBash</option>' : ""}</select></label><small data-hier-slot-help>기존 슬롯을 선택하면 UUID·미디어·설정·결과를 보존하고 이름만 적용합니다.</small><button type="button" data-hier-add>수동 추가</button></div></section></div></div>
+    <div class="hier-manual"><h3 data-hier-manual-title>수동 샷 추가</h3><label data-hier-manual-name-field>샷 이름<input data-hier-manual-name placeholder="정식 샷 코드 또는 수동 이름" autocomplete="off"></label><label>연결할 슬롯<select data-hier-slot><option value="new">새 독립 샷 추가</option>${state.shot_routing.shots.map(shot => `<option value="${shot.shot_uuid}" ${used.has(shot.shot_uuid) || imageShotStatus(state,shot.shot_uuid) ? "disabled" : ""}>${String(shot.number).padStart(2, "0")} · ${escapeHtml(shot.name)} (입력·연결 유지)</option>`).join("")}${typeof addImageBash === "function" ? '<option value="image_bash">HMBImageBash</option>' : ""}</select></label><small data-hier-slot-help>기존 슬롯을 선택하면 UUID·미디어·설정·결과를 보존하고 이름만 적용합니다.</small><button type="button" data-hier-add>수동 추가</button></div></section></div></div>
     <footer><span>${representativeCount}개 대표 · ${draft.members.length - roots.length}개 하위</span><div class="hier-actions"><button type="button" data-hier-cancel>취소</button><button type="button" class="hier-primary" data-hier-confirm>선택 확정</button></div></footer>`);
     dialog.querySelectorAll("[data-hier-cancel]").forEach(button => button.addEventListener("click", close, events));
     const confirmImageBash = () => {
@@ -7907,7 +7987,7 @@ export function hmbOpenShotHierarchyDialog(container, state, focusedShotUuid, co
     if (basketBinding) {
       const slot = dialog.querySelector("[data-hier-slot]");
       slot.querySelector('option[value="image_bash"]')?.remove();
-      if (!manualDraft && !used.has(focusedShotUuid) && [...slot.options].some(option => option.value === focusedShotUuid)) {
+      if (!manualDraft && [...slot.options].some(option => option.value === focusedShotUuid && !option.disabled)) {
         slot.value = focusedShotUuid;
       }
       dialog.querySelector("[data-hier-manual-title]").hidden = true;
@@ -8440,7 +8520,8 @@ function installEvents(container, state, props, remount, listeners) {
       if (container.__hmbImageAssetLatestState === previous) { optimistic = remount(published); state = optimistic; }
     }
   };
-  on(container.querySelector("[data-shot-add]"), "click", (event) => {
+  on(container, "click", (event) => {
+    if (!event.target?.closest?.("[data-shot-add],[data-compact-shot-add]")) return;
     event.preventDefault();
     event.stopPropagation();
     if (container.__hmbNativeUiContract?.props?.disabled) return;
@@ -8464,9 +8545,10 @@ function installEvents(container, state, props, remount, listeners) {
       commitShotMutation(() => hmbDeleteImageAssetShot(state, shotUuid));
     });
   });
-  container.querySelectorAll("[data-shot-tab]").forEach((button) => {
-    const shotUuid = clean(button.getAttribute("data-shot-tab"));
-    on(button, "click", (event) => {
+  on(container, "click", (event) => {
+      const button = event.target?.closest?.("[data-shot-tab],[data-compact-shot-tab]");
+      if (!button) return;
+      const shotUuid = clean(button.dataset.shotTab || button.dataset.compactShotTab);
       event.preventDefault();
       event.stopPropagation();
       if (event.target?.closest?.("[data-shot-rename],[data-shot-rename-input]")) return;
@@ -8477,13 +8559,12 @@ function installEvents(container, state, props, remount, listeners) {
       const previousShot = activeImageAssetShot(state);
       commitShotMutation(
         () => hmbActivateImageAssetShot(state, shotUuid),
-        () => hmbApplyImageAssetShotSwitchFeedback(container, state, {
+        () => container.__hmbImageAssetCompact ? hmbPatchCompactImageAssetState(container, state) : hmbApplyImageAssetShotSwitchFeedback(container, state, {
           assetsByLibraryId,
           assetsBySourceUid,
           previousShot,
         }),
       );
-    });
   });
   on(container, "click", event => {
     const tab = event.target?.closest?.("[data-image-bash-tab]");
@@ -9343,8 +9424,13 @@ function hmbNativeUiImplementation(container, props) {
   };
   rememberNodeInternalsUpdater(props);
   const cleanupImportHandles = hmbInstallImageAssetImportHandleDecoration(container);
-  let state = normalizeState(props?.value);
-  container.__hmbImageAssetAuthorityCandidate = props?.value;
+  const initial = parseValue(props?.value);
+  const initialDocument = initial?.schema === "hmb-image-shot-status"
+    && initial.document?.schema === "hmb-image-asset-library-state"
+    && hmbImageAssetWidgetLease(initial.document) === hmbImageAssetWidgetLease(initial)
+    && initial.document.shot_routing?.channel_uuid === initial.channel_uuid ? initial.document : initial;
+  let state = normalizeState(initialDocument);
+  container.__hmbImageAssetAuthorityCandidate = initialDocument;
   container.__hmbImageAssetWidgetLease = hmbImageAssetWidgetLease(state);
   let leaseTransition = null, leaseDisposed = false;
   const clearLeaseTransition = () => {
@@ -9626,6 +9712,14 @@ function hmbNativeUiImplementation(container, props) {
       return;
     }
     const rawIncoming = parseValue(nextProps?.value);
+    if (rawIncoming?.schema === "hmb-image-shot-status") {
+      if (hmbImageAssetWidgetLease(rawIncoming) === hmbImageAssetWidgetLease(state)
+          && rawIncoming.channel_uuid === state.shot_routing.channel_uuid
+          && Array.isArray(rawIncoming.shot_edit_locks) && Array.isArray(rawIncoming.verified_shots)) {
+        applyImageShotStatus(container,state,rawIncoming);
+      }
+      return;
+    }
     // A node-scoped folder command can echo locally before its canonical receipt.
     if (rawIncoming?.schema === "hmb-image-asset-site-command-v1") return;
     if (rawIncoming?.schema === "hmb-image-asset-library-state") {
@@ -9759,6 +9853,17 @@ function hmbNativeUiImplementation(container, props) {
       return;
     }
     const incomingState = normalizeState(hmbImageAssetLocalPageProjection(rawIncoming,state,container));
+    if (!Array.isArray(rawIncoming.shot_edit_locks) && hmbImageAssetWidgetLease(incomingState) === hmbImageAssetWidgetLease(state)
+        && incomingState.shot_routing.channel_uuid === state.shot_routing.channel_uuid) {
+      incomingState.shot_edit_locks = state.shot_edit_locks;
+      incomingState.verified_shots = state.verified_shots;
+    }
+    if (Array.isArray(rawIncoming.shot_edit_locks) && hmbImageAssetWidgetLease(incomingState) === hmbImageAssetWidgetLease(state)
+        && incomingState.shot_routing.channel_uuid === state.shot_routing.channel_uuid
+        && (JSON.stringify(incomingState.shot_edit_locks) !== JSON.stringify(state.shot_edit_locks)
+          || JSON.stringify(incomingState.verified_shots) !== JSON.stringify(state.verified_shots))) {
+      applyImageShotStatus(container,state,incomingState);
+    }
     if (container.__hmbFolderMemory && rawIncoming?.schema === "hmb-image-asset-library-state"
       && hmbImageAssetWidgetLease(incomingState) === hmbImageAssetWidgetLease(state)) {
       // A matching folder receipt is independent of optimistic shot edit revisions.
@@ -10331,23 +10436,34 @@ function hmbAcquireNativeStockSafety(container) {
   const key = "__HMB_NATIVE_STOCK_SAFETY_V1__";
   let shared = doc[key];
   if (!shared) {
-    const owners = new Set(), identities = new Map();
+    const owners = new Set(), identities = new Set();
+    let parents = new WeakSet(), awaitingMount = false;
     let contextNode = null, notice = null, noticeTimer = null, disposed = false;
     const nativeReady = () => doc.documentElement.getAttribute("data-hmb-native-deletion-guard") === "engine-preflight"
       && doc.documentElement.getAttribute("data-hmb-native-deletion-protection-version") === "2";
     const rootOf = value => value?.closest?.(".react-flow__node[data-id]") || null;
+    const currentRoot = owner => owner.container?.isConnected ? rootOf(owner.container) : null;
+    const trackParents = element => {
+      for (let parent = element?.parentNode; parent && !parents.has(parent); parent = parent.parentNode) {
+        parents.add(parent);
+      }
+    };
     const roots = () => {
+      parents = new WeakSet();
+      awaitingMount = false;
       for (const owner of owners) {
-        const node = owner.active && owner.container?.isConnected ? rootOf(owner.container) : null;
-        if (node) identities.set(node, node.getAttribute("data-id"));
+        owner.node = currentRoot(owner);
+        if (owner.node) identities.add(owner.node);
+        if (owner.container.isConnected) trackParents(owner.container);
+        else awaitingMount = true;
       }
       // A stock fold/virtualized widget unmount is not a node deletion. Keep
       // its exact outer DOM identity until that node actually leaves the view.
-      for (const [node] of identities) {
+      for (const node of identities) {
         if (!node.isConnected) identities.delete(node);
-        else identities.set(node, node.getAttribute("data-id")); // Native rename keeps this exact retained outer node.
+        else trackParents(node);
       }
-      return new Set(identities.keys());
+      return identities;
     };
     const isEditing = target => Boolean(target?.closest?.("input,textarea,select,[contenteditable='true'],[contenteditable=''],[role='textbox'],.CodeMirror,.cm-editor"));
     const canvasOf = node => node?.closest?.(".react-flow");
@@ -10414,10 +10530,16 @@ function hmbAcquireNativeStockSafety(container) {
       if (!owners.size && !retained.size) { dispose(); return; }
       if (nativeReady() || !retained.size) dismiss();
     };
-    const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(sync) : null;
+    // Card and prompt edits occur below the widget host and cannot move its
+    // outer node. Still observe reparenting, folds, native markers and late mounts.
+    const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(records => {
+      if (awaitingMount || records.some(record => record.type === "attributes" || parents.has(record.target))) sync();
+    }) : null;
     observer?.observe(doc.documentElement, { attributes: true, attributeFilter: ["data-hmb-native-deletion-guard", "data-hmb-native-deletion-protection-version", "data-id"], childList: true, subtree: true });
     win.addEventListener("keydown", keydown, true); win.addEventListener("click", click, true); win.addEventListener("contextmenu", contextmenu, true);
-    shared = { owners, sync, release(owner) {
+    shared = { owners, sync, refresh(owner) {
+      if (currentRoot(owner) !== owner.node) sync();
+    }, release(owner) {
       owner.active = false; owners.delete(owner);
       sync();
     } };
@@ -10426,7 +10548,7 @@ function hmbAcquireNativeStockSafety(container) {
   const owner = { container, active: true };
   shared.owners.add(owner);
   shared.sync();
-  return { refresh() { if (owner.active) shared.sync(); }, cleanup() { if (owner.active) shared.release(owner); } };
+  return { refresh() { if (owner.active) (shared.refresh || shared.sync)(owner); }, cleanup() { if (owner.active) shared.release(owner); } };
 }
 
 // Griptape loads each widget as a separate module. One selection per editor

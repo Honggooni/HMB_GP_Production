@@ -22,6 +22,9 @@ from typing import Any, Callable
 
 MAX_ATTACHMENTS = 8
 MAX_IMAGE_ATTACHMENTS = 4
+# The Prompt admits up to 50 image rows. Generator applies its model's
+# independent input limit before submission.
+MAX_PROJECT_IMAGE_ATTACHMENTS = 50
 MAX_EDGE = 768
 MAX_INPUT_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_ENCODED_BYTES = 3 * 1024 * 1024
@@ -326,10 +329,6 @@ def _video_info(path: Path, probe: Path | None, deadline: float) -> dict:
                 "start_pts": start}
     except Exception:
         return {}
-
-
-def _duration(path: Path, probe: Path | None, deadline: float) -> float | None:
-    return _video_info(path, probe, deadline).get("duration")
 
 
 def _decode(source: Path | bytes, identity: tuple, seek: float | None,
@@ -652,6 +651,7 @@ def _audio_clip(record: dict, ffmpeg: Path | None, deadline: float) -> bytes:
 
 
 def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
+                   registered_project_images: dict[str, str] | None = None,
                    is_live: Callable[[], bool] = lambda: True,
                    report_sink: Callable[[dict], None] | None = None) -> Any:
     """Return a native ListArtifact, or the original text after optional failure.
@@ -671,6 +671,8 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
     encoded_bytes = 0
     count = 0
     image_count = 0
+    image_limit, attachment_limit = MAX_IMAGE_ATTACHMENTS, MAX_ATTACHMENTS
+    preparation_seconds = PREPARATION_SECONDS
     cache_summary = {"decoded_hits": 0, "decoded_misses": 0, "probe_hits": 0, "probe_misses": 0}
 
     def skip(record: dict, kind: str, reason: str, sample: dict | None = None) -> None:
@@ -689,6 +691,14 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
         images = [v for v in snapshot.get("images", [])[:64] if isinstance(v, dict)]
         videos = [v for v in snapshot.get("videos", [])[:64] if isinstance(v, dict)]
         audios = [v for v in snapshot.get("audios", [])[:64] if isinstance(v, dict)]
+        # Only a live, frozen Prompt Shot supplies this permission, separately
+        # from the serialized media rows used by web replay and unbound nodes.
+        project_images = registered_project_images or {}
+        if project_images and len(images) > image_limit:
+            image_limit = min(MAX_PROJECT_IMAGE_ATTACHMENTS, len(images))
+            # Keep the original/control paired samples in larger image selections.
+            attachment_limit = max(attachment_limit, image_limit + min(2, len(videos)) * 3 + min(1, len(audios)))
+            preparation_seconds += (attachment_limit - MAX_ATTACHMENTS) * PER_DECODE_SECONDS
         records = [(v, "image") for v in images] + [(v, "video") for v in videos] + [(v, "audio") for v in audios]
         if not is_live() or not driver_accepts_images(agent):
             reason = "cancelled" if not is_live() else "no_vision_driver"
@@ -701,15 +711,15 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
             from pydantic_ai.messages import BinaryContent
         else:
             from griptape.artifacts import ImageArtifact, ListArtifact, TextArtifact
-        deadline = started + PREPARATION_SECONDS
+        deadline = started + preparation_seconds
         ffmpeg, probe = _binaries()
 
         for record in audios:
             if not driver_accepts_audio(agent):
                 skip(record, "audio", "unsupported_audio_model")
                 continue
-            if not is_live() or count >= MAX_ATTACHMENTS or time.monotonic() >= deadline:
-                skip(record, "audio", "cancelled" if not is_live() else "attachment_cap" if count >= MAX_ATTACHMENTS else "deadline")
+            if not is_live() or count >= attachment_limit or time.monotonic() >= deadline:
+                skip(record, "audio", "cancelled" if not is_live() else "attachment_cap" if count >= attachment_limit else "deadline")
                 continue
             try:
                 blob = _audio_clip(record, ffmpeg, deadline)
@@ -737,14 +747,16 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
                    normalized_target: float | None = None) -> bool:
             nonlocal count, encoded_bytes, image_count
             reason = ("cancelled" if not is_live() else "deadline" if time.monotonic() >= deadline else
-                      "attachment_cap" if count >= MAX_ATTACHMENTS else
-                      "image_cap" if kind == "image" and image_count >= MAX_IMAGE_ATTACHMENTS else "")
+                      "attachment_cap" if count >= attachment_limit else
+                      "image_cap" if kind == "image" and image_count >= image_limit else "")
             if reason:
                 skip(record, kind, reason, sample)
                 return False
             try:
-                source, identity = _source(record.get("source"), kind,
-                    allow_verified_network=record.get("_hmb_verified_analysis_original") is True)
+                value = record.get("source")
+                registered_image = kind == "image" and bool(value) and project_images.get(_token(record)) == value
+                source, identity = _source(value, kind, allow_verified_network=(
+                    registered_image or record.get("_hmb_verified_analysis_original") is True))
                 seek = sample["seek"] if sample else None
                 with _CACHE_LOCK:
                     hit = (*identity, seek, MAX_EDGE) in _CACHE
@@ -763,10 +775,10 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
                         blob, width, height, actual = _decode(source, identity, corrected, ffmpeg, deadline)
                         normalized = round(actual - start_pts, 6) if actual is not None else None
                         seek, retried = corrected, True
-                # Reserve encoded-byte capacity for all eight slots as well as
+                # Reserve encoded-byte capacity for each slot as well as
                 # attachment slots. A noisy character sheet cannot exhaust the
                 # entire budget before Original/Mask/Depth are observed.
-                byte_limit = MAX_ENCODED_BYTES // MAX_ATTACHMENTS
+                byte_limit = MAX_ENCODED_BYTES // attachment_limit
                 if len(blob) > byte_limit:
                     import sys
                     blob = _run([sys.executable, "-c", _PNG_BUDGET_DECODER, str(byte_limit)], deadline, blob).stdout
@@ -813,8 +825,10 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
 
         # Reserve a first observation for each selected role before any role
         # repeats. Character sheets cannot consume the Original/Mask/Depth slots.
-        images.sort(key=lambda v: (0 if v.get("_hmb_verified_analysis_original") is True else 1,
-                                   0 if _role(v, "image") == "character" else 1))
+        all_project_images_fit = bool(project_images) and len(images) <= image_limit
+        if not all_project_images_fit:
+            images.sort(key=lambda v: (0 if v.get("_hmb_verified_analysis_original") is True else 1,
+                                       0 if _role(v, "image") == "character" else 1))
         priorities = {"original": 0, "mask": 1, "depth": 2, "motion_guide": 3, "video": 4}
         videos.sort(key=lambda v: (0 if v.get("_hmb_verified_analysis_original") is True else 1,
                                    priorities[_role(v, "video")]))
@@ -843,7 +857,7 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
 
         def observe_unit(members: list[dict], sample_index: int) -> None:
             nonlocal preview_scan_used
-            if not is_live() or time.monotonic() >= deadline or count + len(members) > MAX_ATTACHMENTS:
+            if not is_live() or time.monotonic() >= deadline or count + len(members) > attachment_limit:
                 for record in members:
                     skip(record, "video", "cancelled" if not is_live() else
                          "deadline" if time.monotonic() >= deadline else "attachment_cap")
@@ -924,7 +938,7 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
         seen_image_roles = set()
         for record in images:
             role = _role(record, "image")
-            if role not in seen_image_roles:
+            if all_project_images_fit or role not in seen_image_roles:
                 if append(record, "image", None):
                     seen_image_roles.add(role)
         seen_video_roles = set()
@@ -983,8 +997,8 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
         report["unobserved_media_tokens"] = [_token(v) for v, _kind in records if _token(v) not in observed]
         report["native_input_status"] = "prepared" if report["coverage"] else "text_only"
         report["cache_summary"] = cache_summary
-        report["budget_summary"] = {"attachment_limit": MAX_ATTACHMENTS, "image_limit": MAX_IMAGE_ATTACHMENTS,
-            "encoded_byte_limit": MAX_ENCODED_BYTES, "preparation_seconds_limit": PREPARATION_SECONDS,
+        report["budget_summary"] = {"attachment_limit": attachment_limit, "image_limit": image_limit,
+            "encoded_byte_limit": MAX_ENCODED_BYTES, "preparation_seconds_limit": preparation_seconds,
             "attachments_prepared": count, "attachments_delivered": len(report["coverage"]),
             "encoded_bytes_prepared": encoded_bytes, "elapsed_seconds": round(time.monotonic() - started, 6),
             "role_counts": {role: sum(v.get("observation_role") == role for v in report["coverage"])

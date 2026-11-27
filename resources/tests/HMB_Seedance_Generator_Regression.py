@@ -116,7 +116,7 @@ target = load_target()
 # The dedicated five-Shot concurrency regression validates the production
 # 1.05-second create cadence. Keep this broad generator suite deterministic and
 # fast while it exercises cancellation after a Broker POST has actually begun.
-target.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.0
+target._broker_transport.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.0
 image_asset_target = load_image_asset_target()
 video_picker_target = load_video_picker_target()
 
@@ -3100,9 +3100,9 @@ def assert_broker_generation_contract() -> None:
             opener=HttpErrorOpener(status_code)
         )
         with (
-            mock.patch.object(target, "_broker_load_token", return_value="test-token"),
+            mock.patch.object(target._broker_transport, "_broker_load_token", return_value="test-token"),
             mock.patch.object(
-                target,
+                target._broker_transport,
                 "_broker_validated_server_url",
                 return_value="https://broker.example",
             ),
@@ -3772,7 +3772,7 @@ def assert_broker_account_and_button_contract() -> None:
         "_request_json",
         side_effect=target._BrokerUnavailableError("safe unavailable"),
     ), mock.patch.object(
-        target,
+        target._broker_transport,
         "_broker_device_login",
         side_effect=AssertionError("server outage triggered a login exchange"),
     ):

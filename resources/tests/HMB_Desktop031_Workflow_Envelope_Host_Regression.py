@@ -388,7 +388,8 @@ async def exercise(engine, patches):
     pinned = agent_module._BuiltinAgent
     assert pinned is not None and isinstance(agent, pinned)
     assert Path(sys.modules[pinned.__module__].__file__).resolve().is_relative_to(ROOT / "_hmb_native_agent")
-    native_cls = agent_module._hmb.find_builtin_agent_class()
+    from hmb_standard_agent_reference import find_builtin_agent_class
+    native_cls = find_builtin_agent_class()
     assert native_cls is not pinned, "The stock comparison must load a separate Agent implementation"
     assert native_cls is not None and Path(sys.modules[native_cls.__module__].__file__).resolve().is_relative_to(
         STANDARD.resolve()), "Expected the Agent from the selected Standard Library checkout"

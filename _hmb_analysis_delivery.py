@@ -1,7 +1,9 @@
 """Serialize selected analysis as bounded data at the existing native calls."""
 from __future__ import annotations
 
+import asyncio
 from collections import OrderedDict
+import copy
 import hashlib
 import json
 import math
@@ -10,10 +12,12 @@ from pathlib import Path
 import re
 import stat
 import threading
+from typing import Any
 from urllib.parse import urlsplit
 from urllib.request import url2pathname
 
 from _hmb_reference_analysis import ANALYSIS_CATEGORIES
+from _hmb_shot_routing import _same_flow_nodes
 
 
 ANALYSIS_ORIGINAL_REFERENCE = "@analysis_original"
@@ -87,11 +91,208 @@ def cached_file_sha256(path: Path, *, read=None, refresh=False, max_size=None) -
         return digest
 
 
+_ROLES = ("after", "before")
+
+
+class _AnalysisStateError(ValueError):
+    code = "ANALYSIS_STATE_INVALID"
+
+
+class _OtherShotAnalyzing(Exception):
+    """An execution must await an already admitted job before its own admission."""
+
+    def __init__(self, completion):
+        self.completion = completion
+
+
+def _scope(channel: str, shot: str) -> str:
+    return f"{channel}\x1f{shot}" if channel and shot else ""
+
+
+def _edited_result(slot: dict) -> str:
+    return slot["edited_result"] if slot["edited_categories"] == slot["categories"] else ""
+
+
+def _registered_node_class(name: str) -> type | None:
+    try:
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+        return LibraryRegistry.get_library("HMB_GP_Production").get_node_class(name)
+    except (ImportError, AttributeError, RuntimeError, KeyError, ValueError):
+        return None
+
+
+def _live_analysis_nodes(nodes: list[Any]) -> list[Any]:
+    candidates = [node for node in nodes if getattr(node, "_hmb_reference_analysis_node", False)
+                  and not getattr(node, "_hmb_node_deleted", False)]
+    if not candidates:
+        return []
+    expected = _registered_node_class("HMBAnalysisAgent")
+    return [node for node in candidates if type(node) is expected]
+
+
+def _analysis_role(node: Any) -> str | None:
+    return getattr(node, "_role", "after")
+
+
+def _find_analysis_node(nodes: list[Any], *, role: str) -> Any | None:
+    live = _live_analysis_nodes(nodes)
+    matches = [node for node in live if _analysis_role(node) == role]
+    return matches[0] if len(live) <= len(_ROLES) and len(matches) == 1 else None
+
+
+def analysis_render_input_preview(prompt_owner: Any, *, channel_uuid: str, shot_uuid: str) -> dict:
+    """Project applied settings for controls without resolving, hashing or opening media."""
+    from _hmb_connection_management import relationship_suspended
+
+    flow, nodes = _same_flow_nodes(prompt_owner)
+    if not flow or prompt_owner not in nodes:
+        return {}
+    key = _scope(channel_uuid, shot_uuid)
+    result = {}
+    for role in _ROLES:
+        node = _find_analysis_node(nodes, role=role)
+        if node is None or relationship_suspended(prompt_owner, node):
+            continue
+        with node._lock:
+            slot = node._slots.get(key)
+            if not slot:
+                continue
+            contributes = bool(slot["result"] or slot.get("analysis_pending"))
+            if role == "after":
+                contributes = ((contributes and slot["send_agent"]) or slot["results_only"]
+                               or slot["origin"] == "direct")
+            if not contributes:
+                continue
+            row = {field: copy.deepcopy(slot[field]) for field in (
+                "origin", "kind", "source_id", "path", "model", "guidance", "start", "end", "full_video",
+                "frame_ranges", "time_ranges", "categories", "field_overrides", "results_only", "send_agent")}
+            running = node._job is not None and node._job[0] == key
+            row.update(cache_key=slot["result"].get("cache_key", ""), edited=_edited_result(slot),
+                       analysis_pending=bool(slot.get("analysis_pending") or running))
+            if manual_run := slot["result"].get("manual_run_id"):
+                row["manual_run_id"] = manual_run
+            result[role] = row
+    return result
+
+
+async def prepare_analysis_for_run(owner: Any, *, channel_uuid: str, shot_uuid: str,
+                                   role: str, check_live=None) -> None:
+    """Refresh only this execution's applied Analysis route at its point in the chain."""
+    from _hmb_connection_management import relationship_suspended
+
+    flow, nodes = _same_flow_nodes(owner)
+    if not flow or owner not in nodes:
+        return
+    live = _live_analysis_nodes(nodes)
+    matching = [node for node in live if _analysis_role(node) == role
+                and not relationship_suspended(owner, node)]
+    if not matching:
+        return
+    if len(matching) != 1 or _find_analysis_node(nodes, role=role) is not matching[0]:
+        raise _AnalysisStateError("분석 노드의 위치와 중복 연결을 확인하세요.")
+    from _hmb_shot_routing import (_HMB_SOURCE_PREPARE_RETRY_SECONDS, _HMB_SOURCE_PREPARE_TIMEOUT_SECONDS,
+                                   _HMBSourcePreparationError, _hmb_source_is_preparing)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _HMB_SOURCE_PREPARE_TIMEOUT_SECONDS
+    while True:
+        if check_live is not None:
+            check_live()
+        try:
+            await matching[0]._prepare_for_run(owner, channel_uuid, shot_uuid, role, check_live)
+            return
+        except _OtherShotAnalyzing as busy:
+            await asyncio.shield(asyncio.wrap_future(busy.completion))
+        except ValueError as exc:
+            if not _hmb_source_is_preparing(exc):
+                raise
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise _HMBSourcePreparationError("SOURCE_PREPARATION_TIMEOUT") from None
+            await asyncio.sleep(min(remaining, _HMB_SOURCE_PREPARE_RETRY_SECONDS))
+
+
+def get_analysis_context(prompt_owner: Any, *, channel_uuid: str, shot_uuid: str, destination: str) -> dict:
+    """Read only an applied selection from the exact registered Prompt flow."""
+    flow, nodes = _same_flow_nodes(prompt_owner)
+    if not flow or prompt_owner not in nodes:
+        return {}
+    node = _find_analysis_node(nodes, role="after")
+    if node is None:
+        return {}
+    return node._hmb_analysis_context_for(prompt_owner, channel_uuid=channel_uuid,
+        shot_uuid=shot_uuid, destination=destination)
+
+
+def get_analysis_original(prompt_owner: Any, *, channel_uuid: str, shot_uuid: str) -> dict:
+    flow, nodes = _same_flow_nodes(prompt_owner)
+    node = _find_analysis_node(nodes, role="after") if flow and prompt_owner in nodes else None
+    return node._hmb_analysis_original_for(prompt_owner, channel_uuid=channel_uuid, shot_uuid=shot_uuid) if node else {}
+
+
+def get_analysis_originals(prompt_owner: Any, *, channel_uuid: str, shot_uuid: str, preview: bool = False) -> list[dict]:
+    flow, nodes = _same_flow_nodes(prompt_owner)
+    if not flow or prompt_owner not in nodes or type(prompt_owner) is not _registered_node_class("HMBPromptLibrary"):
+        return []
+    node = _find_analysis_node(nodes, role="after")
+    if node is not None:
+        return node._hmb_analysis_originals_for(prompt_owner, channel_uuid=channel_uuid, shot_uuid=shot_uuid, preview=preview)
+    live = _live_analysis_nodes(nodes)
+    if len(live) > len(_ROLES) or any(_analysis_role(candidate) != "before" for candidate in live):
+        return []
+    # The default also applies before an Analysis Agent is added. Only a
+    # registered analysis node can opt an exact Shot out of its originals.
+    return _reference_tokens(_prompt_analysis_originals(prompt_owner, channel_uuid, shot_uuid, preview=preview))
+
+
+def _prompt_analysis_originals(owner: Any, channel: str, shot: str, *, preview: bool) -> list[dict]:
+    getter = getattr(owner, "_hmb_analysis_preview_sources_for" if preview else "_hmb_analysis_originals_for", None)
+    try:
+        return getter(channel_uuid=channel, shot_uuid=shot) if callable(getter) else []
+    except (RuntimeError, ValueError):
+        return []
+
+
+def _reference_tokens(originals: list[dict]) -> list[dict]:
+    seen = set()
+    rows = []
+    for original in originals:
+        kind, path = original["kind"], original["path"]
+        identity = kind, reference_identity(path)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        rows.append({**original, "start": original.get("start_seconds"), "end": original.get("end_seconds")})
+    for index, row in enumerate(rows, 1):
+        if not row.get("shot_reference"):
+            row["shot_reference"] = "@analysis_original" if len(rows) == 1 else f"@analysis_original_{row['kind']}_{index}"
+    return rows
+
+
+def get_analysis_results_only(prompt_owner: Any, *, channel_uuid: str, shot_uuid: str, preview: bool = False) -> bool:
+    from _hmb_connection_management import relationship_suspended
+
+    flow, nodes = _same_flow_nodes(prompt_owner)
+    node = _find_analysis_node(nodes, role="after") if flow and prompt_owner in nodes else None
+    if (node is None or relationship_suspended(prompt_owner, node)
+            or (not preview and node._exact_owner(node._registered_catalogs(), channel_uuid, shot_uuid) is not prompt_owner)):
+        return False
+    with node._lock:
+        return (_analysis_role(node) == "after"
+                and node._slots.get(_scope(channel_uuid, shot_uuid), {}).get("results_only") is True)
+
+
+def schedule_analysis_refresh(anchor: Any) -> None:
+    """Refresh the analysis panel after same-flow Prompt or Agent changes."""
+    flow, nodes = _same_flow_nodes(anchor)
+    if flow and anchor in nodes:
+        for node in _live_analysis_nodes(nodes):
+            node._hmb_schedule_analysis_refresh()
+
+
 def analysis_original(prompt_owner, *, channel_uuid, shot_uuid):
     if prompt_owner is None or not channel_uuid or not shot_uuid:
         return {}
-    from HMBAnalysisAgent import get_analysis_original
-
     return get_analysis_original(prompt_owner, channel_uuid=channel_uuid, shot_uuid=shot_uuid)
 
 
@@ -102,16 +303,12 @@ analysis_original_for_generator = analysis_original
 def analysis_originals(prompt_owner, *, channel_uuid, shot_uuid, preview=False):
     if prompt_owner is None or not channel_uuid or not shot_uuid:
         return []
-    from HMBAnalysisAgent import get_analysis_originals
-
     return get_analysis_originals(prompt_owner, channel_uuid=channel_uuid, shot_uuid=shot_uuid, preview=preview)
 
 
 def analysis_results_only(prompt_owner, *, channel_uuid, shot_uuid, preview=False):
     if prompt_owner is None or not channel_uuid or not shot_uuid:
         return False
-    from HMBAnalysisAgent import get_analysis_results_only
-
     return get_analysis_results_only(prompt_owner, channel_uuid=channel_uuid, shot_uuid=shot_uuid, preview=preview)
 
 
@@ -171,8 +368,6 @@ def route_analysis_media(kind, media, excluded, original, original_reference="")
 def analysis_delivery_context(prompt_owner, *, channel_uuid, shot_uuid, destination):
     if destination != "agent" or prompt_owner is None or not channel_uuid or not shot_uuid:
         return {}
-    from HMBAnalysisAgent import get_analysis_context
-
     value = get_analysis_context(prompt_owner, channel_uuid=channel_uuid,
                                  shot_uuid=shot_uuid, destination=destination)
     if (not isinstance(value, dict) or value.get("schema") != "hmb-reference-analysis-context"

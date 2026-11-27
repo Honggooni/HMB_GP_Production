@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
-import inspect
 import json
 import shutil
 import sys
@@ -18,7 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import HMBVideoPickerLibrary as picker
-from griptape_nodes.exe_types.flow import ControlFlow
+from hmb_host_workflow import scoped_fixture_workflow
 from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultSuccess,
@@ -53,6 +52,14 @@ def compact_state(state: dict[str, Any]) -> dict[str, Any]:
 
 
 async def run(scene: Path, timeout_seconds: float, keep: bool) -> dict[str, Any]:
+    flow_name = f"HMBTransportFlow_{time.time_ns()}"
+    events = GriptapeNodes.EventManager()
+    events.initialize_queue()
+    with scoped_fixture_workflow(getattr(events, "engine", None), flow_name):
+        return await exercise(scene, timeout_seconds, keep, flow_name)
+
+
+async def exercise(scene: Path, timeout_seconds: float, keep: bool, flow_name: str) -> dict[str, Any]:
     source_scene = scene.resolve()
     if not source_scene.is_file() or source_scene.suffix.lower() not in {".mb", ".ma"}:
         raise FileNotFoundError(f"A Maya .mb or .ma scene is required: {source_scene}")
@@ -69,14 +76,9 @@ async def run(scene: Path, timeout_seconds: float, keep: bool) -> dict[str, Any]
         "transitions": [],
     }
 
-    GriptapeNodes.EventManager().initialize_queue()
     node = picker.HMBVideoPickerLibrary(name=f"HMBVideoPickerTransport_{time.time_ns()}")
-    flow_options = {"name": f"HMBTransportFlow_{time.time_ns()}"}
-    if "engine" in inspect.signature(ControlFlow).parameters:
-        flow_options["engine"] = GriptapeNodes.EventManager().engine
-    flow = ControlFlow(**flow_options)
     from _hmb_fixture_sdk import ensure_fixture_flow, register_fixture_node
-    flow = ensure_fixture_flow(GriptapeNodes, flow.name)
+    flow = ensure_fixture_flow(GriptapeNodes, flow_name)
     register_fixture_node(GriptapeNodes, flow, node)
 
     try:

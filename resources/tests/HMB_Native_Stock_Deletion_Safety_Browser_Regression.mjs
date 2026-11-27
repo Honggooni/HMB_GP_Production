@@ -155,5 +155,75 @@ try{
  await check('measurement_widget_without_native_outer_node_does_not_create_a_status',async()=>{
   const result=await page.evaluate(()=>{const c=document.createElement('div');document.body.append(c);const l=safety.hmbAcquireNativeStockSafety(c);l.refresh();const count=document.querySelectorAll('[data-hmb-native-safety-status]').length;l.cleanup();c.remove();return{count,released:!document.__HMB_NATIVE_STOCK_SAFETY_V1__};});assert.deepEqual(result,{count:0,released:true});
  });
+ await check('late_mount_and_reparent_preserve_folded_node_deletion_protection',async()=>{
+  const moved = await page.evaluate(async () => {
+   const region = document.createElement('section');
+   const first = document.createElement('div'), second = document.createElement('div');
+   for (const [index,node] of [first,second].entries()) {
+    node.className = 'react-flow__node'; node.dataset.id = 'late-'+index;
+   }
+   const host = document.createElement('div');
+   const temporary = safety.hmbAcquireNativeStockSafety(host);
+   first.append(host); region.append(first,second); document.body.append(region);
+   await Promise.resolve();
+   second.append(host);
+   await Promise.resolve();
+   host.remove(); temporary.cleanup(); first.remove();
+   second.classList.add('selected');
+   const key = new KeyboardEvent('keydown',{key:'Delete',bubbles:true,cancelable:true});
+   second.dispatchEvent(key);
+   region.remove();
+   await Promise.resolve();
+   return {protected:key.defaultPrevented, released:!document.__HMB_NATIVE_STOCK_SAFETY_V1__};
+  });
+  assert.deepEqual(moved,{protected:true,released:true});
+ });
+ await check('editing_one_widget_does_not_reinspect_sibling_nodes',async()=>{
+  const bench = await browser.newPage();
+  try {
+   report.widget_churn = await bench.evaluate(async source => {
+    const mod = await import('data:text/javascript;base64,'+btoa(unescape(encodeURIComponent(source))));
+    const nodes = [], hosts = [], handles = [];
+    for (let i = 0; i < 50; i++) {
+     const node = document.createElement('div'), host = document.createElement('section');
+     node.className = 'react-flow__node'; node.dataset.id = 'n'+i;
+     node.append(host); document.body.append(node);
+     nodes.push(node); hosts.push(host);
+     handles.push(mod.hmbNativeStockSafetyContract(host, {}, () => ({update(value) {
+      host.replaceChildren(Object.assign(document.createElement('div'), {textContent:String(value)}));
+     }})));
+    }
+    await Promise.resolve();
+    let editedOwnerReads = 0, siblingOwnerReads = 0;
+    const closest = Element.prototype.closest;
+    for (const [index, host] of hosts.entries()) {
+     host.closest = function(selector) {
+      if (selector === '.react-flow__node[data-id]') {
+       if (index) siblingOwnerReads++; else editedOwnerReads++;
+      }
+      return closest.call(this, selector);
+     };
+    }
+    const times = [], iterations = 200;
+    for (let run = 0; run < 9; run++) {
+     const start = performance.now();
+     for (let i = 0; i < iterations; i++) {
+      handles[0].update(i);
+      await Promise.resolve(); // Allow the actual document MutationObserver to run.
+     }
+     times.push(performance.now() - start);
+    }
+    const counts = {editedOwnerReads, siblingOwnerReads};
+    for (const handle of handles) handle.cleanup();
+    for (const node of nodes) node.remove();
+    await Promise.resolve();
+    return {owners:hosts.length, batches:times.length, updates_per_batch:iterations,
+      ...counts, median_ms:[...times].sort((a,b)=>a-b)[4],
+      released:!document.__HMB_NATIVE_STOCK_SAFETY_V1__};
+   },source);
+   assert.equal(report.widget_churn.released,true);
+   assert.equal(report.widget_churn.siblingOwnerReads,0);
+  } finally { await bench.close(); }
+ });
  assert.deepEqual(errors,[]);assert.equal(report.external_requests,0);report.passed=true;
 }finally{await browser.close();report.errors=errors;const p=process.argv.indexOf('--evidence-path');if(p>=0){fs.mkdirSync(path.dirname(process.argv[p+1]),{recursive:true});fs.writeFileSync(process.argv[p+1],JSON.stringify(report,null,2));}console.log(JSON.stringify(report));}

@@ -6,6 +6,7 @@ import base64
 import hashlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -90,6 +91,35 @@ def check_seedance_reference_upload_copy():
 
 
 check_seedance_reference_upload_copy()
+
+
+def check_lossless_image_cache_after_overwrite():
+    generator = object.__new__(seedance.HMBSeedanceGeneration)
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "same-reference.png"
+        for color in ("red", "blue"):
+            # Uncompressed PNGs of the same dimensions have the same byte length.
+            Image.new("RGB", (1024, 768), color).save(path, compress_level=0)
+            info = path.stat()
+            if color == "blue":
+                assert info.st_size == old_stat.st_size
+                os.utime(path, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+            result = generator._prepare_cloud_image(str(path), seedance.SEEDANCE_2_5_MODEL_ID, 1)
+            data, filename = result
+            assert filename == "same-reference.webp"
+            with Image.open(BytesIO(data)) as decoded:
+                assert decoded.size == (1024, 768)
+                assert decoded.getpixel((100, 100)) == ((255, 0, 0) if color == "red" else (0, 0, 255))
+            if color == "red":
+                old_stat, previous = info, data
+            else:
+                assert data != previous
+            # Re-reading either unchanged revision must reuse its verified packed bytes.
+            with mock.patch.object(Image.Image, "save", side_effect=AssertionError("unchanged PNG re-encoded")):
+                assert generator._prepare_cloud_image(str(path), seedance.SEEDANCE_2_5_MODEL_ID, 1) == result
+
+
+check_lossless_image_cache_after_overwrite()
 
 assert callable(
     getattr(seedance.GriptapeCloudStorageDriver, "create_signed_upload_url", None)
@@ -378,6 +408,40 @@ with tempfile.TemporaryDirectory() as temporary:
     assert tested["reference_images"] == [proofs[1], proofs[2], proofs[2], proofs[0]]
     assert tested["video_references"] == [proofs[3], proofs[3]]
     assert tested["reference_audio"] == [proofs[4], proofs[4]] and proof_driver.uploads[4]["file_content"] == audio
+    # Only references on the final wire are in the journal. An object may occupy multiple slots.
+    wire_payload = {field: tested[key] for field, key in (("image_urls", "reference_images"),
+                    ("video_urls", "video_references"), ("audio_urls", "reference_audio"))}
+    old_handles = cloud_node._hmb_cloud_proof_handles.copy()
+    with mock.patch.dict("os.environ", {"APPDATA": str(folder)}):
+        lease = cloud_node._bind_temporary_reference_lease(None, "https://broker.example", "hmb-fixture-upload", wire_payload)
+        text = seedance._reference_leases._journal_path(lease).read_text(encoding="utf8")
+    rows = json.loads(text)["upload_manifest"]
+    assert "signed=opaque" not in text and "https://storage.example" not in text and str(folder) not in text
+    assert not cloud_node._hmb_cloud_proof_handles
+    expected = []
+    for field, values in wire_payload.items():
+        for slot, value in enumerate(values, 1):
+            p = Path(old_handles[value])
+            upload = next(entry for entry in proof_driver.uploads if entry["path"] == p)
+            body = upload["file_content"]
+            expected.append(dict(field=field, slot=slot, object_uid=p.parent.name,
+                                 filename=p.name, sha256=hashlib.sha256(body).hexdigest(), bytes=len(body)))
+    assert expected == rows
+    # An invalid final image must fail the whole preparation before any render payload exists.
+    # In particular, losing @image7 must never turn a seven-slot request into a six-slot render.
+    empty_image = folder / "empty-final-reference.png"
+    empty_image.write_bytes(b"")
+    for invalid in (folder / "missing-final-reference.png", empty_image):
+        staged = LegacyCloudDriver()
+        try:
+            cloud_node._prepare_video_references_for_run({
+                "model_id": seedance.SEEDANCE_2_5_MODEL_ID, "_hmb_cloud_reference_proof_v1": True,
+                "reference_images": [str(image_path)] * 6 + [str(invalid)],
+            }, cloud_driver=staged)
+        except (ValueError, RuntimeError, FileNotFoundError, OSError):
+            assert not staged.uploads
+        else:
+            raise AssertionError("The last missing or empty reference allowed a shortened render request")
     for entry in proof_driver.uploads[:3]:
         assert entry["path"].suffix == ".webp" and entry["file_content"] != image_bytes
         with Image.open(BytesIO(entry["file_content"])) as packed, Image.open(image_path) as original:
@@ -627,8 +691,8 @@ def load_fixture_token(*, server_url: str) -> str:
     return "regression-token"
 
 
-seedance.MAX_REQUEST_BYTES = len(expected_transport_body)
-seedance._broker_load_token = load_fixture_token
+seedance._broker_transport.MAX_REQUEST_BYTES = len(expected_transport_body)
+seedance._broker_transport._broker_load_token = load_fixture_token
 try:
     bridge = seedance._HMBAIBrokerBridge(opener=capturing_opener, server_url=transport_broker)
     response = bridge._request_json(
@@ -647,7 +711,7 @@ try:
     assert sent_timeout == 3.0
     assert token_endpoints == [transport_broker]
 
-    seedance.MAX_REQUEST_BYTES = len(expected_transport_body) - 1
+    seedance._broker_transport.MAX_REQUEST_BYTES = len(expected_transport_body) - 1
     try:
         bridge._request_json(
             "POST",
@@ -665,7 +729,7 @@ try:
         "Every credential lookup, including rejected media, must keep its explicit Broker gateway."
     )
 finally:
-    seedance.MAX_REQUEST_BYTES = original_request_limit
-    seedance._broker_load_token = original_load_token
+    seedance._broker_transport.MAX_REQUEST_BYTES = original_request_limit
+    seedance._broker_transport._broker_load_token = original_load_token
 
 print("HMB Seedance media preflight/streaming regression: PASS")

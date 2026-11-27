@@ -247,6 +247,46 @@ class AlignedMediaTests(unittest.TestCase):
         self.assertEqual(report["coverage"], [])
         self.assertEqual(report["budget_summary"]["attachments_delivered"], 0)
 
+    def test_live_project_shot_observes_seven_images_and_both_videos(self):
+        images = [{"token": f"@image{slot}", "source": f"//share/project/{slot}.png"} for slot in range(1, 8)]
+        images[4]["source"] = str(self.hero)  # local import amidst six registered project rows
+        images[4]["image_main_type"] = "Character"
+        selected = {row["token"]: row["source"] for row in images if row["source"].startswith("//")}
+        value = snapshot(images=images, videos=[video("@video1", "Original Preview", self.hero),
+                                                 video("@video2", "Mask", self.hero)])
+        original_source = media._source
+        def fixture_source(source, kind, *, allow_verified_network=False):
+            if source.startswith("//") and allow_verified_network:
+                self.assertIn(source, selected.values())
+                return self.hero, (source,)
+            return original_source(source, kind, allow_verified_network=allow_verified_network)
+        pixels = self.hero.read_bytes()
+        with patch.object(media, "_source", side_effect=fixture_source), \
+             patch.object(media, "_decode", side_effect=lambda _source, _identity, seek, *_args: (pixels, 96, 96, seek)), \
+             patch.object(media, "_video_info", return_value={"duration": 5, "start_pts": 0}), \
+             patch.object(media, "_missing_preview_view", return_value=None):
+            _, report = self.call(value, registered_project_images=selected)
+            self.assertEqual(report["status"], "observed")
+            tokens = [row["media_token"] for row in report["coverage"]]
+            self.assertEqual([t for t in tokens if t.startswith("@image")], [row["token"] for row in images])
+            self.assertEqual((tokens.count("@video1"), tokens.count("@video2")), (3, 3))
+            # A replayed flag or a different slot's path cannot admit a share read.
+            value["registered_project_images"] = selected
+            value["images"][0]["source"] = "//share/project/2.png"
+            _, changed = self.call(value, registered_project_images=selected)
+            self.assertIn("@image1", changed["unobserved_media_tokens"])
+            _, untrusted = self.call(value)
+            self.assertEqual(set(untrusted["unobserved_media_tokens"]), set(selected))
+
+    def test_live_project_shot_keeps_order_through_last_prompt_slot(self):
+        pixels = self.hero.read_bytes()
+        images = [{"token": f"@image{i}", "source": str(self.hero)} for i in range(1, 51)]
+        registered = {row["token"]: row["source"] for row in images}
+        with patch.object(media, "_decode", return_value=(pixels, 96, 96, None)):
+            _, report = self.call(snapshot(images=images), registered_project_images=registered)
+        self.assertEqual([row["media_token"] for row in report["coverage"]], list(registered))
+        self.assertEqual(report["skips"], [])
+
     def test_missing_first_source_does_not_spend_later_available_role_reservation(self):
         fake = self.hero.read_bytes()
         value = snapshot(images=[{"token": f"@image{i}", "source": str(self.hero), "image_main_type": "Character"}

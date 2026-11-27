@@ -902,6 +902,22 @@ class SoundNodeRegression(SoundLibraryRegression):
         self.assertEqual(state["tracks"][-1]["shot_uuid"],SHOTS[1]["shot_uuid"])
         with self.assertRaises(helper.SoundError):self.command("shot_add",source_uid=state["assets"][0]["source_uid"],shot_uuid="invented-shot")
 
+    def test_running_shot_is_readable_and_sibling_is_editable(self):
+        self.node._hmb_reconcile_shot_routing(CATALOG)
+        state = self.node._state_sound
+        shot_a, shot_b = (shot["shot_uuid"] for shot in SHOTS)
+        scope = {"channel_uuid":CHANNEL,"shot_uuid":shot_a}
+        with mock.patch.object(routing,"shot_edit_locks",return_value=[scope]):
+            self.node._hmb_sound_snapshot_for(**scope)
+            self.assertIn(scope, routing.source_shot_status_fields(self.node,state)["verified_shots"])
+            source = state["assets"][0]["source_uid"]
+            with self.assertRaisesRegex(ValueError,"Generator"):
+                self.command("shot_add",source_uid=source,shot_uuid=shot_a)
+            self.command("shot_add",source_uid=source,shot_uuid=shot_b)
+            self.drain()
+            self.assertEqual(state["tracks"][-1]["shot_uuid"],shot_b)
+            self.assertIn(scope, routing.source_shot_status_fields(self.node,state)["verified_shots"])
+
     def test_standalone_discovery_chooses_one_and_ambiguity_needs_shot_context(self):
         self.node.set_parameter_value(target.UI,target.default_state(),initial_setup=True)
         row={"project_id":"showA","project_root":str(self.audio)}

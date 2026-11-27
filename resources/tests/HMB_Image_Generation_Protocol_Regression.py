@@ -209,7 +209,7 @@ for http_status, code in ((404, "IMAGE_GENERATION_UNSUPPORTED"), (405, "IMAGE_GE
     check(not any(call[1] == "/api/v1/generate/image" for call in bridge.calls))
 bridge.capability_error = None
 bridge.calls.clear()
-AuthFailure = type("_BrokerAuthenticationError", (RuntimeError,), {"__module__": "HMBSeedanceGeneration"})
+from _hmb_broker_transport import _BrokerAuthenticationError as AuthFailure
 for error in (AuthFailure("missing secret token body"), AuthFailure("undecryptable secret token body")):
     bridge.capability_error = error
     denied = rejects(lambda: transport.capabilities(), "IMAGE_BROKER_LOGIN_REQUIRED")

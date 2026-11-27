@@ -41,7 +41,7 @@ class Opener:
         return Response(request.full_url, {"ok": True})
 
 with tempfile.TemporaryDirectory(prefix="hmb-global-broker-" ) as temporary, mock.patch.dict(os.environ,
-        {"APPDATA": temporary, "LOCALAPPDATA": temporary}), mock.patch.object(target, "_broker_device_login", side_effect=AssertionError("Unexpected login")):
+        {"APPDATA": temporary, "LOCALAPPDATA": temporary}), mock.patch.object(target._broker_transport, "_broker_device_login", side_effect=AssertionError("Unexpected login")):
     with mock.patch.object(target.urllib.request.OpenerDirector, "open", side_effect=AssertionError("Live HTTP forbidden")):
         nodes = [target.HMBSeedanceGeneration(name=f"Generator {i}") for i in range(1, 6)]
         assert all(n._selected_broker_server_url() == config.DEFAULT_BROKER_BASE_URL for n in nodes)
@@ -82,7 +82,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-global-broker-" ) as temporary, moc
         checks += 3
         opener = Opener()
         bridge = target._HMBAIBrokerBridge(opener=opener, server_url=server_a)
-        with mock.patch.object(target, "_broker_load_token", return_value="test-token") as token:
+        with mock.patch.object(target._broker_transport, "_broker_load_token", return_value="test-token") as token:
             bridge._request_json("GET", "/api/me", payload=None, timeout=1)
             assert opener.requests[-1].full_url == server_a + "/api/me"
             token.assert_called_once_with(server_url=server_a)
@@ -105,7 +105,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-global-broker-" ) as temporary, moc
             def open(self, request, **_kwargs):
                 raise urllib.error.HTTPError(request.full_url, 401, "test", {}, io.BytesIO(b"{}"))
         bridge._opener = Unauthorized()
-        with mock.patch.object(target, "_broker_load_token", return_value="test-token"):
+        with mock.patch.object(target._broker_transport, "_broker_load_token", return_value="test-token"):
             try: bridge._request_json("GET", "/api/me", payload=None, timeout=1)
             except target._BrokerAuthenticationError: pass
             else: raise AssertionError("401 accepted")

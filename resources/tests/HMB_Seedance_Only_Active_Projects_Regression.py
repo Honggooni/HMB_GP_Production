@@ -32,8 +32,8 @@ class OnlyActiveProjects(unittest.TestCase):
         stack = fixture.project.ExitStack()
         stack.enter_context(mock.patch.object(t._review, "bind_task_origin"))
         stack.enter_context(mock.patch.object(t._review, "bind_task_project"))
-        stack.enter_context(mock.patch.object(t, "_broker_log_transport_error"))
-        stack.enter_context(mock.patch.object(t, "_broker_load_token",
+        stack.enter_context(mock.patch.object(t._broker_transport, "_broker_log_transport_error"))
+        stack.enter_context(mock.patch.object(t._broker_transport, "_broker_load_token",
             side_effect=AssertionError("Active choices must not read authentication tokens")))
         for target in ("socket.create_connection", "socket.socket.connect"):
             stack.enter_context(mock.patch(target,

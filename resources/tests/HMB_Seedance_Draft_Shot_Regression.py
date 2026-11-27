@@ -1236,5 +1236,5 @@ class DraftShotTests(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    t.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.0
+    t._broker_transport.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.0
     unittest.main()

@@ -296,9 +296,9 @@ class AdmissionTests(unittest.TestCase):
             sys.modules[key] = module
             spec.loader.exec_module(module)
         target = sys.modules[key].t
-        patch = mock.patch.object(target, "_broker_load_token", side_effect=lambda **_: self.auth)
+        patch = mock.patch.object(target._broker_transport, "_broker_load_token", side_effect=lambda **_: self.auth)
         patch.start(); self.addCleanup(patch.stop)
-        target.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0
+        target._broker_transport.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0
         self.bridge = target._HMBAIBrokerBridge(server_url=fixture.ORIGIN, opener=SimpleNamespace(open=self.open))
         return target, self.bridge
 

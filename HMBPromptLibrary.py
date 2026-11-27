@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import nullcontext
 from pathlib import Path
 import hashlib
 import importlib.util
@@ -60,6 +61,14 @@ def _diagnostic_exception(context: str, exc: BaseException) -> None:
         _LOGGER.exception("%s %s: %s", _DIAGNOSTIC_PREFIX, context, exc)
     except Exception:
         return
+
+
+def _source_is_preparing(exc: BaseException) -> bool:
+    return isinstance(exc, ValueError) and (
+        getattr(exc, "hmb_image_asset_selection_preparing", False) is True
+        or getattr(exc, "hmb_picker_media_preparing", False) is True
+        or getattr(exc, "hmb_sound_preparing", False) is True
+    )
 
 
 try:
@@ -4366,7 +4375,7 @@ def _same_griptape_input_file(first: Path, second: Path | None) -> bool:
 
 def _restore_external_macro_row_authoring(
     state: Dict[str, Any], snapshot: Dict[str, Any], shot: Dict[str, Any],
-    *, unavailable: bool = False,
+    *, unavailable: bool = False, workflow: Any = None,
 ) -> tuple[set[str], set[str]]:
     """Recover authored rows when the live Shot resolves the same local file."""
     visible = state["images"]
@@ -4386,7 +4395,8 @@ def _restore_external_macro_row_authoring(
 
     def resolve(reference: str) -> Path | None:
         try:
-            path = Path(File(reference).resolve())
+            file = File(reference, workflow=workflow) if workflow is not None else File(reference)
+            path = Path(file.resolve())
             if path.is_absolute() and "{" not in str(path):
                 canonical = path.resolve(strict=not unavailable)
                 if unavailable or canonical.is_file():
@@ -5225,11 +5235,13 @@ def _merge_prompt_revision_axes(
 
     source = _normalize_state(copy.deepcopy(source_state))
     ui = _normalize_state(copy.deepcopy(ui_state))
+    source_shot = _normalize_shot_selection(source.get("shot"))
     if source.get("multi_shot_enabled") and ui.get("multi_shot_enabled"):
         documents = _merge_prompt_shot_document_revisions(source["shot_documents"], ui["shot_documents"])
         source["shot_documents"] = documents
         ui_selection = _normalize_shot_selection(ui.get("shot"))
-        if any(item["shot_uuid"] == ui_selection["shot_uuid"] and item["channel_uuid"] == ui_selection["channel_uuid"] for item in _verified_prompt_shot_catalog(source)):
+        if (_prompt_document_key(source_shot) != _prompt_document_key(ui_selection)
+                and any(item["shot_uuid"] == ui_selection["shot_uuid"] and item["channel_uuid"] == ui_selection["channel_uuid"] for item in _verified_prompt_shot_catalog(source))):
             source = _select_prompt_shot_document(source, ui_selection)
             source["shot_documents"] = documents
     # UI intent belongs to its channel/UUID document, not the displayed slot
@@ -5331,6 +5343,10 @@ def _merge_prompt_revision_axes(
         )
         if selected is not None:
             source["shot"] = _normalize_shot_selection(selected)
+            if (source_shot["shot_uuid"], source_shot["channel_uuid"]) == (selected["shot_uuid"], selected["channel_uuid"]):
+                # Catalog rows carry the last proven selection while an exact
+                # image read can already contain the new add/remove/order.
+                source["shot"]["selected_source_uids"] = source_shot["selected_source_uids"]
 
     source[SOURCE_SYNC_REVISION_KEY] = max(
         int(source.get(SOURCE_SYNC_REVISION_KEY) or 0),
@@ -10490,6 +10506,7 @@ class HMBPromptLibrary(DataNode):
         self._hmb_media_preview_source_ports: Dict[str, str] = {}
         # Prepared display pages are independent of execution snapshots.
         self._hmb_prompt_shot_views = {}
+        self._hmb_completed_prompt_shots = set()
         self._hmb_prompt_view_catalog_keys = None
         self._hmb_prompt_view_revision = 0
         self._hmb_prompt_view_warmup_pending = False
@@ -11075,6 +11092,70 @@ class HMBPromptLibrary(DataNode):
             options.pop("media_preview_sources", None)
         element.ui_options = options
 
+    def _hmb_shot_edit_locks_changed(self) -> None:
+        """Editor presentation only. Runtime locks never enter saved Shot documents."""
+        from _hmb_shot_routing import publish_source_widget_view, shot_edit_locks
+        element = _get_parameter_obj(self, WIDGET_PARAMETER_NAME)
+        if element is None:
+            return
+        getter = getattr(element, "authored_ui_options", None)
+        options = dict((getter() if callable(getter) else element.ui_options) or {})
+        values = {"shot_edit_locks": shot_edit_locks(self),
+                  "completed_prompt_shots": sorted(getattr(self, "_hmb_completed_prompt_shots", ()))}
+        if any(options.get(key, []) != value for key, value in values.items()):
+            values["shot_status_revision"] = max(0, _strict_int(options.get("shot_status_revision")) or 0) + 1
+            element.ui_options = {**options, **values}
+            # The pinned editor updates mounted widgets on value changes, but a
+            # ui_options-only transition does not reach their update callback.
+            # Include the current document for a first mount during a render.
+            # This is a view event only, never an authored parameter change.
+            if getattr(self, "workflow", None):
+                raw = _get_parameter_raw(self, WIDGET_PARAMETER_NAME)
+                if isinstance(raw, dict):
+                    raw = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+                if isinstance(raw, str) and raw.lstrip().startswith("{"):
+                    header = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+                    wire = '{"schema":"hmb-prompt-shot-status","status":' + header + ',"document":' + raw + '}'
+                    publish_source_widget_view(self, WIDGET_PARAMETER_NAME, wire)
+
+    def _hmb_check_locked_prompt_documents(self, value):
+        from _hmb_shot_routing import shot_edit_locks, assert_shot_editable
+        locks = shot_edit_locks(self)
+        if not locks:
+            return
+        before = _parse_state(getattr(self, "_hmb_last_accepted_widget_state", "")) or self._current_state()
+        incoming = value if isinstance(value, dict) else _parse_state(value)
+        documents = incoming.get("shot_documents") or {}
+        active = _prompt_document_key(incoming.get("shot"))
+        for lock in locks:
+            key = _prompt_document_key(lock)
+            if key != active and key not in documents:
+                continue
+            # Switching pages archives the outgoing editor with fresh clocks.
+            # Compare authored fields, including a locked archived sibling.
+            expected = _select_prompt_shot_document(copy.deepcopy(before), lock)
+            saved_before = (before.get("shot_documents") or {}).get(key)
+            archived = documents.get(key)
+            for item in (incoming if key == active else None, archived if archived != saved_before else None):
+                if item is None:
+                    continue
+                actual = item if isinstance(item, dict) else _parse_state(item)
+                if (_prompt_document_intent_fingerprint(actual) != _prompt_document_intent_fingerprint(expected)
+                        or actual.get("image_link_notices", []) != expected.get("image_link_notices", [])):
+                    assert_shot_editable(self, lock["channel_uuid"], lock["shot_uuid"])
+
+    def _hmb_set_prompt_completion(self, keys, completed):
+        observed = getattr(self, "_hmb_completed_prompt_shots", None)
+        if observed is None:
+            return
+        changed = (set(keys) - observed) if completed else observed.intersection(keys)
+        if changed:
+            if completed:
+                observed.update(changed)
+            else:
+                observed.difference_update(changed)
+            self._hmb_shot_edit_locks_changed()
+
     def _reconcile_connected_source_inputs_from_graph(self) -> bool:
         """Refresh source inputs from their actual connected output caches.
 
@@ -11330,7 +11411,7 @@ class HMBPromptLibrary(DataNode):
                     "ordered_assets": [{"source_uid": uid, "metadata": {"source_kind": "user"}}
                                        for uid in error.source_paths if uid.startswith("import:")],
                     "media_by_source_uid": error.source_paths,
-                }, current_shot, unavailable=True)
+                }, current_shot, unavailable=True, workflow=getattr(image_source_node, "workflow", None))
                 if restored and getattr(self, "_hmb_ui_syncing", False):
                     self._hmb_restored_external_rows = restored
                 display = error.dashboard_selection
@@ -11428,7 +11509,8 @@ class HMBPromptLibrary(DataNode):
                     image_snapshot, selected_shot
                 )
                 normalized["shot"] = selected_shot
-                restored, retired = _restore_external_macro_row_authoring(normalized, image_snapshot, selected_shot)
+                restored, retired = _restore_external_macro_row_authoring(
+                    normalized, image_snapshot, selected_shot, workflow=getattr(image_source_node, "workflow", None))
                 if restored and getattr(self, "_hmb_ui_syncing", False):
                     self._hmb_restored_external_rows = restored
                 live_uids = set(selected_shot["selected_source_uids"])
@@ -12048,6 +12130,9 @@ class HMBPromptLibrary(DataNode):
                     # A source can be between native hydrate/connection events.
                     # Never expose its former display under a replacement UUID.
                     self._hmb_prompt_shot_views.pop(key, None)
+            missing = getattr(self, "_hmb_completed_prompt_shots", set()) - self._hmb_prompt_shot_views.keys()
+            self._hmb_set_prompt_completion(missing, False)
+            changed.update(missing)
             return changed
 
     def _hmb_notify_prompt_view_consumers(self, keys: set[str] | None = None) -> None:
@@ -12082,6 +12167,39 @@ class HMBPromptLibrary(DataNode):
         except Exception:
             pass
 
+    def _hmb_invalidate_agent_stages(self, keys):
+        if not keys:
+            return
+        workflow = getattr(self, "_workflow", None)
+        connections = getattr(getattr(workflow, "flows", None), "connections", None)
+        if connections is None:
+            try:
+                from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+                connections = GriptapeNodes.FlowManager().get_connections()
+            except (ImportError, AttributeError, RuntimeError, KeyError):
+                return
+        output = _get_parameter_obj(self, "PROMPT_OUT")
+        if output is None:
+            return
+        seen = set()
+        for edge in connections.get_outgoing_connections_from_parameter(self, output):
+            if getattr(edge, "source_node", self) is not self:
+                continue
+            target = getattr(edge, "target_node", None)
+            invalidate = getattr(target, "_hmb_invalidate_shot_stage", None)
+            parameter = getattr(edge, "target_parameter", None)
+            parameter_name = getattr(parameter, "name", parameter) or getattr(edge, "target_parameter_name", None)
+            if parameter_name != "SHOT_PROMPT_IN" or not callable(invalidate) or id(target) in seen:
+                continue
+            seen.add(id(target))
+            for key in keys:
+                channel, _, shot = key.partition("/")
+                if shot:
+                    try:
+                        invalidate(channel, shot)
+                    except Exception as exc:
+                        _diagnostic_exception("Connected Agent Shot invalidation failed", exc)
+
     def _hmb_invalidate_analysis_route(self, *, channel_uuid: str, shot_uuid: str, role: str) -> None:
         """An Analysis remote has no native wire to dirty its consumers."""
         from _hmb_analysis_delivery import invalidate_resolved_analysis_consumer
@@ -12090,6 +12208,7 @@ class HMBPromptLibrary(DataNode):
         if role == "before":
             if self.lock:
                 return
+            self._hmb_set_prompt_completion([f"{channel_uuid}/{shot_uuid}"], False)
             invalidate_resolved_analysis_consumer(self)
         workflow = getattr(self, "_workflow", None)
         connections = getattr(getattr(workflow, "flows", None), "connections", None)
@@ -12107,6 +12226,9 @@ class HMBPromptLibrary(DataNode):
             if (edge.target_parameter.name != "SHOT_PROMPT_IN" or getattr(agent, "lock", False)
                     or not callable(getattr(agent, "_hmb_refresh_analysis_source_preview", None))):
                 continue
+            reset = getattr(agent, "_hmb_invalidate_shot_stage", None)
+            if callable(reset):
+                reset(channel_uuid, shot_uuid)
             invalidate_resolved_analysis_consumer(agent)
             final_text = _get_parameter_obj(agent, "output")
             if final_text is None:
@@ -12193,10 +12315,12 @@ class HMBPromptLibrary(DataNode):
         return {}
 
     def _hmb_prompt_document_for_agent_run(self, *, channel_uuid: str, shot_uuid: str) -> Dict[str, Any]:
-        return self._hmb_prompt_shot_document(channel_uuid=channel_uuid, shot_uuid=shot_uuid, _publish_for_agent=True)
+        document = self._hmb_prompt_shot_document(channel_uuid=channel_uuid, shot_uuid=shot_uuid, _publish_for_agent=True)
+        self._hmb_set_prompt_completion([f"{channel_uuid}/{shot_uuid}"], True)
+        return document
 
     async def _hmb_prepare_shot_analysis(self, *, channel_uuid, shot_uuid, for_agent=False, check_live=None):
-        from HMBAnalysisAgent import prepare_analysis_for_run
+        from _hmb_analysis_delivery import prepare_analysis_for_run
 
         for role in (("before", "after") if for_agent else ("before",)):
             if check_live is not None:
@@ -12264,6 +12388,19 @@ class HMBPromptLibrary(DataNode):
                 "participant_kind": "prompt", "enabled": True,
                 "channel_uuid": selected["channel_uuid"], "shot_uuid": selected["shot_uuid"],
                 "shot_number": selected["number"], "shot_name": selected["name"]}
+            reference_media = view._hmb_agent_reference_media(machine)
+            owner_metadata = getattr(asset_owner, "metadata", None)
+            if (reference_media and isinstance(owner_metadata, dict) and owner_metadata.get("library") == "HMB_GP_Production"
+                    and owner_metadata.get("node_type") == "HMBImageAssetLibrary"):
+                # _apply_exact_shot_routes verified these selected registrations and
+                # their project-relative paths against the connected asset publisher.
+                registered_project_images = {
+                    f"@image{slot}": path for kind, slot, _uid, path, row, excluded
+                    in self._hmb_analysis_visual_rows(state, images, [])
+                    if kind == "image" and not excluded and _verified_project_image(row)
+                }
+                if registered_project_images:
+                    reference_media["registered_project_images"] = registered_project_images
             document = copy.deepcopy({"schema": "hmb-prompt-shot-document", "version": 1,
                 "shot": state["shot"], "subscription": subscription, "visible_prompt": visible,
                 "machine_prompt": machine, "paired_snapshot": paired, "generation": generation,
@@ -12271,7 +12408,7 @@ class HMBPromptLibrary(DataNode):
                 "image_media": images, "video_media": videos,
                 "analysis_excluded_media": self._hmb_analysis_excluded_media(state, images, videos),
                 "audio_sources": copy.deepcopy(getattr(view, "_hmb_current_sound_snapshot", {})),
-                "reference_media": view._hmb_agent_reference_media(machine),
+                "reference_media": reference_media,
                 "generation_context": view._hmb_agent_generation_context(machine),
                 "project_identity": {key: project[key] for key in ("project_id", "project_name")}})
             if (_publish_for_agent and _prompt_document_key(current.get("shot")) == _prompt_document_key(selected)
@@ -12400,7 +12537,7 @@ class HMBPromptLibrary(DataNode):
 
     def _hmb_schedule_analysis_catalog_refresh(self) -> None:
         try:
-            from HMBAnalysisAgent import schedule_analysis_refresh
+            from _hmb_analysis_delivery import schedule_analysis_refresh
 
             schedule_analysis_refresh(self)
         except Exception as exc:
@@ -13083,6 +13220,8 @@ class HMBPromptLibrary(DataNode):
                 if (getattr(self, "lock", False) or not callable(move) or self._hmb_manual_rebind_pending()
                         or shot["shot_uuid"] != request.get("shot") or shot["channel_uuid"] != request.get("channel")):
                     raise ValueError("현재 프롬프트와 연결된 샷에서 이미지를 이동하세요.")
+                from _hmb_shot_routing import assert_shot_editable
+                assert_shot_editable(self, shot["channel_uuid"], shot["shot_uuid"])
                 move(request)
                 return
         if is_widget_write and _is_retired_analysis_pick(value):
@@ -13130,6 +13269,7 @@ class HMBPromptLibrary(DataNode):
             return
         if guarded_widget_write:
             value = self._hmb_filter_prompt_widget_write(value)
+            self._hmb_check_locked_prompt_documents(value)
             before = _parse_state(getattr(self, "_hmb_last_accepted_widget_state", "")) or self._current_state()
             if before.get("image_link_notices"):
                 after = _normalize_state(value if isinstance(value, dict) else _parse_state(value))
@@ -13244,10 +13384,7 @@ class HMBPromptLibrary(DataNode):
                     getattr(self, "_hmb_picker_route_hydration_pending", False)
                 )
         except Exception as exc:
-            if (isinstance(exc, ValueError) and (
-                getattr(exc, "hmb_image_asset_selection_preparing", False) is True
-                or getattr(exc, "hmb_picker_media_preparing", False) is True
-            )):
+            if _source_is_preparing(exc):
                 try:
                     self._schedule_prompt_sync(
                         source_burst=True,
@@ -13269,6 +13406,7 @@ class HMBPromptLibrary(DataNode):
     def _hmb_post_hydration_state_restore(self) -> None:
         self._flush_initial_prompt_hydration()
         self._hmb_refresh_media_preview_sources()
+        self._hmb_shot_edit_locks_changed()
 
     def _flush_initial_prompt_hydration(self) -> bool:
         with self._hmb_sync_lock:
@@ -13493,7 +13631,10 @@ class HMBPromptLibrary(DataNode):
             )
             if any(row.get("asset_source_unavailable") for row in state["images"]):
                 self._hmb_current_shot_images = []
-                self._hmb_prompt_shot_views.pop(_prompt_document_key(state["shot"]), None)
+                key = _prompt_document_key(state["shot"])
+                if self._hmb_prompt_shot_views.pop(key, None) is not None:
+                    self._hmb_set_prompt_completion([key], False)
+                    self._hmb_invalidate_agent_stages([key])
                 if state != current_state:
                     state[SOURCE_SYNC_REVISION_KEY] = min(MAX_SOURCE_SYNC_REVISION, source_sync_revision + 1)
                     _set_parameter_value(self, WIDGET_PARAMETER_NAME, _json_dumps(state))
@@ -13739,6 +13880,8 @@ class HMBPromptLibrary(DataNode):
         changed_prompt_views = self._hmb_prepare_prompt_shot_views()
         if active_view_changed:
             changed_prompt_views.add(_prompt_document_key(state.get("shot")))
+        self._hmb_set_prompt_completion(changed_prompt_views, False)
+        self._hmb_invalidate_agent_stages(changed_prompt_views)
         output_values = getattr(self, "parameter_output_values", {})
         output_getter = getattr(output_values, "get", None)
         current_output = output_getter("PROMPT_OUT") if callable(output_getter) else None
@@ -14394,7 +14537,7 @@ class HMBPromptLibrary(DataNode):
         *,
         source_burst: bool = False,
         publish_shot_media: bool = False,
-        image_retry: int = 0,
+        media_retry: int = 0,
     ) -> None:
         """Schedule on the host loop, or synchronize on the current host thread.
 
@@ -14443,6 +14586,15 @@ class HMBPromptLibrary(DataNode):
         event_loop = None
 
         def run_sync() -> None:
+            # A shared source can finish on the host loop after another
+            # workflow has become active. Resolve connections, macros and
+            # notifications in the workflow which owns this Prompt.
+            workflow = getattr(self, "workflow", None)
+            bind = getattr(getattr(workflow, "engine", None), "bind_workflow", None)
+            with bind(workflow) if callable(bind) else nullcontext():
+                sync_in_workflow()
+
+        def sync_in_workflow() -> None:
             publish_media = False
             try:
                 with self._hmb_sync_lock:
@@ -14464,13 +14616,7 @@ class HMBPromptLibrary(DataNode):
                     )
                     self._hmb_prompt_sync_failure = None
             except Exception as exc:
-                if (
-                    isinstance(exc, ValueError)
-                    and (
-                        getattr(exc, "hmb_image_asset_selection_preparing", False) is True
-                        or getattr(exc, "hmb_picker_media_preparing", False) is True
-                    )
-                ):
+                if _source_is_preparing(exc):
                     # The exact media source is verifying this selection
                     # off-thread. Keep authored state and the previous atomic
                     # output pair until its dependency publication retries us.
@@ -14484,15 +14630,14 @@ class HMBPromptLibrary(DataNode):
                             # A preparation callback can be coalesced with a
                             # newer selection. Give the current Shot a bounded
                             # retry even when no additional edge signal arrives.
-                            if (getattr(exc, "hmb_image_asset_selection_preparing", False) is True
-                                    and event_loop is not None and event_loop.is_running() and image_retry < 7):
+                            if event_loop is not None and event_loop.is_running() and media_retry < 7:
                                 generation = self._hmb_sync_generation
 
-                                def retry_current_image_selection() -> None:
+                                def retry_current_selection() -> None:
                                     if self._hmb_sync_generation == generation:
-                                        self._schedule_prompt_sync(source_burst=True, image_retry=image_retry + 1)
+                                        self._schedule_prompt_sync(source_burst=True, media_retry=media_retry + 1)
 
-                                event_loop.call_later(min(1.0, 0.05 * 2**image_retry), retry_current_image_selection)
+                                event_loop.call_later(min(1.0, 0.05 * 2**media_retry), retry_current_selection)
                     return
                 # A corrupt/replaced source must remain an explicit error, but
                 # an unchanged five-second refresh cannot recompile/log forever.
@@ -14570,6 +14715,11 @@ class HMBPromptLibrary(DataNode):
                     # override. Compare against the instance baseline before
                     # any prompt compile can consume that raw rollback.
                     merged_value = self._merge_widget_revision_axes(value)
+                    try:
+                        self._hmb_check_locked_prompt_documents(merged_value)
+                    except ValueError:
+                        self._restore_accepted_widget_state()
+                        raise
                     if merged_value != value:
                         self._accept_widget_state_baseline(merged_value)
                         self._restore_accepted_widget_state()
@@ -14679,10 +14829,7 @@ class HMBPromptLibrary(DataNode):
                 else:
                     self._sync_prompt_output_now()
         except Exception as exc:
-            if (isinstance(exc, ValueError) and (
-                getattr(exc, "hmb_image_asset_selection_preparing", False) is True
-                or getattr(exc, "hmb_picker_media_preparing", False) is True
-            )):
+            if _source_is_preparing(exc):
                 try:
                     self._schedule_prompt_sync(
                         source_burst=True,
@@ -14895,6 +15042,8 @@ class HMBPromptLibrary(DataNode):
             await self._hmb_prepare_shot_analysis(channel_uuid=channel, shot_uuid=shot, check_live=check_shot)
             check_shot()
         self.process()
+        if scope["enabled"] and _prompt_document_key(scope) in self._hmb_prompt_shot_views:
+            self._hmb_set_prompt_completion([_prompt_document_key(scope)], True)
 
     def process(self) -> None:
         if bool(getattr(self, "_hmb_node_deleted", False)):

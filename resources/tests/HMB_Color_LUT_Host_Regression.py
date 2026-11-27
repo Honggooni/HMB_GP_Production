@@ -1,6 +1,8 @@
 """Actual installed Griptape node/parameter construction, no network or user state."""
 from __future__ import annotations
 import copy
+import builtins
+from contextlib import ExitStack
 import json
 import logging
 import os
@@ -27,16 +29,34 @@ def main():
         env["GTN_CONFIG_WORKSPACE_DIRECTORY"] = str(root)
         with mock.patch.dict(os.environ, env), mock.patch.object(socket, "create_connection", side_effect=AssertionError("Network forbidden")):
             logging.disable(logging.CRITICAL)
-            with engine_scope() as engine:
+            with engine_scope() as engine, ExitStack() as view:
                 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
                 # Mimic Desktop's resolved static origin without starting any
                 # network server or altering the user's application config.
                 GriptapeNodes.StaticFilesManager()._static_server_base_url = "http://127.0.0.1:43219"
-                import HMBColorLUTLibrary as lut
                 import _hmb_shot_routing as routing
                 ensured = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="LUT archive", flow_name="LUTArchive"))
+                assert ensured.succeeded(), ensured.result_details
+                if hasattr(engine, "bind_workflow"):
+                    view.enter_context(engine.bind_workflow(engine.open_workflows.get(ensured.workflow_id)))
                 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
                 workflow = WorkflowRegistry.get_workflow_by_name(GriptapeNodes.ContextManager().get_current_workflow_name())
+                original_import = builtins.__import__
+                def independent_import(name, *args, **kwargs):
+                    if name in {"HMBFinishLookLibrary", "HMBImageAssetLibrary", "HMBSeedanceGeneration"}:
+                        raise ImportError(f"Simulated unavailable peer: {name}")
+                    return original_import(name, *args, **kwargs)
+                with mock.patch("builtins.__import__", side_effect=independent_import):
+                    import HMBColorLUTLibrary as lut
+                    import HMBAnalysisAgent as analyzer
+                    import HMBSoundLibrary as sound
+                    for cls, widget in ((lut.HMBColorLUTLibrary, lut.UI), (analyzer.HMBAnalysisAgent, analyzer.UI),
+                                        (sound.HMBSoundLibrary, sound.UI)):
+                        independent = cls(name=f"Standalone {cls.__name__}")
+                        assert isinstance(independent, DataNode) and independent.get_parameter_by_name(widget)
+                        if cls is sound.HMBSoundLibrary:
+                            assert independent.get_parameter_by_name("HMB_SITE_FOLDER_DRAFT")
+                        independent.after_node_deleted()
                 assert lut._workflow_data_directory() == root / "data"
                 first_path = root / "shots" / "example.py"
                 first_path.parent.mkdir()

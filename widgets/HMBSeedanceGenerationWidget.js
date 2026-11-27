@@ -512,6 +512,10 @@ export function hmbSeedanceShotState(props) {
       ? { cancel_available: source.draft?.cancel_available, active_job_id: source.draft?.active_job_id }
       : source.draft),
     remote_prompt_route: hmbSeedanceRemotePromptRoute(source),
+    shot_edit_locks: Array.isArray(source.shot_edit_locks) ? source.shot_edit_locks
+      .filter(lock => uuid(lock?.channel_uuid) && uuid(lock?.shot_uuid)) : [],
+    shot_edit_fields: Array.isArray(source.shot_edit_fields) ? source.shot_edit_fields
+      .filter(name => typeof name === "string") : [],
   };
   if (mode) {
     Object.assign(state, mode);
@@ -528,6 +532,7 @@ export function hmbSeedanceDraftState(value) {
     action: text(source.action, 80),
     preview_available: source.preview_available === true,
     run_locked: source.run_locked === true,
+    render_completed: source.render_completed === true,
     final_available: source.final_available === true,
     job_id: text(source.job_id, 160),
     effective_resolution: text(source.effective_resolution, 16),
@@ -591,6 +596,60 @@ export function hmbSeedanceShotAccent(state) {
   return HMB_SEEDANCE_JEWEL_NIGHT_PALETTE[hmbSeedancePaletteShotNumber(state)];
 }
 
+export function hmbSeedanceShotLocked(state) {
+  return state?.execution_mode !== "only" && Boolean(state?.shot?.shot_uuid) &&
+    state.shot_edit_locks?.some(lock => lock.channel_uuid === state.shot.channel_uuid &&
+      lock.shot_uuid === state.shot.shot_uuid) === true;
+}
+
+function hmbSeedanceShotComplete(state) {
+  return Boolean(state.shot.shot_uuid && !hmbSeedanceShotWaiting(state) &&
+    !hmbSeedanceShotLocked(state) && state.draft.render_completed);
+}
+
+function hmbSeedanceShotProgress(state) {
+  return hmbSeedanceShotLocked(state) ? "로동중... 수정불가" : "";
+}
+
+function syncLockedParameterRows(container, state) {
+  const node = hmbSeedanceNodeRoot(container);
+  const fields = state && hmbSeedanceShotLocked(state) ? state.shot_edit_fields : [];
+  const previous = container.__hmbShotFieldLock;
+  const key = JSON.stringify(fields);
+  if (previous && previous.node === node && previous.key === key) return;
+  if (previous) {
+    previous.observer?.disconnect();
+    for (const row of previous.changed) row.inert = false;
+    delete container.__hmbShotFieldLock;
+  }
+  if (!fields.length || !node?.querySelectorAll) return;
+  const changed = new Set(), names = new Set(fields);
+  const update = () => {
+    for (const row of changed) {
+      if (!node.contains(row) || !names.has(row.getAttribute("data-parameter-name"))) {
+        changed.delete(row);
+        row.inert = false;
+      }
+    }
+    for (const row of node.querySelectorAll("[data-parameter-name]")) {
+      if (names.has(row.getAttribute("data-parameter-name")) && !row.inert) {
+        row.inert = true;
+        changed.add(row);
+      }
+    }
+  };
+  update();
+  const Observer = node.ownerDocument?.defaultView?.MutationObserver;
+  const containsParameter = element => element.nodeType === 1 &&
+    (element.hasAttribute("data-parameter-name") || element.querySelector("[data-parameter-name]"));
+  const observer = Observer ? new Observer(records => {
+    if (records.some(record => record.type === "attributes" ||
+      [...record.addedNodes, ...record.removedNodes].some(containsParameter))) update();
+  }) : null;
+  observer?.observe(node, {childList: true, subtree: true, attributes: true, attributeFilter: ["data-parameter-name"]});
+  container.__hmbShotFieldLock = {node, key, changed, observer};
+}
+
 function optionLabel(item) {
   if (item.waiting) return item.name;
   if (item.only) return "Only";
@@ -623,7 +682,7 @@ export function hmbSeedanceSyncShotSelect(select, state) {
   if (optionsChanged) select.innerHTML = optionMarkup(state);
   const expected = hmbSeedanceShotKey(state);
   if (String(select.value || "") !== expected) select.value = expected;
-  select.disabled = false;
+  select.disabled = hmbSeedanceShotLocked(state);
   return optionsChanged;
 }
 
@@ -641,6 +700,15 @@ function render(state) {
   const theme = SHOT_THEME[number];
   return `
     <style>
+      /* HMB_SHOT_PROGRESS_BEGIN */
+      .hmb-seedance-shot[data-bound-shot="true"] [data-hmb-native-actions] div:is(.bg-green-600,.bg-blue-600):has(>span.leading-none){display:none!important}
+      .hmb-seedance-shot__progress{flex:none;color:#e2e8f0;font-weight:750;font-size:12px}
+      .hmb-seedance-shot__progress:empty{display:none}
+      .hmb-seedance-shot[data-locked-shot="false"] .hmb-seedance-shot__progress{color:#86efac}
+      .hmb-seedance-shot[data-locked-shot="true"] :is(.hmb-seedance-shot__number,.hmb-seedance-shot__select){filter:grayscale(1);color:#e5e7eb;opacity:1}
+      .react-flow__node:has(.hmb-seedance-shot[data-locked-shot="true"]) [data-parameter-name][inert]{filter:grayscale(1)}
+      .hmb-seedance-shot [data-hmb-shot-check="true"]{display:inline-flex!important;align-items:center;justify-content:center;gap:2px!important;width:38px!important;min-width:38px!important;max-width:38px!important;height:30px!important;min-height:30px!important;max-height:30px!important;flex:none!important;padding:0!important;box-sizing:border-box!important;font:700 11px/1 system-ui!important;font-variant-numeric:tabular-nums;background:#12301d!important;color:#dcfce7!important;border:1px solid #4ade80!important;border-radius:5px!important;filter:none!important;opacity:1!important}.hmb-seedance-shot [data-hmb-shot-check="true"]::before{content:"✓";font:900 20px/1 system-ui;color:#4ade80;flex:none}
+      /* HMB_SHOT_PROGRESS_END */
       button[data-hmb-completed-render]{opacity:.45!important;cursor:default!important;pointer-events:none!important}
       .hmb-seedance-shot :is(button,input,select,textarea):not(:where([data-hmb-native-identity] *,[data-hmb-native-actions] *)){font-family:inherit}
       .hmb-seedance-preview-overlay :is(button,input,select,textarea){font-family:inherit}
@@ -693,7 +761,7 @@ function render(state) {
       /* HMB_NATIVE_HEADER_SLOTS_END */
       @keyframes hmb-seedance-preview-spin{to{transform:rotate(360deg)}}
     </style>
-    <div class="hmb-seedance-shot nodrag" data-shot-number="${number}">
+    <div class="hmb-seedance-shot nodrag" data-shot-number="${number}" data-bound-shot="${Boolean(state.shot.shot_uuid)}" data-locked-shot="${hmbSeedanceShotLocked(state)}">
       <div class="hmb-seedance-shot__row group">
         <div class="hmb-seedance-shot__mark" aria-hidden="true">SD</div>
         <div class="hmb-seedance-shot__title">HMBSeedanceGeneration</div>
@@ -705,8 +773,9 @@ function render(state) {
           <button type="button" class="hmb-seedance-shot__final nodrag" data-hmb-seedance-finalize-draft hidden disabled title="${HMB_SEEDANCE_FINAL_HELP}">생성</button>
           <button type="button" class="hmb-seedance-shot__final nodrag" data-hmb-seedance-retry-final hidden>상태 다시 조회</button>
         </div>
-        <span class="hmb-seedance-shot__number" data-seedance-shot-number>${hmbSeedanceShotBadge(state)}</span>
-        <select class="hmb-seedance-shot__select nodrag" aria-label="Shot">${optionMarkup(state)}</select>
+        <span class="hmb-seedance-shot__number" data-seedance-shot-number data-hmb-shot-check="${hmbSeedanceShotComplete(state)}" title="${hmbSeedanceShotComplete(state) ? "렌더 완료" : ""}">${hmbSeedanceShotBadge(state)}</span>
+        <span class="hmb-seedance-shot__progress" role="status" aria-live="polite">${hmbSeedanceShotProgress(state)}</span>
+        <select class="hmb-seedance-shot__select nodrag" aria-label="Shot"${hmbSeedanceShotLocked(state) ? " disabled" : ""}>${optionMarkup(state)}</select>
       </div>
     </div>`;
 }
@@ -2552,6 +2621,11 @@ function refresh(container, props) {
   const number = hmbSeedancePaletteShotNumber(state);
   const theme = SHOT_THEME[number];
   root.dataset.shotNumber = String(number);
+  root.dataset.boundShot = String(Boolean(state.shot.shot_uuid));
+  root.dataset.lockedShot = String(hmbSeedanceShotLocked(state));
+  const progress = root.querySelector?.(".hmb-seedance-shot__progress");
+  if (progress) setElementText(progress, hmbSeedanceShotProgress(state));
+  syncLockedParameterRows(container, state);
   root.style.setProperty("--shot-accent", HMB_SEEDANCE_JEWEL_NIGHT_PALETTE[number]);
   root.style.setProperty("--shot-rgb", theme.rgb);
   root.style.setProperty("--shot-soft", theme.soft);
@@ -2559,7 +2633,9 @@ function refresh(container, props) {
   if (select) hmbSeedanceSyncShotSelect(select, state);
   const numberBadge = root.querySelector?.("[data-seedance-shot-number]");
   if (numberBadge) {
-    numberBadge.textContent = hmbSeedanceShotBadge(state);
+    setElementText(numberBadge, hmbSeedanceShotBadge(state));
+    numberBadge.dataset.hmbShotCheck = String(hmbSeedanceShotComplete(state));
+    numberBadge.title = hmbSeedanceShotComplete(state) ? "렌더 완료" : "";
   }
   hmbSeedanceSyncDraftAction(container, state);
   const error = container.__hmbSeedanceShotChangeError || "";
@@ -2854,6 +2930,7 @@ function hmbNativeUiImplementation(container, props) {
   compactHost(container);
   const initialState = hmbSeedanceShotState(resolved.props);
   container.innerHTML = render(initialState);
+  syncLockedParameterRows(container, initialState);
   const nativeHeader = hmbInstallNativeHeaderBridge(container, "HMBSeedanceGeneration", ".hmb-seedance-shot");
   hmbSeedanceSyncDraftAction(container, initialState);
   hmbSeedanceSyncPreviewOverlay(container, initialState);
@@ -2909,7 +2986,7 @@ function hmbNativeUiImplementation(container, props) {
     const previousProps = liveProps;
     const previousState = hmbSeedanceShotState(liveProps);
     const selected = hmbSeedanceShotOptions(previousState).find((item) => item.key === select?.value);
-    if (!selected || typeof liveProps.onChange !== "function") {
+    if (hmbSeedanceShotLocked(previousState) || !selected || typeof liveProps.onChange !== "function") {
       refresh(container, liveProps);
       return;
     }
@@ -3028,6 +3105,7 @@ function hmbNativeUiImplementation(container, props) {
   container.addEventListener?.("pointerdown", stopInteriorSelection);
   const cleanup = () => {
     nativeHeader.cleanup();
+    syncLockedParameterRows(container, null);
     hmbSeedanceCleanupRemotePromptEdge(container);
     hmbSeedanceCleanupPreviewOverlay(container);
     if (typeof window !== "undefined" && typeof window.removeEventListener === "function") {
@@ -3231,23 +3309,34 @@ function hmbAcquireNativeStockSafety(container) {
   const key = "__HMB_NATIVE_STOCK_SAFETY_V1__";
   let shared = doc[key];
   if (!shared) {
-    const owners = new Set(), identities = new Map();
+    const owners = new Set(), identities = new Set();
+    let parents = new WeakSet(), awaitingMount = false;
     let contextNode = null, notice = null, noticeTimer = null, disposed = false;
     const nativeReady = () => doc.documentElement.getAttribute("data-hmb-native-deletion-guard") === "engine-preflight"
       && doc.documentElement.getAttribute("data-hmb-native-deletion-protection-version") === "2";
     const rootOf = value => value?.closest?.(".react-flow__node[data-id]") || null;
+    const currentRoot = owner => owner.container?.isConnected ? rootOf(owner.container) : null;
+    const trackParents = element => {
+      for (let parent = element?.parentNode; parent && !parents.has(parent); parent = parent.parentNode) {
+        parents.add(parent);
+      }
+    };
     const roots = () => {
+      parents = new WeakSet();
+      awaitingMount = false;
       for (const owner of owners) {
-        const node = owner.active && owner.container?.isConnected ? rootOf(owner.container) : null;
-        if (node) identities.set(node, node.getAttribute("data-id"));
+        owner.node = currentRoot(owner);
+        if (owner.node) identities.add(owner.node);
+        if (owner.container.isConnected) trackParents(owner.container);
+        else awaitingMount = true;
       }
       // A stock fold/virtualized widget unmount is not a node deletion. Keep
       // its exact outer DOM identity until that node actually leaves the view.
-      for (const [node] of identities) {
+      for (const node of identities) {
         if (!node.isConnected) identities.delete(node);
-        else identities.set(node, node.getAttribute("data-id")); // Native rename keeps this exact retained outer node.
+        else trackParents(node);
       }
-      return new Set(identities.keys());
+      return identities;
     };
     const isEditing = target => Boolean(target?.closest?.("input,textarea,select,[contenteditable='true'],[contenteditable=''],[role='textbox'],.CodeMirror,.cm-editor"));
     const canvasOf = node => node?.closest?.(".react-flow");
@@ -3314,10 +3403,16 @@ function hmbAcquireNativeStockSafety(container) {
       if (!owners.size && !retained.size) { dispose(); return; }
       if (nativeReady() || !retained.size) dismiss();
     };
-    const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(sync) : null;
+    // Card and prompt edits occur below the widget host and cannot move its
+    // outer node. Still observe reparenting, folds, native markers and late mounts.
+    const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(records => {
+      if (awaitingMount || records.some(record => record.type === "attributes" || parents.has(record.target))) sync();
+    }) : null;
     observer?.observe(doc.documentElement, { attributes: true, attributeFilter: ["data-hmb-native-deletion-guard", "data-hmb-native-deletion-protection-version", "data-id"], childList: true, subtree: true });
     win.addEventListener("keydown", keydown, true); win.addEventListener("click", click, true); win.addEventListener("contextmenu", contextmenu, true);
-    shared = { owners, sync, release(owner) {
+    shared = { owners, sync, refresh(owner) {
+      if (currentRoot(owner) !== owner.node) sync();
+    }, release(owner) {
       owner.active = false; owners.delete(owner);
       sync();
     } };
@@ -3326,7 +3421,7 @@ function hmbAcquireNativeStockSafety(container) {
   const owner = { container, active: true };
   shared.owners.add(owner);
   shared.sync();
-  return { refresh() { if (owner.active) shared.sync(); }, cleanup() { if (owner.active) shared.release(owner); } };
+  return { refresh() { if (owner.active) (shared.refresh || shared.sync)(owner); }, cleanup() { if (owner.active) shared.release(owner); } };
 }
 
 // Griptape loads each widget as a separate module. One selection per editor

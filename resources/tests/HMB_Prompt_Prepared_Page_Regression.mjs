@@ -23,6 +23,7 @@ for (const [name, probe] of [
   ['render', 'function render(state, includeStyle = true) {'],
   ['tree_patch', /export function hmbPatchPromptDashboard\([^)]*\) \{/u],
   ['fit', 'function hmbFitGroupHeightsToCenter(container, state, measuredHosts = null) {'],
+  ['scroll_restore', 'function hmbRestoreSourceScrollNow(container) {'],
 ]) {
   const declaration = typeof probe === 'string' ? probe : source.match(probe)?.[0];
   assert.ok(declaration && source.includes(declaration), String(probe));
@@ -81,7 +82,7 @@ try {
       host.querySelector(`[data-prompt-shot="${shots[index].shot_uuid}"]`).click();
       await frames(); await frames();
     };
-    const newProbe = () => ({normalize: 0, render: 0, tree_patch: 0, fit: 0, listeners: 0});
+    const newProbe = () => ({normalize: 0, render: 0, tree_patch: 0, fit: 0, listeners: 0, scroll_restore: 0});
     globalThis.__pageStacks = [];
     globalThis.__pageProbe = newProbe();
     controller = widget.default(host, props(latest));
@@ -157,7 +158,7 @@ try {
       throw Error(`Cached shot navigation measured live layout: ${JSON.stringify(layoutReads)}`);
     }
     const pure = {...globalThis.__pageProbe};
-    if (Object.values(pure).some(Boolean)) throw Error(`Pure navigation performed expensive work: ${JSON.stringify(pure)} ${JSON.stringify(globalThis.__pageStacks)}`);
+    if (Object.entries(pure).some(([key, count]) => count && (!baseline || key !== 'scroll_restore'))) throw Error(`Pure navigation performed expensive work: ${JSON.stringify(pure)} ${JSON.stringify(globalThis.__pageStacks)}`);
     globalThis.__pageProbe = null;
     EventTarget.prototype.addEventListener = add;
     // Edit and immediately leave each page before the typing debounce fires.
@@ -247,6 +248,14 @@ try {
       expectedScroll.set(shots[index].shot_uuid,center.scrollTop);
       if(index!==2 && center.scrollTop<=0)throw Error('Scroll fixture did not overflow '+JSON.stringify({height:center.clientHeight,scroll:center.scrollHeight,overflow:getComputedStyle(center).overflowY,html:center.outerHTML.slice(0,300)}));
     }
+    // A Run outside Prompt flushes its pending shot change before the first
+    // paint. The saved scroll belongs to the incoming shot even if its editor
+    // has just been reattached and Chromium still reports zero.
+    host.querySelector(`[data-prompt-shot="${shots[1].shot_uuid}"]`).click();
+    document.body.dispatchEvent(new MouseEvent('click', {bubbles:true}));
+    await frames(); await frames();
+    const afterFlush=host.querySelector('.group-card[data-group-id="imageSources"] .source-scrollbox').scrollTop;
+    if(Math.abs(afterFlush-expectedScroll.get(shots[1].shot_uuid))>1)throw Error(`Early commit lost shot scroll: ${afterFlush} expected ${expectedScroll.get(shots[1].shot_uuid)}`);
     for(const index of [4,2,0,3,1,4,0]) {
       await select(index);
       const actual=host.querySelector('.group-card[data-group-id="imageSources"] .source-scrollbox').scrollTop;
@@ -303,7 +312,7 @@ try {
     if (host.children.length || host.__hmbPromptLibraryApplyProps || host.__hmbPromptLibraryLifecycle) throw Error('Cleanup left a cached page or lifecycle behind');
     const sorted = [...durations].sort((a, b) => a - b);
     const median = (sorted[19] + sorted[20]) / 2;
-    return {shots: 5, image_rows_per_shot: imageRows, initial_preparation: firstMount, first_other_visit: firstVisit, lazy_heavy: lazy, burst_selections: 40, acknowledged_selections: 10, pure_navigation_work: pure, first_visit_sync_ms: firstVisitSyncMs, median_click_ms: median, max_click_ms: max, burst_clicks_ms: durations, frame_separated_clicks_ms: acknowledgedDurations, synchronous_layout_reads: layoutReads, per_shot_dirty_edit: 5, save_reopen_checks: 5, deleted_replaced_restored_uuid: true, publications, scroll_checks:17, rapid_scroll_switches:46, focus_caret_checks:5, legacy_scroll_checks:6, stale_scroll_ack_checks:1, post_scroll_save_reopen_checks:5, deferred_cleanup_checks:1, passed: true};
+    return {shots: 5, image_rows_per_shot: imageRows, initial_preparation: firstMount, first_other_visit: firstVisit, lazy_heavy: lazy, burst_selections: 40, acknowledged_selections: 10, pure_navigation_work: pure, first_visit_sync_ms: firstVisitSyncMs, median_click_ms: median, max_click_ms: max, burst_clicks_ms: durations, frame_separated_clicks_ms: acknowledgedDurations, synchronous_layout_reads: layoutReads, per_shot_dirty_edit: 5, save_reopen_checks: 5, deleted_replaced_restored_uuid: true, publications, scroll_checks:18, immediate_run_scroll_checks:1, immediate_run_scroll_px:afterFlush, rapid_scroll_switches:46, focus_caret_checks:5, legacy_scroll_checks:6, stale_scroll_ack_checks:1, post_scroll_save_reopen_checks:5, deferred_cleanup_checks:1, passed: true};
   }, {imageRows, baseline});
   assert.deepEqual(errors, []);
   assert.equal(receipt.external_requests, 0);

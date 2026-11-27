@@ -294,7 +294,7 @@
     "library_version": "0.9.77",
     "engine_version": "",
     "agent_policy_delivery": {
-      "archive_source_count": 129,
+      "archive_source_count": 131,
       "mode": "bundled_signed_dat",
       "runtime_path": "resources/agent/superwings12/hmb_agent_core.dat",
       "policy_version": "2026-11-24.sheet-shape.v8.5",

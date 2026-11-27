@@ -5,6 +5,7 @@ from concurrent.futures import Future
 from array import array
 from contextlib import contextmanager
 from functools import lru_cache
+from itertools import islice
 from pathlib import Path
 import asyncio
 import base64
@@ -41,6 +42,7 @@ from _hmb_image_asset_sites import (
     run_site_folder_command, get_site_settings, save_site_settings,
     site_profiles, verify_folder_identity, image_execution_workspace,
 )
+from _hmb_node_controls import add_project_folder_parameter, add_site_folder_parameter
 from _hmb_project import project_display_name
 
 
@@ -91,18 +93,6 @@ image_color_pick_choices_for_taxonomy = _hmb.image_color_pick_choices_for_taxono
 image_sub_type_choices_for_main_type = _hmb.image_sub_type_choices_for_main_type
 image_taxonomy_wire_pair = _hmb.image_taxonomy_wire_pair
 image_taxonomy_payload = _hmb.image_taxonomy_payload
-
-try:
-    from griptape_nodes.traits.file_system_picker import FileSystemPicker  # type: ignore
-except Exception:
-    FileSystemPicker = None  # type: ignore
-
-try:
-    from griptape_nodes.exe_types.param_types.parameter_string import (  # type: ignore
-        ParameterString,
-    )
-except Exception:
-    ParameterString = None  # type: ignore
 
 try:
     from griptape_nodes.exe_types.core_types import ParameterList  # type: ignore
@@ -1027,23 +1017,7 @@ def _taxonomy_key(value: Any) -> str:
     return re.sub(r"[^0-9a-z]+", "", _clean(value).casefold())
 
 
-def _open_shared_asset_read(path: Path):
-    """Allow a teammate to rename or delete a source while this reader is open."""
-    if os.name != "nt":
-        return path.open("rb")
-    import _winapi
-    import msvcrt
-
-    def open_descriptor(filename, _flags):
-        # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
-        handle = _winapi.CreateFile(filename, _winapi.GENERIC_READ, 0x7, 0, _winapi.OPEN_EXISTING, 0, 0)
-        try:
-            return msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
-        except BaseException:
-            _winapi.CloseHandle(handle)
-            raise
-
-    return open(path, "rb", opener=open_descriptor)
+_open_shared_asset_read = _hmb.open_shared_media
 
 
 def _read_shared_manifest_bytes(path: Path) -> bytes:
@@ -4003,7 +3977,7 @@ def _windows_folder_change_times(folder: Path) -> dict[str, int]:
     buffer = ctypes.create_string_buffer(64 * 1024)
     # FILE_LIST_DIRECTORY, all share modes, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS.
     try:
-        handle = _winapi.CreateFile(str(folder), 1, 7, 0, _winapi.OPEN_EXISTING, 0x02000000, 0)
+        handle = _hmb.open_windows_shared_handle(folder, access=1, flags=0x02000000)
     except OSError:
         return {}
     try:
@@ -6776,14 +6750,15 @@ def _registration_folder_path(project_root: Path, folder_value: Any) -> Path:
     return resolved_destination
 
 
-def _resolve_import_file_reference(value: str) -> Path | None:
+def _resolve_import_file_reference(value: str, *, workflow=None) -> Path | None:
     """Resolve a server-local path, including Griptape project macros."""
     text = _decode_file_uri(value)
     if re.search(r"\{[A-Za-z_][A-Za-z0-9_]*\}", text):
         try:
             from griptape_nodes.files.file import File  # type: ignore
 
-            text = File(text).resolve()
+            file = File(text, workflow=workflow) if workflow is not None else File(text)
+            text = file.resolve()
         except Exception:
             return None
     try:
@@ -9761,88 +9736,6 @@ def _add_image_import_input(node: Any) -> None:
     _safe_add_parameter(node, **kwargs)
 
 
-def _add_project_root(node: Any, *, site_draft: bool = False) -> None:
-    name = SITE_FOLDER_DRAFT_PARAMETER if site_draft else PROJECT_ROOT_PARAMETER
-    if parameter_exists(node, name):
-        return
-    tooltip = (
-        "Select a projects catalog. Each direct child "
-        "folder is one project; a direct project folder is also accepted. Optional "
-        "hmb_image_assets.json records may override inferred Asset ID, Image "
-        "Name, optional Main/Sub metadata, and default selection. Registered "
-        "records are read-only; only unregistered project media can use Add."
-    )
-    if site_draft:
-        tooltip = "Choose a shared vendor asset folder. Save in ImageAsset project settings to apply."
-    default = "" if site_draft else str(DEFAULT_PROJECTS_ROOT)
-    trait = None
-    if FileSystemPicker is not None:
-        for trait_kwargs in (
-            {
-                "allow_files": False,
-                "allow_directories": True,
-                "multiple": False,
-            },
-            {"allow_directories": True},
-        ):
-            try:
-                trait = FileSystemPicker(**trait_kwargs)
-                break
-            except Exception:
-                continue
-    if ParameterString is not None:
-        parameter = ParameterString(
-            name=name,
-            default_value=default,
-            tooltip=tooltip,
-            placeholder_text=default,
-        )
-        if trait is not None:
-            try:
-                parameter.add_trait(trait)
-            except Exception:
-                pass
-        try:
-            parameter.allowed_modes = _mode_set("PROPERTY")
-        except Exception:
-            pass
-        try:
-            options = dict(getattr(parameter, "ui_options", {}) or {})
-            options.update(
-                {
-                    "display_name": name,
-                    "placeholder_text": default,
-                    "is_full_width": True,
-                }
-            )
-            parameter.ui_options = options
-        except Exception:
-            pass
-        node.add_parameter(parameter)
-        return
-    kwargs: Dict[str, Any] = {
-        "name": name,
-        "default_value": default,
-        "type": "str",
-        "tooltip": tooltip,
-        "allow_input": False,
-        "allow_output": False,
-        "allow_property": True,
-        "ui_options": {
-            "display_name": name,
-            "placeholder_text": default,
-            "is_full_width": True,
-        },
-    }
-    modes = _mode_set("PROPERTY")
-    if modes is not None:
-        kwargs["allowed_modes"] = modes
-        kwargs["allow_input"] = False
-    if trait is not None:
-        kwargs["traits"] = {trait}
-    _safe_add_parameter(node, **kwargs)
-
-
 def _add_widget_state(node: Any) -> None:
     if parameter_exists(node, WIDGET_STATE_PARAMETER):
         return
@@ -10659,8 +10552,14 @@ class HMBImageAssetLibrary(DataNode):
         _add_shot_asset_output(self)
         _add_image_bash_outputs(self)
         _add_image_import_input(self)
-        _add_project_root(self)
-        _add_project_root(self, site_draft=True)
+        add_project_folder_parameter(self, PROJECT_ROOT_PARAMETER, str(DEFAULT_PROJECTS_ROOT),
+            "Select a projects catalog. Each direct child "
+            "folder is one project; a direct project folder is also accepted. Optional "
+            "hmb_image_assets.json records may override inferred Asset ID, Image "
+            "Name, optional Main/Sub metadata, and default selection. Registered "
+            "records are read-only; only unregistered project media can use Add."
+        )
+        add_site_folder_parameter(self)
         _add_widget_state(self)
         # This parameter carries serialized JSON. Substituting a Windows
         # workspace path inside that JSON inserts unescaped backslashes.
@@ -11137,6 +11036,62 @@ class HMBImageAssetLibrary(DataNode):
             self._hmb_selected_routing_view = (raw, _json_text(state))
         return state
 
+    @staticmethod
+    def _hmb_source_shot_key(state, channel, shot):
+        routing = state.get("shot_routing") or {}
+        row = next((r for r in routing.get("shots", ()) if r.get("shot_uuid") == shot), None)
+        if not row or routing.get("channel_uuid") != channel:
+            return None
+        order = tuple(row.get("selected_source_uids", ()))
+        selected = {a.get("source_uid"): a for a in state.get("assets", ()) if a.get("selected")}
+        fields = _PROJECT_RESOLUTION_KEY_FIELDS + ("media_signature",)
+        hierarchy = state.get("shot_hierarchy") or {}
+        members = hierarchy.get("members") or ()
+        member = next((item for item in members if item["gp_shot_uuid"] == shot), None)
+        relation = None
+        if member:
+            relation = (hierarchy.get("binding_id"), member["member_id"], member.get("parent_id"),
+                        tuple(item["member_id"] for item in members if item.get("parent_id") == member["member_id"]))
+        return (state.get("project_uid"), row.get("name"), order,
+                tuple(tuple(selected.get(uid, {}).get(k) for k in fields) for uid in order),
+                row.get("number"), row.get("name_is_custom"), relation)
+
+    def _assert_locked_sources_preserved(self, previous, candidate):
+        locks = _hmb_shot_routing.shot_edit_locks(self)
+        if not locks:
+            return
+        previous = _parse_mapping(previous)
+        for lock in locks:
+            channel, shot = lock["channel_uuid"], lock["shot_uuid"]
+            before = self._hmb_source_shot_key(previous, channel, shot)
+            after = self._hmb_source_shot_key(candidate, channel, shot)
+            registration = candidate.get("asset_registration_request") or {}
+            edits_selected = before and (candidate.get("disconnect_import_uid") in before[2]
+                or (registration.get("action") in {"edit", "delete"}
+                    and any(entry[0] == registration.get("asset_library_id") for entry in before[3])))
+            if before != after or edits_selected:
+                _hmb_shot_routing.assert_shot_editable(self, channel, shot)
+
+    def _hmb_shot_edit_locks_changed(self):
+        if getattr(self, "workflow", None) and not getattr(self, "_hmb_node_deleted", False):
+            state = getattr(self, "_hmb_catalog_search_authority", None)
+            if state:
+                self._publish_source_status_if_changed(state)
+
+    def _publish_source_status_if_changed(self, state):
+        view = _hmb_shot_routing.source_shot_status_fields(self, state)
+        previous = getattr(self, "_hmb_last_shot_status", None)
+        if view == previous or (previous is None and not any(view.values())):
+            return
+        # The editor can mount a second view from its most recent event alone.
+        # Carry the visible page and selected sources so that view retains its
+        # owner/Shot IDs. Existing mounts only apply the two status fields.
+        _hmb_shot_routing.publish_source_widget_view(self, WIDGET_STATE_PARAMETER,
+            _json_text({"schema":"hmb-image-shot-status", WIDGET_RUNTIME_LEASE_KEY:self._hmb_widget_runtime_lease,
+                        "channel_uuid":state["shot_routing"]["channel_uuid"],
+                        "document": self._catalog_page_projection(state, shot_status=view), **view}))
+        self._hmb_last_shot_status = view
+
     def _hmb_project_identity(self) -> Dict[str, str]:
         """Read the selected project without scanning, publishing, or changing UI."""
         from _hmb_project import project_from_asset_payload
@@ -11443,6 +11398,15 @@ class HMBImageAssetLibrary(DataNode):
         media is an error, never a successful empty/partial publication.
         """
         state = self._selected_routing_state()
+        try:
+            result = self._read_image_shot(state, channel_uuid, shot_uuid, cached_only, include_link_notices)
+        except (_hmb_shot_routing.ShotImageUnavailable, ValueError):
+            _hmb_shot_routing.clear_source_shot_check(self, channel_uuid, shot_uuid)
+            raise
+        _hmb_shot_routing.record_source_shot_check(self, state, channel_uuid, shot_uuid)
+        return result
+
+    def _read_image_shot(self, state, channel_uuid, shot_uuid, cached_only, include_link_notices):
         routing = state["shot_routing"]
         channel, target = _uuid_text(channel_uuid), _uuid_text(shot_uuid)
         if not channel or not target or channel != routing["channel_uuid"]:
@@ -11491,7 +11455,7 @@ class HMBImageAssetLibrary(DataNode):
                 Path(reference).is_absolute() or reference[:5].lower() == "file:"
                 or re.match(r"^\{[A-Za-z_][A-Za-z0-9_]*\}[/\\]", reference)
             ):
-                local_path = _resolve_import_file_reference(reference)
+                local_path = _resolve_import_file_reference(reference, workflow=getattr(self, "workflow", None))
                 if local_path is None or not local_path.is_file():
                     missing_files[uid] = reference
         if missing_files:
@@ -11540,6 +11504,7 @@ class HMBImageAssetLibrary(DataNode):
 
     @hmb_binding_mutation
     def _hmb_move_prompt_image(self, request: dict) -> None:
+        _hmb_shot_routing.assert_shot_editable(self, request.get("channel"), request.get("shot"))
         state = self._current_state()
         routing = state["shot_routing"]
         shot = next((item for item in routing["shots"] if item["shot_uuid"] == request.get("shot")), None)
@@ -11562,6 +11527,7 @@ class HMBImageAssetLibrary(DataNode):
 
     @hmb_binding_mutation
     def _hmb_dismiss_unavailable_prompt_images(self, channel_uuid: str, shot_uuid: str, uids: set[str]) -> None:
+        _hmb_shot_routing.assert_shot_editable(self, channel_uuid, shot_uuid)
         state = self._current_state()
         routing = state["shot_routing"]
         selected = next((row for row in routing["shots"] if row["shot_uuid"] == shot_uuid), None)
@@ -12249,6 +12215,8 @@ class HMBImageAssetLibrary(DataNode):
             _clean(asset.get("asset_library_id")): asset for asset in normalized_state.get("assets", [])}
         self._hmb_catalog_search_selected = tuple(
             asset for asset in normalized_state.get("assets", []) if asset.get("selected"))
+        if getattr(self, "_hmb_source_checks", None) or getattr(self, "_hmb_last_shot_status", None):
+            self._publish_source_status_if_changed(normalized_state)
         self._hmb_last_accepted_widget_state = serialized or _json_text(normalized_state)
         self._hmb_durable_shot_generation = (
             self._hmb_last_accepted_widget_state,
@@ -12579,10 +12547,16 @@ class HMBImageAssetLibrary(DataNode):
 
         def worker() -> None:
             current_task = task
+            previous_scope = None
+            verified_entries = OrderedDict()
             try:
                 while current_task is not None:
                     _, project_identity, epoch, snapshots, imports, import_revision = current_task
-                    resolved_cache: OrderedDict = OrderedDict()
+                    # A newer click can be queued before the host receives the
+                    # previous result. Reuse those exact file checks within
+                    # the same catalog, without mutating a published snapshot.
+                    scope = (project_identity, epoch, import_revision)
+                    resolved_cache = verified_entries.copy() if scope == previous_scope else OrderedDict()
                     try:
                         pending_registration = False
                         for snapshot in snapshots:
@@ -12599,6 +12573,7 @@ class HMBImageAssetLibrary(DataNode):
                     else:
                         with work["lock"]:
                             if not pending_registration and epoch == work["epoch"]:
+                                previous_scope, verified_entries = scope, resolved_cache
                                 work["ready"] = (project_identity, epoch, resolved_cache)
                         try:
                             # No ready result exists while the registry is
@@ -13344,13 +13319,14 @@ class HMBImageAssetLibrary(DataNode):
             _non_negative_int(getattr(self, "_hmb_catalog_search_catalog_revision", 0)),
             len(state.get("assets", [])))
 
-    def _catalog_page_projection(self, state: Dict[str, Any], page: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    def _catalog_page_projection(self, state: Dict[str, Any], page: Dict[str, Any] | None = None,
+                                 *, shot_status: Dict[str, Any] | None = None) -> Dict[str, Any]:
         """Presentation only. The raw property and routing outputs stay full."""
         page = dict(page or getattr(self, "_hmb_catalog_search_page", {}) or {})
         epoch = self._catalog_search_epoch(state)
         if page.get("epoch") != epoch:
-            ids = [_clean(asset.get("asset_library_id")) for asset in state.get("assets", [])
-                   if asset.get("source_kind") == "project"][:80]
+            ids = list(islice((_clean(asset.get("asset_library_id")) for asset in state.get("assets", [])
+                               if asset.get("source_kind") == "project"), 80))
             page = {"query": "", "folder": "", "source_view": "project", "offset": 0,
                 "limit": 80, "total": state.get("status", {}).get("project_asset_count", len(state.get("assets", []))),
                 "asset_library_ids": ids, "epoch": epoch}
@@ -13365,12 +13341,14 @@ class HMBImageAssetLibrary(DataNode):
             assets = [asset for asset in state.get("assets", [])
                       if asset.get("selected") or _clean(asset.get("asset_library_id")) in wanted]
         retained = {row["source_uid"] for row in state.get("image_bash_workspace", {}).get("instances", [])}
-        existing = {_clean(row.get("source_uid")) for row in assets}
-        assets.extend(row for row in state.get("assets", [])
-                      if row.get("source_uid") in retained and row.get("source_uid") not in existing)
+        if retained:
+            existing = {_clean(row.get("source_uid")) for row in assets}
+            assets.extend(row for row in state.get("assets", [])
+                          if row.get("source_uid") in retained and row.get("source_uid") not in existing)
         # The retained tree repeats every asset ID. The widget derives its
         # folder tree from folders/counts, so never copy that full export here.
         dto = {key: value for key, value in state.items() if key not in {"assets", "catalog_page", "tree"}}
+        dto.update(shot_status if shot_status is not None else _hmb_shot_routing.source_shot_status_fields(self, state))
         cached = page.get("cached_thumbnails", {})
         dto["assets"] = [
             {**row, "thumbnail_url": entry[1]}
@@ -15891,7 +15869,9 @@ class HMBImageAssetLibrary(DataNode):
                     failure = "SHOT_STRUCTURE_CHANGED"
                     # A media/status refresh is not an edit of the Shot forest.
                     command = _hmb_shot_routing.rebase_shot_hierarchy_edit(current, command)
-                    _hmb_shot_routing.apply_shot_hierarchy_edit(current, command)
+                    prepared = _hmb_shot_routing.apply_shot_hierarchy_edit(current, command)
+                    failure = "EDIT_LOCKED"
+                    self._assert_locked_sources_preserved(current, prepared)
                     failure = "SOURCE_CHANGED"
                     scope_id = ((command.get("binding") or {}).get("cgt_scope") or {}).get("project_id")
                     if (request.get("cgt_project_id") and scope_id
@@ -16004,6 +15984,8 @@ class HMBImageAssetLibrary(DataNode):
                 _hmb_cgt.verify_binding(command["binding"], project_id, result, refresh_status=True)
                 failure = "SHOT_STRUCTURE_CHANGED"
                 prepared = _hmb_shot_routing.apply_shot_hierarchy_edit(current, command)
+                failure = "EDIT_LOCKED"
+                self._assert_locked_sources_preserved(current, prepared)
                 # Status belongs to the authenticated read. The local structural
                 # rebase above may carry the previous Wait/Work value forward.
                 statuses = {task["task_id"]: task["status"] for task in result["tasks"]}
@@ -16317,6 +16299,8 @@ class HMBImageAssetLibrary(DataNode):
                 raw_state = self._preserve_newer_thumbnail_baseline(raw_state)
                 normalized = _normalize_state(raw_state)
                 assignment = self._widget_initial_assignment(WIDGET_STATE_PARAMETER)
+                if external_state and assignment is None:
+                    self._assert_locked_sources_preserved(self._hmb_last_accepted_widget_state, normalized)
                 if assignment is not None:
                     assignment["allowed"].add(_widget_assignment_digest(normalized))
                 self._accept_normalized_widget_state_baseline(normalized)

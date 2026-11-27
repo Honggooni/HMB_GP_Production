@@ -197,6 +197,22 @@ async def check_wired_image_with_existing_shot(workspace):
                 output_reference = getattr(output[1], "value", output[1])
                 assert asset._resolve_import_file_reference(output_reference).samefile(path)
 
+            # A restored Shot can be read by a downstream callback when no editor
+            # tab is bound. Its imported macro belongs to the ImageAsset's workflow.
+            import griptape_nodes.files.file as files
+            real_request = files.handle_request_in
+            owners = []
+            def record_owner(workflow, request):
+                if isinstance(request, files.GetPathForMacroRequest):
+                    owners.append(workflow)
+                return real_request(workflow, request)
+            with current_engine().bind_workflow(NO_WORKFLOW), patch.object(files, "handle_request_in", record_owner):
+                snapshot, _ = library._hmb_prompt_snapshot_and_link_notices(
+                    channel_uuid=updated["shot_routing"]["channel_uuid"], shot_uuid=shot_id)
+            assert owners and all(owner is library.workflow for owner in owners)
+            assert snapshot["shots"][0]["selected_source_uids"] == [anchor["source_uid"], imports[0]["source_uid"]]
+            assert snapshot["media_by_source_uid"][imports[0]["source_uid"]] == "{inputs}/images/Dingo.jpg"
+
             # A peer can publish an acknowledgement while the node is still
             # verifying the same images off-thread. Only the cursor advances.
             entered = threading.Event()

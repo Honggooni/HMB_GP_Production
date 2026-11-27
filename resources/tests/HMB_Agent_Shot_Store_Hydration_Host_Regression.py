@@ -229,8 +229,10 @@ def main():
                 stack.enter_context(mock.patch.object(routing, name, lambda *args, **kwargs: False))
             stack.enter_context(mock.patch.object(agents.HMBAgentLibrary, "process", deny))
             logging.disable(logging.CRITICAL)
+            from hmb_host_workflow import scoped_fixture_workflow
             with engine_scope() as engine:
-                exercise(engine, base)
+                with scoped_fixture_workflow(engine, "SavedAgentHydrationSynthetic"):
+                    exercise(engine, base)
         assert ATTEMPTS == []
     print("HMB_AGENT_SHOT_STORE_HYDRATION_EXTERNAL_WORK=0")
 

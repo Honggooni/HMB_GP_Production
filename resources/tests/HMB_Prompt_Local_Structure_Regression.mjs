@@ -617,7 +617,6 @@ for (const selector of [
   ".clear-source",
   ".add-color-pick",
   ".remove-color-pick",
-  ".move-image-up, .move-image-down",
 ]) {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   assert.match(
@@ -626,6 +625,8 @@ for (const selector of [
     `${selector} must use the standalone-safe structural commit path.`,
   );
 }
+assert.match(source, /swapImageRowsWithoutReset\(state, hoverIndex, hoverIndex \+ direction\)\) \{\s*hmbCommitLocalPromptStructure\(container, props, state, remount\)/,
+  "Delegated ordering controls keep the standalone structural commit.");
 
 const noLossRoundTrip = widget.normalizeState({
   source_intent_fallbacks: [{

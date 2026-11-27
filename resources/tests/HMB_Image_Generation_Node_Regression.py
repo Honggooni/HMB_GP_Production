@@ -248,6 +248,8 @@ class PersonalImageNodeTests(unittest.TestCase):
         self.engine.event_manager.initialize_queue()
         result = self.engine.handle_request(EnsureWorkflowAndFlowRequest(flow_name="PersonalImageOffline"))
         self.assertTrue(result.succeeded(), str(result.result_details))
+        if hasattr(self.engine, "bind_workflow"):
+            self.enterContext(self.engine.bind_workflow(self.engine.open_workflows.get(result.workflow_id)))
         self.flow = self.engine.flow_manager.get_flow_by_name(result.flow_name)
         self.schema = LibrarySchema.model_validate_json((ROOT / "griptape-nodes-library.json").read_text("utf-8-sig"))
         self.library = LibraryRegistry.generate_new_library(self.schema)
@@ -1469,7 +1471,8 @@ class PersonalImageNodeTests(unittest.TestCase):
         self.authored(); self.run_node()
         stored = self.assert_success()
         driver = SimpleNamespace(create_signed_download_url=mock.Mock(side_effect=forbidden))
-        with mock.patch.object(self.node.engine.static_files_manager, "storage_driver", driver):
+        with mock.patch.object(type(self.node.engine.static_files_manager), "storage_driver",
+                               new_callable=mock.PropertyMock, create=True, return_value=driver):
             self.assertIs(self.node.get_display_value_for_output("IMAGE_OUT", stored), stored)
             driver.create_signed_download_url.assert_not_called()
         self.assert_success()

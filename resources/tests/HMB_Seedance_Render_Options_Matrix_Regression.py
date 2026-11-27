@@ -549,7 +549,7 @@ class RenderOptionMatrix(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    t.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.0
+    t._broker_transport.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.0
     outcome = unittest.main(exit=False)
     print("HMB_RENDER_OPTIONS_METRICS " + json.dumps(dict(METRICS), sort_keys=True))
     raise SystemExit(0 if outcome.result.wasSuccessful() else 1)

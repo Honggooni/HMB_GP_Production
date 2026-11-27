@@ -70,6 +70,23 @@ try {
   await page.waitForFunction(()=>window.ready);
   const button=page.locator('[data-action="upload_web"]');
   assert.equal(await button.isEnabled(),true);
+  const badge=page.locator('[data-lut-shot-number]');
+  assert.equal(await badge.getAttribute('data-hmb-shot-check'),'false');
+  const checks=await page.evaluate(()=>{
+    const original=state, proof={channel_uuid:'channel-one',shot_uuid:'shot-1'};
+    const marks=[];
+    const view=(shot,publication,phase='complete',status='idle')=>{
+      window.state={...original,revision:marks.length+1,shot,status:{phase:status},web_upload:{enabled:true,phase,published_shot:publication}};
+      controller.update(props());
+      const badge=document.querySelector('[data-lut-shot-number]');
+      marks.push([badge.hidden,badge.textContent,badge.dataset.hmbShotCheck,getComputedStyle(badge,'::before').content]);
+    };
+    view(original.shot,proof);view(original.shot,{...proof,shot_uuid:'shot-2'});view(original.shot,proof,'uploading');
+    view(original.shot,proof,'complete','error');view({},proof);view(original.shot,null,'ready');
+    return marks;
+  });
+  assert.deepEqual(checks,[[false,'01','true','"✓"'],[false,'01','false','none'],[false,'01','false','none'],
+    [false,'01','false','none'],[true,'','false','none'],[false,'01','false','none']]);
   const canvas=await page.locator('[data-preview]').evaluate(el => (window.originalCanvas=el,true));
   await button.click();
   assert.equal(await button.isDisabled(),true);

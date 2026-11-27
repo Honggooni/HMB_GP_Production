@@ -48,7 +48,7 @@ print("Depth giant-floor conditional camera-ray policy: PASS")
 NATIVE_WORKER = r'''import hashlib,importlib.util,json,os,traceback
 from pathlib import Path
 import maya.cmds as cmds
-ROOT=Path("C:/HMB_GP_Production")
+ROOT=Path(os.environ["HMB_MAYA_TEST_ROOT"])
 OUT=Path(os.environ["HMB_FLOOR_TEST_OUTPUT"]).resolve()
 RUNNER=ROOT/"resources/maya/HMB_Maya_Background_Preview.py"
 report={"ok":False,"scope":"Private native binary giant-quad fixture; no user scene touched.","roles":{}}
@@ -124,7 +124,7 @@ if args.live_maya:
     for name in ("maya-app","tmp"): (args.output/name).mkdir(exist_ok=True)
     environment=os.environ.copy();environment.update({
         "MAYA_APP_DIR":str(args.output/"maya-app"),"TEMP":str(args.output/"tmp"),"TMP":str(args.output/"tmp"),
-        "HMB_FLOOR_TEST_OUTPUT":str(args.output),"MAYA_ENABLE_LEGACY_RENDER_LAYERS":"1",
+        "HMB_MAYA_TEST_ROOT":str(ROOT), "HMB_FLOOR_TEST_OUTPUT":str(args.output),"MAYA_ENABLE_LEGACY_RENDER_LAYERS":"1",
         "MAYA_DISABLE_CIP":"1","MAYA_DISABLE_CER":"1","MAYA_DISABLE_ADP":"1","PYTHONUTF8":"1"})
     worker_path=str(worker).replace("\\","/")
     command='python("import runpy;runpy.run_path(\\\''+worker_path+"\\',run_name=\\'__main__\\')\");"

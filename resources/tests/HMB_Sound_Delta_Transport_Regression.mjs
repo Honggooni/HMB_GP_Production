@@ -191,5 +191,30 @@ try{
  await page.waitForFunction(()=>document.querySelector('#a [role=status]').textContent.includes('새로고침으로 다시 확인'));
  assert.deepEqual(await page.evaluate(()=>[window.requests.length,window.reads.length]),[0,0]);
  await page.evaluate(()=>window.owners.a.cleanup());
+ await page.evaluate(async()=>{
+   const {default:mount}=await import('/widget.js');
+   const scope={channel_uuid:"channel-a",shot_uuid:"shot-a"};
+   const doc={...window.state,channel_uuid:scope.channel_uuid,shot:scope,
+     shot_catalog:{channel_uuid:scope.channel_uuid,shots:[{...scope,name:"A",number:1},{...scope,shot_uuid:"shot-b",name:"B",number:2}]},
+     tracks:[{...window.state.tracks[0],...scope}],shot_edit_locks:[],verified_shots:[]};
+   window.state=doc;window.seq++;window.owners.a=mount(document.getElementById('a'),window.props('a',window.full()));
+   window.delta({shot_edit_locks:[scope],verified_shots:[scope]},['b']);
+ });
+ const running=page.locator('#a [data-shot-row="shot-a"]');
+ assert.equal(await running.locator('[data-hmb-shot-check="true"]').innerText(),'01');
+ assert.equal(await running.locator('[data-shot-lock]').count(),1);
+ assert.equal(await running.locator('[data-shot]').isEnabled(),true);
+ assert.equal(await running.locator('[data-remove]').isDisabled(),true);
+ assert.equal(await page.locator('#a [data-shot="shot-b"]').isEnabled(),true);
+ const soundHeader=page.locator('#a [data-sound-toggle-surface="header"]');
+ await soundHeader.dispatchEvent('dblclick',{button:0});
+ assert.equal(await page.locator('#a [data-sound-view=compact] [data-shot-row="shot-a"] [data-shot-lock]').count(),1);
+ await page.evaluate(()=>window.delta({shot_edit_locks:[]},['b']));
+ assert.equal(await running.locator('[data-shot-lock]').count(),0);
+ assert.equal(await running.locator('[data-remove]').isEnabled(),true);
+ assert.equal(await running.locator('[data-hmb-shot-check="true"]').evaluate(el=>getComputedStyle(el,'::before').fontSize),'20px');
+ await page.evaluate(()=>window.delta({verified_shots:[]},['b']));
+ assert.equal(await running.locator('[data-hmb-shot-check="false"]').count(),1);
+ await page.evaluate(()=>window.owners.a.cleanup());
  console.log(JSON.stringify({pass:true,pureReducer:true,actualChrome:true,twoMounts:true,nativeFullEcho:true,localAudioPreserved:true,boundedRecovery:3,commandBytes:JSON.stringify(command).length,assets:5000,cleanupNoRetry:true,nativeReadonlyBridge:true,lockedReadonlyRecovery:true,propertyWritesAfterRead:0,noBridgeNoWrite:true,observedSequenceFloor:true,missedNewStreamFull:true,compiledEditor:!!nativeBundle,bridgeFences:fences}));
 }finally{await browser?.close();await new Promise(resolve=>server.close(resolve));}

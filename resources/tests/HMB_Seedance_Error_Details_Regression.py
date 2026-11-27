@@ -134,7 +134,7 @@ class ErrorDetailTests(unittest.TestCase):
         for code in (400, 401, 403, 413, 429, 500, 502, 503, 504):
             with self.subTest(code=code):
                 opener = FailHTTP(code, {"error": "Requested model cannot accept the parameter", "detail": "raw-auth-canary", "request_id": "req-002"})
-                with mock.patch.object(target, "_broker_load_token", return_value="raw-auth-canary"), mock.patch.object(target, "_broker_clear_token") as clear:
+                with mock.patch.object(target._broker_transport, "_broker_load_token", return_value="raw-auth-canary"), mock.patch.object(target._broker_transport, "_broker_clear_token") as clear:
                     bridge = target._HMBAIBrokerBridge(opener=opener)
                     with self.assertRaises(target._BrokerError) as caught:
                         bridge._request_json("POST", "/api/v1/generate/video", payload={}, timeout=1, submission=True)
@@ -147,7 +147,7 @@ class ErrorDetailTests(unittest.TestCase):
 
     def test_terminal_error_body_in_502_refresh_is_diagnostic_not_resubmission(self):
         opener = FailHTTP(502, {"job_id": "job-diag", "status": "failed", "provider_job_id": "", "error": "Model access denied"})
-        with mock.patch.object(target, "_broker_load_token", return_value="fake-token"):
+        with mock.patch.object(target._broker_transport, "_broker_load_token", return_value="fake-token"):
             bridge = target._HMBAIBrokerBridge(opener=opener)
             raw = bridge.refresh_job("job-diag", timeout=1)
         task = target.HMBSeedanceGeneration._normalize_broker_task(raw)
@@ -177,7 +177,7 @@ class ErrorDetailTests(unittest.TestCase):
                 {"field": [], "index": 0, "attempts": [first]},
                 {"field": "audio_urls", "index": True, "attempts": [first]}]
         opener = FailHTTP(422, {"error_code": "cloud_sha256_mismatch", "files": rows, "detail": private_url})
-        with mock.patch.object(target, "_broker_load_token", return_value="secret-login"):
+        with mock.patch.object(target._broker_transport, "_broker_load_token", return_value="secret-login"):
             with self.assertRaises(target._CloudReferenceCheckError) as caught:
                 target._HMBAIBrokerBridge(opener=opener)._request_json(
                     "POST", "/api/v1/generate/video", payload={}, timeout=1, submission=True)
@@ -211,7 +211,7 @@ class ErrorDetailTests(unittest.TestCase):
                                       (False, 422, "upload_digest_required"), (False, 429, "cloud_preflight_busy")):
             with self.subTest(private=private, status=status):
                 opener = FailHTTP(status, {"error_code": code, "error": "private-canary"})
-                with mock.patch.object(target, "_broker_load_token", return_value="fake-token"):
+                with mock.patch.object(target._broker_transport, "_broker_load_token", return_value="fake-token"):
                     with self.assertRaises(target._CloudReferenceCheckError) as caught:
                         target._HMBAIBrokerBridge(opener=opener)._request_json(
                             "POST", "/api/v1/generate/video", payload={"my_box_selection": {}} if private else {},
@@ -339,7 +339,7 @@ class ErrorDetailTests(unittest.TestCase):
                 self.assertEqual(payload["image_urls"], staged)
                 return bridge._request_json("POST", "/api/v1/generate/video", payload=payload, timeout=timeout, submission=True)
             node._ensure_broker_connected = mock.AsyncMock(return_value=SimpleNamespace(generate_seedance=submit))
-            with mock.patch.object(target, "_broker_load_token", return_value="secret-login"), \
+            with mock.patch.object(target._broker_transport, "_broker_load_token", return_value="secret-login"), \
                     mock.patch.object(target, "_negotiate_cloud_reference_proof", new_callable=mock.AsyncMock, return_value=True), \
                     mock.patch.object(target, "_resolve_mp4_decode_verifier", return_value=SimpleNamespace(executable="fake", backend="regression")):
                 await node._aprocess_impl()

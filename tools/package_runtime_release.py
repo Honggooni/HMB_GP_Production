@@ -102,6 +102,7 @@ RUNTIME_INSTALL_FILES = (
     "_hmb_sound.py",
     "_hmb_agent_session.py",
     "_hmb_broker_config.py",
+    "_hmb_broker_transport.py",
     "_hmb_build_diagnostics.py",
     "_hmb_library_bootstrap.py",
     "_hmb_deletion_guard.py",
@@ -126,6 +127,7 @@ RUNTIME_INSTALL_FILES = (
     "_hmb_cgt.py",
     "_hmb_mp4_verify.py",
     "_hmb_common.py",
+    "_hmb_node_controls.py",
     "_hmb_color_lut.py",
     "_hmb_client_review_media.py",
     "_hmb_color_lut_usage.py",
@@ -188,7 +190,7 @@ CANONICAL_LF_SOURCE_FILES = {
     if PurePosixPath(relative).suffix.casefold() in {".py", ".js", ".json", ".md", ".txt", ".sh"}
     or relative in {"LICENSE", "resources/media-tools/COPYING.GPLv2"}
 }
-if len(RUNTIME_INSTALL_FILES) != 107 or len(DISTRIBUTION_ONLY_FILES) != 22:
+if len(RUNTIME_INSTALL_FILES) != 109 or len(DISTRIBUTION_ONLY_FILES) != 22:
     raise RuntimeError("Runtime/distribution release boundary count mismatch.")
 if set(RUNTIME_INSTALL_FILES) & set(DISTRIBUTION_ONLY_FILES):
     raise RuntimeError("Runtime and distribution-only release files overlap.")

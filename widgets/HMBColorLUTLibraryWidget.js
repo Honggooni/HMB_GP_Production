@@ -111,7 +111,10 @@ export function hmbColorLUTState(input = {}) {
     sound: { connected: record(s.sound).connected === true, revision: clean(record(s.sound).revision, 128) },
     output: { codec: ["hevc10", "prores", "ffv1"].includes(output.codec) ? output.codec : "hevc10", manual_output_enabled: output.manual_output_enabled === true, path: clean(output.path) },
     status: { phase: clean(status.phase, 40) || "idle", message: clean(status.message), progress: clamp(finite(status.progress)) },
-    web_upload: { enabled: upload.enabled === true && Boolean(shot.shot_uuid || manualReady), phase: clean(upload.phase, 32), reason: clean(upload.reason, 512) },
+    web_upload: { enabled: upload.enabled === true && Boolean(shot.shot_uuid || manualReady), phase: clean(upload.phase, 32), reason: clean(upload.reason, 512),
+      ...(shot.shot_uuid && upload.published_shot?.channel_uuid === shot.channel_uuid
+        && upload.published_shot?.shot_uuid === shot.shot_uuid && ["complete", "media_retry", "ready"].includes(upload.phase)
+        ? {published_shot:{channel_uuid:shot.channel_uuid,shot_uuid:shot.shot_uuid}} : {}) },
     result: { ...result, path: clean(result.path), url: clean(result.url) } };
 }
 export const hmbNormalizeColorLUTWidgetValue = hmbColorLUTState;
@@ -349,8 +352,13 @@ export function hmbRenderColorLUTWidget(input = {}) {
 .hmb-color-lut .cl-audio-toggle,.hmb-color-lut .cl-audio-mix label{display:flex;align-items:center;gap:6px;font-size:11px}.hmb-color-lut .cl-audio-toggle{white-space:nowrap}
 .hmb-color-lut .cl-audio-mix{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;margin-top:8px;max-height:112px;overflow:auto}.hmb-color-lut .cl-audio-mix select{min-width:0;max-width:100%;font-size:11px}.hmb-color-lut .cl-audio-mix small{color:var(--cl-muted);font-size:10px;line-height:1.4}.hmb-color-lut .cl-audio-mix [data-text="soundNote"]{flex-basis:100%}
 .hmb-color-lut[data-hmb-native-header=active] .cl-head{cursor:grab}.hmb-color-lut[data-hmb-native-header=active] .cl-head:active{cursor:grabbing}
+.hmb-color-lut [data-lut-shot-number][hidden]{display:none!important}
+.hmb-color-lut:not([data-shot-number="0"]) [data-hmb-native-actions] div:is(.bg-green-600,.bg-blue-600):has(>span.leading-none){display:none!important}
+.hmb-color-lut [data-lut-shot-number]{min-width:24px;height:24px;display:grid;place-items:center;border:1px solid var(--cl-accent);border-radius:5px;font-weight:850}
+.hmb-color-lut [data-hmb-shot-check="true"]{display:inline-flex!important;align-items:center;justify-content:center;gap:2px!important;width:38px!important;min-width:38px!important;max-width:38px!important;height:30px!important;min-height:30px!important;max-height:30px!important;flex:none!important;padding:0!important;box-sizing:border-box!important;font:700 11px/1 system-ui!important;font-variant-numeric:tabular-nums;background:#12301d!important;color:#dcfce7!important;border:1px solid #4ade80!important;border-radius:5px!important;filter:none!important;opacity:1!important}
+.hmb-color-lut [data-hmb-shot-check="true"]::before{content:"✓";font:900 20px/1 system-ui;color:#4ade80;flex:none}
 </style><div class="hmb-color-lut nodrag" data-language="${s.language}" data-shot-number="${hmbColorLUTShotOptions(s).find((x) => x.selected)?.number || 0}" tabindex="0">
-<header class="cl-head group"><div class="cl-mark" aria-hidden="true">CL</div><div class="cl-brand"><strong>HMB Color LUT</strong><small data-text="subtitle">${t.subtitle}</small></div><div class="cl-native-identity" data-hmb-native-identity></div><div class="cl-native-actions nodrag" data-hmb-native-actions></div><label class="cl-shot-shell nodrag"><span>SHOT</span><select data-shot-selector aria-label="${t.shot}">${shotMarkup(s)}</select></label><button class="cl-lang nodrag" data-language-toggle type="button" aria-label="${t.language}">${s.language === "ko" ? "한국어" : "EN"}</button></header>
+<header class="cl-head group"><div class="cl-mark" aria-hidden="true">CL</div><div class="cl-brand"><strong>HMB Color LUT</strong><small data-text="subtitle">${t.subtitle}</small></div><div class="cl-native-identity" data-hmb-native-identity></div><div class="cl-native-actions nodrag" data-hmb-native-actions></div><label class="cl-shot-shell nodrag"><span data-lut-shot-number hidden></span><span>SHOT</span><select data-shot-selector aria-label="${t.shot}">${shotMarkup(s)}</select></label><button class="cl-lang nodrag" data-language-toggle type="button" aria-label="${t.language}">${s.language === "ko" ? "한국어" : "EN"}</button></header>
 <div class="cl-input nodrag"><span class="cl-dot"></span><span class="cl-source" data-source></span><small data-source-revision></small><button data-action="browse_video" type="button">${label("browse")}</button></div>
 <main class="cl-work nodrag"><section class="cl-preview"><div class="cl-panel-head">${label("preview")}<div class="cl-mode">${["original", "compare", "graded"].map((view) => `<button type="button" data-view="${view}" aria-pressed="${view === "compare"}">${label(view)}</button>`).join("")}</div></div><div class="cl-screen"><canvas data-preview width="960" height="540" role="img" aria-label="${t.preview}"></canvas><span class="cl-label cl-before" data-text="original">${t.original}</span><span class="cl-label cl-after" data-text="graded">${t.graded}</span><div class="cl-seam"><button type="button" data-wipe-handle role="slider" aria-label="${t.wipe}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50">↔</button></div><div class="cl-empty" data-empty>${t.empty}</div></div><div class="cl-transport"><input data-seek type="range" min="0" max="0" value="0" step="1" aria-label="${t.seek}" disabled><div class="cl-player-row"><button data-play type="button" disabled>${t.play}</button><button data-step type="button" disabled>${label("step")}</button><small data-frame></small></div></div><div class="cl-note"><span data-preview-note></span>${label("live")}</div></section>
 <section class="cl-grade"><div class="cl-panel-head">${label("grade")}<label class="cl-enable"><input data-enable type="checkbox"${s.settings.enabled ? " checked" : ""}>${label("enable")}</label></div><div class="cl-grade-body"><div class="cl-project">${groupFields}<label>${label("project")}<select data-project disabled>${projectOptions(s)}</select></label><label>${label("episode")}<select data-episode disabled></select></label></div><div class="cl-control-grid">${HMB_COLOR_LUT_CONTROLS.map((key, i) => `<div class="cl-control"><label><span>${label(key)}<output class="cl-value" data-value="${key}">${escape(stageLabel(s, key))}</output></span><input data-adjust="${key}" type="range" min="-${HMB_COLOR_LUT_MAX_STEP}" max="${HMB_COLOR_LUT_MAX_STEP}" step="1" value="${sliderStep(s.settings[key])}" aria-label="${t[key]}" aria-valuetext="${escape(stageLabel(s, key))}"><span class="cl-endpoints"><span data-low="${i}">${t.low[i]}</span><span data-high="${i}">${t.high[i]}</span></span></label></div>`).join("")}</div><div class="cl-grade-actions"><button data-reset type="button">${label("reset")}</button></div><div class="cl-web-upload"><button data-action="upload_web" type="button" disabled>${label("upload")}</button><small data-upload-reason aria-live="polite"></small></div></div></section></main>
@@ -565,6 +573,12 @@ function hmbNativeUiImplementation(container, props = {}) {
     for (const el of all("[data-high]")) el.textContent = t.high[Number(el.getAttribute("data-high"))];
     const shot = q("[data-shot-selector]"), options = shotMarkup(state); if (shot.innerHTML !== options) shot.innerHTML = options;
     shot.value = hmbColorLUTShotOptions(state).find((s) => s.selected)?.key || HMB_COLOR_LUT_ONLY_SHOT_VALUE; shot.setAttribute("aria-label", t.shot);
+    const badge = q("[data-lut-shot-number]");
+    const published = Boolean(state.web_upload.published_shot && ["idle","complete"].includes(state.status.phase) && !busy);
+    badge.hidden = !state.shot.shot_uuid;
+    badge.textContent = badge.hidden ? "" : String(state.shot.number).padStart(2, "0");
+    badge.setAttribute("data-hmb-shot-check", String(published));
+    badge.title = published ? (state.language === "ko" ? "웹 게시 완료" : "Published to web") : "";
     q("[data-language-toggle]").textContent = state.language === "ko" ? "한국어" : "EN"; q("[data-language-toggle]").setAttribute("aria-label", t.language);
     q("[data-source]").textContent = state.source.name || (state.shot.shot_uuid ? `${state.shot.name}` : t.standalone);
     q("[data-source-revision]").textContent = `${state.source.revision ? `r${state.source.revision} · ` : ""}${state.shot.shot_uuid ? t.bound : t.unbound}`;
@@ -657,7 +671,13 @@ function hmbNativeUiImplementation(container, props = {}) {
     try { Promise.resolve(latestProps.onChange(captured)).catch((error) => { if (current()) { if (shotRequest && pendingShot === shotRequest) pendingShot = null; say(`${textFor(state).transportError}: ${error.message || error}`); } }); return true; }
     catch (error) { if (current()) { if (shotRequest && pendingShot === shotRequest) pendingShot = null; say(`${textFor(state).transportError}: ${error.message || error}`); } return false; }
   };
-  const invalidateUpload = () => { state.web_upload.enabled = false; const button = q('[data-action="upload_web"]'); if (button) button.disabled = true; };
+  const invalidateUpload = () => {
+    state.web_upload.enabled = false;
+    delete state.web_upload.published_shot;
+    const badge=q("[data-lut-shot-number]");
+    badge.setAttribute("data-hmb-shot-check","false");badge.title="";
+    const button = q('[data-action="upload_web"]'); if (button) button.disabled = true;
+  };
   const scheduleCommit = () => { invalidateUpload(); responseRevision++; pendingEdit = true; if (commitTimer) win.clearTimeout(commitTimer); commitTimer = win.setTimeout(publish, 180); };
   const command = (action, extra = {}) => {
     if (action === "export" && !extra.local_only) {
@@ -999,23 +1019,34 @@ function hmbAcquireNativeStockSafety(container) {
   const key = "__HMB_NATIVE_STOCK_SAFETY_V1__";
   let shared = doc[key];
   if (!shared) {
-    const owners = new Set(), identities = new Map();
+    const owners = new Set(), identities = new Set();
+    let parents = new WeakSet(), awaitingMount = false;
     let contextNode = null, notice = null, noticeTimer = null, disposed = false;
     const nativeReady = () => doc.documentElement.getAttribute("data-hmb-native-deletion-guard") === "engine-preflight"
       && doc.documentElement.getAttribute("data-hmb-native-deletion-protection-version") === "2";
     const rootOf = value => value?.closest?.(".react-flow__node[data-id]") || null;
+    const currentRoot = owner => owner.container?.isConnected ? rootOf(owner.container) : null;
+    const trackParents = element => {
+      for (let parent = element?.parentNode; parent && !parents.has(parent); parent = parent.parentNode) {
+        parents.add(parent);
+      }
+    };
     const roots = () => {
+      parents = new WeakSet();
+      awaitingMount = false;
       for (const owner of owners) {
-        const node = owner.active && owner.container?.isConnected ? rootOf(owner.container) : null;
-        if (node) identities.set(node, node.getAttribute("data-id"));
+        owner.node = currentRoot(owner);
+        if (owner.node) identities.add(owner.node);
+        if (owner.container.isConnected) trackParents(owner.container);
+        else awaitingMount = true;
       }
       // A stock fold/virtualized widget unmount is not a node deletion. Keep
       // its exact outer DOM identity until that node actually leaves the view.
-      for (const [node] of identities) {
+      for (const node of identities) {
         if (!node.isConnected) identities.delete(node);
-        else identities.set(node, node.getAttribute("data-id")); // Native rename keeps this exact retained outer node.
+        else trackParents(node);
       }
-      return new Set(identities.keys());
+      return identities;
     };
     const isEditing = target => Boolean(target?.closest?.("input,textarea,select,[contenteditable='true'],[contenteditable=''],[role='textbox'],.CodeMirror,.cm-editor"));
     const canvasOf = node => node?.closest?.(".react-flow");
@@ -1082,10 +1113,16 @@ function hmbAcquireNativeStockSafety(container) {
       if (!owners.size && !retained.size) { dispose(); return; }
       if (nativeReady() || !retained.size) dismiss();
     };
-    const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(sync) : null;
+    // Card and prompt edits occur below the widget host and cannot move its
+    // outer node. Still observe reparenting, folds, native markers and late mounts.
+    const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(records => {
+      if (awaitingMount || records.some(record => record.type === "attributes" || parents.has(record.target))) sync();
+    }) : null;
     observer?.observe(doc.documentElement, { attributes: true, attributeFilter: ["data-hmb-native-deletion-guard", "data-hmb-native-deletion-protection-version", "data-id"], childList: true, subtree: true });
     win.addEventListener("keydown", keydown, true); win.addEventListener("click", click, true); win.addEventListener("contextmenu", contextmenu, true);
-    shared = { owners, sync, release(owner) {
+    shared = { owners, sync, refresh(owner) {
+      if (currentRoot(owner) !== owner.node) sync();
+    }, release(owner) {
       owner.active = false; owners.delete(owner);
       sync();
     } };
@@ -1094,7 +1131,7 @@ function hmbAcquireNativeStockSafety(container) {
   const owner = { container, active: true };
   shared.owners.add(owner);
   shared.sync();
-  return { refresh() { if (owner.active) shared.sync(); }, cleanup() { if (owner.active) shared.release(owner); } };
+  return { refresh() { if (owner.active) (shared.refresh || shared.sync)(owner); }, cleanup() { if (owner.active) shared.release(owner); } };
 }
 
 // Griptape loads each widget as a separate module. One selection per editor

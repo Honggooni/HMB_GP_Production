@@ -154,6 +154,70 @@ async def exercise(engine):
         assert [row['shot_uuid'] for row in loaded['shot_routing']['shots']] == [row['shot_uuid'] for row in native.SHOTS]
         assert loaded['shot_routing']['channel_uuid'] == native.CHANNEL
     assert json.dumps(receipts, sort_keys=True) == before
+    # The same SDK property setter used by the desktop +Shot dialog must
+    # admit another shot while the first Generator owns its render lock.
+    first = deepcopy(reopened)
+    first["shot_hierarchy"] = {}
+    first["shot_routing"]["shots"] = first["shot_routing"]["shots"][:1]
+    locked_shot = first["shot_routing"]["shots"][0]["shot_uuid"]
+    first["shot_routing"]["active_shot_uuid"] = locked_shot
+    source._publish_state(first)
+    scope = dict(channel_uuid=native.CHANNEL, shot_uuid=locked_shot)
+    owner = engine.node_manager.get_node_by_name('offline_managed_generator_1')
+    with mock.patch.object(routing, 'publish_source_widget_view', wraps=routing.publish_source_widget_view) as events:
+        routing.set_shot_edit_lock(owner, scope)
+        packet = next(json.loads(call.args[2]) for call in events.call_args_list if call.args[0] is source)
+        assert packet['document']['shot_edit_locks'] == [scope]
+        assert packet['document']['shot_routing']['active_shot_uuid'] == locked_shot
+    def submit(state, edits):
+        wire = dict(schema=image.IMAGE_ASSET_EDIT_SCHEMA, version=1,
+                    widget_runtime_lease=source._hmb_widget_runtime_lease,
+                    scan_revision=state["scan_revision"],
+                    ui_edit_revision=state[image.UI_EDIT_REVISION_KEY] + 1,
+                    catalog_identity={key:state[key] for key in image.IMAGE_ASSET_EDIT_CATALOG_FIELDS},
+                    selected_source_uids=[row['source_uid'] for row in state['assets'] if row['selected']],
+                    edits=edits)
+        return engine.handle_request(SetParameterValueRequest(node_name=source.name,
+            parameter_name=image.WIDGET_STATE_PARAMETER, value=json.dumps(wire), data_type='str'))
+    try:
+        state=source._current_state()
+        original=deepcopy(state['shot_routing']['shots'][0])
+        new=deepcopy(members[2])
+        uid=str(uuid4())
+        new.update(member_id='manual:'+uid, origin='manual',manual_uuid=uid,parent_id=None,
+                   selection_order=1, cgt_task_id=None,artist=None,status=None)
+        new.pop('cgt_identity',None)
+        binding=dict(schema=routing.SHOT_HIERARCHY_SCHEMA,version=1,binding_id=str(uuid4()),revision=1,
+                     project_identity=routing.hierarchy_project_key(state),channel_uuid=native.CHANNEL,
+                     cgt_account_id=None,members=[new])
+        command=dict(schema=routing.SHOT_HIERARCHY_REQUEST_SCHEMA,version=1,
+                     expected_generation=state['shot_routing']['generation'],expected_binding_revision=0,
+                     removed_member_ids=[],binding=binding)
+        added=submit(state,{'shot_hierarchy_request':command})
+        assert added.succeeded(), added.result_details
+        state=source._current_state()
+        assert len(state['shot_routing']['shots']) == 2
+        assert state['shot_routing']['shots'][0] == original
+        routes=deepcopy(state['shot_routing'])
+        routes['active_shot_uuid']=new['gp_shot_uuid']
+        routes['shots'][1]['selected_source_uids']=list(original['selected_source_uids'])
+        routes['shots'][1]['revision']+=1
+        routes['generation']+=1
+        changed=submit(state,{'shot_routing':routes})
+        assert changed.succeeded(), changed.result_details
+        state=source._current_state()
+        assert state['shot_routing']['shots'][0] == original and state['shot_routing']['active_shot_uuid']==new['gp_shot_uuid']
+        assert state['shot_routing']['shots'][1]['selected_source_uids'] == original['selected_source_uids']
+        assert routing.shot_edit_locks(source)==[scope]
+        routes=deepcopy(state['shot_routing'])
+        routes['shots'][0]['name']='locked mutation'
+        routes['generation']+=1
+        rejected=submit(state,{'shot_routing':routes})
+        assert not rejected.succeeded(), "The SDK accepted an authored edit of the rendering Shot"
+        assert source._current_state()['shot_routing']['shots'][0]==original
+    finally:
+        routing.set_shot_edit_lock(owner,None)
+    print("PASS Desktop SDK +Shot creates/edits an independent Shot with Shot 1 locked; immutable source and recovery data")
     print('HMB_SHOT_HIERARCHY_HOST=PASS (five independent native Prompt/Agent/Generator executions; split identity; exact naming; save/reopen; immutable recovery and public title; no paid calls)')
 
 native.exercise = exercise

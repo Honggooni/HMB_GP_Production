@@ -24,6 +24,8 @@ _UNSCOPED: list[tuple[list[Any], list[Any]]] = []
 _PROCESS_EPOCH = uuid4().hex
 _IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
 _QUEUE_STATES = frozenset(("waiting", "dispatching", "uncertain", "blocked", "linked"))
+_UPLOAD_FIELDS = {"first_frame": "image", "last_frame": "image", "image_urls": "image",
+                  "video_urls": "video", "audio_urls": "audio"}
 
 
 def lease_id(value: Any) -> str:
@@ -78,6 +80,9 @@ def _write(record: dict[str, Any]) -> None:
     # never enter this document. The private journal is not a cleanup command.
     data = {key: record[key] for key in ("lease_id", "origin", "account_fingerprint",
         "process_epoch", "client_request_id", "task_id", "queue_held", "unresolved", "scope", "remote_objects")}
+    for key in ("upload_manifest", "failed_reference"):
+        if key in record:
+            data[key] = record[key]
     data.update(schema="hmb-reference-lease-v1", version=1, updated_at_ms=int(time.time() * 1000))
     target = _journal_path(record["lease_id"])
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -93,8 +98,29 @@ def _write(record: dict[str, Any]) -> None:
             temporary.unlink()
 
 
+def _upload_manifest(payload: dict[str, Any], handles: dict[str, str], objects: list[dict]) -> list[dict]:
+    """Record wire order and the proof of the actual PUT, never a signed URL or source path."""
+    owned = {obj["path"] for obj in objects if obj["service"] == "cloud"}
+    rows = []
+    for field in _UPLOAD_FIELDS:
+        values = payload.get(field)
+        if not isinstance(values, list):
+            continue
+        for slot, url in enumerate(values, 1):
+            path = handles.get(url) if isinstance(url, str) else None
+            if path not in owned:
+                continue
+            proof = re.fullmatch(r"hmb-v1=([a-f0-9]{64}):([1-9][0-9]{0,8})", urlsplit(url).fragment)
+            parts = PurePosixPath(path).parts
+            if proof and len(parts) == 3 and parts[0] == "artifact_url_storage" and re.fullmatch(r"[a-f0-9]{32}", parts[1]):
+                rows.append({"field": field, "slot": slot, "object_uid": parts[1], "filename": parts[2],
+                             "sha256": proof[1], "bytes": int(proof[2])})
+    return rows
+
+
 def acquire(*, origin: str, principal: str, client_request_id: str, cloud: list[Any],
-            tos: list[Any], scope: str = "video") -> str:
+            tos: list[Any], scope: str = "video", wire_payload: dict[str, Any] | None = None,
+            proof_handles: dict[str, str] | None = None) -> str:
     """Capture this run's real handles before POST; journal failure blocks POST."""
     if not cloud and not tos:
         return ""
@@ -110,6 +136,10 @@ def acquire(*, origin: str, principal: str, client_request_id: str, cloud: list[
     record = dict(lease_id=identifier, origin=origin, account_fingerprint=principal or "unverified-" + _PROCESS_EPOCH,
         process_epoch=_PROCESS_EPOCH, client_request_id=client_request_id, task_id="", queue_held=False,
         unresolved=True, scope=scope, remote_objects=objects, cloud=list(cloud), tos=list(tos))
+    if wire_payload and proof_handles:
+        manifest = _upload_manifest(wire_payload, proof_handles, objects)
+        if manifest:
+            record["upload_manifest"] = manifest
     with _LOCK:
         _write(record)
         _OWNED[identifier] = record
@@ -174,6 +204,16 @@ def observe(identifier: str, *, origin: str, principal: str, requested_id: str,
              or (record["scope"] == "my_box" and (status == "completed" or
                  status == "failed" and response.get("terminal") is True))))
         if not unknown and (blocked_terminal or native_terminal):
+            diagnostic = response.get("provider_failure_diagnostics")
+            if not diagnostic and isinstance(response.get("result"), dict):
+                diagnostic = response["result"].get("provider_failure_diagnostics")
+            failure = diagnostic.get("reference_failure") if isinstance(diagnostic, dict) else None
+            if status in {"failed", "failure"} and isinstance(failure, dict) and failure.get("stage") in {"download", "process"}:
+                matches = [row for row in record.get("upload_manifest", ()) if row["filename"] == failure.get("name")
+                           and _UPLOAD_FIELDS[row["field"]] == failure.get("kind")]
+                if len(matches) == 1:
+                    row = matches[0]
+                    record["failed_reference"] = {"stage": failure["stage"], "field": row["field"], "slot": row["slot"]}
             return _take(record)
         _write(record)
         return [], []

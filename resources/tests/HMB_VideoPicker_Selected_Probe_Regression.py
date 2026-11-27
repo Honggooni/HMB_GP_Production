@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from contextlib import nullcontext
 import json
 import logging
 import os
@@ -19,6 +20,18 @@ sys.path.insert(0, str(ROOT))
 
 
 async def verify(folder):
+    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes as GT
+    from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
+    engine = GT.get_instance()
+    GT.EventManager().initialize_queue()
+    flow_result = GT.handle_request(EnsureWorkflowAndFlowRequest(flow_name="SelectedVideoSlowWire"))
+    assert flow_result.succeeded(), flow_result.result_details
+    view = engine.bind_workflow(engine.open_workflows.get(flow_result.workflow_id)) if hasattr(engine, "bind_workflow") else nullcontext()
+    with view:
+        await verify_flow(folder, engine, GT.FlowManager().get_flow_by_name(flow_result.flow_name))
+
+
+async def verify_flow(folder, engine, flow):
     import HMBVideoPickerLibrary as picker
 
     node = picker.HMBVideoPickerLibrary(name="SelectedVideoPreparation")
@@ -60,13 +73,7 @@ async def verify(folder):
     import HMBSeedanceGeneration as seedance
     import HMBAgentLibrary as agents
     from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes as GT
-    from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
     from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, DeleteConnectionRequest
-    engine = GT.get_instance()
-    GT.EventManager().initialize_queue()
-    flow_result = GT.handle_request(EnsureWorkflowAndFlowRequest(flow_name="SelectedVideoSlowWire"))
-    assert flow_result.succeeded(), flow_result.result_details
-    flow = GT.FlowManager().get_flow_by_name(flow_result.flow_name)
     receiver = prompt.HMBPromptLibrary(name="SlowDirectPrompt")
     agent = agents.HMBAgentLibrary(name="SlowMediaAgent")
     generator = seedance.HMBSeedanceGeneration(name="SlowMediaGenerator")

@@ -24,7 +24,7 @@ assert spec and spec.loader
 target = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = target
 spec.loader.exec_module(target)
-target.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0
+target._broker_transport.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0
 
 
 class ExplicitRunSeedance(target.HMBSeedanceGeneration):

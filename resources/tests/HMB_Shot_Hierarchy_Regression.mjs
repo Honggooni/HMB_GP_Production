@@ -207,6 +207,44 @@ try {
   const renamedSaved=await page.evaluate(()=>JSON.stringify(window.host));
   await page.evaluate(value=>window.openGraph(JSON.parse(value)),renamedSaved);
   assert.equal(await page.locator('[data-shot-name]').first().innerText(),'e201_s001c002-s002c001__');
+  for (const compact of [false,true]) {
+    const locked=structuredClone(initial);
+    const identity={channel_uuid:locked.shot_routing.channel_uuid,shot_uuid:slot};
+    locked.shot_edit_locks=[identity]; locked.verified_shots=[identity];
+    await page.evaluate(({locked,compact})=>{
+      window.controller?.cleanup();
+      window.host=window.w.hmbNormalizeImageAssetState(locked);
+      const container=document.getElementById("widget");
+      window.controller=window.w.default(container,{...window.props(),value:JSON.stringify({
+        schema:"hmb-image-shot-status",widget_runtime_lease:locked.widget_runtime_lease,
+        channel_uuid:locked.shot_routing.channel_uuid,shot_edit_locks:locked.shot_edit_locks,
+        verified_shots:locked.verified_shots,document:window.host
+      })});
+      window.w.hmbSetImageAssetLibraryCompact(container,compact,{geometry:false});
+    },{locked,compact});
+    const add=page.locator(compact?'[data-compact-shot-add]':'[data-shot-add]');
+    const row=page.locator(compact?'[data-compact-shot-row]':'[data-shot-panel]');
+    assert.equal(await row.first().locator('[data-shot-lock]').count(),1);
+    assert.equal(await row.first().locator('[data-hmb-shot-check="true"]').count(),1);
+    for(let number=2;number<=5;number++){
+      await add.click();
+      assert.equal(await page.locator(`[data-hier-slot] option[value="${slot}"]`).evaluate(el=>el.disabled),true);
+      await page.locator('[data-hier-manual-name]').fill('Parallel '+number);
+      await page.locator('[data-hier-add]').click();
+      await page.locator('[data-hier-confirm]').click();
+      await page.waitForFunction(n=>window.host.shot_routing.shots.length===n,number);
+      assert.deepEqual(await page.evaluate(()=>window.host.shot_routing.shots[0]),locked.shot_routing.shots[0]);
+    }
+    await add.click(); await page.locator('[data-hier-manual-name]').fill('Overflow');
+    await page.locator('[data-hier-add]').click();assert.match(await page.locator('[data-hier-message]').innerText(),/5개/);
+    await page.keyboard.press('Escape');
+    const second=row.nth(1).locator(compact?'[data-compact-shot-tab]':'[data-shot-tab]');
+    await second.click();
+    const actual=await page.evaluate(()=>{const r=document.getElementById('widget').__hmbImageAssetLatestState.shot_routing;
+      return [r.active_shot_uuid,r.shots[1].shot_uuid];});
+    assert.equal(actual[0],actual[1],'Unlock Shot 2 selection while Shot 1 renders');
+    checks+=12;
+  }
   assert.deepEqual(errors,[]);checks+=21;
 } finally {await browser?.close();await new Promise(resolve=>server.close(resolve));}
 console.log(JSON.stringify({status:'PASS',checks,product_browser:true,independent_slots:5,cgt_requests:0,paid_requests:0}));

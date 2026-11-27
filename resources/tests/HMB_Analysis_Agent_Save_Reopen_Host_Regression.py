@@ -201,6 +201,21 @@ async def exercise(engine, phase: str, out: Path) -> None:
                 media = source(shot_uuid)
                 Image.new("RGB", (12, 10), color=(30 + index * 25, 90, 150)).save(media["path"])
                 command(node, "select_shot", shot_uuid)
+                if index == 0:
+                    from _hmb_shot_routing import set_shot_edit_lock
+                    target = {"channel_uuid": CHANNEL, "shot_uuid": shot_uuid}
+                    set_shot_edit_lock(source_node, target)
+                    try:
+                        assert node.get_parameter_value(analysis.UI)["shot_edit_locks"] == [target]
+                        rejected = command(node, "select_source", shot_uuid, kind="image", source_id=shot_uuid,
+                                           expected_error="ANALYSIS_REQUEST_INVALID")
+                        assert "작업 중" in rejected["status"]
+                        other = SHOTS[1]["shot_uuid"]
+                        assert command(node, "select_shot", other)["shot_uuid"] == other
+                        assert command(node, "select_shot", shot_uuid)["shot_uuid"] == shot_uuid
+                    finally:
+                        set_shot_edit_lock(source_node, None)
+                    assert node.get_parameter_value(analysis.UI)["shot_edit_locks"] == []
                 if index == 1:
                     host.send(engine, SetParameterValueRequest(node_name=node.name, parameter_name=analysis.FILE,
                         value=media["path"]))

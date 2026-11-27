@@ -1,6 +1,7 @@
 """Regress real host SetParameterValue and native lifecycle state collisions."""
 from __future__ import annotations
 import copy
+from contextlib import ExitStack
 import logging
 import os
 from pathlib import Path
@@ -26,7 +27,7 @@ def main():
         env["GTN_CONFIG_WORKSPACE_DIRECTORY"] = str(root)
         with mock.patch.dict(os.environ, env), mock.patch.object(socket, "create_connection", side_effect=AssertionError("Network forbidden")):
             logging.disable(logging.CRITICAL)
-            with engine_scope() as engine:
+            with engine_scope() as engine, ExitStack() as view:
                 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
                 GriptapeNodes.StaticFilesManager()._static_server_base_url = "http://127.0.0.1:43219"
                 engine.event_manager.initialize_queue()
@@ -37,6 +38,9 @@ def main():
                 subprocess.run([_find_ffmpeg(), "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=96x64:r=30",
                     "-t", "0.4", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(clip)], check=True)
                 ensured = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="Color LUT Native State", flow_name="ColorLUTNativeState"))
+                assert ensured.succeeded(), ensured.result_details
+                if hasattr(engine, "bind_workflow"):
+                    view.enter_context(engine.bind_workflow(engine.open_workflows.get(ensured.workflow_id)))
                 flow = engine.flow_manager.get_flow_by_name(ensured.flow_name)
                 with mock.patch.object(routing, "schedule_post_registration_reconcile"), mock.patch.object(routing, "reconcile_shot_routing"):
                     node = lut.HMBColorLUTLibrary(name="HMB Color LUT State Regression")

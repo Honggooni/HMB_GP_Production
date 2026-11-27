@@ -182,6 +182,102 @@ def main():
                 assert calls and owner not in calls and len(calls) == 1, calls
                 counts.append("snapshot_pending_defers_and_reuses_verified_cache")
 
+                # A folder-image reorder changes the remote Shot revision and
+                # its catalog hash, while both verified video files stay ready.
+                n = node()
+                owner_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+                channel = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                shot = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+                def catalog(revision):
+                    document = {"channel_uuid": channel, "generation": revision, "shots": [
+                        {"shot_uuid": shot, "number": 1, "name": "Shot 1", "revision": revision}]}
+                    return {**document, "schema": "hmb-shot-routing-catalog", "version": 1,
+                            "publisher_instance_uuid": owner_uuid, "metadata_sha256": picker._sha256_canonical(document)}
+                with patch.object(picker, "_probe_readable_video_reference", return_value=root / "controlled.mp4") as media_probe:
+                    # Let the host finish this standalone fixture's initial
+                    # publisher discovery before supplying the test catalog.
+                    await asyncio.sleep(.12)
+                    await wait_worker(n)
+                    n._hmb_reconcile_shot_routing_commit(catalog(1))
+                    await wait_worker(n)
+                    state = n._picker_state()
+                    assert state["shot_uuid"] == shot
+                    state = picker._append_video_asset(state, {"video_uid": "shot-video",
+                        "video_path": "//isolated.invalid/share/shot.mp4"}, defer_thumbnail=True)
+                    n._write_state(state)
+                    n._sync_outputs_from_state(state)
+                    await wait_worker(n)
+                    first = n._hmb_shot_routing_snapshot_for(channel_uuid=channel, shot_uuid=shot)
+                    assert first["shots"][0]["selected_source_uids"]
+                    scope = {"channel_uuid":channel, "shot_uuid":shot}
+                    state = n._picker_state()
+                    assert scope in picker._shot_routing.source_shot_status_fields(n, state)["verified_shots"]
+                    edited = copy.deepcopy(state)
+                    edited["videos"][0]["camera"] = "Changed Camera"
+                    assert scope not in picker._shot_routing.source_shot_status_fields(n, edited)["verified_shots"]
+                    element = picker._get_parameter_obj(n, picker.WIDGET_STATE_PARAMETER)
+                    shown = {"shot_edit_locks": [scope], "verified_shots": [scope]}
+                    revision = n._retain_picker_shot_status(state, shown)
+                    assert element.ui_options["picker_shot_status"] == {
+                        **shown, "channel_uuid": channel, "runtime_instance_id": n._hmb_runtime_instance_id,
+                        "picker_shot_status_revision": revision,
+                    }
+                    assert n._retain_picker_shot_status(state, shown) == revision
+                    cleared = {"shot_edit_locks": [], "verified_shots": []}
+                    assert n._retain_picker_shot_status(state, cleared) > revision
+                    assert not element.ui_options["picker_shot_status"]["shot_edit_locks"]
+                    assert "shot_edit_locks" not in n._picker_state()
+                    counts.append("cold_widget_has_retained_render_status_and_unlock")
+                    with patch.object(picker._shot_routing, "shot_edit_locks", return_value=[scope]):
+                        try:
+                            n._write_state(edited)
+                        except ValueError:
+                            pass
+                        else:
+                            raise AssertionError("A late Picker worker replaced the locked Shot media")
+                        n._assert_locked_shots_unchanged(state, dict(state, preview_frame=47))
+                    media_probe.reset_mock()
+                    with patch.object(n, "_schedule_video_removal_output_sync", wraps=n._schedule_video_removal_output_sync) as scheduled:
+                        n._hmb_reconcile_shot_routing_commit(catalog(2))
+                        latest = n._hmb_shot_routing_snapshot_for(channel_uuid=channel, shot_uuid=shot)
+                        assert latest == first and n._picker_state()["accepted_shot_catalog_generation"] == 2
+                        scheduled.assert_not_called()
+                        media_probe.assert_not_called()
+                    # A caller can wait again after an explicit recheck, even
+                    # when the resulting dependency envelope is byte-identical.
+                    n._hmb_verified_media = None
+                    with patch.object(picker, "_propagate_parameter_update_to_connections") as forward:
+                        try:
+                            n._hmb_shot_routing_snapshot_for(channel_uuid=channel, shot_uuid=shot)
+                        except picker._HMBPickerMediaPreparing:
+                            pass
+                        else:
+                            raise AssertionError("Unverified references were returned")
+                        await wait_worker(n)
+                        assert [c.args[1] for c in forward.call_args_list] == [picker.SHOT_PICKER_OUTPUT_PARAMETER]
+                        forward.reset_mock()
+                        assert n._hmb_shot_routing_snapshot_for(channel_uuid=channel, shot_uuid=shot) == first
+                        forward.assert_not_called()
+                    prepared = (json.loads(n.parameter_output_values["PICKER_OUT"]),
+                                n.parameter_output_values["VIDEO_OUT"], n.parameter_output_values[picker.SHOT_PICKER_OUTPUT_PARAMETER])
+                    n._hmb_shot_readiness_waiting = True
+                    n._sync_outputs_from_state(n._picker_state(), propagate_connections=False, _prepared_publication=prepared)
+                    assert n._hmb_shot_readiness_waiting
+                    with patch.object(picker, "_propagate_parameter_update_to_connections", side_effect=RuntimeError("fixture")):
+                        try:
+                            n._sync_outputs_from_state(n._picker_state(), _prepared_publication=prepared)
+                        except RuntimeError:
+                            pass
+                        else:
+                            raise AssertionError("Failed dependency delivery was acknowledged")
+                    assert n._hmb_shot_readiness_waiting
+                    with patch.object(picker, "_propagate_parameter_update_to_connections") as forward:
+                        n._sync_outputs_from_state(n._picker_state(), _prepared_publication=prepared)
+                        assert not n._hmb_shot_readiness_waiting and forward.call_count == 1
+                counts.extend(["image_only_catalog_revision_keeps_verified_videos",
+                               "unchanged_ready_shot_wakes_waiting_connections_once",
+                               "stage_and_failed_readiness_delivery_preserve_waiter"])
+
                 # Saved-workflow callers can publish on a synchronous retained
                 # request/worker before Generator starts its asyncio execution.
                 # That verified publication must be readable without a second
@@ -322,7 +418,12 @@ def main():
                 assert state == original and payload["media_blocked"] and media == []
                 counts.append("detached_prepare_nonmutating_strict_media")
 
-            asyncio.run(scenario())
+            if G is None:
+                asyncio.run(scenario())
+            else:
+                from hmb_host_workflow import scoped_fixture_workflow
+                with scoped_fixture_workflow(current_engine(), "VideoPickerAsyncRoot"):
+                    asyncio.run(scenario())
             print("Picker async execution: PASS " + json.dumps({"count": len(counts), "cases": counts, **metrics}, sort_keys=True))
 
 

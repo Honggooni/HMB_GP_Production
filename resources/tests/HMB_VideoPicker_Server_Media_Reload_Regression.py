@@ -180,8 +180,10 @@ try:
         restored._hmb_node_deleted = False
         restored._hmb_lifecycle_generation = 1
         restored._hmb_runtime_instance_id = "server-media-reload-runtime"
+        restored._hmb_picker_publisher_uuid = "server-media-reload-publisher"
         restored._hmb_serialized_maya_scene_path = ""
         restored._hmb_state_revision = 0
+        restored._hmb_read_requests = {}
         restored._hmb_authoritative_state = None
         restored._hmb_latest_widget_state = None
         restored._hmb_state_write_lock = threading.RLock()
@@ -214,6 +216,8 @@ try:
         assert hydrated_video["project_video_path"] == project_macro
         assert project_copy.name in hydrated_video["video_url"]
         assert "stale-color" not in hydrated_video["video_url"]
+        stored_video = restored.parameter_values[picker.WIDGET_STATE_PARAMETER]["videos"][0]
+        assert stored_video["video_url"] == hydrated_video["video_url"]
 
         # Original Preview lives outside the card catalog until appended, so
         # its process-local URL must be refreshed independently on hydration.

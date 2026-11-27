@@ -194,7 +194,7 @@ class MyBoxNodeTests(unittest.TestCase):
             mock.patch.object(socket.socket,'connect',local_connect),
             mock.patch.object(urllib.request,'urlopen',forbidden),
             mock.patch.object(urllib.request.OpenerDirector,'open',forbidden),
-            mock.patch.object(target,'_broker_load_token',forbidden),
+            mock.patch.object(target._broker_transport,'_broker_load_token',forbidden),
             mock.patch.object(target._broker_config,'load_broker_base_url',side_effect=lambda:self.origin),
             mock.patch.object(target,'_validate_decodable_mp4_file',side_effect=self.verify_staged_bytes)]
         for patch in self.patches: patch.start(); self.addCleanup(patch.stop)
@@ -358,6 +358,19 @@ class MyBoxNodeTests(unittest.TestCase):
         uri_key = next(iter(self.node._local_reference_paths(path.as_uri())))
         self.assertEqual(self.node.get_parameter_value(target.ONLY_REFERENCE_DIGESTS_PARAMETER)[uri_key],
                          hashlib.sha256(original).hexdigest())
+
+    def test_missing_manual_image_identifies_only_its_slot_and_keeps_verified_siblings(self):
+        self.node.set_parameter_value("task", target.TASK_REFERENCE_TO_VIDEO)
+        valid = self.folder / "valid.png"
+        missing = self.folder / "removed.png"
+        valid.write_bytes(b"Local reference content")
+        self.node.set_parameter_value("reference_images", [str(valid), str(missing)])
+        with self.assertRaisesRegex(ValueError, r"reference_images\[2\].*removed\.png.*does not exist"):
+            asyncio.run(self.node._await_manual_reference_content())
+        saved = self.node.get_parameter_value(target.ONLY_REFERENCE_DIGESTS_PARAMETER)
+        self.assertEqual(set(saved.values()), {hashlib.sha256(valid.read_bytes()).hexdigest()})
+        self.assertEqual(set(self.node._hmb_manual_reference_errors), set(self.node._local_reference_paths(str(missing))))
+        self.assertFalse(self.backend.calls)
 
     def test_rapid_native_reselection_discards_older_file_verification(self):
         node = self.node

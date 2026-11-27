@@ -568,6 +568,18 @@ def project_follow_tests():
         state = {"project_id": "show-b", "project_root": "D:/other/show-b"}
         routing.notify_color_lut_project_change(nodes[0], state)
         assert seen[-1]["name"] == "show-b"
+        broken = mock.Mock(side_effect=RuntimeError("Simulated LUT project failure"))
+        nodes.insert(-1, SimpleNamespace(_hmb_follow_image_asset_project=broken))
+        state = {"project_id": "show-c", "project_root": "D:/other/show-c"}
+        with mock.patch.object(routing._LOGGER, "exception") as logged:
+            routing.notify_color_lut_project_change(nodes[0], state)
+            logged.assert_called_once()
+        assert seen[-1]["name"] == "show-c", "An optional LUT cannot block its peers"
+        broken.side_effect = None
+        routing.notify_color_lut_project_change(nodes[0], state)
+        assert broken.call_count == 2, "Retry failed delivery of the same project"
+        routing.notify_color_lut_project_change(nodes[0], state)
+        assert broken.call_count == 2, "Stop repeating the publication after successful delivery"
     routing._reconcile_color_lut_projects([recipient])
     assert seen[-1] == {}, "Removed ImageAsset cannot leave a stale project"
 

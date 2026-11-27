@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 import HMBAnalysisAgent as analysis
+import _hmb_analysis_delivery as delivery
 
 
 class PromptFixture:
@@ -63,11 +64,37 @@ class AnalysisNodeRegression(unittest.TestCase):
         self.nodes = [self.prompt, self.node]
         registry = {"HMBPromptLibrary": PromptFixture, "HMBAnalysisAgent": analysis.HMBAnalysisAgent}
         for patch in (
+            mock.patch.object(delivery, "_registered_node_class", side_effect=registry.get),
+            mock.patch.object(delivery, "_same_flow_nodes", side_effect=lambda node: ("flow", self.nodes) if node in self.nodes else ("", [])),
             mock.patch.object(analysis, "_registered_node_class", side_effect=registry.get),
             mock.patch.object(analysis, "_same_flow_nodes", side_effect=lambda node: ("flow", self.nodes) if node in self.nodes else ("", [])),
         ):
             patch.start()
             self.addCleanup(patch.stop)
+
+    def test_absent_optional_analyzer_preserves_prompt_originals_and_does_not_load_its_class(self):
+        self.nodes.remove(self.node)
+        sources = [
+            {"kind": "image", "path": str(self.path.with_name(f"ref-{i}.png")), "shot_reference": f"@image{i}"}
+            for i in range(1, 8)
+        ]
+        scope = {"channel_uuid": "channel", "shot_uuid": "shot-1"}
+        def registered(name):
+            self.assertEqual(name, "HMBPromptLibrary")
+            return PromptFixture
+
+        with (mock.patch.dict(sys.modules, {"HMBAnalysisAgent": None}),
+              mock.patch.object(delivery, "_registered_node_class", side_effect=registered),
+              mock.patch.object(self.prompt, "_hmb_analysis_originals_for", return_value=sources)):
+            for role in ("before", "after"):
+                asyncio.run(delivery.prepare_analysis_for_run(self.prompt, **scope, role=role))
+            delivery.schedule_analysis_refresh(self.prompt)
+            self.assertEqual(delivery.analysis_render_input_preview(self.prompt, **scope), {})
+            self.assertEqual(delivery.analysis_delivery_context(self.prompt, **scope, destination="agent"), {})
+            self.assertFalse(delivery.analysis_results_only(self.prompt, **scope))
+            originals = delivery.analysis_originals(self.prompt, **scope)
+            self.assertEqual([(r["path"], r["shot_reference"]) for r in originals],
+                             [(r["path"], r["shot_reference"]) for r in sources])
 
     @staticmethod
     def make_node():

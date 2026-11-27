@@ -131,15 +131,14 @@ class CompileCacheHydration(unittest.TestCase):
     def test_running_loop_scheduler_exception_falls_back_synchronously(self):
         state=copy.deepcopy(self.state);state['text'][next(iter(target.TEXT_FIELD_DEFAULTS))]='saved exception literal 0 OFF'
         raw=target._json_dumps(state)
-        router=types.ModuleType('_hmb_shot_routing')
-        router.schedule_post_hydration_reconcile=mock.Mock(side_effect=RuntimeError('fixture scheduler unavailable'))
-        with mock.patch.dict(sys.modules,{**self.loop_modules(),'_hmb_shot_routing':router}),mock.patch.object(self.node,'_reconcile_connected_source_inputs_from_graph',return_value=True) as reconcile,mock.patch.object(self.node,'_sync_prompt_output_now') as sync:
+        import _hmb_shot_routing as router
+        with mock.patch.dict(sys.modules,self.loop_modules()),mock.patch.object(router,'schedule_post_hydration_reconcile',side_effect=RuntimeError('fixture scheduler unavailable')) as schedule,mock.patch.object(self.node,'_reconcile_connected_source_inputs_from_graph',return_value=True) as reconcile,mock.patch.object(self.node,'_sync_prompt_output_now') as sync:
             self.node.set_parameter_value(target.WIDGET_PARAMETER_NAME,raw,initial_setup=True)
             self.assertEqual(target._get_parameter_raw(self.node,target.WIDGET_PARAMETER_NAME),raw)
             self.assertEqual(self.node._current_state()['text'],state['text'])
             self.assertEqual(reconcile.call_count,1);self.assertEqual(sync.call_count,1)
             self.assertFalse(self.node._hmb_initial_source_hydration_pending)
-            router.schedule_post_hydration_reconcile.assert_called_once_with(self.node)
+            schedule.assert_called_once_with(self.node)
             self.node._hmb_post_hydration_state_restore()
             self.assertEqual(reconcile.call_count,1);self.assertEqual(sync.call_count,1)
 

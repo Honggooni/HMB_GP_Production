@@ -43,6 +43,34 @@ assert.equal(emissions.length, 1, "Focused Prompt text must publish its trailing
 assert.equal(JSON.parse(emissions[0]).text.SCENE_CONTEXT, "Focused trailing value");
 clearTimeout(container.__hmbPromptPendingLocalTimer);
 
+// Continuous input must not keep moving the deadline away from the Agent.
+// Observe the timer directly so machine load cannot mask a debounce regression.
+const burst = focusedTextFixture();
+globalThis.document = { activeElement: burst.input };
+const pending = [];
+const published = [];
+const realTimer = globalThis.setTimeout;
+try {
+  globalThis.setTimeout = (callback, milliseconds) => {
+    pending.push({ callback, milliseconds });
+    return pending.length;
+  };
+  for (const text of ["first", "latest"]) {
+    burst.input.value = text;
+    const latest = widget.normalizeState({ text: { SCENE_CONTEXT: text } });
+    widget.hmbScheduleImmediateStateCommit(burst.container, {
+      onChange(value) { published.push(JSON.parse(value).text.SCENE_CONTEXT); },
+    }, latest);
+  }
+} finally {
+  globalThis.setTimeout = realTimer;
+}
+assert.equal(pending.length, 1, "Successive input must share the first scheduled publication.");
+assert.ok(pending[0].milliseconds <= 16, "Authored text must be due within one frame interval.");
+pending[0].callback();
+assert.deepEqual(published, ["latest"]);
+clearTimeout(burst.container.__hmbPromptPendingLocalTimer);
+
 const composing = focusedTextFixture();
 globalThis.document = { activeElement: composing.input };
 composing.container.__hmbPromptLibraryCompositionActive = true;

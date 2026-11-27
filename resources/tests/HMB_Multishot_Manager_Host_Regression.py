@@ -415,6 +415,73 @@ async def exercise(engine):
         assert manager.get_parameter_value("prompt") == before_prompt and not manager._hmb_shot_workers
         refreshed = manager.get_parameter_value(row2.name)
         assert refreshed["request_id"] == "a" * 32 and not refreshed["selected"]
+        current = prompt._current_state()
+        first = current["shot"]
+        scope = {"channel_uuid": CHANNEL, "shot_uuid": first["shot_uuid"]}
+        with mock.patch.object(routing, "publish_source_widget_view", wraps=routing.publish_source_widget_view) as publish:
+            routing.set_shot_edit_lock(generators[0], scope)
+            prompt_events = [call.args[-1] for call in publish.call_args_list if call.args[0] is prompt]
+            assert len(prompt_events) == 1, "Mounted Prompt needs one real SDK value event per lock transition"
+            packet = json.loads(prompt_events[0])
+            assert packet["schema"] == "hmb-prompt-shot-status" and packet["status"]["shot_edit_locks"] == [scope]
+            assert packet["document"]["shot"]["shot_uuid"] == first["shot_uuid"]
+            assert json.loads(prompt.get_parameter_value(prompt_module.WIDGET_PARAMETER_NAME)) == packet["document"]
+            prompt._hmb_shot_edit_locks_changed()
+            assert sum(call.args[0] is prompt for call in publish.call_args_list) == 1
+        try:
+            row = manager.get_parameter_value(agent_module._AGENT_SHOT_ROW_PREFIX + str(first["number"]))
+            assert row["shot_edit_locks"] == [scope] and not row["stage_completed"]
+            widget = prompt.get_parameter_by_name(prompt_module.WIDGET_PARAMETER_NAME)
+            assert widget.ui_options["shot_edit_locks"] == [scope]
+            attempted = deepcopy(current)
+            attempted["text"]["SCENE_CONTEXT"] = "Locked text must never reach the Agent."
+            attempted[prompt_module.UI_EDIT_REVISION_KEY] += 1
+            try:
+                prompt.set_parameter_value(prompt_module.WIDGET_PARAMETER_NAME, prompt_module._json_dumps(attempted))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("Locked active Prompt accepted an authored edit.")
+            assert prompt._current_state()["text"] == current["text"]
+            other = next(item for item in prompt_module._verified_prompt_shot_catalog(current)
+                         if item["shot_uuid"] != first["shot_uuid"])
+            other_page = prompt_module._select_prompt_shot_document(deepcopy(current), other)
+            other_page[prompt_module.UI_EDIT_REVISION_KEY] = current[prompt_module.UI_EDIT_REVISION_KEY] + 1
+            other_page[prompt_module.SOURCE_SYNC_REVISION_KEY] = current[prompt_module.SOURCE_SYNC_REVISION_KEY]
+            prompt.set_parameter_value(prompt_module.WIDGET_PARAMETER_NAME, prompt_module._json_dumps(other_page))
+            assert prompt._current_state()["shot"]["shot_uuid"] == other["shot_uuid"]
+            other_page = prompt._current_state()
+            first_key = prompt_module._prompt_document_key(first)
+            archived = json.loads(other_page["shot_documents"][first_key])
+            archived["text"]["SCENE_CONTEXT"] = "Tampered dormant locked Shot."
+            other_page["shot_documents"][first_key] = json.dumps(archived)
+            try:
+                prompt._hmb_check_locked_prompt_documents(other_page)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("Nested Prompt document bypassed its Shot lock.")
+            manager.set_parameter_value(agent_module._AGENT_WIDGET_PARAMETER,
+                manager._hmb_widget_value(shot=first, shot_catalog=catalog))
+            try:
+                manager.set_parameter_value("additional_context", "Locked mutation")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("Locked native Agent accepted a setting edit.")
+            manager.set_parameter_value(agent_module._AGENT_WIDGET_PARAMETER,
+                manager._hmb_widget_value(shot=other, shot_catalog=catalog))
+            saved_context = manager.get_parameter_value("additional_context")
+            manager.set_parameter_value("additional_context", "Other Shot is editable")
+            assert manager.get_parameter_value("additional_context") == "Other Shot is editable"
+            manager.set_parameter_value("additional_context", saved_context)
+        finally:
+            routing.set_shot_edit_lock(generators[0], None)
+        assert not prompt.get_parameter_by_name(prompt_module.WIDGET_PARAMETER_NAME).ui_options["shot_edit_locks"]
+        current[prompt_module.UI_EDIT_REVISION_KEY] = prompt._current_state()[prompt_module.UI_EDIT_REVISION_KEY] + 1
+        prompt.set_parameter_value(prompt_module.WIDGET_PARAMETER_NAME, prompt_module._json_dumps(current))
+        manager.set_parameter_value(agent_module._AGENT_WIDGET_PARAMETER, before_refresh)
+        print("PASS registered Generator lease protects exact active and archived Prompt and Agent settings; other Shot stays editable")
         print("PASS native SDK accordion row3/body/row4 order; original IDs, hide restoration, 100 unchanged layouts reorder zero")
 
         async def resolve(targets):
@@ -440,6 +507,16 @@ async def exercise(engine):
             manager._hmb_shot_run_status)
         assert [number for kind, number, _ in events if kind == "generation_finished"] == [3], (events,
             {key: generators[2].parameter_output_values.get(key) for key in ("was_successful", "result_details", "generation_status")})
+        assert manager.get_parameter_value(agent_module._AGENT_SHOT_ROW_PREFIX + "3")["stage_completed"]
+        assert not manager.get_parameter_value(agent_module._AGENT_SHOT_ROW_PREFIX + "2")["stage_completed"]
+        from HMBAnalysisAgent import _notify_prompt_media_changed
+        verified_prompt = f"{CHANNEL}/{SHOTS[2]['shot_uuid']}"
+        assert verified_prompt in prompt._hmb_completed_prompt_shots
+        _notify_prompt_media_changed(prompt, CHANNEL, SHOTS[2]["shot_uuid"], changed_role="after")
+        assert verified_prompt in prompt._hmb_completed_prompt_shots
+        assert not manager.get_parameter_value(agent_module._AGENT_SHOT_ROW_PREFIX + "3")["stage_completed"]
+        _notify_prompt_media_changed(prompt, CHANNEL, SHOTS[2]["shot_uuid"], changed_role="before")
+        assert verified_prompt not in prompt._hmb_completed_prompt_shots
         for number, literal, prepared, exact_finish, visible in finish_observations:
             assert prepared["prompt"] == literal, ("literal_prompt", prepared["prompt"], literal)
             assert exact_finish["finish_look_state"] == finish_authored[number], ("finish_state", number, exact_finish["finish_look_state"], finish_authored[number])
@@ -472,6 +549,8 @@ async def exercise(engine):
         fourth_rule = manager.get_parameter_by_name("rulesets").add_child_parameter()
         fourth_tool = manager.get_parameter_by_name("tools").add_child_parameter()
         manager.set_parameter_value(fourth_rule.name, "FOURTH_SHOT_RULE")
+        assert not manager.get_parameter_value(agent_module._AGENT_SHOT_ROW_PREFIX + "4")["stage_completed"]
+        assert manager.get_parameter_value(agent_module._AGENT_SHOT_ROW_PREFIX + "3")["stage_completed"]
         manager.set_parameter_value(fourth_tool.name, {"name": "Fourth fixture tool", "configuration": {"value": 0}})
         fourth_schema = {"type": "object", "properties": {"fourth": {"type": "string"}}}
         manager.set_parameter_value("output_schema", deepcopy(fourth_schema))
@@ -519,6 +598,7 @@ async def exercise(engine):
         await resolve(generators[:2])
         assert [n for kind, n, _ in events if kind == "generation_finished"] == [2], events
         assert generators[0].parameter_output_values.get("was_successful") is False
+        assert not routing.shot_edit_locks(source), "A pre-submit Agent failure must release its Shot"
         assert "PRIVATE_MODEL_FIXTURE_DETAILS" not in str(generators[0].parameter_output_values)
         assert manager._hmb_agent_shot_result(channel_uuid=CHANNEL, shot_uuid=SHOTS[0]["shot_uuid"]) == {}
         events.clear()
@@ -533,6 +613,56 @@ async def exercise(engine):
         while not entered.is_set() and time.monotonic() < deadline:
             await asyncio.sleep(0.005)
         assert entered.is_set(), "Selected worker did not enter its model boundary"
+        locked = {"channel_uuid": CHANNEL, "shot_uuid": SHOTS[0]["shot_uuid"]}
+        assert locked in routing.shot_edit_locks(source)
+        if callable(getattr(engine, "open_workflow", None)):
+            # Tab B can be active when tab A's worker completes. Use the same
+            # node and flow names in B, as happens on reopening a saved copy.
+            entry = engine.workflow_registry.register_unsaved("Shot lock isolation", listed=False)
+            open_workflows = engine._open_workflows
+            if hasattr(open_workflows, "_allow_several_open"):
+                # SDK 0.104 exposes concurrent workflow tabs through its test seam.
+                with mock.patch.object(open_workflows, "_allow_several_open", True):
+                    sibling_workflow = engine.open_workflow(entry.workflow_id)
+            else:
+                sibling_workflow = engine.open_workflow(entry.workflow_id)
+            with engine.bind_workflow(sibling_workflow):
+                other_flow = engine.handle_request(EnsureWorkflowAndFlowRequest(flow_name=flow.name))
+                assert other_flow.succeeded(), other_flow
+                other_node = agent_module.DataNode(name=source.name)
+                engine.flow_manager.get_flow_by_name(flow.name).add_node(other_node)
+                engine.object_manager.add_object_by_name_in(sibling_workflow, other_node.name, other_node)
+                sibling_workflow.nodes.name_to_parent_flow_name[other_node.name] = flow.name
+                assert routing.shot_edit_locks(other_node) == []
+                assert locked in routing.shot_edit_locks(source)
+                assert engine.current_workflow() is sibling_workflow
+        gen = generators[0]
+        widget = gen.get_parameter_value(seedance_module.SEEDANCE_SHOT_WIDGET_PARAMETER)
+        assert locked in widget["shot_edit_locks"] and "duration" in widget["shot_edit_fields"]
+        assert set(widget["shot_edit_fields"]).isdisjoint({
+            seedance_module.SEEDANCE_SHOT_WIDGET_PARAMETER, seedance_module.SEEDANCE_REFRESH_COMMAND_PARAMETER,
+            "generation_refresh", "generation_status", "provider_response"})
+        old_ratio = gen.get_parameter_value("ratio")
+        try:
+            gen.set_parameter_value("ratio", "1:1" if old_ratio != "1:1" else "16:9")
+        except ValueError as exc:
+            assert "Generator" in str(exc)
+        else:
+            raise AssertionError("An in-flight Shot accepted a Generator setting edit")
+        assert gen.get_parameter_value("ratio") == old_ratio
+        selection = {**widget, "shot": {"channel_uuid": "", "shot_uuid": ""},
+            "selection_request": {"schema": seedance_module.SEEDANCE_MODE_SELECTION_SCHEMA, "version": 1,
+                "expected_revision": widget["execution_mode_revision"],
+                "expected_instance": widget["execution_mode_instance"], "mode": "only"}}
+        try:
+            gen.set_parameter_value(seedance_module.SEEDANCE_SHOT_WIDGET_PARAMETER, selection)
+        except ValueError as exc:
+            assert "Generator" in str(exc)
+        else:
+            raise AssertionError("An in-flight Shot accepted reassignment")
+        assert gen.get_parameter_value(seedance_module.SEEDANCE_SHOT_WIDGET_PARAMETER)["shot"] == widget["shot"]
+        routing.assert_shot_editable(generators[3], CHANNEL, SHOTS[3]["shot_uuid"])
+        assert not generators[3].get_parameter_value(seedance_module.SEEDANCE_SHOT_WIDGET_PARAMETER)["shot_edit_fields"]
         manager.set_parameter_value(agent_module._AGENT_WIDGET_PARAMETER,
             manager._hmb_widget_value(shot={"channel_uuid": CHANNEL, **SHOTS[3]}, shot_catalog=catalog, shot_manager=True))
         state = prompt._current_state()
@@ -548,6 +678,7 @@ async def exercise(engine):
         outcomes = await asyncio.wait_for(asyncio.gather(first, second, return_exceptions=True), timeout=10)
         assert isinstance(outcomes[0], asyncio.CancelledError), outcomes
         assert outcomes[1] is None, outcomes
+        assert locked not in routing.shot_edit_locks(source)
         assert [n for kind, n, _ in events if kind == "generation_finished"] == [2], events
         generators[0].clear_cancellation()
         native_mode["block"] = None
@@ -611,7 +742,7 @@ async def exercise(engine):
         assert manager.metadata["size"] == {"width": 811, "height": 777}
         print("PASS real Prompt1/Agent1/Finish1 to five Generators: exact per-Shot Beauty at every mocked render boundary, literal prompt/480p retained; user resize never forced")
 
-        from HMBAnalysisAgent import HMBAnalysisAgent, _notify_prompt_media_changed
+        from HMBAnalysisAgent import HMBAnalysisAgent
         from HMBSoundLibrary import HMBSoundLibrary
         from HMBVideoPickerLibrary import HMBVideoPickerLibrary
         independent = [HMBVideoPickerLibrary(name="Unchanged Video Picker"),
@@ -653,9 +784,10 @@ async def exercise(engine):
                 "catalog_identity": {field: state[field] for field in image_module.IMAGE_ASSET_EDIT_CATALOG_FIELDS},
                 "selected_source_uids": [row["source_uid"] for row in state["assets"]],
                 "edits": {"shot_routing": routing_state}}
-        changed = await engine.ahandle_request(SetParameterValueRequest(node_name=source.name,
+        event = await engine.event_manager.ahandle_request(SetParameterValueRequest(node_name=source.name,
             parameter_name=image_module.WIDGET_STATE_PARAMETER, value=json.dumps(edit), data_type="str"),
             result_context={"request_id": "desktop-edit-image-selection-1"})
+        changed = event.result
         assert changed.succeeded(), changed.result_details
         assert source._hmb_sound_unchanged_image_request_id == "desktop-edit-image-selection-1"
         assert all(node.state == stale for node in chain)

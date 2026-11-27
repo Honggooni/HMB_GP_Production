@@ -104,6 +104,32 @@ try {
     await callback(); receipt.cases.push({ name, passed: true });
     await page.evaluate(() => { fixtures.splice(0).forEach((fixture) => fixture.cleanup()); });
   };
+  await check("render ownership locks only matching shot fields and completion requires current proof", async () => {
+    const states = await page.evaluate(async () => {
+      const one = makeState(1), two = makeState(2);
+      const locks = [{channel_uuid: one.shot.channel_uuid, shot_uuid: one.shot.shot_uuid}];
+      const locked = {...one, shot_edit_locks: locks, shot_edit_fields: ["resolution", "draft_action"]};
+      const a = createFixture(locked), b = createFixture({...two, shot_edit_locks: locks});
+      const observe = fixture => [
+        fixture.container.querySelector(".hmb-seedance-shot__progress").textContent,
+        fixture.container.querySelector(".hmb-seedance-shot__select").disabled,
+        fixture.node.querySelector('[data-parameter-name="resolution"]').inert,
+        fixture.container.querySelector("[data-seedance-shot-number]").dataset.hmbShotCheck,
+      ];
+      const initial = [observe(a), observe(b)];
+      const replacement = document.createElement("input");
+      replacement.dataset.parameterName = "resolution";
+      a.node.querySelector('[data-parameter-name="resolution"]').replaceWith(replacement);
+      await Promise.resolve();
+      const replaced = replacement.inert;
+      a.update({...one, draft: {...one.draft, render_completed:true}});
+      const complete = observe(a);
+      a.update({...one, draft: {...one.draft, run_locked:true}});
+      return {initial, replaced, complete, verifying:observe(a)};
+    });
+    assert.deepEqual(states, {initial:[["로동중... 수정불가",true,true,"false"],["",false,false,"false"]],replaced:true,
+      complete:["",false,false,"true"],verifying:["",false,false,"false"]});
+  });
   await check("legacy-state-without-additive-fields-retains-final-available-and-busy-compatibility", async () => {
     const result = await page.evaluate(() => {
       const legacy = makeState(); delete legacy.draft.final_state; delete legacy.draft.final_visible; delete legacy.draft.final_task_id;

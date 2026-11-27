@@ -133,10 +133,10 @@ class ManualLUTRegression(unittest.TestCase):
             context = self.ready(artifact)
             self.assertTrue(self.node._upload_projection()["enabled"])
             ack = {**self.ack(context), "group_id": group, "episode": episode}
-            generator = types.ModuleType("HMBSeedanceGeneration")
-            generator._broker_require_exact_response_url = mock.Mock()
-            generator._broker_read_json = mock.Mock(return_value=ack)
-            with mock.patch.dict(sys.modules, {"HMBSeedanceGeneration": generator}):
+            broker = types.ModuleType("_hmb_broker_transport")
+            broker._broker_require_exact_response_url = mock.Mock()
+            broker._broker_read_json = mock.Mock(return_value=ack)
+            with mock.patch.dict(sys.modules, {"_hmb_broker_transport": broker}):
                 for attempt in ("first", "again"):
                     self.node._command({"id": group + action + attempt, "action": action,
                                         "state": copy.deepcopy(self.node._hmb_color_lut_state)})
@@ -571,10 +571,10 @@ class ManualLUTRegression(unittest.TestCase):
             return Response()
         context["bridge"]._load_access_token = lambda: "fixture-token"
         context["bridge"]._opener = types.SimpleNamespace(open=opened)
-        generator = types.ModuleType("HMBSeedanceGeneration")
-        generator._broker_require_exact_response_url = lambda *args: None
-        generator._broker_read_json = lambda *args, **kwargs: self.ack(context)
-        with mock.patch.dict(sys.modules, {"HMBSeedanceGeneration": generator}):
+        broker = types.ModuleType("_hmb_broker_transport")
+        broker._broker_require_exact_response_url = lambda *args: None
+        broker._broker_read_json = lambda *args, **kwargs: self.ack(context)
+        with mock.patch.dict(sys.modules, {"_hmb_broker_transport": broker}):
             self.node._upload_request(context, retrieve=False, cancel=threading.Event())
         self.assertEqual(seen["url"], ORIGIN + target.COLOR_LUT_MANUAL_UPLOAD_PATH)
         self.assertIn(f'filename="color-lut.{suffix}"'.encode(), seen["body"])
@@ -623,10 +623,10 @@ class ManualLUTRegression(unittest.TestCase):
             self.assertEqual(b"".join(chunks), poster_bytes + preview_bytes)
             return response
         opener.open.side_effect = opened
-        generator = types.ModuleType("HMBSeedanceGeneration")
-        generator._broker_require_exact_response_url = mock.Mock()
-        generator._broker_read_json = mock.Mock(return_value=ready)
-        with mock.patch.dict(sys.modules, {"HMBSeedanceGeneration": generator}):
+        broker = types.ModuleType("_hmb_broker_transport")
+        broker._broker_require_exact_response_url = mock.Mock()
+        broker._broker_read_json = mock.Mock(return_value=ready)
+        with mock.patch.dict(sys.modules, {"_hmb_broker_transport": broker}):
             for status in (201, 200):
                 response.status = status
                 self.assertEqual(self.node._upload_review_media(context, derived, poster, preview, cancel=threading.Event()), ready)
@@ -634,7 +634,7 @@ class ManualLUTRegression(unittest.TestCase):
                                   (200, {"source_sha256": "0" * 64})):
                 with self.subTest(status=status, mismatch=patch), self.assertRaises(ValueError):
                     response.status = status
-                    generator._broker_read_json.return_value = {**ready, **patch}
+                    broker._broker_read_json.return_value = {**ready, **patch}
                     self.node._upload_review_media(context, derived, poster, preview, cancel=threading.Event())
             opener.open.reset_mock()
             for invalid in ("../../wrong", "/api/test", ""):

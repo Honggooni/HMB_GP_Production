@@ -273,6 +273,32 @@ class SelectionResolutionTests(unittest.IsolatedAsyncioTestCase):
                             for _, media in self.published))
         self.assertEqual(len(self.reads), 2)
 
+    async def test_append_during_share_verification_probes_each_file_once(self):
+        node, live = fake_node(selected_state("A"))
+        checked = []
+        verify = asset._verified_project_relative_path
+
+        def record(asset_row, state, records):
+            checked.append(asset_row["relative_path"])
+            return verify(asset_row, state, records)
+
+        with patch.object(asset, "_verified_project_relative_path", record):
+            node._sync_output(live["state"])
+            await self.wait_until(self.entered.is_set)
+            state = live["state"]
+            row = selected_state("B")["assets"][0]
+            row["selection_order"] = 2
+            state["assets"].append(row)
+            shot = state["shot_routing"]["shots"][0]
+            shot["selected_source_uids"].append(row["source_uid"])
+            shot["revision"] += 1
+            state["shot_routing"]["generation"] += 1
+            live["state"] = asset._normalize_state(state)
+            node._sync_output(live["state"])
+            self.release.set()
+            await self.wait_until(lambda: bool(self.published) and len(self.published[-1][1]) == 2)
+        self.assertEqual(checked, ["A.png", "B.png"])
+
     async def test_project_switch_rejects_old_result(self):
         node, live = fake_node(selected_state("A", "ProjectA"))
         node._sync_output(live["state"])

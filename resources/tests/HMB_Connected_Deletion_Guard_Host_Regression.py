@@ -139,6 +139,27 @@ async def exercise(engine, _phase, out):
     manager.add_pre_dispatch_hook(preexisting_owner_hook)
     owner = bootstrap.HMBProductionLibrary.__new__(bootstrap.HMBProductionLibrary)
     owner._registrations = set()
+    import _hmb_connection_management as connection_management
+    import _hmb_workflow_serialization_compat as save_compat
+    with (mock.patch.object(bootstrap, "_hmb_coordinate_native_editor_update"),
+          mock.patch.object(connection_management, "install_request_handlers", side_effect=RuntimeError("simulated connection API change")),
+          mock.patch.object(bootstrap, "_acquire_windows_transport_close_guard", side_effect=RuntimeError("simulated close API change")),
+          mock.patch.object(save_compat, "acquire", wraps=save_compat.acquire) as save_hook,
+          mock.patch.object(bootstrap._Registration, "start_web_worker", autospec=True) as start_worker):
+        owner.before_library_nodes_loaded(schema, library)
+        partial = next(iter(owner._registrations))
+        assert partial.connection_handlers is None
+        assert partial.shot_basket_handlers is not None, "Connection API failure skipped independent shot basket registration"
+        save_hook.assert_called_once_with(partial)
+        start_worker.assert_called_once_with(partial)
+        assert guard.protection_readiness(engine) == (True, "")
+    partial.web_worker_module = mock.Mock()
+    partial.web_worker_module.stop_engine_worker.side_effect = RuntimeError("simulated worker stop failure")
+    with mock.patch.object(bootstrap, "_release_windows_transport_close_guard", side_effect=RuntimeError("simulated close API change")):
+        owner.before_library_unregistered(schema, library)
+    partial.web_worker_module.stop_engine_worker.assert_called_once_with(engine)
+    assert not partial.active and manager not in bootstrap._REGISTRATIONS and not owner._registrations
+    harness.record("isolated_optional_api_failures_preserve_shot_basket_save_web_worker_deletion_and_unload")
     with mock.patch.object(bootstrap._Registration, "start_web_worker", lambda *a: None):
         owner.before_library_nodes_loaded(schema, library)
     assert len(owner._registrations) == 1, "Real library-load hook did not register guard"

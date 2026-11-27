@@ -141,12 +141,12 @@ class FiveShotNode(target.HMBSeedanceGeneration):
 async def run_five_shots() -> list[FiveShotNode]:
     # Keep the regression fast while proving that the production cadence is
     # shared by five node instances. Production uses 1.20 seconds.
-    target.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.08
-    target._BROKER_SUBMISSION_LAST_STARTED = 0.0
+    target._broker_transport.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.08
+    target._broker_transport._BROKER_SUBMISSION_LAST_STARTED = 0.0
     coordinator = FiveSubmissionBarrier()
     nodes: list[FiveShotNode] = []
     for shot_number in range(1, SHOT_COUNT + 1):
-        node = object.__new__(FiveShotNode)
+        node = FiveShotNode(name=f"Seedance Barrier {shot_number}")
         node.configure(shot_number, coordinator)
         nodes.append(node)
 
@@ -181,7 +181,7 @@ asyncio.run(run_five_shots())
 
 async def cancel_before_submission_slot() -> None:
     coordinator = FiveSubmissionBarrier()
-    node = object.__new__(FiveShotNode)
+    node = FiveShotNode(name="Seedance Cancel Before Submit")
     node.configure(1, coordinator)
     called = threading.Event()
 
@@ -190,8 +190,8 @@ async def cancel_before_submission_slot() -> None:
         called.set()
         return {"job_id": "must-not-exist", "status": "running"}
 
-    target.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.08
-    target._BROKER_SUBMISSION_LAST_STARTED = time.monotonic()
+    target._broker_transport.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.08
+    target._broker_transport._BROKER_SUBMISSION_LAST_STARTED = time.monotonic()
     operation = asyncio.create_task(
         node._await_submission_result(forbidden_submit, timeout=30.0)
     )

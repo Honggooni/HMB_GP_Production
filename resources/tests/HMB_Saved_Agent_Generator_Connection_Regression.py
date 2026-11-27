@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT), str(ROOT / "resources/tests")]
 sys.dont_write_bytecode = True
 import HMB_Common_Connection_Management_Host_Regression as common
+from hmb_host_workflow import scoped_fixture_workflow
 
 base = common.base
 CASES = []
@@ -124,6 +125,8 @@ async def construct(engine, modules, folder, schema):
     assert common.authoring(nodes) == expected
     artifacts["detached"] = await save(engine, folder / "detached-agent.py", "Private detached Agent")
     record("detach_preserves_five_Shot_inputs_outputs_and_original_TaskIDs_before_save")
+    for artifact in artifacts.values():
+        artifact["picker_publisher_uuid"] = nodes[base.KINDS[1]]._hmb_picker_publisher_uuid
     return artifacts, expected, before_edges
 
 
@@ -230,21 +233,24 @@ async def replay(engine, modules, folder, artifact, expected, original_edges, sc
                     original = getattr(cls, method)
                     def capture(self, *args, _read=original, _kind=kind, **kwargs):
                         result = _read(self, *args, **kwargs)
-                        publications[_kind].append((self, deepcopy(result)))
+                        # Prompt can request the image snapshot and its separate
+                        # disconnected-file notices in one read.
+                        snapshot = result[0] if kwargs.get("include_link_notices") else result
+                        publications[_kind].append((self, deepcopy(snapshot)))
                         return result
                     observed.enter_context(mock.patch.object(cls, method, capture))
-        await replay_observed(engine, modules, folder, artifact, expected, original_edges, scenario, publications)
+        await replay_observed(engine, modules, folder, artifact, expected, original_edges, scenario, publications, observed)
 
 
-async def replay_observed(engine, modules, folder, artifact, expected, original_edges, scenario, publications):
+async def replay_observed(engine, modules, folder, artifact, expected, original_edges, scenario, publications, contexts):
     import _hmb_connection_management as api
     from griptape_nodes.retained_mode.events.node_events import SetLockNodeStateRequest
     from griptape_nodes.retained_mode.events.workflow_events import RunWorkflowFromScratchRequest
     from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
     native_request = GriptapeNodes.ahandle_request
     failures = []
-    async def inspect_request(request):
-        result = await native_request(request)
+    async def inspect_request(request, **kwargs):
+        result = await native_request(request, **kwargs)
         if not result.succeeded():
             failures.append(dict(request=type(request).__name__,
                 node=getattr(request, "node_name", None),
@@ -253,6 +259,8 @@ async def replay_observed(engine, modules, folder, artifact, expected, original_
         return result
     with mock.patch.object(GriptapeNodes, "ahandle_request", side_effect=inspect_request):
         loaded = await base.asend(engine, RunWorkflowFromScratchRequest(file_path=str(artifact["path"])))
+    if hasattr(engine, "bind_workflow"):
+        contexts.enter_context(engine.bind_workflow(engine.open_workflows.get(loaded.workflow_id)))
     (Path(os.environ.get("HMB_LIFECYCLE_REPORT_DIR", str(folder))) / f"{scenario}-load-requests.json").write_text(
         json.dumps(dict(status=str(getattr(loaded, "status", "")), failures=failures), indent=2), encoding="utf-8")
     assert not failures, failures[:5]
@@ -260,11 +268,16 @@ async def replay_observed(engine, modules, folder, artifact, expected, original_
     nodes = retained_nodes(engine)
     view = capabilities(engine, nodes)
     actual = common.authoring(nodes)
-    if actual != expected:
+    try:
+        # The first native publication may arrive before or after this read.
+        # Recompute its receipt against the current nodes and verify every
+        # artist-authored field and every Generator task ID in both cases.
+        common.assert_reopened_authoring(expected, actual, nodes, artifact["picker_publisher_uuid"])
+    except AssertionError:
         (Path(os.environ.get("HMB_LIFECYCLE_REPORT_DIR", str(folder))) / f"{scenario}-authoring-mismatch.json").write_text(
             json.dumps({"expected": expected, "actual": actual}, ensure_ascii=False,
                        indent=2, default=str), encoding="utf-8")
-    assert actual == expected, scenario
+        raise
     agent = nodes[base.KINDS[3]]
     assert not agent._hmb_shot_workers
     assert not any(lock.locked() for lock in agent._hmb_shot_execution_locks.values())
@@ -313,6 +326,7 @@ async def replay_observed(engine, modules, folder, artifact, expected, original_
 async def registered_stage(engine, modules, callback):
     # Match native registration under the engine's active asyncio context.
     with ExitStack() as patches:
+        patches.enter_context(scoped_fixture_workflow(engine, "OfflineCommonConnections"))
         library, schema, owner = common.hooks(engine, modules, patches)
         try:
             return await callback(schema)

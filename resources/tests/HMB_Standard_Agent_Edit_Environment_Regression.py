@@ -13,7 +13,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-import _hmb_common as common
+import hmb_standard_agent_reference as common
 
 prefixes = ("griptape_nodes", "griptape_nodes_library", "hmb_native_provider_fixture")
 saved_modules = {name: value for name, value in sys.modules.items() if any(name == p or name.startswith(p + ".") for p in prefixes)}

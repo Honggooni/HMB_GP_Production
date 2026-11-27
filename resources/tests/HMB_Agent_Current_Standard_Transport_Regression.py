@@ -221,7 +221,7 @@ class NativeTransport(unittest.TestCase):
             "source_kind": "video", "source_reference": "@video2", "analysis_status": "completed",
             "items": [{"category": "effect_timing", "observation": observation, "start": 0, "end": 1.5}]}
         self.final_text = 'Keep the original character design. Exact dialogue: "괜찮아, 함께 가자!" On-screen text: “출입 금지”.'
-        with mock.patch("HMBAnalysisAgent.get_analysis_context", return_value=raw):
+        with mock.patch("_hmb_analysis_delivery.get_analysis_context", return_value=raw):
             result = self.run_native()
         self.assertEqual(len(self.captured), 1)
         user = [item for item in self.captured[0]["messages"] if item["role"] == "user"][-1]["content"]
@@ -296,6 +296,24 @@ class NativeTransport(unittest.TestCase):
         self.assert_bound(pixels=0)
         self.assertEqual(self.node._hmb_reference_observation["status"], "no_vision_driver")
 
+    def test_verified_shot_missing_image_stops_before_native_request(self):
+        machine = self.node._hmb_runtime_prompt
+        missing = str(Path(self.temporary.name) / "unavailable.png")
+        self.snapshot["images"][0]["token"] = "@image1"
+        self.snapshot["images"].append({"token": "@image2", "source": missing, "role": "character"})
+        self.snapshot["registered_project_images"] = {"@image2": missing}
+        subscription = {"channel_uuid": "fixture-channel", "shot_uuid": "fixture-shot"}
+        document = {"schema": "hmb-prompt-shot-document", "version": 1, "subscription": subscription,
+                    "visible_prompt": "human view", "machine_prompt": machine, "paired_snapshot": {"machine_prompt": machine},
+                    "reference_media": self.snapshot}
+        source = hmb._HMBAgentShotSource(self.source, document, subscription)
+        setattr(self.node, hmb._VERIFIED_PROMPT_SOURCE_ATTRIBUTE, source)
+        with self.assertRaisesRegex(RuntimeError, "Protected native Agent scheduler step failed"):
+            self.run_native()
+        self.assertEqual(self.node._hmb_native_failure_code, "SHOT_IMAGE_UNAVAILABLE")
+        self.assertEqual(self.captured, [])
+        self.assertIn("@image2", self.node._hmb_reference_observation["unobserved_media_tokens"])
+
     def test_untrusted_state_shape_cannot_activate_binary_transport(self):
         state = SimpleNamespace(model=ModelConfig(provider=ModelProvider.GRIPTAPE_CLOUD, model=VISION_MODEL_CHOICES[0]))
         self.assertFalse(media.driver_accepts_images(state))
@@ -326,7 +344,7 @@ class NativeTransport(unittest.TestCase):
                 {"category": "not-selected-or-supported", "observation": "REJECT-ME"},
             ],
         }
-        with mock.patch("HMBAnalysisAgent.get_analysis_context", return_value=raw) as getter:
+        with mock.patch("_hmb_analysis_delivery.get_analysis_context", return_value=raw) as getter:
             self.assertEqual(self.run_native().output, FINAL)
         getter.assert_called_once_with(self.source, channel_uuid="fixture-channel",
                                        shot_uuid="fixture-shot", destination="agent")
@@ -343,14 +361,14 @@ class NativeTransport(unittest.TestCase):
         self.assertEqual(self.values["prompt"], "human view")
         raw.update(source_reference="@video2\nPRIVATE-LOCAL-PATH", source_id="C:/private/source.mov",
                    original_requested=False)
-        with mock.patch("HMBAnalysisAgent.get_analysis_context", return_value=raw):
+        with mock.patch("_hmb_analysis_delivery.get_analysis_context", return_value=raw):
             bounded = analysis_delivery_context(self.source, channel_uuid="fixture-channel",
                                                shot_uuid="fixture-shot", destination="agent")
         self.assertNotIn("source_reference", bounded)
         self.assertNotIn("source_id", bounded)
         self.assertFalse(bounded["original_requested"])
         raw["shot_uuid"] = "different-shot"
-        with mock.patch("HMBAnalysisAgent.get_analysis_context", return_value=raw):
+        with mock.patch("_hmb_analysis_delivery.get_analysis_context", return_value=raw):
             self.assertEqual(analysis_delivery_context(self.source, channel_uuid="fixture-channel",
                                                        shot_uuid="fixture-shot", destination="agent"), {})
 
@@ -369,7 +387,7 @@ class NativeTransport(unittest.TestCase):
     def test_opted_original_audio_reaches_native_agent_once(self):
         original = self.audio_original_fixture()
         self.values["model"] = "gemini-2.5-flash"
-        with mock.patch("HMBAnalysisAgent.get_analysis_originals", return_value=[original]) as getter:
+        with mock.patch("_hmb_analysis_delivery.get_analysis_originals", return_value=[original]) as getter:
             self.assertEqual(self.run_native().output, FINAL)
         getter.assert_called_once_with(self.source, channel_uuid="fixture-channel",
                                        shot_uuid="fixture-shot", preview=False)
@@ -381,7 +399,7 @@ class NativeTransport(unittest.TestCase):
     def test_unsupported_audio_model_stops_before_native_request(self):
         original = self.audio_original_fixture()
         self.values["model"] = "claude-sonnet-5"
-        with mock.patch("HMBAnalysisAgent.get_analysis_originals", return_value=[original]) as getter:
+        with mock.patch("_hmb_analysis_delivery.get_analysis_originals", return_value=[original]) as getter:
             with self.assertRaisesRegex(RuntimeError, "Protected native Agent scheduler step failed"):
                 self.run_native()
         getter.assert_called_once_with(self.source, channel_uuid="fixture-channel",

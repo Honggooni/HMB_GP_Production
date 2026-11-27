@@ -3147,6 +3147,7 @@ function hmbClearImmediateStateCommit(container) {
   const timer = container.__hmbPromptLibraryCommitTimer;
   try { if (timer) clearTimeout(timer); } catch (_e) {}
   try { container.__hmbPromptLibraryCommitTimer = null; } catch (_e) {}
+  delete container.__hmbPromptLibraryCommitDraft;
   try { delete container.__hmbPromptLibraryCommitIsReconciliation; } catch (_e) {}
   const pending = Boolean(container.__hmbPromptLibraryCommitPending);
   try { container.__hmbPromptLibraryCommitPending = false; } catch (_e) {}
@@ -3164,25 +3165,28 @@ export function hmbScheduleImmediateStateCommit(container, props, state, publica
   if (!publicationOptions?.reconcileOnly && active && container.contains?.(active)) {
     hmbRememberPromptDirtyTextControl(container, active, state);
   }
-  hmbClearImmediateStateCommit(container);
+  const reconciliation = publicationOptions?.reconcileOnly === true;
+  // A new keystroke replaces the pending payload, not its dispatch deadline.
+  // Backend-only reconciliation can yield to a newly authored draft.
+  if (!reconciliation && container.__hmbPromptLibraryCommitIsReconciliation) {
+    hmbClearImmediateStateCommit(container);
+  }
+  container.__hmbPromptLibraryCommitDraft = { props, state, publicationOptions };
   container.__hmbPromptLibraryCommitPending = true;
-  container.__hmbPromptLibraryCommitIsReconciliation = publicationOptions?.reconcileOnly === true;
+  container.__hmbPromptLibraryCommitIsReconciliation = reconciliation;
+  if (container.__hmbPromptLibraryCommitTimer != null || hmbShouldDeferPromptTextCommit(container)) return;
   const timer = setTimeout(() => {
     if (container.__hmbPromptLibraryCommitTimer !== timer) return;
     container.__hmbPromptLibraryCommitTimer = null;
-    if (hmbShouldDeferPromptTextCommit(container)) {
-      // A composing IME value is not final. Keep one trailing commit armed;
-      // ordinary focus is intentionally not a blocker because users can run a
-      // downstream node without blurring the current Prompt field first.
-      hmbScheduleImmediateStateCommit(container, props, state, publicationOptions);
-      return;
-    }
-    container.__hmbPromptLibraryCommitPending = false;
-    hmbCaptureUiBeforeStateEmit(container, state);
+    // compositionend schedules the completed text. Focus alone never blocks it.
+    if (hmbShouldDeferPromptTextCommit(container)) return;
+    const draft = container.__hmbPromptLibraryCommitDraft;
+    hmbClearImmediateStateCommit(container);
+    hmbCaptureUiBeforeStateEmit(container, draft.state);
     // Register the exact local value before calling the host. A synchronous
     // props echo can then be consumed without replacing the focused control.
-    hmbEmitLocalPromptState(container, props, state, null, publicationOptions);
-  }, 260);
+    hmbEmitLocalPromptState(container, draft.props, draft.state, null, draft.publicationOptions);
+  }, reconciliation ? 260 : 16);
   container.__hmbPromptLibraryCommitTimer = timer;
 }
 
@@ -4010,6 +4014,7 @@ function hmbRestorePromptControlFocus(container) {
 }
 
 const HMB_SOURCE_SCROLL_KEYS = ["imageSources", "videoSources", "soundSources", "managerBody"];
+const hmbInteractedScrollHosts = new WeakSet();
 
 function hmbScrollMemory(container) {
   if (!container) return {};
@@ -4038,6 +4043,7 @@ function hmbSourceScrollbox(container, key) {
 function hmbStoreSourceScroll(container, key, value) {
   if (!container || !key) return;
   const top = Math.max(0, Math.round(Number(value) || 0));
+  if (top) hmbInteractedScrollHosts.add(container);
   const memory = hmbScrollMemory(container);
   memory[key] = top;
   try { const name=hmbScrollDatasetKey(key),next=String(top);if(container.dataset[name]!==next)container.dataset[name]=next; } catch (_e) {}
@@ -4066,6 +4072,7 @@ function hmbRestoreSourceScrollNow(container) {
     const box = hmbSourceScrollbox(container, key);
     if (!box) return;
     const requested = hmbReadStoredSourceScroll(container, key);
+    if (requested) hmbInteractedScrollHosts.add(container);
     const current = box.scrollTop || 0;
     // Most page changes retain the existing scroll position. Avoid measuring
     // every hidden/prepared source group when no restoration is necessary.
@@ -4082,6 +4089,11 @@ function hmbRestoreSourceScroll(container, deferInitial = false) {
   if (!container || hmbIsGroupResizeDragging(container)) return;
   const restore = {};
   container.__hmbPromptScrollRestore = restore;
+  // An untouched shot editor opens at the top. During tab navigation, avoid
+  // forcing layout of its newly attached controls just to verify zero again.
+  // Once a viewport is touched, preserve every saved position, including zero.
+  if (deferInitial && !hmbInteractedScrollHosts.has(container)
+    && HMB_SOURCE_SCROLL_KEYS.every((key) => !hmbReadStoredSourceScroll(container, key))) return;
   const stillCurrent = () => (
     container.__hmbPromptScrollRestore === restore && !hmbIsGroupResizeDragging(container)
   );
@@ -4183,7 +4195,10 @@ function hmbInstallSourceScrollPositionLock(container, listeners) {
   HMB_SOURCE_SCROLL_KEYS.forEach((key) => {
     const box = hmbSourceScrollbox(container, key);
     if (!box) return;
-    const save = () => hmbStoreSourceScroll(container, key, box.scrollTop || 0);
+    const save = () => {
+      hmbInteractedScrollHosts.add(container);
+      hmbStoreSourceScroll(container, key, box.scrollTop || 0);
+    };
     box.addEventListener("scroll", save, { passive: true });
     box.addEventListener("wheel", save, { passive: true });
     box.addEventListener("pointerdown", save);
@@ -4797,8 +4812,11 @@ export function hmbMergePromptRevisionAxes(sourceState, uiState) {
   if (source.multi_shot_enabled && ui.multi_shot_enabled) {
     const documents = hmbMergePromptShotDocumentRevisions(source.shot_documents, ui.shot_documents);
     source.shot_documents = documents;
-    if(hmbPromptVerifiedShotCatalog(source).some(shot=>shot.shot_uuid===clean(ui.shot?.shot_uuid)
-      && shot.channel_uuid===clean(ui.shot?.channel_uuid)))hmbSwitchPromptShot(source, ui.shot?.shot_uuid);
+    if (hmbPromptDocumentKey(source.shot) !== hmbPromptDocumentKey(ui.shot)
+      && hmbPromptVerifiedShotCatalog(source).some(shot => shot.shot_uuid === ui.shot.shot_uuid
+        && shot.channel_uuid === ui.shot.channel_uuid)) {
+      hmbSwitchPromptShot(source, ui.shot.shot_uuid);
+    }
     source.shot_documents = documents;
   }
   // A source-only restore may choose an archived UUID while the previous UI
@@ -4860,7 +4878,15 @@ export function hmbMergePromptRevisionAxes(sourceState, uiState) {
     const selectedShot = hmbPromptVerifiedShotCatalog(source)
       .find((shot) => clean(shot.shot_uuid) === selectedShotUuid
         && clean(shot.channel_uuid) === clean(ui?.shot?.channel_uuid));
-    if (selectedShot) source.shot = normalizeShotSelection(selectedShot);
+    if (selectedShot) {
+      // A retained catalog may be ahead of or behind the verified media rows.
+      // Keep the source's selections when the authored edit stays on that Shot.
+      const sameShot = source.shot.shot_uuid === selectedShot.shot_uuid
+        && source.shot.channel_uuid === selectedShot.channel_uuid;
+      source.shot = normalizeShotSelection(sameShot
+        ? {...selectedShot, selected_source_uids:source.shot.selected_source_uids}
+        : selectedShot);
+    }
   }
   source.source_sync_revision = Math.max(
     normalizeSourceSyncRevision(source.source_sync_revision),
@@ -6679,6 +6705,61 @@ function renderPromptShotRows(state, editorMarkup = "") {
   }).join("")}${fallback}</div>`;
 }
 
+const shotStatusPrefix = '{"schema":"hmb-prompt-shot-status","status":';
+
+function readPromptShotStatus(value, includeDocument = false) {
+  if (typeof value !== "string" || !value.startsWith(shotStatusPrefix)) return null;
+  const delimiter = ',"document":';
+  const end = value.indexOf(delimiter, shotStatusPrefix.length);
+  if (end < 0) return null;
+  try {
+    const options = JSON.parse(value.slice(shotStatusPrefix.length, end));
+    if (!Number.isSafeInteger(options.shot_status_revision) ||
+        !Array.isArray(options.shot_edit_locks) || !Array.isArray(options.completed_prompt_shots)) return null;
+    return {options, document: includeDocument ? value.slice(end + delimiter.length, -1) : null};
+  } catch { return null; }
+}
+
+export function hmbApplyPromptShotRunState(container, channel, options = {}) {
+  const locks = new Set((options.shot_edit_locks || []).filter(item => item.channel_uuid === channel).map(item => item.shot_uuid));
+  const complete = new Set(options.completed_prompt_shots || []);
+  for (const tab of container.querySelectorAll("[data-prompt-shot]")) {
+    const shot = tab.getAttribute("data-prompt-shot");
+    const locked = locks.has(shot);
+    tab.toggleAttribute("data-render-locked", locked);
+    const checked = complete.has(channel + "/" + shot);
+    tab.toggleAttribute("data-stage-completed", checked);
+    const number = tab.querySelector(".prompt-shot-number");
+    if (number) {
+      number.dataset.hmbShotCheck = String(checked);
+      number.title = checked ? "완료" : "";
+    }
+    let label = tab.querySelector(".prompt-shot-lock");
+    if (locked) {
+      if (!label) {
+        label = tab.ownerDocument.createElement("span");
+        label.className = "prompt-shot-lock";
+        tab.appendChild(label);
+      }
+      const text = "로동중... 수정불가";
+      if (label.textContent !== text) label.textContent = text;
+    } else label?.remove();
+  }
+  for (const editor of container.querySelectorAll(".prompt-shot-content")) {
+    const locked = locks.has(editor.getAttribute("data-shot-editor"));
+    editor.toggleAttribute("data-render-locked", locked);
+    for (const el of editor.querySelectorAll(locked ? "input,select,textarea,button,[contenteditable=true]" : "[data-hmb-shot-inert]")) {
+      if (locked && !el.inert) {
+        el.setAttribute("data-hmb-shot-inert", "");
+        el.inert = true;
+      } else if (!locked) {
+        el.inert = false;
+        el.removeAttribute("data-hmb-shot-inert");
+      }
+    }
+  }
+}
+
 function hmbSoundTimeline(row, ko) {
   const enabled = hmbSoundRangeEnabled(row);
   const clips = hmbSoundClips(row);
@@ -6869,8 +6950,6 @@ function render(state, includeStyle = true) {
     .topbar-controls .language-button{min-width:58px;height:28px;padding:0 11px;border:1px solid rgba(148,163,184,.24);border-radius:8px;background:#090d16;color:#e2e8f0;font-size:11px;font-weight:800;cursor:pointer}.topbar-controls .language-button:hover,.topbar-controls .language-button:focus-visible{border-color:var(--hmb-shot-accent);color:var(--hmb-shot-soft);outline:none;box-shadow:0 0 0 1px var(--hmb-shot-accent),0 0 12px var(--hmb-shot-glow)}.shot-selector-shell{flex:0 1 290px;width:290px;max-width:290px;height:30px;display:flex;align-items:center;gap:6px;padding:3px 7px;border:1px solid var(--hmb-shot-line);border-radius:8px;background:linear-gradient(180deg,rgba(var(--hmb-shot-rgb),.24),rgba(15,23,42,.88));box-shadow:0 0 12px var(--hmb-shot-glow)}.shot-selector-shell>span,.shot-selector-shell>i{flex:0 0 auto;color:var(--hmb-shot-soft);font-size:8px;font-style:normal;font-weight:900;letter-spacing:.08em}.shot-selector-shell>i{color:var(--hmb-shot-accent)}.shot-selector{flex:1 1 auto;width:100%;height:22px;padding:0 7px;border:0;border-radius:5px;background:#07101f;color:#dbeafe;font-size:10px;font-weight:800;outline:none}.shot-selector:focus-visible{box-shadow:0 0 0 1px var(--hmb-shot-accent),0 0 10px var(--hmb-shot-glow)}.shot-selector:disabled{opacity:.72}
     .source-row{transition:none}
     .image-card [data-hmb-image-selection-hidden]{display:none}
-    .image-card .image-selection-pending{color:#a9b9ca}
-    .image-selection-pending span:last-child{grid-column:2 / -1}
     .frame-binding-row{grid-column:1/-1;display:grid;grid-template-columns:3.55rem minmax(0,.78fr) minmax(0,.95fr) minmax(0,.82fr) minmax(0,.82fr) minmax(0,.92fr) 3.6rem;gap:8px;align-items:center;min-height:36px;margin-top:-2px}.frame-range-toggle-wrap{grid-column:1;position:relative;display:flex;align-items:center;min-width:0;color:#cbd5e1;font-size:8px;font-weight:800;line-height:1;cursor:pointer}.frame-range-toggle{position:absolute;inset:0;inline-size:100%;block-size:100%;margin:0;opacity:0;pointer-events:auto;cursor:pointer;z-index:2}.frame-range-toggle-ui{width:100%;min-width:52px;height:24px;display:inline-flex;align-items:center;justify-content:space-between;gap:3px;padding:0 5px;border:1px solid rgba(148,163,184,.28);border-radius:7px;background:#090d16;color:#94a3b8;white-space:nowrap;overflow:hidden}.frame-range-toggle:hover+.frame-range-toggle-ui,.frame-range-toggle:focus-visible+.frame-range-toggle-ui{border-color:rgba(34,211,238,.62);color:#cbd5e1;box-shadow:0 0 0 1px rgba(34,211,238,.2)}.frame-range-toggle-ui b,.frame-range-toggle-ui em{font-size:7px;font-style:normal;font-weight:900;letter-spacing:.02em}.frame-range-toggle-ui em{min-width:17px;text-align:center;color:#64748b}.frame-range-toggle:checked+.frame-range-toggle-ui{border-color:rgba(34,211,238,.52);background:rgba(8,145,178,.18);color:#e0f2fe}.frame-range-toggle:checked+.frame-range-toggle-ui em{color:#67e8f9}.frame-range-toggle:disabled+.frame-range-toggle-ui{opacity:.42;cursor:not-allowed}.frame-track-shell{grid-column:2/5;display:grid;grid-template-columns:3.25rem minmax(0,1fr) 3.25rem;align-items:center;gap:5px;min-width:0}.frame-track-stage{position:relative;min-width:0}.frame-domain-number{width:100%;height:26px;border:1px solid rgba(148,163,184,.28);border-radius:7px;background:#090d16;color:#e2e8f0;padding:2px 4px;font-size:9px;font-weight:800;font-variant-numeric:tabular-nums;text-align:center;outline:none}.frame-domain-number:focus{border-color:#22d3ee;box-shadow:0 0 0 1px rgba(34,211,238,.3)}.frame-domain-number[readonly]{border-color:rgba(34,211,238,.25);background:rgba(8,47,73,.18);color:#bae6fd;cursor:default}.frame-domain-number.is-hidden{visibility:hidden;pointer-events:none}.frame-track{position:relative;height:26px;border:1px solid rgba(148,163,184,.26);border-radius:7px;background:#070d17;overflow:hidden;touch-action:none;user-select:none}.frame-track.editable{cursor:crosshair;border-color:rgba(34,211,238,.42)}.frame-track:focus{outline:1px solid #22d3ee;outline-offset:1px}.frame-track-grid{position:absolute;inset:0;background:repeating-linear-gradient(90deg,transparent 0,transparent calc(10% - 1px),rgba(148,163,184,.09) calc(10% - 1px),rgba(148,163,184,.09) 10%)}.frame-track>em{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#718096;font-size:8px;font-style:normal;font-weight:800;letter-spacing:.05em;pointer-events:none}.frame-binding-row.enabled .frame-track>em{justify-content:flex-end;padding-right:7px;color:#fbbf24}.frame-binding-row.invalid .frame-track{border-color:rgba(248,113,113,.65)}.frame-binding-row.invalid .frame-track>em{color:#fca5a5}.frame-range-bar{position:absolute;z-index:2;top:3px;height:18px;min-width:2px;border:1px solid #22d3ee;border-radius:5px;background:linear-gradient(180deg,rgba(34,211,238,.78),rgba(8,145,178,.72));cursor:grab;overflow:visible}.frame-range-bar.selected{border-color:#f8fafc;box-shadow:0 0 0 1px rgba(34,211,238,.85),0 0 8px rgba(34,211,238,.5)}.frame-range-bar>b{display:block;padding:1px 8px;color:#fff;font-size:8px;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}.frame-range-handle{position:absolute;z-index:3;top:-1px;bottom:-1px;width:7px;background:rgba(255,255,255,.45);cursor:ew-resize}.frame-range-handle.left{left:-1px;border-radius:5px 0 0 5px}.frame-range-handle.right{right:-1px;border-radius:0 5px 5px 0}.frame-binding-row.disabled .frame-track{opacity:.72}.frame-binding-row.disabled .frame-range-bar{filter:saturate(.35)}.frame-custom-scope{grid-column:5;display:flex;flex-direction:column;gap:4px;min-width:0}.frame-custom-scope:empty{min-height:1px}.frame-binding-context{grid-column:6;display:flex;align-items:center;gap:5px;min-width:0;color:#94a3b8;font-size:8px;white-space:nowrap;overflow:hidden}.frame-binding-context b,.frame-binding-context span{overflow:hidden;text-overflow:ellipsis}.frame-binding-context.error{color:#fca5a5}.frame-range-editor{position:absolute;z-index:30;left:50%;top:30px;transform:translateX(-50%);display:flex;align-items:center;gap:5px;padding:5px;border:1px solid rgba(34,211,238,.52);border-radius:7px;background:#07111b;box-shadow:0 8px 18px rgba(0,0,0,.55)}.frame-range-editor label{display:flex;align-items:center;gap:3px;color:#cbd5e1;font-size:8px;font-weight:800}.frame-range-number{width:58px;height:24px;border:1px solid rgba(148,163,184,.28);border-radius:5px;background:#090d16;color:#fff;padding:2px 4px;font-size:9px}.frame-range-delete{width:24px;height:24px;border:1px solid rgba(248,113,113,.45);border-radius:5px;background:#3f1720;color:#fecaca;cursor:pointer}
     .image-drag-handle{padding:5px 4px;border:1px solid transparent;border-radius:7px;cursor:grab;user-select:none;-webkit-user-select:none;touch-action:none}
     .image-drag-handle:hover{border-color:rgba(103,232,249,.5);background:rgba(34,211,238,.08)}
@@ -6984,6 +7063,13 @@ function render(state, includeStyle = true) {
     .hmb-dashboard[data-hmb-native-header="active"] .prompt-native-actions{display:flex;align-items:center;flex:0 0 auto}
     .hmb-dashboard .prompt-native-identity>div{min-width:0;max-width:100%}.hmb-dashboard .prompt-native-actions svg{flex-shrink:0}
     .hmb-dashboard[data-hmb-native-header="active"] .topbar{cursor:grab}.hmb-dashboard[data-hmb-native-header="active"] .topbar:active{cursor:grabbing}
+    .hmb-dashboard[data-prompt-manager=true] [data-hmb-native-actions] div:is(.bg-green-600,.bg-blue-600):has(>span.leading-none){display:none!important}
+    .prompt-shot-section>.prompt-shot-row:is([data-render-locked],[data-stage-completed]){grid-template-columns:auto minmax(0,1fr) auto}
+    .prompt-shot-lock{color:#f1eddc;font-weight:600;font-size:10px}
+    .prompt-shot-row[data-render-locked]{background:#232630;color:#c1c4cb;border-color:#555d68;box-shadow:none}
+    .prompt-shot-row[data-render-locked] .prompt-shot-number:not([data-hmb-shot-check=true]),.prompt-shot-content[data-render-locked]{filter:saturate(.2)}
+    [data-hmb-shot-check="true"]{display:inline-flex!important;align-items:center;justify-content:center;gap:2px!important;width:38px!important;min-width:38px!important;max-width:38px!important;height:30px!important;min-height:30px!important;max-height:30px!important;flex:none!important;padding:0!important;box-sizing:border-box!important;font:700 11px/1 system-ui!important;font-variant-numeric:tabular-nums;background:#12301d!important;color:#dcfce7!important;border:1px solid #4ade80!important;border-radius:5px!important;filter:none!important;opacity:1!important}
+    [data-hmb-shot-check="true"]::before{content:"✓";font:900 20px/1 system-ui;color:#4ade80;flex:none}
   </style>` : ""}<div class="hmb-dashboard-clip nodrag"><div class="hmb-dashboard ${state.disabled ? "disabled" : ""}" data-shot-number="${paletteShotNumber}" data-prompt-manager="${Boolean(state.multi_shot_enabled)}">
     <div class="topbar group"><div class="title"><span class="title-mark" aria-hidden="true">PL</span><span>HMBPrompt</span></div><div class="prompt-native-identity" data-hmb-native-identity></div><div class="prompt-native-actions nodrag" data-hmb-native-actions></div><div class="prompt-publish-status" data-prompt-publication-status role="status" aria-live="polite" aria-atomic="true"></div><div class="topbar-controls nodrag">${renderShotSelector(state)}<button type="button" class="language-button" data-language-toggle aria-label="Language">${uiLanguage(state) === "ko" ? "한국어" : "EN"}</button></div></div>
     ${state.manual_rebind?.required ? `<div class="warning nodrag" data-manual-rebind-notice role="status" style="flex:0 0 auto;margin:6px 8px 0">${escapeHtml(state.manual_rebind.message || "기존 입력과 결과를 보존했습니다. 상단 샷 선택에서 연결할 샷을 직접 선택하세요.")}</div>` : ""}
@@ -8042,6 +8128,9 @@ function hmbInstallKeepOutResizers(container, state, props, listeners) {
 }
 
 function hmbCaptureUiBeforeStateEmit(container, state) {
+  // Navigation already saved the previous editor's scroll and resize state.
+  // A timer or external Run can flush before the next shot has been painted.
+  if (container?.__hmbPromptNavigationOnlyState === state) return;
   try { hmbCaptureSourceScroll(container); } catch (_e) {}
   try { hmbPreserveManualGroupHeights(container, state); } catch (_e) {}
   try { hmbCaptureCurrentTextareaHeights(container, state); } catch (_e) {}
@@ -8630,6 +8719,13 @@ function hmbNativeUiImplementation(container, props) {
   };
   container.addEventListener?.("hmb-color-lut-header-state", nativeHeaderState);
   let directSources = props.ui_options?.media_preview_sources;
+  const initialStatus = readPromptShotStatus(props.value, true);
+  if (initialStatus) props = {...props, value: initialStatus.document};
+  let shotRunOptions = props.ui_options || {};
+  if (initialStatus && initialStatus.options.shot_status_revision >= (shotRunOptions.shot_status_revision || 0)) {
+    shotRunOptions = initialStatus.options;
+  }
+  const applyShotRunState = () => hmbApplyPromptShotRunState(container, state.shot?.channel_uuid, shotRunOptions);
   let state = hmbMergeStoredGroupHeights(container, parseValue(props.value));
   state.disabled = Boolean(props.disabled);
   hmbRememberPromptRevisionState(container, state, state.disabled, false);
@@ -8675,23 +8771,104 @@ function hmbNativeUiImplementation(container, props) {
     return hasMediaEdge(detail.source, image ? "SHOT_ASSET_OUT" : "SHOT_PICKER_OUT", image ? "SHOT_ASSET_IN" : "SHOT_PICKER_IN")
       || (image && hasMediaEdge(detail.source, "IMAGE_ASSET_OUT", "IMAGE_ASSET_IN"));
   };
+  const projectionEdits = new Map();
+  const captureProjection = (row, uid) => {
+    const remember = event => {
+      const preview = pendingMedia.get("image_asset");
+      if (!preview || preview.cancelled || !sameShot(preview) || state.disabled
+        || !container.contains(row) || !preview.rows.some(item => item.source_uid === uid)) return;
+      const field = event.target.closest("input,select,textarea,button");
+      if (!field || field.disabled || field.readOnly) return;
+      let selector, type = event.type;
+      if (type === "click") {
+        const action = ["add-color-pick", "remove-color-pick"].find(name => field.classList.contains(name));
+        if (!action) return;
+        selector = "." + action;
+      } else if (field.dataset.field || field.hasAttribute("data-frame-range-toggle")) {
+        selector = field.dataset.field ? '[data-field="' + CSS.escape(field.dataset.field) + '"]' : "[data-frame-range-toggle]";
+        for (const name of ["data-binding-index", "data-color-index"]) {
+          if (field.hasAttribute(name)) selector += '[' + name + '="' + CSS.escape(field.getAttribute(name)) + '"]';
+        }
+        type = field.matches("select,[type=checkbox]") ? "change" : "input";
+      } else return;
+      event.stopImmediatePropagation();
+      const edits = projectionEdits.get(uid) || [];
+      const edit = {selector, type, value:field.value, checked:field.checked};
+      if (type !== "click" && edits.at(-1)?.selector === selector) edits[edits.length - 1] = edit;
+      else edits.push(edit);
+      projectionEdits.set(uid, edits);
+    };
+    for (const event of ["click", "input", "change"]) row.addEventListener(event, remember, true);
+  };
+  const deliverProjectionEdits = preview => {
+    if (!projectionEdits.size) return;
+    // The normal handlers have been rebound when this paint completes.
+    // Re-resolve the UID and permissions for every edit: a preceding control
+    // can rebuild the row, and a later picker selection can supersede this one.
+    queueMicrotask(() => {
+      if (pendingMedia.get("image_asset") !== preview || !preview.source.isConnected || !sameShot(preview)) return;
+      for (const [uid, edits] of projectionEdits) {
+        projectionEdits.delete(uid);
+        const descriptor = preview.rows.find(entry => entry.source_uid === uid);
+        if (!descriptor) continue;
+        for (const edit of edits) {
+          const row = container.querySelector('.image-card [data-hmb-image-selection-uid="' + CSS.escape(uid) + '"]:not([data-hmb-image-selection-pending])');
+          const item = state.images[Number(row?.dataset.index)];
+          const field = row?.querySelector(edit.selector);
+          if (!item?.present || !item.asset_managed || item.asset_source_uid !== uid
+            || (descriptor.source_kind && descriptor.source_kind !== item.asset_source_kind)
+            || (descriptor.registered && !item.asset_verified)
+            || item.asset_source_unavailable || state.disabled || !field || field.disabled || field.readOnly) continue;
+          if (edit.type === "click") { field.click(); continue; }
+          if (field.matches("select")) {
+            hmbFillPromptTargetOptions(field, state);
+            if (![...field.options].some(option => option.value === edit.value && !option.disabled)) continue;
+          }
+          if (field.type === "checkbox") field.checked = edit.checked;
+          else field.value = edit.value;
+          field.dispatchEvent(new Event(edit.type, {bubbles:true}));
+        }
+      }
+    });
+  };
   const syncMediaPreview = () => {
     let imagePreview = null;
     let videoPreview = null;
     for (const [kind, preview] of pendingMedia) {
       if (preview.cancelled) continue;
       const image = kind === "image_asset";
-      if (!sameShot(preview)) { clearTimeout(preview.timer); pendingMedia.delete(kind); continue; }
+      if (!sameShot(preview)) {
+        clearTimeout(preview.timer);
+        pendingMedia.delete(kind);
+        if (image) projectionEdits.clear();
+        continue;
+      }
       const ready = image ? state.image_asset.ordered_source_uids : state.picker.ordered_video_uids;
       const confirmedImages = image ? state.images
         .filter(row => row.asset_managed && row.present && !row.asset_source_unavailable)
         .map(row => row.asset_source_uid) : null;
+      const complete = !image || (confirmedImages.length === ready.length
+        && confirmedImages.every((uid, index) => uid === ready[index]));
       if (ready.length === preview.rows.length &&
         ready.every((uid, index) => uid === preview.rows[index].source_uid)
-        && (!image || (confirmedImages.length === ready.length
-          && confirmedImages.every((uid, index) => uid === ready[index])))) {
+        && complete) {
         clearTimeout(preview.timer);
         preview.cancelled = true;
+        if (image) deliverProjectionEdits(preview);
+        continue;
+      }
+      // An acknowledgement for a later selection can supersede a still-mounted
+      // publisher's preview. A pending or older route must keep the current edit.
+      const catalog = image && state.image_asset.shot_catalog_routing;
+      const catalogShot = catalog?.generation > preview.sourceGeneration && preview.catalogOrder
+        && state.image_asset.shot_catalog.find(shot => shot.shot_uuid === preview.shot_uuid && shot.channel_uuid === preview.channel_uuid);
+      if (complete && catalogShot && catalog.publisher_instance_uuid === preview.publisher_instance_uuid
+        && catalog.channel_uuid === preview.channel_uuid && catalogShot.selected_source_uids.length === ready.length
+        && catalogShot.selected_source_uids.every((uid, index) => uid === ready[index])
+        && (preview.catalogOrder.length !== ready.length || preview.catalogOrder.some((uid, index) => uid !== ready[index]))) {
+        clearTimeout(preview.timer);
+        preview.cancelled = true;
+        projectionEdits.clear();
         continue;
       }
       if (image) imagePreview = preview;
@@ -8715,7 +8892,7 @@ function hmbNativeUiImplementation(container, props) {
     const desired = imagePreview ? new Map(imagePreview.rows.map(row => [row.source_uid, row])) : null;
     const shown = new Set();
     let verifiedCount = 0;
-    for (const row of body.querySelectorAll(".source-row.image[data-index]")) {
+    for (const row of body.querySelectorAll(".source-row.image[data-index]:not([data-hmb-image-selection-pending])")) {
       const uid = row.dataset.hmbImageSelectionUid;
       if (!uid) {
         // Clearing the last disconnected source leaves an empty input. A new
@@ -8732,24 +8909,42 @@ function hmbNativeUiImplementation(container, props) {
     const displayedCount = desired ? Math.max(0, state.status.active_images - verifiedCount) + desired.size : state.status.active_images;
     const countText = `${displayedCount} / ${state.status.max_images}`;
     if (count && count.textContent !== countText) count.textContent = countText;
-    const drawn = [...body.querySelectorAll("[data-hmb-image-selection-pending]")];
-    const nextRows = imagePreview?.rows.filter(row => !shown.has(row.source_uid)) || [];
-    const pendingMatch = drawn.length === nextRows.length && drawn.every((row, index) =>
-      row.dataset.hmbImageSelectionPending === nextRows[index].source_uid
-      && row.lastElementChild?.textContent === nextRows[index].label);
-    if (!pendingMatch) {
-      drawn.forEach(row => row.remove());
-      const fragment = container.ownerDocument.createDocumentFragment();
-      for (const {source_uid: uid, label} of nextRows) {
-        const row = container.ownerDocument.createElement("div");
-        row.className = "source-row image image-selection-pending";
+    for (const row of body.querySelectorAll("[data-hmb-image-selection-pending]")) {
+      const uid = row.dataset.hmbImageSelectionPending;
+      if (!desired?.has(uid) || shown.has(uid)) row.remove();
+      else shown.add(uid);
+    }
+    if (imagePreview?.rows.some(entry => !shown.has(entry.source_uid))) {
+      const existingRows = new Map([...state.image_asset.dormant_asset_rows, ...state.images]
+        .filter(item => item.asset_source_uid && !item.asset_source_unavailable)
+        .map(item => [item.asset_source_uid, item]));
+      const images = imagePreview.rows.map((entry, index) => {
+        const existing = existingRows.get(entry.source_uid);
+        if (existing) return shown.has(entry.source_uid) ? existing : normalizeImage(existing, index + 1);
+        const registered = entry.source_kind === "project" && entry.registered;
+        return normalizeImage({present:true, label:entry.label, asset_managed:true,
+          asset_source_uid:entry.source_uid, asset_source_kind:entry.source_kind, asset_verified:registered,
+          image_main_type:registered ? entry.image_main_type : "", image_sub_type:registered ? entry.image_sub_type : "",
+          source_type:registered ? entry.source_type : ""}, index + 1);
+      });
+      const displayState = {...state, images, image_asset:{...state.image_asset, enabled:true, order_managed:true}};
+      const targetOptions = hmbRenderImageTargetOptions(images, displayState, false);
+      const colorOptions = hmbRenderColorPickOptions(displayState);
+      for (const [index, item] of images.entries()) {
+        const uid = item.asset_source_uid;
+        if (shown.has(uid)) continue;
+        const template = container.ownerDocument.createElement("template");
+        template.innerHTML = renderImageRow(item, index, images, displayState, targetOptions, false, colorOptions);
+        const row = template.content.firstElementChild;
+        // No index in the authoritative document exists yet. In particular a
+        // shared frame-range/blur handler must not bind to the previous occupant.
+        row.dataset.index = "-1";
+        row.querySelectorAll("[data-index]").forEach(child => { child.dataset.index = "-1"; });
+        row.dataset.sourceKey = "projected:" + uid;
         row.dataset.hmbImageSelectionPending = uid;
-        const name = container.ownerDocument.createElement("span");
-        name.textContent = label;
-        row.append(container.ownerDocument.createElement("span"), name);
-        fragment.append(row);
+        captureProjection(row, uid);
+        body.insertBefore(row, body.querySelector(".image-add-row"));
       }
-      body.insertBefore(fragment, body.querySelector(".image-add-row"));
     }
     body.toggleAttribute("data-hmb-preview-order", Boolean(desired));
     const uids = desired ? [...desired.keys()] : state.images.map(item => item.asset_source_uid).filter(Boolean);
@@ -8785,18 +8980,39 @@ function hmbNativeUiImplementation(container, props) {
         || detail.rows.length > (detail.kind === "image_asset" ? MAX_IMAGES : MAX_VIDEOS)) return;
     const previous = pendingMedia.get(detail.kind);
     if (previous?.source === event.target && sameShot(previous) && previous.revision >= detail.revision) return;
-    const rows = detail.rows.map(row => ({source_uid:clean(row?.source_uid), label:clean(row?.label).slice(0,256)}));
+    const rows = detail.rows.map(row => ({source_uid:clean(row?.source_uid), label:clean(row?.label).slice(0,256),
+      source_kind:["project", "user"].includes(row?.source_kind) ? row.source_kind : "", registered:row?.registered === true,
+      image_main_type:clean(row?.image_main_type).slice(0,256), image_sub_type:clean(row?.image_sub_type).slice(0,256),
+      source_type:clean(row?.source_type).slice(0,256)}));
     if (rows.some(row => !row.source_uid || !row.label) || new Set(rows.map(row => row.source_uid)).size !== rows.length) return;
     clearTimeout(previous?.timer);
+    if (detail.kind === "image_asset") {
+      const surviving = new Set(rows.map(row => row.source_uid));
+      if (detail.cancelled || previous?.source !== event.target || !sameShot(previous)
+        || previous.publisher_instance_uuid !== detail.publisher_instance_uuid || previous.scope !== detail.scope
+        || previous.channel_uuid !== detail.channel_uuid || previous.shot_uuid !== detail.shot_uuid) projectionEdits.clear();
+      else for (const uid of projectionEdits.keys()) if (!surviving.has(uid)) projectionEdits.delete(uid);
+    }
     const preview = {kind:detail.kind, scope:detail.scope, publisher_instance_uuid:detail.publisher_instance_uuid,
       channel_uuid:detail.channel_uuid, shot_uuid:detail.shot_uuid, revision:detail.revision,
+      sourceGeneration:Number.isSafeInteger(detail.source_generation) ? detail.source_generation : 0,
       rows, source:event.target, cancelled:detail.cancelled === true};
+    if (detail.kind === "image_asset" && detail.scope === "shot" && preview.sourceGeneration > 0) {
+      // Only the compact catalog shares the ImageAsset editor's clock. A
+      // verified media read for another Shot can independently advance its own.
+      preview.catalogOrder = state.image_asset.shot_catalog.find(shot =>
+        shot.shot_uuid === detail.shot_uuid && shot.channel_uuid === detail.channel_uuid)?.selected_source_uids.slice();
+    }
     pendingMedia.set(detail.kind, preview);
     // Unmounts normally send a cancellation. A lost renderer may not, while
     // a healthy renderer reading a slow share can legitimately take minutes.
     const checkOwner = () => {
       if (pendingMedia.get(detail.kind) !== preview || preview.cancelled) return;
-      if (!preview.source.isConnected || !sameShot(preview)) { preview.cancelled = true; syncMediaPreview(); }
+      if (!preview.source.isConnected || !sameShot(preview)) {
+        preview.cancelled = true;
+        if (detail.kind === "image_asset") projectionEdits.clear();
+        syncMediaPreview();
+      }
       else preview.timer = setTimeout(checkOwner, 30000);
     };
     if (!preview.cancelled) preview.timer = setTimeout(checkOwner, 30000);
@@ -8889,6 +9105,7 @@ function hmbNativeUiImplementation(container, props) {
       tab.setAttribute('aria-selected', String(active));
     }
     container.querySelector('.hmb-dashboard')?.setAttribute('data-shot-number', String(hmbPromptPaletteShotNumber(state)));
+    applyShotRunState();
     const languageButton = container.querySelector('[data-language-toggle]');
     if (languageButton) languageButton.textContent = uiLanguage(state) === 'ko' ? '한국어' : 'EN';
     // The current page's scroll events already retain its position. Restore
@@ -8896,7 +9113,6 @@ function hmbNativeUiImplementation(container, props) {
     hmbRestoreSourceScroll(container, true);
     hmbRestoreTextEditingStateDeferred(container);
     warmCurrentTargetOptions();
-    try { container.__hmbPromptLastPaintedValue = JSON.stringify(state); } catch (_e) {}
     return true;
   };
   hmbApplyInitialNodeSizeOnce(container, state);
@@ -8965,6 +9181,7 @@ function hmbNativeUiImplementation(container, props) {
     ) hmbReleasePromptCompositionLatch(container);
     hmbSyncAllSourceRowActivation(container);
     syncMediaPreview();
+    applyShotRunState();
     hmbFitGroupHeightsToCenter(container, state, measuredHosts);
     hmbInstallPromptInteractionIsolation(container, listeners, !sharedListenersInstalled);
     hmbInstallSourceScrollPositionLock(container, listeners);
@@ -9251,8 +9468,8 @@ function hmbNativeUiImplementation(container, props) {
 
     const managedImageOrder = () => Boolean(state.image_asset?.enabled && state.image_asset.order_managed);
     const displayedImageOrder = () => [...container.querySelectorAll(
-      ".image-card [data-hmb-image-selection-uid]:not([data-hmb-image-selection-hidden]),.image-card [data-hmb-image-selection-pending]",
-    )].map(row => row.dataset.hmbImageSelectionUid || row.dataset.hmbImageSelectionPending);
+      ".image-card [data-hmb-image-selection-uid]:not([data-hmb-image-selection-hidden])",
+    )].map(row => row.dataset.hmbImageSelectionUid);
     const requestManagedMove = (order, from, to) => {
       const owner = promptImageOrderOwner(state);
       if (state.disabled || !owner || from === to || !order[from] || !order[to]) return false;
@@ -9274,129 +9491,83 @@ function hmbNativeUiImplementation(container, props) {
       }
       return true;
     };
-    const stepImage = (row, index, direction) => {
-      if (state.disabled) return;
-      if (managedImageOrder()) {
-        const order = displayedImageOrder(), from = order.indexOf(row?.dataset.hmbImageSelectionUid);
-        requestManagedMove(order, from, from + direction);
-      } else if (swapImageRowsWithoutReset(state, index, index + direction)) {
-        hmbCommitLocalPromptStructure(container, props, state, remount);
-      }
-    };
-    container.querySelectorAll(".move-image-up, .move-image-down").forEach((button) => {
-      const row = button.closest(".source-row");
-      const index = row ? Number(row.getAttribute("data-index")) : -1;
-      const direction = button.classList.contains("move-image-up") ? -1 : 1;
-      const handler = () => {
-        stepImage(row, index, direction);
-      };
-      button.addEventListener("click", handler);
-      listeners.push([button, "click", handler]);
-    });
-
-    container.querySelectorAll("[data-image-drag-handle]").forEach((handle) => {
-      const row = handle.closest(".source-row.image");
-      const sourceIndex = row ? Number(row.getAttribute("data-index")) : -1;
-      const pointerDown = (event) => {
-        event.stopPropagation();
-      };
-      const dragStart = (event) => {
-        event.stopPropagation();
-        if (
-          state.disabled
-          || handle.getAttribute("draggable") !== "true"
-          || state.images.length < 2
-          || sourceIndex < 0
-        ) {
-          event.preventDefault();
+    if (!sharedListenersInstalled) {
+      // Delegation gives a newly selected row the very same ordering controls
+      // before and after the verified Shot envelope arrives.
+      const orderInteraction = event => {
+        const row = event.target.closest?.(".source-row.image:not(.image-add-row)");
+        const ownerShot = row?.closest(".prompt-shot-content")?.getAttribute("data-shot-editor");
+        if (!row || state.disabled || (ownerShot && ownerShot !== state.shot?.shot_uuid)) return;
+        const projected = row.hasAttribute("data-hmb-image-selection-pending");
+        const managed = managedImageOrder() || projected;
+        if (managed && (!promptImageOrderOwner(state) || !row.dataset.hmbImageSelectionUid)) return;
+        const handle = event.target.closest("[data-image-drag-handle]");
+        const hoverIndex = Number(row.dataset.index);
+        const move = direction => {
+          if (managed) {
+            const order = displayedImageOrder(), from = order.indexOf(row.dataset.hmbImageSelectionUid);
+            requestManagedMove(order, from, from + direction);
+          } else if (swapImageRowsWithoutReset(state, hoverIndex, hoverIndex + direction)) {
+            hmbCommitLocalPromptStructure(container, props, state, remount);
+          }
+        };
+        if (event.type === "click") {
+          const button = event.target.closest(".move-image-up,.move-image-down");
+          if (button && !button.disabled) move(button.classList.contains("move-image-up") ? -1 : 1);
           return;
         }
-        hmbCaptureSourceScroll(container);
-        hmbClearImageDragIndicators(container);
-        container.__hmbPromptImageDragIndex = sourceIndex;
-        container.__hmbPromptImageDragUid = row.dataset.hmbImageSelectionUid;
-        row?.classList?.add("image-row-dragging");
-        container.__hmbPromptImageDragIndicators = { source: row, hover: null, after: false, sourceIndex };
-        try {
-          event.dataTransfer.effectAllowed = "move";
-          event.dataTransfer.setData("text/plain", String(sourceIndex));
-        } catch (_error) {}
-      };
-      const dragEnd = (event) => {
-        event.stopPropagation();
-        hmbClearImageDragIndicators(container);
-        delete container.__hmbPromptImageDragIndex;
-        delete container.__hmbPromptImageDragUid;
-      };
-      const keyDown = (event) => {
-        if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
-        if (state.disabled || handle.getAttribute("draggable") !== "true") return;
-        event.preventDefault();
-        event.stopPropagation();
-        stepImage(row, sourceIndex, event.key === "ArrowUp" ? -1 : 1);
-      };
-      handle.addEventListener("pointerdown", pointerDown);
-      handle.addEventListener("dragstart", dragStart);
-      handle.addEventListener("dragend", dragEnd);
-      handle.addEventListener("keydown", keyDown);
-      listeners.push([handle, "pointerdown", pointerDown]);
-      listeners.push([handle, "dragstart", dragStart]);
-      listeners.push([handle, "dragend", dragEnd]);
-      listeners.push([handle, "keydown", keyDown]);
-    });
-
-    container.querySelectorAll(".source-row.image:not(.image-add-row)").forEach((row) => {
-      const hoverIndex = Number(row.getAttribute("data-index"));
-      const dropPosition = (event) => {
-        const rect = row.getBoundingClientRect?.();
-        if (!rect) return false;
-        return Number(event.clientY || 0) >= Number(rect.top || 0) + Number(rect.height || 0) / 2;
-      };
-      const dragOver = (event) => {
-        if (managedImageOrder() && (!container.__hmbPromptImageDragUid || !row.dataset.hmbImageSelectionUid)) return;
-        const sourceIndex = Number(container.__hmbPromptImageDragIndex);
-        if (!Number.isInteger(sourceIndex) || sourceIndex < 0 || sourceIndex >= state.images.length) return;
-        event.preventDefault();
-        event.stopPropagation();
-        try { event.dataTransfer.dropEffect = "move"; } catch (_error) {}
-        hmbUpdateImageDragIndicators(container, row, sourceIndex, dropPosition(event));
-      };
-      const drop = (event) => {
-        if (managedImageOrder()) {
-          const fromUid = container.__hmbPromptImageDragUid;
-          if (!fromUid || !row.dataset.hmbImageSelectionUid) return;
-          event.preventDefault();
-          event.stopPropagation();
-          const order = displayedImageOrder(), from = order.indexOf(fromUid);
-          const to = hmbImageDropTargetIndex(from, order.indexOf(row.dataset.hmbImageSelectionUid), dropPosition(event), order.length);
+        if (event.type === "keydown") {
+          if (!handle || handle.draggable !== true || !["ArrowUp","ArrowDown"].includes(event.key)) return;
+          event.preventDefault(); event.stopPropagation(); move(event.key === "ArrowUp" ? -1 : 1);
+          return;
+        }
+        if (event.type === "pointerdown") { if (handle) event.stopPropagation(); return; }
+        const clearDrag = () => {
           hmbClearImageDragIndicators(container);
-          delete container.__hmbPromptImageDragUid;
           delete container.__hmbPromptImageDragIndex;
-          requestManagedMove(order, from, to);
+          delete container.__hmbPromptImageDragUid;
+        };
+        if (event.type === "dragend") { clearDrag(); return; }
+        if (event.type === "dragstart") {
+          if (!handle) return;
+          event.stopPropagation();
+          const index = managed ? displayedImageOrder().indexOf(row.dataset.hmbImageSelectionUid) : hoverIndex;
+          if (!handle.draggable || index < 0) { event.preventDefault(); return; }
+          hmbCaptureSourceScroll(container); clearDrag();
+          container.__hmbPromptImageDragIndex = index;
+          container.__hmbPromptImageDragUid = row.dataset.hmbImageSelectionUid;
+          row.classList.add("image-row-dragging");
+          container.__hmbPromptImageDragIndicators = {source:row, hover:null, after:false, sourceIndex:index};
+          if (event.dataTransfer) {
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/plain", String(index));
+          }
           return;
         }
-        event.preventDefault();
-        event.stopPropagation();
-        let sourceIndex = Number(container.__hmbPromptImageDragIndex);
-        if (!Number.isInteger(sourceIndex)) {
-          try { sourceIndex = Number(event.dataTransfer.getData("text/plain")); } catch (_error) {}
+        const from = container.__hmbPromptImageDragIndex;
+        if (!Number.isInteger(from) || (managed && !container.__hmbPromptImageDragUid)) return;
+        event.preventDefault(); event.stopPropagation();
+        const rect = row.getBoundingClientRect(), after = event.clientY >= rect.top + rect.height / 2;
+        if (event.type === "dragover") {
+          if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+          hmbUpdateImageDragIndicators(container, row, from, after);
+          return;
         }
-        const targetIndex = hmbImageDropTargetIndex(
-          sourceIndex,
-          hoverIndex,
-          dropPosition(event),
-          state.images.length,
-        );
-        hmbClearImageDragIndicators(container);
-        delete container.__hmbPromptImageDragIndex;
-        if (targetIndex < 0 || !moveImageRowWithoutReset(state, sourceIndex, targetIndex)) return;
-        hmbCommitLocalPromptStructure(container, props, state, remount);
+        if (managed) {
+          const order = displayedImageOrder(), source = order.indexOf(container.__hmbPromptImageDragUid);
+          const to = hmbImageDropTargetIndex(source, order.indexOf(row.dataset.hmbImageSelectionUid), after, order.length);
+          clearDrag(); requestManagedMove(order, source, to);
+        } else {
+          const to = hmbImageDropTargetIndex(from, hoverIndex, after, state.images.length);
+          clearDrag();
+          if (to >= 0 && moveImageRowWithoutReset(state, from, to)) hmbCommitLocalPromptStructure(container, props, state, remount);
+        }
       };
-      row.addEventListener("dragover", dragOver);
-      row.addEventListener("drop", drop);
-      listeners.push([row, "dragover", dragOver]);
-      listeners.push([row, "drop", drop]);
-    });
+      for (const type of ["click","keydown","pointerdown","dragstart","dragend","dragover","drop"]) {
+        container.addEventListener(type, orderInteraction, true);
+        listeners.push([container,type,orderInteraction,true]);
+      }
+    }
 
     container.querySelectorAll("[data-dismiss-image-link]").forEach(button => {
       const dismiss = () => {
@@ -9879,7 +10050,8 @@ function hmbNativeUiImplementation(container, props) {
           value: element.value, checked: element.checked,
         });
         const guarded = function (eventValue) {
-          if (!container.contains(element) || (owner && owner !== state.shot?.shot_uuid)) {
+          if (!container.contains(element) || (owner && owner !== state.shot?.shot_uuid)
+              || element.closest?.('.prompt-shot-content[data-render-locked]')) {
             const previous = controlValues.get(element);
             if (previous) {
               element.value = previous.value;
@@ -10075,6 +10247,7 @@ function hmbNativeUiImplementation(container, props) {
     hmbRememberPromptRevisionState(container, state, state.disabled, false);
     if (shotRegionOnly) {
       hmbApplyPromptShotFeedback(container, state);
+      applyShotRunState();
       hmbApplyPromptDisabledFeedback(container, state.disabled);
       try { container.__hmbPromptLastPaintedValue = JSON.stringify(state); } catch (_e) {}
     } else {
@@ -10087,6 +10260,15 @@ function hmbNativeUiImplementation(container, props) {
     }
   };
   const applyProps = (nextProps = {}) => {
+    const status = readPromptShotStatus(nextProps.value);
+    const nextOptions = status?.options || nextProps.ui_options || {};
+    if ((nextOptions.shot_status_revision || 0) >= (shotRunOptions.shot_status_revision || 0) &&
+        (shotRunOptions.shot_edit_locks !== nextOptions.shot_edit_locks ||
+         shotRunOptions.completed_prompt_shots !== nextOptions.completed_prompt_shots)) {
+      shotRunOptions = nextOptions;
+      applyShotRunState();
+    }
+    if (status) return;
     const value = nextProps.value;
     if (value?.schema === "hmb-prompt-image-order-v1"
       || (typeof value === "string" && value.startsWith('{"schema":"hmb-prompt-image-order-v1",'))) return;
@@ -10376,23 +10558,34 @@ function hmbAcquireNativeStockSafety(container) {
   const key = "__HMB_NATIVE_STOCK_SAFETY_V1__";
   let shared = doc[key];
   if (!shared) {
-    const owners = new Set(), identities = new Map();
+    const owners = new Set(), identities = new Set();
+    let parents = new WeakSet(), awaitingMount = false;
     let contextNode = null, notice = null, noticeTimer = null, disposed = false;
     const nativeReady = () => doc.documentElement.getAttribute("data-hmb-native-deletion-guard") === "engine-preflight"
       && doc.documentElement.getAttribute("data-hmb-native-deletion-protection-version") === "2";
     const rootOf = value => value?.closest?.(".react-flow__node[data-id]") || null;
+    const currentRoot = owner => owner.container?.isConnected ? rootOf(owner.container) : null;
+    const trackParents = element => {
+      for (let parent = element?.parentNode; parent && !parents.has(parent); parent = parent.parentNode) {
+        parents.add(parent);
+      }
+    };
     const roots = () => {
+      parents = new WeakSet();
+      awaitingMount = false;
       for (const owner of owners) {
-        const node = owner.active && owner.container?.isConnected ? rootOf(owner.container) : null;
-        if (node) identities.set(node, node.getAttribute("data-id"));
+        owner.node = currentRoot(owner);
+        if (owner.node) identities.add(owner.node);
+        if (owner.container.isConnected) trackParents(owner.container);
+        else awaitingMount = true;
       }
       // A stock fold/virtualized widget unmount is not a node deletion. Keep
       // its exact outer DOM identity until that node actually leaves the view.
-      for (const [node] of identities) {
+      for (const node of identities) {
         if (!node.isConnected) identities.delete(node);
-        else identities.set(node, node.getAttribute("data-id")); // Native rename keeps this exact retained outer node.
+        else trackParents(node);
       }
-      return new Set(identities.keys());
+      return identities;
     };
     const isEditing = target => Boolean(target?.closest?.("input,textarea,select,[contenteditable='true'],[contenteditable=''],[role='textbox'],.CodeMirror,.cm-editor"));
     const canvasOf = node => node?.closest?.(".react-flow");
@@ -10459,10 +10652,16 @@ function hmbAcquireNativeStockSafety(container) {
       if (!owners.size && !retained.size) { dispose(); return; }
       if (nativeReady() || !retained.size) dismiss();
     };
-    const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(sync) : null;
+    // Card and prompt edits occur below the widget host and cannot move its
+    // outer node. Still observe reparenting, folds, native markers and late mounts.
+    const observer = typeof win.MutationObserver === "function" ? new win.MutationObserver(records => {
+      if (awaitingMount || records.some(record => record.type === "attributes" || parents.has(record.target))) sync();
+    }) : null;
     observer?.observe(doc.documentElement, { attributes: true, attributeFilter: ["data-hmb-native-deletion-guard", "data-hmb-native-deletion-protection-version", "data-id"], childList: true, subtree: true });
     win.addEventListener("keydown", keydown, true); win.addEventListener("click", click, true); win.addEventListener("contextmenu", contextmenu, true);
-    shared = { owners, sync, release(owner) {
+    shared = { owners, sync, refresh(owner) {
+      if (currentRoot(owner) !== owner.node) sync();
+    }, release(owner) {
       owner.active = false; owners.delete(owner);
       sync();
     } };
@@ -10471,7 +10670,7 @@ function hmbAcquireNativeStockSafety(container) {
   const owner = { container, active: true };
   shared.owners.add(owner);
   shared.sync();
-  return { refresh() { if (owner.active) shared.sync(); }, cleanup() { if (owner.active) shared.release(owner); } };
+  return { refresh() { if (owner.active) (shared.refresh || shared.sync)(owner); }, cleanup() { if (owner.active) shared.release(owner); } };
 }
 
 // Griptape loads each widget as a separate module. One selection per editor

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from contextvars import copy_context
 import copy
 import importlib.metadata
 import inspect
@@ -14,6 +16,8 @@ import socket
 import sys
 import tempfile
 from unittest import mock
+
+from hmb_host_workflow import scoped_fixture_workflow
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -30,7 +34,6 @@ try:
     from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
     from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
     from griptape_nodes.retained_mode.engine import engine_scope
-    from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
     from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
     from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, CreateConnectionResultSuccess
     from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
@@ -65,6 +68,19 @@ def send(engine, request):
 def create(engine, name, **kwargs):
     return send(engine, CreateNodeRequest(node_type="HMBPromptLibrary", specific_library_name="HMB_GP_Production",
         node_name=name, create_error_proxy_on_failure=False, **kwargs))
+
+
+def activate_flow(engine, contexts, name):
+    result = send(engine, CreateFlowRequest(flow_name=name, parent_flow_name="PromptFlowA"))
+    assert isinstance(result, CreateFlowResultSuccess), str(result.result_details)
+    contexts.enter_context(engine.context_manager.flow(result.flow_name))
+    assert engine.context_manager.get_current_flow().name == name
+
+
+def simultaneous_requests(function):
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(copy_context().run, function, index) for index in range(12)]
+        return [future.result() for future in futures]
 
 
 def inventory(engine):
@@ -149,11 +165,10 @@ async def main():
          mock.patch.object(socket, "create_connection", side_effect=deny_network), \
          mock.patch.object(socket, "getaddrinfo", side_effect=deny_network):
         WorkflowRegistry.clear_user_workflows()
-        with engine_scope() as engine:
+        with engine_scope() as engine, scoped_fixture_workflow(engine, "PromptFlowA"), ExitStack() as flows:
             engine.event_manager.initialize_queue()
             library, advanced = fixture(engine)
             try:
-                send(engine, EnsureWorkflowAndFlowRequest(flow_name="PromptFlowA"))
                 first = create(engine, "PromptOne", metadata={"position": {"x": 41, "y": 73}, "size": {"width": 720, "height": 1400}})
                 assert isinstance(first, CreateNodeResultSuccess), str(first.result_details)
                 original = engine.node_manager.get_node_by_name(first.node_name)
@@ -193,8 +208,7 @@ async def main():
                 multi_serialized = send(engine, SerializeSelectedNodesToCommandsRequest(nodes_to_serialize=[
                     [first.node_name, "fixture"], ["LegacyPrompt2", "fixture"]]))
                 assert isinstance(multi_serialized, SerializeSelectedNodesToCommandsResultSuccess)
-                empty_batch_flow = send(engine, CreateFlowRequest(flow_name="EmptyBatchFlow", parent_flow_name=None, set_as_new_context=True))
-                assert isinstance(empty_batch_flow, CreateFlowResultSuccess)
+                activate_flow(engine, flows, "EmptyBatchFlow")
                 before = inventory(engine)
                 rejected_batch = send(engine, DeserializeSelectedNodesFromCommandsRequest(
                     deserialize_commands=multi_serialized.serialized_selected_node_commands,
@@ -203,8 +217,7 @@ async def main():
                 assert inventory(engine) == before
                 print("PASS a two-Prompt paste into an empty flow is refused atomically before either constructor")
 
-                new_flow = send(engine, CreateFlowRequest(flow_name="PromptFlowB", parent_flow_name=None, set_as_new_context=True))
-                assert isinstance(new_flow, CreateFlowResultSuccess), str(new_flow.result_details)
+                activate_flow(engine, flows, "PromptFlowB")
                 pasted = send(engine, copy.deepcopy(clipboard))
                 assert isinstance(pasted, DeserializeSelectedNodesFromCommandsResultSuccess), str(pasted.result_details)
                 assert len(engine.flow_manager.get_flow_by_name("PromptFlowB").nodes) == 1
@@ -298,8 +311,7 @@ async def main():
                 bash_batch = send(engine, SerializeSelectedNodesToCommandsRequest(nodes_to_serialize=[
                     [bash.name, "fixture"], [legacy_bash.name, "fixture"]]))
                 assert isinstance(bash_batch, SerializeSelectedNodesToCommandsResultSuccess)
-                bash_empty = send(engine, CreateFlowRequest(flow_name="BashEmptyBatchFlow", parent_flow_name=None, set_as_new_context=True))
-                assert isinstance(bash_empty, CreateFlowResultSuccess)
+                activate_flow(engine, flows, "BashEmptyBatchFlow")
                 before_bash_batch = inventory(engine)
                 quiet(send(engine, DeserializeSelectedNodesFromCommandsRequest(
                     deserialize_commands=bash_batch.serialized_selected_node_commands,
@@ -307,8 +319,7 @@ async def main():
                 assert inventory(engine) == before_bash_batch
                 print("PASS a two-Bash paste into an empty flow is refused atomically before either constructor")
 
-                bash_flow = send(engine, CreateFlowRequest(flow_name="BashOtherFlow", parent_flow_name=None, set_as_new_context=True))
-                assert isinstance(bash_flow, CreateFlowResultSuccess)
+                activate_flow(engine, flows, "BashOtherFlow")
                 bash_pasted = send(engine, copy.deepcopy(bash_clipboard))
                 assert isinstance(bash_pasted, DeserializeSelectedNodesFromCommandsResultSuccess), str(bash_pasted.result_details)
                 assert len(engine.flow_manager.get_flow_by_name("BashOtherFlow").nodes) == 1
@@ -316,15 +327,14 @@ async def main():
                 assert pasted_bash.get_parameter_value("authored") == bash.get_parameter_value("authored")
                 print("PASS cross-flow Bash paste creates exactly one editor with the authored scene")
 
-                bash_race_flow = send(engine, CreateFlowRequest(flow_name="ConcurrentBashFlow", parent_flow_name=None, set_as_new_context=True))
-                assert isinstance(bash_race_flow, CreateFlowResultSuccess)
+                activate_flow(engine, flows, "ConcurrentBashFlow")
                 def simultaneous_bash(number):
-                    with engine_scope(engine):
-                        return send(engine, CreateNodeRequest(node_type="HMBImageBash", specific_library_name="HMB_GP_Production",
-                            node_name=f"ConcurrentBash{number}", create_error_proxy_on_failure=False))
-                with ThreadPoolExecutor(max_workers=8) as executor:
-                    bash_results = list(executor.map(simultaneous_bash, range(12)))
-                assert sum(isinstance(result, CreateNodeResultSuccess) for result in bash_results) == 1
+                    return send(engine, CreateNodeRequest(node_type="HMBImageBash", specific_library_name="HMB_GP_Production",
+                        node_name=f"ConcurrentBash{number}", override_parent_flow_name="ConcurrentBashFlow",
+                        create_error_proxy_on_failure=False))
+                bash_results = simultaneous_requests(simultaneous_bash)
+                assert sum(isinstance(result, CreateNodeResultSuccess) for result in bash_results) == 1, [
+                    (type(r).__name__, str(r.result_details)) for r in bash_results]
                 assert sum(isinstance(result, CreateNodeResultFailure) for result in bash_results) == 11
                 for result in bash_results:
                     if isinstance(result, CreateNodeResultFailure): quiet(result, CreateNodeResultFailure)
@@ -344,8 +354,7 @@ async def main():
                 assert inventory(engine) == before_error
                 print("PASS invalid-parent, unrelated node and actual worker constructor errors retain ERROR semantics")
 
-                failure_flow = send(engine, CreateFlowRequest(flow_name="FailureFlow", parent_flow_name=None, set_as_new_context=True))
-                assert isinstance(failure_flow, CreateFlowResultSuccess)
+                activate_flow(engine, flows, "FailureFlow")
                 failed = create(engine, "FailingPrompt")
                 actual_failure(failed)
                 await asyncio.sleep(0)
@@ -354,13 +363,10 @@ async def main():
                 assert isinstance(retried, CreateNodeResultSuccess), str(retried.result_details)
                 print("PASS failed constructor releases its in-flight creation claim")
 
-                race_flow = send(engine, CreateFlowRequest(flow_name="ConcurrentFlow", parent_flow_name=None, set_as_new_context=True))
-                assert isinstance(race_flow, CreateFlowResultSuccess)
+                activate_flow(engine, flows, "ConcurrentFlow")
                 def simultaneous_create(number):
-                    with engine_scope(engine):
-                        return create(engine, f"ConcurrentPrompt{number}")
-                with ThreadPoolExecutor(max_workers=8) as executor:
-                    results = list(executor.map(simultaneous_create, range(12)))
+                    return create(engine, f"ConcurrentPrompt{number}", override_parent_flow_name="ConcurrentFlow")
+                results = simultaneous_requests(simultaneous_create)
                 assert sum(isinstance(result, CreateNodeResultSuccess) for result in results) == 1
                 assert sum(isinstance(result, CreateNodeResultFailure) for result in results) == 11
                 for result in results:
@@ -418,11 +424,10 @@ async def main():
         # Exercise it
         # in a distinct engine so the existing admission/unload leak assertion
         # above remains exact and does not mistake that separate gate for a leak.
-        with engine_scope() as reset_engine:
+        with engine_scope() as reset_engine, scoped_fixture_workflow(reset_engine, "BashResetFlow"):
             reset_engine.event_manager.initialize_queue()
             reset_library, _reset_advanced = fixture(reset_engine, "fixture-reset")
             try:
-                send(reset_engine, EnsureWorkflowAndFlowRequest(flow_name="BashResetFlow"))
                 created = send(reset_engine, CreateNodeRequest(node_type="HMBImageBash", specific_library_name="HMB_GP_Production",
                     node_name="ResetBash", metadata={"size": {"width": 800, "height": 680}}, create_error_proxy_on_failure=False))
                 assert isinstance(created, CreateNodeResultSuccess), str(created.result_details)

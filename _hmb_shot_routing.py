@@ -15,7 +15,7 @@ registry.
 """
 
 from dataclasses import dataclass, replace
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import asyncio
 import logging
 import json
@@ -31,6 +31,35 @@ SUBSCRIPTION_SCHEMA = "hmb-shot-channel-subscription"
 SUBSCRIPTION_VERSION = 1
 SHOT_ROUTING_PROTOCOL_VERSION = "2026-08-20.shot-routing.v1"
 MAX_SHOTS = 5
+_HMB_SOURCE_PREPARE_TIMEOUT_SECONDS = 30.0
+_HMB_SOURCE_PREPARE_RETRY_SECONDS = 0.1
+_HMB_SOURCE_FAILURE_MESSAGES = {
+    "SOURCE_ANALYSIS_REFRESH_FAILED": "이 샷의 분석 결과를 적용하지 못했습니다. 분석 노드의 원본과 실행 상태를 확인하세요.",
+    "SOURCE_PREPARATION_TIMEOUT": "소스 준비 확인 시간이 초과되었습니다. 이미지·영상·사운드 소스의 준비 상태를 확인한 뒤 다시 실행하세요.",
+    "SOURCE_MEDIA_UNAVAILABLE": "선택한 이미지·영상·사운드 소스를 읽을 수 없습니다. 해당 PC의 파일 경로와 접근 권한을 확인하세요.",
+    "SOURCE_SHOT_IDENTITY_MISMATCH": "샷 또는 소스 식별자가 변경되었습니다. 현재 샷과 원본 연결을 확인하세요.",
+    "SOURCE_PROMPT_OWNER_UNAVAILABLE": "원래 연결된 Prompt 또는 소스 노드를 확인할 수 없습니다. 현재 연결을 확인하세요.",
+    "SOURCE_CONNECTION_UNAVAILABLE": "현재 샷의 연결 확인을 완료하지 못했습니다. 연결 상태를 확인하세요.",
+    "SOURCE_VALIDATION_FAILED": "샷 입력 검증을 완료하지 못했습니다. 소스와 샷 설정을 확인하세요.",
+}
+
+
+class _HMBSourcePreparationError(RuntimeError):
+    """A bounded source-stage error, with no paths or payloads in its message."""
+
+    def __init__(self, code):
+        self.code = code if code in _HMB_SOURCE_FAILURE_MESSAGES else "SOURCE_VALIDATION_FAILED"
+        super().__init__(f"[HMB SOURCE CHECK FAILED] Reason: {self.code}. {_HMB_SOURCE_FAILURE_MESSAGES[self.code]}")
+
+
+def _hmb_source_is_preparing(exc):
+    return isinstance(exc, ValueError) and (
+        getattr(exc, "hmb_image_asset_selection_preparing", False) is True
+        or getattr(exc, "hmb_picker_media_preparing", False) is True
+        or getattr(exc, "hmb_sound_preparing", False) is True
+    )
+
+
 
 
 class ShotImageUnavailable(ValueError):
@@ -756,6 +785,64 @@ def _same_flow_nodes(node: Any) -> tuple[str, list[Any]]:
         return "", []
 
 
+_SHOT_EDIT_OWNERS: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionary()
+_SHOT_EDIT_GUARD = threading.RLock()
+
+
+def _shot_edit_workflow(node: Any):
+    workflow = getattr(node, "workflow", None)
+    bind = getattr(getattr(workflow, "engine", None), "bind_workflow", None)
+    return bind(workflow) if callable(bind) else nullcontext()
+
+
+def shot_edit_locks(node: Any) -> list[dict[str, str]]:
+    """Return only the render-owned Shot identities in this registered flow."""
+    with _SHOT_EDIT_GUARD:
+        if not _SHOT_EDIT_OWNERS:
+            return []
+    with _shot_edit_workflow(node):
+        _, nodes = _same_flow_nodes(node)
+    with _SHOT_EDIT_GUARD:
+        keys = {owner._hmb_render_edit_lock for owner in nodes
+                if _SHOT_EDIT_OWNERS.get(id(owner)) is owner}
+    return [{"channel_uuid": channel, "shot_uuid": shot} for channel, shot in sorted(keys)]
+
+
+def assert_shot_editable(node: Any, channel_uuid: str, shot_uuid: str) -> None:
+    if channel_uuid and shot_uuid and {"channel_uuid": channel_uuid, "shot_uuid": shot_uuid} in shot_edit_locks(node):
+        raise ValueError("이 샷은 Generator에서 작업 중입니다. 작업 결과가 확인되면 수정할 수 있습니다.")
+
+
+def set_shot_edit_lock(owner: Any, identity: Mapping[str, Any] | None) -> None:
+    """Publish only lock transitions. A detached/replaced node cannot lock another flow."""
+    channel = (identity or {}).get("channel_uuid")
+    shot = (identity or {}).get("shot_uuid")
+    key = (channel, shot) if channel and shot else None
+    with _SHOT_EDIT_GUARD:
+        if getattr(owner, "_hmb_render_edit_lock", None) == key:
+            return
+    with _shot_edit_workflow(owner):
+        _, nodes = _same_flow_nodes(owner)
+    if key and not any(candidate is owner for candidate in nodes):
+        return  # A constructor or isolated Web operation is outside this graph.
+    with _SHOT_EDIT_GUARD:
+        if getattr(owner, "_hmb_render_edit_lock", None) == key:
+            return
+        owner._hmb_render_edit_lock = key
+        if key:
+            _SHOT_EDIT_OWNERS[id(owner)] = owner
+        else:
+            _SHOT_EDIT_OWNERS.pop(id(owner), None)
+    with _shot_edit_workflow(owner):
+        for candidate in nodes:
+            changed = getattr(candidate, "_hmb_shot_edit_locks_changed", None)
+            if callable(changed) and not getattr(candidate, "_hmb_node_deleted", False):
+                try:
+                    changed()
+                except Exception:
+                    logging.getLogger(__name__).exception("Could not refresh Shot edit controls for %s.", candidate.name)
+
+
 def _subscription_fingerprint(
     node: Any,
 ) -> tuple[str, bool, str, str] | None:
@@ -768,61 +855,6 @@ def _subscription_fingerprint(
         subscription.channel_uuid,
         subscription.shot_uuid,
     )
-
-
-def _singleton_owner(node: Any, nodes: Iterable[Any]) -> Any | None:
-    """Return the first live same-kind singleton in retained flow order.
-
-    ImageAsset and VideoPicker are flow-level authorities. Prompt, Agent and
-    Seedance remain intentionally multi-instance because every Shot may own an
-    independent downstream chain.
-    """
-
-    current = _subscription_for(node)
-    if current is None or current.kind not in SINGLETON_KINDS:
-        return None
-    candidates = []
-    for candidate in nodes:
-        subscription = _subscription_for(candidate)
-        if subscription is not None and subscription.kind == current.kind:
-            candidates.append(candidate)
-    with _ROUTING_LOCK:
-        registration_orders = {
-            id(candidate): _SINGLETON_REGISTRATION_ORDERS.get(candidate)
-            for candidate in candidates
-        }
-        admissions = {
-            id(candidate): _SINGLETON_ADMISSIONS.get(candidate, ("", ""))
-            for candidate in candidates
-        }
-        authoritative_ids = {
-            id(candidate)
-            for candidate in candidates
-            if candidate in _AUTHORITATIVE_FINGERPRINTS
-        }
-
-    def registration_rank(candidate: Any) -> tuple[int, str]:
-        order = registration_orders.get(id(candidate))
-        return (
-            int(order) if isinstance(order, int) else 2**63 - 1,
-            _clean(getattr(candidate, "name", ""), 512).casefold(),
-        )
-
-    admitted = [
-        candidate
-        for candidate in candidates
-        if admissions.get(id(candidate), ("", ""))[1] == current.kind
-    ]
-    if admitted:
-        return min(admitted, key=registration_rank)
-    authoritative = [
-        candidate for candidate in candidates if id(candidate) in authoritative_ids
-    ]
-    if authoritative:
-        return min(authoritative, key=registration_rank)
-    if candidates:
-        return min(candidates, key=registration_rank)
-    return None
 
 
 def _try_stage_singleton_reset_handoff(
@@ -1923,12 +1955,12 @@ def _reconcile_color_lut_routes(
     return changed + sound_changed
 
 
-def _reconcile_color_lut_projects(nodes: list[Any], project_source: Any = None, project_state: Any = None) -> None:
+def _reconcile_color_lut_projects(nodes: list[Any], project_source: Any = None, project_state: Any = None) -> bool:
     from _hmb_connection_management import is_detached, target_has_suspended_role
     targets = [n for n in nodes if callable(getattr(n, "_hmb_follow_image_asset_project", None))
                and not target_has_suspended_role(n)]
     if not targets:
-        return
+        return True
     project = {}
     for source in nodes:
         if is_detached(source):
@@ -1936,7 +1968,11 @@ def _reconcile_color_lut_projects(nodes: list[Any], project_source: Any = None, 
         sub = _subscription_for(source)
         if sub is None or sub.kind != KIND_IMAGE_ASSET or getattr(source, "_hmb_node_deleted", False):
             continue
-        raw = project_state if source is project_source else getattr(source, "get_parameter_value", lambda _name: None)("HMB_IMAGE_ASSET_STATE")
+        try:
+            raw = project_state if source is project_source else source.get_parameter_value("HMB_IMAGE_ASSET_STATE")
+        except Exception:
+            _LOGGER.exception("Could not read the ImageAsset project for Color LUT.")
+            return False
         if isinstance(raw, str):
             try:
                 raw = json.loads(raw)
@@ -1948,8 +1984,14 @@ def _reconcile_color_lut_projects(nodes: list[Any], project_source: Any = None, 
             if identity:
                 project = {"id": identity, "name": _clean(raw.get("project_id"), 256) or root.replace("\\", "/").rstrip("/").split("/")[-1], "root": root}
         break
+    complete = True
     for target in targets:
-        target._hmb_follow_image_asset_project(project)
+        try:
+            target._hmb_follow_image_asset_project(project)
+        except Exception:
+            complete = False
+            _LOGGER.exception("Could not update the project for Color LUT %s.", getattr(target, "name", ""))
+    return complete
 
 
 def notify_color_lut_project_change(source: Any, state: dict[str, Any]) -> None:
@@ -1957,8 +1999,7 @@ def notify_color_lut_project_change(source: Any, state: dict[str, Any]) -> None:
     if identity == getattr(source, "_hmb_color_lut_project_identity", None):
         return
     flow, nodes = _same_flow_nodes(source)
-    if flow:
-        _reconcile_color_lut_projects(nodes, source, state)
+    if flow and _reconcile_color_lut_projects(nodes, source, state):
         source._hmb_color_lut_project_identity = identity
 
 
@@ -4051,3 +4092,53 @@ __all__ = [
     "schedule_post_hydration_reconcile",
     "schedule_post_registration_reconcile",
 ]
+
+
+# Source-node checks are runtime observations, scoped to the same inputs that
+# were read. UI cursors, source catalogs and native whole-node flags are separate.
+def _notify_source_shot_status(node):
+    try:
+        node._hmb_shot_edit_locks_changed()
+    except Exception:
+        _LOGGER.debug("Could not publish source Shot status", exc_info=True)
+
+
+def record_source_shot_check(node, state, channel, shot):
+    key = node._hmb_source_shot_key(state, channel, shot)
+    scope = (channel, shot)
+    with _SHOT_EDIT_GUARD:
+        receipts = getattr(node, "_hmb_source_checks", {})
+        if key is None or receipts.get(scope) == key:
+            return
+        receipts = {owner: token for owner, token in receipts.items()
+                    if owner[0] == channel and owner != scope}
+        node._hmb_source_checks = {**dict(list(receipts.items())[-(MAX_SHOTS - 1):]), scope: key}
+    _notify_source_shot_status(node)
+
+
+def clear_source_shot_check(node, channel, shot):
+    with _SHOT_EDIT_GUARD:
+        receipts = getattr(node, "_hmb_source_checks", {})
+        if (channel, shot) not in receipts:
+            return
+        node._hmb_source_checks = {owner: token for owner, token in receipts.items() if owner != (channel, shot)}
+    _notify_source_shot_status(node)
+
+
+def source_shot_status_fields(node, state):
+    receipts = getattr(node, "_hmb_source_checks", {})
+    checked = [{"channel_uuid": channel, "shot_uuid": shot} for (channel, shot), token in receipts.items()
+               if node._hmb_source_shot_key(state, channel, shot) == token]
+    return {"shot_edit_locks": shot_edit_locks(node), "verified_shots": checked}
+
+
+def publish_source_widget_view(node, parameter_name, value):
+    """A display-only event. A check or lock must never write the graph."""
+    if not getattr(node, "workflow", None) or getattr(node, "_hmb_node_deleted", False):
+        return
+    from griptape_nodes.retained_mode.events.execution_events import ParameterValueUpdateEvent
+    param = node.get_parameter_by_name(parameter_name)
+    if param:
+        event = ParameterValueUpdateEvent(node_name=node.name, parameter_name=parameter_name,
+                                          data_type=param.type, value=value)
+        node.engine.event_manager.put_event(node.execution_event(event))

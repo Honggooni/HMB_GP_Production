@@ -158,6 +158,46 @@ assert post_registration_preview["action"] == "refresh_existing"
 assert post_registration_schedules == []
 
 
+def verify_shot_edit_lock_recovery():
+    # The same durable channel/Shot UUIDs can appear in two open copies of a
+    # workflow. Only actual members of the submitting retained flow are locked.
+    channel = "11111111-1111-4111-8111-111111111111"
+    shot = "22222222-2222-4222-8222-222222222222"
+    origin = {"channel_uuid": channel, "shot_uuid": shot, "number": 2, "name": "Shot 2",
+              "source_node_instance_id": "33333333-3333-4333-8333-333333333333"}
+    identity = {"channel_uuid": channel, "shot_uuid": shot}
+    owner = target.HMBSeedanceGeneration(name="Edit lock recovery")
+    listener, other = SimpleNamespace(name="same flow"), SimpleNamespace(name="other workflow")
+    routing = target._shot_routing
+    transitions = []
+    listener._hmb_shot_edit_locks_changed = lambda: transitions.append(routing.shot_edit_locks(listener))
+    owner._hmb_shot_edit_locks_changed = lambda: None
+    scope = lambda node: ("other", [other]) if node is other else ("original", [owner, listener])
+    current = target._seedance_recovery_value({
+        "task_id": "hmb-synthetic-client", "task_identity": "client_request", "stage": "pre_submit",
+        "status": "submitting", "generation_origin": origin,
+    })
+    with mock.patch.object(routing, "_same_flow_nodes", scope):
+        owner.set_parameter_value(target.SEEDANCE_RECOVERY_PARAMETER, current, initial_setup=True, emit_change=False)
+        owner._restore_generation_recovery_preview()
+        for status in ("submission_unknown", "running", "timed_out", "cancelled_locally"):
+            current.update(status=status, stage="submission_unknown" if status == "submission_unknown" else "accepted")
+            owner._sync_render_edit_lock(current)
+            assert routing.shot_edit_locks(listener) == [identity]
+            assert routing.shot_edit_locks(other) == []
+        assert transitions == [[identity]]
+        owner._sync_render_edit_lock({**current, "status": "failed", "terminal": True, "stage": "terminal"})
+        assert transitions == [[identity], []]
+        owner._sync_render_edit_lock(current)
+        owner._sync_render_edit_lock({**current, "status": "succeeded", "stage": "local_succeeded"})
+        assert transitions == [[identity], [], [identity], []]
+        owner._sync_render_edit_lock({**current, "generation_origin": {}})
+        assert routing.shot_edit_locks(listener) == []
+
+
+verify_shot_edit_lock_recovery()
+
+
 # The client request ID is checkpointed before the billable create call.  If
 # the app dies while its status is still ``submitting``, acceptance is unknown:
 # reopen may only retrieve this same idempotent request, never submit again.
@@ -1092,7 +1132,7 @@ new_destination_checkpoint = new_destination_node._set_generation_recovery_check
     },
 )
 assert new_destination_checkpoint["output_file"] == (
-    new_destination_node._output_file._default_filename
+    f"volcengine_seedance_video.{target.NEW_NODE_OUTPUT_FORMAT}"
 )
 assert new_destination_checkpoint["output_file"] != "previous-task.mov"
 

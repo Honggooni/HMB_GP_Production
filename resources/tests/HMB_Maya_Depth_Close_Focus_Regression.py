@@ -49,7 +49,7 @@ print("Depth close focus compact-root, local-context, weak-hint and temporal pol
 NATIVE=r'''import hashlib,importlib.util,json,os,traceback
 from pathlib import Path
 import maya.cmds as cmds
-ROOT=Path("C:/HMB_GP_Production");OUT=Path(os.environ["HMB_CLOSE_TEST_OUTPUT"]).resolve()
+ROOT=Path(os.environ["HMB_MAYA_TEST_ROOT"]);OUT=Path(os.environ["HMB_CLOSE_TEST_OUTPUT"]).resolve()
 RUNNER=ROOT/"resources/maya/HMB_Maya_Background_Preview.py"
 report={"ok":False,"scope":"Private 3-frame binary scene and direct camera API checks; no user scene touched."}
 try:
@@ -134,7 +134,7 @@ if args.live_maya:
     worker=args.output/"native_worker.py";worker.write_text(NATIVE,encoding="utf-8")
     for name in ("maya-app","tmp"): (args.output/name).mkdir(exist_ok=True)
     env=os.environ.copy();env.update({"MAYA_APP_DIR":str(args.output/"maya-app"),"TEMP":str(args.output/"tmp"),"TMP":str(args.output/"tmp"),
-        "HMB_CLOSE_TEST_OUTPUT":str(args.output),"MAYA_ENABLE_LEGACY_RENDER_LAYERS":"1","MAYA_DISABLE_CIP":"1","MAYA_DISABLE_CER":"1","MAYA_DISABLE_ADP":"1","PYTHONUTF8":"1"})
+        "HMB_MAYA_TEST_ROOT":str(ROOT), "HMB_CLOSE_TEST_OUTPUT":str(args.output),"MAYA_ENABLE_LEGACY_RENDER_LAYERS":"1","MAYA_DISABLE_CIP":"1","MAYA_DISABLE_CER":"1","MAYA_DISABLE_ADP":"1","PYTHONUTF8":"1"})
     script=str(worker).replace("\\","/")
     command='python("import runpy;_close_result=runpy.run_path(\\\''+script+"\\',run_name=\\'__main__\\')\");"
     with (args.output/"mayabatch.log").open("w",encoding="utf-8",errors="replace") as log:

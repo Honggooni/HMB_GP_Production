@@ -269,6 +269,46 @@ try {
   await page.route("**/*", route => new URL(route.request().url()).hostname === "127.0.0.1" ? route.continue() : route.abort());
   await page.goto(`http://127.0.0.1:${server.address().port}`);
   await page.waitForFunction(() => window.ready);
+  await page.evaluate(() => {
+    const shell = document.createElement("section");
+    shell.className = "react-flow__node";
+    document.body.prepend(shell);
+    const file = document.createElement("button");
+    file.dataset.parameterName = "HMB_ANALYSIS_FILE";
+    shell.append(document.querySelector("#widget"), file);
+    window.state = {...window.state, shot_edit_locks: [{channel_uuid: "channel", shot_uuid: "shot-1"}]};
+    window.controller.update(window.props());
+  });
+  assert.match(await page.locator('[data-shot="shot-1"]').innerText(), /로동중\.\.\. 수정불가/);
+  await page.evaluate(() => {
+    window.state = {...window.state, shots:window.state.shots.map((shot,i) => i ? shot : {...shot,applied:true})};
+    window.controller.update(window.props());
+  });
+  const numberBadge = page.locator('[data-shot="shot-1"] > [data-hmb-shot-check]');
+  assert.equal(await numberBadge.getAttribute("data-hmb-shot-check"), "true");
+  assert.equal(await numberBadge.evaluate(el => getComputedStyle(el,"::before").content), '"✓"');
+  assert.equal(await page.locator("[data-guidance]").isDisabled(), true);
+  assert.equal(await page.locator("[data-parameter-name]").evaluate(el => getComputedStyle(el).pointerEvents), "none");
+  assert.equal(await page.locator('[data-shot="shot-2"]').isEnabled(), true);
+  await page.evaluate(() => {
+    window.state = {...window.state, shot_uuid: "shot-2"};
+    window.controller.update(window.props());
+  });
+  assert.equal(await page.locator("[data-guidance]").isEnabled(), true);
+  assert.equal(await page.locator("[data-parameter-name]").evaluate(el => getComputedStyle(el).pointerEvents), "auto");
+  assert.equal(await page.locator('[data-shot="shot-1"]').getAttribute("data-locked-shot"), "true");
+  await page.evaluate(() => {
+    window.state = {...window.state, shot_uuid: "shot-1", shot_edit_locks: []};
+    window.controller.update(window.props());
+  });
+  assert.match(await page.locator('[data-shot="shot-1"]').innerText(), /완료/);
+  assert.equal(await numberBadge.textContent(), "01");
+  await page.evaluate(() => {
+    window.state = {...window.state, shots:window.state.shots.map((shot,i) => i ? shot : {...shot,applied:false})};
+    window.controller.update(window.props());
+  });
+  assert.equal(await numberBadge.getAttribute("data-hmb-shot-check"), "false");
+  assert.equal(await page.locator("[data-guidance]").isEnabled(), true);
   const modelPicker = page.locator("[data-model]");
   assert.deepEqual(await modelPicker.locator("option").allTextContents(), ["None", "Gemini 4 Carbon", "Gemini 4 Argon"]);
   await modelPicker.selectOption("gemini-4-argon");

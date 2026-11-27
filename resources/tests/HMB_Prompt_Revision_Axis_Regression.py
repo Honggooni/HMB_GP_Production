@@ -343,6 +343,19 @@ restored_node.set_parameter_value(
 assert prompt._normalize_state(restored_node._current_state()) == restored
 
 
+# A source notification can update the exact selection before its compact
+# catalog catches up. A crossed Prompt edit owns authoring only.
+for multishot in (False, True):
+    earlier = copy.deepcopy(ui)
+    earlier["multi_shot_enabled"] = multishot
+    for selected_uids in (["image-beta", "image-alpha"], ["image-alpha"], []):
+        latest = copy.deepcopy(earlier)
+        latest["shot"]["selected_source_uids"] = selected_uids
+        latest[prompt.SOURCE_SYNC_REVISION_KEY] += 1
+        earlier[prompt.UI_EDIT_REVISION_KEY] += 1
+        result = prompt._merge_prompt_revision_axes(latest, earlier)
+        assert result["shot"]["selected_source_uids"] == selected_uids
+
 print(
     "HMB Prompt revision-axis regression: PASS "
     "(stable identity / equal echo / crossed clocks / saved reload)"
