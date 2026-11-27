@@ -1,8 +1,21 @@
 """Offline media and upload recorder for Generator submission tests."""
 from hashlib import sha256
+from functools import lru_cache
 from pathlib import Path
+import subprocess
+import wave
 
 from PIL import Image
+
+
+@lru_cache(maxsize=1)
+def movie_bytes():
+    from _hmb_video_tools import _find_ffmpeg
+    return subprocess.check_output(
+        [_find_ffmpeg(), "-nostdin", "-v", "error", "-f", "lavfi", "-i", "color=blue:s=854x480:d=0.2",
+         "-an", "-c:v", "libx264", "-movflags", "+frag_keyframe+empty_moov", "-f", "mp4", "pipe:1"],
+        timeout=30,
+    )
 
 
 class CloudInputFixture:
@@ -12,9 +25,11 @@ class CloudInputFixture:
             with Image.new("RGB", (32, 16), color) as image:
                 image.save(path)
         self.video = Path(folder, "reference.mp4")
-        self.video.write_bytes(b"\x00\x00\x00\x18ftypisom" + b"fixture-video" * 8)
+        self.video.write_bytes(movie_bytes())
         self.audio = Path(folder, "reference.wav")
-        self.audio.write_bytes(b"RIFF" + bytes(4) + b"WAVEfmt " + bytes(38))
+        with wave.open(str(self.audio), "wb") as output:
+            output.setparams((1, 2, 8000, 0, "NONE", ""))
+            output.writeframes(bytes(3200))
         self.uploads = []
 
     def upload_file(self, *, path, file_content, timeout):

@@ -238,13 +238,14 @@ def _video_geometry(width: Any, height: Any) -> tuple[int, int]:
     return result
 
 
-def probe_video(path: str | Path) -> dict[str, Any]:
+def probe_video(path: str | Path, *, allowed_formats: str = "") -> dict[str, Any]:
     source = Path(path).resolve(strict=True)
     ffmpeg = _find_ffmpeg()
     ffprobe = _find_ffprobe(ffmpeg)
+    options = ["-format_whitelist", allowed_formats, "-protocol_whitelist", "file,pipe"] if allowed_formats else []
     if ffprobe:
         completed = subprocess.run(
-            [ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(source)],
+            [ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", *options, str(source)],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -266,6 +267,7 @@ def probe_video(path: str | Path) -> dict[str, Any]:
                     or _positive_media_number(payload.get("format", {}).get("duration")))
         return {
             "probe_backend": "ffprobe",
+            "container_format": str(payload.get("format", {}).get("format_name") or ""),
             "path": str(source),
             "width": width,
             "height": height,
@@ -283,7 +285,7 @@ def probe_video(path: str | Path) -> dict[str, Any]:
             "audio_channel_layout": str(audio.get("channel_layout") or "") if isinstance(audio, dict) else "",
         }
     completed = subprocess.run(
-        [ffmpeg, "-hide_banner", "-i", str(source)],
+        [ffmpeg, "-hide_banner", *options, "-i", str(source)],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -318,8 +320,10 @@ def probe_video(path: str | Path) -> dict[str, Any]:
     audio_layout = audio_layout_match.group(1).strip() if audio_layout_match else ""
     pixel_format = pixel_format_match.group(1) if pixel_format_match else ""
     pixel_format = pixel_format.split("(", 1)[0]
+    input_format = re.search(r"^Input #0, (.+?), from ", details, re.MULTILINE)
     return {
         "probe_backend": "ffmpeg",
+        "container_format": input_format.group(1) if input_format else "",
         "path": str(source),
         "width": int(size.group(1)),
         "height": int(size.group(2)),

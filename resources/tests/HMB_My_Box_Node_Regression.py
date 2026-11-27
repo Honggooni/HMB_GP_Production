@@ -250,9 +250,6 @@ class MyBoxNodeTests(unittest.TestCase):
             destination.write(cloud.video.read_bytes())
         self.enterContext(mock.patch.object(self.node, '_download_external_media', new=download))
         self.enterContext(mock.patch.object(self.node, '_create_gt_cloud_storage_driver', return_value=cloud))
-        self.enterContext(mock.patch('_hmb_video_tools.probe_video', return_value={
-            'width': 1280, 'height': 720, 'duration': 4, 'video_codec': 'h264',
-        }))
         return cloud
     def assert_uploaded_video(self, cloud, payload, previous_count):
         self.assertEqual(len(cloud.uploads), previous_count + 1)

@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import wave
 from contextlib import nullcontext
 from io import BytesIO
 from pathlib import Path
@@ -317,7 +318,11 @@ with tempfile.TemporaryDirectory() as temporary:
         destination.write(image_bytes)
         return b""
     cloud_node._download_external_media = read_remote
-    audio = b"RIFF" + bytes(4) + b"WAVEfmt "
+    stream = BytesIO()
+    with wave.open(stream, "wb") as output:
+        output.setparams((1, 2, 8000, 0, "NONE", ""))
+        output.writeframes(bytes(3200))
+    audio = stream.getvalue()
     audio_uri = "data:audio/wav;base64," + base64.b64encode(audio).decode("ascii")
     cloud_params = {
         "model_id": seedance.SEEDANCE_2_5_MODEL_ID,
@@ -402,7 +407,7 @@ with tempfile.TemporaryDirectory() as temporary:
         signed_bytes_driver.create_signed_download_url.assert_not_called()
     assert cloud_params["reference_images"] == [image_data_uri, remote_image, {"url":remote_image}, {"path":str(image_path)}]
     try:
-        cloud_node._prepare_video_references_for_run(cloud_params, cloud_driver=None)
+        cloud_node._prepare_video_references_for_run(dict(cloud_params, video_reference_slots=[]), cloud_driver=None)
     except RuntimeError as exc:
         assert "Griptape Cloud" in str(exc)
     else:

@@ -160,7 +160,7 @@ import _hmb_review as _review
 import _hmb_broker_config as _broker_config
 import _hmb_my_box_node as _my_box_node
 import _hmb_reference_leases as _reference_leases
-from _hmb_image_limits import inspect_seedance_image_payload
+from _hmb_image_limits import SeedanceImageLimitError, inspect_seedance_image_payload
 from _hmb_project import project_display_name, resolve_routing_project as resolve_project
 from _hmb_build_diagnostics import get_build_diagnostics as _get_build_diagnostics
 from _hmb_common import (
@@ -13705,10 +13705,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         with TemporaryDirectory(prefix="hmb-cloud-input-") as folder:
             path = Path(folder) / "reference"
             with path.open("wb") as stream:
-                asyncio.run(self._download_external_media(
-                    text, accept=f"{kind}/*,application/octet-stream", max_bytes=limits[kind],
-                    media_label=f"Reference {kind}", destination=stream,
-                ))
+                try:
+                    asyncio.run(self._download_external_media(
+                        text, accept=f"{kind}/*,application/octet-stream", max_bytes=limits[kind],
+                        media_label=f"Reference {kind}", destination=stream,
+                    ))
+                except (ValueError, OSError, RuntimeError, httpx.HTTPError) as exc:
+                    raise ConnectionError("참조 파일 다운로드 실패") from exc
             if kind == "image":
                 suffix = suffix if suffix in IMAGE_MIME_BY_SUFFIX else ".png"
             elif kind == "video":
@@ -13740,6 +13743,19 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise ValueError("Reference audio must be nonempty and no larger than 15 MiB.")
         return content, path.name
 
+    @staticmethod
+    def _check_reference_track(source_args: list[str], track: str, content: bytes | None = None, *, stream: str = "") -> None:
+        """Require one decodable frame. FFmpeg also handles hosts without ffprobe."""
+        from _hmb_video_tools import _find_ffmpeg
+        subprocess.run(
+            [_find_ffmpeg(), "-nostdin", "-v", "error", "-xerror", "-abort_on", "empty_output",
+             "-protocol_whitelist", "file,pipe", *source_args, "-map", stream or f"0:{track}:0",
+             f"-frames:{track}", "1", "-f", "null", "-"],
+            input=content, stdin=subprocess.DEVNULL if content is None else None,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
     def _prepare_cloud_image(self, source: str, model: str, ordinal: int) -> tuple[bytes, str]:
         content, mime, name = self._read_image_for_cloud_upload(source, reference_ordinal=ordinal)
         if model == SEEDANCE_2_5_MODEL_ID and mime == "image/png" and len(content) >= SEEDANCE_LOSSLESS_PNG_COPY_THRESHOLD:
@@ -13748,29 +13764,38 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 name = Path(name).with_suffix(".webp").name
         return content, name
 
-    def _stage_cloud_reference(
-        self, driver: Any, kind: str, value: Any, model: str, ordinal: int, *, cloud_proof_v1: bool = False,
-    ) -> str:
-        with self._cloud_reference_source(kind, value) as source:
-            if kind == "video":
-                path = self._resolve_local_video_path(source)
-                with self._reference_video_upload_path(path, model) as upload_path:
-                    key = Path("artifact_url_storage") / uuid4().hex / upload_path.name
-                    self._temporary_video_uploads.append((driver, key))
-                    return self._upload_local_video_to_griptape_cloud(
-                        driver, upload_path, key, cloud_proof_v1=cloud_proof_v1,
-                    )
-            if kind == "audio":
-                content, name = self._read_cloud_reference_audio(source)
-            else:
-                content, name = self._prepare_cloud_image(source, model, ordinal)
-            return self._upload_cloud_reference_bytes(driver, content, name, cloud_proof_v1=cloud_proof_v1)
+    @staticmethod
+    def _reference_intake_guidance(kind: str, exc: Exception) -> str:
+        code = getattr(exc, "code", "")
+        if code == "SEEDANCE_IMAGE_PIXEL_LIMIT":
+            d = exc.details
+            return (f"이미지는 {d['width']}×{d['height']} ({d['pixels']:,}픽셀)이며 한도는 {d['max_pixels']:,}픽셀입니다. "
+                    f"{d['suggested_width']}×{d['suggested_height']} 이하의 복사본을 첨부하세요.")
+        if code == "SEEDANCE_IMAGE_BYTE_LIMIT" or "smaller than" in str(exc) or "safety limit" in str(exc):
+            return "파일이 허용 용량을 초과합니다. 용량을 줄인 복사본을 첨부하세요."
+        if code == "SEEDANCE_IMAGE_VALIDATOR_UNAVAILABLE" or "FFmpeg is not available" in str(exc):
+            return "PC에 미디어 검사 도구가 없습니다. 도구를 복구한 뒤 같은 파일로 다시 시도하세요."
+        if isinstance(exc, subprocess.TimeoutExpired):
+            return "PC에서 파일 검사 시간이 초과되었습니다. 파일을 로컬에 복사한 뒤 다시 시도하세요."
+        if isinstance(exc, (FileLoadError, FileNotFoundError, PermissionError)) or "does not exist" in str(exc):
+            return "파일을 열 수 없습니다. 원본 파일의 위치와 읽기 권한을 확인한 뒤 다시 첨부하세요."
+        if isinstance(exc, httpx.HTTPError) or isinstance(exc, ConnectionError):
+            return "파일을 내려받지 못했습니다. 열 수 있는 원본 파일이나 새 다운로드 주소를 연결하세요."
+        if "asset://" in str(exc):
+            return "asset:// ID만으로는 원본을 읽을 수 없습니다. 원본 파일이나 다운로드 주소를 연결하세요."
+        if isinstance(exc, LocalReferenceVideoError) and "업로드 사본" in str(exc):
+            return "업로드용 MP4 사본을 만들 수 없습니다. H.264 또는 HEVC로 재생되는 MP4/MOV 파일을 첨부하세요."
+        return {"image": "이미지를 읽을 수 없습니다. 열리는 이미지 파일을 이 슬롯에 다시 첨부하세요.",
+                "video": "영상 트랙을 읽을 수 없습니다. 재생되는 동영상 파일을 이 슬롯에 다시 첨부하세요.",
+                "audio": "음성 트랙을 읽을 수 없습니다. 재생되는 WAV 또는 MP3를 이 슬롯에 다시 첨부하세요."}[kind]
 
     def _prepare_video_references_for_run(
         self, params: dict[str, Any], cloud_driver: Any = _CLOUD_DRIVER_UNSET,
     ) -> dict[str, Any]:
         """Stage every client-supplied render file in Cloud before building the Broker request."""
         self._assert_operation_project_selection()
+        params = params.copy()
+        display = params.pop("_hmb_intake_display_sources", None)
         cloud_proof_v1 = params.get("_hmb_cloud_reference_proof_v1") is True
         images = [params.get("first_frame"), params.get("last_frame"), *(params.get("reference_images") or [])]
         videos = self._generation_video_reference_values(params)
@@ -13784,37 +13809,73 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return kind, text
 
         with ExitStack() as scratch:
-            # Validate every local image before the first upload. Retain at most
-            # one image budget in memory. Spill larger batches to private scratch
-            # so a network source is only read once, even if it changes on disk.
+            # Acquire and check every input before issuing the first upload. Keep
+            # video files open to the preparation scope and bound in-memory bytes.
             prepared: dict[tuple[str, str], tuple[bytes | Path, str]] = {}
             memory_left = MAX_IMAGE_BYTES
             spill_dir = None
-            ordinal = 0
-            for image in images:
-                if not self._has_reference_value(image):
-                    continue
-                ordinal += 1
-                key = source_key("image", image)
-                source = str(self._coerce_reference_value(image)).strip()
-                if source.startswith(("http://", "https://", "asset://")) or key in prepared:
-                    continue
-                content, name = self._prepare_cloud_image(source, model, ordinal)
-                if len(content) <= memory_left:
-                    prepared[key] = (content, name)
-                    memory_left -= len(content)
-                else:
-                    if spill_dir is None:
-                        spill_dir = Path(scratch.enter_context(TemporaryDirectory(prefix="hmb-render-inputs-")))
-                    staged = spill_dir / str(ordinal)
-                    staged.write_bytes(content)
-                    prepared[key] = (staged, name)
-                del content
-
-            for video in dict.fromkeys(source_key("video", value)[1] for value in videos):
-                if not video.startswith(("http://", "https://", "asset://", "data:")):
-                    self._resolve_local_video_path(video)
-            if ordinal or videos or audio:
+            fields = (("first_frame", "image", images[:1]), ("last_frame", "image", images[1:2]),
+                      ("image_urls", "image", images[2:]), ("video_urls", "video", videos),
+                      ("audio_urls", "audio", audio))
+            local_slots = []
+            remote_slots = []
+            for field, kind, values in fields:
+                selected = (value for value in values if self._has_reference_value(value))
+                for index, value in enumerate(selected):
+                    # Invalid local media should be reported before any remote GET.
+                    try:
+                        raw = str(self._coerce_reference_value(value)).strip()
+                    except (TypeError, ValueError):
+                        raw = ""
+                    slots = remote_slots if raw.startswith(("https://", "http://")) else local_slots
+                    slots.append((field, kind, index, value))
+            for field, kind, index, value in (*local_slots, *remote_slots):
+                try:
+                    key = source_key(kind, value)
+                    if key in prepared:
+                        continue
+                    source = scratch.enter_context(self._cloud_reference_source(kind, value))
+                    if kind == "video":
+                        path = self._resolve_local_video_path(source)
+                        staged = scratch.enter_context(self._reference_video_upload_path(path, model))
+                        prepared[key] = staged, staged.name
+                        continue
+                    if kind == "image":
+                        content, name = self._prepare_cloud_image(source, model, index + 1)
+                    else:
+                        content, name = self._read_cloud_reference_audio(source)
+                        self._check_reference_track(["-f", Path(name).suffix[1:].lower(), "-i", "pipe:0"], "a", content)
+                    if len(content) <= memory_left:
+                        prepared[key] = content, name
+                        memory_left -= len(content)
+                    else:
+                        if spill_dir is None:
+                            spill_dir = Path(scratch.enter_context(TemporaryDirectory(prefix="hmb-render-inputs-")))
+                        staged = spill_dir / str(len(prepared))
+                        staged.write_bytes(content)
+                        prepared[key] = staged, name
+                    del content
+                except (ValueError, OSError, RuntimeError, subprocess.SubprocessError, FileLoadError, httpx.HTTPError) as exc:
+                    if display is None:
+                        display = self._cloud_reference_display_sources(params, include_widget_slots=False)
+                    slot, name = display.get((field, index), (index + 1, "파일명 미제공"))
+                    if name == "파일명 미제공":
+                        with suppress(ValueError, TypeError):
+                            raw = str(self._coerce_reference_value(value))
+                            if not raw.startswith("data:") and "://" not in raw:
+                                basename = raw.replace("\\", "/").rsplit("/", 1)[-1]
+                                if re.fullmatch(r"[\w .()+\[\]-]{1,150}\.[\w]{1,12}", basename):
+                                    name = basename
+                    title = {"first_frame": "첫 프레임", "last_frame": "마지막 프레임",
+                             "image_urls": "참조 이미지", "video_urls": "참조 영상", "audio_urls": "참조 오디오"}[field]
+                    if field.endswith("_urls"):
+                        title = f"{title} {slot}번"
+                    action = self._reference_intake_guidance(kind, exc)
+                    message = f"{title} ({name}) · {action}"
+                    if isinstance(exc, SeedanceImageLimitError):
+                        raise SeedanceImageLimitError(exc.code, message, exc.details) from exc
+                    raise ValueError(message) from exc
+            if prepared:
                 if cloud_driver is _CLOUD_DRIVER_UNSET:
                     cloud_driver = self._create_gt_cloud_storage_driver()
                 if cloud_driver is None:
@@ -13822,28 +13883,27 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
             uploaded: dict[tuple[str, str], str] = {}
 
-            def upload_once(kind: str, value: Any, index: int) -> str:
+            def upload_once(kind: str, value: Any) -> str:
                 key = source_key(kind, value)
                 if key not in uploaded:
-                    if key in prepared:
-                        blob, name = prepared.pop(key)
+                    blob, name = prepared.pop(key)
+                    if kind == "video":
+                        remote = Path("artifact_url_storage") / uuid4().hex / name
+                        self._temporary_video_uploads.append((cloud_driver, remote))
+                        url = self._upload_local_video_to_griptape_cloud(cloud_driver, blob, remote, cloud_proof_v1=cloud_proof_v1)
+                        uploaded[key] = url
+                    else:
                         content = blob.read_bytes() if isinstance(blob, Path) else blob
                         uploaded[key] = self._upload_cloud_reference_bytes(
                             cloud_driver, content, name, cloud_proof_v1=cloud_proof_v1,
                         )
-                    else:
-                        uploaded[key] = self._stage_cloud_reference(
-                            cloud_driver, kind, value, model, index, cloud_proof_v1=cloud_proof_v1,
-                        )
                 return uploaded[key]
 
-            ordinal = 0
             for index, value in enumerate(images):
                 if self._has_reference_value(value):
-                    ordinal += 1
-                    images[index] = upload_once("image", value, ordinal)
-            video_urls = [upload_once("video", value, index) for index, value in enumerate(videos, 1)]
-            audio_urls = [upload_once("audio", value, index) for index, value in enumerate(audio, 1)]
+                    images[index] = upload_once("image", value)
+            video_urls = [upload_once("video", value) for value in videos]
+            audio_urls = [upload_once("audio", value) for value in audio]
         first, last, *references = images
         return dict(
             params, first_frame=first, last_frame=last, reference_images=references,
@@ -13904,29 +13964,29 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     @contextmanager
     def _reference_video_upload_path(path: Path, model_id: Any) -> Iterator[Path]:
         """Make a bounded H.264 upload copy when Ark would need a heavy decode."""
-        if model_id != SEEDANCE_2_5_MODEL_ID:
-            yield path
-            return
         from _hmb_video_tools import _find_ffmpeg, probe_video
 
-        try:
-            metadata = probe_video(path)
-        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-            logger.info("Could not inspect reference video geometry (%s); keeping the original.", type(exc).__name__)
-            yield path
-            return
+        # Select movie demuxers explicitly. FFmpeg can otherwise identify a
+        # renamed still image as a one-frame video, or follow external playlists.
+        formats = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mxf,asf,flv,mpeg,mpegts,mpegvideo,ogg,h264,hevc,ivf"
+        metadata = probe_video(path, allowed_formats=formats)
+        source_args = ["-format_whitelist", formats, "-i", str(path)]
+        stream = f"0:{metadata['video_stream_index']}"
+        HMBSeedanceGeneration._check_reference_track(source_args, "v", stream=stream)
         width, height = metadata["width"], metadata["height"]
         area = width * height
         ratio = width / height
         # Ark's input geometry is independent of the user's selected output resolution.
-        valid_geometry = (
+        valid_geometry = model_id != SEEDANCE_2_5_MODEL_ID or (
             300 <= min(width, height) <= max(width, height) <= 6000
             and 407_696 <= area <= 8_847_360 and .4 <= ratio <= 2.5
         )
         seconds = metadata.get("duration")
-        heavy = bool(seconds and path.stat().st_size * 8 > seconds * SEEDANCE_REFERENCE_VIDEO_COPY_THRESHOLD)
+        heavy = bool(model_id == SEEDANCE_2_5_MODEL_ID and seconds
+                     and path.stat().st_size * 8 > seconds * SEEDANCE_REFERENCE_VIDEO_COPY_THRESHOLD)
         supported_codec = metadata.get("video_codec") in {"h264", "hevc"}
-        if valid_geometry and not heavy and supported_codec and path.suffix.lower() in {".mp4", ".mov"}:
+        movie_container = bool({"mov", "mp4"} & set(metadata["container_format"].split(",")))
+        if valid_geometry and not heavy and supported_codec and movie_container and path.suffix.lower() in {".mp4", ".mov"}:
             yield path
             return
 
@@ -13947,7 +14007,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         with TemporaryDirectory(prefix="hmb-seedance-reference-") as directory:
             prepared = Path(directory) / (path.stem + ".mp4")
             try:
-                subprocess.run([_find_ffmpeg(), "-nostdin", "-v", "error", "-i", str(path),
+                subprocess.run([_find_ffmpeg(), "-nostdin", "-v", "error", "-xerror", "-abort_on", "empty_output",
+                                "-protocol_whitelist", "file,pipe", *source_args,
                                 "-map", f"0:{metadata['video_stream_index']}", "-map", "0:a?", "-vf", frame,
                                 "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
                                 "-maxrate", str(SEEDANCE_REFERENCE_VIDEO_COPY_RATE),
@@ -13955,8 +14016,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                                 "-c:a", "aac", "-movflags", "+faststart", str(prepared)],
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=True, timeout=180)
-            except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                raise LocalReferenceVideoError(f"Could not prepare the Seedance upload copy of {path.name}.") from exc
+            except subprocess.CalledProcessError as exc:
+                raise LocalReferenceVideoError("로컬에서 참조 영상의 업로드 사본을 만들 수 없습니다.") from exc
             yield prepared
 
     @staticmethod
@@ -16573,7 +16634,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 )
                 params = await self._run_blocking_generation_stage(
                     self._prepare_video_references_for_run,
-                    params,
+                    dict(params, _hmb_intake_display_sources=cloud_display_sources),
                 )
                 self._assert_operation_project_selection()
             if not self._runtime_node_is_live(require_registered=True):

@@ -217,7 +217,7 @@ class SeedanceImagePipelineIntegrationRegression(unittest.TestCase):
                 self.assertIs(node.results[-1]["was_successful"], False)
                 message = node.results[-1]["result_details"]
                 self.assertIn("SEEDANCE_IMAGE_PIXEL_LIMIT", message)
-                self.assertIn("Image reference 3 (oversized-background.png)", message)
+                self.assertIn("참조 이미지 3번 (oversized-background.png)", message)
                 self.assertIn("36,997,202", message)
                 self.assertIn("36,000,000", message)
                 messages.append(message)
@@ -258,7 +258,7 @@ class SeedanceImagePipelineIntegrationRegression(unittest.TestCase):
         for node in batch.nodes:
             self.assertIs(node.results[-1]["was_successful"], False)
             self.assertIn("SEEDANCE_IMAGE_INVALID", node.results[-1]["result_details"])
-            self.assertIn("Image reference 3", node.results[-1]["result_details"])
+            self.assertIn("참조 이미지 3번", node.results[-1]["result_details"])
             self.assertEqual(node.bridge.posts, [])
             node._create_gt_cloud_storage_driver.assert_not_called()
 
@@ -271,7 +271,7 @@ class SeedanceImagePipelineIntegrationRegression(unittest.TestCase):
             asyncio.run(batch.execute())
             for node in batch.nodes:
                 self.assertIs(node.results[-1]["was_successful"], False)
-                self.assertIn("Image reference 3 (third-reference.png)", node.results[-1]["result_details"])
+                self.assertIn("참조 이미지 3번 (third-reference.png)", node.results[-1]["result_details"])
                 self.assertEqual(node.bridge.posts, [])
                 node._create_gt_cloud_storage_driver.assert_not_called()
 
