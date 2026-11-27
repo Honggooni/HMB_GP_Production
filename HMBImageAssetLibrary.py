@@ -11389,23 +11389,38 @@ class HMBImageAssetLibrary(DataNode):
         snapshot = _build_shot_routing_snapshot(scoped,
             getattr(self, "_hmb_import_media_by_uid", {}), resolution_cache=cache,
             import_revision=revision, generation=max(1, _non_negative_int(routing["generation"])), normalized=True)
-        actual = snapshot["shots"][0]["selected_source_uids"]
-        if actual != requested:
-            missing = [uid for uid in requested if uid not in snapshot["media_by_source_uid"]]
-            if any(_asset_resolution_cache_key(by_uid[uid], scoped, revision) not in cache for uid in missing):
-                raise _ImageAssetSelectionPreparing("ImageAsset exact Shot media is still preparing.")
-            raise _hmb_shot_routing.ShotImageUnavailable({uid: _clean(by_uid[uid].get("path")) for uid in missing})
-        missing_files = {}
-        for uid in requested:
+        media = snapshot["media_by_source_uid"]
+        resolved_order = snapshot["shots"][0]["selected_source_uids"]
+        if resolved_order != [uid for uid in requested if uid in media] or set(media) != set(resolved_order):
+            raise ValueError("ImageAsset exact Shot media order does not match its selection.")
+        missing_files = {uid: _clean(by_uid[uid].get("path")) for uid in requested if uid not in media}
+        if any(_asset_resolution_cache_key(by_uid[uid], scoped, revision) not in cache for uid in missing_files):
+            raise _ImageAssetSelectionPreparing("ImageAsset exact Shot media is still preparing.")
+        for uid, reference in media.items():
             asset = by_uid[uid]
-            reference = snapshot["media_by_source_uid"][uid]
             if asset.get("source_kind") == "user" and len(reference) <= 4096 and (
                 Path(reference).is_absolute() or reference[:5].lower() == "file:"
                 or re.match(r"^\{[A-Za-z_][A-Za-z0-9_]*\}[/\\]", reference)
-            ) and _resolve_import_file_reference(reference) is None:
-                missing_files[uid] = reference
+            ):
+                local_path = _resolve_import_file_reference(reference)
+                if local_path is None or not local_path.is_file():
+                    missing_files[uid] = reference
         if missing_files:
-            raise _hmb_shot_routing.ShotImageUnavailable(missing_files)
+            dashboard_selection = None
+            if include_link_notices:
+                # Only the dashboard can see the surviving rows while a
+                # sibling is missing. No partial media list crosses this API.
+                metadata = {row["source_uid"]: row["metadata"] for row in snapshot["ordered_assets"]}
+                display_order = [uid for uid in requested if uid not in missing_files]
+                display_order.extend(uid for uid in requested if uid in missing_files)
+                rows = [dict(metadata[uid], selection_order=index) if uid not in missing_files
+                        else {"source_uid": uid, "image_name": by_uid[uid].get("image_name") or uid,
+                              "selection_order": index}
+                        for index, uid in enumerate(display_order, 1)]
+                dashboard_selection = {"channel_uuid": channel, "shot_uuid": target,
+                    "publisher_instance_uuid": routing["publisher_instance_uuid"],
+                    "project_id": scoped.get("project_id"), "ordered_images": rows}
+            raise _hmb_shot_routing.ShotImageUnavailable(missing_files, dashboard_selection=dashboard_selection)
         result = self._hmb_image_shot_snapshot_view(snapshot, scoped=True)
         if include_link_notices:
             return result, selected.get("image_link_notices")
@@ -16584,10 +16599,19 @@ class HMBImageAssetLibrary(DataNode):
             if _import_media_map_identity(media) != _import_media_map_identity(import_media):
                 revision += 1
         state = _normalize_state(state)
+        if current.get("site_selection_memory"):
+            # A reconnected folder can restore a saved selection during the
+            # live merge. Verify the same bookmarked files on this worker.
+            same_project = bool(state.get("project_cache_uid")) and (
+                state["project_cache_uid"] == current.get("project_cache_uid")
+            )
+            _restore_site_selection(state, current, same_project)
         cache: OrderedDict = OrderedDict()
+        # This runs off the editor loop. A disk-backed browse snapshot can
+        # precede the complete catalog; verify its selected registrations now.
         _resolve_selected_assets(
             state, media, resolution_cache=cache, import_revision=revision,
-            force=True, normalized=True,
+            force=True, normalized=True, wait_for_catalog=True,
         )
         return state, media, revision, cache
 

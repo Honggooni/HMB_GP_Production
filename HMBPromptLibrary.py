@@ -11333,6 +11333,31 @@ class HMBPromptLibrary(DataNode):
                 }, current_shot, unavailable=True)
                 if restored and getattr(self, "_hmb_ui_syncing", False):
                     self._hmb_restored_external_rows = restored
+                display = error.dashboard_selection
+                if display is not None:
+                    if (not image_targeted or display["channel_uuid"] != expected_channel
+                            or display["shot_uuid"] != current_shot["shot_uuid"]
+                            or display["publisher_instance_uuid"] != compact_catalog["publisher_instance_uuid"]):
+                        raise _ShotRoutingContractError("Disconnected image rows belong to another Shot.") from error
+                    rows = display["ordered_images"]
+                    previous_missing = {_image_asset_row_uid(row): row for row in normalized["images"]
+                                        if _image_asset_row_uid(row) in error.source_paths}
+                    previous_binding = normalized["image_asset"]
+                    verified = [row for row in rows if row.get("verified_asset")]
+                    normalized = _apply_image_asset_payload(normalized, {
+                        "schema": "hmb-image-asset-library-binding", "mode": "image_asset",
+                        "project_id": display["project_id"], "project_uid": previous_binding.get("project_uid"),
+                        "ordered_images": rows, "verified_assets": verified,
+                    }, connected=True)
+                    # A display-only pass must not replace the last complete
+                    # route proof or discard authored options on a broken row.
+                    for key in ("shot_catalog", "shot_catalog_routing", "shot_routing"):
+                        normalized["image_asset"][key] = previous_binding.get(key)
+                    for index, row in enumerate(normalized["images"]):
+                        previous = previous_missing.get(_image_asset_row_uid(row))
+                        if previous is not None:
+                            normalized["images"][index] = dict(previous, slot=row["slot"],
+                                asset_selection_order=row["asset_selection_order"])
                 _project_unavailable_prompt_images(normalized, error.source_paths)
                 if not any(row.get("asset_source_unavailable") for row in normalized["images"]):
                     raise _ShotRoutingContractError(str(error)) from error
@@ -13526,7 +13551,15 @@ class HMBPromptLibrary(DataNode):
                 serialized_state != state_before_source_sync
             )
             recovered_image_source = any(row.get("asset_source_unavailable") for row in current_state["images"])
-            if (upstream_source_changed or recovered_image_source) and source_application_changed_state:
+            # A late editor echo can restore an empty or older visible list at
+            # the same upstream fingerprint. Publish its repaired row order
+            # with a fresh clock so the widget can acknowledge this update.
+            repaired_image_order = source_application_changed_state and [
+                _image_asset_row_uid(row) for row in state["images"] if row.get("asset_managed")
+            ] != [
+                _image_asset_row_uid(row) for row in current_state["images"] if row.get("asset_managed")
+            ]
+            if (upstream_source_changed or recovered_image_source or repaired_image_order) and source_application_changed_state:
                 state[SOURCE_SYNC_REVISION_KEY] = min(
                     MAX_SOURCE_SYNC_REVISION,
                     source_sync_revision + 1,

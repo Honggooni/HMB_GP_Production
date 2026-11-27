@@ -36,8 +36,11 @@ MAX_SHOTS = 5
 class ShotImageUnavailable(ValueError):
     """The exact Shot exists, but some of its selected image files do not."""
 
-    def __init__(self, source_paths: Mapping[str, str]):
+    def __init__(self, source_paths: Mapping[str, str], *, dashboard_selection: dict | None = None):
         self.source_paths = dict(source_paths)
+        # Optional metadata from the exact same read, exclusively for the
+        # Prompt dashboard. This exception never supplies an execution snapshot.
+        self.dashboard_selection = dashboard_selection
         super().__init__("ImageAsset exact Shot selected image media is unavailable: " + ", ".join(source_paths))
 
 # Management data lives beside the native, fixed-shape Shot identity.  It must

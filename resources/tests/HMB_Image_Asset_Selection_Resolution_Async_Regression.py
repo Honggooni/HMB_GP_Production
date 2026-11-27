@@ -6,10 +6,12 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import threading
 import time
 import unittest
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -358,6 +360,79 @@ class SelectionResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.release.set()
         await asyncio.sleep(0.04)
         self.assertEqual(len(self.published), count)
+
+
+class ReconnectedSiteExecutionTests(unittest.TestCase):
+    def test_restored_selection_is_verified_on_first_run_and_explicit_edits_survive(self):
+        from PIL import Image
+        from _hmb_image_asset_sites import _EXECUTION_WORKSPACE
+
+        with TemporaryDirectory(prefix="hmb-site-execution-") as temp:
+            root = Path(temp)
+            head = root / "projects" / "Example" / "Ai_Ct_image"
+            shared = root / "shared"
+            for folder, name in [(head, "Anchor"), (shared, "Reed")]:
+                (folder / ".json").mkdir(parents=True)
+                Image.new("RGB", (3, 3), "green").save(folder / f"{name}.png")
+                record = {"path": f"{name}.png", "asset_id": name, "image_name": name,
+                          "image_main_type": "Custom / Context", "image_sub_type": "Context"}
+                (folder / ".json/hmb_image_assets.json").write_text(json.dumps({"assets": [record]}), encoding="utf-8")
+            token = _EXECUTION_WORKSPACE.set(root)
+            self.addCleanup(_EXECUTION_WORKSPACE.reset, token)
+            with patch.object(asset, "_ASSET_CATALOG_INDEX_ROOT", root / "index"), \
+                    patch.object(asset, "_LEGACY_CATALOG_INDEX_ROOT", root / "legacy"):
+                profile = asset.save_site_settings(head, [{"id": "shared", "label": "Shared", "root": str(shared)}], "hq", "0")
+                linked = asset._load_project_catalog(head, {})
+                peer = next(row for row in linked["assets"] if row["asset_id"] == "Reed")
+                anchor = next(row for row in linked["assets"] if row["asset_id"] == "Anchor")
+                peer_uid, anchor_uid = peer["source_uid"], anchor["source_uid"]
+                peer.update(selected=True, selection_order=1)
+                linked["shot_routing"]["shots"][0]["selected_source_uids"] = [peer_uid]
+                removed = asset.save_site_settings(head, [], "hq", profile["revision"])
+                offline = asset._load_project_catalog(head, linked)
+                self.assertIn(peer_uid, offline["site_selection_memory"])
+                self.assertFalse(any(row["source_uid"] == peer_uid for row in offline["assets"]))
+                # The catalog is already warm when the saved Shot's membership is restored.
+                asset.save_site_settings(head, profile["links"], "hq", removed["revision"])
+                reopened = asset._load_project_catalog(head, {})
+                reopened["shot_routing"] = deepcopy(offline["shot_routing"])
+                reopened["site_selection_memory"] = deepcopy(offline["site_selection_memory"])
+                self.assertTrue(asset._state_catalog_is_current(reopened, head))
+
+                def execute(state, expected_uids, expected_paths):
+                    worker, media, revision, cache = asset.HMBImageAssetLibrary._prepare_execution_files(
+                        state, str(head), None, {}, 0)
+                    merged = asset._merge_async_scan_result_with_live_state(worker, state, state)
+                    selected = [row for row in merged["assets"] if row["selected"]]
+                    self.assertEqual([row["source_uid"] for row in selected], expected_uids)
+                    self.assertEqual(merged["shot_routing"]["shots"][0]["selected_source_uids"], expected_uids)
+                    for row in selected:
+                        self.assertIn(asset._asset_resolution_cache_key(row, merged, revision), cache,
+                                      "The detached worker must verify the restored row before publication")
+                    result = asset._resolve_selected_assets(merged, media, resolution_cache=cache, import_revision=revision)
+                    self.assertEqual(result["unresolved"], [])
+                    self.assertEqual([Path(row["media"]).resolve() for row in result["resolved"]],
+                                     [path.resolve() for path in expected_paths])
+                    return merged
+
+                current = execute(reopened, [peer_uid], [shared / "Reed.png"])
+                self.assertFalse(current["site_selection_memory"])
+                # Press X on the recovered image and select a different one in the same Shot.
+                toggles = """
+                    import { readFileSync } from 'node:fs';
+                    const { hmbToggleImageAssetShotAsset } = await import(process.argv[1]);
+                    const state = JSON.parse(readFileSync(0, 'utf8'));
+                    for (const uid of process.argv.slice(2)) {
+                        if (!hmbToggleImageAssetShotAsset(state, state.shot_routing.active_shot_uuid, uid))
+                            throw new Error('Shot selection toggle failed');
+                    }
+                    process.stdout.write(JSON.stringify(state));
+                """
+                widget_uri = (ROOT / "widgets/HMBImageAssetLibraryWidget.js").as_uri()
+                changed = subprocess.run(["node", "--input-type=module", "-e", toggles, widget_uri, peer_uid, anchor_uid],
+                                         input=json.dumps(current), text=True, encoding="utf-8", capture_output=True,
+                                         check=True, timeout=20)
+                execute(asset._normalize_state(json.loads(changed.stdout)), [anchor_uid], [head / "Anchor.png"])
 
 
 if __name__ == "__main__":

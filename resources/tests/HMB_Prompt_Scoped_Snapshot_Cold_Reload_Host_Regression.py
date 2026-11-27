@@ -29,7 +29,7 @@ def send(engine, request):
     return result
 
 
-async def exercise(engine):
+async def exercise(engine, *, check_image_repair=False):
     import HMBImageAssetLibrary as images
     import HMBVideoPickerLibrary as pickers
     import HMBPromptLibrary as prompts
@@ -253,6 +253,79 @@ async def exercise(engine):
         assert restored["picker"]["selected_video_count"] == 1
         print("PASS empty Picker preserves 34px Editor measurement without idle writes; real video reselection still publishes")
         print("PASS actual Image/Picker exact readers; 120 alternating views; 10 idle five-view preparations without dashboard writes; five saved generations >100; SDK serialize/delete/cold reload; fresh lower source clocks safely rebase all five exact Prompt/media documents without UI writes")
+        if not check_image_repair:
+            # Other host tests continue using this exact five-page workflow.
+            return
+        # A late empty editor acknowledgement can carry the already-observed
+        # upstream identity. The repaired option rows still need a new UI clock.
+        empty_ack = deepcopy(restored)
+        empty_ack["images"] = [prompts._default_image_item(1)]
+        prompt._hmb_write_merged_prompt_state(prompts._json_dumps(empty_ack))
+        repaired = prompt._write_dashboard_state()
+        assert repaired["images"] == restored["images"]
+        assert repaired[prompts.SOURCE_SYNC_REVISION_KEY] > empty_ack[prompts.SOURCE_SYNC_REVISION_KEY], "Repaired image rows reused the empty editor clock"
+        assert prompt._write_dashboard_state()[prompts.SOURCE_SYNC_REVISION_KEY] == repaired[prompts.SOURCE_SYNC_REVISION_KEY]
+        # Keep one unavailable file in the Shot while selecting three working siblings.
+        # Its UID has never had a visible row on this reopened Prompt page.
+        selected = image._current_state()
+        shot_id = restored["shot"]["shot_uuid"]
+        shot = next(row for row in selected["shot_routing"]["shots"] if row["shot_uuid"] == shot_id)
+        previous_uid = shot["selected_source_uids"][0]
+        available = [previous_uid, *[r["source_uid"] for r in selected["assets"] if r["source_uid"] != previous_uid][:2]]
+        missing_asset = next(row for row in selected["assets"] if row["source_uid"] not in available)
+        missing = missing_asset["source_uid"]
+        missing_asset["path"] = str(Path(os.environ["GTN_CONFIG_WORKSPACE_DIRECTORY"]) / "gone.png")
+        shot["selected_source_uids"] = [missing, *available]
+        shot["revision"] += 1
+        selected["shot_routing"]["generation"] += 1
+        image._publish_state(selected)
+        try:
+            await asyncio.to_thread(image._hmb_shot_routing_snapshot_for, channel_uuid=CHANNEL, shot_uuid=shot_id)
+        except images._hmb_shot_routing.ShotImageUnavailable as error:
+            assert list(error.source_paths) == [missing] and error.dashboard_selection is None
+        else:
+            raise AssertionError("ImageAsset published a local file that no longer exists")
+        dashboard = prompt._write_dashboard_state()
+        actual = [r["asset_source_uid"] for r in dashboard["images"]]
+        assert actual == available + [missing], (actual, available, missing)
+        assert all(row["asset_managed"] and not row.get("asset_source_unavailable") for row in dashboard["images"][:-1])
+        assert dashboard["images"][-1]["asset_source_unavailable"] and prompt._hmb_current_shot_images == []
+        edited = deepcopy(dashboard)
+        edited["images"][0]["owner"] = "Edited while sibling unavailable"
+        edited[prompts.UI_EDIT_REVISION_KEY] += 1
+        send(engine, SetParameterValueRequest(node_name=prompt.name, parameter_name=prompts.WIDGET_PARAMETER_NAME,
+            value=prompts._json_dumps(edited)))
+        edited = prompt._write_dashboard_state()
+        assert edited["images"][0]["owner"] == "Edited while sibling unavailable"
+        try:
+            prompt._compile_current_prompt_pair()
+        except prompts._ShotRoutingContractError as error:
+            assert missing in str(error) or "disconnected image" in str(error)
+        else:
+            raise AssertionError("Mixed selection reached the execution compiler")
+        removed = deepcopy(edited)
+        removed["images"].pop()
+        removed[prompts.UI_EDIT_REVISION_KEY] += 1
+        send(engine, SetParameterValueRequest(node_name=prompt.name, parameter_name=prompts.WIDGET_PARAMETER_NAME,
+            value=prompts._json_dumps(removed)))
+        recovered = prompt._write_dashboard_state()
+        assert [r["asset_source_uid"] for r in recovered["images"]] == available
+        assert not any(r.get("asset_source_unavailable") for r in recovered["images"])
+        assert recovered["images"][0]["owner"] == "Edited while sibling unavailable"
+        assert prompt._hmb_current_shot_images == [f"https://media.invalid/{uid.removeprefix('import:')}.png" for uid in available]
+        build_snapshot = images._build_shot_routing_snapshot
+        def wrong_order(*args, **kwargs):
+            snapshot = build_snapshot(*args, **kwargs)
+            snapshot["shots"][0]["selected_source_uids"].reverse()
+            return snapshot
+        with mock.patch.object(images, "_build_shot_routing_snapshot", wrong_order):
+            try:
+                image._hmb_shot_routing_snapshot_for(channel_uuid=CHANNEL, shot_uuid=shot_id)
+            except ValueError as error:
+                assert "media order" in str(error)
+            else:
+                raise AssertionError("Exact publisher accepted reordered media")
+        print("PASS repaired editor after stale empty acknowledgement; three editable images plus a missing file; fail-closed execution, X dismissal and exact ordered media recovery")
     finally:
         workflow_context.close()
         LibraryRegistry.unregister_library(schema.name, event_manager=engine.event_manager)
@@ -275,7 +348,7 @@ def main():
             stack.enter_context(mock.patch.object(routing, name, lambda *a, **k: False))
         logging.disable(logging.CRITICAL)
         with engine_scope() as engine:
-            asyncio.run(exercise(engine))
+            asyncio.run(exercise(engine, check_image_repair=True))
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ def denied(*args,**kwargs):
     import traceback
     caller=traceback.extract_stack(limit=3)[-2];ATTEMPTS.append((Path(caller.filename).name,caller.name,caller.lineno));raise AssertionError("Inspection must never execute, upload, submit, write or reconcile")
 
-def exact_snapshot(snapshot, *, channel_uuid, shot_uuid, **_kwargs):
+def exact_snapshot(snapshot, *, channel_uuid, shot_uuid, include_link_notices=False, **_kwargs):
     """The cached-media fixture implements both whole and exact-source APIs."""
     assert channel_uuid==snapshot["channel_uuid"]
     result=deepcopy(snapshot)
@@ -36,7 +36,7 @@ def exact_snapshot(snapshot, *, channel_uuid, shot_uuid, **_kwargs):
     if "project_id" in result:keys+=("project_id",)
     result["metadata_sha256"]=digest({key:result[key] for key in keys})
     result["media_sha256"]=digest({"media_descriptors":[{"source_uid":uid,"media_value_sha256":hashlib.sha256(result["media_by_source_uid"][uid].encode()).hexdigest()} for uid in uids]})
-    return result
+    return (result, []) if include_link_notices else result
 
 async def exercise(engine):
     import HMBSeedanceGeneration as seedance

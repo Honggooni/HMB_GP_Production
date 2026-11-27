@@ -430,6 +430,7 @@ jobs:
             "- Color LUT and other Broker clients can check sign-in status without creating a credentials directory on first use.",
             "- ImageAsset checks the local catalog again when a restored project finishes loading. Saved Shot selections can resolve their images after an empty first lookup.",
             "- HMBPrompt preserves authored edits on publisher changes and prevents a delayed acknowledgement from restoring a deselected image.",
+            "- HMBPrompt keeps verified image selections editable when an older update arrives during the same frame, including after removing a disconnected image or selecting the first images in an empty Shot.",
             "- Opening a different workflow with the same Shot UUID loads its own Prompt fields. Pending caret restoration respects the field selected by the user.",
             "- Native Reset follows the selected HMB node on supported Griptape editors. Blender snapshots honor the selected Original, Mask, Depth and Motion Guide passes.",
             "- ImageAsset reuses a project catalog in the local Griptape workspace. Startup and manual refresh check the shared registry. Concurrent Add operations take turns writing to the registry.",

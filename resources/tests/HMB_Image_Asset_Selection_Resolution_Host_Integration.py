@@ -262,14 +262,14 @@ async def check_wired_image_with_existing_shot(workspace):
                 assert preview.size == (32, 24)
                 red, green, blue = preview.convert("RGB").getpixel((16, 12))
                 assert red > 220 and green > 100 and blue < 50
-            await check_repeated_wired_selection(library, downstream, anchor["source_uid"], uid)
+            await check_repeated_wired_selection(library, downstream, anchor["source_uid"], uid, generator, cloud)
             await current_engine().aclose_workflow(library.workflow)
             assert not library._scan_owner_is_current(), "Closed workflow still owns pending execution"
     print("Standard LoadImage -> ImageAsset -> HMBPrompt: macro JPEG, first/repeat Resolve, legacy declaration, "
           "preserved Shot and image order, peer publication, unbound callback, retired workflow PASS")
 
 
-async def check_repeated_wired_selection(library, downstream, anchor, imported):
+async def check_repeated_wired_selection(library, downstream, anchor, imported, generator, cloud):
     import HMBPromptLibrary as prompt
 
     state = library._current_state()
@@ -370,6 +370,56 @@ async def check_repeated_wired_selection(library, downstream, anchor, imported):
         await check_settled(expected)
     await submit([], paged=True)
     await check_settled([])
+    # Start with an empty Shot. Each click must deliver editable rows to Prompt
+    # before another input, then the Generator must use those same three files.
+    for count in (1, 2, 3):
+        chosen = extra[:count]
+        await submit(chosen)
+        await check_settled(chosen)
+        rows = [row for row in downstream._current_state()["images"] if row.get("asset_source_uid")]
+        assert all(row["present"] and row["asset_managed"] and not row.get("asset_source_unavailable")
+                   and row["image_main_type"] == "Custom / Context" and row["image_sub_type"] == "Context"
+                   for row in rows), rows
+    import HMBSeedanceGeneration as seedance
+    params = generator._resolve_exact_shot_generation_inputs({
+        **generator._get_parameters(), "model_id": seedance.SEEDANCE_2_5_MODEL_ID,
+        "duration": 4, "resolution": "480p", "prompt": "Use @image1, @image2 and @image3",
+    })
+    prepared = generator._prepare_video_references_for_run(params, cloud_driver=cloud)
+    urls = generator._build_broker_payload(prepared)["image_urls"]
+    assert [cloud.objects[url] for url in urls] == [Path(source_paths[uid]).read_bytes() for uid in chosen]
+    # The project roster and the local browse index can already be available
+    # while another reader is still preparing the complete project catalog.
+    # Run must verify the three selected registrations without another click.
+    state = library._current_state()
+    catalog_key = asset._session_catalog_key("catalog", state["project_root"])
+    with patch.dict(asset._CATALOG_READS), patch.object(
+        asset, "_read_verified_image_catalog", side_effect=TimeoutError("full catalog busy")
+    ):
+        del asset._CATALOG_READS[catalog_key]
+        await library.aprocess()
+        assert library.parameter_output_values[asset.MEDIA_OUTPUT_PARAMETER] == [source_paths[uid] for uid in chosen]
+    entered, resume = threading.Event(), threading.Event()
+    prepare = library._prepare_execution_files
+    def paused_verification(*args):
+        entered.set()
+        assert resume.wait(5)
+        return prepare(*args)
+
+    with patch.object(library, "_prepare_execution_files", paused_verification):
+        pending = asyncio.create_task(library.aprocess())
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            await submit(chosen[:-1])
+        finally:
+            resume.set()
+        try:
+            await pending
+        except ValueError as error:
+            assert "inputs changed while preparing" in str(error), error
+        else:
+            raise AssertionError("An older Run published after a real selection change")
+    await check_settled(chosen[:-1])
     await submit(initial)
     await check_settled(initial)
     # The file worker may publish a derived cursor while the UI still holds
@@ -382,7 +432,7 @@ async def check_repeated_wired_selection(library, downstream, anchor, imported):
     assert library._current_state()["shot_routing"]["generation"] > observed_generation + 1
     await submit([*initial, extra[0]], observed_generation=observed_generation)
     await check_settled([*initial, extra[0]])
-    print("Repeated SDK selection: 107 compact and paged edits, crossed cursor, exact Prompt rows and matching media PASS")
+    print("Repeated SDK selection: compact and paged edits, crossed cursor, empty Shot to three editable rows and matching Generator bytes PASS")
 
 
 async def main():

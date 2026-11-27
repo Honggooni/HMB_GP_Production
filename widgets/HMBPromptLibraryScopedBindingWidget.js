@@ -3398,8 +3398,23 @@ function hmbCoalescePromptProps(job, nextProps, currentRouting) {
     }
     return;
   }
+  // Apply catalog ordering before source/UI clocks. A stale or contradictory
+  // echo can otherwise evict the only verified selection before its first paint.
+  const priorIsStale = hmbPromptShotCatalogRoutingIsStale(currentRouting, priorRouting);
+  if (hmbPromptShotCatalogRoutingIsStale(currentRouting, nextRouting)
+    || (!priorIsStale && hmbPromptShotCatalogRoutingIsStale(priorRouting, nextRouting))) {
+    job.nextProps = { ...nextProps, value: previous };
+    return;
+  }
+  if (priorIsStale || hmbPromptShotCatalogRoutingIsStale(nextRouting, priorRouting)) {
+    job.nextProps = nextProps;
+    job.uiValue = undefined;
+    return;
+  }
+  // The first body for a source revision owns its rows even before paint,
+  // just as it does after paint. A newer UI edit is merged independently below.
   const newestSource = hmbPromptSerializedRevisionHint(previous, "source_sync_revision")
-    > hmbPromptSerializedRevisionHint(incoming, "source_sync_revision") ? previous : incoming;
+    >= hmbPromptSerializedRevisionHint(incoming, "source_sync_revision") ? previous : incoming;
   const priorUi = job.uiValue ?? previous;
   const priorUiRevision = hmbPromptSerializedRevisionHint(priorUi, UI_EDIT_REVISION_KEY);
   const incomingUiRevision = hmbPromptSerializedRevisionHint(incoming, UI_EDIT_REVISION_KEY);
@@ -8695,9 +8710,16 @@ function hmbNativeUiImplementation(container, props) {
     const desired = imagePreview ? new Map(imagePreview.rows.map(row => [row.source_uid, row])) : null;
     const shown = new Set();
     let verifiedCount = 0;
-    for (const row of body.querySelectorAll("[data-hmb-image-selection-uid]")) {
+    for (const row of body.querySelectorAll(".source-row.image[data-index]")) {
       const uid = row.dataset.hmbImageSelectionUid;
-      if (!uid) continue;
+      if (!uid) {
+        // Clearing the last disconnected source leaves an empty input. A new
+        // selection occupies that slot while its verified rows are in transit.
+        const item = state.images[Number(row.dataset.index)];
+        row.toggleAttribute("data-hmb-image-selection-hidden",
+          Boolean(desired?.size && item && !hasImageMeaning(item)));
+        continue;
+      }
       if (row.classList.contains("active")) verifiedCount++;
       row.toggleAttribute("data-hmb-image-selection-hidden", Boolean(desired && !desired.has(uid)));
       shown.add(uid);

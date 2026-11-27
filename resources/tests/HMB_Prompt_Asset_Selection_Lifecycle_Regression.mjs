@@ -15,6 +15,11 @@ const fixture={multi_shot_enabled:true,shot:shots[0],images:[row("project:hero",
  image_asset:{enabled:true,project_id:"superwings12",selected_assets:1,order_managed:true,ordered_source_uids:["project:hero"],shot_catalog:shots,shot_catalog_routing:{publisher_instance_uuid:channel,channel_uuid:channel,generation:1,metadata_sha256:"a".repeat(64)}}};
 const html=`<!doctype html><meta charset="utf-8"><main class="react-flow"><div class="react-flow__node" data-id="Asset"><div id="asset-widget"></div></div><div class="react-flow__edge" aria-label="Edge from Asset to Prompt" data-id="xy-edge__AssetSHOT_ASSET_OUT-PromptSHOT_ASSET_IN"></div><div id="shell" class="react-flow__node" data-id="Prompt" style="width:980px;height:620px"><div style="height:96px">Native header</div><div id="host"></div></div></main><script type="module">
 import mount,* as widget from '/widget.js';window.widget=widget;window.latest=widget.normalizeState(${JSON.stringify(fixture)});window.writes=0;
+if(location.search==='?empty'){
+ window.latest.images=[{}];
+ Object.assign(window.latest.image_asset,{selected_assets:0,verified_assets:0,ordered_source_uids:[]});
+ window.latest=widget.normalizeState(window.latest);
+}
 window.props=value=>({value:JSON.stringify(value),disabled:false,onChange(next){window.latest=JSON.parse(next);window.writes++;window.controller.update(window.props(window.latest));}});
 window.controller=mount(document.getElementById('host'),window.props(window.latest));window.ready=true;
 window.accept=raw=>{window.latest=widget.normalizeState(raw);window.controller.update(window.props(window.latest));};
@@ -320,6 +325,73 @@ try{
  assert.equal(await page.locator('[data-hmb-image-selection-uid="project:somi"] [data-field="image_main_type"]').count(),1);
  assert.equal(await notice.count(),0);
  assert.equal(await replacementText.inputValue(),'New workspace edit');
+ // Last disconnected row dismissed, followed by multiple newly selected project cards.
+ const reeds=['ReedBed_01','ReedBed_07','ReedBed_08'].map(label=>row('project:'+label,label));
+ await accepted([{...externalImage,asset_source_unavailable:true}]);
+ await brokenRow.locator('.clear-source').click();
+ await page.waitForFunction(()=>!window.latest.images.some(image=>image.asset_source_unavailable));
+ await page.evaluate(images=>window.preview(101,images.map(({asset_source_uid,label})=>({source_uid:asset_source_uid,label}))),reeds);
+ assert.equal(await pending.count(),3);
+ assert.deepEqual(await visibleLabels(),[],'Blank editable placeholders cannot precede the three newly selected cards.');
+ assert.equal(await heading.textContent(),'3 / 50');
+ const queued=await page.evaluate(()=>window.latest.images.filter(item=>item.asset_managed&&item.present).length);
+ assert.equal(queued,0,'Provisional selections cannot become render inputs before source acknowledgement.');
+ await accepted(reeds,{deferDelivery:true});
+ assert.deepEqual(await visibleLabels(),reeds.map(image=>image.label));
+ assert.equal(await pending.count(),0);
+ assert.equal(await page.locator('.source-row.image.active [data-field="image_sub_type"]:visible').count(),3);
+ assert.equal(await page.locator('.source-row.image.active [data-field="owner"]:visible').count(),3);
+ // Start a new Prompt as well. A retained host can echo an obsolete catalog
+ // between scheduling the verified rows and painting them a frame later.
+ await page.goto(`http://127.0.0.1:${server.address().port}/?empty`);
+ await page.waitForFunction(()=>window.ready);
+ for(let index=0;index<reeds.length;index++){
+  await page.evaluate(({images,revision})=>window.preview(revision,images.map(({asset_source_uid,label})=>({source_uid:asset_source_uid,label}))),
+    {images:reeds.slice(0,index+1),revision:index+1});
+  assert.equal(await pending.count(),index+1);
+ }
+ await page.evaluate(images=>{
+  const catalog=window.sourceUpdate(images);
+  catalog.image_asset.shot_catalog[0].selected_source_uids=[...catalog.shot.selected_source_uids];
+  catalog.images=[{}];
+  window.accept(catalog);
+ },reeds);
+ await page.waitForFunction(()=>!document.getElementById('host').__hmbPromptLibrarySourcePropsApply);
+ // A host field change at two unchanged clocks is ambiguous (it may be a
+ // retained echo). Do not manufacture render inputs or dismiss the spinner.
+ await page.evaluate(images=>{
+  const unsequenced=structuredClone(window.latest);
+  unsequenced.images=images;
+  window.controller.update(window.props(unsequenced));
+ },reeds);
+ assert.equal(await pending.count(),3);
+ assert.equal(await page.locator('.source-row.image.active [data-field="owner"]:visible').count(),0);
+ const queuedDeliveries=await page.evaluate(images=>{
+  const host=document.getElementById('host'), callbacks=[];
+  const schedule=host.__hmbPromptLibraryScheduleFrame;
+  host.__hmbPromptLibraryScheduleFrame=cb=>callbacks.push(cb);
+  try{
+   const stale=structuredClone(window.latest);
+   const ready=window.sourceUpdate(images);
+   // Selection hydration completes inside the same verified catalog.
+   ready.image_asset.shot_catalog_routing=structuredClone(stale.image_asset.shot_catalog_routing);
+   window.accept(ready);
+   stale.source_sync_revision=ready.source_sync_revision;
+   window.controller.update(window.props(stale));
+   // A conflicting body at the same catalog generation must never displace
+   // the verified pending body, even if its source clock is just as recent.
+   stale.image_asset.shot_catalog_routing.metadata_sha256='e'.repeat(64);
+   window.controller.update(window.props(stale));
+   const count=callbacks.length;
+   while(callbacks.length)callbacks.shift()();
+   return count;
+  }finally{host.__hmbPromptLibraryScheduleFrame=schedule;}
+ },reeds);
+ assert.ok(queuedDeliveries>0);
+ assert.deepEqual(await visibleLabels(),reeds.map(image=>image.label),
+  'A queued verified source acknowledgement cannot be evicted by a conflicting retained echo.');
+ assert.equal(await pending.count(),0);
+ assert.equal(await page.locator('.source-row.image.active [data-field="image_sub_type"]:visible').count(),3);
  assert.equal(external,0);assert.deepEqual(failures,[]);
- console.log('HMB Prompt Asset selection lifecycle: PASS (same UUID add/remove/reorder, UID/Main/Sub/Color and five documents repaint; unrelated renumber retains UUID/body; one retained editor; Korean draft/caret and stale-echo guard; external0)');
+ console.log('HMB Prompt Asset selection lifecycle: PASS (same UUID add/remove/reorder, UID/Main/Sub/Color and five documents repaint; unrelated renumber retains UUID/body; one retained editor; Korean draft/caret; disconnected X and fresh 0-1-3 selections with deferred, unsequenced and conflicting host echoes; external0)');
 }finally{await browser.close();await new Promise(resolve=>server.close(resolve));}
