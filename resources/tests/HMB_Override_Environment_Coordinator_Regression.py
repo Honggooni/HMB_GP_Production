@@ -186,24 +186,14 @@ class Coordinator(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'escaped'):self.run_coordinator()
         self.assertEqual(len(self.calls),1)
         self.assertEqual(self.member.read_bytes(),self.before)
-    def test_optional_prepare_failure_stays_local_and_single_attempt(self):
-        self.audit['needs_tos_runtime']=True
-        original=self.ns['_hmb_environment_child']
-        done=threading.Event()
-        def child(*args,**kwargs):
-            if args[2]['operation']=='prepare':
-                done.set()
-                raise RuntimeError('offline optional setup')
-            return original(*args,**kwargs)
-        self.ns['_hmb_environment_child']=child
-        self.assertEqual(self.run_coordinator()['status'],'clean')
-        self.assertTrue(done.wait(2))
-        state=self.ns['_hmb_environment_state']()
-        for thread in threading.enumerate():
-            if thread.name=='HMB isolated TOS preparation':thread.join(2)
-        self.assertEqual([job['status'] for job in state.jobs.values()],['pending'])
-        self.assertTrue(self.run_coordinator()['cached'])
-        self.assertEqual(self.member.read_bytes(),self.before)
+    def test_cloud_only_startup_skips_legacy_tos_preparation(self):
+        self.audit['needs_tos_runtime'] = True
+        with mock.patch.object(threading, 'Thread') as background_thread:
+            self.assertEqual(self.run_coordinator()['status'], 'clean')
+            self.assertTrue(self.run_coordinator()['cached'])
+            background_thread.assert_not_called()
+        self.assertEqual([call['operation'] for call in self.calls], ['audit'])
+        self.assertEqual(self.member.read_bytes(), self.before)
     def test_actual_private_child_protocol_and_job(self):
         # Source is fixed fixture code; no SDK, uv, network or filesystem writes.
         node=next(n for n in NODES if isinstance(n,ast.FunctionDef) and n.name=='_hmb_environment_child')

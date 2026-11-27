@@ -408,6 +408,83 @@ class RefreshCleanupRegression(unittest.TestCase):
             self.assertEqual(json.loads(path.read_bytes())["assets"], [self.keep])
             self.assertTrue((path.parents[1] / self.keep["path"]).is_file())
 
+    def test_jettmini_moved_under_default_and_linked_roots_reuses_id_after_one_confirmation(self):
+        from PIL import Image
+        from _hmb_image_asset_sites import _folder_identity
+
+        linked = self.root.parent / "Partner"
+        linked.mkdir()
+        site = _folder_identity(linked)
+        profile = {"revision": "jett-fixture", "write_site_id": "hq",
+                   "links": [{"id": site, "label": "Partner", "root": linked.as_posix()}]}
+        name = "JettMini_ASheet_BoosterOn_"
+        old = f"CH/{name}.png"
+        moved = f"CH/e200/{name}.png"
+        old_deep = "CH/OldTree/variants/lod/Deep.png"
+        new_deep = "CH/e200/variants/lod/Deep.png"
+        deleted = "CH/RemovedTree/variants/lod/Gone.png"
+        sibling = "CH/OldTreeSibling/variants/lod/Keep.png"
+        manifests = []
+        for root in (self.root, linked):
+            for relative in (old, old_deep, deleted, sibling):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (2, 2), "red").save(path)
+            manifest = root / ".json" / self.manifest.name
+            manifest.parent.mkdir(exist_ok=True)
+            manifest.write_text(json.dumps({**self.payload, "assets": [record(old, name), record(old_deep, "Deep"),
+                                record(deleted, "Gone"), record(sibling, "Keep")]}), encoding="utf-8")
+            manifests.append(manifest)
+            (root / moved).parent.mkdir(parents=True)
+            (root / old).rename(root / moved)
+            (root / "CH/OldTree/variants").rename(root / "CH/e200/variants")
+            (root / "CH/OldTree").rmdir()
+            (root / deleted).unlink()
+            for relative in ("CH/RemovedTree/variants/lod", "CH/RemovedTree/variants", "CH/RemovedTree"):
+                (root / relative).rmdir()
+
+        def register(state, relative, title):
+            row = next(row for row in state["assets"] if row["relative_path"] == relative)
+            return library._apply_asset_registration(state, {
+                "request_id": uuid.uuid4().hex, "project_uid": state["project_uid"],
+                "source_kind": "project", "asset_library_id": row["asset_library_id"], "relative_path": relative,
+                "asset_id": title, "image_name": title, "image_main_type": "Character",
+                "image_sub_type": "Full Appearance", "site_settings_revision": profile["revision"],
+            })
+
+        with patch.object(library, "get_site_settings", return_value=profile), \
+             patch.object(library, "_ASSET_CATALOG_INDEX_ROOT", self.root.parent / "local-index"), \
+             patch.object(library, "_ASSET_THUMBNAIL_CACHE_ROOT", self.root.parent / "local-thumbs"), \
+             patch.object(library, "_publish_thumbnail_payload", return_value="memory://jett"):
+            initial = library._load_project_catalog(self.root, library._default_state(), use_shared_cache=False)
+            prefixes = ["", f"site:{site}/"]
+            for prefix in prefixes:
+                with self.assertRaises(library._RegistrationFieldConflict) as collision:
+                    register(initial, prefix + moved, name)
+                self.assertEqual(collision.exception.existing_path, old)
+            before = [file.read_bytes() for file in manifests]
+            node, live, _ = fake_node(initial)
+            node._schedule_project_manifest_refresh(initial, self.root.as_posix(), [])
+            report = finish_worker(node, live)["asset_refresh_review"]
+            self.assertEqual(report["status"], "review", report)
+            self.assertCountEqual(report["missing_paths"], [label + path for label in ("", "Partner / ")
+                                                            for path in (old, old_deep, deleted)])
+            self.assertEqual([file.read_bytes() for file in manifests], before)
+            node._schedule_project_manifest_cleanup(live["state"], {"request_id": report["request_id"]})
+            state = finish_worker(node, live)
+            self.assertEqual(state["asset_refresh_review"]["cleaned_count"], 6, state["asset_refresh_review"])
+            for file in manifests:
+                self.assertEqual(json.loads(file.read_bytes())["assets"], [record(sibling, "Keep")])
+            for prefix in prefixes:
+                for relative, title in ((moved, name), (new_deep, "Deep")):
+                    row = next(r for r in state["assets"] if r["relative_path"] == prefix + relative)
+                    self.assertFalse(row["registered"])
+                    state = register(state, prefix + relative, title)
+            for file in manifests:
+                records = json.loads(file.read_bytes())["assets"]
+                self.assertEqual({r["path"]: r["asset_id"] for r in records},
+                                 {sibling: "Keep", moved: name, new_deep: "Deep"})
+
     def test_incomplete_and_changed_folder_registries_are_preserved(self):
         profile, (default, available, unreadable) = self.linked_refresh_fixture()
         unreadable.write_bytes(b'{"malformed user metadata"')

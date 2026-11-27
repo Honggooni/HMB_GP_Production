@@ -14,6 +14,13 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 
+def assert_conflict_guidance(error, existing_path):
+    for message, phrases in (
+        (str(error), ("already registered", "moved", "Confirm cleanup", "original name and ID", "copied", "unique image name and asset ID")),
+        (error.korean_message(), ("이미 등록", "이동", "‘확인’", "기존 이름과 ID", "복사", "이미지 이름과 에셋 ID")),
+    ):
+        assert existing_path in message and all(phrase in message for phrase in phrases), message
+
 
 def load_module():
     path = ROOT / "HMBImageAssetLibrary.py"
@@ -644,8 +651,9 @@ try:
     duplicate_id["asset_id"] = "ExistingBackground"
     try:
         asset_library._apply_asset_registration(main_only_state, duplicate_id)
-    except ValueError as exc:
-        assert "already registered" in str(exc)
+    except asset_library._RegistrationFieldConflict as exc:
+        assert exc.field == "Asset ID"
+        assert_conflict_guidance(exc, existing_path.relative_to(project_root).as_posix())
     else:
         raise AssertionError("A duplicate registered Asset ID must be rejected.")
     assert manifest_path.read_bytes() == manifest_after_main_only
@@ -844,6 +852,7 @@ try:
         submit(folders[1], stem, live)
     except asset_library._RegistrationFieldConflict as exc:
         assert exc.field == "Image Name" and first["path"] in exc.korean_message() and "이미지 이름" in exc.korean_message()
+        assert_conflict_guidance(exc, first["path"])
     else:
         raise AssertionError("An explicit duplicate must fail without silently renaming it")
     live = submit(folders[1], by_folder[folders[1]]["registration_default_name"], live)

@@ -3239,11 +3239,21 @@ class _RegistrationFieldConflict(ValueError):
         self.field = field
         self.value = value
         self.existing_path = existing_path
-        super().__init__(f"{field} {value!r} is already registered for {existing_path or 'another image'}.")
+        super().__init__(
+            f"{field} {value!r} is already registered for {existing_path or 'another image'}. "
+            "If you moved the file, refresh the library and look for the old path in the missing list. "
+            "Review all missing entries before choosing Confirm cleanup. Then Add the file at its new path using its original name and ID. "
+            "If you copied the file, give the copy a unique image name and asset ID. Its filename can stay the same."
+        )
 
     def korean_message(self) -> str:
         label = "에셋 ID" if self.field == "Asset ID" else "이미지 이름"
-        return f"‘{self.existing_path or '다른 이미지'}’에 이미 등록된 {label}입니다. ‘{self.value}’ 대신 다른 값을 입력하세요."
+        return (
+            f"‘{self.existing_path or '다른 이미지'}’에 이미 등록된 {label} ‘{self.value}’입니다. "
+            "파일을 이동했다면 새로고침하세요. 보고서의 누락 목록에서 이전 경로를 찾고, 정리할 전체 목록을 검토한 뒤 ‘확인’을 누르세요. "
+            "새 경로에서 기존 이름과 ID로 다시 Add하세요. "
+            "파일을 복사했다면 복사본의 이미지 이름과 에셋 ID를 각각 고유한 값으로 등록하세요. 파일명은 그대로 써도 됩니다."
+        )
 
 
 def _write_asset_manifest_record_locked(
