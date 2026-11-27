@@ -469,9 +469,13 @@ class DraftFinalStateSyncTests(unittest.TestCase):
             node.bridge.generate_seedance = mock.Mock(side_effect=AssertionError("Duplicate Final create"))
             # Run the real process until the new authenticated advisory gate.
             node._ensure_broker_connected = mock.AsyncMock(return_value=node.bridge)
-            with fixture.run_boundaries(node):
+            manager = mock.Mock(spec=["check_for_existing_running_flow"])
+            manager.check_for_existing_running_flow.return_value = False
+            with fixture.run_boundaries(node), mock.patch.object(t.GriptapeNodes, "FlowManager", return_value=manager):
                 await node._run_draft_final(node._draft_source_record(), "native-final-click")
+            manager.check_for_existing_running_flow.assert_called()
             node.bridge.generate_seedance.assert_not_called()
+            self.assertTrue(node.opener.calls, node._set_status_results.call_args_list)
             self.assertEqual(node.opener.calls[0][0], "GET")
             self.assertFalse(node._draft_ui_state()["final_visible"])
         asyncio.run(scenario())

@@ -851,8 +851,10 @@ class DraftTests(unittest.TestCase):
         node._prepare_video_references_for_run = mock.Mock(side_effect=AssertionError("media upload"))
         node._resolve_exact_shot_generation_inputs = mock.Mock(side_effect=AssertionError("new inputs"))
         with mock.patch.object(t, "_resolve_mp4_decode_verifier", return_value=SimpleNamespace(executable="fixture", backend="test")), \
+             mock.patch.object(t, "_negotiate_cloud_reference_proof", side_effect=AssertionError("Final must use its existing Draft")) as proof, \
              mock.patch.object(t._review, "capture_inputs", side_effect=AssertionError("media capture")):
             asyncio.run(node._process_generation_impl())
+        proof.assert_not_awaited()
         self.assertEqual(len(node.bridge.posts), 1)
         self.assertEqual(set(node.bridge.posts[0]), {"provider", "model", "draft_job_id", "resolution", "output_format", "project_id", "project_name", "client_request_id"})
         self.assertEqual((node.bridge.posts[0]["resolution"], node.bridge.posts[0]["output_format"]),

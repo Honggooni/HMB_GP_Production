@@ -394,6 +394,8 @@ class MyBoxController:
                     raise ValueError("Private queue source identity changed.")
             else:
                 params = dict(params, video_references=[grant["url"], *params["video_references"]])
+        if await m._negotiate_cloud_reference_proof(getattr(broker, "_bridge", None), origin, params):
+            params = dict(params, _hmb_cloud_reference_proof_v1=True)
         params = await node._run_blocking_generation_stage(node._prepare_video_references_for_run, params)
         self._guard(epoch, origin)
         input_mode = m.TASK_INPUT_MODES[params["task"]]

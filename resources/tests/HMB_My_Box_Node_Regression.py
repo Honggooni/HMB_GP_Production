@@ -7,7 +7,7 @@ boundaries; this script must never connect to an open editor or real Broker.
 from __future__ import annotations
 
 import asyncio
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from copy import deepcopy
 from email.message import Message
 import hashlib
@@ -41,6 +41,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest, DeleteNodeRequest, DeserializeNodeFromCommandsRequest, SerializeNodeToCommandsRequest,
 )
 from griptape_nodes.serialization.values import decode_value
+from _hmb_cloud_proof_fixtures import CloudInputFixture
 
 BASE = 'https://broker.invalid/GripTapeServer'
 WID = 'mbx_' + '1' * 32
@@ -240,6 +241,23 @@ class MyBoxNodeTests(unittest.TestCase):
         return node
     def controller(self, node=None): return (node or self.node)._hmb_my_box_controller()
     def run_node(self, node=None, **kwargs): return asyncio.run(self.controller(node).run(**kwargs))
+    def use_external_video_fixture(self, reference):
+        cloud = CloudInputFixture(self.folder)
+        async def download(url, *, destination, **kwargs):
+            self.assertEqual(url, reference)
+            self.assertEqual(kwargs['media_label'], 'Reference video')
+            destination.write(cloud.video.read_bytes())
+        self.enterContext(mock.patch.object(self.node, '_download_external_media', new=download))
+        self.enterContext(mock.patch.object(self.node, '_create_gt_cloud_storage_driver', return_value=cloud))
+        self.enterContext(mock.patch('_hmb_video_tools.probe_video', return_value={
+            'width': 1280, 'height': 720, 'duration': 4, 'video_codec': 'h264',
+        }))
+        return cloud
+    def assert_uploaded_video(self, cloud, payload, previous_count):
+        self.assertEqual(len(cloud.uploads), previous_count + 1)
+        content, signed_url = cloud.uploads[-1]
+        self.assertEqual(content, cloud.video.read_bytes())
+        self.assertEqual(payload['video_urls'], [signed_url])
     def checkpoint(self, node=None): return self.controller(node).checkpoint()
     def authored(self, node=None):
         node=node or self.node
@@ -279,6 +297,64 @@ class MyBoxNodeTests(unittest.TestCase):
     def test_preflight_has_no_auth_workspace_upload_or_post(self):
         before=self.authored(); self.controller().preflight()
         self.assertEqual(self.authored(),before); self.assertFalse(self.backend.calls)
+
+    def test_cloud_proof_private_submission_retrieve_download_and_final(self):
+        self.backend.enable_final()
+        proof_route = '/api/v1/preflight/griptape-cloud'
+        probes = []
+        ordinary_request = self.backend.bridge._request_json
+        def dispatch(method, path, **kwargs):
+            if path == proof_route:
+                self.assertEqual((method, kwargs['payload']), ('POST', {}))
+                probes.append(path)
+                return {'_http_status': 200, 'provider_submitted': False, 'files': []}
+            return ordinary_request(method, path, **kwargs)
+        self.enterContext(mock.patch.object(self.backend.bridge, '_request_json', side_effect=dispatch))
+        self.enterContext(mock.patch.dict(os.environ, {'HMB_CLOUD_PREFLIGHT_V1_BROKER_URL': self.origin}))
+        for kind in ('references', 'frames', 'text'):
+            with self.subTest(kind=kind):
+                node = self.create('Cloud proof ' + kind)
+                cloud = CloudInputFixture(self.folder)
+                node._create_gt_cloud_storage_driver = mock.Mock(return_value=cloud)
+                node._reference_video_upload_path = lambda path, model: nullcontext(path)
+                if kind == 'frames':
+                    node.set_parameter_value('task', target.TASK_FIRST_LAST_FRAME)
+                    node.set_parameter_value('ratio', 'adaptive')
+                    node.set_parameter_value('first_frame', str(cloud.images[1]))
+                    node.set_parameter_value('last_frame', str(cloud.images[0]))
+                elif kind == 'references':
+                    node.set_parameter_value('task', target.TASK_REFERENCE_TO_VIDEO)
+                    node.set_parameter_value('reference_images', [str(path) for path in (*cloud.images, cloud.images[0])])
+                    node.set_parameter_value(target.VIDEO_REFERENCES_PARAMETER, [str(cloud.video)] * 2)
+                    node.set_parameter_value('reference_audio', [str(cloud.audio)] * 2)
+                before = len(probes)
+                asyncio.run(node._aprocess_impl())
+                file = self.assert_success(node)
+                payload = self.backend.created[-1]
+                self.assertFalse(FORBIDDEN_PROJECT_FIELDS & set(payload))
+                if kind == 'text':
+                    self.assertFalse(cloud.uploads)
+                else:
+                    cloud.assert_payload(self, payload, frames=kind == 'frames')
+                self.assertEqual(len(probes) - before, int(kind != 'text'))
+                if kind == 'references':
+                    # Force an actual original download by removing just the test output.
+                    source_id = self.checkpoint(node)['job_id']
+                    cloud_count, probe_count = len(cloud.uploads), len(probes)
+                    create_count, downloads = len(self.backend.created), len(self.backend.downloads)
+                    file.unlink()
+                    self.run_node(node, refresh=True)
+                    self.assert_success(node)
+                    self.assertEqual(len(self.backend.downloads), downloads + 1)
+                    self.assertEqual(len(self.backend.created), create_count)
+                    self.run_node(node, final=True)
+                    self.assert_success(node)
+                    self.run_node(node, final=True)
+                    self.assertEqual(len(self.backend.created), create_count + 1)
+                    self.assertEqual(self.backend.created[-1]['draft_job_id'], source_id)
+                    self.assertEqual((len(cloud.uploads), len(probes)), (cloud_count, probe_count))
+        ids = [row['client_request_id'] for row in self.backend.created]
+        self.assertEqual(len(set(ids)), len(ids))
     def test_removed_source_field_stays_hidden_after_visibility_refresh(self):
         field=self.node.get_parameter_by_name(controller_module.SOURCE_PARAMETER)
         self.assertTrue(field.hide); self.assertTrue(field.hide_property)
@@ -504,11 +580,12 @@ class MyBoxNodeTests(unittest.TestCase):
         self.node.set_parameter_value('task',target.TASK_VIDEO_EDITING)
         self.node.set_parameter_value(controller_module.SOURCE_PARAMETER,source)
         reference='https://93.184.216.34/synthetic-fixture-only/explicit-source.mp4'
+        cloud = self.use_external_video_fixture(reference)
         self.node.set_parameter_value(target.VIDEO_REFERENCES_PARAMETER,[VideoUrlArtifact(value=reference)])
         self.node.set_parameter_value('draft_action',target.DRAFT_ACTION_OFF)
         self.run_node(); self.assert_success()
         self.assertEqual(len(self.backend.created),2,self.node.parameter_output_values.get('result_details'))
-        self.assertEqual(self.backend.created[-1]['video_urls'],[reference])
+        self.assert_uploaded_video(cloud, self.backend.created[-1], 0)
         self.assertEqual(self.backend.created[-1].get('omni_reference_task_type'),'edit')
         self.assertEqual(self.backend.created[-1]['duration_seconds'],-1)
         self.assertEqual(self.backend.created[-1]['aspect_ratio'],'adaptive')
@@ -538,15 +615,18 @@ class MyBoxNodeTests(unittest.TestCase):
 
     def test_private_payload_keeps_native_subtask_for_all_models_and_tasks(self):
         before=self.authored()
+        reference = 'https://93.184.216.34/synthetic-fixture-only/source.mp4'
+        cloud = self.use_external_video_fixture(reference)
         for model,tasks in target.MODEL_TASK_CHOICES.items():
             for task in tasks:
                 with self.subTest(model=model,task=task):
                     params=self.node._get_parameters()
                     params.update(model_id=model,task=task,output_format='mov' if model==target.SEEDANCE_2_5_MODEL_ID else 'mp4',
-                        _private_source_id='',video_reference_slots=[],video_references=['https://93.184.216.34/synthetic-fixture-only/source.mp4']
+                        _private_source_id='',video_reference_slots=[],video_references=[reference]
                             if task in (target.TASK_REFERENCE_TO_VIDEO,target.TASK_VIDEO_EDITING,target.TASK_VIDEO_EXTENSION) else [],
                         reference_images=[],reference_audio=[],first_frame=None,last_frame=None)
                     frozen=deepcopy(params)
+                    previous_count = len(cloud.uploads)
                     controller=self.controller()
                     payload=asyncio.run(controller._payload(params,protocol.MyBoxBroker(self.backend.bridge),SELECTION,
                         'synthetic-task-map',epoch=controller._epoch,origin=BASE))
@@ -554,6 +634,10 @@ class MyBoxNodeTests(unittest.TestCase):
                     self.assertEqual(payload.get('omni_reference_task_type'),expected)
                     self.assertEqual(payload['hmb_generation_task'],task)
                     self.assertEqual(params,frozen)
+                    if params['video_references']:
+                        self.assert_uploaded_video(cloud, payload, previous_count)
+                    else:
+                        self.assertEqual(len(cloud.uploads), previous_count)
         self.assertEqual(self.authored(),before)
     def test_save_failure_recovers_accepted_task_without_another_create(self):
         with mock.patch.object(self.node,'_atomic_publish_completed_video',new_callable=mock.AsyncMock,
@@ -797,6 +881,8 @@ class MyBoxNodeTests(unittest.TestCase):
         self.assertTrue(self.checkpoint().get('job_id')); self.assertFalse(self.node._execution_succeeded)
         immediate.assert_not_called(); self.assertTrue(deferred.called,'Unconfirmed remote Task references were not retained')
     def test_editing_and_extension_use_explicit_video_after_source_field_removal(self):
+        reference = 'https://93.184.216.34/synthetic-fixture-only/explicit-source.mp4'
+        cloud = self.use_external_video_fixture(reference)
         source='job-mybox-'+'a'*32
         source_payload=dict(provider='volcengine_ark',model=target.SEEDANCE_2_5_MODEL_ID,
             client_request_id='source-request',hmb_generation_task=target.TASK_TEXT_ONLY)
@@ -807,13 +893,13 @@ class MyBoxNodeTests(unittest.TestCase):
                 self.node.set_parameter_value('draft_action',target.DRAFT_ACTION_OFF)
                 self.node.set_parameter_value('resolution','720p')
                 self.node.set_parameter_value(controller_module.SOURCE_PARAMETER,source)
-                reference='https://93.184.216.34/synthetic-fixture-only/explicit-source.mp4'
+                previous_count = len(cloud.uploads)
                 self.node.set_parameter_value(target.VIDEO_REFERENCES_PARAMETER,[VideoUrlArtifact(value=reference)])
                 self.run_node(); self.assert_success()
                 payload=self.backend.created[-1]
                 self.assertEqual(payload.get('omni_reference_task_type'),target.TASK_OMNI_REFERENCE_TYPES[task])
                 self.assertFalse(self.backend.posts('/source-reference'))
-                self.assertEqual(payload['video_urls'],[reference])
+                self.assert_uploaded_video(cloud, payload, previous_count)
                 self.assertFalse(FORBIDDEN_PROJECT_FIELDS & set(payload))
     def test_legacy_foreign_source_is_not_a_hidden_input_for_new_render(self):
         source='job-mybox-'+'b'*32

@@ -3,6 +3,7 @@ from __future__ import annotations
 """Seedance media memory/preflight regression for v0.6.46 local testing."""
 
 import base64
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -35,6 +36,10 @@ sys.modules[SPEC.name] = seedance
 SPEC.loader.exec_module(seedance)
 
 
+def expected_proof(content: bytes) -> str:
+    return f"#hmb-v1={hashlib.sha256(content).hexdigest()}:{len(content)}"
+
+
 def check_seedance_reference_upload_copy():
     from _hmb_video_tools import _find_ffmpeg, probe_video
 
@@ -49,6 +54,16 @@ def check_seedance_reference_upload_copy():
             assert copy != original and copy.name == original.name
             probed = probe_video(copy)
             assert (probed['width'], probed['height'], probed['frame_rate'], probed['duration']) == (854, 480, 24.0, 2.0)
+            transport = object.__new__(seedance.HMBSeedanceGeneration)
+            uploaded = []
+            def upload_file(*, path, file_content, timeout):
+                uploaded.append(file_content)
+                return 'https://storage.example/transcoded.mp4?b=%2f&a=2&a=1'
+            result = transport._upload_local_video_to_griptape_cloud(
+                SimpleNamespace(upload_file=upload_file), copy, Path('probe.mp4'), cloud_proof_v1=True,
+            )
+            assert uploaded == [copy.read_bytes()] and uploaded[0] != original_bytes
+            assert result == 'https://storage.example/transcoded.mp4?b=%2f&a=2&a=1' + expected_proof(uploaded[0])
             with upload_path(copy, seedance.SEEDANCE_2_5_MODEL_ID) as existing:
                 assert existing == copy
         assert not copy.exists() and original.read_bytes() == original_bytes
@@ -205,6 +220,36 @@ with tempfile.TemporaryDirectory() as temporary:
     assert captured["follow_redirects"] is False
     assert captured["trust_env"] is False
 
+    download_url = "https://storage.example/reference.mp4?b=%2f%2B&a=2&a=1&sig=a%2Fb%3D"
+    with (
+        mock.patch.object(seedance.httpx, "request", side_effect=fake_request),
+        mock.patch.object(driver, "create_signed_download_url", return_value=download_url) as sign,
+        mock.patch.object(node, "_iter_local_video_upload_chunks", wraps=node._iter_local_video_upload_chunks) as reads,
+    ):
+        proven = node._upload_local_video_to_griptape_cloud(driver, upload_path, remote_path, cloud_proof_v1=True)
+        reads.assert_called_once_with(upload_path)
+        sign.assert_called_once_with(remote_path)
+    assert proven == download_url + expected_proof(b"".join(captured["chunks"]))
+    assert len(captured["chunks"]) > 1
+
+    def partial_request(*_args, content, **_opts):
+        next(iter(content))
+        return SimpleNamespace(raise_for_status=lambda: None)
+    interrupted_chunks = node._iter_local_video_upload_chunks(upload_path)
+    with (
+        mock.patch.object(seedance.httpx, "request", side_effect=partial_request),
+        mock.patch.object(driver, "create_signed_download_url") as sign,
+        mock.patch.object(node, "_iter_local_video_upload_chunks", return_value=interrupted_chunks),
+    ):
+        try:
+            node._upload_local_video_to_griptape_cloud(driver, upload_path, remote_path, cloud_proof_v1=True)
+        except RuntimeError as exc:
+            assert "complete video reference upload body" in str(exc)
+        else:
+            raise AssertionError("A short signed upload received an evidence fragment")
+        sign.assert_not_called()
+    assert interrupted_chunks.gi_frame is None
+
     # httpx includes a full request URL in status exceptions. Signed Cloud/TOS
     # query credentials must never reach the node's public error/status output.
     signed_query_url = (
@@ -306,6 +351,55 @@ with tempfile.TemporaryDirectory() as temporary:
     assert [upload["file_content"] for upload in cloud_driver.uploads[:3]] == [image_bytes] * 3
     assert cloud_driver.uploads[3]["file_content"] == upload_media
     assert cloud_driver.uploads[-1]["file_content"] == audio
+    assert all("#" not in url for url in urls)
+
+    # Proofs for each slot use the bytes that this driver actually received.
+    # The PNG is converted to a smaller lossless WebP before uploading.
+    proof_driver = LegacyCloudDriver()
+    with (
+        mock.patch.object(seedance, "SEEDANCE_LOSSLESS_PNG_COPY_THRESHOLD", 1),
+        mock.patch.object(cloud_node, "_reference_video_upload_path", side_effect=lambda path, model: nullcontext(path)),
+    ):
+        tested = cloud_node._prepare_video_references_for_run(
+            dict(cloud_params, _hmb_cloud_reference_proof_v1=True), cloud_driver=proof_driver,
+        )
+    assert len(proof_driver.uploads) == 5
+    proofs = []
+    for entry in proof_driver.uploads:
+        path, body = entry["path"], entry["file_content"]
+        url = f"https://storage.example/{path.parent.name}/{path.name}?signed=opaque"
+        proofs.append(url + expected_proof(body))
+    assert tested["first_frame"] == tested["last_frame"] == proofs[0]
+    assert tested["reference_images"] == [proofs[1], proofs[2], proofs[2], proofs[0]]
+    assert tested["video_references"] == [proofs[3], proofs[3]]
+    assert tested["reference_audio"] == [proofs[4], proofs[4]] and proof_driver.uploads[4]["file_content"] == audio
+    for entry in proof_driver.uploads[:3]:
+        assert entry["path"].suffix == ".webp" and entry["file_content"] != image_bytes
+        with Image.open(BytesIO(entry["file_content"])) as packed, Image.open(image_path) as original:
+            assert packed.format == "WEBP" and packed.tobytes() == original.tobytes()
+
+    signed_bytes_driver = SimpleNamespace(
+        create_signed_upload_url=lambda _path: {"method": "PUT", "url": "https://storage.example/upload"},
+        create_signed_download_url=mock.Mock(return_value=download_url),
+    )
+    with mock.patch.object(seedance.httpx, "request") as put:
+        for entry in (proof_driver.uploads[0], proof_driver.uploads[-1]):
+            body = entry["file_content"]
+            result = cloud_node._upload_cloud_reference_bytes(
+                signed_bytes_driver, body, entry["path"].name, cloud_proof_v1=True,
+            )
+            assert put.call_args.kwargs["content"] is body
+            assert put.call_args.kwargs["headers"]["Content-Length"] == str(len(body))
+            assert result == download_url + expected_proof(body)
+        signed_bytes_driver.create_signed_download_url.reset_mock()
+        put.return_value.raise_for_status.side_effect = RuntimeError("simulated HTTP failure")
+        try:
+            cloud_node._upload_cloud_reference_bytes(signed_bytes_driver, audio, "clip.wav", cloud_proof_v1=True)
+        except RuntimeError as exc:
+            assert str(exc) == "simulated HTTP failure"
+        else:
+            raise AssertionError("Failed upload received a signed download URL")
+        signed_bytes_driver.create_signed_download_url.assert_not_called()
     assert cloud_params["reference_images"] == [image_data_uri, remote_image, {"url":remote_image}, {"path":str(image_path)}]
     try:
         cloud_node._prepare_video_references_for_run(cloud_params, cloud_driver=None)

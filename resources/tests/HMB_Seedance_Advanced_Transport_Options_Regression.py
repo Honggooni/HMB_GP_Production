@@ -5,12 +5,17 @@ clean-CI node fixture. No provider, Broker, upload or active workflow is used.
 """
 from __future__ import annotations
 
+import asyncio
+from contextlib import nullcontext
 from copy import deepcopy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 TESTS = Path(__file__).resolve().parent
@@ -24,9 +29,30 @@ fixture = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = fixture
 spec.loader.exec_module(fixture)
 t = fixture.t
+from _hmb_cloud_proof_fixtures import CloudInputFixture
 
 
 class AdvancedTransportOptionsRegression(unittest.TestCase):
+    def test_cloud_proof_requires_the_designated_broker_and_an_empty_authenticated_probe(self):
+        target = "https://test.example/GripTapeTest"
+        bridge = Mock(server_url=target)
+        ref = {"reference_images": ["image.png"]}
+        bridge._request_json.return_value = {"_http_status": 200, "files": [], "provider_submitted": False}
+        probe = t._negotiate_cloud_reference_proof
+        with patch.dict(os.environ, {"HMB_CLOUD_PREFLIGHT_V1_BROKER_URL": target}):
+            self.assertFalse(asyncio.run(probe(bridge, "https://other.example", ref)))
+            self.assertFalse(asyncio.run(probe(bridge, target, {"video_reference_slots": [None, ""]})))
+            bridge._request_json.assert_not_called()
+            self.assertTrue(asyncio.run(probe(bridge, target, ref)))
+            bridge._request_json.assert_called_once_with("POST", "/api/v1/preflight/griptape-cloud", payload={}, timeout=10.0)
+            for changed in ({"_http_status": 204}, {"files": [{}]}, {"provider_submitted": 0}):
+                bridge._request_json.return_value = {"_http_status": 200, "files": [], "provider_submitted": False, **changed}
+                with self.assertRaises(t._BrokerProtocolError):
+                    asyncio.run(probe(bridge, target, ref))
+            bridge._request_json.side_effect = t._BrokerError("Unknown route", status_code=404)
+            with self.assertRaises(t._BrokerError):
+                asyncio.run(probe(bridge, target, ref))
+
     def tearDown(self):
         while fixture.TEMPORARIES:
             fixture.TEMPORARIES.pop().cleanup()
@@ -187,6 +213,52 @@ class AdvancedTransportOptionsRegression(unittest.TestCase):
                          (fixture.JOB, "1080p", "mov"))
         self.assertEqual(node.bridge.posts, [])
         self.assertEqual(node.upload_calls, 0)
+
+    def test_designated_project_posts_proven_media_once_and_retrieves_existing_id(self):
+        origin = 'https://project-fixture.invalid/GripTapeTest'
+        for kind in ('references', 'frames', 'text'):
+            with self.subTest(kind=kind):
+                node = fixture.Node(self.values())
+                node.bridge.server_url = origin
+                node._selected_broker_server_url = lambda: origin
+                cloud = CloudInputFixture(node.base.name)
+                node._create_gt_cloud_storage_driver = Mock(return_value=cloud)
+                node._reference_video_upload_path = lambda path, model: nullcontext(path)
+                node._prepare_video_references_for_run = t.HMBSeedanceGeneration._prepare_video_references_for_run.__get__(node)
+                node.bridge._request_json = Mock(return_value={'_http_status': 200, 'provider_submitted': False, 'files': []})
+                if kind == 'frames':
+                    node.values.update(task=t.TASK_FIRST_LAST_FRAME, input_mode=t.INPUT_MODE_FIRST_LAST_FRAME,
+                                       ratio='adaptive', first_frame=str(cloud.images[1]), last_frame=str(cloud.images[0]))
+                elif kind == 'references':
+                    node.values.update(task=t.TASK_REFERENCE_TO_VIDEO, input_mode=t.INPUT_MODE_MULTIMODAL_REFERENCES,
+                                       reference_images=[str(path) for path in (*cloud.images, cloud.images[0])],
+                                       video_reference_slots=[str(cloud.video)] * 2, reference_audio=[str(cloud.audio)] * 2)
+                selection = {'schema': t.PROJECT_SELECTION_SCHEMA, 'project': deepcopy(fixture.PROJECT)}
+                node._resolve_exact_shot_generation_inputs = lambda values: dict(values, _hmb_imageasset_project_selection=deepcopy(selection))
+                with (
+                    patch.dict(os.environ, {'HMB_CLOUD_PREFLIGHT_V1_BROKER_URL': origin, 'APPDATA': node.base.name}),
+                    patch.object(t._broker_config, 'load_broker_base_url', return_value=origin),
+                    patch.object(t, '_resolve_mp4_decode_verifier', return_value=SimpleNamespace(executable='fixture', backend='test')),
+                    patch.object(node, '_capture_imageasset_project_selection', return_value=selection),
+                    patch.object(t._review, 'capture_inputs', return_value={}),
+                ):
+                    asyncio.run(node._process_generation())
+                    self.assertEqual(len(node.bridge.posts), 1)
+                    payload = node.bridge.posts[0]
+                    if kind == 'text':
+                        node.bridge._request_json.assert_not_called()
+                        self.assertFalse(cloud.uploads)
+                    else:
+                        node.bridge._request_json.assert_called_once_with('POST', '/api/v1/preflight/griptape-cloud', payload={}, timeout=10.0)
+                        cloud.assert_payload(self, payload, frames=kind == 'frames')
+                    job_id = node.saved[-1][0]
+                    node.values['resume_generation_id'] = job_id
+                    node.parameter_values['resume_generation_id'] = job_id
+                    before = len(cloud.uploads), node.bridge._request_json.call_count
+                    asyncio.run(node._process_generation())
+                    self.assertEqual(node.bridge.refresh_ids, [job_id])
+                    self.assertEqual(len(node.bridge.posts), 1)
+                    self.assertEqual((len(cloud.uploads), node.bridge._request_json.call_count), before)
 
 
 if __name__ == "__main__":

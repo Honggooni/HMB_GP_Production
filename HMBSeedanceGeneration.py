@@ -25,15 +25,15 @@ import urllib.error
 import urllib.request
 import webbrowser
 import weakref
-from collections.abc import Iterator
-from contextlib import ExitStack, asynccontextmanager, contextmanager, nullcontext, suppress
+from collections.abc import Generator, Iterator
+from contextlib import ExitStack, asynccontextmanager, closing, contextmanager, nullcontext, suppress
 from copy import copy, deepcopy
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Mapping
-from urllib.parse import quote, urlencode, urljoin, urlparse
+from urllib.parse import quote, unquote, urlencode, urljoin, urlparse
 from uuid import UUID, uuid4
 
 import httpx
@@ -2062,6 +2062,78 @@ class _BrokerUnavailableError(_BrokerError):
     pass
 
 
+class _CloudReferenceCheckError(_BrokerError):
+    """Project only safe, bounded fields from the Broker's Cloud preflight report."""
+
+    limits = {"first_frame": 1, "last_frame": 1, "image_urls": 30, "video_urls": 10, "audio_urls": 10}
+    codes = frozenset({
+        "invalid_cloud_url", "griptape_signed_url_required", "upload_digest_required", "reference_size_limit",
+        "cloud_http_status", "cloud_length_mismatch", "cloud_encoding_invalid", "cloud_sha256_mismatch",
+        "cloud_timeout", "cloud_transport_error", "cloud_request_invalid", "cloud_reference_count",
+        "cloud_preflight_busy",
+    })
+
+    @staticmethod
+    def _metric(value: Any) -> str:
+        return str(value) if type(value) is int and 0 <= value < 10**12 else "미제공"
+
+    @classmethod
+    def from_body(cls, body: bytes, status: int, *, private: bool) -> "_CloudReferenceCheckError | None":
+        try:
+            data = json.loads(body)
+        except (ValueError, UnicodeError, RecursionError):
+            return None
+        code = data.get("error_code") if isinstance(data, dict) else None
+        if not isinstance(code, str) or code not in cls.codes:
+            return None
+        message = f"Griptape Cloud 참조 검사 실패 · {code} (HTTP {status})"
+        error = cls(message, status_code=status)
+        error.rows = []
+        if private:
+            error.args = (message + "\nMy Box는 오류 코드만 제공합니다. 파일별 시도 내역은 이 요청의 브로커 로그에서 확인하세요.",)
+            return error
+        files = data.get("files")
+        for row in files[:50] if isinstance(files, list) else ():
+            if not isinstance(row, dict):
+                continue
+            field, index, attempts = row.get("field"), row.get("index"), row.get("attempts")
+            if (not isinstance(field, str) or field not in cls.limits or type(index) is not int
+                    or not 0 <= index < cls.limits[field] or not isinstance(attempts, list) or not 1 <= len(attempts) <= 2
+                    or not isinstance(attempts[-1], dict) or attempts[-1].get("result") == "ok"):
+                continue
+            for attempt in attempts:
+                if not isinstance(attempt, dict):
+                    continue
+                result = attempt.get("result")
+                if not isinstance(result, str) or result not in cls.codes:
+                    continue
+                if result == "cloud_sha256_mismatch":
+                    stage = "SHA-256 대조"
+                elif type(attempt.get("first_byte_ms")) is int:
+                    stage = "본문 수신"
+                elif type(attempt.get("headers_ms")) is int:
+                    stage = "헤더 수신 후, 첫 바이트 수신 전"
+                else:
+                    stage = "응답 헤더 수신 전"
+                error.rows.append((field, index,
+                    f"{stage} · {result} · 시도 {cls._metric(attempt.get('number'))} · "
+                    f"수신 {cls._metric(attempt.get('bytes'))} B · 소요 {cls._metric(attempt.get('total_ms'))} ms"))
+        if error.rows:
+            error.with_sources({})
+        else:
+            error.args = (message + "\n파일별 내역이 응답에 없습니다. 브로커 로그에서 이 요청을 확인하세요.",)
+        return error
+
+    def with_sources(self, sources: dict) -> None:
+        if self.rows:
+            lines = [str(self).split("\n", 1)[0]]
+            for field, index, detail in self.rows:
+                source = sources.get((field, index))
+                label = f"슬롯 {source[0]} · {source[1]}" if source else "원본 슬롯 미확인"
+                lines.append(f"{field}[{index}] · {label} · {detail}")
+            self.args = ("\n".join(lines),)
+
+
 class _BrokerAuthenticationError(_BrokerError):
     pass
 
@@ -2249,6 +2321,31 @@ def _broker_display_server_url() -> str:
         return _broker_config.load_broker_base_url()
     except (ValueError, OSError):
         return ""
+
+
+async def _negotiate_cloud_reference_proof(bridge: Any, origin: str, params: dict[str, Any]) -> bool:
+    """Enable v1 only for an explicitly upgraded Broker and its authenticated diagnostic route."""
+    target = os.environ.get("HMB_CLOUD_PREFLIGHT_V1_BROKER_URL", "").strip()
+    if not target:
+        return False
+    refs = [params.get("first_frame"), params.get("last_frame")]
+    for field in ("reference_images", "reference_audio", "video_references", "video_reference_slots"):
+        refs.extend(params.get(field) or ())
+    if not any(HMBSeedanceGeneration._has_reference_value(value) for value in refs):
+        return False
+    if _broker_validated_server_url(target) != origin:
+        return False
+    if bridge is None or bridge.server_url != origin:
+        raise _BrokerProtocolError("Cloud reference preflight does not match the selected Broker.")
+    # No URLs in this probe, hence neither Cloud downloads nor provider creates.
+    # Never fall back to an unsigned request if this designated server was rolled back.
+    response = await asyncio.to_thread(
+        bridge._request_json, "POST", "/api/v1/preflight/griptape-cloud", payload={}, timeout=10.0,
+    )
+    if (not isinstance(response, dict) or response.get("_http_status") != 200
+            or response.get("provider_submitted") is not False or response.get("files") != []):
+        raise _BrokerProtocolError("The selected Broker could not confirm Cloud reference preflight v1.")
+    return True
 
 
 def _broker_token_path(*, server_url: str | None = None) -> Path:
@@ -3388,6 +3485,18 @@ class _HMBAIBrokerBridge:
                     status_code=401,
                 ) from exc
             error_body: bytes | None = getattr(exc, "_hmb_interval_response_body", None)
+            if submission and path == "/api/v1/generate/video" and exc.code in {422, 429}:
+                if error_body is None:
+                    try:
+                        error_body = exc.read(self._MAX_ERROR_CLASSIFICATION_BYTES + 1)
+                    except OSError:
+                        error_body = b""
+                if len(error_body) <= self._MAX_ERROR_CLASSIFICATION_BYTES:
+                    cloud_error = _CloudReferenceCheckError.from_body(
+                        error_body, exc.code, private=isinstance(payload, dict) and "my_box_selection" in payload,
+                    )
+                    if cloud_error is not None:
+                        raise cloud_error from None
             if (
                 not submission
                 and method.upper() == "POST"
@@ -9792,28 +9901,19 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
         return removed
 
-    def _get_list_input(self, name: str) -> list[Any]:
+    def _get_list_input(self, name: str, *, include_empty: bool = False) -> list[Any]:
         """Read the current list value, then an older serialized top-level value."""
-        current = [
-            value
-            for value in self._as_list(self.get_parameter_value(name))
-            if self._has_reference_value(value)
-        ]
-        if self._has_incoming_parameter_connection(name):
-            return current
-        if current:
-            return current
-        if name in getattr(self, "_hmb_explicit_list_authority", set()):
-            return []
+        slots = self._as_list(self.get_parameter_value(name))
+        current = [value for value in slots if self._has_reference_value(value)]
+        if (current or self._has_incoming_parameter_connection(name)
+                or name in getattr(self, "_hmb_explicit_list_authority", set())):
+            return slots if include_empty else current
         # Griptape's ParameterList getter (still used by reference_audio) reads
         # child elements and intentionally ignores a former top-level serialized
         # value. Retain that value only for a legacy workflow that has not since
         # authored, connected, or explicitly cleared the current list.
-        return [
-            value
-            for value in self._as_list(self.parameter_values.get(name))
-            if self._has_reference_value(value)
-        ]
+        slots = self._as_list(self.parameter_values.get(name))
+        return slots if include_empty else [value for value in slots if self._has_reference_value(value)]
 
     def _list_input_is_authoritative(self, name: str) -> bool:
         return bool(
@@ -12908,7 +13008,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             ) from exc
 
     @staticmethod
-    def _iter_local_video_upload_chunks(path: Path) -> Iterator[bytes]:
+    def _iter_local_video_upload_chunks(path: Path) -> Generator[bytes, None, None]:
         """Yield one local upload as bounded chunks for signed HTTP storage."""
 
         try:
@@ -13009,7 +13109,22 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         suffix = next(suffix for suffix, candidate in IMAGE_MIME_BY_SUFFIX.items() if candidate == mime)
         return content, mime, path.with_suffix(suffix).name
 
-    def _upload_cloud_reference_bytes(self, driver: Any, content: bytes, filename: str) -> str:
+    @staticmethod
+    def _append_cloud_upload_proof(url: str, digest: str, size: int) -> str:
+        if size <= 0 or "#" in url:
+            raise RuntimeError("Griptape Cloud returned an invalid reference for upload proof.")
+        # The storage signature covers the original query. Do not parse and rebuild it.
+        return f"{url}#hmb-v1={digest}:{size}"
+
+    def _cloud_bytes_download_url(self, value: Any, content: bytes, cloud_proof_v1: bool) -> str:
+        url = self._require_cloud_https_url(value, label="download")
+        if cloud_proof_v1:
+            return self._append_cloud_upload_proof(url, hashlib.sha256(content).hexdigest(), len(content))
+        return url
+
+    def _upload_cloud_reference_bytes(
+        self, driver: Any, content: bytes, filename: str, *, cloud_proof_v1: bool = False,
+    ) -> str:
         remote_path = Path("artifact_url_storage") / uuid4().hex / filename
         self._temporary_video_uploads.append((driver, remote_path))
 
@@ -13021,10 +13136,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 file_content=content,
                 timeout=120.0,
             )
-            return self._require_cloud_https_url(
-                public_url,
-                label="download",
-            )
+            return self._cloud_bytes_download_url(public_url, content, cloud_proof_v1)
 
         upload = create_upload(remote_path)
         if not isinstance(upload, dict):
@@ -13054,16 +13166,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             trust_env=False,
         )
         response.raise_for_status()
-        return self._require_cloud_https_url(
-            create_download(remote_path),
-            label="download",
-        )
+        return self._cloud_bytes_download_url(create_download(remote_path), content, cloud_proof_v1)
 
     def _upload_local_video_to_griptape_cloud(
         self,
         driver: GriptapeCloudStorageDriver,
         local_path: Path,
         remote_path: Path,
+        *,
+        cloud_proof_v1: bool = False,
     ) -> str:
         """Stream through the driver's signed URL, with legacy fallback.
 
@@ -13078,14 +13189,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         create_download = getattr(driver, "create_signed_download_url", None)
         if not callable(create_upload) or not callable(create_download):
             _path, content = self._read_local_video_for_upload(str(local_path))
-            return self._require_cloud_https_url(
-                driver.upload_file(
-                    path=remote_path,
-                    file_content=content,
-                    timeout=120.0,
-                ),
-                label="download",
+            public_url = driver.upload_file(
+                path=remote_path,
+                file_content=content,
+                timeout=120.0,
             )
+            return self._cloud_bytes_download_url(public_url, content, cloud_proof_v1)
 
         upload = create_upload(remote_path)
         if not isinstance(upload, dict):
@@ -13106,21 +13215,36 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             for key, value in dict(upload.get("headers") or {}).items()
             if str(key).lower() != "content-length"
         }
-        headers["Content-Length"] = str(local_path.stat().st_size)
-        response = httpx.request(
-            method,
-            upload_url,
-            content=self._iter_local_video_upload_chunks(local_path),
-            headers=headers,
-            timeout=120.0,
-            follow_redirects=False,
-            trust_env=False,
-        )
+        upload_size = local_path.stat().st_size
+        headers["Content-Length"] = str(upload_size)
+        digest = hashlib.sha256() if cloud_proof_v1 else None
+        consumed_size = 0
+
+        def measured_chunks(chunks: Iterator[bytes]) -> Iterator[bytes]:
+            nonlocal consumed_size
+            assert digest is not None
+            for chunk in chunks:
+                digest.update(chunk)
+                consumed_size += len(chunk)
+                yield chunk
+
+        with closing(self._iter_local_video_upload_chunks(local_path)) as chunks:
+            response = httpx.request(
+                method,
+                upload_url,
+                content=measured_chunks(chunks) if digest is not None else chunks,
+                headers=headers,
+                timeout=120.0,
+                follow_redirects=False,
+                trust_env=False,
+            )
         response.raise_for_status()
-        return self._require_cloud_https_url(
-            create_download(remote_path),
-            label="download",
-        )
+        if digest is not None and consumed_size != upload_size:
+            raise RuntimeError("Griptape Cloud did not receive the complete video reference upload body.")
+        url = self._require_cloud_https_url(create_download(remote_path), label="download")
+        if digest is not None:
+            return self._append_cloud_upload_proof(url, digest.hexdigest(), consumed_size)
+        return url
 
     def _upload_local_video_to_tos(
         self,
@@ -13247,25 +13371,30 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 name = Path(name).with_suffix(".webp").name
         return content, name
 
-    def _stage_cloud_reference(self, driver: Any, kind: str, value: Any, model: str, ordinal: int) -> str:
+    def _stage_cloud_reference(
+        self, driver: Any, kind: str, value: Any, model: str, ordinal: int, *, cloud_proof_v1: bool = False,
+    ) -> str:
         with self._cloud_reference_source(kind, value) as source:
             if kind == "video":
                 path = self._resolve_local_video_path(source)
                 with self._reference_video_upload_path(path, model) as upload_path:
                     key = Path("artifact_url_storage") / uuid4().hex / upload_path.name
                     self._temporary_video_uploads.append((driver, key))
-                    return self._upload_local_video_to_griptape_cloud(driver, upload_path, key)
+                    return self._upload_local_video_to_griptape_cloud(
+                        driver, upload_path, key, cloud_proof_v1=cloud_proof_v1,
+                    )
             if kind == "audio":
                 content, name = self._read_cloud_reference_audio(source)
             else:
                 content, name = self._prepare_cloud_image(source, model, ordinal)
-            return self._upload_cloud_reference_bytes(driver, content, name)
+            return self._upload_cloud_reference_bytes(driver, content, name, cloud_proof_v1=cloud_proof_v1)
 
     def _prepare_video_references_for_run(
         self, params: dict[str, Any], cloud_driver: Any = _CLOUD_DRIVER_UNSET,
     ) -> dict[str, Any]:
         """Stage every client-supplied render file in Cloud before building the Broker request."""
         self._assert_operation_project_selection()
+        cloud_proof_v1 = params.get("_hmb_cloud_reference_proof_v1") is True
         images = [params.get("first_frame"), params.get("last_frame"), *(params.get("reference_images") or [])]
         videos = self._generation_video_reference_values(params)
         audio = params.get("reference_audio") or []
@@ -13322,9 +13451,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     if key in prepared:
                         blob, name = prepared.pop(key)
                         content = blob.read_bytes() if isinstance(blob, Path) else blob
-                        uploaded[key] = self._upload_cloud_reference_bytes(cloud_driver, content, name)
+                        uploaded[key] = self._upload_cloud_reference_bytes(
+                            cloud_driver, content, name, cloud_proof_v1=cloud_proof_v1,
+                        )
                     else:
-                        uploaded[key] = self._stage_cloud_reference(cloud_driver, kind, value, model, index)
+                        uploaded[key] = self._stage_cloud_reference(
+                            cloud_driver, kind, value, model, index, cloud_proof_v1=cloud_proof_v1,
+                        )
                 return uploaded[key]
 
             ordinal = 0
@@ -13343,6 +13476,52 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     def _generation_video_reference_values(self, params: dict[str, Any]) -> list[Any]:
         slots = [value for value in params.get("video_reference_slots") or [] if self._has_reference_value(value)]
         return slots or [value for value in params.get("video_references") or [] if self._has_reference_value(value)]
+
+    def _cloud_reference_display_sources(self, params: dict, *, include_widget_slots: bool = True) -> dict:
+        """Map Broker indices to authored slots without retaining paths, credentials or signed URLs."""
+        videos = params.get("video_reference_slots") or []
+        legacy_video_slots = any(self._has_reference_value(value) for value in videos)
+        if not legacy_video_slots:
+            videos = params.get("video_references") or []
+        list_inputs = {"image_urls": "reference_images", "audio_urls": "reference_audio"}
+        if not legacy_video_slots:
+            list_inputs["video_urls"] = VIDEO_REFERENCES_PARAMETER
+        sources = {}
+        for field, values in (
+            ("first_frame", [params.get("first_frame")]), ("last_frame", [params.get("last_frame")]),
+            ("image_urls", params.get("reference_images") or []), ("video_urls", videos),
+            ("audio_urls", params.get("reference_audio") or []),
+        ):
+            if include_widget_slots and values and field in list_inputs:
+                # The wire array omits empty widget rows. Use the authored slot numbers
+                # only if that widget supplied this exact ordered selection for the shot.
+                slots = self._get_list_input(list_inputs[field], include_empty=True)
+                if len(slots) > len(values) and [v for v in slots if self._has_reference_value(v)] == list(values):
+                    values = slots
+            wire_index = 0
+            for slot, value in enumerate(values, 1):
+                if not self._has_reference_value(value):
+                    continue
+                name = ""
+                try:
+                    raw = str(self._coerce_reference_value(value))
+                    if isinstance(value, dict):
+                        name = value.get("filename") or value.get("file_name") or value.get("name") or ""
+                    if not isinstance(name, str) or not name:
+                        if raw.startswith(("http://", "https://", "asset://")):
+                            name = unquote(urlparse(raw).path.rsplit("/", 1)[-1])
+                        elif not raw.startswith("data:") and "://" not in raw:
+                            name = raw.replace("\\", "/").rsplit("/", 1)[-1]
+                except (ValueError, TypeError, UnicodeError):
+                    name = ""
+                if not isinstance(name, str) or not re.fullmatch(
+                    r"[\w .()+\[\]-]{1,150}\.(?:png|jpe?g|webp|gif|bmp|tiff?|avif|heic|exr|"
+                    r"mp4|mov|m4v|webm|mkv|avi|wav|mp3|aac|flac|m4a|ogg|aiff?)", name, re.IGNORECASE,
+                ):
+                    name = "파일명 미제공"
+                sources[field, wire_index] = (slot, name)
+                wire_index += 1
+        return sources
 
     @staticmethod
     @contextmanager
@@ -16004,6 +16183,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if not self._runtime_node_is_live(require_registered=True):
                 return
             self._set_generation_status("preparing_media", generation_id="")
+            cloud_display_sources = {}
             if not draft_final:
                 self._assert_operation_project_selection()
                 try:
@@ -16012,6 +16192,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     )
                 except (OSError, ValueError, TypeError):
                     self._hmb_review_inputs = {"status": "capture_unavailable"}
+                if await _negotiate_cloud_reference_proof(bridge, broker_origin, params):
+                    params = dict(params, _hmb_cloud_reference_proof_v1=True)
+                cloud_display_sources = self._cloud_reference_display_sources(
+                    params, include_widget_slots=params.get("_hmb_cloud_reference_proof_v1") is True,
+                )
                 params = await self._run_blocking_generation_stage(
                     self._prepare_video_references_for_run,
                     params,
@@ -16155,6 +16340,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 if not self._runtime_node_is_live(require_registered=True):
                     return
                 recovered_task = None
+                if isinstance(exc, _CloudReferenceCheckError):
+                    exc.with_sources(cloud_display_sources)
                 if getattr(exc, "_hmb_web_submission_not_started", False) is True:
                     # The web prepared handshake failed before the normal
                     # create transport. Its provisional key is not a task.

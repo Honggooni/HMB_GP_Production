@@ -156,6 +156,74 @@ class ErrorDetailTests(unittest.TestCase):
         self.assertEqual(len(opener.calls), 1)
         self.assertTrue(opener.calls[0][1].endswith("/job-diag/refresh"))
 
+    def test_cloud_project_files_use_authored_slots_and_do_not_echo_server_values(self):
+        private_url = "https://secret-user:secret-login@private.invalid/folder/두번째.mp4?sig=secret-sig#secret-fragment"
+        node = self.node()
+        sources = node._cloud_reference_display_sources({
+            "first_frame": Path("secret-dir") / "front.png", "last_frame": "data:image/png;base64,c2VjcmV0",
+            "reference_images": [r"C:\secret-dir\Titan.png", r"C:\secret-dir\Titan.png"],
+            "video_reference_slots": [None, private_url], "video_references": ["secret-stale.mov"],
+            "reference_audio": [{"name": "배경.wav", "url": "data:audio/wav;base64,YQ=="}],
+        })
+        self.assertEqual(sources, {("first_frame", 0): (1, "front.png"), ("last_frame", 0): (1, "파일명 미제공"),
+            ("image_urls", 0): (1, "Titan.png"), ("image_urls", 1): (2, "Titan.png"),
+            ("video_urls", 0): (2, "두번째.mp4"), ("audio_urls", 0): (1, "배경.wav")})
+        first = {"number": 1, "bytes": 0, "total_ms": 123, "result": "cloud_timeout"}
+        last = {"number": 2, "bytes": 12345, "headers_ms": 40, "first_byte_ms": 51, "total_ms": 350,
+                "result": "cloud_sha256_mismatch", "detail": private_url, "sha256": "secret-sha"}
+        rows = [{"field": "image_urls", "index": 0, "attempts": [{"result": "ok"}]},
+                {"field": "image_urls", "index": 1, "file": "secret-filename.png", "attempts": [first, last]},
+                {"field": "video_urls", "index": 0, "attempts": [first]},
+                {"field": [], "index": 0, "attempts": [first]},
+                {"field": "audio_urls", "index": True, "attempts": [first]}]
+        opener = FailHTTP(422, {"error_code": "cloud_sha256_mismatch", "files": rows, "detail": private_url})
+        with mock.patch.object(target, "_broker_load_token", return_value="secret-login"):
+            with self.assertRaises(target._CloudReferenceCheckError) as caught:
+                target._HMBAIBrokerBridge(opener=opener)._request_json(
+                    "POST", "/api/v1/generate/video", payload={}, timeout=1, submission=True)
+        caught.exception.with_sources(sources)
+        message = node._safe_exception_message(caught.exception)
+        for expected in ("image_urls[1] · 슬롯 2 · Titan.png", "video_urls[0] · 슬롯 2 · 두번째.mp4",
+                         "응답 헤더 수신 전", "시도 1 · 수신 0 B · 소요 123 ms", "SHA-256 대조",
+                         "시도 2 · 수신 12345 B · 소요 350 ms"):
+            self.assertIn(expected, message)
+        for excluded in ("image_urls[0]", "audio_urls", "secret", "private.invalid", "https://"):
+            self.assertNotIn(excluded, message)
+        self.assertFalse(caught.exception.submission_outcome_unknown)
+        self.assertEqual(len(opener.calls), 1)
+
+    def test_empty_widget_rows_keep_display_slot_numbers_without_changing_the_wire_order(self):
+        node = self.node()
+        slots = {"reference_images": [None, "Titan.png", "", "Titan.png"], "reference_audio": [None, "music.wav"]}
+        with mock.patch.object(node, "get_parameter_value", side_effect=slots.get):
+            sources = node._cloud_reference_display_sources({
+                "reference_images": node._get_list_input("reference_images"),
+                "reference_audio": node._get_list_input("reference_audio"),
+            })
+            self.assertEqual(sources["image_urls", 0], (2, "Titan.png"))
+            self.assertEqual(sources["image_urls", 1], (4, "Titan.png"))
+            self.assertEqual(sources["audio_urls", 0], (2, "music.wav"))
+            shot = node._cloud_reference_display_sources({"reference_images": ["Somi.png"]})
+            self.assertEqual(shot["image_urls", 0], (1, "Somi.png"))
+
+    def test_cloud_code_only_private_and_empty_project_reports_explain_logs(self):
+        for private, status, code in ((True, 422, "cloud_sha256_mismatch"),
+                                      (False, 422, "upload_digest_required"), (False, 429, "cloud_preflight_busy")):
+            with self.subTest(private=private, status=status):
+                opener = FailHTTP(status, {"error_code": code, "error": "private-canary"})
+                with mock.patch.object(target, "_broker_load_token", return_value="fake-token"):
+                    with self.assertRaises(target._CloudReferenceCheckError) as caught:
+                        target._HMBAIBrokerBridge(opener=opener)._request_json(
+                            "POST", "/api/v1/generate/video", payload={"my_box_selection": {}} if private else {},
+                            timeout=1, submission=True)
+                self.assertEqual(caught.exception.status_code, status)
+                self.assertIn(code, str(caught.exception))
+                self.assertIn("브로커 로그", str(caught.exception))
+                self.assertEqual("My Box" in str(caught.exception), private)
+                self.assertNotIn("private-canary", str(caught.exception))
+                self.assertNotIn("슬롯", str(caught.exception))
+                self.assertEqual(len(opener.calls), 1)
+
     def test_refresh_shots_save_diagnostics_without_crossing_tasks(self):
         async def check():
             snapshots = []
@@ -264,6 +332,50 @@ class ErrorDetailTests(unittest.TestCase):
             bridge.refresh_job.assert_not_called()
             keys = [call.args[0]["client_request_id"] for call in bridge.generate_seedance.call_args_list]
             self.assertEqual(len(set(keys)), 2)
+        asyncio.run(check())
+
+    def test_project_run_shows_original_name_after_cloud_staging(self):
+        async def check():
+            node = self.node()
+            node._clear_execution_status = mock.Mock()
+            node._clear_generation_recovery_checkpoint()
+            node._submission_start_is_authorized = lambda **kwargs: True
+            node._output_file = SimpleNamespace(build_file=lambda: object(), _default_filename="output.mp4")
+            node._get_parameters = lambda: {
+                "resume_generation_id": "", "model_id": target.SEEDANCE_2_0_MODEL_ID,
+                target.TASK_PARAMETER: target.TASK_REFERENCE_TO_VIDEO, "output_format": "mp4", "return_last_frame": False,
+                "generation_timeout_seconds": 600, "poll_interval_seconds": 5, "reference_images": ["Titan.png", "Titan.png"],
+            }
+            selection = {"schema": target.PROJECT_SELECTION_SCHEMA,
+                         "project": {"project_id": "superwings12", "project_name": "슈퍼윙즈12"}}
+            node._capture_imageasset_project_selection = lambda: deepcopy(selection)
+            node._manual_agent_prompt_source = lambda: None
+            node._resolve_exact_shot_generation_inputs = lambda p: {
+                **p, **selection["project"], "_hmb_imageasset_project_selection": deepcopy(selection)}
+            node._validate_parameters = lambda p: None
+            node._preflight_output_destination = lambda *args: None
+            node._start_review_case = mock.Mock()
+            staged = ["https://cloud.invalid/secret-blob?sig=secret-signature"] * 2
+            node._prepare_video_references_for_run = lambda p: {**p, "reference_images": staged}
+            node._build_broker_payload = lambda p: {"image_urls": p["reference_images"]}
+            opener = FailHTTP(422, {"error_code": "cloud_length_mismatch", "provider_submitted": False, "files": [
+                {"field": "image_urls", "index": 1, "attempts": [
+                    {"number": 1, "bytes": 4, "total_ms": 15, "first_byte_ms": 2, "result": "cloud_length_mismatch"}]}]})
+            bridge = target._HMBAIBrokerBridge(opener=opener)
+            def submit(payload, *, timeout, **kwargs):
+                self.assertEqual(payload["image_urls"], staged)
+                return bridge._request_json("POST", "/api/v1/generate/video", payload=payload, timeout=timeout, submission=True)
+            node._ensure_broker_connected = mock.AsyncMock(return_value=SimpleNamespace(generate_seedance=submit))
+            with mock.patch.object(target, "_broker_load_token", return_value="secret-login"), \
+                    mock.patch.object(target, "_negotiate_cloud_reference_proof", new_callable=mock.AsyncMock, return_value=True), \
+                    mock.patch.object(target, "_resolve_mp4_decode_verifier", return_value=SimpleNamespace(executable="fake", backend="regression")):
+                await node._aprocess_impl()
+            details = node._set_status_results.call_args.kwargs["result_details"]
+            self.assertIn("image_urls[1] · 슬롯 2 · Titan.png", details)
+            self.assertIn("시도 1 · 수신 4 B · 소요 15 ms", details)
+            self.assertNotIn("secret", details)
+            self.assertNotIn("image_urls[0]", details)
+            self.assertEqual(len(opener.calls), 1)
         asyncio.run(check())
 
     def test_malformed_oversized_and_html_http_bodies_are_bounded(self):

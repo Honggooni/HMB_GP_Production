@@ -7,6 +7,32 @@ bound to the original Broker origin, authenticated account fingerprint and
 client request ID. A validated response from that create or same-key lookup may
 bind its final Task ID once. A new Run or another Shot cannot consume that lease.
 
+## Broker preflight v1
+
+For the staged rollout, set `HMB_CLOUD_PREFLIGHT_V1_BROKER_URL` in the HMB engine
+environment to the exact upgraded Broker base URL, including its gateway prefix.
+Select that Broker in the client. Project and My Box reference submissions first
+send an authenticated empty POST to `/api/v1/preflight/griptape-cloud`. The
+client requires HTTP 200, an empty `files` array and `provider_submitted: false`.
+The empty probe has no media to download. Other Broker addresses use their
+existing reference format. An unavailable designated endpoint blocks the new
+reference submission before upload.
+
+On the designated Broker, the download URL carries
+`#hmb-v1=<sha256>:<bytes>`. Both values describe the uploaded representation.
+The Broker strips the fragment, verifies the file, and passes the signed URL
+on to the provider. The client leaves per-file download retries to the Broker.
+Existing job lookup, result download and Draft-ID-only Final keep their original
+request paths.
+
+Coordinate the production switch with the Broker owner. Deploy support for
+both client formats on every routed worker and verify the diagnostic route
+through the gateway. Then enable the exact production origin on upgraded
+clients. Enforce v1 after upgrading remaining clients and accounting for queued
+legacy reference jobs. A strict-only Broker like the initial TEST build needs
+a coordinated cutover that keeps old clients and queued legacy creates off
+that route. Keep status and result retrieval available throughout.
+
 Cleanup authority also follows the exact authenticated HTTP response. A bearer
 change, sign-out, failed token load or stale response invalidates the private
 account evidence. A bounded, process-only response proof crosses validated My

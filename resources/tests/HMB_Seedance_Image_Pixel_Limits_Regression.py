@@ -193,7 +193,7 @@ class SeedanceImagePipelineIntegrationRegression(unittest.TestCase):
             # Use a content digest to verify the bytes supplied to Cloud without a network call.
             node._prepare_video_references_for_run = target.HMBSeedanceGeneration._prepare_video_references_for_run.__get__(node)
             node._create_gt_cloud_storage_driver = unittest.mock.Mock(return_value=object())
-            node._upload_cloud_reference_bytes = lambda driver, content, name: "https://storage.example/" + hashlib.sha256(content).hexdigest()
+            node._upload_cloud_reference_bytes = lambda driver, content, name, **_opts: "https://storage.example/" + hashlib.sha256(content).hexdigest()
             node.bridge.require_seedance_features = unittest.mock.Mock(
                 side_effect=lambda *, output_format, **_features: output_format,
             )
