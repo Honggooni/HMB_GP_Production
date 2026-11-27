@@ -142,6 +142,17 @@ large = initialize_detached_image_asset(hot, images, state=large, name="ImageAss
 assert large[images.WIDGET_RUNTIME_LEASE_KEY] == hot._hmb_widget_runtime_lease
 native = {"value": hot._hmb_last_accepted_widget_state}
 with mock.patch.object(images,"_get_parameter_raw",side_effect=lambda _node,_name:native["value"]):
+    # A peer gets a detached selection, while every changed native value
+    # (including same-count replacement selections) invalidates that view.
+    view = hot._selected_routing_state()
+    expected_uids = [row["source_uid"] for row in large["assets"] if row["selected"]]
+    assert [row["source_uid"] for row in view["assets"]] == expected_uids
+    view["assets"].clear()
+    view["shot_routing"]["shots"].clear()
+    with mock.patch.object(images, "_normalize_state", side_effect=AssertionError("redundant catalog read")):
+        cached = hot._selected_routing_state()
+        assert len(cached["shot_routing"]["shots"]) == 5
+        assert [row["source_uid"] for row in cached["assets"]] == expected_uids
     with mock.patch.object(images,"_normalize_state",wraps=images._normalize_state) as normalize:
         started = time.perf_counter()
         for _ in range(100):
@@ -154,6 +165,7 @@ with mock.patch.object(images,"_get_parameter_raw",side_effect=lambda _node,_nam
     changed = deepcopy(large)
     changed["shot_routing"]["active_shot_uuid"] = shots[3]["shot_uuid"]
     native["value"] = images._json_text(changed)
+    assert hot._selected_routing_state()["shot_routing"]["active_shot_uuid"] == shots[3]["shot_uuid"]
     with mock.patch.object(images,"_normalize_state",wraps=images._normalize_state) as normalize:
         assert hot._hmb_shot_channel_subscription()["shot_uuid"] == shots[3]["shot_uuid"]
         assert normalize.call_count == 1

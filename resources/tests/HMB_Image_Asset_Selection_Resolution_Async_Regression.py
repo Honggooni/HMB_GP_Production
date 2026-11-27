@@ -143,6 +143,19 @@ class SelectionResolutionTests(unittest.IsolatedAsyncioTestCase):
         node._sync_output(state)
         self.assertEqual(len(self.reads), count)
 
+    async def test_slow_registry_does_not_publish_missing_or_poll_itself(self):
+        node, live = fake_node(selected_state())
+        with patch.object(asset, "_read_asset_manifest", side_effect=TimeoutError("share busy")) as read:
+            node._sync_output(live["state"])
+            await self.wait_until(lambda: read.called and not node._hmb_selection_resolution_work["active"])
+            await asyncio.sleep(0.08)
+            self.assertEqual(read.call_count, 1)
+            self.assertEqual(self.published, [])
+        self.release.set()
+        node._sync_output(live["state"])
+        await self.wait_until(lambda: bool(self.published))
+        self.assertEqual(self.published[-1][1], [live["state"]["assets"][0]["path"]])
+
     async def test_folder_refresh_verifies_only_new_shot_image_and_publishes_before_completion(self):
         node, live = fake_node(selected_state("A"))
         self.release.set()
@@ -235,6 +248,16 @@ class SelectionResolutionTests(unittest.IsolatedAsyncioTestCase):
                 node._sync_output(live["state"])
             await self.wait_until(lambda: self.published[-1][1] == [state["assets"][0]["path"]])
             self.assertEqual(len(checks), first_checks + 1)
+
+    async def test_transient_file_probe_recovers_without_another_selection(self):
+        node, live = fake_node(selected_state("A"))
+        self.release.set()
+        checks = [asset._ImageAssetSelectionPreparing("share timed out"), "A.png"]
+        with patch.object(asset, "_verified_project_relative_path", side_effect=checks) as verify:
+            node._sync_output(live["state"])
+            await self.wait_until(lambda: bool(self.published))
+        self.assertEqual(verify.call_count, 2)
+        self.assertEqual([media for _, media in self.published], [[live["state"]["assets"][0]["path"]]])
 
     async def test_rapid_selection_keeps_only_latest_queued_click(self):
         node, live = fake_node(selected_state("A"))

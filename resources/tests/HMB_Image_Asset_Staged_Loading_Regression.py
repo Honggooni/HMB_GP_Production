@@ -1270,10 +1270,11 @@ try:
         else []
     )
     flight_sync_calls = []
-    flight_node._sync_output = lambda state: (
-        flight_sync_calls.append(asset_library._normalize_state(state))
-        or asset_library._normalize_state(state)
-    )
+    def capture_flight_sync(state, *, normalized=False):
+        captured = state if normalized else asset_library._normalize_state(state)
+        flight_sync_calls.append(captured)
+        return captured
+    flight_node._sync_output = capture_flight_sync
     flight_node._hmb_last_reconciled_shot_catalog_identity = ""
     flight_node._reconcile_hmb_shot_routing = lambda *_args: None
 
@@ -1636,6 +1637,10 @@ try:
         asset_library, "_scan_project_assets", side_effect=held_project_scan
     ), patch.object(asset_library, "_catalog_read_once", observed_read), ThreadPoolExecutor(max_workers=3) as executor:
         worker = asset_library.HMBImageAssetLibrary.start_catalog_warmup(threading.Event())
+        worker.join(5)
+        assert not worker.is_alive() and not scans, "Startup read images from an unopened project"
+        roster = asset_library._discover_shared_image_projects(projects)
+        first_open = executor.submit(asset_library._read_selected_image_catalog, roster, roster["projects"][0], {})
         try:
             assert started.wait(5)
             cache = OrderedDict()
@@ -1663,8 +1668,7 @@ try:
             assert b["project_id"] == "B" and b["shot_routing"] == saved_workflows[1]["shot_routing"]
         finally:
             resume.set()
-            worker.join(10)
-        assert not worker.is_alive()
+        assert first_open.result(timeout=5)["project_id"] == "A"
         assert a.result(timeout=5)["shot_routing"] == saved_workflows[0]["shot_routing"]
         assert [row["source_uid"] for row in ready["resolved"]] == requested
         assert Path(ready["resolved"][0]["media"]).samefile(projects / "A" / "Ai_Ct_image" / "Hero.png")

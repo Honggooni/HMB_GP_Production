@@ -398,6 +398,8 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- ImageAsset dispatches selection changes on the next editor turn. HMBPrompt reuses the selected Shot rows and a brief shared-folder read failure can recover without a second click.",
+            "",
             "- Registering the same external image repeatedly in the same shared folder reuses its registration. Refresh preserves the selected Shot image and picks up registrations from other workstations.",
             "- For Project and My Box references, the client checks the official Broker's supported upload format before transfer. A compatible Broker receives the SHA-256 and length of the actual uploaded bytes.",
             "",

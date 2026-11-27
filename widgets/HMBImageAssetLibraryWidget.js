@@ -298,7 +298,6 @@ const DEFAULT_FOLDER_LABEL = "Ai_Ct_image";
 const IMAGE_ASSET_STATE_VERSION = 4;
 const IMAGE_TAXONOMY_SCHEMA = "hmb-image-taxonomy";
 const IMAGE_TAXONOMY_VERSION = 3;
-const IMAGE_ASSET_SELECTION_COMMIT_FALLBACK_MS = 120;
 const IMAGE_ASSET_ECHO_EXPIRY_MS = 1500;
 // Search covers the complete in-memory catalog, but foreground DOM work stays
 // bounded for projects containing thousands of images.
@@ -5473,14 +5472,12 @@ function hmbCancelImageAssetSelectionJobHandles(job) {
     try { clearTimeout(job.fallbackTimer); } catch (_error) {}
   }
   if (typeof cancelAnimationFrame === "function") {
-    [job.firstFrame, job.secondFrame].forEach((handle) => {
-      if (handle == null) return;
-      try { cancelAnimationFrame(handle); } catch (_error) {}
-    });
+    if (job.firstFrame != null) {
+      try { cancelAnimationFrame(job.firstFrame); } catch (_error) {}
+    }
   }
   job.fallbackTimer = null;
   job.firstFrame = null;
-  job.secondFrame = null;
 }
 
 function hmbSettleImageAssetSelectionCommit(container, job, publish) {
@@ -5530,23 +5527,18 @@ export function hmbScheduleImageAssetSelectionCommit(container, commit) {
     commit,
     settled: false,
     firstFrame: null,
-    secondFrame: null,
     fallbackTimer: null,
   };
   container.__hmbImageAssetSelectionCommitJob = job;
   container.__hmbImageAssetSelectionCommitPending = true;
   const run = () => hmbSettleImageAssetSelectionCommit(container, job, true);
   if (typeof setTimeout === "function") {
-    // requestAnimationFrame can stop entirely in a background tab. The bounded
-    // fallback preserves the click even when no paint callbacks are delivered.
-    job.fallbackTimer = setTimeout(run, IMAGE_ASSET_SELECTION_COMMIT_FALLBACK_MS);
+    // Selection feedback was applied by the input handler. Dispatch on the
+    // next turn even when the editor throttles or suspends animation frames.
+    job.fallbackTimer = setTimeout(run, 0);
   }
   if (typeof requestAnimationFrame === "function") {
-    // The first frame paints local card/tray feedback; the second publishes.
-    job.firstFrame = requestAnimationFrame(() => {
-      if (job.settled || container.__hmbImageAssetSelectionCommitJob !== job) return;
-      job.secondFrame = requestAnimationFrame(run);
-    });
+    job.firstFrame = requestAnimationFrame(run);
   } else if (job.fallbackTimer == null) {
     run();
   }

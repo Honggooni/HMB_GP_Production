@@ -2492,15 +2492,26 @@ def _verified_project_relative_path(
         site, site_rel = _site_location(asset.get("relative_path"))
         resolved_root = (_site_root(root, get_site_settings(root), site) if site != "hq"
                          else _resolve_image_path(root))
-        resolved_path = _resolve_image_path(path)
+        # A linked root is verified as a physical UNC by _site_root. The
+        # browse cache deliberately restores the user's mapped-drive path.
+        resolved_path = path.resolve(strict=True) if site != "hq" else _resolve_image_path(path)
         relative = resolved_path.relative_to(resolved_root)
         identity = _site_project_key(project_id, site)
-    except Exception:
+        facts = resolved_path.lstat()
+    except (OSError, ValueError) as exc:
+        failure = exc.__cause__ if isinstance(exc.__cause__, OSError) else exc
+        if (isinstance(failure, (TimeoutError, ConnectionError))
+                or getattr(failure, "winerror", None) in {32, 33, 53, 59, 64, 121, 1231, 1232}
+                or getattr(failure, "errno", None) in {errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH}):
+            raise _ImageAssetSelectionPreparing("등록 이미지의 공유 폴더 응답을 기다리고 있습니다.") from exc
+        return ""
+    except RuntimeError:
+        # pathlib reports a symlink loop as RuntimeError on older Pythons.
         return ""
     if (
-        not resolved_path.is_file()
+        not stat.S_ISREG(facts.st_mode)
         or resolved_path.suffix.casefold() not in IMAGE_EXTENSIONS
-        or _is_reparse_point(resolved_path)
+        or getattr(facts, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
     ):
         return ""
     relative_text = relative.as_posix()
@@ -3390,6 +3401,8 @@ def _read_asset_manifest(root: Path, *, signature: str = "") -> Dict[str, Dict[s
             if manifest_path.stat().st_size > 2 * 1024 * 1024:
                 raise ValueError("Image asset manifest exceeds 2 MiB.")
             payload = json.loads(_read_shared_manifest_bytes(manifest_path).decode("utf-8"))
+        except OSError:
+            raise
         except Exception as exc:
             raise ValueError(f"Unable to read {manifest_path.name}: {exc}") from exc
         records = payload.get("assets") if isinstance(payload, dict) else payload
@@ -3824,7 +3837,11 @@ def _read_selection_registrations(root, selected):
         try:
             physical = _site_root(root, settings, site)
             entries = _read_asset_manifest(physical)
-        except (OSError, ValueError):
+        except OSError as exc:
+            raise _ImageAssetSelectionPreparing("등록 폴더를 읽을 수 없어 이미지 확인을 기다리고 있습니다.") from exc
+        except ValueError as exc:
+            if isinstance(exc.__cause__, OSError):
+                raise _ImageAssetSelectionPreparing("등록 폴더 연결을 확인하는 중입니다.") from exc
             continue
         prefix = "" if site == "hq" else f"site:{site}/"
         for relative in wanted & entries.keys():
@@ -3841,17 +3858,14 @@ def _manifest_for_selection(root, selected, *, catalog_root=None, wait_for_catal
         pinned = _CATALOG_READS.get(key)
         session_started = roster_key in _CATALOG_SESSION_LOCKS
         roster = _CATALOG_READS.get(roster_key)
-    if pinned is not None:
-        if pinned.exception() is not None:
-            return {}
+    if pinned is not None and pinned.exception() is None:
         facts = pinned.result()
-    elif session_started:
-        if roster is None and not wait_for_catalog:
+    elif session_started or pinned is not None:
+        if roster is None and (not wait_for_catalog or not catalog_root):
             raise _ImageAssetSelectionPreparing("ImageAsset project registrations are still preparing.")
         try:
             catalog = roster.result() if roster is not None else _discover_shared_image_projects(catalog_root)
-            project = next((row for row in catalog["projects"]
-                            if _session_catalog_key("catalog", row["path"]) == key), None)
+            project = next((row for row in catalog["projects"] if Path(row["path"]) == root), None)
             if project is None:
                 return {}
             if not wait_for_catalog:
@@ -3860,7 +3874,7 @@ def _manifest_for_selection(root, selected, *, catalog_root=None, wait_for_catal
             # while another thread hydrates the browse catalog. The latter may
             # be opening image headers for hundreds of unrelated files.
             return _read_selection_registrations(Path(project["path"]), selected)
-        except TimeoutError as exc:
+        except OSError as exc:
             raise _ImageAssetSelectionPreparing("ImageAsset project registrations are still preparing.") from exc
     else:
         return _read_selection_registrations(root, selected)
@@ -5504,6 +5518,7 @@ def _merge_async_scan_result_with_live_state(
     scan_result: Dict[str, Any],
     scan_base: Dict[str, Any],
     live_state: Dict[str, Any],
+    *, normalized: bool = False,
 ) -> Dict[str, Any]:
     """Merge filesystem authority without rolling back in-flight UI edits.
 
@@ -5513,9 +5528,9 @@ def _merge_async_scan_result_with_live_state(
     them when the generation completes.
     """
 
-    scanned = _normalize_state(scan_result)
-    base = _normalize_state(scan_base)
-    live = _normalize_state(live_state)
+    scanned = dict(scan_result) if normalized else _normalize_state(scan_result)
+    base = scan_base if normalized else _normalize_state(scan_base)
+    live = live_state if normalized else _normalize_state(live_state)
     live_revision = live.get("site_catalog_revision")
     if (live_revision and scanned.get("site_catalog_revision") != live_revision and live.get("project_root")
             and live["project_root"] == scanned.get("project_root") and base.get("site_catalog_revision") != live_revision
@@ -5697,10 +5712,11 @@ def _shared_catalog_cache_key(state: Dict[str, Any]) -> tuple[str, str, str] | N
     return uid, manifest_signature, folder_signature
 
 
-def _shared_catalog_snapshot(state: Dict[str, Any], *, registry_defaults: bool = False) -> Dict[str, Any]:
+def _shared_catalog_snapshot(state: Dict[str, Any], *, registry_defaults: bool = False,
+                             normalized: bool = False) -> Dict[str, Any]:
     """Copy project catalog authority without copying any Shot/UI selection."""
 
-    normalized = _normalize_state(state)
+    normalized = state if normalized else _normalize_state(state)
     assets: List[Dict[str, Any]] = []
     for raw_asset in normalized["assets"]:
         if (_clean(raw_asset.get("source_kind")).casefold() != "project"
@@ -5740,7 +5756,7 @@ def _store_shared_catalog_snapshot(
     key = _shared_catalog_cache_key(normalized_state)
     if key is None or _clean(normalized_state.get("error")):
         return
-    snapshot = _shared_catalog_snapshot(normalized_state)
+    snapshot = _shared_catalog_snapshot(normalized_state, normalized=True)
     root_key = _clean(snapshot.get("project_root")).replace("\\", "/").casefold()
     with _SHARED_CATALOG_CACHE_LOCK:
         _SHARED_CATALOG_CACHE[key] = snapshot
@@ -8792,14 +8808,24 @@ def _resolve_selected_assets(
                         # One failed shared-manifest read invalidates all project
                         # selections in this immutable resolution snapshot.
                         manifest_records = {}
+                file_pending = False
                 if manifest_records:
-                    relative_path = _verified_project_relative_path(asset, normalized, manifest_records)
-                    if not relative_path and wait_for_catalog:
-                        verified_asset, relative_path = _revalidate_saved_registration(asset, normalized, manifest_records)
+                    # A transient file probe after reading a valid registry is
+                    # not evidence of a deleted source. The verification worker
+                    # can repeat that probe once, without rescanning the catalog.
+                    for _ in range(2 if wait_for_catalog else 1):
+                        try:
+                            relative_path = _verified_project_relative_path(asset, normalized, manifest_records)
+                            if not relative_path and wait_for_catalog:
+                                verified_asset, relative_path = _revalidate_saved_registration(asset, normalized, manifest_records)
+                            file_pending = False
+                            break
+                        except _ImageAssetSelectionPreparing:
+                            file_pending = True
                 if relative_path:
                     media_value = _resolved_media_value(verified_asset.get("path"))
                 else:
-                    reason = "project_catalog_preparing" if manifest_pending else "project_asset_verification_failed"
+                    reason = "project_catalog_preparing" if manifest_pending or file_pending else "project_asset_verification_failed"
             else:
                 media_value = _resolved_media_value(asset.get("path"))
                 if not media_value:
@@ -10403,12 +10429,12 @@ class HMBImageAssetLibrary(DataNode):
 
     @staticmethod
     def start_catalog_warmup(stop: threading.Event) -> threading.Thread:
-        """Prepare catalog metadata at editor startup, independently of any node."""
+        """Discover available projects; opening a project owns its asset scan."""
         root = DEFAULT_PROJECTS_ROOT
 
         def prepare() -> None:
             started = time.monotonic()
-            completed = failures = asset_count = 0
+            discovered = failures = 0
             _LOGGER.info("[HMB_IMAGE_CATALOG_WARMUP] started root=%s", root)
             try:
                 catalog = _discover_shared_image_projects(root)
@@ -10416,23 +10442,14 @@ class HMBImageAssetLibrary(DataNode):
                     return
                 with _SHARED_CATALOG_CACHE_LOCK:
                     _WARM_PROJECT_LIST.update(catalog)
-                for project in catalog["projects"]:
-                    if stop.is_set():
-                        break
-                    try:
-                        state = _read_selected_image_catalog(catalog, project, {})
-                        completed += 1
-                        asset_count += len(state["assets"])
-                    except Exception as exc:
-                        failures += 1
-                        _diagnostic_warning("Startup image project read", exc)
+                discovered = len(catalog["projects"])
             except Exception as exc:
                 failures += 1
                 _diagnostic_warning("Startup project discovery", exc)
             finally:
                 _LOGGER.info(
-                    "[HMB_IMAGE_CATALOG_WARMUP] %s projects=%d assets=%d errors=%d elapsed=%.2fs",
-                    "cancelled" if stop.is_set() else "finished", completed, asset_count, failures,
+                    "[HMB_IMAGE_CATALOG_WARMUP] %s projects=%d errors=%d elapsed=%.2fs",
+                    "cancelled" if stop.is_set() else "finished", discovered, failures,
                     time.monotonic() - started,
                 )
 
@@ -11073,9 +11090,11 @@ class HMBImageAssetLibrary(DataNode):
             )
 
     def _current_state(self) -> Dict[str, Any]:
-        state = _normalize_state(
-            _get_parameter_raw(self, WIDGET_STATE_PARAMETER)
-        )
+        raw = _get_parameter_raw(self, WIDGET_STATE_PARAMETER)
+        if isinstance(raw, str) and raw == getattr(self, "_hmb_normalized_widget_json", None):
+            state = json.loads(raw)
+        else:
+            state = _normalize_state(raw)
         authority = getattr(self, "_hmb_cgt_work_notice", None)
         if authority and authority[0] == _hmb_shot_routing.hierarchy_project_key(state):
             state["cgt_work_start_notice"] = dict(authority[1])
@@ -11084,6 +11103,20 @@ class HMBImageAssetLibrary(DataNode):
                 and notice.get("request_id") not in getattr(self, "_hmb_cgt_work_seen", set())):
             # A saved in-flight notice is never a command to resume a write.
             state["cgt_work_start_notice"] = {**notice, "status": "unknown"}
+        return state
+
+    def _selected_routing_state(self) -> Dict[str, Any]:
+        """Detach a Shot query from the browse catalog. Only selected sources feed routing."""
+        raw = _get_parameter_raw(self, WIDGET_STATE_PARAMETER)
+        cached = getattr(self, "_hmb_selected_routing_view", None)
+        if isinstance(raw, str) and cached is not None and raw == cached[0]:
+            return json.loads(cached[1])
+        state = self._current_state()
+        state["assets"] = [asset for asset in state["assets"] if asset["selected"]]
+        for key in ("tree", "folders", "projects", "expanded_folders"):
+            state.pop(key, None)
+        if isinstance(raw, str) and raw == _get_parameter_raw(self, WIDGET_STATE_PARAMETER):
+            self._hmb_selected_routing_view = (raw, _json_text(state))
         return state
 
     def _hmb_project_identity(self) -> Dict[str, str]:
@@ -11270,7 +11303,7 @@ class HMBImageAssetLibrary(DataNode):
                 loop = None
             if loop is not None and self._defer_project_selection_resolution(state):
                 raise _ImageAssetSelectionPreparing("ImageAsset Shot publication is still preparing.")
-        snapshot = self._cache_shot_routing_snapshot(state, cached_only=cached_only)
+        snapshot = self._cache_shot_routing_snapshot(state, cached_only=cached_only, normalized=True)
         expected = _clean(expected_channel_uuid)
         if expected and expected != snapshot["channel_uuid"]:
             raise ValueError(
@@ -11353,7 +11386,7 @@ class HMBImageAssetLibrary(DataNode):
         Shot's references. Authored empty [] remains valid; selected missing
         media is an error, never a successful empty/partial publication.
         """
-        state = self._current_state()
+        state = self._selected_routing_state()
         routing = state["shot_routing"]
         channel, target = _uuid_text(channel_uuid), _uuid_text(shot_uuid)
         if not channel or not target or channel != routing["channel_uuid"]:
@@ -11473,9 +11506,9 @@ class HMBImageAssetLibrary(DataNode):
     def _hmb_shot_routing_catalog(self) -> Dict[str, Any]:
         """Return the bounded, media-free Shot catalog used by same-flow peers."""
 
-        state = self._current_state()
+        state = self._selected_routing_state()
         try:
-            snapshot = self._cache_shot_routing_snapshot(state, cached_only=True)
+            snapshot = self._cache_shot_routing_snapshot(state, normalized=True, cached_only=True)
         except ValueError:
             # Discovery needs only authored Shot names/IDs. Resolving images
             # here would put UNC IO back on the event loop while a selection
@@ -11698,7 +11731,7 @@ class HMBImageAssetLibrary(DataNode):
             return
         identity = (
             _clean(catalog_identity)
-            or _shot_routing_catalog_identity(self._current_state())
+            or _shot_routing_catalog_identity(self._current_state(), normalized=True)
         )
         if not identity or identity == _clean(
             getattr(self, "_hmb_last_reconciled_shot_catalog_identity", "")
@@ -11760,9 +11793,7 @@ class HMBImageAssetLibrary(DataNode):
             or _clean(acknowledgement.get("code")) != "ready"
         ):
             return
-        current_identity = _shot_routing_catalog_identity(
-            self._current_state()
-        )
+        current_identity = _shot_routing_catalog_identity(self._current_state(), normalized=True)
         if current_identity == token:
             self._hmb_last_reconciled_shot_catalog_identity = token
 
@@ -12455,21 +12486,28 @@ class HMBImageAssetLibrary(DataNode):
                     _, project_identity, epoch, snapshots, imports, import_revision = current_task
                     resolved_cache: OrderedDict = OrderedDict()
                     try:
+                        pending_registration = False
                         for snapshot in snapshots:
-                            _resolve_selected_assets(
+                            selection = _resolve_selected_assets(
                                 snapshot, imports, resolution_cache=resolved_cache,
                                 import_revision=import_revision, normalized=True, wait_for_catalog=True,
                             )
+                            pending_registration |= any(row["reason"] == "project_catalog_preparing"
+                                                        for row in selection["unresolved"])
                     except Exception as exc:
                         # A failed task must release its slot and still drain a
                         # newer queued selection. Never publish a partial cache.
                         _diagnostic_exception("Selected project image verification failed", exc)
                     else:
                         with work["lock"]:
-                            if epoch == work["epoch"]:
+                            if not pending_registration and epoch == work["epoch"]:
                                 work["ready"] = (project_identity, epoch, resolved_cache)
                         try:
-                            loop.call_soon_threadsafe(host_context.copy().run, publish_ready)
+                            # No ready result exists while the registry is
+                            # pending. The next catalog publication or edit
+                            # retries; self-notification here starts a loop.
+                            if not pending_registration:
+                                loop.call_soon_threadsafe(host_context.copy().run, publish_ready)
                         except RuntimeError:
                             # A retained callback will consume the ready cache if
                             # the host loop stopped between lookup and handoff.
@@ -13570,19 +13608,17 @@ class HMBImageAssetLibrary(DataNode):
             finally:
                 self._hmb_root_syncing = False
         serialized = _json_text(normalized)
-        self._accept_normalized_widget_state_baseline(
-            normalized,
-            serialized,
-        )
-        self._hmb_state_syncing = True
-        try:
-            _set_parameter_value(
-                self,
-                WIDGET_STATE_PARAMETER,
-                serialized,
-            )
-        finally:
-            self._hmb_state_syncing = False
+        # The SDK echoes the complete widget parameter to the editor. An
+        # unchanged execution can still owe downstream ports a readiness
+        # notification, but the editor already has this exact catalog.
+        if (serialized != getattr(self, "_hmb_last_accepted_widget_state", None)
+                or serialized != _get_parameter_raw(self, WIDGET_STATE_PARAMETER)):
+            self._accept_normalized_widget_state_baseline(normalized, serialized)
+            self._hmb_state_syncing = True
+            try:
+                _set_parameter_value(self, WIDGET_STATE_PARAMETER, serialized)
+            finally:
+                self._hmb_state_syncing = False
         self._hmb_refresh_revision = _non_negative_int(
             normalized.get("refresh_revision")
         )
@@ -15292,7 +15328,15 @@ class HMBImageAssetLibrary(DataNode):
         )
 
     def _apply_widget_state(self, value: Any) -> Dict[str, Any]:
-        state = _normalize_state(self._expand_widget_edit(value))
+        expanded = self._expand_widget_edit(value)
+        # The native setter echoes the exact canonical value it received from
+        # before_value_set. Admission above still validates the live lease and
+        # workspace commands. Reuse the detached rows from decoding that echo.
+        if (isinstance(value, str) and value == getattr(self, "_hmb_normalized_widget_json", None)
+                and value == self._hmb_last_accepted_widget_state):
+            state = expanded
+        else:
+            state = _normalize_state(expanded)
         site_request = state.pop("site_settings_request", None)
         if site_request and site_request == getattr(self, "_hmb_live_site_request", None):
             self._hmb_live_site_request = None
@@ -15570,11 +15614,11 @@ class HMBImageAssetLibrary(DataNode):
             # selection/order edit while the single worker is active. Ignore
             # only the thumbnail intent; semantic output/reconcile below must
             # still observe that live edit immediately.
-        normalized = self._sync_output(state)
+        normalized = self._sync_output(state, normalized=True)
         # Search, language, folder, and display edits must not scan the flow.
         # Advertise only when the bounded catalog visible to peers changed;
         # lifecycle reloads and process() retain their force-style paths.
-        catalog_identity = _shot_routing_catalog_identity(normalized)
+        catalog_identity = _shot_routing_catalog_identity(normalized, normalized=True)
         if catalog_identity != getattr(
             self, "_hmb_last_reconciled_shot_catalog_identity", ""
         ):
@@ -16168,13 +16212,14 @@ class HMBImageAssetLibrary(DataNode):
                 assignment = self._widget_initial_assignment(WIDGET_STATE_PARAMETER)
                 if assignment is not None:
                     assignment["allowed"].add(_widget_assignment_digest(normalized))
-                self._accept_widget_state_baseline(normalized)
+                self._accept_normalized_widget_state_baseline(normalized)
+                self._hmb_normalized_widget_json = self._hmb_last_accepted_widget_state
                 if external_state and assignment is None:
                     # SDK is_output assignments still run this hook but may
                     # skip after_value_set. They must retire the first-load
                     # duplicate exception just like ordinary live edits.
                     self._hmb_widget_live_authored = True
-                return _json_text(normalized)
+                return self._hmb_normalized_widget_json
 
             current_raw = dict(
                 _parse_mapping(
@@ -16202,7 +16247,8 @@ class HMBImageAssetLibrary(DataNode):
             try:
                 clean_state = self._expand_widget_edit(value)
                 value = _json_text(clean_state)
-                actual = _parse_mapping(_get_parameter_raw(self, WIDGET_STATE_PARAMETER))
+                actual_value = _get_parameter_raw(self, WIDGET_STATE_PARAMETER)
+                actual = clean_state if actual_value == value else _parse_mapping(actual_value)
                 if actual.get("image_bash_workspace") != clean_state.get("image_bash_workspace") or actual.get(IMAGE_BASH_WORKSPACE_EDIT_KEY):
                     self._hmb_state_syncing = True
                     try:
@@ -16252,7 +16298,7 @@ class HMBImageAssetLibrary(DataNode):
             elif name == IMAGE_IMPORT_PARAMETER:
                 self._apply_import_value(value)
             elif name == WIDGET_STATE_PARAMETER:
-                if _parse_mapping(value).get("schema") == IMAGE_ASSET_EDIT_SCHEMA:
+                if clean_state.get("schema") == IMAGE_ASSET_EDIT_SCHEMA:
                     try:
                         value = _json_text(self._expand_widget_edit(value))
                     except ValueError:
@@ -16261,7 +16307,7 @@ class HMBImageAssetLibrary(DataNode):
                 if (
                     not self._hmb_state_syncing
                     and not self._hmb_restoring_widget_state
-                    and self._widget_state_is_stale(value)
+                    and self._widget_state_is_stale(clean_state)
                 ):
                     # A host may assign the raw Parameter and call this hook with
                     # skip_before_value_set=True. Restore the accepted B snapshot
@@ -16269,9 +16315,10 @@ class HMBImageAssetLibrary(DataNode):
                     self._restore_accepted_widget_state()
                     return result
                 if not self._hmb_state_syncing and not self._hmb_restoring_widget_state:
-                    self._accept_widget_state_baseline(value)
+                    if value != self._hmb_last_accepted_widget_state:
+                        self._accept_widget_state_baseline(value)
                 self._apply_widget_state(value)
-                command = _parse_mapping(value).get("image_bash_workspace_request")
+                command = clean_state.get("image_bash_workspace_request")
                 if command:
                     # A presentation-only edit can leave all normal Shot
                     # outputs unchanged, so _apply_widget_state need not
@@ -16562,8 +16609,7 @@ class HMBImageAssetLibrary(DataNode):
         parent = getattr(super(), "after_node_deleted", None)
         return parent(*args, **kwargs) if callable(parent) else None
 
-    def _execution_preparation_identity(self) -> str:
-        state = self._current_state()
+    def _execution_preparation_identity(self, state: Dict[str, Any]) -> str:
         imports = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
         routing = state["shot_routing"]
         return _sha256_canonical({
@@ -16591,7 +16637,30 @@ class HMBImageAssetLibrary(DataNode):
         import_media: Dict[str, Any], import_revision: int,
     ) -> tuple[Dict[str, Any], Dict[str, Any], int, OrderedDict]:
         """Detached filesystem preparation: no node, ports, or graph mutation."""
-        state = current if _state_catalog_is_current(current, root_value) else _load_project_catalog(root_value, current)
+        state = current
+        if not _state_catalog_is_current(current, root_value):
+            # A browse snapshot can be ready before the whole project's scan.
+            # Only take this shortcut for a project in the verified roster and
+            # only when all saved bookmarks are already represented in state.
+            root = Path(current.get("project_root") or ".")
+            roster_key = _session_catalog_key("projects", root_value)
+            catalog_key = _session_catalog_key("catalog", root)
+            with _SHARED_CATALOG_CACHE_LOCK:
+                roster = _CATALOG_READS.get(roster_key)
+                pinned = _CATALOG_READS.get(catalog_key)
+            verified_project = (
+                (pinned is None or pinned.exception() is not None)
+                and roster is not None and roster.exception() is None
+                and Path(roster.result()["catalog_root"]) == Path(current["catalog_root"])
+                and any(Path(row["path"]) == root and row["project_uid"] == current["project_uid"]
+                        and row["project_id"] == current["project_id"] for row in roster.result()["projects"])
+                and current.get("project_cache_uid") == _project_cache_uid(root)
+                and any(row.get("selected") for row in current["assets"])
+                and set(current.get("site_selection_memory", {})).issubset(
+                    row["source_uid"] for row in current["assets"])
+            )
+            if not verified_project:
+                state = _load_project_catalog(root_value, current)
         media = import_media
         revision = import_revision
         if _flatten_import_values(import_value):
@@ -16609,10 +16678,12 @@ class HMBImageAssetLibrary(DataNode):
         cache: OrderedDict = OrderedDict()
         # This runs off the editor loop. A disk-backed browse snapshot can
         # precede the complete catalog; verify its selected registrations now.
-        _resolve_selected_assets(
+        selection = _resolve_selected_assets(
             state, media, resolution_cache=cache, import_revision=revision,
             force=True, normalized=True, wait_for_catalog=True,
         )
+        if any(row["reason"] == "project_catalog_preparing" for row in selection["unresolved"]):
+            raise _ImageAssetSelectionPreparing("ImageAsset project registrations are still preparing.")
         return state, media, revision, cache
 
     async def aprocess(self) -> None:
@@ -16640,7 +16711,7 @@ class HMBImageAssetLibrary(DataNode):
         base = self._current_state()
         if base.get("scan_busy"):
             raise _ImageAssetSelectionPreparing("ImageAsset project catalog is still preparing.")
-        identity = self._execution_preparation_identity()
+        identity = self._execution_preparation_identity(base)
         root_value = _project_root_text(_get_parameter_raw(self, PROJECT_ROOT_PARAMETER)) or str(DEFAULT_PROJECTS_ROOT)
         import_value = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
         media = dict(getattr(self, "_hmb_import_media_by_uid", {}) or {})
@@ -16650,14 +16721,14 @@ class HMBImageAssetLibrary(DataNode):
         )
         if bool(getattr(self, "is_cancellation_requested", False)):
             raise asyncio.CancelledError()
+        live = self._current_state()
         if (generation != getattr(self, "_hmb_execution_prepare_generation", 0)
             or not self._scan_owner_is_current()
-            or self._current_state().get("scan_busy")
-            or identity != self._execution_preparation_identity()):
+            or live.get("scan_busy")
+            or identity != self._execution_preparation_identity(live)):
             raise ValueError("ImageAsset inputs changed while preparing execution; run again with the current selection.")
-        live = self._current_state()
         worker_state = prepared
-        prepared = _merge_async_scan_result_with_live_state(prepared, base, live)
+        prepared = _merge_async_scan_result_with_live_state(prepared, base, live, normalized=True)
         if _flatten_import_values(import_value):
             # Unlike a background catalog scan, execution already proved that
             # IMAGE_IMPORT_IN is unchanged. Preserve its freshly prepared rows

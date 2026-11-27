@@ -14485,11 +14485,12 @@ class HMBPromptLibrary(DataNode):
                     self, "_hmb_compact_route_syncing", False
                 ) and not (name == WIDGET_PARAMETER_NAME and ui_only_widget_write):
                     self._schedule_prompt_sync(
+                        # ImageAsset publishes its verified dependency and
+                        # metadata in the same host transaction. The next loop
+                        # turn sees both and still coalesces sibling callbacks.
                         source_burst=name in {
                             SOUND_INPUT_PARAMETER_NAME,
                             PICKER_INPUT_PARAMETER_NAME,
-                            IMAGE_ASSET_INPUT_PARAMETER_NAME,
-                            SHOT_ASSET_INPUT_PARAMETER_NAME,
                             SHOT_PICKER_INPUT_PARAMETER_NAME,
                         },
                         publish_shot_media=name in {

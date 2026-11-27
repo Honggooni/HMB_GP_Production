@@ -113,6 +113,11 @@ async def check_wired_image_with_existing_shot(workspace):
             state["shot_routing"]["shots"][0]["selected_source_uids"] = [anchor["source_uid"]]
             library._sync_output(state, force=True)
             library._publish_state(state)
+            settled = library._publish_state(library._current_state(), preserve_outputs=True)
+            with patch.object(asset, "_set_parameter_value", wraps=asset._set_parameter_value) as writes:
+                library._publish_state(settled, normalized=True, preserve_outputs=True)
+            assert not any(call.args[1] == asset.WIDGET_STATE_PARAMETER for call in writes.call_args_list), (
+                "Identical catalog was sent to the editor twice")
             slot = await GriptapeNodes.ahandle_request(AddParameterToNodeRequest(
                 node_name=library.name, parent_container_name=asset.IMAGE_IMPORT_PARAMETER))
             assert not slot.failed(), slot
@@ -124,10 +129,10 @@ async def check_wired_image_with_existing_shot(workspace):
             checked_state_reads = []
             original_prepare = library._execution_preparation_identity
 
-            def record_widget_read():
+            def record_widget_read(snapshot):
                 checked_state_reads.append((library.get_parameter_value(asset.WIDGET_STATE_PARAMETER),
                                             library.parameter_values[asset.WIDGET_STATE_PARAMETER]))
-                return original_prepare()
+                return original_prepare(snapshot)
 
             for attempt in (1, 2):
                 if attempt == 2:
@@ -394,7 +399,7 @@ async def check_repeated_wired_selection(library, downstream, anchor, imported, 
     state = library._current_state()
     catalog_key = asset._session_catalog_key("catalog", state["project_root"])
     with patch.dict(asset._CATALOG_READS), patch.object(
-        asset, "_read_verified_image_catalog", side_effect=TimeoutError("full catalog busy")
+        asset, "_read_verified_image_catalog", side_effect=AssertionError("Run joined the full browse scan")
     ):
         del asset._CATALOG_READS[catalog_key]
         await library.aprocess()

@@ -13,7 +13,7 @@ const THUMBNAIL_BRIDGE_WIDGET_PATH = new URL(
   "../../widgets/HMBImageAssetThumbnailPatchBridgeWidget.js",
   import.meta.url,
 );
-const assetSource = fs.readFileSync(ASSET_WIDGET_PATH, "utf8");
+const assetSource = fs.readFileSync(ASSET_WIDGET_PATH, "utf8").replaceAll("\r\n", "\n");
 const assetWidget = await import(ASSET_WIDGET_PATH);
 const thumbnailBridgeWidget = await import(THUMBNAIL_BRIDGE_WIDGET_PATH);
 
@@ -553,10 +553,8 @@ try {
   assert.equal(commitCount, 0);
   assert.equal(scheduledFrames.length, 1);
   scheduledFrames.shift()();
-  assert.equal(commitCount, 0, "The first animation frame must paint local feedback.");
-  assert.equal(scheduledFrames.length, 1);
-  scheduledFrames.shift()();
-  assert.equal(commitCount, 1, "The second frame may publish the canonical state.");
+  assert.equal(commitCount, 1, "The first frame must deliver the selection.");
+  assert.equal(scheduledFrames.length, 0);
 } finally {
   if (originalAnimationFrame === undefined) delete globalThis.requestAnimationFrame;
   else globalThis.requestAnimationFrame = originalAnimationFrame;
@@ -573,7 +571,8 @@ globalThis.requestAnimationFrame = (callback) => {
   return backgroundFrames.length;
 };
 globalThis.cancelAnimationFrame = () => {};
-globalThis.setTimeout = (callback) => {
+globalThis.setTimeout = (callback, delay) => {
+  assert.equal(delay, 0, "Selection dispatch must have no deliberate delay.");
   const id = ++backgroundTimerId;
   backgroundTimers.set(id, callback);
   return id;
@@ -596,11 +595,10 @@ try {
   const delivered = [];
   assetWidget.hmbScheduleImageAssetSelectionCommit(continuous, () => delivered.push(1));
   const firstDeadline = [...backgroundTimers.keys()][0];
-  backgroundFrames.shift()();
   assetWidget.hmbScheduleImageAssetSelectionCommit(continuous, () => delivered.push(2));
   assert.deepEqual([...backgroundTimers.keys()], [firstDeadline], "A new click must not move the first publication deadline.");
   backgroundFrames.shift()();
-  assert.deepEqual(delivered, [2], "Publish during the burst on its original second frame.");
+  assert.deepEqual(delivered, [2], "Publish during the burst on its first frame.");
   assetWidget.hmbScheduleImageAssetSelectionCommit(continuous, () => delivered.push(3));
   assetWidget.hmbScheduleImageAssetSelectionCommit(continuous, () => delivered.push(4));
   [...backgroundTimers.values()][0]();
