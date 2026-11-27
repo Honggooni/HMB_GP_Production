@@ -6003,6 +6003,21 @@ def _discover_shared_image_projects(root: Any, *, refresh: bool = False) -> Dict
     return _catalog_read_once(_session_catalog_key("projects", root), discover, refresh=refresh)
 
 
+def _cached_project_roster(root: Any) -> Future | None:
+    requested = _session_catalog_key("projects", root)
+    with _SHARED_CATALOG_CACHE_LOCK:
+        direct = _CATALOG_READS.get(requested)
+        if direct is not None:
+            return direct
+        # Discovery can run under a Windows short name while the node later
+        # supplies the expanded name. Use the destination discovery verified.
+        for key, completed in reversed(_CATALOG_READS.items()):
+            if key[0] == "projects" and completed.done() and not completed.cancelled() and completed.exception() is None:
+                if _session_catalog_key("projects", completed.result()["catalog_root"]) == requested:
+                    return completed
+    return None
+
+
 def _scan_linked_sites(project: Path, settings: dict, prior: dict, *, pinned=None, verify_all_files=False) -> dict:
     # On a profile edit the pinned facts are from this engine's last verified
     # read. Workflow data may preserve selections but cannot replace those facts.
@@ -16643,10 +16658,9 @@ class HMBImageAssetLibrary(DataNode):
             # Only take this shortcut for a project in the verified roster and
             # only when all saved bookmarks are already represented in state.
             root = Path(current.get("project_root") or ".")
-            roster_key = _session_catalog_key("projects", root_value)
+            roster = _cached_project_roster(root_value)
             catalog_key = _session_catalog_key("catalog", root)
             with _SHARED_CATALOG_CACHE_LOCK:
-                roster = _CATALOG_READS.get(roster_key)
                 pinned = _CATALOG_READS.get(catalog_key)
             verified_project = (
                 (pinned is None or pinned.exception() is not None)

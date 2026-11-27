@@ -402,6 +402,17 @@ async def check_repeated_wired_selection(library, downstream, anchor, imported, 
         asset, "_read_verified_image_catalog", side_effect=AssertionError("Run joined the full browse scan")
     ):
         del asset._CATALOG_READS[catalog_key]
+        # The discovery request can use a short Windows TEMP name while
+        # PROJECT_ROOT subsequently contains its fully expanded spelling.
+        canonical = state["catalog_root"]
+        discovered = asset._cached_project_roster(canonical)
+        assert discovered is not None
+        for key in list(asset._CATALOG_READS):
+            if asset._CATALOG_READS[key] is discovered:
+                del asset._CATALOG_READS[key]
+        asset._CATALOG_READS[("projects", "c:/runner~1/fixture/projects")] = discovered
+        assert asset._cached_project_roster(canonical) is discovered
+        assert asset._cached_project_roster(Path(canonical).parent / "unrelated") is None
         await library.aprocess()
         assert library.parameter_output_values[asset.MEDIA_OUTPUT_PARAMETER] == [source_paths[uid] for uid in chosen]
     entered, resume = threading.Event(), threading.Event()

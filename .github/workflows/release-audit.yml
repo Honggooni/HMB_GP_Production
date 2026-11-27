@@ -29,10 +29,6 @@ jobs:
     needs: sound-link
     runs-on: windows-latest
     timeout-minutes: 60
-    outputs:
-      package_version: ${{ steps.release_metadata.outputs.version }}
-      release_label: ${{ steps.release_metadata.outputs.release_label }}
-      archive_name: ${{ steps.release_metadata.outputs.archive_name }}
     steps:
       - uses: actions/checkout@v4
       - name: Require the public team distribution channel
@@ -94,9 +90,6 @@ jobs:
             throw "Release label $releaseLabel does not match technical version $version; expected $expectedReleaseLabel."
           }
           $archiveName = "HMB_GP_Production_${releaseLabel}_Runtime.zip"
-          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "version=$version"
-          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "release_label=$releaseLabel"
-          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "archive_name=$archiveName"
           Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_PACKAGE_VERSION=$version"
           Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_RELEASE_LABEL=$releaseLabel"
           Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_RUNTIME_ARCHIVE=$archiveName"
@@ -323,7 +316,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
         shell: pwsh
         run: python tools/package_runtime_release.py --check-parity-proof .github/hmb-release-parity.json
-      - name: Prepare tagged team distribution
+      - name: Verify Team tag matches the audited version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
@@ -335,196 +328,4 @@ jobs:
           $versionParts = $version.Split('.')
           if ($versionParts.Count -ne 3 -or ([int]$versionParts[2] % 2) -eq 0) {
             throw "Even technical patch version $version is local-test-only. Team releases require an odd technical patch version."
-          }
-          $artifact = Join-Path $env:RUNNER_TEMP $env:HMB_RUNTIME_ARCHIVE
-          $checksum = "{0} *{1}" -f `
-            (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant(), `
-            (Split-Path -Leaf $artifact)
-          Set-Content -LiteralPath "$artifact.sha256" -Value $checksum -Encoding ascii -NoNewline
-      - name: Upload audited tagged team distribution
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
-        with:
-          name: hmb-team-release-${{ github.ref_name }}
-          path: |
-            ${{ runner.temp }}/${{ steps.release_metadata.outputs.archive_name }}
-            ${{ runner.temp }}/${{ steps.release_metadata.outputs.archive_name }}.sha256
-          if-no-files-found: error
-          retention-days: 30
-
-  publish-team-release:
-    needs: windows-release-audit
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: windows-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download audited team distribution
-        uses: actions/download-artifact@v4
-        with:
-          name: hmb-team-release-${{ github.ref_name }}
-          path: release
-      - name: Publish GitHub team release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-          HMB_PACKAGE_VERSION: ${{ needs.windows-release-audit.outputs.package_version }}
-          HMB_RELEASE_LABEL: ${{ needs.windows-release-audit.outputs.release_label }}
-          HMB_RUNTIME_ARCHIVE: ${{ needs.windows-release-audit.outputs.archive_name }}
-        run: |
-          $repository = $env:GITHUB_REPOSITORY
-          $version = "$env:HMB_PACKAGE_VERSION".Trim()
-          $releaseLabel = "$env:HMB_RELEASE_LABEL".Trim()
-          if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
-            throw "Unsafe or unsupported package version: $version"
-          }
-          $major = $Matches[1]
-          $minor = $Matches[2]
-          $patch = [int]$Matches[3]
-          $expectedReleaseLabel = "v${major}.${minor}.$($patch.ToString('D2'))"
-          if ($releaseLabel -cne $expectedReleaseLabel -or $env:GITHUB_REF_NAME -cne $releaseLabel) {
-            throw "Published tag, release label, and technical version are inconsistent."
-          }
-          $expectedArchiveName = "HMB_GP_Production_${releaseLabel}_Runtime.zip"
-          if ($env:HMB_RUNTIME_ARCHIVE -ne $expectedArchiveName) {
-            throw "Audited release metadata is inconsistent."
-          }
-          $archive = Join-Path $PWD "release/$expectedArchiveName"
-          $checksum = "$archive.sha256"
-          if (-not (Test-Path -LiteralPath $archive) -or -not (Test-Path -LiteralPath $checksum)) {
-            throw "Audited release assets are missing."
-          }
-          $notesPath = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_${releaseLabel}_release_notes.md"
-          @(
-            "## HMB GP Production $releaseLabel",
-            "",
-            "- ImageAsset dispatches selection changes on the next editor turn. HMBPrompt reuses the selected Shot rows and a brief shared-folder read failure can recover without a second click.",
-            "",
-            "- Registering the same external image repeatedly in the same shared folder reuses its registration. Refresh preserves the selected Shot image and picks up registrations from other workstations.",
-            "- For Project and My Box references, the client checks the official Broker's supported upload format before transfer. A compatible Broker receives the SHA-256 and length of the actual uploaded bytes.",
-            "",
-            "- Local reference images are uploaded through Griptape Cloud in the selected Shot order. Large images can use a lossless WebP upload copy.",
-            "- Seedance prepares smaller upload copies of high-bitrate local references and checks newly issued storage links before submitting.",
-            "- After an HTTP 504, Seedance checks the original request or task ID. This recovery does not submit a new render.",
-            "",
-            "- Color LUT uploads can include the preview and thumbnail created on the workstation.",
-            "- The Windows installer prepares the HMB library dependencies before the first Desktop launch. The startup check reuses dependency metadata and checks fewer filesystem paths.",
-            "",
-            "- ImageAsset shows Ai_Ct_image and linked folders at the top level. External images can be registered in a selected root or subfolder. Project Add applies folder changes immediately.",
-            "- My Upload filters the current project's registrations by uploader. Authors can edit or remove their own registrations while preserving the source files.",
-            "- ImageAsset Refresh previews the registration JSON audit for each linked folder. After confirmation it backs up affected registries and removes verified missing entries.",
-            "- ImageAsset updates the Prompt preview as images are added or removed and preserves Shot identity across overlapping selections.",
-            "",
-            "- ImageAsset resolves connected image inputs alongside saved shot selections. Publishing the same selection during file preparation now succeeds, while changing the selected images still discards stale results.",
-            "- External images connected from Load Image appear in the active shot and its preview. Project-relative image paths retain their original reference when the workflow is reopened.",
-            "- HMBPrompt batches incoming ImageAsset and VideoPicker updates in a shorter window and skips repeated error fingerprints for healthy inputs. The selected media and Shot ordering stay consistent.",
-            "- ImageAsset restores cached thumbnails alongside the project list and serves saved WebP/PNG files locally across workflow reopening. New or changed images get new thumbnails.",
-            "- VideoPicker Original and Mask preserve Redshift eye material switching and rebuild connected Color Correct inputs with Maya nodes when the renderer is unavailable.",
-            "- HMBPrompt shows the selected image and video names in order while ImageAsset and VideoPicker check the files in the background. Agent and Generator receive the verified media for their connected shot.",
-            "- Color LUT lists the upload groups, projects and episodes provided by the Broker. Team members, leads and administrators can send an original or a graded video directly to the selected destination when the Broker supports group selection.",
-            "- Seedance checks 1080p and 4K Final availability for a completed Draft when its workflow is reopened. The generation button uses the Broker status and request key for the selected resolution.",
-            "- Project Add in ImageAsset and Sound manages linked folders for each project. Select a folder to register images there, or disconnect a folder to remove it from the local catalog. Existing files stay on disk.",
-            "- ImageAsset reads the headquarters and partner registries together. Registrations use the selected folder's registry and are serialized per registry, including when two workstations Add images concurrently.",
-            "- Loads the signed Super Wings 12 policy for linked Prompt and Agent shots. The independent Seedance Only route applies its Super Wings defaults to a connected Standard text Agent and preserves authored directions and other project routes.",
-            "- Color LUT can create the review JPEG and MP4 when a Windows workstation stores its review cache under a long directory path.",
-            "- Seedance writes SDK-readable output metadata for MOV, MP4 and last-frame PNG files. Indexed PNG destinations now allocate the next available name, including concurrent saves.",
-            "- Seedance resolves output names in the workflow that owns the destination and reuses the filename search when publishing a completed video.",
-            "- Color LUT and other Broker clients can check sign-in status without creating a credentials directory on first use.",
-            "- ImageAsset checks the local catalog again when a restored project finishes loading. Saved Shot selections can resolve their images after an empty first lookup.",
-            "- HMBPrompt preserves authored edits on publisher changes and prevents a delayed acknowledgement from restoring a deselected image.",
-            "- HMBPrompt keeps verified image selections editable when an older update arrives during the same frame, including after removing a disconnected image or selecting the first images in an empty Shot.",
-            "- Opening a different workflow with the same Shot UUID loads its own Prompt fields. Pending caret restoration respects the field selected by the user.",
-            "- Native Reset follows the selected HMB node on supported Griptape editors. Blender snapshots honor the selected Original, Mask, Depth and Motion Guide passes.",
-            "- ImageAsset reuses a project catalog in the local Griptape workspace. Startup and manual refresh check the shared registry. Concurrent Add operations take turns writing to the registry.",
-            "- HMB nodes zoom on hover and scroll inside a selected scroll area. Its outline marks the active area. HMBPrompt opens with more room for video and sound controls.",
-            "- VideoPicker adds Teal and Brown actor colors and an Olive ghost color. Saved jobs can still use their original palettes.",
-            "- VideoPicker shows the current production stage and measured percentage in the activity log header. You can also show it over the preview while playing a video. The overlay starts off. Generation start and result stay in the log.",
-            "- The Stop button beside Generate Playblast stops the current Shot's generation and preserves completed clips and video playback.",
-            "- Playblast jobs carry their own marker palette. Maya can open older jobs against the verified additive palette without changing the assigned mask colors.",
-            "- Restores saved Image Generation model option controls and their values when switching models and reopening an existing workflow.",
-            "- Displays asset names in the HMBPrompt sound target picker while preserving saved source identities and shot bindings.",
-            "- Restores HMB headers and Rodong Mart on Desktop 0.31.0 (Editor 0.132.0) and retains the previously supported Desktop builds.",
-            "- Checks the official Windows stable package identity daily and before Team distribution. A new or republished build requires compatibility verification.",
-            "- Continue editing another Shot while generators are busy. Maya Mask and Depth output publishes on the editor event loop, pending media checks wait before Agent execution, and sound validation follows the bound Shot.",
-            "- In HMBPrompt, enable the sound range bar and drag empty space to cut multiple cues from one sound. Click a cue for source trim and shot placement. Korean sound usage labels, speaker reference and the full-width dialogue field are included.",
-            "- Seedance 2.5 supports 4K in Team and Local when the broker advertises 4K. The default remains 480p Draft in MOV.",
-            "- Includes Analysis Agent, Sound Library, Rodong Mart, 13 widgets and all six UI image sheets.",
-            "- Fixes Original output for saved Maya rigs whose eye shading groups retain hidden intermediate history meshes. Proven out-of-scope history memberships remain untouched; ambiguous render targets and material restore failures still stop safely, preserving completed outputs and Shot bindings.",
-            "- Fixes Picker READ completion after another Shot was rendered: reconciles captured Shot drafts before execution, accepts runtime-scoped completion acknowledgements independently of optimistic media selection, and bounds completed Maya worker/console shutdown without changing existing outputs or bindings.",
-            "- Separates READ admission and receipts for all five Shot workspaces. Object and JSON-string widget requests receive an acknowledgement before network-file inspection; queued reads, cancellation and late results retain their exact Shot and workflow ownership.",
-            "- Preserves the v0.8.65 saved-shot restoration hotfix, per-Shot Picker scene state, cross-Shot video concatenation, authored bindings and existing outputs.",
-            "- Distinguishes imported reference videos from generated Playblasts and carries verified analysis provenance and current source references through Agent and Generator request payloads.",
-            "- Verifies Korean Prompt fields, analysis observations, exact quoted text and five-Shot save restoration with current-SDK transport and browser tests. Controlled responses do not establish live model translation quality.",
-            "- Collects rapid ImageAsset instance copy and removal clicks, then applies them in order against canonical Engine acknowledgements. Intentional copies remain supported while repeated local events cannot silently change the final image count.",
-            "- Bounds busy and connection recovery retries and waits for the owning session to reconnect. A request with an uncertain outcome is reconciled against canonical state before another edit; ambiguous requests are never blindly replayed.",
-            "- Waits asynchronously for the exact selected Shot sources before Agent and Generator admission; first-use source preparation no longer requires running a successful saved workflow first.",
-            "- Separates source preparation timeout, missing media, changed Shot identity and unavailable owners from generic connection errors, with safe bounded diagnostic codes.",
-            "- Preserves verified saved previews, authored values and per-Shot cancellation; source waiting never retries model inference or video submission.",
-            "- Restores saved Agent and Generator Connection Management without treating passive Draft status observers as active rendering; real locks, Final dispatch, rendering and result refresh remain protected.",
-            "- Rechecks temporarily unavailable connection readiness only while the dialog is visible, bounds connection and deletion preflight requests, and reconciles uncertain disconnect results without replaying mutations.",
-            "- Releases My Box Final reservations after pre-dispatch failures or cancellation using exact task ownership; stale cleanup cannot release or start a newer request.",
-            "- Closes unscheduled native Draft coroutines after dispatch failures and retains existing outputs, Task IDs, saved inputs and intentional Bash instances.",
-            "- Defers Bash source decoding and raster preparation off the host hydration path. Readiness feedback keeps editor opening tied to current inputs, and Apply refreshes the verified output without Run or reopening while preserving authored layers, brush pixels and transforms.",
-            "- Preserves Bash inputs and intentional instance identities through remote reconnect, editing, Apply, saving and reopening. Restoring an existing source does not append another copy, and stale or foreign-owner results cannot overwrite the current workspace.",
-            "- Exports Color LUT HEVC Main 10 final video as MOV and retains that MOV filename for review upload. Exports verify the original width and height without resizing, padding or changing the source; incompatible odd dimensions are reported with the available FFV1 alternative instead of silently changing the codec or geometry.",
-            "- Reports current executed and unexecuted checks in this commit's regression coverage receipts; offline media and fake-transport checks do not establish paid generation, live review upload or actual Desktop acceptance.",
-            "- Connects ImageAsset and HMB ImageBash automatically in either palette creation order. Creation intent is captured before the SDK and native constructor add metadata, so drag-and-drop and workspace creation prepare the same shared workspace as the explicit Shot control while authored or disconnected relationships remain intact.",
-            "- Verifies the actual palette metadata mutation and both creation orders with the installed SDK. The metadata-only owner-lease fixture uses the exact registered ImageAsset type without weakening production source identity checks.",
-            "- Keeps one HMB ImageBash per flow. Repeated palette, duplicate and paste actions quietly retain the existing workspace, while legacy saved Bash nodes remain loadable.",
-            "- Restores Save metadata for the current unsaved HMB canvas when its legacy workflow key is unregistered, preserving existing nodes, connections, images, values and outputs.",
-            "- Restores the owned detached-port guard exactly once after library reload, keeping original image ports, saved connections and data while leaving unrelated handlers intact.",
-            "- Completes native editor integration through Git Update/Override without a separate ZIP installation. A fresh isolated updater validates the supported editor and SDK, backs up outside the checkout and atomically updates the pinned editor file; save and restart Griptape to load the new native and Python code.",
-            "- Updates the reviewed native adapter by actual editor structure and source integrity. Unified headers, rounded capsules, ports and connected-node protection remain independent of the desktop release label; unknown contracts preserve data and report the unsupported state.",
-            "- Automatically prepares the same ImageAsset Bash workspace whether ImageAsset or HMBImageBash is added first. Ambiguous sources require selection, occupied workspaces are preserved, and explicit disconnects never silently reconnect.",
-            "- Adds new Bash inputs to an already-open editor without Run or reopening. Apply publishes the verified local image immediately while retaining authored brush pixels, transforms, layer identities and Undo/Redo history. New Bash nodes start at 800 by 680; saved user sizes remain authoritative.",
-            "- Uses the common selection confirmation for Bash preparation and preserves pending CGT Shot edits. Starting selected CGT tasks changes Wait to Work; existing Work tasks are left unchanged.",
-            "- Rejects stale Bash Apply requests before committing values, using exact source and workspace ownership. Source conflicts, failed loads, deleted owners and changes during Apply retain previous results and show actionable status; standard Image Bash remains isolated.",
-            "- Preserves all Picker Shot and Loader media during native Reset. Failed handoff retains the original node; a transient rename failure is recovered once, while persistent failure retains the replacement data and reports the recovery state.",
-            "- Repairs native disconnect/reconnect dirty-state handling and retains leased dynamic image ports. Restoring saved relationships keeps the original ports, Shot data and images. VideoPicker retries now reload the same media URL once and reject stale retry callbacks.",
-            "- Prevents the old stock editor from optimistically removing HMB nodes while restart or native integration is pending. Input editing and internal asset/Shot actions remain available; disk readiness is kept separate from the running UI and Engine readiness.",
-            "- Keeps the engine deletion gate active across library unload/reload while HMB nodes remain. Native deletion requires the current protection readiness contract; unsupported SDK APIs and initialization failures are reported instead of silently disabling protection.",
-            "- Requires griptape-nodes 0.101.3 or newer plus the actual pre-dispatch APIs. Native synchronization validates SDK metadata and source definitions, checks them again before applying, and upgrades any reviewed previous native patch atomically. Locked files stay unchanged and report pending status.",
-            "- Reads image projects only from projects/<project>/Ai_Ct_image, including superwings12 and Katuri8. Known old saved addresses are replaced in memory; retired folders are never read as compatibility or recovery locations. Existing Shot and bundle identities remain intact.",
-            "- Adds HMB ImageBash as a local image workspace with remote ImageAsset selection, native image output, local save and durable workspace restoration. Existing production Shot slots remain separate.",
-            "- Applies the unified rounded native header to HMB VideoPicker, HMB Agent, HMB ImageAsset Library, HMBPrompt, HMB ImageBash, Color LUT and Finish Look while retaining their existing palettes, controls and connections.",
-            "- Uses the dedicated fold control for the rounded Soft Link capsule and Double Click to Unlock restoration. Other header double-clicks select compact mode only where supported. Capsule restore, edge resizing and popup hit areas retain native port behavior.",
-            "- Adds common connected-node deletion protection to every registered HMB tool, including future types. Trash, Delete, context-menu, batch and engine paths refuse removal while a real wire or accepted remote binding remains and identify the connected targets.",
-            "- Adds Connection Management to inspect, disconnect and reconnect exact original relationships without deleting Shot inputs, prompts, settings, media, results or Task IDs. Saved disconnect fences survive reopening; missing or replaced owners are never silently substituted.",
-            "- Reduces unnecessary Agent and Prompt page calculations, repeated image resolution, idle acknowledgements and duplicate layout work. All five Shot inputs, bindings, model settings and results retain independent ownership during switching and execution.",
-            "- Restores CGT account and installed-SDK integration with pinned server trust, own-task lookup and a project-plus-episode selector. Episode filtering reuses the received catalog without clearing selected Shots.",
-            "- Restores explicit parent and child Shot assignment, including a child that also heads a separate bundle. Cycles are rejected; all five Shot UUIDs and individual executions remain independent. Bundle names include direct children and use the available name area without moving the fixed selection note.",
-            "- Preserves legacy standalone Prompt and Agent authoring, saved model identities, existing Task IDs, per-Shot outputs and recovery snapshots. The workflow serialization compatibility layer prevents temporary-list identity collisions without editing the Griptape SDK.",
-            "- Keeps user-authored schemas and structured Agent results containing shot_uuid fields separate from actual binding metadata during legacy reopen. Detached Shot stores and ambiguous original ownership still require their existing explicit recovery checks.",
-            "- Makes Color LUT Web Upload transfer the original immediately. The wider final-output button exports the graded result before uploading. Bound uploads keep the verified project and generation-time Shot name even if the current library bundle is renamed; manual uploads use an authenticated project or personal My Box and the source filename.",
-            "- Includes the native editor patcher, helper and hash descriptor in the Git checkout. Unknown editor builds are preserved and rejected; owned rollback restores a failed replacement. The optional manual installer retains its complete-app-shutdown requirement and rollback checks.",
-            "- Preserves personal local image generation with Nano Banana Pro and Nano Banana 2, model-specific options, exact provider IDs and existing Task recovery. Provider keys remain on the Broker; generated images are not published to project review lists.",
-            "- Preserves original local image and MOV/MP4 previews, My Box result retrieval, mode-preserving web rerenders and ambiguous-submission protection. Release tests never submit replacement paid generations.",
-            "- Uses Griptape Cloud for Generator reference images, video and audio, including older workflows that selected TOS. Keeps authenticated Broker project discovery, Only mode, explicit Draft settings and the bundled signed Agent runtime.",
-            "- Preserves authored materials for both exact Maya sets, AIPicker_SET and AIPickerM_SET, in Mask video and snapshots. New captures use a revised Mask cache identity.",
-            "- Includes registered Python, JavaScript, browser, installed-SDK and DCC checks. Coverage receipts distinguish actual executions, historical evidence and not-run items; offline fixtures do not establish live provider or animation quality.",
-            "- Includes SHA256 integrity manifests and verified local-to-team functional parity. Private policy sources, signing material, credentials, test data and local reports are excluded from the distribution.",
-            "",
-            "Use the existing HMB Git library's Update/Override. Native editor synchronization runs automatically; save your workflow, fully close Griptape and restart it once. A separate Runtime ZIP or PowerShell install is not required for normal updates. Check native UI and Engine protection readiness after restart. Keep existing workflows, settings and outputs; do not use destructive Download overwrite as a substitute for Update Override."
-          ) | Set-Content -LiteralPath $notesPath -Encoding utf8
-          $releaseLookup = @(gh api "repos/$repository/releases/tags/$env:GITHUB_REF_NAME" --include --silent 2>&1)
-          $releaseLookupExitCode = $LASTEXITCODE
-          if ($releaseLookupExitCode -eq 0) {
-            gh release upload $env:GITHUB_REF_NAME $archive $checksum --clobber --repo $repository
-            if ($LASTEXITCODE -ne 0) { throw "Could not upload the audited release assets." }
-            gh release edit $env:GITHUB_REF_NAME `
-              --title "HMB GP Production $env:GITHUB_REF_NAME" `
-              --notes-file $notesPath `
-              --latest `
-              --repo $repository
-            if ($LASTEXITCODE -ne 0) { throw "Could not update the release metadata." }
-          } elseif (($releaseLookup -join "`n") -match '(?m)^HTTP/\S+\s+404(?:\s|$)') {
-            gh release create $env:GITHUB_REF_NAME $archive $checksum `
-              --verify-tag `
-              --title "HMB GP Production $env:GITHUB_REF_NAME" `
-              --notes-file $notesPath `
-              --latest `
-              --repo $repository
-            if ($LASTEXITCODE -ne 0) { throw "Could not create the audited team release." }
-          } else {
-            throw "Could not determine whether the release exists (GitHub CLI exit $releaseLookupExitCode); publication stopped."
           }

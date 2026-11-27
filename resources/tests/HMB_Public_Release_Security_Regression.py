@@ -487,12 +487,19 @@ assert "id: release_metadata" in workflow_text
 assert "tomllib.load(open('pyproject.toml','rb'))" in workflow_text
 assert "from tools.package_runtime_release import RELEASE_LABEL" in workflow_text
 assert "Unsafe or unsupported package version" in workflow_text
-assert "release_label=$releaseLabel" in workflow_text
 assert "HMB_RELEASE_LABEL=$releaseLabel" in workflow_text
 assert 'HMB_GP_Production_${releaseLabel}_Runtime.zip' in workflow_text
-assert "steps.release_metadata.outputs.archive_name" in workflow_text
-assert "needs.windows-release-audit.outputs.package_version" in workflow_text
-assert "needs.windows-release-audit.outputs.release_label" in workflow_text
+assert "Verify Team tag matches the audited version" in workflow_text
+assert "$env:GITHUB_REF_NAME -cne $releaseLabel" in workflow_text
+assert "HMB_RUNTIME_ARCHIVE=$archiveName" in workflow_text
+assert "contents: write" not in workflow_text
+assert "gh release " not in workflow_text
+upload_steps = re.findall(
+    r"uses: actions/upload-artifact@[^\n]+\n(.*?)(?=^      - |\Z)",
+    workflow_text, re.MULTILINE | re.DOTALL,
+)
+assert len(upload_steps) == 1 and "hmb-coverage/" in upload_steps[0]
+assert "HMB_RUNTIME_ARCHIVE" not in upload_steps[0] and ".zip" not in upload_steps[0]
 assert re.search(
     r"Even(?: technical)? patch version v?\$version is local-test-only",
     workflow_text,
