@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import Future
-from contextlib import ExitStack, suppress
+from contextlib import suppress
 from copy import deepcopy
 import hashlib
 import json
@@ -492,48 +491,32 @@ class MyBoxController:
             requested_id=cp.get("job_id") or cp["client_request_id"],
             identifier=cp.get("reference_lease_id", ""), private_scope=True)
 
-    def _completed_media_claim(self, cp: dict[str, Any], broker: Any, job: dict[str, Any]):
-        workspace = cp.get("selection", {}).get("workspace_id")
-        authorized = (workspace and job.get("status") == "completed" and job.get("scope") == protocol.SCOPE
-            and job.get("publish_to_reviews") is False and job.get("workspace_id") == workspace
-            and job.get("job_id") == cp.get("job_id"))
-        return _host(self.node)._completed_review_source(getattr(broker, "_bridge", None) if authorized else None,
-            job.get("job_id"), private=True)
-
-    async def _complete(self, cp: dict[str, Any], broker: Any, job: dict[str, Any], *, epoch: int, origin: str,
-                        review_source: Future) -> dict[str, Any]:
+    async def _complete(self, cp: dict[str, Any], broker: Any, job: dict[str, Any], *, epoch: int, origin: str) -> dict[str, Any]:
         node, m = self.node, _host(self.node)
         self._guard(epoch, origin)
         self._status("downloading", job["job_id"])
         data = await asyncio.to_thread(broker.download_result, job, is_alive=lambda: self._alive(epoch, origin), timeout=300)
         self._guard(epoch, origin)
-        try:
-            self._status("verifying", job["job_id"])
-            destination = m._SeedanceDraftOutputDestination(cp["output_file"])
-            digest = hashlib.sha256(data).hexdigest()
-            def same_file() -> bool:
-                path = Path(cp["output_file"])
-                return path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == digest
-            if await asyncio.to_thread(same_file):
-                saved = m.File(cp["output_file"])
-            else:
-                publication = asyncio.create_task(node._atomic_publish_completed_video(destination, data, cp["output_format"]))
-                while True:
-                    try:
-                        saved = await asyncio.shield(publication)
-                        break
-                    except asyncio.CancelledError:
-                        # A filesystem commit can have won the cancellation race.
-                        # Observe its outcome before deciding whether this paid Task
-                        # still requires publication; never report saved bytes lost.
-                        if publication.done() and publication.cancelled():
-                            raise
-        except Exception:
-            if self._alive(epoch, origin):
-                review_source.set_result(data)
-            raise
-        if self._alive(epoch, origin):
-            review_source.set_result(m._published_review_original(saved, data))
+        self._status("verifying", job["job_id"])
+        destination = m._SeedanceDraftOutputDestination(cp["output_file"])
+        digest = hashlib.sha256(data).hexdigest()
+        def same_file() -> bool:
+            path = Path(cp["output_file"])
+            return path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == digest
+        if await asyncio.to_thread(same_file):
+            saved = m.File(cp["output_file"])
+        else:
+            publication = asyncio.create_task(node._atomic_publish_completed_video(destination, data, cp["output_format"]))
+            while True:
+                try:
+                    saved = await asyncio.shield(publication)
+                    break
+                except asyncio.CancelledError:
+                    # A filesystem commit can have won the cancellation race.
+                    # Observe its outcome before deciding whether this paid Task
+                    # still requires publication; never report saved bytes lost.
+                    if publication.done() and publication.cancelled():
+                        raise
         path = str(saved.location)
         cp = {**cp, "stage": "local_succeeded", "status": "completed", "output_file": path, "saved_file_sha256": digest}
         quality = "480p" if cp.get("draft_preview") else cp.get("draft_final_resolution")
@@ -778,8 +761,6 @@ class MyBoxController:
         historical_unresolved = False
         submitted_this_run = False
         completion_attempted = False
-        review_claim = ExitStack()
-        review_source = None
         try:
             if final and final_resolution not in _host(self.node).DRAFT_FINAL_RESOLUTIONS:
                 raise ValueError("Choose a supported private Draft Final resolution.")
@@ -839,11 +820,7 @@ class MyBoxController:
                 job = await asyncio.to_thread(broker.refresh, cp.get("job_id") or cp["client_request_id"], selection=cp["selection"], client_request_id=cp["client_request_id"], timeout=300)
                 self._guard(epoch, origin)
                 await self.node._run_blocking_generation_stage(self._observe_reference_job, cp, job)
-                if job["status"] == "completed" and cp.get("job_id") == job.get("job_id"):
-                    review_source = review_claim.enter_context(self._completed_media_claim(cp, broker, job))
                 if job["status"] == "completed" and await self._reuse_local(cp, epoch=epoch, origin=origin):
-                    if review_source is not None and self._alive(epoch, origin):
-                        review_source.set_result(Path(cp["output_file"]))
                     if _preview_task_id(cp):
                         with suppress(Exception):
                             await self._final_source(broker, cp)
@@ -960,15 +937,10 @@ class MyBoxController:
                 cp = await self._adopt(cp, job)
             if job["status"] == "completed":
                 completion_attempted = True
-                if review_source is None:
-                    review_source = review_claim.enter_context(self._completed_media_claim(cp, broker, job))
-                cp = await self._complete(cp, broker, job, epoch=epoch, origin=origin, review_source=review_source)
+                cp = await self._complete(cp, broker, job, epoch=epoch, origin=origin)
             else:
                 self._status("failed", cp.get("job_id", ""), successful=False, details="FAILURE: My Box Task failed. The saved Task and previous local video are retained.")
         except (Exception, asyncio.CancelledError) as exc:
-            if (review_source is not None and not review_source.done() and self._alive(epoch, origin)
-                    and not isinstance(exc, asyncio.CancelledError)):
-                review_source.set_result(None)
             if not self._deleted and not getattr(self.node, "_hmb_node_deleted", False):
                 with suppress(Exception):
                     current = self.checkpoint()
@@ -998,7 +970,6 @@ class MyBoxController:
             if isinstance(exc, asyncio.CancelledError):
                 raise
         finally:
-            review_claim.close()
             self._active_final_resolution = ""
             self._busy = False
             self._lock.release()

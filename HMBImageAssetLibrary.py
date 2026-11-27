@@ -1027,11 +1027,38 @@ def _taxonomy_key(value: Any) -> str:
     return re.sub(r"[^0-9a-z]+", "", _clean(value).casefold())
 
 
+def _open_shared_asset_read(path: Path):
+    """Allow a teammate to rename or delete a source while this reader is open."""
+    if os.name != "nt":
+        return path.open("rb")
+    import _winapi
+    import msvcrt
+
+    def open_descriptor(filename, _flags):
+        # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
+        handle = _winapi.CreateFile(filename, _winapi.GENERIC_READ, 0x7, 0, _winapi.OPEN_EXISTING, 0, 0)
+        try:
+            return msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+        except BaseException:
+            _winapi.CloseHandle(handle)
+            raise
+
+    return open(path, "rb", opener=open_descriptor)
+
+
+def _read_shared_manifest_bytes(path: Path) -> bytes:
+    with _open_shared_asset_read(path) as stream:
+        data = stream.read(2 * 1024 * 1024 + 1)
+    if len(data) > 2 * 1024 * 1024:
+        raise ValueError("Image asset manifest exceeds 2 MiB.")
+    return data
+
+
 def _asset_dimensions(path: Path) -> tuple[int, int]:
     try:
         from PIL import Image
 
-        with Image.open(path) as image:
+        with _open_shared_asset_read(path) as stream, Image.open(stream) as image:
             width, height = image.size
             return max(0, int(width)), max(0, int(height))
     except Exception:
@@ -1078,9 +1105,9 @@ def _verified_image_dimensions(source: Any) -> tuple[int, int]:
     header = b""
     if isinstance(source, (str, Path)):
         try:
-            with Path(source).open("rb") as stream:
-                header = stream.read(1024 * 1024)
-        except Exception as exc:
+            with _open_shared_asset_read(Path(source)) as stream:
+                return _verified_image_dimensions(stream)
+        except OSError as exc:
             raise ValueError(f"Image data could not be read safely: {exc}") from exc
     elif hasattr(source, "read"):
         try:
@@ -1108,17 +1135,13 @@ def _verified_image_dimensions(source: Any) -> tuple[int, int]:
 
 
 def _asset_content_probe(path: Path, size: int) -> str:
-    """Hash bounded file samples so equal stat metadata cannot alias content."""
+    """Fingerprint all bytes, preserving existing keys for images up to 64 KiB."""
 
-    sample_size = 32 * 1024
     digest = hashlib.sha256()
     digest.update(str(max(0, int(size))).encode("ascii"))
-    with path.open("rb") as stream:
-        first = stream.read(sample_size)
-        digest.update(first)
-        if size > sample_size:
-            stream.seek(max(sample_size, size - sample_size))
-            digest.update(stream.read(sample_size))
+    with _open_shared_asset_read(path) as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
     return digest.hexdigest()
 
 
@@ -1429,7 +1452,7 @@ def _write_persistent_thumbnail_cache(
 def _generate_thumbnail_payload(path: Path) -> tuple[bytes, str, int, int]:
     from PIL import Image
 
-    with Image.open(path) as image:
+    with _open_shared_asset_read(path) as stream, Image.open(stream) as image:
         image.seek(0)
         width, height = max(0, int(image.size[0])), max(0, int(image.size[1]))
         resampling = getattr(
@@ -2290,7 +2313,7 @@ def _project_cache_uid(root: Path) -> str:
             and not _is_reparse_point(manifest_path)
             and manifest_path.stat().st_size <= 2 * 1024 * 1024
         ):
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            payload = json.loads(_read_shared_manifest_bytes(manifest_path).decode("utf-8"))
             if isinstance(payload, dict):
                 persisted = _valid_project_cache_uid(
                     payload.get(_ASSET_PROJECT_CACHE_UID_FIELD)
@@ -2833,10 +2856,7 @@ def _asset_manifest_signature(root: Path) -> str:
         # Fast atomic replacement (and some SMB clients) can preserve every
         # stat field. Registration/project identity must still change then.
         # Only this bounded JSON is read; image contents are not polled.
-        with manifest_path.open("rb") as stream:
-            manifest_bytes = stream.read(2 * 1024 * 1024 + 1)
-        if len(manifest_bytes) > 2 * 1024 * 1024:
-            raise ValueError("Image asset manifest exceeds 2 MiB.")
+        manifest_bytes = _read_shared_manifest_bytes(manifest_path)
         payload = "|".join(
             (
                 # An old registration file is a read-only source during a
@@ -2928,6 +2948,27 @@ def _catalog_directory_entries(root, current):
     return rows
 
 
+def _retryable_inventory_error(exc: OSError) -> bool:
+    return isinstance(exc, (FileNotFoundError, NotADirectoryError)) or getattr(exc, "winerror", None) in {32, 33, 59}
+
+
+def _asset_refresh_error(exc: Exception) -> str:
+    if getattr(exc, "winerror", None) in {32, 33}:
+        return f"다른 프로그램이 경로를 사용 중입니다. 해당 작업이 끝나면 새로고침하세요. {exc}"
+    return str(exc) or type(exc).__name__
+
+
+def _read_catalog_inventory(root, previous, dirty, *, full):
+    try:
+        return _collect_catalog_inventory(root, previous, dirty, full=full)
+    except OSError as exc:
+        if not _retryable_inventory_error(exc):
+            raise
+    # SMB may still list a child removed during reorganization. Re-enumerate
+    # from the root once without reusing any entries from the failed walk.
+    return _collect_catalog_inventory(root, {}, set(), full=True)
+
+
 def _catalog_file_inventory(root: Path, *, incremental=False, reconcile=False, confirm=False,
                             manifest_signature="", records=None, full=False):
     """Default full verification is kept for registration and cleanup authority.
@@ -2938,7 +2979,7 @@ def _catalog_file_inventory(root: Path, *, incremental=False, reconcile=False, c
     file probe also revisits a rotating window. Explicit Refresh visits all.
     """
     if not incremental:
-        return _collect_catalog_inventory(root, {}, set(), full=True)[:3]
+        return _read_catalog_inventory(root, {}, set(), full=True)[:3]
     root_facts = root.lstat()
     identity = (root, _asset_manifest_cache_root_key(root), root_facts.st_dev, root_facts.st_ino)
     with _CATALOG_INVENTORIES_LOCK:
@@ -2977,15 +3018,7 @@ def _catalog_file_inventory(root: Path, *, incremental=False, reconcile=False, c
             count = min(len(ordered), _RAW_FOLDER_PROBE_BATCH)
             dirty.update(ordered[(cursor + offset) % len(ordered)] for offset in range(count))
             cursor = (cursor + count) % len(ordered)
-        try:
-            folders, images, metadata, updated, visited = _collect_catalog_inventory(root, old, dirty, full=full)
-        except (FileNotFoundError, NotADirectoryError):
-            # A mapped share can retain the old parent's timestamp after a
-            # child has gone or changed type. Recover from actual directory
-            # entries; never advance the rotation on a failed partial walk.
-            if not old or full:
-                raise
-            folders, images, metadata, updated, visited = _collect_catalog_inventory(root, {}, set(), full=True)
+        folders, images, metadata, updated, visited = _read_catalog_inventory(root, old, dirty, full=full)
         # Publish atomically after the complete read. A blocked or disconnected
         # share cannot replace the last verified snapshot with a partial list.
         memo["entries"] = updated if len(folders) < MAX_FOLDERS and len(images) < MAX_ASSETS else {}
@@ -3104,7 +3137,7 @@ def _load_asset_manifest_document(
     try:
         if source_path.stat().st_size > 2 * 1024 * 1024:
             raise ValueError("Image asset manifest exceeds 2 MiB.")
-        payload = json.loads(source_path.read_text(encoding="utf-8"))
+        payload = json.loads(_read_shared_manifest_bytes(source_path).decode("utf-8"))
     except Exception as exc:
         raise ValueError(f"Unable to read {source_path.name}: {exc}") from exc
     records = payload.get("assets") if isinstance(payload, dict) else payload
@@ -3184,7 +3217,7 @@ def _write_asset_manifest_record(root: Path, record: Dict[str, Any], *, action="
             return _write_asset_manifest_record_locked(root, record, action=action, revision=revision)
 
 
-def _replace_registration_manifest(temporary: Path, manifest: Path) -> None:
+def _replace_registration_manifest(temporary: Path, manifest: Path, *, before_retry=None) -> None:
     """A short-lived SMB reader can deny replacement even with the writer lock."""
     for delay in (0.04, 0.08, 0.16, 0.32, 0.64, 1.0):
         try:
@@ -3196,6 +3229,8 @@ def _replace_registration_manifest(temporary: Path, manifest: Path) -> None:
             # Keep our existing FIFO turn, prepared bytes and legacy commit
             # lock. Never remove the previous registry or repeat the Add.
             time.sleep(delay)
+            if before_retry is not None:
+                before_retry()
     os.replace(temporary, manifest)
 
 
@@ -3238,15 +3273,6 @@ def _write_asset_manifest_record_locked(
             raise ValueError("등록한 계정만 수정하거나 삭제할 수 있습니다. 등록 정보가 바뀌었다면 새로고침하세요.")
     elif matching_indices:
         raise ValueError("This image asset is already registered and cannot be edited. Only unregistered assets can be added.")
-    else:
-        # An old client can still post Add against a moved row using a new
-        # display name. Recheck that exceptional case under the shared lock.
-        by_path = {_manifest_asset_relative_path(root, row).casefold(): row for row in records if isinstance(row, dict)}
-        parts = relative_key.split("/")
-        if any("/".join([*parts[:depth], parts[-1]]) in by_path for depth in range(1, len(parts) - 1)):
-            folders, files, _ = _catalog_file_inventory(root)
-            if relative_key in _manifest_at_current_paths(by_path, root, folders, files):
-                raise ValueError("This image asset is already registered and cannot be edited.")
     if not matching_indices and len(records) >= MAX_ASSETS:
         raise ValueError(
             f"{manifest_path.name} reached the {MAX_ASSETS}-asset safety limit."
@@ -3353,7 +3379,7 @@ def _read_asset_manifest(root: Path, *, signature: str = "") -> Dict[str, Dict[s
         try:
             if manifest_path.stat().st_size > 2 * 1024 * 1024:
                 raise ValueError("Image asset manifest exceeds 2 MiB.")
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            payload = json.loads(_read_shared_manifest_bytes(manifest_path).decode("utf-8"))
         except Exception as exc:
             raise ValueError(f"Unable to read {manifest_path.name}: {exc}") from exc
         records = payload.get("assets") if isinstance(payload, dict) else payload
@@ -3421,7 +3447,7 @@ def _refresh_manifest_document(
             raise ValueError(f"Refresh manifest is not a regular file: {candidate}")
         if facts.st_size > 2 * 1024 * 1024:
             raise ValueError("Refresh manifest exceeds 2 MiB.")
-        original = candidate.read_bytes()
+        original = _read_shared_manifest_bytes(candidate)
         if len(original) > 2 * 1024 * 1024:
             raise ValueError("Refresh manifest exceeds 2 MiB.")
         payload = json.loads(original.decode("utf-8-sig"))
@@ -3461,7 +3487,35 @@ def _refresh_manifest_relative_path(record: Any) -> str:
     return relative
 
 
-def _audit_project_manifest_refresh(root: Path) -> Dict[str, Any]:
+def _refresh_registration_is_missing(root: Path, relative: str) -> bool:
+    parts = relative.split("/")
+    try:
+        _refresh_manifest_regular_stat(root.joinpath(*parts))
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 59:
+            raise
+        # Some SMB servers return ERROR_UNEXP_NET_ERR for lookups under a
+        # deleted directory. Only a complete listing of a stable, accessible
+        # parent can distinguish that case from loss of the share.
+        directory = root
+        for part in parts:
+            before = _refresh_manifest_regular_stat(directory)
+            if not stat.S_ISDIR(before.st_mode):
+                raise
+            with os.scandir(directory) as entries:
+                names = {entry.name.casefold() for entry in entries}
+            if _catalog_directory_stamp(before) != _catalog_directory_stamp(_refresh_manifest_regular_stat(directory)):
+                raise
+            if part.casefold() not in names:
+                return True
+            directory /= part
+        raise
+    return False
+
+
+def _audit_project_manifest_refresh(root: Path, *, _retry: bool = True) -> Dict[str, Any]:
     """Explicit Refresh only: compare a stable, fully accessible image inventory.
 
     Ordinary polling deliberately remains best effort. This separate audit is
@@ -3549,15 +3603,12 @@ def _audit_project_manifest_refresh(root: Path) -> Dict[str, Any]:
         review["file_count"] = len(inventory)
         missing_records: List[Dict[str, Any]] = []
         missing_paths: List[str] = []
-        moves, possible_moves = _manifest_folder_moves(registered, inventory)
         for key, (relative, record) in registered.items():
-            if key in inventory or key in possible_moves:
+            if key in inventory:
                 continue
             # A full successful walk must agree with a direct lookup. A
             # permission/network error, changed folder, or restored file aborts.
-            try:
-                _refresh_manifest_regular_stat(root.joinpath(*relative.split("/")))
-            except FileNotFoundError:
+            if _refresh_registration_is_missing(root, relative):
                 missing_records.append(copy.deepcopy(record))
                 missing_paths.append(relative)
             else:
@@ -3574,9 +3625,8 @@ def _audit_project_manifest_refresh(root: Path) -> Dict[str, Any]:
         with os.scandir(root) as entries:
             for _entry in entries:
                 pass
-        moved_paths = set(moves.values())
         unregistered = sorted(
-            (row[0] for key, row in inventory.items() if key not in registered and key not in moved_paths),
+            (row[0] for key, row in inventory.items() if key not in registered),
             key=str.casefold,
         )
         inventory_payload = {
@@ -3597,8 +3647,10 @@ def _audit_project_manifest_refresh(root: Path) -> Dict[str, Any]:
             "safe_to_clean": source_path is None or source_path.is_relative_to(root),
         })
     except Exception as exc:
+        if _retry and isinstance(exc, OSError) and _retryable_inventory_error(exc):
+            return _audit_project_manifest_refresh(root, _retry=False)
         review["safe_to_clean"] = False
-        review["error"] = str(exc) or type(exc).__name__
+        review["error"] = _asset_refresh_error(exc)
     return review
 
 
@@ -3667,23 +3719,22 @@ def _clean_project_manifest_refresh(
                     handle.write(encoded)
                     handle.flush()
                     os.fsync(handle.fileno())
-                latest_path, latest_bytes, _latest_payload, _latest_records = _refresh_manifest_document(root)
-                if latest_path != manifest_path or latest_bytes != original:
-                    raise ValueError("Registration JSON changed before cleanup; please refresh again.")
-                for relative in current["missing_paths"]:
-                    try:
-                        _refresh_manifest_regular_stat(root.joinpath(*relative.split("/")))
-                    except FileNotFoundError:
-                        pass
-                    else:
-                        raise ValueError("An image was restored before cleanup; please refresh again.")
-                with os.scandir(root) as entries:
-                    for _entry in entries:
-                        pass
-                if not is_current():
-                    raise ValueError("Refresh confirmation expired before saving; nothing was removed.")
+                def verify_before_replace():
+                    latest_path, latest_bytes, _latest_payload, _latest_records = _refresh_manifest_document(root)
+                    if latest_path != manifest_path or latest_bytes != original:
+                        raise ValueError("Registration JSON changed before cleanup; please refresh again.")
+                    for relative in current["missing_paths"]:
+                        if not _refresh_registration_is_missing(root, relative):
+                            raise ValueError("An image was restored before cleanup; please refresh again.")
+                    with os.scandir(root) as entries:
+                        for _entry in entries:
+                            pass
+                    if not is_current():
+                        raise ValueError("Refresh confirmation expired before saving; nothing was removed.")
+
+                verify_before_replace()
                 replace_attempted = True
-                os.replace(temporary, manifest_path)
+                _replace_registration_manifest(temporary, manifest_path, before_retry=verify_before_replace)
             except Exception as exc:
                 # SMB may commit a rename before its acknowledgement is lost.
                 # Retain rollback bytes whenever the commit outcome is unknown.
@@ -3693,6 +3744,11 @@ def _clean_project_manifest_refresh(
                     except OSError:
                         pass
                 if replace_attempted:
+                    if getattr(exc, "winerror", None) in {5, 32, 33}:
+                        raise RuntimeError(
+                            f"등록 JSON을 교체할 수 없습니다. 파일 사용 중 여부와 쓰기 권한을 확인한 뒤 "
+                            f"새로고침하세요. 원본 백업: {backup}. {exc}"
+                        ) from exc
                     raise RuntimeError(
                         f"Registration cleanup save could not be confirmed. Refresh to verify the current JSON; backup retained: {backup}. {exc}"
                     ) from exc
@@ -3724,33 +3780,6 @@ def _clean_project_manifest_refresh(
                 "backup_warning": backup_warning,
             })
             return result
-
-
-def _manifest_folder_moves(records, inventory):
-    """Match a missing server path only to one namesake in a descendant folder."""
-    present = set(inventory)
-    missing = records.keys() - present
-    candidates = {}
-    for path in present:
-        parts = path.split("/")
-        for depth in range(1, len(parts) - 1):
-            old = "/".join([*parts[:depth], parts[-1]])
-            if old in missing:
-                candidates.setdefault(old, []).append(path)
-    claims = {}
-    for paths in candidates.values():
-        for path in paths:
-            claims[path] = claims.get(path, 0) + 1
-    moves = {old: paths[0] for old, paths in candidates.items()
-             if len(paths) == 1 and paths[0] not in records and claims[paths[0]] == 1}
-    return moves, candidates.keys()
-
-
-def _manifest_at_current_paths(records, root, folders, paths):
-    if len(folders) >= MAX_FOLDERS or len(paths) >= MAX_ASSETS:
-        return records
-    moves, _ = _manifest_folder_moves(records, (path.relative_to(root).as_posix().casefold() for path in paths))
-    return {moves.get(key, key): record for key, record in records.items()}
 
 
 def _restore_manifest_registration(asset, root, relative, overrides, stems):
@@ -3785,27 +3814,11 @@ def _read_selection_registrations(root, selected):
         try:
             physical = _site_root(root, settings, site)
             entries = _read_asset_manifest(physical)
-            missing = wanted - entries.keys()
-            for key in wanted & entries.keys():
-                origin = _manifest_asset_relative_path(physical, entries[key])
-                if origin and not (physical / origin).is_file():
-                    missing.add(key)
-            current_paths = {}
-            if missing:
-                folders, paths, _ = _catalog_file_inventory(physical)
-                entries = _manifest_at_current_paths(entries, physical, folders, paths)
-                current_paths = {path.relative_to(physical).as_posix().casefold():
-                                 path.relative_to(physical).as_posix() for path in paths}
         except (OSError, ValueError):
             continue
         prefix = "" if site == "hq" else f"site:{site}/"
-        for relative, record in entries.items():
-            origin = _manifest_asset_relative_path(physical, record).casefold()
-            if relative in wanted or origin in missing:
-                direct = {key: value for key, value in record.items() if key != "_selected_move_path"}
-                records[prefix + relative] = direct
-                if origin in missing and origin != relative and relative in current_paths:
-                    records[prefix + origin] = {**direct, "_selected_move_path": prefix + current_paths[relative]}
+        for relative in wanted & entries.keys():
+            records[prefix + relative] = entries[relative]
     return records
 
 
@@ -3847,44 +3860,16 @@ def _manifest_for_selection(root, selected, *, catalog_root=None, wait_for_catal
         if not row.get("registered") or not row.get("connected", True):
             continue
         relative = row["relative_path"].casefold()
-        origin = _clean(row.get("registration_relative_path")).casefold()
-        if relative in requested or origin in requested:
+        if relative in requested:
             records[relative] = row
-        if origin in requested and origin != relative:
-            records[origin] = {**row, "_selected_move_path": row["relative_path"]}
     return records
-
-
-def _verify_moved_selection(asset, state, records):
-    # Preserve the exact saved Shot slot while the browse scan catches up.
-    old_path = _clean(asset.get("relative_path"))
-    moved_path = _clean(records.get(old_path.casefold(), {}).get("_selected_move_path"))
-    if not moved_path:
-        return asset, ""
-    site, old_relative = _site_location(old_path)
-    new_site, new_relative = _site_location(moved_path)
-    project = _site_project_key(state["project_id"], site)
-    if new_site != site or asset.get("asset_library_id") != _asset_library_id(project, old_relative):
-        return asset, ""
-    root = Path(state["project_root"])
-    try:
-        physical = _site_root(root, get_site_settings(root), site)
-        previous = _resolve_image_path(physical / old_relative)
-        if _resolve_image_path(Path(asset["path"])) != previous or previous.is_file():
-            return asset, ""
-    except (OSError, ValueError):
-        return asset, ""
-    current = {**asset, "relative_path": moved_path, "path": str(physical / new_relative),
-               "asset_library_id": _asset_library_id(project, new_relative)}
-    verified = _verified_project_relative_path(current, state, records)
-    return (current, verified) if verified else (asset, "")
 
 
 def _revalidate_saved_registration(asset, state, records):
     """Read current registry metadata for the exact file in an older save."""
     relative = _clean(asset.get("relative_path"))
     record = records.get(relative.casefold())
-    if record is None or record.get("_selected_move_path"):
+    if record is None:
         return asset, ""
     current = {**asset, **_normalize_image_taxonomy_fields(record)}
     current["asset_id"] = _clean(record.get("asset_id")) or asset["asset_id"]
@@ -3941,7 +3926,7 @@ def _suggest_registration_names(assets, *, writer="hq", manifest_records=()):
 @lru_cache(maxsize=256)
 def _image_content_digest(path, size, modified, changed, inode):
     # The stat fields key the cache for the small number of import collisions.
-    with path.open("rb") as stream:
+    with _open_shared_asset_read(path) as stream:
         digest = hashlib.sha256()
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
@@ -3979,6 +3964,50 @@ def _legacy_import_originals(root, paths, registrations):
     return originals
 
 
+def _windows_folder_change_times(folder: Path) -> dict[str, int]:
+    """Get filesystem ChangeTime in directory batches; Python's Windows ctime is creation time."""
+    import _winapi
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    query = kernel.GetFileInformationByHandleEx
+    query.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+    query.restype = wintypes.BOOL
+    times = {}
+    remote = folder.drive.startswith("\\\\") or kernel.GetDriveTypeW(ctypes.c_wchar_p(folder.anchor)) == 4
+    buffer = ctypes.create_string_buffer(64 * 1024)
+    # FILE_LIST_DIRECTORY, all share modes, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS.
+    try:
+        handle = _winapi.CreateFile(str(folder), 1, 7, 0, _winapi.OPEN_EXISTING, 0x02000000, 0)
+    except OSError:
+        return {}
+    try:
+        while query(handle, 14, buffer, len(buffer)):  # FileFullDirectoryInfo
+            offset = 0
+            while True:
+                # FILE_FULL_DIR_INFO has a 68-byte header followed by a UTF-16 name.
+                if offset + 68 > len(buffer):
+                    return {}
+                step = struct.unpack_from("<I", buffer, offset)[0]
+                created, _, modified, changed = struct.unpack_from("<4q", buffer, offset + 8)
+                length = struct.unpack_from("<I", buffer, offset + 60)[0]
+                end = offset + 68 + length
+                if length % 2 or end > len(buffer) or (step and step < 68 + length):
+                    return {}
+                name = buffer[offset + 68:end].decode("utf-16-le", "surrogatepass")
+                # Some NAS implementations supply creation or write time in both fields.
+                if changed > 0 and not (remote and changed in (created, modified)):
+                    times[name] = changed
+                if not step:
+                    break
+                offset += step
+        # Unsupported queries and incomplete listings require content verification.
+        return times if ctypes.get_last_error() == 18 else {}  # ERROR_NO_MORE_FILES
+    finally:
+        _winapi.CloseHandle(handle)
+
+
 def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | None = None,
                          verify_all_files: bool = False) -> Dict[str, Any]:
     """Scan one selected project and classify image files with common taxonomy."""
@@ -4011,7 +4040,6 @@ def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | N
     folders, paths, metadata = _catalog_file_inventory(
         root, incremental=True, full=verify_all_files or previous_scan is None,
         manifest_signature=manifest_signature, records=manifest_overrides)
-    manifest_overrides = _manifest_at_current_paths(manifest_overrides, root, folders, paths)
     warnings: List[str] = []
     folder_signature = _folder_metadata_signature_from_inventory(root, folders, paths, metadata=metadata)
     previous = previous_scan or {}
@@ -4027,6 +4055,7 @@ def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | N
 
     assets: List[Dict[str, Any]] = []
     legacy_originals = _legacy_import_originals(root, paths, manifest_overrides)
+    change_times = {}
     for path in paths:
         if path in legacy_originals:
             continue
@@ -4054,18 +4083,32 @@ def _scan_project_assets(project_root: Any, *, previous_scan: Dict[str, Any] | N
         )
         library_id = _asset_library_id(project_id, relative_text)
         facts = metadata[path]
-        file_stamp = hashlib.sha256((str(root).casefold() + "|" + relative_text.casefold() + "|" +
-            str((facts.st_size, facts.st_mtime_ns, facts.st_ctime_ns))).encode("utf-8")).hexdigest()
+        if os.name == "nt":
+            parent = path.parent
+            if parent not in change_times:
+                change_times[parent] = _windows_folder_change_times(parent)
+            change_time = change_times[parent].get(path.name)
+        else:
+            change_time = facts.st_ctime_ns
+        file_stamp = "v2:unverified"
+        if change_time:
+            stamp_values = (facts.st_size, facts.st_mtime_ns, facts.st_ctime_ns, change_time)
+            stamp_key = f"{str(root).casefold()}|{relative_text.casefold()}|{stamp_values}"
+            file_stamp = "v2:" + hashlib.sha256(stamp_key.encode("utf-8")).hexdigest()[:61]
         prior = reusable.get(relative_text.casefold(), {})
-        if prior.get("catalog_file_stamp") == file_stamp and _clean(prior.get("media_signature")):
+        if change_time and prior.get("catalog_file_stamp") == file_stamp and _clean(prior.get("media_signature")):
             width, height = _non_negative_int(prior.get("width")), _non_negative_int(prior.get("height"))
             media_signature = _clean(prior["media_signature"])
         else:
-            width, height = _asset_dimensions(path)
+            width, height = 0, 0
             try:
                 _resolved, _size, _mtime_ns, media_signature = _asset_file_facts(
                     path, project_uid=project_cache_uid, relative_path=relative_text, inventory_root=root,
                 )
+                if media_signature == prior.get("media_signature"):
+                    width, height = _non_negative_int(prior.get("width")), _non_negative_int(prior.get("height"))
+                else:
+                    width, height = _asset_dimensions(path)
                 # Reuse is presentation-only, never media/cleanup authority.
                 # Do not stamp a file that changed while it was being read.
                 after = path.stat()
@@ -4602,6 +4645,17 @@ def _sha256_canonical(value: Any) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _shot_link_notices(entries):
+    notices = {}
+    for entry in entries if isinstance(entries, list) else ():
+        if isinstance(entry, dict) and (uid := _clean(entry.get("uid"))[:512]):
+            path = _clean(entry.get("path"))
+            if len(path) > 4096 or re.match(r"^(?:data:|blob:|[a-z][a-z0-9+.-]*://)", path, re.I):
+                path = ""
+            notices[uid] = dict(uid=uid, label=_clean(entry.get("label"))[:256], path=path)
+    return list(notices.values())[-MAX_SHOT_IMAGES:]
+
+
 def _normalize_shot_routing(
     value: Any,
     ordered_selected_source_uids: Sequence[str],
@@ -4679,6 +4733,8 @@ def _normalize_shot_routing(
                 "name_is_custom": name_is_custom,
                 "revision": revision,
                 "selected_source_uids": selected_source_uids,
+                **({"image_link_notices": _shot_link_notices(item["image_link_notices"])}
+                   if "image_link_notices" in item else {}),
                 "media_count": min(
                     len(selected_source_uids),
                     _non_negative_int(item.get("media_count")),
@@ -5224,6 +5280,21 @@ def _normalize_site_selection_memory(value):
     return result
 
 
+def _retire_shot_image_links(state, removed):
+    """Retain the old label and path outside the playable Shot membership."""
+    if removed:
+        state["shot_routing"] = copy.deepcopy(state["shot_routing"])
+        for shot in state["shot_routing"]["shots"]:
+            members = shot["selected_source_uids"]
+            lost = [dict(uid=uid, label=removed[uid].get("image_name"), path=removed[uid].get("path"))
+                    for uid in members if uid in removed]
+            if lost:
+                shot["image_link_notices"] = _shot_link_notices([*shot.get("image_link_notices", []), *lost])
+                shot["selected_source_uids"] = [uid for uid in members if uid not in removed]
+                shot["revision"] += 1
+                state["shot_routing"]["generation"] += 1
+
+
 def _restore_site_selection(state, previous, same_project):
     memory = _normalize_site_selection_memory(previous.get("site_selection_memory")) if same_project else {}
     state["site_selection_memory"] = memory
@@ -5234,16 +5305,25 @@ def _restore_site_selection(state, previous, same_project):
     # Only a disconnected folder generates bookmarks. Removal of a registered
     # image inside a connected folder still follows the normal removal rules.
     active_sites = {f[5:] for f in state.get("folders", []) if f.startswith("site:") and "/" not in f}
+    removed = {}
     for asset in previous.get("assets", []):
-        if asset.get("source_kind") != "project" or not asset.get("selected") or asset["source_uid"] in indexed:
+        if asset.get("source_kind") != "project" or not asset.get("selected"):
             continue
         site = _site_location(asset.get("relative_path"))[0]
-        if site == "hq" or site in active_sites:
-            continue
         uid = asset["source_uid"]
+        if site == "hq" or site in active_sites:
+            current = indexed.get(uid)
+            if asset.get("registered") and not (current and current.get("registered")) and not state.get("warnings"):
+                removed[uid] = asset
+                if current:
+                    current.update(selected=False, selection_order=0)
+            continue
+        if uid in indexed:
+            continue
         memory[uid] = {"site": site, "rank": asset["selection_order"], "shots": {
             shot["shot_uuid"]: shot["selected_source_uids"].index(uid) + 1 for shot in routing.get("shots", [])
             if uid in shot.get("selected_source_uids", [])}}
+    _retire_shot_image_links(state, removed)
     if not memory:
         return
     ordered = sorted((a for a in state["assets"] if a.get("selected")), key=lambda a: a["selection_order"])
@@ -5351,7 +5431,6 @@ def _merge_scan_with_state(
             "scan_revision": int(previous_state.get("scan_revision") or 0) + 1,
         }
     )
-    _restore_catalog_relocations(state, previous_state, same_project)
     _restore_site_selection(state, previous_state, same_project)
     return _normalize_state(state)
 
@@ -5382,31 +5461,6 @@ _ASYNC_SCAN_LIVE_STATE_FIELDS = (
     "disconnect_import_uid",
 )
 
-
-def _restore_catalog_relocations(state, previous, same_project):
-    """Carry Shot membership across moves already proven by the registration scan."""
-    if not same_project:
-        return
-    previous_rows = [row for row in previous.get("assets", []) if isinstance(row, dict)]
-    old_by_path = {_clean(row.get("relative_path")).casefold(): row for row in previous_rows
-                   if row.get("registered") and row.get("relative_path")}
-    current_paths = {row["relative_path"].casefold() for row in state["assets"] if row.get("relative_path")}
-    previous_uids = {_clean(row.get("source_uid")) for row in previous_rows}
-    origins = Counter(row["registration_relative_path"].casefold() for row in state["assets"]
-                      if row.get("registered") and row.get("registration_relative_path"))
-    for asset in state["assets"]:
-        origin = _clean(asset.get("registration_relative_path")).casefold()
-        old = old_by_path.get(origin)
-        old_uid = _clean(old.get("source_uid")) if old else ""
-        old_asset_id = _clean(old.get("asset_id")).casefold() if old else ""
-        if (not old_uid or not old_asset_id or origin in current_paths or origins[origin] != 1
-                or not asset.get("registered") or asset.get("connected") is False
-                or old_asset_id != _clean(asset.get("asset_id")).casefold()):
-            continue
-        if asset["source_uid"] not in previous_uids or old.get("selected"):
-            asset["selected"] = bool(old.get("selected"))
-            asset["selection_order"] = _non_negative_int(old.get("selection_order"))
-        _remap_shot_routing_source_uid(state, old_uid, asset["source_uid"])
 
 _ASYNC_SCAN_USER_ASSET_FIELDS = (
     "asset_id",
@@ -5539,7 +5593,6 @@ def _merge_async_scan_result_with_live_state(
         and _non_negative_int(asset.get("import_index")) > 0
     )
     merged["assets"] = assets
-    _restore_catalog_relocations(merged, live, same_project)
     _restore_site_selection(merged, live, same_project)
     merged["scan_revision"] = max(
         _non_negative_int(scanned.get("scan_revision")),
@@ -5609,6 +5662,8 @@ def _merge_async_registration_result_with_live_state(
     target["selected"] = bool(selected_order and target.get("registered"))
     target["selection_order"] = selected_order if target["selected"] else 0
     merged["assets"] = rows
+    if request.get("action") == "delete":
+        _retire_shot_image_links(merged, {target["source_uid"]: target})
     if import_uid:
         _remap_shot_routing_source_uid(merged, import_uid, target["source_uid"])
     for field in ("scan_revision", "thumbnail_revision"):
@@ -5735,8 +5790,7 @@ def _rebind_shared_catalog_snapshot(
             root, folders, paths, metadata=metadata
         ):
             return None
-        overrides = _manifest_at_current_paths(records, root, folders, paths)
-        verified_paths = set(paths) - _legacy_import_originals(root, paths, overrides)
+        verified_paths = set(paths) - _legacy_import_originals(root, paths, records)
         stems = Counter(path.stem.casefold() for path in paths)
         assets: List[Dict[str, Any]] = []
         for raw_asset in snapshot.get("assets", []):
@@ -5757,9 +5811,11 @@ def _rebind_shared_catalog_snapshot(
             rebound = root / relative
             if rebound not in verified_paths:
                 return None
+            if metadata[rebound].st_size > 65536 and not _clean(asset.get("catalog_file_stamp")).startswith("v2:"):
+                return None  # Older cache keys only covered the ends of large files.
             asset["path"] = str(rebound).replace("\\", "/")
             asset["asset_project_uid"] = project_uid
-            _restore_manifest_registration(asset, root, relative, overrides, stems)
+            _restore_manifest_registration(asset, root, relative, records, stems)
             if not _thumbnail_url_is_live(
                 asset.get("media_signature"), asset.get("thumbnail_url")
             ):
@@ -5954,7 +6010,7 @@ def _scan_linked_sites(project: Path, settings: dict, prior: dict, *, pinned=Non
             # offline. Offline rows are display data, never handover authority.
             rows.extend({**r, "connected": False} for r in previous_rows)
             folders.extend(f for f in prior.get("folders", []) if f.startswith(prefix + "/"))
-            warnings.append(f'{link["label"]}: 등록 폴더를 확인할 수 없습니다. {exc}')
+            warnings.append(f'{link["label"]}: 등록 폴더를 확인할 수 없습니다. {_asset_refresh_error(exc)}')
             manifest_signatures.extend((site, "offline"))
             folder_signatures.extend((site, "offline"))
             continue
@@ -6296,8 +6352,11 @@ def _read_local_catalog_snapshot(project_root: Any, previous_state: Dict[str, An
                 return None
             asset["path"] = (row_root / relative).as_posix()
             asset["thumbnail_url"] = ""
-            # An offline index can paint existing choices. Only the current
-            # registration scan may authorize a saved selection's relocation.
+            # An older cache may have assigned a registration by filename after
+            # a move. Rebuild that snapshot from the exact manifest paths.
+            origin = _clean(asset.get("registration_relative_path"))
+            if origin and origin.casefold() != virtual_path.casefold():
+                return None
             asset.pop("registration_relative_path", None)
         merged = _merge_scan_with_state(raw, previous_state)
         merged["scan_revision"] = _non_negative_int(previous_state.get("scan_revision"))
@@ -6470,8 +6529,7 @@ def _read_catalog_index(
             resolved_root, folders, paths, metadata=metadata
         ):
             return None
-        overrides = _manifest_at_current_paths(records, resolved_root, folders, paths)
-        verified_paths = set(paths) - _legacy_import_originals(resolved_root, paths, overrides)
+        verified_paths = set(paths) - _legacy_import_originals(resolved_root, paths, records)
         stems = Counter(path.stem.casefold() for path in paths)
         assets = raw.get("assets")
         if not isinstance(assets, list) or len(assets) > MAX_ASSETS:
@@ -6494,8 +6552,10 @@ def _read_catalog_index(
             resolved_asset = resolved_root / relative
             if resolved_asset not in verified_paths:
                 return None
+            if metadata[resolved_asset].st_size > 65536 and not _clean(asset.get("catalog_file_stamp")).startswith("v2:"):
+                return None
             asset["path"] = str(resolved_asset).replace("\\", "/")
-            _restore_manifest_registration(asset, resolved_root, relative, overrides, stems)
+            _restore_manifest_registration(asset, resolved_root, relative, records, stems)
             asset["thumbnail_url"] = ""
         if {Path(asset["path"]) for asset in assets} != verified_paths:
             return None
@@ -6829,7 +6889,7 @@ def _copy_import_to_project(
         try:
             with destination.open("xb") as output:
                 if local_source is not None:
-                    with local_source.open("rb") as source:
+                    with _open_shared_asset_read(local_source) as source:
                         shutil.copyfileobj(source, output, length=1024 * 1024)
                 else:
                     output.write(payload or b"")
@@ -7435,6 +7495,8 @@ def _commit_asset_registration(
             request.get("source_uid"),
             registered_row.get("source_uid"),
         )
+    if action == "delete":
+        _retire_shot_image_links(refreshed, {registered_row["source_uid"]: registered_row})
     refreshed["asset_registration_request"] = {}
     refreshed["asset_registration_result"] = {
         "request_id": request["request_id"],
@@ -7782,6 +7844,9 @@ def _merge_import_input(
     previous_uids = {asset["source_uid"] for asset in normalized["assets"]}
     previous_live_uids = {asset["source_uid"] for asset in normalized["assets"]
                           if asset["source_kind"] == "user" and asset["import_index"]}
+    if media_by_uid:
+        _retire_shot_image_links(normalized, {asset["source_uid"]: asset for asset in normalized["assets"]
+            if asset["source_uid"] in previous_live_uids and asset["source_uid"] not in media_by_uid})
     routing = normalized["shot_routing"]
     shots = routing["shots"]
     active = next(shot for shot in shots if shot["shot_uuid"] == routing["active_shot_uuid"])
@@ -7923,6 +7988,8 @@ def _merge_live_import_thumbnail_result(
 
 def _remove_live_imports(state: Dict[str, Any]) -> Dict[str, Any]:
     normalized = _normalize_state(state)
+    _retire_shot_image_links(normalized, {asset["source_uid"]: asset for asset in normalized["assets"]
+        if asset.get("source_kind") == "user" and asset.get("import_index")})
     normalized["assets"] = [
         dict(asset)
         for asset in normalized["assets"]
@@ -8714,8 +8781,6 @@ def _resolve_selected_assets(
                     relative_path = _verified_project_relative_path(asset, normalized, manifest_records)
                     if not relative_path and wait_for_catalog:
                         verified_asset, relative_path = _revalidate_saved_registration(asset, normalized, manifest_records)
-                    if not relative_path:
-                        verified_asset, relative_path = _verify_moved_selection(asset, normalized, manifest_records)
                 if relative_path:
                     media_value = _resolved_media_value(verified_asset.get("path"))
                 else:
@@ -11261,7 +11326,8 @@ class HMBImageAssetLibrary(DataNode):
         channel_uuid: str,
         shot_uuid: str,
         cached_only: bool = False,
-    ) -> Dict[str, Any]:
+        include_link_notices: bool = False,
+    ):
         """Resolve only one exact Shot and reject every missing owned source.
 
         Another Shot's unavailable share/file must not erase or block this
@@ -11319,7 +11385,29 @@ class HMBImageAssetLibrary(DataNode):
                 missing_files[uid] = reference
         if missing_files:
             raise _hmb_shot_routing.ShotImageUnavailable(missing_files)
-        return self._hmb_image_shot_snapshot_view(snapshot, scoped=True)
+        result = self._hmb_image_shot_snapshot_view(snapshot, scoped=True)
+        if include_link_notices:
+            return result, selected.get("image_link_notices")
+        return result
+
+    def _hmb_prompt_snapshot_and_link_notices(self, *, channel_uuid, shot_uuid):
+        return self._hmb_shot_routing_snapshot_for(channel_uuid=channel_uuid, shot_uuid=shot_uuid, include_link_notices=True)
+
+    @hmb_binding_mutation
+    def _hmb_update_shot_link_notices(self, channel_uuid, shot_uuid, *, additions=(), dismiss=()):
+        state = self._current_state()
+        routing = state["shot_routing"]
+        if routing["channel_uuid"] != channel_uuid:
+            raise ValueError("Image history belongs to a different publisher.")
+        shot = next(row for row in routing["shots"] if row["shot_uuid"] == shot_uuid)
+        prior = shot.get("image_link_notices", [])
+        notices = _shot_link_notices([*(n for n in prior if n["uid"] not in dismiss), *additions])
+        if notices != prior:
+            shot["image_link_notices"] = notices
+            shot["revision"] += 1
+            routing["generation"] += 1
+            self._publish_state(state, preserve_outputs=True, reconcile_graph=False)
+        return notices
 
     def _hmb_prompt_known_image_sources(self, source_uids: set[str]) -> set[str]:
         return {row["source_uid"] for row in self._current_state()["assets"]
@@ -11863,6 +11951,15 @@ class HMBImageAssetLibrary(DataNode):
             raise ValueError("Image asset Shot structure requires a newer structure revision.")
         for row in rows:
             previous = old_rows.get(row["shot_uuid"])
+            # The catalog owns notice contents. The widget may only dismiss
+            # existing entries in a newer Shot edit, never author an old link.
+            proposed = row.pop("image_link_notices", None)
+            if previous is not None and "image_link_notices" in previous:
+                notices = previous["image_link_notices"]
+                if isinstance(proposed, list) and _non_negative_int(row.get("revision")) > previous["revision"]:
+                    retained = {n["uid"] for n in _shot_link_notices(proposed)}
+                    notices = [n for n in notices if n["uid"] in retained]
+                row["image_link_notices"] = notices
             if previous is not None and _non_negative_int(row.get("revision")) < _non_negative_int(previous.get("revision")):
                 raise ValueError("Image asset Shot edit is older than the accepted Shot.")
             members = row.get("selected_source_uids")

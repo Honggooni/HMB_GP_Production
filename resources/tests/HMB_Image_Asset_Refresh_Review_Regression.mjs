@@ -54,7 +54,7 @@ for (const change of [
 const lifecycle = {};
 let view = hmbSyncImageAssetRefreshReview(lifecycle, initial);
 let markup = hmbRenderImageAssetRefreshReview(initial, view);
-assert.match(markup, /파일 없는 등록 정리/);
+assert.match(markup, /data-refresh-cleanup-confirm[^>]*>확인</);
 assert.match(markup, /이동되었거나 이름이 바뀌었을 수/);
 assert.match(markup, /자동으로 등록하지 않습니다/);
 assert.match(markup, /검사한 폴더/);
@@ -106,7 +106,7 @@ function makeHarness(value = initial, publish = () => {}) {
     const current = hmbSyncImageAssetRefreshReview(container, state);
     container.markup = hmbRenderImageAssetRefreshReview(state, current);
     container.controls.clear();
-    for (const attribute of ["data-refresh-review-backdrop", "data-refresh-review-cancel", "data-refresh-cleanup-start", "data-refresh-cleanup-confirm"]) {
+    for (const attribute of ["data-refresh-review-backdrop", "data-refresh-review-cancel", "data-refresh-cleanup-confirm"]) {
       if (container.markup.includes(attribute)) container.controls.set(`[${attribute}]`, new Control());
     }
     hmbInstallImageAssetRefreshReviewEvents(container, state, props, remount, (target, type, handler, options) => target?.addEventListener(type, handler, options));
@@ -117,12 +117,11 @@ function makeHarness(value = initial, publish = () => {}) {
 }
 
 const cancelled = makeHarness();
-cancelled.click("[data-refresh-cleanup-start]");
 assert.match(cancelled.container.markup, /JSON 메타데이터만/);
 assert.match(cancelled.container.markup, /실제 이미지 파일은 변경하지 않습니다/);
 assert.match(cancelled.container.markup, /백업을 생성/);
 assert.match(cancelled.container.markup, /기존 Shot은 수정하지 않습니다/);
-assert.equal(cancelled.writes.length, 0, "Opening confirmation never publishes.");
+assert.equal(cancelled.writes.length, 0, "Displaying the report never publishes.");
 cancelled.click("[data-refresh-review-cancel]");
 assert.equal(cancelled.writes.length, 0, "Cancel never publishes.");
 assert.equal(cancelled.container.markup, "");
@@ -136,7 +135,6 @@ assert.equal(escape.container.markup, "");
 assert.equal(escape.writes.length, 0);
 
 const confirmed = makeHarness();
-confirmed.click("[data-refresh-cleanup-start]");
 const confirm = confirmed.container.querySelector("[data-refresh-cleanup-confirm]");
 confirm.dispatch("click");
 confirm.dispatch("click");
@@ -155,19 +153,17 @@ confirmed.remount(cleanedState);
 assert.match(confirmed.container.markup, /정리한 등록: 1/);
 assert.match(confirmed.container.markup, /backup\.json/);
 assert.equal(confirmed.container.__hmbImageAssetRefreshCleanupPending, undefined);
-assert.equal(confirmed.container.querySelector("[data-refresh-cleanup-start]"), null);
+assert.equal(confirmed.container.querySelector("[data-refresh-cleanup-confirm]"), null);
 
 let syncHarness;
 syncHarness = makeHarness(initial, () => {
   syncHarness.remount(cleanedState);
 });
-syncHarness.click("[data-refresh-cleanup-start]");
 syncHarness.click("[data-refresh-cleanup-confirm]");
 assert.equal(syncHarness.container.__hmbImageAssetLatestState.asset_refresh_review.status, "cleaned", "A synchronous server completion must not be overwritten by the submitted review.");
 
 let rejectTransport;
 const failed = makeHarness(initial, () => new Promise((_resolve, reject) => { rejectTransport = reject; }));
-failed.click("[data-refresh-cleanup-start]");
 failed.click("[data-refresh-cleanup-confirm]");
 const previousError = console.error;
 console.error = () => {};
@@ -182,7 +178,7 @@ try {
 }
 
 const english = hmbNormalizeImageAssetState({ ...initial, language: "en" });
-markup = hmbRenderImageAssetRefreshReview(english, { review: english.asset_refresh_review, confirming: true });
+markup = hmbRenderImageAssetRefreshReview(english, { review: english.asset_refresh_review });
 assert.match(markup, /Media files are unaffected/);
 assert.match(markup, /Existing Shots are not edited/);
 assert.match(markup, /not added automatically/);
@@ -277,7 +273,6 @@ if (playwright && fs.existsSync(executablePath)) {
       assert.ok(layout.dialogHeight > 50, JSON.stringify(layout));
       const sizeDuring = await page.locator(".hmb-image-assets").boundingBox();
       assert.equal(sizeDuring.height, sizeBefore.height, "The modal must not resize or switch the compact/expanded layout.");
-      await page.locator("[data-refresh-cleanup-start]").click();
       assert.equal(await page.evaluate(() => window.writes.length), 0);
       await page.locator("[data-refresh-cleanup-confirm]").click();
       assert.equal(await page.evaluate(() => window.writes.length), 1);

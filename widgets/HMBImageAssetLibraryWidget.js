@@ -844,7 +844,6 @@ const IMAGE_ASSET_UI_TEXT = {
     refresh_unregistered: "Unregistered image files",
     refresh_unregistered_hint: "These files are not added automatically. Use Add to register them.",
     refresh_none: "None",
-    refresh_cleanup: "Clean registrations without files",
     refresh_confirm: "Confirm cleanup",
     refresh_confirm_hint: "Only the missing registrations in JSON metadata will be removed. Media files are unaffected. A backup is created before cleanup. Existing Shots are not edited.",
     refresh_cleaning: "Cleaning registrations…",
@@ -937,8 +936,7 @@ const IMAGE_ASSET_UI_TEXT = {
     refresh_unregistered: "미등록 이미지 파일",
     refresh_unregistered_hint: "자동으로 등록하지 않습니다. Add로 개별 등록하세요.",
     refresh_none: "없음",
-    refresh_cleanup: "파일 없는 등록 정리",
-    refresh_confirm: "정리 실행 확인",
+    refresh_confirm: "확인",
     refresh_confirm_hint: "파일이 없는 등록의 JSON 메타데이터만 정리합니다. 실제 이미지 파일은 변경하지 않습니다. 정리 전에 백업을 생성하며, 기존 Shot은 수정하지 않습니다.",
     refresh_cleaning: "등록 정리 중…",
     refresh_cleaned: "정리한 등록",
@@ -1681,6 +1679,7 @@ function normalizeImageAssetShotRouting(rawValue, assets) {
       name_is_custom: nameIsCustom,
       revision: Math.max(0, Math.floor(Number(item.revision) || 0)) + (reindexed ? 1 : 0),
       selected_source_uids: selectedSourceUids,
+      ...(Array.isArray(item.image_link_notices) ? {image_link_notices: item.image_link_notices.slice(-MAX_SHOT_IMAGES)} : {}),
       media_count: Math.min(
         selectedSourceUids.length,
         Math.max(0, Math.floor(Number(item.media_count) || 0)),
@@ -2367,6 +2366,7 @@ function cloneImageAssetShotRouting(routing) {
       name_is_custom: Boolean(shot.name_is_custom),
       revision: shot.revision,
       selected_source_uids: [...shot.selected_source_uids],
+      ...(shot.image_link_notices ? {image_link_notices: [...shot.image_link_notices]} : {}),
       media_count: shot.media_count,
       metadata_sha256: shot.metadata_sha256,
       media_sha256: shot.media_sha256,
@@ -3618,7 +3618,6 @@ function imageAssetFocusDescriptor(container) {
     "data-registration-sub",
     "data-registration-submit",
     "data-refresh-review-cancel",
-    "data-refresh-cleanup-start",
     "data-refresh-cleanup-confirm",
   ];
   for (const attribute of directAttributes) {
@@ -4903,6 +4902,23 @@ export function hmbReconcileImageAssetCatalog(container, state, options = {}) {
   };
 }
 
+export function hmbDismissShotLinkNotice(state, shotUuid, uid) {
+  const shot = state.shot_routing.shots.find(row => row.shot_uuid === shotUuid);
+  if (!shot?.image_link_notices?.some(n => n.uid === uid)) return false;
+  shot.image_link_notices = shot.image_link_notices.filter(n => n.uid !== uid);
+  bumpImageAssetShotRouting(state.shot_routing, shot);
+  return true;
+}
+
+function renderShotLinkNotices(shot, state) {
+  const label = imageAssetLanguage(state) === "ko" ? "이전 연결" : "Previous link";
+  return (shot.image_link_notices || []).map(notice =>
+    `<aside class="shot-link-notice" style="align-self:center;min-width:100px;color:#ffa5b7" title="${escapeHtml(notice.path)}"><span>🔗 ${label}</span>
+      <button type="button" data-dismiss-shot-link="${escapeHtml(notice.uid)}" data-notice-shot="${escapeHtml(shot.shot_uuid)}" aria-label="${label} ×">×</button>
+      <div>${escapeHtml(notice.label)}</div></aside>`
+  ).join("");
+}
+
 function renderSelectedCard(asset, index, selected, state, shot = activeImageAssetShot(state)) {
   const number = String(index + 1).padStart(2, "0");
   const removeTitle = imageAssetText(state, "remove_selection");
@@ -5030,7 +5046,7 @@ export function hmbReconcileImageAssetSelectionTray(tray, selected, state, optio
     card.remove?.();
     removed += 1;
   });
-  if (!ordered.length && !tray.querySelector?.(".tray-empty")) {
+  if (!ordered.length && !tray.querySelector?.(".shot-link-notice") && !tray.querySelector?.(".tray-empty")) {
     const trayEmpty = hmbCreateSelectedAssetTrayEmpty(
       tray,
       state,
@@ -5847,7 +5863,6 @@ export function hmbSyncImageAssetRefreshReview(container, state) {
     || clean(review.project_id) !== clean(state?.project_id)
   ) {
     delete container.__hmbImageAssetRefreshReviewOpen;
-    delete container.__hmbImageAssetRefreshReviewConfirm;
     delete container.__hmbImageAssetRefreshCleanupPending;
     return null;
   }
@@ -5856,7 +5871,6 @@ export function hmbSyncImageAssetRefreshReview(container, state) {
     seen.add(key);
     while (seen.size > 64) seen.delete(seen.values().next().value);
     container.__hmbImageAssetRefreshReviewOpen = key;
-    delete container.__hmbImageAssetRefreshReviewConfirm;
     delete container.__hmbImageAssetRefreshReviewError;
   }
   if (
@@ -5864,7 +5878,6 @@ export function hmbSyncImageAssetRefreshReview(container, state) {
     || review.status !== "review"
   ) delete container.__hmbImageAssetRefreshCleanupPending;
   if (review.status !== "review") {
-    delete container.__hmbImageAssetRefreshReviewConfirm;
     delete container.__hmbImageAssetRefreshReviewError;
   }
   // Dismissal is local UI state. A thumbnail echo or the completion of an
@@ -5872,7 +5885,6 @@ export function hmbSyncImageAssetRefreshReview(container, state) {
   if (container.__hmbImageAssetRefreshReviewOpen !== key) return null;
   return {
     review,
-    confirming: container.__hmbImageAssetRefreshReviewConfirm === key,
     busy: container.__hmbImageAssetRefreshCleanupPending === key,
     error: clean(container.__hmbImageAssetRefreshReviewError),
   };
@@ -5880,7 +5892,7 @@ export function hmbSyncImageAssetRefreshReview(container, state) {
 
 export function hmbRenderImageAssetRefreshReview(state, view) {
   if (!view?.review?.request_id) return "";
-  const { review, confirming, busy } = view;
+  const { review, busy } = view;
   const label = (key) => escapeHtml(imageAssetText(state, key));
   const paths = (items) => items.length
     ? `<ul>${items.map((path) => `<li>${escapeHtml(path)}</li>`).join("")}</ul>`
@@ -5888,8 +5900,8 @@ export function hmbRenderImageAssetRefreshReview(state, view) {
   const canClean = hmbImageAssetRefreshCleanupEligible(state, review) && !busy && !state.scan_busy;
   const folders = review.folders || [];
   return `<div class="asset-registration-backdrop asset-refresh-backdrop nodrag nopan nowheel" data-refresh-review-backdrop>
-    <section class="asset-passport asset-refresh-review" role="dialog" aria-modal="true" aria-label="${label(confirming ? "refresh_confirm" : "refresh_review")}" ${busy ? 'aria-busy="true"' : ""}>
-      <header class="passport-head" data-hmb-popup-header><div><small>${label("project")} · ${escapeHtml(review.project_id)}</small><h2>${label(confirming ? "refresh_confirm" : "refresh_review")}</h2></div><button type="button" data-refresh-review-cancel aria-label="${label("refresh_close")}">&times;</button></header>
+    <section class="asset-passport asset-refresh-review" role="dialog" aria-modal="true" aria-label="${label("refresh_review")}" ${busy ? 'aria-busy="true"' : ""}>
+      <header class="passport-head" data-hmb-popup-header><div><small>${label("project")} · ${escapeHtml(review.project_id)}</small><h2>${label("refresh_review")}</h2></div><button type="button" data-refresh-review-cancel aria-label="${label("refresh_close")}">&times;</button></header>
       <div class="refresh-review-body">
         <p class="refresh-review-root">${escapeHtml(review.project_root)}</p>
         <p>${label("registered")}: ${review.registered_count} · ${label("refresh_files")}: ${review.file_count}</p>
@@ -5903,10 +5915,10 @@ export function hmbRenderImageAssetRefreshReview(state, view) {
         ${review.status === "review" && !review.safe_to_clean ? `<p class="refresh-review-error">${label("refresh_unsafe")}</p>` : ""}
         <h3>${label("refresh_missing")}: ${review.missing_count}</h3><p>${label("refresh_missing_hint")}</p>${paths(review.missing_paths)}
         <h3>${label("refresh_unregistered")}: ${review.unregistered_count}</h3><p>${label("refresh_unregistered_hint")}</p>${paths(review.unregistered_paths)}
-        ${confirming ? `<p class="refresh-review-confirm">${label("refresh_confirm_hint")}</p>` : ""}
+        ${review.status === "review" && review.missing_count ? `<p class="refresh-review-confirm">${label("refresh_confirm_hint")}</p>` : ""}
         ${busy ? `<p role="status">${label("refresh_cleaning")}</p>` : ""}
       </div>
-      <footer class="passport-actions"><button type="button" data-refresh-review-cancel>${label(review.status === "review" ? "cancel" : "close")}</button>${review.status === "review" ? `<button type="button" class="passport-register" ${confirming ? "data-refresh-cleanup-confirm" : "data-refresh-cleanup-start"} ${canClean ? "" : "disabled"}>${label(busy ? "refresh_cleaning" : confirming ? "refresh_confirm" : "refresh_cleanup")}</button>` : ""}</footer>
+      <footer class="passport-actions"><button type="button" data-refresh-review-cancel>${label(review.status === "review" ? "cancel" : "close")}</button>${review.status === "review" ? `<button type="button" class="passport-register" data-refresh-cleanup-confirm ${canClean ? "" : "disabled"}>${label(busy ? "refresh_cleaning" : "refresh_confirm")}</button>` : ""}</footer>
     </section>
   </div>`;
 }
@@ -5966,7 +5978,6 @@ export function hmbInstallImageAssetRefreshReviewEvents(container, state, props,
   const currentState = () => container.__hmbImageAssetLatestState || state;
   const close = () => {
     delete container.__hmbImageAssetRefreshReviewOpen;
-    delete container.__hmbImageAssetRefreshReviewConfirm;
     delete container.__hmbImageAssetRefreshReviewError;
     remount(currentState());
     container.querySelector("[data-project-reload]")?.focus?.();
@@ -6002,15 +6013,7 @@ export function hmbInstallImageAssetRefreshReviewEvents(container, state, props,
       buttons[0].focus?.();
     }
   });
-  on(container.querySelector("[data-refresh-cleanup-start]"), "click", (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    state = currentState();
-    if (!hmbImageAssetRefreshCleanupEligible(state) || state.scan_busy || container.__hmbImageAssetRefreshCleanupPending) return;
-    container.__hmbImageAssetRefreshReviewConfirm = imageAssetRefreshReviewKey(state.asset_refresh_review);
-    remount(state);
-    container.querySelector("[data-refresh-cleanup-confirm]")?.focus?.();
-  });
+  const displayedReviewKey = imageAssetRefreshReviewKey(state.asset_refresh_review);
   on(container.querySelector("[data-refresh-cleanup-confirm]"), "click", (event) => {
     event.preventDefault();
     event.stopPropagation();
@@ -6020,7 +6023,8 @@ export function hmbInstallImageAssetRefreshReviewEvents(container, state, props,
       !hmbImageAssetRefreshCleanupEligible(state)
       || state.scan_busy
       || container.__hmbImageAssetRefreshCleanupPending
-      || container.__hmbImageAssetRefreshReviewConfirm !== key
+      || displayedReviewKey !== key
+      || container.__hmbImageAssetRefreshReviewOpen !== key
     ) return;
     container.__hmbImageAssetRefreshCleanupPending = key;
     delete container.__hmbImageAssetRefreshReviewError;
@@ -6075,7 +6079,7 @@ function renderImageAssetShotStack(state) {
       ? `<button type="button" class="shot-add" data-shot-add title="${escapeHtml(isKorean ? "CGT 선택 · 수동 샷 추가 · 묶음 구성" : "Select CGT shots · Add manual shots · Manage groups")}">+ Shot</button>`
       : "";
     const tray = isActive
-      ? `<div class="tray-scroll" data-shot-tray="${escapeHtml(shot.shot_uuid)}">${shotAssets.map((asset, index) => renderSelectedCard(asset, index, shotAssets, state, shot)).join("") || `<div class="tray-empty">${escapeHtml(imageAssetText(state, "tray_empty"))}</div>`}</div>`
+      ? `<div class="tray-scroll" data-shot-tray="${escapeHtml(shot.shot_uuid)}">${shotAssets.map((asset, index) => renderSelectedCard(asset, index, shotAssets, state, shot)).join("") + renderShotLinkNotices(shot, state) || `<div class="tray-empty">${escapeHtml(imageAssetText(state, "tray_empty"))}</div>`}</div>`
       : "";
     return `<section class="shot-panel ${isActive ? "active" : "collapsed"}" data-shot-panel data-shot-number="${shot.number}" data-shot-uuid="${escapeHtml(shot.shot_uuid)}" style="--shot-accent:${palette.accent};--shot-rgb:${palette.rgb}">
       <header class="shot-panel-head">
@@ -6099,6 +6103,7 @@ export function hmbImageAssetCompactShotRows(state) {
     name: shot.name,
     active: !state.image_bash_active && shot.shot_uuid === routing.active_shot_uuid,
     palette: hmbImageAssetShotPalette(shot.number),
+    image_link_notices: shot.image_link_notices,
     assets: imageAssetShotAssets(state, shot, selectedByUid).map((asset, index) => ({
       ...asset,
       order: index + 1,
@@ -6125,7 +6130,7 @@ function renderImageAssetCompactShotRow(state, row) {
   const assets = Array.isArray(row?.assets) ? row.assets.slice(0, MAX_SHOT_IMAGES) : [];
   return `<article class="compact-shot-row ${row.active ? "active" : ""}" data-compact-shot-row="${escapeHtml(row.shot_uuid)}" data-shot-number="${row.number}" style="--shot-accent:${row.palette.accent};--shot-rgb:${row.palette.rgb}">
       <header class="compact-shot-head"><small>${String(row.number).padStart(2, "0")}</small><b data-compact-shot-name>${escapeHtml(row.name)}</b><span>${escapeHtml(imageAssetText(state, "selected_images"))}</span><em data-compact-shot-count>${assets.length}/${MAX_SHOT_IMAGES}</em><i>REMOTE</i></header>
-      <div class="compact-shot-assets ${assets.length ? "" : "empty"}" role="list" data-compact-shot-assets="${escapeHtml(row.shot_uuid)}">${assets.map((asset, index) => renderImageAssetCompactAsset(asset, index, row.shot_uuid, assets.length)).join("") || `<span class="compact-shot-empty">${escapeHtml(imageAssetText(state, "tray_empty"))}</span>`}</div>
+      <div class="compact-shot-assets ${assets.length ? "" : "empty"}" role="list" data-compact-shot-assets="${escapeHtml(row.shot_uuid)}">${assets.map((asset, index) => renderImageAssetCompactAsset(asset, index, row.shot_uuid, assets.length)).join("") + renderShotLinkNotices(row, state) || `<span class="compact-shot-empty">${escapeHtml(imageAssetText(state, "tray_empty"))}</span>`}</div>
     </article>`;
 }
 
@@ -9215,6 +9220,14 @@ function installEvents(container, state, props, remount, listeners) {
   }, true);
 
   const selectedTray = container.querySelector("[data-shot-tray]");
+  on(container, "click", (event) => {
+    const button = event.target?.closest?.("[data-dismiss-shot-link]");
+    if (!button) return;
+    event.preventDefault();
+    event.stopPropagation();
+    state = container.__hmbImageAssetLatestState || state;
+    commitShotMutation(() => hmbDismissShotLinkNotice(state, button.dataset.noticeShot, button.dataset.dismissShotLink));
+  }, true);
   const selectedCardForEvent = (event) => {
     const card = event.target?.closest?.("[data-selected-key]");
     return card && selectedTray?.contains?.(card) ? card : null;

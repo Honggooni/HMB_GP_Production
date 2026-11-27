@@ -68,6 +68,67 @@ class FirstPaintRegression(unittest.TestCase):
             "scan_revision": self.state["scan_revision"],
             "asset_library_ids": [self.state["assets"][0]["asset_library_id"]]}
 
+    def test_refresh_rebuilds_only_middle_pixel_overwrite_with_preserved_times(self):
+        self.check_middle_pixel_overwrite()
+
+    @unittest.skipUnless(os.name == "nt", "Windows share without ChangeTime")
+    def test_refresh_without_change_time_rebuilds_only_changed_thumbnail(self):
+        with patch.object(library, "_windows_folder_change_times", return_value={}):
+            self.check_middle_pixel_overwrite()
+
+    def check_middle_pixel_overwrite(self):
+        from io import BytesIO
+        from PIL import Image
+
+        original = Image.new("RGB", (320, 320), "red")
+        original.save(self.image, format="BMP")
+        sibling = self.image.with_name("Unaffected.bmp")
+        original.save(sibling)
+        manifest = self.manifest.read_bytes()
+
+        def refresh():
+            self.state = library._load_project_catalog(self.catalog, self.state, use_shared_cache=False)
+
+        def hydrate():
+            request = self.request()
+            request["asset_library_ids"] = [r["asset_library_id"] for r in self.state["assets"]]
+            self.state = library._hydrate_asset_thumbnails(self.state, request)
+            self.assertCountEqual(self.state["thumbnail_result"]["completed_asset_library_ids"], request["asset_library_ids"])
+            return {r["relative_path"]: r["media_signature"] for r in self.state["assets"]}
+
+        refresh()
+        hero_uid = next(row["source_uid"] for row in self.state["assets"] if row["relative_path"] == "Assets/Hero.png")
+        self.state["shot_routing"]["shots"][0]["selected_source_uids"] = [hero_uid]
+        routing = deepcopy(self.state["shot_routing"])
+        with patch.object(library, "_publish_thumbnail_payload", side_effect=lambda *args: "memory://" + args[-1]), \
+             patch.object(library, "_generate_thumbnail_payload", wraps=library._generate_thumbnail_payload) as decode:
+            before = hydrate()
+            self.assertEqual(decode.call_count, 2)
+            saved = self.image.stat()
+            raw = self.image.read_bytes()
+            original.paste("blue", (130, 130, 190, 190))
+            original.save(self.image, format="BMP")
+            os.utime(self.image, ns=(saved.st_atime_ns, saved.st_mtime_ns))
+            changed = self.image.read_bytes()
+            self.assertEqual(self.image.stat().st_mtime_ns, saved.st_mtime_ns)
+            self.assertEqual((len(raw), raw[:32768], raw[-32768:]), (len(changed), changed[:32768], changed[-32768:]))
+            self.assertNotEqual(raw, changed)
+            decode.reset_mock()
+            refresh()
+            after = hydrate()
+            self.assertEqual([p.args[0] for p in decode.call_args_list], [self.image])
+            self.assertEqual(after["Assets/Unaffected.bmp"], before["Assets/Unaffected.bmp"])
+            self.assertNotEqual(after["Assets/Hero.png"], before["Assets/Hero.png"])
+            payload = library._read_persistent_thumbnail_cache(after["Assets/Hero.png"])[0]
+            with Image.open(BytesIO(payload)) as thumbnail:
+                self.assertGreater(thumbnail.getpixel((160, 160))[2], 240)
+            decode.reset_mock()
+            refresh()
+            self.assertEqual(hydrate(), after)
+            decode.assert_not_called()
+            self.assertEqual(self.state["shot_routing"], routing)
+            self.assertEqual(self.manifest.read_bytes(), manifest)
+
     def test_unstable_directory_is_retried_once_in_isolation(self):
         affected = self.image.parent
         stable = self.project / "Stable"

@@ -181,15 +181,11 @@ class SavedTaskRefreshTests(unittest.TestCase):
         for _ in range(5):
             asyncio.run(node._refresh_async())
             self.assert_success(node, JOB)
-            call = self.media_schedule.call_args
-            self.assertEqual(call.args, (node.bridge, JOB))
-            self.assertIs(call.kwargs['private'], False)
-            self.assertTrue(path.samefile(call.kwargs['local_source'].result(timeout=0)))
         self.assert_no_publication(node)
         self.assertEqual(file_identity(path), before)
         self.assertEqual(list(path.parent.iterdir()), [path])
         self.assertEqual(node.bridge.refresh_ids, [JOB] * 5)
-        self.assertEqual(self.media_schedule.call_count, 5)
+        self.media_schedule.assert_not_called()
 
     def test_explicit_resume_of_already_saved_task_does_not_republish_or_submit(self):
         node, path = self.make_node()

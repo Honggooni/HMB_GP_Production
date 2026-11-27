@@ -26,7 +26,6 @@ import urllib.request
 import webbrowser
 import weakref
 from collections.abc import Iterator
-from concurrent.futures import Future
 from contextlib import ExitStack, asynccontextmanager, contextmanager, nullcontext, suppress
 from copy import copy, deepcopy
 from ctypes import wintypes
@@ -112,36 +111,6 @@ def _write_generation_sidecar(file_path: Path, metadata: Any, *, workflow: Any =
 
 def _generation_file(path: str | MacroPath, workflow: Any) -> File:
     return File(path, workflow=workflow) if workflow is not None else File(path)
-
-
-@contextmanager
-def _completed_review_source(bridge: Any, task_id: str, *, private: bool = False) -> Iterator[Future]:
-    """Claim during the foreground fetch. Only its owner supplies bytes, a verified path or a failed fetch."""
-    source = Future()
-    if bridge is not None and isinstance(task_id, str) and re.fullmatch(
-            r"job-mybox-[a-f0-9]{32}" if private else r"job-[a-f0-9]{32}", task_id):
-        try:
-            from _hmb_client_review_media import schedule_completed_review_media
-            schedule_completed_review_media(bridge, task_id, local_source=source, private=private)
-        except Exception as exc:
-            logger.warning("Optional completed-video review media was not scheduled (%s).", type(exc).__name__)
-    try:
-        yield source
-    finally:
-        if not source.done():
-            source.cancel()  # Node deleted, selection changed or foreground operation cancelled.
-
-
-def _published_review_original(saved: Any, downloaded: bytes) -> Path | bytes:
-    """Use the existing original on disk when the host can resolve its destination."""
-    with suppress(Exception):
-        location = Path(str(saved.location))
-        if not location.is_absolute():
-            resolved = saved.resolve()
-            location = Path(str(getattr(resolved, "location", resolved)))
-        if location.is_absolute():
-            return location
-    return downloaded
 
 
 async def _write_generation_png_stage(path: Path, content: bytes, workflow: Any = None) -> Path:
@@ -2002,6 +1971,14 @@ def _volc_failure_reason(response: Any) -> str:
     if diagnostic is None and isinstance(result, dict):
         diagnostic = result.get("provider_failure_diagnostics")
     projected = isinstance(diagnostic, dict) and diagnostic.get("schema") == "hmb-provider-failure-diagnostics-v1"
+    if projected and diagnostic.get("code") == "InvalidParameter" and isinstance(diagnostic.get("reference_failure"), dict):
+        message = response.get("error")
+        if isinstance(message, str) and re.fullmatch(
+            r"참조 (?:이미지|영상|오디오|미디어) (?:다운로드|처리) 시간 초과 "
+            r"\([\w가-힣 .()·\[\]-]{1,155}\)\. 해당 (?:이미지|영상|오디오|미디어) 파일을 다시 첨부해 주세요\.",
+            message,
+        ):
+            return _broker_safe_error_text(message)
     error = diagnostic if projected else response.get("error")
     if isinstance(error, dict):
         code = error.get("code")
@@ -3497,14 +3474,6 @@ class _HMBAIBrokerBridge:
         result["_http_status"] = status_code
         account_read = method.upper() == "GET" and path == "/api/me"
         result = self._reference_auth_response(result, reference_auth_epoch, account=account_read)
-        if account_read:
-            with self._reference_principal_scope(result) as principal:
-                if principal:
-                    try:
-                        from _hmb_client_review_media import start_pending_review_media
-                        start_pending_review_media(self)
-                    except (ImportError, ValueError, RuntimeError) as error:
-                        logger.debug("Optional workstation discovery unavailable (%s).", type(error).__name__)
         return result
 
     def account_snapshot(self, *, connect: bool) -> _BrokerAccountSnapshot:
@@ -14981,7 +14950,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         model_id: str | None = None,
         output_format: str | None = None,
         return_last_frame: bool | None = None,
-        review_source: Future | None = None,
     ) -> None:
         if not self._runtime_node_is_live(require_registered=True):
             return
@@ -14990,11 +14958,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             recovery_at_download.get("generation_origin")
             if recovery_at_download.get("task_id") == generation_id else None
         )
-        media_bridge = getattr(self, "_broker_bridge_instance", None)
-        if (final_task.get("id") != generation_id or final_task.get("status") != "succeeded"
-                or recovery_at_download.get("task_id") == generation_id
-                and recovery_at_download.get("broker_server_url") not in (None, "", getattr(media_bridge, "server_url", None))):
-            media_bridge = None
         if model_id is None:
             raw_model = str(
                 self.get_parameter_value("model_id") or MODEL_NAME_SEEDANCE_2_0
@@ -15013,29 +14976,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if effective_model_id == SEEDANCE_2_5_MODEL_ID
             else DEFAULT_OUTPUT_FORMAT
         )
-        # Claim before downloading. The worker heartbeats while the foreground
-        # fetches and publishes, then uses that file without another GET or copy.
-        claim = nullcontext(review_source) if review_source is not None else _completed_review_source(media_bridge, generation_id)
-        with claim as source:
-            video_bytes = None
-            try:
-                video_download_url = self._extract_video_url(final_task)
-                if not video_download_url:
-                    raise RuntimeError("FN AI Broker task succeeded but the video URL was missing.")
-                self._publish_generation_preview("downloading", generation_id=generation_id)
-                video_bytes = await self._download_broker_video(video_download_url)
-                if not self._runtime_node_is_live(require_registered=True):
-                    return
-                self._publish_generation_preview("verifying", generation_id=generation_id)
-                saved = await self._atomic_publish_completed_video(
-                    destination, video_bytes, effective_output_format, verifier,
-                )
-            except Exception:
-                if self._runtime_node_is_live(require_registered=True) and not getattr(self, "is_cancellation_requested", False):
-                    source.set_result(video_bytes)
-                raise
-            if self._runtime_node_is_live(require_registered=True) and not getattr(self, "is_cancellation_requested", False):
-                source.set_result(_published_review_original(saved, video_bytes))
+        video_download_url = self._extract_video_url(final_task)
+        if not video_download_url:
+            raise RuntimeError("FN AI Broker task succeeded but the video URL was missing.")
+        self._publish_generation_preview("downloading", generation_id=generation_id)
+        video_bytes = await self._download_broker_video(video_download_url)
+        if not self._runtime_node_is_live(require_registered=True):
+            return
+        self._publish_generation_preview("verifying", generation_id=generation_id)
+        saved = await self._atomic_publish_completed_video(
+            destination, video_bytes, effective_output_format, verifier,
+        )
         if not self._runtime_node_is_live(require_registered=True):
             return
         artifact = VideoUrlArtifact(value=saved.location, name=saved.name)
@@ -15170,7 +15121,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
 
     async def _reuse_saved_generation_result(
-        self, generation_id: str, checkpoint: dict[str, Any] | None = None, *, review_source: Future | None = None,
+        self, generation_id: str, checkpoint: dict[str, Any] | None = None,
     ) -> bool:
         """Restore an exact completed task without publishing its file again.
 
@@ -15270,8 +15221,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise validation_error
         if file_identity is None:
             return False
-        if review_source is not None:
-            review_source.set_result(path)
 
         artifact = self.parameter_output_values.get("VIDEO_OUT")
         if artifact_path(artifact) != path:
@@ -15312,8 +15261,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return
         generation_id = ""
         operation_phase = "broker_lookup"
-        review_claim = ExitStack()
-        review_source = None
         try:
             generation_id = self._authoritative_existing_generation_id()
             if not generation_id:
@@ -15412,12 +15359,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             await self._run_blocking_generation_stage(self._observe_reference_lease_response,
                 response, bridge, broker_origin, requested_generation_id,
                 recovery_contract.get("reference_lease_id", ""))
-            if status == "succeeded":
-                review_source = review_claim.enter_context(_completed_review_source(bridge, generation_id))
             if preserve_local_success:
                 operation_phase = "local_validation"
                 if await self._reuse_saved_generation_result(
-                    generation_id, recovery_contract, review_source=review_source,
+                    generation_id, recovery_contract,
                 ):
                     return
             if status == "succeeded":
@@ -15495,7 +15440,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     return_last_frame=bool(
                         refresh_params.get("return_last_frame")
                     ),
-                    review_source=review_source,
                 )
                 return
             if status == "submission_unknown":
@@ -15528,8 +15472,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 return
             if generation_id and self._authoritative_existing_generation_id() != generation_id:
                 return
-            if review_source is not None and not review_source.done():
-                review_source.set_result(None)
             if operation_phase != "local_validation" and generation_id:
                 # A failed GET cannot undo an independently verified local
                 # success. This path never creates a replacement server task.
@@ -15629,8 +15571,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 was_successful=False,
                 result_details=detail,
             )
-        finally:
-            review_claim.close()
 
     def _on_refresh_clicked(
         self,

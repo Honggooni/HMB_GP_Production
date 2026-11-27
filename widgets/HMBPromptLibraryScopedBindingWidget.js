@@ -3009,6 +3009,11 @@ export function normalizeState(input) {
     mode: "prompt_only_role_dashboard",
     ...(normalizeManualRebindNotice(input?.manual_rebind) ? {manual_rebind:normalizeManualRebindNotice(input.manual_rebind)} : {}),
     multi_shot_enabled: input?.multi_shot_enabled === true,
+    ...(Array.isArray(input?.image_link_notices) && input.image_link_notices.length ? {
+      image_link_notices: input.image_link_notices.filter(item => typeof item?.uid === "string" && item.uid)
+        .slice(-MAX_IMAGES).map(item => ({uid: clean(item.uid).slice(0, 512),
+          label: clean(item.label).slice(0, 256), path: clean(item.path).slice(0, 4096)})),
+    } : {}),
     shot_documents: hmbNormalizePromptShotDocuments(input?.shot_documents),
     source_sync_revision: normalizeSourceSyncRevision(input?.source_sync_revision),
     [UI_EDIT_REVISION_KEY]: normalizeUiEditRevision(input?.[UI_EDIT_REVISION_KEY]),
@@ -6371,6 +6376,16 @@ function renderImageRow(item, index, images, state, renderTargetOptions, deferre
   </div>`;
 }
 
+function renderImageLinkNotices(state) {
+  const ko = uiLanguage(state) === "ko";
+  return (state.image_link_notices || []).map(item =>
+    `<div class="source-row image-link-notice" data-kind="image-link-notice" data-source-key="notice:${escapeHtml(item.uid)}" style="display:flex;align-items:center;gap:8px;padding:6px;color:#ffa5b7">
+      <span aria-hidden="true">🔗</span><span>${ko ? "이전 연결" : "Previous link"} · ${escapeHtml(item.label)}</span>
+      <small style="overflow-wrap:anywhere;flex:1">${escapeHtml(item.path)}</small>
+      <button type="button" data-dismiss-image-link="${escapeHtml(item.uid)}" aria-label="${ko ? "연결 안내 지우기" : "Dismiss link notice"}">×</button></div>`
+  ).join("");
+}
+
 function renderVideoRow(item, index, images, state) {
   const primaryVideo = index === 0;
   const roleChoices = compatibleVideoRoleChoices(item, primaryVideo);
@@ -6777,7 +6792,7 @@ function render(state, includeStyle = true) {
   const hVideoText = groupHeightStyle(state, "videoText");
   const editorMarkup = `<div class="layout nodrag"${state.manual_rebind?.required ? ' inert aria-disabled="true"' : ""}>
       <main class="center">
-        <section class="group-card image-card" data-group-id="imageSources" ${hImageSources}><h3>${escapeHtml(uiText(state, "image_source_binding", "IMAGE SOURCE BINDING"))} <b>${state.status.active_images} / ${state.status.max_images}</b></h3><div class="group-body source-scrollbox" data-scroll-id="imageSources" data-hmb-scroll-viewport ${state.shot?.shot_uuid ? `data-hmb-wheel-key="${escapeHtml(JSON.stringify(["prompt-images", state.shot.channel_uuid, state.shot.shot_uuid]))}"` : ""}><div class="source-header image-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "target", "TARGET"))}</span><span class="image-video-surface-columns"><span>${escapeHtml(uiText(state, "video_color_pick", "VIDEO / COLOR PICK"))}</span><span class="image-surface-heading">${escapeHtml(uiText(state, "surface_2d", "2DSurface"))}</span></span><span></span></div>${images.map((item, idx) => renderImageRow(item, idx, images, state, renderTargetOptions, deferredTargets, renderColorOptions)).join("")}${renderImageAddRow(images, state)}</div><div class="group-resize-bar nodrag" data-resize-group="imageSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
+        <section class="group-card image-card" data-group-id="imageSources" ${hImageSources}><h3>${escapeHtml(uiText(state, "image_source_binding", "IMAGE SOURCE BINDING"))} <b>${state.status.active_images} / ${state.status.max_images}</b></h3><div class="group-body source-scrollbox" data-scroll-id="imageSources" data-hmb-scroll-viewport ${state.shot?.shot_uuid ? `data-hmb-wheel-key="${escapeHtml(JSON.stringify(["prompt-images", state.shot.channel_uuid, state.shot.shot_uuid]))}"` : ""}><div class="source-header image-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "target", "TARGET"))}</span><span class="image-video-surface-columns"><span>${escapeHtml(uiText(state, "video_color_pick", "VIDEO / COLOR PICK"))}</span><span class="image-surface-heading">${escapeHtml(uiText(state, "surface_2d", "2DSurface"))}</span></span><span></span></div>${images.map((item, idx) => renderImageRow(item, idx, images, state, renderTargetOptions, deferredTargets, renderColorOptions)).join("")}${renderImageAddRow(images, state)}${renderImageLinkNotices(state)}</div><div class="group-resize-bar nodrag" data-resize-group="imageSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card imgtext" data-group-id="imageText" ${hImageText}><h3>${escapeHtml(uiText(state, "image_text_context", "SHOT TEXT DIRECTION / EXACT LITERALS"))} <b>${escapeHtml(uiText(state, "scene_level_notes", "scene-level notes"))}</b></h3><div class="group-body"><div class="text-grid">${groupBFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="imageText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card video-card" data-group-id="videoSources" ${hVideoSources}><h3>${escapeHtml(uiText(state, "video_source_binding", "VIDEO SOURCE BINDING"))} <b>${state.status.active_videos} / ${state.status.max_videos}</b></h3><div class="group-body source-scrollbox" data-scroll-id="videoSources"><div class="source-header video-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "keep_out", "KEEP OUT"))}</span><span></span></div>${videos.map((item, idx) => renderVideoRow(item, idx, images, state)).join("")}${renderVideoAddRow(videos, state)}</div><div class="group-resize-bar nodrag" data-resize-group="videoSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card sound-card" data-group-id="soundSources" ${hSoundSources}><h3>${escapeHtml(uiLanguage(state) === "ko" ? "사운드 / 발화 / 립싱크 바인딩" : "SOUND / SPEECH / LIP-SYNC BINDING")} <b>${state.sound_sources?.length || 0} / 64</b></h3><div class="group-body source-scrollbox" data-scroll-id="soundSources">${hmbRenderPromptSoundSources(state)}</div><div class="group-resize-bar nodrag" data-resize-group="soundSources" title="Resize sound binding"></div></section>
@@ -9289,6 +9304,14 @@ function hmbNativeUiImplementation(container, props) {
       listeners.push([row, "drop", drop]);
     });
 
+    container.querySelectorAll("[data-dismiss-image-link]").forEach(button => {
+      const dismiss = () => {
+        state.image_link_notices = (state.image_link_notices || []).filter(item => item.uid !== button.dataset.dismissImageLink);
+        hmbCommitLocalPromptStructure(container, props, state, remount);
+      };
+      button.addEventListener("click", dismiss);
+      listeners.push([button, "click", dismiss]);
+    });
     container.querySelectorAll(".clear-source").forEach((button) => {
       const row = button.closest(".source-row");
       const kind = row ? row.getAttribute("data-kind") : "";

@@ -438,6 +438,18 @@ class CompactContainer extends FakeContainer {
   cleanup();
 }
 const compactMarkup = widget.hmbRenderImageAssetCompactSummary(initialState());
+{
+  const state = initialState();
+  const shot = state.shot_routing.shots[0];
+  const members = [...shot.selected_source_uids];
+  shot.image_link_notices = [{uid:"old-path", label:"Old image", path:"e203/A.png"}];
+  const tray = widget.hmbRenderImageAssetCompactSummary(state).split("</article></div>")[0];
+  const link = tray.indexOf('data-dismiss-shot-link="old-path"');
+  assert.ok(link > tray.indexOf('aria-posinset="3"') && tray.indexOf('aria-posinset="3"') > 0);
+  assert.equal(widget.hmbDismissShotLinkNotice(state, shot.shot_uuid, "old-path"), true);
+  assert.deepEqual(shot.selected_source_uids, members);
+  assert.ok(!widget.hmbRenderImageAssetCompactSummary(state).includes("old-path"));
+}
 assert.match(compactMarkup, /class="compact-shot-asset [^"]*" draggable="true"/);
 assert.match(compactMarkup, /role="listitem" aria-posinset="1" aria-setsize="3"/);
 console.log("HMB ImageAsset expanded + compact Shot-local drag reorder regression: PASS");

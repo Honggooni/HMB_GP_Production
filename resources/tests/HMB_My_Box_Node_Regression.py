@@ -201,6 +201,8 @@ class MyBoxNodeTests(unittest.TestCase):
         self.engine.event_manager.initialize_queue()
         result=self.engine.handle_request(EnsureWorkflowAndFlowRequest(flow_name='PrivateOnlyOffline'))
         self.assertTrue(result.succeeded(),str(result.result_details))
+        if getattr(result, 'open_workflow', None) is not None:
+            self.enterContext(self.engine.bind_workflow(self.engine.open_workflows.get(result.open_workflow.workflow_id)))
         self.flow=self.engine.flow_manager.get_flow_by_name(result.flow_name)
         self.schema=LibrarySchema.model_validate_json((ROOT/'griptape-nodes-library.json').read_text('utf-8-sig'))
         self.library=LibraryRegistry.generate_new_library(self.schema)
@@ -559,7 +561,7 @@ class MyBoxNodeTests(unittest.TestCase):
             self.run_node()
         self.assertEqual(len(self.backend.created),1); cp=self.checkpoint()
         self.assertTrue(cp.get('job_id')); self.assertFalse(self.node._execution_succeeded)
-        self.assertEqual(self.media_schedule.call_args.kwargs['local_source'].result(timeout=0),MOV)
+        self.media_schedule.assert_not_called()
         self.run_node(); self.assert_success(); self.assertEqual(len(self.backend.created),1)
         self.assertEqual(self.checkpoint()['job_id'],cp['job_id'])
     def test_original_mov_bytes_publish_atomically_and_preview_keeps_original(self):
@@ -575,22 +577,18 @@ class MyBoxNodeTests(unittest.TestCase):
             running=asyncio.create_task(self.controller().run())
             try:
                 self.assertTrue(await asyncio.to_thread(self.backend.started.wait,3))
-                call=self.media_schedule.call_args
-                self.assertEqual(call.args,(self.backend.bridge,self.checkpoint()['job_id']))
-                self.assertIs(call.kwargs['private'],True)
-                self.assertFalse(call.kwargs['local_source'].done())
+                self.media_schedule.assert_not_called()
                 self.assertEqual(self.node._hmb_generation_preview_state['phase'],'downloading')
                 self.assertNotEqual(self.checkpoint()['stage'],'local_succeeded')
             finally:self.backend.release.set()
             await running
         asyncio.run(exercise()); path=self.assert_success()
-        self.assertEqual(self.media_schedule.call_count,1)
-        self.assertEqual(self.media_schedule.call_args.kwargs['local_source'].result(timeout=0),path)
+        self.media_schedule.assert_not_called()
         self.assertEqual(self.node._hmb_generation_preview_state['phase'],'succeeded')
         self.assertEqual(self.node._hmb_generation_preview_state['media_revision'],self.node._hmb_generation_media_revision)
         task=self.checkpoint()['job_id']; before=self.authored()
         self.run_node(refresh=True)
-        self.assertEqual(self.media_schedule.call_args.kwargs['local_source'].result(timeout=0),path)
+        self.media_schedule.assert_not_called()
         self.assertEqual(self.assert_success(),path)
         self.assertEqual(self.node._hmb_generation_preview_state['phase'],'succeeded')
         reopened=self.reopen()
@@ -602,21 +600,6 @@ class MyBoxNodeTests(unittest.TestCase):
         self.assertEqual(len(self.backend.created),1)
         self.assertEqual(len(self.backend.downloads),1)
 
-    def test_private_media_worker_failure_preserves_success_and_rejects_foreign_workspace(self):
-        self.media_schedule.side_effect=RuntimeError('offline worker unavailable')
-        self.run_node()
-        stored=self.assert_success()
-        cp=self.checkpoint()
-        self.assertEqual(self.media_schedule.call_count,1)
-        self.assertEqual(self.media_schedule.call_args.kwargs['local_source'].result(timeout=0),stored)
-        self.assertEqual(len(self.backend.created),1)
-        broker=SimpleNamespace(_bridge=self.backend.bridge)
-        job=self.backend.jobs[cp['job_id']]
-        for changes in ({'workspace_id':'another-workspace'},{'publish_to_reviews':True},
-                        {'job_id':'job-mybox-'+'f'*32},{'scope':'project'}):
-            with self.subTest(changes=changes), self.controller()._completed_media_claim(cp,broker,{**job,**changes}):
-                self.assertEqual(self.media_schedule.call_count,1)
-        self.assertEqual(stored.read_bytes(),MOV)
     def test_remote_success_is_not_local_preview_success(self):
         controller=self.controller()
         controller._status('succeeded','job-mybox-'+'a'*32)
@@ -1071,7 +1054,10 @@ class MyBoxNodeTests(unittest.TestCase):
     def test_final_scheduler_respects_other_running_flow_and_inactive_node(self):
         self.backend.enable_final(); self.run_node(); self.assert_success(); source=self.checkpoint()['job_id']
         count=len(self.backend.calls)
-        with mock.patch.object(self.engine.flow_manager,'check_for_existing_running_flow',return_value=True), \
+        manager = self.engine.flow_manager
+        running_check = ('check_for_existing_running_flow_in' if hasattr(manager, 'check_for_existing_running_flow_in')
+                         else 'check_for_existing_running_flow')
+        with mock.patch.object(manager,running_check,return_value=True), \
              mock.patch.object(controller_module.asyncio,'run_coroutine_threadsafe',side_effect=forbidden) as schedule:
             result=self.controller().schedule_final({},source)
         self.assertFalse(result.success); schedule.assert_not_called()

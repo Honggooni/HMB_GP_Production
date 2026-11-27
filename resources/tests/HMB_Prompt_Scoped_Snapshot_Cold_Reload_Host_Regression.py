@@ -126,6 +126,33 @@ async def exercise(engine):
             picker._hmb_verified_media = (picker._execution_media_identity(state), cache)
 
         await warm(image, picker)
+        # A moved project image can keep its display name but acquire a new UID.
+        # Replay an old row alongside the verified selection in this real SDK graph.
+        probe = prompts._select_prompt_shot_document(deepcopy(state), {**ROWS[0], "channel_uuid": CHANNEL})
+        probe, media, *_ = prompt._apply_exact_shot_routes(probe)
+        active = deepcopy(probe["images"][0])
+        old = dict(active, asset_source_uid="project:removed-path", asset_library_id="removed-path",
+                   asset_last_source_path="old/e203/A.png", asset_source_unavailable=True)
+        probe["images"] = [old, active]
+        prompts._renumber_image_rows(probe["images"])
+        probe["text"]["SCENE_CONTEXT"] = "Old @image1 / live @image2"
+        probe, actual_media, *_ = prompt._apply_exact_shot_routes(probe)
+        assert probe["text"]["SCENE_CONTEXT"] == "Old [deselected image source #1] / live @image1", probe["text"]["SCENE_CONTEXT"]
+        assert actual_media == media and len(actual_media) == 1
+        assert [r["asset_source_uid"] for r in probe["images"] if r.get("asset_managed")] == ROWS[0]["selected_source_uids"]
+        assert probe["images"][0]["slot"] == 1 and not probe["images"][0].get("asset_source_unavailable")
+        assert probe["image_link_notices"] == [{"uid": "project:removed-path", "label": active["label"], "path": "old/e203/A.png"}]
+        probe = prompts._store_prompt_shot_document(probe)
+        other = prompts._select_prompt_shot_document(probe, {**ROWS[1], "channel_uuid": CHANNEL})
+        assert not other.get("image_link_notices")
+        probe = prompts._select_prompt_shot_document(other, {**ROWS[0], "channel_uuid": CHANNEL})
+        assert probe["image_link_notices"][0]["uid"] == "project:removed-path"
+        published, history = image._hmb_prompt_snapshot_and_link_notices(channel_uuid=CHANNEL, shot_uuid=ROWS[0]["shot_uuid"])
+        assert history == probe["image_link_notices"]
+        assert "project:removed-path" not in published["shots"][0]["selected_source_uids"]
+        image._hmb_update_shot_link_notices(CHANNEL, ROWS[0]["shot_uuid"], dismiss={"project:removed-path"})
+        probe, actual_media, *_ = prompt._apply_exact_shot_routes(probe)
+        assert not probe.get("image_link_notices") and actual_media == media
         for _ in range(24):
             for n, row in enumerate(ROWS, 1):
                 state = prompts._select_prompt_shot_document(state, {**row, "channel_uuid": CHANNEL})

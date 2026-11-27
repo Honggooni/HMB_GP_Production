@@ -4,7 +4,9 @@ from __future__ import annotations
 from copy import deepcopy
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import threading
@@ -34,6 +36,12 @@ def record(path: str, name: str) -> dict:
         "scope_candidate": "Full body / full appearance",
         "custom_metadata": {"retained": [1, "한글", True]},
     }
+
+
+def smb_path_error(path: Path) -> OSError:
+    error = OSError(f"Simulated SMB lookup failure: {path}")
+    error.winerror = 59
+    return error
 
 
 def fake_node(initial_state: dict):
@@ -126,6 +134,117 @@ class RefreshCleanupRegression(unittest.TestCase):
         self.assertTrue(review["safe_to_clean"], review["error"])
         return review
 
+    def test_reorganized_share_refresh_and_confirm_after_winerror_59(self):
+        old = self.make_image("add/e203/Tree.png")
+        self.payload["assets"] = [self.keep, record("add/e203/Tree.png", "Tree")]
+        self.write_manifest(self.payload)
+        # Model an SMB share that coalesces parent directory timestamps.
+        with patch.object(library, "_catalog_directory_stamp", side_effect=lambda st: (st.st_dev, st.st_ino)):
+            self._check_reorganized_catalog(old)
+        new = self.root / "add/BG/Tree.png"
+        before = self.manifest.read_bytes()
+        stat_path = library._refresh_manifest_regular_stat
+
+        def stale(path):
+            if path == old:
+                raise smb_path_error(path)
+            return stat_path(path)
+
+        with patch.object(library, "_refresh_manifest_regular_stat", side_effect=stale):
+            review = self.audit()
+            self.assertEqual(review["missing_paths"], ["add/e203/Tree.png"])
+            self.assertIn("add/BG/Tree.png", review["unregistered_paths"])
+            self.assertEqual(self.manifest.read_bytes(), before)
+            result = library._clean_project_manifest_refresh(review, lambda: True)
+            self.assertEqual(Path(result["backup_path"]).read_bytes(), before)
+            self.assertFalse(self.audit()["missing_paths"])
+        self.assertEqual(json.loads(self.manifest.read_bytes())["assets"], [self.keep])
+        self.assertTrue(new.is_file())
+        self.assertFalse(old.parent.exists())
+
+    def test_delete_and_move_whole_folders_release_only_the_old_registrations(self):
+        deleted = [record("add/e203/BG/Tree.png", "Tree"), record("add/e203/Sky.png", "Sky")]
+        moved = [record("CH/Hero.png", "Character"), record("CH/Alt/Mask.png", "Mask")]
+        for item in deleted + moved:
+            item["registration_owner"] = "other-author"
+            self.make_image(item["path"])
+        self.write_manifest({**self.payload, "assets": [self.keep, *deleted, *moved]})
+        original = self.manifest.read_bytes()
+        for item in deleted:
+            (self.root / item["path"]).unlink()
+        (self.root / "add/e203/BG").rmdir()
+        (self.root / "add/e203").rmdir()
+        (self.root / "Sorted").mkdir()
+        (self.root / "CH").rename(self.root / "Sorted/CH")
+
+        review = self.audit()
+        self.assertEqual(set(review["missing_paths"]), {item["path"] for item in deleted + moved})
+        self.assertTrue(all(f"Sorted/{item['path']}" in review["unregistered_paths"] for item in moved))
+        self.assertEqual(self.manifest.read_bytes(), original)
+        result = library._clean_project_manifest_refresh(review, lambda: True)
+        self.assertEqual(result["cleaned_count"], 4)
+        self.assertEqual(json.loads(self.manifest.read_bytes())["assets"], [self.keep])
+        self.assertFalse((self.root / "add/e203").exists())
+        self.assertFalse((self.root / "CH").exists())
+        for item in moved:
+            self.assertTrue((self.root / "Sorted" / item["path"]).is_file())
+
+        # Recreate the same filename, name and ID after confirmed deletion.
+        replacement = self.make_image(deleted[0]["path"])
+        replacement.write_bytes(b"new image content")
+        self.assertIn(deleted[0]["path"], self.audit()["unregistered_paths"])
+        library._write_asset_manifest_record(self.root, record(deleted[0]["path"], "Tree"))
+        restored = library._read_asset_manifest(self.root)[deleted[0]["path"].casefold()]
+        self.assertEqual((restored["asset_id"], restored["image_name"]), ("Tree", "Tree"))
+        self.assertNotEqual(restored.get("registration_owner"), "other-author")
+
+    def _check_reorganized_catalog(self, old):
+        library._catalog_file_inventory(self.root, incremental=True)
+        new = self.root / "add/BG/Tree.png"
+        new.parent.mkdir()
+        old.rename(new)
+        old.parent.rmdir()
+        real_lstat = Path.lstat
+
+        def stale(path):
+            if path == old.parent:
+                raise smb_path_error(path)
+            return real_lstat(path)
+
+        with patch.object(Path, "lstat", stale):
+            folders, files, _ = library._catalog_file_inventory(self.root, incremental=True)
+        self.assertNotIn("add/e203", folders)
+        self.assertIn("add/BG", folders)
+        self.assertIn(new, files)
+
+    def test_share_error_on_listed_folder_retries_once_and_retains_json(self):
+        directory = self.root / "Present"
+        real_scan = library.os.scandir
+        for permanent in (False, True):
+            for catalog in (False, True):
+                calls = []
+
+                def scan(path):
+                    if Path(path) == directory:
+                        calls.append(path)
+                        if permanent or len(calls) == 1:
+                            raise smb_path_error(path)
+                    return real_scan(path)
+                before = self.manifest.read_bytes()
+                with self.subTest(permanent=permanent, catalog=catalog), patch.object(library.os, "scandir", side_effect=scan):
+                    if catalog:
+                        if permanent:
+                            with self.assertRaises(OSError):
+                                library._catalog_file_inventory(self.root, incremental=True, full=True)
+                        else:
+                            folders, _, _ = library._catalog_file_inventory(self.root, incremental=True, full=True)
+                            self.assertIn("Present", folders)
+                    else:
+                        review = library._audit_project_manifest_refresh(self.root)
+                        self.assertEqual(review["safe_to_clean"], not permanent, review["error"])
+                    self.assertEqual(len(calls), 2)
+                    self.assertEqual(self.manifest.read_bytes(), before)
+
     def state(self):
         state = library._default_state()
         state.update({
@@ -157,6 +276,22 @@ class RefreshCleanupRegression(unittest.TestCase):
         self.assertIsInstance(node._hmb_refresh_authority, dict)
         return node, live, published
 
+    def test_removed_shot_file_is_only_history_even_after_same_path_returns(self):
+        state = self.state()
+        state["project_cache_uid"] = self.payload["project_cache_uid"]
+        old = deepcopy(state["assets"][0])
+        uid = old["source_uid"]
+        state["shot_routing"]["shots"][0]["selected_source_uids"] = [uid]
+        scan = {**state, "assets": [], "warnings": []}
+        gone = library._merge_scan_with_state(scan, state)
+        shot = gone["shot_routing"]["shots"][0]
+        self.assertEqual(shot["selected_source_uids"], [])
+        self.assertEqual(shot["image_link_notices"], [dict(uid=uid, label=old["image_name"], path=old["path"])])
+        restored = library._merge_scan_with_state({**scan, "assets": [dict(old, selected=False, registered=False)]}, gone)
+        self.assertFalse(restored["assets"][0]["registered"])
+        self.assertFalse(restored["assets"][0]["selected"])
+        self.assertEqual(restored["shot_routing"]["shots"][0]["selected_source_uids"], [])
+
     def linked_refresh_fixture(self):
         from _hmb_image_asset_sites import _folder_identity
 
@@ -173,6 +308,78 @@ class RefreshCleanupRegression(unittest.TestCase):
             links.append({"id": _folder_identity(root), "label": label, "root": root.as_posix()})
             manifests.append(manifest)
         return {"revision": "linked-v1", "links": links, "write_site_id": links[0]["id"]}, manifests
+
+    @unittest.skipUnless(os.name == "nt", "Windows sharing modes")
+    def test_open_reader_allows_reorganization_and_confirming_another_users_deletion(self):
+        self.missing["registration_owner"] = "a-different-workstation-user"
+        self.write_manifest(self.payload)
+        old = self.make_image(self.missing["path"])
+        moved = self.root / "Reclassified.png"
+        rename = [sys.executable, "-B", "-c",
+                  "import sys; from pathlib import Path; Path(sys.argv[1]).rename(sys.argv[2])",
+                  str(old), str(moved)]
+        # A legacy read handle reproduces the Explorer operation failing.
+        with old.open("rb"):
+            blocked = subprocess.run(rename, capture_output=True, timeout=10)
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertIn(b"WinError 32", blocked.stderr)
+            self.assertEqual(self.audit()["missing_count"], 0)
+        before = self.manifest.read_bytes()
+        # A running node keeps parsed registrations after the read finishes.
+        cached_registrations = library._read_asset_manifest(self.root)
+        with library._open_shared_asset_read(old) as image:
+            subprocess.run(rename, check=True, capture_output=True, timeout=10)
+            old.parent.rmdir()
+            self.assertTrue(image.read())
+            node, live, _ = self.refresh_node()
+            review = live["state"]["asset_refresh_review"]
+            self.assertEqual(review["missing_paths"], [self.missing["path"]])
+            self.assertEqual(before, self.manifest.read_bytes())
+            with patch.object(library, "_load_project_catalog", side_effect=lambda _, state, **kw: deepcopy(state)):
+                node._schedule_project_manifest_cleanup(live["state"], {"request_id": review["request_id"]})
+                report = finish_worker(node, live)["asset_refresh_review"]
+                self.assertEqual(report["cleaned_count"], 1, report)
+            self.assertIn(self.missing["path"].casefold(), cached_registrations)
+            self.assertEqual(json.loads(self.manifest.read_bytes())["assets"], [self.keep])
+        self.assertFalse(old.parent.exists())
+        self.assertTrue(moved.is_file())
+
+    @unittest.skipUnless(os.name == "nt", "Windows sharing modes")
+    def test_other_process_deletes_image_while_hmb_reader_is_open(self):
+        old = self.make_image(self.missing["path"])
+        self.missing["registration_owner"] = "another-user"
+        self.write_manifest(self.payload)
+        before = self.manifest.read_bytes()
+        with library._open_shared_asset_read(old) as image:
+            subprocess.run([sys.executable, "-B", "-c",
+                            "import os, sys; os.unlink(sys.argv[1])", str(old)],
+                           check=True, capture_output=True, timeout=10)
+            self.assertTrue(image.read())
+        review = self.audit()
+        self.assertEqual(review["missing_paths"], [self.missing["path"]])
+        self.assertEqual(before, self.manifest.read_bytes())
+        library._clean_project_manifest_refresh(review, lambda: True)
+        self.assertEqual(json.loads(self.manifest.read_bytes())["assets"], [self.keep])
+
+    @unittest.skipUnless(os.name == "nt", "Windows sharing modes")
+    def test_legacy_reader_releases_json_after_first_replace_attempt(self):
+        review = self.audit()
+        replace = os.replace
+        conflicts = []
+        with self.manifest.open("rb") as legacy_reader:
+            def legacy_conflict(source, destination):
+                try:
+                    return replace(source, destination)
+                except PermissionError as exc:
+                    conflicts.append(exc.winerror)
+                    legacy_reader.close()
+                    raise
+
+            with patch.object(library.os, "replace", side_effect=legacy_conflict):
+                result = library._clean_project_manifest_refresh(review, lambda: True)
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(result["cleaned_count"], 1)
+        self.assertEqual(json.loads(self.manifest.read_bytes())["assets"], [self.keep])
 
     def test_refresh_previews_and_cleans_each_linked_json_after_confirmation(self):
         profile, manifests = self.linked_refresh_fixture()

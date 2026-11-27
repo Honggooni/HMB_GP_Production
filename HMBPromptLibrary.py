@@ -4305,6 +4305,28 @@ def _prompt_image_display_path(reference: Any) -> str:
     return path
 
 
+def _image_link_notices(value: Any) -> list[dict[str, str]]:
+    notices = {}
+    for item in value if isinstance(value, list) else ():
+        if not isinstance(item, dict):
+            continue
+        uid = _clean_string(item.get("uid"))[:512]
+        if uid:
+            notices[uid] = {"uid": uid, "label": _clean_string(item.get("label"))[:256],
+                            "path": _prompt_image_display_path(item.get("path"))}
+    return list(notices.values())[-MAX_IMAGES:]
+
+
+def _remember_image_link_notices(state: Dict[str, Any], lost: set[str]) -> None:
+    previous = state.get("image_link_notices", [])
+    new = [{"uid": _image_asset_row_uid(row), "label": row.get("label"),
+            "path": row.get("asset_last_source_path") or row.get("asset_path")}
+           for row in state["images"]
+           if row.get("asset_source_unavailable") or _image_asset_row_uid(row) in lost]
+    if new:
+        state["image_link_notices"] = _image_link_notices([*previous, *new])
+
+
 def _project_unavailable_prompt_images(state: Dict[str, Any], missing: Dict[str, str]) -> None:
     for row in state["images"]:
         uid = _image_asset_row_uid(row)
@@ -4645,6 +4667,7 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
         # Dormant editors remain encoded data. Normalizing one visible editor
         # must not parse and rebuild another four source dashboards.
         "shot_documents": _normalize_prompt_shot_documents(state.get("shot_documents")),
+        **({"image_link_notices": notices} if (notices := _image_link_notices(state.get("image_link_notices"))) else {}),
         SOURCE_SYNC_REVISION_KEY: source_sync_revision,
         UI_EDIT_REVISION_KEY: ui_edit_revision,
         "image_taxonomy": _image_taxonomy_payload(),
@@ -11293,8 +11316,13 @@ class HMBPromptLibrary(DataNode):
             from _hmb_shot_routing import ShotImageUnavailable
 
             try:
-                raw_snapshot = (image_target_api(channel_uuid=expected_channel, shot_uuid=current_shot["shot_uuid"])
-                    if image_targeted else image_api(expected_channel_uuid=expected_channel))
+                stored_notices = None
+                read_with_notices = getattr(image_source_node, "_hmb_prompt_snapshot_and_link_notices", None)
+                if image_targeted and callable(read_with_notices):
+                    raw_snapshot, stored_notices = read_with_notices(channel_uuid=expected_channel, shot_uuid=current_shot["shot_uuid"])
+                else:
+                    raw_snapshot = (image_target_api(channel_uuid=expected_channel, shot_uuid=current_shot["shot_uuid"])
+                        if image_targeted else image_api(expected_channel_uuid=expected_channel))
             except ShotImageUnavailable as error:
                 if not show_unavailable_images:
                     raise _ShotRoutingContractError(str(error)) from error
@@ -11385,11 +11413,20 @@ class HMBPromptLibrary(DataNode):
                 known_sources = getattr(image_source_node, "_hmb_prompt_known_image_sources", None)
                 if lost_uids and callable(known_sources):
                     lost_uids.difference_update(known_sources(lost_uids))
-                    if lost_uids:
-                        if not show_unavailable_images:
-                            raise _ShotRoutingContractError("The Shot has disconnected image sources.")
-                        _project_unavailable_prompt_images(normalized, dict.fromkeys(lost_uids, ""))
-                        return normalized, [], [], True, False
+                else:
+                    lost_uids.clear()
+                # This exact snapshot already verified every selected UID. Old
+                # paths belong to the Shot's history, never its media order.
+                legacy_notices = normalized.get("image_link_notices", [])
+                if stored_notices is not None:
+                    normalized["image_link_notices"] = _image_link_notices(stored_notices)
+                _remember_image_link_notices(normalized, lost_uids)
+                notices = normalized.get("image_link_notices", [])
+                share = getattr(image_source_node, "_hmb_update_shot_link_notices", None)
+                if image_targeted and callable(share) and notices and (
+                    notices != (stored_notices or []) or (stored_notices is None and legacy_notices)
+                ):
+                    normalized["image_link_notices"] = share(expected_channel, selected_shot["shot_uuid"], additions=notices)
                 _project_unavailable_prompt_images(normalized, {})
                 normalized = _apply_image_asset_payload(
                     normalized, payload, connected=True
@@ -12962,7 +12999,16 @@ class HMBPromptLibrary(DataNode):
             return
         if guarded_widget_write:
             value = self._hmb_filter_prompt_widget_write(value)
-            before = self._current_state()
+            before = _parse_state(getattr(self, "_hmb_last_accepted_widget_state", "")) or self._current_state()
+            if before.get("image_link_notices"):
+                after = _normalize_state(value if isinstance(value, dict) else _parse_state(value))
+                if _prompt_document_key(before["shot"]) == _prompt_document_key(after["shot"]):
+                    removed_notices = {n["uid"] for n in before["image_link_notices"]} - {n["uid"] for n in after.get("image_link_notices", [])}
+                    sources = getattr(self, "_hmb_connected_source_nodes", {})
+                    source = sources.get(SHOT_ASSET_INPUT_PARAMETER_NAME) or sources.get(IMAGE_ASSET_INPUT_PARAMETER_NAME)
+                    share = getattr(source, "_hmb_update_shot_link_notices", None)
+                    if removed_notices and callable(share):
+                        share(before["shot"]["channel_uuid"], before["shot"]["shot_uuid"], dismiss=removed_notices)
             if any(row.get("asset_source_unavailable") for row in before["images"]):
                 after = _normalize_state(value if isinstance(value, dict) else _parse_state(value))
                 if _prompt_document_key(before["shot"]) == _prompt_document_key(after["shot"]):

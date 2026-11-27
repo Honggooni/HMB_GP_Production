@@ -284,6 +284,23 @@ try{
  await brokenRow.locator('.clear-source').click();
  await waitForLabels(['Replacement']);
  await page.waitForFunction(()=>!window.latest.images.some(image=>image.asset_source_uid==='import:dingo'));
+ const projectCopy = row('project:new-path','Max_ASheet_Control_');
+ await page.evaluate((images)=>{
+   const next=window.sourceUpdate(images);
+   next.image_link_notices=[{uid:'project:old-path',label:'Max_ASheet_Control_',path:'add/e203/Max_ASheet_Control_.png'}];
+   window.accept(next);
+ },[connected[0],projectCopy]);
+ const notice=page.locator('.image-link-notice');
+ await notice.waitFor();
+ assert.match(await notice.innerText(),/add\/e203/);
+ const activeCopy=page.locator('[data-hmb-image-selection-uid="project:new-path"]');
+ assert.equal(await activeCopy.locator('[data-field="image_main_type"]').count(),1);
+ assert.equal(await notice.locator('select,input').count(),0);
+ assert.equal(await page.locator('[data-group-id="imageSources"] h3 b').textContent(),'2 / 50');
+ await notice.getByRole('button').click();
+ await notice.waitFor({state:'detached'});
+ await page.waitForFunction(()=>!(window.latest.image_link_notices||[]).length);
+ assert.equal(await activeCopy.locator('[data-field="image_sub_type"]').count(),1);
  assert.equal(await replacementText.inputValue(),'New workspace edit');
  assert.equal(external,0);assert.deepEqual(failures,[]);
  console.log('HMB Prompt Asset selection lifecycle: PASS (same UUID add/remove/reorder, UID/Main/Sub/Color and five documents repaint; unrelated renumber retains UUID/body; one retained editor; Korean draft/caret and stale-echo guard; external0)');

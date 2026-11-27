@@ -722,34 +722,33 @@ try:
         row["selection_order"] = int(row["selected"])
     saved["shot_routing"]["shots"][0]["selected_source_uids"] = [saved_existing["source_uid"]]
     before_browse = restarted._resolve_selected_assets(saved, wait_for_catalog=True)
-    assert not before_browse["unresolved"], before_browse["unresolved"]
-    assert Path(before_browse["resolved"][0]["media"]) == moved
-    assert before_browse["resolved"][0]["source_uid"] == saved_existing["source_uid"]
-    data = restarted._load_project_catalog(catalog_root, registered_state)
-    restored = next(a for a in data["assets"] if a["relative_path"] == moved.relative_to(project_root).as_posix())
-    assert restored["registered"] and restored["asset_id"] == existing["asset_id"]
-    assert restarted._verified_project_relative_path(restored, data) == restored["relative_path"]
+    assert before_browse["unresolved"] and not before_browse["resolved"]
+    data = restarted._load_project_catalog(catalog_root, registered_state, use_shared_cache=False)
+    new_path = moved.relative_to(project_root).as_posix()
+    relocated = next(a for a in data["assets"] if a["relative_path"] == new_path)
+    assert not relocated["registered"] and not relocated.get("registration_revision")
+    assert not restarted._verified_project_relative_path(relocated, data)
     merged = restarted._merge_scan_with_state(data, saved)
-    assert merged["shot_routing"]["shots"][0]["selected_source_uids"] == [restored["source_uid"]]
-    assert manifest_path.read_bytes() == manifest_before_registered_edit
-    review = asset_library._audit_project_manifest_refresh(project_root)
-    assert not review["error"] and existing["relative_path"] not in review["missing_paths"]
-    assert restored["relative_path"] not in review["unregistered_paths"]
-    try:
-        asset_library._write_asset_manifest_record(project_root, {
-            "path": restored["relative_path"], "asset_id": "stale-client", "image_name": "duplicate Add",
-        })
-    except ValueError as exc:
-        assert "already registered" in str(exc)
-    else:
-        raise AssertionError("A stale workstation must not register a moved server asset twice.")
+    assert relocated["source_uid"] not in merged["shot_routing"]["shots"][0]["selected_source_uids"]
     duplicate = existing_path.parent / "e203" / existing_path.name
     duplicate.parent.mkdir()
     duplicate.write_bytes(PNG_1X1)
-    ambiguous = asset_library._scan_project_assets(project_root)
-    assert not any(a["registered"] for a in ambiguous["assets"] if a["path"] in (moved.as_posix(), duplicate.as_posix()))
-    assert asset_library._resolve_selected_assets(saved, wait_for_catalog=True)["unresolved"]
-    assert existing["relative_path"] not in asset_library._audit_project_manifest_refresh(project_root)["missing_paths"]
+    review = restarted._audit_project_manifest_refresh(project_root)
+    assert not review["error"] and existing["relative_path"] in review["missing_paths"]
+    assert {new_path, duplicate.relative_to(project_root).as_posix()} <= set(review["unregistered_paths"])
+    assert manifest_path.read_bytes() == manifest_before_registered_edit
+    restarted._clean_project_manifest_refresh(review, lambda: True)
+    assert existing["relative_path"].casefold() not in restarted._read_asset_manifest(project_root)
+    refreshed = restarted._load_project_catalog(catalog_root, data, use_shared_cache=False)
+    added_again = restarted._apply_asset_registration(refreshed, {
+        "request_id": "add-moved-image", "project_uid": refreshed["project_uid"],
+        "source_kind": "project", "asset_library_id": relocated["asset_library_id"], "relative_path": new_path,
+        "asset_id": existing["asset_id"], "image_name": existing["image_name"],
+        "image_main_type": "Environment / Background", "image_sub_type": "Main Background",
+    })
+    by_path = {row["relative_path"]: row for row in added_again["assets"]}
+    assert by_path[new_path]["registered"] and by_path[new_path]["image_name"] == existing["image_name"]
+    assert not by_path[duplicate.relative_to(project_root).as_posix()]["registered"]
 
     # Two workstation sessions can keep editing their own catalogs while
     # merging each writer's single registration in the same server manifest.

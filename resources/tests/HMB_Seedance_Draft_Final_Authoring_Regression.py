@@ -162,7 +162,7 @@ class DraftFinalAuthoringTests(unittest.TestCase):
                 self.assertEqual(phases, ['downloading', 'verifying', 'succeeded'])
                 self.assertEqual(node.bridge.posts, [])
 
-    def test_completed_media_claim_starts_before_single_download_for_normal_draft_and_final(self):
+    def test_broker_server_owns_media_for_normal_draft_and_final(self):
         for action in (t.DRAFT_ACTION_OFF, t.DRAFT_ACTION_PREVIEW, t.DRAFT_ACTION_FINAL):
             with self.subTest(action=action):
                 node = self.make_node()
@@ -173,82 +173,16 @@ class DraftFinalAuthoringTests(unittest.TestCase):
                 media = SimpleNamespace(schedule_completed_review_media=scheduled)
                 original = b'SYNTHETIC-COMPLETED-ORIGINAL'
                 async def download(url):
-                    scheduled.assert_called_once()
-                    self.assertFalse(scheduled.call_args.kwargs['local_source'].done())
+                    scheduled.assert_not_called()
                     return original
                 with self.publication(node, before), mock.patch.dict(sys.modules, {'_hmb_client_review_media': media}):
                     node._download_broker_video.side_effect = download
                     asyncio.run(node._save_completed_task({'id': JOB, 'status': 'succeeded'}, JOB, node.destination,
                         model_id=t.SEEDANCE_2_5_MODEL_ID, output_format='mov', return_last_frame=False))
                     node._download_broker_video.assert_awaited_once()
-                call = scheduled.call_args
-                self.assertEqual(call.args, (node.bridge, JOB))
-                self.assertIs(call.kwargs['private'], False)
-                self.assertTrue(Path(node.destination.resolve()).samefile(call.kwargs['local_source'].result(timeout=0)))
+                scheduled.assert_not_called()
                 self.assertTrue(node.parameter_output_values['VIDEO_OUT'])
                 self.assertEqual(node.bridge.posts, [])
-
-    def test_completed_media_enqueue_error_preserves_original_output(self):
-        node = self.make_node()
-        node._broker_bridge_instance = node.bridge
-        self.seed_checkpoint(node, action=t.DRAFT_ACTION_OFF)
-        schedule = mock.Mock(side_effect=RuntimeError('worker offline'))
-        with self.publication(node, authored(node)), mock.patch.dict(sys.modules, {
-                '_hmb_client_review_media': SimpleNamespace(schedule_completed_review_media=schedule)}):
-            asyncio.run(node._save_completed_task({'id': JOB, 'status': 'succeeded'}, JOB, node.destination,
-                model_id=t.SEEDANCE_2_5_MODEL_ID, output_format='mov', return_last_frame=False))
-        schedule.assert_called_once()
-        self.assertTrue(node.parameter_output_values['VIDEO_OUT'])
-        self.assertEqual(node._generation_recovery_state()['stage'], 'local_succeeded')
-
-    def test_claim_heartbeats_during_long_foreground_download_and_reuses_published_file(self):
-        from HMB_Workstation_Review_Media_Regression import Broker, worker
-        node = self.make_node()
-        original = b'SYNTHETIC-COMPLETED-ORIGINAL'
-        broker = Broker(JOB, original)
-        broker.server_url = fixture.ORIGIN
-        node._broker_bridge_instance = broker
-        self.seed_checkpoint(node, action=t.DRAFT_ACTION_OFF)
-        realtime = os.environ.get('HMB_TEST_REALTIME_MEDIA_HEARTBEAT') == '1'
-        interval = 8 if realtime else .025
-        completed = []
-        def schedule(*args, **kwargs):
-            completed.append(worker.schedule_completed_review_media(*args, **kwargs))
-            return completed[-1]
-        async def slow_download(_):
-            started = time.monotonic()
-            while broker.count('POST', broker.route + '/heartbeat') < 5:
-                self.assertLess(time.monotonic() - started, interval * 5 + 5)
-                await asyncio.sleep(min(.05, interval / 2))
-            self.assertEqual(broker.count('GET', broker.original), 0)
-            if realtime:
-                self.assertGreaterEqual(time.monotonic() - started, 30)
-            with worker._Session(broker).open(broker.server_url + broker.original) as response:
-                return response.read()
-        async def publish(destination, data, fmt, verifier):
-            path = Path(destination.resolve())
-            path.write_bytes(data)
-            return SimpleNamespace(location=str(path), name=path.name)
-        def encode(source, directory, cancel, *, expected_sha256):
-            self.assertTrue(source.samefile(node.destination.resolve()))
-            self.assertEqual(source.read_bytes(), original)
-            poster, preview = directory / 'poster.jpg', directory / 'preview.mp4'
-            poster.write_bytes(b'\xff\xd8poster')
-            preview.write_bytes(b'\0\0\0\x18ftypmp42preview')
-            return poster, preview
-        with self.publication(node, authored(node)), mock.patch.dict(sys.modules, {
-                '_hmb_client_review_media': SimpleNamespace(schedule_completed_review_media=schedule)}), \
-             mock.patch.dict(os.environ, LOCALAPPDATA=node.base.name), \
-             mock.patch.object(worker, '_HEARTBEAT', interval), mock.patch.object(worker, 'make_review_media', encode):
-            node._download_broker_video.side_effect = slow_download
-            node._atomic_publish_completed_video.side_effect = publish
-            asyncio.run(node._save_completed_task({'id': JOB, 'status': 'succeeded'}, JOB, node.destination,
-                model_id=t.SEEDANCE_2_5_MODEL_ID, output_format='mov', return_last_frame=False))
-            self.assertEqual(len(completed), 1)
-            self.assertEqual(completed[0].result(timeout=5)['state'], 'ready')
-        self.assertEqual(broker.count('GET', broker.original), 1)
-        self.assertEqual(broker.count('POST', broker.route), 1)
-        self.assertFalse(list(Path(node.base.name).rglob('source.mov')))
 
     def test_direct_final_is_ephemeral_sparse_and_consumed_once_with_authored_480p_unchanged(self):
         async def scenario(shot):
